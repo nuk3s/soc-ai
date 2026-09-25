@@ -275,3 +275,38 @@ async def test_a_rule_with_live_fires_pays_for_no_extra_query(
     assert out["imported_alerts"] is None
     assert "could not be measured" not in out["summary"]
     assert "absence" not in out["summary"]
+
+
+@pytest.mark.asyncio
+async def test_lookback_over_cap_is_an_error_without_a_query(
+    settings_kratos: Settings,
+) -> None:
+    """A window past the ceiling is refused before any ES request is built.
+
+    The sibling read tools cap ``lookback_days`` because alert text is
+    prompt-injection surface; this tool has the same LLM-controlled argument
+    and the same live cluster behind it, so it must hold the same line.
+    """
+    elastic = _make_elastic(settings_kratos, EsSearchResult(total=0, took_ms=1))
+
+    out = await suggest_rule_tuning(
+        RULE, elastic=elastic, settings=settings_kratos, lookback_days=366
+    )
+
+    assert out["error"] is True
+    assert out["type"] == "ValueError"
+    assert out["message"] == "lookback_days must be <= 365, got 366"
+    assert elastic.search.await_count == 0  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_lookback_at_the_cap_still_runs(settings_kratos: Settings) -> None:
+    """365 is the widest window allowed, not the first one refused."""
+    elastic = _make_elastic(settings_kratos, EsSearchResult(total=0, took_ms=1))
+
+    out = await suggest_rule_tuning(
+        RULE, elastic=elastic, settings=settings_kratos, lookback_days=365
+    )
+
+    assert "error" not in out
+    assert elastic.search.await_count >= 1  # type: ignore[attr-defined]
