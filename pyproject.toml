@@ -29,7 +29,14 @@ dependencies = [
     # pydantic-ai went 1.0 well before this floor mattered; the resolved
     # client is 1.91.x. Pin the major so a fresh resolve can't silently
     # cross into a future breaking 2.x.
-    "pydantic-ai>=1.0,<2",
+    # The slim distribution with only the OpenAI extra: the agent talks to
+    # LiteLLM and the Oracle through the OpenAI-compatible client and imports
+    # nothing else from the provider set. The full `pydantic-ai` meta-package
+    # pulls every provider SDK (Anthropic, Bedrock, Google, Cohere, Groq,
+    # Mistral, xAI, Temporal, Logfire, ...) into the image and the lockfile:
+    # ~80 packages nothing here imports, and where the advisory-flagged
+    # transitive pins (pyasn1, google-auth, authlib) came from.
+    "pydantic-ai-slim[openai]>=1.0,<2",
     "mcp>=1.1.0",
     # HTTP / search clients
     "httpx>=0.27.0",
