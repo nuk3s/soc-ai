@@ -156,3 +156,57 @@ async def test_a_bad_first_draft_gets_one_retry_with_the_error(settings_kratos: 
         )
     assert draft.rationale == "fixed" and spec.id == "local-rc4-ticket-from-workstation"
     assert len(prompts) == 2 and "failed validation" in prompts[1]
+
+
+async def test_the_retry_prompt_never_carries_a_desanitized_identifier(
+    settings_kratos: Settings,
+) -> None:
+    """The validation error the retry quotes comes from the draft the model
+    wrote in label space. If the draft is desanitized first, pydantic's
+    ``input_value=`` repr echoes the real value and the retry ships it to the
+    cloud model behind the guard's back. The retry is also swept, like the
+    first prompt, so fail-closed still means closed."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from tests.test_detection_drafter import _FakeRedactionGuard
+
+    guard = _FakeRedactionGuard()
+    nested = GOOD_YAML.replace(
+        '    - field: winlog.event_data.TicketEncryptionType\n      value: "0x17"\n',
+        f"    - none:\n        - field: source.ip\n          value: {guard.LABEL}\n",
+    )
+    assert "none:" in nested and guard.LABEL in nested
+    bad = AnalyticDraft(spec_yaml=nested, rationale="x")
+    good = AnalyticDraft(spec_yaml=GOOD_YAML, rationale="fixed")
+    runs = [MagicMock(output=bad), MagicMock(output=good)]
+    prompts: list[str] = []
+
+    async def fake_run(prompt: str):  # type: ignore[no-untyped-def]
+        prompts.append(prompt)
+        return runs.pop(0)
+
+    with (
+        patch("soc_ai.detection.analytic_drafter.Agent") as agent_cls,
+        patch("soc_ai.detection.analytic_drafter.build_synthesizer_model"),
+    ):
+        agent_cls.return_value.run = AsyncMock(side_effect=fake_run)
+        draft, spec = await draft_analytic(
+            settings_kratos,
+            finding={"title": "t", "detail": f"traffic from {guard.REAL}"},
+            evidence="e",
+            catalog_ids=[],
+            guard=guard,
+        )
+    assert draft.rationale == "fixed" and spec.id == "local-rc4-ticket-from-workstation"
+    assert len(prompts) == 2
+    # The retry names the failure in label space only.
+    assert "failed validation" in prompts[1]
+    assert guard.REAL not in prompts[1]
+    assert guard.LABEL in prompts[1]
+    # Both outbound prompts went through the residue sweep, with the
+    # settings' fail-closed flag threaded through each time.
+    assert [text for text, _ in guard.check_or_raise_calls] == prompts
+    assert all(
+        flag is settings_kratos.analyst_redaction_fail_closed
+        for _, flag in guard.check_or_raise_calls
+    )
