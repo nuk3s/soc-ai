@@ -44,7 +44,7 @@ An optional cloud Oracle gives a second opinion on a hard alert. The Oracle is o
 
 Read the [1.5.0 release notes](docs/releases/1.5.0.md) and the [hunting guide](docs/HUNTING.md).
 
-1.5.1 is a review release on top of it. A line-by-line review of the whole repository produced 61 fixes across the evidence gates, the Oracle redaction, the egress guard, the pcap tool, the installer and the console, and each fix is pinned by a test. Read the [1.5.1 release notes](docs/releases/1.5.1.md).
+1.5.1 is a review release. A review of the full repository produced 61 fixes. Each fix has a test that failed before the fix. Read the [1.5.1 release notes](docs/releases/1.5.1.md).
 
 ## The web console
 
