@@ -37,7 +37,7 @@ import { DEMO_ACTION_NOTE, demoBlocked, useDemo } from '../lib/demo';
 import { ackMessage, ackTail, escalateMessage } from '../lib/groupWriteMessages';
 import { plural } from '../lib/plural';
 import { middleEllipsis } from '../lib/text';
-import { useToast } from '../lib/toast';
+import { type ToastTone, useToast } from '../lib/toast';
 import { useAsync } from '../lib/useAsync';
 import { isEditableTarget, nextFocusIndex, resolveTriageKey } from '../lib/triageKeys';
 import { type SortDir, useSort } from '../lib/useSort';
@@ -165,6 +165,20 @@ const RANGE_LINK_VALUES = new Set(['15m', '1h', '4h', '24h', '3d', '7d', '30d'])
 // by default (see seedFromLink's `!== 'false'`), which is exactly the default a
 // partial apply used to flip off.
 const DEFAULT_VIEW: ViewId = 'all';
+/** Exactly the preset chips, and so the only views a ?view= (or a saved view)
+ * can name. Anything else resolves to the default rather than falling through
+ * matchView to "every row": that branch showed the whole list under no
+ * highlighted chip, so an analyst who asked for their own queue got the
+ * network's detections with no sign the ask had been dropped. */
+const VIEW_LINK_VALUES: ReadonlySet<string> = new Set<ViewId>([
+  'mine',
+  'inreview',
+  'critical',
+  'decision',
+  'all',
+]);
+const asViewId = (raw: unknown): ViewId =>
+  typeof raw === 'string' && VIEW_LINK_VALUES.has(raw) ? (raw as ViewId) : DEFAULT_VIEW;
 const DEFAULT_RANGE = '24h';
 const DEFAULT_HIDE_ACKED = true;
 
@@ -643,7 +657,7 @@ export function Alerts() {
     // set the rows on screen came from.
     q: filterQ || undefined,
   };
-  const view = (searchParams.get('view') as ViewId) || 'all';
+  const view = asViewId(searchParams.get('view'));
   const drawerId = searchParams.get('drawer');
   // useAsync captures pauseWhen at setup and can't see `drawerId` there (it's
   // not in the deps below), so track it in a ref and let pauseWhen consult
@@ -673,6 +687,16 @@ export function Alerts() {
   // a follow-up page is currently fetching.
   const [eventsMore, setEventsMore] = useState<Record<string, boolean>>({});
   const [eventsLoadingMore, setEventsLoadingMore] = useState<Record<string, boolean>>({});
+  // Why a group's first page could not be fetched, keyed like the maps above.
+  // A failed page is NOT cached as an empty one: "No events in window." is a
+  // claim about the grid, and a 503 supports no such claim — it read as a
+  // group with nothing in it, with no way to ask again short of a filter change.
+  const [eventsError, setEventsError] = useState<Record<string, string>>({});
+  // Bumped by the filter-reset effect. A page already in flight when the
+  // filter changes cannot be cancelled, but it can be ignored when it lands:
+  // written into the freshly cleared map it sat under the NEW filter, and the
+  // cached-key guard in fetchFirstPage then kept it there.
+  const eventsEpoch = useRef(0);
   // Which event buckets (keyed "<groupKey>:<bucketIndex>") an analyst has
   // unfolded into individual rows via "Show each".
   const [openBuckets, setOpenBuckets] = useState<Record<string, boolean>>({});
@@ -711,8 +735,11 @@ export function Alerts() {
   const [acking, setAcking] = useState(false);
   const [ackingCount, setAckingCount] = useState(0);
   const [ackingAlertTotal, setAckingAlertTotal] = useState(0);
-  const showAckMsg = (m: string) =>
-    toast({ message: m, tone: m === DEMO_ACTION_NOTE ? 'info' : 'success' });
+  // A rejected write goes out as 'danger': the toaster keeps that tone until
+  // it is dismissed, where a 'success' wears the green check and is gone at 6s,
+  // which read as the write having landed to anyone who glanced and looked away.
+  const showAckMsg = (m: string, tone: ToastTone = 'success') =>
+    toast({ message: m, tone: m === DEMO_ACTION_NOTE ? 'info' : tone });
 
   // ---- group-hunt reason strip -------------------------------------------
   const [huntReason, setHuntReason] = useState<string | null>(null);
@@ -730,6 +757,12 @@ export function Alerts() {
   const [pct, setPct] = useState(0);
   const [triageStatus, setTriageStatus] = useState<AutoTriageStatus | null>(null);
   const triageTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Whether this screen is still on the page. The start POST can outlive it
+  // (api.ts gives the request 20s; the analyst may navigate away sooner), and
+  // the unmount cleanup can only clear an interval that already exists — one
+  // installed by a `.then` landing after it would poll the status route every
+  // 2s for the rest of the sweep from a screen nobody is looking at.
+  const mountedRef = useRef(true);
   // Severity floor for the global sweep button ("High and up" by default).
   const [triageFloor, setTriageFloor] = useState<string>('high');
 
@@ -804,14 +837,18 @@ export function Alerts() {
     if (triageTimer.current) clearInterval(triageTimer.current);
     const finish = (msg: string | null) => {
       if (triageTimer.current) clearInterval(triageTimer.current);
+      if (!mountedRef.current) return;
       setPct(100);
-      setTimeout(() => setTriaging(false), 900);
+      setTimeout(() => {
+        if (mountedRef.current) setTriaging(false);
+      }, 900);
       setReloadKey((k) => k + 1); // pull in the verdicts the batch produced
       if (msg) showTriageMsg(msg);
     };
     const poll = () => {
       getAutoTriageStatus()
         .then((s) => {
+          if (!mountedRef.current) return;
           // skipped never enters the worker, so progress is processed/total.
           const done = s.hunted + s.failed;
           setPct(s.total ? Math.round((100 * done) / s.total) : 0);
@@ -822,6 +859,8 @@ export function Alerts() {
     };
     startAutoTriage(alertIds?.length ? { alertIds } : { minSeverity })
       .then((s) => {
+        // Landed after the analyst left: nothing to show, and no poll to start.
+        if (!mountedRef.current) return;
         if (!s.active) {
           // nothing to hunt, or the batch already wrapped up — show why
           finish(s.note || (s.total ? triageSummary(s) : 'Nothing to investigate'));
@@ -832,10 +871,13 @@ export function Alerts() {
         if (s.note) showTriageMsg(s.note);
         // Refresh the list ~1.5 s after start so rows flip to "Triaging…"
         // before investigations have completed (the finish() bump handles verdicts).
-        setTimeout(() => setReloadKey((k) => k + 1), 1500);
+        setTimeout(() => {
+          if (mountedRef.current) setReloadKey((k) => k + 1);
+        }, 1500);
         triageTimer.current = setInterval(poll, 2000);
       })
       .catch((err: unknown) => {
+        if (!mountedRef.current) return;
         setTriaging(false);
         const msg = triageStartFailure(err);
         setTriageError(msg);
@@ -861,9 +903,16 @@ export function Alerts() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [location.key]);
 
-  useEffect(() => () => {
-    if (triageTimer.current) clearInterval(triageTimer.current);
-    if (huntReasonTimer.current) clearTimeout(huntReasonTimer.current);
+  useEffect(() => {
+    // Set on mount as well as at declaration: a dev-mode double-invoke runs
+    // this cleanup once before the mount that counts, and the flag must come
+    // back up with it.
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      if (triageTimer.current) clearInterval(triageTimer.current);
+      if (huntReasonTimer.current) clearTimeout(huntReasonTimer.current);
+    };
   }, []);
 
   // Reset row expansion + cached events when the query that produced them
@@ -871,11 +920,13 @@ export function Alerts() {
   // with the old value is stale under the new filter — clear it too, else an
   // expanded group shows acknowledged events after "Hide acknowledged" is on.
   useEffect(() => {
+    eventsEpoch.current += 1;
     setExpanded({});
     setGroupEvents({});
     setEventsLoading({});
     setEventsMore({});
     setEventsLoadingMore({});
+    setEventsError({});
     // Bucket-unfold state is keyed on "<groupKey>:<bucketIndex>", and the
     // index is only stable within one fetched event page — the group key
     // alone collides across a filter change, so a stale unfold would show
@@ -991,7 +1042,15 @@ export function Alerts() {
         return startHunt(rep.alert_id);
       })
       .then((invId) => openDrawer(invId))
-      .catch(() => setStarting(null))
+      .catch((err: unknown) => {
+        setStarting(null);
+        // The strip above named the event this hunt would use; with no hunt
+        // it describes nothing, and beside the refusal it would contradict it.
+        setHuntReason(null);
+        // e.g. 409 hunt_in_progress — same report as hunt()/huntEvent(), so the
+        // drawer does not just flash and close with nothing to say why.
+        showTriageMsg(err instanceof Error ? err.message : 'Could not start the investigation');
+      })
       .finally(() => setHuntGroupPending((s) => ({ ...s, [gk]: false })));
   };
 
@@ -1008,7 +1067,7 @@ export function Alerts() {
         showAckMsg(ackMessage(r, g.name));
         setReloadKey((k) => k + 1);
       })
-      .catch(() => showAckMsg(`Failed to acknowledge ${g.name}`))
+      .catch(() => showAckMsg(`Failed to acknowledge ${g.name}`, 'danger'))
       .finally(() => setAcking(false));
   };
 
@@ -1022,12 +1081,47 @@ export function Alerts() {
         showAckMsg(escalateMessage(r, g.name));
         setReloadKey((k) => k + 1);
       })
-      .catch(() => showAckMsg(`Failed to escalate ${g.name}`));
+      .catch(() => showAckMsg(`Failed to escalate ${g.name}`, 'danger'));
   };
 
   // Toggle a single group's selection (keyboard `x`) into the same `selected`
   // map the checkboxes + bulk bar use.
   const toggleSelectGroup = (g: AlertGroup) => sel.toggle(groupKey(g));
+
+  // A group's first page of events: fetched on its first expand, and again
+  // from the inline Retry after a failure. Results from before the last filter
+  // change are dropped rather than merged (see eventsEpoch).
+  const fetchFirstPage = (g: AlertGroup) => {
+    const gk = groupKey(g);
+    const epoch = eventsEpoch.current;
+    setEventsLoading((s) => ({ ...s, [gk]: true }));
+    setEventsError((s) => {
+      if (!(gk in s)) return s;
+      const next = { ...s };
+      delete next[gk];
+      return next;
+    });
+    getAlertGroupEvents(g, alertQuery, { size: EVENTS_PAGE_SIZE, offset: 0 })
+      .then((evs) => {
+        if (epoch !== eventsEpoch.current) return;
+        setGroupEvents((s) => ({ ...s, [gk]: evs }));
+        // A full page implies there may be more — show "Load more".
+        setEventsMore((s) => ({ ...s, [gk]: evs.length >= EVENTS_PAGE_SIZE }));
+      })
+      .catch((err: unknown) => {
+        if (epoch !== eventsEpoch.current) return;
+        setEventsError((s) => ({
+          ...s,
+          [gk]: err instanceof Error ? err.message : 'The request did not complete',
+        }));
+      })
+      .finally(() => {
+        // A stale finally must not flip loading off under a newer fetch; the
+        // reset effect already cleared the map for this epoch.
+        if (epoch !== eventsEpoch.current) return;
+        setEventsLoading((s) => ({ ...s, [gk]: false }));
+      });
+  };
 
   const toggleExpand = (g: AlertGroup) => {
     const gk = groupKey(g);
@@ -1035,15 +1129,7 @@ export function Alerts() {
     setExpanded((s) => ({ ...s, [gk]: !s[gk] }));
     // Fetch this group's first page of events the first time it's opened.
     if (opening && groupEvents[gk] === undefined && !eventsLoading[gk]) {
-      setEventsLoading((s) => ({ ...s, [gk]: true }));
-      getAlertGroupEvents(g, alertQuery, { size: EVENTS_PAGE_SIZE, offset: 0 })
-        .then((evs) => {
-          setGroupEvents((s) => ({ ...s, [gk]: evs }));
-          // A full page implies there may be more — show "Load more".
-          setEventsMore((s) => ({ ...s, [gk]: evs.length >= EVENTS_PAGE_SIZE }));
-        })
-        .catch(() => setGroupEvents((s) => ({ ...s, [gk]: [] })))
-        .finally(() => setEventsLoading((s) => ({ ...s, [gk]: false })));
+      fetchFirstPage(g);
     } else if (!opening) {
       // Collapsing: forget which buckets were unfolded, so re-expanding
       // starts summarized again rather than reopening a stale flood.
@@ -1066,14 +1152,22 @@ export function Alerts() {
     const gk = groupKey(g);
     if (eventsLoadingMore[gk]) return;
     const offset = groupEvents[gk]?.length ?? 0;
+    const epoch = eventsEpoch.current;
     setEventsLoadingMore((s) => ({ ...s, [gk]: true }));
     getAlertGroupEvents(g, alertQuery, { size: EVENTS_PAGE_SIZE, offset })
       .then((evs) => {
+        if (epoch !== eventsEpoch.current) return;
         setGroupEvents((s) => ({ ...s, [gk]: [...(s[gk] ?? []), ...evs] }));
         setEventsMore((s) => ({ ...s, [gk]: evs.length >= EVENTS_PAGE_SIZE }));
       })
-      .catch(() => setEventsMore((s) => ({ ...s, [gk]: false })))
-      .finally(() => setEventsLoadingMore((s) => ({ ...s, [gk]: false })));
+      .catch(() => {
+        if (epoch !== eventsEpoch.current) return;
+        setEventsMore((s) => ({ ...s, [gk]: false }));
+      })
+      .finally(() => {
+        if (epoch !== eventsEpoch.current) return;
+        setEventsLoadingMore((s) => ({ ...s, [gk]: false }));
+      });
   };
 
   const ownerOf = (g: AlertGroup) => g.owner ?? '';
@@ -1088,21 +1182,21 @@ export function Alerts() {
     if (blocked) { showAckMsg(blocked); return; }
     assignAlert(g.name)
       .then(() => setReloadKey((k) => k + 1))
-      .catch(() => showAckMsg(`Failed to assign ${g.name}`));
+      .catch(() => showAckMsg(`Failed to assign ${g.name}`, 'danger'));
   };
   const release = (g: AlertGroup) => {
     const blocked = demoBlocked(demo);
     if (blocked) { showAckMsg(blocked); return; }
     assignAlert(g.name, true)
       .then(() => setReloadKey((k) => k + 1))
-      .catch(() => showAckMsg(`Failed to release ${g.name}`));
+      .catch(() => showAckMsg(`Failed to release ${g.name}`, 'danger'));
   };
   const setTriage = (g: AlertGroup, state: TriageState) => {
     const blocked = demoBlocked(demo);
     if (blocked) { showAckMsg(blocked); return; }
     assignAlert(g.name, false, state)
       .then(() => setReloadKey((k) => k + 1))
-      .catch(() => showAckMsg(`Failed to update ${g.name}`));
+      .catch(() => showAckMsg(`Failed to update ${g.name}`, 'danger'));
   };
 
   // The Verdict filter carries a synthetic 'pipeline_error' value (E1.2): a
@@ -1379,7 +1473,7 @@ export function Alerts() {
     // the ON-by-default hide-acked OFF for any view saved before that key
     // existed. A saved view that silently unhides acknowledged alerts is worse
     // than no saved views.
-    setView(typeof saved.view === 'string' ? (saved.view as ViewId) : DEFAULT_VIEW);
+    setView(asViewId(saved.view));
     setFilterSevs(Array.isArray(saved.sevs) ? (saved.sevs as string[]) : []);
     setFilterVerdicts(Array.isArray(saved.verdicts) ? (saved.verdicts as string[]) : []);
     setHideAcked(typeof saved.hideAcked === 'boolean' ? saved.hideAcked : DEFAULT_HIDE_ACKED);
@@ -1629,7 +1723,7 @@ export function Alerts() {
                           const ok = n - failedIds.length;
                           sel.select(failedIds);
                           if (failedIds.length) {
-                            showAckMsg(`Assigned ${ok} of ${n} group${n !== 1 ? 's' : ''} · ${failedIds.length} failed. The failed groups stay selected. Click Assign to me to retry.`);
+                            showAckMsg(`Assigned ${ok} of ${n} group${n !== 1 ? 's' : ''} · ${failedIds.length} failed. The failed groups stay selected. Click Assign to me to retry.`, 'danger');
                           } else {
                             showAckMsg(`Assigned ${ok} group${ok !== 1 ? 's' : ''} to you`);
                           }
@@ -1679,7 +1773,10 @@ export function Alerts() {
                           const parts = [`Acknowledged ${plural(totalAcked, 'alert')} across ${plural(okGroups, 'group')}`];
                           if (totalFailed) parts.push(`${plural(totalFailed, 'event')} failed`);
                           if (failedGroups) parts.push(`${plural(failedGroups, 'group')} failed. The failed groups stay selected. Click Acknowledge to retry.`);
-                          showAckMsg(parts.join(' · ') + ackTail({ capped: anyCapped, remaining: totalRemaining, already_acked: totalAlready }));
+                          showAckMsg(
+                            parts.join(' · ') + ackTail({ capped: anyCapped, remaining: totalRemaining, already_acked: totalAlready }),
+                            totalFailed || failedGroups ? 'danger' : 'success',
+                          );
                           setReloadKey((k) => k + 1);
                         })
                         .finally(() => setAcking(false));
@@ -1701,6 +1798,13 @@ export function Alerts() {
                           await ackEvents(looseEventIds);
                           setSelEvents({});
                           setReloadKey((k) => k + 1);
+                        } catch (err: unknown) {
+                          // The selection is deliberately left standing so the
+                          // same click retries it, as the group path does.
+                          showAckMsg(
+                            err instanceof Error ? err.message : 'Failed to acknowledge the selected events',
+                            'danger',
+                          );
                         } finally {
                           setAckingEvents(false);
                         }
@@ -2180,7 +2284,21 @@ export function Alerts() {
                   {eventsLoading[gk] && (
                     <div className="py-2.5 pl-[50px] font-mono text-[11.5px] text-faint">Loading events…</div>
                   )}
-                  {!eventsLoading[gk] && (groupEvents[gk]?.length ?? 0) === 0 && (
+                  {!eventsLoading[gk] && eventsError[gk] && (
+                    <div
+                      role="alert"
+                      className="flex items-center gap-2.5 py-2.5 pl-[50px] pr-3.5 font-mono text-[11.5px] text-danger"
+                    >
+                      <span className="min-w-0 truncate">Couldn't load this group's events. {eventsError[gk]}</span>
+                      <button
+                        onClick={() => fetchFirstPage(g)}
+                        className="flex-shrink-0 rounded-control border border-border-strong bg-surface-3 px-2 py-0.5 font-sans text-[11px] font-semibold text-text hover:border-accent"
+                      >
+                        Retry
+                      </button>
+                    </div>
+                  )}
+                  {!eventsLoading[gk] && !eventsError[gk] && (groupEvents[gk]?.length ?? 0) === 0 && (
                     <div className="py-2.5 pl-[50px] font-mono text-[11.5px] text-faint">No events in window.</div>
                   )}
                   {bucketEvents(groupEvents[gk] ?? []).map((b, bi) => {

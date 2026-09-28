@@ -179,3 +179,35 @@ describe('Alerts verdict filter actually filters', () => {
     );
   });
 });
+
+// The view chip is the one URL-seeded facet that had no allow-list. A ?view=
+// the chips cannot show ('myqueue' from the palette, a stale bookmark) fell
+// through matchView's default to "every row" with no chip highlighted: the
+// analyst who asked for their own queue got the whole network's detections and
+// no sign on screen that the ask had been dropped.
+describe('Alerts ?view= seeding', () => {
+  const OWNED = { ...GROUP, id: 'g2', name: 'ET POLICY Owned Detection', owner: 'me' };
+
+  /** The "All" preset chip: the only aria-pressed button whose label starts with All. */
+  const allChip = () =>
+    screen
+      .getAllByRole('button')
+      .find((b) => b.hasAttribute('aria-pressed') && /^All/.test((b.textContent ?? '').trim()));
+
+  it('falls back to All, and highlights it, for a ?view= the chips cannot show', async () => {
+    mount('/alerts?view=myqueue');
+    await screen.findByText(GROUP.name);
+    expect(allChip()?.getAttribute('aria-pressed')).toBe('true');
+  });
+
+  it('applies the Mine preset from ?view=mine', async () => {
+    vi.mocked(getAlerts).mockResolvedValueOnce({
+      groups: [GROUP, OWNED],
+      truncated: false,
+      other_docs: 0,
+    } as never);
+    mount('/alerts?view=mine');
+    await screen.findByText(OWNED.name);
+    expect(screen.queryByText(GROUP.name)).toBeNull();
+  });
+});

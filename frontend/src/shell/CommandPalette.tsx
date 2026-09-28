@@ -130,7 +130,7 @@ export function CommandPalette() {
           toggleNav();
         },
       },
-      { group: 'View', label: 'My queue', icon: <Triangle size={15} />, run: go('/alerts?view=myqueue') },
+      { group: 'View', label: 'My queue', icon: <Triangle size={15} />, run: go('/alerts?view=mine') },
       { group: 'View', label: 'Critical alerts', icon: <Triangle size={15} />, run: go('/alerts?view=critical') },
       { group: 'View', label: 'Needs decision', icon: <Triangle size={15} />, run: go('/alerts?view=decision') },
       {

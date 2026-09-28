@@ -3,7 +3,7 @@
 // strip and NEVER fire the network write. The guard is one shared helper
 // (`demoBlocked`) wired through the real DemoProvider → useDemo chain, so this
 // tests the actual decision the ack/escalate/save handlers make — not a copy.
-import { fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { describe, expect, it, vi } from 'vitest';
 import { DEMO_ACTION_NOTE, DemoProvider, demoBlocked, useDemo } from '../lib/demo';
@@ -230,5 +230,38 @@ describe('assignAlert write paths surface a failure instead of failing silently 
     fireEvent.click(assignBtn);
 
     await screen.findByText(`Failed to assign ${POLL_GROUP.name}`);
+  });
+
+  // The message alone is not the fix. Every "Failed to …" from this screen went
+  // through the same helper as its successes, so a rejected write rendered with
+  // the green check and the 6s auto-dismiss: an analyst who glanced at the
+  // colour and looked away had no failure left to read. The toaster already
+  // keeps a 'danger' until dismissed; the failure has to be sent as one.
+  it('keeps a failed write on screen as a danger notice, not a green one that expires', async () => {
+    vi.mocked(assignAlert).mockRejectedValueOnce(new Error('network down'));
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      render(
+        <ToastProvider>
+          <MemoryRouter initialEntries={['/alerts']}>
+            <ShellProvider>
+              <Alerts />
+            </ShellProvider>
+          </MemoryRouter>
+        </ToastProvider>,
+      );
+
+      fireEvent.click(await screen.findByTitle('Assign to me'));
+      const notice = await screen.findByText(`Failed to assign ${POLL_GROUP.name}`);
+      const toast = notice.closest('[role="status"]');
+      expect(toast?.querySelector('.lucide-triangle-alert')).toBeTruthy();
+      expect(toast?.querySelector('.lucide-circle-check')).toBeNull();
+
+      // Past the success/info auto-dismiss: a failure must still be there.
+      await act(() => vi.advanceTimersByTimeAsync(6500));
+      expect(screen.queryByText(`Failed to assign ${POLL_GROUP.name}`)).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

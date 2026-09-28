@@ -50,6 +50,7 @@ vi.mock('../lib/notifications', async (importOriginal) => ({
 }));
 
 import {
+  ackEvents,
   ackGroup,
   getAlertGroupEvents,
   getAlerts,
@@ -61,6 +62,7 @@ import {
   getRepresentative,
   getWorkspaces,
   listSavedViews,
+  startHunt,
 } from '../lib/api';
 import { queueOf } from '../test/alertQueue';
 import { Alerts } from './Alerts';
@@ -102,7 +104,7 @@ beforeEach(() => {
   vi.mocked(listSavedViews).mockResolvedValue([]);
 });
 
-async function pressAcknowledge() {
+function renderAlerts() {
   render(
     <ToastProvider>
       <MemoryRouter initialEntries={['/alerts']}>
@@ -112,6 +114,10 @@ async function pressAcknowledge() {
       </MemoryRouter>
     </ToastProvider>,
   );
+}
+
+async function pressAcknowledge() {
+  renderAlerts();
   await screen.findByText(GROUP.name);
   await act(async () => {
     fireEvent.keyDown(window, { key: 'j' });
@@ -176,5 +182,85 @@ describe('the acknowledge strip', () => {
     const strip = await screen.findByText(/Acknowledged 12 alerts/);
     expect(strip.textContent).not.toMatch(/left/);
     expect(strip.textContent).not.toMatch(/already acknowledged/);
+  });
+});
+
+// The per-event acknowledge button awaited its write inside try/finally with no
+// catch: a 503 or a demo refusal escaped as an unhandled rejection, no notice
+// was shown, and the button simply re-enabled, which reads as the write having
+// landed. The sibling group path reports every failure and keeps the failed
+// rows selected for a retry; the event path has to do the same.
+describe('the loose-event acknowledge button', () => {
+  // The shared beforeEach clears calls but not implementations, so the
+  // rejection this block installs is reset here rather than leaking onward.
+  // Block body on purpose: mockReset() returns the mock, and a function
+  // returned from beforeEach runs as a cleanup hook after the test — which
+  // would call the rejecting mock once more and fail the test on its own.
+  beforeEach(() => {
+    vi.mocked(ackEvents).mockReset();
+  });
+
+  it('reports a rejected acknowledge and keeps the selection for a retry', async () => {
+    vi.mocked(getAlertGroupEvents).mockResolvedValue([
+      { id: 'ev-1', src: '10.0.0.1', dst: '10.0.0.2', host: 'so-sensor', sev: 'high', ts: '2026-07-30T00:00:00Z' },
+    ]);
+    vi.mocked(ackEvents).mockImplementation(() => Promise.reject(new Error('grid unavailable')));
+    renderAlerts();
+    await screen.findByText(GROUP.name);
+
+    // Expand the group, wait for its event row to RENDER (called is not
+    // rendered), then tick that one event.
+    const before = screen.getAllByRole('checkbox').length;
+    fireEvent.click(screen.getByText(GROUP.name));
+    await waitFor(() => expect(screen.getAllByRole('checkbox').length).toBeGreaterThan(before));
+    const boxes = screen.getAllByRole('checkbox');
+    fireEvent.click(boxes[boxes.length - 1]);
+
+    fireEvent.click(await screen.findByText('Acknowledge 1 event'));
+    await waitFor(() => expect(ackEvents).toHaveBeenCalledWith(['ev-1']));
+
+    await screen.findByText('grid unavailable');
+    // The failed selection stays, so the same click retries it.
+    expect(screen.getByText('Acknowledge 1 event')).toBeTruthy();
+    const after = screen.getAllByRole('checkbox');
+    expect(after[after.length - 1].getAttribute('aria-checked')).toBe('true');
+  });
+});
+
+// The row's Investigate button (also Retry, and the o/Enter/i keys) resolved
+// the representative event, started the hunt, and on ANY rejection only closed
+// the "Starting investigation…" drawer. A 409 because a hunt was already
+// running, or a 503 from the grid, left the operator with a drawer that
+// flashed and closed and nothing to say why; the single-event Investigate
+// beside it quotes the server's sentence for exactly this case.
+describe('the row Investigate button', () => {
+  beforeEach(() => {
+    vi.mocked(startHunt).mockReset();
+  });
+
+  it('quotes the refusal when the hunt cannot start, and takes the reason strip with it', async () => {
+    vi.mocked(startHunt).mockImplementation(() => Promise.reject(new Error('hunt in progress')));
+    renderAlerts();
+    await screen.findByText(GROUP.name);
+
+    fireEvent.click(screen.getAllByLabelText('Investigate')[0]);
+    await waitFor(() => expect(startHunt).toHaveBeenCalledWith('rep'));
+
+    await screen.findByText('hunt in progress');
+    expect(screen.queryByText(/Starting investigation on/)).toBeNull();
+    // The strip naming the chosen event described a hunt that never started.
+    expect(screen.queryByText(/uses the representative event/)).toBeNull();
+  });
+
+  it('reports a failed representative lookup the same way', async () => {
+    vi.mocked(getRepresentative).mockImplementation(() => Promise.reject(new Error('grid unavailable')));
+    renderAlerts();
+    await screen.findByText(GROUP.name);
+
+    fireEvent.click(screen.getAllByLabelText('Investigate')[0]);
+    await waitFor(() => expect(getRepresentative).toHaveBeenCalled());
+
+    await screen.findByText('grid unavailable');
+    expect(startHunt).not.toHaveBeenCalled();
   });
 });
