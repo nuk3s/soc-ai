@@ -44,11 +44,13 @@ jobs:
       - name: Install dependencies
         run: uv sync --all-extras --dev
 
+      # scripts/ is in scope too: pyproject.toml carries per-file-ignores for
+      # it and the pre-commit hooks format it, so CI must hold the same line.
       - name: ruff check
-        run: uv run ruff check soc_ai/ tests/
+        run: uv run ruff check soc_ai/ tests/ scripts/
 
       - name: ruff format check
-        run: uv run ruff format --check soc_ai/ tests/
+        run: uv run ruff format --check soc_ai/ tests/ scripts/
 
       - name: mypy
         run: uv run mypy soc_ai/
@@ -57,8 +59,8 @@ jobs:
         run: uv run pytest -v
 
   # The React SPA (frontend/) — typecheck + unit tests (vitest) + production
-  # build so a broken UI can't land silently. No eslint config is committed
-  # yet, so `lint` is omitted.
+  # build so a broken UI can't land silently. There is no eslint setup yet
+  # (no dependency, no config, no `lint` script); tsc is the only static gate.
   frontend:
     name: frontend typecheck + test + build
     runs-on: ubuntu-latest
@@ -134,3 +136,82 @@ jobs:
       # smoke, with no coverage gate applied.
       - name: pytest (browser smoke)
         run: uv run pytest --override-ini "addopts=" --no-header -v -m browser tests/browser/
+
+  # Strict docs build on every PR, so a page renamed out from under mkdocs.yml's
+  # nav or a broken internal link fails here and not in the post-merge Pages
+  # deploy (docs.yml), which used to be the first strict run. Only the docs
+  # group from uv.lock is installed: the site build needs none of the app.
+  # Never add -q: quiet mode exits 0 on a strict abort.
+  docs:
+    name: docs strict build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install the docs group
+        run: uv sync --only-group docs --frozen
+
+      - name: mkdocs build (strict)
+        run: uv run --no-sync mkdocs build --strict
+
+  # Known-advisory gate on what ships: the locked runtime Python set (uv.lock
+  # without the dev group) and the SPA's production npm dependencies. Its own
+  # job, so a new advisory shows up as "dependency audit" in the checks rather
+  # than as a test failure, and so it runs even when nothing else moved. An
+  # advisory with no released fix is not actionable here: allowlist it with
+  # `--ignore-vuln <ID>` (pip-audit) or raise the npm threshold, name the
+  # advisory in a comment, and drop the entry once Dependabot
+  # (.github/dependabot.yml) opens the bump that clears it.
+  audit:
+    name: dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      # --no-dev: audit what the image ships, not the test tooling. --quiet:
+      # uv export echoes the file to stdout as well, which is only log noise.
+      # --no-deps: the export is fully pinned, so there is nothing left to
+      # resolve. --strict: a package pip-audit could not check fails the job
+      # instead of passing silently. pip-audit is pinned like every other
+      # installer here.
+      - name: pip-audit (locked runtime dependencies)
+        run: |
+          uv export --frozen --quiet --format requirements-txt --no-hashes --no-emit-project \
+            --no-dev -o "${RUNNER_TEMP}/requirements.txt"
+          uvx pip-audit==2.10.1 -r "${RUNNER_TEMP}/requirements.txt" --no-deps --strict
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      # Production dependencies only (--omit=dev): the vite/vitest advisories
+      # are build-time and their fixes are major bumps. High and critical fail
+      # the job. react-router 6.x carries a known moderate advisory (open
+      # redirect through a backslash in <Link>) whose fix is 7.x, so moderate
+      # is reported but does not block. The audit reads package-lock.json and
+      # needs no install.
+      - name: npm audit (production dependencies)
+        working-directory: frontend
+        run: npm audit --omit=dev --audit-level=high

@@ -1168,8 +1168,7 @@ def build_hunt_prev(hunt_id: str) -> tuple[Hunt, list]:
             {
                 "title": "No SMB admin-share access from fin-ws-041",
                 "detail": (
-                    f"zeek.smb_files shows zero ADMIN$/C$ or IPC$ writes from {src} "
-                    "in the window."
+                    f"zeek.smb_files shows zero ADMIN$/C$ or IPC$ writes from {src} in the window."
                 ),
                 "severity": "info",
                 "category": "observation",
@@ -1237,7 +1236,9 @@ def build_hunt_prev(hunt_id: str) -> tuple[Hunt, list]:
         finished_at=created + timedelta(minutes=2, seconds=2),
     )
     events = [
-        HuntEvent(hunt_id=hunt_id, sequence=1, kind="hunt_started", payload={"objective": HUNT_OBJECTIVE}),
+        HuntEvent(
+            hunt_id=hunt_id, sequence=1, kind="hunt_started", payload={"objective": HUNT_OBJECTIVE}
+        ),
         HuntEvent(
             hunt_id=hunt_id,
             sequence=2,
@@ -1619,7 +1620,15 @@ async def seed(data_dir: Path) -> dict:
         # Manual internal identifiers: the demo workstation names are what the
         # E5.2 analyst redaction preview must redact (TEST-NET IPs are already
         # is_private to the sanitizer); also demos the identifiers panel.
-        for host in ("fin-ws-041", "eng-ws-112", "hr-ws-023", "it-ws-007", "sec-scan-01", "mkt-ws-019", "eng-ws-233"):
+        for host in (
+            "fin-ws-041",
+            "eng-ws-112",
+            "hr-ws-023",
+            "it-ws-007",
+            "sec-scan-01",
+            "mkt-ws-019",
+            "eng-ws-233",
+        ):
             db.add(InternalIdentifier(kind="host", value=host, source="manual", state="active"))
         db.add(
             InternalIdentifier(

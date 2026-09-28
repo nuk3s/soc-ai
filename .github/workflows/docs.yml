@@ -15,7 +15,7 @@ on:
 
 # Workflow-level: least privilege (read only). The Pages deploy scopes
 # (pages: write + id-token: write) are granted ONLY on the deploy job below, so
-# the build job — which runs `pip install` — never holds a deploy/OIDC token.
+# the build job — which installs packages — never holds a deploy/OIDC token.
 permissions:
   contents: read
 
@@ -28,22 +28,31 @@ jobs:
   build:
     name: build
     runs-on: ubuntu-latest
+    # A stalled install would otherwise hold the `pages` concurrency group for
+    # GitHub's 360-minute default and queue every later docs deploy behind it.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
 
-      - name: Set up Python
-        uses: actions/setup-python@v6
+      - name: Install uv
+        # Same SHA pin as ci.yml (setup-uv publishes no floating v8 major tag).
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
-          python-version: "3.12"
-          cache: pip
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.12
 
       - name: Install MkDocs Material
-        # Pin exactly (not `>=`) so a docs build is reproducible and a surprise
-        # upstream release can't change the published site without a repo edit.
-        run: pip install "mkdocs-material==9.7.6"
+        # From uv.lock's docs group, so the published site is built with the
+        # exact versions CI's strict build checked, and a surprise upstream
+        # release can't change it without a lock diff. Only that group: the
+        # site build needs none of the app.
+        run: uv sync --only-group docs --frozen
 
       - name: Build site (strict)
-        run: mkdocs build --strict
+        run: uv run --no-sync mkdocs build --strict
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v5
@@ -54,6 +63,9 @@ jobs:
     name: deploy
     needs: build
     runs-on: ubuntu-latest
+    # deploy-pages can sit in the Pages queue for a few minutes; 10 leaves room
+    # for that without letting a stuck deploy block the next one for hours.
+    timeout-minutes: 10
     # The Pages deploy needs these scopes; grant them here (not workflow-level)
     # so only this job — which runs no untrusted install — holds them.
     permissions:
