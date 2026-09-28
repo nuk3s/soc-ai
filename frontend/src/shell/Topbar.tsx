@@ -345,20 +345,9 @@ export function Topbar() {
           {notifs.length === 0 && (
             <div className="px-3.5 py-6 text-center text-[12px] text-faint">No notifications.</div>
           )}
-          {notifs.map((nt) => (
-            <div
-              key={nt.id}
-              onClick={() => openNotif(nt)}
-              className={
-                'flex gap-2.5 border-b border-border-faint px-3.5 py-[11px] hover:bg-[#141b25] ' +
-                (nt.href ? 'cursor-pointer' : '')
-              }
-            >
-              <span
-                className="mt-[5px] h-[7px] w-[7px] flex-none rounded-full"
-                style={{ background: TONE[nt.tone], boxShadow: `0 0 7px ${TONE[nt.tone]}` }}
-              />
-              <div className="min-w-0 flex-1">
+          {notifs.map((nt) => {
+            const body = (
+              <>
                 <div className="text-[12.5px] leading-[1.45]">
                   {formatNotificationTitle(nt.title)}
                   {/* A run against planted synthetic scenarios must never read
@@ -375,24 +364,43 @@ export function Topbar() {
                     {formatNotificationWhen(nt.when)}
                   </div>
                 )}
+              </>
+            );
+            return (
+              <div
+                key={nt.id}
+                className="flex gap-2.5 border-b border-border-faint px-3.5 py-[11px] hover:bg-[#141b25]"
+              >
+                <span
+                  className="mt-[5px] h-[7px] w-[7px] flex-none rounded-full"
+                  style={{ background: TONE[nt.tone], boxShadow: `0 0 7px ${TONE[nt.tone]}` }}
+                />
+                {/* The body is a real button when the row leads somewhere, so it
+                    sits in the Tab order beside Dismiss. As a div with an
+                    onClick, Tab skipped it, and the only thing the keyboard
+                    could do to a notification was make it disappear. */}
+                {nt.href ? (
+                  <button type="button" onClick={() => openNotif(nt)} className="min-w-0 flex-1 text-left">
+                    {body}
+                  </button>
+                ) : (
+                  <div className="min-w-0 flex-1">{body}</div>
+                )}
+                {/* No dismiss control on a finding the server says must not be
+                    silenceable from local storage: an audit record whose content no
+                    longer matches its own hash. */}
+                {nt.dismissible !== false && (
+                  <button
+                    onClick={() => handleDismiss(nt.id)}
+                    aria-label="Dismiss"
+                    className="flex flex-none self-start p-0.5 text-faint hover:text-text"
+                  >
+                    <X size={13} />
+                  </button>
+                )}
               </div>
-              {/* No dismiss control on a finding the server says must not be
-                  silenceable from local storage: an audit record whose content no
-                  longer matches its own hash. */}
-              {nt.dismissible !== false && (
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    handleDismiss(nt.id);
-                  }}
-                  aria-label="Dismiss"
-                  className="flex flex-none self-start p-0.5 text-faint hover:text-text"
-                >
-                  <X size={13} />
-                </button>
-              )}
-            </div>
-          ))}
+            );
+          })}
           <button
             onClick={() => {
               navigate('/notifications');
