@@ -43,3 +43,13 @@ repos:
 #     uv run mypy soc_ai
 #
 # CI runs the same check on PRs.
+
+  # The commit message follows ASD-STE100: no em dash, no en dash. Install
+  # the stage with `uv run pre-commit install --hook-type commit-msg`.
+  - repo: local
+    hooks:
+      - id: check-commit-msg
+        name: commit message has no em dash or en dash
+        entry: scripts/check-commit-msg.sh
+        language: script
+        stages: [commit-msg]

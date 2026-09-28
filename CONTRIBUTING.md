@@ -99,6 +99,22 @@ uv run pytest --override-ini "addopts=" --no-header -v -m browser tests/browser/
   Elasticsearch. Write tools always go through the human approval gate. Anything
   sent to the Oracle is sanitized first. Don't route around these.
 
+## Writing style
+
+Write prose in ASD-STE100 Simplified Technical English. This covers docs, changelog entries,
+release notes, UI strings, API hints and commit messages.
+
+- One topic per sentence. At most 20 words in an instruction, 25 in a description.
+- Active voice, present tense. Imperative for an instruction.
+- One term for one thing. Do not vary synonyms.
+- No em dash, no en dash, no parenthetical aside, no rhetorical contrast such as "not X but Y".
+- State the fact. Then state the reason, in a separate sentence.
+
+`tests/test_prose_style.py` fails when a prose file, a console string or a backend string gains an
+em dash or an en dash. `tests/prose_style_baseline.json` records the older counts. Lower a count
+when you remove a dash. The `commit-msg` hook rejects a dash in a commit message; install it with
+`uv run pre-commit install --hook-type commit-msg`.
+
 ## Architecture pointers
 
 - `docs/ARCHITECTURE.md`: the system shape.
