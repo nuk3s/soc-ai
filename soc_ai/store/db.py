@@ -67,9 +67,20 @@ async def run_migrations(engine: AsyncEngine) -> None:
     first statement on the connection. ``foreign_key_check`` is what stands in
     for enforcement meanwhile: an upgrade that leaves dangling references is
     rolled back rather than committed.
+
+    The explicit ``BEGIN`` is what makes that rollback mean anything. The
+    driver's implicit transaction only starts ahead of DML, so without it every
+    CREATE / ALTER in the chain commits the moment it runs while the version
+    stamp and the backfills are what ``rollback()`` undoes. A revision that
+    raises half-way (or a process killed inside the startup window) then leaves
+    a schema ahead of its stamp, and every later start fails on "table already
+    exists" until the store is restored. Opened here, the transaction holds the
+    whole chain: Alembic sees it as external and commits nothing on its own, so
+    a failed upgrade leaves the store exactly as it found it.
     """
     async with engine.connect() as conn:
         await conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        await conn.exec_driver_sql("BEGIN")
         try:
             await conn.run_sync(_upgrade_to_head)
             violations = (await conn.exec_driver_sql("PRAGMA foreign_key_check")).all()
