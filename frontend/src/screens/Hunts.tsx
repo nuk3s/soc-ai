@@ -29,6 +29,7 @@ import { TimeRangeFilter, type CustomRange } from '../components/TimeRangeFilter
 import { demoBlocked, useDemo } from '../lib/demo';
 import { rangeToSinceUntil } from '../lib/timeRange';
 import {
+  ApiError,
   bulkDeleteHunts,
   createHuntSchedule,
   deleteHunt,
@@ -392,27 +393,39 @@ function ScheduledHunts() {
     }
   };
 
+  // A refused toggle or delete must say so. Both routes are admin-only and the
+  // panel offers the controls to everyone, so an analyst's click is answered
+  // with a 403 — and this list is not polled, so nothing would ever correct a
+  // pill that silently stayed put while the schedule kept firing. The message
+  // lands in the same slot the add/edit form uses.
+  const writeFailure = (e: unknown, fallback: string): string => {
+    if (e instanceof ApiError && e.status === 403) return 'Only an admin can change schedules.';
+    return e instanceof Error ? e.message : fallback;
+  };
+
   const toggleEnabled = async (s: HuntSchedule) => {
     const blocked = demoBlocked(demo);
     if (blocked) { setFormErr(blocked); return; } // demo: no doomed write
+    setFormErr(null);
     try {
       await updateHuntSchedule(s.id, { enabled: !s.enabled });
-      reload();
-    } catch {
-      /* transient — the next poll reflects reality */
+    } catch (e: unknown) {
+      setFormErr(writeFailure(e, 'Could not update the schedule.'));
     }
+    reload();
   };
 
   const removeOne = async (id: number) => {
     const blocked = demoBlocked(demo);
     if (blocked) { setFormErr(blocked); setPendingDelete(null); return; } // demo: no doomed write
+    setFormErr(null);
     try {
       await deleteHuntSchedule(id);
-    } catch {
-      /* admin-gated / transient */
+      if (editing === id) resetForm();
+    } catch (e: unknown) {
+      setFormErr(writeFailure(e, 'Could not delete the schedule.'));
     }
     setPendingDelete(null);
-    if (editing === id) resetForm();
     reload();
   };
 

@@ -504,3 +504,53 @@ describe('Investigations saved-view chip is a toggle', () => {
     expect(age).toBeLessThan(24.1 * 3600_000);
   });
 });
+
+// A row opened only through a div's onClick. Nothing in it took focus and
+// nothing carried an href, so a keyboard or screen-reader user could not open
+// a run from the list, and a mouse user could not middle-click one into a new
+// tab or copy its address. The detection name is now a real link (Hosts and
+// Hunts already do this on their identifying cell) and the sortable headers
+// are buttons, so the sort is reachable without a pointer.
+describe('Investigations rows open without a mouse', () => {
+  it('links the detection name to the run', async () => {
+    listInvestigations.mockResolvedValue(list([row({ id: 'INV-1', name: 'ET SCAN Nmap' })]));
+    mount('/investigations');
+    const link = await screen.findByRole('link', { name: /ET SCAN Nmap/ });
+    expect(link.getAttribute('href')).toBe('/investigation/INV-1');
+    // The whole-row click stays for mouse users; the link's own click must not
+    // navigate twice or throw.
+    fireEvent.click(link);
+  });
+
+  it('links an earlier run to that run, not to the primary', async () => {
+    listInvestigations.mockResolvedValue(
+      list([
+        row({ id: 'INV-PRIMARY' }),
+        row({ id: 'INV-RETRY', status: 'error', verdict: 'untriaged', isPrimary: false }),
+      ]),
+    );
+    mount('/investigations');
+    await screen.findAllByText('GPL ICMP Large ICMP Packet');
+    fireEvent.click(screen.getByRole('button', { name: /1 earlier/ }));
+    const link = screen.getByRole('link', { name: /earlier run/ });
+    expect(link.getAttribute('href')).toBe('/investigation/INV-RETRY');
+  });
+
+  it('sorts from a header button', async () => {
+    listInvestigations.mockResolvedValue(
+      list([
+        row({ id: 'b', alertId: 'ev-b', name: 'Beta detection' }),
+        row({ id: 'a', alertId: 'ev-a', name: 'Alpha detection' }),
+      ]),
+    );
+    mount('/investigations');
+    await screen.findByText('Beta detection');
+    const header = screen.getByRole('button', { name: 'Sort by Detection' });
+    fireEvent.click(header);
+    // A new column starts ascending on this screen: Alpha before Beta, and the
+    // header carries the caret.
+    const names = screen.getAllByRole('link', { name: /detection$/ }).map((l) => l.textContent);
+    expect(names).toEqual(['Alpha detection', 'Beta detection']);
+    expect(header.textContent).toContain('↑');
+  });
+});

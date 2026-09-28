@@ -815,24 +815,54 @@ export function Investigations() {
               }
             />
           </div>
-          <div className={headerCls('name')} onClick={() => toggleSort('name')}>
+          <button
+            type="button"
+            aria-label="Sort by Detection"
+            className={`text-left uppercase ${headerCls('name')}`}
+            onClick={() => toggleSort('name')}
+          >
             Detection{caret('name')}
-          </div>
-          <div className={headerCls('verdict')} onClick={() => toggleSort('verdict')}>
+          </button>
+          <button
+            type="button"
+            aria-label="Sort by Verdict"
+            className={`text-left uppercase ${headerCls('verdict')}`}
+            onClick={() => toggleSort('verdict')}
+          >
             Verdict{caret('verdict')}
-          </div>
-          <div className={headerCls('conf')} onClick={() => toggleSort('conf')}>
+          </button>
+          <button
+            type="button"
+            aria-label="Sort by Conf"
+            className={`text-left uppercase ${headerCls('conf')}`}
+            onClick={() => toggleSort('conf')}
+          >
             Conf{caret('conf')}
-          </div>
-          <div className={headerCls('host')} onClick={() => toggleSort('host')}>
+          </button>
+          <button
+            type="button"
+            aria-label="Sort by Source → Dest"
+            className={`text-left uppercase ${headerCls('host')}`}
+            onClick={() => toggleSort('host')}
+          >
             Source → Dest{caret('host')}
-          </div>
-          <div className={headerCls('status')} onClick={() => toggleSort('status')}>
+          </button>
+          <button
+            type="button"
+            aria-label="Sort by Status"
+            className={`text-left uppercase ${headerCls('status')}`}
+            onClick={() => toggleSort('status')}
+          >
             Status{caret('status')}
-          </div>
-          <div className={headerCls('when')} onClick={() => toggleSort('when')}>
+          </button>
+          <button
+            type="button"
+            aria-label="Sort by When"
+            className={`text-left uppercase ${headerCls('when')}`}
+            onClick={() => toggleSort('when')}
+          >
             When{caret('when')}
-          </div>
+          </button>
           <div />
         </div>
 
@@ -920,9 +950,18 @@ export function Investigations() {
                 {/* A run against planted synthetic scenarios must never read
                     as a real one — badge it wherever the row appears. */}
                 {r.isSynthEval && <SyntheticEvalBadge />}
-                <span title={r.name} className="min-w-0 flex-1 truncate text-[13px] font-medium">
+                {/* A real link, not a span: the row's onClick serves the
+                    mouse, and this is what serves the keyboard, a screen
+                    reader, a middle-click and a copied address. */}
+                <Link
+                  to={`/investigation/${r.id}`}
+                  state={{ from: '/investigations' }}
+                  onClick={(e) => e.stopPropagation()}
+                  title={r.name}
+                  className="min-w-0 flex-1 truncate text-[13px] font-medium hover:text-accent"
+                >
                   {middleEllipsis(r.name)}
-                </span>
+                </Link>
                 {/* Why this row is NOT one the Dashboard tile counts. Without
                     it a run dismissed seconds earlier rendered exactly like a
                     live one, so the tile went nine, eight, seven while the list
@@ -1045,7 +1084,14 @@ export function Investigations() {
                       <div />
                       <div className="flex min-w-0 items-center gap-[7px] pl-3 text-faint">
                         <CornerDownRight size={12} className="flex-none" />
-                        <span className="truncate text-[12px]">earlier run</span>
+                        <Link
+                          to={`/investigation/${rt.id}`}
+                          state={{ from: '/investigations' }}
+                          onClick={(e) => e.stopPropagation()}
+                          className="truncate text-[12px] hover:text-accent"
+                        >
+                          earlier run
+                        </Link>
                         {rt.isSynthEval && <SyntheticEvalBadge />}
                       </div>
                       <div>{rt.fallback ? <PipelineErrorChip /> : rt.verdict === 'untriaged' ? <span className="text-faint">—</span> : <VerdictPill verdict={rt.verdict} />}</div>
