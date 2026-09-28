@@ -304,7 +304,7 @@ export function autoHuntOn(leads: readonly { hunt_queued?: boolean }[]): boolean
  *  pill yet. A new surface renders `LeadStatePill` instead: the pill states the
  *  state, the outcome and the sentence that explains both. */
 export function leadRowStatus(lead: { status: string; hunt_status?: string | null }): string {
-  if (lead.hunt_status && HUNT_DONE.has(lead.hunt_status)) return 'Hunted';
+  if (lead.hunt_status && !HUNT_RUNNING.has(lead.hunt_status)) return 'Hunted';
   return leadStatusLabel(lead.status);
 }
 

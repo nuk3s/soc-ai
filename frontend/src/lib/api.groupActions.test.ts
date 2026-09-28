@@ -27,7 +27,7 @@ const init = (): RequestInit => fetchMock.mock.calls[0][1] as RequestInit;
 const body = (): Record<string, unknown> =>
   JSON.parse(String(init().body)) as Record<string, unknown>;
 
-const GROUP = { name: 'ET SCAN Nmap', kind: 'suricata' };
+const GROUP = { name: 'ET SCAN Nmap', kind: 'suricata' } as const;
 
 describe('ackGroup', () => {
   it('sends the active OQL filter so the write stays scoped to the rows on screen', async () => {
