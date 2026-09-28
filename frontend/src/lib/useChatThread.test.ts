@@ -20,7 +20,7 @@ import type { ChatThread } from './api';
 import { loadChatDraft, saveChatDraft } from './chatDraft';
 import { useChatThread } from './useChatThread';
 
-const NET_ERR = 'Could not reach the server — please try again.';
+const NET_ERR = 'Could not reach the server. Try again.';
 const POLL_MS = 1500;
 
 /** A settled thread snapshot — no turn in flight, so the poll must not re-arm. */

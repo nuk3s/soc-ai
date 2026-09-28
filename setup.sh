@@ -63,7 +63,7 @@ trim(){ local s=$1; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"
 envsafe(){ local name v
   for name in "$@"; do v=${!name:-}
     if [[ $v == *\'* || $v == *\\* || $v == *$'\n'* ]]; then
-      die "$name contains a single quote, backslash or newline — .env can't carry it reliably; pick another value."
+      die "$name contains a single quote, a backslash or a newline. .env cannot carry that value reliably. Choose another value."
     fi
   done
 }
@@ -99,9 +99,9 @@ key_readable_by_container(){ local u g m
 make_key_readable(){
   if { [[ $(id -u) -eq 1000 ]] || chgrp 1000 certs/key.pem 2>/dev/null; } \
      && chmod 640 certs/key.pem 2>/dev/null; then return 0; fi
-  warn "certs/key.pem must be readable by the container's uid 1000 — relaxing it to 0644 (see the mounts note in docker-compose.yml)."
+  warn "certs/key.pem must be readable by the container's uid 1000. Relaxing it to 0644. See the mounts note in docker-compose.yml."
   chmod 644 certs/key.pem 2>/dev/null \
-    || warn "  couldn't change certs/key.pem — make it readable by uid 1000 yourself before the container starts."
+    || warn "  could not change certs/key.pem. Make it readable by uid 1000 before the container starts."
 }
 
 # Load a KEY=value config file. Only sets vars that aren't already in the
@@ -117,7 +117,7 @@ load_conf(){ local f=$1 line k v
     # Checked before the ${!k+x} test below: an indirect expansion of a name
     # bash can't hold (`export KEY=…`, a hyphen, a space) aborts the whole run
     # with bash's own one-line error and neither the file nor the line named.
-    [[ $k =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "$f: invalid key '$k' (expected KEY=value)"
+    [[ $k =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "$f: invalid key '$k'. Expected KEY=value."
     # An unquoted value ends at the first whitespace-then-#, the way dotenv and
     # compose read the .env this feeds — setup.conf.example annotates its lines
     # that way, and a comment carried into the value flipped API_AUTH_REQUIRED
@@ -460,7 +460,7 @@ if [[ $RECFG == y ]]; then
   # MaxMind GeoLite2 (GeoIP/ASN enrichment). Free key: https://www.maxmind.com/en/geolite2/signup
   # Documented in docs/DOCKER.md but previously missing here — GeoIP silently
   # no-ops without it.
-  ask MAXMIND_LICENSE_KEY "  MaxMind GeoLite2 license key (optional; the .mmdb files are copied by hand, see docs/BLOCKLISTS.md)" "${MAXMIND_LICENSE_KEY:-}"
+  ask MAXMIND_LICENSE_KEY "  MaxMind GeoLite2 license key, optional. Copy the .mmdb files by hand, see docs/BLOCKLISTS.md" "${MAXMIND_LICENSE_KEY:-}"
 
   echo
   info "Day-1 automation:"
@@ -715,7 +715,7 @@ yesno SEED "$_seed_q" y
 hr; ipshow=$(hostname -I 2>/dev/null | awk '{print $1}'); ipshow=${ipshow:-localhost}
 echo
 ok "${B}soc-ai is running.${N}"
-echo "    Open:     ${C}https://${ipshow}:${_port}/app${N}   (accept the self-signed cert on first visit)"
+echo "    Open:     ${C}https://${ipshow}:${_port}/app${N}   Accept the self-signed cert on the first visit."
 echo "    Sign in:  admin"
 if [[ $RECFG == y ]]; then
   echo "    Password: ${B}${BOOTSTRAP_ADMIN_PASSWORD}${N}    ← save this now; change it after first login"

@@ -229,10 +229,10 @@ describe('assignAlert write paths surface a failure instead of failing silently 
     const assignBtn = await screen.findByTitle('Assign to me');
     fireEvent.click(assignBtn);
 
-    await screen.findByText(`Failed to assign ${POLL_GROUP.name}`);
+    await screen.findByText(`Could not assign ${POLL_GROUP.name}`);
   });
 
-  // The message alone is not the fix. Every "Failed to …" from this screen went
+  // The message alone is not the fix. Every "Could not …" from this screen went
   // through the same helper as its successes, so a rejected write rendered with
   // the green check and the 6s auto-dismiss: an analyst who glanced at the
   // colour and looked away had no failure left to read. The toaster already
@@ -252,14 +252,14 @@ describe('assignAlert write paths surface a failure instead of failing silently 
       );
 
       fireEvent.click(await screen.findByTitle('Assign to me'));
-      const notice = await screen.findByText(`Failed to assign ${POLL_GROUP.name}`);
+      const notice = await screen.findByText(`Could not assign ${POLL_GROUP.name}`);
       const toast = notice.closest('[role="status"]');
       expect(toast?.querySelector('.lucide-triangle-alert')).toBeTruthy();
       expect(toast?.querySelector('.lucide-circle-check')).toBeNull();
 
       // Past the success/info auto-dismiss: a failure must still be there.
       await act(() => vi.advanceTimersByTimeAsync(6500));
-      expect(screen.queryByText(`Failed to assign ${POLL_GROUP.name}`)).toBeTruthy();
+      expect(screen.queryByText(`Could not assign ${POLL_GROUP.name}`)).toBeTruthy();
     } finally {
       vi.useRealTimers();
     }

@@ -47,7 +47,7 @@ esac
   python /opt/soc-ai/scripts/demo/mock_es.py --port 9200 \
     --fixtures /opt/soc-ai/soc_ai/demo/fixtures.json
   rc=$?
-  echo "demo-entrypoint: mock ES exited (rc $rc) — stopping the app" >&2
+  echo "demo-entrypoint: mock ES exited with rc $rc, stopping the app" >&2
   kill 1 2>/dev/null ) &
 
 # exec so uvicorn is PID 1 and receives the platform's SIGTERM directly for a

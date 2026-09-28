@@ -637,7 +637,7 @@ describe('LeadDetail when the read fails', () => {
       .mockResolvedValue(LEAD as never);
     mount();
     const retry = await screen.findByRole('button', { name: /retry/i });
-    expect(screen.getByText(/Couldn't load this lead/)).toBeTruthy();
+    expect(screen.getByText(/Could not load this lead/)).toBeTruthy();
     expect(screen.queryByText(/does not exist/)).toBeNull();
     expect(screen.queryByText(/No such lead/)).toBeNull();
     fireEvent.click(retry);

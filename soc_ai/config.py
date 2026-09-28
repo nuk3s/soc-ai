@@ -635,11 +635,13 @@ class Settings(BaseSettings):
         logging traceback. Normalise here and reject typos at load time instead.
         """
         if not isinstance(v, str):
-            raise ValueError(f"LOG_LEVEL must be a string, got {type(v).__name__}")
+            raise ValueError(f"LOG_LEVEL must be a string. The value has type {type(v).__name__}.")
         names = logging.getLevelNamesMapping()
         upper = v.strip().upper()
         if upper not in names:
-            raise ValueError(f"LOG_LEVEL must be one of: {', '.join(sorted(names))}; got {v!r}")
+            raise ValueError(
+                f"LOG_LEVEL must be one of: {', '.join(sorted(names))}. The value is {v!r}."
+            )
         return upper
 
     # --- Web UI / local store -------------------------------------------

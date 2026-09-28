@@ -2,7 +2,7 @@
 // the public demo used to answer the full user table and which secrets are set
 // to anyone. The screen's job is to render that refusal as POLICY, not as an
 // incident: it is the first thing a demo visitor who clicks Config ever sees,
-// and the alarm-red "Couldn't load this view" card read as breakage (it broke
+// and the alarm-red "Could not load this view" card read as breakage (it broke
 // the public browser smoke exactly that way — Check fitness never rendered,
 // because the whole pane was an error card).
 //
@@ -59,7 +59,7 @@ describe('Config under the demo read lock', () => {
     expect(await screen.findByText('Read-only demo')).toBeTruthy();
     // Both halves, because each alone is satisfiable by the wrong render:
     // the calm notice present, AND the alarm card absent.
-    expect(screen.queryByText(/Couldn't load this view/)).toBeNull();
+    expect(screen.queryByText(/Could not load this view/)).toBeNull();
   });
 
   it('keeps the alarm card for a real failed load', async () => {
@@ -69,7 +69,7 @@ describe('Config under the demo read lock', () => {
     vi.mocked(getConfig).mockRejectedValue(new ApiError('admin required', 403, 'admin_required'));
     mount();
 
-    expect(await screen.findByText(/Couldn't load this view/)).toBeTruthy();
+    expect(await screen.findByText(/Could not load this view/)).toBeTruthy();
     expect(screen.queryByText('Read-only demo')).toBeNull();
   });
 });

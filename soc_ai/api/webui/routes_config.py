@@ -981,17 +981,18 @@ def _egress_destinations(settings: Settings) -> list[dict[str, Any]]:
             # points off-box — most MISP instances are operator-run.
             "enabled": settings.misp_url is not None,
             "redaction": (
-                "external indicators only (internal IPs skipped); sends the MISP API key"
+                "external indicators only. The lookup skips internal IPs. Sends the MISP API key."
             ),
             "detail": (
                 (
-                    f"Indicator lookups against MISP at {misp_host}. This is a real "
+                    f"Indicator lookups go to MISP at {misp_host}. This is a real "
                     "egress only if that host is outside your network."
                 )
                 if settings.misp_url is not None
                 else (
-                    "MISP is not configured. When it is, indicator lookups go to that "
-                    "host, a real egress only if it is outside your network."
+                    "MISP is not configured. When it is, indicator lookups go to the "
+                    "MISP host. That is a real egress only if the host is outside your "
+                    "network."
                 )
             ),
         },
@@ -1000,12 +1001,12 @@ def _egress_destinations(settings: Settings) -> list[dict[str, Any]]:
             "label": "Release check (GitHub)",
             "enabled": bool(settings.update_check_enabled),
             "redaction": (
-                "none. Sends nothing about the deployment; fetches the latest "
+                "none. Sends nothing about the deployment. Fetches the latest "
                 "release tag from api.github.com."
             ),
             "detail": (
                 "Opt-in version check behind the Update button. Fetches release "
-                "metadata from api.github.com; nothing about this deployment leaves."
+                "metadata from api.github.com. Nothing about this deployment leaves."
             ),
         },
     ]

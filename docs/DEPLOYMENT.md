@@ -244,14 +244,14 @@ sudo firewall-cmd --reload
 ## 7. Audit-index role grant (one-time, on the SO manager)
 
 The default SO `analyst` role lacks `auto_configure` and `create_index` on
-`soc-ai-audit-*`, so every audit write from the orchestrator fails with a 403.
-You can verify that in `journalctl -u soc-ai`. A read-only investigation still
-completes, without its forensic trail. A write does not. soc-ai ships with
-`AUDIT_FAIL_CLOSED=true`, and under it every acknowledge, escalate-to-case and
-add-comment is aborted (`aborted: ...` in the tool result) until the grant
-exists, so nothing reaches Security Onion without an audit record. Run the
-script below before the first write-back. Only with `AUDIT_FAIL_CLOSED=false`
-is the event dropped and the action allowed through.
+`soc-ai-audit-*`. As a result, every audit write from the orchestrator fails with
+a 403. You can verify that in `journalctl -u soc-ai`. A read-only investigation
+still completes, without its forensic trail. A write does not. soc-ai ships with
+`AUDIT_FAIL_CLOSED=true`. Under that setting, soc-ai aborts every acknowledge,
+escalate-to-case and add-comment until the grant exists. The tool result reads
+`aborted: ...`. Nothing reaches Security Onion without an audit record. Run the
+script below before the first write-back. soc-ai drops the audit event and
+allows the action through only when `AUDIT_FAIL_CLOSED=false`.
 
 To unlock the audit index:
 
@@ -347,7 +347,7 @@ done           recommended_count=1 rounds=1
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `audit log write failed (event dropped) … indices:admin/auto_create … unauthorized for [analyst]` | The audit-index role grant is missing. Under `AUDIT_FAIL_CLOSED=true` (the default) every ack, escalate and comment is aborted until it lands, not just unlogged. | Run `scripts/setup-audit-index.sh` on the SO manager. |
+| `audit log write failed (event dropped) … indices:admin/auto_create … unauthorized for [analyst]` | The audit-index role grant is missing. `AUDIT_FAIL_CLOSED=true` is the default. Under it, soc-ai aborts every ack, escalate and comment until the grant lands. | Run `scripts/setup-audit-index.sh` on the SO manager. |
 | `ContextWindowExceededError … input_tokens 65537` | The accumulated tool results blew the 64K serving window. | Lower `AGENT_TOOL_CALLS_LIMIT`. Its default is 25. Or raise `SYNTHESIS_CONFIDENCE_FLOOR`, so the retask happens later. |
 | "writes fail with `Kratos login flow init failed`" | The Kratos auth prefix is wrong for SO 3.0. | Set `SO_KRATOS_PATH_PREFIX=/auth`. That is the default. A write uses the SO web API and the Kratos session, and not the Connect API. |
 | Service won't start after pulling new code | The venv is out of sync. | `cd /opt/soc-ai && uv sync && sudo systemctl restart soc-ai`. |

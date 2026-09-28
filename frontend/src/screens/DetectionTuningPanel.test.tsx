@@ -98,7 +98,7 @@ describe('DetectionTuningPanel muted-rules count', () => {
     getDetectionTuningMock.mockRejectedValue(new Error('grid unavailable'));
     fireEvent.click(screen.getByText('Un-mute'));
 
-    expect(await screen.findByText(/couldn't load this view/i)).toBeTruthy();
+    expect(await screen.findByText(/could not load this view/i)).toBeTruthy();
     expect(screen.getByText('Muted rules (1)')).toBeTruthy();
     expect(screen.queryByText(/this is not a claim that none are muted/i)).toBeNull();
   });

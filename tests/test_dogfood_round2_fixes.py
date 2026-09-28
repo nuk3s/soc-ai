@@ -202,6 +202,6 @@ def test_a_silent_host_says_it_was_not_seen() -> None:
     measured = _rate_dep("connection_rate", "work", value=0.0, median=85.0)
     measured.observed = {"value": 0.0, "sample_ids": []}
     assert _phrase(Kind.BELOW_BASELINE, silent).endswith(
-        "That is 0.0 times the median. The host was not seen at all in the window"
+        "That is 0.0 times the median. The sweep did not see the host in the window"
     )
     assert _phrase(Kind.BELOW_BASELINE, measured).endswith("That is 0.0 times the median")

@@ -492,7 +492,7 @@ async def test_too_many_candidate_files_is_an_error_not_a_sweep() -> None:
         )
     assert isinstance(result, dict)
     assert result["ok"] is False
-    assert "narrow window_minutes" in result["error"]
+    assert "Narrow window_minutes" in result["error"]
     assert mock_run.call_count == 1  # find only, no tcpdump
 
 

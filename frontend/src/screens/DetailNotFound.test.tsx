@@ -1,7 +1,7 @@
 // "Not found" is not "the backend is down" (dogfood B3, 2026-08-11).
 //
 // An unknown investigation / hunt / host id rendered the same alarm-red
-// "Couldn't load this view" card, with a Retry button, as a genuine outage — so
+// "Could not load this view" card, with a Retry button, as a genuine outage — so
 // the analyst opening a stale link could not tell whether the run had been
 // deleted or the grid had fallen over. These tests pin the split: a 404 gets a
 // calm not-found card with a way back to the list and NO retry; a 500 or a
@@ -106,7 +106,7 @@ describe('an unknown id is a calm answer, not an alarm', () => {
     // only useful if it names the thing.
     expect(card.textContent).toContain('INV-nope');
     expect(card.textContent).toMatch(/Back to Alerts/);
-    expect(screen.queryByText(/Couldn't load/i)).toBeNull();
+    expect(screen.queryByText(/Could not load/i)).toBeNull();
     expect(screen.queryByRole('button', { name: /retry/i })).toBeNull();
   });
 
@@ -114,7 +114,7 @@ describe('an unknown id is a calm answer, not an alarm', () => {
     vi.mocked(getHunt).mockImplementation(notFound);
     mountHunt();
     expect(await screen.findByText(/No such hunt/i)).toBeTruthy();
-    expect(screen.queryByText(/Couldn't load/i)).toBeNull();
+    expect(screen.queryByText(/Could not load/i)).toBeNull();
     expect(screen.queryByRole('button', { name: /retry/i })).toBeNull();
   });
 
@@ -122,7 +122,7 @@ describe('an unknown id is a calm answer, not an alarm', () => {
     vi.mocked(getDossier).mockImplementation(notFound);
     mountHost();
     expect(await screen.findByText(/No such host/i)).toBeTruthy();
-    expect(screen.queryByText(/Couldn't load/i)).toBeNull();
+    expect(screen.queryByText(/Could not load/i)).toBeNull();
     expect(screen.queryByRole('button', { name: /retry/i })).toBeNull();
   });
 });
@@ -157,7 +157,7 @@ describe('a later 404 never takes away a report already on screen', () => {
 
     expect(screen.getByTestId('investigation-report')).toBeTruthy();
     expect(screen.queryByText(/No such investigation/i)).toBeNull();
-    expect(screen.queryByText(/Couldn't load/i)).toBeNull();
+    expect(screen.queryByText(/Could not load/i)).toBeNull();
   });
 
   it('hunt: refreshing stale data on a deleted hunt keeps the report', async () => {
@@ -213,7 +213,7 @@ describe('a failed foreground refresh is marked, not swallowed', () => {
     // button really is the only way forward, and the copy promises nothing else.
     expect(screen.queryByText(/retrying/i)).toBeNull();
     // Still not the alarm card — the report was never taken away.
-    expect(screen.queryByText(/Couldn't load/i)).toBeNull();
+    expect(screen.queryByText(/Could not load/i)).toBeNull();
 
     // And a refresh that WORKS clears it. Nothing to dismiss by hand: the
     // marker is a statement about the last load, not a notification.
@@ -268,14 +268,14 @@ describe('a real failure still reads like one', () => {
   it('investigation: a 500 keeps the error card', async () => {
     vi.mocked(getInvestigation).mockImplementation(serverError);
     mountInvestigation();
-    expect(await screen.findByText(/Couldn't load/i)).toBeTruthy();
+    expect(await screen.findByText(/Could not load/i)).toBeTruthy();
     expect(screen.queryByText(/No such investigation/i)).toBeNull();
   });
 
   it('hunt: a client timeout keeps the error card and its Retry', async () => {
     vi.mocked(getHunt).mockImplementation(timedOut);
     mountHunt();
-    expect(await screen.findByText(/Couldn't load/i)).toBeTruthy();
+    expect(await screen.findByText(/Could not load/i)).toBeTruthy();
     expect(screen.getByRole('button', { name: /retry/i })).toBeTruthy();
     expect(screen.queryByText(/No such hunt/i)).toBeNull();
   });
@@ -283,7 +283,7 @@ describe('a real failure still reads like one', () => {
   it('host: a 500 keeps the error card', async () => {
     vi.mocked(getDossier).mockImplementation(serverError);
     mountHost();
-    await waitFor(() => expect(screen.getByText(/Couldn't load/i)).toBeTruthy());
+    await waitFor(() => expect(screen.getByText(/Could not load/i)).toBeTruthy());
     expect(screen.queryByText(/No such host/i)).toBeNull();
   });
 });
@@ -296,7 +296,7 @@ describe('the error card offers a way out of the outage', () => {
     // The one of the three detail screens that never wired it.
     vi.mocked(getInvestigation).mockImplementation(serverError);
     mountInvestigation();
-    await screen.findByText(/Couldn't load/i);
+    await screen.findByText(/Could not load/i);
     const before = vi.mocked(getInvestigation).mock.calls.length;
 
     fireEvent.click(screen.getByRole('button', { name: /retry/i }));
@@ -308,7 +308,7 @@ describe('the error card offers a way out of the outage', () => {
   it('host: Retry re-runs the fetch', async () => {
     vi.mocked(getDossier).mockImplementation(serverError);
     mountHost();
-    await waitFor(() => expect(screen.getByText(/Couldn't load/i)).toBeTruthy());
+    await waitFor(() => expect(screen.getByText(/Could not load/i)).toBeTruthy());
     const before = vi.mocked(getDossier).mock.calls.length;
 
     fireEvent.click(screen.getByRole('button', { name: /retry/i }));
@@ -318,7 +318,7 @@ describe('the error card offers a way out of the outage', () => {
   it('hunt: Retry re-runs the fetch', async () => {
     vi.mocked(getHunt).mockImplementation(timedOut);
     mountHunt();
-    await screen.findByText(/Couldn't load/i);
+    await screen.findByText(/Could not load/i);
     const before = vi.mocked(getHunt).mock.calls.length;
 
     fireEvent.click(screen.getByRole('button', { name: /retry/i }));

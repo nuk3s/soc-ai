@@ -79,11 +79,11 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
   -addext "subjectAltName=DNS:soc-ai.local,IP:<your-host-ip>" \
   -keyout ./certs/key.pem \
   -out    ./certs/cert.pem
-# The container runs as uid 1000 and must be able to READ these through a bind
-# mount that carries no ACLs. Keep the cert world-readable (0644). Give the
-# private key to gid 1000 and make it group-readable (0640) so it is readable
-# in the container without being world-readable on the host; if you cannot
-# chgrp on this host, 0644 is the fallback that still boots.
+# The container runs as uid 1000. It reads these files through a bind mount
+# that carries no ACLs. Keep the cert world-readable, mode 0644. Give the
+# private key to gid 1000 and make it group-readable, mode 0640. The container
+# can then read the key, and the host does not expose it to every user. If you
+# cannot chgrp on this host, use 0644. The container boots with that mode too.
 chmod 644 ./certs/cert.pem
 chgrp 1000 ./certs/key.pem && chmod 640 ./certs/key.pem
 ```
@@ -156,17 +156,17 @@ docker compose exec soc-ai python -m soc_ai doctor
 
 Open `https://<host>:8443/app` and log in as the bootstrap admin. The
 username is `admin`. Use `BOOTSTRAP_ADMIN_PASSWORD` from `.env` if you set it.
-Otherwise soc-ai generated the password at the first start and wrote it once to
+Otherwise soc-ai generates the password at the first start and writes it once to
 a sidecar file in the data volume, mode `0600`. Read it with:
 
 ```bash
 docker exec soc-ai cat /var/lib/soc-ai/data/bootstrap-admin-password.txt
 ```
 
-The container log names that file and holds no password. Only when the data
-directory was not writable at startup does the password go to the log instead;
+The container log names that file and holds no password. If the data directory
+is not writable at startup, the password goes to the log.
 `docker compose logs soc-ai` shows it then. Change the password after the first
-login, then delete the file if it is still there.
+login. Then delete the file if it is still there.
 
 The first visit prompts you to accept the self-signed certificate.
 
@@ -215,11 +215,11 @@ docker compose run --rm soc-ai python -m soc_ai blocklists refresh
 docker exec soc-ai python -m soc_ai blocklists refresh
 ```
 
-### GeoIP and ASN data is a manual download
+### GeoIP and ASN data
 
 No command in soc-ai downloads the MaxMind GeoLite2 databases. They need a MaxMind
-account, and they arrive as a tarball, so you fetch them yourself with your free
-license key and copy the two files into the `soc_ai_maxmind` volume:
+account, and they arrive as a tarball. Fetch them with your free license key. Then
+copy the two files into the `soc_ai_maxmind` volume:
 
 ```bash
 docker cp GeoLite2-City.mmdb soc-ai:/var/lib/soc-ai/maxmind/
@@ -227,10 +227,10 @@ docker cp GeoLite2-ASN.mmdb soc-ai:/var/lib/soc-ai/maxmind/
 docker compose restart soc-ai
 ```
 
-soc-ai opens the files at startup, so the restart matters, and the files must be
-readable by uid 1000 like every other mount. Without them GeoIP and ASN enrichment
-report nothing, and everything else still works. `MAXMIND_LICENSE_KEY` in `.env`
-triggers no download; the Data sources page only shows whether a key is on file.
+soc-ai opens the files at startup. The restart is necessary for that reason. Uid 1000
+must be able to read the files, the same as every other mount. Without them, GeoIP and
+ASN enrichment report nothing. Everything else still works. `MAXMIND_LICENSE_KEY` in
+`.env` triggers no download. The Data sources page only shows whether a key is on file.
 [BLOCKLISTS.md](BLOCKLISTS.md#maxmind-geoip) has the full procedure.
 
 ---
@@ -327,12 +327,12 @@ docker exec soc-ai rm /var/lib/soc-ai/data/backup.tar.gz
 ```
 
 The backup excludes the enrichment caches by default. Those caches are the
-blocklists, the MaxMind databases and the cloud prefixes, and they dwarf the DB.
-Add `--full` to include them. That is worth doing on an air-gapped host, where
-nothing can fetch them again.
+blocklists, the MaxMind databases and the cloud prefixes. They are much larger than
+the DB. Add `--full` to include them. Do that on an air-gapped host, where nothing
+can fetch them again.
 
 `soc-ai blocklists refresh` downloads the blocklists and the cloud prefixes again.
-The `.mmdb` files come back the way they arrived, by hand; see
+The `.mmdb` files come back by hand, the same way they arrived. See
 [Seeding enrichment data](#seeding-enrichment-data).
 
 #### Scheduling backups (with retention)
@@ -365,12 +365,11 @@ find "$DEST" -name 'soc-ai-backup-*.tar.gz' -type f -mtime "+$RETAIN_DAYS" -dele
 47 2 * * *  root  /usr/local/bin/soc-ai-backup.sh >/var/log/soc-ai-backup.log 2>&1
 ```
 
-Store the backups off the box, because they hold the decision-record signing key,
-the pinned sensor `known_hosts` and the full store (password hashes, encrypted
-secrets). The archive is written mode `0600` regardless of the umask; keep it that
-way wherever you copy it. The one-shot `bootstrap-admin-password.txt` is never
-packed. Test a restore at regular intervals. An untested backup is not a recovery
-plan.
+Store the backups off the box. They hold the decision-record signing key, the pinned
+sensor `known_hosts` and the full store. The store holds the password hashes and the
+encrypted secrets. soc-ai writes the archive with mode `0600`, whatever the umask.
+Keep that mode wherever you copy it. The archive never packs the one-shot
+`bootstrap-admin-password.txt`. Test a restore at regular intervals.
 
 Restore refuses every dangerous step without `--yes`. It does not overwrite an
 existing store, and it prints exactly what it would replace. It does not restore
@@ -451,7 +450,7 @@ ES_VERIFY_SSL=false        # Elasticsearch
 LITELLM_VERIFY_SSL=false   # LiteLLM gateway
 ```
 
-For SO, ES and MISP, point at the CA file instead. That is better than a disabled
+For SO, ES and MISP, point at the CA file. That is better than a disabled
 check. Bind-mount the CA into the container and reference it:
 
 ```ini
@@ -460,9 +459,9 @@ ES_CA_BUNDLE=/etc/soc-ai/es-ca.pem
 MISP_CA_BUNDLE=/etc/soc-ai/misp-ca.pem
 ```
 
-Add the `,Z` SELinux relabel suffix to a CA bind-mount, the same as the cert mounts
-do. The LiteLLM client takes no CA file. For it you use `LITELLM_VERIFY_SSL=false`,
-or a certificate that the container's public bundle already trusts.
+Add the `,Z` SELinux relabel suffix to a CA bind-mount, the same as the cert mounts.
+The LiteLLM client takes no CA file. For it, use `LITELLM_VERIFY_SSL=false` or a
+certificate that the container's public bundle already trusts.
 
 ### Port 8443 collides with Security Onion's own nginx
 
@@ -485,20 +484,21 @@ sudo firewall-cmd --add-port=9443/tcp --permanent && sudo firewall-cmd --reload
 Docker inserts its own iptables and nftables rules ahead of firewalld. The
 `"${SOC_AI_BIND:-0.0.0.0}:${SOC_AI_PORT:-8443}:8443"` mapping binds `0.0.0.0` by
 default. A published port is therefore reachable from any host that can route to
-this box, even if firewalld shows the port closed. `firewall-cmd --list-ports` does
-not list it, and adding or removing a firewalld rule does not change its
-reachability. To restrict who can reach the admin console, work at the Docker layer:
+this box. That holds even if firewalld shows the port closed.
+`firewall-cmd --list-ports` does not list it. A firewalld rule that you add or
+remove does not change its reachability. To restrict who can reach the admin
+console, work at the Docker layer:
 
-- **Bind a specific host IP** with `SOC_AI_BIND` in `.env`, so Docker does not
-  publish the port on every interface. Localhost only, behind a reverse proxy:
+- **Bind a specific host IP** with `SOC_AI_BIND` in `.env`. Docker then does not
+  publish the port on every interface. For localhost only, behind a reverse proxy:
 
   ```ini
-  SOC_AI_BIND=127.0.0.1    # host side; container still listens on :8443
+  SOC_AI_BIND=127.0.0.1    # host side. The container still listens on :8443
   ```
 
-  Or the address of your mgmt LAN: `SOC_AI_BIND=10.0.0.5`. `SOC_AI_PORT` stays a
-  plain port number. The container reads the same `.env`, and an `IP:PORT` value
-  there fails validation before the app listens.
+  For the address of your management LAN: `SOC_AI_BIND=10.0.0.5`. `SOC_AI_PORT`
+  stays a plain port number. The container reads the same `.env`. An `IP:PORT`
+  value there fails validation before the app listens.
 - Or add a rule to the `DOCKER-USER` iptables chain to filter source
   addresses. Docker evaluates that chain before its own publish rules.
 
@@ -547,7 +547,7 @@ an SSH key and not an ES or SO role.
 
 The systemd path can run a timer. The Docker stack ships no scheduler for the
 enrichment refresh. Without one, the blocklists and the cloud prefixes go stale.
-Add a host cron job, or any scheduler, that execs the refresh at an interval:
+Add a host cron job, or any scheduler, that runs the refresh at an interval:
 
 ```cron
 # /etc/cron.d/soc-ai-blocklists — weekly refresh, Sundays 03:17
@@ -652,5 +652,5 @@ again. See DEPLOYMENT.md §10.
 
 **Enrichment returns no GeoIP / ASN data**
 The `soc_ai_maxmind` volume has no `GeoLite2-City.mmdb` and `GeoLite2-ASN.mmdb`. No
-command fetches them, and `MAXMIND_LICENSE_KEY` alone changes nothing. Copy the files
-in as [Seeding enrichment data](#seeding-enrichment-data) shows, then restart.
+command fetches them. `MAXMIND_LICENSE_KEY` alone changes nothing. Copy the files in
+as [Seeding enrichment data](#seeding-enrichment-data) shows. Then restart.

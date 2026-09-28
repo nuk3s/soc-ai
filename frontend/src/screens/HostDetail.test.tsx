@@ -430,7 +430,7 @@ describe('HostDetail — an address the sweep has never seen', () => {
     // Config keys quoted at an analyst were the F5 finding; they are gone.
     expect(screen.queryByText(/dossier_min_events/)).toBeNull();
     expect(screen.queryByText(/dossier_lookback_days/)).toBeNull();
-    expect(screen.queryByText(/Couldn't load/i)).toBeNull();
+    expect(screen.queryByText(/Could not load/i)).toBeNull();
   });
 
   it('answers "is this address even monitored?" and offers the sweep', async () => {
@@ -892,7 +892,7 @@ describe('HostDetail — a sweep that came back blind does not report an address
     expect(screen.getByRole('button', { name: /sweep the network now/i })).toBeTruthy();
     // And the panel is still a panel, not an error wall: the page answers the
     // question it was opened to answer.
-    expect(screen.queryByText(/Couldn't load/i)).toBeNull();
+    expect(screen.queryByText(/Could not load/i)).toBeNull();
   });
 });
 
@@ -1834,7 +1834,7 @@ describe('HostDetail — a failed foreground refresh is marked, not swallowed', 
     // carries the one thing it was missing: that it is not current.
     expect(await screen.findByText(REFRESH_FAILED)).toBeTruthy();
     expect(screen.getByTestId('host-hero')).toBeTruthy();
-    expect(screen.queryByText(/Couldn't load/i)).toBeNull();
+    expect(screen.queryByText(/Could not load/i)).toBeNull();
     // Still the host whose URL this is: what went stale is the reading, not
     // which machine is being read.
     expect(within(screen.getByTestId('host-hero')).getAllByText(/blue/i).length).toBeGreaterThan(0);
@@ -2069,7 +2069,7 @@ describe('HostDetail — the activity row', () => {
     const everything = document.body.textContent?.match(/comes from the network sweep/gi) ?? [];
     expect(everything.length).toBe(1);
     // The dossier half is still the point of the page.
-    expect(screen.queryByText(/Couldn't load this host/i)).toBeNull();
+    expect(screen.queryByText(/Could not load this host/i)).toBeNull();
     expect(await row('role')).toBeTruthy();
     expect(screen.queryByTestId('host-peer-graph')).toBeNull();
   });
@@ -2202,7 +2202,7 @@ describe('HostDetail — the activity window', () => {
   it('hides the window controls on a page that has no activity to window', async () => {
     vi.mocked(getDossier).mockRejectedValue(new Error('boom'));
     mount();
-    await screen.findByText(/Couldn't load this host/i);
+    await screen.findByText(/Could not load this host/i);
     expect(screen.queryByRole('button', { name: /refresh host/i })).toBeNull();
   });
 });

@@ -238,8 +238,8 @@ function huntDisposition(
   if (worst >= 3) return { label: 'Malicious activity found', color: '#f85149' }; // high/critical
   if (worst === 2) return { label: 'Suspicious activity found', color: '#d29922' }; // medium
   if (worst === 1) return { label: 'Low-severity findings', color: '#d29922' }; // low
-  // No threat evidence. Gaps mean the objective couldn't be fully tested —
-  // an honest grey "couldn't see", never a green all-clear.
+  // No threat evidence. Gaps mean the objective could not be fully tested —
+  // an honest grey "could not see", never a green all-clear.
   // One phrase for a gap, here and on the hunts list. The two read differently
   // and an analyst had to decide whether they meant the same thing.
   if (gaps.length > 0) return { label: 'No threat observed · visibility gap', color: '#8b949e' };

@@ -686,8 +686,9 @@ async def _silent_hosts(
     """
     if len(present) >= RECENT_MAX_ENTITIES:
         notes.append(
-            f"{spec_id}: recent read returned {RECENT_MAX_ENTITIES} entities, "
-            "so absence is not silence; silent hosts were not scored"
+            f"{spec_id}: the recent read returned {RECENT_MAX_ENTITIES} entities. That is "
+            "the cap. A profiled host outside the answer can rank below the cut. "
+            "The sweep did not score silent hosts."
         )
         return {}
     zero = _zero_cells(_covered_cells(hours=hours, tz=tz))

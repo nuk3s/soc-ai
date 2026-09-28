@@ -40,7 +40,7 @@ import { LeadsStrip } from '../components/LeadsStrip';
 
 // request() collapses an HTTPException detail to its `hint`, so this IS the
 // 404's own wording from routes_dossier._require_ip. Matching it lets the screen
-// say "that is not an address" instead of "couldn't load", which is a different
+// say "that is not an address" instead of "could not load", which is a different
 // and much less useful thing to tell someone who mistyped a URL.
 const NOT_AN_IP = /keyed on IP addresses/i;
 

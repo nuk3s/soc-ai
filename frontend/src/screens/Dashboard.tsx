@@ -474,7 +474,7 @@ function EnrichmentPanel({
  * Three states share the `!summary` slot: loading (no error yet), errored
  * (a persistently rejecting `getPreflight`), and — once a summary lands —
  * green or degraded. The errored state is distinct so a dead read reads as
- * "couldn't tell", not as a "Checking…" that never resolves.
+ * "could not tell", not as a "Checking…" that never resolves.
  *
  * "Green" means BOTH counts are zero, not `status === 'green'`. The summary's
  * status is FAIL-driven server-side (the same exit_code semantics the CLI
@@ -528,7 +528,7 @@ function SetupHealthCard({
           // has, in fact, failed outright. Same honesty rationale as
           // `recheckFailed` below: say what isn't known rather than look
           // calm. Quiet styling (not danger-red), same as "Checking…" — this
-          // is "couldn't tell", not a confirmed degraded state.
+          // is "could not tell", not a confirmed degraded state.
           <div className="px-[15px] py-3 text-[13px] text-dim">The setup health read failed. The result is unknown.</div>
         ) : (
           <div className="px-[15px] py-3 text-[13px] text-dim">Checking setup health…</div>

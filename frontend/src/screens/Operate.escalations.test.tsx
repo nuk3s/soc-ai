@@ -11,7 +11,7 @@
 //
 // What the assertions below pin is the distinction the panel exists for. An
 // empty list must read as "every escalate has an answer" and NOT as a failed
-// read; a failed read must read as "couldn't tell" and NOT as an empty list;
+// read; a failed read must read as "could not tell" and NOT as an empty list;
 // and the count must be the ledger's, not the list's, because a capped list
 // reporting its own length is the same silent under-report all over again.
 import { render, screen, waitFor, within } from '@testing-library/react';
@@ -135,7 +135,7 @@ describe('Operate escalation-ledger panel', () => {
     mount();
     // The distinction the whole panel exists for, applied to the panel itself:
     // an absence must not be reported as an all-clear.
-    expect(await screen.findByText(/couldn't read the escalation ledger/i)).toBeInTheDocument();
+    expect(await screen.findByText(/could not read the escalation ledger/i)).toBeInTheDocument();
     expect(screen.queryByText(/all escalations have an answer/i)).toBeNull();
   });
 });

@@ -19,9 +19,9 @@
 
 soc-ai writes every LLM input, every LLM output and every tool invocation to a
 date-stamped ES audit index, `soc-ai-audit-YYYY.MM.dd`. That includes the
-read tools an MCP client calls through `python -m soc_ai.mcp_server`: each one
+read tools an MCP client calls through `python -m soc_ai.mcp_server`. Each call
 lands as a `tool_call` / `tool_result` pair under a `mcp-*` session id with
-`user=mcp`, so a grid query or IOC lookup made over stdio is as visible to
+`user=mcp`. A grid query or IOC lookup made over stdio is as visible to
 `soc-ai audit verify` as one the agent made. These hardening properties apply:
 
 - **Tamper-evidence through a hash chain.** Each record carries a monotonic

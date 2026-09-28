@@ -2,7 +2,7 @@
 //
 // Degraded-grid UI dogfood, 2026-08-14 (D2/D7/D16). Driven through four sick
 // grids, this screen printed "0 untriaged · 0 detections · 0 events in window"
-// above its own "Couldn't load this view" card, and a chip row of confident
+// above its own "Could not load this view" card, and a chip row of confident
 // zeros beside it. Every one of those numbers was unknown: the query 503'd and
 // the counts were derived from the empty array left behind. A false all-clear
 // on the top line an analyst scans first outranks any loud error, so these
@@ -94,7 +94,7 @@ describe('Alerts on a grid that refused the query (D2)', () => {
 
   it('does not report zero untriaged for a count it never obtained', async () => {
     mount();
-    await screen.findByText("Couldn't load this view");
+    await screen.findByText("Could not load this view");
 
     expect(headerLine()).not.toContain('0 untriaged');
     expect(headerLine()).toContain('— untriaged');
@@ -102,7 +102,7 @@ describe('Alerts on a grid that refused the query (D2)', () => {
 
   it('renders no badge on any view chip rather than a zero badge', async () => {
     mount();
-    await screen.findByText("Couldn't load this view");
+    await screen.findByText("Could not load this view");
 
     // The chips are still there — degrade the claim, not the screen.
     expect(chipTexts()).toEqual(['Mine', 'In review', 'Critical', 'Needs decision', 'All']);
@@ -111,7 +111,7 @@ describe('Alerts on a grid that refused the query (D2)', () => {
 
   it('does not report zero detections in the footer', async () => {
     mount();
-    await screen.findByText("Couldn't load this view");
+    await screen.findByText("Could not load this view");
 
     expect(footerLine()).not.toContain('0 detections');
     expect(footerLine()).toContain('— detections');
@@ -123,7 +123,7 @@ describe('the failed-view card (D16)', () => {
   it('offers a Retry that re-runs the query the card is about', async () => {
     vi.mocked(getAlerts).mockRejectedValue(gridDown());
     mount();
-    await screen.findByText("Couldn't load this view");
+    await screen.findByText("Could not load this view");
     expect(vi.mocked(getAlerts)).toHaveBeenCalledTimes(1);
 
     fireEvent.click(screen.getByText('Retry'));
@@ -142,7 +142,7 @@ describe('a Bulk Investigate that never started (D7)', () => {
 
   const clickBulkInvestigate = async () => {
     mount();
-    await screen.findByText("Couldn't load this view");
+    await screen.findByText("Could not load this view");
     fireEvent.click(screen.getByText('Bulk Investigate'));
   };
 
@@ -243,7 +243,7 @@ describe('a Bulk Investigate that never started (D7)', () => {
       }),
     );
     const { unmount } = mount();
-    await screen.findByText("Couldn't load this view");
+    await screen.findByText("Could not load this view");
     fireEvent.click(screen.getByText('Bulk Investigate'));
     unmount();
 
@@ -298,7 +298,7 @@ describe('Alerts whose refresh failed on top of rows it already has (D2 control)
 
     // A dependency change re-runs the query in the foreground; this one 503s.
     fireEvent.click(screen.getByText('Hide acknowledged'));
-    await screen.findByText("Couldn't load this view");
+    await screen.findByText("Could not load this view");
 
     expect(screen.getByText('ET SCAN Test Detection')).toBeTruthy();
     expect(headerLine()).toContain('1 detection');
@@ -320,7 +320,7 @@ describe('Alerts on a healthy grid with nothing in the window (D2 control)', () 
     expect(headerLine()).toBe('0 untriaged · 0 detections · 0 events in window');
     expect(footerLine()).toBe('0 detections · grouped · click a row to expand events');
     expect(chipTexts()).toEqual(['Mine0', 'In review0', 'Critical0', 'Needs decision0', 'All0']);
-    expect(screen.queryByText("Couldn't load this view")).toBeNull();
+    expect(screen.queryByText("Could not load this view")).toBeNull();
   });
 });
 
@@ -380,7 +380,7 @@ describe('Alerts telling a quiet grid apart from a filter that matched nothing',
     vi.mocked(getAlertsEmptyReason).mockRejectedValue(gridDown());
     mount();
     const zero = await screen.findByText('No detection matches this view in this window. Widen the time range.');
-    expect(screen.queryByText("Couldn't load this view")).toBeNull();
+    expect(screen.queryByText("Could not load this view")).toBeNull();
     expect(zero.parentElement?.getAttribute('data-empty-reason')).toBe('unchecked');
   });
 

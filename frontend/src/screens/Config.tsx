@@ -247,7 +247,7 @@ function ModelFitnessChip({
         <span
           data-testid="fitness-staged"
           className="text-[11px] text-faint"
-          title="The fitness check grades the analyst model the server is running. Apply this change first, then check."
+          title="The fitness check grades the analyst model that is running. Apply the model change first. Then check fitness."
         >
           Apply the change to check fitness
         </span>
@@ -2180,7 +2180,7 @@ export function Config() {
               epochs (amber, no checkmark — every restart's own trail checked
               out, but that is short of one unbroken chain; see
               auditChainDetail above), TAMPERED (red, its own line, never the
-              success line above it), and "couldn't verify" (amber — a
+              success line above it), and "could not verify" (amber — a
               network/permission failure must never read as any of the other
               four; a false all-clear outranks any 500, and a false alarm is
               nearly as costly). */}

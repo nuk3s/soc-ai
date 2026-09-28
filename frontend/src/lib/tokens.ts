@@ -41,7 +41,7 @@ export const VERDICT: Record<Verdict, VerdictMeta> = {
   true_positive: { label: 'True positive', color: '#f04438', bg: 'rgba(240,68,56,.10)', border: 'rgba(240,68,56,.32)', wash: 'rgba(240,68,56,.07)' },
   false_positive: { label: 'False positive', color: '#7ba893', bg: 'rgba(123,168,147,.10)', border: 'rgba(123,168,147,.32)', wash: 'rgba(123,168,147,.07)' },
   needs_more_info: { label: 'Needs info', color: '#f5a623', bg: 'rgba(245,166,35,.10)', border: 'rgba(245,166,35,.32)', wash: 'rgba(245,166,35,.07)' },
-  // Self-consistency vote didn't converge — "the model couldn't decide", a
+  // Self-consistency vote didn't converge — "the model could not decide", a
   // terminal hedge distinct from needs_more_info's "needs YOUR input" amber.
   // Gold matches the interrupted/warning tone used elsewhere (#d29922).
   inconclusive: { label: 'Inconclusive', color: '#d29922', bg: 'rgba(210,153,34,.10)', border: 'rgba(210,153,34,.32)', wash: 'rgba(210,153,34,.07)' },

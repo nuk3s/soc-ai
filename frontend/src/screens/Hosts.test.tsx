@@ -604,7 +604,7 @@ describe('Hosts — quiet-but-real census', () => {
     vi.mocked(listDossiers).mockRejectedValue(new Error('500 Internal Server Error'));
     mount();
 
-    expect(await screen.findByText(/couldn't load the host list/i)).toBeTruthy();
+    expect(await screen.findByText(/could not load the host list/i)).toBeTruthy();
     expect(screen.getByRole('button', { name: /retry/i })).toBeTruthy();
     expect(screen.queryByText(/hasn't run yet/i)).toBeNull();
     // Retry over an outage, not a verdict about a page that never arrived —

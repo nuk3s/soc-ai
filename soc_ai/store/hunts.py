@@ -501,7 +501,7 @@ async def reap_stale_pending_chat(db: AsyncSession) -> int:
         payload["status"] = "error"
         if not payload.get("content"):
             payload["content"] = (
-                "The assistant was interrupted (likely a restart) — please ask again."
+                "The assistant did not finish this turn. A restart is the likely cause. Ask again."
             )
         # Reassigned rather than mutated in place, so the JSON column is dirty.
         ev.payload = payload

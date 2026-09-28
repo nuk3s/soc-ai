@@ -374,7 +374,7 @@ async def test_reap_stale_pending_chat_resolves_orphaned_turns(settings_kratos: 
 
         by_id = {ev.id: ev for ev in await hunt_svc.list_chat_messages(db, hunt.id)}
         assert by_id[pending.id].payload["status"] == "error"
-        assert "interrupted" in by_id[pending.id].payload["content"]
+        assert "did not finish this turn" in by_id[pending.id].payload["content"]
         assert by_id[done.id].payload == {"content": "10.0.0.5", "status": "done"}
         assert not any(ev.payload.get("status") == "pending" for ev in by_id.values())
         # Nothing left to reap.

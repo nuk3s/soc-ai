@@ -271,7 +271,7 @@ def test_banner_on_config(page: Page, demo_mode_stack: dict) -> None:
     expect(page.get_by_text(_BANNER, exact=False).first).to_be_visible(timeout=_WAIT_MS)
     # Policy, not incident: the calm demo notice, and no outage card.
     expect(page.get_by_text("Read-only demo", exact=True).first).to_be_visible(timeout=_WAIT_MS)
-    expect(page.get_by_text("Couldn't load", exact=False)).not_to_be_visible()
+    expect(page.get_by_text("Could not load", exact=False)).not_to_be_visible()
 
 
 @pytest.mark.browser

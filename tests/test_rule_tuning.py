@@ -295,7 +295,7 @@ async def test_lookback_over_cap_is_an_error_without_a_query(
 
     assert out["error"] is True
     assert out["type"] == "ValueError"
-    assert out["message"] == "lookback_days must be <= 365, got 366"
+    assert out["message"] == "lookback_days must be at most 365. The value is 366."
     assert elastic.search.await_count == 0  # type: ignore[attr-defined]
 
 

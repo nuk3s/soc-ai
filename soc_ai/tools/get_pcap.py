@@ -278,7 +278,7 @@ def _stream_filtered(settings: Settings, remote_path: str, bpf: str) -> bytes:
         stderr = (proc.stderr or b"").decode(errors="replace").strip()[:200]
         if len(out) > _PCAP_HEADER_LEN:
             _LOGGER.warning(
-                "tcpdump on %s exit=%d after partial read (torn tail of the live file): %s",
+                "tcpdump on %s exit=%d after a partial read of the live file. stderr: %s",
                 remote_path,
                 proc.returncode,
                 stderr,
@@ -373,8 +373,8 @@ def fetch_pcap_bytes(
         return b""
     if len(files) > _MAX_PCAP_FILES:
         raise RuntimeError(
-            f"window spans {len(files)} so-pcap files on {settings.so_ssh_host} "
-            f"(max {_MAX_PCAP_FILES}); narrow window_minutes"
+            f"The window spans {len(files)} so-pcap files on {settings.so_ssh_host}. "
+            f"The limit is {_MAX_PCAP_FILES}. Narrow window_minutes."
         )
     _LOGGER.info(
         "pcap fetch: %d candidate file(s) for BPF %r on %s",
@@ -486,9 +486,9 @@ async def get_pcap_facts(
     # tcpdump rejects ``port 70000`` at BPF compile time with exit 1, which
     # must never be mistaken for "no packets matched" — refuse it here.
     if coerced_src_port is not None and not 0 <= coerced_src_port <= 65535:
-        return {"ok": False, "error": f"invalid src_port {src_port!r} (must be 0-65535)"}
+        return {"ok": False, "error": f"invalid src_port {src_port!r}: must be 0-65535"}
     if coerced_dst_port is not None and not 0 <= coerced_dst_port <= 65535:
-        return {"ok": False, "error": f"invalid dst_port {dst_port!r} (must be 0-65535)"}
+        return {"ok": False, "error": f"invalid dst_port {dst_port!r}: must be 0-65535"}
 
     # ------------------------------------------------------------------
     # Time window

@@ -597,7 +597,7 @@ export interface DryRunResult {
   /** Up to 5 ES `_id`s that matched — rendered as chips in the review pane. */
   sample_ids: string[];
   window_days: number;
-  /** Set when the dry run couldn't run at all (bad/whitelist-rejected OQL,
+  /** Set when the dry run could not run at all (bad/whitelist-rejected OQL,
    *  grid down) — the review pane shows this instead of a hit count. */
   error: string | null;
 }
@@ -1422,7 +1422,7 @@ export interface PreflightDetail {
 //
 // NOT fail-soft like the checks above: an unreachable or partially-read audit
 // index makes the backend RAISE (502/503) rather than answer, so a 200
-// response's `ok: false` always means TAMPERED, never "couldn't check" — a
+// response's `ok: false` always means TAMPERED, never "could not check" — a
 // caller must keep a thrown/rejected call and an `ok: false` result visually
 // distinct (never render a request failure as "tampered", and never render
 // tampered as success).

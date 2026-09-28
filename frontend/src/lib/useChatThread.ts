@@ -31,7 +31,7 @@ const POLL_MS = 1500;
 const POLL_MAX_FAILURES = 3;
 
 /** Shown as an assistant bubble when the transport itself fails. */
-const NET_ERR_TEXT = 'Could not reach the server — please try again.';
+const NET_ERR_TEXT = 'Could not reach the server. Try again.';
 
 /** Stable empty seed — a fresh array per render would say nothing new. */
 const NO_MESSAGES: ChatMessage[] = [];

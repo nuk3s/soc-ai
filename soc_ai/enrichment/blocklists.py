@@ -96,7 +96,8 @@ class BlocklistDB:
                 # not loaded, and the startup warning in
                 # build_local_enrichment_context tells the operator to refresh.
                 _LOGGER.warning(
-                    "blocklist source %s: cannot parse %s (%s: %s); treating as not loaded",
+                    "blocklist source %s: cannot parse %s. Error %s: %s. "
+                    "The source counts as not loaded",
                     source,
                     data_dir / filename,
                     type(e).__name__,
@@ -111,7 +112,7 @@ class BlocklistDB:
                 # answer, and blocklist_checked is derived from loaded_sources,
                 # so it must not read as "checked, clean".
                 _LOGGER.warning(
-                    "blocklist source %s: %s holds no indicators; treating as not loaded",
+                    "blocklist source %s: %s holds no indicators. The source counts as not loaded",
                     source,
                     data_dir / filename,
                 )
@@ -399,7 +400,7 @@ def _load_internal_seed(db: BlocklistDB, data_dir: Path) -> None:
                 # A bare `- 1.2.3.4` line is the common hand-editing slip; skip
                 # it rather than fail the whole seed list.
                 _LOGGER.warning(
-                    "internal_seed: skipping %s entry %r (expected a mapping)", attr, entry
+                    "internal_seed: skipped %s entry %r. The entry must be a mapping", attr, entry
                 )
                 continue
             indicator = str(entry.get("indicator") or "").strip()

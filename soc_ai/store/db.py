@@ -115,14 +115,14 @@ async def run_migrations(engine: AsyncEngine) -> None:
                 await conn.rollback()
                 tables = sorted({str(row[0]) for row in introduced})
                 raise RuntimeError(
-                    "store migration left rows that reference missing parents in "
-                    f"{', '.join(tables)}; the upgrade was rolled back"
+                    "The store migration left rows that reference missing parents in "
+                    f"{', '.join(tables)}. soc-ai rolled the upgrade back."
                 )
             if after:
                 tables = sorted({str(row[0]) for row in after})
                 _LOGGER.warning(
-                    "store holds %d row(s) that reference missing parents in %s; "
-                    "they predate this upgrade and were left in place",
+                    "store holds %d row(s) that reference missing parents in %s. "
+                    "The rows predate this upgrade. The upgrade left them in place",
                     len(after),
                     ", ".join(tables),
                 )

@@ -4,28 +4,28 @@
 #   $EDITOR setup.conf          # fill in the REQUIRED values below
 #   ./setup.sh --auto           # installs with no prompts
 #
-# Format is KEY=value, one per line. Lines starting with # are ignored, and so
-# is anything after a space-then-# on a value line — so quote a value that
-# itself contains ` #`, as KEY='value'. Anything you leave blank falls back to
-# the default shown.
+# The format is KEY=value, one per line. setup.sh ignores a line that starts
+# with #. It also ignores anything after a space-then-# on a value line. Quote a
+# value that contains ` #`, as KEY='value'. A blank value falls back to the
+# default shown.
 # setup.conf holds secrets — it is chmod 600 and gitignored; keep it private.
 
 # ── REQUIRED ──────────────────────────────────────────────────────────────────
 # Security Onion URL
 SO_HOST=https://your-so-grid
-# SO analyst login (also used for Elasticsearch)
+# SO analyst login. Elasticsearch uses the same login.
 SO_USERNAME=analyst@example.com
 # SO analyst password
 SO_PASSWORD=
 # your LiteLLM gateway
 LITELLM_BASE_URL=http://localhost:4000
-# a model your gateway serves (GET /v1/models) — REQUIRED for hunts to work
+# a model your gateway serves. GET /v1/models lists them. REQUIRED for hunts to work.
 ANALYST_MODEL=
 
 # ── Connection details (sensible defaults) ────────────────────────────────────
 # false for a self-signed Security Onion
 SO_VERIFY_SSL=false
-# Elasticsearch URL; blank = <SO_HOST>:9200
+# Elasticsearch URL. Blank = <SO_HOST>:9200
 ES_HOSTS=
 ES_VERIFY_SSL=false
 # gateway API key, if it requires one
@@ -46,15 +46,15 @@ WEBUI_ALERTS_QUERY=tags:alert OR event.kind:alert
 # backing indices and forces you to list Elastic Agent namespaces — omit
 # `.ds-logs-*-default-*` and system.auth/system.syslog vanish with no error.
 EVENTS_INDEX_PATTERN=logs-*
-# require login/token for the API (recommended)
+# require a login or token for the API. Recommended.
 API_AUTH_REQUIRED=true
 
 # ── Secrets (leave blank to auto-generate; fill in to pin a value) ────────────
-# Fernet key for encrypted secret overrides; auto-generated if blank
+# Fernet key for encrypted secret overrides. Auto-generated if blank.
 CONFIG_SECRET_KEY=
-# first admin password; auto-generated + printed if blank
+# first admin password. Auto-generated and printed if blank.
 BOOTSTRAP_ADMIN_PASSWORD=
 
 # ── TLS cert ──────────────────────────────────────────────────────────────────
-# IP/DNS put in the self-signed cert SAN; blank = this host's primary IP
+# IP or DNS name for the self-signed cert SAN. Blank = this host's primary IP.
 CERT_HOST=

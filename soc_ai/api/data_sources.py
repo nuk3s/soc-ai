@@ -99,8 +99,8 @@ def collect_data_sources(settings: Settings) -> list[DataSourceOut]:
             needs_key=False,
             key_configured=_secret_set(settings.maxmind_license_key),
             note=(
-                "No command downloads these. Copy GeoLite2-City.mmdb and "
-                "GeoLite2-ASN.mmdb into MAXMIND_DATA_DIR by hand, then restart."
+                "No command downloads these files. Copy GeoLite2-City.mmdb and "
+                "GeoLite2-ASN.mmdb into MAXMIND_DATA_DIR. Then restart soc-ai."
             ),
         )
     )

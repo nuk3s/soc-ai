@@ -182,9 +182,9 @@ def _validate_feed_body(feed: BlocklistFeed, content: bytes, data_dir: Path) -> 
             # provokes; any of them means "not this feed's format".
             return f"body does not parse as {feed.filename}: {e}"
         if feed.name in db.missing_sources:
-            return f"loader could not read {feed.filename}"
+            return f"the loader could not read {feed.filename}"
         if not (db.ips or db.domains or db.hashes):
-            return f"body parsed as {feed.filename} but contains no indicators"
+            return f"body parsed as {feed.filename} with no indicators"
         return None
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
@@ -263,7 +263,7 @@ async def refresh_blocklists(
             rejected = _validate_feed_body(feed, content, data_dir)
             if rejected is not None:
                 _LOGGER.warning(
-                    "blocklist refresh %s rejected: %s (keeping the existing file)",
+                    "blocklist refresh %s rejected: %s. The existing file stays in place",
                     feed.name,
                     rejected,
                 )

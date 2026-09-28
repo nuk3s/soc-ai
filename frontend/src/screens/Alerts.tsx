@@ -1067,7 +1067,7 @@ export function Alerts() {
         showAckMsg(ackMessage(r, g.name));
         setReloadKey((k) => k + 1);
       })
-      .catch(() => showAckMsg(`Failed to acknowledge ${g.name}`, 'danger'))
+      .catch(() => showAckMsg(`Could not acknowledge ${g.name}`, 'danger'))
       .finally(() => setAcking(false));
   };
 
@@ -1081,7 +1081,7 @@ export function Alerts() {
         showAckMsg(escalateMessage(r, g.name));
         setReloadKey((k) => k + 1);
       })
-      .catch(() => showAckMsg(`Failed to escalate ${g.name}`, 'danger'));
+      .catch(() => showAckMsg(`Could not escalate ${g.name}`, 'danger'));
   };
 
   // Toggle a single group's selection (keyboard `x`) into the same `selected`
@@ -1182,21 +1182,21 @@ export function Alerts() {
     if (blocked) { showAckMsg(blocked); return; }
     assignAlert(g.name)
       .then(() => setReloadKey((k) => k + 1))
-      .catch(() => showAckMsg(`Failed to assign ${g.name}`, 'danger'));
+      .catch(() => showAckMsg(`Could not assign ${g.name}`, 'danger'));
   };
   const release = (g: AlertGroup) => {
     const blocked = demoBlocked(demo);
     if (blocked) { showAckMsg(blocked); return; }
     assignAlert(g.name, true)
       .then(() => setReloadKey((k) => k + 1))
-      .catch(() => showAckMsg(`Failed to release ${g.name}`, 'danger'));
+      .catch(() => showAckMsg(`Could not release ${g.name}`, 'danger'));
   };
   const setTriage = (g: AlertGroup, state: TriageState) => {
     const blocked = demoBlocked(demo);
     if (blocked) { showAckMsg(blocked); return; }
     assignAlert(g.name, false, state)
       .then(() => setReloadKey((k) => k + 1))
-      .catch(() => showAckMsg(`Failed to update ${g.name}`, 'danger'));
+      .catch(() => showAckMsg(`Could not update ${g.name}`, 'danger'));
   };
 
   // The Verdict filter carries a synthetic 'pipeline_error' value (E1.2): a
@@ -1409,7 +1409,7 @@ export function Alerts() {
   // one — so the header, the view chips and the footer each printed a literal 0
   // for a count the screen never obtained. On a down grid that put
   // "0 untriaged · 0 detections · 0 events in window" directly above this
-  // screen's own "Couldn't load this view" card: a false all-clear, which is the
+  // screen's own "Could not load this view" card: a false all-clear, which is the
   // one thing worse than a loud error, sitting on the top line a tired analyst
   // scans first. Same convention (and the same shape) as the Dashboard's stat
   // cards: the real number once we have data — INCLUDING a genuine 0, because a
@@ -1802,7 +1802,7 @@ export function Alerts() {
                           // The selection is deliberately left standing so the
                           // same click retries it, as the group path does.
                           showAckMsg(
-                            err instanceof Error ? err.message : 'Failed to acknowledge the selected events',
+                            err instanceof Error ? err.message : 'Could not acknowledge the selected events',
                             'danger',
                           );
                         } finally {
@@ -2289,7 +2289,7 @@ export function Alerts() {
                       role="alert"
                       className="flex items-center gap-2.5 py-2.5 pl-[50px] pr-3.5 font-mono text-[11.5px] text-danger"
                     >
-                      <span className="min-w-0 truncate">Couldn't load this group's events. {eventsError[gk]}</span>
+                      <span className="min-w-0 truncate">Could not load the events for this group. {eventsError[gk]}</span>
                       <button
                         onClick={() => fetchFirstPage(g)}
                         className="flex-shrink-0 rounded-control border border-border-strong bg-surface-3 px-2 py-0.5 font-sans text-[11px] font-semibold text-text hover:border-accent"

@@ -521,9 +521,9 @@ export function HuntCatalogPanel() {
         catalog.error ? (
           // A persistently rejecting read must not sit under "Reading…"
           // forever — that looks like a load in flight when the read has
-          // failed outright. Quiet, not danger-red: this is "couldn't tell",
+          // failed outright. Quiet, not danger-red: this is "could not tell",
           // not a confirmed bad state. Same rule as the setup-health card.
-          <div className="px-[15px] py-3 text-[13px] text-dim">Couldn't read the hunt catalog.</div>
+          <div className="px-[15px] py-3 text-[13px] text-dim">Could not read the hunt catalog.</div>
         ) : (
           <LoadingState label="Reading the hunt catalog…" />
         )

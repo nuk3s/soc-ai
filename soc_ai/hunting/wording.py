@@ -175,7 +175,7 @@ def phrase(kind: Kind, departure: Any, *, window_hours: int = DEFAULT_RECENT_HOU
         # the two mean different things: say which one this is.
         observed = getattr(departure, "observed", None)
         if isinstance(observed, dict) and observed.get("silent"):
-            text += ". The host was not seen at all in the window"
+            text += ". The sweep did not see the host in the window"
         return text
     try:
         documents = int(count)

@@ -108,7 +108,7 @@ export function EscalationLedgerPanel() {
           // rows, and here the difference is the whole point: this surface
           // exists because an absence was being read as an all-clear.
           <div className="px-[15px] py-3 text-[13px] text-dim">
-            Couldn't read the escalation ledger.
+            Could not read the escalation ledger.
           </div>
         ) : (
           <LoadingState label="Reading the escalation ledger…" />

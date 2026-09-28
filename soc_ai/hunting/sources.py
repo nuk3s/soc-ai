@@ -262,7 +262,7 @@ async def _drop_from_leads(db: AsyncSession, lead_ids: Sequence[int], *, now: da
                 db,
                 lead.id,
                 reason="other",
-                note="The alert that formed this lead was re-triaged as a false positive.",
+                note="A later triage marked the alert that formed this lead as a false positive.",
                 by="soc-ai",
                 now=now,
             )

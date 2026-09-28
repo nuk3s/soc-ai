@@ -232,8 +232,8 @@ async def origin_chain(  # noqa: PLR0915 - one function reads as one procedure
             "error": True,
             "type": "ValueError",
             "message": (
-                f"lookback_minutes must be between 1 and {_MAX_LOOKBACK_MINUTES}, "
-                f"got {lookback_minutes}"
+                f"lookback_minutes must be between 1 and {_MAX_LOOKBACK_MINUTES}. "
+                f"The value is {lookback_minutes}."
             ),
         }
 

@@ -51,7 +51,7 @@ export function ErrorState({
       <span className="text-danger">
         <AlertTriangle size={20} />
       </span>
-      <div className="text-[13.5px] font-semibold text-text">Couldn't load {label}</div>
+      <div className="text-[13.5px] font-semibold text-text">Could not load {label}</div>
       {onRetry && (
         <button
           onClick={onRetry}
@@ -75,7 +75,7 @@ export function ErrorState({
  *
  * Same reasoning as NotFoundState below: the demo's admin-read lock (403
  * `demo_mode`, a security fix — the public demo used to answer the full user
- * table and which secrets are set) rendered as the alarm-red "Couldn't load
+ * table and which secrets are set) rendered as the alarm-red "Could not load
  * this view" card, so a visitor's first look at Config read as breakage. No
  * Retry: retrying a policy answers the same policy.
  */
@@ -98,7 +98,7 @@ export function DemoDisabledState({ what }: { what: string }) {
  * The id asked for isn't there — a calm answer, not an incident.
  *
  * Deliberately NOT the ErrorState: an unknown investigation/hunt/host id used
- * to render the same alarm-red "Couldn't load this view" card as a real outage,
+ * to render the same alarm-red "Could not load this view" card as a real outage,
  * so the analyst could not tell "this run doesn't exist" from "the grid is
  * down" (dogfood B3, 2026-08-11). Neutral chrome, and no Retry — retrying a
  * 404 just fails again. The way out is the list it came from.

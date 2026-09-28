@@ -431,7 +431,7 @@ async def test_init_store_reaps_pending_hunt_chat_turns(settings_kratos: Setting
         reaped = await db.get(HuntEvent, pend.id)
         assert reaped is not None
         assert reaped.payload["status"] == "error"
-        assert "interrupted" in reaped.payload["content"]
+        assert "did not finish this turn" in reaped.payload["content"]
         kept = await db.get(HuntEvent, done.id)
         assert kept is not None
         assert kept.payload["status"] == "done" and kept.payload["content"] == "kept"

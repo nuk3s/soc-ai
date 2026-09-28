@@ -517,7 +517,7 @@ describe('Operate hunt-catalog panel', () => {
   it('names a failed read instead of sitting on "Reading…" forever', async () => {
     vi.mocked(getHuntCatalog).mockRejectedValue(new Error('500'));
     mount();
-    expect(await screen.findByText(/couldn't read the hunt catalog/i)).toBeInTheDocument();
+    expect(await screen.findByText(/could not read the hunt catalog/i)).toBeInTheDocument();
     expect(screen.queryByText(/reading the hunt catalog/i)).toBeNull();
     expect(screen.queryByRole('listitem')).toBeNull();
   });

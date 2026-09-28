@@ -122,9 +122,9 @@ async def create_user_endpoint(request: Request, body: CreateUserIn) -> dict[str
             detail={
                 "reason": "no_session_user",
                 "hint": (
-                    "Creating a user requires an authenticated admin session; "
-                    "log in at /app/login (anonymous or bearer-token callers "
-                    "cannot create users)."
+                    "Creating a user requires an authenticated admin session. "
+                    "Log in at /app/login. Anonymous callers and bearer-token "
+                    "callers cannot create users."
                 ),
             },
         )
@@ -283,9 +283,9 @@ async def set_user_role_endpoint(
             detail={
                 "reason": "no_session_user",
                 "hint": (
-                    "Changing a role requires an authenticated admin session; "
-                    "log in at /app/login (anonymous or bearer-token callers "
-                    "cannot change roles)."
+                    "Changing a role requires an authenticated admin session. "
+                    "Log in at /app/login. Anonymous callers and bearer-token "
+                    "callers cannot change roles."
                 ),
             },
         )

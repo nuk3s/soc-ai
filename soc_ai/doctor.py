@@ -387,7 +387,7 @@ async def check_upstream_reachability(settings: Settings) -> list[CheckResult]:
 # FTS5 and are stamped applied anyway, so a store first migrated on such a
 # Python keeps its head but never gets the index, and nothing retries it later.
 _FTS_TABLES: dict[str, str] = {
-    "runbook_fts": "runbook search falls back to the legacy keyword ranker",
+    "runbook_fts": "runbook search uses the legacy keyword ranker",
     "chat_memory_fts": "chat memory retrieval returns nothing",
 }
 
@@ -474,13 +474,13 @@ async def check_store(settings: Settings) -> list[CheckResult]:
                     CheckResult(
                         "store fts5",
                         "WARN",
-                        f"SQLite has FTS5 but the store has no {' or '.join(missing)}. The "
-                        "store was migrated on a Python without FTS5, so the index was "
-                        f"skipped: {'; '.join(_FTS_TABLES[name] for name in missing)}.",
+                        f"The store has no {' or '.join(missing)}. SQLite has FTS5 now. "
+                        "A Python without FTS5 migrated the store. The migration skipped "
+                        f"the index. Effect: {'; '.join(_FTS_TABLES[name] for name in missing)}.",
                         hint="The app still works. Migrations 0017 and 0018 create the index "
-                        "only when SQLite has FTS5 at that moment and never retry. Back up "
-                        "the store, then re-create the missing tables and their triggers "
-                        "with the DDL in those two revisions.",
+                        "only when SQLite has FTS5 at migration time. They do not retry later. "
+                        "Back up the store. Then re-create the missing tables and their "
+                        "triggers with the DDL in those two revisions.",
                     )
                 )
             elif has_fts5:
@@ -1606,7 +1606,8 @@ async def run_doctor(
         if applied:
             cfg.detail += (
                 f" The config console holds {len(applied)} saved non-secret setting(s): "
-                f"{', '.join(sorted(applied))}. Saved secrets apply but are not listed."
+                f"{', '.join(sorted(applied))}. Saved secrets also apply. This list does not "
+                "show them."
             )
     else:
         results.append(CheckResult("config", "PASS", "settings loaded"))

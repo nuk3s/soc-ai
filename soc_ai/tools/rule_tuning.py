@@ -205,7 +205,9 @@ async def suggest_rule_tuning(
         return {
             "error": True,
             "type": "ValueError",
-            "message": f"lookback_days must be <= {_MAX_LOOKBACK_DAYS}, got {lookback_days}",
+            "message": (
+                f"lookback_days must be at most {_MAX_LOOKBACK_DAYS}. The value is {lookback_days}."
+            ),
         }
 
     query = _rule_disposition_query(rule_name, lookback_days, provenance)

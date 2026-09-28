@@ -1156,7 +1156,7 @@ async def test_a_saturated_recent_read_does_not_score_absent_hosts_as_silent(
 
     assert sweep.fired == ()
     assert not [r for r in sweep.results if r.entity_key == _SWITCH], sweep.results
-    assert any("absence is not silence" in note for note in sweep.notes), sweep.notes
+    assert any("did not score silent hosts" in note for note in sweep.notes), sweep.notes
     await engine.dispose()
 
 
