@@ -32,10 +32,10 @@ dependencies = [
     # The slim distribution with only the OpenAI extra: the agent talks to
     # LiteLLM and the Oracle through the OpenAI-compatible client and imports
     # nothing else from the provider set. The full `pydantic-ai` meta-package
-    # pulls every provider SDK (Anthropic, Bedrock, Google, Cohere, Groq,
-    # Mistral, xAI, Temporal, Logfire, ...) into the image and the lockfile:
-    # ~80 packages nothing here imports, and where the advisory-flagged
-    # transitive pins (pyasn1, google-auth, authlib) came from.
+    # pulls every provider SDK it supports, plus Temporal and Logfire, into
+    # the image and the lockfile: ~80 packages nothing here imports, and where
+    # the advisory-flagged transitive pins (pyasn1, google-auth, authlib)
+    # came from.
     "pydantic-ai-slim[openai]>=1.0,<2",
     # mcp 2.x is a split package (mcp + mcp-types) that removes
     # `mcp.server.fastmcp`: the module is a stub that raises ModuleNotFoundError
