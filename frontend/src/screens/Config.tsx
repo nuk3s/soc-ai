@@ -1,5 +1,5 @@
 import { ChevronRight, Key, ShieldAlert, Users } from 'lucide-react';
-import { Fragment, useEffect, useMemo, useState } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import type { ReactNode } from 'react';
 import { ApplyBadge, RoleChip, SourceBadge, StatusTag } from '../components/Badges';
@@ -230,16 +230,28 @@ function _fitnessView(f: ModelFitness): FitnessView | null {
 function ModelFitnessChip({
   fitness,
   loading,
+  staged,
   onCheck,
 }: {
   fitness: ModelFitness | null;
   loading: boolean;
+  /** true = the selected model is a pending edit the server is not running yet. */
+  staged: boolean;
   onCheck: () => void;
 }) {
   const view = fitness ? _fitnessView(fitness) : null;
   return (
     <div className="flex items-center gap-2">
       {loading && <span className="text-[11px] text-faint">Checking fitness…</span>}
+      {!loading && staged && (
+        <span
+          data-testid="fitness-staged"
+          className="text-[11px] text-faint"
+          title="The fitness check grades the analyst model the server is running. Apply this change first, then check."
+        >
+          Apply the change to check fitness
+        </span>
+      )}
       {!loading && view && (
         <span
           data-testid="fitness-chip"
@@ -279,7 +291,7 @@ function ModelFitnessChip({
         type="button"
         className="rounded border border-border bg-surface-2 px-2 py-0.5 text-[11px] font-medium hover:bg-surface-3 transition-colors disabled:opacity-50"
         onClick={onCheck}
-        disabled={loading}
+        disabled={loading || staged}
       >
         Check fitness
       </button>
@@ -304,6 +316,7 @@ function _batteryAge(iso: string | null): string {
 function ModelBatteryPanel({
   battery,
   running,
+  startError,
   demo,
   onRun,
   onRunAll,
@@ -312,6 +325,8 @@ function ModelBatteryPanel({
 }: {
   battery: ModelBatteryStatus | null;
   running: boolean;
+  /** Why the last start request was refused ('' = it was not). */
+  startError: string;
   demo: boolean;
   onRun: () => void;
   onRunAll: () => void;
@@ -403,6 +418,11 @@ function ModelBatteryPanel({
       {!running && battery?.error && (
         <span className="max-w-[280px] truncate text-[11px] text-danger" title={battery.error}>
           The full check failed: {battery.error}
+        </span>
+      )}
+      {!running && startError && (
+        <span className="max-w-[280px] truncate text-[11px] text-danger" title={startError}>
+          The full check could not start: {startError}
         </span>
       )}
     </div>
@@ -501,21 +521,38 @@ export function Config() {
 
   // ── Analyst-model fitness (E1.1) ───────────────────────────────────────────
   // A model that LISTS on the gateway can still be unfit (all-fallback verdicts).
-  // We grade it: on the analyst-model dropdown changing (or a manual "Check
-  // fitness"), fire the probe and show the grade inline. Strictly non-blocking —
-  // it NEVER gates Apply; a fetch error shows nothing (neutral), never an error.
+  // We grade it: on the page loading, on an Apply that changes the analyst
+  // model, or on a manual "Check fitness", fire the probe and show the grade
+  // inline. Strictly non-blocking — it NEVER gates Apply; a fetch error shows
+  // nothing (neutral), never an error.
   const [fitness, setFitness] = useState<ModelFitness | null>(null);
   const [fitnessLoading, setFitnessLoading] = useState(false);
   // The analyst model currently selected (staged edit wins over the server value).
-  const currentAnalystModel =
-    staged['analyst_model'] ??
-    data?.groups.flatMap((g) => g.items).find((i) => i.key === 'analyst_model')?.value ??
-    '';
+  const appliedAnalystModel = String(
+    data?.groups.flatMap((g) => g.items).find((i) => i.key === 'analyst_model')?.value ?? '',
+  );
+  const currentAnalystModel = staged['analyst_model'] ?? appliedAnalystModel;
+  // The probe takes no model of its own: it grades the analyst model the server
+  // is RUNNING. So a staged, unapplied pick cannot be graded — the chip would
+  // show the applied model's grade beside a different name, the one verdict it
+  // exists to prevent. While the pick is staged the chip offers the check for
+  // after Apply instead.
+  const analystStaged = currentAnalystModel !== appliedAnalystModel;
+  // The model the chip sits beside. A probe answer names the model it graded;
+  // an answer for any other model (a slow manual check that lands after the
+  // dropdown moved on) is dropped rather than shown under the wrong name.
+  const fitnessModelRef = useRef('');
+  const acceptFitness = (r: ModelFitness) =>
+    setFitness(r.model && r.model !== fitnessModelRef.current ? null : r);
 
   const runFitness = (force = false) => {
+    if (analystStaged) {
+      setFitness(null);
+      return;
+    }
     setFitnessLoading(true);
     getModelFitness(force)
-      .then((r) => setFitness(r))
+      .then(acceptFitness)
       // Fail-soft: a probe/gateway/permission error must not surface as an error
       // chip — clear the stale grade and stay neutral.
       .catch(() => setFitness(null))
@@ -525,8 +562,22 @@ export function Config() {
   // ── Fitness battery (design spec 2026-08-05) ────────────────────────────
   const [battery, setBattery] = useState<ModelBatteryStatus | null>(null);
   const batteryModel = String(currentAnalystModel);
+  // Why the start request itself was refused (a 5xx, a permission error) —
+  // distinct from battery.error, which the server reports about a run that did
+  // start. Shown under the buttons so a refused click is not a silent one.
+  const [batteryStartError, setBatteryStartError] = useState('');
+  // Bumped after every start request so the effect below re-arms its poll.
+  // The loop only re-arms itself while the server says running, and the mount
+  // poll of an idle model leaves no timer behind — so without this, a run
+  // started from the buttons was never polled and its result never appeared.
+  const [batteryPollNonce, setBatteryPollNonce] = useState(0);
+  // The model the battery on screen belongs to: the result is cleared only
+  // when this changes, never on a plain re-arm.
+  const batteryModelRef = useRef('');
 
   // Load the stored result for the selected model; keep polling while running.
+  // The server's answer is the only source of `running` — the effect's cleanup
+  // cancels the previous loop, so there is never more than one timer.
   useEffect(() => {
     if (!batteryModel) return;
     let cancelled = false;
@@ -542,24 +593,30 @@ export function Config() {
           if (!cancelled) setBattery(null);
         });
     };
-    setBattery(null); // model changed — a stale battery result would mislead
+    if (batteryModelRef.current !== batteryModel) {
+      batteryModelRef.current = batteryModel;
+      setBattery(null); // model changed — a stale battery result would mislead
+      setBatteryStartError('');
+    }
     poll();
     return () => {
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, [batteryModel]);
+  }, [batteryModel, batteryPollNonce]);
 
   const runBattery = () => {
+    setBatteryStartError('');
     startModelBattery(batteryModel)
-      .then(() => getModelBattery(batteryModel))
-      .then((r) => setBattery(r))
-      // 409 (already running) also lands here: the poll below re-syncs.
-      .catch(() => getModelBattery(batteryModel).then(setBattery).catch(() => undefined))
-      .finally(() => {
-        // Kick the polling effect even if the effect's timer already fired.
-        setBattery((b) => (b ? { ...b, running: true } : b));
-      });
+      .catch((e: unknown) => {
+        // 409 = one is already running; the re-sync below simply picks it up.
+        if (e instanceof ApiError && e.status === 409) return;
+        setBatteryStartError(e instanceof Error ? e.message : String(e));
+      })
+      // Whatever the answer, re-sync from the server rather than assume: a
+      // refused start then settles back to idle instead of freezing the panel
+      // in a run that never began.
+      .finally(() => setBatteryPollNonce((n) => n + 1));
   };
 
   // Does the CURRENT state (staged edit wins over server value) already match
@@ -598,22 +655,30 @@ export function Config() {
   // Auto-run (debounced) whenever the selected analyst model changes. The grade
   // is model-specific, so a stale grade for the previous model would mislead —
   // clear it immediately, then re-probe after a short settle so rapid dropdown
-  // changes don't spam the gateway.
+  // changes don't spam the gateway. A staged pick is cleared but not probed
+  // (see analystStaged); it is probed once Apply makes it the running model.
+  // The cleanup cancels a probe still in flight, so its answer cannot land on
+  // a chip that has since moved to another model.
   useEffect(() => {
+    fitnessModelRef.current = String(currentAnalystModel);
     if (!currentAnalystModel) return;
     setFitness(null);
+    if (analystStaged) return;
+    let cancelled = false;
     const t = setTimeout(() => {
-      let cancelled = false;
       setFitnessLoading(true);
       getModelFitness()
-        .then((r) => { if (!cancelled) setFitness(r); })
+        .then((r) => { if (!cancelled) acceptFitness(r); })
         .catch(() => { if (!cancelled) setFitness(null); })
         .finally(() => { if (!cancelled) setFitnessLoading(false); });
-      return () => { cancelled = true; };
     }, 600);
-    return () => clearTimeout(t);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+      setFitnessLoading(false);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentAnalystModel]);
+  }, [currentAnalystModel, analystStaged]);
 
   const dirtyKeys = Object.keys(staged);
   const isDirty = dirtyKeys.length > 0;
@@ -1207,11 +1272,13 @@ export function Config() {
           <ModelFitnessChip
             fitness={fitness}
             loading={fitnessLoading}
+            staged={analystStaged}
             onCheck={() => runFitness(true)}
           />
           <ModelBatteryPanel
             battery={battery}
             running={!!battery?.running}
+            startError={batteryStartError}
             demo={demo}
             onRun={runBattery}
             onRunAll={runAllChecks}
@@ -1262,8 +1329,9 @@ export function Config() {
         </div>
       );
     } else if (s.key === 'analyst_model') {
-      // No gateway list (gateway down / empty) — keep the free-text field, but
-      // still offer the fitness check on whatever id is typed.
+      // No gateway list (gateway down / empty) — keep the free-text field, with
+      // the same fitness chip: it grades the applied id, so a typed id gets its
+      // check once it is applied.
       control = (
         <div className="flex flex-col items-end gap-1.5">
           <input
@@ -1275,11 +1343,13 @@ export function Config() {
           <ModelFitnessChip
             fitness={fitness}
             loading={fitnessLoading}
+            staged={analystStaged}
             onCheck={() => runFitness(true)}
           />
           <ModelBatteryPanel
             battery={battery}
             running={!!battery?.running}
+            startError={batteryStartError}
             demo={demo}
             onRun={runBattery}
             onRunAll={runAllChecks}
