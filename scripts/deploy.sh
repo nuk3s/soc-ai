@@ -37,7 +37,7 @@ rsync -az --delete \
   --exclude='node_modules/' --exclude='.git/' \
   --exclude='.coverage*' --exclude='.pytest_cache/' --exclude='.mypy_cache/' \
   --exclude='.ruff_cache/' --exclude='__pycache__/' --exclude='.worktrees/' \
-  --exclude='.superpowers/' --exclude='.claude/' --exclude='.remember/' \
+  --exclude='.superpowers/' --exclude='.remember/' \
   ./ "${TARGET}:${DEST}/"
 
 # Rebuild + replace the container, then wait for the app to answer on 8443.

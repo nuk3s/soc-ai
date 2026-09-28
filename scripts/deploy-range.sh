@@ -60,7 +60,7 @@ rsync -az --delete \
   --exclude='.cache/' \
   --exclude='.coverage*' --exclude='.pytest_cache/' --exclude='.mypy_cache/' \
   --exclude='.ruff_cache/' --exclude='__pycache__/' --exclude='.worktrees/' \
-  --exclude='.superpowers/' --exclude='.claude/' --exclude='.remember/' \
+  --exclude='.superpowers/' --exclude='.remember/' \
   ./ "${TARGET}:${DEST}/"
 
 # Ownership, reinstall, restart, then WAIT for a real answer. A restart that
