@@ -15,10 +15,13 @@ and :func:`running_auto_hunts` counts the hunts it already has in flight.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
+from weakref import WeakValueDictionary
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from soc_ai.store.leads import HUNT_RUNNING_STATUSES
@@ -37,6 +40,29 @@ __all__ = [
 # hunt the loop began reads as the loop's on every surface, and the cap below
 # can tell its own hunts from an analyst's.
 AUTO_HUNT_ACTOR = "auto-hunt"
+
+# One lock per lead, held from the read of the lead to the mark. The console
+# awaits the hunt row and the first event before it answers with an id, and
+# the lead is marked only after that. A second start that read the lead in
+# that window found no hunt id, ran a second agent, and then wrote its id
+# over the first one's, so the first hunt ran on with no lead pointing at it.
+# The analyst's click and the loop's wake are the two callers that meet here.
+# A WeakValueDictionary drops a lead's lock once no start holds it, so the map
+# does not keep an entry for every lead ever hunted.
+_STARTS: WeakValueDictionary[int, asyncio.Lock] = WeakValueDictionary()
+
+
+def _start_lock(lead_id: int) -> asyncio.Lock:
+    """The lock two starts of one lead share.
+
+    The get-or-create never awaits, so two coroutines racing for the same lead
+    cannot interleave here and always receive the same lock.
+    """
+    lock = _STARTS.get(lead_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _STARTS[lead_id] = lock
+    return lock
 
 
 @dataclass(frozen=True)
@@ -88,11 +114,21 @@ async def start_lead_hunt(state: Any, *, lead_id: int, started_by: str) -> LeadH
     finished hunt stays as history and the lead moves to the new one. A hunt
     id with no row is treated as running: the console writes the row before
     it reports the id, so the id is the record that a start is under way.
+
+    The read, the console start and the mark run under one lock per lead, so
+    a start that lands while another is between the read and the mark waits
+    for it and then reads the hunt it left, rather than starting its own.
     """
+    lead_id = int(lead_id)
+    async with _start_lock(lead_id):
+        return await _start_lead_hunt(state, lead_id=lead_id, started_by=started_by)
+
+
+async def _start_lead_hunt(state: Any, *, lead_id: int, started_by: str) -> LeadHuntStart:
+    """The body of :func:`start_lead_hunt`, run with the lead's lock held."""
     from soc_ai.store import leads as leads_store  # noqa: PLC0415 - lazy
     from soc_ai.webui import hunt_console_manager as hcm  # noqa: PLC0415 - lazy
 
-    lead_id = int(lead_id)
     async with state.db_sessionmaker() as db:
         lead = await leads_store.get(db, lead_id)
         if lead is None:
@@ -133,7 +169,9 @@ async def start_lead_hunt(state: Any, *, lead_id: int, started_by: str) -> LeadH
     return LeadHuntStart(hunt_id=str(hunt_id), existing=False)
 
 
-async def leads_awaiting_a_hunt(db: AsyncSession, *, limit: int = 50) -> list[Lead]:
+async def leads_awaiting_a_hunt(
+    db: AsyncSession, *, limit: int = 50, after: tuple[datetime, int] | None = None
+) -> list[Lead]:
     """The open leads the loop may hunt, oldest first.
 
     Four conditions, and each one is a decision the loop must not overrule:
@@ -146,20 +184,33 @@ async def leads_awaiting_a_hunt(db: AsyncSession, *, limit: int = 50) -> list[Le
       can still fail. The row is the record that the lead has had its hunt.
 
     Oldest first, because the oldest lead has waited longest.
+
+    ``after`` is the formation time and id of the last lead of the page read
+    before, and the answer is the page after it. The loop skips a lead that
+    cites no documents and the lead stays where it is, so the loop has to be
+    able to read past a page of them. The cursor is a time and an id rather
+    than an offset, because two leads can form in the same second and a lead
+    dismissed ahead of the cursor would shift an offset by one.
     """
-    rows = await db.scalars(
-        select(Lead)
-        .where(
-            Lead.status == "open",
-            Lead.hunt_id.is_(None),
-            Lead.dismissed_at.is_(None),
-            # A shadow lead came from an analytic in shadow. Shadow records and
-            # never acts, so its hunt waits for the analyst.
-            Lead.shadow.is_(False),
-            ~select(Hunt.id).where(Hunt.lead_id == Lead.id).exists(),
+    query = select(Lead).where(
+        Lead.status == "open",
+        Lead.hunt_id.is_(None),
+        Lead.dismissed_at.is_(None),
+        # A shadow lead came from an analytic in shadow. Shadow records and
+        # never acts, so its hunt waits for the analyst.
+        Lead.shadow.is_(False),
+        ~select(Hunt.id).where(Hunt.lead_id == Lead.id).exists(),
+    )
+    if after is not None:
+        formed_at, last_id = after
+        query = query.where(
+            or_(
+                Lead.formed_at > formed_at,
+                and_(Lead.formed_at == formed_at, Lead.id > int(last_id)),
+            )
         )
-        .order_by(Lead.formed_at.asc(), Lead.id.asc())
-        .limit(max(1, int(limit)))
+    rows = await db.scalars(
+        query.order_by(Lead.formed_at.asc(), Lead.id.asc()).limit(max(1, int(limit)))
     )
     return list(rows.all())
 

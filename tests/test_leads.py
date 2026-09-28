@@ -7,6 +7,7 @@ of those, allowed, turns the layer into a novelty detector with extra steps.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -1195,6 +1196,57 @@ async def test_a_second_start_returns_the_hunt_that_exists(
     await engine.dispose()
 
 
+async def test_two_starts_in_flight_at_once_run_one_agent(
+    settings_kratos: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The click and the loop's wake land while the console is still starting.
+
+    The sequential test above is not enough: the console awaits the hunt row
+    and the first event before it answers, and the lead is marked only after
+    that. A second start that reads the lead inside that window used to find
+    no hunt id, start a second agent and then overwrite the first hunt's id on
+    the lead, leaving the first hunt running with no lead pointing at it.
+    """
+    from soc_ai.hunting import lead_hunt
+    from soc_ai.store.models import Lead
+
+    engine, maker = await _db(settings_kratos)
+    lead_id = await _one_lead(maker, evidence={"sample_ids": ["d1"]})
+    calls: list[dict[str, Any]] = []
+    gate = asyncio.Event()
+
+    async def _start(_state, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append(kwargs)
+        await gate.wait()
+        return f"01HUNT{len(calls)}"
+
+    monkeypatch.setattr(
+        "soc_ai.webui.hunt_console_manager.get_manager",
+        lambda _s: SimpleNamespace(start=_start),
+    )
+
+    both = asyncio.gather(
+        lead_hunt.start_lead_hunt(_state(maker), lead_id=lead_id, started_by="analyst"),
+        lead_hunt.start_lead_hunt(_state(maker), lead_id=lead_id, started_by="auto-hunt"),
+    )
+    # Give the second start every chance to reach the console before the
+    # first is allowed to answer. It must be waiting, not starting.
+    for _ in range(50):
+        if len(calls) == 2:
+            break
+        await asyncio.sleep(0.01)
+    gate.set()
+    first, second = await both
+
+    assert len(calls) == 1, "two starts in flight ran two agents"
+    assert first.hunt_id == second.hunt_id == "01HUNT1"
+    assert sorted([first.existing, second.existing]) == [False, True]
+    async with maker() as db:
+        lead = await db.get(Lead, lead_id)
+        assert lead.status == "hunting" and lead.hunt_id == "01HUNT1"
+    await engine.dispose()
+
+
 async def test_a_dismissed_lead_refuses_the_start(
     settings_kratos: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1335,6 +1387,38 @@ async def test_the_loop_takes_open_leads_that_never_had_a_hunt_oldest_first(
     async with maker() as db:
         waiting = await lead_hunt.leads_awaiting_a_hunt(db, limit=10)
     assert [int(lead.id) for lead in waiting] == [older, newer]
+    await engine.dispose()
+
+
+async def test_the_loop_reads_the_waiting_leads_a_page_at_a_time(
+    settings_kratos: Settings,
+) -> None:
+    """A page is the leads after the last one read, in the same order.
+
+    The loop skips a lead that cites nothing and the lead stays where it is,
+    so the loop must be able to read past a page of them. The cursor is the
+    last lead's formation time and id, because two leads can form in the same
+    second and an offset would slip when a lead ahead of it is dismissed.
+    """
+    from soc_ai.hunting import lead_hunt
+
+    engine, maker = await _db(settings_kratos)
+    formed = (_NOW - timedelta(hours=3)).replace(tzinfo=None)
+    first = await _row(maker, formed_at=formed)
+    second = await _row(maker, formed_at=formed)
+    third = await _row(maker, formed_at=formed + timedelta(seconds=1))
+    async with maker() as db:
+        page = await lead_hunt.leads_awaiting_a_hunt(db, limit=2)
+        assert [int(lead.id) for lead in page] == [first, second]
+        last = page[-1]
+        rest = await lead_hunt.leads_awaiting_a_hunt(
+            db, limit=2, after=(last.formed_at, int(last.id))
+        )
+        assert [int(lead.id) for lead in rest] == [third]
+        beyond = await lead_hunt.leads_awaiting_a_hunt(
+            db, limit=2, after=(rest[-1].formed_at, int(rest[-1].id))
+        )
+        assert beyond == []
     await engine.dispose()
 
 

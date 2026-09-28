@@ -1030,10 +1030,17 @@ async def _hunt_schedule_loop(app: FastAPI) -> None:
             _LOGGER.exception("hunt scheduler iteration failed; continuing")
 
 
-# How many leads one wake reads before it decides. Wider than any sensible
-# concurrency cap, because a lead that cites no documents is skipped and must
-# not hold the slot of a lead behind it that does.
+# How many leads one wake reads at a time. Wider than any sensible concurrency
+# cap, because a lead that cites no documents is skipped and must not hold the
+# slot of a lead behind it that does.
 _LEAD_AUTO_HUNT_BATCH = 50
+
+# How many such pages one wake reads before it gives up looking. A skipped lead
+# stays open and stays where it is, so the skipped leads pile up at the head of
+# the queue, and a wake that read one page found nothing but skips once a page
+# of them was older than every lead with evidence. The wake reads on past them.
+# The bound keeps a table of thousands of skipped leads from pinning one wake.
+_LEAD_AUTO_HUNT_PAGES = 20
 
 # How often the skip of one lead is said. The loop wakes every 60 seconds, so
 # an unthrottled line would write sixty an hour about one lead that is not
@@ -1041,22 +1048,33 @@ _LEAD_AUTO_HUNT_BATCH = 50
 _LEAD_AUTO_HUNT_QUIET = timedelta(hours=1)
 
 
-async def _leads_the_loop_may_hunt(db: Any) -> tuple[list[int], list[int]]:
+async def _leads_the_loop_may_hunt(db: Any, *, need: int) -> tuple[list[int], list[int]]:
     """The waiting leads, split by whether their observations cite a document.
 
     The second list is skipped rather than hunted: a hunt of a lead that cites
     nothing has no evidence to read first, so it searches the grid from
     scratch. The split is re-read on every wake, because the sweep can record
     documents for a lead that had none.
+
+    ``need`` is how many leads the wake can start. The pages are read in order
+    until a page has brought the first list to that many, until a page comes
+    back short, or until the page bound is spent. Every skipped lead read on
+    the way is in the second list, so the log still names each one.
     """
     from soc_ai.hunting import lead_hunt  # noqa: PLC0415
     from soc_ai.store import leads as leads_store  # noqa: PLC0415
 
     cited: list[int] = []
     bare: list[int] = []
-    for lead in await lead_hunt.leads_awaiting_a_hunt(db, limit=_LEAD_AUTO_HUNT_BATCH):
-        rows = await leads_store.timeline(db, int(lead.id))
-        (cited if leads_store.cites_documents(rows) else bare).append(int(lead.id))
+    after: tuple[datetime, int] | None = None
+    for _ in range(_LEAD_AUTO_HUNT_PAGES):
+        page = await lead_hunt.leads_awaiting_a_hunt(db, limit=_LEAD_AUTO_HUNT_BATCH, after=after)
+        for lead in page:
+            rows = await leads_store.timeline(db, int(lead.id))
+            (cited if leads_store.cites_documents(rows) else bare).append(int(lead.id))
+        if len(cited) >= need or len(page) < _LEAD_AUTO_HUNT_BATCH:
+            break
+        after = (page[-1].formed_at, int(page[-1].id))
     return cited, bare
 
 
@@ -1131,7 +1149,7 @@ async def _lead_auto_hunt_loop(app: FastAPI) -> None:
                 running = await lead_hunt.running_auto_hunts(db)
                 if running >= cap:
                     continue
-                eligible, no_documents = await _leads_the_loop_may_hunt(db)
+                eligible, no_documents = await _leads_the_loop_may_hunt(db, need=cap - running)
 
             said_no_documents = _say_the_skipped_leads(
                 said_no_documents, no_documents, datetime.now(UTC).replace(tzinfo=None)
