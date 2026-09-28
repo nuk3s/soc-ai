@@ -37,7 +37,13 @@ dependencies = [
     # ~80 packages nothing here imports, and where the advisory-flagged
     # transitive pins (pyasn1, google-auth, authlib) came from.
     "pydantic-ai-slim[openai]>=1.0,<2",
-    "mcp>=1.1.0",
+    # mcp 2.x is a split package (mcp + mcp-types) that removes
+    # `mcp.server.fastmcp`: the module is a stub that raises ModuleNotFoundError
+    # because FastMCP became `mcp.server.mcpserver.MCPServer`. That is the one
+    # import soc_ai.mcp_server makes, so cap the major here as well; a bare
+    # `uv lock --upgrade` otherwise takes the MCP server down with no diff
+    # in this file to review.
+    "mcp>=1.1.0,<2",
     # HTTP / search clients
     "httpx>=0.27.0",
     "geoip2>=4.8.0",
@@ -78,13 +84,13 @@ dev = [
     "pytest>=8.3.0",
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=6.0.0",
-    "pytest-vcr>=1.0.2",
     "respx>=0.21.0",
     "ruff>=0.8.0",
     "mypy>=1.13.0",
     "playwright>=1.59.0",
     "pytest-playwright>=0.7.2",
     "pre-commit>=3.8.0",
+    "pytest-xdist>=3.8.0",
 ]
 docs = [
     # Documentation site (Material for MkDocs). Build/serve with:

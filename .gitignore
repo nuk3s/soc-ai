@@ -43,9 +43,6 @@ certs/
 .DS_Store
 Thumbs.db
 
-# VCR cassettes - store these explicitly when we want them
-tests/cassettes/
-
 # Qdrant local data (when running compose locally)
 qdrant_storage/
 
