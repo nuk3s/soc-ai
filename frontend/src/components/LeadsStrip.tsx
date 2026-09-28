@@ -92,9 +92,12 @@ export function leadStatusLabel(status: string): string {
   return LEAD_STATUS_LABEL[status] ?? status.replace(/_/g, ' ');
 }
 
-/** A hunt that has stopped. The lead is no longer waiting on it. This is the
- *  server's rule for `needs_decision` too, so the pill and the tab agree. */
-const HUNT_DONE = new Set(['complete', 'error']);
+/** A hunt that is still going. Any other status is a hunt that has stopped,
+ *  and the lead is no longer waiting on it. This is the server's rule for
+ *  `needs_decision` too, so the pill and the tab agree: a set of finished
+ *  statuses drifted from it, and a cancelled or interrupted hunt sat on the
+ *  Needs decision tab while the pill read "In progress" and hid every act. */
+const HUNT_RUNNING = new Set(['running', 'queued']);
 
 /** The outcome label that makes a benign repeat the right reason to dismiss. */
 const NO_THREAT = 'No threat observed';
@@ -113,7 +116,7 @@ export function leadState(lead: {
 }): LeadState {
   if (lead.status === 'dismissed') return 'dismissed';
   if (lead.status === 'promoted') return 'promoted';
-  if (lead.hunt_status && HUNT_DONE.has(lead.hunt_status)) return 'hunted';
+  if (lead.hunt_status && !HUNT_RUNNING.has(lead.hunt_status)) return 'hunted';
   if (lead.status === 'hunting' || lead.hunt_status) return 'in_progress';
   return 'new';
 }

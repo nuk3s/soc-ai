@@ -217,6 +217,48 @@ describe('LeadDetail hunts on the lead', () => {
     expect(within(panel).getByText('Complete').getAttribute('title')).not.toBe(STATUS_COMPLETE);
   });
 
+  // The list answers the newest hundred lead hunts. An older lead's own hunt
+  // sits outside that window, and the row the page built for it said
+  // "Complete · 0 threat findings" whatever the hunt was doing. The lead
+  // record states the status and the outcome, so the row reads those.
+  it.each([
+    ['running', 'Running'],
+    ['error', 'Error'],
+    ['interrupted', 'Interrupted'],
+  ])('states the lead\'s own %s hunt when the list left it out', async (status, label) => {
+    vi.mocked(getHunts).mockResolvedValue([]);
+    vi.mocked(getLead).mockResolvedValue({
+      ...LEAD,
+      status: 'hunting',
+      hunt_id: 'H-OLD',
+      hunt_status: status,
+    } as never);
+    mount();
+    const panel = await screen.findByTestId('lead-hunts');
+    expect(within(panel).getByRole('link', { name: /H-OLD/ }).getAttribute('href')).toBe(
+      '/hunts/H-OLD',
+    );
+    expect(within(panel).getByText(label)).toBeTruthy();
+    expect(within(panel).queryByText('Complete')).toBeNull();
+    expect(within(panel).queryByText(/threat finding/)).toBeNull();
+  });
+
+  it('carries the outcome, not a count it never read, on a finished hunt the list left out', async () => {
+    vi.mocked(getHunts).mockResolvedValue([]);
+    vi.mocked(getLead).mockResolvedValue({
+      ...LEAD,
+      status: 'hunting',
+      hunt_id: 'H-OLD',
+      hunt_status: 'complete',
+      hunt_outcome_label: 'Threat findings',
+    } as never);
+    mount();
+    const panel = await screen.findByTestId('lead-hunts');
+    expect(within(panel).getByText('Complete')).toBeTruthy();
+    expect(within(panel).getByText('Threat findings')).toBeTruthy();
+    expect(within(panel).queryByText(/0 threat findings/)).toBeNull();
+  });
+
   // A hunt is running, so the one act left is to follow it. The page offered
   // "Open the hunt", which reads as a second way to start one.
   it('links to the running hunt and offers nothing else', async () => {
@@ -486,6 +528,68 @@ describe('LeadDetail hunted leads', () => {
     expect(screen.getByRole('button', { name: 'Hunt again' })).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
     expect((screen.getByLabelText('Reason') as HTMLSelectElement).value).toBe('benign_repeat');
+  });
+
+  // A cancelled or interrupted hunt has stopped, and the server counts the
+  // lead as waiting on the analyst. The page read "In progress" over it and
+  // offered nothing but the hunt, so the lead could never be closed. Every
+  // restart interrupts the running hunts, so this is the ordinary case.
+  it.each(['cancelled', 'interrupted'])('reads a %s hunt as Hunted and offers the acts', async (status) => {
+    vi.mocked(getLead).mockResolvedValue({
+      ...HUNTED,
+      hunt_status: status,
+      hunt_outcome_label: null,
+    } as never);
+    mount();
+    const chip = await screen.findByTestId('lead-status');
+    expect(chip.textContent).toMatch(/^Hunted/);
+    expect(screen.getByRole('button', { name: 'Promote' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Dismiss' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Hunt again' })).toBeTruthy();
+    expect(screen.queryByRole('link', { name: 'View hunt' })).toBeNull();
+  });
+});
+
+// The page answered every failed read with "This lead does not exist". A grid
+// outage on the first load read as a deleted record with no way to try again,
+// and a failed re-read after Promote took a page that was on screen away.
+describe('LeadDetail when the read fails', () => {
+  it('keeps the error card and its Retry on a server failure', async () => {
+    vi.mocked(getLead)
+      .mockRejectedValueOnce(new ApiError('500 Internal Server Error', 500))
+      .mockResolvedValue(LEAD as never);
+    mount();
+    const retry = await screen.findByRole('button', { name: /retry/i });
+    expect(screen.getByText(/Couldn't load this lead/)).toBeTruthy();
+    expect(screen.queryByText(/does not exist/)).toBeNull();
+    expect(screen.queryByText(/No such lead/)).toBeNull();
+    fireEvent.click(retry);
+    await waitFor(() => expect(screen.getByText('10.1.2.3')).toBeTruthy());
+    expect(vi.mocked(getLead).mock.calls.length).toBe(2);
+  });
+
+  it('explains a 404 and offers the list, with no Retry', async () => {
+    vi.mocked(getLead).mockRejectedValue(new ApiError('Lead 12 not found', 404));
+    mount();
+    expect(await screen.findByText(/No such lead/)).toBeTruthy();
+    expect(screen.getByRole('link', { name: 'Back to leads' }).getAttribute('href')).toBe(
+      '/hunts#leads',
+    );
+    expect(screen.queryByRole('button', { name: /retry/i })).toBeNull();
+    expect(screen.queryByText(/does not exist/)).toBeNull();
+  });
+
+  it('keeps the lead on screen when a re-read fails, and says the refresh failed', async () => {
+    vi.mocked(getLead)
+      .mockResolvedValueOnce({ ...LEAD, status: 'promoted', investigation_id: 'INV-1' } as never)
+      .mockRejectedValueOnce(new ApiError('500 Internal Server Error', 500));
+    mount();
+    fireEvent.click(await screen.findByRole('button', { name: 'Reopen' }));
+    await waitFor(() => expect(vi.mocked(getLead).mock.calls.length).toBe(2));
+    await waitFor(() => expect(screen.getByRole('status').textContent).toMatch(/Refresh failed/));
+    expect(screen.getByText('10.1.2.3')).toBeTruthy();
+    expect(screen.queryByText(/does not exist/)).toBeNull();
+    expect(screen.queryByText(/No such lead/)).toBeNull();
   });
 });
 
