@@ -64,6 +64,12 @@ data/
 # ...but vendored package-data dirs under soc_ai/ MUST ship in the wheel.
 !soc_ai/**/data/
 !soc_ai/**/data/**
+# A store that lands anywhere else (the alembic CLI creates one relative to the
+# cwd) never ships in the wheel or the image and never carries triage history
+# into the repo.
+*.db
+*.db-wal
+*.db-shm
 
 # Local deploy targets (hosts stay out of the public repo)
 .deploy-target
