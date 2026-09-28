@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import argparse
+import sqlite3
+from pathlib import Path
+
 import pytest
+from alembic import command
 from pydantic import SecretStr
 from soc_ai.config import Settings
 from soc_ai.store import auth as auth_svc
-from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
+from soc_ai.store.db import _migration_config, make_engine, make_sessionmaker, run_migrations
 from soc_ai.store.models import Base, User, UserSession
 from sqlalchemy import inspect, select
 from sqlalchemy.exc import IntegrityError
@@ -52,6 +57,36 @@ async def test_run_migrations_creates_schema(settings_kratos: Settings) -> None:
     # idempotent: a second run is a no-op, not an error
     await run_migrations(engine)
     await engine.dispose()
+
+
+def _db_head(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    with sqlite3.connect(path) as conn:
+        row = conn.execute("SELECT version_num FROM alembic_version").fetchone()
+    return None if row is None else str(row[0])
+
+
+def test_cli_env_honours_x_db_url(tmp_path: Path) -> None:
+    """``-x db_url=...`` on the alembic CLI targets that store, not the ini's URL.
+
+    The env.py docstring advertises the option; an operator who follows it to
+    point a manual upgrade or downgrade at the real store must not have the
+    argument dropped and a fresh, empty store migrated in its place.
+    """
+    cfg = _migration_config()
+    cfg.set_main_option("sqlalchemy.url", f"sqlite:///{tmp_path / 'wrong.db'}")
+    cfg.cmd_opts = argparse.Namespace(x=[f"db_url=sqlite:///{tmp_path / 'right.db'}"])
+    command.upgrade(cfg, "head")
+    assert not (tmp_path / "wrong.db").exists()
+    assert _db_head(tmp_path / "right.db") is not None
+
+
+def test_cli_env_uses_the_ini_url_without_x_arguments(tmp_path: Path) -> None:
+    cfg = _migration_config()
+    cfg.set_main_option("sqlalchemy.url", f"sqlite:///{tmp_path / 'ini.db'}")
+    command.upgrade(cfg, "head")
+    assert _db_head(tmp_path / "ini.db") is not None
 
 
 # ---------------------------------------------------------------------------
