@@ -18,12 +18,14 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from ipaddress import ip_network
 from pathlib import Path
 from typing import cast
 
 import httpx
 
 from soc_ai.demo.guard import assert_ambient_egress_allowed
+from soc_ai.enrichment.blocklist_refresh import _atomic_write_bytes
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -50,6 +52,15 @@ _CLOUD_FILENAMES = {
     "gcp": ("gcp_prefixes", "gcp.json"),
     "azure": ("azure_prefixes", "azure.json"),
     "cloudflare": ("cloudflare_v4", "cloudflare.json"),
+}
+
+# The top-level list each JSON feed must carry — the key the matching
+# CloudPrefixDB loader iterates. A body that parses as JSON but lacks it (an
+# error document, a challenge page served as JSON) is not that provider's feed.
+_CLOUD_JSON_LIST_KEY = {
+    "aws": "prefixes",
+    "gcp": "prefixes",
+    "azure": "values",
 }
 
 
@@ -146,6 +157,38 @@ async def _fetch_validated(
     raise last_err
 
 
+def _validate_cloud_body(source: str, content: bytes) -> bytes:
+    """Return the bytes to write for ``source``; raise ``ValueError`` if ``content``
+    is not that provider's prefix list.
+
+    ``_fetch_validated`` only proves the transfer was complete (and, for JSON
+    feeds, that it parses). A 200 can still carry an HTML challenge page, an
+    empty body or the wrong document, and writing that over a good file would
+    silently drop every prefix for the provider. Cloudflare's TXT is converted
+    to the ``{"prefixes": [...]}`` envelope here, keeping only the lines that
+    are CIDRs; the JSON feeds must carry their top-level list.
+    """
+    if source == "cloudflare":
+        prefixes: list[str] = []
+        for raw in content.decode("utf-8", "replace").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                ip_network(line, strict=False)
+            except ValueError:
+                continue
+            prefixes.append(line)
+        if not prefixes:
+            raise ValueError("cloudflare body contains no CIDR prefixes")
+        return json.dumps({"prefixes": prefixes}).encode("utf-8")
+    key = _CLOUD_JSON_LIST_KEY[source]
+    data = json.loads(content)
+    if not isinstance(data, dict) or not isinstance(data.get(key), list):
+        raise ValueError(f"{source} body has no top-level {key!r} list")
+    return content
+
+
 _AZURE_DOWNLOAD_PAGE = "https://www.microsoft.com/en-us/download/details.aspx?id=56519"
 _AZURE_FILE_RE = re.compile(
     r"https://download\.microsoft\.com/download/[^\"'\s]+?/ServiceTags_Public_\d{8}\.json"
@@ -171,6 +214,22 @@ async def _resolve_azure_service_tags_url(client: httpx.AsyncClient) -> str | No
     return None
 
 
+def _record_cloud_failure(
+    data_dir: Path,
+    status: dict[str, dict[str, str]],
+    source: str,
+    entry: dict[str, str],
+    err: Exception,
+) -> RefreshResult:
+    """Log a failed attempt for ``source``, persist it in the status file, and
+    return the failed :class:`RefreshResult`. ``last_success`` is left as it was."""
+    _LOGGER.warning("refresh cloud %s failed: %s", source, err)
+    entry["last_error"] = str(err)
+    status[source] = entry
+    _save_cloud_status(data_dir, status)
+    return RefreshResult(source=source, success=False, error=str(err))
+
+
 async def refresh_cloud_prefixes(
     data_dir: Path,
     *,
@@ -192,6 +251,12 @@ async def refresh_cloud_prefixes(
     Cloudflare publishes a plain-text list of prefixes; we wrap them in
     a JSON envelope ``{"prefixes": [...]}`` so the CloudPrefixDB loader
     can parse uniformly.
+
+    A body that is not the provider's prefix list (see
+    :func:`_validate_cloud_body`) or a write that fails part-way is a failed
+    attempt: the previous file is kept (writes are temp-file + ``os.replace``)
+    and the status entry records ``last_error`` rather than a new
+    ``last_success``.
 
     After each source attempt (success or failure) the status is written
     to ``cloud_refresh_status.json`` in ``data_dir`` so that
@@ -224,9 +289,15 @@ async def refresh_cloud_prefixes(
             entry: dict[str, str] = status.get(source, {})
             entry["last_attempt"] = now_iso
 
+            # ``content`` stays None until a body has passed BOTH the transfer
+            # check and the shape check, so a body that fetched fine but is not
+            # the feed lands in the failure branch below instead of on disk.
             content: bytes | None = None
             try:
-                content = await _fetch_validated(client, url, as_json=(source != "cloudflare"))
+                content = _validate_cloud_body(
+                    source,
+                    await _fetch_validated(client, url, as_json=(source != "cloudflare")),
+                )
             except (httpx.HTTPError, ValueError) as err:
                 # Azure rotates its dated filename + GUID path weekly, so the
                 # configured URL eventually 404s. On failure, resolve the current
@@ -237,26 +308,23 @@ async def refresh_cloud_prefixes(
                     resolved = await _resolve_azure_service_tags_url(client)
                     if resolved and resolved != url:
                         try:
-                            content = await _fetch_validated(client, resolved, as_json=True)
+                            content = _validate_cloud_body(
+                                source, await _fetch_validated(client, resolved, as_json=True)
+                            )
                         except (httpx.HTTPError, ValueError) as err2:
                             fail_err = err2
                 if content is None:
-                    _LOGGER.warning("refresh cloud %s failed: %s", source, fail_err)
-                    entry["last_error"] = str(fail_err)
-                    status[source] = entry
-                    _save_cloud_status(data_dir, status)
-                    results.append(RefreshResult(source=source, success=False, error=str(fail_err)))
+                    results.append(_record_cloud_failure(data_dir, status, source, entry, fail_err))
                     continue
 
-            if source == "cloudflare":
-                # Convert TXT prefix list → JSON envelope.
-                lines = [
-                    line.strip()
-                    for line in content.decode("utf-8", "replace").splitlines()
-                    if line.strip() and not line.startswith("#")
-                ]
-                content = json.dumps({"prefixes": lines}).encode("utf-8")
-            (data_dir / fname).write_bytes(content)
+            # Temp file + os.replace: a crash mid-write must not leave a
+            # truncated JSON that the loader then rejects, silently emptying
+            # the provider's prefixes.
+            try:
+                _atomic_write_bytes(data_dir / fname, content)
+            except OSError as err:
+                results.append(_record_cloud_failure(data_dir, status, source, entry, err))
+                continue
             entry["last_success"] = now_iso
             entry.pop("last_error", None)
             status[source] = entry

@@ -96,6 +96,31 @@ def test_concurrent_cold_cache_probes_single_flight(monkeypatch):
     assert len(calls) == 1
 
 
+def test_concurrent_cold_cache_pcap_probe_single_flight(monkeypatch):
+    """The pcap leg spawns an ssh login per probe, so N concurrent polls on a
+    cold cache must share ONE in-flight probe, not fork N ssh children
+    against a sensor that may already be the thing that is slow."""
+    calls = []
+
+    async def counting_probe(*_a, **_k):
+        calls.append(1)
+        await asyncio.sleep(0.05)
+        return {"ok": True, "detail": "up"}
+
+    monkeypatch.setattr(routes_meta.probes, "probe_pcap", counting_probe)
+
+    state = SimpleNamespace()
+
+    async def go():
+        return await asyncio.gather(
+            *[routes_meta._cached_pcap_probe(state, _settings()) for _ in range(5)]
+        )
+
+    results = asyncio.run(go())
+    assert len(calls) == 1
+    assert all(r == {"ok": True, "detail": "up"} for r in results)
+
+
 def test_dep_transitions_tracked_and_cleared():
     """down flip records a since-timestamp; recovery clears it; a still-down
     dep keeps its ORIGINAL flip time (stable notification id per outage)."""

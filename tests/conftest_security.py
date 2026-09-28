@@ -4,8 +4,10 @@ The repo's hermetic harnesses boot with ``api_auth_required=False``; an auth
 audit needs the opposite. This plugin boots the real ``create_app()`` with auth
 genuinely ON, seeds two users of different roles through the app's own
 user-creation path (real bcrypt hashing), and logs each one in through the real
-``POST /api/v1/login`` route — session cookies are never fabricated. The grid
-is the packaged mock-ES fixture responder, so the whole surface (including the
+``POST /api/v1/login`` route — session cookies are never fabricated. Each role
+then gets its own client whose jar carries that session, while the shared
+``audit_client`` stays anonymous for the unauthenticated checks. The grid is
+the packaged mock-ES fixture responder, so the whole surface (including the
 sigma-authoring bridge and the analyst-cloud redaction guard) is reachable with
 no lab dependency.
 
@@ -101,31 +103,51 @@ def _seed_audit_users(client: TestClient) -> None:
     asyncio.run(_go())
 
 
-def _login_session(client: TestClient, username: str, password: str) -> dict[str, str]:
-    """Log in through the REAL login route and return the session cookie dict.
+def _login(client: TestClient, username: str, password: str) -> str:
+    """Log in through the REAL login route and return the raw session cookie.
 
-    The cookie is then cleared from the client's jar so the shared
-    ``audit_client`` stays anonymous — tests attach a role per request via
-    ``cookies=...``, and an un-cookied request genuinely has no session.
+    The cookie is then cleared from the shared client's jar so ``audit_client``
+    stays anonymous — an un-cookied request genuinely has no session.
     """
     resp = client.post("/api/v1/login", json={"username": username, "password": password})
     assert resp.status_code == 200, f"harness login failed for {username!r}: {resp.text}"
     raw = resp.cookies.get(auth_svc.SESSION_COOKIE)
     assert raw, "login response did not set the session cookie"
     client.cookies.clear()
-    return {auth_svc.SESSION_COOKIE: raw}
+    return raw
 
 
-@pytest.fixture
-def analyst_session(audit_client: TestClient) -> dict[str, str]:
-    """Session cookie dict for a real, logged-in ``analyst``-role user."""
-    return _login_session(audit_client, *ANALYST_CREDS)
+def _role_client(client: TestClient, username: str, password: str) -> TestClient:
+    """A client logged in as ``username`` — the shape audit tests should take.
+
+    It is a second ``TestClient`` over the same booted app: it shares
+    ``app.state`` with ``audit_client`` and differs only in its cookie jar, so
+    every request through it is that role with nothing attached by hand (the
+    test client deprecates per-request ``cookies=`` because jar persistence is
+    ambiguous). No ``with`` here: the lifespan already ran under
+    ``audit_client`` and must not run twice; a bare client only routes
+    requests into the app.
+    """
+    role = TestClient(client.app)
+    role.cookies.set(auth_svc.SESSION_COOKIE, _login(client, username, password))
+    return role
 
 
-@pytest.fixture
-def admin_session(audit_client: TestClient) -> dict[str, str]:
-    """Session cookie dict for a real, logged-in ``admin``-role user."""
-    return _login_session(audit_client, *ADMIN_CREDS)
+@pytest.fixture(name="analyst")
+def analyst_client(audit_client: TestClient) -> TestClient:
+    """A client logged in as a real ``analyst``-role user.
+
+    Registered as ``analyst`` so a test module can import this function by
+    name (the way ``tests/conftest.py`` registers the rest of the harness)
+    without that import shadowing the ``analyst`` parameter its tests take.
+    """
+    return _role_client(audit_client, *ANALYST_CREDS)
+
+
+@pytest.fixture(name="admin")
+def admin_client(audit_client: TestClient) -> TestClient:
+    """A client logged in as a real ``admin``-role user (see ``analyst_client``)."""
+    return _role_client(audit_client, *ADMIN_CREDS)
 
 
 @pytest.fixture

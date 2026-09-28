@@ -109,14 +109,19 @@ class Investigation(Base):
         # Migration 0038. The session lookup is "completed verdicts on this
         # session, newest first", so created_at rides the index with it.
         Index("ix_investigations_session", "community_id", "created_at"),
+        # Migration 0052. The completed half of the bell bounds and orders on
+        # finished_at, the clock it renders; (status, created_at) served the
+        # equality and then sorted every completed row on each poll.
+        Index("ix_investigations_status_finished", "status", "finished_at"),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)  # ULID
     alert_es_id: Mapped[str] = mapped_column(String(128), index=True)
     # Where this investigation came from. 'suricata' | 'sigma' | 'notice' are
     # detector-flag kinds (the alert feed's vocabulary); 'hunt' marks a
-    # promoted hunt finding — anchored on a cited evidence doc, with NOTHING in
-    # SO to ack (every SO-write surface must gate on this).
+    # promoted hunt finding and 'lead' a promoted lead — both anchored on a
+    # cited evidence doc, with NOTHING in SO to ack (every SO-write surface
+    # must gate on both; see investigations.PROMOTED_KINDS).
     kind: Mapped[str] = mapped_column(String(16), default="suricata", server_default="suricata")
     # Promotion provenance: the hunt and the zero-based index into its
     # report["findings"]. Set only when kind == 'hunt'. The ordinal is stable:
@@ -201,8 +206,13 @@ class Hunt(Base):
     __tablename__ = "hunts"
     # (status, created_at) composite from migration 0028 — serves the
     # /notifications completed-hunt scan and previous_completed_run. Declared so
-    # the ORM metadata matches the DB (see the Investigation note).
-    __table_args__ = (Index("ix_hunts_status_created", "status", "created_at"),)
+    # the ORM metadata matches the DB (see the Investigation note). The
+    # (status, finished_at) composite from 0052 serves the bell's finished_since
+    # window, which is bounded and ordered on finished_at.
+    __table_args__ = (
+        Index("ix_hunts_status_created", "status", "created_at"),
+        Index("ix_hunts_status_finished", "status", "finished_at"),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)  # ULID
     objective: Mapped[str] = mapped_column(Text)
@@ -503,8 +513,13 @@ class ConfigOverride(Base):
     """Admin-set overrides for a whitelisted subset of Settings.
 
     ``value`` holds a JSON-encoded scalar (bool/str/float). The whitelist and
-    type coercion live in ``soc_ai.store.config_overrides`` — this table never
-    holds secrets (no password/api-key keys are whitelisted).
+    type coercion live in ``soc_ai.store.config_overrides``. The whitelist
+    includes the Danger Zone connection settings and write-only secret specs:
+    a secret's ``value`` is Fernet ciphertext keyed by ``CONFIG_SECRET_KEY``
+    (see ``soc_ai.store.secret_box``), while connection identity (hosts,
+    usernames) is stored in plaintext. Treat this table as sensitive in
+    dumps, backups and exports — a dump alone reveals no live secret without
+    the key, but it does reveal where soc-ai connects and as whom.
     """
 
     __tablename__ = "config_overrides"
@@ -1244,6 +1259,10 @@ class EntityObservation(Base):
         Index("ix_entity_observation_entity", "entity_kind", "entity_key"),
         Index("ix_entity_observation_born", "born_at"),
         Index("ix_entity_observation_lead", "lead_id"),
+        # Migration 0052. Covers the unread shadow-hit clause every surface
+        # counts (bell, sidebar badge, needs-you strip, Dashboard card, hits
+        # filter), which was a full scan of this table on each poll.
+        Index("ix_entity_observation_unread", "shadow", "read_at", "spec_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)

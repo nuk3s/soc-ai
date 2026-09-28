@@ -150,7 +150,8 @@ _PIVOT_ID_SAFE_ATTRS: tuple[str, ...] = (
 # Pivot event attributes whose values are distinctive enough to prove a verdict
 # was grounded in correlated evidence when cited (a JA3, a file hash, a Kerberos
 # SPN, a service binary name, an RPC endpoint — not generic fields like a port
-# or state). Shared with :mod:`soc_ai.agent.gates` (`_pivot_evidence_tokens`).
+# or state). Shared with :mod:`soc_ai.agent.gates` (`_pivot_evidence_tokens` for
+# the id-safe subset, `_pivot_wire_string_cited` for the wire-string leaves).
 #
 # Beyond the id-safe subset above, this set carries four attacker-chosen
 # free-form WIRE strings — an SMB file name, a client-requested Kerberos SPN,
@@ -187,7 +188,8 @@ _PIVOT_DECISIVE_ATTRS: tuple[str, ...] = (
 #     ``zeek_dce_rpc_operation``) are attacker-chosen free-form wire strings
 #     that ride the attacker's own flow into the community-id prefetch, so
 #     admitting them here reopened M2 through a typed slot. They stay citable
-#     GROUNDING evidence in the gates (``_pivot_evidence_tokens``) — they just
+#     GROUNDING evidence in the gates (``_pivot_wire_string_cited``, banded for
+#     distinctiveness) — they just
 #     cannot satisfy an id-shaped citation's identity claim.
 #   * detector-assigned rule metadata — ``signature_severity`` / ``classtype``
 #     / ``severity_label`` / ``alert_action``: written by the matched RULE, not

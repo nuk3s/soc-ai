@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -393,6 +394,38 @@ async def test_a_cited_lead_still_runs_behind_one_that_cites_nothing(
 
     await _run(monkeypatch, _app(maker, concurrency=1))
     assert [c["lead_id"] for c in started] == [cited]
+    await engine.dispose()
+
+
+async def test_a_batch_of_leads_that_cite_nothing_does_not_hide_the_one_behind_them(
+    monkeypatch: pytest.MonkeyPatch, settings_kratos: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The skipped leads never leave the queue, so they pile up at its head.
+
+    A lead that cites nothing is skipped and stays open, and a false-positive
+    verdict empties a lead without closing it. Once a page of them was older
+    than every lead with evidence, one wake read that page, skipped all of it
+    and started nothing, and every wake after did the same. The loop reads on
+    past a page of skips, and still says each skipped lead once.
+    """
+    engine, maker = await _db(settings_kratos)
+    bare = [await _lead(maker, minutes_old=180 + n, cites=False) for n in range(50)]
+    cited = await _lead(maker, minutes_old=10)
+    started: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "soc_ai.webui.hunt_console_manager.get_manager", lambda _s: _console(started)
+    )
+
+    with caplog.at_level(logging.INFO):
+        await _run(monkeypatch, _app(maker, concurrency=1))
+
+    assert [c["lead_id"] for c in started] == [cited]
+    said = [
+        int(m.group(1))
+        for r in caplog.records
+        if (m := re.search(r"lead auto-hunt: lead (\d+) cites no documents", r.getMessage()))
+    ]
+    assert sorted(said) == sorted(bare)
     await engine.dispose()
 
 

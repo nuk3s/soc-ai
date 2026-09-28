@@ -432,7 +432,8 @@ async def set_analytic_status(
     retirement with no reason is an analytic that disappeared. A shipped
     analytic that is still live can only be retired, because its file on disk
     is the analytic and an in-place local edit would make the repository and
-    the database disagree about what ran.
+    the database disagree about what ran. Once retired it comes back through
+    shadow, where the sweep dry-runs it again, and never through candidate.
     """
     by = await identify_caller(request)
     now = datetime.now(UTC)
@@ -476,7 +477,7 @@ async def set_analytic_status(
                     db, analytic_id, to_status=body.to, by=by, why=body.why, receipts=receipts
                 )
         except ValueError as exc:
-            allowed = sorted(analytics_store.ALLOWED_TRANSITIONS.get(status, frozenset()))
+            allowed = sorted(analytics_store.allowed_transitions(tier, status))
             targets = ", ".join(allowed) if allowed else "no other status"
             raise api_error(
                 422,

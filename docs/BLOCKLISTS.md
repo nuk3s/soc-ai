@@ -21,8 +21,16 @@ timer, the cron alternative and the synth-eval snapshot pinning.
 The job writes each feed under the exact filename that the matching loader in
 `soc_ai/enrichment/blocklists.py` reads from `blocklist_data_dir`. It writes the format
 that the loader parses. The job writes the download atomically. It writes a temporary
-file in the same directory and then calls `os.replace`. A partial or failed download can
-never corrupt a live feed file that triage reads.
+file in the same directory and then calls `os.replace`, so an interrupted write can
+never leave a half-written live feed file that triage reads.
+
+An HTTP 200 alone does not replace a feed. Before the swap, the job runs the download
+through the same loader that triage uses. A body that parses to no indicator at all is
+discarded: an empty body, a sign-in or WAF challenge page served as HTML, a JSON error
+document, or a download that ended early. The previous file stays in place, the feed is
+reported as `FAIL`, and the job exits non-zero so the timer log shows it. The
+cloud-prefix half applies the same rule: the Cloudflare list must contain at least one
+CIDR line, and the AWS, GCP and Azure documents must carry their top-level prefix list.
 
 This job never fetches 2 configured sources over the network:
 
@@ -75,7 +83,8 @@ soc-ai blocklists refresh --source urlhaus
 ```
 
 The output reports `ok`, `FAIL` or `skip` for each feed. The exit code is non-zero only
-if a feed failed with an HTTP error or a write error. A skipped abuse.ch feed means
+if a feed failed with an HTTP error, a write error, or a body that the loader cannot
+turn into at least one indicator (see above). A skipped abuse.ch feed means
 that you set no Auth-Key. That state is expected, and it keeps the exit code 0.
 
 The job writes only to the configured `blocklist_data_dir` and `cloud_prefix_data_dir`.
@@ -157,6 +166,35 @@ catalogue stays reproducible, and the live dir refreshes daily for real triage.
 
 ## MaxMind GeoIP
 
-You download the MaxMind GeoLite2 `.mmdb` files separately. They need a license key and
-arrive as a ZIP file, so they have a different shape. `docs/DEPLOYMENT.md` covers them.
-This CLI does not.
+`soc-ai blocklists refresh` never touches the GeoIP data, and nothing else in soc-ai
+downloads it either. The MaxMind GeoLite2 databases need a MaxMind account, and they
+arrive as a tarball, so they have a different shape from the feeds above. You download
+the two files by hand:
+
+1. Create a free MaxMind account and generate a license key at
+   <https://www.maxmind.com/en/geolite2/signup>. Put it in `.env` as
+   `MAXMIND_LICENSE_KEY=`. soc-ai does not use the key itself; the Data sources page
+   in Config only shows whether one is on file.
+2. Download the **GeoLite2 City** and **GeoLite2 ASN** databases in `.mmdb` format
+   from the GeoLite2 download page of your account, or with MaxMind's `geoipupdate`
+   tool and the same key. Each tarball unpacks to a dated directory that holds the
+   `.mmdb` file.
+3. Place `GeoLite2-City.mmdb` and `GeoLite2-ASN.mmdb` in `maxmind_data_dir`. The
+   default is `/var/lib/soc-ai/maxmind`, and `MAXMIND_DATA_DIR` in `.env` overrides
+   it. The files must be readable by the user soc-ai runs as (uid 1000 in the
+   container).
+4. Restart soc-ai. It opens the two files at startup, and the MaxMind row on the Data
+   sources page shows them as present.
+
+In the Docker stack `maxmind_data_dir` is the `soc_ai_maxmind` volume, so the last two
+steps are:
+
+```bash
+docker cp GeoLite2-City.mmdb soc-ai:/var/lib/soc-ai/maxmind/
+docker cp GeoLite2-ASN.mmdb soc-ai:/var/lib/soc-ai/maxmind/
+docker compose restart soc-ai
+```
+
+Without the files, GeoIP and ASN enrichment return nothing, and everything else still
+works. Repeat the download when you want fresher data; the refresh job will not do it
+for you.

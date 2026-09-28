@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import logging
 import secrets
 import time
@@ -43,6 +44,32 @@ MIN_PASSWORD_LENGTH = 8
 # ---------------------------------------------------------------------------
 
 
+def _source_bucket(ip: str) -> str:
+    """Collapse an IPv6 client address to its /64 for throttle keying.
+
+    One IPv6 host owns a whole /64 (SLAAC privacy extensions hand it a fresh
+    interface identifier whenever it likes, and ISPs delegate at least a /64),
+    so keying on the full 128-bit address would let a single machine reset its
+    failure count for free just by rotating the low bits. Bucketing by /64
+    makes that rotation land on the same key, which is the same shared-source
+    trade-off the throttle already accepts for an IPv4 NAT egress.
+
+    IPv4 addresses and IPv4-mapped IPv6 (``::ffff:a.b.c.d``) keep the raw
+    string. So does anything that does not parse as an address: the value can
+    come from an ``X-Forwarded-For`` hop and the throttle must never crash on a
+    malformed one, only key it as the opaque string it is.
+    """
+    if not ip:
+        return "?"
+    try:
+        parsed = ipaddress.ip_address(ip)
+    except ValueError:
+        return ip
+    if not isinstance(parsed, ipaddress.IPv6Address) or parsed.ipv4_mapped is not None:
+        return ip
+    return str(ipaddress.ip_network((parsed, 64), strict=False))
+
+
 class LoginThrottle:
     """Sliding-window failed-login throttle keyed by (client IP, username).
 
@@ -51,7 +78,9 @@ class LoginThrottle:
     bounded (``max_keys``): BOTH the failure map (``_fails``) and the lockout map
     (``_locked``) evict when full, so a flood of distinct keys cannot grow either
     dict without limit. Per-process only — adequate for the single-process
-    deployment; not shared across workers.
+    deployment; not shared across workers. An IPv6 client is keyed by its /64
+    (see ``_source_bucket``) so one host cannot dodge the lock by rotating
+    addresses inside its own prefix.
     """
 
     __slots__ = ("_fails", "_locked", "cooldown_s", "max_failures", "max_keys", "window_s")
@@ -75,7 +104,7 @@ class LoginThrottle:
 
     @staticmethod
     def _key(ip: str, username: str) -> tuple[str, str]:
-        return (ip or "?", (username or "").lower())
+        return (_source_bucket(ip), (username or "").lower())
 
     def _evict_if_full(self) -> None:
         # Cheap bound: when over capacity, drop ~one entry. Locked keys are kept

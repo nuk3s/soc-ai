@@ -247,6 +247,42 @@ async def test_check_store_reports_fts5(tmp_path: Path) -> None:
     assert "FTS5" in fts.detail
 
 
+async def test_check_store_at_head_with_fts_tables_reports_fts5(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    await _migrate(settings)
+    results = await doctor.check_store(settings)
+    fts = _by_name(results, "store fts5")
+    assert fts.status == "INFO"
+
+
+async def test_check_store_warns_when_the_fts_tables_are_missing(tmp_path: Path) -> None:
+    """A store migrated on a Python without FTS5 has the head but not the index.
+
+    0017 / 0018 skip the CREATE VIRTUAL TABLE on such a SQLite and stamp the
+    revision anyway, and nothing retries it later, so on this Python (which has
+    FTS5) the module check alone would report BM25 retrieval as on while chat
+    memory silently returns nothing. This is exactly the state the skip leaves.
+    """
+    settings = _settings(tmp_path)
+    await _migrate(settings)
+    engine = make_engine(settings)
+    try:
+        async with engine.begin() as conn:
+            for table in ("runbook_fts", "chat_memory_fts"):
+                for suffix in ("ai", "ad", "au"):
+                    await conn.execute(text(f"DROP TRIGGER IF EXISTS {table}_{suffix}"))
+                await conn.execute(text(f"DROP TABLE {table}"))
+    finally:
+        await engine.dispose()
+    results = await doctor.check_store(settings)
+    assert _by_name(results, "store").status == "PASS"  # the head itself is fine
+    fts = _by_name(results, "store fts5")
+    assert fts.status == "WARN"
+    assert "runbook_fts" in fts.detail
+    assert "chat_memory_fts" in fts.detail
+    assert "FTS5" in fts.hint
+
+
 # ── check 3: SO API + Elasticsearch ──────────────────────────────────────────
 
 
@@ -600,6 +636,8 @@ def test_check_egress_posture_is_info_only(tmp_path: Path) -> None:
     assert all(r.status == "INFO" for r in results)
     names = {r.name for r in results}
     assert {"egress", "egress: oracle", "egress: analyst_cloud"} <= names
+    # The doctor and the Egress policy page name the same destinations.
+    assert {"egress: misp", "egress: update_check"} <= names
     oracle = _by_name(results, "egress: oracle")
     assert oracle.detail.startswith("ON")
 

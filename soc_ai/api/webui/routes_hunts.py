@@ -18,8 +18,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from soc_ai.agent.context import HuntSubject, build_hunt_subject
 from soc_ai.agent.prompts import FocusOrigin
-from soc_ai.api.deps import ctx_from_state, get_elastic, get_settings_dep
-from soc_ai.api.hunt_runner import hunt_recorded_run
+from soc_ai.api.deps import get_elastic, get_settings_dep
 from soc_ai.api.hunt_runner import sse_encode as hunt_sse_encode
 from soc_ai.api.security import identify_caller
 from soc_ai.api.webui._errors import api_error
@@ -811,7 +810,6 @@ async def stream_hunt_chat(request: Request, body: HuntChatIn) -> EventSourceRes
     is the streaming interface for API/CLI callers that read the trace live.
     """
     started_by = await identify_caller(request)
-    ctx = ctx_from_state(request.app.state)
     prior: str | None = None
     if body.prior_hunt_id:
         async with request.app.state.db_sessionmaker() as db:
@@ -819,16 +817,21 @@ async def stream_hunt_chat(request: Request, body: HuntChatIn) -> EventSourceRes
         if got is not None:
             prior_hunt, _ = got
             prior = prior_hunt.narrative or _hunt_report(prior_hunt).get("narrative")
+    # Started through the manager, not by driving hunt_recorded_run here: that is
+    # what puts the hunt under the shared concurrency ceiling, gives it the cancel
+    # token POST /hunts/{id}/cancel flips, and keeps the run alive if the reader
+    # goes away. A stream that ran outside the manager was invisible to all three.
+    started = await hunt_console_manager.get_manager(request.app.state).start_streaming(
+        request.app.state, objective=body.objective, started_by=started_by, prior=prior
+    )
+    if started is None:
+        raise _could_not_start()
+    hunt_id, events = started
 
     async def stream() -> Any:
-        async for name, data in hunt_recorded_run(
-            request.app.state,
-            ctx=ctx,
-            objective=body.objective,
-            started_by=started_by,
-            prior=prior,
-        ):
-            yield hunt_sse_encode(name, data)
+        yield hunt_sse_encode("hunt_created", {"hunt_id": hunt_id})
+        while (item := await events.get()) is not None:
+            yield hunt_sse_encode(*item)
 
     return EventSourceResponse(stream())
 
@@ -2634,7 +2637,10 @@ async def dismiss_lead(request: Request, lead_id: int, body: LeadDismissIn) -> L
 async def hunt_lead(
     request: Request, lead_id: int, settings: Settings = Depends(get_settings_dep)
 ) -> dict[str, str]:
-    """Start a hunt from the lead. A second call returns the same hunt.
+    """Start a hunt from the lead.
+
+    A second call while that hunt runs returns the same hunt. A call after it
+    has finished starts another one, which is Hunt again on the lead page.
 
     The body of the start lives in :mod:`soc_ai.hunting.lead_hunt`, because the
     auto-hunt loop starts the same hunt. This route turns the refusals into
@@ -2680,7 +2686,11 @@ async def promote_lead(
         lead = await leads_store.get(db, lead_id)
         if lead is None:
             raise _lead_not_found(lead_id)
-        if lead.investigation_id:
+        # The second click on a promoted lead lands on its investigation. A
+        # reopened lead keeps the id as history and is open to decide again,
+        # so the id alone is not the answer: read it only while the
+        # promotion stands. Promoting again writes the new id over it.
+        if lead.investigation_id and lead.status == "promoted":
             return {"investigation_id": lead.investigation_id, "existing": "true"}
         if lead.status in leads_store.CLOSED_STATUSES:
             raise _lead_is_closed(lead, "promote")

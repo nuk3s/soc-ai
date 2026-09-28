@@ -53,7 +53,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, cast
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from soc_ai import metrics
 from soc_ai.config import Settings
@@ -175,7 +175,11 @@ class OracleVerdict(BaseModel):
     # adjudication over a voted-inconclusive local report can echo the class
     # without a validation crash (kept in sync with soc_ai.triage_models.Verdict).
     verdict: Literal["true_positive", "false_positive", "needs_more_info", "inconclusive"]
-    confidence: float
+    # Bounded here so a NaN, inf or percent-style value (json.loads accepts all
+    # of them) fails validation and takes the unparseable-answer path instead of
+    # being clamped downstream into a fabricated 1.0 that could clear the
+    # auto-ack threshold.
+    confidence: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
     summary: str
     reasoning: str
 
@@ -358,7 +362,7 @@ def _verdict_to_report(
 
     return TriageReport(
         verdict=verdict.verdict,
-        confidence=max(0.0, min(1.0, verdict.confidence)),
+        confidence=verdict.confidence,
         summary=combined_summary,
         citations=list(local_report.citations),
         recommended_actions=list(local_report.recommended_actions) if same_verdict else [],

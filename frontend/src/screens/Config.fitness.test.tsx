@@ -10,9 +10,9 @@
 // chip to that wire shape: RED KEYS ON `alarm`, a lone fail is a caution, and a
 // declined measurement is a quiet state rather than a stale verdict in a fresh
 // coat of paint.
-import { fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('./AgentToolsPanel', () => ({ AgentToolsPanel: () => null }));
 vi.mock('./ApiKeysPanel', () => ({ ApiKeysPanel: () => null }));
@@ -75,7 +75,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
 }));
 
 import { Config } from './Config';
-import { getModelFitness } from '../lib/api';
+import { getGatewayModels, getModelFitness } from '../lib/api';
 import type { ModelFitness } from '../lib/api';
 
 /** A fitness response with only the field(s) a test cares about spelled out. */
@@ -313,5 +313,94 @@ describe('the tooltip keeps the falsifiable per-leg numbers', () => {
     // The visible line is the history now, so the diagnosis has to live here.
     expect(chip.title).toContain(`${MODEL}: structured_output=fail`);
     expect(chip.title).toContain('structured_output timed out after 27.4s (budget 30s)');
+  });
+});
+
+// The auto-probe fired on every dropdown change, but GET /config/model-fitness
+// takes no model of its own: it grades the analyst_model the server is RUNNING.
+// So a staged, unapplied pick of model B showed model A's grade beside B — the
+// one verdict the chip exists to prevent. And the probe's cancel flag lived
+// inside the debounce timer's callback, whose return value nobody reads, so a
+// probe for the previous selection could still land after the chip was
+// cleared for the next one.
+describe('a staged, unapplied model pick is not graded', () => {
+  const renderPage = () =>
+    render(
+      <MemoryRouter initialEntries={['/config']}>
+        <Config />
+      </MemoryRouter>,
+    );
+
+  beforeEach(() => {
+    // Two served models → the dropdown branch, with MODEL applied and 'model-b'
+    // one change away.
+    vi.mocked(getGatewayModels).mockResolvedValue({ ok: true, models: [MODEL, 'model-b'] });
+    vi.mocked(getModelFitness).mockReset();
+  });
+
+  afterEach(() => {
+    vi.mocked(getGatewayModels).mockResolvedValue({ ok: true, models: [] });
+  });
+
+  it('offers the check for after Apply instead of showing the applied model\'s grade', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      vi.mocked(getModelFitness).mockResolvedValue(fit());
+      renderPage();
+      const sel = await screen.findByDisplayValue(MODEL);
+      await act(() => vi.advanceTimersByTimeAsync(700));
+      // The applied model is graded on mount, as before.
+      expect((await screen.findByTestId('fitness-chip')).textContent).toBe('fit');
+      const probes = vi.mocked(getModelFitness).mock.calls.length;
+      expect(probes).toBeGreaterThanOrEqual(1);
+
+      fireEvent.change(sel, { target: { value: 'model-b' } });
+      await act(() => vi.advanceTimersByTimeAsync(700));
+
+      // No probe for the staged pick — it would only grade MODEL again…
+      expect(vi.mocked(getModelFitness).mock.calls.length).toBe(probes);
+      // …and no grade is shown beside a model it does not belong to.
+      expect(screen.queryByTestId('fitness-chip')).toBeNull();
+      expect(screen.getByText('Apply the change to check fitness')).toBeTruthy();
+      expect((screen.getByText('Check fitness') as HTMLButtonElement).disabled).toBe(true);
+
+      // Back on the applied model, the chip works again without Apply.
+      fireEvent.change(sel, { target: { value: MODEL } });
+      await act(() => vi.advanceTimersByTimeAsync(700));
+      expect((await screen.findByTestId('fitness-chip')).textContent).toBe('fit');
+      expect((screen.getByText('Check fitness') as HTMLButtonElement).disabled).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('discards a probe answer that lands after the selection moved on', async () => {
+    let resolveProbe: (f: ModelFitness) => void = () => undefined;
+    vi.mocked(getModelFitness).mockReturnValue(
+      new Promise<ModelFitness>((r) => {
+        resolveProbe = r;
+      }),
+    );
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      renderPage();
+      const sel = await screen.findByDisplayValue(MODEL);
+      await act(() => vi.advanceTimersByTimeAsync(700));
+      // The mount probe for the applied model is in flight…
+      expect(vi.mocked(getModelFitness)).toHaveBeenCalledTimes(1);
+      expect(screen.getByText('Checking fitness…')).toBeTruthy();
+
+      // …when the operator moves the dropdown to a staged pick, and only then
+      // does the old answer arrive.
+      fireEvent.change(sel, { target: { value: 'model-b' } });
+      await act(async () => {
+        resolveProbe(fit());
+      });
+
+      expect(screen.queryByTestId('fitness-chip')).toBeNull();
+      expect(screen.queryByText('Checking fitness…')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

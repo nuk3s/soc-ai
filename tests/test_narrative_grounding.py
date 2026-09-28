@@ -15,6 +15,7 @@ from soc_ai.agent.narrative_grounding import (
     check_narrative_grounding,
     extract_artifacts,
     redact_ungrounded,
+    regrounding_instruction,
 )
 
 
@@ -107,6 +108,42 @@ def test_real_alert_ip_with_fabricated_host_dns_smb_is_flagged() -> None:
     assert "ad.local" in g.ungrounded and "wsus.internal" in g.ungrounded
     assert "10.20.30.10" in g.ungrounded
     assert "10.20.30.66" not in g.ungrounded  # the alert's real IP, grounded in the seed
+
+
+def test_smb_only_failure_is_actionable_by_regrounding_and_redaction() -> None:
+    """An answer that anchors on the alert's REAL IP and embellishes it with an
+    SMB story that appears nowhere in the evidence is exactly the fabrication
+    shape this module exists to catch — yet a failure whose ONLY ungrounded
+    claim was the SMB one used to come back as grounded=False with an EMPTY
+    ``ungrounded`` list. Downstream, that shape is invisible: the regrounding
+    loop keys off ``ungrounded`` (nothing to ask the agent to verify), and the
+    terminal redaction keys off it too (nothing to strip) — so the chat engine
+    shipped the SMB claim verbatim while appending the quiet line saying
+    something had been removed. The SMB claim's matched text must ride in
+    ``ungrounded`` so both halves of ground-or-strip act on it."""
+    answer = "The host at 10.0.0.5 opened SMB shares against the file server."
+    seed = "Alert: ET SCAN (10.0.0.5 -> 10.0.0.9)"
+    g = check_narrative_grounding(answer, seed_context=seed, tool_evidence=[])
+    assert g.grounded is False
+    assert "10.0.0.5" not in g.ungrounded  # the alert's real IP, grounded in the seed
+    assert g.ungrounded != []
+    assert regrounding_instruction(g.ungrounded) != ""
+    redacted = redact_ungrounded(answer, g.ungrounded)
+    assert redacted != answer
+    assert "smb" not in redacted.lower()
+    assert "(unverified)" in redacted
+    assert "10.0.0.5" in redacted
+
+
+def test_smb_claim_grounded_by_a_tool_result_is_not_flagged() -> None:
+    """The SMB check stays evidence-aware: an SMB claim whose token appears in a
+    tool result this turn is grounded, and the answer is accepted unchanged."""
+    answer = "The host at 10.0.0.5 opened SMB shares against the file server."
+    seed = "Alert: ET SCAN (10.0.0.5 -> 10.0.0.9)"
+    tool_evidence = [{"tool": "t_query_events_oql", "result": "zeek.smb_files hit from 10.0.0.5"}]
+    g = check_narrative_grounding(answer, seed_context=seed, tool_evidence=tool_evidence)
+    assert g.grounded is True
+    assert g.ungrounded == []
 
 
 def test_lowercase_hostname_needs_backticks_to_qualify() -> None:

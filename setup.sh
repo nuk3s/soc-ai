@@ -52,6 +52,58 @@ genpw(){ openssl rand -base64 15 2>/dev/null | tr -d '/+=' || head -c12 /dev/ura
 b2yn(){ [[ ${1:-} == true ]] && echo y || echo n; }
 trim(){ local s=$1; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
 
+# The managed .env block writes every free-text value single-quoted — the one
+# form compose's env_file parser and python-dotenv both read literally (left
+# bare, `$name` expands and ` #` starts a comment, so a password like `pa$sw #x`
+# reached the container as `pa` seconds after the grid check passed with the
+# real one). Neither parser has a portable escape for a single quote inside
+# single quotes, and compose rejects the whole file on a trailing backslash, so
+# a value carrying either is refused up front instead of written in a shape
+# that reads back as something else.
+envsafe(){ local name v
+  for name in "$@"; do v=${!name:-}
+    if [[ $v == *\'* || $v == *\\* || $v == *$'\n'* ]]; then
+      die "$name contains a single quote, backslash or newline — .env can't carry it reliably; pick another value."
+    fi
+  done
+}
+
+# Last-wins read of one key from .env, quotes stripped. The managed block is
+# APPENDED after .env.example's own defaults, so the file carries duplicate
+# keys and dotenv takes the last one; a first-match read returns the placeholder.
+env_readback(){ local v
+  v=$(grep "^$1=" .env 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '\r') || true
+  [[ $v == \'*\' && $v == *\' ]] && v=${v:1:-1}
+  [[ $v == \"*\" && $v == *\" ]] && v=${v:1:-1}
+  printf '%s' "$v"
+}
+
+# uvicorn opens the TLS key inside the container as uid 1000 (Dockerfile: USER
+# soc-ai) through a read-only bind mount that carries no ACLs, so the host file
+# must be readable by that uid through plain owner/group/other bits. openssl
+# writes it 0600 owned by whoever runs setup.sh — fine when that is uid 1000
+# (usually the first Linux user), but `sudo ./setup.sh` or a second admin
+# account leaves a key the container cannot open: uvicorn dies on
+# PermissionError, the container restart-loops, and the only hint is buried in
+# `docker compose logs`. Hand the group to gid 1000 and keep the key
+# group-readable when we may; otherwise 0644, as docker-compose.yml's mounts
+# note asks for.
+key_readable_by_container(){ local u g m
+  read -r u g m < <(stat -c '%u %g %a' certs/key.pem 2>/dev/null) || return 1
+  [[ -n ${m:-} ]] || return 1
+  (( 8#$m & 4 )) && return 0
+  [[ $u == 1000 ]] && (( 8#$m & 256 )) && return 0
+  [[ $g == 1000 ]] && (( 8#$m & 32 )) && return 0
+  return 1
+}
+make_key_readable(){
+  if { [[ $(id -u) -eq 1000 ]] || chgrp 1000 certs/key.pem 2>/dev/null; } \
+     && chmod 640 certs/key.pem 2>/dev/null; then return 0; fi
+  warn "certs/key.pem must be readable by the container's uid 1000 — relaxing it to 0644 (see the mounts note in docker-compose.yml)."
+  chmod 644 certs/key.pem 2>/dev/null \
+    || warn "  couldn't change certs/key.pem — make it readable by uid 1000 yourself before the container starts."
+}
+
 # Load a KEY=value config file. Only sets vars that aren't already in the
 # environment, so an explicit `FOO=bar ./setup.sh` still wins over the file.
 load_conf(){ local f=$1 line k v
@@ -60,10 +112,24 @@ load_conf(){ local f=$1 line k v
     line=${line%$'\r'}
     [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
     [[ $line == *=* ]] || continue
-    k=$(trim "${line%%=*}"); v=$(trim "${line#*=}")
+    k=$(trim "${line%%=*}"); v=${line#*=}
+    [[ -n $k ]] || continue
+    # Checked before the ${!k+x} test below: an indirect expansion of a name
+    # bash can't hold (`export KEY=…`, a hyphen, a space) aborts the whole run
+    # with bash's own one-line error and neither the file nor the line named.
+    [[ $k =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "$f: invalid key '$k' (expected KEY=value)"
+    # An unquoted value ends at the first whitespace-then-#, the way dotenv and
+    # compose read the .env this feeds — setup.conf.example annotates its lines
+    # that way, and a comment carried into the value flipped API_AUTH_REQUIRED
+    # and LITELLM_VERIFY_SSL to "not true" and made the comment text the Fernet
+    # key. A quoted value is taken whole (quotes stripped), so it can hold ` #`.
+    # Stripped on the raw text before trim(): a line that is only an annotation
+    # (`ES_HOSTS=      # blank = …`) would otherwise trim to a value starting `#`.
+    [[ $(trim "$v") == [\"\']* ]] || v=${v%%[[:space:]]#*}
+    v=$(trim "$v")
     [[ $v == \"*\" && $v == *\" ]] && v=${v:1:-1}
     [[ $v == \'*\' && $v == *\' ]] && v=${v:1:-1}
-    [[ -n $k && -z ${!k+x} ]] && export "$k=$v"
+    [[ -z ${!k+x} ]] && export "$k=$v"
   done < "$f"
   return 0
 }
@@ -228,6 +294,7 @@ if [[ $RECFG == y ]]; then
   ask ES_HOSTS "  Elasticsearch URL" "${ES_HOSTS:-${SO_HOST%/}:9200}"
   [[ -n ${SO_HOST:-} && -n ${SO_USERNAME:-} && -n ${SO_PASSWORD:-} ]] \
     || die "SO_HOST, SO_USERNAME and SO_PASSWORD are required."
+  envsafe SO_HOST SO_USERNAME SO_PASSWORD ES_HOSTS
 
   # Validate SO + ES BEFORE the long build, so a typo'd host/password fails in
   # seconds instead of after a 3-minute build and a first hunt.
@@ -265,6 +332,7 @@ if [[ $RECFG == y ]]; then
     yesno LLM_TLS "  Verify the gateway's TLS cert? (No for a self-signed gateway)" "$(b2yn "${LITELLM_VERIFY_SSL:-true}")"
     ANALYST_CLOUD_REDACTION=""
   fi
+  envsafe LITELLM_BASE_URL LITELLM_API_KEY
 
   # HEAVY_MODEL is the old name for ANALYST_MODEL — honor it if a config file
   # still uses it, so upgrades don't silently lose the setting.
@@ -392,7 +460,7 @@ if [[ $RECFG == y ]]; then
   # MaxMind GeoLite2 (GeoIP/ASN enrichment). Free key: https://www.maxmind.com/en/geolite2/signup
   # Documented in docs/DOCKER.md but previously missing here — GeoIP silently
   # no-ops without it.
-  ask MAXMIND_LICENSE_KEY "  MaxMind GeoLite2 license key (blank to skip GeoIP/ASN)" "${MAXMIND_LICENSE_KEY:-}"
+  ask MAXMIND_LICENSE_KEY "  MaxMind GeoLite2 license key (optional; the .mmdb files are copied by hand, see docs/BLOCKLISTS.md)" "${MAXMIND_LICENSE_KEY:-}"
 
   echo
   info "Day-1 automation:"
@@ -409,27 +477,31 @@ if [[ $RECFG == y ]]; then
   # Pin the prebuilt image to the release version, so --prebuilt never rides the
   # mutable :latest tag. Resolved from pyproject.toml (fallback: newest v* tag).
   SOC_AI_IMAGE_TAG=${SOC_AI_IMAGE_TAG:-$(resolve_release_version)}
+  envsafe ANALYST_MODEL WEBUI_ALERTS_QUERY ABUSE_CH_AUTH_KEY MAXMIND_LICENSE_KEY \
+          CONFIG_SECRET_KEY BOOTSTRAP_ADMIN_PASSWORD
 
   [[ -f .env ]] || cp .env.example .env
   sed -i '/# >>> soc-ai setup.sh >>>/,/# <<< soc-ai setup.sh <<</d' .env 2>/dev/null || true
   {
     echo "# >>> soc-ai setup.sh >>>   (this block wins — dotenv last value applies)"
-    echo "SO_HOST=${SO_HOST%/}"
+    # Free-text values are single-quoted: literal for compose and dotenv alike
+    # (see envsafe above), so `$` and ` #` in a secret survive the parse.
+    echo "SO_HOST='${SO_HOST%/}'"
     echo "SO_VERIFY_SSL=$([[ $SO_TLS == y ]] && echo true || echo false)"
-    echo "SO_USERNAME=${SO_USERNAME}"
-    echo "SO_PASSWORD=${SO_PASSWORD}"
-    echo "ES_HOSTS=${ES_HOSTS}"
-    echo "ES_USERNAME=${SO_USERNAME}"
-    echo "ES_PASSWORD=${SO_PASSWORD}"
+    echo "SO_USERNAME='${SO_USERNAME}'"
+    echo "SO_PASSWORD='${SO_PASSWORD}'"
+    echo "ES_HOSTS='${ES_HOSTS}'"
+    echo "ES_USERNAME='${SO_USERNAME}'"
+    echo "ES_PASSWORD='${SO_PASSWORD}'"
     echo "ES_VERIFY_SSL=$([[ $SO_TLS == y ]] && echo true || echo false)"
-    echo "LITELLM_BASE_URL=${LITELLM_BASE_URL%/}"
-    echo "LITELLM_API_KEY=${LITELLM_API_KEY}"
+    echo "LITELLM_BASE_URL='${LITELLM_BASE_URL%/}'"
+    echo "LITELLM_API_KEY='${LITELLM_API_KEY}'"
     echo "LITELLM_VERIFY_SSL=$([[ $LLM_TLS == y ]] && echo true || echo false)"
-    echo "ANALYST_MODEL=${ANALYST_MODEL}"
+    echo "ANALYST_MODEL='${ANALYST_MODEL}'"
     [[ -n ${ANALYST_CLOUD_REDACTION:-} ]] && echo "ANALYST_CLOUD_REDACTION=true"
-    [[ -n ${MAXMIND_LICENSE_KEY:-} ]] && echo "MAXMIND_LICENSE_KEY=${MAXMIND_LICENSE_KEY}"
+    [[ -n ${MAXMIND_LICENSE_KEY:-} ]] && echo "MAXMIND_LICENSE_KEY='${MAXMIND_LICENSE_KEY}'"
     [[ ${AUTO_TRIAGE:-n} == y ]] && echo "AUTO_TRIAGE_SCHEDULE_ENABLED=true"
-    [[ -n ${ABUSE_CH_AUTH_KEY:-} ]] && echo "ABUSE_CH_AUTH_KEY=${ABUSE_CH_AUTH_KEY}"
+    [[ -n ${ABUSE_CH_AUTH_KEY:-} ]] && echo "ABUSE_CH_AUTH_KEY='${ABUSE_CH_AUTH_KEY}'"
     # Prebuilt installs pin the image to a specific release rather than :latest
     # (an unaudited moving target). Source builds don't pull, so no pin is written.
     if [[ $PREBUILT -eq 1 ]]; then
@@ -439,14 +511,14 @@ if [[ $RECFG == y ]]; then
         echo "# SOC_AI_IMAGE_TAG=   # PIN THIS to a release (e.g. 1.1.0); :latest is an unaudited moving target"
       fi
     fi
-    echo "WEBUI_ALERTS_QUERY=${WEBUI_ALERTS_QUERY}"
+    echo "WEBUI_ALERTS_QUERY='${WEBUI_ALERTS_QUERY}'"
     echo "EVENTS_INDEX_PATTERN=${EVENTS_INDEX_PATTERN}"
     echo "CASES_INDEX_PATTERN=${EIDX_PFX}so-case*"
     echo "DETECTIONS_INDEX_PATTERN=${EIDX_PFX}so-detection*"
     echo "PLAYBOOKS_INDEX_PATTERN=${EIDX_PFX}so-playbook*"
     echo "API_AUTH_REQUIRED=$([[ $APIAUTH == y ]] && echo true || echo false)"
-    echo "CONFIG_SECRET_KEY=${CONFIG_SECRET_KEY}"
-    echo "BOOTSTRAP_ADMIN_PASSWORD=${BOOTSTRAP_ADMIN_PASSWORD}"
+    echo "CONFIG_SECRET_KEY='${CONFIG_SECRET_KEY}'"
+    echo "BOOTSTRAP_ADMIN_PASSWORD='${BOOTSTRAP_ADMIN_PASSWORD}'"
     echo "SOC_AI_HOST=0.0.0.0"
     echo "SOC_AI_PORT=8443"
     echo "SOC_AI_TLS_CERT=/etc/soc-ai/cert.pem"
@@ -476,7 +548,10 @@ if [[ $RECFG == y ]]; then
             API_AUTH_REQUIRED)           v=$([[ $APIAUTH == y ]] && echo true || echo false) ;;
             *)                           v="${!k:-}" ;;
           esac
-          echo "$k=$v"
+          # Single-quoted so a password with ` #` or `$` in it reads back whole
+          # on the next host — load_conf() strips the quotes and only treats a
+          # ` #` as a comment on an unquoted value.
+          echo "$k='$v'"
         done
       } > "$DEFAULT_CONF"
       ok "Saved ${DEFAULT_CONF} (chmod 600). Reuse it on another host with: ./setup.sh --auto"
@@ -492,6 +567,7 @@ fi
 # ── 3. TLS certificate ────────────────────────────────────────────────────────
 hr
 if [[ -f certs/cert.pem && -f certs/key.pem ]]; then ok "Reusing existing certs/."
+  key_readable_by_container || make_key_readable
 else
   ipdef=$(hostname -I 2>/dev/null | awk '{print $1}'); ipdef=${ipdef:-127.0.0.1}
   ask CERT_HOST "Host IP/DNS for the TLS cert" "${CERT_HOST:-$ipdef}"
@@ -501,7 +577,8 @@ else
     -keyout certs/key.pem -out certs/cert.pem 2>/dev/null \
     || openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj "/CN=soc-ai" \
          -keyout certs/key.pem -out certs/cert.pem 2>/dev/null
-  chmod 644 certs/cert.pem; chmod 640 certs/key.pem   # cert is public; key not world-readable
+  chmod 644 certs/cert.pem   # the cert is public; the key stays as tight as uid 1000 allows
+  make_key_readable
   ok "Generated self-signed certs/ (your browser warns once — accept it)."
 fi
 
@@ -547,9 +624,16 @@ else
   $DC up -d --build
 fi
 info "Waiting for the service to answer…"
+# The managed block always writes SOC_AI_PORT=8443, but a keep-existing .env
+# (RECFG=n) can carry a different host port — docker-compose.yml publishes
+# ${SOC_AI_PORT:-8443}:8443 — so read it back last-wins rather than assume 8443,
+# or this poll spins for three minutes against a port nothing listens on and
+# the summary prints a URL nobody can open. The starter-pack calls and the
+# summary below use the same value.
+_port=$(env_readback SOC_AI_PORT); _port=${_port:-8443}
 healthy=0
 for _ in $(seq 1 60); do
-  out=$(curl -fsk -m5 "https://localhost:8443/healthz" 2>/dev/null || true)
+  out=$(curl -fsk -m5 "https://localhost:${_port}/healthz" 2>/dev/null || true)
   if [[ -n $out ]]; then ok "Up — ${out}"; healthy=1; break; fi
   sleep 3
 done
@@ -587,23 +671,12 @@ fi
 # ── seed the runbook starter pack ─────────────────────────────────────────────
 if [[ ${STARTER_PACK:-y} == y ]]; then
   # BOOTSTRAP_ADMIN_PASSWORD is set in this shell on a fresh configure; on a
-  # keep-existing-.env run, read it back from .env. .env is written as
-  # `.env.example` (which ships BOOTSTRAP_ADMIN_PASSWORD= empty and
-  # SOC_AI_PORT=8443) with the real managed block APPENDED after it, so the
-  # file INTENTIONALLY carries duplicate keys — dotenv semantics are
-  # last-value-wins, so any shell read-back has to take the LAST occurrence
-  # too, same as the app itself and the test harness's env_values() helper
-  # (tests/test_setup_script.py). A first-match read silently returns
-  # .env.example's placeholder/default instead of the real value.
+  # keep-existing-.env run, read it back from .env (last occurrence wins, same
+  # as the app itself and the test harness's env_values() helper in
+  # tests/test_setup_script.py — see env_readback above).
   if [[ -z ${BOOTSTRAP_ADMIN_PASSWORD:-} && -f .env ]]; then
-    BOOTSTRAP_ADMIN_PASSWORD=$(grep '^BOOTSTRAP_ADMIN_PASSWORD=' .env | tail -1 | cut -d= -f2- | tr -d '\r') || true
+    BOOTSTRAP_ADMIN_PASSWORD=$(env_readback BOOTSTRAP_ADMIN_PASSWORD)
   fi
-  # The managed block always writes SOC_AI_PORT=8443, but a keep-existing .env
-  # (RECFG=n) can carry a different port — read it back the same last-wins way
-  # as the password instead of assuming 8443. (The earlier health poll
-  # predates this task and stays hardcoded to 8443 — out of scope here.)
-  _port=$(grep '^SOC_AI_PORT=' .env | tail -1 | cut -d= -f2- | tr -d '\r') || true
-  _port=${_port:-8443}
   # genpw() (base64, tr -d '/+=') only ever emits alphanumerics, so naive JSON
   # interpolation is safe for a freshly generated password — but a
   # keep-existing .env can carry a user-set password with a quote or backslash
@@ -642,7 +715,7 @@ yesno SEED "$_seed_q" y
 hr; ipshow=$(hostname -I 2>/dev/null | awk '{print $1}'); ipshow=${ipshow:-localhost}
 echo
 ok "${B}soc-ai is running.${N}"
-echo "    Open:     ${C}https://${ipshow}:8443/app${N}   (accept the self-signed cert on first visit)"
+echo "    Open:     ${C}https://${ipshow}:${_port}/app${N}   (accept the self-signed cert on first visit)"
 echo "    Sign in:  admin"
 if [[ $RECFG == y ]]; then
   echo "    Password: ${B}${BOOTSTRAP_ADMIN_PASSWORD}${N}    ← save this now; change it after first login"

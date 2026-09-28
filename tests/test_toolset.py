@@ -521,3 +521,37 @@ async def test_zeek_query_runs_when_the_prefetch_holds_no_record(
     )
     assert ran == ["1:abc=="]
     assert result == [{"_id": "zeek-1"}]
+
+
+def test_clamp_tool_result_clips_long_string_leaves_of_plain_dicts() -> None:
+    """A plain dict (no hits/items/rows list, no aggregations) over budget must
+    shrink, not merely be tagged. t_get_event_raw returns the raw ES _source,
+    and a Suricata alert carries payload + payload_printable + the full EVE
+    copy in message — 100KB+ that would otherwise land verbatim in the loop.
+    """
+    import json
+
+    from soc_ai.agent.toolset import _TOOL_RESULT_BUDGET_BYTES, _clamp_tool_result
+
+    big = {
+        "_id": "x",
+        "payload": "A" * 200_000,
+        "event": {"original": "B" * 50_000, "kind": "alert"},
+        "message": "C" * 50_000,
+    }
+    out = _clamp_tool_result(big)
+
+    assert out["__truncated__"] is True
+    assert len(json.dumps(out)) <= _TOOL_RESULT_BUDGET_BYTES + 512
+    # Every key survives; only the oversized string leaves are shortened.
+    assert set(big) <= set(out)
+    assert out["_id"] == "x"
+    assert out["event"]["kind"] == "alert"
+    assert len(out["payload"]) < len(big["payload"])
+    assert len(out["event"]["original"]) < len(big["event"]["original"])
+    assert len(out["message"]) < len(big["message"])
+    # The clip is announced in-band and the affected paths are listed.
+    assert "clipped" in out["payload"]
+    assert {"payload", "event.original", "message"} <= set(out["__clipped_fields__"])
+    # The caller's dict is never mutated.
+    assert len(big["payload"]) == 200_000

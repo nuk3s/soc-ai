@@ -36,6 +36,7 @@ from soc_ai.config import Settings
 from soc_ai.eval.batch import BatchSummary
 from soc_ai.eval.nightly import resolve_out_dir, run_eval_nightly
 from soc_ai.eval.quality import (
+    CODE_FALLBACK_JUMP,
     AlarmReason,
     SnapshotMetrics,
     TrendPoint,
@@ -334,11 +335,33 @@ def test_detector_fallback_jump_over_median() -> None:
     new = _metrics(fallback_rate=0.5)
     reasons = detect_regression(new, _hist(5, fallback=0.1), alarm_drop=0.15)
     assert any("fallback_rate" in r for r in reasons)
-    # A jump comfortably UNDER the 0.3 threshold stays silent. (Tested inside
-    # the boundary, not on it — 0.4-0.1 lands on binary-float 0.3000…04 and
-    # would flake an exact-boundary assertion.)
+    # A jump under the 0.3 threshold stays silent.
     below = _metrics(fallback_rate=0.35)
     assert detect_regression(below, _hist(5, fallback=0.1), alarm_drop=0.15) == []
+
+
+def test_detector_fallback_jump_exactly_on_threshold_is_silent() -> None:
+    """A jump landing EXACTLY on the 0.3 threshold must not fire on float dust.
+
+    Fallback rates are n_fallback / n_ok, so a 5-run nightly produces multiples
+    of 0.2, and an even-length history averages the middle pair: (0.0, 0.2,
+    0.0, 0.2) has median 0.1 and 0.4 - 0.1 is the binary float 0.3000…04.
+    Whether that alarms must not depend on which side of the threshold the
+    rounding lands — the operator message says "more than 0.30", so a jump of
+    exactly 0.30 stays silent, the same as it does for 0.6 over a 0.3 median.
+    """
+    mixed = _hist(2, agreement=None, fallback=0.0) + _hist(2, agreement=None, fallback=0.2)
+    on_edge = _metrics(mode="local", agreement_rate=None, fallback_rate=0.4)
+    assert detect_regression(on_edge, mixed, alarm_drop=0.15) == []
+
+    higher = _hist(2, agreement=None, fallback=0.2) + _hist(2, agreement=None, fallback=0.4)
+    on_edge = _metrics(mode="local", agreement_rate=None, fallback_rate=0.6)
+    assert detect_regression(on_edge, higher, alarm_drop=0.15) == []
+
+    # Clearly over the threshold still fires against the same history.
+    over = _metrics(mode="local", agreement_rate=None, fallback_rate=0.8)
+    reasons = detect_regression(over, mixed, alarm_drop=0.15)
+    assert [r.code for r in reasons] == [CODE_FALLBACK_JUMP]
 
 
 def test_detector_local_mode_skips_agreement_but_keeps_fallback() -> None:

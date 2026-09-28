@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from soc_ai.config import Settings
+from soc_ai.hunting.catalog_tiers import effective_catalog
 from soc_ai.store import analytics as analytics_store
 from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
 
@@ -152,6 +153,40 @@ async def test_retire_shipped_keeps_the_file_and_records_the_reason(
     assert state.tier == "shipped" and state.status == "retired"
     assert again.reason == "no domain controller on this grid"
     assert len(versions) == 1
+
+
+async def test_a_reinstated_shipped_analytic_runs_in_shadow_and_never_becomes_a_candidate(
+    settings_kratos: Settings,
+) -> None:
+    """Reinstating a shipped analytic puts it back in the sweep, in shadow.
+
+    The row read 'shadow' while the catalog ran it neither live nor in shadow,
+    so the reinstated detection was silently off and the approval to live had
+    no receipts to read. A shipped analytic also has no candidate: the file on
+    disk is its spec, and there is no text to edit.
+    """
+    shipped_id = "identity-4662-dcsync-nonmachine"
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        await analytics_store.retire_shipped(
+            db, shipped_id, shipped_text="id: x\n", by="analyst", why="no domain controller"
+        )
+        state = await analytics_store.transition(
+            db, shipped_id, to_status="shadow", by="analyst", why="reinstate"
+        )
+        cat = await effective_catalog(db)
+        with pytest.raises(ValueError, match="shipped"):
+            await analytics_store.transition(
+                db, shipped_id, to_status="candidate", by="analyst", why="edit"
+            )
+        versions = await analytics_store.versions(db, shipped_id)
+    await engine.dispose()
+    assert state.tier == "shipped" and state.status == "shadow"
+    assert cat.status_of(shipped_id) == ("shipped", "shadow")
+    assert shipped_id in cat.specs
+    assert shipped_id in cat.shadow_ids
+    assert "candidate" not in analytics_store.allowed_transitions("shipped", "shadow")
+    assert [v.to_status for v in versions] == ["retired", "shadow"]
 
 
 async def test_a_bad_spec_text_is_refused(settings_kratos: Settings) -> None:

@@ -41,9 +41,10 @@ from soc_ai.main import (
 from soc_ai.store import auth as auth_svc
 from soc_ai.store import chat as chat_svc
 from soc_ai.store import general_chat as gc_svc
+from soc_ai.store import hunts as hunt_svc
 from soc_ai.store import investigations as inv_svc
 from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
-from soc_ai.store.models import ChatMessage, GeneralChatMessage
+from soc_ai.store.models import ChatMessage, GeneralChatMessage, HuntEvent
 
 
 def _make_app(status: _DiscoveryStatus) -> SimpleNamespace:
@@ -406,6 +407,38 @@ async def test_init_store_reaps_pending_chat_turns(settings_kratos: Settings) ->
 
 
 @pytest.mark.asyncio
+async def test_init_store_reaps_pending_hunt_chat_turns(settings_kratos: Settings) -> None:
+    """A hunt follow-up chat turn still 'pending' after a restart is resolved to
+    'error' by _init_store, while a done turn is kept. The hunt chat lives in
+    hunt_events rather than chat_messages, so the chat reaper above never
+    reaches it; without its own sweep the row stayed pending forever and every
+    later question on that hunt was refused as busy."""
+    engine = make_engine(settings_kratos)
+    await run_migrations(engine)
+    maker = make_sessionmaker(engine)
+    async with maker() as db:
+        hunt = await hunt_svc.create(db, objective="beaconing", started_by="t")
+        await hunt_svc.finalize(db, hunt.id, status="complete", report={"findings": []})
+        done = await hunt_svc.create_pending_chat_assistant(db, hunt.id)
+        await hunt_svc.finish_chat_assistant(db, done.id, content="kept", status="done")
+        pend = await hunt_svc.create_pending_chat_assistant(db, hunt.id)
+    await engine.dispose()
+
+    # Restart on the same on-disk DB → startup reap runs.
+    engine2 = make_engine(settings_kratos)
+    maker2 = await _init_store(engine2, settings_kratos)
+    async with maker2() as db:
+        reaped = await db.get(HuntEvent, pend.id)
+        assert reaped is not None
+        assert reaped.payload["status"] == "error"
+        assert "interrupted" in reaped.payload["content"]
+        kept = await db.get(HuntEvent, done.id)
+        assert kept is not None
+        assert kept.payload["status"] == "done" and kept.payload["content"] == "kept"
+    await engine2.dispose()
+
+
+@pytest.mark.asyncio
 async def test_init_store_reaps_orphaned_investigation_to_interrupted(
     settings_kratos: Settings,
 ) -> None:
@@ -461,6 +494,58 @@ async def test_init_store_bootstrap_password_written_to_locked_file_not_logged(
     async with maker() as db:
         assert await auth_svc.authenticate(db, "admin", written_pw) is not None
     await engine.dispose()
+
+
+def test_persist_bootstrap_credential_mode_is_set_at_creation_not_by_chmod(
+    settings_kratos: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sidecar must be born 0600, not created under the umask and locked
+    down a moment later: between those two steps another local user could read
+    the password, and a stale 0644 sidecar from an earlier run would keep its
+    old mode through a plain truncate-and-rewrite. Neutralising chmod and
+    opening up the umask exposes both."""
+    import os
+    from pathlib import Path
+
+    from soc_ai.main import _persist_bootstrap_credential
+
+    cred_path = settings_kratos.soc_ai_data_dir / "bootstrap-admin-password.txt"
+    cred_path.parent.mkdir(parents=True, exist_ok=True)
+    cred_path.write_text("stale\n")
+    cred_path.chmod(0o644)
+
+    monkeypatch.setattr(Path, "chmod", lambda self, mode, **kw: None)
+    old_umask = os.umask(0o000)
+    try:
+        _persist_bootstrap_credential(settings_kratos, "fresh-pw")
+    finally:
+        os.umask(old_umask)
+
+    assert stat.S_IMODE(cred_path.stat().st_mode) == 0o600
+    assert cred_path.read_text() == "fresh-pw\n"
+
+
+def test_persist_bootstrap_credential_chmod_failure_leaves_no_readable_file(
+    settings_kratos: Settings, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """When the data dir cannot honour the mode, the fallback log line is the
+    operator's only way to the account — but the file that was already written
+    must not survive alongside it, or the credential sits in both places."""
+    from pathlib import Path
+
+    from soc_ai.main import _persist_bootstrap_credential
+
+    def _refuse(self: Path, mode: int, **kw: Any) -> None:
+        raise OSError("mode changes not supported")
+
+    monkeypatch.setattr(Path, "chmod", _refuse)
+    cred_path = settings_kratos.soc_ai_data_dir / "bootstrap-admin-password.txt"
+    cred_path.parent.mkdir(parents=True, exist_ok=True)
+    with caplog.at_level(logging.WARNING, logger="soc_ai.main"):
+        _persist_bootstrap_credential(settings_kratos, "fallback-pw")
+
+    assert not cred_path.exists()
+    assert "password=fallback-pw" in caplog.text
 
 
 # --------------------------------------------------------------------------- #

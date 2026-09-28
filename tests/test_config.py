@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from ipaddress import IPv4Network
 from pathlib import Path
 
@@ -74,6 +75,43 @@ def test_env_example_oracle_models_match_shipped_defaults() -> None:
         values[key.strip()] = value.strip()
     assert values.get("ORACLE_MODEL") == Settings.model_fields["oracle_model"].default
     assert values.get("CLAUDE_ORACLE_MODEL") == Settings.model_fields["claude_oracle_model"].default
+
+
+def test_env_example_commented_timeout_defaults_match_settings() -> None:
+    """Every commented-out value in the Timeouts & retries block is the code default.
+
+    The block's header promises exactly that, and an operator sizing the timeout
+    ladder uncomments a line believing it is a no-op. AUTO_TRIAGE_PER_TARGET_TIMEOUT_S
+    sat at 600 after the default moved to 1200. Only class defaults are read, so
+    no env is needed.
+    """
+    text = (Path(__file__).resolve().parent.parent / ".env.example").read_text(encoding="utf-8")
+    start = text.index("# --- Timeouts & retries")
+    end = text.find("\n# ---", start + 1)
+    block = text[start:end] if end != -1 else text[start:]
+    pairs = re.findall(r"(?m)^# ([A-Z_]+)=(\S+)$", block)
+    assert pairs, "no commented defaults found in the Timeouts & retries block"
+    for key, value in pairs:
+        field = key.lower()
+        assert field in Settings.model_fields, f"{key} is not a Settings field"
+        default = Settings.model_fields[field].default
+        assert str(default) == value, (
+            f".env.example says {key}={value}; the code default is {default}"
+        )
+
+
+def test_soc_ai_port_rejects_host_ip_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``SOC_AI_PORT`` is the plain host port; the host interface is ``SOC_AI_BIND``.
+
+    compose feeds the same .env to the container, so an ``IP:PORT`` value here
+    (the shape Docker accepts in a publish spec) reaches this int field and the
+    container fails validation before it listens. DOCKER.md's loopback recipe is
+    pinned to SOC_AI_BIND in tests/test_docs_accuracy.py for that reason.
+    """
+    _setenv_required(monkeypatch)
+    monkeypatch.setenv("SOC_AI_PORT", "127.0.0.1:8443")
+    with pytest.raises(ValidationError, match="soc_ai_port"):
+        Settings()
 
 
 def test_audit_redact_defaults_on(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -201,6 +239,57 @@ def test_so_ca_bundle_accepts_path(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SO_CA_BUNDLE", "/etc/pki/ca.pem")
     s = Settings()
     assert s.so_ca_bundle == Path("/etc/pki/ca.pem")
+
+
+def test_blank_tls_cert_and_key_are_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A verbatim ``.env.example`` ships ``SOC_AI_TLS_CERT=`` / ``SOC_AI_TLS_KEY=``
+    bare; both must read as unset (plain HTTP), not ``Path(".")``."""
+    from soc_ai import cli
+
+    _setenv_required(monkeypatch)
+    monkeypatch.setenv("SOC_AI_TLS_CERT", "")
+    monkeypatch.setenv("SOC_AI_TLS_KEY", "")
+    s = Settings()
+    assert s.soc_ai_tls_cert is None
+    assert s.soc_ai_tls_key is None
+    monkeypatch.setattr(cli, "get_settings", lambda: s)
+    assert cli._resolve_base_url(None).startswith("http://")
+
+
+def test_log_level_is_normalised_to_uppercase(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``logging.basicConfig`` only accepts upper-case level names, so the
+    uvicorn-style lowercase spelling must be normalised rather than crash serve."""
+    _setenv_required(monkeypatch)
+    monkeypatch.setenv("LOG_LEVEL", "debug")
+    assert Settings().log_level == "DEBUG"
+    monkeypatch.setenv("LOG_LEVEL", " warning ")
+    assert Settings().log_level == "WARNING"
+
+
+def test_log_level_rejects_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
+    _setenv_required(monkeypatch)
+    monkeypatch.setenv("LOG_LEVEL", "verbose")
+    with pytest.raises(ValidationError, match="LOG_LEVEL"):
+        Settings()
+
+
+def test_blank_provider_keys_are_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The optional API keys / webhook URL ship bare in ``.env.example``; a blank
+    value must be ``None`` so every ``is not None`` feature gate stays off."""
+    _setenv_required(monkeypatch)
+    fields = {
+        "GREYNOISE_API_KEY": "greynoise_api_key",
+        "SHODAN_API_KEY": "shodan_api_key",
+        "MAXMIND_LICENSE_KEY": "maxmind_license_key",
+        "ABUSE_CH_AUTH_KEY": "abuse_ch_auth_key",
+        "NOTIFY_WEBHOOK_URL": "notify_webhook_url",
+        "CRAWL4AI_TOKEN": "crawl4ai_token",
+    }
+    for env_name in fields:
+        monkeypatch.setenv(env_name, "")
+    s = Settings()
+    for env_name, attr in fields.items():
+        assert getattr(s, attr) is None, env_name
 
 
 def test_blocklist_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -684,6 +773,21 @@ def test_csv_env_forms_for_oracle_and_proxy_lists(monkeypatch: pytest.MonkeyPatc
     # A single bare value must also work (not just multi-item CSV).
     monkeypatch.setenv("PROXY_TRUSTED_IPS", "192.0.2.1")
     assert Settings().proxy_trusted_ips == ["192.0.2.1"]
+
+
+def test_oracle_internal_suffixes_env_is_canonicalised(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A suffix typed without its leading dot or in mixed case must load in the
+    same canonical form the DB identifier path produces (lowercase, leading dot).
+
+    The sanitizer's suffix-FQDN regex embeds the suffix verbatim after a label
+    that cannot end in ``.``, and its email/domain rules lowercase the value but
+    not the suffix, so ``acme.example`` or ``.ACME.EXAMPLE`` silently matched
+    nothing on every consumer that reads the raw settings tuple.
+    """
+    _setenv_required(monkeypatch)
+    monkeypatch.setenv("ORACLE_INTERNAL_SUFFIXES", "acme.example, .ACME.Corp ,.lan,LAN, . ,")
+    s = Settings()
+    assert s.oracle_internal_suffixes == (".acme.example", ".acme.corp", ".lan")
 
 
 def test_apply_to_settings_returns_only_applied_keys(monkeypatch: pytest.MonkeyPatch) -> None:

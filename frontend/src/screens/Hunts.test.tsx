@@ -62,7 +62,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
   }),
 }));
 
-import { getAnalytic, getAnalytics, getHunts, getHuntStats, getLeads } from '../lib/api';
+import { ApiError, getAnalytic, getAnalytics, getHunts, getHuntStats, getLeads } from '../lib/api';
 import { ShellProvider } from '../shell/ShellContext';
 import { CHIP_CATALOG_RUN, TYPE_LEAD } from '../lib/tooltips';
 import type { HuntsQuery } from '../lib/api';
@@ -185,6 +185,67 @@ describe('ScheduledHunts demo guard', () => {
 
     await screen.findByText(/Not available in the read-only demo/);
     expect(deleteHuntScheduleMock).not.toHaveBeenCalled();
+  });
+});
+
+// The toggle and the delete used to swallow every rejection. PUT/DELETE
+// /hunt-schedules are admin-only, and the panel never reads the caller's role,
+// so an analyst who paused a schedule (or confirmed its deletion) saw the pill
+// stay put and the row survive, with nothing on screen saying why — and no
+// poll runs on this list to correct it later. The schedule kept firing while
+// the operator believed it was off. Every rejection now lands in the panel's
+// error slot, the same one the add/edit form already uses.
+describe('ScheduledHunts surfaces a refused toggle or delete', () => {
+  const scheduleRow = async () =>
+    (await screen.findByText('Nightly beacon sweep')).closest('div')!.parentElement!
+      .parentElement!;
+
+  it('names the admin gate when the toggle is refused with 403', async () => {
+    getHuntSchedulesMock.mockResolvedValue({ schedules: [SCHEDULE], masterSwitchEnabled: true });
+    updateHuntScheduleMock.mockRejectedValue(new ApiError('Only an admin can do this.', 403));
+    renderHunts(false);
+
+    fireEvent.click(within(await scheduleRow()).getByText('on'));
+
+    await screen.findByText('Only an admin can change schedules.');
+    expect(updateHuntScheduleMock).toHaveBeenCalledWith(1, { enabled: false });
+  });
+
+  it('shows the server message when the toggle fails for another reason', async () => {
+    getHuntSchedulesMock.mockResolvedValue({ schedules: [SCHEDULE], masterSwitchEnabled: true });
+    updateHuntScheduleMock.mockRejectedValue(new ApiError('Scheduler is unavailable.', 503));
+    renderHunts(false);
+
+    fireEvent.click(within(await scheduleRow()).getByText('on'));
+
+    await screen.findByText('Scheduler is unavailable.');
+  });
+
+  it('names the admin gate when the delete is refused with 403', async () => {
+    getHuntSchedulesMock.mockResolvedValue({ schedules: [SCHEDULE], masterSwitchEnabled: true });
+    deleteHuntScheduleMock.mockRejectedValue(new ApiError('Only an admin can do this.', 403));
+    renderHunts(false);
+
+    const row = await scheduleRow();
+    fireEvent.click(within(row).getByTitle('Delete schedule'));
+    fireEvent.click(within(row).getByTitle('Confirm delete'));
+
+    await screen.findByText('Only an admin can change schedules.');
+    expect(deleteHuntScheduleMock).toHaveBeenCalledWith(1);
+    // The row is still there — the delete did not happen.
+    expect(screen.getByText('Nightly beacon sweep')).toBeTruthy();
+  });
+
+  it('falls back to a plain sentence when the rejection carries no message', async () => {
+    getHuntSchedulesMock.mockResolvedValue({ schedules: [SCHEDULE], masterSwitchEnabled: true });
+    deleteHuntScheduleMock.mockRejectedValue('boom');
+    renderHunts(false);
+
+    const row = await scheduleRow();
+    fireEvent.click(within(row).getByTitle('Delete schedule'));
+    fireEvent.click(within(row).getByTitle('Confirm delete'));
+
+    await screen.findByText('Could not delete the schedule.');
   });
 });
 

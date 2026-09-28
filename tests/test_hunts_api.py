@@ -972,6 +972,79 @@ def test_hunt_console_manager_caps_concurrent_hunts() -> None:
     asyncio.run(_go())
 
 
+def test_stream_hunt_chat_refuses_at_concurrency_ceiling(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """POST /hunts/chat/stream counts against the SAME ceiling as every other
+    start path. It used to drive hunt_recorded_run directly, so N concurrent
+    streams put N hunts on the model route no matter how full the manager was —
+    the incident the ceiling exists for, reachable from the API/CLI surface."""
+
+    async def _no_events(*_a: Any, **_kw: Any) -> Any:
+        return
+        yield  # pragma: no cover - makes this an async generator
+
+    monkeypatch.setattr(hcm, "_MAX_CONCURRENT_HUNTS", 0)
+    with patch("soc_ai.api.hunt_runner.run_hunt", _no_events):
+        resp = client.post("/api/v1/hunts/chat/stream", json={"objective": "hunt for beaconing"})
+    assert resp.status_code == 503
+    assert resp.json()["detail"]["reason"] == "could_not_start"
+
+
+def test_stream_hunt_chat_is_cancellable_from_the_console() -> None:
+    """A streamed hunt is registered with the HuntConsoleManager like a polled
+    one, so POST /hunts/{id}/cancel finds it (instead of 404 no_live_hunt), the
+    run is told it was an operator cancel, and the live stream ends."""
+    from types import SimpleNamespace
+
+    from soc_ai.api.webui import routes_hunts
+
+    async def _go() -> None:
+        block = asyncio.Event()
+        seen: dict[str, Any] = {}
+
+        def _fake_run(_state: Any, **kw: Any) -> Any:
+            seen.update(kw)
+
+            async def _gen() -> Any:
+                yield "hunt_created", {"hunt_id": "h1"}
+                yield "hunt_started", {"sequence": 1}
+                await block.wait()  # hold the run open until cancelled
+
+            return _gen()
+
+        state = SimpleNamespace()
+        request = SimpleNamespace(app=SimpleNamespace(state=state), headers={})
+        with (
+            patch.object(hcm, "hunt_recorded_run", _fake_run),
+            patch.object(hcm, "ctx_from_state", lambda _s: MagicMock()),
+            patch.object(routes_hunts, "identify_caller", AsyncMock(return_value="tester")),
+        ):
+            resp = await routes_hunts.stream_hunt_chat(
+                request, routes_hunts.HuntChatIn(objective="hunt for beaconing")
+            )
+            events = resp.body_iterator
+            first = await anext(events)
+            assert first["event"] == "hunt_created"
+            assert '"h1"' in first["data"]
+            second = await anext(events)
+            assert second["event"] == "hunt_started"
+
+            mgr = hcm.get_manager(state)
+            assert mgr.cancel("h1") is True
+            # The run learns it was an EXPLICIT cancel (recorded as 'cancelled',
+            # not 'error'), and the live stream closes instead of hanging.
+            assert seen["cancel_token"].requested is True
+            with pytest.raises(StopAsyncIteration):
+                await anext(events)
+            for _ in range(5):
+                await asyncio.sleep(0)  # flush done-callbacks (slot cleanup)
+            assert "h1" not in mgr._tasks
+            assert mgr.cancel("h1") is False
+
+    asyncio.run(_go())
+
+
 def test_run_hunt_chat_turn_error_content_is_scrubbed_before_persisting() -> None:
     """F75: identical to the investigation-chat catch-all (chat_manager.py) —
     the raised exception's message is stringified straight into the persisted
@@ -4023,6 +4096,9 @@ def test_a_lead_hunt_that_finds_no_threat_closes_the_lead(
     assert detail["hunt_outcome_label"] == "No threat observed"
     assert lead_id in _lead_set(client, "closed")
     assert lead_id not in _lead_set(client, "needs_decision")
+    # What a second click does depends on whether the hunt has finished:
+    # test_hunting_a_lead_whose_hunt_still_runs_returns_it and
+    # test_hunting_a_lead_whose_hunt_finished_starts_a_new_one pin both.
 
 
 def test_every_kind_has_analyst_words() -> None:
@@ -4256,6 +4332,98 @@ def test_hunting_a_lead_that_is_already_hunting_says_the_hunt_exists(client: Tes
     assert res.json() == {"hunt_id": "01HUNTEXISTING", "existing": "true"}
 
 
+def test_hunting_a_lead_whose_hunt_still_runs_returns_it(client: TestClient) -> None:
+    """A running hunt is the hunt. The click lands on it rather than beside it."""
+    lead_id = _seed_lead_row(client, status="hunting", hunt_status="running")
+    res = client.post(f"/api/v1/hunts/leads/{lead_id}/hunt")
+    assert res.status_code == 200
+    assert res.json() == {"hunt_id": "lead-hunt-hunting-running", "existing": "true"}
+
+
+def test_hunting_a_lead_whose_hunt_finished_starts_a_new_one(
+    client: TestClient, settings_kratos: Settings
+) -> None:
+    """Hunt again on a finished hunt starts another one.
+
+    The page offers Start another hunt on a lead whose hunt has landed, and a
+    second hunt is a real thing to want after a visibility gap or a failed
+    run. The route used to answer with the old hunt, so the control never did
+    what it said.
+    """
+    import time
+
+    from soc_ai.so_client.elastic import EsSearchResult
+
+    lead_id = _seed_lead(client)
+    old_hunt_id = _attach_complete_hunt(client, lead_id)
+    with (
+        patch(
+            "soc_ai.api.hunt_runner.build_investigator_model",
+            return_value=TestModel(
+                call_tools=["t_query_events_oql"], custom_output_args=FAKE_REPORT
+            ),
+        ),
+        patch(
+            "soc_ai.agent.toolset.query_events_oql",
+            AsyncMock(return_value=EsSearchResult(total=0, took_ms=1)),
+        ),
+    ):
+        res = client.post(f"/api/v1/hunts/leads/{lead_id}/hunt")
+        assert res.status_code == 200, res.text
+        assert "existing" not in res.json()
+        new_hunt_id = res.json()["hunt_id"]
+        assert new_hunt_id != old_hunt_id
+        out = None
+        for _ in range(50):
+            out = _read_hunt(settings_kratos, new_hunt_id)
+            if out is not None and out["status"] in ("complete", "error"):
+                break
+            time.sleep(0.1)
+    assert out is not None and out["status"] == "complete"
+    assert client.get(f"/api/v1/hunts/{new_hunt_id}").status_code == 200
+    detail = client.get(f"/api/v1/hunts/leads/{lead_id}").json()
+    assert detail["status"] == "hunting" and detail["hunt_id"] == new_hunt_id
+    # The first hunt is history, not gone.
+    assert client.get(f"/api/v1/hunts/{old_hunt_id}").status_code == 200
+
+
+def test_deleting_a_hunt_clears_the_lead_that_started_it(
+    client: TestClient, settings_kratos: Settings
+) -> None:
+    """A lead whose hunt was deleted is open again, and can take another hunt.
+
+    ``Lead.hunt_id`` carries no foreign key. The lead used to keep the dead
+    id under a ``hunting`` status: Hunt answered with an id that 404s,
+    Promote refused it, the loop skipped it, and Needs decision listed it
+    with nothing to decide.
+    """
+    from soc_ai.so_client.elastic import EsSearchResult
+
+    lead_id = _seed_lead_row(client, status="hunting", hunt_status="complete")
+    resp = client.delete("/api/v1/hunts/lead-hunt-hunting-complete")
+    assert resp.status_code == 200
+
+    detail = client.get(f"/api/v1/hunts/leads/{lead_id}").json()
+    assert detail["status"] == "open" and detail["hunt_id"] is None
+
+    with (
+        patch(
+            "soc_ai.api.hunt_runner.build_investigator_model",
+            return_value=TestModel(
+                call_tools=["t_query_events_oql"], custom_output_args=FAKE_REPORT
+            ),
+        ),
+        patch(
+            "soc_ai.agent.toolset.query_events_oql",
+            AsyncMock(return_value=EsSearchResult(total=0, took_ms=1)),
+        ),
+    ):
+        res = client.post(f"/api/v1/hunts/leads/{lead_id}/hunt")
+    assert res.status_code == 200, res.text
+    assert "existing" not in res.json()
+    assert res.json()["hunt_id"] != "lead-hunt-hunting-complete"
+
+
 def test_promoting_a_lead_investigates_its_hunt(client: TestClient) -> None:
     """The subject is the hunt, not the one document the lead cited hardest."""
     from types import SimpleNamespace
@@ -4343,6 +4511,58 @@ def test_promoting_a_lead_twice_returns_the_same_investigation(client: TestClien
         second = client.post(f"/api/v1/hunts/leads/{lead_id}/promote")
     assert first.status_code == 200 and second.status_code == 200
     assert second.json() == {"investigation_id": "01INVLEAD", "existing": "true"}
+    assert start.await_count == 1
+
+
+def test_promoting_a_reopened_lead_starts_a_new_investigation(client: TestClient) -> None:
+    """A reopened lead is open to decide again, and Promote is one of the decisions.
+
+    The reopen keeps the old investigation id as history. The route used to
+    read the id alone and answer with it, so a reopened lead could never be
+    promoted again, and a lead whose investigation had been deleted reported
+    a promotion that linked to nothing.
+    """
+    from types import SimpleNamespace
+
+    from soc_ai.so_client.elastic import ElasticClient, EsSearchResult
+    from soc_ai.store import leads as leads_store
+
+    lead_id = _seed_lead(client)
+    _attach_complete_hunt(
+        client,
+        lead_id,
+        findings=[{"title": "A new peer", "citations": ["tel-doc-000002"]}],
+    )
+
+    async def promote_then_lose_the_record() -> None:
+        async with client.app.state.db_sessionmaker() as db:
+            await leads_store.mark_promoted(db, lead_id, investigation_id="01INVGONE")
+
+    asyncio.run(promote_then_lose_the_record())
+    reopened = client.post(f"/api/v1/hunts/leads/{lead_id}/reopen")
+    assert reopened.status_code == 200 and reopened.json()["status"] == "open"
+
+    hits = [{"_id": "tel-doc-000002", "_source": {"event": {"dataset": "zeek.conn"}}}]
+    start = AsyncMock(return_value="01INVNEW")
+    with (
+        patch.object(
+            ElasticClient,
+            "search",
+            AsyncMock(return_value=EsSearchResult(total=1, took_ms=1, hits=hits)),
+        ),
+        patch(
+            "soc_ai.api.webui.routes_hunts.hunt_manager.get_manager",
+            return_value=SimpleNamespace(start=start),
+        ),
+    ):
+        first = client.post(f"/api/v1/hunts/leads/{lead_id}/promote")
+        second = client.post(f"/api/v1/hunts/leads/{lead_id}/promote")
+    assert first.status_code == 200, first.text
+    assert first.json() == {"investigation_id": "01INVNEW"}
+    detail = client.get(f"/api/v1/hunts/leads/{lead_id}").json()
+    assert detail["status"] == "promoted" and detail["investigation_id"] == "01INVNEW"
+    # Promoted again, the second click lands on the new investigation.
+    assert second.json() == {"investigation_id": "01INVNEW", "existing": "true"}
     assert start.await_count == 1
 
 

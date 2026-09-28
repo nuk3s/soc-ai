@@ -263,8 +263,11 @@ reuses the same tool functions as the FastAPI path.
 Local enrichment makes no call at runtime. soc-ai loads the blocklists, the
 MaxMind GeoLite2 databases and the vendored cloud-provider prefix lists from
 disk. The blocklists are URLhaus, ThreatFox, Feodo, the Tor exit list and the
-operator seed. MaxMind GeoLite2 supplies the ASN database and the City database.
-The `soc-ai blocklists refresh` CLI subcommand refreshes them all.
+operator seed. MaxMind GeoLite2 supplies the ASN database and the City database,
+and the operator downloads those two files by hand.
+
+The `soc-ai blocklists refresh` CLI subcommand refreshes the blocklists and the
+cloud prefixes.
 
 Every enrichment source is wrapped, so a missing or stale source degrades triage
 and never blocks it. MISP is the one optional network lookup, if you configure

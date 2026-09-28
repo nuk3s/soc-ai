@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
@@ -282,6 +283,7 @@ async def test_transport_error_is_fail_soft_and_audited() -> None:
 
     class _BoomClient(_FakeClient):
         async def post(self, url: str, *, json: dict[str, Any]) -> _FakeResponse:
+            self.posts.append((url, json))
             raise RuntimeError("connection refused")
 
     client = _BoomClient()
@@ -290,10 +292,62 @@ async def test_transport_error_is_fail_soft_and_audited() -> None:
     event = notify.NotifyEvent(kind="tp", title="t", body="b", url="/app/investigation/INV-1")
     with ctx:
         await notify.fire(event, _settings(), audit)  # must not raise
+    # Not an httpx transport error → not transient → no retry.
+    assert len(client.posts) == 1
     audit.log_kind.assert_awaited_once()
     _a, kwargs = audit.log_kind.call_args
     assert kwargs["payload"]["ok"] is False
     assert kwargs["payload"]["error"] == "RuntimeError"
+
+
+class _FlakyClient(_FakeClient):
+    """Raises ``httpx.ConnectError`` for the first *failures* POSTs, then returns 200."""
+
+    def __init__(self, failures: int) -> None:
+        super().__init__(200)
+        self._failures = failures
+
+    async def post(self, url: str, *, json: dict[str, Any]) -> _FakeResponse:
+        self.posts.append((url, json))
+        if len(self.posts) <= self._failures:
+            raise httpx.ConnectError("connection reset")
+        return _FakeResponse(self._status)
+
+
+@pytest.mark.asyncio
+async def test_transport_error_is_retried_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A connect error on the first attempts is retried; the send lands on the next try."""
+    monkeypatch.setattr(notify, "_RETRY_BACKOFF_S", 0)
+    client = _FlakyClient(failures=notify._MAX_RETRIES)
+    ctx, _ = _patch_client(client)
+    audit = AsyncMock()
+    event = notify.NotifyEvent(kind="tp", title="t", body="b", url="/app/investigation/INV-1")
+    with ctx:
+        await notify.fire(event, _settings(), audit)
+    assert len(client.posts) == notify._MAX_RETRIES + 1
+    audit.log_kind.assert_awaited_once()
+    _a, kwargs = audit.log_kind.call_args
+    assert kwargs["payload"]["ok"] is True
+    assert kwargs["payload"]["status"] == 200
+    assert kwargs["payload"]["error"] is None
+
+
+@pytest.mark.asyncio
+async def test_transport_error_exhausts_retry_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A connect error on every attempt uses the whole budget, then is fail-soft + audited."""
+    monkeypatch.setattr(notify, "_RETRY_BACKOFF_S", 0)
+    client = _FlakyClient(failures=notify._MAX_RETRIES + 10)
+    ctx, _ = _patch_client(client)
+    audit = AsyncMock()
+    event = notify.NotifyEvent(kind="tp", title="t", body="b", url="/app/investigation/INV-1")
+    with ctx:
+        await notify.fire(event, _settings(), audit)  # must not raise
+    assert len(client.posts) == notify._MAX_RETRIES + 1
+    audit.log_kind.assert_awaited_once()
+    _a, kwargs = audit.log_kind.call_args
+    assert kwargs["payload"]["ok"] is False
+    assert kwargs["payload"]["status"] is None
+    assert kwargs["payload"]["error"] == "ConnectError"
 
 
 @pytest.mark.asyncio

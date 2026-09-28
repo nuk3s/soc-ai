@@ -344,6 +344,45 @@ async def test_kratos_login_idempotent_under_concurrency(
         await auth.aclose()
 
 
+@pytest.mark.asyncio
+async def test_kratos_concurrent_401s_cost_one_login(
+    settings_kratos: Settings, kratos_init: dict[str, Any]
+) -> None:
+    """Ten in-flight reads on one expired session make ONE login, not ten.
+
+    The 401s land a few milliseconds apart. The first one replaces the
+    session; the rest must retry with that fresh cookie rather than throw it
+    away and log in again, which would cost a login per in-flight read on
+    every expiry and feed SO's login throttling.
+    """
+    auth = KratosAuth(_forced(settings_kratos, "browser"))
+    auth._logged_in = True  # a session that has expired: no cookie in the jar
+    try:
+        with respx.mock(base_url="https://so.example.com") as mock:
+            routes = _mock_browser_login(mock, kratos_init)
+            answered = 0
+
+            async def answer(request: httpx.Request) -> httpx.Response:
+                nonlocal answered
+                answered += 1
+                await asyncio.sleep(0.004 * answered)
+                if "ory_kratos_session" in request.headers.get("cookie", ""):
+                    return httpx.Response(200, json=[])
+                return httpx.Response(401, text="session expired")
+
+            mock.get("/connect/case").mock(side_effect=answer)
+
+            responses = await asyncio.gather(
+                *(auth.request("GET", "/connect/case") for _ in range(10))
+            )
+
+            assert [r.status_code for r in responses] == [200] * 10
+            assert routes["submit"].call_count == 1
+        assert auth._refusal_count == 0
+    finally:
+        await auth.aclose()
+
+
 # =====================================================================
 # The ceiling on the login loop
 #

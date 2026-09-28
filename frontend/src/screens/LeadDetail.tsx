@@ -13,12 +13,14 @@ import { Definition } from '../components/Definition';
 import { LeadTimeline } from '../components/LeadTimeline';
 import { DismissLeadForm, HUNT_CLOSED_ACTOR, REASON_LABEL, closedByHunt } from '../components/LeadsStrip';
 import { Panel, PanelHeader } from '../components/Panel';
-import { EmptyState, LoadingState } from '../components/States';
+import { ErrorState, LoadingState, NotFoundState, StaleNotice } from '../components/States';
 import {
+  ApiError,
   getHunts,
   getLead,
   getNeedsYou,
   huntLead,
+  isNotFound,
   promoteLead,
   reopenLead,
   type LeadDetail as LeadDetailT,
@@ -67,23 +69,33 @@ import { useAsync } from '../lib/useAsync';
 /** The outcome label that makes a benign repeat the right reason to dismiss. */
 const NO_THREAT = 'No threat observed';
 
+/** One hunt on the lead. A row the list answered carries its counts. A row
+ *  built from the lead's own `hunt_id` carries only what the lead record
+ *  states about the hunt, and `fromLead` says so. */
+type LeadHunt = HuntRow & { fromLead?: boolean };
+
 /** The hunts this lead started, newest first. The page named one hunt, from
  *  `hunt_id`, so a lead hunted twice showed the first hunt forever. */
-function huntsOnLead(rows: HuntRow[] | null, lead: LeadDetailT): HuntRow[] {
-  const mine = (rows ?? []).filter((h) => h.leadId === lead.id);
-  // The lead's own `hunt_id` may sit outside the window the list answered.
+function huntsOnLead(rows: HuntRow[] | null, lead: LeadDetailT): LeadHunt[] {
+  const mine: LeadHunt[] = (rows ?? []).filter((h) => h.leadId === lead.id);
+  // The lead's own `hunt_id` may sit outside the window the list answered:
+  // the list is the newest hundred, and an older lead's hunt falls off it. The
+  // row then reads the status the lead record states. It stated "complete"
+  // whatever the hunt was doing, so a running hunt read as finished and an
+  // errored one read as clean, against the pill on the same page.
   if (lead.hunt_id && !mine.some((h) => h.id === lead.hunt_id)) {
     mine.push({
       id: lead.hunt_id,
       objective: '',
       kind: 'lead',
-      status: 'complete',
+      status: lead.hunt_status ?? 'complete',
       findingCount: 0,
       affectedHosts: 0,
       confidence: null,
       startedBy: '',
       when: '',
       ts: '',
+      fromLead: true,
     });
   }
   return mine;
@@ -101,7 +113,15 @@ export function LeadDetail() {
   // page: the record held the promotion and the running investigation, and
   // the page still read Hunted with Promote live.
   const [promoted, setPromoted] = useState('');
-  const lead = useAsync<LeadDetailT>(() => getLead(leadId), [leadId]);
+  // A lead id is an integer. Anything else in the address is a wrong link,
+  // not a read to retry: `Number('01BOGUS')` is NaN, the request went out as
+  // /leads/NaN, and the 422 rendered an error card whose Retry could never
+  // succeed. A 404 here takes the not-found branch below without a request.
+  const validId = Number.isInteger(leadId) && leadId > 0;
+  const lead = useAsync<LeadDetailT>(
+    () => (validId ? getLead(leadId) : Promise.reject(new ApiError(`Lead ${id} not found`, 404))),
+    [leadId],
+  );
   // Every hunt on this lead, not only the newest. `kind=lead` is the whole
   // class; the lead id narrows it to this one.
   const leadHunts = useAsync(() => getHunts({ kind: 'lead' }), [leadId]);
@@ -113,7 +133,19 @@ export function LeadDetail() {
   const needsYou = useAsync(() => getNeedsYou().catch(() => null), [leadId]);
 
   if (lead.loading && !lead.data) return <LoadingState label="Reading the lead" />;
-  if (lead.error || !lead.data) return <EmptyState>This lead does not exist.</EmptyState>;
+  // A 404 is an answer, and retrying one fails again. Any other failure keeps
+  // the error card and its Retry: the page answered every failure with "does
+  // not exist", so a grid outage read as a deleted record. Both branches wait
+  // on `!data`, the way the hunt and host pages do: the re-read behind
+  // Promote, Reopen and Dismiss keeps the lead on screen when it fails.
+  if (lead.error && !lead.data) {
+    return isNotFound(lead.error) ? (
+      <NotFoundState what="lead" id={id} backTo="/hunts#leads" backLabel="Back to leads" />
+    ) : (
+      <ErrorState error={lead.error} onRetry={lead.refetch} label="this lead" />
+    );
+  }
+  if (!lead.data) return null;
   const d = lead.data;
   // The state the strip shows, derived once. The page said "Hunting" over a
   // hunt that had already finished, and the strip said "Hunted".
@@ -167,6 +199,16 @@ export function LeadDetail() {
 
   return (
     <div className="p-5">
+      {/* The re-read failed and the page still shows the record it read
+          before. Nothing polls underneath, so the line offers the refresh. */}
+      {lead.error && (
+        <StaleNotice
+          since={lead.lastUpdated}
+          reason="refresh-failed"
+          onRefresh={lead.refetch}
+          className="mb-3"
+        />
+      )}
       <div className="flex flex-wrap items-center gap-3">
         <h1 className="text-[19px] font-semibold">
           Lead {d.id} ·{' '}
@@ -418,7 +460,18 @@ export function LeadDetail() {
       {confirmAgain && (
         <div className="mt-3 flex flex-wrap items-center gap-2 rounded-panel border border-border bg-surface-1 p-3 text-[12.5px]">
           <span>
-            A hunt on this lead already exists. Open {attached?.id} before you start another.
+            A hunt on this lead already exists.{' '}
+            {attached ? (
+              <>
+                Open{' '}
+                <Link to={`/hunts/${attached.id}`} className="font-mono text-accent hover:underline">
+                  {attached.id}
+                </Link>{' '}
+                before you start another.
+              </>
+            ) : (
+              'Open it before you start another.'
+            )}
           </span>
           <button
             type="button"
@@ -487,10 +540,16 @@ export function LeadDetail() {
                   {HUNT_STATUS[h.status as HuntStatus]?.label ?? h.status}
                 </span>
                 {h.when && <span className="text-[11.5px] text-faint">started {h.when}</span>}
-                {h.status === 'complete' && (
+                {/* A row the list never answered carries no count. It states
+                    the outcome the lead record holds, and "0 threat findings"
+                    over a hunt that found some was the earlier defect. */}
+                {h.status === 'complete' && !h.fromLead && (
                   <span className="text-[11.5px] text-dim" title={COUNT_THREAT_FINDINGS}>
                     {plural(h.threatFindingCount ?? h.findingCount, 'threat finding')}
                   </span>
+                )}
+                {h.status === 'complete' && h.fromLead && d.hunt_outcome_label && (
+                  <span className="text-[11.5px] text-dim">{d.hunt_outcome_label}</span>
                 )}
               </li>
             ))}

@@ -1,0 +1,30 @@
+# Weekly bump PRs for the pins that nothing else refreshes: the SHA-pinned
+# actions in .github/workflows and the digest-pinned base images in the
+# Dockerfile. A pin that fell behind its release arrives as a diff to review
+# instead of aging silently.
+#
+# uv.lock and frontend/package-lock.json are not watched here. This
+# repository is published from a private upstream; a lockfile PR opened here
+# cannot be merged, and the next publish would overwrite it. The CI
+# `dependency audit` job fails a push whose lock carries a known advisory,
+# which is the alert that matters, and the lock is refreshed upstream.
+version: 2
+updates:
+  # The SHA-pinned `uses:` lines in .github/workflows (release.yml explains
+  # why they are SHAs); Dependabot moves the SHA and the version comment.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "build"
+      include: "scope"
+
+  # The digest-pinned FROM lines in the Dockerfile.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "build"
+      include: "scope"

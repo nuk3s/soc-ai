@@ -107,6 +107,27 @@ async def list_users_endpoint(request: Request) -> UsersListOut:
 
 @router.post("/config/users", dependencies=[Depends(require_admin_api)])
 async def create_user_endpoint(request: Request, body: CreateUserIn) -> dict[str, bool]:
+    """Create a user with a caller-chosen password and role.
+
+    Requires a real authenticated session user — the same ``no_session_user``
+    floor as :func:`reset_user_password_endpoint`. With auth on the admin gate
+    already guarantees one; with auth off the gate no-ops, and without this
+    check an anonymous LAN caller could persist an admin login that keeps
+    working after the operator flips auth on. A logged-in admin session works
+    either way.
+    """
+    if await current_user(request) is None:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "reason": "no_session_user",
+                "hint": (
+                    "Creating a user requires an authenticated admin session; "
+                    "log in at /app/login (anonymous or bearer-token callers "
+                    "cannot create users)."
+                ),
+            },
+        )
     username = body.username.strip()
     if not username:
         raise HTTPException(
@@ -250,6 +271,24 @@ async def reset_user_password_endpoint(request: Request, user_id: int) -> dict[s
 async def set_user_role_endpoint(
     request: Request, user_id: int, body: SetRoleIn
 ) -> dict[str, bool]:
+    """Change a user's role.
+
+    Promoting an account to admin mints the same class of persistent
+    credential as creating one, so it carries the same ``no_session_user``
+    floor for the auth-off posture (see :func:`create_user_endpoint`).
+    """
+    if await current_user(request) is None:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "reason": "no_session_user",
+                "hint": (
+                    "Changing a role requires an authenticated admin session; "
+                    "log in at /app/login (anonymous or bearer-token callers "
+                    "cannot change roles)."
+                ),
+            },
+        )
     if body.role not in auth_svc.VALID_ROLES:
         raise HTTPException(
             status_code=400,

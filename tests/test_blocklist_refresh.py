@@ -6,6 +6,7 @@ Network is fully mocked with respx — these tests never hit the live internet.
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 from typing import ClassVar
 
@@ -248,6 +249,55 @@ async def test_refresh_http_failure_keeps_old_file(tmp_path: Path) -> None:
     assert live.read_text(encoding="utf-8") == "# stale-but-valid\n198.51.100.1\n"
 
 
+async def test_refresh_rejects_body_the_loader_cannot_use_and_keeps_old_file(
+    tmp_path: Path,
+) -> None:
+    """A 200 whose body is empty, an HTML page or a JSON error document must not
+    replace a good live file: the refresh reports a genuine failure and leaves
+    the previous feed byte-for-byte intact (no stray temp files either)."""
+    tor_before = "# stale-but-valid\n198.51.100.1\n"
+    urlhaus_before = _URLHAUS_BODY
+    threatfox_before = _THREATFOX_BODY
+    (tmp_path / "tor_exits.txt").write_text(tor_before, encoding="utf-8")
+    (tmp_path / "urlhaus.csv").write_text(urlhaus_before, encoding="utf-8")
+    (tmp_path / "threatfox.json").write_text(threatfox_before, encoding="utf-8")
+
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(BLOCKLIST_FEEDS["tor"].url).mock(return_value=httpx.Response(200, content=b""))
+        mock.get(BLOCKLIST_FEEDS["urlhaus"].url).mock(
+            return_value=httpx.Response(200, text="<html>Sign in</html>")
+        )
+        mock.get(BLOCKLIST_FEEDS["threatfox"].url).mock(
+            return_value=httpx.Response(200, text='{"query_status": "error"}')
+        )
+        results = await refresh_blocklists(
+            tmp_path,
+            sources=["tor", "urlhaus", "threatfox"],
+            abuse_ch_auth_key=_AUTH_KEY,
+        )
+
+    by_src = {r.source: r for r in results}
+    for src in ("tor", "urlhaus", "threatfox"):
+        assert by_src[src].success is False, src
+        assert by_src[src].skipped is False, src
+        assert by_src[src].bytes_written == 0, src
+        assert by_src[src].error, src
+    assert (tmp_path / "tor_exits.txt").read_text(encoding="utf-8") == tor_before
+    assert (tmp_path / "urlhaus.csv").read_text(encoding="utf-8") == urlhaus_before
+    assert (tmp_path / "threatfox.json").read_text(encoding="utf-8") == threatfox_before
+    assert sorted(os.listdir(tmp_path)) == ["threatfox.json", "tor_exits.txt", "urlhaus.csv"]
+
+
+async def test_refresh_rejected_body_leaves_no_file_when_none_existed(tmp_path: Path) -> None:
+    """A rejected first download does not create an empty live file the loader
+    would otherwise read as "checked, clean"."""
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(BLOCKLIST_FEEDS["tor"].url).mock(return_value=httpx.Response(200, content=b""))
+        results = await refresh_blocklists(tmp_path, sources=["tor"], abuse_ch_auth_key=None)
+    assert results[0].success is False
+    assert not (tmp_path / "tor_exits.txt").exists()
+
+
 # ---------------------------------------------------------------------------
 # 4. --source single-feed filtering.
 # ---------------------------------------------------------------------------
@@ -320,6 +370,31 @@ def test_cli_refresh_single_source_invokes_refresh(
 
     assert rc == 0
     assert (tmp_path / "tor_exits.txt").exists()
+
+
+def test_cli_refresh_unusable_body_exits_nonzero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An upstream 200 with an empty body is a failed refresh: the CLI exits 1
+    so the systemd timer / cron log shows it, and the old file survives."""
+    from pydantic import SecretStr
+
+    class _FakeSettings:
+        blocklist_data_dir = tmp_path
+        blocklist_sources: ClassVar[list[str]] = ["tor"]
+        abuse_ch_auth_key = SecretStr(_AUTH_KEY)
+
+    monkeypatch.setattr("soc_ai.config.Settings", lambda *a, **k: _FakeSettings())
+    live = tmp_path / "tor_exits.txt"
+    live.write_text(_TOR_BODY, encoding="utf-8")
+
+    args = argparse.Namespace(source="tor")
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(BLOCKLIST_FEEDS["tor"].url).mock(return_value=httpx.Response(200, content=b""))
+        rc = _refresh_cli(args)
+
+    assert rc == 1
+    assert live.read_text(encoding="utf-8") == _TOR_BODY
 
 
 def test_cli_refresh_unknown_single_source_errors(

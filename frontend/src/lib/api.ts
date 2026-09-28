@@ -787,10 +787,7 @@ export function getModelBattery(model: string): Promise<ModelBatteryStatus> {
 /** Start the full fitness battery for a model in the background (409 while one
  * is already running — single-flight so timings stay attributable). */
 export function startModelBattery(model: string): Promise<{ started: boolean; model: string }> {
-  return request<{ started: boolean; model: string }>('/config/model-battery', {
-    method: 'POST',
-    body: JSON.stringify({ model }),
-  });
+  return post<{ started: boolean; model: string }>('/config/model-battery', { model });
 }
 
 // ── Egress policy (E5.3) — one inspectable page of every egress destination ──
@@ -1980,11 +1977,19 @@ export function assignAlert(
   });
 }
 
-/** Acknowledge all events for a detection group via the SO ack_alert write tool. */
-export function ackGroup(
-  group: Pick<AlertGroup, 'name' | 'kind'>,
-  query: AlertQuery = {},
-): Promise<AckGroupResult> {
+/**
+ * The request body both group-scoped writes send. One builder, so the two can
+ * never disagree about which events a filter selects. It mirrors
+ * alertQueryParams minus hideAcked (the server hard-codes that for writes):
+ * in particular the OQL filter `q` MUST travel with the write — the rows and
+ * counts on screen are fetched under it, so a body without it would
+ * acknowledge (or open cases for) every event of the rule in the window, on
+ * hosts the analyst never saw.
+ */
+function groupActionBody(
+  group: { name: string; kind: string },
+  query: AlertQuery,
+): Record<string, string | undefined> {
   const body: Record<string, string | undefined> = { rule_name: group.name, kind: group.kind };
   if (query.range === 'custom' && query.from && query.to) {
     body.from_ = query.from;
@@ -1993,7 +1998,16 @@ export function ackGroup(
     body.range = query.range;
   }
   if (query.severity) body.severity = query.severity;
-  return post<AckGroupResult>('/alerts/ack-group', body);
+  if (query.q) body.q = query.q;
+  return body;
+}
+
+/** Acknowledge all events for a detection group via the SO ack_alert write tool. */
+export function ackGroup(
+  group: Pick<AlertGroup, 'name' | 'kind'>,
+  query: AlertQuery = {},
+): Promise<AckGroupResult> {
+  return post<AckGroupResult>('/alerts/ack-group', groupActionBody(group, query));
 }
 
 /** Acknowledge a specific set of events by ES id (per-event selection). */
@@ -2010,15 +2024,7 @@ export function escalateGroup(
   group: { name: string; kind: string },
   query: AlertQuery = {},
 ): Promise<EscalateGroupResult> {
-  const body: Record<string, string | undefined> = { rule_name: group.name, kind: group.kind };
-  if (query.range === 'custom' && query.from && query.to) {
-    body.from_ = query.from;
-    body.to = query.to;
-  } else if (query.range) {
-    body.range = query.range;
-  }
-  if (query.severity) body.severity = query.severity;
-  return post<EscalateGroupResult>('/alerts/escalate-group', body);
+  return post<EscalateGroupResult>('/alerts/escalate-group', groupActionBody(group, query));
 }
 
 // ── Internal-identifier managed list ────────────────────────────────────────────
@@ -2399,7 +2405,11 @@ export async function login(username: string, password: string): Promise<LoginRe
 /** Destroy the current session and clear the cookie. */
 export async function logout(): Promise<void> {
   try {
+    // Same budget as request(): a backend stalled behind a hung upstream would
+    // otherwise hold the Sign out click open indefinitely — with the menu
+    // already closed and the session cookie still alive.
     await fetch(API_BASE + '/logout', {
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       method: 'POST',
       headers: { Accept: 'application/json' },
       credentials: 'include',

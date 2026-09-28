@@ -14,7 +14,7 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { ApiError } from '../lib/api';
+import { ApiError, type AutoTriageStatus } from '../lib/api';
 import type { AlertGroup } from '../lib/types';
 import { ToastProvider } from '../lib/toast';
 import { ShellProvider } from '../shell/ShellContext';
@@ -32,7 +32,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
 
 import { queueOf } from '../test/alertQueue';
 import { Alerts } from './Alerts';
-import { getAlerts, getAlertsEmptyReason, startAutoTriage } from '../lib/api';
+import { getAlerts, getAlertsEmptyReason, getAutoTriageStatus, startAutoTriage } from '../lib/api';
 
 // The 503 the grid routes actually return, verbatim off the wire: `detail.hint`
 // is the sentence meant for the analyst, and api.ts puts it on ApiError.message.
@@ -228,6 +228,49 @@ describe('a Bulk Investigate that never started (D7)', () => {
     // The strip is the durable copy of the toast's sentence — it inherits the
     // same joining, so it inherits the same guard.
     expect(strip?.textContent).not.toMatch(DOUBLED_STOP);
+  });
+
+  it('does not start polling for a sweep whose start resolved after the screen unmounted', async () => {
+    // The start POST has api.ts's 20s budget, and an analyst who navigates
+    // away inside it unmounts this screen before its cleanup has any interval
+    // to clear. The interval the late `.then` then installed polled the status
+    // route every 2s for the rest of the sweep — hours, for a large one — from
+    // a screen nobody was looking at.
+    let resolveStart!: (s: AutoTriageStatus) => void;
+    vi.mocked(startAutoTriage).mockReturnValue(
+      new Promise<AutoTriageStatus>((r) => {
+        resolveStart = r;
+      }),
+    );
+    const { unmount } = mount();
+    await screen.findByText("Couldn't load this view");
+    fireEvent.click(screen.getByText('Bulk Investigate'));
+    unmount();
+
+    vi.mocked(getAutoTriageStatus).mockClear();
+    // Fake timers only from here: the waits above need real ones.
+    vi.useFakeTimers();
+    const intervalSpy = vi.spyOn(window, 'setInterval');
+    try {
+      resolveStart({
+        active: true,
+        total: 5,
+        hunted: 0,
+        skipped: 0,
+        failed: 0,
+        finished_at: null,
+        severities: ['high'],
+        note: null,
+        current: null,
+        tool_calls: 0,
+      });
+      await vi.advanceTimersByTimeAsync(4500);
+      expect(intervalSpy.mock.calls.some((c) => c[1] === 2000)).toBe(false);
+      expect(getAutoTriageStatus).not.toHaveBeenCalled();
+    } finally {
+      intervalSpy.mockRestore();
+      vi.useRealTimers();
+    }
   });
 });
 

@@ -22,11 +22,16 @@ export function ApiKeysPanel({
   const [value, setValue] = useState('');
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<{ key: string; text: string; ok: boolean } | null>(null);
+  // Arms an inline two-step confirm for a row's Clear (matches every other
+  // destructive action in the app) — a cleared key cannot be read back, so a
+  // mis-click beside Replace would send the operator back to the provider.
+  const [pendingClear, setPendingClear] = useState<string | null>(null);
 
   const keys: ApiKeyField[] = data ?? [];
   const cancel = () => {
     setEditKey(null);
     setValue('');
+    setPendingClear(null);
   };
 
   const save = async (k: string) => {
@@ -59,6 +64,7 @@ export function ApiKeysPanel({
       setMsg({ key: k, text, ok: false });
     } finally {
       setBusy(false);
+      setPendingClear(null);
     }
   };
 
@@ -114,17 +120,36 @@ export function ApiKeysPanel({
                       setEditKey(k.key);
                       setValue('');
                       setMsg(null);
+                      setPendingClear(null);
                     }}
                     className="flex-none rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-[5px] text-[11.5px] font-semibold text-text hover:border-accent"
                   >
                     {k.isSet ? 'Replace' : 'Set'}
                   </button>
                 )}
-                {!editing && k.isSet && (
+                {!editing && k.isSet && pendingClear === k.key && (
+                  <>
+                    <button
+                      onClick={() => {
+                        void clear(k.key);
+                      }}
+                      disabled={busy}
+                      className="flex-none rounded-[7px] border border-danger px-[11px] py-[5px] text-[11.5px] font-semibold text-danger hover:bg-[rgba(240,68,56,.12)] disabled:opacity-50"
+                    >
+                      Confirm clear
+                    </button>
+                    <button
+                      onClick={() => setPendingClear(null)}
+                      disabled={busy}
+                      className="flex-none rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-[5px] text-[11.5px] font-semibold text-dim hover:text-text disabled:opacity-50"
+                    >
+                      Cancel
+                    </button>
+                  </>
+                )}
+                {!editing && k.isSet && pendingClear !== k.key && (
                   <button
-                    onClick={() => {
-                      void clear(k.key);
-                    }}
+                    onClick={() => setPendingClear(k.key)}
                     disabled={busy}
                     className="flex-none rounded-[7px] border px-[11px] py-[5px] text-[11.5px] font-semibold text-danger hover:bg-[rgba(240,68,56,.12)] disabled:opacity-50"
                     style={{ borderColor: 'rgba(240,68,56,.3)' }}

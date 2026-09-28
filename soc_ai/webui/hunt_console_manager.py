@@ -5,6 +5,11 @@ POST /api/v1/hunts/chat creates the hunt row via ``hunt_recorded_run``'s first
 asyncio.Task that runs to completion regardless of client state — so a hunt
 survives an SSE-client disconnect and lands its report.
 
+POST /api/v1/hunts/chat/stream takes the same path (:meth:`start_streaming`);
+the only difference is that the drainer also mirrors each event into a queue the
+SSE response reads from. One start path means one ceiling, one cancel token and
+one registry for every hunt, however it was started.
+
 Mirrors :mod:`soc_ai.webui.hunt_manager` (the interactive-investigation drainer)
 but for free-form Hunt Console objectives.
 """
@@ -44,6 +49,10 @@ _CHAT_STATE_ATTR = "_hunt_chat_manager"
 # scheduled paths; the bulk endpoint's ``_REHUNT_START_CAP`` is a smaller
 # per-request cap that sits under this global one.
 _MAX_CONCURRENT_HUNTS = 5
+
+# What a streamed hunt's drainer hands the SSE response: ``(event_name, data)``
+# pairs, then ``None`` once the run is over (finished, failed or cancelled).
+HuntEventQueue = asyncio.Queue[tuple[str, dict[str, Any]] | None]
 
 
 class HuntConsoleManager:
@@ -85,6 +94,55 @@ class HuntConsoleManager:
         ``starter`` names the class that started the hunt: analyst, schedule or
         lead. ``lead_id`` links a lead-started hunt to its lead.
         """
+        return await self._launch(
+            state,
+            objective=objective,
+            started_by=started_by,
+            prior=prior,
+            kind=kind,
+            starter=starter,
+            lead_id=lead_id,
+            sink=None,
+        )
+
+    async def start_streaming(
+        self,
+        state: Any,
+        *,
+        objective: str,
+        started_by: str,
+        prior: str | None = None,
+    ) -> tuple[str, HuntEventQueue] | None:
+        """:meth:`start`, plus a queue the caller reads the run's events from.
+
+        For the SSE route. The hunt is started exactly like a polled one — same
+        ceiling, same cancel token, same registry, same survive-the-disconnect
+        drainer — so an operator can cancel it from the console and a burst of
+        streams cannot slip past the ceiling. The drainer mirrors every event
+        after ``hunt_created`` into the queue and ends it with ``None``; the
+        caller emits ``hunt_created`` itself from the returned id. Returns None
+        under the same conditions as :meth:`start`.
+        """
+        sink: HuntEventQueue = asyncio.Queue()
+        hunt_id = await self._launch(
+            state, objective=objective, started_by=started_by, prior=prior, sink=sink
+        )
+        if hunt_id is None:
+            return None
+        return hunt_id, sink
+
+    async def _launch(
+        self,
+        state: Any,
+        *,
+        objective: str,
+        started_by: str,
+        prior: str | None,
+        kind: str = "chat",
+        starter: str = "analyst",
+        lead_id: int | None = None,
+        sink: HuntEventQueue | None,
+    ) -> str | None:
         # Concurrency guard: this manager is fire-and-forget (one unbounded
         # background asyncio.Task per call), so without a cap a scripted/rapid-fire
         # burst of starts puts N simultaneous hunts on the single model route.
@@ -127,7 +185,7 @@ class HuntConsoleManager:
             if hunt_id is None:
                 return None
 
-            task: asyncio.Task[None] = asyncio.create_task(_drain(gen, hunt_id=hunt_id))
+            task: asyncio.Task[None] = asyncio.create_task(_drain(gen, hunt_id=hunt_id, sink=sink))
             self._tasks[hunt_id] = task
             self._tokens[hunt_id] = token
 
@@ -160,13 +218,24 @@ class HuntConsoleManager:
         return True
 
 
-async def _drain(gen: Any, *, hunt_id: str) -> None:
-    """Exhaust the remaining events in *gen* (the recorder persists everything)."""
+async def _drain(gen: Any, *, hunt_id: str, sink: HuntEventQueue | None = None) -> None:
+    """Exhaust the remaining events in *gen* (the recorder persists everything).
+
+    With a *sink*, each event is also mirrored into it for a live reader, and
+    ``None`` closes it however the run ends. The queue is unbounded on purpose:
+    the recorder is the source of truth and a slow or vanished reader must never
+    stall the hunt, so the drainer never waits on the sink. Its size is bounded
+    by the run's own event count.
+    """
     try:
-        async for _name, _data in gen:
-            pass
+        async for name, data in gen:
+            if sink is not None:
+                sink.put_nowait((name, data))
     except Exception:
         _LOGGER.exception("hunt_console_manager: background drain failed for hunt_id=%s", hunt_id)
+    finally:
+        if sink is not None:
+            sink.put_nowait(None)
 
 
 def get_manager(state: Any) -> HuntConsoleManager:

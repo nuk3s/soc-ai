@@ -95,6 +95,10 @@ async def test_privacy_guard_refuses_internal_ip() -> None:
         "benchmark 198.18.0.1 route",  # benchmarking range
         "internal v6 fd00::1 host",  # IPv6 ULA
         "who is ::1",  # IPv6 loopback
+        "research dc01.corp.local:443",  # internal FQDN written as host:port
+        "smb on finance-pc:445",  # known internal host written as host:port
+        "host 10.0.0.5_ seen",  # internal IPv4 with a trailing underscore
+        "flow 10.0.0.5:80:1",  # internal IPv4 with more than one colon after it
     ],
 )
 async def test_privacy_guard_refuses_internal_identifiers(query: str) -> None:

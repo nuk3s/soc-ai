@@ -5,7 +5,7 @@
 // the clock. These pin the fix: no poll while the tab is hidden, and one
 // immediate refresh on return to visible so the bell is current the moment the
 // analyst looks again (the house guard, lib/useAsync.ts:118).
-import { act, render } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -14,6 +14,14 @@ vi.mock('../lib/api', async (importOriginal) => ({
   getWorkspaces: vi.fn(),
   getNotifications: vi.fn(),
   getHealth: vi.fn(),
+}));
+
+// The Topbar calls useNavigate() to follow a notification — stub it so a test
+// can assert the target. MemoryRouter below stays real.
+const navigateMock = vi.fn();
+vi.mock('react-router-dom', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('react-router-dom')>()),
+  useNavigate: () => navigateMock,
 }));
 
 import { emitNeedsYouChanged, getHealth, getNotifications, getWorkspaces } from '../lib/api';
@@ -188,5 +196,88 @@ describe('Topbar bell follows a hit that was read', () => {
     });
     await flush();
     expect(getNotifications).toHaveBeenCalledTimes(2);
+  });
+});
+
+// The bell is the app's primary alerting affordance, and each row in its
+// dropdown was a div with an onClick: Tab landed on every row's Dismiss and on
+// "View all", never on the row, so the one thing a keyboard user could do to a
+// true-positive notice from the bell was make it disappear.
+describe('Topbar notification rows are reachable from the keyboard', () => {
+  const truePositive = {
+    id: 'inv:1',
+    tone: 'danger' as const,
+    title: 'Verdict true_positive: ET MALWARE Z',
+    when: 'now',
+    href: '/investigation/INV-1',
+  };
+
+  it('renders a row with somewhere to go as a button that navigates there', async () => {
+    vi.mocked(getNotifications).mockResolvedValue([truePositive]);
+    mount();
+    await flush();
+    act(() => {
+      screen.getByLabelText('Notifications').click();
+    });
+
+    // A button is in the Tab order and fires on Enter and Space; a div with an
+    // onClick is neither, so the role query alone is the keyboard contract.
+    const row = screen.getByRole('button', { name: /true positive: ET MALWARE Z/i });
+    act(() => {
+      row.focus();
+    });
+    expect(document.activeElement).toBe(row);
+    fireEvent.click(row);
+    expect(navigateMock).toHaveBeenCalledWith('/investigation/INV-1');
+  });
+
+  it('keeps Dismiss a separate target and leaves a row with nowhere to go inert', async () => {
+    vi.mocked(getNotifications).mockResolvedValue([
+      truePositive,
+      { id: 'dep:es', tone: 'warn', title: 'Elasticsearch unreachable', when: '3m', href: null },
+    ]);
+    mount();
+    await flush();
+    act(() => {
+      screen.getByLabelText('Notifications').click();
+    });
+
+    expect(screen.queryByRole('button', { name: /Elasticsearch unreachable/ })).toBeNull();
+    expect(screen.getByText('Elasticsearch unreachable')).toBeTruthy();
+
+    fireEvent.click(screen.getAllByLabelText('Dismiss')[0]);
+    expect(navigateMock).not.toHaveBeenCalled();
+    expect(screen.queryByRole('button', { name: /true positive: ET MALWARE Z/i })).toBeNull();
+  });
+
+  it('opens once from a click on the row outside the text, and Dismiss does not open it', async () => {
+    // The keyboard fix made the body a button. A mouse user who clicks the
+    // tone dot or the row padding must still get the old whole-row
+    // behaviour, and the body click bubbling to the row must not open it
+    // twice.
+    // A fresh id: the test above dismissed inv:1, and a dismissal lives in
+    // local storage across tests.
+    const rowNotice = { ...truePositive, id: 'inv:2', href: '/investigation/INV-2' };
+    vi.mocked(getNotifications).mockResolvedValue([rowNotice]);
+    mount();
+    await flush();
+    act(() => {
+      screen.getByLabelText('Notifications').click();
+    });
+
+    const body = screen.getByRole('button', { name: /true positive: ET MALWARE Z/i });
+    const row = body.parentElement!;
+    fireEvent.click(row);
+    expect(navigateMock).toHaveBeenCalledTimes(1);
+    expect(navigateMock).toHaveBeenCalledWith('/investigation/INV-2');
+
+    // Opening closed the dropdown. Open it again: Dismiss sits inside the
+    // row, and its click must not bubble into a second navigation.
+    act(() => {
+      screen.getByLabelText('Notifications').click();
+    });
+    fireEvent.click(screen.getAllByLabelText('Dismiss')[0]);
+    expect(navigateMock).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('button', { name: /true positive: ET MALWARE Z/i })).toBeNull();
   });
 });

@@ -19,6 +19,17 @@ import type { ChatMessage } from './types';
 /** How long between polls of an in-flight turn. */
 const POLL_MS = 1500;
 
+/**
+ * Consecutive poll failures tolerated before a turn is given up on. One
+ * dropped GET (a request timeout while the grid is slow, a connection blip)
+ * says nothing about the turn, which the backend keeps running regardless —
+ * giving up there hides a reply that lands in the DB moments later and frees
+ * the composer for a second send the server refuses with a 409. A run of
+ * failures is different: the server is gone, and a poll that never stops is
+ * the cost bug this hook exists to avoid.
+ */
+const POLL_MAX_FAILURES = 3;
+
 /** Shown as an assistant bubble when the transport itself fails. */
 const NET_ERR_TEXT = 'Could not reach the server — please try again.';
 
@@ -75,7 +86,8 @@ export interface ChatThreadState {
  *
  * The poll re-arms ONLY while a turn is pending. That is the property that
  * makes an always-resident chat affordable: an idle thread costs exactly one
- * GET on mount, not a heartbeat for as long as the tab is open.
+ * GET on mount, not a heartbeat for as long as the tab is open. While pending
+ * it rides out a few failed GETs before it reports the server unreachable.
  */
 export function useChatThread({
   subject,
@@ -91,6 +103,9 @@ export function useChatThread({
   const [draft, setDraft] = useState(() => loadChatDraft(subject));
 
   const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Polls of the in-flight turn that have failed back to back. Any thread that
+  // applies resets it; a subject change drops it with the poll.
+  const pollFailures = useRef(0);
   // False once the surface has unmounted. Guards the poll continuations: an
   // in-flight send/fetch that resolves after unmount must not re-arm pollTimer
   // (a detached loop nothing would ever clear) or setState.
@@ -159,6 +174,7 @@ export function useChatThread({
       setDraft(loadChatDraft(subject));
     }
     if (pollTimer.current) clearTimeout(pollTimer.current);
+    pollFailures.current = 0;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [subject]);
 
@@ -208,21 +224,33 @@ export function useChatThread({
     // indicator (dogfood 2026-08-06).
     setProgressTools(thread.pending ? (thread.progress_tools ?? []) : []);
     if (pollTimer.current) clearTimeout(pollTimer.current);
-    if (thread.pending) {
-      pollTimer.current = setTimeout(() => {
-        fetchRef.current(subject).then(applyThread).catch(() => {
-          if (!aliveRef.current || currentSubjectRef.current !== subject) return;
-          setPending(false);
-          // Only push the error message if the last message isn't already it
-          // (repeated poll failures must not stack duplicate error bubbles).
-          setMessages((c) => {
-            const last = c[c.length - 1];
-            if (last?.role === 'assistant' && last.text === NET_ERR_TEXT) return c;
-            return [...c, { role: 'assistant', text: NET_ERR_TEXT }];
-          });
+    pollFailures.current = 0; // the server answered — whatever failed before is history
+    if (thread.pending) armPoll();
+  };
+
+  // Arm one poll of the in-flight turn. A reply applies through applyThread,
+  // which re-arms while the turn is still pending. A failed GET re-arms too,
+  // up to the cap — only a run of failures ends the turn, with one error
+  // bubble and no further polling.
+  const armPoll = () => {
+    pollTimer.current = setTimeout(() => {
+      fetchRef.current(subject).then(applyThread).catch(() => {
+        if (!aliveRef.current || currentSubjectRef.current !== subject) return;
+        pollFailures.current += 1;
+        if (pollFailures.current < POLL_MAX_FAILURES) {
+          armPoll();
+          return;
+        }
+        setPending(false);
+        // Only push the error message if the last message isn't already it
+        // (repeated poll failures must not stack duplicate error bubbles).
+        setMessages((c) => {
+          const last = c[c.length - 1];
+          if (last?.role === 'assistant' && last.text === NET_ERR_TEXT) return c;
+          return [...c, { role: 'assistant', text: NET_ERR_TEXT }];
         });
-      }, POLL_MS);
-    }
+      });
+    }, POLL_MS);
   };
 
   const send = (textOverride?: string) => {

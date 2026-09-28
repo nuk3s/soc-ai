@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from soc_ai.audit.logger import AuditLogger
 from soc_ai.config import get_settings
 from soc_ai.mcp_server.server import build_mcp
 from soc_ai.so_client.elastic import ElasticClient
@@ -31,8 +32,17 @@ async def _run() -> None:
     # lookup_runbook degrades to [] on the first query.
     db_engine = make_engine(settings)
     db_sessionmaker = make_sessionmaker(db_engine)
+    # Write MCP tool calls to the same tamper-evident ES audit index the
+    # FastAPI app uses. The chain is claimed per position on the grid, so a
+    # second writer process beside the server is safe (see SAFETY_MODEL.md).
+    audit = AuditLogger(settings, elastic)
     mcp = build_mcp(
-        settings, elastic, misp=misp, enrichment=enrichment, db_sessionmaker=db_sessionmaker
+        settings,
+        elastic,
+        misp=misp,
+        enrichment=enrichment,
+        db_sessionmaker=db_sessionmaker,
+        audit=audit,
     )
     try:
         await mcp.run_stdio_async()

@@ -50,8 +50,8 @@ commands locally before you open one:
 
 ```bash
 # Backend — must all pass
-uv run ruff check soc_ai/ tests/
-uv run ruff format --check soc_ai/ tests/
+uv run ruff check soc_ai/ tests/ scripts/
+uv run ruff format --check soc_ai/ tests/ scripts/
 uv run mypy soc_ai/                  # strict mode (configured in pyproject.toml)
 uv run pytest                        # coverage gate: 80% (browser E2E excluded)
 

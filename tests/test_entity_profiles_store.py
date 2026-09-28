@@ -38,7 +38,7 @@ async def test_migration_creates_the_table(settings_kratos: Settings) -> None:
             lambda sc: {c["name"] for c in inspect(sc).get_columns("prior_spec_runs")}
         )
         row = await conn.execute(text("SELECT version_num FROM alembic_version"))
-        assert row.scalar_one() == "0051"
+        assert row.scalar_one() == "0052"
     # Why a dimension could not be measured, and what the sweep knew about
     # its baselines. Without the first, a refused query wrote no row and read
     # as blind; without the second, coverage counts implied "now".
@@ -554,3 +554,39 @@ async def test_unmeasurable_keeps_its_reason_and_is_not_scorable(
     assert row.coverage_reason == "Trying to create too many buckets"
     assert row.vector is None
     assert not row.is_scorable, "a refused measurement must not score a departure"
+
+
+async def test_purging_keeps_host_rows_keyed_on_a_hostname(settings_kratos: Settings) -> None:
+    """A hostname is not an address, and failing the address test is not proof
+    of being foreign.
+
+    The process and logon dimensions key their host rows on ``host.name``.
+    Purging those as out of scope would delete every agent-plane baseline on
+    any estate that had configured its CIDRs, on every sweep.
+    """
+    import ipaddress
+
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        for key, dim in (
+            ("dc01", "logon_users"),
+            ("WS01.corp.example", "process_names"),
+            ("52.123.129.14", "peers_out"),
+        ):
+            await ep.upsert_profile(
+                db,
+                entity_kind="host",
+                entity_key=key,
+                dimension=dim,
+                shape="categorical",
+                vector={},
+            )
+        removed = await ep.purge_out_of_scope(db, cidrs=[ipaddress.ip_network("10.1.0.0/16")])
+        dc = await ep.load_profiles(db, entity_kind="host", entity_key="dc01")
+        ws = await ep.load_profiles(db, entity_kind="host", entity_key="WS01.corp.example")
+        gone = await ep.load_profiles(db, entity_kind="host", entity_key="52.123.129.14")
+
+    assert removed == 1
+    assert set(dc) == {"logon_users"}
+    assert set(ws) == {"process_names"}
+    assert gone == {}

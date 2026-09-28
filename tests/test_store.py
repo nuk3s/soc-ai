@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import argparse
+import sqlite3
+from pathlib import Path
+
 import pytest
+from alembic import command
 from pydantic import SecretStr
 from soc_ai.config import Settings
 from soc_ai.store import auth as auth_svc
-from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
+from soc_ai.store.db import _migration_config, make_engine, make_sessionmaker, run_migrations
 from soc_ai.store.models import Base, User, UserSession
 from sqlalchemy import inspect, select
 from sqlalchemy.exc import IntegrityError
@@ -52,6 +57,36 @@ async def test_run_migrations_creates_schema(settings_kratos: Settings) -> None:
     # idempotent: a second run is a no-op, not an error
     await run_migrations(engine)
     await engine.dispose()
+
+
+def _db_head(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    with sqlite3.connect(path) as conn:
+        row = conn.execute("SELECT version_num FROM alembic_version").fetchone()
+    return None if row is None else str(row[0])
+
+
+def test_cli_env_honours_x_db_url(tmp_path: Path) -> None:
+    """``-x db_url=...`` on the alembic CLI targets that store, not the ini's URL.
+
+    The env.py docstring advertises the option; an operator who follows it to
+    point a manual upgrade or downgrade at the real store must not have the
+    argument dropped and a fresh, empty store migrated in its place.
+    """
+    cfg = _migration_config()
+    cfg.set_main_option("sqlalchemy.url", f"sqlite:///{tmp_path / 'wrong.db'}")
+    cfg.cmd_opts = argparse.Namespace(x=[f"db_url=sqlite:///{tmp_path / 'right.db'}"])
+    command.upgrade(cfg, "head")
+    assert not (tmp_path / "wrong.db").exists()
+    assert _db_head(tmp_path / "right.db") is not None
+
+
+def test_cli_env_uses_the_ini_url_without_x_arguments(tmp_path: Path) -> None:
+    cfg = _migration_config()
+    cfg.set_main_option("sqlalchemy.url", f"sqlite:///{tmp_path / 'ini.db'}")
+    command.upgrade(cfg, "head")
+    assert _db_head(tmp_path / "ini.db") is not None
 
 
 # ---------------------------------------------------------------------------
@@ -287,4 +322,46 @@ async def test_create_user_overlong_password_raises_clean_error(
     async with maker() as db:
         with pytest.raises(auth_svc.PasswordTooLongError):
             await auth_svc.create_user(db, "ivan", "x" * 73)
+    await engine.dispose()
+
+
+async def test_latest_for_pairs_loads_no_report_blobs(settings_kratos: Settings) -> None:
+    """The inheritance lookup runs on every alerts-page poll and every
+    auto-triage sweep, over every complete in-window row of every rule on the
+    page. Its callers read the id, the key columns, the verdict and confidence
+    and when it ran — never the report, summary or rationale — so those blobs
+    must stay unloaded, exactly as ``latest_per_finding`` already keeps them.
+    ``raiseload`` turns an accidental read into a loud error instead of a
+    silent lazy-load."""
+    from soc_ai.store import investigations as inv_svc
+
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        inv = await inv_svc.create(
+            db,
+            alert_es_id="e1",
+            started_by="x",
+            rule_name="RULE A",
+            src_ip="10.0.0.1",
+            dest_ip="10.0.0.2",
+        )
+        await inv_svc.finalize(
+            db,
+            inv.id,
+            status="complete",
+            verdict="false_positive",
+            confidence=0.9,
+            rationale="r" * 4096,
+            summary="s" * 4096,
+            report={"summary": "x" * 8192},
+        )
+        db.expunge_all()
+
+        pair = inv_svc.pair_key("RULE A", "10.0.0.1", "10.0.0.2")
+        hits = await inv_svc.latest_for_pairs(db, [pair], window_days=7)
+        hit = hits[pair]
+        assert (hit.id, hit.verdict, hit.confidence) == (inv.id, "false_positive", 0.9)
+        assert hit.created_at is not None
+        unloaded = inspect(hit).unloaded
+        assert {"report", "summary", "rationale"} <= unloaded, unloaded
     await engine.dispose()

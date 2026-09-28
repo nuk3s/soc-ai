@@ -1156,6 +1156,37 @@ def test_attack_classtype_guard_reads_the_eve_description() -> None:
         assert match_decision_template(_ctx(alert, enrichments=_INTERNAL_PAIR)) is None, description
 
 
+def test_attack_classtype_withholds_the_protocol_housekeeping_anchors() -> None:
+    """The guard above lived only in clean_internal_traffic. The three
+    dispositive protocol templates key on a rule-name token, so an ET DOS NTP
+    amplification alert or a STUN scan carrying an attack classtype and the
+    routine SF conn was settled false_positive before a single tool ran. The
+    classtype is the detection; the protocol in the name is not a defence."""
+    for rule_name in (
+        "ET DOS Possible NTP DDoS Inbound Frequent Un-Authed MON_LIST Requests IMPL 0x03",
+        "ET SCAN Possible STUN Binding Request Scan",
+        "ET INFO Outbound RRSIG DNS Query Observed",
+    ):
+        for description in (
+            "Attempted Administrator Privilege Gain",
+            "Attempted Information Leak",
+            "Attempted Denial of Service",
+            "Web Application Attack",
+            "Successful Credential Theft Detected",
+        ):
+            alert = SoAlert(
+                id="a1",
+                rule_name=rule_name,
+                severity_label="low",
+                source_ip="10.0.0.1",
+                destination_ip="203.0.113.9",
+                classtype=description,
+            )
+            typed = TypedZeekFields(conn_states=["SF"])
+            cv = match_decision_template(_ctx(alert, typed_zeek=typed))
+            assert cv is None, (rule_name, description)
+
+
 def test_benign_eve_descriptions_still_match_a_template() -> None:
     """NEGATIVE CONTROL. Widening the guard to descriptions must not swallow the
     benign categories, which are the bulk of the queue."""

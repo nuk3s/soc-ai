@@ -51,6 +51,7 @@ from elasticsearch import ApiError, AuthenticationException
 from pydantic import ValidationError
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.ext.asyncio import AsyncConnection
 
 from soc_ai.config import DEFAULT_ALERTS_QUERY, Settings
 from soc_ai.errors import OqlValidationError, SoAuthError
@@ -381,6 +382,24 @@ async def check_upstream_reachability(settings: Settings) -> list[CheckResult]:
 
 # ── Check 2: local store (DB + migration head + FTS5) ────────────────────────
 
+# The FTS5 tables migrations 0017 / 0018 create, and what the app does without
+# each one. Both revisions skip the CREATE VIRTUAL TABLE on a SQLite without
+# FTS5 and are stamped applied anyway, so a store first migrated on such a
+# Python keeps its head but never gets the index, and nothing retries it later.
+_FTS_TABLES: dict[str, str] = {
+    "runbook_fts": "runbook search falls back to the legacy keyword ranker",
+    "chat_memory_fts": "chat memory retrieval returns nothing",
+}
+
+
+async def _missing_fts_tables(conn: AsyncConnection) -> list[str]:
+    rows = await conn.execute(
+        text("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (:a, :b)"),
+        {"a": "runbook_fts", "b": "chat_memory_fts"},
+    )
+    found = {str(row[0]) for row in rows}
+    return [name for name in _FTS_TABLES if name not in found]
+
 
 async def check_store(settings: Settings) -> list[CheckResult]:
     """DB reachable/creatable; Alembic head matches code head; FTS5 available.
@@ -389,7 +408,9 @@ async def check_store(settings: Settings) -> list[CheckResult]:
     test_migration_at_head_is_current``: the DB side is ``alembic_version.
     version_num``, the code side is the migration ScriptDirectory's current
     head. FTS5 absence is a WARN, never a FAIL — runbook/chat retrieval falls
-    back to the legacy keyword ranker (see ``soc_ai.store.runbooks``).
+    back to the legacy keyword ranker (see ``soc_ai.store.runbooks``). So is a
+    store at head whose FTS tables are missing: SQLite having the module says
+    nothing about a store that was migrated before it did.
     """
     db_path = settings.soc_ai_data_dir / "soc-ai.db"
     code_head = ScriptDirectory.from_config(_migration_config()).get_current_head() or "?"
@@ -446,7 +467,23 @@ async def check_store(settings: Settings) -> list[CheckResult]:
                 has_fts5 = bool(fts_row.scalar_one())
             except Exception:  # ancient SQLite without pragma_module_list
                 has_fts5 = None
-            if has_fts5:
+            at_head = db_head is not None and str(db_head) == code_head
+            missing = await _missing_fts_tables(conn) if has_fts5 and at_head else []
+            if missing:
+                results.append(
+                    CheckResult(
+                        "store fts5",
+                        "WARN",
+                        f"SQLite has FTS5 but the store has no {' or '.join(missing)}. The "
+                        "store was migrated on a Python without FTS5, so the index was "
+                        f"skipped: {'; '.join(_FTS_TABLES[name] for name in missing)}.",
+                        hint="The app still works. Migrations 0017 and 0018 create the index "
+                        "only when SQLite has FTS5 at that moment and never retry. Back up "
+                        "the store, then re-create the missing tables and their triggers "
+                        "with the DDL in those two revisions.",
+                    )
+                )
+            elif has_fts5:
                 results.append(
                     CheckResult(
                         "store fts5",
@@ -1286,7 +1323,14 @@ async def check_model_fitness(settings: Settings) -> list[CheckResult]:
 # (soc_ai.api.webui.routes_config.api_egress_policy) — same row builder, same
 # wording — restricted to the always-relevant destinations. INFO only: posture
 # is a fact to surface, never a pass/fail judgement.
-_EGRESS_DOCTOR_IDS = ("oracle", "analyst_cloud", "notifications", "rag_gateway")
+_EGRESS_DOCTOR_IDS = (
+    "oracle",
+    "analyst_cloud",
+    "notifications",
+    "rag_gateway",
+    "misp",
+    "update_check",
+)
 
 
 def check_egress_posture(settings: Settings) -> list[CheckResult]:
@@ -1561,8 +1605,8 @@ async def run_doctor(
         applied = await apply_persisted_overrides(settings)
         if applied:
             cfg.detail += (
-                f" The config console holds {len(applied)} saved setting(s): "
-                f"{', '.join(sorted(applied))}."
+                f" The config console holds {len(applied)} saved non-secret setting(s): "
+                f"{', '.join(sorted(applied))}. Saved secrets apply but are not listed."
             )
     else:
         results.append(CheckResult("config", "PASS", "settings loaded"))

@@ -191,9 +191,21 @@ async def _post_with_retries(url: str, payload: dict[str, Any], *, verify: bool)
     attempt = 0
     async with httpx.AsyncClient(timeout=_SEND_TIMEOUT_S, verify=verify) as client:
         while True:
-            resp = await client.post(url, json=payload)
-            if resp.status_code < 500 or attempt >= _MAX_RETRIES:
-                return resp.status_code
+            try:
+                resp = await client.post(url, json=payload)
+            except (httpx.ConnectError, httpx.ConnectTimeout):
+                # A connect failure is the transient class the retry budget
+                # exists for: the request never reached the receiver, and a
+                # momentary reset must not drop the page because the dedup
+                # slot for this hour is already taken. A read timeout or a
+                # torn response is not retried: the receiver may have taken
+                # the POST, and a page delivered twice is worse than one
+                # delivered slowly. Anything else (bad URL, bug) propagates.
+                if attempt >= _MAX_RETRIES:
+                    raise
+            else:
+                if resp.status_code < 500 or attempt >= _MAX_RETRIES:
+                    return resp.status_code
             attempt += 1
             await asyncio.sleep(_RETRY_BACKOFF_S * attempt)
 

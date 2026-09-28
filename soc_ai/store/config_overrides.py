@@ -6,9 +6,14 @@ JSON-encoded scalars persisted in the ``config_overrides`` table; they are
 re-applied to ``app.state.settings`` at startup so they survive restarts, and
 hot-applied via ``setattr`` immediately on save when the field is marked hot.
 
-SECURITY: the whitelist contains NO secret/connection fields (passwords,
-api-keys, hosts). Secrets are never written to the DB and never echoed in a
-response body. Connection/secret settings are display-only (masked) in inc1.
+SECURITY: the whitelist includes the Danger Zone connection settings (hosts,
+usernames) and write-only secret specs (``secret=True``: passwords, api-keys,
+tokens). A secret override is persisted as Fernet ciphertext keyed by
+``CONFIG_SECRET_KEY`` (see :mod:`soc_ai.store.secret_box`) and is write-only:
+it is never rendered back or echoed in a response body. Connection identity is
+stored in plaintext. The ``config_overrides`` table is therefore sensitive in
+dumps, backups and exports, even though a dump alone yields no live secret
+without the key.
 """
 
 from __future__ import annotations

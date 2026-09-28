@@ -624,6 +624,22 @@ def _is_internal_ip(value: str, cidrs: list[IpNetwork]) -> bool:
     return any(addr in net for net in cidrs)
 
 
+def _is_ip_literal(value: str) -> bool:
+    """True when ``value`` parses as an IP address.
+
+    The estate scope is a set of CIDRs, so it can only ever answer for a key
+    that is an address. A host keyed on its agent name (the process and logon
+    planes key on ``host.name``) is neither inside nor outside a CIDR, and the
+    three places that scope host rows by CIDR all have to treat it the same
+    way: keep it.
+    """
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # CIDR discovery (Increment 3 — SUGGEST-FIRST)
 # ---------------------------------------------------------------------------

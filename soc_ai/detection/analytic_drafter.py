@@ -107,15 +107,30 @@ def _build_prompt(finding: dict[str, Any], evidence: str, catalog_ids: list[str]
 async def _draft_once(
     agent: Agent[None, AnalyticDraft], prompt: str, guard: Any
 ) -> tuple[AnalyticDraft, HuntSpec] | tuple[str, None]:
-    """One model call. Returns the draft and its spec, or the error text and None."""
+    """One model call. Returns the draft and its spec, or the error text and None.
+
+    The error text goes back out to the model on the retry, so it must never
+    carry a real identifier. Validation therefore runs on the draft as the
+    model wrote it, in label space, before the guard puts the real values
+    back. pydantic quotes the offending input in its message, and a YAML
+    error quotes the offending line, so validating the desanitized draft
+    would echo the identifiers the guard had masked.
+    """
     result = await agent.run(prompt)
     out = result.output
-    if guard is not None:
-        out = AnalyticDraft.model_validate(guard.desanitize_obj(out.model_dump(mode="json")))
+    try:
+        spec = parse_spec(out.spec_yaml)
+    except ValueError as exc:
+        return str(exc)[:1500], None
+    if guard is None:
+        return out, spec
+    out = AnalyticDraft.model_validate(guard.desanitize_obj(out.model_dump(mode="json")))
     try:
         return out, parse_spec(out.spec_yaml)
     except ValueError as exc:
-        return str(exc)[:1500], None
+        # The real values broke a spec the labels satisfied. Send the model
+        # only what it could have seen.
+        return str(guard.sanitize_text(str(exc)))[:1500], None
 
 
 async def draft_analytic(
@@ -130,8 +145,9 @@ async def draft_analytic(
 
     ``guard`` is an optional egress guard, threaded the same way
     :func:`soc_ai.detection.drafter.draft_detection` threads it. With a guard
-    the prompt is sanitized and swept fail-closed before the model call, and
-    the structured output is desanitized after.
+    the prompt is sanitized and swept fail-closed before the model call, the
+    retry prompt is swept the same way, and the structured output is
+    desanitized after.
     """
     prompt = _build_prompt(finding, evidence, catalog_ids)
     if guard is not None:
@@ -150,6 +166,10 @@ async def draft_analytic(
         retry = (
             f"{prompt}\n\nThe previous draft failed validation. Fix this and draft again:\n{out}"
         )
+        if guard is not None:
+            # The error text is a second outbound string. It gets the same
+            # sweep the prompt got, so fail-closed holds on the retry too.
+            guard.check_or_raise(retry, fail_closed=settings.analyst_redaction_fail_closed)
         out, spec = await _draft_once(agent, retry, guard)
         if spec is None:
             raise ValueError(str(out))

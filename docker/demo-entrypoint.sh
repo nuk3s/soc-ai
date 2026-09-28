@@ -32,17 +32,22 @@ case "${SOC_AI_DEMO:-}" in
     ;;
 esac
 
-python /opt/soc-ai/scripts/demo/mock_es.py --port 9200 \
-  --fixtures /opt/soc-ai/soc_ai/demo/fixtures.json &
-mock_pid=$!
-
 # Supervise the mock. /healthz is pure app liveness — it never probes ES — so a
 # mock that dies after startup would leave the app reporting healthy while
-# silently serving empty grids. Watch the mock process; if it exits, stop the
+# silently serving empty grids. The mock runs inside a subshell that is its
+# parent and waits for it, so the exit is seen the moment it happens. Polling
+# `kill -0` from a bystander does not work here: once this script has exec'd
+# into uvicorn, an orphaned mock is reparented to PID 1, which never reaps it,
+# and `kill -0` keeps succeeding on the zombie. When the mock exits, stop the
 # app (PID 1 after the exec below) so the platform restarts the whole container
-# instead of showing a broken demo. Detached so it can't block the exec.
-( while kill -0 "$mock_pid" 2>/dev/null; do sleep 5; done
-  echo "demo-entrypoint: mock ES (pid $mock_pid) exited — stopping the app" >&2
+# instead of showing a broken demo. `set +e` because the script runs under
+# `set -e` and a non-zero mock exit must still reach the kill. Backgrounded so
+# it can't block the exec.
+( set +e
+  python /opt/soc-ai/scripts/demo/mock_es.py --port 9200 \
+    --fixtures /opt/soc-ai/soc_ai/demo/fixtures.json
+  rc=$?
+  echo "demo-entrypoint: mock ES exited (rc $rc) — stopping the app" >&2
   kill 1 2>/dev/null ) &
 
 # exec so uvicorn is PID 1 and receives the platform's SIGTERM directly for a

@@ -929,6 +929,110 @@ class TestAutoTriageSingleFlight:
                 count = _count_investigations(at_settings)
                 assert count <= 1
 
+    def test_identify_caller_failure_releases_slot(
+        self, at_settings: Settings, fake_es: AsyncMock
+    ) -> None:
+        """A failure resolving the caller after planning must not wedge the slot.
+
+        identify_caller does a DB read, so a transient error (SQLite
+        "database is locked") or a request cancellation can raise there. If the
+        slot has already been claimed by then and no worker task exists, every
+        later POST answers "already running" and the scheduled sweep no-ops
+        until restart.
+        """
+        from soc_ai.webui import autotriage as at
+        from soc_ai.webui.autotriage import Target
+
+        target = Target(
+            alert_es_id="a1", rule_name="ET RULE A", src_ip="10.0.0.1", dst_ip="10.0.0.2"
+        )
+
+        async def _one_target(
+            state: Any,
+            *,
+            time_range: str,
+            oql: str | None,
+            severities: tuple[str, ...],
+        ) -> tuple[list[Any], int, list[Any]]:
+            return [target], 0, []
+
+        fake_auth = AsyncMock()
+        identify = AsyncMock(side_effect=[RuntimeError("database is locked"), "analyst"])
+        worker = AsyncMock()
+        with (
+            patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=fake_es),
+            patch("soc_ai.main.make_auth", return_value=fake_auth),
+            patch("soc_ai.main.get_settings", return_value=at_settings),
+            patch("soc_ai.api.webui.routes_autotriage.at.plan_targets", _one_target),
+            patch("soc_ai.api.webui.routes_autotriage.at.run_auto_triage", worker),
+            patch("soc_ai.api.webui.routes_autotriage.identify_caller", identify),
+        ):
+            app = create_app()
+            with TestClient(app, raise_server_exceptions=False) as client:
+                resp1 = client.post("/api/v1/auto-triage", json={"range": "24h"})
+                assert resp1.status_code == 500
+                assert at.get_status(app.state).active is False
+                assert not worker.await_count
+
+                # The slot is free again: the next POST launches a sweep instead
+                # of reporting one that does not exist.
+                resp2 = client.post("/api/v1/auto-triage", json={"range": "24h"})
+                assert resp2.status_code == 200
+                assert resp2.json()["note"] != "already running"
+                assert worker.await_count == 1
+
+    def test_caller_lookup_is_not_a_window_for_a_second_sweep(
+        self, at_settings: Settings, fake_es: AsyncMock
+    ) -> None:
+        """The caller lookup is an await; the scheduler may take the slot during it.
+
+        The POST resolves the caller before its own single-flight check, so a
+        sweep that starts while the request is parked on that lookup is seen and
+        reported as "already running" instead of being launched over.
+        """
+        from soc_ai.webui import autotriage as at
+        from soc_ai.webui.autotriage import Target
+
+        target = Target(
+            alert_es_id="a1", rule_name="ET RULE A", src_ip="10.0.0.1", dst_ip="10.0.0.2"
+        )
+
+        async def _one_target(
+            state: Any,
+            *,
+            time_range: str,
+            oql: str | None,
+            severities: tuple[str, ...],
+        ) -> tuple[list[Any], int, list[Any]]:
+            return [target], 0, []
+
+        holder: dict[str, Any] = {}
+
+        async def _scheduler_wins(request: Any) -> str:
+            # The scheduler's sweep lands while this request is parked here.
+            await at.start_config_sweep(holder["state"], started_by="scheduler")
+            return "analyst"
+
+        fake_auth = AsyncMock()
+        worker = AsyncMock()
+        with (
+            patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=fake_es),
+            patch("soc_ai.main.make_auth", return_value=fake_auth),
+            patch("soc_ai.main.get_settings", return_value=at_settings),
+            patch("soc_ai.api.webui.routes_autotriage.at.plan_targets", _one_target),
+            patch("soc_ai.webui.autotriage.plan_targets", _one_target),
+            patch("soc_ai.api.webui.routes_autotriage.at.run_auto_triage", worker),
+            patch("soc_ai.webui.autotriage.run_auto_triage", worker),
+            patch("soc_ai.api.webui.routes_autotriage.identify_caller", _scheduler_wins),
+        ):
+            app = create_app()
+            holder["state"] = app.state
+            with TestClient(app, raise_server_exceptions=False) as client:
+                resp = client.post("/api/v1/auto-triage", json={"range": "24h"})
+                assert resp.status_code == 200
+                assert resp.json()["note"] == "already running"
+                assert worker.await_count == 1
+
 
 class TestAutoTriageFailedCountsStreamErrors:
     def test_autotriage_failed_counts_stream_errors(

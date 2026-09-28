@@ -162,7 +162,7 @@ def phrase(kind: Kind, departure: Any, *, window_hours: int = DEFAULT_RECENT_HOU
             f"The sweep counted {count} events"
         )
     if kind in (Kind.ABOVE_BASELINE, Kind.BELOW_BASELINE):
-        return rate_phrase(
+        text = rate_phrase(
             dimension,
             member,
             value=getattr(departure, "observed_value", None),
@@ -170,6 +170,13 @@ def phrase(kind: Kind, departure: Any, *, window_hours: int = DEFAULT_RECENT_HOU
             ratio=getattr(departure, "ratio", None),
             count=count,
         )
+        # A host the recent read did not see at all is scored as zero in
+        # every covered cell. That reads the same as a measured zero, and
+        # the two mean different things: say which one this is.
+        observed = getattr(departure, "observed", None)
+        if isinstance(observed, dict) and observed.get("silent"):
+            text += ". The host was not seen at all in the window"
+        return text
     try:
         documents = int(count)
     except (TypeError, ValueError):

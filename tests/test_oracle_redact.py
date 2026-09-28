@@ -899,6 +899,11 @@ class TestWinlogHostLeafKeys:
             ("TargetHostName", "DBNODE3"),
             ("RemoteHost", "PRINTSRV"),
             ("RemoteMachine", "MAILGW"),
+            # The ECS-flattened spellings the OQL whitelist exposes to the local
+            # loop: winlogbeat's own ``winlog.computer_name`` and Zeek's NTLM
+            # ``ntlm.server_nb_computer_name`` (a bare NetBIOS name).
+            ("computer_name", "FILESRV"),
+            ("server_nb_computer_name", "PDC01"),
         ],
     )
     def test_new_winlog_host_leaf_key_tokenised(self, leaf: str, value: str) -> None:
@@ -912,6 +917,20 @@ class TestWinlogHostLeafKeys:
         assert value not in text, f"{leaf} host value must be tokenised, not egress raw"
         assert "HOST_" in text
         assert m.counters.get("HOST", 0) >= 1
+
+    def test_top_level_winlog_computer_name_tokenised(self) -> None:
+        """``winlog.computer_name`` sits directly under ``winlog`` (not under
+        ``event_data``) in every winlogbeat document and in an OQL hit; the
+        leaf match must catch it there too."""
+        m = _mapping()
+        out = sanitize_case(
+            {"winlog": {"computer_name": "FILESRV"}, "ntlm": {"server_nb_computer_name": "PDC01"}},
+            m,
+        )
+        text = json.dumps(out)
+        assert "FILESRV" not in text, "winlog.computer_name egressed raw"
+        assert "PDC01" not in text, "ntlm.server_nb_computer_name egressed raw"
+        assert m.counters.get("HOST", 0) >= 2
 
     def test_caller_computer_name_backslash_prefix_tokenised(self) -> None:
         """``CallerComputerName`` often carries a leading ``\\`` (``\\WIN-DC01``).
@@ -1713,3 +1732,53 @@ class TestDnsSdFreeText:
         assert "aaplcache" not in outbound
         assert "corp.lan" not in outbound
         assert unsafe_residue(outbound) == []
+
+
+class TestKerberosClientPrincipal:
+    """``kerberos.client`` (Zeek ``kerberos.log``) carries a ``user/REALM``
+    principal — an account name and the AD realm in one string. It sits in no
+    ECS user field, so the harvest never classified it, and a principal has no
+    regex shape the wire gate catches: it egressed raw. Route it onto USER
+    through the credential-stopset gate (like the winlog account leaves), NOT
+    unconditionally: Zeek logs ``-`` for an absent client on a large share of
+    records, and an unconditional USER label for ``-`` would propagate into
+    every hyphen of free text."""
+
+    @pytest.mark.parametrize("path", ["kerberos", "zeek.kerberos"])
+    def test_kerberos_client_principal_tokenised(self, path: str) -> None:
+        m = _mapping()
+        doc: dict[str, Any] = {}
+        cur = doc
+        parts = path.split(".")
+        for part in parts[:-1]:
+            cur = cur.setdefault(part, {})
+        cur[parts[-1]] = {"client": "jdoe/ACME.COM"}
+        out = sanitize_case(doc, m)
+        text = json.dumps(out)
+        assert "jdoe" not in text, f"{path}.client principal egressed raw"
+        assert "ACME.COM" not in text, f"{path}.client realm egressed raw"
+        assert "USER_" in text
+        assert m.counters.get("USER", 0) >= 1
+
+    def test_absent_kerberos_client_leaves_free_text_untouched(self) -> None:
+        m = _mapping()
+        out = sanitize_case(
+            {"kerberos": {"client": "-"}, "message": "logon type 3 - see details"}, m
+        )
+        assert out["kerberos"]["client"] == "-"
+        assert out["message"] == "logon type 3 - see details"
+        assert m.counters.get("USER", 0) == 0
+
+    def test_kerberos_client_principal_propagates_to_free_text(self) -> None:
+        """The learned principal is replaced wherever it recurs, so the Oracle
+        can still correlate the same account across the transcript."""
+        m = _mapping()
+        out = sanitize_case(
+            {
+                "kerberos": {"client": "jdoe/ACME.COM"},
+                "message": "TGS-REQ from jdoe/ACME.COM for cifs/filesrv",
+            },
+            m,
+        )
+        assert "jdoe/ACME.COM" not in out["message"]
+        assert "USER_" in out["message"]

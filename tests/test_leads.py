@@ -7,6 +7,7 @@ of those, allowed, turns the layer into a novelty detector with extra steps.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -22,6 +23,7 @@ from soc_ai.hunting.leads import (
     record_observation,
     weigh_entity,
 )
+from soc_ai.hunting.sources import observe_alert_verdict
 from soc_ai.hunting.weight import KIND_WEIGHT_CAP, Kind
 from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
 from soc_ai.store.models import EntityObservation, Lead
@@ -412,6 +414,41 @@ async def test_out_of_scope_observations_are_purged(settings_kratos: Settings) -
     assert {r.entity_key for r in rows} == {"10.1.10.21"}
 
 
+async def test_purging_observations_keeps_host_rows_keyed_on_a_hostname(
+    settings_kratos: Settings,
+) -> None:
+    """A host keyed on its agent name is neither inside nor outside a CIDR.
+
+    The process and logon planes key their observations on ``host.name``.
+    The purge must keep those rows, as the profile purge does, or every
+    agent-plane departure is deleted at the start of the next sweep on any
+    estate with CIDRs configured.
+    """
+    import ipaddress
+
+    from soc_ai.hunting.leads import purge_out_of_scope_observations
+
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        for key in ("dc01", "WS01.corp.example", "52.123.129.14"):
+            await record_observation(
+                db,
+                entity_kind="host",
+                entity_key=key,
+                kind=Kind.OFF_HOURS,
+                spec_id="s",
+                fingerprint=content_fingerprint("hour", "3"),
+                now=_NOW,
+            )
+        removed = await purge_out_of_scope_observations(
+            db, cidrs=[ipaddress.ip_network("10.1.0.0/16")]
+        )
+        rows = (await db.execute(select(EntityObservation))).scalars().all()
+
+    assert removed == 1
+    assert {r.entity_key for r in rows} == {"dc01", "WS01.corp.example"}
+
+
 async def test_purging_observations_with_no_cidrs_removes_nothing(
     settings_kratos: Settings,
 ) -> None:
@@ -518,6 +555,115 @@ async def test_a_true_positive_alert_forms_a_lead_alone(settings_kratos: Setting
         leads = (await db.execute(select(Lead))).scalars().all()
     assert len(outcome.formed) == 1
     assert leads[0].single_signal is False
+
+
+async def _alert(db, verdict: str, *, alert_id: str = "alert-1", now=_NOW):  # type: ignore[no-untyped-def]
+    return await observe_alert_verdict(
+        db,
+        alert_id=alert_id,
+        rule_name="ET MALWARE Test",
+        verdict=verdict,
+        confidence=0.9,
+        hosts=[_HOST[1]],
+        now=now,
+    )
+
+
+async def test_a_verdict_changed_to_false_positive_closes_the_lead_it_formed(
+    settings_kratos: Settings,
+) -> None:
+    # The alert formed the lead alone. Deleting the observation and leaving
+    # the lead open left a lead with no evidence in the queue for good.
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        first = await _alert(db, "true_positive")
+        await _alert(db, "false_positive", now=_NOW + timedelta(hours=1))
+        rows = (await db.execute(select(EntityObservation))).scalars().all()
+        lead = await db.get(Lead, first.formed[0])
+    assert rows == []
+    assert lead is not None
+    assert lead.status == "dismissed"
+    assert lead.dismissed_reason == "other"
+    assert lead.dismissed_at is not None
+    assert lead.hunt_id is None
+
+
+async def test_a_false_positive_reshapes_a_lead_that_still_holds_other_observations(
+    settings_kratos: Settings,
+) -> None:
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        first = await _alert(db, "true_positive")
+        await _observe(db, Kind.OFF_HOURS, "03:14", now=_NOW + timedelta(minutes=5))
+        await form_leads(db, entity_keys=[_HOST], now=_NOW + timedelta(minutes=5))
+        await _alert(db, "false_positive", now=_NOW + timedelta(hours=1))
+        rows = (await db.execute(select(EntityObservation))).scalars().all()
+        lead = await db.get(Lead, first.formed[0])
+    assert [r.kind for r in rows] == ["off_hours"]
+    assert lead is not None
+    assert lead.status == STATUS_OPEN
+    assert lead.kinds_json == ["off_hours"]
+    assert lead.entities_json == [list(_HOST)]
+    assert lead.scope_count == 1
+    assert {r.lead_id for r in rows} == {lead.id}
+
+
+async def test_a_false_positive_leaves_a_hunted_lead_alone(settings_kratos: Settings) -> None:
+    # The hunt was run on the evidence as it stood. Its lead keeps the hunt
+    # and the analyst's decision on it; only the observation goes.
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        first = await _alert(db, "true_positive")
+        lead = await db.get(Lead, first.formed[0])
+        assert lead is not None
+        lead.status = "hunting"
+        lead.hunt_id = "hunt-1"
+        await db.commit()
+        await _alert(db, "false_positive", now=_NOW + timedelta(hours=1))
+        rows = (await db.execute(select(EntityObservation))).scalars().all()
+        await db.refresh(lead)
+    assert rows == []
+    assert lead.status == "hunting"
+    assert lead.hunt_id == "hunt-1"
+    assert lead.dismissed_at is None
+
+
+async def test_a_false_positive_closes_a_lead_whose_hunt_did_not_run(
+    settings_kratos: Settings,
+) -> None:
+    # The settle rule returns a lead to open and keeps the hunt it names when
+    # that hunt errored, so the loop may try once more. No hunt read the
+    # evidence, and the evidence is now gone: the lead closes like one that
+    # never had a hunt, rather than sit open citing nothing.
+    from soc_ai.store.models import Hunt
+
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        first = await _alert(db, "true_positive")
+        lead = await db.get(Lead, first.formed[0])
+        assert lead is not None
+        db.add(
+            Hunt(
+                id="hunt-err",
+                objective="o",
+                objective_hash="x",
+                started_by="auto-hunt",
+                kind="lead",
+                starter="lead",
+                status="error",
+                lead_id=lead.id,
+            )
+        )
+        lead.status = STATUS_OPEN
+        lead.hunt_id = "hunt-err"
+        await db.commit()
+        await _alert(db, "false_positive", now=_NOW + timedelta(hours=1))
+        rows = (await db.execute(select(EntityObservation))).scalars().all()
+        await db.refresh(lead)
+    assert rows == []
+    assert lead.status == "dismissed"
+    assert lead.dismissed_reason == "other"
+    assert lead.hunt_id == "hunt-err"
 
 
 async def test_a_needs_more_info_alert_does_not_form_alone(settings_kratos: Settings) -> None:
@@ -1238,6 +1384,74 @@ async def test_a_start_after_the_hunt_finished_starts_another_and_repoints_the_l
     await engine.dispose()
 
 
+async def test_two_starts_in_flight_at_once_run_one_agent(
+    settings_kratos: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The click and the loop's wake land while the console is still starting.
+
+    The sequential test above is not enough: the console awaits the hunt row
+    and the first event before it answers, and the lead is marked only after
+    that. A second start that reads the lead inside that window used to find
+    no hunt id, start a second agent and then overwrite the first hunt's id on
+    the lead, leaving the first hunt running with no lead pointing at it.
+    """
+    from soc_ai.hunting import lead_hunt
+    from soc_ai.store.models import Hunt, Lead
+
+    engine, maker = await _db(settings_kratos)
+    lead_id = await _one_lead(maker, evidence={"sample_ids": ["d1"]})
+    calls: list[dict[str, Any]] = []
+    gate = asyncio.Event()
+
+    async def _start(_state, **kwargs):  # type: ignore[no-untyped-def]
+        # The real console writes the hunt row before it answers with the
+        # id. The second start reads that row to find the hunt running.
+        calls.append(kwargs)
+        hunt_id = f"01HUNT{len(calls)}"
+        async with maker() as db:
+            db.add(
+                Hunt(
+                    id=hunt_id,
+                    objective=str(kwargs.get("objective") or "o"),
+                    objective_hash="x",
+                    started_by=str(kwargs.get("started_by") or "tester"),
+                    kind="lead",
+                    starter="lead",
+                    status="running",
+                    lead_id=lead_id,
+                )
+            )
+            await db.commit()
+        await gate.wait()
+        return hunt_id
+
+    monkeypatch.setattr(
+        "soc_ai.webui.hunt_console_manager.get_manager",
+        lambda _s: SimpleNamespace(start=_start),
+    )
+
+    both = asyncio.gather(
+        lead_hunt.start_lead_hunt(_state(maker), lead_id=lead_id, started_by="analyst"),
+        lead_hunt.start_lead_hunt(_state(maker), lead_id=lead_id, started_by="auto-hunt"),
+    )
+    # Give the second start every chance to reach the console before the
+    # first is allowed to answer. It must be waiting, not starting.
+    for _ in range(50):
+        if len(calls) == 2:
+            break
+        await asyncio.sleep(0.01)
+    gate.set()
+    first, second = await both
+
+    assert len(calls) == 1, "two starts in flight ran two agents"
+    assert first.hunt_id == second.hunt_id == "01HUNT1"
+    assert sorted([first.existing, second.existing]) == [False, True]
+    async with maker() as db:
+        lead = await db.get(Lead, lead_id)
+        assert lead.status == "hunting" and lead.hunt_id == "01HUNT1"
+    await engine.dispose()
+
+
 async def test_a_dismissed_lead_refuses_the_start(
     settings_kratos: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1378,6 +1592,78 @@ async def test_the_loop_takes_open_leads_that_never_had_a_hunt_oldest_first(
     async with maker() as db:
         waiting = await lead_hunt.leads_awaiting_a_hunt(db, limit=10)
     assert [int(lead.id) for lead in waiting] == [older, newer]
+    await engine.dispose()
+
+
+async def test_the_loop_reads_the_waiting_leads_a_page_at_a_time(
+    settings_kratos: Settings,
+) -> None:
+    """A page is the leads after the last one read, in the same order.
+
+    The loop skips a lead that cites nothing and the lead stays where it is,
+    so the loop must be able to read past a page of them. The cursor is the
+    last lead's formation time and id, because two leads can form in the same
+    second and an offset would slip when a lead ahead of it is dismissed.
+    """
+    from soc_ai.hunting import lead_hunt
+
+    engine, maker = await _db(settings_kratos)
+    formed = (_NOW - timedelta(hours=3)).replace(tzinfo=None)
+    first = await _row(maker, formed_at=formed)
+    second = await _row(maker, formed_at=formed)
+    third = await _row(maker, formed_at=formed + timedelta(seconds=1))
+    async with maker() as db:
+        page = await lead_hunt.leads_awaiting_a_hunt(db, limit=2)
+        assert [int(lead.id) for lead in page] == [first, second]
+        last = page[-1]
+        rest = await lead_hunt.leads_awaiting_a_hunt(
+            db, limit=2, after=(last.formed_at, int(last.id))
+        )
+        assert [int(lead.id) for lead in rest] == [third]
+        beyond = await lead_hunt.leads_awaiting_a_hunt(
+            db, limit=2, after=(rest[-1].formed_at, int(rest[-1].id))
+        )
+        assert beyond == []
+    await engine.dispose()
+
+
+async def test_a_page_of_leads_the_loop_gave_up_on_does_not_hide_the_one_behind_them(
+    settings_kratos: Settings,
+) -> None:
+    """The retry rule drops rows after the query, and the page refills.
+
+    Two leads at the head of the queue each had two auto-hunts that did not
+    run, so the loop leaves them to the analyst. They stay open and oldest,
+    so a page of two read only them, dropped both and came back empty, and
+    the fresh lead behind them never started. A short page is the last page,
+    and a page that has dropped rows reads on until it is full or the table
+    runs out.
+    """
+    from soc_ai.hunting import lead_hunt
+    from soc_ai.store.models import Hunt
+
+    engine, maker = await _db(settings_kratos)
+    formed = (_NOW - timedelta(hours=3)).replace(tzinfo=None)
+    given_up = [await _row(maker, formed_at=formed + timedelta(seconds=n)) for n in range(2)]
+    fresh = await _row(maker, formed_at=formed + timedelta(minutes=5))
+    async with maker() as db:
+        for lead_id in given_up:
+            for n in range(2):
+                db.add(
+                    Hunt(
+                        id=f"01HUNT{lead_id}-{n}",
+                        objective="o",
+                        objective_hash="x",
+                        started_by=lead_hunt.AUTO_HUNT_ACTOR,
+                        kind="lead",
+                        starter="lead",
+                        status="error",
+                        lead_id=lead_id,
+                    )
+                )
+        await db.commit()
+        page = await lead_hunt.leads_awaiting_a_hunt(db, limit=2)
+        assert [int(lead.id) for lead in page] == [fresh]
     await engine.dispose()
 
 

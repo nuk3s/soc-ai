@@ -16,13 +16,14 @@ from typing import Any, NamedTuple
 
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select
+from sqlalchemy import update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 from ulid import ULID
 
 from soc_ai.hunting.findings import threat_finding_count
 from soc_ai.store import chat_memory
 from soc_ai.store.auth import utcnow
-from soc_ai.store.models import Hunt, HuntEvent
+from soc_ai.store.models import Hunt, HuntEvent, HuntSpecState, Lead
 
 STATUS_RUNNING = "running"
 STATUS_COMPLETE = "complete"
@@ -349,10 +350,34 @@ async def delete(db: AsyncSession, hunt_id: str) -> bool:
     """Delete a hunt and its events in one transaction.
 
     Returns True if the hunt existed (and was removed), False otherwise.
+
+    Neither ``Lead.hunt_id`` nor ``HuntSpecState.hunt_id`` is a foreign key,
+    so the rows that name the hunt are released here, in the same transaction.
+    A lead left ``hunting`` on a hunt that is gone could never be hunted again:
+    the button answered with the dead id, the loop only takes a lead with no
+    id, and Promote wanted the hunt it could not find. The lead goes back to
+    ``open`` with no hunt, which is where it was before the hunt started, so
+    with the auto-hunt loop on, deleting a lead's hunt queues a new one. A
+    reopened lead keeps its dismissal as history and only loses the id. A
+    fired catalog condition pointing at the deleted hunt read as handled while
+    nothing was left for an operator to read; with the id gone the gate fires
+    it again on the next sweep, the way it does after a crash.
     """
     hunt = await db.get(Hunt, hunt_id)
     if hunt is None:
         return False
+    now = utcnow()
+    await db.execute(
+        sa_update(Lead)
+        .where(Lead.hunt_id == hunt_id, Lead.status == "hunting")
+        .values(status="open", updated_at=now)
+    )
+    await db.execute(
+        sa_update(Lead).where(Lead.hunt_id == hunt_id).values(hunt_id=None, updated_at=now)
+    )
+    await db.execute(
+        sa_update(HuntSpecState).where(HuntSpecState.hunt_id == hunt_id).values(hunt_id=None)
+    )
     await db.execute(sa_delete(HuntEvent).where(HuntEvent.hunt_id == hunt_id))
     # The hunt's chat thread was projected into chat_memory (dual-write below) —
     # remove it in the same transaction so a deleted hunt can't keep echoing
@@ -448,6 +473,41 @@ async def finish_chat_assistant(
             content=content,
         )
     await db.commit()
+
+
+async def reap_stale_pending_chat(db: AsyncSession) -> int:
+    """Mark every ``pending`` hunt-chat assistant turn ``error``. Returns the count.
+
+    The startup twin of :func:`soc_ai.store.chat.reap_stale_pending`. The hunt
+    follow-up chat keeps its turns in ``hunt_events``, so the chat reapers never
+    see them, and a turn whose task died with the old process stayed pending
+    for ever: the panel spun and every later question on that hunt was refused
+    as busy. Startup only, because a hunt event carries no timestamp, so a
+    periodic sweep could not tell an orphan from a turn still being written.
+    At startup every pending row is an orphan: the task writing it is gone.
+    """
+    rows = list(
+        (
+            await db.scalars(
+                select(HuntEvent).where(
+                    HuntEvent.kind == CHAT_ASSISTANT,
+                    HuntEvent.payload["status"].as_string() == "pending",
+                )
+            )
+        ).all()
+    )
+    for ev in rows:
+        payload = dict(ev.payload or {})
+        payload["status"] = "error"
+        if not payload.get("content"):
+            payload["content"] = (
+                "The assistant was interrupted (likely a restart) — please ask again."
+            )
+        # Reassigned rather than mutated in place, so the JSON column is dirty.
+        ev.payload = payload
+    if rows:
+        await db.commit()
+    return len(rows)
 
 
 async def set_progress(db: AsyncSession, event_id: int, tools: list[str]) -> None:

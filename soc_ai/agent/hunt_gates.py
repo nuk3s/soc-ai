@@ -158,6 +158,45 @@ def _cap_severity(severity: str, ceiling: str) -> str:
     return _SEV_ORDER[min(_severity_rank(severity), cap)]
 
 
+# Tool-call short-circuits the toolset returns INSTEAD of running the tool: an
+# error (``_tool_error``, which echoes the rejected query ``fragment``), a
+# duplicate-call stop (``_dedup_result``, which echoes the model's own ``args``)
+# and the prefetch hint. None of them retrieved anything — every value they
+# carry is the model's own words handed back — so they must never enter the
+# citation corpus. Otherwise a finding could cite a domain the model merely
+# ASKED about twice and pass both the citation gate and the corroboration gate.
+_SHORT_CIRCUIT_KEYS: tuple[str, ...] = ("error", "duplicate_call", "prefetch_already_has_this")
+
+
+def _is_short_circuit(result: Any) -> bool:
+    """True iff ``result`` is a toolset short-circuit payload (see above).
+
+    Deliberately narrower than :func:`soc_ai.agent.evidence.tool_return_is_evidence`:
+    that predicate also rejects inference tools (decoded payloads corroborate a
+    hunt finding) and zero-hit search shapes (an aggregation-only OQL rollup is
+    ``total=0, hits=[]`` and is exactly the measured evidence the corroboration
+    gate wants). Only the echo shapes are dropped here.
+    """
+    return isinstance(result, dict) and any(result.get(k) for k in _SHORT_CIRCUIT_KEYS)
+
+
+def _retrieved_results(tool_results: list[Any]) -> list[Any]:
+    """``tool_results`` minus the short-circuit payloads.
+
+    Applied ONCE, up front, so the evidence text, the retrieved-id set and the
+    corroboration subset are all built from the same corpus. Labeled
+    ``{tool_name, result}`` items are judged on their ``result``; a bare legacy
+    item is judged on itself.
+    """
+    kept: list[Any] = []
+    for item in tool_results:
+        payload = item.get("result") if isinstance(item, dict) and "result" in item else item
+        if _is_short_circuit(payload):
+            continue
+        kept.append(item)
+    return kept
+
+
 def _gathered_evidence_text(tool_results: list[Any]) -> str:
     """Lower-cased JSON dump of every gathered tool-result payload.
 
@@ -443,6 +482,10 @@ def _validate_hunt_findings(
     tallies for the ``citation_validation`` audit event:
     ``{findings, findings_capped, citations_total, citations_stripped}``.
     """
+    # Drop the toolset's short-circuit payloads first: an error, a duplicate-call
+    # stop or a prefetch hint carries only the model's own arguments echoed
+    # back, and a citation must never resolve against those.
+    tool_results = _retrieved_results(tool_results)
     evidence_text = _gathered_evidence_text(tool_results)
     # Evidence set for id-shaped citations (M2): the document ids and typed
     # values the hunt actually retrieved, collected from payload STRUCTURE —
@@ -596,6 +639,9 @@ def _validate_hunt_charts(
     for the ``citation_validation`` audit event:
     ``{charts, charts_dropped}``.
     """
+    # Same corpus as findings: short-circuit echoes are not evidence a chart
+    # can be sourced from either.
+    tool_results = _retrieved_results(tool_results)
     evidence_text = _gathered_evidence_text(tool_results)
     # Same two-tier resolver as findings (M2): id-shaped source_citations must
     # name evidence the hunt actually retrieved, not a token in dumped text.

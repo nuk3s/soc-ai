@@ -66,8 +66,8 @@ deployment step and neither is worth a restart of its own.
 SQLite ADD COLUMN is metadata-only for nullable columns without a default, so
 Part 2 is O(1) regardless of table size.
 
-Revision ID: 0040
-Revises: 0039
+Revision ID: 0041
+Revises: 0040
 Create Date: 2026-09-10
 """
 

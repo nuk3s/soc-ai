@@ -93,6 +93,8 @@ from soc_ai.oracle._cred_data import (
     plausible_netbios_domain,
 )
 from soc_ai.oracle.sanitize import (
+    _DEFANG_DOT_RE,
+    _DEFANG_HXXP_RE,
     Mapping,
     _is_private_ipv4,
     _is_private_ipv6,
@@ -131,6 +133,16 @@ _USER_FIELDS: frozenset[str] = frozenset(
         "destination.user.name",
     }
 )
+
+# USER fields that go through the credential-stopset gate instead of the
+# unconditional route above.  Zeek's ``kerberos.client`` carries a ``user/REALM``
+# principal — an account name and the AD realm in one string, sitting in no ECS
+# user field and with no regex shape the wire gate catches, so it egressed raw.
+# It cannot join ``_USER_FIELDS``: Zeek logs ``-`` for an absent client on a large
+# share of ``kerberos.log`` records, and an unconditional USER label for ``-``
+# would propagate into every hyphen of free text (``logon type 3 - see details``).
+# Matched as a dotted-path suffix, so ``zeek.kerberos.client`` is covered too.
+_GATED_USER_FIELDS: frozenset[str] = frozenset({"kerberos.client"})
 
 # Winlog/EVTX credential LEAF keys — matched case-insensitively against the last
 # path segment, wherever they nest (``winlog.event_data.TargetUserName``). These
@@ -181,6 +193,14 @@ _WINLOG_HOST_LEAF_KEYS: frozenset[str] = frozenset(
         "targethostname",
         "remotehost",
         "remotemachine",
+        # The ECS-flattened spellings the OQL whitelist exposes to the local loop:
+        # winlogbeat's own ``winlog.computer_name`` (top-level, not under
+        # ``event_data``) and Zeek NTLM's ``ntlm.server_nb_computer_name`` (the
+        # server's bare NetBIOS name).  Their FQDN-valued siblings
+        # (``server_dns_computer_name``, ``dhcp.client_fqdn``) stay with the
+        # suffix rule, per the domain/FQDN exclusion above.
+        "computer_name",
+        "server_nb_computer_name",
     }
 )
 
@@ -689,6 +709,13 @@ def _try_harvest_scalar(
         mapping.label_for(value, "USER")
         return
 
+    # Gated USER fields (``kerberos.client``) — honour the credential stopset so
+    # Zeek's ``-`` placeholder is left verbatim rather than learned as a label.
+    if any(s in _GATED_USER_FIELDS for s in suffixes_of_path):
+        if not _is_nonusername_token(value):
+            mapping.label_for(value, "USER")
+        return
+
     # Winlog/EVTX credential leaf keys (TargetUserName / SubjectUserName /
     # SamAccountName / AccountName) — case-insensitive LEAF match, wherever they
     # nest.  Honour the credential stopset so a built-in (SYSTEM / "-") is left
@@ -936,6 +963,10 @@ def _global_scan_pass(
     the mapping.
     """
     if isinstance(obj, str):
+        # (a.0) Re-fang first. A learned host written ``dc01[.]corp[.]local``
+        # in a runbook must match the learned regex below; re-fanging only in
+        # the shape pass (b) left it in clear for the residue gate to refuse.
+        obj = _DEFANG_HXXP_RE.sub(r"http\1", _DEFANG_DOT_RE.sub(".", obj))
         # (a.1) Direct replacement for short DOMAIN_LIKE values: whole-string match.
         if direct_replace and obj in direct_replace:
             label = mapping.forward.get(obj) or mapping.forward.get(obj.lower())

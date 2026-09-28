@@ -72,6 +72,12 @@ _SELF_ADDRESSES: tuple[str, ...] = ("127.0.0.1", "::1")
 # sessions. The incident's gap was 96 seconds.
 DEFAULT_LOOKBACK_MINUTES = 30
 
+# Ceiling on ``lookback_minutes`` (30 days), the bound the other windowed read
+# tools enforce. A non-positive lookback would put the window's start after its
+# end: empty by construction, which the empty branch below would then report as
+# the host having acted on its own. Refused instead, before ES is asked.
+_MAX_LOOKBACK_MINUTES = 43_200
+
 _MAX_SESSIONS = 25
 
 # How many raw hits to read before collapsing them. A domain controller logs
@@ -221,6 +227,15 @@ async def origin_chain(  # noqa: PLR0915 - one function reads as one procedure
     if not ip or not str(ip).strip():
         return {"error": True, "type": "ValueError", "message": "ip is required"}
     ip = str(ip).strip()
+    if lookback_minutes <= 0 or lookback_minutes > _MAX_LOOKBACK_MINUTES:
+        return {
+            "error": True,
+            "type": "ValueError",
+            "message": (
+                f"lookback_minutes must be between 1 and {_MAX_LOOKBACK_MINUTES}, "
+                f"got {lookback_minutes}"
+            ),
+        }
 
     try:
         response = await elastic.search(

@@ -226,6 +226,23 @@ describe('Promote waits on a hunt', () => {
     await waitFor(() => expect(vi.mocked(getLead).mock.calls.length).toBeGreaterThan(1));
   });
 
+  // The re-read behind the note is a second request, and it can fail on its
+  // own. The page answered that failure with "This lead does not exist" over
+  // a lead that was on screen a moment ago and had just been promoted.
+  it('keeps the page and the note when the re-read fails', async () => {
+    vi.mocked(getLead)
+      .mockResolvedValueOnce(HUNTED as never)
+      .mockRejectedValueOnce(new ApiError('500 Internal Server Error', 500));
+    mount();
+    fireEvent.click(await screen.findByRole('button', { name: LEAD_ACTION.promote }));
+    await screen.findByTestId('lead-promoted');
+    await waitFor(() => expect(vi.mocked(getLead).mock.calls.length).toBeGreaterThan(1));
+    await waitFor(() => expect(screen.getByRole('status').textContent).toMatch(/Refresh failed/));
+    expect(screen.getByTestId('lead-promoted')).toBeTruthy();
+    expect(screen.getByRole('heading', { level: 1 }).textContent).toContain('Lead 12');
+    expect(screen.queryByText(/does not exist/)).toBeNull();
+  });
+
   it('shows the sentence the server sent on a refusal', async () => {
     vi.mocked(getLead).mockResolvedValue(HUNTED as never);
     vi.mocked(promoteLead).mockRejectedValue(

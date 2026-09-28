@@ -1,6 +1,7 @@
 // useChatThread is the transport slice every chat surface shares: the mount
-// fetch, a poll that re-arms ONLY while a turn is pending, send with a
-// one-in-flight guard, network-error surfacing, and the per-subject draft.
+// fetch, a poll that re-arms ONLY while a turn is pending (and rides out a
+// transient failure before giving up), send with a one-in-flight guard,
+// network-error surfacing, and the per-subject draft.
 //
 // These tests pin the contract that makes it reusable rather than a third
 // copy-paste: the idle cost (exactly one GET — a dashboard-resident chat that
@@ -162,7 +163,29 @@ describe('useChatThread transport', () => {
     expect(texts(result.current)).toEqual(['question', NET_ERR]);
   });
 
-  it('surfaces a failed poll and stops polling instead of spinning forever', async () => {
+  it('retries a transient poll failure and delivers the reply', async () => {
+    const { result } = mount();
+    await flush();
+
+    sendMessage.mockResolvedValue(busy('q'));
+    act(() => result.current.setDraft('q'));
+    await act(async () => { result.current.send(); });
+
+    // One dropped GET (a request timeout while the grid is slow, a connection
+    // blip) says nothing about the turn, which the backend keeps running. The
+    // turn must stay pending — abandoning it here would hide a reply that
+    // lands moments later and free the composer for a send the server 409s.
+    fetchThread.mockRejectedValueOnce(new TypeError('network down')).mockResolvedValue(idle('q', 'answer'));
+    await tick(POLL_MS);
+    expect(result.current.pending).toBe(true);
+    expect(texts(result.current)).toEqual(['q']);
+
+    await tick(POLL_MS);
+    expect(result.current.pending).toBe(false);
+    expect(texts(result.current)).toEqual(['q', 'answer']);
+  });
+
+  it('gives up after repeated poll failures and stops polling', async () => {
     const { result } = mount();
     await flush();
 
@@ -171,6 +194,13 @@ describe('useChatThread transport', () => {
     await act(async () => { result.current.send(); });
 
     fetchThread.mockRejectedValue(new TypeError('network down'));
+    // Two failures in a row are still a wait, not a verdict on the server.
+    await tick(POLL_MS * 2);
+    expect(result.current.pending).toBe(true);
+    expect(texts(result.current)).toEqual(['q']);
+
+    // The third is the cap: one error bubble, pending cleared, and nothing
+    // re-arms — a chat that polls a dead server forever is a cost bug.
     await tick(POLL_MS);
     expect(result.current.pending).toBe(false);
     expect(texts(result.current)).toEqual(['q', NET_ERR]);

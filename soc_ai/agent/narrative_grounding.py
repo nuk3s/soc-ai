@@ -341,17 +341,26 @@ def check_narrative_grounding(
     smb_unsupported = artifacts.smb and not any(
         tok in corpus for tok in ("smb", "file share", "file-share", "fileshare")
     )
+    if smb_unsupported:
+        # The claim rides in `ungrounded` as the text the answer actually used
+        # ("SMB", "file shares"), not as a descriptive label: the regrounding
+        # prompt and `redact_ungrounded` both work on that list, and neither can
+        # act on a label that never appears in the answer. Before this, an
+        # SMB-only failure came back with an empty list, so the chat engine
+        # skipped the retry, stripped nothing, and still told the analyst
+        # something had been removed while the claim shipped verbatim.
+        seen: dict[str, str] = {}
+        for m in _SMB_CLAIM.finditer(answer):
+            seen.setdefault(m.group(0).lower(), m.group(0))
+        ungrounded.extend(seen.values())
 
-    if not ungrounded and not smb_unsupported:
+    if not ungrounded:
         return NarrativeGrounding(grounded=True, asserted=identifiers, ungrounded=[])
 
-    detail = list(ungrounded)
-    if smb_unsupported:
-        detail.append("SMB/file-share activity")
     reason = (
         "answer asserts per-event fact(s) "
-        + ", ".join(repr(a) for a in detail[:6])
-        + (" …" if len(detail) > 6 else "")
+        + ", ".join(repr(a) for a in ungrounded[:6])
+        + (" …" if len(ungrounded) > 6 else "")
         + " that appear in neither a tool result nor the investigation context"
     )
     return NarrativeGrounding(

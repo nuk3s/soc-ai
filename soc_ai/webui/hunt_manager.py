@@ -18,6 +18,7 @@ from soc_ai.agent.context import HuntSubject
 from soc_ai.agent.prompts import FocusOrigin
 from soc_ai.api.deps import ctx_from_state
 from soc_ai.api.runner import CancelToken, run_recorded
+from soc_ai.store import investigations as inv_svc
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -90,12 +91,13 @@ class HuntManager:
         Returns the investigation id, or None if the generator ended or
         errored before emitting ``investigation_created``.
         """
-        if kind == "hunt":
+        if kind in inv_svc.PROMOTED_KINDS:
             # Single source of truth, forced HERE rather than trusted from the
             # caller: the promotion route's explicit allow_so_writes=False stays
-            # as documentation at the call site, but a FUTURE kind="hunt" caller
-            # that forgets the kwarg must not reopen the unattended-auto-ack
-            # hole — a promoted finding's anchor never has an SO alert to ack.
+            # as documentation at the call site, but a FUTURE promoted-kind
+            # caller that forgets the kwarg must not reopen the unattended-auto-ack
+            # hole — a promoted finding's or lead's anchor never has an SO alert
+            # to ack.
             allow_so_writes = False
         ctx = ctx_from_state(state)
         token = CancelToken()

@@ -19,11 +19,16 @@ is unset, those feeds are SKIPPED with a clear message — the refresh does not
 fail hard, and the Tor exit list (which needs no key) still refreshes. The key
 is never logged.
 
-Atomic writes
--------------
+Atomic writes + body validation
+-------------------------------
 Each feed is downloaded to a temp file in the same directory and then
-``os.replace``-d into place, so a partial or failed download can never corrupt
-a live feed file that triage is reading.
+``os.replace``-d into place, so an interrupted write can never leave a
+half-written live feed file that triage is reading. Before that swap the body
+is run through the real :mod:`soc_ai.enrichment.blocklists` loader: an empty
+body, an HTML sign-in/challenge page, a JSON error document or a truncated
+download parses to zero indicators and is discarded, the previous file is
+kept, and the feed is reported as FAILED (non-zero exit) so the timer log shows
+it. A 200 is therefore not enough to replace a good feed.
 
 Synth-eval reproducibility
 ---------------------------
@@ -40,6 +45,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,6 +53,7 @@ from pathlib import Path
 import httpx
 
 from soc_ai.demo.guard import assert_ambient_egress_allowed
+from soc_ai.enrichment.blocklists import BlocklistDB
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -146,6 +153,43 @@ def _atomic_write_bytes(dest: Path, content: bytes) -> None:
         raise
 
 
+def _validate_feed_body(feed: BlocklistFeed, content: bytes, data_dir: Path) -> str | None:
+    """Return why ``content`` is unusable as ``feed``'s file, or ``None`` when it is fine.
+
+    Upstreams answer 200 for things that are not the feed: an empty body, a
+    WAF/captive-portal/maintenance HTML page, a JSON error document, a
+    connection that ended early. Rather than hand-roll a per-feed format check
+    that drifts from abuse.ch's layout, the body is written into a scratch
+    directory under ``data_dir`` and run through the SAME loader triage uses;
+    anything that raises or yields zero indicators is rejected. The scratch
+    directory is removed on every path so nothing is left next to the live files.
+    """
+    if not content:
+        return "empty response body"
+    try:
+        scratch = Path(tempfile.mkdtemp(prefix=f".{feed.name}.check.", dir=str(data_dir)))
+    except OSError as e:
+        return f"could not stage {feed.filename} for validation: {e}"
+    try:
+        try:
+            (scratch / feed.filename).write_bytes(content)
+        except OSError as e:
+            return f"could not stage {feed.filename} for validation: {e}"
+        try:
+            db = BlocklistDB.from_dir(scratch, sources=[feed.name])
+        except Exception as e:
+            # The loaders raise whatever json/csv/codec error the garbage
+            # provokes; any of them means "not this feed's format".
+            return f"body does not parse as {feed.filename}: {e}"
+        if feed.name in db.missing_sources:
+            return f"loader could not read {feed.filename}"
+        if not (db.ips or db.domains or db.hashes):
+            return f"body parsed as {feed.filename} but contains no indicators"
+        return None
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
 async def refresh_blocklists(
     data_dir: Path,
     *,
@@ -165,7 +209,8 @@ async def refresh_blocklists(
 
     Returns:
         One :class:`RefreshResult` per attempted feed. A single feed failing
-        (HTTP error) does not abort the others (fail-open).
+        (HTTP error, unusable body, write error) does not abort the others
+        (fail-open); a failed feed keeps whatever file was already on disk.
     """
     # No Settings parameter in this signature (the CLI handler owns that), so
     # the ambient guard resolves the demo flag itself.
@@ -215,6 +260,16 @@ async def refresh_blocklists(
                 continue
 
             content = resp.content
+            rejected = _validate_feed_body(feed, content, data_dir)
+            if rejected is not None:
+                _LOGGER.warning(
+                    "blocklist refresh %s rejected: %s (keeping the existing file)",
+                    feed.name,
+                    rejected,
+                )
+                results.append(RefreshResult(source=feed.name, success=False, error=rejected))
+                continue
+
             try:
                 _atomic_write_bytes(data_dir / feed.filename, content)
             except OSError as e:

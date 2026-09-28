@@ -6,7 +6,7 @@
 // such events into a single summary row; these tests pin the UI wiring:
 // the bucket row itself, the "Show each" unfold, and that the bucket
 // checkbox is a true stand-in for every event id it covers.
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ShellProvider } from '../shell/ShellContext';
@@ -69,8 +69,26 @@ async function expandGroup(events: AlertEvent[]): Promise<void> {
   await waitFor(() => expect(getAlertGroupEvents).toHaveBeenCalled());
 }
 
+/** Mount the screen and return once the one group's row is on screen. */
+async function mountAlerts(): Promise<void> {
+  render(
+    <MemoryRouter initialEntries={['/alerts']}>
+      <ShellProvider>
+        <Alerts />
+      </ShellProvider>
+    </MemoryRouter>,
+  );
+  await screen.findByText(GROUP.name);
+}
+
+// Block body on purpose: mockReset() returns the mock, and a function returned
+// from beforeEach runs as a cleanup hook after the test — which would call the
+// mock once more, and with a rejecting page installed fail the test on its own.
+beforeEach(() => {
+  vi.mocked(getAlertGroupEvents).mockReset();
+});
+
 describe('event floods collapse into summary buckets', () => {
-  beforeEach(() => vi.mocked(getAlertGroupEvents).mockReset());
 
   it('a run of 5 identical events renders one bucket row, not five plain rows', async () => {
     await expandGroup(FLOOD);
@@ -120,5 +138,64 @@ describe('event floods collapse into summary buckets', () => {
 
     fireEvent.click(await screen.findByText(GROUP.name));
     await waitFor(() => expect(screen.queryAllByTestId('event-bucket-row')).toHaveLength(1));
+  });
+});
+
+// A rejected event page used to be cached as `[]`: a grid 503 rendered "No
+// events in window.", and because the cache key was then defined, collapsing
+// and re-expanding never asked again for the life of the filter. A false empty
+// on a degraded grid is the same calm-night lie the list-level error card
+// exists to prevent; the per-group page needs its own error and its own Retry.
+describe('a group whose event page failed to load', () => {
+  it('says so with a Retry instead of claiming the group is empty', async () => {
+    vi.mocked(getAlertGroupEvents)
+      .mockImplementationOnce(() => Promise.reject(new Error('grid unavailable')))
+      .mockResolvedValue(DISTINCT);
+    await mountAlerts();
+    fireEvent.click(screen.getByText(GROUP.name));
+    await waitFor(() => expect(getAlertGroupEvents).toHaveBeenCalledTimes(1));
+
+    const retry = await screen.findByRole('button', { name: 'Retry' });
+    expect(screen.getByRole('alert').textContent).toContain('grid unavailable');
+    expect(screen.queryByText('No events in window.')).toBeNull();
+
+    // Retry re-runs the same fetch, and the rows it returns replace the error.
+    fireEvent.click(retry);
+    await waitFor(() => expect(getAlertGroupEvents).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getAllByRole('checkbox').length).toBeGreaterThan(1));
+    expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull();
+    expect(screen.queryByText('No events in window.')).toBeNull();
+  });
+});
+
+// The filter-change effect clears the cached event pages but cannot cancel a
+// page already in flight. When that page landed it was written into the
+// freshly cleared map — under the NEW filter — and the guard that skips a
+// fetch for a cached key then kept it there: acknowledged events under "Hide
+// acknowledged", or events outside the new window, listed as if they matched.
+describe('an event page still in flight when the filter changes', () => {
+  it('is dropped, and re-expanding fetches under the new filter', async () => {
+    let resolveStale!: (evs: AlertEvent[]) => void;
+    vi.mocked(getAlertGroupEvents)
+      .mockImplementationOnce(() => new Promise<AlertEvent[]>((r) => { resolveStale = r; }))
+      .mockResolvedValue(DISTINCT);
+    await mountAlerts();
+    fireEvent.click(screen.getByText(GROUP.name));
+    await waitFor(() => expect(getAlertGroupEvents).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(getAlertGroupEvents).mock.calls[0][1]).toMatchObject({ range: '24h' });
+
+    // Change the window while the old page is still pending, then let it land.
+    fireEvent.click(screen.getByRole('button', { name: '7d' }));
+    await screen.findByText(GROUP.name);
+    await act(async () => {
+      resolveStale(FLOOD);
+    });
+
+    fireEvent.click(screen.getByText(GROUP.name));
+    await waitFor(() => expect(getAlertGroupEvents).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(getAlertGroupEvents).mock.calls[1][1]).toMatchObject({ range: '7d' });
+    // The fresh page renders; the stale flood never does.
+    await waitFor(() => expect(screen.getAllByRole('checkbox').length).toBeGreaterThan(1));
+    expect(screen.queryAllByTestId('event-bucket-row')).toHaveLength(0);
   });
 });

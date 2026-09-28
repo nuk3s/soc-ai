@@ -38,6 +38,10 @@ export function NotificationsPanel({
   const [testResult, setTestResult] = useState<{ ok: boolean; detail: string } | null>(null);
   const [testing, setTesting] = useState(false);
   const [reload, setReload] = useState(0);
+  // Arms an inline two-step confirm for Clear (matches every other destructive
+  // action in the app) — the URL cannot be read back, so a mis-click beside
+  // Replace would silently stop every notification until it is re-entered.
+  const [pendingClear, setPendingClear] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -56,6 +60,7 @@ export function NotificationsPanel({
   const cancel = () => {
     setEditing(false);
     setValue('');
+    setPendingClear(false);
   };
 
   const save = async () => {
@@ -87,6 +92,7 @@ export function NotificationsPanel({
       setMsg({ text: e instanceof Error ? e.message : 'soc-ai could not clear the webhook URL.', ok: false });
     } finally {
       setBusy(false);
+      setPendingClear(false);
     }
   };
 
@@ -157,17 +163,36 @@ export function NotificationsPanel({
                       setEditing(true);
                       setValue('');
                       setMsg(null);
+                      setPendingClear(false);
                     }}
                     className="flex-none rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-[5px] text-[11.5px] font-semibold text-text hover:border-accent"
                   >
                     {isSet ? 'Replace' : 'Set'}
                   </button>
                 )}
-                {!editing && isSet && (
+                {!editing && isSet && pendingClear && (
+                  <>
+                    <button
+                      onClick={() => {
+                        void clear();
+                      }}
+                      disabled={busy}
+                      className="flex-none rounded-[7px] border border-danger px-[11px] py-[5px] text-[11.5px] font-semibold text-danger hover:bg-[rgba(240,68,56,.12)] disabled:opacity-50"
+                    >
+                      Confirm clear
+                    </button>
+                    <button
+                      onClick={() => setPendingClear(false)}
+                      disabled={busy}
+                      className="flex-none rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-[5px] text-[11.5px] font-semibold text-dim hover:text-text disabled:opacity-50"
+                    >
+                      Cancel
+                    </button>
+                  </>
+                )}
+                {!editing && isSet && !pendingClear && (
                   <button
-                    onClick={() => {
-                      void clear();
-                    }}
+                    onClick={() => setPendingClear(true)}
                     disabled={busy}
                     className="flex-none rounded-[7px] border px-[11px] py-[5px] text-[11.5px] font-semibold text-danger hover:bg-[rgba(240,68,56,.12)] disabled:opacity-50"
                     style={{ borderColor: 'rgba(240,68,56,.3)' }}

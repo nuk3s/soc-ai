@@ -13,7 +13,9 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
 import sqlite3
+import stat
 import tarfile
 from pathlib import Path
 from typing import Any
@@ -172,6 +174,35 @@ async def test_backup_restore_round_trip(tmp_path: Path) -> None:
     assert restored_key.read_bytes() == KEY_BYTES
     assert restored_key.stat().st_mode & 0o777 == 0o600
     assert (dst_dir / "known_hosts").read_text() == KNOWN_HOSTS
+
+
+async def test_backup_archive_is_private_and_excludes_bootstrap_credential(
+    tmp_path: Path,
+) -> None:
+    """The archive holds secrets, so it must be 0600 regardless of the umask,
+    and the one-shot bootstrap admin password parked beside the DB must not
+    ride along."""
+    src_dir = tmp_path / "src"
+    await _seed_store(_settings(src_dir))
+    _write_sidecars(src_dir)
+    cred = src_dir / "bootstrap-admin-password.txt"
+    cred.write_text("hunter2\n")
+    cred.chmod(0o600)
+
+    archive = tmp_path / "backup.tar.gz"
+    old_umask = os.umask(0o022)  # the permissive default the app runs under
+    try:
+        result = create_backup(src_dir, archive)
+    finally:
+        os.umask(old_umask)
+
+    assert stat.S_IMODE(archive.stat().st_mode) == 0o600
+    assert result.manifest.sidecars == ["decision_signing_ed25519.key", "known_hosts"]
+    assert read_manifest(archive).sidecars == ["decision_signing_ed25519.key", "known_hosts"]
+    with tarfile.open(archive, "r:gz") as tar:
+        names = tar.getnames()
+    assert "data/bootstrap-admin-password.txt" not in names
+    assert "data/decision_signing_ed25519.key" in names
 
 
 async def test_backup_is_safe_while_wal_journal_is_hot(tmp_path: Path) -> None:

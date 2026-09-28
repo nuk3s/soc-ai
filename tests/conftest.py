@@ -16,8 +16,10 @@ with nothing here to keep in step.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import shutil
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
@@ -35,14 +37,17 @@ from pydantic import SecretStr
 _real_gensalt = bcrypt.gensalt
 bcrypt.gensalt = lambda rounds=4, prefix=b"2b": _real_gensalt(rounds, prefix)  # type: ignore[assignment]
 
+from soc_ai import main as soc_ai_main  # noqa: E402
 from soc_ai.config import Settings, get_settings  # noqa: E402
+from soc_ai.store import db as store_db  # noqa: E402
+from sqlalchemy.ext.asyncio import AsyncEngine  # noqa: E402
 
 # Security-audit harness fixtures (auth ON, two real roles, hostile-doc
 # factory). Imported by name so pytest registers them here: pytest 9 rejects
 # `pytest_plugins` in a non-rootdir conftest, and the repo has no root conftest.
 from tests.conftest_security import (  # noqa: E402, F401
-    admin_session,
-    analyst_session,
+    admin_client,
+    analyst_client,
     audit_client,
     audit_settings,
     hostile_doc,
@@ -100,13 +105,18 @@ def _settings_env_names() -> frozenset[str]:
 _SETTINGS_ENV_NAMES = _settings_env_names()
 
 
-@pytest.fixture(autouse=True)
-def clean_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]:
-    """Strip soc-ai env vars and isolate tests from any .env in the project root."""
+def _scrub_soc_ai_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Drop every env var :class:`Settings` would read (see the module docstring)."""
     for key in list(os.environ):
         upper = key.upper()  # Settings reads env case-insensitively; so do we.
         if upper.startswith(_PREFIXES) or upper in _SETTINGS_ENV_NAMES:
             monkeypatch.delenv(key, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def clean_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]:
+    """Strip soc-ai env vars and isolate tests from any .env in the project root."""
+    _scrub_soc_ai_env(monkeypatch)
     # pydantic-settings reads `.env` from cwd; chdir to a clean tmp dir so the
     # repo's runtime .env doesn't bleed into tests.
     monkeypatch.chdir(tmp_path)
@@ -127,6 +137,64 @@ def clean_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]
     _auth.password_change_throttle.reset()
     yield
     get_settings.cache_clear()
+
+
+@pytest.fixture(scope="session")
+def migrated_store_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """A store file already at alembic head, migrated once per session.
+
+    Every app boot runs the whole migration chain against an empty SQLite file,
+    about a quarter of a second, and well over a thousand tests boot the app.
+    The chain is deterministic, so it runs once here and each boot starts from
+    a copy (see :func:`fast_app_boot`). The Settings it needs are built under
+    the same env scrub as :func:`clean_env`, from a cwd of its own, so a dev
+    shell cannot steer them. ``dispose()`` closes the last connection, which
+    checkpoints and removes the WAL sidecar: the one file is the whole store.
+    """
+    template_dir = tmp_path_factory.mktemp("store-template")
+    with pytest.MonkeyPatch.context() as mp:
+        _scrub_soc_ai_env(mp)
+        mp.chdir(template_dir)
+        settings = Settings(**_base_settings_kwargs(), soc_ai_data_dir=template_dir / "data")
+
+    async def _migrate_fresh_store() -> None:
+        engine = store_db.make_engine(settings)
+        try:
+            await store_db.run_migrations(engine)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_migrate_fresh_store())
+    return settings.soc_ai_data_dir / "soc-ai.db"
+
+
+@pytest.fixture(autouse=True)
+def fast_app_boot(monkeypatch: pytest.MonkeyPatch, migrated_store_template: Path) -> None:
+    """Take the migration chain out of an app boot.
+
+    Only the lifespan's call (``soc_ai.main.run_migrations``) is redirected, and
+    only when the store file does not exist yet: it then starts as a copy of
+    the migrated template. A store that already exists, because the test
+    migrated it first or is restarting the app, still goes through
+    ``soc_ai.store.db.run_migrations``, which stays untouched for the migration
+    tests and every direct caller.
+
+    The other fixed cost of a boot, the bootstrap admin's bcrypt hash, is paid
+    at the minimum cost through the module-level ``bcrypt.gensalt`` patch at the
+    top of this file (it has to precede the first soc_ai import to reach
+    auth.py's import-time dummy hash), so nothing is patched per test here.
+    """
+
+    async def _migrate_or_copy(engine: AsyncEngine) -> None:
+        database = engine.url.database
+        store = Path(database) if database and database != ":memory:" else None
+        if store is None or store.exists():
+            await store_db.run_migrations(engine)
+            return
+        store.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(migrated_store_template, store)
+
+    monkeypatch.setattr(soc_ai_main, "run_migrations", _migrate_or_copy)
 
 
 @pytest.fixture

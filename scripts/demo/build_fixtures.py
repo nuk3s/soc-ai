@@ -463,9 +463,7 @@ def build(
         # authored hunt id can never shadow another seeded row either).
         earlier = seen_ids.get(record["id"])
         if earlier is not None:
-            sys.exit(
-                f"duplicate {kind} id {record['id']} — {earlier} and {bundle} {detail}"
-            )
+            sys.exit(f"duplicate {kind} id {record['id']} — {earlier} and {bundle} {detail}")
         seen_ids[record["id"]] = bundle
 
     for bundle in bundle_dirs:

@@ -27,8 +27,16 @@ echo "TIMER: setup complete at ${t_setup}s"
 
 # Read effective values from the generated .env: it intentionally carries
 # duplicate keys (example base + appended managed block) — LAST value wins.
-pw=$(grep '^BOOTSTRAP_ADMIN_PASSWORD=' .env | tail -1 | cut -d= -f2- | tr -d '\r') || true
-port=$(grep '^SOC_AI_PORT=' .env | tail -1 | cut -d= -f2- | tr -d '\r') || true
+# setup.sh single-quotes the values it writes, so strip one surrounding
+# quote pair the way setup.sh's own read-back does.
+env_readback() { local v
+  v=$(grep "^$1=" .env 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '\r') || true
+  [[ $v == \'*\' && $v == *\' ]] && v=${v:1:-1}
+  [[ $v == \"*\" && $v == *\" ]] && v=${v:1:-1}
+  printf '%s' "$v"
+}
+pw=$(env_readback BOOTSTRAP_ADMIN_PASSWORD)
+port=$(env_readback SOC_AI_PORT)
 port=${port:-8443}
 base="https://localhost:${port}"
 

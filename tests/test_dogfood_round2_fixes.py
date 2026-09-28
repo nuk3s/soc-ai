@@ -188,3 +188,20 @@ def test_the_legacy_seen_and_baseline_tails_become_sentences() -> None:
     assert reword_legacy_summary("a thing (seen once) — against a baseline of 1 over 1d") == (
         "a thing. The sweep saw it once. The baseline holds 1 value over 1 day."
     )
+
+
+def test_a_silent_host_says_it_was_not_seen() -> None:
+    """A collapse scored from absence names the absence.
+
+    The silent-host path scores a host the recent read did not see as zero in
+    every covered cell. That sentence was identical to a measured zero, and an
+    analyst could not tell a stopped shipper from a quiet host.
+    """
+    silent = _rate_dep("connection_rate", "work", value=0.0, median=85.0)
+    silent.observed = {"value": 0.0, "sample_ids": [], "silent": True}
+    measured = _rate_dep("connection_rate", "work", value=0.0, median=85.0)
+    measured.observed = {"value": 0.0, "sample_ids": []}
+    assert _phrase(Kind.BELOW_BASELINE, silent).endswith(
+        "That is 0.0 times the median. The host was not seen at all in the window"
+    )
+    assert _phrase(Kind.BELOW_BASELINE, measured).endswith("That is 0.0 times the median")

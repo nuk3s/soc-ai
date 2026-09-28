@@ -80,6 +80,14 @@ _LOGGER = logging.getLogger(__name__)
 # (mirrors rule_prevalence — Zeek/notice datasets have their own cadence).
 _DATASET = "suricata.alert"
 
+# Cap the caller-supplied lookback window. This is an LLM-callable read tool and
+# alert-embedded text is in-scope prompt-injection surface, so an unbounded
+# lookback_days would let the agent turn a tuning check into a full-retention
+# aggregation (track_total_hits, the day histogram, and on the zero branch a
+# second import-count search) against the live SO grid. 365d is ample for a
+# disposition trend and mirrors the sibling read tools' ceilings.
+_MAX_LOOKBACK_DAYS = 365
+
 
 def _rule_disposition_query(
     rule_name: str, lookback_days: int, provenance: Provenance = LIVE
@@ -161,7 +169,7 @@ async def suggest_rule_tuning(
             ``rule.name`` / ``signature`` value).
         elastic: client for the SO ES cluster.
         settings: app settings (uses ``events_index_pattern``).
-        lookback_days: window size in days. Default 7.
+        lookback_days: window size in days. Default 7, at most 365.
         provenance: which population the volume and disposition trend are
             measured over (:mod:`soc_ai.tools._provenance`). ``"live"`` (the
             default) counts only alerts this grid's own sensors raised, because
@@ -192,6 +200,12 @@ async def suggest_rule_tuning(
             "error": True,
             "type": "ValueError",
             "message": f"lookback_days must be positive, got {lookback_days}",
+        }
+    if lookback_days > _MAX_LOOKBACK_DAYS:
+        return {
+            "error": True,
+            "type": "ValueError",
+            "message": f"lookback_days must be <= {_MAX_LOOKBACK_DAYS}, got {lookback_days}",
         }
 
     query = _rule_disposition_query(rule_name, lookback_days, provenance)

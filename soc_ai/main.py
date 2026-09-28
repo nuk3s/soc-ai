@@ -1136,10 +1136,17 @@ async def _hunt_schedule_loop(app: FastAPI) -> None:
             _LOGGER.exception("hunt scheduler iteration failed; continuing")
 
 
-# How many leads one wake reads before it decides. Wider than any sensible
-# concurrency cap, because a lead that cites no documents is skipped and must
-# not hold the slot of a lead behind it that does.
+# How many leads one wake reads at a time. Wider than any sensible concurrency
+# cap, because a lead that cites no documents is skipped and must not hold the
+# slot of a lead behind it that does.
 _LEAD_AUTO_HUNT_BATCH = 50
+
+# How many such pages one wake reads before it gives up looking. A skipped lead
+# stays open and stays where it is, so the skipped leads pile up at the head of
+# the queue, and a wake that read one page found nothing but skips once a page
+# of them was older than every lead with evidence. The wake reads on past them.
+# The bound keeps a table of thousands of skipped leads from pinning one wake.
+_LEAD_AUTO_HUNT_PAGES = 20
 
 # How often the skip of one lead is said. The loop wakes every 60 seconds, so
 # an unthrottled line would write sixty an hour about one lead that is not
@@ -1147,22 +1154,33 @@ _LEAD_AUTO_HUNT_BATCH = 50
 _LEAD_AUTO_HUNT_QUIET = timedelta(hours=1)
 
 
-async def _leads_the_loop_may_hunt(db: Any) -> tuple[list[int], list[int]]:
+async def _leads_the_loop_may_hunt(db: Any, *, need: int) -> tuple[list[int], list[int]]:
     """The waiting leads, split by whether their observations cite a document.
 
     The second list is skipped rather than hunted: a hunt of a lead that cites
     nothing has no evidence to read first, so it searches the grid from
     scratch. The split is re-read on every wake, because the sweep can record
     documents for a lead that had none.
+
+    ``need`` is how many leads the wake can start. The pages are read in order
+    until a page has brought the first list to that many, until a page comes
+    back short, or until the page bound is spent. Every skipped lead read on
+    the way is in the second list, so the log still names each one.
     """
     from soc_ai.hunting import lead_hunt  # noqa: PLC0415
     from soc_ai.store import leads as leads_store  # noqa: PLC0415
 
     cited: list[int] = []
     bare: list[int] = []
-    for lead in await lead_hunt.leads_awaiting_a_hunt(db, limit=_LEAD_AUTO_HUNT_BATCH):
-        rows = await leads_store.timeline(db, int(lead.id))
-        (cited if leads_store.cites_documents(rows) else bare).append(int(lead.id))
+    after: tuple[datetime, int] | None = None
+    for _ in range(_LEAD_AUTO_HUNT_PAGES):
+        page = await lead_hunt.leads_awaiting_a_hunt(db, limit=_LEAD_AUTO_HUNT_BATCH, after=after)
+        for lead in page:
+            rows = await leads_store.timeline(db, int(lead.id))
+            (cited if leads_store.cites_documents(rows) else bare).append(int(lead.id))
+        if len(cited) >= need or len(page) < _LEAD_AUTO_HUNT_BATCH:
+            break
+        after = (page[-1].formed_at, int(page[-1].id))
     return cited, bare
 
 
@@ -1251,7 +1269,7 @@ async def _lead_auto_hunt_loop(app: FastAPI) -> None:
                 running = await lead_hunt.running_auto_hunts(db)
                 if running >= cap:
                     continue
-                eligible, no_documents = await _leads_the_loop_may_hunt(db)
+                eligible, no_documents = await _leads_the_loop_may_hunt(db, need=cap - running)
 
             said_no_documents = _say_the_skipped_leads(
                 said_no_documents, no_documents, datetime.now(UTC).replace(tzinfo=None)
@@ -1301,11 +1319,23 @@ def _persist_bootstrap_credential(settings: Any, created_pw: str) -> None:
     """
     cred_path = bootstrap_credential_path(settings)
     try:
-        cred_path.write_text(created_pw + "\n")
+        # Born 0600 rather than created under the umask and locked down after:
+        # a write-then-chmod leaves a window where any local user can read the
+        # password. Unlink first because O_TRUNC on a sidecar left over from an
+        # earlier run would keep that file's old mode. The chmod afterwards is
+        # belt-and-braces, mirroring the signing-key sidecar.
+        cred_path.unlink(missing_ok=True)
+        fd = os.open(cred_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(created_pw + "\n")
         cred_path.chmod(0o600)
     except OSError:
         # Data dir not writable for some reason — fall back to the log line
         # rather than leaving the operator with no way to reach the account.
+        # Whatever did land on disk must not stay there next to the log line,
+        # or the credential is exposed in two places instead of none.
+        with contextlib.suppress(OSError):
+            cred_path.unlink()
         _LOGGER.warning(
             "BOOTSTRAP CREDENTIAL (change at first login, then scrub this log line): "
             "initial admin user 'admin' password=%s",
@@ -1416,6 +1446,18 @@ async def _reap_orphans_at_startup(db_sessionmaker: Any) -> None:
     if orphaned_general:
         _LOGGER.info(
             "reaped %d orphaned 'pending' dashboard chat turn(s) at startup", orphaned_general
+        )
+
+    # …and the hunt follow-up chat, whose turns live in hunt_events rather than
+    # in either chat table. Neither reaper above reaches them, and a pending
+    # turn left there keeps the hunt's chat spinning and refuses every later
+    # question on that hunt as busy. Startup only: the rows carry no timestamp
+    # for the periodic sweep to age them by.
+    async with db_sessionmaker() as db:
+        orphaned_hunt_chat = await hunt_svc.reap_stale_pending_chat(db)
+    if orphaned_hunt_chat:
+        _LOGGER.info(
+            "reaped %d orphaned 'pending' hunt chat turn(s) at startup", orphaned_hunt_chat
         )
 
     # Expired sessions: get_session_user rejects them but leaves the row, so an
@@ -1973,19 +2015,34 @@ def create_app() -> FastAPI:  # noqa: PLR0915 - app factory wires many middlewar
     # anonymous caller can flood with an arbitrarily large request body — the
     # deployed stack terminates TLS in uvicorn directly with nothing in front to
     # impose a size cap. Reject early on a declared Content-Length so the body is
-    # never buffered; LoginIn's own Field(max_length=...) is defense in depth for
-    # callers that omit Content-Length.
+    # never buffered. A body with NO declared length (chunked transfer) gets no
+    # such early answer: Starlette reads it to the end before LoginIn's
+    # Field(max_length=...) ever runs, so the declared length is REQUIRED here
+    # (411). Browsers, fetch() with a string body, and httpx all send
+    # Content-Length for a JSON login, so no real client is affected. A request
+    # that carries Content-Length AND Transfer-Encoding is framed as chunked by
+    # the HTTP parser, so its length header cannot be trusted either.
     _LOGIN_MAX_BODY_BYTES = 8 * 1024  # ample for a username+password JSON body
 
     @app.middleware("http")
     async def _login_body_size_guard(request: Any, call_next: Any) -> Response:
-        if request.url.path == "/api/v1/login":
+        if request.url.path == "/api/v1/login" and request.method == "POST":
             content_length = request.headers.get("content-length")
             if (
-                content_length is not None
-                and content_length.isdigit()
-                and int(content_length) > _LOGIN_MAX_BODY_BYTES
+                request.headers.get("transfer-encoding")
+                or content_length is None
+                or not content_length.isdigit()
             ):
+                return JSONResponse(
+                    status_code=411,
+                    content={
+                        "detail": {
+                            "reason": "length_required",
+                            "hint": "Login requires a Content-Length header.",
+                        }
+                    },
+                )
+            if int(content_length) > _LOGIN_MAX_BODY_BYTES:
                 return JSONResponse(
                     status_code=413,
                     content={

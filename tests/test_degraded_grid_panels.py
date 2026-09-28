@@ -924,14 +924,21 @@ async def test_a_caller_that_walks_away_mid_planning_does_not_wedge_the_sweep(
 
     state = SimpleNamespace(settings=stalled_settings, elastic=_NeverAnswers())
     request = cast("Request", _StubRequest(state))
-    task = asyncio.create_task(start_auto_triage(request, AutoTriageIn(range="24h")))
-    with anyio.fail_after(5):
-        await planning.wait()
-    assert at.get_status(state).active is True, "the slot was never claimed — test is vacuous"
+    # The route resolves the caller before its single-flight check, and the stub
+    # request carries no session to resolve; the lookup is not what this test is
+    # about, so it answers a fixed name and the cancel lands in planning as before.
+    with patch(
+        "soc_ai.api.webui.routes_autotriage.identify_caller",
+        AsyncMock(return_value="analyst"),
+    ):
+        task = asyncio.create_task(start_auto_triage(request, AutoTriageIn(range="24h")))
+        with anyio.fail_after(5):
+            await planning.wait()
+        assert at.get_status(state).active is True, "the slot was never claimed — test is vacuous"
 
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
     assert at.get_status(state).active is False, (
         "the single-flight claim survived the cancelled request — every later Bulk "
