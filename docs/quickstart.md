@@ -11,7 +11,7 @@ The demo takes 5 minutes. It needs no Security Onion grid and no model.
 ```bash
 git clone https://github.com/nuk3s/soc-ai.git && cd soc-ai
 docker compose -f docker-compose.demo.yml up --build
-# → http://127.0.0.1:8080/ui/alerts
+# → http://127.0.0.1:8080/app/alerts
 ```
 
 The demo replays recorded investigations, hunts and a backtest on canned data.

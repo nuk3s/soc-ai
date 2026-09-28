@@ -166,6 +166,35 @@ catalogue stays reproducible, and the live dir refreshes daily for real triage.
 
 ## MaxMind GeoIP
 
-You download the MaxMind GeoLite2 `.mmdb` files separately. They need a license key and
-arrive as a ZIP file, so they have a different shape. `docs/DEPLOYMENT.md` covers them.
-This CLI does not.
+`soc-ai blocklists refresh` never touches the GeoIP data, and nothing else in soc-ai
+downloads it either. The MaxMind GeoLite2 databases need a MaxMind account, and they
+arrive as a tarball, so they have a different shape from the feeds above. You download
+the two files by hand:
+
+1. Create a free MaxMind account and generate a license key at
+   <https://www.maxmind.com/en/geolite2/signup>. Put it in `.env` as
+   `MAXMIND_LICENSE_KEY=`. soc-ai does not use the key itself; the Data sources page
+   in Config only shows whether one is on file.
+2. Download the **GeoLite2 City** and **GeoLite2 ASN** databases in `.mmdb` format
+   from the GeoLite2 download page of your account, or with MaxMind's `geoipupdate`
+   tool and the same key. Each tarball unpacks to a dated directory that holds the
+   `.mmdb` file.
+3. Place `GeoLite2-City.mmdb` and `GeoLite2-ASN.mmdb` in `maxmind_data_dir`. The
+   default is `/var/lib/soc-ai/maxmind`, and `MAXMIND_DATA_DIR` in `.env` overrides
+   it. The files must be readable by the user soc-ai runs as (uid 1000 in the
+   container).
+4. Restart soc-ai. It opens the two files at startup, and the MaxMind row on the Data
+   sources page shows them as present.
+
+In the Docker stack `maxmind_data_dir` is the `soc_ai_maxmind` volume, so the last two
+steps are:
+
+```bash
+docker cp GeoLite2-City.mmdb soc-ai:/var/lib/soc-ai/maxmind/
+docker cp GeoLite2-ASN.mmdb soc-ai:/var/lib/soc-ai/maxmind/
+docker compose restart soc-ai
+```
+
+Without the files, GeoIP and ASN enrichment return nothing, and everything else still
+works. Repeat the download when you want fresher data; the refresh job will not do it
+for you.

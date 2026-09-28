@@ -32,6 +32,8 @@ import tomllib
 from pathlib import Path
 from typing import get_args
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 AGENT_TOOLS_DOC = REPO_ROOT / "docs" / "AGENT_TOOLS.md"
 
@@ -437,6 +439,34 @@ def test_readme_version_badge_matches_pyproject() -> None:
     assert m.group(1) == version, f"README badge {m.group(1)} != pyproject {version}"
 
 
+def test_readme_prebuilt_note_not_pre_release() -> None:
+    """The prebuilt-image callout must not describe the image as unpublished.
+
+    The note still said no image existed before the first release tag and
+    that ``--prebuilt`` answers ``denied``, four minor versions after
+    release.yml started publishing ghcr.io/nuk3s/soc-ai on every tag. A
+    reader picking an install route was told the faster one does not work.
+    """
+    version = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())["project"]["version"]
+    readme = README_DOC.read_text()
+    if int(version.split(".")[0]) >= 1:
+        assert "No image is published before the first release" not in readme
+        assert "for the first tag" not in readme
+
+
+def test_docs_site_changelog_mentions_current_version() -> None:
+    """The docs-site changelog page carries a highlight for the shipped version.
+
+    mkdocs publishes docs/project/changelog.md as Project → Changelog and the
+    roadmap calls it the version-by-version record; its highlights stopped at
+    1.2.6 while 1.5.0 shipped. Same regression class as the README badge: a
+    hand-edited version string nobody touches on release.
+    """
+    version = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())["project"]["version"]
+    page = (DOCS_DIR / "project" / "changelog.md").read_text()
+    assert f"**{version}**" in page, f"docs/project/changelog.md has no highlight for {version}"
+
+
 def test_quickstart_internal_links_resolve() -> None:
     """Every relative .md link in the quickstart must exist — the page owns
     clone-to-verdict and a dangling link strands a first-run user."""
@@ -646,3 +676,276 @@ def test_changelog_day1_claim_matches_curation() -> None:
     assert f"config opens on {_NUMBER_WORDS[day1]} decisions" in text, (
         f"CHANGELOG's day-1 claim doesn't match the curated count ({day1})"
     )
+
+
+# ---------------------------------------------------------------------------
+# Gate 8 — the deployment pages vs the code they describe (DOCKER.md,
+# DEPLOYMENT.md, HUNTING.md, .env.example, docker-compose*.yml)
+# ---------------------------------------------------------------------------
+#
+# These are the pages an operator follows with a terminal open, so a stale
+# claim costs an afternoon rather than a raised eyebrow: a refresh command
+# credited with a GeoIP download it never performs (and a troubleshooting
+# entry that sends the operator back to it), a demo URL the app answers with
+# a 404, a loopback recipe that fails Settings validation in the container it
+# was meant to lock down, a TLS section that sends a private-CA site to
+# ES_VERIFY_SSL=false while ES_CA_BUNDLE exists, an audit section that calls a
+# fail-closed abort "not fatal", a first-login recipe that greps a log the
+# password is no longer written to, and a CLI table that omits a required
+# flag. Each pin reads the claim out of the doc and checks it against the
+# code that decides what actually happens.
+
+DOCKER_DOC = DOCS_DIR / "DOCKER.md"
+DEPLOYMENT_DOC = DOCS_DIR / "DEPLOYMENT.md"
+HUNTING_DOC = DOCS_DIR / "HUNTING.md"
+BLOCKLISTS_DOC = DOCS_DIR / "BLOCKLISTS.md"
+ARCHITECTURE_DOC = DOCS_DIR / "ARCHITECTURE.md"
+ENV_EXAMPLE = REPO_ROOT / ".env.example"
+COMPOSE_FILE = REPO_ROOT / "docker-compose.yml"
+DEMO_COMPOSE_FILE = REPO_ROOT / "docker-compose.demo.yml"
+BLOCKLIST_REFRESH_SOURCE = REPO_ROOT / "soc_ai" / "enrichment" / "blocklist_refresh.py"
+
+# The five settings without a default; enough for create_app() and a request
+# that never reaches the grid.
+_REQUIRED_ENV = {
+    "SO_HOST": "https://so.example.com",
+    "SO_USERNAME": "analyst",
+    "SO_PASSWORD": "password123",
+    "ES_HOSTS": "https://so.example.com:9200",
+    "LITELLM_BASE_URL": "http://localhost:4000",
+}
+
+
+def _section(text: str, heading: str) -> str:
+    """Body of the first markdown heading whose text starts with ``heading``,
+    up to the next heading of the same or a higher level."""
+    m = re.search(rf"(?m)^(#+) {re.escape(heading)}", text)
+    assert m is not None, f"no heading starting with {heading!r}"
+    rest = text[m.end() :]
+    end = re.search(rf"(?m)^#{{1,{len(m.group(1))}}} ", rest)
+    return rest[: end.start()] if end else rest
+
+
+def _paragraphs(text: str) -> list[str]:
+    return [p for p in re.split(r"\n[ \t]*\n", text) if p.strip()]
+
+
+def test_docs_do_not_claim_cli_downloads_maxmind(tmp_path: Path) -> None:
+    """``blocklists refresh`` fetches the blocklists and the cloud prefixes and
+    nothing else; the GeoLite2 databases are a manual download.
+
+    DOCKER.md, .env.example, docker-compose.yml, ARCHITECTURE.md and the Data
+    sources note all credited the refresh with the GeoIP download once
+    MAXMIND_LICENSE_KEY was set, and BLOCKLISTS.md deferred the real procedure
+    to a page that never mentioned MaxMind. The premise is pinned first, so
+    whoever adds the download to the CLI is told to put the claim back.
+    """
+    code = "\n".join(
+        line
+        for line in BLOCKLIST_REFRESH_SOURCE.read_text().splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    assert "maxmind" not in code.lower(), (
+        "blocklist_refresh.py now handles MaxMind; the docs this gate pins say it "
+        "does not. Update them and retire the gate."
+    )
+    geo = ("maxmind", "geoip", "geolite")
+    for path in (DOCKER_DOC, ENV_EXAMPLE, COMPOSE_FILE, ARCHITECTURE_DOC):
+        for para in _paragraphs(path.read_text()):
+            low = para.lower()
+            if "blocklists refresh" in low:
+                assert not any(g in low for g in geo), (
+                    f"{path.name} still pairs `blocklists refresh` with the GeoIP data:\n{para}"
+                )
+    section = _section(BLOCKLISTS_DOC.read_text(), "MaxMind GeoIP")
+    for name in ("GeoLite2-City.mmdb", "GeoLite2-ASN.mmdb"):
+        assert name in section, f"BLOCKLISTS.md's MaxMind section does not name {name}"
+    for target in re.findall(r"docs/([A-Za-z_\-]+\.md)", section):
+        assert "maxmind" in (DOCS_DIR / target).read_text().lower(), (
+            f"BLOCKLISTS.md points at docs/{target} for MaxMind, which never mentions it"
+        )
+
+    from types import SimpleNamespace
+
+    from soc_ai.api.data_sources import collect_data_sources
+
+    stub = SimpleNamespace(
+        blocklist_data_dir=tmp_path,
+        maxmind_data_dir=tmp_path,
+        cloud_prefix_data_dir=tmp_path,
+        maxmind_license_key=None,
+        misp_url="",
+        misp_api_key=None,
+        allow_online_enrichment=False,
+        greynoise_api_key=None,
+        shodan_api_key=None,
+    )
+    rows = {row.id: row for row in collect_data_sources(stub)}
+    assert "refresh" not in rows["maxmind"].note.lower(), rows["maxmind"].note
+
+
+def test_quickstart_demo_url_path_is_served(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The first URL a new user pastes must be one the app answers.
+
+    Step 0 of the quickstart and the usage header of docker-compose.demo.yml
+    printed ``/ui/alerts`` long after the server-rendered ``/ui`` console was
+    retired; the SPA lives under ``/app`` and bare ``/`` redirects there. The
+    documented path is compared against that redirect rather than fetched,
+    because the CI checkout carries no frontend build and ``/app`` 404s there.
+    """
+    for key, value in _REQUIRED_ENV.items():
+        monkeypatch.setenv(key, value)
+    from fastapi.testclient import TestClient
+    from soc_ai.main import create_app
+
+    app = create_app()
+    client = TestClient(app)
+    landing = client.get("/", follow_redirects=False)
+    assert landing.status_code == 307
+    front_door = landing.headers["location"]
+
+    step0 = re.split(r"(?m)^## ", QUICKSTART_DOC.read_text())[1]
+    header = DEMO_COMPOSE_FILE.read_text().split("\nservices:")[0]
+    for name, text in (("quickstart.md", step0), ("docker-compose.demo.yml", header)):
+        m = re.search(r"http://127\.0\.0\.1:8080(/\S*)", text)
+        assert m is not None, f"{name} no longer prints the demo URL"
+        assert m.group(1) == front_door, (
+            f"{name} sends the reader to {m.group(1)}; the app's front door is {front_door}"
+        )
+    if app.state.spa_mounted:
+        assert client.get(front_door).status_code == 200
+
+
+def test_docker_doc_loopback_recipe_uses_soc_ai_bind() -> None:
+    """The loopback recipe sets SOC_AI_BIND, never an IP:PORT in SOC_AI_PORT.
+
+    compose publishes ``${SOC_AI_BIND:-0.0.0.0}:${SOC_AI_PORT:-8443}:8443`` and
+    feeds the same .env to the container, where ``soc_ai_port`` is an int
+    (tests/test_config.py pins that it rejects ``127.0.0.1:8443``). The old
+    recipe therefore produced an invalid publish spec and a container that
+    failed validation, for the operator who was trying to reduce exposure.
+    """
+    text = DOCKER_DOC.read_text()
+    assert "SOC_AI_BIND=127.0.0.1" in text, "DOCKER.md's loopback recipe no longer sets SOC_AI_BIND"
+    assert re.search(r"SOC_AI_PORT=\d+\.\d+\.\d+\.\d+", text) is None, (
+        "DOCKER.md puts a host IP into SOC_AI_PORT; the interface knob is SOC_AI_BIND"
+    )
+    mapping = re.search(r'(?m)^\s*-\s*"([^"]+:8443)"\s*$', COMPOSE_FILE.read_text())
+    assert mapping is not None, "docker-compose.yml no longer publishes 8443"
+    assert mapping.group(1) in text, "DOCKER.md quotes a port mapping compose does not use"
+
+
+def test_docker_doc_tls_section_names_every_ca_bundle_setting() -> None:
+    """Every ``*_ca_bundle`` setting is offered before ``*_VERIFY_SSL=false``.
+
+    The TLS-trust section said Elasticsearch had no CA-bundle option and sent
+    a private-CA site to ES_VERIFY_SSL=false, on the connection that carries
+    the ES credential and the audit chain, while ES_CA_BUNDLE was wired all
+    along. Importing Settings does not instantiate it, so no env is needed.
+    """
+    from soc_ai.config import Settings
+
+    text = DOCKER_DOC.read_text()
+    bundles = [name for name in Settings.model_fields if name.endswith("_ca_bundle")]
+    assert bundles, "no *_ca_bundle settings left to document"
+    for name in bundles:
+        assert name.upper() in text, f"DOCKER.md never mentions {name.upper()}"
+    assert "has no CA-bundle option" not in text
+
+
+def test_deployment_doc_audit_section_states_fail_closed() -> None:
+    """§7 of the bare-metal guide must say what the shipped default does.
+
+    With ``audit_fail_closed=True`` every acknowledge, escalate and comment is
+    aborted until the ``soc-ai-audit-*`` grant exists; only a read-only
+    investigation completes without its trail. §7 called the failure "not
+    fatal", contradicting the code, SECURITY-ONION-SETUP.md and the same
+    document's own §12, and the §10 symptom row said only that the event was
+    dropped. The default is asserted first, so flipping it flags this text.
+    """
+    from soc_ai.config import Settings
+
+    assert Settings.model_fields["audit_fail_closed"].default is True, (
+        "audit_fail_closed no longer defaults to True; rewrite §7 and the §10 "
+        "audit row of DEPLOYMENT.md to match before changing this pin"
+    )
+    text = DEPLOYMENT_DOC.read_text()
+    section = _section(text, "7. Audit-index role grant")
+    assert "AUDIT_FAIL_CLOSED" in section
+    assert "not fatal" not in section
+    row = next(
+        (line for line in text.splitlines() if line.startswith("| `audit log write failed")),
+        None,
+    )
+    assert row is not None, "DEPLOYMENT.md §10 lost its audit-write symptom row"
+    assert "AUDIT_FAIL_CLOSED" in row, "the §10 audit row does not say the write is aborted"
+
+
+def test_bootstrap_password_docs_name_the_sidecar() -> None:
+    """The first-login recipe points at the sidecar file, not the log.
+
+    The generated admin password is written to
+    ``<data_dir>/bootstrap-admin-password.txt`` (mode 0600) and the log carries
+    a pointer; the plaintext reaches the log only when the data dir is not
+    writable. DOCKER.md told the manual-install operator to grep the log, and
+    .env.example gave the credential a character count that was already wrong.
+    """
+    from soc_ai.bootstrap_credential import _FILENAME
+
+    docker = DOCKER_DOC.read_text()
+    assert _FILENAME in docker, f"DOCKER.md never names {_FILENAME}"
+    assert "grep -i password" not in _section(docker, "4. Open the web UI")
+
+    env_text = ENV_EXAMPLE.read_text()
+    lines = env_text.splitlines()
+    idx = next(i for i, line in enumerate(lines) if line.startswith("BOOTSTRAP_ADMIN_PASSWORD="))
+    comment: list[str] = []
+    while idx > 0 and lines[idx - 1].startswith("#"):
+        idx -= 1
+        comment.insert(0, lines[idx])
+    assert _FILENAME in "\n".join(comment), (
+        f".env.example's BOOTSTRAP_ADMIN_PASSWORD comment never names {_FILENAME}"
+    )
+    assert "12-character" not in env_text
+
+
+# The hunting CLI commands HUNTING.md's table documents, by the module-level
+# helper that registers each subparser; the parser can be built from these
+# without running main().
+_HUNTING_CLI_REGISTRARS = {
+    "spec-run": "_register_spec_run",
+    "spec-sweep": "_register_spec_sweep",
+    "priors": "_register_priors",
+    "leads": "_register_leads",
+}
+
+
+def test_hunting_doc_cli_rows_name_required_flags() -> None:
+    """Every required option of a documented hunting command is in its row.
+
+    ``soc-ai spec-run`` makes ``--since`` required, and the table listed the
+    command bare, so the reference row exited with an argparse error as
+    typed. The neighbouring ``spec-sweep`` row was right (its ``--since``
+    defaults to None), which is what made the omission easy to trust.
+    """
+    import argparse
+
+    from soc_ai import cli
+
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="cmd")
+    for registrar in _HUNTING_CLI_REGISTRARS.values():
+        getattr(cli, registrar)(sub)
+    required = {
+        cmd: [a.option_strings[0] for a in sub.choices[cmd]._actions if a.required]
+        for cmd in _HUNTING_CLI_REGISTRARS
+    }
+
+    table = _section(HUNTING_DOC.read_text(), "The command line")
+    rows = re.findall(r"(?m)^\| `soc-ai ([^\s`]+)([^`]*)`(.*)$", table)
+    documented = {cmd for cmd, _, _ in rows}
+    missing = set(_HUNTING_CLI_REGISTRARS) - documented
+    assert not missing, f"HUNTING.md's command table lost {sorted(missing)}"
+    for cmd, cell, rest in rows:
+        for flag in required.get(cmd, []):
+            assert flag in cell + rest, f"HUNTING.md's `soc-ai {cmd}` row omits the required {flag}"

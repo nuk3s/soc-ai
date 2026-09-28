@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from ipaddress import IPv4Network
 from pathlib import Path
 
@@ -74,6 +75,43 @@ def test_env_example_oracle_models_match_shipped_defaults() -> None:
         values[key.strip()] = value.strip()
     assert values.get("ORACLE_MODEL") == Settings.model_fields["oracle_model"].default
     assert values.get("CLAUDE_ORACLE_MODEL") == Settings.model_fields["claude_oracle_model"].default
+
+
+def test_env_example_commented_timeout_defaults_match_settings() -> None:
+    """Every commented-out value in the Timeouts & retries block is the code default.
+
+    The block's header promises exactly that, and an operator sizing the timeout
+    ladder uncomments a line believing it is a no-op. AUTO_TRIAGE_PER_TARGET_TIMEOUT_S
+    sat at 600 after the default moved to 1200. Only class defaults are read, so
+    no env is needed.
+    """
+    text = (Path(__file__).resolve().parent.parent / ".env.example").read_text(encoding="utf-8")
+    start = text.index("# --- Timeouts & retries")
+    end = text.find("\n# ---", start + 1)
+    block = text[start:end] if end != -1 else text[start:]
+    pairs = re.findall(r"(?m)^# ([A-Z_]+)=(\S+)$", block)
+    assert pairs, "no commented defaults found in the Timeouts & retries block"
+    for key, value in pairs:
+        field = key.lower()
+        assert field in Settings.model_fields, f"{key} is not a Settings field"
+        default = Settings.model_fields[field].default
+        assert str(default) == value, (
+            f".env.example says {key}={value}; the code default is {default}"
+        )
+
+
+def test_soc_ai_port_rejects_host_ip_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``SOC_AI_PORT`` is the plain host port; the host interface is ``SOC_AI_BIND``.
+
+    compose feeds the same .env to the container, so an ``IP:PORT`` value here
+    (the shape Docker accepts in a publish spec) reaches this int field and the
+    container fails validation before it listens. DOCKER.md's loopback recipe is
+    pinned to SOC_AI_BIND in tests/test_docs_accuracy.py for that reason.
+    """
+    _setenv_required(monkeypatch)
+    monkeypatch.setenv("SOC_AI_PORT", "127.0.0.1:8443")
+    with pytest.raises(ValidationError, match="soc_ai_port"):
+        Settings()
 
 
 def test_audit_redact_defaults_on(monkeypatch: pytest.MonkeyPatch) -> None:

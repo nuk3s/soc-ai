@@ -269,7 +269,7 @@ Each command reads the local store or the grid. None of them calls a model.
 | `soc-ai leads --report` | Print the lead quality table. `--weeks N` sets the window. The default is 4. |
 | `soc-ai priors` | Run the role priors against every entity that has a behavioural profile, and print what departed. `--recent-hours N` sets the window. The default is 24. |
 | `soc-ai priors --record` | Write each departure as an observation, and form leads from what accumulates. Off by default, because a read of the coverage must have no side effect. |
-| `soc-ai spec-run [<id>]` | Run one analytic, or the whole catalog, and print the candidates as JSON. |
+| `soc-ai spec-run [<id>] --since <start>` | Run one analytic, or the whole catalog, and print the candidates as JSON. `--since` is required (ES date math or ISO-8601, e.g. `now-7d`); `--until` and `--include-synth` shape the run. |
 | `soc-ai spec-sweep` | Sweep the catalog and record what is not already handled. `--since`, `--until`, `--shadow` and `--backfill` shape the run. |
 
 `soc-ai leads --report` and the Lead quality block print the same numbers from the same function,

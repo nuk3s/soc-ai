@@ -96,7 +96,10 @@ def collect_data_sources(settings: Settings) -> list[DataSourceOut]:
             last_refreshed=_iso_mtime(maxmind),
             needs_key=True,
             key_configured=_secret_set(settings.maxmind_license_key),
-            note="Needs MAXMIND_LICENSE_KEY to refresh.",
+            note=(
+                "No command downloads these. Copy GeoLite2-City.mmdb and "
+                "GeoLite2-ASN.mmdb into MAXMIND_DATA_DIR by hand, then restart."
+            ),
         )
     )
     cloud = _files(settings.cloud_prefix_data_dir, "*.json")

@@ -156,7 +156,7 @@ git clone https://github.com/nuk3s/soc-ai.git && cd soc-ai
 
 `setup.sh` builds the image from the Dockerfile in place and starts the stack. The first build takes about 3 min.
 
-> **A prebuilt image is available after the first release.** `./setup.sh --prebuilt` then pulls the image from [GHCR](https://github.com/nuk3s/soc-ai/pkgs/container/soc-ai) instead of building it. That path is faster. Pin a version with `SOC_AI_IMAGE_TAG=<x.y.z>`. No image is published before the first release tag, so `--prebuilt` reports `error from registry: denied`. Run plain `./setup.sh` above to build from source. [Watch the releases page](https://github.com/nuk3s/soc-ai/releases) for the first tag.
+> **Prebuilt image.** `./setup.sh --prebuilt` pulls the image from [GHCR](https://github.com/nuk3s/soc-ai/pkgs/container/soc-ai), pinned to the release version, instead of building it. That path is faster. Pin another version with `SOC_AI_IMAGE_TAG=<x.y.z>`; the versions are on [the releases page](https://github.com/nuk3s/soc-ai/releases). If the registry refuses the pull, `setup.sh` says so and offers to build from source in the same run.
 
 `setup.sh` does the following:
 

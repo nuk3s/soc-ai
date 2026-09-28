@@ -16,7 +16,7 @@
 #
 # Usage:
 #   docker compose -f docker-compose.demo.yml up --build
-#   → http://127.0.0.1:8080/ui/alerts
+#   → http://127.0.0.1:8080/app/alerts
 #
 # NO .env, NO secrets: every value below is a loopback URL or an inert
 # placeholder that the Settings schema requires to boot. Nothing sensitive
