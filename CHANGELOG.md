@@ -5,9 +5,14 @@ All notable changes to this project are documented here. The format is based on
 [Semantic Versioning](https://semver.org/) from 1.0 onward.
 
 ## [Unreleased]
+
+## [1.5.1] - 2026-09-28
+
 The 1.5.0 post-release fix arc, and a repository-wide review of the code, the tests, the
 installer and the docs. A test that failed before the fix pins every change below.
+
 ### Security
+
 - A model-authored `resolution` marker in a triage report no longer makes a real verdict store and render as a pipeline failure. The privileged field is stripped on every synthesis path: round-1, loop synthesis, investigator report, Phase-D, budget-cut partial and self-consistency samples.
 - Hard evidence gate: a short, generic SMB file name, Kerberos SPN or DCE-RPC string on the alert's own flow (a file named `name` or `alert`) can no longer make an alert-only citation count as "grounded in a pivot". Wire-string pivot values now need the same distinctiveness as GATE C: no stop-words, whole-word from 5 chars, substring from 8. Doc ids and JA3, hash and cipher values ground as before.
 - Hunt citation gate no longer treats tool short-circuit payloads (errors, duplicate-call stops, prefetch hints) as gathered evidence, so a finding cannot be grounded or corroborated by a domain or IP the model merely asked about.
@@ -28,7 +33,9 @@ installer and the docs. A test that failed before the fix pins every change belo
 - The bootstrap admin password sidecar is now created with mode 0600 from the start (and a stale copy replaced), and is removed rather than left readable if locking it down fails.
 - **Acknowledge and Escalate on a filtered queue write only to the rows on screen.** The host page's Alerts KPI narrows the queue to one host with an OQL filter, and the rows and counts honoured it, but the two group writes did not send it: acknowledging three events for one host acknowledged every event of that rule in the window, on every host, and Escalate could open cases for hosts the analyst never looked at.
 - **`setup.conf.example` works as shipped.** Copied and edited the way its header says, every annotated line leaked its ` # comment` into the value: `API_AUTH_REQUIRED=true` and `LITELLM_VERIFY_SSL=true` came out as `false` in `.env`, and `ES_HOSTS`, `CONFIG_SECRET_KEY` and `BOOTSTRAP_ADMIN_PASSWORD` became the comment text.
+
 ### Fixed
+
 - **A lead settles when its hunt finishes.** A lead stayed in hunting after its hunt had finished,
   so a hunt that found no threat left the lead on Needs decision for you to dismiss by hand, and a
   hunt that could not run left it there with no second try. A hunt that finds no threat now closes
@@ -125,7 +132,9 @@ installer and the docs. A test that failed before the fix pins every change belo
 - **`sudo ./setup.sh` no longer leaves a TLS key the container cannot read.** The generated `certs/key.pem` was `chmod 640` owned by whoever ran the installer, while the container opens it as uid 1000; unless that was the installing user, uvicorn died on the key and the container restart-looped behind a "Liveness check timed out" message.
 - **The installer polls and prints the port `.env` actually publishes.** On a re-run that keeps an existing `.env` with a different `SOC_AI_PORT`, the liveness poll still hit 8443 for three minutes and the summary printed an 8443 URL; both now use the port read back from `.env`, as the starter-pack step already did.
 - **A malformed `setup.conf` line is named.** `export KEY=value`, a hyphenated key or a key with a space made bash abort with its own `invalid variable name` one-liner before the installer had said anything; `setup.sh` now stops with the file and the offending key.
+
 ### Changed
+
 - `t_get_pcap` now caps `window_minutes` at 60 (half-width around the alert) on both the interactive and Phase-D paths, so a model-supplied window can no longer sweep the sensor's whole pcap ring buffer.
 - **`suggest_rule_tuning` caps its window at 365 days.** The tool rejected a zero or negative `lookback_days` but accepted any larger value, so an agent turn could run the tuning aggregation, and the import-count probe behind an empty result, over the grid's full retention.
 - The alerts-page and auto-triage inheritance lookup no longer loads every completed investigation's report, summary and rationale just to pick the newest row per detection pair; it reads only the columns its callers use.
@@ -4428,5 +4437,6 @@ The first public release. Highlights:
     positives is **capped** to low-stakes alerts (a prompt-injected verdict can
     no longer auto-acknowledge a malware/exploit/high-severity alert).
 
-[Unreleased]: https://github.com/nuk3s/soc-ai/compare/v1.4.0...HEAD
+[Unreleased]: https://github.com/nuk3s/soc-ai/compare/v1.5.1...HEAD
+[1.5.1]: https://github.com/nuk3s/soc-ai/compare/v1.5.0...v1.5.1
 [1.0.0]: https://github.com/nuk3s/soc-ai/releases/tag/v1.0.0

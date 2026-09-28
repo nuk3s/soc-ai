@@ -9,6 +9,12 @@ follows [Semantic Versioning](https://semver.org/) from 1.0 onward.
 
 ## Recent highlights
 
+- **1.5.1** — The review release: a line-by-line review of the whole repository, 61 fixes, each
+  pinned by a test. The evidence gates refuse more of what they should refuse, the Oracle redaction
+  covers Windows and Kerberos names and defanged text, an internal name cannot reach a search engine
+  through a port, the pcap tool reports a sensor failure as a failure, the installer writes a clean
+  `.env`, and the bell and the unread counts read from indexes. See the
+  [1.5.1 release notes](../releases/1.5.1.md).
 - **1.5.0** — The hunting release: soc-ai now looks for the attacks that raise no alert. An
   analytic finds a hit, hits on one entity form a lead, a lead starts its own hunt, and a hunt
   reaches a verdict; the Hunts page holds that pipeline and the Needs-you strip names what waits

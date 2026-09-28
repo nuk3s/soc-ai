@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/license-Apache%202.0-4b8bf5" alt="Apache 2.0">
   <img src="https://img.shields.io/badge/python-3.12-4b8bf5" alt="Python 3.12">
   <img src="https://img.shields.io/badge/Security%20Onion-3.0-3fb950" alt="Security Onion 3.0">
-  <img src="https://img.shields.io/badge/status-1.5.0-3fb950" alt="1.5.0">
+  <img src="https://img.shields.io/badge/status-1.5.1-3fb950" alt="1.5.1">
   <a href="https://soc-ai-demo.onrender.com/"><img src="https://img.shields.io/badge/live%20demo-online-3fb950" alt="Live demo"></a>
 </p>
 
@@ -43,6 +43,8 @@ An optional cloud Oracle gives a second opinion on a hard alert. The Oracle is o
 - `soc-ai leads --report` prints what the lead rule produced per week, so you move a threshold on measurement.
 
 Read the [1.5.0 release notes](docs/releases/1.5.0.md) and the [hunting guide](docs/HUNTING.md).
+
+1.5.1 is a review release on top of it. A line-by-line review of the whole repository produced 61 fixes across the evidence gates, the Oracle redaction, the egress guard, the pcap tool, the installer and the console, and each fix is pinned by a test. Read the [1.5.1 release notes](docs/releases/1.5.1.md).
 
 ## The web console
 
@@ -215,6 +217,7 @@ the same docs as the list below, with search and a dark mode. Build it on your h
 - [docs/DOCKER.md](docs/DOCKER.md) · [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md): how to install soc-ai.
 - [docs/LESSER_MODELS.md](docs/LESSER_MODELS.md): how to start a backend, and how to qualify a small or slow model with `model-probe`.
 - [docs/ROADMAP.md](docs/ROADMAP.md): the state of the project and the plan for it.
+- [docs/releases/1.5.1.md](docs/releases/1.5.1.md): the 1.5.1 release notes, the review release.
 - [docs/releases/1.5.0.md](docs/releases/1.5.0.md): the 1.5.0 release notes, with the measured numbers and the upgrade steps.
 - [CHANGELOG.md](CHANGELOG.md) · [CONTRIBUTING.md](CONTRIBUTING.md) · [SECURITY.md](.github/SECURITY.md)
 
