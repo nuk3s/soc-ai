@@ -33,7 +33,7 @@ async def test_migration_creates_the_table(settings_kratos: Settings) -> None:
         tables = await conn.run_sync(lambda sc: inspect(sc).get_table_names())
         assert "entity_profiles" in tables
         row = await conn.execute(text("SELECT version_num FROM alembic_version"))
-        assert row.scalar_one() == "0050"
+        assert row.scalar_one() == "0051"
     await engine.dispose()
 
 

@@ -63,7 +63,7 @@ async def test_migration_adds_the_provenance_columns(settings_kratos: Settings) 
     assert {"app_version", "code_commit", "analyst_model"} <= cols
     async with engine.connect() as conn:
         head = await conn.execute(text("SELECT version_num FROM alembic_version"))
-    assert head.scalar_one() == "0050"
+    assert head.scalar_one() == "0051"
     await engine.dispose()
 
 

@@ -103,6 +103,10 @@ class Investigation(Base):
         # Migration 0038. The session lookup is "completed verdicts on this
         # session, newest first", so created_at rides the index with it.
         Index("ix_investigations_session", "community_id", "created_at"),
+        # Migration 0051. The completed half of the bell bounds and orders on
+        # finished_at, the clock it renders; (status, created_at) served the
+        # equality and then sorted every completed row on each poll.
+        Index("ix_investigations_status_finished", "status", "finished_at"),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)  # ULID
@@ -196,8 +200,13 @@ class Hunt(Base):
     __tablename__ = "hunts"
     # (status, created_at) composite from migration 0028 — serves the
     # /notifications completed-hunt scan and previous_completed_run. Declared so
-    # the ORM metadata matches the DB (see the Investigation note).
-    __table_args__ = (Index("ix_hunts_status_created", "status", "created_at"),)
+    # the ORM metadata matches the DB (see the Investigation note). The
+    # (status, finished_at) composite from 0051 serves the bell's finished_since
+    # window, which is bounded and ordered on finished_at.
+    __table_args__ = (
+        Index("ix_hunts_status_created", "status", "created_at"),
+        Index("ix_hunts_status_finished", "status", "finished_at"),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)  # ULID
     objective: Mapped[str] = mapped_column(Text)
@@ -1238,6 +1247,10 @@ class EntityObservation(Base):
         Index("ix_entity_observation_entity", "entity_kind", "entity_key"),
         Index("ix_entity_observation_born", "born_at"),
         Index("ix_entity_observation_lead", "lead_id"),
+        # Migration 0051. Covers the unread shadow-hit clause every surface
+        # counts (bell, sidebar badge, needs-you strip, Dashboard card, hits
+        # filter), which was a full scan of this table on each poll.
+        Index("ix_entity_observation_unread", "shadow", "read_at", "spec_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
