@@ -30,6 +30,8 @@ from fastapi.testclient import TestClient
 from soc_ai.config import Settings
 from soc_ai.main import create_app
 
+# The role clients register here by import; their fixture names (analyst,
+# admin) come from the decorator, so the bindings do not shadow the parameters.
 from .conftest_security import ANALYST_CREDS
 
 _RULE = "ET INFO Observed DNS Query to .biz TLD"
@@ -98,48 +100,36 @@ def test_the_owner_survives_a_round_trip_to_the_alerts_list(client: TestClient) 
 # ── Negative control: authentication ON behaves exactly as it did ────────────
 
 
-def test_signed_in_user_is_reported_as_themselves(
-    audit_client: TestClient, analyst_session: dict[str, str]
-) -> None:
-    me = audit_client.get("/api/v1/me", cookies=analyst_session).json()
+def test_signed_in_user_is_reported_as_themselves(analyst: TestClient) -> None:
+    me = analyst.get("/api/v1/me").json()
     assert me["username"] == ANALYST_CREDS[0]
     assert me["role"] == "analyst"
     assert me["signed_in"] is True
 
 
-def test_signed_in_ownership_records_the_real_username(
-    audit_client: TestClient, analyst_session: dict[str, str]
-) -> None:
-    assigned = _assign(audit_client, cookies=analyst_session, headers=_SAME_ORIGIN)
+def test_signed_in_ownership_records_the_real_username(analyst: TestClient) -> None:
+    assigned = _assign(analyst, headers=_SAME_ORIGIN)
     assert assigned["owner"] == ANALYST_CREDS[0]
 
 
-def test_signed_in_saved_views_still_work(
-    audit_client: TestClient, analyst_session: dict[str, str]
-) -> None:
-    saved = audit_client.post(
+def test_signed_in_saved_views_still_work(analyst: TestClient) -> None:
+    saved = analyst.post(
         "/api/v1/me/views",
         json={"screen": "alerts", "name": "my view", "query": {"q": "dns"}},
-        cookies=analyst_session,
         headers=_SAME_ORIGIN,
     )
     assert saved.status_code == 200, saved.text
-    rows = audit_client.get("/api/v1/me/views", cookies=analyst_session).json()["rows"]
+    rows = analyst.get("/api/v1/me/views").json()["rows"]
     assert [r["name"] for r in rows] == ["my view"]
 
 
 def test_a_bearer_token_caller_is_authenticated_but_not_signed_in(
-    audit_client: TestClient, admin_session: dict[str, str]
+    audit_client: TestClient, admin: TestClient
 ) -> None:
     """A token has no user row, so it cannot own a saved view either. Reporting
     it as signed in would send the interface back to offering a control that
     401s, which is the failure one step over."""
-    created = audit_client.post(
-        "/api/v1/config/tokens",
-        json={"name": "probe"},
-        cookies=admin_session,
-        headers=_SAME_ORIGIN,
-    )
+    created = admin.post("/api/v1/config/tokens", json={"name": "probe"}, headers=_SAME_ORIGIN)
     assert created.status_code == 200, created.text
     secret = created.json()["token"]
     headers = {"Authorization": f"Bearer {secret}"}

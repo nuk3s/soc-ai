@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import warnings
 from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -18,6 +19,11 @@ from fastapi.testclient import TestClient
 from soc_ai.agent.context import InvestigationContext
 from soc_ai.agent.egress_guard import EgressGuard, EgressResidueError
 from soc_ai.config import Settings
+from soc_ai.store import auth as auth_svc
+
+# The role clients register here by import, the way tests/conftest.py registers
+# the rest of the harness; their fixture names (analyst, admin) come from the
+# decorator, so the bindings here do not shadow the parameters the tests take.
 
 # Fictional internal identifiers for the egress tests. RFC1918/-suffix shaped so
 # the SANITIZE pass catches them; never real deployment values.
@@ -29,20 +35,28 @@ _RESIDUE_ONLY = "user=jdoe on DESKTOP-AB12"
 
 
 def test_audit_harness_gives_distinct_analyst_and_admin_sessions(
-    audit_client: TestClient, analyst_session: dict[str, str], admin_session: dict[str, str]
+    audit_client: TestClient, analyst: TestClient, admin: TestClient
 ) -> None:
-    """The harness itself must be trustworthy: two real, distinct, authed roles."""
-    assert analyst_session != admin_session
+    """The harness itself must be trustworthy: two real, distinct, authed roles,
+    each on its own client, and a shared client that never picks up a session."""
+    cookie = auth_svc.SESSION_COOKIE
+    assert analyst.cookies[cookie] != admin.cookies[cookie]
 
-    me_analyst = audit_client.get("/api/v1/me", cookies=analyst_session)
-    me_admin = audit_client.get("/api/v1/me", cookies=admin_session)
+    # A role client carries its session in its own jar. The test client
+    # deprecates per-request ``cookies=`` (jar persistence is ambiguous), so
+    # the harness must never need it.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        me_analyst = analyst.get("/api/v1/me")
+        me_admin = admin.get("/api/v1/me")
 
     assert me_analyst.status_code == 200
     assert me_admin.status_code == 200
     assert me_analyst.json()["role"] == "analyst"
     assert me_admin.json()["role"] == "admin"
 
-    # Auth is genuinely ON — an unauthenticated call is refused.
+    # Auth is genuinely ON — the shared client stayed anonymous through both
+    # logins, so an unauthenticated call is refused.
     assert audit_client.get("/api/v1/me").status_code in (401, 403)
 
 
@@ -1332,7 +1346,7 @@ def test_login_ip_spray_bucket_drains_on_successful_login(audit_client: TestClie
 
 
 def test_ack_events_refuses_a_promoted_finding_anchor(
-    audit_client: TestClient, analyst_session: dict[str, str]
+    audit_client: TestClient, analyst: TestClient
 ) -> None:
     """L1: POST /alerts/ack-events must refuse a promoted hunt finding's anchor.
 
@@ -1349,12 +1363,7 @@ def test_ack_events_refuses_a_promoted_finding_anchor(
         "soc_ai.api.webui.routes_alert_actions.execute_write_tool",
         new=AsyncMock(return_value=({}, None)),
     ) as write_spy:
-        resp = audit_client.post(
-            "/api/v1/alerts/ack-events",
-            json={"es_ids": [anchor]},
-            cookies=analyst_session,
-            headers=_ORIGIN,
-        )
+        resp = analyst.post("/api/v1/alerts/ack-events", json={"es_ids": [anchor]}, headers=_ORIGIN)
 
     assert resp.status_code == 400, f"anchor ack not refused: {resp.status_code} {resp.text}"
     assert resp.json()["detail"]["reason"] == "hunt_kind_no_so_target"
@@ -1362,7 +1371,7 @@ def test_ack_events_refuses_a_promoted_finding_anchor(
 
 
 def test_ack_events_still_acks_ordinary_alerts(
-    audit_client: TestClient, analyst_session: dict[str, str]
+    audit_client: TestClient, analyst: TestClient
 ) -> None:
     """L1 companion: an id that is NOT a promoted-finding anchor still acks —
     analysts acking alerts is their job; the guard must not over-block."""
@@ -1373,11 +1382,8 @@ def test_ack_events_still_acks_ordinary_alerts(
         "soc_ai.api.webui.routes_alert_actions.execute_write_tool",
         new=AsyncMock(return_value=({}, None)),
     ) as write_spy:
-        resp = audit_client.post(
-            "/api/v1/alerts/ack-events",
-            json={"es_ids": [ordinary]},
-            cookies=analyst_session,
-            headers=_ORIGIN,
+        resp = analyst.post(
+            "/api/v1/alerts/ack-events", json={"es_ids": [ordinary]}, headers=_ORIGIN
         )
 
     assert resp.status_code == 200, resp.text
@@ -1389,7 +1395,7 @@ def test_ack_events_still_acks_ordinary_alerts(
 
 
 def test_investigate_disables_so_writes_over_a_hunt_anchor(
-    audit_client: TestClient, analyst_session: dict[str, str]
+    audit_client: TestClient, analyst: TestClient
 ) -> None:
     """L2: POST /investigate over a hunt-kind investigation's anchor document
     must run with allow_so_writes=False.
@@ -1413,12 +1419,7 @@ def test_investigate_disables_so_writes_over_a_hunt_anchor(
         return _gen()
 
     with patch("soc_ai.api.routes.investigate", _fake_investigate):
-        resp = audit_client.post(
-            "/investigate",
-            json={"alert_id": anchor},
-            cookies=analyst_session,
-            headers=_ORIGIN,
-        )
+        resp = analyst.post("/investigate", json={"alert_id": anchor}, headers=_ORIGIN)
 
     assert resp.status_code == 200, resp.text
     assert captured, "patched investigate() was never consumed"
@@ -1427,9 +1428,7 @@ def test_investigate_disables_so_writes_over_a_hunt_anchor(
     )
 
 
-def test_investigate_keeps_so_writes_on_for_ordinary_alerts(
-    audit_client: TestClient, analyst_session: dict[str, str]
-) -> None:
+def test_investigate_keeps_so_writes_on_for_ordinary_alerts(analyst: TestClient) -> None:
     """L2 companion: an ordinary alert keeps the default write posture."""
     captured: dict[str, Any] = {}
 
@@ -1442,11 +1441,8 @@ def test_investigate_keeps_so_writes_on_for_ordinary_alerts(
         return _gen()
 
     with patch("soc_ai.api.routes.investigate", _fake_investigate):
-        resp = audit_client.post(
-            "/investigate",
-            json={"alert_id": "ordinary-alert-000002"},
-            cookies=analyst_session,
-            headers=_ORIGIN,
+        resp = analyst.post(
+            "/investigate", json={"alert_id": "ordinary-alert-000002"}, headers=_ORIGIN
         )
 
     assert resp.status_code == 200, resp.text
@@ -1454,7 +1450,7 @@ def test_investigate_keeps_so_writes_on_for_ordinary_alerts(
 
 
 def test_execute_action_refuses_a_row_laundered_over_a_hunt_anchor(
-    audit_client: TestClient, analyst_session: dict[str, str]
+    audit_client: TestClient, analyst: TestClient
 ) -> None:
     """L2: the execute-action hunt guard must key off the ANCHOR document, not
     just the row's own kind — a fresh kind='suricata' row over a hunt anchor
@@ -1476,10 +1472,8 @@ def test_execute_action_refuses_a_row_laundered_over_a_hunt_anchor(
         "soc_ai.api.webui.routes_actions.execute_write_tool",
         new=AsyncMock(return_value=({}, None)),
     ) as write_spy:
-        resp = audit_client.post(
-            f"/api/v1/investigations/{laundered_id}/actions/0/execute",
-            cookies=analyst_session,
-            headers=_ORIGIN,
+        resp = analyst.post(
+            f"/api/v1/investigations/{laundered_id}/actions/0/execute", headers=_ORIGIN
         )
 
     assert resp.status_code == 400, f"laundered ack not refused: {resp.status_code} {resp.text}"
@@ -1523,8 +1517,7 @@ def test_metrics_refused_in_demo_mode() -> None:
     [("severity", "Bogus"), ("range", "9999y"), ("kind", "wormhole")],
 )
 def test_group_actions_reject_unrecognized_filter_values(
-    audit_client: TestClient,
-    analyst_session: dict[str, str],
+    analyst: TestClient,
     endpoint: str,
     field: str,
     value: str,
@@ -1537,12 +1530,7 @@ def test_group_actions_reject_unrecognized_filter_values(
         "soc_ai.api.webui.routes_alert_actions.execute_write_tool",
         new=AsyncMock(return_value=({}, None)),
     ) as write_spy:
-        resp = audit_client.post(
-            f"/api/v1/alerts/{endpoint}",
-            json=body,
-            cookies=analyst_session,
-            headers=_ORIGIN,
-        )
+        resp = analyst.post(f"/api/v1/alerts/{endpoint}", json=body, headers=_ORIGIN)
     assert resp.status_code == 422, (
         f"{endpoint} accepted {field}={value!r}: {resp.status_code} {resp.text}"
     )
@@ -1550,9 +1538,7 @@ def test_group_actions_reject_unrecognized_filter_values(
     write_spy.assert_not_awaited()
 
 
-def test_ack_group_accepts_capitalized_severity_and_narrows(
-    audit_client: TestClient, analyst_session: dict[str, str]
-) -> None:
+def test_ack_group_accepts_capitalized_severity_and_narrows(analyst: TestClient) -> None:
     """L5 companion: 'Critical' (a plausible stale deep-link) must NARROW the
     ack to the critical severity — never silently widen to all severities."""
     seen: dict[str, Any] = {}
@@ -1562,10 +1548,9 @@ def test_ack_group_accepts_capitalized_severity_and_narrows(
         return []
 
     with patch("soc_ai.webui.alerts_query.fetch_group_events", new=_fake_fetch):
-        resp = audit_client.post(
+        resp = analyst.post(
             "/api/v1/alerts/ack-group",
             json={"rule_name": "ET MALWARE Known Bad", "severity": "Critical"},
-            cookies=analyst_session,
             headers=_ORIGIN,
         )
 
@@ -1575,9 +1560,7 @@ def test_ack_group_accepts_capitalized_severity_and_narrows(
     )
 
 
-def test_ack_group_accepts_the_no_severity_selector(
-    audit_client: TestClient, analyst_session: dict[str, str]
-) -> None:
+def test_ack_group_accepts_the_no_severity_selector(analyst: TestClient) -> None:
     """Defect 2 companion: a queue filtered to the alerts with no severity label
     must still be actionable.
 
@@ -1593,10 +1576,9 @@ def test_ack_group_accepts_the_no_severity_selector(
         return []
 
     with patch("soc_ai.webui.alerts_query.fetch_group_events", new=_fake_fetch):
-        resp = audit_client.post(
+        resp = analyst.post(
             "/api/v1/alerts/ack-group",
             json={"rule_name": "Ingress Tool Transfer via CURL", "severity": "Unknown"},
-            cookies=analyst_session,
             headers=_ORIGIN,
         )
 
@@ -1604,9 +1586,7 @@ def test_ack_group_accepts_the_no_severity_selector(
     assert seen.get("severity") == "unknown"
 
 
-def test_ack_group_accepts_the_alert_kind(
-    audit_client: TestClient, analyst_session: dict[str, str]
-) -> None:
+def test_ack_group_accepts_the_alert_kind(analyst: TestClient) -> None:
     """L5 over-correction (D2): ``kind="alert"`` is the app's OWN fallback —
     ``_kind_for`` returns it for any ``tags:alert`` document without a mapped
     ``event.dataset``, ``fetch_groups`` renders it, and the SPA posts it back
@@ -1621,10 +1601,9 @@ def test_ack_group_accepts_the_alert_kind(
         return []
 
     with patch("soc_ai.webui.alerts_query.fetch_group_events", new=_fake_fetch):
-        resp = audit_client.post(
+        resp = analyst.post(
             "/api/v1/alerts/ack-group",
             json={"rule_name": "ET MALWARE Known Bad", "kind": "alert"},
-            cookies=analyst_session,
             headers=_ORIGIN,
         )
 

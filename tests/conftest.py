@@ -30,8 +30,8 @@ from soc_ai.config import Settings, get_settings
 # factory). Imported by name so pytest registers them here: pytest 9 rejects
 # `pytest_plugins` in a non-rootdir conftest, and the repo has no root conftest.
 from tests.conftest_security import (  # noqa: F401
-    admin_session,
-    analyst_session,
+    admin_client,
+    analyst_client,
     audit_client,
     audit_settings,
     hostile_doc,

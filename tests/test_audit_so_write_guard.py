@@ -93,7 +93,7 @@ async def test_hunt_anchor_ids_recognises_a_lead_promotion_anchor(
 
 
 def test_investigate_disables_so_writes_over_a_lead_anchor(
-    audit_client: TestClient, analyst_session: dict[str, str]
+    audit_client: TestClient, analyst: TestClient
 ) -> None:
     anchor = "lead-anchor-000001"
     _seed_lead_promotion(audit_client, alert_es_id=anchor)
@@ -110,12 +110,7 @@ def test_investigate_disables_so_writes_over_a_lead_anchor(
         return _gen()
 
     with patch("soc_ai.api.routes.investigate", _fake_investigate):
-        resp = audit_client.post(
-            "/investigate",
-            json={"alert_id": anchor},
-            cookies=analyst_session,
-            headers=_ORIGIN,
-        )
+        resp = analyst.post("/investigate", json={"alert_id": anchor}, headers=_ORIGIN)
 
     assert resp.status_code == 200, resp.text
     assert captured, "patched investigate() was never consumed"
@@ -125,7 +120,7 @@ def test_investigate_disables_so_writes_over_a_lead_anchor(
 
 
 def test_ack_events_refuses_a_promoted_lead_anchor(
-    audit_client: TestClient, analyst_session: dict[str, str]
+    audit_client: TestClient, analyst: TestClient
 ) -> None:
     anchor = "lead-anchor-000002"
     _seed_lead_promotion(audit_client, alert_es_id=anchor)
@@ -134,12 +129,7 @@ def test_ack_events_refuses_a_promoted_lead_anchor(
         "soc_ai.api.webui.routes_alert_actions.execute_write_tool",
         new=AsyncMock(return_value=({}, None)),
     ) as write_spy:
-        resp = audit_client.post(
-            "/api/v1/alerts/ack-events",
-            json={"es_ids": [anchor]},
-            cookies=analyst_session,
-            headers=_ORIGIN,
-        )
+        resp = analyst.post("/api/v1/alerts/ack-events", json={"es_ids": [anchor]}, headers=_ORIGIN)
 
     assert resp.status_code == 400, f"lead anchor ack not refused: {resp.status_code} {resp.text}"
     assert resp.json()["detail"]["reason"] == "hunt_kind_no_so_target"
@@ -148,7 +138,7 @@ def test_ack_events_refuses_a_promoted_lead_anchor(
 
 @pytest.mark.parametrize("promoted_kind", ["hunt", "lead"])
 def test_execute_action_refuses_a_row_laundered_over_a_promoted_anchor(
-    audit_client: TestClient, analyst_session: dict[str, str], promoted_kind: str
+    audit_client: TestClient, analyst: TestClient, promoted_kind: str
 ) -> None:
     """The execute-action guard keys off the anchor document: an ordinary
     kind='suricata' row over a promoted anchor (a re-investigation) must not
@@ -189,10 +179,8 @@ def test_execute_action_refuses_a_row_laundered_over_a_promoted_anchor(
         "soc_ai.api.webui.routes_actions.execute_write_tool",
         new=AsyncMock(return_value=({}, None)),
     ) as write_spy:
-        resp = audit_client.post(
-            f"/api/v1/investigations/{laundered_id}/actions/0/execute",
-            cookies=analyst_session,
-            headers=_ORIGIN,
+        resp = analyst.post(
+            f"/api/v1/investigations/{laundered_id}/actions/0/execute", headers=_ORIGIN
         )
 
     assert resp.status_code == 400, f"laundered ack not refused: {resp.status_code} {resp.text}"
