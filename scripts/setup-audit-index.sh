@@ -35,11 +35,16 @@ INDEX_PATTERN="${INDEX_PATTERN:-soc-ai-audit-*}"
 echo "[1/3] fetching current ${ROLE} role definition..."
 CUR_JSON=$(so-elasticsearch-query "_security/role/${ROLE}")
 
-# Extract the role body (top-level key is the role name).
-BODY=$(python3 -c "
-import json, sys
-src = json.loads('''${CUR_JSON}''')
-role = src['${ROLE}']
+# Extract the role body (top-level key is the role name). The role JSON and
+# the two names reach Python through the environment, never as source text: a
+# role with a document-level-security query carries backslash escapes, and
+# spliced into a string literal those were unescaped by Python before
+# json.loads ever saw them.
+BODY=$(CUR_JSON="${CUR_JSON}" ROLE="${ROLE}" INDEX_PATTERN="${INDEX_PATTERN}" python3 - <<'PY'
+import json, os
+src = json.loads(os.environ['CUR_JSON'])
+role = src[os.environ['ROLE']]
+pattern = os.environ['INDEX_PATTERN']
 # Drop fields the PUT API rejects.
 role.pop('transient_metadata', None)
 
@@ -47,10 +52,10 @@ role.pop('transient_metadata', None)
 indices = role.get('indices', [])
 indices = [
     block for block in indices
-    if '${INDEX_PATTERN}' not in block.get('names', [])
+    if pattern not in block.get('names', [])
 ]
 indices.append({
-    'names': ['${INDEX_PATTERN}'],
+    'names': [pattern],
     'privileges': [
         'auto_configure', 'create_index', 'index', 'read',
         'view_index_metadata', 'write',
@@ -59,7 +64,8 @@ indices.append({
 })
 role['indices'] = indices
 print(json.dumps(role))
-")
+PY
+)
 
 echo "[2/3] writing updated role with ${INDEX_PATTERN} grant..."
 RESP=$(so-elasticsearch-query "_security/role/${ROLE}" -X PUT -d "${BODY}")

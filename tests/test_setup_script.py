@@ -20,6 +20,8 @@ import subprocess
 from pathlib import Path
 from typing import NamedTuple
 
+import pytest
+
 REPO = Path(__file__).resolve().parent.parent
 
 # ANALYST_MODEL is set to a value that does NOT match .env.example's shipped
@@ -43,6 +45,33 @@ STUBS = {
     "openssl": "#!/bin/sh\necho stubsecret\nexit 0\n",
 }
 
+# Stubs for the whole flow (no --env-only). curl answers "000" to everything,
+# which is a non-empty body, so the health poll reports healthy on its first
+# try and never sleeps; it logs its argv when CURL_LOG is set so a test can see
+# which URL each call went to. `openssl req` must leave the -keyout/-out files
+# behind (the chmod that follows fails under set -e otherwise) and `openssl
+# rand` still feeds genpw().
+FULL_STUBS = {
+    "curl": """#!/bin/sh
+[ -n "${CURL_LOG:-}" ] && printf '%s\\n' "$*" >> "$CURL_LOG"
+echo 000
+exit 0
+""",
+    "docker": "#!/bin/sh\nexit 0\n",
+    "openssl": """#!/bin/sh
+prev=""
+for a in "$@"; do
+  case "$prev" in
+    -keyout) : > "$a"; chmod 600 "$a" ;;
+    -out) : > "$a" ;;
+  esac
+  prev=$a
+done
+echo stubsecret
+exit 0
+""",
+}
+
 _KV_LINE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
@@ -55,13 +84,20 @@ class SetupRun(NamedTuple):
 def env_values(text: str) -> dict[str, str]:
     """Effective .env: the appended setup.sh overrides win over the .env.example base
     (the generated file INTENTIONALLY contains duplicate keys; last wins for dotenv).
+
+    One matching pair of surrounding quotes is stripped, the way compose's env_file
+    parser and python-dotenv read a quoted value — the managed block writes its
+    free-text values single-quoted so `$` and ` #` inside a secret survive.
     """
     out: dict[str, str] = {}
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if line and not line.startswith("#") and "=" in line:
             k, v = line.split("=", 1)
-            out[k.strip()] = v.strip()
+            v = v.strip()
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+                v = v[1:-1]
+            out[k.strip()] = v
     return out
 
 
@@ -96,6 +132,54 @@ def run_setup(tmp_path: Path, conf: str) -> SetupRun:
         capture_output=True,
         text=True,
         timeout=60,
+        check=False,
+    )
+    env_text = (workdir / ".env").read_text() if (workdir / ".env").exists() else ""
+    return SetupRun(proc, env_text, workdir)
+
+
+def run_setup_full(
+    tmp_path: Path,
+    conf: str,
+    *,
+    existing_env: str | None = None,
+    existing_key_mode: int | None = None,
+) -> SetupRun:
+    """Like run_setup() but drives the whole flow (no --env-only): cert
+    generation, the stubbed build/start, the health poll, the doctor exec, the
+    starter pack and the printed summary. `existing_env` pre-seeds workdir/.env,
+    which --auto then keeps (RECFG defaults to n); `existing_key_mode` pre-seeds
+    certs/ with a key at that mode so the reuse branch runs instead of
+    generation. curl's argv log lands in tmp_path / "curl.log".
+    """
+    workdir = tmp_path / "repo"
+    workdir.mkdir()
+    for name in ("setup.sh", ".env.example", "pyproject.toml"):
+        (workdir / name).write_text((REPO / name).read_text())
+    (workdir / "setup.sh").chmod(0o755)
+    (workdir / "setup.conf").write_text(conf)
+    if existing_env is not None:
+        (workdir / ".env").write_text(existing_env)
+    if existing_key_mode is not None:
+        certs = workdir / "certs"
+        certs.mkdir()
+        (certs / "cert.pem").write_text("cert")
+        (certs / "key.pem").write_text("key")
+        (certs / "key.pem").chmod(existing_key_mode)
+    stubbin = tmp_path / "stubbin"
+    stubbin.mkdir()
+    for tool, body in FULL_STUBS.items():
+        p = stubbin / tool
+        p.write_text(body)
+        p.chmod(0o755)
+    env = {**_hermetic_env(tmp_path), "CURL_LOG": str(tmp_path / "curl.log")}
+    proc = subprocess.run(
+        ["bash", "setup.sh", "--auto"],
+        cwd=workdir,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
         check=False,
     )
     env_text = (workdir / ".env").read_text() if (workdir / ".env").exists() else ""
@@ -468,6 +552,223 @@ def test_env_example_documents_maxmind_and_redaction() -> None:
     lines = (REPO / ".env.example").read_text().splitlines()
     assert any(line.startswith("MAXMIND_LICENSE_KEY=") for line in lines)
     assert any("ANALYST_CLOUD_REDACTION" in line for line in lines)
+
+
+# ── setup.conf parsing ────────────────────────────────────────────────────────
+
+
+def _conf_example_filled() -> str:
+    """The shipped setup.conf.example with only the three REQUIRED blanks filled
+    in, each value inserted right after its `=` so whatever follows on the line
+    (an annotation, today or in an older copy) stays exactly as shipped. This is
+    the file an operator is told to `cp` and edit.
+    """
+    text = (REPO / "setup.conf.example").read_text()
+    text = text.replace("https://your-so-grid", "https://so.example.com", 1)
+    text = re.sub(r"^(SO_PASSWORD=)", r"\1hunter2", text, count=1, flags=re.M)
+    return re.sub(r"^(ANALYST_MODEL=)", r"\1soc-ai-analyst-test", text, count=1, flags=re.M)
+
+
+def test_conf_example_as_shipped_yields_documented_values(tmp_path: Path) -> None:
+    """Pins: setup.conf.example, copied and edited the way its header says,
+    produces the .env its own annotations promise. Before load_conf dropped an
+    unquoted trailing ` # ...`, every annotated line leaked its comment into the
+    value: API_AUTH_REQUIRED=true read as `true   # require login...`, which
+    b2yn() maps to n, so a LAN-exposed install came up with auth OFF and cloud
+    TLS verification off, while ES_HOSTS, CONFIG_SECRET_KEY and
+    BOOTSTRAP_ADMIN_PASSWORD became the comment text (dotenv and compose both
+    take a leading `#` literally, so the container really received it).
+    """
+    run = run_setup(tmp_path, _conf_example_filled())
+    assert run.proc.returncode == 0, run.proc.stderr + run.proc.stdout
+    values = env_values(run.env_text)
+    assert values["SO_HOST"] == "https://so.example.com"
+    assert values["ES_HOSTS"] == "https://so.example.com:9200"
+    assert values["API_AUTH_REQUIRED"] == "true"
+    assert values["LITELLM_VERIFY_SSL"] == "true"
+    assert values["SO_VERIFY_SSL"] == "false"
+    assert values["LITELLM_BASE_URL"] == "http://localhost:4000"
+    assert values["LITELLM_API_KEY"] == ""
+    assert values["ANALYST_MODEL"] == "soc-ai-analyst-test"
+    assert values["WEBUI_ALERTS_QUERY"] == "tags:alert OR event.kind:alert"
+    assert values["EVENTS_INDEX_PATTERN"] == "logs-*"
+    assert values["BOOTSTRAP_ADMIN_PASSWORD"] == "stubsecret"
+    assert not values["CONFIG_SECRET_KEY"].startswith("#")
+
+
+def test_conf_inline_comment_is_stripped_from_unquoted_value(tmp_path: Path) -> None:
+    """Pins the parser itself, independent of what setup.conf.example ships
+    today: an unquoted value ends at the first whitespace-then-`#`, the way
+    python-dotenv and compose read an env file, and a line whose value is
+    nothing but an annotation (`ES_HOSTS=      # blank = ...`) reads as blank so
+    the `${ES_HOSTS:-...}` default still applies.
+    """
+    conf = """
+SO_HOST=https://so.test.lan           # Security Onion URL
+SO_USERNAME=analyst                   # SO login
+SO_PASSWORD=hunter2
+ES_HOSTS=                             # blank = <SO_HOST>:9200
+LITELLM_BASE_URL=http://llm.test.lan:4000
+ANALYST_MODEL=soc-ai-analyst-test
+API_AUTH_REQUIRED=true                # require login (recommended)
+LITELLM_VERIFY_SSL=true               # false behind a self-signed gateway
+BOOTSTRAP_ADMIN_PASSWORD=             # auto-generated if blank
+"""
+    run = run_setup(tmp_path, conf)
+    assert run.proc.returncode == 0, run.proc.stderr + run.proc.stdout
+    values = env_values(run.env_text)
+    assert values["SO_HOST"] == "https://so.test.lan"
+    assert values["SO_USERNAME"] == "analyst"
+    assert values["ES_HOSTS"] == "https://so.test.lan:9200"
+    assert values["API_AUTH_REQUIRED"] == "true"
+    assert values["LITELLM_VERIFY_SSL"] == "true"
+    assert values["BOOTSTRAP_ADMIN_PASSWORD"] == "stubsecret"
+
+
+@pytest.mark.parametrize(
+    ("line", "key"),
+    [("export EXTRA=1", "export EXTRA"), ("SO-HOST=x", "SO-HOST"), ("MY KEY=a", "MY KEY")],
+)
+def test_bad_conf_key_dies_with_message(tmp_path: Path, line: str, key: str) -> None:
+    """Pins: a malformed setup.conf key (`export KEY=...`, a hyphen, a space)
+    dies with the file name and the offending key, not bash's raw `invalid
+    variable name` abort. load_conf() fed the key straight into `${!k+x}`, so
+    the indirect expansion blew up first with a one-line bash error naming
+    neither the file nor the line; an --auto run in CI reported only
+    "setup.sh failed". It dies rather than skipping the line: a silently
+    dropped setting is worse than a stopped install.
+    """
+    run = run_setup(tmp_path, BASE_CONF + line + "\n")
+    assert run.proc.returncode != 0
+    assert f"setup.conf: invalid key '{key}'" in run.proc.stderr
+    assert "invalid variable name" not in run.proc.stderr
+    assert run.env_text == ""
+
+
+def test_conf_hash_inside_value_survives(tmp_path: Path) -> None:
+    """Guards the two shapes the comment strip must leave alone: a `#` with no
+    whitespace before it is part of the value (`pa#ss`), and a quoted value is
+    taken whole, so a value can carry ` #` when it is written in quotes. Same
+    rules dotenv and compose apply to the .env this feeds.
+    """
+    conf = BASE_CONF.replace("SO_PASSWORD=hunter2", "SO_PASSWORD=pa#ss") + (
+        "WEBUI_ALERTS_QUERY='tags:alert #keep'\n"
+    )
+    run = run_setup(tmp_path, conf)
+    assert run.proc.returncode == 0, run.proc.stderr + run.proc.stdout
+    values = env_values(run.env_text)
+    assert values["SO_PASSWORD"] == "pa#ss"
+    assert values["WEBUI_ALERTS_QUERY"] == "tags:alert #keep"
+
+
+def test_secret_with_dollar_and_hash_round_trips(tmp_path: Path) -> None:
+    """Pins: a secret is written to .env in the one shape compose's env_file parser
+    and python-dotenv (what pydantic-settings reads) both take literally —
+    single-quoted. Unquoted, `$name` expands and ` #` starts a comment, so a
+    password like `pa$sw #x` reached the container as `pa` right after setup.sh
+    had validated the real value against Elasticsearch and printed
+    "credentials OK". Parsed back with dotenv_values, the same parser the app
+    uses, not the harness's own env_values().
+    """
+    from dotenv import dotenv_values
+
+    conf = BASE_CONF.replace("SO_PASSWORD=hunter2", "SO_PASSWORD='pa$sw #x'") + (
+        "LITELLM_API_KEY='k$HOMEy'\n"
+    )
+    run = run_setup(tmp_path, conf)
+    assert run.proc.returncode == 0, run.proc.stderr + run.proc.stdout
+    values = dotenv_values(run.workdir / ".env")
+    assert values["SO_PASSWORD"] == "pa$sw #x"
+    assert values["ES_PASSWORD"] == "pa$sw #x"
+    assert values["LITELLM_API_KEY"] == "k$HOMEy"
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("SO_PASSWORD", "it's"), ("LITELLM_API_KEY", "abc\\"), ("BOOTSTRAP_ADMIN_PASSWORD", "a'b")],
+)
+def test_secret_with_unquotable_character_is_refused(tmp_path: Path, key: str, value: str) -> None:
+    """Pins: a value no .env parser can carry inside single quotes — a single quote
+    (compose has no portable escape for it) or a backslash (compose rejects the
+    whole file on a trailing one; dotenv unescapes it) — makes setup.sh die with
+    the key named, before anything is written. Silently writing it would leave
+    the container with a different secret from the one that just passed the
+    grid check.
+    """
+    conf = BASE_CONF.replace("SO_PASSWORD=hunter2", "SO_PASSWORD=hunter2\n" + f"{key}={value}")
+    if key == "SO_PASSWORD":
+        conf = BASE_CONF.replace("SO_PASSWORD=hunter2", f"SO_PASSWORD={value}")
+    run = run_setup(tmp_path, conf)
+    assert run.proc.returncode != 0
+    assert f"{key} contains" in run.proc.stderr
+    assert not (run.workdir / ".env").exists()
+
+
+# ── TLS key ownership ─────────────────────────────────────────────────────────
+
+_container_uid_is_ours = pytest.mark.skipif(
+    os.getuid() == 1000 or os.getgid() == 1000,
+    reason="a key owned by uid/gid 1000 is readable by the container either way",
+)
+
+
+def _key_readable_by_uid_1000(path: Path) -> bool:
+    st = path.stat()
+    return bool(st.st_mode & 0o004) or (st.st_gid == 1000 and bool(st.st_mode & 0o040))
+
+
+@_container_uid_is_ours
+def test_generated_key_is_readable_by_container_uid(tmp_path: Path) -> None:
+    """Pins: certs/key.pem, generated as whoever runs setup.sh, ends up readable
+    by uid 1000 — the in-container soc-ai user that opens it through a
+    read-only bind mount carrying no ACLs. It used to be chmod 640 owned by the
+    invoking user, so `sudo ./setup.sh` (or any account but the first Linux
+    user) left a key uvicorn could not open: the container restart-looped and
+    setup.sh reported only "Liveness check timed out". Either the group is
+    handed to gid 1000 with the key still group-only, or it is relaxed to 0644
+    with a warning — both satisfy this check; a 0640 key in the runner's own
+    group does not.
+    """
+    run = run_setup_full(tmp_path, BASE_CONF)
+    assert run.proc.returncode == 0, run.proc.stderr + run.proc.stdout
+    key = run.workdir / "certs" / "key.pem"
+    st = key.stat()
+    assert _key_readable_by_uid_1000(key), f"key mode {oct(st.st_mode)} gid {st.st_gid}"
+
+
+@_container_uid_is_ours
+def test_reused_key_is_made_readable_by_container_uid(tmp_path: Path) -> None:
+    """Pins the reuse branch: an existing certs/ (a previous `sudo ./setup.sh`,
+    or a hand-copied CA-signed key at 0640) gets the same treatment, since
+    "Reusing existing certs/." followed by a crash loop is the same dead end.
+    """
+    run = run_setup_full(tmp_path, BASE_CONF, existing_key_mode=0o640)
+    assert run.proc.returncode == 0, run.proc.stderr + run.proc.stdout
+    assert "Reusing existing certs/" in run.proc.stdout
+    assert _key_readable_by_uid_1000(run.workdir / "certs" / "key.pem")
+
+
+# ── published port ────────────────────────────────────────────────────────────
+
+
+def test_health_poll_and_summary_use_the_env_port(tmp_path: Path) -> None:
+    """Pins: on a keep-existing-.env run, the liveness poll and the printed
+    "Open:" URL use SOC_AI_PORT from .env — the host port docker-compose.yml
+    publishes as `${SOC_AI_PORT:-8443}:8443` — not a hardcoded 8443. The
+    starter-pack calls already read the port back last-wins; the poll and the
+    summary did not, so a .env carrying SOC_AI_PORT=9443 spun the poll for
+    three minutes against the wrong port, printed "the server never
+    answered", and ended with a URL nobody could open.
+    """
+    existing = (REPO / ".env.example").read_text() + "\nSOC_AI_PORT=9443\n"
+    run = run_setup_full(tmp_path, BASE_CONF, existing_env=existing)
+    assert run.proc.returncode == 0, run.proc.stderr + run.proc.stdout
+    assert "Keeping the existing .env." in run.proc.stdout
+    calls = (tmp_path / "curl.log").read_text()
+    assert "https://localhost:9443/healthz" in calls
+    assert "localhost:8443/healthz" not in calls
+    assert ":9443/app" in run.proc.stdout
+    assert ":8443/app" not in run.proc.stdout
 
 
 # ── post-start glue (Task 7): doctor preflight, starter pack, summary ──────────

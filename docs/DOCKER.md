@@ -79,11 +79,13 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
   -addext "subjectAltName=DNS:soc-ai.local,IP:<your-host-ip>" \
   -keyout ./certs/key.pem \
   -out    ./certs/cert.pem
-# The container runs as uid 1000 and must be able to READ these. Keep the cert
-# world-readable (0644) but the private key group-readable only (0640) so it
-# isn't world-readable:
+# The container runs as uid 1000 and must be able to READ these through a bind
+# mount that carries no ACLs. Keep the cert world-readable (0644). Give the
+# private key to gid 1000 and make it group-readable (0640) so it is readable
+# in the container without being world-readable on the host; if you cannot
+# chgrp on this host, 0644 is the fallback that still boots.
 chmod 644 ./certs/cert.pem
-chmod 640 ./certs/key.pem
+chgrp 1000 ./certs/key.pem && chmod 640 ./certs/key.pem
 ```
 
 The compose file bind-mounts `./certs/cert.pem` to `/etc/soc-ai/cert.pem` and
@@ -108,7 +110,7 @@ until you restart:
 cp your-ca-cert.pem  ./certs/cert.pem   # the full chain (leaf + intermediates)
 cp your-ca-key.pem   ./certs/key.pem
 chmod 644 ./certs/cert.pem
-chmod 640 ./certs/key.pem
+chgrp 1000 ./certs/key.pem && chmod 640 ./certs/key.pem   # readable by the container uid
 docker compose restart soc-ai
 ```
 
