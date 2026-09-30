@@ -73,6 +73,14 @@ def _allowed_origins(request: Request, settings: Settings) -> set[str]:
     norm_base = _normalize_origin(base)
     if norm_base:
         allowed.add(norm_base)
+        # Behind a proxy that terminates TLS, this request arrived as
+        # http://<host> while the browser's origin is https://<host>. Allow the
+        # scheme the proxy reports, from a trusted peer only (PROXY_TRUSTED_IPS).
+        if norm_base.startswith("http://"):
+            from soc_ai.api.webui._shared import _request_is_https  # noqa: PLC0415 - cycle
+
+            if _request_is_https(request, settings):
+                allowed.add("https://" + norm_base[len("http://") :])
     # Configured host as a fallback (proxy / pre-first-request).
     norm_host = _normalize_origin(settings.soc_ai_host)
     if norm_host:

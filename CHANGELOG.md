@@ -54,6 +54,14 @@ validates the certificate and warns before it expires.
   `X-Forwarded-Proto`. uvicorn's own proxy-header rewrite is off (`--no-proxy-headers` in the
   image command and the systemd unit), so soc-ai holds the one rule.
 - **The container healthcheck tries HTTPS and then HTTP.** It passes on both paths.
+- **The CSRF guard accepts the https origin a trusted proxy reports.** Behind Caddy, soc-ai
+  receives plain HTTP while the browser's origin is `https://<host>`. The guard built the app's
+  own origin from the request scheme and rejected every cookie-authenticated write from the
+  console with `bad_origin`. A forged `X-Forwarded-Proto` from an untrusted peer is still
+  rejected.
+- **`pyjwt` moves to 2.15.1, `urllib3` to 2.8.0 and `virtualenv` to 21.14.1.** They close
+  CVE-2026-101918, CVE-2026-102265 to CVE-2026-102272, CVE-2026-97688, CVE-2026-97689 and
+  PYSEC-2026-4011 to PYSEC-2026-4014.
 - **The systemd unit passes the same cipher list as the image.**
 - **The docs describe both paths.** DOCKER.md, TLS paths, holds the proxy recipe with the three
   certificate sources, the network name rule, and the trust-block check. DEPLOYMENT.md holds the

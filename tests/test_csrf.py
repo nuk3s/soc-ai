@@ -114,6 +114,38 @@ def test_cookie_post_same_origin_is_allowed(auth_client: TestClient) -> None:
     assert resp.json()["ok"] is True
 
 
+def test_cookie_post_behind_a_trusted_tls_proxy_allows_the_https_origin(
+    auth_settings: Settings,
+) -> None:
+    """Caddy terminates TLS and forwards over plain HTTP. The browser's origin is
+    https://host while soc-ai sees http://host. The proxy's X-Forwarded-Proto,
+    from a trusted peer, makes the https origin the app's own origin."""
+    s = auth_settings.model_copy(update={"proxy_trusted_ips": ["192.0.2.0/24"]})
+    for client in _client(s, peer="192.0.2.7"):
+        _login(client)
+        resp = client.post(
+            "/api/v1/me/status",
+            json={"status": "busy"},
+            headers={"Origin": "https://testserver", "X-Forwarded-Proto": "https"},
+        )
+        assert resp.status_code == 200, resp.text
+
+
+def test_cookie_post_with_a_forged_forwarded_proto_from_an_untrusted_peer_is_rejected(
+    auth_settings: Settings,
+) -> None:
+    s = auth_settings.model_copy(update={"proxy_trusted_ips": ["192.0.2.0/24"]})
+    for client in _client(s, peer="198.51.100.9"):
+        _login(client)
+        resp = client.post(
+            "/api/v1/me/status",
+            json={"status": "busy"},
+            headers={"Origin": "https://testserver", "X-Forwarded-Proto": "https"},
+        )
+        assert resp.status_code == 403
+        assert resp.json()["detail"]["reason"] == "bad_origin"
+
+
 def test_cookie_post_referer_fallback_is_allowed(auth_client: TestClient) -> None:
     """No Origin but a same-origin Referer → allowed."""
     _login(auth_client)

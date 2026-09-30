@@ -32,6 +32,7 @@ const DIRECT: TlsStatus = {
   errors: [],
   loaded_at: '2026-09-29T12:00:00+00:00',
   restart_required: false,
+  proxy_trusted_ips: [],
 };
 
 function mount() {
@@ -123,10 +124,24 @@ describe('TlsPanel', () => {
     expect(await screen.findByText(/Checked at \d\d:\d\d:\d\d UTC\./)).toBeTruthy();
   });
 
-  it('reads the proxy path when TLS is off', async () => {
+  it('reads the proxy path when TLS is off and a proxy is trusted', async () => {
+    vi.mocked(getTlsStatus).mockResolvedValue({
+      ...DIRECT,
+      mode: 'off',
+      subject: null,
+      sans: [],
+      days_left: null,
+      proxy_trusted_ips: ['172.18.0.0/16'],
+    });
+    mount();
+    expect(await screen.findByText(/TLS terminates at the proxy/)).toBeTruthy();
+    expect(screen.getByText(/172\.18\.0\.0\/16/)).toBeTruthy();
+  });
+
+  it('says TLS is off with no proxy trusted', async () => {
     vi.mocked(getTlsStatus).mockResolvedValue({ ...DIRECT, mode: 'off', subject: null, sans: [], days_left: null });
     mount();
     expect(await screen.findByText(/TLS is off/)).toBeTruthy();
-    expect(screen.getByText(/proxy/)).toBeTruthy();
+    expect(screen.getByText(/Put a proxy in front of it/)).toBeTruthy();
   });
 });

@@ -97,8 +97,9 @@ export function TlsPanel({
           )}
           {data && data.mode === "off" && (
             <div className="px-4 py-3 text-[12.5px]">
-              TLS is off. soc-ai serves plain HTTP. Put a proxy in front of it,
-              or set the certificate paths. See docs/DOCKER.md, TLS.
+              {data.proxy_trusted_ips.length > 0
+                ? `TLS terminates at the proxy. soc-ai serves plain HTTP and trusts forwarded headers from ${data.proxy_trusted_ips.join(', ')}.`
+                : 'TLS is off. soc-ai serves plain HTTP. Put a proxy in front of it, or set the certificate paths. See docs/DOCKER.md, TLS.'}
             </div>
           )}
           {data && data.mode === "direct" && (

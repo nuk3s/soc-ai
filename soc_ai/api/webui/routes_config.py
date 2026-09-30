@@ -1108,6 +1108,7 @@ class TlsStatusOut(BaseModel):
     errors: list[str] = []
     loaded_at: str | None = None
     restart_required: bool = False
+    proxy_trusted_ips: list[str] = []
 
 
 @router.get(
@@ -1140,6 +1141,7 @@ async def api_tls_status(
             **now_status.as_dict(),
             "loaded_at": getattr(request.app.state, "tls_loaded_at", None),
             "restart_required": restart,
+            "proxy_trusted_ips": [str(x) for x in (settings.proxy_trusted_ips or [])],
         }
     )
 

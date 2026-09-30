@@ -101,6 +101,15 @@ async def api_logout(request: Request) -> JSONResponse:
     if raw is not None:
         async with request.app.state.db_sessionmaker() as db:
             await auth_svc.delete_session(db, raw)
+    settings = request.app.state.settings
     resp = JSONResponse({"ok": True})
-    resp.delete_cookie(auth_svc.SESSION_COOKIE, path="/")
+    # The same attributes the login set. A browser matches a cookie on its
+    # attributes when it clears it.
+    resp.delete_cookie(
+        auth_svc.SESSION_COOKIE,
+        path="/",
+        httponly=True,
+        samesite="lax",
+        secure=_request_is_https(request, settings),
+    )
     return resp

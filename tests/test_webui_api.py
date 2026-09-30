@@ -6320,6 +6320,10 @@ def test_api_logout_clears_session(settings_kratos: Settings) -> None:
         logout_resp = client.post("/api/v1/logout")
         assert logout_resp.status_code == 200
         assert logout_resp.json()["ok"] is True
+        # The clearing cookie carries the attributes the login set, so a
+        # browser matches it. HttpOnly and SameSite always; Secure over TLS.
+        cleared = logout_resp.headers.get("set-cookie", "")
+        assert "Max-Age=0" in cleared and "HttpOnly" in cleared and "SameSite=lax" in cleared
 
         # The cookie should be cleared (deleted by the response)
         assert client.cookies.get("soc_ai_session", "") == ""

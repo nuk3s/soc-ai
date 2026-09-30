@@ -839,6 +839,7 @@ export interface TlsStatus {
   errors: string[];
   loaded_at: string | null;
   restart_required: boolean;
+  proxy_trusted_ips: string[];
 }
 
 export function getTlsStatus(): Promise<TlsStatus> {
