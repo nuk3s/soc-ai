@@ -31,6 +31,8 @@ from soc_ai.so_client.elastic import EsSearchResult
 from soc_ai.store.db import make_engine, run_migrations
 from sqlalchemy import text
 
+from tests.test_tls_status import NOW, _cert, _key, _write
+
 # ── helpers / doubles ─────────────────────────────────────────────────────────
 
 
@@ -913,3 +915,137 @@ def test_a_failure_exits_one_in_both_modes() -> None:
     results = [doctor.CheckResult("a", "FAIL", "broken")]
     assert doctor.exit_code(results) == 1
     assert doctor.exit_code(results, strict=True) == 1
+
+
+def test_tls_check_passes_on_a_valid_ca_signed_chain(tmp_path: Path) -> None:
+    ca_key, leaf_key = _key(), _key()
+    ca = _cert(
+        subject="Example CA",
+        issuer_name="Example CA",
+        issuer_key=ca_key,
+        key=ca_key,
+        days=3650,
+        ca=True,
+    )
+    leaf = _cert(
+        subject="soc-ai.example.test",
+        issuer_name="Example CA",
+        issuer_key=ca_key,
+        key=leaf_key,
+        days=90,
+        sans=("soc-ai.example.test",),
+    )
+    cert_path, key_path = _write(tmp_path, [leaf, ca], leaf_key)
+    settings = _settings(tmp_path, soc_ai_tls_cert=cert_path, soc_ai_tls_key=key_path)
+    row = _by_name(doctor.check_tls(settings, now=NOW), "tls")
+    assert row.status == "PASS"
+    assert "soc-ai.example.test" in row.detail and "90 days" in row.detail
+
+
+def test_tls_check_warns_on_self_signed_and_on_thirty_days(tmp_path: Path) -> None:
+    key = _key()
+    cert = _cert(
+        subject="soc-ai.example.test",
+        issuer_name="soc-ai.example.test",
+        issuer_key=key,
+        key=key,
+        days=20,
+    )
+    cert_path, key_path = _write(tmp_path, [cert], key)
+    settings = _settings(tmp_path, soc_ai_tls_cert=cert_path, soc_ai_tls_key=key_path)
+    row = _by_name(doctor.check_tls(settings, now=NOW), "tls")
+    assert row.status == "WARN"
+    assert "self-signed" in row.detail and "20 days" in row.detail
+    assert "proxy" in row.hint
+    assert "soc-ai loads the files at start. After a swap, restart soc-ai." in row.hint
+
+
+def test_tls_check_reads_a_self_signed_certificate_with_nothing_else_wrong_as_info(
+    tmp_path: Path,
+) -> None:
+    key = _key()
+    cert = _cert(
+        subject="soc-ai.example.test",
+        issuer_name="soc-ai.example.test",
+        issuer_key=key,
+        key=key,
+        days=200,
+    )
+    cert_path, key_path = _write(tmp_path, [cert], key)
+    settings = _settings(tmp_path, soc_ai_tls_cert=cert_path, soc_ai_tls_key=key_path)
+    row = _by_name(doctor.check_tls(settings, now=NOW), "tls")
+    assert row.status == "INFO"
+    assert row.detail.endswith("Browsers warn on it. The proxy path gives a trusted certificate.")
+
+
+def test_tls_check_warns_when_a_trusted_block_is_every_address(tmp_path: Path) -> None:
+    for block in ("0.0.0.0/0", "::/0"):
+        settings = _settings(
+            tmp_path,
+            soc_ai_tls_cert=None,
+            soc_ai_tls_key=None,
+            proxy_trusted_ips=["172.16.0.0/12", block],
+            soc_ai_host="127.0.0.1",
+        )
+        rows = [r for r in doctor.check_tls(settings) if r.name == "tls" and r.status == "WARN"]
+        assert len(rows) == 1, block
+        assert rows[0].detail == (
+            "PROXY_TRUSTED_IPS trusts every address. Any client can forge the forwarded headers."
+        )
+    narrow = _settings(
+        tmp_path,
+        soc_ai_tls_cert=None,
+        soc_ai_tls_key=None,
+        proxy_trusted_ips=["172.16.0.0/12", "10.0.0.1"],
+        soc_ai_host="127.0.0.1",
+    )
+    assert not [r for r in doctor.check_tls(narrow) if r.status == "WARN"]
+
+
+def test_tls_check_fails_on_an_expired_certificate_or_a_wrong_key(tmp_path: Path) -> None:
+    key, other = _key(), _key()
+    cert = _cert(
+        subject="soc-ai.example.test",
+        issuer_name="soc-ai.example.test",
+        issuer_key=key,
+        key=key,
+        days=-2,
+    )
+    cert_path, key_path = _write(tmp_path, [cert], other)
+    settings = _settings(tmp_path, soc_ai_tls_cert=cert_path, soc_ai_tls_key=key_path)
+    row = _by_name(doctor.check_tls(settings, now=NOW), "tls")
+    assert row.status == "FAIL"
+    assert "expired" in row.detail and "does not match" in row.detail
+    assert "soc-ai loads the files at start. After a swap, restart soc-ai." in row.hint
+
+
+def test_tls_check_reads_the_proxy_path_as_info_and_a_bare_bind_as_warn(tmp_path: Path) -> None:
+    behind = _settings(
+        tmp_path,
+        soc_ai_tls_cert=None,
+        soc_ai_tls_key=None,
+        proxy_trusted_ips=["172.16.0.0/12"],
+        soc_ai_host="0.0.0.0",
+    )
+    row = _by_name(doctor.check_tls(behind), "tls")
+    assert row.status == "INFO" and "172.16.0.0/12" in row.detail
+    assert row.detail.endswith(
+        "Confirm SOC_AI_BIND=127.0.0.1 so port 8443 stays on the host loopback."
+    )
+    bare = _settings(
+        tmp_path,
+        soc_ai_tls_cert=None,
+        soc_ai_tls_key=None,
+        proxy_trusted_ips=[],
+        soc_ai_host="0.0.0.0",
+    )
+    row = _by_name(doctor.check_tls(bare), "tls")
+    assert row.status == "WARN" and "plain HTTP" in row.detail
+    local = _settings(
+        tmp_path,
+        soc_ai_tls_cert=None,
+        soc_ai_tls_key=None,
+        proxy_trusted_ips=[],
+        soc_ai_host="127.0.0.1",
+    )
+    assert _by_name(doctor.check_tls(local), "tls").status == "INFO"

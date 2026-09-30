@@ -32,6 +32,8 @@ coverage.xml
 # setup.sh automated-install settings (holds secrets) + generated TLS cert
 setup.conf
 certs/
+# The Caddy CA root that scripts/tls-proxy.sh enable <domain> internal exports
+caddy-root.crt
 
 # IDE
 .vscode/

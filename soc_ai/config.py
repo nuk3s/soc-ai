@@ -1401,6 +1401,10 @@ class Settings(BaseSettings):
     that can mean someone edited the record of a decision, so it is sent at
     critical severity. Inert unless ``notify_enabled`` is on; the bell in the
     app carries it either way."""
+    notify_on_tls_expiry: bool = True
+    """Notify when the certificate soc-ai serves with enters the 30, 14 or 7 day
+    band before expiry, or expires. Inert unless ``notify_enabled`` is on. The
+    bell in the app carries it either way."""
 
     # --- crawl4ai (deep page read) ------------------------------------
     crawl4ai_enabled: bool = False

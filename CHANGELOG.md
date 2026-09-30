@@ -6,7 +6,59 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
-## [1.5.1] - 2026-09-28
+## [1.5.2] - 2026-09-29
+
+The TLS release. TLS has two paths. The proxy path is the production path. The direct path
+validates the certificate and warns before it expires.
+
+### Added
+
+- **The proxy path.** `scripts/tls-proxy.sh enable <domain> [auto|internal|<cert.pem> <key.pem>]`
+  puts Caddy in front of soc-ai in one command. The `caddy` service lives in `docker-compose.yml`
+  under the `proxy` profile. `COMPOSE_PROFILES=proxy` in `.env` keeps it in every later
+  `docker compose up -d`. There is no separate compose project. Caddy terminates TLS and renews
+  the certificate. `SOC_AI_DOMAIN` names the site. `SOC_AI_CADDY_TLS` picks the certificate
+  source: empty for automatic HTTPS from Let's Encrypt, `tls internal` for Caddy's own CA, or
+  `tls /certs/proxy-cert.pem /certs/proxy-key.pem` for your own files. The Caddy container
+  receives those two variables and no soc-ai secret. The script writes the settings, reads the
+  compose network subnet into `PROXY_TRUSTED_IPS`, waits for the certificate and prints the trust
+  steps for the internal CA. `disable` restores the direct path. `setup.sh` asks for the HTTPS
+  domain.
+- **The certificate inspector.** soc-ai reads the certificate and the key at start and states the
+  subject, the issuer, the names, the validity window, the chain order, the key match and the
+  SHA-256 fingerprint. It refuses a file over 256 KiB. It never stops the start: a bad file is
+  an error in the log, the doctor, the bell and the webhook.
+- **`soc-ai doctor` has a `tls` check.** PASS for a valid chain. INFO for a self-signed
+  certificate, with the proxy path as the way to a trusted one. WARN 30 days before expiry, for a
+  broken chain, for plain HTTP on a non-loopback bind with no trusted proxy, and for a trusted
+  block that covers every address. FAIL for an expired or not yet valid certificate, a key that
+  does not match, or a file that cannot be read. INFO on the proxy path, with the trusted
+  addresses.
+- **The Config screen has a TLS panel.** It shows the same record, the load time, and a
+  "Check again" button that reads the files on disk. When the files on disk differ from the
+  files loaded at start, it says so and names the restart command.
+- **`GET /api/v1/config/tls`** returns the record for an admin, with `restart_required`.
+- **A daily expiry check.** soc-ai compares the days left on the certificate it serves against
+  30, 14 and 7. When the band changes it fires the `tls_expiry` notification and puts a row on
+  the bell. A restart does not repeat the webhook: soc-ai keeps the last band it sent in
+  `tls-expiry-state.json` in the data directory. A swap on disk without a restart keeps the
+  alarm and notes the restart. `NOTIFY_ON_TLS_EXPIRY` turns the webhook off; the bell row stays.
+
+### Changed
+
+- **`PROXY_TRUSTED_IPS` accepts CIDR blocks.** A proxy in a container has no fixed address. The
+  operator lists the Docker address pool. An IPv4-mapped IPv6 peer matches its IPv4 block. An
+  entry that is not an address or a block trusts nothing.
+- **One forwarded-header trust rule.** The HSTS header now follows the same trusted-proxy rule as
+  the Secure cookie flag. Before this release, any client could add the header with a forged
+  `X-Forwarded-Proto`. uvicorn's own proxy-header rewrite is off (`--no-proxy-headers` in the
+  image command and the systemd unit), so soc-ai holds the one rule.
+- **The container healthcheck tries HTTPS and then HTTP.** It passes on both paths.
+- **The systemd unit passes the same cipher list as the image.**
+- **The docs describe both paths.** DOCKER.md, TLS paths, holds the proxy recipe with the three
+  certificate sources, the network name rule, and the trust-block check. DEPLOYMENT.md holds the
+  host Caddy recipe for a source install.
+
 
 This release has two parts. The first part is the set of fixes made after 1.5.0. The second part
 is a review of the full repository: the code, the tests, the installer and the documents. Each
@@ -4406,6 +4458,7 @@ The first public release. Highlights:
     positives is **capped** to low-stakes alerts (a prompt-injected verdict can
     no longer auto-acknowledge a malware/exploit/high-severity alert).
 
-[Unreleased]: https://github.com/nuk3s/soc-ai/compare/v1.5.1...HEAD
+[Unreleased]: https://github.com/nuk3s/soc-ai/compare/v1.5.2...HEAD
+[1.5.2]: https://github.com/nuk3s/soc-ai/compare/v1.5.1...v1.5.2
 [1.5.1]: https://github.com/nuk3s/soc-ai/compare/v1.5.0...v1.5.1
 [1.0.0]: https://github.com/nuk3s/soc-ai/releases/tag/v1.0.0

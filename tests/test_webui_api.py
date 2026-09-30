@@ -18,7 +18,7 @@ from soc_ai.main import create_app
 from soc_ai.webui.alerts_query import AlertEvent, AlertGroup, GroupPage
 
 
-def _client(settings: Settings) -> Iterator[TestClient]:
+def _client(settings: Settings, *, peer: str = "testclient") -> Iterator[TestClient]:
     fake_es = AsyncMock()
     fake_auth = AsyncMock()
     with (
@@ -27,7 +27,7 @@ def _client(settings: Settings) -> Iterator[TestClient]:
         patch("soc_ai.main.get_settings", return_value=settings),
     ):
         app = create_app()
-        with TestClient(app) as client:
+        with TestClient(app, client=(peer, 50000)) as client:
             yield client
 
 
@@ -6166,12 +6166,12 @@ def testresolve_alert_for_hunt_returns_existence_and_rule_name() -> None:
 ADMIN_PW_API = "test-api-login-pw"
 
 
-def _auth_client(settings_kratos: Settings) -> Iterator[TestClient]:
+def _auth_client(settings_kratos: Settings, *, peer: str = "testclient") -> Iterator[TestClient]:
     """Client with api_auth_required=True and a bootstrapped admin account."""
     auth_settings = settings_kratos.model_copy(
         update={"api_auth_required": True, "bootstrap_admin_password": SecretStr(ADMIN_PW_API)}
     )
-    yield from _client(auth_settings)
+    yield from _client(auth_settings, peer=peer)
 
 
 def test_api_login_success_sets_cookie(settings_kratos: Settings) -> None:
@@ -6631,9 +6631,10 @@ def test_login_cookie_is_secure_behind_trusted_https_forwarded_proto(
 ) -> None:
     """A TLS-terminating proxy IN proxy_trusted_ips that forwards
     X-Forwarded-Proto: https gets the Secure flag even though the upstream hop to
-    uvicorn is plain HTTP. The TestClient's socket peer is 'testclient'."""
-    settings_kratos.proxy_trusted_ips = ["testclient"]
-    for client in _auth_client(settings_kratos):
+    uvicorn is plain HTTP. The TestClient's socket peer is set to an address
+    inside the trusted block."""
+    settings_kratos.proxy_trusted_ips = ["192.0.2.0/24"]
+    for client in _auth_client(settings_kratos, peer="192.0.2.7"):
         resp = client.post(
             "/api/v1/login",
             json={"username": "admin", "password": ADMIN_PW_API},

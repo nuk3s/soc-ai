@@ -116,6 +116,7 @@ nav:
       - Getting an LLM to show its work: blog/2026-07-getting-an-llm-to-show-its-work.md
   - Project:
       - Roadmap: ROADMAP.md
+      - Release notes 1.5.2: releases/1.5.2.md
       - Release notes 1.5.1: releases/1.5.1.md
       - Release notes 1.5.0: releases/1.5.0.md
       - Changelog: project/changelog.md

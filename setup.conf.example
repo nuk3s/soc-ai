@@ -58,3 +58,12 @@ BOOTSTRAP_ADMIN_PASSWORD=
 # ── TLS cert ──────────────────────────────────────────────────────────────────
 # IP or DNS name for the self-signed cert SAN. Blank = this host's primary IP.
 CERT_HOST=
+
+# ── HTTPS domain: the proxy path ──────────────────────────────────────────────
+# A domain puts Caddy in front of soc-ai on ports 80 and 443. Caddy gets the
+# certificate and renews it. Blank keeps the direct path: the self-signed
+# cert on 8443. See docs/DOCKER.md, TLS paths.
+HTTPS_DOMAIN=
+# auto = Let's Encrypt. The name must resolve to this host from the internet.
+# internal = Caddy's own CA. setup.sh prints the steps to trust its root.
+HTTPS_CA=internal

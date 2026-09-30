@@ -209,6 +209,16 @@ sudo chgrp soc-ai key.pem cert.pem
 In production, replace it with a certificate from your internal CA or from Let's
 Encrypt.
 
+For a browser-trusted certificate with renewal, run Caddy on the host in front of soc-ai.
+In `/opt/soc-ai/.env`, leave `SOC_AI_TLS_CERT` and `SOC_AI_TLS_KEY` blank. Set
+`SOC_AI_HOST=127.0.0.1` and `PROXY_TRUSTED_IPS=127.0.0.1`. soc-ai then serves plain HTTP
+on `127.0.0.1:8443`. Copy the `Caddyfile` from the repository root to
+`/etc/caddy/Caddyfile`. Replace `{$SOC_AI_DOMAIN}` with the site name. Replace
+`{$SOC_AI_CADDY_TLS}` with the `tls` directive, or delete that line. Change
+`reverse_proxy soc-ai:8443` to `reverse_proxy 127.0.0.1:8443`. Then run
+`sudo systemctl reload caddy`. See [DOCKER.md](DOCKER.md), TLS paths, for the three `tls`
+choices.
+
 ---
 
 ## 5. systemd service
@@ -410,7 +420,8 @@ grant that ack and escalate silently depend on under `AUDIT_FAIL_CLOSED=true`.
 
 If you put a reverse proxy in front of soc-ai, set `PROXY_TRUSTED_IPS` to the IP
 addresses of the proxy. nginx, Caddy and Traefik are examples of such a proxy. An
-example value is `PROXY_TRUSTED_IPS=203.0.113.10`.
+example value is `PROXY_TRUSTED_IPS=203.0.113.10`. `PROXY_TRUSTED_IPS` takes addresses
+and CIDR blocks.
 
 The login throttle and the API rate limit are keyed per client IP address.
 Without this setting, the proxy's own socket IP address stands in for every

@@ -949,3 +949,14 @@ def test_hunting_doc_cli_rows_name_required_flags() -> None:
     for cmd, cell, rest in rows:
         for flag in required.get(cmd, []):
             assert flag in cell + rest, f"HUNTING.md's `soc-ai {cmd}` row omits the required {flag}"
+
+
+def test_docker_doc_describes_both_tls_paths() -> None:
+    text = DOCKER_DOC.read_text(encoding="utf-8")
+    assert "scripts/tls-proxy.sh" in text
+    assert "COMPOSE_PROFILES" in text
+    assert "SOC_AI_CADDY_TLS" in text
+    assert "PROXY_TRUSTED_IPS" in text
+    assert "docker-compose.proxy.yml" not in text
+    assert "/config/tls" in text or "TLS panel" in text
+    assert "no reverse proxy" not in text.lower()

@@ -12,7 +12,8 @@
 #
 # It installs Docker if missing, collects connection settings (validating them
 # before the build), generates the encryption key + admin password + a TLS cert,
-# writes .env, brings the stack up, seeds enrichment, and prints the URL + login.
+# writes .env, asks for an HTTPS domain (blank = self-signed on 8443), brings
+# the stack up, seeds enrichment, and prints the URL + login.
 # Re-running is safe.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -541,6 +542,7 @@ if [[ $RECFG == y ]]; then
                  LLM_ROUTE LITELLM_BASE_URL LITELLM_API_KEY LITELLM_VERIFY_SSL ANALYST_MODEL \
                  WEBUI_ALERTS_QUERY EVENTS_INDEX_PATTERN API_AUTH_REQUIRED \
                  MAXMIND_LICENSE_KEY AUTO_TRIAGE STARTER_PACK \
+                 HTTPS_DOMAIN HTTPS_CA \
                  CONFIG_SECRET_KEY BOOTSTRAP_ADMIN_PASSWORD; do
           case $k in
             SO_VERIFY_SSL|ES_VERIFY_SSL) v=$([[ $SO_TLS == y ]] && echo true || echo false) ;;
@@ -582,6 +584,45 @@ else
   ok "Generated self-signed certs/ (your browser warns once — accept it)."
 fi
 
+# ── 3b. HTTPS domain: the proxy path ─────────────────────────────────────────
+# One question. A domain puts Caddy in front of soc-ai through
+# scripts/tls-proxy.sh, which writes the proxy settings to .env and starts
+# Caddy through the compose proxy profile. Blank keeps the direct path: the
+# self-signed pair on 8443. The default is the domain a previous run wrote,
+# so a re-run keeps the proxy path.
+echo
+info "HTTPS:"
+ask HTTPS_DOMAIN "  HTTPS domain served by Caddy (blank = self-signed on 8443)" "${HTTPS_DOMAIN:-$(env_readback SOC_AI_DOMAIN)}"
+if [[ -n ${HTTPS_DOMAIN:-} ]]; then
+  # The default follows .env on a re-run: an empty SOC_AI_CADDY_TLS next to a
+  # domain means Let's Encrypt. A fresh install defaults to Caddy's own CA.
+  _ca_default=${HTTPS_CA:-}
+  if [[ -z $_ca_default && -n $(env_readback SOC_AI_DOMAIN) && -z $(env_readback SOC_AI_CADDY_TLS) ]]; then _ca_default=auto; fi
+  ask HTTPS_CA "  Certificate source: auto (Let's Encrypt) or internal (Caddy CA)" "${_ca_default:-internal}"
+  case $HTTPS_CA in
+    auto|internal) ;;
+    *) die "HTTPS_CA must be auto or internal. Got '${HTTPS_CA}'." ;;
+  esac
+fi
+
+# The direct path starts the stack here. The proxy path builds or pulls
+# first, then hands the start to scripts/tls-proxy.sh, which writes the proxy
+# settings, starts Caddy and prints the trust steps. A blank domain on a box
+# with the proxy path on turns it off, so Caddy never fronts a TLS listener.
+start_stack(){
+  if [[ -n ${HTTPS_DOMAIN:-} ]]; then
+    [[ ${1:-} == --build ]] && $DC build
+    info "The proxy path: Caddy serves https://${HTTPS_DOMAIN}/ with a certificate from ${HTTPS_CA}…"
+    scripts/tls-proxy.sh enable "$HTTPS_DOMAIN" "$HTTPS_CA"
+  elif [[ $(env_readback COMPOSE_PROFILES) == *proxy* ]]; then
+    [[ ${1:-} == --build ]] && $DC build
+    warn "The proxy path is on in .env and no HTTPS domain was given. Turning it off."
+    scripts/tls-proxy.sh disable
+  else
+    $DC up -d ${1:-}
+  fi
+}
+
 # ── 4. build + start ──────────────────────────────────────────────────────────
 hr
 if [[ $PREBUILT -eq 1 ]]; then
@@ -611,17 +652,17 @@ if [[ $PREBUILT -eq 1 ]]; then
     yesno BUILD_NOW "Build the image from source instead? (~3 min)" y
     if [[ $BUILD_NOW == y ]]; then
       info "Building and starting the stack (first build pulls deps — ~3 min)…"
-      $DC up -d --build
+      start_stack --build
     else
       info "Nothing built. When you're ready, run:  ${B}./setup.sh${N}  (no --prebuilt) to build from source."
       die "no image to run yet."
     fi
   else
-    $DC up -d
+    start_stack
   fi
 else
   info "Building and starting the stack (first build pulls deps — ~3 min)…"
-  $DC up -d --build
+  start_stack --build
 fi
 info "Waiting for the service to answer…"
 # The managed block always writes SOC_AI_PORT=8443, but a keep-existing .env
@@ -631,9 +672,16 @@ info "Waiting for the service to answer…"
 # the summary prints a URL nobody can open. The starter-pack calls and the
 # summary below use the same value.
 _port=$(env_readback SOC_AI_PORT); _port=${_port:-8443}
+# On the proxy path every call goes through Caddy on the domain, the way a
+# browser does. --resolve pins the name to this host, so DNS can lag.
+if [[ -n ${HTTPS_DOMAIN:-} ]]; then
+  _base="https://${HTTPS_DOMAIN}"; _resolve="--resolve ${HTTPS_DOMAIN}:443:127.0.0.1"
+else
+  _base="https://localhost:${_port}"; _resolve=""
+fi
 healthy=0
 for _ in $(seq 1 60); do
-  out=$(curl -fsk -m5 "https://localhost:${_port}/healthz" 2>/dev/null || true)
+  out=$(curl -fsk -m5 $_resolve "${_base}/healthz" 2>/dev/null || true)
   if [[ -n $out ]]; then ok "Up — ${out}"; healthy=1; break; fi
   sleep 3
 done
@@ -690,11 +738,11 @@ if [[ ${STARTER_PACK:-y} == y ]]; then
   # app's own origin is rejected 403 bad_origin — curl sends neither by default.
   # Send an Origin that matches this exact request's scheme+host+port (verified
   # live against the hermetic harness: the bare call 403s without this header).
-  if curl -fsk -c "$jar" -m 10 -X POST "https://localhost:${_port}/api/v1/login" \
+  if curl -fsk $_resolve -c "$jar" -m 10 -X POST "${_base}/api/v1/login" \
         -H 'Content-Type: application/json' \
         -d "{\"username\":\"admin\",\"password\":\"${_pw_json}\"}" >/dev/null 2>&1 \
-     && out=$(curl -fsk -b "$jar" -m 30 -X POST "https://localhost:${_port}/api/v1/runbooks/starter-pack" \
-        -H "Origin: https://localhost:${_port}" 2>/dev/null); then
+     && out=$(curl -fsk $_resolve -b "$jar" -m 30 -X POST "${_base}/api/v1/runbooks/starter-pack" \
+        -H "Origin: ${_base}" 2>/dev/null); then
     ok "Runbook starter pack: ${out}"
   else
     warn "Couldn't install the pack automatically (changed admin password?) —"
@@ -715,7 +763,11 @@ yesno SEED "$_seed_q" y
 hr; ipshow=$(hostname -I 2>/dev/null | awk '{print $1}'); ipshow=${ipshow:-localhost}
 echo
 ok "${B}soc-ai is running.${N}"
-echo "    Open:     ${C}https://${ipshow}:${_port}/app${N}   Accept the self-signed cert on the first visit."
+if [[ -n ${HTTPS_DOMAIN:-} ]]; then
+  echo "    Open:     ${C}https://${HTTPS_DOMAIN}/app${N}"
+else
+  echo "    Open:     ${C}https://${ipshow}:${_port}/app${N}   Accept the self-signed cert on the first visit."
+fi
 echo "    Sign in:  admin"
 if [[ $RECFG == y ]]; then
   echo "    Password: ${B}${BOOTSTRAP_ADMIN_PASSWORD}${N}    ← save this now; change it after first login"
@@ -737,6 +789,17 @@ if [[ ${AUTO_TRIAGE:-n} == y ]]; then
     echo "        Each sweep calls your cloud provider — metered spend starts now; cap or"
     echo "        disable in Config → Triage automation."
   fi
+fi
+if [[ -n ${HTTPS_DOMAIN:-} && ${HTTPS_CA:-} == internal ]]; then
+  echo "      • Trust the Caddy root certificate on each client. The file is ./caddy-root.crt."
+  echo "          Fedora, RHEL:    sudo cp caddy-root.crt /etc/pki/ca-trust/source/anchors/soc-ai-caddy.crt && sudo update-ca-trust"
+  echo "          Debian, Ubuntu:  sudo install -m644 caddy-root.crt /usr/local/share/ca-certificates/soc-ai-caddy.crt && sudo update-ca-certificates"
+  echo "          macOS:           sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain caddy-root.crt"
+  echo "          Windows:         certutil -addstore -f Root caddy-root.crt"
+  echo "        Browsers on those hosts trust it after a restart. Firefox needs its own import under Settings, Certificates."
+fi
+if [[ -n ${HTTPS_DOMAIN:-} ]]; then
+  echo "      • Go back to the direct path at any time:  scripts/tls-proxy.sh disable"
 fi
 echo "      • Back up before every upgrade:  ${DC} exec soc-ai python -m soc_ai backup --out /var/lib/soc-ai/data/backup.tar.gz"
 echo "      • Schedule the blocklist refresh (feeds go stale without it):"

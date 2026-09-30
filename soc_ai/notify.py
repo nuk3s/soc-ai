@@ -55,6 +55,7 @@ NOTIFY_KINDS: tuple[str, ...] = (
     "model_fitness_fail",
     "quality_regression",
     "audit_chain_break",
+    "tls_expiry",
     "test",
 )
 
@@ -173,6 +174,7 @@ def _trigger_enabled(settings: Any, kind: str) -> bool:
         "model_fitness_fail": "notify_on_model_fitness_fail",
         "quality_regression": "notify_on_quality_regression",
         "audit_chain_break": "notify_on_audit_chain_break",
+        "tls_expiry": "notify_on_tls_expiry",
     }.get(kind)
     if flag is None:
         return False
@@ -452,6 +454,42 @@ def event_for_audit_chain_break(
         body=body[:500],
         url="/app/config",
         severity="critical",
+    )
+
+
+def event_for_tls_expiry(
+    *, subject: str, days_left: int, band: int, settings: Any
+) -> NotifyEvent | None:
+    """The certificate soc-ai serves with is close to expiry, or expired.
+
+    Critical at 7 days and below, and once expired. Warning at 30 and 14 days.
+    The permalink is the TLS panel on the config page. It doubles as the dedup
+    entity, so the band sits in the URL and the hourly dedup keys per band.
+    The daily loop fires once per band change, so on-call hears about each
+    band once.
+    """
+    if not bool(getattr(settings, "notify_on_tls_expiry", False)):
+        return None
+    if band == 0:
+        title = f"TLS certificate expired: {subject}"
+        body = (
+            "The certificate soc-ai serves with has expired. Browsers refuse it. "
+            "Install a new certificate and restart soc-ai."
+        )
+        severity = "critical"
+    else:
+        title = f"TLS certificate expires in {days_left} days: {subject}"
+        body = (
+            f"The certificate soc-ai serves with expires in {days_left} days. "
+            "Install a new certificate and restart soc-ai."
+        )
+        severity = "critical" if band <= 7 else "warning"
+    return NotifyEvent(
+        kind="tls_expiry",
+        title=title,
+        body=body,
+        url=f"/app/config?band={band}#tls",
+        severity=severity,
     )
 
 

@@ -818,3 +818,41 @@ async def test_a_failing_health_probe_does_not_kill_the_loop() -> None:
 
     assert len(calls) >= 3, "the loop stopped after a failure"
     assert still_running
+
+
+def test_notifications_carry_a_tls_expiry_row_while_the_alarm_stands(tmp_path):
+    """The bell carries the TLS expiry alarm, read from the loop's in-memory slot."""
+
+    from fastapi.testclient import TestClient
+    from soc_ai.main import _TlsStatusSlot, create_app
+
+    settings = _settings(db_path=str(tmp_path / "tls-bell.db"))
+    fake_es = AsyncMock()
+    fake_auth = AsyncMock()
+    with (
+        patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=fake_es),
+        patch("soc_ai.main.make_auth", return_value=fake_auth),
+        patch("soc_ai.main.get_settings", return_value=settings),
+    ):
+        app = create_app()
+        with TestClient(app) as client:
+            slot = _TlsStatusSlot()
+            slot.alarm = {
+                "band": 7,
+                "days_left": 6,
+                "subject": "CN=soc-ai.example.test",
+                "since": "2026-09-29T12:00:00+00:00",
+                "fingerprint": "abc",
+            }
+            app.state._tls_status = slot
+            rows = [
+                r
+                for r in client.get("/api/v1/notifications").json()
+                if r["id"].startswith("tls-expiry:")
+            ]
+            assert rows and rows[0]["tone"] == "danger"
+            assert "6 days" in rows[0]["title"] and rows[0]["href"] == "/config#tls"
+
+            slot.alarm = None
+            after = client.get("/api/v1/notifications").json()
+            assert not [r for r in after if r["id"].startswith("tls-expiry:")]

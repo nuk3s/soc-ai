@@ -9,6 +9,10 @@ follows [Semantic Versioning](https://semver.org/) from 1.0 onward.
 
 ## Recent highlights
 
+- **1.5.2**: The TLS release. A Caddy overlay terminates TLS in front of soc-ai and renews the
+  certificate. On the direct path, soc-ai validates its certificate, shows it on the Config screen
+  and in `soc-ai doctor`, and warns 30, 14 and 7 days before it expires. `PROXY_TRUSTED_IPS`
+  accepts CIDR blocks. See the [1.5.2 release notes](../releases/1.5.2.md).
 - **1.5.1**: The review release. A review of the full repository produced 61 fixes. Each fix has
   a test that failed before the fix. The changes are in the evidence gates, the Oracle redaction,
   the egress guard, the pcap tool, the installer and the console. See the

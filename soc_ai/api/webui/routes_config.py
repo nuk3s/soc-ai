@@ -1087,6 +1087,63 @@ async def api_egress_policy(
     return EgressPolicyOut(destinations=destinations, zero_egress=zero_egress)
 
 
+class TlsStatusOut(BaseModel):
+    mode: str
+    cert_path: str | None = None
+    key_path: str | None = None
+    subject: str | None = None
+    issuer: str | None = None
+    sans: list[str] = []
+    not_before: str | None = None
+    not_after: str | None = None
+    days_left: int | None = None
+    expired: bool = False
+    expiry_band: int | None = None
+    self_signed: bool = False
+    chain_length: int = 0
+    chain_ok: bool = True
+    key_matches: bool | None = None
+    fingerprint_sha256: str | None = None
+    warnings: list[str] = []
+    errors: list[str] = []
+    loaded_at: str | None = None
+    restart_required: bool = False
+
+
+@router.get(
+    "/config/tls",
+    response_model=TlsStatusOut,
+    dependencies=[Depends(require_admin_api)],
+    tags=["config"],
+)
+async def api_tls_status(
+    request: Request, settings: Settings = Depends(get_settings_dep)
+) -> TlsStatusOut:
+    """The certificate on disk now, and whether it differs from the one loaded at start.
+
+    soc-ai reads the certificate and the key once at start. An operator who
+    swaps the files sees the new certificate here and a restart flag.
+    """
+    from soc_ai.tls_status import inspect_tls  # noqa: PLC0415 - lazy
+
+    now_status = inspect_tls(settings.soc_ai_tls_cert, settings.soc_ai_tls_key)
+    at_start = getattr(request.app.state, "tls_at_start", None)
+    loaded_fp = getattr(at_start, "fingerprint_sha256", None)
+    restart = bool(
+        now_status.mode == "direct"
+        and now_status.fingerprint_sha256
+        and loaded_fp
+        and now_status.fingerprint_sha256 != loaded_fp
+    )
+    return TlsStatusOut.model_validate(
+        {
+            **now_status.as_dict(),
+            "loaded_at": getattr(request.app.state, "tls_loaded_at", None),
+            "restart_required": restart,
+        }
+    )
+
+
 # ── Runbook retrieval (RAG) admin: re-embed (E4.1) ─────────────────────────
 # The semantic tier embeds runbooks at write time (fail-soft), so vectors go
 # MISSING when the gateway was down during a save, and STALE when the operator

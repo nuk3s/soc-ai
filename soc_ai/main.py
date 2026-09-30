@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import re
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -28,7 +30,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse, RedirectResponse, Response
 from starlette.types import Scope
 
-from soc_ai import __version__
+from soc_ai import __version__, notify
 from soc_ai.agent.orchestrator import build_local_enrichment_context
 from soc_ai.api.routes import router
 from soc_ai.api.webui_api import open_router as api_v1_open_router
@@ -882,6 +884,123 @@ async def _raise_audit_chain_alarm(
         await notify.fire_safe(event, settings, audit)
 
 
+@dataclass
+class _TlsStatusSlot:
+    """The standing TLS expiry alarm. In memory, like the audit-chain alarm."""
+
+    last_check: str | None = None
+    alarm: dict[str, Any] | None = None
+
+
+def _get_tls_status(state: Any) -> _TlsStatusSlot:
+    slot = getattr(state, "_tls_status", None)
+    if not isinstance(slot, _TlsStatusSlot):
+        slot = _TlsStatusSlot()
+        state._tls_status = slot
+    return slot
+
+
+def _utcnow_for_tls() -> datetime:
+    return datetime.now(UTC)
+
+
+_TLS_STATE_FILE = "tls-expiry-state.json"
+"""The last TLS expiry webhook, as (fingerprint, band). A restart must not repeat it."""
+
+
+def _tls_state_path(settings: Any) -> Path | None:
+    data_dir = getattr(settings, "soc_ai_data_dir", None)
+    return Path(data_dir) / _TLS_STATE_FILE if data_dir else None
+
+
+def _tls_last_notified(settings: Any) -> tuple[str, int] | None:
+    """The (fingerprint, band) pair of the last webhook. None when nothing fired yet."""
+    path = _tls_state_path(settings)
+    if path is None:
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return str(data["fingerprint"]), int(data["band"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _tls_remember_notified(settings: Any, fingerprint: str, band: int) -> None:
+    path = _tls_state_path(settings)
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"fingerprint": fingerprint, "band": band}), encoding="utf-8")
+    except OSError:
+        _LOGGER.warning("Cannot write %s. A restart may repeat the TLS expiry webhook.", path)
+
+
+async def _tls_expiry_check(app: Any, settings: Any) -> None:
+    """One check of the certificate soc-ai serves. Fires once per band.
+
+    The served certificate is ``app.state.tls_at_start``. soc-ai loads the
+    files once, so a swap on disk changes nothing until a restart. The alarm
+    is keyed by the served fingerprint and the band. It notes whether the
+    disk differs, and only a restart with a new certificate clears it.
+    """
+    from soc_ai.tls_status import TlsStatus, days_left_at, expiry_band, inspect_tls  # noqa: PLC0415
+
+    slot = _get_tls_status(app.state)
+    now = _utcnow_for_tls()
+    cert_path = getattr(settings, "soc_ai_tls_cert", None)
+    key_path = getattr(settings, "soc_ai_tls_key", None)
+    served = getattr(app.state, "tls_at_start", None)
+    if not isinstance(served, TlsStatus):
+        served = inspect_tls(cert_path, key_path, now=now)
+        app.state.tls_at_start = served
+    on_disk = inspect_tls(cert_path, key_path, now=now)
+    slot.last_check = now.isoformat()
+    fingerprint = served.fingerprint_sha256
+    if served.mode == "off" or not served.not_after or not fingerprint:
+        slot.alarm = None
+        return
+    days_left = days_left_at(served.not_after, now)
+    band = expiry_band(days_left)
+    if band is None:
+        slot.alarm = None
+        return
+    previous = slot.alarm or {}
+    same = previous.get("band") == band and previous.get("fingerprint") == fingerprint
+    slot.alarm = {
+        "band": band,
+        "days_left": days_left,
+        "subject": served.subject or "",
+        "since": previous.get("since") if same else now.isoformat(),
+        "fingerprint": fingerprint,
+        "disk_differs": on_disk.fingerprint_sha256 != fingerprint,
+    }
+    if same or _tls_last_notified(settings) == (fingerprint, band):
+        return
+    event = notify.event_for_tls_expiry(
+        subject=served.subject or "",
+        days_left=days_left,
+        band=band,
+        settings=settings,
+    )
+    if event is not None:
+        await notify.fire_safe(event, settings)
+        _tls_remember_notified(settings, fingerprint, band)
+
+
+async def _tls_expiry_loop(app: Any, settings: Any) -> None:
+    """Check once at start, then once a day."""
+    wake_seconds = 3600
+    while True:
+        try:
+            slot = _get_tls_status(app.state)
+            if _discovery_due(slot.last_check, 24):
+                await _tls_expiry_check(app, settings)
+        except Exception:
+            _LOGGER.exception("tls expiry check failed")
+        await asyncio.sleep(wake_seconds)
+
+
 async def _discovery_scheduler_loop(app: FastAPI, settings: Any) -> None:
     """Periodically run the internal-identifier discovery scan when scheduled.
 
@@ -1572,6 +1691,29 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: PLR0915 — li
         settings.so_host,
     )
 
+    from soc_ai.tls_status import TlsStatus, describe, inspect_tls  # noqa: PLC0415 - lazy
+
+    try:
+        tls_at_start = inspect_tls(settings.soc_ai_tls_cert, settings.soc_ai_tls_key)
+    except Exception as exc:  # a surprise in the inspector must not stop the start
+        _LOGGER.exception("The TLS inspection failed at start. soc-ai starts anyway.")
+        tls_at_start = TlsStatus(mode="direct", errors=[f"Cannot inspect the certificate: {exc}."])
+    app.state.tls_at_start = tls_at_start
+    app.state.tls_loaded_at = datetime.now(UTC).isoformat()
+    # A self-signed certificate alone is the stock install. It reads at INFO
+    # here and in the doctor. An expiry band or a broken chain reads at WARNING.
+    serious = [
+        w for w in tls_at_start.warnings if not w.startswith("The certificate is self-signed")
+    ]
+    if tls_at_start.errors:
+        _LOGGER.error(
+            "TLS: %s soc-ai starts anyway. Fix the files and restart.", describe(tls_at_start)
+        )
+    elif serious:
+        _LOGGER.warning("TLS: %s %s", describe(tls_at_start), " ".join(tls_at_start.warnings))
+    else:
+        _LOGGER.info("TLS: %s %s", describe(tls_at_start), " ".join(tls_at_start.warnings))
+
     # Loud warning when API auth is disabled — with auth off, require_admin_api is
     # a no-op, so secret mutation, user creation, and token minting are open to any
     # caller that can reach the port. Acceptable for loopback-only dev; a real risk
@@ -1646,6 +1788,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: PLR0915 — li
     spec_sweep_task = asyncio.create_task(_hunt_spec_sweep_loop(app))
     prior_sweep_task = asyncio.create_task(_prior_sweep_loop(app))
     audit_verify_task = asyncio.create_task(_audit_verify_loop(app, settings))
+    tls_expiry_task = asyncio.create_task(_tls_expiry_loop(app, settings))
     health_probe_task = asyncio.create_task(_health_probe_loop(app, settings))
 
     try:
@@ -1685,6 +1828,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: PLR0915 — li
         audit_verify_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await audit_verify_task
+        tls_expiry_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await tls_expiry_task
         # An in-flight quality-eval worker (scheduled or run-now) holds its own
         # engine/ES clients — cancel + drain like the discovery worker below.
         from soc_ai.api.webui_api import _get_quality_eval_status  # noqa: PLC0415
@@ -1979,6 +2125,8 @@ def create_app() -> FastAPI:  # noqa: PLR0915 - app factory wires many middlewar
     except Exception:
         _csp = ""
 
+    from soc_ai.api.webui_api import _request_is_https  # noqa: PLC0415
+
     @app.middleware("http")
     async def _security_headers(request: Any, call_next: Any) -> Response:
         """Set conservative security response headers on every response.
@@ -2001,10 +2149,12 @@ def create_app() -> FastAPI:  # noqa: PLR0915 - app factory wires many middlewar
             response.headers.setdefault("Content-Security-Policy", _csp)
         # Emit HSTS when the browser reached us over HTTPS — directly, or via a
         # TLS-terminating reverse proxy that forwards plain HTTP with
-        # X-Forwarded-Proto: https. Mirrors _request_is_https (webui_api) so a
-        # proxy-fronted HTTPS deployment doesn't silently lose HSTS.
-        _fwd_proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
-        if request.url.scheme == "https" or _fwd_proto == "https":
+        # X-Forwarded-Proto: https. The same trust rule as the Secure cookie
+        # flag decides: the forwarded header counts only from a peer in
+        # proxy_trusted_ips, so an untrusted client cannot switch HSTS on.
+        # The resolved settings sit on app.state (set at startup); the helper
+        # tolerates a missing state.
+        if _request_is_https(request, getattr(request.app.state, "settings", None)):
             response.headers.setdefault(
                 "Strict-Transport-Security", "max-age=63072000; includeSubDomains"
             )

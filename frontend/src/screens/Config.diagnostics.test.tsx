@@ -39,6 +39,7 @@ import { ErrorBoundary } from '../components/ErrorBoundary';
 vi.mock('./AgentToolsPanel', () => ({ AgentToolsPanel: () => null }));
 vi.mock('./ApiKeysPanel', () => ({ ApiKeysPanel: () => null }));
 vi.mock('./DataSourcesPanel', () => ({ DataSourcesPanel: () => null }));
+vi.mock('./TlsPanel', () => ({ TlsPanel: () => null }));
 vi.mock('./EgressPolicyPanel', () => ({ EgressPolicyPanel: () => null }));
 vi.mock('./NotificationsPanel', () => ({ NotificationsPanel: () => null }));
 vi.mock('./RedactionPreviewPanel', () => ({ RedactionPreviewPanel: () => null }));

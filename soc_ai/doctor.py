@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
 import socket
 import ssl
 from collections.abc import Awaitable
@@ -1388,6 +1389,107 @@ _BLOCKLIST_FEED_FILES: dict[str, str] = {
 _ABUSE_CH_FEEDS = frozenset({"urlhaus", "threatfox", "feodo"})
 
 
+_RESTART_AFTER_SWAP = "soc-ai loads the files at start. After a swap, restart soc-ai."
+
+
+def _open_proxy_blocks(proxies: list[str]) -> list[str]:
+    """The entries in ``proxy_trusted_ips`` that trust every address: a /0 block."""
+    found: list[str] = []
+    for entry in proxies:
+        text = str(entry).strip()
+        if "/" not in text:
+            continue
+        try:
+            network = ipaddress.ip_network(text, strict=False)
+        except ValueError:
+            continue
+        if network.prefixlen == 0:
+            found.append(text)
+    return found
+
+
+def check_tls(settings: Settings, *, now: datetime | None = None) -> list[CheckResult]:
+    """The certificate soc-ai serves with, or the reason it serves plain HTTP."""
+    proxies = [str(p) for p in (getattr(settings, "proxy_trusted_ips", None) or [])]
+    rows = [_tls_mode_row(settings, proxies, now=now)]
+    if _open_proxy_blocks(proxies):
+        rows.append(
+            CheckResult(
+                "tls",
+                "WARN",
+                "PROXY_TRUSTED_IPS trusts every address. "
+                "Any client can forge the forwarded headers.",
+                hint=(
+                    "List the proxy address or the Docker address pool, for example "
+                    "172.16.0.0/12. Do not list 0.0.0.0/0 or ::/0."
+                ),
+            )
+        )
+    return rows
+
+
+def _tls_mode_row(settings: Settings, proxies: list[str], *, now: datetime | None) -> CheckResult:
+    """The one row that states the TLS mode and the state of the served certificate."""
+    from soc_ai.tls_status import describe, inspect_tls  # noqa: PLC0415 - lazy
+
+    status = inspect_tls(settings.soc_ai_tls_cert, settings.soc_ai_tls_key, now=now)
+    if status.mode == "off":
+        host = str(getattr(settings, "soc_ai_host", "127.0.0.1"))
+        if proxies:
+            return CheckResult(
+                "tls",
+                "INFO",
+                "TLS terminates at the proxy. soc-ai serves plain HTTP and trusts "
+                f"forwarded headers from {', '.join(proxies)}. "
+                "Confirm SOC_AI_BIND=127.0.0.1 so port 8443 stays on the host loopback.",
+            )
+        if host in {"127.0.0.1", "::1", "localhost"}:
+            return CheckResult("tls", "INFO", "TLS is off. soc-ai serves plain HTTP on loopback.")
+        return CheckResult(
+            "tls",
+            "WARN",
+            f"TLS is off. soc-ai serves plain HTTP on {host}, and no proxy is trusted.",
+            hint=(
+                "Set SOC_AI_TLS_CERT and SOC_AI_TLS_KEY for the direct path. Behind a proxy, "
+                "set PROXY_TRUSTED_IPS to the proxy address. See docs/DOCKER.md, TLS."
+            ),
+        )
+    detail = describe(status)
+    if status.errors:
+        return CheckResult(
+            "tls",
+            "FAIL",
+            detail,
+            hint=(
+                "Install a valid certificate and key at the configured paths. "
+                f"{_RESTART_AFTER_SWAP}"
+            ),
+        )
+    proxy_hint = (
+        "For a browser-trusted certificate with automatic renewal, use the proxy path: "
+        "scripts/tls-proxy.sh enable <domain>. See docs/DOCKER.md, TLS."
+    )
+    # describe() already states the expiry. Repeat only the other warnings.
+    extra = [w for w in status.warnings if not w.startswith("The certificate expires in")]
+    only_self_signed = status.self_signed and status.expiry_band is None and status.chain_ok
+    if only_self_signed:
+        return CheckResult(
+            "tls",
+            "INFO",
+            f"{detail} {' '.join(extra)} The proxy path gives a trusted certificate.",
+            hint=proxy_hint,
+        )
+    if status.warnings:
+        return CheckResult(
+            "tls",
+            "WARN",
+            " ".join([detail, *extra]),
+            hint=f"{proxy_hint} {_RESTART_AFTER_SWAP}",
+        )
+    sans = ", ".join(status.sans) if status.sans else "no SAN"
+    return CheckResult("tls", "PASS", f"{detail} Names: {sans}. Chain of {status.chain_length}.")
+
+
 def _blocklist_hint(settings: Settings, missing: list[str], stale: list[str]) -> str:
     """What would actually clear this warning, in THIS configuration.
 
@@ -1646,6 +1748,7 @@ async def run_doctor(
     for batch in batches:
         results.extend(batch)
     results.extend(check_egress_posture(settings))
+    results.extend(check_tls(settings))
     results.extend(check_blocklists(settings))
     results.extend(check_prompt_assets())
     return results

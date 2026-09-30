@@ -238,6 +238,42 @@ def _audit_chain_notifications(request: Request) -> list[NotificationOut]:
     ]
 
 
+def _tls_notifications(request: Request) -> list[NotificationOut]:
+    """A standing bell row while the certificate is inside an expiry band.
+
+    Read from the daily loop's in-memory slot (see
+    :func:`soc_ai.main._tls_expiry_loop`), so a 15-second poll never reads the
+    certificate files. The id carries the fingerprint and the band, so a
+    dismissal holds for one band of one certificate and the next band arrives
+    undismissed. The loop clears the slot when the certificate changes.
+    """
+    alarm = getattr(getattr(request.app.state, "_tls_status", None), "alarm", None)
+    if not isinstance(alarm, dict):
+        return []
+    band = int(alarm.get("band") or 0)
+    days = int(alarm.get("days_left") or 0)
+    subject = str(alarm.get("subject") or "the certificate")
+    since = str(alarm.get("since") or "")
+    if band == 0:
+        title = f"TLS certificate expired: {subject}. Install a new certificate and restart soc-ai."
+        tone = "danger"
+    else:
+        title = (
+            f"TLS certificate expires in {days} days: {subject}. "
+            "Install a new certificate and restart soc-ai."
+        )
+        tone = "danger" if band <= 7 else "warn"
+    return [
+        NotificationOut(
+            id=f"tls-expiry:{alarm.get('fingerprint')}:{band}",
+            tone=tone,
+            title=title,
+            when=_ago(since) if since else "just now",
+            href="/config#tls",
+        )
+    ]
+
+
 async def _dossier_conflict_notifications(request: Request) -> list[NotificationOut]:
     """Bell entries for host-dossier prods the sweep has actually fired.
 
@@ -530,6 +566,7 @@ async def list_notifications(request: Request) -> list[NotificationOut]:
             )
         )
     out.extend(_audit_chain_notifications(request))
+    out.extend(_tls_notifications(request))
     out.extend(await _quality_alarm_notifications(request))
     out.extend(await _dossier_conflict_notifications(request))
     out.extend(await _shadow_hit_notifications(request))

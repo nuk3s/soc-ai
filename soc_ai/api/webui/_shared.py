@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 from datetime import UTC, datetime
 from typing import Any
@@ -23,6 +24,36 @@ router = APIRouter(dependencies=[Depends(require_api_auth), Depends(require_csrf
 open_router = APIRouter()
 
 
+def peer_is_trusted_proxy(peer: str, settings: Any) -> bool:
+    """Whether *peer* is a proxy whose forwarded headers soc-ai trusts.
+
+    ``proxy_trusted_ips`` holds addresses and CIDR blocks. A proxy in a
+    container has no fixed address, so the operator lists the Docker
+    address pool. An entry that is not an address or a block trusts nothing.
+    """
+    entries = list(getattr(settings, "proxy_trusted_ips", None) or ())
+    if not entries:
+        return False
+    try:
+        address: ipaddress.IPv4Address | ipaddress.IPv6Address = ipaddress.ip_address(peer)
+    except ValueError:
+        return False
+    # A dual-stack listener reports a v4 peer as ::ffff:a.b.c.d. Match the v4 form.
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    for entry in entries:
+        text = str(entry).strip()
+        try:
+            if "/" in text:
+                if address in ipaddress.ip_network(text, strict=False):
+                    return True
+            elif address == ipaddress.ip_address(text):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
 def _request_is_https(request: Request, settings: Any = None) -> bool:
     """True when the client connection is HTTPS, honoring a TLS-terminating proxy.
 
@@ -42,9 +73,8 @@ def _request_is_https(request: Request, settings: Any = None) -> bool:
     """
     if request.url.scheme == "https":
         return True
-    trusted = set(getattr(settings, "proxy_trusted_ips", None) or ())
     peer = request.client.host if request.client else "?"
-    if peer not in trusted:
+    if not peer_is_trusted_proxy(peer, settings):
         return False
     forwarded = request.headers.get("x-forwarded-proto", "")
     # Take the LEFT-most entry. Unlike X-Forwarded-For — where the left-most hop is
@@ -66,8 +96,7 @@ def client_ip(request: Request, settings: Any) -> str:
     client could otherwise forge it and evade (or poison) the throttles.
     """
     peer = request.client.host if request.client else "?"
-    trusted = set(getattr(settings, "proxy_trusted_ips", None) or ())
-    if peer in trusted:
+    if peer_is_trusted_proxy(peer, settings):
         # Append-style reverse proxies (nginx ``$proxy_add_x_forwarded_for``,
         # Caddy, Traefik, HAProxy) put the REAL peer at the RIGHT and leave the
         # left-most entries fully client-forgeable. Walk right-to-left, skipping
@@ -76,7 +105,7 @@ def client_ip(request: Request, settings: Any) -> str:
         # left-most) would let a client forge its own throttling key.
         for hop in reversed(request.headers.get("x-forwarded-for", "").split(",")):
             candidate = hop.strip()
-            if candidate and candidate not in trusted:
+            if candidate and not peer_is_trusted_proxy(candidate, settings):
                 return candidate
     return peer
 

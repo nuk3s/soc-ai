@@ -10,7 +10,8 @@ User=soc-ai
 Group=soc-ai
 WorkingDirectory=/opt/soc-ai
 EnvironmentFile=/opt/soc-ai/.env
-ExecStart=/opt/soc-ai/.venv/bin/uvicorn soc_ai.main:app --host 0.0.0.0 --port 8443 --ssl-certfile /etc/soc-ai/cert.pem --ssl-keyfile /etc/soc-ai/key.pem
+# soc-ai applies its own forwarded-header trust rule (PROXY_TRUSTED_IPS).
+ExecStart=/opt/soc-ai/.venv/bin/uvicorn soc_ai.main:app --host 0.0.0.0 --port 8443 --ssl-certfile /etc/soc-ai/cert.pem --ssl-keyfile /etc/soc-ai/key.pem --no-proxy-headers --ssl-ciphers 'ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM'
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal

@@ -261,6 +261,8 @@ def _serve(_args: argparse.Namespace) -> int:
         ssl_keyfile=str(settings.soc_ai_tls_key) if settings.soc_ai_tls_key else None,
         # AEAD ciphers only — no CBC/SHA-1. OpenSSL 3.x already floors at TLS 1.2.
         ssl_ciphers="ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM",
+        # soc-ai applies its own forwarded-header trust rule (PROXY_TRUSTED_IPS).
+        proxy_headers=False,
     )
     return 0
 

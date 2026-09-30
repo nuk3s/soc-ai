@@ -478,3 +478,24 @@ def test_notify_test_route_is_admin_gated() -> None:
         resp = c.post("/api/v1/config/notify/test")
         assert resp.status_code in (401, 403)
         break
+
+
+def test_tls_expiry_event_respects_its_toggle() -> None:
+    from soc_ai.notify import event_for_tls_expiry
+
+    on = SimpleNamespace(notify_on_tls_expiry=True)
+    ev = event_for_tls_expiry(subject="CN=soc-ai.example.test", days_left=6, band=7, settings=on)
+    assert ev is not None and ev.kind == "tls_expiry"
+    assert ev.severity == "critical" and "6 days" in ev.body
+    assert ev.url == "/app/config?band=7#tls"
+    expired = event_for_tls_expiry(
+        subject="CN=soc-ai.example.test", days_left=-1, band=0, settings=on
+    )
+    assert expired is not None and expired.severity == "critical" and "expired" in expired.title
+    soft = event_for_tls_expiry(
+        subject="CN=soc-ai.example.test", days_left=20, band=30, settings=on
+    )
+    assert soft is not None and soft.severity == "warning"
+    assert soft.url == "/app/config?band=30#tls"
+    off = SimpleNamespace(notify_on_tls_expiry=False)
+    assert event_for_tls_expiry(subject="x", days_left=6, band=7, settings=off) is None

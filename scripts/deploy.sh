@@ -14,6 +14,7 @@
 #                                 anchor keeps an unanchored 'data/' from matching it.
 #   .ssh/                         so_pcap SSH key source
 #   certs/                        TLS cert/key + the mounted so_pcap key (compose mounts ./certs)
+#   caddy-root.crt                the Caddy CA root that scripts/tls-proxy.sh exports on the VM
 #   docker-compose.override.yml   box-local mounts (e.g. the PCAP key)
 #
 # node_modules/ is excluded (huge); frontend/dist/ IS synced and baked into the image.
@@ -31,7 +32,7 @@ rsync -az --delete \
   --exclude='.env' --exclude='.env.*' \
   --exclude='/data/' \
   --exclude='.ssh/' \
-  --exclude='certs/' \
+  --exclude='certs/' --exclude='caddy-root.crt' \
   --exclude='docker-compose.override.yml' \
   --exclude='.venv/' --exclude='evals/' \
   --exclude='node_modules/' --exclude='.git/' \
@@ -45,6 +46,6 @@ rsync -az --delete \
 # `for … break` loop always exits 0, so a container that crash-loops would be
 # reported as a successful deploy. Track success explicitly and exit non-zero.
 ssh "${TARGET}" "cd ${DEST} && sudo docker compose up -d --build && \
-  ok=0; for i in \$(seq 1 20); do if curl -ksf https://127.0.0.1:8443/healthz >/dev/null; then ok=1; break; fi; sleep 3; done; \
+  ok=0; for i in \$(seq 1 20); do if curl -ksf https://127.0.0.1:8443/healthz >/dev/null || curl -sf http://127.0.0.1:8443/healthz >/dev/null; then ok=1; break; fi; sleep 3; done; \
   if [ \"\$ok\" != 1 ]; then echo 'DEPLOY HEALTHCHECK FAILED: app did not answer /healthz after ~60s' >&2; exit 1; fi; \
   echo 'healthy'"

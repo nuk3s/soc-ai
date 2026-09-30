@@ -198,21 +198,24 @@ EXPOSE 8443
 # or `docker compose exec soc-ai python -m soc_ai doctor`; the response body
 # says so too, so it reads correctly in `docker inspect`'s health log.
 #
-# /healthz is served over HTTPS with a self-signed cert; -k skips verify.
+# /healthz answers over HTTPS on the direct path and over HTTP on the proxy
+# path. The check tries HTTPS first, with -k to skip verify, then HTTP.
 # Interval is generous (30s) so a slow cold-start (DB migration + bootstrap)
 # doesn't flip the container unhealthy before the server is ready.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -fsk https://127.0.0.1:8443/healthz || exit 1
+    CMD curl -fsk https://127.0.0.1:8443/healthz || curl -fs http://127.0.0.1:8443/healthz || exit 1
 
 # ── Default command ───────────────────────────────────────────────────────────
 # Invoked as `python -m uvicorn`, NOT the `uvicorn` console script: the venv is
 # built at /build/.venv (Stage 1) and copied to /opt/soc-ai/.venv, so the
 # script's baked-in shebang (#!/build/.venv/bin/python) is dead — but the venv
 # python + the uvicorn module are both fine. Cert/key paths come from ENV above.
+# soc-ai applies its own forwarded-header trust rule (PROXY_TRUSTED_IPS).
 CMD ["sh", "-c", \
      "exec python -m uvicorn soc_ai.main:app \
         --host 0.0.0.0 \
         --port 8443 \
+        --no-proxy-headers \
         --ssl-certfile \"${SOC_AI_TLS_CERT}\" \
         --ssl-keyfile \"${SOC_AI_TLS_KEY}\" \
         --ssl-ciphers 'ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM'"]

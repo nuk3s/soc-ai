@@ -51,6 +51,7 @@ export const PANELS: PanelDef[] = [
   { id: 'users', label: 'Users', parent: 'System' },
   { id: 'api-tokens', label: 'API tokens', parent: 'System' },
   { id: 'maintenance', label: 'Scheduled maintenance', parent: 'System' },
+  { id: 'tls', label: 'TLS', parent: 'System' },
   { id: 'diagnostics', label: 'Diagnostics', parent: 'System' },
   { id: 'danger-zone', label: 'Danger Zone', parent: 'System' },
 ];

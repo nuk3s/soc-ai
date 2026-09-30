@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/license-Apache%202.0-4b8bf5" alt="Apache 2.0">
   <img src="https://img.shields.io/badge/python-3.12-4b8bf5" alt="Python 3.12">
   <img src="https://img.shields.io/badge/Security%20Onion-3.0-3fb950" alt="Security Onion 3.0">
-  <img src="https://img.shields.io/badge/status-1.5.1-3fb950" alt="1.5.1">
+  <img src="https://img.shields.io/badge/status-1.5.2-3fb950" alt="1.5.2">
   <a href="https://soc-ai-demo.onrender.com/"><img src="https://img.shields.io/badge/live%20demo-online-3fb950" alt="Live demo"></a>
 </p>
 
@@ -45,6 +45,8 @@ An optional cloud Oracle gives a second opinion on a hard alert. The Oracle is o
 Read the [1.5.0 release notes](docs/releases/1.5.0.md) and the [hunting guide](docs/HUNTING.md).
 
 1.5.1 is a review release. A review of the full repository produced 61 fixes. Each fix has a test that failed before the fix. Read the [1.5.1 release notes](docs/releases/1.5.1.md).
+
+1.5.2 is the TLS release. One command, `scripts/tls-proxy.sh enable <domain>`, puts Caddy in front of soc-ai. Caddy terminates TLS and renews the certificate. On the direct path, soc-ai validates its certificate, shows it on the Config screen and in `soc-ai doctor`, and warns before it expires. Read the [1.5.2 release notes](docs/releases/1.5.2.md).
 
 ## The web console
 
@@ -214,9 +216,10 @@ the same docs as the list below, with search and a dark mode. Build it on your h
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): how the parts work together.
 - [docs/OQL_PRIMER.md](docs/OQL_PRIMER.md): the query language that the agent searches with.
 - [docs/SAFETY_MODEL.md](docs/SAFETY_MODEL.md): the write-action flow, the audit schema, and redaction for the Oracle and for a cloud analyst model.
-- [docs/DOCKER.md](docs/DOCKER.md) · [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md): how to install soc-ai.
+- [docs/DOCKER.md](docs/DOCKER.md) · [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md): how to install soc-ai, and the two TLS paths.
 - [docs/LESSER_MODELS.md](docs/LESSER_MODELS.md): how to start a backend, and how to qualify a small or slow model with `model-probe`.
 - [docs/ROADMAP.md](docs/ROADMAP.md): the state of the project and the plan for it.
+- [docs/releases/1.5.2.md](docs/releases/1.5.2.md): the 1.5.2 release notes, the TLS release.
 - [docs/releases/1.5.1.md](docs/releases/1.5.1.md): the 1.5.1 release notes, the review release.
 - [docs/releases/1.5.0.md](docs/releases/1.5.0.md): the 1.5.0 release notes, with the measured numbers and the upgrade steps.
 - [CHANGELOG.md](CHANGELOG.md) · [CONTRIBUTING.md](CONTRIBUTING.md) · [SECURITY.md](.github/SECURITY.md)

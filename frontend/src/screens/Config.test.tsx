@@ -17,6 +17,7 @@ vi.mock('./AgentToolsPanel', () => ({ AgentToolsPanel: () => null }));
 // position relative to the server-driven settings groups around them.
 vi.mock('./ApiKeysPanel', () => ({ ApiKeysPanel: () => <div data-testid="panel-api-keys" /> }));
 vi.mock('./DataSourcesPanel', () => ({ DataSourcesPanel: () => null }));
+vi.mock('./TlsPanel', () => ({ TlsPanel: () => null }));
 vi.mock('./EgressPolicyPanel', () => ({ EgressPolicyPanel: () => null }));
 vi.mock('./NotificationsPanel', () => ({ NotificationsPanel: () => null }));
 vi.mock('./RedactionPreviewPanel', () => ({ RedactionPreviewPanel: () => null }));

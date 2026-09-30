@@ -26,7 +26,7 @@ SAME_ORIGIN = "http://testserver"
 CROSS_ORIGIN = "https://evil.example.com"
 
 
-def _client(settings: Settings) -> Iterator[TestClient]:
+def _client(settings: Settings, *, peer: str = "testclient") -> Iterator[TestClient]:
     fake_es = AsyncMock()
     fake_auth = AsyncMock()
     with (
@@ -35,7 +35,7 @@ def _client(settings: Settings) -> Iterator[TestClient]:
         patch("soc_ai.main.get_settings", return_value=settings),
     ):
         app = create_app()
-        with TestClient(app) as client:
+        with TestClient(app, client=(peer, 50000)) as client:
             yield client
 
 
@@ -231,8 +231,8 @@ def test_login_lockout_survives_ipv6_address_rotation(auth_settings: Settings) -
     """Five failed logins for one username from five addresses inside the same
     IPv6 /64 still trip the per-(ip, username) throttle: one host owns the whole
     /64, so rotating the interface identifier is not a new source."""
-    settings = auth_settings.model_copy(update={"proxy_trusted_ips": ["testclient"]})
-    for client in _client(settings):
+    settings = auth_settings.model_copy(update={"proxy_trusted_ips": ["192.0.2.1"]})
+    for client in _client(settings, peer="192.0.2.1"):
         for i in range(1, 6):
             r = client.post(
                 "/api/v1/login",

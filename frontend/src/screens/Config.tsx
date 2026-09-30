@@ -10,6 +10,7 @@ import { DemoDisabledState, ErrorState, LoadingState, Spinner } from '../compone
 import { AgentToolsPanel } from './AgentToolsPanel';
 import { ApiKeysPanel } from './ApiKeysPanel';
 import { DataSourcesPanel } from './DataSourcesPanel';
+import { TlsPanel } from './TlsPanel';
 import { EgressPolicyPanel } from './EgressPolicyPanel';
 import { NotificationsPanel } from './NotificationsPanel';
 import { RedactionPreviewPanel } from './RedactionPreviewPanel';
@@ -2427,6 +2428,7 @@ export function Config() {
         onToggleCollapse={() => toggleSection('Scheduled maintenance')}
       />
     ),
+    tls: <TlsPanel collapsed={!!collapsed['TLS']} onToggleCollapse={() => toggleSection('TLS')} />,
     diagnostics: diagnosticsSection,
     'danger-zone': dangerZoneSection,
   };

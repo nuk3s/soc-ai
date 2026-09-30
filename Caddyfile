@@ -1,0 +1,16 @@
+# The soc-ai site. SOC_AI_DOMAIN names it. SOC_AI_CADDY_TLS holds the tls
+# directive, or stays empty for automatic HTTPS. See the caddy service in
+# docker-compose.yml and scripts/tls-proxy.sh.
+{$SOC_AI_DOMAIN} {
+	{$SOC_AI_CADDY_TLS}
+	encode zstd gzip
+	# soc-ai sets Strict-Transport-Security, X-Content-Type-Options and
+	# Referrer-Policy itself. Caddy does not set them a second time.
+
+	# soc-ai serves plain HTTP on the compose network. Caddy sets
+	# X-Forwarded-For and X-Forwarded-Proto; soc-ai trusts them from
+	# PROXY_TRUSTED_IPS.
+	reverse_proxy soc-ai:8443 {
+		flush_interval -1
+	}
+}

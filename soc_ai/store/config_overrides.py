@@ -1704,6 +1704,18 @@ WHITELIST: tuple[SettingSpec, ...] = (
         ),
     ),
     SettingSpec(
+        key="notify_on_tls_expiry",
+        attr="notify_on_tls_expiry",
+        type="bool",
+        label="Notify before the TLS certificate expires",
+        section="Notifications",
+        hot=True,
+        help=(
+            "soc-ai notifies at 30, 14 and 7 days before the certificate it serves with "
+            "expires, and when it has expired. The bell reports it whatever this setting is."
+        ),
+    ),
+    SettingSpec(
         key="notify_webhook_url",
         attr="notify_webhook_url",
         type="str",

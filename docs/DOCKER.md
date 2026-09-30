@@ -67,10 +67,97 @@ a secret field such as a password or an API key in the UI.
 
 ---
 
-### 2. Generate a TLS cert pair
+### 2. TLS paths
 
-uvicorn terminates TLS directly, so you need no reverse proxy. Create a `certs/` directory
-in the repo root. Generate a self-signed certificate there, or copy in your CA-signed pair:
+soc-ai has two TLS paths.
+
+The proxy path is the production path. Caddy terminates TLS in front of soc-ai and renews
+the certificate on its own. soc-ai serves plain HTTP inside the compose network. Use this
+path for a public name, for Caddy's own CA in a lab, or for a certificate from your own CA.
+One command, `scripts/tls-proxy.sh enable <domain>`, sets it up.
+
+The direct path is the default after `setup.sh`. uvicorn terminates TLS with a certificate
+file and a key file. Use it for a lab, or when a proxy is not an option. soc-ai validates
+the files at start. The Config screen, under TLS, and `soc-ai doctor` report them. soc-ai
+warns 30, 14 and 7 days before expiry.
+
+#### The proxy path: Caddy in front of soc-ai
+
+One command sets it up. It takes the domain and, as an option, the certificate source:
+
+```bash
+scripts/tls-proxy.sh enable soc-ai.example.com                    # Let's Encrypt, the default
+scripts/tls-proxy.sh enable soc-ai.example.com internal           # Caddy's own CA
+scripts/tls-proxy.sh enable soc-ai.example.com cert.pem key.pem   # your own certificate and key
+```
+
+- `auto`, the default: automatic HTTPS from Let's Encrypt. The name must resolve to this
+  host on the public internet. Ports 80 and 443 must be reachable from the internet.
+- `internal`: a certificate from Caddy's own CA. The script exports the root as
+  `./caddy-root.crt` and prints the trust steps.
+- `<cert.pem> <key.pem>`: a certificate from your own CA. The certificate file holds the
+  full chain: the leaf first, then each issuer. The script copies the two files into
+  `./certs/` as `proxy-cert.pem` and `proxy-key.pem`. To install a renewed pair, run the same
+  command with the new files. The script copies them and reloads Caddy.
+
+The script backs up `.env` to `.env.bak-<stamp>` and then changes these settings:
+
+- `SOC_AI_TLS_CERT` and `SOC_AI_TLS_KEY` become blank. soc-ai serves plain HTTP inside the
+  compose network.
+- `SOC_AI_BIND=127.0.0.1`. Port 8443 stays on the host loopback.
+- `SOC_AI_DOMAIN=<domain>` and `SOC_AI_CADDY_TLS=<the tls directive>`. The Caddy container
+  receives these two variables and no soc-ai secret.
+- `COMPOSE_PROFILES=proxy`. The `caddy` service in `docker-compose.yml` sits under the
+  `proxy` profile. This line keeps Caddy in every later `docker compose up -d`.
+- `PROXY_TRUSTED_IPS=<the subnet of the compose network>`. The script reads the subnet with
+  `docker network inspect`. soc-ai trusts the forwarded headers from that subnet. It skips
+  every trusted hop when it reads the client address, so the block must not cover the
+  addresses your analysts connect from.
+
+Then it runs `docker compose up -d`, waits up to 120 s for the certificate, and prints the
+URL and a health check. `--dry-run` before the verb prints the changes and the commands and
+changes nothing.
+
+The self-signed pair in `./certs/` stays. The main stack still mounts the two files, and the
+direct path needs them again after `disable`.
+
+For `internal`, trust the root on each client. The script prints these steps:
+
+```bash
+# Fedora, RHEL
+sudo cp caddy-root.crt /etc/pki/ca-trust/source/anchors/soc-ai-caddy.crt && sudo update-ca-trust
+# Debian, Ubuntu
+sudo install -m644 caddy-root.crt /usr/local/share/ca-certificates/soc-ai-caddy.crt && sudo update-ca-certificates
+# macOS
+sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain caddy-root.crt
+# Windows
+certutil -addstore -f Root caddy-root.crt
+```
+
+Browsers on those hosts trust it after a restart. Firefox needs its own import under Settings,
+Certificates.
+
+`scripts/tls-proxy.sh status` prints the mode, the domain, the source and one health check.
+`scripts/tls-proxy.sh disable` restores the direct path. It puts the certificate paths back,
+removes the five proxy settings, stops and removes Caddy, and starts soc-ai with TLS on 8443.
+Caddy's data volume stays, with its CA.
+
+`setup.sh` asks the same question. `HTTPS_DOMAIN` in `setup.conf`, with `HTTPS_CA=auto` or
+`HTTPS_CA=internal`, makes the installer run the command for you.
+
+Caddy reloads a changed certificate without downtime. To reload a changed `Caddyfile`:
+
+```bash
+docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile
+```
+
+`soc-ai doctor` reports `TLS terminates at the proxy` on this path. With podman-compose, pass
+`--profile proxy` on each compose command. It does not read `COMPOSE_PROFILES` from `.env`.
+
+#### The direct path: soc-ai terminates TLS
+
+Create a `certs/` directory in the repo root. Generate a self-signed certificate there, or
+copy in your CA-signed pair:
 
 ```bash
 mkdir -p ./certs
@@ -103,7 +190,7 @@ default. Override them in `.env` if you mount the files elsewhere.
 
 To swap the self-signed pair for a certificate from your internal CA or from Let's
 Encrypt, copy the new files to the same mounted paths. Then restart the container.
-soc-ai reads the certificate and the key once at startup, so a swap does nothing
+soc-ai reads the certificate and the key once at start, so a swap does nothing
 until you restart:
 
 ```bash
@@ -118,6 +205,11 @@ Keep the filenames `cert.pem` and `key.pem`, because the compose mounts and the
 `SOC_AI_TLS_CERT` and `SOC_AI_TLS_KEY` variables point at them. You can also update both
 to match new names. On an SELinux host the `,Z` relabel applies automatically at the next
 start.
+
+After the swap, open Config and check the TLS panel, or run `soc-ai doctor`. Both inspect
+the files on disk, not the files loaded at start. The panel says "Restart soc-ai to load
+them" until you restart.
+`GET /api/v1/config/tls` returns the same record.
 
 ---
 

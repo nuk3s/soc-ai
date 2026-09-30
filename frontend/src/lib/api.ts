@@ -816,6 +816,35 @@ export function getEgressPolicy(): Promise<EgressPolicy> {
   return request<EgressPolicy>('/config/egress-policy');
 }
 
+// ── TLS status — the certificate soc-ai serves, read from GET /config/tls ──
+
+export interface TlsStatus {
+  mode: 'direct' | 'off';
+  cert_path: string | null;
+  key_path: string | null;
+  subject: string | null;
+  issuer: string | null;
+  sans: string[];
+  not_before: string | null;
+  not_after: string | null;
+  days_left: number | null;
+  expired: boolean;
+  expiry_band: number | null;
+  self_signed: boolean;
+  chain_length: number;
+  chain_ok: boolean;
+  key_matches: boolean | null;
+  fingerprint_sha256: string | null;
+  warnings: string[];
+  errors: string[];
+  loaded_at: string | null;
+  restart_required: boolean;
+}
+
+export function getTlsStatus(): Promise<TlsStatus> {
+  return request<TlsStatus>('/config/tls');
+}
+
 // ── Quality trend (I4) — the nightly micro-eval history for the Quality card ──
 
 /** One `soc-ai eval-nightly` snapshot. `mode` labels the instrument: `graded`

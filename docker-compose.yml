@@ -43,7 +43,8 @@ services:
     container_name: soc-ai
 
     # ── Port ─────────────────────────────────────────────────────────────────
-    # uvicorn terminates TLS directly on 8443; no reverse-proxy needed.
+    # uvicorn terminates TLS on 8443 on the direct path. The caddy service
+    # below puts Caddy in front for the proxy path.
     # Published on all interfaces by default. Set SOC_AI_BIND=127.0.0.1 to bind
     # loopback only (e.g. behind a reverse proxy on the same host). NOTE: Docker's
     # publish rules bypass firewalld — `firewall-cmd --list-ports` won't show this
@@ -107,15 +108,15 @@ services:
       - soc_ai_evals:/var/lib/soc-ai/evals
 
     # ── Liveness check ───────────────────────────────────────────────────────
-    # Mirrors the HEALTHCHECK in the Dockerfile; compose uses it to gate
-    # dependent services (e.g. a future nginx reverse-proxy).
+    # Mirrors the HEALTHCHECK in the Dockerfile. It tries HTTPS, then HTTP, so
+    # it passes on the direct path and behind the caddy service.
     #
     # LIVENESS, not health: a green container here means this process answered,
     # nothing more. It probes no dependency and must not, or an outage upstream
     # would become a restart loop down here. For the verdict, run
     # `docker compose exec soc-ai python -m soc_ai doctor`.
     healthcheck:
-      test: ["CMD", "curl", "-fsk", "https://127.0.0.1:8443/healthz"]
+      test: ["CMD-SHELL", "curl -fsk https://127.0.0.1:8443/healthz || curl -fs http://127.0.0.1:8443/healthz"]
       interval: 30s
       timeout: 10s
       start_period: 60s
@@ -151,6 +152,50 @@ services:
         reservations:
           memory: 256M
 
+  caddy:
+    # ── The proxy path: Caddy in front of soc-ai ─────────────────────────────
+    # Caddy terminates TLS and renews its certificate. soc-ai serves plain HTTP
+    # inside the compose network. The service sits under the "proxy" profile,
+    # so a plain `docker compose up -d` does not start it. COMPOSE_PROFILES=proxy
+    # in .env turns the profile on for every compose command, so a later
+    # `docker compose up -d` keeps Caddy. `scripts/tls-proxy.sh enable <domain>`
+    # writes that line and the other proxy settings. See docs/DOCKER.md, TLS paths.
+    profiles: ["proxy"]
+    # Digest-pinned, the same rule as the Dockerfile base images. Tag: 2.11.4.
+    image: caddy:2.11.4@sha256:0c994536bddb66445885237f1a5dcc1916bccea922661c76b4e9fc24061f9b52
+    container_name: soc-ai-caddy
+    restart: unless-stopped
+    depends_on:
+      - soc-ai
+    # Two variables from the project .env, and none of soc-ai's secrets. Both
+    # use the default form: compose interpolates the whole file before it
+    # filters profiles, so a required form would break the direct path.
+    # SOC_AI_DOMAIN names the site. SOC_AI_CADDY_TLS holds the tls directive:
+    # empty for automatic HTTPS from Let's Encrypt, "tls internal" for Caddy's
+    # own CA, or "tls /certs/proxy-cert.pem /certs/proxy-key.pem" for your files.
+    environment:
+      SOC_AI_DOMAIN: "${SOC_AI_DOMAIN:-}"
+      SOC_AI_CADDY_TLS: "${SOC_AI_CADDY_TLS:-}"
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro,Z
+      # Your certificate and key, for SOC_AI_CADDY_TLS="tls /certs/proxy-cert.pem
+      # /certs/proxy-key.pem". The script copies them in. ./certs exists before
+      # the first start, or Docker creates it as root.
+      - ./certs:/certs:ro,Z
+      - caddy_data:/data
+      - caddy_config:/config
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
 # ── Named volumes ─────────────────────────────────────────────────────────────
 volumes:
   # Persistent application data (SQLite DB + session store).
@@ -168,3 +213,8 @@ volumes:
   # a deleted bundle, and the trend row that points at it outlives it by
   # ~3 months.
   soc_ai_evals:
+
+  # Caddy keeps its certificates and its CA here. Keep it across restarts.
+  caddy_data:
+  # Caddy's own runtime config. Safe to recreate.
+  caddy_config:

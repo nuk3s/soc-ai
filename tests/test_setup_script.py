@@ -57,7 +57,10 @@ FULL_STUBS = {
 echo 000
 exit 0
 """,
-    "docker": "#!/bin/sh\nexit 0\n",
+    "docker": """#!/bin/sh
+[ -n "${DOCKER_LOG:-}" ] && printf '%s\\n' "$*" >> "$DOCKER_LOG"
+exit 0
+""",
     "openssl": """#!/bin/sh
 prev=""
 for a in "$@"; do
@@ -71,6 +74,15 @@ echo stubsecret
 exit 0
 """,
 }
+
+# The proxy script, stubbed: setup.sh hands the start of the stack to it when
+# an HTTPS domain is set. It logs its argv and prints one line the summary
+# test can look for.
+TLS_PROXY_STUB = """#!/bin/sh
+printf '%s\\n' "$*" >> "$TLS_PROXY_LOG"
+echo "stub: soc-ai is behind Caddy."
+exit 0
+"""
 
 _KV_LINE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
@@ -144,19 +156,27 @@ def run_setup_full(
     *,
     existing_env: str | None = None,
     existing_key_mode: int | None = None,
+    tls_proxy_stub: bool = False,
 ) -> SetupRun:
     """Like run_setup() but drives the whole flow (no --env-only): cert
     generation, the stubbed build/start, the health poll, the doctor exec, the
     starter pack and the printed summary. `existing_env` pre-seeds workdir/.env,
     which --auto then keeps (RECFG defaults to n); `existing_key_mode` pre-seeds
     certs/ with a key at that mode so the reuse branch runs instead of
-    generation. curl's argv log lands in tmp_path / "curl.log".
+    generation. curl's argv log lands in tmp_path / "curl.log", docker's in
+    tmp_path / "docker.log". `tls_proxy_stub` puts a stubbed
+    scripts/tls-proxy.sh in the workdir; its argv log is tmp_path / "tls-proxy.log".
     """
     workdir = tmp_path / "repo"
     workdir.mkdir()
     for name in ("setup.sh", ".env.example", "pyproject.toml"):
         (workdir / name).write_text((REPO / name).read_text())
     (workdir / "setup.sh").chmod(0o755)
+    if tls_proxy_stub:
+        (workdir / "scripts").mkdir()
+        stub = workdir / "scripts" / "tls-proxy.sh"
+        stub.write_text(TLS_PROXY_STUB)
+        stub.chmod(0o755)
     (workdir / "setup.conf").write_text(conf)
     if existing_env is not None:
         (workdir / ".env").write_text(existing_env)
@@ -172,7 +192,12 @@ def run_setup_full(
         p = stubbin / tool
         p.write_text(body)
         p.chmod(0o755)
-    env = {**_hermetic_env(tmp_path), "CURL_LOG": str(tmp_path / "curl.log")}
+    env = {
+        **_hermetic_env(tmp_path),
+        "CURL_LOG": str(tmp_path / "curl.log"),
+        "DOCKER_LOG": str(tmp_path / "docker.log"),
+        "TLS_PROXY_LOG": str(tmp_path / "tls-proxy.log"),
+    }
     proc = subprocess.run(
         ["bash", "setup.sh", "--auto"],
         cwd=workdir,
@@ -769,6 +794,63 @@ def test_health_poll_and_summary_use_the_env_port(tmp_path: Path) -> None:
     assert "localhost:8443/healthz" not in calls
     assert ":9443/app" in run.proc.stdout
     assert ":8443/app" not in run.proc.stdout
+
+
+# ── the HTTPS domain question: the proxy path through scripts/tls-proxy.sh ────
+
+
+def test_https_domain_hands_the_start_to_the_proxy_script(tmp_path: Path) -> None:
+    """Pins: a conf with HTTPS_DOMAIN and HTTPS_CA makes setup.sh build the
+    image, then call scripts/tls-proxy.sh enable <domain> <source> in place of
+    its own `up -d --build`. The health poll and the starter-pack calls go
+    through Caddy on the domain, and the summary prints the https URL and the
+    trust steps for the internal CA.
+    """
+    conf = BASE_CONF + "HTTPS_DOMAIN=soc-ai.example.test\nHTTPS_CA=internal\n"
+    run = run_setup_full(tmp_path, conf, tls_proxy_stub=True)
+    assert run.proc.returncode == 0, run.proc.stderr + run.proc.stdout
+    assert (tmp_path / "tls-proxy.log").read_text().splitlines() == [
+        "enable soc-ai.example.test internal"
+    ]
+    docker_calls = (tmp_path / "docker.log").read_text().splitlines()
+    assert "compose build" in docker_calls
+    assert not any(c.startswith("compose up") for c in docker_calls), docker_calls
+    curl_calls = (tmp_path / "curl.log").read_text()
+    assert "--resolve soc-ai.example.test:443:127.0.0.1" in curl_calls
+    assert "https://soc-ai.example.test/healthz" in curl_calls
+    assert "localhost:8443" not in curl_calls
+    assert "https://soc-ai.example.test/app" in run.proc.stdout
+    assert "update-ca-trust" in run.proc.stdout
+    assert "stub: soc-ai is behind Caddy." in run.proc.stdout
+
+
+def test_https_domain_blank_keeps_the_direct_path(tmp_path: Path) -> None:
+    """Pins: with no HTTPS_DOMAIN the flow is the one from 1.5.2: `up -d --build`,
+    the poll on localhost, and no call to the proxy script."""
+    run = run_setup_full(tmp_path, BASE_CONF, tls_proxy_stub=True)
+    assert run.proc.returncode == 0, run.proc.stderr + run.proc.stdout
+    assert not (tmp_path / "tls-proxy.log").exists()
+    assert "compose up -d --build" in (tmp_path / "docker.log").read_text().splitlines()
+    assert "https://localhost:8443/healthz" in (tmp_path / "curl.log").read_text()
+    assert ":8443/app" in run.proc.stdout
+
+
+def test_https_ca_must_be_auto_or_internal(tmp_path: Path) -> None:
+    conf = BASE_CONF + "HTTPS_DOMAIN=soc-ai.example.test\nHTTPS_CA=letsencrypt\n"
+    run = run_setup_full(tmp_path, conf, tls_proxy_stub=True)
+    assert run.proc.returncode != 0
+    assert "HTTPS_CA must be auto or internal" in run.proc.stderr
+    assert not (tmp_path / "tls-proxy.log").exists()
+
+
+def test_https_keys_in_saved_conf_key_list_and_conf_example() -> None:
+    text = (REPO / "setup.sh").read_text()
+    match = re.search(r"for k in (.*?); do", text, re.DOTALL)
+    assert match
+    assert "HTTPS_DOMAIN" in match.group(1) and "HTTPS_CA" in match.group(1)
+    example = (REPO / "setup.conf.example").read_text()
+    assert re.search(r"^HTTPS_DOMAIN=", example, re.M)
+    assert re.search(r"^HTTPS_CA=internal", example, re.M)
 
 
 # ── post-start glue (Task 7): doctor preflight, starter pack, summary ──────────

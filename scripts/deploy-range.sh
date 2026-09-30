@@ -72,7 +72,7 @@ ssh "${TARGET}" "set -e
   systemctl restart soc-ai
   ok=0
   for i in \$(seq 1 20); do
-    if curl -ksf https://127.0.0.1:8443/healthz >/dev/null; then ok=1; break; fi
+    if curl -ksf https://127.0.0.1:8443/healthz >/dev/null || curl -sf http://127.0.0.1:8443/healthz >/dev/null; then ok=1; break; fi
     sleep 3
   done
   if [ \"\$ok\" != 1 ]; then
