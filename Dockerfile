@@ -46,7 +46,7 @@ RUN uv sync --frozen --no-install-project --no-dev
 # ── Stage 2: frontend build (React SPA → /fe/dist) ────────────────────────────
 # Built here and copied into the runtime image at /opt/soc-ai/frontend/dist —
 # where main.py's FRONTEND_DIST resolves, so FastAPI serves the SPA at /app.
-FROM node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3 AS frontend
+FROM node:26-bookworm-slim@sha256:662933cf47f013bc8e4beb31a6116448427a82057ba7c42c97e4c5ba766504c2 AS frontend
 # ^ digest-pinned (see the builder stage's FROM comment above); tag: 22-bookworm-slim.
 
 WORKDIR /fe
