@@ -304,10 +304,15 @@ def test_domain_regex_scales_linearly_on_dot_dense_text() -> None:
     def build(n: int) -> str:
         return "a." * n + "a" * 100  # dot-dense label run with no valid TLD tail
 
-    def elapsed(payload: str) -> float:
-        start = time.perf_counter()
-        list(_DOMAIN.finditer(payload))
-        return time.perf_counter() - start
+    def elapsed(payload: str, runs: int = 5) -> float:
+        # The best of several runs. One run measures the scheduler as much as
+        # the pattern on a shared CI runner: the ratio read 3.07 there once.
+        best = float("inf")
+        for _ in range(runs):
+            start = time.perf_counter()
+            list(_DOMAIN.finditer(payload))
+            best = min(best, time.perf_counter() - start)
+        return best
 
     elapsed("ab" * 100)  # warm the compiled pattern before anything is timed
     single = elapsed(build(10_000))
