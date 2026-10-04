@@ -28,6 +28,12 @@ class DryRunResult(BaseModel):
     sample_ids: list[str] = Field(default_factory=list)
     window_days: int = 30
     error: str | None = None
+    # How many distinct entities of the analytic's scope field matched. One
+    # entity on a generalized clause is the analyst's cue that the analytic
+    # still describes one case. None when the dry run does not group.
+    entity_count: int | None = None
+    entity_count_is_lower_bound: bool = False
+    scope_kind: str | None = None
 
 
 class SigmaDraft(BaseModel):

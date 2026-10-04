@@ -5,6 +5,14 @@ import { HUNT_CLOSED_ACTOR, REASON_LABEL, closedByHunt } from './LeadsStrip';
 import { Panel, PanelHeader } from './Panel';
 import type { LeadDetail } from '../lib/api';
 import { kindLabel, sourceLabel, sourceTitle } from '../lib/kinds';
+import {
+  DECISION_WORD,
+  HOLD_SENTENCE,
+  actorOf,
+  decisionsOf,
+  type LeadDecision,
+  type LeadDecisionFields,
+} from '../lib/leadDecisions';
 import { plural } from '../lib/plural';
 import { absTime, ago } from '../lib/timeRange';
 import {
@@ -53,20 +61,101 @@ export function leadReopened(lead: {
   return Boolean(lead.dismissed_at) && (lead.status === 'open' || lead.status === 'hunting');
 }
 
-/** One lead's observations, newest first, with the dismissal on the record.
+/** One decision on the lead, in one sentence. */
+export function decisionSentence(d: LeadDecision): string {
+  const by = actorOf(d.by, HUNT_CLOSED_ACTOR);
+  switch (d.action) {
+    case 'dismissed': {
+      const reason = REASON_LABEL[d.reason ?? ''] ?? d.reason ?? 'Other';
+      return `Dismissed${by ? ` by ${by}` : ''}: ${reason}${d.note ? `. ${d.note}` : ''}.`;
+    }
+    case 'reopened':
+      if (d.reason === 'new_type')
+        return `Reopened by ${HUNT_CLOSED_ACTOR}. An observation of a new type joined the lead.`;
+      return by ? `Reopened by ${by}.` : 'Reopened.';
+    case 'promoted':
+      return `Promoted${by ? ` by ${by}` : ''} to an investigation.`;
+    case 'closed_by_hunt':
+      return `Closed by ${HUNT_CLOSED_ACTOR}. The hunt found no threat.`;
+    case 'held':
+      return `Left open by ${HUNT_CLOSED_ACTOR}. ${
+        HOLD_SENTENCE[d.reason ?? ''] ?? 'The hunt did not settle the lead.'
+      }`;
+    default:
+      return d.action;
+  }
+}
+
+/** Every decision on the lead, oldest first. */
+function DecisionRows({ decisions }: { decisions: LeadDecision[] }) {
+  return (
+    <>
+      {decisions.map((d, i) => (
+        <li
+          key={`${d.action}-${d.at ?? ''}-${i}`}
+          data-testid="lead-decision"
+          className="px-[15px] py-2.5 text-[13px]"
+        >
+          <div className="flex flex-wrap items-center gap-2">
+            {d.at && (
+              <span className="font-mono text-[11px] text-dim" title={absTime(d.at)}>
+                {ago(d.at)}
+              </span>
+            )}
+            <span
+              className="rounded-chip border border-border-strong bg-surface-2 px-1.5 py-px text-[10.5px] text-text-2"
+              title={CHIP_DISMISSED_EVENT}
+            >
+              {DECISION_WORD[d.action] ?? d.action}
+            </span>
+          </div>
+          <div className="mt-0.5 font-medium">
+            {decisionSentence(d)}
+            {d.action === 'promoted' && d.investigation_id && (
+              <>
+                {' '}
+                <Link
+                  to={`/investigation/${encodeURIComponent(d.investigation_id)}`}
+                  className="font-mono text-[12px] text-accent hover:underline"
+                >
+                  {d.investigation_id}
+                </Link>
+              </>
+            )}
+            {(d.action === 'closed_by_hunt' || d.action === 'held') && d.hunt_id && (
+              <>
+                {' '}
+                <Link
+                  to={`/hunts/${encodeURIComponent(d.hunt_id)}`}
+                  className="font-mono text-[12px] text-accent hover:underline"
+                >
+                  {d.hunt_id}
+                </Link>
+              </>
+            )}
+          </div>
+        </li>
+      ))}
+    </>
+  );
+}
+
+/** One lead's observations, newest first, under every decision on the record.
  *
- *  The dismissal line names the reopen. A lead an analyst put back in the
- *  queue read as a lead that had been dismissed and left. */
+ *  The decisions read oldest first, so a dismiss, a reopen and a promotion
+ *  read in the order they happened. A server that sends no history gets the
+ *  single dismissal line, and that line names the reopen. */
 export function LeadTimeline({
   lead,
   title,
   className,
 }: {
-  lead: LeadDetail;
+  lead: LeadDetail & LeadDecisionFields;
   title?: string;
   className?: string;
 }) {
   const reopened = leadReopened(lead);
+  const decisions = decisionsOf(lead);
   return (
     <Panel className={className ?? 'mt-4'}>
       <PanelHeader
@@ -84,7 +173,8 @@ export function LeadTimeline({
       <ul className="divide-y divide-border-faint">
         {/* The dismissal is a decision on the record, so it stays on the
             timeline whatever the lead's status is now. */}
-        {lead.dismissed_at && (
+        {decisions && decisions.length > 0 && <DecisionRows decisions={decisions} />}
+        {!decisions && lead.dismissed_at && (
           <li data-testid="lead-dismissal" className="px-[15px] py-2.5 text-[13px]">
             <div className="flex flex-wrap items-center gap-2">
               <span className="font-mono text-[11px] text-dim" title={absTime(lead.dismissed_at)}>
@@ -105,6 +195,17 @@ export function LeadTimeline({
                   }${lead.dismissed_note ? `. ${lead.dismissed_note}` : ''}`}
               {reopened ? '. Reopened.' : ''}
             </div>
+          </li>
+        )}
+        {/* F10: a lead whose observations aged out or were removed read
+            "0 observations" under a header that counted one. The kinds
+            that formed it are on the record, so the empty list says them. */}
+        {lead.observations.length === 0 && (
+          <li data-testid="lead-no-observations" className="px-[15px] py-2.5 text-[12.5px] text-dim">
+            {`No observation remains on this lead. It formed from ${
+              lead.kinds.map((k, i) => kindLabel(k, lead.kind_labels?.[i])).join(' and ') ||
+              'observations that are gone'
+            }.`}
           </li>
         )}
         {lead.observations.map((o) => (

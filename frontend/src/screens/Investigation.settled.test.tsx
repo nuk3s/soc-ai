@@ -57,7 +57,7 @@ describe('settled-action bar vs pipeline fallback', () => {
   it('keeps the settled bar on a genuine actionless complete run', () => {
     render(
       <MemoryRouter>
-        <Investigation inv={baseInv({ fallback: null })} layout="page" />
+        <Investigation inv={baseInv({ fallback: null, verdict: 'false_positive' })} layout="page" />
       </MemoryRouter>,
     );
     expect(screen.getByText(/Verdict settled\. Take action\./i)).toBeTruthy();
@@ -77,7 +77,7 @@ describe('settled-action bar vs pipeline fallback', () => {
 const mountDrawer = () =>
   render(
     <MemoryRouter>
-      <Investigation inv={baseInv({ fallback: null })} layout="drawer" />
+      <Investigation inv={baseInv({ fallback: null, verdict: 'false_positive' })} layout="drawer" />
     </MemoryRouter>,
   );
 

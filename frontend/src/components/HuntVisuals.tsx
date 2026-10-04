@@ -350,7 +350,7 @@ function HostFindingMap({ findings, hosts }: { findings: HuntFinding[]; hosts: H
           const c = SEV_COLOR[sev] ?? SEV_COLOR.info;
           const y = yAt(i, findings.length);
           const tip = [
-            `F${i + 1} — ${f.title}`,
+            `F${i + 1}: ${f.title}`,
             `${sev} · ${f.category ?? 'threat'}`,
             f.hosts.length ? `hosts: ${f.hosts.join(', ')}` : 'no hosts named',
           ].join('\n');
@@ -613,7 +613,7 @@ export function HuntVisuals({ findings, affectedHosts = [], charts = [] }: HuntV
         <Panel className="xl:col-span-2">
           <PanelHeader
             icon={<Network size={15} />}
-            title="Host–finding map"
+            title="Host and finding map"
             right={
               <span className="font-mono text-[11px] text-accent">
                 {findings.length}F · {mapHosts.length}H
@@ -634,10 +634,10 @@ export function HuntVisuals({ findings, affectedHosts = [], charts = [] }: HuntV
                 ]}
               />
               <TableDisclosure
-                caption="Host–finding map · each finding and the hosts it names"
+                caption="Host and finding map · each finding and the hosts it names"
                 columns={['Finding', 'Severity', 'Category', 'Hosts']}
                 rows={findings.map((f, i) => [
-                  `F${i + 1} — ${f.title}`,
+                  `F${i + 1}: ${f.title}`,
                   sevKey(f.severity),
                   f.category ?? 'threat',
                   f.hosts.length ? f.hosts.join(', ') : '—',

@@ -123,6 +123,9 @@ def demo_stack() -> Iterator[dict]:
             mock_base = f"http://127.0.0.1:{ES_PORT}"
             env = {
                 "PATH": "/usr/bin:/bin",
+                # This checkout's soc_ai and frontend/dist, also from a git
+                # worktree whose venv's editable install names another tree.
+                "PYTHONPATH": str(REPO),
                 "HOME": str(work),
                 "SOC_AI_DATA_DIR": str(data),
                 "SO_HOST": "https://securityonion.demo.example.com",
@@ -226,6 +229,7 @@ def demo_mode_stack() -> Iterator[dict]:
             mock_base = f"http://127.0.0.1:{DEMO_ES_PORT}"
             env = {
                 "PATH": "/usr/bin:/bin",
+                "PYTHONPATH": str(REPO),  # this checkout's code, as above
                 "HOME": str(work),
                 "SOC_AI_DATA_DIR": str(data),
                 "SOC_AI_DEMO": "true",

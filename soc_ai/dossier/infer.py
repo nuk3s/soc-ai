@@ -70,7 +70,7 @@ from __future__ import annotations
 import dataclasses
 import math
 import re
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import datetime
 from typing import Any
 
@@ -82,6 +82,7 @@ from soc_ai.dossier.types import (
     HostObservations,
     ProvenanceSource,
     Strength,
+    is_service_or_reverse_name,
     provenance_rank,
 )
 from soc_ai.so_client.fields import EPHEMERAL_PORT_FLOOR
@@ -183,11 +184,11 @@ _MIN_WORKSTATION_PEERS = 5
 _MAX_IOT_PEERS = 20
 
 # Ports are rendered as ``tcp/8006`` throughout, matching the dossier's evidence
-# convention. The responder aggregation is a terms agg on ``destination.port``
-# over ``zeek.conn`` and carries no transport breakdown, so the label is an
-# assumption: a UDP-only responder (a DHCP server on 67) reads as ``tcp/67``.
-# The role rules treat those ports as signals regardless of transport, so the
-# classification is unaffected; only the rendering is imprecise.
+# convention. The responder aggregation carries the transport of each port
+# (the busiest of tcp and udp), and the label reads it: a DNS server answers
+# on ``udp/53``. ``_PROTO`` is the label for a port whose transport the grid
+# did not record. The role rules treat ports as signals regardless of
+# transport, so the classification is unaffected.
 _PROTO = "tcp"
 
 # How many responder ports to record in `services_offered`.
@@ -477,6 +478,7 @@ class _PortObservation:
     answered: int
     peers: int | None = None
     hours: int | None = None
+    proto: str = _PROTO
 
 
 def _bucket_int(bucket: dict[str, Any], key: str) -> int | None:
@@ -544,8 +546,27 @@ def _responder_ports(obs: HostObservations) -> list[_PortObservation]:
                 answered=answered,
                 peers=_bucket_int(bucket, "peers"),
                 hours=_bucket_int(bucket, "hours"),
+                proto=_proto_of(bucket),
             )
         )
+    return out
+
+
+def _proto_of(bucket: dict[str, Any]) -> str:
+    """The transport the collector recorded for one port, else the default label."""
+    raw = bucket.get("transport")
+    if isinstance(raw, str) and raw.lower() in ("tcp", "udp"):
+        return raw.lower()
+    return _PROTO
+
+
+def _resp_protos(obs: HostObservations) -> dict[int, str]:
+    """Port to transport for every responder port the collector labelled."""
+    out: dict[int, str] = {}
+    for bucket in obs.resp_ports or ():
+        parsed = _parse_port_bucket(bucket)
+        if parsed is not None:
+            out.setdefault(parsed[0], _proto_of(bucket))
     return out
 
 
@@ -554,8 +575,9 @@ def _qualified_ports(ports: Sequence[_PortObservation]) -> set[int]:
     return {row.port for row in ports if row.answered >= _MIN_PORT_HITS}
 
 
-def _render_ports(ports: Iterable[int]) -> str:
-    return ", ".join(f"{_PROTO}/{port}" for port in sorted(ports))
+def _render_ports(ports: Iterable[int], protos: Mapping[int, str] | None = None) -> str:
+    known = protos or {}
+    return ", ".join(f"{known.get(port, _PROTO)}/{port}" for port in sorted(ports))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -573,6 +595,8 @@ class _Traffic:
     peers: int
     hours: int
     attributed: bool
+    # The transport of each matched port, for the evidence line.
+    protos: Mapping[int, str] = dataclasses.field(default_factory=dict)
 
     @property
     def sustained(self) -> bool:
@@ -608,6 +632,7 @@ def _matched_traffic(
             peers=max(measured_peers, default=0),
             hours=max(measured_hours, default=0),
             attributed=True,
+            protos={row.port: row.proto for row in rows},
         )
 
     total = sum(row.answered for row in ports)
@@ -618,6 +643,7 @@ def _matched_traffic(
         peers=obs.resp_peer_count,
         hours=obs.resp_hours,
         attributed=conns >= _MATCHED_VOLUME_FLOOR or share >= _MATCHED_SHARE_FLOOR,
+        protos={row.port: row.proto for row in rows},
     )
 
 
@@ -732,13 +758,18 @@ class _NameCandidate:
     evidence: str
 
 
-def _clean_hostname(value: Any) -> str | None:
+def _clean_hostname(value: Any, *, self_reported: bool = False) -> str | None:
     """Normalise a hostname candidate, or reject it.
 
     Rejects addresses (``host.name`` frequently carries the IP), stubs under
     three characters, everything ``discovery._junk_host_reason`` knows to be a
     protocol artifact (``WORKGROUP``, ``__MSBROWSE__``, escaped NetBIOS suffix
     bytes, a bare public TLD), and a per-device mDNS GUID name.
+
+    ``self_reported`` is for the agent's own ``host.name`` and a DHCP lease
+    hostname. Those are the machine's claims about itself, so the bare public
+    TLD rule does not apply: "nexus" and "green" are gTLDs and real machine
+    names. The PTR and DNS-SD rejections still apply.
     """
     # Lazy: `discovery` pulls in the identifier store and the ES field helpers,
     # and this module's whole contract is that importing it costs nothing and
@@ -751,7 +782,11 @@ def _clean_hostname(value: Any) -> str | None:
     text = text.strip().rstrip(".")
     if len(text) < _HOSTNAME_MIN_LEN or _looks_like_ip(text):
         return None
-    if _junk_host_reason(text) is not None:
+    if _junk_host_reason(text, self_reported=self_reported) is not None:
+        return None
+    if is_service_or_reverse_name(text):
+        # "_uscan._tcp.local" names a printer's scan service and
+        # "4.2.0.192.in-addr.arpa" names an address. Neither names the machine.
         return None
     if _MACHINE_GUID_RE.match(text):
         # A per-device mDNS GUID ("3a7471a9-….local") identifies nothing to a
@@ -784,8 +819,10 @@ def _hostname_candidates(obs: HostObservations) -> list[_NameCandidate]:
         source: ProvenanceSource,
         strength: Strength,
         evidence: str | None = None,
+        *,
+        self_reported: bool = False,
     ) -> None:
-        name = _clean_hostname(raw)
+        name = _clean_hostname(raw, self_reported=self_reported)
         if name is None or (name, label) in seen:
             return
         seen.add((name, label))
@@ -811,10 +848,11 @@ def _hostname_candidates(obs: HostObservations) -> list[_NameCandidate]:
             "hostlog",
             "strong",
             _hostlog_evidence(obs.agent_report.host_name, obs.agent_report),
+            self_reported=True,
         )
     # 1. The host's own DHCP announcement — the strongest first-party claim.
     for record in _dhcp_leases(obs):
-        add(record.get("hostname"), "dhcp", "banner", "strong")
+        add(record.get("hostname"), "dhcp", "banner", "strong", self_reported=True)
     # 2. NTLM, read by DIRECTION. `ntlm.hostname` is the machine name the CLIENT
     #    announces and `ntlm.server_nb_computer_name` is the server's, so a
     #    record attaches one name to each END of the connection — not both to
@@ -1447,7 +1485,15 @@ def _infer_role(
         )
     role, strength, evidence = matched
     client_os = _client_os_reported(os_detail)
-    if role == "server" and client_os:
+    # Two sources that agree resolve to the stronger one. The ports read a
+    # workstation at weak strength, the agent reports a client OS at strong,
+    # and the field read "possibly workstation 0.50" under both.
+    if role in ("server", "workstation") and client_os:
+        why = (
+            "The answered ports alone read as a server"
+            if role == "server"
+            else "The answered ports agree"
+        )
         return _fact(
             "role",
             value="workstation",
@@ -1456,7 +1502,7 @@ def _infer_role(
             evidence=[
                 _evidence(
                     f"the agent on this machine reports {client_os}, a client operating "
-                    "system. The answered ports alone read as a server",
+                    f"system. {why}",
                     "hostlog",
                 ),
                 *evidence,
@@ -1574,7 +1620,10 @@ def _match_domain_controller(
         # Corroboration only — LDAPS/GC/DNS/SMB are served by plenty of hosts
         # that are not domain controllers, so they never trigger the row.
         evidence.append(
-            _evidence(f"corroborating directory ports {_render_ports(extra)}", "behaviour")
+            _evidence(
+                f"corroborating directory ports {_render_ports(extra, _resp_protos(obs))}",
+                "behaviour",
+            )
         )
     return "domain_controller", _sustained_strength(directory), evidence
 
@@ -1648,7 +1697,8 @@ def _match_workstation(
     if qualified:
         evidence = [
             _evidence(
-                f"answers only {_render_ports(qualified)} with {answered.conns:,} "
+                f"answers only {_render_ports(qualified, _resp_protos(obs))} with "
+                f"{answered.conns:,} "
                 f"zeek.conn records from {answered.peers} distinct peers. The host "
                 f"initiates connections to {obs.orig_peer_count} distinct peers",
                 "behaviour",
@@ -1681,7 +1731,10 @@ def _role_evidence(ports: Iterable[int], traffic: _Traffic) -> str:
     When the spread could not be attributed to these ports the line says so
     rather than borrowing the host's totals silently.
     """
-    head = f"responds on {_render_ports(ports)} with {traffic.conns:,} zeek.conn records"
+    head = (
+        f"responds on {_render_ports(ports, traffic.protos)} with {traffic.conns:,} "
+        "zeek.conn records"
+    )
     if traffic.attributed:
         return _evidence(
             f"{head} from {traffic.peers} distinct peers across {traffic.hours} hours",
@@ -1698,7 +1751,8 @@ def _unknown_role_evidence(obs: HostObservations, qualified: set[int]) -> str:
     """Absence is a real answer — say which absence."""
     if qualified:
         return _evidence(
-            f"responds on {_render_ports(qualified)}. No role rule matches this port set",
+            f"responds on {_render_ports(qualified, _resp_protos(obs))}. "
+            "No role rule matches this port set",
             "behaviour",
         )
     return _evidence(
@@ -1729,6 +1783,7 @@ def _infer_services(obs: HostObservations, *, ports: Sequence[_PortObservation])
     """
     pairs = [(row.port, row.answered) for row in ports if row.answered >= _MIN_PORT_HITS]
     pairs = pairs[:_MAX_SERVICES]
+    protos = {row.port: row.proto for row in ports}
     if not pairs:
         return _fact(
             "services_offered",
@@ -1745,9 +1800,9 @@ def _infer_services(obs: HostObservations, *, ports: Sequence[_PortObservation])
         evidence.append(_evidence(f"zeek service names in window: {', '.join(names)}", "behaviour"))
     return _fact(
         "services_offered",
-        value=_render_ports_in_order(pairs),
+        value=_render_ports_in_order(pairs, protos),
         value_json=[
-            {"port": port, "proto": _PROTO, "count": count, "service": None}
+            {"port": port, "proto": protos.get(port, _PROTO), "count": count, "service": None}
             for port, count in pairs
         ],
         strength="strong",
@@ -1757,9 +1812,12 @@ def _infer_services(obs: HostObservations, *, ports: Sequence[_PortObservation])
     )
 
 
-def _render_ports_in_order(pairs: Sequence[tuple[int, int]]) -> str:
+def _render_ports_in_order(
+    pairs: Sequence[tuple[int, int]], protos: Mapping[int, str] | None = None
+) -> str:
     """Ports in bucket order (busiest first), unlike the sorted evidence form."""
-    return ", ".join(f"{_PROTO}/{port}" for port, _ in pairs)
+    known = protos or {}
+    return ", ".join(f"{known.get(port, _PROTO)}/{port}" for port, _ in pairs)
 
 
 def _infer_management_plane(obs: HostObservations, *, qualified: set[int], floor: int) -> Fact:
@@ -1778,7 +1836,10 @@ def _infer_management_plane(obs: HostObservations, *, qualified: set[int], floor
             strength="strong",
             source="behaviour",
             evidence=[
-                _evidence(f"management-plane responder on {_render_ports(exposed)}", "behaviour")
+                _evidence(
+                    f"management-plane responder on {_render_ports(exposed, _resp_protos(obs))}",
+                    "behaviour",
+                )
             ],
             observed_at=obs.last_seen,
         )

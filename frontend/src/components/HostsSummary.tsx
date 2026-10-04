@@ -1,314 +1,335 @@
-// The network above the host list: four KPI cards and a role-distribution bar.
+// The network above the machine list: six cards and a role bar.
 //
-// The numbers still come from GET /dossiers/summary — the WHOLE table, never
-// the page on screen (the table below is one SQL page of up to 5,000 hosts,
-// and a count taken off it would describe fifty rows while reading as the
-// network's; this app has shipped that defect twice).
+// The numbers come from GET /hosts/summary. They count MACHINES over the whole
+// census, never the page on screen. Each card and each role segment is a link
+// that applies the list filter it counts, so a number is always one click from
+// the rows behind it. The server holds the rule that makes this true: each
+// count equals the `total` of the list call with the matching filter.
 //
-// The rules the one-line strip enforced carry over unchanged:
-//   * a count is a DOOR or it is a CAPTION — broken builds and open
-//     disagreements link to the views that show exactly those rows, and no
-//     door exists at zero;
-//   * a failed read never renders a zero. The cards show the shared dash
-//     instead, because "0 hosts" is a claim about the network that is false
-//     exactly when the endpoint is down;
-//   * ONE freshness line, from the data's own clock (MAX(last_built_at)).
-//
-// The cards are the same Kpi component the host page's strip uses — one idea
-// at two altitudes, not two components that look alike.
+// A failed read never renders a zero. The cards show the shared dash, because
+// "0 machines" is a claim about the network that is false exactly when the
+// endpoint is down.
 
-import { AlertTriangle, RadioTower, Scale, Server } from 'lucide-react';
+import { AlertTriangle, RadioTower, Scale, Server, Sparkles, WifiOff } from 'lucide-react';
+import type { ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import { cn } from '../lib/cn';
 import { provenanceTone, roleRail } from '../lib/hostColors';
 import { roleLabel } from '../lib/hostDossier';
 import { plural } from '../lib/plural';
 import { absTime, ago } from '../lib/timeRange';
-import type { DossierSummary } from '../lib/types';
+import type { MachineSummary } from '../lib/types';
 import { Kpi, UNKNOWN, UNKNOWN_TONE } from './Kpi';
 
-/** The Config anchor for the dossier's master switch and its schedule. BOTH
- *  are off by default, which is why every dead end on this screen points here:
- *  an empty host list, a Rebuild that swept nothing, and counts nothing will
- *  refresh are all one settings answer rather than a failure. */
+/** The Config anchor for the dossier's master switch and its schedule. Both
+ *  are off by default, so every dead end on this screen points here. */
 export const DOSSIER_CONFIG_HREF = '/config#host-dossier';
 
-/** The conflicts queue on this same screen — a disclosure, not a route;
- *  `?conflicts=1` opens it pre-revealed. */
-const CONFLICTS_HREF = '/hosts?conflicts=1';
+/** The bucket keys the summary's `roles` carries beside the role slugs. Each
+ *  is also a value of the list's `role` filter. */
+export const ROLE_BUCKETS = ['low_confidence', 'stale', 'unknown'] as const;
 
-/** The broken-builds view: the same set the `never_built` count describes. */
-export const BROKEN_BUILDS_HREF = '/hosts?health=broken';
+// ---- the role bar -----------------------------------------------------------
 
-// ---- the role-distribution bar ----------------------------------------------
-
-interface RoleSlice {
-  /** The resolved role word, or null for the unresolved remainder. */
-  role: string | null;
+export interface RoleSlice {
+  /** The `role` filter value this slice links to: a slug or a bucket. */
+  filter: string;
+  label: string;
   count: number;
-  /** Inferred below the confidence gate: not resolved, but not unknown either. */
-  low?: boolean;
+  bucket: boolean;
 }
 
 /**
- * The bar's segments, biggest first, the gray remainder last.
- *
- * The wire's `roles` only holds RESOLVED roles, so the remainder is computed
- * here as `hosts - sum(counts)` — with one fold: the classifier can emit the
- * literal role "unknown" (soc_ai/dossier/infer.py), and to a reader that IS
- * the remainder. Two adjacent gray segments both meaning "don't know" would
- * look like a distinction the data is not making.
+ * The bar's segments: the resolved roles biggest first, then the three
+ * buckets. Every count comes off the wire. The client derives no remainder.
  */
-export function roleSlices(summary: DossierSummary): RoleSlice[] {
-  const known = Object.entries(summary.roles)
-    .filter(([role, count]) => role.trim().toLowerCase() !== 'unknown' && count > 0)
+export function roleSlices(summary: MachineSummary): RoleSlice[] {
+  const buckets = new Set<string>(ROLE_BUCKETS);
+  const known = Object.entries(summary.roles ?? {})
+    .filter(([role, count]) => !buckets.has(role) && count > 0)
     .sort(([roleA, a], [roleB, b]) => b - a || roleA.localeCompare(roleB))
-    .map(([role, count]) => ({ role, count }));
-  // The wire names the hosts whose role the resolver withholds. They are not
-  // unknown: the host page says "possibly security appliance" about them, and
-  // they are exactly the hosts a role-scoped hunt cannot score.
-  const low = summary.roles_low_confidence ?? 0;
-  const unresolved = summary.hosts - known.reduce((total, s) => total + s.count, 0) - low;
-  const out: RoleSlice[] = [...known];
-  if (low > 0) out.push({ role: null, count: low, low: true });
-  if (unresolved > 0) out.push({ role: null, count: unresolved });
-  return out;
+    .map(([role, count]) => ({ filter: role, label: roleLabel(role), count, bucket: false }));
+  const tail: RoleSlice[] = [];
+  for (const bucket of ROLE_BUCKETS) {
+    const count = summary.roles?.[bucket] ?? 0;
+    if (count > 0) {
+      tail.push({ filter: bucket, label: bucket.replace(/_/g, ' '), count, bucket: true });
+    }
+  }
+  return [...known, ...tail];
+}
+
+const BUCKET_TITLES: Record<string, string> = {
+  low_confidence:
+    'The sweep guessed a role for these machines. The evidence is too thin to assert it. Role-scoped analytics leave these machines unscored.',
+  stale:
+    'The sweep inferred a role for these machines. The evidence is older than the staleness window. Run a sweep to confirm it.',
+  unknown: 'The sweep has no role for these machines.',
+};
+
+function sliceRail(s: RoleSlice): string {
+  if (s.filter === 'low_confidence') return 'bg-warn/55';
+  if (s.filter === 'stale') return 'bg-warn/30';
+  if (s.filter === 'unknown') return roleRail(null);
+  return roleRail(s.filter);
 }
 
 function RoleBar({
   summary,
-  shown,
-  filtered,
+  linkFor,
 }: {
-  summary: DossierSummary;
-  shown?: number;
-  filtered?: boolean;
+  summary: MachineSummary;
+  linkFor: (patch: Record<string, string | null>) => string;
 }) {
   const slices = roleSlices(summary);
-  if (summary.hosts <= 0 || slices.length === 0) return null;
-  const label = (s: RoleSlice) => (s.low ? 'low confidence' : s.role == null ? 'unknown' : roleLabel(s.role));
-  const segId = (s: RoleSlice) => s.role ?? (s.low ? 'low-confidence' : 'unknown');
-  const rail = (s: RoleSlice) => (s.low ? 'bg-warn/55' : roleRail(s.role));
-  const LOW_TITLE =
-    'The sweep inferred this role below the dossier confidence gate. The host page names the inferred role. Role-scoped analytics leave these hosts unscored.';
-  const subset = filtered && shown != null && shown !== summary.hosts;
+  if (summary.machines <= 0 || slices.length === 0) return null;
+  const hrefOf = (s: RoleSlice) => linkFor({ role: s.filter, activity: 'all' });
+  const titleOf = (s: RoleSlice) =>
+    `${s.label}: ${plural(s.count, 'machine')}. Show these machines.${BUCKET_TITLES[s.filter] ? ` ${BUCKET_TITLES[s.filter]}` : ''}`;
   return (
     <div data-testid="role-bar" className="mt-3 rounded-panel border border-border bg-surface-1 px-4 py-3">
       <div className="mb-2 flex items-baseline justify-between gap-2">
         <span className="text-[10.5px] font-semibold uppercase tracking-[.06em] text-faint">
           Roles
         </span>
-        <span
-          className="text-[11px] text-faint"
-          title="Each host's effective role: an operator's declaration, or the answer the sweep reached. Gray is every host whose role is not resolved."
-        >
-          across {plural(summary.hosts, 'host')}
-          {subset && ` · ${shown.toLocaleString()} in the list below`}
+        <span className="text-[11px] text-faint" title="The role of each machine. An operator declaration wins over the sweep.">
+          across {plural(summary.machines, 'machine')}
         </span>
       </div>
-      {/* The segments are proportional; the LEGIBLE labels live in the legend
-          underneath, because a 2%-wide segment cannot carry its own words. */}
-      <div className="flex h-2.5 w-full overflow-hidden rounded-pill" role="img" aria-label="role distribution">
+      {/* Each segment is a link to the machines it counts. The legend below
+          carries the same links with words, for a segment too thin to click. */}
+      <div className="flex h-2.5 w-full overflow-hidden rounded-pill" aria-label="Role distribution">
         {slices.map((s) => (
-          <div
-            key={segId(s)}
-            data-testid={`role-seg-${segId(s)}`}
-            title={`${label(s)} · ${s.count.toLocaleString()} host${s.count === 1 ? '' : 's'}${s.low ? `. ${LOW_TITLE}` : ''}`}
-            className={cn('min-w-[6px]', rail(s))}
+          <Link
+            key={s.filter}
+            to={hrefOf(s)}
+            data-testid={`role-seg-${s.filter}`}
+            aria-label={`${s.label}: ${plural(s.count, 'machine')}`}
+            title={titleOf(s)}
+            className={cn('min-w-[6px] hover:opacity-80', sliceRail(s))}
             style={{ flexGrow: s.count, flexBasis: 0 }}
           />
         ))}
       </div>
       <div className="mt-2 flex flex-wrap items-center gap-x-3.5 gap-y-1">
         {slices.map((s) => (
-          <span key={segId(s)} className="flex items-center gap-1.5 text-[11.5px] text-dim" title={s.low ? LOW_TITLE : undefined}>
-            <span className={cn('h-2 w-2 flex-none rounded-full', rail(s))} />
-            {label(s)}
+          <Link
+            key={s.filter}
+            to={hrefOf(s)}
+            data-testid={`role-legend-${s.filter}`}
+            title={titleOf(s)}
+            className="flex items-center gap-1.5 text-[11.5px] text-dim hover:text-text"
+          >
+            <span className={cn('h-2 w-2 flex-none rounded-full', sliceRail(s))} />
+            {s.label}
             <span className="font-mono text-[11px] font-semibold text-text-2">
               {s.count.toLocaleString()}
             </span>
-          </span>
+          </Link>
         ))}
       </div>
     </div>
   );
 }
 
-// ---- the strip --------------------------------------------------------------
+// ---- the cards --------------------------------------------------------------
 
-export interface HostsSummaryProps {
-  /** The whole-network summary, or null while in flight / after a cold fail. */
-  summary: DossierSummary | null;
-  /** How many hosts the table BELOW currently holds, and whether that is a
-   *  filtered subset. The KPI and the roles bar describe every host the sweep
-   *  knows; the default table shows only those with traffic. On the range
-   *  that was "43" and "unknown 37" above a list of 31 -- the bar's biggest
-   *  segment describing twelve rows nobody could see (dogfood, 2026-09-16). */
-  shown?: number;
-  filtered?: boolean;
-  /** True once the read has failed. With no summary behind it that is a cold
-   *  failure; with one, a refresh that failed over good numbers. */
-  failed: boolean;
-  /** True while the disagreement banner is on screen directly below, already
-   *  carrying the review action — the counts keep their words and give up
-   *  their doors, or one control looks like two. */
-  queueVisible: boolean;
+/** A card that is a link to the filter it counts. */
+function CardLink({
+  to,
+  testId,
+  label,
+  children,
+}: {
+  to: string;
+  testId: string;
+  label: string;
+  children: ReactNode;
+}) {
+  return (
+    <Link
+      to={to}
+      data-testid={testId}
+      aria-label={label}
+      className="block rounded-panel outline-none transition-colors hover:[&>div]:border-accent/60 focus-visible:[&>div]:border-accent"
+    >
+      {children}
+    </Link>
+  );
 }
 
-export function HostsSummary({ summary, failed, queueVisible, shown, filtered }: HostsSummaryProps) {
-  const attention = summary == null ? null : summary.never_built + summary.conflicts;
+export interface HostsSummaryProps {
+  /** The census summary, or null while in flight or after a cold failure. */
+  summary: MachineSummary | null;
+  /** True once the read has failed. */
+  failed: boolean;
+  /** A list URL that applies these filters. The screen owns the URL shape. */
+  linkFor: (patch: Record<string, string | null>) => string;
+  /** The broken-builds view. */
+  brokenHref: string;
+  /** The disagreement queue. */
+  conflictsHref: string;
+  /** False when sweeps do not run on a schedule. Null when unknown. */
+  scheduleEnabled?: boolean | null;
+}
+
+export function HostsSummary({
+  summary,
+  failed,
+  linkFor,
+  brokenHref,
+  conflictsHref,
+  scheduleEnabled,
+}: HostsSummaryProps) {
+  const n = (v: number | undefined) => (summary == null || v == null ? UNKNOWN : v.toLocaleString());
+  const tone = (good: string) => (summary == null ? UNKNOWN_TONE : good);
   return (
     <div data-testid="hosts-summary" className="mb-3.5">
-      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-        <Kpi
-          testId="sum-hosts"
-          label="Hosts"
-          value={summary == null ? UNKNOWN : summary.hosts.toLocaleString()}
-          sub={
-            summary == null ? (
-              UNKNOWN
-            ) : summary.hosts === 0 ? (
-              'nothing swept yet'
-            ) : (
-              <span title="Hosts with a confirmed name. The name comes from an operator or from a high-confidence sweep answer.">
-                {`${summary.named.toLocaleString()} named · ${(summary.hosts - summary.named).toLocaleString()} unnamed`}
-              </span>
-            )
-          }
-          icon={<Server size={16} />}
-          tone={summary == null ? UNKNOWN_TONE : 'text-accent'}
-          title="Every host the sweep holds, whatever the table below is filtered to."
-        />
-        <Kpi
-          testId="sum-reporting"
-          label="Reporting"
-          value={summary == null ? UNKNOWN : summary.reporting.toLocaleString()}
-          sub={summary == null ? UNKNOWN : 'with agent logs'}
-          icon={<RadioTower size={16} />}
-          tone={
-            summary == null || summary.reporting === 0
-              ? UNKNOWN_TONE
-              : provenanceTone('hostlog')
-          }
-          title={
-            summary == null
-              ? undefined
-              : `An agent on the machine ships its own logs. Those pages can say more than traffic alone shows. No agent data comes from ${plural(summary.hosts - summary.reporting, 'host')}.`
-          }
-        />
-        <Kpi
-          testId="sum-attention"
-          label="Needs attention"
-          value={attention == null ? UNKNOWN : attention.toLocaleString()}
-          sub={
-            summary == null ? (
-              UNKNOWN
-            ) : attention === 0 ? (
-              'no broken builds, no open disagreements'
-            ) : (
-              // The doors, exactly where the number is — a count with no way
-              // to the rows it counts is a dead end.
-              <span className="flex flex-col gap-0.5">
-                {summary.never_built > 0 && (
-                  <Link
-                    data-testid="sum-broken"
-                    to={BROKEN_BUILDS_HREF}
-                    title="The sweep is not reaching these hosts. Click to see which hosts."
-                    className="font-semibold text-danger hover:underline"
-                  >
-                    {summary.never_built.toLocaleString()} broken or never built
-                  </Link>
-                )}
-                {summary.conflicts > 0 &&
-                  (queueVisible ? (
-                    <span data-testid="sum-review" className="font-semibold text-warn">
-                      {summary.conflicts.toLocaleString()} need review
-                    </span>
-                  ) : (
-                    <Link
-                      data-testid="sum-review"
-                      to={CONFLICTS_HREF}
-                      title="The sweep keeps disagreeing with these declared answers. Each one needs a decision."
-                      className="font-semibold text-warn hover:underline"
-                    >
-                      {summary.conflicts.toLocaleString()} need review
-                    </Link>
-                  ))}
-              </span>
-            )
-          }
-          icon={<AlertTriangle size={16} />}
-          tone={
-            summary == null
-              ? UNKNOWN_TONE
-              : summary.never_built > 0
-                ? 'text-danger'
-                : summary.conflicts > 0
-                  ? 'text-warn'
-                  : 'text-mono-green'
-          }
-        />
-        <Kpi
-          testId="sum-conflicts"
-          label="Conflicts"
-          value={summary == null ? UNKNOWN : summary.conflicts.toLocaleString()}
-          sub={
-            summary == null ? (
-              UNKNOWN
-            ) : summary.conflicts === 0 ? (
-              'the two sources agree'
-            ) : queueVisible ? (
-              // The banner below already carries the action — a second door
-              // 40px away is one control that looks like two.
-              'in the review queue below'
-            ) : (
-              <Link
-                to={CONFLICTS_HREF}
-                title="The sweep keeps disagreeing with these declared answers. Each one needs a decision."
-                className="font-semibold text-warn hover:underline"
-              >
-                open the review queue
-              </Link>
-            )
-          }
-          icon={<Scale size={16} />}
-          tone={
-            summary == null ? UNKNOWN_TONE : summary.conflicts > 0 ? 'text-warn' : 'text-mono-green'
-          }
-          title="Open disagreements between an operator's declaration and what the sweep keeps seeing."
-        />
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
+        <CardLink
+          to={linkFor({ activity: 'all' })}
+          testId="card-machines"
+          label={`Machines: ${n(summary?.machines)}. Show every machine.`}
+        >
+          <Kpi
+            testId="sum-machines"
+            label="Machines"
+            value={n(summary?.machines)}
+            sub={
+              summary == null
+                ? UNKNOWN
+                : summary.machines === 0
+                  ? 'nothing swept yet'
+                  : `${summary.named.toLocaleString()} named · ${summary.unnamed.toLocaleString()} unnamed`
+            }
+            icon={<Server size={16} />}
+            tone={tone('text-accent')}
+            title="Every machine in the census. One machine can hold many addresses."
+          />
+        </CardLink>
+        <CardLink
+          to={linkFor({ agent: 'yes', activity: 'all' })}
+          testId="card-with-agent"
+          label={`With an agent: ${n(summary?.with_agent)}. Show these machines.`}
+        >
+          <Kpi
+            testId="sum-with-agent"
+            label="With an agent"
+            value={n(summary?.with_agent)}
+            sub={summary == null ? UNKNOWN : 'an agent reports from the machine'}
+            icon={<RadioTower size={16} />}
+            tone={
+              summary == null || summary.with_agent === 0 ? UNKNOWN_TONE : provenanceTone('hostlog')
+            }
+            title="An agent on the machine ships its own logs."
+          />
+        </CardLink>
+        <CardLink
+          to={linkFor({ agent: 'no', activity: 'all' })}
+          testId="card-without-agent"
+          label={`Without an agent: ${n(summary?.without_agent)}. Show these machines.`}
+        >
+          <Kpi
+            testId="sum-without-agent"
+            label="Without an agent"
+            value={n(summary?.without_agent)}
+            sub={summary == null ? UNKNOWN : 'network traffic only'}
+            icon={<WifiOff size={16} />}
+            tone={tone('text-text-2')}
+            title="No agent reports from these machines. Everything soc-ai knows comes from the network."
+          />
+        </CardLink>
+        <CardLink
+          to={linkFor({ seen: 'new', activity: 'all' })}
+          testId="card-new"
+          label={`New in 7 days: ${n(summary?.new_7d)}. Show these machines.`}
+        >
+          <Kpi
+            testId="sum-new"
+            label="New in 7 days"
+            value={n(summary?.new_7d)}
+            sub={summary == null ? UNKNOWN : 'first seen in the last 7 days'}
+            icon={<Sparkles size={16} />}
+            tone={tone(summary && summary.new_7d > 0 ? 'text-accent' : 'text-text-2')}
+          />
+        </CardLink>
+        <CardLink
+          to={brokenHref}
+          testId="card-attention"
+          label={`Needs attention: ${n(summary?.needs_attention)}. Show the addresses with a broken build.`}
+        >
+          <Kpi
+            testId="sum-attention"
+            label="Needs attention"
+            value={n(summary?.needs_attention)}
+            sub={
+              summary == null
+                ? UNKNOWN
+                : summary.never_built > 0
+                  ? `${summary.never_built.toLocaleString()} broken or never built`
+                  : 'no broken builds'
+            }
+            icon={<AlertTriangle size={16} />}
+            tone={
+              summary == null
+                ? UNKNOWN_TONE
+                : summary.never_built > 0
+                  ? 'text-danger'
+                  : summary.needs_attention > 0
+                    ? 'text-warn'
+                    : 'text-mono-green'
+            }
+            title="Machines the sweep cannot build, or builds from old evidence. The link opens the addresses with no clean build."
+          />
+        </CardLink>
+        <CardLink
+          to={conflictsHref}
+          testId="card-conflicts"
+          label={`Conflicts: ${n(summary?.conflicts)}. Open the review queue.`}
+        >
+          <Kpi
+            testId="sum-conflicts"
+            label="Conflicts"
+            value={n(summary?.conflicts)}
+            sub={
+              summary == null
+                ? UNKNOWN
+                : summary.conflicts === 0
+                  ? 'the two sources agree'
+                  : 'open the review queue'
+            }
+            icon={<Scale size={16} />}
+            tone={
+              summary == null ? UNKNOWN_TONE : summary.conflicts > 0 ? 'text-warn' : 'text-mono-green'
+            }
+            title="An operator declaration and the sweep disagree. Each one needs a decision."
+          />
+        </CardLink>
       </div>
 
-      {summary != null && <RoleBar summary={summary} shown={shown} filtered={filtered} />}
+      {summary != null && <RoleBar summary={summary} linkFor={linkFor} />}
 
-      {/* The strip's ONE status/freshness line. Degraded states say what
-          happened where the numbers would have dated themselves. */}
+      {/* The strip's one status line. */}
       {summary == null ? (
         <div className="mt-1.5 text-[12px] text-dim">
           {failed
-            ? 'Counts could not be read. The host list below is a separate query, and it still works.'
+            ? 'The counts could not be read. The machine list below is a separate query. The list still works.'
             : 'Counting the network…'}
         </div>
       ) : (
         <div className="mt-1.5 text-[11.5px] text-faint">
           {failed && 'Could not refresh. These are the last counts. '}
-          {summary.last_built_at == null ? (
-            <span title="No host in the table carries a build stamp. Nothing has swept the network yet.">
-              Never swept. Nothing has built these hosts yet.
-            </span>
+          {summary.last_sweep_at == null ? (
+            <span title="No sweep has built a machine yet.">Never swept.</span>
           ) : (
-            <span title={absTime(summary.last_built_at)}>
-              Last swept {ago(summary.last_built_at)}
-            </span>
+            <span title={absTime(summary.last_sweep_at)}>Last swept {ago(summary.last_sweep_at)}</span>
           )}
-          {/* Only when it is off. A schedule that is running needs no comment,
-              and a line that always says something stops being read at all. */}
-          {!summary.schedule_enabled && (
+          {scheduleEnabled === false && (
             <>
               {' · '}
               <Link
                 to={DOSSIER_CONFIG_HREF}
-                title="These counts change only after a sweep. If the schedule is off, a sweep runs only if somebody presses Rebuild."
+                title="These counts change only after a sweep. With the schedule off, a sweep runs only when an admin starts one."
                 className="underline decoration-faint/50 underline-offset-2 hover:text-text hover:decoration-dim"
               >
                 automatic sweeps are off

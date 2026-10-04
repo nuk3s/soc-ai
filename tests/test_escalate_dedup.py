@@ -807,3 +807,31 @@ def test_a_claim_the_grid_disproves_does_not_strand_the_alert(client: TestClient
     assert out["status"] == "executed"
     assert written == ["ev-0"]
     assert _ledger(client, "ev-0") == (True, "case-retried")
+
+
+def test_the_escalate_response_names_the_cases_it_opened(client: TestClient) -> None:
+    """RL7. The toast said "Opened 2 cases" and named none, so the operator went
+    searching Security Onion for them. The response carries each case id and the
+    console link built from ``so_host``."""
+    grid = _Grid([_event(0), _event(1)])
+
+    out = grid.press(client).json()
+
+    assert out["escalated"] == 2
+    assert [c["id"] for c in out["cases"]] == ["case-1", "case-2"]
+    for case in out["cases"]:
+        assert case["url"].endswith(f"/#/case/{case['id']}")
+        assert case["url"].startswith("https://")
+
+
+def test_a_press_that_opens_nothing_names_no_case(client: TestClient) -> None:
+    """NEGATIVE CONTROL. A second press withholds every alert. The cases the
+    FIRST press opened must not come back as if this press opened them."""
+    grid = _Grid([_event(0)], link_lag=True)
+    grid.press(client)
+
+    second = grid.press(client).json()
+
+    assert second["escalated"] == 0
+    assert second["already_escalated"] == 1
+    assert second["cases"] == []

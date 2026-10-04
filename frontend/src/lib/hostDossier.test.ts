@@ -265,7 +265,7 @@ describe('unresolvedPhrase — why a field is unknown, without blaming machinery
         retracted_at: null,
         inferred_value: 'server',
       }),
-    ).toBe('possibly "server", but the evidence is too thin to say');
+    ).toBe('low confidence: "server". The evidence is too thin to say');
   });
   it('says when the evidence behind a fact went away', () => {
     expect(

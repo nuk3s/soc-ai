@@ -305,7 +305,7 @@ def test_endpoint_returns_grade(client: TestClient) -> None:
         }
     )
     with patch("soc_ai.api.webui.routes_config.probes.probe_model_fitness", fake):
-        resp = client.get("/api/v1/config/model-fitness")
+        resp = client.get("/api/v1/config/model-fitness?force=true")
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["grade"] == "degraded"
@@ -328,7 +328,7 @@ def test_endpoint_emits_audit_event(client: TestClient) -> None:
         patch("soc_ai.api.webui.routes_config.probes.probe_model_fitness", fake),
         patch("soc_ai.audit.logger.AuditLogger.log_kind", new_callable=AsyncMock) as log_kind,
     ):
-        resp = client.get("/api/v1/config/model-fitness")
+        resp = client.get("/api/v1/config/model-fitness?force=true")
     assert resp.status_code == 200, resp.text
     log_kind.assert_awaited_once()
     _args, kwargs = log_kind.call_args
@@ -348,7 +348,7 @@ def test_endpoint_audit_failure_is_fail_soft(client: TestClient) -> None:
             side_effect=RuntimeError("audit index down"),
         ),
     ):
-        resp = client.get("/api/v1/config/model-fitness")
+        resp = client.get("/api/v1/config/model-fitness?force=true")
     assert resp.status_code == 200
     assert resp.json()["grade"] == "pass"
 
@@ -361,7 +361,7 @@ def test_endpoint_never_calls_a_write_tool(client: TestClient) -> None:
         patch("soc_ai.api.webui.routes_config.probes.probe_model_fitness", fake),
         patch("soc_ai.tools.write_exec.execute_write_tool", new_callable=AsyncMock) as write_exec,
     ):
-        resp = client.get("/api/v1/config/model-fitness")
+        resp = client.get("/api/v1/config/model-fitness?force=true")
     assert resp.status_code == 200
     write_exec.assert_not_awaited()
 
@@ -389,7 +389,7 @@ def test_endpoint_admin_gated() -> None:
         assert login.status_code == 200, login.text
         fake = AsyncMock(return_value={"grade": "pass", "model": "m", "legs": [], "detail": "ok"})
         with patch("soc_ai.api.webui.routes_config.probes.probe_model_fitness", fake):
-            ok = c.get("/api/v1/config/model-fitness")
+            ok = c.get("/api/v1/config/model-fitness?force=true")
         assert ok.status_code == 200
         assert ok.json()["grade"] == "pass"
 
@@ -819,10 +819,10 @@ def test_auto_probe_is_skipped_while_the_quality_eval_batch_runs(client: TestCli
     with patch("soc_ai.webui.probes.probe_model_fitness", probe):
         body = client.get("/api/v1/config/model-fitness").json()
 
-    assert probe.calls == []  # never measured under our own load
+    assert probe.calls == []  # a plain GET never measures
     assert body["measured"] is False
-    assert "not measured" in (body["note"] or "")
-    assert "eval" in (body["note"] or "")
+    assert body["stale"] is True
+    assert "older than one day" in (body["note"] or "")
     assert body["grade"] == "pass"  # the cached verdict is kept, not overwritten
     assert body["cached"] is True
 
@@ -844,7 +844,7 @@ def test_auto_probe_is_skipped_while_auto_triage_runs(client: TestClient) -> Non
 
     assert probe.calls == []
     assert body["measured"] is False
-    assert "triage" in (body["note"] or "")
+    assert body["stale"] is True
 
 
 def test_force_probes_even_under_our_own_load(client: TestClient) -> None:
@@ -879,7 +879,7 @@ def test_skip_without_a_cached_verdict_reports_unknown(client: TestClient) -> No
     assert body["grade"] == "unknown"
     assert body["measured"] is False
     assert body["legs"] == []
-    assert "not measured" in (body["note"] or "")
+    assert "no fitness check" in (body["note"] or "")
 
 
 # B2 — n-of-m from the audit store (no migration: the records are already there)

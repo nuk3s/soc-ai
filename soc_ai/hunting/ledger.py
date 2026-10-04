@@ -42,6 +42,11 @@ class Ledger:
     docs_scanned: int = 0
     runtime_ms: int = 0
     sweeps: int = 0
+    # Prior sweep runs over the window. A profile analytic is run by the prior
+    # sweep, which reads stored baselines and records no document count and no
+    # runtime. Its cost is this count. ``sweeps`` above counts the catalog
+    # sweep only, and its rows for a profile analytic predate the split.
+    profile_runs: int = 0
     coverage: dict[str, int] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
@@ -59,6 +64,7 @@ class Ledger:
             "docs_scanned": self.docs_scanned,
             "runtime_ms": self.runtime_ms,
             "sweeps": self.sweeps,
+            "profile_runs": self.profile_runs,
             "coverage": dict(self.coverage),
         }
 
@@ -136,6 +142,18 @@ async def analytic_ledgers(
     ).all()
     by_cost = {str(spec): (int(n), int(docs or 0), int(ms or 0)) for spec, n, docs, ms in cost}
 
+    prior_runs = (
+        await db.execute(
+            select(PriorSpecRun.spec_id, func.count(PriorSpecRun.id))
+            .where(
+                PriorSpecRun.spec_id.in_(wanted),
+                PriorSpecRun.created_at >= since_naive,
+            )
+            .group_by(PriorSpecRun.spec_id)
+        )
+    ).all()
+    by_prior_runs = {str(spec): int(n) for spec, n in prior_runs}
+
     # Coverage is the NEWEST prior run, not a sum over the window. The question
     # is how much of the estate this analytic can score now; a sum would keep
     # the number of a fortnight ago on a spec that has since gone blind.
@@ -193,6 +211,7 @@ async def analytic_ledgers(
             docs_scanned=docs,
             runtime_ms=runtime,
             sweeps=sweeps,
+            profile_runs=by_prior_runs.get(spec, 0),
             coverage=by_coverage.get(spec, {}),
         )
     return out

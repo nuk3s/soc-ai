@@ -31,8 +31,8 @@ export const DEFINE_LEAD =
   'dismiss it, or promote it to an investigation.';
 
 export const DEFINE_HUNT =
-  'A hunt is one agent run with an objective. It ends in findings, not a verdict. You, a ' +
-  'schedule or a lead can start one.';
+  'A hunt is one agent run with an objective. It ends in findings. You, a schedule or a ' +
+  'lead can start one.';
 
 export const DEFINE_SCHEDULE =
   'A schedule starts a hunt on an interval and writes a hunt row on every run.';
@@ -96,7 +96,8 @@ export const TAB_NEEDS_DECISION =
 
 export const TAB_IN_PROGRESS = 'Leads with a hunt running. Nothing waits on you here.';
 
-export const TAB_CLOSED = 'Leads an analyst dismissed or promoted. Reopen puts one back.';
+export const TAB_CLOSED =
+  'Leads an analyst dismissed or promoted, and leads a clean hunt closed. Reopen puts one back.';
 
 export const TAB_ALL = 'Every lead, in every state.';
 
@@ -131,7 +132,7 @@ export const CHIP_NO_BENIGN_BASELINE =
 
 export const CHIP_NO_LEAD = 'This hit formed no lead and joined none.';
 
-export const CHIP_CATALOG_RUN = 'A row the catalog sweep wrote for an analytic hit. Not an agent run.';
+export const CHIP_CATALOG_RUN = 'A row the analytic sweep wrote for an analytic hit. Not an agent run.';
 
 export const CHIP_DISMISS_REASON = 'The dismissal reason the analyst chose.';
 export const CHIP_CLOSED_BY_HUNT = 'soc-ai closed this lead after its hunt. No analyst chose a reason.';
@@ -178,7 +179,7 @@ export const TYPE_SCHEDULE = 'Hunts a schedule started.';
 
 export const TYPE_LEAD = 'Hunts started from a lead.';
 
-export const TYPE_CATALOG = 'Rows the catalog sweep wrote. Recorded before this release.';
+export const TYPE_CATALOG = 'Rows the analytic sweep wrote. Recorded before this release.';
 
 // ── The hunt statuses and the unread dot ────────────────────────────────────
 
@@ -203,8 +204,9 @@ export const UNREAD_DOT = 'Unread. Open the evidence or act on the hit to mark i
 /** The line under the lead tabs and the lead actions. The tab is a filter and
  *  the pill is the state, so the four words are said once, in one place. */
 export const LEAD_LEGEND =
-  'New: nobody has acted. In progress: a hunt is running. Hunted: the hunt finished, decide. ' +
-  'Closed: dismissed or promoted.';
+  'New: nobody has acted. In progress: a hunt is running. ' +
+  'Hunted: the hunt finished, and the lead waits on a decision. ' +
+  'Closed: an analyst dismissed or promoted the lead, or a clean hunt closed it.';
 
 export const CHIP_CANDIDATE =
   'Candidate: the analytic has never run. Put it in shadow to see what it would find.';
@@ -225,7 +227,7 @@ export const ENTITY_NAME =
   'A name, not an address. It may be a host or an account, and this grid does not say which.';
 
 export const CHIP_NOT_SWEPT =
-  'The catalog sweep has never reached this analytic. A count of zero would read as a clean grid.';
+  'The analytic sweep has never reached this analytic. A count of zero would read as a clean grid.';
 
 export const CHIP_ONE_SIGNAL =
   'One type of observation repeated until its weight reached the single-signal threshold.';
@@ -277,7 +279,7 @@ export const FILTER_LEAD = 'Hunts started from a lead.';
 
 export const FILTER_ALL = 'Every hunt an agent ran.';
 
-export const FILTER_CATALOG = 'Rows the catalog sweep wrote. Recorded before this release.';
+export const FILTER_CATALOG = 'Rows the analytic sweep wrote. Recorded before this release.';
 
 export const STATUS_INVESTIGATION =
   'Where the investigation is. A run that is still going has no verdict yet.';

@@ -22,12 +22,14 @@ from typing import Literal
 from fastapi import Request
 from pydantic import BaseModel
 
+from soc_ai.api.webui._errors import api_error
 from soc_ai.api.webui._shared import (
     _iso_utc,
     _sev,
     _verdict,
     router,
 )
+from soc_ai.store import host_machines
 from soc_ai.store import hunts as hunt_svc
 from soc_ai.store import investigations as inv_svc
 
@@ -71,6 +73,14 @@ class EntityOut(BaseModel):
     kind: Literal["ip", "host", "unknown"]
     timeline: list[EntityTimelineItem] = []
     summary: EntitySummaryOut = EntitySummaryOut()
+    # The primary address of the one machine the dossier knows by this name.
+    # The page sends a known name to that host's page: a name that stopped on
+    # "the timeline is empty" was a dead end. Null for an address.
+    host_ip: str | None = None
+    # The key of the machine this address or name belongs to, for the machine
+    # page (`/hosts/<key>`). Null when no machine holds it, or when a name
+    # belongs to two machines.
+    host_key: str | None = None
 
 
 def _classify(value: str) -> Literal["ip", "host", "unknown"]:
@@ -95,10 +105,23 @@ async def get_entity(request: Request, value: str) -> EntityOut:
     ``latestVerdict``, the box's current disposition — and a planted scenario
     describes nothing that happened on the box, so exclusion beats badging
     here. The runs stay visible (badged) on their list and detail surfaces.
+
+    A blank value is a 400. It used to answer 200 with type "unknown" and an
+    empty timeline, which reads as an entity with no history.
     """
+    if not value.strip():
+        raise api_error(
+            400,
+            "empty_entity",
+            "The entity is empty. Send an IP address, a host name or a user name.",
+        )
+    kind = _classify(value)
     async with request.app.state.db_sessionmaker() as db:
         investigations = await inv_svc.for_entity(db, value, limit=_INV_LIMIT)
         findings = await hunt_svc.findings_for_entity(db, value, scan_limit=_HUNT_SCAN_LIMIT)
+        machine = await host_machines.resolve_membership(db, value)
+        host_key = machine.key if machine is not None else None
+        host_ip = machine.primary_ip if machine is not None and kind == "host" else None
 
     items: list[EntityTimelineItem] = []
     for inv in investigations:
@@ -129,7 +152,9 @@ async def get_entity(request: Request, value: str) -> EntityOut:
 
     return EntityOut(
         value=value,
-        kind=_classify(value),
+        kind=kind,
+        host_ip=host_ip,
+        host_key=host_key,
         timeline=items,
         summary=EntitySummaryOut(
             investigationCount=len(investigations),

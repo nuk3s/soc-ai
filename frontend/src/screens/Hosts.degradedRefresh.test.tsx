@@ -16,11 +16,12 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { DossierList, DossierRefreshStatus, DossierSummary } from '../lib/types';
+import type { DossierRefreshStatus, DossierSummary, MachineList } from '../lib/types';
 
 vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
-  listDossiers: vi.fn(),
+  listMachines: vi.fn(),
+  getMachineSummary: vi.fn(),
   getDossierConflicts: vi.fn(),
   getDossierSummary: vi.fn(),
   getDossierRefreshStatus: vi.fn(),
@@ -32,39 +33,44 @@ import {
   getDossierConflicts,
   getDossierRefreshStatus,
   getDossierSummary,
+  getMachineSummary,
   getMe,
-  listDossiers,
+  listMachines,
   startDossierRefresh,
 } from '../lib/api';
 import { Hosts } from './Hosts';
 
-// One host, for the tests about the line above the table.
-const LIST: DossierList = {
+// One machine, for the tests about the line above the table.
+const LIST: MachineList = {
   rows: [
     {
-      ip: '192.0.2.24',
-      found: true,
-      fields: [],
+      key: 'ip:192.0.2.24',
+      href: '/hosts/ip%3A192.0.2.24',
+      name: null,
+      name_source: null,
+      names: [],
+      primary_ip: '192.0.2.24',
+      address_count: 1,
+      addresses: ['192.0.2.24'],
+      container_count: 0,
+      agent: null,
+      role: { value: null, label: null, confidence: null, state: 'unknown', guess: null, stale_hours: null },
+      events: 12,
       first_seen: '2026-08-01T00:00:00+00:00',
       last_seen: '2026-08-13T11:00:00+00:00',
-      last_built_at: '2026-08-13T11:30:00+00:00',
-      last_observed_at: '2026-08-13T11:00:00+00:00',
-      event_count: 12,
-      identity_rebound_at: null,
-      build_error: null,
-      override_count: 0,
-      conflict_count: 0,
-      reporting: true,
+      flags: { declared: false, conflict: false, broken: false, new: false, rebound: false },
     },
   ],
   total: 1,
   limit: 50,
   offset: 0,
+  sort: 'last_seen',
+  dir: 'desc',
 };
 
 // Nothing built. A sweep that never ran and a sweep that died against a down
 // grid leave the same empty table, which is the whole difficulty.
-const NO_HOSTS: DossierList = { rows: [], total: 0, limit: 50, offset: 0 };
+const NO_HOSTS: MachineList = { ...LIST, rows: [], total: 0 };
 
 const SUMMARY: DossierSummary = {
   hosts: 1,
@@ -88,7 +94,9 @@ const status = (last_summary: Record<string, unknown> | null): DossierRefreshSta
 });
 
 beforeEach(() => {
-  vi.mocked(listDossiers).mockReset().mockResolvedValue(LIST);
+  vi.mocked(listMachines).mockReset().mockResolvedValue(LIST);
+  // The cards are not what these tests are about. The read stays in flight.
+  vi.mocked(getMachineSummary).mockReset().mockReturnValue(new Promise(() => {}));
   vi.mocked(getDossierConflicts).mockReset().mockResolvedValue({ pending: 0, rows: [] });
   vi.mocked(getDossierSummary).mockReset().mockResolvedValue(SUMMARY);
   vi.mocked(getDossierRefreshStatus).mockReset();
@@ -115,7 +123,7 @@ const mountEmpty = async (
   last_run: string | null = LAST_RUN,
   running = false,
 ) => {
-  vi.mocked(listDossiers).mockResolvedValue(NO_HOSTS);
+  vi.mocked(listMachines).mockResolvedValue(NO_HOSTS);
   // The first-run branch is keyed off the CENSUS (summary.hosts), not off the
   // page's own total — a census that has been swept but is entirely quiet
   // must read as "no hosts match", never as "the sweep hasn't run". This
@@ -347,7 +355,7 @@ describe('Hosts first run — a sweep in flight is not a sweep that has not run'
     // so whatever sentence stands here stands for the session. "Hasn't run
     // yet" is the one claim this screen has just proven it cannot make;
     // HostDetail answers the identical failure with "could not check".
-    vi.mocked(listDossiers).mockResolvedValue(NO_HOSTS);
+    vi.mocked(listMachines).mockResolvedValue(NO_HOSTS);
     vi.mocked(getDossierSummary).mockResolvedValue({ ...SUMMARY, hosts: 0 });
     vi.mocked(getDossierRefreshStatus).mockRejectedValue(new Error('503 Service Unavailable'));
     render(
@@ -427,7 +435,7 @@ describe('Hosts sweep report for a NON-admin — the projection keeps the screen
 
   it('says the first sweep died rather than that none has run', async () => {
     asAnalyst();
-    vi.mocked(listDossiers).mockResolvedValue(NO_HOSTS);
+    vi.mocked(listMachines).mockResolvedValue(NO_HOSTS);
     vi.mocked(getDossierSummary).mockResolvedValue({ ...SUMMARY, hosts: 0 });
     stubSweepHealth({ running: false, degraded: true, last_run: LAST_RUN, error_count: 1 });
     mountScreen();
@@ -447,7 +455,7 @@ describe('Hosts sweep report for a NON-admin — the projection keeps the screen
 
   it('says a sweep is running rather than that none has run', async () => {
     asAnalyst();
-    vi.mocked(listDossiers).mockResolvedValue(NO_HOSTS);
+    vi.mocked(listMachines).mockResolvedValue(NO_HOSTS);
     vi.mocked(getDossierSummary).mockResolvedValue({ ...SUMMARY, hosts: 0 });
     stubSweepHealth({ running: true, degraded: false, last_run: null, error_count: 0 });
     mountScreen();
@@ -462,7 +470,7 @@ describe('Hosts sweep report for a NON-admin — the projection keeps the screen
     // honest "hasn't run yet" — a projection that always degraded would be the
     // same false story pointing the other way.
     asAnalyst();
-    vi.mocked(listDossiers).mockResolvedValue(NO_HOSTS);
+    vi.mocked(listMachines).mockResolvedValue(NO_HOSTS);
     vi.mocked(getDossierSummary).mockResolvedValue({ ...SUMMARY, hosts: 0 });
     stubSweepHealth({ running: false, degraded: false, last_run: null, error_count: 0 });
     mountScreen();
@@ -481,7 +489,7 @@ describe('Hosts sweep report for a NON-admin — the projection keeps the screen
     // retried, so the false all-clear stood for the session. The same failure
     // on HostDetail reads "could not check"; this screen now says the same.
     asAnalyst();
-    vi.mocked(listDossiers).mockResolvedValue(NO_HOSTS);
+    vi.mocked(listMachines).mockResolvedValue(NO_HOSTS);
     vi.mocked(getDossierSummary).mockResolvedValue({ ...SUMMARY, hosts: 0 });
     vi.stubGlobal(
       'fetch',

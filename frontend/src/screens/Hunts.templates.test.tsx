@@ -124,28 +124,32 @@ describe('TemplatePicker three-state catalogue', () => {
     }),
   ];
 
-  it('renders normal + amber chips inline and demotes not-applicable into a collapsed cluster', async () => {
+  it('renders the normal chip inline and demotes missing-telemetry and not-applicable into a collapsed cluster', async () => {
     getHuntTemplatesMock.mockResolvedValue(THREE);
     renderHunts();
 
     // Wait for the TEMPLATE-fed render (the fallback pills paint first, while
     // the fetch is in flight, and share names with the builtins) — the cluster
     // expander only exists once real templates are in.
-    const expander = await screen.findByText(/Not applicable here · 1/);
+    const expander = await screen.findByText(/Not applicable here · 2/);
 
     // normal chip: plain objective tooltip, no warning copy
     const normal = screen.getByText('Beaconing to rare IPs');
     expect(normal.closest('button')!.getAttribute('title')).toBe('Hunt for beaconing.');
 
-    // amber chip: the existing missing-telemetry copy (a FIXABLE gap)
-    const amber = screen.getByText('DNS / C2 exfiltration');
-    expect(amber.closest('button')!.getAttribute('title')).toContain(
-      'missing telemetry: zeek.dns',
-    );
-
-    // demoted chip: NOT in the strip until the cluster is expanded
+    // demoted chips: NOT in the strip until the cluster is expanded. A
+    // starter with missing telemetry is one of them (RH8/F16/RA8).
+    expect(screen.queryByText('DNS / C2 exfiltration')).toBeNull();
     expect(screen.queryByText('Lateral movement')).toBeNull();
     fireEvent.click(expander);
+
+    // amber chip inside the cluster: the missing-telemetry copy stays (a
+    // FIXABLE gap, listed with its reason, never hidden)
+    const amber = screen.getByText('DNS / C2 exfiltration').closest('button')!;
+    expect(amber.getAttribute('data-availability')).toBe('missing');
+    expect(amber.closest('[data-demoted]')).not.toBeNull();
+    expect(amber.getAttribute('title')).toContain('missing telemetry: zeek.dns');
+    expect(amber.getAttribute('title')).toContain('You can still run this hunt.');
 
     const demoted = screen.getByText('Lateral movement');
     const title = demoted.closest('button')!.getAttribute('title')!;
@@ -156,6 +160,7 @@ describe('TemplatePicker three-state catalogue', () => {
     // collapsing hides it again
     fireEvent.click(expander);
     expect(screen.queryByText('Lateral movement')).toBeNull();
+    expect(screen.queryByText('DNS / C2 exfiltration')).toBeNull();
   });
 
   it('a demoted chip still fills the objective and launches the hunt', async () => {
@@ -163,7 +168,7 @@ describe('TemplatePicker three-state catalogue', () => {
     startHuntConsoleMock.mockResolvedValue({ hunt_id: 'h-99' });
     renderHunts();
 
-    fireEvent.click(await screen.findByText(/Not applicable here · 1/));
+    fireEvent.click(await screen.findByText(/Not applicable here · 2/));
     fireEvent.click(screen.getByText('Lateral movement'));
 
     const box = screen.getByPlaceholderText(/hunt for beaconing to rare external IPs/i);
@@ -176,6 +181,49 @@ describe('TemplatePicker three-state catalogue', () => {
       THREE[2].id,
     );
     expect(await screen.findByText('HUNT DETAIL')).toBeTruthy();
+  });
+
+  // RH8/F16/RA8: a starter whose telemetry is missing sat among the
+  // highlighted starters. It belongs in the cluster, with its reason.
+  it('puts a missing-telemetry starter inside the Not applicable cluster, not the highlighted strip', async () => {
+    getHuntTemplatesMock.mockResolvedValue([
+      tpl({ name: 'Beaconing to rare IPs' }),
+      tpl({
+        name: 'DCE-RPC abuse',
+        objectiveTemplate: 'Hunt for DC attacks.',
+        available: false,
+        missingDatasets: ['zeek.dce_rpc'],
+      }),
+    ]);
+    const { container } = renderHunts();
+    const expander = await screen.findByText(/Not applicable here · 1/);
+
+    // Collapsed: only the runnable starter is in the strip.
+    const inline = [...container.querySelectorAll('[data-availability]')].map(
+      (c) => c.textContent,
+    );
+    expect(inline).toEqual(['Beaconing to rare IPs']);
+    expect(screen.queryByText('DCE-RPC abuse')).toBeNull();
+
+    fireEvent.click(expander);
+    const chip = screen.getByText('DCE-RPC abuse').closest('button')!;
+    expect(chip.closest('[data-demoted]')).not.toBeNull();
+    expect(chip.getAttribute('title')).toContain('missing telemetry: zeek.dce_rpc');
+    // NEGATIVE CONTROL: the runnable starter is not in the cluster.
+    const beacon = screen.getByText('Beaconing to rare IPs').closest('button')!;
+    expect(beacon.closest('[data-demoted]')).toBeNull();
+  });
+
+  // An unknown availability is not a measurement: it must not demote.
+  it('keeps an availability-unknown starter out of the cluster', async () => {
+    getHuntTemplatesMock.mockResolvedValue([
+      tpl({ name: 'DCE-RPC abuse', availabilityKnown: false }),
+    ]);
+    renderHunts();
+    await screen.findByText(UNKNOWN_CAPTION);
+    expect(screen.queryByText(/Not applicable here/)).toBeNull();
+    const chip = screen.getByText('DCE-RPC abuse').closest('button')!;
+    expect(chip.getAttribute('data-availability')).toBe('unknown');
   });
 
   // A requirement that names alternatives ("zeek.rdp|system.security") is
@@ -195,6 +243,7 @@ describe('TemplatePicker three-state catalogue', () => {
     // Wait for the TEMPLATE-fed render: the legend only exists once a real,
     // flagged template is in (the fallback pills share the builtin names).
     await screen.findByText(/highlighted starters match the telemetry/);
+    fireEvent.click(screen.getByText(/Not applicable here · 1/));
 
     const chip = screen.getByText('Lateral movement').closest('button')!;
     expect(chip.getAttribute('data-availability')).toBe('missing');
@@ -225,6 +274,7 @@ describe('TemplatePicker three-state catalogue', () => {
     expect(chip.getAttribute('data-backfill')).toBe('true');
     expect(chip.getAttribute('title')).toContain('Backfill only: zeek.dns');
     // NEGATIVE CONTROL: a live plane carries no such note.
+    fireEvent.click(screen.getByText(/Not applicable here · 1/));
     const other = screen.getByText('Lateral movement').closest('button')!;
     expect(other.getAttribute('data-backfill')).toBeNull();
   });
@@ -369,6 +419,7 @@ describe('TemplatePicker availability unknown (inventory unreadable)', () => {
 
     expect(await screen.findByText(/highlighted starters match the telemetry/i)).toBeTruthy();
     expect(screen.queryByText(UNKNOWN_CAPTION)).toBeNull();
+    fireEvent.click(screen.getByText(/Not applicable here · 1/));
 
     const states = [...container.querySelectorAll('[data-availability]')].map((c) =>
       c.getAttribute('data-availability'),

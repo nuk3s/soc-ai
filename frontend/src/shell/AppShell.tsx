@@ -7,8 +7,17 @@ import { DEMO_BANNER_H, DemoBanner, DemoProvider, useDemoStatus } from '../lib/d
 import { ToastProvider } from '../lib/toast';
 import { useUpdateCheck } from '../lib/useUpdateCheck';
 import { CommandPalette } from './CommandPalette';
+import { SessionProvider, useSession } from './Session';
 import { Sidebar } from './Sidebar';
 import { Topbar } from './Topbar';
+
+/** The routed screen, held back until /me answers. A screen's own reads are
+ *  protected endpoints too, so an unauthenticated visit must not mount it. */
+function GatedOutlet() {
+  const { status } = useSession();
+  if (status === 'pending') return <RouteFallback />;
+  return <Outlet />;
+}
 
 /** The global authenticated shell: sidebar + topbar + scrolling content. */
 export function AppShell() {
@@ -18,6 +27,7 @@ export function AppShell() {
   return (
     <DemoProvider demo={demo}>
       <ToastProvider>
+      <SessionProvider>
       {/* Demo honesty banner: pinned above the shell on EVERY screen, never
           dismissible. Absent (and the DOM untouched) outside demo mode. */}
       {demo && <DemoBanner />}
@@ -39,7 +49,7 @@ export function AppShell() {
                 a clean boundary (the crash doesn't wedge every other screen). */}
             <Suspense fallback={<RouteFallback />}>
               <ErrorBoundary key={location.pathname}>
-                <Outlet />
+                <GatedOutlet />
               </ErrorBoundary>
             </Suspense>
           </div>
@@ -78,6 +88,7 @@ export function AppShell() {
           </div>
         )}
       </div>
+      </SessionProvider>
       </ToastProvider>
     </DemoProvider>
   );

@@ -109,7 +109,7 @@ export function App() {
             <Route path="/leads/:id" element={<LeadDetail />} />
             <Route path="/entity/:value" element={<EntityRoute />} />
             <Route path="/hosts" element={<Hosts />} />
-            <Route path="/hosts/:ip" element={<HostDetail />} />
+            <Route path="/hosts/:key" element={<HostDetail />} />
             <Route path="/operate" element={<Operate />} />
             <Route path="/backtest" element={<Backtest />} />
             <Route path="/runbooks" element={<Runbooks />} />

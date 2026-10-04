@@ -103,3 +103,81 @@ describe('HuntCatalogPanel', () => {
     expect(screen.queryByText('Open catalog hunts')).toBeNull();
   });
 });
+
+// F2, RH14, H5. The Operate panel said "live" on analytics no sweep had run,
+// showed "live" and "shadow" on one profile row, and printed "blind 489" on a
+// 336-host estate with no word on the cap.
+describe('HuntCatalogPanel run state', () => {
+  const PROFILE: HuntCatalogSpec = {
+    ...SPEC,
+    id: 'prior-hypervisor-novel-served-port',
+    title: 'A hypervisor serves a new port',
+    evaluator: 'profile',
+    status: 'live',
+    coverage: {
+      last_run_at: iso(HOUR / 6),
+      measured: 11,
+      learning: 0,
+      blind: 489,
+      not_applicable: 0,
+      fired: 0,
+      shadow: true,
+      recent_cap: 500,
+      capped: true,
+    },
+  };
+
+  it('says live, not running on a match analytic when the sweeps are off', async () => {
+    vi.mocked(getHuntCatalog).mockResolvedValue({
+      ...CATALOG,
+      specs: [SPEC, PROFILE],
+      sweeps_enabled: false,
+      last_sweep_at: null,
+      prior_sweeps_enabled: true,
+      last_prior_run_at: iso(HOUR / 6),
+    });
+    mount();
+    const match = (await screen.findByText(SPEC.title)).closest('li')!;
+    expect(within(match).getByText('live, not running')).toBeTruthy();
+    const profile = screen.getByText(PROFILE.title).closest('li')!;
+    expect(within(profile).getByText('live')).toBeTruthy();
+  });
+
+  it('reads the shadow marker from the status, not the trail', async () => {
+    vi.mocked(getHuntCatalog).mockResolvedValue({
+      ...CATALOG,
+      specs: [PROFILE],
+      last_prior_run_at: iso(HOUR / 6),
+    });
+    mount();
+    const row = (await screen.findByText(PROFILE.title)).closest('li')!;
+    expect(within(row).getByText('live')).toBeTruthy();
+    expect(within(row).queryByText('shadow')).toBeNull();
+  });
+
+  it('says a coverage at the cap is capped', async () => {
+    vi.mocked(getHuntCatalog).mockResolvedValue({
+      ...CATALOG,
+      specs: [PROFILE],
+      last_prior_run_at: iso(HOUR / 6),
+    });
+    mount();
+    const row = (await screen.findByText(PROFILE.title)).closest('li')!;
+    expect(row.textContent).toContain('blind 489 · capped at 500');
+  });
+
+  it('says when the profile sweep is off', async () => {
+    vi.mocked(getHuntCatalog).mockResolvedValue({
+      ...CATALOG,
+      specs: [PROFILE],
+      prior_sweeps_enabled: false,
+      last_prior_run_at: iso(HOUR / 6),
+    });
+    mount();
+    expect(
+      await screen.findByText('The profile sweep is off. These analytics do not run.'),
+    ).toBeTruthy();
+    const row = screen.getByText(PROFILE.title).closest('li')!;
+    expect(within(row).getByText('live, not running')).toBeTruthy();
+  });
+});

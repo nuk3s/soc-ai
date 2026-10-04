@@ -90,7 +90,7 @@ describe('the analytic and hit chips', () => {
       'No benign population produces this. One observation is a finding on its own.',
     );
     expect(CHIP_NO_LEAD).toBe('This hit formed no lead and joined none.');
-    expect(CHIP_CATALOG_RUN).toBe('A row the catalog sweep wrote for an analytic hit. Not an agent run.');
+    expect(CHIP_CATALOG_RUN).toBe('A row the analytic sweep wrote for an analytic hit. Not an agent run.');
     expect(CHIP_DISMISS_REASON).toBe('The dismissal reason the analyst chose.');
     expect(CHIP_WINDOW).toBe('The window the hunt searched.');
   });
@@ -127,7 +127,7 @@ describe('the filters and the statuses', () => {
     expect(TYPE_MANUAL).toBe('Hunts an analyst started from an objective.');
     expect(TYPE_SCHEDULE).toBe('Hunts a schedule started.');
     expect(TYPE_LEAD).toBe('Hunts started from a lead.');
-    expect(TYPE_CATALOG).toBe('Rows the catalog sweep wrote. Recorded before this release.');
+    expect(TYPE_CATALOG).toBe('Rows the analytic sweep wrote. Recorded before this release.');
   });
 
   it('states each hunt status and the unread dot', () => {
@@ -179,7 +179,7 @@ describe('tooltips', () => {
     expect(TIP.CHIP_ANALYTIC_MATCH).toBe('An analytic matched documents on this entity.');
     expect(TIP.CHIP_NO_LEAD).toBe('This hit formed no lead and joined none.');
     expect(TIP.CHIP_CATALOG_RUN).toBe(
-      'A row the catalog sweep wrote for an analytic hit. Not an agent run.',
+      'A row the analytic sweep wrote for an analytic hit. Not an agent run.',
     );
     expect(TIP.CHIP_DISMISS_REASON).toBe('The dismissal reason the analyst chose.');
     expect(TIP.UNREAD_DOT).toBe('Unread. Open the evidence or act on the hit to mark it read.');

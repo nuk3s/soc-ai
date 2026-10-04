@@ -191,15 +191,46 @@ def _describe_duplicate(records: list[dict[str, Any]], seq: int) -> str:
     """
     copies = [r for r in records if r.get("seq") == seq]
     intact = sum(1 for r in copies if _self_consistent(r))
-    if intact == len(copies):
+    return _duplicate_sentence(seq, len(copies), intact)
+
+
+def _duplicate_sentence(seq: int, copies: int, intact: int) -> str:
+    """The duplicate sentence from the counts alone (shared with the streaming checker)."""
+    if intact == copies:
         return (
-            f"{len(copies)} records claim sequence {seq}, and each one still matches its "
-            "own hash — the records were not altered; two writers continued the chain "
-            "from the same point"
+            f"{copies} records claim sequence {seq}. Each record still matches its own hash, "
+            "so the records were not altered. The cause is two writers that continued the "
+            "chain from the same point"
         )
     return (
-        f"{len(copies)} records claim sequence {seq}, and {len(copies) - intact} of them "
-        "no longer match their own hash — content was altered, not merely duplicated"
+        f"{copies} records claim sequence {seq}. {copies - intact} of them no longer match "
+        "their own hash, so the content was altered after it was written"
+    )
+
+
+def _missing_sentence(expected_seq: int, seq: int) -> str:
+    missing = expected_seq if seq == expected_seq + 1 else f"{expected_seq}..{seq - 1}"
+    return f"Sequence {missing} is absent. A record was deleted, or it never arrived in the index"
+
+
+def _orphan_sentence(seq: int) -> str:
+    return (
+        f"The oldest record found is at sequence {seq} and does not start a chain. "
+        "The records before it are missing from the index"
+    )
+
+
+def _relinked_sentence(seq: int) -> str:
+    return (
+        f"The record at sequence {seq} points at a predecessor that is not the record "
+        "before it. The order was changed"
+    )
+
+
+def _altered_sentence(seq: int) -> str:
+    return (
+        f"The record at sequence {seq} no longer matches its own hash. Its content was "
+        "changed after it was written"
     )
 
 
@@ -227,34 +258,14 @@ def verify_chain_detail(
         if seq != expected_seq:
             if seq == chained[position - 1]["seq"]:
                 return ChainBreak(seq, "duplicate_seq", _describe_duplicate(chained, seq))
-            missing = expected_seq if seq == expected_seq + 1 else f"{expected_seq}..{seq - 1}"
-            return ChainBreak(
-                seq,
-                "missing_seq",
-                f"sequence {missing} is absent — a record was deleted, or never landed",
-            )
+            return ChainBreak(seq, "missing_seq", _missing_sentence(expected_seq, seq))
         if expected_prev is not None and rec.get("prev_hash") != expected_prev:
             if position == 0 and seq != GENESIS_SEQ:
-                return ChainBreak(
-                    seq,
-                    "orphan_head",
-                    f"the oldest record found is at sequence {seq} and does not start a "
-                    "chain — everything before it is missing from the index",
-                )
-            return ChainBreak(
-                seq,
-                "relinked",
-                f"the record at sequence {seq} points at a predecessor that is not the "
-                "record before it — the order was changed",
-            )
+                return ChainBreak(seq, "orphan_head", _orphan_sentence(seq))
+            return ChainBreak(seq, "relinked", _relinked_sentence(seq))
         recomputed = compute_hash(_content_without_hash(rec), rec["prev_hash"])
         if recomputed != rec["hash"]:
-            return ChainBreak(
-                seq,
-                "content_altered",
-                f"the record at sequence {seq} no longer matches its own hash — its "
-                "content was changed after it was written",
-            )
+            return ChainBreak(seq, "content_altered", _altered_sentence(seq))
         expected_prev = rec["hash"]
         expected_seq = seq + 1
 
@@ -299,3 +310,181 @@ def verify_chain(
     """
     brk = verify_chain_detail(records, expect_genesis=expect_genesis)
     return (True, None) if brk is None else (False, brk.seq)
+
+
+class EpochStreamChecker:
+    """:func:`verify_chain_detail` and :func:`census_chain` over ONE epoch, streamed.
+
+    The records arrive one page at a time in ``seq`` order (``timestamp`` as the
+    tiebreak), which is the order :func:`verify_chain_detail` sorts into, so the
+    walk below makes the same decisions on the same records without ever holding
+    more than the page it is handed. The census is folded in on the same pass:
+    duplicated positions arrive as one contiguous run, so a run is everything the
+    duplicate count, the claimant count and the duplicate sentence need.
+
+    ``first_break`` is the verdict :func:`verify_chain_detail` would return.
+    ``newest_break`` is the HIGHEST-seq damage the census saw (a duplicated
+    position, an altered record or a gap), so a report about "the newest break"
+    describes the newest one and not the first one again. It falls back to
+    ``first_break`` for the kinds the census does not count (a relinked record,
+    a missing head).
+    """
+
+    def __init__(self, *, expect_genesis: bool) -> None:
+        self._expect_genesis = expect_genesis
+        self.first_break: ChainBreak | None = None
+        self._last_event: ChainBreak | None = None
+        self._pending_dup: int | None = None
+        self._started = False
+        self._position0 = True
+        self._expected_seq: Any = None
+        self._expected_prev: str | None = None
+        self._prev_seq: Any = None
+        # The run of records at the current seq.
+        self._run_seq: Any = None
+        self._run_n = 0
+        self._run_intact = 0
+        self._run_ts_min: str | None = None
+        self._run_ts_max: str | None = None
+        # Census accumulators.
+        self.duplicate_seqs = 0
+        self.extra_records = 0
+        self.max_claimants = 0
+        self.altered_records = 0
+        self._distinct_int = 0
+        self._min_int: int | None = None
+        self._max_int: int | None = None
+        self._oldest: str | None = None
+        self._newest: str | None = None
+        self.min_timestamp: str | None = None
+        self.chained = 0
+
+    def feed_page(self, records: list[dict[str, Any]]) -> None:
+        """Check one page. CPU-bound (one SHA-256 per record): run it off the event loop."""
+        for rec in records:
+            self._feed(rec)
+
+    def _feed(self, rec: dict[str, Any]) -> None:
+        if rec.get("hash") is None or rec.get("seq") is None:
+            return
+        self.chained += 1
+        seq = rec["seq"]
+        ts = rec.get("timestamp")
+        if isinstance(ts, str) and (self.min_timestamp is None or ts < self.min_timestamp):
+            self.min_timestamp = ts
+        ok_self = _self_consistent(rec)
+
+        if self._run_n == 0 or seq != self._run_seq:
+            before = self._run_seq if self._run_n else None
+            self._close_run()
+            if isinstance(seq, int) and isinstance(before, int) and seq > before + 1:
+                self._last_event = ChainBreak(
+                    seq, "missing_seq", _missing_sentence(before + 1, seq)
+                )
+            self._run_seq = seq
+            self._run_n = 0
+            self._run_intact = 0
+            self._run_ts_min = None
+            self._run_ts_max = None
+            if isinstance(seq, int):
+                self._distinct_int += 1
+                self._min_int = seq if self._min_int is None else min(self._min_int, seq)
+                self._max_int = seq if self._max_int is None else max(self._max_int, seq)
+        self._run_n += 1
+        if ok_self:
+            self._run_intact += 1
+        else:
+            self.altered_records += 1
+        if isinstance(ts, str):
+            if self._run_ts_min is None or ts < self._run_ts_min:
+                self._run_ts_min = ts
+            if self._run_ts_max is None or ts > self._run_ts_max:
+                self._run_ts_max = ts
+
+        self._check_link(rec, seq, ok_self)
+        self._prev_seq = seq
+
+    def _check_link(self, rec: dict[str, Any], seq: Any, ok_self: bool) -> None:
+        """The :func:`verify_chain_detail` walk, one record at a time."""
+        if self.first_break is not None or self._pending_dup is not None:
+            return
+        if not self._started:
+            self._started = True
+            self._expected_seq = seq
+            self._expected_prev = (
+                GENESIS_PREV_HASH if seq == GENESIS_SEQ or self._expect_genesis else None
+            )
+        position0 = self._position0
+        self._position0 = False
+        if seq != self._expected_seq:
+            if seq == self._prev_seq:
+                # The sentence needs every copy at this seq: settle it when the run ends.
+                self._pending_dup = seq
+                return
+            self.first_break = ChainBreak(
+                seq, "missing_seq", _missing_sentence(self._expected_seq, seq)
+            )
+            return
+        if self._expected_prev is not None and rec.get("prev_hash") != self._expected_prev:
+            if position0 and seq != GENESIS_SEQ:
+                self.first_break = ChainBreak(seq, "orphan_head", _orphan_sentence(seq))
+            else:
+                self.first_break = ChainBreak(seq, "relinked", _relinked_sentence(seq))
+            return
+        if not ok_self:
+            self.first_break = ChainBreak(seq, "content_altered", _altered_sentence(seq))
+            return
+        self._expected_prev = rec["hash"]
+        self._expected_seq = seq + 1
+
+    def _close_run(self) -> None:
+        n = self._run_n
+        if n == 0:
+            return
+        seq = self._run_seq
+        if n > 1:
+            self.duplicate_seqs += 1
+            self.extra_records += n - 1
+            self.max_claimants = max(self.max_claimants, n)
+            self._last_event = ChainBreak(
+                seq, "duplicate_seq", _duplicate_sentence(seq, n, self._run_intact)
+            )
+        elif self._run_intact == 0:
+            self._last_event = ChainBreak(seq, "content_altered", _altered_sentence(seq))
+        if (n > 1 or self._run_intact < n) and self._run_ts_min is not None:
+            if self._oldest is None or self._run_ts_min < self._oldest:
+                self._oldest = self._run_ts_min
+            if self._newest is None or (
+                self._run_ts_max is not None and self._run_ts_max > self._newest
+            ):
+                self._newest = self._run_ts_max
+        if self._pending_dup is not None and self._pending_dup == seq:
+            self.first_break = ChainBreak(
+                seq, "duplicate_seq", _duplicate_sentence(seq, n, self._run_intact)
+            )
+            self._pending_dup = None
+        self._run_n = 0
+
+    def finish(self) -> None:
+        """Settle the last run. Call once, after the last page."""
+        self._close_run()
+
+    @property
+    def newest_break(self) -> ChainBreak | None:
+        if self.first_break is None:
+            return None
+        return self._last_event or self.first_break
+
+    def census(self) -> ChainCensus:
+        missing = 0
+        if self._min_int is not None and self._max_int is not None:
+            missing = max((self._max_int - self._min_int + 1) - self._distinct_int, 0)
+        return ChainCensus(
+            duplicate_seqs=self.duplicate_seqs,
+            extra_records=self.extra_records,
+            max_claimants=self.max_claimants,
+            altered_records=self.altered_records,
+            missing_seqs=missing,
+            oldest_break_at=self._oldest,
+            newest_break_at=self._newest,
+        )

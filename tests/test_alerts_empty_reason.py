@@ -30,7 +30,7 @@ from soc_ai.so_client import inventory as inventory_svc
 from soc_ai.so_client.elastic import ElasticClient, EsSearchResult, GridPartialResultsError
 from soc_ai.so_client.oql import filter_to_dsl, parse_oql
 
-_RETRY_SHORTLY = "retry shortly"
+_RETRY_SHORTLY = "Retry shortly"
 
 
 @pytest.fixture

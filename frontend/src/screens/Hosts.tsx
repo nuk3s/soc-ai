@@ -1,53 +1,78 @@
 import {
   AlertTriangle,
+  ArrowUpDown,
+  Check,
   ChevronDown,
   ChevronRight,
-  CircleDashed,
-  RadioTower,
+  ChevronUp,
+  Filter,
   RefreshCw,
+  Scale,
   Server,
   UserCheck,
+  X,
 } from 'lucide-react';
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { Link, useNavigate, useSearchParams } from 'react-router-dom';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { Link, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { StatusTag } from '../components/Badges';
 import { Checkbox, Select } from '../components/Controls';
-import { DOSSIER_CONFIG_HREF, HostsSummary } from '../components/HostsSummary';
+import { DOSSIER_CONFIG_HREF, HostsSummary, ROLE_BUCKETS } from '../components/HostsSummary';
 import { ListToolbar } from '../components/ListToolbar';
 import { Panel, PanelHeader } from '../components/Panel';
 import { EmptyState, ErrorState, Freshness, LoadingState, StaleNotice } from '../components/States';
 import {
   bulkSetDossierOverride,
+  clearDossierOverride,
+  getDossier,
   getDossierConflicts,
   getDossierRefreshStatus,
   getDossierSummary,
+  getMachineSummary,
   getMe,
   listDossiers,
+  listMachines,
+  setDossierOverride,
   startDossierRefresh,
 } from '../lib/api';
 import { cn } from '../lib/cn';
 import { demoBlocked, useDemo } from '../lib/demo';
-import { criticalityAccent, provenanceTone, roleAccent } from '../lib/hostColors';
+import { roleAccent } from '../lib/hostColors';
 import {
   fieldLabel,
-  isResolved,
-  isWithheldGuess,
+  machineRoleView,
+  nameSourceLabel,
+  nameSourceTitle,
   roleLabel,
   roleVocabulary,
 } from '../lib/hostDossier';
+import {
+  FIRST_DIR,
+  HOSTS_PAGE_SIZE,
+  MACHINE_SORT_KEYS,
+  listHref,
+  machineHref,
+  machineQuery,
+  patchListParams,
+  readListState,
+  rememberListScroll,
+  rememberListUrl,
+  savedListScroll,
+  scrollParent,
+  type HostsListState,
+  type HostsLocationState,
+} from '../lib/hostsList';
 import { plural } from '../lib/plural';
 import { SHOWN_ERRORS, sweepErrorList } from '../lib/sweepErrors';
-import { ago } from '../lib/timeRange';
+import { absTime, ago } from '../lib/timeRange';
 import { useListSelection } from '../lib/useListSelection';
 import { useSavedViews } from '../lib/useSavedViews';
 import type {
   DossierConflictKind,
   DossierConflictRow,
-  DossierFieldBrief,
-  DossierFieldName,
   DossierRefreshStatus,
-  DossierRow,
-  DossierSortKey,
+  MachineRow,
+  MachineSortKey,
+  MachineSummary,
   Me,
   SavedViewQuery,
 } from '../lib/types';
@@ -59,15 +84,11 @@ import { useAsync } from '../lib/useAsync';
 // `GET /dossiers/refresh` is admin-gated because its `last_summary` carries the
 // sweep's raw failure strings; the projection is the CLOSED four-field record
 // (running / degraded / last_run / error count) the backend serves to any
-// authenticated caller, so the honest empty states below work for every role —
-// before it existed, an analyst on a fresh install read "the sweep hasn't run
-// yet" over a sweep that ran and died. Fetched here rather than through
-// lib/api.ts deliberately: lib/ belongs to an in-flight branch, and this moves
-// there when it frees up (the sweepErrors.ts precedent — HostDetail carries the
-// same copy for the same reason). No login redirect on a failure either: a
-// failed read leaves the sweep unreadable — the empty lead says "could not
-// check" rather than claiming no sweep has run — and every other request on
-// this screen still goes through lib/api's own expiry handoff.
+// authenticated caller, so the empty states below work for every role. Before
+// it existed, an analyst on a fresh install read "the sweep hasn't run yet"
+// over a sweep that ran and died. HostDetail carries the same copy for the
+// same reason. No login redirect on a failure either: a failed read leaves the
+// sweep unreadable, and the empty lead says "could not check".
 // ---------------------------------------------------------------------------
 
 interface SweepHealth {
@@ -92,7 +113,7 @@ async function getSweepHealth(): Promise<SweepHealth> {
 
 /** One shape for BOTH status reads, so everything below keys off what is known
  *  rather than which route the caller was allowed to ask. `errors` and
- *  `summary` are the admin read's extras; the projection leaves them empty —
+ *  `summary` are the admin read's extras; the projection leaves them empty.
  *  `errorCount` is the piece of the verdict that crosses the role boundary. */
 interface SweepStatusRead {
   running: boolean;
@@ -124,128 +145,31 @@ const fromProjection = (h: SweepHealth): SweepStatusRead => ({
   summary: null,
 });
 
-// One SQL page. The store's own default (DEFAULT_LIST_LIMIT in
-// soc_ai/store/host_dossier.py); the endpoint 422s above MAX_LIST_LIMIT=200.
-// The network is capped at 5,000 hosts, which is why this screen pages against
-// the server instead of fetching the table and slicing it.
-const PAGE_SIZE = 50;
-
-/**
- * The ROLE facet's value for "the sweep guessed, and the resolver withheld the
- * answer".
- *
- * Spelled the way the summary's own bucket is
- * (soc_ai/store/host_dossier.py, `_LOW_CONFIDENCE_BUCKET`), because it names
- * the same set. The ROLES bar has always counted these hosts in amber and no
- * filter on this screen could list them: the facet offers roles, and the
- * defining fact about this set is that it HAS no role (dogfood 2026-09-17).
- *
- * It never reaches the server. `list_dossiers` matches the role facet against
- * a stored value, and there is no stored value to match, so the request drops
- * the facet and narrows over the rows that come back.
- */
-export const LOW_CONFIDENCE_ROLE = '__low_confidence__';
-
-/** The page size while the withheld-guess filter is on: the endpoint's own
- *  ceiling (MAX_LIST_LIMIT), because every row it returns is a row the client
- *  has to read before it can say how many matched. */
-const SCAN_SIZE = 200;
-
 // A typed query is a new result set, so a keystroke can't fire a request.
 const SEARCH_DEBOUNCE_MS = 250;
 
-// address | host | role | flags | events | last seen. Identity first, then the
-// flags column that says which rows want a human — the criticality word, the
-// disagreement badge, the declared count and the broken-build marker share it,
-// because they answer one question ("does this row need me?") and the two
-// columns they used to occupy were dashes on 37+ of 41 rows.
-const GRID = 'minmax(126px,1fr) minmax(110px,1.1fr) minmax(110px,1fr) minmax(120px,1fr) 76px 82px';
-// With the select column, when the operator can actually declare something.
-// Same 28px gutter the Investigations table uses.
-const GRID_SELECTABLE = `28px ${GRID}`;
-
-// The two fields a bulk declare is FOR. Both are operator-lane-only in practice
-// — criticality is never inferred at all, and a role the sweep guessed is the
-// thing an operator most often corrects across a whole subnet at once.
+// The two fields a bulk declare is FOR. Criticality is never inferred at all,
+// and a role the sweep guessed is the thing an operator most often corrects
+// across a whole subnet at once.
 const BULK_FIELDS: Array<{ value: 'role' | 'criticality'; label: string }> = [
   { value: 'criticality', label: 'Criticality' },
   { value: 'role', label: 'Role' },
 ];
 
-// The criticality vocabulary, worst first — the same four words the importance
-// sort ranks on (soc_ai/store/host_dossier.py::_CRITICALITY_RANK).
+// The criticality vocabulary, worst first.
 const CRITICALITIES = ['critical', 'high', 'medium', 'low'];
 
-const SORTS: Array<{ value: DossierSortKey; label: string }> = [
-  // Importance is what the screen LANDS on, and the label is the rule: hosts
-  // graded critical or high, then NAMED hosts, then the rest of the grading
-  // (medium, low), then any host a human has touched. Only the two grades that
-  // say the host matters lead the named ones — putting every grade in front
-  // would mean one bulk "declare criticality" pass over a subnet of printers
-  // tagged low buries the named servers, which is this very defect again.
-  // Attention — broken builds, then
-  // open disagreements, then declared, then named — was the landing order and
-  // is now one click away. It ranks "no clean build" first, and on a real
-  // estate that is not a tier, it is nearly the whole table: the first screen
-  // was 15 rows of `HOST — ROLE —` while the domain controller sat below the
-  // fold (dogfood B2a, 2026-08-11). Broken hosts stay findable — this control,
-  // the summary bar's own count, and the ?health=broken filter behind it.
-  { value: 'importance', label: 'named & critical first' },
-  { value: 'attention', label: 'needs attention' },
-  { value: 'last_seen', label: 'last seen' },
-  { value: 'first_seen', label: 'first seen' },
-  { value: 'stale', label: 'stalest' },
-  { value: 'event_count', label: 'busiest' },
-  { value: 'ip', label: 'address' },
-];
-
-// The landing order is the SCREEN's choice, not the endpoint's: the API keeps
-// defaulting to `attention` for callers asking "what is the sweep failing to
-// reach", and this screen always names the order it wants (see SORTS). Named,
-// because a saved view that does not carry a sort must restore THIS, not
-// whatever the operator happened to be sorting by.
-const DEFAULT_SORT: DossierSortKey = 'importance';
-
-// The landing FILTER: hosts the network has actually shown traffic for. DNS-
-// only census entries land with event_count=0 (enrichment/host_dossier.py::
-// _ingest_dns_names) and, on the lab grid, were 185 of 234 rows — quiet noise
-// in front of every host worth a glance. 'active' rides in the same `source`
-// facet as the operator/inferred lane split (see the Show control below) so a
-// saved view captures it with everything else in one field; named here for
-// the same reason DEFAULT_SORT is — a saved view or a cleared chip that does
-// not name a source must restore THIS, not the empty ''-for-all-hosts value.
-const DEFAULT_SOURCE = 'active';
-
-// How a disagreement undermines the declaration, weakest first. The word alone
-// is jargon; the gloss is what tells an operator whether their answer was wrong
-// or merely about a machine that is no longer there.
+// How a disagreement undermines the declaration, weakest first.
 const CONFLICT_KIND_HELP: Record<DossierConflictKind, string> = {
   mismatch: 'The evidence points to a different value.',
   retracted: 'The evidence for this field is gone.',
   rebound: 'A different host answers on this address now.',
 };
 
-/** Pull one field out of a row's twelve. The wire order is the backend's render
- *  order, so a positional read would silently shift if a field were ever added
- *  in the middle of DOSSIER_FIELDS. */
-function fieldOf(row: DossierRow, name: DossierFieldName): DossierFieldBrief | undefined {
-  return row.fields.find((f) => f.field === name);
-}
-
-/** Why a cell shows nothing — three different answers that a bare blank cell
- *  collapses into one. */
-function unresolvedTitle(f: DossierFieldBrief | undefined): string {
-  switch (f?.reason) {
-    case 'stale':
-      return 'This value is too old to trust. The sweep has not confirmed it again.';
-    case 'low_confidence':
-      return 'The sweep saw some evidence. The evidence is too weak to give a value.';
-    case 'no_signal':
-      return 'The sweep found nothing for this field yet.';
-    default:
-      return 'The value is not known.';
-  }
-}
+/** The broken-builds view: the addresses with no clean build. Build health
+ *  is a fact about an address dossier, so this view lists addresses. */
+const BROKEN_HREF = '/hosts?health=broken';
+const CONFLICTS_HREF = '/hosts?conflicts=1';
 
 function absolute(iso: string | null): string {
   if (!iso) return 'never seen';
@@ -254,106 +178,12 @@ function absolute(iso: string | null): string {
 }
 
 /** One lane's answer as text, for the conflict queue. The structured fields
- *  leave `value` null and carry the answer in `value_json` — a cell reading
- *  only the scalar renders blank on exactly the rows hardest to read. */
+ *  leave `value` null and carry the answer in `value_json`. */
 function laneText(value: string | null, json: unknown): string | null {
   const scalar = value?.trim();
   if (scalar) return scalar;
   if (json == null) return null;
   return typeof json === 'string' ? json : JSON.stringify(json);
-}
-
-/** The em-dash a cell shows when a field never resolved. TEXT, never a link:
- *  the placeholder is a truthy string, and `value ? <link> : <text>` is what
- *  shipped `/entity/%E2%80%94` on the Alerts screen (2026-08-07). */
-function Unknown({ f }: { f: DossierFieldBrief | undefined }) {
-  return (
-    <span className="text-faint" title={unresolvedTitle(f)}>
-      —
-    </span>
-  );
-}
-
-/**
- * Everything on a row that says "this one wants a human", in one cell:
- * a broken or never-run build, an open disagreement, the operator's own
- * declarations, and the criticality word. No per-row confidence decimals —
- * "0.63" vs "0.70" is not a distinction anyone acts on in a table.
- */
-function FlagsCell({ row }: { row: DossierRow }) {
-  const crit = fieldOf(row, 'criticality');
-  const critValue = crit && isResolved(crit) ? crit.value : null;
-  const empty =
-    !row.build_error &&
-    row.last_built_at != null &&
-    row.conflict_count === 0 &&
-    row.override_count === 0 &&
-    !row.reporting &&
-    !critValue;
-  if (empty) return null;
-  return (
-    <span className="flex flex-wrap items-center gap-1.5">
-      {row.build_error && (
-        <span
-          title={`The last build failed. Error: ${row.build_error}`}
-          aria-label="build failed"
-          className="flex items-center text-danger"
-        >
-          <AlertTriangle size={12} />
-        </span>
-      )}
-      {!row.build_error && row.last_built_at == null && (
-        <span
-          title="Never built. No sweep has written this host yet."
-          aria-label="never built"
-          className="flex items-center text-faint"
-        >
-          <CircleDashed size={12} />
-        </span>
-      )}
-      {row.conflict_count > 0 && (
-        <span
-          title={`The sweep disagrees with ${row.conflict_count} declared field${row.conflict_count === 1 ? '' : 's'}. Open the host to decide.`}
-          className="flex items-center gap-1 rounded-badge border border-warn/40 bg-warn/10 px-[6px] py-[2px] font-mono text-[10.5px] font-semibold text-warn"
-        >
-          <AlertTriangle size={10} />
-          {row.conflict_count}
-        </span>
-      )}
-      {row.override_count > 0 && (
-        <span
-          title={`An operator declared ${row.override_count} field${row.override_count === 1 ? '' : 's'} on this host. Open the host to change the declaration.`}
-          className="flex items-center gap-1 rounded-badge border border-border-2 bg-surface-2 px-[6px] py-[2px] font-mono text-[10.5px] text-text-2"
-        >
-          <UserCheck size={10} />
-          {row.override_count}
-        </span>
-      )}
-      {/* Agent coverage, row by row: the aggregate ("no agent data on 32")
-          never said WHICH rows were the blind spots. Marking the covered
-          minority keeps the flag rare — absence reads as network-only. */}
-      {row.reporting && (
-        <span
-          title="An agent on this host reports its own logs. The host page shows more than the network traffic alone."
-          aria-label="agent reporting"
-          className={cn('flex items-center', provenanceTone('hostlog'))}
-        >
-          <RadioTower size={11} />
-        </span>
-      )}
-      {critValue && (
-        <span
-          title="Criticality says how much this host matters. Open the host to change the value."
-          className={cn(
-            'rounded-chip border px-1.5 py-px font-mono text-[10.5px] font-semibold',
-            criticalityAccent(critValue),
-          )}
-        >
-          {critValue}
-        </span>
-      )}
-    </span>
-  );
 }
 
 /** One open disagreement, read-only. Both claims side by side is the whole
@@ -365,8 +195,8 @@ function ConflictRow({ c }: { c: DossierConflictRow }) {
   return (
     <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-border-faint px-3.5 py-2 text-[12.5px] last:border-0">
       <Link
-        // ?field= is the host page's highlight+scroll target — without it the
-        // reader lands with no sign of which fact prodded.
+        // ?field= is the host page's highlight target. The host page resolves
+        // the address to its machine and keeps the address in focus.
         to={`/hosts/${encodeURIComponent(c.ip)}?field=${encodeURIComponent(c.field)}`}
         className="flex-none font-mono text-[12px] font-semibold text-accent hover:underline"
       >
@@ -379,11 +209,11 @@ function ConflictRow({ c }: { c: DossierConflictRow }) {
       )}
       <span className="flex min-w-0 items-center gap-1.5">
         <span className="flex-none text-[11px] text-faint">yours</span>
-        <span className="min-w-0 truncate font-mono text-[11.5px] text-text-2">{yours ?? '—'}</span>
+        <span className="min-w-0 truncate font-mono text-[11.5px] text-text-2">{yours ?? 'none'}</span>
       </span>
       <span className="flex min-w-0 items-center gap-1.5">
         <span className="flex-none text-[11px] text-faint">sweep</span>
-        <span className="min-w-0 truncate font-mono text-[11.5px] text-text-2">{theirs ?? '—'}</span>
+        <span className="min-w-0 truncate font-mono text-[11.5px] text-text-2">{theirs ?? 'none'}</span>
       </span>
       <span
         className="flex-none text-[11px] text-faint"
@@ -403,104 +233,719 @@ function ConflictRow({ c }: { c: DossierConflictRow }) {
   );
 }
 
+// ---- header controls --------------------------------------------------------
+
+interface FilterOption {
+  value: string;
+  label: string;
+  count?: number;
+}
+
+interface FilterGroup {
+  /** The group heading, when a menu holds more than one group. */
+  label?: string;
+  value: string;
+  /** The first option is the default: the filter is off. */
+  options: FilterOption[];
+  onChange: (value: string) => void;
+}
+
 /**
- * The host list: every machine the sweep holds a row for, ordered by which
- * rows want a human first.
- *
- * The screen shows the RESOLVED answer — the operator's declaration where one
- * exists, otherwise what the sweep concluded — because that is the only value
- * anything downstream (the agent's prompt block, the host tool) ever sees.
+ * A small filter menu in a column header. The button shows the filter is on;
+ * the menu lists each choice with its count where the summary has one.
  */
-export function Hosts() {
+function HeaderFilter({
+  name,
+  groups,
+  align = 'left',
+}: {
+  name: string;
+  groups: FilterGroup[];
+  /** Which edge of the button the menu lines up with. A right-aligned
+   *  column opens its menu leftward, so the menu stays on screen. */
+  align?: 'left' | 'right';
+}) {
+  const [open, setOpen] = useState(false);
+  // The menu is position: fixed at the button. The table panel clips its
+  // overflow, and a short list (no rows, one row) would cut an absolute menu
+  // off exactly when the operator needs to change the filter.
+  const [at, setAt] = useState<{ top: number; left?: number; right?: number } | null>(null);
+  const ref = useRef<HTMLSpanElement>(null);
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(false);
+    };
+    // A fixed menu does not move with the page, so a scroll closes it.
+    const onScroll = (e: Event) => {
+      if (ref.current && e.target instanceof Node && ref.current.contains(e.target)) return;
+      setOpen(false);
+    };
+    const onResize = () => setOpen(false);
+    document.addEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey);
+    window.addEventListener('scroll', onScroll, true);
+    window.addEventListener('resize', onResize);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      document.removeEventListener('keydown', onKey);
+      window.removeEventListener('scroll', onScroll, true);
+      window.removeEventListener('resize', onResize);
+    };
+  }, [open]);
+  const toggle = () => {
+    if (!open) {
+      const rect = buttonRef.current?.getBoundingClientRect();
+      if (rect) {
+        setAt(
+          align === 'right'
+            ? { top: rect.bottom + 4, right: Math.max(8, window.innerWidth - rect.right) }
+            : { top: rect.bottom + 4, left: rect.left },
+        );
+      }
+    }
+    setOpen((v) => !v);
+  };
+  const active = groups.some((g) => g.value !== (g.options[0]?.value ?? ''));
+  return (
+    <span ref={ref} className="relative inline-flex">
+      <button
+        ref={buttonRef}
+        type="button"
+        aria-label={`Filter by ${name.toLowerCase()}`}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        data-active={active ? 'true' : 'false'}
+        title={active ? `The ${name.toLowerCase()} filter is on.` : `Filter by ${name.toLowerCase()}.`}
+        onClick={toggle}
+        className={cn(
+          'flex items-center rounded-[4px] p-[3px]',
+          active ? 'bg-accent/15 text-accent' : 'text-faint hover:text-text-2',
+        )}
+      >
+        <Filter size={10} />
+      </button>
+      {open && (
+        <div
+          role="menu"
+          aria-label={`${name} filter`}
+          style={at ? { position: 'fixed', top: at.top, left: at.left, right: at.right } : undefined}
+          className={cn(
+            'z-50 min-w-[200px] rounded-card border border-border-strong bg-surface-card p-1 text-left normal-case tracking-normal shadow-palette',
+            !at && 'absolute left-0 top-full mt-1',
+          )}
+        >
+          {groups.map((g, gi) => (
+            <div key={g.label ?? gi} role="group" aria-label={g.label ?? name}>
+              {g.label && (
+                <div className="px-2 pb-0.5 pt-1.5 text-[10px] font-semibold uppercase tracking-[.06em] text-faint">
+                  {g.label}
+                </div>
+              )}
+              {g.options.map((o) => (
+                <button
+                  key={o.value || 'any'}
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={g.value === o.value}
+                  onClick={() => {
+                    g.onChange(o.value);
+                    setOpen(false);
+                  }}
+                  className="flex w-full items-center gap-2 rounded-control px-2 py-1.5 text-[12px] font-normal text-text-2 hover:bg-surface-hover hover:text-text"
+                >
+                  <span className="flex w-3 flex-none justify-center text-accent">
+                    {g.value === o.value && <Check size={11} />}
+                  </span>
+                  <span className="flex-1">{o.label}</span>
+                  {o.count != null && (
+                    <span className="font-mono text-[10.5px] text-faint">{o.count.toLocaleString()}</span>
+                  )}
+                </button>
+              ))}
+            </div>
+          ))}
+        </div>
+      )}
+    </span>
+  );
+}
+
+interface Column {
+  key: MachineSortKey;
+  label: string;
+  right?: boolean;
+  width: string;
+}
+
+const COLUMNS: Column[] = [
+  { key: 'name', label: 'Host', width: 'w-[22%]' },
+  { key: 'address', label: 'Address', width: 'w-[15%]' },
+  { key: 'agent', label: 'Agent', width: 'w-[15%]' },
+  { key: 'role', label: 'Role', width: 'w-[17%]' },
+  { key: 'events', label: 'Events', right: true, width: 'w-[9%]' },
+  { key: 'first_seen', label: 'First seen', right: true, width: 'w-[10%]' },
+  { key: 'last_seen', label: 'Last seen', right: true, width: 'w-[10%]' },
+];
+
+/** A column header that sorts on click, toggles the direction and shows it. */
+function SortHeader({
+  col,
+  state,
+  onSort,
+  filter,
+}: {
+  col: Column;
+  state: HostsListState;
+  onSort: (key: MachineSortKey) => void;
+  filter?: ReactNode;
+}) {
+  const active = state.sort === col.key;
+  const ariaSort = active ? (state.dir === 'asc' ? 'ascending' : 'descending') : 'none';
+  const nextDir = active ? (state.dir === 'asc' ? 'desc' : 'asc') : FIRST_DIR[col.key];
+  return (
+    <th
+      scope="col"
+      aria-sort={ariaSort}
+      className={cn('px-2.5 py-[9px] font-semibold', col.width, col.right ? 'text-right' : 'text-left')}
+    >
+      <span className={cn('inline-flex items-center gap-1', col.right && 'justify-end')}>
+        <button
+          type="button"
+          onClick={() => onSort(col.key)}
+          title={`Sort by ${col.label.toLowerCase()}, ${nextDir === 'asc' ? 'ascending' : 'descending'}.`}
+          className={cn(
+            'inline-flex items-center gap-1 uppercase tracking-[.06em] hover:text-text-2',
+            active && 'text-text-2',
+          )}
+        >
+          {col.label}
+          {active ? (
+            state.dir === 'asc' ? (
+              <ChevronUp size={11} aria-hidden="true" />
+            ) : (
+              <ChevronDown size={11} aria-hidden="true" />
+            )
+          ) : (
+            <ArrowUpDown size={10} aria-hidden="true" className="opacity-50" />
+          )}
+        </button>
+        {filter}
+      </span>
+    </th>
+  );
+}
+
+// ---- one machine row --------------------------------------------------------
+
+function RowFlags({ row }: { row: MachineRow }) {
+  const f = row.flags;
+  if (!f.broken && !f.conflict && !f.rebound && !f.new && !f.declared) return null;
+  return (
+    <span className="flex flex-none items-center gap-1">
+      {f.broken && (
+        <span
+          title="The sweep cannot build this machine. The last build failed or never ran."
+          aria-label="build failed"
+          className="flex items-center text-danger"
+        >
+          <AlertTriangle size={11} />
+        </span>
+      )}
+      {f.conflict && (
+        <span
+          title="An operator declaration and the sweep disagree. Open the machine to decide."
+          aria-label="disagreement"
+          className="flex items-center text-warn"
+        >
+          <Scale size={11} />
+        </span>
+      )}
+      {f.rebound && (
+        <span
+          title="A different machine may hold this address now."
+          className="rounded-chip border border-warn/40 px-1 font-mono text-[9.5px] font-semibold text-warn"
+        >
+          rebound
+        </span>
+      )}
+      {f.declared && (
+        <span
+          title="An operator declared a value on this machine."
+          aria-label="declared"
+          className="flex items-center text-text-2"
+        >
+          <UserCheck size={11} />
+        </span>
+      )}
+      {f.new && (
+        <span
+          title="First seen in the last 7 days."
+          className="rounded-chip border border-accent/40 px-1 font-mono text-[9.5px] font-semibold text-accent"
+        >
+          new
+        </span>
+      )}
+    </span>
+  );
+}
+
+function RoleCell({ row }: { row: MachineRow }) {
+  const view = machineRoleView(row.role);
+  if (view.state === 'unknown') {
+    return (
+      <span data-testid="role-unknown" className="text-[12px] text-faint" title={view.title}>
+        unknown
+      </span>
+    );
+  }
+  if (view.state === 'low_confidence' || view.state === 'stale') {
+    return (
+      <span
+        data-testid={`role-${view.state === 'stale' ? 'stale' : 'low-confidence'}`}
+        title={view.title}
+        className="inline-flex max-w-full items-center gap-1.5 truncate rounded-chip border border-warn/40 bg-warn/[0.08] px-1.5 py-px text-[12px] font-medium text-warn"
+      >
+        <span className="h-1.5 w-1.5 flex-none rounded-full bg-warn" />
+        {view.text}
+      </span>
+    );
+  }
+  return (
+    <span className="inline-flex max-w-full items-baseline gap-1.5" title={view.title}>
+      <span
+        className={cn(
+          'inline-flex max-w-full truncate rounded-chip border px-1.5 py-px text-[12px] font-medium',
+          roleAccent(view.accent),
+        )}
+      >
+        {view.text}
+      </span>
+      {view.note && <span className="text-[10.5px] text-faint">{view.note}</span>}
+    </span>
+  );
+}
+
+function AddressCell({ row }: { row: MachineRow }) {
+  const more = Math.max(0, row.address_count - 1);
+  const others = row.addresses.filter((a) => a !== row.primary_ip);
+  const unlisted = Math.max(0, more - others.length);
+  const tip = `${others.join(', ')}${unlisted > 0 ? `${others.length ? ', ' : ''}and ${plural(unlisted, 'more address', 'more addresses')}` : ''}`;
+  return (
+    <span className="inline-flex min-w-0 items-baseline gap-1.5">
+      <span className="truncate font-mono text-[12.5px] text-text">{row.primary_ip}</span>
+      {more > 0 && (
+        <span
+          data-testid="address-more"
+          title={tip}
+          aria-label={`${plural(more, 'more address', 'more addresses')}: ${tip}`}
+          className="flex-none rounded-chip border border-border-2 px-1 font-mono text-[10.5px] text-dim"
+        >
+          +{more}
+        </span>
+      )}
+    </span>
+  );
+}
+
+function MachineTableRow({
+  row,
+  selectable,
+  selected,
+  onToggle,
+  onOpen,
+  linkState,
+}: {
+  row: MachineRow;
+  selectable: boolean;
+  selected: boolean;
+  onToggle: () => void;
+  onOpen: () => void;
+  linkState: HostsLocationState;
+}) {
   const navigate = useNavigate();
-  const demo = useDemo();
-  const [searchParams, setSearchParams] = useSearchParams();
+  const href = machineHref(row.key);
+  const source = nameSourceLabel(row.name_source);
+  return (
+    <tr
+      data-testid={`machine-row-${row.key}`}
+      onClick={() => {
+        onOpen();
+        navigate(href, { state: linkState });
+      }}
+      className="cursor-pointer border-b border-border-faint last:border-0 hover:bg-surface-hover"
+    >
+      {selectable && (
+        <td
+          className="w-[28px] px-2.5 py-[9px] align-middle"
+          onClick={(e) => {
+            e.stopPropagation();
+            onToggle();
+          }}
+        >
+          <Checkbox
+            checked={selected}
+            title="Select this machine."
+            aria-label={`Select ${row.name ?? row.primary_ip}`}
+          />
+        </td>
+      )}
+      <td className="min-w-0 px-2.5 py-[9px] align-middle">
+        <div className="flex min-w-0 items-center gap-1.5">
+          {/* The one tab stop per row. The whole row is a link for a mouse;
+              this is the link for a keyboard. */}
+          <Link
+            to={href}
+            state={linkState}
+            onClick={(e) => {
+              e.stopPropagation();
+              onOpen();
+            }}
+            aria-label={`${row.name ?? 'No name'}, ${row.primary_ip}`}
+            className={cn(
+              'min-w-0 truncate text-[12.5px] hover:text-accent focus-visible:text-accent',
+              row.name ? 'font-mono text-text' : 'italic text-faint',
+            )}
+          >
+            {row.name ?? 'no name'}
+          </Link>
+          <RowFlags row={row} />
+        </div>
+        {row.name && source && (
+          <div className="text-[10.5px] text-faint" title={nameSourceTitle(row.name_source)}>
+            {source}
+          </div>
+        )}
+      </td>
+      <td className="min-w-0 px-2.5 py-[9px] align-middle">
+        <AddressCell row={row} />
+      </td>
+      <td className="min-w-0 px-2.5 py-[9px] align-middle">
+        {row.agent ? (
+          <div
+            className="min-w-0"
+            title={
+              row.agent.last_report
+                ? `The agent last reported ${absTime(row.agent.last_report)}.`
+                : 'The agent has no report time on record.'
+            }
+          >
+            <div className="truncate font-mono text-[12px] text-text-2">{row.agent.name}</div>
+            {row.agent.os && <div className="truncate text-[10.5px] text-faint">{row.agent.os}</div>}
+          </div>
+        ) : (
+          <span className="text-[12px] text-faint" title="No agent reports from this machine.">
+            none
+          </span>
+        )}
+      </td>
+      <td className="min-w-0 px-2.5 py-[9px] align-middle">
+        <RoleCell row={row} />
+      </td>
+      <td className="px-2.5 py-[9px] text-right align-middle font-mono text-[12px] text-dim">
+        {row.events.toLocaleString()}
+      </td>
+      <td
+        className="px-2.5 py-[9px] text-right align-middle font-mono text-[11.5px] text-faint"
+        title={absolute(row.first_seen)}
+      >
+        {ago(row.first_seen)}
+      </td>
+      <td
+        className="px-2.5 py-[9px] text-right align-middle font-mono text-[11.5px] text-faint"
+        title={absolute(row.last_seen)}
+      >
+        {ago(row.last_seen)}
+      </td>
+    </tr>
+  );
+}
 
-  // Filters are SERVER parameters, not a view over the fetched page: the table
-  // is one page of up to 5,000 hosts, and a client-side filter would quietly
-  // claim the other 4,950 don't match.
-  const [q, setQ] = useState('');
-  const [debouncedQ, setDebouncedQ] = useState('');
-  const [role, setRole] = useState('');
-  const [source, setSource] = useState(DEFAULT_SOURCE);
-  const [sort, setSort] = useState<DossierSortKey>(DEFAULT_SORT);
-  const [offset, setOffset] = useState(0);
-  // The broken-builds view lives in the URL so the summary bar's count can be
-  // a door and the view can be shared. The spelling (?health=broken) is the
-  // hosts-kpi backend contract — the same predicate the count describes.
-  const health = searchParams.get('health') === 'broken' ? ('broken' as const) : undefined;
+// ---- the broken-builds view -------------------------------------------------
 
-  useEffect(() => {
-    const t = setTimeout(() => setDebouncedQ(q.trim()), SEARCH_DEBOUNCE_MS);
-    return () => clearTimeout(t);
-  }, [q]);
-  // A new query is a new result set — page 3 of the old one means nothing
-  // under it. Reset with the DEBOUNCED value so offset and query change in one
-  // refetch instead of two.
-  useEffect(() => {
-    setOffset(0);
-  }, [debouncedQ, health]);
-
-  // The one facet this screen resolves itself. Everything else is a server
-  // parameter; see the note on LOW_CONFIDENCE_ROLE for why this cannot be.
-  const scanning = role === LOW_CONFIDENCE_ROLE;
-  const pageSize = scanning ? SCAN_SIZE : PAGE_SIZE;
-
+/**
+ * The addresses the sweep is not getting through to: a build never ran, or
+ * the last build failed. Build health is a fact about one address dossier, so
+ * this view lists addresses. Each address links to its machine page.
+ */
+function BrokenBuilds({ page, onPage }: { page: number; onPage: (page: number) => void }) {
   const list = useAsync(
     () =>
       listDossiers({
-        q: debouncedQ || undefined,
-        role: scanning ? undefined : role || undefined,
-        source: source === 'operator' || source === 'inferred' ? source : undefined,
-        // Broken hosts are often exactly the quiet ones — a build that never
-        // ran is a build that never saw traffic either. The broken-builds view
-        // must not hide the rows it exists to find, so activity never composes
-        // with health.
-        activity: source === 'active' && !health ? 'active' : undefined,
-        health,
-        sort,
-        limit: pageSize,
-        offset,
+        health: 'broken',
+        limit: HOSTS_PAGE_SIZE,
+        offset: (page - 1) * HOSTS_PAGE_SIZE,
       }),
-    [debouncedQ, role, scanning, pageSize, source, health, sort, offset],
+    [page],
+  );
+  const rows = list.data?.rows ?? [];
+  const total = list.data?.total ?? 0;
+  const from = total === 0 ? 0 : (page - 1) * HOSTS_PAGE_SIZE + 1;
+  const to = Math.min(page * HOSTS_PAGE_SIZE, total);
+  return (
+    <Panel>
+      <PanelHeader
+        icon={<AlertTriangle size={15} />}
+        title={list.data ? `Addresses with no clean build · ${total.toLocaleString()}` : 'Addresses with no clean build'}
+      />
+      {list.loading && !list.data ? (
+        <LoadingState label="Loading addresses…" />
+      ) : list.error ? (
+        <div className="p-3.5">
+          <ErrorState error={list.error} onRetry={list.refetch} label="the broken builds" />
+        </div>
+      ) : rows.length === 0 ? (
+        <EmptyState>Every address has a clean build.</EmptyState>
+      ) : (
+        <>
+          <table className="w-full table-fixed text-[12.5px]">
+            <thead className="border-b border-border bg-surface-2 text-[10.5px] uppercase tracking-[.06em] text-faint">
+              <tr>
+                <th scope="col" className="w-[22%] px-[15px] py-[9px] text-left font-semibold">
+                  Address
+                </th>
+                <th scope="col" className="px-2.5 py-[9px] text-left font-semibold">
+                  Build
+                </th>
+                <th scope="col" className="w-[14%] px-[15px] py-[9px] text-right font-semibold">
+                  Last built
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r) => (
+                <tr key={r.ip} className="border-b border-border-faint last:border-0">
+                  <td className="px-[15px] py-[9px]">
+                    <Link
+                      to={`/hosts/${encodeURIComponent(r.ip)}`}
+                      className="font-mono text-text hover:text-accent"
+                    >
+                      {r.ip}
+                    </Link>
+                  </td>
+                  <td className="min-w-0 truncate px-2.5 py-[9px] font-mono text-[11.5px] text-text-2" title={r.build_error ?? undefined}>
+                    {r.build_error ?? (r.last_built_at == null ? 'never built' : 'failed')}
+                  </td>
+                  <td
+                    className="px-[15px] py-[9px] text-right font-mono text-[11.5px] text-faint"
+                    title={absolute(r.last_built_at)}
+                  >
+                    {r.last_built_at ? ago(r.last_built_at) : 'never'}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <Pager from={from} to={to} total={total} page={page} onPage={onPage} />
+        </>
+      )}
+    </Panel>
+  );
+}
+
+function Pager({
+  from,
+  to,
+  total,
+  page,
+  onPage,
+}: {
+  from: number;
+  to: number;
+  total: number;
+  page: number;
+  onPage: (page: number) => void;
+}) {
+  return (
+    <div className="flex items-center justify-between border-t border-border px-[15px] py-2.5">
+      <span data-testid="hosts-pager" className="font-mono text-[11.5px] text-faint">
+        {`${from} to ${to} of ${total.toLocaleString()}`}
+      </span>
+      <div className="flex items-center gap-1.5">
+        <button
+          type="button"
+          onClick={() => onPage(Math.max(1, page - 1))}
+          disabled={page <= 1}
+          className="rounded-control border border-border-strong px-2.5 py-1 text-[11.5px] font-semibold text-dim hover:text-text disabled:opacity-40"
+        >
+          Previous
+        </button>
+        <button
+          type="button"
+          onClick={() => onPage(page + 1)}
+          disabled={to >= total}
+          className="rounded-control border border-border-strong px-2.5 py-1 text-[11.5px] font-semibold text-dim hover:text-text disabled:opacity-40"
+        >
+          Next
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ---- filter vocabulary ------------------------------------------------------
+
+const BUCKET_LABELS: Record<string, string> = {
+  low_confidence: 'low confidence',
+  stale: 'stale',
+  unknown: 'unknown',
+};
+
+function roleFilterLabel(role: string): string {
+  return BUCKET_LABELS[role] ?? roleLabel(role);
+}
+
+/** The role menu: every role a machine holds, with its count, then the three
+ *  buckets. A role with no machine is not offered. A filter that lists
+ *  nothing reads as a broken filter. The three buckets are always offered
+ *  with their count, 0 included: the count says the bucket is empty. */
+function roleOptions(summary: MachineSummary | null, current: string): FilterOption[] {
+  const roles = summary?.roles ?? {};
+  const buckets = new Set<string>(ROLE_BUCKETS);
+  const known = Object.entries(roles)
+    .filter(([role, count]) => !buckets.has(role) && count > 0)
+    .sort(([a], [b]) => roleLabel(a).localeCompare(roleLabel(b)))
+    .map(([role, count]) => ({ value: role, label: roleLabel(role), count }));
+  const options: FilterOption[] = [{ value: '', label: 'any role' }, ...known];
+  for (const bucket of ROLE_BUCKETS) {
+    options.push({ value: bucket, label: BUCKET_LABELS[bucket], count: summary ? roles[bucket] ?? 0 : undefined });
+  }
+  if (current && !options.some((o) => o.value === current)) {
+    options.push({ value: current, label: roleFilterLabel(current) });
+  }
+  return options;
+}
+
+/** A saved view, read into the URL shape. Views saved before the machine list
+ *  carry `source` and the old sort keys; each maps to its nearest filter. */
+function fromSavedView(saved: SavedViewQuery): Partial<Record<keyof HostsListState, string | null>> {
+  const str = (v: unknown) => (typeof v === 'string' ? v : '');
+  let role = str(saved.role);
+  if (role === '__low_confidence__') role = 'low_confidence';
+  if (role === '__stale__') role = 'stale';
+  let activity = str(saved.activity);
+  let declared = str(saved.declared);
+  if (typeof saved.source === 'string') {
+    if (saved.source === '') activity = 'all';
+    if (saved.source === 'operator') declared = 'yes';
+    if (saved.source === 'inferred') declared = 'no';
+  }
+  const sort = str(saved.sort) as MachineSortKey;
+  const known = MACHINE_SORT_KEYS.includes(sort);
+  return {
+    q: str(saved.q) || null,
+    role: role || null,
+    agent: str(saved.agent) || null,
+    activity: activity || null,
+    seen: str(saved.seen) || null,
+    declared: declared || null,
+    sort: known ? sort : null,
+    dir: known ? str(saved.dir) || null : null,
+  };
+}
+
+// ---- the screen -------------------------------------------------------------
+
+/**
+ * The host list: one row per machine.
+ *
+ * A machine is a set of addresses soc-ai holds to be one device. The server
+ * resolves the machine, its name, its role and the state of that role; this
+ * screen shows the answer and keeps every control in the URL, so Back, reload
+ * and the host page breadcrumb return to the same list.
+ */
+export function Hosts() {
+  const demo = useDemo();
+  const location = useLocation();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const state = readListState(searchParams);
+  // The broken-builds view lives in the URL so the Needs attention card can be
+  // a door and the view can be shared.
+  const health = searchParams.get('health') === 'broken' ? ('broken' as const) : undefined;
+
+  // One URL write per change. A change to anything but the page resets the
+  // page to 1 in the same write, so a search from page 3 is one request.
+  const update = useCallback(
+    (patch: Partial<Record<keyof HostsListState, string | number | null>>) => {
+      setSearchParams((prev) => patchListParams(prev, patch), { replace: true });
+    },
+    [setSearchParams],
   );
 
-  // The summary bar's numbers: an AGGREGATE request over the whole table,
-  // never computed from `list.data.rows` (one page of up to 5,000 hosts).
-  const kpis = useAsync(() => getDossierSummary(), []);
+  // The search box. The input is local so typing stays fast; the URL takes the
+  // value after the debounce, and the request follows the URL.
+  const [qInput, setQInput] = useState(state.q);
+  const urlQ = state.q;
+  const lastWritten = useRef(urlQ);
+  useEffect(() => {
+    // Back, a saved view or a card link changed the URL: show its query.
+    if (urlQ !== lastWritten.current) {
+      lastWritten.current = urlQ;
+      setQInput(urlQ);
+    }
+  }, [urlQ]);
+  useEffect(() => {
+    const next = qInput.trim();
+    if (next === urlQ) return;
+    const t = setTimeout(() => {
+      lastWritten.current = next;
+      update({ q: next || null });
+    }, SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [qInput]);
+
+  const queryKey = JSON.stringify(machineQuery(state));
+  const list = useAsync(
+    () => (health ? Promise.resolve(null) : listMachines(machineQuery(state))),
+    [queryKey, health],
+  );
+
+  // The cards: counts over the whole census, never the page.
+  const kpis = useAsync(() => getMachineSummary(), []);
+  // The header menus: counts under the activity the list shows, so a menu
+  // count is the number of rows its choice lists. A search ignores the
+  // activity, and so do its menus.
+  const menuActivity = state.activity === 'active' && !state.q ? 'active' : 'all';
+  const activeCounts = useAsync(
+    () => (menuActivity === 'active' ? getMachineSummary('active') : Promise.resolve(null)),
+    [menuActivity],
+  );
+  const menuCounts = menuActivity === 'active' ? activeCounts.data : kpis.data;
+  // The address census. It says whether any sweep has built anything (the
+  // first-run screen), whether sweeps run on a schedule, and the role
+  // vocabulary a bulk declare may write.
+  const census = useAsync(() => getDossierSummary(), []);
 
   // The disagreement queue. Its own request because `pending` counts the whole
   // queue, not this page.
   const conflicts = useAsync(() => getDossierConflicts(), []);
   const pending = conflicts.data?.pending ?? 0;
-  // The Dashboard nudge deep-links with ?conflicts=1. Initializer-only: once
-  // mounted the operator owns the toggle and the URL never fights them.
+  // The Dashboard nudge and the Conflicts card deep-link with ?conflicts=1.
   const [showConflicts, setShowConflicts] = useState(() => searchParams.get('conflicts') === '1');
   const conflictsParam = searchParams.get('conflicts');
   useEffect(() => {
     if (conflictsParam === '1') setShowConflicts(true);
   }, [conflictsParam]);
 
-  // The SPA's only role source (Sidebar reads it the same way). The mutating
-  // dossier routes are admin-gated server-side with no `hint` on the 403.
+  // The SPA's only role source. The mutating dossier routes are admin-gated.
   const [me, setMe] = useState<Me | null>(null);
   useEffect(() => {
     getMe()
       .then(setMe)
       .catch(() => {
-        /* unknown role — the rebuild control stays hidden, reads still work */
+        /* unknown role: the rebuild control stays hidden, reads still work */
       });
   }, []);
   const isAdmin = me?.role === 'admin';
 
-  // Sweep status. The FULL record (counters + failure strings) is an
-  // admin-gated GET; every other role reads the closed sweep-health projection
-  // instead, so a dead or running sweep is disclosed to whoever is looking at
-  // the list it explains. Neither is asked until /me has answered — the
-  // projection needs an authenticated caller, and getMe failing leaves the
-  // whole page degraded anyway. Polling is armed but SKIPPED unless a sweep is
-  // in flight — a rebuild is a rare, operator-initiated act, not a live
-  // console.
+  // Sweep status. The FULL record is an admin-gated GET; every other role
+  // reads the closed sweep-health projection. Polling is armed but SKIPPED
+  // unless a sweep is in flight.
   const roleKnown = me !== null;
   const runningRef = useRef(false);
   const refresh = useAsync<SweepStatusRead | null>(
@@ -518,16 +963,16 @@ export function Hosts() {
   const [starting, setStarting] = useState(false);
   const [note, setNote] = useState<string | null>(null);
 
-  // A finished sweep rewrote every row it touched — reload the page the
-  // operator is looking at rather than leaving them on pre-sweep answers.
+  // A finished sweep rewrote every machine it touched. Reload the page the
+  // operator is looking at, the cards and the queue.
   const wasRunning = useRef(false);
   useEffect(() => {
     if (wasRunning.current && !running) {
       list.refetch();
       conflicts.refetch();
-      // The bar counts what the sweep just rewrote; leaving it on pre-sweep
-      // numbers would make it the one thing on screen describing yesterday.
       kpis.refetch();
+      activeCounts.refetch();
+      census.refetch();
     }
     wasRunning.current = running;
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -543,9 +988,8 @@ export function Hosts() {
     setNote(null);
     try {
       const status = await startDossierRefresh();
-      // 'started' is the happy path and needs no words; 'already running' and
-      // 'dossier disabled' both mean THIS click did nothing, and saying so is
-      // the difference between an honest no-op and a button that lies.
+      // 'already running' and 'dossier disabled' both mean THIS click did
+      // nothing, and the screen says so.
       if (status.note && status.note !== 'started') setNote(status.note);
       refresh.refetch();
     } catch (err) {
@@ -555,29 +999,68 @@ export function Hosts() {
     }
   };
 
-  const read = list.data?.rows ?? [];
-  // The withheld guesses out of what the server returned. Every other facet is
-  // resolved in SQL and `total` describes the whole match set; this one cannot
-  // be, so the count line below names the stretch of the network it read.
-  const rows = scanning
-    ? read.filter((row) => {
-        const f = fieldOf(row, 'role');
-        return f != null && isWithheldGuess(f);
-      })
-    : read;
-  const total = list.data?.total ?? 0;
-  // What the table actually holds, which is the server's count everywhere
-  // except under the one filter this screen resolves itself.
-  const shownCount = scanning ? rows.length : total;
-  const limit = list.data?.limit ?? pageSize;
+  const listData = list.data;
+  const rows = useMemo(() => listData?.rows ?? [], [listData]);
+  const total = listData?.total ?? 0;
+  const offset = (state.page - 1) * HOSTS_PAGE_SIZE;
   const shownFrom = total === 0 ? 0 : offset + 1;
-  const shownTo = Math.min(offset + limit, total);
+  const shownTo = Math.min(offset + HOSTS_PAGE_SIZE, total);
 
-  // Checkboxes — the one list screen that never had them (dogfood A4). Admin
-  // only, because the declare they exist for is admin-gated server-side:
-  // offering a selection to an analyst who can only be 403'd for using it is a
-  // worse screen than not offering it.
-  const sel = useListSelection(rows.map((r) => r.ip));
+  // ---- the way back: the list URL and the scroll position ------------------
+  const rootRef = useRef<HTMLDivElement>(null);
+  const scrollTop = useRef(0);
+  // A row click saves the position at the click. The machine page then takes
+  // the place of the long list, the pane is short, and its scroll goes to 0
+  // before the unmount cleanup runs. The cleanup must not write that 0 over
+  // the click (dogfood 2026-10-02: 1729, then 0 52 ms later).
+  const savedAtOpen = useRef(false);
+  const search = location.search;
+  const searchRef = useRef(search);
+  searchRef.current = search;
+  useEffect(() => {
+    rememberListUrl(search);
+    // A click that opened a new tab left the list here, on a new URL now.
+    savedAtOpen.current = false;
+  }, [search]);
+  useEffect(() => {
+    const scroller = scrollParent(rootRef.current);
+    if (!scroller) return;
+    const onScroll = () => {
+      scrollTop.current = scroller.scrollTop;
+    };
+    scroller.addEventListener('scroll', onScroll, { passive: true });
+    return () => {
+      scroller.removeEventListener('scroll', onScroll);
+      if (!savedAtOpen.current) rememberListScroll(searchRef.current, scrollTop.current);
+    };
+  }, []);
+  const saveScroll = () => {
+    const scroller = scrollParent(rootRef.current);
+    rememberListScroll(search, scroller?.scrollTop ?? scrollTop.current);
+    savedAtOpen.current = true;
+  };
+  // Restore once, after the rows for this URL have rendered. Before the rows
+  // load the page is too short to hold the old position.
+  const restored = useRef(false);
+  useEffect(() => {
+    if (restored.current || !listData) return;
+    restored.current = true;
+    const top = savedListScroll(search);
+    if (top == null || top <= 0) return;
+    const scroller = scrollParent(rootRef.current);
+    if (scroller) {
+      scroller.scrollTop = top;
+      scrollTop.current = top;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [listData]);
+  const linkState: HostsLocationState = { fromList: `/hosts${search}` };
+
+  // ---- bulk declare --------------------------------------------------------
+  // Admin only, because the declare is admin-gated server-side. A machine is
+  // declared through its primary address: the address the machine page shows
+  // and edits.
+  const sel = useListSelection(rows.map((r) => r.primary_ip));
   const selecting = isAdmin && sel.count > 0;
   const [bulkField, setBulkField] = useState<'role' | 'criticality'>('criticality');
   const [bulkValue, setBulkValue] = useState('');
@@ -588,6 +1071,70 @@ export function Hosts() {
     const t = setTimeout(() => setBulkNote(null), 6000);
     return () => clearTimeout(t);
   }, [bulkNote]);
+
+  // The last bulk declaration, for Undo. Each address carries the operator
+  // value it held BEFORE the declaration: Undo restores that value, or removes
+  // the declaration when there was none. An address whose earlier value could
+  // not be read is left alone, and the note says so.
+  const [lastBulk, setLastBulk] = useState<{
+    field: 'role' | 'criticality';
+    value: string;
+    prior: Array<{ ip: string; value: string | null }>;
+    unknown: string[];
+  } | null>(null);
+  const [undoBusy, setUndoBusy] = useState(false);
+
+  const undoBulk = async () => {
+    if (!lastBulk) return;
+    const blocked = demoBlocked(demo);
+    if (blocked) {
+      setBulkNote(blocked);
+      return;
+    }
+    setUndoBusy(true);
+    const failed: string[] = [];
+    for (const { ip, value } of lastBulk.prior) {
+      try {
+        if (value == null) await clearDossierOverride(ip, lastBulk.field);
+        else await setDossierOverride(ip, { field: lastBulk.field, value });
+      } catch {
+        failed.push(ip);
+      }
+    }
+    const undone = lastBulk.prior.length - failed.length;
+    const parts = [`Undid ${lastBulk.field} "${lastBulk.value}" on ${plural(undone, 'machine')}.`];
+    if (lastBulk.unknown.length) {
+      parts.push(
+        `${plural(lastBulk.unknown.length, 'machine')} kept the declaration. This page could not read their earlier value.`,
+      );
+    }
+    if (failed.length) parts.push(`${failed.length} failed: ${failed.slice(0, 3).join(', ')}.`);
+    setBulkNote(parts.join(' '));
+    setLastBulk(null);
+    setUndoBusy(false);
+    list.refetch();
+    kpis.refetch();
+    activeCounts.refetch();
+  };
+
+  /** The operator value each address holds now, read off its dossier. An
+   *  address whose dossier cannot be read maps to undefined. */
+  const readPrior = async (ips: string[], field: 'role' | 'criticality') => {
+    const out = new Map<string, string | null | undefined>();
+    await Promise.all(
+      ips.map((ip) =>
+        getDossier(ip)
+          .then((d) => {
+            const f = d.fields.find((x) => x.field === field);
+            out.set(ip, f && f.overridden ? (f.value ?? null) : null);
+          })
+          .catch(() => {
+            out.set(ip, undefined);
+          }),
+      ),
+    );
+    return out;
+  };
 
   const declare = async () => {
     const ips = sel.ids;
@@ -601,15 +1148,14 @@ export function Hosts() {
     setBulkBusy(true);
     setBulkNote(null);
     try {
+      const before = await readPrior(ips, bulkField);
       const out = await bulkSetDossierOverride(ips, { field: bulkField, value });
-      // Name what did NOT take, per arm. A bare count — or worse, a raw error
-      // after a batch that half-landed — leaves the operator re-checking every
-      // row by hand.
-      const names = (list: string[]) =>
-        `${list.slice(0, 3).join(', ')}${list.length > 3 ? `, +${list.length - 3} more` : ''}`;
+      // Name what did NOT take, per arm.
+      const names = (items: string[]) =>
+        `${items.slice(0, 3).join(', ')}${items.length > 3 ? `, +${items.length - 3} more` : ''}`;
       const failedIps = (out.failed ?? []).map((f) => f.ip);
       const parts = [
-        `Declared ${bulkField} "${value}" on ${out.updated.length} of ${ips.length} host${ips.length === 1 ? '' : 's'}.`,
+        `Declared ${bulkField} "${value}" on ${out.updated.length} of ${plural(ips.length, 'machine')}.`,
       ];
       if (out.not_found.length) {
         parts.push(`${out.not_found.length} not swept yet: ${names(out.not_found)}.`);
@@ -618,14 +1164,28 @@ export function Hosts() {
         parts.push(`${failedIps.length} failed: ${names(failedIps)}. Try those again.`);
       }
       setBulkNote(parts.join(' '));
+      const known = (ip: string) => before.get(ip) !== undefined;
+      setLastBulk(
+        out.updated.length
+          ? {
+              field: bulkField,
+              value,
+              prior: out.updated
+                .filter(known)
+                .map((ip) => ({ ip, value: before.get(ip) ?? null })),
+              unknown: out.updated.filter((ip) => !known(ip)),
+            }
+          : null,
+      );
       // Keep the ones that did not land selected, so "try those again" is one
-      // click and not a re-selection exercise (the Alerts retry contract).
+      // click.
       const retry = [...out.not_found, ...failedIps];
       if (retry.length) sel.select(retry);
       else sel.clear();
       setBulkValue('');
       list.refetch();
       kpis.refetch();
+      activeCounts.refetch();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setBulkNote(/^403\b/.test(msg) ? 'Only an admin can declare host facts.' : msg);
@@ -634,69 +1194,10 @@ export function Hosts() {
     }
   };
 
-  // First run: nothing swept, nothing filtered. One sentence and one action —
-  // not four zero tiles, two competing calls to action and a live search box
-  // over zero rows. `source` narrows the network only at 'operator' /
-  // 'inferred' — its default ('active') and the explicit 'all hosts' ('') are
-  // both the screen's un-narrowed state, or a fresh install with nothing
-  // swept yet would read as "filtered" and never show the first-run screen.
-  const unfiltered =
-    !debouncedQ && !role && source !== 'operator' && source !== 'inferred' && !health;
-  // Gated on the SUMMARY's `hosts` — the whole table, never filtered by
-  // activity — rather than the page's own `total`. The screen's default
-  // already asks for `activity=active`, so a census that has been swept but
-  // is entirely quiet (every host event_count=0, the DNS-only-census case
-  // this filter exists for) also reports total=0 on the filtered page. That
-  // is "no hosts match", not "the sweep hasn't run" — a real census reading
-  // as an empty one is the exact defect the KPI strip exists to prevent
-  // (dossier_summary's own docstring), rebuilt here if `total` drove this.
-  //
-  // `!list.error` too: a failed list fetch must surface as an error with
-  // Retry, never get dressed up as first-run just because the summary (a
-  // SEPARATE request) came back with an empty census.
-  const firstRun = !!kpis.data && kpis.data.hosts === 0 && unfiltered && !list.error;
-
-  // The role options the screen can honestly offer: the classifier's closed
-  // vocabulary read from the summary wire (frontend list as fallback), plus any
-  // declared role visible on this page, plus whatever is currently selected (so
-  // an active filter never vanishes from its own list).
-  const wireRoles = kpis.data?.role_vocabulary;
-  const lowConfidenceHosts = kpis.data?.roles_low_confidence ?? 0;
-  const roleOptions = useMemo(() => {
-    const seen = new Set(roleVocabulary(wireRoles));
-    for (const r of rows) {
-      const v = fieldOf(r, 'role')?.value?.trim();
-      if (v) seen.add(v);
-    }
-    // The sentinel is not a role, so it never joins the vocabulary set.
-    if (role && role !== LOW_CONFIDENCE_ROLE) seen.add(role);
-    const options = [
-      { value: '', label: 'any role' },
-      ...[...seen].sort().map((r) => ({ value: r, label: roleLabel(r) })),
-    ];
-    // Last, and only over a network that has one: the ROLES bar's amber
-    // bucket, now reachable. An option that would list nothing is an option
-    // that reads as a broken filter.
-    if (lowConfidenceHosts > 0 || role === LOW_CONFIDENCE_ROLE) {
-      options.push({ value: LOW_CONFIDENCE_ROLE, label: 'low confidence' });
-    }
-    return options;
-  }, [rows, role, wireRoles, lowConfidenceHosts]);
-
   // What a BULK declare may set a role to: the classifier's closed vocabulary,
-  // and nothing else. Deliberately NOT `roleOptions` — the filter widens to
-  // whatever is on the page (a filter that cannot name a value on screen is
-  // broken), but a bulk WRITE that widens the same way would launder one
-  // free-text declare into the list everyone picks from.
-  //
-  // The single-host declare on /hosts/:ip stays free text on purpose. An
-  // operator who knows a machine is a `jump_host` knows more than the
-  // classifier, and that claim costs one row. This control writes the same
-  // keystroke to every selected host, and a role is a bucket in the ROLES bar
-  // and an entry in this screen's own facet — so one typo here is a new
-  // first-class role for every user of the deployment. The server enforces the
-  // same list (routes_dossier.py::bulk_set_dossier_override, `unknown_role`);
-  // this is the affordance, not the guard.
+  // and nothing else. One typo here would become a role for every machine
+  // selected. The server enforces the same list.
+  const wireRoles = census.data?.role_vocabulary;
   const bulkRoleOptions = useMemo(
     () => [
       { value: '', label: 'choose…' },
@@ -705,46 +1206,51 @@ export function Hosts() {
     [wireRoles],
   );
 
-  // Saved views. The whole filter set travels as one object, so a chip restores
-  // it whole — half-applying a view is how a "saved" view stops being the thing
-  // that was saved.
-  const currentQuery: SavedViewQuery = { q, role, source, sort };
-  // A TOTAL apply: a facet the view does not name goes back to THIS screen's
-  // default, never to whatever was on screen a moment ago. That is also what
-  // makes the chip a real toggle — clicking an active chip applies the empty
-  // query, which is this screen unfiltered.
+  // ---- filters, sort, saved views ------------------------------------------
+  const currentQuery: SavedViewQuery = {
+    q: state.q,
+    role: state.role,
+    agent: state.agent,
+    activity: state.activity,
+    seen: state.seen,
+    declared: state.declared,
+    sort: state.sort,
+    dir: state.dir,
+  };
+  // A TOTAL apply: a filter the view does not name goes back to the default.
   const views = useSavedViews('hosts', currentQuery, (saved) => {
-    setQ(typeof saved.q === 'string' ? saved.q : '');
-    setRole(typeof saved.role === 'string' ? saved.role : '');
-    // A view saved with an explicit '' (all hosts, from before this filter
-    // existed, or chosen on purpose) must restore to THAT, not the new
-    // default — `typeof === 'string'` tells '' apart from "not saved" so it
-    // does. Only a facet the saved query never named at all falls back to the
-    // screen's own default, same as every other facet here.
-    setSource(typeof saved.source === 'string' ? saved.source : DEFAULT_SOURCE);
-    setSort(typeof saved.sort === 'string' ? (saved.sort as DossierSortKey) : DEFAULT_SORT);
-    setOffset(0);
+    const patch = fromSavedView(saved);
+    setSearchParams(
+      (prev) => {
+        const base = new URLSearchParams(prev);
+        for (const key of ['q', 'role', 'agent', 'activity', 'seen', 'declared', 'sort', 'dir', 'page']) {
+          base.delete(key);
+        }
+        return patchListParams(base, patch);
+      },
+      { replace: true },
+    );
   });
 
-  const onRole = (v: string) => {
-    setRole(v);
-    setOffset(0);
+  const setFilter = (patch: Partial<Record<keyof HostsListState, string | null>>) => {
+    update(patch);
     views.clearActive();
   };
-  const onSource = (v: string) => {
-    setSource(v);
-    setOffset(0);
-    views.clearActive();
-  };
-  const onSort = (v: string) => {
-    setSort(v as DossierSortKey);
-    setOffset(0);
+  const onSort = (key: MachineSortKey) => {
+    const dir = state.sort === key ? (state.dir === 'asc' ? 'desc' : 'asc') : FIRST_DIR[key];
+    update({ sort: key, dir });
     views.clearActive();
   };
   const clearHealth = () => {
     const next = new URLSearchParams(searchParams);
     next.delete('health');
+    next.delete('page');
     setSearchParams(next, { replace: true });
+  };
+  const clearFilters = () => {
+    setQInput('');
+    lastWritten.current = '';
+    setFilter({ q: null, role: null, agent: null, seen: null, declared: null });
   };
 
   const summary = refresh.data?.summary ?? null;
@@ -752,92 +1258,62 @@ export function Hosts() {
     const v = summary?.[key];
     return typeof v === 'number' ? v : null;
   };
-
-  // What the last sweep DID, with no clock on it: the age of the data itself
-  // is the summary bar's one freshness line, and a second clock here (the
-  // sweep PROCESS's own stamp) legitimately disagrees with it.
   const sweptCounts: string[] = [];
   const hostsBuilt = summaryCount('hosts_built');
   const fieldsWritten = summaryCount('fields_written');
   if (hostsBuilt != null) sweptCounts.push(`${hostsBuilt.toLocaleString()} hosts built`);
   if (fieldsWritten != null) sweptCounts.push(`${fieldsWritten.toLocaleString()} fields written`);
 
-  // What the sweep could NOT do. The counts above are the sweep's own report of
-  // its work, and on a blind run they are a quiet, plausible-looking zero — the
-  // refresh route writes a bare {"errors": [...]} when the task died, so on the
-  // worst run of all there are no counts to print at all and this line was the
-  // only thing that could have said so.
-  //
-  // `errors` and nothing else. DossierSummary keeps advisory `notes` (a
-  // truncated cap, a cadence ceiling) in a separate field precisely so a
-  // healthy nightly sweep does not report trouble every night, and a zero
-  // count is not trouble either: an estate where nothing changed builds zero
-  // hosts and that is the right answer. (The projection's `degraded` is keyed
-  // to the same rule server-side, so the two reads cannot disagree about
-  // whether a run was trouble.)
-  //
-  // The STRINGS are the admin read's; a non-admin gets the verdict and the
-  // count. Both are the same `degraded` answer.
+  // What the sweep could NOT do. `errors` and nothing else: advisory notes are
+  // not trouble, and a zero count is not trouble either.
   const sweepErrors = refresh.data?.errors ?? [];
   const sweepErrorCount = refresh.data?.errorCount ?? 0;
   const sweepDegraded = !!refresh.data?.degraded;
-  // The screen asked after the sweep and got nothing back — distinct from a
-  // read that has not answered yet, and from a record read clean. "We could
-  // not check" and "no sweep has run" are different sentences, and the empty
-  // lead below used to print the second over this state. A FOREGROUND failure
-  // only, the HostDetail rule: useAsync keeps last-good data through a failed
-  // background poll, and a record read once outranks the blip that followed it.
+  // The screen asked after the sweep and got nothing back. "We could not
+  // check" and "no sweep has run" are different sentences. A FOREGROUND
+  // failure only: useAsync keeps last-good data through a failed poll.
   const sweepUnreadable = !!refresh.error && !refresh.data;
 
-  // The verdict on the last SWEEP, which is not feedback on the last click, so
-  // a POST note ('already running', a demo block, a failed POST) does not stand
-  // in for it. The note is never cleared, so letting it suppress the verdict
-  // meant one click that collided with a sweep already in flight buried that
-  // sweep's outcome for the rest of the session — and the sweep the operator
-  // collided with is exactly the one whose result they were waiting for.
-  //
-  // Not gated on `firstRun` either. An empty table is precisely what a first
-  // sweep that died against a down grid leaves behind, and a fresh install
-  // against a down grid is where the catch-all payload comes from — the state
-  // that most needs saying was the one state that could not say it.
-  //
-  // Not gated on the ROLE either, any more: an incomplete list is incomplete
-  // for whoever is reading it, and the projection carries the verdict and the
-  // count for a non-admin — only the failure strings stay behind the admin
-  // gate.
+  // The first run: nothing swept, nothing filtered. Gated on the address
+  // CENSUS, never on the page's own total. A census that is swept but quiet is
+  // "no machines match", not "the sweep hasn't run". A failed list read is an
+  // error with Retry, never the first-run panel.
+  const narrowed = !!(state.q || state.role || state.agent || state.seen || state.declared || health);
+  const firstRun = !!census.data && census.data.hosts === 0 && !narrowed && !list.error;
+
   const showSweepErrors = !running && sweepDegraded;
   const showSweptCounts = isAdmin && !note && !running && !firstRun && sweptCounts.length > 0;
-
-  // A sweep this screen is waiting on: one the server reports running, and the
-  // gap before the POST that starts one has answered — which on a slow grid is
-  // seconds long, and is time the empty state below spends asserting that no
-  // sweep has ever run.
   const sweepInFlight = running || starting;
 
-  // The Show control's DISPLAYED value under the broken-builds view. The
-  // query builder above already drops `activity` while `health` is set — a
-  // build that never ran never saw traffic either, so a broken host is often
-  // exactly a quiet one, and the view must not hide the rows it exists to
-  // find. The control has to stay honest about that: showing "with traffic"
-  // while the request behind it does not actually filter on traffic is the
-  // control lying about its own state. Narrowed to the 'active' value only —
-  // 'operator' and 'inferred' genuinely still compose with `health` (unlike
-  // `activity`, nothing suppresses them), so forcing the control to 'all
-  // hosts' for those too would make a real, still-applied choice stop
-  // showing as selected.
-  const displayedSource = health && source === 'active' ? '' : source;
+  const activeChips: Array<{ key: keyof HostsListState; label: string }> = [];
+  if (state.role) activeChips.push({ key: 'role', label: `Role: ${roleFilterLabel(state.role)}` });
+  if (state.agent) activeChips.push({ key: 'agent', label: state.agent === 'yes' ? 'With an agent' : 'Without an agent' });
+  if (state.seen) activeChips.push({ key: 'seen', label: 'New in 7 days' });
+  if (state.declared) {
+    activeChips.push({ key: 'declared', label: state.declared === 'yes' ? 'Declared by an operator' : 'Not declared' });
+  }
+
+  const machines = kpis.data?.machines;
+  const addresses = kpis.data?.addresses;
 
   return (
-    <div className="px-[22px] pb-[60px] pt-5">
+    <div ref={rootRef} className="px-[22px] pb-[60px] pt-5">
       {/* page header */}
       <div className="mb-4">
         <div className="flex items-baseline gap-3">
           <div className="text-title">Hosts</div>
           <Freshness at={list.lastUpdated} />
         </div>
+        <div data-testid="hosts-count" className="mt-0.5 font-mono text-[12.5px] text-text-2">
+          {machines != null && addresses != null
+            ? `${plural(machines, 'machine')} · ${plural(addresses, 'address', 'addresses')}`
+            : kpis.error
+              ? 'The machine count could not be read.'
+              : 'Counting machines…'}
+        </div>
         <div className="mt-0.5 max-w-[760px] text-[13px] text-dim">
-          The network sweep learns facts about each host. You can declare your own answers. Your
-          declaration replaces the sweep's answer.
+          One row is one machine. A machine holds every address that soc-ai ties to one device.
+          You can declare your own answers. Your declaration replaces the sweep answer.
         </div>
       </div>
 
@@ -845,130 +1321,152 @@ export function Hosts() {
         <StaleNotice since={list.lastUpdated} onRefresh={list.refetch} className="mb-3" />
       )}
 
-      {/* The shared list toolbar — server parameters, all of them. Hidden on
-          first run: search, three filters and a sort over zero rows was half of
-          F9. */}
-      {!firstRun && (
-        <ListToolbar
-          views={views.views}
-          activeViewId={views.activeViewId}
-          onApplyView={views.onApplyView}
-          onDeleteView={views.onDeleteView}
-          onSaveView={views.onSaveView}
-          viewError={views.error}
-          saveViewUnavailable={views.unavailable}
-          search={{
-            value: q,
-            onChange: (v) => {
-              setQ(v);
-              views.clearActive();
-            },
-            placeholder: 'Search address or hostname…',
-            label: 'Search hosts',
-          }}
-          note={bulkNote}
-          selection={
-            selecting
-              ? {
-                  count: sel.count,
-                  noun: sel.count === 1 ? 'host selected' : 'hosts selected',
-                  offPageCount: sel.offPageCount,
-                  onClearOffPage: sel.clearOffPage,
-                  onClear: sel.clear,
-                  actions: (
-                    <>
-                      <Select
-                        value={bulkField}
-                        options={BULK_FIELDS}
-                        label="Field to declare"
-                        onChange={(v) => {
-                          setBulkField(v as 'role' | 'criticality');
-                          setBulkValue('');
-                        }}
-                      />
-                      {bulkField === 'criticality' ? (
-                        <Select
-                          value={bulkValue}
-                          options={[
-                            { value: '', label: 'choose…' },
-                            ...CRITICALITIES.map((c) => ({ value: c, label: c })),
-                          ]}
-                          onChange={setBulkValue}
-                          label="Criticality to declare"
-                        />
-                      ) : (
-                        <Select
-                          value={bulkValue}
-                          options={bulkRoleOptions}
-                          onChange={setBulkValue}
-                          label="Role to declare"
-                        />
-                      )}
-                      <button
-                        disabled={bulkBusy || !bulkValue.trim()}
-                        onClick={() => {
-                          void declare();
-                        }}
-                        title="Declare this value on every selected host. Your answer wins over the sweep answer and survives the next rebuild."
-                        className="flex items-center gap-1.5 rounded-[7px] border px-[11px] py-1.5 text-[12.5px] font-semibold text-[#cfe0ff] disabled:opacity-50"
-                        style={{ background: 'rgba(75,139,245,.14)', borderColor: 'rgba(75,139,245,.4)' }}
-                      >
-                        <UserCheck size={12} />
-                        {bulkBusy ? 'Declaring…' : `Declare (${sel.count})`}
-                      </button>
-                    </>
-                  ),
-                }
-              : undefined
-          }
-          trailing={
-            isAdmin ? (
-              <button
-                onClick={() => {
-                  void rebuild();
-                }}
-                disabled={starting || running}
-                title="Start a network sweep now. The sweep runs in the background because it queries hundreds of hosts."
-                className="flex items-center gap-1.5 rounded-[7px] border border-border-strong px-[11px] py-1.5 text-[12.5px] font-semibold text-dim hover:text-text disabled:opacity-60"
-              >
-                <RefreshCw size={12} className={running || starting ? 'animate-spin' : ''} />
-                {running ? 'Rebuilding…' : 'Rebuild now'}
-              </button>
-            ) : undefined
-          }
+      {/* The shared list toolbar. Hidden on first run. The toolbar holds the
+          bulk bar and stays on screen while the operator selects rows. */}
+      {!firstRun && !health && (
+        <div
+          data-testid="hosts-toolbar"
+          className={cn(selecting && 'sticky top-0 z-20 bg-bg pb-1 shadow-[0_1px_0_rgba(0,0,0,.4)]')}
         >
-          <label className="flex items-center gap-1.5">
-            <span className="text-[10.5px] font-semibold uppercase tracking-[.06em] text-faint">
-              Role
-            </span>
-            <Select value={role} options={roleOptions} onChange={onRole} />
-          </label>
-          <label className="flex items-center gap-1.5">
-            <span className="text-[10.5px] font-semibold uppercase tracking-[.06em] text-faint">
-              Show
-            </span>
-            <Select
-              value={displayedSource}
-              options={[
-                { value: 'active', label: 'with traffic' },
-                { value: '', label: 'all hosts' },
-                { value: 'operator', label: 'with declarations' },
-                { value: 'inferred', label: 'sweep answers only' },
-              ]}
-              onChange={onSource}
-            />
-          </label>
-          <label className="flex items-center gap-1.5">
-            <span className="text-[10.5px] font-semibold uppercase tracking-[.06em] text-faint">
-              Sort
-            </span>
-            <Select value={sort} options={SORTS} onChange={onSort} />
-          </label>
-        </ListToolbar>
+          <ListToolbar
+            views={views.views}
+            activeViewId={views.activeViewId}
+            onApplyView={views.onApplyView}
+            onDeleteView={views.onDeleteView}
+            onSaveView={views.onSaveView}
+            viewError={views.error}
+            saveViewUnavailable={views.unavailable}
+            search={{
+              value: qInput,
+              onChange: (v) => {
+                setQInput(v);
+                views.clearActive();
+              },
+              placeholder: 'Search name, address, MAC, OS, role, agent…',
+              label: 'Search hosts',
+            }}
+            note={bulkNote}
+            selection={
+              selecting
+                ? {
+                    count: sel.count,
+                    noun: sel.count === 1 ? 'machine selected' : 'machines selected',
+                    offPageCount: sel.offPageCount,
+                    onClearOffPage: sel.clearOffPage,
+                    onClear: sel.clear,
+                    actions: (
+                      <>
+                        <Select
+                          value={bulkField}
+                          options={BULK_FIELDS}
+                          label="Field to declare"
+                          onChange={(v) => {
+                            setBulkField(v as 'role' | 'criticality');
+                            setBulkValue('');
+                          }}
+                        />
+                        {bulkField === 'criticality' ? (
+                          <Select
+                            value={bulkValue}
+                            options={[
+                              { value: '', label: 'choose…' },
+                              ...CRITICALITIES.map((c) => ({ value: c, label: c })),
+                            ]}
+                            onChange={setBulkValue}
+                            label="Criticality to declare"
+                          />
+                        ) : (
+                          <Select
+                            value={bulkValue}
+                            options={bulkRoleOptions}
+                            onChange={setBulkValue}
+                            label="Role to declare"
+                          />
+                        )}
+                        <button
+                          disabled={bulkBusy || !bulkValue.trim()}
+                          onClick={() => {
+                            void declare();
+                          }}
+                          title="Declare this value on the primary address of every selected machine. Your answer wins over the sweep answer and survives the next rebuild."
+                          className="flex items-center gap-1.5 rounded-[7px] border px-[11px] py-1.5 text-[12.5px] font-semibold text-[#cfe0ff] disabled:opacity-50"
+                          style={{ background: 'rgba(75,139,245,.14)', borderColor: 'rgba(75,139,245,.4)' }}
+                        >
+                          <UserCheck size={12} />
+                          {bulkBusy ? 'Declaring…' : `Declare (${sel.count})`}
+                        </button>
+                      </>
+                    ),
+                  }
+                : undefined
+            }
+            trailing={
+              isAdmin ? (
+                <>
+                  {lastBulk && (
+                    <button
+                      data-testid="bulk-undo"
+                      onClick={() => {
+                        void undoBulk();
+                      }}
+                      disabled={undoBusy}
+                      title="Undo the last bulk declaration. Each address gets back the value it held before. Nothing else changes."
+                      className="flex items-center gap-1.5 rounded-[7px] border border-warn/40 px-[11px] py-1.5 text-[12.5px] font-semibold text-warn hover:bg-warn/10 disabled:opacity-60"
+                    >
+                      {undoBusy
+                        ? 'Undoing…'
+                        : `Undo ${lastBulk.field} "${lastBulk.value}" (${lastBulk.prior.length})`}
+                    </button>
+                  )}
+                  <button
+                    onClick={() => {
+                      void rebuild();
+                    }}
+                    disabled={starting || running}
+                    title="Start a network sweep now. The sweep runs in the background because it queries hundreds of hosts."
+                    className="flex items-center gap-1.5 rounded-[7px] border border-border-strong px-[11px] py-1.5 text-[12.5px] font-semibold text-dim hover:text-text disabled:opacity-60"
+                  >
+                    <RefreshCw size={12} className={running || starting ? 'animate-spin' : ''} />
+                    {running ? 'Rebuilding…' : 'Rebuild now'}
+                  </button>
+                </>
+              ) : undefined
+            }
+          />
+          {/* The search reads the whole census. The activity filter does not
+              apply to it, and the screen says so while a query is set. */}
+          {state.q && (
+            <div data-testid="hosts-search-scope" className="-mt-1.5 mb-2 text-[11.5px] text-faint">
+              Searching all hosts. The activity filter does not apply to a search.
+            </div>
+          )}
+          {activeChips.length > 0 && (
+            <div data-testid="hosts-active-filters" className="mb-2.5 flex flex-wrap items-center gap-1.5">
+              {activeChips.map((c) => (
+                <button
+                  key={c.key}
+                  type="button"
+                  onClick={() => setFilter({ [c.key]: null })}
+                  aria-label={`Remove the filter ${c.label}`}
+                  className="flex items-center gap-1 rounded-chip border border-accent/40 bg-accent/10 px-2 py-0.5 text-[11.5px] font-semibold text-accent hover:bg-accent/20"
+                >
+                  {c.label}
+                  <X size={11} />
+                </button>
+              ))}
+              <button
+                type="button"
+                onClick={clearFilters}
+                className="text-[11.5px] text-dim underline hover:text-text"
+              >
+                Clear filters
+              </button>
+            </div>
+          )}
+        </div>
       )}
 
-      {/* Sweep feedback: the note from the POST (never a silent no-op) and a
-          compact read of the last run's counters. */}
+      {/* Sweep feedback: the note from the POST and the last run's counters. */}
       {note && (
         <div className="mb-3.5 rounded-card border border-warn/30 bg-warn/[0.06] px-3.5 py-2.5 text-[12.5px] text-text-2">
           {note === 'dossier disabled' ? (
@@ -986,10 +1484,6 @@ export function Hosts() {
       )}
       {(showSweepErrors || showSweptCounts) && (
         <div className="mb-3.5">
-          {/* Above the counts, not instead of them: a sweep that failed four
-              queries and still built 300 hosts really did build them, and
-              erasing that record under-reports the run in the other direction.
-              A total failure carries no counts, so the note stands alone. */}
           {showSweepErrors && (
             <div
               data-testid="sweep-degraded"
@@ -1007,14 +1501,6 @@ export function Hosts() {
                   ? 'A rebuild runs the same queries. Start with what failed:'
                   : 'An admin can read what failed on this screen. An admin can start another sweep.'}
               </div>
-              {/* The strings themselves, not just how many. This channel carries
-                  local faults as well as grid ones ("no internal CIDRs
-                  configured; cannot scope the network"), and a bare count sends
-                  the operator off to wait on Security Onion for something
-                  Security Onion will never fix. Admin only: the strings are the
-                  reason the full status is gated, so the projection a non-admin
-                  reads never carries them — for that reader the verdict and
-                  the count stand alone. */}
               {sweepErrors.length > 0 && (
                 <ul className="mt-1.5 max-w-[760px] space-y-0.5 text-[11.5px] text-dim">
                   {sweepErrors.slice(0, SHOWN_ERRORS).map((e, i) => (
@@ -1045,11 +1531,17 @@ export function Hosts() {
 
       {/* Network-wide, above everything the table says about a page of it. */}
       {!firstRun && (
-        <HostsSummary summary={kpis.data} failed={kpis.error != null} queueVisible={pending > 0} shown={list.data ? shownCount : undefined} filtered={displayedSource !== ''} />
+        <HostsSummary
+          summary={kpis.data}
+          failed={kpis.error != null}
+          linkFor={(patch) => listHref({ sort: state.sort, dir: state.dir, ...patch })}
+          brokenHref={BROKEN_HREF}
+          conflictsHref={CONFLICTS_HREF}
+          scheduleEnabled={census.data ? census.data.schedule_enabled : null}
+        />
       )}
 
-      {/* The disagreement queue — the single conflict surface on this screen,
-          in the one-line both-claims shape the critique called the good one. */}
+      {/* The disagreement queue: the single conflict surface on this screen. */}
       {!firstRun && pending > 0 && (
         <div className="mb-3.5 overflow-hidden rounded-card border border-warn/30 bg-warn/[0.06]">
           <div className="flex items-center gap-2.5 px-3.5 py-2.5 text-[13px]">
@@ -1084,20 +1576,19 @@ export function Hosts() {
         </div>
       )}
 
-      {/* The broken-builds view names itself, with the way back — a filtered
-          table that looks like the whole network is its own defect. */}
+      {/* The broken-builds view names itself, with the way back. */}
       {health && (
         <div className="mb-3.5 flex flex-wrap items-center gap-3 rounded-card border border-danger/30 bg-danger/[0.05] px-3.5 py-2.5 text-[12.5px] text-text-2">
           <AlertTriangle size={13} className="flex-none text-danger" />
           <span className="min-w-0 flex-1">
-            This view shows the hosts the sweep is not getting through to. A build never ran, or
-            the last build failed.
+            This view shows the addresses the sweep is not getting through to. A build never ran,
+            or the last build failed.
           </span>
           <button
             onClick={clearHealth}
             className="flex-none rounded-control border border-border-strong bg-surface-3 px-2.5 py-1 text-[11.5px] font-semibold text-text-2 hover:text-text"
           >
-            Show all hosts
+            Show all machines
           </button>
         </div>
       )}
@@ -1107,38 +1598,10 @@ export function Hosts() {
           <PanelHeader icon={<Server size={15} />} title="Hosts" />
           <EmptyState>
             <div className="mx-auto max-w-[520px]">
-              {/* An empty table has THREE very different causes and the sweep
-                  record tells them apart. "Hasn't run yet" over a sweep that
-                  ran and died is this screen's own version of the bug the note
-                  above exists to fix, and it is the sentence a fresh install
-                  against a down grid lands on every time. It is just as false
-                  over a sweep that is running right now, which is the state an
-                  operator who has just pressed the button is staring at — for
-                  minutes, on a grid that answers slowly, with a dimmed button
-                  as the only sign anything is happening. The in-flight branch
-                  goes FIRST: a running sweep supersedes the last one's verdict,
-                  the same way the degraded note above hides itself while one is
-                  in flight.
-
-                  All three branches key off the normalized status read, so they
-                  hold for a NON-admin too (the projection carries running and
-                  degraded) — an analyst on a fresh install used to read
-                  "hasn't run yet" over a sweep that ran and died, because the
-                  full status is admin-gated and this screen never asked
-                  anything else.
-
-                  A FOURTH branch for the read that FAILED: 'unknown' below is
-                  a status still in flight, and the healthy copy stands in for
-                  the moment it takes to answer — but once the answer is a
-                  failure, "hasn't run yet" is a claim this screen has just
-                  proven it cannot make, and the paused poll means it would
-                  stand for the session. HostDetail's sweepUnreadable precedent:
-                  say "could not check" instead.
-
-                  `data-sweep` says what this lead KNOWS: the healthy copy also
-                  renders while the status read is in flight, so a test (or
-                  anything else) asserting the first-run copy off the first
-                  paint would be asserting nothing. */}
+              {/* An empty census has several causes, and the sweep record
+                  tells them apart: a sweep in flight, a sweep that died, a
+                  status read that failed, and a sweep that never ran.
+                  `data-sweep` says what this lead KNOWS. */}
               <div
                 data-testid="hosts-empty-lead"
                 data-sweep={
@@ -1180,9 +1643,6 @@ export function Hosts() {
                   className="mx-auto mt-3 flex items-center gap-1.5 rounded-control border border-accent bg-accent/10 px-3.5 py-1.5 text-[12.5px] font-semibold text-accent hover:bg-accent/20 disabled:opacity-60"
                 >
                   <RefreshCw size={12} className={sweepInFlight ? 'animate-spin' : ''} />
-                  {/* "Run the first sweep" claims none has run — over an
-                      unreadable record that is the lead's false sentence again,
-                      half an inch lower. A neutral label makes no claim. */}
                   {sweepInFlight
                     ? 'Sweeping…'
                     : sweepDegraded
@@ -1207,199 +1667,171 @@ export function Hosts() {
             </div>
           </EmptyState>
         </Panel>
+      ) : health ? (
+        <BrokenBuilds page={state.page} onPage={(page) => update({ page })} />
       ) : (
         <Panel>
           <PanelHeader
             icon={<Server size={15} />}
-            title={list.data ? `Hosts · ${shownCount.toLocaleString()}` : 'Hosts'}
+            title={listData ? `Machines · ${total.toLocaleString()}` : 'Machines'}
           />
-
-          <div
-            className="grid gap-2.5 border-b border-border bg-surface-2 px-[15px] py-[9px] text-[10.5px] font-semibold uppercase tracking-[.06em] text-faint"
-            style={{ gridTemplateColumns: isAdmin ? GRID_SELECTABLE : GRID }}
-          >
-            {isAdmin && (
-              <div className="flex items-center">
-                <Checkbox
-                  checked={sel.allVisibleSelected}
-                  indeterminate={!sel.allVisibleSelected && sel.someVisibleSelected}
-                  onChange={sel.toggleAll}
-                  title="Select every host on this page."
-                  aria-label="Select all hosts on this page"
-                />
-              </div>
-            )}
-            <div>Address</div>
-            <div>Host</div>
-            <div>Role</div>
-            <div>Flags</div>
-            <div className="text-right">Events</div>
-            <div className="text-right">Last seen</div>
+          <div className="overflow-x-auto">
+            <table data-testid="hosts-table" className="w-full table-fixed border-collapse text-[12.5px]">
+              <thead className="border-b border-border bg-surface-2 text-[10.5px] text-faint">
+                <tr>
+                  {isAdmin && (
+                    <th scope="col" className="w-[38px] px-2.5 py-[9px] text-left">
+                      <Checkbox
+                        checked={sel.allVisibleSelected}
+                        indeterminate={!sel.allVisibleSelected && sel.someVisibleSelected}
+                        onChange={sel.toggleAll}
+                        title="Select every machine on this page."
+                        aria-label="Select all hosts on this page"
+                      />
+                    </th>
+                  )}
+                  {COLUMNS.map((col) => (
+                    <SortHeader
+                      key={col.key}
+                      col={col}
+                      state={state}
+                      onSort={onSort}
+                      filter={
+                        col.key === 'role' ? (
+                          <HeaderFilter
+                            name="Role"
+                            groups={[
+                              {
+                                label: 'Role',
+                                value: state.role,
+                                options: roleOptions(menuCounts, state.role),
+                                onChange: (v) => setFilter({ role: v || null }),
+                              },
+                              {
+                                label: 'Declaration',
+                                value: state.declared,
+                                options: [
+                                  { value: '', label: 'any' },
+                                  { value: 'yes', label: 'declared by an operator' },
+                                  { value: 'no', label: 'not declared' },
+                                ],
+                                onChange: (v) => setFilter({ declared: v || null }),
+                              },
+                            ]}
+                          />
+                        ) : col.key === 'agent' ? (
+                          <HeaderFilter
+                            name="Agent"
+                            groups={[
+                              {
+                                value: state.agent,
+                                options: [
+                                  { value: '', label: 'any' },
+                                  { value: 'yes', label: 'with an agent', count: menuCounts?.with_agent },
+                                  { value: 'no', label: 'without an agent', count: menuCounts?.without_agent },
+                                ],
+                                onChange: (v) => setFilter({ agent: v || null }),
+                              },
+                            ]}
+                          />
+                        ) : col.key === 'events' ? (
+                          <HeaderFilter
+                            name="Activity"
+                            align="right"
+                            groups={[
+                              {
+                                value: state.activity,
+                                options: [
+                                  { value: 'active', label: 'machines with events' },
+                                  { value: 'all', label: 'all machines', count: kpis.data?.machines },
+                                ],
+                                onChange: (v) => setFilter({ activity: v === 'all' ? 'all' : null }),
+                              },
+                            ]}
+                          />
+                        ) : col.key === 'first_seen' ? (
+                          <HeaderFilter
+                            name="First seen"
+                            align="right"
+                            groups={[
+                              {
+                                value: state.seen,
+                                options: [
+                                  { value: '', label: 'any time' },
+                                  { value: 'new', label: 'in the last 7 days', count: menuCounts?.new_7d },
+                                ],
+                                onChange: (v) => setFilter({ seen: v || null }),
+                              },
+                            ]}
+                          />
+                        ) : undefined
+                      }
+                    />
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {list.loading && !listData ? (
+                  <tr>
+                    <td colSpan={COLUMNS.length + (isAdmin ? 1 : 0)}>
+                      <LoadingState label="Loading machines…" />
+                    </td>
+                  </tr>
+                ) : list.error ? (
+                  <tr>
+                    <td colSpan={COLUMNS.length + (isAdmin ? 1 : 0)} className="p-3.5">
+                      <ErrorState error={list.error} onRetry={list.refetch} label="the host list" />
+                    </td>
+                  </tr>
+                ) : rows.length === 0 ? (
+                  <tr>
+                    <td colSpan={COLUMNS.length + (isAdmin ? 1 : 0)}>
+                      <EmptyState>
+                        {state.q
+                          ? `No machine matches "${state.q}". The search reads every name, address, MAC, OS, role and agent name.`
+                          : 'No machines match the current filters. Change a filter to see more machines.'}
+                      </EmptyState>
+                    </td>
+                  </tr>
+                ) : (
+                  rows.map((row) => (
+                    <MachineTableRow
+                      key={row.key}
+                      row={row}
+                      selectable={isAdmin}
+                      selected={sel.isSelected(row.primary_ip)}
+                      onToggle={() => sel.toggle(row.primary_ip)}
+                      onOpen={saveScroll}
+                      linkState={linkState}
+                    />
+                  ))
+                )}
+              </tbody>
+            </table>
           </div>
 
-          {list.loading && !list.data ? (
-            <LoadingState label="Loading hosts…" />
-          ) : list.error ? (
-            <div className="p-3.5">
-              <ErrorState error={list.error} onRetry={list.refetch} label="the host list" />
-            </div>
-          ) : rows.length === 0 ? (
-            <EmptyState>
-              No hosts match the current filters. Change a filter to see more hosts.
-            </EmptyState>
-          ) : (
-            <>
-              {rows.map((row) => {
-                const hostnameField = fieldOf(row, 'hostname');
-                const hostname =
-                  hostnameField && isResolved(hostnameField) ? hostnameField.value : null;
-                const roleField = fieldOf(row, 'role');
-                const roleValue = roleField && isResolved(roleField) ? roleField.value : null;
-                return (
-                  <div
-                    key={row.ip}
-                    onClick={() => navigate(`/hosts/${encodeURIComponent(row.ip)}`)}
-                    className="grid cursor-pointer items-center gap-2.5 border-b border-border-faint px-[15px] py-[10px] last:border-0 hover:bg-surface-hover"
-                    style={{ gridTemplateColumns: isAdmin ? GRID_SELECTABLE : GRID }}
-                  >
-                    {isAdmin && (
-                      <div
-                        className="flex items-center"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          sel.toggle(row.ip);
-                        }}
-                      >
-                        <Checkbox
-                          checked={sel.isSelected(row.ip)}
-                          title="Select this host."
-                          aria-label={`Select ${row.ip}`}
-                        />
-                      </div>
-                    )}
-                    <div className="min-w-0">
-                      <Link
-                        to={`/hosts/${encodeURIComponent(row.ip)}`}
-                        onClick={(e) => e.stopPropagation()}
-                        className="min-w-0 truncate font-mono text-[12.5px] text-text hover:text-accent"
-                      >
-                        {row.ip}
-                      </Link>
-                    </div>
-                    <div className="min-w-0">
-                      {hostname ? (
-                        <span className="min-w-0 truncate font-mono text-[12.5px] text-text-2">
-                          {hostname}
-                        </span>
-                      ) : (
-                        <Unknown f={hostnameField} />
-                      )}
-                    </div>
-                    <div className="min-w-0">
-                      {/* The FRIENDLY label, the same one the ROLES legend up
-                          the screen uses. The pill used to print the raw slug,
-                          so one screen showed `network_device` in the table and
-                          "network device" in the legend counting it — two
-                          spellings of one value, twelve rows apart, reading as
-                          two things. roleLabel passes operator free text
-                          through, so a declared role is still their own word;
-                          the title keeps the stored value one hover away. */}
-                      {roleValue ? (
-                        <span
-                          title={roleValue}
-                          className={cn(
-                            'inline-flex max-w-full truncate rounded-chip border px-1.5 py-px text-[12px] font-medium',
-                            roleAccent(roleValue),
-                          )}
-                        >
-                          {roleLabel(roleValue)}
-                        </span>
-                      ) : roleField && isWithheldGuess(roleField) ? (
-                        // The sweep has a guess and the resolver will not
-                        // assert it. The row cannot name the guess — the list
-                        // shape carries the answer, not the inference lane —
-                        // so it says that one exists and where to read it.
-                        <span
-                          data-testid="role-possibly"
-                          title="The sweep inferred a role below the confidence gate. Open the host to read the inferred role."
-                          className="inline-flex max-w-full items-center gap-1.5 truncate rounded-chip border border-warn/40 bg-warn/[0.08] px-1.5 py-px text-[12px] font-medium text-warn"
-                        >
-                          <span className="h-1.5 w-1.5 flex-none rounded-full bg-warn" />
-                          possibly
-                        </span>
-                      ) : (
-                        <Unknown f={roleField} />
-                      )}
-                    </div>
-                    <div className="min-w-0">
-                      <FlagsCell row={row} />
-                    </div>
-                    <div className="text-right font-mono text-[12px] text-dim">
-                      {row.event_count.toLocaleString()}
-                    </div>
-                    <div
-                      className="text-right font-mono text-[11.5px] text-faint"
-                      title={absolute(row.last_seen)}
-                    >
-                      {ago(row.last_seen)}
-                    </div>
-                  </div>
-                );
-              })}
-
-              {/* Real pagination over the SQL page: `total` is the whole match
-                  set, so the range is exact rather than inferred. */}
-              <div className="flex items-center justify-between border-t border-border px-[15px] py-2.5">
-                <span className="font-mono text-[11.5px] text-faint">
-                  {scanning
-                    ? // The matched count and the stretch of the network it
-                      // came from. The server counted every host it was asked
-                      // for; this filter counted the rows it was handed.
-                      `${rows.length.toLocaleString()} low confidence · read ${shownFrom}–${shownTo} of ${total.toLocaleString()}`
-                    : `${shownFrom}–${shownTo} of ${total.toLocaleString()}`}
-                </span>
-                <div className="flex items-center gap-1.5">
-                  <button
-                    onClick={() => setOffset(Math.max(0, offset - pageSize))}
-                    disabled={offset === 0}
-                    className="rounded-control border border-border-strong px-2.5 py-1 text-[11.5px] font-semibold text-dim hover:text-text disabled:opacity-40"
-                  >
-                    Previous
-                  </button>
-                  <button
-                    onClick={() => setOffset(offset + pageSize)}
-                    disabled={shownTo >= total}
-                    className="rounded-control border border-border-strong px-2.5 py-1 text-[11.5px] font-semibold text-dim hover:text-text disabled:opacity-40"
-                  >
-                    Next
-                  </button>
-                </div>
-              </div>
-            </>
+          {listData && !list.error && rows.length > 0 && (
+            <Pager
+              from={shownFrom}
+              to={shownTo}
+              total={total}
+              page={state.page}
+              onPage={(page) => update({ page })}
+            />
           )}
 
-          {/* The honest note for the screen's default: rows are hidden, not
-              gone, and the way back is one click. Independent of rows.length
-              on purpose — a census that is real but entirely quiet (every
-              host event_count=0) still renders the EmptyState above, and that
-              is exactly the case the escape hatch matters most for: without
-              it, "no hosts match" reads as an empty network rather than a
-              filtered one. Suppressed while still loading (no verdict to
-              give yet), on a failed fetch (a Retry over an outage is not the
-              moment to also print a verdict about a result that never
-              arrived), and under the broken-builds view — that filter already
-              dropped activity (a build that never ran never saw traffic
-              either), so claiming quiet hosts are hidden there would describe
-              a filter that is not actually applied. */}
-          {!(list.loading && !list.data) && !list.error && source === 'active' && !health && (
-            <div className="px-[15px] pb-2.5 text-[11.5px] text-faint">
-              This table hides quiet hosts. A quiet host has no observed events.{' '}
+          {/* The note for the screen's default: quiet machines are hidden, not
+              gone, and the way back is one click. Not while a search is set:
+              the search reads every machine. */}
+          {!(list.loading && !listData) && !list.error && state.activity === 'active' && !state.q && (
+            <div className="px-[15px] pb-2.5 pt-1 text-[11.5px] text-faint">
+              This list hides quiet machines. A quiet machine has no events.{' '}
               <button
                 type="button"
                 className="text-dim underline hover:text-text"
-                onClick={() => onSource('')}
+                onClick={() => setFilter({ activity: 'all' })}
               >
-                show all hosts
+                show all machines
               </button>
             </div>
           )}

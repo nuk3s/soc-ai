@@ -929,11 +929,13 @@ class HostDossier(Base):
     backfill rather than a schema rewrite.
 
     The cost of an IP key is that an address outlives the machine behind it.
-    That is mitigated rather than designed away: ``identity_fingerprint`` hashes
-    the hostname+MAC seen at the last build, and ``identity_rebound_at`` is
-    stamped when it changes from one non-null value to a *different* non-null
-    value — the tripwire that tells an operator "the machine behind this address
-    appears to have changed; your override may no longer apply".
+    That is mitigated rather than designed away: ``identity_fingerprint`` holds
+    one digest for the hostname and one for the MAC seen at the last build, and
+    ``identity_rebound_at`` is stamped when one part changes from one value to a
+    *different* value — the tripwire that tells an operator "the machine behind
+    this address appears to have changed; your override may no longer apply".
+    A part that appears is no change, and an address with no operator
+    declaration is never stamped: it holds no override to warn about.
 
     ``first_seen`` is MONOTONE: a build over a narrower window must widen it, never
     reset it. ``last_built_at`` is the staleness sort key the sweep orders by, so
@@ -966,12 +968,70 @@ class HostDossier(Base):
     # last_built_at, which is about the builder rather than the host.
     last_observed_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
     event_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
-    # sha256(hostname + "|" + mac)[:32] as of the last build.
+    # "h:<hostname digest>|m:<MAC digest>" as of the last build. Each digest is
+    # sha256(value)[:16]. A part no build has seen is empty.
     identity_fingerprint: Mapped[str | None] = mapped_column(String(64), default=None)
     identity_rebound_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
     # Last per-host failure, NULL on success. A host that fails to build keeps
     # its previous beliefs and reports why the refresh didn't happen.
     build_error: Mapped[str | None] = mapped_column(Text, default=None)
+    # The machine this address belongs to (migration 0054), and how it joined:
+    # agent | dhcp | name | network | container. NULL until a sweep has built the
+    # machines. No foreign key: the sweep rewrites both columns as a set, and a
+    # machine row that goes away leaves the address to the next sweep.
+    machine_id: Mapped[int | None] = mapped_column(Integer, default=None, index=True)
+    address_kind: Mapped[str | None] = mapped_column(String(16), default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class HostMachine(Base):
+    """One machine: the set of addresses soc-ai holds to be one device (migration 0054).
+
+    The per-address :class:`HostDossier` stays. It holds the facts an alert joins
+    on. The machine sits above it, so the Hosts list shows one row per device
+    where it showed one row per address: production had 14 rows for one proxy.
+
+    ``machine_key`` is stable across sweeps: ``agent:<agent.id>``, else
+    ``mac:<mac>``, else ``ip:<address>``. When an agent appears on a machine the
+    sweep knew by MAC or by address, the sweep merges the older machine into the
+    agent machine and records the older key in ``merged_from_json``.
+
+    The JSON columns are written whole by the sweep. ``addresses_json`` is the
+    history: an address that left the census stays in it.
+    """
+
+    __tablename__ = "host_machine"
+    __table_args__ = (
+        Index("uq_host_machine_key", "machine_key", unique=True),
+        Index("ix_host_machine_agent_id", "agent_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    machine_key: Mapped[str] = mapped_column(String(128))
+    name: Mapped[str | None] = mapped_column(String(255), default=None)
+    # declared | agent | dhcp | dns | ntlm | other
+    name_source: Mapped[str | None] = mapped_column(String(16), default=None)
+    # [{"value": str, "source": str}], strongest source first.
+    names_json: Mapped[list[dict[str, str]] | None] = mapped_column(NULLABLE_JSON, default=None)
+    primary_ip: Mapped[str | None] = mapped_column(String(64), default=None)
+    agent_id: Mapped[str | None] = mapped_column(String(128), default=None)
+    agent_name: Mapped[str | None] = mapped_column(String(255), default=None)
+    agent_last_report: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+    os: Mapped[str | None] = mapped_column(String(255), default=None)
+    macs_json: Mapped[list[str] | None] = mapped_column(NULLABLE_JSON, default=None)
+    first_seen: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+    last_seen: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+    event_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # The addresses in the census now. A machine at 0 is history only.
+    address_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    container_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    merged_from_json: Mapped[list[str] | None] = mapped_column(NULLABLE_JSON, default=None)
+    # [{"ip", "kind", "first_seen", "last_seen", "current"}]
+    addresses_json: Mapped[list[dict[str, Any]] | None] = mapped_column(NULLABLE_JSON, default=None)
+    built_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(), server_default=func.now(), onupdate=func.now()
@@ -1356,6 +1416,13 @@ class Lead(Base):
     dismissed_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
     # The investigation a promotion started.
     investigation_id: Mapped[str | None] = mapped_column(String(32), default=None)
+    # Every decision on the lead, oldest first (migration 0053): dismissed,
+    # reopened, promoted, closed_by_hunt, held. The dismissal columns above
+    # hold the current dismissal only, and a reopen or a promotion clears them.
+    decisions_json: Mapped[Any | None] = mapped_column(NULLABLE_JSON, default=None)
+    # When an analyst last reopened the lead. The loop and the settle rule
+    # leave a reopened lead to the analyst who reopened it.
+    reopened_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
 
 
 class PriorSpecRun(Base):

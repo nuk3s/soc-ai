@@ -192,7 +192,7 @@ def test_parse_empty_query_rejected() -> None:
 
 
 def test_parse_garbage_rejected() -> None:
-    with pytest.raises(OqlValidationError, match="parse"):
+    with pytest.raises(OqlValidationError, match="syntax error"):
         parse_oql("this is not valid syntax")
 
 

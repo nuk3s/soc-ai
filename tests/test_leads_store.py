@@ -183,13 +183,77 @@ async def test_reopen_keeps_the_dismissal_as_history(settings_kratos: Settings) 
         )
         reopened = await leads_store.reopen(db, lead.id, by="bob")
         assert reopened.status == "open"
-        # The dismissal stays readable. The sharpening loop reads the reason
-        # later, and a reopening that erased it would erase the lesson too.
-        assert reopened.dismissed_reason == "bad_baseline"
-        assert reopened.dismissed_by == "ann"
-        assert reopened.dismissed_at is not None
+        # The dismissal moves to the history. The current fields clear, so
+        # the header and the API no longer read a reopened lead as dismissed.
+        assert reopened.dismissed_reason is None
+        assert reopened.dismissed_by is None
+        assert reopened.dismissed_at is None
+        assert reopened.reopened_at is not None
+        history = leads_store.decisions_of(reopened)
+        assert [d["action"] for d in history] == ["dismissed", "reopened"]
+        assert history[0]["reason"] == "bad_baseline" and history[0]["by"] == "ann"
+        assert history[0]["note"] == "the baseline was 2 days old"
+        assert history[1]["by"] == "bob"
         hunting = await leads_store.mark_hunting(db, lead.id, hunt_id="01HUNT")
     assert hunting.status == "hunting"
+
+
+async def test_every_decision_appends_to_the_history(settings_kratos: Settings) -> None:
+    """RH3: a dismiss after a reopen wrote over the first dismissal.
+
+    Two dismissals, two reopens and a promotion leave five entries in order,
+    and the promoted lead carries no dismissal.
+    """
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        lead = await _lead(db)
+        await leads_store.dismiss(db, lead.id, reason="benign_repeat", note=None, by="ann")
+        await leads_store.reopen(db, lead.id, by="bob")
+        await leads_store.dismiss(
+            db, lead.id, reason="expected_for_role", note="backup host", by="cat"
+        )
+        await leads_store.reopen(db, lead.id, by="dan")
+        promoted = await leads_store.mark_promoted(db, lead.id, investigation_id="01INV", by="eve")
+        history = leads_store.decisions_of(promoted)
+    assert [d["action"] for d in history] == [
+        "dismissed",
+        "reopened",
+        "dismissed",
+        "reopened",
+        "promoted",
+    ]
+    assert [d.get("reason") for d in history if d["action"] == "dismissed"] == [
+        "benign_repeat",
+        "expected_for_role",
+    ]
+    assert history[-1]["investigation_id"] == "01INV" and history[-1]["by"] == "eve"
+    assert promoted.status == "promoted"
+    assert promoted.dismissed_reason is None and promoted.dismissed_at is None
+
+
+async def test_a_legacy_dismissal_survives_the_first_reopen(settings_kratos: Settings) -> None:
+    """A row with no history reads its dismissal off the columns. A reopen keeps it."""
+    _engine, maker = await _db(settings_kratos)
+    at = datetime(2026, 9, 20, 8, 0)
+    async with maker() as db:
+        lead = Lead(
+            status="dismissed",
+            entities_json=[["host", "198.51.100.8"]],
+            kinds_json=["novel_served_port"],
+            weight_at_formation=1.0,
+            shadow=False,
+            dismissed_reason="known_change",
+            dismissed_by="ann",
+            dismissed_at=at,
+        )
+        db.add(lead)
+        await db.commit()
+        await db.refresh(lead)
+        reopened = await leads_store.reopen(db, lead.id, by="bob")
+        history = leads_store.decisions_of(reopened)
+    assert [d["action"] for d in history] == ["dismissed", "reopened"]
+    assert history[0]["reason"] == "known_change" and history[0]["at"] == at.isoformat()
+    assert reopened.dismissed_at is None
 
 
 async def test_reopen_keeps_the_hunt_the_lead_already_had(settings_kratos: Settings) -> None:
@@ -283,7 +347,7 @@ async def test_a_profile_observation_names_the_documents_behind_it(
 # ids come from the shipped catalog, because the technique is read from the
 # analytic file and not from anything the test writes.
 _FIRST_LOGON = "prior-workstation-account-first-logon-to-dc"
-_GROUP_CHANGED = "prior-privileged-group-membership-changed"
+_GROUP_CHANGED = "identity-privileged-group-change"
 
 
 async def _seed_lead(  # type: ignore[no-untyped-def]
@@ -724,6 +788,95 @@ async def test_a_clean_hunt_closes_its_lead(settings_kratos: Settings) -> None:
     assert lead.dismissed_by == leads_store.AUTO_HUNT_ACTOR == "auto-hunt"
     assert lead.dismissed_at == now.replace(tzinfo=None)
     assert lead.hunt_id == "01CLEAN"
+    history = leads_store.decisions_of(lead)
+    assert [d["action"] for d in history] == ["closed_by_hunt"]
+    assert history[0]["hunt_id"] == "01CLEAN"
+
+
+async def test_a_clean_hunt_with_a_visibility_gap_does_not_close_its_lead(
+    settings_kratos: Settings,
+) -> None:
+    """RH1 negative control: the outcome reads clean, and the hunt still did not read it all.
+
+    An observation finding beside a gap reads "clean" on the Hunts page. The
+    range re-hunt that closed a lead as hunt_clean had exactly this shape:
+    "Alert documents unreadable due to grid timeout" beside two observations.
+    """
+    _engine, maker = await _db(settings_kratos)
+    unread = {
+        "title": "Alert documents unreadable due to grid timeout",
+        "category": "visibility_gap",
+        "severity": "low",
+    }
+    async with maker() as db:
+        lead = await _lead_row(db, hunt_id="01GAPCLEAN")
+        hunt = await _hunt_row(
+            db, hunt_id="01GAPCLEAN", lead_id=lead.id, findings=[_OBSERVATION, unread]
+        )
+        assert leads_store.hunt_outcome_of(hunt) == "clean"
+        assert await leads_store.settle_after_hunt(db, hunt) == "waits"
+        # The reconciliation pass runs every wake. The hold is recorded once.
+        assert await leads_store.settle_after_hunt(db, hunt) == "waits"
+        lead = await leads_store.get(db, lead.id)
+    assert lead.status == "hunting" and lead.dismissed_reason is None
+    assert leads_store.hold_reason_of(lead) == leads_store.HOLD_PARTIAL_READ
+    assert [d["action"] for d in leads_store.decisions_of(lead)] == ["held"]
+
+
+async def test_a_clean_hunt_after_a_threat_hunt_does_not_close_its_lead(
+    settings_kratos: Settings,
+) -> None:
+    """RH1 negative control: the new hunt is clean on its own, the lead's record is not."""
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        lead = await _lead_row(db, hunt_id="01AFTER")
+        await _hunt_row(db, hunt_id="01BEFORE", lead_id=lead.id, findings=[_THREAT])
+        hunt = await _hunt_row(db, hunt_id="01AFTER", lead_id=lead.id, findings=[])
+        assert leads_store.hunt_outcome_of(hunt) == "clean"
+        assert await leads_store.settle_after_hunt(db, hunt) == "waits"
+        lead = await leads_store.get(db, lead.id)
+    assert lead.status == "hunting" and lead.dismissed_reason is None
+    assert leads_store.hold_reason_of(lead) == leads_store.HOLD_EARLIER_THREAT
+
+
+async def test_a_clean_hunt_with_a_failed_tool_call_does_not_close_its_lead(
+    settings_kratos: Settings,
+) -> None:
+    """A grid timeout in the trace leaves no finding behind. The trace still says it."""
+    from soc_ai.store import hunts as hunt_svc
+
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        failed = await _lead_row(db, hunt_id="01TOOLFAIL")
+        hunt = await _hunt_row(db, hunt_id="01TOOLFAIL", lead_id=failed.id, findings=[])
+        await hunt_svc.append_events(
+            db,
+            "01TOOLFAIL",
+            [
+                {
+                    "kind": "tool_result",
+                    "sequence": 3,
+                    "payload": {
+                        "tool_call_id": "c1",
+                        "result": {"error": "grid_unavailable", "message": "timed out"},
+                    },
+                }
+            ],
+        )
+        assert await leads_store.settle_after_hunt(db, hunt) == "waits"
+        partial = await _lead_row(db, hunt_id="01PARTIAL")
+        hunt = await _hunt_row(db, hunt_id="01PARTIAL", lead_id=partial.id, findings=[])
+        await hunt_svc.append_events(
+            db,
+            "01PARTIAL",
+            [{"kind": "done", "sequence": 9, "payload": {"degraded": False, "partial": True}}],
+        )
+        assert await leads_store.settle_after_hunt(db, hunt) == "waits"
+        failed = await leads_store.get(db, failed.id)
+        partial = await leads_store.get(db, partial.id)
+    assert failed.status == "hunting" and partial.status == "hunting"
+    assert leads_store.hold_reason_of(failed) == leads_store.HOLD_PARTIAL_READ
+    assert leads_store.hold_reason_of(partial) == leads_store.HOLD_PARTIAL_READ
 
 
 async def test_threat_findings_and_a_visibility_gap_leave_the_lead_on_the_analyst(
@@ -904,3 +1057,26 @@ async def test_the_recorder_returns_the_lead_to_open_when_the_hunt_errors(
     async with maker() as db:
         lead = await leads_store.get(db, lead.id)
     assert lead.status == "open" and lead.hunt_id == hunt_id
+
+
+async def test_a_lead_reopened_before_the_rule_shows_its_hold_on_read(
+    settings_kratos: Settings,
+) -> None:
+    """The range lead 8 closed on a clean hunt before the rule existed, and an
+    analyst reopened it. Its history has no ``held`` entry. The page still
+    says why the clean answer did not settle it."""
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        lead = await _lead_row(db, hunt_id="01OLDCLEAN")
+        await _hunt_row(db, hunt_id="01OLDTHREAT", lead_id=lead.id, findings=[_THREAT])
+        await _hunt_row(db, hunt_id="01OLDCLEAN", lead_id=lead.id, findings=[])
+        lead.status = "open"
+        await db.commit()
+        assert leads_store.hold_reason_of(lead) is None
+        assert await leads_store.derived_hold_reason(db, lead) == leads_store.HOLD_EARLIER_THREAT
+        # A lead whose hunt found no earlier threat and read its evidence has no hold.
+        clean = await _lead_row(db, hunt_id="01OLDFINE")
+        await _hunt_row(db, hunt_id="01OLDFINE", lead_id=clean.id, findings=[])
+        clean.status = "open"
+        await db.commit()
+        assert await leads_store.derived_hold_reason(db, clean) is None

@@ -861,3 +861,93 @@ async def test_a_template_stores_and_updates_its_analytics(settings_kratos: Sett
         plain = await ht_svc.create(db, name="Plain", objective_template="Hunt.")
         assert plain.analytics == []
     await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# RH8 / F16 / RA8: the grid's own Windows planes feed the environment axis, and
+# a failed inventory read is remembered for a short window
+# ---------------------------------------------------------------------------
+
+
+def _list_with(client: TestClient, inv: GridInventory) -> dict[str, dict[str, Any]]:
+    with patch("soc_ai.api.webui.routes_hunts.discover_datasets", AsyncMock(return_value=inv)):
+        resp = client.get("/api/v1/hunt-templates")
+    assert resp.status_code == 200, resp.text
+    return _templates_by_name(resp.json())
+
+
+@pytest.mark.parametrize(
+    "windows_plane",
+    [
+        "system.security",
+        "windows.forwarded",
+        "windows.sysmon_operational",
+        "endpoint.events.registry",
+        "microsoft_defender_endpoint.log",
+    ],
+)
+def test_environment_fit_a_live_windows_plane_reopens_the_hunts(
+    client: TestClient, windows_plane: str
+) -> None:
+    """A domain controller ships its Security log and Defender events, and no
+    dossier has resolved an os_family or a domain_membership fact. The
+    Windows and domain hunts must not read "the network shows none of it"."""
+    for ip in ("192.0.2.11", "192.0.2.12"):
+        _seed_dossier_host(client, ip, os_family="linux")
+    by_name = _list_with(client, _inventory(*_FULL_INV, windows_plane))
+    for name in ENV_GATED:
+        assert by_name[name]["applicable"] is True, (windows_plane, name)
+        assert by_name[name]["missingEnvironment"] == []
+
+
+def test_environment_fit_without_a_windows_plane_keeps_the_demotion(client: TestClient) -> None:
+    """NEGATIVE CONTROL on the paths the new rule could miss: cross-platform
+    endpoint planes, Kerberos on the wire, a Linux auth log, and a Windows
+    Security log that is only an import. None of them proves a Windows host
+    on THIS network."""
+    for ip in ("192.0.2.11", "192.0.2.12"):
+        _seed_dossier_host(client, ip, os_family="linux")
+    inv = _inventory_with_backfill(
+        live=(*_FULL_INV, "endpoint.events.network", "endpoint.events.file", "system.auth"),
+        backfill_only=("system.security", "windows.forwarded"),
+    )
+    by_name = _list_with(client, inv)
+    assert by_name["Credential abuse / lockouts"]["applicable"] is False
+    assert by_name["Credential abuse / lockouts"]["missingEnvironment"] == ["a domain-joined host"]
+    for name in ("Lateral movement", "Suspicious PowerShell / LOLBins"):
+        assert by_name[name]["applicable"] is False, name
+        assert by_name[name]["missingEnvironment"] == ["a Windows host"]
+
+
+def test_a_failed_inventory_read_is_remembered_for_a_short_window(client: TestClient) -> None:
+    """RA8: on a stalled grid every call waited out the full timeout again.
+    The second call inside the window must not touch the grid, and both must
+    say the availability is unknown, never available and never missing."""
+    failing = AsyncMock(side_effect=RuntimeError("grid stalled"))
+    with patch("soc_ai.api.webui.routes_hunts.discover_datasets", failing):
+        first = client.get("/api/v1/hunt-templates")
+        second = client.get("/api/v1/hunt-templates")
+    assert failing.await_count == 1
+    for resp in (first, second):
+        assert resp.status_code == 200, resp.text
+        payload = resp.json()
+        assert payload
+        for t in payload:
+            assert t["availabilityKnown"] is False
+            assert t["missingDatasets"] == []
+            assert t["backfillOnlyDatasets"] == []
+
+
+def test_a_remembered_failure_expires_and_a_success_is_measured(client: TestClient) -> None:
+    """The window is short: once it passes the grid is read again, and a good
+    read reports measured availability."""
+    from soc_ai.api.webui import routes_hunts
+
+    failing = AsyncMock(side_effect=RuntimeError("grid stalled"))
+    with patch("soc_ai.api.webui.routes_hunts.discover_datasets", failing):
+        client.get("/api/v1/hunt-templates")
+    expired = routes_hunts.monotonic() + routes_hunts._INVENTORY_FAILURE_TTL_S + 1
+    with patch("soc_ai.api.webui.routes_hunts.monotonic", return_value=expired):
+        by_name = _list_with(client, _inventory(*_FULL_INV))
+    assert all(t["availabilityKnown"] is True for t in by_name.values())
+    assert by_name["DCE-RPC abuse / DC attacks"]["available"] is True

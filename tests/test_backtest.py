@@ -526,7 +526,9 @@ class TestBacktestRefusesToReportAnOutageAsAnEmptyWindow:
                 resp = client.post("/api/v1/backtest", json={"window_days": 30})
         assert resp.status_code == 200
         assert resp.json()["active"] is False
-        assert "no dispositioned alerts" in (resp.json()["note"] or "")
+        assert resp.json()["backtest_id"] is None
+        assert resp.json()["refused"]["reason"] == "no_dispositioned_alerts"
+        assert "no alert that an analyst escalated" in resp.json()["refused"]["hint"]
 
     def test_the_note_that_outlives_the_error_still_carries_the_remedy(
         self, bt_settings: Settings
@@ -555,7 +557,8 @@ class TestBacktestRefusesToReportAnOutageAsAnEmptyWindow:
             app = create_app()
             with TestClient(app) as client:
                 assert client.post("/api/v1/backtest", json={"window_days": 30}).status_code == 503
-                note = str(client.get("/api/v1/backtest").json()["note"] or "")
+                refused = client.get("/api/v1/backtest").json()["refused"] or {}
+                note = str(refused.get("hint") or "")
 
         assert note, "the failure left no durable note at all"
         assert note[0].isupper(), f"the note reads as a fragment, not a sentence: {note!r}"
@@ -607,7 +610,10 @@ class TestBacktestRefusesToReportAnOutageAsAnEmptyWindow:
                 assert client.post("/api/v1/backtest", json={"window_days": 30}).status_code == 503
                 after = client.get("/api/v1/backtest").json()
 
-        note = str(after["note"] or "")
+        note = str((after["refused"] or {}).get("hint") or "")
+        # The refusal rides beside the stored run. The stored run's own note
+        # stays as it was (fleet 2026-10-01, RO11).
+        assert after["note"] is None
         assert note, (
             "the failed run left no trace on a console with history — it is served as the "
             f"previous run's finished results, which is the false all-clear: {after}"
@@ -1092,3 +1098,92 @@ def _severity_clauses_of(query: Any) -> list[Any]:
         for item in query:
             found += _severity_clauses_of(item)
     return found
+
+
+# ---------------------------------------------------------------------------
+# Fleet 2026-10-01: H6, RO11, RO12, RO20, RA20
+# ---------------------------------------------------------------------------
+
+
+class TestBacktestContract:
+    def test_an_unknown_key_is_refused_and_starts_no_run(self, bt_client: TestClient) -> None:
+        """{"sample": -5} used to start a full default run (RA20)."""
+        resp = bt_client.post("/api/v1/backtest", json={"sample": -5})
+        assert resp.status_code == 422
+        assert "sample is not a known field" in resp.json()["detail"]["hint"]
+        assert bt_client.get("/api/v1/backtest").json()["active"] is False
+
+    def test_a_negative_sample_size_is_refused(self, bt_client: TestClient) -> None:
+        resp = bt_client.post("/api/v1/backtest", json={"sample_size": -5})
+        assert resp.status_code == 422
+        assert resp.json()["detail"]["hint"].startswith("sample_size must be 1 or more.")
+
+    def test_an_unknown_severity_floor_is_refused(self, bt_client: TestClient) -> None:
+        resp = bt_client.post("/api/v1/backtest", json={"min_severity": "severe"})
+        assert resp.status_code == 422
+        assert "critical, high, medium, low" in resp.json()["detail"]["hint"]
+
+    def test_a_refused_attempt_leaves_the_stored_run_untouched(self, bt_settings: Settings) -> None:
+        empty = {"took": 1, "hits": {"total": {"value": 0}, "hits": []}}
+        state = {"empty": False}
+
+        async def _search(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            return empty if state["empty"] else SAMPLING_ES_RESPONSE
+
+        fake_es = AsyncMock()
+        fake_es.search.side_effect = _search
+        with (
+            patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=fake_es),
+            patch("soc_ai.main.make_auth", return_value=AsyncMock()),
+            patch("soc_ai.main.get_settings", return_value=bt_settings),
+            patch("soc_ai.api.runner.investigate", _fake_investigate),
+        ):
+            app = create_app()
+            with TestClient(app) as client:
+                assert client.post("/api/v1/backtest", json={}).status_code == 200
+                before = _poll_backtest(client)
+                assert before["status"] == "complete"
+
+                state["empty"] = True
+                refused = client.post("/api/v1/backtest", json={})
+                assert refused.status_code == 200
+                body = refused.json()
+                assert body["backtest_id"] is None
+                assert body["refused"]["reason"] == "no_dispositioned_alerts"
+                assert body["note"] is None
+
+                after = client.get("/api/v1/backtest").json()
+
+        # The old run is served as it was, and the refusal sits beside it.
+        assert after["backtest_id"] == before["backtest_id"]
+        assert after["results"] == before["results"]
+        assert after["note"] is None
+        assert after["refused"]["reason"] == "no_dispositioned_alerts"
+        assert after["refused"]["hint"][0].isupper()
+
+    def test_finished_at_carries_a_time_zone(self, bt_client: TestClient) -> None:
+        """The UI showed "Ran" four hours off: the stored value had no zone (RO12)."""
+        bt_client.post("/api/v1/backtest", json={})
+        data = _poll_backtest(bt_client)
+        assert data["finished_at"].endswith("Z"), data["finished_at"]
+
+    def test_a_short_sample_says_why(self, bt_client: TestClient) -> None:
+        """ "requested 20, replayed 14" had no reason on screen (RO20)."""
+        bt_client.post("/api/v1/backtest", json={"sample_size": 20})
+        data = _poll_backtest(bt_client)
+        assert data["requested"] == 20
+        assert data["sampled"] == 3
+        assert "3 distinct pairs of detection and disposition" in data["skipped_reason"]
+
+    def test_a_full_sample_has_no_skipped_reason(self, bt_client: TestClient) -> None:
+        bt_client.post("/api/v1/backtest", json={"sample_size": 3})
+        data = _poll_backtest(bt_client)
+        assert data["requested"] == 3
+        assert data["skipped_reason"] is None
+
+
+def test_iso_utc_marks_a_naive_value_as_utc() -> None:
+    from datetime import datetime
+
+    assert backtest_svc.iso_utc(datetime(2026, 8, 1, 12, 0, 0)) == "2026-08-01T12:00:00Z"
+    assert backtest_svc.iso_utc(None) is None

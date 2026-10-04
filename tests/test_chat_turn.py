@@ -25,6 +25,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from soc_ai.agent.context import InvestigationContext
+from soc_ai.agent.narrative_grounding import NOTHING_GROUNDED_REPLY
 from soc_ai.webui.chat_turn import ChatTaskManager, ChatTurnSpec, TurnInputs, run_chat_turn
 
 _TEMPLATE = "You are a test assistant.\n\n## Context\n{context}"
@@ -483,10 +484,11 @@ async def test_finalize_meta_hook_sees_the_turns_evidence() -> None:
 
 async def test_ungrounded_answer_is_redacted_for_any_chat_shape() -> None:
     """Ground-or-strip (2026-08-20): once regrounding is exhausted, an
-    ungrounded specific is mechanically replaced in the visible answer — not
-    named inline under a "verify before acting" caveat. This must fire
+    ungrounded specific leaves the visible answer with its sentence. Nothing
+    takes its place, and no line says it went (2026-10-02). This must fire
     identically regardless of which chat shape is running (the whole point of
-    the shared engine)."""
+    the shared engine). The only sentence went, so the reply says that no
+    statement had support: an empty reply would read as an answer."""
     state = _state()
     ctx = _ctx(state)
     finish = _Finish()
@@ -509,8 +511,9 @@ async def test_ungrounded_answer_is_redacted_for_any_chat_shape() -> None:
     assert "evil.example.com" in finish.last["meta"]["narrative_grounding"]["ungrounded"]
     assert finish.last["meta"]["narrative_grounding"]["stripped"] == ["evil.example.com"]
     assert "evil.example.com" not in finish.last["content"]
-    assert "(unverified)" in finish.last["content"]
-    assert "Some unverifiable specifics were removed" in finish.last["content"]
+    assert "(unverified)" not in finish.last["content"]
+    assert "unverifiable" not in finish.last["content"].lower()
+    assert finish.last["content"] == NOTHING_GROUNDED_REPLY
     assert "⚠" not in finish.last["content"]
 
 
@@ -549,9 +552,10 @@ async def test_ungrounded_artifact_and_fabricated_citation_both_get_redacted() -
     assert grounding["grounded"] is False
     assert "evil.example.com" not in content
     assert "Verified by the tools" not in content
-    assert "(unverified)" in content
-    # Exactly one quiet line — not one per detector that fired.
-    assert content.count("Some unverifiable specifics were removed") == 1
+    assert "(unverified)" not in content
+    # No line about the removal, from either detector.
+    assert "unverifiable" not in content.lower()
+    assert content == NOTHING_GROUNDED_REPLY
     assert "⚠" not in content
     # Both causes are on the record, not just whichever fired last.
     assert "evil.example.com" in grounding["ungrounded"]
@@ -627,9 +631,183 @@ async def test_fabricated_tool_citations_on_a_zero_tool_turn_are_redacted() -> N
     assert finish.last["meta"]["narrative_grounding"]["grounded"] is False
     assert finish.last["meta"]["narrative_grounding"]["stripped"]
     assert "Verified by the tools" not in finish.last["content"]
-    assert "(unverified)" in finish.last["content"]
-    assert "Some unverifiable specifics were removed" in finish.last["content"]
+    assert finish.last["content"] == "This looks benign."
     assert "⚠" not in finish.last["content"]
+
+
+# ── the 2026-10-02 host chat answer ─────────────────────────────────────────
+
+_DASH = "—"
+# The production answer, anonymised. The shipped text had "(unverified)" where
+# the model named `endpoint.events.network` and `endpoint.events.file`, and the
+# engine appended the quiet line. This is the answer the model wrote.
+_HOST_CHAT_ANSWER = (
+    "**This host ships no endpoint process events.** The host `depot` (192.0.2.41) "
+    "ships only host-log, auth and osquery planes.\n\n"
+    "The query `host.ip:192.0.2.41 | groupby event.dataset` returned exactly these "
+    "datasets:\n"
+    f"- `system.syslog` {_DASH} 8,884 docs (host system logs)\n"
+    f"- `system.auth` {_DASH} 1,074 docs (authentication)\n"
+    f"- `elastic_agent.osquerybeat` {_DASH} 104 docs\n"
+    f"- `osquery_manager.result` {_DASH} 90 docs\n"
+    f"- `elastic_agent` {_DASH} 47 docs (agent self-logs)\n\n"
+    "The query `host.name:depot AND event.dataset:endpoint.events.*` returned **0** "
+    "docs. This confirms no `endpoint.events.process`, `endpoint.events.network` or "
+    "`endpoint.events.file` data exists for this host.\n\n"
+    "The correction is now properly grounded: this host ships no endpoint process "
+    "events. Its process visibility comes only from osquery, not from an Elastic "
+    "Defend endpoint agent."
+)
+_GROUPBY = "host.ip:192.0.2.41 | groupby event.dataset"
+_ENDPOINT = "host.name:depot AND event.dataset:endpoint.events.*"
+
+
+class _ToolResult:
+    """A run result whose message log holds real tool call and return parts."""
+
+    def __init__(self, output: str, calls: list[tuple[str, dict[str, Any], Any]]) -> None:
+        self.output = output
+        self._calls = calls
+
+    def all_messages(self) -> list[Any]:
+        from pydantic_ai.messages import ModelRequest, ModelResponse, ToolCallPart, ToolReturnPart
+
+        out: list[Any] = []
+        for i, (tool, args, content) in enumerate(self._calls):
+            out.append(
+                ModelResponse(parts=[ToolCallPart(tool_name=tool, args=args, tool_call_id=f"c{i}")])
+            )
+            out.append(
+                ModelRequest(
+                    parts=[ToolReturnPart(tool_name=tool, content=content, tool_call_id=f"c{i}")]
+                )
+            )
+        return out
+
+
+class _ToolAgent:
+    """Replays queued (output, calls) pairs, one per run."""
+
+    def __init__(self, runs: list[tuple[str, list[tuple[str, dict[str, Any], Any]]]]) -> None:
+        self._runs = list(runs)
+        self.prompts: list[str] = []
+
+    async def run(self, prompt: str) -> _ToolResult:
+        self.prompts.append(prompt)
+        output, calls = self._runs.pop(0)
+        return _ToolResult(output, calls)
+
+
+async def test_the_production_host_chat_answer_ships_without_grounding_artifacts() -> None:
+    """Dogfood 2026-10-02: the host chat answer carried two "(unverified)"
+    placeholders where the model had named `endpoint.events.network` and
+    `endpoint.events.file`, the meta sentence "The correction is now properly
+    grounded: ...", and the closing line "_Some unverifiable specifics were
+    removed from this reply._". The owner's rule (2026-08-21): ground or strip,
+    never banner, and no internal vocabulary leaks.
+
+    The query `event.dataset:endpoint.events.*` returned 0, so it grounds the
+    claim that no `endpoint.events.*` dataset holds data for this host.
+    """
+    state = _state(chat_regrounding_attempts=1)
+    ctx = _ctx(state)
+    finish = _Finish()
+    dossier = ("t_host_dossier", {"ip": "192.0.2.41"}, {"ip": "192.0.2.41", "found": True})
+    groupby = (
+        "t_query_events_oql",
+        {"query": _GROUPBY},
+        {
+            "total": 10199,
+            "aggregations": {
+                "event.dataset": [
+                    {"key": "system.syslog", "doc_count": 8884},
+                    {"key": "system.auth", "doc_count": 1074},
+                    {"key": "elastic_agent.osquerybeat", "doc_count": 104},
+                    {"key": "osquery_manager.result", "doc_count": 90},
+                    {"key": "elastic_agent", "doc_count": 47},
+                ]
+            },
+        },
+    )
+    endpoint = ("t_query_events_oql", {"query": _ENDPOINT}, {"total": 0, "hits": []})
+    agent = _ToolAgent(
+        [
+            # The first answer named a dataset no call ever touched.
+            ("The host ships `windows.security` events.", [dossier]),
+            (_HOST_CHAT_ANSWER, [dossier, groupby, endpoint]),
+        ]
+    )
+
+    async def _prepare() -> TurnInputs:
+        return TurnInputs(
+            ctx=ctx,
+            seed_context="Host: 192.0.2.41",
+            question=(
+                "Which telemetry does this host ship, and does it ship endpoint process events?"
+            ),
+            system_prompt=_TEMPLATE,
+            build_agent=lambda _m, _c, _p: agent,  # type: ignore[arg-type,return-value]
+        )
+
+    with _patched():
+        await run_chat_turn(state, _spec(prepare=_prepare, finish=finish))
+
+    content = finish.last["content"]
+    assert finish.last["status"] == "done"
+    assert "Do not mention this correction" in agent.prompts[1]
+    assert "(unverified)" not in content
+    assert "unverifiable" not in content.lower()
+    assert "removed" not in content.lower()
+    assert "correction" not in content.lower()
+    assert "properly grounded" not in content.lower()
+    # The names the zero-hit wildcard query grounded stay in the answer.
+    assert (
+        "no `endpoint.events.process`, `endpoint.events.network` or `endpoint.events.file` "
+        "data exists for this host." in content
+    )
+    assert content.startswith("**This host ships no endpoint process events.**")
+    assert content.endswith(
+        "Its process visibility comes only from osquery, not from an Elastic Defend endpoint agent."
+    )
+    assert finish.last["meta"]["narrative_grounding"] == {"grounded": True}
+    assert finish.last["meta"]["regrounding_attempts"] == 1
+
+
+async def test_an_ungrounded_list_item_leaves_with_its_clause_and_no_notice() -> None:
+    """NEGATIVE CONTROL: a dataset no call touched is still stripped.
+
+    The query named `endpoint.events.*` only. `windows.security` sits
+    in the same list, so it leaves the list, and nothing in the reply says so.
+    """
+    state = _state()
+    ctx = _ctx(state)
+    finish = _Finish()
+    answer = (
+        "**No endpoint data.** No `endpoint.events.process` or "
+        "`windows.security` data exists for this host."
+    )
+    endpoint = ("t_query_events_oql", {"query": _ENDPOINT}, {"total": 0, "hits": []})
+    agent = _ToolAgent([(answer, [endpoint])])
+
+    async def _prepare() -> TurnInputs:
+        return TurnInputs(
+            ctx=ctx,
+            seed_context="Host: 192.0.2.41",
+            question="q",
+            system_prompt=_TEMPLATE,
+            build_agent=lambda _m, _c, _p: agent,  # type: ignore[arg-type,return-value]
+        )
+
+    with _patched():
+        await run_chat_turn(state, _spec(prepare=_prepare, finish=finish))
+
+    content = finish.last["content"]
+    assert content == (
+        "**No endpoint data.** No `endpoint.events.process` data exists for this host."
+    )
+    grounding = finish.last["meta"]["narrative_grounding"]
+    assert grounding["grounded"] is False
+    assert grounding["stripped"] == ["windows.security"]
 
 
 # ── the task tracker ────────────────────────────────────────────────────────

@@ -4,8 +4,8 @@
 // 2026-07-15). searchEntities matches investigations and alert groups by
 // rule-name fragment or IP, case-insensitively.
 import { describe, expect, it } from 'vitest';
-import { searchEntities } from './paletteSearch';
-import type { AlertGroup, InvestigationRow } from './types';
+import { machineHitLabel, searchEntities } from './paletteSearch';
+import type { AlertGroup, InvestigationRow, MachineRow } from './types';
 
 const inv = (over: Partial<InvestigationRow>): InvestigationRow =>
   ({
@@ -62,6 +62,16 @@ describe('searchEntities', () => {
   it('returns nothing for a non-matching query', () => {
     expect(searchEntities('zzz-nope', [inv({})], [grp({})])).toEqual([]);
   });
+
+  // The row read "… — false_positive 0.90 · 16m": a dash and the raw enum.
+  it('names the verdict with its label and separates fields with a dot', () => {
+    const [hit] = searchEntities('teardrop', [inv({ verdict: 'false_positive', conf: 0.9 })], []);
+    expect(hit.label).toContain('· False positive 0.90 ·');
+    expect(hit.label).not.toContain('false_positive');
+    expect(hit.label).not.toMatch(/[—–]/);
+    const [g] = searchEntities('198.51.100.252', [], [grp({})]);
+    expect(g.label).not.toMatch(/[—–]/);
+  });
 });
 
 describe('searchEntities — synthetic-evaluation marker', () => {
@@ -76,5 +86,49 @@ describe('searchEntities — synthetic-evaluation marker', () => {
   it('adds no marker to an ordinary run', () => {
     const hits = searchEntities('teardrop', [inv({ isSynthEval: false })], []);
     expect(hits[0].label).not.toContain('Synthetic');
+  });
+});
+
+describe('machineHitLabel', () => {
+  const row = (over: Partial<MachineRow>): MachineRow => ({
+    key: 'ip:192.0.2.40',
+    href: '/hosts/ip%3A192.0.2.40',
+    name: null,
+    name_source: null,
+    names: [],
+    primary_ip: '192.0.2.40',
+    address_count: 1,
+    addresses: ['192.0.2.40'],
+    container_count: 0,
+    agent: null,
+    role: { value: null, label: null, confidence: null, state: 'unknown', guess: null, stale_hours: null },
+    events: 0,
+    first_seen: null,
+    last_seen: null,
+    flags: { declared: false, conflict: false, broken: false, new: false, rebound: false },
+    ...over,
+  });
+
+  it('reads "<name> · <primary address> · <role>"', () => {
+    const label = machineHitLabel(
+      row({
+        name: 'web01',
+        role: { value: 'server', label: 'server', confidence: 0.9, state: 'inferred', guess: null, stale_hours: null },
+      }),
+    );
+    expect(label).toBe('web01 · 192.0.2.40 · server');
+  });
+
+  it('leads with the address when the machine has no name, and drops an unknown role', () => {
+    expect(machineHitLabel(row({}))).toBe('192.0.2.40');
+  });
+
+  it('names a withheld role with its state', () => {
+    const label = machineHitLabel(
+      row({
+        role: { value: null, label: null, confidence: 0.3, state: 'low_confidence', guess: 'hypervisor', stale_hours: null },
+      }),
+    );
+    expect(label).toBe('192.0.2.40 · low confidence: hypervisor');
   });
 });

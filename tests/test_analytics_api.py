@@ -454,6 +454,76 @@ def test_the_ledger_reads_the_cost_of_a_sweep(client: TestClient) -> None:
     assert ledger["runtime_ms"] == 1840
 
 
+_PRIOR = "prior-hypervisor-novel-served-port"
+
+
+def _record_prior_runs(client: TestClient, n: int) -> None:
+    from soc_ai.hunting.prior_sweep import PriorSweep
+    from soc_ai.store import prior_spec_runs
+
+    async def go() -> None:
+        async with client.app.state.db_sessionmaker() as db:
+            for back in range(n):
+                await prior_spec_runs.record_sweep(
+                    db,
+                    PriorSweep(evaluated_specs=(_PRIOR,)),
+                    shadow_ids=frozenset(),
+                    now=datetime.now(UTC) - timedelta(minutes=5 + back),
+                )
+
+    asyncio.run(go())
+
+
+def test_a_profile_analytic_reads_its_runs_from_the_prior_sweep(client: TestClient) -> None:
+    """F12, RO19. The drawer said "0 documents · 0 ms · 0 sweeps" on a profile
+    analytic that ran minutes ago. Its runs are on the prior sweep's trail."""
+    _record_prior_runs(client, 2)
+    body = client.get(f"/api/v1/analytics/{_PRIOR}").json()
+    assert body["ledger"]["profile_runs"] == 2
+    assert body["ledger"]["sweeps"] == 0
+    assert body["last_run_at"] is not None and body["last_run_at"].endswith("Z")
+    assert body["runner_enabled"] is True
+
+
+def test_a_match_analytic_that_never_ran_says_so(client: TestClient) -> None:
+    """F2. With the sweeps off and no trail row, the drawer must be able to say
+    "has not run". A prior run on another analytic does not count."""
+    _record_prior_runs(client, 1)
+    body = client.get(f"/api/v1/analytics/{_SHIPPED}").json()
+    assert body["last_run_at"] is None
+    assert body["runner_enabled"] is False
+
+
+def test_the_recent_list_counts_observations_like_the_ledger(client: TestClient) -> None:
+    """RH15. The drawer read "OBSERVATIONS 5" beside "seen 7 times" for one
+    entity: the list summed repeat sightings, the ledger counted observations.
+    One observation seen three times is one observation in both places."""
+    from soc_ai.hunting.leads import content_fingerprint, record_observation
+    from soc_ai.hunting.weight import Kind
+
+    async def seed() -> None:
+        async with client.app.state.db_sessionmaker() as db:
+            for _ in range(3):
+                await record_observation(
+                    db,
+                    entity_kind="host",
+                    entity_key="192.0.2.7",
+                    kind=Kind.CATALOG_MATCH,
+                    spec_id=_SHIPPED,
+                    fingerprint=content_fingerprint(_SHIPPED, "192.0.2.7"),
+                    summary="seed",
+                    evidence={"sample_ids": ["d1"]},
+                    source="catalog",
+                    now=datetime.now(UTC) - timedelta(hours=1),
+                )
+                await db.commit()
+
+    asyncio.run(seed())
+    body = client.get(f"/api/v1/analytics/{_SHIPPED}").json()
+    assert body["ledger"]["observations"] == 1
+    assert [r["count"] for r in body["recent"]] == [1]
+
+
 def test_the_observations_route_needs_an_entity(client: TestClient) -> None:
     """A blank entity read the whole table. Refuse it and name the parameter."""
     for url in (

@@ -72,6 +72,7 @@ from datetime import datetime
 from typing import Any
 
 from soc_ai.config import Settings
+from soc_ai.dossier.coverage import HostCoverage, coverage_window, describe, host_coverage
 from soc_ai.so_client import fields
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.so_client.fields import (
@@ -289,6 +290,7 @@ def _empty_result(ip: str, provenance: Provenance, imported: int | None) -> dict
         "top_ports": [],
         "top_dns": [],
         "top_dns_sample_size": 0,
+        "host_logs": None,
         "evidence": {},
     }
 
@@ -573,7 +575,25 @@ async def host_summary(
             index,
             _base_host_query(ip, time_range_minutes, time_anchor, include_synth, ANY),
         )
-        return _empty_result(ip, provenance, imported)
+        empty = _empty_result(ip, provenance, imported)
+        # No flow names the address. Its own agent may still ship host logs,
+        # and "no observations" on such a host is the false absence the model
+        # repeated as "no host telemetry".
+        cov = await _host_log_coverage(
+            elastic, settings, ip, (), lookback_hours, time_anchor, include_synth, provenance
+        )
+        empty["host_logs"] = _host_logs_block(cov, ip)
+        if cov.covered:
+            empty["observations"] = True
+            empty["summary"] = (
+                f"no network observations for {ip} in the lookback window "
+                f"({denominator_note(provenance)}). "
+                + " ".join(describe(cov, subject=ip))
+                + imports_note(imported)
+            )
+        elif not cov.read_ok:
+            empty["summary"] += " " + " ".join(describe(cov, subject=ip))
+        return empty
 
     hits = [h.get("_source", {}) for h in result.hits]
     aggregations = result.aggregations or {}
@@ -587,6 +607,25 @@ async def host_summary(
     hostname, hostname_evidence = _resolve_hostname(hits, ip)
     if hostname_evidence:
         evidence["hostname"] = hostname_evidence
+
+    # --- host logs: the documents the host's own agent ships ---
+    # Read by host.ip and by host.name (the resolved name, its short form and
+    # its full form). The flow query above keys on source.ip/destination.ip
+    # and never sees a host log, so a host that ships system.auth and osquery
+    # read as a host with nothing but flows.
+    host_logs = _host_logs_block(
+        await _host_log_coverage(
+            elastic,
+            settings,
+            ip,
+            (hostname,) if hostname else (),
+            lookback_hours,
+            time_anchor,
+            include_synth,
+            provenance,
+        ),
+        ip,
+    )
 
     # --- device / OS guess (parse User-Agents — the iPhone-vs-Mac fix) ---
     ua_guess, ua_evidence = _resolve_device_os(hits)
@@ -643,8 +682,58 @@ async def host_summary(
         "top_ports": top_ports,
         "top_dns": top_dns,
         "top_dns_sample_size": len(hits),
+        # Host-log counts per dataset, read by host.ip and host.name. See
+        # _host_logs_block for the shape.
+        "host_logs": host_logs,
         "evidence": evidence,
     }
+
+
+async def _host_log_coverage(
+    elastic: ElasticClient,
+    settings: Settings,
+    ip: str,
+    names: tuple[str, ...],
+    lookback_hours: int,
+    time_anchor: datetime | None,
+    include_synth: SynthScope,
+    provenance: Provenance,
+) -> HostCoverage:
+    """The host's own documents over the summary window. Never raises."""
+    since, until = coverage_window(time_anchor, hours=lookback_hours)
+    return await host_coverage(
+        elastic,
+        settings,
+        addresses=[ip],
+        names=names,
+        since=since,
+        until=until,
+        include_synth=include_synth,
+        provenance=provenance,
+    )
+
+
+def _host_logs_block(cov: HostCoverage, ip: str) -> dict[str, Any]:
+    """Host-log counts per dataset, the agent that wrote them, and the sentences.
+
+    ``read_ok`` False means the read failed. The block then carries no dataset
+    at all, so a failed read cannot read as a host that ships nothing.
+    """
+    block: dict[str, Any] = {
+        "read_ok": cov.read_ok,
+        "datasets": (
+            {d.dataset: d.count for p in cov.planes for d in p.datasets}
+            | {d.dataset: d.count for d in cov.other}
+            if cov.read_ok
+            else {}
+        ),
+        "planes": cov.present,
+        "agent": cov.agent_payload(),
+        "sentences": describe(cov, subject=ip),
+    }
+    if cov.reason:
+        block["reason"] = cov.reason
+    return block
 
 
 def _looks_like_ip(value: str) -> bool:

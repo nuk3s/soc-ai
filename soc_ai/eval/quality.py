@@ -376,8 +376,8 @@ def _agreement_drop_by_counts(
         CODE_AGREEMENT_DROP,
         f"agreement_rate {rate:.2f} ({_grade_split(new)}) "
         f"is a real drop from the pooled baseline {baseline.rate:.2f} "
-        f"({baseline.n_yes}/{baseline.n_classified} over {baseline.n_points} runs) — "
-        f"a night this bad happens by chance {tail * 100:.1f}% of the time"
+        f"({baseline.n_yes}/{baseline.n_classified} over {baseline.n_points} runs). "
+        f"A night this bad happens by chance {tail * 100:.1f}% of the time"
         f"{_what_kind_of_bad(new)}{_what_this_cannot_tell_you(new)}",
     )
 
@@ -406,7 +406,7 @@ def _what_this_cannot_tell_you(new: SnapshotMetrics) -> str:
         return ""
     return (
         ". Every verdict in this batch was benign and the batch plants no known "
-        "positive, so this measures agreement on benign traffic only — it is not "
+        "positive, so this measures agreement on benign traffic only. It gives no "
         "evidence either way about whether a real detection would be caught"
     )
 
@@ -443,15 +443,12 @@ def _what_kind_of_bad(new: SnapshotMetrics) -> str:
         return ""
     if new.n_no == 0 and new.n_partial:
         return (
-            ". Every grade was partial: the oracle contradicted no verdict, it declined to "
-            "fully stand behind the reasoning, which points at thin grounds or missing "
-            "citations rather than wrong calls"
+            ". Every grade was partial. The Oracle contradicted no verdict. It did not "
+            "fully accept the reasoning, which points at thin grounds or missing "
+            "citations"
         )
     if new.n_partial == 0 and new.n_no:
-        return (
-            ". Every grade was a flat disagreement, not thin reasoning — the verdicts "
-            "themselves are what the oracle rejected"
-        )
+        return ". Every grade was a flat disagreement. The Oracle rejected the verdicts themselves"
     return ""
 
 

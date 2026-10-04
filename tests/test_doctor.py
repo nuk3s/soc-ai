@@ -10,6 +10,7 @@ tmp-path SQLite so the migration-head derivation is exercised for real.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -644,6 +645,109 @@ def test_check_egress_posture_is_info_only(tmp_path: Path) -> None:
     assert oracle.detail.startswith("ON")
 
 
+def test_doctor_egress_lists_every_row_the_egress_policy_page_lists(tmp_path: Path) -> None:
+    """Same rows, same source: web search, page fetch and online enrichment too.
+
+    The doctor listed six of the nine rows, and the three it left out were the
+    ones switched on. Every row line also ends in one period, never two.
+    """
+    from soc_ai.api.webui.routes_config import _egress_destinations
+
+    settings = _settings(tmp_path)
+    page_ids = {row["id"] for row in _egress_destinations(settings)}
+    assert {"web_search", "crawl", "online_enrichment"} <= page_ids
+    results = doctor.check_egress_posture(settings)
+    doctor_ids = {r.name.removeprefix("egress: ") for r in results if r.name != "egress"}
+    assert doctor_ids == page_ids
+    assert not any(".." in r.detail for r in results)
+
+
+# ── check 5c: audit chain (last 24 h) ────────────────────────────────────────
+
+
+def _chain_result(**overrides: Any) -> Any:
+    from soc_ai.audit.verify import ChainVerifyResult
+
+    base: dict[str, Any] = {
+        "ok": True,
+        "records_verified": 21000,
+        "first_broken_seq": None,
+        "first_seq": 762325,
+        "last_seq": 783324,
+        "capped": False,
+        "epochs": 1,
+        "first_broken_epoch_start": None,
+        "epochs_broken": 0,
+        "newest_broken_epoch_start": None,
+        "latest_epoch_broken": False,
+    }
+    base.update(overrides)
+    return ChainVerifyResult(**base)
+
+
+_BROKEN = {
+    "ok": False,
+    "first_broken_seq": 770001,
+    "first_broken_epoch_start": "2026-09-30T00:00:00+00:00",
+    "epochs_broken": 1,
+    "newest_broken_epoch_start": "2026-09-30T00:00:00+00:00",
+    "latest_epoch_broken": True,
+}
+
+
+async def test_audit_chain_row_passes_on_an_intact_day(tmp_path: Path) -> None:
+    verify = AsyncMock(return_value=_chain_result())
+    with patch("soc_ai.audit.verify.verify_audit_chain", verify):
+        row = await doctor.check_audit_chain(_settings(tmp_path))
+    assert row.name == "audit chain"
+    assert row.status == "PASS"
+    assert "762325..783324" in row.detail
+    assert verify.call_args.kwargs["days"] == 1
+    assert verify.call_args.kwargs["max_records"] is not None  # a bounded read
+
+
+async def test_audit_chain_row_warns_on_duplicates_and_fails_on_an_edit(tmp_path: Path) -> None:
+    """Duplicates only is a WARN that says nothing was altered; an edit is a FAIL."""
+    dup = _chain_result(
+        **_BROKEN,
+        duplicate_seqs=6,
+        extra_records=6,
+        max_claimants=2,
+        break_kinds=("duplicate_seq",),
+        newest_break_kind="duplicate_seq",
+    )
+    with patch("soc_ai.audit.verify.verify_audit_chain", AsyncMock(return_value=dup)):
+        row = await doctor.check_audit_chain(_settings(tmp_path))
+    assert row.status == "WARN"
+    assert "duplicate sequence numbers" in row.detail
+    assert "No record was altered" in row.detail
+
+    edit = _chain_result(
+        **_BROKEN,
+        altered_records=1,
+        break_kinds=("content_altered",),
+        newest_break_kind="content_altered",
+    )
+    with patch("soc_ai.audit.verify.verify_audit_chain", AsyncMock(return_value=edit)):
+        row = await doctor.check_audit_chain(_settings(tmp_path))
+    assert row.status == "FAIL"
+    assert "a record was altered" in row.detail
+    assert "No record was altered" not in row.detail
+
+
+async def test_audit_chain_row_is_not_checked_when_the_grid_is_slow(tmp_path: Path) -> None:
+    """A slow grid is INFO "not checked", never PASS and never a chain FAIL."""
+
+    async def _slow(*_a: Any, **_k: Any) -> Any:
+        await asyncio.sleep(5)
+        return _chain_result()
+
+    with patch("soc_ai.audit.verify.verify_audit_chain", _slow):
+        row = await doctor.check_audit_chain(_settings(tmp_path), timeout_s=0.05)
+    assert row.status == "INFO"
+    assert row.detail.startswith("not checked: the grid did not answer in")
+
+
 # ── check 7: blocklist freshness ─────────────────────────────────────────────
 
 
@@ -687,7 +791,7 @@ def test_blocklist_hint_names_what_would_actually_clear_it(tmp_path: Path) -> No
     hint = _by_name(doctor.check_blocklists(settings), "blocklists").hint
 
     assert "ABUSE_CH_AUTH_KEY is not set" in hint
-    assert "cannot clear" in hint
+    assert "The warning stays until" in hint
     # Both real options, not just the one that needs a third party.
     assert "auth.abuse.ch" in hint
     assert "blocklist_sources" in hint
@@ -704,7 +808,7 @@ def test_blocklist_hint_is_the_ordinary_one_when_the_key_is_set(tmp_path: Path) 
     hint = _by_name(doctor.check_blocklists(settings), "blocklists").hint
 
     assert "run `soc-ai blocklists refresh`" in hint
-    assert "cannot clear" not in hint
+    assert "The warning stays until" not in hint
 
 
 def test_blocklist_hint_ignores_a_missing_feed_that_needs_no_key(tmp_path: Path) -> None:
@@ -796,10 +900,12 @@ async def test_run_doctor_all_green(tmp_path: Path) -> None:
         "audit write grant",
         "index pattern coverage",
         "alerts feed filter",
+        "audit chain",
         "gateway",
         "analyst model",
         "model fitness",
         "egress",
+        "egress: web_search",
         "blocklists",
         "prompt assets",
     } <= names

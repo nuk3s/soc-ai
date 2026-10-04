@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import re
 from collections.abc import Awaitable, Callable, Coroutine
@@ -38,10 +39,12 @@ from soc_ai.agent.context import InvestigationContext
 from soc_ai.agent.egress_guard import EgressGuard
 from soc_ai.agent.models import build_investigator_model
 from soc_ai.agent.narrative_grounding import (
-    UNVERIFIED_QUIET_LINE,
+    NOTHING_GROUNDED_REPLY,
     check_narrative_grounding,
     redact_ungrounded,
     regrounding_instruction,
+    strip_correction_talk,
+    strip_sentences,
 )
 from soc_ai.agent.prompts import oql_primer_block
 from soc_ai.so_client.inventory import inventory_prompt_block
@@ -63,10 +66,10 @@ _FABRICATED_TOOL_CITATION_RE = re.compile(
 
 # Same shapes as above, widened for REDACTION rather than detection: consumes
 # the full `t_xxx(args)` call through its closing paren, and "tool(s)" /
-# "citation(s)" whole, so replacing a match with `(unverified)` never leaves a
-# dangling `)` or a stray trailing "s" in the answer. Kept separate from the
-# detection regex above so widening this one can never change what a
-# zero-tool turn gets FLAGGED for — only what gets redacted once it is.
+# "citation(s)" whole, so the stripped list records the whole citation. Kept
+# separate from the detection regex above so widening this one can never
+# change what a zero-tool turn gets FLAGGED for — only what gets redacted once
+# it is.
 _FABRICATED_CITATION_REDACT_RE = re.compile(
     r"\bt_[a-z][a-z0-9_]*\s*\([^)]*\)|verified by the tools?|evidence citations?",
     re.IGNORECASE,
@@ -221,37 +224,59 @@ def _extract_tool_evidence(result: Any) -> list[dict[str, Any]]:
     return out
 
 
-def _finish_run(result: Any, guard: Any) -> tuple[str, dict[str, Any], Any]:
-    """Normalize one agent run into (answer, meta, tool_evidence).
+def _extract_tool_calls(result: Any) -> list[dict[str, Any]]:
+    """[{tool, args}] from the run: the names a call used ground a claim too.
+
+    A dataset that a zero-hit query asked for grounds the claim that the
+    dataset holds nothing (``narrative_grounding.argument_names``).
+    """
+    out: list[dict[str, Any]] = []
+    for msg in result.all_messages():
+        for part in getattr(msg, "parts", []) or []:
+            if type(part).__name__ != "ToolCallPart":
+                continue
+            tool_for = getattr(part, "tool_name", None)
+            args = getattr(part, "args", None)
+            if isinstance(args, str):
+                with contextlib.suppress(ValueError):
+                    args = json.loads(args)
+            if tool_for and tool_for != "propose_verdict" and isinstance(args, dict):
+                out.append({"tool": tool_for, "args": args})
+    return out
+
+
+def _finish_run(result: Any, guard: Any) -> tuple[str, dict[str, Any], Any, Any]:
+    """Normalize one agent run into (answer, meta, tool_evidence, tool_calls).
 
     Desanitizes BEFORE the grounding check so answer artifacts compare against
-    seed_context / tool_evidence in the same (real-value) space. Extracted so
-    the regrounding loop can re-derive all three per attempt.
+    seed_context / tool_evidence / tool_calls in the same (real-value) space.
+    Extracted so the regrounding loop can re-derive all four per attempt.
     """
     answer = (str(result.output) or "").strip() or "(no answer produced)"
     meta: dict[str, Any] = {"tools": _extract_tools(result)}
     tool_evidence = _extract_tool_evidence(result)
+    tool_calls = _extract_tool_calls(result)
     if guard is not None:
         answer = str(guard.desanitize_obj(answer))
         tool_evidence = guard.desanitize_obj(tool_evidence)
-    return answer, meta, tool_evidence
+        tool_calls = guard.desanitize_obj(tool_calls)
+    return answer, meta, tool_evidence, tool_calls
 
 
 def _redact_fabricated_citations(answer: str) -> tuple[str, list[str]]:
     """Ground-or-strip for the OTHER shape a zero-tool answer can fake: not an
     ungrounded identifier (:func:`~soc_ai.agent.narrative_grounding.redact_ungrounded`
     handles that), but a citation of evidence that was never pulled — "verified
-    by the tools", `t_enrich_ip(...)`. Strips each fabricated-citation match and
-    returns what it removed, so the caller can record it in meta (the trace
+    by the tools", `t_enrich_ip(...)`. Takes out each sentence that carries a
+    fabricated citation, with no placeholder in its place, and returns the
+    citations it removed, so the caller can record them in meta (the trace
     keeps the receipts) the same way the artifact path does.
     """
-    stripped: list[str] = []
-
-    def _sub(m: re.Match[str]) -> str:
-        stripped.append(m.group(0))
-        return "(unverified)"
-
-    return _FABRICATED_CITATION_REDACT_RE.sub(_sub, answer), stripped
+    stripped = [m.group(0) for m in _FABRICATED_CITATION_REDACT_RE.finditer(answer)]
+    redacted = strip_sentences(
+        answer, lambda sentence: bool(_FABRICATED_CITATION_REDACT_RE.search(sentence))
+    )
+    return redacted, stripped
 
 
 def _progress_reporter(write: SetProgress) -> Callable[[str], None]:
@@ -380,10 +405,13 @@ async def run_chat_turn(state: Any, spec: ChatTurnSpec) -> None:  # noqa: PLR091
         # stuck pending forever.
         async with asyncio.timeout(spec.timeout_s):
             result = await agent.run(prompt_for_run)
-            answer, meta, tool_evidence = _finish_run(result, guard)
+            answer, meta, tool_evidence, tool_calls = _finish_run(result, guard)
             for _ in range(attempts):
                 probe = check_narrative_grounding(
-                    answer, seed_context=inputs.seed_context, tool_evidence=tool_evidence
+                    answer,
+                    seed_context=inputs.seed_context,
+                    tool_evidence=tool_evidence,
+                    tool_calls=tool_calls,
                 )
                 if probe.grounded or not probe.ungrounded:
                     break
@@ -405,10 +433,14 @@ async def run_chat_turn(state: Any, spec: ChatTurnSpec) -> None:  # noqa: PLR091
                 )
                 prompt_for_run = prompt_for_run + correction
                 result = await agent.run(prompt_for_run)
-                answer, meta, tool_evidence = _finish_run(result, guard)
+                answer, meta, tool_evidence, tool_calls = _finish_run(result, guard)
                 reground_used += 1
         if reground_used:
             meta["regrounding_attempts"] = reground_used
+            # The analyst never saw the correction. A sentence about it is the
+            # grounder's vocabulary in the reply (2026-10-02: "The correction is
+            # now properly grounded: ...").
+            answer = strip_correction_talk(answer) or answer
 
         # The answer is produced from here on — what remains is bookkeeping
         # (grounding re-check, ground-or-strip redaction, finalize_meta) and one
@@ -425,7 +457,10 @@ async def run_chat_turn(state: Any, spec: ChatTurnSpec) -> None:  # noqa: PLR091
             # artifact that is STILL ungrounded gets mechanically redacted out of the
             # answer — never shipped under a "verify before acting" caveat naming it.
             grounding = check_narrative_grounding(
-                answer, seed_context=inputs.seed_context, tool_evidence=tool_evidence
+                answer,
+                seed_context=inputs.seed_context,
+                tool_evidence=tool_evidence,
+                tool_calls=tool_calls,
             )
             if not grounding.grounded:
                 _LOGGER.warning(
@@ -434,18 +469,15 @@ async def run_chat_turn(state: Any, spec: ChatTurnSpec) -> None:  # noqa: PLR091
                     len(meta["tools"]),
                     grounding.reason,
                 )
-                # Whole-token, case-insensitive replace of every ungrounded artifact,
-                # then one quiet line — no ⚠, no per-token listing. Tool calls or not,
-                # the treatment is now identical: the old "scoped" (tools ran) vs
-                # "blanket" (zero-tool) caveat split (dogfood 2026-07-15) existed only
-                # to word a banner that no longer ships.
-                # The quiet line claims a removal, so it is earned only by an
-                # actual change to the text — a flagged answer that redaction
-                # left untouched must not tell the analyst otherwise.
+                # Each ungrounded artifact leaves with its clause: a list item,
+                # else its sentence. No placeholder and no closing line says so
+                # (owner, 2026-08-21: ground or strip, never banner; a
+                # 2026-10-02 host chat reply still carried both). Tool calls or
+                # not, the treatment is identical. The meta keeps the receipts.
                 redacted = redact_ungrounded(answer, grounding.ungrounded)
                 stripped = list(grounding.ungrounded) if redacted != answer else []
                 if stripped:
-                    answer = redacted + UNVERIFIED_QUIET_LINE
+                    answer = redacted or NOTHING_GROUNDED_REPLY
                 meta["narrative_grounding"] = {
                     "grounded": False,
                     "ungrounded": grounding.ungrounded,
@@ -458,24 +490,23 @@ async def run_chat_turn(state: Any, spec: ChatTurnSpec) -> None:  # noqa: PLR091
             # F1: a zero-tool turn must never present tool-call citations it never
             # made ("verified by the tools", `t_enrich_ip(...)`) — that is fabricated
             # evidence to the analyst. Same ground-or-strip policy, applied to the
-            # OTHER shape a zero-tool answer can fake: strip the fabricated-citation
-            # text itself (it is extraction-shaped noise, not a named artifact) rather
-            # than caveat around it. ALWAYS redact — even when Layer 2 above already
-            # fired — because a confabulating zero-tool model routinely produces
-            # BOTH shapes in the same breath (an ungrounded artifact AND a fake
-            # citation); skipping the redaction here left the citation phrase
-            # shipping unredacted while meta claimed it was caught (2026-08-20
-            # review finding). Only the SECOND quiet-line append is skipped — one
-            # line total — and the two detectors' reasons/stripped lists merge
-            # rather than clobber each other.
+            # OTHER shape a zero-tool answer can fake: strip the sentence that
+            # carries the fabricated citation rather than caveat around it. ALWAYS
+            # redact — even when Layer 2 above already fired — because a
+            # confabulating zero-tool model routinely produces BOTH shapes in the
+            # same breath (an ungrounded artifact AND a fake citation); skipping
+            # the redaction here left the citation phrase shipping unredacted
+            # while meta claimed it was caught (2026-08-20 review finding). The
+            # two detectors' reasons/stripped lists merge rather than clobber
+            # each other.
             if not meta["tools"] and _FABRICATED_TOOL_CITATION_RE.search(answer):
                 _LOGGER.warning(
                     "chat: fabricated tool citations on a zero-tool turn for %s", spec.label
                 )
                 prior_grounding = meta.get("narrative_grounding", {})
                 answer, fab_stripped = _redact_fabricated_citations(answer)
+                answer = answer or NOTHING_GROUNDED_REPLY
                 if prior_grounding.get("grounded", True):
-                    answer = answer + UNVERIFIED_QUIET_LINE
                     meta["narrative_grounding"] = {
                         "grounded": False,
                         "reason": "fabricated tool citations on a zero-tool turn",
@@ -526,9 +557,7 @@ async def run_chat_turn(state: Any, spec: ChatTurnSpec) -> None:  # noqa: PLR091
         # Scrub the exception text before it becomes user-facing content — a
         # verbose provider/gateway error body could otherwise echo a credential
         # (same defensive scrub probes.py applies to its error surfaces).
-        await _persist_terminal_error(
-            spec, f"Sorry — the chat turn failed ({_scrub(str(e))}). Try again."
-        )
+        await _persist_terminal_error(spec, f"The chat turn failed: {_scrub(str(e))}. Try again.")
 
 
 async def _persist_terminal_error(spec: ChatTurnSpec, content: str) -> None:

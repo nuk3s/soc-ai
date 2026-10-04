@@ -81,3 +81,24 @@ def test_env_example_documents_the_proxy_path() -> None:
         assert key in text, key
     assert "scripts/tls-proxy.sh" in text
     assert "docker-compose.proxy.yml" not in text
+
+
+def test_caddyfile_carries_the_acme_snippet_the_script_imports() -> None:
+    """The acme source writes SOC_AI_CADDY_TLS="import acme_ca <url> <root>".
+
+    The Caddyfile must define that snippet with the directory URL as the ca and
+    the root file as the ca_root. The root path sits under the /certs mount.
+    """
+    caddyfile = (REPO_ROOT / "Caddyfile").read_text(encoding="utf-8")
+    m = re.search(r"^\(acme_ca\) \{\n(.*?)^\}", caddyfile, re.M | re.S)
+    assert m is not None, "the (acme_ca) snippet is missing"
+    body = m.group(1)
+    assert re.search(r"^\s*tls \{\s*$", body, re.M)
+    assert re.search(r"^\s*ca \{args\[0\]\}\s*$", body, re.M)
+    assert re.search(r"^\s*ca_root \{args\[1\]\}\s*$", body, re.M)
+    # The snippet comes before the site that imports it.
+    assert caddyfile.index("(acme_ca)") < caddyfile.index("{$SOC_AI_DOMAIN} {")
+    script = (REPO_ROOT / "scripts" / "tls-proxy.sh").read_text(encoding="utf-8")
+    assert 'ACME_SNIPPET="import acme_ca"' in script
+    assert "ACME_ROOT_FILE=certs/acme-ca-root.pem" in script
+    assert "./certs:/certs:ro,Z" in _compose()["services"]["caddy"]["volumes"]

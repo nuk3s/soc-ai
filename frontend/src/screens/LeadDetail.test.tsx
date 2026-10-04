@@ -465,7 +465,9 @@ describe('LeadDetail counting', () => {
     expect(screen.getByText('Timeline · 1 observation')).toBeTruthy();
   });
 
-  it('names the entities and the ones that carry observations', async () => {
+  it('names the entities and drops the scope count', async () => {
+    // F10: "1 with observations" sat beside "0 observations". The count read
+    // scope_count, which is a formation number, not the timeline.
     vi.mocked(getLead).mockResolvedValue({
       ...LEAD,
       entities: [['host', '10.1.2.3'], ['host', '10.1.2.9']],
@@ -473,7 +475,79 @@ describe('LeadDetail counting', () => {
     } as never);
     mount();
     await waitFor(() => expect(screen.getByText(/2 entities named/)).toBeTruthy());
-    expect(screen.getByText(/1 with observations/)).toBeTruthy();
+    expect(screen.queryByText(/with observations/)).toBeNull();
+  });
+
+  it('says what formed a lead whose observations are gone', async () => {
+    vi.mocked(getLead).mockResolvedValue({
+      ...LEAD,
+      kinds: ['alert'],
+      kind_labels: ['triaged alert'],
+      observations: [],
+    } as never);
+    mount();
+    const line = await screen.findByTestId('lead-no-observations');
+    expect(line.textContent).toBe(
+      'No observation remains on this lead. It formed from triaged alert.',
+    );
+  });
+});
+
+// RH2, RH3: the lead kept one decision row. A dismiss after a reopen wrote
+// over the first, a reopened lead read its old dismissal as current, and the
+// promotion was on no timeline.
+describe('LeadDetail decisions', () => {
+  const DECISIONS = [
+    { action: 'closed_by_hunt', at: '2026-09-20T10:00:00Z', by: 'auto-hunt', reason: 'hunt_clean', note: null, hunt_id: 'H-1', investigation_id: null },
+    { action: 'reopened', at: '2026-09-21T10:00:00Z', by: 'ann', reason: null, note: null, hunt_id: null, investigation_id: null },
+    { action: 'dismissed', at: '2026-09-22T10:00:00Z', by: 'bob', reason: 'benign_repeat', note: 'seen before', hunt_id: null, investigation_id: null },
+    { action: 'reopened', at: '2026-09-23T10:00:00Z', by: 'cat', reason: null, note: null, hunt_id: null, investigation_id: null },
+    { action: 'promoted', at: '2026-09-24T10:00:00Z', by: 'dan', reason: null, note: null, hunt_id: null, investigation_id: 'INV-9' },
+  ];
+
+  it('renders every decision in order, and no stale dismissal in the header', async () => {
+    vi.mocked(getLead).mockResolvedValue({
+      ...LEAD,
+      status: 'promoted',
+      investigation_id: 'INV-9',
+      investigation_exists: true,
+      decisions: DECISIONS,
+    } as never);
+    mount();
+    const rows = await screen.findAllByTestId('lead-decision');
+    expect(rows.map((r) => r.textContent)).toEqual([
+      expect.stringContaining('Closed by soc-ai. The hunt found no threat.'),
+      expect.stringContaining('Reopened by ann.'),
+      expect.stringContaining('Dismissed by bob: A benign repeat. seen before.'),
+      expect.stringContaining('Reopened by cat.'),
+      expect.stringContaining('Promoted by dan to an investigation.'),
+    ]);
+    expect(within(rows[4]).getByText('INV-9').getAttribute('href')).toBe('/investigation/INV-9');
+    expect(within(rows[0]).getByText('H-1').getAttribute('href')).toBe('/hunts/H-1');
+    expect(screen.queryByTestId('lead-dismissal')).toBeNull();
+    expect(screen.queryByTestId('lead-closed-reason')).toBeNull();
+  });
+
+  it('states why a finished hunt did not close the lead', async () => {
+    vi.mocked(getLead).mockResolvedValue({
+      ...LEAD,
+      status: 'hunting',
+      hunt_id: 'H-2',
+      hunt_status: 'complete',
+      hunt_outcome_label: 'No threat observed',
+      hold_reason: 'earlier_threat',
+      hold_sentence: 'An earlier hunt found a threat.',
+      decisions: [
+        { action: 'held', at: '2026-09-25T10:00:00Z', by: 'auto-hunt', reason: 'earlier_threat', note: null, hunt_id: 'H-2', investigation_id: null },
+      ],
+    } as never);
+    mount();
+    const hold = await screen.findByTestId('lead-hold-reason');
+    expect(hold.textContent).toBe(
+      'The hunt did not close this lead. An earlier hunt found a threat. Decide on the lead.',
+    );
+    const row = screen.getByTestId('lead-decision');
+    expect(row.textContent).toContain('Left open by soc-ai. An earlier hunt found a threat.');
   });
 });
 

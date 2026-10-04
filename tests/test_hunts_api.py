@@ -1340,8 +1340,9 @@ def test_hunt_chat_ungrounded_answer_now_gets_redacted(
 
     assert done is not None
     assert "evil.example.com" not in done["payload"]["content"]
-    assert "(unverified)" in done["payload"]["content"]
-    assert "Some unverifiable specifics were removed" in done["payload"]["content"]
+    # The claim leaves with its sentence. No placeholder, no line about it.
+    assert "(unverified)" not in done["payload"]["content"]
+    assert "unverifiable" not in done["payload"]["content"].lower()
     assert "⚠" not in done["payload"]["content"]
     grounding = done["payload"]["meta"]["narrative_grounding"]
     assert grounding["grounded"] is False
@@ -1482,7 +1483,7 @@ def test_validate_hunt_findings_high_sev_no_citations_capped() -> None:
     high = validated[0]
     assert high.severity == "medium"  # critical capped to medium
     assert high.validator_note is not None
-    assert "lacks citations" in high.validator_note.lower()
+    assert "has no citations" in high.validator_note.lower()
     # the info observation with no citations is untouched
     low = validated[1]
     assert low.severity == "info"
@@ -2564,7 +2565,7 @@ def test_validate_hunt_findings_caps_high_threat_citing_only_alerts() -> None:
     assert f.severity == "medium"  # capped from high — cited only the alert
     assert f.citations == ["sALERT_DOC_7Zk"]  # citation still resolves (it exists)
     assert f.validator_note is not None
-    assert "only detector alerts cited" in f.validator_note.lower()
+    assert "cites only detector alerts" in f.validator_note.lower()
     assert counts["findings_capped"] == 1
     # the citation resolved, so nothing was stripped
     assert counts["citations_stripped"] == 0
@@ -2674,7 +2675,7 @@ def test_validate_hunt_findings_get_event_raw_refetching_alert_is_not_corroborat
 
     f = validated[0]
     assert f.severity == "medium"  # capped — a refetched alert doc is not corroboration
-    assert "only detector alerts cited" in (f.validator_note or "").lower()
+    assert "cites only detector alerts" in (f.validator_note or "").lower()
     assert counts["findings_capped"] == 1
 
 
@@ -2734,7 +2735,7 @@ def test_validate_hunt_findings_rule_content_is_not_corroboration() -> None:
 
     f = validated[0]
     assert f.severity == "medium"  # critical → medium: no non-alert corroboration
-    assert "only detector alerts cited" in (f.validator_note or "").lower()
+    assert "cites only detector alerts" in (f.validator_note or "").lower()
     assert counts["findings_capped"] == 1
 
 
@@ -2867,7 +2868,7 @@ def test_run_hunt_gathers_labeled_evidence_and_caps_alert_only_threat(
     report_ev = next(e for e in events if e.kind == "hunt_report")
     f = report_ev.payload["findings"][0]
     assert f["severity"] == "medium"  # capped: cited only the detector alert
-    assert "only detector alerts cited" in (f["validator_note"] or "").lower()
+    assert "cites only detector alerts" in (f["validator_note"] or "").lower()
 
 
 # ── Layer 3: deterministic partial-report humility ───────────────────────────
@@ -4286,7 +4287,12 @@ def test_a_second_dismissal_answers_200_and_changes_nothing(client: TestClient) 
 
 
 def test_reopening_a_lead_keeps_the_dismissal_as_history(client: TestClient) -> None:
-    # The dismissal stays on the row so the page can show it as a timeline event.
+    """RH2/RA21: the dismissal is history in `decisions`, never the current state.
+
+    A reopened lead carried benign_repeat in dismissed_reason, so the header
+    read the old dismissal as current. A dismiss after the reopen wrote over
+    the first one (RH3). A promotion was in no timeline at all.
+    """
     lead_id = _seed_lead(client)
     client.post(
         f"/api/v1/hunts/leads/{lead_id}/dismiss",
@@ -4296,7 +4302,22 @@ def test_reopening_a_lead_keeps_the_dismissal_as_history(client: TestClient) -> 
     assert res.status_code == 200, res.text
     body = res.json()
     assert body["status"] == "open"
-    assert body["dismissed_reason"] is not None and body["dismissed_at"] is not None
+    assert body["dismissed_reason"] is None and body["dismissed_at"] is None
+    assert [d["action"] for d in body["decisions"]] == ["dismissed", "reopened"]
+    assert body["decisions"][0]["reason"] == "benign_repeat"
+    assert body["decisions"][0]["note"] == "seen before"
+    assert body["decisions"][0]["at"].endswith("Z")
+    client.post(f"/api/v1/hunts/leads/{lead_id}/dismiss", json={"reason": "known_change"})
+    body = client.post(f"/api/v1/hunts/leads/{lead_id}/reopen").json()
+    assert [d["action"] for d in body["decisions"]] == [
+        "dismissed",
+        "reopened",
+        "dismissed",
+        "reopened",
+    ]
+    listed = client.get("/api/v1/leads?status=all").json()
+    row = next(r for r in listed if r["id"] == lead_id)
+    assert row["dismissed_reason"] is None and row["dismissed_at"] is None
     assert client.post("/api/v1/hunts/leads/999999/reopen").status_code == 404
 
 
@@ -4774,6 +4795,7 @@ def test_a_template_without_analytics_leaves_the_objective_alone(client: TestCli
 
 
 def test_draft_analytic_from_a_threat_finding_writes_a_candidate(client: TestClient) -> None:
+    from soc_ai.detection.analytic_drafter import DraftResult
     from soc_ai.detection.analytic_models import AnalyticDraft
     from soc_ai.hunting.execute import SpecRun
     from soc_ai.hunting.spec import parse_spec
@@ -4785,7 +4807,7 @@ def test_draft_analytic_from_a_threat_finding_writes_a_candidate(client: TestCli
         patch(
             "soc_ai.api.webui.routes_detection.draft_analytic",
             AsyncMock(
-                return_value=(
+                return_value=DraftResult(
                     AnalyticDraft(spec_yaml=GOOD_YAML, rationale="r"),
                     parse_spec(GOOD_YAML),
                 )
@@ -4814,6 +4836,208 @@ def test_draft_analytic_from_a_threat_finding_writes_a_candidate(client: TestCli
     assert body["dry_run"]["hit_count"] == 3
     listed = client.get("/api/v1/analytics").json()["analytics"]
     assert any(a["id"] == body["analytic_id"] and a["status"] == "candidate" for a in listed)
+
+
+def _timeline_events(stamp: str | None) -> list[Any]:
+    from soc_ai.store.models import HuntEvent
+
+    def ev(seq: int, kind: str, payload: dict[str, Any]) -> HuntEvent:
+        if stamp is not None:
+            payload = {**payload, "_at": stamp}
+        return HuntEvent(hunt_id="h", sequence=seq, kind=kind, payload=payload)
+
+    return [
+        ev(1, "hunt_started", {"objective": "o"}),
+        ev(2, "tool_call", {"tool_name": "t_host_summary", "args": {}, "tool_call_id": "a"}),
+        ev(3, "tool_call", {"tool_name": "final_result", "args": {}, "tool_call_id": "b"}),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("status", "synth"),
+    [
+        ("complete", "Findings synthesis: done"),
+        ("cancelled", "Findings synthesis: stopped by a cancel request"),
+        ("interrupted", "Findings synthesis: stopped by a service restart"),
+        ("error", "Findings synthesis: did not finish"),
+        ("running", "Findings synthesis: running…"),
+    ],
+)
+def test_the_synthesis_step_settles_with_the_hunt(status: str, synth: str) -> None:
+    """F3/RH6: a stored row from a hunt two days old read "Verdict synthesis: running…".
+
+    The rule reads the hunt's status, so an old row with no time stamp reads
+    right with no backfill. A hunt ends in findings, so the step says so.
+    """
+    from soc_ai.api.webui.routes_hunts import _build_hunt_timeline
+
+    steps = _build_hunt_timeline(_timeline_events(None), status)
+    titles = [s.title for s in steps]
+    assert titles[-1] == synth
+    assert not any("Verdict" in t for t in titles)
+    if status != "running":
+        assert not any("running…" in t for t in titles), titles
+        assert titles[1].endswith("no result recorded")
+    assert all(s.time == "" for s in steps)
+
+
+def test_the_timeline_shows_the_time_the_recorder_stamped() -> None:
+    from soc_ai.api.webui.routes_hunts import _build_hunt_timeline
+
+    steps = _build_hunt_timeline(_timeline_events("2026-10-01T09:08:07+00:00"), "complete")
+    assert [s.time for s in steps] == ["09:08:07"] * 3
+    # The stamp is bookkeeping. It never shows in a step's detail.
+    assert all("_at" not in s.detail for s in steps)
+
+
+async def test_the_recorder_stamps_each_event_and_keeps_the_report_clean(
+    settings_kratos: Settings,
+) -> None:
+    from soc_ai.api.hunt_recorder import HuntRecorder
+    from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
+
+    engine = make_engine(settings_kratos)
+    await run_migrations(engine)
+    maker = make_sessionmaker(engine)
+    recorder = HuntRecorder(maker, objective="o", started_by="admin")
+    hunt_id = await recorder.start()
+    assert hunt_id
+    await recorder.record("hunt_started", 1, {"objective": "o"})
+    await recorder.record("hunt_report", 2, {"findings": [], "narrative": "n"})
+    await recorder.finish("complete")
+    async with maker() as db:
+        got = await hunt_svc.get_with_events(db, hunt_id)
+    assert got is not None
+    hunt, events = got
+    assert all(isinstance(e.payload.get("_at"), str) for e in events)
+    assert "_at" not in (hunt.report or {})
+    await engine.dispose()
+
+
+def _draft_patches(
+    *,
+    cited: Any = None,
+    dry: Any = None,
+    spec_yaml: str | None = None,
+    generalization: dict[str, Any] | None = None,
+    real_dry_run: bool = False,
+) -> Any:
+    """Patch the model call, and optionally the two grid reads, of the draft route.
+
+    ``real_dry_run`` leaves ``run_spec`` unpatched, so the dry run reads the
+    app's grid client and a test fakes the grid's answers.
+    """
+    from contextlib import ExitStack
+
+    from soc_ai.detection.analytic_drafter import DraftResult
+    from soc_ai.detection.analytic_models import AnalyticDraft
+    from soc_ai.hunting.execute import SpecRun
+    from soc_ai.hunting.spec import parse_spec
+
+    from tests.test_analytic_drafter import GOOD_YAML
+
+    text = spec_yaml or GOOD_YAML
+    stack = ExitStack()
+    model = stack.enter_context(
+        patch(
+            "soc_ai.api.webui.routes_detection.draft_analytic",
+            AsyncMock(
+                return_value=DraftResult(
+                    AnalyticDraft(spec_yaml=text, rationale="r"),
+                    parse_spec(text),
+                    generalization,
+                )
+            ),
+        )
+    )
+    if not real_dry_run:
+        stack.enter_context(
+            patch(
+                "soc_ai.api.webui.routes_detection.run_spec",
+                dry
+                or AsyncMock(
+                    return_value=SpecRun(
+                        spec_id="local-rc4-ticket-from-workstation",
+                        since="now-30d",
+                        until="now",
+                        blind=False,
+                        precondition_docs=1,
+                        matched_docs=2,
+                        candidates=[],
+                    )
+                ),
+            )
+        )
+    stack.enter_context(
+        patch(
+            "soc_ai.api.webui.routes_detection._resolve_cited_docs",
+            cited or AsyncMock(return_value=[]),
+        )
+    )
+    return stack, model
+
+
+def test_draft_analytic_preview_stores_nothing_and_the_confirm_stores_it(
+    client: TestClient,
+) -> None:
+    """F1: the click drafts and the confirm writes. A retry cannot write twice.
+
+    The console wrote a candidate on one click, aborted at 20 s while the
+    server committed, and a retry wrote a second one. Now the preview names
+    the id, the confirm stores it with no second model call, and a second
+    draft of the same finding answers 409 with the first id.
+    """
+    hunt_id = _seed_complete_hunt(client)
+    stack, model = _draft_patches()
+    with stack:
+        res = client.post(
+            f"/api/v1/hunts/{hunt_id}/findings/0/draft-analytic", json={"preview": True}
+        )
+        assert res.status_code == 200, res.text
+        preview = res.json()
+        assert preview["status"] == "preview"
+        assert preview["analytic_id"] == "local-rc4-ticket-from-workstation"
+        assert client.get("/api/v1/analytics").json()["counts"].get("candidate", 0) == 0
+
+        res = client.post(
+            f"/api/v1/hunts/{hunt_id}/findings/0/draft-analytic",
+            json={"spec_yaml": preview["spec_yaml"]},
+        )
+        assert res.status_code == 200, res.text
+        assert res.json()["analytic_id"] == "local-rc4-ticket-from-workstation"
+        assert res.json()["status"] == "candidate"
+        assert model.await_count == 1
+
+        again = client.post(
+            f"/api/v1/hunts/{hunt_id}/findings/0/draft-analytic", json={"preview": True}
+        )
+    assert again.status_code == 409, again.text
+    detail = again.json()["detail"]
+    assert detail["reason"] == "analytic_exists_for_finding"
+    assert detail["analytic_id"] == "local-rc4-ticket-from-workstation"
+    assert model.await_count == 1
+    finding = client.get(f"/api/v1/hunts/{hunt_id}").json()["findings"][0]
+    assert finding["analyticId"] == "local-rc4-ticket-from-workstation"
+
+
+def test_draft_analytic_works_from_the_stored_finding_when_the_grid_is_slow(
+    client: TestClient,
+) -> None:
+    """RH5: the range answered 503 at 12 s on five of five drafts. The draft degrades."""
+    hunt_id = _seed_complete_hunt(client)
+    stack, _model = _draft_patches(
+        cited=AsyncMock(side_effect=TimeoutError()), dry=AsyncMock(side_effect=TimeoutError())
+    )
+    with stack:
+        res = client.post(
+            f"/api/v1/hunts/{hunt_id}/findings/0/draft-analytic", json={"preview": True}
+        )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["notes"] and "stored finding" in body["notes"][0]
+    # A dry run that did not run never reads as zero matches.
+    assert body["dry_run"]["ran"] is False
+    assert "did not run" in body["dry_run"]["error"]
 
 
 def test_draft_analytic_refuses_a_visibility_gap(client: TestClient) -> None:
@@ -4857,6 +5081,165 @@ def test_draft_analytic_reports_a_bad_draft_as_422(client: TestClient) -> None:
     assert res.status_code == 422, res.text
     assert res.json()["detail"]["reason"] == "bad_draft"
     assert client.get("/api/v1/analytics").json()["counts"].get("candidate", 0) == 0
+
+
+def test_a_pinned_draft_warns_in_the_preview_and_marks_the_candidate(
+    client: TestClient,
+) -> None:
+    """The owner's case: a draft that names one host and two domains.
+
+    The preview carries the pins. The confirm computes them again from the
+    text it stores, so a console that drops them cannot store a clean mark.
+    The list marks the candidate and the drawer lists the pins.
+    """
+    from tests.test_analytic_drafter import PINNED_YAML
+
+    hunt_id = _seed_complete_hunt(client)
+    pins = ["The clause on dns.query.name pins the analytic to a fixed list of domain values."]
+    stack, _model = _draft_patches(
+        spec_yaml=PINNED_YAML, generalization={"pinned": pins, "retried": True}
+    )
+    with stack:
+        preview = client.post(
+            f"/api/v1/hunts/{hunt_id}/findings/0/draft-analytic", json={"preview": True}
+        ).json()
+        assert preview["generalization"] == {"pinned": pins, "retried": True}
+        # The confirm body carries no pins. The server finds them itself.
+        res = client.post(
+            f"/api/v1/hunts/{hunt_id}/findings/0/draft-analytic",
+            json={"spec_yaml": preview["spec_yaml"], "retried": True},
+        )
+    assert res.status_code == 200, res.text
+    stored = res.json()["generalization"]
+    assert stored["retried"] is True
+    assert (
+        "The clause on source.ip pins the analytic to one address. Describe the behaviour."
+        in stored["pinned"]
+    )
+    rows = {a["id"]: a for a in client.get("/api/v1/analytics").json()["analytics"]}
+    assert rows["local-dead-domain-dns-polling"]["pinned"] == stored["pinned"]
+    # A shipped analytic carries no mark.
+    assert rows["identity-4662-dcsync-nonmachine"]["pinned"] == []
+    detail = client.get("/api/v1/analytics/local-dead-domain-dns-polling").json()
+    assert detail["pinned"] == stored["pinned"]
+    # The pins ride on the first version row. They are no approval receipts.
+    assert detail["versions"][0]["has_receipts"] is False
+
+
+def test_a_clean_draft_stores_no_mark(client: TestClient) -> None:
+    """The negative control: a draft that describes a behaviour is not marked."""
+    from tests.test_analytic_drafter import BEHAVIOUR_YAML
+
+    hunt_id = _seed_complete_hunt(client)
+    stack, _model = _draft_patches(spec_yaml=BEHAVIOUR_YAML)
+    with stack:
+        res = client.post(
+            f"/api/v1/hunts/{hunt_id}/findings/0/draft-analytic",
+            json={"spec_yaml": BEHAVIOUR_YAML},
+        )
+    assert res.status_code == 200, res.text
+    assert res.json()["generalization"] is None
+    rows = {a["id"]: a for a in client.get("/api/v1/analytics").json()["analytics"]}
+    assert rows["local-dns-query-nxdomain"]["pinned"] == []
+
+
+def test_a_feed_indicator_on_a_cited_event_excuses_the_pin(client: TestClient) -> None:
+    """A known-bad domain from a feed is the point of the finding, so it may stay."""
+    spec_yaml = """
+id: local-query-to-feed-domain
+title: A host queries a domain a threat feed lists
+level: high
+scope_field: source.ip
+scope_kind: ip
+precondition:
+  all:
+    - field: event.dataset
+      value: zeek.dns
+detection:
+  all:
+    - field: event.dataset
+      value: zeek.dns
+    - field: dns.question.name
+      value: bad.example.test
+"""
+    hunt_id = _seed_complete_hunt(client)
+    doc = {
+        "_id": "es-abc",
+        "_source": {
+            "threat": {"enrichments": [{"indicator": {"url": {"domain": "bad.example.test"}}}]}
+        },
+    }
+    stack, _model = _draft_patches(spec_yaml=spec_yaml, cited=AsyncMock(return_value=[doc]))
+    with stack:
+        res = client.post(
+            f"/api/v1/hunts/{hunt_id}/findings/0/draft-analytic", json={"spec_yaml": spec_yaml}
+        )
+    assert res.status_code == 200, res.text
+    assert res.json()["generalization"] is None
+
+
+def test_the_dry_run_counts_the_entities_it_matched(client: TestClient) -> None:
+    """A generalized clause that matched one host in 30 days is the analyst's cue.
+
+    The dry run reads a fake grid. The detection groups by the scope field, so
+    the count is the number of scope buckets the grid returned.
+    """
+    from soc_ai.so_client.elastic import EsSearchResult
+
+    from tests.test_analytic_drafter import BEHAVIOUR_YAML
+
+    def bucket(key: str, count: int) -> dict[str, Any]:
+        return {
+            "key": key,
+            "doc_count": count,
+            "samples": {"hits": {"hits": [{"_id": f"id-{key}", "_index": "logs-x"}]}},
+        }
+
+    def grid(buckets: list[dict[str, Any]], other: int = 0) -> list[EsSearchResult]:
+        total = sum(b["doc_count"] for b in buckets) + other
+        return [
+            EsSearchResult(total=40, took_ms=1, hits=[]),
+            EsSearchResult(
+                total=total,
+                took_ms=1,
+                hits=[],
+                aggregations={"scopes": {"buckets": buckets, "sum_other_doc_count": other}},
+            ),
+        ]
+
+    hunt_id = _seed_complete_hunt(client)
+    elastic = client.app.state.elastic
+    stack, _model = _draft_patches(spec_yaml=BEHAVIOUR_YAML, real_dry_run=True)
+    with (
+        stack,
+        patch.object(elastic, "search", AsyncMock(side_effect=grid([bucket("198.51.100.7", 12)]))),
+    ):
+        one = client.post(
+            f"/api/v1/hunts/{hunt_id}/findings/0/draft-analytic", json={"preview": True}
+        ).json()["dry_run"]
+    assert one["ran"] is True and one["hit_count"] == 12
+    assert one["entity_count"] == 1
+    assert one["entity_count_is_lower_bound"] is False
+    assert one["scope_kind"] == "ip"
+
+    many = grid([bucket("198.51.100.7", 3), bucket("198.51.100.8", 2)], other=9)
+    stack, _model = _draft_patches(spec_yaml=BEHAVIOUR_YAML, real_dry_run=True)
+    with stack, patch.object(elastic, "search", AsyncMock(side_effect=many)):
+        two = client.post(
+            f"/api/v1/hunts/{hunt_id}/findings/0/draft-analytic", json={"preview": True}
+        ).json()["dry_run"]
+    assert two["entity_count"] == 2
+    # Buckets past the ceiling hold more entities, so the count is a floor.
+    assert two["entity_count_is_lower_bound"] is True
+
+    # A dry run that did not run counts no entities. It never reads as zero.
+    stack, _model = _draft_patches(spec_yaml=BEHAVIOUR_YAML, real_dry_run=True)
+    with stack, patch.object(elastic, "search", AsyncMock(side_effect=TimeoutError())):
+        off = client.post(
+            f"/api/v1/hunts/{hunt_id}/findings/0/draft-analytic", json={"preview": True}
+        ).json()["dry_run"]
+    assert off["ran"] is False
+    assert off["entity_count"] is None
 
 
 def test_observations_for_an_entity_list_every_source(client: TestClient) -> None:
@@ -5448,7 +5831,7 @@ def test_the_lead_page_relates_by_an_external_address_and_by_a_technique(
     _seed_related_lead(
         client,
         host="10.3.3.6",
-        spec_id="prior-privileged-group-membership-changed",
+        spec_id="identity-privileged-group-change",
         born_at=born - timedelta(days=4),
     )
     detail = client.get(f"/api/v1/hunts/leads/{technique}").json()

@@ -293,7 +293,8 @@ const isLeadTab = (v: unknown): v is LeadTab => LEAD_TABS.some((t) => t.id === v
  *  nobody can read is a filter an analyst guesses at. */
 export const STATUS_LEGEND =
   'New: nobody has acted. In progress: a hunt is running. ' +
-  'Hunted: the hunt finished, decide. Closed: dismissed or promoted.';
+  'Hunted: the hunt finished, and the lead waits on a decision. ' +
+  'Closed: an analyst dismissed or promoted the lead, or a clean hunt closed it.';
 
 /** The legend, with the sentence auto-hunt adds. With the loop on, New no
  *  longer means "hunt it": it means the hunt is coming. */
@@ -329,8 +330,8 @@ export function leadRowStatus(lead: { status: string; hunt_status?: string | nul
 const EMPTY_STATE: Record<LeadTab, string> = {
   needs_decision:
     'No lead waits on a decision. Every lead is under a hunt, or closed, or none has formed.',
-  in_progress: 'No hunt is running on a lead. No analyst has started a hunt from a lead.',
-  closed: 'No closed leads. No analyst has dismissed or promoted a lead.',
+  in_progress: 'No hunt is running on a lead.',
+  closed: 'No closed leads. No analyst closed a lead, and no clean hunt closed one.',
   all: 'No leads. No entity has observations of two types, a finding, or a repeated single type.',
 };
 
@@ -769,7 +770,11 @@ function LeadRow({
               >
                 {sourceLabel(o.source, o.shadow)}
               </span>
-              {o.summary ?? kindLabel(o.kind, o.kind_label)}
+              {/* The summary ends in a stop. The sweep count follows it with a
+                  comma, so drop the stop and the line does not read "days., seen". */}
+              {o.occurrences > 1 && o.summary
+                ? o.summary.replace(/\.\s*$/, '')
+                : (o.summary ?? kindLabel(o.kind, o.kind_label))}
               {o.occurrences > 1 &&
                 `, seen on ${plural(o.occurrences, 'sweep')}${
                   o.first_seen_at ? `, first seen ${ago(o.first_seen_at)}` : ''
@@ -789,6 +794,7 @@ function LeadRow({
 
 export function LeadsStrip({
   entityKey,
+  aliases,
   className,
   status: firstTab = 'needs_decision',
   noun = 'host',
@@ -798,6 +804,10 @@ export function LeadsStrip({
   onToggleCollapsed,
 }: {
   entityKey?: string;
+  /** The other keys the same machine is stored under: its strong hostnames.
+   *  A lead on the host name belongs on the address's page too. A host alias
+   *  matches a host entity only, in any case. */
+  aliases?: string[];
   className?: string;
   /** The tab the strip opens on. A host page opens on All, because a lead
    *  under a hunt and a lead already closed both belong to the host. */
@@ -851,8 +861,13 @@ export function LeadsStrip({
   onRowsRef.current = onRows;
   // On a host page the strip shows only the leads that touch this host: the
   // lead points at the host, and the host page pointed at nothing.
+  const aliasKeys = new Set((aliases ?? []).map((a) => a.toLowerCase()));
   const rows = (leads.data ?? []).filter(
-    (lead) => !entityKey || lead.entities.some((e) => e[1] === entityKey),
+    (lead) =>
+      !entityKey ||
+      lead.entities.some(
+        (e) => e[1] === entityKey || (e[0] === 'host' && aliasKeys.has(String(e[1]).toLowerCase())),
+      ),
   );
   // The rows, to the block that asked for them. The effect keys on the loaded
   // list, so a render the poll did not change does not re-announce it.

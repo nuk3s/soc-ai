@@ -116,7 +116,7 @@ def collect_data_sources(settings: Settings) -> list[DataSourceOut]:
             last_refreshed=_iso_mtime(cloud),
             needs_key=False,
             key_configured=False,
-            note="Azure's URL rotates — set AZURE_SERVICE_TAGS_URL if azure tagging fails.",
+            note="The Azure URL rotates. Set AZURE_SERVICE_TAGS_URL when Azure tagging fails.",
         )
     )
 
@@ -172,7 +172,7 @@ def collect_data_sources(settings: Settings) -> list[DataSourceOut]:
     out.append(
         DataSourceOut(
             id="shodan_host",
-            name="Shodan host (full /shodan/host — banners, services, vulns)",
+            name="Shodan host: full /shodan/host, banners, services, vulns",
             category="Online lookup",
             egress="on-lookup",
             enabled=online and shodan_key,

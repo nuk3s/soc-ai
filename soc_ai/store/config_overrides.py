@@ -484,12 +484,12 @@ WHITELIST: tuple[SettingSpec, ...] = (
         help=(
             "soc-ai acknowledges a completed investigation in Security Onion if "
             "its verdict is false_positive at or above the threshold below. An "
-            "auto-triage sweep also acknowledges an alert that inherits such a "
+            "Auto-Investigate run also acknowledges an alert that inherits such a "
             "verdict inside the inherit window. The alert must share the rule, the "
             "source and the destination. The default is on, and soc-ai audits every "
             "unattended acknowledgement. soc-ai never acknowledges a high or "
             "critical severity alert, and never a malware or exploit alert. To "
-            "clear a standing false-positive backlog, run an auto-triage sweep over "
+            "clear a standing false-positive backlog, run Auto-Investigate over "
             "those alerts and lower the severity floor to medium or low. Turn this "
             "setting off to require a click for every acknowledgement."
         ),
@@ -545,7 +545,7 @@ WHITELIST: tuple[SettingSpec, ...] = (
         key="auto_triage_schedule_enabled",
         attr="auto_triage_schedule_enabled",
         type="bool",
-        label="Continuous auto-investigate",
+        label="Continuous Auto-Investigate",
         section="Triage automation",
         hot=True,
         day1=True,
@@ -560,7 +560,7 @@ WHITELIST: tuple[SettingSpec, ...] = (
         key="auto_triage_schedule_interval_minutes",
         attr="auto_triage_schedule_interval_minutes",
         type="int",
-        label="Continuous auto-investigate interval (minutes)",
+        label="Continuous Auto-Investigate interval (minutes)",
         section="Triage automation",
         hot=True,
         day1=True,
@@ -590,29 +590,34 @@ WHITELIST: tuple[SettingSpec, ...] = (
         key="hunt_spec_sweeps_enabled",
         attr="hunt_spec_sweeps_enabled",
         type="bool",
-        label="Catalog sweeps",
+        label="Analytic sweeps",
         section="Triage automation",
         hot=True,
         help=(
-            "soc-ai runs the declarative hunt catalog on an interval. It records a "
-            "finding for anything new. A sweep makes no model call. It runs two "
-            "Elasticsearch queries per spec, so the cost is query load. The default "
-            "is off, because a sweep writes findings unattended. Run "
-            "`soc-ai spec-sweep --shadow` for a week first and read the counts."
+            "On, soc-ai runs every live analytic as a grid query on a schedule. "
+            "Each run reads the lookback window. A document that matches an analytic "
+            "becomes an observation on the host or the user it names. The Hunts page "
+            "lists it under Analytic hits, and the host page shows it. Observations "
+            "that stack past the lead threshold form a lead, and a lead starts a hunt "
+            "when auto-hunt is on. A sweep makes no model call. It runs two grid "
+            "queries per analytic. Off, no analytic runs and the Analytics tab says so. "
+            "The default is off, because a sweep writes observations without an "
+            "analyst. To read what the catalog would raise first, set an analytic to "
+            "shadow, or run `soc-ai spec-sweep --shadow` for a week and read the counts."
         ),
     ),
     SettingSpec(
         key="hunt_spec_sweep_interval_minutes",
         attr="hunt_spec_sweep_interval_minutes",
         type="int",
-        label="Minutes between catalog sweeps",
+        label="Minutes between analytic sweeps",
         section="Triage automation",
         hot=True,
         help=(
-            "This setting is the number of minutes between catalog sweeps. The "
-            "floor is 5 minutes, because a sweep runs no model. Keep the look-back "
-            "window wider than this interval. A wider window still sees a condition "
-            "that arrived during an outage."
+            "How often the analytic sweep runs, in minutes. Each run queries the grid "
+            "once per analytic for the lookback window. The floor is 5 minutes, "
+            "because a sweep runs no model. Keep the lookback window wider than this "
+            "interval, so a document that arrived during an outage is still read."
         ),
         min_value=5,
         max_value=1440,
@@ -621,14 +626,15 @@ WHITELIST: tuple[SettingSpec, ...] = (
         key="hunt_spec_sweep_window_minutes",
         attr="hunt_spec_sweep_window_minutes",
         type="int",
-        label="Catalog sweep look-back window (minutes)",
+        label="Analytic sweep lookback window (minutes)",
         section="Triage automation",
         hot=True,
         help=(
-            "This setting is how far back each sweep looks. Keep it wider than the "
-            "interval. A window as short as the interval misses anything that "
-            "arrived during a restart or an ingest lag. The fire-once gate stops "
-            "the overlap from making repeat findings."
+            "How far back each analytic sweep reads, in minutes. Keep it wider than "
+            "the interval between sweeps. A window as short as the interval misses a "
+            "document that arrived during a restart or an ingest lag. A document the "
+            "sweep has already matched does not make a second observation, so the "
+            "overlap costs nothing."
         ),
         min_value=5,
         max_value=43200,
@@ -641,8 +647,9 @@ WHITELIST: tuple[SettingSpec, ...] = (
         section="Hunting",
         hot=True,
         help=(
-            "The catalog sweep writes a hunt row for each hit, as it did before "
-            "1.5.0. Off, it writes the observation only."
+            "When this setting is on, the analytic sweep writes a hunt row for each "
+            "hit, as it did before 1.5.0. When it is off, the analytic sweep writes "
+            "the observation and no hunt row."
         ),
     ),
     SettingSpec(
@@ -654,7 +661,7 @@ WHITELIST: tuple[SettingSpec, ...] = (
         hot=True,
         help=(
             "soc-ai compares each host with its own baseline every hour and "
-            "records what departs. In shadow the sweep writes observations and "
+            "records what departs. An analytic in shadow writes observations and "
             "raises nothing."
         ),
     ),
@@ -1400,6 +1407,22 @@ WHITELIST: tuple[SettingSpec, ...] = (
         max_value=100000,
     ),
     SettingSpec(
+        key="dossier_stale_address_days",
+        attr="dossier_stale_address_days",
+        type="int",
+        label="Remove an address unseen for (days)",
+        section="Host dossier",
+        hot=True,
+        help=(
+            "An address that no census has seen for this many days leaves the "
+            "Hosts list. The default is 30 days. An address with an operator "
+            "declaration stays. The machine keeps the address in its history. "
+            "A sweep that could not read the grid removes nothing."
+        ),
+        min_value=1,
+        max_value=3650,
+    ),
+    SettingSpec(
         key="dossier_min_events",
         attr="dossier_min_events",
         type="int",
@@ -1997,16 +2020,75 @@ def notify_webhook_spec() -> SettingSpec:
     return WHITELIST_BY_KEY["notify_webhook_url"]
 
 
-def _coerce_bool(raw: str) -> bool:
-    return raw.strip().lower() in ("on", "true", "1", "yes", "checked")
+class SettingValueError(ValueError):
+    """A rejected setting value, with the refusal reason the API answers with.
+
+    ``reason`` is ``invalid_value`` for a value of the wrong shape and
+    ``out_of_range`` for a number outside the spec's bounds. The message is the
+    hint an operator reads, so it names the accepted values.
+    """
+
+    def __init__(self, message: str, *, reason: str = "invalid_value") -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+# The strings a bool setting accepts. An HTML checkbox posts "on" when checked
+# and nothing when unchecked, so the empty string is False. Anything else used
+# to read as False too: "notabool" was stored as off with a 200.
+_BOOL_TRUE = ("on", "true", "1", "yes", "checked")
+_BOOL_FALSE = ("", "off", "false", "0", "no")
+
+# Free-string settings whose Settings validator takes a fixed set of values.
+# The spec stays type "str" so the console keeps its own control, but the save
+# refuses a value outside the set with the set in the hint.
+_STR_CHOICES: dict[str, tuple[str, ...]] = {
+    "auto_triage_min_severity": ("critical", "high", "medium", "low"),
+    "notify_format": ("json", "slack", "matrix"),
+}
+
+
+def accepted_values(spec: SettingSpec) -> tuple[str, ...] | None:
+    """The fixed values *spec* accepts, or None for an open value."""
+    if spec.options:
+        return spec.options
+    return _STR_CHOICES.get(spec.key)
+
+
+def _choices_message(key: str, choices: tuple[str, ...]) -> str:
+    return f"{key} accepts one of these values: {', '.join(choices)}."
+
+
+def _coerce_bool(key: str, raw: str) -> bool:
+    lowered = raw.strip().lower()
+    if lowered in _BOOL_TRUE:
+        return True
+    if lowered in _BOOL_FALSE:
+        return False
+    accepted = ", ".join(v for v in _BOOL_TRUE + _BOOL_FALSE if v)
+    raise SettingValueError(
+        f"{key} is an on or off setting. Send true or false. The accepted values are {accepted}."
+    )
+
+
+def _fmt_bound(spec: SettingSpec, value: float) -> str:
+    return str(int(value)) if spec.type == "int" else str(float(value))
 
 
 def _check_bounds(spec: SettingSpec, value: float) -> None:
-    """Raise ValueError if a numeric *value* falls outside the spec's bounds."""
-    if spec.min_value is not None and value < spec.min_value:
-        raise ValueError(f"{spec.key} must be >= {spec.min_value}")
-    if spec.max_value is not None and value > spec.max_value:
-        raise ValueError(f"{spec.key} must be <= {spec.max_value}")
+    """Raise SettingValueError if a numeric *value* falls outside the spec's bounds."""
+    low, high = spec.min_value, spec.max_value
+    if (low is not None and value < low) or (high is not None and value > high):
+        if low is not None and high is not None:
+            span = f"between {_fmt_bound(spec, low)} and {_fmt_bound(spec, high)}"
+        elif low is not None:
+            span = f"{_fmt_bound(spec, low)} or more"
+        else:
+            span = f"{_fmt_bound(spec, high or 0)} or less"
+        raise SettingValueError(
+            f"{spec.key} must be {span}. soc-ai did not save {value}.",
+            reason="out_of_range",
+        )
 
 
 # URL-valued settings. An admin may legitimately point these at an internal
@@ -2038,13 +2120,19 @@ def coerce(key: str, raw_str: str) -> Any:
     """
     spec = WHITELIST_BY_KEY[key]  # KeyError → caller rejects non-whitelisted key
     if spec.type == "bool":
-        return _coerce_bool(raw_str)
+        return _coerce_bool(key, raw_str)
     if spec.type == "float":
-        v = float(raw_str)  # ValueError on junk → caller rejects
+        try:
+            v = float(raw_str)
+        except ValueError as exc:
+            raise SettingValueError(f"{key} must be a number.") from exc
         _check_bounds(spec, v)
         return v
     if spec.type == "int":
-        v_int = int(raw_str)  # ValueError on junk/"1.5" → caller rejects
+        try:
+            v_int = int(raw_str)  # "1.5" is refused: the field takes whole numbers
+        except ValueError as exc:
+            raise SettingValueError(f"{key} must be a whole number.") from exc
         _check_bounds(spec, v_int)
         return v_int
     # URL-scheme guard for BOTH csv (es_hosts) and plain-str URL settings. Runs
@@ -2060,8 +2148,14 @@ def coerce(key: str, raw_str: str) -> Any:
     if spec.type == "select":
         v_sel = str(raw_str).strip()
         if not spec.options or v_sel not in spec.options:
-            raise ValueError(f"{spec.key} must be one of {list(spec.options or ())}")
+            raise SettingValueError(_choices_message(spec.key, spec.options or ()))
         return v_sel
+    choices = _STR_CHOICES.get(key)
+    if choices is not None:
+        v_choice = str(raw_str).strip().lower()
+        if v_choice not in choices:
+            raise SettingValueError(_choices_message(key, choices))
+        return v_choice
     return str(raw_str)
 
 
@@ -2099,7 +2193,7 @@ def _validate_typed(spec: SettingSpec, value: Any) -> Any:
     if not isinstance(value, str):
         raise ValueError(f"{spec.key} expects a string")
     if spec.type == "select" and (not spec.options or value not in spec.options):
-        raise ValueError(f"{spec.key} must be one of {list(spec.options or ())}")
+        raise SettingValueError(_choices_message(spec.key, spec.options or ()))
     if spec.key in _URL_SETTING_KEYS:
         _require_http_scheme(spec.key, value)
     return value

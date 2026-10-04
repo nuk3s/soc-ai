@@ -76,8 +76,52 @@ FLOW_CANDIDATES: tuple[str, ...] = (
     "endpoint.events.network",
 )
 DNS_CANDIDATES: tuple[str, ...] = ("zeek.dns", "network_traffic.dns")
-PROCESS_CANDIDATES: tuple[str, ...] = ("endpoint.events.process", "windows.sysmon_operational")
-LOGON_CANDIDATES: tuple[str, ...] = ("system.security",)
+# The Linux audit planes count only where the grid ships them: the probe reads
+# field presence, so a grid with no auditd adds nothing here.
+PROCESS_CANDIDATES: tuple[str, ...] = (
+    "endpoint.events.process",
+    "windows.sysmon_operational",
+    "auditd_manager.auditd",
+    "auditd.log",
+)
+# ``system.auth`` is how a Linux agent ships its logons. Read alone,
+# ``system.security`` left every Linux host blind on the logon dimension while
+# the grid held thousands of its accepted logons a day.
+LOGON_CANDIDATES: tuple[str, ...] = ("system.security", "system.auth")
+
+# The documents of a plane that a dimension may read, when that is fewer than
+# every document of the plane. ``system.auth`` carries failed logons, sudo and
+# cron lines beside the accepted logons. A failed logon is not a known user: a
+# baseline that held one would hold a brute-force username list, and the next
+# real logon by one of those names would never read as novel. The Filebeat and
+# Elastic Agent system pipelines mark an accepted logon with
+# ``event.outcome: success`` and the sshd line with
+# ``system.auth.ssh.event: Accepted``.
+_PLANE_SCOPE: dict[str, dict[str, Any]] = {
+    # An audit record is a process start only when it is an execve. The other
+    # records (logins, file access, configuration changes) carry process.name
+    # too and would fill the process baseline with the auditor's own noise.
+    "auditd_manager.auditd": {"term": {"event.action": "executed"}},
+    "auditd.log": {"term": {"event.action": "executed"}},
+    "system.auth": {
+        "bool": {
+            "should": [
+                {"term": {"event.outcome": "success"}},
+                {"term": {"system.auth.ssh.event": "Accepted"}},
+            ],
+            "minimum_should_match": 1,
+        }
+    },
+}
+
+# Member fields a dimension reads BESIDE its own, per dimension. The baseline
+# and the recent read both read every one, so the two sides agree. Security
+# Onion 3.x ``zeek.dns`` writes ``dns.query.name``; packet capture writes the
+# ECS ``dns.question.name``. Probing the ECS name alone left every host blind
+# on a Security Onion grid.
+_MEMBER_ALTERNATES: dict[str, tuple[str, ...]] = {"dns_names": ("dns.query.name",)}
+# The aggregation key of each alternate member field, beside ``members``.
+_ALT_MEMBERS = "members_alt_"
 
 # EPHEMERAL_PORT_FLOOR lives in so_client.fields so the dossier's own port
 # inference can apply the same floor without importing this lane.
@@ -140,13 +184,83 @@ def _dataset_clause(dataset: str) -> dict[str, Any]:
     ``data_stream.dataset`` is not optional here: on the measured grid the
     entire network-metadata plane — 4,040,237 documents — carries no
     ``event.dataset`` at all.
+
+    A plane in :data:`_PLANE_SCOPE` is narrowed to the documents a dimension
+    may read. The probe, the baseline and the recent read all select a plane
+    through here, so the three agree on what the plane holds.
     """
-    return {
+    clause: dict[str, Any] = {
         "bool": {
             "should": [{"term": {f: dataset}} for f in DATASET_NAME_FIELDS],
             "minimum_should_match": 1,
         }
     }
+    scope = _PLANE_SCOPE.get(dataset)
+    if scope is None:
+        return clause
+    return {"bool": {"filter": [clause, scope]}}
+
+
+def member_alternates(dimension: str) -> tuple[str, ...]:
+    """The member fields ``dimension`` reads beside its own. Usually none."""
+    return _MEMBER_ALTERNATES.get(dimension, ())
+
+
+def member_exists_clause(dimension: str, member_field: str) -> dict[str, Any]:
+    """A document carries the member field, or any alternate of it."""
+    fields = (member_field, *member_alternates(dimension))
+    if len(fields) == 1:
+        return {"exists": {"field": member_field}}
+    return {
+        "bool": {
+            "should": [{"exists": {"field": f}} for f in fields],
+            "minimum_should_match": 1,
+        }
+    }
+
+
+def member_buckets(bucket: dict[str, Any]) -> list[dict[str, Any]]:
+    """One entity's member buckets, the alternate fields merged in by key.
+
+    A name that two fields carry is one member. Its count is the sum, its
+    first and last sightings the outer pair, its peer count the larger, and
+    its sample the union of both samples.
+    """
+    merged: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for key, node in bucket.items():
+        if key != "members" and not key.startswith(_ALT_MEMBERS):
+            continue
+        for member in (node or {}).get("buckets") or []:
+            name = member.get("key")
+            if name is None:
+                continue
+            ident = str(name)
+            held = merged.get(ident)
+            if held is None:
+                merged[ident] = dict(member)
+                order.append(ident)
+                continue
+            merged[ident] = _merge_member(held, member)
+    return [merged[k] for k in order]
+
+
+def _merge_member(held: dict[str, Any], other: dict[str, Any]) -> dict[str, Any]:
+    out = dict(held)
+    out["doc_count"] = int(held.get("doc_count") or 0) + int(other.get("doc_count") or 0)
+    for key, pick in (("first", min), ("last", max)):
+        stamps = [s for s in (_stamp(held, key), _stamp(other, key)) if s]
+        if stamps:
+            out[key] = {"value_as_string": pick(stamps)}
+    if "peers" in held or "peers" in other:
+        out["peers"] = {"value": max(_member_peers(held), _member_peers(other))}
+    hits = [
+        *(((held.get("samples") or {}).get("hits") or {}).get("hits") or []),
+        *(((other.get("samples") or {}).get("hits") or {}).get("hits") or []),
+    ]
+    if hits:
+        out["samples"] = {"hits": {"hits": hits}}
+    return out
 
 
 def _scope_must_not() -> list[dict[str, Any]]:
@@ -204,6 +318,7 @@ async def resolve_plane(
     minutes: int,
     time_anchor: datetime | None = None,
     lag_minutes: int = 0,
+    also: tuple[str, ...] = (),
 ) -> tuple[str, ...] | None:
     """Which candidate datasets hold documents that actually carry ``field``.
 
@@ -221,15 +336,20 @@ async def resolve_plane(
     rendered as "no plane carries destination.ip", which an operator reads as a
     fact about their estate rather than as a broken query. A dead grid must
     never be reportable as a quiet network.
+
+    ``also`` names more fields to probe in the same request. A plane that
+    carries any of them can answer.
     """
     if not candidates:
         return ()
 
+    probed = (field, *also)
     filters = {
-        f"{dataset}|{field}": {
-            "bool": {"filter": [_dataset_clause(dataset), {"exists": {"field": field}}]}
+        f"{dataset}|{name}": {
+            "bool": {"filter": [_dataset_clause(dataset), {"exists": {"field": name}}]}
         }
         for dataset in candidates
+        for name in probed
     }
     query = {
         "bool": {
@@ -251,8 +371,10 @@ async def resolve_plane(
     buckets = ((result.aggregations or {}).get("plane_probe") or {}).get("buckets") or {}
     usable: list[str] = []
     for dataset in candidates:
-        bucket = buckets.get(f"{dataset}|{field}") or {}
-        if int(bucket.get("doc_count") or 0) > 0:
+        if any(
+            int((buckets.get(f"{dataset}|{name}") or {}).get("doc_count") or 0) > 0
+            for name in probed
+        ):
             usable.append(dataset)
     return tuple(usable)
 
@@ -276,6 +398,10 @@ def _member_aggs(peer_field: str | None = None) -> dict[str, Any]:
     }
     if peer_field:
         aggs["peers"] = {"cardinality": {"field": peer_field}}
+        # The guarded dimensions are the port ones. The member key stays the
+        # bare port, so a stored baseline keeps matching. The transport rides
+        # beside it, so a reader can say udp/53 where it said tcp/53.
+        aggs["transport"] = {"terms": {"field": "network.transport", "size": 4}}
     return aggs
 
 
@@ -321,7 +447,11 @@ def _stamp_date(bucket: dict[str, Any], key: str) -> date | None:
 
 
 def _nested_terms(
-    *, entity_field: str, member_field: str, peer_field: str | None = None
+    *,
+    entity_field: str,
+    member_field: str,
+    peer_field: str | None = None,
+    also: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """One entity terms agg, each with its members and its own day count.
 
@@ -342,23 +472,29 @@ def _nested_terms(
     reads. The day count it also reads is derived from ``first`` and
     ``last``, which every member carries, so the guard adds one cardinality
     per member and no buckets.
+
+    ``also`` adds one member aggregation per alternate field, under
+    ``members_alt_<n>``. :func:`member_buckets` merges them.
     """
-    return {
-        "terms": {"field": entity_field, "size": _MAX_ENTITIES},
-        "aggs": {
-            "active_days": {
-                "date_histogram": {
-                    "field": "@timestamp",
-                    "calendar_interval": "day",
-                    "min_doc_count": 1,
-                }
-            },
-            "members": {
-                "terms": {"field": member_field, "size": _MAX_MEMBERS},
-                "aggs": _member_aggs(peer_field),
-            },
+    aggs: dict[str, Any] = {
+        "active_days": {
+            "date_histogram": {
+                "field": "@timestamp",
+                "calendar_interval": "day",
+                "min_doc_count": 1,
+            }
+        },
+        "members": {
+            "terms": {"field": member_field, "size": _MAX_MEMBERS},
+            "aggs": _member_aggs(peer_field),
         },
     }
+    for n, alternate in enumerate(also):
+        aggs[f"{_ALT_MEMBERS}{n}"] = {
+            "terms": {"field": alternate, "size": _MAX_MEMBERS},
+            "aggs": _member_aggs(peer_field),
+        }
+    return {"terms": {"field": entity_field, "size": _MAX_ENTITIES}, "aggs": aggs}
 
 
 def _port_bound(member_field: str) -> list[dict[str, Any]]:
@@ -371,7 +507,30 @@ def _port_bound(member_field: str) -> list[dict[str, Any]]:
     """
     if not member_field.endswith(".port"):
         return []
-    return [{"range": {member_field: {"lt": EPHEMERAL_PORT_FLOOR}}}]
+    return [
+        # Port 0 is no port. It is what a portless transport writes.
+        {"range": {member_field: {"gte": 1, "lt": EPHEMERAL_PORT_FLOOR}}},
+        # ICMP has no ports. Zeek writes the ICMP type and code into the port
+        # fields, so ICMP type 3 entered the served-port baseline as port 3.
+        # A must_not on a field the grid does not map drops nothing.
+        {"bool": {"must_not": [{"terms": {"network.transport": list(_PORTLESS_TRANSPORTS)}}]}},
+    ]
+
+
+# The transports with no port numbers.
+_PORTLESS_TRANSPORTS: tuple[str, ...] = ("icmp", "icmp6", "ipv6-icmp")
+# The transports a port member can carry.
+_PORT_TRANSPORTS: tuple[str, ...] = ("tcp", "udp")
+
+
+def member_transport(member: dict[str, Any]) -> str | None:
+    """The busiest of tcp and udp under one port member. None when unrecorded."""
+    buckets = ((member.get("transport") or {}).get("buckets")) or []
+    for bucket in sorted(buckets, key=lambda b: -int(b.get("doc_count") or 0)):
+        key = str(bucket.get("key") or "").lower()
+        if key in _PORT_TRANSPORTS:
+            return key
+    return None
 
 
 # Dimensions whose members are addresses, and so subject to the peer test.
@@ -520,7 +679,7 @@ def _profiles_from_buckets(
             continue
         if not _ours(key, entity_kind=entity_kind, cidrs=cidrs):
             continue
-        members = ((bucket.get("members") or {}).get("buckets")) or []
+        members = member_buckets(bucket)
         vector: dict[str, Any] = {}
         support = _entity_support_days(bucket, window_days=window_days)
         first: str | None = None
@@ -554,6 +713,9 @@ def _profiles_from_buckets(
                     continue
                 entry["peers"] = peers
                 entry["days"] = days
+                transport = member_transport(member)
+                if transport is not None:
+                    entry["transport"] = transport
             vector[name] = entry
             if m_first and (first is None or m_first < first):
                 first = m_first
@@ -937,8 +1099,10 @@ async def collect_entity_profiles(  # noqa: PLR0915 - one function reads as one 
 
     for dimension, candidates, probe_field, entity_field, member_field in _CATEGORICAL:
         cache = resolved.setdefault(candidates, {})
-        if probe_field not in cache:
-            cache[probe_field] = await resolve_plane(
+        alternates = member_alternates(dimension)
+        probe_key = "|".join((probe_field, *alternates))
+        if probe_key not in cache:
+            cache[probe_key] = await resolve_plane(
                 elastic,
                 settings,
                 candidates=candidates,
@@ -946,8 +1110,9 @@ async def collect_entity_profiles(  # noqa: PLR0915 - one function reads as one 
                 minutes=minutes,
                 time_anchor=time_anchor,
                 lag_minutes=lag_minutes,
+                also=alternates,
             )
-        usable = cache[probe_field]
+        usable = cache[probe_key]
 
         label = _PLANE_LABEL.get(candidates, dimension)
         usable_planes = usable or ()
@@ -984,7 +1149,7 @@ async def collect_entity_profiles(  # noqa: PLR0915 - one function reads as one 
                         }
                     },
                     {"exists": {"field": entity_field}},
-                    {"exists": {"field": member_field}},
+                    member_exists_clause(dimension, member_field),
                     *_port_bound(member_field),
                     *direction["filter"],
                 ],
@@ -1000,6 +1165,7 @@ async def collect_entity_profiles(  # noqa: PLR0915 - one function reads as one 
                 entity_field=entity_field,
                 member_field=member_field,
                 peer_field=_peer_field(dimension),
+                also=alternates,
             )
         }
         try:

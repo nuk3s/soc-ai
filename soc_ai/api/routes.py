@@ -104,7 +104,7 @@ async def _refuse_metrics_in_demo(request: Request) -> None:
     if is_demo(request.app.state.settings):
         raise HTTPException(
             status_code=403,
-            detail={"reason": "demo_mode", "hint": "Demo — operational metrics are disabled."},
+            detail={"reason": "demo_mode", "hint": "The demo turns off the operational metrics."},
         )
 
 
@@ -171,8 +171,8 @@ async def investigate_endpoint(
                         "reason": "investigation_in_progress",
                         "running_inv_id": existing.id,
                         "hint": (
-                            "an investigation is already running for this alert — "
-                            "open it or wait for it to finish before starting another"
+                            "An investigation is already running for this alert. "
+                            "Open it, or wait for it to finish before you start another."
                         ),
                     },
                 )
@@ -215,11 +215,30 @@ async def investigate_endpoint(
     # let the recorder backfill from the stream. Bounded because "best-effort" and
     # "unbounded" together mean a silent grid delays the stream by the ES client's
     # whole retry budget for a name we are willing to do without.
+    #
+    # The same lookup also says whether the alert exists. An id the grid does
+    # not hold gets a 404 BEFORE the recorder creates a row: the old order
+    # stored an error investigation for every mistyped id (dogfood 2026-10-01
+    # RA6). A lookup that FAILS proves nothing about the id, so the run goes
+    # ahead as before and the prefetch reports the grid fault.
     try:
         async with asyncio.timeout(ctx.settings.webui_grid_timeout_s):
-            _, seed_rule_name = await resolve_alert_for_hunt(elastic, ctx.settings, req.alert_id)
+            exists, seed_rule_name = await resolve_alert_for_hunt(
+                elastic, ctx.settings, req.alert_id
+            )
     except Exception:
-        seed_rule_name = None
+        exists, seed_rule_name = True, None
+    if not exists:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "reason": "alert_not_found",
+                "hint": (
+                    "The grid holds no alert with this id. It may have aged out. "
+                    "Copy the id from the alerts list and try again."
+                ),
+            },
+        )
 
     async def stream() -> Any:
         # `investigate` stays a routes-module binding so tests can patch it.
@@ -312,7 +331,13 @@ async def find_alert_endpoint(
     if not must:
         raise HTTPException(
             status_code=400,
-            detail="must provide at least one of: rule_uuid, source_ip, destination_ip, rule_name",
+            detail={
+                "reason": "no_filter",
+                "hint": (
+                    "Send at least one filter field. Use rule_uuid, source_ip, "
+                    "destination_ip or rule_name."
+                ),
+            },
         )
 
     # Two-stage matching: try a tight ~2s window around the row's timestamp

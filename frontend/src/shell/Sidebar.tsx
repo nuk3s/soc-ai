@@ -21,6 +21,7 @@ import { getAbout, getMe, getNeedsYou, onNeedsYouChanged } from '../lib/api';
 import type { AboutInfo, Me } from '../lib/types';
 import { ScopeMark, Wordmark } from '../components/Logo';
 import { AccountMenu } from './AccountMenu';
+import { useSession } from './Session';
 import { useShell } from './ShellContext';
 
 interface NavItem {
@@ -95,6 +96,8 @@ function readStoredOperateCollapsed(): boolean {
 export function Sidebar() {
   const { collapsed, toggleNav } = useShell();
   const location = useLocation();
+  // Hold every read until /me answers (see Session.tsx, D14).
+  const ready = useSession().status === 'ready';
 
   const [me, setMe] = useState<Me>({ username: 'analyst', role: 'analyst', status: '' });
   const [about, setAbout] = useState<AboutInfo | null>(null);
@@ -113,11 +116,13 @@ export function Sidebar() {
   const [needsYouFailed, setNeedsYouFailed] = useState(false);
 
   useEffect(() => {
+    if (!ready) return;
     getMe().then(setMe).catch(() => {/* keep placeholder */});
     getAbout().then(setAbout).catch(() => {/* version line just stays hidden */});
-  }, []);
+  }, [ready]);
 
   useEffect(() => {
+    if (!ready) return;
     const read = () =>
       getNeedsYou()
         .then((r) => {
@@ -135,7 +140,7 @@ export function Sidebar() {
       window.clearInterval(timer);
       stop();
     };
-  }, []);
+  }, [ready]);
 
   // Force-expand: while the active route lives inside the Operate group, it
   // always renders expanded, regardless of the stored preference — the

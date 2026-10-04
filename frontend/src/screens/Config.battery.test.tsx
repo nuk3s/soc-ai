@@ -138,14 +138,14 @@ describe('the empty-result marker is a quiet state, not a crash', () => {
 
     // The buttons anchor the panel and appear at mount; wait for the poll to land
     // its empty result and re-render — that re-render is where the crash lived.
-    await screen.findByText('Run the full check');
+    await screen.findByText('Run the model battery');
     await waitFor(() => expect(vi.mocked(getModelBattery)).toHaveBeenCalled());
 
     // Did NOT fall into the boundary…
     expect(screen.queryByText('Something went wrong loading this page')).toBeNull();
     // …renders the same quiet state as "no result at all": buttons, no table.
-    expect(screen.getByText('Run the full check')).toBeTruthy();
-    expect(screen.getByText('Run all checks')).toBeTruthy();
+    expect(screen.getByText('Run the model battery')).toBeTruthy();
+    expect(screen.getByText('Check fitness and run the battery')).toBeTruthy();
     expect(screen.queryByRole('table')).toBeNull();
   });
 });
@@ -204,11 +204,11 @@ describe('a populated battery result still renders the per-config table', () => 
 // "Run the full check". The start handler then forced running:true itself,
 // which pinned "Full check: … 1 of 4…" with both buttons disabled until a hard
 // reload, whether the server finished, refused the start (5xx), or never ran.
-describe('Run the full check keeps polling until the server reports the result', () => {
+describe('Run the model battery keeps polling until the server reports the result', () => {
   /** Mount, wait for the idle poll to land, and hand back the Run button. */
   async function mountIdle(): Promise<HTMLButtonElement> {
     renderConfig();
-    const run = (await screen.findByText('Run the full check')) as HTMLButtonElement;
+    const run = (await screen.findByText('Run the model battery')) as HTMLButtonElement;
     await waitFor(() => expect(vi.mocked(getModelBattery)).toHaveBeenCalledTimes(1));
     return run;
   }
@@ -233,7 +233,7 @@ describe('Run the full check keeps polling until the server reports the result',
       expect(vi.mocked(getModelBattery).mock.calls.length).toBeGreaterThanOrEqual(3);
       expect(screen.getByRole('table')).toBeTruthy();
       expect(screen.getByText('native')).toBeTruthy();
-      expect(screen.queryByText(/Full check:/)).toBeNull();
+      expect(screen.queryByText(/Model battery:/)).toBeNull();
       expect(run.disabled).toBe(false);
     } finally {
       vi.useRealTimers();
@@ -250,10 +250,10 @@ describe('Run the full check keeps polling until the server reports the result',
     fireEvent.click(run);
 
     // The refusal is shown, not swallowed…
-    const err = await screen.findByText(/The full check could not start/);
+    const err = await screen.findByText(/The model battery could not start/);
     expect(err.textContent).toContain('The model gateway is unreachable.');
     // …and the panel reflects the server's state (idle), not a run that never began.
-    expect(screen.queryByText(/Full check:/)).toBeNull();
+    expect(screen.queryByText(/Model battery:/)).toBeNull();
     expect(run.disabled).toBe(false);
   });
 
@@ -266,7 +266,7 @@ describe('Run the full check keeps polling until the server reports the result',
     const run = await mountIdle();
     fireEvent.click(run);
 
-    expect(await screen.findByText(/Full check:/)).toBeTruthy();
+    expect(await screen.findByText(/Model battery:/)).toBeTruthy();
     expect(screen.queryByText(/could not start/)).toBeNull();
     expect(run.disabled).toBe(true);
   });

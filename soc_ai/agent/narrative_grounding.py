@@ -19,19 +19,31 @@ against the corpus; no model is consulted.
 
 from __future__ import annotations
 
+import fnmatch
+import itertools
+import json
 import re
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from typing import Any
 
-# Appended once, after `redact_ungrounded` below has mechanically stripped
-# whatever stayed ungrounded through the regrounding loop. Ground-or-strip
-# (2026-08-20, the owner's ruling): a 2026-08-05 chat turn shipped a caveat
-# banner naming its suspect claims inline, and a 2026-08-20 dogfood turn
-# shipped one listing ordinary prose fragments ("closest-preceding",
-# "package-update") as "unverified hostnames" — a "verify before acting"
-# banner is not an acceptable substitute for actually grounding or removing
-# the specific. This line says something was removed, once, with no ⚠ and no
-# token list — the tokens themselves are gone from the text, not flagged.
-UNVERIFIED_QUIET_LINE = "\n\n_Some unverifiable specifics were removed from this reply._"
+from soc_ai.dossier.coverage import HostCoverage
+from soc_ai.dossier.coverage import describe as describe_coverage
+
+# Ground-or-strip (2026-08-20, the owner's ruling; 2026-08-21: never bannered).
+# A 2026-08-05 chat turn shipped a caveat banner naming its suspect claims
+# inline, and a 2026-08-20 dogfood turn shipped one listing ordinary prose
+# fragments ("closest-preceding", "package-update") as "unverified hostnames".
+# The quiet line that replaced the banner ("Some unverifiable specifics were
+# removed from this reply.") and the "(unverified)" placeholder were still the
+# grounder talking to the analyst: a 2026-10-02 host chat reply carried both.
+# `redact_ungrounded` now takes each claim out with its clause and says
+# nothing. When nothing is left, the reply is this line, because an empty
+# reply reads as an answer.
+NOTHING_GROUNDED_REPLY = (
+    "No statement in this answer had support in a tool result of this turn. "
+    "Ask again, and name the host, the address or the dataset to check."
+)
 
 
 # Cap on artifacts named in a correction prompt — enough to be actionable
@@ -73,29 +85,137 @@ def regrounding_instruction(ungrounded: list[str]) -> str:
         "tool result; or\n"
         "  2. Remove the claim entirely.\n"
         "Do NOT soften, hedge or re-word an unsupported claim to make it sound "
-        "tentative — an unverified assertion is still unverified. Do NOT describe "
+        "tentative. An unverified assertion is still unverified. Do NOT describe "
         "a tool result you did not receive. If a claim cannot be verified, say "
-        "plainly that it is unknown and what you would need to check."
+        "plainly that it is unknown and what you would need to check.\n"
+        "Write the whole answer again for the analyst. Do not mention this correction, "
+        "a removal or grounding in the answer."
     )
 
 
 def redact_ungrounded(answer: str, ungrounded: list[str]) -> str:
-    """Ground-or-strip's terminal half: replace each ungrounded artifact string
-    with ``(unverified)``.
+    """Ground-or-strip's terminal half: take each ungrounded artifact out with its clause.
 
-    Whole-token, case-insensitive, every occurrence — an artifact that survives
-    the regrounding loop is never shipped dressed as fact under a "verify
-    before acting" caveat (the old :func:`scoped_unverified_caveat` /
-    ``UNVERIFIED_CAVEAT`` banners this replaces); it is mechanically removed
-    from the visible answer instead, and :data:`UNVERIFIED_QUIET_LINE` says so
-    once, without naming it again. Longest-first so a shorter artifact that is
-    a substring of a longer one (e.g. an IP that is also a JA3-adjacent
-    prefix) cannot partially clobber the longer replacement first.
+    The clause of a list item is the item: "no `a`, `b` or `c` data" loses `b`
+    and keeps the rest of the sentence. Anywhere else the clause is the
+    sentence, and a line that loses every sentence goes whole, its bullet
+    included. No placeholder takes the place of a claim, and no line says that
+    one went: a 2026-10-02 host chat reply carried "(unverified)" twice in one
+    sentence and closed with "Some unverifiable specifics were removed". The
+    match ignores case, takes every occurrence, and never starts or ends inside
+    a longer token, so `192.0.2.6` cannot take out a sentence about
+    `192.0.2.61`. Longest-first, as before, so a shorter artifact that is a
+    prefix of a longer one cannot cut the longer one apart.
     """
-    redacted = answer
-    for artifact in sorted({a for a in ungrounded if a}, key=len, reverse=True):
-        redacted = re.compile(re.escape(artifact), re.IGNORECASE).sub("(unverified)", redacted)
-    return redacted
+    artifacts = sorted({a for a in ungrounded if a}, key=len, reverse=True)
+    if not artifacts:
+        return answer
+    folded = {a.casefold() for a in artifacts}
+    text = _ENUMERATION.sub(lambda m: _without_items(m.group(0), folded), answer)
+    patterns = [_token_pattern(a) for a in artifacts]
+    return strip_sentences(text, lambda sentence: any(p.search(sentence) for p in patterns))
+
+
+def _token_pattern(artifact: str) -> re.Pattern[str]:
+    """``artifact`` as a whole token: not inside a longer name or address."""
+    return re.compile(rf"(?<![\w.-]){re.escape(artifact)}(?![\w-]|\.\w)", re.IGNORECASE)
+
+
+# An item of an inline list: a code span, or a bare dotted or colon-joined
+# token (a name, an address, an address with a port).
+_ITEM = r"(?:`[^`\n]+`|(?<![\w`.:-])[A-Za-z0-9_-]+(?:[.:][A-Za-z0-9_-]+)+(?![\w`]|[.:]\w))"
+_ITEM_RE = re.compile(_ITEM)
+_JOIN = r"(?:[ \t]*,[ \t]*(?:(?:and|or)[ \t]+)?|[ \t]+(?:and|or)[ \t]+)"
+_ENUMERATION = re.compile(rf"{_ITEM}(?:{_JOIN}{_ITEM})+", re.IGNORECASE)
+
+
+def _without_items(run: str, folded: set[str]) -> str:
+    """An inline list without the items in ``folded``, its conjunction kept.
+
+    A list that would lose every item comes back unchanged: the sentence pass
+    then takes the whole sentence out.
+    """
+    spans = list(_ITEM_RE.finditer(run))
+    items = [m.group(0) for m in spans]
+    joins = [run[a.end() : b.start()] for a, b in itertools.pairwise(spans)]
+    keep = [item for item in items if item.strip("`").casefold() not in folded]
+    if len(keep) == len(items) or not keep:
+        return run
+    words = [w for j in joins for w in re.findall(r"\b(?:and|or)\b", j, re.IGNORECASE)]
+    conjunction = words[-1] if words else ""
+    oxford = bool(joins) and bool(re.match(r"\s*,\s*(?:and|or)\s", joins[-1], re.IGNORECASE))
+    if len(keep) == 1:
+        return keep[0]
+    if not conjunction:
+        return ", ".join(keep)
+    if len(keep) == 2:
+        return f"{keep[0]} {conjunction} {keep[1]}"
+    return f"{', '.join(keep[:-1])}{',' if oxford else ''} {conjunction} {keep[-1]}"
+
+
+# A sentence ends at . ! or ? and any closing bold, code or quote marks, before
+# whitespace or the end of the line. A dotted name has no space after its dots.
+_SENTENCE_END = re.compile(r"[.!?]+(?:\*\*|__|[*_`\"')\]])*(?=\s|$)")
+# A list bullet, a list number, a heading mark or a quote mark before the text.
+_LINE_LEAD = re.compile(r"^\s*(?:[-*+•]\s+|\d+[.)]\s+|#{1,6}\s+|>\s+)?")
+
+
+def _split_sentences(body: str) -> list[str]:
+    out: list[str] = []
+    start = 0
+    for m in _SENTENCE_END.finditer(body):
+        out.append(body[start : m.end()].strip())
+        start = m.end()
+    out.append(body[start:].strip())
+    return [s for s in out if s]
+
+
+def strip_sentences(text: str, drop: Callable[[str], bool]) -> str:
+    """``text`` without each sentence that ``drop`` names.
+
+    Works line by line, so a list keeps its shape. A line that loses every
+    sentence goes whole, its bullet included. Paragraph breaks stay, and no run
+    of blank lines is left behind. Text with nothing to drop comes back as it
+    was, byte for byte.
+    """
+    lines: list[str] = []
+    changed = False
+    for line in text.split("\n"):
+        if not line.strip():
+            lines.append("")
+            continue
+        lead = _LINE_LEAD.match(line)
+        prefix = lead.group(0) if lead else ""
+        sentences = _split_sentences(line[len(prefix) :])
+        kept = [s for s in sentences if not drop(s)]
+        if len(kept) == len(sentences):
+            lines.append(line)
+            continue
+        changed = True
+        if kept:
+            lines.append(prefix + " ".join(kept))
+    if not changed:
+        return text
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
+# What a model writes about the correction retry in place of the answer. The
+# retry prompt asks for none of it; this takes out what comes anyway.
+_CORRECTION_TALK = re.compile(
+    r"\b(?:the correction is now|properly grounded|as corrected"
+    r"|corrected (?:answer|reply|version))\b",
+    re.IGNORECASE,
+)
+
+
+def strip_correction_talk(answer: str) -> str:
+    """``answer`` without the sentences that talk about the correction retry.
+
+    Production 2026-10-02: "The correction is now properly grounded: this host
+    ships no endpoint process events." The analyst never saw a correction, so
+    a sentence about one is the grounder's vocabulary leaking into the reply.
+    """
+    return strip_sentences(answer, lambda sentence: bool(_CORRECTION_TALK.search(sentence)))
 
 
 # ── Artifact detectors ──────────────────────────────────────────────────────
@@ -293,6 +413,83 @@ def extract_artifacts(answer: str) -> NarrativeArtifacts:
     return NarrativeArtifacts(hostnames=hostnames, domains=domains, ips=ips, ja3=ja3, smb=smb)
 
 
+# ── Names a tool call used ──────────────────────────────────────────────────
+# A dotted name. A "*" may stand for a label or the end of one.
+_DOTTED_NAME = r"[A-Za-z0-9_*][\w*-]*(?:\.[\w*-]+)+"
+# A field on the left of a comparison: "dhcp.hostname:", "winlog.event_id ==".
+_QUERY_FIELD = re.compile(rf"(?<![\w.*-])({_DOTTED_NAME})\s*(?:==|!=|>=|<=|=|:|>|<)")
+# The value of a dataset field: one name, or a list in brackets.
+_QUERY_DATASET = re.compile(
+    r"\b(?:event\.dataset|event\.module|data_stream\.dataset)\s*(?:==|!=|=|:|\s+in\s+)\s*"
+    r"(?:\(([^)]*)\)|\[([^\]]*)\]|[\"']?([\w.*-]+)[\"']?)",
+    re.IGNORECASE,
+)
+# The fields a pipe stage names: "| groupby event.dataset, host.name".
+_QUERY_STAGE = re.compile(
+    r"\|\s*(?:groupby|sortby|table|fields|count\s+by|by)\s+([^|]+)", re.IGNORECASE
+)
+# Named arguments that hold a dataset or a field.
+_NAME_ARGUMENTS = frozenset({"dataset", "datasets", "field", "fields"})
+
+
+def _tool_args(call: dict[str, object]) -> dict[str, Any]:
+    raw = call.get("args")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _query_names(query: str) -> set[str]:
+    found = {m.group(1) for m in _QUERY_FIELD.finditer(query)}
+    for m in _QUERY_DATASET.finditer(query):
+        listed = next((g for g in m.groups() if g), "")
+        found.update(re.findall(_DOTTED_NAME, listed))
+    for m in _QUERY_STAGE.finditer(query):
+        found.update(re.findall(_DOTTED_NAME, m.group(1)))
+    return {name.lower() for name in found}
+
+
+def argument_names(tool_calls: Iterable[dict[str, object]]) -> set[str]:
+    """The dataset and field names this turn's tool calls used, lower case.
+
+    Read from an OQL query (the value of a dataset field, a field on the left
+    of a comparison, the fields of a pipe stage) and from a named ``dataset``
+    or ``field`` argument. A value the call searched for is not read: a query
+    for a made-up domain does not make the domain observed. A name may hold a
+    "*", and :func:`_names_used` matches it only when a literal label comes
+    first.
+    """
+    names: set[str] = set()
+    for call in tool_calls:
+        for key, value in _tool_args(call).items():
+            if key in _NAME_ARGUMENTS:
+                values = value if isinstance(value, list) else [value]
+                names.update(v.strip().lower() for v in values if isinstance(v, str))
+            elif key == "query" and isinstance(value, str):
+                names.update(_query_names(value))
+    return {name for name in names if "." in name}
+
+
+def _names_used(artifact: str, used: set[str]) -> bool:
+    """True when ``artifact`` is a name in ``used``, its namespace, or a "*" name covers it.
+
+    A namespace is a leading run of whole labels: "endpoint.events" is the
+    namespace of "endpoint.events.*" and of "endpoint.events.network". A
+    pattern needs a literal first label: "endpoint.events.*" covers
+    "endpoint.events.network", and "*.internal" covers nothing.
+    """
+    low = artifact.lower()
+    if low in used or any(name.startswith(low + ".") for name in used):
+        return True
+    return any(
+        "*" in name and "*" not in name.split(".", 1)[0] and fnmatch.fnmatchcase(low, name)
+        for name in used
+    )
+
+
 def _corpus(seed_context: str, tool_evidence: list[dict[str, object]]) -> str:
     """Lower-cased evidence corpus: seed context + every tool result this turn."""
     parts = [seed_context or ""]
@@ -307,6 +504,7 @@ def check_narrative_grounding(
     *,
     seed_context: str,
     tool_evidence: list[dict[str, object]],
+    tool_calls: Iterable[dict[str, object]] = (),
 ) -> NarrativeGrounding:
     """Grade the answer's concrete artifacts against the turn's evidence corpus.
 
@@ -317,6 +515,11 @@ def check_narrative_grounding(
     in the corpus. The narrative is flagged ONLY when it asserts concrete identifier
     artifacts and not one of them is grounded — so the alert's own host/IP/domain, which
     lives in the seed context, is always grounded and never trips a false positive.
+
+    ``tool_calls`` is the ``[{"tool", "args"}]`` list of this turn's calls. A
+    dotted name that a call used as a dataset or a field is grounded too, a
+    zero-hit query included: the query that found nothing grounds the claim
+    that the dataset holds nothing (see :func:`argument_names`).
     """
     artifacts = extract_artifacts(answer)
     identifiers = artifacts.identifier_assertions()
@@ -336,7 +539,13 @@ def check_narrative_grounding(
     # exactly that mixed shape: anchor on the alert's own (grounded) host/IP, then
     # embellish with a fabricated hostname / internal DNS / SMB story (the
     # DESKTOP-JSM4N2P / ad.local case). "One ground → accept" would wave it through.
-    ungrounded = [a for a in identifiers if a.lower() not in corpus]
+    used = argument_names(tool_calls)
+    domains = {d.lower() for d in artifacts.domains}
+    ungrounded = [
+        a
+        for a in identifiers
+        if a.lower() not in corpus and not (a.lower() in domains and _names_used(a, used))
+    ]
     # SMB / file-share activity asserted with no SMB evidence anywhere in the corpus.
     smb_unsupported = artifacts.smb and not any(
         tok in corpus for tok in ("smb", "file share", "file-share", "fileshare")
@@ -366,3 +575,196 @@ def check_narrative_grounding(
     return NarrativeGrounding(
         grounded=False, asserted=identifiers, ungrounded=ungrounded, reason=reason
     )
+
+
+# ── Host telemetry claims ───────────────────────────────────────────────────
+# Production held twelve sentences like "No host-level telemetry exists" and
+# "no host-level endpoint telemetry exists for <host>" about one Linux server
+# that shipped system logs, auth logs and osquery. Every probe behind them
+# asked Elastic Defend, which the host never ran. A sentence of this class is
+# a claim about EVERY plane of a host. It is false while any plane is present.
+#
+# The patterns match the generic claim only. A plane-level sentence ("no
+# endpoint process telemetry", "no host-level process visibility") names the
+# plane it is about, and it is true on such a host, so it never matches: a
+# plane word between the qualifier and the noun breaks every pattern below.
+_HOST_GAP_CLAIMS: tuple[re.Pattern[str], ...] = (
+    # "no host-level endpoint telemetry", "No host-level telemetry exists",
+    # "(no host-level events)", "no host telemetry on X", "no host data".
+    re.compile(
+        r"\bno\s+host(?:[- ](?:level|side|based))?\s+(?:endpoint\s+)?"
+        r"(?:telemetry|events?|data|visibility)\b",
+        re.IGNORECASE,
+    ),
+    # "host-level endpoint telemetry is not indexed for this host".
+    re.compile(
+        r"\bhost[- ]level\s+(?:endpoint\s+)?telemetry\s+(?:is|was|are)\s+not\b",
+        re.IGNORECASE,
+    ),
+    # "endpoint plane does not cover <host>", "endpoint telemetry does not
+    # cover this host".
+    re.compile(
+        r"\b(?:endpoint|host)\s+(?:plane|telemetry|agent|coverage)\s+(?:does|did)\s+not\s+cover\b",
+        re.IGNORECASE,
+    ),
+    # "not covered by endpoint telemetry" (but not "by endpoint process telemetry").
+    re.compile(
+        r"\bnot\s+covered\s+by\s+(?:any\s+)?(?:host|endpoint)\s+(?:telemetry|agent)\b",
+        re.IGNORECASE,
+    ),
+    # "without host telemetry", "lacks host-level telemetry".
+    re.compile(
+        r"\b(?:lacks?|without)\s+(?:any\s+)?host(?:[- ]level)?\s+(?:telemetry|visibility)\b",
+        re.IGNORECASE,
+    ),
+    # "no endpoint telemetry for <host>" (but not "no endpoint process telemetry").
+    re.compile(r"\bno\s+endpoint\s+(?:telemetry|agent|coverage|visibility)\b", re.IGNORECASE),
+)
+
+# A sentence ends at . ! or ? before whitespace, or at a line break. A dotted
+# name or a field path ("host.ip:192.0.2.41") has no space after its dots.
+_SENTENCE_BREAK = re.compile(r"((?<=[.!?])[ \t]+|\n+)")
+
+
+def claims_no_host_telemetry(sentence: str) -> bool:
+    """True when ``sentence`` says a host has no host telemetry at all."""
+    return any(p.search(sentence) for p in _HOST_GAP_CLAIMS)
+
+
+def rewrite_host_gap_claims(
+    text: str,
+    replacement: Callable[[str], str | None],
+) -> tuple[str, int]:
+    """Rewrite each sentence of ``text`` that claims a host has no host telemetry.
+
+    ``replacement`` gets the claiming sentence and returns the text to put in
+    its place: the coverage sentences of the host it names, ``""`` to strip it,
+    or ``None`` to keep it. A replacement that an earlier sentence in the same
+    text already inserted is not inserted twice. Line breaks and the other
+    sentences stay as they were. Returns the new text and the count of
+    sentences changed.
+    """
+    if not text:
+        return text, 0
+    parts = _SENTENCE_BREAK.split(text)
+    changed = 0
+    inserted: set[str] = set()
+    out: list[str] = []
+    drop_break = False
+    for i, part in enumerate(parts):
+        if i % 2 == 1:
+            # A stripped sentence takes the break after it, so no blank
+            # line or double space is left behind.
+            if not drop_break:
+                out.append(part)
+            drop_break = False
+            continue
+        if not claims_no_host_telemetry(part):
+            out.append(part)
+            continue
+        new = replacement(part)
+        if new is None:
+            out.append(part)
+            continue
+        changed += 1
+        if new and new not in inserted:
+            inserted.add(new)
+            # Keep a bullet or a list number that sat before the sentence.
+            lead = re.match(r"^\s*(?:[-*\u2022]\s+|\d+[.)]\s+)?", part)
+            out.append((lead.group(0) if lead else "") + new)
+        else:
+            drop_break = True
+    if not changed:
+        return text, 0
+    return "".join(out).strip(), changed
+
+
+@dataclass(frozen=True)
+class CoverageSubject:
+    """One host a report may write about, with the coverage soc-ai read for it.
+
+    ``label`` is the name a replacement sentence uses. ``tokens`` are the
+    spellings a sentence may name the host by: its address, its agent name
+    and the names the coverage read searched.
+    """
+
+    label: str
+    tokens: tuple[str, ...]
+    coverage: HostCoverage
+
+
+def coverage_subject(address: str, coverage: HostCoverage) -> CoverageSubject:
+    """A subject for one address and the coverage read for it."""
+    agent = coverage.agent
+    label = agent.name if agent is not None and agent.name else address
+    tokens = {address.lower(), *coverage.host_names()}
+    return CoverageSubject(
+        label=label, tokens=tuple(sorted(t for t in tokens if t)), coverage=coverage
+    )
+
+
+def _names_subject(sentence: str, subject: CoverageSubject) -> bool:
+    low = sentence.lower()
+    return any(
+        re.search(rf"(?<![\w.-]){re.escape(token)}(?![\w-])", low) for token in subject.tokens
+    )
+
+
+def coverage_replacer(subjects: list[CoverageSubject]) -> Callable[[str], str | None]:
+    """The replacement for a "no host telemetry" claim, read from the coverage.
+
+    A claim that names a host gets that host's coverage sentences when the
+    host ships any plane. A claim that names no host gets them only when every
+    host the report concerns ships a plane, because then the claim is false
+    whichever host it meant. A claim about a host that ships nothing, or whose
+    coverage soc-ai could not read, stays: it may be true.
+    """
+
+    def _replace(sentence: str) -> str | None:
+        named = [s for s in subjects if _names_subject(sentence, s)]
+        targets = named or subjects
+        if not targets or not all(t.coverage.covered for t in targets):
+            return None
+        return " ".join(
+            line for t in targets for line in describe_coverage(t.coverage, subject=t.label)
+        )
+
+    return _replace
+
+
+def ground_host_coverage_claims(report: Any, subjects: list[CoverageSubject]) -> tuple[Any, int]:
+    """Rewrite the "no host telemetry" claims of a triage report from the coverage.
+
+    Reads the summary, the field reconciliation and each recommended action's
+    rationale. Returns the report (a copy when anything changed) and the count
+    of sentences rewritten.
+    """
+    if not subjects:
+        return report, 0
+    replace = coverage_replacer(subjects)
+    changed = 0
+    update: dict[str, Any] = {}
+    summary, n = rewrite_host_gap_claims(str(getattr(report, "summary", "") or ""), replace)
+    if n:
+        update["summary"] = summary
+        changed += n
+    reconciliation = getattr(report, "field_reconciliation", None)
+    if isinstance(reconciliation, str):
+        text, n = rewrite_host_gap_claims(reconciliation, replace)
+        if n:
+            update["field_reconciliation"] = text
+            changed += n
+    actions = list(getattr(report, "recommended_actions", None) or [])
+    new_actions = []
+    for action in actions:
+        text, n = rewrite_host_gap_claims(str(getattr(action, "rationale", "") or ""), replace)
+        if n:
+            changed += n
+            new_actions.append(action.model_copy(update={"rationale": text}))
+        else:
+            new_actions.append(action)
+    if any(a is not b for a, b in zip(actions, new_actions, strict=True)):
+        update["recommended_actions"] = new_actions
+    if not update:
+        return report, 0
+    return report.model_copy(update=update), changed

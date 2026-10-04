@@ -51,6 +51,9 @@ HOST_DOSSIER_COLUMNS = {
     "identity_fingerprint",
     "identity_rebound_at",
     "build_error",
+    # migration 0054: the machine the address belongs to, and how it joined.
+    "machine_id",
+    "address_kind",
     "created_at",
     "updated_at",
 }

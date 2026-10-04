@@ -12,6 +12,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from soc_ai.config import Settings
+from soc_ai.secret_scrub import scrub_secrets
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.so_client.fields import get_dotted
 from soc_ai.store.models import Investigation
@@ -63,6 +64,36 @@ _TL_GROUP = {
     "session_prior": "Prefetch & pivots",
     # Holding a verdict is a decision, not a lookup.
     "session_verdict_conflict": "Decision",
+    # The "Tool calls" group holds tool calls and nothing else, because the
+    # page counts its rows as the run's tool calls (P10, 2026-10-01). Every
+    # other kind is filed by what it is. The dossier block is prompt assembly.
+    "host_dossier": "Prefetch & pivots",
+    "rubric_derivation": "Prefetch & pivots",
+    "retask": "Prefetch & pivots",
+    "retask_skipped_no_closeable_gap": "Prefetch & pivots",
+    "targeted_dispatch": "Tool calls",
+    # An auto-ack that did not fire is a decision about the verdict, the same
+    # as the auto-ack that did.
+    "auto_ack_skipped": "Decision",
+    "auto_ack_inherited": "Decision",
+    "classification": "Decision",
+    "investigation_transcript": "Decision",
+    "self_consistency_vote": "Decision",
+    "fast_path_escalation": "Decision",
+    "approval_decision": "Decision",
+    "session_end": "Decision",
+    "verdict_floor_rewrite": "Validators",
+    "coverage_cap": "Validators",
+    "fast_path_evidence_guard": "Validators",
+    "fast_path_verdict_cap": "Validators",
+    "icmp_solicited_downgrade": "Validators",
+    "evidence_gate_downgrade": "Validators",
+    "ungrounded_host_anchored_tp_downgrade": "Validators",
+    "malware_rule_name_ungrounded_downgrade": "Validators",
+    "decisive_value_support_cap": "Validators",
+    "unsupported_decisive_value_downgrade": "Validators",
+    "recommended_actions_blocked": "Validators",
+    "egress_blocked": "Validators",
 }
 # Write-action tools (ack/escalate/comment): their tool_call rows belong under
 # "Decision" too — they act on the verdict rather than investigate.
@@ -90,7 +121,9 @@ _ACTION_TAG = {"ack_alert": "ack", "escalate_to_case": "escalate", "add_case_com
 def _tl_group(kind: str) -> str:
     if kind.startswith("oracle"):
         return "Oracle"
-    return _TL_GROUP.get(kind, "Tool calls")
+    # An unknown kind is not a tool call. Filing it under "Tool calls" made the
+    # section disagree with the tool-call count (P10).
+    return _TL_GROUP.get(kind, "Decision")
 
 
 def _compact(obj: Any, limit: int = 160) -> str:
@@ -290,7 +323,7 @@ def _entity_graph(
         else:
             edge["label"] = "observed"
         edges.append(edge)
-    note = f"{label or src} contacted {n} peer(s)." + (
+    note = f"{label or src} contacted {n} peer{'' if n == 1 else 's'}." + (
         f" Enrichment flagged {len(flagged_names)} of them as malicious: "
         f"{_compact(', '.join(flagged_names), 60)}."
         if flagged_names
@@ -329,6 +362,7 @@ _TOOL_NOUN = {
     "t_describe_dataset": "Dataset shape",
     "t_field_values": "Field values",
     "t_get_event_raw": "Raw event",
+    "t_host_dossier": "Host dossier",
     "t_ack_alert": "Acknowledge",
     "t_escalate_to_case": "Escalate to case",
     "t_add_case_comment": "Case comment",
@@ -366,7 +400,9 @@ def _tool_outcome(result: Any) -> str:
     if result is None:
         return "running…"
     if isinstance(result, list):
-        return "no results" if not result else f"{len(result)} result(s)"
+        return (
+            "no results" if not result else f"{len(result)} result{'' if len(result) == 1 else 's'}"
+        )
     if isinstance(result, str):
         return _compact(result, 80)
     if not isinstance(result, dict):
@@ -393,9 +429,9 @@ def _tool_outcome(result: Any) -> str:
     if "event_count" in result and ("ip" in result or "host" in result):
         who = result.get("ip") or result.get("host")
         if not result.get("observations", True):
-            return f"{who} — no observations"
+            return f"{who}, no observations"
         n = result.get("event_count")
-        return f"{who} — {n} events"
+        return f"{who}, {n} events"
     # enrichment result
     if {"blocklist_hits", "misp_hits", "indicator"} & set(result):
         bl = result.get("blocklist_hits") or []
@@ -413,7 +449,7 @@ def _tool_outcome(result: Any) -> str:
         where = "internal address" if result.get("internal") else ""
         if result.get("blocklist_checked") is False:
             unloaded = "no blocklist loaded. soc-ai checked nothing"
-            return f"{where} — {unloaded}" if where else unloaded
+            return f"{where}, {unloaded}" if where else unloaded
         return where or "no blocklist/MISP match"
     # ES query / zeek result
     if result.get("prefetch_already_has_this"):
@@ -436,6 +472,32 @@ def _tool_outcome(result: Any) -> str:
     return "done"
 
 
+def _dossier_outcome(result: Any) -> str | None:
+    """A host dossier answer, as the facts it holds.
+
+    The dossier carries an ``event_count`` beside the ``ip``, so the generic
+    host-summary branch titled it "<ip>, 0 events". That reads as an all-clear
+    on a host the dossier describes in full (RL10). The point of the step is
+    what the host IS: its role and how many facts the record holds.
+    """
+    if not isinstance(result, dict) or result.get("error") or "found" not in result:
+        return None
+    who = result.get("ip") or "this host"
+    if result.get("found") is False:
+        return f"{who}, no record in the sweep"
+    raw_fields = result.get("fields")
+    fields: dict[str, Any] = raw_fields if isinstance(raw_fields, dict) else {}
+    known = [f for f in fields.values() if isinstance(f, dict) and f.get("value") is not None]
+    declared = [f for f in known if f.get("source") == "operator"]
+    role_field = fields.get("role")
+    role = role_field.get("value") if isinstance(role_field, dict) else None
+    parts = [f"role {role}" if role else "role unknown"]
+    parts.append(f"{len(known)} known fact{'' if len(known) == 1 else 's'}")
+    if declared:
+        parts.append(f"{len(declared)} declared by an operator")
+    return f"{who}, " + ", ".join(parts)
+
+
 def _tool_step(tool_name: str, args: dict[str, Any], result: Any) -> tuple[str, str]:
     """Title carries the point (tool + a short outcome); detail (shown on expand)
     carries the FULL headline result first, then the query and any enrichment chips.
@@ -444,7 +506,8 @@ def _tool_step(tool_name: str, args: dict[str, Any], result: Any) -> tuple[str, 
     analyst reads the whole answer — never just the arguments (the old behaviour).
     """
     noun = _TOOL_NOUN.get(tool_name, _humanize_id(tool_name).capitalize())
-    title = f"{noun}: {_tool_outcome(result)}"
+    outcome = _dossier_outcome(result) if tool_name == "t_host_dossier" else None
+    title = f"{noun}: {outcome or _tool_outcome(result)}"
 
     lines: list[str] = []
     headline_key: str | None = None
@@ -472,6 +535,90 @@ def _tool_step(tool_name: str, args: dict[str, Any], result: Any) -> tuple[str, 
         if extra:
             lines.append(" · ".join(extra))
     return title, "\n".join(lines)
+
+
+def _percent(ratio: Any) -> str:
+    """A 0..1 ratio as a whole percent: "83%", never 0.8333333333333334."""
+    if isinstance(ratio, bool) or not isinstance(ratio, int | float):
+        return "unknown"
+    return f"{round(float(ratio) * 100)}%"
+
+
+_AUTO_ACK_SKIP_REASON = {
+    "high_stakes": "high stakes",
+    "below_threshold": "confidence below the threshold",
+    "no_investigation": "the run retrieved nothing",
+    "uncited": "no citation resolves",
+    "promoted_finding": "a promoted finding has no alert",
+}
+
+
+def _auto_ack_skip_reason(p: dict[str, Any]) -> str:
+    reason = str(p.get("reason") or "")
+    return _AUTO_ACK_SKIP_REASON.get(reason, reason.replace("_", " ") or "no reason recorded")
+
+
+def _dossier_event_detail(p: dict[str, Any]) -> str:
+    """The prompt's dossier block, as text an analyst reads.
+
+    The payload is the audit record: a host-to-role map and the markdown block
+    the model saw. The raw JSON put a "## Host dossier" heading inside a code
+    box (P11). The hosts come first, then the block without its headings.
+    """
+    raw_hosts = p.get("hosts")
+    hosts: dict[str, Any] = raw_hosts if isinstance(raw_hosts, dict) else {}
+    lines: list[str] = []
+    if hosts:
+        lines.append("Hosts: " + ", ".join(f"{ip} ({role})" for ip, role in hosts.items()))
+    omitted = p.get("hosts_omitted")
+    if isinstance(omitted, int) and omitted > 0:
+        lines.append(f"{omitted} more host(s) not described.")
+    block = p.get("block")
+    if isinstance(block, str) and block.strip():
+        body = [ln for ln in block.strip().splitlines() if not ln.lstrip().startswith("#")]
+        text = "\n".join(body).strip()
+        if text:
+            lines.append(_compact(text, 1200))
+    return "\n".join(lines) or "The dossier block was empty."
+
+
+def _citation_detail(p: dict[str, Any]) -> str:
+    """The citation check: the count, the coverage as a percent, each citation.
+
+    The step used to say "5/5 citations valid. Coverage is 1.0." and list none
+    of them (P3). A ratio printed raw read 0.8333333333333334 (RL13).
+    """
+    c = p.get("counts") or {}
+    valid, total, cov = c.get("valid", "?"), p.get("total", "?"), p.get("coverage_ratio")
+    if p.get("vacuous") or total == 0:
+        # Coverage over nothing is not a number. Saying "0/0 (coverage 0.0)"
+        # implies the report tried to cite and failed; it did not try.
+        return "the report offered no citations"
+    lines = [f"{valid}/{total} citations valid. Coverage is {_percent(cov)}."]
+    per = p.get("per_citation")
+    for item in per if isinstance(per, list) else []:
+        if isinstance(item, dict) and item.get("citation"):
+            mark = "valid" if item.get("resolved") else "not resolved"
+            lines.append(f"{mark}: {_compact(str(item['citation']), 160)}")
+    return "\n".join(lines)
+
+
+def _special_step(kind: str, p: dict[str, Any]) -> tuple[str, str] | None:
+    """Title and detail for the kinds whose payload is machine data (P11)."""
+    if kind == "auto_ack_skipped":
+        reason = _auto_ack_skip_reason(p)
+        return (
+            f"Auto-acknowledge skipped: {reason}",
+            f"soc-ai did not acknowledge the alert. The reason is {reason}.",
+        )
+    if kind == "host_dossier":
+        raw_hosts = p.get("hosts")
+        n = len(raw_hosts) if isinstance(raw_hosts, dict) else 0
+        return (
+            f"Host dossier: asset context for {n} host{'' if n == 1 else 's'}",
+            _dossier_event_detail(p),
+        )
+    return None
 
 
 def _detail_for(kind: str, p: dict[str, Any] | None, result: Any = None) -> str:
@@ -524,13 +671,7 @@ def _detail_for(kind: str, p: dict[str, Any] | None, result: Any = None) -> str:
         cites = p.get("citations") or []
         return f"{p.get('template_id')} grounds recorded as the citations: {', '.join(cites)}"
     if kind == "citation_validation":
-        c = p.get("counts") or {}
-        valid, total, cov = c.get("valid", "?"), p.get("total", "?"), p.get("coverage_ratio")
-        if p.get("vacuous") or total == 0:
-            # Coverage over nothing is not a number. Saying "0/0 (coverage 0.0)"
-            # implies the report tried to cite and failed; it did not try.
-            return "the report offered no citations"
-        return f"{valid}/{total} citations valid. Coverage is {cov}."
+        return _citation_detail(p)
     if kind == "citation_cap":
         return (
             f"confidence {p.get('original_confidence')} → {p.get('capped_confidence')} "
@@ -703,6 +844,133 @@ def _fallback_out(report: dict[str, Any]) -> FallbackOut | None:
     )
 
 
+class CitationOut(BaseModel):
+    """One citation of the report, with what it names.
+
+    ``kind`` is ``id`` (a document id), ``path`` (an alert-context field),
+    ``tool`` (a tool the run called) or ``unknown``. ``target`` is the id, path
+    or tool name. ``resolved`` is the validator's answer, None when the run
+    recorded no validation.
+    """
+
+    text: str
+    kind: str
+    target: str | None = None
+    resolved: bool | None = None
+
+
+class FailureOut(BaseModel):
+    """Why a failed run failed (RL11, RD13).
+
+    ``permanent`` is True when a re-run cannot change the outcome: the alert is
+    gone from the grid. The page then does not advise a re-run.
+    """
+
+    cause: str
+    hint: str | None = None
+    permanent: bool = False
+
+
+# Markers the pipeline writes into `citations` that name no document.
+_NON_DOCUMENT_CITATIONS = frozenset({"synth_first_failure"})
+
+
+_ULID_RE = re.compile(r"[0-7][0-9A-HJKMNP-TV-Z]{25}")
+
+
+def _citations_out(report: dict[str, Any], events: list[Any]) -> list[CitationOut]:
+    """The report's citations, classified, with the validator's verdict on each.
+
+    The detail used to send no citations at all, so the page could link none
+    and the Validators step listed none of the ids it had checked (P3).
+    """
+    from soc_ai.agent.evidence import _classify_citation  # noqa: PLC0415
+
+    resolved_by_text: dict[str, bool] = {}
+    for e in events:
+        if e.kind != "citation_validation":
+            continue
+        per = (e.payload or {}).get("per_citation")
+        if not isinstance(per, list):
+            continue
+        resolved_by_text = {
+            str(item.get("citation")): bool(item.get("resolved"))
+            for item in per
+            if isinstance(item, dict) and item.get("citation")
+        }
+    raw = report.get("citations")
+    out: list[CitationOut] = []
+    seen: set[str] = set()
+    for c in raw if isinstance(raw, list) else []:
+        if not isinstance(c, str) or not c.strip() or c in seen:
+            continue
+        seen.add(c)
+        if c.strip() in _NON_DOCUMENT_CITATIONS:
+            continue
+        kind, target = _classify_citation(c)
+        if kind == "id" and target is not None and _ULID_RE.fullmatch(target):
+            # A ULID names an investigation or a hunt, never a grid document.
+            # The page would open the document dialog on it and read a 404.
+            kind = "run"
+        out.append(CitationOut(text=c, kind=kind, target=target, resolved=resolved_by_text.get(c)))
+    return out
+
+
+def _open_questions_out(report: dict[str, Any], events: list[Any]) -> list[str]:
+    """The gaps the run could not close.
+
+    ``TriageReport`` has no ``open_questions`` field. The investigator's
+    transcript has it, and the run stores the transcript as an
+    ``investigation_transcript`` event. The detail read the report alone, so
+    every needs_more_info run on prod showed no open questions (P2). An older
+    report that carries the key still wins.
+    """
+
+    def _clean(raw: Any) -> list[str]:
+        if not isinstance(raw, list):
+            return []
+        return [str(q).strip() for q in raw if isinstance(q, str) and q.strip()]
+
+    from_report = _clean(report.get("open_questions"))
+    if from_report:
+        return from_report
+    for e in reversed(events):
+        if e.kind == "investigation_transcript":
+            found = _clean((e.payload or {}).get("open_questions"))
+            if found:
+                return found
+    return []
+
+
+# An error type or message that no re-run can change: the alert itself is gone.
+_PERMANENT_ERROR_TYPES = frozenset({"SoNotFoundError"})
+_PERMANENT_ERROR_PREFIXES = ("alert not found", "hunt not found")
+
+
+def _failure_out(status: str | None, events: list[Any]) -> FailureOut | None:
+    """The recorded cause of an errored run, from its last ``error`` event."""
+    if status != "error":
+        return None
+    for e in reversed(events):
+        if e.kind != "error":
+            continue
+        p = e.payload or {}
+        message = str(p.get("message") or p.get("error") or "").strip()
+        if not message:
+            continue
+        err_type = str(p.get("type") or "")
+        permanent = err_type in _PERMANENT_ERROR_TYPES or message.lower().startswith(
+            _PERMANENT_ERROR_PREFIXES
+        )
+        hint = p.get("hint")
+        return FailureOut(
+            cause=_compact(message, 240),
+            hint=hint if isinstance(hint, str) and hint.strip() else None,
+            permanent=permanent,
+        )
+    return None
+
+
 class InvestigationOut(BaseModel):
     id: str
     groupId: str
@@ -729,6 +997,12 @@ class InvestigationOut(BaseModel):
     hostContext: list[dict[str, Any]] = []
     graphNote: str | None = None
     openQuestions: list[str] = []
+    # The report's citations, each with what it names. The page links an `id`
+    # citation to its event (P3). Built by `_citations_out`.
+    citations: list[CitationOut] = []
+    # Why a run that ended in `error` failed, from its last `error` event. None
+    # on any other run. Built by `_failure_out`.
+    failure: FailureOut | None = None
     resolution: dict[str, Any] | None = None
     validatorNote: str | None = None
     # Pipeline-failure fallback provenance (E1.2). Present ONLY when the run's
@@ -768,6 +1042,35 @@ class InvestigationOut(BaseModel):
     # hunt). The drawer badges it so a planted attack can never be read as
     # real activity.
     isSynthEval: bool = False
+    # Per-end host context (dogfood 2026-10-01 RL3). One entry per endpoint IP
+    # of the alert: the IP, which end of the alert it is, and its in-window
+    # alerts split by side. Empty on runs stored before the split existed;
+    # the page then labels ``hostContext`` as pooled over both ends.
+    hostContexts: list[dict[str, Any]] = []
+    # The id of the newer primary run for the same alert, when a later run
+    # superseded this one. None when this run is the primary run.
+    supersededBy: str | None = None
+
+
+def _host_contexts(profiles: Any) -> list[dict[str, Any]]:
+    """Wire shape of the per-end host context: each end named, each side ranked."""
+    if not isinstance(profiles, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for p in profiles:
+        if not isinstance(p, dict) or not p.get("ip"):
+            continue
+        as_src = p.get("as_source")
+        as_dst = p.get("as_destination")
+        out.append(
+            {
+                "ip": str(p["ip"]),
+                "end": str(p.get("end") or ""),
+                "asSource": _host_signals(as_src if isinstance(as_src, dict) else {}),
+                "asDestination": _host_signals(as_dst if isinstance(as_dst, dict) else {}),
+            }
+        )
+    return out
 
 
 def _collect_reasoning(events: list[Any]) -> list[str]:
@@ -784,7 +1087,10 @@ def _collect_reasoning(events: list[Any]) -> list[str]:
             continue
         trace = (e.payload or {}).get("reasoning_trace")
         if isinstance(trace, str) and trace.strip():
-            out.append(trace.strip())
+            # The trace quotes tool results verbatim, so it can carry a
+            # credential the telemetry held. The store keeps the event as
+            # evidence; the console never shows the value.
+            out.append(scrub_secrets(trace.strip()))
     return out
 
 
@@ -1056,14 +1362,14 @@ def _redaction_note(redaction: object) -> str | None:
             )
             parts.append(f"{count} {singular if count == 1 else plural}")
         if parts:
-            return f"{_join_phrases(parts)} redacted before the second opinion"
+            return f"{_join_phrases(parts)} redacted before the data went to the Oracle"
         # Nothing to name. Which of the two reasons matters: a summary that
         # counted and found zero ({"IP": 0}) means nothing was replaced, and
         # saying otherwise would tell every analyst their data went off-box
         # redacted when it did not. A summary we could not read is the other
         # case, and there silence would be the lie.
-        return None if all_counted else "redacted before the second opinion"
-    return "redacted before the second opinion"
+        return None if all_counted else "redacted before the data went to the Oracle"
+    return "redacted before the data went to the Oracle"
 
 
 def _build_oracle(events: list[Any]) -> OracleOut | None:
@@ -1116,12 +1422,21 @@ def _build_timeline(events: list[Any]) -> tuple[list[TimelineStepOut], int, int,
         if e.kind == "tool_result"
     }
     timeline: list[TimelineStepOut] = []
-    tool_calls = pivots = 0
+    pivots = 0
     has_oracle = False
+    last_dispatch: int | None = None
     for e in events:
         if e.kind in _TL_SKIP:
             continue
         p = e.payload or {}
+        if e.kind == "targeted_tool_result" and last_dispatch is not None:
+            # The answer to a follow-up check belongs on the check's own row.
+            # A second row counted one tool call twice (P10).
+            row = timeline[last_dispatch]
+            outcome = timeline_labels.title_for(e.kind, p)
+            row.detail = f"{row.detail}\nresult: {outcome}".strip()
+            last_dispatch = None
+            continue
         if e.kind.startswith("oracle"):
             has_oracle = True
         group = _tl_group(e.kind)
@@ -1131,7 +1446,6 @@ def _build_timeline(events: list[Any]) -> tuple[list[TimelineStepOut], int, int,
         # isn't mis-badged "heuristic · no tools" with toolCalls 0 (F06).
         if e.kind == "targeted_dispatch":
             td_tool = str(p.get("tool_name", ""))
-            tool_calls += 1
             if "query" in td_tool or "zeek" in td_tool or "pcap" in td_tool:
                 pivots += 1
         if e.kind == "tool_call":
@@ -1142,7 +1456,6 @@ def _build_timeline(events: list[Any]) -> tuple[list[TimelineStepOut], int, int,
             # hero. Drop it from the analyst timeline (and the tool-call count).
             if tn == "final_result":
                 continue
-            tool_calls += 1
             if "query" in tn or "zeek" in tn or "pcap" in tn:
                 pivots += 1
             # Write-actions (ack/escalate/comment) act on the verdict — file
@@ -1160,12 +1473,19 @@ def _build_timeline(events: list[Any]) -> tuple[list[TimelineStepOut], int, int,
                 else "No pattern matched: a full investigation ran"
             )
             detail = _detail_for(e.kind, p)
+        elif (special := _special_step(e.kind, p)) is not None:
+            title, detail = special
         else:
             title = timeline_labels.title_for(e.kind, p)
             detail = _detail_for(e.kind, p)
+        if e.kind == "targeted_dispatch":
+            last_dispatch = len(timeline)
         timeline.append(
             TimelineStepOut(id=f"e{e.sequence}", group=group, title=title, detail=detail)
         )
+    # One count from one source: the rows the "Tool calls" section shows. A
+    # separate tally drifted from the section (2 against 3 rows on prod, P10).
+    tool_calls = sum(1 for step in timeline if step.group == "Tool calls")
     return timeline, tool_calls, pivots, has_oracle
 
 
@@ -1181,7 +1501,9 @@ def _chat_msg_out(m: Any) -> ChatMessageOut:
     is_prop = meta.get("kind") in PROPOSAL_KINDS
     return ChatMessageOut(
         role=m.role,
-        text=m.content,
+        # Scrubbed on read as well as on store: rows from before the store-side
+        # scrub can still quote a credential from telemetry.
+        text=scrub_secrets(m.content) if isinstance(m.content, str) else m.content,
         tools=tools,
         messageId=m.id if is_prop else None,
         kind=meta.get("kind") if is_prop else None,

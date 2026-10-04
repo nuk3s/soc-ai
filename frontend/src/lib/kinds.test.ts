@@ -39,7 +39,7 @@ describe('kindLabel', () => {
 describe('sourceLabel', () => {
   it('maps the legacy candidate word to catalog', () => {
     expect(sourceLabel('candidate')).toBe('catalog');
-    expect(sourceTitle('candidate')).toContain('catalog sweep');
+    expect(sourceTitle('candidate')).toContain('analytic sweep');
   });
 
   it('reads a shadow observation as shadow whatever wrote it', () => {

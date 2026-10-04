@@ -30,7 +30,7 @@ whole sentence it has always had.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from soc_ai.hunting.execute import SpecRun
@@ -177,6 +177,16 @@ def _undecided_clause(spec: HuntSpec, run: SpecRun) -> str:
     )
 
 
+def detail_sentence(details: Sequence[tuple[str, Sequence[str]]]) -> str:
+    """The quoted document fields of one candidate, as one sentence.
+
+    ``threat: Trojan:Win64/Example; action: Quarantine.`` Empty when the
+    spec quotes nothing or no sample carried a value.
+    """
+    parts = [f"{label}: {', '.join(values)}" for label, values in details if values]
+    return "; ".join(parts) + "." if parts else ""
+
+
 def candidate_findings(spec: HuntSpec, run: SpecRun) -> list[dict[str, Any]]:
     """One finding per candidate, in the shape the hunt report already uses.
 
@@ -274,6 +284,31 @@ def candidate_findings(spec: HuntSpec, run: SpecRun) -> list[dict[str, Any]]:
             }
         )
 
+    if run.role_unconfirmed_docs:
+        # The role gate could not place these hosts. Dropping their documents
+        # would make an unclassified server a safe harbour, and firing on them
+        # would undo the scope, so the finding names the hosts and asks for the
+        # one fact that decides them.
+        hosts = ", ".join(run.role_unconfirmed_hosts) or "unnamed hosts"
+        findings.append(
+            {
+                "title": f"Unconfirmed host role for {spec.id}"[:60],
+                "spec_rationale": _sentence(spec),
+                "detail": (
+                    f"{_sentence(spec)} {run.role_unconfirmed_docs} document(s) matched "
+                    f"this detection on hosts with no confirmed role: {hosts}. The "
+                    f"analytic applies to {', '.join(spec.roles)}. The dossier holds no "
+                    f"role for these hosts at confidence {spec.min_role_confidence:.2f} "
+                    "or above. Declare the role on the host page. This is not a clean "
+                    "result."
+                ),
+                "severity": "medium",
+                "category": "visibility_gap",
+                "hosts": [],
+                "citations": [],
+            }
+        )
+
     if run.truncated_docs:
         findings.append(
             {
@@ -300,6 +335,7 @@ def candidate_findings(spec: HuntSpec, run: SpecRun) -> list[dict[str, Any]]:
                 if candidate.first_seen != candidate.last_seen
                 else f" The match is at {candidate.first_seen}."
             )
+        quoted = detail_sentence(candidate.details)
         findings.append(
             {
                 "title": _title(spec, candidate.scope_key),
@@ -307,14 +343,14 @@ def candidate_findings(spec: HuntSpec, run: SpecRun) -> list[dict[str, Any]]:
                 "detail": (
                     f"{_sentence(spec)} The spec matched {docs} document"
                     f"{'' if docs == 1 else 's'} for {candidate.scope_kind} "
-                    f"{candidate.scope_key}.{span}"
+                    f"{candidate.scope_key}.{span}{' ' + quoted if quoted else ''}"
                 ),
                 # The card says "3 of 4 matching documents" beside the citation
                 # chips, because a bucket over MAX_SAMPLE_IDS cites a sample.
                 # It read the 4 back out of the sentence above; the number is
                 # right here.
                 "matched_docs": docs,
-                "severity": _LEVEL_TO_SEVERITY.get(spec.level, "medium"),
+                "severity": _LEVEL_TO_SEVERITY.get(candidate.level or spec.level, "medium"),
                 "category": "threat",
                 "hosts": [candidate.scope_key] if candidate.scope_kind in {"host", "ip"} else [],
                 # Real document ids. The promotion route resolves one of these
@@ -358,6 +394,11 @@ def spec_report(spec: HuntSpec, run: SpecRun) -> dict[str, Any]:
             f" The spec could not evaluate its exclusions against {run.undecided_docs} "
             "document(s). It did not match them and did not rule them out."
             if run.undecided_docs
+            else ""
+        )
+        extra += (
+            f" The role gate could not place the hosts of {run.role_unconfirmed_docs} document(s)."
+            if run.role_unconfirmed_docs
             else ""
         )
         narrative = (
@@ -453,6 +494,7 @@ def hunt_outcome(status: str, findings: Any) -> tuple[int, str]:
 
 __all__ = [
     "candidate_findings",
+    "detail_sentence",
     "finding_category",
     "hunt_outcome",
     "spec_report",

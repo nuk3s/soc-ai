@@ -1110,6 +1110,26 @@ def test_services_offered_carries_the_structured_port_list() -> None:
     assert any("ssl" in line and "ssh" in line for line in services.evidence)
 
 
+def test_a_udp_service_reads_as_udp_in_the_facts_and_the_evidence() -> None:
+    """H2. UDP 53 rendered as tcp/53. The collector now records the transport
+    of each port, and the services and the role evidence read it. A port the
+    collector did not label keeps the old default."""
+    obs = _obs(
+        resp_ports=[
+            {"value": 53, "count": 900, "transport": "udp"},
+            {"value": 443, "count": 300},
+        ],
+        resp_peer_count=8,
+        resp_hours=12,
+    )
+    facts = infer_host_facts(obs, min_events=20)
+    services = facts["services_offered"]
+    assert services.value == "udp/53, tcp/443"
+    assert [(e["port"], e["proto"]) for e in services.value_json] == [(53, "udp"), (443, "tcp")]
+    lines = " ".join(services.evidence)
+    assert "udp/53" in lines and "tcp/53" not in lines
+
+
 def test_services_offered_is_empty_when_the_host_only_originates() -> None:
     services = infer_host_facts(_obs(orig_peer_count=8), min_events=20)["services_offered"]
     assert services.value is None
@@ -1889,3 +1909,109 @@ def test_a_client_os_never_promotes_or_demotes_a_domain_controller() -> None:
     )
     role = infer_host_facts(obs, min_events=20)["role"]
     assert role.value != "workstation"
+
+
+def test_two_agreeing_role_sources_resolve_to_the_stronger() -> None:
+    """The ports read a workstation at weak strength and the agent reports a
+    client OS. Both say workstation, and the field read "possibly workstation
+    0.50" because the weaker source wrote it (dogfood RO8, 2026-10-01)."""
+    workstation_shaped = dict(orig_peer_count=40)
+    weak = infer_host_facts(_obs(**workstation_shaped), min_events=20)["role"]
+    assert (weak.value, weak.strength) == ("workstation", "weak")
+
+    obs = _obs(agent_report=_agent(os=_windows_os("Windows 11 Enterprise")), **workstation_shaped)
+    role = infer_host_facts(obs, min_events=20)["role"]
+    assert (role.value, role.strength, role.source) == ("workstation", "strong", "hostlog")
+
+    # NEGATIVE CONTROL: a server OS does not lift the weak workstation verdict.
+    obs = _obs(
+        agent_report=_agent(os=_windows_os("Windows Server 2022 Datacenter")), **workstation_shaped
+    )
+    assert infer_host_facts(obs, min_events=20)["role"].strength == "weak"
+
+
+# ---------------------------------------------------------------------------
+# Self-reported names are not filtered as bare public TLDs (2026-10-02)
+# ---------------------------------------------------------------------------
+#
+# "nexus" and "green" are gTLDs. Two production agents carried gTLD names for
+# themselves, and the TLD rule threw both away: the rows had no name and search
+# could not find either machine. An agent's own host.name and a DHCP lease
+# hostname are the machine's claims about itself. The TLD rule stays for a name
+# that DNS hands out about an address.
+
+
+def test_an_agent_named_after_a_gtld_keeps_its_name() -> None:
+    obs = _obs(agent_report=_agent(host_name="nexus"))
+
+    fact = infer_host_facts(obs, min_events=20)["hostname"]
+
+    assert (fact.value, fact.source) == ("nexus", "hostlog")
+
+
+def test_a_dhcp_lease_named_after_a_gtld_keeps_its_name() -> None:
+    obs = _obs(dhcp=(_dhcp_named("green"),))
+
+    fact = infer_host_facts(obs, min_events=20)["hostname"]
+
+    assert (fact.value, fact.source) == ("green", "banner")
+
+
+def test_a_dns_bare_label_that_is_a_gtld_is_still_rejected() -> None:
+    # NEGATIVE CONTROL on the DNS path, where the TLD rule still applies: a bare
+    # "nexus" answer is an FQDN-parsing artifact as far as DNS is concerned.
+    obs = _obs(dns_name="nexus", dns_name_evidence=DNS_EVIDENCE)
+
+    fact = infer_host_facts(obs, min_events=20)["hostname"]
+
+    assert fact.value is None
+
+
+def test_a_self_reported_reverse_or_service_name_is_still_rejected() -> None:
+    # NEGATIVE CONTROL on the self-reported path: the TLD exemption must not
+    # open the PTR and DNS-SD rejections that sit beside it.
+    for junk in ("4.2.0.192.in-addr.arpa", "_uscan._tcp.local"):
+        assert (
+            infer_host_facts(_obs(agent_report=_agent(host_name=junk)), min_events=20)[
+                "hostname"
+            ].value
+            != junk
+        )
+        assert (
+            infer_host_facts(_obs(dhcp=(_dhcp_named(junk),)), min_events=20)["hostname"].value
+            != junk
+        )
+
+
+def test_an_so3_dhcp_lease_names_the_host_and_gives_its_mac() -> None:
+    # The SO 3.x record has no source.ip. The assigned address decides whose
+    # lease it is.
+    lease = {
+        "hostname": "sensor-view",
+        "mac": "02:00:5e:10:00:27",
+        "assigned_ip": HOST_IP,
+        "client_ip": HOST_IP,
+        "source_ip": None,
+        "destination_ip": None,
+        "timestamp": RECORD_SEEN_ISO,
+    }
+    facts = infer_host_facts(_obs(dhcp=(lease,)), min_events=20)
+
+    assert (facts["hostname"].value, facts["hostname"].source) == ("sensor-view", "banner")
+    assert facts["mac"].value == "02:00:5e:10:00:27"
+
+
+def test_an_so3_lease_for_another_address_is_not_this_hosts() -> None:
+    # NEGATIVE CONTROL: the search matched on client.address, and the server
+    # handed out a different address. The lease names the other address.
+    lease = {
+        "hostname": "moved-away",
+        "mac": "02:00:5e:10:00:28",
+        "assigned_ip": "192.0.2.250",
+        "client_ip": HOST_IP,
+        "timestamp": RECORD_SEEN_ISO,
+    }
+    facts = infer_host_facts(_obs(dhcp=(lease,)), min_events=20)
+
+    assert facts["hostname"].value != "moved-away"
+    assert facts["mac"].value is None

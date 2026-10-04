@@ -81,6 +81,12 @@ function renderNotifications() {
   );
 }
 
+/** Clear all asks once: press it, then confirm. */
+function clearAll() {
+  fireEvent.click(screen.getByRole('button', { name: /clear all/i }));
+  fireEvent.click(screen.getByRole('button', { name: 'Dismiss all' }));
+}
+
 /** The visible notification titles, in order. */
 function visibleTitles(): string[] {
   return screen
@@ -133,7 +139,7 @@ describe('Notifications — the shared list toolbar', () => {
     renderNotifications();
     await screen.findByText(/ET SCAN Suspicious inbound/);
 
-    fireEvent.click(screen.getByRole('button', { name: /^Hunts/ }));
+    fireEvent.click(screen.getByRole('button', { name: /^Hunting/ }));
     await waitFor(() => expect(visibleTitles()).toHaveLength(1));
     expect(visibleTitles()[0]).toContain('Hunt finished');
 
@@ -150,9 +156,9 @@ describe('Notifications — the shared list toolbar', () => {
     await screen.findByText(/ET SCAN Suspicious inbound/);
     expect(screen.getByRole('button', { name: /^All/ })).toHaveAttribute('aria-pressed', 'true');
 
-    fireEvent.click(screen.getByRole('button', { name: /^Hunts/ }));
+    fireEvent.click(screen.getByRole('button', { name: /^Hunting/ }));
     await waitFor(() =>
-      expect(screen.getByRole('button', { name: /^Hunts/ })).toHaveAttribute('aria-pressed', 'true'),
+      expect(screen.getByRole('button', { name: /^Hunting/ })).toHaveAttribute('aria-pressed', 'true'),
     );
     expect(screen.getByRole('button', { name: /^All/ })).toHaveAttribute('aria-pressed', 'false');
   });
@@ -197,7 +203,7 @@ describe('Notifications — the shared list toolbar', () => {
     await waitFor(() =>
       expect(screen.getByRole('button', { name: /Investigations/ }).textContent).toContain('1'),
     );
-    expect(screen.getByRole('button', { name: /^Hunts/ }).textContent).toContain('0');
+    expect(screen.getByRole('button', { name: /^Hunting/ }).textContent).toContain('0');
     expect(screen.getByRole('button', { name: /^All/ }).textContent).toContain('2');
 
     fireEvent.click(screen.getByRole('button', { name: /Investigations/ }));
@@ -208,7 +214,7 @@ describe('Notifications — the shared list toolbar', () => {
     renderNotifications();
     await screen.findByText(/ET SCAN Suspicious inbound/);
 
-    fireEvent.click(screen.getByRole('button', { name: /^Hunts/ }));
+    fireEvent.click(screen.getByRole('button', { name: /^Hunting/ }));
     fireEvent.click(screen.getByRole('button', { name: /Urgency/ }));
     fireEvent.click(screen.getByText('Urgent'));
 
@@ -224,7 +230,7 @@ describe('Notifications — the shared list toolbar', () => {
     renderNotifications();
     await screen.findByText(/ET SCAN Suspicious inbound/);
     const headings = screen.getAllByTestId('notification-group').map((h) => h.textContent);
-    expect(headings).toEqual(['System', 'Hosts', 'Investigations', 'Hunts']);
+    expect(headings).toEqual(['System', 'Hosts', 'Investigations', 'Hunting']);
 
     // One kind on screen needs no headers — they would only repeat the chip.
     fireEvent.click(screen.getByRole('button', { name: /Investigations/ }));
@@ -290,10 +296,10 @@ describe('Notifications — behaviour the toolbar must not have changed', () => 
     // leave the bell badge counting rows this screen claims it just cleared.
     renderNotifications();
     await screen.findByText(/ET SCAN Suspicious inbound/);
-    fireEvent.click(screen.getByRole('button', { name: /^Hunts/ }));
+    fireEvent.click(screen.getByRole('button', { name: /^Hunting/ }));
     await waitFor(() => expect(visibleTitles()).toHaveLength(1));
 
-    fireEvent.click(screen.getByRole('button', { name: /clear all/i }));
+    clearAll();
     await waitFor(() => expect(screen.getByText('No active notifications.')).toBeTruthy());
     const dismissed = JSON.parse(localStorage.getItem('soc-ai:dismissed-notifications')!);
     expect(dismissed).toHaveLength(ROWS.length);
@@ -311,9 +317,11 @@ describe('Notifications — what the header says the list holds', () => {
     vi.mocked(api.getNotifications).mockResolvedValue(ROWS as never);
     const { container } = renderNotifications();
     await screen.findByText(/ET SCAN Suspicious inbound/);
+    // Only the types on the list, each with its count (D3).
     expect(container.textContent).toContain(
-      '5 items: shadow hits, leads, hunts and investigations from the last 24 h',
+      '5 items from the last 24 h: 1 system notice, 1 host disagreement, 1 running investigation, 1 completed investigation and 1 finished hunt.',
     );
+    expect(container.textContent).not.toMatch(/shadow hit|lead/);
   });
 
   it('groups a row under the group the API named for it', async () => {
@@ -389,10 +397,38 @@ describe('Notifications: a finding that must not be silenceable', () => {
     expect(visibleTitles()).toHaveLength(2);
     expect(screen.getAllByRole('button', { name: 'Dismiss' })).toHaveLength(1);
 
-    fireEvent.click(screen.getByRole('button', { name: /clear all/i }));
+    clearAll();
     await waitFor(() => expect(visibleTitles()).toHaveLength(1));
     expect(visibleTitles()[0]).toContain('Audit trail broken');
     const dismissed = JSON.parse(localStorage.getItem('soc-ai:dismissed-notifications')!);
     expect(dismissed).toEqual(['inv-done:INV-3']);
+  });
+});
+
+// A lead sat under the HUNTING heading and counted on the "System 1" chip, and
+// a failed triage sat on "System" while "Investigations" held verdicts only
+// (D7, RD7). The chip and the heading now read one field.
+describe('Notifications: chips and headings agree', () => {
+  beforeEach(() => localStorage.clear());
+  afterEach(() => localStorage.clear());
+
+  it('files a lead under Hunting and a failed triage under Investigations', async () => {
+    const api = await import('../lib/api');
+    vi.mocked(api.getNotifications).mockResolvedValue([
+      ROWS[0],
+      { id: 'inv-failed:INV-7', tone: 'danger', title: 'Triage failed, no verdict: ET X', when: '4m', href: '/investigation/INV-7' },
+      { id: 'lead:15', tone: 'warn', title: 'Lead 15 formed on 192.0.2.8: beaconing', when: '6m', href: '/leads/15', group: 'hunting' },
+    ] as never);
+    renderNotifications();
+    await screen.findByText(/Lead 15 formed/);
+    const headings = screen.getAllByTestId('notification-group').map((h) => h.textContent);
+    expect(headings).toEqual(['System', 'Investigations', 'Hunting']);
+    expect(screen.getByRole('button', { name: /^System/ }).textContent).toContain('1');
+    expect(screen.getByRole('button', { name: /^Investigations/ }).textContent).toContain('1');
+
+    fireEvent.click(screen.getByRole('button', { name: /^Hunting/ }));
+    await waitFor(() => expect(visibleTitles()).toEqual([expect.stringContaining('Lead 15 formed')]));
+    fireEvent.click(screen.getByRole('button', { name: /^Investigations/ }));
+    await waitFor(() => expect(visibleTitles()).toEqual([expect.stringContaining('Triage failed')]));
   });
 });

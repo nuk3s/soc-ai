@@ -19,6 +19,8 @@ import type { Dossier, DossierField, DossierFieldName } from '../lib/types';
 vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
   getDossier: vi.fn(),
+  resolveMachine: vi.fn(),
+  getMachine: vi.fn(),
   getHostActivity: vi.fn(),
   getMe: vi.fn(),
   // The role datalist's vocabulary GET; resolves empty here (not under test),
@@ -31,15 +33,25 @@ vi.mock('../lib/api', async (importOriginal) => ({
 }));
 
 import {
+  ApiError,
   clearHostChat,
   getDossier,
   getHostActivity,
   getHostChat,
   getMe,
   postHostChat,
+  resolveMachine,
   startHuntConsole,
 } from '../lib/api';
 import { HostDetail } from './HostDetail';
+
+// The page resolves an address to its machine first. These tests are about
+// the dock on the page of one address, so no machine holds it.
+beforeEach(() => {
+  vi.mocked(resolveMachine)
+    .mockReset()
+    .mockRejectedValue(new ApiError('No machine holds this value.', 404, 'no_host'));
+});
 
 // TEST-NET-1 (RFC 5737) — never a lab address; the leak gate reads tests too.
 const IP = '192.0.2.10';
@@ -148,7 +160,7 @@ const mount = (url = `/hosts/${IP}`) =>
   render(
     <MemoryRouter initialEntries={[url]}>
       <Routes>
-        <Route path="/hosts/:ip" element={<HostDetail />} />
+        <Route path="/hosts/:key" element={<HostDetail />} />
         <Route path="*" element={null} />
       </Routes>
       <Here />
@@ -230,10 +242,9 @@ describe('HostChatDock — mounting on the host page', () => {
     expect(scope.length).toBeGreaterThan(0);
   });
 
-  it('mounts no dock when the segment is not a host address', async () => {
-    vi.mocked(getDossier).mockRejectedValue(new Error('the dossier is keyed on IP addresses'));
+  it('mounts no dock when the segment names no machine', async () => {
     mount('/hosts/not-a-host');
-    await screen.findByText(/not an IP address/i);
+    await screen.findByTestId('host-unknown-name');
     expect(screen.queryByRole('button', { name: /chat/i })).toBeNull();
   });
 });

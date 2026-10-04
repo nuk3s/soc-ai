@@ -24,12 +24,25 @@ describe('Notifications — Clear all', () => {
   beforeEach(() => localStorage.clear());
   afterEach(() => localStorage.clear());
 
-  it('dismisses every visible notification in one click and shows the empty state', async () => {
+  // A dismissal has no undo and no dismissed view, so Clear all asks once (D8).
+  it('asks once, and Cancel keeps every row', async () => {
+    renderNotifications();
+    await screen.findByText('Investigation A running');
+    fireEvent.click(screen.getByRole('button', { name: /clear all/i }));
+    expect(screen.getByText(/Dismiss 2 notifications\? You cannot undo this\./)).toBeTruthy();
+    expect(localStorage.getItem('soc-ai:dismissed-notifications')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(screen.getByText('Investigation A running')).toBeTruthy();
+    expect(screen.getByRole('button', { name: /clear all/i })).toBeTruthy();
+  });
+
+  it('dismisses every visible notification after the confirm and shows the empty state', async () => {
     renderNotifications();
     await screen.findByText('Investigation A running');
     expect(screen.queryByText('Investigation B needs info')).toBeTruthy();
 
     fireEvent.click(screen.getByRole('button', { name: /clear all/i }));
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss all' }));
 
     await waitFor(() => {
       expect(screen.queryByText('Investigation A running')).toBeNull();
@@ -42,6 +55,7 @@ describe('Notifications — Clear all', () => {
     renderNotifications();
     await screen.findByText('Investigation A running');
     fireEvent.click(screen.getByRole('button', { name: /clear all/i }));
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss all' }));
     await waitFor(() => expect(screen.queryByRole('button', { name: /clear all/i })).toBeNull());
   });
 });

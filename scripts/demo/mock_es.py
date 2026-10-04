@@ -17,6 +17,9 @@ demo container (docker/demo-entrypoint.sh). Serves, on ONE local port
                                 * flat per-group event listings (row expansion)
                                 * the ``ids`` acked-state lookup used by the
                                   investigation detail page
+                                * the host page's conversation and account
+                                  passes for the hosts in demo_dataset.py's
+                                  HOST_PEERS / HOST_USERS (dataset mode only)
                               Source: demo_dataset.py's TEST-NET groups by
                               default, or — with ``--fixtures FILE`` — the
                               sanitized ``alerts[]`` documents of a packaged
@@ -89,6 +92,7 @@ import threading
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -175,6 +179,103 @@ def _bucket(g: dict) -> dict:
     }
 
 
+# Share of a day's connections per UTC hour: an office that browses 08-18.
+_HOUR_WEIGHT = [2, 1, 1, 1, 1, 2, 4, 7, 11, 12, 12, 11, 9, 11, 12, 12, 11, 9, 6, 4, 3, 3, 2, 2]
+
+
+def _spread(total: int, weights: list[int]) -> list[int]:
+    """Split ``total`` over ``weights``; the counts sum to ``total`` exactly."""
+    whole = sum(weights) or 1
+    counts = [total * w // whole for w in weights]
+    counts[-1] += total - sum(counts)
+    return counts
+
+
+def _host_conn_response(aggs: dict[str, Any]) -> dict[str, Any] | None:
+    """The host page's conversation pass: peers both ways, the dataset, the volume.
+
+    Answers only a host listed in ``demo_dataset.HOST_PEERS``. ``None`` for any
+    other host, so it falls through to the empty answer it always had.
+    """
+    out_term = ((aggs.get("out") or {}).get("filter") or {}).get("term") or {}
+    peers = dd.HOST_PEERS.get(str(out_term.get("source.ip") or ""))
+    if peers is None:
+        return None
+    interval = ((aggs.get("volume") or {}).get("date_histogram") or {}).get("calendar_interval")
+    daily = interval in ("day", "1d")
+    scale = 6 if daily else 1  # a week holds five working days and a quiet weekend
+
+    def side(direction: str) -> dict[str, Any]:
+        rows = sorted(
+            ((ip, port, n * scale) for ip, d, port, n in peers if d == direction),
+            key=lambda row: -row[2],
+        )
+        return {
+            "doc_count": sum(n for _, _, n in rows),
+            "peers": {
+                "buckets": [
+                    {
+                        "key": ip,
+                        "doc_count": n,
+                        "ports": {"buckets": [{"key": port, "doc_count": n}]},
+                    }
+                    for ip, port, n in rows
+                ]
+            },
+        }
+
+    total = sum(n for _, _, _, n in peers) * scale
+    now = datetime.now(UTC)
+    if daily:
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=6)
+        stamps = [start + timedelta(days=i) for i in range(7)]
+        weights = [10 if ts.weekday() < 5 else 3 for ts in stamps]
+    else:
+        start = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=23)
+        stamps = [start + timedelta(hours=i) for i in range(24)]
+        weights = [_HOUR_WEIGHT[ts.hour] for ts in stamps]
+    volume = [
+        {"key": int(ts.timestamp() * 1000), "key_as_string": _iso(ts), "doc_count": n}
+        for ts, n in zip(stamps, _spread(total, weights), strict=True)
+    ]
+    return {
+        "took": 4,
+        "timed_out": False,
+        "hits": {"total": {"value": total, "relation": "eq"}, "hits": []},
+        "aggregations": {
+            "by_dataset": {"buckets": [{"key": "zeek.conn", "doc_count": total}]},
+            "by_stream_dataset": {"buckets": []},
+            "out": side("out"),
+            "in": side("in"),
+            "volume": {"buckets": volume},
+        },
+    }
+
+
+def _host_users_response(aggs: dict[str, Any], query: dict[str, Any]) -> dict[str, Any] | None:
+    """The host page's auth pass: the accounts and the one agent that wrote them."""
+    held = dd.HOST_USERS.get(str(_terms_in(query).get("host.ip") or ""))
+    if held is None or "users" not in aggs or "agents" not in aggs:
+        return None
+    agent, users = held
+    total = sum(n for _, n in users)
+    last = _iso(datetime.now(UTC) - timedelta(minutes=17))
+    return {
+        "took": 2,
+        "timed_out": False,
+        "hits": {"total": {"value": total, "relation": "eq"}, "hits": []},
+        "aggregations": {
+            "agents": {"buckets": [{"key": agent, "doc_count": total}]},
+            "users": {
+                "buckets": [
+                    {"key": name, "doc_count": n, "last": {"value_as_string": last}}
+                    for name, n in users
+                ]
+            },
+        },
+    }
+
+
 def _terms_in(node) -> dict:
     """Every ``{"term": {field: value}}`` filter found anywhere in a query tree."""
     found: dict = {}
@@ -221,6 +322,16 @@ def _search_response(body: dict) -> dict:
             },
             "aggregations": {"rules": {"buckets": [_bucket(g) for g in groups]}},
         }
+
+    # --- host page: conversations and accounts of a listed host --------------
+    if "out" in aggs and "in" in aggs and "volume" in aggs:
+        conn = _host_conn_response(aggs)
+        if conn is not None:
+            return conn
+    if "users" in aggs:
+        users = _host_users_response(aggs, query)
+        if users is not None:
+            return users
 
     # --- ids lookup (acked-state probe on the investigation detail page) -----
     ids = query.get("ids") or {}

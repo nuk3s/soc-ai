@@ -135,23 +135,41 @@ def test_legacy_summaries_are_reworded_on_the_way_out() -> None:
         " — against a baseline of 15 over 8d"
     )
     assert reword_legacy_summary(hour) == (
-        "active around 23:00 UTC. This host is not normally active then (7 events)."
+        "Active around 23:00 UTC. This host is not normally active then (7 events)."
         " The baseline holds 15 values over 8 days."
     )
     above = "connection_rate in the off cell is far ABOVE its own median (129/h)"
     assert reword_legacy_summary(above) == (
-        "connection rate during off-hours is far above this host's own median (129/h)"
+        "Connection rate during off-hours is far above this host's own median (129/h)"
     )
     cell = "connection rate around off has collapsed against this host's own median (2/h)"
     assert reword_legacy_summary(cell) == (
-        "connection rate during off-hours has collapsed against this host's own median (2/h)"
+        "Connection rate during off-hours has collapsed against this host's own median (2/h)"
     )
     assert reword_legacy_summary("novel peers_out: 10.0.0.5 x3") == (
-        "new outbound peer for this host: 10.0.0.5. The sweep saw it 3 times"
+        "New outbound peer for this host: 10.0.0.5. The sweep saw it 3 times"
     )
     assert reword_legacy_summary(None) is None
-    today = "new DNS name for this host: a.example. The sweep saw it once"
+    today = "New DNS name for this host: a.example. The sweep saw it once"
     assert reword_legacy_summary(today) == today
+    # A row stored before the capital: the sentence on the card starts with one.
+    assert reword_legacy_summary(today[0].lower() + today[1:]) == today
+
+
+def test_a_summary_reads_as_a_sentence_and_keeps_entity_names() -> None:
+    """The lead page read "active around 22:00 UTC" and "(1 documents)"."""
+    from soc_ai.hunting.wording import reword_legacy_summary
+
+    assert reword_legacy_summary("Beacon: host-a.example.test (1 documents)") == (
+        "Beacon: host-a.example.test (1 document)"
+    )
+    # An entity name at the start stays as the grid holds it.
+    assert reword_legacy_summary("host-a.example.test (3 documents)") == (
+        "host-a.example.test (3 documents)"
+    )
+    assert reword_legacy_summary("new.example.test (2 documents)") == (
+        "new.example.test (2 documents)"
+    )
 
 
 def test_the_colon_free_legacy_headline_reads_as_a_sentence() -> None:
@@ -170,7 +188,7 @@ def test_the_colon_free_legacy_headline_reads_as_a_sentence() -> None:
         "The baseline holds 3 values over 13 days."
     )
     assert reword_legacy_summary("novel served_ports 445 x9") == (
-        "new served port for this host: 445. The sweep saw it 9 times"
+        "New served port for this host: 445. The sweep saw it 9 times"
     )
 
 
@@ -182,7 +200,7 @@ def test_the_legacy_seen_and_baseline_tails_become_sentences() -> None:
         " — against a baseline of 15 over 8d"
     )
     assert reword_legacy_summary(row) == (
-        "new outbound peer for this host: 10.0.0.5. The sweep saw it 3 times. "
+        "New outbound peer for this host: 10.0.0.5. The sweep saw it 3 times. "
         "The baseline holds 15 values over 8 days."
     )
     assert reword_legacy_summary("a thing (seen once) — against a baseline of 1 over 1d") == (

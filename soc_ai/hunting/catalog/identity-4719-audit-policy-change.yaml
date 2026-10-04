@@ -1,0 +1,72 @@
+id: identity-4719-audit-policy-change
+title: An account changes the audit policy on a domain controller
+description: >
+  A 4719 event reports that the system audit policy changed. The event names
+  the account, the subcategory and the change, for example "Success removed".
+  A change to the audit policy changes the evidence every other analytic reads.
+  An administrator makes this change rarely and on purpose. An intruder who
+  intends to stay makes the same change early.
+
+  Group policy refresh also writes 4719. It writes the event under the computer
+  account of the domain controller. The analytic excludes subject accounts that
+  end in a dollar sign. That exclusion is the whole discriminator.
+
+  This analytic replaces the prior prior-audit-policy-changed-on-dc. That prior
+  read new logon accounts on the domain controller. It never read event 4719.
+  On the development range the attack chain of 2026-09-04 wrote two 4719
+  events under a user account. The prior saw neither.
+
+  The analytic applies to the domain_controller role only. The finding quotes
+  the subject account, the subcategory and the change.
+
+level: critical
+# The benign population is "planned change", and that is not a property of the
+# event. Frequency says nothing about whether one change was authorised.
+no_benign_baseline: true
+scope_field: host.name
+scope_kind: host
+roles:
+  - domain_controller
+
+# A Windows host writes Security events all day. Silence in the window means
+# the Security log does not ship.
+precondition:
+  all:
+    - field: winlog.channel
+      value: Security
+
+detection:
+  all:
+    # The channel pin keeps the winlog copy of the event. An endpoint copy of
+    # a Windows event carries the code and no winlog.event_data tree.
+    - field: winlog.channel
+      value: Security
+    - field: event.code
+      value: "4719"
+  none:
+    - field: winlog.event_data.SubjectUserName
+      op: wildcard
+      value: "*$"
+
+details:
+  - field: winlog.event_data.SubjectUserName
+    label: account
+  - field: winlog.event_data.SubCategory
+    label: subcategory
+  - field: winlog.event_data.AuditPolicyChangesDescription
+    label: change
+
+attack:
+  - T1562.002
+
+false_positives:
+  - An administrator runs planned hardening work or a group policy rollout
+    under a named account. The telemetry does not show the authorisation. The
+    analyst confirms the change against the change record.
+  - An intruder who runs as SYSTEM on the domain controller writes the change
+    under the computer account. The exclusion removes that change. This is a
+    known gap of the analytic.
+
+references:
+  - https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4719
+  - https://attack.mitre.org/techniques/T1562/002/

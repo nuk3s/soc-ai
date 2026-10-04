@@ -46,6 +46,15 @@ class OqlValidationError(SocAiError):
         self.fragment = fragment
 
 
+class TimeBoundError(OqlValidationError):
+    """An absolute time bound (``from`` or ``to``) is not an ISO 8601 timestamp.
+
+    A subclass so every caller that already turns an OQL refusal into a 400
+    keeps doing so; the API answers it with reason ``bad_time`` because the
+    query itself was fine.
+    """
+
+
 class ModelError(SocAiError):
     """The LiteLLM gateway / underlying model returned an error or malformed output."""
 

@@ -83,7 +83,10 @@
     "tunnel",
     "websocket",
     "weird",
-    "wireguard"
+    "wireguard",
+    "osquery",
+    "osquery_meta",
+    "action_data"
   ],
   "_comment_ecs_zeek": "Modern SO / Elastic-Agent 9.x populates ECS field names for Zeek data (dns.query.name, client.bytes, hash.ja3s, http.virtual_host, ...) while the zeek.* fields are mapped-but-empty. These ECS names are already covered by the prefixes above (dns/client/server/network/connection/hash/ssl/http/user_agent/file) and so already pass is_allowed(); they are listed explicitly here too as the documented, intended OQL surface for the agent so the field-resolution layer in so_client/fields.py and the OQL allowlist agree on the same canonical names. The zeek.* prefix stays valid for older SO and synth fixtures.",
   "exact_fields": [
@@ -133,7 +136,18 @@
     "winlog.event_data.LmPackageName",
     "winlog.logon.type",
     "winlog.event_data.WorkstationName",
-    "winlog.event_data.IpAddress"
+    "winlog.event_data.IpAddress",
+    "winlog.event_data.MemberName",
+    "winlog.event_data.MemberSid",
+    "winlog.event_data.SubCategory",
+    "winlog.event_data.AuditPolicyChangesDescription",
+    "winlog.event_data.threat_name",
+    "winlog.event_data.Severity Name",
+    "winlog.event_data.Action Name",
+    "winlog.event_data.Path",
+    "action_id",
+    "pack_id",
+    "response_id"
   ],
   "forbidden_fields": [
     "_index",
@@ -144,5 +158,6 @@
     "script_fields"
   ],
   "_comment_winlog": "Windows Security channel leaves are enumerated INDIVIDUALLY in exact_fields, never as a `winlog` prefix. A prefix would admit several hundred leaves in one line, including many carrying identifiers no Oracle redaction route classifies \u2014 the same open-set problem the allow-known-safe backstop was built to close, reintroduced on the query side. Each field here is one an identity detection turns on and was verified present on real 4662/4768/4769 documents. Adding another means classifying it for egress in soc_ai/oracle/redact.py too.",
-  "_comment_winlog_auth_package": "AuthenticationPackageName / LogonProcessName / LmPackageName and the readable `winlog.logon.type` alias are the fields that separate Kerberos from NTLM, which is the first question Windows triage asks and the one the range's operating documentation names for telling management traffic from real users. Counted on the range over fourteen days, all on system.security: AuthenticationPackageName Negotiate 20614 / Kerberos 19984 / NTLM 526; LmPackageName NTLM V2 501 / NTLM V1 24; winlog.logon.type Network 37452 / Service 2271 / Interactive 1320. Their values are public Windows constants, so they are allowlisted BY PATH in oracle/backstop.py rather than tokenised \u2014 word-shaped constants would otherwise reach the Oracle masked. One data-shape trap on LogonProcessName: Windows right-pads it to eight characters, so an exact term for `NtLmSsp` matched 2 documents on the range where `NtLmSsp ` matched 555. Query it with the anchored wildcard `NtLmSsp*`; the other three fields are unpadded."
+  "_comment_winlog_auth_package": "AuthenticationPackageName / LogonProcessName / LmPackageName and the readable `winlog.logon.type` alias are the fields that separate Kerberos from NTLM, which is the first question Windows triage asks and the one the range's operating documentation names for telling management traffic from real users. Counted on the range over fourteen days, all on system.security: AuthenticationPackageName Negotiate 20614 / Kerberos 19984 / NTLM 526; LmPackageName NTLM V2 501 / NTLM V1 24; winlog.logon.type Network 37452 / Service 2271 / Interactive 1320. Their values are public Windows constants, so they are allowlisted BY PATH in oracle/backstop.py rather than tokenised \u2014 word-shaped constants would otherwise reach the Oracle masked. One data-shape trap on LogonProcessName: Windows right-pads it to eight characters, so an exact term for `NtLmSsp` matched 2 documents on the range where `NtLmSsp ` matched 555. Query it with the anchored wildcard `NtLmSsp*`; the other three fields are unpadded.",
+  "_comment_osquery": "Elastic Agent osquery results carry the query columns under osquery, the run metadata under osquery_meta and action_data, and the query identity in action_id, pack_id and response_id. Their dataset is osquery_manager.result. A Linux agent with no Elastic Defend ships its process, login and cron facts only here. The allow-known-safe backstop masks their values at the Oracle boundary, because no field here is on its known-safe list."
 }

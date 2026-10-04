@@ -104,14 +104,24 @@ _INTERNAL_HOST_PLAYBOOK = """
 ## Investigating internal hosts and pulling more evidence
 
 **Characterise a host by IP.** OQL works across ALL datasets. It works on RFC1918 \
-addresses too. Run `t_query_events_oql` with `source.ip:<IP> OR destination.ip:<IP>` \
-to find every event that touches that host. Narrow with `AND event.dataset:zeek.conn` \
-to focus on one log type. The other log types are `zeek.dns`, `zeek.http`, `zeek.ssl` \
-and `suricata`.
+addresses too. Run `t_query_events_oql` with \
+`source.ip:<IP> OR destination.ip:<IP> OR host.ip:<IP>` to find every event that \
+touches that host. `host.ip` finds the documents that the host's own agent ships: \
+host logs, osquery results and endpoint events. Narrow with \
+`AND event.dataset:zeek.conn` to focus on one log type. The other log types are \
+`zeek.dns`, `zeek.http`, `zeek.ssl` and `suricata`.
 
-**Get the hostname.** `host.name` is present on most zeek.conn and endpoint events. A \
-targeted query returns it. For example: \
-`event.dataset:zeek.conn AND (source.ip:<IP> OR destination.ip:<IP>)`.
+**Read the host's coverage.** Call `t_host_dossier` for the address. Its `coverage` \
+names the planes the host ships: host logs, process events, endpoint network events, \
+Windows security events and osquery. You can also run \
+`host.name:<name> | groupby event.dataset`. A dataset that the host does not ship is \
+a gap in that plane only. Write "this host ships no process events". Do not write \
+"this host has no host telemetry" while the host ships any plane.
+
+**Get the hostname.** `host.name` names the host on the documents its own agent \
+ships. Run `host.ip:<IP> | groupby host.name` to read it. On a network sensor \
+document, `host.name` names the sensor. A DNS answer or a DHCP lease also names the \
+host. For example: `event.dataset:zeek.dhcp AND (source.ip:<IP> OR destination.ip:<IP>)`.
 
 **Infer a host role from DNS.** Query \
 `event.dataset:zeek.dns AND (source.ip:<IP> OR destination.ip:<IP>)` to see which \

@@ -94,8 +94,8 @@ def assess(
             False,
             "none",
             (
-                f"fired {alert_count}×, {triaged} triaged — "
-                f"{tp} true positive: keep (caught real signal)"
+                f"fired {alert_count}×, {triaged} triaged; "
+                f"{tp} true positive: keep, it caught real signal"
             ),
         )
 
@@ -112,8 +112,8 @@ def assess(
                 True,
                 "monitor",
                 (
-                    f"fired {alert_count}× but as a single burst rather than a recurring "
-                    f"rate, so volume says nothing about noise; {override_fp} analyst "
+                    f"fired {alert_count}× in a single burst with no recurring rate, "
+                    f"so volume says nothing about noise; {override_fp} analyst "
                     "FP-overrides on this rule, so watch it"
                 ),
             )
@@ -121,9 +121,9 @@ def assess(
             False,
             "none",
             (
-                f"fired {alert_count}× but as a single burst rather than a recurring "
-                "rate — one episode is not a tuning problem, and the burst itself may be "
-                "the event worth investigating"
+                f"fired {alert_count}× in a single burst with no recurring rate; "
+                "one episode is no tuning problem, and the burst itself can be "
+                "the event to investigate"
             ),
         )
 
@@ -136,15 +136,15 @@ def assess(
                 True,
                 "monitor",
                 (
-                    f"fired {alert_count}× (below the {MIN_ALERTS} volume floor) but "
-                    f"{override_fp} analyst FP-overrides — the analyst keeps correcting "
-                    "this rule to false positive; watch it"
+                    f"fired {alert_count}×, below the {MIN_ALERTS} volume floor, but "
+                    f"{override_fp} analyst FP-overrides; the analyst keeps correcting "
+                    "this rule to false positive, so watch it"
                 ),
             )
         return (
             False,
             "none",
-            f"fired {alert_count}× — below the noisy-rule volume floor ({MIN_ALERTS})",
+            f"fired {alert_count}×, below the noisy-rule volume floor of {MIN_ALERTS}",
         )
 
     # High volume but not yet enough AI triage history to trust the trend. Normally
@@ -159,8 +159,8 @@ def assess(
                 recommendation,
                 (
                     f"fired {alert_count}×, {triaged} triaged "
-                    f"({fp} FP / {nmi} NMI, 0 TP) — thin AI trend but "
-                    f"{override_fp} analyst FP-overrides (human corrected it to benign)"
+                    f"({fp} FP / {nmi} NMI, 0 TP); thin AI trend, but "
+                    f"{override_fp} analyst FP-overrides corrected it to benign"
                 ),
             )
         return (
@@ -168,8 +168,8 @@ def assess(
             "monitor",
             (
                 f"fired {alert_count}×, {triaged} triaged "
-                f"({fp} FP / {nmi} NMI, 0 TP) — high volume but thin triage history; "
-                "watch it"
+                f"({fp} FP / {nmi} NMI, 0 TP); high volume but thin triage history, "
+                "so watch it"
             ),
         )
 
@@ -180,7 +180,7 @@ def assess(
             True,
             "mute",
             (
-                f"fired {alert_count}×, {triaged} triaged — "
+                f"fired {alert_count}×, {triaged} triaged; "
                 f"all false positive ({fp} FP / {nmi} NMI), 0 true positive"
                 f"{override_note}"
             ),
@@ -194,18 +194,18 @@ def assess(
             True,
             "mute",
             (
-                f"fired {alert_count}×, {triaged} triaged — "
+                f"fired {alert_count}×, {triaged} triaged; "
                 f"all false positive ({fp} FP / {nmi} NMI), 0 true positive, "
-                f"and {override_fp} analyst FP-overrides (human corrected it to benign)"
+                f"and {override_fp} analyst FP-overrides corrected it to benign"
             ),
         )
     return (
         True,
         "monitor",
         (
-            f"fired {alert_count}×, {triaged} triaged — "
+            f"fired {alert_count}×, {triaged} triaged; "
             f"all false positive ({fp} FP / {nmi} NMI), 0 true positive, "
-            f"but under the high-volume bar ({MUTE_MIN_ALERTS})"
+            f"but under the high-volume bar of {MUTE_MIN_ALERTS}"
         ),
     )
 

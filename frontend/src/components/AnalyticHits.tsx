@@ -3,12 +3,15 @@ import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 
 import {
   getAnalyticHits,
+  getHuntCatalog,
   markShadowHitRead,
   setAnalyticStatus,
   startHuntConsole,
   type AnalyticHit,
   type AnalyticHitFilter,
+  type HuntCatalog,
 } from '../lib/api';
+import { loopRuns } from '../lib/analyticRuns';
 import { entityPath as pathOfEntity } from '../lib/entityPath';
 import { plural } from '../lib/plural';
 import { absTime, ago } from '../lib/timeRange';
@@ -69,6 +72,34 @@ const FILTERS: { id: AnalyticHitFilter; label: string; title: string }[] = [
   { id: 'live', label: 'Live', title: HIT_FILTER_LIVE },
   { id: 'shadow', label: 'Shadow', title: HIT_FILTER_SHADOW },
 ];
+
+/** What an empty hit list means. "No analytic matched a document the sweeps
+ *  read" was a false all-clear on a grid where no sweep had run. */
+export function emptyHitsText(catalog: HuntCatalog | null | undefined): string {
+  const head = 'No analytic hit in the last 7 days.';
+  if (!catalog) return `${head} soc-ai cannot tell if the sweeps ran.`;
+  const match = loopRuns(catalog, 'match');
+  const profile = loopRuns(catalog, 'profile');
+  if (match && profile !== false) return `${head} No analytic matched a document the sweeps read.`;
+  const parts = [head];
+  if (!match) {
+    parts.push(
+      catalog.sweeps_enabled
+        ? 'No analytic sweep has run yet.'
+        : 'Sweeps are off. The match analytics do not run.',
+    );
+  }
+  if (profile === false) {
+    parts.push(
+      catalog.prior_sweeps_enabled === false
+        ? 'The profile sweep is off. The profile analytics do not run.'
+        : 'The profile sweep has not run yet.',
+    );
+  }
+  if (match) parts.push('The match analytics found nothing.');
+  if (profile) parts.push('The profile analytics found nothing.');
+  return parts.join(' ');
+}
 
 const isFilter = (v: unknown): v is AnalyticHitFilter => FILTERS.some((f) => f.id === v);
 
@@ -630,6 +661,9 @@ export function AnalyticHits({
     refetchInterval: 60_000,
   });
   const rows = hits.data?.hits ?? [];
+  // Whether the sweeps ran decides what an empty list means. Read on the
+  // catalog's own cadence.
+  const catalog = useAsync(getHuntCatalog, [], { refetchInterval: 300_000 });
 
   const wasRead = (hit: AnalyticHit) => hit.read === true || readIds.has(hit.id);
 
@@ -743,7 +777,7 @@ export function AnalyticHits({
         // Absence is stated, with the reason it is not an all-clear.
         <div className="px-[15px] py-2.5 text-[12.5px] text-dim">
           {filter === 'all'
-            ? 'No analytic hit in the last 7 days. No analytic matched a document the sweeps read.'
+            ? emptyHitsText(catalog.data)
             : 'No hit under this filter. Another filter may hold one.'}
         </div>
       ) : (

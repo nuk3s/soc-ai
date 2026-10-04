@@ -60,7 +60,7 @@ async def check_for_update(settings: Any) -> dict[str, Any]:
             "current_version": current,
             "latest_version": current,
             "update_available": False,
-            "detail": "demo mode — the live deployment checks GitHub for releases",
+            "detail": "This is the demo. A live deployment checks GitHub for releases.",
         }
     try:
         async with online_client(settings) as client:

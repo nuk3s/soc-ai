@@ -1090,13 +1090,15 @@ def test_the_shipped_catalog_loads() -> None:
         "identity-4768-preauth-disabled",
         "identity-4769-rc4-service-ticket",
         "decoy-opencanary-interaction",
+        # The three role-scoped analytics that replaced the priors which read
+        # the wrong dimension.
+        "identity-defender-detection",
+        "identity-4719-audit-policy-change",
+        "identity-privileged-group-change",
     }
     assert {k for k, v in catalog.items() if v.evaluator == "profile"} == {
-        "prior-audit-policy-changed-on-dc",
         "prior-dc-originates-rdp-or-smb-to-workstation",
-        "prior-defender-adjudication-on-server",
         "prior-hypervisor-novel-served-port",
-        "prior-privileged-group-membership-changed",
         "prior-server-internet-nonweb-novel-port",
         "prior-workstation-account-first-logon-to-dc",
         "prior-workstation-remote-execution-tooling",
@@ -1488,18 +1490,21 @@ def test_exactly_the_specs_whose_exceptions_are_identities_declare_no_baseline()
     flagged = sorted(
         s.id for s in catalog.values() if s.no_benign_baseline and s.evaluator == "match"
     )
-    assert flagged == ["identity-4662-dcsync-nonmachine", "identity-4768-preauth-disabled"]
+    assert flagged == [
+        "identity-4662-dcsync-nonmachine",
+        "identity-4719-audit-policy-change",
+        "identity-4768-preauth-disabled",
+        "identity-defender-detection",
+        "identity-privileged-group-change",
+    ]
 
-    # The priors make the same declaration for the same reason, and are pinned
-    # separately so adding one to either list stays a deliberate decision.
+    # The priors made the same declaration for the same reason. The three that
+    # did became match analytics, so no shipped prior declares it now, and
+    # adding one stays a deliberate decision.
     flagged_priors = sorted(
         s.id for s in catalog.values() if s.no_benign_baseline and s.evaluator == "profile"
     )
-    assert flagged_priors == [
-        "prior-audit-policy-changed-on-dc",
-        "prior-defender-adjudication-on-server",
-        "prior-privileged-group-membership-changed",
-    ]
+    assert flagged_priors == []
 
 
 # ---------------------------------------------------------------------------

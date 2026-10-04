@@ -260,19 +260,19 @@ def _result_hint(result: Any) -> str:
         if "observations" in result and result.get("ip"):
             ip = result["ip"]
             if not result.get("observations"):
-                return f" — {ip}: no observations"
+                return f" · {ip}: no observations"
             n = result.get("event_count")
-            return f" — {ip}: {n} events" if isinstance(n, int) else f" — {ip}"
+            return f" · {ip}: {n} events" if isinstance(n, int) else f" · {ip}"
         for key, unit in _COUNT_LABELS.items():
             v = result.get(key)
             if isinstance(v, int) and not isinstance(v, bool):
-                return f" — {v} {unit}"
+                return f" · {v} {unit}"
         for key in ("classification", "sni", "summary", "verdict", "status", "note"):
             v = result.get(key)
             if isinstance(v, str) and v:
-                return f" — {_phrase(v, 50)}"
+                return f" · {_phrase(v, 50)}"
         if result.get("error"):
-            return f" — failed: {_phrase(result['error'], 50)}"
+            return f" · failed: {_phrase(result['error'], 50)}"
         # Unknown dict: surface up to two scalar fields, verbatim-but-clipped.
         bits: list[str] = []
         for k, v in result.items():
@@ -284,11 +284,15 @@ def _result_hint(result: Any) -> str:
                 bits.append(f"{_humanize(k)} {_phrase(v, 40)}")
             if len(bits) == 2:
                 break
-        return f" — {', '.join(bits)}" if bits else ""
+        return f" · {', '.join(bits)}" if bits else ""
     if isinstance(result, list):
-        return " — no results" if not result else f" — {len(result)} result(s)"
+        return (
+            " · no results"
+            if not result
+            else f" · {len(result)} result{'' if len(result) == 1 else 's'}"
+        )
     if isinstance(result, str) and result:
-        return f" — {_phrase(result, 50)}"
+        return f" · {_phrase(result, 50)}"
     return ""
 
 
@@ -465,7 +469,7 @@ def _t_citation_validation(p: dict[str, Any]) -> str:
     if p.get("vacuous") or p.get("total") == 0:
         return "No evidence citations were offered"
     valid = (p.get("counts") or {}).get("valid")
-    return "Validated evidence citations" + (f" — {valid} valid" if valid is not None else "")
+    return "Validated evidence citations" + (f": {valid} valid" if valid is not None else "")
 
 
 def _t_template_grounds_adopted(p: dict[str, Any]) -> str:

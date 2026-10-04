@@ -103,7 +103,7 @@ def test_build_filter_excludes_a_plant_nested_under_the_sigma_envelope(
 
 
 def test_build_filter_rejects_pipes(settings_kratos: Settings) -> None:
-    with pytest.raises(OqlValidationError, match="pipes"):
+    with pytest.raises(OqlValidationError, match="pipe stages"):
         aq.build_filter(settings_kratos, time_range="24h", severity=None, oql="foo | groupby bar")
 
 

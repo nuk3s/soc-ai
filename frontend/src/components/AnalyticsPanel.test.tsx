@@ -117,12 +117,97 @@ beforeEach(() => {
     counts: { live: 1, shadow: 1, candidate: 1 },
   });
   vi.mocked(getAnalytic).mockReset().mockResolvedValue(DETAIL);
-  vi.mocked(getHuntCatalog).mockReset().mockResolvedValue({
-    specs: [],
-    sweeps_enabled: true,
-    sweep_interval_minutes: 60,
-    sweep_window_minutes: 61,
-    last_sweep_at: null,
+  vi.mocked(getHuntCatalog).mockReset().mockResolvedValue(RAN);
+});
+
+/** Both loops on, both ran ten minutes ago. */
+const RAN = {
+  specs: [],
+  sweeps_enabled: true,
+  sweep_interval_minutes: 60,
+  sweep_window_minutes: 61,
+  last_sweep_at: new Date(Date.now() - 600_000).toISOString(),
+  prior_sweeps_enabled: true,
+  last_prior_run_at: new Date(Date.now() - 600_000).toISOString(),
+};
+
+// F2. Production had sweeps_enabled false and last_sweep_at null. The tab
+// showed sixteen green "live" dots, and the only sign was "last sweep never".
+describe('AnalyticsPanel when the sweeps do not run', () => {
+  it('says sweeps are off and no analytic has run, with the setting', async () => {
+    vi.mocked(getHuntCatalog).mockResolvedValue({
+      ...RAN,
+      sweeps_enabled: false,
+      last_sweep_at: null,
+      last_prior_run_at: null,
+    });
+    mount();
+    const notice = await screen.findByTestId('analytics-sweeps-notice');
+    expect(notice.textContent).toContain('Sweeps are off. No analytic has run.');
+    expect(within(notice).getByRole('link').getAttribute('href')).toBe(
+      '/config#triage-automation',
+    );
+    const live = await screen.findByTestId(`analytic-${SHIPPED_LIVE.id}`);
+    expect(within(live).getByText('live, not running')).toBeTruthy();
+    expect(within(live).queryByText('live')).toBeNull();
+  });
+
+  it('keeps a profile analytic live when only the profile sweep runs', async () => {
+    vi.mocked(getAnalytics).mockResolvedValue({
+      analytics: [SHIPPED_LIVE, { ...SHIPPED_LIVE, id: 'prior-x', evaluator: 'profile' }],
+      counts: { live: 2 },
+    });
+    vi.mocked(getHuntCatalog).mockResolvedValue({
+      ...RAN,
+      sweeps_enabled: false,
+      last_sweep_at: null,
+    });
+    mount();
+    const notice = await screen.findByTestId('analytics-sweeps-notice');
+    expect(notice.textContent).toContain('Sweeps are off. No match analytic has run.');
+    const match = await screen.findByTestId(`analytic-${SHIPPED_LIVE.id}`);
+    expect(within(match).getByText('live, not running')).toBeTruthy();
+    const profile = screen.getByTestId('analytic-prior-x');
+    expect(within(profile).getByText('live')).toBeTruthy();
+  });
+
+  it('shows no notice when both sweeps run', async () => {
+    mount();
+    await screen.findByTestId(`analytic-${SHIPPED_LIVE.id}`);
+    expect(screen.queryByTestId('analytics-sweeps-notice')).toBeNull();
+  });
+
+  it('says "1 lead", never "1 leads"', async () => {
+    mount();
+    const live = await screen.findByTestId(`analytic-${SHIPPED_LIVE.id}`);
+    expect(live.textContent).toContain('1 lead ·');
+    expect(live.textContent).not.toContain('1 leads');
+  });
+
+  it('says a coverage at the recent cap is capped', async () => {
+    vi.mocked(getHuntCatalog).mockResolvedValue({
+      ...RAN,
+      specs: [
+        {
+          id: SHIPPED_LIVE.id,
+          coverage: {
+            last_run_at: RAN.last_prior_run_at,
+            measured: 11,
+            learning: 0,
+            blind: 489,
+            not_applicable: 0,
+            fired: 0,
+            shadow: false,
+            recent_cap: 500,
+            capped: true,
+          },
+          blind: false,
+        },
+      ],
+    } as never);
+    mount();
+    const row = await screen.findByTestId(`analytic-${SHIPPED_LIVE.id}`);
+    expect(within(row).getByText('11 measured · 489 blind · capped at 500')).toBeTruthy();
   });
 });
 
@@ -156,6 +241,20 @@ describe('AnalyticsPanel', () => {
     );
     const actions = screen.getByText('Actions');
     expect(actions.className).toContain('lg:w-[210px]');
+  });
+
+  it('marks a candidate that is specific to one case, and no other row', async () => {
+    const pin = 'The clause on host.name pins the analytic to one host. Describe the behaviour.';
+    vi.mocked(getAnalytics).mockResolvedValue({
+      analytics: [SHIPPED_LIVE, LOCAL_SHADOW, { ...LOCAL_CANDIDATE, pinned: [pin] }],
+      counts: { live: 1, shadow: 1, candidate: 1 },
+    });
+    mount();
+    const marker = await screen.findByTestId(`analytic-specific-${LOCAL_CANDIDATE.id}`);
+    expect(marker.textContent).toBe('specific');
+    expect(marker.getAttribute('title')).toContain(pin);
+    expect(screen.queryByTestId(`analytic-specific-${LOCAL_SHADOW.id}`)).toBeNull();
+    expect(screen.queryByTestId(`analytic-specific-${SHIPPED_LIVE.id}`)).toBeNull();
   });
 
   it('gives every row its status word and its tier', async () => {
@@ -258,6 +357,7 @@ describe('AnalyticsPanel sweep', () => {
   });
 
   it('says never when no sweep has run', async () => {
+    vi.mocked(getHuntCatalog).mockResolvedValue({ ...RAN, last_sweep_at: null });
     mount();
     const line = await screen.findByTestId('analytics-sweep');
     expect(line.textContent).toBe('last sweep never · window 61 min');

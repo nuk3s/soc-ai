@@ -47,7 +47,7 @@ from soc_ai.hunting.sweep import SWEEP_ACTOR, catalog_objective
 from soc_ai.store.auth import utcnow
 from soc_ai.store.hunt_spec_sweeps import sweep_row
 from soc_ai.store.hunts import _objective_hash
-from soc_ai.store.models import Hunt, HuntSpecSweep
+from soc_ai.store.models import Hunt, HuntSpecSweep, PriorSpecRun
 
 # Deterministic, ULID-shaped like every other demo row id, so a restart finds
 # it and skips the whole trail.
@@ -274,6 +274,24 @@ async def seed_catalog_trail(
             for row in rows
         ]
         db.add_all(sweeps)
+        # The catalog reads a profile analytic's trail from ``prior_spec_runs``,
+        # so the demo seeds that table too: each prior sweep measured a few
+        # hosts and fired nothing.
+        db.add_all(
+            PriorSpecRun(
+                created_at=row.at,
+                spec_id=row.spec_id,
+                shadow=False,
+                measured=3,
+                learning=0,
+                blind=1,
+                not_applicable=0,
+                fired=0,
+                profiles_built_at=row.at,
+            )
+            for row in rows
+            if catalog[row.spec_id].evaluator == "profile"
+        )
         await db.commit()
     return 1
 

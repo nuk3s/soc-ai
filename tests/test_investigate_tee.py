@@ -474,3 +474,54 @@ async def test_finish_is_idempotent(settings_kratos: Settings) -> None:
     assert got is not None
     inv, _events = got
     assert inv.status == "complete"
+
+
+def test_unknown_alert_id_is_a_404_and_leaves_no_row(
+    tee_client: TestClient, tee_settings: Settings
+) -> None:
+    """RA6: a bogus id stored an error investigation before the 404 arrived.
+
+    The route now asks the grid first. An id the grid does not hold answers 404
+    alert_not_found with a hint, and the store holds no row for it.
+    """
+    with patch(
+        "soc_ai.api.routes.resolve_alert_for_hunt",
+        AsyncMock(return_value=(False, None)),
+    ):
+        resp = tee_client.post("/investigate", json={"alert_id": "es-bogus-id"})
+    assert resp.status_code == 404
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "alert_not_found"
+    assert detail["hint"]
+
+    async def _rows() -> int:
+        from soc_ai.store.models import Investigation
+        from sqlalchemy import func, select
+
+        engine = make_engine(tee_settings)
+        await run_migrations(engine)
+        maker = make_sessionmaker(engine)
+        async with maker() as db:
+            n = await db.scalar(
+                select(func.count())
+                .select_from(Investigation)
+                .where(Investigation.alert_es_id == "es-bogus-id")
+            )
+        await engine.dispose()
+        return int(n or 0)
+
+    assert asyncio.run(_rows()) == 0
+
+
+def test_a_failed_lookup_still_runs_the_investigation(tee_client: TestClient) -> None:
+    """A lookup that fails proves nothing about the id, so the run goes ahead."""
+    with (
+        patch(
+            "soc_ai.api.routes.resolve_alert_for_hunt",
+            AsyncMock(side_effect=TimeoutError()),
+        ),
+        tee_client.stream("POST", "/investigate", json={"alert_id": "es-grid-slow"}) as resp,
+    ):
+        assert resp.status_code == 200
+        body = "".join(chunk for chunk in resp.iter_text())
+    assert "investigation_created" in body

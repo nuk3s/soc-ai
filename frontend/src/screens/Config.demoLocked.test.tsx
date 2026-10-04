@@ -52,7 +52,7 @@ beforeEach(() => vi.clearAllMocks());
 describe('Config under the demo read lock', () => {
   it('renders the refusal as policy, not as an outage', async () => {
     vi.mocked(getConfig).mockRejectedValue(
-      new ApiError('Demo — read-only; admin config is disabled.', 403, 'demo_mode'),
+      new ApiError('The demo is read-only. The admin config is off.', 403, 'demo_mode'),
     );
     mount();
 

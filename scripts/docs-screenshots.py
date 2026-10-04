@@ -38,12 +38,13 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from playwright.sync_api import Page
@@ -141,6 +142,10 @@ def demo_stack(es_port: int, app_port: int) -> Iterator[dict]:
             mock_base = f"http://127.0.0.1:{es_port}"
             env = {
                 "PATH": "/usr/bin:/bin",
+                # The app imports soc_ai from THIS checkout, and so serves this
+                # checkout's frontend/dist. Without it a git worktree runs the
+                # code and the SPA build that the venv's editable install names.
+                "PYTHONPATH": str(REPO),
                 "HOME": str(work),
                 "SOC_AI_DATA_DIR": str(data),
                 "SO_HOST": "https://securityonion.demo.example.com",
@@ -252,11 +257,22 @@ def shoot_dashboard(page: Page, base: str, manifest: dict, out: Path) -> None:
     HONEST, more informative state (see tests/browser/test_first_run_setup_
     health.py) — the shot captures it on purpose rather than racing to catch
     an early placeholder before the checks resolve.
+
+    The same fake SO_HOST makes the header's Security Onion probe fail, so the
+    page also opens a red "Security Onion API is not reachable" banner above
+    the content. The setup-health card already names that failure, so the
+    shot dismisses the banner with its own Dismiss button, as an operator
+    would. The header pill still reads "1 degraded".
     """
     page.goto(f"{base}/app/dashboard", wait_until="networkidle")
     card = page.locator("div.rounded-panel").filter(has_text="Setup health")
     card.first.wait_for(state="visible", timeout=15000)
     card.get_by_text("failing", exact=False).first.wait_for(state="visible", timeout=20000)
+    banner = page.get_by_role("alert").filter(has_text="Security Onion API is not reachable")
+    banner.first.wait_for(state="visible", timeout=15000)
+    banner.first.get_by_role("button", name="Dismiss").click()
+    banner.first.wait_for(state="detached", timeout=5000)
+    page.mouse.move(0, 0)  # off the button the click left it on
     _settle(page, 1500)  # KPI cards + recent lists
     page.screenshot(path=str(out / "screenshot-dashboard.png"))
     print("  captured screenshot-dashboard.png")
@@ -314,6 +330,36 @@ def shoot_config_day1(page: Page, base: str, manifest: dict, out: Path) -> None:
     print("  captured screenshot-config-day1.png")
 
 
+def shoot_hosts(page: Page, base: str, manifest: dict[str, Any], out: Path) -> None:
+    """/app/hosts: the machine list under its cards, sorted by last seen, no filter."""
+    page.goto(f"{base}/app/hosts", wait_until="networkidle")
+    page.get_by_text(re.compile(r"Last swept .+ ago")).first.wait_for(
+        state="visible", timeout=15000
+    )
+    rows = page.locator("tbody tr")
+    rows.filter(has_text="web-proxy-01").first.wait_for(state="visible", timeout=15000)
+    rows.filter(has_text="dc-01").first.wait_for(state="visible", timeout=10000)
+    _settle(page)
+    page.screenshot(path=str(out / "screenshot-hosts.png"))
+    print("  captured screenshot-hosts.png")
+
+
+def shoot_host(page: Page, base: str, manifest: dict[str, Any], out: Path) -> None:
+    """/app/hosts/<key>: the proxy machine, its header, Addresses and the folded containers line."""
+    key = urllib.parse.quote(manifest["host_proxy"], safe="")
+    page.goto(f"{base}/app/hosts/{key}", wait_until="networkidle")
+    addresses = page.get_by_test_id("host-addresses")
+    addresses.wait_for(state="visible", timeout=15000)
+    # The address the DNS name joined: the last row, so every row has painted.
+    addresses.get_by_test_id("address-row-198.51.100.8").wait_for(state="visible", timeout=10000)
+    page.get_by_test_id("host-containers").get_by_text(
+        "3 containers on this machine", exact=False
+    ).wait_for(state="visible", timeout=10000)
+    _settle(page, 1200)  # hero + KPI strip + briefing
+    page.screenshot(path=str(out / "screenshot-host.png"))
+    print("  captured screenshot-host.png")
+
+
 SHOTS: dict[str, Callable[[Page, str, dict, Path], None]] = {
     "alerts": shoot_alerts,
     "investigation": shoot_investigation,
@@ -322,6 +368,8 @@ SHOTS: dict[str, Callable[[Page, str, dict, Path], None]] = {
     "hunt": shoot_hunt,
     "operate": shoot_operate,
     "config-day1": shoot_config_day1,
+    "hosts": shoot_hosts,
+    "host": shoot_host,
 }
 
 
@@ -368,6 +416,10 @@ def _run_shots(
 
             for name in names:
                 try:
+                    # Park the pointer in the sidebar's empty corner. The last
+                    # click (Sign in, a Dismiss) leaves it over a row or a
+                    # button, and the shot then paints that hover state.
+                    page.mouse.move(0, 0)
                     SHOTS[name](page, base, manifest, out_dir)
                 except Exception as exc:  # report and keep shooting the rest
                     failures.append(name)

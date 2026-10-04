@@ -228,6 +228,59 @@ async def test_run_doctor_include_fitness_false_skips_fitness(
     assert all(r.name != "model fitness" for r in results)
 
 
+async def test_preflight_rows_carry_the_audit_chain(settings_kratos: Settings) -> None:
+    """The preflight runs the doctor without fitness; the audit chain row is in it.
+
+    The preflight detail said green while the verify-chain endpoint said the
+    chain was broken: neither the doctor nor the preflight checked the chain.
+    The stub grid here has no search handle, so the row is INFO "not checked",
+    never a PASS it did not earn.
+    """
+    from soc_ai.audit.verify import ChainVerifyResult
+
+    with (
+        patch("soc_ai.doctor.make_auth", return_value=_StubAuth()),
+        patch("soc_ai.doctor.ElasticClient", return_value=_StubElastic()),
+        patch("soc_ai.doctor.list_gateway_models", AsyncMock(return_value=([], None))),
+        patch("soc_ai.doctor._classify_endpoint", return_value=("", "resolves and connects")),
+    ):
+        results = await doctor.run_doctor(settings_kratos, include_fitness=False)
+    rows = [r for r in results if r.name == "audit chain"]
+    assert len(rows) == 1
+    assert rows[0].status == "INFO"
+    assert rows[0].detail.startswith("not checked")
+
+    dup = AsyncMock(
+        return_value=ChainVerifyResult(
+            ok=False,
+            records_verified=100,
+            first_broken_seq=12,
+            first_seq=0,
+            last_seq=99,
+            capped=False,
+            epochs=1,
+            first_broken_epoch_start="2026-09-30T00:00:00+00:00",
+            epochs_broken=1,
+            newest_broken_epoch_start="2026-09-30T00:00:00+00:00",
+            latest_epoch_broken=True,
+            duplicate_seqs=1,
+            extra_records=1,
+            break_kinds=("duplicate_seq",),
+        )
+    )
+    with (
+        patch("soc_ai.doctor.make_auth", return_value=_StubAuth()),
+        patch("soc_ai.doctor.ElasticClient", return_value=_StubElastic()),
+        patch("soc_ai.doctor.list_gateway_models", AsyncMock(return_value=([], None))),
+        patch("soc_ai.doctor._classify_endpoint", return_value=("", "resolves and connects")),
+        patch("soc_ai.audit.verify.verify_audit_chain", dup),
+    ):
+        results = await doctor.run_doctor(settings_kratos, include_fitness=False)
+    row = next(r for r in results if r.name == "audit chain")
+    assert row.status == "WARN"
+    assert "No record was altered" in row.detail
+
+
 # ── GET /api/v1/health/preflight — closed non-admin projection ──────────────
 
 

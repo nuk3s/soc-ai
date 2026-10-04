@@ -103,3 +103,46 @@ describe('DetectionTuningPanel muted-rules count', () => {
     expect(screen.queryByText(/this is not a claim that none are muted/i)).toBeNull();
   });
 });
+
+// The Dashboard nudge said "29 mute suggestions pending" and its Review target
+// listed 39 rules with no count (D10). The list now states both numbers, and a
+// "none" recommendation reads as a word.
+describe('DetectionTuningPanel nominated count', () => {
+  const nom = (rule: string, rec: 'mute' | 'monitor' | 'none', muted = false) => ({
+    rule_name: rule,
+    alert_count: 10,
+    investigations: 2,
+    fp: 2,
+    tp: 0,
+    nmi: 0,
+    recommendation: rec,
+    reason: 'test',
+    already_muted: muted,
+    override_fp: 0,
+    chat_resolved: 0,
+    manual_resolved: 0,
+  });
+
+  it('states the rule count and the pending mutes among them', async () => {
+    getDetectionTuningMock.mockResolvedValue({
+      nominations: [
+        nom('ET A', 'mute'),
+        nom('ET B', 'mute'),
+        nom('ET C', 'mute', true),
+        nom('ET D', 'monitor'),
+        nom('ET E', 'none'),
+      ],
+      overrides: [],
+    });
+    render(<DetectionTuningPanel />);
+    expect(await screen.findByText('Nominated rules (5 · 2 mute suggestions)')).toBeTruthy();
+    expect(screen.getByText('None')).toBeTruthy();
+    expect(screen.getByText('Monitor')).toBeTruthy();
+  });
+
+  it('does not print a count it never read', async () => {
+    getDetectionTuningMock.mockRejectedValue(new Error('grid unavailable'));
+    render(<DetectionTuningPanel />);
+    expect(await screen.findByText('Nominated rules (—)')).toBeTruthy();
+  });
+});

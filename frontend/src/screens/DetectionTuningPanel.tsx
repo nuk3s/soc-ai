@@ -15,7 +15,7 @@ import { useAsync } from '../lib/useAsync';
 function recBadge(rec: DetectionNomination['recommendation']): { color: string; label: string } {
   if (rec === 'mute') return { color: '#f04438', label: 'Mute' };
   if (rec === 'monitor') return { color: '#f5a623', label: 'Monitor' };
-  return { color: '#8b949e', label: '—' };
+  return { color: '#8b949e', label: 'None' };
 }
 
 /**
@@ -35,6 +35,13 @@ function analystSignal(n: DetectionNomination): string {
     if (n.manual_resolved > 0) parts.push(`${n.manual_resolved} manual`);
   }
   return parts.join(' · ');
+}
+
+/** "39 · 29 mute suggestions": every nominated rule, then the pending mutes
+ *  among them. The Dashboard nudge counts pending mutes the same way. */
+function nominationCountLine(nominations: DetectionNomination[]): string {
+  const pending = nominations.filter((n) => n.recommendation === 'mute' && !n.already_muted).length;
+  return `${nominations.length} · ${pending} mute suggestion${pending === 1 ? '' : 's'}`;
 }
 
 export function DetectionTuningPanel({
@@ -98,8 +105,13 @@ export function DetectionTuningPanel({
       )}
 
       {/* ── Nominations ──────────────────────────────────────────────────── */}
-      <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-[.06em] text-faint">
-        Nominated rules
+      {/* The count matches the Dashboard nudge, which names both numbers
+          (D10). Unknown until a load lands, for the reason given above. */}
+      <div
+        data-testid="nominated-count"
+        className="mb-1.5 text-[11px] font-semibold uppercase tracking-[.06em] text-faint"
+      >
+        Nominated rules ({overridesKnown ? nominationCountLine(nominations) : '—'})
       </div>
       <div className="mb-4 overflow-hidden rounded-card border border-border bg-surface-1">
         <div className="grid grid-cols-[1fr_80px_120px_110px_90px] gap-2 border-b border-border bg-surface-2 px-3.5 py-2 text-[10.5px] font-semibold uppercase tracking-[.06em] text-faint">

@@ -105,7 +105,7 @@ def test_healthz_does_not_claim_to_be_a_health_verdict(
     body = app_with_test_model.get("/healthz").json()
     assert body["status"] != "ok"
     checks = body["checks"]
-    assert "no dependency is probed" in checks
+    assert "It probes no dependency" in checks
     assert "/api/v1/health" in checks
     assert "soc-ai doctor" in checks
 

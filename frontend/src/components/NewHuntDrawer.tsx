@@ -74,7 +74,9 @@ const FALLBACK_PRESETS: { label: string; objective: string }[] = [
 // box (like the old static pills). Three states, three operator actions:
 //   · available + applicable → normal accent chip ("the telemetry is here").
 //   · missing telemetry (available=false) → amber flag + "missing telemetry:
-//     zeek.rdp" — a FIXABLE collection gap.
+//     zeek.rdp" — a FIXABLE collection gap. Demoted into the "Not applicable
+//     here" cluster with its reason: the highlighted strip holds only the
+//     starters this grid can run as written.
 //   · availability UNKNOWN (availabilityKnown=false — the server could not read
 //     the grid inventory, so `available` is a fail-open default and not a
 //     measurement) → neutral gray chip, no glyph, one caption for the strip.
@@ -174,18 +176,37 @@ function TemplatePicker({
   // The two-axis split: applicable chips render inline (normal or amber);
   // not-applicable ones cluster at the end, collapsed. `!== false` keeps a
   // payload without the field (older server) on the inline path — fail open.
-  const applicableTemplates = templates.filter((t) => t.applicable !== false);
-  const demoted = templates.filter((t) => t.applicable === false);
+  //
+  // A starter whose telemetry the server CHECKED and found missing joins the
+  // cluster too: the highlighted strip is the set of starters this grid can
+  // run as written, and an amber chip among them read as one of those. It
+  // stays listed with its reason. An unknown availability is not a
+  // measurement, so it never demotes a chip.
+  const telemetryMissing = (t: HuntTemplate): boolean => availabilityKnown(t) && !t.available;
+  const isDemoted = (t: HuntTemplate): boolean => t.applicable === false || telemetryMissing(t);
+  const applicableTemplates = templates.filter((t) => !isDemoted(t));
+  const demoted = templates.filter(isDemoted);
+  const missingText = (t: HuntTemplate): string =>
+    t.missingDatasets.map((m) => m.split('|').join(' or ')).join(', ');
 
   const demotedTitle = (t: HuntTemplate): string => {
-    const needs = t.missingEnvironment.length
-      ? t.missingEnvironment.join(' and ')
-      : 'machinery that this network has not shown';
     const runsFirst =
       t.analytics && t.analytics.length > 0 ? `\n\nRuns first: ${t.analytics.join(', ')}.` : '';
+    const reasons: string[] = [];
+    if (telemetryMissing(t)) {
+      reasons.push(`⚠ missing telemetry: ${missingText(t)}`);
+    }
+    if (t.applicable === false) {
+      const needs = t.missingEnvironment.length
+        ? t.missingEnvironment.join(' and ')
+        : 'machinery that this network has not shown';
+      reasons.push(
+        `This hunt needs ${needs}. The network shows none of it. ` +
+          'Each dossier sweep checks this again.',
+      );
+    }
     return (
-      `${t.objectiveTemplate}\n\nThis hunt needs ${needs}. The network shows none of it. ` +
-      'Each dossier sweep checks this again. You can still run this hunt.' +
+      `${t.objectiveTemplate}\n\n${reasons.join('\n\n')}\n\nYou can still run this hunt.` +
       runsFirst
     );
   };
@@ -214,10 +235,13 @@ function TemplatePicker({
               // available, so asking `!t.available` alone can only ever produce
               // the confident answer.
               const unknown = !availabilityKnown(t);
-              const flagged = !unknown && !t.available;
+              // Always false on this path today: a known-missing starter is
+              // demoted into the cluster. Kept so the chip cannot claim
+              // availability if the split above ever changes.
+              const flagged = telemetryMissing(t);
               // A requirement that names alternatives ("zeek.rdp|system.security")
               // is missing as a whole; read it back as "either … or …".
-              const missing = t.missingDatasets.map((m) => m.split('|').join(' or ')).join(', ');
+              const missing = missingText(t);
               // Present only as imported history: still available, and said so.
               const backfill = (t.backfillOnlyDatasets ?? [])
                 .map((m) => m.split('|').join(' or '))
@@ -291,18 +315,39 @@ function TemplatePicker({
         )}
         {!useFallback &&
           showDemoted &&
-          demoted.map((t) => (
-            <span key={t.id} className="inline-flex items-center">
-              <button
-                type="button"
-                onClick={() => onPick(t.objectiveTemplate, { id: t.id, analytics: t.analytics })}
-                title={demotedTitle(t)}
-                className="flex items-center gap-1 rounded-badge border border-border bg-surface-2 px-[9px] py-[3px] text-[11.5px] font-medium text-faint opacity-70 transition-opacity hover:opacity-100"
-              >
-                {t.name}
-              </button>
-            </span>
-          ))}
+          demoted.map((t) => {
+            const flagged = telemetryMissing(t);
+            return (
+              <span key={t.id} className="inline-flex items-center" data-demoted="true">
+                <button
+                  type="button"
+                  onClick={() => onPick(t.objectiveTemplate, { id: t.id, analytics: t.analytics })}
+                  title={demotedTitle(t)}
+                  data-availability={
+                    !availabilityKnown(t) ? 'unknown' : flagged ? 'missing' : 'available'
+                  }
+                  className={
+                    flagged
+                      ? 'flex items-center gap-1 rounded-badge border border-warn/40 bg-warn/5 px-[9px] py-[3px] text-[11.5px] font-medium text-warn/80 opacity-70 transition-opacity hover:opacity-100'
+                      : 'flex items-center gap-1 rounded-badge border border-border bg-surface-2 px-[9px] py-[3px] text-[11.5px] font-medium text-faint opacity-70 transition-opacity hover:opacity-100'
+                  }
+                >
+                  {flagged && <AlertTriangle size={11} className="flex-none" />}
+                  {t.name}
+                </button>
+                {!t.builtin && (
+                  <button
+                    type="button"
+                    onClick={() => { void removeCustom(t.id); }}
+                    title="Delete this starter"
+                    className="ml-0.5 flex text-faint hover:text-danger"
+                  >
+                    <X size={11} />
+                  </button>
+                )}
+              </span>
+            );
+          })}
         {/* add-custom toggle */}
         <button
           type="button"
@@ -314,13 +359,13 @@ function TemplatePicker({
         </button>
       </div>
 
-      {/* legend — only when at least one INLINE template is unavailable
+      {/* legend — only when at least one template is known to be unavailable
           (nothing to contrast otherwise; the collapsed cluster explains
           itself). Positive framing: the highlighted ones are the runnable
           ones; the AlertTriangle stays on the unavailable chips only. It is
           gated on `!fitUnknown` because the claim it makes ("these match live
           telemetry") is exactly the one an unread inventory cannot support. */}
-      {!useFallback && !fitUnknown && applicableTemplates.some((t) => !t.available) && (
+      {!useFallback && !fitUnknown && templates.some(telemetryMissing) && (
         <div className="mt-1.5 text-[10.5px] text-accent/80">
           The highlighted starters match the telemetry this grid sees.
         </div>

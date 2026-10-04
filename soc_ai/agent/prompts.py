@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from soc_ai.dossier.coverage import describe as describe_coverage
 from soc_ai.tools.get_alert_context import (
     ENDPOINT_COVERAGE_DATASET_ABSENT,
     ENDPOINT_COVERAGE_HOST_UNCOVERED,
@@ -352,7 +353,10 @@ _INVESTIGATOR_STEPS = """
    an external indicator, call `enrich_ip`, `enrich_domain` or `enrich_hash` to
    consult the local MISP instance if one is configured.
 4. **Reconstruct the host and temporal context.** Check `host_alert_profile`. It
-   is a NEUTRAL histogram of the rule names that recently fired on this IP. It is
+   is a NEUTRAL histogram of the rule names that recently fired on EITHER end of
+   this alert. `host_alert_profiles` splits the same window per end. Each entry
+   names the IP, the end of this alert it is, and its alerts as source and as
+   destination. Read it to say WHICH host an alert belongs to. It is
    CONTEXT. It is not proof. A malware, RAT or C2 rule in the histogram means a
    SEPARATE alert fired. It does not confirm THIS alert as post-exploitation.
    That other alert may itself be a false positive. If the profile shows
@@ -1060,6 +1064,47 @@ def format_endpoint_coverage_block(reason: str | None) -> str:
     if reason == ENDPOINT_COVERAGE_DATASET_ABSENT:
         return _ENDPOINT_COVERAGE_DATASET_ABSENT_BLOCK
     return ""
+
+
+# The host coverage block: one line per internal endpoint of the alert, in
+# both directions. The endpoint-coverage block above renders NOTHING for a
+# covered host, and a covered host was exactly the one the model called
+# "no host telemetry": it shipped host logs and osquery and no Elastic
+# Defend, and the only zero the model saw was from Elastic Defend.
+_HOST_COVERAGE_HEADER = (
+    "\n\n## Host coverage for this alert's internal hosts\n\n"
+    "The prefetch read which telemetry planes each internal host ships in the "
+    "24-hour window around this alert. The planes are host logs, process events, "
+    "endpoint network events, Windows security events, osquery and agent self-logs. "
+    "A zero from one dataset is a gap in that plane only. Name the plane when you "
+    "report a gap. Do not write that a host has no host telemetry while any plane "
+    "is present.\n"
+)
+
+
+def format_host_coverage_block(entries: Any, host_pivot_note: str | None) -> str:
+    """Render the prefetch's per-host coverage and the host pivot note, or ``""``.
+
+    ``entries`` is ``AlertContext.host_coverage``. Each entry renders the
+    planes the host ships and the core planes it does not ship, or one
+    sentence that says soc-ai could not read its coverage. The block starts
+    with a blank line so callers append it unconditionally.
+    """
+    rows = list(entries or [])
+    if not rows:
+        return ""
+    lines = [_HOST_COVERAGE_HEADER]
+    for entry in rows:
+        cov = entry.coverage
+        agent = cov.agent
+        who = f"{entry.ip}, the alert {entry.end}"
+        if agent is not None and agent.name:
+            who += f", agent {agent.name}"
+        sentences = " ".join(describe_coverage(cov, subject=entry.ip))
+        lines.append(f"- {who}: {sentences}")
+    if host_pivot_note:
+        lines.append(f"- Host pivot: {host_pivot_note}")
+    return "\n".join(lines) + "\n"
 
 
 def build_synth_first_user_message(

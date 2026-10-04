@@ -68,12 +68,17 @@ from typing import Any
 
 from soc_ai.config import Settings
 from soc_ai.dossier.types import (
+    AGENT_ADDRESS_CAP,
+    AgentAddressReport,
     AgentInventory,
     AgentSelfReport,
+    DhcpLease,
+    DhcpLeaseInventory,
     DnsNameClaim,
     DnsNameInventory,
     HostObservations,
     identity_bearing_ip,
+    is_service_or_reverse_name,
 )
 from soc_ai.so_client import fields, inventory
 from soc_ai.so_client.elastic import ElasticClient
@@ -96,6 +101,47 @@ _SAMPLE_SIZE = 20
 
 # Newest-first. A dossier states what a host is NOW.
 _NEWEST_FIRST: list[dict[str, Any]] = [{"@timestamp": {"order": "desc"}}]
+
+# The transports with no port. Their port fields hold an ICMP type and code.
+NON_PORT_TRANSPORT_VALUES: tuple[str, ...] = ("icmp", "icmp6", "ipv6-icmp")
+_NON_PORT_TRANSPORTS: list[dict[str, Any]] = [
+    {"terms": {name: list(NON_PORT_TRANSPORT_VALUES)}} for name in fields.CONN_TRANSPORT
+]
+# The transports a served port can run over.
+PORT_TRANSPORTS: tuple[str, ...] = ("tcp", "udp")
+_TRANSPORT_AGG_SIZE = 4
+
+
+def _port_pairs(agg: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """The responder port terms as ``[{value, count, transport?}]``.
+
+    ``transport`` is the busiest of tcp and udp under the port. It is absent
+    when the grid carries no transport field, and the renderer then keeps its
+    old assumption. Port 0 is not a port and is dropped.
+    """
+    out: list[dict[str, Any]] = []
+    for pair, bucket in zip(_bucket_pairs(agg), _raw_buckets(agg), strict=False):
+        if str(pair.get("value")) == "0":
+            continue
+        transports = ((bucket.get("transport") or {}).get("buckets")) or []
+        best = next(
+            (
+                str(t.get("key")).lower()
+                for t in sorted(transports, key=lambda t: -int(t.get("doc_count") or 0))
+                if str(t.get("key")).lower() in PORT_TRANSPORTS
+            ),
+            None,
+        )
+        out.append({**pair, "transport": best} if best is not None else pair)
+    return out
+
+
+def _raw_buckets(agg: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """The terms buckets ``_bucket_pairs`` keeps, in the same order."""
+    if not agg:
+        return []
+    return [b for b in (agg.get("buckets") or []) if b.get("key") not in (None, "")]
+
 
 # Aggregation bucket caps. Ports are wide (a hypervisor answers on many), names
 # wider still (the DNS/SNI sets feed the OS hint), datasets narrow.
@@ -131,6 +177,16 @@ _DHCP_READS: _Reads = (
     ("mac", fields.DHCP_MAC),
     ("client_fqdn", fields.DHCP_CLIENT_FQDN),
     ("domain", fields.DHCP_DOMAIN),
+    # The two keys `infer._is_dhcp_client` reads before direction. An SO 3.x
+    # lease has no source.ip, so without them no lease is attributable.
+    ("assigned_ip", fields.DHCP_ASSIGNED_IP),
+    ("client_ip", fields.DHCP_CLIENT_ADDRESS),
+)
+# The lease-address fields a DHCP search also matches on, beside the endpoint
+# pair. An SO 3.x zeek.dhcp document carries only these.
+_DHCP_ADDRESS_FIELDS: tuple[str, ...] = (
+    *fields.DHCP_ASSIGNED_IP[:1],
+    *fields.DHCP_CLIENT_ADDRESS[:1],
 )
 _SSH_READS: _Reads = (
     ("client", fields.SSH_CLIENT),
@@ -197,11 +253,16 @@ _HOSTLOG_DATASETS: tuple[str, ...] = (
 )
 
 # Machines per network, and addresses per machine. The host cap is generous
-# because an agent-shipping network is bounded by installs, not by traffic; the
-# address cap is small because a host with 40 addresses is a container host and
-# the extras are bridges that will lose the claim test anyway.
+# because an agent-shipping network is bounded by installs, not by traffic. The
+# address cap holds a container host: one production agent reported 111
+# addresses, 102 of them link-local, and a cap of 40 dropped real addresses
+# from one sweep to the next. The values come in key order, where every IPv4
+# address sorts before every IPv6 one, so link-local IPv6 values fall off the
+# cap first. Elasticsearch cannot drop single values of an `ip` field inside a
+# terms agg (a regex include works on keyword fields only), so the link-local
+# values that do arrive are dropped by `identity_bearing_ip`.
 _AGENT_HOST_AGG_SIZE = 500
-_AGENT_IP_AGG_SIZE = 40
+_AGENT_IP_AGG_SIZE = AGENT_ADDRESS_CAP
 
 # Projected out of the newest document per machine. `host.os` is taken as a
 # whole object: os_detail renders whichever of name/version/kernel exist, and a
@@ -215,6 +276,7 @@ _AGENT_READS: tuple[str, ...] = (
     "host.os",
     "agent.type",
     "agent.version",
+    "agent.id",
 )
 _AGENT_OS_KEYS: tuple[str, ...] = ("name", "family", "version", "kernel", "platform", "type")
 
@@ -258,6 +320,7 @@ class _AggFields:
     reg_domain: str
     dns_query: str
     sni: str
+    transport: str = "network.transport"
 
 
 @dataclass(frozen=True)
@@ -358,7 +421,7 @@ async def collect_host_observations(
         total_events=total,
         first_seen=_agg_datetime(aggs.get("first_seen")),
         last_seen=_agg_datetime(aggs.get("last_seen")),
-        resp_ports=_bucket_pairs(responder.get("ports")),
+        resp_ports=_port_pairs(responder.get("ports")),
         orig_ports=_bucket_pairs(originator.get("ports")),
         resp_peer_count=_cardinality(responder.get("peers")),
         orig_peer_count=_cardinality(originator.get("peers")),
@@ -468,7 +531,19 @@ def _agent_aggs() -> dict[str, Any]:
         "hosts": {
             "terms": {"field": "host.name", "size": _AGENT_HOST_AGG_SIZE},
             "aggs": {
-                "ips": {"terms": {"field": "host.ip", "size": _AGENT_IP_AGG_SIZE}},
+                "ips": {
+                    "terms": {
+                        "field": "host.ip",
+                        "size": _AGENT_IP_AGG_SIZE,
+                        "order": {"_key": "asc"},
+                    },
+                    # The agent's own documents per address: the activity of an
+                    # address no network sensor sees.
+                    "aggs": {
+                        "first_seen": {"min": {"field": "@timestamp"}},
+                        "last_seen": {"max": {"field": "@timestamp"}},
+                    },
+                },
                 # The reporting window, not the build time: an agent-only host
                 # takes its dossier lifetime from these.
                 "first_report": {"min": {"field": "@timestamp"}},
@@ -503,6 +578,7 @@ def _agent_report(bucket: Mapping[str, Any]) -> AgentSelfReport | None:
     }
     return AgentSelfReport(
         host_name=name,
+        agent_id=_first_str(get_dotted(source, "agent.id")),
         os=os_struct,
         macs=_ordered_unique(_as_list(get_dotted(source, "host.mac"))),
         architecture=_first_str(get_dotted(source, "host.architecture")),
@@ -515,7 +591,24 @@ def _agent_report(bucket: Mapping[str, Any]) -> AgentSelfReport | None:
         doc_count=int(bucket.get("doc_count") or 0),
         first_report=_agg_datetime(bucket.get("first_report")),
         last_report=_agg_datetime(bucket.get("last_report")),
+        addresses=_agent_addresses(bucket.get("ips") or {}),
+        ips_truncated=int((bucket.get("ips") or {}).get("sum_other_doc_count") or 0) > 0,
     )
+
+
+def _agent_addresses(agg: Mapping[str, Any]) -> dict[str, AgentAddressReport]:
+    """Per identity-bearing address: the agent's own documents and their span."""
+    out: dict[str, AgentAddressReport] = {}
+    for bucket in agg.get("buckets") or ():
+        ip = identity_bearing_ip(bucket.get("key"))
+        if ip is None:
+            continue
+        out[ip] = AgentAddressReport(
+            docs=int(bucket.get("doc_count") or 0),
+            first_seen=_agg_datetime(bucket.get("first_seen")),
+            last_seen=_agg_datetime(bucket.get("last_seen")),
+        )
+    return out
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -523,6 +616,190 @@ def _as_list(value: Any) -> list[Any]:
     if value is None:
         return []
     return list(value) if isinstance(value, (list, tuple)) else [value]
+
+
+# ---------------------------------------------------------------------------
+# The network DHCP lease inventory: one aggregation for every lease in the window
+# ---------------------------------------------------------------------------
+
+# Every spelling a lease's three parts take. A terms agg on a field the index
+# does not map returns no buckets and no error, so the pass asks for all of them
+# and merges. SO 3.x writes host.mac, dhcp.assigned_ip, client.address and
+# host.hostname. The older shape writes dhcp.client.mac, source.ip (the client
+# is the originator) and dhcp.hostname.
+_LEASE_MAC_FIELDS: tuple[str, ...] = fields.DHCP_MAC
+_LEASE_ADDRESS_FIELDS: tuple[str, ...] = (
+    fields.DHCP_ASSIGNED_IP[0],
+    fields.DHCP_CLIENT_ADDRESS[0],
+    "source.ip",
+)
+_LEASE_NAME_FIELDS: tuple[str, ...] = fields.DHCP_HOSTNAME
+# The SO 3.x spellings alone: the retry when the full pass fails on a field an
+# older mapping holds as text.
+_LEASE_SO3_FIELDS = (("host.mac",), ("dhcp.assigned_ip", "client.address"), ("host.hostname",))
+_LEASE_MAC_AGG_SIZE = 2000
+_LEASE_IP_AGG_SIZE = 8
+_LEASE_NAME_AGG_SIZE = 3
+
+
+async def collect_dhcp_leases(
+    *,
+    elastic: ElasticClient,
+    settings: Settings,
+    window_hours: int,
+    cidrs: Sequence[Any] = (),
+    time_anchor: datetime | None = None,
+) -> DhcpLeaseInventory:
+    """Every (address, MAC) lease in the window, internal addresses only.
+
+    ONE ``size=0`` aggregation for the network, once per sweep, beside the agent
+    and DNS passes. The machine clustering needs every lease at once: an
+    address that two MACs held in the window belongs to the newer lease.
+
+    Gated on ``zeek.dhcp`` like the per-host DHCP search: a grid without it
+    pays nothing. Never raises. A failed pass comes back empty with the reason
+    in ``errors``, and the sweep then keeps the machines it already has.
+    """
+    if not cidrs:
+        return DhcpLeaseInventory()
+    minutes = max(1, window_hours) * 60
+    available = await _available_datasets(elastic, settings, minutes)
+    present = _present_datasets(_DHCP_DATASETS, available)
+    if not present:
+        return DhcpLeaseInventory()
+    query: dict[str, Any] = {
+        "bool": {
+            "filter": [
+                _build_time_filter(minutes, time_anchor)[0],
+                {"terms": {"event.dataset": list(present)}},
+            ],
+            "must_not": list(synth_scope_must_not(False)),
+        }
+    }
+    shapes = (
+        (_LEASE_MAC_FIELDS, _LEASE_ADDRESS_FIELDS, _LEASE_NAME_FIELDS),
+        _LEASE_SO3_FIELDS,
+    )
+    failure = ""
+    for macs, addresses, names in shapes:
+        try:
+            result = await elastic.search(
+                settings.events_index_pattern,
+                query,
+                size=0,
+                aggs=_lease_aggs(macs, addresses, names),
+            )
+        except Exception as exc:
+            failure = f"DHCP lease pass failed: {exc}"
+            _LOGGER.warning("dossier: %s", failure)
+            continue
+        return _lease_inventory(result.aggregations or {}, list(cidrs))
+    return DhcpLeaseInventory(errors=(failure,))
+
+
+def _lease_aggs(
+    macs: Sequence[str], addresses: Sequence[str], names: Sequence[str]
+) -> dict[str, Any]:
+    inner: dict[str, Any] = {}
+    for j, field_name in enumerate(addresses):
+        inner[f"ip{j}"] = {
+            "terms": {"field": field_name, "size": _LEASE_IP_AGG_SIZE},
+            "aggs": {
+                "first_seen": {"min": {"field": "@timestamp"}},
+                "last_seen": {"max": {"field": "@timestamp"}},
+            },
+        }
+    for k, field_name in enumerate(names):
+        inner[f"name{k}"] = {
+            "terms": {"field": field_name, "size": _LEASE_NAME_AGG_SIZE},
+            "aggs": {"last_seen": {"max": {"field": "@timestamp"}}},
+        }
+    return {
+        f"leases{i}": {"terms": {"field": field_name, "size": _LEASE_MAC_AGG_SIZE}, "aggs": inner}
+        for i, field_name in enumerate(macs)
+    }
+
+
+def _lease_inventory(aggs: Mapping[str, Any], nets: list[Any]) -> DhcpLeaseInventory:
+    """Fold the MAC buckets into leases. One lease per (address, MAC)."""
+    merged: dict[tuple[str, str], DhcpLease] = {}
+    dropped = 0
+    for key, agg in aggs.items():
+        if not key.startswith("leases"):
+            continue
+        dropped += int((agg or {}).get("sum_other_doc_count") or 0)
+        for bucket in (agg or {}).get("buckets") or ():
+            for lease in _bucket_leases(bucket, nets):
+                held = merged.get((lease.ip, lease.mac))
+                merged[(lease.ip, lease.mac)] = lease if held is None else _wider(held, lease)
+    notes: tuple[str, ...] = ()
+    if dropped:
+        notes = (
+            f"DHCP lease pass truncated at {_LEASE_MAC_AGG_SIZE} MACs. "
+            f"{dropped} lease document(s) sit in MACs that did not fit.",
+        )
+    return DhcpLeaseInventory(leases=tuple(merged.values()), notes=notes)
+
+
+def _bucket_leases(bucket: Mapping[str, Any], nets: list[Any]) -> list[DhcpLease]:
+    mac = _first_str(bucket.get("key"))
+    if not mac:
+        return []
+    hostname: str | None = None
+    newest: datetime | None = None
+    for key, agg in bucket.items():
+        if not key.startswith("name") or not isinstance(agg, Mapping):
+            continue
+        for name_bucket in agg.get("buckets") or ():
+            value = _first_str(name_bucket.get("key"))
+            seen = _agg_datetime(name_bucket.get("last_seen"))
+            if value and (newest is None or (seen is not None and seen > newest)):
+                hostname, newest = value, seen
+    out: list[DhcpLease] = []
+    for key, agg in bucket.items():
+        if not key.startswith("ip") or not isinstance(agg, Mapping):
+            continue
+        for ip_bucket in agg.get("buckets") or ():
+            ip = identity_bearing_ip(ip_bucket.get("key"))
+            if ip is None or not _inside(ip, nets):
+                continue
+            out.append(
+                DhcpLease(
+                    ip=ip,
+                    mac=mac,
+                    hostname=hostname,
+                    first_seen=_agg_datetime(ip_bucket.get("first_seen")),
+                    last_seen=_agg_datetime(ip_bucket.get("last_seen")),
+                )
+            )
+    return out
+
+
+def _inside(ip: str, nets: list[Any]) -> bool:
+    try:
+        address = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(address in net for net in nets if address.version == net.version)
+
+
+def _wider(first: DhcpLease, second: DhcpLease) -> DhcpLease:
+    """One lease seen under two field spellings: the wider span, the newer name."""
+    starts = [t for t in (first.first_seen, second.first_seen) if t is not None]
+    ends = [t for t in (first.last_seen, second.last_seen) if t is not None]
+    newer = (
+        second
+        if (second.last_seen or datetime.min.replace(tzinfo=UTC))
+        > (first.last_seen or datetime.min.replace(tzinfo=UTC))
+        else first
+    )
+    return DhcpLease(
+        ip=first.ip,
+        mac=first.mac,
+        hostname=newer.hostname or first.hostname or second.hostname,
+        first_seen=min(starts) if starts else None,
+        last_seen=max(ends) if ends else None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -713,6 +990,10 @@ def _dns_claim(name: str, bucket: Mapping[str, Any], nets: list[Any]) -> DnsName
     # the collector, and `infer` keeps the same import lazy for the same reason.
     from soc_ai.enrichment.discovery import _is_internal_ip  # noqa: PLC0415
 
+    # A service-discovery or reverse name names a service or an address. It
+    # must not name a machine, and it must not add one to the census.
+    if is_service_or_reverse_name(name):
+        return None
     ip = identity_bearing_ip(bucket.get("key"))
     if ip is None or not _is_internal_ip(ip, nets):
         return None
@@ -788,6 +1069,7 @@ async def _resolve_agg_fields(elastic: ElasticClient, index: str) -> _AggFields:
         reg_domain=await fields.resolve_agg_field(elastic, index, fields.DNS_REGISTERED_DOMAIN),
         dns_query=await fields.resolve_agg_field(elastic, index, fields.DNS_QUERY),
         sni=await fields.resolve_agg_field(elastic, index, fields.SSL_SNI),
+        transport=await fields.resolve_agg_field(elastic, index, fields.CONN_TRANSPORT),
     )
 
 
@@ -859,6 +1141,11 @@ def _build_aggs(ip: str, f: _AggFields, *, optional: bool = True) -> dict[str, A
         "peers": {"cardinality": {"field": "destination.ip"}},
     }
     if optional:
+        # Which transport each answered port ran over. A UDP-only service on
+        # 53 rendered as tcp/53 because the port terms carried no transport.
+        responder_aggs["ports"]["aggs"] = {
+            "transport": {"terms": {"field": f.transport, "size": _TRANSPORT_AGG_SIZE}}
+        }
         responder_aggs["services"] = {"terms": {"field": f.service, "size": _SERVICE_AGG_SIZE}}
         responder_aggs["bytes"] = {"percentiles": {"field": f.resp_bytes, "percents": [50, 95]}}
         originator_aggs["bytes"] = {"percentiles": {"field": f.orig_bytes, "percents": [50, 95]}}
@@ -878,7 +1165,12 @@ def _build_aggs(ip: str, f: _AggFields, *, optional: bool = True) -> dict[str, A
                     "must": [
                         {"term": {"destination.ip": ip}},
                         fields.flow_dataset_filter(),
-                    ]
+                    ],
+                    # ICMP has no ports. Zeek writes the ICMP type and code
+                    # into the port fields, so type 3 and 13 read as
+                    # services: "responds on tcp/3" was an ICMP unreachable.
+                    # A must_not on a field a grid does not map drops nothing.
+                    "must_not": _NON_PORT_TRANSPORTS,
                 }
             },
             "aggs": responder_aggs,
@@ -965,7 +1257,9 @@ async def _collect_identity(
 ) -> _Identity:
     """The six identity searches, each skipped when its datasets are absent."""
 
-    async def _search(datasets: Sequence[str], reads: _Reads) -> tuple[dict[str, Any], ...]:
+    async def _search(
+        datasets: Sequence[str], reads: _Reads, *, also_match: Sequence[str] = ()
+    ) -> tuple[dict[str, Any], ...]:
         present = _present_datasets(datasets, available)
         if not present:
             _LOGGER.debug("dossier: skipping %s for %s — not on this grid", datasets, ip)
@@ -974,13 +1268,13 @@ async def _collect_identity(
             elastic,
             index,
             ip=ip,
-            query=_dataset_query(ip, minutes, anchor, present),
+            query=_dataset_query(ip, minutes, anchor, present, also_match=also_match),
             reads=reads,
             label="/".join(present),
             errors=errors,
         )
 
-    dhcp = await _search(_DHCP_DATASETS, _DHCP_READS)
+    dhcp = await _search(_DHCP_DATASETS, _DHCP_READS, also_match=_DHCP_ADDRESS_FIELDS)
     ssh_banners = await _search(_SSH_DATASETS, _SSH_READS)
     windows_identity = await _search(_WINDOWS_DATASETS, _WINDOWS_READS)
     software = await _search(_SOFTWARE_DATASETS, _SOFTWARE_READS)
@@ -1009,7 +1303,12 @@ async def _collect_identity(
 
 
 def _dataset_query(
-    ip: str, minutes: int, anchor: datetime | None, datasets: Sequence[str]
+    ip: str,
+    minutes: int,
+    anchor: datetime | None,
+    datasets: Sequence[str],
+    *,
+    also_match: Sequence[str] = (),
 ) -> dict[str, Any]:
     """``_base_host_query`` plus a dataset filter.
 
@@ -1017,8 +1316,18 @@ def _dataset_query(
     that gets the either-endpoint predicate AND the synthetic-eval kill-switch
     (``must_not exists synth.scenario_id``) right, and a synth fixture leaking
     into an asset record would be a durable, prompt-injected lie.
+
+    ``also_match`` adds more address fields to the either-endpoint predicate.
+    The DHCP search needs it: an SO 3.x lease document names the client in
+    ``client.address`` and ``dhcp.assigned_ip`` and has no endpoint pair.
     """
     query = _base_host_query(ip, minutes, anchor)
+    if also_match:
+        for held in query["bool"]["must"]:
+            shoulds = (held.get("bool") or {}).get("should")
+            if isinstance(shoulds, list):
+                shoulds.extend({"term": {name: ip}} for name in also_match)
+                break
     clause: dict[str, Any] = (
         {"term": {"event.dataset": datasets[0]}}
         if len(datasets) == 1
@@ -1268,6 +1577,7 @@ def _fold_hour_of_day(agg: dict[str, Any] | None) -> dict[int, int]:
 
 __all__ = [
     "collect_agent_inventory",
+    "collect_dhcp_leases",
     "collect_dns_names",
     "collect_host_observations",
     "reverse_zone",

@@ -15,10 +15,14 @@ from typing import Any, NamedTuple
 
 from sqlalchemy import and_, case, func, literal, or_, select
 from sqlalchemy import delete as sa_delete
+from sqlalchemy import update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased, load_only
+from sqlalchemy.orm.attributes import set_committed_value
 from ulid import ULID
 
+from soc_ai.secret_scrub import MODEL_TEXT_EVENT_KINDS, scrub_optional, scrub_value
+from soc_ai.so_client.fields import DETECTION_KINDS, detection_kind_of_alert_payload
 from soc_ai.store import chat_memory
 from soc_ai.store.auth import utcnow
 from soc_ai.store.models import ChatMessage, Investigation, InvestigationEvent
@@ -76,17 +80,57 @@ def alert_group_id(inv: Any) -> str | None:
     return None if is_hunt_subject(inv) else getattr(inv, "alert_es_id", None)
 
 
-def not_hunt_subject() -> Any:
+def not_hunt_subject(model: Any = Investigation) -> Any:
     """The SQL for a run that belongs to the alert it names.
 
     ``json_extract`` returns NULL for an alert run, whose ``subject_json`` is
     NULL, and the coalesce keeps that row in the set. A NULL compared to a
     string is NULL, which is not true, and the filter would have dropped every
-    alert run.
+    alert run. ``model`` takes an alias of :class:`Investigation` for a
+    correlated subquery.
     """
-    return (
-        func.coalesce(func.json_extract(Investigation.subject_json, "$.type"), "")
-        != HUNT_SUBJECT_TYPE
+    return func.coalesce(func.json_extract(model.subject_json, "$.type"), "") != HUNT_SUBJECT_TYPE
+
+
+# The stored statuses the primacy rule prefers: a run that is still going or
+# that finished. Mirrors ``_primary_run_ids`` in the investigations route.
+_LIVE_STATUSES = ("running", "complete")
+
+
+def superseded_sql() -> Any:
+    """True for a run that is NOT its alert's primary run, as a SQL expression.
+
+    The SQL twin of the route's ``_primary_run_ids`` rule: per alert, the
+    primary run is the newest running-or-complete run, else the newest run of
+    any status. So a run is superseded when another run of the same alert is
+    live and (this run is not live, or that run is newer), or when this run is
+    not live and another run is newer. A run with no alert group (a blank
+    ``alert_es_id``, a hunt-subject run) stands alone and is never superseded.
+
+    The bell's failed-triage half filters on it (dogfood 2026-10-01 D1): two
+    red "Triage failed" rows stood for alerts that a later run had settled.
+    """
+    other = aliased(Investigation)
+    other_newer = or_(
+        other.created_at > Investigation.created_at,
+        and_(other.created_at == Investigation.created_at, other.id > Investigation.id),
+    )
+    this_live = Investigation.status.in_(_LIVE_STATUSES)
+    other_live = other.status.in_(_LIVE_STATUSES)
+    return and_(
+        Investigation.alert_es_id != "",
+        not_hunt_subject(),
+        select(other.id)
+        .where(
+            other.alert_es_id == Investigation.alert_es_id,
+            other.id != Investigation.id,
+            not_hunt_subject(other),
+            or_(
+                and_(other_live, or_(~this_live, other_newer)),
+                and_(~this_live, other_newer),
+            ),
+        )
+        .exists(),
     )
 
 
@@ -99,11 +143,16 @@ async def _observe_verdict(db: AsyncSession, inv: Investigation) -> None:
     """
     if not inv.alert_es_id:
         return
-    if is_hunt_subject(inv):
+    if is_promoted(inv):
         # The verdict is on the hunt, not on the anchor document. The hunt's
         # findings already wrote their observations, and the lead behind the
         # hunt is the thing the analyst promoted. An alert observation here
         # would feed a second lead on the same ground.
+        #
+        # A promoted kind with no hunt subject is the older shape of the same
+        # run. Its rule_name is the promotion title, so the range wrote "Lead
+        # 12 on <ip>: true positive at 0.70" as an alert on every internal end
+        # of the anchor document, and one landed on another host's lead.
         return
     from soc_ai.hunting.sources import observe_alert_verdict  # noqa: PLC0415 - cycle
 
@@ -181,12 +230,26 @@ async def set_alert_fields(
     dest_ip: str | None = None,
     community_id: str | None = None,
     host_name: str | None = None,
+    kind: str | None = None,
 ) -> None:
-    """Set investigation fields only if currently unset (only-set-if-unset semantics)."""
+    """Set investigation fields only if currently unset (only-set-if-unset semantics).
+
+    ``kind`` is the one exception: the row is born with the "suricata" default,
+    so a detector type read off the alert document replaces it. A promoted row
+    (hunt, lead) keeps its kind.
+    """
     inv = await db.get(Investigation, inv_id)
     if inv is None:
         return
     changed = False
+    if (
+        kind is not None
+        and kind in DETECTION_KINDS
+        and inv.kind not in PROMOTED_KINDS
+        and inv.kind != kind
+    ):
+        inv.kind = kind
+        changed = True
     if rule_name is not None and not inv.rule_name:
         inv.rule_name = rule_name[:512]
         changed = True
@@ -218,10 +281,82 @@ async def append_events(db: AsyncSession, inv_id: str, events: list[dict[str, An
                 investigation_id=inv_id,
                 sequence=int(ev.get("sequence", 0)),
                 kind=str(ev.get("kind", ""))[:40],
-                payload=ev.get("payload") or {},
+                payload=_scrub_event_payload(str(ev.get("kind", "")), ev.get("payload") or {}),
             )
         )
     await db.commit()
+
+
+_CONTEXT_EVENT_KINDS = ("alert_context", "enriched_alert_context")
+
+
+async def heal_detection_kinds(db: AsyncSession, invs: Sequence[Investigation]) -> None:
+    """Correct a stored detector type that disagrees with the alert document.
+
+    Rows from before the recorder read the type off the alert carry the
+    "suricata" default, so the list called Sigma detections Suricata ones
+    (dogfood 2026-10-01 RL5). This reads the dataset and the module from each
+    row's stored alert context, derives the type the Alerts grid would show,
+    and writes the correction back once. A row whose context names no
+    detector keeps its value. Promoted rows (hunt, lead) are never touched.
+    """
+    candidates = {inv.id: inv for inv in invs if inv.kind in DETECTION_KINDS}
+    if not candidates:
+        return
+    rows = (
+        await db.execute(
+            select(
+                InvestigationEvent.investigation_id,
+                func.json_extract(InvestigationEvent.payload, "$.alert.event_dataset"),
+                func.json_extract(InvestigationEvent.payload, "$.alert.event_module"),
+                func.json_extract(InvestigationEvent.payload, "$.alert.raw.sigma_level"),
+            )
+            .where(
+                InvestigationEvent.investigation_id.in_(list(candidates)),
+                InvestigationEvent.kind.in_(_CONTEXT_EVENT_KINDS),
+            )
+            .order_by(InvestigationEvent.investigation_id, InvestigationEvent.sequence)
+        )
+    ).all()
+    derived: dict[str, str] = {}
+    for inv_id, dataset, module, sigma_level in rows:
+        if inv_id in derived:
+            continue
+        kind = detection_kind_of_alert_payload(
+            {
+                "event_dataset": dataset,
+                "event_module": module,
+                "raw": {"sigma_level": sigma_level} if sigma_level is not None else {},
+            }
+        )
+        if kind is not None:
+            derived[inv_id] = kind
+    by_kind: dict[str, list[str]] = {}
+    for inv_id, kind in derived.items():
+        inv = candidates[inv_id]
+        if inv.kind != kind:
+            by_kind.setdefault(kind, []).append(inv_id)
+            # The caller renders this object next; give it the corrected value.
+            set_committed_value(inv, "kind", kind)
+    if not by_kind:
+        return
+    for kind, ids in by_kind.items():
+        await db.execute(
+            sa_update(Investigation)
+            .where(Investigation.id.in_(ids), Investigation.kind.in_(DETECTION_KINDS))
+            .values(kind=kind)
+            .execution_options(synchronize_session=False)
+        )
+    await db.commit()
+
+
+def _scrub_event_payload(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+    # The model-written events (the report, the raw response) carry the same
+    # text as the row's rationale and summary, so they get the same scrub.
+    if kind in MODEL_TEXT_EVENT_KINDS:
+        scrubbed: dict[str, Any] = scrub_value(payload)
+        return scrubbed
+    return payload
 
 
 async def finalize(
@@ -243,11 +378,14 @@ async def finalize(
         inv.verdict = verdict
     if confidence is not None:
         inv.confidence = confidence
+    # Credential values the model lifted from telemetry never reach the store
+    # (dogfood 2026-10-01 P1): every console user reads these columns.
     if rationale is not None:
-        inv.rationale = rationale
+        inv.rationale = scrub_optional(rationale)
     if summary is not None:
-        inv.summary = summary
+        inv.summary = scrub_optional(summary)
     if report is not None:
+        report = scrub_value(report)
         inv.report = report
         # Denormalize the pipeline-fallback marker so query_page's aggregate reads
         # a column instead of json_extract'ing every row's report on each poll
@@ -303,11 +441,11 @@ async def resolve(
         resolution["source_message_id"] = source_message_id
     report["resolution"] = resolution
     if recommended_actions is not None:
-        report["recommended_actions"] = recommended_actions
+        report["recommended_actions"] = scrub_value(recommended_actions)
     inv.verdict = verdict
     inv.confidence = confidence
     if rationale is not None:
-        inv.rationale = rationale
+        inv.rationale = scrub_optional(rationale)
     inv.report = report  # reassign so the JSON column persists the mutation
     # The override replaced report["resolution"] with a manual/chat resolution
     # (no `provenance`), so the row is no longer a pipeline fallback — recompute
@@ -374,9 +512,9 @@ async def reap_stale_running(
         inv.finished_at = now
         if not inv.rationale:
             inv.rationale = (
-                "Investigation was interrupted by a service restart before it finished — re-run it."
+                "A service restart interrupted the investigation before it finished. Run it again."
                 if interrupted
-                else "Investigation did not finish (interrupted by a restart or timed out)."
+                else "The investigation did not finish. A restart or a timeout stopped it."
             )
     if rows:
         await db.commit()
@@ -872,6 +1010,7 @@ async def list_recent_notifications(
     finished_since: datetime | None = None,
     no_verdict: bool = False,
     exclude_dismissed: bool = False,
+    primary_only: bool = False,
 ) -> list[NotifRow]:
     """Lightweight investigation rows for the notifications bell — scalar columns only.
 
@@ -892,9 +1031,10 @@ async def list_recent_notifications(
     for completions no longer hands back a run that reached no decision and
     titles it "Verdict untriaged". Asking for errors finds it instead.
 
-    ``no_verdict`` narrows to runs that ended without one, and
+    ``no_verdict`` narrows to runs that ended without one,
     ``exclude_dismissed`` drops the ones an operator has already acknowledged
-    (``POST /investigations/{id}/dismiss-error``). Together they are the bell's
+    (``POST /investigations/{id}/dismiss-error``), and ``primary_only`` drops
+    the runs a later run of the same alert superseded. Together they are the bell's
     failed-triage half. Both are SQL conditions rather than a Python filter over
     the page, because dropping rows after a LIMIT is how a bounded query comes
     back empty while matching rows sit just past the cut.
@@ -923,6 +1063,10 @@ async def list_recent_notifications(
         q = q.where(_blank_verdict_sql())
     if exclude_dismissed:
         q = q.where(Investigation.error_dismissed_at.is_(None))
+    if primary_only:
+        # A failed run that a later run of the same alert replaced is history,
+        # not a standing fault. See :func:`superseded_sql`.
+        q = q.where(~superseded_sql())
     if finished_since is not None:
         q = q.where(Investigation.finished_at >= finished_since).order_by(
             Investigation.finished_at.desc(), Investigation.id.desc()

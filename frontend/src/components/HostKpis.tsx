@@ -221,7 +221,14 @@ export function HostKpis({
             'silent on the wire'
           ) : (
             <>
-              connection records · <span title={peers.title}>{peers.text}</span>
+              connection records ·{' '}
+              <span
+                data-testid="kpi-events-rate"
+                title="Connections in and out, per hour, averaged over the window. The profile baseline counts only the connections this host starts."
+              >
+                {Math.round((events ?? 0) / (range === '7d' ? 168 : 24)).toLocaleString()} per hour in and out
+              </span>{' '}
+              · <span title={peers.title}>{peers.text}</span>
             </>
           ))
         }

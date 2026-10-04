@@ -12,6 +12,7 @@ import { useState } from 'react';
 import { Link } from 'react-router-dom';
 
 import { getHuntCatalog, type HuntCatalog, type HuntCatalogSpec } from '../lib/api';
+import { loopRuns } from '../lib/analyticRuns';
 import { useDemo } from '../lib/demo';
 import { SEVERITY, tint } from '../lib/tokens';
 import { absTime, ago } from '../lib/timeRange';
@@ -66,7 +67,7 @@ const LEVEL_SEVERITY: Record<string, Severity> = {
 // row is shipped and live, which is the default for the whole catalog and the
 // same default the backend applies. Rendered without the status, a retired
 // analytic and a quiet live one are the same row of zeros.
-function TierStatus({ spec }: { spec: HuntCatalogSpec }) {
+function TierStatus({ spec, running }: { spec: HuntCatalogSpec; running: boolean | null }) {
   return (
     <>
       <span
@@ -76,7 +77,7 @@ function TierStatus({ spec }: { spec: HuntCatalogSpec }) {
         {spec.tier ?? 'shipped'}
       </span>
       <span className="flex-none text-[11.5px] text-dim">
-        <StatusDot status={spec.status ?? 'live'} />
+        <StatusDot status={spec.status ?? 'live'} running={running} />
       </span>
     </>
   );
@@ -265,7 +266,7 @@ function sweepOverdue(data: HuntCatalog, now: number): boolean {
 }
 
 const PROFILE_ROW_TITLE =
-  'A stored behavioural profile of a host answers this analytic, so the catalog sweep does not run it. The hourly profile sweep runs it. This panel has no trail for that loop, so it reports nothing here. A count of zero would read as \u201cswept, found nothing\u201d.';
+  'A stored behavioural profile of a host answers this analytic, so the analytic sweep does not run it. The hourly profile sweep runs it. This panel has no trail for that loop, so it reports nothing here. A count of zero would read as \u201cswept, found nothing\u201d.';
 
 const COVERAGE_TITLE =
   'The newest run of the profile sweep, counted in analytic-entity evaluations. measured: soc-ai scored the entity against a real baseline. learning: the entity has under 7 days of history. blind: no baseline, no confident role, or no telemetry on the grid that can answer. n/a: the host\u2019s role is outside the analytic\u2019s scope. fired: evaluations that produced a departure.';
@@ -397,13 +398,21 @@ function RowTitle({ spec, onOpen }: { spec: HuntCatalogSpec; onOpen: (id: string
   );
 }
 
-function ProfileSpecRow({ spec, onOpen }: { spec: HuntCatalogSpec; onOpen: (id: string) => void }) {
+function ProfileSpecRow({
+  spec,
+  running,
+  onOpen,
+}: {
+  spec: HuntCatalogSpec;
+  running: boolean | null;
+  onOpen: (id: string) => void;
+}) {
   const c = spec.coverage;
   return (
     <li className="flex items-center gap-2.5 px-[15px] py-3 text-[13px]">
       <RowTitle spec={spec} onOpen={onOpen} />
       <LevelPill level={spec.level} />
-      <TierStatus spec={spec} />
+      <TierStatus spec={spec} running={running} />
       {c === null ? (
         <span className="flex-none text-[12px] text-dim" title={PROFILE_ROW_TITLE}>
           not yet run · <code className="font-mono text-[11.5px]">soc-ai priors</code>
@@ -416,14 +425,17 @@ function ProfileSpecRow({ spec, onOpen }: { spec: HuntCatalogSpec; onOpen: (id: 
           <span className="flex-none font-mono text-[11.5px] text-dim" title={COVERAGE_TITLE}>
             fired {c.fired} · measured {c.measured} · learning {c.learning} · blind {c.blind}
             {c.not_applicable > 0 && ` · n/a ${c.not_applicable}`}
+            {/* The totals of a run that reached the recent read's cap count
+                the cap, not the estate. */}
+            {c.capped && ` · capped at ${c.recent_cap ?? 500}`}
           </span>
           <span className="flex-none text-[12px] text-dim" title={c.last_run_at ? absTime(c.last_run_at) : undefined}>
             last run {ago(c.last_run_at)}
           </span>
-          {c.shadow && (
-            // Plain "shadow", not "shadow ×N": on a swept row the count is
-            // how many of the window's sweeps were shadow runs, and here every
-            // run is, so a number would be a count of nothing.
+          {spec.status === 'shadow' && (
+            // The analytic's status, the one source the Hunts tab reads too.
+            // The trail's own flag said shadow on every live prior, so this
+            // screen showed "live" and "shadow" on one row.
             <span
               className="inline-flex flex-none items-center gap-1 whitespace-nowrap rounded-chip border px-1.5 py-px text-[9.5px] font-semibold tracking-[.02em]"
               style={{ color: AMBER, borderColor: tint(AMBER, 0.35), background: tint(AMBER, 0.09) }}
@@ -449,12 +461,20 @@ function ProfileSpecRow({ spec, onOpen }: { spec: HuntCatalogSpec; onOpen: (id: 
   );
 }
 
-function SpecRow({ spec, onOpen }: { spec: HuntCatalogSpec; onOpen: (id: string) => void }) {
+function SpecRow({
+  spec,
+  running,
+  onOpen,
+}: {
+  spec: HuntCatalogSpec;
+  running: boolean | null;
+  onOpen: (id: string) => void;
+}) {
   return (
     <li className="flex items-center gap-2.5 px-[15px] py-3 text-[13px]">
       <RowTitle spec={spec} onOpen={onOpen} />
       <LevelPill level={spec.level} />
-      <TierStatus spec={spec} />
+      <TierStatus spec={spec} running={running} />
       {spec.last_swept_at === null ? (
         // Null trail: the loop has never reached this spec. Zeros here would
         // read as "swept, saw nothing", which is the confusion the trail
@@ -511,7 +531,7 @@ export function HuntCatalogPanel() {
   const profiled = specs.filter((s) => s.evaluator === 'profile');
   const swept = specs.filter((s) => s.evaluator !== 'profile');
   return (
-    <Panel className="md:col-span-2">
+    <Panel id="catalog" className="md:col-span-2">
       <PanelHeader
         icon={<Radar size={16} />}
         title="Analytics"
@@ -563,7 +583,12 @@ export function HuntCatalogPanel() {
               </div>
               <ul className="divide-y divide-border">
                 {swept.map((spec) => (
-                  <SpecRow key={spec.id} spec={spec} onOpen={setOpenId} />
+                  <SpecRow
+                    key={spec.id}
+                    spec={spec}
+                    running={loopRuns(data, spec.evaluator)}
+                    onOpen={setOpenId}
+                  />
                 ))}
               </ul>
               {profiled.length > 0 && (
@@ -574,7 +599,11 @@ export function HuntCatalogPanel() {
                       the catalog sweep, and none of them apply here. */}
                   <div className="flex items-center justify-between gap-2 border-y border-border-faint bg-surface-2/40 px-[15px] py-1.5 text-[11px] text-dim">
                     <span>Evaluated against behavioural profiles · {profiled.length}</span>
-                    <span title={PROFILE_ROW_TITLE}>run by the hourly profile sweep · counts are analytic-host evaluations</span>
+                    <span title={PROFILE_ROW_TITLE}>
+                      {data.prior_sweeps_enabled === false
+                        ? 'The profile sweep is off. These analytics do not run.'
+                        : 'run by the hourly profile sweep · counts are analytic-host evaluations'}
+                    </span>
                   </div>
                   {/* The two chips on these rows are the vocabulary of the
                       layer, and a reader meets them here first. */}
@@ -599,7 +628,12 @@ export function HuntCatalogPanel() {
                   </div>
                   <ul className="divide-y divide-border">
                     {profiled.map((spec) => (
-                      <ProfileSpecRow key={spec.id} spec={spec} onOpen={setOpenId} />
+                      <ProfileSpecRow
+                        key={spec.id}
+                        spec={spec}
+                        running={loopRuns(data, 'profile')}
+                        onOpen={setOpenId}
+                      />
                     ))}
                   </ul>
                 </>

@@ -7,6 +7,7 @@ import logging
 import re
 from collections.abc import Sequence
 from datetime import UTC, datetime, time, timedelta
+from time import monotonic
 from typing import Any
 
 from elastic_transport import TransportError
@@ -43,6 +44,7 @@ from soc_ai.demo.replay import find_replay, start_background_replay
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.so_client.fields import get_dotted
 from soc_ai.so_client.inventory import discover_datasets
+from soc_ai.store import analytics as analytics_store
 from soc_ai.store import host_dossier as dossier_store
 from soc_ai.store import hunt_schedules as hs_svc
 from soc_ai.store import hunt_templates as ht_svc
@@ -196,6 +198,9 @@ class HuntFindingOut(BaseModel):
     # (mirrors the promotion route's idempotency), so the UI shows Investigate
     # again — status is included so the card can tell running from complete.
     investigation: HuntFindingInvOut | None = None
+    # The analytic an analyst drafted from this finding, while it is not
+    # retired. The card links it and offers no second draft.
+    analyticId: str | None = None
 
 
 # The classifier lives in soc_ai.hunting.findings so the notifications bell and
@@ -436,8 +441,51 @@ def _hunt_row(hunt: Hunt, chat_count: int = 0) -> HuntRowOut:
     )
 
 
-def _build_hunt_timeline(events: list[HuntEvent]) -> list[TimelineStepOut]:
-    """Reuse the shared tool-step formatter; bucket by the hunt group map."""
+# The pseudo-tool the agent returns its structured report through. It never
+# lands a tool_result, so the shared formatter read it as "running…" for ever,
+# on a hunt that finished two days before. A hunt ends in findings, so the
+# step is named for them.
+_SYNTH_TOOL = "final_result"
+_SYNTH_TITLE = "Findings synthesis"
+_SYNTH_STATE: dict[str, str] = {
+    "complete": "done",
+    "cancelled": "stopped by a cancel request",
+    "interrupted": "stopped by a service restart",
+    "error": "did not finish",
+}
+# The outcome of a tool call with no result on a hunt that has ended.
+_NO_RESULT_ON_A_TERMINAL_HUNT = "no result recorded"
+
+
+def _event_time(payload: dict[str, Any]) -> str:
+    """The wall-clock time the recorder stamped on the event, as HH:MM:SS UTC.
+
+    Rows recorded before the stamp carry none, and the step shows no time.
+    """
+    raw = payload.get("_at")
+    if not isinstance(raw, str) or not raw:
+        return ""
+    try:
+        at = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    if at.tzinfo is not None:
+        at = at.astimezone(UTC)
+    return at.strftime("%H:%M:%S")
+
+
+def _build_hunt_timeline(
+    events: list[HuntEvent], hunt_status: str = "running"
+) -> list[TimelineStepOut]:
+    """Reuse the shared tool-step formatter; bucket by the hunt group map.
+
+    ``hunt_status`` settles the steps a running hunt leaves open. A step with
+    no result on a hunt that has ended never reads "running…": the synthesis
+    step states how the hunt ended, and any other step states that no result
+    was recorded. The rule reads the hunt's status, so an old stored row
+    reads right with no backfill.
+    """
+    terminal = hunt_status not in ("running", "queued")
     result_by_call = {
         (e.payload or {}).get("tool_call_id"): (e.payload or {}).get("result")
         for e in events
@@ -447,11 +495,17 @@ def _build_hunt_timeline(events: list[HuntEvent]) -> list[TimelineStepOut]:
     for e in events:
         if e.kind in _HUNT_TL_SKIP:
             continue
-        p = e.payload or {}
+        stamped = e.payload or {}
+        p = {k: v for k, v in stamped.items() if k != "_at"}
         if e.kind == "tool_call":
             tn = str(p.get("tool_name", ""))
             result = result_by_call.get(p.get("tool_call_id"))
             title, detail = _tool_step(tn, p.get("args") or {}, result)
+            if tn == _SYNTH_TOOL:
+                state = _SYNTH_STATE.get(hunt_status, "running…") if terminal else "running…"
+                title = f"{_SYNTH_TITLE}: {state}"
+            elif result is None and terminal and title.endswith(": running…"):
+                title = title.removesuffix("running…") + _NO_RESULT_ON_A_TERMINAL_HUNT
         elif e.kind == "hunt_started":
             title = "Objective"
             detail = _compact(p.get("objective") or "", 400)
@@ -471,6 +525,7 @@ def _build_hunt_timeline(events: list[HuntEvent]) -> list[TimelineStepOut]:
                 id=f"h{e.sequence}",
                 group=_HUNT_TL_GROUP.get(e.kind, "Tool calls"),
                 title=title,
+                time=_event_time(stamped),
                 detail=detail,
             )
         )
@@ -633,10 +688,12 @@ def _compute_hunt_diff(
 async def get_hunt(request: Request, hunt_id: str) -> HuntOut:
     diff: HuntDiffOut | None = None
     inv_map: dict[int, Investigation] = {}
+    drafted: dict[int, str] = {}
     async with request.app.state.db_sessionmaker() as db:
         got = await hunt_svc.get_with_events(db, hunt_id)
         if got is not None:
             hunt, _ = got
+            drafted = await analytics_store.drafted_for_hunt(db, hunt_id)
             # Per-finding promotion state (newest investigation per ordinal) —
             # the card's Investigate/Investigating…/Open state.
             inv_map = await inv_svc.latest_per_finding(db, hunt_id)
@@ -683,6 +740,7 @@ async def get_hunt(request: Request, hunt_id: str) -> HuntOut:
                 specRationale=_finding_rationale(f),
                 matchedDocs=_finding_matched_docs(f),
                 investigation=_finding_inv_out(inv_map.get(i)),
+                analyticId=drafted.get(i),
             )
             for i, f in enumerate(findings)
             if isinstance(f, dict)
@@ -701,7 +759,7 @@ async def get_hunt(request: Request, hunt_id: str) -> HuntOut:
         elapsedSec=elapsed,
         # tz-AWARE ISO so the browser localizes correctly (naive → parsed as local).
         ts=_iso_utc(hunt.created_at),
-        timeline=_build_hunt_timeline(events),
+        timeline=_build_hunt_timeline(events, _HUNT_STATUS.get(hunt.status, "error")),
         diff=diff,
         isSynthEval=bool(hunt.is_synth_eval),
     )
@@ -1674,17 +1732,21 @@ class HuntScheduleOut(BaseModel):
     intervalMinutes: int
     enabled: bool
     lastRunAt: str | None = None
+    # The hunt the schedule last started, so "last ran" links to it. None
+    # when no scheduled hunt with this objective is in the store.
+    lastHuntId: str | None = None
     createdBy: str
     createdAt: str
 
 
-def _schedule_out(row: HuntSchedule) -> HuntScheduleOut:
+def _schedule_out(row: HuntSchedule, last_hunt_id: str | None = None) -> HuntScheduleOut:
     return HuntScheduleOut(
         id=row.id,
         objective=row.objective,
         intervalMinutes=row.interval_minutes,
         enabled=row.enabled,
         lastRunAt=_iso_utc(row.last_run_at) if row.last_run_at is not None else None,
+        lastHuntId=last_hunt_id if row.last_run_at is not None else None,
         createdBy=row.created_by,
         createdAt=_iso_utc(row.created_at),
     )
@@ -1707,8 +1769,9 @@ async def list_hunt_schedules(
     plus whether the ``hunt_schedules_enabled`` master switch is currently on."""
     async with request.app.state.db_sessionmaker() as db:
         rows = await hs_svc.list_all(db)
+        last_runs = await hunt_svc.latest_scheduled_runs(db, [r.objective for r in rows])
     return HuntScheduleListOut(
-        schedules=[_schedule_out(r) for r in rows],
+        schedules=[_schedule_out(r, last_runs.get(r.objective)) for r in rows],
         masterSwitchEnabled=bool(getattr(settings, "hunt_schedules_enabled", False)),
     )
 
@@ -1850,18 +1913,27 @@ class HuntTemplateOut(BaseModel):
     # ``available`` says the grid can SEE the telemetry; ``applicable`` says the
     # network HAS the machinery the hunt is about (a Windows host, a domain).
     # False iff a requirement in ht_svc.BUILTIN_ENV_REQUIREMENTS is met by NO
-    # resolved dossier. ``missingEnvironment`` carries the human phrases
-    # ("a domain-joined host"). A not-applicable template is DEMOTED in the
-    # picker, never hidden, and stays fully runnable. Fail-open: custom
-    # templates, profile errors and a never-built dossier table are all True.
+    # resolved dossier and by NO live Windows plane on the grid.
+    # ``missingEnvironment`` carries the human phrases ("a domain-joined host").
+    # A not-applicable template is DEMOTED in the picker, never hidden, and
+    # stays fully runnable. Fail-open: custom templates, profile errors and a
+    # never-built dossier table are all True.
     applicable: bool = True
     missingEnvironment: list[str] = []
 
 
 def _environment_fit(
-    row: HuntTemplate, profile: dossier_store.EnvironmentProfile | None
+    row: HuntTemplate,
+    profile: dossier_store.EnvironmentProfile | None,
+    grid_env: frozenset[str] = frozenset(),
 ) -> tuple[bool, list[str]]:
     """``(applicable, missing-environment phrases)`` for one template.
+
+    ``grid_env`` is the set of requirements the grid's live datasets satisfy
+    on their own (:func:`ht_svc.environment_from_datasets`). A requirement in
+    it is met whatever the dossier says: a domain controller that ships its
+    Security log proves a Windows host and a domain even when no dossier has
+    resolved an ``os_family`` or a ``domain_membership`` fact.
 
     FAIL-OPEN, all three rules mandatory:
 
@@ -1890,7 +1962,7 @@ def _environment_fit(
     missing = [
         ht_svc.ENV_REQUIREMENT_PHRASES.get(req, req)
         for req in requirements
-        if not met.get(req, True)
+        if req not in grid_env and not met.get(req, True)
     ]
     return not missing, missing
 
@@ -1908,7 +1980,9 @@ def _template_out(
     error must never hide or falsely flag a template) and, crucially,
     ``availabilityKnown=False``, so the fail-open value is never mistaken for a
     measured one. ``profile is None`` fails open the same way on the environment
-    axis (see :func:`_environment_fit`).
+    axis (see :func:`_environment_fit`). The live dataset names in ``present``
+    also feed the environment axis: a Windows plane on the grid reopens the
+    Windows and domain hunts.
     """
     required = [str(d) for d in (row.required_datasets or [])]
     if present is None:
@@ -1930,7 +2004,8 @@ def _template_out(
             for d in required
             if d not in missing and not any(alt in live_names for alt in ht_svc.alternatives(d))
         ]
-    applicable, missing_environment = _environment_fit(row, profile)
+    grid_env = ht_svc.environment_from_datasets(present[1]) if present is not None else frozenset()
+    applicable, missing_environment = _environment_fit(row, profile, grid_env)
     return HuntTemplateOut(
         id=row.id,
         name=row.name,
@@ -1950,6 +2025,11 @@ def _template_out(
     )
 
 
+# How long a failed inventory read answers for itself on the template route.
+# Short: the picker polls every 60 s, so a recovered grid shows within a poll.
+_INVENTORY_FAILURE_TTL_S = 60.0
+
+
 async def _present_dataset_names(request: Request) -> tuple[set[str], set[str]] | None:
     """``(present, live)`` dataset-name sets, or ``None`` on failure.
 
@@ -1966,15 +2046,29 @@ async def _present_dataset_names(request: Request) -> tuple[set[str], set[str]] 
     on a console route, and against a grid that accepts but never answers the ES
     client's retry budget would hold the Hunt Console for ~90 s. The timeout lands
     in the same fail-open branch as any other discovery failure.
+
+    A failed read is remembered for ``_INVENTORY_FAILURE_TTL_S``. The inventory
+    cache in :mod:`soc_ai.so_client.inventory` stores successes only, so on a
+    grid that stalls every poll of the picker waited out the full timeout again
+    (10 to 12 s per call, measured). Inside the window the route answers at
+    once with ``None``, which the caller reports as ``availabilityKnown=False``:
+    unknown, never "available" and never "missing". The memory lives on
+    ``app.state`` so each app instance starts clean.
     """
+    state = request.app.state
+    failed_until: float | None = getattr(state, "hunt_template_inventory_failed_until", None)
+    if failed_until is not None and monotonic() < failed_until:
+        return None
     try:
-        elastic = request.app.state.elastic
-        settings = request.app.state.settings
+        elastic = state.elastic
+        settings = state.settings
         async with asyncio.timeout(settings.webui_grid_timeout_s):
             inv = await discover_datasets(elastic, settings)
     except Exception:
         _LOGGER.warning("hunt-template availability: inventory discovery failed", exc_info=True)
+        state.hunt_template_inventory_failed_until = monotonic() + _INVENTORY_FAILURE_TTL_S
         return None
+    state.hunt_template_inventory_failed_until = None
     return set(inv.dataset_names()), set(inv.live_dataset_names())
 
 
@@ -2250,8 +2344,53 @@ class LeadKindWeightOut(BaseModel):
     saturated: bool
 
 
+class LeadDecisionOut(BaseModel):
+    """One decision on a lead, in the order it was taken.
+
+    ``action`` is one of ``dismissed``, ``reopened``, ``promoted``,
+    ``closed_by_hunt`` and ``held``. A held entry names why the settle rule
+    left a clean hunt to the analyst in ``reason``.
+    """
+
+    action: str
+    at: str | None = None
+    by: str | None = None
+    reason: str | None = None
+    note: str | None = None
+    hunt_id: str | None = None
+    investigation_id: str | None = None
+
+
+def _decision_at(value: Any) -> str | None:
+    """A stored decision time as the ISO the page parses as UTC."""
+    if not isinstance(value, str) or not value:
+        return None
+    return value if value.endswith("Z") or "+" in value[10:] else value + "Z"
+
+
+def _decisions_out(lead: Any) -> list[LeadDecisionOut]:
+    from soc_ai.store.leads import decisions_of  # noqa: PLC0415 - lazy
+
+    out: list[LeadDecisionOut] = []
+    for d in decisions_of(lead):
+        out.append(
+            LeadDecisionOut(
+                action=str(d.get("action") or ""),
+                at=_decision_at(d.get("at")),
+                by=(str(d["by"]) if d.get("by") else None),
+                reason=(str(d["reason"]) if d.get("reason") else None),
+                note=(str(d["note"]) if d.get("note") else None),
+                hunt_id=(str(d["hunt_id"]) if d.get("hunt_id") else None),
+                investigation_id=(
+                    str(d["investigation_id"]) if d.get("investigation_id") else None
+                ),
+            )
+        )
+    return out
+
+
 class LeadDetailOut(LeadOut):
-    """One lead with its timeline, its live weight and its dismissal."""
+    """One lead with its timeline, its live weight and its decisions."""
 
     weight_now: float
     # The live weight per type, each against the cap one type can reach.
@@ -2264,6 +2403,14 @@ class LeadDetailOut(LeadOut):
     dismissed_at: str | None = None
     investigation_id: str | None = None
     dismiss_reasons: list[str]
+    # Every decision on the lead, oldest first: dismissals, reopens, the
+    # promotion, the close by a clean hunt, and a hold.
+    decisions: list[LeadDecisionOut] = []
+    # Why a finished hunt did not close the lead, when the settle rule held
+    # it: ``partial_read`` or ``earlier_threat``. ``hold_sentence`` is the
+    # line the page prints.
+    hold_reason: str | None = None
+    hold_sentence: str | None = None
     # The open leads this one shares an analytic, an external network or a
     # technique with, newest first. Computed on read.
     related: list[LeadRelatedOut] = []
@@ -2277,6 +2424,22 @@ class LeadDismissIn(BaseModel):
 
 def _iso(dt: Any) -> str | None:
     return dt.isoformat() + "Z" if isinstance(dt, datetime) else None
+
+
+# Every value GET /leads takes for ``status``: the stored values, ``all`` and
+# the four tab aliases. Anything else used to fall through to a WHERE on a
+# status no row holds and answer [], which reads as "no leads".
+_LEAD_STATUS_FILTERS = (
+    "open",
+    "hunting",
+    "dismissed",
+    "promoted",
+    "all",
+    "new",
+    "closed",
+    "needs_decision",
+    "in_progress",
+)
 
 
 @router.get("/leads", response_model=list[LeadOut])
@@ -2299,6 +2462,12 @@ async def list_leads(request: Request, status: str = "open", limit: int = 50) ->
     from soc_ai.store import leads as leads_store  # noqa: PLC0415 - lazy
     from soc_ai.store.models import EntityObservation, Lead  # noqa: PLC0415 - lazy
 
+    if status not in _LEAD_STATUS_FILTERS:
+        raise api_error(
+            422,
+            "bad_filter",
+            f"status accepts one of these values: {', '.join(_LEAD_STATUS_FILTERS)}.",
+        )
     limit = max(1, min(int(limit), 200))
     auto_hunt = _auto_hunt(request)
     async with request.app.state.db_sessionmaker() as db:
@@ -2445,6 +2614,8 @@ async def _lead_detail_from_db(
             h.id: h
             for h in (await db.scalars(select(Hunt).where(Hunt.id.in_(related_hunt_ids)))).all()
         }
+    from soc_ai.store.leads import derived_hold_reason  # noqa: PLC0415 - lazy
+
     return _lead_detail(
         lead,
         rows,
@@ -2455,6 +2626,7 @@ async def _lead_detail_from_db(
         related=related,
         related_hunts=related_hunts,
         auto_hunt=auto_hunt,
+        hold_reason=await derived_hold_reason(db, lead),
     )
 
 
@@ -2469,6 +2641,7 @@ def _lead_detail(
     related: Sequence[Any] | None = None,
     related_hunts: dict[str, Hunt] | None = None,
     auto_hunt: bool = False,
+    hold_reason: str | None = None,
 ) -> LeadDetailOut:
     """One lead, its observations and what each one is worth now.
 
@@ -2481,7 +2654,12 @@ def _lead_detail(
         live_weight,
         weight_by_kind,
     )
-    from soc_ai.store.leads import DISMISS_REASONS, hunt_is_queued  # noqa: PLC0415 - lazy
+    from soc_ai.store.leads import (  # noqa: PLC0415 - lazy
+        DISMISS_REASONS,
+        HOLD_SENTENCES,
+        hold_reason_of,
+        hunt_is_queued,
+    )
 
     obs = []
     pairs: list[tuple[str, float]] = []
@@ -2541,6 +2719,7 @@ def _lead_detail(
                 hunt_outcome_label=r_label,
             )
         )
+    hold = hold_reason if hold_reason is not None else hold_reason_of(lead)
     return LeadDetailOut(
         id=lead.id,
         hunt_status=hunt_status,
@@ -2566,6 +2745,9 @@ def _lead_detail(
         investigation_id=lead.investigation_id,
         investigation_exists=investigation_exists,
         dismiss_reasons=list(DISMISS_REASONS),
+        decisions=_decisions_out(lead),
+        hold_reason=hold,
+        hold_sentence=HOLD_SENTENCES.get(hold or ""),
         related=related_out,
         related_count=len(related_out),
         observations=obs,
@@ -2758,7 +2940,7 @@ async def promote_lead(
     )
     async with request.app.state.db_sessionmaker() as db:
         try:
-            await leads_store.mark_promoted(db, lead_id, investigation_id=inv_id)
+            await leads_store.mark_promoted(db, lead_id, investigation_id=inv_id, by=started_by)
         except ValueError as exc:
             # The lead closed while the console was starting the investigation.
             lead = await leads_store.get(db, lead_id)
@@ -2768,11 +2950,11 @@ async def promote_lead(
 
 @router.post("/hunts/leads/{lead_id}/reopen", response_model=LeadDetailOut)
 async def reopen_lead(request: Request, lead_id: int) -> LeadDetailOut:
-    """Put a closed lead back to open. The dismissal stays as history.
+    """Put a closed lead back to open. The dismissal moves to the history.
 
     A dismissal is reversible. The reason, the note, the hand and the time of
-    the dismissal are kept on the row, so the page can show it as a timeline
-    event and the sharpening loop can read the reason.
+    the dismissal stay in the lead's decisions, so the page shows it as a
+    timeline event. The current dismissal fields are cleared.
     """
     from soc_ai.store import leads as leads_store  # noqa: PLC0415 - lazy
 

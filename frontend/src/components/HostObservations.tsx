@@ -134,8 +134,10 @@ export function HostObservations({
         )
       ) : rows.length === 0 ? (
         <div className="px-[15px] py-3 text-[12.5px] text-dim">
-          No observations on this {noun} in the last {DAYS} days. Operate shows the analytics
-          that could not score it.
+          No observations on this {noun} in the last {DAYS} days.{' '}
+          <Link to="/operate#catalog" className="text-accent hover:underline">
+            Operate shows the analytics that could not score it.
+          </Link>
         </div>
       ) : (
         <ul className="divide-y divide-border-faint">

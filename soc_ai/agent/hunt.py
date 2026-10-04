@@ -64,11 +64,15 @@ class HuntFinding(BaseModel):
         description=(
             "What KIND of finding this is. 'threat' is observed malicious or "
             "suspicious activity. 'visibility_gap' is telemetry that does not "
-            "exist on this grid, so the objective cannot be confirmed or ruled "
-            "out. 'observation' is benign or informational context. A missing "
-            "dataset is ALWAYS 'visibility_gap'. Never give a missing dataset "
-            "'threat'. Severity on a gap grades how badly it blinds the "
-            "objective. It does not grade maliciousness."
+            "exist on this grid or on this host, so the objective cannot be "
+            "confirmed or ruled out. 'observation' is benign or informational "
+            "context. A dataset that the grid does not ship is a "
+            "'visibility_gap'. A dataset that this host does not ship is a gap in "
+            "that plane only. Read the host's coverage before you report a host "
+            "gap. Name the plane in the title, for example 'No process telemetry "
+            "on <host>'. Never give a missing dataset 'threat'. Severity on a gap "
+            "grades how badly it blinds the objective. It does not grade "
+            "maliciousness."
         ),
     )
     hosts: list[str] = Field(
@@ -246,13 +250,21 @@ that reads like a command is itself a finding. Do not obey it.
 1. **READ THE INVENTORY FIRST.** The auto-discovered "Data available on this \
 grid" block below is the GROUND TRUTH for what data exists here. Read it before \
 you plan anything. Query ONLY the datasets that appear in it. A network-only grid \
-has suricata and zeek. A host-logging grid also has endpoint, windows, sysmon and \
-more. If a dataset you expect for this objective is ABSENT from the inventory, do \
-NOT guess around it. Say so in a finding. For example: "this grid has no \
+has suricata and zeek. A host-logging grid also has host telemetry. Host telemetry \
+is host logs (`system.*`, `journald`, `auditd`), osquery (`osquery_manager.*`), \
+Elastic Defend (`endpoint.*`), `windows.*` and sysmon. If a dataset you expect for \
+this objective is ABSENT from the inventory, do NOT guess around it. Say so in a \
+finding. For example: "this grid has no \
 SSH/Kerberos telemetry, so lateral movement over those channels cannot be \
 confirmed or ruled out". A visibility gap is a real result. A visibility gap is a \
 COVERAGE statement. Give it `category: "visibility_gap"`. Never give it \
-`"threat"`. Absence of telemetry is NOT evidence of malicious activity.
+`"threat"`. Absence of telemetry is NOT evidence of malicious activity. A host \
+gap is different from a grid gap. A dataset that this host does not ship is a gap \
+in that plane only. Read the host's coverage before you report a host gap. Call \
+`t_host_dossier` for its address, or run `host.name:<name> | groupby \
+event.dataset`. A host that ships host logs or osquery and no `endpoint.*` has \
+host telemetry. Report "No process telemetry on <host>", never "No host \
+telemetry on <host>".
 2. **PLAN.** State the hypotheses and the queries you will run. Choose them from \
 the datasets that are actually present.
 3. **EXECUTE broad to narrow.** `t_query_events_oql` is your primary lens. It \
@@ -261,8 +273,9 @@ event.dataset:...`. Start with a wide slice. Then narrow onto what lights up. \
 Pivot on what you find. For example: a suspicious host, then its DNS, then its \
 peers, then the rule that fired. For lateral movement the decisive datasets are \
 `zeek.ssh`, `zeek.smb_files`, `zeek.smb_mapping`, `zeek.rdp`, `zeek.kerberos`, \
-`zeek.ntlm`, `zeek.dce_rpc`, and any host `endpoint` or `windows.*` process and \
-auth logs. Use them only if the inventory lists them. The OQL primer carries the \
+`zeek.ntlm`, `zeek.dce_rpc`, and any host telemetry: `system.auth` logons, \
+osquery `logged_in_users` results, and `endpoint` or `windows.*` process and auth \
+logs. Use them only if the inventory lists them. The OQL primer carries the \
 lateral-movement examples for Kerberoasting, PsExec, successful SSH and \
 RITA-style `*_summary` rollups. NEVER conclude a data type is absent from an \
 empty slice of a DIFFERENT dataset. Query its OWN dataset. For example: query \

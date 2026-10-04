@@ -40,7 +40,7 @@ class LivenessResponse(BaseModel):
     # not alive, which is the entire signal a liveness probe carries.
     status: Literal["alive"] = "alive"
     checks: str = (
-        "none — liveness only, no dependency is probed. "
+        "None. This is a liveness probe only. It probes no dependency. "
         "For a health verdict use GET /api/v1/health or `soc-ai doctor`."
     )
     version: str

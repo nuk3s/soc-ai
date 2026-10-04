@@ -15,9 +15,9 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from soc_ai.config import Settings
-from soc_ai.errors import OqlValidationError
+from soc_ai.errors import OqlValidationError, TimeBoundError
 from soc_ai.so_client.elastic import ElasticClient
-from soc_ai.so_client.fields import ENVELOPE_FIELD, envelope
+from soc_ai.so_client.fields import ENVELOPE_FIELD, detection_kind, envelope
 from soc_ai.so_client.oql import filter_to_dsl, parse_oql, validate_oql
 from soc_ai.tools._synth_scope import synth_scope_must_not
 
@@ -181,16 +181,11 @@ UNNAMED_KIND = "unnamed"
 # the literal text.
 UNKNOWN_DATASET = "(unknown dataset)"
 
-# event.dataset → triage "kind" badge.
-_KIND_BY_DATASET = {
-    "suricata.alert": "suricata",
-    "sigma.alert": "sigma",
-    "zeek.notice": "notice",
-}
 
-
-def _kind_for(dataset: str | None) -> str:
-    return _KIND_BY_DATASET.get((dataset or "").lower(), "alert")
+def _kind_for(dataset: str | None, module: str | None = None) -> str:
+    # The triage "kind" badge. One derivation, shared with the investigation
+    # row: see soc_ai.so_client.fields.detection_kind.
+    return detection_kind(dataset, module)
 
 
 @dataclass
@@ -324,8 +319,9 @@ def _parse_abs_ts(value: str, *, bound: str) -> datetime:
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError as exc:
-        raise OqlValidationError(
-            f"{bound} must be an ISO 8601 timestamp (e.g. 2026-08-10T00:00:00Z), got {value!r}",
+        raise TimeBoundError(
+            f"{bound} must be an ISO 8601 timestamp, for example 2026-08-10T00:00:00Z. "
+            f"soc-ai got {value[:60]!r}.",
             fragment=value,
         ) from exc
 
@@ -364,7 +360,9 @@ def build_filter(
         # Deliberate over-block: rejects "|" even inside quoted values; pipe stages are
         # meaningless here and quoted-pipe rule names are rare. Revisit if it bites.
         if "|" in oql:
-            raise OqlValidationError("pipes are not supported here — grouping is built in")
+            raise OqlValidationError(
+                "This filter does not accept pipe stages. The page groups the alerts itself."
+            )
         must.append(_oql_filter_dsl(oql))
     if abs_from and abs_to:
         lo = _parse_abs_ts(abs_from, bound="from")
@@ -416,7 +414,7 @@ def build_filter(
 # The per-label ``event.dataset`` breakdown rides on the same size=0 searches
 # the label counts already run. ``event.dataset`` is the class dimension because
 # it is the one the product already treats as the kind of an alert
-# (``_KIND_BY_DATASET``, :data:`SIGMA_SOURCE_OQL`, the unnamed-group fallback) and
+# (``detection_kind``, :data:`SIGMA_SOURCE_OQL`, the unnamed-group fallback) and
 # the one a narrowed filter is usually written against.
 ALERT_CLASS_AGG = "alert_classes"
 # Buckets per label. Grids measured so far carry a handful of alert datasets, so
@@ -704,7 +702,7 @@ def _group_from_bucket(bucket: dict[str, Any], *, kind: str | None = None) -> Al
         severity=str(_dig(src, "event.severity_label") or "unknown").lower(),
         latest_ts=str(_dig(src, "@timestamp") or ""),
         latest_id=str(top[0].get("_id", "")) if top else "",
-        kind=kind or _kind_for(_dig(src, "event.dataset")),
+        kind=kind or _kind_for(_dig(src, "event.dataset"), _dig(src, "event.module")),
         acked_count=int((bucket.get("acked") or {}).get("doc_count", 0)) if answerable else None,
         escalated_count=(
             int((bucket.get("escalated") or {}).get("doc_count", 0)) if answerable else None
@@ -1060,7 +1058,7 @@ async def fetch_group_events(
                 src_ip=src_ip,
                 dst_ip=dst_ip,
                 dst_port=int(dst_port_text) if dst_port_text is not None else None,
-                kind=_kind_for(_dig(source, "event.dataset")),
+                kind=_kind_for(_dig(source, "event.dataset"), _dig(source, "event.module")),
                 host_ip=_host_ip(source, env),
                 acknowledged=_source_acknowledged(source),
                 escalated=_source_escalated(source),

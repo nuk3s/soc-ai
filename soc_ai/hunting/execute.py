@@ -30,7 +30,8 @@ reached if something survives.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from soc_ai.config import Settings
@@ -84,6 +85,12 @@ class Candidate:
     # The other machines this candidate's own documents name. Sorted and
     # deduplicated, and never the scope key itself.
     hosts: tuple[str, ...] = ()
+    # The values a spec's ``details`` fields hold in the sample documents, as
+    # (label, values) pairs in the spec's order. Only fields with a value.
+    details: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    # The level read from the spec's ``severity`` field, or None when no
+    # sample carries a mapped value and the spec's own level stands.
+    level: str | None = None
 
 
 @dataclass(frozen=True)
@@ -162,6 +169,14 @@ class SpecRun:
     # because the two can disagree: the catalog file is edited and the trail is
     # not, and a blind report has to name the window that run was blind over.
     precondition_since: str = ""
+    # The role gate of a role-scoped analytic, set by :func:`apply_role_gate`.
+    # Documents on scope hosts the dossier cannot place are neither a match nor
+    # a non-match, so they are counted apart, with the hosts, and the run is not
+    # clean. Documents on hosts the dossier places in another role are a
+    # decided non-match and leave ``matched_docs``.
+    role_unconfirmed_docs: int = 0
+    role_unconfirmed_hosts: tuple[str, ...] = ()
+    role_out_of_scope_docs: int = 0
 
     @property
     def clean(self) -> bool:
@@ -184,6 +199,7 @@ class SpecRun:
             and self.matched_docs == 0
             and self.truncated_docs == 0
             and self.undecided_docs == 0
+            and self.role_unconfirmed_docs == 0
         )
 
 
@@ -204,15 +220,25 @@ def _agg_body(spec: HuntSpec) -> dict[str, Any]:
                     "top_hits": {
                         "size": MAX_SAMPLE_IDS,
                         "sort": [{"@timestamp": {"order": "desc"}}],
-                        # Only the fields that name a machine. A full _source
-                        # would carry the whole document into memory for three
-                        # values, and _source False carried nothing at all.
-                        "_source": list(RELATED_FIELDS),
+                        # Only the fields that name a machine, and the fields
+                        # the spec quotes. A full _source would carry the whole
+                        # document into memory for three values, and _source
+                        # False carried nothing at all.
+                        "_source": _source_fields(spec),
                     }
                 },
             },
         }
     }
+
+
+def _source_fields(spec: HuntSpec) -> list[str]:
+    """The ``_source`` fields a sample hit carries back."""
+    wanted = list(RELATED_FIELDS)
+    wanted += [d.field for d in spec.details]
+    if spec.severity is not None:
+        wanted.append(spec.severity.field)
+    return list(dict.fromkeys(wanted))
 
 
 # The undecided query's per-field breakdown, named once so the writer and the
@@ -314,6 +340,45 @@ def _related_hosts(hits: list[dict[str, Any]], scope_key: str) -> tuple[str, ...
     return tuple(sorted(found))[:MAX_RELATED_HOSTS]
 
 
+# How many distinct values one detail field quotes, and how long each may be. A
+# path or a command line can run to kilobytes, and the finding is read in a list.
+MAX_DETAIL_VALUES = 3
+MAX_DETAIL_CHARS = 200
+
+# Lowest first, so the highest level a sample maps to is the one kept.
+_LEVEL_ORDER = ("informational", "low", "medium", "high", "critical")
+
+
+def _details(spec: HuntSpec, hits: list[dict[str, Any]]) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """The spec's detail fields as the sample documents hold them."""
+    out: list[tuple[str, tuple[str, ...]]] = []
+    for detail in spec.details:
+        values: list[str] = []
+        for hit in hits:
+            for value in _field_values(hit.get("_source"), detail.field):
+                text = value[:MAX_DETAIL_CHARS]
+                if text not in values:
+                    values.append(text)
+        if values:
+            out.append((detail.label, tuple(values[:MAX_DETAIL_VALUES])))
+    return tuple(out)
+
+
+def _level(spec: HuntSpec, hits: list[dict[str, Any]]) -> str | None:
+    """The highest level a sample document maps to, or None."""
+    if spec.severity is None:
+        return None
+    mapped = [
+        spec.severity.map[value]
+        for hit in hits
+        for value in _field_values(hit.get("_source"), spec.severity.field)
+        if value in spec.severity.map
+    ]
+    if not mapped:
+        return None
+    return max(mapped, key=_LEVEL_ORDER.index)
+
+
 def _candidates_from(spec: HuntSpec, aggs: dict[str, Any]) -> tuple[list[Candidate], int]:
     """Every bucket becomes a Candidate. Truncation is the gate's job, not this one.
 
@@ -344,9 +409,55 @@ def _candidates_from(spec: HuntSpec, aggs: dict[str, Any]) -> tuple[list[Candida
                 first_seen=(bucket.get("first_seen") or {}).get("value_as_string"),
                 last_seen=(bucket.get("last_seen") or {}).get("value_as_string"),
                 hosts=_related_hosts(hits, str(bucket.get("key", ""))),
+                details=_details(spec, hits),
+                level=_level(spec, hits),
             )
         )
     return out, truncated
+
+
+RoleOf = Callable[[str], tuple[str | None, float]]
+
+
+def apply_role_gate(spec: HuntSpec, run: SpecRun, role_of: RoleOf) -> SpecRun:
+    """Hold a run to the spec's role gate. A spec with no roles passes through.
+
+    ``role_of`` answers the dossier role and its confidence for one scope key.
+    The sweep passes the dossier. The coverage gate passes the roles a
+    scenario declares. One function serves both, so the two cannot disagree
+    about which candidate a role removes.
+
+    A candidate on a host in another role at full confidence leaves the run,
+    and its documents leave ``matched_docs``: the gate is part of the
+    detection. A candidate on a host the dossier cannot place leaves the
+    candidate list too, and its documents and its host are counted on the run.
+    The finding then names the host and asks for its role.
+    """
+    if not spec.roles or not run.candidates:
+        return run
+    kept: list[Candidate] = []
+    unconfirmed_docs = out_docs = 0
+    unconfirmed_hosts: list[str] = []
+    for candidate in run.candidates:
+        role, confidence = role_of(candidate.scope_key)
+        verdict = spec.role_verdict(role, confidence)
+        if verdict == "in_scope":
+            kept.append(candidate)
+        elif verdict == "out_of_scope":
+            out_docs += candidate.doc_count
+        else:
+            unconfirmed_docs += candidate.doc_count
+            unconfirmed_hosts.append(candidate.scope_key)
+    return replace(
+        run,
+        candidates=kept,
+        matched_docs=max(0, run.matched_docs - out_docs - unconfirmed_docs),
+        role_unconfirmed_docs=run.role_unconfirmed_docs + unconfirmed_docs,
+        role_unconfirmed_hosts=tuple(
+            sorted(set(run.role_unconfirmed_hosts) | set(unconfirmed_hosts))
+        ),
+        role_out_of_scope_docs=run.role_out_of_scope_docs + out_docs,
+    )
 
 
 async def run_spec(
@@ -519,10 +630,14 @@ def _total(result: EsSearchResult) -> int:
 
 
 __all__ = [
+    "MAX_DETAIL_CHARS",
+    "MAX_DETAIL_VALUES",
     "MAX_RELATED_HOSTS",
     "MAX_SAMPLE_IDS",
     "RELATED_FIELDS",
     "Candidate",
+    "RoleOf",
     "SpecRun",
+    "apply_role_gate",
     "run_spec",
 ]

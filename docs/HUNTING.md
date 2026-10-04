@@ -131,6 +131,11 @@ A lead settles when its hunt finishes. What the hunt found decides where the lea
 - The hunt found **no threat**. soc-ai closes the lead with the reason `hunt_clean`. The lead moves
   to the Closed tab and reads "Closed. The hunt found no threat.", with the chip "closed by soc-ai".
   No analyst chose a reason, so the lead quality report counts it apart from your dismissals.
+  soc-ai closes the lead only when the hunt read its evidence. A visibility gap finding, a failed
+  tool call, a degraded run or a report from the budget synthesizer keeps the lead open. An earlier
+  hunt on the same lead with a threat finding keeps it open too. The lead then waits under Needs
+  decision, and the lead page states the reason: "The hunt could not read all evidence." or "An
+  earlier hunt found a threat."
 - The hunt found a **threat**, or it reported a **visibility gap**. The lead waits on you under
   Needs decision as "Hunted · Threat findings" or "Hunted · No threat observed · visibility gap".
   Read the hunt, then promote or dismiss.
@@ -144,6 +149,10 @@ it first, then hunt again.
 
 soc-ai signs a hunt closure as soc-ai even when you started the hunt by hand. A lead you dismissed
 yourself and then reopened is never closed by a hunt. A clean hunt on it waits on you.
+
+The lead page lists every decision on the lead in order: each dismissal, each reopen, the
+promotion, the close by a clean hunt and a hold. A reopen clears the current dismissal. The old
+dismissal stays in the list.
 
 A closed lead keeps its history. When a type the hunt already cleared shows up again while the
 lead's observations are still live, the new observation joins the closed lead as history. Nothing
@@ -276,6 +285,23 @@ wrote, the leads it contributed to, how many of those leads were hunted, promote
 under each reason, the documents it scanned with the runtime, and the entities it scored against
 the entities it could not see. Retirement decisions read the ledger.
 
+#### Drafts from a finding
+
+"Draft an analytic" on a threat finding writes one local analytic. The console shows the draft
+and its 30-day dry run. The analyst confirms, and soc-ai stores the analytic as a candidate.
+
+**Generalization.** An analytic describes a behaviour that any host, user or address can show.
+The model keeps an exact value only for a stable discriminator, such as an event code, a dataset,
+a port or a response code. soc-ai checks each draft for clauses that name the entity of the
+finding. A pin is a value test on a host, user, address, domain, URL, path or command line field.
+A literal IP address in a clause is a pin. A host of the finding in the title or the id is a pin.
+A value from the finding's indicator list is no pin. On a pin, the model rewrites the draft once.
+A draft that still pins shows a warning with one line per clause, and the save button reads
+"Save anyway". The drawer lists the pins under "Specific to one case". The Analytics tab marks
+the row "specific". The dry run also states how many distinct scope entities matched. One host
+in 30 days tells the analyst that the analytic still describes one case. The clause language
+matches each event and cannot count. A finding about a repeat becomes an analytic for one event.
+
 ### 7. Lead quality
 
 A block under the analytics table. It states the lead rule in one sentence, and the noise floor
@@ -291,6 +317,53 @@ columns count your reasons only.
 
 The reason columns come from the data, so a reason nobody used costs no column. A failed read
 states the failure. Over a dead endpoint, "no leads" is a false all-clear.
+
+## Role-scoped analytics
+
+A match analytic can name roles. It then applies only to scope hosts that the dossier places in
+one of those roles. The gate uses the role and the confidence that the role priors use. An
+operator declaration has full confidence.
+
+| Dossier belief about the scope host | Result |
+|---|---|
+| A named role at confidence 0.9 or above | The analytic fires. |
+| Another role at confidence 0.9 or above | No hit. The documents leave the match count. |
+| No role, `unknown`, or a confidence below 0.9 | No hit. The sweep reports a coverage gap that names the host. |
+
+The third row is not a clean result. A server with no confident role must not hide a hit. Declare
+the role on the host page. The next sweep then decides the host.
+
+Three shipped analytics carry a role gate. Each one replaces a role prior that tested a different
+fact from the one its title stated. soc-ai removed the three prior files. The old observations keep
+the old id.
+
+| Old prior id | New analytic id | Event read | Roles | The finding quotes |
+|---|---|---|---|---|
+| `prior-defender-adjudication-on-server` | `identity-defender-detection` | Defender 1116 and 1117 | server, domain_controller | threat, path, action |
+| `prior-audit-policy-changed-on-dc` | `identity-4719-audit-policy-change` | 4719 | domain_controller | account, subcategory, change |
+| `prior-privileged-group-membership-changed` | `identity-privileged-group-change` | 4728, 4732, 4756 | domain_controller | account, group, member, member SID |
+
+The reasons for the change:
+
+- The Defender prior read new process names. It never read a Defender event. On the development
+  range it missed all 10 Defender detections. It fired 73 times on Defender updater files, because
+  each definition update has a new file name.
+- The audit-policy prior and the group-change prior read new logon accounts on the domain
+  controller. Neither read event 4719 or a group change.
+
+The level of a Defender hit follows the Defender severity. Severe is critical. High is high.
+Moderate is medium. Low is low. A document with no severity keeps the level critical.
+
+The audit-policy analytic excludes subject accounts that end in `$`. Group policy refresh writes
+4719 under the computer account. An intruder who runs as SYSTEM on the domain controller also
+writes under the computer account. The analytic does not see that change.
+
+The group-change analytic matches the group by name. The names are Domain Admins, Enterprise
+Admins, Schema Admins, Administrators, Account Operators, Backup Operators, Server Operators, Print
+Operators, DnsAdmins, Group Policy Creator Owners, Remote Desktop Users and Distributed COM Users.
+A renamed group or a translated builtin name needs a tuning filter.
+
+All three declare no benign baseline. One hit forms a lead.
 
 ## The shadow week
 
@@ -328,9 +401,9 @@ Retirement is the one status that hides a hit. A retired analytic keeps its ledg
 | `lead_auto_hunt` | on | A lead that has never had a hunt starts one when it forms. | live |
 | `lead_auto_hunt_concurrency` | 2 | How many lead hunts the loop runs at once. The floor is 1. | live |
 | `entity_profiles_enabled` | off | Build a behavioural baseline for each host. The profile sweep rebuilds it when it is older than the dossier refresh interval, and a dossier refresh rebuilds it too. The profile sweep reads every host as blind until this is on. Turn it on for the shadow week. | live |
-| `hunt_spec_sweeps_enabled` | off | Run the analytic catalog on a loop. Turn this on last. | live |
-| `hunt_spec_sweep_interval_minutes` | 60 | Minutes between catalog sweeps. The floor is 5. | live |
-| `hunt_spec_sweep_window_minutes` | 1440 | How far back each sweep looks. | live |
+| `hunt_spec_sweeps_enabled` | off | Run every live analytic as a grid query on a schedule. A matching document becomes an observation on the host it names. Observations can form a lead. No model call. Turn this on last, after the shadow week. | live |
+| `hunt_spec_sweep_interval_minutes` | 60 | Minutes between analytic sweeps. The floor is 5. | live |
+| `hunt_spec_sweep_window_minutes` | 1440 | How far back each analytic sweep reads. Keep it wider than the interval. | live |
 | `catalog_hunt_rows` | off | Add an entry to the Hunts list for each analytic hit, as the sweep did before 1.5.0. | live |
 | `investigator_emits_report` | on | The investigation loop writes the verdict report itself. | next run |
 | `synth_round1_always` | off | Run the first-pass synthesis even when it cannot close the alert. | next run |
@@ -392,6 +465,10 @@ carries `subjectType`, which reads `alert` or `hunt`.
   single-type threshold (1.5) come from arithmetic. The hub limit (8) was set on an attack range
   with no derivation on record. Read the lead quality report for a week before you move any of
   them.
+- A profile dimension has no exclusion list. The `process_names` dimension records each Defender
+  updater file name, such as `mpam-d_bd_<version>.exe`, as a new process. No shipped analytic on a
+  server reads that dimension now. `prior-workstation-remote-execution-tooling` still reads it on
+  workstations.
 - A hunt-subject investigation still stores its anchor document as `alert_es_id`, and
   `GET /investigations/{id}` returns that id as `groupId`. soc-ai keeps the run out of the alert's
   group on every surface, so a hunt verdict does not read as the alert's verdict.

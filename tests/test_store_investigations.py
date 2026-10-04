@@ -82,6 +82,65 @@ async def test_a_hunt_subject_verdict_writes_no_alert_observation(
     await engine.dispose()
 
 
+async def test_a_promoted_lead_verdict_never_lands_on_another_hosts_lead(
+    settings_kratos: Settings,
+) -> None:
+    """RH4: two leads on two hosts. The lead promotion writes no alert observation.
+
+    The range promoted lead 12 on one host. Its run carried the older shape: a
+    promoted kind, the promotion title as rule_name, and no hunt subject. The
+    anchor document named a second internal host, so "Lead 12 on <ip>: true
+    positive at 0.70" landed as an alert on lead 11 too. The alert run beside
+    it records on its own host, under its own rule name.
+    """
+    from soc_ai.store.models import EntityObservation, Lead
+
+    host_a, host_b = "10.20.30.10", "10.20.30.40"
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        db.add_all(
+            [
+                Lead(status="promoted", entities_json=[["host", host_a]], shadow=False),
+                Lead(status="open", entities_json=[["host", host_b]], shadow=False),
+            ]
+        )
+        promoted_run = Investigation(
+            id="01LEADPROMO000000000000000",
+            alert_es_id="doc-anchor",
+            started_by="admin",
+            kind="lead",
+            rule_name=f"Lead 12 on {host_a}",
+            status="complete",
+            verdict="true_positive",
+            confidence=0.7,
+            src_ip=host_a,
+            dest_ip=host_b,
+        )
+        alert_run = Investigation(
+            id="01ALERTONB0000000000000000",
+            alert_es_id="doc-alert",
+            started_by="admin",
+            kind="suricata",
+            rule_name="ET SCAN Potential VNC Scan 5800-5820",
+            status="complete",
+            verdict="true_positive",
+            confidence=0.7,
+            src_ip="203.0.113.5",
+            dest_ip=host_b,
+        )
+        db.add_all([promoted_run, alert_run])
+        await db.flush()
+        await inv_svc._observe_verdict(db, promoted_run)
+        await inv_svc._observe_verdict(db, alert_run)
+        await db.commit()
+        rows = (await db.execute(select(EntityObservation))).scalars().all()
+    assert [(r.entity_key, r.summary) for r in rows] == [
+        (host_b, "ET SCAN Potential VNC Scan 5800-5820: true positive at 0.70")
+    ]
+    assert not any("Lead 12" in str(r.summary) for r in rows)
+    await engine.dispose()
+
+
 async def test_create_seeds_rule_name_at_birth(settings_kratos: Settings) -> None:
     """create(rule_name=...) names the row immediately so it is never anonymous,
     even if the run dies before the first alert_context event. Empty/None seeds
@@ -758,7 +817,7 @@ async def test_reap_interrupted_status_marks_benign_state(settings_kratos: Setti
         assert row.status == "interrupted"
         assert row.finished_at is not None
         # interrupted-specific note (distinct from the 'error' timeout note)
-        assert "interrupted by a service restart" in row.rationale
+        assert "A service restart interrupted the investigation" in row.rationale
         # re-huntable: continuous auto-triage / manual re-hunt must pick it back up
         assert inv_svc.blocks_rehunt(row) is False
     await engine.dispose()

@@ -140,6 +140,25 @@ class SpecJourney(BaseModel):
     "at least one per expected scope key" and is the right default for a spec
     whose count depends on how many documents the render happens to emit."""
 
+    host_roles: dict[str, str] = Field(default_factory=dict)
+    """The dossier role of each planted host, as an operator would declare it.
+
+    A role-scoped analytic reads the role of its scope host. A fixture has no
+    dossier, so the scenario declares the roles it plants, at full confidence.
+    A host the scenario does not name has no role, and the role gate reports
+    its documents apart.
+    """
+
+    @field_validator("host_roles")
+    @classmethod
+    def _roles_are_in_the_vocabulary(cls, v: dict[str, str]) -> dict[str, str]:
+        from soc_ai.dossier.infer import ROLE_VOCABULARY  # noqa: PLC0415 - lazy, avoids a cycle
+
+        unknown = sorted({role for role in v.values() if role not in ROLE_VOCABULARY})
+        if unknown:
+            raise ValueError(f"unknown role(s) {unknown!r}. Known roles: {list(ROLE_VOCABULARY)}")
+        return v
+
 
 class Scenario(BaseModel):
     """A complete synthetic-TP scenario.

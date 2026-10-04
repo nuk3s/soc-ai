@@ -1,5 +1,5 @@
 import { ArrowUpRight, Check, ChevronRight, Filter, Sparkles, X, Zap } from 'lucide-react';
-import { type Dispatch, type SetStateAction, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { type Dispatch, type RefObject, type SetStateAction, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { KindBadge, PipelineErrorChip, SeverityTag, VerdictPill } from '../components/Badges';
 import { FlowBadge } from '../components/FlowBadge';
@@ -29,12 +29,13 @@ import {
   getInvestigation,
   getMe,
   getRepresentative,
+  isRequestTimeout,
   startAutoTriage,
   startHunt,
   stopAutoTriage,
 } from '../lib/api';
 import { DEMO_ACTION_NOTE, demoBlocked, useDemo } from '../lib/demo';
-import { ackMessage, ackTail, escalateMessage } from '../lib/groupWriteMessages';
+import { ackMessage, ackTail, escalateLinks, escalateMessage } from '../lib/groupWriteMessages';
 import { plural } from '../lib/plural';
 import { middleEllipsis } from '../lib/text';
 import { type ToastTone, useToast } from '../lib/toast';
@@ -189,6 +190,7 @@ function seedFromLink(params: URLSearchParams): {
   custom: CustomRange | null;
   hideAcked: boolean;
   q: string | null;
+  sort: { key: SortKey; dir: SortDir } | null;
 } {
   const list = (raw: string | null, allowed: Set<string>): string[] =>
     raw
@@ -219,7 +221,50 @@ function seedFromLink(params: URLSearchParams): {
     // land a host-scoped count on a network-wide list — the untriaged-tile
     // defect this file's header describes.
     q: (params.get('q') ?? '').trim() || null,
+    sort: sortFromLink(params.get('sort')),
   };
+}
+
+const SORT_KEYS = new Set<SortKey>(['count', 'detection', 'sev', 'verdict', 'conf', 'latest']);
+const DEFAULT_SORT: { key: SortKey; dir: SortDir } = { key: 'sev', dir: 'desc' };
+
+/** `?sort=latest:asc`. Anything else is ignored and the default applies. */
+function sortFromLink(raw: string | null): { key: SortKey; dir: SortDir } | null {
+  if (!raw) return null;
+  const [key, dir] = raw.split(':');
+  if (!SORT_KEYS.has(key as SortKey) || (dir !== 'asc' && dir !== 'desc')) return null;
+  return { key: key as SortKey, dir };
+}
+
+/**
+ * Write the filters back into the URL, so a reload or a shared link keeps
+ * them. The screen read ?range, ?sev, ?verdict and ?hide_acked and never wrote
+ * them, so a reload reset every filter the analyst had set (P8, RL15). A value
+ * at its default leaves the URL; every other parameter (view, drawer, q) stays.
+ */
+function writeFiltersToParams(
+  params: URLSearchParams,
+  f: {
+    range: string;
+    custom: CustomRange | null;
+    sevs: string[];
+    verdicts: string[];
+    hideAcked: boolean;
+    sort: { key: SortKey; dir: SortDir };
+  },
+): URLSearchParams {
+  const next = new URLSearchParams(params);
+  const put = (k: string, v: string | null) => (v ? next.set(k, v) : next.delete(k));
+  const custom = f.range === 'custom' && f.custom ? f.custom : null;
+  put('range', custom ? 'custom' : f.range === DEFAULT_RANGE ? null : f.range);
+  put('from', custom ? custom.from : null);
+  put('to', custom ? custom.to : null);
+  put('sev', f.sevs.length ? f.sevs.join(',') : null);
+  put('verdict', f.verdicts.length ? f.verdicts.join(',') : null);
+  put('hide_acked', f.hideAcked === DEFAULT_HIDE_ACKED ? null : String(f.hideAcked));
+  const sortIsDefault = f.sort.key === DEFAULT_SORT.key && f.sort.dir === DEFAULT_SORT.dir;
+  put('sort', sortIsDefault ? null : `${f.sort.key}:${f.sort.dir}`);
+  return next;
 }
 
 /** Stable per-detection identity for client-side row state (expansion,
@@ -229,7 +274,12 @@ function seedFromLink(params: URLSearchParams): {
  * collapses, a ticked checkbox drops). kind+name is the identity every write
  * path already addresses a group by (ackGroup / assignAlert take `g.name`).
  * `g.id` is kept only as the representative-event payload for a new hunt. */
-const groupKey = (g: AlertGroup): string => `${g.kind}:${g.name}`;
+const groupKey = (g: Pick<AlertGroup, 'kind' | 'name'>): string => `${g.kind}:${g.name}`;
+
+/** What a group write needs to know about its target. The drawer has only the
+ *  investigation's name and type, so the counts and owner are optional. */
+type GroupRef = Pick<AlertGroup, 'name' | 'kind'> &
+  Partial<Pick<AlertGroup, 'owner' | 'ackedCount' | 'escalatedCount'>>;
 
 /** The count chip for a group's already-handled events — or the absence of one.
  *
@@ -603,6 +653,91 @@ function EventRow({ ev, g, selEvents, setSelEvents, navigate, openDrawer, huntEv
   );
 }
 
+const WIDEST_RANGE = '30d';
+
+/** "14:05", the local clock time of a read. */
+function hhmm(ms: number): string {
+  return new Date(ms).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', hour12: false });
+}
+
+/**
+ * Why the list is empty, named after the narrowest filter in force. "Widen the
+ * time range" was the only answer, also where the cause was the Mine view, the
+ * verdict filter or the query, and also at the widest window (D16, P9, RL13).
+ */
+function emptySentence(f: {
+  view: ViewId;
+  sevs: string[];
+  verdicts: string[];
+  q: string | null;
+  hideAcked: boolean;
+  widest: boolean;
+}): string {
+  switch (f.view) {
+    case 'mine':
+      return 'No detection is assigned to you in this window.';
+    case 'inreview':
+      return 'No detection is in review in this window.';
+    case 'critical':
+      return 'No critical detection fired in this window.';
+    case 'decision':
+      return 'No detection needs a decision in this window.';
+    default:
+      break;
+  }
+  if (f.q) return 'No detection matches the query filter in this window.';
+  if (f.verdicts.length) return 'No detection matches the verdict filter in this window.';
+  if (f.sevs.length) return 'No detection matches the severity filter in this window.';
+  const tail = f.widest ? '' : ' Widen the time range.';
+  if (f.hideAcked) {
+    return `No open detection in this window. The list hides acknowledged and escalated groups.${tail}`;
+  }
+  return `No detection fired in this window.${tail}`;
+}
+
+/** A group write the console stopped waiting for, with the group's state at
+ *  the press. The poll compares the rows against it to see the write land. */
+interface PendingWrite {
+  kind: 'ack' | 'escalate' | 'assign' | 'release';
+  name: string;
+  toastId: number;
+  /** The filter the press ran under. A row that leaves the list under a
+   *  different filter says nothing about the write. */
+  queryKey: string;
+  owner: string;
+  acked: number | null;
+  escalated: number | null;
+}
+
+const WRITE_NOUN: Record<PendingWrite['kind'], string> = {
+  ack: 'acknowledge',
+  escalate: 'escalate',
+  assign: 'assign',
+  release: 'release',
+};
+
+/** True when the polled row shows the timed-out write took effect. A row that
+ *  left the list counts only for ack and escalate, and only under the filter
+ *  of the press: hide-acknowledged drops a handled group from the list. */
+function writeLanded(
+  p: PendingWrite,
+  g: AlertGroup | undefined,
+  queryKey: string,
+  me: string,
+): boolean {
+  if (p.queryKey !== queryKey) return false;
+  switch (p.kind) {
+    case 'ack':
+      return !g || (g.ackedCount != null && g.ackedCount > (p.acked ?? 0));
+    case 'escalate':
+      return !g || (g.escalatedCount != null && g.escalatedCount > (p.escalated ?? 0));
+    case 'assign':
+      return !!g && !!g.owner && g.owner !== p.owner && (!me || g.owner === me);
+    case 'release':
+      return !!g && !g.owner;
+  }
+}
+
 export function Alerts() {
   const { paletteOpen, modalOpen } = useShell();
   const navigate = useNavigate();
@@ -664,16 +799,34 @@ export function Alerts() {
   // that instead — same gotcha/pattern as Investigations.tsx, Hunts.tsx, etc.
   const drawerOpenRef = useRef(false);
   drawerOpenRef.current = !!drawerId;
-  const { data: queue, loading, error, lastUpdated, refetch } = useAsync(
+  // A filter the server refused. Polling it re-sent the same 400 every few
+  // seconds (P7), so the poll stops until the filter changes.
+  const badFilterRef = useRef(false);
+  const { data: queue, loading, error, lastUpdated, failCount, refetch } = useAsync(
     () => getAlerts(alertQuery),
     [filterTime, customRange?.from, customRange?.to, hideAcked, filterQ, reloadKey],
     {
       refetchInterval: 10000, // keep the grid + verdict/status badges live without a reload
       // Pause the 10s ES aggregation while an investigation drawer is open, so
       // the grid doesn't churn under the analyst; resumes on close.
-      pauseWhen: () => drawerOpenRef.current,
+      pauseWhen: () => drawerOpenRef.current || badFilterRef.current,
     }
   );
+  const badFilter = error instanceof ApiError && error.status === 400 && error.reason === 'bad_oql';
+  badFilterRef.current = badFilter;
+
+  // Which window the rows on screen came from. A range change keeps the old
+  // rows while the new window loads, and the header went on showing the 24h
+  // figures under a pressed 30d chip for about 6 s (P5). A response that lands
+  // after a filter change always belongs to the new filter: useAsync drops the
+  // older ones.
+  const windowKey = [filterTime, customRange?.from, customRange?.to, hideAcked, filterQ].join('|');
+  const [dataWindow, setDataWindow] = useState(windowKey);
+  useEffect(() => {
+    if (lastUpdated != null) setDataWindow(windowKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lastUpdated]);
+  const switchingWindow = loading && !!queue && dataWindow !== windowKey;
 
   // The rows, and separately whether they are all the rows. The grid caps every
   // terms aggregation, so past the cap these are a floor — see `truncated`.
@@ -721,15 +874,46 @@ export function Alerts() {
   // Per-row element refs so the focused row can be scrolled into view as focus
   // moves. Keyed by group id; stale keys are harmless (a WeakMap-ish plain map).
   const rowRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  // The row whose drawer is open, read on close. A getter so it resolves the
+  // row element at close time: a reload can replace the element.
+  const drawerRowKeyRef = useRef<string | null>(null);
+  const drawerReturnRef = useMemo<RefObject<HTMLElement | null>>(
+    () => ({
+      get current() {
+        const key = drawerRowKeyRef.current;
+        return key ? (rowRefs.current[key] ?? null) : null;
+      },
+    }),
+    [],
+  );
   // Shared sort mechanics; clicking a new column here starts it descending.
   const { sort, toggleSort, caret, headerCls: hdrCls } = useSort<SortKey>(
-    { key: 'sev', dir: 'desc' },
+    seed.sort ?? DEFAULT_SORT,
     'desc',
   );
+  // The filters go back into the URL on every change (see writeFiltersToParams).
+  // `replace`, so a filter change is not a Back step.
+  useEffect(() => {
+    setSearchParams(
+      (prev) => {
+        const next = writeFiltersToParams(prev, {
+          range: filterTime,
+          custom: customRange,
+          sevs: filterSevs,
+          verdicts: filterVerdicts,
+          hideAcked,
+          sort,
+        });
+        return next.toString() === prev.toString() ? prev : next;
+      },
+      { replace: true },
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filterTime, customRange?.from, customRange?.to, filterSevs, filterVerdicts, hideAcked, sort]);
 
   // Results (ack / triage batch summaries) go to the app-wide toaster instead of
   // stacking dismissible strips in this header.
-  const { toast } = useToast();
+  const { toast, dismiss: dismissToast } = useToast();
 
   // ---- group-ack strip ---------------------------------------------------
   const [acking, setAcking] = useState(false);
@@ -964,6 +1148,16 @@ export function Alerts() {
     setSearchParams(searchParams, { replace: true });
   };
   const openDrawer = (id: string) => {
+    // Remember the row the drawer belongs to, so Escape hands focus back to
+    // it. A row opened by a key or a click on the row body has no focused
+    // control, and focus used to land on BODY (fleet P13).
+    const active = document.activeElement as HTMLElement | null;
+    const fromRow = active?.closest?.('[data-group-key]')?.getAttribute('data-group-key');
+    // A re-run from inside the open drawer swaps the run and keeps the row.
+    if (!drawerId || fromRow) {
+      const byInv = groups?.find((g) => g.invId === id);
+      drawerRowKeyRef.current = fromRow ?? focusedKey ?? (byInv ? groupKey(byInv) : null);
+    }
     setStarting(null);
     searchParams.set('drawer', id);
     setSearchParams(searchParams);
@@ -1054,6 +1248,52 @@ export function Alerts() {
       .finally(() => setHuntGroupPending((s) => ({ ...s, [gk]: false })));
   };
 
+  // ---- writes the console stopped waiting for -------------------------------
+  // A client abort is not a failed write. On a slow grid the ack or the case
+  // landed 60 to 75 s after the abort, under a red "Could not escalate" toast
+  // that stayed after the row was gone (dogfood 2026-10-01, RL2). So a timed-out
+  // write is recorded here with the group's state at the press, and the poll
+  // below dismisses its notice once the rows show the change landed.
+  const pendingWrites = useRef<Record<string, PendingWrite>>({});
+  const queryKey = JSON.stringify(alertQuery);
+  const noteTimedOut = (g: GroupRef, kind: PendingWrite['kind'], err: Error) => {
+    const toastId = toast({
+      message: `No answer yet for the ${WRITE_NOUN[kind]} of ${g.name}. ${err.message}`,
+      tone: 'info',
+      duration: 0,
+    });
+    const gk = groupKey(g);
+    const prior = pendingWrites.current[gk];
+    if (prior) dismissToast(prior.toastId);
+    pendingWrites.current[gk] = {
+      kind,
+      name: g.name,
+      toastId,
+      queryKey,
+      owner: g.owner ?? '',
+      acked: g.ackedCount ?? null,
+      escalated: g.escalatedCount ?? null,
+    };
+  };
+  useEffect(() => {
+    if (!groups) return;
+    const byKey = new Map(groups.map((g) => [groupKey(g), g]));
+    for (const [gk, p] of Object.entries(pendingWrites.current)) {
+      if (!writeLanded(p, byKey.get(gk), queryKey, me)) continue;
+      dismissToast(p.toastId);
+      delete pendingWrites.current[gk];
+      toast({ message: `The ${WRITE_NOUN[p.kind]} of ${p.name} landed.`, tone: 'success' });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [groups]);
+
+  // Groups with an escalate in flight. The ack has its strip in the activity
+  // slot; an escalate had nothing, so a slow one read as a dead key press.
+  const [escalating, setEscalating] = useState<Record<string, string>>({});
+  // Rows whose owner change is in flight: the avatar shows a spinner and
+  // takes no second click.
+  const [ownerPending, setOwnerPending] = useState<Record<string, boolean>>({});
+
   // Acknowledge a single group (keyboard `a`) — reuses the same ackGroup write
   // path + ack strip as the bulk bar, scoped to one detection.
   const ackOneGroup = (g: AlertGroup) => {
@@ -1067,22 +1307,57 @@ export function Alerts() {
         showAckMsg(ackMessage(r, g.name));
         setReloadKey((k) => k + 1);
       })
-      .catch(() => showAckMsg(`Could not acknowledge ${g.name}`, 'danger'))
+      .catch((err: unknown) => {
+        if (isRequestTimeout(err)) noteTimedOut(g, 'ack', err);
+        else showAckMsg(`Could not acknowledge ${g.name}`, 'danger');
+      })
       .finally(() => setAcking(false));
   };
 
-  // Escalate a single group to a Security Onion case (keyboard `e`) — reuses
-  // the escalateGroup write path; result surfaces in the ack strip.
-  const escalateOneGroup = (g: AlertGroup) => {
+  // Escalate groups to Security Onion cases: keyboard `e`, the bulk bar and
+  // the drawer. The toast names each case and links it when the server can
+  // build the console URL.
+  const escalateGroups = (targets: GroupRef[], query: AlertQuery = alertQuery) => {
     const blocked = demoBlocked(demo);
     if (blocked) { showAckMsg(blocked); return; } // demo: no doomed write
-    escalateGroup(g, alertQuery)
-      .then((r) => {
-        showAckMsg(escalateMessage(r, g.name));
-        setReloadKey((k) => k + 1);
-      })
-      .catch(() => showAckMsg(`Could not escalate ${g.name}`, 'danger'));
+    const fresh = targets.filter((g) => !escalating[groupKey(g)]);
+    if (!fresh.length) return;
+    setEscalating((m) => {
+      const next = { ...m };
+      fresh.forEach((g) => { next[groupKey(g)] = g.name; });
+      return next;
+    });
+    fresh.forEach((g) => {
+      escalateGroup(g, query)
+        .then((r) => {
+          toast({
+            message: escalateMessage(r, g.name),
+            tone: r.failed > 0 ? 'danger' : 'success',
+            links: escalateLinks(r),
+            // A case id is something to copy; do not take it away at 6 s.
+            duration: (r.cases?.length ?? 0) > 0 ? 0 : undefined,
+          });
+          setReloadKey((k) => k + 1);
+        })
+        .catch((err: unknown) => {
+          if (isRequestTimeout(err)) noteTimedOut(g, 'escalate', err);
+          else
+            showAckMsg(
+              `Could not escalate ${g.name}. ${err instanceof Error ? err.message : ''}`.trim(),
+              'danger',
+            );
+        })
+        .finally(() =>
+          setEscalating((m) => {
+            const next = { ...m };
+            delete next[groupKey(g)];
+            return next;
+          }),
+        );
+    });
   };
+  const escalateOneGroup = (g: AlertGroup) => escalateGroups([g]);
+  const escalatingNames = Object.values(escalating);
 
   // Toggle a single group's selection (keyboard `x`) into the same `selected`
   // map the checkboxes + bulk bar use.
@@ -1177,20 +1452,34 @@ export function Alerts() {
   // the list so the chip/owner update. Assign-to-me and release both change
   // ownership; mark-in-review / mark-done only move the state on an owned rule.
   // Demo blocks every /alerts/assign write; the note lands on the shared ack strip.
-  const assignToMe = (g: AlertGroup) => {
+  // The owner avatar: one click assigns or releases. Each press reports its
+  // outcome in a toast and holds the avatar until the write answers, so a
+  // slow grid does not read as a click that did nothing (RL9).
+  const changeOwner = (g: AlertGroup, kind: 'assign' | 'release') => {
     const blocked = demoBlocked(demo);
     if (blocked) { showAckMsg(blocked); return; }
-    assignAlert(g.name)
-      .then(() => setReloadKey((k) => k + 1))
-      .catch(() => showAckMsg(`Could not assign ${g.name}`, 'danger'));
+    const gk = groupKey(g);
+    if (ownerPending[gk]) return;
+    setOwnerPending((m) => ({ ...m, [gk]: true }));
+    assignAlert(g.name, kind === 'release')
+      .then(() => {
+        showAckMsg(kind === 'release' ? `Released ${g.name}.` : `Assigned ${g.name} to you.`);
+        setReloadKey((k) => k + 1);
+      })
+      .catch((err: unknown) => {
+        if (isRequestTimeout(err)) noteTimedOut(g, kind, err);
+        else showAckMsg(`Could not ${kind} ${g.name}`, 'danger');
+      })
+      .finally(() =>
+        setOwnerPending((m) => {
+          const next = { ...m };
+          delete next[gk];
+          return next;
+        }),
+      );
   };
-  const release = (g: AlertGroup) => {
-    const blocked = demoBlocked(demo);
-    if (blocked) { showAckMsg(blocked); return; }
-    assignAlert(g.name, true)
-      .then(() => setReloadKey((k) => k + 1))
-      .catch(() => showAckMsg(`Could not release ${g.name}`, 'danger'));
-  };
+  const assignToMe = (g: AlertGroup) => changeOwner(g, 'assign');
+  const release = (g: AlertGroup) => changeOwner(g, 'release');
   const setTriage = (g: AlertGroup, state: TriageState) => {
     const blocked = demoBlocked(demo);
     if (blocked) { showAckMsg(blocked); return; }
@@ -1374,6 +1663,22 @@ export function Alerts() {
     ),
   );
   const looseEventIds = selectedEventIds.filter((id) => !coveredEventIds.has(id));
+  // A group leaves the selection after a write, and the expanded event boxes
+  // the group ticked must leave with it. They stayed ticked, and the bar then
+  // offered group actions on "2 events" that did nothing (RL1). `keep` names
+  // the groups still selected (the failed ones), whose events stay.
+  const dropEventsOutside = (left: AlertGroup[], keep: string[]) => {
+    const keepSet = new Set(keep);
+    const ids = left
+      .filter((g) => !keepSet.has(groupKey(g)))
+      .flatMap((g) => (groupEvents[groupKey(g)] ?? []).map((ev) => ev.id).filter(Boolean) as string[]);
+    if (!ids.length) return;
+    setSelEvents((prev) => {
+      const next = { ...prev };
+      ids.forEach((id) => delete next[id]);
+      return next;
+    });
+  };
   selectedRef.current = selCount + selectedEventIds.length;
   const alertsInWindow = selectedGroups.reduce((n, g) => n + (g.count || 0), 0);
 
@@ -1417,12 +1722,15 @@ export function Alerts() {
   // for and did not get, an ellipsis while we are still asking. Keyed off
   // `groups`, not off `error`, so stale rows left on screen by a failed
   // background poll keep counts that describe the rows actually rendered.
-  const num = (n: number): string => (groups ? n.toLocaleString() : error ? '—' : '…');
+  // While a new window loads, the rows on screen are the OLD window's, so a
+  // count of them is a count of the wrong window: it reads as still asking.
+  const counted = !!groups && !switchingWindow;
+  const num = (n: number): string => (counted ? n.toLocaleString() : error ? '—' : '…');
   const countOf = (n: number, one: string, many = `${one}s`): string =>
-    groups ? plural(n, one, many) : `${num(n)} ${many}`;
+    counted ? plural(n, one, many) : `${num(n)} ${many}`;
   // A chip badge is one glyph wide with no room for that distinction, so an
   // uncounted view carries NO badge rather than a confident "0" one.
-  const chipCount = (n: number): number | undefined => (groups ? n : undefined);
+  const chipCount = (n: number): number | undefined => (counted ? n : undefined);
 
   // The OTHER way every number on this line can be wrong, and the harder one to
   // notice. The grid caps each terms aggregation at a fixed number of distinct
@@ -1440,7 +1748,7 @@ export function Alerts() {
   // this route.
   const truncated = queue?.truncated ?? false;
   const floorOf = (n: number, one: string, many = `${one}s`): string =>
-    groups && truncated ? `${n.toLocaleString()}+ ${many}` : countOf(n, one, many);
+    counted && truncated ? `${n.toLocaleString()}+ ${many}` : countOf(n, one, many);
   const FLOOR_TITLE =
     'The grid returned the biggest detections. The grid stopped at its group ceiling. These ' +
     'numbers are floors. This window holds more detections than the queue can show. Narrow ' +
@@ -1497,9 +1805,14 @@ export function Alerts() {
                 read. This says what it means, once, on the line it modifies —
                 the numbers stay scannable and the sentence is there for the
                 analyst who wonders why the queue will not add up. */}
-            {truncated && (
+            {truncated && counted && (
               <span className="ml-1.5" style={{ color: '#f5a623' }}>
                 · more than the queue can show
+              </span>
+            )}
+            {switchingWindow && (
+              <span className="ml-1.5 inline-flex items-center gap-1.5 text-accent" role="status">
+                <Spinner size={11} /> Loading the {filterTime === 'custom' ? 'custom' : filterTime} window…
               </span>
             )}
           </div>
@@ -1554,7 +1867,7 @@ export function Alerts() {
           results go to the toaster. Both jobs at once show as two lines in ONE
           bordered strip, never two stacked strips (the header height is bounded
           by construction). */}
-      {(triaging || acking) && (
+      {(triaging || acking || escalatingNames.length > 0) && (
         <div
           className="relative mb-3.5 flex flex-col gap-2 overflow-hidden rounded-card border px-3.5 py-[11px]"
           style={{ borderColor: 'rgba(75,139,245,.35)', background: 'linear-gradient(90deg,rgba(75,139,245,.10),rgba(75,139,245,.02))' }}
@@ -1600,6 +1913,14 @@ export function Alerts() {
             <div className="flex items-center gap-2.5 text-[13px]">
               <Spinner size={14} />
               <span className="font-semibold text-text-2">Security Onion acknowledges {ackingCount} group{ackingCount !== 1 ? 's' : ''}. The groups hold {ackingAlertTotal} alert{ackingAlertTotal !== 1 ? 's' : ''}.</span>
+            </div>
+          )}
+          {escalatingNames.length > 0 && (
+            <div className="flex items-center gap-2.5 text-[13px]" role="status">
+              <Spinner size={14} />
+              <span className="min-w-0 truncate font-semibold text-text-2">
+                Security Onion opens cases for {escalatingNames.length === 1 ? escalatingNames[0] : plural(escalatingNames.length, 'group')}.
+              </span>
             </div>
           )}
         </div>
@@ -1707,24 +2028,38 @@ export function Alerts() {
                   >
                     <span className="flex" style={{ color: '#facc15' }}><Zap size={13} /></span> Bulk Investigate
                   </button>
+                  {/* The group actions render only with a group selected. With
+                      events alone they returned early and did nothing, under a
+                      bar that still offered them (RL1). */}
+                  {selectedGroups.length > 0 && (
                   <button
                     onClick={() => {
                       if (!selectedGroups.length) return;
                       const blocked = demoBlocked(demo);
                       if (blocked) { showAckMsg(blocked); return; } // demo: no doomed write
-                      const n = selectedGroups.length;
+                      const targets = selectedGroups;
+                      const n = targets.length;
                       // allSettled: a single assign failing must not silently drop the rest.
                       // Keep failed groups selected so the analyst can retry them.
-                      Promise.allSettled(selectedGroups.map((g) => assignAlert(g.name)))
+                      Promise.allSettled(targets.map((g) => assignAlert(g.name)))
                         .then((outcomes) => {
-                          const failedIds = outcomes
-                            .map((o, i) => (o.status === 'rejected' ? groupKey(selectedGroups[i]) : null))
-                            .filter((id): id is string => id !== null);
-                          const ok = n - failedIds.length;
+                          const failedIds: string[] = [];
+                          let timedOut = 0;
+                          outcomes.forEach((o, i) => {
+                            if (o.status === 'fulfilled') return;
+                            if (isRequestTimeout(o.reason)) {
+                              timedOut += 1;
+                              noteTimedOut(targets[i], 'assign', o.reason);
+                            } else {
+                              failedIds.push(groupKey(targets[i]));
+                            }
+                          });
+                          const ok = n - failedIds.length - timedOut;
                           sel.select(failedIds);
+                          dropEventsOutside(targets, failedIds);
                           if (failedIds.length) {
                             showAckMsg(`Assigned ${ok} of ${n} group${n !== 1 ? 's' : ''} · ${failedIds.length} failed. The failed groups stay selected. Click Assign to me to retry.`, 'danger');
-                          } else {
+                          } else if (ok > 0) {
                             showAckMsg(`Assigned ${ok} group${ok !== 1 ? 's' : ''} to you`);
                           }
                           setReloadKey((k) => k + 1);
@@ -1734,19 +2069,22 @@ export function Alerts() {
                   >
                     Assign to me
                   </button>
+                  )}
+                  {selectedGroups.length > 0 && (
                   <button
                     onClick={() => {
                       if (!selectedGroups.length) return;
                       const blocked = demoBlocked(demo);
                       if (blocked) { showAckMsg(blocked); return; } // demo: no doomed write (before setAcking so the strip shows)
-                      const n = selectedGroups.length;
+                      const targets = selectedGroups;
+                      const n = targets.length;
                       const alertTotal = alertsInWindow;
                       setAckingCount(n);
                       setAckingAlertTotal(alertTotal);
                       setAcking(true);
                       // allSettled: one group failing must not wipe the whole batch. Keep
                       // failed groups selected so the analyst can retry them.
-                      Promise.allSettled(selectedGroups.map((g) => ackGroup(g, alertQuery)))
+                      Promise.allSettled(targets.map((g) => ackGroup(g, alertQuery)))
                         .then((outcomes) => {
                           const failedIds: string[] = [];
                           let totalAcked = 0;
@@ -1755,6 +2093,7 @@ export function Alerts() {
                           let anyCapped = false;
                           let totalRemaining = 0;
                           let totalAlready = 0;
+                          let timedOut = 0;
                           outcomes.forEach((o, i) => {
                             if (o.status === 'fulfilled') {
                               okGroups += 1;
@@ -1763,30 +2102,54 @@ export function Alerts() {
                               totalRemaining += o.value.remaining ?? 0;
                               totalAlready += o.value.already_acked ?? 0;
                               if (o.value.capped) anyCapped = true;
+                            } else if (isRequestTimeout(o.reason)) {
+                              // Not a failure: the write may still land. Its own
+                              // notice says so, and the poll clears it.
+                              timedOut += 1;
+                              noteTimedOut(targets[i], 'ack', o.reason);
                             } else {
-                              failedIds.push(groupKey(selectedGroups[i]));
+                              failedIds.push(groupKey(targets[i]));
                             }
                           });
                           const failedGroups = failedIds.length;
                           // Clear only the groups that succeeded; retain failed ones for retry.
                           sel.select(failedIds);
-                          const parts = [`Acknowledged ${plural(totalAcked, 'alert')} across ${plural(okGroups, 'group')}`];
-                          if (totalFailed) parts.push(`${plural(totalFailed, 'event')} failed`);
-                          if (failedGroups) parts.push(`${plural(failedGroups, 'group')} failed. The failed groups stay selected. Click Acknowledge to retry.`);
-                          showAckMsg(
-                            parts.join(' · ') + ackTail({ capped: anyCapped, remaining: totalRemaining, already_acked: totalAlready }),
-                            totalFailed || failedGroups ? 'danger' : 'success',
-                          );
+                          dropEventsOutside(targets, failedIds);
+                          if (okGroups > 0 || failedGroups > 0) {
+                            const parts = [`Acknowledged ${plural(totalAcked, 'alert')} across ${plural(okGroups, 'group')}`];
+                            if (totalFailed) parts.push(`${plural(totalFailed, 'event')} failed`);
+                            if (failedGroups) parts.push(`${plural(failedGroups, 'group')} failed. The failed groups stay selected. Click Acknowledge to retry.`);
+                            if (timedOut) parts.push(`${plural(timedOut, 'group')} did not answer yet`);
+                            showAckMsg(
+                              parts.join(' · ') + ackTail({ capped: anyCapped, remaining: totalRemaining, already_acked: totalAlready }),
+                              totalFailed || failedGroups ? 'danger' : 'success',
+                            );
+                          }
                           setReloadKey((k) => k + 1);
                         })
                         .finally(() => setAcking(false));
                     }}
                     className="rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-1.5 text-[12.5px] font-semibold text-text hover:border-success-btn-border hover:text-success"
                   >
-                    {selectedGroups.length > 0
-                      ? `Acknowledge ${selectedGroups.length} group${selectedGroups.length !== 1 ? 's' : ''} · ${alertsInWindow.toLocaleString()} alert${alertsInWindow !== 1 ? 's' : ''}`
-                      : 'Acknowledge'}
+                    {`Acknowledge ${selectedGroups.length} group${selectedGroups.length !== 1 ? 's' : ''} · ${alertsInWindow.toLocaleString()} alert${alertsInWindow !== 1 ? 's' : ''}`}
                   </button>
+                  )}
+                  {selectedGroups.length > 0 && (
+                    <button
+                      onClick={() => {
+                        const targets = selectedGroups;
+                        escalateGroups(targets);
+                        sel.clear();
+                        dropEventsOutside(targets, []);
+                      }}
+                      disabled={selectedGroups.every((g) => !!escalating[groupKey(g)])}
+                      title="Open a Security Onion case for each alert in the selected groups"
+                      className="rounded-[7px] border px-[11px] py-1.5 text-[12.5px] font-semibold disabled:opacity-50"
+                      style={{ borderColor: 'rgba(240,68,56,.4)', background: 'rgba(240,68,56,.10)', color: '#fca5a5' }}
+                    >
+                      Escalate to cases
+                    </button>
+                  )}
                   {looseEventIds.length > 0 && (
                     <button
                       disabled={ackingEvents}
@@ -1955,17 +2318,50 @@ export function Alerts() {
         </div>
 
         {loading && !groups && <LoadingState label="Loading detections…" />}
+        {/* A filter the server refused is the analyst's to fix, not an outage.
+            The generic card hid the reason under Details and offered a Retry
+            that sent the same 400 again (P7, RL8). */}
+        {badFilter && error && (
+          <div
+            role="alert"
+            className="m-3 flex flex-col items-center gap-2 rounded-card border border-[rgba(245,166,35,.35)] bg-[rgba(245,166,35,.06)] px-4 py-6 text-center"
+          >
+            <div className="text-[13.5px] font-semibold text-text">The filter is not valid</div>
+            <div className="max-w-[560px] break-words text-[12.5px] leading-[1.6] text-text-2">{error.message}</div>
+            <div className="text-[12px] text-faint">Correct the filter or clear its chip. The list does not refresh until then.</div>
+          </div>
+        )}
         {/* The card's own remedy is "retry shortly" — so give it something to
             click. Without onRetry, acting on that advice meant reloading the
             whole page, while the Dashboard's card for the same outage has had a
             Retry button all along. */}
-        {error && <div className="p-3"><ErrorState error={error} onRetry={refetch} /></div>}
+        {error && !badFilter && <div className="p-3"><ErrorState error={error} onRetry={refetch} /></div>}
+        {/* Rows from the last good read stay on screen while the grid does not
+            answer. "updated 1m ago" alone did not say that the rows are old
+            (RL12), so name the time of the read. */}
+        {groups && lastUpdated != null && !badFilter && (failCount > 0 || (error && !loading)) && (
+          <div
+            role="status"
+            className="mx-3 mt-2 rounded-card border border-[rgba(245,166,35,.35)] bg-[rgba(245,166,35,.06)] px-3 py-1.5 text-[12px] text-text-2"
+          >
+            Showing the last good read from {hhmm(lastUpdated)}. The grid did not answer.
+          </div>
+        )}
         {isEmpty && (
           <div
             className="px-4 py-10 text-center text-[13px] text-faint"
             data-empty-reason={emptyReason?.reason ?? 'unchecked'}
           >
-            <div>No detection matches this view in this window. Widen the time range.</div>
+            <div>
+              {emptySentence({
+                view,
+                sevs: filterSevs,
+                verdicts: filterVerdicts,
+                q: filterQ,
+                hideAcked,
+                widest: filterTime === WIDEST_RANGE,
+              })}
+            </div>
             {/* Only when the backend has something to add. `not_empty` means the
                 feed did match events in this window, so the screen is empty
                 because of the filters above it, which the sentence already says. */}
@@ -1982,7 +2378,13 @@ export function Alerts() {
           const seld = sel.isSelected(gk);
           const kbFocused = rowIdx === focusedIndex;
           return (
-            <div key={gk} ref={(el) => { rowRefs.current[gk] = el; }}>
+            <div
+              key={gk}
+              ref={(el) => { rowRefs.current[gk] = el; }}
+              data-group-key={gk}
+              tabIndex={-1}
+              className="outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-accent"
+            >
               <div
                 onClick={() => toggleExpand(g)}
                 className={`relative grid cursor-pointer items-center gap-2.5 border-b border-border-faint hover:bg-surface-hover${
@@ -2139,13 +2541,22 @@ export function Alerts() {
                   {g.conf != null ? g.conf.toFixed(2) : '—'}
                 </div>
                 <div className="flex items-center">
-                  {owner ? (
+                  {ownerPending[gk] ? (
+                    <span
+                      role="status"
+                      aria-label={owner ? `Releasing ${g.name}` : `Assigning ${g.name}`}
+                      className="flex h-[25px] w-[25px] items-center justify-center"
+                    >
+                      <Spinner size={13} />
+                    </span>
+                  ) : owner ? (
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
                         release(g);
                       }}
                       title={`Assigned to ${owner}. Click to release it.`}
+                      aria-label={`Release ${g.name}`}
                       className="flex h-[25px] w-[25px] items-center justify-center rounded-full border border-border-strong bg-[#1a2330] text-[9.5px] font-bold text-[#b9c2cf] hover:border-danger hover:text-danger"
                     >
                       {toInitials(owner)}
@@ -2157,6 +2568,7 @@ export function Alerts() {
                         assignToMe(g);
                       }}
                       title="Assign to me"
+                      aria-label={`Assign ${g.name} to me`}
                       className="flex h-[25px] w-[25px] items-center justify-center rounded-full border-[1.5px] border-dashed border-border-strong text-[14px] leading-none text-faint hover:border-accent hover:text-accent"
                     >
                       +
@@ -2343,8 +2755,8 @@ export function Alerts() {
                           />
                         </div>
                         {/* span of the collapsed run: oldest–newest clock time */}
-                        <div className="flex min-w-0 flex-col leading-tight" title={`${absTime(b.first) ?? ''} – ${absTime(b.last) ?? ''}`}>
-                          <span className="truncate text-text-2">{clockTime(b.first) || '—'}–{clockTime(b.last) || '—'}</span>
+                        <div className="flex min-w-0 flex-col leading-tight" title={`${absTime(b.first) ?? ''} to ${absTime(b.last) ?? ''}`}>
+                          <span className="truncate text-text-2">{clockTime(b.first) || '—'} to {clockTime(b.last) || '—'}</span>
                           {b.head.ago && <span className="text-[10px] text-faint">newest {b.head.ago} ago</span>}
                         </div>
                         {/* severity */}
@@ -2418,10 +2830,18 @@ export function Alerts() {
         drawerId={drawerId}
         starting={starting}
         onClose={closeDrawer}
+        returnFocusRef={drawerReturnRef}
         navigateToPermalink={(id) => navigate(`/investigation/${id}`, { state: { from: '/alerts' } })}
         onReHunt={openDrawer}
         onComplete={onDrawerComplete}
         onAcked={onDrawerAcked}
+        onEscalate={(inv) =>
+          // The drawer's investigation may sit outside the screen's filter, so
+          // its escalate takes the server's default window, as the settled bar
+          // in the report does.
+          escalateGroups([drawerGroup(inv)], {})
+        }
+        escalatingNames={escalatingNames}
       />
     </div>
   );
@@ -2481,22 +2901,42 @@ function KeyHelpOverlay({ onClose }: { onClose: () => void }) {
   );
 }
 
+/** The group the drawer's investigation belongs to, shaped for the group write. */
+function drawerGroup(inv: Inv): GroupRef {
+  return { name: inv.name, kind: inv.kind };
+}
+
+/** Whether the drawer header offers Escalate. A hunt has no alert in Security
+ *  Onion. A settled run with no actions shows its own Escalate in the report,
+ *  and a second button for the same write would only confuse. */
+function drawerCanEscalate(inv: Inv): boolean {
+  if (inv.kind === 'hunt') return false;
+  const settledBar = inv.status === 'complete' && inv.actions.length === 0 && !inv.fallback;
+  return !settledBar;
+}
+
 function AlertDrawer({
   drawerId,
   starting,
   onClose,
+  returnFocusRef,
   navigateToPermalink,
   onReHunt,
   onComplete,
   onAcked,
+  onEscalate,
+  escalatingNames = [],
 }: {
   drawerId: string | null;
   starting: AlertGroup | null;
   onClose: () => void;
+  returnFocusRef?: RefObject<HTMLElement | null>;
   navigateToPermalink: (id: string) => void;
   onReHunt: (id: string) => void;
   onComplete: () => void;
   onAcked?: (ruleName: string) => void;
+  onEscalate?: (inv: Inv) => void;
+  escalatingNames?: string[];
 }) {
   const [tick, setTick] = useState(0);
   const [cancelling, setCancelling] = useState(false);
@@ -2533,6 +2973,8 @@ function AlertDrawer({
     <Drawer
       open={!!drawerId || isStarting}
       onClose={onClose}
+      returnFocusRef={returnFocusRef}
+      ariaLabel={inv?.name ?? starting?.name ?? 'Investigation'}
       header={
         <>
           {/* KindBadge, not a hand-rolled chip: this one hardcoded Suricata's
@@ -2555,6 +2997,17 @@ function AlertDrawer({
               className="flex items-center gap-1.5 text-[12px] text-dim hover:text-danger disabled:opacity-50"
             >
               <X size={13} /> {cancelling ? 'Cancelling…' : 'Cancel'}
+            </button>
+          )}
+          {inv && onEscalate && drawerCanEscalate(inv) && (
+            <button
+              onClick={() => onEscalate(inv)}
+              disabled={escalatingNames.includes(inv.name)}
+              title="Open a Security Onion case for each alert in this detection"
+              className="flex items-center gap-1.5 text-[12px] font-semibold text-[#fca5a5] hover:text-danger disabled:opacity-50"
+            >
+              {escalatingNames.includes(inv.name) ? <Spinner size={12} /> : null}
+              {escalatingNames.includes(inv.name) ? 'Escalating…' : 'Escalate'}
             </button>
           )}
           {inv && (

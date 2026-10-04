@@ -8,9 +8,10 @@ from typing import Any
 from elastic_transport import TransportError
 from elasticsearch import ApiError
 from fastapi import Depends, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from soc_ai.api.security import identify_caller
+from soc_ai.api.webui._errors import api_error
 from soc_ai.api.webui._shared import (
     require_admin_api,
     router,
@@ -46,9 +47,21 @@ class BacktestStatusOut(BaseModel):
     results: dict[str, Any] | None = None
     status: str | None = None
     sampled: int | None = None
+    # The newest attempt when it started no run: {"reason", "hint"}. It sits
+    # beside the stored run and never changes it. A note merged onto the stored
+    # run read as that run's own note (fleet 2026-10-01, RO11).
+    refused: dict[str, str] | None = None
+    # How many alerts the operator asked for, and why fewer were replayed.
+    # "requested 20, replayed 14" had no explanation on the screen (RO20).
+    requested: int | None = None
+    skipped_reason: str | None = None
 
 
 class BacktestIn(BaseModel):
+    # An unknown key is refused. {"sample": -5} used to start a full default
+    # run of 14 replays, because the misspelt key was ignored (RA20).
+    model_config = ConfigDict(extra="forbid")
+
     window_days: int = Field(default=30, ge=1, le=365)
     sample_size: int = Field(default=backtest_svc.DEFAULT_SAMPLE_SIZE, ge=1)
     min_severity: str | None = None
@@ -65,6 +78,7 @@ def _bt_status_out(status: Any) -> BacktestStatusOut:
         finished_at=status.finished_at,
         current=status.current,
         note=status.note,
+        refused=status.refused,
     )
 
 
@@ -79,14 +93,23 @@ def _bt_row_out(bt: Backtest, *, live: Any = None) -> BacktestStatusOut:
         total=(live.total if active else bt.sampled),
         replayed=(live.replayed if active else bt.sampled),
         failed=(live.failed if active else 0),
-        finished_at=(bt.finished_at.isoformat() if bt.finished_at else None),
+        finished_at=backtest_svc.iso_utc(bt.finished_at),
         current=(live.current if active else None),
         note=(live.note if active else None),
         params=bt.params,
         results=bt.results,
         status=bt.status,
         sampled=bt.sampled,
+        requested=_requested(bt.params),
+        skipped_reason=(None if active else backtest_svc.skipped_reason(bt.params, bt.sampled)),
     )
+
+
+def _requested(params: dict[str, Any] | None) -> int | None:
+    if not params:
+        return None
+    value = params.get("requested_sample_size") or params.get("sample_size")
+    return int(value) if value else None
 
 
 def _bt_latest_out(bt: Backtest, *, live: Any) -> BacktestStatusOut:
@@ -129,11 +152,12 @@ def _bt_latest_out(bt: Backtest, *, live: Any) -> BacktestStatusOut:
                 "note": live.note,
             }
         )
-    if live.note:
+    if live.refused:
         # An attempt that never reached a row, and necessarily newer than the
-        # stored one. This note is all the analyst has once the inline error is
-        # gone; dropping it is how a failed run came to leave no trace at all.
-        return out.model_copy(update={"note": live.note})
+        # stored one. This refusal is all the analyst has once the inline error
+        # is gone; dropping it is how a failed run came to leave no trace at
+        # all. It rides beside the stored run, which stays as it was.
+        return out.model_copy(update={"refused": live.refused})
     return out
 
 
@@ -163,7 +187,12 @@ async def start_backtest(request: Request, body: BacktestIn) -> BacktestStatusOu
     started_by = f"backtest:{await identify_caller(request)}"
     min_sev = (body.min_severity or "").strip().lower() or None
     if min_sev is not None and min_sev not in aq.SEVERITIES:
-        min_sev = None
+        raise api_error(
+            422,
+            "bad_request",
+            f"min_severity accepts one of these values: {', '.join(aq.SEVERITIES)}. "
+            "Leave it out for every severity.",
+        )
     try:
         status = await backtest_svc.start_backtest(
             state,
@@ -210,5 +239,9 @@ async def backtest_by_id(request: Request, backtest_id: str) -> BacktestStatusOu
     async with state.db_sessionmaker() as db:
         bt = await bt_svc.get(db, backtest_id)
     if bt is None:
-        raise HTTPException(status_code=404, detail={"reason": "backtest_not_found"})
+        raise api_error(
+            404,
+            "backtest_not_found",
+            "soc-ai has no backtest run with this id. Open the Backtest page for the last run.",
+        )
     return _bt_row_out(bt, live=live)

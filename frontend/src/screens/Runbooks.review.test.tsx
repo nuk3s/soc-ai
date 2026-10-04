@@ -47,4 +47,11 @@ describe('Runbooks list rows', () => {
     // Before the fix the preview read "Beaconing Triage Check the JA3 …".
     expect(preview.textContent).not.toMatch(/Beaconing Triage/);
   });
+
+  // The intro named the internal tool. The operator reads what the model does.
+  it('describes the runbook search without the internal tool name', async () => {
+    render(<Runbooks />);
+    await screen.findByText(/searches the runbooks and cites the best match/);
+    expect(document.body.textContent).not.toContain('lookup_runbook');
+  });
 });

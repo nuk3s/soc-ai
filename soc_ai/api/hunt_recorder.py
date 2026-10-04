@@ -8,6 +8,7 @@ final :class:`~soc_ai.agent.hunt.HuntReport` lands on ``finish``.
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -112,7 +113,11 @@ class HuntRecorder:
     async def record(self, kind: str, sequence: int, payload: dict[str, Any]) -> None:
         if self.hunt_id is None:
             return
-        self._buffer.append({"kind": kind, "sequence": sequence, "payload": payload})
+        # The stored event carries the time it was recorded under ``_at``. The
+        # table has no time column, and the timeline showed every step with an
+        # empty time. A copy, so the report the row lands is the agent's own.
+        stamped = {**payload, "_at": datetime.now(UTC).isoformat()}
+        self._buffer.append({"kind": kind, "sequence": sequence, "payload": stamped})
         if kind == "hunt_report":
             self._report = payload
         if kind == "error":

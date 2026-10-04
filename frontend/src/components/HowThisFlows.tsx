@@ -37,7 +37,7 @@ export const FLOW_LINK_LABEL = 'How this flows';
 export const FLOW_ALT =
   'The hunting pipeline, left to right. An analytic runs on every sweep and finds a hit. ' +
   'Hits on one entity form a lead. You hunt, dismiss or promote the lead. A hunt ends in ' +
-  'findings, not a verdict. A promoted lead becomes an investigation, which ends in a ' +
+  'findings. A promoted lead becomes an investigation, which ends in a ' +
   'verdict. The chart also names what waits on you, and one word per thing.';
 
 /** The five sentences under the chart, in the order the chart reads. */

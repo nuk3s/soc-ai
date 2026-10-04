@@ -16,6 +16,8 @@ vi.mock('../lib/api', async (importOriginal) => ({
   getHunt: vi.fn(),
   getHuntChat: vi.fn(),
   getDossier: vi.fn(),
+  resolveMachine: vi.fn(),
+  getMachine: vi.fn(),
   getHostActivity: vi.fn(),
   getMe: vi.fn(),
 }));
@@ -39,6 +41,7 @@ import {
   getHuntChat,
   getInvestigation,
   getMe,
+  resolveMachine,
 } from '../lib/api';
 import type { HuntDetailData } from '../lib/types';
 import { HostDetail } from './HostDetail';
@@ -85,13 +88,15 @@ const at = (path: string, element: JSX.Element, route: string) =>
 const mountInvestigation = () =>
   at('/investigation/INV-nope', <InvestigationPage />, '/investigation/:id');
 const mountHunt = () => at('/hunts/HUNT-nope', <HuntDetail />, '/hunts/:id');
-const mountHost = () => at('/hosts/10.0.0.9', <HostDetail />, '/hosts/:ip');
+const mountHost = () => at('/hosts/10.0.0.9', <HostDetail />, '/hosts/:key');
 
 beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(getMe).mockResolvedValue({ username: 'ana', role: 'analyst', status: '' });
   vi.mocked(getHostActivity).mockRejectedValue(new ApiError('404 Not Found', 404));
   vi.mocked(getHuntChat).mockResolvedValue({ messages: [], pending: false });
+  // No machine holds the address, so the host page reads the address alone.
+  vi.mocked(resolveMachine).mockRejectedValue(new ApiError('404 Not Found', 404, 'no_host'));
 });
 afterEach(() => {
   vi.useRealTimers(); // one test drives the poll clock; a throw must not leak it

@@ -88,6 +88,24 @@ beforeEach(() => {
 });
 
 describe('AnalyticDrawer', () => {
+  // A drafted analytic that still names the host or the domain of its one
+  // case fires on that case only. The drawer names each clause that pins it.
+  it('lists the pins of a drafted analytic under "Specific to one case"', async () => {
+    const pin = 'The clause on dns.query.name pins the analytic to one domain. Describe the behaviour.';
+    vi.mocked(getAnalytic).mockResolvedValue({ ...DETAIL, pinned: [pin] });
+    mount();
+    const box = await screen.findByTestId('analytic-drawer-pins');
+    expect(within(box).getByText('Specific to one case')).toBeTruthy();
+    expect(within(box).getByText(pin)).toBeTruthy();
+  });
+
+  it('shows no pin list for an analytic that describes a behaviour', async () => {
+    mount();
+    await screen.findByText('Outcome ledger · last 30 days');
+    expect(screen.queryByTestId('analytic-drawer-pins')).toBeNull();
+    expect(screen.queryByText('Specific to one case')).toBeNull();
+  });
+
   it('states the outcome ledger over the month', async () => {
     mount();
     await screen.findByText('Outcome ledger · last 30 days');
@@ -231,6 +249,75 @@ describe('AnalyticDrawer', () => {
 
 // An analytic scoped to user accounts linked every account to the host
 // dossier. The dossier is keyed on an address and 404s a name.
+// F2, F12, RH15, RO19. The drawer said "It has not run, or it found nothing"
+// on a grid where no sweep had run, "0 documents · 0 ms · 0 sweeps" on a
+// profile analytic that ran minutes ago, and "seen 7 times" beside
+// "OBSERVATIONS 5".
+describe('AnalyticDrawer run state and counts', () => {
+  it('says the analytic has not run when no sweep ran it', async () => {
+    vi.mocked(getAnalytic).mockResolvedValue({
+      ...DETAIL,
+      recent: [],
+      last_run_at: null,
+      runner_enabled: false,
+    });
+    mount();
+    const line = await screen.findByTestId('analytic-nothing-observed');
+    expect(line.textContent).toBe('This analytic has not run. Its sweep is off.');
+    expect(line.textContent).not.toContain('or it found nothing');
+    // The header status says so too.
+    expect(screen.getByText('live, not running')).toBeTruthy();
+  });
+
+  it('says when an analytic that ran observed nothing', async () => {
+    vi.mocked(getAnalytic).mockResolvedValue({
+      ...DETAIL,
+      recent: [],
+      last_run_at: iso(HOUR),
+      runner_enabled: true,
+    });
+    mount();
+    const line = await screen.findByTestId('analytic-nothing-observed');
+    expect(line.textContent).toBe(
+      'This analytic ran 1h ago and observed nothing in the last 30 days.',
+    );
+    expect(screen.queryByText('live, not running')).toBeNull();
+  });
+
+  it('reads the cost of a profile analytic as profile runs', async () => {
+    vi.mocked(getAnalytic).mockResolvedValue({
+      ...DETAIL,
+      evaluator: 'profile',
+      ledger: { ...DETAIL.ledger, docs_scanned: 0, runtime_ms: 0, sweeps: 7, profile_runs: 24 },
+    });
+    mount();
+    const cell = await screen.findByTestId('ledger-cost');
+    expect(within(cell).getByText('24')).toBeTruthy();
+    expect(within(cell).getByText('profile runs')).toBeTruthy();
+    expect(cell.textContent).not.toContain('documents');
+    expect(cell.textContent).not.toContain('sweeps');
+  });
+
+  it('counts a match analytic in the right number', async () => {
+    vi.mocked(getAnalytic).mockResolvedValue({
+      ...DETAIL,
+      ledger: { ...DETAIL.ledger, sweeps: 1 },
+    });
+    mount();
+    const cell = await screen.findByTestId('ledger-cost');
+    expect(cell.textContent).toContain('1 sweep');
+    expect(cell.textContent).not.toContain('1 sweeps');
+  });
+
+  it('counts each entity in observations, the unit of the ledger', async () => {
+    mount();
+    await screen.findByText('Outcome ledger · last 30 days');
+    expect(screen.getByText('4 observations')).toBeTruthy();
+    expect(screen.getByText('1 observation')).toBeTruthy();
+    expect(screen.queryByText(/seen \d+ time/)).toBeNull();
+  });
+});
+
 describe('AnalyticDrawer entity links', () => {
   it('links a user entity to its entity page', async () => {
     vi.mocked(getAnalytic).mockResolvedValue({

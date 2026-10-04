@@ -25,6 +25,17 @@ class AnalyticDraft(BaseModel):
     )
 
 
+class Generalization(BaseModel):
+    """What the generalization check found on the draft the route returns.
+
+    ``pinned`` holds one sentence per pin. Empty means the analytic describes a
+    behaviour. ``retried`` says the model rewrote the draft once.
+    """
+
+    pinned: list[str] = []
+    retried: bool = False
+
+
 class AnalyticDraftOut(BaseModel):
     """What the route returns: the stored candidate and its dry run."""
 
@@ -32,4 +43,10 @@ class AnalyticDraftOut(BaseModel):
     spec_yaml: str
     rationale: str
     dry_run: DryRunResult
+    # ``candidate`` once stored. ``preview`` for a draft the route did not store.
     status: str = "candidate"
+    # What the draft could not read, in the analyst's words. A slow grid
+    # leaves the draft to the stored finding, and the note says so.
+    notes: list[str] = []
+    # None when the check found nothing on the first draft.
+    generalization: Generalization | None = None

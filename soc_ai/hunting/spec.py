@@ -449,18 +449,101 @@ class ProfileTest(BaseModel):
     @field_validator("roles")
     @classmethod
     def _roles_are_in_the_vocabulary(cls, v: list[str]) -> list[str]:
-        # Imported here rather than at module scope: the dossier package pulls
-        # in the whole inference stack, and hunting is imported from inside it.
-        from soc_ai.dossier.infer import ROLE_VOCABULARY  # noqa: PLC0415 - lazy, avoids a cycle
+        return _check_roles(v, what="prior")
 
-        unknown = [role for role in v if role not in ROLE_VOCABULARY]
-        if unknown:
-            raise ValueError(
-                f"unknown role(s) {unknown!r}: a typo'd role matches no entity, and a "
-                f"prior that matches nothing reads exactly like a clean network. "
-                f"Known roles: {sorted(ROLE_VOCABULARY)}"
-            )
+
+Level = Literal["informational", "low", "medium", "high", "critical"]
+
+# How many document fields one analytic may copy into its finding. A finding is
+# read in a list, and a field list longer than this is a document dump.
+MAX_DETAIL_FIELDS = 6
+
+
+def _check_roles(v: list[str], *, what: str) -> list[str]:
+    """Refuse a role the dossier never assigns.
+
+    Imported here rather than at module scope: the dossier package pulls in the
+    whole inference stack, and hunting is imported from inside it.
+    """
+    from soc_ai.dossier.infer import ROLE_VOCABULARY  # noqa: PLC0415 - lazy, avoids a cycle
+
+    unknown = [role for role in v if role not in ROLE_VOCABULARY]
+    if unknown:
+        raise ValueError(
+            f"unknown role(s) {unknown!r}: a typo'd role matches no entity, and a "
+            f"{what} that matches nothing reads exactly like a clean network. "
+            f"Known roles: {sorted(ROLE_VOCABULARY)}"
+        )
+    return v
+
+
+def _field_is_whitelisted(v: str, *, what: str) -> str:
+    v = v.strip()
+    if not v:
+        raise ValueError(f"{what} field must not be empty")
+    if not get_whitelist().is_allowed(v):
+        raise ValueError(
+            f"{what} field {v!r} is not on the OQL whitelist. An analytic reads only "
+            "fields the query language already admits."
+        )
+    return v
+
+
+class DetailField(BaseModel):
+    """One document field a finding quotes, with the words it is quoted under.
+
+    The finding names the entity and the document count. For an event whose
+    meaning sits in its payload, such as an antivirus detection, that leaves
+    the analyst one click from the fact. The values come from the sample
+    documents the candidate already carries, so quoting them costs no query.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    field: str
+    label: str
+
+    @field_validator("field")
+    @classmethod
+    def _readable(cls, v: str) -> str:
+        return _field_is_whitelisted(v, what="detail")
+
+    @field_validator("label")
+    @classmethod
+    def _labelled(cls, v: str) -> str:
+        v = " ".join(v.split())
+        if not v:
+            raise ValueError("a detail field needs a label")
         return v
+
+
+class SeverityFrom(BaseModel):
+    """Take a candidate's level from a field of its own documents.
+
+    The spec's ``level`` stays the level when no sample document carries a
+    mapped value. A value the map does not name is ignored for the same reason:
+    an unknown severity word is not evidence of a lower one.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    field: str
+    map: dict[str, Level]
+
+    @field_validator("field")
+    @classmethod
+    def _readable(cls, v: str) -> str:
+        return _field_is_whitelisted(v, what="severity")
+
+    @field_validator("map")
+    @classmethod
+    def _not_empty(cls, v: dict[str, Level]) -> dict[str, Level]:
+        if not v:
+            raise ValueError("a severity map needs at least one value")
+        return v
+
+
+RoleVerdict = Literal["in_scope", "out_of_scope", "unconfirmed"]
 
 
 class HuntSpec(BaseModel):
@@ -471,7 +554,7 @@ class HuntSpec(BaseModel):
     id: str
     title: str
     description: str = ""
-    level: Literal["informational", "low", "medium", "high", "critical"] = "medium"
+    level: Level = "medium"
     evaluator: Literal["match", "profile"] = "match"
 
     # Exactly one of these is set, enforced below and keyed off ``evaluator``.
@@ -523,6 +606,24 @@ class HuntSpec(BaseModel):
     scope_kind: Literal[
         "host", "ip", "user", "cloud_identity", "mailbox", "decoy", "rule", "dataset"
     ] = "host"
+
+    # The role gate of a ``match`` analytic, the same gate a prior uses. Empty
+    # means every role. A named role restricts the analytic to scope hosts the
+    # dossier places in that role at ``min_role_confidence`` or above.
+    #
+    # A host the dossier places in another role at that confidence is a decided
+    # non-match. A host the dossier cannot place is NOT dropped: its documents
+    # are counted apart and reported as a coverage gap that names the host.
+    # Dropping them would make an unclassified server a safe harbour, which is
+    # the failure the inverted gate on the priors exists to prevent. Firing on
+    # them would undo the scope.
+    roles: list[str] = Field(default_factory=list)
+    min_role_confidence: float = 0.9
+
+    # Fields a finding quotes from the sample documents, and the field whose
+    # value sets the level of one candidate. Both are ``match`` only.
+    details: list[DetailField] = Field(default_factory=list)
+    severity: SeverityFrom | None = None
 
     provenance: Provenance = LIVE
     top_k: int = DEFAULT_TOP_K
@@ -592,6 +693,52 @@ class HuntSpec(BaseModel):
                     "evaluator answer it differently"
                 )
         return self
+
+    @field_validator("roles")
+    @classmethod
+    def _match_roles_are_in_the_vocabulary(cls, v: list[str]) -> list[str]:
+        return _check_roles(v, what="role-scoped analytic")
+
+    @model_validator(mode="after")
+    def _match_only_blocks_sit_on_a_match_spec(self) -> HuntSpec:
+        """The role gate, the details and the severity field are read by the match path.
+
+        A ``profile`` spec carries its roles in its profile block, and reads no
+        document a detail could come from. On one of those the blocks below
+        would be parsed, validated and then ignored.
+        """
+        if self.evaluator != "match":
+            for name in ("roles", "details", "severity"):
+                if getattr(self, name):
+                    raise ValueError(
+                        f"a {self.evaluator!r} spec carries a top-level {name!r} block, which "
+                        "only the match path reads"
+                    )
+            return self
+        if self.roles and self.scope_kind not in ("host", "ip"):
+            raise ValueError(
+                f"the role gate reads the role of the scope host, and scope_kind "
+                f"{self.scope_kind!r} names no host"
+            )
+        if not 0.0 < self.min_role_confidence <= 1.0:
+            raise ValueError("min_role_confidence must be above 0 and at most 1")
+        if len(self.details) > MAX_DETAIL_FIELDS:
+            raise ValueError(f"{len(self.details)} detail fields, ceiling is {MAX_DETAIL_FIELDS}")
+        return self
+
+    def role_verdict(self, role: str | None, confidence: float | None) -> RoleVerdict:
+        """Whether a scope host with this dossier role is in this analytic's scope.
+
+        ``out_of_scope`` only when the dossier is confident about a role the
+        analytic does not name. Unknown or below the gate is ``unconfirmed``,
+        never a quiet drop.
+        """
+        if not self.roles:
+            return "in_scope"
+        sure = (confidence or 0.0) >= self.min_role_confidence
+        if role is None or role == "unknown" or not sure:
+            return "unconfirmed"
+        return "in_scope" if role in self.roles else "out_of_scope"
 
     @model_validator(mode="after")
     def _a_lookback_needs_a_precondition_to_widen(self) -> HuntSpec:
@@ -869,12 +1016,16 @@ __all__ = [
     "DEFAULT_TOP_K",
     "MAX_CANDIDATES",
     "MAX_CLAUSES",
+    "MAX_DETAIL_FIELDS",
     "MAX_PRECONDITION_LOOKBACK_MINUTES",
     "Absent",
     "Clause",
+    "DetailField",
     "Detection",
     "HuntSpec",
     "ProfileTest",
+    "RoleVerdict",
+    "SeverityFrom",
     "load_catalog",
     "load_spec",
     "parse_spec",

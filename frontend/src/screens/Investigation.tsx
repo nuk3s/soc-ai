@@ -27,6 +27,7 @@ import { type ReactNode, useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { ChatDockShell, ChatPanelShell, DOCK_SAFE_AREA_CLASS } from '../components/ChatDock';
 import { ConfidenceRing } from '../components/ConfidenceRing';
+import { DocumentChip } from '../components/DocumentDrawer';
 import { DraftDetectionPane } from '../components/DraftDetectionPane';
 import { Markdown } from '../components/Markdown';
 import { EntityGraph } from '../components/EntityGraph';
@@ -63,6 +64,7 @@ import {
 } from '../lib/tooltips';
 import { useAsync } from '../lib/useAsync';
 import { useChatThread } from '../lib/useChatThread';
+import { citedEventIds, splitEventIds } from '../lib/eventIds';
 import { demoBlocked, useDemo } from '../lib/demo';
 import { absTime } from '../lib/timeRange';
 import { SEVERITY, TIMELINE_GROUP_COLOR, VERDICT, tint } from '../lib/tokens';
@@ -129,6 +131,49 @@ function fmt(s: number) {
   const m = Math.floor(s / 60);
   const x = s % 60;
   return `${m < 10 ? '0' : ''}${m}:${x < 10 ? '0' : ''}${x}`;
+}
+
+/** "1m 19s" / "42s": the backend's elapsed-label shape, from the live ticker. */
+function durationLabel(s: number) {
+  const m = Math.floor(s / 60);
+  const x = s % 60;
+  return m > 0 ? `${m}m ${x}s` : `${x}s`;
+}
+
+/** Why Re-run is off while a run is in flight (fleet P4, 2026-10-01). */
+export const RERUN_BUSY_REASON =
+  'A run is in progress. Wait for it to finish before you start another run.';
+
+/** The headline of a pipeline fallback. The stored summary names the failed
+ *  phase and the exception class, which is internal detail (fleet P11). */
+export const FALLBACK_HEADLINE = 'The pipeline stopped. This run has no verdict.';
+
+// The fallback report's summary, for a row that lacks the fallback marker.
+const FALLBACK_SUMMARY_RE = /^Synth-first pipeline fallback:/;
+
+/** The count the page shows for tool calls: the rows of the "Tool calls"
+ *  section. The backend counts the same rows, so the two cannot disagree. */
+export function toolCallCount(inv: Pick<Inv, 'timeline'>): number {
+  return inv.timeline.filter((s) => s.group === 'Tool calls').length;
+}
+
+/** Text with each document id rendered as a control that opens the document. */
+function CitedText({ text, ids }: { text: string; ids: string[] }) {
+  return (
+    <>
+      {splitEventIds(text, ids).map((seg, i) =>
+        seg.t === 'id' ? (
+          <DocumentChip
+            key={i}
+            id={seg.v}
+            className="rounded-chip border border-border-strong bg-surface-2 px-1 py-px align-baseline font-mono text-[0.72em] font-normal tracking-normal text-accent hover:bg-surface-3"
+          />
+        ) : (
+          <span key={i}>{seg.v}</span>
+        ),
+      )}
+    </>
+  );
 }
 
 export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictApplied, onAcked }: InvestigationProps) {
@@ -202,6 +247,13 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   const diedWithNoVerdict = inv.status === 'error' && inv.verdict === 'untriaged';
   // Only spin while genuinely in-flight (not once we've decided it's stuck).
   const running = investigating && !stuck;
+  // A verdict the model did not commit to. It never reads as settled, and it
+  // always offers the two ways forward (fleet P2).
+  const unsettledVerdict = inv.verdict === 'needs_more_info' || inv.verdict === 'inconclusive';
+  const isFallback =
+    !!inv.fallback || FALLBACK_SUMMARY_RE.test(inv.rationale ?? '');
+  const citedIds = citedEventIds(inv.citations);
+  const tools = toolCallCount(inv);
 
   // elapsed ticker while running
   useEffect(() => {
@@ -209,6 +261,11 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     const t = setInterval(() => setElapsed((e) => e + 1), 1000);
     return () => clearInterval(t);
   }, [running]);
+  // Each poll re-seeds the ticker from the server, so the ticker and the
+  // server's label read the same time (two clocks differed by 2 s, P16).
+  useEffect(() => {
+    if (running && inv.elapsedSec != null) setElapsed(inv.elapsedSec);
+  }, [running, inv.elapsedSec]);
 
   // Stuck-guard timer: flips true only when the run is 'investigating' AND has
   // made NO visible progress (no new timeline step from the poll) for the cap.
@@ -361,6 +418,8 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     // this function directly should still no-op rather than mint an
     // unlabeled kind='suricata' duplicate.
     if (inv.kind === 'hunt') return;
+    // A second start while this run is in flight makes a duplicate run (P4).
+    if (running) return;
     setReRunError(null);
     setReHunting(true);
     startHunt(inv.groupId, deep ? { deep: true } : undefined)
@@ -442,17 +501,21 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
       {inv.kind !== 'hunt' && (
         <button
           onClick={reRun}
-          disabled={reHunting}
+          disabled={reHunting || running}
+          title={running ? RERUN_BUSY_REASON : undefined}
           className="flex items-center gap-1.5 rounded-control border border-border-strong bg-surface-3 px-[11px] py-1.5 text-[12px] font-semibold text-dim hover:border-accent hover:text-text disabled:opacity-60"
         >
           {reHunting ? <Spinner size={13} /> : <RotateCw size={13} />}
           {reHunting ? 'Re-running…' : 'Re-run investigation'}
         </button>
       )}
+      {inv.kind !== 'hunt' && running && (
+        <span className="text-[11.5px] text-faint">A run is in progress.</span>
+      )}
       {inv.kind !== 'hunt' && wasHeuristic && (
         <button
           onClick={reRunDeep}
-          disabled={reHunting}
+          disabled={reHunting || running}
           title="This verdict came from the zero-tool fast path. Re-run it with the tool-driven investigation loop."
           className="flex items-center gap-1.5 rounded-control border border-border-strong bg-surface-3 px-[11px] py-1.5 text-[12px] font-semibold text-dim hover:border-accent hover:text-text disabled:opacity-60"
         >
@@ -520,7 +583,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
       <div className="mt-[11px] flex items-center gap-[9px] font-mono text-[12px] text-dim">
         <span className="text-accent">steps</span> <span className="text-text-2">{inv.timeline.length}</span>
         <span className="text-ghost">·</span> <span className="text-accent">tool calls</span>{' '}
-        <span className="text-text-2">{inv.meta?.toolCalls ?? 0}</span>
+        <span className="text-text-2">{tools}</span>
       </div>
       <div className="mt-3 flex flex-col gap-1.5 text-[12.5px] text-dim">
         {inv.timeline.slice(-3).map((s) => (
@@ -554,6 +617,21 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     </div>
   );
 
+  // What the failed run recorded (RL11, RD13). The old copy guessed "the run
+  // may have stalled, the agent may have crashed" while the timeline held the
+  // real cause, and advised a re-run for a cause no re-run can change: an
+  // alert that is no longer in the grid. A run a later run already replaced
+  // needs no re-run either (D1).
+  const failure = inv.status === 'error' ? inv.failure ?? null : null;
+  const noRerunAdvice = !!inv.supersededBy || !!failure?.permanent;
+  const tryAgain =
+    inv.kind === 'hunt' ? 'Re-promote it from its hunt to try again.' : 'Re-run it to try again.';
+  const failureSentence = failure?.permanent
+      ? 'The run reached no verdict. A re-run cannot change the recorded cause.'
+      : failure
+        ? `The run reached no verdict. ${tryAgain}`
+        : `The run reached no verdict. soc·ai recorded no cause. ${tryAgain}`;
+
   // Terminal failure: a reaped/interrupted run (status 'error') OR one the
   // client-side stuck-guard gave up on. Replaces both the spinner and the
   // (empty) verdict so the analyst never stares at "Investigating…" forever.
@@ -586,7 +664,9 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
             "re-run it" here too — the API refuses a direct re-run of a
             promoted finding's anchor (409 hunt_kind_no_rerun), so the two
             instructions would mean different things at the same spot. */}
-        {interrupted
+        {inv.supersededBy
+          ? 'The run reached no verdict.'
+          : interrupted
           ? inv.kind === 'hunt'
             ? 'There is no verdict. The service restarted during the run. soc·ai re-investigates this finding if Auto-Investigate is on. Re-promote it from its hunt to try again.'
             : 'There is no verdict. The service restarted during the run. soc·ai re-investigates this alert if Auto-Investigate is on. Re-run it now to get a verdict.'
@@ -594,14 +674,32 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
             ? inv.kind === 'hunt'
               ? 'The run reached no verdict. An operator cancel or a service restart stopped the run before it finished. Re-promote it from its hunt to try again.'
               : 'The run reached no verdict. An operator cancel or a service restart stopped the run before it finished. Re-run it to get a verdict.'
-            : inv.kind === 'hunt'
-              ? 'The run reached no verdict. The run may have stalled. The agent may have crashed. Re-promote it from its hunt to try again.'
-              : 'The run reached no verdict. The run may have stalled. The agent may have crashed. Re-run it to try again.'}
+            : stuck && inv.status === 'investigating'
+              ? `The run made no progress for 5 minutes. It may have stalled. ${tryAgain}`
+              : failureSentence}
       </div>
+      {failure && (
+        <div data-testid="failure-cause" className="mt-2 text-[12.5px] leading-[1.5] text-dim">
+          Recorded cause:{' '}
+          <span className="break-words font-mono text-[12px] text-text-2">{failure.cause}</span>
+          {failure.hint && <div className="mt-1">{failure.hint}</div>}
+        </div>
+      )}
+      {inv.supersededBy && (
+        <div data-testid="superseded-by" className="mt-2 text-[13px] leading-[1.5] text-text-2">
+          A later run replaced this one.{' '}
+          <Link
+            to={`/investigation/${inv.supersededBy}`}
+            className="font-semibold text-accent underline hover:opacity-80"
+          >
+            Open the later run
+          </Link>
+        </div>
+      )}
       <div className="mt-[14px] flex flex-wrap items-center gap-2">
         {inv.kind === 'hunt' ? (
-          reRunOrPromoteLine('text-[13px] leading-[1.5] text-dim')
-        ) : (
+          !inv.supersededBy && reRunOrPromoteLine('text-[13px] leading-[1.5] text-dim')
+        ) : noRerunAdvice ? null : (
           <button
             onClick={reRun}
             disabled={reHunting}
@@ -699,13 +797,25 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
 
       {/* rationale as headline */}
       <div className="text-[21px] font-semibold leading-[1.32] tracking-[-.015em]" style={{ textWrap: 'pretty' }}>
-        {inv.rationale}
+        {isFallback ? FALLBACK_HEADLINE : <CitedText text={inv.rationale ?? ''} ids={citedIds} />}
       </div>
 
-      {/* summary with citations */}
-      <p className="mt-3.5 text-[13.5px] leading-[1.6] text-[#aeb6c2]" style={{ textWrap: 'pretty' }}>
-        <Summary segments={inv.summary} onCite={goToCite} />
-      </p>
+      {/* summary with citations. A fallback's stored summary is the exception
+          text; the pipeline-error panel below says what an analyst needs. */}
+      {!isFallback && (
+        <p className="mt-3.5 text-[13.5px] leading-[1.6] text-[#aeb6c2]" style={{ textWrap: 'pretty' }}>
+          <Summary segments={inv.summary} onCite={goToCite} ids={citedIds} />
+        </p>
+      )}
+      {/* Every document the report cites, each one opens the event (P3). */}
+      {!isFallback && citedIds.length > 0 && (
+        <div data-testid="cited-evidence" className="mt-3 flex flex-wrap items-center gap-1.5 text-[12px] text-faint">
+          <span>Cited evidence:</span>
+          {citedIds.map((id) => (
+            <DocumentChip key={id} id={id} />
+          ))}
+        </div>
+      )}
       {/* Close the tuning loop: a verdict that cites the rule-tuning tool
           ("tuning recommends mute") gets a direct path to the Mute button —
           the recommendation used to dead-end in prose (dogfood 2026-07-15). */}
@@ -774,7 +884,10 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
         structured open questions — it's a terminal non-committed verdict like
         needs_more_info, and the request-more-info endpoint accepts it too.
         SUPPRESSED for a pipeline fallback — the panel above replaces it. */}
-    {!inv.fallback && ((inv.openQuestions?.length ?? 0) > 0 || inv.verdict === 'inconclusive') && (
+    {/* needs_more_info joins inconclusive here: prod held 49 such runs with
+        no open questions, so the block and its Request more info button
+        never rendered and the settled bar offered Acknowledge instead (P2). */}
+    {!isFallback && ((inv.openQuestions?.length ?? 0) > 0 || unsettledVerdict) && (
       <div
         className="mb-3 rounded-card border px-3.5 py-3"
         style={{ borderColor: 'rgba(245,166,35,.35)', background: 'rgba(245,166,35,.06)' }}
@@ -790,8 +903,9 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
           </ul>
         ) : inv.kind !== 'hunt' ? (
           <div className="mb-2.5 text-[13px] text-text-2">
-            The model could not converge on a verdict. Start a focused
-            re-investigation. You can also resolve it in chat.
+            {inv.verdict === 'needs_more_info'
+              ? 'The model needs more evidence to settle this verdict. The run recorded no open questions. Start a focused re-investigation. You can also resolve it in chat.'
+              : 'The model could not converge on a verdict. Start a focused re-investigation. You can also resolve it in chat.'}
           </div>
         ) : null}
         {/* Honest wayfinding for a promoted finding: every re-run affordance
@@ -1010,7 +1124,11 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   // ack — the promoted finding's anchor is telemetry, not an alert, and the
   // server refuses the write too (Task 6). This is the honest-UI half.
   const settledActionEl =
-    inv.status === 'complete' && inv.actions.length === 0 && !inv.fallback && inv.kind !== 'hunt' ? (
+    inv.status === 'complete' &&
+    inv.actions.length === 0 &&
+    !isFallback &&
+    !unsettledVerdict &&
+    inv.kind !== 'hunt' ? (
       <div
         className="rounded-card border px-3.5 py-3"
         style={{ borderColor: 'rgba(245,166,35,.35)', background: 'rgba(245,166,35,.06)' }}
@@ -1106,7 +1224,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   const timelineEl = (
     <CollapsibleSection
       title="Investigation timeline"
-      meta={`${inv.timeline.length} steps · ${inv.elapsedLabel}`}
+      meta={`${plural(inv.timeline.length, 'step')} · ${running ? durationLabel(elapsed) : inv.elapsedLabel}`}
       open={timelineOpen}
       onToggle={() => setTimelineOpen((o) => !o)}
     >
@@ -1164,6 +1282,8 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     onSend: chat.send,
     invId: inv.id,
     onResolved,
+    verdict: inv.verdict,
+    linkIds: citedIds,
   };
 
   // ── Override verdict modal ────────────────────────────────────────────────
@@ -1260,8 +1380,34 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   ) : inv.alert ? (
     <AlertDetailsPanel alert={inv.alert} sev={inv.sev} kind={inv.kind} />
   ) : null;
-  const hostEl = inv.hostContext?.length ? <HostContextPanel host={inv.host} signals={inv.hostContext} /> : null;
-  const metaEl = inv.meta ? <InvMetaPanel meta={inv.meta} id={inv.id} /> : null;
+  // One panel per end of the alert, each named. A run stored before the per-end
+  // split has only the pooled list, so its panel says it covers both ends.
+  const hostEl = inv.hostContexts?.length ? (
+    <>
+      {inv.hostContexts.map((h) => (
+        <HostContextPanel
+          key={`${h.end}-${h.ip}`}
+          host={h.ip}
+          role={h.end === 'destination' ? 'destination' : 'source'}
+          summary={h.end === 'destination' ? 'Destination of this alert' : 'Source of this alert'}
+          sections={[
+            { label: 'Alerts with this host as source', signals: h.asSource },
+            { label: 'Alerts with this host as destination', signals: h.asDestination },
+          ]}
+        />
+      ))}
+    </>
+  ) : inv.hostContext?.length ? (
+    <HostContextPanel
+      host="Both ends"
+      summary={`${inv.hostContext.length} alert types on either end of this alert`}
+      sections={[{ label: 'Alerts on either end of this alert', signals: inv.hostContext }]}
+    />
+  ) : null;
+  const metaEl = inv.meta ? <InvMetaPanel meta={inv.meta} id={inv.id} toolCalls={tools} /> : null;
+  // A run in flight has no verdict yet. The verdict card would read
+  // an untriaged placeholder with no endpoints and 0.00 confidence (P16).
+  const showVerdict = !(running && inv.verdict === 'untriaged');
 
   // ── PAGE (permalink): two-column workstation layout ──────────────────────
   // Verdict spans full width as the hero. The wide main column carries the
@@ -1285,7 +1431,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
         ) : (
           <>
             {running && runningEl}
-            {verdictEl}
+            {showVerdict && verdictEl}
             <div className="mt-[18px] grid grid-cols-1 items-start gap-[18px] lg:grid-cols-[minmax(0,1fr)_360px]">
               <div className="flex min-w-0 flex-col gap-[18px]">
                 {inv.nodes.length > 0 && entityEl}
@@ -1322,7 +1468,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
       ) : (
         <>
           {running && runningEl}
-          {verdictEl}
+          {showVerdict && verdictEl}
           {inv.nodes.length > 0 && <div className="mt-[18px]">{entityEl}</div>}
           <div className="mt-[18px]">{inv.actions.length > 0 ? actionsEl : settledActionEl}</div>
           {draftDetectionEl && <div className="mt-[18px]">{draftDetectionEl}</div>}
@@ -1355,6 +1501,8 @@ function ChatPanel({
   onClose,
   invId,
   onResolved,
+  verdict,
+  linkIds,
 }: {
   messages: ChatMessage[];
   pending: boolean;
@@ -1366,6 +1514,8 @@ function ChatPanel({
   onClose?: () => void;
   invId: string;
   onResolved: () => void;
+  verdict?: Inv['verdict'];
+  linkIds?: string[];
 }) {
   // Apply-verdict feedback, keyed by the proposal's message index: which one is
   // mid-apply, and a per-message error string so a failed apply surfaces (and
@@ -1406,11 +1556,7 @@ function ChatPanel({
               No messages yet. Ask a follow-up about this investigation.
             </div>
             <div className="flex flex-wrap gap-1.5">
-              {[
-                'Why not a false positive?',
-                'What evidence supports this verdict?',
-                'What should I check next?',
-              ].map((q) => (
+              {starterQuestions(verdict).map((q) => (
                 <button
                   key={q}
                   type="button"
@@ -1424,6 +1570,7 @@ function ChatPanel({
           </div>
         }
         listSizeClass={fill ? 'min-h-0 flex-1' : 'max-h-[460px] min-h-[260px]'}
+        linkIds={linkIds ?? []}
         messages={messages}
         pending={pending}
         progressTools={progressTools}
@@ -1475,6 +1622,18 @@ function ChatPanel({
 }
 
 type ChatPanelProps = Parameters<typeof ChatPanel>[0];
+
+/** Starter questions that fit the verdict. "Why not a false positive?" on a
+ *  false positive verdict asks the chat to argue against itself (P16). */
+export function starterQuestions(verdict: Inv['verdict'] | undefined): string[] {
+  const first =
+    verdict === 'false_positive'
+      ? 'Why not a true positive?'
+      : verdict === 'true_positive'
+        ? 'Why not a false positive?'
+        : 'What evidence would settle this verdict?';
+  return [first, 'What evidence supports this verdict?', 'What should I check next?'];
+}
 
 // Floating chat: a launcher pinned bottom-right of the viewport that opens the
 // scoped chat as a docked panel. Costs no layout space and stays reachable no
@@ -1637,25 +1796,50 @@ function AlertDetailsPanel({ alert, sev, kind }: { alert: AlertMeta; sev?: Sever
   );
 }
 
-function HostContextPanel({ host, signals }: { host: string; signals: HostSignal[] }) {
+function HostContextPanel({
+  host,
+  role,
+  summary,
+  sections,
+}: {
+  host: string;
+  /** Which end of the alert this host is. Absent on a pooled list. */
+  role?: string;
+  summary: string;
+  sections: { label?: string; signals: HostSignal[] }[];
+}) {
+  const shown = sections.filter((sec) => sec.signals.length > 0);
   return (
     <CollapsiblePanel
       icon={<Activity size={15} />}
       title="Host context"
-      right={<div className="font-mono text-[11px] text-mono-amber">{host}</div>}
-      summary={`${signals.length} risk signals on this host`}
+      right={
+        <div className="flex items-center gap-1.5 text-[11px]">
+          {role ? <span className="text-faint">{role}</span> : null}
+          <span className="font-mono text-mono-amber">{host}</span>
+        </div>
+      }
+      summary={summary}
     >
       <div className="flex flex-col gap-2.5 p-[14px]">
-        {signals.map((s, i) => (
-          <div key={i}>
-            <div className="flex items-center gap-2 text-[12px]">
-              <span className="font-mono text-faint">{s.time}</span>
-              <span className="min-w-0 flex-1 truncate text-text-2" title={s.label}>{s.label}</span>
-              <span className="flex-none font-mono text-[10.5px]" style={{ color: SEV_COLOR[s.tone] }}>{s.sev}</span>
-            </div>
-            <div className="mt-1 h-1 overflow-hidden rounded-full bg-surface-3">
-              <div className="h-full origin-left animate-barGrow rounded-full" style={{ width: `${s.w}%`, background: SEV_COLOR[s.tone] }} />
-            </div>
+        {shown.length === 0 ? (
+          <div className="text-[12px] text-faint">No other alerts on this host in the window.</div>
+        ) : null}
+        {shown.map((sec, si) => (
+          <div key={si} className="flex flex-col gap-2.5">
+            {sec.label ? <div className="text-[11px] font-semibold text-faint">{sec.label}</div> : null}
+            {sec.signals.map((s, i) => (
+              <div key={i}>
+                <div className="flex items-center gap-2 text-[12px]">
+                  <span className="font-mono text-faint">{s.time}</span>
+                  <span className="min-w-0 flex-1 truncate text-text-2" title={s.label}>{s.label}</span>
+                  <span className="flex-none font-mono text-[10.5px]" style={{ color: SEV_COLOR[s.tone] }}>{s.sev}</span>
+                </div>
+                <div className="mt-1 h-1 overflow-hidden rounded-full bg-surface-3">
+                  <div className="h-full origin-left animate-barGrow rounded-full" style={{ width: `${s.w}%`, background: SEV_COLOR[s.tone] }} />
+                </div>
+              </div>
+            ))}
           </div>
         ))}
       </div>
@@ -1795,12 +1979,12 @@ function OracleCard({ oracle }: { oracle: OracleAdjudication }) {
   );
 }
 
-function InvMetaPanel({ meta, id }: { meta: InvMeta; id: string }) {
+function InvMetaPanel({ meta, id, toolCalls }: { meta: InvMeta; id: string; toolCalls: number }) {
   const rows: [string, string][] = [
     ['id', id],
     ['model', meta.model],
     ['oracle', meta.oracle ?? '—'],
-    ['tool calls', `${meta.toolCalls}`],
+    ['tool calls', `${toolCalls}`],
     ['pivots', `${meta.pivots}`],
     ['run by', meta.ranBy],
     ['ran at', absTime(meta.ranAt)],
@@ -1809,7 +1993,7 @@ function InvMetaPanel({ meta, id }: { meta: InvMeta; id: string }) {
     <CollapsiblePanel
       icon={<Cpu size={15} />}
       title="Investigation"
-      summary={`${meta.model} · ${meta.toolCalls} tool calls`}
+      summary={`${meta.model} · ${plural(toolCalls, 'tool call')}`}
     >
       <div className="flex flex-col">
         {rows.map(([k, val]) => (
@@ -1909,11 +2093,24 @@ function CollapsibleSection({
   );
 }
 
-function Summary({ segments, onCite }: { segments: SummarySegment[]; onCite: (n: number) => void }) {
+function Summary({
+  segments,
+  onCite,
+  ids = [],
+}: {
+  segments: SummarySegment[];
+  onCite: (n: number) => void;
+  ids?: string[];
+}) {
   return (
     <>
       {segments.map((seg, i) => {
-        if (seg.t === 'text') return <span key={i}>{seg.v}</span>;
+        if (seg.t === 'text')
+          return (
+            <span key={i}>
+              <CitedText text={seg.v} ids={ids} />
+            </span>
+          );
         if (seg.t === 'mono')
           return (
             <span key={i} className="font-mono" style={{ color: seg.tone === 'green' ? '#7ba893' : '#e0a83a' }}>

@@ -521,10 +521,18 @@ def _validate(args: argparse.Namespace) -> int:
 
 
 def _positive_int(value: str) -> int:
-    """argparse type for counts that must be >= 1 (e.g. --repeats)."""
-    n = int(value)
+    """argparse type for counts and windows that must be 1 or more.
+
+    Also ``--weeks`` and ``--recent-hours``: ``--weeks -3``, ``--weeks 0`` and
+    ``--recent-hours 0`` were accepted and printed an empty report, which read
+    as a quiet estate (fleet 2026-10-01, RA18).
+    """
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a whole number.") from None
     if n < 1:
-        raise argparse.ArgumentTypeError(f"must be >= 1, got {n}")
+        raise argparse.ArgumentTypeError(f"{n} is not valid. Use a whole number of 1 or more.")
     return n
 
 
@@ -1219,11 +1227,109 @@ def _discover_internal_identifiers(_args: argparse.Namespace) -> int:
         return 1
 
 
+def _audit_verify_broken(
+    result: Any, scope: str, older_finding: str | None, duplicates_only: bool
+) -> int:
+    """Print a verdict that is not intact. Returns the exit code: 3 or 1."""
+    # The tally: how many epochs broke, and where the oldest and newest
+    # breaks are. `epochs_broken == 1` gets the tighter singular phrasing
+    # (naming "oldest" and "newest" for the same one epoch twice would be
+    # true but redundant) — both name the seq LOCAL to that epoch, since
+    # seq resets to 0 at every genesis.
+    if result.epochs_broken == 1:
+        tally = (
+            f"1 of {result.epochs} epochs broken. The break is at seq "
+            f"{result.first_broken_seq} in epoch {result.first_broken_epoch_start}"
+        )
+    else:
+        tally = (
+            f"{result.epochs_broken} of {result.epochs} epochs broken. The oldest "
+            f"break is at seq {result.first_broken_seq} in epoch "
+            f"{result.first_broken_epoch_start}. The newest broken epoch is "
+            f"{result.newest_broken_epoch_start}"
+        )
+    # A capped scan did not read the oldest end of its window (the walk is
+    # newest first), so the scan makes no claim about the whole run of
+    # epochs under `capped`. The standalone capped warning above already
+    # carries the "this is not the full picture" signal. The CLI runs
+    # uncapped; the branch stays for a caller that passes a bound.
+    if result.capped:
+        trailing = ""
+    elif result.latest_epoch_broken:
+        trailing = " The latest epoch is broken."
+    else:
+        trailing = f" Every epoch after {result.newest_broken_epoch_start} verified intact."
+    # The headline has to match the evidence underneath it. This printed
+    # "TAMPER DETECTED" unconditionally, and the very next line said "the
+    # records were not altered; two writers continued the chain from the
+    # same point" — a headline contradicted by its own body, on a finding
+    # that is soc-ai's own concurrency and not an intruder.
+    #
+    # `altered_records` is the discriminator and it is exact: a record that
+    # no longer matches its own hash is someone changing the record of a
+    # decision. A position claimed twice, with every copy still hashing
+    # true, is two writers.
+    # A duplicates-only finding gets its own headline and its own exit
+    # code (3): "CHAIN BROKEN" with exit 1 read as tamper, on soc-ai's own
+    # concurrency with every copy hashing true.
+    if result.altered_records:
+        headline = "TAMPER DETECTED"
+    elif duplicates_only:
+        headline = "DUPLICATE SEQUENCE NUMBERS"
+    else:
+        headline = "CHAIN BROKEN"
+    tone = _C["yellow"] if duplicates_only else _C["red"]
+    print(
+        f"{tone}{_C['bold']}{headline}{_C['reset']}{tone}: {tally}.{trailing}{_C['reset']}{scope}",
+        file=sys.stderr,
+    )
+    # WHAT broke, not just that something did. A position claimed twice by
+    # two writers and a record whose content was edited after the fact are
+    # different events with different responses, and one sentence covering
+    # both ("a record was edited, reordered, inserted, or deleted") left an
+    # operator unable to tell a known concurrency defect from an intrusion.
+    detail = result.newest_break_detail or result.first_break_detail
+    print(
+        f"{_C['dim']}{result.records_verified} record(s) scanned. "
+        f"{detail or 'A record was edited, reordered, inserted, or deleted.'}"
+        f"{_C['reset']}",
+        file=sys.stderr,
+    )
+    # How widespread, in the same words the scheduled alarm and the webhook
+    # use. Naming one sequence number leaves a single collision and a
+    # forked afternoon reading identically.
+    from soc_ai.audit.verify import describe_blast_radius  # noqa: PLC0415
+
+    blast_radius = describe_blast_radius(result)
+    if blast_radius:
+        print(f"{_C['dim']}{blast_radius}{_C['reset']}", file=sys.stderr)
+    if result.newest_break_kind == "duplicate_seq":
+        print(
+            f"{_C['dim']}A duplicated position is the signature of two writers "
+            f"that append at once. An edit leaves a different signature. Compare "
+            f"the timestamps and sessions of the records at that sequence. "
+            f"Two different sessions minutes apart means concurrency. One record "
+            f"rewritten in place means an edit.{_C['reset']}",
+            file=sys.stderr,
+        )
+    if older_finding:
+        print(f"{_C['dim']}{older_finding}{_C['reset']}", file=sys.stderr)
+    if duplicates_only:
+        print(
+            f"{_C['yellow']}duplicate sequence numbers; no record was altered."
+            f"{_C['reset']} Exit 3.",
+            file=sys.stderr,
+        )
+        return 3
+    return 1
+
+
 def _audit_verify(args: argparse.Namespace) -> int:
     """argparse handler for ``soc-ai audit verify``.
 
-    Pulls every record from the audit index (``{audit_index_alias}-*``), sorted
-    ascending by timestamp, partitions it into epochs at each restart boundary,
+    Streams the records of the window (default: the newest 7 days; ``--all``
+    for the whole index) out of ``{audit_index_alias}-*``, one epoch at a time,
+    newest first,
     and runs the tamper-evident hash chain over EVERY epoch — never stopping at
     the first broken one (:func:`soc_ai.audit.verify.verify_audit_chain`). This
     is the operator's way to actually exercise the tamper-evidence: every epoch
@@ -1251,20 +1357,24 @@ def _audit_verify(args: argparse.Namespace) -> int:
     broken") — see :mod:`soc_ai.audit.verify`'s module docstring for the finding
     that made this a real requirement.
 
+    The default scan is the newest 7 days (``--days N`` to change it, ``--all``
+    for the whole index). The verifier streams one page at a time, so memory
+    stays bounded on any index size: the old whole-index load was SIGKILLed
+    inside a 1 GB container (exit 137, no output).
+
     Exit codes:
       0   every epoch intact (including an empty index — nothing to tamper
           with), whether that is one epoch or many
-      1   the chain does not verify — at least one epoch broke. The headline
-          distinguishes the two reasons: TAMPER DETECTED when a record no
-          longer matches its own hash, CHAIN BROKEN when every copy still
-          hashes true and the damage is duplicated or absent positions (two
-          writers, not an intruder). Both exit 1.
-      2   could not run (ES unreachable / settings didn't load)
+      1   the chain does not verify and the damage is more than duplicated
+          positions: a record no longer matches its own hash (TAMPER DETECTED),
+          or a position is absent or relinked (CHAIN BROKEN)
+      2   could not run (ES unreachable / settings didn't load / bad flags)
+      3   duplicate sequence numbers only, and every copy still matches its own
+          hash: two writers appended at once, no record was altered. This had
+          exit 1 and read as "CHAIN BROKEN", while 1 means tamper.
     """
-    from soc_ai.audit.verify import (  # noqa: PLC0415 - lazy
-        ChainVerifyResult,
-        verify_audit_chain,
-    )
+    from soc_ai.audit import verify as audit_verify  # noqa: PLC0415 - lazy
+    from soc_ai.audit.verify import ChainVerifyResult  # noqa: PLC0415 - lazy
     from soc_ai.so_client.elastic import ElasticClient  # noqa: PLC0415 - lazy
 
     try:
@@ -1277,18 +1387,35 @@ def _audit_verify(args: argparse.Namespace) -> int:
         )
         return 2
 
-    days: int | None = getattr(args, "days", None)
+    days_arg: int | None = getattr(args, "days", None)
+    if days_arg is not None and days_arg < 1:
+        print(
+            f"{_C['red']}audit verify could not run{_C['reset']}: --days must be 1 or more.",
+            file=sys.stderr,
+        )
+        return 2
+    days: int | None = None if getattr(args, "all", False) else (days_arg or 7)
 
-    async def _go() -> ChainVerifyResult:
+    async def _go() -> tuple[ChainVerifyResult, str | None]:
         elastic = ElasticClient(settings)
         try:
-            return await verify_audit_chain(elastic, settings.audit_index_alias, days=days)
+            # No record bound: the verifier streams one page at a time, so the
+            # whole index costs time and never memory.
+            res = await audit_verify.verify_audit_chain(
+                elastic, settings.audit_index_alias, days=days, max_records=None
+            )
+            older = None
+            if days is not None:
+                older = await audit_verify.recorded_older_duplicate(
+                    elastic, settings.audit_index_alias, days=days
+                )
+            return res, older
         finally:
             with contextlib.suppress(Exception):
                 await elastic.aclose()
 
     try:
-        result = asyncio.run(_go())
+        result, older_finding = asyncio.run(_go())
     except Exception as e:
         # A verification against an unreachable index is "could not run", NOT
         # "intact" — never let an ES/transport error read as a clean chain.
@@ -1303,90 +1430,18 @@ def _audit_verify(args: argparse.Namespace) -> int:
     scope = f" (last {days}d window)" if days is not None else ""
     if result.capped:
         print(
-            f"{_C['yellow']}warning: the scan hit the record cap. It verified only "
-            f"a prefix of the chain. Bound the scan with --days to check a smaller "
+            f"{_C['yellow']}warning: the scan hit the record cap. It verified the "
+            f"newest records only. Bound the scan with --days to check a smaller "
             f"window.{_C['reset']}",
             file=sys.stderr,
         )
 
+    duplicates_only = not result.ok and audit_verify.is_duplicates_only(result)
     if not result.ok:
-        # The tally: how many epochs broke, and where the oldest and newest
-        # breaks are. `epochs_broken == 1` gets the tighter singular phrasing
-        # (naming "oldest" and "newest" for the same one epoch twice would be
-        # true but redundant) — both name the seq LOCAL to that epoch, since
-        # seq resets to 0 at every genesis.
-        if result.epochs_broken == 1:
-            tally = (
-                f"1 of {result.epochs} epochs broken. The break is at seq "
-                f"{result.first_broken_seq} in epoch {result.first_broken_epoch_start}"
-            )
-        else:
-            tally = (
-                f"{result.epochs_broken} of {result.epochs} epochs broken. The oldest "
-                f"break is at seq {result.first_broken_seq} in epoch "
-                f"{result.first_broken_epoch_start}. The newest broken epoch is "
-                f"{result.newest_broken_epoch_start}"
-            )
-        # A capped scan cannot vouch for anything beyond its own prefix — the
-        # cap always truncates the NEWEST end of the chain (the fetch is
-        # oldest-first) — so neither claim below is honest under `capped`,
-        # regardless of which way `latest_epoch_broken` happens to land for
-        # the prefix actually scanned. The standalone capped warning above
-        # already carries the "this is not the full picture" signal.
-        if result.capped:
-            trailing = ""
-        elif result.latest_epoch_broken:
-            trailing = " The latest epoch is broken."
-        else:
-            trailing = f" Every epoch after {result.newest_broken_epoch_start} verified intact."
-        # The headline has to match the evidence underneath it. This printed
-        # "TAMPER DETECTED" unconditionally, and the very next line said "the
-        # records were not altered; two writers continued the chain from the
-        # same point" — a headline contradicted by its own body, on a finding
-        # that is soc-ai's own concurrency and not an intruder.
-        #
-        # `altered_records` is the discriminator and it is exact: a record that
-        # no longer matches its own hash is someone changing the record of a
-        # decision. A position claimed twice, with every copy still hashing
-        # true, is two writers. Both mean the chain does not verify, so both
-        # still exit 1 and both still print red — what changes is which of the
-        # two an operator is being told to go and look for.
-        headline = "TAMPER DETECTED" if result.altered_records else "CHAIN BROKEN"
-        print(
-            f"{_C['red']}{_C['bold']}{headline}{_C['reset']}{_C['red']}: "
-            f"{tally}.{trailing}{_C['reset']}{scope}",
-            file=sys.stderr,
-        )
-        # WHAT broke, not just that something did. A position claimed twice by
-        # two writers and a record whose content was edited after the fact are
-        # different events with different responses, and one sentence covering
-        # both ("a record was edited, reordered, inserted, or deleted") left an
-        # operator unable to tell a known concurrency defect from an intrusion.
-        detail = result.newest_break_detail or result.first_break_detail
-        print(
-            f"{_C['dim']}{result.records_verified} record(s) scanned. "
-            f"{detail or 'A record was edited, reordered, inserted, or deleted.'}"
-            f"{_C['reset']}",
-            file=sys.stderr,
-        )
-        # How widespread, in the same words the scheduled alarm and the webhook
-        # use. Naming one sequence number leaves a single collision and a
-        # forked afternoon reading identically.
-        from soc_ai.audit.verify import describe_blast_radius  # noqa: PLC0415
+        return _audit_verify_broken(result, scope, older_finding, duplicates_only)
 
-        blast_radius = describe_blast_radius(result)
-        if blast_radius:
-            print(f"{_C['dim']}{blast_radius}{_C['reset']}", file=sys.stderr)
-        if result.newest_break_kind == "duplicate_seq":
-            print(
-                f"{_C['dim']}A duplicated position is the signature of two writers "
-                f"that append at once. An edit leaves a different signature. Compare "
-                f"the timestamps and sessions of the records at that sequence. "
-                f"Two different sessions minutes apart means concurrency. One record "
-                f"rewritten in place means an edit.{_C['reset']}",
-                file=sys.stderr,
-            )
-        return 1
+    if older_finding:
+        print(f"{_C['yellow']}note{_C['reset']}: {older_finding}")
 
     if result.records_verified == 0:
         print(f"{_C['green']}audit chain intact{_C['reset']}: 0 records{scope}")
@@ -1425,17 +1480,29 @@ def _register_audit(sub: Any) -> None:
     p_ver = audit_sub.add_parser(
         "verify",
         help="Verify the tamper-evident audit hash chain against the live ES "
-        "audit index. Exit 0 = intact, 1 = tamper detected, 2 = could not run",
+        "audit index. The default scan is the newest 7 days. Exit 0 = intact, "
+        "1 = a record was altered, deleted or reordered, 2 = could not verify, "
+        "3 = duplicate sequence numbers only, no record was altered",
+        description="Verify the tamper-evident audit hash chain. Exit codes: "
+        "0 intact. 1 a record was altered, deleted or reordered. 2 could not verify. "
+        "3 duplicate sequence numbers only: two writers appended at once, and no "
+        "record was altered.",
     )
     p_ver.add_argument(
         "--days",
         type=int,
         default=None,
         metavar="N",
-        help="Bound the scan to audit records from the last N days, by timestamp. "
-        "The default is the whole index. A windowed scan verifies contiguity "
-        "WITHIN the window. It cannot verify linkage across the window boundary, "
-        "because it does not fetch the record before the window.",
+        help="Verify the audit records from the last N days, by timestamp. The "
+        "default is 7. A windowed scan verifies contiguity WITHIN the window. It "
+        "cannot verify linkage across the window boundary, because it does not "
+        "fetch the record before the window.",
+    )
+    p_ver.add_argument(
+        "--all",
+        action="store_true",
+        help="Verify the whole audit index. The scan reads one page at a time, so "
+        "memory stays bounded. A large index takes minutes.",
     )
     p_ver.set_defaults(func=_audit_verify)
     # `soc-ai audit` with no subcommand: print the group help instead of serving.
@@ -1906,7 +1973,7 @@ def _register_priors(sub: Any) -> None:
     )
     p_pr.add_argument(
         "--recent-hours",
-        type=int,
+        type=_positive_int,
         default=24,
         help="How far back 'lately' reaches. The default is 24. This window is "
         "much shorter than the 30-day baseline. Over one window, every "
@@ -2019,7 +2086,7 @@ def _register_leads(sub: Any) -> None:
     )
     p_le.add_argument(
         "--weeks",
-        type=int,
+        type=_positive_int,
         default=4,
         help="How many ISO weeks to report, newest first. The default is 4. A "
         "threshold moves on a week of data, never on a day.",

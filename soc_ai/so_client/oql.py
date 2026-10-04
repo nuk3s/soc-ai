@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any, assert_never
 
 from lark import Lark, Token, Transformer, v_args
-from lark.exceptions import LarkError
+from lark.exceptions import LarkError, UnexpectedCharacters, UnexpectedEOF, UnexpectedToken
 
 from soc_ai.errors import OqlValidationError
 
@@ -492,12 +492,7 @@ def _parse_filter_with_fallback(filter_text: str) -> FilterNode:
             except LarkError:
                 pass
         raise OqlValidationError(
-            f"failed to parse filter: {primary_err}. "
-            "OQL syntax: every clause is field:value, joined with AND/OR/NOT; "
-            "parentheses group clauses ((a:1 OR b:2) AND c:3) or values "
-            "(field:(v1 OR v2)); bare terms are not supported — for full-text "
-            "matching write message:term* (anchored wildcard) or "
-            "message:~term (contains, compiles to a full-text match).",
+            f"{_syntax_error_sentence(primary_err, filter_text)} {_OQL_SYNTAX_HINT}",
             fragment=filter_text,
         ) from primary_err
     except RecursionError as rec_err:
@@ -507,6 +502,45 @@ def _parse_filter_with_fallback(filter_text: str) -> FilterNode:
             "filter too deeply nested to parse",
             fragment=filter_text,
         ) from rec_err
+
+
+# The second half of every parse refusal. The API, the console and the MCP
+# query_events tool all show it, and the model reads it to correct its next
+# query, so it says how to write a clause and stops there. The parser's own
+# trace ("Expected one of: * LPAR * FIELD ...") used to ride along and helped
+# nobody.
+_OQL_SYNTAX_HINT = (
+    "Write every clause as field:value. Join clauses with AND, OR or NOT. "
+    "Use parentheses to group clauses or values, for example field:(v1 OR v2). "
+    "A bare term is not supported. For a full-text match, write message:term* "
+    "or message:~term."
+)
+
+
+def _syntax_error_sentence(err: LarkError, text: str) -> str:
+    """One sentence with the position and the token where the parser stopped."""
+    if isinstance(err, UnexpectedEOF) or (
+        isinstance(err, UnexpectedToken) and getattr(err.token, "type", "") == "$END"
+    ):
+        return (
+            f"The filter ends early at column {len(text) + 1}. "
+            "Close every parenthesis and every quote."
+        )
+    if isinstance(err, UnexpectedToken):
+        near = str(err.token)[:40]
+        return (
+            f"The filter has a syntax error at column {err.column} near '{near}'. "
+            "Check the field name and the quotes."
+        )
+    if isinstance(err, UnexpectedCharacters):
+        # Lark types pos_in_stream as None on the base class; read it as Any.
+        pos: Any = getattr(err, "pos_in_stream", None)
+        near = text[pos] if isinstance(pos, int) and 0 <= pos < len(text) else ""
+        return (
+            f"The filter has a syntax error at column {err.column} near '{near}'. "
+            "Check the field name and the quotes."
+        )
+    return "The filter has a syntax error. Check the field name and the quotes."
 
 
 def _split_pipe(query: str) -> list[str]:

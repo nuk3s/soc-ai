@@ -81,6 +81,10 @@ async def get_chat(request: Request, inv_id: str) -> ChatThreadOut:
         # of this route instead of a bet on the table having stayed empty.
         return _thread([])
     async with request.app.state.db_sessionmaker() as db:
+        # An unknown id is a 404, like GET /hunts/{id}/chat. An empty thread
+        # for an investigation that does not exist read as "nobody asked yet".
+        if await db.get(Investigation, inv_id) is None:
+            raise HTTPException(status_code=404, detail={"reason": "not_found"})
         msgs = await chat_svc.list_messages(db, inv_id)
     return _thread(msgs)
 

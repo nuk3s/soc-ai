@@ -24,6 +24,7 @@ separately all the way out.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -49,9 +50,14 @@ from soc_ai.dossier.profile import (
     _port_bound,
     _scope_must_not,
     _window_filter,
+    member_alternates,
+    member_buckets,
+    member_exists_clause,
+    member_transport,
     resolve_plane,
 )
 from soc_ai.dossier.profile_math import GUARDED_PORT_DIMENSIONS, TimeCell, cell_for, median
+from soc_ai.enrichment.discovery import _is_internal_ip, _is_ip_literal
 from soc_ai.hunting.leads import (
     LeadOutcome,
     content_fingerprint,
@@ -140,7 +146,11 @@ def _keep_ids(into: list[str], ids: Sequence[str]) -> None:
 
 
 def _recent_terms(
-    *, entity_field: str, member_field: str, peer_field: str | None = None
+    *,
+    entity_field: str,
+    member_field: str,
+    peer_field: str | None = None,
+    also: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """The baseline's member aggregation, plus the documents behind each member.
 
@@ -155,12 +165,12 @@ def _recent_terms(
     days from both sides of the comparison.
     """
     body = _nested_terms(
-        entity_field=entity_field, member_field=member_field, peer_field=peer_field
+        entity_field=entity_field, member_field=member_field, peer_field=peer_field, also=also
     )
-    body["aggs"]["members"]["aggs"] = {
-        **body["aggs"]["members"]["aggs"],
-        "samples": _samples_agg(),
-    }
+    # Every member aggregation carries the sample, the alternate fields too.
+    for key, node in body["aggs"].items():
+        if key == "members" or key.startswith("members_alt_"):
+            node["aggs"] = {**node["aggs"], "samples": _samples_agg()}
     return body
 
 
@@ -237,6 +247,71 @@ def _dimension_spec(dimension: str) -> tuple[tuple[str, ...], str, str, str] | N
 RECENT_MAX_ENTITIES = 500
 
 
+@dataclass(frozen=True)
+class _Estate:
+    """The addresses the recent read may return as entities.
+
+    ``terms`` is the query clause value: the estate CIDRs plus every census
+    address the CIDRs do not cover. Empty means unknown, and the read fails
+    OPEN, like every scope test in this lane.
+    """
+
+    cidrs: tuple[Any, ...] = ()
+    census: frozenset[str] = frozenset()
+
+    @property
+    def terms(self) -> list[str]:
+        nets = [str(c).strip() for c in self.cidrs if str(c).strip()]
+        if not nets:
+            return []
+        extra = sorted(ip for ip in self.census if not _is_internal_ip(ip, list(self.cidrs)))
+        return [*nets, *extra[:_MAX_CENSUS_TERMS]]
+
+    def holds(self, key: str) -> bool:
+        """Whether one entity key may be scored. A hostname always may."""
+        if not self.cidrs or not _is_ip_literal(key):
+            return True
+        return key in self.census or _is_internal_ip(key, list(self.cidrs))
+
+
+# A terms query holds at most 65,536 values by default. The census adds the
+# hosts the CIDRs miss, and on a sane estate that is a handful.
+_MAX_CENSUS_TERMS = 10_000
+
+
+def _estate_clause(entity_field: str, estate: _Estate | None) -> list[dict[str, Any]]:
+    """Keep only estate entities in the recent read, on address-keyed fields.
+
+    The served-port read keys on ``destination.ip``. With no filter every
+    internet address the estate reached became an entity, the read filled its
+    500-entity cap with them, and each one scored as a blind row: "blind 489"
+    on a 336-host estate, 81,621 blind rows on the range.
+    """
+    if estate is None or not entity_field.endswith(".ip"):
+        return []
+    terms = estate.terms
+    if not terms:
+        return []
+    return [{"terms": {entity_field: terms}}]
+
+
+def _networks(cidrs: Sequence[Any]) -> tuple[Any, ...]:
+    """The CIDRs as network objects. A value that does not parse is dropped."""
+    out: list[Any] = []
+    for c in cidrs:
+        try:
+            out.append(ipaddress.ip_network(str(c).strip(), strict=False))
+        except ValueError:
+            continue
+    return tuple(out)
+
+
+async def _census(db: AsyncSession) -> frozenset[str]:
+    """The addresses the dossier knows as hosts."""
+    rows = (await db.execute(select(HostDossier.host_key))).all()
+    return frozenset(str(key) for (key,) in rows if key and _is_ip_literal(str(key)))
+
+
 async def _recent_shaped(
     elastic: Any,
     settings: Any,
@@ -248,6 +323,7 @@ async def _recent_shaped(
     probe_field: str,
     hours: int,
     tz: str,
+    estate: _Estate | None = None,
 ) -> dict[str, dict[str, Any]] | None:
     """Recent activity for a non-categorical dimension.
 
@@ -282,6 +358,7 @@ async def _recent_shaped(
                     }
                 },
                 {"exists": {"field": entity_field}},
+                *_estate_clause(entity_field, estate),
             ],
             "must_not": _scope_must_not(),
         }
@@ -311,6 +388,8 @@ async def _recent_shaped(
     for bucket in buckets:
         key = bucket.get("key")
         if not isinstance(key, str) or not key:
+            continue
+        if estate is not None and not estate.holds(key):
             continue
         hourly = ((bucket.get("per_hour") or {}).get("buckets")) or []
         if shape == "active_hours":
@@ -374,6 +453,7 @@ async def _recent_members(
     dimension: str,
     hours: int,
     cidrs: Sequence[Any] = (),
+    estate: _Estate | None = None,
 ) -> dict[str, dict[str, Any]] | None:
     """What each entity did on this dimension lately, keyed entity -> members.
 
@@ -394,8 +474,14 @@ async def _recent_members(
     candidates, probe_field, entity_field, member_field = spec
 
     minutes = max(1, hours) * 60
+    alternates = member_alternates(dimension)
     usable = await resolve_plane(
-        elastic, settings, candidates=candidates, field=probe_field, minutes=minutes
+        elastic,
+        settings,
+        candidates=candidates,
+        field=probe_field,
+        minutes=minutes,
+        also=alternates,
     )
     if usable is None:
         raise RuntimeError(
@@ -417,7 +503,8 @@ async def _recent_members(
                     }
                 },
                 {"exists": {"field": entity_field}},
-                {"exists": {"field": member_field}},
+                member_exists_clause(dimension, member_field),
+                *_estate_clause(entity_field, estate),
                 # The SAME bound the baseline was built with. An asymmetry here
                 # is the ephemeral-port defect in reverse: the recent read would
                 # surface dynamic ports the baseline was never allowed to hold,
@@ -444,6 +531,7 @@ async def _recent_members(
                 entity_field=entity_field,
                 member_field=member_field,
                 peer_field=_peer_field(dimension),
+                also=alternates,
             )
         },
     )
@@ -454,7 +542,9 @@ async def _recent_members(
         key = bucket.get("key")
         if not isinstance(key, str) or not key:
             continue
-        members = ((bucket.get("members") or {}).get("buckets")) or []
+        if estate is not None and not estate.holds(key):
+            continue
+        members = member_buckets(bucket)
         seen: dict[str, Any] = {}
         for m in members:
             if m.get("key") is None:
@@ -466,6 +556,9 @@ async def _recent_members(
             if dimension in GUARDED_PORT_DIMENSIONS:
                 entry["peers"] = _member_peers(m)
                 entry["days"] = _member_days(m)
+                transport = member_transport(m)
+                if transport is not None:
+                    entry["transport"] = transport
             seen[str(m.get("key"))] = entry
         out[key] = seen
     return out
@@ -631,11 +724,12 @@ async def _recent(
     hours: int,
     tz: str,
     cidrs: Sequence[Any],
+    estate: _Estate | None = None,
 ) -> dict[str, dict[str, Any]] | None:
     """The recent read for one dimension, through whichever reader it needs."""
     if shaped is None:
         return await _recent_members(
-            elastic, settings, dimension=dimension, hours=hours, cidrs=cidrs
+            elastic, settings, dimension=dimension, hours=hours, cidrs=cidrs, estate=estate
         )
     # Both shaped dimensions read the same flow plane, keyed by the same
     # entity; the lane holds those three once.
@@ -650,6 +744,7 @@ async def _recent(
         probe_field=_SHAPED_PROBE_FIELD,
         hours=hours,
         tz=tz,
+        estate=estate,
     )
 
 
@@ -769,6 +864,8 @@ async def run_prior_sweep(
 
     try:
         roles = await _roles(db)
+        # The census is read from the same table, so one failure covers both.
+        estate = _Estate(cidrs=_networks(cidrs), census=await _census(db))
     except Exception as exc:
         return PriorSweep(errors=(f"could not read host roles: {exc}",))
 
@@ -794,6 +891,7 @@ async def run_prior_sweep(
                     hours=recent_hours,
                     tz=tz,
                     cidrs=cidrs,
+                    estate=estate,
                 )
             except Exception as exc:
                 errors.append(f"{spec.id}: recent read for {dimension} failed: {exc}")
@@ -865,7 +963,7 @@ async def run_prior_sweep(
         try:
             from soc_ai.store import prior_spec_runs  # noqa: PLC0415 - lazy, avoids a cycle
 
-            await prior_spec_runs.record_sweep(db, sweep, profiles=profiles)
+            await prior_spec_runs.record_sweep(db, sweep, shadow_ids=shadow_ids, profiles=profiles)
         except Exception as exc:
             errors.append(f"could not record the sweep trail: {exc}")
 

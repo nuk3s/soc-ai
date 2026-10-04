@@ -128,7 +128,7 @@ def test_a_segment_that_is_not_an_address_is_404_on_all_three(client: TestClient
         lambda: client.delete("/api/v1/dossiers/not-a-host/chat"),
     ):
         resp = call()
-        assert resp.status_code == 404, resp.text
+        assert resp.status_code == 400, resp.text
         assert resp.json()["detail"]["reason"] == "not_an_ip"
 
 

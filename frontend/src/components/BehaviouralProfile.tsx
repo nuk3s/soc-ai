@@ -79,7 +79,13 @@ const MORE = /\s\+\d+ more$/;
 
 // What a row with no members says. Three different absences, three sentences.
 function fallbackFor(d: ProfileDimension): string {
-  if (d.coverage === 'blind') return 'cannot be measured for this host';
+  // The reason travels with the row. A bare "cannot be measured" beside an
+  // "agent on box" chip could not say whether the agent or the join was missing.
+  if (d.coverage === 'blind') {
+    return d.coverage_reason
+      ? `cannot be measured: ${d.coverage_reason}`
+      : 'cannot be measured for this host';
+  }
   if (d.coverage === 'unmeasurable') {
     return `not measured: ${d.coverage_reason ?? 'the grid refused the query'}`;
   }

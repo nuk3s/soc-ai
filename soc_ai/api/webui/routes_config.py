@@ -9,12 +9,13 @@ from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlsplit
 
-from fastapi import Depends, HTTPException, Request
+from fastapi import Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field, SecretStr, ValidationError
 from sqlalchemy import select
 
 from soc_ai.api import agent_tools as agent_tools_svc
 from soc_ai.api.deps import get_settings_dep
+from soc_ai.api.webui._errors import api_error
 from soc_ai.api.webui._shared import (
     _ago,
     require_admin_api,
@@ -275,9 +276,9 @@ class ModelFitnessOut(BaseModel):
     # alias can be re-routed without the client seeing it, so "model X is unfit"
     # otherwise names what we asked for, not what ran.
     served_backend: dict[str, str] | None = None
-    # Was a measurement actually taken for this response? False when the
-    # self-load guard declined to probe (see ``_self_load_reason``), in which
-    # case ``note`` says why and the verdict is the cached one (or "unknown").
+    # Was a measurement actually taken for this response? False when a plain
+    # GET served a stale cache or found none, in which case ``note`` says why
+    # and the verdict is the cached one (or "unknown").
     measured: bool = True
     note: str | None = None
     # n-of-m history from the audit store. ``alarm`` is the ONE boolean the chip
@@ -289,6 +290,9 @@ class ModelFitnessOut(BaseModel):
     recent_fails: int | None = None
     consecutive_fails: int | None = None
     last_pass_at: str | None = None
+    # The cached verdict is older than the cache TTL. A plain GET serves it
+    # as it is and runs no probe; ``?force=true`` measures again.
+    stale: bool = False
 
 
 # One day: the operator's "maybe once a day" (dogfood 2026-08-05). The manual
@@ -306,36 +310,6 @@ _FITNESS_ALARM_CONSECUTIVE = 2
 # the fetch (see _recent_fitness_checks). Covers an operator A/B-ing two models
 # without a second round trip.
 _HISTORY_OVERFETCH = 4
-
-
-def _self_load_reason(state: Any) -> str | None:
-    """Name the soc-ai batch currently saturating the gateway, or None.
-
-    A fitness probe measures the model AND everything queued in front of it. At
-    22:37:10 on 2026-08-06 the probe graded deepseek-v4-flash UNFIT while a
-    graded eval was in flight against the same gateway — and that eval landed
-    nine minutes later with agreement 1.0 over n_ok=5. The model "unable to
-    produce a TriageReport" produced five, correctly, concurrently.
-
-    Reads each batch through its OWNER's accessor rather than poking app.state
-    attribute names, so a renamed status slot fails in CI (the tests import the
-    same accessors) instead of quietly disabling the guard. At runtime it is
-    fail-soft: the guard is a refinement of a read-only diagnostic and must never
-    be the reason the Config page 500s.
-    """
-    try:
-        from soc_ai.api.webui.routes_quality import _get_quality_eval_status  # noqa: PLC0415
-        from soc_ai.webui import autotriage as at  # noqa: PLC0415
-
-        if _get_quality_eval_status(state).running:
-            return "quality-eval batch in flight"
-        if at.get_status(state).active:
-            return "auto-triage batch in flight"
-        if _battery_status(state).running:
-            return "model battery in flight"
-    except Exception:
-        _LOGGER.warning("model_fitness self-load check failed (probing anyway)", exc_info=True)
-    return None
 
 
 def _fitness_history_summary(window: list[dict[str, str]]) -> dict[str, Any]:
@@ -497,12 +471,16 @@ async def api_model_fitness(
     audit index must never turn a read-only diagnostic into a 500 — so it is
     wrapped and logged, never raised.
 
-    Two guards on the AUTO path (``force=false``), both from the 2026-08-07 audit
-    of all 50 stored checks. First, the probe does not run while soc-ai's own
-    eval/auto-triage/battery is saturating the gateway — that measures the queue,
-    not the model. Second, the red state is n-of-m: the response carries the last
-    checks read back out of the audit index, and ``alarm`` needs two consecutive
-    fails. ``?force=true`` (the operator's "Check fitness") bypasses the first.
+    The red state is n-of-m, from the 2026-08-07 audit of all 50 stored checks:
+    the response carries the last checks read back out of the audit index, and
+    ``alarm`` needs two consecutive fails.
+
+    A plain GET never probes. It serves the cached verdict, with ``stale`` set
+    when the cache is past its TTL, or grade "unknown" when there is no cache.
+    A stale cache used to start a live probe of three model legs: a GET that
+    took 26 s and wrote a cache row, an audit event and possibly a webhook
+    (fleet 2026-10-01, A12). Only ``?force=true`` measures, and the console's
+    Check fitness button sends it.
     """
     from soc_ai.store import model_battery as mb_svc  # noqa: PLC0415
 
@@ -519,40 +497,34 @@ async def api_model_fitness(
                 age_s = (datetime.now(UTC).replace(tzinfo=None) - checked).total_seconds()
             except ValueError:
                 age_s = _FITNESS_CACHE_TTL_S + 1
-            if age_s < _FITNESS_CACHE_TTL_S:
-                return await _fitness_out(
-                    request,
-                    settings,
-                    result=cached["result"],
-                    model_id=model_id,
-                    cached=True,
-                    checked_at=cached["checked_at"],
-                )
-
-        # Stale (or absent) cache AND soc-ai is hammering its own gateway: keep
-        # the old verdict rather than manufacture a new one from queue latency.
-        load = _self_load_reason(request.app.state)
-        if load is not None:
-            note = f"not measured: {load}"
-            if cached is not None:
-                return await _fitness_out(
-                    request,
-                    settings,
-                    result=cached["result"],
-                    model_id=model_id,
-                    cached=True,
-                    checked_at=cached["checked_at"],
-                    measured=False,
-                    note=note,
-                )
-            return await _fitness_out(
+            stale = age_s >= _FITNESS_CACHE_TTL_S
+            out = await _fitness_out(
                 request,
                 settings,
-                result={"grade": "unknown", "model": model_id, "legs": [], "detail": note},
+                result=cached["result"],
                 model_id=model_id,
-                measured=False,
-                note=note,
+                cached=True,
+                checked_at=cached["checked_at"],
+                measured=not stale,
+                note=(
+                    "This verdict is older than one day. Select Check fitness to measure again."
+                    if stale
+                    else None
+                ),
             )
+            return out.model_copy(update={"stale": stale})
+        note = "soc-ai has no fitness check for this model. Select Check fitness to measure it."
+        return await _fitness_out(
+            request,
+            settings,
+            result={"grade": "unknown", "model": model_id, "legs": [], "detail": note},
+            model_id=model_id,
+            measured=False,
+            note=note,
+        )
+
+    # A forced check measures even while soc-ai's own eval or auto-triage
+    # loads the gateway: the operator asked for it.
 
     result = await probes.probe_model_fitness(settings)
     checked_at_now = datetime.now(UTC).replace(tzinfo=None).isoformat()
@@ -705,6 +677,14 @@ class AuditChainVerifyOut(BaseModel):
     newest_break_at: str | None = None
     break_kinds: list[str] = Field(default_factory=list)
     blast_radius: str = ""
+    # The window this scan covered: the newest `window_days` days (null: the
+    # whole index). first_seq..last_seq is the seq range verified inside it,
+    # and `capped` says the record bound stopped the scan before the OLDEST end
+    # of the window (the walk is newest first, so the present is always read).
+    window_days: int | None = None
+    # One sentence when a recorded duplicate is older than the window, so an
+    # intact window does not hide a known older scar. Null otherwise.
+    older_finding: str | None = None
     checked_at: str  # ISO-8601 UTC timestamp of this verification
 
 
@@ -716,7 +696,7 @@ class AuditChainVerifyOut(BaseModel):
 )
 async def api_audit_verify_chain(
     request: Request,
-    days: int | None = None,
+    days: int = Query(7, ge=1, le=3650),
     settings: Settings = Depends(get_settings_dep),
 ) -> AuditChainVerifyOut:
     """Verify the tamper-evident audit hash chain against the live ES audit index.
@@ -745,10 +725,19 @@ async def api_audit_verify_chain(
     so an ES error propagates to a 5xx rather than being reported as ``ok``. A
     windowed (``days``) scan verifies contiguity within the window but cannot
     verify linkage across the window boundary.
+
+    The scan covers the newest ``days`` days (default 7), newest epoch first,
+    one page at a time, with the hash work in a worker thread. The old
+    whole-index, oldest-first read took 32 to 77 s, stopped at its cap on
+    August data, and stalled every other request while it ran.
     """
     from datetime import UTC, datetime  # noqa: PLC0415
 
-    from soc_ai.audit.verify import describe_blast_radius, verify_audit_chain  # noqa: PLC0415
+    from soc_ai.audit.verify import (  # noqa: PLC0415
+        describe_blast_radius,
+        recorded_older_duplicate,
+        verify_audit_chain,
+    )
     from soc_ai.so_client.elastic import GridPartialResultsError  # noqa: PLC0415
 
     elastic = getattr(request.app.state, "elastic", None)
@@ -780,6 +769,16 @@ async def api_audit_verify_chain(
             detail={"reason": "audit_verify_failed", "message": f"{type(exc).__name__}"},
         ) from exc
 
+    older_finding: str | None = None
+    try:
+        # One size-1 read, bounded: the note is extra, the verdict above stands alone.
+        async with asyncio.timeout(settings.webui_grid_timeout_s):
+            older_finding = await recorded_older_duplicate(
+                elastic, settings.audit_index_alias, days=days
+            )
+    except TimeoutError:
+        older_finding = None
+
     return AuditChainVerifyOut(
         ok=result.ok,
         records_verified=result.records_verified,
@@ -805,6 +804,8 @@ async def api_audit_verify_chain(
         newest_break_at=result.newest_break_at,
         break_kinds=list(result.break_kinds),
         blast_radius=describe_blast_radius(result),
+        window_days=days,
+        older_finding=older_finding,
         checked_at=datetime.now(UTC).isoformat(),
     )
 
@@ -825,6 +826,10 @@ class EgressDestinationOut(BaseModel):
     redaction: str  # short posture string
     detail: str  # one-line human description
     count_7d: int | None = None  # best-effort 7-day audit count; null = unknown
+    # Why count_7d is null, or what a numeric count leaves out. Null when the
+    # count is complete. Every null count carries one: a blank cell with no
+    # reason is what the panel showed on all nine rows.
+    count_reason: str | None = None
 
 
 class EgressPolicyOut(BaseModel):
@@ -896,11 +901,11 @@ def _egress_destinations(settings: Settings) -> list[dict[str, Any]]:
     return [
         {
             "id": "oracle",
-            "label": "Oracle (cloud second opinion)",
+            "label": "The Oracle",
             "enabled": bool(settings.oracle_enabled),
             "redaction": "sanitized + fail-closed residue gate",
             "detail": (
-                f"The frontier adjudicator {settings.oracle_model} runs through the "
+                f"The Oracle model {settings.oracle_model} runs through the "
                 "gateway. soc-ai pseudonymizes internal identifiers before egress. "
                 "A residue gate checks the result."
             ),
@@ -1032,7 +1037,7 @@ async def api_egress_policy(
     search, page fetch, online enrichment, analyst model — generic ``tool_call``s
     at the index level) return null counts by design (honest "unknown", not 0).
     """
-    from soc_ai.audit.counts import audit_counts_by_kind  # noqa: PLC0415
+    from soc_ai.audit import counts as audit_counts  # noqa: PLC0415
 
     rows = _egress_destinations(settings)
     zero_egress = not any(row["enabled"] for row in rows)
@@ -1043,6 +1048,7 @@ async def api_egress_policy(
     # this read-only diagnostic into a 500 — null counts, table still returned.
     all_kinds = sorted({k for kinds in _EGRESS_AUDIT_KINDS.values() for k in kinds})
     counts_by_kind: dict[str, int | None] = {}
+    counts_reason: str | None = None
     if all_kinds:
         try:
             elastic = getattr(request.app.state, "elastic", None)
@@ -1054,12 +1060,21 @@ async def api_egress_policy(
             # worst place in the product to look frozen. A timeout lands in that
             # handler like any other failure: unknown counts, table still drawn.
             async with asyncio.timeout(settings.webui_grid_timeout_s):
-                counts_by_kind = await audit_counts_by_kind(
+                counted = await audit_counts.audit_counts_with_reason(
                     elastic, settings.audit_index_alias, all_kinds, days=7
                 )
-        except Exception:  # the helper is fail-soft, but never trust it to a 500
+            counts_by_kind = counted.counts
+            counts_reason = counted.reason
+        except TimeoutError:
+            _LOGGER.warning("egress-policy audit counts timed out (continuing null)")
+            counts_by_kind = {}
+            counts_reason = (
+                f"The grid did not answer the audit count in {settings.webui_grid_timeout_s:g} s."
+            )
+        except Exception as exc:  # the helper is fail-soft, but never trust it to a 500
             _LOGGER.warning("egress-policy audit counts failed (continuing null)", exc_info=True)
             counts_by_kind = {}
+            counts_reason = f"The audit count failed: {type(exc).__name__}."
 
     destinations: list[EgressDestinationOut] = []
     for row in rows:
@@ -1068,11 +1083,18 @@ async def api_egress_policy(
         # has no mapped kind, OR when any of its kinds' counts is unknown (a
         # partial sum would understate — better an honest null).
         count_7d: int | None
+        count_reason: str | None
         if not kinds:
             count_7d = None
+            count_reason = (
+                "soc-ai writes no audit record type for this destination, so it cannot count it."
+            )
         else:
             per = [counts_by_kind.get(k) for k in kinds]
             count_7d = None if any(c is None for c in per) else sum(c or 0 for c in per)
+            count_reason = counts_reason
+            if count_7d is None and count_reason is None:
+                count_reason = "The audit count is not available."
         destinations.append(
             EgressDestinationOut(
                 id=row["id"],
@@ -1081,6 +1103,7 @@ async def api_egress_policy(
                 redaction=row["redaction"],
                 detail=row["detail"],
                 count_7d=count_7d,
+                count_reason=count_reason,
             )
         )
 
@@ -1210,27 +1233,32 @@ async def set_setting(request: Request, body: SettingIn) -> dict[str, Any]:
     """
     settings = request.app.state.settings
     if not cfg_svc.is_editable(body.key):
-        raise HTTPException(status_code=400, detail={"reason": "unknown_setting"})
+        raise api_error(
+            400,
+            "unknown_setting",
+            "soc-ai has no editable setting with this key. "
+            "Read GET /api/v1/config for the list of keys.",
+        )
     spec = cfg_svc.WHITELIST_BY_KEY[body.key]
     if spec.danger:
-        raise HTTPException(
-            status_code=400,
-            detail={"reason": "danger_zone", "hint": "use POST /api/v1/config/danger/setting"},
+        raise api_error(
+            400,
+            "danger_zone",
+            "This setting is in the Danger Zone. Use POST /api/v1/config/danger/setting.",
         )
     if spec.secret:
         # Secrets never go through the plaintext (secret_box=None) path — that
         # would raise deep in set_override (500). Route them to the dedicated
         # write-only endpoint instead.
-        raise HTTPException(
-            status_code=400,
-            detail={"reason": "secret_setting", "hint": "use POST /api/v1/config/api-keys"},
+        raise api_error(
+            400,
+            "secret_setting",
+            "This setting is a secret. Use POST /api/v1/config/api-keys.",
         )
     try:
         typed = cfg_svc.coerce(body.key, body.value)
     except ValueError as exc:
-        raise HTTPException(
-            status_code=400, detail={"reason": "invalid_value", "hint": str(exc)}
-        ) from exc
+        raise api_error(400, getattr(exc, "reason", "invalid_value"), str(exc)) from exc
     user = await current_user(request)
     # Validate the live assignment BEFORE persisting: coerce() accepts a
     # type-correct value that a Settings field validator / cross-field constraint
@@ -1609,10 +1637,23 @@ class AgentToolsOut(BaseModel):
     tags=["config"],
 )
 async def api_get_agent_tools(
+    request: Request,
     settings: Settings = Depends(get_settings_dep),
 ) -> AgentToolsOut:
-    """List every tool available to the agent, with its description + dependencies."""
-    return AgentToolsOut(tools=agent_tools_svc.collect_agent_tools(settings))
+    """List every tool available to the agent, with its description + dependencies.
+
+    Availability reads the same cached probe the header pill reads, so a tool
+    that needs a grid the pill calls down is unavailable here too.
+    """
+    from soc_ai.api.webui import routes_meta  # noqa: PLC0415 - avoid an import cycle
+
+    try:
+        probed = await routes_meta._cached_health_probes(request.app.state, settings)
+        live: dict[str, bool] | None = routes_meta.health_ok_by_dependency(probed)
+    except Exception:  # the panel still lists the tools on config alone
+        _LOGGER.warning("agent tools: live health read failed", exc_info=True)
+        live = None
+    return AgentToolsOut(tools=agent_tools_svc.collect_agent_tools(settings, live))
 
 
 # ── Notifications (E2.4): the webhook secret + a "Send test" validation ────────
@@ -1628,6 +1669,17 @@ async def api_get_agent_tools(
 class NotifyWebhookOut(BaseModel):
     isSet: bool
     source: str  # "db" | "env" | "unset"
+    # Whether a save can store the URL. A save needs CONFIG_SECRET_KEY, and the
+    # panel learned that only from the 400 after the operator typed the URL
+    # (fleet 2026-10-01, RC8). The panel disables Set and shows the hint.
+    can_store: bool = True
+    store_hint: str | None = None
+
+
+_WEBHOOK_STORE_HINT = (
+    "Set CONFIG_SECRET_KEY on the server and restart soc-ai. "
+    "soc-ai then stores the webhook URL encrypted."
+)
 
 
 class SaveNotifyWebhookIn(BaseModel):
@@ -1646,15 +1698,22 @@ async def api_get_notify_webhook(
 ) -> NotifyWebhookOut:
     """Report whether the notification webhook URL is set (never returns the value)."""
     spec = cfg_svc.notify_webhook_spec()
+    can_store = getattr(request.app.state, "secret_box", None) is not None
+    store_hint = None if can_store else _WEBHOOK_STORE_HINT
     async with request.app.state.db_sessionmaker() as db:
         in_db = (
             await db.scalars(select(ConfigOverride.key).where(ConfigOverride.key == spec.key))
         ).first() is not None
     if in_db:
-        return NotifyWebhookOut(isSet=True, source="db")
+        return NotifyWebhookOut(isSet=True, source="db", can_store=can_store, store_hint=store_hint)
     attr_val = getattr(settings, spec.attr, None)
     is_set = _secret_is_set(attr_val)
-    return NotifyWebhookOut(isSet=is_set, source="env" if is_set else "unset")
+    return NotifyWebhookOut(
+        isSet=is_set,
+        source="env" if is_set else "unset",
+        can_store=can_store,
+        store_hint=store_hint,
+    )
 
 
 @router.post(
@@ -1700,10 +1759,7 @@ async def api_save_notify_webhook(
     except ValueError as exc:
         raise HTTPException(
             status_code=400,
-            detail={
-                "reason": "no_config_secret_key",
-                "hint": "Set CONFIG_SECRET_KEY to store the webhook URL via the UI.",
-            },
+            detail={"reason": "no_config_secret_key", "hint": _WEBHOOK_STORE_HINT},
         ) from exc
     # Hot-apply: notify.fire reads the URL fresh per send. setattr the plaintext
     # onto the live Settings singleton (validate_assignment coerces str→SecretStr).
@@ -1793,7 +1849,9 @@ async def api_danger_test_connection(
         )
 
     if target == "es":
-        budget = settings.webui_grid_timeout_s
+        # The shared probe budget: the header pill and the doctor wait the same
+        # time, so Test ES cannot pass in a minute when the pill says down.
+        budget = probes.probe_budget_s(settings)
         try:
             async with asyncio.timeout(budget):
                 result = await probes.probe_es(request.app.state.elastic)
@@ -1801,8 +1859,8 @@ async def api_danger_test_connection(
             return ConnTestOut(
                 ok=False,
                 detail=(
-                    f"Security Onion did not answer within {budget} s. soc-ai treats the "
-                    "grid as down. Check Elasticsearch load and shard health."
+                    f"Elasticsearch did not answer within {budget:g} s. soc-ai treats the "
+                    "grid as down. Check the Elasticsearch load and the shard health."
                 ),
             )
     else:

@@ -228,6 +228,8 @@ _LEGACY_CELL = re.compile(r"connection rate around (work|off|weekend) (is far ab
 _LEGACY_NOVEL = re.compile(r"novel (\w+):? (\S+) x(\d+)")
 _LEGACY_SEEN = re.compile(r"\s*\(seen (once|\d+ times?)\)")
 _LEGACY_BASELINE = re.compile(r"\s*[—-]\s*against a baseline of (\d+) over (\d+)d")
+_LEGACY_ONE_DOCUMENTS = re.compile(r"\(1 documents\)")
+_LOWER_START = re.compile(r"^(active|new|connection rate)(?= )")
 
 
 def _legacy_novel(dimension: str, member: str, count: str) -> str:
@@ -269,4 +271,9 @@ def reword_legacy_summary(text: str | None) -> str | None:
         lambda m: f". {baseline_sentence(m.group(1), m.group(2))}",
         s,
     )
-    return s
+    # An older catalog build wrote "(1 documents)".
+    s = _LEGACY_ONE_DOCUMENTS.sub("(1 document)", s)
+    # The summary is the first sentence on the card, so it starts with a capital.
+    # Only the words this module writes are raised: a summary that opens with an
+    # entity name keeps that name as the grid holds it.
+    return _LOWER_START.sub(lambda m: m.group(1).capitalize(), s)

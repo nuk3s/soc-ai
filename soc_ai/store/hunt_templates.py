@@ -17,6 +17,7 @@ duplicates a builtin, and the builtin's fields are refreshed to the code's value
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from sqlalchemy import select
@@ -170,6 +171,38 @@ ENV_REQUIREMENT_PHRASES: dict[str, str] = {
     ENV_DOMAIN: "a domain-joined host",
     ENV_WINDOWS: "a Windows host",
 }
+
+# The grid's own telemetry is a second witness for the environment axis. The
+# dossier reads the NETWORK side (os_family, domain_membership facts), and a
+# grid whose domain controller ships its Security log and Defender events was
+# told "needs a domain-joined host. The network shows none of it." A plane
+# below exists only where a Windows host produces it, so its presence proves a
+# Windows host. A Windows Security log is also where a domain's logons, ticket
+# requests and directory access land, so the same planes reopen the domain
+# hunts: demotion is the claim that the network shows none of the machinery,
+# and that claim is false while those events arrive.
+#
+# Deliberately NOT here: endpoint.events.process / .network / .file. Elastic
+# Defend ships those from Linux and macOS hosts as well, so they prove an
+# endpoint agent, not a Windows host. endpoint.events.registry is Windows-only.
+WINDOWS_DATASET_PREFIXES: tuple[str, ...] = (
+    "windows.",
+    "microsoft_defender_endpoint.",
+    "m365_defender.",
+)
+WINDOWS_DATASET_NAMES: frozenset[str] = frozenset({"system.security", "endpoint.events.registry"})
+
+
+def environment_from_datasets(names: Iterable[str]) -> frozenset[str]:
+    """The environment requirements the grid's datasets alone satisfy.
+
+    ``names`` should be the LIVE dataset names: an imported Windows event log
+    describes somebody else's network, and must not reopen a hunt here.
+    """
+    for name in names:
+        if name in WINDOWS_DATASET_NAMES or name.startswith(WINDOWS_DATASET_PREFIXES):
+            return frozenset({ENV_WINDOWS, ENV_DOMAIN})
+    return frozenset()
 
 
 # One requirement, several planes that satisfy it. A hunt that three planes

@@ -389,6 +389,34 @@ def client(settings_kratos: Settings) -> Iterator[TestClient]:
     yield from _client(settings_kratos)
 
 
+def test_a_schedule_names_the_hunt_it_last_started(client: TestClient) -> None:
+    """F17: "last ran" was plain text. The row names the newest scheduled hunt."""
+    from soc_ai.store import hunts as hunt_svc
+
+    sid = client.post(
+        "/api/v1/hunt-schedules",
+        json={"objective": "Nightly beacon sweep", "interval_minutes": 1440, "enabled": True},
+    ).json()["id"]
+    assert client.get("/api/v1/hunt-schedules").json()["schedules"][0]["lastHuntId"] is None
+
+    async def _run() -> tuple[str, str]:
+        async with client.app.state.db_sessionmaker() as db:
+            # A manual hunt with the same words is not the schedule's run.
+            manual = await hunt_svc.create(
+                db, objective="Nightly beacon sweep", started_by="ann", kind="chat"
+            )
+            scheduled = await hunt_svc.create(
+                db, objective="nightly  beacon sweep", started_by="scheduler", kind="scheduled"
+            )
+            await hs_svc.mark_ran(db, sid)
+            return manual.id, scheduled.id
+
+    manual_id, scheduled_id = asyncio.run(_run())
+    row = client.get("/api/v1/hunt-schedules").json()["schedules"][0]
+    assert row["lastRunAt"] is not None
+    assert row["lastHuntId"] == scheduled_id != manual_id
+
+
 def test_schedules_crud_roundtrip(client: TestClient) -> None:
     # empty to start
     assert client.get("/api/v1/hunt-schedules").json() == {

@@ -1015,6 +1015,52 @@ async def test_a_served_port_membership_carries_its_peers_and_days() -> None:
     assert served.vector["22"]["days"] == 26
 
 
+async def test_a_port_dimension_reads_no_icmp_and_no_port_zero() -> None:
+    """H2. Zeek writes an ICMP type and code into the port fields, so ICMP type
+    3 entered the served-port baseline as port 3, and "0" was a member. Both
+    port dimensions drop ICMP and port 0 in the query."""
+    es = _FakeES(field_presence=_FLOW_OK)
+    await collect_entity_profiles(
+        elastic=es, settings=_settings(), window_hours=24 * 30, time_anchor=_ANCHOR
+    )
+    port_calls = [c for c in es.calls if set(c["aggs"] or {}) & {"served_ports", "consumed_ports"}]
+    assert port_calls
+    for call in port_calls:
+        filters = call["query"]["bool"]["filter"]
+        bound = next(
+            f["range"]["destination.port"]
+            for f in filters
+            if "range" in f and "destination.port" in f["range"]
+        )
+        assert bound["gte"] == 1
+        icmp = [
+            f
+            for f in filters
+            if {"terms": {"network.transport": ["icmp", "icmp6", "ipv6-icmp"]}}
+            in (f.get("bool") or {}).get("must_not", [])
+        ]
+        assert icmp, f"the port read keeps ICMP: {filters}"
+
+
+async def test_a_served_port_member_carries_its_transport() -> None:
+    """The member key stays the bare port, so a stored baseline keeps matching.
+    The transport rides beside it: udp/53, never tcp/53."""
+    bucket = _entity_bucket(
+        "198.51.100.20", [("53", 40, "2026-08-20T00:00:00Z", "2026-09-14T00:00:00Z")]
+    )
+    bucket["members"]["buckets"][0]["transport"] = {
+        "buckets": [{"key": "udp", "doc_count": 38}, {"key": "tcp", "doc_count": 2}]
+    }
+    es = _FakeES(field_presence=_FLOW_OK, agg_payloads={"served_ports": {"buckets": [bucket]}})
+    sweep = await collect_entity_profiles(
+        elastic=es, settings=_settings(), window_hours=24 * 30, time_anchor=_ANCHOR
+    )
+    served = next(p for p in sweep.profiles if p.dimension == "served_ports")
+    assert served.vector["53"]["transport"] == "udp"
+    member_aggs = _served_call(es)["aggs"]["served_ports"]["aggs"]["members"]["aggs"]
+    assert member_aggs["transport"]["terms"]["field"] == "network.transport"
+
+
 async def test_the_builder_drops_a_served_port_one_peer_reached_on_one_day() -> None:
     """The 200 member slots hold real ports.
 

@@ -76,6 +76,8 @@ AuditKind = Literal[
     # flag-gated N-sample self-consistency vote on the final verdict
     # (verdict_consistency_samples > 1; a split lands verdict=inconclusive)
     "self_consistency_vote",
+    # a "no host telemetry" sentence rewritten from the prefetch host coverage
+    "host_coverage_grounding",
     # decision helpers
     "decision_template_match",
     "recommended_actions_blocked",

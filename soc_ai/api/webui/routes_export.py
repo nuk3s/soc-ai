@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from typing import Any, Literal
 
 from fastapi import Depends, HTTPException, Request
@@ -18,6 +19,7 @@ from soc_ai.api.webui._shared import (
     router,
 )
 from soc_ai.config import Settings
+from soc_ai.secret_scrub import scrub_value
 from soc_ai.store import investigations as inv_svc
 from soc_ai.store.models import Investigation
 
@@ -50,6 +52,14 @@ class RedactionPreviewOut(BaseModel):
     note: str
 
 
+_LABEL_RE = re.compile(r"\b(?:USER|HOST|IP|MAC|EMAIL)_\d+\b", re.IGNORECASE)
+
+
+def _restore_labels(value: str, reverse: dict[str, str]) -> str:
+    """Put back any label embedded in a learned value, matched case-blind."""
+    return _LABEL_RE.sub(lambda m: reverse.get(m.group(0).upper(), m.group(0)), value)
+
+
 @router.get(
     "/oracle/redaction-preview",
     response_model=RedactionPreviewOut,
@@ -66,11 +76,14 @@ async def oracle_redaction_preview(
     trust the redaction before enabling the Oracle — and confirm that public
     addresses pass through while every internal identifier is pseudonymized.
     """
+    from soc_ai.oracle.client import (  # noqa: PLC0415
+        OracleToolGuard,
+        sanitize_initial_payload,
+    )
     from soc_ai.oracle.sanitize import (  # noqa: PLC0415
         Mapping,
         redaction_replacements,
         redaction_summary,
-        sanitize,
     )
 
     suffix = (settings.oracle_internal_suffixes or (".local",))[0]
@@ -83,21 +96,52 @@ async def oracle_redaction_preview(
         "destination": {"ip": "8.8.8.8"},  # external — preserved
         "note": f"beacon from dc01{suffix} (10.0.0.15) to 8.8.8.8 every 60s",
     }
+    # The SAME function the Oracle send path calls (A5, C6). Plain sanitize()
+    # passed user.name through, so the preview misstated what leaves.
     mapping = Mapping()
-    sanitized = sanitize(sample, mapping, extra_suffixes=settings.oracle_internal_suffixes)
+    hosts = tuple(settings.oracle_extra_hosts)
+    suffixes = tuple(settings.oracle_internal_suffixes)
+    no_propagate: set[str] = set()
+    guard = (
+        OracleToolGuard(
+            mapping=mapping,
+            extra_hosts=hosts,
+            extra_suffixes=suffixes,
+            allowlist=(),
+            no_propagate=no_propagate,
+        )
+        if settings.oracle_tools_enabled
+        else None
+    )
+    sanitized = sanitize_initial_payload(
+        sample,
+        mapping,
+        allowlist=(),
+        extra_hosts=hosts,
+        extra_suffixes=suffixes,
+        no_propagate=no_propagate,
+        guard=guard,
+    )
     # The mapping only ever holds what sanitize() actually matched, but filter
     # by occurrence in the sanitized output anyway — the contract is "what YOU
     # see highlighted", not "what the sanitizer learned along the way".
     sanitized_json = json.dumps(sanitized)
+    original_json = json.dumps(sample)
+    pairs: list[RedactionReplacementOut] = []
+    for r in redaction_replacements(mapping):
+        if r.label not in sanitized_json:
+            continue
+        # sanitize_case learns some values AFTER an earlier label replaced part
+        # of them: the email arrives as "user_01@corp..." once user.name is
+        # tokenised. Show the analyst the value as it stands in the original.
+        value = _restore_labels(r.value, mapping.reverse)
+        if value in original_json:
+            pairs.append(RedactionReplacementOut(label=r.label, value=value, category=r.category))
     return RedactionPreviewOut(
         original=sample,
         sanitized=sanitized,
         summary=redaction_summary(mapping),
-        replacements=[
-            RedactionReplacementOut(label=r.label, value=r.value, category=r.category)
-            for r in redaction_replacements(mapping)
-            if r.label in sanitized_json
-        ],
+        replacements=pairs,
         note=(
             "soc-ai replaces internal identifiers with stable opaque labels before any "
             "Oracle call. The labels look like IP_01 and HOST_01. The same real value "
@@ -295,7 +339,7 @@ async def analyst_redaction_preview(
             status="context_unparseable",
             detail=(
                 "The stored enriched context no longer parses against the current "
-                "schema. soc-ai cannot rebuild the analyst prompt honestly."
+                "schema. soc-ai cannot rebuild the analyst prompt from it."
             ),
         )
 
@@ -453,6 +497,11 @@ def _decision_record(
         # The agent trace, in order — the actual evidence the verdict rests on.
         "trace": [{"sequence": e.sequence, "kind": e.kind, "payload": e.payload} for e in events],
     }
+    # The record leaves the console as a file. Scrub every credential value
+    # before the hash and the signature cover it: a row stored before the
+    # store-side scrub existed, and a tool result that quotes a password,
+    # both pass through here (dogfood 2026-10-01 P1).
+    body = scrub_value(body)
     canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str)
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     integrity: dict[str, Any] = {

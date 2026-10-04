@@ -27,9 +27,9 @@ from typing import Any
 
 import pytest
 from soc_ai.eval.journey import JourneyStage
-from soc_ai.eval.spec_journey import score_spec_journey
+from soc_ai.eval.spec_journey import declared_roles, score_spec_journey
 from soc_ai.eval.synth_loader import Scenario, load_all_scenarios
-from soc_ai.hunting.execute import Candidate, SpecRun
+from soc_ai.hunting.execute import Candidate, SpecRun, apply_role_gate
 from soc_ai.hunting.match import (
     clause_matches,
     detection_matches,
@@ -80,7 +80,7 @@ def _simulate(spec: HuntSpec, scenario: Scenario) -> SpecRun:
         if key is not None:
             by_scope[str(key)] = by_scope.get(str(key), 0) + 1
 
-    return SpecRun(
+    run = SpecRun(
         spec.id,
         "a",
         "b",
@@ -93,6 +93,10 @@ def _simulate(spec: HuntSpec, scenario: Scenario) -> SpecRun:
             for k, n in sorted(by_scope.items(), key=lambda kv: -kv[1])
         ],
     )
+    # The role gate the sweep applies, with the roles the scenario declares in
+    # place of the dossier. Same function, so the two cannot disagree.
+    assert scenario.spec_journey is not None
+    return apply_role_gate(spec, run, declared_roles(scenario.spec_journey))
 
 
 def test_there_is_at_least_one_spec_journey_scenario() -> None:
@@ -427,3 +431,45 @@ def test_the_ingester_names_the_right_population_when_it_refuses() -> None:
         "stopped being true when the second population landed"
     )
     assert "declarative population" in source
+
+
+@pytest.mark.parametrize("scenario", WITH_SPEC, ids=lambda s: s.id)
+def test_the_role_gate_is_load_bearing(scenario: Scenario) -> None:
+    """Deleting the role gate of a role-scoped analytic must break its scenario.
+
+    Each role-scoped scenario plants a matching document on a host in another
+    role. Without the gate that host surfaces as a second candidate. A
+    scenario that planted no such host would pass against a spec that had lost
+    its roles.
+    """
+    assert scenario.spec_journey is not None
+    spec = CATALOG[scenario.spec_journey.spec_id]
+    if not spec.roles:
+        pytest.skip(f"{spec.id} has no role gate")
+    ungated = spec.model_copy(update={"roles": []})
+    result = score_spec_journey(scenario.id, scenario.spec_journey, _simulate(ungated, scenario))
+    assert result.reached is not JourneyStage.COMPLETE, (
+        f"{scenario.id} still passes with the role gate of {spec.id} deleted"
+    )
+
+
+@pytest.mark.parametrize("scenario", WITH_SPEC, ids=lambda s: s.id)
+def test_a_role_scoped_scenario_declares_every_host_it_plants(scenario: Scenario) -> None:
+    """A planted host with no declared role is reported apart, never scored.
+
+    The negative control for the role gate itself: drop the declarations and
+    the scenario must fail, because a host the gate cannot place is not a
+    clean result.
+    """
+    assert scenario.spec_journey is not None
+    spec = CATALOG[scenario.spec_journey.spec_id]
+    if not spec.roles:
+        pytest.skip(f"{spec.id} has no role gate")
+    bare = scenario.model_copy(
+        update={"spec_journey": scenario.spec_journey.model_copy(update={"host_roles": {}})}
+    )
+    assert bare.spec_journey is not None
+    run = _simulate(spec, bare)
+    assert run.role_unconfirmed_docs > 0
+    result = score_spec_journey(scenario.id, bare.spec_journey, run)
+    assert result.reached is not JourneyStage.COMPLETE

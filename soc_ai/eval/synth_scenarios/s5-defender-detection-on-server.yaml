@@ -1,0 +1,128 @@
+id: s5-defender-detection-on-server
+name: "Defender detection on a server with no alert"
+version: 1
+tier: easy
+story: |
+  Microsoft Defender on a member server detects an attack tool and removes it.
+  Defender writes event 1116 for the detection and event 1117 for the action.
+  No signature on the grid fires. The alert queue stays quiet.
+
+  The prior that this analytic replaces read new process names on the server.
+  It never read a Defender event. On the development range it missed all 10
+  Defender detections and fired on Defender updater files, whose names carry
+  the definition version.
+
+  The benign twin is a Defender definition update on a second server: event
+  2000 from the same provider. It is the routine traffic that produced the
+  old noise. The twin sits on a second server, so a spec without the event
+  code clause surfaces two candidates and the pinned count fails. The third
+  document is a detection on a workstation. The analytic
+  applies to servers and domain controllers only, so the workstation detection
+  must not fire.
+attack:
+  - T1204
+sigma_refs: []
+
+ground_truth:
+  verdict: true_positive
+  confidence_min: 0.70
+  required_citation_kinds:
+    - typed_path
+  expected_actions:
+    - kind: escalate
+  expected_field_reconciliation: false
+
+spec_journey:
+  spec_id: identity-defender-detection
+  expected_scope_keys:
+    - "synth-srv01"
+  expected_candidate_count: 1
+  host_roles:
+    synth-srv01: server
+    synth-srv02: server
+    synth-ws01: workstation
+
+events:
+  # The detection.
+  - index: logs-synth-winlog-defender
+    time_offset_seconds: 0
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: winlog.winlog
+      event.module: winlog
+      event.kind: event
+      event.code: "1116"
+      event.provider: Microsoft-Windows-Windows Defender
+      host.name: "synth-srv01"
+      winlog.channel: Microsoft-Windows-Windows Defender/Operational
+      winlog.event_id: "1116"
+      winlog.computer_name: "SYNTH-SRV01.synth.test"
+      winlog.event_data.threat_name: "HackTool:Win32/Example.A"
+      winlog.event_data.Severity Name: Severe
+      winlog.event_data.Path: "file:_C:\\Users\\Public\\tool.exe"
+      winlog.event_data.Action Name: Not Applicable
+      synth.scenario_id: s5-defender-detection-on-server
+      synth.scenario_version: 1
+
+  # The action on the same detection.
+  - index: logs-synth-winlog-defender
+    time_offset_seconds: 5
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(5) }}"
+      event.dataset: winlog.winlog
+      event.module: winlog
+      event.kind: event
+      event.code: "1117"
+      event.provider: Microsoft-Windows-Windows Defender
+      host.name: "synth-srv01"
+      winlog.channel: Microsoft-Windows-Windows Defender/Operational
+      winlog.event_id: "1117"
+      winlog.computer_name: "SYNTH-SRV01.synth.test"
+      winlog.event_data.threat_name: "HackTool:Win32/Example.A"
+      winlog.event_data.Severity Name: Severe
+      winlog.event_data.Path: "file:_C:\\Users\\Public\\tool.exe"
+      winlog.event_data.Action Name: Remove
+      synth.scenario_id: s5-defender-detection-on-server
+      synth.scenario_version: 1
+
+  # The benign twin: a definition update on a second server.
+  - index: logs-synth-winlog-defender
+    time_offset_seconds: -600
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-600) }}"
+      event.dataset: winlog.winlog
+      event.module: winlog
+      event.kind: event
+      event.code: "2000"
+      event.provider: Microsoft-Windows-Windows Defender
+      host.name: "synth-srv02"
+      winlog.channel: Microsoft-Windows-Windows Defender/Operational
+      winlog.event_id: "2000"
+      winlog.computer_name: "SYNTH-SRV02.synth.test"
+      synth.scenario_id: s5-defender-detection-on-server
+      synth.scenario_version: 1
+
+  # A detection on a workstation. Out of the analytic's scope.
+  - index: logs-synth-winlog-defender
+    time_offset_seconds: -300
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-300) }}"
+      event.dataset: winlog.winlog
+      event.module: winlog
+      event.kind: event
+      event.code: "1116"
+      event.provider: Microsoft-Windows-Windows Defender
+      host.name: "synth-ws01"
+      winlog.channel: Microsoft-Windows-Windows Defender/Operational
+      winlog.event_id: "1116"
+      winlog.computer_name: "SYNTH-WS01.synth.test"
+      winlog.event_data.threat_name: "PUA:Win32/Example"
+      winlog.event_data.Severity Name: Low
+      winlog.event_data.Path: "file:_C:\\Users\\example\\Downloads\\setup.exe"
+      winlog.event_data.Action Name: Quarantine
+      synth.scenario_id: s5-defender-detection-on-server
+      synth.scenario_version: 1

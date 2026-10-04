@@ -8,11 +8,12 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
   getEntity: vi.fn(),
+  resolveMachine: vi.fn(),
   getObservations: vi.fn(),
   getLeads: vi.fn(),
 }));
 
-import { getEntity, getLeads, getObservations, type Lead } from '../lib/api';
+import { ApiError, getEntity, getLeads, getObservations, resolveMachine, type Lead } from '../lib/api';
 import { ENTITY_ADDRESS, ENTITY_NAME } from '../lib/tooltips';
 import { Entity } from './Entity';
 
@@ -73,6 +74,10 @@ beforeEach(() => {
     .mockReset()
     .mockResolvedValue({ entity: 'svc_sql', days: 7, observations: [OBSERVATION] });
   vi.mocked(getLeads).mockReset().mockResolvedValue([LEAD, OTHER_LEAD]);
+  // An account belongs to no machine.
+  vi.mocked(resolveMachine)
+    .mockReset()
+    .mockRejectedValue(new ApiError('No machine holds this value.', 404, 'no_host'));
 });
 
 describe('Entity hunting panels', () => {

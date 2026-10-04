@@ -188,7 +188,7 @@ export function EntityGraph({
             // the node; the lone left (source) node keeps its label underneath
             const side = n.x >= 60;
             const tip = [
-              `${n.id} — ${kindLabel(n.kind)}`,
+              `${n.id} · ${kindLabel(n.kind)}`,
               n.sub,
               n.flagged
                 ? `flagged by: ${(n.flagSources ?? []).join(', ') || 'threat intel'}`

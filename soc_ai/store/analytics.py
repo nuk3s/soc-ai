@@ -28,6 +28,11 @@ __all__ = [
     "STATUSES",
     "allowed_transitions",
     "create_local",
+    "drafted_for_finding",
+    "drafted_for_hunt",
+    "drafted_from",
+    "pinned_analytics",
+    "pins_of",
     "retire_shipped",
     "states",
     "transition",
@@ -84,10 +89,103 @@ async def versions(db: AsyncSession, analytic_id: str) -> Sequence[AnalyticVersi
     return rows.all()
 
 
+def drafted_from(hunt_id: str, ordinal: int) -> str:
+    """The reason the first version row of an analytic drafted from a finding carries.
+
+    The draft route reads it back to find the analytic a finding already has.
+    """
+    return f"drafted from hunt {hunt_id} finding {int(ordinal)}"
+
+
+def pins_of(version: AnalyticVersion) -> list[str]:
+    """The generalization pins a version row carries. Empty for any other row."""
+    packet = version.receipts_json
+    if not isinstance(packet, dict):
+        return []
+    found = packet.get("generalization")
+    pinned = found.get("pinned") if isinstance(found, dict) else None
+    return [str(p) for p in pinned] if isinstance(pinned, list) else []
+
+
+async def pinned_analytics(db: AsyncSession) -> dict[str, list[str]]:
+    """The generalization pins of every drafted analytic that has any. One query.
+
+    Read from the first version row, which the draft route writes. The list
+    marks such an analytic "specific", and the drawer lists the pins.
+    """
+    rows = await db.scalars(
+        select(AnalyticVersion).where(
+            AnalyticVersion.from_status.is_(None),
+            AnalyticVersion.receipts_json.is_not(None),
+        )
+    )
+    out: dict[str, list[str]] = {}
+    for version in rows:
+        pins = pins_of(version)
+        if pins:
+            out[version.analytic_id] = pins
+    return out
+
+
+async def drafted_for_finding(db: AsyncSession, hunt_id: str, ordinal: int) -> str | None:
+    """The id of the analytic already drafted from this finding, or None.
+
+    A retired analytic does not count: the analyst rejected it, and a new
+    draft is a new question.
+    """
+    rows = await db.execute(
+        select(AnalyticVersion.analytic_id)
+        .join(AnalyticState, AnalyticState.analytic_id == AnalyticVersion.analytic_id)
+        .where(
+            AnalyticVersion.why == drafted_from(hunt_id, ordinal),
+            AnalyticState.status != "retired",
+        )
+        .order_by(AnalyticVersion.at.desc())
+        .limit(1)
+    )
+    found = rows.scalar_one_or_none()
+    return str(found) if found else None
+
+
+async def drafted_for_hunt(db: AsyncSession, hunt_id: str) -> dict[int, str]:
+    """The analytic drafted from each finding of one hunt, by ordinal. One query.
+
+    The hunt page reads it, so a finding that has an analytic links it and
+    offers no second draft, after a reload too.
+    """
+    prefix = drafted_from(hunt_id, 0).removesuffix("0")
+    rows = await db.execute(
+        select(AnalyticVersion.why, AnalyticVersion.analytic_id)
+        .join(AnalyticState, AnalyticState.analytic_id == AnalyticVersion.analytic_id)
+        .where(
+            AnalyticVersion.why.startswith(prefix, autoescape=True),
+            AnalyticState.status != "retired",
+        )
+        .order_by(AnalyticVersion.at.asc())
+    )
+    out: dict[int, str] = {}
+    for why, analytic_id in rows.all():
+        tail = str(why or "").removeprefix(prefix)
+        if tail.isdigit():
+            out[int(tail)] = str(analytic_id)
+    return out
+
+
 async def create_local(
-    db: AsyncSession, *, spec_text: str, by: str, now: datetime | None = None
+    db: AsyncSession,
+    *,
+    spec_text: str,
+    by: str,
+    now: datetime | None = None,
+    why: str = "created",
+    generalization: dict[str, Any] | None = None,
 ) -> AnalyticState:
     """Validate the text, store it as a candidate, and write the first version row.
+
+    ``generalization`` is what the drafter's generalization check found. It
+    rides on the first version row as ``{"generalization": {...}}`` in
+    ``receipts_json``. Receipts of an approval are a list, so the two shapes
+    never meet.
 
     The text is validated before it is stored. A row that does not parse is an
     analytic the catalog must list and cannot run, and the analyst who wrote it
@@ -125,9 +223,10 @@ async def create_local(
             to_status="candidate",
             who=by[:80],
             at=at,
-            why="created",
+            why=why,
             spec_before=None,
             spec_after=text,
+            receipts_json={"generalization": generalization} if generalization else None,
         )
     )
     await db.commit()

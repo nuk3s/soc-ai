@@ -378,3 +378,115 @@ def test_unknown_verb_exits_two(tmp_path: Path) -> None:
     r = run(tmp_path, workdir, "renew")
     assert r.proc.returncode == 2
     assert not _backups(workdir)
+
+
+# ── acme: a private ACME CA ──────────────────────────────────────────────────
+
+ACME_URL = "https://ca.example.test/acme/local/directory"
+ACME_TLS = f"import acme_ca {ACME_URL} /certs/acme-ca-root.pem"
+ROOT_PEM = "-----BEGIN CERTIFICATE-----\nMIIBroot\n-----END CERTIFICATE-----\n"
+
+
+def _root(tmp_path: Path, body: str = ROOT_PEM) -> Path:
+    root = tmp_path / "lab-root.pem"
+    root.write_text(body)
+    return root
+
+
+def test_enable_acme_writes_the_import_line_and_copies_the_root(tmp_path: Path) -> None:
+    workdir = make_workdir(tmp_path, network_exists=True)
+    root = _root(tmp_path)
+    r = run(tmp_path, workdir, "enable", DOMAIN, "acme", ACME_URL, str(root))
+    assert r.proc.returncode == 0, r.proc.stderr + r.proc.stdout
+    v = env_values(r.env_text)
+    assert v["SOC_AI_CADDY_TLS"] == ACME_TLS
+    assert v["SOC_AI_DOMAIN"] == DOMAIN
+    assert v["SOC_AI_BIND"] == "127.0.0.1"
+    assert v["COMPOSE_PROFILES"] == "proxy"
+    copied = workdir / "certs" / "acme-ca-root.pem"
+    assert copied.read_text() == ROOT_PEM
+    assert oct(copied.stat().st_mode & 0o777) == "0o644"
+    # Caddy obtains the certificate itself, so the script waits on the log line
+    # and exports no Caddy root.
+    assert any(c.startswith("compose logs") for c in r.docker_log.splitlines())
+    assert "compose cp" not in r.docker_log
+    assert not (workdir / "caddy-root.crt").exists()
+    # The chain check verifies against the copied root, not with -k.
+    assert f"--cacert certs/acme-ca-root.pem --resolve {DOMAIN}:443:127.0.0.1" in r.curl_log
+    out = r.proc.stdout
+    assert f"acme ({ACME_URL})" in out
+    assert "Chain check" in out
+
+
+def test_enable_acme_status_names_the_directory(tmp_path: Path) -> None:
+    workdir = make_workdir(tmp_path, network_exists=True)
+    r1 = run(tmp_path, workdir, "enable", DOMAIN, "acme", ACME_URL, str(_root(tmp_path)))
+    assert r1.proc.returncode == 0, r1.proc.stderr
+    r = run(tmp_path, workdir, "status")
+    assert r.proc.returncode == 0, r.proc.stderr
+    assert f"Source:  acme ({ACME_URL})" in r.proc.stdout
+
+
+def test_dry_run_acme_prints_the_plan_and_changes_nothing(tmp_path: Path) -> None:
+    workdir = make_workdir(tmp_path)
+    root = _root(tmp_path)
+    before = (workdir / ".env").read_text()
+    r = run(tmp_path, workdir, "--dry-run", "enable", DOMAIN, "acme", ACME_URL, str(root))
+    assert r.proc.returncode == 0, r.proc.stderr + r.proc.stdout
+    assert r.env_text == before
+    assert not _backups(workdir)
+    assert r.docker_log == "" and r.curl_log == ""
+    assert not (workdir / "certs" / "acme-ca-root.pem").exists()
+    out = r.proc.stdout
+    assert f"SOC_AI_CADDY_TLS={ACME_TLS}" in out
+    assert f"cp {root} certs/acme-ca-root.pem" in out
+    assert "--cacert certs/acme-ca-root.pem" in out
+
+
+@pytest.mark.parametrize(
+    ("args", "needle"),
+    [
+        (["acme", ACME_URL], "acme needs"),
+        (["acme"], "acme needs"),
+        (["acme", "http://ca.example.test/acme/local/directory", "ROOT"], "https"),
+        (["acme", "https://ca.example.test/acme dir", "ROOT"], "https"),
+        (["acme", "https://ca.example.test/{$X}", "ROOT"], "https"),
+        (["acme", "https://ca.example.test/a#b", "ROOT"], "https"),
+        (["acme", ACME_URL, "/nonexistent/root.pem"], "not found"),
+        (["acme", ACME_URL, "ROOT", "extra"], "acme needs"),
+    ],
+)
+def test_enable_acme_refuses_bad_input(tmp_path: Path, args: list[str], needle: str) -> None:
+    workdir = make_workdir(tmp_path)
+    root = _root(tmp_path)
+    args = [str(root) if a == "ROOT" else a for a in args]
+    before = (workdir / ".env").read_text()
+    r = run(tmp_path, workdir, "enable", DOMAIN, *args)
+    assert r.proc.returncode == 2, r.proc.stdout + r.proc.stderr
+    assert needle in r.proc.stderr, r.proc.stderr
+    assert r.env_text == before
+    assert not _backups(workdir)
+    assert r.docker_log == ""
+
+
+def _key_block(kind: str) -> str:
+    # Built at run time, so the secret scanners see no key header in this file.
+    label = f"{kind}PRIVATE KEY"
+    return f"-----BEGIN {label}-----\nMIIkey\n-----END {label}-----\n"
+
+
+@pytest.mark.parametrize(
+    ("body", "needle"),
+    [
+        ("not a certificate\n", "no PEM certificate"),
+        (ROOT_PEM + _key_block(""), "private key"),
+        (ROOT_PEM + _key_block("EC "), "private key"),
+    ],
+)
+def test_enable_acme_refuses_a_bad_root_file(tmp_path: Path, body: str, needle: str) -> None:
+    workdir = make_workdir(tmp_path)
+    r = run(tmp_path, workdir, "enable", DOMAIN, "acme", ACME_URL, str(_root(tmp_path, body)))
+    assert r.proc.returncode == 2
+    assert needle in r.proc.stderr, r.proc.stderr
+    assert not _backups(workdir)
+    assert not (workdir / "certs" / "acme-ca-root.pem").exists()

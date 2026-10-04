@@ -1,0 +1,90 @@
+id: identity-privileged-group-change
+title: An account adds a member to a privileged group on a domain controller
+description: >
+  Events 4728, 4732 and 4756 report that a member was added to a
+  security-enabled global, local or universal group. This analytic reads those
+  three events when the target group is privileged. The privileged groups are
+  Domain Admins, Enterprise Admins, Schema Admins, Administrators, Account
+  Operators, Backup Operators, Server Operators, Print Operators, DnsAdmins,
+  Group Policy Creator Owners, Remote Desktop Users and Distributed COM Users.
+  An add to any other group does not match.
+
+  A membership change in these groups is rare and deliberate. It is also the
+  most common persistence step after a domain compromise.
+
+  This analytic replaces the prior prior-privileged-group-membership-changed.
+  That prior read new logon accounts on the domain controller. It never read a
+  group change. On the development range the attack chain of 2026-09-03 and
+  2026-09-04 added a member to Domain Admins, Enterprise Admins, Schema Admins,
+  Group Policy Creator Owners and Remote Desktop Users. The prior saw none of
+  these adds.
+
+  The analytic matches the group by its name. A domain that renames a group,
+  or a Windows language that translates the builtin names, needs a tuning
+  filter. The analytic applies to the domain_controller role only. The finding
+  quotes the subject account, the group and the member.
+
+level: critical
+# "How often does privileged membership change here" has no answer that makes
+# one change benign. A shop that reorganises its admins monthly has a high
+# rate, and every one of those changes still matters.
+no_benign_baseline: true
+scope_field: host.name
+scope_kind: host
+roles:
+  - domain_controller
+
+# A Windows host writes Security events all day. Silence in the window means
+# the Security log does not ship.
+precondition:
+  all:
+    - field: winlog.channel
+      value: Security
+
+detection:
+  all:
+    - field: winlog.channel
+      value: Security
+    - field: event.code
+      op: one_of
+      value: ["4728", "4732", "4756"]
+    # The group is TargetUserName on all three events.
+    - field: winlog.event_data.TargetUserName
+      op: one_of
+      value:
+        - Domain Admins
+        - Enterprise Admins
+        - Schema Admins
+        - Administrators
+        - Account Operators
+        - Backup Operators
+        - Server Operators
+        - Print Operators
+        - DnsAdmins
+        - Group Policy Creator Owners
+        - Remote Desktop Users
+        - Distributed COM Users
+
+details:
+  - field: winlog.event_data.SubjectUserName
+    label: account
+  - field: winlog.event_data.TargetUserName
+    label: group
+  - field: winlog.event_data.MemberName
+    label: member
+  - field: winlog.event_data.MemberSid
+    label: member SID
+
+attack:
+  - T1098.007
+  - T1078.002
+
+false_positives:
+  - An operator onboards or offboards an administrator as planned. The change
+    record holds this fact. The telemetry does not show it. The analyst
+    confirms the change against the change record.
+  - A directory synchronisation tool rewrites group membership on a schedule.
+
+references:
+  - https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4728
+  - https://attack.mitre.org/techniques/T1098/007/

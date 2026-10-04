@@ -193,9 +193,9 @@ describe('hunt-kind error-state re-run', () => {
     // two different meanings ("click a button" vs "go re-promote from the
     // hunt") stacked at the same spot is the bug under test here.
     expect(container.textContent).toContain(
-      'The run may have stalled. The agent may have crashed. Re-promote it from its hunt to try again.',
+      'soc·ai recorded no cause. Re-promote it from its hunt to try again.',
     );
-    expect(container.textContent).not.toContain('The agent may have crashed. Re-run it to try again.');
+    expect(container.textContent).not.toContain('Re-run it to try again.');
     const link = screen.getByRole('link', { name: 'Sweep for beaconing to rare external IPs' });
     expect(link).toHaveAttribute('href', '/hunts/01HUNTERR00000000000000000');
   });
@@ -210,9 +210,9 @@ describe('hunt-kind error-state re-run', () => {
     // a suricata-kind run; only the count (not zero) is under test here.
     expect(screen.getAllByRole('button', { name: /Re-run investigation/i }).length).toBeGreaterThan(0);
     expect(container.textContent).not.toContain('Re-promote this finding');
-    // Suricata prose is byte-identical to before this polish pass.
+    // The suricata copy names the missing cause and keeps the re-run advice.
     expect(container.textContent).toContain(
-      'The run may have stalled. The agent may have crashed. Re-run it to try again.',
+      'soc·ai recorded no cause. Re-run it to try again.',
     );
   });
 });

@@ -160,6 +160,33 @@ ACKED_EVENT_IDS = {
     for n in range(1, 39)
 }
 
+# --- host page activity (the mock's answer to the host page's grid reads) -----
+# Conversation records per host over 24h, zeek.conn-shaped: (peer, direction,
+# service port, records). "in": the peer opened the connection; "out": the host
+# did. Only the hosts listed here have live activity in the demo. Every other
+# address reads as quiet, which is the answer the mock gave every host before.
+PROXY_IP = "198.51.100.5"  # web-proxy-01, the forward proxy the office browses through
+HOST_PEERS: dict[str, list[tuple[str, str, int, int]]] = {
+    PROXY_IP: [
+        ("203.0.113.80", "out", 443, 3_904),
+        ("198.51.100.23", "in", 3128, 2_140),
+        ("198.51.100.31", "in", 3128, 1_872),
+        ("198.51.100.44", "in", 3128, 1_310),
+        (DNS_SERVER, "out", 53, 1_206),
+        ("198.51.100.57", "in", 3128, 902),
+        ("198.51.100.62", "in", 3128, 611),
+        ("198.51.100.66", "in", 3128, 540),
+        ("203.0.113.29", "out", 8443, 418),
+        (SCANNER_IP, "in", 443, 76),
+    ],
+}
+
+# Accounts each host's own auth log names over 24h:
+# address -> (the agent's host.name, [(account, events)]).
+HOST_USERS: dict[str, tuple[str, list[tuple[str, int]]]] = {
+    PROXY_IP: ("web-proxy-01", [("svc-deploy", 41), ("ops-admin", 7)]),
+}
+
 # --- demo login (local throwaway instance only) --------------------------------
 DEMO_ADMIN_USER = "admin"
 DEMO_ADMIN_PASSWORD = "demo-only-not-a-secret"

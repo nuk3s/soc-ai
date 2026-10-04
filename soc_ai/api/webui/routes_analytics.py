@@ -19,7 +19,7 @@ from typing import Any
 import yaml
 from fastapi import Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from soc_ai.api.deps import get_elastic, get_settings_dep
@@ -39,7 +39,8 @@ from soc_ai.hunting.weight import live_weight
 from soc_ai.hunting.wording import reword_legacy_summary
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.store import analytics as analytics_store
-from soc_ai.store.models import EntityObservation
+from soc_ai.store import host_machines
+from soc_ai.store.models import EntityObservation, HuntSpecSweep, PriorSpecRun
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -90,6 +91,9 @@ class AnalyticRowOut(BaseModel):
     dismissed_7d: int = 0
     shadow_hits_7d: int = 0
     unread_shadow_hits: int = 0
+    # The generalization check's sentences on a drafted analytic that still
+    # names the entity of its one case. Empty for every other analytic.
+    pinned: list[str] = []
 
 
 class AnalyticsListOut(BaseModel):
@@ -113,6 +117,13 @@ class AnalyticDetailOut(AnalyticRowOut):
     ledger: dict[str, Any]
     versions: list[AnalyticVersionOut]
     recent: list[dict[str, Any]]
+    # When the loop that runs this analytic last ran it: the catalog sweep for
+    # a ``match`` analytic, the prior sweep for a ``profile`` one. None when
+    # it has never run. ``runner_enabled`` is that loop's setting. The drawer
+    # said "It has not run, or it found nothing" on a grid where the sweeps
+    # were off, and the two cases need two sentences.
+    last_run_at: str | None = None
+    runner_enabled: bool = True
 
 
 class AnalyticCreateIn(BaseModel):
@@ -254,7 +265,13 @@ def _iso(value: Any) -> str | None:
     return None if value is None else value.replace(tzinfo=UTC).isoformat().replace("+00:00", "Z")
 
 
-def _row(spec_id: str, spec: HuntSpec, cat: Catalog, ledger: Ledger) -> AnalyticRowOut:
+def _row(
+    spec_id: str,
+    spec: HuntSpec,
+    cat: Catalog,
+    ledger: Ledger,
+    pinned: list[str] | None = None,
+) -> AnalyticRowOut:
     tier, status = cat.status_of(spec_id)
     return AnalyticRowOut(
         id=spec_id,
@@ -271,6 +288,7 @@ def _row(spec_id: str, spec: HuntSpec, cat: Catalog, ledger: Ledger) -> Analytic
         dismissed_7d=sum(ledger.dismissed.values()),
         shadow_hits_7d=ledger.shadow_hits,
         unread_shadow_hits=ledger.unread_shadow_hits,
+        pinned=list(pinned or []),
     )
 
 
@@ -329,7 +347,11 @@ async def list_analytics(request: Request) -> AnalyticsListOut:
             since=now - timedelta(days=_LEDGER_DAYS_LIST),
             now=now,
         )
-    rows = [_row(spec_id, spec, cat, ledgers[spec_id]) for spec_id, spec in cat.listed.items()]
+        pinned = await analytics_store.pinned_analytics(db)
+    rows = [
+        _row(spec_id, spec, cat, ledgers[spec_id], pinned.get(spec_id))
+        for spec_id, spec in cat.listed.items()
+    ]
     counts: dict[str, int] = {}
     for row in rows:
         counts[row.status] = counts.get(row.status, 0) + 1
@@ -350,14 +372,21 @@ async def get_analytic(request: Request, analytic_id: str) -> AnalyticDetailOut:
         )
         versions = await analytics_store.versions(db, analytic_id)
         states = await analytics_store.states(db)
+        since = now - timedelta(days=_LEDGER_DAYS_DETAIL)
         recent_rows = (
             await db.scalars(
                 select(EntityObservation)
-                .where(EntityObservation.spec_id == analytic_id)
+                .where(
+                    EntityObservation.spec_id == analytic_id,
+                    # The ledger's window, so the per-entity counts add up to
+                    # the ledger's observation count.
+                    EntityObservation.first_seen_at >= since.replace(tzinfo=None),
+                )
                 .order_by(EntityObservation.born_at.desc())
                 .limit(_MAX_RECENT_OBSERVATIONS)
             )
         ).all()
+        last_run_at = await _last_run_at(db, analytic_id, evaluator=spec.evaluator)
     state = states.get(analytic_id)
     by_entity: dict[str, dict[str, Any]] = {}
     for observation in recent_rows:
@@ -365,7 +394,10 @@ async def get_analytic(request: Request, analytic_id: str) -> AnalyticDetailOut:
             observation.entity_key,
             {"entity": observation.entity_key, "count": 0, "lead_id": None, "last": None},
         )
-        entry["count"] += int(observation.occurrences or 1)
+        # Observations, the unit the ledger counts. Occurrences counted the
+        # repeat sightings inside each observation, so the drawer read
+        # "OBSERVATIONS 5" beside "seen 7 times" for one entity.
+        entry["count"] += 1
         entry["lead_id"] = entry["lead_id"] or observation.lead_id
         entry["last"] = entry["last"] or _iso(observation.born_at)
     try:
@@ -378,7 +410,14 @@ async def get_analytic(request: Request, analytic_id: str) -> AnalyticDetailOut:
             "Reinstall the app or retire the analytic.",
         ) from exc
     return AnalyticDetailOut(
-        **_row(analytic_id, spec, cat, ledger).model_dump(),
+        **_row(
+            analytic_id,
+            spec,
+            cat,
+            ledger,
+            # The first version row is the draft's. A later row never carries pins.
+            analytics_store.pins_of(versions[0]) if versions else None,
+        ).model_dump(),
         description=spec.description,
         spec_text=spec_text,
         reason=state.reason if state is not None else None,
@@ -390,12 +429,38 @@ async def get_analytic(request: Request, analytic_id: str) -> AnalyticDetailOut:
                 who=version.who,
                 at=_iso(version.at) or "",
                 why=version.why,
-                has_receipts=bool(version.receipts_json),
+                # Receipts are a list. The first row of a drafted analytic
+                # carries its generalization pins as a mapping, and those are
+                # no receipts.
+                has_receipts=isinstance(version.receipts_json, list)
+                and bool(version.receipts_json),
             )
             for version in versions
         ],
         recent=list(by_entity.values())[:_MAX_RECENT_ENTITIES],
+        last_run_at=_iso(last_run_at),
+        runner_enabled=_runner_enabled(request.app.state.settings, evaluator=spec.evaluator),
     )
+
+
+async def _last_run_at(db: AsyncSession, analytic_id: str, *, evaluator: str) -> datetime | None:
+    """The newest trail row of the loop that runs this analytic. None if it never ran."""
+    if evaluator == "profile":
+        newest: datetime | None = await db.scalar(
+            select(func.max(PriorSpecRun.created_at)).where(PriorSpecRun.spec_id == analytic_id)
+        )
+        return newest
+    swept: datetime | None = await db.scalar(
+        select(func.max(HuntSpecSweep.created_at)).where(HuntSpecSweep.spec_id == analytic_id)
+    )
+    return swept
+
+
+def _runner_enabled(settings: Any, *, evaluator: str) -> bool:
+    """The setting of the loop that runs this analytic."""
+    if evaluator == "profile":
+        return bool(getattr(settings, "hunting_prior_sweep_enabled", True))
+    return bool(getattr(settings, "hunt_spec_sweeps_enabled", False))
 
 
 @router.post("/analytics", status_code=201, response_model=AnalyticRowOut)
@@ -956,6 +1021,10 @@ class EntityObservationsOut(BaseModel):
     entity: str
     days: int
     observations: list[EntityObservationOut]
+    # The other keys the same machine is stored under: every address and every
+    # name of the machine the entity belongs to. The host page keyed on an
+    # address read zero observations while six sat under the machine's name.
+    aliases: list[str] = Field(default_factory=list)
 
 
 @router.get("/hunts/observations", response_model=EntityObservationsOut)
@@ -990,13 +1059,29 @@ async def list_observations(
     since = (now - timedelta(days=days)).replace(tzinfo=None)
     async with request.app.state.db_sessionmaker() as db:
         cat = await effective_catalog(db)
+        # Every address and every name of the entity's machine. A value that
+        # names no machine expands to itself only, and a first label two
+        # machines share joins neither.
+        aliases = (await host_machines.entity_expansion(db, entity))[1:]
+        # The key as asked matches any entity type. An alias joins HOST rows
+        # only: a user account that shares a host's name is a different thing.
+        keyed = EntityObservation.entity_key == entity
+        if aliases:
+            keyed = or_(
+                keyed,
+                and_(
+                    EntityObservation.entity_kind == "host",
+                    # Any case: host.name arrives as the agent spells it, and
+                    # the key as asked joins in any case too.
+                    func.lower(EntityObservation.entity_key).in_(
+                        [a.lower() for a in (entity, *aliases)]
+                    ),
+                ),
+            )
         rows = (
             await db.scalars(
                 select(EntityObservation)
-                .where(
-                    EntityObservation.entity_key == entity,
-                    EntityObservation.born_at >= since,
-                )
+                .where(keyed, EntityObservation.born_at >= since)
                 .order_by(EntityObservation.born_at.desc(), EntityObservation.id.desc())
                 .limit(_MAX_ENTITY_OBSERVATIONS)
             )
@@ -1004,6 +1089,7 @@ async def list_observations(
     return EntityObservationsOut(
         entity=entity,
         days=days,
+        aliases=aliases,
         observations=[
             EntityObservationOut(
                 id=observation.id,

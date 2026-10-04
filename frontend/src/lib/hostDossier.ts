@@ -13,7 +13,15 @@
 // what lets the identity sentence's composition RULES be tested as rules.
 // ---------------------------------------------------------------------------
 
-import type { DossierFieldBrief, DossierFieldName, DossierField } from './types';
+import type {
+  DossierFieldBrief,
+  DossierFieldName,
+  DossierField,
+  MachineAddressKind,
+  MachineNameSource,
+  MachineRole,
+  MachineRoleState,
+} from './types';
 
 // ---- field labels -----------------------------------------------------------
 
@@ -136,10 +144,14 @@ export function unresolvedPhrase(f: {
   retracted_at: string | null;
   inferred_value?: string | null;
 }): string {
-  if (f.reason === 'stale') return 'last seen too long ago, too old to trust';
+  if (f.reason === 'stale') {
+    return f.last_run_at
+      ? `stale. The sweep last checked it ${relativeAge(f.last_run_at)}, too old to trust`
+      : 'stale. Last seen too long ago, too old to trust';
+  }
   if (f.reason === 'low_confidence') {
-    return f.inferred_value
-      ? `possibly "${f.inferred_value}", but the evidence is too thin to say`
+    return f.inferred_value && f.inferred_value.trim().toLowerCase() !== 'unknown'
+      ? `low confidence: "${f.inferred_value}". The evidence is too thin to say`
       : 'a faint signal, too thin to say';
   }
   if (f.retracted_at) return 'the evidence behind it has gone';
@@ -157,6 +169,16 @@ export function isResolved(f: DossierFieldBrief): boolean {
   return (f.value != null && f.value.trim() !== '') || f.value_json != null;
 }
 
+/** A guess the resolver withheld, with the state that withheld it. */
+export interface WithheldGuess {
+  /** `low_confidence`: fresh, below the gate. `stale`: older than the window. */
+  state: 'low_confidence' | 'stale';
+  /** The sweep's guess, as stored. */
+  value: string;
+  /** For a stale guess, how long ago the sweep last checked it. */
+  age: string | null;
+}
+
 /**
  * The sweep worked this field out and the resolver withheld the answer.
  *
@@ -165,15 +187,72 @@ export function isResolved(f: DossierFieldBrief): boolean {
  * guess, and on a role it is the difference between a host nothing can score
  * and a host nobody has looked at.
  *
- * Same predicate the summary's `roles_low_confidence` bucket counts
- * (store/host_dossier.py, summarize_dossiers), so the ROLES bar's count and
- * the rows the ROLE filter lists describe one set. One residue a list row
- * cannot carry: the summary also drops an inferred value spelled "unknown",
- * and a brief field ships no inference lane to read.
+ * Null when there is no guess to name: an override, a resolved field, no
+ * inferred value, or the classifier's own "unknown". Every unknown row wore a
+ * "possibly" chip whose tooltip claimed a withheld inference, and the wire
+ * held none. Same rule as the summary's two withheld buckets
+ * (store/host_dossier.py, _effective_role), and the server lists both.
  */
+export function withheldGuess(f: DossierFieldBrief, now = Date.now()): WithheldGuess | null {
+  if (f.overridden) return null;
+  if (f.reason !== 'low_confidence' && f.reason !== 'stale') return null;
+  const value = (f.inferred_value ?? '').trim();
+  if (!value || value.toLowerCase() === 'unknown') return null;
+  return {
+    state: f.reason,
+    value,
+    age: f.reason === 'stale' && f.last_run_at ? relativeAge(f.last_run_at, now) : null,
+  };
+}
+
 export function isWithheldGuess(f: DossierFieldBrief): boolean {
-  if (f.overridden) return false;
-  return f.reason === 'low_confidence' || f.reason === 'stale';
+  return withheldGuess(f) != null;
+}
+
+/** The one phrase for a withheld guess: "server · low confidence" or
+ *  "server · stale 8d ago". Labels, never slugs. */
+export function withheldPhrase(g: WithheldGuess, label: (v: string) => string = roleLabel): string {
+  return g.state === 'stale'
+    ? `${label(g.value)} · stale${g.age ? ` ${g.age}` : ''}`
+    : `${label(g.value)} · low confidence`;
+}
+
+/** A stored value in reading form: a role label, a port list, or the scalar. */
+export function valueText(field: DossierFieldName, value: string | null, json: unknown): string | null {
+  const scalar = (value ?? '').trim();
+  if (scalar) return field === 'role' ? roleLabel(scalar) : scalar;
+  if (json == null) return null;
+  const ports = portsView(json);
+  if (ports && ports.ports.length > 0) return ports.ports.join(', ');
+  if (field === 'activity_profile') return 'a traffic pattern';
+  return null;
+}
+
+/**
+ * What removing a declaration leaves, in one sentence for the button.
+ *
+ * The old copy said "The sweep's answer domain_controller then stands" while
+ * the field went to a low-confidence guess at 0.50, or to nothing at all.
+ * This reads the lane underneath and states the real outcome, with the label.
+ */
+export function removeOutcome(f: DossierField): string {
+  const text = valueText(f.field, f.inferred_value, f.inferred_value_json);
+  const conf = f.inferred_confidence != null ? ` at ${f.inferred_confidence.toFixed(2)}` : '';
+  const unknownGuess = f.field === 'role' && (f.inferred_value ?? '').trim().toLowerCase() === 'unknown';
+  if (text == null || unknownGuess) {
+    return 'Remove my declaration. This field then goes back to unknown.';
+  }
+  const reason = f.inference_reason === undefined ? null : f.inference_reason;
+  if (reason === 'low_confidence') {
+    return `Remove my declaration. The sweep's answer, ${text}${conf}, then shows as a low-confidence guess.`;
+  }
+  if (reason === 'stale') {
+    return `Remove my declaration. The sweep's answer, ${text}, is stale and then shows as a stale guess.`;
+  }
+  if (reason === 'no_signal') {
+    return 'Remove my declaration. This field then goes back to unknown.';
+  }
+  return `Remove my declaration. The sweep's answer, ${text}${conf}, then stands.`;
 }
 
 /** Wire order in, wire order out — the screens must not invent an ordering the
@@ -420,12 +499,18 @@ const OS_FAMILY_LABELS: Record<string, string> = {
  * Saying "critical" in both places would restate one fact 40px apart — the
  * exact duplication the 2026-08-08 pass counted six deep on conflicts.
  */
-export function identitySentence(host: {
-  ip: string;
-  fields: DossierFieldBrief[];
-}): SentencePart[] {
+export function identitySentence(
+  host: {
+    ip: string;
+    fields: DossierFieldBrief[];
+  },
+  // The machine name, when the page is a machine page. The machine name comes
+  // from the strongest source on any address; the primary address's own
+  // hostname field may be empty while the agent names the box.
+  name?: string | null,
+): SentencePart[] {
   const { fields } = host;
-  const subject = scalarOf(fields, 'hostname') ?? host.ip;
+  const subject = (name ?? '').trim() || scalarOf(fields, 'hostname') || host.ip;
   const parts: SentencePart[] = [{ text: subject, strong: true }];
 
   type Clause = SentencePart[];
@@ -506,4 +591,146 @@ export function selfReportedFields(fields: DossierField[]): DossierFieldName[] {
       return rungs.some((rung) => SELF_REPORTED.has(rung));
     })
     .map((f) => f.field);
+}
+
+// ---- machines ---------------------------------------------------------------
+//
+// A machine is a set of addresses soc-ai holds to be one device. The server
+// resolves its name, its role and the state of that role; these helpers only
+// put the answer into words.
+
+/** A machine key as the API spells it: `agent:<id>`, `mac:<mac>`, `ip:<address>`.
+ *  No address and no host name starts with one of these prefixes. */
+export function isMachineKey(value: string): boolean {
+  return /^(agent|mac|ip):./.test(value.trim());
+}
+
+const NAME_SOURCE_LABELS: Record<MachineNameSource, string> = {
+  declared: 'declared',
+  agent: 'agent',
+  dhcp: 'DHCP lease',
+  dns: 'DNS',
+  ntlm: 'NTLM',
+  other: 'other source',
+};
+
+/** The small text under a machine name: where the name came from. */
+export function nameSourceLabel(source: string | null | undefined): string | null {
+  if (!source) return null;
+  return NAME_SOURCE_LABELS[source as MachineNameSource] ?? source;
+}
+
+const NAME_SOURCE_TITLES: Record<MachineNameSource, string> = {
+  declared: 'An operator declared this name.',
+  agent: 'The agent on the machine reports this name.',
+  dhcp: 'A DHCP lease for this machine carries this name.',
+  dns: 'A DNS answer for the primary address carries this name.',
+  ntlm: 'An NTLM logon from this machine carries this name.',
+  other: 'Other network evidence carries this name.',
+};
+
+export function nameSourceTitle(source: string | null | undefined): string | undefined {
+  if (!source) return undefined;
+  return NAME_SOURCE_TITLES[source as MachineNameSource];
+}
+
+const ADDRESS_KIND_LABELS: Record<MachineAddressKind, string> = {
+  agent: 'agent',
+  dhcp: 'DHCP lease',
+  name: 'DNS name',
+  network: 'network',
+};
+
+const ADDRESS_KIND_TITLES: Record<MachineAddressKind, string> = {
+  agent: 'The agent on the machine reports this address.',
+  dhcp: 'A DHCP lease gave this address to a MAC of this machine.',
+  name: 'The DNS name of this address matches the machine name.',
+  network: 'Only network traffic ties this address to the machine.',
+};
+
+/** How soc-ai tied an address to its machine, in words. */
+export function addressKindLabel(kind: string): string {
+  return ADDRESS_KIND_LABELS[kind as MachineAddressKind] ?? kind;
+}
+
+export function addressKindTitle(kind: string): string | undefined {
+  return ADDRESS_KIND_TITLES[kind as MachineAddressKind];
+}
+
+/** An age in hours, short: "18h", "3d". */
+export function hoursAge(hours: number | null | undefined): string | null {
+  if (hours == null || !Number.isFinite(hours) || hours < 0) return null;
+  if (hours < 48) return `${Math.max(1, Math.round(hours))}h`;
+  return `${Math.round(hours / 24)}d`;
+}
+
+/** A machine role as the list and the machine page show it. */
+export interface MachineRoleView {
+  /** The chip text. */
+  text: string;
+  /** The small state word beside the chip, or null. */
+  note: string | null;
+  /** The role the accent colour keys on. Null when the role is withheld or
+   *  unknown, so a guess never wears the colour of an answer. */
+  accent: string | null;
+  state: MachineRoleState;
+  /** One or two sentences for the hover. */
+  title: string;
+}
+
+/**
+ * The role, with its state, in one place for both screens.
+ *
+ * declared: the operator's role. inferred: the sweep's role. low_confidence:
+ * "low confidence: <guess>". stale: "stale <age>: <guess>". unknown: "unknown".
+ */
+export function machineRoleView(role: MachineRole | null | undefined): MachineRoleView {
+  const state: MachineRoleState = role?.state ?? 'unknown';
+  const label = (slug: string | null | undefined): string | null => {
+    const v = (slug ?? '').trim();
+    return v ? roleLabel(v) : null;
+  };
+  const answer = (role?.label ?? '').trim() || label(role?.value);
+  const guess = label(role?.guess) ?? answer;
+  if ((state === 'declared' || state === 'inferred') && answer) {
+    return {
+      text: answer,
+      note: state,
+      accent: role?.value ?? answer,
+      state,
+      title:
+        state === 'declared'
+          ? 'An operator declared this role.'
+          : 'The sweep inferred this role from the evidence.',
+    };
+  }
+  if (state === 'low_confidence') {
+    return {
+      text: guess ? `low confidence: ${guess}` : 'low confidence',
+      note: null,
+      accent: null,
+      state,
+      title: guess
+        ? `The sweep guessed ${guess}. The evidence is too thin to assert it. Declare the role to settle it.`
+        : 'The sweep has a faint signal. The evidence is too thin to name a role.',
+    };
+  }
+  if (state === 'stale') {
+    const age = hoursAge(role?.stale_hours);
+    const head = age ? `stale ${age}` : 'stale';
+    return {
+      text: guess ? `${head}: ${guess}` : head,
+      note: null,
+      accent: null,
+      state,
+      title: `The sweep inferred ${guess ?? 'a role'}. The evidence is ${age ? `${age} old` : 'old'}. Run a sweep to confirm it.`,
+    };
+  }
+  return {
+    text: 'unknown',
+    note: null,
+    accent: null,
+    state: 'unknown',
+    title: 'The sweep has no role for this machine.',
+  };
 }

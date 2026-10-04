@@ -421,7 +421,8 @@ def test_resolve_dossier_carries_the_host_header() -> None:
         identity_rebound_at=NOW - timedelta(days=1),
         build_error="elastic timeout",
     )
-    dossier = resolve_dossier(host, [], now=NOW)
+    declared = _row("criticality", operator_value="high", operator_set_at=NOW - timedelta(days=2))
+    dossier = resolve_dossier(host, [declared], now=NOW)
     assert dossier.ip == "192.168.10.202"
     assert dossier.first_seen == datetime(2026, 6, 2)
     assert dossier.last_seen == NOW - timedelta(minutes=3)
@@ -431,6 +432,23 @@ def test_resolve_dossier_carries_the_host_header() -> None:
     # reader deciding whether an override still applies.
     assert dossier.identity_rebound_at == NOW - timedelta(days=1)
     assert dossier.build_error == "elastic timeout"
+
+
+def test_the_rebound_tripwire_needs_a_declaration_to_warn_about() -> None:
+    """The tripwire says "your override may no longer apply".
+
+    An address that holds no declaration has no override to warn about. The
+    store kept stamps from before that rule, so the reader drops them too.
+    """
+    host = HostDossier(ip="192.168.10.202", identity_rebound_at=NOW - timedelta(days=1))
+
+    bare = resolve_dossier(host, [_inferred("role", value="server")], now=NOW)
+    json_only = resolve_dossier(
+        host, [_row("services_offered", operator_value_json=["ssh"])], now=NOW
+    )
+
+    assert bare.identity_rebound_at is None
+    assert json_only.identity_rebound_at == NOW - timedelta(days=1)
 
 
 def test_resolved_fields_lists_only_what_is_actually_known() -> None:

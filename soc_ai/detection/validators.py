@@ -24,10 +24,12 @@ analyst ever sees it, mirroring
 
 from __future__ import annotations
 
+import ipaddress
 import re
+from collections.abc import Iterable
 from datetime import datetime
 from fnmatch import fnmatch
-from typing import Any, assert_never
+from typing import TYPE_CHECKING, Any, assert_never
 
 import yaml
 
@@ -54,6 +56,9 @@ from soc_ai.so_client.oql import (
 )
 from soc_ai.tools.query_events import query_events_oql
 
+if TYPE_CHECKING:
+    from soc_ai.hunting.spec import HuntSpec
+
 _REQUIRED_SIGMA_KEYS = ("title", "logsource", "detection")
 
 # ``detection`` keys that are Sigma directives, not named selections.
@@ -75,7 +80,7 @@ _MAX_DRY_RUN_WINDOW_DAYS = 30
 # Match-all floor: a drafted rule whose filter matches EVERY event is not a
 # detection — refusing to dry-run it saves a pointless full-window grid scan
 # and tells the analyst plainly why there is no would-have-fired number.
-_MATCH_ALL_ERROR = "rule matches all events — not specific enough to dry-run"
+_MATCH_ALL_ERROR = "rule matches all events, so it is not specific enough to dry-run"
 
 # Model-supplied result-shaping stages the dry run strips before appending its
 # own ``| head 5`` (mirrors ``_HEAD_RE`` in soc_ai.so_client.oql).
@@ -149,7 +154,7 @@ def _condition_references_selection(condition: str, selection_keys: set[str]) ->
 # field/polarity sets.
 
 _DIVERGENCE_PREFIX = "Sigma/OQL divergence: "
-_UNCOMPARABLE_SUFFIX = " — the dry-run count cannot be certified to measure the exported rule."
+_UNCOMPARABLE_SUFFIX = ". soc-ai cannot certify that the dry-run count measures the exported rule."
 
 
 def _condition_polarities(condition: str, selection_keys: set[str]) -> dict[str, set[bool]] | None:
@@ -307,27 +312,27 @@ def _sigma_oql_divergence(selections: dict[str, Any], condition: str, oql: str) 
     if sigma_only:
         return _DIVERGENCE_PREFIX + (
             f"the Sigma rule excludes (NOT) {', '.join(sigma_only)} but the OQL twin "
-            "that produced the would-have-fired count has no such exclusion — the dry "
+            "that produced the would-have-fired count has no such exclusion. The dry "
             "run did not measure the exported rule."
         )
     oql_only = sorted(set(oql_neg) - set(sigma_neg))
     if oql_only:
         return _DIVERGENCE_PREFIX + (
             f"the OQL twin excludes (NOT) {', '.join(oql_only)} but the exported Sigma "
-            "rule does not — the dry run measured a narrower query than the rule being "
+            "rule does not. The dry run measured a narrower query than the rule being "
             "exported."
         )
     mismatched = sorted(field for field in sigma_neg if sigma_neg[field] != oql_neg[field])
     if mismatched:
         return _DIVERGENCE_PREFIX + (
             f"the exclusion (NOT) values for {', '.join(mismatched)} differ between the "
-            "Sigma rule and its OQL twin — the dry run did not measure the exported rule."
+            "Sigma rule and its OQL twin. The dry run did not measure the exported rule."
         )
     missing = sorted(sigma_fields - oql_fields)
     if missing:
         return _DIVERGENCE_PREFIX + (
             f"the Sigma rule's detection logic uses {', '.join(missing)}, which the OQL "
-            "twin never queries — the would-have-fired count did not measure the "
+            "twin never queries. The would-have-fired count did not measure the "
             "exported rule."
         )
     # Positive-side VALUES (D3): a shared field keyed on different values means
@@ -341,7 +346,7 @@ def _sigma_oql_divergence(selections: dict[str, Any], condition: str, oql: str) 
     if keyed_differently:
         return _DIVERGENCE_PREFIX + (
             f"the exported Sigma rule and its OQL twin match different values for "
-            f"{', '.join(keyed_differently)} — the would-have-fired count measured a "
+            f"{', '.join(keyed_differently)}. The would-have-fired count measured a "
             "different query than the rule being exported."
         )
     return None
@@ -517,3 +522,220 @@ async def dry_run_detection(
             )
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# Generalization: does a drafted analytic describe a behaviour, or one case?
+# ---------------------------------------------------------------------------
+
+# Fields whose value names WHO or WHAT did something, never what was done. A
+# value test on one of them ties the analytic to the entity of the finding it
+# was drafted from. The first range draft pinned one host and two domain
+# names, and could fire on nothing else. Each maps to the noun its sentence
+# uses.
+_IDENTITY_FIELDS: dict[str, str] = {
+    "source.ip": "address",
+    "destination.ip": "address",
+    "client.ip": "address",
+    "server.ip": "address",
+    "host.ip": "address",
+    "related.ip": "address",
+    "host.name": "host",
+    "host.hostname": "host",
+    "winlog.computer_name": "host",
+    "agent.name": "host",
+    "agent.hostname": "host",
+    "observer.name": "host",
+    "user.name": "user",
+    "user.id": "user",
+    "related.user": "user",
+    "winlog.event_data.SubjectUserName": "user",
+    "winlog.event_data.TargetUserName": "user",
+    "dns.question.name": "domain",
+    "dns.question.registered_domain": "domain",
+    "dns.query.name": "domain",
+    "zeek.dns.query": "domain",
+    "url.domain": "domain",
+    "url.full": "URL",
+    "destination.domain": "domain",
+    "source.domain": "domain",
+    "server.domain": "domain",
+    "file.path": "path",
+    "process.command_line": "command line",
+}
+
+# The value tests that name an entity. ``exists`` names none, and the range
+# operators compare numbers.
+_PIN_OPS = frozenset({"equals", "one_of", "prefix", "contains", "wildcard"})
+
+# Values that name a CLASS on a user field, so they describe a behaviour. The
+# well-known privileged groups sit in TargetUserName on the group change
+# events, and a shipped analytic keys on exactly that list.
+_CLASS_VALUES = frozenset(
+    v.casefold()
+    for v in (
+        "Domain Admins",
+        "Enterprise Admins",
+        "Schema Admins",
+        "Administrators",
+        "Account Operators",
+        "Backup Operators",
+        "Server Operators",
+        "Print Operators",
+        "DnsAdmins",
+        "Group Policy Creator Owners",
+        "Remote Desktop Users",
+        "Distributed COM Users",
+        "Protected Users",
+        "Key Admins",
+        "Enterprise Key Admins",
+    )
+)
+
+_IPV4_RE = re.compile(r"(?<![\d.])\d{1,3}(?:\.\d{1,3}){3}(?![\d.])")
+_IPV4_SLUG_RE = re.compile(r"(?<![^-])\d{1,3}(?:-\d{1,3}){3}(?![^-])")
+_IPV6_TOKEN_RE = re.compile(r"[0-9A-Fa-f]*:[0-9A-Fa-f:.]*")
+
+# A host name shorter than this matches inside ordinary words too often to read
+# a title or an id by.
+_MIN_HOST_CHARS = 3
+
+
+def _clause_values(value: Any) -> list[str]:
+    if isinstance(value, (list, tuple, set)):
+        return [str(v) for v in value if v is not None]
+    return [] if value is None else [str(value)]
+
+
+def _has_ip_literal(text: str) -> bool:
+    for found in _IPV4_RE.findall(text):
+        try:
+            ipaddress.IPv4Address(found)
+        except ValueError:
+            continue
+        return True
+    for token in _IPV6_TOKEN_RE.findall(text):
+        if token.count(":") < 2:
+            continue
+        try:
+            ipaddress.IPv6Address(token.rstrip("."))
+        except ValueError:
+            continue
+        return True
+    return False
+
+
+def _is_class_value(field: str, op: str, value: str) -> bool:
+    """A value that names a set of entities. ``*$`` is every machine account."""
+    if op in {"wildcard", "prefix", "contains"} and not any(ch.isalnum() for ch in value):
+        return True
+    return _IDENTITY_FIELDS.get(field) == "user" and value.casefold() in _CLASS_VALUES
+
+
+def _host_names(hosts: Iterable[Any]) -> list[str]:
+    """The finding's hosts casefolded, and the first label of each dotted name."""
+    out: list[str] = []
+    for raw in hosts:
+        name = str(raw).strip().casefold()
+        # The first label of an address is a number, and it names nothing.
+        short = name if _has_ip_literal(name) else name.split(".", 1)[0]
+        for candidate in (name, short):
+            if len(candidate) >= _MIN_HOST_CHARS and candidate not in out:
+                out.append(candidate)
+    return out
+
+
+def _slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", text.casefold()).strip("-")
+
+
+def _names_word(text: str, word: str) -> bool:
+    """``word`` appears in ``text`` with no letter or digit on either side."""
+    pattern = rf"(?<![0-9a-z]){re.escape(word)}(?![0-9a-z])"
+    return re.search(pattern, text.casefold()) is not None
+
+
+def generalization_pins(
+    spec: HuntSpec,
+    *,
+    hosts: Iterable[Any] = (),
+    indicators: Iterable[Any] = (),
+) -> list[str]:
+    """The ways a drafted analytic is tied to the one case it was drafted from.
+
+    Pure and deterministic. Returns one sentence per pin, in the analyst's
+    words, each naming the clause and never its value: the sentences go back
+    to the model on the retry, and a value would carry an identifier past the
+    egress guard. Empty means the analytic describes a behaviour.
+
+    A pin is a value test (equals, one_of, prefix, contains, wildcard) on a
+    field that names an entity, or on the spec's own scope field; a literal
+    address or a host of the finding in any clause value; and a title or an
+    id that names a host of the finding or an address.
+
+    Only the positive lists are read, ``all`` and ``any`` under both the
+    precondition and the detection. A ``none`` clause removes entities from a
+    behaviour. An exclusion of one service account is how an analytic says
+    "except this one", and it cannot tie the analytic to one case.
+
+    ``indicators`` is the finding's indicator list. A value in it is the point
+    of the finding, a known-bad domain or hash from a feed, and is no pin.
+    Nothing else excuses a value.
+    """
+    indicator_set = {str(v).strip().casefold() for v in indicators if str(v).strip()}
+    host_list = list(hosts)
+    host_names = _host_names(host_list)
+    host_values = {str(h).strip().casefold() for h in host_list if str(h).strip()}
+    host_values.update(host_names)
+    out: list[str] = []
+    pinned_values: list[str] = []
+
+    def add(sentence: str) -> None:
+        if sentence not in out:
+            out.append(sentence)
+
+    for block in (spec.precondition, spec.detection):
+        if block is None:
+            continue
+        for clause in [*block.all, *block.any]:
+            field = clause.field
+            values = [
+                v for v in _clause_values(clause.value) if v.strip().casefold() not in indicator_set
+            ]
+            if not values:
+                continue
+            noun = _IDENTITY_FIELDS.get(field) or ("entity" if field == spec.scope_field else None)
+            if noun is not None and clause.op in _PIN_OPS:
+                named = [v for v in values if not _is_class_value(field, clause.op, v)]
+                if named:
+                    pinned_values.extend(named)
+                    what = f"one {noun}" if len(named) == 1 else f"a fixed list of {noun} values"
+                    add(
+                        f"The clause on {field} pins the analytic to {what}. "
+                        "Describe the behaviour."
+                    )
+                    continue
+            literal = [v for v in values if _has_ip_literal(v)]
+            if literal:
+                pinned_values.extend(literal)
+                add(f"The clause on {field} names a literal IP address. Describe the behaviour.")
+                continue
+            named_host = [v for v in values if v.strip().casefold() in host_values]
+            if named_host:
+                pinned_values.extend(named_host)
+                add(f"The clause on {field} names a host from the finding. Describe the behaviour.")
+
+    if any(_names_word(spec.title, h) for h in host_names):
+        add("The title names a host from the finding. Name the behaviour.")
+    elif _has_ip_literal(spec.title):
+        add("The title names an IP address. Name the behaviour.")
+    elif any(
+        len(v.strip()) >= _MIN_HOST_CHARS and v.strip().casefold() in spec.title.casefold()
+        for v in pinned_values
+    ):
+        add("The title names a value that a clause pins. Name the behaviour.")
+    if any(_names_word(spec.id, _slug(h)) for h in host_names if _slug(h)):
+        add("The id names a host from the finding. Name the behaviour.")
+    elif _IPV4_SLUG_RE.search(spec.id):
+        add("The id names an IP address. Name the behaviour.")
+    return out

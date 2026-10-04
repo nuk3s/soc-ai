@@ -514,7 +514,22 @@ def classify_host(candidate: _Candidate, min_hosts: int) -> str:
     return "active" if candidate.host_count >= min_hosts else "muted"
 
 
-def _junk_host_reason(value: str) -> str | None:
+# The host-dossier signals that are a machine's claim about itself: the agent's
+# own host.name and a DHCP lease hostname. The bare-public-TLD rule does not
+# apply to them. "nexus" and "green" are gTLDs and real machine names.
+SELF_REPORTED_SIGNALS: frozenset[str] = frozenset({"hostlog", "dhcp"})
+
+
+def _self_reported_proposal(evidence: Any) -> bool:
+    """True for a host row the dossier proposed from a self-reported name."""
+    if not isinstance(evidence, dict):
+        return False
+    return (
+        evidence.get("source") == "host_dossier" and evidence.get("signal") in SELF_REPORTED_SIGNALS
+    )
+
+
+def _junk_host_reason(value: str, *, self_reported: bool = False) -> str | None:
     """Return a drop reason iff *value* is junk as a bare-host identifier.
 
     Junk hosts are parsing/protocol artifacts that can never be a real
@@ -532,6 +547,10 @@ def _junk_host_reason(value: str) -> str | None:
       ``__MSBROWSE__``, or any value carrying a literal backslash-x escape
       sequence (non-printable NetBIOS suffix bytes rendered as text, e.g.
       ``\\x01\\x02__MSBROWSE__\\x02``).
+
+    ``self_reported`` skips the TLD rule. An agent's own ``host.name`` and a
+    DHCP lease hostname are what the machine calls itself, and "nexus" and
+    "green" are gTLDs that real machines carry. The other rules still apply.
 
     Returns ``None`` for a legitimate candidate.
     """
@@ -551,7 +570,7 @@ def _junk_host_reason(value: str) -> str | None:
         return "netbios-msbrowse"
     if "\\x" in v.lower():
         return "netbios-escape"
-    if v.lower() in _load_public_tlds():
+    if not self_reported and v.lower() in _load_public_tlds():
         return "bare-public-tld"
     return None
 
@@ -1249,7 +1268,7 @@ async def _retire_vestigial_rows(
         if row.kind == "suffix" and _is_machine_guid_suffix(row.value):
             reason = "machine-guid suffix — rule added after this row was detected"
         elif row.kind == "host":
-            junk = _junk_host_reason(row.value)
+            junk = _junk_host_reason(row.value, self_reported=_self_reported_proposal(row.evidence))
             if junk is not None:
                 reason = f"junk host ({junk}) — rule added after this row was detected"
         elif (

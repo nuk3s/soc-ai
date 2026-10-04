@@ -140,3 +140,26 @@ describe('Login post-login redirect', () => {
     expect(sessionStorage.getItem(POST_LOGIN_REDIRECT_KEY)).toBeNull();
   });
 });
+
+// A failed sign-in must reach a screen reader. The error box had no role, so
+// the reader announced nothing and the form looked unchanged (D13).
+describe('Login error', () => {
+  it('announces a refused sign-in as an alert', async () => {
+    fetchMock.mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/demo-status')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ demo: false }) } as Response);
+      }
+      if (url.endsWith('/login')) {
+        return Promise.resolve({ ok: false, status: 401, json: () => Promise.resolve({}) } as Response);
+      }
+      return Promise.reject(new TypeError('offline'));
+    });
+    renderLogin();
+    fireEvent.change(screen.getByLabelText('Username'), { target: { value: 'ana' } });
+    fireEvent.change(screen.getByLabelText('Password'), { target: { value: 'wrong' } });
+    fireEvent.click(screen.getByRole('button', { name: /sign in/i }));
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toMatch(/invalid username or password/i);
+  });
+});

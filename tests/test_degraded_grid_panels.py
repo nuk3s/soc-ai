@@ -767,7 +767,7 @@ _ACTIONS = [
     _Action(
         "model-fitness",
         "GET",
-        "/api/v1/config/model-fitness",
+        "/api/v1/config/model-fitness?force=true",
         None,
         200,
         budgets=4,

@@ -13,7 +13,10 @@ Two layers, both hermetic (no live ES):
 
 from __future__ import annotations
 
+import asyncio
 import functools
+import gc
+import weakref
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -170,8 +173,59 @@ def _compare_sort_values(a: list[Any], b: list[Any], fields: list[tuple[str, str
     return 0
 
 
+def _as_comparable(field: str, value: Any) -> Any:
+    """``timestamp`` values compare as instants (ES parses dates); the rest as-is."""
+    if field == "timestamp" and isinstance(value, str):
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return value
+
+
+def _record_matches(record: dict[str, Any], query: Any) -> bool:
+    """Apply the ``bool.filter`` clauses the verifier sends: exists, term, range.
+
+    The verifier reads each epoch through its own timestamp window, so a fake
+    that ignored the query would hand every epoch the whole index.
+    """
+    if not isinstance(query, dict):
+        return True
+    filters = query.get("bool", {}).get("filter", []) if "bool" in query else [query]
+    for clause in filters:
+        if "exists" in clause:
+            if record.get(clause["exists"]["field"]) is None:
+                return False
+        elif "term" in clause:
+            ((field, value),) = clause["term"].items()
+            if isinstance(value, dict):
+                value = value.get("value")
+            if record.get(field) != value:
+                return False
+        elif "terms" in clause:
+            ((field, values),) = clause["terms"].items()
+            if record.get(field) not in values:
+                return False
+        elif "range" in clause:
+            ((field, bounds),) = clause["range"].items()
+            have = record.get(field)
+            if have is None:
+                return False
+            have_c = _as_comparable(field, have)
+            for op, bound in bounds.items():
+                b = _as_comparable(field, bound)
+                if (
+                    (op == "gte" and not have_c >= b)
+                    or (op == "gt" and not have_c > b)
+                    or (op == "lt" and not have_c < b)
+                    or (op == "lte" and not have_c <= b)
+                ):
+                    return False
+    return True
+
+
 class _FakeES:
     """Minimal ES double honoring the helper's ``search_after`` paging.
+
+    Honors the ``bool.filter`` clauses of the query too (see
+    :func:`_record_matches`): the verifier reads one epoch window at a time.
 
     Serves records ordered by whatever ``sort`` clause the REQUEST carries —
     derived per call via :func:`_sort_fields_from_request` /
@@ -200,8 +254,9 @@ class _FakeES:
         if failure is not None:
             return failure
         fields = _sort_fields_from_request(body.get("sort"))
+        matching = [r for r in self._records if _record_matches(r, body.get("query"))]
         ordered = sorted(
-            self._records,
+            matching,
             key=functools.cmp_to_key(
                 lambda a, b: _compare_sort_values(
                     _record_sort_values(a, fields), _record_sort_values(b, fields), fields
@@ -373,9 +428,15 @@ async def test_verify_windowed_slice_is_not_tamper() -> None:
     window was rotated out / filtered) must NOT be reported as tampered. Regression
     for the windowed false-positive: verify_chain forced the genesis prev_hash onto
     the first in-window record regardless of its real seq."""
-    full = _build_chain(10)
-    window = full[6:]  # seqs 6..9 — exactly what a days= filter hands back on an old deploy
-    elastic = _elastic_with(window)
+    # One record a day, seqs 0..5 older than the 7-day window, seqs 6..9 inside
+    # it. The fake applies the same timestamp filter ES does, so the scan sees
+    # exactly the in-window slice. Relative to now, so the test does not rot.
+    full = _build_chain(
+        10,
+        start_time=datetime.now(UTC) - timedelta(days=12, hours=12),
+        step=timedelta(days=1),
+    )
+    elastic = _elastic_with(full)
     result = await verify_audit_chain(elastic, "soc-ai-audit", days=7)
     assert result.ok is True
     assert result.first_broken_seq is None
@@ -800,34 +861,61 @@ async def test_verify_latest_epoch_broken_is_flagged() -> None:
 
 
 async def test_verify_cap_tallies_only_scanned_epochs() -> None:
-    """A capped scan's tally covers what it actually scanned — nothing more.
+    """A capped scan's tally covers what it actually scanned, and it scans the NEWEST.
 
-    Epoch 0 broken, epoch 1 intact, epoch 2 (never fetched — the cap fires
-    right after epoch 1) would-be intact. The tally must reflect exactly the
-    TWO epochs the scan reached: ``epochs_broken=1`` (only epoch 0),
-    ``newest_broken_epoch_start`` is epoch 0's own start (the only break), and
-    ``latest_epoch_broken`` is False because epoch 1 — the last epoch this
-    capped scan actually fetched — verified intact. This is a data-layer pin:
-    the CAVEAT that a capped scan cannot vouch for anything beyond its own
-    prefix (so a consumer must not present ``latest_epoch_broken=False`` here
-    as "the chain is currently sound" — there may be a real epoch 2 this scan
-    never saw) is a RENDERING decision, tested at the CLI/Config.tsx layer,
-    not something this function computes differently based on ``capped``.
+    Epoch 0 broken, epochs 1 and 2 intact. The walk is newest first, so a cap
+    of 6 reads epochs 2 and 1 and never reaches epoch 0. The verdict covers
+    those two epochs only, and ``capped`` says the oldest end was not read.
+    The old oldest-first walk read epoch 0 and 1 and never verified the
+    present: on a live deployment it reported an August break and never looked
+    at the current trail.
     """
     e0 = _build_chain(3, start_time=_BASE_TS)
-    e0[1]["payload"] = {"i": "tampered"}
+    e0[1]["payload"] = {"i": "tampered"}  # never fetched under the cap
     e1 = _build_chain(3, start_time=_BASE_TS + timedelta(hours=1))
-    e2 = _build_chain(3, start_time=_BASE_TS + timedelta(hours=2))  # never fetched
+    e2 = _build_chain(3, start_time=_BASE_TS + timedelta(hours=2))
     elastic = _elastic_with(e0 + e1 + e2)
     result = await verify_audit_chain(elastic, "soc-ai-audit", max_records=6)
 
     assert result.capped is True
     assert result.records_verified == 6
     assert result.epochs == 2
-    assert result.epochs_broken == 1
-    assert result.first_broken_epoch_start == e0[0]["timestamp"]
-    assert result.newest_broken_epoch_start == e0[0]["timestamp"]
+    assert result.ok is True
+    assert result.epochs_broken == 0
     assert result.latest_epoch_broken is False
+
+    # The same index without the cap finds the old break, so the cap is what
+    # hid it (the negative control for the assertion above).
+    full = await verify_audit_chain(elastic, "soc-ai-audit", max_records=None)
+    assert full.ok is False
+    assert full.first_broken_epoch_start == e0[0]["timestamp"]
+    assert full.latest_epoch_broken is False
+
+
+async def test_verify_cap_keeps_the_newest_records_of_one_long_epoch() -> None:
+    """One epoch larger than the cap: the scan verifies its NEWEST records.
+
+    This is the live shape: one epoch since the chain-head fix, longer than the
+    cap. The old walk verified seq 0 upward and stopped, so the present was
+    never checked. A break near the top of the epoch must be found under the
+    cap; a break near the bottom lies outside the capped scan.
+    """
+    records = _build_chain(50)
+    records[45]["payload"] = {"i": "tampered"}
+    elastic = _elastic_with(records)
+    result = await verify_audit_chain(elastic, "soc-ai-audit", max_records=10)
+    assert result.capped is True
+    assert result.records_verified == 10
+    assert (result.first_seq, result.last_seq) == (40, 49)
+    assert result.ok is False
+    assert result.first_broken_seq == 45
+    assert result.first_break_kind == "content_altered"
+
+    old_break = _build_chain(50)
+    old_break[5]["payload"] = {"i": "tampered"}
+    result = await verify_audit_chain(_elastic_with(old_break), "soc-ai-audit", max_records=10)
+    assert result.capped is True
+    assert result.ok is True  # seq 40..49 verify; the cut is a window boundary
 
 
 async def test_verify_tolerates_identical_timestamps_within_an_epoch() -> None:
@@ -876,17 +964,12 @@ async def test_verify_identical_timestamp_at_an_epoch_boundary_still_resolves() 
     assert result.epochs_broken >= 1
 
 
-async def test_verify_cap_can_stop_mid_epoch_after_earlier_epochs_completed() -> None:
-    """A capped scan's LAST epoch can be a genuine partial — never itself a break.
+async def test_verify_cap_can_stop_mid_epoch_after_newer_epochs_completed() -> None:
+    """A capped scan's OLDEST epoch can be a genuine partial, never itself a break.
 
-    Three epochs of 5 records each; the cap (8) lands 3 records into epoch 2.
-    ``verify_chain`` never requires a group to end on any particular record — a
-    forward-only prefix is intact by construction — so this must report
-    ``ok=True``, ``capped=True``, and ``epochs=2``: epoch 3 was never fetched at
-    all (the cap fired before reaching it), so it does not exist in the
-    returned records and is not counted. Mirrors the pre-epoch capped
-    contract (a capped scan verifies the OLDEST records) one level up: now the
-    oldest EPOCHS.
+    Three epochs of 5 records each; the cap (8) reads epoch 2 whole and the
+    newest 3 records of epoch 1. The cut is a window boundary, so its first
+    link is not checked and the partial epoch is intact. Epoch 0 is never read.
     """
     e0 = _build_chain(5, start_time=_BASE_TS)
     e1 = _build_chain(5, start_time=_BASE_TS + timedelta(hours=1))
@@ -906,32 +989,36 @@ async def test_verify_cap_can_stop_mid_epoch_after_earlier_epochs_completed() ->
 async def test_fetch_requests_timestamp_major_sort_and_excludes_legacy_docs() -> None:
     """Pins the two structural facts the epoch partition depends on.
 
-    1. The fetch sort is timestamp-major (``[{timestamp: asc}, {seq: asc}]``) —
-       epochs were written sequentially in time, and the OLD seq-major sort
-       interleaves every epoch's seq=0 first, making partition on seq alone
-       impossible (see the multi-epoch tests above for what that did to the
-       verdict).
+    1. The epoch boundaries come from a timestamp-major read of the genesis
+       records, and each epoch is then read seq-major inside its own timestamp
+       window. A seq-major read of the whole index would interleave every
+       epoch's seq=0 first (see the multi-epoch tests above).
     2. The query still filters ``exists: seq``, so legacy pre-chain docs
        (written before the hash chain existed — no ``seq`` at all) can never
        reach the partition logic. Nothing downstream has to guess what a
        seq-less record means; it structurally cannot appear.
     """
-    captured: dict[str, Any] = {}
+    captured: list[dict[str, Any]] = []
 
     class _CapturingES(_FakeES):
         async def search(self, *, index: str, body: dict[str, Any], **kw: Any) -> dict[str, Any]:
-            captured["sort"] = body.get("sort")
-            captured["query"] = body.get("query")
+            captured.append({"sort": body.get("sort"), "query": body.get("query")})
             return await super().search(index=index, body=body, **kw)
 
     elastic = _elastic_with([], fake=_CapturingES(_build_chain(3)))
-    await verify_audit_chain(elastic, "soc-ai-audit")
+    await verify_audit_chain(elastic, "soc-ai-audit", max_records=None)
 
-    assert captured["sort"] == [
-        {"timestamp": {"order": "asc"}},
-        {"seq": {"order": "asc"}},
-    ]
-    assert {"exists": {"field": "seq"}} in captured["query"]["bool"]["filter"]
+    # The boundary pass: genesis records only, timestamp-major.
+    genesis = captured[0]
+    assert genesis["sort"] == [{"timestamp": {"order": "asc"}}, {"seq": {"order": "asc"}}]
+    assert {"term": {"seq": 0}} in genesis["query"]["bool"]["filter"]
+    # Every epoch read: seq-major (the order verify_chain_detail checks in),
+    # timestamp tiebreak, never `_id`, and legacy seq-less docs filtered out.
+    epoch_reads = captured[1:]
+    assert epoch_reads
+    for call in epoch_reads:
+        assert call["sort"] == [{"seq": {"order": "asc"}}, {"timestamp": {"order": "asc"}}]
+        assert {"exists": {"field": "seq"}} in call["query"]["bool"]["filter"]
 
 
 async def test_verify_half_read_index_raises_not_intact() -> None:
@@ -1037,6 +1124,261 @@ async def test_verify_es_error_propagates() -> None:
         pytest.raises(RuntimeError, match="ES down"),
     ):
         await verify_audit_chain(elastic, "soc-ai-audit")
+
+
+# ── streaming: bounded memory, off the event loop, parity with the list walk ──
+
+
+class _Tracked(dict):  # type: ignore[type-arg]
+    """A served ``_source`` that a WeakSet can watch (a plain dict cannot be weakref'd)."""
+
+    __hash__ = object.__hash__  # identity, so the WeakSet can hold it
+
+
+class _TrackingES(_FakeES):
+    """Hands out fresh, watched copies of every record, so a test can count how
+    many served records are still alive while the verifier works."""
+
+    def __init__(self, records: list[dict[str, Any]]) -> None:
+        super().__init__(records)
+        self.live: weakref.WeakSet[_Tracked] = weakref.WeakSet()
+
+    async def search(self, *, index: str, body: dict[str, Any], **kw: Any) -> dict[str, Any]:
+        resp = await super().search(index=index, body=body, **kw)
+        for hit in resp["hits"]["hits"]:
+            tracked = _Tracked(hit["_source"])
+            self.live.add(tracked)
+            hit["_source"] = tracked
+        return resp
+
+
+async def test_verify_streams_one_page_at_a_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The verifier never holds more than one page of records.
+
+    ``soc-ai audit verify`` used to load the whole index before it hashed one
+    record, and a 1 GB container killed it (exit 137, no output). Here the
+    index holds 35 records and a page is 10, so the scan takes four pages. At
+    every page the checker receives, the served records still alive must fit
+    in one page. The old fetch-everything walk held all 35 at once.
+    """
+    from soc_ai.audit import chain as chain_mod
+
+    page = 10
+    fake = _TrackingES(_build_chain(35))
+    elastic = _elastic_with([], fake=fake)
+    held: list[int] = []
+    real_feed = chain_mod.EpochStreamChecker.feed_page
+
+    def _spy(self: Any, records: list[dict[str, Any]]) -> None:
+        gc.collect()
+        held.append(len(fake.live))
+        real_feed(self, records)
+
+    monkeypatch.setattr(chain_mod.EpochStreamChecker, "feed_page", _spy)
+    result = await verify_audit_chain(elastic, "soc-ai-audit", page_size=page, max_records=None)
+
+    assert result.ok is True
+    assert result.records_verified == 35
+    assert len(held) >= 4, f"expected more than two pages, saw {len(held)}"
+    assert max(held) <= page, f"held {max(held)} records at once; one page is {page}"
+
+
+async def test_verify_runs_its_hash_work_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every other request keeps moving while a verification runs.
+
+    The verify-chain endpoint used to stall the whole API (an /about call went
+    from 20 ms to 8 s) because the hash work ran on the event loop. The fake
+    grid below never suspends, so the only way a concurrent task gets a turn is
+    the verifier handing the hash work to a thread.
+    """
+    calls: list[str] = []
+    real_to_thread = asyncio.to_thread
+
+    async def _spy(func: Any, /, *args: Any, **kwargs: Any) -> Any:
+        calls.append(getattr(func, "__name__", repr(func)))
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", _spy)
+
+    ticks = 0
+    done = False
+
+    async def _other_request() -> None:
+        nonlocal ticks
+        while not done:
+            ticks += 1
+            await asyncio.sleep(0)
+
+    elastic = _elastic_with(_build_chain(30))
+    other = asyncio.create_task(_other_request())
+    await asyncio.sleep(0)
+    start = ticks
+    result = await verify_audit_chain(elastic, "soc-ai-audit", page_size=10, max_records=None)
+    progressed = ticks - start
+    done = True
+    await other
+
+    assert result.ok is True
+    assert "feed_page" in calls
+    assert progressed >= 3, f"a concurrent task advanced {progressed} times during the verify"
+
+
+def _forked(record: dict[str, Any], *, later: timedelta) -> dict[str, Any]:
+    """A second writer's record at the same seq: same prev_hash, own content, own valid hash."""
+    fork = {k: v for k, v in record.items() if k != "hash"}
+    fork["session_id"] = "second-writer"
+    fork["timestamp"] = (datetime.fromisoformat(record["timestamp"]) + later).isoformat()
+    fork["hash"] = compute_hash(fork, fork["prev_hash"])
+    return fork
+
+
+async def test_newest_break_detail_describes_the_newest_break() -> None:
+    """``newest_break_detail`` names the newest duplicate, not the first one again.
+
+    The live shape: one epoch, duplicated positions spread over several days.
+    The console printed the first break's sequence beside the newest break's
+    date. Here seq 10 and seq 40 are each claimed twice, hours apart.
+    """
+    records = _build_chain(50, step=timedelta(minutes=10))
+    early = _forked(records[10], later=timedelta(seconds=30))
+    late = _forked(records[40], later=timedelta(seconds=30))
+    elastic = _elastic_with([*records, early, late])
+    result = await verify_audit_chain(elastic, "soc-ai-audit", max_records=None)
+
+    assert result.ok is False
+    assert result.first_break_kind == "duplicate_seq"
+    assert "sequence 10" in (result.first_break_detail or "")
+    assert result.newest_break_kind == "duplicate_seq"
+    assert "sequence 40" in (result.newest_break_detail or "")
+    assert result.newest_break_at == late["timestamp"]
+    assert result.duplicate_seqs == 2
+    assert result.extra_records == 2
+    assert result.altered_records == 0
+    for detail in (result.first_break_detail, result.newest_break_detail):
+        assert "—" not in (detail or "") and "–" not in (detail or "")
+
+
+async def test_windowed_verdict_clears_once_the_duplicates_leave_the_window() -> None:
+    """The latest epoch is not broken forever: a 7-day window past the scar is intact.
+
+    The duplicates sit 20 days back. A whole-index scan still reports them; the
+    default 7-day window does not contain them and verifies intact.
+    """
+    now = datetime.now(UTC)
+    records = _build_chain(40, start_time=now - timedelta(days=30), step=timedelta(days=0.7))
+    fork = _forked(records[14], later=timedelta(seconds=5))  # about 20 days ago
+    elastic = _elastic_with([*records, fork])
+
+    whole = await verify_audit_chain(elastic, "soc-ai-audit", max_records=None)
+    assert whole.ok is False
+    assert whole.break_kinds == ("duplicate_seq",)
+
+    window = await verify_audit_chain(elastic, "soc-ai-audit", days=7)
+    assert window.ok is True
+    assert window.window_days == 7
+    assert window.records_verified > 0
+
+
+def test_streaming_checker_matches_the_list_walk() -> None:
+    """The streamed walk reaches the verdict and census the list walk does.
+
+    Random runs with forks, edits, deletions and relinks, fed in the seq order
+    the epoch read uses, one small page at a time.
+    """
+    import random
+
+    from soc_ai.audit.chain import EpochStreamChecker, census_chain, verify_chain_detail
+
+    rng = random.Random(20261001)
+    for trial in range(300):
+        records = _build_chain(rng.randint(1, 30), step=timedelta(minutes=1))
+        start = rng.choice([0, 0, rng.randint(0, len(records) - 1)])
+        records = records[start:]
+        extra: list[dict[str, Any]] = []
+        for rec in list(records):
+            roll = rng.random()
+            if roll < 0.05:
+                extra.append(_forked(rec, later=timedelta(seconds=rng.randint(1, 50))))
+            elif roll < 0.08:
+                rec["payload"] = {"i": "edited"}
+            elif roll < 0.10:
+                rec["prev_hash"] = "f" * 64
+        records = [r for r in records if rng.random() > 0.05] + extra
+        expect_genesis = rng.random() < 0.5
+        ordered = sorted(records, key=lambda r: (r["seq"], r["timestamp"]))
+        by_time = sorted(records, key=lambda r: (r["timestamp"], r["seq"]))
+
+        checker = EpochStreamChecker(expect_genesis=expect_genesis)
+        for i in range(0, len(ordered), 3):
+            checker.feed_page(ordered[i : i + 3])
+        checker.finish()
+
+        want = verify_chain_detail(by_time, expect_genesis=expect_genesis)
+        assert checker.first_break == want, f"trial {trial}"
+        if want is not None:
+            assert checker.census() == census_chain(by_time), f"trial {trial}"
+
+
+async def test_recorded_older_duplicate_is_named_when_it_left_the_window() -> None:
+    """An intact window says so when an older epoch has a recorded duplicate."""
+    from soc_ai.audit.verify import recorded_older_duplicate
+
+    now = datetime.now(UTC)
+    record = {
+        "kind": "audit_chain_verification",
+        "timestamp": (now - timedelta(days=1)).isoformat(),
+        "payload": {
+            "break_kinds": ["duplicate_seq"],
+            "duplicate_seqs": 6,
+            "newest_break_at": (now - timedelta(days=20)).isoformat(),
+        },
+    }
+    note = await recorded_older_duplicate(_elastic_with([record]), "soc-ai-audit", days=7)
+    assert note is not None
+    assert "older epoch has a recorded duplicate" in note
+    assert "6 duplicate sequence numbers" in note
+
+    # Inside the window, the scan itself reports it: no note.
+    record["payload"]["newest_break_at"] = (now - timedelta(days=2)).isoformat()
+    assert await recorded_older_duplicate(_elastic_with([record]), "soc-ai-audit", days=7) is None
+    # No recorded finding at all: no note.
+    assert await recorded_older_duplicate(_elastic_with([]), "soc-ai-audit", days=7) is None
+
+
+def test_duplicates_only_is_its_own_condition() -> None:
+    """Duplicates with every copy intact are not an alteration; anything else is."""
+    from soc_ai.audit.verify import is_duplicates_only
+
+    base: dict[str, Any] = {
+        "ok": False,
+        "records_verified": 10,
+        "first_broken_seq": 3,
+        "first_seq": 0,
+        "last_seq": 9,
+        "capped": False,
+        "epochs": 1,
+        "first_broken_epoch_start": "2026-09-02T00:00:00+00:00",
+        "epochs_broken": 1,
+        "newest_broken_epoch_start": "2026-09-02T00:00:00+00:00",
+        "latest_epoch_broken": True,
+    }
+    dup = ChainVerifyResult(
+        **base, duplicate_seqs=6, extra_records=6, break_kinds=("duplicate_seq",)
+    )
+    assert is_duplicates_only(dup) is True
+    edited = ChainVerifyResult(
+        **base,
+        duplicate_seqs=1,
+        altered_records=1,
+        break_kinds=("content_altered", "duplicate_seq"),
+    )
+    assert is_duplicates_only(edited) is False
+    gap = ChainVerifyResult(**base, break_kinds=("duplicate_seq", "missing_seq"))
+    assert is_duplicates_only(gap) is False
+    unknown = ChainVerifyResult(**base)
+    assert is_duplicates_only(unknown) is False
 
 
 # ── endpoint: GET /config/audit/verify-chain ───────────────────────────────────
@@ -1279,6 +1621,42 @@ def test_endpoint_passes_days_param(client: TestClient) -> None:
     assert resp.status_code == 200, resp.text
     _args, kwargs = fake.call_args
     assert kwargs["days"] == 7
+
+
+def test_endpoint_verifies_the_newest_seven_days_by_default(client: TestClient) -> None:
+    """With no ``days``, the endpoint verifies the newest 7 days and says so.
+
+    It used to read the whole index oldest first and stop at its cap on August
+    data, while the CLI said the current trail was intact.
+    """
+    fake = AsyncMock(
+        return_value=ChainVerifyResult(
+            ok=True,
+            records_verified=21000,
+            first_broken_seq=None,
+            first_seq=762325,
+            last_seq=783324,
+            capped=False,
+            epochs=1,
+            first_broken_epoch_start=None,
+            epochs_broken=0,
+            newest_broken_epoch_start=None,
+            latest_epoch_broken=False,
+            window_days=7,
+        )
+    )
+    with patch("soc_ai.audit.verify.verify_audit_chain", fake):
+        resp = client.get("/api/v1/config/audit/verify-chain")
+    assert resp.status_code == 200, resp.text
+    assert fake.call_args.kwargs["days"] == 7
+    body = resp.json()
+    assert body["window_days"] == 7
+    assert (body["first_seq"], body["last_seq"]) == (762325, 783324)
+    assert body["capped"] is False
+    assert body["older_finding"] is None
+
+    bad = client.get("/api/v1/config/audit/verify-chain?days=0")
+    assert bad.status_code == 422
 
 
 def test_endpoint_es_error_is_not_reported_as_intact(client: TestClient) -> None:

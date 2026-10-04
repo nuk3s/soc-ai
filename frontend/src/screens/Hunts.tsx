@@ -264,15 +264,32 @@ const statNoun = (s: { label: string; value: string | number }): string => {
   return label.toLowerCase();
 };
 
+/** F4: the cell and the header counted threat findings under the word
+ *  Findings, so a hunt with one finding read 0 and one with six read 1. The
+ *  cell states both counts. */
+function findingsCellText(h: HuntRow): string {
+  if (h.outcome === 'failed' || h.outcome === 'gap') return '—';
+  const total = h.findingCount ?? 0;
+  // A row recorded before the threat count existed states the total only.
+  const threats = h.threatFindingCount;
+  return threats != null && threats > 0 ? `${total} · ${threats} threat` : String(total);
+}
+
+/** The hunt a schedule last started. The server sends it beside the schedule
+ *  row, and an older server sends nothing. */
+function lastHuntOf(s: HuntSchedule): string | null {
+  return (s as HuntSchedule & { lastHuntId?: string | null }).lastHuntId ?? null;
+}
+
 function findingsCellTitle(h: HuntRow): string | undefined {
   if (h.outcome === 'failed') return 'The hunt did not run. The result is unknown.';
   // One phrase for a gap, here and on the hunt page. The two read differently
   // and an analyst had to decide whether they meant the same thing.
   if (h.outcome === 'gap')
-    return 'No threat observed · visibility gap. The hunt found no telemetry for its precondition.';
+    return 'No threat observed · visibility gap. The hunt found no telemetry of one type that its objective needs. The gap finding names the type.';
   const threats = h.threatFindingCount ?? h.findingCount;
   const other = h.findingCount - threats;
-  return other > 0 ? `${threats} threat finding${threats === 1 ? '' : 's'} · ${other} visibility gap / observation` : undefined;
+  return other > 0 ? `${threats} threat finding${threats === 1 ? '' : 's'} · ${other} other finding${other === 1 ? '' : 's'}: visibility gaps and observations` : undefined;
 }
 
 function StatusDot({
@@ -512,9 +529,26 @@ function ScheduledHunts() {
                   <div className="truncate text-[13px] text-text">{s.objective}</div>
                   <div className="mt-0.5 text-[11.5px] text-faint">
                     every {intervalLabel(s.intervalMinutes)}
-                    {s.lastRunAt
-                      ? ` · last ran ${new Date(s.lastRunAt).toLocaleString()}`
-                      : ' · never run'}
+                    {/* F17: "last ran" was plain text. It links the hunt the
+                        schedule started when the store still holds it. */}
+                    {s.lastRunAt ? (
+                      <>
+                        {' · last ran '}
+                        {lastHuntOf(s) ? (
+                          <Link
+                            data-testid={`schedule-last-hunt-${s.id}`}
+                            to={`/hunts/${encodeURIComponent(lastHuntOf(s) ?? '')}`}
+                            className="underline hover:text-accent"
+                          >
+                            {new Date(s.lastRunAt).toLocaleString()}
+                          </Link>
+                        ) : (
+                          new Date(s.lastRunAt).toLocaleString()
+                        )}
+                      </>
+                    ) : (
+                      ' · never run'
+                    )}
                   </div>
                 </div>
                 <div className="flex flex-none items-center gap-2">
@@ -830,7 +864,12 @@ export function Hunts() {
         : '';
     return [
       { label: 'Hunts', value: rows.length, sub: 'in window', detail: byKind ? `(${byKind})` : '' },
-      { label: 'Findings', value: rows.reduce((n, h) => n + (h.threatFindingCount ?? h.findingCount ?? 0), 0), sub: 'threat findings', detail: '' },
+      {
+        label: 'Findings',
+        value: rows.reduce((n, h) => n + (h.findingCount ?? 0), 0),
+        sub: `${rows.reduce((n, h) => n + (h.threatFindingCount ?? h.findingCount ?? 0), 0)} threat`,
+        detail: '',
+      },
       { label: 'In progress', value: rows.filter((h) => h.status === 'running').length, sub: 'running now', detail: '' },
     ];
   }, [visible, kind]);
@@ -1212,7 +1251,7 @@ export function Hunts() {
                   <div key={s.id} className="flex items-center gap-2 py-[3px]">
                     <X size={12} className="flex-none text-faint" />
                     <span className="min-w-0 truncate text-dim">{s.id}</span>
-                    <span className="flex-none text-faint">— {rehuntSkipReason(s.reason)}</span>
+                    <span className="flex-none text-faint">{rehuntSkipReason(s.reason)}</span>
                   </div>
                 ))}
               </div>
@@ -1347,11 +1386,11 @@ export function Hunts() {
                   </span>
                 )}
               </div>
-              <div className="truncate text-[12px] text-dim" title="The class that started this hunt.">
+              <div className="truncate text-[12px] text-dim" title="Who or what started this hunt.">
                 {starterText(h)}
               </div>
               <div className="text-[13px] tabular-nums text-text-2" title={findingsCellTitle(h)}>
-                {h.outcome === 'failed' || h.outcome === 'gap' ? '—' : (h.threatFindingCount ?? h.findingCount)}
+                {findingsCellText(h)}
               </div>
               <div className="text-[13px] tabular-nums text-text-2">{h.affectedHosts}</div>
               <div>

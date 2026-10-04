@@ -2,12 +2,13 @@ import { Bell, BookOpen, ChevronsLeft, Crosshair, History, Info, LayoutDashboard
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { getAlerts, getConfig, getInvestigations, listDossiers, signOut } from '../lib/api';
+import { getAlerts, getConfig, getInvestigations, listMachines, signOut } from '../lib/api';
 import { buildConfigLayout, keyToSectionId } from '../lib/configLayout';
 import type { ConfigParent } from '../lib/configLayout';
-import { roleLabel, scalarOf } from '../lib/hostDossier';
-import { searchEntities } from '../lib/paletteSearch';
-import type { AlertGroup, DossierRow, InvestigationRow } from '../lib/types';
+import { machineHref } from '../lib/hostsList';
+import { machineHitLabel, searchEntities } from '../lib/paletteSearch';
+import type { AlertGroup, InvestigationRow, MachineRow } from '../lib/types';
+import { isSignedOut, useSession } from './Session';
 import { useShell } from './ShellContext';
 
 interface Command {
@@ -81,6 +82,9 @@ const FOCUSABLE =
 export function CommandPalette() {
   const { paletteOpen, openPalette, closePalette, togglePalette, collapsed, toggleNav, pushModal, popModal } =
     useShell();
+  // With sign-in off there is no session to end. Sign out stranded the analyst
+  // on a login page with no credentials to use (RD2).
+  const signedOut = isSignedOut(useSession().me);
   const navigate = useNavigate();
   const [q, setQ] = useState('');
   const [idx, setIdx] = useState(0);
@@ -133,20 +137,24 @@ export function CommandPalette() {
       { group: 'View', label: 'My queue', icon: <Triangle size={15} />, run: go('/alerts?view=mine') },
       { group: 'View', label: 'Critical alerts', icon: <Triangle size={15} />, run: go('/alerts?view=critical') },
       { group: 'View', label: 'Needs decision', icon: <Triangle size={15} />, run: go('/alerts?view=decision') },
-      {
-        group: 'Account',
-        label: 'Sign out',
-        icon: <Triangle size={15} />,
-        // Destroy the server session — not just a client-side route change
-        // (which would leave the session cookie alive). Shared with the sidebar.
-        run: () => {
-          closePalette();
-          void signOut(navigate);
-        },
-      },
+      ...(signedOut
+        ? []
+        : ([
+            {
+              group: 'Account',
+              label: 'Sign out',
+              icon: <Triangle size={15} />,
+              // Destroy the server session — not just a client-side route change
+              // (which would leave the session cookie alive). Shared with the sidebar.
+              run: () => {
+                closePalette();
+                void signOut(navigate);
+              },
+            },
+          ] satisfies Command[])),
     ];
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [collapsed, navigate, closePalette, toggleNav]);
+  }, [collapsed, navigate, closePalette, toggleNav, signedOut]);
 
   // Entity corpus for the search half of "Search or jump to": fetched once per
   // palette open (fail-soft — a fetch error just means command-only results).
@@ -161,11 +169,11 @@ export function CommandPalette() {
   const [layout, setLayout] = useState<ConfigParent[] | null>(null);
   const configRequested = useRef(false);
 
-  // Hosts are searched SERVER-side per keystroke — the dossier list has a real
-  // `q` over IP + hostname, and the host table can exceed any one-shot corpus
-  // (MAX_LIST_LIMIT is 200; the lab grid alone holds 234). 150ms debounce,
-  // fail-soft like the other corpora.
-  const [hostRows, setHostRows] = useState<DossierRow[]>([]);
+  // Hosts are searched SERVER-side per keystroke, through the same machine
+  // search the Hosts list uses, so the palette and the list give one answer
+  // (dogfood 2026-10-02, U7). The search reads every machine, quiet ones too.
+  // 150ms debounce, fail-soft like the other corpora.
+  const [hostRows, setHostRows] = useState<MachineRow[]>([]);
   useEffect(() => {
     if (!paletteOpen || q.trim().length < 2) {
       setHostRows([]);
@@ -173,7 +181,7 @@ export function CommandPalette() {
     }
     let alive = true;
     const t = setTimeout(() => {
-      listDossiers({ q: q.trim(), limit: 8 })
+      listMachines({ q: q.trim(), limit: 8 })
         .then((res) => {
           if (alive) setHostRows(res.rows);
         })
@@ -196,20 +204,15 @@ export function CommandPalette() {
       : commands;
     // IP → host page is the analyst's primary pivot, so host hits sit ahead of
     // investigation/alert entity hits.
-    const hostCmds = hostRows.map<Command>((h) => {
-      const hostname = scalarOf(h.fields, 'hostname');
-      const rawRole = scalarOf(h.fields, 'role');
-      const role = rawRole && rawRole.toLowerCase() !== 'unknown' ? roleLabel(rawRole) : null;
-      return {
-        group: 'Hosts',
-        label: `${h.ip}${hostname ? ` — ${hostname}` : ''}${role ? ` · ${role}` : ''}`,
-        icon: <Server size={15} />,
-        run: () => {
-          closePalette();
-          navigate(`/hosts/${h.ip}`);
-        },
-      };
-    });
+    const hostCmds = hostRows.map<Command>((h) => ({
+      group: 'Hosts',
+      label: machineHitLabel(h),
+      icon: <Server size={15} />,
+      run: () => {
+        closePalette();
+        navigate(machineHref(h.key));
+      },
+    }));
     const entities = searchEntities(q, invs, groups).map<Command>((h) => ({
       group: h.group,
       label: h.label,

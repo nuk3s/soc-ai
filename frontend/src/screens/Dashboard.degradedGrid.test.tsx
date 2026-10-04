@@ -89,6 +89,9 @@ describe('Dashboard awaiting-investigation tile — unknown is not zero', () => 
     expect(tile.textContent).not.toContain('queue clear');
     // …and no number is asserted either, since none was read.
     expect(tile.textContent).not.toMatch(/\d/);
+    // The error card names the read that failed. The rest of the page loaded.
+    expect(await screen.findByText('Could not load the alert counts')).toBeTruthy();
+    expect(screen.queryByText('Could not load the dashboard')).toBeNull();
   });
 
   it('still says queue clear when the queue really was read and really is empty', async () => {
@@ -101,6 +104,8 @@ describe('Dashboard awaiting-investigation tile — unknown is not zero', () => 
     vi.mocked(getAlerts).mockResolvedValue(queueOf([untriagedGroup]));
     await mount();
     expect(await screen.findByText(/triage from Alerts/i)).toBeTruthy();
+    // One group reads as one group. The header said "1 detection groups".
+    expect(screen.getByText('1 detection group')).toBeTruthy();
   });
 
   it('keeps the calm caption when the probe is degraded but this read succeeded', async () => {

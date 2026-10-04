@@ -660,9 +660,12 @@ def test_route_returns_query_shape_with_honest_counts(client: TestClient) -> Non
     # A run that ended without a verdict renders 'untriaged' — unchanged row shape.
     assert all(r["verdict"] == "untriaged" for r in body["rows"])
 
-    # Unknown filter members are DROPPED (a mangled deep link must not 500 or
-    # wedge the filter): 'bogus' alone means unfiltered.
-    assert client.get("/api/v1/investigations?status=bogus&limit=200").json()["total"] == 124
+    # An unknown filter member is refused with the accepted values. Dropping it
+    # read 'bogus' as unfiltered and answered with the whole total (fleet A4).
+    bogus = client.get("/api/v1/investigations?status=bogus&limit=200")
+    assert bogus.status_code == 422
+    assert bogus.json()["detail"]["reason"] == "bad_filter"
+    assert "running" in bogus.json()["detail"]["hint"]
 
     # Paging: second page picks up where the first stopped.
     p1 = client.get("/api/v1/investigations?limit=100&offset=0").json()
@@ -1177,14 +1180,15 @@ def test_error_state_says_so_when_the_set_outgrew_one_page(client: TestClient, m
     assert whole["partial"] is False
 
 
-def test_unknown_error_state_is_dropped_not_rejected(client: TestClient) -> None:
-    """A mangled deep link degrades to the broader query, the way an unknown
-    verdict member already does. It must never wedge the list behind a 4xx."""
+def test_unknown_error_state_is_refused(client: TestClient) -> None:
+    """An unknown error_state used to read as no filter and answer with the
+    whole set (fleet A4). The console cleans its deep links first, so the
+    server refuses what is left with the accepted values."""
     _pipeline_error_fixture(client)
 
     resp = client.get("/api/v1/investigations?verdict=pipeline_error&error_state=bogus")
-    assert resp.status_code == 200
-    assert resp.json()["total"] == 4
+    assert resp.status_code == 422
+    assert "live, handled" in resp.json()["detail"]["hint"]
 
 
 def test_error_state_leaves_an_ordinary_list_query_alone(client: TestClient) -> None:

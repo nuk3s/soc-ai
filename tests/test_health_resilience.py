@@ -69,6 +69,8 @@ def test_hanging_es_probe_is_bounded_and_reads_as_down(monkeypatch):
     probed = asyncio.run(go())
     assert probed["es"]["ok"] is False
     assert "soc-ai treats it as down." in probed["es"]["detail"]
+    # The detail is a sentence an operator reads: capital start, product name.
+    assert probed["es"]["detail"].startswith("Elasticsearch did not answer the probe")
     assert probed["llm"]["ok"] is True
 
 

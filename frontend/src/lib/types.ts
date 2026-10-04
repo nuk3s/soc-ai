@@ -370,7 +370,10 @@ export interface Investigation {
   // drawer omits these). Optional so investigations without them degrade cleanly.
   sev?: Severity;
   alert?: AlertMeta;
+  /** Pooled over both ends of the alert. Read hostContexts when it is present. */
   hostContext?: HostSignal[];
+  /** One entry per end of the alert, named, with its alerts split by side. */
+  hostContexts?: HostContextEnd[];
   meta?: InvMeta;
   /** Structured Oracle (2nd-opinion) adjudication — present only when Oracle was consulted. */
   oracle?: OracleAdjudication | null;
@@ -378,6 +381,13 @@ export interface Investigation {
   graphNote?: string;
   /** Unresolved gaps from a needs_more_info verdict — seeds the resolve-in-chat flow. */
   openQuestions?: string[];
+  /** The report's citations with their type. An `id` citation names a document
+   *  the page links to the event drawer. */
+  citations?: InvestigationCitation[];
+  /** Why an errored run failed, from its recorded `error` event. */
+  failure?: InvestigationFailure | null;
+  /** The id of a later run that replaced this one, when there is one. */
+  supersededBy?: string | null;
   /** Manual or chat provenance — present when the AI verdict was overridden. */
   resolution?: ResolutionProvenance;
   /** Post-validator override note — present when a validator auto-corrected the verdict. */
@@ -401,6 +411,22 @@ export interface Investigation {
   /** synthetic-evaluation marker (migration 0032): this run investigated PLANTED
    * synthetic attack scenarios — badged so it can never be read as real activity. */
   isSynthEval?: boolean;
+}
+
+/** One citation of the report. `kind` is 'id', 'run', 'path', 'tool' or 'unknown'. */
+export interface InvestigationCitation {
+  text: string;
+  kind: string;
+  target?: string | null;
+  /** The validator's answer. Null when the run recorded no validation. */
+  resolved?: boolean | null;
+}
+
+/** The recorded cause of a failed run. `permanent`: a re-run cannot change it. */
+export interface InvestigationFailure {
+  cause: string;
+  hint?: string | null;
+  permanent: boolean;
 }
 
 /** The triggering detection's raw facts — the "what fired" reference panel. */
@@ -571,6 +597,9 @@ export interface HuntFinding {
    *  joined them, and it is always the head of `detail`. Absent on a model's
    *  finding and on catalog hunts recorded before the field existed. */
   specRationale?: string | null;
+  /** The analytic an analyst drafted from this finding, while it is not
+   *  retired. The card links it and offers no second draft. */
+  analyticId?: string | null;
   /** Documents this candidate matched, for the "3 of 4 matching documents"
    *  note beside the citation chips (a bucket cites at most three ids).
    *  Absent on a gap finding, which counted no candidate documents. */
@@ -695,6 +724,14 @@ export interface HuntDetailData {
   isSynthEval?: boolean;
 }
 
+export interface HostContextEnd {
+  ip: string;
+  /** Which end of the alert this host is: "source" or "destination". */
+  end: string;
+  asSource: HostSignal[];
+  asDestination: HostSignal[];
+}
+
 export interface HostSignal {
   time: string;
   label: string;
@@ -739,6 +776,9 @@ export interface EntityDetail {
   kind: EntityValueKind;
   timeline: EntityTimelineItem[];
   summary: EntitySummary;
+  /** The address of the one host the dossier knows by this name. Null when no
+   *  host, or more than one, answers to it. Absent from an older server. */
+  host_ip?: string | null;
 }
 
 // ---- Config ----------------------------------------------------------------
@@ -1010,6 +1050,13 @@ export interface Backtest {
   results: BacktestResults | null;
   status: BacktestRunStatus | null;
   sampled: number | null;
+  /** The newest attempt when it started no run. It sits beside the stored run
+   *  and never changes it: a note merged onto the old run read as that run's
+   *  own note (fleet 2026-10-01, RO11). */
+  refused?: { reason: string; hint: string } | null;
+  /** How many alerts the operator asked for, and why fewer were replayed. */
+  requested?: number | null;
+  skipped_reason?: string | null;
 }
 
 export interface StartBacktestOpts {
@@ -1125,6 +1172,11 @@ export interface DossierFieldBrief {
   reason: DossierUnresolvedReason | null;
   overridden: boolean;
   conflict_kind: DossierConflictKind | null;
+  /** The sweep's guess underneath a withheld answer, so a list row can name it.
+   *  Absent from an older server. */
+  inferred_value?: string | null;
+  /** Last build that EVALUATED this field. A stale row states its age from it. */
+  last_run_at?: string | null;
 }
 
 /** One resolved field with BOTH lanes and the evidence behind them. The
@@ -1146,6 +1198,10 @@ export interface DossierField extends DossierFieldBrief {
   inferred_value_json: unknown;
   inferred_confidence: number | null;
   inferred_source: DossierProvenance | null;
+  /** Why the inference lane alone does not resolve, or null when it does.
+   *  Under a declaration it says what removing the declaration leaves.
+   *  Absent from an older server. */
+  inference_reason?: DossierUnresolvedReason | null;
   conflict: DossierConflict | null;
 }
 
@@ -1202,6 +1258,10 @@ export interface Dossier extends DossierRow {
    *  different builds of the same host. Empty for a host never profiled;
    *  absent from an older backend, which the page reads as empty. */
   profile?: ProfileDimension[];
+  /** The other keys this machine is stored under: its strong hostnames, and a
+   *  first label no other host shares. Observations and leads written under the
+   *  host name belong on this page. Absent from an older server. */
+  aliases?: string[];
 }
 
 export interface DossierList {
@@ -1269,9 +1329,20 @@ export interface DossierSummary {
    *  no bucket, so the values need not sum to `hosts`: the difference is the
    *  unresolved remainder the distribution bar draws in gray. */
   roles: Record<string, number>;
-  /** Hosts whose inferred role is below the confidence gate (or stale) with no
-   *  operator value — 'possibly …' on the host page, unscored by role-scoped hunts. */
+  /** Hosts whose inferred role is fresh but below the confidence gate, with no
+   *  operator value. Unscored by role-scoped hunts. The role filter
+   *  `__low_confidence__` lists the same set on the server. */
   roles_low_confidence?: number;
+  /** Hosts whose inferred role is older than the staleness window, with no
+   *  operator value. The role filter `__stale__` lists them. */
+  roles_stale?: number;
+  /** Hosts with a clean build older than the staleness window. */
+  stale_hosts?: number;
+  /** Hosts whose agent was reporting at the last build, where that build is
+   *  older than the staleness window. Not in `reporting`. */
+  reporting_stale?: number;
+  /** The staleness window the counts apply, in hours. */
+  staleness_hours?: number;
   /** The newest build stamp in the table; null when nothing has ever been swept. */
   last_built_at: string | null;
   /** Whether sweeps run on a schedule. Off by default, in which case these
@@ -1292,6 +1363,148 @@ export interface DossierRefreshStatus {
   last_run: string | null;
   last_summary: Record<string, unknown> | null;
   note: string | null;
+}
+
+// ---- Machines (GET /api/v1/hosts) --------------------------------------------
+// One row per MACHINE: a set of addresses soc-ai holds to be one device. The
+// per-address dossier above stays; a machine sits on top of it. Mirrors the
+// machine API contract (docs/dev/specs/2026-10-02-host-identity-design.md).
+
+/** The columns the machine list sorts on. `address` sorts numerically. */
+export type MachineSortKey =
+  | 'name'
+  | 'address'
+  | 'role'
+  | 'agent'
+  | 'events'
+  | 'first_seen'
+  | 'last_seen';
+
+export type SortDir = 'asc' | 'desc';
+
+/** Where the machine name came from, strongest first. */
+export type MachineNameSource = 'declared' | 'agent' | 'dhcp' | 'dns' | 'ntlm' | 'other';
+
+/** The role state the server resolved. `low_confidence` and `stale` carry the
+ *  withheld `guess`; `unknown` carries nothing. */
+export type MachineRoleState = 'declared' | 'inferred' | 'low_confidence' | 'stale' | 'unknown';
+
+export interface MachineAgent {
+  id: string;
+  name: string;
+  os: string | null;
+  last_report: string | null;
+}
+
+export interface MachineRole {
+  value: string | null;
+  label: string | null;
+  confidence: number | null;
+  state: MachineRoleState;
+  guess: string | null;
+  /** For a stale role: the age of the evidence, in hours. */
+  stale_hours: number | null;
+}
+
+export interface MachineFlags {
+  declared: boolean;
+  conflict: boolean;
+  broken: boolean;
+  new: boolean;
+  rebound: boolean;
+}
+
+export interface MachineName {
+  value: string;
+  source: string;
+}
+
+/** Fields a list row and the machine page share. */
+interface MachineBase {
+  key: string;
+  href: string;
+  name: string | null;
+  name_source: MachineNameSource | null;
+  names: MachineName[];
+  primary_ip: string;
+  address_count: number;
+  container_count: number;
+  agent: MachineAgent | null;
+  role: MachineRole;
+  events: number;
+  first_seen: string | null;
+  last_seen: string | null;
+  flags: MachineFlags;
+}
+
+/** One machine in the list. `addresses` holds the first five, primary first. */
+export interface MachineRow extends MachineBase {
+  addresses: string[];
+}
+
+export interface MachineList {
+  rows: MachineRow[];
+  /** Machines that match, not the length of the page. */
+  total: number;
+  limit: number;
+  offset: number;
+  sort: MachineSortKey;
+  dir: SortDir;
+}
+
+/** The cards above the list. Each count equals the `total` of the list call
+ *  with the matching filter and `activity=all`. */
+export interface MachineSummary {
+  machines: number;
+  addresses: number;
+  with_agent: number;
+  without_agent: number;
+  new_7d: number;
+  named: number;
+  unnamed: number;
+  /** Machines per role slug, plus the `unknown`, `low_confidence` and `stale`
+   *  buckets. */
+  roles: Record<string, number>;
+  needs_attention: number;
+  conflicts: number;
+  never_built: number;
+  last_sweep_at: string | null;
+  stale_hours: number | null;
+}
+
+export interface MachineResolve {
+  key: string;
+  primary_ip: string;
+  matched: 'address' | 'name' | 'mac' | 'agent';
+}
+
+/** How soc-ai tied an address to its machine. */
+export type MachineAddressKind = 'agent' | 'dhcp' | 'name' | 'network';
+
+export interface MachineAddress {
+  ip: string;
+  kind: MachineAddressKind;
+  primary: boolean;
+  first_seen: string | null;
+  last_seen: string | null;
+  events: number;
+}
+
+export interface MachineContainer {
+  ip: string;
+  first_seen: string | null;
+  last_seen: string | null;
+  events: number;
+}
+
+/** One machine: every address, the containers, and the dossier of the primary
+ *  address. */
+export interface MachineDetail extends MachineBase {
+  addresses: MachineAddress[];
+  containers: MachineContainer[];
+  macs: string[];
+  merged_from: string[];
+  dossier: Dossier;
 }
 
 // ---- Host activity (live half of the host page) -----------------------------

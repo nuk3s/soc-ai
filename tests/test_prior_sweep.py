@@ -527,6 +527,41 @@ async def test_the_profile_state_reaches_the_trail_past_the_per_entity_read(
     await engine.dispose()
 
 
+async def test_the_trail_records_the_status_each_analytic_ran_under(
+    settings_kratos: Settings,
+) -> None:
+    """``record_sweep`` defaulted ``shadow`` to True and the sweep never passed
+    it, so every trail row of a live prior said shadow and the catalog showed
+    every live prior as a shadow one. The trail carries the spec's real status.
+    """
+    from soc_ai.store.models import PriorSpecRun
+    from sqlalchemy import select
+
+    engine, maker = await _db(settings_kratos)
+    await _seed_host(maker, role="network_device", operator=True, confidence=0.0)
+    await _seed_profile(maker, vector={"22": {"count": 40}})
+
+    catalog = _prior()
+    spec = catalog["prior-under-test"]
+    catalog["prior-in-shadow"] = spec.model_copy(update={"id": "prior-in-shadow"})
+
+    es = _FakeES(recent={_SWITCH: {"445": 6}})
+    async with maker() as db:
+        await run_prior_sweep(
+            elastic=es,
+            settings=_settings_like(settings_kratos),
+            db=db,
+            catalog=catalog,
+            record=True,
+            shadow_ids=frozenset({"prior-in-shadow"}),
+        )
+        runs = {r.spec_id: r for r in (await db.execute(select(PriorSpecRun))).scalars().all()}
+
+    assert runs["prior-under-test"].shadow is False
+    assert runs["prior-in-shadow"].shadow is True
+    await engine.dispose()
+
+
 async def test_a_no_baseline_prior_records_at_finding_weight(
     settings_kratos: Settings,
 ) -> None:
@@ -635,6 +670,75 @@ async def test_the_recent_read_scopes_outbound_ports_like_the_baseline(
         if "range" in c and "destination.port" in c["range"]
     ]
     assert bounds and bounds[0]["lt"] == 49152
+
+
+async def test_the_served_port_read_keeps_to_the_estate(
+    settings_kratos: Settings,
+) -> None:
+    """H5, RO19. The served-port read keys on ``destination.ip`` and had no
+    estate filter. Every internet address the estate reached became an entity
+    and a blind row, and the read filled its cap with them.
+
+    The negative control is an external address in the read's answer. The fake
+    grid ignores the query, so the address reaches the sweep and the sweep
+    itself must drop it. A census host outside the CIDRs stays.
+    """
+    import ipaddress
+
+    from soc_ai.store.models import HostDossier
+
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        db.add(HostDossier(host_key="198.51.100.20", ip="198.51.100.20"))
+        await db.commit()
+    # A baseline under every address, so each result names its entity.
+    for key in ("192.0.2.10", "198.51.100.20", "203.0.113.9"):
+        await _seed_profile(maker, vector={"22": {"count": 40}}, entity_key=key)
+    es = _FakeES(
+        recent={
+            "192.0.2.10": {"445": 6},
+            "198.51.100.20": {"22": 4},
+            "203.0.113.9": {"443": 9},
+        }
+    )
+    async with maker() as db:
+        sweep = await run_prior_sweep(
+            elastic=es,
+            settings=_settings_like(settings_kratos),
+            db=db,
+            catalog=_prior(),
+            cidrs=[ipaddress.ip_network("192.0.2.0/24")],
+        )
+    await engine.dispose()
+
+    scored = {r.entity_key for r in sweep.results}
+    assert "203.0.113.9" not in scored
+    assert scored == {"192.0.2.10", "198.51.100.20"}
+    reads = [q for keys, q in es.reads if "served_ports" in keys]
+    assert reads, "the sweep issued no served-port read"
+    clauses = [
+        c["terms"]["destination.ip"]
+        for c in reads[0]["bool"]["filter"]
+        if "terms" in c and "destination.ip" in c["terms"]
+    ]
+    assert clauses == [["192.0.2.0/24", "198.51.100.20"]]
+
+
+async def test_with_no_estate_configured_the_recent_read_fails_open(
+    settings_kratos: Settings,
+) -> None:
+    """An unconfigured estate is unknown. Dropping everything would report a
+    busy grid as silent, so no address is filtered."""
+    engine, maker = await _db(settings_kratos)
+    for key in ("192.0.2.10", "203.0.113.9"):
+        await _seed_profile(maker, vector={"22": {"count": 40}}, entity_key=key)
+    es = _FakeES(recent={"192.0.2.10": {"445": 6}, "203.0.113.9": {"443": 9}})
+    async with maker() as db:
+        sweep = await run_prior_sweep(
+            elastic=es, settings=_settings_like(settings_kratos), db=db, catalog=_prior()
+        )
+    await engine.dispose()
+    assert {r.entity_key for r in sweep.results} == {"192.0.2.10", "203.0.113.9"}
 
 
 async def test_the_recent_read_asks_for_the_documents_behind_each_member(

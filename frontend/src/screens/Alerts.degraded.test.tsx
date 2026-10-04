@@ -315,7 +315,7 @@ describe('Alerts on a healthy grid with nothing in the window (D2 control)', () 
 
   it('still says zero, because a quiet shift is a real answer', async () => {
     mount();
-    await screen.findByText('No detection matches this view in this window. Widen the time range.');
+    await screen.findByText('No open detection in this window. The list hides acknowledged and escalated groups. Widen the time range.');
 
     expect(headerLine()).toBe('0 untriaged · 0 detections · 0 events in window');
     expect(footerLine()).toBe('0 detections · grouped · click a row to expand events');
@@ -365,10 +365,10 @@ describe('Alerts telling a quiet grid apart from a filter that matched nothing',
     // the night it means something.
     vi.mocked(getAlertsEmptyReason).mockResolvedValue({
       reason: 'quiet',
-      hint: 'No alert label matches anything in this window. The grid is quiet, not misconfigured.',
+      hint: 'No alert label matches anything in this window. The grid is quiet. The configuration is sound.',
     });
     mount();
-    await screen.findByText('No detection matches this view in this window. Widen the time range.');
+    await screen.findByText('No open detection in this window. The list hides acknowledged and escalated groups. Widen the time range.');
     expect(screen.queryByText(literal(MISMATCH))).toBeNull();
   });
 
@@ -379,7 +379,7 @@ describe('Alerts telling a quiet grid apart from a filter that matched nothing',
     // show would still leave the sentence on screen.
     vi.mocked(getAlertsEmptyReason).mockRejectedValue(gridDown());
     mount();
-    const zero = await screen.findByText('No detection matches this view in this window. Widen the time range.');
+    const zero = await screen.findByText('No open detection in this window. The list hides acknowledged and escalated groups. Widen the time range.');
     expect(screen.queryByText("Could not load this view")).toBeNull();
     expect(zero.parentElement?.getAttribute('data-empty-reason')).toBe('unchecked');
   });

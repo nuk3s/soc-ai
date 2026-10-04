@@ -618,26 +618,61 @@ class SoCase(BaseModel):
     raw: dict[str, Any] = Field(default_factory=dict, exclude=True)
 
     @classmethod
-    def from_so_doc(cls, doc: dict[str, Any]) -> SoCase:
-        """Construct from a raw SOC API case JSON object.
+    def from_so_doc(cls, doc: dict[str, Any], *, doc_id: str | None = None) -> SoCase:
+        """Construct from a raw SOC API case JSON object or an ``so-case*`` document.
 
         Read through :func:`_first` for the same reason
         :meth:`SoAlert.from_es_hit` is: ``query_cases`` reads these off the
         grid's own ``so-case*`` index, which carries no scalar guarantee.
+
+        Security Onion 3.3 nests the case under ``so_case.*`` (the same shape
+        as ``so_detection.*``) and the index document carries no top-level
+        ``id``. The old ``doc["id"]`` read raised KeyError on every case, and
+        the MCP ``cases`` tool and ``t_query_cases`` crashed with it (dogfood
+        2026-10-01 RA4). The id comes from ``so_case.id``, then ``id``, then
+        the hit's ``_id`` (``doc_id``). Every other field is optional.
+
+        Raises ValueError when no id can be found at all.
         """
+        nested = doc.get("so_case")
+        case: dict[str, Any] = nested if isinstance(nested, dict) else doc
+
+        def field(name: str) -> Any:
+            value = _first(case.get(name))
+            if value is None and case is not doc:
+                value = _first(doc.get(name))
+            return value
+
+        case_id = field("id") or doc_id or _first(doc.get("_id"))
+        if not case_id:
+            raise ValueError("the case document carries no id")
         return cls(
-            id=_first(doc["id"]),
-            title=_first(doc.get("title")) or "",
-            description=_first(doc.get("description")),
-            status=_first(doc.get("status")) or "unknown",
-            severity=_first(doc.get("severity")),
-            priority=_first(doc.get("priority")),
-            assignee_id=_first(doc.get("assigneeId")),
-            tags=_as_str_list(doc.get("tags")),
-            created=_parse_iso(_first(doc.get("createTime"))),
-            updated=_parse_iso(_first(doc.get("updateTime"))),
+            id=str(case_id),
+            title=str(field("title") or ""),
+            description=field("description"),
+            status=str(field("status") or "unknown"),
+            severity=field("severity"),
+            priority=field("priority"),
+            assignee_id=field("assigneeId"),
+            tags=_as_str_list(case.get("tags") if "tags" in case else doc.get("tags")),
+            created=_parse_iso(field("createTime")),
+            updated=_parse_iso(field("updateTime")),
             raw=doc,
         )
+
+
+class CaseReadError(BaseModel):
+    """A ``so-case*`` document that :meth:`SoCase.from_so_doc` could not read.
+
+    ``query_cases`` returns one of these in the case's place, so one malformed
+    document costs one entry and never the whole search.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    error: str = "unreadable_case"
+    id: str | None = None
+    reason: str
 
 
 class SoDetection(BaseModel):

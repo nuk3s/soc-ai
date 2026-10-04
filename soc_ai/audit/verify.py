@@ -7,13 +7,16 @@ the date-stamped audit indices (``{audit_index_alias}-*``) and runs them through
 :func:`verify_chain`, so a ``soc-ai audit verify`` CLI run and the admin
 ``GET /config/audit/verify-chain`` endpoint share one ES-fetch path.
 
-Paging: the chain can be large (one record per LLM I/O + tool call), so a single
-``size`` search would hit ES's 10 000-hit ``from``+``size`` ceiling. We page with
-``search_after`` on ``timestamp`` ascending (``seq`` tiebreak — see "Epochs"
-below for why), which has no window limit, and stop when a page returns fewer
-than the page size. A ``max_records`` safety cap bounds a pathological run; if
-it is hit we set ``capped=True`` and the caller MUST surface it (a capped scan
-cannot claim the whole chain was verified). We never silently truncate.
+Paging: the chain can be large (one record per LLM I/O + tool call; a live
+deployment passed 780 000 records in its newest epoch). The verifier streams:
+one pass reads the genesis timestamps (the epoch boundaries), then each epoch is
+paged with ``search_after`` in ``seq`` order and checked one page at a time
+(:class:`~soc_ai.audit.chain.EpochStreamChecker`). Memory holds one page, never
+the trail: the old fetch-everything-then-verify shape was SIGKILLed inside a
+1 GB container. The hash work runs in a worker thread, so the event loop keeps
+serving every other request. Epochs are walked NEWEST first, so a
+``max_records`` bound drops the oldest records and never the present; when it
+bites, ``capped=True`` and the caller MUST surface it.
 
 Time window: ``days=N`` bounds the scan to records with ``timestamp >= now-Nd``
 (the audit field is ``timestamp``; ``verify_chain`` still checks that ``seq`` is
@@ -68,12 +71,13 @@ that actually answers "am I sound right now".
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from soc_ai.audit.chain import GENESIS_SEQ, ChainCensus, census_chain, verify_chain_detail
+from soc_ai.audit.chain import GENESIS_SEQ, EpochStreamChecker
 from soc_ai.so_client.elastic import (
     ElasticClient,
     GridPartialResultsError,
@@ -119,15 +123,10 @@ class ChainVerifyResult:
       single-epoch case consumers already render ("seq X..Y"), and the
       multi-epoch verdict deliberately doesn't feature them (see each
       consumer's amber-branch wording).
-    - ``capped`` — True iff the ``max_records`` cap was hit, so the scan did NOT
-      reach the end of the chain (``ok`` then covers only the fetched prefix —
-      now the oldest EPOCHS, not just the oldest records; see
-      :func:`_fetch_audit_records`). The blast-radius fields below (
-      ``epochs_broken``, ``newest_broken_epoch_start``, ``latest_epoch_broken``)
-      cover only what was actually scanned when capped — a consumer must not
-      read a clean tail among the scanned epochs as proof the chain is
-      currently sound; there may be more, unseen, past the cap (the cap always
-      truncates the NEWEST end, since the fetch is oldest-first).
+    - ``capped`` — True iff the ``max_records`` bound was hit, so the scan did
+      NOT reach the OLDEST end of the window (the walk is newest first, so the
+      present is always covered). The blast-radius fields cover only what was
+      scanned.
     - ``epochs`` — count of epochs found in the fetched set (0 for an empty
       scan, 1 for an ordinary unbroken chain or a windowed scan that never
       crosses a restart boundary, >1 once more than one process incarnation is
@@ -159,7 +158,10 @@ class ChainVerifyResult:
       position claimed twice by two writers and a record whose content was
       edited after the fact, and an operator has to be able to tell those
       apart. ``*_detail`` is one printable sentence and names no record
-      content.
+      content. ``newest_break_*`` describes the newest damage in the newest
+      broken epoch (the highest seq the census flagged), so it agrees with
+      ``newest_break_at``; it used to repeat that epoch's first break.
+    - ``window_days`` — the ``days`` window the scan used (None: whole index).
     - ``latest_epoch_broken`` — True iff the temporally LAST epoch actually
       fetched failed its own check. False (including vacuously, for an empty
       scan) otherwise. This is what lets a consumer tell "every epoch after
@@ -210,6 +212,7 @@ class ChainVerifyResult:
     oldest_break_at: str | None = None
     newest_break_at: str | None = None
     break_kinds: tuple[str, ...] = ()
+    window_days: int | None = None
 
 
 def _raise_if_partial(
@@ -261,8 +264,8 @@ def _raise_if_partial(
     reason = _first_failure_reason(shards)
     detail = f" ({reason})" if reason else ""
     raise GridPartialResultsError(
-        f"could not read the whole audit index ({index}): {' and '.join(parts)}{detail} — "
-        f"{consequence}",
+        f"could not read the whole audit index ({index}): {' and '.join(parts)}{detail}, "
+        f"so {consequence}",
         shards_failed=shards_failed,
         shards_total=shards_total,
         timed_out=timed_out,
@@ -310,86 +313,132 @@ async def _search_page(
     return list(response.get("hits", {}).get("hits", []))
 
 
-async def _fetch_audit_records(
-    elastic: ElasticClient,
-    audit_index_alias: str,
-    *,
-    days: int | None,
-    max_records: int,
-) -> tuple[list[dict[str, Any]], bool]:
-    """Pull audit ``_source`` bodies from ``{alias}-*`` sorted ascending by time.
+def _range_filter(field: str, *, gte: Any = None, lt: Any = None) -> dict[str, Any] | None:
+    bounds: dict[str, Any] = {}
+    if gte is not None:
+        bounds["gte"] = gte
+    if lt is not None:
+        bounds["lt"] = lt
+    return {"range": {field: bounds}} if bounds else None
 
-    Pages with ``search_after`` on ``timestamp`` (no 10k window limit). Returns
-    ``(records, capped)`` where ``capped`` is True iff ``max_records`` was reached
-    before the scan exhausted the index (so the caller must not claim the whole
-    chain was verified).
+
+async def _genesis_timestamps(
+    elastic: ElasticClient, index: str, *, since: str | None, page_size: int
+) -> list[str]:
+    """The ``timestamp`` of every genesis record (``seq == 0``) in the window, oldest first.
+
+    These are the epoch boundaries. Only the timestamps are kept: a real trail
+    carries a few hundred of them at most (one per restart before the
+    chain-head recovery fix), never a page of full records.
     """
-    index = f"{audit_index_alias}-*"
-    # Only records that carry a seq — legacy pre-chain docs have none and
-    # verify_chain would ignore them anyway; excluding them here keeps paging
-    # tight AND is what keeps a legacy doc from ever reaching the epoch
-    # partition below (it has no seq to be mistaken for a genesis marker, or
-    # anything else).
-    filters: list[dict[str, Any]] = [{"exists": {"field": "seq"}}]
-    if days is not None:
-        since = (datetime.now(UTC) - timedelta(days=days)).isoformat()
-        filters.append({"range": {"timestamp": {"gte": since}}})
+    filters: list[dict[str, Any]] = [{"term": {"seq": GENESIS_SEQ}}]
+    window = _range_filter("timestamp", gte=since)
+    if window is not None:
+        filters.append(window)
     query: dict[str, Any] = {"bool": {"filter": filters}}
-    # Sort is timestamp-major, seq-minor — NOT seq-major. This used to sort on
-    # `seq` first (see below for why the tiebreak avoids `_id`), which is fine
-    # for a single unbroken chain (seq is monotonic and unique) but wrong once
-    # an index holds multiple epochs (see this module's docstring): `seq`
-    # resets to 0 at every genesis, so sorting seq-major interleaves ALL
-    # epochs' seq=0 records first, then all their seq=1 records, and so on —
-    # there is no contiguous run of "one epoch's records" to partition at all.
-    # Epochs were written sequentially in time (one process incarnation's
-    # entire trail, then the next's), so `timestamp` is the field that actually
-    # groups them, with `seq` breaking ties — the SAME field pair as before,
-    # just swapped in priority, so this carries the ES 9 fix below unchanged.
-    #
-    # Tie-break on the record's own `seq`, not `_id`. Two records can share an
-    # ES-visible timestamp (write-rate can exceed clock granularity); `seq` is
-    # unique *within* an epoch and, crucially, is exactly the field the epoch
-    # partition and verify_chain need in the right relative order — so the
-    # tiebreak serves the consumer, not just determinism. `_id` would also
-    # give a deterministic order, but sorting on it requires fielddata, which
-    # stock ES 9 ships disabled (`indices.id_field_data.enabled=false`), so
-    # that tiebreak used to fail every data-bearing shard on a real ES 9 grid
-    # (found on a 93M-doc prod grid: "58 of 76 shards failed") and the correct
-    # partial-read guard below then refused the whole scan — turning
-    # `soc-ai audit verify` into permanent couldn't-verify on any ES 9 install.
-    # A PIT + `_shard_doc` tiebreak is the canonical fix for search_after's own
-    # ordering caveats, but it drags PIT support into every mock/fake in this
-    # suite for a tiebreak `seq` already gives us for free.
     sort: list[dict[str, Any]] = [{"timestamp": {"order": "asc"}}, {"seq": {"order": "asc"}}]
-
-    records: list[dict[str, Any]] = []
+    out: list[str] = []
     search_after: list[Any] | None = None
     while True:
-        remaining = max_records - len(records)
-        if remaining <= 0:
-            return records, True  # cap reached — scan did NOT exhaust the index
-        page_size = min(_PAGE_SIZE, remaining)
         hits = await _search_page(
             elastic, index, query, size=page_size, sort=sort, search_after=search_after
         )
-        if not hits:
-            break
         for hit in hits:
             src = hit.get("_source")
-            if isinstance(src, dict):
-                records.append(src)
+            ts = src.get("timestamp") if isinstance(src, dict) else None
+            if isinstance(ts, str):
+                out.append(ts)
         if len(hits) < page_size:
-            break  # last (partial) page — index exhausted
+            return out
         cursor = hits[-1].get("sort")
         if not isinstance(cursor, list) or not cursor:
-            # ES echoes `sort` on every hit when a sort is set; if it didn't, stop
-            # rather than risk an infinite loop re-fetching the same page.
+            _LOGGER.warning("audit verify: page missing sort cursor, stopping scan early")
+            return out
+        search_after = cursor
+
+
+def _epoch_query(lo: str | None, hi: str | None, *, min_seq: int | None = None) -> dict[str, Any]:
+    """Every chained record with ``lo <= timestamp < hi`` (and ``seq >= min_seq``)."""
+    filters: list[dict[str, Any]] = [{"exists": {"field": "seq"}}]
+    window = _range_filter("timestamp", gte=lo, lt=hi)
+    if window is not None:
+        filters.append(window)
+    if min_seq is not None:
+        filters.append({"range": {"seq": {"gte": min_seq}}})
+    return {"bool": {"filter": filters}}
+
+
+async def _edge_seq(elastic: ElasticClient, index: str, query: dict[str, Any], order: str) -> Any:
+    """The lowest (``asc``) or highest (``desc``) seq that *query* matches, or None."""
+    hits = await _search_page(
+        elastic, index, query, size=1, sort=[{"seq": {"order": order}}], search_after=None
+    )
+    src = hits[0].get("_source") if hits else None
+    return src.get("seq") if isinstance(src, dict) else None
+
+
+async def _stream_epoch(
+    elastic: ElasticClient,
+    index: str,
+    query: dict[str, Any],
+    *,
+    expect_genesis: bool,
+    page_size: int,
+    limit: int | None,
+) -> tuple[EpochStreamChecker, int, int | None, int | None, bool]:
+    """Check one epoch page by page, in seq order. Holds one page at a time.
+
+    The hash work for each page runs in a worker thread
+    (:func:`asyncio.to_thread`), so a long verification never holds the event
+    loop: every other request keeps being served while it runs. Returns the
+    checker, the count of records with an integer seq, the seq span, and
+    whether *limit* stopped the stream before the epoch ended.
+    """
+    checker = EpochStreamChecker(expect_genesis=expect_genesis)
+    # seq-major with a timestamp tiebreak: the order verify_chain_detail sorts
+    # into, so the streamed walk is the same walk. Never `_id`: stock ES 9
+    # refuses to sort on it (see the _es9 doubles in tests/test_audit_verify.py).
+    sort: list[dict[str, Any]] = [{"seq": {"order": "asc"}}, {"timestamp": {"order": "asc"}}]
+    seqs = 0
+    lo_seq: int | None = None
+    hi_seq: int | None = None
+    search_after: list[Any] | None = None
+    truncated = False
+    while True:
+        size = page_size if limit is None else min(page_size, limit - seqs)
+        if size <= 0:
+            truncated = True
+            break
+        hits = await _search_page(
+            elastic, index, query, size=size, sort=sort, search_after=search_after
+        )
+        page = [h["_source"] for h in hits if isinstance(h.get("_source"), dict)]
+        for src in page:
+            seq = src.get("seq")
+            if isinstance(seq, int):
+                seqs += 1
+                lo_seq = seq if lo_seq is None else min(lo_seq, seq)
+                hi_seq = seq if hi_seq is None else max(hi_seq, seq)
+        await asyncio.to_thread(checker.feed_page, page)
+        n_hits = len(hits)
+        cursor = hits[-1].get("sort") if hits else None
+        # Drop the page before the next round trip: one page in memory, never two.
+        del page, hits
+        if n_hits < size:
+            break
+        if not isinstance(cursor, list) or not cursor:
             _LOGGER.warning("audit verify: page missing sort cursor, stopping scan early")
             break
         search_after = cursor
-
-    return records, False
+    if truncated:
+        # The limit landed on a page edge. Call it truncated only when the
+        # epoch really holds more.
+        probe = await _search_page(
+            elastic, index, query, size=1, sort=sort, search_after=search_after
+        )
+        truncated = bool(probe)
+    await asyncio.to_thread(checker.finish)
+    return checker, seqs, lo_seq, hi_seq, truncated
 
 
 def _partition_epochs(records: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
@@ -450,25 +499,122 @@ def _epoch_start(epoch: list[dict[str, Any]]) -> str | None:
     return ts if isinstance(ts, str) else None
 
 
-def _aggregate_census(broken_epochs: list[list[dict[str, Any]]], kinds: set[str]) -> ChainCensus:
-    """Sum the per-epoch censuses of the epochs that broke.
+async def verify_audit_chain(
+    elastic: ElasticClient,
+    audit_index_alias: str,
+    *,
+    days: int | None = None,
+    max_records: int | None = _MAX_RECORDS,
+    page_size: int | None = None,
+) -> ChainVerifyResult:
+    """Verify the tamper-evident chain over the audit index, newest epoch first.
 
-    Per epoch, because ``seq`` restarts at zero on every process incarnation:
-    one position claimed once in each of two epochs is not a duplicate. Mutates
-    *kinds* to add whatever the census found beyond the first break each epoch
-    reported, so "the chain has a fork AND something was edited" is expressible
-    rather than collapsing to whichever came first.
+    Two passes, both streamed. The first reads only the timestamps of the
+    genesis records in the window: those are the epoch boundaries. The second
+    walks each epoch, NEWEST first, one ``seq``-ordered page at a time through
+    an :class:`~soc_ai.audit.chain.EpochStreamChecker`, which makes the same
+    decisions :func:`~soc_ai.audit.chain.verify_chain_detail` and
+    :func:`~soc_ai.audit.chain.census_chain` make without holding more than one
+    page. Every epoch is checked, never just the first broken one (see this
+    module's docstring for the prod finding behind that).
+
+    ``days`` bounds the scan to ``timestamp >= now - days``; None reads the
+    whole index. ``max_records`` bounds the work (None: no bound). Because the
+    walk is newest first, the bound always drops the OLDEST records: a capped
+    scan still verifies the present. Inside the one epoch the bound cuts, the
+    scan starts at the seq that leaves the newest records it can afford, and
+    that cut is a window boundary (its first link is not checked).
+
+    Raises on a transport/ES error and on a partial read (the caller maps that
+    to exit 2 / a 502). An unreachable index is "could not run", never "intact".
     """
-    duplicate_seqs = extra_records = max_claimants = altered_records = missing_seqs = 0
-    oldest: str | None = None
-    newest: str | None = None
-    for epoch in broken_epochs:
-        census = census_chain(epoch)
+    index = f"{audit_index_alias}-*"
+    if page_size is None:
+        page_size = _PAGE_SIZE  # read at call time, so a test can shrink it
+    since = (datetime.now(UTC) - timedelta(days=days)).isoformat() if days is not None else None
+    genesis = await _genesis_timestamps(elastic, index, since=since, page_size=page_size)
+
+    # Epoch windows in time order: [lo, hi) on timestamp. The first one is the
+    # stretch before the first genesis in the window (a windowed scan starts
+    # mid-epoch there; a full scan that finds records there has lost its head).
+    windows: list[tuple[str | None, str | None, bool, bool]] = []
+    windows.append((since, genesis[0] if genesis else None, days is None, False))
+    for i, g_ts in enumerate(genesis):
+        g_next = genesis[i + 1] if i + 1 < len(genesis) else None
+        windows.append((g_ts, g_next, True, True))
+
+    outcomes: list[tuple[str | None, EpochStreamChecker]] = []  # newest first
+    scanned = 0
+    capped = False
+    first_seq: int | None = None
+    last_seq: int | None = None
+    for lo, hi, expect_genesis, starts_at_genesis in reversed(windows):
+        if lo is not None and hi is not None and lo == hi:
+            continue  # two genesis records on one timestamp: nothing between them
+        remaining = None if max_records is None else max_records - scanned
+        query = _epoch_query(lo, hi)
+        if remaining is not None and remaining <= 0:
+            # The budget is spent. Older records exist only if this window has one.
+            if await _edge_seq(elastic, index, query, "desc") is not None:
+                capped = True
+            break
+        cut = False
+        if remaining is not None:
+            top = await _edge_seq(elastic, index, query, "desc")
+            if top is None:
+                continue
+            bottom = await _edge_seq(elastic, index, query, "asc")
+            if isinstance(top, int) and isinstance(bottom, int) and top - bottom + 1 > remaining:
+                # Keep the newest `remaining` positions of this epoch.
+                query = _epoch_query(lo, hi, min_seq=top - remaining + 1)
+                cut = True
+        checker, seqs, lo_seq, hi_seq, truncated = await _stream_epoch(
+            elastic,
+            index,
+            query,
+            expect_genesis=expect_genesis and not cut,
+            page_size=page_size,
+            limit=remaining,
+        )
+        if seqs == 0 and checker.chained == 0:
+            continue
+        scanned += seqs
+        if lo_seq is not None:
+            first_seq = lo_seq if first_seq is None else min(first_seq, lo_seq)
+        if hi_seq is not None:
+            last_seq = hi_seq if last_seq is None else max(last_seq, hi_seq)
+        start = lo if starts_at_genesis and not cut else checker.min_timestamp
+        outcomes.append((start, checker))
+        if cut or truncated:
+            capped = True
+            break
+
+    return _summarize(list(reversed(outcomes)), scanned, first_seq, last_seq, capped, days)
+
+
+def _summarize(
+    outcomes: list[tuple[str | None, EpochStreamChecker]],
+    scanned: int,
+    first_seq: int | None,
+    last_seq: int | None,
+    capped: bool,
+    days: int | None,
+) -> ChainVerifyResult:
+    """Fold the per-epoch outcomes (oldest first) into one :class:`ChainVerifyResult`."""
+    broken = [(start, c) for start, c in outcomes if c.first_break is not None]
+    kinds: set[str] = set()
+    duplicate_seqs = extra_records = max_claimants = altered = missing = 0
+    oldest_at: str | None = None
+    newest_at: str | None = None
+    for _start, c in broken:
+        if c.first_break is not None:
+            kinds.add(c.first_break.kind)
+        census = c.census()
         duplicate_seqs += census.duplicate_seqs
         extra_records += census.extra_records
         max_claimants = max(max_claimants, census.max_claimants)
-        altered_records += census.altered_records
-        missing_seqs += census.missing_seqs
+        altered += census.altered_records
+        missing += census.missing_seqs
         if census.duplicate_seqs:
             kinds.add("duplicate_seq")
         if census.altered_records:
@@ -476,149 +622,107 @@ def _aggregate_census(broken_epochs: list[list[dict[str, Any]]], kinds: set[str]
         if census.missing_seqs:
             kinds.add("missing_seq")
         if census.oldest_break_at is not None and (
-            oldest is None or census.oldest_break_at < oldest
+            oldest_at is None or census.oldest_break_at < oldest_at
         ):
-            oldest = census.oldest_break_at
+            oldest_at = census.oldest_break_at
         if census.newest_break_at is not None and (
-            newest is None or census.newest_break_at > newest
+            newest_at is None or census.newest_break_at > newest_at
         ):
-            newest = census.newest_break_at
-    return ChainCensus(
-        duplicate_seqs=duplicate_seqs,
-        extra_records=extra_records,
-        max_claimants=max_claimants,
-        altered_records=altered_records,
-        missing_seqs=missing_seqs,
-        oldest_break_at=oldest,
-        newest_break_at=newest,
-    )
+            newest_at = census.newest_break_at
 
-
-async def verify_audit_chain(
-    elastic: ElasticClient,
-    audit_index_alias: str,
-    *,
-    days: int | None = None,
-    max_records: int = _MAX_RECORDS,
-) -> ChainVerifyResult:
-    """Fetch every audit record from ES and verify the tamper-evident chain.
-
-    Queries ``{audit_index_alias}-*`` for all chained records (optionally the last
-    ``days`` days), sorted ascending by timestamp, partitions them into epochs at
-    each genesis marker (:func:`_partition_epochs`), and runs :func:`verify_chain`
-    over EVERY epoch — never stopping at the first break, so a break in old
-    history cannot hide whether anything more recent is also broken (see this
-    module's docstring for the prod finding that makes this a real requirement,
-    not a hypothetical). An empty index (no chained records) is intact by
-    definition, with zero epochs.
-
-    Shared by the ``soc-ai audit verify`` CLI and the admin verify-chain endpoint.
-    Raises on a transport/ES error (the caller maps that to exit-2 / a 5xx) — this
-    is a *verification*, so an unreachable index is "could not run", NOT "intact".
-    A half-read index is the same refusal with a quieter cause: ES answers 200
-    with only the surviving shards' records, and :class:`GridPartialResultsError`
-    (raised per page, see :func:`_raise_if_partial`) keeps that from being scored
-    as either an intact chain or a tampered one.
-    """
-    records, capped = await _fetch_audit_records(
-        elastic, audit_index_alias, days=days, max_records=max_records
-    )
-
-    epochs = _partition_epochs(records)
-
-    ok = True
-    epochs_broken = 0
-    first_broken_seq: int | None = None
-    first_broken_epoch_start: str | None = None
-    newest_broken_epoch_start: str | None = None
-    first_break_kind: str | None = None
-    first_break_detail: str | None = None
-    newest_break_kind: str | None = None
-    newest_break_detail: str | None = None
-    # Tracks whichever epoch was checked most recently; after the loop it
-    # holds the LAST (temporally newest) epoch's own result. Vacuously True
-    # for zero epochs — nothing exists to be "the broken latest epoch".
-    last_epoch_ok = True
-    # The epochs that actually broke, censused after the loop. An intact epoch
-    # censuses to all zeros by construction (verify_chain_detail checks every
-    # record's hash and the contiguity of every position), so skipping it costs
-    # nothing but a hash recompute it would have redone.
-    broken_epochs: list[list[dict[str, Any]]] = []
-    kinds: set[str] = set()
-    for i, epoch in enumerate(epochs):
-        # Only epoch 0 can be a legitimately-unfetched boundary — a windowed
-        # (days=N) scan may start mid-epoch, with its first record's predecessor
-        # filtered out of the fetch, so `expect_genesis` there follows the same
-        # rule as before epochs existed (True only for a full scan). Every
-        # LATER epoch's first record is, by construction, the one that started
-        # the group (seq == GENESIS_SEQ) — verify_chain's own
-        # `expected_seq == GENESIS_SEQ` check already forces the genesis-hash
-        # requirement regardless of this flag, but passing True explicitly
-        # (rather than leaning on that fallthrough) also holds if a crafted
-        # record with a negative/duplicate seq ever tried to hide inside a
-        # group under cover of a real genesis marker — expect_genesis=True
-        # never lets that boundary go unverified the way False would.
-        expect_genesis = True if i > 0 else days is None
-        brk = verify_chain_detail(epoch, expect_genesis=expect_genesis)
-        last_epoch_ok = brk is None
-        if brk is not None:
-            ok = False
-            epochs_broken += 1
-            epoch_start = _epoch_start(epoch)
-            if first_broken_seq is None:
-                # First (oldest, since epochs are in time order) break — set
-                # once, kept for the single-break-era fields' compatibility.
-                first_broken_seq = brk.seq
-                first_broken_epoch_start = epoch_start
-                first_break_kind = brk.kind
-                first_break_detail = brk.detail
-            # Keeps being overwritten by every later break found, so after the
-            # loop it holds the MOST RECENT (temporally newest) broken epoch —
-            # never break out of this loop early; a later epoch's status is
-            # exactly the thing "am I sound now" needs.
-            newest_broken_epoch_start = epoch_start
-            newest_break_kind = brk.kind
-            newest_break_detail = brk.detail
-
-            kinds.add(brk.kind)
-            broken_epochs.append(epoch)
-
-    radius = _aggregate_census(broken_epochs, kinds)
-    latest_epoch_broken = bool(epochs) and not last_epoch_ok
-
-    # Seq span actually covered (over ALL fetched chained records, regardless of
-    # where — or whether — a break was found; same "everything fetched" convention
-    # records_verified already used before epochs existed). With more than one
-    # epoch this is no longer one chain's span (seq resets at every genesis); see
-    # ChainVerifyResult's docstring.
-    seqs = [r["seq"] for r in records if isinstance(r.get("seq"), int)]
-    first_seq = min(seqs) if seqs else None
-    last_seq = max(seqs) if seqs else None
-
+    first = broken[0] if broken else None
+    newest = broken[-1] if broken else None
+    first_brk = first[1].first_break if first else None
+    newest_brk = newest[1].newest_break if newest else None
     return ChainVerifyResult(
-        ok=ok,
-        records_verified=len(seqs),
-        first_broken_seq=first_broken_seq,
+        ok=not broken,
+        records_verified=scanned,
+        first_broken_seq=first_brk.seq if first_brk else None,
         first_seq=first_seq,
         last_seq=last_seq,
         capped=capped,
-        epochs=len(epochs),
-        first_broken_epoch_start=first_broken_epoch_start,
-        epochs_broken=epochs_broken,
-        newest_broken_epoch_start=newest_broken_epoch_start,
-        latest_epoch_broken=latest_epoch_broken,
-        first_break_kind=first_break_kind,
-        first_break_detail=first_break_detail,
-        newest_break_kind=newest_break_kind,
-        newest_break_detail=newest_break_detail,
-        duplicate_seqs=radius.duplicate_seqs,
-        extra_records=radius.extra_records,
-        max_claimants=radius.max_claimants,
-        altered_records=radius.altered_records,
-        missing_seqs=radius.missing_seqs,
-        oldest_break_at=radius.oldest_break_at,
-        newest_break_at=radius.newest_break_at,
+        epochs=len(outcomes),
+        first_broken_epoch_start=first[0] if first else None,
+        epochs_broken=len(broken),
+        newest_broken_epoch_start=newest[0] if newest else None,
+        latest_epoch_broken=bool(outcomes) and outcomes[-1][1].first_break is not None,
+        first_break_kind=first_brk.kind if first_brk else None,
+        first_break_detail=first_brk.detail if first_brk else None,
+        newest_break_kind=newest_brk.kind if newest_brk else None,
+        newest_break_detail=newest_brk.detail if newest_brk else None,
+        duplicate_seqs=duplicate_seqs,
+        extra_records=extra_records,
+        max_claimants=max_claimants,
+        altered_records=altered,
+        missing_seqs=missing,
+        oldest_break_at=oldest_at,
+        newest_break_at=newest_at,
         break_kinds=tuple(sorted(kinds)),
+        window_days=days,
+    )
+
+
+def is_duplicates_only(result: ChainVerifyResult) -> bool:
+    """True iff the only damage is duplicated positions and no record was altered.
+
+    That is the signature of two writers that appended at once. Every copy still
+    matches its own hash, so nothing was edited, deleted or reordered. Any other
+    kind, or an unknown kind, is not this case.
+    """
+    if result.ok or result.altered_records:
+        return False
+    kinds = set(result.break_kinds) or {
+        k for k in (result.first_break_kind, result.newest_break_kind) if k is not None
+    }
+    return kinds == {"duplicate_seq"}
+
+
+async def recorded_older_duplicate(
+    elastic: ElasticClient, audit_index_alias: str, *, days: int
+) -> str | None:
+    """One sentence about a recorded duplicate that is older than the window, or None.
+
+    A windowed scan cannot see a break that is older than its window. The
+    scheduled verification writes every finding into the trail as an
+    ``audit_chain_verification`` record, so one bounded read of the newest such
+    record tells whether an older epoch has a recorded duplicate. Best effort:
+    any failure returns None, and the verdict for the window stands on its own.
+    """
+    since = datetime.now(UTC) - timedelta(days=days)
+    try:
+        hits = await _search_page(
+            elastic,
+            f"{audit_index_alias}-*",
+            {"bool": {"filter": [{"term": {"kind": "audit_chain_verification"}}]}},
+            size=1,
+            sort=[{"timestamp": {"order": "desc"}}],
+            search_after=None,
+        )
+    except Exception:
+        _LOGGER.info("audit verify: the recorded-finding read failed", exc_info=True)
+        return None
+    src = hits[0].get("_source") if hits else None
+    payload = src.get("payload") if isinstance(src, dict) else None
+    if not isinstance(payload, dict):
+        return None
+    kinds = payload.get("break_kinds")
+    newest = payload.get("newest_break_at")
+    count = payload.get("duplicate_seqs")
+    if not isinstance(kinds, list) or "duplicate_seq" not in kinds or not isinstance(newest, str):
+        return None
+    try:
+        newest_dt = datetime.fromisoformat(newest.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if newest_dt.tzinfo is None:
+        newest_dt = newest_dt.replace(tzinfo=UTC)
+    if newest_dt >= since:
+        return None
+    n = f"{count} " if isinstance(count, int) else ""
+    return (
+        f"An older epoch has a recorded duplicate. The scheduled check found {n}duplicate "
+        f"sequence numbers. The newest affected record is at {newest}, before this window. "
+        "Run soc-ai audit verify --all to check the whole index."
     )
 
 

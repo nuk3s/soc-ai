@@ -169,6 +169,11 @@ _WS_RE = re.compile(r"\s+")
 # weak inferences reset its own counter forever and never earn a prod.
 _NO_SIGNAL = "no_signal"
 
+# The two withheld role buckets. Values of :func:`_effective_role`, and the
+# role-filter values that list them. Neither is a role the classifier emits.
+_LOW_CONFIDENCE_BUCKET = "__low_confidence__"
+_STALE_BUCKET = "__stale__"
+
 # Columns whose absence must be written as SQL NULL rather than as the JSON
 # literal 'null'. See :func:`_update_values` / :func:`_insert_values`.
 #
@@ -325,6 +330,75 @@ async def _get_field_row(db: AsyncSession, dossier_id: int, field: str) -> HostD
 
 
 # ---------------------------------------------------------------------------
+# The identity fingerprint
+# ---------------------------------------------------------------------------
+
+# One digest per identity signal, labelled: "h:<hostname>|m:<MAC>". A part the
+# builds have never seen is empty. The labels let a reader compare part by part:
+# a part that appears is new evidence about the same machine, and only a part
+# that moves from one value to a DIFFERENT value says the machine changed.
+IDENTITY_PARTS: tuple[str, ...] = ("h", "m")
+_LABELLED_FINGERPRINT = re.compile(r"^h:([0-9a-f]*)\|m:([0-9a-f]*)$")
+# The shape before the labels: "<hostname digest>:<MAC digest>".
+_PLAIN_FINGERPRINT = re.compile(r"^([0-9a-f]*):([0-9a-f]*)$")
+
+
+def fingerprint_parts(value: str | None) -> dict[str, str]:
+    """The non-empty part digests of a stored fingerprint, by label.
+
+    Reads the labelled shape and the plain shape before it. A shape older than
+    both, one digest over the whole, cannot be split: it reads as no parts, so
+    it can never stamp a rebind.
+    """
+    if not value:
+        return {}
+    match = _LABELLED_FINGERPRINT.match(value) or _PLAIN_FINGERPRINT.match(value)
+    if match is None:
+        return {}
+    return {
+        label: digest
+        for label, digest in zip(IDENTITY_PARTS, match.groups(), strict=True)
+        if digest
+    }
+
+
+def compose_fingerprint(parts: dict[str, str]) -> str | None:
+    """The stored shape of *parts*, or ``None`` when no part holds a value."""
+    if not any(parts.get(label) for label in IDENTITY_PARTS):
+        return None
+    return "|".join(f"{label}:{parts.get(label) or ''}" for label in IDENTITY_PARTS)
+
+
+def identity_rebound(known: str | None, current: str | None) -> bool:
+    """True when a part moved from one value to a DIFFERENT value.
+
+    A part that appears never counts. Production 2026-10-02: the first machine
+    sweep read DHCP MACs that no build had read before, the fingerprint gained
+    its MAC part on every leased host, and a whole-string compare stamped 41
+    machines "rebound".
+    """
+    before, after = fingerprint_parts(known), fingerprint_parts(current)
+    return any(
+        before.get(label) and after.get(label) and before[label] != after[label]
+        for label in IDENTITY_PARTS
+    )
+
+
+async def _holds_declaration(db: AsyncSession, row: HostDossier) -> bool:
+    """True when an operator value stands on any field of this address."""
+    held = await db.scalar(
+        select(func.count(HostDossierField.id)).where(
+            HostDossierField.dossier_id == row.id,
+            or_(
+                HostDossierField.operator_value.is_not(None),
+                HostDossierField.operator_value_json.is_not(None),
+            ),
+        )
+    )
+    return bool(held)
+
+
+# ---------------------------------------------------------------------------
 # Host header
 # ---------------------------------------------------------------------------
 
@@ -350,10 +424,12 @@ async def upsert_host(
     arrived every time the lookback shrank. ``event_count`` is the *window*
     count and replaces.
 
-    ``identity_fingerprint`` stamps ``identity_rebound_at`` only when it moves
-    from one non-null value to a *different* non-null value. A build that saw no
-    DHCP/NTLM this window passes ``None``, and silence is not evidence that the
-    machine changed.
+    ``identity_fingerprint`` stamps ``identity_rebound_at`` only when one of its
+    parts moves from one value to a *different* value (:func:`identity_rebound`),
+    and only on an address that holds an operator declaration. The stamp exists
+    to say "your override may no longer apply", and an address with no override
+    has nothing it could undermine. A build that saw no DHCP/NTLM this window
+    passes ``None``, and silence is not evidence that the machine changed.
 
     A build's outcome is one atomic fact: pass ``last_built_at`` and
     ``build_error`` together and ``build_error`` is written verbatim (``None``
@@ -391,7 +467,7 @@ async def upsert_host(
         row.event_count = event_count
     if identity_fingerprint is not None:
         known = row.identity_fingerprint
-        if known is not None and known != identity_fingerprint:
+        if identity_rebound(known, identity_fingerprint) and await _holds_declaration(db, row):
             row.identity_rebound_at = stamp
         row.identity_fingerprint = identity_fingerprint
     if last_built_at is not None:
@@ -1053,6 +1129,38 @@ def _lane_assertable(fresh_since: datetime, min_confidence: float) -> Any:
     )
 
 
+def _effective_role(fresh_since: datetime, min_confidence: float) -> Any:
+    """What one ``role`` row counts as, in SQL: a role, or one of two withheld buckets.
+
+    The operator lane first, then an inferred role the resolver would assert.
+    A guess the resolver withholds groups under :data:`_STALE_BUCKET` when the
+    last build that evaluated it is outside the staleness window, and under
+    :data:`_LOW_CONFIDENCE_BUCKET` when it is fresh and below the floor. That
+    is the resolver's own order: staleness is reported ahead of low confidence.
+    A guess spelled "unknown" is no guess and groups under NULL.
+
+    ONE spelling for the summary's role bar and the list's role filter. The
+    filter matched the stored lanes with no gate and the bar counted through
+    the gates, so "server 1" on the bar listed four hosts under the filter.
+    """
+    has_guess = and_(
+        HostDossierField.inferred_value.is_not(None),
+        func.lower(HostDossierField.inferred_value) != "unknown",
+    )
+    stale = or_(
+        HostDossierField.inferred_last_run_at.is_(None),
+        HostDossierField.inferred_last_run_at < fresh_since,
+    )
+    return func.coalesce(
+        HostDossierField.operator_value,
+        case((_lane_assertable(fresh_since, min_confidence), HostDossierField.inferred_value)),
+        case(
+            (and_(has_guess, stale), _STALE_BUCKET),
+            (has_guess, _LOW_CONFIDENCE_BUCKET),
+        ),
+    )
+
+
 def _attention_order(
     stamp: datetime,
     *,
@@ -1246,10 +1354,10 @@ async def list_dossiers(
     Paged in SQL rather than shipping the table: the identifiers list can hand
     the client ~100 rows, but this table is capped at 5,000 hosts x ~12 fields.
 
-    ``role`` matches ``coalesce(operator_value, inferred_value)`` — the operator
-    lane wins, exactly as the resolver decides it. This is a coarse prefilter:
-    the resolver still applies the confidence floor and the staleness window, so
-    a listed host may resolve to "unknown" on the detail card. ``source`` splits
+    ``role`` matches the effective role (:func:`_effective_role`): the operator
+    lane, or an inferred role that clears the confidence floor and the
+    staleness window. ``__low_confidence__`` and ``__stale__`` select the two
+    withheld buckets the summary counts. ``source`` splits
     the network by whether a human has touched it at all (``operator`` = at least
     one override, ``inferred`` = none). ``q`` matches the IP or a hostname in
     either lane.
@@ -1301,13 +1409,17 @@ async def list_dossiers(
             )
             conditions.append(or_(HostDossier.ip.contains(needle, autoescape=True), hostname_hit))
     if role:
+        # The summary's own role expression, so a bucket on the ROLES bar and
+        # the rows its filter lists are one set. The two withheld buckets are
+        # values of the same expression, which is why the "low confidence" and
+        # "stale" filters run here over the whole table and not on a page.
+        fresh_since = (_naive_utc(now) or utcnow()) - timedelta(hours=staleness_hours)
         conditions.append(
             select(HostDossierField.id)
             .where(
                 HostDossierField.dossier_id == HostDossier.id,
-                HostDossierField.field == "role",
-                func.coalesce(HostDossierField.operator_value, HostDossierField.inferred_value)
-                == role,
+                HostDossierField.field == ROLE_FIELD,
+                _effective_role(fresh_since, min_confidence) == role,
             )
             .exists()
         )
@@ -1419,9 +1531,6 @@ async def conflicts_due(
     return [(host, field) for host, field in rows], total
 
 
-_LOW_CONFIDENCE_BUCKET = "__low_confidence__"
-
-
 @dataclass(frozen=True)
 class DossierSummary:
     """Network-wide dossier counts — the whole table, never a page.
@@ -1455,6 +1564,17 @@ class DossierSummary:
     # remainder, the bar relabelled ten hosts as unknown and hid why seven of
     # twelve profile specs were unscored.
     roles_low_confidence: int = 0
+    # Hosts whose inferred role the last build to evaluate it is too old to
+    # vouch for. Apart from low confidence: "the sweep is behind" and "the
+    # evidence is thin" ask an operator for two different actions.
+    roles_stale: int = 0
+    # Hosts with a clean build older than the staleness window. A sweep that
+    # stopped running leaves every answer stale, and the "needs attention" card
+    # said 0 over a table eight days old.
+    stale_hosts: int = 0
+    # Hosts whose agent lane holds a value above the floor that is now stale.
+    # The agent was reporting at the last build; nobody has checked since.
+    reporting_stale: int = 0
 
 
 async def summarize_dossiers(
@@ -1519,10 +1639,24 @@ async def summarize_dossiers(
                 func.count(HostDossier.id),
                 func.sum(case((_no_clean_build(), 1), else_=0)),
                 func.max(HostDossier.last_built_at),
+                func.sum(
+                    case(
+                        (
+                            and_(
+                                HostDossier.build_error.is_(None),
+                                HostDossier.last_built_at.is_not(None),
+                                HostDossier.last_built_at < fresh_since,
+                            ),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ),
             )
         )
     ).one()
     hosts, unbuilt, last_built_at = int(totals[0] or 0), int(totals[1] or 0), totals[2]
+    stale_hosts = int(totals[3] or 0)
 
     # ---- one pass over the field rows ----
     # The resolver's gates and the operator-lane predicate, in the one SQL
@@ -1561,6 +1695,23 @@ async def summarize_dossiers(
                         )
                     )
                 ),
+                # The agent lane above the floor, fresh or not: the hosts that
+                # had an agent at their last build.
+                func.count(
+                    distinct(
+                        case(
+                            (
+                                and_(
+                                    HostDossierField.inferred_source == HOSTLOG_SOURCE,
+                                    HostDossierField.inferred_value.is_not(None),
+                                    func.coalesce(HostDossierField.inferred_confidence, 0.0)
+                                    >= min_confidence,
+                                ),
+                                HostDossierField.dossier_id,
+                            )
+                        )
+                    )
+                ),
             )
         )
     ).one()
@@ -1586,19 +1737,7 @@ async def summarize_dossiers(
     # A third arm, so the withheld roles are counted in the SAME pass rather
     # than a fifth query: a host with an inferred role the resolver will not
     # assert (and no operator value) groups under a sentinel bucket.
-    effective_role = func.coalesce(
-        HostDossierField.operator_value,
-        case((assertable, HostDossierField.inferred_value)),
-        case(
-            (
-                and_(
-                    HostDossierField.inferred_value.is_not(None),
-                    func.lower(HostDossierField.inferred_value) != "unknown",
-                ),
-                _LOW_CONFIDENCE_BUCKET,
-            )
-        ),
-    )
+    effective_role = _effective_role(fresh_since, min_confidence)
     role_rows = (
         await db.execute(
             select(effective_role, func.count(HostDossierField.id))
@@ -1606,14 +1745,16 @@ async def summarize_dossiers(
             .group_by(effective_role)
         )
     ).all()
+    withheld = (_LOW_CONFIDENCE_BUCKET, _STALE_BUCKET)
     roles = {
         str(value): int(count or 0)
         for value, count in role_rows
-        if value is not None and str(value).strip() and value != _LOW_CONFIDENCE_BUCKET
+        if value is not None and str(value).strip() and value not in withheld
     }
     low_confidence = sum(
         int(count or 0) for value, count in role_rows if value == _LOW_CONFIDENCE_BUCKET
     )
+    stale_roles = sum(int(count or 0) for value, count in role_rows if value == _STALE_BUCKET)
 
     return DossierSummary(
         hosts=hosts,
@@ -1624,6 +1765,9 @@ async def summarize_dossiers(
         roles=roles,
         last_built_at=last_built_at,
         roles_low_confidence=low_confidence,
+        roles_stale=stale_roles,
+        stale_hosts=stale_hosts,
+        reporting_stale=max(0, int(counts[2] or 0) - int(counts[1] or 0)),
     )
 
 
@@ -1841,6 +1985,77 @@ async def _compute_environment_profile(
 # ---------------------------------------------------------------------------
 
 
+async def delete_hosts(db: AsyncSession, ips: list[str]) -> int:
+    """Delete the rows for *ips* that no operator has declared anything on.
+
+    For addresses that name no host at all (a broadcast address). A row that
+    carries a declaration stays, as it does under :func:`prune`: an operator's
+    word is not the census's to delete. Returns the number of rows deleted.
+    """
+    keys = [key for key in (_lookup_key(ip) for ip in ips) if key is not None]
+    if not keys:
+        return 0
+    protected = select(HostDossierField.dossier_id).where(_lane_declared())
+    doomed = list(
+        (
+            await db.scalars(
+                select(HostDossier.id).where(
+                    HostDossier.host_key.in_(keys), HostDossier.id.not_in(protected)
+                )
+            )
+        ).all()
+    )
+    if not doomed:
+        return 0
+    await db.execute(
+        sa_delete(HostDossier)
+        .where(HostDossier.id.in_(doomed))
+        .execution_options(synchronize_session=False)
+    )
+    await db.commit()
+    return len(doomed)
+
+
+async def prune_stale(
+    db: AsyncSession,
+    *,
+    older_than_days: int,
+    seen_now: set[str] | frozenset[str] = frozenset(),
+    now: datetime | None = None,
+) -> list[str]:
+    """Delete the rows no census has seen for *older_than_days*. Returns their IPs.
+
+    A row is stale when its newest sighting (``last_seen``, or ``created_at``
+    for a row that never had one) is older than the window and the current
+    census did not find it (*seen_now*). A row that holds an operator
+    declaration stays, as it does under :func:`prune`. The cap prune alone let
+    an address that left the network stay until the table held 5,000 rows.
+
+    The caller passes *seen_now* only from a census that READ the grid. A
+    failed census must not call this at all: it saw nothing, and nothing is
+    not evidence that a host left.
+    """
+    cutoff = (_naive_utc(now) or utcnow()) - timedelta(days=max(1, older_than_days))
+    protected = select(HostDossierField.dossier_id).where(_lane_declared())
+    keep = sorted(key for ip in seen_now if (key := _lookup_key(ip)) is not None)
+    conditions: list[Any] = [
+        func.coalesce(HostDossier.last_seen, HostDossier.created_at) < cutoff,
+        HostDossier.id.not_in(protected),
+    ]
+    if keep:
+        conditions.append(HostDossier.host_key.not_in(keep))
+    doomed = (await db.execute(select(HostDossier.id, HostDossier.ip).where(*conditions))).all()
+    if not doomed:
+        return []
+    await db.execute(
+        sa_delete(HostDossier)
+        .where(HostDossier.id.in_([row_id for row_id, _ in doomed]))
+        .execution_options(synchronize_session=False)
+    )
+    await db.commit()
+    return sorted(str(ip) for _, ip in doomed)
+
+
 async def prune(db: AsyncSession, *, max_hosts: int) -> int:
     """Trim the table to *max_hosts*, sparing every host a human has touched.
 
@@ -1875,3 +2090,41 @@ async def prune(db: AsyncSession, *, max_hosts: int) -> int:
     )
     await db.commit()
     return len(doomed)
+
+
+# ---------------------------------------------------------------------------
+# Entity keys: the spellings of a host name
+# ---------------------------------------------------------------------------
+#
+# Machine membership (soc_ai.store.host_machines) decides which keys one
+# machine is stored under. These helpers read it and spell the keys.
+
+
+async def entity_aliases(db: AsyncSession, key: str) -> list[str]:
+    """The other keys the machine of *key* is stored under, without *key*.
+
+    Machine membership answers it: every address and every name of the
+    machine, and a first label no other machine has. A value that names no
+    machine has no aliases. Kept under this name for the callers that read it.
+    The join used to go through a strong hostname with no check that the name
+    was one machine's, and one machine's observations showed on each address.
+    """
+    # Imported here: the machine module reads this module's table models, and
+    # a reader of this module must not pay for the clustering import.
+    from soc_ai.store import host_machines  # noqa: PLC0415
+
+    return (await host_machines.entity_expansion(db, key))[1:]
+
+
+def alias_key_variants(keys: list[str]) -> list[str]:
+    """Each key as written, lower-cased and upper-cased, for an indexed ``IN``.
+
+    ``host.name`` arrives in whatever case the agent ships. An index-friendly
+    exact match over the three spellings finds the row without a ``lower()``
+    scan of the observation table.
+    """
+    out: dict[str, None] = {}
+    for key in keys:
+        for variant in (key, key.lower(), key.upper()):
+            out.setdefault(variant, None)
+    return list(out)

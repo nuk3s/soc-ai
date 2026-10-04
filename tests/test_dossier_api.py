@@ -440,10 +440,13 @@ def test_get_dossier_for_an_unswept_host_is_found_false(client: TestClient) -> N
     assert all(f["reason"] == "no_signal" for f in body["fields"])
 
 
-def test_get_dossier_for_a_non_address_is_404(client: TestClient) -> None:
+def test_get_dossier_for_a_non_address_is_400(client: TestClient) -> None:
     resp = client.get("/api/v1/dossiers/not-an-ip")
-    assert resp.status_code == 404
+    assert resp.status_code == 400
     assert resp.json()["detail"]["reason"] == "not_an_ip"
+    # HostDetail.tsx matches this phrase to say "not a host address".
+    assert "keyed on IP addresses" in resp.json()["detail"]["hint"]
+    assert "Send an IPv4 or IPv6 address." in resp.json()["detail"]["hint"]
 
 
 # ---------------------------------------------------------------------------
@@ -1197,9 +1200,9 @@ def test_activity_rejects_a_range_it_cannot_bucket(activity_client: TestClient) 
     assert resp.status_code == 422
 
 
-def test_activity_for_a_non_address_is_404(activity_client: TestClient) -> None:
+def test_activity_for_a_non_address_is_400(activity_client: TestClient) -> None:
     resp = activity_client.get("/api/v1/dossiers/not-an-ip/activity")
-    assert resp.status_code == 404
+    assert resp.status_code == 400
     assert resp.json()["detail"]["reason"] == "not_an_ip"
 
 
@@ -1857,7 +1860,7 @@ def test_the_dossier_carries_the_behavioural_profile_with_its_coverage(client) -
 
     rate = by_dim["connection_rate"]
     assert rate["shape"] == "numeric"
-    assert rate["summary"] == "work 42/h · off 3/h · weekend —"
+    assert rate["summary"] == "started per hour, median · work 42 · off 3 · weekend none"
 
 
 def test_a_host_with_no_profile_has_an_empty_list_not_an_error(client) -> None:

@@ -57,7 +57,7 @@ export function sourceLabel(source: string, shadow = false): string {
 const SOURCE_TITLE: Record<string, string> = {
   profile:
     'A behavioural profile of this entity produced this observation. The profile sweep wrote it.',
-  catalog: 'A query analytic matched this entity. The catalog sweep wrote it.',
+  catalog: 'A query analytic matched this entity. The analytic sweep wrote it.',
   alert:
     'A triage verdict on an alert produced this observation. A false positive is not recorded.',
   hunt: 'An analyst promoted a hunt finding on this entity.',

@@ -57,7 +57,13 @@ describe('AppShell demo banner', () => {
   it('pins the honesty banner when the backend reports demo mode', async () => {
     mockFetch('true');
     renderShell();
-    const banner = await screen.findByRole('status');
+    // The route fallback is a status too while the shell waits on /me, so pick
+    // the banner by its copy.
+    const banner = await waitFor(() => {
+      const el = screen.getAllByRole('status').find((s) => s.textContent?.includes(BANNER_COPY));
+      expect(el).toBeTruthy();
+      return el!;
+    });
     expect(banner).toHaveTextContent(BANNER_COPY);
     expect(fetchMock).toHaveBeenCalledWith('/api/v1/demo-status', expect.anything());
   });

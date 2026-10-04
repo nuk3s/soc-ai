@@ -1039,6 +1039,7 @@ _DOSSIER_KNOBS: dict[str, tuple[str, object, float | None, float | None]] = {
     "dossier_context_enabled": ("bool", True, None, None),
     "dossier_conflict_min_observations": ("int", 3, 1, 50),
     "dossier_conflict_prompt_interval_hours": ("int", 336, 0, 8760),
+    "dossier_stale_address_days": ("int", 30, 1, 3650),
 }
 
 
@@ -1119,6 +1120,7 @@ def test_dossier_settings_coerce_from_form_strings() -> None:
         "dossier_context_enabled": ("on", True),
         "dossier_conflict_min_observations": ("3", 3),
         "dossier_conflict_prompt_interval_hours": ("336", 336),
+        "dossier_stale_address_days": ("30", 30),
     }
     assert set(samples) == set(_DOSSIER_KNOBS)
     for key, (raw, expected) in samples.items():
@@ -1269,7 +1271,7 @@ def test_catalog_hunt_rows_is_a_hot_bool_in_its_own_hunting_section(
     assert spec.secret is False and spec.danger is False
     assert spec.section == "Hunting"
     assert spec.label == "Record a hunt row for each analytic hit"
-    assert spec.help.startswith("The catalog sweep writes a hunt row for each hit")
+    assert spec.help.startswith("When this setting is on, the analytic sweep writes a hunt row")
     assert "Hunting" in SECTION_ORDER
     assert SECTION_PARENTS["Hunting"] == "Triage & Workflow"
 

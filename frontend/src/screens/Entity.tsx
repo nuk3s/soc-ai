@@ -4,7 +4,8 @@ import { SeverityTag, VerdictPill } from '../components/Badges';
 import { HostObservations } from '../components/HostObservations';
 import { LeadsStrip } from '../components/LeadsStrip';
 import { EmptyState, ErrorState, LoadingState } from '../components/States';
-import { getEntity } from '../lib/api';
+import { getEntity, isNotFound, resolveMachine } from '../lib/api';
+import { machineHref } from '../lib/hostsList';
 import { isIpKey } from '../lib/ip';
 import { absTime } from '../lib/timeRange';
 import { ENTITY_ADDRESS, ENTITY_NAME } from '../lib/tooltips';
@@ -68,6 +69,28 @@ function TimelineCard({ item }: { item: EntityTimelineItem }) {
 export function Entity() {
   const { value = '' } = useParams();
   const { data, loading, error, refetch } = useAsync(() => getEntity(value), [value]);
+  // The machine this name or address belongs to. A value that names no
+  // machine is a 404 and shows no link.
+  const machineRead = useAsync(
+    () =>
+      resolveMachine(value.trim()).then(
+        (r) => ({ value, r }),
+        (err: unknown) => {
+          if (isNotFound(err)) return { value, r: null };
+          throw err;
+        },
+      ),
+    [value],
+  );
+  const machine = machineRead.data?.value === value ? machineRead.data.r : null;
+  // The machine page, or the host page of the address the entity read joined
+  // the name to when the machine read had no answer. That page resolves the
+  // address to its machine.
+  const hostLink = machine
+    ? { to: machineHref(machine.key), ip: machine.primary_ip }
+    : data?.host_ip
+      ? { to: `/hosts/${encodeURIComponent(data.host_ip)}`, ip: data.host_ip }
+      : null;
   // A user account reaches this page and nothing else on it. The observations
   // and the leads on the account were written, and the page that names the
   // account did not list them. An address keeps the host page for both.
@@ -83,7 +106,10 @@ export function Entity() {
           <ChevronLeft size={13} /> Alerts
         </Link>
         <span className="text-ghost">/</span>
-        <div className="text-[15px] font-semibold">Entity</div>
+        {/* The crumb names the entity. "Alerts / Entity" named the screen. */}
+        <div data-testid="entity-crumb" className="font-mono text-[15px] font-semibold">
+          {value}
+        </div>
       </div>
 
       <div className="mx-auto max-w-workstation">
@@ -118,7 +144,19 @@ export function Entity() {
                     internal-CIDR-only — so the link would dead-end on "the network
                     sweep has never seen this address" for essentially every host
                     that could click it. An operator who has declared a public
-                    CIDR internal still reaches those hosts from the Hosts screen. */}
+                    CIDR internal still reaches those hosts from the Hosts screen.
+                    A NAME the dossier knows is the exception: it has a host
+                    page, and the link goes there. */}
+                {hostLink && (
+                  <Link
+                    data-testid="entity-host-link"
+                    to={hostLink.to}
+                    title="This entity belongs to a machine. The machine page holds its addresses, profile, observations and leads."
+                    className="rounded-chip border border-accent/40 bg-accent/10 px-2 py-0.5 text-[11.5px] font-semibold text-accent hover:bg-accent/20"
+                  >
+                    machine {hostLink.ip} →
+                  </Link>
+                )}
               </div>
               <div className="mt-2.5 flex flex-wrap items-center gap-4 text-[12px] text-dim">
                 <span>
@@ -143,6 +181,14 @@ export function Entity() {
               <EmptyState>
                 The timeline for <span className="font-mono text-dim">{data.value}</span> is empty.
                 No investigation or hunt finding names this entity.
+                {hostLink && (
+                  <>
+                    {' '}
+                    <Link to={hostLink.to} className="text-accent hover:underline">
+                      Open the machine page for {hostLink.ip}.
+                    </Link>
+                  </>
+                )}
               </EmptyState>
             ) : (
               <div className="flex flex-col gap-2">

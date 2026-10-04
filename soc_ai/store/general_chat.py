@@ -28,6 +28,7 @@ from sqlalchemy import delete as sa_delete
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from soc_ai.secret_scrub import scrub_secrets
 from soc_ai.store.auth import utcnow
 from soc_ai.store.models import GeneralChatMessage
 
@@ -69,6 +70,8 @@ async def finish_assistant(
     msg = await db.get(GeneralChatMessage, msg_id)
     if msg is None:
         return
+    # A chat answer can quote a credential from telemetry; scrub before store.
+    content = scrub_secrets(content)
     msg.content = content
     msg.status = status
     msg.meta = meta
@@ -120,9 +123,7 @@ async def reap_stale_pending(db: AsyncSession, *, older_than: timedelta | None =
     for msg in rows:
         msg.status = "error"
         if not msg.content:
-            msg.content = (
-                "The assistant was interrupted (likely a restart or timeout) — please ask again."
-            )
+            msg.content = "A restart or a timeout interrupted the assistant. Ask again."
     if rows:
         await db.commit()
     return len(rows)

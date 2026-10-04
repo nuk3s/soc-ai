@@ -42,7 +42,7 @@ function baseProps() {
 function visibleValues(): string[] {
   return screen
     .getAllByRole('switch')
-    .map((el) => (el.getAttribute('aria-label') ?? '').replace('Active — ', ''));
+    .map((el) => (el.getAttribute('aria-label') ?? '').replace('Active: ', ''));
 }
 
 describe('ManagedList — no optional props (unchanged behaviour)', () => {

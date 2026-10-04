@@ -41,7 +41,13 @@ from soc_ai.so_client.elastic import EsSearchResult
 from soc_ai.store import host_dossier as store
 from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
 from soc_ai.store.internal_identifiers import list_identifiers, set_state
-from soc_ai.store.models import DossierRun, EntityProfile, HostDossier, HostDossierField
+from soc_ai.store.models import (
+    DossierRun,
+    EntityProfile,
+    HostDossier,
+    HostDossierField,
+    HostMachine,
+)
 from soc_ai.tools._synth_scope import synth_scope_must_not
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
@@ -176,6 +182,8 @@ def _call_kind(query: dict[str, Any], aggs: dict[str, Any] | None) -> str:
         return "agent"
     if aggs and "names" in aggs:
         return "dns"
+    if aggs and any(str(key).startswith("leases") for key in aggs):
+        return "leases"
     if "exists" in query:
         return "probe"
     if aggs and "responder" in aggs:
@@ -243,6 +251,8 @@ class _FakeES:
         census_other: int = 0,
         agents: list[dict[str, Any]] | None = None,
         dns: list[dict[str, Any]] | None = None,
+        leases: list[dict[str, Any]] | None = None,
+        lease_error: str | None = None,
     ) -> None:
         self.src = dict(src or {})
         self.dst = dict(dst or {})
@@ -253,6 +263,9 @@ class _FakeES:
         self.agents = list(agents or [])
         # Query-name buckets for the network DNS pass — the telemetry lane.
         self.dns = list(dns or [])
+        # MAC buckets for the network DHCP lease pass, and a failure switch.
+        self.leases = list(leases or [])
+        self.lease_error = lease_error
         self.census_error = census_error
         # Every search raises — a grid-wide outage, as opposed to one bad agg.
         self.search_error = search_error
@@ -327,6 +340,14 @@ class _FakeES:
                 total=sum(int(b["doc_count"]) for b in self.dns),
                 took_ms=2,
                 aggregations={"names": {"buckets": self.dns}},
+            )
+        if kind == "leases":
+            if self.lease_error:
+                raise RuntimeError(self.lease_error)
+            return EsSearchResult(
+                total=len(self.leases),
+                took_ms=2,
+                aggregations={"leases0": {"buckets": self.leases}},
             )
         if kind == "probe":
             # Only the ECS spellings carry data on this (modern) grid.
@@ -954,10 +975,8 @@ async def test_a_build_stamps_identity_and_lifetime_on_the_host_row(
     # Per-component digests joined, NOT one hash over both: the two halves have
     # to stay independently comparable or a component ageing out reads as a
     # different machine (see the rebind tests below).
-    expected = ":".join(
-        hashlib.sha256(part).hexdigest()[:16] for part in (b"pve01", b"aa:bb:cc:dd:ee:01")
-    )
-    assert row.identity_fingerprint == expected
+    name, mac = (hashlib.sha256(part).hexdigest()[:16] for part in (b"pve01", b"aa:bb:cc:dd:ee:01"))
+    assert row.identity_fingerprint == f"h:{name}|m:{mac}"
     assert row.identity_rebound_at is None
     await engine.dispose()
 
@@ -987,6 +1006,11 @@ async def test_a_host_with_no_identity_signal_never_looks_rebound(
     await engine.dispose()
 
 
+async def _declare(maker: async_sessionmaker[Any], ip: str = _HYPERVISOR) -> None:
+    async with maker() as db:
+        await store.set_override(db, ip, "os_family", "windows", actor="analyst")
+
+
 async def test_a_different_machine_on_the_address_stamps_the_rebind(
     settings_kratos: Settings,
 ) -> None:
@@ -997,14 +1021,69 @@ async def test_a_different_machine_on_the_address_stamps_the_rebind(
         targeted={(_HYPERVISOR, "zeek.dhcp"): [_dhcp_hit(_HYPERVISOR, "pve01")]},
     )
     await job.run_dossier_refresh(es, maker, settings)
+    await _declare(maker)
 
     es.targeted[(_HYPERVISOR, "zeek.dhcp")] = [
-        _dhcp_hit(_HYPERVISOR, "laptop-7", mac="aa:bb:cc:dd:ee:99")
+        _dhcp_hit(_HYPERVISOR, "pve01", mac="aa:bb:cc:dd:ee:99")
     ]
     await job.run_dossier_refresh(es, maker, settings)
 
     row = await _host_row(maker, _HYPERVISOR)
     assert row is not None and row.identity_rebound_at is not None
+    await engine.dispose()
+
+
+async def test_a_different_machine_on_an_undeclared_address_stamps_nothing(
+    settings_kratos: Settings,
+) -> None:
+    """NEGATIVE CONTROL: the same MAC change with no declaration on the address.
+
+    The tripwire says "your override may no longer apply". With no override,
+    the chip told the operator nothing they could act on.
+    """
+    settings = _settings(settings_kratos)
+    engine, maker = await _db(settings)
+    es = _FakeES(
+        src={_HYPERVISOR: 3412},
+        targeted={(_HYPERVISOR, "zeek.dhcp"): [_dhcp_hit(_HYPERVISOR, "pve01")]},
+    )
+    await job.run_dossier_refresh(es, maker, settings)
+
+    es.targeted[(_HYPERVISOR, "zeek.dhcp")] = [
+        _dhcp_hit(_HYPERVISOR, "pve01", mac="aa:bb:cc:dd:ee:99")
+    ]
+    await job.run_dossier_refresh(es, maker, settings)
+
+    row = await _host_row(maker, _HYPERVISOR)
+    assert row is not None and row.identity_rebound_at is None
+    await engine.dispose()
+
+
+async def test_a_mac_the_sweep_now_reads_is_not_a_rebind_on_a_declared_host(
+    settings_kratos: Settings,
+) -> None:
+    """Production 2026-10-02: the first machine sweep read DHCP MACs it never read.
+
+    The fingerprint went from the hostname alone to the hostname and the MAC,
+    and 41 machines read "rebound". A part that appears is new evidence about
+    the same machine.
+    """
+    settings = _settings(settings_kratos)
+    engine, maker = await _db(settings)
+    es = _FakeES(
+        src={_HYPERVISOR: 3412},
+        targeted={(_HYPERVISOR, "zeek.dhcp"): [_dhcp_hit(_HYPERVISOR, "pve01", mac=None)]},
+    )
+    await job.run_dossier_refresh(es, maker, settings)
+    await _declare(maker)
+
+    es.targeted[(_HYPERVISOR, "zeek.dhcp")] = [_dhcp_hit(_HYPERVISOR, "pve01")]
+    await job.run_dossier_refresh(es, maker, settings)
+
+    row = await _host_row(maker, _HYPERVISOR)
+    assert row is not None and row.identity_rebound_at is None
+    assert row.identity_fingerprint is not None and "|m:" in row.identity_fingerprint
+    assert not row.identity_fingerprint.endswith("|m:")
     await engine.dispose()
 
 
@@ -1141,6 +1220,75 @@ async def test_the_sweep_prunes_the_table_to_the_configured_cap(
     async with maker() as db:
         ips = set((await db.scalars(select(HostDossier.ip))).all())
     assert ips == {_HYPERVISOR}
+    await engine.dispose()
+
+
+async def _seed_seen(
+    maker: async_sessionmaker[Any], ip: str, *, days_ago: int, declared: bool = False
+) -> None:
+    """A row the census last saw *days_ago* days before now. Relative to now on
+    purpose: a fixed date rots into the stale window and the test flips."""
+    seen = datetime.now(UTC) - timedelta(days=days_ago)
+    async with maker() as db:
+        host = await store.upsert_host(db, ip, first_seen=seen, last_seen=seen)
+        await db.commit()
+        if declared:
+            await store.set_override(db, ip, "criticality", "high", actor="analyst")
+        assert host is not None
+
+
+async def test_an_address_unseen_for_the_stale_window_leaves_the_census(
+    settings_kratos: Settings,
+) -> None:
+    """Stale rows stayed until the table held 5,000 rows. Production carried
+    122 rows that no census had found in weeks."""
+    settings = _settings(settings_kratos)
+    engine, maker = await _db(settings)
+    await _seed_seen(maker, "10.0.5.40", days_ago=40)
+    await _seed_seen(maker, "10.0.5.41", days_ago=40, declared=True)
+    await _seed_seen(maker, "10.0.5.10", days_ago=10)
+    es = _FakeES(src={_HYPERVISOR: 3412})
+
+    summary = await job.run_dossier_refresh(es, maker, settings)
+
+    async with maker() as db:
+        ips = set((await db.scalars(select(HostDossier.ip))).all())
+    assert "10.0.5.40" not in ips
+    # NEGATIVE CONTROLS: an operator declaration keeps its row, and a row seen
+    # inside the window stays.
+    assert "10.0.5.41" in ips
+    assert "10.0.5.10" in ips
+    assert _HYPERVISOR in ips
+    assert summary.hosts_pruned == 1
+    await engine.dispose()
+
+
+async def test_the_stale_window_is_the_operators_setting(settings_kratos: Settings) -> None:
+    settings = _settings(settings_kratos, dossier_stale_address_days=60)
+    engine, maker = await _db(settings)
+    await _seed_seen(maker, "10.0.5.40", days_ago=40)
+    es = _FakeES(src={_HYPERVISOR: 3412})
+
+    await job.run_dossier_refresh(es, maker, settings)
+
+    assert await _host_row(maker, "10.0.5.40") is not None
+    await engine.dispose()
+
+
+async def test_a_failed_census_prunes_no_stale_row(settings_kratos: Settings) -> None:
+    """NEGATIVE CONTROL: a census that could not read the grid saw nothing.
+
+    Absence of evidence is not evidence of absence. A grid outage must not
+    empty the table of every row older than the window.
+    """
+    settings = _settings(settings_kratos)
+    engine, maker = await _db(settings)
+    await _seed_seen(maker, "10.0.5.40", days_ago=40)
+    es = _FakeES(src={_HYPERVISOR: 3412}, census_error="connection refused")
+
+    await job.run_dossier_refresh(es, maker, settings)
+
+    assert await _host_row(maker, "10.0.5.40") is not None
     await engine.dispose()
 
 
@@ -1347,6 +1495,7 @@ async def test_a_spent_rebind_stamp_ages_out(settings_kratos: Settings) -> None:
         targeted={(_HYPERVISOR, "zeek.dhcp"): [_dhcp_hit(_HYPERVISOR, "pve01")]},
     )
     await job.run_dossier_refresh(es, maker, settings)
+    await _declare(maker)
     es.targeted[(_HYPERVISOR, "zeek.dhcp")] = [
         _dhcp_hit(_HYPERVISOR, "laptop-7", mac="aa:bb:cc:dd:ee:99")
     ]
@@ -1597,6 +1746,67 @@ async def test_a_machine_that_only_self_reports_still_gets_a_dossier(
     await engine.dispose()
 
 
+async def test_an_address_only_an_agent_reports_counts_the_agents_documents(
+    settings_kratos: Settings,
+) -> None:
+    """The agent's own documents for the address are its events and last seen.
+
+    The census wrote 0 for an address only an agent reports, and the Hosts
+    screen's default view (events above 0) hid the machine. The build must not
+    put the 0 back either.
+    """
+    settings = _settings(settings_kratos)
+    engine, maker = await _db(settings)
+    bucket = _agent_bucket("quiet-vm", [_QUIET_VM, "fe80::5054:ff:feaa:1"], docs=6175)
+    bucket["ips"]["buckets"][0]["doc_count"] = 712
+    bucket["ips"]["buckets"][0]["last_seen"] = {
+        "value": float(_ms(_AGENT_LAST)),
+        "value_as_string": _iso(_AGENT_LAST),
+    }
+    es = _FakeES(
+        src={_HYPERVISOR: 3412},
+        grid_datasets=_GRID_WITH_HOST_LOGS,
+        agents=[bucket],
+        main_total=0,
+    )
+
+    await job.run_dossier_refresh(es, maker, settings)
+
+    row = await _host_row(maker, _QUIET_VM)
+    assert row is not None
+    # The address row keeps the network's count. A per-address copy of the
+    # agent's documents made every bridge address of one machine read as its
+    # busiest address, so the machine carries the documents once.
+    assert row.event_count == 0
+    assert row.last_seen == _AGENT_LAST.replace(tzinfo=None)
+    async with maker() as db:
+        machine = await db.scalar(select(HostMachine).where(HostMachine.primary_ip == _QUIET_VM))
+    assert machine is not None
+    assert machine.event_count == 712
+    await engine.dispose()
+
+
+async def test_an_agent_address_with_network_events_keeps_the_network_count(
+    settings_kratos: Settings,
+) -> None:
+    """NEGATIVE CONTROL: the agent's documents do not replace a network count."""
+    settings = _settings(settings_kratos)
+    engine, maker = await _db(settings)
+    bucket = _agent_bucket("pve-a", [_HYPERVISOR], docs=6175)
+    bucket["ips"]["buckets"][0]["doc_count"] = 99999
+    es = _FakeES(
+        src={_HYPERVISOR: 3412},
+        grid_datasets=_GRID_WITH_HOST_LOGS,
+        agents=[bucket],
+    )
+
+    await job.run_dossier_refresh(es, maker, settings)
+
+    row = await _host_row(maker, _HYPERVISOR)
+    assert row is not None and row.event_count == 3412
+    await engine.dispose()
+
+
 async def test_a_self_reported_hostname_outranks_the_wire_and_reaches_the_store(
     settings_kratos: Settings,
 ) -> None:
@@ -1685,6 +1895,61 @@ async def test_an_address_two_agents_claim_is_named_by_neither(
     await engine.dispose()
 
 
+async def test_an_so3_dhcp_lease_names_the_host_in_the_store(
+    settings_kratos: Settings,
+) -> None:
+    """Security Onion 3.x writes the lease to client.address and host.hostname.
+
+    On production 0 of 337 rows had a DHCP name while 60 rows held a lease
+    hostname the sweep never read.
+    """
+    settings = _settings(settings_kratos)
+    engine, maker = await _db(settings)
+    so3_lease = {
+        "@timestamp": _iso(_LAST_SEEN),
+        "event.dataset": "zeek.dhcp",
+        "client.address": _LAPTOP,
+        "dhcp.assigned_ip": _LAPTOP,
+        "host.hostname": "sensor-view",
+        "host.mac": "02:00:5e:10:00:27",
+    }
+    es = _FakeES(src={_LAPTOP: 400}, targeted={(_LAPTOP, "zeek.dhcp"): [so3_lease]})
+
+    await job.run_dossier_refresh(es, maker, settings)
+
+    row = await _field(maker, _LAPTOP, "hostname")
+    assert (row.inferred_value, row.inferred_source) == ("sensor-view", "banner")
+    mac = await _field(maker, _LAPTOP, "mac")
+    assert mac.inferred_value == "02:00:5e:10:00:27"
+    await engine.dispose()
+
+
+async def test_an_agent_named_after_a_gtld_is_named_and_proposed(
+    settings_kratos: Settings,
+) -> None:
+    """ "nexus" is a gTLD. Production had agents whose own host.name is a gTLD.
+
+    The TLD rule dropped the name, so every row of that machine had no name and
+    search could not find it. The agent reads the name from the machine itself.
+    """
+    settings = _settings(settings_kratos)
+    engine, maker = await _db(settings)
+    es = _FakeES(
+        src={_HYPERVISOR: 3412},
+        grid_datasets=_GRID_WITH_HOST_LOGS,
+        agents=[_agent_bucket("nexus", [_HYPERVISOR])],
+    )
+
+    await job.run_dossier_refresh(es, maker, settings)
+
+    row = await _field(maker, _HYPERVISOR, "hostname")
+    assert (row.inferred_value, row.inferred_source) == ("nexus", "hostlog")
+    async with maker() as db:
+        hosts = {r.value: r for r in await list_identifiers(db) if r.kind == "host"}
+    assert hosts["nexus"].state == "muted"
+    await engine.dispose()
+
+
 async def test_a_grid_without_host_logs_sweeps_exactly_as_it_did_before(
     settings_kratos: Settings,
 ) -> None:
@@ -1708,6 +1973,238 @@ async def test_a_grid_without_host_logs_sweeps_exactly_as_it_did_before(
     row = await _field(maker, _HYPERVISOR, "hostname")
     assert (row.inferred_value, row.inferred_source) == ("pve01", "banner")
     assert set(row.inferred_evidence) == {"banner"}
+    await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# Machines: the sweep's last step
+# ---------------------------------------------------------------------------
+
+
+def _lease_bucket(mac: str, ip: str, hostname: str) -> dict[str, Any]:
+    """One MAC bucket of the lease pass, in the SO 3.x spelling."""
+    span = {
+        "first_seen": {"value": float(_ms(_FIRST_SEEN)), "value_as_string": _iso(_FIRST_SEEN)},
+        "last_seen": {"value": float(_ms(_LAST_SEEN)), "value_as_string": _iso(_LAST_SEEN)},
+    }
+    return {
+        "key": mac,
+        "doc_count": 12,
+        "ip0": {"buckets": [{"key": ip, "doc_count": 12, **span}]},
+        "name0": {"buckets": [{"key": hostname, "doc_count": 12, "last_seen": span["last_seen"]}]},
+    }
+
+
+def _agent_with_id(name: str, ips: list[str], agent_id: str) -> dict[str, Any]:
+    bucket = _agent_bucket(name, ips)
+    source = bucket["latest"]["hits"]["hits"][0]["_source"]
+    source["agent"]["id"] = agent_id
+    return bucket
+
+
+async def _machines(maker: async_sessionmaker[Any]) -> dict[str, Any]:
+    from soc_ai.store.models import HostMachine
+
+    async with maker() as db:
+        return {r.machine_key: r for r in (await db.scalars(select(HostMachine))).all()}
+
+
+async def test_the_sweep_ends_by_writing_one_machine_per_device(
+    settings_kratos: Settings,
+) -> None:
+    """The proxy had 14 rows. One agent, one machine, every address under it."""
+    settings = _settings(settings_kratos)
+    engine, maker = await _db(settings)
+    es = _FakeES(
+        src={_HYPERVISOR: 3412, "192.168.20.1": 15, _LAPTOP: 40},
+        grid_datasets=_GRID_WITH_HOST_LOGS,
+        agents=[_agent_with_id("pve-a", [_HYPERVISOR, "192.168.20.1"], "agent-0001")],
+        leases=[_lease_bucket("02:00:5e:10:00:27", _LAPTOP, "laptop-7")],
+    )
+
+    summary = await job.run_dossier_refresh(es, maker, settings)
+
+    machines = await _machines(maker)
+    assert set(machines) == {"agent:agent-0001", "mac:02:00:5e:10:00:27"}
+    assert summary.machines == 2
+    pve = machines["agent:agent-0001"]
+    assert (pve.name, pve.primary_ip, pve.address_count) == ("pve-a", _HYPERVISOR, 2)
+    laptop = machines["mac:02:00:5e:10:00:27"]
+    assert (laptop.name, laptop.name_source, laptop.primary_ip) == ("laptop-7", "dhcp", _LAPTOP)
+    assert len([c for c in es.calls if c["kind"] == "leases"]) == 1
+    await engine.dispose()
+
+
+async def test_a_failed_lease_pass_keeps_the_previous_machines(
+    settings_kratos: Settings,
+) -> None:
+    """NEGATIVE CONTROL: a pass that could not read is not a network change.
+
+    Built without its leases the laptop would turn into an ip: machine for one
+    sweep and back on the next, and an analyst's open link would break.
+    """
+    settings = _settings(settings_kratos)
+    engine, maker = await _db(settings)
+    args: dict[str, Any] = {
+        "src": {_HYPERVISOR: 3412, _LAPTOP: 40},
+        "grid_datasets": _GRID_WITH_HOST_LOGS,
+        "agents": [_agent_with_id("pve-a", [_HYPERVISOR], "agent-0001")],
+        "leases": [_lease_bucket("02:00:5e:10:00:27", _LAPTOP, "laptop-7")],
+    }
+    await job.run_dossier_refresh(_FakeES(**args), maker, settings)
+    before = {k: (r.id, r.address_count) for k, r in (await _machines(maker)).items()}
+
+    summary = await job.run_dossier_refresh(
+        _FakeES(**args, lease_error="search_phase_execution_exception"), maker, settings
+    )
+
+    after = {k: (r.id, r.address_count) for k, r in (await _machines(maker)).items()}
+    assert after == before
+    assert summary.machines == 0
+    assert any("kept the previous machines" in e for e in summary.errors)
+    await engine.dispose()
+
+
+async def test_a_container_only_its_agents_sensor_sees_is_no_machine_row(
+    settings_kratos: Settings,
+) -> None:
+    settings = _settings(settings_kratos)
+    engine, maker = await _db(settings)
+    es = _FakeES(
+        src={_HYPERVISOR: 3412, "172.18.0.7": 30},
+        grid_datasets=_GRID_WITH_HOST_LOGS,
+        agents=[_agent_with_id("registry-a", [_HYPERVISOR, "172.18.0.1"], "agent-0002")],
+    )
+    real_buckets = es._buckets
+
+    def with_sources(counts: dict[str, int]) -> dict[str, Any]:
+        out = real_buckets(counts)
+        for bucket in out["buckets"]:
+            if bucket["key"] == "172.18.0.7":
+                bucket["datasets"] = {"buckets": [{"key": "endpoint.events.network"}]}
+                bucket["shippers"] = {"buckets": [{"key": "registry-a"}]}
+        return out
+
+    es._buckets = with_sources  # type: ignore[method-assign]
+
+    await job.run_dossier_refresh(es, maker, settings)
+
+    machines = await _machines(maker)
+    assert set(machines) == {"agent:agent-0002"}
+    assert machines["agent:agent-0002"].container_count == 1
+    await engine.dispose()
+
+
+def _sourced(
+    es: _FakeES, sources: dict[str, tuple[list[str], list[str]]], *, more_shippers: int = 0
+) -> None:
+    """Give the census buckets of some addresses their datasets and shippers."""
+    real_buckets = es._buckets
+
+    def with_sources(counts: dict[str, int]) -> dict[str, Any]:
+        out = real_buckets(counts)
+        for bucket in out["buckets"]:
+            held = sources.get(bucket["key"])
+            if held is not None:
+                bucket["datasets"] = {"buckets": [{"key": d} for d in held[0]]}
+                bucket["shippers"] = {
+                    "buckets": [{"key": s} for s in held[1]],
+                    "sum_other_doc_count": more_shippers,
+                }
+        return out
+
+    es._buckets = with_sources  # type: ignore[method-assign]
+
+
+_MIXED = (["endpoint.events.network", "zeek.conn"], ["registry-a", "sensor-01"])
+
+
+async def test_a_container_the_network_sensor_also_sees_is_still_a_container(
+    settings_kratos: Settings,
+) -> None:
+    """Production: zeek saw 172.18.0.5 too, and it stood alone as a machine.
+
+    The agent owns the bridge and its endpoint sensor sees the address. Other
+    datasets that carry the address do not change that.
+    """
+    settings = _settings(settings_kratos)
+    engine, maker = await _db(settings)
+    es = _FakeES(
+        src={_HYPERVISOR: 3412, "172.18.0.7": 582},
+        grid_datasets=_GRID_WITH_HOST_LOGS,
+        agents=[_agent_with_id("registry-a", [_HYPERVISOR, "172.18.0.1"], "agent-0002")],
+    )
+    _sourced(es, {"172.18.0.7": _MIXED})
+
+    await job.run_dossier_refresh(es, maker, settings)
+
+    machines = await _machines(maker)
+    assert set(machines) == {"agent:agent-0002"}
+    assert machines["agent:agent-0002"].container_count == 1
+    await engine.dispose()
+
+
+async def test_a_container_whose_shipper_list_fell_short_stays_a_machine(
+    settings_kratos: Settings,
+) -> None:
+    """NEGATIVE CONTROL: a shipper the sub-agg cut off may be a second agent."""
+    settings = _settings(settings_kratos)
+    engine, maker = await _db(settings)
+    es = _FakeES(
+        src={_HYPERVISOR: 3412, "172.18.0.7": 582},
+        grid_datasets=_GRID_WITH_HOST_LOGS,
+        agents=[_agent_with_id("registry-a", [_HYPERVISOR, "172.18.0.1"], "agent-0002")],
+    )
+    _sourced(es, {"172.18.0.7": _MIXED}, more_shippers=40)
+
+    await job.run_dossier_refresh(es, maker, settings)
+
+    machines = await _machines(maker)
+    assert "ip:172.18.0.7" in machines
+    assert machines["agent:agent-0002"].container_count == 0
+    await engine.dispose()
+
+
+async def test_a_leased_address_in_the_bridge_stays_a_machine(
+    settings_kratos: Settings,
+) -> None:
+    """NEGATIVE CONTROL: a DHCP lease names the address, so it is a device."""
+    settings = _settings(settings_kratos)
+    engine, maker = await _db(settings)
+    es = _FakeES(
+        src={_HYPERVISOR: 3412, "172.18.0.7": 582},
+        grid_datasets=_GRID_WITH_HOST_LOGS,
+        agents=[_agent_with_id("registry-a", [_HYPERVISOR, "172.18.0.1"], "agent-0002")],
+        leases=[_lease_bucket("02:00:5e:10:00:31", "172.18.0.7", "cam-3")],
+    )
+    _sourced(es, {"172.18.0.7": _MIXED})
+
+    await job.run_dossier_refresh(es, maker, settings)
+
+    machines = await _machines(maker)
+    assert "mac:02:00:5e:10:00:31" in machines
+    assert machines["agent:agent-0002"].container_count == 0
+    await engine.dispose()
+
+
+async def test_a_mixed_address_outside_every_owned_bridge_stays_a_machine(
+    settings_kratos: Settings,
+) -> None:
+    """NEGATIVE CONTROL: the endpoint sensor sees a LAN peer outside its bridges."""
+    settings = _settings(settings_kratos)
+    engine, maker = await _db(settings)
+    es = _FakeES(
+        src={_HYPERVISOR: 3412, _LAPTOP: 40},
+        grid_datasets=_GRID_WITH_HOST_LOGS,
+        agents=[_agent_with_id("registry-a", [_HYPERVISOR, "172.18.0.1"], "agent-0002")],
+    )
+    _sourced(es, {_LAPTOP: _MIXED})
+
+    await job.run_dossier_refresh(es, maker, settings)
+
+    machines = await _machines(maker)
+    assert f"ip:{_LAPTOP}" in machines
+    assert machines["agent:agent-0002"].container_count == 0
     await engine.dispose()
 
 

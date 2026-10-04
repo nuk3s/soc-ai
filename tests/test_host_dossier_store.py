@@ -143,27 +143,127 @@ async def test_aware_timestamps_are_stored_as_naive_utc(settings_kratos: Setting
     await engine.dispose()
 
 
+# Part digests in the stored shape: "h:<hostname digest>|m:<MAC digest>".
+_NAME_A, _NAME_B = "a" * 16, "b" * 16
+_MAC_A, _MAC_B = "c" * 16, "d" * 16
+
+
+def _fp(name: str = "", mac: str = "") -> str:
+    return f"h:{name}|m:{mac}"
+
+
+async def _declare(db: AsyncSession, ip: str = "192.168.10.202") -> None:
+    await store.set_override(db, ip, "criticality", "high", actor="analyst", now=T0)
+
+
 async def test_identity_rebound_stamped_only_on_a_different_non_null_fingerprint(
     settings_kratos: Settings,
 ) -> None:
     engine, maker = await _db(settings_kratos)
     async with maker() as db:
-        row = await store.upsert_host(db, "192.168.10.202", identity_fingerprint="aaa", now=T0)
+        row = await store.upsert_host(
+            db, "192.168.10.202", identity_fingerprint=_fp(_NAME_A, _MAC_A), now=T0
+        )
         assert row.identity_rebound_at is None  # first sighting is not a rebind
+        await _declare(db)
 
         row = await store.upsert_host(
             db, "192.168.10.202", identity_fingerprint=None, now=T0 + HOUR
         )
-        assert row.identity_fingerprint == "aaa"  # silence is not a change
+        assert row.identity_fingerprint == _fp(_NAME_A, _MAC_A)  # silence is not a change
         assert row.identity_rebound_at is None
 
         row = await store.upsert_host(
-            db, "192.168.10.202", identity_fingerprint="bbb", now=T0 + 2 * HOUR
+            db, "192.168.10.202", identity_fingerprint=_fp(_NAME_A, _MAC_B), now=T0 + 2 * HOUR
         )
         await db.commit()
-        assert row.identity_fingerprint == "bbb"
+        assert row.identity_fingerprint == _fp(_NAME_A, _MAC_B)
         assert row.identity_rebound_at == T0 + 2 * HOUR
     await engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "known",
+    [
+        _fp(_NAME_A),
+        # The shape before the labels: "<hostname digest>:<MAC digest>".
+        f"{_NAME_A}:",
+    ],
+)
+async def test_a_mac_the_sweep_now_reads_is_not_a_rebind(
+    settings_kratos: Settings, known: str
+) -> None:
+    """Production 2026-10-02: 41 machines read "rebound" after the first machine sweep.
+
+    The sweep read DHCP MACs it never read before. A part that goes from no
+    value to a value is new evidence about the same machine.
+    """
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        await store.upsert_host(db, "192.168.10.202", identity_fingerprint=known, now=T0)
+        await _declare(db)
+
+        row = await store.upsert_host(
+            db, "192.168.10.202", identity_fingerprint=_fp(_NAME_A, _MAC_A), now=T0 + HOUR
+        )
+        await db.commit()
+        assert row.identity_rebound_at is None
+        assert row.identity_fingerprint == _fp(_NAME_A, _MAC_A)
+    await engine.dispose()
+
+
+async def test_a_legacy_fingerprint_whose_part_changed_is_a_rebind(
+    settings_kratos: Settings,
+) -> None:
+    """NEGATIVE CONTROL: the older stored shape still reads by part."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        await store.upsert_host(
+            db, "192.168.10.202", identity_fingerprint=f"{_NAME_A}:{_MAC_A}", now=T0
+        )
+        await _declare(db)
+
+        row = await store.upsert_host(
+            db, "192.168.10.202", identity_fingerprint=_fp(_NAME_B, _MAC_A), now=T0 + HOUR
+        )
+        await db.commit()
+        assert row.identity_rebound_at == T0 + HOUR
+    await engine.dispose()
+
+
+async def test_a_rebind_on_an_undeclared_address_stamps_nothing(
+    settings_kratos: Settings,
+) -> None:
+    """The tripwire tells an operator that an override may no longer apply.
+
+    An address with no declaration has no override to warn about. The new
+    fingerprint is still stored, so a later declaration compares against it.
+    """
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        await store.upsert_host(
+            db, "192.168.10.202", identity_fingerprint=_fp(_NAME_A, _MAC_A), now=T0
+        )
+        row = await store.upsert_host(
+            db, "192.168.10.202", identity_fingerprint=_fp(_NAME_A, _MAC_B), now=T0 + HOUR
+        )
+        await db.commit()
+        assert row.identity_rebound_at is None
+        assert row.identity_fingerprint == _fp(_NAME_A, _MAC_B)
+    await engine.dispose()
+
+
+def test_the_fingerprint_parts_read_both_stored_shapes() -> None:
+    assert store.fingerprint_parts(_fp(_NAME_A, _MAC_A)) == {"h": _NAME_A, "m": _MAC_A}
+    assert store.fingerprint_parts(_fp(_NAME_A)) == {"h": _NAME_A}
+    assert store.fingerprint_parts(f"{_NAME_A}:{_MAC_A}") == {"h": _NAME_A, "m": _MAC_A}
+    assert store.fingerprint_parts(f":{_MAC_A}") == {"m": _MAC_A}
+    # One digest over the whole cannot be split. It reads as no parts.
+    assert store.fingerprint_parts("e" * 64) == {}
+    assert store.fingerprint_parts(None) == {}
+    assert store.compose_fingerprint({"h": _NAME_A, "m": ""}) == _fp(_NAME_A)
+    assert store.compose_fingerprint({}) is None
+    assert len(store.compose_fingerprint({"h": _NAME_A, "m": _MAC_A}) or "") <= 64
 
 
 async def test_build_outcome_is_recorded_with_the_build_stamp(settings_kratos: Settings) -> None:
@@ -937,13 +1037,15 @@ async def test_identity_rebound_after_an_override_is_a_conflict(
 ) -> None:
     engine, maker = await _db(settings_kratos)
     async with maker() as db:
-        host = await store.upsert_host(db, "192.168.10.202", identity_fingerprint="aaa", now=T0)
+        host = await store.upsert_host(
+            db, "192.168.10.202", identity_fingerprint=_fp(_NAME_A, _MAC_A), now=T0
+        )
         await store.set_override(
             db, "192.168.10.202", "criticality", "high", actor="analyst", now=T0
         )
         # A different machine now answers on this address.
         host = await store.upsert_host(
-            db, "192.168.10.202", identity_fingerprint="bbb", now=T0 + 10 * HOUR
+            db, "192.168.10.202", identity_fingerprint=_fp(_NAME_B, _MAC_B), now=T0 + 10 * HOUR
         )
         result = await store.upsert_inferred(
             db,
@@ -1135,9 +1237,22 @@ async def test_list_dossiers_pages_filters_and_counts(settings_kratos: Settings)
         assert total == 4
         assert [r.ip for r, _fields in rows] == ["192.168.10.11", "192.168.10.10"]
 
-        rows, total = await store.list_dossiers(db, role="hypervisor")
+        rows, total = await store.list_dossiers(db, role="hypervisor", now=T0)
         assert total == 2
         assert {r.ip for r, _fields in rows} == {"192.168.10.10", "192.168.10.11"}
+
+        # Weeks later the inferred roles are stale. The filter applies the
+        # resolver's gates, as the ROLES bar does: the declared role stands,
+        # and the stale guesses move to the stale bucket.
+        later = T0 + timedelta(days=30)
+        rows, total = await store.list_dossiers(db, role="hypervisor", now=later)
+        assert {r.ip for r, _fields in rows} == {"192.168.10.11"}
+        rows, total = await store.list_dossiers(db, role="__stale__", now=later)
+        assert {r.ip for r, _fields in rows} == {
+            "192.168.10.10",
+            "192.168.10.12",
+            "192.168.10.13",
+        }
 
         rows, total = await store.list_dossiers(db, source="operator")
         assert [r.ip for r, _fields in rows] == ["192.168.10.11"]

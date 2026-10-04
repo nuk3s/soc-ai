@@ -871,3 +871,116 @@ def test_top_peers_exclude_multicast_and_link_local() -> None:
     }
     peers = [p["value"] for p in _collect_top_peers("10.0.0.1", aggs)]
     assert peers == ["8.8.8.8", "10.1.10.255"]
+
+
+# ---------------------------------------------------------------------------
+# Host logs: the documents the host's own agent ships. The flow query keys on
+# source.ip/destination.ip and never saw them, so a host that shipped
+# system.auth and osquery read as a host with nothing but flows.
+# ---------------------------------------------------------------------------
+
+_HOST_LOG_AGGS = {
+    "host_datasets": {
+        "buckets": [
+            {"key": "system.syslog", "doc_count": 62713, "newest": {}},
+            {"key": "system.auth", "doc_count": 11309, "newest": {}},
+            {"key": "osquery_manager.result", "doc_count": 2623, "newest": {}},
+        ]
+    },
+    "host_agents": {
+        "buckets": [
+            {
+                "key": "a1b2c3d4-0000-4000-8000-000000000001",
+                "doc_count": 76645,
+                "names": {"buckets": [{"key": "app-01"}]},
+                "os": {"buckets": [{"key": "Fedora Linux"}]},
+            }
+        ]
+    },
+}
+
+
+def _routing_search(
+    network: EsSearchResult, host_logs: EsSearchResult | Exception, calls: list[dict[str, Any]]
+) -> Any:
+    async def _search(index: str, query: dict[str, Any], **kwargs: Any) -> EsSearchResult:
+        calls.append({"query": query, **kwargs})
+        if "host_datasets" in (kwargs.get("aggs") or {}):
+            if isinstance(host_logs, Exception):
+                raise host_logs
+            return host_logs
+        return network
+
+    return _search
+
+
+@pytest.mark.asyncio
+async def test_host_summary_reads_host_logs_by_address_and_name(settings_kratos: Settings) -> None:
+    hits = [
+        {
+            "@timestamp": "2026-09-20T10:00:00Z",
+            "event.dataset": "zeek.dhcp",
+            "source.ip": "192.0.2.41",
+            "zeek": {"dhcp": {"host_name": "app-01.example.test"}},
+        }
+    ]
+    calls: list[dict[str, Any]] = []
+    elastic, _ = _make_elastic(settings_kratos, _result(hits))
+    elastic.search = _routing_search(  # type: ignore[method-assign]
+        _result(hits), EsSearchResult(total=76645, took_ms=1, aggregations=_HOST_LOG_AGGS), calls
+    )
+
+    out = await host_summary("192.0.2.41", elastic=elastic, settings=settings_kratos)
+
+    logs = out["host_logs"]
+    assert logs["read_ok"] is True
+    assert logs["datasets"] == {
+        "system.syslog": 62713,
+        "system.auth": 11309,
+        "osquery_manager.result": 2623,
+    }
+    assert logs["planes"] == ["host_logs", "osquery"]
+    assert logs["agent"]["name"] == "app-01"
+    assert "192.0.2.41 ships no process events" in " ".join(logs["sentences"])
+    # The read keys on host.ip and on host.name, short form included.
+    should = calls[-1]["query"]["bool"]["should"]
+    terms = {next(iter(c["terms"])): next(iter(c["terms"].values())) for c in should}
+    assert terms["host.ip"] == ["192.0.2.41"]
+    assert "app-01" in terms["host.name"]
+
+
+@pytest.mark.asyncio
+async def test_no_flow_is_not_no_observations_when_the_host_ships_logs(
+    settings_kratos: Settings,
+) -> None:
+    """Negative control on the path that read as "no host telemetry"."""
+    calls: list[dict[str, Any]] = []
+    elastic, _ = _make_elastic(settings_kratos, _result([], total=0))
+    elastic.search = _routing_search(  # type: ignore[method-assign]
+        _result([], total=0),
+        EsSearchResult(total=76645, took_ms=1, aggregations=_HOST_LOG_AGGS),
+        calls,
+    )
+
+    out = await host_summary("192.0.2.41", elastic=elastic, settings=settings_kratos)
+
+    assert out["observations"] is True
+    assert out["summary"].startswith("no network observations for 192.0.2.41")
+    assert "192.0.2.41 ships host logs" in out["summary"]
+    assert out["host_logs"]["datasets"]["system.auth"] == 11309
+
+
+@pytest.mark.asyncio
+async def test_a_failed_host_log_read_is_unknown(settings_kratos: Settings) -> None:
+    calls: list[dict[str, Any]] = []
+    elastic, _ = _make_elastic(settings_kratos, _result([], total=0))
+    elastic.search = _routing_search(  # type: ignore[method-assign]
+        _result([], total=0), TimeoutError("read timed out"), calls
+    )
+
+    out = await host_summary("192.0.2.41", elastic=elastic, settings=settings_kratos)
+
+    assert out["observations"] is False
+    assert out["host_logs"]["read_ok"] is False
+    assert out["host_logs"]["datasets"] == {}
+    assert "could not read the coverage of 192.0.2.41" in out["summary"]

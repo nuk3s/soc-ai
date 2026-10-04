@@ -580,6 +580,15 @@ async def _apply_closed_leads(
         await _join_lead(db, lead.id, loose)
         await db.commit()
         return [o for o in kept if o.lead_id is not None]
+    from soc_ai.store.leads import (  # noqa: PLC0415 - avoids an import cycle
+        AUTO_HUNT_ACTOR,
+        record_decision,
+    )
+
+    # The history keeps the close and states the reopen. Written before the
+    # dismissal is cleared, so a row with no history yet keeps its close.
+    # reopened_at stays empty: soc-ai reopened this lead, so the loop hunts it.
+    record_decision(lead, "reopened", naive_at, by=AUTO_HUNT_ACTOR, reason="new_type")
     lead.status = STATUS_OPEN
     lead.hunt_id = None
     lead.dismissed_reason = None

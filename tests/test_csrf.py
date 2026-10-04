@@ -184,7 +184,11 @@ def test_bearer_post_cross_origin_is_allowed(
         json={"status": "busy"},
         headers={"Authorization": f"Bearer {raw}", "Origin": CROSS_ORIGIN},
     )
-    assert resp.status_code == 200, resp.text
+    # The CSRF guard and the bearer check both pass. The handler then refuses
+    # because a token has no user row to hold a status (RD4). A 403 bad_origin
+    # here would mean the guard fired.
+    assert resp.status_code == 401, resp.text
+    assert resp.json()["detail"]["reason"] == "no_session"
 
 
 # ── GET / login exemptions ──────────────────────────────────────────────────
@@ -216,7 +220,9 @@ def test_dev_mode_no_cookie_is_exempt(open_client: TestClient) -> None:
         json={"status": "busy"},
         headers={"Origin": CROSS_ORIGIN},
     )
-    assert resp.status_code == 200
+    # Past the guard, the handler refuses a caller with no session user (RD4).
+    assert resp.status_code == 401, resp.text
+    assert resp.json()["detail"]["reason"] == "no_session"
 
 
 def test_dev_mode_with_cookie_still_enforced(open_client: TestClient) -> None:

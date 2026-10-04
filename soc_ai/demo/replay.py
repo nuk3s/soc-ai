@@ -84,8 +84,8 @@ def _unknown_alert_replay(alert_es_id: str) -> dict[str, Any]:
                     "type": "ReplayNotFound",
                     "message": f"no recorded demo replay for alert {alert_es_id}",
                     "hint": (
-                        "the public demo replays its recorded alerts only — "
-                        "pick an alert from the demo's alerts list"
+                        "The public demo replays its recorded alerts only. "
+                        "Pick an alert from the demo's alerts list."
                     ),
                 },
             },

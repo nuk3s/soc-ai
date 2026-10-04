@@ -32,7 +32,9 @@ import {
   Spinner,
   StaleNotice,
 } from '../components/States';
+import { AnalyticPins, entityLine } from '../components/AnalyticPins';
 import {
+  ApiError,
   type AnalyticDraftResult,
   type ChatThread,
   type HuntChatThread,
@@ -223,12 +225,16 @@ function splitCatalogDetail(f: HuntFinding): CatalogDetail | null {
 // VISIBILITY GAP is a coverage statement, and headlining it "Malicious
 // activity found" tells the analyst something the hunt never observed.
 const _SEV_ORDER = ['info', 'low', 'medium', 'high', 'critical'];
+//
+// A hunt that stopped (cancelled, interrupted, error) has no disposition. The
+// status pill names the stop and one sentence says why. The badge read
+// INCONCLUSIVE beside "Cancelled", and the page said the same stop four ways.
 function huntDisposition(
   status: HuntStatus | undefined,
   findings: HuntFinding[],
-): { label: string; color: string } {
+): { label: string; color: string } | null {
   if (status === 'running') return { label: 'Hunting…', color: '#4b8bf5' };
-  if (status !== 'complete') return { label: 'Inconclusive', color: '#8b949e' };
+  if (status !== 'complete') return null;
   const threats = findings.filter((f) => (f.category ?? 'threat') === 'threat');
   const gaps = findings.filter((f) => f.category === 'visibility_gap');
   const worst = threats.reduce(
@@ -244,6 +250,15 @@ function huntDisposition(
   // and an analyst had to decide whether they meant the same thing.
   if (gaps.length > 0) return { label: 'No threat observed · visibility gap', color: '#8b949e' };
   return { label: 'No malicious activity found', color: '#3fb950' }; // observations-only or clean
+}
+
+// The one sentence a stopped hunt shows. An error carries the stored reason.
+// A cancel and a restart are their own reason, so the stored text is not
+// needed to say them.
+function stopSentence(status: HuntStatus | undefined, narrative?: string | null): string {
+  if (status === 'cancelled') return 'A cancel request stopped this hunt before it finished.';
+  if (status === 'interrupted') return 'A service restart stopped this hunt before it finished.';
+  return narrative?.trim() || 'The hunt ended in an error. The server recorded no reason.';
 }
 
 function DispositionBadge({ label, color }: { label: string; color: string }) {
@@ -393,10 +408,14 @@ function FindingCard({
   catalog,
   sigmaOn,
   sigmaOff,
+  onChanged,
 }: {
   f: HuntFinding;
   huntId: string;
   ordinal: number;
+  /** Read the hunt again. A draft that finds an analytic already on the
+   *  finding asks for it, so the card links the analytic the server names. */
+  onChanged?: () => void;
   /** This finding came from a declarative spec, not a model (CATALOG_ACTOR).
    *  Its detail is a composed string whose halves have different provenance. */
   catalog: boolean;
@@ -420,9 +439,27 @@ function FindingCard({
   // the local tier, as a candidate. A candidate does not run. The analyst
   // moves it to shadow from the Analytics tab, which is why the result line
   // links there.
+  //
+  // Two steps. The click drafts and dry-runs the analytic and stores nothing.
+  // The confirm names the id and stores it. The one-click write aborted at the
+  // client's 20 s budget while the server committed, and the live button then
+  // wrote a duplicate.
   const [analyticBusy, setAnalyticBusy] = useState(false);
+  const [analyticPreview, setAnalyticPreview] = useState<
+    (AnalyticDraftResult & { notes?: string[] }) | null
+  >(null);
   const [analyticDraft, setAnalyticDraft] = useState<AnalyticDraftResult | null>(null);
   const [analyticErr, setAnalyticErr] = useState<string | null>(null);
+  const savedAnalytic = analyticDraft?.analytic_id ?? f.analyticId ?? null;
+  const analyticFailed = (err: unknown) => {
+    setAnalyticErr(err instanceof Error ? err.message : 'The analytic was not drafted.');
+    // The finding already has an analytic. Read the hunt again, and the card
+    // links the one the server names.
+    if (err instanceof ApiError && err.reason === 'analytic_exists_for_finding') {
+      setAnalyticPreview(null);
+      onChanged?.();
+    }
+  };
   // Only a threat finding can become an analytic. A visibility gap reports
   // telemetry this grid does not have, and an observation is benign context.
   const isThreat = (f.category ?? 'threat') === 'threat';
@@ -461,7 +498,7 @@ function FindingCard({
         {f.category === 'visibility_gap' && (
           <span
             className="flex-none rounded-chip border border-border-2 bg-surface-3 px-1.5 py-px text-[10px] font-semibold uppercase tracking-[.04em] text-dim"
-            title="A visibility gap reports telemetry that this grid does not have. The hunt observed no malicious activity here."
+            title="A visibility gap names a type of telemetry that this grid or this host does not ship. The finding title names the type. The hunt observed no malicious activity here."
           >
             visibility gap
           </span>
@@ -544,28 +581,26 @@ function FindingCard({
             Draft detection
           </button>
         )}
-        {isThreat && analyticDraft == null && (
-          // Draft an analytic (merge 5). No confirm-first gate here: the
-          // candidate never runs until an analyst moves it to shadow, so the
-          // cost of a weak draft is a row the analyst rejects.
+        {isThreat && savedAnalytic == null && analyticPreview == null && (
+          // Draft an analytic (merge 5). The confirm-first rule of Draft
+          // detection does not apply: the server drafts from any threat
+          // finding, and a candidate never runs until an analyst moves it to
+          // shadow. The click stores nothing. The confirm below stores it.
           <button
             type="button"
+            data-testid="draft-analytic"
             onClick={(e) => {
               e.stopPropagation();
               if (analyticBusy) return;
               setAnalyticBusy(true);
               setAnalyticErr(null);
-              draftAnalytic(huntId, ordinal)
-                .then((r) => setAnalyticDraft(r))
-                .catch((err) =>
-                  setAnalyticErr(
-                    err instanceof Error ? err.message : 'The analytic was not drafted.',
-                  ),
-                )
+              draftAnalytic(huntId, ordinal, { preview: true })
+                .then((r) => setAnalyticPreview(r))
+                .catch(analyticFailed)
                 .finally(() => setAnalyticBusy(false));
             }}
             disabled={analyticBusy}
-            title="Draft a catalog analytic from this finding. soc-ai stores it as a candidate. A candidate does not run until you move it to shadow."
+            title="Draft a catalog analytic from this threat finding. You read the draft and confirm before soc-ai stores it as a candidate. A candidate does not run."
             className="inline-flex items-center gap-1.5 rounded-badge border px-[9px] py-[3px] font-sans text-[11px] font-semibold text-accent disabled:opacity-50"
             style={{ borderColor: 'rgba(75,139,245,.3)', background: 'rgba(75,139,245,.07)' }}
           >
@@ -603,17 +638,99 @@ function FindingCard({
       {analyticErr && (
         <div className="mb-1.5 font-mono text-[11px] text-danger">{analyticErr}</div>
       )}
-      {analyticDraft && (
-        // One line, and the number an analyst reads before the move to shadow.
-        // A dry run that could not run says so; it never reads as zero.
-        <div className="mb-1.5 font-sans text-[11.5px] text-dim">
-          {`Candidate ${analyticDraft.analytic_id} written. `}
-          {analyticDraft.dry_run.ran
-            ? `Dry run over ${analyticDraft.dry_run.window_days} days: ${analyticDraft.dry_run.hit_count} matches. `
-            : 'The dry run did not run. The result is unknown. '}
-          <Link to="/hunts?tab=analytics" className="underline hover:text-text-2">
-            Open the Analytics tab
+      {analyticPreview && (
+        // The confirm. It names the id, states that a candidate does not
+        // run, and shows the dry run an analyst reads before the move to
+        // shadow. A dry run that could not run says so; it never reads as zero.
+        <div
+          role="dialog"
+          aria-label={`Save the analytic ${analyticPreview.analytic_id}`}
+          data-testid="draft-analytic-confirm"
+          className="mb-2 rounded-card border border-border-2 bg-surface-3 px-3 py-2.5 font-sans text-[12px] text-text-2"
+        >
+          <div className="font-semibold">
+            Save the analytic <span className="font-mono">{analyticPreview.analytic_id}</span> as a
+            candidate?
+          </div>
+          <div className="mt-1 text-dim">
+            A candidate does not run. Move it to shadow in the Analytics tab to run it.
+          </div>
+          {/* The pins sit above the dry run: a dry run of a pinned clause
+              counts the one case again, and reads as proof. */}
+          <AnalyticPins
+            pins={analyticPreview.generalization?.pinned}
+            label="This analytic is specific to one case."
+            testId="draft-analytic-pins"
+          />
+          <div className="mt-1 text-dim">
+            {analyticPreview.dry_run.ran
+              ? `Dry run over ${analyticPreview.dry_run.window_days} days: ${analyticPreview.dry_run.hit_count} matches. ${entityLine(analyticPreview.dry_run)}`.trim()
+              : 'The dry run did not run. The result is unknown.'}
+          </div>
+          {!analyticPreview.dry_run.ran && analyticPreview.dry_run.error && (
+            <div className="mt-1 font-mono text-[11px] text-faint">
+              {analyticPreview.dry_run.error}
+            </div>
+          )}
+          {(analyticPreview.notes ?? []).map((n) => (
+            <div key={n} className="mt-1 text-warn">
+              {n}
+            </div>
+          ))}
+          <div className="mt-2 flex items-center gap-2">
+            <button
+              type="button"
+              data-testid="draft-analytic-save"
+              disabled={analyticBusy}
+              onClick={() => {
+                if (analyticBusy) return;
+                setAnalyticBusy(true);
+                setAnalyticErr(null);
+                draftAnalytic(huntId, ordinal, {
+                  specYaml: analyticPreview.spec_yaml,
+                  ...(analyticPreview.generalization?.retried ? { retried: true } : {}),
+                })
+                  .then((r) => {
+                    setAnalyticDraft({ ...r, dry_run: analyticPreview.dry_run });
+                    setAnalyticPreview(null);
+                  })
+                  .catch(analyticFailed)
+                  .finally(() => setAnalyticBusy(false));
+              }}
+              className="rounded-control border border-accent bg-[rgba(75,139,245,.14)] px-[10px] py-1 text-[11.5px] font-semibold text-[#cfe0ff] disabled:opacity-60"
+            >
+              {analyticBusy
+                ? 'Saving…'
+                : analyticPreview.generalization?.pinned.length
+                  ? 'Save anyway'
+                  : 'Save candidate'}
+            </button>
+            <button
+              type="button"
+              disabled={analyticBusy}
+              onClick={() => setAnalyticPreview(null)}
+              className="rounded-control border border-border-strong bg-surface-2 px-[10px] py-1 text-[11.5px] font-semibold text-dim disabled:opacity-60"
+            >
+              Discard
+            </button>
+          </div>
+        </div>
+      )}
+      {savedAnalytic && (
+        // One line, and the link to the candidate itself.
+        <div data-testid="draft-analytic-saved" className="mb-1.5 font-sans text-[11.5px] text-dim">
+          {analyticDraft ? 'Candidate ' : 'Analytic '}
+          <Link
+            to={`/hunts?tab=analytics&open=${encodeURIComponent(savedAnalytic)}`}
+            className="font-mono underline hover:text-text-2"
+          >
+            {savedAnalytic}
           </Link>
+          {analyticDraft
+            ? analyticDraft.dry_run.ran
+              ? ` saved. Dry run over ${analyticDraft.dry_run.window_days} days: ${analyticDraft.dry_run.hit_count} matches.`
+              : ' saved. The dry run did not run. The result is unknown.'
+            : ' was drafted from this finding.'}
         </div>
       )}
       {spec ? (
@@ -647,10 +764,6 @@ function FindingCard({
           className="mt-2 rounded-card border px-3 py-2 text-[11.5px] leading-[1.5] text-dim"
           style={{ borderColor: 'rgba(107,135,168,.3)', background: 'rgba(107,135,168,.05)' }}
         >
-          <span className="font-semibold" style={{ color: '#8fa3bf' }}>
-            Post-validator
-          </span>
-          {': '}
           {f.validatorNote}
         </div>
       )}
@@ -819,9 +932,13 @@ export function HuntDetail() {
   // the current status in a ref and let pauseWhen consult it: stop polling once
   // the hunt reaches a terminal state.
   const statusRef = useRef<HuntStatus | undefined>(undefined);
+  // A 404 is an answer. The page for a bogus id polled it every 3 s for as
+  // long as the tab stayed open.
+  const notFoundRef = useRef(false);
   const { data, loading, error, lastUpdated, failCount } = useAsync<HuntDetailData>(() => getHunt(id), [id, reloadKey], {
     refetchInterval: 3000,
     pauseWhen: () => {
+      if (notFoundRef.current) return true;
       // Pause once the hunt reaches ANY terminal state. Only 'running' is live;
       // enumerating the terminal set missed 'interrupted', which then polled
       // every 3s forever. Gate on a known status that is not 'running' so a new
@@ -831,6 +948,7 @@ export function HuntDetail() {
     },
   });
   statusRef.current = data?.status;
+  notFoundRef.current = !data && isNotFound(error);
 
   const doCancel = () => {
     if (cancelling) return;
@@ -1014,7 +1132,7 @@ export function HuntDetail() {
                     className="mb-2.5 text-[13px] leading-[1.55] text-warn"
                     style={{ textWrap: 'pretty' }}
                   >
-                    {data.narrative?.trim() || 'The hunt failed. No reason was recorded.'}
+                    {stopSentence(data.status, data.narrative)}
                   </div>
                 )}
                 {/* generated title (from the objective) as the hero headline */}
@@ -1179,9 +1297,11 @@ export function HuntDetail() {
             </Panel>
           )}
 
-          {/* failure banner */}
+          {/* What a stopped hunt left behind. The reason sits under the
+              status pill, once. This line names only what the page holds. */}
           {failed && (
             <div
+              data-testid="hunt-stopped-banner"
               className="mt-[18px] flex items-start gap-2.5 rounded-panel-lg border px-[18px] py-3.5"
               style={{
                 borderColor: 'rgba(240,68,56,.32)',
@@ -1192,11 +1312,9 @@ export function HuntDetail() {
                 <AlertTriangle size={16} />
               </span>
               <div className="text-[13px] leading-[1.55] text-dim" style={{ textWrap: 'pretty' }}>
-                {status === 'cancelled'
-                  ? 'A cancel request stopped this hunt before it finished. The page still shows the partial findings and the trace below.'
-                  : status === 'interrupted'
-                    ? 'A service restart interrupted this hunt. The page still shows the partial findings and the trace below.'
-                    : 'This hunt ended in an error. The page still shows the partial findings and the trace below.'}
+                {data.findings.length > 0
+                  ? 'The findings and the trace below are partial.'
+                  : 'The trace below shows how far the hunt got.'}
               </div>
             </div>
           )}
@@ -1266,7 +1384,9 @@ export function HuntDetail() {
                   <Panel className="px-4 py-3.5 text-[13px] text-dim">
                     {complete
                       ? 'No findings. The hunt found nothing notable for this objective.'
-                      : 'No findings yet.'}
+                      : failed
+                        ? 'The hunt stopped before it recorded a finding.'
+                        : 'No findings yet.'}
                   </Panel>
                 ) : (
                   <div className="flex flex-col gap-2.5">
@@ -1275,7 +1395,7 @@ export function HuntDetail() {
                     {complete && (
                       <div className="text-[12px] leading-[1.5] text-faint" style={{ textWrap: 'pretty' }}>
                         Promote a finding to investigate it. Draft a detection from a confirmed true
-                        positive.
+                        positive. Draft an analytic from any threat finding.
                       </div>
                     )}
                     {data.findings.map((f, i) => (
@@ -1287,6 +1407,7 @@ export function HuntDetail() {
                         catalog={catalog}
                         sigmaOn={sigmaOn}
                         sigmaOff={sigmaOff}
+                        onChanged={() => setReloadKey((k) => k + 1)}
                       />
                     ))}
                   </div>

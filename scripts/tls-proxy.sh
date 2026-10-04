@@ -7,6 +7,7 @@
 # for the certificate and reports the result. It backs .env up first.
 #
 #   scripts/tls-proxy.sh enable <domain> [auto|internal|<cert.pem> <key.pem>]
+#   scripts/tls-proxy.sh enable <domain> acme <directory-url> <root.pem>
 #   scripts/tls-proxy.sh disable
 #   scripts/tls-proxy.sh status
 #   scripts/tls-proxy.sh --dry-run enable <domain> [...]
@@ -27,6 +28,7 @@ usage_die(){ printf '%s %s\n' "${R}✗${N}" "$*" >&2; exit 2; }
 usage(){ cat <<'USAGE'
 Usage:
   scripts/tls-proxy.sh enable <domain> [auto|internal|<cert.pem> <key.pem>]
+  scripts/tls-proxy.sh enable <domain> acme <directory-url> <root.pem>
   scripts/tls-proxy.sh disable
   scripts/tls-proxy.sh status
   scripts/tls-proxy.sh --dry-run enable <domain> [...]
@@ -40,6 +42,13 @@ enable    Put Caddy in front of soc-ai on <domain>, ports 80 and 443.
           <cert.pem> <key.pem>
                      Your own certificate and key. The script copies them
                      into ./certs/.
+          acme <directory-url> <root.pem>
+                     A certificate from your own ACME CA, for example
+                     step-ca or a Caddy acme_server. Caddy obtains and
+                     renews it. The URL is the https ACME directory. The
+                     root file is the CA root. Caddy trusts it for the
+                     connection to the CA. The script copies it into
+                     ./certs/acme-ca-root.pem.
 disable   Go back to the direct path. soc-ai terminates TLS on port 8443.
 status    Print the mode, the domain, the source and one health check.
 --dry-run Print the .env changes and the commands. Change nothing.
@@ -125,11 +134,33 @@ valid_domain(){
   [[ $1 =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]]
 }
 
+# An https URL with no space, quote or brace. The value lands in .env and in
+# the Caddyfile through SOC_AI_CADDY_TLS, so it must stay one plain token.
+valid_acme_url(){
+  [[ $1 =~ ^https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?(/[A-Za-z0-9._~%/-]*)?$ ]]
+}
+
+# The root file holds a certificate and no private key.
+check_acme_root(){
+  [[ -r $1 ]] || usage_die "Root certificate file not found: $1"
+  grep -q -- '-----BEGIN CERTIFICATE-----' "$1" \
+    || usage_die "The root file holds no PEM certificate: $1"
+  ! grep -q -- 'PRIVATE KEY-----' "$1" \
+    || usage_die "The root file holds a private key. Give the CA root certificate only: $1"
+}
+
+# The Caddyfile snippet acme_ca takes the directory URL and the root path.
+ACME_SNIPPET="import acme_ca"
+ACME_ROOT_FILE=certs/acme-ca-root.pem
+
+acme_url_of(){ local rest=${1#"${ACME_SNIPPET} "}; printf '%s' "${rest%% *}"; }
+
 source_label(){
   case "$1" in
-    "")             printf 'auto (Let'"'"'s Encrypt)' ;;
-    "tls internal") printf 'internal (Caddy CA)' ;;
-    *)              printf 'your files in ./certs/' ;;
+    "")                  printf 'auto (Let'"'"'s Encrypt)' ;;
+    "tls internal")      printf 'internal (Caddy CA)' ;;
+    "${ACME_SNIPPET} "*) printf 'acme (%s)' "$(acme_url_of "$1")" ;;
+    *)                   printf 'your files in ./certs/' ;;
   esac
 }
 
@@ -145,20 +176,28 @@ print_trust_steps(){
 
 # ── enable ────────────────────────────────────────────────────────────────────
 cmd_enable(){
-  local domain=${1:-} src cert key tls_value project net subnet code
-  [[ -n $domain ]] || usage_die "enable needs a domain. Usage: scripts/tls-proxy.sh enable <domain> [auto|internal|<cert.pem> <key.pem>]"
+  local domain=${1:-} src cert key acme_url acme_root tls_value project net subnet code
+  [[ -n $domain ]] || usage_die "enable needs a domain. Usage: scripts/tls-proxy.sh enable <domain> [auto|internal|acme <directory-url> <root.pem>|<cert.pem> <key.pem>]"
   valid_domain "$domain" || usage_die "Domain '${domain}' is not valid. Use letters, digits, dots and hyphens, with at least one dot."
   shift
-  case $# in
-    0) src=auto ;;
-    1) src=$1
-       [[ $src == auto || $src == internal ]] \
-         || usage_die "Source must be auto, internal, or a certificate file and a key file. Got '${src}'." ;;
-    2) src=files; cert=$1; key=$2
-       [[ -r $cert ]] || usage_die "Certificate file not found: ${cert}"
-       [[ -r $key ]]  || usage_die "Key file not found: ${key}" ;;
-    *) usage_die "Too many arguments. Usage: scripts/tls-proxy.sh enable <domain> [auto|internal|<cert.pem> <key.pem>]" ;;
-  esac
+  if [[ ${1:-} == acme ]]; then
+    [[ $# -eq 3 ]] || usage_die "acme needs the directory URL and the root certificate file. Usage: scripts/tls-proxy.sh enable <domain> acme <directory-url> <root.pem>"
+    src=acme; acme_url=$2; acme_root=$3
+    valid_acme_url "$acme_url" \
+      || usage_die "The ACME directory URL must be one https URL with no space, quote or brace. Got '${acme_url}'."
+    check_acme_root "$acme_root"
+  else
+    case $# in
+      0) src=auto ;;
+      1) src=$1
+         [[ $src == auto || $src == internal ]] \
+           || usage_die "Source must be auto, internal, acme, or a certificate file and a key file. Got '${src}'." ;;
+      2) src=files; cert=$1; key=$2
+         [[ -r $cert ]] || usage_die "Certificate file not found: ${cert}"
+         [[ -r $key ]]  || usage_die "Key file not found: ${key}" ;;
+      *) usage_die "Too many arguments. Usage: scripts/tls-proxy.sh enable <domain> [auto|internal|acme <directory-url> <root.pem>|<cert.pem> <key.pem>]" ;;
+    esac
+  fi
   [[ -f .env ]] || die ".env not found. Run ./setup.sh first, or copy .env.example to .env."
   # The main stack bind-mounts the two files. Without them Docker creates two
   # directories with those names, and a later disable fails on them.
@@ -169,6 +208,7 @@ cmd_enable(){
     auto)     tls_value="" ;;
     internal) tls_value="tls internal" ;;
     files)    tls_value="tls /certs/proxy-cert.pem /certs/proxy-key.pem" ;;
+    acme)     tls_value="${ACME_SNIPPET} ${acme_url} /${ACME_ROOT_FILE}" ;;
   esac
   project=$(project_name); net="${project}_default"
 
@@ -186,6 +226,7 @@ cmd_enable(){
     info "Commands:"
     [[ $src == files ]] && echo "    cp ${cert} certs/proxy-cert.pem && cp ${key} certs/proxy-key.pem"
     [[ $src == files ]] && echo "    docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile   # when Caddy already runs"
+    [[ $src == acme ]] && echo "    cp ${acme_root} ${ACME_ROOT_FILE}"
     echo "    cp .env .env.bak-<stamp>"
     echo "    docker network inspect ${net} -f '{{(index .IPAM.Config 0).Subnet}}'   # after docker compose up --no-start when the network is absent"
     echo "    docker compose up -d"
@@ -195,6 +236,7 @@ cmd_enable(){
       echo "    docker compose logs caddy   # until it says: certificate obtained"
     fi
     [[ $src == internal ]] && echo "    docker compose cp caddy:/data/caddy/pki/authorities/local/root.crt ./caddy-root.crt"
+    [[ $src == acme ]] && echo "    curl --cacert ${ACME_ROOT_FILE} --resolve ${domain}:443:127.0.0.1 https://${domain}/healthz   # the chain check"
     ok "Dry run. Nothing changed."
     return 0
   fi
@@ -206,6 +248,11 @@ cmd_enable(){
     cp "$cert" certs/proxy-cert.pem; chmod 0644 certs/proxy-cert.pem
     cp "$key"  certs/proxy-key.pem;  chmod 0640 certs/proxy-key.pem
     ok "Copied the certificate and the key into ./certs/ as proxy-cert.pem (0644) and proxy-key.pem (0640)."
+  fi
+  if [[ $src == acme ]]; then
+    mkdir -p certs
+    cp "$acme_root" "$ACME_ROOT_FILE"; chmod 0644 "$ACME_ROOT_FILE"
+    ok "Copied the ACME CA root into ./${ACME_ROOT_FILE} (0644)."
   fi
   env_set SOC_AI_TLS_CERT ""
   env_set SOC_AI_TLS_KEY ""
@@ -273,6 +320,16 @@ cmd_enable(){
   done
   if [[ $code == 200 ]]; then ok "Health check: HTTP ${code} from https://${domain}/healthz"
   else warn "Health check: HTTP ${code} from https://${domain}/healthz. Read: docker compose logs caddy soc-ai"; fi
+
+  # The health check skips the certificate check. For ACME, check that the
+  # served chain ends at the root the operator gave.
+  if [[ $src == acme ]]; then
+    code=$(curl -s -m 5 --cacert "$ACME_ROOT_FILE" --resolve "${domain}:443:127.0.0.1" \
+      "https://${domain}/healthz" -o /dev/null -w '%{http_code}' 2>/dev/null || echo 000)
+    if [[ $code == 200 ]]; then ok "Chain check: the certificate for ${domain} chains to ./${ACME_ROOT_FILE}."
+    else warn "Chain check failed: the served certificate does not chain to ./${ACME_ROOT_FILE}. Read: docker compose logs caddy"; fi
+    info "Caddy renews the certificate from ${acme_url}. Clients need the same root in their trust store."
+  fi
 
   if [[ $src == internal ]]; then
     if "${DOCKER[@]}" compose cp caddy:/data/caddy/pki/authorities/local/root.crt ./caddy-root.crt; then

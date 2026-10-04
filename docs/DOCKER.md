@@ -73,7 +73,8 @@ soc-ai has two TLS paths.
 
 The proxy path is the production path. Caddy terminates TLS in front of soc-ai and renews
 the certificate on its own. soc-ai serves plain HTTP inside the compose network. Use this
-path for a public name, for Caddy's own CA in a lab, or for a certificate from your own CA.
+path for a public name, for Caddy's own CA in a lab, for an ACME CA of your own, or for a
+certificate from your own CA.
 One command, `scripts/tls-proxy.sh enable <domain>`, sets it up.
 
 The direct path is the default after `setup.sh`. uvicorn terminates TLS with a certificate
@@ -89,6 +90,8 @@ One command sets it up. It takes the domain and, as an option, the certificate s
 scripts/tls-proxy.sh enable soc-ai.example.com                    # Let's Encrypt, the default
 scripts/tls-proxy.sh enable soc-ai.example.com internal           # Caddy's own CA
 scripts/tls-proxy.sh enable soc-ai.example.com cert.pem key.pem   # your own certificate and key
+scripts/tls-proxy.sh enable soc-ai.example.com acme \
+  https://ca.example.com/acme/local/directory ca-root.pem          # your own ACME CA
 ```
 
 - `auto`, the default: automatic HTTPS from Let's Encrypt. The name must resolve to this
@@ -99,6 +102,16 @@ scripts/tls-proxy.sh enable soc-ai.example.com cert.pem key.pem   # your own cer
   full chain: the leaf first, then each issuer. The script copies the two files into
   `./certs/` as `proxy-cert.pem` and `proxy-key.pem`. To install a renewed pair, run the same
   command with the new files. The script copies them and reloads Caddy.
+- `acme <directory-url> <root.pem>`: a certificate from an ACME CA on your network, for
+  example step-ca or a Caddy `acme_server`. Caddy obtains the certificate and renews it with
+  no key copy. The URL is the https ACME directory of the CA. The root file is the CA root
+  certificate. Caddy trusts it for the connection to the CA. The script copies it into
+  `./certs/acme-ca-root.pem` and writes
+  `SOC_AI_CADDY_TLS=import acme_ca <directory-url> /certs/acme-ca-root.pem`. The `acme_ca`
+  snippet in the `Caddyfile` turns that line into the `ca` and `ca_root` settings. The CA
+  must reach this host on port 80 or 443 under the domain name to validate the order. After
+  the start the script checks that the served chain ends at the root file. Clients need the
+  same root in their trust store. Use this source when a fleet already trusts a private CA.
 
 The script backs up `.env` to `.env.bak-<stamp>` and then changes these settings:
 
@@ -115,8 +128,9 @@ The script backs up `.env` to `.env.bak-<stamp>` and then changes these settings
   addresses your analysts connect from.
 
 Then it runs `docker compose up -d`, waits up to 120 s for the certificate, and prints the
-URL and a health check. `--dry-run` before the verb prints the changes and the commands and
-changes nothing.
+URL and a health check. The health check does not verify the certificate. For `acme`, a
+second check verifies the chain against the root file. `--dry-run` before the verb prints
+the changes and the commands and changes nothing.
 
 The self-signed pair in `./certs/` stays. The main stack still mounts the two files, and the
 direct path needs them again after `disable`.
@@ -229,7 +243,7 @@ Run the liveness check. It says whether the server answers:
 
 ```bash
 curl -k https://localhost:8443/healthz
-# → {"status":"alive","checks":"none — liveness only, no dependency is probed. …",
+# → {"status":"alive","checks":"None. This is a liveness probe only. It probes no dependency. …",
 #    "version":"1.5.0","so_auth":"kratos",...}
 ```
 

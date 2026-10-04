@@ -344,7 +344,7 @@ export function ManagedList({
                       on={row.mutable ? active : true}
                       disabled={!row.mutable}
                       onChange={(next) => row.id != null && onSetActive(row.id, next)}
-                      label={`Active — ${row.value}`}
+                      label={`Active: ${row.value}`}
                     />
                     {!row.mutable && <span className="text-[10px] text-faint">always on</span>}
                   </div>

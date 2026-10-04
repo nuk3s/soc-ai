@@ -110,6 +110,11 @@ export function NotificationsPanel({
   };
 
   const isSet = !!status?.isSet;
+  // Whether a save can store the URL. Read defensively: a server older than
+  // the field sends nothing, and that must not lock the control.
+  const store = status as (NotifyWebhookStatus & { can_store?: boolean; store_hint?: string | null }) | null;
+  const canStore = store?.can_store !== false;
+  const storeHint = canStore ? null : store?.store_hint ?? 'soc-ai cannot store the webhook URL.';
 
   return (
     <div id="notifications-webhook" className="mb-[22px] scroll-mt-6">
@@ -127,8 +132,9 @@ export function NotificationsPanel({
       {!collapsed && (
         <>
           <div className="mb-3 text-[12.5px] leading-[1.5] text-dim">
-            This webhook is the one outbound egress path in soc-ai. soc-ai stores the URL
-            encrypted, applies it live and never shows it again. soc-ai sends nothing until you set
+            This webhook is one of the outbound egress paths in soc-ai. The Egress policy section
+            lists every path. soc-ai stores the URL encrypted, applies it live and never shows it
+            again. soc-ai sends nothing until you set
             this URL <strong>and</strong> turn on "Notifications enabled" above. Use{' '}
             <strong>Send test</strong> to check the destination first. The test sends a synthetic
             message with no internal data. The test does not need the master toggle.
@@ -165,7 +171,9 @@ export function NotificationsPanel({
                       setMsg(null);
                       setPendingClear(false);
                     }}
-                    className="flex-none rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-[5px] text-[11.5px] font-semibold text-text hover:border-accent"
+                    disabled={!canStore}
+                    title={storeHint ?? undefined}
+                    className="flex-none rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-[5px] text-[11.5px] font-semibold text-text hover:border-accent disabled:cursor-not-allowed disabled:opacity-50"
                   >
                     {isSet ? 'Replace' : 'Set'}
                   </button>
@@ -232,11 +240,19 @@ export function NotificationsPanel({
                     {busy ? 'Saving…' : 'Save'}
                   </button>
                   <button
-                    onClick={cancel}
+                    onClick={() => {
+                      cancel();
+                      setMsg(null);
+                    }}
                     className="rounded-[7px] border border-border-strong px-[11px] py-1.5 text-[12px] font-semibold text-dim hover:text-text"
                   >
                     Cancel
                   </button>
+                </div>
+              )}
+              {storeHint && (
+                <div data-testid="webhook-store-hint" className="mt-1.5 text-[11.5px] text-warn">
+                  {storeHint}
                 </div>
               )}
               {msg && (

@@ -1,135 +1,183 @@
-// The host list is the front door to the host pages: one row per machine, the
-// identity an operator glances at, and a flags column that says which rows
-// want a human. The 2026-08-08 dogfood pass found it ranking noise first (the
-// one host that mattered was row 41 of 41), spending two columns on dashes,
-// and printing per-row confidence decimals nobody acts on. These tests pin the
-// rebuilt shape:
-//   * the landing order is IMPORTANCE — declared criticality, then named, then
-//     any host a human has touched (the backend's sort=importance); ATTENTION —
-//     broken, conflicted, declared, named — stays one click away in the control;
-//   * criticality and the human-touch badges merge into one flags column, and
-//     a broken build is finally findable (row marker + summary door +
-//     ?health=broken filter);
-//   * every filter/sort/pager control reaches the SERVER — the table is one
-//     SQL page of a network that can be 5,000 hosts;
-//   * an unresolved field renders as em-dash TEXT, never a link (the
-//     /entity/%E2%80%94 defect);
-//   * first run is one sentence and one action, not four zero tiles over a
-//     live search box.
+// The host list: one row per MACHINE (dogfood 2026-10-02). The owner's words:
+// "I am not convinced that the search works. The columns cannot be filtered or
+// sorted. There is clearly an issue with hosts with multiple nics being
+// displayed multiple times." These tests pin the rebuilt screen:
+//   * a real table: column headers that sort both ways and say so with
+//     aria-sort, header filters for role, agent and activity, and one tab
+//     stop per row (plus the checkbox for an admin);
+//   * one search box that asks the server over the whole census, debounced,
+//     from page 1 in one request, and says that it reads every host;
+//   * every control in the URL, so Back, reload and the breadcrumb return to
+//     the same list;
+//   * the cards and the role bar are links to the filters they count.
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
+import { useLayoutEffect } from 'react';
+import { MemoryRouter, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
+  Dossier,
   DossierConflicts,
-  DossierFieldBrief,
-  DossierFieldName,
   DossierList,
   DossierRow,
   DossierSummary,
+  MachineList,
+  MachineRow,
+  MachineSummary,
 } from '../lib/types';
 
-const FIELDS: DossierFieldName[] = [
-  'hostname',
-  'mac',
-  'os_family',
-  'os_detail',
-  'role',
-  'services_offered',
-  'management_plane',
-  'domain_membership',
-  'is_static_addressed',
-  'activity_profile',
-  'criticality',
-  'policy_notes',
-];
+vi.mock('../lib/api', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../lib/api')>()),
+  listMachines: vi.fn(),
+  getMachineSummary: vi.fn(),
+  listDossiers: vi.fn(),
+  getDossier: vi.fn(),
+  getDossierConflicts: vi.fn(),
+  getDossierSummary: vi.fn(),
+  getDossierRefreshStatus: vi.fn(),
+  startDossierRefresh: vi.fn(),
+  getMe: vi.fn(),
+  bulkSetDossierOverride: vi.fn(),
+  listSavedViews: vi.fn(),
+}));
 
-const brief = (
-  field: DossierFieldName,
-  over: Partial<DossierFieldBrief> = {},
-): DossierFieldBrief => ({
-  field,
+import {
+  bulkSetDossierOverride,
+  getDossier,
+  getDossierConflicts,
+  getDossierRefreshStatus,
+  getDossierSummary,
+  getMachineSummary,
+  getMe,
+  listDossiers,
+  listMachines,
+  listSavedViews,
+  startDossierRefresh,
+} from '../lib/api';
+import { listUrlToReturnTo } from '../lib/hostsList';
+import { Hosts } from './Hosts';
+
+// ---- fixtures ---------------------------------------------------------------
+
+const UNKNOWN_ROLE = {
   value: null,
-  value_json: null,
-  source: null,
-  confidence: 0,
-  strength: 'none',
-  reason: 'no_signal',
-  overridden: false,
-  conflict_kind: null,
+  label: null,
+  confidence: null,
+  state: 'unknown' as const,
+  guess: null,
+  stale_hours: null,
+};
+
+const NO_FLAGS = { declared: false, conflict: false, broken: false, new: false, rebound: false };
+
+const machine = (key: string, over: Partial<MachineRow> = {}): MachineRow => ({
+  key,
+  href: `/hosts/${encodeURIComponent(key)}`,
+  name: null,
+  name_source: null,
+  names: [],
+  primary_ip: '192.0.2.99',
+  address_count: 1,
+  addresses: [over.primary_ip ?? '192.0.2.99'],
+  container_count: 0,
+  agent: null,
+  role: UNKNOWN_ROLE,
+  events: 4,
+  first_seen: '2026-09-01T00:00:00+00:00',
+  last_seen: '2026-10-01T11:00:00+00:00',
+  flags: NO_FLAGS,
   ...over,
 });
 
-const host = (
-  ip: string,
-  over: Partial<DossierRow> = {},
-  resolved: Partial<Record<DossierFieldName, Partial<DossierFieldBrief>>> = {},
-): DossierRow => ({
-  ip,
-  found: true,
-  fields: FIELDS.map((f) => brief(f, resolved[f] ?? {})),
-  first_seen: '2026-08-01T00:00:00+00:00',
-  last_seen: '2026-08-07T11:00:00+00:00',
-  last_built_at: '2026-08-07T11:30:00+00:00',
-  last_observed_at: '2026-08-07T11:00:00+00:00',
-  event_count: 4,
-  identity_rebound_at: null,
-  build_error: null,
-  override_count: 0,
-  conflict_count: 0,
-  reporting: false,
-  ...over,
+// A machine with seven addresses: one row, the primary address, "+6".
+const PROXY = machine('agent:a1', {
+  name: 'web01',
+  name_source: 'agent',
+  names: [{ value: 'web01', source: 'agent' }],
+  primary_ip: '192.0.2.10',
+  address_count: 7,
+  addresses: ['192.0.2.10', '198.51.100.4', '198.51.100.5', '198.51.100.6', '198.51.100.7'],
+  agent: { id: 'a1', name: 'web01', os: 'Ubuntu 24.04', last_report: '2026-10-01T10:00:00+00:00' },
+  role: { value: 'server', label: 'server', confidence: 0.9, state: 'inferred', guess: null, stale_hours: null },
+  events: 11158,
 });
 
-// A host a human has argued with: role declared, and the sweep still disagrees.
-const BLUE = host(
-  '192.168.10.8',
-  { event_count: 8123, override_count: 2, conflict_count: 1, reporting: true },
-  {
-    role: {
-      value: 'hypervisor',
-      source: 'operator',
-      confidence: 1,
-      strength: 'strong',
-      reason: null,
-      overridden: true,
-      conflict_kind: 'mismatch',
-    },
-    hostname: { value: 'blue', source: 'banner', confidence: 0.9, strength: 'strong', reason: null },
-    criticality: {
-      value: 'high',
-      source: 'operator',
-      confidence: 1,
-      strength: 'strong',
-      reason: null,
-      overridden: true,
-    },
+// No name, a role the resolver withheld.
+const UNNAMED = machine('mac:aa:bb:cc:dd:ee:01', {
+  primary_ip: '192.0.2.20',
+  addresses: ['192.0.2.20'],
+  role: {
+    value: null,
+    label: null,
+    confidence: 0.4,
+    state: 'low_confidence',
+    guess: 'hypervisor',
+    stale_hours: null,
   },
-);
-
-// The normal early-life row: found, but nothing has resolved yet.
-const QUIET = host('192.168.10.9');
-
-// The two health states the flags column must make findable (F3).
-const BROKEN = host('192.168.10.140', {
-  build_error: 'elasticsearch: ConnectionTimeout after 30s querying logs-* (window 14d)',
 });
-const NEVER_BUILT = host('192.168.10.77', { last_built_at: null });
 
-const page = (rows: DossierRow[], total = rows.length, offset = 0): DossierList => ({
+// A DNS name and a stale role.
+const PRINTER = machine('ip:192.0.2.30', {
+  name: 'printer.example.test',
+  name_source: 'dns',
+  primary_ip: '192.0.2.30',
+  addresses: ['192.0.2.30'],
+  role: { value: null, label: null, confidence: 0.8, state: 'stale', guess: 'iot', stale_hours: 200 },
+});
+
+const page = (rows: MachineRow[], total = rows.length, offset = 0): MachineList => ({
   rows,
   total,
   limit: 50,
   offset,
+  sort: 'last_seen',
+  dir: 'desc',
 });
+
+const SUMMARY: MachineSummary = {
+  machines: 144,
+  addresses: 205,
+  with_agent: 12,
+  without_agent: 132,
+  new_7d: 4,
+  named: 60,
+  unnamed: 84,
+  roles: { server: 20, workstation: 7, hypervisor: 0, low_confidence: 9, stale: 2, unknown: 103 },
+  needs_attention: 5,
+  conflicts: 2,
+  never_built: 3,
+  last_sweep_at: '2026-10-01T08:00:00+00:00',
+  stale_hours: null,
+};
+
+// The same census under activity=active: the header menus read this one.
+const ACTIVE_SUMMARY: MachineSummary = {
+  ...SUMMARY,
+  machines: 110,
+  with_agent: 12,
+  without_agent: 136,
+  roles: { server: 16, workstation: 5, hypervisor: 0, low_confidence: 8, stale: 0, unknown: 81 },
+};
+
+// The address census: swept, schedule off.
+const CENSUS: DossierSummary = {
+  hosts: 337,
+  never_built: 3,
+  named: 55,
+  reporting: 43,
+  conflicts: 2,
+  roles: { server: 20 },
+  last_built_at: '2026-10-01T08:00:00+00:00',
+  schedule_enabled: false,
+};
 
 const CONFLICTS: DossierConflicts = {
   pending: 2,
   rows: [
     {
-      ip: '192.168.10.8',
+      ip: '192.0.2.10',
       field: 'role',
       kind: 'mismatch',
-      first_seen_at: '2026-08-03T09:00:00+00:00',
+      first_seen_at: '2026-09-03T09:00:00+00:00',
       observations: 7,
       last_prompted_at: null,
       prompt_count: 1,
@@ -139,15 +187,13 @@ const CONFLICTS: DossierConflicts = {
       inferred_value: 'server',
       inferred_value_json: null,
       identity_rebound_at: null,
-      href: '/entity/192.168.10.8',
+      href: '/entity/192.0.2.10',
     },
     {
-      // The JSON-shaped case: both scalars are null and the answer rides in
-      // the _json columns — a row reading only the scalars renders blank here.
-      ip: '192.168.10.9',
+      ip: '192.0.2.20',
       field: 'services_offered',
       kind: 'mismatch',
-      first_seen_at: '2026-08-04T09:00:00+00:00',
+      first_seen_at: '2026-09-04T09:00:00+00:00',
       observations: 3,
       last_prompted_at: null,
       prompt_count: 0,
@@ -157,583 +203,709 @@ const CONFLICTS: DossierConflicts = {
       inferred_value: null,
       inferred_value_json: ['ssh', 'http'],
       identity_rebound_at: null,
-      href: '/entity/192.168.10.9',
+      href: '/entity/192.0.2.20',
     },
   ],
 };
 
-// A network far bigger than any page of it: none of these numbers could be
-// derived from the two-row list fixture, which is the point.
-const SUMMARY: DossierSummary = {
-  hosts: 147,
-  never_built: 3,
-  named: 25,
-  reporting: 13,
-  conflicts: 2,
-  roles: { server: 12, workstation: 30 },
-  last_built_at: '2026-08-07T08:00:00+00:00',
-  schedule_enabled: false,
-};
-
-vi.mock('../lib/api', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../lib/api')>()),
-  listDossiers: vi.fn(),
-  getDossierConflicts: vi.fn(),
-  getDossierSummary: vi.fn(),
-  getDossierRefreshStatus: vi.fn(),
-  startDossierRefresh: vi.fn(),
-  getMe: vi.fn(),
-  bulkSetDossierOverride: vi.fn(),
-}));
-
-import {
-  bulkSetDossierOverride,
-  getDossierConflicts,
-  getDossierRefreshStatus,
-  getDossierSummary,
-  getMe,
-  listDossiers,
-  startDossierRefresh,
-} from '../lib/api';
-import { roleAccent } from '../lib/hostColors';
-import { Hosts, LOW_CONFIDENCE_ROLE } from './Hosts';
-
 beforeEach(() => {
-  vi.mocked(listDossiers).mockReset().mockResolvedValue(page([BLUE, QUIET]));
+  sessionStorage.clear();
+  vi.mocked(listMachines).mockReset().mockResolvedValue(page([PROXY, UNNAMED, PRINTER]));
+  vi.mocked(getMachineSummary).mockReset().mockResolvedValue(SUMMARY);
+  vi.mocked(listDossiers).mockReset();
+  vi.mocked(getDossier).mockReset();
   vi.mocked(getDossierConflicts).mockReset().mockResolvedValue({ pending: 0, rows: [] });
-  vi.mocked(getDossierSummary).mockReset().mockResolvedValue(SUMMARY);
+  vi.mocked(getDossierSummary).mockReset().mockResolvedValue(CENSUS);
   vi.mocked(getDossierRefreshStatus)
     .mockReset()
     .mockResolvedValue({ running: false, last_run: null, last_summary: null, note: null });
   vi.mocked(startDossierRefresh).mockReset();
   vi.mocked(getMe).mockReset().mockResolvedValue({ username: 'ana', role: 'analyst', status: '' });
   vi.mocked(bulkSetDossierOverride).mockReset().mockResolvedValue({ updated: [], not_found: [], failed: [] });
+  vi.mocked(listSavedViews).mockReset().mockResolvedValue([]);
 });
+
+// ---- harness ----------------------------------------------------------------
+
+/** The machine page stand-in: where the row link went, with a Back button. */
+function HostStub() {
+  const loc = useLocation();
+  const navigate = useNavigate();
+  return (
+    <div>
+      <div data-testid="here">{loc.pathname}</div>
+      <div data-testid="here-state">{JSON.stringify(loc.state)}</div>
+      <button type="button" onClick={() => navigate(-1)}>
+        go back
+      </button>
+    </div>
+  );
+}
+
+/** The machine page stand-in that does what the browser does when the long
+ *  list leaves the pane: the pane is short now, so its scroll goes to 0 and a
+ *  scroll event fires. It runs in a layout effect, before the list's passive
+ *  unmount cleanup. */
+function PaneResetStub() {
+  useLayoutEffect(() => {
+    const pane = document.querySelector<HTMLElement>('[data-testid="scroller"]');
+    if (!pane) return;
+    pane.scrollTop = 0;
+    pane.dispatchEvent(new Event('scroll'));
+  }, []);
+  return <HostStub />;
+}
+
+function UrlProbe() {
+  const loc = useLocation();
+  return <div data-testid="url">{`${loc.pathname}${loc.search}`}</div>;
+}
 
 const mount = (url = '/hosts') =>
   render(
     <MemoryRouter initialEntries={[url]}>
-      <Hosts />
+      <UrlProbe />
+      <Routes>
+        <Route path="/hosts" element={<Hosts />} />
+        <Route path="/hosts/:key" element={<HostStub />} />
+      </Routes>
     </MemoryRouter>,
   );
 
-/** The last query object listDossiers was called with. */
-const lastQuery = () => vi.mocked(listDossiers).mock.calls.slice(-1)[0][0];
+/** The last query listMachines was called with. */
+const lastQuery = () => vi.mocked(listMachines).mock.calls.slice(-1)[0][0]!;
+const url = () => screen.getByTestId('url').textContent;
+const rowOf = (m: MachineRow) => screen.getByTestId(`machine-row-${m.key}`);
+const header = (name: string) => screen.getByRole('columnheader', { name: new RegExp(`^${name}`) });
+const asAdmin = () =>
+  vi.mocked(getMe).mockResolvedValue({ username: 'root', role: 'admin', status: '' });
+/** The list has rendered: the web01 row's link is on screen. */
+const ready = () => screen.findByRole('link', { name: 'web01, 192.0.2.10' });
 
-/** One host's table row, reached from its address link. */
-const rowFor = (ip: string) => screen.getByText(ip).closest('a')!.parentElement!.parentElement!;
+// ---- the table --------------------------------------------------------------
 
-describe('Hosts table', () => {
-  it('calls the table what the nav, the breadcrumb and every other string call it', async () => {
+describe('Hosts table: one row per machine', () => {
+  it('is a real table with column headers', async () => {
     mount();
-    expect(await screen.findByText(`Hosts · ${(2).toLocaleString()}`)).toBeTruthy();
-    expect(screen.queryByText(/^Network/)).toBeNull();
+    await ready();
+    const table = screen.getByRole('table');
+    const headers = within(table)
+      .getAllByRole('columnheader')
+      .map((h) => (h.textContent ?? '').trim());
+    expect(headers).toEqual(['Host', 'Address', 'Agent', 'Role', 'Events', 'First seen', 'Last seen']);
+    // One row per machine: three machines, three body rows.
+    expect(within(table).getAllByRole('row')).toHaveLength(4);
   });
 
-  it('renders identity per row — and not a single confidence decimal', async () => {
+  it('shows a machine with many addresses once, with the primary address and +N', async () => {
     mount();
-    await screen.findByText('192.168.10.8');
-    const row = rowFor('192.168.10.8');
-    expect(within(row).getByText('hypervisor')).toBeTruthy();
-    expect(within(row).getByText('blue')).toBeTruthy();
-    expect(within(row).getByText((8123).toLocaleString())).toBeTruthy();
-    // "0.63" vs "0.70" is not a distinction an analyst acts on in a table (F7).
-    expect(row.textContent).not.toMatch(/0\.\d{2}/);
-  });
-
-  it('colours the role with the same accent the host page uses', async () => {
-    mount();
-    await screen.findByText('192.168.10.8');
-    const role = within(rowFor('192.168.10.8')).getByText('hypervisor');
-    expect(role.className).toContain(roleAccent('hypervisor'));
-  });
-
-  it('spells the role the same way in the row pill and the ROLES legend', async () => {
-    // One screen, one value, two renderings: the pill printed the raw slug
-    // (`network_device`) while the legend counting that very host printed the
-    // friendly label ("network device"). Both read the label now, and the
-    // stored slug stays one hover away on the pill's title.
-    const SWITCH = host(
-      '192.168.10.30',
-      {},
-      {
-        role: {
-          value: 'network_device',
-          source: 'behaviour',
-          confidence: 0.9,
-          strength: 'strong',
-          reason: null,
-        },
-      },
+    await ready();
+    const row = rowOf(PROXY);
+    expect(within(row).getByText('192.0.2.10')).toBeTruthy();
+    const more = within(row).getByTestId('address-more');
+    expect(more.textContent).toBe('+6');
+    // The other addresses ride the tooltip. The API sends the first five, so
+    // the rest are counted.
+    expect(more.getAttribute('title')).toBe(
+      '198.51.100.4, 198.51.100.5, 198.51.100.6, 198.51.100.7, and 2 more addresses',
     );
-    vi.mocked(listDossiers).mockResolvedValue(page([SWITCH]));
-    vi.mocked(getDossierSummary).mockResolvedValue({
-      ...SUMMARY,
-      hosts: 1,
-      roles: { network_device: 1 },
-    });
-    mount();
-    await screen.findByText('192.168.10.30');
-
-    const pill = within(rowFor('192.168.10.30')).getByTitle('network_device');
-    expect(pill.textContent).toBe('network device');
-    const legend = await screen.findByTestId('role-bar');
-    expect(legend.textContent).toContain('network device');
-    expect(legend.textContent).not.toContain('network_device');
+    // No other row repeats the machine.
+    expect(screen.getAllByText('web01', { selector: 'a' })).toHaveLength(1);
   });
 
-  it('merges criticality and the human-touch badges into one flags cell', async () => {
+  it('names the machine and its name source, and says "no name" when there is none', async () => {
     mount();
-    await screen.findByText('192.168.10.8');
-    const row = rowFor('192.168.10.8');
-    // Criticality is a word an operator declared — it renders as itself.
-    expect(within(row).getByText('high')).toBeTruthy();
-    expect(within(row).getByTitle(/declared 2 fields/i)).toBeTruthy();
-    expect(within(row).getByTitle(/disagrees/i).textContent).toContain('1');
-    // The old CRITICALITY and LANES column headers are gone.
-    expect(screen.queryByText('Lanes')).toBeNull();
-    expect(screen.queryByText('Criticality')).toBeNull();
+    await ready();
+    expect(within(rowOf(PROXY)).getByText('agent', { selector: 'div' })).toBeTruthy();
+    expect(within(rowOf(PRINTER)).getByText('DNS')).toBeTruthy();
+    expect(within(rowOf(UNNAMED)).getByText('no name')).toBeTruthy();
   });
 
-  it('marks which rows the blind spots are NOT — agent coverage per row', async () => {
-    // The REPORTING count used to aggregate ("no agent data on 32") with no
-    // way to see which rows were the blind spots (F12). The wire now carries
-    // `reporting` per host, so the flags cell can say it row by row.
+  it('shows the agent name and OS, or "none"', async () => {
     mount();
-    await screen.findByText('192.168.10.8');
-    expect(within(rowFor('192.168.10.8')).getByTitle(/reports its own logs/i)).toBeTruthy();
-    expect(within(rowFor('192.168.10.9')).queryByTitle(/reports its own logs/i)).toBeNull();
+    await ready();
+    expect(within(rowOf(PROXY)).getByText('Ubuntu 24.04')).toBeTruthy();
+    expect(within(rowOf(UNNAMED)).getByText('none')).toBeTruthy();
   });
 
-  it('marks a broken build on its row, with the stored error in reach', async () => {
-    vi.mocked(listDossiers).mockResolvedValue(page([BROKEN, NEVER_BUILT]));
-    mount();
-    await screen.findByText('192.168.10.140');
-    expect(
-      within(rowFor('192.168.10.140')).getByTitle(/ConnectionTimeout/),
-    ).toBeTruthy();
-    // "Never looked" and "looked and it broke" are different states.
-    expect(within(rowFor('192.168.10.77')).getByTitle(/never built/i)).toBeTruthy();
-  });
-
-  it('renders an unresolved field as quiet text, never a pivot link', async () => {
-    mount();
-    await screen.findByText('192.168.10.9');
-    const dashes = screen.getAllByText('—');
-    expect(dashes.length).toBeGreaterThan(0);
-    // `/entity/%E2%80%94` — an entity page for a punctuation mark — is the bug
-    // this pins. Emptiness is a matter of VALUE, not truthiness.
-    for (const d of dashes) expect(d.closest('a')).toBeNull();
-  });
-
-  it('links each IP to its host page', async () => {
-    mount();
-    await screen.findByText('192.168.10.8');
-    const hrefs = screen.getAllByRole('link').map((a) => a.getAttribute('href'));
-    expect(hrefs).toContain('/hosts/192.168.10.8');
-    expect(hrefs).toContain('/hosts/192.168.10.9');
-  });
-
-  it('speaks the analyst`s language, not the resolver`s', async () => {
-    mount();
-    await screen.findByText('192.168.10.8');
-    const text = document.body.textContent ?? '';
-    expect(text).not.toMatch(/\blanes?\b/i);
-    expect(text).not.toMatch(/resolved on read/i);
-    expect(text).not.toMatch(/\binference\b/i);
-    // The subtitle is the user's version of the doctrine sentence.
-    expect(text).toMatch(/your declaration replaces the sweep's answer/i);
-  });
-});
-
-describe('Hosts ordering', () => {
-  it('lands on importance — the named, graded hosts above the anonymous tail', async () => {
-    // Dogfood B2a (2026-08-11): `attention` leads with "no clean build", which
-    // on a real estate is nearly every host, so the whole first screen read
-    // `HOST — ROLE —` and the crown jewels sat below the fold. The mock answers
-    // the order it was ASKED for, so a screen that still asks for attention
-    // renders the anonymous row first and fails the position assertion.
-    vi.mocked(listDossiers).mockImplementation((q) =>
-      Promise.resolve(
-        q?.sort === 'importance'
-          ? page([BLUE, QUIET, NEVER_BUILT])
-          : page([NEVER_BUILT, QUIET, BLUE]),
-      ),
+  it('shows the role with its state from the wire', async () => {
+    vi.mocked(listMachines).mockResolvedValue(
+      page([PROXY, UNNAMED, PRINTER, machine('ip:192.0.2.40', { primary_ip: '192.0.2.40' })]),
     );
     mount();
-    await screen.findByText('192.168.10.8');
-    expect(lastQuery()).toMatchObject({ sort: 'importance' });
-
-    const named = rowFor('192.168.10.8');
-    const anonymous = rowFor('192.168.10.77');
-    expect(named.compareDocumentPosition(anonymous) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    await ready();
+    expect(within(rowOf(PROXY)).getByText('server')).toBeTruthy();
+    expect(within(rowOf(PROXY)).getByText('inferred')).toBeTruthy();
+    expect(within(rowOf(UNNAMED)).getByTestId('role-low-confidence').textContent).toBe(
+      'low confidence: hypervisor',
+    );
+    expect(within(rowOf(PRINTER)).getByTestId('role-stale').textContent).toBe('stale 8d: IoT device');
+    expect(screen.getByTestId('role-unknown').textContent).toBe('unknown');
   });
 
-  it('keeps needs-attention as an opt-in sort — broken hosts stay one click away', async () => {
-    // The property the attention order was built for survives the demotion: it
-    // is still in the control, and the ?health=broken door is untouched.
+  it('gives each row one tab stop, a link to the machine page', async () => {
     mount();
-    await screen.findByText('192.168.10.8');
-    const sort = screen.getByLabelText('Sort') as HTMLSelectElement;
-    expect([...sort.options].map((o) => o.value)).toContain('attention');
-    fireEvent.change(sort, { target: { value: 'attention' } });
-    await waitFor(() => expect(lastQuery()).toMatchObject({ sort: 'attention' }));
+    await ready();
+    const row = rowOf(PROXY);
+    const links = within(row).getAllByRole('link');
+    expect(links).toHaveLength(1);
+    expect(links[0].getAttribute('href')).toBe('/hosts/agent%3Aa1');
+    // Nothing else in the row takes focus for an analyst.
+    expect(within(row).queryAllByRole('button')).toHaveLength(0);
+    expect(within(row).queryAllByRole('checkbox')).toHaveLength(0);
   });
 
-  it('still offers the other orders, server-side', async () => {
+  it('adds the checkbox as the second tab stop for an admin', async () => {
+    asAdmin();
     mount();
-    await screen.findByText('192.168.10.8');
-    fireEvent.change(screen.getByLabelText('Sort'), { target: { value: 'event_count' } });
-    await waitFor(() => expect(lastQuery()).toMatchObject({ sort: 'event_count' }));
+    await screen.findByLabelText('Select web01');
+    const row = rowOf(PROXY);
+    expect(within(row).getAllByRole('link')).toHaveLength(1);
+    expect(within(row).getAllByRole('checkbox')).toHaveLength(1);
+  });
+
+  it('opens the machine page from a row click', async () => {
+    mount();
+    await ready();
+    fireEvent.click(within(rowOf(PRINTER)).getByText('stale 8d: IoT device'));
+    expect((await screen.findByTestId('here')).textContent).toBe('/hosts/ip%3A192.0.2.30');
+  });
+
+  it('says the header count in machines and addresses', async () => {
+    mount();
+    await ready();
+    await waitFor(() =>
+      expect(screen.getByTestId('hosts-count').textContent).toBe('144 machines · 205 addresses'),
+    );
   });
 });
 
-describe('Hosts summary bar', () => {
-  it('states the network, not the page it is sitting on', async () => {
+// ---- sorting ----------------------------------------------------------------
+
+describe('Hosts sort: every header sorts, both ways', () => {
+  it('lands on last seen, newest first, and says so with aria-sort', async () => {
     mount();
-    await screen.findByText('192.168.10.8');
-    expect(getDossierSummary).toHaveBeenCalled();
-    const bar = screen.getByTestId('hosts-summary');
-    expect(within(bar).getByText('147')).toBeTruthy();
-    expect(bar.textContent).toMatch(/25 named/);
-    // The table's own count still describes the page's match set, unchanged.
-    expect(screen.getByText('1–2 of 2')).toBeTruthy();
+    await ready();
+    expect(lastQuery()).toMatchObject({ sort: 'last_seen', dir: 'desc' });
+    expect(header('Last seen').getAttribute('aria-sort')).toBe('descending');
+    expect(header('Host').getAttribute('aria-sort')).toBe('none');
   });
 
-  it('sits above the disagreement queue and the table', async () => {
-    vi.mocked(getDossierConflicts).mockResolvedValue(CONFLICTS);
+  it('sorts on a header click, then toggles the direction', async () => {
     mount();
-    const bar = await screen.findByTestId('hosts-summary');
-    const banner = await screen.findByRole('button', { name: /disagreements need review/i });
-    const panel = screen.getByText(/^Hosts · /);
-    const follows = (node: Element) =>
-      Boolean(bar.compareDocumentPosition(node) & Node.DOCUMENT_POSITION_FOLLOWING);
-    expect(follows(banner)).toBe(true);
-    expect(follows(panel)).toBe(true);
+    await ready();
+    fireEvent.click(within(header('Host')).getByRole('button', { name: /^Host/ }));
+    await waitFor(() => expect(lastQuery()).toMatchObject({ sort: 'name', dir: 'asc' }));
+    expect(header('Host').getAttribute('aria-sort')).toBe('ascending');
+    expect(header('Last seen').getAttribute('aria-sort')).toBe('none');
+    expect(url()).toBe('/hosts?sort=name');
+
+    fireEvent.click(within(header('Host')).getByRole('button', { name: /^Host/ }));
+    await waitFor(() => expect(lastQuery()).toMatchObject({ sort: 'name', dir: 'desc' }));
+    expect(header('Host').getAttribute('aria-sort')).toBe('descending');
+    expect(url()).toBe('/hosts?sort=name&dir=desc');
   });
 
-  it('keeps the counts when the summary fails, without taking the table down', async () => {
-    vi.mocked(getDossierSummary).mockRejectedValue(new Error('500 Internal Server Error'));
+  it('starts a count or a time column at the biggest, and an address at the lowest', async () => {
     mount();
-    await screen.findByText('192.168.10.8');
-    expect(screen.getByTestId('hosts-summary').textContent).toMatch(/could not be read/i);
-    expect(within(rowFor('192.168.10.8')).getByText('hypervisor')).toBeTruthy();
+    await ready();
+    fireEvent.click(within(header('Events')).getByRole('button', { name: /^Events/ }));
+    await waitFor(() => expect(lastQuery()).toMatchObject({ sort: 'events', dir: 'desc' }));
+    fireEvent.click(within(header('Address')).getByRole('button', { name: /^Address/ }));
+    await waitFor(() => expect(lastQuery()).toMatchObject({ sort: 'address', dir: 'asc' }));
   });
 
-  it('dates the sweep once, from one clock', async () => {
-    // The run line keeps the counters the bar has not got, and gives up its
-    // clock — two "last sweep" ages from two different stamps was F6.
-    vi.mocked(getMe).mockResolvedValue({ username: 'root', role: 'admin', status: '' });
-    vi.mocked(getDossierRefreshStatus).mockResolvedValue({
-      running: false,
-      last_run: '2026-08-07T09:00:00+00:00',
-      last_summary: { hosts_built: 147, fields_written: 1240 },
-      note: null,
-    });
-    mount();
-    const line = await screen.findByTestId('sweep-run-summary');
-    expect(line.textContent).toMatch(/147 hosts built/);
-    expect(line.textContent).toMatch(/1,240 fields written/);
-    expect(line.textContent).not.toMatch(/ago/);
-    expect(screen.getByTestId('hosts-summary').textContent).toMatch(/swept/i);
-  });
-
-  it('re-counts the network after a sweep finishes', async () => {
-    vi.mocked(getMe).mockResolvedValue({ username: 'root', role: 'admin', status: '' });
-    let running = true;
-    vi.mocked(getDossierRefreshStatus).mockImplementation(async () => ({
-      running,
-      last_run: null,
-      last_summary: null,
-      note: null,
-    }));
-
-    vi.useFakeTimers();
-    try {
-      mount();
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(0);
-      });
-      expect(vi.mocked(getDossierSummary)).toHaveBeenCalledTimes(1);
-
-      running = false;
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(5000);
-      });
-      expect(vi.mocked(getDossierSummary)).toHaveBeenCalledTimes(2);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it('marks the counts stale when the post-sweep re-count fails, and keeps them', async () => {
-    vi.mocked(getMe).mockResolvedValue({ username: 'root', role: 'admin', status: '' });
-    let running = true;
-    vi.mocked(getDossierRefreshStatus).mockImplementation(async () => ({
-      running,
-      last_run: null,
-      last_summary: null,
-      note: null,
-    }));
-    vi.mocked(getDossierSummary)
-      .mockResolvedValueOnce(SUMMARY)
-      .mockRejectedValue(new Error('503 Service Unavailable'));
-
-    vi.useFakeTimers();
-    try {
-      mount();
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(0);
-      });
-      expect(within(screen.getByTestId('hosts-summary')).getByText('147')).toBeTruthy();
-
-      running = false;
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(5000);
-      });
-
-      expect(within(screen.getByTestId('hosts-summary')).getByText('147')).toBeTruthy();
-      expect(screen.getByTestId('hosts-summary').textContent).toMatch(/could not refresh/i);
-    } finally {
-      vi.useRealTimers();
-    }
+  it('resets the page to 1 in the same request', async () => {
+    mount('/hosts?page=3');
+    await waitFor(() => expect(lastQuery()).toMatchObject({ offset: 100 }));
+    const before = vi.mocked(listMachines).mock.calls.length;
+    fireEvent.click(within(header('Agent')).getByRole('button', { name: /^Agent/ }));
+    await waitFor(() => expect(lastQuery()).toMatchObject({ sort: 'agent', offset: 0 }));
+    expect(vi.mocked(listMachines).mock.calls.length).toBe(before + 1);
   });
 });
 
-describe('Hosts controls reach the server', () => {
-  it('asks for one SQL page and pages forward by the page size', async () => {
-    vi.mocked(listDossiers).mockResolvedValue(page([BLUE, QUIET], 120));
-    mount();
-    await screen.findByText('192.168.10.8');
-    expect(lastQuery()).toMatchObject({ limit: 50, offset: 0 });
-    expect(screen.getByText('1–50 of 120')).toBeTruthy();
+// ---- header filters -----------------------------------------------------------
 
-    fireEvent.click(screen.getByRole('button', { name: /next/i }));
-    await waitFor(() => expect(lastQuery()).toMatchObject({ offset: 50 }));
+describe('Hosts header filters', () => {
+  it('lists the roles machines hold, with counts, and the three buckets', async () => {
+    mount();
+    await ready();
+    await waitFor(() => expect(getMachineSummary).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole('button', { name: 'Filter by role' }));
+    const menu = await screen.findByRole('menu', { name: 'Role filter' });
+    const roleGroup = within(menu).getByRole('group', { name: 'Role' });
+    const items = within(roleGroup)
+      .getAllByRole('menuitemradio')
+      .map((i) => (i.textContent ?? '').replace(/\s+/g, ' ').trim());
+    expect(items).toEqual([
+      'any role',
+      'server20',
+      'workstation7',
+      'low confidence9',
+      'stale2',
+      'unknown103',
+    ]);
+    // A role no machine holds is not offered.
+    expect(within(menu).queryByText('hypervisor')).toBeNull();
   });
 
-  it('lands on hosts with traffic — the screen default, server-side', async () => {
+  it('counts each menu choice under the activity the list shows', async () => {
+    // Dogfood 2026-10-02: the Role menu read "unknown 117" and the Agent menu
+    // "without an agent 172" from the whole census. The default list keeps the
+    // machines with events and showed 81 and 136.
+    vi.mocked(getMachineSummary).mockImplementation((activity) =>
+      Promise.resolve(activity === 'active' ? ACTIVE_SUMMARY : SUMMARY),
+    );
     mount();
-    await screen.findByText('192.168.10.8');
+    await ready();
+    await waitFor(() => expect(getMachineSummary).toHaveBeenCalledWith('active'));
+    fireEvent.click(screen.getByRole('button', { name: 'Filter by role' }));
+    const roleMenu = await screen.findByRole('menu', { name: 'Role filter' });
+    const roleItems = within(within(roleMenu).getByRole('group', { name: 'Role' }))
+      .getAllByRole('menuitemradio')
+      .map((i) => (i.textContent ?? '').replace(/\s+/g, ' ').trim());
+    // The stale bucket stays on offer at 0. A missing option reads as a
+    // broken filter, and the count says the list is empty.
+    expect(roleItems).toEqual(['any role', 'server16', 'workstation5', 'low confidence8', 'stale0', 'unknown81']);
+    fireEvent.keyDown(document, { key: 'Escape' });
+    fireEvent.click(screen.getByRole('button', { name: 'Filter by agent' }));
+    expect(await screen.findByRole('menuitemradio', { name: /^without an agent/ })).toHaveProperty(
+      'textContent',
+      'without an agent136',
+    );
+    // The cards count every machine. They read the summary with no activity.
+    expect(getMachineSummary).toHaveBeenCalledWith();
+    expect(screen.getByTestId('sum-without-agent').textContent).toContain('132');
+  });
+
+  it('counts the menus over every machine when the list shows every machine', async () => {
+    // NEGATIVE CONTROL: activity=all must not read the active counts.
+    vi.mocked(getMachineSummary).mockImplementation((activity) =>
+      Promise.resolve(activity === 'active' ? ACTIVE_SUMMARY : SUMMARY),
+    );
+    mount('/hosts?activity=all');
+    await ready();
+    await waitFor(() => expect(getMachineSummary).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole('button', { name: 'Filter by agent' }));
+    expect(await screen.findByRole('menuitemradio', { name: /^without an agent/ })).toHaveProperty(
+      'textContent',
+      'without an agent132',
+    );
+    expect(getMachineSummary).not.toHaveBeenCalledWith('active');
+  });
+
+  it('filters on unknown, and the request names it', async () => {
+    mount('/hosts?page=2');
+    await ready();
+    fireEvent.click(screen.getByRole('button', { name: 'Filter by role' }));
+    fireEvent.click(await screen.findByRole('menuitemradio', { name: /^unknown/ }));
+    await waitFor(() => expect(lastQuery()).toMatchObject({ role: 'unknown', offset: 0 }));
+    expect(url()).toBe('/hosts?role=unknown');
+    expect(screen.getByRole('button', { name: 'Filter by role' }).getAttribute('data-active')).toBe('true');
+    expect(screen.getByRole('button', { name: /Remove the filter Role: unknown/ })).toBeTruthy();
+  });
+
+  it('opens the menu at the button, outside the clipped table panel', async () => {
+    // The table panel clips its overflow. An absolute menu on a list with no
+    // rows was cut off exactly when the operator needed to change a filter.
+    vi.mocked(listMachines).mockResolvedValue(page([], 0));
+    mount('/hosts?role=stale');
+    await screen.findByText(/No machines match/);
+    fireEvent.click(screen.getByRole('button', { name: 'Filter by role' }));
+    const menu = await screen.findByRole('menu', { name: 'Role filter' });
+    expect(menu.style.position).toBe('fixed');
+    // Escape closes it.
+    fireEvent.keyDown(document, { key: 'Escape' });
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull());
+  });
+
+  it('filters on the agent', async () => {
+    mount();
+    await ready();
+    fireEvent.click(screen.getByRole('button', { name: 'Filter by agent' }));
+    fireEvent.click(await screen.findByRole('menuitemradio', { name: /^without an agent/ }));
+    await waitFor(() => expect(lastQuery()).toMatchObject({ agent: 'no' }));
+    expect(url()).toBe('/hosts?agent=no');
+  });
+
+  it('filters on activity, and the default asks for machines with events', async () => {
+    mount();
+    await ready();
     expect(lastQuery()).toMatchObject({ activity: 'active' });
-    expect(lastQuery()?.source).toBeUndefined();
-    // The escape hatch names what it hides and offers the way out.
-    expect(screen.getByText(/this table hides quiet hosts/i)).toBeTruthy();
-
-    fireEvent.click(screen.getByRole('button', { name: /show all hosts/i }));
-    await waitFor(() => expect(lastQuery()?.activity).toBeUndefined());
-    expect(lastQuery()?.source).toBeUndefined();
-    expect(screen.queryByText(/this table hides quiet hosts/i)).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Filter by activity' }));
+    fireEvent.click(await screen.findByRole('menuitemradio', { name: /^all machines/ }));
+    await waitFor(() => expect(lastQuery()).toMatchObject({ activity: 'all' }));
+    expect(url()).toBe('/hosts?activity=all');
   });
 
-  it('sends the search to the server, debounced, from the first page', async () => {
-    vi.mocked(listDossiers).mockResolvedValue(page([BLUE, QUIET], 120));
+  it('filters on the declaration from the role menu', async () => {
     mount();
-    await screen.findByText('192.168.10.8');
-    fireEvent.click(screen.getByRole('button', { name: /next/i }));
-    await waitFor(() => expect(lastQuery()).toMatchObject({ offset: 50 }));
-
-    fireEvent.change(screen.getByPlaceholderText(/search/i), { target: { value: 'blue' } });
-    await waitFor(() => expect(lastQuery()).toMatchObject({ q: 'blue', offset: 0 }));
+    await ready();
+    fireEvent.click(screen.getByRole('button', { name: 'Filter by role' }));
+    fireEvent.click(await screen.findByRole('menuitemradio', { name: 'declared by an operator' }));
+    await waitFor(() => expect(lastQuery()).toMatchObject({ declared: 'yes' }));
   });
 
-  it('sends the role and declared prefilters to the server', async () => {
-    mount();
-    await screen.findByText('192.168.10.8');
-
-    fireEvent.change(screen.getByLabelText('Role'), { target: { value: 'workstation' } });
-    await waitFor(() => expect(lastQuery()).toMatchObject({ role: 'workstation' }));
-
-    fireEvent.change(screen.getByLabelText('Show'), { target: { value: 'operator' } });
-    await waitFor(() => expect(lastQuery()).toMatchObject({ source: 'operator' }));
+  it('removes a filter from its chip', async () => {
+    mount('/hosts?role=server&agent=yes');
+    await ready();
+    fireEvent.click(screen.getByRole('button', { name: /Remove the filter With an agent/ }));
+    await waitFor(() => expect(url()).toBe('/hosts?role=server'));
+    expect(lastQuery().agent).toBeUndefined();
   });
 
-  it('offers roles from the summary wire vocabulary, not just this page', async () => {
-    // `printer` is a role no host on the page carries — it can only reach the
-    // filter from the server's vocabulary. This is the F10 fix: the filter reads
-    // the wire, so a new backend role is selectable without a frontend edit.
-    vi.mocked(getDossierSummary).mockResolvedValue({
-      ...SUMMARY,
-      role_vocabulary: ['workstation', 'server', 'printer'],
-    });
+  it('has no Show control and no Sort dropdown any more', async () => {
+    // The Show control mixed the traffic filter with the declaration filter,
+    // so the two could not combine (U14). The header filters replace it.
     mount();
-    await screen.findByText('192.168.10.8');
-
-    const roleSelect = screen.getByLabelText('Role') as HTMLSelectElement;
-    const values = Array.from(roleSelect.options).map((o) => o.value);
-    expect(values).toContain('printer');
-    // And selecting it reaches the server like any other role.
-    fireEvent.change(roleSelect, { target: { value: 'printer' } });
-    await waitFor(() => expect(lastQuery()).toMatchObject({ role: 'printer' }));
+    await ready();
+    expect(screen.queryByLabelText('Show')).toBeNull();
+    expect(screen.queryByLabelText('Sort')).toBeNull();
   });
 });
 
-describe('Hosts — quiet-but-real census', () => {
-  it('a real but entirely quiet census is "no hosts match", never "first run"', async () => {
-    // getDossierSummary's default mock (SUMMARY.hosts = 147, from beforeEach)
-    // is the TRUE census — a network that has been swept. This pins the
-    // DNS-only-census case the activity filter exists for: every host on it
-    // reads event_count=0, so the default activity=active page reports
-    // total=0 even though the network is real and has been swept — `total`
-    // driving `firstRun` was the bug; `summary.hosts` is the fix.
-    vi.mocked(listDossiers).mockImplementation((q) =>
-      Promise.resolve(q?.activity === 'active' ? page([], 0) : page([QUIET], 1)),
+// ---- search -----------------------------------------------------------------
+
+describe('Hosts search', () => {
+  it('asks the server over the whole census, debounced, in one request from page 1', async () => {
+    mount('/hosts?page=2');
+    await waitFor(() => expect(lastQuery()).toMatchObject({ offset: 50 }));
+    const before = vi.mocked(listMachines).mock.calls.length;
+    vi.mocked(listMachines).mockResolvedValue(page([PROXY], 1));
+
+    fireEvent.change(screen.getByLabelText('Search hosts'), { target: { value: 'web' } });
+    fireEvent.change(screen.getByLabelText('Search hosts'), { target: { value: 'web01' } });
+    // Nothing until the debounce runs out.
+    expect(vi.mocked(listMachines).mock.calls.length).toBe(before);
+
+    await waitFor(() => expect(lastQuery()).toMatchObject({ q: 'web01', offset: 0, limit: 50 }));
+    // One request for the search: the page reset rides in the same URL write.
+    expect(vi.mocked(listMachines).mock.calls.length).toBe(before + 1);
+    expect(url()).toBe('/hosts?q=web01');
+    // The pager counts the matches.
+    await waitFor(() => expect(screen.getByTestId('hosts-pager').textContent).toBe('1 to 1 of 1'));
+  });
+
+  it('says it searches all hosts while a query is set', async () => {
+    mount('/hosts?q=web01');
+    await ready();
+    expect(screen.getByTestId('hosts-search-scope').textContent).toBe(
+      'Searching all hosts. The activity filter does not apply to a search.',
+    );
+    // The quiet-machines note describes the activity filter, which the search
+    // does not apply.
+    expect(screen.queryByText(/hides quiet machines/i)).toBeNull();
+  });
+
+  it('says nothing about scope without a query', async () => {
+    mount();
+    await ready();
+    expect(screen.queryByTestId('hosts-search-scope')).toBeNull();
+    expect(screen.getByText(/hides quiet machines/i)).toBeTruthy();
+  });
+
+  it('says what the search reads when nothing matches', async () => {
+    vi.mocked(listMachines).mockResolvedValue(page([], 0));
+    mount('/hosts?q=files01');
+    expect(await screen.findByText(/No machine matches "files01"/)).toBeTruthy();
+  });
+});
+
+// ---- URL state --------------------------------------------------------------
+
+describe('Hosts URL state', () => {
+  it('reads every control from the URL', async () => {
+    mount('/hosts?q=web01&sort=name&dir=desc&role=server&agent=yes&activity=all&seen=new&declared=yes&page=2');
+    await ready();
+    expect(vi.mocked(listMachines).mock.calls[0][0]).toEqual({
+      q: 'web01',
+      sort: 'name',
+      dir: 'desc',
+      role: 'server',
+      agent: 'yes',
+      activity: 'all',
+      seen: 'new',
+      declared: 'yes',
+      limit: 50,
+      offset: 50,
+    });
+    expect((screen.getByLabelText('Search hosts') as HTMLInputElement).value).toBe('web01');
+  });
+
+  it('returns to the same list on Back from the machine page', async () => {
+    mount('/hosts?role=server&sort=name');
+    await ready();
+    fireEvent.click(within(rowOf(PROXY)).getByRole('link'));
+    expect((await screen.findByTestId('here')).textContent).toBe('/hosts/agent%3Aa1');
+    // The machine page learns that the list is the entry behind it.
+    expect(screen.getByTestId('here-state').textContent).toBe(
+      JSON.stringify({ fromList: '/hosts?role=server&sort=name' }),
+    );
+
+    const calls = vi.mocked(listMachines).mock.calls.length;
+    fireEvent.click(screen.getByRole('button', { name: 'go back' }));
+    await ready();
+    expect(url()).toBe('/hosts?role=server&sort=name');
+    await waitFor(() => expect(vi.mocked(listMachines).mock.calls.length).toBe(calls + 1));
+    expect(lastQuery()).toMatchObject({ role: 'server', sort: 'name', dir: 'asc' });
+  });
+
+  it('remembers the list URL for the breadcrumb and a reload', async () => {
+    mount('/hosts?agent=no&seen=new');
+    await ready();
+    expect(listUrlToReturnTo()).toBe('/hosts?agent=no&seen=new');
+  });
+
+  it('restores the scroll position after the rows load', async () => {
+    sessionStorage.setItem(
+      'soc-ai:hosts-list:scroll',
+      JSON.stringify({ search: '?role=server', top: 640 }),
+    );
+    let resolveList: (v: MachineList) => void = () => {};
+    vi.mocked(listMachines).mockImplementation(
+      () => new Promise<MachineList>((r) => (resolveList = r)),
+    );
+    render(
+      <MemoryRouter initialEntries={['/hosts?role=server']}>
+        <div data-testid="scroller" style={{ overflowY: 'auto', height: '300px' }}>
+          <Routes>
+            <Route path="/hosts" element={<Hosts />} />
+          </Routes>
+        </div>
+      </MemoryRouter>,
+    );
+    const scroller = screen.getByTestId('scroller');
+    // Before the rows load, the page is too short to hold the old position.
+    expect(scroller.scrollTop).toBe(0);
+    await act(async () => {
+      resolveList(page([PROXY, UNNAMED, PRINTER]));
+    });
+    await ready();
+    await waitFor(() => expect(scroller.scrollTop).toBe(640));
+  });
+
+  it('keeps the position the row click saved when the pane resets before the unmount', async () => {
+    // Dogfood 2026-10-02: the click saved {"top":1729}. The machine page took
+    // the place of the long list, the pane went back to the top, and the
+    // list's unmount cleanup 52 ms later wrote {"top":0} over the click.
+    render(
+      <MemoryRouter initialEntries={['/hosts?activity=all&page=2']}>
+        <div data-testid="scroller" style={{ overflowY: 'auto', height: '300px' }}>
+          <Routes>
+            <Route path="/hosts" element={<Hosts />} />
+            <Route path="/hosts/:key" element={<PaneResetStub />} />
+          </Routes>
+        </div>
+      </MemoryRouter>,
+    );
+    await ready();
+    const scroller = screen.getByTestId('scroller');
+    scroller.scrollTop = 1729;
+    fireEvent.scroll(scroller);
+    fireEvent.click(within(rowOf(PROXY)).getByRole('link'));
+    expect((await screen.findByTestId('here')).textContent).toBe('/hosts/agent%3Aa1');
+    expect(JSON.parse(sessionStorage.getItem('soc-ai:hosts-list:scroll') ?? 'null')).toEqual({
+      search: '?activity=all&page=2',
+      top: 1729,
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'go back' }));
+    await ready();
+    await waitFor(() => expect(scroller.scrollTop).toBe(1729));
+  });
+
+  it('saves the scroll position on an unmount that no row click started', async () => {
+    // NEGATIVE CONTROL: the unmount still writes when no click saved first.
+    const view = render(
+      <MemoryRouter initialEntries={['/hosts?role=server']}>
+        <div data-testid="scroller" style={{ overflowY: 'auto', height: '300px' }}>
+          <Routes>
+            <Route path="/hosts" element={<Hosts />} />
+          </Routes>
+        </div>
+      </MemoryRouter>,
+    );
+    await ready();
+    const scroller = screen.getByTestId('scroller');
+    scroller.scrollTop = 300;
+    fireEvent.scroll(scroller);
+    view.unmount();
+    expect(JSON.parse(sessionStorage.getItem('soc-ai:hosts-list:scroll') ?? 'null')).toEqual({
+      search: '?role=server',
+      top: 300,
+    });
+  });
+
+  it('does not restore a scroll position saved for another list', async () => {
+    sessionStorage.setItem(
+      'soc-ai:hosts-list:scroll',
+      JSON.stringify({ search: '?role=workstation', top: 640 }),
+    );
+    render(
+      <MemoryRouter initialEntries={['/hosts?role=server']}>
+        <div data-testid="scroller" style={{ overflowY: 'auto', height: '300px' }}>
+          <Routes>
+            <Route path="/hosts" element={<Hosts />} />
+          </Routes>
+        </div>
+      </MemoryRouter>,
+    );
+    await ready();
+    expect(screen.getByTestId('scroller').scrollTop).toBe(0);
+  });
+});
+
+// ---- cards ------------------------------------------------------------------
+
+describe('Hosts cards', () => {
+  it('applies the filter a card counts', async () => {
+    mount('/hosts?q=web01&role=server');
+    await ready();
+    fireEvent.click(await screen.findByTestId('card-with-agent'));
+    await waitFor(() => expect(url()).toBe('/hosts?agent=yes&activity=all'));
+    await waitFor(() => expect(lastQuery()).toMatchObject({ agent: 'yes', activity: 'all' }));
+    expect(lastQuery().q).toBeUndefined();
+    expect(lastQuery().role).toBeUndefined();
+  });
+
+  it('keeps the sort when a card applies its filter', async () => {
+    mount('/hosts?sort=events');
+    await ready();
+    expect(screen.getByTestId('card-new').getAttribute('href')).toBe(
+      '/hosts?sort=events&seen=new&activity=all',
+    );
+  });
+
+  it('links a role bar segment to its role filter', async () => {
+    mount();
+    await ready();
+    fireEvent.click(await screen.findByTestId('role-seg-unknown'));
+    await waitFor(() => expect(lastQuery()).toMatchObject({ role: 'unknown', activity: 'all' }));
+  });
+
+  it('keeps the table when the summary fails', async () => {
+    vi.mocked(getMachineSummary).mockRejectedValue(new Error('500 Internal Server Error'));
+    mount();
+    await ready();
+    await waitFor(() =>
+      expect(screen.getByTestId('hosts-summary').textContent).toMatch(/could not be read/i),
+    );
+    expect(screen.getByTestId('hosts-count').textContent).toMatch(/could not be read/i);
+  });
+});
+
+// ---- quiet census, failures, first run ---------------------------------------
+
+describe('Hosts empty states', () => {
+  it('a real but quiet census is "no machines match", never "first run"', async () => {
+    vi.mocked(listMachines).mockImplementation((q) =>
+      Promise.resolve(q?.activity === 'active' ? page([], 0) : page([UNNAMED], 1)),
     );
     mount();
-
-    await waitFor(() => expect(lastQuery()).toMatchObject({ activity: 'active' }));
+    expect(await screen.findByText(/No machines match the current filters/)).toBeTruthy();
     expect(screen.queryByText(/hasn't run yet/i)).toBeNull();
-    expect(screen.getByText(/no hosts match/i)).toBeTruthy();
-    // The escape hatch is exactly where it matters most here: a zero-row page
-    // has no pager to carry it, so the note has to reach off the EmptyState
-    // too, not only off a table that this page never renders.
-    expect(screen.getByText(/this table hides quiet hosts/i)).toBeTruthy();
-
-    fireEvent.click(screen.getByRole('button', { name: /show all hosts/i }));
-    await waitFor(() => expect(lastQuery()?.activity).toBeUndefined());
-    await screen.findByText('192.168.10.9');
+    fireEvent.click(screen.getByRole('button', { name: /show all machines/i }));
+    await waitFor(() => expect(lastQuery()).toMatchObject({ activity: 'all' }));
+    await screen.findByText('no name');
   });
 
   it('a failed list fetch is an error with Retry, never the first-run panel', async () => {
-    // The summary and the list are two SEPARATE requests. Before this fix,
-    // `firstRun` read straight off `kpis.data.hosts === 0` — so a summary
-    // reporting an empty census while the list fetch itself failed (a
-    // transient 500) rendered "The network sweep hasn't run yet" over an
-    // outage, with no Retry in sight.
-    vi.mocked(getDossierSummary).mockResolvedValue({ ...SUMMARY, hosts: 0 });
-    vi.mocked(listDossiers).mockRejectedValue(new Error('500 Internal Server Error'));
+    vi.mocked(getDossierSummary).mockResolvedValue({ ...CENSUS, hosts: 0 });
+    vi.mocked(listMachines).mockRejectedValue(new Error('500 Internal Server Error'));
     mount();
-
     expect(await screen.findByText(/could not load the host list/i)).toBeTruthy();
     expect(screen.getByRole('button', { name: /retry/i })).toBeTruthy();
     expect(screen.queryByText(/hasn't run yet/i)).toBeNull();
-    // Retry over an outage, not a verdict about a page that never arrived —
-    // "this table hides quiet hosts" claims a result the failed fetch never got.
-    expect(screen.queryByText(/this table hides quiet hosts/i)).toBeNull();
+    expect(screen.queryByText(/hides quiet machines/i)).toBeNull();
+  });
+
+  it('first run is one sentence and one action', async () => {
+    asAdmin();
+    vi.mocked(listMachines).mockResolvedValue(page([], 0));
+    vi.mocked(getDossierSummary).mockResolvedValue({ ...CENSUS, hosts: 0, last_built_at: null });
+    mount();
+    expect(await screen.findByText(/hasn't run yet/i)).toBeTruthy();
+    expect(screen.getByRole('button', { name: /run the first sweep/i })).toBeTruthy();
+    expect(screen.queryByLabelText('Search hosts')).toBeNull();
+    expect(screen.queryByTestId('hosts-summary')).toBeNull();
   });
 });
 
-describe('Hosts broken-builds filter', () => {
-  it('filters server-side from the summary door (?health=broken)', async () => {
-    vi.mocked(listDossiers).mockResolvedValue(page([BROKEN, NEVER_BUILT]));
+// ---- the broken-builds view --------------------------------------------------
+
+const brokenRow = (ip: string, over: Partial<DossierRow> = {}): DossierRow => ({
+  ip,
+  found: true,
+  fields: [],
+  first_seen: null,
+  last_seen: null,
+  last_built_at: null,
+  last_observed_at: null,
+  event_count: 0,
+  identity_rebound_at: null,
+  build_error: null,
+  override_count: 0,
+  conflict_count: 0,
+  reporting: false,
+  ...over,
+});
+
+describe('Hosts broken-builds view', () => {
+  it('lists the addresses with no clean build, from the Needs attention card', async () => {
+    const list: DossierList = {
+      rows: [
+        brokenRow('192.0.2.140', { build_error: 'elasticsearch: ConnectionTimeout', last_built_at: '2026-10-01T00:00:00+00:00' }),
+        brokenRow('192.0.2.77'),
+      ],
+      total: 2,
+      limit: 50,
+      offset: 0,
+    };
+    vi.mocked(listDossiers).mockResolvedValue(list);
     mount('/hosts?health=broken');
-    await screen.findByText('192.168.10.140');
-    expect(lastQuery()).toMatchObject({ health: 'broken' });
-    // The view names itself, so a shared link cannot read as the whole network.
+    expect(await screen.findByText('192.0.2.140')).toBeTruthy();
+    expect(vi.mocked(listDossiers).mock.calls[0][0]).toMatchObject({ health: 'broken', offset: 0 });
+    expect(screen.getByText('never built')).toBeTruthy();
     expect(screen.getByText(/not getting through/i)).toBeTruthy();
-  });
-
-  it('offers the way back to all hosts', async () => {
-    vi.mocked(listDossiers).mockResolvedValue(page([BROKEN]));
-    mount('/hosts?health=broken');
-    await screen.findByText('192.168.10.140');
-    fireEvent.click(screen.getByRole('button', { name: /show all hosts/i }));
-    // The clear must land as a NEW server query without the filter — until the
-    // refetch fires, the last call still carries health=broken.
-    await waitFor(() => expect(lastQuery()?.health).toBeUndefined());
-  });
-
-  it('says when the broken view is empty rather than reading as first run', async () => {
-    vi.mocked(listDossiers).mockResolvedValue(page([], 0));
-    mount('/hosts?health=broken');
-    expect(await screen.findByText(/no hosts match/i)).toBeTruthy();
-    expect(screen.queryByText(/hasn't run yet/i)).toBeNull();
-  });
-
-  it('does not compose the traffic default with the broken-builds view', async () => {
-    // Broken hosts are often exactly the quiet ones — a build that never ran
-    // never saw traffic either. The default filter must not hide the rows
-    // this view exists to find, and its own "quiet hosts hidden" note (whose
-    // button text collides with this view's own "Show all hosts") must not
-    // render over it.
-    vi.mocked(listDossiers).mockResolvedValue(page([BROKEN, NEVER_BUILT]));
-    mount('/hosts?health=broken');
-    await screen.findByText('192.168.10.140');
-    expect(lastQuery()).toMatchObject({ health: 'broken' });
-    expect(lastQuery()?.activity).toBeUndefined();
-    expect(screen.queryByText(/this table hides quiet hosts/i)).toBeNull();
-    expect(screen.getAllByRole('button', { name: /show all hosts/i })).toHaveLength(1);
-    // The Show control must not keep claiming "with traffic" over a request
-    // that, per the assertions above, does not actually filter on it.
-    expect((screen.getByLabelText('Show') as HTMLSelectElement).value).toBe('');
+    // The machine list is not asked for under this view.
+    expect(listMachines).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: /show all machines/i }));
+    await waitFor(() => expect(listMachines).toHaveBeenCalled());
   });
 });
+
+// ---- the disagreement queue ----------------------------------------------------
 
 describe('Hosts conflicts queue', () => {
-  it('counts the open disagreements and reveals them read-only', async () => {
-    vi.mocked(getDossierConflicts).mockResolvedValue(CONFLICTS);
-    mount();
-    const banner = await screen.findByRole('button', { name: /2 disagreements need review/i });
-    expect(screen.queryByText('192.168.10.8 · role')).toBeNull();
-
-    fireEvent.click(banner);
-    const queue = (await screen.findByText('192.168.10.8 · role')).closest('div')!.parentElement!;
-    // Both claims, so the operator can judge without opening the host.
-    expect(within(queue).getByText('hypervisor')).toBeTruthy();
-    expect(within(queue).getByText('server')).toBeTruthy();
-    expect(within(queue).getByText(/7/)).toBeTruthy();
-  });
-
-  it('names a field in words, not schema keys', async () => {
+  it('opens from the Conflicts card link (?conflicts=1) with both claims', async () => {
     vi.mocked(getDossierConflicts).mockResolvedValue(CONFLICTS);
     mount('/hosts?conflicts=1');
-    // services_offered is a column name; "services offered" is a fact.
-    expect(await screen.findByText('192.168.10.9 · services offered')).toBeTruthy();
-    expect(screen.queryByText(/services_offered/)).toBeNull();
-  });
-
-  it('reads the structured lanes for a JSON-shaped field', async () => {
-    vi.mocked(getDossierConflicts).mockResolvedValue(CONFLICTS);
-    mount('/hosts?conflicts=1');
-    await screen.findByText('192.168.10.9 · services offered');
-    expect(screen.getByText('["ssh"]')).toBeTruthy();
+    const link = await screen.findByText('192.0.2.10 · role');
+    expect(link.getAttribute('href')).toBe('/hosts/192.0.2.10?field=role');
     expect(screen.getByText('["ssh","http"]')).toBeTruthy();
   });
 
-  it('opens pre-revealed from the Dashboard nudge (?conflicts=1)', async () => {
+  it('counts the open disagreements and reveals them on demand', async () => {
     vi.mocked(getDossierConflicts).mockResolvedValue(CONFLICTS);
-    mount('/hosts?conflicts=1');
-    expect(await screen.findByText('192.168.10.8 · role')).toBeTruthy();
-  });
-
-  it('links a conflict to the host page, not the entity page', async () => {
-    vi.mocked(getDossierConflicts).mockResolvedValue(CONFLICTS);
-    mount('/hosts?conflicts=1');
-    await screen.findByText('192.168.10.8 · role');
-    const hrefs = screen.getAllByRole('link').map((a) => a.getAttribute('href'));
-    expect(hrefs.some((h) => h?.startsWith('/entity/'))).toBe(false);
-  });
-
-  it('says nothing at all when the lanes agree', async () => {
     mount();
-    await screen.findByText('192.168.10.8');
-    expect(screen.queryByText(/disagreements? need review/i)).toBeNull();
+    const banner = await screen.findByRole('button', { name: /2 disagreements need review/i });
+    expect(screen.queryByText('192.0.2.10 · role')).toBeNull();
+    fireEvent.click(banner);
+    expect(await screen.findByText('192.0.2.10 · role')).toBeTruthy();
   });
 });
 
+// ---- rebuild ------------------------------------------------------------------
+
 describe('Hosts rebuild control', () => {
-  it('is hidden from an analyst — the route is admin-only', async () => {
+  it('is hidden from an analyst', async () => {
     mount();
-    await screen.findByText('192.168.10.8');
+    await ready();
     expect(screen.queryByRole('button', { name: /rebuild/i })).toBeNull();
   });
 
-  it('starts a sweep for an admin', async () => {
-    vi.mocked(getMe).mockResolvedValue({ username: 'root', role: 'admin', status: '' });
-    vi.mocked(startDossierRefresh).mockResolvedValue({
-      running: true,
-      last_run: null,
-      last_summary: null,
-      note: 'started',
-    });
-    mount();
-    const btn = await screen.findByRole('button', { name: /rebuild/i });
-    fireEvent.click(btn);
-    await waitFor(() => expect(startDossierRefresh).toHaveBeenCalled());
-  });
-
   it('says the master switch is off rather than pretending a sweep ran', async () => {
-    vi.mocked(getMe).mockResolvedValue({ username: 'root', role: 'admin', status: '' });
+    asAdmin();
     vi.mocked(startDossierRefresh).mockResolvedValue({
       running: false,
       last_run: null,
@@ -747,334 +919,82 @@ describe('Hosts rebuild control', () => {
   });
 });
 
-describe('Hosts — first run', () => {
-  beforeEach(() => {
-    vi.mocked(listDossiers).mockResolvedValue(page([], 0));
-    vi.mocked(getDossierSummary).mockResolvedValue({
-      hosts: 0,
-      never_built: 0,
-      named: 0,
-      reporting: 0,
-      conflicts: 0,
-      roles: {},
-      last_built_at: null,
-      schedule_enabled: false,
-    });
-  });
+// ---- bulk declare --------------------------------------------------------------
 
-  it('is one sentence and one action, not four zero tiles over a live search box', async () => {
-    vi.mocked(getMe).mockResolvedValue({ username: 'root', role: 'admin', status: '' });
-    mount();
-    expect(await screen.findByText(/hasn't run yet/i)).toBeTruthy();
-    // One primary action for an admin…
-    expect(screen.getByRole('button', { name: /run the first sweep/i })).toBeTruthy();
-    // …one link to the schedule…
-    expect(screen.getByRole('link', { name: /scheduled sweeps/i })).toHaveAttribute(
-      'href',
-      '/config#host-dossier',
-    );
-    // …and none of the working-screen furniture over zero rows (F9).
-    expect(screen.queryByPlaceholderText(/search/i)).toBeNull();
-    expect(screen.queryByLabelText('Sort')).toBeNull();
-    expect(screen.queryByTestId('hosts-summary')).toBeNull();
-  });
-
-  it('runs the first sweep from the button', async () => {
-    vi.mocked(getMe).mockResolvedValue({ username: 'root', role: 'admin', status: '' });
-    vi.mocked(startDossierRefresh).mockResolvedValue({
-      running: true,
-      last_run: null,
-      last_summary: null,
-      note: 'started',
-    });
-    mount();
-    fireEvent.click(await screen.findByRole('button', { name: /run the first sweep/i }));
-    await waitFor(() => expect(startDossierRefresh).toHaveBeenCalled());
-  });
-
-  it('tells a non-admin who can, instead of offering a button that would 403', async () => {
-    mount();
-    expect(await screen.findByText(/hasn't run yet/i)).toBeTruthy();
-    expect(screen.queryByRole('button', { name: /run the first sweep/i })).toBeNull();
-    expect(screen.getByText(/an admin/i)).toBeTruthy();
-  });
-});
-
-
-// ---------------------------------------------------------------------------
-// Bulk select + declare (dogfood A4) — Hosts was the only list screen with no
-// checkboxes at all, so tagging a subnet of unnamed machines was a
-// one-at-a-time chore.
-// ---------------------------------------------------------------------------
-
-const asAdmin = () =>
-  vi.mocked(getMe).mockResolvedValue({ username: 'root', role: 'admin', status: '' });
+const dossierWith = (ip: string, criticality: string | null): Dossier =>
+  ({
+    ip,
+    found: true,
+    fields: [
+      {
+        field: 'criticality',
+        value: criticality,
+        value_json: null,
+        source: criticality ? 'operator' : null,
+        confidence: criticality ? 1 : 0,
+        strength: criticality ? 'strong' : 'none',
+        reason: criticality ? null : 'no_signal',
+        overridden: !!criticality,
+        conflict_kind: null,
+      },
+    ],
+  }) as unknown as Dossier;
 
 describe('Hosts bulk declare', () => {
-  it('offers no checkboxes to an analyst, who could only be 403d for using them', async () => {
+  it('offers no checkboxes to an analyst', async () => {
     mount();
-    await screen.findByText('192.168.10.8');
-    expect(screen.queryByLabelText(/^Select 192\.168\.10\.8$/)).toBeNull();
+    await ready();
     expect(screen.queryByLabelText(/select all hosts/i)).toBeNull();
   });
 
-  it('selects a row, and the toolbar says how many', async () => {
+  it('declares on the primary address of every selected machine', async () => {
     asAdmin();
-    mount();
-    await screen.findByText('192.168.10.8');
-    fireEvent.click(await screen.findByLabelText('Select 192.168.10.8'));
-    expect(await screen.findByText(/host selected/i)).toBeTruthy();
-  });
-
-  it('selects every host on the page from the header box', async () => {
-    asAdmin();
-    mount();
-    fireEvent.click(await screen.findByLabelText(/select all hosts/i));
-    const strip = (await screen.findByText(/hosts selected/i)).parentElement!;
-    expect(within(strip).getByText('2')).toBeTruthy();
-  });
-
-  it('writes the OPERATOR lane for every selected host, through the one declare path', async () => {
-    asAdmin();
+    vi.mocked(getDossier).mockImplementation(async (ip) => dossierWith(ip, null));
     vi.mocked(bulkSetDossierOverride).mockResolvedValue({
-      updated: ['192.168.10.8', '192.168.10.9'],
+      updated: ['192.0.2.10', '192.0.2.20', '192.0.2.30'],
       not_found: [],
       failed: [],
     });
     mount();
     fireEvent.click(await screen.findByLabelText(/select all hosts/i));
+    expect(await screen.findByText(/machines selected/i)).toBeTruthy();
     fireEvent.change(await screen.findByDisplayValue('choose…'), { target: { value: 'low' } });
-    fireEvent.click(screen.getByRole('button', { name: /declare \(2\)/i }));
+    fireEvent.click(screen.getByRole('button', { name: /declare \(3\)/i }));
     await waitFor(() =>
       expect(vi.mocked(bulkSetDossierOverride)).toHaveBeenCalledWith(
-        ['192.168.10.8', '192.168.10.9'],
+        ['192.0.2.10', '192.0.2.20', '192.0.2.30'],
         { field: 'criticality', value: 'low' },
       ),
     );
-    expect(await screen.findByText(/Declared criticality "low" on 2 of 2 hosts/)).toBeTruthy();
+    expect(await screen.findByText(/Declared criticality "low" on 3 of 3 machines/)).toBeTruthy();
   });
 
-  it('names the hosts the sweep has never seen rather than reporting a bare count', async () => {
+  it('names the addresses that failed and keeps them selected for a retry', async () => {
     asAdmin();
+    vi.mocked(getDossier).mockImplementation(async (ip) => dossierWith(ip, null));
     vi.mocked(bulkSetDossierOverride).mockResolvedValue({
-      updated: ['192.168.10.8'],
-      not_found: ['192.168.10.9'],
-      failed: [],
+      updated: ['192.0.2.10'],
+      not_found: ['192.0.2.30'],
+      failed: [{ ip: '192.0.2.20', reason: 'SQLAlchemyError' }],
     });
     mount();
     fireEvent.click(await screen.findByLabelText(/select all hosts/i));
     fireEvent.change(await screen.findByDisplayValue('choose…'), { target: { value: 'high' } });
-    fireEvent.click(screen.getByRole('button', { name: /declare \(2\)/i }));
-    expect(await screen.findByText(/1 of 2 hosts/)).toBeTruthy();
-    expect(screen.getByText(/1 not swept yet: 192\.168\.10\.9/)).toBeTruthy();
-    // The host that did not take it stays selected, so "try again" is one click.
-    expect(screen.getByRole('button', { name: /declare \(1\)/i })).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: /declare \(3\)/i }));
+    expect(await screen.findByText(/1 not swept yet: 192\.0\.2\.30/)).toBeTruthy();
+    expect(screen.getByText(/1 failed: 192\.0\.2\.20\. Try those again/)).toBeTruthy();
+    expect(screen.getByRole('button', { name: /declare \(2\)/i })).toBeTruthy();
   });
 
-  it('declares a role, offering the vocabulary the screen already knows', async () => {
+  it('constrains the bulk role to the vocabulary on the wire', async () => {
     asAdmin();
-    vi.mocked(bulkSetDossierOverride).mockResolvedValue({
-      updated: ['192.168.10.8'],
-      not_found: [],
-      failed: [],
-    });
+    vi.mocked(getDossierSummary).mockResolvedValue({ ...CENSUS, role_vocabulary: ['workstation', 'jump_host'] });
     mount();
-    fireEvent.click(await screen.findByLabelText('Select 192.168.10.8'));
+    fireEvent.click(await screen.findByLabelText('Select web01'));
     fireEvent.change(await screen.findByDisplayValue('Criticality'), { target: { value: 'role' } });
-    fireEvent.change(await screen.findByLabelText('Role to declare'), {
-      target: { value: 'hypervisor' },
-    });
-    fireEvent.click(screen.getByRole('button', { name: /declare \(1\)/i }));
+    const control = (await screen.findByLabelText('Role to declare')) as HTMLSelectElement;
     await waitFor(() =>
-      expect(vi.mocked(bulkSetDossierOverride)).toHaveBeenCalledWith(['192.168.10.8'], {
-        field: 'role',
-        value: 'hypervisor',
-      }),
+      expect(Array.from(control.options).map((o) => o.value)).toEqual(['', 'jump_host', 'workstation']),
     );
-  });
-
-  it('constrains the bulk role to the vocabulary — a typo cannot become a role', async () => {
-    // A free-text box here amplified one typo into N polluted hosts, and a role
-    // is not a per-host label: `srever-typo-role` on three hosts became a
-    // first-class bucket in the ROLES bar and an entry in the role facet, for
-    // every user. The control is now the same shape as the criticality one
-    // beside it — a closed list.
-    asAdmin();
-    mount();
-    fireEvent.click(await screen.findByLabelText('Select 192.168.10.8'));
-    fireEvent.change(await screen.findByDisplayValue('Criticality'), { target: { value: 'role' } });
-
-    const roleControl = await screen.findByLabelText('Role to declare');
-    expect(roleControl.tagName).toBe('SELECT');
-    const values = Array.from((roleControl as HTMLSelectElement).options).map((o) => o.value);
-    expect(values).toContain('server');
-    expect(values).toContain('domain_controller');
-    expect(values).not.toContain('srever-typo-role');
-  });
-
-  it('takes the bulk role list from the summary wire, like the filter does', async () => {
-    // Same source as the role facet: a role the backend adds is declarable in
-    // bulk without a frontend edit, and one it drops stops being offered.
-    asAdmin();
-    vi.mocked(getDossierSummary).mockResolvedValue({
-      ...SUMMARY,
-      role_vocabulary: ['workstation', 'jump_host'],
-    });
-    mount();
-    fireEvent.click(await screen.findByLabelText('Select 192.168.10.8'));
-    fireEvent.change(await screen.findByDisplayValue('Criticality'), { target: { value: 'role' } });
-
-    const roleControl = (await screen.findByLabelText('Role to declare')) as HTMLSelectElement;
-    const values = Array.from(roleControl.options).map((o) => o.value);
-    expect(values).toEqual(['', 'jump_host', 'workstation']);
-  });
-
-  it('refuses to declare nothing', async () => {
-    asAdmin();
-    mount();
-    fireEvent.click(await screen.findByLabelText('Select 192.168.10.8'));
-    expect(screen.getByRole('button', { name: /declare \(1\)/i })).toBeDisabled();
-  });
-
-  it('bulk-tagging a subnet `low` does not reorder the list ahead of the named hosts', async () => {
-    // The guard on this whole feature. Only `critical` and `high` rank above a
-    // NAMED host in the importance order, so a pass tagging a rack of anonymous
-    // printers `low` must not put 200 rows of `HOST —` in front of the domain
-    // controller. The order is the SERVER's — the screen must re-ask for it
-    // with the same sort and render what comes back, never re-sort a page.
-    asAdmin();
-    const named = host('192.0.2.5', {}, { hostname: { value: 'dc-01', source: 'banner', confidence: 0.95, strength: 'strong', reason: null } });
-    const anon = [host('192.0.2.100'), host('192.0.2.101')];
-    vi.mocked(listDossiers).mockResolvedValue(page([named, ...anon]));
-    vi.mocked(bulkSetDossierOverride).mockResolvedValue({
-      updated: ['192.0.2.100', '192.0.2.101'],
-      not_found: [],
-      failed: [],
-    });
-    mount();
-    await screen.findByText('192.0.2.5');
-    const order = () =>
-      screen
-        .getAllByRole('link')
-        .map((a) => a.textContent ?? '')
-        .filter((t) => t.startsWith('192.0.2.'));
-    const before = order();
-    expect(before[0]).toBe('192.0.2.5');
-
-    fireEvent.click(await screen.findByLabelText('Select 192.0.2.100'));
-    fireEvent.click(await screen.findByLabelText('Select 192.0.2.101'));
-    fireEvent.change(await screen.findByDisplayValue('choose…'), { target: { value: 'low' } });
-    fireEvent.click(screen.getByRole('button', { name: /declare \(2\)/i }));
-
-    await waitFor(() => expect(vi.mocked(bulkSetDossierOverride)).toHaveBeenCalled());
-    // The list is re-asked for with the landing sort untouched…
-    await waitFor(() => expect(lastQuery()).toMatchObject({ sort: 'importance' }));
-    // …and the named host is still first.
-    await waitFor(() => expect(order()).toEqual(before));
-  });
-});
-
-
-describe('Hosts bulk declare reports a partial batch', () => {
-  it('names the hosts that failed and keeps them selected for a retry', async () => {
-    // A mid-batch failure used to surface as a raw 500 with a stale list and no
-    // hint that part of the selection had already been declared.
-    asAdmin();
-    vi.mocked(bulkSetDossierOverride).mockResolvedValue({
-      updated: ['192.168.10.8'],
-      not_found: [],
-      failed: [{ ip: '192.168.10.9', reason: 'SQLAlchemyError' }],
-    });
-    mount();
-    fireEvent.click(await screen.findByLabelText(/select all hosts/i));
-    fireEvent.change(await screen.findByDisplayValue('choose…'), { target: { value: 'low' } });
-    fireEvent.click(screen.getByRole('button', { name: /declare \(2\)/i }));
-
-    expect(await screen.findByText(/1 of 2 hosts/)).toBeTruthy();
-    expect(screen.getByText(/1 failed: 192\.168\.10\.9\. Try those again/)).toBeTruthy();
-    expect(screen.getByRole('button', { name: /declare \(1\)/i })).toBeTruthy();
-  });
-
-  it('clears the selection when every host took the declaration', async () => {
-    asAdmin();
-    vi.mocked(bulkSetDossierOverride).mockResolvedValue({
-      updated: ['192.168.10.8', '192.168.10.9'],
-      not_found: [],
-      failed: [],
-    });
-    mount();
-    fireEvent.click(await screen.findByLabelText(/select all hosts/i));
-    fireEvent.change(await screen.findByDisplayValue('choose…'), { target: { value: 'high' } });
-    fireEvent.click(screen.getByRole('button', { name: /declare \(2\)/i }));
-    await waitFor(() => expect(screen.queryByTestId('list-toolbar-selection')).toBeNull());
-  });
-});
-
-// ---------------------------------------------------------------------------
-// The roles the resolver withholds
-// ---------------------------------------------------------------------------
-
-// The ROLES bar counts these hosts in their own amber bucket, and until now no
-// filter on the screen could list them: the ROLE facet offered only values the
-// resolver had asserted (dogfood 2026-09-17).
-describe('Hosts — a role the sweep guessed and the resolver withheld', () => {
-  const GUESSED = host('192.168.10.31', {}, { role: { reason: 'low_confidence' } });
-  const STALE_GUESS = host('192.168.10.32', {}, { role: { reason: 'stale' } });
-
-  const withBucket = (count: number) =>
-    vi.mocked(getDossierSummary).mockResolvedValue({ ...SUMMARY, roles_low_confidence: count });
-
-  it('offers the bucket in the ROLE filter only when the network has one', async () => {
-    withBucket(0);
-    mount();
-    await screen.findByText('192.168.10.8');
-    expect(
-      within(screen.getByLabelText('Role') as HTMLSelectElement).queryByText('low confidence'),
-    ).toBeNull();
-  });
-
-  it('lists exactly the rows the bucket counts', async () => {
-    withBucket(2);
-    vi.mocked(listDossiers).mockResolvedValue(page([BLUE, QUIET, GUESSED, STALE_GUESS], 4));
-    mount();
-    await screen.findByText('192.168.10.8');
-
-    fireEvent.change(screen.getByLabelText('Role'), { target: { value: LOW_CONFIDENCE_ROLE } });
-
-    // The server has no such role, so the request drops the facet and widens
-    // the page instead — the narrowing happens over the rows it returns.
-    await waitFor(() => expect(lastQuery()?.role).toBeUndefined());
-    expect(lastQuery()?.limit).toBe(200);
-
-    await waitFor(() => expect(screen.queryByText('192.168.10.8')).toBeNull());
-    expect(screen.getByText('192.168.10.31')).toBeTruthy();
-    expect(screen.getByText('192.168.10.32')).toBeTruthy();
-    // A declared role and a field nothing was ever found for are not guesses.
-    expect(screen.queryByText('192.168.10.9')).toBeNull();
-  });
-
-  // A count taken off the page must say which page, or it reads as the
-  // network's — the defect the summary strip exists to prevent.
-  it('says how much of the network it read to reach that answer', async () => {
-    withBucket(9);
-    vi.mocked(listDossiers).mockResolvedValue({
-      rows: [BLUE, QUIET, GUESSED],
-      total: 500,
-      limit: 200,
-      offset: 0,
-    });
-    mount();
-    await screen.findByText('192.168.10.8');
-    fireEvent.change(screen.getByLabelText('Role'), { target: { value: LOW_CONFIDENCE_ROLE } });
-    expect(await screen.findByText(/1 low confidence · read 1–200 of 500/)).toBeTruthy();
-  });
-
-  it('marks the withheld guess in the Role column', async () => {
-    withBucket(1);
-    vi.mocked(listDossiers).mockResolvedValue(page([GUESSED], 1));
-    mount();
-    await screen.findByText('192.168.10.31');
-    const cell = within(rowFor('192.168.10.31')).getByTestId('role-possibly');
-    expect(cell.textContent).toContain('possibly');
   });
 });

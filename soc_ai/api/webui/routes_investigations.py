@@ -40,6 +40,7 @@ from soc_ai.api.webui._timeline import (
 )
 from soc_ai.api.webui.routes_alerts import _es_api_error_http, _grid_unavailable
 from soc_ai.config import Settings
+from soc_ai.secret_scrub import scrub_secrets, scrub_value
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.store import chat as chat_svc
 from soc_ai.store import investigations as inv_svc
@@ -250,8 +251,9 @@ def _row(
         id=inv.id,
         name=inv.rule_name or f"Alert {(inv.alert_es_id or inv.id)[:12]}…",
         # Persisted since migration 0031. Legacy rows were backfilled
-        # kind='suricata' regardless of their feed doc's real kind — accepted;
-        # no ES-derived fallback.
+        # kind='suricata' regardless of their feed doc's real kind. The list
+        # route corrects them from the stored alert context before this runs
+        # (heal_detection_kinds, RL5).
         kind=inv.kind,
         subjectType=_subject_type(inv),
         verdict=_verdict(inv.verdict),
@@ -357,16 +359,27 @@ _VERDICT_FILTERS = (
 )
 
 
-def _csv_filter(raw: str | None, allowed: tuple[str, ...]) -> list[str]:
-    """Parse a comma-separated multi-value filter param, dropping unknowns.
+def _csv_filter(name: str, raw: str | None, allowed: tuple[str, ...]) -> list[str]:
+    """Parse a comma-separated multi-value filter param, refusing unknowns.
 
-    Unknown members are dropped rather than 422'd (matching the screen's
-    verdictFilterFromSearch): a mangled deep link must degrade to a broader
-    query, not wedge the whole list behind an error. All-unknown → unfiltered.
+    Unknown members used to be dropped, and an all-unknown filter read as no
+    filter: ``status=garbage`` answered with the unfiltered total, a count that
+    looked like an answer. The console already cleans a mangled deep link on
+    its side (verdictFilterFromSearch, errorStateFromSearch) before it asks, so
+    the server refuses what is left with the accepted values.
     """
     if not raw:
         return []
-    return [v for v in (p.strip() for p in raw.split(",")) if v in allowed]
+    members = [p.strip() for p in raw.split(",") if p.strip()]
+    unknown = [v for v in members if v not in allowed]
+    if unknown:
+        raise api_error(
+            422,
+            "bad_filter",
+            f"{name} accepts these values: {', '.join(allowed)}. "
+            "Separate two or more values with commas.",
+        )
+    return members
 
 
 # The two halves of a pipeline-error set. A run "needs a retry" when it produced
@@ -455,11 +468,17 @@ async def list_investigations(
     one filter that cannot be SQL, because "superseded" is a fact about an
     alert's whole run group rather than a column, so it is decided in Python
     over one capped read and the response says when the set outgrew that cap.
-    An unknown value is dropped, like an unknown ``verdict`` member.
+    An unknown value is refused with 422, like an unknown ``verdict`` member.
     """
-    statuses = _csv_filter(status, inv_svc.DISPLAY_STATUSES)
-    verdicts = _csv_filter(verdict, _VERDICT_FILTERS)
-    wanted_state = error_state if error_state in _ERROR_STATES else None
+    statuses = _csv_filter("status", status, inv_svc.DISPLAY_STATUSES)
+    verdicts = _csv_filter("verdict", verdict, _VERDICT_FILTERS)
+    if error_state and error_state not in _ERROR_STATES:
+        raise api_error(
+            422,
+            "bad_filter",
+            f"error_state accepts one of these values: {', '.join(_ERROR_STATES)}.",
+        )
+    wanted_state = error_state or None
     needle = (q or "").strip()
     if len(needle) > _SEARCH_MAX:
         raise HTTPException(
@@ -486,6 +505,9 @@ async def list_investigations(
             limit=read_limit,
             offset=read_offset,
         )
+        # A row stored with the old "suricata" default shows the type its alert
+        # document names (RL5). Corrected once, in place.
+        await inv_svc.heal_detection_kinds(db, page.rows)
         chat_counts = await chat_svc.counts_for(db, [inv.id for inv in page.rows])
         alert_ids = sorted({g for inv in page.rows if (g := inv_svc.alert_group_id(inv))})
         group_rows = await inv_svc.runs_for_alerts(db, alert_ids)
@@ -560,7 +582,10 @@ async def get_investigation(
         if got is None:
             raise HTTPException(status_code=404, detail={"reason": "not_found"})
         inv, events = got
+        await inv_svc.heal_detection_kinds(db, [inv])
         chat = await chat_svc.list_messages(db, inv.id)
+        group_id = inv_svc.alert_group_id(inv)
+        group_runs = await inv_svc.runs_for_alerts(db, [group_id]) if group_id else []
         # Promotion provenance: hunt_id has no FK (the referenced hunt may be
         # deleted — see the Investigation model note), so this must degrade
         # gracefully rather than 404/500 when the row is gone.
@@ -569,7 +594,9 @@ async def get_investigation(
         wants_hunt = inv.kind == "hunt" or _subject_type(inv) == "hunt"
         hunt = await db.get(Hunt, inv.hunt_id) if wants_hunt and inv.hunt_id else None
 
-    report = inv.report or {}
+    # A row stored before the store-side scrub existed can still hold a
+    # credential the model quoted. Scrub the model-written text on read too.
+    report = scrub_value(inv.report or {})
     # Live acked state so an ack performed OUTSIDE this run (group-ack, another
     # run's auto-ack, the SO web UI) marks the ack action applied. False on any
     # ES error — the action is simply offered as before.
@@ -591,6 +618,12 @@ async def get_investigation(
     enrichments: dict[str, Any] = _en_raw if isinstance(_en_raw, dict) else {}
 
     timeline, tool_calls, pivots, has_oracle = _build_timeline(events)
+    # A tool result or a host summary in the timeline can quote a credential
+    # from telemetry. The row stays verbatim in the store; the page does not
+    # show the value.
+    for step in timeline:
+        step.title = scrub_secrets(step.title)
+        step.detail = scrub_secrets(step.detail)
     nodes, edges, graph_note = _entity_graph(alert_obj, enrichments, inv)
     summary_text = report.get("summary") or inv.summary or ""
     meta = InvMetaOut(
@@ -612,8 +645,8 @@ async def get_investigation(
         ip=inv.dest_ip or inv.src_ip or "—",
         verdict=_verdict(inv.verdict),
         conf=inv.confidence if inv.confidence is not None else 0.0,
-        rationale=inv.rationale or summary_text,
-        summary=[{"t": "text", "v": summary_text}],
+        rationale=scrub_secrets(inv.rationale or summary_text),
+        summary=[{"t": "text", "v": scrub_secrets(summary_text)}],
         status=(
             "investigating"
             if inv.status == "running"
@@ -643,8 +676,11 @@ async def get_investigation(
         sev=_sev(alert_obj.get("severity_label")) if alert_obj else None,
         alert=_alert_meta(alert_obj, host_profile, inv),
         hostContext=_host_signals(host_profile),
+        hostContexts=_timeline._host_contexts(enr_p.get("host_alert_profiles")),
         graphNote=graph_note,
-        openQuestions=report.get("open_questions") or [],
+        openQuestions=_timeline._open_questions_out(report, events),
+        citations=_timeline._citations_out(report, events),
+        failure=_timeline._failure_out(inv.status, events),
         resolution=report.get("resolution") or None,
         validatorNote=_note_or_none(report.get("validator_note")),
         # Pipeline-failure provenance (E1.2) — non-None ONLY for a synth-failure
@@ -657,7 +693,35 @@ async def get_investigation(
         huntObjective=(hunt.objective[:160] if hunt else None),
         alertAcked=alert_acked,
         isSynthEval=bool(inv.is_synth_eval),
+        supersededBy=_superseded_by(inv, group_runs),
     )
+
+
+def _superseded_by(inv: Investigation, group_runs: Sequence[inv_svc.RunRef]) -> str | None:
+    """The newer primary run of the same alert, when one replaced this run.
+
+    None when this run is the alert's primary run, when it stands alone, and
+    when the primary run is OLDER (an errored retry of a settled alert): no
+    newer run replaced that one, and the page must not say so.
+    """
+    if not group_runs:
+        return None
+    primary = _primary_run_ids(group_runs)
+    if inv.id in primary:
+        return None
+    this = next((r for r in group_runs if r.id == inv.id), None)
+    for run in group_runs:  # newest-first
+        if (
+            run.id in primary
+            and this is not None
+            and (run.created_at, run.id)
+            > (
+                this.created_at,
+                this.id,
+            )
+        ):
+            return run.id
+    return None
 
 
 @router.post("/investigations/{inv_id}/cancel")
@@ -919,11 +983,14 @@ async def bulk_rehunt(  # noqa: PLR0915 — linear per-id skip/start loop, each 
     return RehuntResultOut(started=started, skipped=skipped)
 
 
-def _open_questions_of(inv: Investigation) -> list[str]:
-    """Pull the prior run's open questions off the stored report JSON."""
+def _open_questions_of(inv: Investigation, events: Sequence[Any] = ()) -> list[str]:
+    """The prior run's open questions: the report's, else the transcript's.
+
+    Same source as the detail's ``openQuestions`` so the focused re-run targets
+    the questions the analyst read on the page.
+    """
     report = inv.report if isinstance(inv.report, dict) else {}
-    raw = report.get("open_questions") or []
-    return [str(q).strip() for q in raw if isinstance(q, str) and q.strip()]
+    return _timeline._open_questions_out(report, list(events))
 
 
 def _focus_hint_from_questions(questions: list[str]) -> str:
@@ -954,7 +1021,8 @@ async def request_more_info(
     started_by = await identify_caller(request)
 
     async with request.app.state.db_sessionmaker() as db:
-        inv = await db.get(Investigation, inv_id)
+        got = await inv_svc.get_with_events(db, inv_id)
+        inv, inv_events = got if got is not None else (None, [])
         # Anchor-keyed, like bulk re-hunt: an ordinary row over a promoted
         # anchor (a re-investigation) is as much off-limits as the promoted
         # row itself — the manager's default kind would relaunch it with SO
@@ -1004,7 +1072,7 @@ async def request_more_info(
             },
         )
 
-    questions = _open_questions_of(inv)
+    questions = _open_questions_of(inv, inv_events)
     focus_hint = _focus_hint_from_questions(questions) if questions else None
 
     # Re-resolve the display name if the source row was created nameless.

@@ -152,6 +152,10 @@ class DetectionTuningSummaryOut(BaseModel):
     # muted. Feeds the Dashboard nudge so the suggestions stop living unseen in
     # Config while auto-investigate keeps paying for runs on the same rules.
     pending: int
+    # Every nominated rule, whatever its recommendation. The nudge states both
+    # counts. It said "29 mute suggestions" over a Review list of 39 rules, with
+    # nothing to say how the two relate (dogfood 2026-10-01, D10).
+    nominated: int = 0
 
 
 @router.get(
@@ -171,7 +175,7 @@ async def get_detection_tuning_summary(
     pending = sum(
         1 for n in nominations if n.get("recommendation") == "mute" and not n.get("already_muted")
     )
-    return DetectionTuningSummaryOut(pending=pending)
+    return DetectionTuningSummaryOut(pending=pending, nominated=len(nominations))
 
 
 @router.post(

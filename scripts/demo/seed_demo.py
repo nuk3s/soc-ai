@@ -48,6 +48,12 @@ What it seeds
   Hunts "Catalog" preset render as they do on a grid the loop has swept.
 * 3 starter-pack runbooks (via the shipped loader) so /app/runbooks and the
   lookup_runbook tool demo non-empty.
+* a host estate of 16 machines over 22 TEST-NET addresses: one dossier row per
+  address with hostname, OS and role facts, then the sweep's own clustering
+  (agent claims, DHCP leases, container sightings) writes the host_machine
+  rows. It holds 11 agent machines, a 4-address proxy with 3 containers, a
+  hypervisor named by DNS only, 2 DHCP devices, 2 unnamed addresses (one new
+  this week), 2 declared roles and 1 low-confidence role.
 * alert assignments in every state: Emotet owned, dnstop in_review,
   ATTACK::Discovery done (curl stays unassigned).
 * manual internal-identifier rows (demo workstation hostnames + org suffix).
@@ -62,7 +68,9 @@ import asyncio
 import json
 import shutil
 import sys
-from datetime import timedelta
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
@@ -72,10 +80,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import demo_dataset as dd  # noqa: E402
 from soc_ai.config import Settings  # noqa: E402
 from soc_ai.demo.catalog_trail import CATALOG_HUNT_ID, seed_catalog_trail  # noqa: E402
+from soc_ai.dossier.types import (  # noqa: E402
+    STRENGTH_CONFIDENCE,
+    DhcpLease,
+    Fact,
+    ProvenanceSource,
+    Strength,
+)
 from soc_ai.enrichment.blocklists import BlocklistHit  # noqa: E402
 from soc_ai.so_client.models import RuleMetadata, SoAlert  # noqa: E402
 from soc_ai.store import chat as chat_svc  # noqa: E402
-from soc_ai.store import runbook_pack  # noqa: E402
+from soc_ai.store import host_dossier as dossier_store  # noqa: E402
+from soc_ai.store import host_machines, runbook_pack  # noqa: E402
 from soc_ai.store import runbooks as runbooks_svc  # noqa: E402
 from soc_ai.store.auth import create_user, utcnow  # noqa: E402
 from soc_ai.store.config_overrides import set_override  # noqa: E402
@@ -85,6 +101,7 @@ from soc_ai.store.models import (  # noqa: E402
     AlertAssignment,
     ChatMemory,
     ChatMessage,
+    DossierRun,
     Hunt,
     HuntEvent,
     HuntSchedule,
@@ -95,6 +112,7 @@ from soc_ai.store.models import (  # noqa: E402
 from soc_ai.tools.enrichment import IndicatorEnrichment  # noqa: E402
 from soc_ai.tools.get_alert_context import EnrichedAlertContext  # noqa: E402
 from sqlalchemy import update  # noqa: E402
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker  # noqa: E402
 from ulid import ULID  # noqa: E402
 
 
@@ -1519,6 +1537,448 @@ def build_hunt_error(hunt_id: str) -> tuple[Hunt, list]:
     return hunt, events
 
 
+# --------------------------------------------------------------------------
+# Host estate: the machines behind the Hosts page
+# --------------------------------------------------------------------------
+#
+# Written the way the network sweep writes them: one host_dossier row per
+# address (the header plus hostname / OS / role facts, through the store's own
+# upsert functions), then the sweep's last step (load_address_facts -> the pure
+# cluster_machines -> persist_clustering) over hand-built agent claims, DHCP
+# leases and container sightings. The machines are what the real clustering
+# makes of those inputs, so the Hosts cards count what a sweep would write.
+#
+# Every address is TEST-NET, every MAC sits in the RFC 7042 documentation
+# block (00:00:5e:00:53:xx), and every agent id is a UUID derived from the
+# fictional FQDN.
+
+_DOC_MAC = "00:00:5e:00:53:{:02x}"
+# What the evidence line calls each OS signal: "debian (from ssh)".
+_OS_SIGNAL: dict[str, str] = {"hostlog": "hostlog", "banner": "ssh", "telemetry": "dhcp"}
+
+
+@dataclass(frozen=True)
+class DemoAddress:
+    ip: str
+    events: int
+    last_min: float  # minutes since the newest event on the address
+    first_days: float = 120.0  # days since the first event
+    dns: str | None = None  # the strong DNS name the network's answers agree on
+    reported: bool = True  # the machine's agent reports the address in host.ip
+
+
+@dataclass(frozen=True)
+class DemoMachine:
+    name: str | None
+    addresses: tuple[DemoAddress, ...]  # the first is the primary
+    agent_os: str | None = None  # set: an agent ships logs from the machine
+    agent_docs: int = 0
+    os_family: str | None = None
+    os_detail: str | None = None
+    os_source: ProvenanceSource = "hostlog"
+    mac: int | None = None  # documentation-block MAC suffix
+    dhcp: bool = False  # a DHCP lease names the primary address
+    role: str | None = None
+    role_strength: Strength = "strong"
+    role_source: ProvenanceSource = "behaviour"
+    role_evidence: str = ""
+    # The ports the primary address answers, busiest first: (proto, port, records).
+    services: tuple[tuple[str, int, int], ...] = ()
+    declared: dict[str, str] = field(default_factory=dict)
+    bridge: str | None = None  # a bridge gateway the agent reports
+    containers: tuple[DemoAddress, ...] = ()
+
+    @property
+    def agent_id(self) -> str | None:
+        if self.agent_os is None or self.name is None:
+            return None
+        return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{self.name}.{dd.ORG_DOMAIN}"))
+
+    @property
+    def mac_address(self) -> str | None:
+        return _DOC_MAC.format(self.mac) if self.mac is not None else None
+
+
+def _workstation(
+    name: str, ip: str, events: int, last_min: float, os: str, mac: int
+) -> DemoMachine:
+    """A managed workstation: an agent, one address, a client OS."""
+    return DemoMachine(
+        name=name,
+        addresses=(DemoAddress(ip, events, last_min),),
+        agent_os=os,
+        agent_docs=events * 3,
+        os_family="apple" if os.startswith("macOS") else "windows",
+        os_detail=os,
+        mac=mac,
+        role="workstation",
+        role_source="hostlog",
+        role_evidence=(
+            f"the agent on this machine reports {os}, a client operating system. "
+            "The answered ports agree (from hostlog)"
+        ),
+    )
+
+
+# The fleet the alerts and hunts already name (fin-ws-041 and the file servers
+# it talks to, the DNS server and domain controller, the authorized scanner),
+# plus what a real network also holds: a multi-homed proxy that runs
+# containers, a hypervisor seen only on the wire, two DHCP devices and two
+# addresses that nothing names.
+DEMO_PROXY = "web-proxy-01"
+DEMO_MACHINES: tuple[DemoMachine, ...] = (
+    DemoMachine(
+        name="dc-01",
+        addresses=(DemoAddress(dd.DNS_SERVER, 48_210, 1, 400, dns=f"dc-01.{dd.ORG_DOMAIN}"),),
+        agent_os="Windows Server 2022",
+        agent_docs=91_544,
+        os_family="windows",
+        os_detail="Windows Server 2022",
+        mac=0x02,
+        role="domain_controller",
+        role_evidence=(
+            "responds on tcp/88, tcp/389, tcp/445, udp/53 with 41,233 zeek.conn "
+            "records from 38 distinct peers across 24 hours (from behaviour)"
+        ),
+        services=(
+            ("tcp", 445, 14_210),
+            ("tcp", 389, 9_876),
+            ("udp", 53, 8_745),
+            ("tcp", 88, 8_402),
+        ),
+        declared={"role": "domain_controller", "criticality": "critical"},
+    ),
+    DemoMachine(
+        name=DEMO_PROXY,
+        addresses=(
+            DemoAddress(dd.PROXY_IP, 18_420, 2, 300),
+            DemoAddress("198.51.100.6", 6_310, 3, 300),
+            DemoAddress("198.51.100.7", 2_875, 26, 210),
+            # Not in the agent's report. Its strong DNS name joins it.
+            DemoAddress(
+                "198.51.100.8", 940, 41, 95, dns=f"{DEMO_PROXY}.{dd.ORG_DOMAIN}", reported=False
+            ),
+        ),
+        agent_os="Ubuntu 24.04 LTS",
+        agent_docs=52_300,
+        os_family="linux",
+        os_detail="Ubuntu 24.04 LTS",
+        mac=0x05,
+        role="server",
+        role_evidence=(
+            "responds on tcp/443, tcp/3128 with 7,451 zeek.conn records from "
+            "7 distinct peers across 24 hours (from behaviour)"
+        ),
+        services=(("tcp", 3128, 7_375), ("tcp", 443, 76)),
+        bridge="192.0.2.1",
+        containers=(
+            DemoAddress("192.0.2.2", 1_204, 2, 60),
+            DemoAddress("192.0.2.3", 388, 9, 60),
+            DemoAddress("192.0.2.4", 97, 74, 21),
+        ),
+    ),
+    DemoMachine(
+        name="fs-01",
+        addresses=(DemoAddress("198.51.100.12", 21_870, 6, 400, dns=f"fs-01.{dd.ORG_DOMAIN}"),),
+        agent_os="Windows Server 2019",
+        agent_docs=38_112,
+        os_family="windows",
+        os_detail="Windows Server 2019",
+        mac=0x12,
+        role="server",
+        role_evidence=(
+            "responds on tcp/445 with 19,402 zeek.conn records from 29 distinct peers "
+            "across 24 hours (from behaviour)"
+        ),
+        services=(("tcp", 445, 19_402),),
+    ),
+    DemoMachine(
+        name="fs-02",
+        addresses=(DemoAddress("198.51.100.13", 9_655, 9, 400, dns=f"fs-02.{dd.ORG_DOMAIN}"),),
+        agent_os="Windows Server 2019",
+        agent_docs=27_480,
+        os_family="windows",
+        os_detail="Windows Server 2019",
+        mac=0x13,
+        role="server",
+        role_evidence=(
+            "responds on tcp/445 with 8,117 zeek.conn records from 22 distinct peers "
+            "across 24 hours (from behaviour)"
+        ),
+        services=(("tcp", 445, 8_117),),
+    ),
+    DemoMachine(
+        name="intranet-01",
+        addresses=(
+            DemoAddress("198.51.100.14", 12_302, 4, 260, dns=f"intranet-01.{dd.ORG_DOMAIN}"),
+        ),
+        agent_os="Ubuntu 22.04 LTS",
+        agent_docs=19_870,
+        os_family="linux",
+        os_detail="Ubuntu 22.04 LTS",
+        mac=0x14,
+        role="server",
+        role_evidence=(
+            "responds on tcp/443 with 10,996 zeek.conn records from 44 distinct peers "
+            "across 24 hours (from behaviour)"
+        ),
+        services=(("tcp", 443, 10_996),),
+    ),
+    DemoMachine(
+        name="hv-01",
+        addresses=(DemoAddress("198.51.100.20", 7_412, 12, 365, dns=f"hv-01.{dd.ORG_DOMAIN}"),),
+        os_family="linux",
+        os_detail="debian",
+        os_source="banner",
+        role="hypervisor",
+        role_evidence=(
+            "responds on tcp/22, tcp/8006 with 1,284 zeek.conn records from "
+            "4 distinct peers across 24 hours (from behaviour)"
+        ),
+        services=(("tcp", 8006, 1_102), ("tcp", 22, 182)),
+    ),
+    _workstation("fin-ws-041", "198.51.100.23", 6_118, 8, "Windows 11 Pro", 0x23),
+    _workstation("eng-ws-112", "198.51.100.31", 4_902, 13, "Windows 11 Pro", 0x31),
+    _workstation("it-ws-007", "198.51.100.44", 3_377, 19, "Windows 11 Pro", 0x44),
+    _workstation("hr-ws-023", "198.51.100.57", 2_210, 31, "Windows 10 Pro", 0x57),
+    _workstation("eng-ws-233", "198.51.100.62", 1_846, 124, "macOS 14.6", 0x62),
+    DemoMachine(
+        name="sec-scan-01",
+        addresses=(DemoAddress(dd.SCANNER_IP, 15_906, 22, 330),),
+        agent_os="Debian 12",
+        agent_docs=8_340,
+        os_family="linux",
+        os_detail="Debian 12",
+        mac=0x66,
+        role="server",
+        role_strength="weak",
+        role_evidence=(
+            "opens connections to 112 peers on 41 ports. The answered ports do not "
+            "settle a role (from behaviour)"
+        ),
+        declared={"role": "security_appliance"},
+    ),
+    DemoMachine(
+        name="mkt-ws-019",
+        addresses=(DemoAddress("198.51.100.66", 2_964, 33, 75),),
+        os_family="windows",
+        os_source="telemetry",
+        mac=0x76,
+        dhcp=True,
+        role="workstation",
+        role_evidence=(
+            "opens connections to 23 peers and answers none. The DHCP vendor class "
+            "reads MSFT 5.0 (from behaviour)"
+        ),
+    ),
+    DemoMachine(
+        name="conf-b-display",
+        addresses=(DemoAddress("198.51.100.120", 611, 47, 140),),
+        mac=0x91,
+        dhcp=True,
+        role="iot",
+        role_strength="weak",
+        role_evidence=(
+            "talks to 2 external peers on tcp/443 and answers tcp/8009 once (from behaviour)"
+        ),
+    ),
+    # Two addresses nothing names. The second one arrived two days ago.
+    DemoMachine(name=None, addresses=(DemoAddress("198.51.100.140", 1_022, 180, 50),)),
+    DemoMachine(name=None, addresses=(DemoAddress("198.51.100.201", 357, 54, 2),)),
+)
+
+
+def _fact(
+    field_name: str,
+    value: str,
+    source: ProvenanceSource,
+    evidence: str,
+    observed: datetime,
+    strength: Strength = "strong",
+) -> Fact:
+    return Fact(
+        field=field_name,
+        value=value,
+        confidence=STRENGTH_CONFIDENCE[strength],
+        strength=strength,
+        source=source,
+        evidence=[evidence],
+        observed_at=observed,
+    )
+
+
+def _address_facts(machine: DemoMachine, address: DemoAddress, observed: datetime) -> list[Fact]:
+    """What one build concludes about one member address of a machine."""
+    out: list[Fact] = []
+    if machine.name is not None and machine.agent_os is not None and address.reported:
+        out.append(
+            _fact("hostname", machine.name, "hostlog", f"{machine.name} (from hostlog)", observed)
+        )
+    elif machine.name is not None and machine.dhcp:
+        out.append(
+            _fact("hostname", machine.name, "banner", f"{machine.name} (from dhcp)", observed)
+        )
+    elif address.dns is not None:
+        out.append(
+            _fact(
+                "hostname",
+                address.dns,
+                "telemetry",
+                f"{address.dns} (from dns, 212 answers agree)",
+                observed,
+            )
+        )
+    else:
+        out.append(Fact(field="hostname", evidence=["no hostname signal in window"]))
+    signal = _OS_SIGNAL[machine.os_source]
+    if machine.os_family is not None:
+        family = machine.os_family
+        out.append(
+            _fact("os_family", family, machine.os_source, f"{family} (from {signal})", observed)
+        )
+    if machine.os_detail is not None:
+        detail = machine.os_detail
+        out.append(
+            _fact("os_detail", detail, machine.os_source, f"{detail} (from {signal})", observed)
+        )
+    if address is machine.addresses[0]:
+        if machine.role is not None:
+            out.append(
+                _fact(
+                    "role",
+                    machine.role,
+                    machine.role_source,
+                    machine.role_evidence,
+                    observed,
+                    machine.role_strength,
+                )
+            )
+        mac = machine.mac_address
+        if mac is not None:
+            source: ProvenanceSource = "hostlog" if machine.agent_os else "banner"
+            label = "hostlog" if machine.agent_os else "dhcp"
+            out.append(_fact("mac", mac, source, f"{mac} (from {label})", observed))
+        if machine.services:
+            out.append(
+                Fact(
+                    field="services_offered",
+                    value=", ".join(f"{proto}/{port}" for proto, port, _ in machine.services),
+                    value_json=[
+                        {"port": port, "proto": proto, "count": count, "service": None}
+                        for proto, port, count in machine.services
+                    ],
+                    confidence=STRENGTH_CONFIDENCE["strong"],
+                    strength="strong",
+                    source="behaviour",
+                    evidence=[machine.role_evidence],
+                    observed_at=observed,
+                )
+            )
+    return out
+
+
+async def seed_hosts(sm: async_sessionmaker[AsyncSession], *, actor: str) -> dict[str, str]:
+    """Write the demo estate's address rows and its machines. Returns manifest keys."""
+    now = utcnow()
+    built = now - timedelta(minutes=38)
+    agents: list[host_machines.AgentClaim] = []
+    leases: list[DhcpLease] = []
+    sightings: list[host_machines.ContainerSighting] = []
+    dns_names: dict[str, str] = {}
+    fields_written = 0
+    async with sm() as db:
+        for machine in DEMO_MACHINES:
+            primary = machine.addresses[0]
+            for address in machine.addresses + machine.containers:
+                last = now - timedelta(minutes=address.last_min)
+                host = await dossier_store.upsert_host(
+                    db,
+                    address.ip,
+                    first_seen=now - timedelta(days=address.first_days),
+                    last_seen=last,
+                    last_observed_at=last,
+                    event_count=address.events,
+                    last_built_at=built,
+                    build_error=None,
+                    now=built,
+                )
+                if address.dns is not None:
+                    dns_names[address.ip] = address.dns
+                if address in machine.containers:
+                    continue
+                for fact in _address_facts(machine, address, last):
+                    await dossier_store.upsert_inferred(db, host, fact, now=built)
+                    fields_written += 1
+            mac = machine.mac_address
+            if machine.agent_id is not None and machine.name is not None:
+                reported = [a.ip for a in machine.addresses if a.reported]
+                if machine.bridge is not None:
+                    reported.append(machine.bridge)
+                agents.append(
+                    host_machines.AgentClaim(
+                        agent_id=machine.agent_id,
+                        name=machine.name,
+                        os=machine.agent_os,
+                        macs=(mac,) if mac else (),
+                        addresses=tuple(reported),
+                        last_report=now - timedelta(minutes=primary.last_min),
+                        docs=machine.agent_docs,
+                    )
+                )
+                sightings.extend(
+                    host_machines.ContainerSighting(ip=c.ip, agent_id=machine.agent_id)
+                    for c in machine.containers
+                )
+            if machine.dhcp and mac is not None:
+                leases.append(
+                    DhcpLease(
+                        ip=primary.ip,
+                        mac=mac,
+                        hostname=machine.name,
+                        first_seen=now - timedelta(days=primary.first_days),
+                        last_seen=now - timedelta(minutes=primary.last_min),
+                    )
+                )
+        census = sum(len(m.addresses) + len(m.containers) for m in DEMO_MACHINES)
+        db.add(
+            DossierRun(
+                started_at=built - timedelta(minutes=3),
+                finished_at=built,
+                trigger="schedule",
+                hosts_seen=census,
+                hosts_built=census,
+                fields_written=fields_written,
+            )
+        )
+        await db.commit()
+
+    # Declarations ride the operator lane, as a declare from the console does.
+    async with sm() as db:
+        for machine in DEMO_MACHINES:
+            for name, value in machine.declared.items():
+                await dossier_store.set_override(
+                    db, machine.addresses[0].ip, name, value, actor=actor, now=built
+                )
+
+    # The sweep's last step, over the census the rows above make.
+    async with sm() as db:
+        facts = await host_machines.load_address_facts(
+            db,
+            dns_names=dns_names,
+            now=now,
+            min_confidence=dossier_store.DEFAULT_MIN_CONFIDENCE,
+            staleness_hours=dossier_store.DEFAULT_STALENESS_HOURS,
+        )
+    clustering = host_machines.cluster_machines(
+        facts, agents=agents, leases=leases, sightings=sightings
+    )
+    async with sm() as db:
+        await host_machines.persist_clustering(db, clustering, facts, now=built)
+
+    proxy = next(m for m in DEMO_MACHINES if m.name == DEMO_PROXY)
+    return {"host_proxy": f"agent:{proxy.agent_id}", "host_proxy_ip": proxy.addresses[0].ip}
+
+
 async def seed(data_dir: Path) -> dict:
     # Nuke-to-reseed (ignore_errors: a missing dir is the normal first run).
     shutil.rmtree(data_dir, ignore_errors=True)
@@ -1713,6 +2173,9 @@ async def seed(data_dir: Path) -> dict:
     # startup, so the Operate hub's catalog panel has a trail to read.
     await seed_catalog_trail(sm)
 
+    # The machines on the Hosts page: address rows, then the sweep's clustering.
+    hosts = await seed_hosts(sm, actor=dd.DEMO_ADMIN_USER)
+
     await engine.dispose()
 
     manifest = {
@@ -1725,6 +2188,7 @@ async def seed(data_dir: Path) -> dict:
         "hunt_prev": ids["hunt_prev"],
         "hunt_error": ids["hunt_error"],
         "hunt_catalog": CATALOG_HUNT_ID,
+        **hosts,
         "admin_user": dd.DEMO_ADMIN_USER,
         "admin_password": dd.DEMO_ADMIN_PASSWORD,
     }

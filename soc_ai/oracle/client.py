@@ -1097,6 +1097,38 @@ class OracleToolGuard:
         return self._backstop(wrapped["result"])
 
 
+def sanitize_initial_payload(
+    case_dict: dict[str, Any],
+    mapping: Mapping,
+    *,
+    allowlist: tuple[str, ...],
+    extra_hosts: tuple[str, ...],
+    extra_suffixes: tuple[str, ...],
+    no_propagate: set[str],
+    guard: OracleToolGuard | None,
+) -> dict[str, Any]:
+    """Sanitize the INITIAL Oracle payload. The one function every caller uses.
+
+    ``sanitize_case`` first: its field-aware harvest tokenises ``user.name``,
+    ``host.name`` and the other identity fields that plain ``sanitize`` passes
+    through. Then, when the tool loop is on, the guard's allow-known-safe
+    backstop. Both send paths call this, and so does the redaction preview, so
+    the preview shows what actually leaves the network (dogfood 2026-10-01 A5:
+    the preview called plain ``sanitize`` and showed ``user.name`` in the clear).
+    """
+    sanitized = sanitize_case(
+        case_dict,
+        mapping,
+        allowlist=allowlist,
+        extra_hosts=extra_hosts,
+        extra_suffixes=extra_suffixes,
+        no_propagate_out=no_propagate,
+    )
+    if guard is not None:
+        sanitized = guard._backstop(sanitized)
+    return sanitized
+
+
 def _is_residue_error(exc: BaseException) -> bool:
     """Whether :class:`OracleResidueError` is anywhere in *exc*'s cause chain.
 
@@ -1218,20 +1250,20 @@ async def _adjudicate_with_tools(  # noqa: PLR0915 - one linear egress-gated pip
         allowlist=allowlist,
         no_propagate=no_propagate,
     )
-    sanitized_case = sanitize_case(
-        case_dict,
-        mapping,
-        allowlist=allowlist,
-        extra_hosts=resolved_hosts,
-        extra_suffixes=resolved_suffixes,
-        no_propagate_out=no_propagate,
-    )
     # Allow-known-safe backstop over the initial payload — the FINAL pass after
     # sanitize_case, identical to OracleToolGuard.sanitize_obj's tool-result pass:
     # mask any residual free-form scalar the harvest could not classify. The
     # count folds into guard.masked_count so oracle_masked_values reports the FULL
     # utility cost (initial payload + tool results), not just the tool-result half.
-    sanitized_case = guard._backstop(sanitized_case)
+    sanitized_case = sanitize_initial_payload(
+        case_dict,
+        mapping,
+        allowlist=allowlist,
+        extra_hosts=resolved_hosts,
+        extra_suffixes=resolved_suffixes,
+        no_propagate=no_propagate,
+        guard=guard,
+    )
     try:
         payload_text = json.dumps(sanitized_case)
     except (TypeError, ValueError) as exc:
@@ -1532,13 +1564,14 @@ async def adjudicate(  # noqa: PLR0915 - one linear pipeline; splitting hides th
     # below — otherwise the gate flags the same substring inside a legitimate
     # public FQDN and refuses by construction (finding oracle-refuse-by-design).
     no_propagate: set[str] = set()
-    sanitized_case = sanitize_case(
+    sanitized_case = sanitize_initial_payload(
         case_dict,
         mapping,
         allowlist=allowlist,
         extra_hosts=resolved_hosts,
         extra_suffixes=resolved_suffixes,
-        no_propagate_out=no_propagate,
+        no_propagate=no_propagate,
+        guard=None,
     )
 
     # 3. Serialize to the ACTUAL outbound bytes.

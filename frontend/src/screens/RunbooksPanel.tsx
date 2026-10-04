@@ -40,10 +40,8 @@ export function RunbooksPanel({
             <BookOpen size={16} />
           </span>
           <div className="min-w-0 flex-1 text-[12.5px] leading-[1.5] text-dim">
-            A runbook holds your team's own triage guidance. The investigation agent searches
-            the runbooks with the{' '}
-            <code className="text-[11.5px] text-text">lookup_runbook</code> tool. Open the Runbooks
-            page to add a runbook. Author one, import .md files, or load the starter pack.
+            A runbook holds your team's own triage guidance. During an investigation, the model
+            searches the runbooks. Open the Runbooks page to add a runbook. Author one, import .md files, or load the starter pack.
           </div>
           <Link
             to="/runbooks"

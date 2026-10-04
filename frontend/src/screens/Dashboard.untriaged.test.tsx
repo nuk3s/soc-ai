@@ -5,7 +5,7 @@
 // stays untriaged, so the destination was empty BY CONSTRUCTION ("1x untriaged
 // that when clicked reveals no investigations", prod 2026-08-07).
 //
-// Untriaged has to land on /alerts: same endpoint (GET /alerts), same unit
+// Every verdict tile lands on /alerts now (D2, RD3). Untriaged was first: same endpoint (GET /alerts), same unit
 // (groups), and the place the operator can actually start the investigation.
 // The two carried params are load-bearing — Alerts defaults to range=24h and
 // hide_acked=true while the Dashboard queries the operator's range with
@@ -94,15 +94,25 @@ const tile = async (label: string) =>
 const here = () => screen.getByTestId('here').textContent;
 
 describe('Dashboard outcome breakdown — where each verdict lands', () => {
+  // Every tile counts alert groups in the Dashboard window. The four settled
+  // verdicts used to open /investigations?verdict=<v>, a list of investigation
+  // rows over 30 days: "False positive 43" for 24 h opened 2,091 rows, and
+  // "True positive 0" opened one (D2, RD3). They now land where untriaged
+  // does, on the same unit and window.
   it.each([
     ['True positive', 'true_positive'],
     ['Needs info', 'needs_more_info'],
     ['Inconclusive', 'inconclusive'],
     ['False positive', 'false_positive'],
-  ])('sends %s to the Investigations list', async (label, value) => {
+  ])('sends %s to the Alerts list in the same window', async (label, value) => {
     await mount();
+    fireEvent.click(screen.getByText('7d'));
     fireEvent.click(await tile(label));
-    expect(here()).toBe(`/investigations?verdict=${value}`);
+    const dest = new URL(here()!, 'http://x');
+    expect(dest.pathname).toBe('/alerts');
+    expect(dest.searchParams.get('verdict')).toBe(value);
+    expect(dest.searchParams.get('range')).toBe('7d');
+    expect(dest.searchParams.get('hide_acked')).toBe('false');
   });
 
   it('sends Untriaged to the Alerts list, carrying range and hide_acked=false', async () => {
@@ -150,9 +160,10 @@ describe('Dashboard outcome breakdown — where each verdict lands', () => {
     // It used to read "Show Untriaged investigations" — a list that cannot exist.
     expect(title).not.toMatch(/untriaged investigations/i);
     expect(title).toMatch(/alerts/i);
-    // The settled verdicts still promise investigations, because they have them.
-    expect((await tile('True positive')).getAttribute('title')).toMatch(
-      /investigations/i,
+    // The settled verdicts open the Alerts list too, and their tooltip names
+    // that list and its unit (D2).
+    expect((await tile('True positive')).getAttribute('title')).toBe(
+      'Show the True positive detection groups in the Alerts list',
     );
   });
 });

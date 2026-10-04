@@ -19,7 +19,7 @@ vi.mock('../lib/api', () => ({
   getAlerts: vi.fn(() => Promise.resolve({ groups: [], truncated: false, other_docs: 0 })),
   getInvestigations: vi.fn(() => Promise.resolve([])),
   getConfig: vi.fn(() => Promise.resolve({ groups: [], tokens: [], users: [], dangerHost: '' })),
-  listDossiers: vi.fn(() => Promise.resolve({ rows: [], total: 0, limit: 8, offset: 0 })),
+  listMachines: vi.fn(() => Promise.resolve({ rows: [], total: 0, limit: 8, offset: 0, sort: 'last_seen', dir: 'desc' })),
   signOut: vi.fn(),
 }));
 

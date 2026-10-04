@@ -33,6 +33,8 @@ import type {
 vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
   getDossier: vi.fn(),
+  resolveMachine: vi.fn(),
+  getMachine: vi.fn(),
   getHostActivity: vi.fn(),
   setDossierOverride: vi.fn(),
   clearDossierOverride: vi.fn(),
@@ -67,11 +69,22 @@ import {
   getHostActivity,
   getHostChat,
   getLeads,
+  getMachine,
   getMe,
+  resolveMachine,
   setDossierOverride,
   snoozeDossierConflict,
   startDossierRefresh,
 } from '../lib/api';
+
+// The page resolves an address to its machine first. Most tests here are
+// about the page of one address, so by default no machine holds it.
+beforeEach(() => {
+  vi.mocked(resolveMachine)
+    .mockReset()
+    .mockRejectedValue(new ApiError('No machine holds this value.', 404, 'no_host'));
+  vi.mocked(getMachine).mockReset();
+});
 import { roleAccent, roleRail } from '../lib/hostColors';
 import type { HostActivity } from '../lib/types';
 import { peerGraph } from '../components/HostActivityRow';
@@ -333,7 +346,7 @@ const mount = (url = `/hosts/${IP}`) =>
   render(
     <MemoryRouter initialEntries={[url]}>
       <Routes>
-        <Route path="/hosts/:ip" element={<HostDetail />} />
+        <Route path="/hosts/:key" element={<HostDetail />} />
       </Routes>
     </MemoryRouter>,
   );
@@ -449,11 +462,15 @@ describe('HostDetail — an address the sweep has never seen', () => {
     expect(screen.queryByRole('button', { name: /sweep the network now/i })).toBeNull();
   });
 
-  it('names a path segment that is not an address at all', async () => {
-    // The 404's hint is what request() surfaces as the Error message.
-    vi.mocked(getDossier).mockRejectedValue(new Error('the dossier is keyed on IP addresses'));
+  it('says so when a name in the path matches no machine', async () => {
+    // A name is resolved to its machine. A name no machine answers to is a
+    // 404 from the resolve read, and the page offers the search and the
+    // entity page. It never asks the address dossier for a name.
     mount('/hosts/not-a-host');
-    expect(await screen.findByText(/not an IP address/i)).toBeTruthy();
+    expect(await screen.findByTestId('host-unknown-name')).toBeTruthy();
+    expect(resolveMachine).toHaveBeenCalledWith('not-a-host');
+    expect(getDossier).not.toHaveBeenCalled();
+    expect(screen.getByRole('link', { name: 'Hosts list' }).getAttribute('href')).toBe('/hosts?q=not-a-host');
   });
 });
 
@@ -1421,7 +1438,8 @@ describe('HostDetail — the unknown line tells the truth about why', () => {
     expect(unknowns.textContent).toMatch(/checked, nothing found/i);
     expect(unknowns.textContent).toMatch(/not checked yet/i);
     expect(unknowns.textContent).toMatch(/too old to trust/i);
-    expect(unknowns.textContent).toMatch(/possibly "CORP"/i);
+    expect(unknowns.textContent).toMatch(/low confidence: "CORP"/i);
+    expect(unknowns.textContent).not.toMatch(/possibly/i);
   });
 
   // A role the sweep guessed and the resolver withheld used to live in the
@@ -1442,8 +1460,29 @@ describe('HostDetail — the unknown line tells the truth about why', () => {
     mount();
     const facts = await screen.findByTestId('host-facts');
     const roleRow = within(facts).getByTestId('field-role');
-    expect(roleRow.textContent).toContain('possibly security appliance');
+    expect(within(roleRow).getByTestId('withheld-role').textContent).toBe(
+      'security appliance · low confidence',
+    );
     expect(roleRow.textContent).toContain('0.55');
+  });
+
+  // "possibly unknown · confidence 0.00" named no guess (dogfood RO16).
+  it('names no guess when the sweep guessed "unknown"', async () => {
+    vi.mocked(getDossier).mockResolvedValue(
+      dossier({
+        role: {
+          reason: 'low_confidence',
+          inferred_value: 'unknown',
+          inferred_confidence: 0,
+          inferred_source: 'behaviour',
+          last_run_at: '2026-08-07T06:00:00Z',
+        },
+      }),
+    );
+    mount();
+    await screen.findByTestId('host-unknowns');
+    expect(screen.queryByTestId('withheld-role')).toBeNull();
+    expect(document.body.textContent).not.toMatch(/possibly unknown/i);
   });
 
   it('states a withheld role guess once, not twice', async () => {

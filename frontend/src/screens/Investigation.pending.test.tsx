@@ -79,7 +79,7 @@ describe('empty investigation chat', () => {
         <Investigation inv={baseInv({ seedChat: [] })} layout="drawer" />
       </MemoryRouter>,
     );
-    expect(screen.getByText('Why not a false positive?')).toBeTruthy();
+    expect(screen.getByText('Why not a true positive?')).toBeTruthy();
     expect(screen.getByText(/Ask a follow-up about this investigation/i)).toBeTruthy();
   });
 });

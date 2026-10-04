@@ -19,7 +19,7 @@ import { AboutPanel } from './AboutPanel';
 import { MaintenancePanel } from './MaintenancePanel';
 import { RunbooksPanel } from './RunbooksPanel';
 import { addInternalIdentifier, createUser, dismissIdentifier, getConfig, getDiscoveryScan, getGatewayModels, getInternalIdentifiers, getModelBattery, getModelFitness, listDangerSettings, listUsers, mintToken, reembedRunbooks, removeIdentifier, resetUserPassword, revokeToken, saveDangerSetting, setIdentifierActive, setSetting, setUserRole, startModelBattery, startDiscoveryScan, testConnection, toggleUserDisabled, verifyAuditChain } from '../lib/api';
-import { ApiError } from '../lib/api';
+import { ApiError, isRequestTimeout } from '../lib/api';
 import type { BatteryRecommendation, ModelBatteryStatus } from '../lib/api';
 import type { IdentifierKind, InternalIdentifiers, ModelFitness, RagReembedResult } from '../lib/api';
 import { demoBlocked, useDemo } from '../lib/demo';
@@ -232,18 +232,23 @@ function ModelFitnessChip({
   fitness,
   loading,
   staged,
+  error = '',
   onCheck,
 }: {
   fitness: ModelFitness | null;
   loading: boolean;
   /** true = the selected model is a pending edit the server is not running yet. */
   staged: boolean;
+  /** Why the last check did not finish ('' = it did). The previous grade stays
+   *  on screen beside it: an aborted check measured nothing new. */
+  error?: string;
   onCheck: () => void;
 }) {
   const view = fitness ? _fitnessView(fitness) : null;
   return (
+    <div className="flex flex-col items-end gap-0.5">
     <div className="flex items-center gap-2">
-      {loading && <span className="text-[11px] text-faint">Checking fitness…</span>}
+      {loading && !view && <span className="text-[11px] text-faint">Checking fitness…</span>}
       {!loading && staged && (
         <span
           data-testid="fitness-staged"
@@ -253,7 +258,7 @@ function ModelFitnessChip({
           Apply the change to check fitness
         </span>
       )}
-      {!loading && view && (
+      {view && (
         <span
           data-testid="fitness-chip"
           className={`rounded px-1.5 py-0.5 text-[10.5px] font-semibold uppercase tracking-wide${
@@ -263,6 +268,11 @@ function ModelFitnessChip({
           title={view.title}
         >
           {view.label}
+        </span>
+      )}
+      {loading && view && (
+        <span data-testid="fitness-checking" className="text-[11px] text-faint">
+          checking…
         </span>
       )}
       {!loading && view && view.detail && (
@@ -297,8 +307,29 @@ function ModelFitnessChip({
         Check fitness
       </button>
     </div>
+      {!loading && error && (
+        <span data-testid="fitness-error" role="status" className="max-w-[420px] text-[11px] text-danger">
+          The fitness check did not finish. {error}
+        </span>
+      )}
+    </div>
   );
 }
+
+/** How long an "Applied N changes." notice stays on the sticky bar. */
+const APPLY_NOTICE_MS = 8000;
+
+/** Days since a stored battery result; null when unknown. */
+function _batteryAgeDays(iso: string | null): number | null {
+  if (!iso) return null;
+  const ms = Date.now() - new Date(iso + (iso.endsWith('Z') ? '' : 'Z')).getTime();
+  if (!Number.isFinite(ms) || ms < 0) return null;
+  return ms / 86_400_000;
+}
+
+/** A battery result older than this reads amber: the model behind the
+ *  gateway may have changed since it was measured. */
+const BATTERY_STALE_DAYS = 30;
 
 /** Age string for a stored battery result ("2h ago"); empty when unknown. */
 function _batteryAge(iso: string | null): string {
@@ -337,16 +368,20 @@ function ModelBatteryPanel({
   onRun: () => void;
   onRunAll: () => void;
   onApply: (rec: BatteryRecommendation) => void;
-  /** true = the live knob values already match the recommendation. */
-  recApplied: boolean;
+  /** 'live' = the running values match the recommendation. 'staged' = only
+   *  the pending edits match it, and Apply changes has not saved them yet. */
+  recApplied: 'live' | 'staged' | 'none';
 }) {
   const result = battery?.result ?? null;
+  const ageDays = _batteryAgeDays(battery?.stored_at ?? null);
+  const age = battery?.stored_at ? _batteryAge(battery.stored_at) : '';
+  const oldResult = ageDays != null && ageDays > BATTERY_STALE_DAYS;
   return (
     <div className="flex flex-col items-end gap-1">
       <div className="flex items-center gap-2">
         {running && (
           <span className="text-[11px] text-faint">
-            Full check: {battery?.current_config ?? '…'} · {(battery?.completed ?? 0) + 1} of{' '}
+            Model battery: {battery?.current_config ?? '…'} · {(battery?.completed ?? 0) + 1} of{' '}
             {battery?.total ?? 4}…
           </span>
         )}
@@ -362,11 +397,11 @@ function ModelBatteryPanel({
             demo
               ? 'The demo blocks this action. The demo has no model egress.'
               : staged
-                ? 'Apply the model change first. The full check probes the model that is running.'
-                : 'The full check probes this model under every structured output configuration. The configurations are tool, native, prompted and tool+required. The full check takes minutes on a slow backend.'
+                ? 'Apply the model change first. The model battery probes the model that is running.'
+                : 'The model battery probes this model under every structured output configuration. The configurations are tool, native, prompted and tool+required. The model battery takes minutes on a slow backend.'
           }
         >
-          Run the full check
+          Run the model battery
         </button>
         <button
           type="button"
@@ -378,10 +413,10 @@ function ModelBatteryPanel({
               ? 'The demo blocks this action. The demo has no model egress.'
               : staged
                 ? 'Apply the model change first. Both checks probe the model that is running.'
-                : 'This button starts both checks. It measures fitness again and runs the full check.'
+                : 'This button measures fitness again and runs the model battery.'
           }
         >
-          Run all checks
+          Check fitness and run the battery
         </button>
       </div>
       {!running && result?.configs && (
@@ -402,15 +437,24 @@ function ModelBatteryPanel({
           </tbody>
         </table>
       )}
-      {!running && result?.recommendation && recApplied && (
+      {!running && result?.recommendation && recApplied === 'live' && (
         <span
-          className="text-[11px] text-success"
+          data-testid="battery-match"
+          className={`text-[11px] ${oldResult ? '' : 'text-success'}`}
+          style={oldResult ? { color: '#f5a623' } : undefined}
           title={result.recommendation.reason}
         >
-          ✓ The current settings match the {result.recommendation.config} recommendation
+          {oldResult ? '' : '✓ '}The current settings match the {result.recommendation.config} recommendation
+          {age ? ` of ${age}` : ''}.
+          {oldResult ? ' The result is older than 30 days. Run the model battery again.' : ''}
         </span>
       )}
-      {!running && result?.recommendation && !recApplied && (
+      {!running && result?.recommendation && recApplied === 'staged' && (
+        <span data-testid="battery-match" className="text-[11px] text-faint" title={result.recommendation.reason}>
+          The {result.recommendation.config} recommendation is staged, not applied. Select Apply changes below to save it.
+        </span>
+      )}
+      {!running && result?.recommendation && recApplied === 'none' && (
         <div className="flex items-center gap-2 rounded border border-border bg-surface-2 px-2 py-1">
           <span className="max-w-[260px] text-[11px] text-text" title={result.recommendation.reason}>
             {result.recommendation.reason}
@@ -427,12 +471,12 @@ function ModelBatteryPanel({
       )}
       {!running && battery?.error && (
         <span className="max-w-[280px] truncate text-[11px] text-danger" title={battery.error}>
-          The full check failed: {battery.error}
+          The model battery failed: {battery.error}
         </span>
       )}
       {!running && startError && (
         <span className="max-w-[280px] truncate text-[11px] text-danger" title={startError}>
-          The full check could not start: {startError}
+          The model battery could not start: {startError}
         </span>
       )}
     </div>
@@ -523,11 +567,24 @@ export function Config() {
   // Bumped on discard/apply to force uncontrolled inputs (NumberField/text, which
   // use defaultValue) to remount and re-read the current server/staged value.
   const [formNonce, setFormNonce] = useState(0);
+  const remountOnData = useRef(false);
+  useEffect(() => {
+    if (!remountOnData.current) return;
+    remountOnData.current = false;
+    setFormNonce((n) => n + 1);
+  }, [data]);
   const [applying, setApplying] = useState(false);
   // Per-key apply errors, surfaced inline beside the offending control.
   const [applyErrors, setApplyErrors] = useState<Record<string, string>>({});
   // Sticky-bar result after an Apply: how many saved, and whether any need a restart.
   const [applyResult, setApplyResult] = useState<{ ok: boolean; msg: string } | null>(null);
+  // "Applied N changes." stayed for minutes across sections (RC13). A success
+  // is a notice: it leaves after 8 s. A failure stays, beside its fields.
+  useEffect(() => {
+    if (!applyResult?.ok) return;
+    const t = setTimeout(() => setApplyResult(null), APPLY_NOTICE_MS);
+    return () => clearTimeout(t);
+  }, [applyResult]);
 
   // ── Analyst-model fitness (E1.1) ───────────────────────────────────────────
   // A model that LISTS on the gateway can still be unfit (all-fallback verdicts).
@@ -555,17 +612,22 @@ export function Config() {
   const acceptFitness = (r: ModelFitness) =>
     setFitness(r.model && r.model !== fitnessModelRef.current ? null : r);
 
+  // Why the last fitness check did not finish. The check aborted at the 20 s
+  // default while the server needed 26 to 53 s, and the previous chip vanished
+  // with no word (RC3). Now the previous grade stays and this line says why.
+  const [fitnessError, setFitnessError] = useState('');
   const runFitness = (force = false) => {
     if (analystStaged) {
       setFitness(null);
       return;
     }
     setFitnessLoading(true);
+    setFitnessError('');
     getModelFitness(force)
       .then(acceptFitness)
-      // Fail-soft: a probe/gateway/permission error must not surface as an error
-      // chip — clear the stale grade and stay neutral.
-      .catch(() => setFitness(null))
+      // The previous grade stays: a check that did not finish measured nothing,
+      // so it can neither confirm nor clear the grade on screen.
+      .catch((e: unknown) => setFitnessError(e instanceof Error ? e.message : String(e)))
       .finally(() => setFitnessLoading(false));
   };
 
@@ -637,10 +699,20 @@ export function Config() {
     return staged[key] ?? String(server ?? '');
   };
   const rec = battery?.result?.recommendation ?? null;
-  const recApplied =
+  const liveKnob = (key: string) =>
+    String(data?.groups.flatMap((g) => g.items).find((i) => i.key === key)?.value ?? '');
+  const recMatches = (read: (key: string) => string) =>
     !!rec &&
-    currentKnob('synthesizer_output_mode') === rec.synthesizer_output_mode &&
-    currentKnob('analyst_tool_choice_required') === String(rec.analyst_tool_choice_required);
+    read('synthesizer_output_mode') === rec.synthesizer_output_mode &&
+    read('analyst_tool_choice_required') === String(rec.analyst_tool_choice_required);
+  // The match line reads the LIVE value. A staged pick that matches is not yet
+  // the running config, and "the current settings match" right after the
+  // recommendation's Apply stage was a claim about a save that never ran (RC5).
+  const recApplied: 'live' | 'staged' | 'none' = recMatches(liveKnob)
+    ? 'live'
+    : recMatches(currentKnob)
+      ? 'staged'
+      : 'none';
 
   // One click, both measurements: force a fresh fitness check and start the
   // battery together (dogfood 2026-08-05).
@@ -673,13 +745,20 @@ export function Config() {
     fitnessModelRef.current = String(currentAnalystModel);
     if (!currentAnalystModel) return;
     setFitness(null);
+    setFitnessError('');
     if (analystStaged) return;
     let cancelled = false;
     const t = setTimeout(() => {
       setFitnessLoading(true);
       getModelFitness()
         .then((r) => { if (!cancelled) acceptFitness(r); })
-        .catch(() => { if (!cancelled) setFitness(null); })
+        .catch((e: unknown) => {
+          if (cancelled) return;
+          setFitness(null);
+          // An abort is the one error the page load must name: the server is
+          // still working, and a blank chip read as "never measured".
+          if (isRequestTimeout(e)) setFitnessError(e.message);
+        })
         .finally(() => { if (!cancelled) setFitnessLoading(false); });
     }, 600);
     return () => {
@@ -842,6 +921,11 @@ export function Config() {
       : validId(storedSection)
         ? storedSection
         : (flatSections[0]?.id ?? '');
+  // A section change also ends an "Applied N changes." notice (RC13). The
+  // notice is about the edits just saved, not about the section now on screen.
+  useEffect(() => {
+    setApplyResult((r) => (r?.ok ? null : r));
+  }, [effectiveId]);
   useEffect(() => {
     if (!effectiveId) return;
     try {
@@ -1202,7 +1286,11 @@ export function Config() {
           ? `Applied ${saved} change${saved === 1 ? '' : 's'}. Some changes need a service restart.`
           : `Applied ${saved} change${saved === 1 ? '' : 's'}.`,
       });
-      setFormNonce((n) => n + 1);
+      // Remount the uncontrolled fields only once the refetch LANDS. Bumped here,
+      // beside the refetch, they remounted on the old server value and showed
+      // it until a reload (RC1). Until then the fields keep the typed value,
+      // which is the value just applied.
+      remountOnData.current = true;
       setNonce((n) => n + 1); // refetch config → re-sync source badges / values
     } else {
       setApplyResult({
@@ -1283,6 +1371,7 @@ export function Config() {
             fitness={fitness}
             loading={fitnessLoading}
             staged={analystStaged}
+            error={fitnessError}
             onCheck={() => runFitness(true)}
           />
           <ModelBatteryPanel
@@ -1355,6 +1444,7 @@ export function Config() {
             fitness={fitness}
             loading={fitnessLoading}
             staged={analystStaged}
+            error={fitnessError}
             onCheck={() => runFitness(true)}
           />
           <ModelBatteryPanel
@@ -1824,10 +1914,11 @@ export function Config() {
           <span className="flex-none pt-px">{autoAckInert ? '⚠' : 'ℹ'}</span>
           <span>
             Auto-ack acks only a false positive that soc-ai investigates.
-            {autoAckInert && scheduleOn === false && ' Scheduled auto-triage is off. soc-ai investigates nothing automatically.'}
-            {autoAckInert && floorTooHigh && ` The auto-triage severity floor is “${minSev}”. Auto-ack never acks a high or critical alert.`}
-            {' '}Run a sweep to clear a backlog. You can also enable continuous auto-investigate in
-            this group. Set its severity floor to medium or low.
+            {autoAckInert && scheduleOn === false && ' Continuous Auto-Investigate is off. soc-ai investigates nothing automatically.'}
+            {autoAckInert && floorTooHigh && ` The Auto-Investigate severity floor is “${minSev}”. Auto-ack never acks a high or critical alert.`}
+            {' '}Run Auto-Investigate to clear a backlog.
+            {scheduleOn !== true && ' You can also turn on Continuous Auto-Investigate in this group.'}
+            {' '}Set its severity floor to medium or low.
           </span>
         </div>
       )}

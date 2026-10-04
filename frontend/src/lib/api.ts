@@ -41,6 +41,11 @@ import type {
   Investigation,
   InvestigationList,
   InvestigationRow,
+  MachineDetail,
+  MachineList,
+  MachineResolve,
+  MachineSortKey,
+  MachineSummary,
   Me,
   Notification,
   PreflightDetail,
@@ -51,6 +56,7 @@ import type {
   SavedViewQuery,
   SavedViewScreen,
   SigmaDraft,
+  SortDir,
   StartBacktestOpts,
   TriageState,
   UpdateCheckResult,
@@ -214,6 +220,54 @@ function redirectToLogin(): void {
 // NOT go through this helper — a total-duration signal would kill them.
 const REQUEST_TIMEOUT_MS = 20_000;
 
+// Budgets for the calls the 20 s default cut short while the server was still
+// working (dogfood 2026-10-01). A client abort on a write is not a failed
+// write: the request is already on the server, and on a slow grid the ack or
+// the case landed 60 to 75 s later under a red "Could not escalate" toast.
+/** Security Onion writes: ack, escalate, assign, release, bulk declare. */
+export const SO_WRITE_TIMEOUT_MS = 90_000;
+/** POST /hunt, lead promote, and hunt start. Each opens a run on the server. */
+export const RUN_START_TIMEOUT_MS = 60_000;
+/** The audit chain verify reads the whole audit index: 33 to 77 s measured. */
+export const AUDIT_VERIFY_TIMEOUT_MS = 150_000;
+/** The model fitness check makes real model calls: 26 to 53 s measured. */
+export const MODEL_FITNESS_TIMEOUT_MS = 90_000;
+
+/** What a write's client-side abort says. The write may still land, so the
+ *  copy must not call it failed. */
+export const WRITE_TIMEOUT_NOTE =
+  'The grid is slow. The change may still land. Check the row in a minute.';
+const READ_TIMEOUT_NOTE = 'The soc-ai API is slow or down, or Security Onion behind it is.';
+const INVESTIGATION_START_NOTE =
+  'The server is slow. The investigation may still start. Check the investigations list in a minute.';
+const HUNT_START_NOTE = 'The server is slow. The hunt may still start. Check the hunts list in a minute.';
+
+/** The shared abort sentence: how long the console waited, then the note. */
+export function timeoutMessage(timeoutMs: number, note: string = READ_TIMEOUT_NOTE): string {
+  return `The request did not return in ${Math.round(timeoutMs / 1000)} s. ${note}`;
+}
+
+/**
+ * The console stopped waiting. There was no response, so this carries no
+ * status, and it is not proof that the server did nothing: a write may still
+ * land after the abort. Callers that issue writes branch on this class to show
+ * a pending state where they would otherwise show a failure.
+ */
+export class RequestTimeoutError extends Error {
+  readonly timeoutMs: number;
+
+  constructor(timeoutMs: number, note?: string) {
+    super(timeoutMessage(timeoutMs, note));
+    this.name = 'RequestTimeoutError';
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+/** True when the console aborted the request before the server answered. */
+export function isRequestTimeout(error: unknown): error is RequestTimeoutError {
+  return error instanceof RequestTimeoutError;
+}
+
 /**
  * Per-call overrides the fetch helpers forward to `request()`.
  *
@@ -224,6 +278,8 @@ const REQUEST_TIMEOUT_MS = 20_000;
  */
 interface RequestOpts {
   timeoutMs?: number;
+  /** The sentence after "The request did not return in N s." on an abort. */
+  timeoutNote?: string;
   skipLoginRedirect?: boolean;
 }
 
@@ -233,17 +289,18 @@ async function request<T>(path: string, init?: RequestInit & RequestOpts): Promi
   if (init?.headers) Object.assign(headers, init.headers as Record<string, string>);
   if (token) headers.Authorization = `Bearer ${token}`;
 
+  const timeoutMs = init?.timeoutMs ?? REQUEST_TIMEOUT_MS;
   let res: Response;
   try {
     res = await fetch(API_BASE + path, {
       credentials: 'include',
-      signal: AbortSignal.timeout(init?.timeoutMs ?? REQUEST_TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeoutMs),
       ...init,
       headers,
     });
   } catch (e) {
     if (e instanceof DOMException && e.name === 'TimeoutError') {
-      throw new Error('The request timed out. The soc-ai API is slow or down, or Security Onion behind it is.');
+      throw new RequestTimeoutError(timeoutMs, init?.timeoutNote);
     }
     throw new Error('Network error. Check that the soc-ai API is reachable.');
   }
@@ -500,7 +557,10 @@ export function promoteFinding(
   huntId: string,
   ordinal: number,
 ): Promise<{ investigation_id: string; existing?: boolean }> {
-  return post(`/hunts/${encodeURIComponent(huntId)}/findings/${ordinal}/investigate`);
+  return post(`/hunts/${encodeURIComponent(huntId)}/findings/${ordinal}/investigate`, undefined, {
+    timeoutMs: RUN_START_TIMEOUT_MS,
+    timeoutNote: INVESTIGATION_START_NOTE,
+  });
 }
 
 /**
@@ -568,13 +628,17 @@ export function startHuntConsole(
   priorHuntId?: string,
   templateId?: number,
 ): Promise<{ hunt_id: string }> {
-  return post<{ hunt_id: string }>('/hunts/chat', {
-    objective,
-    prior_hunt_id: priorHuntId ?? null,
-    // The starter the objective came from. The server reads it for the
-    // analytics that starter names, and renders them into the objective.
-    template_id: templateId ?? null,
-  });
+  return post<{ hunt_id: string }>(
+    '/hunts/chat',
+    {
+      objective,
+      prior_hunt_id: priorHuntId ?? null,
+      // The starter the objective came from. The server reads it for the
+      // analytics that starter names, and renders them into the objective.
+      template_id: templateId ?? null,
+    },
+    { timeoutMs: RUN_START_TIMEOUT_MS, timeoutNote: HUNT_START_NOTE },
+  );
 }
 
 /** Cancel an in-flight Hunt Console hunt (marks it cancelled). */
@@ -734,7 +798,9 @@ export interface ModelFitness {
  * merely LISTS on the gateway (getGatewayModels) can still be unfit — this runs
  * the real fitness probe and returns the grade for the "Check fitness" chip. */
 export function getModelFitness(force = false): Promise<ModelFitness> {
-  return request<ModelFitness>(`/config/model-fitness${force ? '?force=true' : ''}`);
+  return request<ModelFitness>(`/config/model-fitness${force ? '?force=true' : ''}`, {
+    timeoutMs: MODEL_FITNESS_TIMEOUT_MS,
+  });
 }
 
 // ── Model fitness battery (design spec 2026-08-05) ──────────────────────────
@@ -1303,6 +1369,11 @@ export interface PriorCoverage {
   profiles_built_at?: string | null;
   profiles_stale?: boolean;
   profiles_reason?: string | null;
+  /** The recent read returns at most this many entities. `capped` is true
+   *  when the run's evaluations reached it, so the totals are the cap and not
+   *  the estate. Absent from an older backend. */
+  recent_cap?: number;
+  capped?: boolean;
 }
 
 export interface HuntCatalogSpec {
@@ -1379,6 +1450,10 @@ export interface HuntCatalog {
   sweep_interval_minutes: number;
   sweep_window_minutes: number;
   last_sweep_at: string | null;
+  /** The profile sweep is a second loop with its own setting. It runs the
+   *  `profile` analytics. Absent from an older backend. */
+  prior_sweeps_enabled?: boolean;
+  last_prior_run_at?: string | null;
 }
 
 /** The hunt catalog with each spec's sweep status (analyst-readable). */
@@ -1558,10 +1633,14 @@ export function checkForUpdates(): Promise<UpdateCheckResult> {
  * `deep` forces the full tool-driven loop for this run — the "deep re-run"
  * of a heuristic (zero-tool) verdict. */
 export function startHunt(alertId: string, opts?: { deep?: boolean }): Promise<string> {
-  return post<{ investigation_id: string }>('/hunt', {
-    alert_id: alertId,
-    ...(opts?.deep ? { deep: true } : {}),
-  }).then((r) => r.investigation_id);
+  return post<{ investigation_id: string }>(
+    '/hunt',
+    {
+      alert_id: alertId,
+      ...(opts?.deep ? { deep: true } : {}),
+    },
+    { timeoutMs: RUN_START_TIMEOUT_MS, timeoutNote: INVESTIGATION_START_NOTE },
+  ).then((r) => r.investigation_id);
 }
 
 /** Cancel an in-flight hunt (lands the run as `cancelled`). 404 if not running. */
@@ -1811,7 +1890,9 @@ export function testConnection(target: 'es' | 'llm'): Promise<ConnTestResult> {
  * resolving with a result (see AuditChainVerifyResult's doc) — a caller must
  * not fold that rejection into "tampered". */
 export function verifyAuditChain(): Promise<AuditChainVerifyResult> {
-  return request<AuditChainVerifyResult>('/config/audit/verify-chain');
+  return request<AuditChainVerifyResult>('/config/audit/verify-chain', {
+    timeoutMs: AUDIT_VERIFY_TIMEOUT_MS,
+  });
 }
 
 export interface AutoTriageStatus {
@@ -1941,6 +2022,9 @@ export interface EscalateGroupResult {
    *  case now sitting in the queue for the operator to close or reuse. */
   empty_cases?: string[];
   remaining?: number;
+  /** The cases this press opened, one per distinct case id. `url` is the case
+   *  in Security Onion's console, null when the settings name no host. */
+  cases?: Array<{ id: string; url: string | null }>;
 }
 
 /** One escalate the ledger claimed and never got an answer for. The claim is
@@ -2000,12 +2084,20 @@ export function assignAlert(
   unassign = false,
   state?: TriageState,
 ): Promise<AssignResult> {
-  return post<AssignResult>('/alerts/assign', {
-    rule_name: ruleName,
-    unassign,
-    ...(state ? { state } : {}),
-  });
+  return post<AssignResult>(
+    '/alerts/assign',
+    {
+      rule_name: ruleName,
+      unassign,
+      ...(state ? { state } : {}),
+    },
+    SO_WRITE_OPTS,
+  );
 }
+
+/** Every Security Onion write waits SO_WRITE_TIMEOUT_MS, and its abort says
+ *  the change may still land. */
+const SO_WRITE_OPTS: RequestOpts = { timeoutMs: SO_WRITE_TIMEOUT_MS, timeoutNote: WRITE_TIMEOUT_NOTE };
 
 /**
  * The request body both group-scoped writes send. One builder, so the two can
@@ -2037,12 +2129,12 @@ export function ackGroup(
   group: Pick<AlertGroup, 'name' | 'kind'>,
   query: AlertQuery = {},
 ): Promise<AckGroupResult> {
-  return post<AckGroupResult>('/alerts/ack-group', groupActionBody(group, query));
+  return post<AckGroupResult>('/alerts/ack-group', groupActionBody(group, query), SO_WRITE_OPTS);
 }
 
 /** Acknowledge a specific set of events by ES id (per-event selection). */
 export function ackEvents(esIds: string[]): Promise<AckGroupResult> {
-  return post<AckGroupResult>('/alerts/ack-events', { es_ids: esIds });
+  return post<AckGroupResult>('/alerts/ack-events', { es_ids: esIds }, SO_WRITE_OPTS);
 }
 
 /**
@@ -2054,7 +2146,11 @@ export function escalateGroup(
   group: { name: string; kind: string },
   query: AlertQuery = {},
 ): Promise<EscalateGroupResult> {
-  return post<EscalateGroupResult>('/alerts/escalate-group', groupActionBody(group, query));
+  return post<EscalateGroupResult>(
+    '/alerts/escalate-group',
+    groupActionBody(group, query),
+    SO_WRITE_OPTS,
+  );
 }
 
 // ── Internal-identifier managed list ────────────────────────────────────────────
@@ -2314,7 +2410,7 @@ export function bulkSetDossierOverride(
   ips: string[],
   body: DossierOverrideInput,
 ): Promise<DossierBulkOverrideResult> {
-  return post<DossierBulkOverrideResult>('/dossiers/bulk-override', { ips, ...body });
+  return post<DossierBulkOverrideResult>('/dossiers/bulk-override', { ips, ...body }, SO_WRITE_OPTS);
 }
 
 export function setDossierOverride(ip: string, body: DossierOverrideInput): Promise<Dossier> {
@@ -2379,6 +2475,64 @@ export function getHostActivity(
   return request<HostActivity>(
     `/dossiers/${encodeURIComponent(ip)}/activity?range=${encodeURIComponent(range)}`,
   );
+}
+
+// ── Machines ──────────────────────────────────────────────────────────────────
+// One row per machine: the addresses soc-ai holds to be one device. The
+// per-address dossier routes above stay; these answer for the machine. A
+// machine key (`agent:<id>`, `mac:<mac>`, `ip:<address>`) carries a colon, so
+// every path segment is percent-encoded.
+
+export interface MachineQuery {
+  /** One box over every name, address, MAC, OS, role and agent name. The
+   *  server ignores `activity` while `q` is set. */
+  q?: string;
+  sort?: MachineSortKey;
+  dir?: SortDir;
+  /** A role slug, or `unknown`, `low_confidence`, `stale`. */
+  role?: string;
+  agent?: 'yes' | 'no';
+  activity?: 'active' | 'all';
+  /** `new`: first seen in the last 7 days. */
+  seen?: 'new';
+  declared?: 'yes' | 'no';
+  limit?: number;
+  offset?: number;
+}
+
+/** One page of machines. `total` counts every machine that matches. */
+export function listMachines(query: MachineQuery = {}): Promise<MachineList> {
+  const p = new URLSearchParams();
+  if (query.q) p.set('q', query.q);
+  if (query.sort) p.set('sort', query.sort);
+  if (query.dir) p.set('dir', query.dir);
+  if (query.role) p.set('role', query.role);
+  if (query.agent) p.set('agent', query.agent);
+  if (query.activity) p.set('activity', query.activity);
+  if (query.seen) p.set('seen', query.seen);
+  if (query.declared) p.set('declared', query.declared);
+  if (query.limit != null) p.set('limit', String(query.limit));
+  if (query.offset != null) p.set('offset', String(query.offset));
+  const qs = p.toString();
+  return request<MachineList>('/hosts' + (qs ? `?${qs}` : ''));
+}
+
+/** The counts above the machine list. Each count is a list filter. With no
+ *  activity the server counts every machine: the cards read that. The header
+ *  menus send the activity of the list, so each count matches its rows. */
+export function getMachineSummary(activity?: 'active' | 'all'): Promise<MachineSummary> {
+  return request<MachineSummary>('/hosts/summary' + (activity ? `?activity=${activity}` : ''));
+}
+
+/** An address, a name, a MAC or an agent id to its machine key. A value that
+ *  names no machine is a 404 (`no_host`). */
+export function resolveMachine(value: string): Promise<MachineResolve> {
+  return request<MachineResolve>(`/hosts/resolve?value=${encodeURIComponent(value)}`);
+}
+
+/** One machine: every address, the containers and the primary dossier. */
+export function getMachine(key: string): Promise<MachineDetail> {
+  return request<MachineDetail>(`/hosts/${encodeURIComponent(key)}`);
 }
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
@@ -2658,7 +2812,10 @@ export interface LeadHuntStarted {
 
 /** Start a hunt from the lead. A second call returns the same hunt. */
 export function huntLead(id: number): Promise<LeadHuntStarted> {
-  return post<LeadHuntStarted>(`/hunts/leads/${id}/hunt`, {}).then(leadChanged);
+  return post<LeadHuntStarted>(`/hunts/leads/${id}/hunt`, {}, {
+    timeoutMs: RUN_START_TIMEOUT_MS,
+    timeoutNote: HUNT_START_NOTE,
+  }).then(leadChanged);
 }
 
 /** Reopen a dismissed or promoted lead. The lead returns to `open`. */
@@ -2675,7 +2832,10 @@ export function dismissLead(id: number, reason: string, note?: string): Promise<
 
 /** Start an investigation of the lead's strongest cited evidence. */
 export function promoteLead(id: number): Promise<{ investigation_id: string }> {
-  return post<{ investigation_id: string }>(`/hunts/leads/${id}/promote`, {}).then(leadChanged);
+  return post<{ investigation_id: string }>(`/hunts/leads/${id}/promote`, {}, {
+    timeoutMs: RUN_START_TIMEOUT_MS,
+    timeoutNote: INVESTIGATION_START_NOTE,
+  }).then(leadChanged);
 }
 
 // ── Lead quality (the rule is instrumented, not moved) ───────────────────────
@@ -2748,6 +2908,20 @@ export interface AnalyticDryRun {
   sample_ids: string[];
   window_days: number;
   error: string | null;
+  /** How many distinct entities of the scope field matched. null when the
+   *  dry run did not run. Absent from an older server. */
+  entity_count?: number | null;
+  /** True when the grid held more entities than it returned. */
+  entity_count_is_lower_bound?: boolean;
+  /** The scope type of the analytic: host, user, ip and others. */
+  scope_kind?: string | null;
+}
+
+/** What the generalization check found on a drafted analytic. `pinned` holds
+ *  one sentence per clause that names the entity of the one case. */
+export interface AnalyticGeneralization {
+  pinned: string[];
+  retried: boolean;
 }
 
 /** One drafted analytic, already stored as a candidate. */
@@ -2757,13 +2931,29 @@ export interface AnalyticDraftResult {
   rationale: string;
   dry_run: AnalyticDryRun;
   status: string;
+  /** null when the first draft described a behaviour. Absent from an older server. */
+  generalization?: AnalyticGeneralization | null;
 }
 
-/** Draft a catalog analytic from one threat hunt finding, by ordinal. */
-export function draftAnalytic(huntId: string, ordinal: number): Promise<AnalyticDraftResult> {
-  return post<AnalyticDraftResult>(
+/** Draft a catalog analytic from one threat hunt finding, by ordinal.
+ *
+ *  `preview` drafts and dry-runs it and stores nothing. `specYaml` stores a
+ *  previewed draft with no second model call. Neither stores in one call.
+ *  The model call runs past the 20 s default, and the console aborted while
+ *  the server committed, so a retry wrote a second candidate. 90 s covers
+ *  the model and the two grid reads. */
+export function draftAnalytic(
+  huntId: string,
+  ordinal: number,
+  opts: { preview?: boolean; specYaml?: string; retried?: boolean } = {},
+): Promise<AnalyticDraftResult & { notes?: string[] }> {
+  const body: Record<string, unknown> = { preview: opts.preview ?? false };
+  if (opts.specYaml !== undefined) body.spec_yaml = opts.specYaml;
+  if (opts.retried !== undefined) body.retried = opts.retried;
+  return post<AnalyticDraftResult & { notes?: string[] }>(
     `/hunts/${encodeURIComponent(huntId)}/findings/${ordinal}/draft-analytic`,
-    {},
+    body,
+    { timeoutMs: 90_000 },
   );
 }
 
@@ -2899,6 +3089,9 @@ export interface AnalyticRow {
   dismissed_7d: number;
   shadow_hits_7d: number;
   unread_shadow_hits: number;
+  /** The generalization check's sentences on a drafted analytic that names
+   *  the entity of its one case. Empty or absent for every other analytic. */
+  pinned?: string[];
 }
 
 export interface AnalyticsList {
@@ -2935,6 +3128,8 @@ export interface AnalyticLedger {
   docs_scanned: number;
   runtime_ms: number;
   sweeps: number;
+  /** Prior sweep runs over the window. The cost of a `profile` analytic. */
+  profile_runs?: number;
   coverage: Record<string, number>;
 }
 
@@ -2954,6 +3149,11 @@ export interface AnalyticDetail extends AnalyticRow {
   ledger: AnalyticLedger;
   versions: AnalyticVersion[];
   recent: AnalyticRecentEntity[];
+  /** When the loop that runs this analytic last ran it. null: never. Absent
+   *  from an older backend. */
+  last_run_at?: string | null;
+  /** The setting of the loop that runs this analytic. */
+  runner_enabled?: boolean;
 }
 
 /** One observation on one entity, from any source. `weight_now` decays with a
@@ -2982,6 +3182,9 @@ export interface EntityObservations {
   entity: string;
   days: number;
   observations: EntityObservation[];
+  /** The other keys the server joined: the host's strong hostnames, or the
+   *  address a name belongs to. Absent from an older server. */
+  aliases?: string[];
 }
 
 /** Shadow hits, unread first and then newest first. */

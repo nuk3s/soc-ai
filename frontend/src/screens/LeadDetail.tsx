@@ -28,6 +28,7 @@ import {
 } from '../lib/api';
 import { entityPath } from '../lib/entityPath';
 import { kindLabel } from '../lib/kinds';
+import { holdSentence, type LeadDecisionFields } from '../lib/leadDecisions';
 import { plural } from '../lib/plural';
 import { HUNT_STATUS } from '../lib/statusMeta';
 import { ago } from '../lib/timeRange';
@@ -118,7 +119,7 @@ export function LeadDetail() {
   // /leads/NaN, and the 422 rendered an error card whose Retry could never
   // succeed. A 404 here takes the not-found branch below without a request.
   const validId = Number.isInteger(leadId) && leadId > 0;
-  const lead = useAsync<LeadDetailT>(
+  const lead = useAsync<LeadDetailT & LeadDecisionFields>(
     () => (validId ? getLead(leadId) : Promise.reject(new ApiError(`Lead ${id} not found`, 404))),
     [leadId],
   );
@@ -453,8 +454,21 @@ export function LeadDetail() {
             </span>
           ))}{' '}
         · {plural(d.kinds.length, 'type')} ·{' '}
-        {plural(d.entities.length, 'entity', 'entities')} named · {d.scope_count} with observations
+        {plural(d.entities.length, 'entity', 'entities')} named
       </div>
+      {/* RH1: a hunt that answered clean and did not close the lead. The
+          range closed a lead as clean after a re-hunt that could not read the
+          alert documents, over two earlier hunts that found a threat. The
+          lead now waits, and this line says why. */}
+      {hunted && holdSentence(d) && (
+        <div
+          data-testid="lead-hold-reason"
+          className="mt-2 rounded-panel border px-3 py-2 text-[12.5px] text-warn"
+          style={{ borderColor: 'rgba(210,153,34,.35)', background: 'rgba(210,153,34,.06)' }}
+        >
+          {`The hunt did not close this lead. ${holdSentence(d)} Decide on the lead.`}
+        </div>
+      )}
       {/* A second hunt on one lead is a real thing to want and a common
           mis-click. The confirm names the hunt that already exists. */}
       {confirmAgain && (

@@ -791,6 +791,59 @@ async def test_dhcp_lease_is_collected() -> None:
     assert lease["timestamp"] == datetime(2026, 8, 6, 17, 0, tzinfo=UTC)
 
 
+# A Security Onion 3.x zeek.dhcp document, shaped like the production census of
+# 2026-10-02. It carries no source.ip, destination.ip, dhcp.hostname or
+# dhcp.client.mac. The lease lives in client.address, dhcp.assigned_ip,
+# host.hostname and host.mac.
+_SO3_DHCP_DOC: dict[str, Any] = {
+    "@timestamp": "2026-08-06T17:00:00.000Z",
+    "event": {"dataset": "zeek.dhcp", "module": "zeek"},
+    "client": {"address": _IP},
+    "dhcp": {"assigned_ip": _IP, "lease_time": 86400.0, "message_types": ["ACK", "REQUEST"]},
+    "host": {"hostname": "sensor-view", "mac": "02:00:5e:10:00:27"},
+    "server": {"address": "192.168.10.1"},
+}
+
+
+async def test_an_so3_dhcp_lease_is_read_and_attributed() -> None:
+    es = _FakeES(
+        main_aggs=_MAIN_AGGS, main_total=3412, targeted_hits={"zeek.dhcp": [_SO3_DHCP_DOC]}
+    )
+
+    obs = await _collect(es)
+
+    assert len(obs.dhcp) == 1
+    lease = obs.dhcp[0]
+    assert lease["hostname"] == "sensor-view"
+    assert lease["mac"] == "02:00:5e:10:00:27"
+    assert lease["assigned_ip"] == _IP
+    assert lease["client_ip"] == _IP
+    # The query reaches the SO 3.x lease fields. A query on source.ip and
+    # destination.ip alone matches no SO 3.x lease at all.
+    query = _one(es, "zeek.dhcp")["query"]
+    terms = [
+        term
+        for clause in query["bool"]["must"]
+        for should in (clause.get("bool") or {}).get("should", [])
+        if (term := should.get("term"))
+    ]
+    assert {"client.address": _IP} in terms
+    assert {"dhcp.assigned_ip": _IP} in terms
+    assert {"source.ip": _IP} in terms
+
+
+async def test_an_older_dhcp_lease_shape_is_still_read() -> None:
+    # NEGATIVE CONTROL: the older shape (source.ip, dhcp.hostname,
+    # dhcp.client.mac) must keep working beside the SO 3.x one.
+    es = _FakeES(main_aggs=_MAIN_AGGS, main_total=3412, targeted_hits=_TARGETED_HITS)
+
+    obs = await _collect(es)
+
+    lease = obs.dhcp[0]
+    assert (lease["hostname"], lease["mac"]) == ("pve01", "AA:BB:CC:11:22:33")
+    assert "assigned_ip" not in lease
+
+
 async def test_ssh_banner_keeps_its_direction_and_endpoints() -> None:
     # A client banner identifies the ORIGINATOR and a server banner the
     # RESPONDER; without the endpoints the banner's OS lands on the wrong host.
@@ -1236,6 +1289,68 @@ async def test_the_agent_inventory_is_one_aggregation_for_the_whole_network() ->
     datasets = [c for c in call["query"]["bool"]["filter"] if "terms" in c]
     assert datasets[0]["terms"]["event.dataset"] == list(_HOSTLOG_DATASETS)
     assert call["query"]["bool"]["must_not"] == synth_scope_must_not(False)
+
+
+async def test_the_agent_address_agg_holds_a_container_host_and_keeps_ipv4_first() -> None:
+    """One production agent reported 111 addresses, 102 of them link-local.
+
+    The cap of 40 dropped real addresses from one sweep to the next, so the
+    claims churned. The cap is 256 and the values come in key order: every IPv4
+    address sorts before every IPv6 one, so link-local IPv6 values are the ones
+    the cap drops first.
+    """
+    es = _network_es()
+
+    await _agent_inventory(es)
+
+    ips = _calls(es, "agent")[0]["aggs"]["hosts"]["aggs"]["ips"]
+    assert ips["terms"]["size"] == 256
+    assert ips["terms"]["order"] == {"_key": "asc"}
+    # Each address carries its own document count and lifetime, so an address
+    # that only an agent reports has an activity of its own.
+    assert set(ips["aggs"]) == {"first_seen", "last_seen"}
+
+
+async def test_a_container_host_with_many_link_local_addresses_keeps_every_real_one() -> None:
+    real = [f"10.20.{i}.1" for i in range(9)]
+    link_local = [f"fe80::{i:x}" for i in range(1, 103)]
+    es = _network_es(agent_buckets=[_agent_bucket("registry-b", real + link_local)])
+
+    inventory_ = await _agent_inventory(es)
+
+    assert set(inventory_.unique_claims()) == set(real)
+    assert inventory_.notes == ()
+
+
+async def test_a_truncated_agent_address_list_is_reported() -> None:
+    """The cap is a note an operator can read, never a silent short list."""
+    bucket = _agent_bucket("registry-b", ["10.20.0.1"])
+    bucket["ips"]["sum_other_doc_count"] = 412
+    es = _network_es(agent_buckets=[bucket])
+
+    inventory_ = await _agent_inventory(es)
+
+    assert len(inventory_.notes) == 1
+    assert "registry-b" in inventory_.notes[0]
+    assert "256" in inventory_.notes[0]
+    assert inventory_.errors == ()
+
+
+async def test_each_claimed_address_carries_the_agents_own_document_count() -> None:
+    bucket = _agent_bucket("quiet-vm", [_QUIET_IP])
+    bucket["ips"]["buckets"][0].update(
+        doc_count=712,
+        first_seen={"value": float(_ms(_AGENT_FIRST)), "value_as_string": _AGENT_FIRST.isoformat()},
+        last_seen={"value": float(_ms(_AGENT_LAST)), "value_as_string": _AGENT_LAST.isoformat()},
+    )
+    es = _network_es(agent_buckets=[bucket])
+
+    inventory_ = await _agent_inventory(es)
+    report, _ = inventory_.for_ip(_QUIET_IP)
+
+    assert report is not None
+    held = report.addresses[_QUIET_IP]
+    assert (held.docs, held.first_seen, held.last_seen) == (712, _AGENT_FIRST, _AGENT_LAST)
 
 
 async def test_a_uniquely_claimed_address_carries_the_agents_self_report() -> None:
@@ -2056,3 +2171,217 @@ def test_no_flow_aggregation_pins_itself_to_one_dataset() -> None:
         assert '{"term": {"event.dataset": "zeek.conn"}}' not in text, (
             f"{path.name} pins a flow aggregation to zeek.conn again"
         )
+
+
+# ---------------------------------------------------------------------------
+# Served-port transport (H2). ICMP type numbers read as TCP services, and
+# udp/53 read as tcp/53.
+# ---------------------------------------------------------------------------
+
+
+async def test_the_responder_pass_excludes_icmp_and_asks_for_the_transport() -> None:
+    """Zeek writes the ICMP type and code into the port fields. The responder
+    filter drops ICMP on both transport field names, and each port carries a
+    transport sub-aggregation."""
+    es = _FakeES(main_aggs=_MAIN_AGGS, main_total=3412)
+    await _collect(es)
+    responder = _one(es, "main")["aggs"]["responder"]
+    must_not = responder["filter"]["bool"]["must_not"]
+    for name in ("network.transport", "zeek.conn.proto"):
+        assert {"terms": {name: ["icmp", "icmp6", "ipv6-icmp"]}} in must_not
+    assert "transport" in responder["aggs"]["ports"]["aggs"]
+
+
+async def test_a_udp_port_keeps_its_transport_and_port_zero_is_dropped() -> None:
+    aggs = {
+        **_MAIN_AGGS,
+        "responder": {
+            **_MAIN_AGGS["responder"],
+            "ports": {
+                "buckets": [
+                    {
+                        "key": 53,
+                        "doc_count": 400,
+                        "transport": {
+                            "buckets": [
+                                {"key": "udp", "doc_count": 380},
+                                {"key": "tcp", "doc_count": 20},
+                            ]
+                        },
+                    },
+                    {"key": 0, "doc_count": 90},
+                    {"key": 22, "doc_count": 41},
+                ]
+            },
+        },
+    }
+    obs = await _collect(_FakeES(main_aggs=aggs, main_total=3412))
+    assert obs.resp_ports == [
+        {"value": 53, "count": 400, "transport": "udp"},
+        {"value": 22, "count": 41},
+    ]
+
+
+# ---------------------------------------------------------------------------
+# The network DHCP lease pass: the machine clustering's third rule.
+# ---------------------------------------------------------------------------
+
+
+class _LeaseES:
+    """Answers the dataset inventory and the lease pass. Fails the first N passes."""
+
+    def __init__(self, aggregations: dict[str, Any], *, failures: int = 0) -> None:
+        self.aggregations = aggregations
+        self.failures = failures
+        self.passes: list[dict[str, Any]] = []
+
+    async def search(self, index: str, query: dict[str, Any], **kwargs: Any) -> EsSearchResult:
+        aggs = kwargs.get("aggs") or {}
+        if "datasets" in aggs:
+            return _result(
+                total=10,
+                aggregations={
+                    "datasets": {
+                        "buckets": [
+                            {
+                                "key": "zeek.dhcp",
+                                "doc_count": 10,
+                                "categories": {"buckets": []},
+                                "live": {"doc_count": 10, "last_seen": {"value": None}},
+                            }
+                        ]
+                    },
+                    "live_events": {"doc_count": 10},
+                },
+            )
+        self.passes.append(aggs)
+        if self.failures:
+            self.failures -= 1
+            raise RuntimeError("illegal_argument_exception: text field")
+        return _result(total=10, aggregations=self.aggregations)
+
+
+def _span(at: datetime) -> dict[str, Any]:
+    return {"value": float(_ms(at)), "value_as_string": at.isoformat()}
+
+
+async def test_the_lease_pass_reads_both_shapes_and_keeps_internal_addresses() -> None:
+    import ipaddress
+
+    from soc_ai.dossier.observe import collect_dhcp_leases
+
+    later = _LAST_SEEN
+    aggregations = {
+        # host.mac, the SO 3.x spelling.
+        "leases2": {
+            "buckets": [
+                {
+                    "key": "02:00:5e:10:00:27",
+                    "ip0": {
+                        "buckets": [
+                            {
+                                "key": "192.168.10.135",
+                                "first_seen": _span(_FIRST_SEEN),
+                                "last_seen": _span(later),
+                            }
+                        ]
+                    },
+                    "ip1": {
+                        "buckets": [
+                            {
+                                "key": "203.0.113.4",
+                                "first_seen": _span(_FIRST_SEEN),
+                                "last_seen": _span(later),
+                            }
+                        ]
+                    },
+                    "name3": {"buckets": [{"key": "sensor-view", "last_seen": _span(later)}]},
+                }
+            ]
+        },
+        # dhcp.client.mac, the older spelling.
+        "leases0": {
+            "buckets": [
+                {
+                    "key": "aa:bb:cc:dd:ee:01",
+                    "ip2": {
+                        "buckets": [
+                            {
+                                "key": "192.168.10.77",
+                                "first_seen": _span(_FIRST_SEEN),
+                                "last_seen": _span(later),
+                            }
+                        ]
+                    },
+                    "name0": {"buckets": [{"key": "pve01", "last_seen": _span(later)}]},
+                }
+            ]
+        },
+    }
+    es = _LeaseES(aggregations)
+
+    inventory_ = await collect_dhcp_leases(
+        elastic=es,  # type: ignore[arg-type]
+        settings=_settings(),
+        window_hours=336,
+        cidrs=[ipaddress.ip_network("192.168.0.0/16")],
+    )
+
+    leases = {(lease.ip, lease.mac): lease for lease in inventory_.leases}
+    assert set(leases) == {
+        ("192.168.10.135", "02:00:5e:10:00:27"),
+        ("192.168.10.77", "aa:bb:cc:dd:ee:01"),
+    }
+    assert leases[("192.168.10.135", "02:00:5e:10:00:27")].hostname == "sensor-view"
+    assert leases[("192.168.10.77", "aa:bb:cc:dd:ee:01")].last_seen == later
+    # One aggregation, every spelling of each part asked for.
+    assert len(es.passes) == 1
+    fields_asked = {agg["terms"]["field"] for agg in es.passes[0].values()}
+    assert {"host.mac", "dhcp.client.mac"} <= fields_asked
+    inner = next(iter(es.passes[0].values()))["aggs"]
+    assert {a["terms"]["field"] for a in inner.values()} >= {
+        "dhcp.assigned_ip",
+        "client.address",
+        "source.ip",
+        "host.hostname",
+        "dhcp.hostname",
+    }
+
+
+async def test_a_failed_full_lease_pass_retries_with_the_so3_fields() -> None:
+    import ipaddress
+
+    from soc_ai.dossier.observe import collect_dhcp_leases
+
+    es = _LeaseES({}, failures=1)
+
+    inventory_ = await collect_dhcp_leases(
+        elastic=es,  # type: ignore[arg-type]
+        settings=_settings(),
+        window_hours=336,
+        cidrs=[ipaddress.ip_network("192.168.0.0/16")],
+    )
+
+    assert inventory_.errors == ()
+    assert len(es.passes) == 2
+    assert {agg["terms"]["field"] for agg in es.passes[1].values()} == {"host.mac"}
+
+
+async def test_a_lease_pass_that_fails_twice_reports_the_failure() -> None:
+    """NEGATIVE CONTROL: an empty inventory from a failure must say so."""
+    import ipaddress
+
+    from soc_ai.dossier.observe import collect_dhcp_leases
+
+    es = _LeaseES({}, failures=2)
+
+    inventory_ = await collect_dhcp_leases(
+        elastic=es,  # type: ignore[arg-type]
+        settings=_settings(),
+        window_hours=336,
+        cidrs=[ipaddress.ip_network("192.168.0.0/16")],
+    )
+
+    assert inventory_.leases == ()
+    assert len(inventory_.errors) == 1
+    assert "DHCP lease pass failed" in inventory_.errors[0]

@@ -523,10 +523,8 @@ export function Runbooks() {
         <div className="text-[20px] font-semibold tracking-[-.015em]">Runbooks</div>
       </div>
       <div className="mb-4 mt-0.5 max-w-[880px] flex-none text-[13px] leading-[1.55] text-dim">
-        A runbook holds your team's own triage guidance. The investigation agent searches the
-        runbooks with the{' '}
-        <code className="text-[12px] text-text">lookup_runbook</code> tool and cites the best
-        match. The verdict then cites <strong>your</strong> procedure. A runbook that names a
+        A runbook holds your team's own triage guidance. During an investigation, the model
+        searches the runbooks and cites the best match. The verdict then cites <strong>your</strong> procedure. A runbook that names a
         detection rule under <em>Linked rules</em> ranks first if that rule fires. Every runbook
         stays local. soc-ai never writes a runbook to Security Onion.
       </div>

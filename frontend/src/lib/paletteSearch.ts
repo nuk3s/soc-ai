@@ -1,4 +1,17 @@
-import type { AlertGroup, InvestigationRow } from './types';
+import { machineRoleView } from './hostDossier';
+import { VERDICT } from './tokens';
+import type { AlertGroup, InvestigationRow, MachineRow } from './types';
+
+/**
+ * One machine hit in the palette: "<name> · <primary address> · <role>".
+ * A machine with no name leads with its address. An unknown role says
+ * nothing, because "unknown" on every row is noise.
+ */
+export function machineHitLabel(row: MachineRow): string {
+  const role = machineRoleView(row.role);
+  const parts = [row.name?.trim() || null, row.primary_ip, role.state === 'unknown' ? null : role.text];
+  return parts.filter((p): p is string => !!p).join(' · ');
+}
 
 /** One entity result for the ⌘K palette: an investigation or an alert group
  * matched by rule-name fragment or IP. */
@@ -38,7 +51,8 @@ export function searchEntities(
       // The palette renders a plain-text label, so the synth-eval marker rides
       // it as the badge's exact wording — a planted run surfaced by ⌘K must
       // never read as real activity.
-      label: `${r.name} — ${r.verdict}${conf} · ${r.when}${r.isSynthEval ? ' · Synthetic evaluation data' : ''}`,
+      // The verdict is the label the badge shows, never the raw enum.
+      label: `${r.name} · ${VERDICT[r.verdict]?.label ?? r.verdict}${conf} · ${r.when}${r.isSynthEval ? ' · Synthetic evaluation data' : ''}`,
       to: `/investigation/${r.id}`,
     });
   }
@@ -48,7 +62,7 @@ export function searchEntities(
     if (!hay.includes(query)) continue;
     hits.push({
       group: 'Alerts',
-      label: `${g.name} — ×${g.count} · ${g.sev}`,
+      label: `${g.name} · ×${g.count} · ${g.sev}`,
       to: '/alerts',
     });
   }

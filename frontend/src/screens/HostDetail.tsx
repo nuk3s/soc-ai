@@ -1,8 +1,9 @@
 import { AlertTriangle, ChevronLeft, RotateCw, Server } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
-import { Link, useParams, useSearchParams } from 'react-router-dom';
+import { Link, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { DOCK_SAFE_AREA_CLASS } from '../components/ChatDock';
 import { HostActivityRow } from '../components/HostActivityRow';
+import { HostAddresses } from '../components/HostAddresses';
 import { HostBriefing } from '../components/HostBriefing';
 import { HostChatDock } from '../components/HostChatDock';
 import { HostFacts, HostUnknowns } from '../components/HostFacts';
@@ -22,27 +23,41 @@ import {
   getDossierRefreshStatus,
   getDossierSummary,
   getHostActivity,
+  getMachine,
   getMe,
   isNotFound,
+  resolveMachine,
   startDossierRefresh,
 } from '../lib/api';
 import { cn } from '../lib/cn';
 import { activityState } from '../lib/hostActivity';
-import { isResolved, portsView, roleVocabulary } from '../lib/hostDossier';
+import { isMachineKey, isResolved, portsView, roleVocabulary } from '../lib/hostDossier';
+import { listUrlToReturnTo, machineHref, type HostsLocationState } from '../lib/hostsList';
+import { isIpKey } from '../lib/ip';
 import { plural } from '../lib/plural';
 import { SHOWN_ERRORS, sweepErrorList } from '../lib/sweepErrors';
 import { absTime } from '../lib/timeRange';
-import type { Dossier, DossierRefreshStatus, HostActivityRange } from '../lib/types';
+import type { Dossier, DossierRefreshStatus, HostActivityRange, MachineDetail } from '../lib/types';
 import { useAsync } from '../lib/useAsync';
 import { BehaviouralProfile } from '../components/BehaviouralProfile';
 import { HostObservations } from '../components/HostObservations';
 import { LeadsStrip } from '../components/LeadsStrip';
 
-// request() collapses an HTTPException detail to its `hint`, so this IS the
-// 404's own wording from routes_dossier._require_ip. Matching it lets the screen
-// say "that is not an address" instead of "could not load", which is a different
-// and much less useful thing to tell someone who mistyped a URL.
-const NOT_AN_IP = /keyed on IP addresses/i;
+/** What the route segment resolved to. Each carries the segment it answers
+ *  for, because useAsync keeps the last answer while the next one loads. */
+type Resolution =
+  | { param: string; kind: 'skip' }
+  | { param: string; kind: 'machine'; key: string }
+  | { param: string; kind: 'none' };
+
+/** The page's main read: a machine, or one address dossier. */
+interface HostRead {
+  param: string;
+  machine: MachineDetail | null;
+  dossier: Dossier | null;
+  /** A machine key from before a merge, and the key that holds it now. */
+  moved?: string;
+}
 
 // ---------------------------------------------------------------------------
 // Sweep health for a NON-admin: GET /api/v1/dossiers/sweep-health.
@@ -147,6 +162,16 @@ function profileServedPorts(dossier: Dossier): string[] | null {
   return d.top.map(([port]) => port);
 }
 
+/** The start of the newest volume bar that holds an event, or null. The
+ *  activity read is live; the dossier's last_seen is as old as the last sweep. */
+export function newestActivity(volume: { ts: string; events: number }[] | undefined): string | null {
+  let best: string | null = null;
+  for (const point of volume ?? []) {
+    if (point.events > 0 && (best == null || point.ts > best)) best = point.ts;
+  }
+  return best;
+}
+
 /**
  * One host: what it IS (swept, cached, survives a grid outage) and what it is
  * DOING (read live off Security Onion, degrades on its own).
@@ -164,13 +189,105 @@ function profileServedPorts(dossier: Dossier): string[] | null {
  * the page rather than patching a field.
  */
 export function HostDetail() {
-  const { ip = '' } = useParams();
+  const { key: rawParam = '' } = useParams();
+  const param = rawParam.trim();
+  const navigate = useNavigate();
+  const location = useLocation();
   const [searchParams] = useSearchParams();
   // Deep-link target: the conflicts queue and the reconsider notifications
   // point at one field; landing with no sign of which was meant is the same as
   // not linking at all.
   const focusField = searchParams.get('field');
-  const { data, loading, error, refetch, lastUpdated } = useAsync(() => getDossier(ip), [ip]);
+  // The address a link named. Old links, /entity redirects and bookmarks name
+  // an address; the page resolves it to the machine and keeps it in focus.
+  const focusAddress = searchParams.get('address');
+  const keyed = isMachineKey(param);
+  const paramIsIp = isIpKey(param);
+  // The record page of one address. The machine page links here, so a
+  // declaration on an address that is not the primary has a page to live on.
+  const addressOnly = !keyed && paramIsIp && searchParams.get('view') === 'address';
+
+  // An address or a name resolves to a machine key first.
+  const resolution = useAsync<Resolution>(
+    () =>
+      keyed || !param
+        ? Promise.resolve({ param, kind: 'skip' as const })
+        : resolveMachine(param).then(
+            (r) => ({ param, kind: 'machine' as const, key: r.key }),
+            (err: unknown) => {
+              if (isNotFound(err)) return { param, kind: 'none' as const };
+              throw err;
+            },
+          ),
+    [param, keyed],
+  );
+  const resolved = resolution.data && resolution.data.param === param ? resolution.data : null;
+  // The resolve read failed for a reason other than "no machine". A FOREGROUND
+  // failure for this segment.
+  const resolveFailed = !keyed && !resolved && !!resolution.error && !resolution.loading;
+
+  // Replace the URL with the machine key. `replace` keeps the address URL out
+  // of history, and the router state rides along so the breadcrumb still
+  // knows the list is the entry behind this one.
+  const redirectTo = !addressOnly && resolved?.kind === 'machine' ? resolved.key : null;
+  useEffect(() => {
+    if (!redirectTo) return;
+    const next = new URLSearchParams(searchParams);
+    if (paramIsIp && !next.has('address')) next.set('address', param);
+    const qs = next.toString();
+    navigate(`${machineHref(redirectTo)}${qs ? `?${qs}` : ''}`, {
+      replace: true,
+      state: location.state,
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [redirectTo, param]);
+
+  // An address that no machine holds, or whose machine could not be read,
+  // keeps the page of the address alone. A 404 from the resolve read lands
+  // here, and the address dossier then says "never seen" when the sweep has
+  // no record.
+  const addressMode =
+    !keyed && paramIsIp && (addressOnly || resolved?.kind === 'none' || resolveFailed);
+  const mode: 'machine' | 'address' | null = keyed ? 'machine' : addressMode ? 'address' : null;
+  // A name that no machine answers to.
+  const unknownName = !keyed && !paramIsIp && resolved?.kind === 'none';
+  const nameResolveFailed = !keyed && !paramIsIp && resolveFailed;
+
+  const read = useAsync<HostRead | null>(() => {
+    if (mode === 'machine') {
+      return getMachine(param).then(
+        (m) => ({ param, machine: m, dossier: m.dossier }),
+        async (err: unknown) => {
+          if (!isNotFound(err)) throw err;
+          // A key from before a merge: the value it carries may resolve to the
+          // machine that absorbed it.
+          const tail = param.slice(param.indexOf(':') + 1);
+          const r = await resolveMachine(tail).catch(() => null);
+          if (r && r.key !== param) return { param, machine: null, dossier: null, moved: r.key };
+          throw err;
+        },
+      );
+    }
+    if (mode === 'address') {
+      return getDossier(param).then((d) => ({ param, machine: null, dossier: d }));
+    }
+    return Promise.resolve(null);
+  }, [param, mode]);
+  const current = read.data && read.data.param === param ? read.data : null;
+  const { loading, error, refetch, lastUpdated } = read;
+  const data = current?.dossier ?? null;
+  const machine = current?.machine ?? null;
+  const moved = current?.moved ?? null;
+  useEffect(() => {
+    if (!moved) return;
+    navigate(`${machineHref(moved)}${location.search}`, { replace: true, state: location.state });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [moved]);
+
+  // The address every per-address read below uses: the machine's primary
+  // address, or the address of an address page. The server expands the
+  // observations read to every address of the machine.
+  const ip = data?.ip ?? machine?.primary_ip ?? (mode === 'address' ? param : '');
 
   // The classifier's role vocabulary, from the network summary (best-effort,
   // unpolled). It feeds the declare editor's role datalist so this form offers
@@ -189,7 +306,10 @@ export function HostDetail() {
   // labelled with the window its data actually describes — not the one just
   // clicked while the request is still in flight.
   const activity = useAsync(
-    () => getHostActivity(ip, range).then((payload) => ({ payload, range })),
+    () =>
+      ip
+        ? getHostActivity(ip, range).then((payload) => ({ payload, range }))
+        : Promise.resolve(null),
     [ip, range],
   );
   const shown = activity.data?.payload ?? null;
@@ -207,9 +327,15 @@ export function HostDetail() {
   // about what this machine is called. The address is the honest fallback.
   const hostnameField = dossier?.fields.find((f) => f.field === 'hostname');
   const hostname =
-    hostnameField && isResolved(hostnameField)
+    (machine?.name ?? '').trim() ||
+    (hostnameField && isResolved(hostnameField)
       ? (hostnameField.value ?? '').trim() || null
-      : null;
+      : null);
+  // A field named in the URL describes the primary address unless the link
+  // also named another address. That address opens in the Addresses section
+  // with the field marked there.
+  const primaryFocusField =
+    !machine || !focusAddress || focusAddress === machine.primary_ip ? focusField : null;
 
   // The SPA's only role source is /me (Sidebar does the same). A failure
   // leaves the role UNKNOWN rather than "analyst": hiding the controls on a
@@ -372,36 +498,62 @@ export function HostDetail() {
     }
   };
 
-  const notAnIp = !!error && NOT_AN_IP.test(error.message);
-  // Three ways to have no activity row: a segment that is not an address, an
+  // The segment is still resolving, or the page is on its way to the machine
+  // key. Either way there is nothing of this page's own to show yet.
+  const settling =
+    !!redirectTo ||
+    !!moved ||
+    (mode === null && !unknownName && !nameResolveFailed && (resolution.loading || !resolved));
+  // Three ways to have no activity row: a name no machine answers to, an
   // address the sweep has never seen, and a read that failed. Keying on the
   // row's own precondition covers all three without flickering the toolbar in
   // during the initial load.
-  const showActivityControls = loading ? !dossier || dossier.found : !!dossier && dossier.found;
+  const showActivityControls =
+    !unknownName &&
+    !nameResolveFailed &&
+    (settling || loading ? !dossier || dossier.found : !!dossier && dossier.found);
 
-  // Scroll the deep-linked field into view once it exists — ONCE per link, not
-  // per render: every write replaces the dossier, and re-scrolling under an
+  // Scroll the deep-linked field into view once it exists, ONCE per link and
+  // not per render: every write replaces the dossier, and re-scrolling under an
   // operator mid-edit would fight them. Guarded: jsdom has no scrollIntoView.
   const scrolledFor = useRef<string | null>(null);
   useEffect(() => {
-    if (!focusField || !dossier) return;
-    const key = `${ip}:${focusField}`;
+    if (!primaryFocusField || !dossier) return;
+    const key = `${ip}:${primaryFocusField}`;
     if (scrolledFor.current === key) return;
     scrolledFor.current = key;
-    const el = document.getElementById(`field-${focusField}`);
+    const el = document.getElementById(`field-${primaryFocusField}`);
     (el as HTMLElement | null)?.scrollIntoView?.({ behavior: 'auto', block: 'center' });
-  }, [focusField, dossier, ip]);
+  }, [primaryFocusField, dossier, ip]);
+
+  // The way back to the list. When the list opened this page, the entry
+  // behind this one IS the list, with its scroll position: go back to it.
+  // Otherwise open the list URL the screen last held.
+  const fromList = (location.state as HostsLocationState | null)?.fromList ?? null;
+  const backTo = fromList ?? listUrlToReturnTo();
+  const crumb = machine ? (machine.name ?? machine.primary_ip) : param;
 
   return (
     // The dock at the bottom right is fixed to the viewport. Without the
     // reservation it draws over the last Edit control on the facts panel.
     <div className={cn('px-[22px] pt-[18px] font-sans text-text', DOCK_SAFE_AREA_CLASS)}>
       <div className="mb-3.5 flex flex-wrap items-center gap-3">
-        <Link to="/hosts" className="flex items-center gap-1.5 text-[12.5px] text-dim hover:text-text">
+        <Link
+          to={backTo}
+          data-testid="hosts-crumb"
+          onClick={(e) => {
+            if (!fromList) return;
+            e.preventDefault();
+            navigate(-1);
+          }}
+          className="flex items-center gap-1.5 text-[12.5px] text-dim hover:text-text"
+        >
           <ChevronLeft size={13} /> Hosts
         </Link>
         <span className="text-ghost">/</span>
-        <div className="font-mono text-[15px] font-semibold">{ip}</div>
+        <div data-testid="host-crumb-name" className="font-mono text-[15px] font-semibold">
+          {crumb}
+        </div>
         <div className="flex-1" />
         {showActivityControls && (
           <>
@@ -445,25 +597,56 @@ export function HostDetail() {
       </div>
 
       <div className="mx-auto max-w-workstation">
-        {loading && !dossier ? (
-          <LoadingState label="Loading host…" />
-        ) : notAnIp ? (
+        {/* The machine read failed, so this page cannot say which machine
+            holds the address. It says so above the page of the address,
+            the "never seen" page included. */}
+        {mode === 'address' && resolveFailed && (
+          <div
+            data-testid="host-resolve-failed"
+            role="status"
+            className="mb-3 flex flex-wrap items-start gap-x-3 gap-y-2 rounded-card border border-warn/30 bg-warn/[0.06] px-3.5 py-2.5 text-[12.5px] leading-[1.5] text-text-2"
+          >
+            <div className="min-w-0 flex-1">
+              This page could not find the machine that holds this address. The page shows the
+              address alone.
+              <span className="mt-0.5 block text-[11.5px] text-dim">{resolution.error?.message}</span>
+            </div>
+            <button
+              type="button"
+              onClick={resolution.refetch}
+              className="flex flex-none items-center gap-1.5 rounded-control border border-warn/40 px-2.5 py-1 text-[11.5px] font-semibold text-warn hover:bg-warn/15"
+            >
+              <RotateCw size={11} /> Retry
+            </button>
+          </div>
+        )}
+        {unknownName ? (
           <Panel>
-            <PanelHeader icon={<Server size={15} />} title="Not a host address" />
+            <PanelHeader icon={<Server size={15} />} title="No machine has this name" />
             <EmptyState>
-              <span className="font-mono text-dim">{ip}</span> is not an IP address. A host is
-              keyed on an IP address. Pick a host from the{' '}
-              <Link to="/hosts" className="text-accent hover:underline">
-                Hosts screen
-              </Link>
-              .
+              <div data-testid="host-unknown-name">
+                No machine answers to <span className="font-mono text-dim">{param}</span>. The
+                search reads every name, address, MAC and agent of every machine. Search the{' '}
+                <Link to={`/hosts?q=${encodeURIComponent(param)}`} className="text-accent hover:underline">
+                  Hosts list
+                </Link>
+                , or open the{' '}
+                <Link to={`/entity/${encodeURIComponent(param)}`} className="text-accent hover:underline">
+                  entity page
+                </Link>{' '}
+                for the investigations and findings that name it.
+              </div>
             </EmptyState>
           </Panel>
+        ) : nameResolveFailed ? (
+          <ErrorState error={resolution.error!} onRetry={resolution.refetch} label="this host" />
+        ) : settling || (loading && !dossier) ? (
+          <LoadingState label="Loading host…" />
         ) : error && !dossier && isNotFound(error) ? (
-          // The route itself 404'd — a different answer again from "the sweep
+          // The route itself 404'd. That is a different answer from "the sweep
           // has never seen this address" (200 + found:false, below), and from
           // a real outage, which keeps the alarm card and its Retry.
-          <NotFoundState what="host" id={ip} backTo="/hosts" backLabel="Back to Hosts" />
+          <NotFoundState what="host" id={param} backTo="/hosts" backLabel="Back to Hosts" />
         ) : error && !dossier ? (
           <ErrorState error={error} onRetry={refetch} label="this host" />
         ) : !dossier ? null : !dossier.found ? (
@@ -714,7 +897,32 @@ export function HostDetail() {
               />
             )}
 
-            <HostHero dossier={dossier} adminBlocked={adminBlocked} />
+            {/* The address page says why it is not the machine page. */}
+            {mode === 'address' && !addressOnly && resolved?.kind === 'none' && (
+              <div data-testid="host-no-machine" className="mb-3 text-[12px] text-faint">
+                No machine holds this address. This page shows the address alone.
+              </div>
+            )}
+            {addressOnly && (
+              <div data-testid="host-address-only" className="mb-3 text-[12px] text-faint">
+                This page shows one address and its record.{' '}
+                {resolved?.kind === 'machine' && (
+                  <Link
+                    to={`${machineHref(resolved.key)}?address=${encodeURIComponent(param)}`}
+                    className="font-semibold text-accent hover:underline"
+                  >
+                    Open the machine page
+                  </Link>
+                )}
+              </div>
+            )}
+
+            <HostHero
+              dossier={dossier}
+              machine={machine}
+              adminBlocked={adminBlocked}
+              lastActivity={newestActivity(shown?.volume)}
+            />
 
             {/* The cards lead (the owner's ask: KPIs and charts at the top),
                 and the why-care strip sits directly under them — still above
@@ -735,8 +943,13 @@ export function HostDetail() {
               dossier={dossier}
               canDeclare={canDeclare}
               onApplied={setApplied}
-              focusField={focusField}
+              focusField={primaryFocusField}
             />
+
+            {/* Every address of the machine, and its containers. */}
+            {machine && (
+              <HostAddresses machine={machine} focusAddress={focusAddress} focusField={focusField} />
+            )}
 
             <HostActivityRow
               ip={dossier.ip}
@@ -752,8 +965,9 @@ export function HostDetail() {
               dossier={dossier}
               canDeclare={canDeclare}
               onApplied={setApplied}
-              focusField={focusField}
+              focusField={primaryFocusField}
               roleVocabulary={roleVocab}
+              address={machine ? dossier.ip : undefined}
             />
 
             {/* Directly beneath the facts and their traffic pattern, because
@@ -767,13 +981,13 @@ export function HostDetail() {
             <HostObservations entityKey={ip} />
             {/* All, not New. A lead under a hunt and a lead already closed
                 both belong to this host, and the host page listed neither. */}
-            <LeadsStrip entityKey={ip} status="all" className="mt-4" />
+            <LeadsStrip entityKey={ip} aliases={dossier.aliases} status="all" className="mt-4" />
 
             <HostUnknowns
               dossier={dossier}
               canDeclare={canDeclare}
               onApplied={setApplied}
-              focusField={focusField}
+              focusField={primaryFocusField}
               roleVocabulary={roleVocab}
             />
           </>

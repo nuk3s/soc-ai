@@ -31,23 +31,56 @@ sanctions for value-shaped citations.
 
 from __future__ import annotations
 
+import ipaddress
 import json
+import logging
 import re
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from soc_ai.agent.evidence import _classify_citation, _collect_evidence_values
 from soc_ai.agent.gates import _CITATION_STOP_WORDS, _FUZZY_TOKEN_RE
+from soc_ai.agent.narrative_grounding import (
+    claims_no_host_telemetry,
+    coverage_replacer,
+    coverage_subject,
+    rewrite_host_gap_claims,
+)
+from soc_ai.dossier.coverage import (
+    HostCoverage,
+    HostIdentity,
+    host_coverage,
+    host_identity,
+    plane_phrase,
+)
+from soc_ai.dossier.coverage import describe as describe_coverage
 from soc_ai.so_client import fields
+from soc_ai.tools._synth_scope import SynthScope
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def _is_address(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return True
+
 
 # Severity ordinal — "cap at X" == min(current, X). Only ever LOWERS a severity.
 _SEV_ORDER: tuple[str, ...] = ("info", "low", "medium", "high", "critical")
 _SEV_RANK: dict[str, int] = {s: i for i, s in enumerate(_SEV_ORDER)}
 
-_UNRESOLVED_NOTE = "Citations did not resolve to gathered evidence; severity capped to low."
-_HIGH_NO_CITE_NOTE = "High-severity finding lacks citations; capped to medium."
+_UNRESOLVED_NOTE = (
+    "The citations did not resolve to gathered evidence, so soc-ai lowered the severity to low."
+)
+_HIGH_NO_CITE_NOTE = (
+    "This high-severity finding has no citations, so soc-ai lowered the severity to medium."
+)
 _ALERT_ONLY_NOTE = (
-    "Only detector alerts cited — corroborate before asserting compromise; "
-    "severity capped to medium."
+    "This finding cites only detector alerts, so soc-ai lowered the severity to medium. "
+    "Corroborate it before you claim a compromise."
 )
 
 # ── Corroboration gate: alert-query vs corroborating-evidence tools ───────────
@@ -667,3 +700,230 @@ def _validate_hunt_charts(
         )
 
     return kept, counts
+
+
+# ── Host gap gate ────────────────────────────────────────────────────────────
+# A production hunt reported "No host telemetry on <host> for attribution" as a
+# visibility gap. Its evidence was two Elastic Defend queries that returned
+# zero. The host shipped system.syslog, system.auth and osquery through
+# Elastic Agent. The citation gate above exempts a visibility gap from every
+# check, so nothing compared the claim with the host. This gate does: a gap
+# that names a host is read against the host's coverage, and a gap on a host
+# that ships any plane is rewritten to the plane the host lacks.
+
+# How far back the gate reads a host's coverage. A hunt objective covers the
+# past 72 hours unless it says otherwise.
+HOST_GAP_WINDOW_HOURS = 72
+
+# The most hosts one finding sends to the grid. A gap names one host or two.
+_MAX_GAP_HOSTS = 3
+
+_HOST_GAP_REWRITE_NOTE = (
+    "soc-ai read the host's coverage. The finding now names the plane the host does not ship."
+)
+_HOST_GAP_PRESENT_NOTE = (
+    "soc-ai read the host's coverage. The host ships every core plane, so this is no gap."
+)
+_HOST_GAP_UNREAD_NOTE = "soc-ai could not read the host's coverage."
+
+# The planes a finding's text names. Order is the order a title names them in.
+_PLANE_MENTIONS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("process", re.compile(r"\bprocess(?:es)?\b|\bsysmon\b|endpoint\.events\.process", re.I)),
+    (
+        "endpoint_network",
+        re.compile(
+            r"endpoint\.events\.network|\bendpoint\s+(?:process\s*(?:/|or|and)\s*)?network", re.I
+        ),
+    ),
+    ("windows_security", re.compile(r"\bwindows\b|\bwinlog\b|\b46\d\d\b", re.I)),
+    (
+        "host_logs",
+        re.compile(r"\bsyslog\b|system\.auth|\bauth(?:entication)? logs?\b|\bhost logs?\b", re.I),
+    ),
+    ("osquery", re.compile(r"osquery", re.I)),
+)
+
+
+def _planes_named(text: str) -> list[str]:
+    return [plane for plane, pattern in _PLANE_MENTIONS if pattern.search(text)]
+
+
+def _append_note(current: str | None, note: str) -> str:
+    if not current:
+        return note
+    if note in current:
+        return current
+    return f"{current} {note}"
+
+
+def _rewrite_host_gap(finding: Any, covered: list[tuple[str, HostCoverage]]) -> Any:
+    """The finding restated with the planes its host ships and the plane it lacks."""
+    host, cov = covered[0]
+    agent = cov.agent
+    label = agent.name if agent is not None and agent.name else host
+    title = str(getattr(finding, "title", "") or "")
+    detail = str(getattr(finding, "detail", "") or "")
+    absent = cov.absent()
+    named = _planes_named(f"{title} {detail}")
+    lacking = [p for p in named if p in absent] or absent
+    facts: list[str] = []
+    for other_host, other_cov in covered:
+        other_agent = other_cov.agent
+        subject = other_agent.name if other_agent is not None and other_agent.name else other_host
+        facts.extend(describe_coverage(other_cov, subject=subject))
+    kept, _n = rewrite_host_gap_claims(detail, lambda _sentence: "")
+    new_detail = " ".join([*facts, kept]).strip()
+    if lacking:
+        planes = " or ".join(plane_phrase(p) for p in lacking[:2])
+        return finding.model_copy(
+            update={
+                "title": _clamp_title(f"No {planes} telemetry on {label}"),
+                "detail": new_detail,
+                "validator_note": _append_note(
+                    getattr(finding, "validator_note", None), _HOST_GAP_REWRITE_NOTE
+                ),
+            }
+        )
+    return finding.model_copy(
+        update={
+            "title": _clamp_title(f"Host telemetry present on {label}"),
+            "detail": new_detail,
+            "category": "observation",
+            "validator_note": _append_note(
+                getattr(finding, "validator_note", None), _HOST_GAP_PRESENT_NOTE
+            ),
+        }
+    )
+
+
+async def _host_gap_coverage(
+    host: str,
+    *,
+    elastic: Any,
+    settings: Any,
+    sessionmaker: Any | None,
+    since: datetime,
+    until: datetime,
+    include_synth: SynthScope,
+) -> HostCoverage:
+    """One host's coverage. The identity comes from the dossier when there is a store."""
+    identity = HostIdentity(addresses=[host]) if _is_address(host) else HostIdentity(names=[host])
+    if sessionmaker is not None:
+        try:
+            async with sessionmaker() as db:
+                identity = await host_identity(db, host)
+        except Exception:  # the address alone still reads the host
+            _LOGGER.warning("host gap gate: identity read failed for one host", exc_info=True)
+    return await host_coverage(
+        elastic,
+        settings,
+        addresses=identity.addresses,
+        names=identity.names,
+        agent_ids=identity.agent_ids,
+        since=since,
+        until=until,
+        include_synth=include_synth,
+    )
+
+
+async def gate_host_gaps(
+    report: Any,
+    *,
+    elastic: Any,
+    settings: Any,
+    sessionmaker: Any | None = None,
+    include_synth: SynthScope = False,
+    now: datetime | None = None,
+    window_hours: int = HOST_GAP_WINDOW_HOURS,
+) -> tuple[Any, dict[str, int]]:
+    """Check each host gap of a HuntReport against the host's coverage.
+
+    A ``visibility_gap`` finding that names a host gets one coverage read per
+    host, cached across findings. When a host ships any plane, the finding is
+    rewritten: the detail states the planes the host ships and the planes it
+    does not ship, and the title names the plane, "No process telemetry on
+    X". When the host ships every core plane, the finding is no gap and
+    becomes an observation. When the read fails, the finding stays and its
+    note says that soc-ai could not read the host's coverage. A host that
+    ships nothing keeps its gap. Every other finding passes through.
+
+    The narrative gets the same rule. A narrative sentence that says a host
+    has no host telemetry is replaced by the coverage facts when the host
+    ships a plane. The hosts are the ones the gaps named, else the report's
+    affected hosts.
+
+    Returns ``(report, counts)``; counts are ``host_gaps``,
+    ``host_gaps_rewritten``, ``host_gaps_unread`` and, when the narrative
+    changed, ``narrative_sentences_rewritten``.
+    """
+    counts = {"host_gaps": 0, "host_gaps_rewritten": 0, "host_gaps_unread": 0}
+    findings = list(getattr(report, "findings", None) or [])
+    current = now or datetime.now(UTC)
+    since = current - timedelta(hours=max(1, window_hours))
+    cache: dict[str, HostCoverage] = {}
+    out: list[Any] = []
+    for finding in findings:
+        category = str(getattr(finding, "category", None) or "").strip().lower()
+        hosts = [str(h).strip() for h in (getattr(finding, "hosts", None) or []) if str(h).strip()]
+        if category != "visibility_gap" or not hosts:
+            out.append(finding)
+            continue
+        counts["host_gaps"] += 1
+        reads: list[tuple[str, HostCoverage]] = []
+        for host in hosts[:_MAX_GAP_HOSTS]:
+            if host not in cache:
+                cache[host] = await _host_gap_coverage(
+                    host,
+                    elastic=elastic,
+                    settings=settings,
+                    sessionmaker=sessionmaker,
+                    since=since,
+                    until=current,
+                    include_synth=include_synth,
+                )
+            reads.append((host, cache[host]))
+        covered = [(h, c) for h, c in reads if c.covered]
+        if covered:
+            out.append(_rewrite_host_gap(finding, covered))
+            counts["host_gaps_rewritten"] += 1
+        elif any(not c.read_ok for _h, c in reads):
+            out.append(
+                finding.model_copy(
+                    update={
+                        "validator_note": _append_note(
+                            getattr(finding, "validator_note", None), _HOST_GAP_UNREAD_NOTE
+                        )
+                    }
+                )
+            )
+            counts["host_gaps_unread"] += 1
+        else:
+            out.append(finding)
+
+    update: dict[str, Any] = {}
+    if counts["host_gaps"]:
+        update["findings"] = out
+    narrative = str(getattr(report, "narrative", "") or "")
+    if any(claims_no_host_telemetry(line) for line in re.split(r"(?<=[.!?])\s+", narrative)):
+        if not cache:
+            for host in [str(h).strip() for h in getattr(report, "affected_hosts", None) or []][
+                :_MAX_GAP_HOSTS
+            ]:
+                if host:
+                    cache[host] = await _host_gap_coverage(
+                        host,
+                        elastic=elastic,
+                        settings=settings,
+                        sessionmaker=sessionmaker,
+                        since=since,
+                        until=current,
+                        include_synth=include_synth,
+                    )
+        subjects = [coverage_subject(host, cov) for host, cov in cache.items()]
+        new_narrative, n = rewrite_host_gap_claims(narrative, coverage_replacer(subjects))
+        if n:
+            update["narrative"] = new_narrative
+            counts["narrative_sentences_rewritten"] = n
+    if not update:
+        return report, counts
+    return report.model_copy(update=update), counts

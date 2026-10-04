@@ -569,6 +569,15 @@ class Settings(BaseSettings):
     `last_seen` first and NEVER touches a row carrying an operator override —
     losing hand-entered criticality to a port scan would be the worse outcome."""
 
+    dossier_stale_address_days: int = 30
+    """Days after which an address no census has seen leaves the dossier table.
+
+    The cap above prunes only when the table is full, so an address that left
+    the network stayed for months: production held 122 rows that no census had
+    found in weeks. A row that holds an operator declaration stays. The machine
+    that held the address keeps it in its history. A sweep whose census failed
+    prunes nothing, because a grid outage is not evidence that a host left."""
+
     dossier_min_events: int = 20
     """Events in the window below which the classifier refuses to guess a role.
     Identity facts (hostname, MAC, domain) still get emitted — a single DHCP

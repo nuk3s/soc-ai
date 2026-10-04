@@ -8,7 +8,7 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { listDossiers } from '../lib/api';
+import { listMachines } from '../lib/api';
 import type { Config, Setting } from '../lib/types';
 import { CommandPalette } from './CommandPalette';
 import { ShellProvider } from './ShellContext';
@@ -65,7 +65,7 @@ vi.mock('../lib/api', () => ({
   getAlerts: vi.fn(() => Promise.resolve({ groups: [], truncated: false, other_docs: 0 })),
   getInvestigations: vi.fn(() => Promise.resolve([])),
   getConfig: () => getConfigMock(),
-  listDossiers: vi.fn(),
+  listMachines: vi.fn(),
   signOut: vi.fn(),
 }));
 
@@ -92,7 +92,7 @@ describe('CommandPalette', () => {
     getConfigMock.mockResolvedValue(CONFIG_FIXTURE);
     // Default: no hosts corpus, so the existing (host-agnostic) tests below
     // see the palette behave exactly as before host search was added.
-    vi.mocked(listDossiers).mockResolvedValue({ rows: [], total: 0, limit: 8, offset: 0 });
+    vi.mocked(listMachines).mockResolvedValue({ rows: [], total: 0, limit: 8, offset: 0, sort: 'last_seen', dir: 'desc' });
   });
 
   it('offers Go-to entries for every primary route, incl. Dashboard/Notifications/Backtest/Operate', async () => {
@@ -179,29 +179,45 @@ describe('CommandPalette', () => {
     expect(screen.queryAllByText('Settings')).toHaveLength(0);
   });
 
-  it('an IP query surfaces the host page as a first-class hit', async () => {
-    vi.mocked(listDossiers).mockResolvedValue({
+  it('asks the machine search the Hosts list uses, 8 rows, and opens the machine page', async () => {
+    // The palette searched the per-address dossier list while the Hosts page
+    // searched with another scope, so the two gave two answers (U7). Both now
+    // call GET /hosts?q=.
+    vi.mocked(listMachines).mockResolvedValue({
       rows: [
         {
-          ip: '192.168.10.15',
-          found: true,
-          event_count: 199468,
-          fields: [
-            { field: 'hostname', value: 'bazzite', overridden: false },
-            { field: 'role', value: 'workstation', overridden: false },
-          ],
-        } as never,
+          key: 'agent:7f3a',
+          href: '/hosts/agent%3A7f3a',
+          name: 'ws-15',
+          name_source: 'agent',
+          names: [{ value: 'ws-15', source: 'agent' }],
+          primary_ip: '192.0.2.15',
+          address_count: 2,
+          addresses: ['192.0.2.15', '198.51.100.15'],
+          container_count: 0,
+          agent: { id: '7f3a', name: 'ws-15', os: 'Fedora 42', last_report: null },
+          role: { value: 'workstation', label: 'workstation', confidence: 0.9, state: 'inferred', guess: null, stale_hours: null },
+          events: 199468,
+          first_seen: null,
+          last_seen: null,
+          flags: { declared: false, conflict: false, broken: false, new: false, rebound: false },
+        },
       ],
       total: 1,
       limit: 8,
       offset: 0,
+      sort: 'last_seen',
+      dir: 'desc',
     });
     await openPalette();
-    type('192.168.10.15');
-    const hit = await screen.findByText(/192\.168\.10\.15 — bazzite/);
+    type('192.0.2.15');
+    const hit = await screen.findByRole('option', { name: /ws-15 · 192\.0\.2\.15 · workstation/ });
     expect(hit).toBeInTheDocument();
+    expect(vi.mocked(listMachines)).toHaveBeenLastCalledWith({ q: '192.0.2.15', limit: 8 });
+    // The row reads "<name> · <primary address> · <role>". No dash.
+    expect(hit.textContent).not.toMatch(/[–—]/);
 
     fireEvent.keyDown(window, { key: 'Enter' });
-    expect(navigateMock).toHaveBeenCalledWith('/hosts/192.168.10.15');
+    expect(navigateMock).toHaveBeenCalledWith('/hosts/agent%3A7f3a');
   });
 });

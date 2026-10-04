@@ -457,6 +457,21 @@ def test_junk_host_reason_bare_public_tld() -> None:
     assert _junk_host_reason("corp") is None
 
 
+def test_a_self_reported_name_is_not_a_bare_public_tld() -> None:
+    """An agent's own host.name or a DHCP lease hostname is the machine's claim.
+
+    "nexus" and "green" are gTLDs. Two production agents carried gTLD names, and
+    the TLD rule dropped both. The rule stays for a name nobody vouched for.
+    """
+    assert _junk_host_reason("nexus") == "bare-public-tld"
+    assert _junk_host_reason("nexus", self_reported=True) is None
+    assert _junk_host_reason("Green", self_reported=True) is None
+    # NEGATIVE CONTROL: the exemption covers the TLD rule only. A protocol
+    # artifact or an address is junk whoever reports it.
+    assert _junk_host_reason("WORKGROUP", self_reported=True) == "netbios-workgroup"
+    assert _junk_host_reason("192.0.2.10", self_reported=True) == "ip-literal"
+
+
 def test_junk_host_reason_netbios_junk() -> None:
     assert _junk_host_reason("WORKGROUP") == "netbios-workgroup"
     assert _junk_host_reason("workgroup") == "netbios-workgroup"  # case-insensitive
@@ -744,6 +759,53 @@ async def test_retirement_sweep_dismisses_vestigial_rows() -> None:
     assert visible[("suffix", ".apple.com")].state == "muted"
     assert visible[("suffix", ".printers.lan")].state == "muted"
     assert visible[("suffix", ".corp.bigco.com")].state == "muted"  # in-scan → kept
+
+
+async def test_retirement_keeps_a_self_reported_name_the_dossier_proposed() -> None:
+    """A gTLD-shaped name an agent or a DHCP lease reported is not retired as junk.
+
+    The dossier proposes the name with its signal. A retirement that re-applied
+    the TLD rule would dismiss "nexus" on the next discovery scan, and the
+    dismissal is terminal.
+    """
+    settings = _settings()
+    maker = await _sessionmaker(settings)
+    async with maker() as db:
+        await ids.upsert_detected(
+            db,
+            "host",
+            "nexus",
+            {"source": "host_dossier", "ip": "192.0.2.10", "signal": "hostlog"},
+            "muted",
+        )
+        await ids.upsert_detected(
+            db,
+            "host",
+            "green",
+            {"source": "host_dossier", "ip": "192.0.2.11", "signal": "dhcp"},
+            "muted",
+        )
+        # NEGATIVE CONTROL: the same shape from a DNS-derived proposal is still
+        # an FQDN-parsing artifact and is retired.
+        await ids.upsert_detected(
+            db,
+            "host",
+            "museum",
+            {"source": "host_dossier", "ip": "192.0.2.12", "signal": "dns"},
+            "muted",
+        )
+
+    fake = FakeES(host_buckets=[_bucket("dc01.corp.acme.local", 50, 5)])
+    summary = await run_discovery(fake, maker, settings)  # type: ignore[arg-type]
+
+    async with maker() as db:
+        full = {
+            (r.kind, r.value): r for r in await ids.list_identifiers(db, include_dismissed=True)
+        }
+    assert full[("host", "nexus")].state == "muted"
+    assert full[("host", "green")].state == "muted"
+    assert full[("host", "museum")].state == "dismissed"
+    assert summary.retired == 1
 
 
 async def test_retirement_sweep_is_terminal_across_rescans() -> None:

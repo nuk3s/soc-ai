@@ -16,6 +16,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
   getAnalytic: vi.fn(),
   getAnalyticHits: vi.fn(),
   getEvent: vi.fn(),
+  getHuntCatalog: vi.fn(),
   markShadowHitRead: vi.fn(),
   setAnalyticStatus: vi.fn(),
   startHuntConsole: vi.fn(),
@@ -24,6 +25,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
 import {
   ApiError,
   getAnalyticHits,
+  getHuntCatalog,
   markShadowHitRead,
   setAnalyticStatus,
   startHuntConsole,
@@ -126,7 +128,18 @@ beforeEach(() => {
   vi.mocked(markShadowHitRead).mockReset().mockResolvedValue({ ok: true });
   vi.mocked(setAnalyticStatus).mockReset().mockResolvedValue({} as never);
   vi.mocked(startHuntConsole).mockReset().mockResolvedValue({ hunt_id: 'H9' });
+  vi.mocked(getHuntCatalog).mockReset().mockResolvedValue(CATALOG_RAN);
 });
+
+const CATALOG_RAN = {
+  specs: [],
+  sweeps_enabled: true,
+  sweep_interval_minutes: 60,
+  sweep_window_minutes: 61,
+  last_sweep_at: new Date(Date.now() - 600_000).toISOString(),
+  prior_sweeps_enabled: true,
+  last_prior_run_at: new Date(Date.now() - 600_000).toISOString(),
+};
 
 describe('the block', () => {
   it('names the window, counts the hits and states the order', async () => {
@@ -185,7 +198,47 @@ describe('the block', () => {
       counts: { all: 0, unread: 0, live: 0, shadow: 0 },
     });
     mount();
-    expect(await screen.findByText(/No analytic hit in the last 7 days/)).toBeTruthy();
+    expect(
+      await screen.findByText(
+        'No analytic hit in the last 7 days. No analytic matched a document the sweeps read.',
+      ),
+    ).toBeTruthy();
+  });
+
+  // F2. Production had the sweeps off and no sweep on record, and the empty
+  // list said no analytic matched a document the sweeps read.
+  it('says the sweeps have not run when no sweep ran', async () => {
+    vi.mocked(getAnalyticHits).mockResolvedValue({
+      hits: [],
+      counts: { all: 0, unread: 0, live: 0, shadow: 0 },
+    });
+    vi.mocked(getHuntCatalog).mockResolvedValue({
+      ...CATALOG_RAN,
+      sweeps_enabled: false,
+      last_sweep_at: null,
+      last_prior_run_at: null,
+    });
+    mount();
+    const line = await screen.findByText(/^No analytic hit in the last 7 days\. Sweeps are off/);
+    expect(line.textContent).toBe(
+      'No analytic hit in the last 7 days. Sweeps are off. The match analytics do not run. ' +
+        'The profile sweep has not run yet.',
+    );
+    expect(line.textContent).not.toContain('matched a document');
+  });
+
+  it('cannot tell when the catalog is unreadable', async () => {
+    vi.mocked(getAnalyticHits).mockResolvedValue({
+      hits: [],
+      counts: { all: 0, unread: 0, live: 0, shadow: 0 },
+    });
+    vi.mocked(getHuntCatalog).mockRejectedValue(new Error('down'));
+    mount();
+    expect(
+      await screen.findByText(
+        'No analytic hit in the last 7 days. soc-ai cannot tell if the sweeps ran.',
+      ),
+    ).toBeTruthy();
   });
 
   // A failed first read reads as a failure. A poll failing after a good read

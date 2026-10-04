@@ -78,20 +78,31 @@ export function formatNotificationWhen(when: string | null | undefined): string 
 // ── What produced this notification ────────────────────────────────────────
 
 /** Which part of the app raised the item. */
-export type NotificationKind = 'system' | 'host' | 'investigation' | 'hunt';
+export type NotificationKind = 'system' | 'host' | 'investigation' | 'hunting';
 
 /**
  * The kinds in the order /notifications itself emits them: standing conditions
- * first (a down dependency, a dossier disagreement), then work — in flight, then
- * finished. The pane's preset chips and its group headers both read this, so the
- * two can never disagree about what a kind is called or where it sits.
+ * first (a down dependency, a dossier disagreement), then work. The pane's
+ * preset chips and its group headers both read this, so the two can never
+ * disagree about what a kind is called or where it sits.
+ *
+ * "Hunting" holds shadow hits, leads and finished hunts. Shadow hits and leads
+ * used to fall to "System" on the chips while their heading said HUNTING, so
+ * the chip and the heading named one row two ways (D7, RD7).
  */
 export const NOTIFICATION_KINDS: ReadonlyArray<{ id: NotificationKind; label: string }> = [
   { id: 'system', label: 'System' },
   { id: 'host', label: 'Hosts' },
   { id: 'investigation', label: 'Investigations' },
-  { id: 'hunt', label: 'Hunts' },
+  { id: 'hunting', label: 'Hunting' },
 ];
+
+/** The one empty-state line for the bell and the Notifications screen. They
+ *  said "No notifications." and "No active notifications." (D8). */
+export const NO_NOTIFICATIONS = 'No active notifications.';
+
+/** The most rows GET /notifications returns (routes_meta.list_notifications). */
+export const NOTIFICATIONS_CAP = 12;
 
 /**
  * The source of a notification, off the id prefix the API mints.
@@ -101,22 +112,73 @@ export const NOTIFICATION_KINDS: ReadonlyArray<{ id: NotificationKind; label: st
  * present, unlike `href` (a down dependency has none) or `tone` (which says how
  * loud, not who). Matching the segment BEFORE the first colon rather than a
  * `startsWith` keeps `inv:` and `inv-done:` apart from anything that merely
- * begins with those letters.
+ * begins with those letters. A row whose wire `group` is "hunting" is hunting
+ * whatever its prefix. The wire says "system" for every other row, so only
+ * "hunting" on the wire decides anything.
  *
  * Anything unrecognised is `system`, never dropped: the bell badge counts the
  * same rows this pane shows, so a source a future build adds has to land in a
  * bucket rather than disappear out of one.
  */
-export function notificationKind(n: { id: string }): NotificationKind {
+export function notificationKind(n: { id: string; group?: unknown }): NotificationKind {
+  if (n.group === 'hunting') return 'hunting';
   switch (n.id.split(':', 1)[0]) {
     case 'inv':
     case 'inv-done':
+    // A failed triage is an investigation that ended with no verdict. It sat
+    // under "System" while the Investigations chip held verdicts only (D7).
+    case 'inv-failed':
       return 'investigation';
     case 'hunt-done':
-      return 'hunt';
+    case 'lead':
+    case 'shadow-hit':
+      return 'hunting';
     case 'dossier-conflict':
       return 'host';
     default:
       return 'system';
   }
+}
+
+/** The noun for each row source, singular and plural. */
+const ROW_NOUN: Record<string, [string, string]> = {
+  'shadow-hit': ['shadow hit', 'shadow hits'],
+  lead: ['lead', 'leads'],
+  inv: ['running investigation', 'running investigations'],
+  'inv-failed': ['failed triage', 'failed triages'],
+  'inv-done': ['completed investigation', 'completed investigations'],
+  'hunt-done': ['finished hunt', 'finished hunts'],
+  'dossier-conflict': ['host disagreement', 'host disagreements'],
+};
+const SYSTEM_NOUN: [string, string] = ['system notice', 'system notices'];
+
+/**
+ * The header line of the Notifications screen.
+ *
+ * It names only the row types that are present, in list order, with a count
+ * each. When the API answered with a full list, the last type is the one the
+ * cap cut, so it reads "the N newest". The header said "shadow hits, leads,
+ * hunts and investigations from the last 24 h" whatever the list held, over
+ * 10 completed investigations out of 65 (D3).
+ */
+export function describeNotifications(rows: ReadonlyArray<{ id: string }>, capped: boolean): string {
+  if (rows.length === 0) return '0 items from the last 24 h.';
+  const order: string[] = [];
+  const counts = new Map<string, number>();
+  for (const r of rows) {
+    const prefix = r.id.split(':', 1)[0];
+    const key = prefix in ROW_NOUN ? prefix : 'system';
+    if (!counts.has(key)) order.push(key);
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  const parts = order.map((key, i) => {
+    const n = counts.get(key)!;
+    const [one, many] = ROW_NOUN[key] ?? SYSTEM_NOUN;
+    const noun = n === 1 ? one : many;
+    if (!(capped && i === order.length - 1)) return `${n} ${noun}`;
+    return n === 1 ? `the newest ${noun}` : `the ${n} newest ${noun}`;
+  });
+  const list =
+    parts.length === 1 ? parts[0] : `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}`;
+  return `${rows.length} item${rows.length === 1 ? '' : 's'} from the last 24 h: ${list}.`;
 }

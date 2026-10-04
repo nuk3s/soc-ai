@@ -11,6 +11,7 @@ import {
   formatNotificationTitle,
   formatNotificationWhen,
   getDismissed,
+  describeNotifications,
   notificationKind,
 } from './notifications';
 
@@ -77,7 +78,7 @@ describe('notificationKind', () => {
   it('reads the source off the id prefix the backend mints', () => {
     expect(notificationKind({ id: 'inv:01ABC' })).toBe('investigation');
     expect(notificationKind({ id: 'inv-done:01ABC' })).toBe('investigation');
-    expect(notificationKind({ id: 'hunt-done:01ABC' })).toBe('hunt');
+    expect(notificationKind({ id: 'hunt-done:01ABC' })).toBe('hunting');
     expect(notificationKind({ id: 'dossier-conflict:10.0.0.14:hostname:2' })).toBe('host');
     expect(notificationKind({ id: 'dep-down:es:20260812234343' })).toBe('system');
   });
@@ -97,7 +98,46 @@ describe('notificationKind', () => {
 
   it('lists every kind the derivation can return', () => {
     const kinds = NOTIFICATION_KINDS.map((k) => k.id);
-    expect(kinds).toEqual(['system', 'host', 'investigation', 'hunt']);
+    expect(kinds).toEqual(['system', 'host', 'investigation', 'hunting']);
+  });
+
+  // A failed triage sat on the System chip while the Investigations chip held
+  // verdicts only, and a lead sat under the HUNTING heading while its chip said
+  // System (D7, RD7).
+  it('files a failed triage under investigations and a lead or shadow hit under hunting', () => {
+    expect(notificationKind({ id: 'inv-failed:01ABC' })).toBe('investigation');
+    expect(notificationKind({ id: 'lead:15' })).toBe('hunting');
+    expect(notificationKind({ id: 'shadow-hit:7' })).toBe('hunting');
+    // The wire group wins for "hunting", and "system" on the wire decides nothing.
+    expect(notificationKind({ id: 'future-thing:1', group: 'hunting' })).toBe('hunting');
+    expect(notificationKind({ id: 'inv-done:01ABC', group: 'system' })).toBe('investigation');
+  });
+});
+
+describe('describeNotifications', () => {
+  // The header said "shadow hits, leads, hunts and investigations from the last
+  // 24 h" over any list, and never said the API caps completions (D3).
+  it('names only the row types present, with a count each', () => {
+    expect(
+      describeNotifications([{ id: 'lead:1' }, { id: 'inv-done:a' }, { id: 'inv-done:b' }], false),
+    ).toBe('3 items from the last 24 h: 1 lead and 2 completed investigations.');
+  });
+
+  it('states the cap on the last type when the API list is full', () => {
+    const rows = [
+      { id: 'shadow-hit:1' },
+      { id: 'shadow-hit:2' },
+      ...Array.from({ length: 10 }, (_, i) => ({ id: `inv-done:${i}` })),
+    ];
+    expect(describeNotifications(rows, true)).toBe(
+      '12 items from the last 24 h: 2 shadow hits and the 10 newest completed investigations.',
+    );
+  });
+
+  it('counts an unknown source as a system notice', () => {
+    expect(describeNotifications([{ id: 'dep-down:es:1' }], false)).toBe(
+      '1 item from the last 24 h: 1 system notice.',
+    );
   });
 });
 

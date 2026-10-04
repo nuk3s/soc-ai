@@ -299,7 +299,7 @@ async def test_reap_stale_pending_marks_pending_error_leaves_others(
         assert reaped is not None
         assert reaped.status == "error"
         assert "interrupted" in reaped.content
-        assert "ask again" in reaped.content
+        assert "Ask again" in reaped.content
         assert (await db.get(GeneralChatMessage, done.id)).status == "done"
         assert (await db.get(GeneralChatMessage, err.id)).content == "boom"
         assert (await db.get(GeneralChatMessage, user.id)).status == "done"

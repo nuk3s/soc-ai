@@ -487,12 +487,12 @@ def test_a_profile_spec_carries_the_prior_sweeps_coverage(client: TestClient) ->
                 coverage="not_applicable",
             ),
         ),
-        evaluated_specs=(spec_id, "prior-audit-policy-changed-on-dc"),
+        evaluated_specs=(spec_id, "prior-workstation-account-first-logon-to-dc"),
     )
 
     async def _seed() -> None:
         async with client.app.state.db_sessionmaker() as db:
-            await prior_spec_runs.record_sweep(db, sweep)
+            await prior_spec_runs.record_sweep(db, sweep, shadow_ids=frozenset({spec_id}))
 
     asyncio.run(_seed())
     by_id = {s["id"]: s for s in client.get("/api/v1/hunt-catalog").json()["specs"]}
@@ -505,7 +505,7 @@ def test_a_profile_spec_carries_the_prior_sweeps_coverage(client: TestClient) ->
 
     # A spec the sweep considered but had nothing to score gets a row of zeros
     # -- a fact about the run -- rather than reading as never-run.
-    zeros = by_id["prior-audit-policy-changed-on-dc"]["coverage"]
+    zeros = by_id["prior-workstation-account-first-logon-to-dc"]["coverage"]
     assert zeros is not None and zeros["measured"] == 0 and zeros["blind"] == 0
 
     # A match spec has no prior coverage at all.
@@ -523,7 +523,7 @@ def test_the_coverage_says_how_fresh_the_baselines_were(client: TestClient) -> N
     from soc_ai.store import prior_spec_runs
 
     stale_spec = "prior-hypervisor-novel-served-port"
-    plain_spec = "prior-audit-policy-changed-on-dc"
+    plain_spec = "prior-workstation-account-first-logon-to-dc"
     built = datetime.now(UTC) - timedelta(hours=26)
 
     def _sweep(spec_id: str) -> PriorSweep:
@@ -541,13 +541,14 @@ def test_the_coverage_says_how_fresh_the_baselines_were(client: TestClient) -> N
             await prior_spec_runs.record_sweep(
                 db,
                 _sweep(stale_spec),
+                shadow_ids=frozenset(),
                 profiles=ProfileState(
                     built_at=built.replace(tzinfo=None),
                     stale=True,
                     reason="active_hours: Trying to create too many buckets",
                 ),
             )
-            await prior_spec_runs.record_sweep(db, _sweep(plain_spec))
+            await prior_spec_runs.record_sweep(db, _sweep(plain_spec), shadow_ids=frozenset())
 
     asyncio.run(_seed())
     by_id = {s["id"]: s for s in client.get("/api/v1/hunt-catalog").json()["specs"]}
@@ -563,3 +564,90 @@ def test_the_coverage_says_how_fresh_the_baselines_were(client: TestClient) -> N
     assert plain["profiles_built_at"] is None
     assert plain["profiles_stale"] is False
     assert plain["profiles_reason"] is None
+
+
+def _prior_run(
+    client: TestClient,
+    spec_id: str,
+    *,
+    at: datetime,
+    shadow: bool = False,
+    results: int = 1,
+) -> None:
+    """Write one prior sweep row for ``spec_id`` through the store."""
+    from soc_ai.hunting.prior_sweep import PriorSweep
+    from soc_ai.hunting.priors import PriorResult
+    from soc_ai.store import prior_spec_runs
+
+    sweep = PriorSweep(
+        results=tuple(
+            PriorResult(
+                spec_id=spec_id,
+                entity_kind="host",
+                entity_key=f"192.0.2.{n % 250}",
+                coverage="blind",
+            )
+            for n in range(results)
+        ),
+        evaluated_specs=(spec_id,),
+    )
+
+    async def _go() -> None:
+        async with client.app.state.db_sessionmaker() as db:
+            await prior_spec_runs.record_sweep(
+                db, sweep, shadow_ids=frozenset({spec_id} if shadow else ()), now=at
+            )
+
+    asyncio.run(_go())
+
+
+def test_a_profile_spec_reads_its_trail_from_the_prior_sweep(client: TestClient) -> None:
+    """R1a. The catalog read a profile spec's error and its last sweep from the
+    catalog sweep's table. That loop stopped running profile specs, so all nine
+    priors showed a 2026-09-15 AttributeError under an hourly prior sweep that
+    ran fine. The negative control is the stale error row: it must not surface.
+    """
+    spec_id = "prior-hypervisor-novel-served-port"
+    now = _now()
+    _seed(
+        client,
+        spec_id=spec_id,
+        now=now - timedelta(days=16),
+        error="AttributeError: 'NoneType' object has no attribute 'exclusion_fields'",
+    )
+    _prior_run(client, spec_id, at=now - timedelta(hours=2))
+    _prior_run(client, spec_id, at=now - timedelta(minutes=5))
+
+    body = client.get("/api/v1/hunt-catalog").json()
+    row = next(s for s in body["specs"] if s["id"] == spec_id)
+    assert row["last_error"] is None
+    assert row["last_swept_at"] == (now - timedelta(minutes=5)).isoformat() + "Z"
+    assert row["sweeps_24h"] == 2
+    assert row["shadow_24h"] == 0
+    assert row["coverage"]["shadow"] is False
+    assert body["last_prior_run_at"] == (now - timedelta(minutes=5)).isoformat() + "Z"
+    assert body["prior_sweeps_enabled"] is True
+
+
+def test_a_match_spec_still_reads_the_catalog_sweeps_error(client: TestClient) -> None:
+    """The split is by evaluator. A match spec keeps its own trail and error."""
+    now = _now()
+    _seed(client, spec_id=DCSYNC, now=now, error="ConnectionError: grid down")
+    _prior_run(client, "prior-hypervisor-novel-served-port", at=now)
+    body = client.get("/api/v1/hunt-catalog").json()
+    dcsync = next(s for s in body["specs"] if s["id"] == DCSYNC)
+    assert dcsync["last_error"] == "ConnectionError: grid down"
+
+
+def test_a_coverage_at_the_recent_cap_says_it_is_capped(client: TestClient) -> None:
+    """H5. A served-port prior reported 500 evaluations on a 336-host estate.
+    500 is the recent read's cap, and the totals have to say so."""
+    from soc_ai.hunting.prior_sweep import RECENT_MAX_ENTITIES
+
+    now = _now()
+    _prior_run(client, "prior-hypervisor-novel-served-port", at=now, results=RECENT_MAX_ENTITIES)
+    _prior_run(client, "prior-server-internet-nonweb-novel-port", at=now, results=3)
+    by_id = {s["id"]: s for s in client.get("/api/v1/hunt-catalog").json()["specs"]}
+    capped = by_id["prior-hypervisor-novel-served-port"]["coverage"]
+    assert capped["capped"] is True and capped["recent_cap"] == RECENT_MAX_ENTITIES
+    assert by_id["prior-server-internet-nonweb-novel-port"]["coverage"]["capped"] is False

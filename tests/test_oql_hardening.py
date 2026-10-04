@@ -107,7 +107,7 @@ def test_list_alerts_bad_abs_range_is_400_not_500(client: TestClient) -> None:
     OqlValidationError (400), never handed verbatim to ES to 500 on."""
     resp = client.get("/api/v1/alerts", params={"from": "lol", "to": "lol"})
     assert resp.status_code == 400
-    assert resp.json()["detail"]["reason"] == "bad_oql"
+    assert resp.json()["detail"]["reason"] == "bad_time"
 
 
 def _bad_request_error() -> BadRequestError:

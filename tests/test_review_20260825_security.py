@@ -1418,7 +1418,15 @@ def test_investigate_disables_so_writes_over_a_hunt_anchor(
 
         return _gen()
 
-    with patch("soc_ai.api.routes.investigate", _fake_investigate):
+    # The route asks the grid whether the alert exists before it creates a
+    # row (RA6). This fake grid holds nothing, so the lookup says it exists.
+    with (
+        patch("soc_ai.api.routes.investigate", _fake_investigate),
+        patch(
+            "soc_ai.api.routes.resolve_alert_for_hunt",
+            AsyncMock(return_value=(True, None)),
+        ),
+    ):
         resp = analyst.post("/investigate", json={"alert_id": anchor}, headers=_ORIGIN)
 
     assert resp.status_code == 200, resp.text
@@ -1440,7 +1448,15 @@ def test_investigate_keeps_so_writes_on_for_ordinary_alerts(analyst: TestClient)
 
         return _gen()
 
-    with patch("soc_ai.api.routes.investigate", _fake_investigate):
+    # The route asks the grid whether the alert exists before it creates a
+    # row (RA6). This fake grid holds nothing, so the lookup says it exists.
+    with (
+        patch("soc_ai.api.routes.investigate", _fake_investigate),
+        patch(
+            "soc_ai.api.routes.resolve_alert_for_hunt",
+            AsyncMock(return_value=(True, None)),
+        ),
+    ):
         resp = analyst.post(
             "/investigate", json={"alert_id": "ordinary-alert-000002"}, headers=_ORIGIN
         )

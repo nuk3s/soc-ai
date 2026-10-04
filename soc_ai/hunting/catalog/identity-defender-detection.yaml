@@ -1,0 +1,79 @@
+id: identity-defender-detection
+title: Microsoft Defender detects a threat on a server or a domain controller
+description: >
+  Microsoft Defender writes event 1116 when it detects malware or other
+  unwanted software. It writes event 1117 when it acts on the detection. Both
+  events go to the Defender operational log. This analytic reads those two
+  events and nothing else.
+
+  A detection on a workstation is frequent. A detection on a server or a
+  domain controller is rare. Those machines do not browse the web, open mail
+  or receive files from users. The analytic therefore applies to the server
+  and domain_controller roles only.
+
+  This analytic replaces the prior prior-defender-adjudication-on-server. That
+  prior read new process names on the host. It never read a Defender event. On
+  the development range it missed all 10 Defender detections. It fired 73
+  times on Defender updater files, whose names carry the definition version.
+
+  The level follows the Defender severity of the threat. Severe is critical,
+  High is high, Moderate is medium and Low is low. A document with no severity
+  keeps the level critical. The finding quotes the threat name, the path and
+  the action that Defender took.
+
+level: critical
+# No benign population. A server has no normal rate of malware detections, so
+# the first one is the finding. A triage may not close this false_positive on
+# how often it fires.
+no_benign_baseline: true
+scope_field: host.name
+scope_kind: host
+roles:
+  - server
+  - domain_controller
+
+# Defender writes health events 1150 and 1151 every hour on every protected
+# host. A grid that ships the operational log therefore carries the provider in
+# every sweep window. Silence here means the log does not ship.
+precondition:
+  all:
+    - field: event.provider
+      value: Microsoft-Windows-Windows Defender
+
+detection:
+  all:
+    # Event ids 1116 and 1117 are not unique across providers. The provider
+    # pin keeps another application log out of the match.
+    - field: event.provider
+      value: Microsoft-Windows-Windows Defender
+    - field: event.code
+      op: one_of
+      value: ["1116", "1117"]
+
+details:
+  - field: winlog.event_data.threat_name
+    label: threat
+  - field: winlog.event_data.Path
+    label: path
+  - field: winlog.event_data.Action Name
+    label: action
+
+severity:
+  field: winlog.event_data.Severity Name
+  map:
+    Severe: critical
+    High: high
+    Moderate: medium
+    Low: low
+
+attack:
+  - T1204
+
+false_positives:
+  - A tester deploys an EICAR file or another test file on purpose. The tester
+    announces the test in advance. This is the only benign case.
+  - A scanner writes test files to a share on the server.
+
+references:
+  - https://learn.microsoft.com/en-us/defender-endpoint/troubleshoot-microsoft-defender-antivirus
+  - https://attack.mitre.org/techniques/T1204/

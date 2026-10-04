@@ -51,7 +51,7 @@ describe('EntityGraph — naming what a node means', () => {
     // would just move the false claim somewhere less visible.
     const { container } = mount(PEERS, [], { kindLabels: { c2: 'external' } });
     const titles = Array.from(container.querySelectorAll('title')).map((t) => t.textContent);
-    expect(titles.some((t) => t?.includes('198.51.100.7 — external'))).toBe(true);
+    expect(titles.some((t) => t?.includes('198.51.100.7 · external'))).toBe(true);
     expect(titles.some((t) => t?.includes('C2'))).toBe(false);
   });
 });

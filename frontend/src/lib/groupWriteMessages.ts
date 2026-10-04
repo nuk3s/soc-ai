@@ -82,7 +82,8 @@ export function escalateMessage(r: EscalateGroupResult, groupName: string): stri
   const empty = r.empty_cases ?? [];
   const remaining = r.remaining ?? 0;
   const opened = r.escalated > 0 ? plural(r.escalated, 'case') : 'no cases';
-  const parts = [`Opened ${opened} for ${groupName}`];
+  const ids = (r.cases ?? []).map((c) => c.id);
+  const parts = [`Opened ${opened} for ${groupName}${ids.length ? `: ${ids.join(', ')}` : ''}`];
   if (r.failed > 0) parts.push(`${plural(r.failed, 'alert')} failed`);
   if (empty.length > 0) {
     // Security Onion made the case and attached nothing, so the alert is on no
@@ -107,4 +108,12 @@ export function escalateMessage(r: EscalateGroupResult, groupName: string): stri
     parts.push(`${plural(remaining, 'alert')} left${r.capped ? '. Press again to continue' : ''}`);
   }
   return parts.join(' · ');
+}
+
+/** The toast links for the cases an escalate opened. A case with no console
+ *  URL is named in the message and gets no link. */
+export function escalateLinks(r: EscalateGroupResult): Array<{ label: string; href: string }> {
+  return (r.cases ?? [])
+    .filter((c): c is { id: string; url: string } => !!c.url)
+    .map((c) => ({ label: `Open case ${c.id}`, href: c.url }));
 }

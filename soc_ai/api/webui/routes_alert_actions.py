@@ -6,6 +6,7 @@ import asyncio
 import logging
 from datetime import UTC, datetime
 from typing import Annotated, Any
+from urllib.parse import quote
 
 from elastic_transport import TransportError
 from elasticsearch import ApiError
@@ -14,6 +15,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from soc_ai.api.deps import get_elastic, get_settings_dep
 from soc_ai.api.security import identify_caller
+from soc_ai.api.webui._errors import oql_refusal
 from soc_ai.api.webui._shared import (
     _iso_z,
     router,
@@ -345,9 +347,7 @@ async def ack_group(
             # first write, so a grid failure here acknowledges nothing.
             matched = await _count_group(elastic, settings, body) if more else 0
     except OqlValidationError as exc:
-        raise HTTPException(
-            status_code=400, detail={"reason": "bad_oql", "hint": str(exc)}
-        ) from exc
+        raise oql_refusal(exc) from exc
     except (TimeoutError, TransportError) as exc:
         raise HTTPException(status_code=503, detail=_grid_unavailable(exc)) from exc
     except ApiError as exc:
@@ -487,6 +487,22 @@ async def _escalate_many(
     return escalated, failed, case_ids, empty_cases
 
 
+class EscalatedCase(BaseModel):
+    """One Security Onion case a press opened, and where the console shows it."""
+
+    id: str
+    # The case in Security Onion's console, built from ``so_host``. ``None``
+    # when the settings name no host to build it from.
+    url: str | None = None
+
+
+def _case_url(settings: Settings, case_id: str) -> str | None:
+    host = str(settings.so_host or "").rstrip("/")
+    if not host:
+        return None
+    return f"{host}/#/case/{quote(case_id, safe='')}"
+
+
 class EscalateGroupOut(BaseModel):
     escalated: int
     failed: int
@@ -514,6 +530,10 @@ class EscalateGroupOut(BaseModel):
     # case. Named so the operator can close or reuse them.
     empty_cases: list[str] = []
     remaining: int = 0
+    # The cases this press opened, one entry per distinct case id, in the order
+    # the writes returned them. The operator needs the id to find the case, and
+    # a toast that says "Opened 2 cases" with no id sends them searching.
+    cases: list[EscalatedCase] = []
 
 
 async def _existing_case_links(
@@ -654,9 +674,7 @@ async def escalate_group(
             events, handled, more = await _scan_group(elastic, settings, body, cap=_ESCALATE_CAP)
             matched = await _count_group(elastic, settings, body) if more else 0
     except OqlValidationError as exc:
-        raise HTTPException(
-            status_code=400, detail={"reason": "bad_oql", "hint": str(exc)}
-        ) from exc
+        raise oql_refusal(exc) from exc
     except (TimeoutError, TransportError) as exc:
         raise HTTPException(status_code=503, detail=_grid_unavailable(exc)) from exc
     except ApiError as exc:
@@ -708,6 +726,10 @@ async def escalate_group(
         unresolved=reserved.unresolved,
         empty_cases=empty_cases,
         remaining=remaining,
+        cases=[
+            EscalatedCase(id=case_id, url=_case_url(settings, case_id))
+            for case_id in dict.fromkeys(case_ids.values())
+        ],
     )
 
 

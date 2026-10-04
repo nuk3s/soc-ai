@@ -11,6 +11,7 @@ import re
 from collections.abc import Iterable
 from typing import Any
 
+from soc_ai.dossier.coverage import describe as describe_coverage
 from soc_ai.tools.get_alert_context import (
     ENDPOINT_COVERAGE_DATASET_ABSENT as _ENDPOINT_COVERAGE_DATASET_ABSENT,
 )
@@ -924,7 +925,28 @@ def _materialize_prefetch_evidence(alert_ctx: Any) -> list[str]:
             "here; a coverage gap, not exoneration (path prefetch_gaps.endpoint.coverage)"
         )
 
+    evidence.extend(_host_coverage_evidence(alert_ctx))
     return evidence
+
+
+def _host_coverage_evidence(alert_ctx: Any) -> list[str]:
+    """Host coverage bullets, per internal endpoint and in both directions.
+
+    The endpoint-coverage bullet says nothing for a covered host, and the
+    covered host is the one the synthesizer called "no host telemetry" when
+    Elastic Defend was the only plane it lacked. Each bullet names the planes
+    the host ships and the planes it does not ship, and cites the prefetch
+    entry it came from.
+    """
+    entries = getattr(alert_ctx, "host_coverage", None) or []
+    out: list[str] = []
+    for i, entry in enumerate(entries):
+        sentences = " ".join(describe_coverage(entry.coverage, subject=entry.ip))
+        out.append(f"host coverage: {sentences} (path host_coverage.{i}.coverage.read_ok)")
+    note = getattr(alert_ctx, "host_pivot_note", None)
+    if note and entries:
+        out.append(f"host pivot: {note} (path host_pivot_note)")
+    return out
 
 
 def _bundle_dump_text(alert_ctx: Any) -> str:

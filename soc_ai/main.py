@@ -23,9 +23,11 @@ from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.utils import is_body_allowed_for_status_code
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse, RedirectResponse, Response
 from starlette.types import Scope
@@ -1986,21 +1988,286 @@ _LOC_PARTS = frozenset({"body", "query", "path", "header", "cookie"})
 _HINT_VALUE_CHARS = 60
 
 
+def _bound(value: Any) -> str:
+    return str(int(value)) if isinstance(value, float) and value.is_integer() else str(value)
+
+
+def _bounded_sentence(field: str, kind: str, ctx: dict[str, Any]) -> str | None:
+    """The sentence for a value outside a length, size, number or choice bound."""
+    if kind == "string_too_long" and "max_length" in ctx:
+        return f"{field} must be at most {ctx['max_length']} characters."
+    if kind == "string_too_short" and "min_length" in ctx:
+        if ctx["min_length"] == 1:
+            return f"{field} is empty. Send a value."
+        return f"{field} must be at least {ctx['min_length']} characters."
+    if kind == "too_long" and "max_length" in ctx:
+        return f"{field} must hold at most {ctx['max_length']} items."
+    if kind == "too_short" and "min_length" in ctx:
+        return f"{field} must hold at least {ctx['min_length']} items."
+    if kind == "greater_than_equal" and "ge" in ctx:
+        return f"{field} must be {_bound(ctx['ge'])} or more."
+    if kind == "less_than_equal" and "le" in ctx:
+        return f"{field} must be {_bound(ctx['le'])} or less."
+    if kind == "greater_than" and "gt" in ctx:
+        return f"{field} must be more than {_bound(ctx['gt'])}."
+    if kind == "less_than" and "lt" in ctx:
+        return f"{field} must be less than {_bound(ctx['lt'])}."
+    if kind in {"literal_error", "enum"} and "expected" in ctx:
+        return f"{field} accepts one of these values: {ctx['expected']}."
+    return None
+
+
 def _validation_hint(err: dict[str, Any]) -> str:
-    """One sentence for one rejected field: what it is, what is wrong, what arrived."""
+    """One STE sentence for one rejected field: what it is and what it must be.
+
+    Built from the pydantic error ``type``. The raw ``msg`` read as noise in an
+    operator's toast: "0 jSON decode error; got '{}'" for a body that was not
+    JSON, "username field required; got '{}'" for a missing field.
+    """
     parts = [str(p) for p in (err.get("loc") or ()) if str(p) not in _LOC_PARTS]
-    field = ".".join(parts) or "the request"
-    message = str(err.get("msg") or "is not valid").strip()
-    if message:
-        message = message[0].lower() + message[1:]
-    if _SECRET_FIELD_RE.search(field):
-        return f"{field} {message}."
-    if "input" not in err:
-        return f"{field} {message}."
+    kind = str(err.get("type") or "")
+    ctx = err.get("ctx") or {}
+    if kind == "json_invalid":
+        return "The body is not valid JSON."
+    # A JSON body that is a list or a string where an object belongs.
+    if kind in {"model_attributes_type", "dict_type", "model_type"} and not parts:
+        return "The body must be a JSON object."
+    field = ".".join(p for p in parts if not p.isdigit()) or ".".join(parts)
+    if not field:
+        if kind == "missing":
+            return "The request body is required. Send a JSON object."
+        field = "The request"
+    if kind == "missing":
+        return f"{field} is required."
+    if kind == "extra_forbidden":
+        return f"{field} is not a known field. Remove it."
+    if kind in {"int_parsing", "int_type", "int_from_float"}:
+        return f"{field} must be a whole number."
+    if kind in {"float_parsing", "float_type", "decimal_parsing"}:
+        return f"{field} must be a number."
+    if kind in {"bool_parsing", "bool_type"}:
+        return f"{field} must be true or false."
+    if kind in {"string_type"}:
+        return f"{field} must be a string."
+    if kind in {"list_type"}:
+        return f"{field} must be a list."
+    sentence = _bounded_sentence(field, kind, ctx)
+    if sentence is None:
+        message = str(err.get("msg") or "").strip().rstrip(".")
+        if message.lower().startswith("value error, "):
+            message = message[len("value error, ") :]
+        sentence = f"{field} is not valid."
+        if message:
+            sentence += f" {message[0].upper()}{message[1:]}."
+    # The value is quoted so the analyst sees what arrived, with one exception:
+    # the rejected value of a credential field is the plaintext secret.
+    if _SECRET_FIELD_RE.search(field) or "input" not in err:
+        return sentence
     value = str(err.get("input"))
     if len(value) > _HINT_VALUE_CHARS:
         value = value[:_HINT_VALUE_CHARS] + "…"
-    return f"{field} {message}; got '{value}'"
+    return f"{sentence} soc-ai got '{value}'."
+
+
+# The largest request body soc-ai reads. No route takes an upload: the largest
+# body is a runbook, 64 Ki characters, well under this cap. A 20 MB JSON body
+# on /hunts/bulk-delete was parsed to the end while login refused at 8 KiB
+# (fleet 2026-10-01, RA19).
+_MAX_BODY_BYTES = 1024 * 1024
+# Tighter caps for named routes. Login is unauthenticated and sits in front of
+# the throttle, so it gets the smallest one.
+_ROUTE_BODY_CAPS: dict[str, int] = {"/api/v1/login": 8 * 1024}
+
+
+def _too_large(limit: int) -> JSONResponse:
+    size = f"{limit // 1024} KiB" if limit < 1024 * 1024 else f"{limit // (1024 * 1024)} MiB"
+    return JSONResponse(
+        status_code=413,
+        content={
+            "detail": {
+                "reason": "payload_too_large",
+                "hint": f"The request body is larger than {size}. soc-ai did not read it.",
+            }
+        },
+    )
+
+
+class _BodySizeCap:
+    """Refuse a request body over the cap, counted in bytes as it arrives.
+
+    A declared Content-Length over the cap is refused before any byte is read.
+    A body with no declared length is read up to the cap and then refused, so
+    the cap holds whatever framing a proxy in front chose. A body under the cap
+    is handed to the app unchanged.
+    """
+
+    def __init__(self, app: Any, max_bytes: int = _MAX_BODY_BYTES) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope: Scope, receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        limit = _ROUTE_BODY_CAPS.get(str(scope.get("path", "")), self.max_bytes)
+        headers = dict(scope.get("headers") or [])
+        declared = headers.get(b"content-length")
+        if declared is not None:
+            if declared.isdigit() and int(declared) > limit:
+                await _too_large(limit)(scope, receive, send)
+                return
+            await self.app(scope, receive, send)
+            return
+        if b"transfer-encoding" not in headers or scope.get("path") == "/api/v1/login":
+            # No body, or login: its own guard answers 411 to a body with no
+            # declared length without reading a byte of it.
+            await self.app(scope, receive, send)
+            return
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            message = await receive()
+            if message.get("type") != "http.request":
+                # A disconnect before the body ended: nothing to hand on.
+                return
+            body = message.get("body", b"")
+            total += len(body)
+            if total > limit:
+                await _too_large(limit)(scope, receive, send)
+                return
+            chunks.append(body)
+            if not message.get("more_body"):
+                break
+        buffered = b"".join(chunks)
+        replayed = False
+
+        async def replay() -> Any:
+            nonlocal replayed
+            if not replayed:
+                replayed = True
+                return {"type": "http.request", "body": buffered, "more_body": False}
+            return await receive()
+
+        await self.app(scope, replay, send)
+
+
+# The API prefix every refusal shape rule below applies to. Routes outside it
+# (/healthz, /investigate, the SPA under /app) keep their own answers.
+_API_V1_PREFIX = "/api/v1/"
+
+# The default hint for a refusal that names a reason and no hint. A bare
+# {"reason": "not_found"} on a red toast told the operator nothing, and the
+# 2026-10-01 fleet found more than a dozen of them. A route that knows more
+# writes its own hint; this table is the floor under the rest.
+_REASON_HINTS: dict[str, str] = {
+    "admin_required": "This action needs the admin role. Ask an admin to do it.",
+    "already_applied": "This proposal is already applied. Reload the page.",
+    "bad_token": "The confirmation token does not match. Reload the page and try again.",
+    "chat_busy": "The chat is answering an earlier message. Wait for the answer, then send again.",
+    "empty_message": "The message is empty. Type a message and send it again.",
+    "finding_not_found": "The hunt has no finding with this id. Reload the hunt.",
+    "hunt_not_found": "soc-ai has no hunt with this id. Check the hunt id.",
+    "malformed_proposal": "The proposal is not complete. Ask the chat for a new proposal.",
+    "no_session": "Sign in first. This route needs a session.",
+    "no_such_action": "The investigation has no action at this index. Reload the investigation.",
+    "not_applyable": "This proposal cannot be applied. Ask the chat for a new proposal.",
+    "planning_failed": "soc-ai could not plan the sweep. Check the server log and try again.",
+    "proposal_not_found": "soc-ai has no proposal with this id. Reload the chat.",
+    "still_running": "The run is still in progress. Wait for it to finish, then try again.",
+}
+
+# The noun a 404 names, read off the first path segment after /api/v1/.
+_PATH_NOUNS: dict[str, str] = {
+    "investigations": "investigation",
+    "hunts": "hunt",
+    "analyst": "investigation",
+    "backtest": "backtest run",
+    "runbooks": "runbook",
+    "leads": "lead",
+    "analytics": "analytic",
+    "detections": "detection",
+    "identifiers": "identifier",
+    "users": "user",
+    "tokens": "token",
+    "notifications": "notification",
+    "dossiers": "dossier",
+    "events": "event",
+}
+
+# The reason a refusal gets when the route raised a bare string, by status.
+_STATUS_REASONS: dict[int, str] = {
+    400: "bad_request",
+    401: "unauthorized",
+    403: "forbidden",
+    404: "not_found",
+    405: "method_not_allowed",
+    409: "conflict",
+    411: "length_required",
+    413: "payload_too_large",
+    422: "bad_request",
+    429: "rate_limited",
+    500: "server_error",
+    502: "upstream_error",
+    503: "unavailable",
+    504: "upstream_timeout",
+}
+
+
+def _default_hint(status: int, reason: str, path: str) -> str:
+    """One STE sentence for a refusal that came with no hint of its own."""
+    if reason in _REASON_HINTS:
+        return _REASON_HINTS[reason]
+    if status == 404:
+        segment = path[len(_API_V1_PREFIX) :].split("/", 1)[0]
+        noun = _PATH_NOUNS.get(segment)
+        if noun:
+            return f"soc-ai has no {noun} with this id. Check the id in the address."
+        return "soc-ai has no record at this address. Check the id in the address."
+    if status == 401:
+        return "Sign in and try again."
+    if status == 403:
+        return "Your role does not allow this action."
+    if status == 409:
+        return "The record changed state. Reload it and try again."
+    if status >= 500:
+        return "soc-ai could not complete the request. Check the server log and try again."
+    return "The request is not valid. Check the values and try again."
+
+
+def _sentence(text: str) -> str:
+    """A bare-string detail as one sentence: capital first letter, final period."""
+    text = text.strip()
+    if not text:
+        return text
+    text = text[0].upper() + text[1:]
+    return text if text.endswith((".", "!", "?")) else text + "."
+
+
+def _api_refusal_detail(status: int, detail: Any, path: str, method: str) -> Any:
+    """The ``{"reason", "hint"}`` shape for any refusal under /api/v1.
+
+    Three shapes reached clients before this: a dict with a hint (the good
+    one), a dict with a reason and no hint, and a bare string. The router's own
+    404 for an unknown path was the bare string "Not Found".
+    """
+    if isinstance(detail, dict):
+        reason = detail.get("reason")
+        if isinstance(reason, str) and not detail.get("hint"):
+            return {**detail, "hint": _default_hint(status, reason, path)}
+        return detail
+    if status == 404 and detail == "Not Found":
+        return {
+            "reason": "unknown_route",
+            "hint": "soc-ai has no API route at this address. Check the path.",
+        }
+    if status == 405 and detail == "Method Not Allowed":
+        return {
+            "reason": "method_not_allowed",
+            "hint": f"This route does not accept the {method} method.",
+        }
+    reason = _STATUS_REASONS.get(status, "error")
+    hint = _sentence(detail) if isinstance(detail, str) and detail.strip() else ""
+    return {"reason": reason, "hint": hint or _default_hint(status, reason, path)}
 
 
 def create_app() -> FastAPI:  # noqa: PLR0915 - app factory wires many middlewares + routers
@@ -2045,13 +2312,31 @@ def create_app() -> FastAPI:  # noqa: PLR0915 - app factory wires many middlewar
         reporters, browser devtools history. A field whose name looks like a
         credential is reported without its value.
         """
-        hints = [_validation_hint(err) for err in exc.errors()]
-        hint = hints[0] if hints else "The request is not valid."
-        if len(hints) > 1:
-            hint = f"{hint} {len(hints) - 1} more fields are not valid."
+        hints = list(dict.fromkeys(_validation_hint(err) for err in exc.errors()))
+        hint = " ".join(hints[:3]) if hints else "The request is not valid."
+        if len(hints) > 3:
+            hint = f"{hint} {len(hints) - 3} more fields are not valid."
         return JSONResponse(
             status_code=422,
             content={"detail": jsonable_encoder({"reason": "bad_request", "hint": hint})},
+        )
+
+    @app.exception_handler(StarletteHTTPException)
+    async def _api_refusal_shape(request: Request, exc: StarletteHTTPException) -> Response:
+        """Every refusal under /api/v1 answers ``{"detail": {"reason", "hint"}}``.
+
+        Routes outside the API prefix keep FastAPI's own answer.
+        """
+        path = request.url.path
+        if not path.startswith(_API_V1_PREFIX) or not is_body_allowed_for_status_code(
+            exc.status_code
+        ):
+            return await http_exception_handler(request, exc)
+        detail = _api_refusal_detail(exc.status_code, exc.detail, path, request.method)
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": jsonable_encoder(detail)},
+            headers=getattr(exc, "headers", None),
         )
 
     try:
@@ -2198,7 +2483,7 @@ def create_app() -> FastAPI:  # noqa: PLR0915 - app factory wires many middlewar
                     content={
                         "detail": {
                             "reason": "payload_too_large",
-                            "hint": "Login request body too large.",
+                            "hint": "The login body is larger than 8 KiB. soc-ai did not read it.",
                         }
                     },
                 )
@@ -2256,6 +2541,10 @@ def create_app() -> FastAPI:  # noqa: PLR0915 - app factory wires many middlewar
                     )
             response: Response = await call_next(request)
             return response
+
+    # Added last, so it is the outermost layer and runs before any other
+    # middleware reads the body.
+    app.add_middleware(_BodySizeCap)
 
     app.include_router(router)
     # Open (pre-auth) endpoints first so FastAPI resolves /api/v1/login before

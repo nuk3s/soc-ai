@@ -14,6 +14,7 @@ from fastapi import Depends, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict
 
 from soc_ai.api.deps import get_elastic, get_settings_dep
+from soc_ai.api.webui._errors import api_error, oql_refusal
 from soc_ai.api.webui._shared import (
     _ago,
     _inv_ago,
@@ -45,7 +46,10 @@ _OQL_Q_MAXLEN = 2048
 # the next attempt genuinely may succeed — and it must stay on those classes.
 _GRID_UNAVAILABLE = {
     "reason": "grid_unavailable",
-    "hint": ("The Security Onion grid (Elasticsearch) is slow or unreachable — retry shortly."),
+    "hint": (
+        "The Security Onion grid did not answer. Elasticsearch is slow or unreachable. "
+        "Retry shortly."
+    ),
 }
 
 # An Elasticsearch exception TYPE token, e.g. ``circuit_breaking_exception``.
@@ -99,6 +103,57 @@ def _partial_read_hint(exc: GridPartialResultsError) -> str:
         "unknown. Repeating the search returns the same partial read until Elasticsearch "
         "shard health recovers; check the cluster's shard allocation."
     )
+
+
+def _check_filters(
+    *,
+    range_: str,
+    from_: str | None,
+    to: str | None,
+    severity: str | None = None,
+    sort: str | None = None,
+) -> None:
+    """Refuse a filter value the queue does not know, with the accepted values.
+
+    Each of these used to fall back without a word: ``range=7days`` read the
+    default 24 hours, ``severity=garbage`` read every severity and
+    ``sort=bogus`` read by count. The page then answered for a window or a
+    severity nobody asked for, and the empty-reason route called the grid
+    quiet. "custom" is the console's own marker for an absolute window and
+    needs both bounds.
+    """
+    if (from_ is None) != (to is None):
+        raise api_error(422, "bad_time", "Send both from and to for a custom window.")
+    if range_ == "custom":
+        if from_ is None:
+            raise api_error(
+                422, "bad_time", "range custom needs from and to. Send both timestamps."
+            )
+    elif range_ not in aq.TIME_RANGES:
+        raise api_error(
+            422,
+            "bad_range",
+            f"range accepts one of these values: {', '.join(aq.TIME_RANGES)}. "
+            "For a custom window, send from and to.",
+        )
+    if severity and severity not in aq.SELECTABLE_SEVERITIES:
+        raise api_error(
+            422,
+            "bad_severity",
+            f"severity accepts one of these values: {', '.join(aq.SELECTABLE_SEVERITIES)}. "
+            "Leave it out for every severity.",
+        )
+    if sort is not None and sort not in aq.GROUP_SORTS:
+        raise api_error(
+            422,
+            "bad_sort",
+            f"sort accepts one of these values: {', '.join(aq.GROUP_SORTS)}.",
+        )
+
+
+def _check_rule_name(rule_name: str) -> None:
+    if not rule_name.strip():
+        raise api_error(422, "bad_request", "rule_name is required. Send the detection name.")
 
 
 def _grid_unavailable(exc: BaseException | None = None) -> dict[str, str]:
@@ -311,7 +366,8 @@ def _inherited_reason(inv: Investigation) -> str:
     when = _ago(inv.created_at.isoformat()) if inv.created_at else "?"
     flow = f" on {inv.src_ip or '?'} → {inv.dest_ip or '?'}" if (inv.src_ip or inv.dest_ip) else ""
     return (
-        f"Inherited — same detection, investigated {when} ago{flow} (investigation {inv.id[:8]}…)"
+        f"Inherited from the same detection, investigated {when} ago{flow}. "
+        f"Investigation {inv.id[:8]}…"
     )
 
 
@@ -363,6 +419,7 @@ async def list_alerts(
     Rules an operator has muted (detection tuning) are EXCLUDED from the default
     feed; pass ``include_muted=true`` to show them (each flagged ``muted: true``).
     """
+    _check_filters(range_=range_, from_=from_, to=to, severity=severity, sort=sort)
     try:
         async with asyncio.timeout(settings.webui_grid_timeout_s):
             page = await aq.fetch_groups(
@@ -378,9 +435,7 @@ async def list_alerts(
                 hide_acked=hide_acked,
             )
     except OqlValidationError as exc:
-        raise HTTPException(
-            status_code=400, detail={"reason": "bad_oql", "hint": str(exc)}
-        ) from exc
+        raise oql_refusal(exc) from exc
     except (TimeoutError, TransportError) as exc:
         # Fail fast with a clean error instead of hanging the console while the
         # ES client retries a slow/unreachable Security Onion grid.
@@ -532,7 +587,7 @@ class AlertsEmptyReasonOut(BaseModel):
 
 
 _QUIET_HINT = (
-    "No alert label matches anything in this window. The grid is quiet, not misconfigured."
+    "No alert label matches anything in this window. The grid is quiet. The configuration is sound."
 )
 
 
@@ -560,6 +615,7 @@ async def alerts_empty_reason(
     absolute window, which is the caller's bug and 400s exactly as the list
     route 400s it.
     """
+    _check_filters(range_=range_, from_=from_, to=to)
     # Tell the two OQL failures apart before they blur into one hint: parse the
     # configured filter on its own first, so a rejection there is unambiguously
     # the filter. Anything the counting call then rejects is the caller's
@@ -594,9 +650,7 @@ async def alerts_empty_reason(
                 time_zone=settings.so_timezone,
             )
     except OqlValidationError as exc:
-        raise HTTPException(
-            status_code=400, detail={"reason": "bad_oql", "hint": str(exc)}
-        ) from exc
+        raise oql_refusal(exc) from exc
     except (TimeoutError, TransportError) as exc:
         return AlertsEmptyReasonOut(reason="unknown", hint=_grid_unavailable(exc)["hint"])
     except ApiError as exc:
@@ -664,6 +718,8 @@ async def list_group_events(
     """Flat events for one detection group, newest first (the row-expand view).
 
     Paginate large groups with ``size`` + ``offset`` ("load more")."""
+    _check_rule_name(rule_name)
+    _check_filters(range_=range_, from_=from_, to=to, severity=severity)
     try:
         async with asyncio.timeout(settings.webui_grid_timeout_s):
             events = await aq.fetch_group_events(
@@ -682,9 +738,7 @@ async def list_group_events(
                 time_zone=settings.so_timezone,
             )
     except OqlValidationError as exc:
-        raise HTTPException(
-            status_code=400, detail={"reason": "bad_oql", "hint": str(exc)}
-        ) from exc
+        raise oql_refusal(exc) from exc
     except (TimeoutError, TransportError) as exc:
         raise HTTPException(status_code=503, detail=_grid_unavailable(exc)) from exc
     except ApiError as exc:
@@ -859,6 +913,8 @@ async def get_representative(
     client's retry budget (~90 s at shipped defaults) while the analyst waited
     on the button that opens an investigation.
     """
+    _check_rule_name(rule_name)
+    _check_filters(range_=range_, from_=from_, to=to, severity=severity)
     try:
         async with asyncio.timeout(settings.webui_grid_timeout_s):
             events = await aq.fetch_group_events(
@@ -876,9 +932,7 @@ async def get_representative(
                 time_zone=settings.so_timezone,
             )
     except OqlValidationError as exc:
-        raise HTTPException(
-            status_code=400, detail={"reason": "bad_oql", "hint": str(exc)}
-        ) from exc
+        raise oql_refusal(exc) from exc
     except (TimeoutError, TransportError) as exc:
         raise HTTPException(status_code=503, detail=_grid_unavailable(exc)) from exc
     except ApiError as exc:

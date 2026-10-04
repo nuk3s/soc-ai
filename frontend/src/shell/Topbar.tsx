@@ -1,5 +1,5 @@
-import { Bell, Check, ChevronDown, HelpCircle, Search, Settings, X } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { Bell, Check, ChevronDown, HelpCircle, Network, Search, Settings, X } from 'lucide-react';
+import { type RefObject, useEffect, useRef, useState } from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import { DevBadge, SyntheticEvalBadge } from '../components/Badges';
 import {
@@ -11,12 +11,14 @@ import {
 } from '../lib/api';
 import {
   NOTIFICATIONS_DISMISSED_EVENT,
+  NO_NOTIFICATIONS,
   dismissNotification,
   formatNotificationTitle,
   formatNotificationWhen,
   getDismissed,
 } from '../lib/notifications';
 import type { Notification, Workspace } from '../lib/types';
+import { useSession } from './Session';
 import { useShell } from './ShellContext';
 
 const TONE: Record<Notification['tone'], string> = {
@@ -24,6 +26,37 @@ const TONE: Record<Notification['tone'], string> = {
   warn: '#f5a623',
   accent: '#4b8bf5',
 };
+
+// An IPv4 or IPv6 literal. A workspace named for its grid address used to show
+// the first digit as its avatar ("1"), which reads as a count (RD15).
+const IP_NAME = /^(\d{1,3}(\.\d{1,3}){3}(:\d+)?|\[?[0-9a-f]{0,4}(:[0-9a-f]{0,4}){2,7}\]?(:\d+)?)$/i;
+
+/** The avatar glyph for a workspace: its first letter, or a network glyph when
+ *  the name is an address. */
+export function WorkspaceGlyph({ name, size = 11 }: { name: string; size?: number }) {
+  if (!name) return <>?</>;
+  if (IP_NAME.test(name.trim())) {
+    return (
+      <span aria-hidden="true" data-testid="ws-glyph-ip" className="flex">
+        <Network size={size} />
+      </span>
+    );
+  }
+  return <>{name[0].toUpperCase()}</>;
+}
+
+/** The panel header line for the bell: the badge counts only the rows that ask
+ *  for action, so the header says how the two numbers relate (D4, RD8). */
+export function notificationSummary(total: number, actionable: number): string {
+  const rest = total - actionable;
+  const head = actionable > 0 ? `${actionable} need${actionable === 1 ? 's' : ''} attention` : 'None need attention';
+  return rest > 0 ? `${head} · ${rest} more` : head;
+}
+
+function isInside(target: EventTarget | null, refs: RefObject<HTMLElement | null>[]): boolean {
+  if (!(target instanceof Node)) return false;
+  return refs.some((r) => r.current?.contains(target));
+}
 
 function useBreadcrumb(): { crumb: string; crumb2?: string } {
   const { pathname } = useLocation();
@@ -34,7 +67,7 @@ function useBreadcrumb(): { crumb: string; crumb2?: string } {
   if (pathname.startsWith('/investigation')) return { crumb: 'Investigation', crumb2: params.id };
   if (pathname.startsWith('/hunts') && params.id) return { crumb: 'Hunts', crumb2: params.id };
   if (pathname.startsWith('/hunts')) return { crumb: 'Hunts' };
-  if (pathname.startsWith('/hosts') && params.ip) return { crumb: 'Hosts', crumb2: params.ip };
+  if (pathname.startsWith('/hosts') && params.key) return { crumb: 'Hosts', crumb2: params.key };
   if (pathname.startsWith('/hosts')) return { crumb: 'Hosts' };
   if (pathname.startsWith('/notifications')) return { crumb: 'Notifications' };
   if (pathname.startsWith('/backtest')) return { crumb: 'Backtest' };
@@ -45,6 +78,9 @@ function useBreadcrumb(): { crumb: string; crumb2?: string } {
 
 export function Topbar() {
   const { openPalette, ws, setWs } = useShell();
+  // Every read below is a protected endpoint. Hold them until /me answers, so
+  // a signed-out visit does not fire a burst of 401s before the redirect (D14).
+  const ready = useSession().status === 'ready';
   const { crumb, crumb2 } = useBreadcrumb();
   const navigate = useNavigate();
   const [wsOpen, setWsOpen] = useState(false);
@@ -56,6 +92,7 @@ export function Topbar() {
   const [healthFailed, setHealthFailed] = useState(false);
 
   useEffect(() => {
+    if (!ready) return;
     let alive = true;
     getWorkspaces()
       .then((list) => {
@@ -100,7 +137,7 @@ export function Topbar() {
       window.removeEventListener(NOTIFICATIONS_DISMISSED_EVENT, load);
       stopNeedsYou();
     };
-  }, []);
+  }, [ready]);
 
   const handleDismiss = (id: string) => {
     dismissNotification(id);
@@ -116,6 +153,7 @@ export function Topbar() {
   // Poll upstream health (ES / model gateway / Security Onion API / PCAP) for
   // the status indicator.
   useEffect(() => {
+    if (!ready) return;
     let alive = true;
     const tick = () =>
       getHealth()
@@ -145,7 +183,7 @@ export function Topbar() {
       clearInterval(t);
       document.removeEventListener('visibilitychange', onVisible);
     };
-  }, []);
+  }, [ready]);
 
   // Every component the pill's one word speaks for. `so` covers the Security
   // Onion web API, the path every acknowledge, escalate and case write takes.
@@ -162,26 +200,65 @@ export function Topbar() {
   const healthColor = healthFailed ? '#f5a623' : health === null ? '#6b7484' : healthOk ? '#3fb950' : '#f5a623';
 
   const menusOpen = wsOpen || notifOpen || healthOpen;
-  const closeMenus = () => {
-    setWsOpen(false);
-    setNotifOpen(false);
-    setHealthOpen(false);
-  };
+
+  const wsBtnRef = useRef<HTMLButtonElement>(null);
+  const wsPanelRef = useRef<HTMLDivElement>(null);
+  const notifBtnRef = useRef<HTMLButtonElement>(null);
+  const notifPanelRef = useRef<HTMLDivElement>(null);
+  const healthBtnRef = useRef<HTMLButtonElement>(null);
+  const healthPanelRef = useRef<HTMLDivElement>(null);
+
+  // Outside click and Escape close the open dropdown. This used to be a
+  // `fixed inset-0` click-catcher inside this bar, and the bar's backdrop blur
+  // makes it the containing block for fixed children, so the catcher covered
+  // the 52 px strip only. A click on the page did nothing, and the open panel
+  // sat over "Clear all" and "Test LLM" (D5, RC9, RD6). A document listener
+  // has no layer to clip and covers nothing.
+  useEffect(() => {
+    if (!menusOpen) return;
+    const keep = [wsBtnRef, wsPanelRef, notifBtnRef, notifPanelRef, healthBtnRef, healthPanelRef];
+    const close = () => {
+      setWsOpen(false);
+      setNotifOpen(false);
+      setHealthOpen(false);
+    };
+    const onDown = (e: MouseEvent) => {
+      if (!isInside(e.target, keep)) close();
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      const opener = notifOpen ? notifBtnRef : healthOpen ? healthBtnRef : wsBtnRef;
+      close();
+      opener.current?.focus();
+    };
+    document.addEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [menusOpen, notifOpen, healthOpen]);
 
   // The badge is a call to action, so it counts only items that ARE one:
   // danger (true positives) and warn (needs-info, hunts with findings,
   // dependency-down). `accent` completions — the "FP closed itself" firehose —
   // stay in the dropdown and on /notifications but never light the badge.
   const actionable = notifs.filter((n) => n.tone !== 'accent');
+  const bellName =
+    actionable.length > 0 ? `Notifications, ${actionable.length} need${actionable.length === 1 ? 's' : ''} attention` : 'Notifications';
 
   return (
     <div className="relative z-30 flex h-[52px] flex-none items-center gap-[11px] border-b border-border bg-[rgba(11,14,19,.7)] py-0 pl-4 pr-3.5 backdrop-blur-[8px]">
       {/* workspace switcher — dropdown only when >1 workspace exists */}
       {workspaces.length > 1 ? (
         <button
+          ref={wsBtnRef}
+          aria-haspopup="dialog"
+          aria-expanded={wsOpen}
           onClick={() => {
             setWsOpen((o) => !o);
             setNotifOpen(false);
+            setHealthOpen(false);
           }}
           title="Switch workspace"
           className="flex flex-none items-center gap-2 rounded-control border border-border-2 bg-surface-1 px-[9px] py-[5px] hover:border-border-strong"
@@ -190,7 +267,7 @@ export function Topbar() {
             className="flex h-5 w-5 items-center justify-center rounded-[5px] text-[10px] font-bold text-white"
             style={{ background: 'linear-gradient(135deg,#4b8bf5,#2c5fd0)' }}
           >
-            {ws ? ws[0] : '?'}
+            <WorkspaceGlyph name={ws} />
           </div>
           <span className="whitespace-nowrap text-[12.5px] font-semibold">{ws || '…'}</span>
           <span className="flex text-faint">
@@ -206,9 +283,55 @@ export function Topbar() {
             className="flex h-5 w-5 items-center justify-center rounded-[5px] text-[10px] font-bold text-white"
             style={{ background: 'linear-gradient(135deg,#4b8bf5,#2c5fd0)' }}
           >
-            {ws ? ws[0] : '?'}
+            <WorkspaceGlyph name={ws} />
           </div>
           <span className="whitespace-nowrap text-[12.5px] font-semibold">{ws || '…'}</span>
+        </div>
+      )}
+
+      {/* workspace dropdown — only shown when multiple workspaces exist */}
+      {wsOpen && workspaces.length > 1 && (
+        <div ref={wsPanelRef} role="dialog" aria-label="Workspaces" className="absolute left-3.5 top-12 z-[33] w-64 animate-fadeUp rounded-panel border border-border-input bg-surface-card p-1.5 shadow-dropdown">
+          <div className="px-[9px] pb-1.5 pt-[7px] text-[10px] font-semibold uppercase tracking-[.06em] text-faint">
+            Workspaces
+          </div>
+          {workspaces.map((w) => (
+            <button
+              key={w.name}
+              onClick={() => {
+                setWs(w.name);
+                setWsOpen(false);
+              }}
+              className="flex w-full items-center gap-[9px] rounded-control px-[9px] py-2 hover:bg-[#141b25]"
+            >
+              <div
+                className="flex h-[23px] w-[23px] items-center justify-center rounded-badge border border-border-strong text-[10.5px] font-bold text-text-2"
+                style={{ background: 'linear-gradient(135deg,#3a4250,#22272f)' }}
+              >
+                <WorkspaceGlyph name={w.name} size={12} />
+              </div>
+              <div className="min-w-0 flex-1 truncate text-left text-[12.5px] font-semibold">{w.name}</div>
+              <span
+                className="h-[7px] w-[7px] rounded-full"
+                title={w.env}
+                style={{ background: w.env === 'prod' ? '#3fb950' : '#f5a623' }}
+              />
+              {w.name === ws && (
+                <span className="flex text-accent">
+                  <Check size={14} />
+                </span>
+              )}
+            </button>
+          ))}
+          <div className="mt-[5px] border-t border-border-2 pt-[5px]">
+            <div className="flex w-full cursor-default items-center gap-[9px] rounded-control px-[9px] py-2 text-[12.5px] text-faint">
+              <span className="flex w-[23px] justify-center">
+                <Settings size={14} />
+              </span>
+              <span className="flex-1 text-left">Manage workspaces</span>
+              <DevBadge />
+            </div>
+          </div>
         </div>
       )}
 
@@ -243,6 +366,9 @@ export function Topbar() {
 
       {/* upstream health (ES / LLM / PCAP) */}
       <button
+        ref={healthBtnRef}
+        aria-haspopup="dialog"
+        aria-expanded={healthOpen}
         onClick={() => {
           setHealthOpen((o) => !o);
           setWsOpen(false);
@@ -257,15 +383,65 @@ export function Topbar() {
         />
         {healthFailed ? 'unreachable' : health === null ? 'checking…' : healthOk ? 'connected' : `${healthDown} degraded`}
       </button>
+      {/* health dropdown: ES / LLM / Security Onion / PCAP, with the PCAP hint */}
+      {healthOpen && (
+        <div
+          ref={healthPanelRef}
+          role="dialog"
+          aria-label="Upstream health"
+          className="absolute right-[150px] top-12 z-[33] w-[360px] animate-fadeUp overflow-hidden rounded-panel border border-border-input bg-surface-card shadow-dropdown">
+          <div className="border-b border-border-2 px-3.5 py-3 text-[13px] font-semibold">
+            Upstream health
+          </div>
+          {healthFailed && (
+            <div className="px-3.5 py-6 text-center text-[12px] text-warn">The API is unreachable. Retrying…</div>
+          )}
+          {!healthFailed && health === null && (
+            <div className="px-3.5 py-6 text-center text-[12px] text-faint">Checking…</div>
+          )}
+          {([
+            ['Elasticsearch', health?.es],
+            ['LLM gateway', health?.llm],
+            ['Security Onion API', health?.so],
+            ['PCAP (sensor)', health?.pcap],
+          ] as const).map(([label, c]) =>
+            c == null ? null : (
+              <div key={label} className="flex gap-2.5 border-b border-border-faint px-3.5 py-[11px] last:border-0">
+                <span
+                  className="mt-[5px] h-[7px] w-[7px] flex-none rounded-full"
+                  style={{ background: c.ok ? '#3fb950' : '#f5a623', boxShadow: `0 0 7px ${c.ok ? '#3fb950' : '#f5a623'}` }}
+                />
+                <div className="min-w-0 flex-1">
+                  <div className="text-[12.5px] font-semibold">
+                    {label} <span className={c.ok ? 'text-success' : 'text-warn'}>{c.ok ? 'ok' : 'down'}</span>
+                  </div>
+                  <div className="mt-0.5 break-words font-mono text-[10.5px] leading-[1.5] text-faint">
+                    {c.detail}
+                  </div>
+                </div>
+              </div>
+            )
+          )}
+          {health?.pcap == null && health !== null && (
+            <div className="px-3.5 py-2.5 font-mono text-[10.5px] text-faint">
+              PCAP fetch is off. The setting pcap_enabled is false.
+            </div>
+          )}
+        </div>
+      )}
 
       {/* notifications */}
       <button
+        ref={notifBtnRef}
+        aria-haspopup="dialog"
+        aria-expanded={notifOpen}
         onClick={() => {
           setNotifOpen((o) => !o);
           setWsOpen(false);
+          setHealthOpen(false);
         }}
-        title="Notifications"
-        aria-label="Notifications"
+        title={bellName}
+        aria-label={bellName}
         className="relative flex h-[34px] w-[34px] flex-none items-center justify-center rounded-control border border-border-2 text-dim hover:border-border-strong hover:text-text"
       >
         <Bell size={16} />
@@ -279,71 +455,26 @@ export function Topbar() {
         )}
       </button>
 
-      {/* help */}
-      <button
-        onClick={openPalette}
-        title="Help & shortcuts"
-        aria-label="Help and shortcuts"
-        className="flex h-[34px] w-[34px] flex-none items-center justify-center rounded-control border border-border-2 text-dim hover:border-border-strong hover:text-text"
-      >
-        <HelpCircle size={16} />
-      </button>
-
-      {/* click-catcher */}
-      {menusOpen && <div onClick={closeMenus} className="fixed inset-0 z-[31]" />}
-
-      {/* workspace dropdown — only shown when multiple workspaces exist */}
-      {wsOpen && workspaces.length > 1 && (
-        <div className="absolute left-3.5 top-12 z-[33] w-64 animate-fadeUp rounded-panel border border-border-input bg-surface-card p-1.5 shadow-dropdown">
-          <div className="px-[9px] pb-1.5 pt-[7px] text-[10px] font-semibold uppercase tracking-[.06em] text-faint">
-            Workspaces
-          </div>
-          {workspaces.map((w) => (
-            <button
-              key={w.name}
-              onClick={() => {
-                setWs(w.name);
-                setWsOpen(false);
-              }}
-              className="flex w-full items-center gap-[9px] rounded-control px-[9px] py-2 hover:bg-[#141b25]"
-            >
-              <div
-                className="flex h-[23px] w-[23px] items-center justify-center rounded-badge border border-border-strong text-[10.5px] font-bold text-text-2"
-                style={{ background: 'linear-gradient(135deg,#3a4250,#22272f)' }}
-              >
-                {w.name[0]}
-              </div>
-              <div className="min-w-0 flex-1 truncate text-left text-[12.5px] font-semibold">{w.name}</div>
-              <span
-                className="h-[7px] w-[7px] rounded-full"
-                title={w.env}
-                style={{ background: w.env === 'prod' ? '#3fb950' : '#f5a623' }}
-              />
-              {w.name === ws && (
-                <span className="flex text-accent">
-                  <Check size={14} />
-                </span>
-              )}
-            </button>
-          ))}
-          <div className="mt-[5px] border-t border-border-2 pt-[5px]">
-            <div className="flex w-full cursor-default items-center gap-[9px] rounded-control px-[9px] py-2 text-[12.5px] text-faint">
-              <span className="flex w-[23px] justify-center">
-                <Settings size={14} />
-              </span>
-              <span className="flex-1 text-left">Manage workspaces</span>
-              <DevBadge />
-            </div>
-          </div>
-        </div>
-      )}
-
+      {/* The panel follows the bell in the DOM so Tab reaches its rows before
+          the Help button (D6, RD8). It is absolute, so the order does not move
+          it on screen. */}
       {/* notifications dropdown */}
       {notifOpen && (
-        <div className="absolute right-[46px] top-12 z-[33] w-[332px] animate-fadeUp overflow-hidden rounded-panel border border-border-input bg-surface-card shadow-dropdown">
-          <div className="border-b border-border-2 px-3.5 py-3 text-[13px] font-semibold">Notifications</div>
+        <div
+          ref={notifPanelRef}
+          role="dialog"
+          aria-label="Notifications"
+          className="absolute right-[46px] top-12 z-[33] w-[332px] animate-fadeUp overflow-hidden rounded-panel border border-border-input bg-surface-card shadow-dropdown">
+          <div className="flex items-baseline gap-2 border-b border-border-2 px-3.5 py-3">
+            <span className="text-[13px] font-semibold">Notifications</span>
+            {notifs.length > 0 && (
+              <span data-testid="notif-summary" className="ml-auto text-[11.5px] text-faint">
+                {notificationSummary(notifs.length, actionable.length)}
+              </span>
+            )}
+          </div>
           {notifs.length === 0 && (
-            <div className="px-3.5 py-6 text-center text-[12px] text-faint">No notifications.</div>
+            <div className="px-3.5 py-6 text-center text-[12px] text-faint">{NO_NOTIFICATIONS}</div>
           )}
           {notifs.map((nt) => {
             const body = (
@@ -420,48 +551,16 @@ export function Topbar() {
         </div>
       )}
 
-      {/* health dropdown: ES / LLM / Security Onion / PCAP, with the PCAP hint */}
-      {healthOpen && (
-        <div className="absolute right-[150px] top-12 z-[33] w-[360px] animate-fadeUp overflow-hidden rounded-panel border border-border-input bg-surface-card shadow-dropdown">
-          <div className="border-b border-border-2 px-3.5 py-3 text-[13px] font-semibold">
-            Upstream health
-          </div>
-          {healthFailed && (
-            <div className="px-3.5 py-6 text-center text-[12px] text-warn">The API is unreachable. Retrying…</div>
-          )}
-          {!healthFailed && health === null && (
-            <div className="px-3.5 py-6 text-center text-[12px] text-faint">Checking…</div>
-          )}
-          {([
-            ['Elasticsearch', health?.es],
-            ['LLM gateway', health?.llm],
-            ['Security Onion API', health?.so],
-            ['PCAP (sensor)', health?.pcap],
-          ] as const).map(([label, c]) =>
-            c == null ? null : (
-              <div key={label} className="flex gap-2.5 border-b border-border-faint px-3.5 py-[11px] last:border-0">
-                <span
-                  className="mt-[5px] h-[7px] w-[7px] flex-none rounded-full"
-                  style={{ background: c.ok ? '#3fb950' : '#f5a623', boxShadow: `0 0 7px ${c.ok ? '#3fb950' : '#f5a623'}` }}
-                />
-                <div className="min-w-0 flex-1">
-                  <div className="text-[12.5px] font-semibold">
-                    {label} <span className={c.ok ? 'text-success' : 'text-warn'}>{c.ok ? 'ok' : 'down'}</span>
-                  </div>
-                  <div className="mt-0.5 break-words font-mono text-[10.5px] leading-[1.5] text-faint">
-                    {c.detail}
-                  </div>
-                </div>
-              </div>
-            )
-          )}
-          {health?.pcap == null && health !== null && (
-            <div className="px-3.5 py-2.5 font-mono text-[10.5px] text-faint">
-              PCAP fetch is off. The setting pcap_enabled is false.
-            </div>
-          )}
-        </div>
-      )}
+      {/* help */}
+      <button
+        onClick={openPalette}
+        title="Help & shortcuts"
+        aria-label="Help and shortcuts"
+        className="flex h-[34px] w-[34px] flex-none items-center justify-center rounded-control border border-border-2 text-dim hover:border-border-strong hover:text-text"
+      >
+        <HelpCircle size={16} />
+      </button>
+
     </div>
   );
 }

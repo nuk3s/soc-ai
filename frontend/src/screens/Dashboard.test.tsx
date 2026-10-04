@@ -253,6 +253,20 @@ describe('Dashboard recent-investigations row layout', () => {
 });
 
 
+// The running tile read "of the 16 most recent, any time" when 16 was every
+// investigation there is. With the whole set on the page it says "all".
+describe('Dashboard running tile scope', () => {
+  it('says "all" when the page holds every investigation', async () => {
+    render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    );
+    await screen.findByText(`of all ${ROWS.length}`);
+    expect(screen.queryByText(/most recent, any time/)).toBeNull();
+  });
+});
+
 // The Dashboard KPI is the fourth of the five surfaces that make a shadow hit
 // obvious. It is the only tile on this screen that comes and goes, because a
 // standing zero teaches the eye to skip the spot where the number will be.

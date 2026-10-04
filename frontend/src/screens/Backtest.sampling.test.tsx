@@ -84,9 +84,12 @@ const SCORED: BacktestData = {
   },
 };
 
-const GRID_NOTE =
-  'Grid unavailable — the window could not be read, so no alerts were sampled. ' +
-  'Security Onion (Elasticsearch) is slow or unreachable; retry shortly.';
+const GRID_REFUSAL = {
+  reason: 'grid_unavailable',
+  hint:
+    'The grid is unavailable, so soc-ai could not read the window and sampled no alert. ' +
+    'Security Onion Elasticsearch is slow or unreachable. Retry shortly.',
+};
 
 const mount = async (d: BacktestData) => {
   state.current = d;
@@ -130,9 +133,12 @@ describe("Backtest — the newest attempt's outcome is not hidden by an older sc
     // what the API serves is last week's score with this note over it. The note
     // was only ever rendered inside the empty panel, which a console with
     // history never draws — so the failure was invisible.
-    await mount({ ...SCORED, note: GRID_NOTE });
+    await mount({ ...SCORED, refused: GRID_REFUSAL });
 
-    expect(await screen.findByTestId('backtest-note')).toHaveTextContent(/retry shortly/);
+    const panel = await screen.findByTestId('backtest-refused');
+    expect(panel).toHaveTextContent(/The last backtest attempt did not run/);
+    expect(panel).toHaveTextContent(/Retry shortly/);
+    expect(panel).toHaveTextContent(/The result below is from an earlier run/);
     // ...without deleting the measurement that really happened. Losing a real
     // score to an unrelated outage is this fix's own over-correction.
     expect(screen.getByText(/Agreement with analysts/)).toBeTruthy();
@@ -145,5 +151,6 @@ describe("Backtest — the newest attempt's outcome is not hidden by an older sc
 
     expect(await screen.findByText(/Agreement with analysts/)).toBeTruthy();
     expect(screen.queryByTestId('backtest-note')).toBeNull();
+    expect(screen.queryByTestId('backtest-refused')).toBeNull();
   });
 });

@@ -132,6 +132,25 @@ def provenance_rank(source: str | None) -> int:
 
 
 @dataclasses.dataclass(frozen=True)
+class AgentAddressReport:
+    """The agent's own documents for one address it reports, and their span.
+
+    An address that only an agent reports has no network events. Its activity is
+    the agent's own documents that carry it in ``host.ip``. Without this the
+    census wrote 0 for it and the Hosts screen hid the machine.
+    """
+
+    docs: int = 0
+    first_seen: datetime | None = None
+    last_seen: datetime | None = None
+
+
+# The most addresses one agent's report carries. The sweep notes a report that
+# holds more, so a short claim list is never silent.
+AGENT_ADDRESS_CAP = 256
+
+
+@dataclasses.dataclass(frozen=True)
 class AgentSelfReport:
     """What a log-shipping agent on one machine says that machine is.
 
@@ -147,6 +166,9 @@ class AgentSelfReport:
     """
 
     host_name: str
+    # The agent's own id (`agent.id`), the stable key of its machine. None on a
+    # document that carries no agent envelope.
+    agent_id: str | None = None
     # host.os.{name,family,version,kernel,platform,type}, only the keys present.
     # A dict rather than six fields because the render is "whatever it told us"
     # and a grid that adds a key should not need a schema change.
@@ -165,6 +187,11 @@ class AgentSelfReport:
     doc_count: int = 0
     first_report: datetime | None = None
     last_report: datetime | None = None
+    # Per address: the agent's own documents that carry it, keyed by the
+    # identity-bearing spelling (see `identity_bearing_ip`).
+    addresses: dict[str, AgentAddressReport] = dataclasses.field(default_factory=dict)
+    # The address list stopped at AGENT_ADDRESS_CAP. More addresses exist.
+    ips_truncated: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -212,25 +239,36 @@ class AgentInventory:
     # Advisory notes from a healthy-but-degraded pass (a truncated cap), kept
     # apart from `errors` so a cap the operator can see does not read as a
     # failure. The sweep folds these into `DossierSummary.notes`, never
-    # `errors`. Empty today — the agent pass has no truncation note yet — but
-    # carried for symmetry with `DnsNameInventory` and the merge that reads both.
+    # `errors`. A report whose address list hit the cap writes one.
     notes: tuple[str, ...] = ()
 
     @classmethod
     def from_reports(
         cls, reports: Sequence[AgentSelfReport], *, errors: Sequence[str] = ()
     ) -> AgentInventory:
-        """Build the claim map from the reports, so the two cannot disagree."""
+        """Build the claim map from the reports, so the two cannot disagree.
+
+        A report whose address list hit the cap adds a note. The claims it
+        holds are still true. The addresses past the cap are not in them.
+        """
         claims: dict[str, set[str]] = {}
+        notes: list[str] = []
         for report in reports:
             for raw in report.ips:
                 ip = identity_bearing_ip(raw)
                 if ip is not None:
                     claims.setdefault(ip, set()).add(report.host_name)
+            if report.ips_truncated:
+                notes.append(
+                    f"agent {report.host_name} reports more than {AGENT_ADDRESS_CAP} "
+                    f"addresses. The sweep read the first {AGENT_ADDRESS_CAP} in address "
+                    "order, IPv4 first."
+                )
         return cls(
             hosts=tuple(reports),
             claims={ip: tuple(sorted(names)) for ip, names in claims.items()},
             errors=tuple(errors),
+            notes=tuple(notes),
         )
 
     def unique_claims(self) -> dict[str, AgentSelfReport]:
@@ -264,6 +302,31 @@ class AgentInventory:
         if len(claimants) != 1:
             return None, claimants
         return next((h for h in self.hosts if h.host_name == claimants[0]), None), ()
+
+
+@dataclasses.dataclass(frozen=True)
+class DhcpLease:
+    """One (address, MAC) pair a DHCP server handed out, with its span.
+
+    The network-wide lease pass builds these once per sweep. The machine
+    clustering reads them: an address a lease gave to one MAC belongs to the
+    machine of that MAC.
+    """
+
+    ip: str
+    mac: str
+    hostname: str | None = None
+    first_seen: datetime | None = None
+    last_seen: datetime | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class DhcpLeaseInventory:
+    """Every lease the window holds. ``errors`` names a pass that failed."""
+
+    leases: tuple[DhcpLease, ...] = ()
+    errors: tuple[str, ...] = ()
+    notes: tuple[str, ...] = ()
 
 
 def identity_bearing_ip(value: Any) -> str | None:
@@ -354,6 +417,21 @@ def fold_dns_name(value: str) -> str:
     BOUNDARY on :class:`DnsNameClaim` for why this cannot live in the collector.
     """
     return value.strip().rstrip(".").lower()
+
+
+def is_service_or_reverse_name(value: str) -> bool:
+    """True for a DNS name that names a service or an address, not a machine.
+
+    Two shapes reached the census as strong hostnames. A service-discovery name
+    (mDNS or DNS-SD) carries a label that starts with an underscore:
+    ``_uscan._tcp.local``, ``Living Room._amzn-alexa._tcp.local``. A reverse
+    name ends in ``in-addr.arpa`` or ``ip6.arpa`` and names an address. Neither
+    is what anybody calls the machine.
+    """
+    folded = fold_dns_name(value)
+    if folded in ("in-addr.arpa", "ip6.arpa") or folded.endswith((".in-addr.arpa", ".ip6.arpa")):
+        return True
+    return any(label.startswith("_") for label in folded.split("."))
 
 
 @dataclasses.dataclass(frozen=True)

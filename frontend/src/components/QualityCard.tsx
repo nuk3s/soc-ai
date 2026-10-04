@@ -634,7 +634,7 @@ export function QualityCard({
           <Sparkline values={series.values} alarmed={latest.alarmed} />
           <div className="mt-0.5 text-[10.5px] text-faint">
             {series.label}
-            {series.lowerIsBetter ? ' · lower is better' : ''} · fixed 0–100% scale
+            {series.lowerIsBetter ? ' · lower is better' : ''} · fixed 0 to 100% scale
           </div>
         </>
       )}

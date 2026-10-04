@@ -113,10 +113,11 @@ export function Backtest() {
     setStartError(null);
     startBacktest({ windowDays, sampleSize, minSeverity: minSeverity || undefined })
       .then((s) => {
-        // A non-active status means the run never started (no dispositioned
-        // alerts in the window, planning failed, already running, …). The POST
-        // carries the reason; a follow-up GET drops it, so surface it here.
-        if (!s.active) setStartError(s.note ?? 'The backtest did not start.');
+        // A refused attempt comes back on GET /backtest too, beside the stored
+        // run, so a reload draws it in its own panel. Any other non-active
+        // status (already running) carries only the POST's note.
+        if (s.refused) setReloadKey((k) => k + 1);
+        else if (!s.active) setStartError(s.note ?? 'The backtest did not start.');
         else setReloadKey((k) => k + 1);
       })
       .catch((e: unknown) =>
@@ -245,6 +246,24 @@ export function Backtest() {
         </Panel>
       )}
 
+      {/* The newest attempt, when it started no run. Drawn on its own, above
+          the older run, so the old score is not read as today's answer. */}
+      {!running && data?.refused && (
+        <div
+          data-testid="backtest-refused"
+          role="status"
+          className="mb-3 rounded-card border border-border bg-surface-2 px-4 py-3 text-[12px]"
+        >
+          <div className="mb-1 flex items-center gap-1.5 font-semibold text-warn">
+            <AlertTriangle size={13} /> The last backtest attempt did not run
+          </div>
+          <div className="text-text-2">{data.refused.hint}</div>
+          {storedRun && (
+            <div className="mt-1 text-faint">The result below is from an earlier run.</div>
+          )}
+        </div>
+      )}
+
       {/* The newest attempt's outcome, when what follows is an OLDER run. */}
       {!running && storedRun && data?.note && (
         <div
@@ -265,7 +284,9 @@ export function Backtest() {
       ) : !running && !loading ? (
         <div data-testid="backtest-empty">
           <Panel className="p-8 text-center text-[13px] text-faint">
-            {data?.note
+            {data?.refused
+              ? 'soc-ai has no earlier backtest result.'
+              : data?.note
               ? data.note
               : 'No backtest yet. Select a window above and run a backtest. The report compares soc-ai’s verdicts to the real dispositions your analysts made.'}
           </Panel>
@@ -329,6 +350,10 @@ function Results({ data }: { data: BacktestData }) {
   const r = data.results!;
   const m = r.metrics;
   const missed = m.missed_tp;
+  // With no escalated alert in the sample there is no true positive to agree
+  // on or to miss. "100%" and "none missed" over zero incidents was a false
+  // all-clear (fleet 2026-10-01, H6).
+  const noEscalated = m.counts.human_tp === 0;
 
   return (
     <>
@@ -352,12 +377,22 @@ function Results({ data }: { data: BacktestData }) {
 
       {/* headline metric cards */}
       <div className="mb-5 grid grid-cols-1 gap-3 md:grid-cols-3">
-        <MetricCard
-          label="Agreement with analysts"
-          value={pct(m.agreement_rate)}
-          sub={`${m.counts.agreements} of ${m.counts.decided ?? m.counts.total} replayed verdicts matched the human call`}
-          color="#4b8bf5"
-        />
+        {noEscalated ? (
+          <MetricCard
+            label="Agreement with analysts"
+            value="Not measurable"
+            sub="No escalated alert in the window. Agreement is not measurable."
+            color="#8b94a3"
+            small
+          />
+        ) : (
+          <MetricCard
+            label="Agreement with analysts"
+            value={pct(m.agreement_rate)}
+            sub={`${m.counts.agreements} of ${m.counts.decided ?? m.counts.total} replayed verdicts matched the human call`}
+            color="#4b8bf5"
+          />
+        )}
         <MetricCard
           label="False-positive toil cleared"
           value={pct(m.fp_reduction)}
@@ -384,9 +419,17 @@ function Results({ data }: { data: BacktestData }) {
         <div className="border-b border-border px-4 py-3 text-[13px] font-semibold">
           Per-alert comparison
           <span className="ml-2 text-[12px] font-normal text-dim">
+            {data.requested != null && data.requested !== data.sampled
+              ? `${data.requested} requested · `
+              : ''}
             {data.sampled} replayed · window {data.params?.window_days}d
             {data.params?.min_severity ? ` · ≥ ${data.params.min_severity}` : ''}
           </span>
+          {data.skipped_reason && (
+            <div data-testid="backtest-skipped" className="mt-1 text-[11.5px] font-normal text-faint">
+              {data.skipped_reason}
+            </div>
+          )}
         </div>
         <RowsTable rows={r.rows} />
       </Panel>
@@ -404,16 +447,21 @@ function MetricCard({
   value,
   sub,
   color,
+  small = false,
 }: {
   label: string;
   value: string;
   sub: string;
   color: string;
+  small?: boolean;
 }) {
   return (
     <Panel className="px-4 py-3.5">
       <div className="text-[11px] uppercase tracking-[.05em] text-dim">{label}</div>
-      <div className="mt-1 text-[30px] font-semibold tabular-nums" style={{ color }}>
+      <div
+        className={`mt-1 font-semibold tabular-nums ${small ? 'text-[20px] leading-[45px]' : 'text-[30px]'}`}
+        style={{ color }}
+      >
         {value}
       </div>
       <div className="mt-1 text-[11.5px] text-faint">{sub}</div>
@@ -432,6 +480,17 @@ function MissedTpCard({
   humanTp: number;
   rows: BacktestRow[];
 }) {
+  if (humanTp === 0) {
+    return (
+      <MetricCard
+        label="Missed true positives"
+        value="Not measurable"
+        sub="No escalated alert in the window. soc-ai had no true positive to miss."
+        color="#8b94a3"
+        small
+      />
+    );
+  }
   const safe = missed === 0;
   const color = safe ? '#3fb950' : '#f04438';
   const bg = safe ? 'rgba(63,185,80,.07)' : 'rgba(240,68,56,.08)';
@@ -457,7 +516,9 @@ function MissedTpCard({
       </div>
       <div className="mt-1 text-[11.5px]" style={{ color: safe ? '#7ea88a' : '#e88' }}>
         {safe
-          ? `soc-ai agreed on every one of the ${humanTp} escalated incident${humanTp === 1 ? '' : 's'}.`
+          ? humanTp === 1
+            ? 'soc-ai did not call the one escalated incident a false positive.'
+            : `soc-ai called none of the ${humanTp} escalated incidents a false positive.`
           : `soc-ai called ${missed} real incident${missed === 1 ? '' : 's'} a false positive. This is the critical safety miss.`}
       </div>
       {!safe && rows.length > 0 && (
@@ -549,9 +610,19 @@ function RowsTable({ rows }: { rows: BacktestRow[] }) {
                 </td>
                 <td className="px-4 py-2 text-right">
                   {row.match ? (
-                    <CheckCircle2 size={15} className="ml-auto text-success" />
+                    <CheckCircle2
+                      size={15}
+                      role="img"
+                      aria-label="Match"
+                      className="ml-auto text-success"
+                    />
                   ) : (
-                    <AlertTriangle size={15} className="ml-auto text-danger" />
+                    <AlertTriangle
+                      size={15}
+                      role="img"
+                      aria-label="No match"
+                      className="ml-auto text-danger"
+                    />
                   )}
                 </td>
               </tr>

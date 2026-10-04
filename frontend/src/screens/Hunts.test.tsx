@@ -313,6 +313,72 @@ describe('Hunts header counts the window, not all time', () => {
   });
 });
 
+// F4: the Findings column and the header counted threat findings only, so a
+// hunt with one finding read 0 and a hunt with six read 1.
+describe('Hunts findings counts', () => {
+  it('states every finding and the threat count beside it', async () => {
+    vi.mocked(getHunts).mockResolvedValue([
+      {
+        id: 'h6',
+        objective: 'six findings, one threat',
+        kind: 'chat',
+        status: 'complete',
+        findingCount: 6,
+        threatFindingCount: 1,
+        outcome: 'threats',
+        affectedHosts: 2,
+        confidence: 0.7,
+        startedBy: 'analyst',
+        when: '1h',
+        ts: '2026-08-22T06:14:40Z',
+      },
+      {
+        id: 'h1',
+        objective: 'one finding, no threat',
+        kind: 'chat',
+        status: 'complete',
+        findingCount: 1,
+        threatFindingCount: 0,
+        outcome: 'clean',
+        affectedHosts: 1,
+        confidence: 0.7,
+        startedBy: 'analyst',
+        when: '2h',
+        ts: '2026-08-22T05:14:40Z',
+      },
+    ]);
+    renderHunts();
+    await screen.findByText('six findings, one threat');
+    expect(screen.getByText('6 · 1 threat')).toBeTruthy();
+    const line = screen.getByTestId('hunt-stats-line');
+    expect(line.textContent).toContain('7 findings');
+    expect(within(line).getByTitle('1 threat')).toBeTruthy();
+  });
+});
+
+// F17: the schedule's "last ran" was plain text. It links the hunt it started.
+describe('ScheduledHunts last run', () => {
+  it('links the hunt the schedule last started', async () => {
+    getHuntSchedulesMock.mockResolvedValue({
+      schedules: [{ ...SCHEDULE, lastRunAt: '2026-09-30T06:00:00Z', lastHuntId: 'H-SCHED-1' }],
+      masterSwitchEnabled: true,
+    });
+    renderHunts();
+    const link = await screen.findByTestId('schedule-last-hunt-1');
+    expect(link.getAttribute('href')).toBe('/hunts/H-SCHED-1');
+  });
+
+  it('keeps plain text when the server names no hunt', async () => {
+    getHuntSchedulesMock.mockResolvedValue({
+      schedules: [{ ...SCHEDULE, lastRunAt: '2026-09-30T06:00:00Z' }],
+      masterSwitchEnabled: true,
+    });
+    renderHunts();
+    await screen.findByText(/last ran/);
+    expect(screen.queryByTestId('schedule-last-hunt-1')).toBeNull();
+  });
+});
+
 // Since 1.5.0 the declarative hunt catalog records Hunt(kind="triggered") rows
 // with no model call. HuntRow.kind reached the browser and nothing read it, so
 // a spec-authored hunt was indistinguishable from one an analyst typed except
@@ -981,6 +1047,11 @@ describe('Hunts list status word', () => {
       /No threat observed · visibility gap/,
     );
     expect(findings).toBeTruthy();
+    // A gap is a gap in one type of telemetry. "found no telemetry" read as a
+    // host with no telemetry at all on a host that shipped host logs.
+    const title = findings.getAttribute('title') ?? '';
+    expect(title).not.toMatch(/found no telemetry for/);
+    expect(title).toMatch(/The gap finding names the type\./);
   });
 });
 

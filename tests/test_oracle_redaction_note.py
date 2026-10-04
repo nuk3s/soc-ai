@@ -62,7 +62,10 @@ def test_the_production_payload_builds_instead_of_500ing() -> None:
     assert oracle.redacted is True
     # Singular and plural both agree with their count, and the counts survive:
     # "2 hostnames" is the fact the analyst needs to judge what went off-box.
-    assert oracle.redactionNote == "1 IP address and 2 hostnames redacted before the second opinion"
+    assert (
+        oracle.redactionNote
+        == "1 IP address and 2 hostnames redacted before the data went to the Oracle"
+    )
 
 
 def test_nothing_redacted_claims_nothing() -> None:
@@ -89,15 +92,16 @@ def test_a_zero_count_is_not_a_redaction() -> None:
 @pytest.mark.parametrize(
     ("summary", "expected"),
     [
-        ({"IP": 1}, "1 IP address redacted before the second opinion"),
-        ({"HOST": 3}, "3 hostnames redacted before the second opinion"),
+        ({"IP": 1}, "1 IP address redacted before the data went to the Oracle"),
+        ({"HOST": 3}, "3 hostnames redacted before the data went to the Oracle"),
         (
             {"USER": 1, "EMAIL": 1},
-            "1 username and 1 email address redacted before the second opinion",
+            "1 username and 1 email address redacted before the data went to the Oracle",
         ),
         (
             {"IP": 2, "HOST": 1, "MAC": 4},
-            "2 IP addresses, 1 hostname and 4 MAC addresses redacted before the second opinion",
+            "2 IP addresses, 1 hostname and 4 MAC addresses redacted "
+            "before the data went to the Oracle",
         ),
     ],
 )
@@ -112,7 +116,10 @@ def test_an_unknown_category_still_counts() -> None:
     Falling back to the raw key keeps a new redaction type visible in the
     console the day it ships, rather than the day someone updates this map.
     """
-    assert _redaction_note({"PASSPORT": 2}) == "2 passports redacted before the second opinion"
+    assert (
+        _redaction_note({"PASSPORT": 2})
+        == "2 passports redacted before the data went to the Oracle"
+    )
 
 
 @pytest.mark.parametrize("weird", [["IP"], 7, True, object()])

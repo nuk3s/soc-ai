@@ -92,14 +92,24 @@ from soc_ai.dossier.infer import infer_host_facts
 from soc_ai.dossier.observe import (
     _agg_datetime,
     collect_agent_inventory,
+    collect_dhcp_leases,
     collect_dns_names,
     collect_host_observations,
 )
-from soc_ai.dossier.types import AgentInventory, DnsNameInventory, Fact, HostObservations
-from soc_ai.enrichment.discovery import _is_internal_ip, _junk_host_reason
+from soc_ai.dossier.types import (
+    AgentInventory,
+    AgentSelfReport,
+    DhcpLeaseInventory,
+    DnsNameInventory,
+    Fact,
+    HostObservations,
+    identity_bearing_ip,
+)
+from soc_ai.enrichment.discovery import SELF_REPORTED_SIGNALS, _is_internal_ip, _junk_host_reason
 from soc_ai.oracle.identifiers import effective_internal_identifiers
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.store import host_dossier as dossier_store
+from soc_ai.store import host_machines
 from soc_ai.store.auth import utcnow
 from soc_ai.store.internal_identifiers import upsert_detected
 from soc_ai.store.models import DossierRun, HostDossier, HostDossierField
@@ -156,8 +166,9 @@ _TELEMETRY_SOURCE = "telemetry"
 # The concrete signal behind a hostname, as `infer` writes it: "pve01 (from dhcp)".
 _SIGNAL_RE = re.compile(r"\(from ([^)]+)\)\s*$")
 
-# The identity signals the fingerprint is built from, in order. Each is hashed
-# SEPARATELY and the digests joined — never one hash over the concatenation.
+# The identity signals the fingerprint is built from, in the order of the
+# store's part labels (`IDENTITY_PARTS`: h, m). Each is hashed SEPARATELY and
+# the digests stored as labelled parts — never one hash over the concatenation.
 # A single hash makes "the MAC aged out of the window" and "a different machine
 # answers here now" the same event, which is the flap that re-stamped
 # `identity_rebound_at` on every sweep (a 30-day DHCP lease against a 14-day
@@ -187,6 +198,12 @@ class DossierSummary:
     # noise in the error channel is what makes an operator stop reading it, the
     # same failure the alarm work fixed elsewhere in this codebase.
     notes: list[str] = field(default_factory=list)
+    # Hosts whose served-port read came back partial, so the sweep kept their
+    # previous role and services. The first reason rides with the count.
+    partial_reads: int = 0
+    partial_reason: str | None = None
+    # Machines the sweep wrote at its end. 0 when it kept the previous ones.
+    machines: int = 0
 
 
 @dataclass
@@ -197,6 +214,18 @@ class _Candidate:
     events: int = 0
     first_seen: datetime | None = None
     last_seen: datetime | None = None
+    # Which datasets and which shippers' documents carry the address. An
+    # address an agent's endpoint sensor sees is a container candidate.
+    datasets: set[str] = field(default_factory=set)
+    shippers: set[str] = field(default_factory=set)
+    # The shipper sub-agg fell short: another agent may see the address too.
+    partial_shippers: bool = False
+
+
+# Sub-agg caps on each census address bucket. Small on purpose: the container
+# test needs to know "an endpoint dataset, and which agents ship", nothing more.
+_SOURCE_DATASET_AGG_SIZE = 4
+_SOURCE_SHIPPER_AGG_SIZE = 3
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +298,10 @@ def _endpoint_agg(field_name: str, size: int) -> dict[str, Any]:
         "aggs": {
             "first_seen": {"min": {"field": "@timestamp"}},
             "last_seen": {"max": {"field": "@timestamp"}},
+            # Who reports the address: the container rule needs an address an
+            # agent's endpoint sensor sees.
+            "datasets": {"terms": {"field": "event.dataset", "size": _SOURCE_DATASET_AGG_SIZE}},
+            "shippers": {"terms": {"field": "host.name", "size": _SOURCE_SHIPPER_AGG_SIZE}},
         },
     }
 
@@ -297,6 +330,11 @@ def _ingest_buckets(
             _agg_datetime(bucket.get("first_seen")),
             _agg_datetime(bucket.get("last_seen")),
         )
+        for name, held in (("datasets", candidate.datasets), ("shippers", candidate.shippers)):
+            agg = bucket.get(name) or {}
+            if name == "shippers" and int(agg.get("sum_other_doc_count") or 0) > 0:
+                candidate.partial_shippers = True
+            held.update(str(b.get("key")) for b in agg.get("buckets") or () if b.get("key"))
 
 
 def _widen_lifetime(candidate: _Candidate, first: datetime | None, last: datetime | None) -> None:
@@ -349,7 +387,7 @@ async def _census(
             track_total_hits=True,
         )
     except Exception as exc:
-        summary.errors.append(f"census pass: {type(exc).__name__}: {exc}")
+        summary.errors.append(f"{_CENSUS_FAILURE_PREFIX} {type(exc).__name__}: {exc}")
         _LOGGER.warning("dossier: census aggregation failed: %s", exc)
         return {}
 
@@ -406,19 +444,27 @@ def _ingest_agent_claims(
       network census applies — "internal" is the operator's definition, and an
       agent on a machine with a public address must not put the internet in the
       table;
-    * ``events`` is left alone. It is the WINDOW's network event count, and
-      inventing one out of host-log volume would make a silent machine look busy
-      on a screen that means something else by it.
+    * an address the network census counted keeps its NETWORK event count. An
+      address no network sensor sees counts the agent's own documents that
+      carry it in ``host.ip``. The census wrote 0 for it before, and the Hosts
+      screen's default view (events above 0) hid the machine.
 
-    The lifetime IS widened from the agent's reporting window: the machine was
-    demonstrably alive then — it said so — and a row with no lifetime at all
+    The lifetime IS widened from the agent's own documents for the address, or
+    from its reporting window when the address carries no span: the machine was
+    demonstrably alive then (it said so), and a row with no lifetime at all
     sorts first for pruning, which would delete the quiet host on the next sweep.
     """
     for ip, report in inventory.unique_claims().items():
         if not _is_internal_ip(ip, cidrs):
             continue
         candidate = out.setdefault(ip, _Candidate(ip=ip))
-        _widen_lifetime(candidate, report.first_report, report.last_report)
+        held = report.addresses.get(ip)
+        if candidate.events == 0 and held is not None:
+            candidate.events = held.docs
+        if held is not None and (held.first_seen or held.last_seen):
+            _widen_lifetime(candidate, held.first_seen, held.last_seen)
+        else:
+            _widen_lifetime(candidate, report.first_report, report.last_report)
 
 
 def _ingest_dns_names(
@@ -454,6 +500,32 @@ def _ingest_dns_names(
             continue
         candidate = out.setdefault(ip, _Candidate(ip=ip))
         _widen_lifetime(candidate, claim.first_answer, claim.last_answer)
+
+
+_LIMITED_BROADCAST = "255.255.255.255"
+
+
+def _broadcast_addresses(cidrs: list[Any]) -> frozenset[str]:
+    """Every broadcast address the estate's CIDRs define, plus the limited one.
+
+    The last address of an IPv4 network is its broadcast address. A frame to it
+    reaches every host on the segment and comes from none of them, so it is no
+    host. The census listed one with 3,733 events. A /31 and a /32 have no
+    broadcast address, and IPv6 has none at all.
+    """
+    out = {_LIMITED_BROADCAST}
+    for net in cidrs:
+        if isinstance(net, ipaddress.IPv4Network) and net.prefixlen <= 30:
+            out.add(str(net.broadcast_address))
+    return frozenset(out)
+
+
+def _drop_broadcast(candidates: dict[str, _Candidate], cidrs: list[Any]) -> list[str]:
+    """Remove broadcast addresses from the census. Returns the addresses removed."""
+    doomed = sorted(ip for ip in candidates if ip in _broadcast_addresses(cidrs))
+    for ip in doomed:
+        del candidates[ip]
+    return doomed
 
 
 async def _record_census(
@@ -530,8 +602,9 @@ def _component_digest(value: str | None) -> str:
 def _identity_fingerprint(facts: dict[str, Fact], prior: str | None) -> str | None:
     """This build's identity fingerprint, or ``None`` when it saw no signal.
 
-    Per-component digests joined with ``:``, and a component this build did NOT
-    see is carried over from *prior* rather than emptied. That carry-over is the
+    Per-component digests in the store's labelled shape, ``h:<hex>|m:<hex>``,
+    and a component this build did NOT see is carried over from *prior* rather
+    than emptied. That carry-over is the
     fix for the flap: signals age out of the lookback window independently (a
     30-day DHCP lease against a 14-day window drops the MAC while the name keeps
     being announced), and a fingerprint that changed on absence oscillated
@@ -544,21 +617,19 @@ def _identity_fingerprint(facts: dict[str, Fact], prior: str | None) -> str | No
     identical for every headless host on the grid, and the first DHCP lease one
     of them ever emitted would read as a machine swap.
 
-    A *prior* that does not have this shape (a fingerprint written by an older
-    build) is ignored rather than half-parsed — it can only ever produce one
-    spurious rebind, where mis-slotting its digest would produce a wrong one.
+    A *prior* in the plain ``<hex>:<hex>`` shape of the previous build is read
+    part by part, so the change of shape is no change of machine. A *prior*
+    older than that (one digest over the whole) reads as no parts: it is
+    ignored rather than half-parsed, and the store never stamps a part that
+    appears.
     """
-    carried = (prior or "").split(":")
-    if len(carried) != len(_IDENTITY_COMPONENTS):
-        carried = [""] * len(_IDENTITY_COMPONENTS)
-    parts: list[str] = []
-    for index, name in enumerate(_IDENTITY_COMPONENTS):
+    carried = dossier_store.fingerprint_parts(prior)
+    parts: dict[str, str] = {}
+    for label, name in zip(dossier_store.IDENTITY_PARTS, _IDENTITY_COMPONENTS, strict=True):
         fact = facts.get(name)
         digest = _component_digest(fact.value if fact is not None else None)
-        parts.append(digest or carried[index])
-    if not any(parts):
-        return None
-    return ":".join(parts)
+        parts[label] = digest or carried.get(label, "")
+    return dossier_store.compose_fingerprint(parts)
 
 
 def _hostname_signal(fact: Fact) -> str:
@@ -648,18 +719,95 @@ async def _push_hostname(
     if fact is None or fact.value is None or not _proposable(fact):
         return False
     name = fact.value.strip()
-    if len(name) < _MIN_PUSHED_HOSTNAME or _junk_host_reason(name) is not None:
+    signal = _hostname_signal(fact)
+    # The agent's own host.name and a DHCP lease name skip the TLD rule, as
+    # they do in `infer`. "nexus" is a gTLD and a real machine.
+    junk = _junk_host_reason(name, self_reported=signal in SELF_REPORTED_SIGNALS)
+    if len(name) < _MIN_PUSHED_HOSTNAME or junk is not None:
         return False
     if not _is_internal_ip(ip, cidrs):
         return False
     evidence = {
         "source": "host_dossier",
         "ip": ip,
-        "signal": _hostname_signal(fact),
+        "signal": signal,
         "last_seen": observed.isoformat() if observed is not None else None,
     }
     await upsert_detected(db, "host", name, evidence, "muted")
     return True
+
+
+# The fields the served-port read decides. A partial read of the port set
+# rewrote a domain controller (tcp/88, tcp/389) as a server that "responds on
+# tcp/53", and the sweep report said errors=[].
+_PORT_FIELDS: tuple[str, ...] = ("role", "services_offered", "management_plane")
+# The main pass is the one that reads the ports. Its error lines carry these
+# prefixes (soc_ai.dossier.observe._run_main_pass).
+_MAIN_PASS_PREFIXES: tuple[str, ...] = ("reduced-agg fallback:", "multi-agg pass failed:")
+# A grid that could not answer in full: shard failures, a timeout, a 503. A
+# chronic 400 on a text-mapped field is not one, and must not freeze a role.
+_DEGRADED_RE = re.compile(
+    r"partial search results|timed? ?out|timeout|\b503\b|unavailable|circuit_breaking",
+    re.IGNORECASE,
+)
+# A port set that shrank to under half of the previous build's is a short read
+# until a full one says otherwise. Below this prior size a drop is ordinary.
+_PORT_DROP_MIN_PRIOR = 4
+
+
+def _port_count(value_json: Any) -> int | None:
+    """How many ports a services payload lists, or ``None`` for another shape."""
+    if isinstance(value_json, list):
+        return len(value_json)
+    if isinstance(value_json, dict) and isinstance(value_json.get("ports"), list):
+        return len(value_json["ports"])
+    return None
+
+
+def _partial_port_read(
+    observations: HostObservations,
+    facts: dict[str, Fact],
+    prior: dict[str, HostDossierField],
+) -> str | None:
+    """Name the reason the served-port read is partial, or ``None`` when it is whole.
+
+    Two tests. The main pass that reads the ports reported a degraded grid
+    (shard failures, a timeout, a 503). Or the read returned fewer than half the
+    ports the previous build held for this host. The second catches a grid
+    that answers partial results with no error, which is what a deployment
+    with ``es_fail_on_partial_results`` off receives.
+    """
+    for error in observations.errors:
+        if error.startswith(_MAIN_PASS_PREFIXES) and _DEGRADED_RE.search(error):
+            return f"the served-port read was partial: {error[:200]}"
+    held = prior.get("services_offered")
+    before = _port_count(held.inferred_value_json) if held is not None else None
+    fact = facts.get("services_offered")
+    now = _port_count(fact.value_json) if fact is not None else None
+    if before is not None and before >= _PORT_DROP_MIN_PRIOR and (now or 0) * 2 < before:
+        return f"the read returned {now or 0} served ports where the previous build had {before}"
+    return None
+
+
+def _activity(observations: HostObservations) -> tuple[int, datetime | None]:
+    """The event count and the last sighting the build writes for one address.
+
+    The count is the network's count, always. The agent's own documents carry
+    every address the agent has in ``host.ip``, so a per-address copy of that
+    figure made each bridge address of one machine read as its busiest
+    address and summed the same documents once per address. The machine
+    carries the agent's documents once (``host_machines``). An address that
+    only its agent reports keeps the network's 0 and takes the agent's newest
+    timestamp as its last sighting, so it is not read as unseen.
+    """
+    if observations.total_events or observations.agent_report is None:
+        return observations.total_events, observations.last_seen
+    key = identity_bearing_ip(observations.ip) or observations.ip
+    held = observations.agent_report.addresses.get(key)
+    if held is None or held.docs <= 0:
+        return observations.total_events, observations.last_seen
+    last = held.last_seen or observations.agent_report.last_report or observations.last_seen
+    return observations.total_events, last
 
 
 def _collection_failure(observations: HostObservations) -> str | None:
@@ -845,16 +993,43 @@ async def _build_host(
         prods: list[dict[str, Any]] = []
         async with db_sessionmaker() as db:
             prior = await _prior_fingerprint(db, ip)
+            held = await dossier_store.get_dossier(db, ip)
+            prior_fields = {row.field: row for row in (held[1] if held is not None else [])}
+            # A partial port read must not overwrite a stronger prior answer.
+            # The fields it decides keep their previous values, and the host
+            # row says why: a stale read is not a clean build.
+            partial = _partial_port_read(observations, facts, prior_fields)
+            kept: tuple[str, ...] = ()
+            if partial is not None:
+                kept = tuple(
+                    name
+                    for name in _PORT_FIELDS
+                    if name in prior_fields
+                    and (
+                        prior_fields[name].inferred_value is not None
+                        or prior_fields[name].inferred_value_json is not None
+                    )
+                )
+            stale_read = (
+                f"Stale read. The sweep kept the previous {', '.join(kept)}. Reason: {partial}."
+                if kept
+                else None
+            )
+            if stale_read is not None:
+                summary.partial_reads += 1
+                if summary.partial_reason is None:
+                    summary.partial_reason = partial
+            events, last_seen = _activity(observations)
             host = await dossier_store.upsert_host(
                 db,
                 ip,
                 first_seen=observations.first_seen,
-                last_seen=observations.last_seen,
-                last_observed_at=observations.last_seen,
-                event_count=observations.total_events,
+                last_seen=last_seen,
+                last_observed_at=last_seen,
+                event_count=events,
                 identity_fingerprint=_identity_fingerprint(facts, prior),
                 last_built_at=now,
-                build_error=None,
+                build_error=stale_read,
                 now=now,
             )
             # Before the field writes: `upsert_inferred` reads the host's rebind
@@ -866,6 +1041,8 @@ async def _build_host(
                 ttl=timedelta(hours=max(1, window_hours)),
             )
             for fact in facts.values():
+                if fact.field in kept:
+                    continue
                 write = await dossier_store.upsert_inferred(
                     db,
                     host,
@@ -1039,6 +1216,158 @@ def _note_cadence(settings: Settings, summary: DossierSummary) -> None:
     )
 
 
+# The prefix `_census` writes on a failed census pass.
+_CENSUS_FAILURE_PREFIX = "census pass:"
+
+# The dataset prefix of an agent's endpoint sensor (Elastic Defend).
+_ENDPOINT_DATASET_PREFIX = "endpoint."
+
+
+def _agent_key(report: AgentSelfReport) -> str:
+    """The machine key part of an agent: its id, else its name."""
+    return report.agent_id or report.host_name
+
+
+def _sightings(
+    candidates: dict[str, _Candidate], inventory: AgentInventory
+) -> list[host_machines.ContainerSighting]:
+    """The census addresses an agent's endpoint sensor sees.
+
+    An endpoint dataset carries the address, and an agent is among its
+    shippers: one sighting per such agent. Other datasets may carry the address
+    too. Production had 172.18.0.5 with 582 events that zeek also saw, and the
+    old "endpoint datasets only" test left it a machine of its own beside the
+    containers of its host. The clustering decides: the address must sit in a
+    bridge the agent owns, no other agent may claim it, and no DHCP lease may
+    name it. A shipper list that fell short may hide a second claim, so it
+    says nothing. A short dataset list still proves the datasets it holds.
+    """
+    by_name = {report.host_name.casefold(): _agent_key(report) for report in inventory.hosts}
+    out: list[host_machines.ContainerSighting] = []
+    for ip, candidate in candidates.items():
+        if candidate.partial_shippers:
+            continue
+        if not any(d.startswith(_ENDPOINT_DATASET_PREFIX) for d in candidate.datasets):
+            continue
+        agents = {by_name.get(shipper.casefold()) for shipper in candidate.shippers}
+        for agent in sorted(a for a in agents if a is not None):
+            out.append(host_machines.ContainerSighting(ip=ip, agent_id=agent))
+    return out
+
+
+def _agent_claims(inventory: AgentInventory) -> list[host_machines.AgentClaim]:
+    out: list[host_machines.AgentClaim] = []
+    for report in inventory.hosts:
+        os_name = " ".join(
+            part for part in (report.os.get("name"), report.os.get("version")) if part
+        )
+        out.append(
+            host_machines.AgentClaim(
+                agent_id=_agent_key(report),
+                name=report.host_name,
+                os=os_name or None,
+                macs=report.macs,
+                addresses=report.ips,
+                last_report=report.last_report,
+                # The agent's own documents, once. Every address in host.ip
+                # carries the same figure, so the largest is the agent's total.
+                docs=max((held.docs for held in report.addresses.values()), default=0),
+            )
+        )
+    return out
+
+
+async def _build_machines(
+    db_sessionmaker: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    *,
+    agent_inventory: AgentInventory,
+    leases: DhcpLeaseInventory,
+    dns_names: DnsNameInventory,
+    sightings: list[host_machines.ContainerSighting],
+    summary: DossierSummary,
+) -> None:
+    """Group the census addresses into machines and write them. The last step.
+
+    A pass that failed this sweep would turn its machines into single
+    addresses for one sweep and back on the next, and the keys in an analyst's
+    open links would break. So a failed census, agent or lease pass keeps the
+    previous machines, and the sweep says so.
+    """
+    failed = [
+        name
+        for name, broken in (
+            ("census", _census_failed(summary)),
+            ("agent inventory", bool(agent_inventory.errors)),
+            ("DHCP lease", bool(leases.errors)),
+        )
+        if broken
+    ]
+    if failed:
+        _record_error(
+            summary,
+            f"the sweep kept the previous machines. The {', '.join(failed)} pass failed.",
+        )
+        return
+    now = datetime.now(UTC)
+    try:
+        async with db_sessionmaker() as db:
+            facts = await host_machines.load_address_facts(
+                db,
+                dns_names={ip: claim.name for ip, claim in dns_names.consensus().items()},
+                now=now,
+                min_confidence=float(settings.dossier_min_confidence),
+                staleness_hours=int(settings.dossier_staleness_hours),
+            )
+            prior = await host_machines.load_prior(db)
+        clustering = host_machines.cluster_machines(
+            facts,
+            agents=_agent_claims(agent_inventory),
+            leases=leases.leases,
+            sightings=sightings,
+            prior=prior,
+        )
+        async with db_sessionmaker() as db:
+            stats = await host_machines.persist_clustering(
+                db,
+                clustering,
+                facts,
+                now=now,
+                stale_days=int(getattr(settings, "dossier_stale_address_days", 30)),
+            )
+    except Exception as exc:
+        _record_error(summary, f"machines: {type(exc).__name__}: {exc}")
+        _LOGGER.warning("dossier: machine build failed: %s", exc)
+        return
+    summary.machines = stats.machines
+
+
+def _census_failed(summary: DossierSummary) -> bool:
+    """True when this sweep's census could not read the grid."""
+    return any(error.startswith(_CENSUS_FAILURE_PREFIX) for error in summary.errors)
+
+
+async def _prune_stale(
+    db_sessionmaker: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    seen_now: set[str],
+    summary: DossierSummary,
+) -> None:
+    """Remove the addresses no census has seen for ``dossier_stale_address_days``.
+
+    Read fresh from settings on every sweep, like every other knob here.
+    """
+    days = max(1, int(getattr(settings, "dossier_stale_address_days", 30)))
+    try:
+        async with db_sessionmaker() as db:
+            gone = await dossier_store.prune_stale(db, older_than_days=days, seen_now=seen_now)
+    except Exception as exc:
+        _record_error(summary, f"stale prune: {type(exc).__name__}: {exc}")
+        _LOGGER.warning("dossier: stale prune failed: %s", exc)
+        return
+    summary.hosts_pruned += len(gone)
+
+
 def _record_error(summary: DossierSummary, detail: str) -> None:
     """Append a failure, bounded. A network-wide outage is one error, repeated."""
     if len(summary.errors) < _MAX_RECORDED_ERRORS:
@@ -1173,11 +1502,14 @@ async def _sweep(
     dns_names = await collect_dns_names(
         elastic=es_client, settings=settings, window_hours=window_hours, cidrs=cidrs
     )
-    for detail in (*agent_inventory.errors, *dns_names.errors):
+    leases = await collect_dhcp_leases(
+        elastic=es_client, settings=settings, window_hours=window_hours, cidrs=cidrs
+    )
+    for detail in (*agent_inventory.errors, *dns_names.errors, *leases.errors):
         _record_error(summary, detail)
     # The DNS/agent passes' truncation notes ride the notes channel, never the
     # error one — a hit cap is a healthy-but-capped pass (see `_dns_truncation`).
-    for note in (*agent_inventory.notes, *dns_names.notes):
+    for note in (*agent_inventory.notes, *dns_names.notes, *leases.notes):
         _record_note(summary, note)
 
     build = await profile_job.build_profiles(es_client, db_sessionmaker, settings, cidrs)
@@ -1191,10 +1523,21 @@ async def _sweep(
     )
     _ingest_agent_claims(agent_inventory, cidrs, candidates)
     _ingest_dns_names(dns_names, cidrs, candidates)
+    _drop_broadcast(candidates, cidrs)
+    # A row an older census wrote for a broadcast address goes too.
+    try:
+        async with db_sessionmaker() as db:
+            await dossier_store.delete_hosts(db, sorted(_broadcast_addresses(cidrs)))
+    except Exception as exc:
+        _record_error(summary, f"broadcast cleanup: {type(exc).__name__}: {exc}")
     summary.hosts_seen = len(candidates)
     if candidates:
         await _record_census(db_sessionmaker, candidates, summary)
     _note_cadence(settings, summary)
+    if not _census_failed(summary):
+        # Before the builds, so the sweep spends no host budget on an address
+        # that left the network weeks ago.
+        await _prune_stale(db_sessionmaker, settings, set(candidates), summary)
 
     for ip in await _due_hosts(db_sessionmaker, int(settings.dossier_max_hosts_per_run)):
         try:
@@ -1216,14 +1559,34 @@ async def _sweep(
             _LOGGER.warning("dossier: build failed for %s: %s", ip, exc)
             await _record_build_error(db_sessionmaker, ip, detail)
 
+    if summary.partial_reads:
+        # An error, not a note: the run did not read the grid in full, and the
+        # Hosts screen marks a run with errors as degraded.
+        _record_error(
+            summary,
+            f"partial read on {summary.partial_reads} host(s). The sweep kept their "
+            f"previous role and services. First reason: {summary.partial_reason}",
+        )
+
     try:
         async with db_sessionmaker() as db:
-            summary.hosts_pruned = await dossier_store.prune(
+            summary.hosts_pruned += await dossier_store.prune(
                 db, max_hosts=int(settings.dossier_max_hosts)
             )
     except Exception as exc:
         _record_error(summary, f"prune: {type(exc).__name__}: {exc}")
         _LOGGER.warning("dossier: prune failed: %s", exc)
+
+    # Last, over the table as the builds and the prunes left it.
+    await _build_machines(
+        db_sessionmaker,
+        settings,
+        agent_inventory=agent_inventory,
+        leases=leases,
+        dns_names=dns_names,
+        sightings=_sightings(candidates, agent_inventory),
+        summary=summary,
+    )
 
 
 __all__ = ["DossierSummary", "latest_run_started_at", "run_dossier_refresh"]

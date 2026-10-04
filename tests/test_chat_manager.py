@@ -588,8 +588,9 @@ def test_run_turn_redacts_fabricated_tool_citations_on_zero_tool_turn() -> None:
     assert captured["meta"]["narrative_grounding"]["stripped"]
     assert "t_enrich_ip" not in captured["content"]
     assert "Verified by the tools" not in captured["content"]
-    assert "(unverified)" in captured["content"]
-    assert "Some unverifiable specifics were removed" in captured["content"]
+    # The citation leaves with its sentence. No placeholder, no line about it.
+    assert "(unverified)" not in captured["content"]
+    assert "unverifiable" not in captured["content"].lower()
     assert "⚠" not in captured["content"]
 
 
@@ -692,8 +693,8 @@ def test_run_turn_redacts_ungrounded_claim_when_tools_ran() -> None:
     assert captured["meta"]["narrative_grounding"]["grounded"] is False
     assert captured["meta"]["narrative_grounding"]["stripped"] == ["ad.local"]
     assert "ad.local" not in captured["content"]
-    assert "(unverified)" in captured["content"]
-    assert "Some unverifiable specifics were removed" in captured["content"]
+    assert "(unverified)" not in captured["content"]
+    assert "unverifiable" not in captured["content"].lower()
     assert "Partially unverified" not in captured["content"]
     assert "⚠" not in captured["content"]
 

@@ -54,22 +54,83 @@ def _coverage_response(grid_total: int, host_docs: int) -> dict[str, Any]:
 _COVERED = _coverage_response(1_800_000, 42)
 
 
+def _is_host_coverage_query(body: dict[str, Any]) -> bool:
+    """The per-host coverage read is the one with a ``host_datasets`` terms agg."""
+    return "host_datasets" in (body.get("aggs") or {})
+
+
+def _is_address_host_pivot(body: dict[str, Any]) -> bool:
+    """The address host pivot filters on a should over ``host.ip``/``agent.id``."""
+    filters = (body.get("query", {}).get("bool", {}) or {}).get("filter") or []
+    for clause in filters:
+        should = (clause.get("bool") or {}).get("should") if isinstance(clause, dict) else None
+        if should and any("host.ip" in (c.get("terms") or {}) for c in should):
+            return True
+    return False
+
+
+def _host_coverage_response(
+    counts: dict[str, int], agent_name: str | None = None
+) -> dict[str, Any]:
+    """A scripted per-host coverage read: ``counts`` is dataset -> documents."""
+    agents = (
+        [
+            {
+                "key": "a1b2c3d4-0000-4000-8000-000000000001",
+                "doc_count": sum(counts.values()),
+                "names": {"buckets": [{"key": agent_name, "doc_count": 1}]},
+                "os": {"buckets": [{"key": "Fedora Linux", "doc_count": 1}]},
+            }
+        ]
+        if agent_name
+        else []
+    )
+    return {
+        "took": 1,
+        "hits": {"total": {"value": sum(counts.values())}, "hits": []},
+        "aggregations": {
+            "host_datasets": {
+                "buckets": [
+                    {
+                        "key": k,
+                        "doc_count": v,
+                        "newest": {"value_as_string": "2026-05-07T10:00:00Z"},
+                    }
+                    for k, v in counts.items()
+                ]
+            },
+            "host_agents": {"buckets": agents},
+            "host_agent_names": {"buckets": []},
+        },
+    }
+
+
+# Default per-host coverage: the host ships nothing in the window, so no
+# address pivot runs and tests written before the read keep their shape.
+_NO_HOST_DOCS = _host_coverage_response({})
+
+
 def _make_elastic(
     settings: Settings,
     responses: list[dict[str, Any]],
     behavioral_response: dict[str, Any] | None = None,
     coverage_response: dict[str, Any] | Exception | None = None,
+    host_coverage_response: dict[str, Any] | Exception | None = None,
+    address_pivot_response: dict[str, Any] | Exception | None = None,
 ) -> tuple[ElasticClient, AsyncMock]:
     fake_es = AsyncMock()
-    # The behavioral-summary pivot (beacon / DNS-tunnel) and the endpoint-
-    # coverage check are ADDITIVE fan-outs that these tests don't script;
-    # answer them from ``behavioral_response`` / ``coverage_response``
-    # (defaults: empty / covered) WITHOUT consuming a positional response, so
-    # each test's response list still maps 1:1 to the lookup + 5 tight pivots
-    # + host-risk agg it was written for.
+    # The behavioral-summary pivot (beacon / DNS-tunnel), the endpoint-
+    # coverage check, the per-host coverage read and the address host pivot
+    # are ADDITIVE fan-outs that these tests don't script; answer them from
+    # their own responses (defaults: empty / covered / no host documents /
+    # empty) WITHOUT consuming a positional response, so each test's response
+    # list still maps 1:1 to the lookup + 5 tight pivots + host-risk agg it was
+    # written for.
     _it = iter(responses)
     _behavioral = behavioral_response if behavioral_response is not None else _EMPTY_HITS
     _coverage = coverage_response if coverage_response is not None else _COVERED
+    _host_cov = host_coverage_response if host_coverage_response is not None else _NO_HOST_DOCS
+    _addr_pivot = address_pivot_response if address_pivot_response is not None else _EMPTY_HITS
 
     def _search(*args: Any, **kwargs: Any) -> dict[str, Any]:
         body = kwargs.get("body") or (args[1] if len(args) > 1 else {})
@@ -77,6 +138,14 @@ def _make_elastic(
             if isinstance(_coverage, Exception):
                 raise _coverage
             return _coverage
+        if _is_host_coverage_query(body):
+            if isinstance(_host_cov, Exception):
+                raise _host_cov
+            return _host_cov
+        if _is_address_host_pivot(body):
+            if isinstance(_addr_pivot, Exception):
+                raise _addr_pivot
+            return _addr_pivot
         if _is_behavioral_summary_query(body):
             return _behavioral
         return next(_it)
@@ -120,8 +189,10 @@ async def test_happy_path_all_pivots_empty(
     }
     assert ctx.host_alert_profile == {}
     # 1 lookup + 5 pivots + host-risk agg + 1 behavioral-summary pivot
-    # + 1 endpoint-coverage check.
-    assert fake_es.search.call_count == 9
+    # + 1 endpoint-coverage check + 1 host coverage read for the internal
+    # source. The alert names a genuine endpoint host, so the host.name pivot
+    # ran and no address pivot is spent.
+    assert fake_es.search.call_count == 10
 
 
 @pytest.mark.asyncio
@@ -232,8 +303,8 @@ async def test_skips_pivot_when_field_absent(
 
     assert ctx.pivot_summary["community_id"] == 0
     # lookup + 4 pivots + host-risk agg + behavioral-summary pivot
-    # + endpoint-coverage check.
-    assert fake_es.search.call_count == 8
+    # + endpoint-coverage check + host coverage read for the internal source.
+    assert fake_es.search.call_count == 9
 
 
 @pytest.mark.asyncio
@@ -251,13 +322,14 @@ async def test_skips_all_pivots_when_no_timestamp(
 
     ctx = await get_alert_context("alert-001", elastic=elastic, settings=settings_kratos)
 
+    # No host pivot ran, so the summary carries no host zero. The note says why.
     assert ctx.pivot_summary == {
         "community_id": 0,
-        "host": 0,
         "user": 0,
         "process": 0,
         "file": 0,
     }
+    assert ctx.host_pivot_note == "The host pivot did not run. The alert has no timestamp."
     assert fake_es.search.call_count == 1  # only the lookup
 
 
@@ -526,8 +598,9 @@ async def test_pivots_exclude_alert_id(
     await get_alert_context("alert-001", elastic=elastic, settings=settings_kratos)
 
     pivot_calls = fake_es.search.call_args_list[1:]  # skip the lookup
-    # 5 pivots + host-risk agg + behavioral-summary + endpoint-coverage check.
-    assert len(pivot_calls) == 8
+    # 5 pivots + host-risk agg + behavioral-summary + endpoint-coverage check
+    # + host coverage read.
+    assert len(pivot_calls) == 9
     for call in pivot_calls:
         body = call.kwargs["body"]
         must_not = body["query"]["bool"]["must_not"]
@@ -662,6 +735,66 @@ async def test_host_risk_profile_aggregates_endpoint_rules(
     should_fields = {next(iter(s["terms"])) for s in bool_q["should"]}
     assert should_fields == {"source.ip", "destination.ip"}
     assert {"exists": {"field": "synth.scenario_id"}} in bool_q["must_not"]
+
+
+@pytest.mark.asyncio
+async def test_host_risk_names_each_end_and_keeps_the_other_hosts_alerts_apart(
+    settings_kratos: Settings, sample_alert: dict[str, Any]
+) -> None:
+    """RL3: the pooled histogram mixed both ends of the alert, so the panel
+    "Host context <source ip>" listed the destination's alerts. The per-end
+    profile names each host and splits its alerts by side."""
+    src = sample_alert["_source"]["source"]["ip"]
+    dst = sample_alert["_source"]["destination"]["ip"]
+    agg_resp = {
+        "took": 1,
+        "hits": {"total": {"value": 9}, "hits": []},
+        "aggregations": {
+            "rules": {
+                "buckets": [
+                    {"key": "ET SCAN Inbound probe", "doc_count": 7},
+                    {"key": "ET POLICY Outbound fetch", "doc_count": 2},
+                ]
+            },
+            "ends": {
+                "buckets": {
+                    f"source|{src}": {
+                        "doc_count": 2,
+                        "rules": {"buckets": [{"key": "ET POLICY Outbound fetch", "doc_count": 2}]},
+                    },
+                    f"destination|{src}": {"doc_count": 0, "rules": {"buckets": []}},
+                    f"source|{dst}": {"doc_count": 0, "rules": {"buckets": []}},
+                    f"destination|{dst}": {
+                        "doc_count": 7,
+                        "rules": {"buckets": [{"key": "ET SCAN Inbound probe", "doc_count": 7}]},
+                    },
+                }
+            },
+        },
+    }
+    elastic, fake_es = _make_elastic(
+        settings_kratos,
+        [_alert_lookup_response(sample_alert), *([_EMPTY_HITS] * 5), agg_resp],
+    )
+
+    ctx = await get_alert_context("alert-001", elastic=elastic, settings=settings_kratos)
+
+    by_ip = {p.ip: p for p in ctx.host_alert_profiles}
+    assert set(by_ip) == {src, dst}
+    assert by_ip[src].end == "source"
+    assert by_ip[dst].end == "destination"
+    # The destination's scan alerts do NOT appear under the source host.
+    assert by_ip[src].as_source == {"ET POLICY Outbound fetch": 2}
+    assert by_ip[src].as_destination == {}
+    assert by_ip[dst].as_destination == {"ET SCAN Inbound probe": 7}
+    assert by_ip[dst].as_source == {}
+    # The pooled histogram stays for the gates that read it.
+    assert ctx.host_alert_profile == {"ET SCAN Inbound probe": 7, "ET POLICY Outbound fetch": 2}
+    # The query asks for each side of each end by name.
+    agg_call = next(c for c in fake_es.search.call_args_list if "aggs" in c.kwargs.get("body", {}))
+    filters = agg_call.kwargs["body"]["aggs"]["ends"]["filters"]["filters"]
+    assert filters[f"source|{src}"] == {"term": {"source.ip": src}}
+    assert filters[f"destination|{dst}"] == {"term": {"destination.ip": dst}}
 
 
 @pytest.mark.asyncio
@@ -806,6 +939,7 @@ async def test_host_risk_degrades_gracefully_on_agg_failure(
     )
     ctx = await get_alert_context("alert-001", elastic=elastic, settings=settings_kratos)
     assert ctx.host_alert_profile == {}
+    assert ctx.host_alert_profiles == []
     assert ctx.alert.id == "alert-001"
 
 
@@ -852,7 +986,11 @@ async def test_host_pivot_skipped_when_host_name_is_observer_name(
 
     assert _host_pivot_queries(fake_es) == []  # no host.name term query issued
     assert ctx.host_events == []
-    assert ctx.pivot_summary["host"] == 0
+    # The pivot did not run, so the summary carries no zero for it. The note
+    # says why: the internal source ships nothing in the window.
+    assert "host" not in ctx.pivot_summary
+    assert ctx.host_pivot_note is not None
+    assert ctx.host_pivot_note.startswith("The host pivot did not run.")
     assert ctx.prefetch_gaps.get("host.name") == "skipped_sensor_identity"
 
 
@@ -1017,8 +1155,9 @@ async def test_scenario_scope_excludes_siblings_keeps_own_and_real(
     real_doc: dict[str, Any] = {}
 
     fanouts = _fanout_must_nots(fake_es)
-    # 5 tight pivots + host-risk agg + behavioral pivot + endpoint-coverage check.
-    assert len(fanouts) == 8
+    # 5 tight pivots + host-risk agg + behavioral pivot + endpoint-coverage check
+    # + host coverage read.
+    assert len(fanouts) == 9
     for must_not in fanouts:
         assert _visible(own_plant, must_not), must_not
         assert _visible(real_doc, must_not), must_not
@@ -1388,8 +1527,9 @@ async def test_endpoint_coverage_costs_exactly_one_bounded_query(
     # Bounded in time (window centered on the alert) and in dataset scope.
     filters = body["query"]["bool"]["filter"]
     assert any("range" in f for f in filters)
-    # Total prefetch fan-out: lookup + 5 pivots + host-risk + behavioral + coverage.
-    assert fake_es.search.call_count == 9
+    # Total prefetch fan-out: lookup + 5 pivots + host-risk + behavioral +
+    # coverage + one host coverage read for the internal source.
+    assert fake_es.search.call_count == 10
 
 
 @pytest.mark.asyncio
@@ -1508,6 +1648,48 @@ def test_materialized_evidence_cites_endpoint_coverage_gap() -> None:
     )
 
 
+def _covered_entry() -> Any:
+    from soc_ai.dossier.coverage import DatasetCount, HostCoverage, PlaneCoverage
+    from soc_ai.tools.get_alert_context import EndpointCoverage
+
+    planes = [
+        PlaneCoverage(
+            plane="host_logs",
+            present=True,
+            count=11309,
+            datasets=[DatasetCount(dataset="system.auth", count=11309)],
+        ),
+        *(
+            PlaneCoverage(plane=p, present=False)
+            for p in ("process", "endpoint_network", "windows_security", "osquery", "agent_self")
+        ),
+    ]
+    return EndpointCoverage(
+        ip=_INTERNAL_SRC, end="source", coverage=HostCoverage(read_ok=True, planes=planes)
+    )
+
+
+def test_materialized_evidence_states_host_coverage_and_the_pivot_note() -> None:
+    """The round-1 synthesizer has no tools. It gets the coverage as a citable bullet."""
+    from soc_ai.agent.evidence import _materialize_prefetch_evidence, _path_exists_in_alert
+    from soc_ai.so_client.models import SoAlert
+
+    ctx = AlertContext(
+        alert=SoAlert(id="alert-cov-3", rule_name="ET INFO External IP Lookup"),
+        host_coverage=[_covered_entry()],
+        host_pivot_note="The host pivot ran on host.ip 192.0.2.41 over the alert window. "
+        "It found 0 host document(s).",
+    )
+    bullets = _materialize_prefetch_evidence(ctx)
+    coverage = [b for b in bullets if b.startswith("host coverage:")]
+    assert len(coverage) == 1
+    assert f"{_INTERNAL_SRC} ships host logs (system.auth 11,309)" in coverage[0]
+    assert f"{_INTERNAL_SRC} ships no process events and no endpoint network events" in coverage[0]
+    assert _path_exists_in_alert(ctx, "host_coverage.0.coverage.read_ok")
+    assert any(b.startswith("host pivot: The host pivot ran") for b in bullets)
+    assert _path_exists_in_alert(ctx, "host_pivot_note")
+
+
 @pytest.mark.asyncio
 async def test_investigator_loop_message_carries_coverage_block(
     settings_kratos: Settings,
@@ -1553,6 +1735,8 @@ async def test_investigator_loop_message_carries_coverage_block(
     async def _stub_enriched(alert_id: str, **_kw: Any) -> Any:
         enriched = _malware_signal_enriched(alert_id)
         enriched.prefetch_gaps[ENDPOINT_COVERAGE_GAP_KEY] = ENDPOINT_COVERAGE_HOST_UNCOVERED
+        enriched.host_coverage = [_covered_entry()]
+        enriched.host_pivot_note = "The host pivot did not run. Test note."
         return enriched
 
     with (
@@ -1575,3 +1759,214 @@ async def test_investigator_loop_message_carries_coverage_block(
     block = format_endpoint_coverage_block(ENDPOINT_COVERAGE_HOST_UNCOVERED)
     assert block  # the block renders...
     assert block in prompt  # ...and lands verbatim in the loop's user message
+    # The host coverage block rides the same message, in both directions.
+    assert "## Host coverage for this alert's internal hosts" in prompt
+    assert f"{_INTERNAL_SRC} ships host logs (system.auth 11,309)." in prompt
+    assert "The host pivot did not run. Test note." in prompt
+
+
+# =====================================================================
+# Host coverage in the prefetch: every internal endpoint, both directions
+# =====================================================================
+#
+# Production triaged twelve alerts on one Linux server and wrote "no host
+# telemetry" each time. The host shipped system.syslog, system.auth and
+# osquery. The old check counted those as covered and rendered NOTHING, the
+# host pivot was skipped for every network alert, and host_events=0 read as
+# "no host-level events". These tests pin the coverage line, the address
+# pivot and the honest "did not run".
+
+_INTERNAL_SRC = "192.0.2.41"
+_EXTERNAL_DST = "203.0.113.10"
+_RFC5737_INTERNAL = ["192.0.2.0/24"]
+
+
+def _network_alert(sample_alert: dict[str, Any]) -> dict[str, Any]:
+    """The Security Onion network-alert shape: no host.name, a suricata dataset."""
+    doc = copy.deepcopy(sample_alert)
+    del doc["_source"]["host"]
+    doc["_source"]["source"]["ip"] = _INTERNAL_SRC
+    doc["_source"]["destination"]["ip"] = _EXTERNAL_DST
+    doc["_source"]["event"]["dataset"] = "suricata.alert"
+    return doc
+
+
+_HOST_LOGS_ONLY = {
+    "system.syslog": 62713,
+    "system.auth": 11309,
+    "osquery_manager.result": 2623,
+}
+
+
+def _host_doc(doc_id: str, dataset: str) -> dict[str, Any]:
+    return {
+        "_id": doc_id,
+        "_source": {
+            "@timestamp": "2026-05-07T10:29:30Z",
+            "event": {"dataset": dataset},
+            "host": {"name": "app-01", "ip": [_INTERNAL_SRC]},
+            "message": "Accepted publickey for alice from 198.51.100.7 port 50022 ssh2",
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_covered_internal_host_gets_its_planes_and_an_address_pivot(
+    settings_kratos: Settings, sample_alert: dict[str, Any]
+) -> None:
+    alert_doc = _network_alert(sample_alert)
+    elastic, fake_es = _make_elastic(
+        settings_kratos,
+        [_alert_lookup_response(alert_doc), *([_EMPTY_HITS] * 5)],
+        host_coverage_response=_host_coverage_response(_HOST_LOGS_ONLY, agent_name="app-01"),
+        address_pivot_response=_hits_response(
+            [_host_doc("auth-1", "system.auth"), _host_doc("sys-1", "system.syslog")]
+        ),
+    )
+    ctx = await get_alert_context(
+        "alert-001",
+        elastic=elastic,
+        settings=settings_kratos,
+        internal_cidrs=_RFC5737_INTERNAL,
+    )
+
+    # One coverage entry, for the internal end only.
+    assert [(c.ip, c.end) for c in ctx.host_coverage] == [(_INTERNAL_SRC, "source")]
+    cov = ctx.host_coverage[0].coverage
+    assert cov.read_ok and cov.present == ["host_logs", "osquery"]
+
+    # The host.name pivot cannot run on a network alert; the address pivot did.
+    assert ctx.prefetch_gaps.get("host.name") == "skipped_field_absent"
+    assert [e.id for e in ctx.host_events] == ["auth-1", "sys-1"]
+    assert ctx.pivot_summary["host"] == 2
+    assert ctx.host_pivot_note is not None
+    assert "ran" in ctx.host_pivot_note and _INTERNAL_SRC in ctx.host_pivot_note
+
+    pivot = next(
+        c.kwargs["body"]
+        for c in fake_es.search.call_args_list
+        if _is_address_host_pivot(c.kwargs["body"])
+    )
+    should = next(f["bool"]["should"] for f in pivot["query"]["bool"]["filter"] if "bool" in f)
+    assert {"terms": {"host.ip": [_INTERNAL_SRC]}} in should
+    assert {"terms": {"host.name": ["app-01"]}} in should
+    # The alert window, the same window_seconds as the other pivots.
+    rng = next(f["range"] for f in pivot["query"]["bool"]["filter"] if "range" in f)
+    assert rng["@timestamp"]["gte"].startswith("2026-05-07T10:25:00")
+    must_not = pivot["query"]["bool"]["must_not"]
+    assert {"ids": {"values": ["alert-001"]}} in must_not
+
+
+@pytest.mark.asyncio
+async def test_an_uncovered_host_runs_no_pivot_and_never_shows_a_zero(
+    settings_kratos: Settings, sample_alert: dict[str, Any]
+) -> None:
+    """host_events=0 from a pivot that never ran read as "no host-level events"."""
+    alert_doc = _network_alert(sample_alert)
+    elastic, fake_es = _make_elastic(
+        settings_kratos,
+        [_alert_lookup_response(alert_doc), *([_EMPTY_HITS] * 5)],
+        host_coverage_response=_host_coverage_response({}),
+    )
+    ctx = await get_alert_context(
+        "alert-001",
+        elastic=elastic,
+        settings=settings_kratos,
+        internal_cidrs=_RFC5737_INTERNAL,
+    )
+
+    assert not any(_is_address_host_pivot(c.kwargs["body"]) for c in fake_es.search.call_args_list)
+    assert "host" not in ctx.pivot_summary
+    assert ctx.host_events == []
+    assert ctx.host_pivot_note is not None
+    assert ctx.host_pivot_note.startswith("The host pivot did not run.")
+
+
+@pytest.mark.asyncio
+async def test_a_failed_coverage_read_is_unknown_and_runs_no_pivot(
+    settings_kratos: Settings, sample_alert: dict[str, Any]
+) -> None:
+    alert_doc = _network_alert(sample_alert)
+    elastic, _fake_es = _make_elastic(
+        settings_kratos,
+        [_alert_lookup_response(alert_doc), *([_EMPTY_HITS] * 5)],
+        host_coverage_response=RuntimeError("simulated timeout"),
+    )
+    ctx = await get_alert_context(
+        "alert-001",
+        elastic=elastic,
+        settings=settings_kratos,
+        internal_cidrs=_RFC5737_INTERNAL,
+    )
+
+    assert ctx.host_coverage[0].coverage.read_ok is False
+    assert "host" not in ctx.pivot_summary
+    assert ctx.host_pivot_note is not None
+    assert "could not read" in ctx.host_pivot_note
+
+
+@pytest.mark.asyncio
+async def test_an_external_endpoint_gets_no_coverage_read(
+    settings_kratos: Settings, sample_alert: dict[str, Any]
+) -> None:
+    alert_doc = _network_alert(sample_alert)
+    elastic, fake_es = _make_elastic(
+        settings_kratos,
+        [_alert_lookup_response(alert_doc), *([_EMPTY_HITS] * 5)],
+    )
+    # No internal range covers either end: no coverage read is spent.
+    ctx = await get_alert_context(
+        "alert-001", elastic=elastic, settings=settings_kratos, internal_cidrs=["10.0.0.0/8"]
+    )
+    assert ctx.host_coverage == []
+    assert not any(_is_host_coverage_query(c.kwargs["body"]) for c in fake_es.search.call_args_list)
+    assert ctx.host_pivot_note == "The host pivot did not run. The alert has no internal endpoint."
+
+
+def test_the_endpoint_check_counts_osquery_and_agent_self_logs() -> None:
+    from soc_ai.so_client.models import SoAlert
+    from soc_ai.tools.get_alert_context import _alert_is_endpoint_document
+
+    for dataset in ("osquery_manager.result", "elastic_agent.filebeat", "elastic_agent"):
+        assert _alert_is_endpoint_document(SoAlert(id="x", event_dataset=dataset)), dataset
+
+
+def test_the_coverage_block_states_both_directions() -> None:
+    """A covered host gets one line that names its planes and the planes it lacks."""
+    from soc_ai.agent.prompts import format_host_coverage_block
+    from soc_ai.dossier.coverage import DatasetCount, HostCoverage, PlaneCoverage
+    from soc_ai.tools.get_alert_context import EndpointCoverage
+
+    planes = [
+        PlaneCoverage(
+            plane="host_logs",
+            present=True,
+            count=74022,
+            datasets=[
+                DatasetCount(dataset="system.syslog", count=62713),
+                DatasetCount(dataset="system.auth", count=11309),
+            ],
+        ),
+        PlaneCoverage(plane="process", present=False),
+        PlaneCoverage(plane="endpoint_network", present=False),
+        PlaneCoverage(plane="windows_security", present=False),
+        PlaneCoverage(
+            plane="osquery",
+            present=True,
+            count=2623,
+            datasets=[DatasetCount(dataset="osquery_manager.result", count=2623)],
+        ),
+        PlaneCoverage(plane="agent_self", present=False),
+    ]
+    entry = EndpointCoverage(
+        ip=_INTERNAL_SRC, end="source", coverage=HostCoverage(read_ok=True, planes=planes)
+    )
+    block = format_host_coverage_block([entry], "The host pivot did not run. Test.")
+    assert block.startswith("\n\n## Host coverage")
+    assert (
+        f"{_INTERNAL_SRC} ships host logs (system.syslog 62,713, system.auth 11,309) and "
+        "osquery (osquery_manager.result 2,623)." in block
+    )
+    assert f"{_INTERNAL_SRC} ships no process events and no endpoint network events." in block
+    assert "The host pivot did not run. Test." in block
+    assert format_host_coverage_block([], None) == ""

@@ -41,6 +41,7 @@ import contextlib
 import ipaddress
 import socket
 import ssl
+import time
 from collections.abc import Awaitable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -48,6 +49,7 @@ from typing import Any, Literal
 from urllib.parse import urlparse
 
 from alembic.script import ScriptDirectory
+from elastic_transport import ConnectionTimeout as EsConnectionTimeout
 from elasticsearch import ApiError, AuthenticationException
 from pydantic import ValidationError
 from sqlalchemy import text
@@ -60,7 +62,13 @@ from soc_ai.so_client.auth import make_auth
 from soc_ai.so_client.elastic import ElasticClient, GridPartialResultsError
 from soc_ai.store.db import _migration_config, make_engine
 from soc_ai.webui import alerts_query as aq
-from soc_ai.webui.probes import _safe_reason, _scrub, list_gateway_models, probe_model_fitness
+from soc_ai.webui.probes import (
+    PROBE_BUDGET_S,
+    _safe_reason,
+    _scrub,
+    list_gateway_models,
+    probe_model_fitness,
+)
 
 CheckStatus = Literal["PASS", "WARN", "FAIL", "INFO"]
 
@@ -122,11 +130,20 @@ _COVERAGE_TIMEOUT_S = 8.0  # 3 CONCURRENT searches — worst case is ~one 5s rou
 _ALERT_FILTER_TIMEOUT_S = 8.0  # same shape: 4 CONCURRENT size=0 counts, one round trip
 _GATEWAY_TIMEOUT_S = 12.0  # list_gateway_models carries its own 10s HTTP timeout
 _FITNESS_TIMEOUT_S = 150.0  # probes._FITNESS_TOTAL_TIMEOUT_S (130s) + headroom
+# The audit chain row verifies the last 24 h under its own short bound and
+# reports INFO "not checked" when the grid is slow. The _isolated wrapper sits
+# above that bound, so a slow grid never reads as a FAIL of the chain.
+_AUDIT_CHAIN_TIMEOUT_S = 15.0
+_AUDIT_CHAIN_WRAP_S = _AUDIT_CHAIN_TIMEOUT_S + 5.0
+# A day of a busy deployment is about 25 000 records; the bound keeps the row
+# cheap on a grid that writes far more.
+_AUDIT_CHAIN_MAX_RECORDS = 100_000
 
 # Client-side per-request timeout for the doctor's ES calls — deliberately
 # tighter than the app's es_request_timeout_s (30s) so a slow/wedged cluster
-# fails fast here, and with retries off (one honest attempt, not 3).
-_ES_REQUEST_TIMEOUT_S = 5
+# fails fast here, and with retries off (one honest attempt, not 3). It is the
+# shared probe budget, the same one the header pill and Test ES wait for.
+_ES_REQUEST_TIMEOUT_S = int(PROBE_BUDGET_S)
 
 
 def _probe_client(settings: Settings) -> ElasticClient:
@@ -169,7 +186,7 @@ def check_config() -> tuple[Settings | None, CheckResult]:
             _safe_reason(exc),
             hint="Check that .env exists and is readable. Every line must parse as KEY=value.",
         )
-    return settings, CheckResult("config", "PASS", "settings loaded from env/.env")
+    return settings, CheckResult("config", "PASS", "settings loaded from env/.env.")
 
 
 async def apply_persisted_overrides(settings: Settings) -> list[str]:
@@ -644,8 +661,11 @@ async def check_elasticsearch(settings: Settings) -> list[CheckResult]:
     name = "elasticsearch"
     pattern = settings.events_index_pattern
     elastic = _probe_client(settings)
+    ping_s: float | None = None
     try:
+        started = time.monotonic()
         info = await elastic.ping()
+        ping_s = time.monotonic() - started
         cluster = str(info.get("cluster") or "") or "(unknown cluster)"
         version = str(info.get("version") or "") or "?"
         result = await elastic.search(
@@ -705,11 +725,35 @@ async def check_elasticsearch(settings: Settings) -> list[CheckResult]:
             )
         ]
     except Exception as exc:
+        if ping_s is not None:
+            # The base URL answered. A connectivity remedy here sent the
+            # operator to ES_HOSTS, TLS and the firewall while `/` answered
+            # in 0.02 s (fleet 2026-10-01, RA16).
+            timed_out = isinstance(exc, (TimeoutError, EsConnectionTimeout))
+            what = (
+                f"a search timed out after {_ES_REQUEST_TIMEOUT_S} s"
+                if timed_out
+                else f"a search failed: {_safe_reason(exc)}"
+            )
+            return [
+                CheckResult(
+                    name,
+                    "FAIL",
+                    f"the ping answered in {ping_s:.2f} s, but {what}",
+                    hint=(
+                        "The grid is overloaded. Check the Elasticsearch load and the "
+                        "shard health. The address and the network route work."
+                        if timed_out
+                        else "Elasticsearch answers on the base URL. Check the Elasticsearch "
+                        "load and the shard health."
+                    ),
+                )
+            ]
         return [
             CheckResult(
                 name,
                 "FAIL",
-                f"unreachable: {_safe_reason(exc)}",
+                f"unreachable, no answer on the base URL: {_safe_reason(exc)}",
                 hint="Check ES_HOSTS and the network route. Check TLS with ES_VERIFY_SSL. "
                 "Check the SO firewall pinhole for this host.",
             )
@@ -1318,20 +1362,94 @@ async def check_model_fitness(settings: Settings) -> list[CheckResult]:
     ]
 
 
+# ── Check 5c: audit chain (last 24 h) ────────────────────────────────────────
+
+
+async def check_audit_chain(
+    settings: Settings, *, timeout_s: float = _AUDIT_CHAIN_TIMEOUT_S
+) -> CheckResult:
+    """Verify the audit hash chain over the last 24 h, with a bounded read.
+
+    The doctor and the preflight said green while the verify-chain endpoint
+    said the chain was broken: neither looked at the chain. This row closes
+    that gap with the same streamed verifier the CLI and the endpoint use.
+
+    PASS intact. WARN duplicate sequence numbers only: two writers appended at
+    once, and no record was altered. FAIL any other break: a record was
+    altered, deleted or reordered. INFO when the check could not run: a slow
+    grid is not a verdict about the chain.
+    """
+    from soc_ai.audit import verify as audit_verify  # noqa: PLC0415 - lazy
+
+    name = "audit chain"
+    hint_run = "Run soc-ai audit verify --days 1 to check the chain."
+    elastic = _probe_client(settings)
+    try:
+        result = await asyncio.wait_for(
+            audit_verify.verify_audit_chain(
+                elastic,
+                settings.audit_index_alias,
+                days=1,
+                max_records=_AUDIT_CHAIN_MAX_RECORDS,
+            ),
+            timeout=timeout_s,
+        )
+    except TimeoutError:
+        return CheckResult(
+            name,
+            "INFO",
+            f"not checked: the grid did not answer in {timeout_s:.0f} s.",
+            hint=hint_run,
+        )
+    except GridPartialResultsError:
+        return CheckResult(
+            name,
+            "INFO",
+            "not checked: the grid read only part of the audit index.",
+            hint=hint_run,
+        )
+    except Exception as exc:
+        return CheckResult(name, "INFO", f"not checked: {_safe_reason(exc)}", hint=hint_run)
+    finally:
+        with contextlib.suppress(Exception):
+            await elastic.aclose()
+
+    if result.ok:
+        if result.records_verified == 0:
+            return CheckResult(name, "PASS", "intact. The last 24 h hold no audit records.")
+        detail = (
+            f"intact: {result.records_verified} records in the last 24 h, "
+            f"seq {result.first_seq}..{result.last_seq}."
+        )
+        if result.capped:
+            detail += " The check read the newest records only."
+        return CheckResult(name, "PASS", detail)
+    blast = audit_verify.describe_blast_radius(result)
+    if audit_verify.is_duplicates_only(result):
+        return CheckResult(
+            name,
+            "WARN",
+            f"duplicate sequence numbers in the last 24 h: {result.duplicate_seqs}. "
+            "No record was altered.",
+            hint="Two writers appended at once. Run soc-ai audit verify for the detail.",
+        )
+    what = "a record was altered" if result.altered_records else "the chain does not verify"
+    return CheckResult(
+        name,
+        "FAIL",
+        f"{what} in the last 24 h. {blast}".strip(),
+        hint="Run soc-ai audit verify --days 1 for the detail. Treat an altered record as "
+        "an incident.",
+    )
+
+
 # ── Check 6: egress posture (INFO only) ──────────────────────────────────────
 
 # The doctor lines mirror the config console's egress-policy read-model
 # (soc_ai.api.webui.routes_config.api_egress_policy) — same row builder, same
-# wording — restricted to the always-relevant destinations. INFO only: posture
-# is a fact to surface, never a pass/fail judgement.
-_EGRESS_DOCTOR_IDS = (
-    "oracle",
-    "analyst_cloud",
-    "notifications",
-    "rag_gateway",
-    "misp",
-    "update_check",
-)
+# wording, and the SAME ROWS. It used to list six of the nine, and the three it
+# left out (web search, page fetch, online enrichment) were the ones switched
+# on. INFO only: posture is a fact to surface, never a pass/fail judgement.
 
 
 def check_egress_posture(settings: Settings) -> list[CheckResult]:
@@ -1351,18 +1469,23 @@ def check_egress_posture(settings: Settings) -> list[CheckResult]:
         CheckResult(
             "egress",
             "INFO",
-            "zero egress: " + ("yes. Every egress destination is off." if zero_egress else "no."),
+            "zero egress: "
+            + (
+                "yes. Every egress destination is off."
+                if zero_egress
+                else "no. At least one egress destination is on."
+            ),
         )
     ]
     for row in rows:
-        if row["id"] not in _EGRESS_DOCTOR_IDS:
-            continue
         state = "ON" if row["enabled"] else "off"
+        label = str(row["label"]).rstrip(".")
+        redaction = str(row["redaction"]).rstrip(".")
         results.append(
             CheckResult(
                 f"egress: {row['id']}",
                 "INFO",
-                f"{state}. {row['label']}. Redaction: {row['redaction']}.",
+                f"{state}. {label}. Redaction: {redaction}.",
             )
         )
     return results
@@ -1511,9 +1634,9 @@ def _blocklist_hint(settings: Settings, missing: list[str], stale: list[str]) ->
         joined = ", ".join(unrefreshable)
         return (
             f"{joined} need a free abuse.ch Auth-Key. ABUSE_CH_AUTH_KEY is not set, so "
-            f"`soc-ai blocklists refresh` skips them. This warning cannot clear. Register "
-            f"at https://auth.abuse.ch/ and set the key. You can instead drop {joined} "
-            f"from blocklist_sources. Triage is fail-open either way. See "
+            f"`soc-ai blocklists refresh` skips them. The warning stays until you do one "
+            f"of two things. Register at https://auth.abuse.ch/ and set the key. Or remove "
+            f"{joined} from blocklist_sources. Triage continues in both cases. See "
             f"docs/BLOCKLISTS.md."
         )
     return (
@@ -1707,7 +1830,8 @@ async def run_doctor(
         applied = await apply_persisted_overrides(settings)
         if applied:
             cfg.detail += (
-                f" The config console holds {len(applied)} saved non-secret setting(s): "
+                f" The config console holds {len(applied)} saved non-secret "
+                f"setting{'' if len(applied) == 1 else 's'}: "
                 f"{', '.join(sorted(applied))}. Saved secrets also apply. This list does not "
                 "show them."
             )
@@ -1740,6 +1864,7 @@ async def run_doctor(
             _solo(check_alerts_feed_filter(settings)),
             _ALERT_FILTER_TIMEOUT_S,
         ),
+        _isolated("audit chain", _solo(check_audit_chain(settings)), _AUDIT_CHAIN_WRAP_S),
         _isolated("gateway", check_gateway(settings), _GATEWAY_TIMEOUT_S),
     ]
     if include_fitness:

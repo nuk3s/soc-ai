@@ -149,6 +149,7 @@ _DEP_TROUBLE = {
     "partial": "reading only part of the grid",
     "overloaded": "overloaded and shedding load",
     "timeout": "not answering",
+    "slow": "slow to answer",
     # Reachable but with no events index pattern configured: the connection is
     # fine and nothing can be read through it, which "unreachable" would
     # misdescribe and send the reader at the network.
@@ -589,6 +590,9 @@ async def list_notifications(request: Request) -> list[NotificationOut]:
             finished_since=cutoff,
             no_verdict=True,
             exclude_dismissed=True,
+            # Only the alert's primary run. A failed run that a later run
+            # settled is not a standing fault (dogfood 2026-10-01 D1).
+            primary_only=True,
         )
         hunts_done = await hunts_svc.list_recent_notifications(
             db, status="complete", limit=10, finished_since=cutoff
@@ -834,17 +838,22 @@ async def get_me(request: Request) -> MeOut:
 async def set_my_status(request: Request, body: SetStatusIn) -> dict[str, str | bool]:
     """Update the current user's status string (trim + cap at 64 chars).
 
-    In dev mode with no session the request is a no-op that echoes back the
-    (sanitised) status — nothing is persisted.
+    Requires a real session user, like ``/me/password``. A caller with no
+    session (auth off, or a bearer token with no user row) gets a 401
+    ``no_session``. It used to get ``{"ok": true}`` with nothing stored, so the
+    account menu showed the new status and a reload lost it (dogfood
+    2026-10-01, RD4).
     """
     trimmed = body.status.strip()[:64]
     user = await current_user(request)
     if user is None:
-        # No session (dev / no-auth mode, or a bearer-token caller with no user
-        # row): nothing to persist, echo back. The CSRF layer already governs
-        # who may POST here; this endpoint is also the suite's canonical
-        # authenticated-POST probe, so it must stay a 200 for bearer callers.
-        return {"ok": True, "status": trimmed}
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "reason": "no_session",
+                "hint": "A status needs a signed-in user. This session has no user account.",
+            },
+        )
     async with request.app.state.db_sessionmaker() as db:
         await auth_svc.set_user_status(db, user.id, trimmed)
     return {"ok": True, "status": trimmed}
@@ -871,8 +880,8 @@ async def change_my_password(request: Request, body: ChangePasswordIn) -> dict[s
     Requires a real session user: this endpoint asks "prove you know the
     CURRENT password", which only means something for an account with a stored
     hash. A bearer-token caller (or the no-auth dev fallback) has no such
-    account, so it gets a 401 rather than a confusing no-op — the deliberate
-    contrast with ``/me/status``, which echoes for those callers.
+    account, so it gets a 401 rather than a confusing no-op. ``/me/status``
+    answers those callers the same way.
 
     The current password is verified BEFORE the new one is validated: proving
     the credential is the authentication step, so a caller riding a borrowed
@@ -1086,6 +1095,10 @@ _HEALTH_PROBE_TTL_S = 15.0
 class HealthComponentOut(BaseModel):
     ok: bool
     detail: str
+    # "ok", "slow" or "down". A leg over its budget, or one that answered late,
+    # is "slow" and never ok (fleet 2026-10-01, RA1).
+    state: str = ""
+    elapsed_ms: int | None = None
     # WHICH failure, when ok is False: "partial", "overloaded", "timeout",
     # "refused" (see soc_ai.webui.probes). Every surface used to hardcode
     # "<dep> not reachable", so a grid answering 429 — up, replying, shedding
@@ -1104,6 +1117,10 @@ class HealthComponentOut(BaseModel):
         out: dict[str, Any] = {"ok": self.ok, "detail": self.detail}
         if self.kind:
             out["kind"] = self.kind
+        if self.state:
+            out["state"] = self.state
+        if self.elapsed_ms is not None:
+            out["elapsed_ms"] = self.elapsed_ms
         return out
 
 
@@ -1116,6 +1133,11 @@ class HealthOut(BaseModel):
     # the pill say "connected" beside a card reporting a Security Onion timeout.
     so: HealthComponentOut
     pcap: HealthComponentOut | None = None  # only when pcap_enabled
+    # When the ES, LLM and Security Onion legs were last probed, and how old
+    # that is. The legs are cached for a few seconds, and a cached "ok" read
+    # as a live one (fleet 2026-10-01, RA1).
+    checked_at: str | None = None
+    age_s: float | None = None
 
 
 async def _cached_pcap_probe(state: Any, settings: Settings) -> dict[str, Any]:
@@ -1144,24 +1166,54 @@ async def _cached_pcap_probe(state: Any, settings: Settings) -> dict[str, Any]:
 # Hard bound on ONE health probe leg. Without it, probe_es rides the ES
 # client's own timeout+retry stack (~90s worst case with a down grid) — which
 # made /health, the very endpoint the UI's degraded-mode banner keys off, the
-# slowest thing on the page during an outage (dogfood 2026-08-05).
-_HEALTH_PROBE_LEG_TIMEOUT_S = 5.0
+# slowest thing on the page during an outage (dogfood 2026-08-05). It is the
+# shared probe budget, so the pill, Test ES and the doctor wait the same time.
+_HEALTH_PROBE_LEG_TIMEOUT_S = probes.PROBE_BUDGET_S
+
+# A leg that answered but used more than this share of its budget is "slow",
+# and slow is not ok. A size=1 search that takes 3 s on a grid whose real
+# reads take 17 s is the grid stalling, and the pill said "connected" over it
+# (fleet 2026-10-01, RA1).
+_HEALTH_SLOW_SHARE = 0.6
 
 
-async def _bounded_probe(coro: Any, dep: str) -> dict[str, Any]:
-    """One probe leg under the hard bound; a timeout IS the down verdict."""
+async def _bounded_probe(coro: Any, dep: str, settings: Settings | None = None) -> dict[str, Any]:
+    """One probe leg under the shared budget, with its state and its time.
+
+    ``state`` is "ok", "slow" or "down". A leg that ran out of its budget is
+    slow with kind "timeout", and a leg that answered late is slow with kind
+    "slow". Neither is ok.
+    """
+    budget = min(_HEALTH_PROBE_LEG_TIMEOUT_S, probes.probe_budget_s(settings))
+    started = time.monotonic()
     try:
-        async with asyncio.timeout(_HEALTH_PROBE_LEG_TIMEOUT_S):
-            return await coro  # type: ignore[no-any-return]
+        async with asyncio.timeout(budget):
+            result: dict[str, Any] = dict(await coro)
     except TimeoutError:
         return {
             "ok": False,
             "kind": "timeout",
-            "detail": (
-                f"the {dep} probe exceeded {_HEALTH_PROBE_LEG_TIMEOUT_S:.0f} s. "
-                "soc-ai treats it as down."
-            ),
+            "state": "slow",
+            "elapsed_ms": int(budget * 1000),
+            "detail": f"{dep} did not answer the probe in {budget:g} s. soc-ai treats it as down.",
         }
+    elapsed = time.monotonic() - started
+    result["elapsed_ms"] = int(elapsed * 1000)
+    if not result.get("ok"):
+        result["state"] = "down"
+    elif elapsed > budget * _HEALTH_SLOW_SHARE:
+        result.update(
+            ok=False,
+            kind="slow",
+            state="slow",
+            detail=(
+                f"{dep} answered the probe in {elapsed:.1f} s. The budget is {budget:g} s. "
+                "soc-ai treats it as slow."
+            ),
+        )
+    else:
+        result["state"] = "ok"
+    return result
 
 
 async def _cached_health_probes(state: Any, settings: Settings) -> dict[str, dict[str, Any]]:
@@ -1189,16 +1241,38 @@ async def _cached_health_probes(state: Any, settings: Settings) -> dict[str, dic
         if cached is not None and now - cached[0] < _HEALTH_PROBE_TTL_S:
             return cached[1]  # type: ignore[no-any-return]
         result = {
-            "es": await _bounded_probe(probes.probe_es(state.elastic, settings), "elasticsearch"),
-            "llm": await _bounded_probe(probes.probe_llm(settings), "llm gateway"),
+            "es": await _bounded_probe(
+                probes.probe_es(state.elastic, settings), "Elasticsearch", settings
+            ),
+            "llm": await _bounded_probe(probes.probe_llm(settings), "The LLM gateway", settings),
             "so": await _bounded_probe(
                 probes.probe_so_api(getattr(state, "auth", None), settings),
-                "security onion api",
+                "The Security Onion API",
+                settings,
             ),
         }
         state._health_probe_cache = (now, result)
+        state._health_checked_at = datetime.now(tz=UTC)
+        if cached is not None and _ok_flags(cached[1]) != _ok_flags(result):
+            # A dependency flipped. The setup-health card reads a doctor run
+            # cached for ten minutes, and it said "2 checks failing" beside a
+            # pill that said "connected" (fleet 2026-10-01, RD5). Drop it so
+            # the next poll runs the doctor against the state the pill shows.
+            state._preflight_cache = None
         _note_dep_transitions(state, result)
         return result
+
+
+def _ok_flags(probed: dict[str, dict[str, Any]]) -> dict[str, bool]:
+    return {dep: bool(res.get("ok")) for dep, res in probed.items()}
+
+
+def health_ok_by_dependency(probed: dict[str, dict[str, Any]]) -> dict[str, bool]:
+    """The live ES and Security Onion state, keyed by the agent-tools labels."""
+    return {
+        "Elasticsearch": bool(probed.get("es", {}).get("ok")),
+        "Security Onion": bool(probed.get("so", {}).get("ok")),
+    }
 
 
 def _note_dep_transitions(state: Any, probed: dict[str, dict[str, Any]]) -> None:
@@ -1241,11 +1315,21 @@ async def health(
     """Live status of the upstreams the UI depends on. ES, the model gateway and
     the Security Onion web API are cheap HTTP probes (short-TTL cached); PCAP
     (heavy SSH) is cached longer. Secret-free."""
-    probed = await _cached_health_probes(request.app.state, settings)
+    state = request.app.state
+    probed = await _cached_health_probes(state, settings)
+    checked = getattr(state, "_health_checked_at", None)
     out = HealthOut(
         es=HealthComponentOut(**probed["es"]),
         llm=HealthComponentOut(**probed["llm"]),
         so=HealthComponentOut(**probed["so"]),
+        checked_at=(
+            checked.isoformat().replace("+00:00", "Z") if isinstance(checked, datetime) else None
+        ),
+        age_s=(
+            round((datetime.now(tz=UTC) - checked).total_seconds(), 1)
+            if isinstance(checked, datetime)
+            else None
+        ),
     )
     if settings.pcap_enabled:
         out.pcap = HealthComponentOut(**await _cached_pcap_probe(request.app.state, settings))

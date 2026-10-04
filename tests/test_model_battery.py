@@ -441,7 +441,7 @@ def test_fitness_api_serves_cache_within_ttl(tmp_path):
     with p1, p2, p3, patch("soc_ai.webui.probes.probe_model_fitness", fake_probe):
         app = create_app()
         with TestClient(app) as client:
-            first = client.get("/api/v1/config/model-fitness").json()
+            first = client.get("/api/v1/config/model-fitness?force=true").json()
             assert first["grade"] == "pass"
             assert first["cached"] is False
             assert len(calls) == 1
@@ -467,16 +467,18 @@ def test_fitness_api_force_bypasses_cache(tmp_path):
     with p1, p2, p3, patch("soc_ai.webui.probes.probe_model_fitness", fake_probe):
         app = create_app()
         with TestClient(app) as client:
-            client.get("/api/v1/config/model-fitness")
+            client.get("/api/v1/config/model-fitness?force=true")
             forced = client.get("/api/v1/config/model-fitness?force=true").json()
             assert forced["cached"] is False
             assert len(calls) == 2
 
 
-def test_fitness_api_stale_cache_reprobes(tmp_path):
-    """Past the TTL the cache is stale and the route probes again."""
+def test_fitness_api_stale_cache_is_served_without_a_probe(tmp_path):
+    """Past the TTL a plain GET serves the stale verdict marked stale and runs
+    no probe. Only ?force=true measures again (fleet 2026-10-01, A12: a GET
+    that took 26 s and wrote a cache row, an audit event and a webhook)."""
     from datetime import datetime, timedelta
-    from unittest.mock import patch
+    from unittest.mock import AsyncMock, patch
 
     from soc_ai.store.models import ModelBatteryResult
     from sqlalchemy import update
@@ -492,7 +494,7 @@ def test_fitness_api_stale_cache_reprobes(tmp_path):
     with p1, p2, p3, patch("soc_ai.webui.probes.probe_model_fitness", fake_probe):
         app = create_app()
         with TestClient(app) as client:
-            client.get("/api/v1/config/model-fitness")
+            client.get("/api/v1/config/model-fitness?force=true")
 
             async def backdate():
                 stale = datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=25)
@@ -501,6 +503,17 @@ def test_fitness_api_stale_cache_reprobes(tmp_path):
                     await db.commit()
 
             asyncio.run(backdate())
-            again = client.get("/api/v1/config/model-fitness").json()
-            assert again["cached"] is False
+            with patch(
+                "soc_ai.audit.logger.AuditLogger.log_kind", new_callable=AsyncMock
+            ) as log_kind:
+                again = client.get("/api/v1/config/model-fitness").json()
+            assert again["cached"] is True
+            assert again["stale"] is True
+            assert again["checked_at"]
+            assert len(calls) == 1  # no probe on a plain GET
+            log_kind.assert_not_awaited()  # and no audit write
+
+            forced = client.get("/api/v1/config/model-fitness?force=true").json()
+            assert forced["cached"] is False
+            assert forced["stale"] is False
             assert len(calls) == 2

@@ -281,6 +281,98 @@ async def test_host_dossier_dedups_and_survives_a_store_failure(
     assert failed["type"] == "RuntimeError"
 
 
+# A host-logs-only Linux agent: the shape behind twelve false "no host
+# telemetry" claims on production. RFC 5737 address, example.test name.
+_COVERED_IP = "192.0.2.41"
+
+
+def _host_logs_only_elastic() -> Any:
+    from soc_ai.so_client.elastic import EsSearchResult
+
+    from tests.test_dossier_coverage import host_logs_only_aggs
+
+    elastic = AsyncMock()
+    elastic.search = AsyncMock(
+        return_value=EsSearchResult(total=76645, took_ms=1, aggregations=host_logs_only_aggs())
+    )
+    return elastic
+
+
+@pytest.mark.asyncio
+async def test_host_dossier_states_the_agent_and_the_planes_it_ships(
+    settings_kratos: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The dossier names the agent and the planes, so a zero from Elastic Defend
+    reads as a gap in two planes and never as "no host telemetry"."""
+    from soc_ai.store import host_dossier as store
+
+    async def _get(db: object, ip: str) -> tuple[HostDossier, list[HostDossierField]] | None:
+        return _stored()
+
+    monkeypatch.setattr(store, "get_dossier", _get)
+    elastic = _host_logs_only_elastic()
+    agent: Agent = Agent(TestModel(call_tools=[]), output_type=str, system_prompt="x")
+    ctx = InvestigationContext(
+        settings=_dossier_settings(settings_kratos),
+        auth=AsyncMock(),
+        elastic=elastic,
+        db_sessionmaker=_sessionmaker(),
+    )
+    register_read_tools(agent, ctx, role="investigator")
+    result = await agent._function_toolset.tools["t_host_dossier"].function(ip=_COVERED_IP)
+
+    assert result["agent"] == {
+        "id": "a1b2c3d4-0000-4000-8000-000000000001",
+        "name": "app-01",
+        "os": "Fedora Linux",
+    }
+    coverage = result["coverage"]
+    assert coverage["read_ok"] is True
+    assert coverage["planes"]["host_logs"]["present"] is True
+    assert coverage["planes"]["osquery"]["present"] is True
+    assert coverage["planes"]["process"]["present"] is False
+    text = " ".join(coverage["sentences"])
+    assert "ships no process events" in text
+    # Negative control: the false claim the production runs made.
+    lowered = text.lower()
+    for false_claim in ("no host telemetry", "no host-level", "no host logs"):
+        assert false_claim not in lowered
+    # The read searched the address the caller asked about.
+    body = elastic.search.call_args
+    should = body.args[1]["bool"]["should"]
+    assert {"terms": {"host.ip": [_COVERED_IP]}} in should
+
+
+@pytest.mark.asyncio
+async def test_host_dossier_says_when_it_could_not_read_coverage(
+    settings_kratos: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed coverage read is unknown. It never reads as an absent plane."""
+    from soc_ai.store import host_dossier as store
+
+    async def _none(db: object, ip: str) -> None:
+        return None
+
+    monkeypatch.setattr(store, "get_dossier", _none)
+    elastic = AsyncMock()
+    elastic.search = AsyncMock(side_effect=TimeoutError("read timed out"))
+    agent: Agent = Agent(TestModel(call_tools=[]), output_type=str, system_prompt="x")
+    ctx = InvestigationContext(
+        settings=_dossier_settings(settings_kratos),
+        auth=AsyncMock(),
+        elastic=elastic,
+        db_sessionmaker=_sessionmaker(),
+    )
+    register_read_tools(agent, ctx, role="chat")
+    result = await agent._function_toolset.tools["t_host_dossier"].function(ip=_COVERED_IP)
+
+    assert result["found"] is False
+    assert result["coverage"]["read_ok"] is False
+    assert result["coverage"]["planes"] == {}
+    assert result["coverage"]["sentences"][0].startswith("soc-ai could not read")
+    assert result["agent"] is None
+
+
 # ---------------------------------------------------------------------------
 # Egress-tool identifier threading (finding search-guard-ignores-db-identifiers)
 # ---------------------------------------------------------------------------

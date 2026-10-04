@@ -53,6 +53,7 @@ sanitize → residue-sweep → desanitize round trip. A fail-closed residue leak
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime
 from typing import Any
 
@@ -61,6 +62,7 @@ import yaml
 from elastic_transport import TransportError
 from elasticsearch import ApiError
 from fastapi import Depends, HTTPException, Request
+from pydantic import BaseModel, Field
 from pydantic_ai.exceptions import AgentRunError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -72,19 +74,26 @@ from soc_ai.api.webui.routes_alerts import _es_api_error_http, _grid_unavailable
 from soc_ai.api.webui.routes_hunts import _ID_SHAPED, _hunt_report
 from soc_ai.config import Settings
 from soc_ai.detection.analytic_drafter import draft_analytic
-from soc_ai.detection.analytic_models import AnalyticDraftOut
+from soc_ai.detection.analytic_models import AnalyticDraftOut, Generalization
 from soc_ai.detection.drafter import draft_detection
 from soc_ai.detection.models import DryRunResult, SigmaDraft
 from soc_ai.detection.untrusted import neutralize_untrusted
-from soc_ai.detection.validators import dry_run_detection, validate_sigma_yaml
+from soc_ai.detection.validators import (
+    dry_run_detection,
+    generalization_pins,
+    validate_sigma_yaml,
+)
 from soc_ai.hunting.catalog_tiers import effective_catalog
 from soc_ai.hunting.execute import run_spec
+from soc_ai.hunting.spec import parse_spec
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.so_client.fields import get_dotted
 from soc_ai.store import analytics as analytics_store
 from soc_ai.store import investigations as inv_svc
 from soc_ai.store.models import Hunt, Investigation
 from soc_ai.webui.runbook_promotion import _build_guard
+
+_LOGGER = logging.getLogger(__name__)
 
 # Citation-resolution bound: full ``_source`` is fetched for at most this many
 # cited docs — enough to ground the drafter and anchor the dry-run window,
@@ -127,6 +136,19 @@ _OBSERVED_FIELDS: tuple[str, ...] = (
     "process.name",
     "user.name",
     "host.name",
+    # The Windows event fields the role-scoped identity analytics read. A rule
+    # drafted from one of their findings keys on these: the event code, the
+    # provider and the discriminating value.
+    "event.code",
+    "event.provider",
+    "winlog.channel",
+    "winlog.event_data.SubjectUserName",
+    "winlog.event_data.TargetUserName",
+    "winlog.event_data.SubCategory",
+    "winlog.event_data.AuditPolicyChangesDescription",
+    "winlog.event_data.threat_name",
+    "winlog.event_data.Severity Name",
+    "winlog.event_data.Action Name",
 )
 
 _NOT_CONFIRMED_DETAIL: dict[str, str] = {
@@ -366,7 +388,7 @@ async def _drafted_detection(
                 "reason": "no_promotable_evidence",
                 "hint": (
                     "None of the finding's citations resolve to an event on the "
-                    "grid — there is no observed evidence to ground a detection on."
+                    "grid. There is no observed evidence to ground a detection on."
                 ),
             },
         )
@@ -386,7 +408,7 @@ async def _drafted_detection(
             status_code=504,
             detail={
                 "reason": "draft_timeout",
-                "hint": "Drafting the rule ran out of time — try again.",
+                "hint": "Drafting the rule ran out of time. Try again.",
             },
         ) from exc
     except (httpx.HTTPError, AgentRunError) as exc:
@@ -394,7 +416,7 @@ async def _drafted_detection(
             status_code=502,
             detail={
                 "reason": "draft_model_unavailable",
-                "hint": "The analyst model could not be reached or did not answer — try again.",
+                "hint": "The analyst model could not be reached or did not answer. Try again.",
             },
         ) from exc
 
@@ -461,8 +483,8 @@ async def draft_hunt_finding_detection(
                 detail={
                     "reason": "still_running",
                     "hint": (
-                        "The hunt is still running — findings can be drafted "
-                        "once it lands its report."
+                        "The hunt is still running. You can draft a detection from "
+                        "a finding when the hunt has its report."
                     ),
                 },
             )
@@ -602,11 +624,125 @@ async def _threat_finding_for_draft(
     return finding, guard, list(cat.listed)
 
 
+class AnalyticDraftIn(BaseModel):
+    """The two steps of a draft from a finding.
+
+    ``preview`` drafts and dry-runs the analytic and stores nothing. The
+    console shows the id and the dry run, and the analyst confirms. The
+    confirm sends the previewed ``spec_yaml`` back, and the route stores it
+    with no second model call. An empty body drafts and stores in one call,
+    as before.
+    """
+
+    preview: bool = False
+    spec_yaml: str | None = Field(default=None, max_length=20000)
+    # The confirm echoes whether the preview was a rewrite. The pins themselves
+    # are computed again here from the confirmed text, never taken from the body.
+    retried: bool = False
+
+
+def _indicator_values(finding: dict[str, Any], cited_docs: list[dict[str, Any]]) -> list[str]:
+    """The finding's indicator list: the one exception the generalization check allows.
+
+    A finding has no ``indicators`` field today. One that carries it is read.
+    The cited documents add every value under ``threat.indicator`` and under
+    the ``indicator`` of each ``threat.enrichments`` entry, which is where a
+    feed match lands. Nothing else counts as an indicator.
+    """
+    out: list[str] = []
+    raw = finding.get("indicators")
+    if isinstance(raw, list):
+        out += [str(v) for v in raw if isinstance(v, (str, int))]
+
+    def leaves(node: Any) -> None:
+        if isinstance(node, dict):
+            for value in node.values():
+                leaves(value)
+        elif isinstance(node, list):
+            for value in node:
+                leaves(value)
+        elif isinstance(node, (str, int)) and str(node).strip():
+            out.append(str(node))
+
+    for doc in cited_docs:
+        source = doc.get("_source")
+        if not isinstance(source, dict):
+            continue
+        threat = source.get("threat")
+        if isinstance(threat, dict):
+            leaves(threat.get("indicator"))
+            for entry in threat.get("enrichments") or []:
+                if isinstance(entry, dict):
+                    leaves(entry.get("indicator"))
+        for key, value in source.items():
+            if key.startswith("threat.indicator.") or key == "threat.indicator":
+                leaves(value)
+    return out
+
+
+def _generalization_of(raw: dict[str, Any] | None) -> Generalization | None:
+    return Generalization(**raw) if raw else None
+
+
+# The note a draft carries when the grid did not answer the read of the cited
+# documents. The draft then reads the stored finding only.
+GRID_SLOW_DRAFT_NOTE = (
+    "The grid did not answer in time. The draft reads the stored finding and not the "
+    "cited documents."
+)
+GRID_SLOW_DRY_RUN = "The grid did not answer in time. The dry run did not run."
+
+
+def _analytic_exists(analytic_id: str) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={
+            "reason": "analytic_exists_for_finding",
+            "hint": (
+                f"This finding already has the analytic {analytic_id}. "
+                "Open it in the Analytics tab."
+            ),
+            "analytic_id": analytic_id,
+        },
+    )
+
+
+async def _store_drafted(
+    request: Request,
+    *,
+    spec_text: str,
+    by: str,
+    hunt_id: str,
+    ordinal: int,
+    generalization: dict[str, Any] | None = None,
+) -> str:
+    """Store a drafted analytic as a candidate linked to its finding. Return its id."""
+    async with request.app.state.db_sessionmaker() as db:
+        # Checked again here: two clicks can both pass the check at the start.
+        existing = await analytics_store.drafted_for_finding(db, hunt_id, ordinal)
+        if existing is not None:
+            raise _analytic_exists(existing)
+        try:
+            state = await analytics_store.create_local(
+                db,
+                spec_text=spec_text,
+                by=by,
+                why=analytics_store.drafted_from(hunt_id, ordinal),
+                generalization=generalization,
+            )
+        except (ValueError, yaml.YAMLError) as exc:
+            raise HTTPException(
+                status_code=409, detail={"reason": "analytic_exists", "hint": str(exc)}
+            ) from exc
+    return state.analytic_id
+
+
 @router.post("/hunts/{hunt_id}/findings/{ordinal}/draft-analytic")
-async def draft_hunt_finding_analytic(
+async def draft_hunt_finding_analytic(  # noqa: PLR0915 - one linear path, each failure maps to one answer
     request: Request,
     hunt_id: str,
     ordinal: int,
+    body: AnalyticDraftIn | None = None,
     settings: Settings = Depends(get_settings_dep),
     elastic: ElasticClient = Depends(get_elastic),
 ) -> AnalyticDraftOut:
@@ -615,6 +751,15 @@ async def draft_hunt_finding_analytic(
     The finding must be a threat finding. It does not need a promotion: the
     candidate never runs until an analyst moves it to shadow. The dry run over
     the last 30 days is what an analyst reads before that move.
+
+    A finding has one analytic. A second draft answers 409 with the id of the
+    first, until the analyst retires it. The console used to write on one
+    click, abort at its own 20 s budget while the server committed, and leave
+    the button live, so the retry wrote a second candidate.
+
+    A slow grid does not refuse the draft. The read of the cited documents
+    and the dry run each have the grid budget. Past it, the draft reads the
+    stored finding, and the dry run reports that it did not run.
     """
     if not settings.analytic_drafting_enabled:
         raise HTTPException(
@@ -624,30 +769,92 @@ async def draft_hunt_finding_analytic(
                 "hint": "Turn on 'Draft analytics from findings' in the config console.",
             },
         )
+    body = body or AnalyticDraftIn()
     by = await identify_caller(request)
     finding, guard, catalog_ids = await _threat_finding_for_draft(
         request, settings, hunt_id, ordinal
     )
+    async with request.app.state.db_sessionmaker() as db:
+        existing = await analytics_store.drafted_for_finding(db, hunt_id, ordinal)
+    if existing is not None:
+        raise _analytic_exists(existing)
 
+    if body.spec_yaml is not None and not body.preview:
+        # The confirm of a preview. The analyst read this text and its dry
+        # run. No second model call, and no second dry run.
+        try:
+            spec = parse_spec(body.spec_yaml)
+        except (ValueError, yaml.YAMLError) as exc:
+            raise HTTPException(
+                status_code=422, detail={"reason": "bad_draft", "hint": str(exc)}
+            ) from exc
+        if not spec.id.startswith("local-"):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "reason": "bad_draft",
+                    "hint": "A drafted analytic id must start with local-.",
+                },
+            )
+        # The pins are computed again from the text the analyst confirmed. The
+        # check is deterministic, so they match the preview. The cited
+        # documents are read only when an indicator could excuse a pin, and a
+        # grid that does not answer keeps the pins.
+        hosts = list(finding.get("hosts") or [])
+        indicators = _indicator_values(finding, [])
+        pins = generalization_pins(spec, hosts=hosts, indicators=indicators)
+        if pins and _citation_ids(finding):
+            try:
+                async with asyncio.timeout(settings.webui_grid_timeout_s):
+                    cited = await _resolve_cited_docs(elastic, settings, _citation_ids(finding))
+                pins = generalization_pins(
+                    spec, hosts=hosts, indicators=_indicator_values(finding, cited)
+                )
+            except (TimeoutError, TransportError, ApiError) as exc:
+                _LOGGER.warning("draft analytic: indicators unread on confirm: %r", exc)
+        generalization = {"pinned": pins, "retried": body.retried} if pins or body.retried else None
+        analytic_id = await _store_drafted(
+            request,
+            spec_text=body.spec_yaml,
+            by=by,
+            hunt_id=hunt_id,
+            ordinal=ordinal,
+            generalization=generalization,
+        )
+        return AnalyticDraftOut(
+            analytic_id=analytic_id,
+            spec_yaml=body.spec_yaml,
+            rationale="",
+            dry_run=DryRunResult(ran=False, error="The preview ran the dry run."),
+            generalization=_generalization_of(generalization),
+        )
+
+    notes: list[str] = []
     # The evidence is built from the SAME resolved citations the Sigma route
     # uses, so the two drafters ground on one set of observed values.
     try:
         async with asyncio.timeout(settings.webui_grid_timeout_s):
             cited_docs = await _resolve_cited_docs(elastic, settings, _citation_ids(finding))
     except (TimeoutError, TransportError) as exc:
-        raise HTTPException(status_code=503, detail=_grid_unavailable(exc)) from exc
+        # The finding is stored, and its title, detail, hosts and citation ids
+        # are evidence enough to draft from. The range answered 503 on five of
+        # five tries here while the health check read the grid as ok.
+        _LOGGER.warning("draft analytic: cited documents unread: %r", exc)
+        cited_docs = []
+        notes.append(GRID_SLOW_DRAFT_NOTE)
     except ApiError as exc:
         raise _es_api_error_http(exc) from exc
     evidence = _build_evidence(finding, cited_docs)
 
     try:
         async with asyncio.timeout(settings.sigma_draft_timeout_s):
-            draft, spec = await draft_analytic(
+            result = await draft_analytic(
                 settings,
                 finding=finding,
                 evidence=evidence,
                 catalog_ids=catalog_ids,
                 guard=guard,
+                indicators=_indicator_values(finding, cited_docs),
             )
     except EgressResidueError as exc:
         raise HTTPException(
@@ -674,6 +881,7 @@ async def draft_hunt_finding_analytic(
                 "hint": "The analyst model could not be reached or did not answer. Try again.",
             },
         ) from exc
+    draft, spec = result.draft, result.spec
 
     # The dry run is the receipt an analyst reads before the move to shadow. A
     # run that errored is reported as a run that did not run, never as zero.
@@ -682,28 +890,50 @@ async def draft_hunt_finding_analytic(
             run = await run_spec(
                 spec, elastic=elastic, settings=settings, since="now-30d", until="now"
             )
+        dry = DryRunResult(
+            ran=run.error is None,
+            hit_count=run.matched_docs,
+            sample_ids=[c.anchor_id for c in run.candidates if c.anchor_id][:5],
+            window_days=30,
+            error=run.error,
+            # The run groups its matches by the scope field, one candidate per
+            # entity. One entity on a clause that reads as a behaviour is the
+            # analyst's cue that the analytic still describes one case.
+            entity_count=None if run.error is not None or run.blind else len(run.candidates),
+            entity_count_is_lower_bound=run.truncated_docs > 0,
+            scope_kind=str(spec.scope_kind),
+        )
     except (TimeoutError, TransportError) as exc:
-        raise HTTPException(status_code=503, detail=_grid_unavailable(exc)) from exc
+        # The model call is the expensive half, and it is done. A dry run that
+        # did not run is reported as that, never as zero matches.
+        _LOGGER.warning("draft analytic: dry run unread: %r", exc)
+        dry = DryRunResult(ran=False, window_days=30, error=GRID_SLOW_DRY_RUN)
     except ApiError as exc:
         raise _es_api_error_http(exc) from exc
-    dry = DryRunResult(
-        ran=run.error is None,
-        hit_count=run.matched_docs,
-        sample_ids=[c.anchor_id for c in run.candidates if c.anchor_id][:5],
-        window_days=30,
-        error=run.error,
-    )
 
-    async with request.app.state.db_sessionmaker() as db:
-        try:
-            state = await analytics_store.create_local(db, spec_text=draft.spec_yaml, by=by)
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=409, detail={"reason": "analytic_exists", "hint": str(exc)}
-            ) from exc
+    if body.preview:
+        return AnalyticDraftOut(
+            analytic_id=spec.id,
+            spec_yaml=draft.spec_yaml,
+            rationale=draft.rationale,
+            dry_run=dry,
+            status="preview",
+            notes=notes,
+            generalization=_generalization_of(result.generalization),
+        )
+    analytic_id = await _store_drafted(
+        request,
+        spec_text=draft.spec_yaml,
+        by=by,
+        hunt_id=hunt_id,
+        ordinal=ordinal,
+        generalization=result.generalization,
+    )
     return AnalyticDraftOut(
-        analytic_id=state.analytic_id,
+        analytic_id=analytic_id,
         spec_yaml=draft.spec_yaml,
         rationale=draft.rationale,
         dry_run=dry,
+        notes=notes,
+        generalization=_generalization_of(result.generalization),
     )

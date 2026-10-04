@@ -43,14 +43,23 @@ const asked = (prefix: string): boolean =>
   fetchMock.mock.calls.some((call) => String(call[0]).startsWith(prefix));
 
 describe('hosts routes', () => {
-  it('/hosts mounts the hosts screen', async () => {
+  it('/hosts mounts the hosts screen, which reads the machine list', async () => {
     renderAt('/hosts');
-    await waitFor(() => expect(asked('/api/v1/dossiers')).toBe(true));
+    await waitFor(() => expect(asked('/api/v1/hosts?')).toBe(true));
+    expect(asked('/api/v1/hosts/summary')).toBe(true);
   });
 
-  it('/hosts/:ip mounts the host screen for that address', async () => {
+  it('/hosts/:key resolves an address to its machine first', async () => {
     renderAt('/hosts/192.168.10.8');
+    await waitFor(() => expect(asked('/api/v1/hosts/resolve?value=192.168.10.8')).toBe(true));
+    // An unreachable resolve read keeps the page of the address alone.
     await waitFor(() => expect(asked('/api/v1/dossiers/192.168.10.8')).toBe(true));
+  });
+
+  it('/hosts/:key reads a machine key straight, percent-encoded', async () => {
+    renderAt('/hosts/agent%3Aea2db53b');
+    await waitFor(() => expect(asked('/api/v1/hosts/agent%3Aea2db53b')).toBe(true));
+    expect(asked('/api/v1/hosts/resolve')).toBe(false);
   });
 
   it('the sidebar links to the hosts view', async () => {

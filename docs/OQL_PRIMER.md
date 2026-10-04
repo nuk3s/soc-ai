@@ -224,6 +224,25 @@ indicator below is the TEST-NET address `203.0.113.7`:
 destination.ip:203.0.113.7 | groupby host.name | sortby count desc
 ```
 
+### 16. Which datasets one host ships
+
+Run this query before you report that a host has no telemetry. The host ships a
+plane when a dataset of that plane has documents. A Linux host with Elastic Agent
+and no Elastic Defend ships `system.syslog`, `system.auth` and
+`osquery_manager.result`, and no `endpoint.events.*`. A dataset that a host does
+not ship is a gap in that plane only. Name the plane: "this host ships no process
+events".
+
+```oql
+host.name:<name> | groupby event.dataset
+```
+
+Use the address when you do not know the name:
+
+```oql
+host.ip:192.0.2.41 | groupby event.dataset
+```
+
 ## Common pitfalls (avoid these)
 
 - **Do not quote a bare number or an IP address.** `source.port:"443"` and `source.ip:"203.0.113.1"` work. The unquoted forms behave the same way, and they are clearer.

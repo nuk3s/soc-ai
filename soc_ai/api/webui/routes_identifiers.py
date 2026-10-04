@@ -241,7 +241,7 @@ async def dismiss_internal_identifier(request: Request, ident_id: int) -> dict[s
             status_code=409,
             detail={
                 "reason": "not_dismissable",
-                "hint": "Manual identifiers cannot be dismissed — delete them instead.",
+                "hint": "A manual identifier cannot be dismissed. You can delete it.",
             },
         )
 
@@ -264,7 +264,7 @@ async def delete_internal_identifier(request: Request, ident_id: int) -> dict[st
                 status_code=409,
                 detail={
                     "reason": "not_deletable",
-                    "hint": "Detected identifiers cannot be deleted — dismiss them instead.",
+                    "hint": "A detected identifier cannot be deleted. You can dismiss it.",
                 },
             )
     return {"ok": True}

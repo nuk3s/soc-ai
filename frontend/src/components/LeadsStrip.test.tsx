@@ -108,6 +108,22 @@ describe('LeadsStrip', () => {
     expect(within(row).queryByText(/seen 3 times/)).toBeNull();
   });
 
+  // A stored summary ends in a stop. The line read "over 20 days., seen on 2 sweeps".
+  it('drops the stop before the sweep count', async () => {
+    vi.mocked(getLeads).mockResolvedValue([
+      {
+        ...LEAD,
+        observations: [
+          { ...LEAD.observations[2], summary: 'The baseline holds 4 values over 20 days.' },
+        ],
+      },
+    ]);
+    mount();
+    const row = await screen.findByTestId('lead-7');
+    expect(within(row).getByText(/over 20 days, seen on 3 sweeps/)).toBeTruthy();
+    expect(row.textContent).not.toContain('days.,');
+  });
+
   it('shows a shadow lead with its flag rather than hiding it', async () => {
     mount();
     const row = await screen.findByTestId('lead-7');
@@ -239,9 +255,23 @@ describe('LeadsStrip tabs', () => {
   it('states the legend under the tabs', async () => {
     mount();
     const legend = await screen.findByTestId('leads-legend');
+    // F9: the legend said the analyst decides every close, and every lead on
+    // prod read "closed by soc-ai". The words are true for both closers.
     expect(legend.textContent).toBe(
       'New: nobody has acted. In progress: a hunt is running. ' +
-        'Hunted: the hunt finished, decide. Closed: dismissed or promoted.',
+        'Hunted: the hunt finished, and the lead waits on a decision. ' +
+        'Closed: an analyst dismissed or promoted the lead, or a clean hunt closed it.',
+    );
+  });
+
+  it('names both closers on the Closed tab and in its empty state', async () => {
+    vi.mocked(getLeads).mockResolvedValue([]);
+    mount();
+    const tab = await screen.findByRole('button', { name: 'Closed' });
+    expect(tab.getAttribute('title')).toMatch(/a clean hunt closed/);
+    fireEvent.click(tab);
+    await waitFor(() =>
+      expect(screen.getByText(/no clean hunt closed one/)).toBeTruthy(),
     );
   });
 

@@ -35,6 +35,13 @@ interface Props {
  */
 export function AccountMenu({ me, onMe }: Props) {
   const { collapsed } = useShell();
+  // No user row stands behind this session: sign-in is off, or the caller is a
+  // bearer token. Change password, Sign out and the status field all need a
+  // user row. With sign-in off they 401'd or stored nothing, and the 401 sent
+  // the analyst to a login page with no credentials to use (RD1, RD2, RD4).
+  const noUser = me.signed_in === false;
+  const tokenSession = noUser && me.role === 'token';
+  const sessionLine = tokenSession ? 'API token session' : 'Anonymous session';
   const navigate = useNavigate();
   const [open, setOpen] = useState(false);
   const [pwOpen, setPwOpen] = useState(false);
@@ -100,7 +107,9 @@ export function AccountMenu({ me, onMe }: Props) {
         onClick={toggle}
         aria-haspopup="menu"
         aria-expanded={open}
-        aria-label={`Account menu. You are signed in as ${me.username}.`}
+        aria-label={
+          noUser ? `Account menu. ${sessionLine}.` : `Account menu. You are signed in as ${me.username}.`
+        }
         className="flex w-full items-center gap-[9px] rounded-control border-t border-border px-1 pb-1 pt-2.5 text-left outline-none hover:bg-surface-3 focus-visible:ring-1 focus-visible:ring-accent"
         style={{ justifyContent: collapsed ? 'center' : 'flex-start' }}
       >
@@ -117,7 +126,7 @@ export function AccountMenu({ me, onMe }: Props) {
                 {me.username}
               </span>
               <span className="block truncate text-[10.5px] text-faint">
-                {me.status || me.role}
+                {noUser ? sessionLine : me.status || me.role}
               </span>
             </span>
             <span className="flex flex-none text-faint">
@@ -145,6 +154,12 @@ export function AccountMenu({ me, onMe }: Props) {
               </div>
             </div>
 
+            {noUser ? (
+              <div className="px-3.5 py-3 text-[12px] leading-[1.5] text-dim">
+                {tokenSession ? 'This session uses an API token.' : 'Sign-in is off on this install.'}
+              </div>
+            ) : (
+            <>
             <div className="border-b border-border-2 px-3.5 py-2.5">
               <div className="pb-1 text-[10px] font-semibold uppercase tracking-[.06em] text-faint">
                 Status
@@ -205,6 +220,8 @@ export function AccountMenu({ me, onMe }: Props) {
                 Sign out
               </button>
             </div>
+            </>
+            )}
           </div>
         </>
       )}

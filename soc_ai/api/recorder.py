@@ -12,6 +12,7 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from soc_ai.so_client.fields import detection_kind_of_alert_payload
 from soc_ai.store import investigations as inv_svc
 
 _LOGGER = logging.getLogger(__name__)
@@ -81,6 +82,9 @@ class InvestigationRecorder:
         # place of the endpoints when a detection observed no flow, so a row
         # missing it can only ever inherit from another row missing it too.
         self._host_name: str | None = None
+        # The detector type read off the alert document (dogfood 2026-10-01
+        # RL5). None until an alert_context event names one.
+        self._detection_kind: str | None = None
         self._finished = False
         self.investigation_id: str | None = None
         # Promotion provenance (finding-promotion slice 1): kind='hunt' plus the
@@ -150,6 +154,13 @@ class InvestigationRecorder:
                 self._dest_ip = _dig(payload, "alert.destination_ip")
             if self._host_name is None:
                 self._host_name = _dig(payload, "alert.host_name")
+            if self._detection_kind is None and self._kind not in inv_svc.PROMOTED_KINDS:
+                # The row was born with the "suricata" default. The alert
+                # document says which detector raised it, with the same
+                # derivation the Alerts grid badges the group with.
+                alert_obj = payload.get("alert")
+                if isinstance(alert_obj, dict):
+                    self._detection_kind = detection_kind_of_alert_payload(alert_obj)
             if self._community_id is None:
                 # The hashed five-tuple. Stamped so a later alert from the
                 # SAME session can find what this run concluded: two alerts
@@ -175,6 +186,7 @@ class InvestigationRecorder:
                     or self._dest_ip
                     or self._community_id
                     or self._host_name
+                    or self._detection_kind
                 ):
                     await inv_svc.set_alert_fields(
                         db,
@@ -184,6 +196,7 @@ class InvestigationRecorder:
                         dest_ip=self._dest_ip,
                         community_id=self._community_id,
                         host_name=self._host_name,
+                        kind=self._detection_kind,
                     )
         except Exception:
             _LOGGER.exception("investigation recorder flush failed")

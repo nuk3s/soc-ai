@@ -46,6 +46,7 @@ from elastic_transport import TransportError
 from elasticsearch import ApiError
 from pydantic_ai import Agent
 
+from soc_ai.dossier.coverage import coverage_window, host_coverage, host_identity
 from soc_ai.dossier.resolve import (
     ResolvedDossier,
     ResolvedField,
@@ -237,11 +238,11 @@ GRID_UNAVAILABLE_REASON = "grid_unavailable"
 # off a failed read is the worst output this product has. State the epistemics
 # instead — the answer is unknown, and unknown is not empty.
 _GRID_UNAVAILABLE_MESSAGE = (
-    "The Security Onion grid did not answer this query — it is unreachable, timing "
+    "The Security Onion grid did not answer this query. It is unreachable, timing "
     "out, or returned only partial results. This result is UNKNOWN, not empty: it is "
     "NOT evidence that nothing matched, and it rules nothing out. Do not describe the "
     "network as quiet, clean or clear on the strength of it. Do not re-send this exact "
-    "call — an identical repeat short-circuits as a duplicate instead of re-querying; "
+    "call. An identical repeat short-circuits as a duplicate instead of re-querying; "
     "to re-check, vary the query, once. If the grid keeps failing, say plainly that "
     "the grid was unavailable and the question could not be answered."
 )
@@ -631,14 +632,14 @@ def _clip_string_leaves(value: Any, cap: int, path: str, clipped: list[str]) -> 
 # serves), so the payload says what it is every time rather than relying on the
 # tool description having been read.
 _DOSSIER_NOTE = (
-    "System-inferred asset context. An operator value outranks an inferred one; "
-    "an inferred value is only as good as its strength, and an unknown field "
+    "System-inferred asset context. An operator value outranks an inferred one. "
+    "Trust an inferred value no more than its strength allows. An unknown field "
     "carries the reason it is unknown."
 )
 _DOSSIER_ABSENT_NOTE = (
     "Absence is an answer, not evidence: the network sweep has no record of this "
     "address (external, or never observed). It is not a finding that the host is "
-    "benign — check whether the address is internal at all before reading into it."
+    "benign. Check whether the address is internal at all before reading into it."
 )
 
 
@@ -1432,6 +1433,9 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
         User-Agents (so an iPhone reads as an iPhone, not a Mac), a
         server-vs-workstation role guess, first/last seen, and its top
         peers/ports/DNS — each with the raw evidence string behind it.
+        `host_logs` counts the documents the host's own agent ships, per
+        dataset, read by `host.ip` and `host.name`, with the agent that wrote
+        them and the planes they cover.
 
         Call this whenever the verdict depends on WHAT a host is (device type,
         OS, role) rather than inferring identity from a rule label or a UA seen
@@ -1518,6 +1522,15 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
         nothing has looked yet), `low_confidence` = too weak to assert, `stale`
         = nobody has re-confirmed it lately. `found: false` means the sweep has
         no record of this address at all — not that it is benign.
+
+        `agent` names the agent that ships the host's own logs: its id, its
+        `host.name` and its OS. `coverage` states which telemetry planes the
+        host ships in the window: host logs, process events, endpoint network
+        events, Windows security events, osquery and agent self-logs. Read
+        `coverage.sentences` before you write about host telemetry. A zero from
+        one dataset is a gap in that plane only. Say "this host ships no
+        process events". Do not say "this host has no host telemetry" while
+        any plane is present.
         """
         if dup := _dedup_result(ctx, "t_host_dossier", {"ip": ip}):
             return dup
@@ -1535,6 +1548,7 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
         try:
             async with maker() as db:
                 stored = await dossier_store.get_dossier(db, ip)
+                identity = await host_identity(db, ip)
             if stored is None:
                 entry = unknown_dossier(ip)
             else:
@@ -1545,7 +1559,24 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
         except Exception as e:
             _LOGGER.warning("t_host_dossier failed: %s", e)
             return _tool_error(e)
-        return _clamp_tool_result(_host_dossier_payload(entry, asked_as=ip))
+        # The planes the host ships, read from the grid. The dossier says
+        # what the host IS; this says what telemetry can answer about it. A
+        # zero from one dataset is then a gap in that plane only.
+        since, until = coverage_window(ctx.default_time_anchor)
+        coverage = await host_coverage(
+            ctx.elastic,
+            ctx.settings,
+            addresses=identity.addresses,
+            names=identity.names,
+            agent_ids=identity.agent_ids,
+            since=since,
+            until=until,
+            include_synth=ctx.include_synth,
+        )
+        payload = _host_dossier_payload(entry, asked_as=ip)
+        payload["agent"] = coverage.agent_payload()
+        payload["coverage"] = coverage.tool_payload()
+        return _clamp_tool_result(payload)
 
     @_register
     async def t_prevalence(

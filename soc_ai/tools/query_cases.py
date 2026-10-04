@@ -6,7 +6,7 @@ from typing import Any
 
 from soc_ai.config import Settings
 from soc_ai.so_client.elastic import ElasticClient
-from soc_ai.so_client.models import SoCase
+from soc_ai.so_client.models import CaseReadError, SoCase
 from soc_ai.tools._registry import tool
 
 
@@ -18,7 +18,7 @@ async def query_cases(
     settings: Settings,
     status: str | None = None,
     max_results: int = 25,
-) -> list[SoCase]:
+) -> list[SoCase | CaseReadError]:
     """Full-text search across case titles, descriptions, and tags.
 
     Args:
@@ -39,7 +39,16 @@ async def query_cases(
             {
                 "multi_match": {
                     "query": query,
-                    "fields": ["title", "description", "tags"],
+                    # Flat fields (SOC API, older grids) and the SO 3.3
+                    # ``so_case.*`` nesting.
+                    "fields": [
+                        "title",
+                        "description",
+                        "tags",
+                        "so_case.title",
+                        "so_case.description",
+                        "so_case.tags",
+                    ],
                 }
             }
         )
@@ -58,4 +67,18 @@ async def query_cases(
         size=max_results,
         sort=[{"@timestamp": {"order": "desc", "unmapped_type": "date"}}],
     )
-    return [SoCase.from_so_doc(h.get("_source", {})) for h in result.hits]
+    out: list[SoCase | CaseReadError] = []
+    for hit in result.hits:
+        hit_id = hit.get("_id")
+        try:
+            out.append(
+                SoCase.from_so_doc(hit.get("_source") or {}, doc_id=str(hit_id) if hit_id else None)
+            )
+        except Exception as exc:  # one bad document costs one entry (BLE001 ok)
+            out.append(
+                CaseReadError(
+                    id=str(hit_id) if hit_id else None,
+                    reason=f"{type(exc).__name__}: {str(exc)[:200]}",
+                )
+            )
+    return out

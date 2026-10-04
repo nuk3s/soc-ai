@@ -21,6 +21,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ulid import ULID
 
 from soc_ai.hunting.findings import threat_finding_count
+from soc_ai.secret_scrub import (
+    MODEL_TEXT_EVENT_KINDS,
+    scrub_optional,
+    scrub_secrets,
+    scrub_value,
+)
 from soc_ai.store import chat_memory
 from soc_ai.store.auth import utcnow
 from soc_ai.store.models import Hunt, HuntEvent, HuntSpecState, Lead
@@ -29,6 +35,28 @@ STATUS_RUNNING = "running"
 STATUS_COMPLETE = "complete"
 
 _WS_RE = re.compile(r"\s+")
+
+
+async def latest_scheduled_runs(db: AsyncSession, objectives: list[str]) -> dict[str, str]:
+    """The newest scheduled hunt for each objective, as objective to hunt id. One query.
+
+    The schedule row stores when it last ran and not what it started, so the
+    run is the newest ``scheduled`` hunt with the same objective hash.
+    """
+    hashes = {_objective_hash(o): o for o in objectives}
+    if not hashes:
+        return {}
+    rows = await db.execute(
+        select(Hunt.id, Hunt.objective_hash)
+        .where(Hunt.kind == "scheduled", Hunt.objective_hash.in_(list(hashes)))
+        .order_by(Hunt.created_at.desc(), Hunt.id.desc())
+    )
+    out: dict[str, str] = {}
+    for hunt_id, digest in rows.all():
+        objective = hashes.get(str(digest))
+        if objective is not None and objective not in out:
+            out[objective] = str(hunt_id)
+    return out
 
 
 def _objective_hash(objective: str) -> str:
@@ -118,7 +146,11 @@ async def append_events(db: AsyncSession, hunt_id: str, events: list[dict[str, A
                 hunt_id=hunt_id,
                 sequence=int(ev.get("sequence", 0)),
                 kind=str(ev.get("kind", ""))[:40],
-                payload=ev.get("payload") or {},
+                payload=(
+                    scrub_value(ev.get("payload") or {})
+                    if str(ev.get("kind", "")) in MODEL_TEXT_EVENT_KINDS
+                    else ev.get("payload") or {}
+                ),
             )
         )
     await db.commit()
@@ -136,9 +168,12 @@ async def finalize(
     if hunt is None:
         return
     hunt.status = status
+    # Credential values never reach the store: the narrative and the findings
+    # are model-written text that every console user reads.
     if narrative is not None:
-        hunt.narrative = narrative
+        hunt.narrative = scrub_optional(narrative)
     if report is not None:
+        report = scrub_value(report)
         hunt.report = report
         # Denormalize the finding count so the /notifications bell never
         # deserializes the report blob to answer "N findings" (migration 0028).
@@ -337,9 +372,9 @@ async def reap_stale_running(
         hunt.finished_at = now
         if not hunt.narrative:
             hunt.narrative = (
-                "Hunt was interrupted by a service restart before it finished — re-run it."
+                "A service restart interrupted the hunt before it finished. Run the hunt again."
                 if interrupted
-                else "Hunt did not finish (interrupted by a restart or timed out)."
+                else "The hunt did not finish. A restart or a timeout stopped it."
             )
     if rows:
         await db.commit()
@@ -456,6 +491,7 @@ async def finish_chat_assistant(
     ev = await db.get(HuntEvent, event_id)
     if ev is None:
         return
+    content = scrub_secrets(content)
     payload = dict(ev.payload or {})
     payload["content"] = content
     payload["status"] = status

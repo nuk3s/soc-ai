@@ -272,19 +272,22 @@ def test_every_shipped_prior_loads_and_declares_false_positives() -> None:
         assert spec.description.strip(), f"{spec_id} has no description"
 
 
-def test_the_single_shot_priors_declare_no_benign_baseline() -> None:
+def test_the_single_shot_events_declare_no_benign_baseline() -> None:
     # The design's last three: they never accumulate, and they are how the
     # highest-impact events are covered at all. A triage must not close them
-    # on how often they fire.
+    # on how often they fire. They shipped as priors that read the wrong
+    # dimension; they are now match analytics over the events they name.
     catalog = load_catalog(CATALOG_DIR)
     single_shot = {
-        "prior-defender-adjudication-on-server",
-        "prior-audit-policy-changed-on-dc",
-        "prior-privileged-group-membership-changed",
+        "identity-defender-detection",
+        "identity-4719-audit-policy-change",
+        "identity-privileged-group-change",
     }
     for spec_id in single_shot:
         assert spec_id in catalog, f"{spec_id} is not in the catalog"
         assert catalog[spec_id].no_benign_baseline, f"{spec_id} must declare no baseline"
+        assert catalog[spec_id].evaluator == "match", f"{spec_id} must read its event"
+        assert catalog[spec_id].roles, f"{spec_id} lost its role gate"
 
 
 def test_every_prior_role_is_in_the_dossier_vocabulary() -> None:

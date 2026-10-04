@@ -129,7 +129,7 @@ OBSERVED_BAD_CASES: list[tuple[str, dict[str, Any], str]] = [
             "tool_name": "t_host_summary",
             "result": {"ip": "198.51.100.24", "observations": True, "event_count": 699},
         },
-        "Checked host summary — 198.51.100.24: 699 events",
+        "Checked host summary · 198.51.100.24: 699 events",
     ),
     (
         "tool_result",
@@ -141,7 +141,7 @@ OBSERVED_BAD_CASES: list[tuple[str, dict[str, Any], str]] = [
                 "summary": "no observations for 198.51.100.9 in the lookback window",
             },
         },
-        "Checked host summary — 198.51.100.9: no observations",
+        "Checked host summary · 198.51.100.9: no observations",
     ),
     # 2. Online tools off rendered the full config lecture like an error.
     (
@@ -238,7 +238,7 @@ def test_error_results_read_negative_but_short() -> None:
 
 def test_zero_matches_is_neutral_not_negative() -> None:
     t = title_for("tool_result", {"tool_name": "t_query_events_oql", "result": {"total": 0}})
-    assert t == "Checked events — 0 matches"
+    assert t == "Checked events · 0 matches"
     assert "fail" not in t.lower()
     t2 = title_for("tool_result", {"tool_name": "t_web_search", "result": {"result_count": 0}})
     assert "0 results" in t2
@@ -315,7 +315,7 @@ def test_targeted_and_retask_kinds() -> None:
     t2 = title_for(
         "targeted_tool_result", {"tool_name": "t_query_events_oql", "result": {"total": 3}}
     )
-    assert t2 == "Follow-up: checked events — 3 matches"
+    assert t2 == "Follow-up: checked events · 3 matches"
     t3 = title_for("retask", {"gap_question": "Do other hosts resolve this domain?"})
     assert t3 == "Re-tasked: Do other hosts resolve this domain?"
     assert (

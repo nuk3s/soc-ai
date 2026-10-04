@@ -46,7 +46,7 @@ from soc_ai.store import investigations as inv_svc
 
 # The advice the console gave for every grid failure, of any class, before this
 # batch. Still correct for a grid that never answered; wrong for one that did.
-_RETRY_SHORTLY = "retry shortly"
+_RETRY_SHORTLY = "Retry shortly"
 
 # Documentation rule name — never a real signature on anyone's grid.
 _RULE = "ET DOC TEST Suspicious Beacon"

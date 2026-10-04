@@ -6,6 +6,170 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+A fleet of twelve browser and API dogfood agents ran on the development range and on
+production on 2026-10-01. This section holds what they found and what changed.
+
+### Added
+
+- **The proxy path takes a private ACME CA.** `scripts/tls-proxy.sh enable <domain> acme
+  <directory-url> <root.pem>` puts Caddy on a certificate from an ACME CA on your network,
+  for example step-ca or a Caddy `acme_server`. Caddy obtains and renews the certificate. No
+  key leaves the CA. The script copies the CA root into `./certs/acme-ca-root.pem` and checks
+  that the served chain ends at it. A new `acme_ca` snippet in the `Caddyfile` carries the
+  directory URL and the root. Before this change, a fleet with its own CA had to copy a
+  certificate and a key by hand at each renewal.
+
+### Fixed
+
+- **A hunt closes a lead only after it read its evidence.** A hunt that reports a visibility
+  gap, a failed tool call, an error, a partial read or a budget fallback keeps the lead open
+  under "Needs decision" with the reason. A clean hunt after a hunt that found a threat keeps the
+  lead open too. On the range a hunt that could not read the alert documents had closed a lead
+  with two critical findings.
+- **Every lead decision stays in the history.** Dismiss, reopen, promote, hold and close by hunt
+  append to a decision list. Reopen and promote clear the dismissal. Migration 0053 backfills
+  the list and clears stale dismissals.
+- **A promoted lead's verdict stays on its own host.** The alert observation that a promoted
+  lead's investigation writes back no longer lands on another host's lead.
+- **The host page joins the hostname.** Observations, leads and baselines keyed on a strong
+  hostname now show on the host page of the address. A blind baseline row always states a
+  reason.
+- **A dossier sweep keeps a role through a partial read.** A served-port read with a timeout, a
+  shard failure or a port set under half the previous build keeps the previous role, services
+  and management plane. The host reads "Stale read" and the sweep report counts it.
+- **Served ports carry their transport and drop ICMP.** ICMP type numbers no longer read as
+  TCP ports. A UDP service reads as udp.
+- **The audit chain check reads the newest window first.** The console and the CLI verify the
+  last 7 days by default, stream one page at a time off the event loop, and keep the newest
+  records under the cap. Duplicate sequence numbers from concurrent writers are their own
+  condition with exit code 3. The doctor and the preflight gain an "audit chain" row.
+- **Egress counts state why they are unknown.** Each row carries a reason when the audit index
+  cannot be aggregated. The doctor lists every egress destination.
+- **The Analytics tab says when no sweep has run.** A green live dot no longer sits over an
+  analytic that never ran. The prior trail records the status each analytic ran under. The
+  catalog reads a profile analytic's runs from the prior trail, so a stale error from a past
+  sweep no longer shows.
+- **Credential values never reach a stored report.** A secret scrub runs before a rationale,
+  summary, finding, open question or chat answer is stored and before an export. The key name
+  stays and the value reads "[redacted]".
+- **An NMI verdict always offers Request more info.** The settled bar never says settled on a
+  needs-more-info verdict. The detail reads open questions from the transcript.
+- **Cited event ids are links.** The headline, the summary, the validators step and chat
+  answers render each cited id as a chip that opens the document. Coverage reads as a percent.
+- **Re-run is off while a run is in progress.**
+- **The investigation page shows the recorded failure cause.** A permanent cause and a
+  superseded run drop the re-run advice. The bell lists only primary failed runs.
+- **The investigation host context names each end of the alert.** The detail stores the
+  detection type the Alerts grid derives, so a Sigma detection no longer reads "suricata".
+- **An unknown alert id gets a 404 before a row exists.** The investigate route and the CLI
+  triage command store nothing for an alert the grid does not hold.
+- **The redaction preview runs the send path.** The preview tokenises user names the way the
+  Oracle client does.
+- **The MCP cases tool reads Security Onion 3.3 case documents.**
+- **Config Apply keeps the applied value in the field.** The form remounts after the refetch.
+- **Slow calls carry their own budget.** Security Onion writes wait 90 s, run starts 60 s, the
+  chain check 150 s and the fitness check 90 s. A write that the console stops waiting for says
+  the change may still land, and the next poll that shows it clears the notice.
+- **The escalate response names its cases.** The toast links each case. Escalate has a visible
+  control in the bulk bar and the drawer.
+- **The Alerts filters live in the URL.** A reload keeps the window, the severity, the verdict
+  and the hide-acknowledged state. A bad filter stops polling and shows the hint.
+- **The empty state names the active filter.**
+- **The Dashboard verdict tiles open the Alerts list in the same window.**
+- **The bell and the health pill close on Escape and on a click outside.** The bell names its
+  count. Tab order reaches the rows before Help.
+- **With sign-in off the account menu offers no sign-out and no password change.** A status
+  write without a session is refused.
+- **The shell reads the session before it polls.** An unauthenticated visit sends no protected
+  reads before the redirect.
+- **The Notifications screen groups rows by their type and states its cap.** Clear all asks
+  once.
+- **The API refuses an unknown filter value with a 422 and the accepted values.** A junk value
+  on a boolean, an enumerated or a bounded setting returns 400. Every error body under /api/v1
+  carries a reason and a hint. A bad filter hint names the column and the token.
+- **A plain fitness GET never probes.** Only a forced check runs the gateway probe.
+- **The health endpoint reports the live probe state.** A probe over its budget reads "slow".
+  A flip drops the preflight cache. The agent tools panel reads the live state. One probe
+  budget serves the pill, Test ES and the doctor.
+- **A backtest refuses unknown keys and keeps a refusal apart from the stored run.** With no
+  escalated alert the agreement reads "not measurable". The finish time carries its zone.
+- **The request body has a cap.** A body over 1 MiB gets 413.
+- **The starters picker reads the Windows planes that exist.** A starter with missing telemetry
+  sits under "Not applicable". A failed inventory read is cached for 60 s.
+- **Draft an analytic asks first.** The click previews the draft and a confirm step stores it.
+  A second draft for the same finding returns the existing analytic. The draft works from the
+  stored finding when the grid is slow.
+- **The hunt timeline settles with the hunt.** The findings synthesis step reads done, stopped
+  or did not finish. A cancelled hunt says why once.
+- **The Hosts screen filters withheld roles on the server.** Low confidence and stale are
+  separate buckets. The summary and the filter read one source. A stale sweep counts as needing
+  attention.
+- **Service-discovery names and reverse names are not hostnames.** Broadcast addresses leave
+  the census.
+
+### Host identity (2026-10-02)
+
+The Hosts list showed one row per IP address. On production one proxy had 14 rows, one
+workstation had 10 rows with no name, and 282 of 337 rows had no hostname.
+
+- **One machine per device.** The sweep groups the addresses it finds into machines by five
+  rules: agent, bridge and container, DHCP lease, unique short name, single address. A rule
+  never moves an address that a stronger rule placed. Migration 0054 adds the `host_machine`
+  table and the machine of each address. The per-address dossier stays.
+- **The machine API.** `GET /api/v1/hosts` lists one row per machine. Search reads every name
+  from any source, every address, every MAC, the OS, the role and the agent name. An address
+  matches exactly or by prefix and never in the middle. Each column sorts in both directions,
+  and the address sort is numeric. `GET /api/v1/hosts/summary` counts from the same rows, so each
+  card equals the list total of its filter. `GET /api/v1/hosts/resolve` and
+  `GET /api/v1/hosts/{key}` name and describe one machine. The `/api/v1/dossiers` routes stay.
+- **Joins read the machine.** The observations, the profile and the entity page of a host read
+  every address and every name of its machine. The entity route returns `host_key`.
+- **An agent name that is a public top-level domain stays.** Two agents on production carry a
+  gTLD as their name, and search could not find either machine. The agent's own name and a DHCP
+  lease hostname are no longer rejected as a bare TLD. A DNS name still is.
+- **The sweep reads Security Onion 3.x DHCP leases.** SO 3.x writes `client.address`,
+  `dhcp.assigned_ip`, `host.hostname` and `host.mac`. The sweep read none of them, and no lease
+  named a host.
+- **An address that only an agent reports counts the agent's documents.** It had 0 events, and
+  the default view hid it.
+- **The agent address list holds 256 values.** One agent reported 111 addresses and the cap of 40
+  dropped real ones. A report that hits the cap writes a note on the run.
+- **An address unseen for 30 days leaves the census.** `dossier_stale_address_days` sets the
+  window. An address with a declaration stays. A sweep whose census failed removes nothing.
+
+### Changed
+
+- **A drafted analytic describes a behaviour.** On the range a draft named one host and two
+  domains, and it could fire on that case only. The drafter now keeps exact values only for
+  stable discriminators. A check finds each clause that names the host, user, address or domain
+  of the finding. On a pin, the model rewrites the draft once. A draft that still pins shows the
+  pins in the confirm, in the drawer and as a "specific" marker on the Analytics tab. The dry
+  run states how many distinct entities matched.
+
+- **Three role priors become match analytics that read their events.** Each prior tested a
+  different fact from the one its title stated. The new analytics read the Windows events they
+  name. soc-ai removes the three prior files. The table in `docs/HUNTING.md` maps each old id to
+  its new id.
+  - `identity-defender-detection` replaces `prior-defender-adjudication-on-server`. It reads
+    Defender events 1116 and 1117 on servers and domain controllers. The level follows the
+    Defender severity. The finding quotes the threat, the path and the action. The old prior read
+    new process names. On the development range it missed all 10 Defender detections and fired 73
+    times on Defender updater files.
+  - `identity-4719-audit-policy-change` replaces `prior-audit-policy-changed-on-dc`. It reads
+    event 4719 on domain controllers and excludes computer accounts. The finding quotes the
+    account, the subcategory and the change.
+  - `identity-privileged-group-change` replaces `prior-privileged-group-membership-changed`. It
+    reads events 4728, 4732 and 4756 on domain controllers when the group is privileged. An add
+    to any other group does not match. The finding quotes the account, the group and the member.
+- **A match analytic can carry a role gate.** The gate reads the dossier role of the scope host.
+  A host in another role at confidence 0.9 or above is a non-match. A host with no confident role
+  is not dropped. The sweep reports its documents as a coverage gap that names the host. Declare
+  the role on the host page to decide it.
+- **A match analytic can quote document fields in its finding and take its level from a field.**
+  The observation summary carries the quoted fields too.
+- **A Sigma draft from a hunt finding reads the Windows event fields.** The draft evidence now
+  includes the event code, the provider, the channel and the fields the three analytics read.
+
 ## [1.5.2] - 2026-09-29
 
 The TLS release. TLS has two paths. The proxy path is the production path. The direct path

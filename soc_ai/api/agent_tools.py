@@ -72,6 +72,9 @@ class AgentToolOut(BaseModel):
     requires: list[str]  # every requirement label
     missing: list[str]  # the unmet ones (empty ⇒ available)
     available: bool
+    # Requirements that are configured but down right now, per the live
+    # health probe. They are in ``missing`` too, so the row reads unavailable.
+    unreachable: list[str] = []
 
 
 _ES = _Req("Elasticsearch", _es)
@@ -85,7 +88,7 @@ _CATALOG: tuple[_ToolDef, ...] = (
         "get_alert_context",
         "Query",
         True,
-        "Prefetch an alert's full enriched context — the starting evidence.",
+        "Prefetch the full enriched context of an alert. This is the starting evidence.",
         (_ES,),
     ),
     _ToolDef(
@@ -117,7 +120,7 @@ _CATALOG: tuple[_ToolDef, ...] = (
         "Query",
         True,
         "Decode alert payload bytes (base64/hex) into strings, indicators, and "
-        "protocol facts — local, no egress.",
+        "protocol facts. Runs locally with no egress.",
         (),
     ),
     _ToolDef(
@@ -127,14 +130,14 @@ _CATALOG: tuple[_ToolDef, ...] = (
         "prevalence",
         "Query",
         True,
-        "How common is an indicator (IP/domain/hash) across the grid — rare vs ubiquitous.",
+        "Measure how common an indicator (IP, domain or hash) is across the grid.",
         (_ES,),
     ),
     _ToolDef(
         "rule_prevalence",
         "Query",
         True,
-        "How noisy is a detection rule — fires/day and distinct hosts.",
+        "Measure how noisy a detection rule is: fires per day and distinct hosts.",
         (_ES,),
     ),
     _ToolDef(
@@ -172,16 +175,15 @@ _CATALOG: tuple[_ToolDef, ...] = (
         "describe_dataset",
         "Query",
         True,
-        "Discover which fields populate a dataset by sampling its recent docs — "
-        "learn a schema before querying it.",
+        "Discover which fields populate a dataset. Samples its recent documents "
+        "to learn a schema before a query.",
         (_ES,),
     ),
     _ToolDef(
         "field_values",
         "Query",
         True,
-        "List the top values a field takes (a terms aggregation) — what actually "
-        "populates a field.",
+        "List the top values of a field with a terms aggregation. Shows what populates the field.",
         (_ES,),
     ),
     _ToolDef(
@@ -189,9 +191,8 @@ _CATALOG: tuple[_ToolDef, ...] = (
         "Query",
         True,
         "Beacon-cadence sweep over zeek.conn: measures inter-arrival coefficient "
-        "of variation per src→dst pair so a hunt reports a measured cadence "
-        "instead of an eyeballed guess (hunt-only — no alert-anchored "
-        "equivalent on triage).",
+        "of variation per source and destination pair. A hunt reports a measured "
+        "cadence from it. Hunts only. Triage has no equivalent.",
         (_ES,),
     ),
     _ToolDef(
@@ -228,7 +229,7 @@ _CATALOG: tuple[_ToolDef, ...] = (
         "enrich_ip",
         "Enrichment",
         True,
-        "Enrich an IP against local feeds — blocklists, GeoIP/ASN, cloud prefixes.",
+        "Enrich an IP against local feeds: blocklists, GeoIP/ASN and cloud prefixes.",
         (),
     ),
     _ToolDef(
@@ -256,7 +257,7 @@ _CATALOG: tuple[_ToolDef, ...] = (
         "cve_lookup",
         "Enrichment",
         True,
-        "Score a CVE via Shodan CVEDB — CVSS, EPSS, CISA-KEV (free, no key).",
+        "Score a CVE with Shodan CVEDB: CVSS, EPSS and CISA-KEV. Free, needs no key.",
         (_ONLINE,),
     ),
     _ToolDef(
@@ -270,7 +271,7 @@ _CATALOG: tuple[_ToolDef, ...] = (
         "shodan_host",
         "Enrichment",
         True,
-        "Full Shodan host lookup — owner, banners, services, vulns (paid key).",
+        "Full Shodan host lookup: owner, banners, services and vulns. Needs a paid key.",
         (_ONLINE, _Req("Shodan API key", _key_set("shodan_api_key"))),
     ),
     # ── Web research ─────────────────────────────────────────────────────────
@@ -333,11 +334,24 @@ _CATALOG: tuple[_ToolDef, ...] = (
 CATEGORY_ORDER: tuple[str, ...] = ("Query", "Enrichment", "Web research", "PCAP", "Action")
 
 
-def collect_agent_tools(settings: Settings) -> list[AgentToolOut]:
-    """Introspect every agent tool against the live config — availability + deps."""
+def collect_agent_tools(
+    settings: Settings, live: dict[str, bool] | None = None
+) -> list[AgentToolOut]:
+    """Introspect every agent tool against the live config and the live state.
+
+    ``live`` maps a requirement label ("Elasticsearch", "Security Onion") to
+    whether the health probe reached it. Configured is not available: the
+    panel listed 17 Elasticsearch tools as available while /health said the
+    grid was down (fleet 2026-10-01, RC6). A label absent from ``live`` is
+    judged on config alone.
+    """
+    live = live or {}
     out: list[AgentToolOut] = []
     for t in _CATALOG:
         missing = [r.label for r in t.reqs if not r.ok(settings)]
+        unreachable = [
+            r.label for r in t.reqs if r.label not in missing and live.get(r.label) is False
+        ]
         out.append(
             AgentToolOut(
                 name=t.name,
@@ -345,8 +359,9 @@ def collect_agent_tools(settings: Settings) -> list[AgentToolOut]:
                 read_only=t.read_only,
                 description=t.description,
                 requires=[r.label for r in t.reqs],
-                missing=missing,
-                available=not missing,
+                missing=missing + unreachable,
+                available=not missing and not unreachable,
+                unreachable=unreachable,
             )
         )
     return out

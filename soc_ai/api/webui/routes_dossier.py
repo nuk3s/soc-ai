@@ -23,6 +23,7 @@ hostname cannot name a row in it.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -35,9 +36,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from soc_ai.api.deps import get_elastic, get_settings_dep
 from soc_ai.api.security import identify_caller
+from soc_ai.api.webui._errors import api_error, oql_refusal
 from soc_ai.api.webui._shared import _iso_utc, require_admin_api, router
 from soc_ai.api.webui.routes_alerts import _es_api_error_http, _grid_unavailable
 from soc_ai.config import Settings
+from soc_ai.dossier.coverage import coverage_window, host_coverage, plane_label
 from soc_ai.dossier.infer import ROLE_VOCABULARY
 from soc_ai.dossier.resolve import (
     DEFAULT_MIN_CONFIDENCE,
@@ -52,7 +55,7 @@ from soc_ai.dossier.resolve import (
 from soc_ai.dossier.types import DOSSIER_FIELDS
 from soc_ai.errors import OqlValidationError
 from soc_ai.so_client.elastic import ElasticClient
-from soc_ai.store import entity_profiles
+from soc_ai.store import entity_profiles, host_machines
 from soc_ai.store import host_dossier as dossier_store
 from soc_ai.store import investigations as inv_svc
 from soc_ai.webui import host_activity as activity_query
@@ -117,6 +120,12 @@ class DossierFieldBriefOut(BaseModel):
     reason: str | None = None
     overridden: bool = False
     conflict_kind: str | None = None
+    # The sweep's guess under a withheld answer, so a list row can name it
+    # ("server · low confidence") and not a bare "possibly" over nothing.
+    inferred_value: str | None = None
+    # Last build that EVALUATED this field, even if it concluded nothing. Null
+    # means never evaluated. A stale row states its age from it.
+    last_run_at: str | None = None
 
 
 class DossierFieldOut(DossierFieldBriefOut):
@@ -131,17 +140,17 @@ class DossierFieldOut(DossierFieldBriefOut):
     evidence: dict[str, Any] = Field(default_factory=dict)
     observed_at: str | None = None
     first_seen: str | None = None
-    # Last build that EVALUATED this field, even if it concluded nothing. Null
-    # means never evaluated — "no signal" and "not looked at yet" are different.
-    last_run_at: str | None = None
     retracted_at: str | None = None
     operator_actor: str | None = None
     operator_note: str | None = None
     operator_set_at: str | None = None
-    inferred_value: str | None = None
     inferred_value_json: Any | None = None
     inferred_confidence: float | None = None
     inferred_source: str | None = None
+    # Why the inference lane alone does not resolve ('stale' |
+    # 'low_confidence' | 'no_signal'), or null when it does. Under a
+    # declaration it says what removing the declaration leaves.
+    inference_reason: str | None = None
     conflict: DossierConflictOut | None = None
 
 
@@ -189,7 +198,8 @@ class ProfileDimensionOut(BaseModel):
     support_days: int
     window_days: int
     # A short, per-shape sentence the row can print without a client-side
-    # interpreter: "8 ports · 445, 135, 88, …" or "work 42/h · off 3/h".
+    # interpreter: "8 ports · 445, 135, 88, …" or
+    # "started per hour, median · work 42 · off 3 · weekend none".
     summary: str
     # For categorical dimensions, the members most often seen (name, count).
     top: list[tuple[str, int]] = Field(default_factory=list)
@@ -203,6 +213,11 @@ class DossierOut(DossierRowOut):
     # Served on the SAME read as the dossier so the two cannot describe
     # different builds of the same host.
     profile: list[ProfileDimensionOut] = Field(default_factory=list)
+    # The other keys this machine is stored under: every address and every
+    # name of the machine the address belongs to, and a first label no other
+    # machine shares. Observations, leads and the host-log profile rows key on
+    # ``host.name``, so a page that read the address alone showed none of them.
+    aliases: list[str] = Field(default_factory=list)
 
 
 class DossierListOut(BaseModel):
@@ -296,10 +311,35 @@ class DossierSummaryOut(BaseModel):
     roles_low_confidence: int = Field(
         default=0,
         description=(
-            "Hosts whose inferred role sits below the confidence floor (or is "
-            "stale) and carries no operator value: named on the host page as "
-            "'possibly …', unscored by role-scoped hunts."
+            "Hosts whose inferred role is fresh but sits below the confidence "
+            "floor, and carries no operator value. Unscored by role-scoped hunts. "
+            "The list's role filter '__low_confidence__' lists the same set."
         ),
+    )
+    roles_stale: int = Field(
+        default=0,
+        description=(
+            "Hosts whose inferred role is older than the staleness window, and "
+            "carries no operator value. The role filter '__stale__' lists them."
+        ),
+    )
+    stale_hosts: int = Field(
+        default=0,
+        description=(
+            "Hosts with a clean build older than the staleness window. A sweep "
+            "that stopped running makes every answer stale."
+        ),
+    )
+    reporting_stale: int = Field(
+        default=0,
+        description=(
+            "Hosts whose agent was reporting at the last build, where that build "
+            "is older than the staleness window. Not in 'reporting'."
+        ),
+    )
+    staleness_hours: int = Field(
+        default=DEFAULT_STALENESS_HOURS,
+        description="The staleness window the counts above apply, in hours.",
     )
     last_built_at: str | None = Field(
         default=None,
@@ -537,6 +577,8 @@ def _brief_out(resolved: ResolvedField) -> DossierFieldBriefOut:
         reason=resolved.reason,
         overridden=resolved.overridden,
         conflict_kind=resolved.conflict.kind if resolved.conflict else None,
+        inferred_value=resolved.inferred_value,
+        last_run_at=_ts(resolved.last_run_at),
     )
 
 
@@ -559,15 +601,14 @@ def _field_out(resolved: ResolvedField) -> DossierFieldOut:
         evidence=resolved.evidence,
         observed_at=_ts(resolved.observed_at),
         first_seen=_ts(resolved.first_seen),
-        last_run_at=_ts(resolved.last_run_at),
         retracted_at=_ts(resolved.retracted_at),
         operator_actor=resolved.operator_actor,
         operator_note=resolved.operator_note,
         operator_set_at=_ts(resolved.operator_set_at),
-        inferred_value=resolved.inferred_value,
         inferred_value_json=resolved.inferred_value_json,
         inferred_confidence=resolved.inferred_confidence,
         inferred_source=resolved.inferred_source,
+        inference_reason=resolved.inference_reason,
         conflict=_conflict_out(resolved.conflict),
     )
 
@@ -619,12 +660,16 @@ def _profile_summary(row: Any) -> tuple[str, list[tuple[str, int]]]:
     if row.coverage != "measured" and not vec:
         return ("", [])
     if row.shape == "numeric":
+        # The baseline counts the connections this host STARTS, per hour,
+        # median per cell. The page's Connections card counts both directions
+        # over its window, so the row names its unit: "work 13/h" beside a
+        # card of 236/h read as a collapse that was a different quantity.
         parts = []
         for cell in ("work", "off", "weekend"):
             c = vec.get(cell) or {}
             med = c.get("median")
-            parts.append(f"{cell} {int(med)}/h" if isinstance(med, (int, float)) else f"{cell} —")
-        return (" · ".join(parts), [])
+            parts.append(f"{cell} {int(med)}" if isinstance(med, (int, float)) else f"{cell} none")
+        return ("started per hour, median · " + " · ".join(parts), [])
     if row.shape == "active_hours":
         hours = sorted(int(h) for h in vec if str(h).lstrip("-").isdigit())
         if not hours:
@@ -649,7 +694,146 @@ def _profile_summary(row: Any) -> tuple[str, list[tuple[str, int]]]:
     return (f"{count} {noun} · {preview}{more}" if members else "none observed", members)
 
 
-def _profile_out(rows: dict[str, Any]) -> list[ProfileDimensionOut]:
+# Why a blind row cannot be measured, per dimension. A blind row with no reason
+# printed "cannot be measured for this host" beside an agent chip, and the
+# reader could not tell a missing agent from a missing join. "The agent on this
+# host reports no process events" then read as a dead agent on a host that
+# shipped host logs and osquery (dogfood 2026-10-02). The reason names the
+# plane the row needs and the planes the host ships.
+_AGENT_EVENT_NOUN: dict[str, str] = {
+    "process_names": "endpoint process events",
+    "process_parents": "endpoint process events",
+    "logon_users": "logon events",
+}
+# The coverage plane an agent dimension reads, where the coverage module names one.
+_AGENT_DIMENSION_PLANE: dict[str, str] = {
+    "process_names": "process",
+    "process_parents": "process",
+}
+# The agent's own logs are its bookkeeping. They say nothing about the host.
+_UNNAMED_PLANES = frozenset({"agent_self"})
+# The coverage read is one size=0 search for one host. A grid that cannot answer
+# in this time leaves the reason to the dossier's own facts.
+_PLANE_READ_TIMEOUT_S = 3.0
+_FLOW_BLIND_REASON: dict[str, str] = {
+    "dns_names": "no DNS log on the grid names this host in the window",
+}
+_FLOW_BLIND_DEFAULT = "no flow log on the grid carries this data in the window"
+
+
+def _join_words(items: list[str]) -> str:
+    if len(items) <= 1:
+        return "".join(items)
+    return ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def _blind_reason(
+    dimension: str, *, reporting: bool, shipped: tuple[frozenset[str], list[str]] | None = None
+) -> str:
+    """The reason a blind row states when the store recorded none.
+
+    ``shipped`` is the coverage read: the planes present and their labels in
+    render order. Without it, the dossier knows one plane: an agent that
+    reports about itself ships host logs, because its self-report is read from
+    the host-log datasets.
+    """
+    noun = _AGENT_EVENT_NOUN.get(dimension)
+    if noun is None:
+        return _FLOW_BLIND_REASON.get(dimension, _FLOW_BLIND_DEFAULT)
+    if not reporting:
+        return "no host log in the window"
+    present, labels = shipped if shipped is not None else (frozenset(), [])
+    if _AGENT_DIMENSION_PLANE.get(dimension) in present:
+        return (
+            f"the last profile sweep found no {noun} for this host. "
+            "The host ships them now. The next profile sweep reads them."
+        )
+    return f"this host ships no {noun}. It ships {_join_words(labels or ['host logs'])}."
+
+
+def _needs_plane_read(rows: dict[str, Any], *, reporting: bool) -> bool:
+    """True when a blind agent row on a reporting host has no stored reason."""
+    return reporting and any(
+        dim in _AGENT_EVENT_NOUN
+        and row.coverage == "blind"
+        and getattr(row, "coverage_reason", None) is None
+        for dim, row in rows.items()
+    )
+
+
+async def _shipped_planes(
+    request: Request,
+    settings: Settings,
+    *,
+    address: str,
+    names: list[str],
+) -> tuple[frozenset[str], list[str]] | None:
+    """The planes one host ships now, or ``None`` when the grid cannot say.
+
+    One coverage read over the trailing window, bounded in time. A failed, a
+    partial or a slow read is no answer, and the reason then states only what
+    the dossier knows. It never states an absence that the read did not see.
+    """
+    elastic = getattr(request.app.state, "elastic", None)
+    if elastic is None:
+        return None
+    addresses = [address]
+    hosts: list[str] = []
+    for value in names:
+        try:
+            addresses.append(str(ipaddress.ip_address(value)))
+        except ValueError:
+            hosts.append(value)
+    since, until = coverage_window(None)
+    try:
+        async with asyncio.timeout(_PLANE_READ_TIMEOUT_S):
+            coverage = await host_coverage(
+                elastic, settings, addresses=addresses, names=hosts, since=since, until=until
+            )
+    except TimeoutError:
+        return None
+    if not coverage.read_ok:
+        return None
+    present = frozenset(p.plane for p in coverage.planes if p.present)
+    labels = [
+        plane_label(p.plane)
+        for p in coverage.planes
+        if p.present and p.plane not in _UNNAMED_PLANES
+    ]
+    return present, labels
+
+
+# Which of two rows for one dimension describes the machine better. A real
+# measurement under the host's name beats the blind placeholder the sweep fills
+# in under its address, and the address keeps a tie.
+_COVERAGE_RANK: dict[str, int] = {
+    "measured": 0,
+    "learning": 1,
+    "behind_proxy": 2,
+    "unmeasurable": 3,
+    "blind": 4,
+}
+
+
+def _merge_profiles(primary: dict[str, Any], *others: dict[str, Any]) -> dict[str, Any]:
+    """One row per dimension out of the address's rows and its aliases' rows."""
+    merged = dict(primary)
+    for rows in others:
+        for dim, row in rows.items():
+            held = merged.get(dim)
+            if held is None or _COVERAGE_RANK.get(str(row.coverage), 5) < _COVERAGE_RANK.get(
+                str(held.coverage), 5
+            ):
+                merged[dim] = row
+    return merged
+
+
+def _profile_out(
+    rows: dict[str, Any],
+    *,
+    reporting: bool = False,
+    shipped: tuple[frozenset[str], list[str]] | None = None,
+) -> list[ProfileDimensionOut]:
     out: list[ProfileDimensionOut] = []
     for dim in (
         "served_ports",
@@ -666,12 +850,15 @@ def _profile_out(rows: dict[str, Any]) -> list[ProfileDimensionOut]:
         if row is None:
             continue
         summary, top = _profile_summary(row)
+        reason = getattr(row, "coverage_reason", None)
+        if reason is None and row.coverage == "blind":
+            reason = _blind_reason(dim, reporting=reporting, shipped=shipped)
         out.append(
             ProfileDimensionOut(
                 dimension=dim,
                 shape=row.shape,
                 coverage=row.coverage,
-                coverage_reason=getattr(row, "coverage_reason", None),
+                coverage_reason=reason,
                 support_days=int(row.support_days or 0),
                 window_days=int(row.window_days or 0),
                 summary=summary,
@@ -681,11 +868,17 @@ def _profile_out(rows: dict[str, Any]) -> list[ProfileDimensionOut]:
     return out
 
 
-def _dossier_out(resolved: ResolvedDossier, profile: dict[str, Any] | None = None) -> DossierOut:
+def _dossier_out(
+    resolved: ResolvedDossier,
+    profile: dict[str, Any] | None = None,
+    aliases: list[str] | None = None,
+    shipped: tuple[frozenset[str], list[str]] | None = None,
+) -> DossierOut:
     return DossierOut(
         **_header(resolved),
         fields=[_field_out(f) for f in resolved.fields.values()],
-        profile=_profile_out(profile or {}),
+        profile=_profile_out(profile or {}, reporting=resolved.reporting, shipped=shipped),
+        aliases=list(aliases or []),
     )
 
 
@@ -697,17 +890,20 @@ def _dossier_out(resolved: ResolvedDossier, profile: dict[str, Any] | None = Non
 def _require_ip(ip: str) -> str:
     """Normalize a path segment to a host key, or 404.
 
-    A hostname or a slug cannot name a row in a table keyed on addresses, so it
-    is not-found rather than a 422 — the client asked for a resource that cannot
-    exist. Normalizing here (rather than letting the store return None) keeps
-    "not an address" distinguishable from "address we have never seen".
+    A hostname or a slug cannot name a row in a table keyed on addresses, so
+    the request itself is malformed: 400, with a hint that says what to send.
+    A 404 here read as "this host is gone". Normalizing here (rather than
+    letting the store return None) keeps "not an address" distinguishable from
+    "address we have never seen". The console matches the phrase "keyed on IP
+    addresses" in the hint, so keep it.
     """
     try:
         return dossier_store.normalize_host_key(ip)
     except ValueError:
-        raise HTTPException(
-            status_code=404,
-            detail={"reason": "not_an_ip", "hint": "the dossier is keyed on IP addresses"},
+        raise api_error(
+            400,
+            "not_an_ip",
+            "The dossier is keyed on IP addresses. Send an IPv4 or IPv6 address.",
         ) from None
 
 
@@ -1035,6 +1231,10 @@ async def dossier_summary(
         conflicts=summary.conflicts,
         roles=summary.roles,
         roles_low_confidence=int(getattr(summary, "roles_low_confidence", 0) or 0),
+        roles_stale=summary.roles_stale,
+        stale_hosts=summary.stale_hosts,
+        reporting_stale=summary.reporting_stale,
+        staleness_hours=int(getattr(settings, "dossier_staleness_hours", DEFAULT_STALENESS_HOURS)),
         last_built_at=_ts(summary.last_built_at),
         schedule_enabled=bool(getattr(settings, "dossier_schedule_enabled", False)),
         role_vocabulary=list(ROLE_VOCABULARY),
@@ -1069,10 +1269,10 @@ async def list_dossiers(
 
     Paged in SQL, unlike the internal-identifier list which ships its whole
     table: that contract is right for ~100 rows and wrong for a 5,000-host cap.
-    ``role`` is a coarse prefilter over the stored lanes — the resolver still
-    applies the confidence floor and the staleness window, so a host listed under
-    a role can resolve to unknown on its detail card, which is the honest answer
-    rather than a filter that quietly disagrees with the card it links to.
+    ``role`` matches the effective role through the resolver's gates, the same
+    expression the summary's role bar counts with, so a bucket and its filter
+    list one set. ``__low_confidence__`` and ``__stale__`` list the two withheld
+    buckets over the whole table.
 
     The default order is ``attention``: hosts with no clean build first (never
     built or errored — the same set ``health=broken`` filters and the summary's
@@ -1138,18 +1338,7 @@ async def get_dossier(
     render as an error where the honest reading is "unknown".
     """
     key = _require_ip(ip)
-    now = datetime.now(UTC)
-    async with request.app.state.db_sessionmaker() as db:
-        found = await dossier_store.get_dossier(db, key)
-        resolved = (
-            resolve_dossier_from_settings(found[0], found[1], now=now, settings=settings)
-            if found is not None
-            else unknown_dossier(key)
-        )
-        # No fingerprint passed: this is a RENDER, not a scoring, and the
-        # operator must see a stale profile to know it is stale.
-        profile = await entity_profiles.load_profiles(db, entity_kind="host", entity_key=key)
-    return _dossier_out(resolved, profile)
+    return await _current_dossier(request, key, settings)
 
 
 # ---------------------------------------------------------------------------
@@ -1264,9 +1453,7 @@ async def get_dossier_activity(
         # console uses, so a misconfigured ``webui_alerts_query`` reaches both
         # surfaces. Answer it the way the console does, or one setting typed
         # wrong once produces a named 400 there and a bare 500 here.
-        raise HTTPException(
-            status_code=400, detail={"reason": "bad_oql", "hint": str(exc)}
-        ) from exc
+        raise oql_refusal(exc) from exc
     except (TimeoutError, TransportError) as exc:
         # The console's standard degraded signal. An empty panel here would read
         # as "this host did nothing", which is the opposite of what is known.
@@ -1324,7 +1511,25 @@ async def _current_dossier(request: Request, key: str, settings: Settings) -> Do
         # No fingerprint passed: this is a RENDER, not a scoring, and the
         # operator must see a stale profile to know it is stale.
         profile = await entity_profiles.load_profiles(db, entity_kind="host", entity_key=key)
-    return _dossier_out(resolved, profile)
+        # The host-log dimensions key on host.name. Read them under every name
+        # and address of the machine this address belongs to, or the process
+        # baseline reads blind on a host whose agent ships 175 process names.
+        # The address's own row wins a tie: the per-address read stays per
+        # address unless another key measured what this one could not.
+        aliases = (await host_machines.entity_expansion(db, key))[1:] if found is not None else []
+        alias_rows = [
+            await entity_profiles.load_profiles(db, entity_kind="host", entity_key=variant)
+            for variant in dossier_store.alias_key_variants(aliases)
+            if variant != key
+        ]
+    merged = _merge_profiles(profile, *alias_rows)
+    # Outside the database session: the read waits on the grid, not on SQLite.
+    shipped = (
+        await _shipped_planes(request, settings, address=key, names=aliases)
+        if _needs_plane_read(merged, reporting=resolved.reporting)
+        else None
+    )
+    return _dossier_out(resolved, merged, aliases, shipped)
 
 
 # The two fields a bulk declare constrains to a closed vocabulary — one word
@@ -1549,7 +1754,7 @@ async def bulk_set_dossier_override(
                 status_code=400,
                 detail={
                     "reason": "not_an_ip",
-                    "hint": f"the dossier is keyed on IP addresses. soc-ai got {raw!r}.",
+                    "hint": f"The dossier is keyed on IP addresses. soc-ai got {raw!r}.",
                 },
             ) from None
         if key not in keys:

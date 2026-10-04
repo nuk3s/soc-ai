@@ -1,6 +1,19 @@
 # The soc-ai site. SOC_AI_DOMAIN names it. SOC_AI_CADDY_TLS holds the tls
 # directive, or stays empty for automatic HTTPS. See the caddy service in
 # docker-compose.yml and scripts/tls-proxy.sh.
+
+# A certificate from a private ACME CA, for example step-ca or a Caddy
+# acme_server. SOC_AI_CADDY_TLS="import acme_ca <directory URL> <root file>"
+# selects it. Caddy obtains and renews the certificate from that directory and
+# trusts the root file for the connection to the CA. The script copies the
+# root to ./certs/acme-ca-root.pem, which the container sees under /certs.
+(acme_ca) {
+	tls {
+		ca {args[0]}
+		ca_root {args[1]}
+	}
+}
+
 {$SOC_AI_DOMAIN} {
 	{$SOC_AI_CADDY_TLS}
 	encode zstd gzip

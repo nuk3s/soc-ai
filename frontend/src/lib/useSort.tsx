@@ -33,5 +33,10 @@ export function useSort<K extends string>(initial: SortState<K>, newKeyDir: Sort
   const headerCls = (key: K) =>
     'cursor-pointer select-none hover:text-text ' + (sort.key === key ? 'text-text' : '');
 
-  return { sort, toggleSort, caret, headerCls };
+  // aria-sort for the header cell: the caret is visual only, so a screen
+  // reader could not tell which column sorts the list (fleet P13).
+  const ariaSort = (key: K): 'ascending' | 'descending' | 'none' =>
+    sort.key !== key ? 'none' : sort.dir === 'asc' ? 'ascending' : 'descending';
+
+  return { sort, toggleSort, caret, headerCls, ariaSort };
 }

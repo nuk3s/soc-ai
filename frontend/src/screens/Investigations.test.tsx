@@ -126,7 +126,7 @@ describe('Investigations server-side query', () => {
     listInvestigations.mockResolvedValue(list(rows, { total: 120, totalAll: 120 }));
     const { container } = mount('/investigations');
     await screen.findAllByText('GPL ICMP Large ICMP Packet');
-    expect(container.textContent).toContain('1–50 of 120');
+    expect(container.textContent).toContain('1 to 50 of 120');
 
     fireEvent.click(screen.getByRole('button', { name: 'Next' }));
     await waitFor(() => {
@@ -217,7 +217,24 @@ describe('Investigations pipeline_error deep link', () => {
   it('says so when the active filter matches nothing', async () => {
     listInvestigations.mockResolvedValue(list([], { total: 0, totalAll: 42 }));
     mount('/investigations?verdict=inconclusive');
-    expect(await screen.findByText(/No investigations in this time range/i)).toBeTruthy();
+    expect(await screen.findByText('No investigation matches the verdict filter in this time range.')).toBeTruthy();
+  });
+
+  // RL13: "Widen the time range" was the advice also when the search text
+  // emptied the list.
+  it('names the search when the search emptied the list', async () => {
+    listInvestigations.mockResolvedValue(list([], { total: 0, totalAll: 42 }));
+    mount('/investigations?q=nothing-matches');
+    expect(await screen.findByText('No investigation matches the search.')).toBeTruthy();
+    expect(screen.queryByText(/Widen the time range/)).toBeNull();
+  });
+
+  it('NEGATIVE CONTROL: with no filter it still offers to widen the window', async () => {
+    listInvestigations.mockResolvedValue(list([], { total: 0, totalAll: 42 }));
+    mount('/investigations?range=1h');
+    expect(
+      await screen.findByText('No investigations in this time range. Widen the time range above.'),
+    ).toBeTruthy();
   });
 
   // The product's runs are days old, so the first click on a 24h default read
@@ -552,5 +569,9 @@ describe('Investigations rows open without a mouse', () => {
     const names = screen.getAllByRole('link', { name: /detection$/ }).map((l) => l.textContent);
     expect(names).toEqual(['Alpha detection', 'Beta detection']);
     expect(header.textContent).toContain('↑');
+    // The caret is visual. aria-sort tells a screen reader the same (P13).
+    expect(header.closest('[role="columnheader"]')).toHaveAttribute('aria-sort', 'ascending');
+    const verdict = screen.getByRole('button', { name: 'Sort by Verdict' });
+    expect(verdict.closest('[role="columnheader"]')).toHaveAttribute('aria-sort', 'none');
   });
 });

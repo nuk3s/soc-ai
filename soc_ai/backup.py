@@ -234,7 +234,7 @@ def create_backup(
     data_dir = Path(data_dir).resolve()
     db_path = data_dir / DB_FILENAME
     if not db_path.is_file():
-        raise BackupError(f"no store found at {db_path} — nothing to back up")
+        raise BackupError(f"No store found at {db_path}. There is nothing to back up.")
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -305,7 +305,9 @@ def read_manifest(archive: Path) -> Manifest:
             except KeyError:
                 fobj = None
             if fobj is None:
-                raise BackupError(f"{archive} has no manifest.json — not a soc-ai backup archive")
+                raise BackupError(
+                    f"{archive} has no manifest.json. It is not a soc-ai backup archive."
+                )
             with fobj:
                 raw = json.load(fobj)
     except (tarfile.TarError, OSError, json.JSONDecodeError) as exc:
@@ -332,10 +334,9 @@ def check_archive_head(archive_head: str | None) -> None:
     except Exception as exc:
         raise RestoreRefused(
             f"the archive's migration head {archive_head!r} is unknown to this code "
-            f"(code head: {script.get_current_head()!r}) — the backup was made by a "
-            "NEWER soc-ai, and restoring it here would be a schema downgrade "
-            "(unsupported). Upgrade soc-ai to at least the version that wrote the "
-            "backup, then restore."
+            f"(code head: {script.get_current_head()!r}). A NEWER soc-ai made the "
+            "backup. A restore here is a schema downgrade, and soc-ai does not support "
+            "it. Upgrade soc-ai to at least the version that wrote the backup, then restore."
         ) from exc
 
 
@@ -380,7 +381,7 @@ def _restore_caches(
         if target_dir is None:
             warnings.append(
                 f"archive carries the {label!r} cache but no target directory is "
-                "configured — skipped (re-seed with `soc-ai blocklists refresh`)"
+                "configured. Skipped. Seed it again with `soc-ai blocklists refresh`."
             )
             continue
         try:
@@ -429,8 +430,8 @@ def restore_backup(
     live_msg: str | None = None
     if wal_age is not None and wal_age < RUNNING_WAL_WINDOW_S:
         live_msg = (
-            f"the store at {db_path} has a write-ahead log touched {wal_age:.0f}s ago — "
-            "the app looks RUNNING; restoring under a live app loses writes and can "
+            f"the store at {db_path} has a write-ahead log touched {wal_age:.0f}s ago. "
+            "The app looks RUNNING. A restore under a live app loses writes and can "
             "corrupt the restored store. Stop the app first (docker compose stop "
             "soc-ai / systemctl stop soc-ai)"
         )
@@ -444,7 +445,7 @@ def restore_backup(
         if reasons:
             raise RestoreRefused("\n".join(reasons) + "\nrerun with --yes to restore anyway")
     elif live_msg:
-        warnings.append(f"{live_msg} (--yes given — restoring anyway)")
+        warnings.append(f"{live_msg}. --yes is given, so the restore continues.")
 
     data_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="soc-ai-restore-") as td:
@@ -457,7 +458,7 @@ def restore_backup(
 
         src_db = extracted / "data" / DB_FILENAME
         if not src_db.is_file():
-            raise BackupError(f"{archive} has no {_DB_ARCNAME} — not a soc-ai backup archive")
+            raise BackupError(f"{archive} has no {_DB_ARCNAME}. It is not a soc-ai backup archive.")
 
         # Old journals belong to the OLD database file; left in place they would
         # graft stale WAL frames onto the restored one. Always remove them.

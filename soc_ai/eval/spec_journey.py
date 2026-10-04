@@ -17,7 +17,7 @@ from typing import Any
 
 from soc_ai.eval.journey import JourneyStage
 from soc_ai.eval.synth_loader import SpecJourney
-from soc_ai.hunting.execute import SpecRun
+from soc_ai.hunting.execute import RoleOf, SpecRun
 
 
 @dataclass(frozen=True)
@@ -45,6 +45,21 @@ class SpecJourneyResult:
             "detail": self.detail,
             "passed": self.passed,
         }
+
+
+def declared_roles(journey: SpecJourney) -> RoleOf:
+    """The role gate's lookup for a fixture: the roles the scenario declares.
+
+    A declared role carries full confidence, as an operator declaration does in
+    the dossier. A host the scenario does not name has no role.
+    """
+    roles = {key.casefold(): role for key, role in journey.host_roles.items()}
+
+    def role_of(key: str) -> tuple[str | None, float]:
+        role = roles.get(key.casefold())
+        return (role, 1.0) if role is not None else (None, 0.0)
+
+    return role_of
 
 
 def score_spec_journey(scenario_id: str, journey: SpecJourney, run: SpecRun) -> SpecJourneyResult:
@@ -108,6 +123,20 @@ def score_spec_journey(scenario_id: str, journey: SpecJourney, run: SpecRun) -> 
             ),
         )
 
+    if run.role_unconfirmed_docs:
+        return SpecJourneyResult(
+            scenario_id,
+            journey.spec_id,
+            JourneyStage.TRIGGER_DID_NOT_FIRE,
+            expected,
+            actual,
+            (
+                f"spec {journey.spec_id} could not place the role of "
+                f"{', '.join(run.role_unconfirmed_hosts)}. Declare each planted host "
+                "under host_roles."
+            ),
+        )
+
     if (
         journey.expected_candidate_count is not None
         and len(run.candidates) != journey.expected_candidate_count
@@ -141,4 +170,4 @@ def score_spec_journey(scenario_id: str, journey: SpecJourney, run: SpecRun) -> 
     )
 
 
-__all__ = ["SpecJourneyResult", "score_spec_journey"]
+__all__ = ["SpecJourneyResult", "declared_roles", "score_spec_journey"]

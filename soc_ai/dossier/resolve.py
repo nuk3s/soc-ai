@@ -160,6 +160,10 @@ class ResolvedField:
     # instead cannot apply the staleness window (a knob it does not hold), so
     # it would report an agent that went quiet weeks ago as still reporting.
     inference_assertable: bool = False
+    # Why the inference lane alone does not resolve, or None when it does. The
+    # page states what removing a declaration leaves: the sweep's answer, a
+    # low-confidence guess, a stale guess, or nothing.
+    inference_reason: ResolveReason | None = "no_signal"
     conflict: ResolvedConflict | None = None
 
     @property
@@ -303,6 +307,7 @@ def resolve_field(
         inferred_confidence=inferred_confidence,
         inferred_source=row.inferred_source,
         inference_assertable=inference_reason is None,
+        inference_reason=inference_reason,
         conflict=_resolve_conflict(row),
     )
 
@@ -336,6 +341,13 @@ def resolve_dossier(
         )
         for name in DOSSIER_FIELDS
     }
+    # The rebound tripwire says "your override may no longer apply". An
+    # address that holds no declaration has no override to warn about, and the
+    # store kept stamps from before it learned that.
+    declared = any(
+        row.operator_value is not None or row.operator_value_json is not None
+        for row in stored.values()
+    )
     return ResolvedDossier(
         ip=host.ip,
         found=True,
@@ -345,7 +357,7 @@ def resolve_dossier(
         last_built_at=host.last_built_at,
         last_observed_at=host.last_observed_at,
         event_count=host.event_count or 0,
-        identity_rebound_at=host.identity_rebound_at,
+        identity_rebound_at=host.identity_rebound_at if declared else None,
         build_error=host.build_error,
     )
 

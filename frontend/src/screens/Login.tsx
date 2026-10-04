@@ -96,7 +96,7 @@ export function Login() {
             />
 
             {error && (
-              <div className="mb-4 rounded-control border border-[rgba(240,68,56,.3)] bg-[rgba(240,68,56,.06)] px-3 py-2 text-[12.5px] text-danger">
+              <div role="alert" className="mb-4 rounded-control border border-[rgba(240,68,56,.3)] bg-[rgba(240,68,56,.06)] px-3 py-2 text-[12.5px] text-danger">
                 {error}
               </div>
             )}

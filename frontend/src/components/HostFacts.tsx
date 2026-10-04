@@ -23,6 +23,10 @@ import {
   isJsonField,
   isWithheldGuess,
   partitionFields,
+  removeOutcome,
+  valueText,
+  withheldGuess,
+  withheldPhrase,
   portString,
   portsView,
   provenancePhrase,
@@ -66,6 +70,10 @@ export interface DeclareEditorProps {
   onCancel: () => void;
   /** Validation problems are the parent's error line, beside the control. */
   onInvalid: (msg: string) => void;
+  /** Set when the field carries a declaration the operator may remove. The
+   *  Edit form had no way out of a declaration; the button states the real
+   *  outcome (lib/hostDossier `removeOutcome`). */
+  onRemove?: () => void;
   /** The role datalist suggestions, from the summary wire (see
    *  lib/hostDossier `roleVocabulary`). Omitted, it falls back to the frontend's
    *  ROLE_VOCABULARY — so the declare form and the host filter offer the same
@@ -93,6 +101,7 @@ export function DeclareEditor({
   onCancel,
   onInvalid,
   roleVocabulary,
+  onRemove,
 }: DeclareEditorProps) {
   const jsonField = isJsonField(f.field);
   const label = fieldLabel(f.field);
@@ -188,8 +197,73 @@ export function DeclareEditor({
           Cancel
         </button>
       </div>
+      {onRemove && (
+        <div>
+          <button
+            data-testid={`declare-remove-${f.field}`}
+            disabled={busy}
+            onClick={onRemove}
+            className="rounded-control border border-border-strong bg-surface-3 px-2.5 py-1 text-[11.5px] text-dim hover:text-text disabled:opacity-60"
+          >
+            {removeOutcome(f)}
+          </button>
+        </div>
+      )}
     </div>
   );
+}
+
+// ---- payload rows -----------------------------------------------------------
+
+/** A structured payload as readable rows. The drawer printed
+ *  `[{"port":389,…}]` and `{"hour_of_day":…}` verbatim. */
+function PayloadRows({ field, payload }: { field: DossierFieldName; payload: unknown }) {
+  if (field === 'activity_profile') {
+    const view = activityProfileView(payload);
+    if (view) {
+      const active = view.hours.filter((v) => v > 0).length;
+      return (
+        <ul data-testid="why-payload" className="ml-1 flex flex-col gap-0.5 text-[12px] text-dim">
+          <li>· active in {active} of 24 hours of the day</li>
+          {view.lines.map((line) => (
+            <li key={line}>· {line}</li>
+          ))}
+        </ul>
+      );
+    }
+  }
+  const entries = Array.isArray(payload) ? payload : portsView(payload)?.ports ?? null;
+  if (entries) {
+    return (
+      <ul data-testid="why-payload" className="ml-1 flex flex-col gap-0.5 text-[12px] text-dim">
+        {entries.map((entry, i) => {
+          const rec = entry && typeof entry === 'object' ? (entry as Record<string, unknown>) : null;
+          const count = rec && typeof rec.count === 'number' ? rec.count : null;
+          const svc = rec && typeof rec.service === 'string' ? rec.service : null;
+          return (
+            <li key={i}>
+              · {portString(entry)}
+              {svc ? ` · ${svc}` : ''}
+              {count != null ? ` · ${count.toLocaleString()} connections` : ''}
+            </li>
+          );
+        })}
+      </ul>
+    );
+  }
+  if (payload && typeof payload === 'object') {
+    return (
+      <ul data-testid="why-payload" className="ml-1 flex flex-col gap-0.5 text-[12px] text-dim">
+        {Object.entries(payload as Record<string, unknown>).map(([key, value]) => (
+          <li key={key}>
+            · {key.replace(/_/g, ' ')}:{' '}
+            {value != null && typeof value === 'object' ? 'a structured value' : String(value)}
+          </li>
+        ))}
+      </ul>
+    );
+  }
+  return null;
 }
 
 // ---- value rendering --------------------------------------------------------
@@ -316,7 +390,13 @@ function FactValue({ f }: { f: DossierField }) {
     );
   }
   if (f.value != null && f.value.trim() !== '') {
-    return <span className="break-words text-[13px] text-text">{f.value}</span>;
+    // A role reads as its label. The declared role printed the slug
+    // "domain_controller" one row from "domain controller".
+    return (
+      <span className="break-words text-[13px] text-text" title={f.field === 'role' ? f.value : undefined}>
+        {f.field === 'role' ? roleLabel(f.value) : f.value}
+      </span>
+    );
   }
   if (f.value_json != null) {
     return (
@@ -349,9 +429,7 @@ function WhyDrawer({
   const sources = Object.entries(f.evidence ?? {});
   if (sources.length === 0 && !f.overridden) return null;
 
-  const sweeps =
-    f.inferred_value ??
-    (f.inferred_value_json != null ? JSON.stringify(f.inferred_value_json) : null);
+  const sweeps = valueText(f.field, f.inferred_value, f.inferred_value_json);
 
   return (
     <details className="mt-1.5">
@@ -397,7 +475,9 @@ function WhyDrawer({
               <div className="mb-1 flex flex-wrap items-center gap-2">
                 <Chip>{source}</Chip>
                 {entry.value != null && (
-                  <span className="text-[12px] text-text-2">{String(entry.value)}</span>
+                  <span className="text-[12px] text-text-2">
+                    {f.field === 'role' ? roleLabel(String(entry.value)) : String(entry.value)}
+                  </span>
                 )}
                 {typeof entry.strength === 'string' && (
                   <span className="text-[11px] text-faint">{entry.strength}</span>
@@ -430,12 +510,10 @@ function WhyDrawer({
           </div>
         )}
 
-        {/* Raw payload for the structured fields — source code belongs behind
-            the disclosure, not on the page (F8). */}
+        {/* The structured payload, as rows. Raw JSON is no answer to "says
+            who?" (F8, and the 2026-10-01 dogfood). */}
         {isJsonField(f.field) && f.value_json != null && (
-          <pre className="max-w-full overflow-x-auto whitespace-pre-wrap break-all font-mono text-[10.5px] leading-[1.5] text-faint">
-            {JSON.stringify(f.value_json)}
-          </pre>
+          <PayloadRows field={f.field} payload={f.value_json} />
         )}
 
         {/* The way OUT of a declaration, labelled with its consequence. The old
@@ -449,9 +527,7 @@ function WhyDrawer({
               onClick={onRemove}
               className="rounded-control border border-border-strong bg-surface-3 px-2.5 py-1 text-[11.5px] text-dim hover:text-text disabled:opacity-60"
             >
-              {sweeps != null
-                ? `Remove my declaration. The sweep's answer ${sweeps} then stands.`
-                : 'Remove my declaration. This field then goes back to unknown.'}
+              {removeOutcome(f)}
             </button>
           </div>
         )}
@@ -564,6 +640,11 @@ export function FactRow({
             setErr(null);
           }}
           onSave={(body) => run(() => setDossierOverride(ip, body), () => setEditing(false))}
+          onRemove={
+            f.overridden && !f.conflict
+              ? () => run(() => clearDossierOverride(ip, f.field), () => setEditing(false))
+              : undefined
+          }
         />
       )}
 
@@ -588,7 +669,9 @@ export function FactRow({
  */
 export function withheldRole(fields: DossierField[]): DossierField | null {
   const f = fields.find((row) => row.field === 'role');
-  if (!f || !isWithheldGuess(f) || !f.inferred_value) return null;
+  // isWithheldGuess also refuses the classifier's "unknown": "possibly
+  // unknown · confidence 0.00" named no guess at all.
+  if (!f || !isWithheldGuess(f)) return null;
   return f;
 }
 
@@ -612,6 +695,7 @@ function WithheldRoleRow({
   const { busy, err, setErr, run } = useDossierWrite(onApplied);
   const [editing, setEditing] = useState(false);
   const label = fieldLabel(f.field);
+  const guess = withheldGuess(f);
   return (
     <div
       data-testid={`field-${f.field}`}
@@ -630,11 +714,15 @@ function WithheldRoleRow({
         <div className="min-w-0 flex-1">
           <span
             className="inline-flex items-baseline gap-1.5"
-            title="The sweep inferred this role below the confidence gate. Declare the role to settle it."
+            title={
+              guess?.state === 'stale'
+                ? `The sweep last checked this role ${guess.age ?? 'long ago'}. The value is too old to trust. Declare the role to settle it.`
+                : 'The sweep inferred this role below the confidence gate. Declare the role to settle it.'
+            }
           >
             <span className="relative top-[-2px] h-2 w-2 flex-none rounded-full bg-warn" />
-            <span className="break-words text-[13px] text-dim">
-              possibly {roleLabel(f.inferred_value ?? '')}
+            <span data-testid="withheld-role" className="break-words text-[13px] text-dim">
+              {guess ? withheldPhrase(guess) : roleLabel(f.inferred_value ?? '')}
             </span>
           </span>
         </div>
@@ -694,6 +782,10 @@ export interface HostFactsProps {
    *  the declare editor's datalist. Omitted, the editor falls back to the
    *  frontend's ROLE_VOCABULARY. */
   roleVocabulary?: readonly string[];
+  /** On a machine page: the primary address these facts describe. The panel
+   *  names it, because the machine holds other addresses with facts of their
+   *  own. */
+  address?: string;
 }
 
 export function HostFacts({
@@ -702,6 +794,7 @@ export function HostFacts({
   onApplied,
   focusField,
   roleVocabulary,
+  address,
 }: HostFactsProps) {
   const { known } = partitionFields(dossier.fields);
   const rows = known.filter((f) => !BRIEFING_FIELDS.has(f.field));
@@ -717,6 +810,11 @@ export function HostFacts({
           title="What we know"
           right={
             <span className="font-mono text-[11px] text-faint">
+              {address && (
+                <span data-testid="host-facts-address" title="The facts of the primary address. Each address in the Addresses panel holds its own facts.">
+                  {`primary address ${address} · `}
+                </span>
+              )}
               {known.length} of {dossier.fields.length} facts
             </span>
           }

@@ -5,11 +5,14 @@ no SMB evidence anywhere in the corpus used to reach the engine as
 ``grounded=False`` with nothing in ``ungrounded``. The regrounding loop and the
 terminal redaction both key off that list, so the fabricated claim shipped
 verbatim — under a quiet line telling the analyst something had been removed.
+The quiet line is gone too (2026-10-02): a claim leaves with its sentence, and
+nothing says so.
 """
 
 from __future__ import annotations
 
 from soc_ai.agent.context import InvestigationContext
+from soc_ai.agent.narrative_grounding import NOTHING_GROUNDED_REPLY
 from soc_ai.webui.chat_turn import TurnInputs, run_chat_turn
 
 from tests.test_chat_turn import _TEMPLATE, _Agent, _ctx, _Finish, _patched, _spec, _state
@@ -17,7 +20,7 @@ from tests.test_chat_turn import _TEMPLATE, _Agent, _ctx, _Finish, _patched, _sp
 _SMB_ANSWER = "The host at 10.0.0.5 opened SMB shares against the file server."
 
 
-async def test_smb_only_ungrounded_claim_is_stripped_not_shipped_under_the_quiet_line() -> None:
+async def test_smb_only_ungrounded_claim_is_stripped_with_its_sentence() -> None:
     state = _state()
     ctx = _ctx(state)
     finish = _Finish()
@@ -39,9 +42,10 @@ async def test_smb_only_ungrounded_claim_is_stripped_not_shipped_under_the_quiet
     assert grounding["grounded"] is False
     assert grounding["stripped"] != []
     assert "smb" not in content.lower()
-    assert "(unverified)" in content
-    assert "10.0.0.5" in content
-    assert "Some unverifiable specifics were removed" in content
+    assert "(unverified)" not in content
+    # The one sentence carried the claim, so the reply says no statement had
+    # support. An empty reply would read as an answer.
+    assert content == NOTHING_GROUNDED_REPLY
 
 
 async def test_smb_only_ungrounded_claim_triggers_the_regrounding_retry() -> None:

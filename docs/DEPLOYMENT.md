@@ -216,8 +216,8 @@ on `127.0.0.1:8443`. Copy the `Caddyfile` from the repository root to
 `/etc/caddy/Caddyfile`. Replace `{$SOC_AI_DOMAIN}` with the site name. Replace
 `{$SOC_AI_CADDY_TLS}` with the `tls` directive, or delete that line. Change
 `reverse_proxy soc-ai:8443` to `reverse_proxy 127.0.0.1:8443`. Then run
-`sudo systemctl reload caddy`. See [DOCKER.md](DOCKER.md), TLS paths, for the three `tls`
-choices.
+`sudo systemctl reload caddy`. See [DOCKER.md](DOCKER.md), TLS paths, for the `tls`
+choices. For an ACME CA of your own, copy the `acme_ca` snippet from the `Caddyfile` too.
 
 ---
 

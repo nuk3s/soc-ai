@@ -200,8 +200,10 @@ count.
 
 A lead settles when its hunt finishes. A hunt that found no threat closes the
 lead, and the lead sits under Closed as "Closed. The hunt found no threat." with
-the chip "closed by soc-ai". A hunt that found a threat or a visibility gap leaves
-the lead under Needs decision. A hunt that could not run twice leaves it there as
+the chip "closed by soc-ai". A hunt closes the lead only when it read its
+evidence. A hunt that could not read all evidence, or a lead with an earlier
+threat hunt, stays under Needs decision, and the lead page states the reason. A
+hunt that found a threat or a visibility gap leaves the lead under Needs decision. A hunt that could not run twice leaves it there as
 "Hunted · Could not run", with Hunt again.
 
 [docs/HUNTING.md](HUNTING.md) is the full guide. It covers the five nouns, how a
@@ -212,6 +214,8 @@ command line and the API routes.
 
 This screen holds what soc-ai concluded about each machine on your network, and
 what you declared instead. It has two screens.
+
+![The Hosts list: the summary cards, the role bar and one row for each machine, sorted by last seen](img/screenshot-hosts.png)
 
 **The list** at `/app/hosts` gives one row per host. A row holds the address, the
 role, the hostname, the criticality, the number of fields in each lane, the event
@@ -240,6 +244,8 @@ ago". A note appears while automatic sweeps are off, because nothing else
 refreshes the numbers. A count that soc-ai could not read shows a dash and never
 a zero.
 
+![The page of one machine: the header, the four counters, and the Addresses table with four addresses and a collapsed line for three containers](img/screenshot-host.png)
+
 **The host page** at `/app/hosts/<ip>` holds these parts, top to bottom:
 
 - **The banner** names the machine. It uses the hostname if any source knows one,
@@ -257,9 +263,12 @@ a zero.
 - **12 field cards**, one for each dossier field.
 - **The behavioural profile**, one row for each dimension of the host's baseline.
   Each row carries a coverage chip: measured, learning, blind, behind proxy or
-  unmeasurable. A blind row reads "cannot be measured for this host". An
-  unmeasurable row reads "not measured:" and the reason the grid gave when it
-  refused the query.
+  unmeasurable. A blind row reads "cannot be measured:" and the reason. On a
+  host with an agent, the reason names the missing plane and the planes that the
+  host ships, for example "this host ships no endpoint process events. It ships
+  host logs and osquery." The console reads the planes from the grid. When the
+  grid cannot answer, the reason names host logs only. An unmeasurable row reads
+  "not measured:" and the reason the grid gave when it refused the query.
 
 An internal address opens here from anywhere in the console. Alert rows, the peer
 graph and old `/entity/<ip>` links all redirect to it. An external address still
@@ -295,7 +304,9 @@ On any field card:
 - If the sweep disagrees with a value that you declared, the card says so and
   names the type of disagreement. The evidence points elsewhere. The evidence it
   rested on is gone. The address appears to have rebound to a different machine.
-  Then you have two choices:
+  A rebound needs a hostname or a MAC that changes to a different value. A
+  value that appears for the first time is no rebound. Only an address with a
+  declaration shows a rebound. Then you have two choices:
   - **Accept inference** drops your override and takes the answer from the sweep.
     Confirm it with Discard my value.
   - **Keep mine** keeps your value and stops the question for a period. The
@@ -325,9 +336,91 @@ interval, and a scheduled dossier refresh rebuilds it too.
 - Config → Host dossier turns on the schedule and sets its interval. Every
   setting there is hot, so it needs no restart and the next sweep reads it.
 
+### Host identity
+
+A machine is a set of addresses that soc-ai holds to be one device. The sweep
+builds the machines at the end of each run. The per-address dossier stays. It
+holds the facts that an alert joins on, and the machine sits above it.
+
+The sweep applies five rules in this order. A rule never moves an address that
+a stronger rule placed.
+
+1. **Agent.** One agent is one machine. Its addresses are the internal values
+   of `host.ip` that it reports. Link-local addresses do not count. An address
+   that two agents report belongs to neither agent. Docker's `172.17.0.1` is an
+   example.
+2. **Bridge and container.** An agent that reports a bridge gateway owns the /24
+   of that gateway. A gateway is an IPv4 address that ends in `.1`. An address
+   in that /24 that the endpoint sensor of the agent sees is a container on the
+   machine. Other datasets can also see the address. The address stays a
+   machine when another agent claims it or a DHCP lease names it. A container
+   is not a row in the list. The machine page lists it.
+3. **DHCP lease.** An address that a lease gave to one MAC belongs to the
+   machine of that MAC. An agent owns a MAC when it reports the MAC and reports
+   8 MACs or fewer. A container host reports one MAC for each container, and a
+   host with hundreds of MACs owns none. A MAC that no agent owns is a machine
+   of its own. When two MACs held one address in the window, the newer lease
+   wins.
+4. **Unique name.** A network-only address joins an agent machine when its
+   strong DNS name has the short name of that machine. A short name that two
+   machines share joins neither machine.
+5. **Single address.** An address that no rule placed is a machine of its own.
+
+| Item | Rule |
+|---|---|
+| Machine key | `agent:<agent id>`, else `mac:<mac>`, else `ip:<address>`. The key stays the same across sweeps. |
+| Merge | An agent that appears on a machine soc-ai knew by MAC or by address takes that machine. The machine page lists the older key. |
+| Primary address | The agent address with the most events, else the newest lease, else the only address. |
+| Name | A declaration, else the agent `host.name`, else the newest lease hostname, else the strong DNS name of the primary address. The machine keeps every name with its source. |
+| Events | The sum over the addresses of the machine. An address that only its agent reports counts the agent's own documents for that address. |
+| Last seen | The newest event on any address of the machine. |
+
+An agent's own name and a DHCP lease hostname are what the machine calls itself.
+The sweep keeps them when they are a public top-level domain, such as "nexus".
+A bare DNS name that is a top-level domain is still dropped.
+
+The sweep reads DHCP leases in two shapes. Security Onion 3.x writes
+`client.address`, `dhcp.assigned_ip`, `host.hostname` and `host.mac`. Older
+grids write `source.ip`, `dhcp.hostname` and `dhcp.client.mac`.
+
+An address that no census has found for `dossier_stale_address_days` leaves the
+dossier table. The default is 30 days. An address with an operator declaration
+stays. The machine keeps the address in its history. A sweep whose census
+failed removes nothing.
+
+When the census, the agent pass or the DHCP lease pass fails, the sweep keeps
+the machines that it has. The run records the error. A machine therefore never
+changes its key because one pass could not read the grid.
+
+The observations, the profile and the entity page of a host read every address
+and every name of its machine. A first label of a name joins only when no other
+machine has that label. A value that names no machine reads itself only.
+
+The machine endpoints:
+
+| Route | Answer |
+|---|---|
+| `GET /api/v1/hosts` | One row per machine, searched, filtered, sorted and paged. |
+| `GET /api/v1/hosts/summary?activity=` | The cards and the counts in the column menus. Each count equals the list total of one filter with the same `activity`. The default is `all`, and the cards use it. The column menus send the activity of the list. |
+| `GET /api/v1/hosts/resolve?value=` | The machine key of an address, a name, a MAC or an agent id. 404 when no machine holds it. |
+| `GET /api/v1/hosts/{key}` | One machine: each address with its type, the containers, the MACs, the merged keys and the dossier of the primary address. |
+
+The list takes these parameters. An unknown value is a 422 that names the legal
+values.
+
+| Parameter | Values |
+|---|---|
+| `q` | Search. It matches each name from any source, each address, each MAC, the OS, the role and the agent name. Case does not matter. An address matches exactly or by prefix. A name or an address equal to the query ranks first. A name or an address that starts with the query ranks second. Other matches rank last. The `sort` orders the rows inside one rank. Search ignores `activity`. |
+| `sort`, `dir` | `name`, `address`, `role`, `agent`, `events`, `first_seen`, `last_seen`, with `asc` or `desc`. The address sort is numeric. Empty values sort last in both directions. |
+| `role` | A role, `unknown`, `low_confidence` or `stale`. |
+| `agent`, `declared`, `named`, `conflict` | `yes` or `no`. |
+| `activity` | `active`, the default, keeps the machines with events. `all` keeps every machine. |
+| `seen` | `new` keeps the machines first seen in the last 7 days. |
+| `health` | `broken` keeps the machines whose primary address has no clean build. `attention` adds the machines whose build is older than the staleness window. |
+
 ## Operate hub (`/app/operate`)
 
-![The Operate hub: the Analytics panel, with its sweep status line and one row per analytic, above the trust-instrument cards](img/screenshot-operate.png)
+![The Operate hub: the Analytics panel with its sweep status line and one row for each analytic](img/screenshot-operate.png)
 
 The hub maps the trust instruments of the console. It holds 6 cards. Each card
 names one thing that soc-ai can prove and links to the screen where you prove it.

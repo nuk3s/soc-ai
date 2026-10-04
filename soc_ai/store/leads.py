@@ -19,13 +19,16 @@ from typing import Any
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from soc_ai.store.models import EntityObservation, Hunt, Lead
+from soc_ai.store.models import EntityObservation, Hunt, HuntEvent, Lead
 
 __all__ = [
     "AUTO_HUNT_ACTOR",
     "AUTO_HUNT_RETRY_LIMIT",
     "CLOSED_STATUSES",
     "DISMISS_REASONS",
+    "HOLD_EARLIER_THREAT",
+    "HOLD_PARTIAL_READ",
+    "HOLD_SENTENCES",
     "HUNT_CLEAN_REASON",
     "HUNT_FAILED_STATUSES",
     "HUNT_RUNNING_STATUSES",
@@ -33,9 +36,12 @@ __all__ = [
     "RelatedLead",
     "analyst_dismissed",
     "cites_documents",
+    "decisions_of",
+    "derived_hold_reason",
     "dismiss",
     "evidence_block_for",
     "get",
+    "hold_reason_of",
     "hunt_did_not_run",
     "hunt_is_queued",
     "hunt_outcome_of",
@@ -44,6 +50,7 @@ __all__ = [
     "mark_promoted",
     "needs_decision_clause",
     "objective_for",
+    "record_decision",
     "related_counts",
     "related_leads",
     "reopen",
@@ -80,6 +87,19 @@ HUNT_CLEAN_REASON = "hunt_clean"
 # and the loop tries once more, then leaves it to the analyst.
 HUNT_FAILED_STATUSES: tuple[str, ...] = ("error", "cancelled", "interrupted")
 AUTO_HUNT_RETRY_LIMIT = 2
+
+# Why the settle rule did not close a lead whose hunt answered clean. The
+# lead waits on the analyst, and the lead page states the reason.
+HOLD_PARTIAL_READ = "partial_read"
+HOLD_EARLIER_THREAT = "earlier_threat"
+HOLD_SENTENCES: dict[str, str] = {
+    HOLD_PARTIAL_READ: "The hunt could not read all evidence.",
+    HOLD_EARLIER_THREAT: "An earlier hunt found a threat.",
+}
+
+# The first words of the note the runner writes when a hunt ran out of budget
+# and a no-tools synthesizer wrote the report from what it had read.
+_PARTIAL_SYNTHESIS_PREFIX = "Reached the hunt's exploration budget"
 
 _KIND_WORDS: dict[str, str] = {
     "novel_destination": "a new destination",
@@ -152,7 +172,11 @@ def needs_decision_clause(*, auto_hunt: bool) -> Any:
         # The loop leaves two leads to the analyst: a reopened one, and a
         # shadow one. A shadow lead came from an analytic in shadow, which
         # records and never acts; its hunt is the analyst's call.
-        left_to_analyst = or_(Lead.dismissed_at.is_not(None), Lead.shadow.is_(True))
+        left_to_analyst = or_(
+            Lead.reopened_at.is_not(None),
+            Lead.dismissed_at.is_not(None),
+            Lead.shadow.is_(True),
+        )
         return or_(and_(no_hunt_yet, left_to_analyst), hunt_finished)
     return or_(no_hunt_yet, hunt_finished)
 
@@ -173,6 +197,7 @@ def hunt_is_queued(lead: Lead, *, auto_hunt: bool) -> bool:
         and lead.status == "open"
         and not lead.hunt_id
         and lead.dismissed_at is None
+        and lead.reopened_at is None
         and not lead.shadow
     )
 
@@ -213,6 +238,72 @@ def _refuse_if_closed(lead: Lead) -> None:
         raise ValueError(f"lead {lead.id} is {lead.status}. Reopen it first.")
 
 
+def _iso_at(at: datetime | None) -> str | None:
+    return at.replace(tzinfo=None).isoformat() if isinstance(at, datetime) else None
+
+
+def decisions_of(lead: Lead) -> list[dict[str, Any]]:
+    """Every decision on the lead, oldest first.
+
+    A row written before migration 0053 that the upgrade did not reach has no
+    history. Its current dismissal is the one decision it can show.
+    """
+    stored = lead.decisions_json
+    if isinstance(stored, list):
+        return [dict(d) for d in stored if isinstance(d, dict)]
+    out: list[dict[str, Any]] = []
+    if lead.dismissed_at is not None:
+        out.append(
+            {
+                "action": (
+                    "closed_by_hunt" if lead.dismissed_by == AUTO_HUNT_ACTOR else "dismissed"
+                ),
+                "at": _iso_at(lead.dismissed_at),
+                "by": lead.dismissed_by,
+                "reason": lead.dismissed_reason,
+                "note": lead.dismissed_note,
+            }
+        )
+    return out
+
+
+def record_decision(lead: Lead, action: str, at: datetime, **fields: Any) -> None:
+    """Append one decision to the lead's history.
+
+    The list is written back whole. The JSON column does not track an
+    in-place append, and a decision the session did not see is a decision
+    the page never shows.
+    """
+    entry: dict[str, Any] = {"action": action, "at": _iso_at(at)}
+    entry.update(fields)
+    lead.decisions_json = [*decisions_of(lead), entry]
+
+
+def _clear_dismissal(lead: Lead) -> None:
+    """The lead is no longer dismissed. The dismissal lives on in the history."""
+    lead.dismissed_reason = None
+    lead.dismissed_note = None
+    lead.dismissed_by = None
+    lead.dismissed_at = None
+
+
+def hold_reason_of(lead: Lead) -> str | None:
+    """Why the settle rule left the lead's current hunt to the analyst, or None.
+
+    Read off the history: the newest ``held`` entry for the hunt the lead
+    names now. A hold on an older hunt is history, and a later decision on
+    the lead answers it.
+    """
+    history = decisions_of(lead)
+    if not history or not lead.hunt_id:
+        return None
+    last = history[-1]
+    if last.get("action") != "held" or last.get("hunt_id") != lead.hunt_id:
+        return None
+    reason = last.get("reason")
+    return str(reason) if reason else None
+
+
 async def mark_hunting(db: AsyncSession, lead_id: int, *, hunt_id: str) -> Lead:
     lead = await db.get(Lead, int(lead_id))
     if lead is None:
@@ -246,9 +337,13 @@ async def dismiss(
     if lead.status == "dismissed":
         return lead
     at = (now or datetime.now(UTC)).replace(tzinfo=None)
+    clean_note = (note or "").strip()[:2000] or None
+    # The history first. A row with no history yet reads its decisions off
+    # the dismissal columns, and they must not hold this one twice.
+    record_decision(lead, "dismissed", at, by=by[:80], reason=reason, note=clean_note)
     lead.status = "dismissed"
     lead.dismissed_reason = reason
-    lead.dismissed_note = (note or "").strip()[:2000] or None
+    lead.dismissed_note = clean_note
     lead.dismissed_by = by[:80]
     lead.dismissed_at = at
     lead.updated_at = at
@@ -257,31 +352,61 @@ async def dismiss(
     return lead
 
 
-async def mark_promoted(db: AsyncSession, lead_id: int, *, investigation_id: str) -> Lead:
+async def mark_promoted(
+    db: AsyncSession,
+    lead_id: int,
+    *,
+    investigation_id: str,
+    by: str | None = None,
+    now: datetime | None = None,
+) -> Lead:
+    """Close the lead as promoted. A promoted lead carries no dismissal."""
     lead = await db.get(Lead, int(lead_id))
     if lead is None:
         raise LookupError(lead_id)
     _refuse_if_closed(lead)
+    at = (now or datetime.now(UTC)).replace(tzinfo=None)
+    # The history first: a row with no history yet keeps its old dismissal.
+    record_decision(
+        lead,
+        "promoted",
+        at,
+        by=(by or "")[:80] or None,
+        investigation_id=investigation_id,
+    )
     lead.status = "promoted"
     lead.investigation_id = investigation_id
-    lead.updated_at = datetime.now(UTC).replace(tzinfo=None)
+    _clear_dismissal(lead)
+    lead.updated_at = at
     await db.commit()
     await db.refresh(lead)
     return lead
 
 
 async def reopen(db: AsyncSession, lead_id: int, by: str, *, now: datetime | None = None) -> Lead:
-    """Open a closed lead again. The dismissal stays as history.
+    """Open a closed lead again. The dismissal moves to the history.
 
     An analyst changes their mind. The reason, the note, the hand and the time
-    of the dismissal are kept: the sharpening loop reads the reason, and a
-    reopening that erased it would erase the lesson with it.
+    of the dismissal stay in ``decisions_json``, and the reopen is the next
+    entry there. The dismissal columns are cleared: they state the current
+    dismissal, and a reopened lead has none. They used to keep it, so a
+    reopened lead read as dismissed in its header and in the API.
+
+    ``reopened_at`` marks the lead as the analyst's. The loop does not hunt
+    it, and the settle rule does not close it.
     """
     lead = await db.get(Lead, int(lead_id))
     if lead is None:
         raise LookupError(lead_id)
     at = (now or datetime.now(UTC)).replace(tzinfo=None)
+    if lead.status not in CLOSED_STATUSES:
+        # Nothing to reopen. A repeat of the request is not a second decision.
+        return lead
+    # The history first: a row with no history yet keeps its old dismissal.
+    record_decision(lead, "reopened", at, by=by[:80])
     lead.status = "open"
+    _clear_dismissal(lead)
+    lead.reopened_at = at
     lead.updated_at = at
     await db.commit()
     await db.refresh(lead)
@@ -311,8 +436,93 @@ def hunt_did_not_run(hunt: Hunt) -> bool:
 
 
 def analyst_dismissed(lead: Lead) -> bool:
-    """Whether an analyst, not the settle rule, wrote the dismissal the lead carries."""
+    """Whether an analyst decided on this lead before: a dismissal, or a reopen.
+
+    A reopen clears the dismissal columns, so ``reopened_at`` carries the
+    mark. The dismissal test stays for a row the 0053 upgrade did not reach.
+    """
+    if lead.reopened_at is not None:
+        return True
     return lead.dismissed_at is not None and lead.dismissed_by != AUTO_HUNT_ACTOR
+
+
+def _tool_failed(result: Any) -> bool:
+    return isinstance(result, dict) and bool(result.get("error"))
+
+
+async def _clean_close_blocker(db: AsyncSession, hunt: Hunt) -> str | None:
+    """Why a hunt that answered clean may not close its lead, or None.
+
+    A hunt closes a lead as clean only when it read its evidence. The range
+    closed a lead whose re-hunt ran while the grid stalled: its findings said
+    "Alert documents unreadable due to grid timeout", and two earlier hunts on
+    the same lead held critical threat findings. The close read as an
+    all-clear that nobody had earned.
+
+    - ``earlier_threat``: an earlier complete hunt on the same lead found a
+      threat. A later clean answer does not undo it. The analyst decides.
+    - ``partial_read``: the report holds a visibility gap, a tool call failed
+      in the trace, the run was degraded, or the report came from the
+      budget synthesizer.
+    """
+    if hunt.lead_id is not None:
+        earlier = await db.scalars(
+            select(Hunt).where(
+                Hunt.lead_id == hunt.lead_id,
+                Hunt.id != hunt.id,
+                Hunt.status == "complete",
+            )
+        )
+        if any(hunt_outcome_of(h) == "threats" for h in earlier.all()):
+            return HOLD_EARLIER_THREAT
+
+    from soc_ai.hunting.findings import finding_category  # noqa: PLC0415 - avoids a cycle
+
+    report = hunt.report if isinstance(hunt.report, dict) else {}
+    findings = [f for f in (report.get("findings") or []) if isinstance(f, dict)]
+    if any(finding_category(f) == "visibility_gap" for f in findings):
+        return HOLD_PARTIAL_READ
+
+    events = await db.scalars(
+        select(HuntEvent).where(
+            HuntEvent.hunt_id == hunt.id,
+            HuntEvent.kind.in_(("tool_result", "done", "model_response", "error")),
+        )
+    )
+    for event in events.all():
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        if event.kind == "error":
+            return HOLD_PARTIAL_READ
+        if event.kind == "tool_result" and _tool_failed(payload.get("result")):
+            return HOLD_PARTIAL_READ
+        if event.kind == "done" and (payload.get("degraded") or payload.get("partial")):
+            return HOLD_PARTIAL_READ
+        if event.kind == "model_response" and str(payload.get("text") or "").startswith(
+            _PARTIAL_SYNTHESIS_PREFIX
+        ):
+            return HOLD_PARTIAL_READ
+    return None
+
+
+async def derived_hold_reason(db: AsyncSession, lead: Lead) -> str | None:
+    """The hold a lead would carry today, for a row settled before the rule.
+
+    A lead that a clean hunt closed before 2026-10-01 and that an analyst
+    reopened has no ``held`` entry in its history. The page still has to say
+    why the clean answer did not settle it. Read the hunt it names and apply
+    :func:`_clean_close_blocker` on read. A recorded hold wins.
+    """
+    if lead.status != "open" or lead.hunt_id is None:
+        return None
+    recorded = hold_reason_of(lead)
+    if recorded is not None:
+        return recorded
+    hunt = await db.get(Hunt, lead.hunt_id)
+    if hunt is None or hunt.status in HUNT_RUNNING_STATUSES:
+        return None
+    if hunt_outcome_of(hunt) != "clean":
+        return None
+    return await _clean_close_blocker(db, hunt)
 
 
 async def settle_after_hunt(db: AsyncSession, hunt: Hunt, *, now: datetime | None = None) -> str:
@@ -322,7 +532,9 @@ async def settle_after_hunt(db: AsyncSession, hunt: Hunt, *, now: datetime | Non
 
     - ``clean``: the hunt answered no threat. The lead closes with the reason
       ``hunt_clean`` in the rule's own hand. A lead an analyst dismissed and
-      reopened is theirs to decide; it waits instead.
+      reopened is theirs to decide; it waits instead. A hunt that did not
+      read all its evidence, or a lead an earlier hunt found a threat on,
+      waits too, and the history records why (:func:`_clean_close_blocker`).
     - ``threats`` or ``gap``: the lead waits on the analyst. A threat is a
       decision, and a gap cannot be hunted away.
     - anything else (a query raised, or the hunt ended in error, cancelled
@@ -347,6 +559,26 @@ async def settle_after_hunt(db: AsyncSession, hunt: Hunt, *, now: datetime | Non
     if outcome == "clean":
         if analyst_dismissed(lead):
             return "waits"
+        blocker = await _clean_close_blocker(db, hunt)
+        if blocker is not None:
+            # Recorded once per hunt. The reconciliation pass calls this on
+            # every wake, and a second entry would say nothing new.
+            if hold_reason_of(lead) != blocker:
+                record_decision(
+                    lead, "held", at, by=AUTO_HUNT_ACTOR, reason=blocker, hunt_id=hunt.id
+                )
+                lead.updated_at = at
+                await db.commit()
+                _LOGGER.info("lead %s waits: hunt %s answered clean, %s", lead.id, hunt.id, blocker)
+            return "waits"
+        record_decision(
+            lead,
+            "closed_by_hunt",
+            at,
+            by=AUTO_HUNT_ACTOR,
+            reason=HUNT_CLEAN_REASON,
+            hunt_id=hunt.id,
+        )
         lead.status = "dismissed"
         lead.dismissed_reason = HUNT_CLEAN_REASON
         lead.dismissed_note = None

@@ -11,11 +11,12 @@ answer whose claims all appear in a tool result.
 from __future__ import annotations
 
 from soc_ai.agent.narrative_grounding import (
-    UNVERIFIED_QUIET_LINE,
+    argument_names,
     check_narrative_grounding,
     extract_artifacts,
     redact_ungrounded,
     regrounding_instruction,
+    strip_correction_talk,
 )
 
 
@@ -131,8 +132,8 @@ def test_smb_only_failure_is_actionable_by_regrounding_and_redaction() -> None:
     redacted = redact_ungrounded(answer, g.ungrounded)
     assert redacted != answer
     assert "smb" not in redacted.lower()
-    assert "(unverified)" in redacted
-    assert "10.0.0.5" in redacted
+    # The claim goes with its sentence. No placeholder takes its place.
+    assert "(unverified)" not in redacted
 
 
 def test_smb_claim_grounded_by_a_tool_result_is_not_flagged() -> None:
@@ -360,57 +361,190 @@ def test_com_domain_is_extracted_and_flagged() -> None:
     assert "evilbeacon.com" in g.ungrounded
 
 
-def test_quiet_line_names_no_tokens_and_carries_no_alarm_glyph() -> None:
-    """Ground-or-strip (2026-08-20): the terminal fallback for an ungrounded
-    claim is no longer a caveat banner naming the suspect tokens — a 2026-08-20
-    dogfood turn shipped exactly such a banner listing ordinary prose fragments
-    ("closest-preceding", "package-update") as "unverified hostnames". The
-    replacement line says something was removed, once, with no token list and
-    no ⚠."""
-    assert "unverifiable" in UNVERIFIED_QUIET_LINE.lower()
-    assert "removed" in UNVERIFIED_QUIET_LINE.lower()
-    assert "⚠" not in UNVERIFIED_QUIET_LINE
+def test_redaction_says_nothing_about_itself() -> None:
+    """Ground-or-strip (owner, 2026-08-21): an ungrounded specific is grounded
+    or stripped, never bannered. A 2026-10-02 host chat reply still ended with
+    "_Some unverifiable specifics were removed from this reply._" and carried two
+    "(unverified)" placeholders in the middle of a sentence."""
+    answer = "The host resolved ad.local at noon. It talks to the proxy."
+    redacted = redact_ungrounded(answer, ["ad.local"])
+    assert redacted == "It talks to the proxy."
+    assert "unverif" not in redacted.lower()
+    assert "removed" not in redacted.lower()
 
 
-def test_redact_ungrounded_replaces_every_occurrence_case_insensitively() -> None:
-    """The old scoped caveat NAMED the suspect claims inline; redaction REMOVES
-    them from the visible answer instead — whole-token, case-insensitive, every
-    occurrence, so a claim repeated in a different case still comes out."""
-    answer = "The host DESKTOP-JSM4N2P resolved ad.local; desktop-jsm4n2p asked again."
+def test_redact_ungrounded_removes_every_occurrence_case_insensitively() -> None:
+    """Every sentence that carries the claim goes, whatever its case."""
+    answer = (
+        "The host DESKTOP-JSM4N2P resolved ad.local. Then desktop-jsm4n2p asked again. "
+        "The proxy answered."
+    )
     redacted = redact_ungrounded(answer, ["ad.local", "DESKTOP-JSM4N2P"])
     assert "ad.local" not in redacted.lower()
     assert "desktop-jsm4n2p" not in redacted.lower()
-    assert redacted.count("(unverified)") == 3  # both DESKTOP-JSM4N2P spellings + ad.local
+    assert redacted == "The proxy answered."
 
 
 def test_redact_ungrounded_leaves_grounded_text_untouched() -> None:
-    """Redaction is scoped to the ungrounded list — a grounded artifact sitting
-    right next to a fabricated one in the same sentence must survive."""
-    answer = "WIN11-LAB01 (grounded) resolved ad.local (not grounded)."
+    """Redaction is scoped to the ungrounded list: a grounded sentence beside
+    the fabricated one survives."""
+    answer = "WIN11-LAB01 answered on 445. It resolved ad.local."
     redacted = redact_ungrounded(answer, ["ad.local"])
-    assert "WIN11-LAB01" in redacted
-    assert "ad.local" not in redacted
+    assert redacted == "WIN11-LAB01 answered on 445."
 
 
-def test_redact_ungrounded_collapses_a_prefix_overlap_with_no_dangling_suffix() -> None:
-    """A shorter ungrounded artifact that is a PREFIX of a longer one (a bare
-    IP vs. the same IP with a port) must not partially clobber the longer
-    replacement — longest-first order is what keeps `192.0.2.61:443` from
-    leaving a dangling `:443` once `192.0.2.61` alone would otherwise match
-    first and eat only its own five characters."""
-    answer = "Beaconed to 192.0.2.61:443, and separately 192.0.2.61 answered on 80."
+def test_redact_ungrounded_leaves_no_dangling_suffix_on_a_prefix_overlap() -> None:
+    """A bare IP and the same IP with a port: neither leaves a dangling `:443`."""
+    answer = "Beaconed to 192.0.2.61:443, and separately 192.0.2.61 answered on 80. Done."
     redacted = redact_ungrounded(answer, ["192.0.2.61", "192.0.2.61:443"])
     assert ":443" not in redacted
     assert "192.0.2.61" not in redacted
-    assert redacted.count("(unverified)") == 2
+    assert redacted == "Done."
 
 
-def test_redact_ungrounded_caps_nothing_and_names_nothing() -> None:
-    """Unlike the old scoped caveat (capped at 4, "…" for the rest), redaction
-    has no cap to get wrong — every ungrounded artifact is a text replacement,
-    not a line in a list that has to fit."""
+def test_redact_ungrounded_caps_nothing() -> None:
+    """Every ungrounded artifact goes, however many there are."""
     ungrounded = [f"host-{i}.corp" for i in range(10)]
     redacted = redact_ungrounded(" ".join(ungrounded), ungrounded)
     assert "host-0.corp" not in redacted
     assert "host-9.corp" not in redacted
-    assert redacted.count("(unverified)") == 10
+    assert "(unverified)" not in redacted
+
+
+def test_redaction_takes_an_item_out_of_a_list_and_keeps_the_sentence() -> None:
+    """The clause of a list item is the item. The rest of the list stays."""
+    answer = (
+        "This confirms no `endpoint.events.process`, `endpoint.events.network` or `ad.local` data."
+    )
+    assert redact_ungrounded(answer, ["ad.local"]) == (
+        "This confirms no `endpoint.events.process` or `endpoint.events.network` data."
+    )
+    three = "It resolved ad.local, wsus.internal, corp.example and mail.example."
+    assert redact_ungrounded(three, ["wsus.internal"]) == (
+        "It resolved ad.local, corp.example and mail.example."
+    )
+
+
+def test_redaction_drops_a_sentence_whose_list_loses_every_item() -> None:
+    answer = "First line. It resolved `ad.local` and `wsus.internal` twice."
+    assert redact_ungrounded(answer, ["ad.local", "wsus.internal"]) == "First line."
+
+
+def test_redaction_drops_a_bullet_line_whole() -> None:
+    answer = "Datasets:\n- `system.syslog`: 12 docs\n- `ad.local`: 3 docs\n- `system.auth`: 4 docs"
+    assert redact_ungrounded(answer, ["ad.local"]) == (
+        "Datasets:\n- `system.syslog`: 12 docs\n- `system.auth`: 4 docs"
+    )
+
+
+def test_redaction_keeps_bold_lead_sentences_apart() -> None:
+    """A bold lead sentence ends at ".**". It is a sentence of its own."""
+    answer = "**The host ships no process events.** It resolved ad.local."
+    assert redact_ungrounded(answer, ["ad.local"]) == "**The host ships no process events.**"
+
+
+# ── Names a tool call used ──────────────────────────────────────────────────
+
+
+def _oql(query: str) -> dict[str, object]:
+    return {"tool": "t_query_events_oql", "args": {"query": query}}
+
+
+def test_a_dataset_a_zero_hit_query_named_is_grounded() -> None:
+    """Production 2026-10-02: the model said no `endpoint.events.network` data
+    exists. Its own query had asked for that dataset and returned 0. A query
+    that returns nothing grounds the claim that the dataset holds nothing."""
+    answer = "The query returned 0 docs, so no `endpoint.events.network` data exists."
+    g = check_narrative_grounding(
+        answer,
+        seed_context="",
+        tool_evidence=[{"tool": "t_query_events_oql", "result": '{"total": 0, "hits": []}'}],
+        tool_calls=[_oql("event.dataset:endpoint.events.network AND host.ip:192.0.2.41")],
+    )
+    assert g.grounded is True
+
+
+def test_a_wildcard_dataset_in_a_query_grounds_the_names_it_covers() -> None:
+    answer = (
+        "No `endpoint.events.process`, `endpoint.events.network` or `endpoint.events.file` data."
+    )
+    g = check_narrative_grounding(
+        answer,
+        seed_context="",
+        tool_evidence=[],
+        tool_calls=[_oql("host.name:depot AND event.dataset:endpoint.events.*")],
+    )
+    assert g.grounded is True
+
+
+def test_a_domain_used_as_a_query_value_stays_ungrounded() -> None:
+    """NEGATIVE CONTROL: a query for a made-up domain does not make it observed.
+
+    Only a dataset or a field name grounds through the tool-call arguments. A
+    value the model searched for is a guess until a result carries it.
+    """
+    answer = "The host resolved wsus.internal."
+    g = check_narrative_grounding(
+        answer,
+        seed_context="",
+        tool_evidence=[{"tool": "t_query_events_oql", "result": '{"total": 0}'}],
+        tool_calls=[_oql("event.dataset:zeek.dns AND dns.question.name:wsus.internal")],
+    )
+    assert g.grounded is False
+    assert g.ungrounded == ["wsus.internal"]
+
+
+def test_a_wildcard_with_no_literal_label_grounds_nothing() -> None:
+    """NEGATIVE CONTROL: "event.dataset:*.internal" must not ground every name."""
+    g = check_narrative_grounding(
+        "The host resolved wsus.internal.",
+        seed_context="",
+        tool_evidence=[],
+        tool_calls=[_oql("event.dataset:*.internal")],
+    )
+    assert g.grounded is False
+
+
+def test_argument_names_read_fields_datasets_and_named_arguments() -> None:
+    names = argument_names(
+        [
+            _oql("event.dataset:(system.syslog OR system.auth) | groupby dhcp.hostname"),
+            {
+                "tool": "t_field_values",
+                "args": {"field": "winlog.event_id", "dataset": "windows.security"},
+            },
+            {"tool": "t_describe_dataset", "args": '{"dataset": "strelka.file"}'},
+        ]
+    )
+    assert {"system.syslog", "system.auth", "dhcp.hostname", "winlog.event_id"} <= names
+    assert {"windows.security", "strelka.file"} <= names
+
+
+# ── The correction retry ────────────────────────────────────────────────────
+
+
+def test_the_correction_asks_for_an_answer_that_does_not_mention_it() -> None:
+    text = regrounding_instruction(["ad.local"])
+    assert "Do not mention this correction" in text
+
+
+def test_strip_correction_talk_removes_the_meta_sentence() -> None:
+    """Production 2026-10-02: "The correction is now properly grounded: this host
+    ships no endpoint process events." The reply is for the analyst, and the
+    talk about the correction tells the analyst nothing."""
+    answer = (
+        "**No process events.** The query returned 0.\n\n"
+        "The correction is now properly grounded: this host ships no endpoint process "
+        "events. Its process visibility comes only from osquery.\n\n"
+        "As corrected, the host is quiet."
+    )
+    assert strip_correction_talk(answer) == (
+        "**No process events.** The query returned 0.\n\n"
+        "Its process visibility comes only from osquery."
+    )
+
+
+def test_strip_correction_talk_leaves_an_ordinary_answer_alone() -> None:
+    """NEGATIVE CONTROL: an answer about a corrected rule is not meta talk."""
+    answer = "The operator corrected the firewall rule on Monday. The host sits in the DMZ."
+    assert strip_correction_talk(answer) == answer

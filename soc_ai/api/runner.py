@@ -179,8 +179,8 @@ async def recorded_run(
             "type": "TimeoutError",
             "phase": "whole_run_backstop",
             "hint": (
-                "the run was still streaming when the whole-run wall clock "
-                "expired — usually a hung or very slow model backend. Check the "
+                "The run was still streaming when the whole-run wall clock "
+                "expired. The usual cause is a hung or very slow model backend. Check the "
                 "LLM gateway and its serving engine before raising "
                 "investigation_run_timeout_s."
             ),

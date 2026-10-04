@@ -248,6 +248,16 @@ from soc_ai.api.webui.routes_export import (
     export_investigation,
     oracle_redaction_preview,
 )
+from soc_ai.api.webui.routes_hosts import (  # noqa: F401 - registers the /hosts routes
+    MachineDetailOut,
+    MachineListOut,
+    MachineRowOut,
+    MachineSummaryOut,
+    get_machine,
+    list_machines,
+    machine_summary,
+    resolve_machine,
+)
 from soc_ai.api.webui.routes_hunt_catalog import (
     HuntCatalogOut,
     HuntCatalogSpecOut,

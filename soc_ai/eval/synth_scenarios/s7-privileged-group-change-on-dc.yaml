@@ -1,0 +1,115 @@
+id: s7-privileged-group-change-on-dc
+name: "Domain Admins membership change with no alert"
+version: 1
+tier: medium
+story: |
+  A named account adds a service account to Domain Admins on a domain
+  controller. Windows writes event 4728. No signature fires.
+
+  The prior that this analytic replaces read new logon accounts on the domain
+  controller. It never read a group change. On the development range the
+  attack chain added members to Domain Admins, Enterprise Admins, Schema
+  Admins, Group Policy Creator Owners and Remote Desktop Users, and the prior
+  saw none of these adds.
+
+  The benign twin is an add to an ordinary security group on a second domain
+  controller. The group clause removes it. The twin sits on a second
+  controller, so a spec without the group clause surfaces two candidates and
+  the pinned count fails. The third document adds a member to the local
+  Administrators group of a workstation. The analytic applies to domain
+  controllers only, so it must not fire.
+attack:
+  - T1098.007
+  - T1078.002
+sigma_refs: []
+
+ground_truth:
+  verdict: true_positive
+  confidence_min: 0.70
+  required_citation_kinds:
+    - typed_path
+  expected_actions:
+    - kind: escalate
+  expected_field_reconciliation: false
+
+spec_journey:
+  spec_id: identity-privileged-group-change
+  expected_scope_keys:
+    - "synth-dc01"
+  expected_candidate_count: 1
+  host_roles:
+    synth-dc01: domain_controller
+    synth-dc02: domain_controller
+    synth-ws01: workstation
+
+events:
+  # The add to Domain Admins.
+  - index: logs-synth-winlog-security
+    time_offset_seconds: 0
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: system.security
+      event.module: system
+      event.kind: event
+      event.code: "4728"
+      event.provider: Microsoft-Windows-Security-Auditing
+      host.name: "synth-dc01"
+      winlog.channel: Security
+      winlog.event_id: "4728"
+      winlog.computer_name: "SYNTH-DC01.synth.test"
+      winlog.event_data.SubjectUserName: "ops-admin"
+      winlog.event_data.SubjectDomainName: "synth"
+      winlog.event_data.TargetUserName: Domain Admins
+      winlog.event_data.TargetDomainName: "synth"
+      winlog.event_data.MemberName: "CN=svc-backup,OU=Service,DC=synth,DC=test"
+      winlog.event_data.MemberSid: "S-1-5-21-1000000000-2000000000-3000000000-1201"
+      synth.scenario_id: s7-privileged-group-change-on-dc
+      synth.scenario_version: 1
+
+  # The benign twin: an add to an ordinary group.
+  - index: logs-synth-winlog-security
+    time_offset_seconds: -900
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-900) }}"
+      event.dataset: system.security
+      event.module: system
+      event.kind: event
+      event.code: "4728"
+      event.provider: Microsoft-Windows-Security-Auditing
+      host.name: "synth-dc02"
+      winlog.channel: Security
+      winlog.event_id: "4728"
+      winlog.computer_name: "SYNTH-DC02.synth.test"
+      winlog.event_data.SubjectUserName: "ops-admin"
+      winlog.event_data.SubjectDomainName: "synth"
+      winlog.event_data.TargetUserName: Finance-Readers
+      winlog.event_data.TargetDomainName: "synth"
+      winlog.event_data.MemberName: "CN=new-hire,OU=Staff,DC=synth,DC=test"
+      winlog.event_data.MemberSid: "S-1-5-21-1000000000-2000000000-3000000000-1305"
+      synth.scenario_id: s7-privileged-group-change-on-dc
+      synth.scenario_version: 1
+
+  # An add to the local Administrators group of a workstation. Out of scope.
+  - index: logs-synth-winlog-security
+    time_offset_seconds: -300
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-300) }}"
+      event.dataset: system.security
+      event.module: system
+      event.kind: event
+      event.code: "4732"
+      event.provider: Microsoft-Windows-Security-Auditing
+      host.name: "synth-ws01"
+      winlog.channel: Security
+      winlog.event_id: "4732"
+      winlog.computer_name: "SYNTH-WS01.synth.test"
+      winlog.event_data.SubjectUserName: "ops-admin"
+      winlog.event_data.SubjectDomainName: "synth"
+      winlog.event_data.TargetUserName: Administrators
+      winlog.event_data.TargetDomainName: Builtin
+      winlog.event_data.MemberSid: "S-1-5-21-1000000000-2000000000-3000000000-1201"
+      synth.scenario_id: s7-privileged-group-change-on-dc
+      synth.scenario_version: 1

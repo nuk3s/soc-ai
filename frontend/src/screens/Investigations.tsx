@@ -351,7 +351,7 @@ export function Investigations() {
     };
   }, []);
   // Shared sort mechanics; clicking a new column here starts it ascending.
-  const { sort, toggleSort, caret, headerCls } = useSort<SortKey>(
+  const { sort, toggleSort, caret, headerCls, ariaSort } = useSort<SortKey>(
     { key: 'when', dir: 'desc' },
     'asc',
   );
@@ -788,7 +788,7 @@ export function Investigations() {
                   <div key={s.invId} className="flex items-center gap-2 py-[3px]">
                     <X size={12} className="flex-none text-faint" />
                     <span className="min-w-0 truncate text-dim">{labelForInv(s.invId)}</span>
-                    <span className="flex-none text-faint">— {rehuntSkipReason(s.reason)}</span>
+                    <span className="flex-none text-faint">{rehuntSkipReason(s.reason)}</span>
                   </div>
                 ))}
               </div>
@@ -799,6 +799,7 @@ export function Investigations() {
 
       <div className="overflow-hidden rounded-card border border-border bg-surface-1">
         <div
+          role="row"
           className="grid gap-2.5 border-b border-border bg-surface-2 px-3.5 py-[9px] text-[10.5px] font-semibold uppercase tracking-[.06em] text-faint"
           style={{ gridTemplateColumns: GRID }}
         >
@@ -815,54 +816,66 @@ export function Investigations() {
               }
             />
           </div>
-          <button
-            type="button"
-            aria-label="Sort by Detection"
-            className={`text-left uppercase ${headerCls('name')}`}
-            onClick={() => toggleSort('name')}
-          >
-            Detection{caret('name')}
-          </button>
-          <button
-            type="button"
-            aria-label="Sort by Verdict"
-            className={`text-left uppercase ${headerCls('verdict')}`}
-            onClick={() => toggleSort('verdict')}
-          >
-            Verdict{caret('verdict')}
-          </button>
-          <button
-            type="button"
-            aria-label="Sort by Conf"
-            className={`text-left uppercase ${headerCls('conf')}`}
-            onClick={() => toggleSort('conf')}
-          >
-            Conf{caret('conf')}
-          </button>
-          <button
-            type="button"
-            aria-label="Sort by Source → Dest"
-            className={`text-left uppercase ${headerCls('host')}`}
-            onClick={() => toggleSort('host')}
-          >
-            Source → Dest{caret('host')}
-          </button>
-          <button
-            type="button"
-            aria-label="Sort by Status"
-            className={`text-left uppercase ${headerCls('status')}`}
-            onClick={() => toggleSort('status')}
-          >
-            Status{caret('status')}
-          </button>
-          <button
-            type="button"
-            aria-label="Sort by When"
-            className={`text-left uppercase ${headerCls('when')}`}
-            onClick={() => toggleSort('when')}
-          >
-            When{caret('when')}
-          </button>
+          <div role="columnheader" aria-sort={ariaSort('name')}>
+            <button
+              type="button"
+              aria-label="Sort by Detection"
+              className={`text-left uppercase ${headerCls('name')}`}
+              onClick={() => toggleSort('name')}
+            >
+              Detection{caret('name')}
+            </button>
+          </div>
+          <div role="columnheader" aria-sort={ariaSort('verdict')}>
+            <button
+              type="button"
+              aria-label="Sort by Verdict"
+              className={`text-left uppercase ${headerCls('verdict')}`}
+              onClick={() => toggleSort('verdict')}
+            >
+              Verdict{caret('verdict')}
+            </button>
+          </div>
+          <div role="columnheader" aria-sort={ariaSort('conf')}>
+            <button
+              type="button"
+              aria-label="Sort by Conf"
+              className={`text-left uppercase ${headerCls('conf')}`}
+              onClick={() => toggleSort('conf')}
+            >
+              Conf{caret('conf')}
+            </button>
+          </div>
+          <div role="columnheader" aria-sort={ariaSort('host')}>
+            <button
+              type="button"
+              aria-label="Sort by Source → Dest"
+              className={`text-left uppercase ${headerCls('host')}`}
+              onClick={() => toggleSort('host')}
+            >
+              Source → Dest{caret('host')}
+            </button>
+          </div>
+          <div role="columnheader" aria-sort={ariaSort('status')}>
+            <button
+              type="button"
+              aria-label="Sort by Status"
+              className={`text-left uppercase ${headerCls('status')}`}
+              onClick={() => toggleSort('status')}
+            >
+              Status{caret('status')}
+            </button>
+          </div>
+          <div role="columnheader" aria-sort={ariaSort('when')}>
+            <button
+              type="button"
+              aria-label="Sort by When"
+              className={`text-left uppercase ${headerCls('when')}`}
+              onClick={() => toggleSort('when')}
+            >
+              When{caret('when')}
+            </button>
+          </div>
           <div />
         </div>
 
@@ -884,11 +897,25 @@ export function Investigations() {
           >
             soc-ai runs an investigation on a detection. The investigation pulls the evidence,
             reasons over the evidence and reaches a verdict. Pick a detection on the Alerts
-            screen. Auto-triage can also work the backlog.
+            screen. Auto-Investigate can also work the backlog.
           </EmptyState>
         )}
         {!loading && !error && displayRows.length === 0 && totalAll > 0 && (
-          <EmptyState>No investigations in this time range. Widen the time range above. Clear the filters.</EmptyState>
+          <EmptyState>
+            {/* Named after the filter in force. "Widen the time range" read as
+                the cure also when the cause was the search text (RL13). */}
+            {debouncedQ
+              ? 'No investigation matches the search.'
+              : filterVerdicts.length
+                ? 'No investigation matches the verdict filter in this time range.'
+                : filterStatuses.length
+                  ? 'No investigation matches the status filter in this time range.'
+                  : errorState
+                    ? 'No investigation matches the pipeline error filter in this time range.'
+                    : range === '30d' && !custom
+                      ? 'No investigations in the last 30 days.'
+                      : 'No investigations in this time range. Widen the time range above.'}
+          </EmptyState>
         )}
         {displayRows.map((r, i) => {
           const st = STATUS[r.status] ?? STATUS.error;
@@ -1136,7 +1163,7 @@ export function Investigations() {
         {!loading && !error && total > PAGE_SIZE && (
           <div className="flex items-center justify-between border-t border-border px-3.5 py-2.5">
             <span className="font-mono text-[11.5px] text-faint">
-              {`${total === 0 ? 0 : offset + 1}–${Math.min(offset + PAGE_SIZE, total)} of ${total.toLocaleString()}`}
+              {`${total === 0 ? 0 : offset + 1} to ${Math.min(offset + PAGE_SIZE, total)} of ${total.toLocaleString()}`}
             </span>
             <div className="flex items-center gap-1.5">
               <button

@@ -79,11 +79,11 @@ describe('HuntVisuals — View as table (non-hover path)', () => {
   it('host–finding map table names each finding and its hosts', () => {
     renderVisuals();
     const table = screen
-      .getByText('Host–finding map · each finding and the hosts it names')
+      .getByText('Host and finding map · each finding and the hosts it names')
       .closest('table') as HTMLElement;
-    expect(within(table).getByText('F1 — Beacon to C2')).toBeInTheDocument();
+    expect(within(table).getByText('F1: Beacon to C2')).toBeInTheDocument();
     // a finding that names no host renders an em dash, not an empty cell
-    const noHostRow = within(table).getByText('F3 — DNS lookups').closest('tr') as HTMLElement;
+    const noHostRow = within(table).getByText('F3: DNS lookups').closest('tr') as HTMLElement;
     expect(within(noHostRow).getByText('—')).toBeInTheDocument();
   });
 

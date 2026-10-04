@@ -113,6 +113,7 @@ nav:
       - Reading a broken audit chain: AUDIT-CHAIN.md
       - Running on a lesser model: LESSER_MODELS.md
   - Blog:
+      - soc-ai hunts on its own now: blog/2026-10-soc-ai-hunts-on-its-own-now.md
       - Getting an LLM to show its work: blog/2026-07-getting-an-llm-to-show-its-work.md
   - Project:
       - Roadmap: ROADMAP.md

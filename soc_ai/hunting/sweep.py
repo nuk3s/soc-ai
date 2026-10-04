@@ -28,7 +28,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from soc_ai.config import Settings
-from soc_ai.hunting.execute import Candidate, SpecRun, run_spec
+from soc_ai.hunting.execute import Candidate, RoleOf, SpecRun, apply_role_gate, run_spec
 from soc_ai.hunting.findings import spec_report
 from soc_ai.hunting.receipts import DRY_RUN_WINDOW_DAYS, build_receipts, overlap_with_live
 from soc_ai.hunting.sources import observe_catalog_hits
@@ -148,6 +148,8 @@ async def sweep_spec(
         until=until,
         include_synth=include_synth,
     )
+    if spec.roles and not run.blind and run.error is None:
+        run = apply_role_gate(spec, run, await _role_lookup(session))
     duration_ms = int((time.monotonic() - started) * 1000)
     run = replace(run, duration_ms=duration_ms)
 
@@ -207,7 +209,12 @@ async def sweep_spec(
     # condition has cleared passes no gap and retires the open one. First in the
     # list so the ``top_k`` budget cannot cut the reason the run is not clean.
     gate_input = list(run.candidates)
-    if run.undecided_docs or run.unattributed_docs or run.truncated_docs:
+    if (
+        run.undecided_docs
+        or run.unattributed_docs
+        or run.truncated_docs
+        or run.role_unconfirmed_docs
+    ):
         gate_input.insert(0, _gap_candidate(spec.id, _unclean_reason(run)))
 
     decision = await apply_gate(
@@ -248,6 +255,11 @@ async def sweep_spec(
         # With the count, not without it: the breakdown is what the finding
         # names a field from, and the finding is composed from THIS run.
         undecided_by_field=run.undecided_by_field,
+        # Carried for the same reason: the gate removes candidates, and the role
+        # gate already removed these before it.
+        role_unconfirmed_docs=run.role_unconfirmed_docs,
+        role_unconfirmed_hosts=run.role_unconfirmed_hosts,
+        role_out_of_scope_docs=run.role_out_of_scope_docs,
         gate_already_handled=len([c for c in decision.already_handled if not _is_gap(c)]),
         gate_over_budget=len(decision.over_budget),
         # Only ever non-zero on this path, and only on a run that passed no gap
@@ -435,7 +447,32 @@ def _unclean_reason(run: SpecRun) -> str:
         parts.append(f"{run.unattributed_docs} unattributed")
     if run.truncated_docs:
         parts.append(f"{run.truncated_docs} truncated")
+    if run.role_unconfirmed_docs:
+        parts.append(f"{run.role_unconfirmed_docs} on hosts with no confirmed role")
     return "document(s) not accounted for: " + ", ".join(parts)
+
+
+async def _role_lookup(session: AsyncSession) -> RoleOf:
+    """The dossier role of a scope key, read once per run.
+
+    The prior sweep's reader, so a role-scoped analytic and a role prior read
+    one role for one host. A failed read places no host: every candidate is
+    then unconfirmed and reported, never dropped.
+    """
+    # Lazy: the prior sweep imports the profile builder and its planes.
+    from soc_ai.hunting.prior_sweep import _role_for, _roles  # noqa: PLC0415 - lazy
+
+    try:
+        roles = await _roles(session)
+    except Exception:
+        _LOGGER.warning("spec sweep: could not read host roles", exc_info=True)
+        await session.rollback()
+        roles = {}
+
+    def role_of(key: str) -> tuple[str | None, float]:
+        return _role_for(roles, key)
+
+    return role_of
 
 
 def catalog_objective(spec: HuntSpec, since: str, until: str) -> str:

@@ -1798,8 +1798,10 @@ def _egress_client(settings: Settings) -> Iterator[TestClient]:
     to all-zero, so the tests assert on the POLICY TABLE (enable state + posture)
     deterministically without depending on a live ES aggregation."""
 
+    from soc_ai.audit.counts import AuditCounts
+
     async def _zero_counts(_elastic, _alias, kinds, *, days=7):  # type: ignore[no-untyped-def]
-        return {k: 0 for k in kinds}
+        return AuditCounts(counts={k: 0 for k in kinds})
 
     fake_es = AsyncMock()
     fake_auth = AsyncMock()
@@ -1807,7 +1809,7 @@ def _egress_client(settings: Settings) -> Iterator[TestClient]:
         patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=fake_es),
         patch("soc_ai.main.make_auth", return_value=fake_auth),
         patch("soc_ai.main.get_settings", return_value=settings),
-        patch("soc_ai.audit.counts.audit_counts_by_kind", _zero_counts),
+        patch("soc_ai.audit.counts.audit_counts_with_reason", _zero_counts),
     ):
         app = create_app()
         with TestClient(app) as client:
@@ -1981,7 +1983,7 @@ def test_egress_policy_counts_null_when_audit_errors(settings_kratos: Settings) 
         patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=fake_es),
         patch("soc_ai.main.make_auth", return_value=fake_auth),
         patch("soc_ai.main.get_settings", return_value=settings_kratos),
-        patch("soc_ai.audit.counts.audit_counts_by_kind", _boom),
+        patch("soc_ai.audit.counts.audit_counts_with_reason", _boom),
     ):
         app = create_app()
         with TestClient(app) as client:
@@ -1992,17 +1994,25 @@ def test_egress_policy_counts_null_when_audit_errors(settings_kratos: Settings) 
             assert len(body["destinations"]) == 9
             # every count is null (unknown), never a misleading 0
             assert all(d["count_7d"] is None for d in body["destinations"])
+            # ...and every null count says why. The panel showed nine blank
+            # cells and no reason.
+            assert all(d["count_reason"] for d in body["destinations"])
+            by_id = {d["id"]: d for d in body["destinations"]}
+            assert "RuntimeError" in by_id["oracle"]["count_reason"]
+            assert "no audit record type" in by_id["web_search"]["count_reason"]
 
 
 def test_egress_policy_oracle_count_reflects_audit(settings_kratos: Settings) -> None:
     """A destination WITH a mapped audit kind (Oracle) surfaces its 7-day count;
     a destination without one (web search) stays null."""
 
+    from soc_ai.audit.counts import AuditCounts
+
     async def _counts(_elastic, _alias, kinds, *, days=7):  # type: ignore[no-untyped-def]
-        base = {k: 0 for k in kinds}
+        base: dict[str, int | None] = {k: 0 for k in kinds}
         base["oracle_escalation"] = 3
         base["oracle_adjudication"] = 2
-        return base
+        return AuditCounts(counts=base)
 
     fake_es = AsyncMock()
     fake_auth = AsyncMock()
@@ -2010,7 +2020,7 @@ def test_egress_policy_oracle_count_reflects_audit(settings_kratos: Settings) ->
         patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=fake_es),
         patch("soc_ai.main.make_auth", return_value=fake_auth),
         patch("soc_ai.main.get_settings", return_value=settings_kratos),
-        patch("soc_ai.audit.counts.audit_counts_by_kind", _counts),
+        patch("soc_ai.audit.counts.audit_counts_with_reason", _counts),
     ):
         app = create_app()
         with TestClient(app) as client:
@@ -2020,6 +2030,9 @@ def test_egress_policy_oracle_count_reflects_audit(settings_kratos: Settings) ->
             assert by_id["oracle"]["count_7d"] == 5
             # web search has no dedicated kind → honest null, not 0
             assert by_id["web_search"]["count_7d"] is None
+            assert by_id["web_search"]["count_reason"]
+            # A complete count carries no reason.
+            assert by_id["oracle"]["count_reason"] is None
 
 
 def test_egress_policy_admin_gated(settings_kratos: Settings) -> None:
@@ -2065,7 +2078,11 @@ def test_health_shape(client: TestClient) -> None:
     ):
         body = client.get("/api/v1/health").json()
     assert body["es"]["ok"] is True
-    assert body["llm"] == {"ok": False, "detail": "gateway down"}
+    assert body["llm"]["ok"] is False
+    assert body["llm"]["detail"] == "gateway down"
+    # A failed leg is "down"; a leg over its budget would be "slow".
+    assert body["llm"]["state"] == "down"
+    assert isinstance(body["llm"]["elapsed_ms"], int)
     assert body["pcap"] is None  # pcap_enabled is False by default
 
 
@@ -4998,20 +5015,33 @@ def test_status_defaults_empty_on_create(admin_session_client: TestClient) -> No
     assert frank["status"] == ""
 
 
-def test_set_my_status_dev_echo(client: TestClient) -> None:
-    """POST /me/status echoes back the trimmed status (dev no-session path)."""
+def test_set_my_status_without_a_session_is_refused(client: TestClient) -> None:
+    """POST /me/status with no session user is a 401 no_session, never ok:true.
+
+    With auth off it used to answer {"ok": true} and store nothing, so GET /me
+    returned an empty status on the next read (dogfood 2026-10-01, RD4)."""
     resp = client.post("/api/v1/me/status", json={"status": "  investigating  "})
-    assert resp.status_code == 200
-    data = resp.json()
-    assert data["ok"] is True
-    # The API trims whitespace server-side
-    assert data["status"] == "investigating"
+    assert resp.status_code == 401, resp.text
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "no_session"
+    assert detail["hint"]
+    assert "ok" not in resp.json()
+    assert client.get("/api/v1/me").json()["status"] == ""
 
 
-def test_set_my_status_cap_64(client: TestClient) -> None:
+def test_set_my_status_persists_for_a_session_user(admin_session_client: TestClient) -> None:
+    """A signed-in user's status is trimmed, stored, and read back by GET /me."""
+    client = admin_session_client
+    resp = client.post("/api/v1/me/status", json={"status": "  investigating  "})
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"ok": True, "status": "investigating"}
+    assert client.get("/api/v1/me").json()["status"] == "investigating"
+
+
+def test_set_my_status_cap_64(admin_session_client: TestClient) -> None:
     """POST /me/status truncates status to 64 characters."""
     long_status = "x" * 100
-    resp = client.post("/api/v1/me/status", json={"status": long_status})
+    resp = admin_session_client.post("/api/v1/me/status", json={"status": long_status})
     assert resp.status_code == 200
     assert len(resp.json()["status"]) <= 64
 
@@ -5607,7 +5637,10 @@ class TestNotifyWebhookGet:
         for c in _client(settings):
             r = c.get("/api/v1/config/notify/webhook")
             assert r.status_code == 200
-            assert r.json() == {"isSet": False, "source": "unset"}
+            assert {k: r.json()[k] for k in ("isSet", "source")} == {
+                "isSet": False,
+                "source": "unset",
+            }
 
     def test_env_value_reports_env(self, settings: Settings) -> None:
         configured = settings.model_copy(
@@ -5616,7 +5649,10 @@ class TestNotifyWebhookGet:
         for c in _client(configured):
             r = c.get("/api/v1/config/notify/webhook")
             assert r.status_code == 200
-            assert r.json() == {"isSet": True, "source": "env"}
+            assert {k: r.json()[k] for k in ("isSet", "source")} == {
+                "isSet": True,
+                "source": "env",
+            }
 
     def test_whitespace_only_env_value_reported_unset(self, settings: Settings) -> None:
         """F63: a whitespace-only env-sourced webhook URL (no blank-to-None
@@ -5626,7 +5662,10 @@ class TestNotifyWebhookGet:
         for c in _client(blank):
             r = c.get("/api/v1/config/notify/webhook")
             assert r.status_code == 200
-            assert r.json() == {"isSet": False, "source": "unset"}
+            assert {k: r.json()[k] for k in ("isSet", "source")} == {
+                "isSet": False,
+                "source": "unset",
+            }
 
     def test_db_override_reports_db(self, settings: Settings) -> None:
         for c in _client(settings):
@@ -5636,7 +5675,7 @@ class TestNotifyWebhookGet:
             )
             r = c.get("/api/v1/config/notify/webhook")
             assert r.status_code == 200
-            assert r.json() == {"isSet": True, "source": "db"}
+            assert {k: r.json()[k] for k in ("isSet", "source")} == {"isSet": True, "source": "db"}
 
 
 class TestDangerZoneTest:
@@ -6776,14 +6815,14 @@ def test_tool_outcome_never_leaks_json_and_humanizes_known_shapes() -> None:
         t, _ = _tool_step(tn, {}, res)
         return t
 
-    # host_summary with data -> "<ip> — N events", not the {ip,event_count} dict
+    # host_summary with data -> "<ip>, N events", not the {ip,event_count} dict
     t = title("t_host_summary", {"ip": "192.0.2.247", "observations": True, "event_count": 699})
-    assert t == "Host summary: 192.0.2.247 — 699 events"
+    assert t == "Host summary: 192.0.2.247, 699 events"
     assert "{" not in t
     # host_summary, no observations
     assert (
         title("t_host_summary", {"ip": "10.0.0.9", "observations": False, "event_count": 0})
-        == "Host summary: 10.0.0.9 — no observations"
+        == "Host summary: 10.0.0.9, no observations"
     )
     # online enrichment off -> neutral skipped row (lecture stays in the expander)
     assert (
@@ -7025,7 +7064,7 @@ def test_entity_graph_carries_enrichment_facts() -> None:
     assert by_edge["198.51.100.20"]["label"] == "observed"
     # graphNote keeps its shape but names the flagged peers (bounded)
     assert note == (
-        "ws-finance-07 contacted 3 peer(s). Enrichment flagged 1 of them as malicious: 203.0.113.9."
+        "ws-finance-07 contacted 3 peers. Enrichment flagged 1 of them as malicious: 203.0.113.9."
     )
 
 

@@ -106,22 +106,43 @@ function alertsWindowParams(range: string, custom: CustomRange | null): URLSearc
 }
 
 /**
- * Where a verdict tile lands. Four settled verdicts are investigation OUTCOMES,
- * so they open the Investigations list. 'untriaged' is not an outcome — it
- * counts alert GROUPS with no standing investigation, and such a group has no
- * investigation row to show (nor can it get one while it stays untriaged), so
- * /investigations?verdict=untriaged was empty by construction: the tile read
- * "1" and the destination read "no investigations" (prod 2026-08-07).
+ * Where a verdict tile lands. Every tile counts alert GROUPS in the Dashboard's
+ * window, so every tile opens the Alerts list on the same endpoint (GET
+ * /alerts), with the same verdict, the same window and acked groups shown. The
+ * destination count is then the tile's count.
  *
- * It goes to /alerts instead — same endpoint (GET /alerts), same unit, so the
- * destination count is provably the tile's count — and it is where the operator
- * can start the investigation.
+ * 'untriaged' went there first: /investigations?verdict=untriaged was empty by
+ * construction (prod 2026-08-07). The four settled verdicts still opened
+ * /investigations?verdict=<v>, which counts investigation ROWS over 30 days.
+ * "False positive 43" for 24 h opened a list of 2,091, and "True positive 0"
+ * opened a list with one (D2, RD3, 2026-10-01).
  */
 function verdictDestination(v: Verdict, range: string, custom: CustomRange | null): string {
-  if (v !== 'untriaged') return `/investigations?verdict=${v}`;
   const p = alertsWindowParams(range, custom);
-  p.set('verdict', 'untriaged');
+  p.set('verdict', v);
   return `/alerts?${p}`;
+}
+
+/**
+ * The tuning nudge line. It names both counts that its Review target shows:
+ * every nominated rule, and the mute suggestions among them. It used to name
+ * the mute count only, "29 mute suggestions pending", over a list of 39 rules
+ * (D10). `nominated` is optional: an older backend omits it, and the line then
+ * keeps the mute count alone.
+ */
+function tuningNudgeLine(summary: { pending: number; nominated?: number }): string {
+  const mutes = `${summary.pending} mute suggestion${summary.pending === 1 ? '' : 's'}`;
+  if (typeof summary.nominated !== 'number') return mutes;
+  const rules = `${summary.nominated} nominated rule${summary.nominated === 1 ? '' : 's'}`;
+  return `${rules} · ${mutes}`;
+}
+
+/** The scope under "Investigations running". The tile counts the newest page
+ *  of investigations. When that page holds every investigation, say "all". */
+function recentScope(shown: number, total: number | undefined): string {
+  const n = shown.toLocaleString();
+  if (typeof total === 'number' && total <= shown) return `of all ${n}`;
+  return `of the ${n} newest`;
 }
 
 function severityDestination(sev: string, range: string, custom: CustomRange | null): string {
@@ -245,12 +266,12 @@ function VerdictBreakdown({
             key={v}
             type="button"
             onClick={() => onSelect(v)}
-            // Untriaged has no investigations to show — say where it actually
-            // goes, so the tooltip stops promising a list that can't exist.
+            // Every tile opens the Alerts list (verdictDestination), so the
+            // tooltip names that list and the unit it counts.
             title={
               v === 'untriaged'
                 ? 'The Alerts list holds these detections. Open it to start an investigation.'
-                : `Show ${VERDICT[v].label} investigations`
+                : `Show the ${VERDICT[v].label} detection groups in the Alerts list`
             }
             className="flex items-center justify-between gap-2 rounded-card border border-border-faint px-2.5 py-2 text-left transition-colors hover:border-accent"
           >
@@ -386,7 +407,7 @@ function AutoTriagePanel({ s, loading }: { s: AutoTriageStatus | null; loading: 
           )}
         </>
       ) : (
-        'The sweep is idle. No auto-investigate batch has run yet.'
+        'Auto-Investigate is idle. No Auto-Investigate run has happened yet.'
       )}
     </div>
   );
@@ -699,10 +720,11 @@ export function Dashboard() {
   // polls on its own slow cadence below.
   const fetchDashboardInvestigations = async (): Promise<{
     recent: InvestigationRow[];
+    total: number;
     active: boolean;
   }> => {
     const recent = await listInvestigations({ limit: 100 });
-    return { recent: recent.rows, active: recent.active };
+    return { recent: recent.rows, total: recent.total, active: recent.active };
   };
   const invs = useAsync(fetchDashboardInvestigations, [], {
     refetchInterval: 10_000,
@@ -1095,7 +1117,7 @@ export function Dashboard() {
               : alertsStale
                 ? 'The backlog is unknown. The grid stopped answering.'
                 : triage.data?.active
-                  ? `auto-investigate active · ${triage.data.hunted}/${triage.data.total}`
+                  ? `Auto-Investigate active · ${triage.data.hunted}/${triage.data.total}`
                   : !alerts.data
                     ? 'checking the queue…'
                     : m.verdict.untriaged > 0
@@ -1165,7 +1187,7 @@ export function Dashboard() {
         <StatCard
           label="Investigations running"
           value={i(running)}
-          sub={triage.data?.active ? 'auto-investigate active' : `of the ${i(rows.length)} most recent, any time`}
+          sub={triage.data?.active ? 'Auto-Investigate active' : recentScope(rows.length, invs.data?.total)}
           color="#2dd4bf"
           icon={<Crosshair size={16} />}
           title={COUNT_RUNNING}
@@ -1215,13 +1237,13 @@ export function Dashboard() {
             <PanelHeader
               icon={<Activity size={15} />}
               title="Investigation outcomes"
-              right={<span className="text-[11.5px] text-faint">{a(m.groups)} groups</span>}
+              right={<span className="text-[11.5px] text-faint">{a(m.groups)} detection {m.groups === 1 ? 'group' : 'groups'}</span>}
             />
             {alerts.loading && !alerts.data ? (
               <LoadingState />
             ) : alerts.error ? (
               <div className="p-3.5">
-                <ErrorState error={alerts.error} onRetry={alerts.refetch} label="the dashboard" />
+                <ErrorState error={alerts.error} onRetry={alerts.refetch} label="the alert counts" />
               </div>
             ) : m.groups === 0 ? (
               <EmptyState>No alerts in the {rangeLabel}. Select a different time range to look further back.</EmptyState>
@@ -1450,11 +1472,10 @@ export function Dashboard() {
               <PanelHeader icon={<Gauge size={15} />} title="Detection tuning" />
               <div className="flex items-center justify-between gap-3 px-[15px] py-3">
                 <div className="text-[13px] text-text-2">
-                  <span className="font-semibold" style={{ color: '#f5a623' }}>
-                    {tuning.data!.pending} mute suggestion{tuning.data!.pending === 1 ? '' : 's'}
-                  </span>{' '}
-                  pending. Noisy rules with zero true positives consume
-                  investigations.
+                  <span className="font-semibold" style={{ color: '#f5a623' }} data-testid="tuning-nudge-count">
+                    {tuningNudgeLine(tuning.data!)}
+                  </span>
+                  . Noisy rules with zero true positives consume investigations.
                 </div>
                 <button
                   onClick={() => navigate('/config#detection-tuning')}

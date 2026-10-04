@@ -1,6 +1,8 @@
 import { MessageSquare, Send, Wrench, X } from 'lucide-react';
 import { type ReactNode, useEffect, useRef, useState } from 'react';
+import { DocumentChip } from './DocumentDrawer';
 import { Markdown } from './Markdown';
+import { findEventIds } from '../lib/eventIds';
 import { Panel, PanelHeader } from './Panel';
 
 // ---------------------------------------------------------------------------
@@ -52,6 +54,9 @@ interface ChatPanelShellProps<M extends ChatDockMessage> {
    * reply the analyst judges the proposal by.
    */
   renderSpecial?: (m: M, i: number) => ReactNode | null;
+  /** Document ids the scope already cites. An answer that names one, or any
+   *  id with the Elasticsearch shape, lists it as a control that opens it. */
+  linkIds?: string[];
 }
 
 /**
@@ -82,6 +87,51 @@ const TOOL_LABELS: Record<string, string> = {
   propose_verdict: 'Drafting a verdict',
 };
 
+// Tool name -> the noun for one call and for several. The footer counts
+// calls by tool. It printed the raw identifiers before, for example
+// "t_query_events_oql, t_query_events_oql, ..." (fleet P11, 2026-10-01).
+const TOOL_NOUNS: Record<string, [string, string]> = {
+  t_query_events_oql: ['event query', 'event queries'],
+  t_query_zeek_logs: ['Zeek log query', 'Zeek log queries'],
+  t_enrich_ip: ['IP lookup', 'IP lookups'],
+  t_enrich_domain: ['domain lookup', 'domain lookups'],
+  t_enrich_hash: ['hash lookup', 'hash lookups'],
+  t_host_summary: ['host summary', 'host summaries'],
+  t_host_dossier: ['dossier read', 'dossier reads'],
+  t_origin_chain: ['origin check', 'origin checks'],
+  t_prevalence: ['prevalence check', 'prevalence checks'],
+  t_rule_prevalence: ['rule prevalence check', 'rule prevalence checks'],
+  t_get_pcap: ['PCAP fetch', 'PCAP fetches'],
+  t_decode_payload: ['payload decode', 'payload decodes'],
+  t_get_rule_content: ['rule read', 'rule reads'],
+  t_get_event_raw: ['raw event read', 'raw event reads'],
+  t_query_cases: ['case search', 'case searches'],
+  t_query_detections: ['detection search', 'detection searches'],
+  t_lookup_runbook: ['runbook lookup', 'runbook lookups'],
+  t_get_playbooks: ['playbook read', 'playbook reads'],
+  t_web_search: ['web search', 'web searches'],
+  t_crawl_page: ['page read', 'page reads'],
+  propose_verdict: ['verdict draft', 'verdict drafts'],
+};
+
+/** "Tools used: 14 event queries, 2 IP lookups" from the stored tool list. */
+export function toolsSummary(tools: string | null | undefined): string | null {
+  const names = (tools ?? '')
+    .split(',')
+    .map((t) => t.trim())
+    .filter(Boolean);
+  if (names.length === 0) return null;
+  const counts = new Map<string, number>();
+  for (const n of names) counts.set(n, (counts.get(n) ?? 0) + 1);
+  const parts = [...counts.entries()].map(([name, n]) => {
+    const nouns = TOOL_NOUNS[name];
+    const bare = name.replace(/^t_/, '').replace(/_/g, ' ');
+    const [one, many] = nouns ?? [`${bare} call`, `${bare} calls`];
+    return `${n} ${n === 1 ? one : many}`;
+  });
+  return `Tools used: ${parts.join(', ')}`;
+}
+
 export function toolLabel(name: string): string {
   return (
     TOOL_LABELS[name] ??
@@ -101,7 +151,19 @@ export function toolLabel(name: string): string {
  * Renders nothing for an empty turn rather than an empty bubble: a proposal row
  * whose agent proposed without prose should show the card alone.
  */
-export function AssistantBubble({ text, tools }: { text?: string | null; tools?: string | null }) {
+export function AssistantBubble({
+  text,
+  tools,
+  linkIds,
+}: {
+  text?: string | null;
+  tools?: string | null;
+  linkIds?: string[];
+}) {
+  const summary = toolsSummary(tools);
+  // Ids only when the caller asked for them: the Dashboard chat has no scope
+  // to cite, and its answers name datasets that can share the id shape.
+  const ids = linkIds && text ? findEventIds(text, linkIds) : [];
   return (
     <>
       {text ? (
@@ -112,12 +174,20 @@ export function AssistantBubble({ text, tools }: { text?: string | null; tools?:
           <Markdown>{text}</Markdown>
         </div>
       ) : null}
-      {tools ? (
-        <div className="flex items-center gap-1.5 font-mono text-[10.5px] text-faint">
+      {ids.length > 0 ? (
+        <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-faint">
+          <span>Cited events:</span>
+          {ids.map((id) => (
+            <DocumentChip key={id} id={id} />
+          ))}
+        </div>
+      ) : null}
+      {summary ? (
+        <div className="flex items-center gap-1.5 text-[11px] text-faint">
           <span className="text-accent">
             <Wrench size={11} />
           </span>
-          tools · {tools}
+          {summary}
         </div>
       ) : null}
     </>
@@ -140,6 +210,7 @@ export function ChatPanelShell<M extends ChatDockMessage>({
   emptyHint,
   headerRight,
   renderSpecial,
+  linkIds,
 }: ChatPanelShellProps<M>) {
   const listRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -195,7 +266,15 @@ export function ChatPanelShell<M extends ChatDockMessage>({
         }
         className="py-[11px]"
       />
-      <div ref={listRef} className={`flex flex-col gap-3 overflow-y-auto p-[15px] ${listSizeClass}`}>
+      {/* role="log" makes the list a polite live region: a screen reader
+          announces each new answer without moving focus (fleet P13). */}
+      <div
+        ref={listRef}
+        role="log"
+        aria-live="polite"
+        aria-label={title}
+        className={`flex flex-col gap-3 overflow-y-auto p-[15px] ${listSizeClass}`}
+      >
         {emptyHint != null && messages.length === 0 && !pending && emptyHint}
         {messages.map((m, i) => {
           // Messages that arrived after the panel mounted get a subtle fade-in.
@@ -217,7 +296,7 @@ export function ChatPanelShell<M extends ChatDockMessage>({
               key={i}
               className={`flex min-w-0 max-w-[88%] flex-col gap-1.5 self-start${isNew ? ' animate-fadeUp' : ''}`}
             >
-              <AssistantBubble text={m.text} tools={m.tools} />
+              <AssistantBubble text={m.text} tools={m.tools} linkIds={linkIds} />
             </div>
           );
         })}

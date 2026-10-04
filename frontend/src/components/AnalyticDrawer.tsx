@@ -8,9 +8,11 @@ import {
   type AnalyticDetail,
   type AnalyticRow,
 } from '../lib/api';
+import { NOT_RUNNING_TITLE, statusLabel } from '../lib/analyticRuns';
 import { entityPath } from '../lib/entityPath';
 import { plural } from '../lib/plural';
 import { absTime, ago } from '../lib/timeRange';
+import { AnalyticPins } from './AnalyticPins';
 import {
   CHIP_CANDIDATE,
   CHIP_IN_LEAD,
@@ -18,7 +20,6 @@ import {
   CHIP_LOCAL,
   CHIP_NO_BENIGN_BASELINE,
   CHIP_RETIRED,
-  CHIP_SEEN,
   CHIP_SHADOW,
   CHIP_SHIPPED,
   CHIP_VERSION,
@@ -69,14 +70,26 @@ export const STATUS_TITLE: Record<string, string> = {
   retired: CHIP_RETIRED,
 };
 
-export function StatusDot({ status }: { status: string }) {
+/** The status dot. `running` false means the loop that runs the analytic is
+ *  off or has not run: the dot goes grey and the word says so. A green "live"
+ *  over an analytic no sweep has run is a false all-clear. */
+export function StatusDot({ status, running }: { status: string; running?: boolean | null }) {
+  const idle = running === false && (status === 'live' || status === 'shadow');
   return (
-    <span className="inline-flex items-center gap-1.5 whitespace-nowrap" title={STATUS_TITLE[status]}>
+    <span
+      className="inline-flex items-center gap-1.5 whitespace-nowrap"
+      title={idle ? NOT_RUNNING_TITLE : STATUS_TITLE[status]}
+      data-testid="status-dot"
+    >
       <span
         className="h-[7px] w-[7px] flex-none rounded-full"
-        style={{ background: STATUS_COLOR[status] ?? '#8b949e' }}
+        style={
+          idle
+            ? { border: `1.5px solid ${STATUS_COLOR[status]}` }
+            : { background: STATUS_COLOR[status] ?? '#8b949e' }
+        }
       />
-      {status}
+      {statusLabel(status, running)}
     </span>
   );
 }
@@ -267,6 +280,39 @@ function coverageLine(coverage: Record<string, number>): string {
   return `${coverage.measured ?? 0} measured · ${coverage.blind ?? 0} blind`;
 }
 
+/** What the drawer says when the analytic observed nothing. Whether it ran
+ *  is a fact the backend knows, so the drawer never says "it has not run, or
+ *  it found nothing". */
+export function nothingObserved(detail: AnalyticDetail): string {
+  const off = detail.runner_enabled === false ? ' Its sweep is off.' : '';
+  if (detail.last_run_at === null) return `This analytic has not run.${off}`;
+  if (detail.last_run_at === undefined) {
+    return 'This analytic has observed nothing. soc-ai cannot tell if it ran.';
+  }
+  return `This analytic ran ${ago(detail.last_run_at)} and observed nothing in the last 30 days.${off}`;
+}
+
+/** The cost cell. A profile analytic reads stored baselines: the prior sweep
+ *  records no document count and no runtime, so the cell counts its runs. It
+ *  read "0 documents · 0 ms · 0 sweeps" on an analytic that ran minutes ago. */
+function costCell(detail: AnalyticDetail): { value: string; sub: string; title: string } {
+  const ledger = detail.ledger;
+  if (detail.evaluator === 'profile') {
+    const runs = ledger.profile_runs ?? 0;
+    return {
+      value: String(runs),
+      sub: runs === 1 ? 'profile run' : 'profile runs',
+      title:
+        'Profile sweep runs over the window. A profile run reads stored baselines. It records no document count and no runtime.',
+    };
+  }
+  return {
+    value: ledger.docs_scanned.toLocaleString(),
+    sub: `documents · ${runtimeLine(ledger.runtime_ms)} · ${plural(ledger.sweeps, 'sweep')}`,
+    title: 'Documents scanned and time spent over the window. The sweep trail is the source.',
+  };
+}
+
 function runtimeLine(ms: number): string {
   if (ms < 1000) return `${ms} ms`;
   return `${(ms / 1000).toFixed(1)} s`;
@@ -288,6 +334,7 @@ function numberedVersions(
 function Body({ detail, onChanged }: { detail: AnalyticDetail; onChanged?: () => void }) {
   const [specOpen, setSpecOpen] = useState(false);
   const ledger = detail.ledger;
+  const cost = costCell(detail);
   return (
     <div className="flex flex-col gap-4 p-4">
       <div>
@@ -305,6 +352,11 @@ function Body({ detail, onChanged }: { detail: AnalyticDetail; onChanged?: () =>
         {detail.reason && (
           <div className="mt-1.5 text-[11.5px] text-dim">Reason on record: {detail.reason}</div>
         )}
+        <AnalyticPins
+          pins={detail.pinned}
+          label="Specific to one case"
+          testId="analytic-drawer-pins"
+        />
       </div>
 
       <AnalyticActions analytic={detail} onChanged={onChanged} compact />
@@ -346,12 +398,7 @@ function Body({ detail, onChanged }: { detail: AnalyticDetail; onChanged?: () =>
             sub={dismissedLine(ledger.dismissed)}
             title={LEDGER_DISMISSED}
           />
-          <Cell
-            label="Cost"
-            value={ledger.docs_scanned.toLocaleString()}
-            sub={`documents · ${runtimeLine(ledger.runtime_ms)} · ${ledger.sweeps} sweeps`}
-            title="Documents scanned and time spent over the window. The sweep trail is the source."
-          />
+          <Cell label="Cost" value={cost.value} sub={cost.sub} title={cost.title} />
           <Cell
             label="Coverage"
             value={coverageLine(ledger.coverage)}
@@ -378,8 +425,8 @@ function Body({ detail, onChanged }: { detail: AnalyticDetail; onChanged?: () =>
             host dossier, which is keyed on an address and cannot hold one. */}
         <div className="mb-1.5 text-[13px] font-semibold">Recent observations · by entity</div>
         {detail.recent.length === 0 ? (
-          <div className="text-[12px] text-dim">
-            This analytic has observed nothing. It has not run, or it found nothing.
+          <div data-testid="analytic-nothing-observed" className="text-[12px] text-dim">
+            {nothingObserved(detail)}
           </div>
         ) : (
           <ul className="divide-y divide-border-faint">
@@ -391,8 +438,13 @@ function Body({ detail, onChanged }: { detail: AnalyticDetail; onChanged?: () =>
                 >
                   {r.entity}
                 </Link>
-                <span className="text-[11.5px] text-dim" title={CHIP_SEEN}>
-                  seen {plural(r.count, 'time')}
+                {/* Observations, the unit the ledger counts. "seen 7 times"
+                    sat beside "OBSERVATIONS 5" and counted repeat sightings. */}
+                <span
+                  className="text-[11.5px] text-dim"
+                  title="Observations this analytic wrote on this entity in the last 30 days."
+                >
+                  {plural(r.count, 'observation')}
                 </span>
                 <span className="text-[11.5px] text-dim" title={absTime(r.last)}>
                   · {ago(r.last)}
@@ -486,7 +538,12 @@ export function AnalyticDrawer({
               {analyticId ?? ''}
             </span>
           </span>
-          {data && <StatusDot status={data.status} />}
+          {data && (
+            <StatusDot
+              status={data.status}
+              running={data.last_run_at === undefined ? undefined : data.last_run_at !== null && data.runner_enabled !== false}
+            />
+          )}
         </div>
       }
     >

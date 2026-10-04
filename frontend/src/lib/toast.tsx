@@ -9,6 +9,9 @@ export interface ToastOptions {
   tone?: ToastTone;
   /** Optional single action, e.g. "1 failed — view". Dismisses the toast when clicked. */
   action?: { label: string; onClick: () => void };
+  /** Outbound links, e.g. the Security Onion cases an escalate opened. Each
+   *  opens in a new tab and leaves the toast in place. */
+  links?: Array<{ label: string; href: string }>;
   /**
    * ms before auto-dismiss; 0 = persist until dismissed. Defaults: success/info
    * 6s (glanceable), danger 0 (an error should not vanish before it's read).
@@ -21,11 +24,16 @@ interface Toast {
   tone: ToastTone;
   message: string;
   action?: ToastOptions['action'];
+  links?: ToastOptions['links'];
 }
 
 interface ToastApi {
-  /** Push a toast. Global, bottom-right, newest on top, max 3 stacked. */
-  toast: (opts: ToastOptions) => void;
+  /** Push a toast. Global, bottom-right, newest on top, max 3 stacked.
+   *  Returns the toast's id, for a later `dismiss`. */
+  toast: (opts: ToastOptions) => number;
+  /** Remove one toast, e.g. a stale "did not return" notice once the write
+   *  shows up in the data. Unknown ids are a no-op. */
+  dismiss: (id: number) => void;
 }
 
 const Ctx = createContext<ToastApi | null>(null);
@@ -48,14 +56,17 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       const tone = opts.tone ?? 'info';
       const id = (idRef.current += 1);
       // Newest on top, capped at 3 — a burst never buries the screen.
-      setToasts((cur) => [{ id, tone, message: opts.message, action: opts.action }, ...cur].slice(0, 3));
+      setToasts((cur) =>
+        [{ id, tone, message: opts.message, action: opts.action, links: opts.links }, ...cur].slice(0, 3),
+      );
       const duration = opts.duration ?? (tone === 'danger' ? 0 : 6000);
       if (duration > 0) setTimeout(() => dismiss(id), duration);
+      return id;
     },
     [dismiss],
   );
 
-  const api = useMemo(() => ({ toast }), [toast]);
+  const api = useMemo(() => ({ toast, dismiss }), [toast, dismiss]);
 
   return (
     <Ctx.Provider value={api}>
@@ -72,7 +83,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
 export function useToast(): ToastApi {
   return useContext(Ctx) ?? NOOP;
 }
-const NOOP: ToastApi = { toast: () => {} };
+const NOOP: ToastApi = { toast: () => 0, dismiss: () => {} };
 
 const TONE: Record<ToastTone, { Icon: typeof Info; tint: string; wash: string }> = {
   success: { Icon: CheckCircle2, tint: 'text-success', wash: 'rgba(63,185,80,.10)' },
@@ -102,7 +113,24 @@ function Toaster({ toasts, onDismiss }: { toasts: Toast[]; onDismiss: (id: numbe
             <span className={`mt-px flex-none ${meta.tint}`}>
               <meta.Icon size={15} />
             </span>
-            <div className="min-w-0 flex-1 text-[12.5px] leading-[1.5] text-text">{t.message}</div>
+            <div className="min-w-0 flex-1 text-[12.5px] leading-[1.5] text-text">
+              {t.message}
+              {t.links && t.links.length > 0 && (
+                <span className="mt-1 flex flex-wrap gap-x-2.5 gap-y-0.5">
+                  {t.links.map((l) => (
+                    <a
+                      key={l.href}
+                      href={l.href}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="font-mono text-[11.5px] font-semibold text-accent hover:underline"
+                    >
+                      {l.label}
+                    </a>
+                  ))}
+                </span>
+              )}
+            </div>
             {t.action && (
               <button
                 onClick={() => {

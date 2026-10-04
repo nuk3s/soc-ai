@@ -5,7 +5,7 @@
 // the clock. These pin the fix: no poll while the tab is hidden, and one
 // immediate refresh on return to visible so the bell is current the moment the
 // analyst looks again (the house guard, lib/useAsync.ts:118).
-import { act, fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -26,7 +26,7 @@ vi.mock('react-router-dom', async (importOriginal) => ({
 
 import { emitNeedsYouChanged, getHealth, getNotifications, getWorkspaces } from '../lib/api';
 import { ShellProvider } from './ShellContext';
-import { Topbar } from './Topbar';
+import { Topbar, notificationSummary } from './Topbar';
 
 const NOTIF_MS = 15_000;
 
@@ -38,6 +38,8 @@ let hidden = false;
 const tick = (ms: number) => act(async () => { await vi.advanceTimersByTimeAsync(ms); });
 /** Settle already-resolved promises without moving the clock. */
 const flush = () => tick(0);
+/** The bell. Its name carries the count, so match the prefix. */
+const bell = () => screen.getByRole('button', { name: /^Notifications/ });
 
 /** Toggle tab visibility and dispatch the event the effects listen for. */
 const setHidden = (v: boolean) => {
@@ -217,7 +219,7 @@ describe('Topbar notification rows are reachable from the keyboard', () => {
     mount();
     await flush();
     act(() => {
-      screen.getByLabelText('Notifications').click();
+      bell().click();
     });
 
     // A button is in the Tab order and fires on Enter and Space; a div with an
@@ -239,7 +241,7 @@ describe('Topbar notification rows are reachable from the keyboard', () => {
     mount();
     await flush();
     act(() => {
-      screen.getByLabelText('Notifications').click();
+      bell().click();
     });
 
     expect(screen.queryByRole('button', { name: /Elasticsearch unreachable/ })).toBeNull();
@@ -262,7 +264,7 @@ describe('Topbar notification rows are reachable from the keyboard', () => {
     mount();
     await flush();
     act(() => {
-      screen.getByLabelText('Notifications').click();
+      bell().click();
     });
 
     const body = screen.getByRole('button', { name: /true positive: ET MALWARE Z/i });
@@ -274,10 +276,131 @@ describe('Topbar notification rows are reachable from the keyboard', () => {
     // Opening closed the dropdown. Open it again: Dismiss sits inside the
     // row, and its click must not bubble into a second navigation.
     act(() => {
-      screen.getByLabelText('Notifications').click();
+      bell().click();
     });
     fireEvent.click(screen.getAllByLabelText('Dismiss')[0]);
     expect(navigateMock).toHaveBeenCalledTimes(1);
     expect(screen.queryByRole('button', { name: /true positive: ET MALWARE Z/i })).toBeNull();
+  });
+});
+
+// The bell and the health pill ignored Escape and a click on the page. Their
+// click-catcher sat inside the blurred top bar, which clipped it to the bar, so
+// only a click on the bar closed them. The open panel also covered "Clear all"
+// and "Test LLM" (D5, D6, RC9, RD6, RD8).
+describe('Topbar dropdowns close like the account menu', () => {
+  const notices = [
+    { id: 'inv:9', tone: 'danger' as const, title: 'Verdict true_positive: ET MALWARE Q', when: 'now', href: '/investigation/INV-9' },
+    { id: 'inv:10', tone: 'warn' as const, title: 'Investigation needs more information', when: '2m', href: '/investigation/INV-10' },
+    { id: 'inv:11', tone: 'accent' as const, title: 'Verdict false_positive: ET INFO R', when: '5m', href: '/investigation/INV-11' },
+  ];
+
+  beforeEach(() => {
+    localStorage.clear();
+    vi.mocked(getWorkspaces).mockResolvedValue([]);
+    vi.mocked(getNotifications).mockResolvedValue(notices);
+    vi.mocked(getHealth).mockResolvedValue({
+      es: { ok: true, detail: 'ok' },
+      llm: { ok: true, detail: 'ok' },
+    } as never);
+  });
+
+  it('names the count on the bell and states its state', async () => {
+    mount();
+    await flush();
+    const b = screen.getByRole('button', { name: 'Notifications, 2 need attention' });
+    expect(b).toHaveAttribute('aria-haspopup', 'dialog');
+    expect(b).toHaveAttribute('aria-expanded', 'false');
+    act(() => b.click());
+    expect(b).toHaveAttribute('aria-expanded', 'true');
+    // The badge counts two rows and the panel shows three: the header says so.
+    expect(screen.getByTestId('notif-summary').textContent).toBe('2 need attention · 1 more');
+  });
+
+  it('closes the bell on Escape and gives focus back to the bell', async () => {
+    mount();
+    await flush();
+    act(() => bell().click());
+    expect(screen.getByRole('dialog', { name: 'Notifications' })).toBeTruthy();
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(screen.queryByRole('dialog', { name: 'Notifications' })).toBeNull();
+    expect(document.activeElement).toBe(bell());
+  });
+
+  it('closes the bell on a click on the page, and leaves no layer over the page', async () => {
+    const { container } = render(<button type="button">Clear all</button>);
+    mount();
+    await flush();
+    act(() => bell().click());
+    // Nothing fixed and full-screen may cover the page under the panel.
+    expect(document.querySelector('.fixed.inset-0')).toBeNull();
+    const clearAll = within(container).getByRole('button', { name: 'Clear all' });
+    fireEvent.mouseDown(clearAll);
+    expect(screen.queryByRole('dialog', { name: 'Notifications' })).toBeNull();
+  });
+
+  it('keeps the bell open on a click inside its panel', async () => {
+    mount();
+    await flush();
+    act(() => bell().click());
+    fireEvent.mouseDown(screen.getByRole('dialog', { name: 'Notifications' }));
+    expect(screen.getByRole('dialog', { name: 'Notifications' })).toBeTruthy();
+  });
+
+  it('closes the health popover on Escape and on a page click', async () => {
+    mount();
+    await flush();
+    const pill = screen.getByRole('button', { name: /connected/ });
+    expect(pill).toHaveAttribute('aria-haspopup', 'dialog');
+    act(() => pill.click());
+    expect(pill).toHaveAttribute('aria-expanded', 'true');
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(screen.queryByRole('dialog', { name: 'Upstream health' })).toBeNull();
+    act(() => pill.click());
+    fireEvent.mouseDown(document.body);
+    expect(screen.queryByRole('dialog', { name: 'Upstream health' })).toBeNull();
+  });
+
+  it('puts the bell panel before Help in the Tab order', async () => {
+    mount();
+    await flush();
+    act(() => bell().click());
+    const panel = screen.getByRole('dialog', { name: 'Notifications' });
+    const help = screen.getByRole('button', { name: 'Help and shortcuts' });
+    // DOCUMENT_POSITION_FOLLOWING: the argument comes after the reference.
+    expect(bell().compareDocumentPosition(panel) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(panel.compareDocumentPosition(help) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+});
+
+describe('notificationSummary', () => {
+  it('relates the badge count to the row count', () => {
+    expect(notificationSummary(12, 2)).toBe('2 need attention · 10 more');
+    expect(notificationSummary(1, 1)).toBe('1 needs attention');
+    expect(notificationSummary(4, 0)).toBe('None need attention · 4 more');
+  });
+});
+
+// The avatar for a workspace named by its address showed the first digit, which
+// read as a count (RD15).
+describe('Workspace avatar', () => {
+  it('shows a glyph for an address-named workspace', async () => {
+    vi.mocked(getWorkspaces).mockResolvedValue([{ name: '192.0.2.46', env: 'prod' }] as never);
+    vi.mocked(getNotifications).mockResolvedValue([]);
+    vi.mocked(getHealth).mockResolvedValue({ es: { ok: true, detail: '' }, llm: { ok: true, detail: '' } } as never);
+    mount();
+    await flush();
+    // The avatar box holds the glyph and no digit.
+    expect(screen.getByTestId('ws-glyph-ip').parentElement!.textContent).toBe('');
+  });
+
+  it('keeps the first letter for a named workspace', async () => {
+    vi.mocked(getWorkspaces).mockResolvedValue([{ name: 'soc-east', env: 'prod' }] as never);
+    vi.mocked(getNotifications).mockResolvedValue([]);
+    vi.mocked(getHealth).mockResolvedValue({ es: { ok: true, detail: '' }, llm: { ok: true, detail: '' } } as never);
+    mount();
+    await flush();
+    expect(screen.queryByTestId('ws-glyph-ip')).toBeNull();
+    expect(screen.getByTitle('Current workspace').textContent).toBe('Ssoc-east');
   });
 });

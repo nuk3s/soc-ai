@@ -30,6 +30,24 @@ from soc_ai.errors import SoAuthError
 # UI stays responsive when an upstream is down or hanging.
 _PROBE_TIMEOUT_S = 10.0
 
+# The ONE budget every "is the grid there" surface waits for: the header pill
+# (GET /health), Test ES on the Config page and the doctor's ES check. They
+# used to wait 5 s, 12 s and 5 s per request, so in one minute on a stalled
+# grid Test ES passed while the pill said the grid was down (fleet 2026-10-01,
+# RC7). Read it through probe_budget_s, which never waits longer than the
+# console's own grid budget.
+PROBE_BUDGET_S = 5.0
+
+
+def probe_budget_s(settings: Any | None) -> float:
+    """The shared probe budget, capped by ``webui_grid_timeout_s`` when set."""
+    try:
+        grid = float(getattr(settings, "webui_grid_timeout_s", 0) or 0)
+    except (TypeError, ValueError):
+        grid = 0.0
+    return min(PROBE_BUDGET_S, grid) if grid > 0 else PROBE_BUDGET_S
+
+
 # Defensive scrubbing patterns. Even though we build details from safe pieces,
 # we strip anything that *looks* like a credential as a last line of defence.
 _SCRUB_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -1011,7 +1029,7 @@ async def probe_model_fitness(settings: Any) -> dict[str, Any]:
             "model": model_id,
             "legs": [*completed, marker],
             "detail": _scrub(
-                f"the model-fitness probe exceeded {int(_FITNESS_TOTAL_TIMEOUT_S)} s. "
+                f"The model-fitness probe exceeded {int(_FITNESS_TOTAL_TIMEOUT_S)} s. "
                 f"It stopped during {in_flight[0]}."
             ),
             "served_backend": _served_backend(completed),

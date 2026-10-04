@@ -38,7 +38,11 @@ from soc_ai.agent.hunt import (
     build_hunt_prompt,
     build_hunt_synthesizer,
 )
-from soc_ai.agent.hunt_gates import _validate_hunt_charts, _validate_hunt_findings
+from soc_ai.agent.hunt_gates import (
+    _validate_hunt_charts,
+    _validate_hunt_findings,
+    gate_host_gaps,
+)
 from soc_ai.agent.models import build_investigator_model
 from soc_ai.agent.orchestrator import InvestigationContext, StepEvent, _walk_message
 from soc_ai.agent.prompts import oql_primer_block
@@ -365,7 +369,7 @@ async def run_hunt(
             "model_response",
             {
                 "text": (
-                    "Reached the hunt's exploration budget — synthesizing a partial "
+                    "Reached the hunt's exploration budget. Writing a partial "
                     "report from the evidence gathered so far."
                 )
             },
@@ -408,9 +412,13 @@ async def run_hunt(
     # hunt ACTUALLY gathered; strip non-resolving citations + cap such findings'
     # severity. Returns the validated report + the citation_validation event (or
     # None on a validator error — the gate is fail-soft).
-    report, citation_ev = _gate_hunt_citations(report, gathered_tool_results, _ev)
-    if citation_ev is not None:
-        yield citation_ev
+    #
+    # Then the host gap gate: a visibility gap that names a host is read
+    # against the host's coverage. A host that ships host logs or osquery is
+    # not a host with no telemetry.
+    report, gate_events = await _post_hunt_gates(report, gathered_tool_results, ctx, _ev)
+    for gate_ev in gate_events:
+        yield gate_ev
 
     # ── Evidence-count gate (deterministic, G6) ──────────────────────────────
     # Count what the tools ACTUALLY returned rather than trusting the write-up to
@@ -438,17 +446,24 @@ async def run_hunt(
             # never ran a grid query).
             "degraded": degraded_reason is not None,
             "degraded_reason": degraded_reason,
+            # True when the budget synthesizer wrote the report from a cut-short
+            # trace. The lead settle rule reads it: such a hunt did not read
+            # all its evidence, so it never closes a lead as clean.
+            "partial": partial_synthesis,
         },
     )
 
 
-_PARTIAL_HUMILITY_NOTE = "budget/timeout-partial — uncorroborated; corroborate before acting"
+_PARTIAL_HUMILITY_NOTE = (
+    "budget/timeout-partial: the hunt stopped early and did not corroborate this "
+    "finding. Corroborate it before you act."
+)
 
 _GRID_OUTAGE_NOTE = (
-    "grid unavailable — every grid query in this hunt failed, so nothing was checked "
-    "and nothing was ruled out"
+    "grid unavailable: every grid query in this hunt failed, so the hunt checked "
+    "nothing and ruled out nothing"
 )
-_GRID_OUTAGE_TITLE = "Grid unavailable — this hunt could not look"
+_GRID_OUTAGE_TITLE = "Grid unavailable. This hunt could not look"
 
 # The two evidence-count reasons beside the transport outage. Persisted on the
 # ``done`` event's ``degraded_reason``, so they are vocabulary, not prose: the
@@ -460,16 +475,16 @@ QUERIES_REJECTED_REASON = "grid_queries_rejected"
 NO_GRID_READS_REASON = "no_grid_reads"
 
 _QUERIES_REJECTED_NOTE = (
-    "every grid query rejected — the grid answered and turned down each query this "
-    "hunt wrote as invalid, so nothing was checked and nothing was ruled out"
+    "every grid query rejected: the grid answered and rejected each query this "
+    "hunt wrote as invalid, so the hunt checked nothing and ruled out nothing"
 )
-_QUERIES_REJECTED_TITLE = "Every query rejected — this hunt could not look"
+_QUERIES_REJECTED_TITLE = "Every query rejected. This hunt could not look"
 
 _NO_GRID_READS_NOTE = (
-    "no grid reads — this hunt never ran a successful grid query, so nothing was "
-    "checked and nothing was ruled out"
+    "no grid reads: this hunt never ran a successful grid query, so it checked "
+    "nothing and ruled out nothing"
 )
-_NO_GRID_READS_TITLE = "No grid reads — this hunt never looked"
+_NO_GRID_READS_TITLE = "No grid reads. This hunt never looked"
 
 
 def _grid_tool_outcomes(tool_results: list[Any]) -> tuple[int, int, int]:
@@ -587,12 +602,12 @@ def _mark_grid_outage(report: Any, failures: int) -> Any:
         detail=(
             f"All {failures} Security Onion queries this hunt ran failed and none "
             "succeeded, so the objective was neither confirmed nor ruled out. This "
-            "report is not evidence that the network is quiet — it is evidence that "
-            "the grid could not be read. Re-run the hunt once the grid is reachable."
+            "report is no evidence that the network is quiet. It shows that the hunt "
+            "could not read the grid. Run the hunt again when the grid is reachable."
         ),
         note=_GRID_OUTAGE_NOTE,
         banner=(
-            "**Grid unavailable — this hunt could not read the network.** "
+            "**Grid unavailable. This hunt could not read the network.** "
             f"All {failures} grid queries failed and none succeeded, so nothing below "
             "rules anything out. The write-up that follows was produced without grid "
             "data."
@@ -611,17 +626,17 @@ def _mark_queries_rejected(report: Any, rejections: int) -> Any:
         report,
         title=_QUERIES_REJECTED_TITLE,
         detail=(
-            f"All {rejections} Security Onion queries this hunt ran were rejected as "
-            "invalid (bad query or arguments) and none succeeded — the grid was "
-            "reachable, but every question this hunt asked it was malformed, so the "
-            "objective was neither confirmed nor ruled out. This report is not "
-            "evidence that the network is quiet — it is evidence that nothing was "
-            "successfully read. Re-run the hunt; if every query is rejected again, "
-            "the queries being written no longer match this grid."
+            f"The grid rejected all {rejections} Security Onion queries this hunt ran "
+            "as invalid, and none succeeded. The query or its arguments were bad. The "
+            "grid was reachable, but every question this hunt asked it was malformed, "
+            "so the objective was neither confirmed nor ruled out. This report is no "
+            "evidence that the network is quiet. It shows that the hunt read nothing. "
+            "Run the hunt again. When the grid rejects every query again, the queries "
+            "the model writes no longer match this grid."
         ),
         note=_QUERIES_REJECTED_NOTE,
         banner=(
-            "**Every grid query was rejected — this hunt read nothing.** "
+            "**The grid rejected every query. This hunt read nothing.** "
             f"All {rejections} queries were rejected as invalid and none succeeded, so "
             "nothing below rules anything out. The write-up that follows was produced "
             "without grid data."
@@ -642,12 +657,12 @@ def _mark_no_grid_reads(report: Any) -> Any:
         detail=(
             "This hunt produced its report without running a single Security Onion "
             "query, so the objective was neither confirmed nor ruled out against the "
-            "network's actual telemetry. This report is not evidence that the network "
-            "is quiet — it is evidence that nothing was looked at. Re-run the hunt."
+            "network's actual telemetry. This report is no evidence that the network "
+            "is quiet. It shows that the hunt looked at nothing. Run the hunt again."
         ),
         note=_NO_GRID_READS_NOTE,
         banner=(
-            "**No grid reads — this hunt never queried the network.** "
+            "**No grid reads. This hunt never queried the network.** "
             "Not one grid query ran, so nothing below rules anything out. The "
             "write-up that follows was produced without grid data."
         ),
@@ -772,6 +787,40 @@ def _gate_hunt_citations(
     except Exception:
         _LOGGER.warning("hunt citation gate failed; persisting unvalidated report", exc_info=True)
         return report, None
+
+
+async def _post_hunt_gates(
+    report: Any, tool_results: list[Any], ctx: InvestigationContext, ev_factory: Any
+) -> tuple[Any, list[StepEvent]]:
+    """The citation gate, then the host gap gate. Returns the report and their events."""
+    events: list[StepEvent] = []
+    report, citation_ev = _gate_hunt_citations(report, tool_results, ev_factory)
+    if citation_ev is not None:
+        events.append(citation_ev)
+    report, host_gap_ev = await _gate_host_gaps(report, ctx, ev_factory)
+    if host_gap_ev is not None:
+        events.append(host_gap_ev)
+    return report, events
+
+
+async def _gate_host_gaps(
+    report: Any, ctx: InvestigationContext, ev_factory: Any
+) -> tuple[Any, StepEvent | None]:
+    """Run the host gap gate; return (report, event). Fail-soft, like the citation gate."""
+    try:
+        report, counts = await gate_host_gaps(
+            report,
+            elastic=ctx.elastic,
+            settings=ctx.settings,
+            sessionmaker=ctx.db_sessionmaker,
+            include_synth=ctx.include_synth,
+        )
+    except Exception:
+        _LOGGER.warning("hunt host gap gate failed; persisting the report as-is", exc_info=True)
+        return report, None
+    if not counts.get("host_gaps") and not counts.get("narrative_sentences_rewritten"):
+        return report, None
+    return report, ev_factory("host_gap_validation", counts)
 
 
 async def hunt_recorded_run(

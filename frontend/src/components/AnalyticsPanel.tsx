@@ -1,6 +1,6 @@
 import { Plus, Radar } from 'lucide-react';
 import { useState } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 
 import {
   createAnalytic,
@@ -11,6 +11,9 @@ import {
   type HuntCatalog,
   type PriorCoverage,
 } from '../lib/api';
+import { loopRuns, sweepsNotice } from '../lib/analyticRuns';
+import { useDemo } from '../lib/demo';
+import { plural } from '../lib/plural';
 import { ago } from '../lib/timeRange';
 import { useAsync, type UseAsyncResult } from '../lib/useAsync';
 import { AnalyticActions, COVERAGE_TITLE, StatusDot } from './AnalyticDrawer';
@@ -144,9 +147,45 @@ export function baselineNote(coverage: PriorCoverage): string {
   return ` · baseline ${hours} h old${coverage.profiles_stale ? ', stale' : ''}`;
 }
 
+/** " · capped at 500" when the run's evaluations reached the recent read's
+ *  cap. The totals then count the cap, not the estate: "blind 489" on a
+ *  336-host estate read as operator hosts. */
+export function capNote(coverage: PriorCoverage): string {
+  return coverage.capped ? ` · capped at ${coverage.recent_cap ?? 500}` : '';
+}
+
 function coverageCell(coverage: PriorCoverage | null | undefined): string {
   if (!coverage) return '—';
-  return `${coverage.measured} measured · ${coverage.blind} blind${baselineNote(coverage)}`;
+  return `${coverage.measured} measured · ${coverage.blind} blind${capNote(coverage)}${baselineNote(coverage)}`;
+}
+
+/** The visible state when a loop does not run, with the setting that turns
+ *  the catalog sweep on. The only sign used to be "last sweep never". */
+function SweepsNotice({ catalog }: { catalog: HuntCatalog | null | undefined }) {
+  const demo = useDemo();
+  const lines = sweepsNotice(catalog);
+  if (!lines.length) return null;
+  return (
+    <div
+      data-testid="analytics-sweeps-notice"
+      role="status"
+      className="border-b border-border-faint bg-surface-2/40 px-[15px] py-2 text-[12.5px] text-warn"
+    >
+      {lines.join(' ')}{' '}
+      {catalog && !catalog.sweeps_enabled && (
+        <span data-testid="analytics-sweeps-explainer">
+          An analytic sweep runs every live analytic as a grid query on a schedule. A document
+          that matches becomes an observation on the host it names, and observations can form a
+          lead.{' '}
+        </span>
+      )}
+      {catalog && !catalog.sweeps_enabled && !demo && (
+        <Link to="/config#triage-automation" className="font-semibold text-accent hover:underline">
+          Turn on Analytic sweeps in Config, under Triage automation.
+        </Link>
+      )}
+    </div>
+  );
 }
 
 /** The sweep the coverage figures came from. A coverage column with no date
@@ -221,11 +260,14 @@ function Row({
   analytic,
   coverage,
   blind,
+  running,
   onOpen,
   onChanged,
 }: {
   analytic: AnalyticRow;
   coverage: PriorCoverage | null | undefined;
+  /** False when the loop that runs this analytic is off or has never run. */
+  running: boolean | null;
   /** The newest sweep found nothing the analytic reads. Its zero row is the
    *  absence of telemetry, and it read as an analytic that found nothing. */
   blind: boolean;
@@ -258,16 +300,27 @@ function Row({
               no benign baseline
             </span>
           )}
+          {(analytic.pinned?.length ?? 0) > 0 && (
+            <span
+              data-testid={`analytic-specific-${analytic.id}`}
+              className="rounded-chip border px-1.5 py-px text-[10px] text-warn"
+              style={{ borderColor: 'rgba(245,166,35,.35)' }}
+              title={`This analytic is specific to one case. ${(analytic.pinned ?? []).join(' ')}`}
+            >
+              specific
+            </span>
+          )}
         </div>
       </td>
       <td className="whitespace-nowrap px-2 py-2.5 text-[11.5px] text-dim" title={TIER_TITLE}>
         {analytic.tier}
       </td>
       <td className="whitespace-nowrap px-2 py-2.5 text-[12px]">
-        <StatusDot status={analytic.status} />
+        <StatusDot status={analytic.status} running={running} />
       </td>
       <td className="px-2 py-2.5 font-mono text-[11px] text-dim" title={WEEK_TITLE}>
-        {analytic.observations_7d} obs · {analytic.leads_7d} leads · {analytic.hunted_7d} hunted ·{' '}
+        {analytic.observations_7d} obs · {plural(analytic.leads_7d, 'lead')} · {analytic.hunted_7d}{' '}
+        hunted ·{' '}
         {analytic.dismissed_7d} dismissed
         {analytic.status === 'shadow' && (
           <div>
@@ -465,6 +518,7 @@ export function AnalyticsPanel({
                 {sweep}
               </div>
             )}
+            <SweepsNotice catalog={catalog.data} />
             <div
               data-testid="analytics-legend"
               className="border-b border-border-faint px-[15px] py-1.5 text-[11px] text-dim"
@@ -509,6 +563,7 @@ export function AnalyticsPanel({
                       analytic={analytic}
                       coverage={coverageOf.get(analytic.id)}
                       blind={blindOf.get(analytic.id) === true}
+                      running={loopRuns(catalog.data, analytic.evaluator)}
                       onOpen={() => setOpenId(analytic.id)}
                       onChanged={changed}
                     />

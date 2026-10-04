@@ -66,6 +66,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from soc_ai.config import Settings
+from soc_ai.dossier.coverage import HostCoverage, coverage_window, host_coverage
 from soc_ai.enrichment.zeek_parser import TypedZeekFields, parse_typed_zeek_fields
 from soc_ai.errors import SoNotFoundError, SyntheticAnchorError
 from soc_ai.so_client import fields
@@ -82,6 +83,40 @@ from soc_ai.tools.enrichment import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+class HostAlertProfile(BaseModel):
+    """The recent alert histogram of ONE end of the focus alert, split by side.
+
+    ``host_alert_profile`` pools both ends of the alert, so a panel or a model
+    that reads it as "the alerts of host A" also sees host B's alerts (dogfood
+    2026-10-01 RL3: the model said it was "ambiguous which IP"). This record
+    names the host, names which end of the focus alert it is, and keeps the
+    alerts where it was the source apart from the alerts where it was the
+    destination.
+    """
+
+    ip: str
+    # Which end of the FOCUS alert this host is: "source" or "destination".
+    end: str
+    # rule_name -> count of in-window alerts where this host was source.ip.
+    as_source: dict[str, int] = Field(default_factory=dict)
+    # rule_name -> count of in-window alerts where this host was destination.ip.
+    as_destination: dict[str, int] = Field(default_factory=dict)
+
+
+class EndpointCoverage(BaseModel):
+    """The host coverage of ONE internal end of the focus alert.
+
+    The prefetch reads it for each internal endpoint, both the source and the
+    destination, so the model sees which planes a host ships before it reads a
+    zero from a plane the host never shipped.
+    """
+
+    ip: str
+    # Which end of the FOCUS alert this host is: "source" or "destination".
+    end: str
+    coverage: HostCoverage
 
 
 class AlertContext(BaseModel):
@@ -110,6 +145,10 @@ class AlertContext(BaseModel):
     # activity hours away is visible. Empty when the host has no other alerts
     # in-window or the lookup failed.
     host_alert_profile: dict[str, int] = Field(default_factory=dict)
+    # The same window, per end of the alert: one entry per endpoint IP, each
+    # named and split by side. Read this one to say WHICH host an alert in the
+    # histogram belongs to; ``host_alert_profile`` pools both ends.
+    host_alert_profiles: list[HostAlertProfile] = Field(default_factory=list)
     # Pivots that did NOT contribute evidence, with why. Three value shapes:
     # an exception class name for a pivot that failed AFTER retries and was
     # swallowed so the agent could still get partial context (e.g.
@@ -130,6 +169,14 @@ class AlertContext(BaseModel):
     # The OTHER pivots still return [] silently when their alert field is
     # absent.
     prefetch_gaps: dict[str, str] = Field(default_factory=dict)
+    # The planes each internal endpoint ships in the window around the alert.
+    # Empty when the alert has no internal endpoint or no timestamp. An entry
+    # with ``coverage.read_ok`` False is UNKNOWN, never absent.
+    host_coverage: list[EndpointCoverage] = Field(default_factory=list)
+    # One sentence on the host pivot: what it ran on, or why it did not run.
+    # ``pivot_summary`` carries a ``host`` count only when a host pivot ran, so
+    # a zero there is a pivot that ran and found nothing.
+    host_pivot_note: str | None = None
 
 
 class EnrichedAlertContext(AlertContext):
@@ -160,6 +207,7 @@ async def get_alert_context(
     window_seconds: int = 300,
     max_per_pivot: int = 10,
     include_synth: SynthScope = False,
+    internal_cidrs: Sequence[Any] | None = None,
 ) -> AlertContext:
     """Fetch ``alert_id`` and fan out to five related-event pivots.
 
@@ -177,6 +225,9 @@ async def get_alert_context(
             supporting docs are visible, so concurrently-planted sibling
             scenarios can't contaminate each other's pivots. True: every
             synth doc visible (hunt-journey eval only).
+        internal_cidrs: the ranges that make an endpoint internal. Each
+            internal endpoint gets a host coverage read. ``None`` reads
+            ``settings.internal_cidrs``.
 
     Raises:
         SoNotFoundError: if no document with ``alert_id`` exists.
@@ -251,11 +302,15 @@ async def get_alert_context(
     # window, so it catches a compromised host the narrow pivots miss. Gathered
     # in a separate inner call so the pivots keep return_exceptions semantics
     # while host-risk (which swallows its own failures) keeps its dict type.
+    internal_ends = _internal_endpoints(
+        alert, internal_cidrs if internal_cidrs is not None else settings.internal_cidrs
+    )
     (
         raw_results,
-        host_alert_profile,
+        (host_alert_profile, host_alert_profiles),
         behavioral_summaries,
         endpoint_coverage_gap,
+        endpoint_coverages,
     ) = await asyncio.gather(
         asyncio.gather(*pivot_calls, return_exceptions=True),
         _host_risk(
@@ -275,6 +330,13 @@ async def get_alert_context(
         ),
         _endpoint_coverage(
             alert,
+            elastic,
+            settings,
+            include_synth=include_synth,
+        ),
+        _endpoint_host_coverage(
+            alert,
+            internal_ends,
             elastic,
             settings,
             include_synth=include_synth,
@@ -299,6 +361,37 @@ async def get_alert_context(
             )
         else:
             events_by_key[key] = result
+
+    # The host pivot. The host.name pivot above ran only when the alert names
+    # an endpoint. A network alert names none, so before this the pivot was
+    # skipped for every network alert and ``host: 0`` read as "no host-level
+    # events" on a host that shipped thousands. When an internal endpoint
+    # ships host telemetry, pivot on its address and its agent instead.
+    host_pivot_ran = (
+        host_skip_reason is None
+        and alert.timestamp is not None
+        and not isinstance(raw_results[1], BaseException)
+    )
+    if host_pivot_ran:
+        host_pivot_note = (
+            f"The host pivot ran on host.name {alert.host_name} over the alert window. "
+            f"It found {len(events_by_key['host'])} host document(s)."
+        )
+    else:
+        address_events, host_pivot_note, address_gap = await _address_host_pivot(
+            alert,
+            endpoint_coverages,
+            elastic,
+            settings,
+            window_seconds,
+            max_per_pivot,
+            include_synth=include_synth,
+        )
+        if address_events is not None:
+            events_by_key["host"] = address_events
+            host_pivot_ran = True
+        if address_gap is not None:
+            gaps["host.ip"] = address_gap
 
     # Prepend behavioral-summary docs (beacon / DNS-tunnel profiles) to the
     # community-id pivot list so the materializer surfaces their decisive bullet.
@@ -326,11 +419,18 @@ async def get_alert_context(
         user_events=events_by_key["user"],
         process_events=events_by_key["process"],
         file_events=events_by_key["file"],
+        # ``host`` only when a host pivot ran. A zero for a pivot that never
+        # ran is the false absence this field must not carry.
         pivot_summary={
-            k: len(events_by_key[k]) for k in ("community_id", "host", "user", "process", "file")
+            k: len(events_by_key[k])
+            for k in ("community_id", "host", "user", "process", "file")
+            if k != "host" or host_pivot_ran
         },
         host_alert_profile=host_alert_profile,
+        host_alert_profiles=host_alert_profiles,
         prefetch_gaps=gaps,
+        host_coverage=endpoint_coverages,
+        host_pivot_note=host_pivot_note,
     )
 
 
@@ -371,6 +471,7 @@ async def get_enriched_alert_context(
         window_seconds=window_seconds,
         max_per_pivot=max_per_pivot,
         include_synth=include_synth,
+        internal_cidrs=internal_cidrs,
     )
 
     # 2. Parse typed Zeek fields from the community_id pivot.
@@ -445,7 +546,10 @@ async def get_enriched_alert_context(
         file_events=base.file_events,
         pivot_summary=base.pivot_summary,
         host_alert_profile=base.host_alert_profile,
+        host_alert_profiles=base.host_alert_profiles,
         prefetch_gaps=base.prefetch_gaps,
+        host_coverage=base.host_coverage,
+        host_pivot_note=base.host_pivot_note,
         typed_zeek=typed_zeek,
         enrichments=enrichments,
     )
@@ -513,16 +617,20 @@ def _host_pivot_skip_reason(alert: SoAlert) -> str | None:
 # host-logging examples); whether any of them exist on THIS grid, and whether
 # any of their documents come from THIS alert's hosts, is answered by the
 # query, never by this list.
-_ENDPOINT_DATASET_EXACT: tuple[str, ...] = ("endpoint", "sysmon", "osquery")
+_ENDPOINT_DATASET_EXACT: tuple[str, ...] = ("endpoint", "sysmon", "osquery", "elastic_agent")
 _ENDPOINT_DATASET_PREFIXES: tuple[str, ...] = (
     "endpoint.",
     "windows.",
     "sysmon.",
     "osquery.",
     "system.",
+    # Elastic Agent's osquery integration and the agent's own logs. A Linux
+    # agent with no Elastic Defend ships these and the system.* host logs.
+    "osquery_manager.",
+    "elastic_agent.",
 )
 _ENDPOINT_MODULES: frozenset[str] = frozenset(
-    {"endpoint", "sysmon", "osquery", "windows", "system"}
+    {"endpoint", "sysmon", "osquery", "windows", "system", "osquery_manager", "elastic_agent"}
 )
 
 # The prefetch_gaps key + reason tokens. CONSTANTS on purpose: the tokens (and
@@ -657,6 +765,159 @@ async def _endpoint_coverage(
     return None
 
 
+def _internal_endpoints(alert: SoAlert, cidrs: Sequence[Any]) -> list[tuple[str, str]]:
+    """``[(ip, end)]`` for each end of the alert inside ``cidrs``. Source first."""
+    nets: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    for raw in cidrs or ():
+        try:
+            nets.append(ipaddress.ip_network(str(raw).strip(), strict=False))
+        except ValueError:
+            continue
+    out: list[tuple[str, str]] = []
+    for ip, end in ((alert.source_ip, "source"), (alert.destination_ip, "destination")):
+        if not ip or any(ip == seen for seen, _ in out):
+            continue
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            continue
+        if any(addr.version == net.version and addr in net for net in nets):
+            out.append((ip, end))
+    return out
+
+
+async def _endpoint_host_coverage(
+    alert: SoAlert,
+    internal_ends: list[tuple[str, str]],
+    elastic: ElasticClient,
+    settings: Settings,
+    *,
+    include_synth: SynthScope = False,
+) -> list[EndpointCoverage]:
+    """One host coverage read per internal endpoint, over the day around the alert.
+
+    The read keys on the address. ``host.ip`` carries the address on the
+    documents an agent ships, so the address finds the agent's planes without
+    a name. Never raises: a failed read is an entry with ``read_ok`` False.
+    """
+    if alert.timestamp is None or not internal_ends:
+        return []
+    since, until = coverage_window(alert.timestamp, now=alert.timestamp + timedelta(days=1))
+    reads = await asyncio.gather(
+        *(
+            host_coverage(
+                elastic,
+                settings,
+                addresses=[ip],
+                since=since,
+                until=until,
+                include_synth=include_synth,
+                exclude_ids=[alert.id],
+            )
+            for ip, _end in internal_ends
+        )
+    )
+    return [
+        EndpointCoverage(ip=ip, end=end, coverage=cov)
+        for (ip, end), cov in zip(internal_ends, reads, strict=True)
+    ]
+
+
+async def _address_host_pivot(
+    alert: SoAlert,
+    coverages: list[EndpointCoverage],
+    elastic: ElasticClient,
+    settings: Settings,
+    window_seconds: int,
+    max_results: int,
+    *,
+    include_synth: SynthScope = False,
+) -> tuple[list[SoAlert] | None, str, str | None]:
+    """The host pivot by address and agent, for the internal hosts that ship host telemetry.
+
+    Returns ``(events, note, gap)``. ``events`` is None when the pivot did not
+    run. ``note`` is one sentence that says what the pivot ran on, or why it
+    did not run. ``gap`` is the exception class of a failed pivot.
+
+    The pivot reads host-side documents only. Network-sensor documents are
+    the community_id pivot's work, and a sensor document that carries a
+    ``host.ip`` names the sensor box.
+    """
+    if alert.timestamp is None:
+        return None, "The host pivot did not run. The alert has no timestamp.", None
+    if not coverages:
+        return None, "The host pivot did not run. The alert has no internal endpoint.", None
+    covered = [c for c in coverages if c.coverage.covered]
+    if not covered:
+        unread = [c.ip for c in coverages if not c.coverage.read_ok]
+        if unread:
+            return (
+                None,
+                "The host pivot did not run. soc-ai could not read the coverage of "
+                f"{', '.join(unread)}.",
+                None,
+            )
+        return (
+            None,
+            "The host pivot did not run. No internal endpoint of this alert ships host "
+            "telemetry in the window.",
+            None,
+        )
+
+    ips = [c.ip for c in covered]
+    agent_ids = sorted({a.id for c in covered for a in c.coverage.agents if a.id})
+    agent_names = sorted({a.name for c in covered for a in c.coverage.agents if a.name})
+    should: list[dict[str, Any]] = [{"terms": {"host.ip": ips}}]
+    if agent_ids:
+        should.append({"terms": {"agent.id": agent_ids}})
+    if agent_names:
+        should.append({"terms": {"host.name": agent_names}})
+
+    delta = timedelta(seconds=window_seconds)
+    gte = (alert.timestamp - delta).isoformat()
+    lte = (alert.timestamp + delta).isoformat()
+    query: dict[str, Any] = {
+        "bool": {
+            "filter": [
+                {"range": {"@timestamp": {"gte": gte, "lte": lte}}},
+                {"bool": {"should": should, "minimum_should_match": 1}},
+            ],
+            "must_not": [
+                {"ids": {"values": [alert.id]}},
+                *synth_scope_must_not(include_synth),
+                *({"prefix": {"event.dataset": p}} for p in _NETWORK_SENSOR_DATASET_PREFIXES),
+                {"terms": {"event.module": sorted(_NETWORK_SENSOR_MODULES)}},
+            ],
+        }
+    }
+    on = f"host.ip {', '.join(ips)}"
+    if agent_names:
+        on += f" and host.name {', '.join(agent_names)}"
+    try:
+        result = await elastic.search(
+            settings.events_index_pattern,
+            query,
+            size=max_results,
+            sort=[{"@timestamp": {"order": "asc"}}],
+        )
+    except Exception as exc:  # the other pivots survive one failed pivot
+        _LOGGER.warning(
+            "prefetch address host pivot for alert %s failed: %s", alert.id, type(exc).__name__
+        )
+        return (
+            None,
+            f"The host pivot on {on} failed ({type(exc).__name__}). The result is unknown.",
+            type(exc).__name__,
+        )
+    events = [SoAlert.from_es_hit(h) for h in result.hits]
+    return (
+        events,
+        f"The host pivot ran on {on} over the alert window. "
+        f"It found {len(events)} host document(s).",
+        None,
+    )
+
+
 async def _pivot(
     field_value: str | None,
     field_name: str,
@@ -788,6 +1049,10 @@ async def _behavioral_summary_pivot(
         return []
 
 
+def _end_key(side: str, ip: str) -> str:
+    return f"{side}|{ip}"
+
+
 async def _host_risk(
     alert: SoAlert,
     elastic: ElasticClient,
@@ -795,23 +1060,35 @@ async def _host_risk(
     window_hours: int,
     *,
     include_synth: SynthScope = False,
-) -> dict[str, int]:
+) -> tuple[dict[str, int], list[HostAlertProfile]]:
     """Aggregate the recent alert histogram for the alert's endpoint IPs.
 
-    Returns ``{rule_name: count}`` for every Suricata alert touching the alert's
-    source OR destination IP within ±``window_hours`` (the focus alert and, by
-    default, synthetic-eval docs excluded). This is the wide host-risk signal the
-    5 tight pivots miss: they key on community_id/host.name/user.name (absent on
-    so-import-pcap / network-sensor alerts) and span only ±5 min, so a
-    compromised host's RAT/C2 check-ins fired hours away are invisible to them.
-    Keyed on the IPs a network alert always carries instead.
+    Returns ``({rule_name: count}, per_end)``. The first value pools every
+    Suricata alert touching the alert's source OR destination IP within
+    ±``window_hours`` (the focus alert and, by default, synthetic-eval docs
+    excluded). This is the wide host-risk signal the 5 tight pivots miss: they
+    key on community_id/host.name/user.name (absent on so-import-pcap /
+    network-sensor alerts) and span only ±5 min, so a compromised host's RAT/C2
+    check-ins fired hours away are invisible to them. Keyed on the IPs a
+    network alert always carries instead.
 
-    Best-effort: any failure (field-mapping, timeout) returns ``{}`` rather than
-    poisoning the prefetch — host-risk is additive context, never a hard gate.
+    ``per_end`` is the same window split per endpoint IP and per side, one
+    :class:`HostAlertProfile` for each end of the alert that names an IP. A
+    reader that names one host reads its entry, never the pooled histogram
+    (dogfood 2026-10-01 RL3).
+
+    Best-effort: any failure (field-mapping, timeout) returns ``({}, [])``
+    rather than poisoning the prefetch — host-risk is additive context, never a
+    hard gate.
     """
-    ips = [ip for ip in (alert.source_ip, alert.destination_ip) if ip]
+    ends: list[tuple[str, str]] = []
+    if alert.source_ip:
+        ends.append(("source", alert.source_ip))
+    if alert.destination_ip and alert.destination_ip != alert.source_ip:
+        ends.append(("destination", alert.destination_ip))
+    ips = [ip for _end, ip in ends]
     if not ips or alert.timestamp is None or window_hours <= 0:
-        return {}
+        return {}, []
 
     delta = timedelta(hours=window_hours)
     gte = (alert.timestamp - delta).isoformat()
@@ -836,7 +1113,17 @@ async def _host_risk(
             "must_not": must_not,
         }
     }
-    aggs = {"rules": {"terms": {"field": "rule.name", "size": 50}}}
+    side_filters: dict[str, Any] = {}
+    for ip in ips:
+        side_filters[_end_key("source", ip)] = {"term": {"source.ip": ip}}
+        side_filters[_end_key("destination", ip)] = {"term": {"destination.ip": ip}}
+    aggs = {
+        "rules": {"terms": {"field": "rule.name", "size": 50}},
+        "ends": {
+            "filters": {"filters": side_filters},
+            "aggs": {"rules": {"terms": {"field": "rule.name", "size": 50}}},
+        },
+    }
 
     try:
         result = await elastic.search(
@@ -847,11 +1134,33 @@ async def _host_risk(
         )
     except Exception as exc:
         _LOGGER.warning("host-risk aggregation failed for alert %s: %s", alert.id, exc)
-        return {}
+        return {}, []
 
-    buckets = ((result.aggregations or {}).get("rules") or {}).get("buckets") or []
+    aggregations = result.aggregations or {}
+    profile = _rule_buckets(aggregations.get("rules"))
+    end_buckets_raw = (aggregations.get("ends") or {}).get("buckets") or {}
+    end_buckets: dict[str, Any] = end_buckets_raw if isinstance(end_buckets_raw, dict) else {}
+    per_end = [
+        HostAlertProfile(
+            ip=ip,
+            end=end,
+            as_source=_rule_buckets((end_buckets.get(_end_key("source", ip)) or {}).get("rules")),
+            as_destination=_rule_buckets(
+                (end_buckets.get(_end_key("destination", ip)) or {}).get("rules")
+            ),
+        )
+        for end, ip in ends
+    ]
+    return profile, per_end
+
+
+def _rule_buckets(agg: Any) -> dict[str, int]:
+    """``{rule_name: doc_count}`` from a terms aggregation result."""
+    buckets = (agg.get("buckets") or []) if isinstance(agg, dict) else []
     profile: dict[str, int] = {}
     for b in buckets:
+        if not isinstance(b, dict):
+            continue
         key = b.get("key")
         count = b.get("doc_count")
         if key and isinstance(count, int):
@@ -866,6 +1175,7 @@ __all__ = [
     "ENDPOINT_COVERAGE_WINDOW_MINUTES",
     "AlertContext",
     "EnrichedAlertContext",
+    "HostAlertProfile",
     "get_alert_context",
     "get_enriched_alert_context",
 ]

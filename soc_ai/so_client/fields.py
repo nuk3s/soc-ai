@@ -174,10 +174,26 @@ SSH_DIRECTION: tuple[str, ...] = ("ssh.direction", "zeek.ssh.direction")
 # modern SO grid the ``zeek.dhcp.*`` fields are mapped but empty, so a
 # zeek-first read (``host_summary._DHCP_HOSTNAME``) sees no lease on a host
 # that renews hourly.
-DHCP_HOSTNAME: tuple[str, ...] = ("dhcp.hostname", "zeek.dhcp.host_name", "dhcp.host_name")
+#
+# Security Onion 3.x writes neither of the older shapes. Its zeek.dhcp document
+# carries the lease in ``client.address`` and ``dhcp.assigned_ip``, the client's
+# name in ``host.hostname`` and its hardware address in ``host.mac``. It has no
+# ``source.ip`` and no ``destination.ip``. The older names come first: a document
+# of the older shape that also carries ``host.*`` carries the shipper there.
+DHCP_HOSTNAME: tuple[str, ...] = (
+    "dhcp.hostname",
+    "zeek.dhcp.host_name",
+    "dhcp.host_name",
+    "host.hostname",
+)
 DHCP_CLIENT_FQDN: tuple[str, ...] = ("dhcp.client_fqdn", "zeek.dhcp.client_fqdn")
 DHCP_DOMAIN: tuple[str, ...] = ("dhcp.domain", "zeek.dhcp.domain")
-DHCP_MAC: tuple[str, ...] = ("dhcp.client.mac", "zeek.dhcp.mac")
+DHCP_MAC: tuple[str, ...] = ("dhcp.client.mac", "zeek.dhcp.mac", "host.mac")
+# The address the server gave, and the address the client sent from. Either one
+# names the lease holder on an SO 3.x grid. The older shape names it by
+# direction: the originator (``source.ip``) is the client.
+DHCP_ASSIGNED_IP: tuple[str, ...] = ("dhcp.assigned_ip", "zeek.dhcp.assigned_addr")
+DHCP_CLIENT_ADDRESS: tuple[str, ...] = ("client.address", "zeek.dhcp.client_addr")
 # The hardware address, wherever the document happens to carry it. No zeek.*
 # fallback exists: Zeek's conn log has no MAC, so the endpoint fields are the
 # fallback rather than a legacy schema.
@@ -609,3 +625,81 @@ async def resolve_agg_field(
 def _clear_agg_field_cache() -> None:
     """Reset the resolver cache (test hook only)."""
     _AGG_FIELD_CACHE.clear()
+
+
+# ── Detection type ────────────────────────────────────────────────────────────
+#
+# Which detector raised an alert. ONE derivation for every surface: the Alerts
+# grid badges a group with it, and the investigation row stores it. The two
+# used to disagree: the row took a "suricata" default, so the investigations
+# list called a Sigma detection a Suricata one (dogfood 2026-10-01 RL5).
+
+_KIND_BY_DATASET: dict[str, str] = {
+    "suricata.alert": "suricata",
+    "sigma.alert": "sigma",
+    "zeek.notice": "notice",
+}
+_KIND_BY_MODULE: dict[str, str] = {
+    "suricata": "suricata",
+    "sigma": "sigma",
+}
+# The detector types an investigation row can carry. "alert" is the generic
+# answer for a document that names no detector.
+DETECTION_KINDS: frozenset[str] = frozenset({"suricata", "sigma", "notice", "alert"})
+
+
+def detection_kind(
+    dataset: Any,
+    module: Any = None,
+    *,
+    sigma_marker: bool = False,
+) -> str:
+    """The detector type of an alert document: suricata, sigma, notice or alert.
+
+    ``event.dataset`` decides first (``sigma.alert``, ``suricata.alert``,
+    ``zeek.notice``). ``event.module`` decides next. ``sigma_marker`` is the
+    Sigma pipeline's own field (``sigma_level``) on a document that carries
+    neither. A document with none of these is a generic "alert", never a
+    named detector: naming a detector is a claim about where it came from.
+    """
+    ds = str(dataset or "").strip().lower()
+    if ds in _KIND_BY_DATASET:
+        return _KIND_BY_DATASET[ds]
+    mod = str(module or "").strip().lower()
+    if mod in _KIND_BY_MODULE:
+        return _KIND_BY_MODULE[mod]
+    if sigma_marker:
+        return "sigma"
+    return "alert"
+
+
+def detection_kind_of_source(source: Mapping[str, Any]) -> str:
+    """:func:`detection_kind` for a raw ``_source`` document."""
+
+    def _scalar(path: str) -> Any:
+        v = get_dotted(source, path)
+        if isinstance(v, list):
+            return v[0] if v else None
+        return v
+
+    return detection_kind(
+        _scalar("event.dataset"),
+        _scalar("event.module"),
+        sigma_marker=get_dotted(source, "sigma_level") is not None,
+    )
+
+
+def detection_kind_of_alert_payload(alert: Mapping[str, Any]) -> str | None:
+    """:func:`detection_kind` for a stored ``SoAlert`` dump.
+
+    None when the dump names no dataset, no module and no Sigma marker. The
+    caller then keeps what it has: a dump that says nothing is not evidence.
+    """
+    raw = alert.get("raw")
+    raw_map: Mapping[str, Any] = raw if isinstance(raw, Mapping) else {}
+    dataset = alert.get("event_dataset")
+    module = alert.get("event_module")
+    marker = get_dotted(raw_map, "sigma_level") is not None
+    if not dataset and not module and not marker:
+        return None
+    return detection_kind(dataset, module, sigma_marker=marker)

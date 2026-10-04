@@ -179,8 +179,9 @@ async def leads_awaiting_a_hunt(
 
     - ``open``: a dismissed or promoted lead is answered, and a hunting lead
       has its hunt.
-    - no ``dismissed_at``: a reopened lead carries its dismissal as history.
-      The analyst reopened it to decide again, and Hunt again is their call.
+    - no ``dismissed_at`` and no ``reopened_at``: a reopen clears the
+      dismissal and sets ``reopened_at``. The analyst reopened the lead to
+      decide again, and Hunt again is their call.
     - not shadow: a shadow lead came from an analytic in shadow. Shadow
       records and never acts, so its hunt waits for the analyst.
     - no running or queued hunt names the lead: the console can start a hunt
@@ -217,6 +218,7 @@ async def leads_awaiting_a_hunt(
         query = select(Lead).where(
             Lead.status == "open",
             Lead.dismissed_at.is_(None),
+            Lead.reopened_at.is_(None),
             Lead.shadow.is_(False),
             ~a_hunt_runs,
         )

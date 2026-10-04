@@ -127,7 +127,10 @@ async def require_admin_api(request: Request) -> None:
     if is_demo(settings):
         raise HTTPException(
             status_code=403,
-            detail={"reason": "demo_mode", "hint": "Demo — read-only; admin config is disabled."},
+            detail={
+                "reason": "demo_mode",
+                "hint": "The demo is read-only. The admin config is off.",
+            },
         )
     if not settings.api_auth_required:
         return

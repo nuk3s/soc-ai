@@ -1,0 +1,109 @@
+id: s6-audit-policy-change-on-dc
+name: "Audit policy change on a domain controller with no alert"
+version: 1
+tier: medium
+story: |
+  A named account removes the success auditing of Directory Service Access on
+  a domain controller. Windows writes event 4719. No signature fires. The
+  replication requests that follow now leave no 4662 record.
+
+  The prior that this analytic replaces read new logon accounts on the domain
+  controller. It never read event 4719. On the development range the attack
+  chain of 2026-09-04 wrote two 4719 events under a user account, and the
+  prior saw neither.
+
+  The benign twin is a group policy refresh on a second domain controller.
+  Windows writes that 4719 under the computer account of the controller. The
+  machine-account exclusion removes it. The twin sits on a second controller,
+  so a spec without the exclusion surfaces two candidates and the pinned count
+  fails. The third document is the same change on a workstation. The analytic
+  applies to domain controllers only, so it must not fire.
+attack:
+  - T1562.002
+sigma_refs: []
+
+ground_truth:
+  verdict: true_positive
+  confidence_min: 0.70
+  required_citation_kinds:
+    - typed_path
+  expected_actions:
+    - kind: escalate
+  expected_field_reconciliation: false
+
+spec_journey:
+  spec_id: identity-4719-audit-policy-change
+  expected_scope_keys:
+    - "synth-dc01"
+  expected_candidate_count: 1
+  host_roles:
+    synth-dc01: domain_controller
+    synth-dc02: domain_controller
+    synth-ws01: workstation
+
+events:
+  # The change.
+  - index: logs-synth-winlog-security
+    time_offset_seconds: 0
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time }}"
+      event.dataset: system.security
+      event.module: system
+      event.kind: event
+      event.code: "4719"
+      event.provider: Microsoft-Windows-Security-Auditing
+      host.name: "synth-dc01"
+      winlog.channel: Security
+      winlog.event_id: "4719"
+      winlog.computer_name: "SYNTH-DC01.synth.test"
+      winlog.event_data.SubjectUserName: "ops-admin"
+      winlog.event_data.SubjectDomainName: "synth"
+      winlog.event_data.SubCategory: Directory Service Access
+      winlog.event_data.AuditPolicyChangesDescription: ["Success removed"]
+      synth.scenario_id: s6-audit-policy-change-on-dc
+      synth.scenario_version: 1
+
+  # The benign twin: a group policy refresh under the computer account.
+  - index: logs-synth-winlog-security
+    time_offset_seconds: -900
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-900) }}"
+      event.dataset: system.security
+      event.module: system
+      event.kind: event
+      event.code: "4719"
+      event.provider: Microsoft-Windows-Security-Auditing
+      host.name: "synth-dc02"
+      winlog.channel: Security
+      winlog.event_id: "4719"
+      winlog.computer_name: "SYNTH-DC02.synth.test"
+      winlog.event_data.SubjectUserName: "SYNTH-DC02$"
+      winlog.event_data.SubjectDomainName: "synth"
+      winlog.event_data.SubCategory: Kerberos Service Ticket Operations
+      winlog.event_data.AuditPolicyChangesDescription: ["Success added"]
+      synth.scenario_id: s6-audit-policy-change-on-dc
+      synth.scenario_version: 1
+
+  # The same change on a workstation. Out of the analytic's scope.
+  - index: logs-synth-winlog-security
+    time_offset_seconds: -300
+    is_triage_target: false
+    fields:
+      "@timestamp": "{{ run_time | offset_seconds(-300) }}"
+      event.dataset: system.security
+      event.module: system
+      event.kind: event
+      event.code: "4719"
+      event.provider: Microsoft-Windows-Security-Auditing
+      host.name: "synth-ws01"
+      winlog.channel: Security
+      winlog.event_id: "4719"
+      winlog.computer_name: "SYNTH-WS01.synth.test"
+      winlog.event_data.SubjectUserName: "ops-admin"
+      winlog.event_data.SubjectDomainName: "synth"
+      winlog.event_data.SubCategory: Logon
+      winlog.event_data.AuditPolicyChangesDescription: ["Failure added"]
+      synth.scenario_id: s6-audit-policy-change-on-dc
+      synth.scenario_version: 1

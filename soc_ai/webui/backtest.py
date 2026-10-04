@@ -190,8 +190,8 @@ def _completion(metrics: dict[str, Any]) -> dict[str, Any]:
         "completion_rate": metrics["completion_rate"],
         "degraded": degraded,
         "reason": (
-            f"{no_verdict} of {total} replays produced no verdict — the metrics below "
-            "describe only the replays that completed, not the model."
+            f"{no_verdict} of {total} replays produced no verdict. The metrics below "
+            "describe only the replays that completed. They do not describe the model."
             if degraded
             else None
         ),
@@ -222,8 +222,12 @@ class BacktestStatus:
     finished_at: str | None = None
     # live progress: the rule name (or alert id) currently being replayed
     current: str | None = None
-    # a short human note (e.g. "capped to 50", "nothing to replay")
+    # a short human note (e.g. "capped to 50")
     note: str | None = None
+    # An attempt that did not start a run: {"reason", "hint"}. Kept apart from
+    # ``note`` because GET /backtest serves it beside the LAST stored run, and a
+    # note merged onto that run read as the old result's own note.
+    refused: dict[str, str] | None = None
     # internal: keep a reference to the running task to prevent GC
     _task: asyncio.Task[None] | None = field(default=None, repr=False, compare=False)
 
@@ -236,6 +240,7 @@ class BacktestStatus:
         self.finished_at = None
         self.current = None
         self.note = None
+        self.refused = None
 
 
 def get_status(state: Any) -> BacktestStatus:
@@ -271,6 +276,7 @@ async def plan_samples(
     window_days: int,
     sample_size: int,
     min_severity: str | None,
+    stats: dict[str, int] | None = None,
 ) -> list[BacktestSample]:
     """Sample up to ``sample_size`` already-dispositioned alerts from the window.
 
@@ -288,6 +294,10 @@ async def plan_samples(
     console report an outage as a fact about the operator's own triage history:
     "no dispositioned alerts in the window to replay". A window we could not read
     is not a window we found empty; the caller turns the error into a 503.
+
+    ``stats``, when given, receives the counts that explain a sample smaller
+    than the request: ``scanned`` hits, ``excluded_self`` (soc-ai's own
+    escalations) and ``distinct`` (rule, disposition) keys.
     """
     settings = state.settings
     elastic = state.elastic
@@ -377,6 +387,8 @@ async def plan_samples(
                 human_disposition=disposition,
             )
         )
+    if stats is not None:
+        stats.update(scanned=len(result.hits), excluded_self=excluded_self, distinct=len(seen))
     # Say how many were dropped. A denominator that quietly shrinks is the same
     # defect in a different place: an operator comparing two backtests needs to
     # know whether the sample got smaller because their grid went quiet or
@@ -583,11 +595,12 @@ async def run_backtest(
             "rows": rows,
             # The acked⇒FP mapping is a proxy — carry the caveat with the data.
             "caveat": (
-                "Ground truth is read from Security Onion: event.escalated ⇒ true "
-                "positive; acknowledged-and-not-escalated ⇒ false positive. The "
-                "false-positive proxy is imperfect — an analyst acknowledges alerts "
-                "for several reasons (triaged benign, dismissed, bulk-cleared), so "
-                "some 'human FP' rows were not strictly confirmed benign."
+                "soc-ai reads the ground truth from Security Onion. An escalated alert "
+                "counts as a true positive. An alert that an analyst acknowledged and did "
+                "not escalate counts as a false positive. This proxy is not exact. An "
+                "analyst acknowledges an alert for several reasons, for example a benign "
+                "triage, a dismissal or a bulk clear. Some rows that count as a human "
+                "false positive are therefore not confirmed benign."
             ),
         }
         # A run most of whose replays produced nothing did not measure the model,
@@ -618,7 +631,74 @@ async def run_backtest(
             _LOGGER.exception("backtest: error-finalize failed for id=%s", backtest_id)
     finally:
         status.active = False
-        status.finished_at = datetime.now(UTC).isoformat()
+        status.finished_at = iso_utc(datetime.now(UTC))
+
+
+def iso_utc(when: datetime | None) -> str | None:
+    """ISO 8601 with a ``Z``. A naive value is UTC, the store's convention.
+
+    The stored ``finished_at`` came back from SQLite naive and went out with no
+    zone, so the browser read it as local time: four hours off on the range.
+    """
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return when.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+# The refusal an attempt carries when the window held nothing to replay.
+NO_SAMPLES_REFUSAL = {
+    "reason": "no_dispositioned_alerts",
+    "hint": (
+        "The window holds no alert that an analyst escalated or acknowledged. "
+        "soc-ai started no run. Select a longer window or a lower severity floor."
+    ),
+}
+
+# The refusal an attempt carries when the sampling read could not reach the grid.
+GRID_UNAVAILABLE_REFUSAL = {
+    "reason": "grid_unavailable",
+    "hint": (
+        "The grid is unavailable, so soc-ai could not read the window and sampled "
+        "no alert. Security Onion Elasticsearch is slow or unreachable. Retry shortly."
+    ),
+}
+
+
+def skipped_reason(params: dict[str, Any] | None, sampled: int | None) -> str | None:
+    """Why the run replayed fewer alerts than the operator requested, or None."""
+    if not params or sampled is None:
+        return None
+    requested = int(params.get("requested_sample_size") or params.get("sample_size") or 0)
+    if not requested or sampled >= requested:
+        return None
+    capped = int(params.get("sample_size") or requested)
+    reasons: list[str] = []
+    if capped < requested:
+        reasons.append(
+            f"The server caps a backtest at {capped} alerts. Each replay is a full investigation."
+        )
+    plan = params.get("plan") or {}
+    if sampled < capped:
+        distinct = plan.get("distinct")
+        if isinstance(distinct, int):
+            reasons.append(
+                f"The window held {distinct} distinct pairs of detection and disposition. "
+                "soc-ai samples one alert for each pair."
+            )
+        else:
+            reasons.append(
+                "soc-ai samples one alert for each pair of detection and disposition, "
+                "and the window held fewer pairs."
+            )
+        excluded = plan.get("excluded_self")
+        if isinstance(excluded, int) and excluded:
+            reasons.append(
+                f"soc-ai left out {excluded} alerts that it escalated itself, "
+                "because they are not an analyst disposition."
+            )
+    return " ".join(reasons) or None
 
 
 async def start_backtest(
@@ -685,25 +765,26 @@ async def start_backtest(
         # connection and never answers held this POST for the client's whole 20 s
         # and then, on the disconnect, left ``active`` claimed forever: every
         # later backtest answered "already running" until a restart.
+        plan_stats: dict[str, int] = {}
         async with asyncio.timeout(settings.webui_grid_timeout_s):
             samples = await plan_samples(
                 state,
                 window_days=int(window_days),
                 sample_size=capped,
                 min_severity=min_severity,
+                stats=plan_stats,
             )
+        params["plan"] = plan_stats
     except (TimeoutError, TransportError, ApiError):
         # Release the single-flight slot BEFORE propagating, or one outage wedges
         # every later backtest behind "already running".
         status.active = False
-        # This note is what SURVIVES: the inline error the POST raises is gone on
-        # the next page load, and the console then renders this string on its own.
+        # This refusal is what SURVIVES: the inline error the POST raises is gone
+        # on the next page load, and the console then renders this on its own.
         # It used to be a lowercase fragment with no remedy on it, so the durable
         # half of the failure was the half that did not say what to do next.
-        status.note = (
-            "Grid unavailable — the window could not be read, so no alerts were "
-            "sampled. Security Onion (Elasticsearch) is slow or unreachable; retry shortly."
-        )
+        status.refused = dict(GRID_UNAVAILABLE_REFUSAL)
+        status.finished_at = iso_utc(datetime.now(UTC))
         _LOGGER.warning("backtest: sampling could not read the grid")
         raise
     except asyncio.CancelledError:
@@ -717,13 +798,16 @@ async def start_backtest(
     except Exception:
         status.active = False
         _LOGGER.exception("backtest: planning failed")
-        status.note = "planning failed"
+        status.refused = {
+            "reason": "planning_failed",
+            "hint": "soc-ai could not plan the backtest. Check the server log and try again.",
+        }
         return status
 
     if not samples:
         status.reset(active=False, total=0, backtest_id=None)
-        status.finished_at = datetime.now(UTC).isoformat()
-        status.note = "no dispositioned alerts in the window to replay"
+        status.finished_at = iso_utc(datetime.now(UTC))
+        status.refused = dict(NO_SAMPLES_REFUSAL)
         return status
 
     # Create the row up front so the console can address it by id while it runs.
@@ -733,12 +817,17 @@ async def start_backtest(
     except Exception:
         status.active = False
         _LOGGER.exception("backtest: could not create row")
-        status.note = "could not start"
+        status.refused = {
+            "reason": "could_not_start",
+            "hint": "soc-ai could not store the backtest. Check the server log and try again.",
+        }
         return status
 
     status.reset(active=True, total=len(samples), backtest_id=bt.id)
     if capped < requested:
-        status.note = f"capped to {capped} (each replay is a full investigation)"
+        status.note = (
+            f"The server caps a backtest at {capped} alerts. Each replay is a full investigation."
+        )
     status._task = asyncio.create_task(
         run_backtest(state, backtest_id=bt.id, samples=samples, params=params)
     )

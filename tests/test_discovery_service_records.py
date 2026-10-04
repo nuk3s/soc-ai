@@ -2,7 +2,7 @@
 
 Dogfood 2026-07-31: the auto-detected "internal domain suffixes" list was
 polluted with mDNS service types (``_dns-sd._udp.local``, ``_printer._tcp.local``)
-and a doubled suffix (``_https.hermes.hq.lan.hq.lan``). These are DNS-SD
+and a doubled suffix (``_https.atlas.hq.lan.hq.lan``). These are DNS-SD
 (RFC 6763) / SRV (RFC 2782) service records — underscore-prefixed labels — never
 a host's own domain.
 """
@@ -16,11 +16,11 @@ def test_is_service_record_name() -> None:
     assert _is_service_record_name("_dns-sd._udp.local")
     assert _is_service_record_name("_printer._tcp.local")
     assert _is_service_record_name("_ipp._tcp.local")
-    assert _is_service_record_name("_https.hermes.hq.lan")
+    assert _is_service_record_name("_https.atlas.hq.lan")
     # a real host FQDN is NOT a service record
     assert not _is_service_record_name("dc01.corp.hq.lan")
     assert not _is_service_record_name("host.lan")
-    assert not _is_service_record_name("hermes.hq.lan")
+    assert not _is_service_record_name("atlas.hq.lan")
 
 
 def test_ingest_drops_service_records_but_keeps_real_hosts() -> None:
@@ -28,7 +28,7 @@ def test_ingest_drops_service_records_but_keeps_real_hosts() -> None:
     hosts: dict[str, _Candidate] = {}
     buckets = [
         {"key": "_dns-sd._udp.local", "doc_count": 25200, "distinct_hosts": {"value": 9}},
-        {"key": "_https.hermes.hq.lan", "doc_count": 32, "distinct_hosts": {"value": 2}},
+        {"key": "_https.atlas.hq.lan", "doc_count": 32, "distinct_hosts": {"value": 2}},
         {"key": "dc01.corp.hq.lan", "doc_count": 10, "distinct_hosts": {"value": 3}},
     ]
     _ingest_buckets(buckets, [], suffixes, hosts, associated=False)

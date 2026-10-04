@@ -227,6 +227,8 @@ describe('assignAlert write paths surface a failure instead of failing silently 
     );
 
     const assignBtn = await screen.findByTitle('Assign to me');
+    // The button shows "+". Its accessible name must say what it does (P13).
+    expect(assignBtn).toHaveAccessibleName(`Assign ${POLL_GROUP.name} to me`);
     fireEvent.click(assignBtn);
 
     await screen.findByText(`Could not assign ${POLL_GROUP.name}`);

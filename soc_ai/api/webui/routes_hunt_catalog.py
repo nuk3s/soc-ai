@@ -22,6 +22,7 @@ from pydantic import BaseModel
 
 from soc_ai.api.webui._shared import _iso_z, router
 from soc_ai.hunting.catalog_tiers import effective_catalog
+from soc_ai.hunting.prior_sweep import RECENT_MAX_ENTITIES
 from soc_ai.hunting.window import sweep_window
 from soc_ai.store import hunt_spec_sweeps as sweeps_svc
 from soc_ai.store import prior_spec_runs
@@ -50,6 +51,11 @@ class PriorCoverageOut(BaseModel):
     profiles_built_at: str | None = None
     profiles_stale: bool = False
     profiles_reason: str | None = None
+    # The recent read returns at most ``recent_cap`` entities per dimension.
+    # ``capped`` is true when this run's evaluations reached the cap, so the
+    # totals are the cap and not the size of the estate.
+    recent_cap: int = RECENT_MAX_ENTITIES
+    capped: bool = False
 
 
 class HuntCatalogSpecOut(BaseModel):
@@ -143,6 +149,13 @@ class HuntCatalogOut(BaseModel):
     sweep_interval_minutes: int
     sweep_window_minutes: int
     last_sweep_at: str | None
+    # The profile sweep is a second loop with its own setting. It runs the
+    # ``profile`` analytics, and the two loops can be on and off apart. The
+    # page reads both, so a profile analytic that runs is not shown as idle
+    # under "Sweeps off", and a match analytic is not shown as running
+    # because the profile sweep is.
+    prior_sweeps_enabled: bool = True
+    last_prior_run_at: str | None = None
 
 
 def _coverage_out(run: Any) -> PriorCoverageOut | None:
@@ -160,6 +173,45 @@ def _coverage_out(run: Any) -> PriorCoverageOut | None:
         profiles_built_at=_iso_z(built) if built is not None else None,
         profiles_stale=bool(getattr(run, "profiles_stale", False)),
         profiles_reason=getattr(run, "profiles_reason", None) or None,
+        capped=(
+            int(run.measured or 0)
+            + int(run.learning or 0)
+            + int(run.blind or 0)
+            + int(run.not_applicable or 0)
+        )
+        >= RECENT_MAX_ENTITIES,
+    )
+
+
+def _profile_spec_out(
+    spec: Any, *, tier: str, status: str, run: Any, trail: Any
+) -> HuntCatalogSpecOut:
+    """One profile analytic, every trail field read from the prior sweep's trail."""
+    return HuntCatalogSpecOut(
+        id=spec.id,
+        title=spec.title,
+        level=spec.level,
+        scope_kind=spec.scope_kind,
+        attack=list(spec.attack),
+        evaluator=spec.evaluator,
+        tier=tier,
+        status=status,
+        coverage=_coverage_out(run),
+        last_swept_at=_iso_z(trail.last_run_at) if trail else None,
+        last_fired_at=_iso_z(trail.last_fired_at) if trail else None,
+        # Blindness of a profile analytic is in its coverage counts.
+        blind=False,
+        # The prior trail records completed runs only. A run that wrote a row
+        # did not fail on this analytic.
+        last_error=None,
+        sweeps_24h=trail.runs_24h if trail else 0,
+        fired_24h=trail.fired_24h if trail else 0,
+        fresh_24h=0,
+        already_handled_24h=0,
+        shadow_24h=trail.shadow_24h if trail else 0,
+        undecided_docs=0,
+        unattributed_docs=0,
+        truncated_docs=0,
     )
 
 
@@ -174,12 +226,28 @@ async def get_hunt_catalog(request: Request) -> HuntCatalogOut:
         cat = await effective_catalog(db)
         status = await sweeps_svc.catalog_status(db, now=now)
         prior_runs = await prior_spec_runs.newest(db)
+        prior_status = await prior_spec_runs.catalog_status(db, now=now)
 
     catalog = cat.listed
     specs: list[HuntCatalogSpecOut] = []
     for spec in catalog.values():
-        s = status.get(spec.id)
         tier, spec_status = cat.status_of(spec.id)
+        if spec.evaluator == "profile":
+            # A profile analytic is run by the prior sweep, and its trail is
+            # ``prior_spec_runs``. The catalog sweep's rows for it are from
+            # before the split: reading them showed a 2026-09-15 error on
+            # every prior under an hourly sweep that ran fine.
+            specs.append(
+                _profile_spec_out(
+                    spec,
+                    tier=tier,
+                    status=spec_status,
+                    run=prior_runs.get(spec.id),
+                    trail=prior_status.get(spec.id),
+                )
+            )
+            continue
+        s = status.get(spec.id)
         specs.append(
             HuntCatalogSpecOut(
                 id=spec.id,
@@ -223,4 +291,6 @@ async def get_hunt_catalog(request: Request) -> HuntCatalogOut:
         sweep_interval_minutes=window.interval_minutes,
         sweep_window_minutes=window.window_minutes,
         last_sweep_at=_iso_z(last_sweep),
+        prior_sweeps_enabled=bool(getattr(settings, "hunting_prior_sweep_enabled", True)),
+        last_prior_run_at=_iso_z(max((p.last_run_at for p in prior_status.values()), default=None)),
     )

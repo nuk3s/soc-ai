@@ -500,6 +500,17 @@ def test_python_dash_m_invocation_runs_main() -> None:
 # end-to-end in tests/test_audit_verify.py.
 
 
+@pytest.fixture(autouse=True)
+def _no_recorded_finding_read() -> Any:
+    """The CLI reads the newest recorded chain finding after a windowed scan.
+
+    These tests mock the verifier and point at a host that does not exist, so
+    that one extra read is stubbed here: no test in this file dials out.
+    """
+    with patch("soc_ai.audit.verify.recorded_older_duplicate", AsyncMock(return_value=None)):
+        yield
+
+
 def _cli_settings() -> Settings:
     return Settings(
         so_host="https://so.example.com",
@@ -1107,12 +1118,14 @@ def test_audit_verify_tamper_names_what_broke(capsys: pytest.CaptureFixture[str]
         patch("soc_ai.audit.verify.verify_audit_chain", AsyncMock(return_value=result)),
     ):
         rc = cli._audit_verify(argparse.Namespace(days=3))
-    assert rc == 1
+    # Two writers, every copy still hashing true. This printed "TAMPER
+    # DETECTED", then "CHAIN BROKEN" with exit 1, while --help says 1 means
+    # tamper. Duplicates only is its own condition: exit 3, its own headline.
+    assert rc == 3
     err = _strip_ansi(capsys.readouterr().err)
-    # Two writers, every copy still hashing true. This used to print "TAMPER
-    # DETECTED" directly above its own sentence saying the records were not
-    # altered — a headline contradicted by its body, on soc-ai's own concurrency.
-    assert "CHAIN BROKEN" in err
+    assert "DUPLICATE SEQUENCE NUMBERS" in err
+    assert "duplicate sequence numbers; no record was altered" in err
+    assert "CHAIN BROKEN" not in err
     assert "TAMPER DETECTED" not in err
     assert "two writers continued the chain from the same point" in err
     # And the operator is told how to check it themselves, since this shape is
@@ -1308,3 +1321,155 @@ def test_format_lead_quality_prints_the_hunt_closures_in_their_own_column() -> N
     assert lines[1].split() == ["2026-W39", "3", "3", "0", "0", "2", "benign_repeat=1"]
     types_row = next(line for line in lines if line.startswith("novel_served_port"))
     assert types_row.split() == ["novel_served_port", "3", "1", "2", "0"]
+
+
+# ── soc-ai audit verify: window, streaming, exit 3 ───────────────────────────
+
+
+def _run_verify_against(records: list[dict[str, Any]], args: argparse.Namespace) -> tuple[int, Any]:
+    """Run the CLI end to end against a fake grid that holds *records*."""
+    from soc_ai.audit import verify as verify_mod
+
+    from tests.test_audit_verify import _FakeES
+
+    fake = _FakeES(records)
+    verify_spy = AsyncMock(wraps=verify_mod.verify_audit_chain)
+    with (
+        patch("soc_ai.cli.get_settings", return_value=_cli_settings()),
+        patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=fake),
+        patch("soc_ai.audit.verify.verify_audit_chain", verify_spy),
+    ):
+        rc = cli._audit_verify(args)
+    return rc, verify_spy
+
+
+def test_audit_verify_defaults_to_seven_days_and_all_reads_the_index(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """No flags verifies the newest 7 days; --all verifies the whole index."""
+    from datetime import UTC, datetime, timedelta
+
+    from tests.test_audit_verify import _build_chain
+
+    records = _build_chain(5, start_time=datetime.now(UTC) - timedelta(hours=5))
+    rc, spy = _run_verify_against(records, argparse.Namespace(days=None, all=False))
+    assert rc == 0
+    assert spy.call_args.kwargs["days"] == 7
+    assert spy.call_args.kwargs["max_records"] is None
+    assert "last 7d window" in _strip_ansi(capsys.readouterr().out)
+
+    rc, spy = _run_verify_against(records, argparse.Namespace(days=None, all=True))
+    assert rc == 0
+    assert spy.call_args.kwargs["days"] is None
+
+    rc, _spy = _run_verify_against(records, argparse.Namespace(days=0, all=False))
+    assert rc == 2
+    assert "--days must be 1 or more" in _strip_ansi(capsys.readouterr().err)
+
+
+def test_audit_verify_cli_streams_a_large_index_in_bounded_memory(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`soc-ai audit verify --all` pages the index and never holds more than one page.
+
+    The CLI used to load the whole index first and a 1 GB container killed it
+    (exit 137, no output). With a page of 10 and 45 records, the scan takes
+    five pages, and the records alive at each page fit in one page.
+    """
+    import gc
+    import weakref
+
+    from soc_ai.audit import chain as chain_mod
+    from soc_ai.audit import verify as verify_mod
+
+    from tests.test_audit_verify import _build_chain, _FakeES
+
+    class _Tracked(dict):  # type: ignore[type-arg]
+        __hash__ = object.__hash__
+
+    live: weakref.WeakSet[_Tracked] = weakref.WeakSet()
+
+    class _Watching(_FakeES):
+        async def search(self, *, index: str, body: dict[str, Any], **kw: Any) -> dict[str, Any]:
+            resp = await super().search(index=index, body=body, **kw)
+            for hit in resp["hits"]["hits"]:
+                hit["_source"] = _Tracked(hit["_source"])
+                live.add(hit["_source"])
+            return resp
+
+    held: list[int] = []
+    real_feed = chain_mod.EpochStreamChecker.feed_page
+
+    def _spy(self: Any, page: list[dict[str, Any]]) -> None:
+        gc.collect()
+        held.append(len(live))
+        real_feed(self, page)
+
+    monkeypatch.setattr(chain_mod.EpochStreamChecker, "feed_page", _spy)
+    monkeypatch.setattr(verify_mod, "_PAGE_SIZE", 10)
+    with (
+        patch("soc_ai.cli.get_settings", return_value=_cli_settings()),
+        patch(
+            "soc_ai.so_client.elastic.AsyncElasticsearch", return_value=_Watching(_build_chain(45))
+        ),
+    ):
+        rc = cli._audit_verify(argparse.Namespace(days=None, all=True))
+
+    assert rc == 0
+    assert "45 records verified" in _strip_ansi(capsys.readouterr().out)
+    assert len(held) >= 5
+    # The bound is a page, with one page of slack: under a parallel test run
+    # the collector can lag one feed behind. The whole index would be 45.
+    assert max(held) <= 20, f"held {max(held)} records at once; a page is 10"
+
+
+def test_audit_verify_duplicates_only_exits_3_and_says_no_record_was_altered(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Six duplicated positions, nothing altered: exit 3, never "CHAIN BROKEN"/1.
+
+    The negative control edits one record in the same index: that is exit 1 and
+    TAMPER DETECTED, so exit 3 cannot swallow an alteration.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from soc_ai.audit.chain import compute_hash
+
+    from tests.test_audit_verify import _build_chain
+
+    def _fork(rec: dict[str, Any]) -> dict[str, Any]:
+        fork = {k: v for k, v in rec.items() if k != "hash"}
+        fork["session_id"] = "second-writer"
+        fork["hash"] = compute_hash(fork, fork["prev_hash"])
+        return fork
+
+    records = _build_chain(30, start_time=datetime.now(UTC) - timedelta(hours=10))
+    forks = [_fork(records[i]) for i in (3, 7, 11, 15, 19, 23)]
+    rc, _spy = _run_verify_against([*records, *forks], argparse.Namespace(days=None, all=False))
+    err = _strip_ansi(capsys.readouterr().err)
+    assert rc == 3, err
+    assert "DUPLICATE SEQUENCE NUMBERS" in err
+    assert "duplicate sequence numbers; no record was altered" in err
+    assert "6 sequence numbers" in err
+    assert "CHAIN BROKEN" not in err
+
+    records[9]["payload"] = {"i": "edited"}
+    rc, _spy = _run_verify_against([*records, *forks], argparse.Namespace(days=None, all=False))
+    err = _strip_ansi(capsys.readouterr().err)
+    assert rc == 1
+    assert "TAMPER DETECTED" in err
+    assert "no record was altered" not in err
+
+
+def test_audit_verify_help_documents_exit_3(capsys: pytest.CaptureFixture[str]) -> None:
+    """`soc-ai audit verify --help` states every exit code, including 3."""
+    parser = argparse.ArgumentParser(prog="soc-ai")
+    cli._register_audit(parser.add_subparsers(dest="cmd"))
+    with pytest.raises(SystemExit):
+        parser.parse_args(["audit", "verify", "--help"])
+    text = " ".join(capsys.readouterr().out.split())
+    assert "0 intact" in text
+    assert "1 a record was altered" in text
+    assert "2 could not verify" in text
+    assert "3 duplicate sequence numbers only" in text
+    assert "--all" in text

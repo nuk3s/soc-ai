@@ -494,7 +494,8 @@ def test_detection_tuning_summary_counts_actionable_mutes(client: TestClient) ->
     with patch("soc_ai.webui.detection_tuning.nominate", AsyncMock(return_value=noms)):
         resp = client.get("/api/v1/detection-tuning/summary")
     assert resp.status_code == 200
-    assert resp.json() == {"pending": 1}
+    # Three nominated rules, one of them a pending mute (D10).
+    assert resp.json() == {"pending": 1, "nominated": 3}
 
 
 def test_summary_answers_a_down_grid_with_503_not_an_unhandled_500(client: TestClient) -> None:

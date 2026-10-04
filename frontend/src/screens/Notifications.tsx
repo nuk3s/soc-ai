@@ -7,8 +7,11 @@ import { MultiSelect } from '../components/MultiSelect';
 import { ErrorState, Freshness, LoadingState, StaleNotice } from '../components/States';
 import { getNotifications } from '../lib/api';
 import {
+  NOTIFICATIONS_CAP,
   NOTIFICATIONS_DISMISSED_EVENT,
   NOTIFICATION_KINDS,
+  NO_NOTIFICATIONS,
+  describeNotifications,
   dismissMany,
   dismissNotification,
   formatNotificationTitle,
@@ -54,23 +57,8 @@ const TONE_TITLE: Record<Notification['tone'], string> = {
   accent: TONE_INFORMATIONAL,
 };
 
-/** The group a row names for itself, when the wire carries one. The list holds
- *  shadow hits and leads whose kind is worked out from an id prefix, and a
- *  server that already knows the answer should not be second-guessed. */
-function wireGroup(n: Notification): string | null {
-  const g = (n as { group?: unknown }).group;
-  return typeof g === 'string' && g.trim() ? g.trim() : null;
-}
-
-/** The header a named group prints. */
-const GROUP_LABELS: Record<string, string> = { hunting: 'Hunting' };
-
-/** What a named group holds, in one sentence. */
-const GROUP_TITLE: Record<string, string> = { hunting: GROUP_HUNTING };
-
-function groupLabel(id: string): string {
-  return GROUP_LABELS[id] ?? id.replace(/_/g, ' ').replace(/^./, (c) => c.toUpperCase());
-}
+/** What a group holds, in one sentence. */
+const GROUP_TITLE: Partial<Record<NotificationKind, string>> = { hunting: GROUP_HUNTING };
 
 /**
  * Notifications — the same list toolbar its neighbours wear.
@@ -154,26 +142,13 @@ export function Notifications() {
 
   // Group headers earn their place only while the rows actually span groups:
   // under a kind chip they would just repeat the chip that is already pressed.
-  // A row that names its own group wins; the rest fall back to their kind.
-  const named = new Map<string, Notification[]>();
-  const byDerivedKind: Notification[] = [];
-  for (const n of visible) {
-    const g = wireGroup(n);
-    if (g == null) {
-      byDerivedKind.push(n);
-      continue;
-    }
-    const rows = named.get(g) ?? [];
-    rows.push(n);
-    named.set(g, rows);
-  }
-  const groups = [
-    ...[...named.entries()].map(([id, rows]) => ({ id, label: groupLabel(id), rows })),
-    ...NOTIFICATION_KINDS.map((k) => ({
-      ...k,
-      rows: byDerivedKind.filter((n) => notificationKind(n) === k.id),
-    })),
-  ].filter((g) => g.rows.length > 0);
+  // Headings and chips read the one notificationKind, so a row sits under the
+  // heading its chip names. A lead sat under HUNTING and counted on "System"
+  // when the two read different fields (D7, RD7).
+  const groups = NOTIFICATION_KINDS.map((k) => ({
+    ...k,
+    rows: visible.filter((n) => notificationKind(n) === k.id),
+  })).filter((g) => g.rows.length > 0);
   const grouped = groups.length > 1;
 
   const dismiss = (id: string) => {
@@ -183,8 +158,13 @@ export function Notifications() {
 
   // "Clear all" steps over anything the server marked undismissible. One click
   // that sweeps away a tamper finding is not a tamper alarm.
+  const clearable = items.filter((n) => n.dismissible !== false);
+  // Clear all asks once. A dismissal has no undo and no dismissed view, so one
+  // stray click emptied the list for good (D8).
+  const [confirmClear, setConfirmClear] = useState(false);
   const clearAll = () => {
-    dismissMany(items.filter((n) => n.dismissible !== false).map((n) => n.id));
+    dismissMany(clearable.map((n) => n.id));
+    setConfirmClear(false);
     setDismissTick((t) => t + 1);
   };
 
@@ -273,20 +253,40 @@ export function Notifications() {
                 counts — it is what the bell badge shows, and the two disagreeing
                 is the phantom-badge bug all over again. When a filter is on, say
                 how much of it is on screen instead of quietly restating it. */}
-            {filtered
-              ? `${visible.length} of ${items.length} shown`
-              : `${items.length} item${items.length === 1 ? '' : 's'}`}
-            : shadow hits, leads, hunts and investigations from the last 24 h
+            {filtered && `${visible.length} of ${items.length} shown. `}
+            {/* Names only the row types on the list, and the cap when the API
+                hit it (D3). */}
+            {describeNotifications(items, (data?.length ?? 0) >= NOTIFICATIONS_CAP)}
           </div>
         </div>
-        {items.length > 0 && (
+        {clearable.length > 0 && !confirmClear && (
           <button
-            onClick={clearAll}
+            onClick={() => setConfirmClear(true)}
             title="Dismiss every active notification. The filter does not limit this action."
             className="mt-1 flex-none rounded-control border border-border-strong bg-surface-3 px-3 py-1.5 text-[12px] font-semibold text-dim hover:border-accent hover:text-text"
           >
             Clear all
           </button>
+        )}
+        {clearable.length > 0 && confirmClear && (
+          <div role="group" aria-label="Confirm clear all" className="mt-1 flex flex-none items-center gap-2">
+            <span className="text-[12px] text-dim">
+              Dismiss {clearable.length} notification{clearable.length === 1 ? '' : 's'}? You cannot undo this.
+            </span>
+            <button
+              onClick={clearAll}
+              autoFocus
+              className="rounded-control border border-danger bg-surface-3 px-3 py-1.5 text-[12px] font-semibold text-danger hover:bg-[rgba(240,68,56,.08)]"
+            >
+              Dismiss all
+            </button>
+            <button
+              onClick={() => setConfirmClear(false)}
+              className="rounded-control border border-border-strong px-3 py-1.5 text-[12px] font-semibold text-dim hover:border-accent hover:text-text"
+            >
+              Cancel
+            </button>
+          </div>
         )}
       </div>
       {failCount >= 2 && <StaleNotice since={lastUpdated} onRefresh={refetch} className="mb-3" />}
@@ -316,7 +316,7 @@ export function Notifications() {
         {!loading && !error && items.length === 0 && (
           <div className="px-4 py-12 text-center text-[13px] text-faint">
             <Bell size={20} className="mx-auto mb-2 opacity-40" />
-            No active notifications.
+            {NO_NOTIFICATIONS}
           </div>
         )}
         {/* Filtered-to-nothing is a different fact from having nothing, and it

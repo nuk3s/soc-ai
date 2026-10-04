@@ -130,7 +130,7 @@ describe('Hunts page anatomy', () => {
     expect(within(stats).getByText('0')).toBeTruthy();
     expect(stats.textContent).toMatch(/1 hunt.*4 findings.*0 in progress/);
     // The card band's own sub-labels survive as hover context, not as layout.
-    expect(within(stats).getByTitle('threat findings')).toBeTruthy();
+    expect(within(stats).getByTitle('4 threat')).toBeTruthy();
   });
 
   it('keeps no composer on the page', async () => {

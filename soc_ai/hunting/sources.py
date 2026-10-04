@@ -19,6 +19,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from soc_ai.hunting.execute import Candidate
+from soc_ai.hunting.findings import detail_sentence
 from soc_ai.hunting.leads import (
     STATUS_OPEN,
     LeadOutcome,
@@ -124,6 +125,9 @@ async def observe_catalog_hits(
         # ``Candidate.hosts`` already excludes the scope key, so a host-scoped
         # candidate names only the other end.
         related = [["host", host] for host in candidate.hosts]
+        # The quoted fields ride in the summary, so the hit card and the lead
+        # name the threat, the change or the group without a click.
+        quoted = detail_sentence(candidate.details)
         await record_observation(
             db,
             entity_kind=entity_kind,
@@ -134,6 +138,7 @@ async def observe_catalog_hits(
             summary=(
                 f"{spec.title}: {candidate.scope_key} "
                 f"({candidate.doc_count} document{'' if candidate.doc_count == 1 else 's'})"
+                f"{'. ' + quoted if quoted else ''}"
             ),
             evidence={
                 "sample_ids": list(candidate.sample_ids),
@@ -142,6 +147,12 @@ async def observe_catalog_hits(
                 "first_seen": candidate.first_seen,
                 "last_seen": candidate.last_seen,
                 **({"related": related} if related else {}),
+                **(
+                    {"details": {label: list(values) for label, values in candidate.details}}
+                    if candidate.details
+                    else {}
+                ),
+                **({"level": candidate.level} if candidate.level else {}),
                 **(
                     {"receipts": receipts[candidate.scope_key]}
                     if receipts and candidate.scope_key in receipts

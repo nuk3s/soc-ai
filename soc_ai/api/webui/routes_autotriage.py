@@ -13,6 +13,7 @@ from fastapi import HTTPException, Request
 from pydantic import BaseModel, Field
 
 from soc_ai.api.security import identify_caller
+from soc_ai.api.webui._errors import oql_refusal
 from soc_ai.api.webui._shared import (
     router,
 )
@@ -236,9 +237,7 @@ async def start_auto_triage(request: Request, body: AutoTriageIn) -> AutoTriageS
         # the degraded mark here would leave the dashboard reporting an outage
         # over a typo, on a grid that is perfectly healthy.
         status.active = False
-        raise HTTPException(
-            status_code=400, detail={"reason": "bad_oql", "hint": str(exc)}
-        ) from exc
+        raise oql_refusal(exc) from exc
     except (TimeoutError, TransportError) as exc:
         # The budget above firing is NOT the same event as the grid raising a
         # timeout at us: the planner was cancelled mid-read and never got to stash

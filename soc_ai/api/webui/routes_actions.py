@@ -689,9 +689,14 @@ async def override_verdict(
 ) -> dict[str, Any]:
     """Manually override a completed investigation's verdict with analyst provenance."""
     if body.verdict not in _VALID_VERDICTS:
+        valid = sorted(_VALID_VERDICTS)
         raise HTTPException(
             status_code=400,
-            detail={"reason": "invalid_verdict", "valid": sorted(_VALID_VERDICTS)},
+            detail={
+                "reason": "invalid_verdict",
+                "valid": valid,
+                "hint": f"verdict accepts one of these values: {', '.join(valid)}.",
+            },
         )
     resolved_by = await identify_caller(request)
     async with request.app.state.db_sessionmaker() as db:

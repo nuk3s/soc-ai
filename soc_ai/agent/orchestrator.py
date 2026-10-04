@@ -52,7 +52,7 @@ import uuid
 from collections import Counter
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from datetime import datetime
-from typing import Any
+from typing import Any, cast
 
 from pydantic_ai import Agent, capture_run_messages
 from pydantic_ai.exceptions import UsageLimitExceeded
@@ -128,6 +128,7 @@ from soc_ai.agent.models import (
     build_model,
     build_synthesizer_model,
 )
+from soc_ai.agent.narrative_grounding import coverage_subject, ground_host_coverage_claims
 from soc_ai.agent.prompts import (
     BUDGET_PARTIAL_SYNTH_PROMPT,
     HUNT_SUBJECT_RULES,
@@ -139,6 +140,7 @@ from soc_ai.agent.prompts import (
     build_investigator_prompt,
     case_conditions,
     format_endpoint_coverage_block,
+    format_host_coverage_block,
     rule_body_in_alert,
 )
 from soc_ai.agent.reasoning import extract_reasoning_trace
@@ -552,7 +554,7 @@ def build_agent(  # pragma: no cover - thin alias
 
 _GATEWAY_BACKEND_HINT = (
     "the LLM gateway could not reach its model backend (the engine behind the "
-    "LiteLLM route is down, restarting, or returning 5xx) — this is NOT an "
+    "LiteLLM route is down, restarting, or returning 5xx). This is NOT an "
     "Elasticsearch problem. Verify the serving engine is up and the route's "
     "api_base points at it, then retry."
 )
@@ -643,15 +645,15 @@ def _hint_for(exc: BaseException, *, phase: str | None = None) -> str | None:
             "the model repeatedly produced output that failed TriageReport "
             "schema validation until the retry budget ran out. The per-attempt "
             "validation errors are recorded as retry_causes on this run's error "
-            "event and resolution — read those: persistent schema failures "
-            "usually mean the analyst model or its gateway route changed shape "
-            "(reasoning/tool-call format), not a transient fault."
+            "event and resolution. Read those. A persistent schema failure "
+            "usually means the analyst model or its gateway route changed shape "
+            "(reasoning/tool-call format). It is rarely a transient fault."
         )
     if "token limit" in msg and "before any response" in msg:
         return (
             "the model hit its response-token cap while still reasoning, so no "
             "structured output was produced. Reasoning models can burn the whole "
-            "budget thinking — raise synthesizer_max_response_tokens (config "
+            "budget thinking. Raise synthesizer_max_response_tokens (config "
             "console → Agent) or switch to a less verbose analyst model."
         )
     if "contextwindowexceeded" in msg or "context length" in msg:
@@ -666,9 +668,9 @@ def _hint_for(exc: BaseException, *, phase: str | None = None) -> str | None:
     # which accounted for 8 of 15 recorded prod error events (2026-08-03).
     if "partial search results" in msg:
         return (
-            "the grid answered but did not read all of it — failed or unassigned "
-            "shards, or a search that gave up mid-flight. The results would have "
-            "been incomplete, so the run stopped rather than reason from a partial "
+            "the grid answered but did not read all of it. Shards failed or were "
+            "unassigned, or a search gave up mid-flight. The results would have "
+            "been incomplete, so the run stopped. It does not reason from a partial "
             "view of the network. Check Elasticsearch shard health and retry."
         )
     if "timed out" in msg or "timeout" in msg:
@@ -1763,6 +1765,16 @@ async def _resolve_oracle_identifiers(
     if effective is None:
         return None
     return effective.suffixes, effective.hosts
+
+
+def _ground_host_claims(report: TriageReport, enriched: Any) -> tuple[TriageReport, int]:
+    """Rewrite the report's "no host telemetry" claims from the prefetch coverage."""
+    subjects = [
+        coverage_subject(entry.ip, entry.coverage)
+        for entry in (getattr(enriched, "host_coverage", None) or [])
+    ]
+    grounded, rewritten = ground_host_coverage_claims(report, subjects)
+    return cast("TriageReport", grounded), rewritten
 
 
 def _strip_model_resolution(report: TriageReport) -> TriageReport:
@@ -2993,6 +3005,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             )
             + await inventory_prompt_block(ctx.elastic, ctx.settings)
             + format_endpoint_coverage_block(enriched.prefetch_gaps.get(ENDPOINT_COVERAGE_GAP_KEY))
+            + format_host_coverage_block(enriched.host_coverage, enriched.host_pivot_note)
             + dossier_block
         )
         # The investigator chooses what to retrieve, so it is the one place the
@@ -3832,6 +3845,18 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         await _audit(ev)
         yield ev
 
+    # ----- Host coverage grounding -----
+    # A sentence that says a host has no host telemetry is false while the
+    # prefetch read any plane for that host. Production stored twelve of them
+    # about one host that shipped host logs and osquery. Each such sentence is
+    # replaced by the coverage facts. Runs before the Oracle snapshot, so the
+    # local report the Oracle compares with is the grounded one.
+    triage_final, host_claims = _ground_host_claims(triage_final, enriched)
+    if host_claims:
+        ev = _ev("host_coverage_grounding", {"sentences_rewritten": host_claims})
+        await _audit(ev)
+        yield ev
+
     # ----- Oracle escalation (optional, explicit opt-in) -----
     # After all post-validators, escalate to the frontier Oracle when the local
     # triage needs it (uncertain, malware non-TP, or below-floor confidence).
@@ -4036,6 +4061,19 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             await _audit(fail_ev)
             yield fail_ev
 
+    # The Oracle writes its own prose, and the same rule holds for it. Only
+    # an Oracle report is grounded here: the local one already was, and a
+    # copy of it would break the identity checks below.
+    if triage_final is not local_triage_final:
+        triage_final, oracle_host_claims = _ground_host_claims(triage_final, enriched)
+        if oracle_host_claims:
+            ev = _ev(
+                "host_coverage_grounding",
+                {"sentences_rewritten": oracle_host_claims, "report": "oracle"},
+            )
+            await _audit(ev)
+            yield ev
+
     # ----- Same-session consistency (last word on the verdict) -----
     # After the Oracle, not before: an adjudicated false positive on a session a
     # completed run already called malicious is the same contradiction as a
@@ -4130,7 +4168,12 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
     if auto_ack_ev is not None:
         yield auto_ack_ev
 
-    yield _ev("done", {"recommended_count": len(triage_final.recommended_actions)})
+    # Through _audit like every other event: _audit is what feeds the /metrics
+    # counters, and socai_investigations_total counts "done". Yielded bare, the
+    # counter stayed at 0 on every completed run (dogfood 2026-10-01 RA2).
+    done_ev = _ev("done", {"recommended_count": len(triage_final.recommended_actions)})
+    await _audit(done_ev)
+    yield done_ev
 
 
 __all__ = [
