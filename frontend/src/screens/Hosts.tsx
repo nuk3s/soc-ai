@@ -49,6 +49,7 @@ import {
   FIRST_DIR,
   HOSTS_PAGE_SIZE,
   MACHINE_SORT_KEYS,
+  agentStaleTitle,
   listHref,
   machineHref,
   machineQuery,
@@ -60,6 +61,7 @@ import {
   scrollParent,
   type HostsListState,
   type HostsLocationState,
+  type ListSweep,
 } from '../lib/hostsList';
 import { plural } from '../lib/plural';
 import { SHOWN_ERRORS, sweepErrorList } from '../lib/sweepErrors';
@@ -504,14 +506,28 @@ function RoleCell({ row }: { row: MachineRow }) {
     );
   }
   if (view.state === 'low_confidence' || view.state === 'stale') {
+    // The guess sits whole in the chip and the state words follow it, as the
+    // "inferred" note follows an answer. One chip cut "low confidence:
+    // security appliance" to "security applianc" in the Role column. The
+    // pair wraps to a second line when the cell is narrow.
     return (
       <span
         data-testid={`role-${view.state === 'stale' ? 'stale' : 'low-confidence'}`}
         title={view.title}
-        className="inline-flex max-w-full items-center gap-1.5 truncate rounded-chip border border-warn/40 bg-warn/[0.08] px-1.5 py-px text-[12px] font-medium text-warn"
+        className="inline-flex max-w-full flex-wrap items-baseline gap-x-1.5"
       >
-        <span className="h-1.5 w-1.5 flex-none rounded-full bg-warn" />
-        {view.text}
+        <span
+          data-testid="role-guess"
+          className="inline-flex max-w-full items-center gap-1.5 whitespace-normal break-words rounded-chip border border-warn/40 bg-warn/[0.08] px-1.5 py-px text-[12px] font-medium text-warn"
+        >
+          <span className="h-1.5 w-1.5 flex-none rounded-full bg-warn" />
+          {view.guess ?? view.qualifier ?? view.text}
+        </span>
+        {view.guess && (
+          <span data-testid="role-qualifier" className="text-[10.5px] text-warn">
+            {view.qualifier}
+          </span>
+        )}
       </span>
     );
   }
@@ -559,6 +575,7 @@ function MachineTableRow({
   onToggle,
   onOpen,
   linkState,
+  sweep,
 }: {
   row: MachineRow;
   selectable: boolean;
@@ -566,10 +583,13 @@ function MachineTableRow({
   onToggle: () => void;
   onOpen: () => void;
   linkState: HostsLocationState;
+  /** The sweep the row comes from, for the stale marker. */
+  sweep: ListSweep;
 }) {
   const navigate = useNavigate();
   const href = machineHref(row.key);
   const source = nameSourceLabel(row.name_source);
+  const staleTitle = row.agent ? agentStaleTitle(row.agent.last_report, sweep) : null;
   return (
     <tr
       data-testid={`machine-row-${row.key}`}
@@ -634,7 +654,20 @@ function MachineTableRow({
                 : 'The agent has no report time on record.'
             }
           >
-            <div className="truncate font-mono text-[12px] text-text-2">{row.agent.name}</div>
+            <div className="flex min-w-0 items-center gap-1">
+              <span className="truncate font-mono text-[12px] text-text-2">{row.agent.name}</span>
+              {staleTitle && (
+                <span
+                  data-testid={`agent-stale-${row.key}`}
+                  className="flex-none rounded-chip border px-1 py-px text-[9.5px] font-semibold text-warn"
+                  style={{ borderColor: 'rgba(210,153,34,.45)' }}
+                  title={staleTitle}
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  stale
+                </span>
+              )}
+            </div>
             {row.agent.os && <div className="truncate text-[10.5px] text-faint">{row.agent.os}</div>}
           </div>
         ) : (
@@ -920,6 +953,11 @@ export function Hosts() {
   // first-run screen), whether sweeps run on a schedule, and the role
   // vocabulary a bulk declare may write.
   const census = useAsync(() => getDossierSummary(), []);
+  // What a row's stale marker says about the sweep the row comes from.
+  const listSweep: ListSweep = {
+    scheduleEnabled: census.data ? census.data.schedule_enabled : null,
+    staleHours: kpis.data?.stale_hours ?? null,
+  };
 
   // The disagreement queue. Its own request because `pending` counts the whole
   // queue, not this page.
@@ -1344,6 +1382,7 @@ export function Hosts() {
               },
               placeholder: 'Search name, address, MAC, OS, role, agent…',
               label: 'Search hosts',
+              fitPlaceholder: true,
             }}
             note={bulkNote}
             selection={
@@ -1803,6 +1842,7 @@ export function Hosts() {
                       onToggle={() => sel.toggle(row.primary_ip)}
                       onOpen={saveScroll}
                       linkState={linkState}
+                      sweep={listSweep}
                     />
                   ))
                 )}

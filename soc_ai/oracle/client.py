@@ -50,14 +50,16 @@ import logging
 import random
 import re
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, cast
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from soc_ai import metrics
 from soc_ai.config import Settings
 from soc_ai.demo.guard import assert_egress_allowed
+from soc_ai.oracle import breaker as route_breaker
+from soc_ai.oracle import failures
 from soc_ai.oracle.backstop import mask_unclassified_scalars
 from soc_ai.oracle.redact import (
     _DOMAIN_FIELDS,
@@ -157,7 +159,13 @@ ORACLE_SYSTEM_PROMPT = (
     '"verdict" (one of "true_positive", "false_positive", "needs_more_info"), '
     '"confidence" (float 0.0-1.0), '
     '"summary" (3-6 sentence plain-English narrative for the on-call analyst), '
-    '"reasoning" (brief internal reasoning justifying the verdict).'
+    '"reasoning" (brief internal reasoning justifying the verdict), '
+    '"citations" (a list of the evidence ids in the case that support the verdict: '
+    "the id of a prefetched event, or a document id or a hash inside "
+    "loop_tool_results; copy each id exactly as it appears). "
+    "A verdict that CHANGES the local verdict counts only when at least one of its "
+    "citations names evidence in the case beyond the alert itself. Without one, it is "
+    "kept as an opinion and the local verdict stands."
 )
 
 
@@ -182,6 +190,21 @@ class OracleVerdict(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
     summary: str
     reasoning: str
+    # The evidence ids the Oracle names (design 2026-10-04, "No override
+    # without evidence"). Optional: an answer without the key still parses, and
+    # its verdict can then only agree with the local one or be an opinion.
+    citations: list[str] = Field(default_factory=list)
+
+    @field_validator("citations", mode="before")
+    @classmethod
+    def _coerce_citations(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [value] if value.strip() else []
+        if isinstance(value, list):
+            return [str(v) for v in value if isinstance(v, (str, int)) and str(v).strip()][:50]
+        return []
 
 
 @dataclass
@@ -219,6 +242,22 @@ class OracleResult:
     (design §"The wire gate is a blocklist"). Zero on the single-shot path.
     Surfaced on the ``oracle_adjudication`` event so the owner can measure the
     utility cost the backstop pays for a complete-by-construction boundary."""
+
+    oracle_citations: list[str] = field(default_factory=list)
+    """The Oracle's citations that resolve to evidence: an id the local run
+    retrieved, or, on the tool path, an id in the Oracle's own tool results.
+    Read by the override gate on both paths."""
+
+    oracle_citations_cited: int = 0
+    """How many citations the Oracle named, resolved or not."""
+
+    raw_oracle_confidence: float | None = None
+    """The confidence the Oracle gave, before the override gate. On a withheld
+    flip ``report`` keeps the local confidence; this keeps the opinion's."""
+
+    raw_oracle_summary: str = ""
+    """The Oracle's own summary, desanitized. Kept for the opinion record when
+    the override is withheld."""
 
 
 # ---------------------------------------------------------------------------
@@ -310,8 +349,7 @@ def _verdict_to_report(
     verdict: OracleVerdict,
     *,
     local_report: TriageReport,
-    oracle_tool_calls: int = 0,
-    gate_active: bool = False,
+    backed: bool = False,
 ) -> TriageReport:
     """Map a minimal ``OracleVerdict`` → full ``TriageReport``.
 
@@ -334,24 +372,27 @@ def _verdict_to_report(
     The reasoning text is appended to the summary so it is visible in the
     analyst-facing output.
 
-    **The override gate (design §6, DECIDED 2026-08-27).** When ``gate_active``
-    (the tool-running Oracle), a verdict that CHANGES the local class must be
-    backed by ≥1 successful tool call in the Oracle's own loop
-    (``oracle_tool_calls``). An unbacked flip does NOT override — this returns
-    the LOCAL report VERBATIM (its class, confidence, actions, citations, summary).
-    The Oracle's dissent is on the record via the ``oracle_adjudication`` event
+    **The override gate (design §6, DECIDED 2026-08-27; both paths since
+    2026-10-04).** A verdict that CHANGES the local class must be ``backed``:
+    the Oracle cited evidence that resolves (an id the local run retrieved, or
+    an id in its own tool results), or its own loop made a successful tool
+    call. An unbacked flip does NOT override — this returns the LOCAL report
+    VERBATIM (its class, confidence, actions, citations, summary). The
+    Oracle's dissent is on the record via the ``oracle_adjudication`` event
     (``raw_oracle_verdict`` + ``override_withheld``), not the summary — the
-    orchestrator keeps the local report on a withheld override, so a summary edit
-    here would be discarded. A zero-tool AGREEMENT still lands (adds confidence).
-    ``gate_active`` is False on the single-shot path, so that shipped behaviour —
-    where a flip lands with no tools — is unchanged.
+    orchestrator keeps the local report on a withheld override, so a summary
+    edit here would be discarded. An AGREEMENT still lands (adds confidence).
+
+    The single-shot path used to land a flip with no evidence at all. On
+    production 6 of 23 answers changed the class, NMI to FP, with no tool call
+    and no citation, and 2 of them were then auto-acknowledged.
     """
     combined_summary = verdict.summary
     if verdict.reasoning and verdict.reasoning.strip():
         combined_summary = f"{verdict.summary}\n\nOracle reasoning: {verdict.reasoning}"
     same_verdict = verdict.verdict == local_report.verdict
 
-    if gate_active and not same_verdict and oracle_tool_calls < 1:
+    if not same_verdict and not backed:
         # Withhold the override: the local verdict stands, UNCHANGED. The dissent
         # is recorded on the ``oracle_adjudication`` event (``raw_oracle_verdict``
         # + ``override_withheld``), NOT spliced into the summary — the orchestrator
@@ -397,11 +438,33 @@ class _OracleGatewayError(RuntimeError):
     5xx (server/gateway transient) and transport/timeout errors are retryable;
     4xx (auth / bad request) are terminal — retrying a 401/400 only wastes the
     budget and delays the inevitable, so the loop fails fast on those.
+
+    ``status`` is the HTTP status (0 when no answer came back), ``error_class``
+    the :mod:`soc_ai.oracle.failures` class, ``gateway_text`` the gateway's own
+    message (unscrubbed; the caller scrubs it before it is stored) and
+    ``retry_after`` the ``Retry-After`` header when the gateway sent one.
     """
 
-    def __init__(self, message: str, *, retryable: bool) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool,
+        status: int = 0,
+        error_class: str = failures.SERVER,
+        gateway_text: str = "",
+        retry_after: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.retryable = retryable
+        self.status = status
+        self.error_class = error_class
+        self.gateway_text = gateway_text
+        self.retry_after = retry_after
+
+
+class _OracleAnswerError(RuntimeError):
+    """The gateway answered 200 with a body that is not a chat completion."""
 
 
 async def _call_oracle_raw(
@@ -442,21 +505,38 @@ async def _call_oracle_raw(
         try:
             resp = await client.post(base_url, headers=headers, json=request_body)
         except httpx.TransportError as exc:  # connect / read / timeout — transient
-            raise _OracleGatewayError(f"transport error: {exc}", retryable=True) from exc
+            timed_out = isinstance(exc, httpx.TimeoutException)
+            raise _OracleGatewayError(
+                f"transport error: {exc}",
+                retryable=True,
+                error_class=failures.TIMEOUT if timed_out else failures.TRANSPORT,
+                gateway_text=f"{type(exc).__name__}: {exc}",
+            ) from exc
         try:
             resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code if exc.response is not None else 0
-            body = exc.response.text[:500] if exc.response is not None else ""
+            body = exc.response.text[:2000] if exc.response is not None else ""
+            text = failures.gateway_message(body)
+            resp_headers = getattr(exc.response, "headers", None)
+            retry_after = resp_headers.get("retry-after") if resp_headers is not None else None
             # 5xx = gateway/server transient → retry; 4xx = client error → terminal.
             raise _OracleGatewayError(
-                f"LiteLLM returned {status}: {body}", retryable=status >= 500
+                f"LiteLLM returned {status}: {body[:500]}",
+                retryable=status >= 500,
+                status=status,
+                error_class=failures.classify_http_failure(status, text),
+                gateway_text=text,
+                retry_after=retry_after,
             ) from exc
-        data = resp.json()
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise _OracleAnswerError("LiteLLM answered 200 with a body that is not JSON") from exc
 
-    choices = data.get("choices") or []
+    choices = data.get("choices") if isinstance(data, dict) else None
     if not choices:
-        raise RuntimeError("LiteLLM response had no choices")
+        raise _OracleAnswerError("LiteLLM answered 200 with no choices")
     msg = choices[0].get("message") or {}
     content = msg.get("content")
     if isinstance(content, str):
@@ -720,8 +800,9 @@ ORACLE_TOOL_SYSTEM_PROMPT = ORACLE_SYSTEM_PROMPT + (
     "and check host context, prevalence, rule noisiness and IOC enrichment. "
     "Use them to CHECK a claim you doubt rather than distrusting it in the "
     "abstract. A verdict that CHANGES the local one only counts when you back it "
-    "with at least one successful tool call — an unbacked disagreement is "
-    "discarded and the local verdict stands. Refer to identifiers ONLY by the "
+    "with at least one successful tool call or a citation of an evidence id. An "
+    "unbacked disagreement is kept as an opinion and the local verdict stands. "
+    "Refer to identifiers ONLY by the "
     "opaque labels already present in the evidence (IP_01, HOST_02, USER_03, …); "
     "never invent a label that is not there. When you have gathered enough, stop "
     "calling tools and emit the final JSON verdict object described above as your "
@@ -744,6 +825,24 @@ class OracleResidueError(RuntimeError):
     def __init__(self, categories: list[str]) -> None:
         self.categories = categories
         super().__init__(f"residue detected in an outbound oracle body: {categories}")
+
+
+def refusal_reasons(leaks: list[str], mapping: Mapping) -> list[str]:
+    """The refusal reasons of a residue sweep, with no identifier in them.
+
+    Each reason is the leak category. A residual learned value also names
+    where it was learned when a free-text rule learned it (``Mapping.sources``):
+    ``residual learned value, learned by the UNC rule in
+    alert_summary.payload_printable``. The value itself never appears.
+    """
+    reasons: set[str] = set()
+    for leak in leaks:
+        category, _, value = leak.partition(":")
+        category = category.strip()
+        learned = category == "residual learned value"
+        source = mapping.sources.get(value.strip()) if learned else None
+        reasons.add(f"{category}, learned by {source}" if source else category)
+    return sorted(reasons)
 
 
 def _make_residue_hook(
@@ -779,16 +878,16 @@ def _make_residue_hook(
             extra_hosts=extra_hosts,
             extra_suffixes=extra_suffixes,
             # Exclude the short DOMAIN_LIKE values the sanitizer intentionally
-            # left un-propagated (they would corrupt public FQDNs) — same
-            # exclusion the single-shot gate applies.
-            known_values=tuple(v for v in mapping.reverse.values() if v not in no_propagate),
+            # left un-propagated (they would corrupt public FQDNs) and the host
+            # names a text rule labelled in place only — same exclusion the
+            # single-shot gate applies.
+            known_values=tuple(v for v in mapping.learned_values() if v not in no_propagate),
             # Wire form: json.dumps doubles every real backslash, so a lone one is
             # a JSON escape, not a NetBIOS separator.
             wire_escaped=True,
         )
         if leaks:
-            categories = sorted({leak.split(":")[0].strip() for leak in leaks})
-            raise OracleResidueError(categories)
+            raise OracleResidueError(refusal_reasons(leaks, mapping))
 
     return _hook
 
@@ -1198,7 +1297,7 @@ async def _adjudicate_with_tools(  # noqa: PLR0915 - one linear egress-gated pip
     evidence_bullets: list[str] | None,
     extra_hosts: tuple[str, ...] | None,
     extra_suffixes: tuple[str, ...] | None,
-    failure_out: dict[str, str] | None,
+    failure_out: dict[str, Any] | None,
     http_transport: Any,
 ) -> OracleResult | None:
     """The tool-running Oracle: sanitize → bounded read-only loop → verdict.
@@ -1210,9 +1309,12 @@ async def _adjudicate_with_tools(  # noqa: PLR0915 - one linear egress-gated pip
     """
     settings = ctx.settings
 
-    def _fail(reason: str) -> None:
-        if failure_out is not None:
-            failure_out["reason"] = reason
+    def _fail(
+        reason: str, error_class: str = "", *, status: int | None = None, text: str = ""
+    ) -> None:
+        _record_failure(
+            failure_out, settings, reason=reason, error_class=error_class, status=status, text=text
+        )
 
     # 1. Assemble + sanitize the initial payload under the shared mapping.
     case_dict = _assemble_case_dict(
@@ -1271,7 +1373,7 @@ async def _adjudicate_with_tools(  # noqa: PLR0915 - one linear egress-gated pip
             "oracle.client: payload serialization failed (non-JSON type): %s",
             type(exc).__name__,
         )
-        _fail("payload_serialization")
+        _fail("payload_serialization", failures.SERIALIZATION)
         return None
 
     # Demo mode blocks the oracle egress outright — a tool-running Oracle gets no
@@ -1280,7 +1382,7 @@ async def _adjudicate_with_tools(  # noqa: PLR0915 - one linear egress-gated pip
         assert_egress_allowed(settings, "oracle")
     except Exception:
         _LOGGER.info("oracle.client: egress not allowed for the tool loop; local verdict retained")
-        _fail("egress_blocked")
+        _fail("egress_blocked", failures.BLOCKED)
         return None
 
     # 2. The single wire-level residue choke point (the shared guard is built
@@ -1334,6 +1436,7 @@ async def _adjudicate_with_tools(  # noqa: PLR0915 - one linear egress-gated pip
                 )
             raw_text = run.output
             result_messages = run.all_messages()
+            route_breaker.BREAKER.record_answer(route_breaker.route_key(settings))
         except asyncio.CancelledError:
             raise
         except BaseException as exc:
@@ -1347,14 +1450,31 @@ async def _adjudicate_with_tools(  # noqa: PLR0915 - one linear egress-gated pip
                     categories,
                 )
                 await metrics.get_metrics().record_oracle_refusal()
-                _fail("residue_refusal")
+                _fail(
+                    "residue_refusal",
+                    failures.REFUSED,
+                    text=f"residue: {', '.join(categories)}",
+                )
                 return None
             _LOGGER.warning(
                 "oracle.client: tool loop failed (%s: %s); local verdict retained",
                 type(exc).__name__,
                 exc,
             )
-            _fail("tool_loop_error")
+            status, error_class, text = _tool_loop_failure(exc)
+            _fail(
+                "gateway_error" if status else "tool_loop_error",
+                error_class,
+                status=status or None,
+                text=text,
+            )
+            _breaker_failure(
+                failure_out,
+                settings,
+                route_breaker.route_key(settings),
+                error_class=error_class,
+                text=text,
+            )
             return None
     finally:
         try:
@@ -1365,7 +1485,12 @@ async def _adjudicate_with_tools(  # noqa: PLR0915 - one linear egress-gated pip
     raw_verdict = _parse_oracle_verdict(raw_text) if raw_text is not None else None
     if raw_verdict is None:
         _LOGGER.warning("oracle.client: tool loop produced no parseable verdict; local retained")
-        _fail("no_parseable_verdict")
+        _fail(
+            "no_parseable_verdict",
+            failures.UNPARSEABLE,
+            status=200,
+            text=_unparseable_note(raw_text or ""),
+        )
         return None
 
     # 4. Count the loop's successful (evidence-bearing) tool calls — the override
@@ -1379,16 +1504,24 @@ async def _adjudicate_with_tools(  # noqa: PLR0915 - one linear egress-gated pip
         summary=rehydrated_summary,
         reasoning=rehydrated_reasoning,
     )
+    # Citations resolve against the local run's retrieved evidence and the
+    # Oracle's own tool results.
+    resolved_citations = _resolve_oracle_citations(
+        raw_verdict.citations,
+        mapping=mapping,
+        enriched=enriched,
+        messages=[*(loop_messages or []), *result_messages],
+    )
 
     # 5. Override gate at the _verdict_to_report seam (design §6): an unbacked
-    # class-changing verdict does NOT override; a zero-tool agreement still lands.
+    # class-changing verdict does NOT override; an agreement still lands.
     same_verdict = desanitized_verdict.verdict == local_report.verdict
-    override_withheld = (not same_verdict) and successful_tool_calls < 1
+    backed = successful_tool_calls >= 1 or bool(resolved_citations)
+    override_withheld = (not same_verdict) and not backed
     desanitized_report = _verdict_to_report(
         desanitized_verdict,
         local_report=local_report,
-        oracle_tool_calls=successful_tool_calls,
-        gate_active=True,
+        backed=backed,
     )
 
     if guard.masked_count:
@@ -1406,7 +1539,163 @@ async def _adjudicate_with_tools(  # noqa: PLR0915 - one linear egress-gated pip
         override_withheld=override_withheld,
         raw_oracle_verdict=desanitized_verdict.verdict,
         oracle_masked_values=guard.masked_count,
+        oracle_citations=resolved_citations,
+        oracle_citations_cited=len(raw_verdict.citations),
+        raw_oracle_confidence=desanitized_verdict.confidence,
+        raw_oracle_summary=rehydrated_summary,
     )
+
+
+class _AlertOnly:
+    """The alert of an enriched context, with no pivot and no tool result."""
+
+    def __init__(self, alert: Any) -> None:
+        self.alert = alert
+
+    def model_dump(self, mode: str = "json") -> dict[str, Any]:
+        dump = self.alert.model_dump(mode=mode) if hasattr(self.alert, "model_dump") else {}
+        return {"alert": dump}
+
+
+def _alert_only_tokens(enriched: Any) -> frozenset[str]:
+    """The evidence tokens the alert document alone carries."""
+    from soc_ai.agent.gates import _retrieved_evidence_tokens  # noqa: PLC0415 - cycle
+
+    alert = getattr(enriched, "alert", None)
+    if alert is None:
+        return frozenset()
+    return _retrieved_evidence_tokens(_AlertOnly(alert), None)
+
+
+def _resolve_oracle_citations(
+    citations: list[str],
+    *,
+    mapping: Mapping,
+    enriched: Any,
+    messages: list[Any] | None,
+) -> list[str]:
+    """The Oracle's citations that name evidence the case holds, desanitized.
+
+    A citation resolves only by MEMBERSHIP in the ids and typed evidence values
+    the run retrieved (:func:`soc_ai.agent.gates._retrieved_evidence_tokens`):
+    a prefetched event's id or typed value, an evidence-key leaf inside a real
+    tool return. Never by a substring of dumped text, which an attacker can seed
+    through any plantable field. A label the Oracle echoes (``HOST_01``) is
+    desanitized first. A citation like ``event abc123`` resolves on its id.
+
+    The alert's own id and its own evidence-key leaves do NOT count. Every
+    case holds them, so a flip that cites only the alert rests on the alert
+    alone: the zero-evidence flip this gate exists to stop.
+    """
+    if not citations:
+        return []
+    from soc_ai.agent.gates import _retrieved_evidence_tokens  # noqa: PLC0415 - cycle
+
+    tokens = _retrieved_evidence_tokens(enriched, messages) - _alert_only_tokens(enriched)
+    if not tokens:
+        return []
+    resolved: list[str] = []
+    for cited in citations:
+        real = str(desanitize(cited, mapping)).strip()
+        parts = [real, *re.split(r"[\s=:,;()\[\]{}\"'<>|]+", real)]
+        hit = next((p for p in parts if len(p) >= 4 and p.lower() in tokens), None)
+        if hit is not None and hit not in resolved:
+            resolved.append(hit)
+    return resolved
+
+
+def _record_failure(
+    failure_out: dict[str, Any] | None,
+    settings: Settings,
+    *,
+    reason: str,
+    error_class: str = "",
+    status: int | None = None,
+    text: str = "",
+) -> None:
+    """Write one failure into the caller's ``failure_out`` channel.
+
+    ``reason`` keeps its old values. ``error_class``, ``http_status`` and
+    ``message`` are the truth of the failure (:mod:`soc_ai.oracle.failures`).
+    The message is secret-scrubbed: the configured gateway key and every
+    credential-shaped value are masked before it reaches the store.
+    """
+    if failure_out is None:
+        return
+    failure_out["reason"] = reason
+    if error_class:
+        failure_out["error_class"] = error_class
+    if status is not None:
+        failure_out["http_status"] = status
+    if text:
+        failure_out["message"] = failures.scrub_message(text, secrets=(_gateway_key(settings),))
+
+
+def _gateway_key(settings: Settings) -> str:
+    return settings.litellm_api_key.get_secret_value() if settings.litellm_api_key else ""
+
+
+def _breaker_failure(
+    failure_out: dict[str, Any] | None,
+    settings: Settings,
+    route: str,
+    *,
+    error_class: str,
+    text: str,
+    retry_after: str | None = None,
+) -> bool:
+    """Feed one failed call to the route breaker. True when the route is now paused.
+
+    The breaker stores the scrubbed message and reads the reset time from the
+    raw one. When this failure opened the pause, ``failure_out`` carries
+    ``breaker_opened`` so the orchestrator notifies once.
+    """
+    opened = route_breaker.BREAKER.record_failure(
+        route,
+        error_class=error_class,
+        message=failures.scrub_message(text, secrets=(_gateway_key(settings),)),
+        reset_text=text,
+        retry_after=retry_after,
+    )
+    until = route_breaker.BREAKER.open_until(route)
+    if until is None:
+        return False
+    if failure_out is not None:
+        failure_out["paused_until"] = route_breaker.iso(until)
+        if opened:
+            failure_out["breaker_opened"] = True
+    return True
+
+
+def _unparseable_note(raw_text: str) -> str:
+    """The message for a 200 answer that held no verdict: its first words."""
+    head = " ".join(_strip_think(raw_text).split())[:120]
+    if not head:
+        return "The answer was empty."
+    return f"The answer held no JSON verdict. It began: {head}"
+
+
+def _tool_loop_failure(exc: BaseException) -> tuple[int, str, str]:
+    """HTTP status, error class and message of a tool-loop exception.
+
+    pydantic-ai raises ``ModelHTTPError`` with ``status_code`` and ``body``
+    for a gateway answer above 400. A timeout of the loop or of one call is
+    ``timeout``. Anything else is a ``tool_loop`` failure with status 0.
+    """
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and status >= 400:
+        body = getattr(exc, "body", None)
+        raw = json.dumps(body) if isinstance(body, (dict, list)) else str(body or exc)
+        text = failures.gateway_message(raw)
+        return status, failures.classify_http_failure(status, text), text
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        if isinstance(cur, TimeoutError) or type(cur).__name__.endswith("TimeoutException"):
+            return 0, failures.TIMEOUT, f"{type(cur).__name__}: {cur}"
+        seen.add(id(cur))
+        cur = cur.__cause__ or cur.__context__
+    return 0, "tool_loop", f"{type(exc).__name__}: {exc}"
 
 
 def _residue_categories(exc: BaseException) -> list[str]:
@@ -1431,7 +1720,7 @@ async def adjudicate(  # noqa: PLR0915 - one linear pipeline; splitting hides th
     evidence_bullets: list[str] | None = None,
     extra_hosts: tuple[str, ...] | None = None,
     extra_suffixes: tuple[str, ...] | None = None,
-    failure_out: dict[str, str] | None = None,
+    failure_out: dict[str, Any] | None = None,
     _http_transport: Any = None,
 ) -> OracleResult | None:
     """Send a sanitized case to the frontier Oracle for adjudication.
@@ -1478,7 +1767,11 @@ async def adjudicate(  # noqa: PLR0915 - one linear pipeline; splitting hides th
             ``gateway_error``, or ``no_parseable_verdict``. The orchestrator
             surfaces it in the ``oracle_adjudication_failed`` event so a
             failed second opinion is distinguishable from one that never
-            happened.
+            happened. ``error_class``, ``http_status`` and ``message`` say
+            what failed (:mod:`soc_ai.oracle.failures`).
+            ``no_parseable_verdict`` means the last attempt got a 200 whose
+            body held no verdict. A gateway answer that failed every attempt
+            is ``gateway_error`` with its status and its message.
 
     Returns:
         An :class:`OracleResult` on success; ``None`` on refusal (residue
@@ -1486,6 +1779,24 @@ async def adjudicate(  # noqa: PLR0915 - one linear pipeline; splitting hides th
         The caller MUST keep the local verdict when ``None`` is returned.
     """
     settings: Settings = ctx.settings
+
+    # The route pause (soc_ai.oracle.breaker). A route that answered with a
+    # usage limit gets no call until its reset time. The orchestrator checks
+    # first and records oracle_skipped; this check covers a pause that opened
+    # while this escalation was on its way.
+    route = route_breaker.route_key(settings)
+    paused_until = route_breaker.BREAKER.open_until(route)
+    if paused_until is not None:
+        _record_failure(
+            failure_out,
+            settings,
+            reason="oracle_paused",
+            error_class=failures.PAUSED,
+            text=route_breaker.BREAKER.state(route).message,
+        )
+        if failure_out is not None:
+            failure_out["paused_until"] = route_breaker.iso(paused_until)
+        return None
 
     # Tool-loop opt-in (design 2026-08-27): an adjudicator that doubts a claim
     # runs the read-only oracle tool surface between sanitize and verdict. Off by
@@ -1505,9 +1816,12 @@ async def adjudicate(  # noqa: PLR0915 - one linear pipeline; splitting hides th
             http_transport=_http_transport,
         )
 
-    def _fail(reason: str) -> None:
-        if failure_out is not None:
-            failure_out["reason"] = reason
+    def _fail(
+        reason: str, error_class: str = "", *, status: int | None = None, text: str = ""
+    ) -> None:
+        _record_failure(
+            failure_out, settings, reason=reason, error_class=error_class, status=status, text=text
+        )
 
     # 1. Assemble the raw case dict — INCLUDING the loop's tool results and
     # evidence bullets, so everything below (sanitize_case + the independent
@@ -1584,7 +1898,7 @@ async def adjudicate(  # noqa: PLR0915 - one linear pipeline; splitting hides th
             "oracle.client: payload serialization failed (non-JSON type in case dict): %s",
             type(exc).__name__,
         )
-        _fail("payload_serialization")
+        _fail("payload_serialization", failures.SERIALIZATION)
         return None
 
     # 4. GUARDRAIL — independent residue sweep on the actual outbound bytes.
@@ -1597,16 +1911,18 @@ async def adjudicate(  # noqa: PLR0915 - one linear pipeline; splitting hides th
         extra_hosts=resolved_hosts,
         extra_suffixes=resolved_suffixes,
         # Exclude the no_propagate values (short DOMAIN_LIKE labels the sanitizer
-        # intentionally left un-propagated to protect public FQDNs) — see above.
-        known_values=tuple(v for v in mapping.reverse.values() if v not in no_propagate),
+        # intentionally left un-propagated to protect public FQDNs) — see above —
+        # and the host names a text rule labelled in place only (Mapping.in_place_only).
+        known_values=tuple(v for v in mapping.learned_values() if v not in no_propagate),
         # payload_text is json.dumps output — every real backslash is doubled, so
         # a lone single backslash is a JSON escape (``\n``), not a NetBIOS
         # separator.  WIRE mode rejects that multi-line-transcript false positive.
         wire_escaped=True,
     )
     if leaks:
-        # Log categories only — never log the actual leaked values.
-        categories = sorted({leak.split(":")[0].strip() for leak in leaks})
+        # Log categories only — never log the actual leaked values. A learned
+        # value names the rule and the field it was learned from.
+        categories = refusal_reasons(leaks, mapping)
         _LOGGER.error(
             "oracle.client: REFUSE — residue detected in outbound payload "
             "(categories: %s); local verdict retained",
@@ -1615,7 +1931,7 @@ async def adjudicate(  # noqa: PLR0915 - one linear pipeline; splitting hides th
         # Count it so a silently-disabled Oracle (a gate refusing every real
         # transcript) is visible on the next /metrics scrape, not just in the log.
         await metrics.get_metrics().record_oracle_refusal()
-        _fail("residue_refusal")
+        _fail("residue_refusal", failures.REFUSED, text=f"residue: {', '.join(categories)}")
         return None
 
     # 5. Call the frontier model via the LiteLLM gateway (raw async httpx).
@@ -1629,18 +1945,59 @@ async def adjudicate(  # noqa: PLR0915 - one linear pipeline; splitting hides th
     # httpx POST + tolerant JSON extraction.  We mirror it here with async.
     raw_verdict: OracleVerdict | None = None
     last_exc: str = ""
+    # What the LAST attempt met, so the recorded class is the truth of the
+    # attempt that ended the loop: a gateway failure stays gateway_error with
+    # its status and its message, and only a 200 whose body held no verdict is
+    # no_parseable_verdict. Production filed 23 weekly-limit HTTP 500 answers
+    # as unparseable (2026-09-10 to 2026-09-14), because this loop gave every
+    # exhausted retry that one label.
+    last_failure: dict[str, Any] = {}
     for attempt in range(1, _MAX_RETRIES + 1):
         try:
             raw_text = await _call_oracle_raw(payload_text, settings=settings)
         except _OracleGatewayError as exc:
             last_exc = f"{type(exc).__name__}: {exc}"
+            last_failure = {
+                "reason": "gateway_error",
+                "error_class": exc.error_class,
+                "status": exc.status or None,
+                "text": exc.gateway_text or str(exc),
+            }
+            if _breaker_failure(
+                failure_out,
+                settings,
+                route,
+                error_class=exc.error_class,
+                text=exc.gateway_text or str(exc),
+                retry_after=exc.retry_after,
+            ):
+                # A usage limit, or a run of server errors: a retry cannot
+                # answer. Stop now and keep the local verdict.
+                _LOGGER.error(
+                    "oracle.client: the Oracle route is paused until %s (%s); "
+                    "local verdict retained",
+                    failure_out.get("paused_until") if failure_out is not None else "?",
+                    exc.error_class,
+                )
+                _fail(
+                    "gateway_error",
+                    exc.error_class,
+                    status=exc.status or None,
+                    text=exc.gateway_text or str(exc),
+                )
+                return None
             if not exc.retryable:
                 # 4xx — auth/bad-request won't fix on retry; fail fast, keep local.
                 _LOGGER.error(
                     "oracle.client: non-retryable gateway error (%s); local verdict retained",
                     last_exc,
                 )
-                _fail("gateway_error")
+                _fail(
+                    "gateway_error",
+                    exc.error_class,
+                    status=exc.status or None,
+                    text=exc.gateway_text or str(exc),
+                )
                 return None
             _LOGGER.warning(
                 "oracle.client: gateway attempt %d/%d failed (%s); %s",
@@ -1652,8 +2009,34 @@ async def adjudicate(  # noqa: PLR0915 - one linear pipeline; splitting hides th
             if attempt < _MAX_RETRIES:
                 await asyncio.sleep(_backoff_s(attempt))
             continue
+        except _OracleAnswerError as exc:
+            route_breaker.BREAKER.record_answer(route)
+            last_exc = f"{type(exc).__name__}: {exc}"
+            last_failure = {
+                "reason": "no_parseable_verdict",
+                "error_class": failures.UNPARSEABLE,
+                "status": 200,
+                "text": str(exc),
+            }
+            _LOGGER.warning(
+                "oracle.client: attempt %d/%d answered 200 with no completion (%s); %s",
+                attempt,
+                _MAX_RETRIES,
+                last_exc,
+                "retrying" if attempt < _MAX_RETRIES else "giving up",
+            )
+            if attempt < _MAX_RETRIES:
+                await asyncio.sleep(_backoff_s(attempt))
+            continue
         except Exception as exc:
             last_exc = f"{type(exc).__name__}: {exc}"
+            # No answer to read: the call did not complete. Not a parse failure.
+            last_failure = {
+                "reason": "gateway_error",
+                "error_class": failures.TRANSPORT,
+                "status": None,
+                "text": last_exc,
+            }
             _LOGGER.warning(
                 "oracle.client: gateway attempt %d/%d failed (%s); %s",
                 attempt,
@@ -1665,9 +2048,17 @@ async def adjudicate(  # noqa: PLR0915 - one linear pipeline; splitting hides th
                 await asyncio.sleep(_backoff_s(attempt))
             continue
 
+        # A 200 is an answer: the route is up, whatever the body holds.
+        route_breaker.BREAKER.record_answer(route)
         raw_verdict = _parse_oracle_verdict(raw_text)
         if raw_verdict is not None:
             break
+        last_failure = {
+            "reason": "no_parseable_verdict",
+            "error_class": failures.UNPARSEABLE,
+            "status": 200,
+            "text": _unparseable_note(raw_text),
+        }
         _LOGGER.warning(
             "oracle.client: attempt %d/%d — could not parse verdict from response; %s",
             attempt,
@@ -1679,15 +2070,16 @@ async def adjudicate(  # noqa: PLR0915 - one linear pipeline; splitting hides th
 
     if raw_verdict is None:
         _LOGGER.error(
-            "oracle.client: all %d attempts failed to produce a parseable verdict "
-            "(%s); local verdict retained",
+            "oracle.client: all %d attempts failed (%s); local verdict retained",
             _MAX_RETRIES,
             last_exc or "unparseable response",
         )
-        # Retryable gateway failures land here too (the loop gave up), so the
-        # recorded class is "no parseable verdict came back", whatever mixed
-        # the attempts were. The log above has the per-attempt detail.
-        _fail("no_parseable_verdict")
+        _fail(
+            str(last_failure.get("reason") or "no_parseable_verdict"),
+            str(last_failure.get("error_class") or failures.UNPARSEABLE),
+            status=last_failure.get("status"),
+            text=str(last_failure.get("text") or ""),
+        )
         return None
 
     # 6. Desanitize the verdict's text fields back to real identifiers.
@@ -1704,18 +2096,28 @@ async def adjudicate(  # noqa: PLR0915 - one linear pipeline; splitting hides th
 
     # 7. Map OracleVerdict → TriageReport for the orchestrator, carrying the
     # local report's earned evidence fields forward (see _verdict_to_report).
-    desanitized_report = _verdict_to_report(desanitized_verdict, local_report=local_report)
+    # The override gate holds on this path too: with no tool loop, a flip is
+    # backed only by a citation that names evidence the local run retrieved.
+    resolved_citations = _resolve_oracle_citations(
+        raw_verdict.citations, mapping=mapping, enriched=enriched, messages=loop_messages
+    )
+    backed = bool(resolved_citations)
+    override_withheld = desanitized_verdict.verdict != local_report.verdict and not backed
+    desanitized_report = _verdict_to_report(
+        desanitized_verdict, local_report=local_report, backed=backed
+    )
 
     return OracleResult(
         report=desanitized_report,
         redaction_summary=redaction_summary(mapping),
         oracle_model=settings.oracle_model,
-        # Single-shot path: no tool loop, so the override gate is inactive and a
-        # flip lands as it always has. Record the raw verdict for event parity
-        # with the tool-loop path.
         oracle_tool_calls=0,
-        override_withheld=False,
+        override_withheld=override_withheld,
         raw_oracle_verdict=desanitized_verdict.verdict,
+        oracle_citations=resolved_citations,
+        oracle_citations_cited=len(raw_verdict.citations),
+        raw_oracle_confidence=desanitized_verdict.confidence,
+        raw_oracle_summary=rehydrated_summary,
     )
 
 

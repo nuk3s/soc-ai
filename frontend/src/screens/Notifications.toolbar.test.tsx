@@ -342,7 +342,7 @@ describe('Notifications — row timestamp', () => {
   beforeEach(() => localStorage.clear());
   afterEach(() => localStorage.clear());
 
-  it('reads "just now" for a sub-minute row, never "now ago"', async () => {
+  it('reads "now" for a sub-minute row, never "now ago"', async () => {
     // The backend's _ago() returns the WORD "now" under 60s, so the row's
     // unconditional " ago" produced "now ago" on every fresh notification —
     // which is most of them, on a screen whose whole point is what just
@@ -353,7 +353,7 @@ describe('Notifications — row timestamp', () => {
       { id: 'inv:INV-9', tone: 'accent', title: 'Investigating: ET SCAN fresh', when: 'now', href: null },
     ] as never);
     renderNotifications();
-    expect(await screen.findByText('just now')).toBeTruthy();
+    expect(await screen.findByText('now')).toBeTruthy();
     expect(screen.queryByText('now ago')).toBeNull();
   });
 });

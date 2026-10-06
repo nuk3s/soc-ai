@@ -21,14 +21,19 @@ from soc_ai.hunting.weight import Kind
 from soc_ai.hunting.window import DEFAULT_RECENT_HOURS
 
 __all__ = [
+    "baseline_noun",
     "baseline_sentence",
+    "estate_sentence",
     "noun",
+    "peer_sentence",
     "phrase",
     "plural",
     "rate",
     "rate_phrase",
     "result_note",
     "reword_legacy_summary",
+    "scope_sentence",
+    "statistic_sentence",
     "times",
     "when",
 ]
@@ -58,6 +63,23 @@ _CELL_WORDS: dict[str, str] = {
 def noun(dimension: Any) -> str:
     key = str(dimension or "")
     return _DIMENSION_NOUN.get(key, key.replace("_", " ") or "value")
+
+
+# The name of the baseline of one dimension, where it differs from the member
+# noun. "no active hour baseline" reads as the baseline of one hour.
+_BASELINE_NOUN: dict[str, str] = {
+    "active_hours": "active hours",
+}
+
+
+def baseline_noun(dimension: Any) -> str:
+    """The dimension as an operator names its baseline: "connection rate".
+
+    The blind reason named the column. "no connection_rate profile has been
+    built for this entity" reached the console as the data model talking.
+    """
+    key = str(dimension or "")
+    return _BASELINE_NOUN.get(key, noun(key))
 
 
 def when(member: Any) -> str:
@@ -117,6 +139,8 @@ def rate_phrase(
     median: Any,
     ratio: Any,
     count: Any = 0,
+    at: str | None = None,
+    hours: Any = 0,
 ) -> str:
     """A rate departure, stated as numbers.
 
@@ -127,8 +151,32 @@ def rate_phrase(
 
     A row written before the numbers travelled with the departure has only the
     count. It reads as the rate alone, which is what it is.
+
+    ``at`` names the local hour of the week of the furthest hour, for a
+    departure the hourly test found. The sentence then names the expected
+    count of that hour and how many hours the departure lasted.
     """
     measured = rate(value if value is not None else count)
+    if at:
+        text = (
+            f"The {noun(dimension)} on {at} is {measured} per hour. "
+            f"The baseline expects {rate(median if median is not None else 0)} per hour "
+            "at that hour of the week"
+        )
+        if ratio is not None:
+            number = float(ratio)
+            text += (
+                f". That is {number:.1f} times the expected rate"
+                if number >= 1
+                else (f". That is {number:.2f} of the expected rate")
+            )
+        try:
+            lasted = int(hours)
+        except (TypeError, ValueError):
+            lasted = 0
+        if lasted > 0:
+            text += f". The departure lasted {plural(lasted, 'hour')}"
+        return text
     head = f"The {noun(dimension)} {when(member)} is {measured} per hour"
     if median is None or ratio is None:
         return head
@@ -169,6 +217,8 @@ def phrase(kind: Kind, departure: Any, *, window_hours: int = DEFAULT_RECENT_HOU
             median=getattr(departure, "baseline_median", None),
             ratio=getattr(departure, "ratio", None),
             count=count,
+            at=getattr(departure, "peak_label", None),
+            hours=getattr(departure, "run_hours", 0),
         )
         # A host the recent read did not see at all is scored as zero in
         # every covered cell. That reads the same as a measured zero, and
@@ -181,12 +231,108 @@ def phrase(kind: Kind, departure: Any, *, window_hours: int = DEFAULT_RECENT_HOU
         documents = int(count)
     except (TypeError, ValueError):
         documents = 0
+    text = f"new {noun(dimension)} for this host: {member}"
     if documents > 0:
+        text += f". {plural(documents, 'document')} in the last {int(window_hours)} h"
+    measured = getattr(departure, "estate_measured", None)
+    if measured is not None:
+        text += f". {estate_sentence(getattr(departure, 'estate_hosts', 0), measured)}"
+    peers = getattr(departure, "peer_count", None)
+    if peers is not None:
+        holders = getattr(departure, "peer_holders", 0)
+        text += f". {peer_sentence(holders, peers, getattr(departure, 'peer_role', None))}"
+    return text
+
+
+def peer_sentence(holders: Any, peers: Any, role: Any) -> str:
+    """How many peers in the role hold a member, without a trailing stop."""
+    try:
+        held, of = int(holders or 0), int(peers or 0)
+    except (TypeError, ValueError):
+        return ""
+    group = f"{role} peers" if role else "peers"
+    if held == 0:
+        return f"None of the {of} {group} holds it"
+    verb = "holds" if held == 1 else "hold"
+    return f"{held} of the {of} {group} {verb} it"
+
+
+def estate_sentence(holders: Any, measured: Any) -> str:
+    """How many profiled hosts hold a member, without a trailing stop."""
+    try:
+        held, of = int(holders or 0), int(measured or 0)
+    except (TypeError, ValueError):
+        return ""
+    if held == 0:
+        return f"None of the {plural(of, 'profiled host')} holds it"
+    verb = "holds" if held == 1 else "hold"
+    return f"{held} of {plural(of, 'profiled host')} {verb} it"
+
+
+def scope_sentence(dimension: Any, member: Any, *, hosts: int, holders: Any) -> str:
+    """One member that several hosts gained in one sweep, without a trailing stop."""
+    text = f"{plural(hosts, 'host')} gained the {noun(dimension)} {member} in one sweep"
+    if holders is not None:
+        text += f". {plural(int(holders), 'host')} held it before"
+    return text
+
+
+def _number(value: Any) -> str:
+    """A statistic as a reader reads it: 7.4, 12, or 0.25."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if abs(number - round(number)) < 0.005:
+        return f"{number:.0f}"
+    return f"{number:.2f}" if abs(number) < 1 else f"{number:.1f}"
+
+
+def statistic_sentence(statistic: Any, value: Any, baseline: Any) -> str:
+    """The statistic an observation stores, in one or two sentences.
+
+    Empty when the row stores no statistic. A row written before the
+    statistic travelled with the observation says nothing it does not hold.
+    The console formats the same names in ``lib/statistics.ts``.
+    """
+    name = str(statistic or "")
+    if not name or value is None:
+        return ""
+    v = _number(value)
+    b = _number(baseline) if baseline is not None else None
+    if name == "documents":
+        if b is None:
+            return f"{plural(value, 'document')} matched."
         return (
-            f"new {noun(dimension)} for this host: {member}. "
-            f"{plural(documents, 'document')} in the last {int(window_hours)} h"
+            f"{plural(value, 'document')} in the recent window. "
+            f"The set it is new to holds {plural(baseline, 'member')}."
         )
-    return f"new {noun(dimension)} for this host: {member}"
+    if name == "hour_documents":
+        return f"{plural(value, 'document')} in an hour with no activity in the baseline."
+    if name == "robust_z":
+        return f"A robust z of {v} against a median of {b} per hour."
+    if name == "residual_z":
+        return f"A residual z of {v} against an expected {b} per hour for that hour of the week."
+    if name == "estate_hosts":
+        held = int(float(value))
+        verb = "holds" if held == 1 else "hold"
+        return f"{held} of {plural(baseline, 'profiled host')} {verb} this member."
+    if name == "peer_share":
+        held = int(float(value))
+        verb = "holds" if held == 1 else "hold"
+        return f"{held} of {plural(baseline, 'peer')} in the role {verb} this member."
+    if name == "hosts_departing":
+        text = f"{plural(value, 'host')} gained this member in one sweep."
+        return text + (f" {plural(baseline, 'host')} held it before." if b is not None else "")
+    if name == "plane_documents":
+        text = f"{plural(value, 'document')} on the silent plane in the silent hours."
+        return text + (f" The baseline expects {b} in those hours." if b is not None else "")
+    if name == "chain_minutes":
+        text = f"The attempt came {v} {'minute' if v == '1' else 'minutes'} after the session."
+        if b is None:
+            return text
+        return f"{text} The host held {plural(baseline, 'learned outbound edge')}."
+    return f"{name} {v}" + (f" against a baseline of {b}." if b is not None else ".")
 
 
 def result_note(

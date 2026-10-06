@@ -55,6 +55,16 @@ CONFIG_SECRET_KEY=
 # first admin password. Auto-generated and printed if blank.
 BOOTSTRAP_ADMIN_PASSWORD=
 
+# ── Store ─────────────────────────────────────────────────────────────────────
+# y keeps the store in PostgreSQL: the compose "postgres" profile runs the
+# server next to soc-ai. n keeps SQLite, which suits one site. setup.sh offers
+# PostgreSQL on a fresh install only. To move a store, see docs/DOCKER.md,
+# PostgreSQL.
+STORE_POSTGRES=n
+# The password of the soc_ai role. Auto-generated if blank. Letters, digits,
+# '.', '_', '~' and '-' only, because the store URL carries it.
+SOC_AI_POSTGRES_PASSWORD=
+
 # ── TLS cert ──────────────────────────────────────────────────────────────────
 # IP or DNS name for the self-signed cert SAN. Blank = this host's primary IP.
 CERT_HOST=

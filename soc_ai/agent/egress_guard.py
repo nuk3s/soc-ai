@@ -171,7 +171,9 @@ class EgressGuard:
             allowlist=self._allowlist,
             extra_hosts=self._extra_hosts,
             extra_suffixes=self._extra_suffixes,
-            known_values=tuple(self._mapping.reverse.values()),
+            # The learned set: a host name a text rule labelled in place only
+            # (a 2-letter token, a common word) is not searched for elsewhere.
+            known_values=self._mapping.learned_values(),
         )
 
     def check_or_raise(self, text: str, *, fail_closed: bool) -> None:

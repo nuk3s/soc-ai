@@ -56,6 +56,7 @@ __all__ = [
     "host_coverage",
     "host_identity",
     "name_variants",
+    "plane_dataset_clause",
     "plane_label",
     "plane_phrase",
     "planes_of",
@@ -165,6 +166,23 @@ def planes_of(dataset: str) -> tuple[str, ...]:
         if name in exact or any(name.startswith(p) for p in prefixes):
             out.append(plane)
     return tuple(out)
+
+
+def plane_dataset_clause(planes: Sequence[str] = PLANES) -> dict[str, Any]:
+    """An Elasticsearch clause that selects the datasets of ``planes``.
+
+    The same rules :func:`planes_of` reads, as a query: the exact names as
+    terms, the prefixes as prefix queries, on ``event.dataset``.
+    """
+    exact: list[str] = []
+    should: list[dict[str, Any]] = []
+    for plane in planes:
+        names, prefixes = _PLANE_RULES[plane]
+        exact.extend(n for n in names if n not in exact)
+        should.extend({"prefix": {"event.dataset": p}} for p in prefixes)
+    if exact:
+        should.insert(0, {"terms": {"event.dataset": exact}})
+    return {"bool": {"should": should, "minimum_should_match": 1}}
 
 
 def plane_phrase(plane: str) -> str:

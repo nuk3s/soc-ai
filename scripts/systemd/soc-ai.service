@@ -8,6 +8,10 @@ Wants=network-online.target
 Type=simple
 User=soc-ai
 Group=soc-ai
+# Every file the service makes is readable by the service user only. The store
+# holds password hashes; the store also sets its own modes, and this covers
+# the reports and the scratch files beside it.
+UMask=0077
 WorkingDirectory=/opt/soc-ai
 EnvironmentFile=/opt/soc-ai/.env
 # soc-ai applies its own forwarded-header trust rule (PROXY_TRUSTED_IPS).

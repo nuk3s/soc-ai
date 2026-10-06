@@ -6,9 +6,11 @@ description: >
   tools on an ordinary workstation is an administrator working from the wrong
   machine. It can also be lateral movement. Both cases are worth one look.
 
-  This analytic reads the workstation's own process history. A site that runs
-  one of these tools everywhere stops seeing the analytic after the support
-  window. Nobody has to edit a list.
+  This analytic reads the workstation's own process history. It reads only
+  the process names in the pattern list. Any other new process name, such as
+  a browser or antivirus updater, is not remote execution. This analytic
+  does not see a renamed copy of a tool. A site that runs one of these tools
+  everywhere stops seeing the analytic after the support window.
 
 level: high
 evaluator: profile
@@ -20,10 +22,29 @@ profile:
   test: novel_for
   roles:
     - workstation
+  # Case-insensitive globs on the process base name. Without this list the
+  # prior fired on every new file name, and on the range every observation
+  # was an Edge or Defender updater.
+  member_patterns:
+    # PsExec on the operator's side, and its service on the target.
+    - psexec*.exe
+    - psexesvc*.exe
+    # PsExec clones and their services.
+    - paexec*.exe
+    - remcom*.exe
+    - csexec*.exe
+    # WMI from the command line.
+    - wmic.exe
+    # The WinRM remote shell, client and target.
+    - winrs.exe
+    - winrshost.exe
+    # The PowerShell remoting host on the target.
+    - wsmprovhost.exe
 
 attack:
   - T1569.002
   - T1047
+  - T1021.006
 
 false_positives:
   - An administrator runs this tooling on their own workstation as routine
@@ -33,3 +54,4 @@ false_positives:
 
 references:
   - https://attack.mitre.org/techniques/T1569/002/
+  - https://attack.mitre.org/techniques/T1021/006/

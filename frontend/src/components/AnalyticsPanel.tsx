@@ -15,6 +15,7 @@ import { loopRuns, sweepsNotice } from '../lib/analyticRuns';
 import { useDemo } from '../lib/demo';
 import { plural } from '../lib/plural';
 import { ago } from '../lib/timeRange';
+import { CHIP_HELD_BY_SYSTEM } from '../lib/tooltips';
 import { useAsync, type UseAsyncResult } from '../lib/useAsync';
 import { AnalyticActions, COVERAGE_TITLE, StatusDot } from './AnalyticDrawer';
 import { AnalyticDrawer } from './AnalyticDrawer';
@@ -154,9 +155,27 @@ export function capNote(coverage: PriorCoverage): string {
   return coverage.capped ? ` · capped at ${coverage.recent_cap ?? 500}` : '';
 }
 
-function coverageCell(coverage: PriorCoverage | null | undefined): string {
+/** The coverage column. A learned detector reads no stored host profile, so
+ *  the build time of those profiles says nothing about it. The cell read
+ *  "baseline 13 h old" on a detector that builds its own baseline. */
+function coverageCell(coverage: PriorCoverage | null | undefined, evaluator?: string): string {
   if (!coverage) return '—';
-  return `${coverage.measured} measured · ${coverage.blind} blind${capNote(coverage)}${baselineNote(coverage)}`;
+  const baseline = evaluator === 'model' ? '' : baselineNote(coverage);
+  return `${coverage.measured} measured · ${coverage.blind} blind${capNote(coverage)}${baseline}`;
+}
+
+/** The count a blind reason opens with. The sweep states it on every reason. */
+const COUNTED_REASON = /^\d+ of \d+ blind /;
+
+/** The reason the blind entities are blind, when the sweep named one. The
+ *  two connection rate analytics read as "0 measured · 103 blind" for most
+ *  of a day after an upgrade with nothing on any surface saying why. */
+function blindReason(coverage: PriorCoverage | null | undefined): string | null {
+  const reason = coverage?.blind_reason;
+  if (!reason || !coverage || coverage.blind <= 0) return null;
+  // The sweep opens each reason with its count: "35 of 56 blind hosts: ...".
+  // A row an older sweep stored has no count, and it keeps the label.
+  return COUNTED_REASON.test(reason) ? reason : `blind: ${reason}`;
 }
 
 /** The visible state when a loop does not run, with the setting that turns
@@ -317,6 +336,18 @@ function Row({
       </td>
       <td className="whitespace-nowrap px-2 py-2.5 text-[12px]">
         <StatusDot status={analytic.status} running={running} />
+        {/* A hold by soc-ai reads apart from an analyst's shadow. The reason
+            is on the chip, and the drawer holds the evidence. */}
+        {analytic.held_by_system && (
+          <div
+            data-testid={`analytic-held-${analytic.id}`}
+            className="mt-1 w-fit rounded-chip border px-1.5 py-px text-[10px] text-warn"
+            style={{ borderColor: 'rgba(210,153,34,.45)' }}
+            title={`${CHIP_HELD_BY_SYSTEM} ${analytic.held_by_system}`}
+          >
+            held by soc-ai
+          </div>
+        )}
       </td>
       <td className="px-2 py-2.5 font-mono text-[11px] text-dim" title={WEEK_TITLE}>
         {analytic.observations_7d} obs · {plural(analytic.leads_7d, 'lead')} · {analytic.hunted_7d}{' '}
@@ -329,7 +360,16 @@ function Row({
         )}
       </td>
       <td className="px-2 py-2.5 font-mono text-[11px] text-dim" title={COVERAGE_TITLE}>
-        {coverageCell(coverage)}
+        {coverageCell(coverage, analytic.evaluator)}
+        {blindReason(coverage) && (
+          <div
+            data-testid={`analytic-blind-reason-${analytic.id}`}
+            className="text-dim"
+            title="Why the blind entities could not be measured on the newest sweep."
+          >
+            {blindReason(coverage)}
+          </div>
+        )}
         {blind && (
           <div
             data-testid={`analytic-blind-${analytic.id}`}

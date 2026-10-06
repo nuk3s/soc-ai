@@ -809,10 +809,35 @@ async def test_a_numeric_dimension_is_summarised_into_three_cells() -> None:
     assert rate is not None, "the lane built no numeric dimension"
     assert rate.shape == "numeric"
     # Every cell present even when empty, so "no weekend activity observed" is
-    # a statement the profile can make.
-    assert set(rate.vector) == {"work", "off", "weekend"}
-    assert rate.vector["work"]["median"] == 42.0
+    # a statement the profile can make. The hourly series rides beside them.
+    assert set(rate.vector) == {"work", "off", "weekend", "hourly"}
     assert rate.vector["weekend"]["samples"] == 0
+
+
+async def test_zero_hours_stay_in_the_rate_baseline() -> None:
+    """The aggregation returns only the hours that hold a document. The lane
+    fills the empty hours between the first and the last with zero. Dropped,
+    the baseline measured the rate in active hours: two busy hours in two
+    working days read as a median of 42 an hour."""
+    es = _FakeES(
+        field_presence=_FLOW_OK,
+        agg_payloads={"shaped": {"buckets": [_shaped_bucket("192.0.2.21", _THREE_HOURS)]}},
+    )
+    sweep = await collect_entity_profiles(
+        elastic=es, settings=_settings(), window_hours=24 * 30, time_anchor=_ANCHOR
+    )
+    rate = next(p for p in sweep.profiles if p.dimension == "connection_rate")
+    hourly = rate.vector["hourly"]
+    assert hourly["start"] == "2026-09-15T10:00:00+00:00"
+    # Tuesday 10:00 to Wednesday 23:00, every hour of it.
+    assert len(hourly["counts"]) == 38
+    assert hourly["counts"][0] == 40
+    assert hourly["counts"][25] == 44
+    assert hourly["counts"][-1] == 2
+    assert sum(hourly["counts"]) == 86
+    # 18 working hours, two of them busy: the median working hour is zero.
+    assert rate.vector["work"]["samples"] == 18
+    assert rate.vector["work"]["median"] == 0.0
 
 
 async def test_an_empty_cell_is_recorded_rather_than_omitted() -> None:
@@ -1223,7 +1248,7 @@ async def test_the_two_shaped_dimensions_come_from_one_query() -> None:
     assert {"active_hours", "connection_rate"} <= set(by_dim)
     assert set(by_dim["active_hours"].vector) == {"10", "11", "23"}
     assert by_dim["connection_rate"].shape == "numeric"
-    assert by_dim["connection_rate"].vector["work"]["median"] == 42.0
+    assert by_dim["connection_rate"].vector["hourly"]["counts"][0] == 40
     assert sweep.errors == ()
     assert sweep.unmeasurable == {}
 

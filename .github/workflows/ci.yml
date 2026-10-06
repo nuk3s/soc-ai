@@ -65,6 +65,53 @@ jobs:
       - name: pytest
         run: uv run pytest -n auto --dist loadfile
 
+  # The store on PostgreSQL. The store test modules carry the `postgres` marker
+  # (tests/conftest.py). With SOC_AI_TEST_DATABASE_URL set, each marked test
+  # gets a fresh database on the service below and runs against it. The `ci`
+  # job runs the same modules on SQLite. The image is pinned to a version and a
+  # digest, the same rule as docker-compose.yml. The password belongs to a
+  # throwaway service that lives for this job only.
+  store-postgres:
+    name: store tests on PostgreSQL
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17.6@sha256:00bc86618629af00d2937fdc5a5d63db3ff8450acf52f0636ec813c7f4902929
+        env:
+          POSTGRES_USER: soc_ai
+          POSTGRES_PASSWORD: soc_ai_ci
+          POSTGRES_DB: soc_ai
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U soc_ai"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      SOC_AI_TEST_DATABASE_URL: postgresql+asyncpg://soc_ai:soc_ai_ci@127.0.0.1:5432/soc_ai
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+
+      # --no-cov: the run covers the store only, so the 80% suite gate does
+      # not apply.
+      - name: pytest -m postgres
+        run: uv run pytest -m postgres -n auto --dist loadfile --no-cov
+
   # The React SPA (frontend/) — typecheck + unit tests (vitest) + production
   # build so a broken UI can't land silently. There is no eslint setup yet
   # (no dependency, no config, no `lint` script); tsc is the only static gate.
@@ -95,6 +142,34 @@ jobs:
 
       - name: build
         run: npm run build
+
+  # The scale harness: a synthetic estate of 2,000 hosts through the dossier
+  # sweep, the machine clustering, the profile build and the prior sweep. Each
+  # stage stays under a budget of wall time, searches and peak memory. The
+  # `ci` job's run ignores tests/scale (pyproject addopts), so the harness runs
+  # here on its own, with no coverage gate. `-s` prints the stage table.
+  scale:
+    name: scale harness (2,000 hosts)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+
+      - name: pytest (scale)
+        run: uv run pytest --override-ini "addopts=" --no-header -v -s -m scale tests/scale/
 
   # End-to-end browser smoke: drives the SEEDED DEMO STACK (seed + mock ES/LLM +
   # the real app serving frontend/dist) through login → alerts → investigation
@@ -202,11 +277,14 @@ jobs:
       # --no-deps: the export is fully pinned, so there is nothing left to
       # resolve. --strict: a package pip-audit could not check fails the job
       # instead of passing silently. pip-audit is pinned like every other
-      # installer here.
+      # installer here. --extra postgres: the image ships asyncpg for the
+      # PostgreSQL store, so the audit reads it too. --extra ml: the image
+      # ships scikit-learn, numpy and their five dependencies for the estate
+      # model, so the audit reads them too.
       - name: pip-audit (locked runtime dependencies)
         run: |
           uv export --frozen --quiet --format requirements-txt --no-hashes --no-emit-project \
-            --no-dev -o "${RUNNER_TEMP}/requirements.txt"
+            --no-dev --extra postgres --extra ml -o "${RUNNER_TEMP}/requirements.txt"
           uvx pip-audit==2.10.1 -r "${RUNNER_TEMP}/requirements.txt" --no-deps --strict
 
       - uses: actions/setup-node@v6

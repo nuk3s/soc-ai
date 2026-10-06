@@ -1,8 +1,8 @@
-# Reading a broken audit chain
+# Audit chain breaks
 
 Every audit record carries a `seq`, the `hash` of the previous record, and its own `hash`
-over its content. That is the tamper evidence. Nobody can edit the record of a decision
-afterwards, because the recomputation then fails. Verify the chain by hand at any time:
+over its content. That is the tamper evidence. An edit to the record of a decision makes
+the recomputation fail. Verify the chain by hand at any time:
 
 ```bash
 soc-ai audit verify              # the whole index
@@ -15,9 +15,9 @@ code 2 as either verdict.
 
 The same check also runs on a schedule. It runs daily over the last 7 days by default.
 `AUDIT_VERIFY_SCHEDULE_ENABLED`, `AUDIT_VERIFY_SCHEDULE_INTERVAL_HOURS` and
-`AUDIT_VERIFY_DAYS` control it. A break reaches you 3 ways: an audit record of the
-finding, the notification webhook if you have configured one, and a standing entry on the
-in-app bell.
+`AUDIT_VERIFY_DAYS` control it. A break reaches you in 3 ways: an audit record, the
+notification webhook and a standing entry on the bell in the console. The webhook fires
+only if you configured one.
 
 ## Types of break
 
@@ -35,14 +35,19 @@ response. The verdict names which one:
 `content_altered` means that someone edited a decision record. Each of the other types
 can have an innocent cause. `duplicate_seq` usually does.
 
-## How widespread
+## Scale of a break
 
-Every channel carries the scale of the break, as well as the first position that failed.
-It reports how many sequence numbers more than one record claims, how many extra records
-sit at each of those positions, the largest number of writers at one position, how many
-records no longer match their own hash, and the timestamps of the oldest and the newest
-records involved. A single collision and a forked afternoon are different situations. The
-newest affected timestamp tells you whether the damage is historical. If that timestamp
+Every channel reports the first position that failed and the scale of the break. The
+scale has these parts:
+
+- the count of sequence numbers that more than one record claims
+- the count of extra records at each of those positions
+- the largest count of writers at one position
+- the count of records that no longer match their own hash
+- the timestamps of the oldest and the newest records involved
+
+One collision and an afternoon of forks are different situations. The newest affected
+timestamp tells you whether the damage is historical. If that timestamp
 predates the fix, nothing has forked since.
 
 ## Concurrency fork or alteration
@@ -51,10 +56,11 @@ Two writers that append at the same moment leave two records at one position. Ea
 is internally sound, because every field still hashes to the hash stored on it. An edit
 does not survive that test. The verdict reports the difference:
 
-- *"…and each one still matches its own hash — the records were not altered; two writers
-  continued the chain from the same point"*. This verdict reports concurrency.
-- *"…and N of them no longer match their own hash — content was altered, not merely
-  duplicated"*. This verdict reports that something rewrote a record.
+- *"N records claim sequence S. Each record still matches its own hash, so the records were
+  not altered. The cause is two writers that continued the chain from the same point"*. This
+  verdict reports concurrency.
+- *"N records claim sequence S. M of them no longer match their own hash, so the content was
+  altered after it was written"*. This verdict reports that something rewrote a record.
 
 To see the records yourself, list the duplicated positions in the index:
 
@@ -68,37 +74,39 @@ POST /soc-ai-audit-*/_search
 
 Then fetch the records at one of those positions. Compare their `timestamp`, `session_id`
 and `prev_hash`. A shared `prev_hash` and two different sessions seconds apart is the
-fork. One record rewritten in place is not a fork.
+fork. One record rewritten in place is an alteration.
 
 ## The 2026-09 fork
 
 A deployment that runs soc-ai from before the fix can carry duplicated positions. The
 cause is a defect in the allocation of the chain head. The head lived in memory behind a
-per-process lock, so a second writer could continue the chain from the same point. That
-second writer was the logger of the nightly quality alarm, a `soc-ai` command run from
-cron beside the server, or a write whose acknowledgement never arrived.
+per-process lock, so a second writer could continue the chain from the same point. The
+second writer was one of these:
+
+- the logger of the nightly quality alarm
+- a `soc-ai` command that cron ran beside the server
+- a write whose acknowledgement never arrived
 
 Each record involved is sound, and the position is claimed twice. soc-ai now claims the
 sequence from Elasticsearch itself, so this cannot happen again. The records already
 written stay as they are.
 
-You can confirm that a deployment carries this break. Every copy of every duplicated
-position still matches its own hash. On the deployment where this was found, that held
-for all of them: 41 duplicated positions, some claimed by 3 or 4 records, and no altered
-record.
+One check confirms this break. Every copy of every duplicated position still matches its
+own hash. On the first deployment with this break, the check held for all 41 duplicated
+positions. Some positions carried 3 or 4 records. No record showed an alteration.
 
-### What to do about records already forked
+### Response to a past fork
 
-**Recommended: change nothing in the index. Let the daily check heal itself.**
+**Recommended: change nothing in the index. Let the damage age out of the daily check.**
 
 The scheduled verification reads a window. The window is 7 days by default. After you
 deploy the fix, no new duplicate can be created. The damaged stretch then ages out of the
-window, and the daily check goes green on its own. Nothing is edited and nothing is
-suppressed. Until the stretch ages out, every run reports the break.
+window, and the daily check goes green on its own. soc-ai edits nothing and suppresses
+nothing. Until the stretch ages out, every run reports the break.
 
-That report is the honest state, and soc-ai does not silence it. A standing break is a
-standing claim that the record cannot be trusted. A silent check would read as a resolved
-break.
+That report is the true state, and soc-ai does not suppress it. A standing break is a
+standing claim that the record cannot be trusted. A suppressed check would read as a
+resolved break.
 
 The full-index scan reports the historical break forever. That is correct, because the
 trail does carry real damage. The verdict names the type of damage and the epoch that
@@ -117,15 +125,19 @@ the one subsystem that must not have such a switch. A loosely keyed acknowledgem
 also cover damage that has not happened yet. The windowed schedule reaches the same
 practical outcome, and it needs no switch.
 
-### Dismissing the bell entry
+### Dismissal of the bell entry
 
-The bell entry is separate from the reporting, and you can dismiss it. The old entry was
-keyed on the moment of detection. Every run created a new entry, so nobody could clear
+The bell entry is separate from the reporting, and you can dismiss it. The old entry used
+the moment of detection as its key. Every run created a new entry, so nobody could clear
 it. The result was a danger notification every morning until the damage aged out.
 
-A dismissal covers one finding. The identity of a finding is the types of break present,
-the timestamp of the newest record involved in any of them, and the number of records
-that no longer match their own hash. Dismiss a historical fork and it stays dismissed
+A dismissal covers one finding. The identity of a finding has three parts:
+
+- the types of break present
+- the timestamp of the newest record involved in any of them
+- the count of records that no longer match their own hash
+
+Dismiss a historical fork and it stays dismissed
 while it is the same fork. Anything that breaks afterwards moves the newest timestamp. An
 edited record adds a type that was not there. A second edited record moves the count.
 
@@ -139,8 +151,8 @@ webhook fire on every run while the chain does not verify.
 
 **Rejected: a fresh epoch that closes the damage behind a boundary.** The method works. A
 new genesis record ends the damaged epoch, and everything after it verifies. The method
-needs a command whose effect is "make the verification stop complaining", so it is the
-same switch under a different name. A restart already starts an epoch if the head cannot
+needs a command whose effect is "make the verification stop complaining". That command is
+the same switch with a different name. A restart already starts an epoch if the head cannot
 be recovered. Nothing else may ask for one.
 
 **Never: delete or edit the duplicate records.** If you remove one copy, the

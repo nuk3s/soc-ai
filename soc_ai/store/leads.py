@@ -16,7 +16,7 @@ from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from typing import Any
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from soc_ai.store.models import EntityObservation, Hunt, HuntEvent, Lead
@@ -97,9 +97,18 @@ HOLD_SENTENCES: dict[str, str] = {
     HOLD_EARLIER_THREAT: "An earlier hunt found a threat.",
 }
 
-# The first words of the note the runner writes when a hunt ran out of budget
-# and a no-tools synthesizer wrote the report from what it had read.
-_PARTIAL_SYNTHESIS_PREFIX = "Reached the hunt's exploration budget"
+# The ``done`` event key the runner sets when the budget synthesizer wrote the
+# report. It is the fact the settle rule reads. The runner has written it on
+# every ``done`` event since 2026-10-01.
+_DONE_PARTIAL_KEY = "partial"
+
+# FROZEN text: the first words of the note a hunt recorded before 2026-10-01
+# wrote when the budget synthesizer took over. Such a row has no partial key on
+# its ``done`` event, so this stored text is the only record of the partial
+# read. It is compared ONLY on a row whose ``done`` event lacks the key: the
+# runner's live wording never decides a settle, so an edit to it cannot make a
+# partial hunt close its lead as clean.
+_LEGACY_PARTIAL_TEXT = "Reached the hunt's exploration budget"
 
 _KIND_WORDS: dict[str, str] = {
     "novel_destination": "a new destination",
@@ -113,10 +122,13 @@ _KIND_WORDS: dict[str, str] = {
     "below_baseline": "a collapsed rate",
     "above_baseline": "a rate spike",
     "scope_count": "the same condition on many hosts",
+    "estate_outlier": "an outlier against its learned peer group",
     "alert": "a triaged alert",
     "prior_no_baseline": "a finding with no benign baseline",
     "catalog_match": "a catalog analytic match",
     "hunt_finding": "a promoted hunt finding",
+    "telemetry_silence": "a silent telemetry plane",
+    "logon_chain": "a logon chain",
 }
 
 
@@ -217,11 +229,18 @@ async def get(db: AsyncSession, lead_id: int) -> Lead | None:
 
 
 async def timeline(db: AsyncSession, lead_id: int) -> Sequence[EntityObservation]:
-    """The observations attached to the lead, newest first."""
+    """The observations attached to the lead, newest first.
+
+    Ordered on the time the page shows: the event time when the row has one,
+    the record time when it has none.
+    """
     rows = await db.scalars(
         select(EntityObservation)
         .where(EntityObservation.lead_id == int(lead_id))
-        .order_by(EntityObservation.born_at.desc(), EntityObservation.id.desc())
+        .order_by(
+            func.coalesce(EntityObservation.observed_at, EntityObservation.born_at).desc(),
+            EntityObservation.id.desc(),
+        )
     )
     return rows.all()
 
@@ -464,6 +483,13 @@ async def _clean_close_blocker(db: AsyncSession, hunt: Hunt) -> str | None:
     - ``partial_read``: the report holds a visibility gap, a tool call failed
       in the trace, the run was degraded, or the report came from the
       budget synthesizer.
+
+    Every test reads a structured signal: the finding category, the tool
+    result's error, the ``error`` event, and the ``degraded`` and ``partial``
+    flags on the ``done`` event. A console string decides nothing, because a
+    wording edit in the runner then made a partial hunt close its lead as
+    clean. The one exception is a row recorded before the ``partial`` flag
+    existed (see :data:`_LEGACY_PARTIAL_TEXT`).
     """
     if hunt.lead_id is not None:
         earlier = await db.scalars(
@@ -489,16 +515,21 @@ async def _clean_close_blocker(db: AsyncSession, hunt: Hunt) -> str | None:
             HuntEvent.kind.in_(("tool_result", "done", "model_response", "error")),
         )
     )
-    for event in events.all():
-        payload = event.payload if isinstance(event.payload, dict) else {}
-        if event.kind == "error":
+    rows = [(e.kind, e.payload if isinstance(e.payload, dict) else {}) for e in events.all()]
+    # A ``done`` event that carries the partial key states the fact. Only a row
+    # recorded before the key existed falls back to its frozen stored text.
+    flagged = any(kind == "done" and _DONE_PARTIAL_KEY in payload for kind, payload in rows)
+    for kind, payload in rows:
+        if kind == "error":
             return HOLD_PARTIAL_READ
-        if event.kind == "tool_result" and _tool_failed(payload.get("result")):
+        if kind == "tool_result" and _tool_failed(payload.get("result")):
             return HOLD_PARTIAL_READ
-        if event.kind == "done" and (payload.get("degraded") or payload.get("partial")):
+        if kind == "done" and (payload.get("degraded") or payload.get(_DONE_PARTIAL_KEY)):
             return HOLD_PARTIAL_READ
-        if event.kind == "model_response" and str(payload.get("text") or "").startswith(
-            _PARTIAL_SYNTHESIS_PREFIX
+        if (
+            not flagged
+            and kind == "model_response"
+            and str(payload.get("text") or "").startswith(_LEGACY_PARTIAL_TEXT)
         ):
             return HOLD_PARTIAL_READ
     return None
@@ -665,8 +696,14 @@ def objective_for(
 
 
 def _evidence_ids(observation: EntityObservation) -> list[str]:
+    """The documents an observation cites: the column first, then the evidence.
+
+    The column holds up to ten ids from migration 0057 on. A row written
+    before it holds its ids in the evidence alone.
+    """
     ev = observation.evidence_json if isinstance(observation.evidence_json, dict) else {}
-    ids: list[str] = []
+    column = observation.document_ids if isinstance(observation.document_ids, list) else []
+    ids: list[str] = [str(c) for c in column if c]
     for key in ("anchor_id", "alert_id"):
         if ev.get(key):
             ids.append(str(ev[key]))
@@ -676,7 +713,7 @@ def _evidence_ids(observation: EntityObservation) -> list[str]:
     for i in ids:
         if i not in out:
             out.append(i)
-    return out[:8]
+    return out[:10]
 
 
 def cites_documents(observations: Sequence[EntityObservation]) -> bool:
@@ -694,16 +731,28 @@ def cites_documents(observations: Sequence[EntityObservation]) -> bool:
     return any(_evidence_ids(o) for o in observations)
 
 
-def evidence_block_for(observations: Sequence[EntityObservation]) -> str:
+def evidence_block_for(
+    observations: Sequence[EntityObservation], *, now: datetime | None = None
+) -> str:
     """The evidence a lead hunt reads first.
 
     The first lead hunt on the range searched the grid on its own, found the
     status records of a Sigma rule, and called a real DCSync event a broken
     rule. The documents that formed the lead are known. The hunt reads them
     before it queries.
+
+    An observation that carries its statistic states it in numbers, and one
+    that carries a query states the query and the time range that reaches it.
+    The hunt then reads the departure. It searched the grid for it again,
+    because the numbers lived only in the summary sentence.
     """
+    from soc_ai.hunting.rerun import window_minutes  # noqa: PLC0415 - lazy, avoids a cycle
+    from soc_ai.hunting.wording import statistic_sentence  # noqa: PLC0415 - lazy
+
+    at = now or datetime.now(UTC)
     lines = ["Evidence documents, by observation:"]
     any_ids = False
+    any_query = False
     for o in observations[:12]:
         ids = _evidence_ids(o)
         summary = (o.summary or o.kind).strip()
@@ -712,10 +761,26 @@ def evidence_block_for(observations: Sequence[EntityObservation]) -> str:
             lines.append(f"- {summary}: document ids {', '.join(ids)}")
         else:
             lines.append(f"- {summary}: no document ids recorded")
+        stated = statistic_sentence(o.statistic, o.statistic_value, o.baseline_value)
+        if stated:
+            lines.append(f"  Statistic: {stated}")
+        if o.rerun_query:
+            any_query = True
+            # The query window starts one recent window before the sweep wrote it.
+            start = o.born_at - timedelta(days=1)
+            lines.append(
+                f"  Query: {o.rerun_query} "
+                f"(t_query_events_oql, time_range_minutes {window_minutes(start, now=at)})"
+            )
     if any_ids:
         lines.append(
             "Read each document id with get_event_raw before you run any query. "
             "Judge the observations from these documents first. Then widen the search."
+        )
+    if any_query:
+        lines.append(
+            "Run the query of each observation to read its departure again. "
+            "Do not search for the departure from the start."
         )
     return "\n".join(lines)
 

@@ -207,3 +207,49 @@ export function scrollParent(el: HTMLElement | null): HTMLElement | null {
   }
   return (document.scrollingElement as HTMLElement | null) ?? null;
 }
+
+// ---- the age of a row -------------------------------------------------------
+
+/** An agent report older than this marks a list row stale. */
+export const AGENT_STALE_HOURS = 24;
+
+/** What the list knows about the sweep its rows come from. */
+export interface ListSweep {
+  /** Whether sweeps run on a schedule. null when the screen does not know. */
+  scheduleEnabled: boolean | null;
+  /** The age of the newest sweep in hours, from the summary. null when no
+   *  sweep is on record or the summary is not read. */
+  staleHours: number | null;
+}
+
+/**
+ * The tooltip of the stale marker on one row, or null for no marker.
+ *
+ * The list reads the agent state and the last-seen time from the last sweep.
+ * With the schedule off, the range listed an agent as last seen "3d ago"
+ * while its machine page read live activity from 52 minutes before. The
+ * marker says the row is old and why.
+ */
+export function agentStaleTitle(
+  lastReport: string | null | undefined,
+  sweep: ListSweep,
+  now: number = Date.now(),
+): string | null {
+  if (!lastReport) return null;
+  const at = Date.parse(lastReport);
+  if (!Number.isFinite(at)) return null;
+  const hours = (now - at) / 3_600_000;
+  if (hours <= AGENT_STALE_HOURS) return null;
+  const parts = [
+    `The agent last reported ${Math.floor(hours)} h ago.`,
+    'The list shows the state at the last sweep.',
+  ];
+  if (sweep.scheduleEnabled === false) parts.push('Automatic sweeps are off.');
+  parts.push(
+    sweep.staleHours != null
+      ? `The last sweep ran ${Math.round(sweep.staleHours)} h ago.`
+      : 'The time of the last sweep is not known.',
+  );
+  parts.push('The machine page shows live activity.');
+  return parts.join(' ');
+}

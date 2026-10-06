@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { middleEllipsis } from '../lib/text';
 import {
+  clearRulePrior,
   type DetectionNomination,
   type DetectionOverride,
   getDetectionTuning,
@@ -8,8 +9,78 @@ import {
   unmuteRule,
 } from '../lib/api';
 import { CollapseChevron } from '../components/Panel';
+import { OracleShadowTally } from './OracleShadowTally';
 import { ErrorState, LoadingState } from '../components/States';
+import {
+  RULE_PRIOR_COLUMN,
+  RULE_PRIOR_REASON,
+  RULE_PRIOR_SUSPENDED,
+  RULE_PRIOR_UNCHECKED,
+} from '../lib/tooltips';
 import { useAsync } from '../lib/useAsync';
+
+// The nominations grid. One template for the header and the rows, so the
+// columns cannot drift apart.
+const NOMINATION_COLS = 'grid-cols-[1fr_80px_120px_170px_110px_90px]';
+
+/**
+ * The Rule prior cell: what the rule prior did on this rule. Covered alerts
+ * and the real verdicts beside them; a suspension with its Clear button; or,
+ * when it covered nothing, why it held back on the newest alert.
+ */
+function RulePriorCell({
+  n,
+  busy,
+  onClear,
+}: {
+  n: DetectionNomination;
+  busy: boolean;
+  onClear: () => void;
+}) {
+  const covered = n.prior_covered ?? 0;
+  const agree = n.prior_agreements ?? 0;
+  const disagree = n.prior_disagreements ?? 0;
+  const unchecked = n.prior_unchecked ?? 0;
+  const reason = n.prior_last_reason ? RULE_PRIOR_REASON[n.prior_last_reason] : undefined;
+  return (
+    <div data-testid={`rule-prior-${n.rule_name}`} className="min-w-0 text-[11px] leading-[1.45]">
+      {covered > 0 ? (
+        <div className="font-mono text-dim">
+          covered {covered} · agree {agree} · disagree{' '}
+          <span className={disagree > 0 ? 'text-danger' : undefined}>{disagree}</span>
+          {unchecked > 0 && (
+            <span title={RULE_PRIOR_UNCHECKED} className="text-faint">
+              {' '}
+              · {unchecked} unchecked
+            </span>
+          )}
+        </div>
+      ) : (
+        <div className="text-faint" title={reason}>
+          {reason ? `not covered: ${reason}` : 'not covered'}
+        </div>
+      )}
+      {n.prior_suspended && (
+        <div className="mt-1 flex items-center gap-1.5">
+          <span
+            title={RULE_PRIOR_SUSPENDED}
+            className="rounded-chip border px-1.5 py-px text-[9.5px] font-semibold uppercase tracking-[.04em]"
+            style={{ color: '#f04438', borderColor: 'rgba(240,68,56,.35)', background: 'rgba(240,68,56,.08)' }}
+          >
+            Suspended
+          </span>
+          <button
+            onClick={onClear}
+            disabled={busy}
+            className="rounded-[7px] border border-border-strong bg-surface-3 px-[8px] py-[2px] text-[11px] font-semibold text-text hover:border-accent disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            Clear
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
 
 /** Color + label for a tuning recommendation. */
 function recBadge(rec: DetectionNomination['recommendation']): { color: string; label: string } {
@@ -114,10 +185,11 @@ export function DetectionTuningPanel({
         Nominated rules ({overridesKnown ? nominationCountLine(nominations) : '—'})
       </div>
       <div className="mb-4 overflow-hidden rounded-card border border-border bg-surface-1">
-        <div className="grid grid-cols-[1fr_80px_120px_110px_90px] gap-2 border-b border-border bg-surface-2 px-3.5 py-2 text-[10.5px] font-semibold uppercase tracking-[.06em] text-faint">
+        <div className={`grid ${NOMINATION_COLS} gap-2 border-b border-border bg-surface-2 px-3.5 py-2 text-[10.5px] font-semibold uppercase tracking-[.06em] text-faint`}>
           <div>Rule</div>
           <div>Alerts</div>
           <div>FP / TP / NMI</div>
+          <div title={RULE_PRIOR_COLUMN}>Rule prior</div>
           <div>Recommend</div>
           <div />
         </div>
@@ -139,7 +211,7 @@ export function DetectionTuningPanel({
             return (
               <div
                 key={n.rule_name}
-                className="grid grid-cols-[1fr_80px_120px_110px_90px] items-center gap-2 border-b border-border-faint px-3.5 py-3 last:border-b-0"
+                className={`grid ${NOMINATION_COLS} items-center gap-2 border-b border-border-faint px-3.5 py-3 last:border-b-0`}
               >
                 <div className="min-w-0">
                   <div className="truncate text-[13px] font-medium" title={n.rule_name}>
@@ -159,6 +231,7 @@ export function DetectionTuningPanel({
                 <div className="font-mono text-[11.5px] text-dim">
                   {n.fp} / {n.tp} / {n.nmi}
                 </div>
+                <RulePriorCell n={n} busy={busy} onClear={() => mutate(clearRulePrior(n.rule_name))} />
                 <div>
                   <span
                     className="inline-flex items-center gap-1.5 text-[11.5px]"
@@ -240,6 +313,9 @@ export function DetectionTuningPanel({
           </div>
         ))}
       </div>
+
+      {/* ── Oracle rule shadow ───────────────────────────────────────────── */}
+      <OracleShadowTally />
       </>
       )}
     </div>

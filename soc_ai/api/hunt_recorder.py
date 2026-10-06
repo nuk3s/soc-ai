@@ -14,6 +14,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from soc_ai.hunting.findings import plain_error
+from soc_ai.run_meter import RunMeter, SearchMeter
 from soc_ai.store import hunts as hunt_svc
 from soc_ai.store import leads as leads_store
 from soc_ai.store.models import Hunt
@@ -89,6 +90,14 @@ class HuntRecorder:
         self._error: dict[str, Any] | None = None
         self._finished = False
         self.hunt_id: str | None = None
+        # What the run costs, read off the events this recorder persists. A
+        # hunt runs the hunt budget, which is its standard class.
+        self._meter = RunMeter()
+        self._meter.observe("hunt_started", {"run_class": "standard"})
+
+    def attach_search_meter(self, meter: SearchMeter) -> None:
+        """Count the grid reads of the hunt this recorder tees (see run_meter)."""
+        self._meter.attach_search_meter(meter)
 
     async def start(self) -> str | None:
         try:
@@ -113,6 +122,7 @@ class HuntRecorder:
     async def record(self, kind: str, sequence: int, payload: dict[str, Any]) -> None:
         if self.hunt_id is None:
             return
+        self._meter.observe(kind, payload)
         # The stored event carries the time it was recorded under ``_at``. The
         # table has no time column, and the timeline showed every step with an
         # empty time. A copy, so the report the row lands is the agent's own.
@@ -173,6 +183,7 @@ class HuntRecorder:
                     status=final_status,
                     narrative=narrative,
                     report=report or None,
+                    counters=self._meter.finish(),
                 )
         except Exception:
             _LOGGER.exception("hunt recorder finalize failed")

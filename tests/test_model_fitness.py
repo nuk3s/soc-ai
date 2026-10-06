@@ -1054,3 +1054,105 @@ def test_notification_fires_only_when_the_alarm_is_raised(client: TestClient) ->
         loud = client.get("/api/v1/config/model-fitness?force=true").json()
     assert loud["alarm"] is True
     event_for2.assert_called_once()
+
+
+# ── Range dogfood 2026-10-05, M2: a leg that could not measure ────────────────
+#
+# The doctor told the operator to replace the analyst model after a 30 s gateway
+# timeout, while the same model landed 10 of 10 eval verdicts in that minute.
+# Each leg now states a cause when it could not measure the model, and the
+# doctor reads a failure with that cause as WARN "could not measure".
+
+
+async def test_a_cut_off_leg_carries_the_timeout_cause(monkeypatch) -> None:
+    monkeypatch.setattr(probes, "_FITNESS_LEG_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(probes, "_FITNESS_LEG_GRACE_S", 0.05)
+    with _patch_builder(_hanging_model(), _tool_calling_model(), _so_pass_model()):
+        result = await probes.probe_model_fitness(_settings())
+
+    leg = next(x for x in result["legs"] if x["name"] == "structured_output")
+    assert leg["grade"] == "fail"
+    assert leg["cause"] == probes.CAUSE_TIMEOUT
+
+
+async def test_a_connection_error_leg_carries_the_transport_cause() -> None:
+    import httpx
+
+    with _patch_builder(_erroring_model(httpx.ConnectError("connection refused"))):
+        result = await probes.probe_model_fitness(_settings())
+
+    leg = next(x for x in result["legs"] if x["name"] == "structured_output")
+    assert leg["grade"] == "fail"
+    assert leg["cause"] == probes.CAUSE_TRANSPORT
+    assert "could not reach the model" in leg["detail"]
+    assert "ConnectError" in leg["detail"]
+
+
+@pytest.mark.parametrize("status", [429, 502, 503, 504])
+async def test_a_gateway_status_leg_carries_the_transport_cause(status: int) -> None:
+    from pydantic_ai.exceptions import ModelHTTPError
+
+    with _patch_builder(_erroring_model(ModelHTTPError(status, "fit-test-model"))):
+        result = await probes.probe_model_fitness(_settings())
+
+    leg = next(x for x in result["legs"] if x["name"] == "structured_output")
+    assert leg["cause"] == probes.CAUSE_TRANSPORT
+    assert f"HTTP {status}" in leg["detail"]
+
+
+async def test_a_capability_failure_leg_has_no_cause() -> None:
+    """Negative control: a model that truncates is a capability result, not a cut-off."""
+    with _patch_builder(_truncating_model(), _tool_calling_model(), _so_pass_model()):
+        result = await probes.probe_model_fitness(_settings())
+
+    leg = next(x for x in result["legs"] if x["name"] == "structured_output")
+    assert leg["grade"] == "fail"
+    assert leg["cause"] is None
+
+
+async def test_a_server_error_500_stays_a_failure_with_no_cause() -> None:
+    """Negative control: a 500 can come from the model's own output, so it measures."""
+    from pydantic_ai.exceptions import ModelHTTPError
+
+    with _patch_builder(_erroring_model(ModelHTTPError(500, "fit-test-model"))):
+        result = await probes.probe_model_fitness(_settings())
+
+    leg = next(x for x in result["legs"] if x["name"] == "structured_output")
+    assert leg["grade"] == "fail"
+    assert leg["cause"] is None
+
+
+async def test_the_whole_probe_cap_marks_its_leg_as_a_timeout(monkeypatch) -> None:
+    monkeypatch.setattr(probes, "_FITNESS_TOTAL_TIMEOUT_S", 0.05)
+    with _patch_builder(_hanging_model()):
+        result = await probes.probe_model_fitness(_settings())
+
+    marker = next(x for x in result["legs"] if x["name"] == "probe_timeout")
+    assert marker["cause"] == probes.CAUSE_TIMEOUT
+
+
+async def test_the_doctor_reads_a_real_cut_off_probe_as_could_not_measure(monkeypatch) -> None:
+    """End to end: the real probe, a hanging model, and the doctor row it produces."""
+    from soc_ai import doctor
+
+    monkeypatch.setattr(probes, "_FITNESS_LEG_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(probes, "_FITNESS_LEG_GRACE_S", 0.05)
+    with _patch_builder(_hanging_model(), _tool_calling_model(), _so_pass_model()):
+        [row] = await doctor.check_model_fitness(_settings())
+
+    assert row.status == "WARN"
+    assert row.detail.startswith("could not measure fit-test-model.")
+    assert "structured_output" in row.detail
+    assert "ANALYST_MODEL" not in row.hint
+    assert "not a model capability result" in row.hint
+
+
+async def test_the_doctor_still_fails_a_real_capability_failure() -> None:
+    """Negative control on the same path: a truncating model is unfit, and the row says so."""
+    from soc_ai import doctor
+
+    with _patch_builder(_truncating_model(), _tool_calling_model(), _so_pass_model()):
+        [row] = await doctor.check_model_fitness(_settings())
+
+    assert row.status == "FAIL"
+    assert "ANALYST_MODEL" in row.hint

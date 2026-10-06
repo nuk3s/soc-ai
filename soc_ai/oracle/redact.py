@@ -358,7 +358,7 @@ def _redact_netbios_hostnames(text: str, mapping: Mapping) -> str:
     """
 
     def _sub(m: re.Match[str]) -> str:
-        return mapping.label_for(m.group(0), "HOST")
+        return mapping.label_for(m.group(0), "HOST", text_rule="NetBIOS name")
 
     text = _NETBIOS_PREFIX_RE.sub(_sub, text)
     text = _NETBIOS_SUFFIX_RE.sub(_sub, text)
@@ -524,7 +524,7 @@ def _redact_credentials(text: str, mapping: Mapping) -> str:
         val = m.group("val")
         if val.lower() in _NT_DOMAIN_STOPSET or _OPAQUE_LABEL_FULL_RE.match(val):
             return m.group(0)
-        return f"{m.group('key')}{mapping.label_for(val, 'HOST')}"
+        return f"{m.group('key')}{mapping.label_for(val, 'HOST', text_rule='account domain')}"
 
     text = _CRED_ACCOUNT_DOMAIN_RE.sub(_acct_domain_sub, text)
 
@@ -542,7 +542,7 @@ def _redact_credentials(text: str, mapping: Mapping) -> str:
             return m.group(0)
         out_dom = dom
         if dom.lower() not in _NT_DOMAIN_STOPSET and not _OPAQUE_LABEL_FULL_RE.match(dom):
-            out_dom = mapping.label_for(dom, "HOST")
+            out_dom = mapping.label_for(dom, "HOST", text_rule="logon domain")
         out_usr = usr if _is_nonusername_token(usr) else mapping.label_for(usr, "USER")
         # Reproduce the ORIGINAL separator (one or two backslashes) so a doubled
         # winlog/nested-JSON down-level name round-trips byte-for-byte.
@@ -859,8 +859,15 @@ def _build_learned_re(
     """
     if not mapping.forward:
         return None
-    # Filter out values that should not be globally propagated (short domain-like).
-    propagatable = [real for real in mapping.forward if real not in no_propagate]
+    # Filter out values that should not be globally propagated (short domain-like),
+    # and the host names a free-text rule labelled in place only: they failed
+    # the learned-host shape rule (soc_ai.oracle._cred_data.plausible_learned_host),
+    # so a later scan must not rewrite them everywhere either.
+    propagatable = [
+        real
+        for real in mapping.forward
+        if real not in no_propagate and real not in mapping.in_place_only
+    ]
     if not propagatable:
         return None
     # Sort longest first to prevent a shorter value from consuming a prefix of a
@@ -952,6 +959,7 @@ def _global_scan_pass(
     orig_to_ph: dict[str, str],
     learned_re: re.Pattern[str] | None,
     direct_replace: frozenset[str] = frozenset(),
+    _path: str = "",
 ) -> Any:
     """Walk *obj* and apply both learned-value replacement and shape rules.
 
@@ -963,6 +971,9 @@ def _global_scan_pass(
     the mapping.
     """
     if isinstance(obj, str):
+        # The field this string sits on: a host name a free-text rule learns
+        # here is marked with it, so a refusal can name the source.
+        mapping.scan_field = _path
         # (a.0) Re-fang first. A learned host written ``dc01[.]corp[.]local``
         # in a runbook must match the learned regex below; re-fanging only in
         # the shape pass (b) left it in clear for the residue gate to refuse.
@@ -1003,6 +1014,7 @@ def _global_scan_pass(
                 orig_to_ph=orig_to_ph,
                 learned_re=learned_re,
                 direct_replace=direct_replace,
+                _path=_path,
             ): _global_scan_pass(
                 v,
                 mapping,
@@ -1011,6 +1023,7 @@ def _global_scan_pass(
                 orig_to_ph=orig_to_ph,
                 learned_re=learned_re,
                 direct_replace=direct_replace,
+                _path=f"{_path}.{k}" if _path else str(k),
             )
             for k, v in obj.items()
         }
@@ -1024,6 +1037,7 @@ def _global_scan_pass(
                 orig_to_ph=orig_to_ph,
                 learned_re=learned_re,
                 direct_replace=direct_replace,
+                _path=_path,
             )
             for item in obj
         ]
@@ -1037,6 +1051,7 @@ def _global_scan_pass(
                 orig_to_ph=orig_to_ph,
                 learned_re=learned_re,
                 direct_replace=direct_replace,
+                _path=_path,
             )
             for item in obj
         )
@@ -1139,11 +1154,13 @@ def sanitize_case(
         if real not in pre_pass2_values
         and len(real) >= 4
         and real not in _np
+        and real not in mapping.in_place_only
         and not _is_nonusername_token(real)
     }
     resweep_re = _build_resweep_re(newly_learned)
     if resweep_re is not None:
         result = _resweep_learned(result, mapping, resweep_re)
+    mapping.scan_field = ""
 
     if no_propagate_out is not None:
         no_propagate_out.update(no_propagate)

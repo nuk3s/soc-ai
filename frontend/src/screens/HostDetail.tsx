@@ -39,6 +39,7 @@ import { SHOWN_ERRORS, sweepErrorList } from '../lib/sweepErrors';
 import { absTime } from '../lib/timeRange';
 import type { Dossier, DossierRefreshStatus, HostActivityRange, MachineDetail } from '../lib/types';
 import { useAsync } from '../lib/useAsync';
+import { useOptionalShell } from '../shell/ShellContext';
 import { BehaviouralProfile } from '../components/BehaviouralProfile';
 import { HostObservations } from '../components/HostObservations';
 import { LeadsStrip } from '../components/LeadsStrip';
@@ -532,6 +533,14 @@ export function HostDetail() {
   const fromList = (location.state as HostsLocationState | null)?.fromList ?? null;
   const backTo = fromList ?? listUrlToReturnTo();
   const crumb = machine ? (machine.name ?? machine.primary_ip) : param;
+  // The top bar names the machine too. It read the raw key.
+  const setCrumbName = useOptionalShell()?.setCrumbName;
+  const crumbName = machine ? (machine.name ?? machine.primary_ip) : null;
+  useEffect(() => {
+    if (!setCrumbName || !crumbName) return;
+    setCrumbName({ key: param, name: crumbName });
+    return () => setCrumbName(null);
+  }, [setCrumbName, param, crumbName]);
 
   return (
     // The dock at the bottom right is fixed to the viewport. Without the

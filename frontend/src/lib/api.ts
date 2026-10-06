@@ -1051,6 +1051,17 @@ export interface DetectionNomination {
   override_fp: number;
   chat_resolved: number;
   manual_resolved: number;
+  /** The rule prior's record on this rule over the last 30 days. Absent on a
+   *  backend that predates the rule prior. */
+  prior_covered?: number;
+  prior_agreements?: number;
+  prior_disagreements?: number;
+  /** Covered alerts with no real run (live mode, not sampled). */
+  prior_unchecked?: number;
+  /** A real run disagreed with the prior. It stays off for the rule until an analyst clears it. */
+  prior_suspended?: boolean;
+  /** Why the prior held back on the newest alert it did not cover. */
+  prior_last_reason?: string | null;
 }
 
 /** An active operator override (a soft, reversible mute). */
@@ -1072,6 +1083,31 @@ export interface DetectionTuning {
 /** Nominated noisy rules + the active soft-mute overrides. */
 export function getDetectionTuning(): Promise<DetectionTuning> {
   return request<DetectionTuning>('/detection-tuning');
+}
+
+/** One reason of one Oracle rule in the shadow tally. `overlap` counts the
+ * runs of this row that the other rule sends too. */
+export interface OracleShadowReason {
+  rule: 'uncertainty' | 'classic' | string;
+  reason: string;
+  count: number;
+  overlap: number;
+}
+
+/** What the uncertainty rule would send beside what the classic rule sent,
+ * from the `oracle_shadow` events of the last `days` days. */
+export interface OracleShadowTally {
+  mode: string;
+  days: number;
+  recorded: number;
+  would_escalate: number;
+  classic: number;
+  both: number;
+  by_reason: OracleShadowReason[];
+}
+
+export function getOracleShadowTally(days = 7): Promise<OracleShadowTally> {
+  return request<OracleShadowTally>(`/detection-tuning/oracle-shadow?days=${days}`);
 }
 
 /** One redacted span: the opaque label, the real value it replaced, and the
@@ -1165,6 +1201,13 @@ export function muteRule(rule_name: string, reason?: string): Promise<DetectionO
 /** Un-mute a rule by deactivating its override. */
 export function unmuteRule(id: number): Promise<{ removed: boolean }> {
   return post<{ removed: boolean }>(`/detection-tuning/override/${id}/remove`);
+}
+
+/** Clear the rule prior's suspension of a rule after an analyst looked. */
+export function clearRulePrior(rule_name: string): Promise<{ rule_name: string; cleared: number }> {
+  return post<{ rule_name: string; cleared: number }>('/detection-tuning/rule-prior/clear', {
+    rule_name,
+  });
 }
 
 // ── Operator runbooks (the agent's lookup_runbook tool searches these) ─────
@@ -1374,6 +1417,10 @@ export interface PriorCoverage {
    *  the estate. Absent from an older backend. */
   recent_cap?: number;
   capped?: boolean;
+  /** Why the blind entities are blind, when the sweep could name one reason
+   *  for them. A live analytic that reads a baseline shape the store does not
+   *  hold yet says so here. Absent from an older backend. */
+  blind_reason?: string | null;
 }
 
 export interface HuntCatalogSpec {
@@ -1387,7 +1434,9 @@ export interface HuntCatalogSpec {
   /** Which loop runs this spec. `match` is swept by the catalog sweep and
    *  every `last_*`/`*_24h` field below describes that sweep. `profile` is
    *  answered from stored behavioural baselines by `soc-ai priors` and is NOT
-   *  swept here, so those fields describe a loop that no longer runs it. */
+   *  swept here, so those fields describe a loop that no longer runs it.
+   *  `model` runs a tier 3 detector in the same profile sweep and reads the
+   *  same trail. `lib/analyticRuns.ts` holds the set of the profile sweep. */
   evaluator: string;
   /** The prior sweep's newest verdict for a `profile` spec: (spec, entity)
    *  evaluations by coverage state. Null for a `match` spec, and for a profile
@@ -1434,6 +1483,9 @@ export interface HuntCatalogSpec {
    *  A retired analytic stays in the list with its ledger and its reason, so
    *  the row has to say that it no longer runs. */
   status?: string;
+  /** The reason of a system demotion that holds the analytic in shadow now.
+   *  Null for a shadow an analyst chose. Absent from an older backend. */
+  held_by_system?: string | null;
 }
 
 /** GET /hunt-catalog — every spec in catalog order plus the sweep loop's
@@ -2652,8 +2704,13 @@ export interface LeadObservation {
   kind: string;
   summary: string | null;
   occurrences: number;
+  /** The time soc-ai wrote or refreshed the row. */
   born_at: string | null;
   first_seen_at: string | null;
+  /** The newest document time the observation cites. The live weight decays
+   *  from it. Null when the writer had no document time, and absent on an
+   *  older server. */
+  observed_at?: string | null;
   /** Which source wrote it: profile, catalog, alert, hunt or candidate. */
   source: string;
   /** True when the analytic that wrote it is not live. */
@@ -2742,6 +2799,16 @@ export interface LeadObservationDetail extends LeadObservation {
   weight_now: number;
   birth_weight: number;
   evidence: Record<string, unknown> | null;
+  /** The statistic that departed, its value and the value of the baseline it
+   *  departed from. Null on a row that predates them, and absent on an older
+   *  server. lib/statistics.ts states them in words. */
+  statistic?: string | null;
+  statistic_value?: number | null;
+  baseline_value?: number | null;
+  /** Up to 10 document ids the observation cites. */
+  document_ids?: string[];
+  /** The OQL query that shows the departure again. */
+  rerun_query?: string | null;
 }
 
 /** The live weight of one type on a lead. One type saturates at `cap`, so a
@@ -3045,6 +3112,10 @@ export interface AnalyticHit {
   lead_id: number | null;
   lead_status: string | null;
   document_count: number;
+  /** False when the catalog no longer lists the analytic. The hit stays on
+   *  the list, and its title opens no drawer. Absent from an older server,
+   *  which reads as true. */
+  analytic_exists?: boolean;
 }
 
 /** One count per filter chip. A chip states the number it would show. */
@@ -3092,6 +3163,9 @@ export interface AnalyticRow {
   /** The generalization check's sentences on a drafted analytic that names
    *  the entity of its one case. Empty or absent for every other analytic. */
   pinned?: string[];
+  /** The reason soc-ai moved this analytic from live to shadow, while that
+   *  demotion holds it there. null or absent for every other analytic. */
+  held_by_system?: string | null;
 }
 
 export interface AnalyticsList {
@@ -3109,6 +3183,34 @@ export interface AnalyticVersion {
   at: string;
   why: string | null;
   has_receipts: boolean;
+  /** soc-ai made this change, and no analyst. Absent from an older server. */
+  system?: boolean;
+  /** The numbers a system demotion was taken on. null on every other row. */
+  evidence?: AnalyticDemotionEvidence | null;
+}
+
+/** One budget or floor that a live analytic breached. `rule` names which.
+ *  The numbers are the ones the hold read from the store. */
+export interface AnalyticBreach {
+  rule: string;
+  hits?: number;
+  budget?: number;
+  precision?: number;
+  floor?: number;
+  reached?: number;
+  closed_clean?: number;
+  decided?: number;
+  /** The hours the fire budget read. Under 24 when the analytic went live
+   *  again inside the day. */
+  window_hours?: number;
+  window_start?: string;
+  window_end?: string;
+  [key: string]: unknown;
+}
+
+export interface AnalyticDemotionEvidence {
+  breaches?: AnalyticBreach[];
+  [key: string]: unknown;
 }
 
 /** The outcome ledger of one analytic over one window. Computed on read and
@@ -3176,6 +3278,11 @@ export interface EntityObservation {
   /** The label the server wrote for this kind. Absent on a route that sends
    *  none, and the table in lib/kinds.ts answers instead. */
   kind_label?: string | null;
+  /** The statistic that departed, its value and the baseline value. Null on a
+   *  row that predates them, and absent on an older server. */
+  statistic?: string | null;
+  statistic_value?: number | null;
+  baseline_value?: number | null;
 }
 
 export interface EntityObservations {
@@ -3192,15 +3299,18 @@ export function getShadowHits(limit = 50): Promise<ShadowHits> {
   return request<ShadowHits>(`/hunts/shadow-hits?limit=${limit}`);
 }
 
-/** Every analytic hit of the window, live first and then shadow, unread first.
- *  A parameter the caller leaves out is the server's default. */
+/** Every analytic hit of the window. Under `all` the unread shadow hits come
+ *  first, then the live hits, then the read shadow hits. `limit` and `offset`
+ *  page through that one order. A parameter the caller leaves out is the
+ *  server's default. */
 export function getAnalyticHits(
-  opts: { days?: number; filter?: AnalyticHitFilter; limit?: number } = {},
+  opts: { days?: number; filter?: AnalyticHitFilter; limit?: number; offset?: number } = {},
 ): Promise<AnalyticHits> {
   const query = new URLSearchParams();
   if (opts.days !== undefined) query.set('days', String(opts.days));
   if (opts.filter !== undefined) query.set('filter', opts.filter);
   if (opts.limit !== undefined) query.set('limit', String(opts.limit));
+  if (opts.offset !== undefined) query.set('offset', String(opts.offset));
   const tail = query.toString();
   return request<AnalyticHits>(`/hunts/hits${tail ? `?${tail}` : ''}`);
 }

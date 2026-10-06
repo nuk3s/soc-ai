@@ -385,9 +385,9 @@ async def _run_with_oracle(
 ) -> list[Any]:
     """Drive a full investigation whose Oracle returns ``oracle_verdict``.
 
-    The local synth is scripted unsure so the run escalates on the confidence
-    trigger, which is the route a refused decoy actually takes: the local gate
-    caps it at 0.4, below ``oracle_escalate_below_confidence``.
+    The local synth is scripted unsure, inside the gate band, so the run
+    escalates on the uncertainty rule. That is the route a refused decoy
+    actually takes: the local gate caps it at 0.4, the bottom of the band.
     """
     from pydantic_ai.models.test import TestModel
     from soc_ai.agent.orchestrator import investigate
@@ -395,7 +395,6 @@ async def _run_with_oracle(
 
     settings.investigate_when_unsure = False
     settings.oracle_enabled = True
-    settings.oracle_escalate_below_confidence = 0.6
 
     fake_es = AsyncMock()
     with patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=fake_es):
@@ -404,7 +403,7 @@ async def _run_with_oracle(
 
     local = TriageReport(
         verdict="needs_more_info",
-        confidence=0.3,
+        confidence=0.45,
         summary="Local model is unsure.",
         citations=["alert.event_dataset"],
         recommended_actions=[],
@@ -420,6 +419,8 @@ async def _run_with_oracle(
         ),
         redaction_summary={},
         oracle_model="test-oracle",
+        # A class change needs a citation that resolves (2026-10-04).
+        oracle_citations=["alert-001"],
     )
 
     async def _stub_enriched(alert_id: str, **_kw: Any) -> Any:
@@ -445,9 +446,9 @@ async def test_the_oracle_cannot_close_a_decoy_the_local_path_refused(
 ) -> None:
     """The refusal itself is what sends the case to the Oracle.
 
-    Capping a refused decoy at 0.4 puts it under
-    ``oracle_escalate_below_confidence``, so the Oracle is asked exactly the
-    question the local path just declined to answer benign. Without parity the
+    Capping a refused decoy at 0.4 puts it in the gate band, so the Oracle is
+    asked exactly the question the local path just declined to answer benign.
+    Without parity the
     Oracle's false_positive lands unrefused and the gate is a detour.
     """
     events = await _run_with_oracle(

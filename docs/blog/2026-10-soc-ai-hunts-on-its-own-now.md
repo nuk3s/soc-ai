@@ -14,7 +14,7 @@ Nine more analytics are profiles, and each one compares a machine with its own b
 
 Take the September chain from the range. The Kerberoast left an event 4769 on the domain controller and the DCSync left a 4662, and both analytics fired on them. Each hit became an observation on what it named. Observations decay over about 48 hours and they stack, so one odd event fades out while a few on the same machine add up past a threshold. These formed a lead on the domain controller that cites both the 4662 and the 4769.
 
-Every lead starts its own hunt. You read what the hunt found and promote the finding you believe, and that becomes an investigation that ends in a verdict with its evidence attached. On the Hunts page all of that reads left to right, and a "Needs you" strip lists whatever is waiting on you. Every analytic has a status (candidate, shadow, live, retired) and a ledger of what it produced: the observations it wrote, the leads it fed, and how those leads ended. You approve a shadow analytic to live once you've watched it for a while, and you retire one with a reason.
+Every lead starts its own hunt. You read what the hunt found and promote the finding you believe, and that becomes an investigation that ends in a verdict with its evidence attached. On the Hunts page all of that reads left to right, and a "Needs you" strip lists whatever is waiting on you. Every analytic has a status: candidate, shadow, live or retired. It also has a ledger of what it produced: the observations it wrote, the leads it fed, and how those leads ended. You approve a shadow analytic to live once you've watched it for a while, and you retire one with a reason.
 
 ![How hunting flows: analytic, hit, lead, hunt, investigation](../img/hunting-flow.svg)
 
@@ -36,9 +36,9 @@ From August 7, when the host dossier shipped, the Hosts page showed one row per 
 
 > I am not convinced that the search works. The columns cannot be filtered or sorted. There is clearly an issue with hosts with multiple nics being displayed multiple times.
 
-All three were right. Two agent hosts couldn't even be found by search. Their one-word hostnames are also public top-level domains (there are about 1,400 of those), and the name filter I'd written to throw out junk like a bare "com" was throwing out each agent's own report of its name.
+All three were right. Two agent hosts couldn't even be found by search. Their one-word hostnames are also public top-level domains, and there are about 1,400 of those. The name filter I'd written to throw out junk like a bare "com" was throwing out each agent's own report of its name.
 
-It's one row per machine now. Addresses group by agent identity first, then by a container bridge that agent owns, then by DHCP lease MAC, then by a name only one machine has, and each machine gets a stable key. Every column sorts both ways, and Role, Agent, Activity and First seen have filters in the header. One search box finds names, addresses (exact match first, then prefix), MACs, OS, role and agent name, and it searches every machine whether or not the list is filtered. Back takes you to the page and scroll position you left, because the list state lives in the URL. Each card above the list is a link to the filter it counts.
+It's one row per machine now. Addresses group by agent identity first, then by a container bridge that agent owns, then by DHCP lease MAC, then by a name only one machine has, and each machine gets a stable key. Every column sorts both ways, and Role, Agent, Activity and First seen have filters in the header. One search box finds names, addresses, MACs, OS, role and agent name, and it searches every machine whether or not the list is filtered. An address matches exactly first, then by prefix. Back takes you to the page and scroll position you left, because the list state lives in the URL. Each card above the list is a link to the filter it counts.
 
 ![The Hosts page: one row per machine, with the cards, the role bar and the sortable table](../img/screenshot-hosts.png)
 
@@ -56,7 +56,7 @@ Now soc-ai counts what kinds of data a machine ships, with numbers: host logs, p
 
 1.4.0 added an eval that plants an attack, runs the hunt, promotes the finding, reads the verdict and scores each step, so you can see which step broke. Every synthetic run is marked as synthetic wherever you'd see it. I also ran the same eval batch twice on code that couldn't have changed a verdict, and six of 25 scenarios flipped between pass and fail. That's the noise floor, and it's why the eval never moves a threshold on one batch.
 
-The audit chain check now reads the newest seven days first, a page at a time, and it tells duplicate sequence numbers (two writers at once) apart from an altered record. `soc-ai doctor` and the preflight both carry an audit-chain row. And model text gets a secret scrub before soc-ai stores it, so a password the model read out of a file in the telemetry never lands in a report.
+The audit chain check now reads the newest seven days first, a page at a time, and it tells duplicate sequence numbers apart from an altered record. Two writers at once leave duplicates. `soc-ai doctor` and the preflight both carry an audit-chain row. And model text gets a secret scrub before soc-ai stores it, so a password the model read out of a file in the telemetry never lands in a report.
 
 ## Turning on TLS
 

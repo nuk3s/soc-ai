@@ -32,7 +32,7 @@ import { DraftDetectionPane } from '../components/DraftDetectionPane';
 import { Markdown } from '../components/Markdown';
 import { EntityGraph } from '../components/EntityGraph';
 import { Panel } from '../components/Panel';
-import { KindBadge, RecordedRunChip, SeverityTag, SyntheticEvalBadge, VerdictPill } from '../components/Badges';
+import { KindBadge, RecordedRunChip, RunClassChip, SeverityTag, SyntheticEvalBadge, VerdictPill } from '../components/Badges';
 import { Spinner } from '../components/States';
 import {
   ApiError,
@@ -56,6 +56,7 @@ import { plural } from '../lib/plural';
 import { firstSentence } from '../lib/text';
 import {
   CHIP_SUBJECT_HUNT,
+  ORACLE_REASON,
   SUBJECT_DOCUMENTS,
   SUBJECT_FINDINGS,
   SUBJECT_HUNT_LINK,
@@ -153,6 +154,33 @@ const FALLBACK_SUMMARY_RE = /^Synth-first pipeline fallback:/;
 
 /** The count the page shows for tool calls: the rows of the "Tool calls"
  *  section. The backend counts the same rows, so the two cannot disagree. */
+/** The ends of the alert, from its own fields, and the host that reported it.
+ *
+ *  The chip read the host name of the alert as the source and the source
+ *  address as the destination when the alert named no destination. A grid
+ *  node login failure read "source <node> to destination <attacker>". The
+ *  reporter is named "on <host>" and never sits in a direction slot. */
+export function alertEnds(
+  inv: Pick<Inv, 'host' | 'ip' | 'srcIp' | 'dstIp' | 'reportedBy'>,
+): { src: string | null; dst: string | null; on: string | null; title: string } | null {
+  const shown = (v: string | null | undefined) => (v && v !== '\u2014' ? v : null);
+  // An older server sends only the two display strings.
+  const older = inv.srcIp === undefined && inv.dstIp === undefined && inv.reportedBy === undefined;
+  const src = older ? shown(inv.host) : shown(inv.srcIp);
+  const dst = older ? shown(inv.ip) : shown(inv.dstIp);
+  const reporter = shown(inv.reportedBy);
+  const on = reporter && reporter !== src && reporter !== dst ? reporter : null;
+  if (!src && !dst && !on) return null;
+  const title = [
+    src ? `Source ${src}.` : 'The alert names no source.',
+    dst ? `Destination ${dst}.` : 'The alert names no destination.',
+    on ? `The host ${on} reported the alert.` : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
+  return { src, dst, on, title };
+}
+
 export function toolCallCount(inv: Pick<Inv, 'timeline'>): number {
   return inv.timeline.filter((s) => s.group === 'Tool calls').length;
 }
@@ -479,6 +507,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   // objective and a set of findings where an alert run has a rule and an
   // event. Two panels there would give one run two subjects.
   const huntSubject = inv.subject?.type === 'hunt' ? inv.subject : null;
+  const ends = alertEnds(inv);
 
   // ── composable section blocks (arranged differently per layout) ──────────
   const toolbarEl = (
@@ -655,6 +684,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
             THIS panel instead — the marker must survive every terminal state,
             or an errored synthetic run reads as a real failed investigation. */}
         {inv.isSynthEval && <SyntheticEvalBadge />}
+        <RunClassChip runClass={inv.runClass} />
         <div className="flex-1" />
         <div className="font-mono text-[12.5px] text-faint">elapsed {fmt(elapsed)}</div>
       </div>
@@ -738,6 +768,8 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
         {/* A run against planted synthetic scenarios must never read as a
             real one — badged right beside the verdict. */}
         {inv.isSynthEval && <SyntheticEvalBadge />}
+        {/* What the run was allowed to spend, beside what it concluded. */}
+        <RunClassChip runClass={inv.runClass} />
         {demo && <RecordedRunChip />}
         {/* What this run read, in one line. A hunt subject has no severity
             and no pair of endpoints: the severity and the two addresses on
@@ -770,15 +802,37 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
                 header row and wraps internally when genuinely out of space —
                 the FULL destination is always visible, never clipped to a
                 fragment. */}
-            <span
-              data-testid="verdict-endpoints"
-              className="min-w-0 max-w-full rounded-badge border border-border-input px-2 py-[3px] font-mono text-[12px] text-dim"
-              title={`source ${inv.host} → destination ${inv.ip}`}
-            >
-              <span className="break-all text-mono-amber">{inv.host}</span>
-              <span className="text-faint"> → </span>
-              <span className="break-all text-mono-green">{inv.ip}</span>
-            </span>
+            {ends && (
+              <span
+                data-testid="verdict-endpoints"
+                className="min-w-0 max-w-full rounded-badge border border-border-input px-2 py-[3px] font-mono text-[12px] text-dim"
+                title={ends.title}
+              >
+                {ends.src && ends.dst ? (
+                  <>
+                    <span data-testid="endpoint-src" className="break-all text-mono-amber">{ends.src}</span>
+                    <span className="text-faint"> → </span>
+                    <span data-testid="endpoint-dst" className="break-all text-mono-green">{ends.dst}</span>
+                  </>
+                ) : ends.src ? (
+                  <>
+                    <span className="text-faint">from </span>
+                    <span data-testid="endpoint-src" className="break-all text-mono-amber">{ends.src}</span>
+                  </>
+                ) : ends.dst ? (
+                  <>
+                    <span className="text-faint">to </span>
+                    <span data-testid="endpoint-dst" className="break-all text-mono-green">{ends.dst}</span>
+                  </>
+                ) : null}
+                {ends.on && (
+                  <>
+                    <span className="text-faint">{ends.src || ends.dst ? ' on ' : 'on '}</span>
+                    <span data-testid="endpoint-on" className="break-all text-text-2">{ends.on}</span>
+                  </>
+                )}
+              </span>
+            )}
           </>
         )}
         {inv.oracle?.escalated && (
@@ -1865,13 +1919,16 @@ function HeuristicBadge() {
 }
 
 function OracleBadge({ oracle }: { oracle: OracleAdjudication }) {
-  const overrode = oracle.changed;
+  // A withheld disagreement changed nothing: the local verdict stands.
+  const overrode = oracle.changed && !oracle.withheld;
   const hasVerdict = !!oracle.oracleVerdict;
-  const label = overrode
-    ? `Oracle overrode: ${oracle.localVerdict} → ${oracle.oracleVerdict}`
-    : hasVerdict
-      ? `Oracle upheld ${oracle.oracleVerdict}`
-      : 'Oracle consulted';
+  const label = oracle.withheld
+    ? `Oracle opinion: ${oracle.oracleVerdict}. The local verdict stands`
+    : overrode
+      ? `Oracle overrode: ${oracle.localVerdict} → ${oracle.oracleVerdict}`
+      : hasVerdict
+        ? `Oracle upheld ${oracle.oracleVerdict}`
+        : 'Oracle consulted';
   const borderColor = overrode ? 'rgba(139,92,246,.55)' : 'rgba(139,92,246,.3)';
   const bg = overrode ? 'rgba(139,92,246,.18)' : 'rgba(139,92,246,.07)';
   const textColor = overrode ? '#c4b5fd' : '#a78bfa';
@@ -1888,7 +1945,8 @@ function OracleBadge({ oracle }: { oracle: OracleAdjudication }) {
 
 /** Broken-out Oracle adjudication card rendered below the verdict hero block. */
 function OracleCard({ oracle }: { oracle: OracleAdjudication }) {
-  const overrode = oracle.changed;
+  // A withheld disagreement changed nothing: the local verdict stands.
+  const overrode = oracle.changed && !oracle.withheld;
   return (
     <div
       className="rounded-card border px-3.5 py-3"
@@ -1911,7 +1969,8 @@ function OracleCard({ oracle }: { oracle: OracleAdjudication }) {
       {/* escalation reason */}
       {oracle.reason && (
         <div className="mb-2 text-[12px] text-dim">
-          <span className="text-faint">Escalated because: </span>{oracle.reason}
+          <span className="text-faint">Escalated because: </span>
+          {ORACLE_REASON[oracle.reason] ?? oracle.reason}
         </div>
       )}
 
@@ -1959,13 +2018,21 @@ function OracleCard({ oracle }: { oracle: OracleAdjudication }) {
                     : { color: '#6ee7b7', background: 'rgba(110,231,183,.1)' }
                 }
               >
-                {overrode ? 'overrode' : 'upheld'}
+                {oracle.withheld ? 'opinion only' : overrode ? 'overrode' : 'upheld'}
               </span>
             </span>
           )}
           {!oracle.oracleVerdict && (
             <span className="text-[12px] text-faint italic">Oracle did not return a verdict</span>
           )}
+        </div>
+      )}
+
+      {/* a disagreement with no evidence that resolves: an opinion, never an override */}
+      {oracle.withheld && (
+        <div data-testid="oracle-opinion-note" className="mb-1 text-[12px] text-dim">
+          The Oracle cited no evidence that resolves. Its answer is an opinion. The local
+          verdict stands, and soc-ai does not acknowledge the alert on it.
         </div>
       )}
 
@@ -2260,7 +2327,7 @@ function ActionCard({
                 system suffix. */}
             {(!applied || !action.appliedNote) && (
               <span className="font-mono text-[11px] font-normal text-faint">
-                {applied ? '· system · automatic' : `· ${executedBy ?? 'you'} · just now`}
+                {applied ? '· system · automatic' : `· ${executedBy ?? 'you'} · now`}
               </span>
             )}
           </div>

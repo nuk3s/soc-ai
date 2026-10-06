@@ -22,7 +22,7 @@ import {
 } from '../lib/api';
 import { CHIP_LIVE, DEFINE_ANALYTIC } from '../lib/tooltips';
 import { ShellProvider } from '../shell/ShellContext';
-import { AnalyticDrawer } from './AnalyticDrawer';
+import { AnalyticDrawer, breachLine } from './AnalyticDrawer';
 
 const HOUR = 3_600_000;
 const iso = (msAgo: number) => new Date(Date.now() - msAgo).toISOString();
@@ -179,6 +179,25 @@ describe('AnalyticDrawer', () => {
     );
   });
 
+  // `t_run_analytic` returns could_not_run for a profile or a model
+  // analytic. The drawer offered the control and the hunt failed on step one.
+  it.each(['profile', 'model'])('offers no hunt on a live %s analytic and says why', async (evaluator) => {
+    vi.mocked(getAnalytic).mockResolvedValue({ ...DETAIL, evaluator });
+    mount();
+    expect(await screen.findByTestId('analytic-no-hunt')).toBeTruthy();
+    expect(screen.getByTestId('analytic-no-hunt').textContent).toBe(
+      'A hunt cannot run this analytic. The profile sweep runs it every hour.',
+    );
+    expect(screen.queryByRole('button', { name: 'Hunt with this' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Retire' })).toBeTruthy();
+  });
+
+  it('offers the hunt on a live match analytic with no line', async () => {
+    mount();
+    expect(await screen.findByRole('button', { name: 'Hunt with this' })).toBeTruthy();
+    expect(screen.queryByTestId('analytic-no-hunt')).toBeNull();
+  });
+
   it('keeps every action button on one line', async () => {
     mount();
     const retire = await screen.findByRole('button', { name: 'Retire' });
@@ -296,6 +315,37 @@ describe('AnalyticDrawer run state and counts', () => {
     expect(within(cell).getByText('profile runs')).toBeTruthy();
     expect(cell.textContent).not.toContain('documents');
     expect(cell.textContent).not.toContain('sweeps');
+    expect(cell.textContent).not.toContain('detector');
+    expect(cell.getAttribute('title')).toContain('stored baselines');
+  });
+
+  // A learned detector reads the grid and builds its own baseline. The cell
+  // read "4 profile runs" with a tooltip about stored baselines.
+  it('reads the cost of a model analytic as detector runs', async () => {
+    vi.mocked(getAnalytic).mockResolvedValue({
+      ...DETAIL,
+      evaluator: 'model',
+      ledger: { ...DETAIL.ledger, docs_scanned: 0, runtime_ms: 0, sweeps: 0, profile_runs: 6 },
+    });
+    mount();
+    const cell = await screen.findByTestId('ledger-cost');
+    expect(within(cell).getByText('6')).toBeTruthy();
+    expect(within(cell).getByText('detector runs')).toBeTruthy();
+    expect(cell.textContent).not.toContain('profile run');
+    expect(cell.textContent).not.toContain('documents');
+    expect(cell.getAttribute('title')).toContain('builds its own baseline');
+    expect(cell.getAttribute('title')).not.toContain('stored baselines');
+  });
+
+  it('says one detector run in the singular', async () => {
+    vi.mocked(getAnalytic).mockResolvedValue({
+      ...DETAIL,
+      evaluator: 'model',
+      ledger: { ...DETAIL.ledger, profile_runs: 1 },
+    });
+    mount();
+    const cell = await screen.findByTestId('ledger-cost');
+    expect(within(cell).getByText('detector run')).toBeTruthy();
   });
 
   it('counts a match analytic in the right number', async () => {
@@ -367,5 +417,148 @@ describe('AnalyticDrawer wording', () => {
     mount();
     const line = await screen.findByTestId('define-analytic');
     expect(line.textContent).toContain(DEFINE_ANALYTIC);
+  });
+});
+
+// The self-healing hold moves a live analytic back to shadow. The drawer must
+// say that soc-ai did it, why, and on which numbers, so a hold never reads as
+// a shadow week an analyst started.
+describe('AnalyticDrawer, a system demotion', () => {
+  const REASON =
+    'The analytic wrote 42 hits in 24 hours. Its fire budget is 10 a day.';
+  const HELD: AnalyticDetail = {
+    ...DETAIL,
+    status: 'shadow',
+    reason: REASON,
+    held_by_system: REASON,
+    versions: [
+      ...DETAIL.versions,
+      {
+        from_status: 'live',
+        to_status: 'shadow',
+        who: 'system:self-heal',
+        at: iso(1 * HOUR),
+        why: REASON,
+        has_receipts: false,
+        system: true,
+        evidence: {
+          breaches: [
+            { rule: 'fire_budget', hits: 42, budget: 10 },
+            { rule: 'precision_floor', precision: 0.1, floor: 0.3, reached: 1, decided: 10 },
+          ],
+        },
+      },
+    ],
+  };
+
+  it('states the hold and its reason under the description', async () => {
+    vi.mocked(getAnalytic).mockResolvedValue(HELD);
+    mount();
+    const box = await screen.findByTestId('analytic-held');
+    expect(box.textContent).toContain('soc-ai moved this analytic to shadow.');
+    expect(box.textContent).toContain(REASON);
+    expect(box.textContent).toContain('soc-ai does neither.');
+    // The reason is said once, in the hold box.
+    expect(screen.queryByText(`Reason on record: ${REASON}`)).toBeNull();
+  });
+
+  // N3 of the 2026-10-05 verification. The box said "retire it" over a
+  // control that reads "Reject".
+  it('names the two controls the analyst selects', async () => {
+    vi.mocked(getAnalytic).mockResolvedValue(HELD);
+    mount();
+    const box = await screen.findByTestId('analytic-held');
+    expect(box.textContent).toContain(
+      'Then select Approve or Reject. Approve puts the analytic back to live. Reject retires it.',
+    );
+    expect(box.textContent).not.toContain('approve it to live or retire it');
+    // Each name the box uses is a control on the drawer.
+    expect(screen.getByRole('button', { name: 'Approve' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Reject' })).toBeTruthy();
+    expect(box.title).toContain('Then select Approve or Reject.');
+  });
+
+  it('marks the system row in the ledger and prints its evidence', async () => {
+    vi.mocked(getAnalytic).mockResolvedValue(HELD);
+    mount();
+    const versions = await screen.findByTestId('analytic-versions');
+    const newest = versions.firstElementChild as HTMLElement;
+    expect(newest.textContent).toContain('live → shadow');
+    expect(within(newest).getByTestId('version-system').textContent).toBe('soc-ai');
+    expect(newest.textContent).toContain(`"${REASON}"`);
+    const evidence = within(newest).getByTestId('version-evidence');
+    expect(evidence.textContent).toContain('42 hits in 24 h · budget 10 a day');
+    expect(evidence.textContent).toContain('precision 0.10 on 10 hunted leads');
+    expect(evidence.textContent).toContain('floor 0.30');
+    // A system demotion carries evidence, and no approval receipts.
+    expect(within(newest).queryByText('evidence')).toBeNull();
+  });
+
+  // The ship row "new to shadow" by system:catalog wore the amber chip, so a
+  // ship read as a demotion. It gets a neutral chip. The self-heal row keeps
+  // the amber one.
+  it('marks the ship row neutral and the self-heal row amber', async () => {
+    vi.mocked(getAnalytic).mockResolvedValue({
+      ...HELD,
+      versions: [
+        {
+          from_status: null,
+          to_status: 'shadow',
+          who: 'system:catalog',
+          at: iso(50 * HOUR),
+          why: 'The analytic shipped in shadow. An analyst approves it to live after the shadow week.',
+          has_receipts: false,
+          system: true,
+        },
+        { from_status: 'shadow', to_status: 'live', who: 'analyst', at: iso(30 * HOUR), why: 'ok', has_receipts: false },
+        HELD.versions[HELD.versions.length - 1],
+      ],
+    });
+    mount();
+    const versions = await screen.findByTestId('analytic-versions');
+    const rows = Array.from(versions.children) as HTMLElement[];
+    const [heal, analyst, ship] = rows;
+    // The ship row: a neutral chip, no amber.
+    const shipped = within(ship).getByTestId('version-shipped');
+    expect(shipped.textContent).toBe('shipped in shadow');
+    expect(shipped.className).not.toContain('text-warn');
+    expect(shipped.getAttribute('title')).toContain('A new shipped analytic starts in shadow.');
+    expect(within(ship).queryByTestId('version-system')).toBeNull();
+    // The self-heal row: the amber chip stays.
+    const amber = within(heal).getByTestId('version-system');
+    expect(amber.textContent).toBe('soc-ai');
+    expect(amber.className).toContain('text-warn');
+    expect(within(heal).queryByTestId('version-shipped')).toBeNull();
+    // An analyst row wears neither.
+    expect(within(analyst).queryByTestId('version-system')).toBeNull();
+    expect(within(analyst).queryByTestId('version-shipped')).toBeNull();
+  });
+
+  it('marks no analyst row as a system change', async () => {
+    mount();
+    await screen.findByTestId('analytic-versions');
+    expect(screen.queryByTestId('version-system')).toBeNull();
+    expect(screen.queryByTestId('version-evidence')).toBeNull();
+    expect(screen.queryByTestId('analytic-held')).toBeNull();
+  });
+
+  it('offers the analyst the approval on a held analytic', async () => {
+    vi.mocked(getAnalytic).mockResolvedValue(HELD);
+    mount();
+    await screen.findByTestId('analytic-held');
+    expect(screen.getByRole('button', { name: 'Approve' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Reject' })).toBeTruthy();
+  });
+});
+
+describe('breachLine', () => {
+  it('reads the hours the budget read, after an approval inside the day', () => {
+    expect(breachLine({ rule: 'fire_budget', hits: 4, budget: 3, window_hours: 3 })).toBe(
+      '4 hits in 3 h · budget 3 a day',
+    );
+  });
+
+  it('prints the numbers of a rule this console does not know', () => {
+    expect(breachLine({ rule: 'new_rule', score: 3 })).toBe('new rule · score 3');
   });
 });

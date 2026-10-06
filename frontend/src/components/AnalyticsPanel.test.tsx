@@ -171,6 +171,27 @@ describe('AnalyticsPanel when the sweeps do not run', () => {
     expect(within(profile).getByText('live')).toBeTruthy();
   });
 
+  it('runs a model analytic in the profile sweep, as a profile analytic', async () => {
+    vi.mocked(getAnalytics).mockResolvedValue({
+      analytics: [
+        SHIPPED_LIVE,
+        { ...SHIPPED_LIVE, id: 'model-x', evaluator: 'model', status: 'shadow' },
+      ],
+      counts: { live: 1, shadow: 1 },
+    });
+    vi.mocked(getHuntCatalog).mockResolvedValue({
+      ...RAN,
+      sweeps_enabled: false,
+      last_sweep_at: null,
+    });
+    mount();
+    const match = await screen.findByTestId(`analytic-${SHIPPED_LIVE.id}`);
+    expect(within(match).getByText('live, not running')).toBeTruthy();
+    const model = screen.getByTestId('analytic-model-x');
+    expect(within(model).getByText('shadow')).toBeTruthy();
+    expect(within(model).queryByText('shadow, not running')).toBeNull();
+  });
+
   it('shows no notice when both sweeps run', async () => {
     mount();
     await screen.findByTestId(`analytic-${SHIPPED_LIVE.id}`);
@@ -257,6 +278,27 @@ describe('AnalyticsPanel', () => {
     expect(screen.queryByTestId(`analytic-specific-${SHIPPED_LIVE.id}`)).toBeNull();
   });
 
+  // A shadow analytic that soc-ai moved back from live reads apart from one an
+  // analyst put in shadow. The chip carries the reason.
+  it('marks an analytic that soc-ai holds in shadow, and no other row', async () => {
+    const reason = 'The analytic wrote 42 hits in 24 hours. Its fire budget is 10 a day.';
+    vi.mocked(getAnalytics).mockResolvedValue({
+      analytics: [
+        { ...SHIPPED_LIVE, status: 'shadow', held_by_system: reason },
+        LOCAL_SHADOW,
+        LOCAL_CANDIDATE,
+      ],
+      counts: { shadow: 2, candidate: 1 },
+    });
+    mount();
+    const chip = await screen.findByTestId(`analytic-held-${SHIPPED_LIVE.id}`);
+    expect(chip.textContent).toBe('held by soc-ai');
+    expect(chip.getAttribute('title')).toContain('soc-ai moved this analytic from live to shadow.');
+    expect(chip.getAttribute('title')).toContain(reason);
+    expect(screen.queryByTestId(`analytic-held-${LOCAL_SHADOW.id}`)).toBeNull();
+    expect(screen.queryByTestId(`analytic-held-${LOCAL_CANDIDATE.id}`)).toBeNull();
+  });
+
   it('gives every row its status word and its tier', async () => {
     mount();
     const live = await screen.findByTestId(`analytic-${SHIPPED_LIVE.id}`);
@@ -282,6 +324,57 @@ describe('AnalyticsPanel', () => {
     const live = screen.getByTestId(`analytic-${SHIPPED_LIVE.id}`);
     expect(within(live).getByRole('button', { name: 'Hunt with this' })).toBeTruthy();
     expect(within(live).getByRole('button', { name: 'Retire' })).toBeTruthy();
+  });
+
+  // `t_run_analytic` runs a `match` analytic only. "Hunt with this" on a
+  // profile or a model analytic started a hunt whose first step failed with
+  // could_not_run. The range carries 11 live profile analytics and 2 model
+  // analytics, so every one of them is covered here.
+  it('offers a hunt on a live match analytic only', async () => {
+    const profiles: AnalyticRow[] = Array.from({ length: 11 }, (_, i) => ({
+      ...base,
+      id: `profile-${i}`,
+      title: `Profile analytic ${i}`,
+      evaluator: 'profile',
+      tier: 'shipped',
+      status: 'live',
+    }));
+    const model: AnalyticRow = {
+      ...base,
+      id: 'model-logon-chain',
+      title: 'A logon chain the estate model has not seen',
+      evaluator: 'model',
+      tier: 'shipped',
+      status: 'live',
+    };
+    vi.mocked(getAnalytics).mockResolvedValue({
+      analytics: [SHIPPED_LIVE, model, ...profiles],
+      counts: { live: 13 },
+    });
+    mount();
+    for (const row of [model, ...profiles]) {
+      const tr = await screen.findByTestId(`analytic-${row.id}`);
+      expect(within(tr).queryByRole('button', { name: 'Hunt with this' })).toBeNull();
+      expect(within(tr).getByTestId('analytic-no-hunt').textContent).toBe(
+        'A hunt cannot run this analytic. The profile sweep runs it every hour.',
+      );
+      // The other live action stays.
+      expect(within(tr).getByRole('button', { name: 'Retire' })).toBeTruthy();
+    }
+    // Negative control: the match analytic keeps the control and no line.
+    const live = screen.getByTestId(`analytic-${SHIPPED_LIVE.id}`);
+    expect(within(live).getByRole('button', { name: 'Hunt with this' })).toBeTruthy();
+    expect(within(live).queryByTestId('analytic-no-hunt')).toBeNull();
+  });
+
+  it('says nothing about a hunt on a profile analytic that is not live', async () => {
+    vi.mocked(getAnalytics).mockResolvedValue({
+      analytics: [{ ...LOCAL_SHADOW, evaluator: 'profile' }],
+      counts: { shadow: 1 },
+    });
+    mount();
+    const tr = await screen.findByTestId(`analytic-${LOCAL_SHADOW.id}`);
+    expect(within(tr).queryByTestId('analytic-no-hunt')).toBeNull();
   });
 
   it('opens the drawer on the analytic title', async () => {
@@ -393,6 +486,48 @@ describe('AnalyticsPanel sweep', () => {
     expect(within(row).getByText('6 measured · 38 blind · baseline 26 h old, stale')).toBeTruthy();
   });
 
+  // N2 of the 2026-10-05 verification. The sweep now opens every reason with
+  // its count, so the reason reads as one sentence and needs no label.
+  it('says why the blind entities are blind when the sweep named a reason', async () => {
+    vi.mocked(getHuntCatalog).mockResolvedValue(
+      withBaseline({
+        blind: 56,
+        blind_reason:
+          '35 of 56 blind hosts: the role of this host is not known well enough. ' +
+          'The confidence is 0.50 and the gate is 0.90.',
+      }) as never,
+    );
+    mount();
+    const row = await screen.findByTestId(`analytic-${SHIPPED_LIVE.id}`);
+    expect(within(row).getByTestId(`analytic-blind-reason-${SHIPPED_LIVE.id}`).textContent).toBe(
+      '35 of 56 blind hosts: the role of this host is not known well enough. ' +
+        'The confidence is 0.50 and the gate is 0.90.',
+    );
+  });
+
+  it('keeps the label on a reason an older sweep stored with no count', async () => {
+    vi.mocked(getHuntCatalog).mockResolvedValue(
+      withBaseline({
+        blind: 103,
+        blind_reason: 'the baseline holds no hourly series yet. The next profile build writes one.',
+      }) as never,
+    );
+    mount();
+    const row = await screen.findByTestId(`analytic-${SHIPPED_LIVE.id}`);
+    expect(within(row).getByTestId(`analytic-blind-reason-${SHIPPED_LIVE.id}`).textContent).toBe(
+      'blind: the baseline holds no hourly series yet. The next profile build writes one.',
+    );
+  });
+
+  it('shows no blind reason when the sweep named none or nothing is blind', async () => {
+    vi.mocked(getHuntCatalog).mockResolvedValue(
+      withBaseline({ blind: 0, blind_reason: 'stale text from an older sweep' }) as never,
+    );
+    mount();
+    const row = await screen.findByTestId(`analytic-${SHIPPED_LIVE.id}`);
+    expect(within(row).queryByTestId(`analytic-blind-reason-${SHIPPED_LIVE.id}`)).toBeNull();
+  });
+
   it('says why the baseline could not be measured', async () => {
     vi.mocked(getHuntCatalog).mockResolvedValue(
       withBaseline({
@@ -408,6 +543,47 @@ describe('AnalyticsPanel sweep', () => {
         '6 measured · 38 blind · baseline unmeasurable: active_hours: Trying to create too many buckets',
       ),
     ).toBeTruthy();
+  });
+
+  // A learned detector reads no stored host profile. The cell read
+  // "baseline 13 h old", the build time of the profiles it never reads.
+  it('gives a model analytic no baseline age and keeps it on a profile analytic', async () => {
+    const built = new Date(Date.now() - 13 * 3_600_000).toISOString();
+    const coverage = { ...SWEPT.specs[0].coverage, profiles_built_at: built, profiles_stale: false, profiles_reason: null };
+    const model: AnalyticRow = {
+      ...base,
+      id: 'model-logon-chain',
+      title: 'A logon chain the estate model has not seen',
+      evaluator: 'model',
+      tier: 'shipped',
+      status: 'shadow',
+    };
+    const profile: AnalyticRow = {
+      ...base,
+      id: 'profile-connection-rate-collapsed',
+      title: 'The connection rate of a host collapsed',
+      evaluator: 'profile',
+      tier: 'shipped',
+      status: 'live',
+    };
+    vi.mocked(getAnalytics).mockResolvedValue({
+      analytics: [model, profile],
+      counts: { live: 1, shadow: 1 },
+    });
+    vi.mocked(getHuntCatalog).mockResolvedValue({
+      ...SWEPT,
+      specs: [
+        { ...SWEPT.specs[0], id: model.id, evaluator: 'model', coverage },
+        { ...SWEPT.specs[0], id: profile.id, evaluator: 'profile', coverage },
+      ],
+    } as never);
+    mount();
+    const modelRow = await screen.findByTestId(`analytic-${model.id}`);
+    await waitFor(() => expect(within(modelRow).getByText('6 measured · 38 blind')).toBeTruthy());
+    expect(modelRow.textContent).not.toContain('baseline 13 h old');
+    // Negative control: the profile analytic reads the same coverage with its age.
+    const profileRow = screen.getByTestId(`analytic-${profile.id}`);
+    expect(within(profileRow).getByText('6 measured · 38 blind · baseline 13 h old')).toBeTruthy();
   });
 
   it('reads an older backend without baseline fields unchanged', async () => {

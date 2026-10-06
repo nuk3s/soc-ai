@@ -85,7 +85,26 @@ WHITELIST: tuple[SettingSpec, ...] = (
         hot=True,
         help=(
             "The Oracle is a cloud frontier model that reviews a local verdict. "
-            "The settings below select which verdicts it reviews."
+            "The Oracle rule mode selects which verdicts it reviews. The settings "
+            "below narrow that rule."
+        ),
+    ),
+    SettingSpec(
+        key="oracle_rule_mode",
+        attr="oracle_rule_mode",
+        type="select",
+        options=("classic", "shadow", "uncertainty"),
+        label="Oracle rule mode",
+        section="Oracle",
+        hot=True,
+        help=(
+            "Classic sends a needs_more_info verdict, a verdict other than "
+            "true_positive on a malware or attack rule, or a confidence below 0.6. "
+            "Uncertainty sends a confidence from 0.4 to below 0.7, a verdict the "
+            "decision template disagrees with, or a needs_more_info verdict from a "
+            "deep re-run. Shadow lets the classic rule decide. It records what the "
+            "uncertainty rule would do. Detection tuning shows the tally. This "
+            "setting applies live."
         ),
     ),
     SettingSpec(
@@ -100,29 +119,38 @@ WHITELIST: tuple[SettingSpec, ...] = (
         key="oracle_escalate_needs_more_info",
         attr="oracle_escalate_needs_more_info",
         type="bool",
-        label="Escalate if the local verdict is needs_more_info",
+        label="Allow the Oracle to review a needs_more_info verdict",
         section="Oracle",
         hot=True,
+        help=(
+            "Off, no needs_more_info verdict goes to the Oracle. On, an uncertain "
+            "needs_more_info verdict can go."
+        ),
     ),
     SettingSpec(
         key="oracle_escalate_malware_non_tp",
         attr="oracle_escalate_malware_non_tp",
         type="bool",
-        label="Escalate a malware or exploit alert without a high-confidence verdict",
+        label="Allow the Oracle to review a malware or attack verdict",
         section="Oracle",
         hot=True,
+        help=(
+            "Off, a verdict on a malware, exploit or attack rule stays local. A true "
+            "positive on such a rule always stays local."
+        ),
     ),
     SettingSpec(
         key="oracle_escalate_below_confidence",
         attr="oracle_escalate_below_confidence",
         type="float",
-        label="Escalate if the local confidence is below",
+        label="Review an uncertain verdict only below this confidence",
         section="Oracle",
         hot=True,
         help=(
-            "This setting is the confidence floor for a local verdict. "
-            "A higher floor sends more verdicts to the Oracle. "
-            "The range is 0.0 to 1.0."
+            "An uncertain verdict has a confidence from 0.4 to below 0.7. The Oracle "
+            "reviews it only below this value. The default is 0.7, so the whole band "
+            "goes. A lower value sends fewer verdicts. The classic rule uses 0.6 or "
+            "this value, whichever is lower. The range is 0.0 to 1.0."
         ),
         min_value=0.0,
         max_value=1.0,
@@ -542,6 +570,54 @@ WHITELIST: tuple[SettingSpec, ...] = (
         ),
     ),
     SettingSpec(
+        key="rule_prior_mode",
+        attr="rule_prior_mode",
+        type="select",
+        options=("off", "shadow", "live"),
+        label="Rule prior",
+        section="Triage automation",
+        hot=True,
+        help=(
+            "The rule prior gives a scheduled alert the verdict of its rule's latest "
+            "model run. It applies only when every safeguard holds. The rule needs "
+            "five model false positives this week and one today. Both endpoints are "
+            "internal. Neither host has an open lead or a fresh observation. The "
+            "alert is not critical. Detection tuning nominates the rule. No analyst "
+            "ever overrode it. Shadow runs the model and records what the "
+            "prior would decide. Live skips the model on a covered alert. The prior "
+            "never acknowledges an alert. This setting applies live."
+        ),
+    ),
+    SettingSpec(
+        key="rule_prior_min_runs",
+        attr="rule_prior_min_runs",
+        type="int",
+        label="Rule prior: model false positives this week",
+        section="Triage automation",
+        hot=True,
+        help=(
+            "The rule prior needs this many model false positives of the rule in the "
+            "last 7 days. The minimum is 5."
+        ),
+        min_value=5,
+        max_value=1000,
+    ),
+    SettingSpec(
+        key="rule_prior_sample_rate",
+        attr="rule_prior_sample_rate",
+        type="float",
+        label="Rule prior: sample share",
+        section="Triage automation",
+        hot=True,
+        help=(
+            "In live mode this share of covered alerts still gets a model run. A "
+            "sampled run that disagrees with the prior suspends it for the rule. "
+            "The default is 0.02. The range is 0.0 to 1.0."
+        ),
+        min_value=0.0,
+        max_value=1.0,
+    ),
+    SettingSpec(
         key="auto_triage_schedule_enabled",
         attr="auto_triage_schedule_enabled",
         type="bool",
@@ -602,8 +678,8 @@ WHITELIST: tuple[SettingSpec, ...] = (
             "when auto-hunt is on. A sweep makes no model call. It runs two grid "
             "queries per analytic. Off, no analytic runs and the Analytics tab says so. "
             "The default is off, because a sweep writes observations without an "
-            "analyst. To read what the catalog would raise first, set an analytic to "
-            "shadow, or run `soc-ai spec-sweep --shadow` for a week and read the counts."
+            "analyst. Set an analytic to shadow to read what it would raise first. "
+            "You can also run `soc-ai spec-sweep --shadow` for a week and read the counts."
         ),
     ),
     SettingSpec(
@@ -663,6 +739,24 @@ WHITELIST: tuple[SettingSpec, ...] = (
             "soc-ai compares each host with its own baseline every hour and "
             "records what departs. An analytic in shadow writes observations and "
             "raises nothing."
+        ),
+    ),
+    SettingSpec(
+        key="analytic_self_heal_enabled",
+        attr="analytic_self_heal_enabled",
+        type="bool",
+        label="Move a live analytic to shadow on a breach",
+        section="Hunting",
+        hot=True,
+        help=(
+            "soc-ai checks each live analytic after every sweep. An analytic that "
+            "writes more hits in 24 hours than its fire budget moves to shadow. An "
+            "analytic whose hunted leads fall below its precision floor over 30 days "
+            "also moves to shadow. The version row records the reason and the "
+            "numbers, and the bell shows the change. An analyst approves the analytic "
+            "to live again. soc-ai never approves or retires an analytic. An analytic "
+            "with no budget and no floor in its spec never moves. This setting "
+            "applies live."
         ),
     ),
     SettingSpec(
@@ -1378,6 +1472,67 @@ WHITELIST: tuple[SettingSpec, ...] = (
         max_value=168,
     ),
     SettingSpec(
+        key="profile_build_workers",
+        attr="profile_build_workers",
+        type="int",
+        label="Profile batches built at once",
+        section="Behavioural profiles",
+        hot=True,
+        help=(
+            "The profile build reads the hosts in batches. This setting caps the "
+            "batches in flight at one time. The default is 2. Each batch sends its "
+            "searches to the grid one at a time. A higher value finishes sooner and "
+            "puts more load on the grid."
+        ),
+        min_value=1,
+        max_value=8,
+    ),
+    SettingSpec(
+        key="profile_estate_rare_hosts",
+        attr="profile_estate_rare_hosts",
+        type="int",
+        label="Estate-rare below this many hosts",
+        section="Behavioural profiles",
+        hot=True,
+        help=(
+            "A new member that fewer hosts hold is estate-rare. Its observation is "
+            "born heavier. The default is 3 hosts. A member must also reach this "
+            "number of hosts to be estate-common."
+        ),
+        min_value=1,
+        max_value=100,
+    ),
+    SettingSpec(
+        key="profile_estate_common_share",
+        attr="profile_estate_common_share",
+        type="float",
+        label="Estate-common above this share of hosts",
+        section="Behavioural profiles",
+        hot=True,
+        help=(
+            "A new member that more than this share of the profiled hosts hold is "
+            "a trait of the estate. It forms no observation. The default is 0.2, "
+            "which is 20 % of the profiled hosts."
+        ),
+        min_value=0.0,
+        max_value=1.0,
+    ),
+    SettingSpec(
+        key="estate_model_enabled",
+        attr="estate_model_enabled",
+        type="bool",
+        label="Fit the estate model",
+        section="Behavioural profiles",
+        hot=True,
+        help=(
+            "soc-ai fits a model of the estate once a day. The model groups the "
+            "hosts that act alike. It scores each host against the estate. Its "
+            "observations stay in shadow. A host with no confident role reads its "
+            "learned group as its peer group. The model needs the ml extra. The "
+            "container image includes it. The default is off."
+        ),
+    ),
+    SettingSpec(
         key="dossier_max_hosts_per_run",
         attr="dossier_max_hosts_per_run",
         type="int",
@@ -1736,6 +1891,20 @@ WHITELIST: tuple[SettingSpec, ...] = (
         help=(
             "soc-ai notifies at 30, 14 and 7 days before the certificate it serves with "
             "expires, and when it has expired. The bell reports it whatever this setting is."
+        ),
+    ),
+    SettingSpec(
+        key="notify_on_oracle_failure",
+        attr="notify_on_oracle_failure",
+        type="bool",
+        label="Notify when Oracle calls pause",
+        section="Notifications",
+        hot=True,
+        help=(
+            "soc-ai pauses Oracle calls when the Oracle route answers with a usage limit. "
+            "The pause also starts after three server errors in a row. The bell gets one "
+            "row for each pause. The webhook gets the same message once. The doctor "
+            "reports the pause whatever this setting is."
         ),
     ),
     SettingSpec(
@@ -2107,7 +2276,9 @@ def _require_http_scheme(key: str, value: str) -> None:
             continue
         scheme = urlparse(v).scheme.lower()
         if scheme not in ("http", "https"):
-            raise ValueError(f"{key} must be an http(s) URL (got scheme {scheme or 'none'!r})")
+            raise ValueError(
+                f"{key} must be an http or https URL. The scheme is {scheme or 'none'!r}."
+            )
 
 
 def coerce(key: str, raw_str: str) -> Any:

@@ -240,6 +240,11 @@ async def investigate_endpoint(
             },
         )
 
+    # A caller of this route asked for one alert to be investigated: the
+    # standard class, which runs the tool loop (soc_ai.agent.budget). The
+    # rungs that pick the cheap class serve the scheduler only.
+    ctx.requested_run_class = "standard"
+
     async def stream() -> Any:
         # `investigate` stays a routes-module binding so tests can patch it.
         event_gen = investigate(req.alert_id, ctx=ctx, allow_so_writes=allow_so_writes)

@@ -1,7 +1,7 @@
 site_name: soc-ai
 site_description: >-
-  Self-hosted, privacy-respecting LLM alert triage for Security Onion —
-  Onion AI without the Pro license.
+  Self-hosted LLM alert triage for Security Onion. The model runs on your
+  own hardware, and no data leaves your network by default.
 site_url: https://nuk3s.github.io/soc-ai/
 repo_url: https://github.com/nuk3s/soc-ai
 repo_name: nuk3s/soc-ai
@@ -93,25 +93,25 @@ extra:
 
 nav:
   - Home: index.md
-  - Getting started:
+  - Installation:
       - Quickstart: quickstart.md
       - Security Onion setup: SECURITY-ONION-SETUP.md
       - Docker deployment: DOCKER.md
       - Bare-metal deployment: DEPLOYMENT.md
       - Blocklists: BLOCKLISTS.md
       - Sensor PCAP setup: SENSOR_PCAP_SETUP.md
-  - Using it:
-      - Web console: WEBUI_GUIDE.md
+  - Operation:
+      - Console guide: WEBUI_GUIDE.md
       - Hunting: HUNTING.md
       - Agent tools: AGENT_TOOLS.md
       - OQL primer: OQL_PRIMER.md
       - OQL hunting examples: OQL_HUNT_EXAMPLES.md
       - Test PCAPs: TEST_PCAPS.md
-  - How it works:
+  - Design:
       - Architecture: ARCHITECTURE.md
       - Safety model: SAFETY_MODEL.md
-      - Reading a broken audit chain: AUDIT-CHAIN.md
-      - Running on a lesser model: LESSER_MODELS.md
+      - Audit chain breaks: AUDIT-CHAIN.md
+      - Lesser models: LESSER_MODELS.md
   - Blog:
       - soc-ai hunts on its own now: blog/2026-10-soc-ai-hunts-on-its-own-now.md
       - Getting an LLM to show its work: blog/2026-07-getting-an-llm-to-show-its-work.md

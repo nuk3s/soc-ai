@@ -196,6 +196,46 @@ services:
         max-size: "20m"
         max-file: "3"
 
+  postgres:
+    # ── The PostgreSQL store (optional) ──────────────────────────────────────
+    # soc-ai keeps its store in SQLite by default. SQLite has one writer, and
+    # at corporate scale the scheduler, the sweeps and the console contend for
+    # it. This service sits under the "postgres" profile, so a plain
+    # `docker compose up -d` does not start it. COMPOSE_PROFILES=postgres in
+    # .env turns the profile on for every compose command. setup.sh asks, then
+    # writes that line, SOC_AI_POSTGRES_PASSWORD and SOC_AI_DATABASE_URL.
+    # soc-ai waits up to 60 s at start for the server to accept connections.
+    # See docs/DOCKER.md, PostgreSQL.
+    profiles: ["postgres"]
+    # Digest-pinned, the same rule as the Dockerfile base images. Tag: 17.6.
+    image: postgres:17.6@sha256:00bc86618629af00d2937fdc5a5d63db3ff8450acf52f0636ec813c7f4902929
+    container_name: soc-ai-postgres
+    restart: unless-stopped
+    # The default form, as for caddy: compose interpolates the whole file
+    # before it filters profiles. An empty password stops the server at its
+    # first start, so the profile cannot run without one.
+    environment:
+      POSTGRES_USER: soc_ai
+      POSTGRES_DB: soc_ai
+      POSTGRES_PASSWORD: "${SOC_AI_POSTGRES_PASSWORD:-}"
+    # No published port. soc-ai reaches the server on the compose network as
+    # postgres:5432, and nothing else needs to.
+    volumes:
+      - soc_ai_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U soc_ai -d soc_ai"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 6
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
 # ── Named volumes ─────────────────────────────────────────────────────────────
 volumes:
   # Persistent application data (SQLite DB + session store).
@@ -213,6 +253,10 @@ volumes:
   # a deleted bundle, and the trend row that points at it outlives it by
   # ~3 months.
   soc_ai_evals:
+
+  # The PostgreSQL store, when the "postgres" profile is on. This is the data
+  # itself: back it up with pg_dump, and never recreate it to fix a start.
+  soc_ai_postgres:
 
   # Caddy keeps its certificates and its CA here. Keep it across restarts.
   caddy_data:

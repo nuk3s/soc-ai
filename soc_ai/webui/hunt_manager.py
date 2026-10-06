@@ -100,6 +100,12 @@ class HuntManager:
             # to ack.
             allow_so_writes = False
         ctx = ctx_from_state(state)
+        # Every run started here is one an analyst asked for: Investigate, a
+        # re-run, request-more-info, a promotion. That is the standard class,
+        # which runs the tool loop; the "Deep re-run" is the deep class. The
+        # rungs that pick the cheap class serve the scheduler only
+        # (soc_ai.agent.budget).
+        ctx.requested_run_class = "deep" if deep else "standard"
         token = CancelToken()
         gen = run_recorded(
             state,

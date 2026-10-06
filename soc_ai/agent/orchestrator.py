@@ -46,6 +46,7 @@ audited :func:`~soc_ai.tools.write_exec.execute_write_tool` path.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import re
 import uuid
@@ -60,7 +61,7 @@ from pydantic_ai.models import Model
 from pydantic_ai.usage import RunUsage, UsageLimits
 
 from soc_ai import metrics
-from soc_ai.agent import context_budget
+from soc_ai.agent import budget, context_budget
 from soc_ai.agent._gateway_retry import capture_backend_attribution
 from soc_ai.agent._partial_replay import (
     repair_dangling_tool_calls,
@@ -141,7 +142,10 @@ from soc_ai.agent.prompts import (
     case_conditions,
     format_endpoint_coverage_block,
     format_host_coverage_block,
+    format_more_tools_block,
+    format_prefetched_web_search_block,
     rule_body_in_alert,
+    unresolved_external_indicator,
 )
 from soc_ai.agent.reasoning import extract_reasoning_trace
 
@@ -158,13 +162,19 @@ from soc_ai.agent.toolset import (  # noqa: F401
     prime_playbook_presence,
     register_read_tools,
 )
-from soc_ai.agent.triage import InvestigationTranscript, RecommendedAction, TriageReport
+from soc_ai.agent.triage import (
+    InvestigationTranscript,
+    RecommendedAction,
+    TargetedGap,
+    TriageReport,
+)
 from soc_ai.config import Settings
 from soc_ai.dossier.prompt import MAX_PROMPT_HOSTS, host_dossier_prompt_block
 from soc_ai.errors import OqlValidationError, SoApiError
 
 # Module import (not `from ... import adjudicate`) so tests patching
 # `soc_ai.oracle.client.adjudicate` keep intercepting the escalation call.
+from soc_ai.oracle import breaker as _oracle_breaker
 from soc_ai.oracle import client as _oracle_client
 from soc_ai.oracle.identifiers import EffectiveIdentifiers, effective_internal_identifiers
 from soc_ai.so_client.inventory import inventory_prompt_block
@@ -322,11 +332,19 @@ def build_partial_triage_synthesizer(
     (repaired) message history and forces a TriageReport from ONLY that
     evidence. ``retries=3`` for reasoning-model schema-wobble parity with
     :func:`build_synth_first_agent`.
+
+    The prompt goes in ``instructions=``, never ``system_prompt=``. This agent
+    always runs with a NON-empty replayed ``message_history``, and pydantic-ai
+    emits an agent's ``system_prompt`` only when the history is empty. A
+    ``system_prompt`` here was dropped on every run: the partial verdict was
+    written under the replayed investigator prompt with none of the
+    anti-over-claim rules. ``instructions`` are applied on every request, the
+    same fix :func:`soc_ai.agent.hunt.build_hunt_synthesizer` carries.
     """
     return Agent(
         model,
         output_type=_synth_output_type(output_mode),
-        system_prompt=BUDGET_PARTIAL_SYNTH_PROMPT,
+        instructions=BUDGET_PARTIAL_SYNTH_PROMPT,
         retries=3,
     )
 
@@ -341,7 +359,11 @@ _PARTIAL_CLOSURE_CONTENT: dict[str, Any] = {
 
 
 async def _synthesize_partial_triage(
-    settings: Settings, guard: EgressGuard | None, gathered: list[Any]
+    settings: Settings,
+    guard: EgressGuard | None,
+    gathered: list[Any],
+    *,
+    result_out: list[Any] | None = None,
 ) -> tuple[Any, list[Any]]:
     """Force a TriageReport from a budget-cut investigation loop's history.
 
@@ -350,6 +372,9 @@ async def _synthesize_partial_triage(
     partial verdict earns the loop evidence exemption ONLY from tool results
     that actually landed. Raises on any failure — the caller lands the honest
     pipeline-fallback as the last resort.
+
+    ``result_out`` receives the agent run result, so the caller can record the
+    model usage of this synthesis with the run's other usage.
     """
     repaired = repair_dangling_tool_calls(gathered, closure_content=_PARTIAL_CLOSURE_CONTENT)
     user_msg = replay_reasoning_context(repaired) + (
@@ -370,6 +395,8 @@ async def _synthesize_partial_triage(
             message_history=repaired,
             usage_limits=UsageLimits(request_limit=3, tool_calls_limit=0),
         )
+    if result_out is not None:
+        result_out.append(result)
     return result.output, repaired
 
 
@@ -398,6 +425,37 @@ def build_synth_first_agent(
         output_type=_synth_output_type(output_mode),
         retries=3,
     )
+
+
+_CODE_TOOL_CALL_ID = "pipeline-prefetch"
+
+
+def _code_tool_exchange(tool_name: str, args: dict[str, Any], result: Any) -> list[Any]:
+    """A tool call the pipeline made in code, as a call and a return part.
+
+    The gates read what a run gathered from its message history: the evidence
+    gate counts the returns, a tool citation resolves against the calls, the
+    support gate reads the results. A call the pipeline makes in place of the
+    loop's own turn joins that record in the shape the loop's call had. It is
+    never sent to the model as history.
+    """
+    from pydantic_ai.messages import (  # noqa: PLC0415 - local, one caller
+        ModelRequest,
+        ModelResponse,
+        ToolCallPart,
+        ToolReturnPart,
+    )
+
+    return [
+        ModelResponse(
+            parts=[ToolCallPart(tool_name=tool_name, args=args, tool_call_id=_CODE_TOOL_CALL_ID)]
+        ),
+        ModelRequest(
+            parts=[
+                ToolReturnPart(tool_name=tool_name, content=result, tool_call_id=_CODE_TOOL_CALL_ID)
+            ]
+        ),
+    ]
 
 
 def _guard_egress(guard: EgressGuard | None, text: str, settings: Settings) -> str:
@@ -909,6 +967,7 @@ async def maybe_auto_ack_fp(
     audit_ev: Any,
     investigated: bool,
     citation_coverage: float | None = None,
+    oracle_dissent: bool = False,
 ) -> StepEvent | None:
     """Auto-acknowledge a high-confidence FP alert in Security Onion.
 
@@ -976,7 +1035,7 @@ async def maybe_auto_ack_fp(
     Returns the ``auto_ack`` StepEvent (for the caller to yield into the stream)
     when the write was attempted; an ``auto_ack_skipped`` StepEvent (with
     ``reason`` = ``below_threshold`` | ``no_investigation`` | ``uncited`` |
-    ``high_stakes``)
+    ``high_stakes`` | ``oracle_dissent``)
     when auto-ack was armed for this FP but a guard held it back — recorded so
     the drawer can explain why the pending ack needs a human; or ``None`` when
     auto-ack simply doesn't apply (disabled, or a non-FP verdict).
@@ -986,6 +1045,22 @@ async def maybe_auto_ack_fp(
         return None
     if report.verdict != "false_positive":
         return None
+    if oracle_dissent:
+        # The Oracle answered another class with no evidence that resolves.
+        # Its answer is an opinion on the run and the local verdict stands,
+        # but a verdict the second opinion disputes is not written back to
+        # the grid unattended (design 2026-10-04, "No override without
+        # evidence").
+        dissent_ev: StepEvent = emit_ev(
+            "auto_ack_skipped",
+            {
+                "es_id": es_id,
+                "reason": "oracle_dissent",
+                "confidence": report.confidence,
+                "threshold": settings.auto_ack_fp_threshold,
+            },
+        )
+        return dissent_ev
     if (report.confidence or 0.0) < settings.auto_ack_fp_threshold:
         # Record WHY this FP wasn't auto-acked so the drawer can explain the
         # pending ack instead of leaving the analyst to guess (two identical-
@@ -1132,6 +1207,7 @@ async def _maybe_auto_ack_fp_gated(
     investigated: bool = False,
     citation_coverage: float | None = None,
     allow_so_writes: bool = True,
+    oracle_dissent: bool = False,
 ) -> StepEvent | None:
     """Call-site guard in front of :func:`maybe_auto_ack_fp` (Task 6, finding
     promotion): a promoted hunt finding's ``alert_es_id`` is a cited telemetry
@@ -1164,6 +1240,7 @@ async def _maybe_auto_ack_fp_gated(
         audit_ev=audit_ev,
         investigated=investigated,
         citation_coverage=citation_coverage,
+        oracle_dissent=oracle_dissent,
     )
 
 
@@ -1569,7 +1646,9 @@ async def _walk_message(
             elif trace:
                 payload["reasoning_trace"] = trace
             yield ev_factory("model_response", _stamp(payload))
-        elif ptype == "ToolCallPart":
+        # The ``search_tools`` call that loads a deferred tool (the standard
+        # class) is a tool call too: it costs a turn, and the trail shows it.
+        elif ptype in ("ToolCallPart", "ToolSearchCallPart"):
             yield ev_factory(
                 "tool_call",
                 _stamp(
@@ -1580,7 +1659,7 @@ async def _walk_message(
                     }
                 ),
             )
-        elif ptype == "ToolReturnPart":
+        elif ptype in ("ToolReturnPart", "ToolSearchReturnPart"):
             yield ev_factory(
                 "tool_result",
                 _stamp(
@@ -1600,89 +1679,242 @@ async def _walk_message(
         )
 
 
-def _should_escalate_to_oracle(
+# The Oracle escalation reasons (stage 1, item 6). Each names the uncertainty
+# that sent the case: the egress audit row (``oracle_escalation``) carries it.
+ORACLE_REASON_BAND = "confidence_in_band"
+ORACLE_REASON_SPLIT = "template_split"
+ORACLE_REASON_DEEP_NMI = "deep_needs_more_info"
+
+
+def oracle_escalation_reason(
     report: TriageReport,
     enriched: Any,
     settings: Settings,
     *,
+    candidate: Any = None,
     ran_loop: bool = False,
-) -> bool:
-    """Return True when the local verdict should be escalated to the Oracle.
+    run_class: str = budget.STANDARD,
+) -> str | None:
+    """Why the local verdict goes to the Oracle, or None when it stays local.
 
-    The Oracle is for cases the local path got WRONG or could not resolve — not
-    for re-confirming correct verdicts. Policy (oracle_enabled is a mandatory
-    prerequisite for any escalation):
+    The Oracle escalates on UNCERTAINTY, never on the verdict class alone
+    (docs/dev/specs/2026-10-04-four-tier-detection-methodology.md, "The unified
+    investigator"). Production escalated 59 times in 30 days, 48 of them a
+    malware rule cleared false positive. The Oracle answered 17 of those 48 in
+    the window and confirmed the false positive in all 17 (Oracle failure
+    review, 2026-10-04). Three triggers, first match wins:
 
-    0. SHORT-CIRCUIT: a malware/attack-signalled rule the local path flagged
-       ``true_positive`` is correct regardless of its confidence number — keep it
-       LOCAL. Observed failure: correct local malware TPs were bouncing
-       to the Oracle only because a citation_cap pushed confidence below 0.7/0.6.
-    1. ``oracle_escalate_needs_more_info`` AND verdict == needs_more_info.
-    2. ``oracle_escalate_malware_non_tp`` AND the rule signals malware/exploit OR
-       attack-class (classtype in ``_ATTACK_CLASSTYPES``) AND the local verdict is
-       NOT true_positive (i.e. cleared false_positive) — the wrongly-cleared-
-       malware safety net (QVOD/BPFDoor). Attack-class rules (kerberoast, psexec
-       lateral movement, data exfil, DNS tunnel) don't carry malware tokens, so
-       ``_rule_signals_malware`` alone was too narrow.
-       COST GATE: skipped when the investigation ``ran_loop`` AND
-       ``report.confidence >= oracle_skip_after_confident_loop`` — a confident
-       verdict after a real tool-driven investigation is trustworthy. The
-       zero-tool fast path (``ran_loop`` False) still escalates here.
-    3. confidence < ``oracle_escalate_below_confidence`` (any remaining verdict).
+    1. ``confidence_in_band``: the confidence sits in the gate band
+       (:func:`soc_ai.agent.gates.gate_band`, ``[0.4, 0.7)``). The low edge is
+       where a coercing gate parks a verdict it could not ground; the high edge
+       is the confidence the gates let stand.
+    2. ``template_split``: the decision template and the model disagree on the
+       verdict.
+    3. ``deep_needs_more_info``: a deep run, the analyst's deep re-run, still
+       ended needs_more_info.
 
-    Confident-benign verdicts on non-malware, non-attack rules are NOT escalated.
+    Never: a verdict the template and the model agree on with confidence at or
+    above the band; a pipeline fallback (a mechanical failure, nothing to
+    adjudicate); a cheap or rule-prior run (soc_ai.agent.budget).
+
+    The per-verdict opt-ins narrow the triggers. They never add one:
+
+    - a needs_more_info verdict needs ``oracle_escalate_needs_more_info``;
+    - on a malware or attack rule, a true positive stays local, a non-TP needs
+      ``oracle_escalate_malware_non_tp``, and a loop verdict at or above
+      ``oracle_skip_after_confident_loop`` stays local;
+    - an in-band escalation needs confidence below
+      ``oracle_escalate_below_confidence``.
     """
     if not settings.oracle_enabled:
-        return False
-
+        return None
+    if run_class not in budget.ORACLE_CLASSES:
+        return None
     # A pipeline-fallback placeholder is a MECHANICAL failure (model truncation,
     # gateway 5xx), not a model opinion — there is nothing for the Oracle to
-    # adjudicate and its needs_more_info verdict would trip condition 1 below.
-    # Re-running is the fix; escalating just burnt heavy-model tokens on
-    # "Oracle did not return a verdict" (dogfood 2026-07-15).
+    # adjudicate. Re-running is the fix (dogfood 2026-07-15).
     if is_pipeline_fallback({"resolution": report.resolution}):
-        return False
+        return None
 
+    from soc_ai.agent.gates import gate_band  # noqa: PLC0415 - re-exported module
+
+    low, high = gate_band()
+    confidence = float(report.confidence or 0.0)
+    template_verdict = getattr(candidate, "verdict", None) if candidate is not None else None
+    agrees = template_verdict is not None and template_verdict == report.verdict
+    if agrees and confidence >= high:
+        return None
+    if low <= confidence < high:
+        reason = ORACLE_REASON_BAND
+    elif template_verdict is not None and not agrees:
+        reason = ORACLE_REASON_SPLIT
+    elif run_class == budget.DEEP and report.verdict == "needs_more_info":
+        reason = ORACLE_REASON_DEEP_NMI
+    else:
+        return None
+
+    # ----- The opt-ins narrow -----
+    if report.verdict == "needs_more_info" and not settings.oracle_escalate_needs_more_info:
+        return None
     from soc_ai.agent.decision_templates import (  # noqa: PLC0415
         _rule_signals_attack,
         _rule_signals_malware,
     )
 
-    malware_or_attack = _rule_signals_malware(enriched) or _rule_signals_attack(enriched)
+    if _rule_signals_malware(enriched) or _rule_signals_attack(enriched):
+        # A flagged-malicious verdict on a malware or attack rule is the right
+        # call whatever its confidence (the CryptoWall citation-cap case).
+        if report.verdict == "true_positive":
+            return None
+        if not settings.oracle_escalate_malware_non_tp:
+            return None
+        if ran_loop and confidence >= settings.oracle_skip_after_confident_loop:
+            return None
+    if reason == ORACLE_REASON_BAND and confidence >= settings.oracle_escalate_below_confidence:
+        return None
+    return reason
 
-    # Condition 1: local model genuinely uncertain.
+
+# The classic rule's reasons: the audit codes the verdict-class rule wrote
+# before stage 1.
+ORACLE_REASON_CLASSIC_NMI = "needs_more_info"
+ORACLE_REASON_CLASSIC_MALWARE = "malware_non_tp"
+ORACLE_REASON_CLASSIC_FLOOR = "below_confidence"
+
+# The confidence floor of the classic rule. ``oracle_escalate_below_confidence``
+# held it before stage 1 with a default of 0.6. Stage 1 gave that setting the
+# band ceiling to hold and moved its default to 0.7, so the classic rule keeps
+# 0.6 and takes the setting only when the operator set it lower.
+ORACLE_CLASSIC_BELOW_CONFIDENCE = 0.6
+
+
+def classic_oracle_escalation_reason(
+    report: TriageReport,
+    enriched: Any,
+    settings: Settings,
+    *,
+    ran_loop: bool = False,
+    run_class: str = budget.STANDARD,
+) -> str | None:
+    """The verdict-class rule production ran before stage 1, or None.
+
+    Kept so ``oracle_rule_mode`` can run it (``classic``) or run it and record
+    what the uncertainty rule would do (``shadow``). First match wins:
+
+    1. ``needs_more_info``: the opt-in is on and the verdict is needs_more_info.
+    2. A malware or attack rule with a true positive stays local.
+    3. ``malware_non_tp``: the opt-in is on, the rule signals malware or an
+       attack, and the verdict is not a true positive. A loop that ran and
+       reached ``oracle_skip_after_confident_loop`` keeps it local.
+    4. ``below_confidence``: the confidence is below
+       :data:`ORACLE_CLASSIC_BELOW_CONFIDENCE`, or below
+       ``oracle_escalate_below_confidence`` when that is lower.
+    """
+    if not settings.oracle_enabled:
+        return None
+    if run_class not in budget.ORACLE_CLASSES:
+        return None
+    if is_pipeline_fallback({"resolution": report.resolution}):
+        return None
+    from soc_ai.agent.decision_templates import (  # noqa: PLC0415
+        _rule_signals_attack,
+        _rule_signals_malware,
+    )
+
     if settings.oracle_escalate_needs_more_info and report.verdict == "needs_more_info":
-        return True
-
-    # A malware/attack-signalled rule that the local path flagged TRUE_POSITIVE is
-    # already correctly handled — a flagged-malicious verdict is the right call
-    # regardless of the confidence number, and the Oracle cannot improve "this
-    # malware is malicious." Observed failure (CryptoWall, DNS-PowerShell
-    # scenarios): the loop reached TP, but a citation_cap dragged confidence to 0.54,
-    # which tripped BOTH the malware-non-TP gate and the low-confidence floor and
-    # bounced a correct local verdict to the Oracle. The user's bar: "if we
-    # cannot adjudicate that locally there is something wrong with the path." Keep
-    # flagged-malicious verdicts local; the Oracle is for cases the local path
-    # got WRONG or could not resolve, not for re-confirming correct TPs.
+        return ORACLE_REASON_CLASSIC_NMI
+    malware_or_attack = _rule_signals_malware(enriched) or _rule_signals_attack(enriched)
     if malware_or_attack and report.verdict == "true_positive":
-        return False
-
-    # Condition 2: a malware/attack-signalled rule the local path did NOT flag TP
-    # (i.e. cleared false_positive) — the QVOD/BPFDoor wrongly-cleared-malware
-    # safety net — UNLESS a real investigation loop already resolved it
-    # confidently. The zero-tool fast path (``ran_loop`` False) still escalates.
+        return None
+    confidence = float(report.confidence or 0.0)
     resolved_by_confident_loop = (
-        ran_loop and report.confidence >= settings.oracle_skip_after_confident_loop
+        ran_loop and confidence >= settings.oracle_skip_after_confident_loop
     )
     if (
         settings.oracle_escalate_malware_non_tp
         and malware_or_attack
         and not resolved_by_confident_loop
     ):
-        return True
+        return ORACLE_REASON_CLASSIC_MALWARE
+    floor = min(settings.oracle_escalate_below_confidence, ORACLE_CLASSIC_BELOW_CONFIDENCE)
+    if confidence < floor:
+        return ORACLE_REASON_CLASSIC_FLOOR
+    return None
 
-    # Condition 3: below-floor confidence on any remaining verdict / rule.
-    return report.confidence < settings.oracle_escalate_below_confidence
+
+@dataclasses.dataclass(frozen=True)
+class OracleRuleDecision:
+    """What the Oracle rule mode decided for one local verdict.
+
+    ``reason`` is the deciding rule's reason, None when the verdict stays
+    local. ``classic_reason`` and ``uncertainty_reason`` are each rule's own
+    answer; a rule the mode does not run answers None.
+    """
+
+    mode: str
+    reason: str | None
+    classic_reason: str | None
+    uncertainty_reason: str | None
+
+
+def oracle_rule_decision(
+    report: TriageReport,
+    enriched: Any,
+    settings: Settings,
+    *,
+    candidate: Any = None,
+    ran_loop: bool = False,
+    run_class: str = budget.STANDARD,
+) -> OracleRuleDecision:
+    """Apply ``oracle_rule_mode``: classic, shadow or uncertainty.
+
+    Classic and shadow let the classic rule decide. Shadow also runs the
+    uncertainty rule, and the pipeline records its answer on an
+    ``oracle_shadow`` event. Uncertainty lets the uncertainty rule decide.
+    """
+    mode = str(getattr(settings, "oracle_rule_mode", "shadow") or "shadow")
+    classic: str | None = None
+    uncertainty: str | None = None
+    if mode in ("classic", "shadow"):
+        classic = classic_oracle_escalation_reason(
+            report, enriched, settings, ran_loop=ran_loop, run_class=run_class
+        )
+    if mode in ("uncertainty", "shadow"):
+        uncertainty = oracle_escalation_reason(
+            report,
+            enriched,
+            settings,
+            candidate=candidate,
+            ran_loop=ran_loop,
+            run_class=run_class,
+        )
+    reason = uncertainty if mode == "uncertainty" else classic
+    return OracleRuleDecision(
+        mode=mode, reason=reason, classic_reason=classic, uncertainty_reason=uncertainty
+    )
+
+
+def _should_escalate_to_oracle(
+    report: TriageReport,
+    enriched: Any,
+    settings: Settings,
+    *,
+    candidate: Any = None,
+    ran_loop: bool = False,
+    run_class: str = budget.STANDARD,
+) -> bool:
+    """True when the rule that ``oracle_rule_mode`` selects names a reason."""
+    return (
+        oracle_rule_decision(
+            report,
+            enriched,
+            settings,
+            candidate=candidate,
+            ran_loop=ran_loop,
+            run_class=run_class,
+        ).reason
+        is not None
+    )
 
 
 async def _resolve_effective_identifiers(
@@ -2312,7 +2544,17 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
     # D2. `alert_id` is the anchor document, which a hunt-subject run needs for
     # its time windows. `subject` says what the run is about, so a reader of
     # the trail cannot take the anchor for the subject.
+    # The budget class the caller asked for. None is the scheduler's request:
+    # the rungs below decide (soc_ai.agent.budget).
+    _asked = getattr(ctx, "requested_run_class", None)
+    requested_class: str | None = (
+        budget.DEEP if deep else (_asked if _asked in (budget.STANDARD, budget.DEEP) else None)
+    )
     start_payload: dict[str, Any] = {"alert_id": alert_id, "pipeline": "synth_first"}
+    if requested_class is not None:
+        # An explicit request is the class the run will run in. A run the rungs
+        # decide states its class when they have (the loop entry, the report).
+        start_payload["run_class"] = requested_class
     if subject is not None:
         start_payload["subject"] = "hunt"
     yield _ev("session_start", start_payload)
@@ -2593,10 +2835,25 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
     definitely_investigate = ctx.settings.investigate_when_unsure and _definitely_investigate(
         enriched, candidate
     )
+    # ----- Budget class (stage 1, soc_ai.agent.budget) -----
+    # The rungs above the model plan the class: an explicit request from the
+    # caller, the hunt subject, the session constraint, the decision template.
+    # Planned cheap is the round-1 path. An explicit standard or deep request
+    # runs the loop even where a template could settle the alert, because a
+    # person asked for an investigation.
+    class_plan = budget.plan_run_class(
+        requested=requested_class,
+        subject_is_hunt=subject is not None,
+        round1_can_settle=subject is None and _round1_can_settle(enriched, candidate),
+        session_true_positive=session_conflict_possible,
+        fast_triage_enabled=bool(ctx.settings.fast_triage_enabled),
+    )
     # fast_triage_enabled=False forces the tool-driven loop regardless of how
     # confident round-1 was ("agent does agent things"): deeper but slower.
-    # `deep` is the same override scoped to THIS run (the analyst's deep re-run).
-    force_investigate = deep or not ctx.settings.fast_triage_enabled
+    # `deep` is the same override scoped to THIS run (the analyst's deep re-run),
+    # and an analyst's standard request is the same override at the standard
+    # budget.
+    force_investigate = deep or not ctx.settings.fast_triage_enabled or class_plan.forces_loop
     # W2. Round 1 settles a case only when _round1_can_settle holds; on every
     # other alert the loop runs and overwrites the verdict, so the call is pure
     # cost (18 s and ~8K tokens on production, discarded on 83% of runs). Skip
@@ -2615,6 +2872,14 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         and not getattr(ctx.settings, "synth_round1_always", False)
         and not _round1_can_settle(enriched, candidate)
     )
+    # A run whose class forces the loop (an analyst's standard or deep request)
+    # never lets round 1 settle, so the call before the loop is pure cost.
+    round1_class_skip = (
+        class_plan.forces_loop
+        and not definitely_investigate
+        and not round1_cannot_settle
+        and not getattr(ctx.settings, "synth_round1_always", False)
+    )
     round1_ok = False
     # (agent, user_message, usage_limits|None) describing how to RE-RUN the
     # final verdict synthesis — consumed by the flag-gated self-consistency
@@ -2622,12 +2887,14 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
     # cleared (None) on every fallback path so a vote never re-runs a call
     # that just failed.
     final_synth_rerun: tuple[Any, str, Any] | None = None
-    if definitely_investigate or round1_cannot_settle:
+    if definitely_investigate or round1_cannot_settle or round1_class_skip:
         triage_round1 = _round1_skipped_report(alert_id)
         if subject is not None:
             skip_reason = "hunt_subject"
         elif definitely_investigate:
             skip_reason = "definitely_investigate"
+        elif round1_class_skip:
+            skip_reason = "class_runs_loop"
         else:
             skip_reason = "cannot_settle"
         skip_ev = _ev("synth_round1_skipped", {"reason": skip_reason})
@@ -2865,6 +3132,33 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
 
     triage_final = triage_round1
 
+    # ----- Cheap class: a verdict gate escalates the run -----
+    # A cheap run settles on the round-1 false positive. The deterministic
+    # gates run after the verdict, so ask them now, on the same inputs they
+    # will see: when one of them would change the round-1 verdict, the cheap
+    # verdict cannot stand and the run escalates to the standard loop. The
+    # gates are pure, so the real pass below repeats this exactly.
+    gate_escalation = False
+    if (
+        class_plan.run_class == budget.CHEAP
+        and round1_ok
+        and getattr(triage_round1, "verdict", None) == "false_positive"
+    ):
+        try:
+            gated_round1, _gate_audit = _synth_first_post_validate(
+                triage_round1,
+                enriched,
+                candidate,
+                synthesis_confidence_floor=ctx.settings.synthesis_confidence_floor,
+                blocklist=ctx.blocklist,
+                internal_cidrs=classification_cidrs,
+            )
+            gate_escalation = gated_round1.verdict != triage_round1.verdict
+        except Exception:
+            # A gate fault is no reason to trust the cheap verdict.
+            _LOGGER.warning("cheap-class gate pre-check failed; escalating", exc_info=True)
+            gate_escalation = True
+
     # ----- Bounded investigation loop (Theme-1 Task 1) -----
     # The Phase C synth is a NO-tools structured-output guess that
     # rationalizes the prefetch. When its verdict isn't evidence-backed and
@@ -2875,6 +3169,14 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
     # (confidently clearing a Cobalt Strike beacon). Reversible via the
     # investigate_when_unsure flag.
     ran_investigation_loop = False
+    # The tool exchange the pipeline ran in code before the loop (the web
+    # search). Joined to the loop's message history for the gates below.
+    prefetch_tool_messages: list[Any] = []
+    # Why the run ended in its class: the loop reason when the loop ran, else
+    # the plan's reason (a cheap run settled at round 1).
+    run_class_reason = (
+        class_plan.reason if class_plan.run_class == budget.CHEAP else "loop_not_entered"
+    )
     loop_messages: list[Any] | None = None
     # The investigator's evidence bullets (claim → supporting-id index), kept
     # for the Oracle escalation payload. Set only on the completed-loop path;
@@ -2906,6 +3208,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             ctx.settings.investigate_when_unsure
             and (
                 definitely_investigate
+                or gate_escalation
                 or (round1_ok and _should_investigate(triage_round1, enriched, candidate))
             )
         )
@@ -2915,14 +3218,19 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             loop_reason = "definitely_investigate"
         elif deep:
             loop_reason = "deep_rerun"
+        elif class_plan.forces_loop:
+            loop_reason = class_plan.reason
         elif force_investigate:
             loop_reason = "fast_triage_disabled"
         elif session_conflict_possible:
             loop_reason = "session_true_positive_stands"
         elif round1_cannot_settle:
             loop_reason = "round1_cannot_settle"
+        elif gate_escalation:
+            loop_reason = "gate_would_change"
         else:
             loop_reason = "verdict_not_evidence_backed"
+        run_class_reason = loop_reason
         loop_ev = _ev(
             "investigation_loop_entered",
             {
@@ -2931,6 +3239,9 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 # to report. ``round1_ok`` is the one honest test for that.
                 "round1_verdict": triage_round1.verdict if round1_ok else None,
                 "round1_confidence": triage_round1.confidence if round1_ok else None,
+                # The class the loop runs in. A planned cheap run that gets
+                # here escalated to standard.
+                "run_class": budget.ran_class(class_plan, ran_loop=True),
             },
         )
         await _audit(loop_ev)
@@ -2966,13 +3277,98 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         # playbook must not be offered t_get_playbooks, because the model spends
         # a turn on it and reads back `[]`.
         have_playbooks = await prime_playbook_presence(ctx)
+        # Which conditional tool can still change THIS verdict. A tool whose
+        # condition is not met is not named, so the loop is not invited to
+        # spend a turn on it.
+        conditions = case_conditions(
+            enriched,
+            playbooks_available=have_playbooks,
+            web_search_available=bool(ctx.settings.web_search_enabled),
+        )
+        # ----- Web search from code (stage 1, item 4) -----
+        # The loop spent its one tool turn on this search in 87% of production
+        # runs, on a condition the code already computes, at about 31K input
+        # tokens a turn. The pipeline makes the call here, before the loop, the
+        # same way Phase D dispatches a named tool. The result rides into the
+        # loop's message, the condition line leaves it, and the dedup tracker
+        # turns a repeat of the same query into a stub. A search that failed
+        # leaves the condition in place, so the loop can still try.
+        web_search_block = ""
+        web_indicator = (
+            unresolved_external_indicator(enriched)
+            if conditions.web_search and subject is None
+            else None
+        )
+        if web_indicator is not None:
+            search_args = {"query": web_indicator}
+            search_gap = TargetedGap(
+                question=f"What is the external indicator {web_indicator}?",
+                tool_name="t_web_search",
+                tool_args=search_args,
+                why_this_matters=(
+                    "The prefetch enrichment left this external indicator unanswered."
+                ),
+            )
+            search_dispatch_ev = _ev(
+                "targeted_dispatch",
+                {
+                    "question": search_gap.question,
+                    "tool_name": search_gap.tool_name,
+                    "tool_args": search_args,
+                    "why_this_matters": search_gap.why_this_matters,
+                    "phase": "prefetch",
+                },
+            )
+            await _audit(search_dispatch_ev)
+            yield search_dispatch_ev
+            search_result = await run_targeted_investigation(search_gap, ctx=ctx)
+            search_result_ev = _ev(
+                "targeted_tool_result",
+                {"tool_name": "t_web_search", "result": search_result, "phase": "prefetch"},
+            )
+            await _audit(search_result_ev)
+            yield search_result_ev
+            if isinstance(search_result, dict) and search_result.get("ok") is True:
+                # Registered as seen: the loop's identical call short-circuits.
+                ctx.dedup.is_duplicate("t_web_search", search_args)
+                conditions = dataclasses.replace(conditions, web_search=False)
+                web_search_block = format_prefetched_web_search_block(web_indicator, search_result)
+                # The gates read what the run gathered from the loop's message
+                # history. This call replaced the loop's own turn, so it joins
+                # that record exactly as the loop's call would have.
+                prefetch_tool_messages = _code_tool_exchange(
+                    "t_web_search", search_args, search_result
+                )
+        # ----- Prompt and tool schema trim per class (stage 1, item 5) -----
+        # The standard class sends the prompt sections and the tool schemas the
+        # alert's planes make useful. Every other investigator tool stays
+        # registered with deferred loading, one ``search_tools`` call away. The
+        # deep class, and a hunt subject, keep the whole prompt and every schema.
+        trim_planes = (
+            budget.alert_planes(enriched)
+            if subject is None and budget.ran_class(class_plan, ran_loop=True) == budget.STANDARD
+            else None
+        )
+        ctx.loop_visible_tools = (
+            budget.standard_visible_tools(trim_planes) if trim_planes is not None else None
+        )
+        ctx.deferred_tool_names = []
+        investigator_kwargs: dict[str, Any] = {}
+        if trim_planes is not None:
+            investigator_kwargs["system_prompt"] = build_investigator_prompt(
+                emits_report=emits_report,
+                planes=trim_planes,
+                visible_tools=ctx.loop_visible_tools,
+            )
         investigator = build_investigator(
             build_synthesizer_model(
                 ctx.settings, temperature=ctx.settings.investigator_temperature
             ),
             ctx,
             emits_report=emits_report,
+            **investigator_kwargs,
         )
+        more_tools_block = format_more_tools_block(ctx.deferred_tool_names)
         # Injection 2 of 4, beside the grid inventory: the two blocks are the
         # same class of ambient ground truth, and rubric step 5 already tells the
         # model to weigh what the host IS — this supplies the missing input.
@@ -2989,20 +3385,15 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 enriched_json,
                 focus_hint=focus_hint,
                 focus_origin=focus_origin,
-                # Which conditional tool can still change THIS verdict. A tool
-                # whose condition is not met is not named, so the loop is not
-                # invited to spend a turn on it.
-                conditions=case_conditions(
-                    enriched,
-                    playbooks_available=have_playbooks,
-                    web_search_available=bool(ctx.settings.web_search_enabled),
-                ),
+                conditions=conditions,
                 emits_report=emits_report,
                 # D2. Non-empty only for a hunt subject, where it replaces the
                 # alert block: the hunt, its findings and its cited documents
                 # are the subject, so the enriched alert JSON is not rendered.
                 subject_block=subject_block or None,
             )
+            + web_search_block
+            + more_tools_block
             + await inventory_prompt_block(ctx.elastic, ctx.settings)
             + format_endpoint_coverage_block(enriched.prefetch_gaps.get(ENDPOINT_COVERAGE_GAP_KEY))
             + format_host_coverage_block(enriched.host_coverage, enriched.host_pivot_note)
@@ -3065,10 +3456,11 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 "true_positive",
                 "false_positive",
             )
+            partial_runs: list[Any] = []
             if not settled_r1 and loop_gathered:
                 try:
                     partial_report, repaired_history = await _synthesize_partial_triage(
-                        ctx.settings, guard, loop_gathered
+                        ctx.settings, guard, loop_gathered, result_out=partial_runs
                     )
                 except asyncio.CancelledError:
                     raise  # cooperative cancel — propagate, never swallow
@@ -3083,6 +3475,13 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                     await _audit(err_ev)
                     yield err_ev
             final_synth_rerun = None  # a cut-short verdict — never vote on it
+            for partial_run in partial_runs:
+                # The partial synthesis is a model run too. Its usage joins the
+                # run counters with the rest (soc_ai.run_meter).
+                partial_usage_ev = _usage_ev(2, partial_run)
+                if partial_usage_ev is not None:
+                    await _audit(partial_usage_ev)
+                    yield partial_usage_ev
             if partial_report is not None:
                 triage_final = partial_report.model_copy(
                     update={
@@ -3636,6 +4035,12 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         if phase_d_synth_ok and triage_final.gap_for_investigator is not None:
             triage_final = triage_final.model_copy(update={"gap_for_investigator": None})
 
+    # The web search the pipeline ran for the loop is part of what the loop
+    # gathered. With no loop history (the run fell back), there is nothing to
+    # join, exactly as a loop call would have been lost with it.
+    if prefetch_tool_messages and loop_messages is not None:
+        loop_messages = [*prefetch_tool_messages, *loop_messages]
+
     # ----- Self-consistency vote (flag-gated; OFF by default) -----
     # verdict_consistency_samples=1 (the default) skips this entirely: single
     # synthesis call, no vote, `inconclusive` never produced — byte-identical
@@ -3863,42 +4268,85 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
     # The local verdict is preserved in the audit via `local_verdict` in the
     # oracle_escalation event so evaluators can compare both.
     local_triage_final = triage_final  # snapshot before any Oracle override
-    if _should_escalate_to_oracle(
-        triage_final, enriched, ctx.settings, ran_loop=ran_investigation_loop
+    # True when the Oracle answered with a different class and no evidence: its
+    # answer is an opinion on the run, and the auto-acknowledge never fires.
+    oracle_opinion_withheld = False
+    # The class that ran. A cheap run never reaches the Oracle.
+    final_run_class = budget.ran_class(class_plan, ran_loop=ran_investigation_loop)
+    # The Oracle rule mode decides (classic, shadow or uncertainty). The reason
+    # is computed once, by the predicate itself, so the audit row cannot name a
+    # rule the predicate did not apply.
+    rule_decision = oracle_rule_decision(
+        triage_final,
+        enriched,
+        ctx.settings,
+        candidate=candidate,
+        ran_loop=ran_investigation_loop,
+        run_class=final_run_class,
+    )
+    escalation_reason = rule_decision.reason
+    if rule_decision.mode == "shadow" and (
+        rule_decision.classic_reason is not None or rule_decision.uncertainty_reason is not None
     ):
-        from soc_ai.agent.decision_templates import (  # noqa: PLC0415
-            _rule_signals_attack,
-            _rule_signals_malware,
+        # The shadow ledger: what the uncertainty rule would have done, beside
+        # what the classic rule did. No Oracle call and no verdict change
+        # comes from it. Detection tuning tallies these rows.
+        shadow_ev = _ev(
+            "oracle_shadow",
+            {
+                "classic_reason": rule_decision.classic_reason,
+                "uncertainty_reason": rule_decision.uncertainty_reason,
+                "would_escalate": rule_decision.uncertainty_reason is not None,
+                "classic_escalates": rule_decision.classic_reason is not None,
+                "local_verdict": triage_final.verdict,
+                "local_confidence": triage_final.confidence,
+                "template_verdict": getattr(candidate, "verdict", None),
+                "run_class": final_run_class,
+            },
         )
-
-        # Derive the audit reason to match the ACTUAL gate that fired in
-        # _should_escalate_to_oracle (same flag + predicate order as above).
-        # Previously only _rule_signals_malware was checked here, so an
-        # attack-class escalation was mis-labelled "below_confidence".
-        if (
-            ctx.settings.oracle_escalate_needs_more_info
-            and triage_final.verdict == "needs_more_info"
-        ):
-            escalation_reason = "needs_more_info"
-        elif (
-            ctx.settings.oracle_escalate_malware_non_tp
-            and (_rule_signals_malware(enriched) or _rule_signals_attack(enriched))
-            and not (triage_final.verdict == "true_positive" and triage_final.confidence >= 0.7)
-            and not (
-                ran_investigation_loop
-                and triage_final.confidence >= ctx.settings.oracle_skip_after_confident_loop
-            )
-        ):
-            escalation_reason = "malware_non_tp"
-        else:
-            escalation_reason = "below_confidence"
+        await _audit(shadow_ev)
+        yield shadow_ev
+    # The route pause (soc_ai.oracle.breaker): a route that answered with a
+    # usage limit, or with a run of server errors, gets no call until the
+    # reset time. The escalation is recorded as oracle_skipped, never as an
+    # oracle_escalation: nothing left the box.
+    oracle_route = _oracle_breaker.route_key(ctx.settings)
+    oracle_paused_until = (
+        _oracle_breaker.BREAKER.open_until(oracle_route) if escalation_reason is not None else None
+    )
+    if escalation_reason is not None and oracle_paused_until is not None:
+        pause = _oracle_breaker.BREAKER.state(oracle_route)
+        skip_ev = _ev(
+            "oracle_skipped",
+            {
+                "reason": "oracle_paused",
+                "pause_reason": pause.reason,
+                "paused_until": _oracle_breaker.iso(oracle_paused_until),
+                "reset_named": pause.reset_named,
+                "message": pause.message,
+                "escalation_reason": escalation_reason,
+                "rule_mode": rule_decision.mode,
+                "local_verdict": triage_final.verdict,
+                "local_confidence": triage_final.confidence,
+            },
+        )
+        await _audit(skip_ev)
+        yield skip_ev
+    elif escalation_reason is not None:
+        from soc_ai.agent.gates import gate_band  # noqa: PLC0415 - re-exported module
 
         esc_ev = _ev(
             "oracle_escalation",
             {
+                # The Oracle ledger: the egress audit row of every escalation
+                # carries the reason that sent it and the rule mode.
                 "reason": escalation_reason,
+                "rule_mode": rule_decision.mode,
                 "local_verdict": triage_final.verdict,
                 "local_confidence": triage_final.confidence,
+                "template_verdict": getattr(candidate, "verdict", None),
+                "gate_band": list(gate_band()),
+                "run_class": final_run_class,
             },
         )
         await _audit(esc_ev)
@@ -3934,7 +4382,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         # no_propagate_out precedent): adjudicate() keeps its None-on-failure
         # contract but names WHY, so the failed-adjudication event below can
         # carry a reason instead of a shrug.
-        oracle_failure: dict[str, str] = {}
+        oracle_failure: dict[str, Any] = {}
         oracle_result = await _oracle_client.adjudicate(
             ctx,
             enriched=enriched,
@@ -3947,7 +4395,35 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             failure_out=oracle_failure,
         )
 
+        if (
+            oracle_result is not None
+            and not oracle_result.override_withheld
+            and oracle_result.report.verdict != local_triage_final.verdict
+            and (oracle_result.oracle_tool_calls or 0) < 1
+            and not oracle_result.oracle_citations
+        ):
+            # No override without evidence (2026-10-04). The client applies
+            # this gate on both of its paths; this is the same rule at the
+            # point where the verdict changes hands, so no client path and no
+            # stub can land a flip that names no evidence. Production landed
+            # 6 such flips, NMI to FP, and auto-acknowledged 2 of them.
+            oracle_result = dataclasses.replace(
+                oracle_result,
+                report=local_triage_final,
+                override_withheld=True,
+                raw_oracle_verdict=(
+                    oracle_result.raw_oracle_verdict or oracle_result.report.verdict
+                ),
+                raw_oracle_confidence=(
+                    oracle_result.raw_oracle_confidence
+                    if oracle_result.raw_oracle_confidence is not None
+                    else oracle_result.report.confidence
+                ),
+                raw_oracle_summary=oracle_result.raw_oracle_summary or oracle_result.report.summary,
+            )
+
         if oracle_result is not None:
+            oracle_opinion_withheld = oracle_result.override_withheld
             # Fix M2: post-validate the Oracle's output with the same
             # deterministic targeted downgrades that ran on the local verdict.
             # Closes the path where the Oracle re-introduces a
@@ -3999,7 +4475,17 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                         if oracle_result.override_withheld
                         else oracle_report.verdict
                     ),
-                    "oracle_confidence": oracle_report.confidence,
+                    "oracle_confidence": (
+                        oracle_result.raw_oracle_confidence
+                        if oracle_result.override_withheld
+                        and oracle_result.raw_oracle_confidence is not None
+                        else oracle_report.confidence
+                    ),
+                    # The evidence the Oracle named, and how much of it
+                    # resolved. A class change needs one resolved citation or
+                    # one successful tool call of its own.
+                    "oracle_citations": list(oracle_result.oracle_citations),
+                    "oracle_citations_cited": oracle_result.oracle_citations_cited,
                     "redaction": oracle_result.redaction_summary,
                     "oracle_model": oracle_result.oracle_model,
                     # Observability (design §8): how many successful tool calls
@@ -4018,7 +4504,13 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                     # no supporting tool call did NOT override; the local verdict
                     # below stands, and that decision is recorded here.
                     **(
-                        {"override_withheld": True, "local_verdict": local_triage_final.verdict}
+                        {
+                            "override_withheld": True,
+                            "withheld_reason": "no_resolving_evidence",
+                            "local_verdict": local_triage_final.verdict,
+                            # The opinion, kept on the run for the analyst.
+                            "oracle_summary": (oracle_result.raw_oracle_summary or "")[:1500],
+                        }
                         if oracle_result.override_withheld
                         else {}
                     ),
@@ -4050,16 +4542,37 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             # adjudication silently vanished (scenario b8, 2026-08-27
             # measurement) was indistinguishable from one still in flight.
             # "unknown" = a caller (or test stub) that recorded no reason.
+            # The failure's truth (soc_ai.oracle.failures): the HTTP status,
+            # the error class and the gateway's scrubbed message. Absent keys
+            # stay absent, so "the client recorded no status" never reads as
+            # a status.
             fail_ev = _ev(
                 "oracle_adjudication_failed",
                 {
                     "reason": oracle_failure.get("reason", "unknown"),
+                    **{
+                        key: oracle_failure[key]
+                        for key in ("error_class", "http_status", "message", "paused_until")
+                        if key in oracle_failure
+                    },
                     "local_verdict": triage_final.verdict,
                     "local_confidence": triage_final.confidence,
                 },
             )
             await _audit(fail_ev)
             yield fail_ev
+            if oracle_failure.get("breaker_opened"):
+                # The pause opened on this call: one webhook message per pause.
+                # The bell reads the breaker itself (routes_meta).
+                from soc_ai import notify  # noqa: PLC0415 - lazy, like the runner
+
+                pause_event = notify.event_for_oracle_paused(
+                    pause_reason=_oracle_breaker.BREAKER.state(oracle_route).reason,
+                    until=oracle_failure.get("paused_until"),
+                    settings=ctx.settings,
+                )
+                if pause_event is not None:
+                    await notify.fire_safe(pause_event, ctx.settings, ctx.audit)
 
     # The Oracle writes its own prose, and the same rule holds for it. Only
     # an Oracle report is grounded here: the local one already was, and a
@@ -4137,6 +4650,10 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             "local_verdict": local_triage_final.verdict
             if triage_final is not local_triage_final
             else None,
+            # The budget class this run ran in, and why (soc_ai.agent.budget).
+            # The recorder stamps it on the row; the console shows it as a chip.
+            "run_class": final_run_class,
+            "run_class_reason": run_class_reason,
         },
     )
     await _audit(triage_ev)
@@ -4164,6 +4681,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         investigated=run_retrieved_evidence,
         citation_coverage=ack_coverage,
         allow_so_writes=allow_so_writes,
+        oracle_dissent=oracle_opinion_withheld,
     )
     if auto_ack_ev is not None:
         yield auto_ack_ev
@@ -4191,6 +4709,9 @@ __all__ = [
     "build_synth_first_agent",
     "build_synthesizer",
     "build_synthesizer_model",
+    "classic_oracle_escalation_reason",
     "investigate",
     "maybe_auto_ack_fp",
+    "oracle_escalation_reason",
+    "oracle_rule_decision",
 ]

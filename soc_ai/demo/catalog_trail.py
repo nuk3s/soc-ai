@@ -276,12 +276,13 @@ async def seed_catalog_trail(
         db.add_all(sweeps)
         # The catalog reads a profile analytic's trail from ``prior_spec_runs``,
         # so the demo seeds that table too: each prior sweep measured a few
-        # hosts and fired nothing.
+        # hosts and fired nothing. A model analytic runs in the same sweep,
+        # always in shadow until the analytic lifecycle work lands.
         db.add_all(
             PriorSpecRun(
                 created_at=row.at,
                 spec_id=row.spec_id,
-                shadow=False,
+                shadow=catalog[row.spec_id].evaluator == "model",
                 measured=3,
                 learning=0,
                 blind=1,
@@ -290,7 +291,7 @@ async def seed_catalog_trail(
                 profiles_built_at=row.at,
             )
             for row in rows
-            if catalog[row.spec_id].evaluator == "profile"
+            if catalog[row.spec_id].runs_in_prior_sweep
         )
         await db.commit()
     return 1

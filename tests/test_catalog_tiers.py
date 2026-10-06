@@ -38,7 +38,11 @@ async def test_shipped_specs_are_live_and_a_local_shadow_spec_joins_them(
     assert state.analytic_id not in before.specs
     assert state.analytic_id in before.listed
     assert state.analytic_id in after.specs
-    assert after.shadow_ids == frozenset({state.analytic_id})
+    # The two shipped learned detectors declare ships_as shadow, so they sit
+    # in shadow_ids on every read.
+    shipped_in_shadow = frozenset({"model-cross-plane-silence", "model-logon-chain"})
+    assert after.shadow_ids == shipped_in_shadow | {state.analytic_id}
+    assert before.shadow_ids == shipped_in_shadow
 
 
 async def test_a_retired_shipped_spec_is_listed_but_not_run(settings_kratos: Settings) -> None:

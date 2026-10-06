@@ -46,6 +46,21 @@ describe('machineRoleView', () => {
     expect(machineRoleView(role({ state: 'stale' })).text).toBe('stale');
   });
 
+  // N7 of the 2026-10-05 verification. The list cut "low confidence:
+  // security appliance" in a narrow cell. The view gives the guess and its
+  // state words apart, so the list can keep the guess whole.
+  it('gives a withheld role as the guess and the words that qualify it', () => {
+    const low = machineRoleView(role({ state: 'low_confidence', guess: 'security_appliance' }));
+    expect(low).toMatchObject({ guess: 'security appliance', qualifier: 'low confidence' });
+    const stale = machineRoleView(role({ state: 'stale', guess: 'iot', stale_hours: 200 }));
+    expect(stale).toMatchObject({ guess: 'IoT device', qualifier: 'stale 8d' });
+    // Negative control: no guess, so the state words are all the cell says.
+    const none = machineRoleView(role({ state: 'low_confidence' }));
+    expect(none).toMatchObject({ guess: null, qualifier: 'low confidence' });
+    // An answer has no guess to qualify.
+    expect(machineRoleView(role({ value: 'server', state: 'inferred' })).guess).toBeUndefined();
+  });
+
   it('says "unknown" for an unknown role, and for no role at all', () => {
     expect(machineRoleView(role({})).text).toBe('unknown');
     expect(machineRoleView(null).text).toBe('unknown');

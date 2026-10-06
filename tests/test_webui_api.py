@@ -2241,9 +2241,15 @@ def test_auto_triage_selected_spawns_for_targets(client: TestClient) -> None:
         return [Target(alert_es_id="a", rule_name="", src_ip="", dst_ip="")], 1
 
     async def noop_run(
-        state: object, *, targets: list, started_by: str, inherited_acks: list | None = None
+        state: object,
+        *,
+        targets: list,
+        started_by: str,
+        inherited_acks: list | None = None,
+        requested_class: str | None = None,
     ) -> None:
-        return None
+        # An explicit selection is an analyst's Investigate: the standard class.
+        assert requested_class == "standard"
 
     with (
         patch("soc_ai.api.webui_api.at.plan_targets_for_ids", fake_plan_ids),
@@ -2565,7 +2571,7 @@ def test_notifications_include_recent_completions(client: TestClient) -> None:
     assert "false_positive" in by_id[f"inv-done:{fresh_id}"]["title"]
     assert f"inv-done:{stale_id}" not in by_id  # aged out of the window
     assert f"hunt-done:{hunt_id}" in by_id
-    assert "2 findings" in by_id[f"hunt-done:{hunt_id}"]["title"]
+    assert "2 threat findings" in by_id[f"hunt-done:{hunt_id}"]["title"]
     assert by_id[f"hunt-done:{hunt_id}"]["href"] == f"/hunts/{hunt_id}"
 
 
@@ -6834,10 +6840,10 @@ def test_tool_outcome_never_leaks_json_and_humanizes_known_shapes() -> None:
                 "summary": "online enrichment is off ...",
             },
         )
-        == "GreyNoise: skipped (online enrichment off)"
+        == "GreyNoise: skipped, online enrichment off"
     )
     assert title("t_shodan_host", {"available": False, "reason": "not_configured"}) == (
-        "Shodan host: skipped (not configured)"
+        "Shodan host: skipped, not configured"
     )
     # error -> short, distinct failure phrase
     assert title("t_query_events_oql", {"error": True, "message": "timeout after 30s"}) == (
@@ -7414,7 +7420,7 @@ def test_the_bell_does_not_call_a_visibility_gap_a_finding(client: TestClient) -
     assert gap["tone"] == "accent"
 
     # A threat alongside a gap is announced by the THREAT count, not the total.
-    assert "1 finding" in by_id[f"hunt-done:{threat_id}"]["title"]
+    assert "1 threat finding:" in by_id[f"hunt-done:{threat_id}"]["title"]
     assert by_id[f"hunt-done:{threat_id}"]["tone"] == "warn"
 
     # Legacy shape, classified by title.

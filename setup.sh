@@ -79,6 +79,21 @@ env_readback(){ local v
   printf '%s' "$v"
 }
 
+# Add one name to the COMPOSE_PROFILES list in .env and keep the others.
+# scripts/tls-proxy.sh adds and removes "proxy" in the same list. The line
+# goes after the managed block, so a later run keeps it.
+add_compose_profile(){ local name=$1 cur out="" p parts=()
+  cur=$(env_readback COMPOSE_PROFILES)
+  IFS=',' read -ra parts <<< "$cur" || true
+  for p in "${parts[@]}"; do
+    p=${p//[[:space:]]/}
+    [[ -z $p || $p == "$name" ]] && continue
+    out+="${out:+,}$p"
+  done
+  sed -i '/^[[:space:]]*COMPOSE_PROFILES=/d' .env
+  printf 'COMPOSE_PROFILES=%s\n' "${out:+$out,}$name" >> .env
+}
+
 # uvicorn opens the TLS key inside the container as uid 1000 (Dockerfile: USER
 # soc-ai) through a read-only bind mount that carries no ACLs, so the host file
 # must be readable by that uid through plain owner/group/other bits. openssl
@@ -283,6 +298,10 @@ fi
 # ── 2. configuration (.env) ───────────────────────────────────────────────────
 hr
 RECFG=y
+# A fresh install has no .env yet. Only a fresh install may put a new store in
+# PostgreSQL: on a re-run the SQLite store can hold data, and a switch would
+# leave it behind while the console shows an empty store.
+FRESH_ENV=1; [[ -f .env ]] && FRESH_ENV=0
 if [[ -f .env ]]; then yesno RECFG ".env already exists — reconfigure it?" n
   [[ $RECFG == n ]] && info "Keeping the existing .env."; fi
 
@@ -473,13 +492,42 @@ if [[ $RECFG == y ]]; then
   yesno AUTO_TRIAGE "  Auto-triage the alert backlog on a schedule? (every 5 min, ≤25 targets/sweep, high-severity+)" "${AUTO_TRIAGE:-y}"
   yesno STARTER_PACK "  Install the 10-runbook starter pack after start? (grounds verdicts; idempotent)" "${STARTER_PACK:-y}"
 
+  echo
+  info "Store:"
+  # SQLite is the default and suits one site. PostgreSQL takes the writes of a
+  # large estate; the compose "postgres" profile runs it next to soc-ai. A store
+  # already in PostgreSQL stays there. See docs/DOCKER.md, PostgreSQL.
+  PG_URL=$(env_readback SOC_AI_DATABASE_URL); PG_COMPOSE=n
+  # Read back before the managed block is rewritten: the server keeps the
+  # password it started with, so a new one would lock soc-ai out.
+  SOC_AI_POSTGRES_PASSWORD=${SOC_AI_POSTGRES_PASSWORD:-$(env_readback SOC_AI_POSTGRES_PASSWORD)}
+  if [[ -n $PG_URL ]]; then
+    STORE_POSTGRES=y
+    info "  The store is in PostgreSQL (SOC_AI_DATABASE_URL). It stays there."
+    [[ $PG_URL == *@postgres:5432/* ]] && PG_COMPOSE=y
+  else
+    yesno STORE_POSTGRES "  Keep the store in PostgreSQL? Yes suits a large estate, no keeps SQLite" "${STORE_POSTGRES:-n}"
+    if [[ $STORE_POSTGRES == y && $FRESH_ENV -eq 0 ]]; then
+      warn "This host already has a .env, so its SQLite store can hold data. The store stays in SQLite."
+      warn "  To move it, follow docs/DOCKER.md, PostgreSQL: soc-ai store migrate copies every table."
+      STORE_POSTGRES=n
+    fi
+    if [[ $STORE_POSTGRES == y ]]; then
+      SOC_AI_POSTGRES_PASSWORD=${SOC_AI_POSTGRES_PASSWORD:-$(genpw)}
+      [[ $SOC_AI_POSTGRES_PASSWORD =~ ^[A-Za-z0-9._~-]+$ ]] \
+        || die "SOC_AI_POSTGRES_PASSWORD may hold letters, digits, '.', '_', '~' and '-' only. The store URL carries it."
+      PG_URL="postgresql+asyncpg://soc_ai:${SOC_AI_POSTGRES_PASSWORD}@postgres:5432/soc_ai"
+      PG_COMPOSE=y
+    fi
+  fi
+
   CONFIG_SECRET_KEY=${CONFIG_SECRET_KEY:-$(genfernet)}
   BOOTSTRAP_ADMIN_PASSWORD=${BOOTSTRAP_ADMIN_PASSWORD:-$(genpw)}
   # Pin the prebuilt image to the release version, so --prebuilt never rides the
   # mutable :latest tag. Resolved from pyproject.toml (fallback: newest v* tag).
   SOC_AI_IMAGE_TAG=${SOC_AI_IMAGE_TAG:-$(resolve_release_version)}
   envsafe ANALYST_MODEL WEBUI_ALERTS_QUERY ABUSE_CH_AUTH_KEY MAXMIND_LICENSE_KEY \
-          CONFIG_SECRET_KEY BOOTSTRAP_ADMIN_PASSWORD
+          CONFIG_SECRET_KEY BOOTSTRAP_ADMIN_PASSWORD PG_URL SOC_AI_POSTGRES_PASSWORD
 
   [[ -f .env ]] || cp .env.example .env
   sed -i '/# >>> soc-ai setup.sh >>>/,/# <<< soc-ai setup.sh <<</d' .env 2>/dev/null || true
@@ -525,8 +573,15 @@ if [[ $RECFG == y ]]; then
     echo "SOC_AI_TLS_CERT=/etc/soc-ai/cert.pem"
     echo "SOC_AI_TLS_KEY=/etc/soc-ai/key.pem"
     echo "SOC_AI_DATA_DIR=/var/lib/soc-ai/data"
+    if [[ $STORE_POSTGRES == y ]]; then
+      echo "SOC_AI_DATABASE_URL='${PG_URL}'"
+      [[ $PG_COMPOSE == y ]] && echo "SOC_AI_POSTGRES_PASSWORD='${SOC_AI_POSTGRES_PASSWORD}'"
+    fi
     echo "# <<< soc-ai setup.sh <<<"
   } >> .env
+  # The compose profile goes outside the managed block: scripts/tls-proxy.sh
+  # adds and removes "proxy" in the same COMPOSE_PROFILES list.
+  [[ $PG_COMPOSE == y ]] && add_compose_profile postgres
   chmod 600 .env
   ok "Wrote .env"
 
@@ -541,7 +596,7 @@ if [[ $RECFG == y ]]; then
         for k in SO_HOST SO_VERIFY_SSL SO_USERNAME SO_PASSWORD ES_HOSTS ES_VERIFY_SSL \
                  LLM_ROUTE LITELLM_BASE_URL LITELLM_API_KEY LITELLM_VERIFY_SSL ANALYST_MODEL \
                  WEBUI_ALERTS_QUERY EVENTS_INDEX_PATTERN API_AUTH_REQUIRED \
-                 MAXMIND_LICENSE_KEY AUTO_TRIAGE STARTER_PACK \
+                 MAXMIND_LICENSE_KEY AUTO_TRIAGE STARTER_PACK STORE_POSTGRES \
                  HTTPS_DOMAIN HTTPS_CA \
                  CONFIG_SECRET_KEY BOOTSTRAP_ADMIN_PASSWORD; do
           case $k in

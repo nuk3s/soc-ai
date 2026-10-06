@@ -74,6 +74,14 @@ export function AboutPanel({
                 <span className="rounded-chip border border-border bg-surface-2 px-2 py-0.5 font-mono text-[12px] text-text-2">
                   v{data.version}
                 </span>
+                {data.commit && (
+                  <span
+                    title={data.commit}
+                    className="rounded-chip border border-border bg-surface-2 px-2 py-0.5 font-mono text-[12px] text-text-2"
+                  >
+                    commit {data.commit.slice(0, 12)}
+                  </span>
+                )}
               </div>
               <div className="mt-2 text-[12.5px] leading-[1.6] text-dim">
                 soc-ai is open, self-hosted LLM triage for Security Onion. The license is{' '}

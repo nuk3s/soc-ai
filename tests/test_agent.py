@@ -5279,7 +5279,10 @@ def _oracle_settings(**overrides: Any) -> Settings:
         "oracle_model": "claude-sonnet-4-6",
         "oracle_escalate_needs_more_info": True,
         "oracle_escalate_malware_non_tp": True,
-        "oracle_escalate_below_confidence": 0.6,
+        "oracle_escalate_below_confidence": 0.7,
+        # The stage 1 gate matrix below pins the uncertainty rule. The default
+        # mode is shadow, where the classic rule decides (test_oracle_rule_mode).
+        "oracle_rule_mode": "uncertainty",
     }
     kwargs.update(overrides)
     return Settings(**kwargs)
@@ -5340,25 +5343,27 @@ class TestShouldEscalateToOracle:
         }
         assert self._gate(report, enriched, settings) is False
 
-    def test_malware_signal_fp_escalates(self) -> None:
-        """Malware-signal rule + false_positive (zero-tool path) → escalate (condition 2)."""
-        settings = _oracle_settings()
-        enriched = _malware_signal_enriched()
-        report = self._report(verdict="false_positive", confidence=0.85)
-        # ran_loop defaults False → the zero-tool QVOD/BPFDoor safety net fires.
-        assert self._gate(report, enriched, settings) is True
+    def test_malware_signal_confident_fp_no_longer_escalates_by_class(self) -> None:
+        """Stage 1: the Oracle escalates on uncertainty, never on the verdict class.
 
-    def test_malware_signal_confident_fp_after_loop_no_escalate(self) -> None:
-        """COST GATE: a confident FP AFTER a real investigation loop → NO escalation."""
+        A confident false positive on a malware rule, with no template to split
+        from, is not uncertain. It escalated 48 times in 30 days on production
+        under the class rule, and the Oracle confirmed every audited one.
+        """
         from soc_ai.agent.orchestrator import _should_escalate_to_oracle
 
         settings = _oracle_settings()
         enriched = _malware_signal_enriched()
         report = self._report(verdict="false_positive", confidence=0.85)
-        # 0.85 >= oracle_skip_after_confident_loop (0.8) and the loop ran → trust it.
+        assert _should_escalate_to_oracle(report, enriched, settings, ran_loop=False) is False
         assert _should_escalate_to_oracle(report, enriched, settings, ran_loop=True) is False
-        # but the same verdict from the zero-tool path STILL escalates:
-        assert _should_escalate_to_oracle(report, enriched, settings, ran_loop=False) is True
+
+    def test_malware_signal_in_band_fp_escalates(self) -> None:
+        """The same rule with an uncertain false positive does escalate."""
+        settings = _oracle_settings()
+        enriched = _malware_signal_enriched()
+        report = self._report(verdict="false_positive", confidence=0.6)
+        assert self._gate(report, enriched, settings) is True
 
     def test_malware_signal_low_conf_fp_after_loop_still_escalates(self) -> None:
         """A loop that stayed low-confidence does NOT earn the skip (still escalates)."""
@@ -5473,10 +5478,13 @@ async def test_oracle_wiring_escalated_fp_overridden_to_tp(
     )
     from soc_ai.oracle.client import OracleResult
 
+    # The Oracle cites the alert's id: a class change needs a citation that
+    # resolves (no override without evidence, 2026-10-04).
     oracle_result = OracleResult(
         report=oracle_tp_report,
         redaction_summary={"IP": 2},
         oracle_model="claude-sonnet-4-6",
+        oracle_citations=["beacon-001"],
     )
 
     async def _stub_enriched(alert_id: str, **_kw: Any) -> Any:
@@ -5681,18 +5689,20 @@ class TestShouldEscalateToOracleAttackClass:
             citations=[],
         )
 
-    def test_attack_class_confident_fp_escalates(self) -> None:
-        """ATTACK-class classtype + confident false_positive → escalates (Fix 1).
+    def test_attack_class_uncertain_fp_escalates(self) -> None:
+        """ATTACK-class classtype + an in-band false_positive → escalates (Fix 1).
 
-        Before Fix 1, gate-2 keyed on _rule_signals_malware only.
-        'ET ATTACK_RESPONSE Kerberoast SPN Request' has no malware token →
-        would return False. With Fix 1, _rule_signals_attack sees classtype
-        'attempted-admin' ∈ _ATTACK_CLASSTYPES → returns True.
+        'ET ATTACK_RESPONSE Kerberoast SPN Request' has no malware token, so the
+        malware-rule opt-in reads the classtype through _rule_signals_attack.
+        The opt-in lets the uncertain verdict through. A confident one is not
+        uncertain and stays local (stage 1).
         """
         settings = _oracle_settings()
         enriched = _attack_class_enriched()
-        report = self._report(verdict="false_positive", confidence=0.85)
-        assert self._gate(report, enriched, settings) is True
+        assert self._gate(self._report("false_positive", 0.55), enriched, settings) is True
+        assert self._gate(self._report("false_positive", 0.85), enriched, settings) is False
+        off = _oracle_settings(oracle_escalate_malware_non_tp=False)
+        assert self._gate(self._report("false_positive", 0.55), enriched, off) is False
 
     def test_attack_class_confident_tp_does_not_escalate(self) -> None:
         """ATTACK-class rule + true_positive confidence ≥ 0.7 → NO escalation."""
@@ -5844,10 +5854,13 @@ async def test_oracle_wiring_post_validates_icmp_tp(
     )
     from soc_ai.oracle.client import OracleResult
 
+    # The Oracle cites the alert's id: a class change needs a citation that
+    # resolves (no override without evidence, 2026-10-04).
     oracle_result = OracleResult(
         report=oracle_tp_report,
         redaction_summary={"IP": 2},
         oracle_model="claude-sonnet-4-6",
+        oracle_citations=["icmp-001"],
     )
 
     async def _stub_enriched_icmp(alert_id: str, **_kw: Any) -> Any:
@@ -7279,6 +7292,76 @@ def _fake_partial_agent(report: TriageReport) -> Any:
     agent = MagicMock()
     agent.run = AsyncMock(return_value=MagicMock(output=report))
     return agent
+
+
+@pytest.mark.asyncio
+async def test_partial_triage_synth_prompt_reaches_the_model(settings_kratos: Settings) -> None:
+    """The budget-partial synthesizer always runs with a NON-empty replayed
+    history. pydantic-ai 1.107 emits an agent ``system_prompt`` only when the
+    history is empty, so the ``system_prompt=`` copy of
+    BUDGET_PARTIAL_SYNTH_PROMPT never reached the model: the partial verdict ran
+    under the replayed investigator prompt with none of the anti-over-claim
+    rules. A model that records what it was sent must see the partial prompt."""
+    from pydantic_ai.messages import (
+        ModelRequest,
+        ModelResponse,
+        SystemPromptPart,
+        ToolCallPart,
+        UserPromptPart,
+    )
+    from pydantic_ai.models.function import AgentInfo, FunctionModel
+    from soc_ai.agent.orchestrator import _synthesize_partial_triage
+    from soc_ai.agent.prompts import BUDGET_PARTIAL_SYNTH_PROMPT
+
+    marker = "hit its tool-call budget before the investigator could finish"
+    assert marker in BUDGET_PARTIAL_SYNTH_PROMPT
+
+    sent: list[str] = []
+
+    def _fn(messages: list[Any], info: AgentInfo) -> ModelResponse:
+        # Everything the model can read as framing: the system parts the
+        # request carries plus the instructions pydantic-ai passes alongside.
+        for msg in messages:
+            if isinstance(msg, ModelRequest):
+                sent.extend(p.content for p in msg.parts if isinstance(p, SystemPromptPart))
+        if info.instructions:
+            sent.append(info.instructions)
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name=info.output_tools[0].name,
+                    args={
+                        "verdict": "needs_more_info",
+                        "confidence": 0.4,
+                        "summary": "The loop was cut short.",
+                        "citations": ["(tool t_query_zeek_logs)"],
+                        "recommended_actions": [],
+                    },
+                )
+            ]
+        )
+
+    # The replayed loop history opens with the INVESTIGATOR's system prompt, as
+    # pydantic-ai leaves it in the run's messages.
+    gathered = [
+        ModelRequest(
+            parts=[
+                SystemPromptPart(content="INVESTIGATOR PROMPT: call the read tools"),
+                UserPromptPart(content="Investigate alert beacon-001."),
+            ]
+        ),
+        *_budget_loop_messages(),
+    ]
+    with patch(
+        "soc_ai.agent.orchestrator.build_synthesizer_model",
+        return_value=FunctionModel(_fn),
+    ):
+        report, _repaired = await _synthesize_partial_triage(settings_kratos, None, gathered)
+
+    assert report.verdict == "needs_more_info"
+    assert any(marker in text for text in sent), (
+        f"BUDGET_PARTIAL_SYNTH_PROMPT never reached the model; framing sent={sent!r}"
+    )
 
 
 @pytest.mark.asyncio

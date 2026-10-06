@@ -5,16 +5,24 @@ import {
   getAnalytic,
   setAnalyticStatus,
   startHuntConsole,
+  type AnalyticBreach,
   type AnalyticDetail,
   type AnalyticRow,
 } from '../lib/api';
-import { NOT_RUNNING_TITLE, statusLabel } from '../lib/analyticRuns';
+import {
+  NO_HUNT_LINE,
+  NOT_RUNNING_TITLE,
+  huntCanRun,
+  runsInProfileSweep,
+  statusLabel,
+} from '../lib/analyticRuns';
 import { entityPath } from '../lib/entityPath';
 import { plural } from '../lib/plural';
 import { absTime, ago } from '../lib/timeRange';
 import { AnalyticPins } from './AnalyticPins';
 import {
   CHIP_CANDIDATE,
+  CHIP_HELD_BY_SYSTEM,
   CHIP_IN_LEAD,
   CHIP_LIVE,
   CHIP_LOCAL,
@@ -22,6 +30,8 @@ import {
   CHIP_RETIRED,
   CHIP_SHADOW,
   CHIP_SHIPPED,
+  CHIP_SHIPPED_IN_SHADOW,
+  CHIP_SYSTEM_CHANGE,
   CHIP_VERSION,
   LEDGER_DISMISSED,
   LEDGER_HUNTED_PROMOTED,
@@ -94,6 +104,32 @@ export function StatusDot({ status, running }: { status: string; running?: boole
   );
 }
 
+/** One line per breach on a system demotion: the number the hold read and the
+ *  budget or the floor it read it against. A rule this console does not know
+ *  still prints its numbers, so a newer server never shows an empty line. */
+export function breachLine(breach: AnalyticBreach): string {
+  if (breach.rule === 'fire_budget') {
+    const hours = typeof breach.window_hours === 'number' ? breach.window_hours : 24;
+    return `${breach.hits ?? '?'} hits in ${hours} h · budget ${breach.budget ?? '?'} a day`;
+  }
+  if (breach.rule === 'precision_floor') {
+    const precision = typeof breach.precision === 'number' ? breach.precision.toFixed(2) : '?';
+    const floor = typeof breach.floor === 'number' ? breach.floor.toFixed(2) : '?';
+    return (
+      `precision ${precision} on ${breach.decided ?? '?'} hunted leads · ` +
+      `${breach.reached ?? '?'} reached a finding or an investigation · floor ${floor}`
+    );
+  }
+  const numbers = Object.entries(breach)
+    .filter(([, value]) => typeof value === 'number')
+    .map(([key, value]) => `${key.replace(/_/g, ' ')} ${value}`);
+  return [breach.rule.replace(/_/g, ' '), ...numbers].join(' · ');
+}
+
+/** The actor on the version row that the catalog load writes when a shipped
+ *  analytic ships in shadow. The backend holds it as CATALOG_ACTOR. */
+const CATALOG_ACTOR = 'system:catalog';
+
 const REASON_PLACEHOLDER: Record<string, string> = {
   live: 'Why it goes live',
   retired: 'Why it is retired',
@@ -106,6 +142,11 @@ const REASON_PLACEHOLDER: Record<string, string> = {
  *  A transition that changes what runs asks for a reason first. The sharpening
  *  loop reads the reason later, and a retirement with no reason is an analytic
  *  that disappeared. */
+/** What the analyst does about a hold, in the names of the two controls below it. */
+const HELD_NEXT_STEP =
+  'Read the evidence under Versions. Then select Approve or Reject. Approve puts the analytic ' +
+  'back to live. Reject retires it. soc-ai does neither.';
+
 export function AnalyticActions({
   analytic,
   onChanged,
@@ -120,6 +161,10 @@ export function AnalyticActions({
   const [why, setWhy] = useState('');
   const [busy, setBusy] = useState(false);
   const [failed, setFailed] = useState<string | null>(null);
+  // A hunt runs the analytic with `t_run_analytic`, which runs a `match`
+  // analytic only. The control on a profile or a model analytic started a
+  // hunt whose first step failed.
+  const hunts = huntCanRun(analytic.evaluator);
 
   const move = async (to: string, reason?: string) => {
     setBusy(true);
@@ -183,9 +228,11 @@ export function AnalyticActions({
         )}
         {analytic.status === 'live' && (
           <>
-            <button type="button" disabled={busy} className={btn} onClick={hunt}>
-              Hunt with this
-            </button>
+            {hunts && (
+              <button type="button" disabled={busy} className={btn} onClick={hunt}>
+                Hunt with this
+              </button>
+            )}
             <button
               type="button"
               disabled={busy}
@@ -202,6 +249,11 @@ export function AnalyticActions({
           </button>
         )}
       </div>
+      {analytic.status === 'live' && !hunts && (
+        <div data-testid="analytic-no-hunt" className="basis-full text-[11px] text-dim">
+          {NO_HUNT_LINE}
+        </div>
+      )}
       {asking && (
         <div className="flex flex-wrap items-center gap-2 text-[12px]">
           <input
@@ -294,10 +346,22 @@ export function nothingObserved(detail: AnalyticDetail): string {
 
 /** The cost cell. A profile analytic reads stored baselines: the prior sweep
  *  records no document count and no runtime, so the cell counts its runs. It
- *  read "0 documents · 0 ms · 0 sweeps" on an analytic that ran minutes ago. */
+ *  read "0 documents · 0 ms · 0 sweeps" on an analytic that ran minutes ago.
+ *  A model analytic runs in the same sweep and records the same trail. It
+ *  reads no stored baseline, so its runs are detector runs and the tooltip
+ *  says what a detector reads. */
 function costCell(detail: AnalyticDetail): { value: string; sub: string; title: string } {
   const ledger = detail.ledger;
-  if (detail.evaluator === 'profile') {
+  if (detail.evaluator === 'model') {
+    const runs = ledger.profile_runs ?? 0;
+    return {
+      value: String(runs),
+      sub: runs === 1 ? 'detector run' : 'detector runs',
+      title:
+        'Runs of this learned detector in the profile sweep over the window. The detector reads the grid and builds its own baseline. The sweep records no document count and no runtime for it.',
+    };
+  }
+  if (runsInProfileSweep(detail.evaluator)) {
     const runs = ledger.profile_runs ?? 0;
     return {
       value: String(runs),
@@ -349,8 +413,23 @@ function Body({ detail, onChanged }: { detail: AnalyticDetail; onChanged?: () =>
             no benign baseline
           </div>
         )}
-        {detail.reason && (
-          <div className="mt-1.5 text-[11.5px] text-dim">Reason on record: {detail.reason}</div>
+        {detail.held_by_system ? (
+          <div
+            data-testid="analytic-held"
+            className="mt-2 rounded-panel border px-3 py-2 text-[12px]"
+            style={{ borderColor: 'rgba(210,153,34,.45)' }}
+            title={CHIP_HELD_BY_SYSTEM}
+          >
+            <div className="font-semibold text-warn">soc-ai moved this analytic to shadow.</div>
+            <div className="mt-0.5 text-text-2">{detail.held_by_system}</div>
+            {/* The box said "approve it to live or retire it" over the two
+                controls "Approve" and "Reject". It names the controls now. */}
+            <div className="mt-0.5 text-dim">{HELD_NEXT_STEP}</div>
+          </div>
+        ) : (
+          detail.reason && (
+            <div className="mt-1.5 text-[11.5px] text-dim">Reason on record: {detail.reason}</div>
+          )
         )}
         <AnalyticPins
           pins={detail.pinned}
@@ -483,6 +562,28 @@ function Body({ detail, onChanged }: { detail: AnalyticDetail; onChanged?: () =>
                 <span className="text-text-2">
                   {v.from_status ?? 'new'} → {v.to_status}
                 </span>
+                {/* The ship row is soc-ai's too, and it is no demotion. The
+                    amber chip on it read as a move to shadow. */}
+                {v.who === CATALOG_ACTOR ? (
+                  <span
+                    data-testid="version-shipped"
+                    className="rounded-chip border border-border-strong px-1.5 py-px text-[10.5px] text-dim"
+                    title={CHIP_SHIPPED_IN_SHADOW}
+                  >
+                    shipped in shadow
+                  </span>
+                ) : (
+                  v.system && (
+                    <span
+                      data-testid="version-system"
+                      className="rounded-chip border px-1.5 py-px text-[10.5px] text-warn"
+                      style={{ borderColor: 'rgba(210,153,34,.45)' }}
+                      title={CHIP_SYSTEM_CHANGE}
+                    >
+                      soc-ai
+                    </span>
+                  )
+                )}
                 <span className="text-[11.5px] text-dim">{v.who}</span>
                 {v.why && <span className="text-[11.5px] text-dim">"{v.why}"</span>}
                 {v.has_receipts && (
@@ -492,6 +593,13 @@ function Body({ detail, onChanged }: { detail: AnalyticDetail; onChanged?: () =>
                   >
                     evidence
                   </span>
+                )}
+                {(v.evidence?.breaches ?? []).length > 0 && (
+                  <div data-testid="version-evidence" className="basis-full pl-1 text-[11px] text-dim">
+                    {(v.evidence?.breaches ?? []).map((breach, j) => (
+                      <div key={`${breach.rule}-${j}`}>{breachLine(breach)}</div>
+                    ))}
+                  </div>
                 )}
               </li>
             ))}

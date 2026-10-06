@@ -21,6 +21,7 @@ from sqlalchemy.orm import aliased, load_only
 from sqlalchemy.orm.attributes import set_committed_value
 from ulid import ULID
 
+from soc_ai.run_meter import RunCounters, apply_counters
 from soc_ai.secret_scrub import MODEL_TEXT_EVENT_KINDS, scrub_optional, scrub_value
 from soc_ai.so_client.fields import DETECTION_KINDS, detection_kind_of_alert_payload
 from soc_ai.store import chat_memory
@@ -87,9 +88,10 @@ def not_hunt_subject(model: Any = Investigation) -> Any:
     NULL, and the coalesce keeps that row in the set. A NULL compared to a
     string is NULL, which is not true, and the filter would have dropped every
     alert run. ``model`` takes an alias of :class:`Investigation` for a
-    correlated subquery.
+    correlated subquery. The JSON index renders ``json_extract`` on SQLite and
+    ``->>`` on PostgreSQL; both return SQL NULL for a NULL column.
     """
-    return func.coalesce(func.json_extract(model.subject_json, "$.type"), "") != HUNT_SUBJECT_TYPE
+    return func.coalesce(model.subject_json["type"].as_string(), "") != HUNT_SUBJECT_TYPE
 
 
 # The stored statuses the primacy rule prefers: a run that is still going or
@@ -307,9 +309,11 @@ async def heal_detection_kinds(db: AsyncSession, invs: Sequence[Investigation]) 
         await db.execute(
             select(
                 InvestigationEvent.investigation_id,
-                func.json_extract(InvestigationEvent.payload, "$.alert.event_dataset"),
-                func.json_extract(InvestigationEvent.payload, "$.alert.event_module"),
-                func.json_extract(InvestigationEvent.payload, "$.alert.raw.sigma_level"),
+                # json_extract on SQLite, #>> on PostgreSQL. Only the presence
+                # of sigma_level counts, so its text form on PostgreSQL is enough.
+                InvestigationEvent.payload[("alert", "event_dataset")].as_string(),
+                InvestigationEvent.payload[("alert", "event_module")].as_string(),
+                InvestigationEvent.payload[("alert", "raw", "sigma_level")].as_string(),
             )
             .where(
                 InvestigationEvent.investigation_id.in_(list(candidates)),
@@ -369,11 +373,15 @@ async def finalize(
     rationale: str | None = None,
     summary: str | None = None,
     report: dict[str, Any] | None = None,
+    counters: RunCounters | None = None,
 ) -> None:
     inv = await db.get(Investigation, inv_id)
     if inv is None:
         return
     inv.status = status
+    # What the run cost and its budget class (migration 0058). The recorder
+    # reads them off the run's own events, so they match the trail.
+    apply_counters(inv, counters)
     if verdict is not None:
         inv.verdict = verdict
     if confidence is not None:
@@ -1456,7 +1464,8 @@ async def latest_for_pairs(
     window_days: int,
 ) -> dict[PairKey, Investigation]:
     """Most recent COMPLETE investigation per :data:`PairKey`, no older than the
-    window. Running/error rows never propagate.
+    window. Running/error rows never propagate, and neither does a pipeline
+    fallback: it holds a placeholder verdict the pipeline never reasoned to.
 
     A NULL endpoint is a KEY VALUE, not a reason to skip the row: it coalesces to
     ``""``, the same degrade the sweep planner and the alert grid apply when they
@@ -1522,6 +1531,18 @@ async def latest_for_pairs(
                 Investigation.status == "complete",
                 Investigation.created_at >= cutoff,
                 Investigation.kind != "hunt",
+                # A pipeline fallback is a failure wearing ``complete`` (see
+                # blocks_rehunt). It is never a verdict to hand along: kept here,
+                # it made the planner skip its own pair as "inherited", so a
+                # scheduler fallback blocked its own retry for the whole window.
+                # ``.isnot(True)`` folds NULL to not-a-fallback, as query_page
+                # does; migration 0028 backfilled the column from the report.
+                Investigation.is_fallback.isnot(True),
+                # A rule-prior run is no model's verdict (soc_ai.agent.rule_prior).
+                # Lent along a pair, it would outlive the prior's 24-hour lapse by
+                # the whole inherit window and authorize acknowledgements nobody
+                # investigated. The prior never acknowledges, so it never lends.
+                func.coalesce(Investigation.run_class, "") != "rule_prior",
             )
             .order_by(Investigation.created_at.desc(), Investigation.id.desc())
         )
@@ -1947,9 +1968,11 @@ async def inherited_ack_total(db: AsyncSession, *, source_id: str | None = None)
     Summed in SQL over the recorded fan-outs (``json_extract`` on the payload,
     the expression the fallback-provenance denormalization already uses) so the
     running total costs one query rather than a scan of every payload in Python.
+    ``as_integer`` is ``json_extract`` on SQLite and a cast of ``->>`` on
+    PostgreSQL, which cannot sum a JSON value.
     """
     stmt = select(
-        func.coalesce(func.sum(func.json_extract(InvestigationEvent.payload, "$.acked")), 0)
+        func.coalesce(func.sum(InvestigationEvent.payload["acked"].as_integer()), 0)
     ).where(InvestigationEvent.kind == INHERITED_ACK_EVENT_KIND)
     if source_id is not None:
         stmt = stmt.where(InvestigationEvent.investigation_id == source_id)

@@ -23,10 +23,13 @@ KIND_LABEL: dict[str, str] = {
     "below_baseline": "rate collapsed",
     "above_baseline": "rate spiked",
     "scope_count": "across many hosts",
+    "estate_outlier": "estate outlier",
     "alert": "alert",
     "prior_no_baseline": "finding with no benign baseline",
     "catalog_match": "analytic match",
     "hunt_finding": "hunt finding",
+    "telemetry_silence": "telemetry plane silent",
+    "logon_chain": "logon chain",
 }
 
 __all__ = ["KIND_LABEL", "kind_label"]

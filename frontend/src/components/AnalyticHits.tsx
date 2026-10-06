@@ -9,6 +9,7 @@ import {
   startHuntConsole,
   type AnalyticHit,
   type AnalyticHitFilter,
+  type AnalyticHits as AnalyticHitsPage,
   type HuntCatalog,
 } from '../lib/api';
 import { loopRuns } from '../lib/analyticRuns';
@@ -16,6 +17,7 @@ import { entityPath as pathOfEntity } from '../lib/entityPath';
 import { plural } from '../lib/plural';
 import { absTime, ago } from '../lib/timeRange';
 import {
+  CHIP_ANALYTIC_REMOVED,
   CHIP_LIVE,
   CHIP_LOCAL,
   CHIP_NO_LEAD,
@@ -42,8 +44,13 @@ import { StaleNotice } from './States';
 //
 // A hit is an observation an analytic wrote. The old band held the shadow hits
 // alone, so the real signal had no surface and a shadow hit read as the only
-// thing the analytics produce. Live hits come first here, newest first. Shadow
-// hits follow, unread first.
+// thing the analytics produce. The unread shadow hits come first here: Needs-you
+// counts them, and 147 live hits ahead of one unread shadow hit pushed it off
+// the first page of 50. The live hits follow, newest first, then the read
+// shadow hits.
+//
+// The list reads 50 hits a page. The line under it states how many of the
+// window's hits it holds, and "Show more" reads the next page.
 //
 // A card names two things. The analytic is the logic. The hit is the instance
 // the analytic wrote. The owner's rule: the real hit is never lighter than the
@@ -62,7 +69,38 @@ const AMBER = '#d29922';
 const BODY_ID = 'analytic-hits-body';
 
 const SECTION_NOTE =
-  'What the analytics found. Live hits come first. Then shadow hits, unread first.';
+  'What the analytics found. Unread shadow hits come first, then live hits, then read shadow hits.';
+
+/** The hits one request reads. "Show more" reads one more page of this size. */
+export const HITS_PAGE = 50;
+
+const SHOW_MORE_TOOLTIP = `Read the next ${HITS_PAGE} hits of this list.`;
+
+/** Read the first `pages` pages of one filter as one list.
+ *
+ *  Every poll reads every page the analyst has opened. A page read once and
+ *  kept lost a hit: a new hit moves each row down by one, and the row at the
+ *  page edge left page 1 without a reach into page 2. A hit that two pages
+ *  both hold is listed once. */
+async function readHitPages(
+  filter: AnalyticHitFilter,
+  pages: number,
+): Promise<AnalyticHitsPage> {
+  const answers = await Promise.all(
+    Array.from({ length: pages }, (_, n) =>
+      getAnalyticHits({ days: 7, filter, limit: HITS_PAGE, offset: n * HITS_PAGE }),
+    ),
+  );
+  const seen = new Set<number>();
+  const hits = answers
+    .flatMap((a) => a.hits)
+    .filter((h) => {
+      if (seen.has(h.id)) return false;
+      seen.add(h.id);
+      return true;
+    });
+  return { hits, counts: answers[0].counts };
+}
 
 const TITLE_TOOLTIP = 'Open the analytic: its definition, its ledger and its versions.';
 
@@ -322,8 +360,12 @@ function HitCard({
   // analytic today: it carries the chip and the two decisions. The flag says
   // where the hit was recorded: it picks the half, the border, the weight and
   // the read state, and it holds until the sweep writes the row again.
-  const liveAnalytic = hit.analytic_status === 'live';
-  const shadowAnalytic = hit.analytic_status === 'shadow';
+  // A hit whose analytic the catalog no longer lists. The status the server
+  // sends for it is the flag on the row, so the card read "live" on an
+  // analytic that does not exist. An older server sends no flag.
+  const removed = hit.analytic_exists === false;
+  const liveAnalytic = !removed && hit.analytic_status === 'live';
+  const shadowAnalytic = !removed && hit.analytic_status === 'shadow';
   const recordedLive = !hit.recorded_in_shadow;
   // `complete` false is the packet's own verdict on itself. A shadow hit must
   // prove itself, so the state word and the flag must agree before the card
@@ -421,22 +463,34 @@ function HitCard({
               title={UNREAD_DOT}
             />
           )}
-          <button
-            type="button"
-            data-testid="analytic-hit-title"
-            className={`text-left text-[13px] hover:underline ${
-              recordedLive ? 'font-bold' : 'font-medium'
-            }`}
-            title={TITLE_TOOLTIP}
-            onClick={() => onOpenAnalytic(hit.analytic_id)}
-          >
-            {hit.analytic_title}
-          </button>
-          <Chip
-            label={hit.analytic_status}
-            title={liveAnalytic ? CHIP_LIVE : CHIP_SHADOW}
-            tone={liveAnalytic ? 'live' : 'shadow'}
-          />
+          {removed ? (
+            // No drawer can open an analytic the catalog does not list, so
+            // the id is text and not a control.
+            <span data-testid="analytic-hit-title" className="font-mono text-[12.5px] text-dim">
+              {hit.analytic_id}
+            </span>
+          ) : (
+            <button
+              type="button"
+              data-testid="analytic-hit-title"
+              className={`text-left text-[13px] hover:underline ${
+                recordedLive ? 'font-bold' : 'font-medium'
+              }`}
+              title={TITLE_TOOLTIP}
+              onClick={() => onOpenAnalytic(hit.analytic_id)}
+            >
+              {hit.analytic_title}
+            </button>
+          )}
+          {removed ? (
+            <Chip label="analytic removed" title={CHIP_ANALYTIC_REMOVED} tone="faint" />
+          ) : (
+            <Chip
+              label={hit.analytic_status}
+              title={liveAnalytic ? CHIP_LIVE : CHIP_SHADOW}
+              tone={liveAnalytic ? 'live' : 'shadow'}
+            />
+          )}
           {/* The hit lists under Shadow and its analytic reads live. The chip
               states why, so the two words do not read as a contradiction. */}
           {!recordedLive && liveAnalytic && (
@@ -656,11 +710,23 @@ export function AnalyticHits({
   // was working it. The order holds until the next load.
   const [readIds, setReadIds] = useState<ReadonlySet<number>>(() => new Set<number>());
   const [openAnalytic, setOpenAnalytic] = useState<string | null>(null);
+  // The pages the analyst has opened, for one filter. A filter can change
+  // from the address too, when a Needs-you link names one, so the count is
+  // kept beside the filter it belongs to and a new filter starts on page 1.
+  const [paging, setPaging] = useState<{ filter: AnalyticHitFilter; pages: number }>({
+    filter,
+    pages: 1,
+  });
+  const pages = paging.filter === filter ? paging.pages : 1;
 
-  const hits = useAsync(() => getAnalyticHits({ days: 7, filter, limit: 50 }), [filter, reload], {
+  const hits = useAsync(() => readHitPages(filter, pages), [filter, reload, pages], {
     refetchInterval: 60_000,
   });
   const rows = hits.data?.hits ?? [];
+  // The total of the filter on screen, from the server. The window can hold
+  // more hits than the pages read, and the list said nothing about the rest.
+  const total = Math.max(hits.data?.counts?.[filter] ?? 0, rows.length);
+  const showMore = () => setPaging({ filter, pages: pages + 1 });
   // Whether the sweeps ran decides what an empty list means. Read on the
   // catalog's own cadence.
   const catalog = useAsync(getHuntCatalog, [], { refetchInterval: 300_000 });
@@ -781,18 +847,41 @@ export function AnalyticHits({
             : 'No hit under this filter. Another filter may hold one.'}
         </div>
       ) : (
-        <ul>
-          {rows.map((hit) => (
-            <HitCard
-              key={hit.id}
-              hit={hit}
-              read={wasRead(hit)}
-              onRead={markedRead}
-              onChange={changed}
-              onOpenAnalytic={setOpenAnalytic}
-            />
-          ))}
-        </ul>
+        <>
+          <ul>
+            {rows.map((hit) => (
+              <HitCard
+                key={hit.id}
+                hit={hit}
+                read={wasRead(hit)}
+                onRead={markedRead}
+                onChange={changed}
+                onOpenAnalytic={setOpenAnalytic}
+              />
+            ))}
+          </ul>
+          {/* The list held 50 of 148 hits and ended with no word about the
+              rest. The line states the share, and the control reads more. */}
+          <div className="flex flex-wrap items-center gap-3 border-t border-border-faint px-[15px] py-2.5">
+            <span
+              data-testid="analytic-hits-shown"
+              className="font-mono text-[11.5px] tabular-nums text-dim"
+            >
+              {rows.length} of {plural(total, 'hit')}
+            </span>
+            {rows.length < total && (
+              <button
+                type="button"
+                disabled={hits.loading}
+                onClick={showMore}
+                title={SHOW_MORE_TOOLTIP}
+                className="rounded-control border border-border-strong px-3 py-1 text-[11.5px] font-semibold disabled:opacity-50"
+              >
+                {hits.loading ? 'Reading…' : 'Show more'}
+              </button>
+            )}
+          </div>
+        </>
       )}
         </div>
       )}

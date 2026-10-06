@@ -19,7 +19,14 @@ The ``soc-ai`` script in ``pyproject.toml`` dispatches to subcommands:
 - ``backup`` / ``restore``: snapshot the live SQLite store (+ app-owned
   sidecar files) into a portable tar.gz, and put one back. Backup is safe
   while the app runs; restore wants the app stopped and gates every
-  overwrite behind ``--yes``. Logic lives in ``soc_ai.backup``.
+  overwrite behind ``--yes``. Logic lives in ``soc_ai.backup``. Both refuse
+  a PostgreSQL store, which ``pg_dump`` backs up.
+- ``store migrate --to <url>``: copy every table of the store into an empty
+  store, for example PostgreSQL. ``--dry-run`` writes nothing. Logic lives in
+  ``soc_ai.store.copy``.
+- ``spec-replay``: replay the profile analytics and the learned detectors
+  hour by hour against the grid into a scratch store, and report the hits per
+  100 host-days. Logic lives in ``soc_ai.hunting.spec_replay``.
 
 The triage subcommand connects via HTTPS to the configured
 ``SOC_AI_HOST:SOC_AI_PORT`` and trusts a self-signed cert by default
@@ -41,15 +48,41 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import functools
 import json
 import os
 import sys
+import warnings
 from pathlib import Path
 from typing import Any
 
 import httpx
 
 from soc_ai.config import get_settings
+
+# The SecurityWarning elasticsearch-py raises for ``verify_certs=False``. The
+# client names the module that built it, so the filter matches the
+# elasticsearch package and this one message, and nothing else.
+_GRID_TLS_WARNING = r"Connecting to .* using TLS with verify_certs=False is insecure"
+_GRID_TLS_WARNING_MODULE = r"elasticsearch(\.|$)"
+
+
+def _quiet_grid_tls_warning() -> None:
+    """Hide the two-line ES SecurityWarning about ``verify_certs=False`` in the CLI.
+
+    The operator chose ``ES_VERIFY_SSL=false``, and every CLI command printed the
+    warning before its own output. The filter is set here only, never in the
+    library or the server: the server log keeps the line, and ``soc-ai doctor``
+    states the setting once in its "grid tls" row.
+    """
+    from elastic_transport import SecurityWarning  # noqa: PLC0415 - lazy
+
+    warnings.filterwarnings(
+        "ignore",
+        message=_GRID_TLS_WARNING,
+        category=SecurityWarning,
+        module=_GRID_TLS_WARNING_MODULE,
+    )
 
 
 # ANSI color helpers — fall back to no-color if stdout isn't a TTY.
@@ -251,7 +284,14 @@ def _serve(_args: argparse.Namespace) -> int:
     """Boot the FastAPI app under uvicorn (existing v1 behavior)."""
     import uvicorn  # noqa: PLC0415 - lazy import; only the serve subcommand needs it
 
+    from soc_ai.config import SERVE_BIND_ENV  # noqa: PLC0415 - lazy
+
     settings = get_settings()
+    host = str(settings.soc_ai_host)
+    # The app reads this at start to name its real bind in the auth-off warning.
+    os.environ[SERVE_BIND_ENV] = (
+        f"[{host}]:{settings.soc_ai_port}" if ":" in host else f"{host}:{settings.soc_ai_port}"
+    )
     uvicorn.run(
         "soc_ai.main:app",
         host=settings.soc_ai_host,
@@ -548,6 +588,7 @@ def _validate_batch(args: argparse.Namespace) -> int:
     from pathlib import Path  # noqa: PLC0415 - lazy
 
     from soc_ai.eval.batch import BatchConfig, run_batch  # noqa: PLC0415 - lazy
+    from soc_ai.eval.harness import run as harness_run  # noqa: PLC0415 - lazy
     from soc_ai.so_client.elastic import ElasticClient  # noqa: PLC0415 - lazy
 
     settings = get_settings()
@@ -616,6 +657,7 @@ def _validate_batch(args: argparse.Namespace) -> int:
     print(
         f"{_C['dim']}validate-batch · n={cfg.n} concurrency={cfg.concurrency} "
         f"diversity={','.join(cfg.diversity_keys)} window={cfg.time_range_minutes}m"
+        f"{' · local (no oracle grade, no cloud egress)' if getattr(args, 'local', False) else ''}"
         f"{_C['reset']}",
         file=sys.stderr,
         flush=True,
@@ -624,11 +666,19 @@ def _validate_batch(args: argparse.Namespace) -> int:
     def _emit(line: str) -> None:
         print(f"{_C['dim']}{line}{_C['reset']}", file=sys.stderr, flush=True)
 
+    local = bool(getattr(args, "local", False))
+
     async def _go() -> int:
         elastic = ElasticClient(settings)
         try:
             try:
-                summary = await run_batch(cfg, settings=settings, elastic=elastic, progress=_emit)
+                summary = await run_batch(
+                    cfg,
+                    settings=settings,
+                    elastic=elastic,
+                    runner=functools.partial(harness_run, grade=not local),
+                    progress=_emit,
+                )
             except RuntimeError as e:
                 print(
                     f"{_C['red']}batch failed{_C['reset']}: {e}",
@@ -1537,6 +1587,33 @@ def _resolve_cache_dirs() -> dict[str, Path] | None:
     }
 
 
+def _postgres_store_refusal(args: argparse.Namespace, verb: str) -> int | None:
+    """Exit 2 when the configured store is PostgreSQL and no --data-dir was given.
+
+    ``backup`` and ``restore`` act on the SQLite file in the data directory. With
+    SOC_AI_DATABASE_URL set, that file is not the store: a backup of it would
+    report success for data the app no longer writes, and a restore of it would
+    change nothing the app reads. An explicit --data-dir still names a SQLite
+    store, for example the one a copy left behind.
+    """
+    if getattr(args, "data_dir", None):
+        return None
+    try:
+        url = get_settings().soc_ai_database_url
+    except Exception:
+        return None
+    if url is None or not url.get_secret_value().strip():
+        return None
+    print(
+        f"{_C['red']}{verb} refused{_C['reset']}: the store is PostgreSQL "
+        "(SOC_AI_DATABASE_URL). `soc-ai backup` and `soc-ai restore` act on a SQLite "
+        "store only. Use pg_dump and pg_restore for a PostgreSQL store. See "
+        'docs/DEPLOYMENT.md, "PostgreSQL". Pass --data-dir to act on a SQLite file.',
+        file=sys.stderr,
+    )
+    return 2
+
+
 def _backup(args: argparse.Namespace) -> int:
     """Snapshot the store into a tar.gz (safe while the app is running).
 
@@ -1551,6 +1628,9 @@ def _backup(args: argparse.Namespace) -> int:
         default_backup_name,
     )
 
+    refused = _postgres_store_refusal(args, "backup")
+    if refused is not None:
+        return refused
     data_dir = _resolve_data_dir(args)
     if data_dir is None:
         print(
@@ -1607,6 +1687,9 @@ def _restore(args: argparse.Namespace) -> int:
     """
     from soc_ai.backup import BackupError, RestoreRefused, restore_backup  # noqa: PLC0415 - lazy
 
+    refused = _postgres_store_refusal(args, "restore")
+    if refused is not None:
+        return refused
     data_dir = _resolve_data_dir(args)
     if data_dir is None:
         print(
@@ -1699,6 +1782,341 @@ def _register_backup(sub: Any) -> None:
         help="Override the data directory (default: SOC_AI_DATA_DIR from env/.env)",
     )
     p_res.set_defaults(func=_restore)
+
+
+def _store_migrate(args: argparse.Namespace) -> int:
+    """Copy every table of the store into another, empty store.
+
+    Exit codes:
+      0   copied, or the dry run found nothing that stops the copy
+      1   the copy failed; the target holds no copied row
+      2   refused: a bad URL, a source behind the migration head, a target
+          that holds rows, or source values the target cannot hold
+    """
+    from soc_ai.store.copy import StoreCopyRefused, copy_store  # noqa: PLC0415 - lazy
+    from soc_ai.store.db import (  # noqa: PLC0415 - lazy
+        StoreUrlError,
+        describe_url,
+        engine_for_url,
+        parse_store_url,
+        store_url,
+    )
+
+    def _refuse(reason: str) -> int:
+        print(f"{_C['red']}store migrate refused{_C['reset']}: {reason}", file=sys.stderr)
+        return 2
+
+    try:
+        target_url = parse_store_url(args.to, allow_sqlite=True)
+        if args.from_url:
+            source_url = parse_store_url(args.from_url, allow_sqlite=True)
+        else:
+            source_url = store_url(get_settings())
+    except StoreUrlError as e:
+        return _refuse(str(e))
+    except Exception:
+        return _refuse(
+            "the settings did not load, so the source store is unknown. Run from the "
+            "directory that holds the .env, or name the source with --from."
+        )
+    if source_url.get_backend_name() == "sqlite" and not Path(str(source_url.database)).is_file():
+        return _refuse(f"no SQLite store at {source_url.database}.")
+
+    async def _go() -> int:
+        source = engine_for_url(source_url, pool_size=1)
+        target = engine_for_url(target_url, pool_size=1)
+        try:
+            result = await copy_store(
+                source, target, dry_run=args.dry_run, batch_size=args.batch_size
+            )
+        except StoreCopyRefused as e:
+            return _refuse(str(e))
+        except Exception as e:
+            from soc_ai.webui.probes import _safe_reason  # noqa: PLC0415 - lazy
+
+            print(
+                f"{_C['red']}store migrate failed{_C['reset']}: {_safe_reason(e)}. "
+                "The target holds no copied row.",
+                file=sys.stderr,
+            )
+            return 1
+        finally:
+            await source.dispose()
+            await target.dispose()
+
+        if result.dry_run:
+            print(f"{_C['bold']}dry run{_C['reset']}: soc-ai writes no row.")
+        print(f"source: {describe_url(source_url)} (migration {result.source_head})")
+        print(f"target: {describe_url(target_url)} (migration {result.target_head or 'none'})")
+        width = max(len(t.name) for t in result.tables)
+        for t in result.tables:
+            copied = "" if t.target_rows is None else f"  copied {t.target_rows:>10}"
+            print(f"  {t.name:<{width}}  rows {t.source_rows:>10}{copied}")
+        if result.problems:
+            print(
+                f"{_C['red']}the target cannot hold these source values{_C['reset']}:",
+                file=sys.stderr,
+            )
+            for p in result.problems:
+                column = f".{p.column}" if p.column else ""
+                print(f"  {p.table}{column}: {p.rows} row(s) with {p.problem}", file=sys.stderr)
+            return 2
+        if result.dry_run:
+            print(
+                f"{result.source_rows} rows in {len(result.tables)} tables. "
+                "Nothing stops the copy. Run the command again without --dry-run."
+            )
+        else:
+            print(
+                f"{_C['bold']}copied {result.target_rows} rows in {len(result.tables)} "
+                f"tables{_C['reset']}. The target holds the source count in every table."
+            )
+        return 0
+
+    return asyncio.run(_go())
+
+
+def _register_store(sub: Any) -> None:
+    """Register ``store migrate``."""
+    p_store = sub.add_parser("store", help="Store operations")
+    store_sub = p_store.add_subparsers(dest="store_cmd")
+    p_mig = store_sub.add_parser(
+        "migrate",
+        help="Copy every table of the store into another, empty store, for example "
+        "a PostgreSQL database. Stop the app first",
+    )
+    p_mig.add_argument(
+        "--to",
+        required=True,
+        metavar="URL",
+        help="The target store: postgresql+asyncpg://user@host:5432/database. Leave "
+        "the password out of the URL and set PGPASSWORD, so it stays out of the "
+        "process list. A sqlite:////path/soc-ai.db URL names a new SQLite file",
+    )
+    p_mig.add_argument(
+        "--from",
+        dest="from_url",
+        default=None,
+        metavar="URL",
+        help="The source store (default: the store the settings name)",
+    )
+    p_mig.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Read both stores, count the rows and check the values. Write nothing",
+    )
+    p_mig.add_argument(
+        "--batch-size",
+        type=int,
+        default=1000,
+        metavar="N",
+        help="Rows per INSERT batch (default: 1000)",
+    )
+    p_mig.set_defaults(func=_store_migrate)
+    # `soc-ai store` with no subcommand: print the group help instead of serving.
+    p_store.set_defaults(func=lambda _a: (p_store.print_help(), 2)[1])
+    # Registered here rather than in main(): estate-model reads the store too,
+    # and main() is at its statement budget (the model-probe precedent).
+    _register_estate_model(sub)
+
+
+def _fit_time(at: Any) -> str:
+    return at.strftime("%Y-%m-%d %H:%M UTC") if at is not None else "none"
+
+
+def format_estate_fit(fit: Any, *, enabled: bool) -> str:
+    """The newest estate model fit as the lines ``soc-ai estate-model show`` prints."""
+    setting = "on" if enabled else "off"
+    head = f"The setting estate_model_enabled is {setting}."
+    if fit is None:
+        return f"{head}\nNo estate model fit is on record."
+    psi = "none" if fit.psi is None else f"{fit.psi:.2f}"
+    drifted = ", ".join(f"{d.get('feature')} {d.get('psi')}" for d in fit.drifted or [])
+    reason = f" {fit.reason}" if fit.reason else ""
+    silhouette = "" if fit.silhouette is None else f", silhouette {fit.silhouette:.3f}"
+    role = fit.role
+    if fit.challenger_until is not None and fit.role == "challenger":
+        role = f"challenger until {_fit_time(fit.challenger_until)}"
+    rows = [
+        ("fitted at", _fit_time(fit.fitted_at)),
+        ("state", f"{fit.state}.{reason}"),
+        ("role", role),
+        ("hosts", str(fit.hosts)),
+        ("features", str(fit.features)),
+        ("groups", f"{fit.groups}{silhouette}"),
+        (
+            "outliers",
+            f"{fit.outliers} above the threshold, {fit.unexplained} with no stated reason, "
+            f"{fit.shared} shared with a subgroup, {fit.no_documents} with no document",
+        ),
+        ("observations", str(fit.observations)),
+        ("model file", fit.model_file or "none"),
+        ("sha256", fit.model_sha256 or "none"),
+        ("drift index", f"{psi}{'. Drifted: ' + drifted if drifted else ''}"),
+        ("audited", "yes" if fit.audited else "no"),
+    ]
+    width = max(len(label) for label, _ in rows)
+    body = "\n".join(f"  {label:<{width}}  {value}" for label, value in rows)
+    return f"{head}\nThe newest fit, fit {fit.id}:\n{body}"
+
+
+def _estate_fit_json(fit: Any, *, enabled: bool) -> dict[str, Any]:
+    import dataclasses  # noqa: PLC0415 - lazy
+
+    out: dict[str, Any] = {"enabled": enabled, "fit": None}
+    if fit is not None:
+        record = dataclasses.asdict(fit)
+        for key in ("fitted_at", "challenger_until"):
+            value = record.get(key)
+            record[key] = value.isoformat() if value is not None else None
+        out["fit"] = record
+    return out
+
+
+def _estate_model_show(args: argparse.Namespace) -> int:
+    """Print the newest estate model fit. Reads the local store only.
+
+    Exit codes:
+      0   the fit printed, or the line that no fit is on record
+    """
+    from soc_ai.doctor import apply_persisted_overrides  # noqa: PLC0415 - lazy
+    from soc_ai.store import estate_model as estate_store  # noqa: PLC0415 - lazy
+    from soc_ai.store.db import (  # noqa: PLC0415 - lazy
+        make_engine,
+        make_sessionmaker,
+        run_migrations,
+    )
+
+    settings = get_settings()
+
+    async def _go() -> int:
+        await apply_persisted_overrides(settings)
+        enabled = bool(settings.estate_model_enabled)
+        engine = make_engine(settings)
+        await run_migrations(engine)
+        try:
+            async with make_sessionmaker(engine)() as session:
+                fit = await estate_store.latest_fit(session)
+        finally:
+            await engine.dispose()
+        if args.json:
+            print(json.dumps(_estate_fit_json(fit, enabled=enabled), indent=2))
+        else:
+            print(format_estate_fit(fit, enabled=enabled))
+        return 0
+
+    return asyncio.run(_go())
+
+
+def _estate_model_run(args: argparse.Namespace) -> int:
+    """Fit the estate model once, now, with the guards of the daily loop.
+
+    Exit codes:
+      0   the fit ran and is recorded
+      2   refused: a demo deployment
+      3   the ml extra is not installed
+      5   the fit failed
+
+    The loop does nothing while ``estate_model_enabled`` is off. A one-shot run
+    is an operator's request, so it runs with the setting off and says so. The
+    loop's daily stamp does not gate it either. The demo guard stays.
+    """
+    from soc_ai.audit.logger import AuditLogger  # noqa: PLC0415 - lazy
+    from soc_ai.doctor import apply_persisted_overrides  # noqa: PLC0415 - lazy
+    from soc_ai.hunting.estate_model.job import (  # noqa: PLC0415 - lazy
+        STATUS_FAILED,
+        STATUS_UNAVAILABLE,
+        UNAVAILABLE_LINE,
+        run_estate_model,
+    )
+    from soc_ai.so_client.elastic import ElasticClient  # noqa: PLC0415 - lazy
+    from soc_ai.store.db import (  # noqa: PLC0415 - lazy
+        make_engine,
+        make_sessionmaker,
+        run_migrations,
+    )
+
+    settings = get_settings()
+
+    async def _go() -> int:
+        await apply_persisted_overrides(settings)
+        if bool(getattr(settings, "soc_ai_demo", False)):
+            print(
+                f"{_C['red']}estate-model run refused{_C['reset']}: this is a demo "
+                "deployment. The daily loop fits nothing in a demo.",
+                file=sys.stderr,
+            )
+            return 2
+        if not settings.estate_model_enabled:
+            print(
+                "The setting estate_model_enabled is off. This one fit runs because you "
+                "asked for it. The daily loop stays off."
+            )
+        one_shot = settings.model_copy(update={"estate_model_enabled": True})
+        engine = make_engine(settings)
+        await run_migrations(engine)
+        elastic = ElasticClient(settings)
+        try:
+            run = await run_estate_model(
+                db_sessionmaker=make_sessionmaker(engine),
+                settings=one_shot,
+                elastic=elastic,
+                audit=AuditLogger(settings, elastic),
+            )
+        finally:
+            await elastic.aclose()
+            await engine.dispose()
+        if run.status == STATUS_UNAVAILABLE:
+            print(UNAVAILABLE_LINE, file=sys.stderr)
+            print("Install the extra with `uv sync --extra ml`.", file=sys.stderr)
+            return 3
+        if run.status == STATUS_FAILED:
+            for line in run.errors:
+                print(f"{_C['red']}estate model{_C['reset']}: {line}", file=sys.stderr)
+            return 5
+        if run.groups or run.model_file:
+            print(run.line())
+        else:
+            print(f"estate model: {run.state}. {run.hosts} hosts.")
+        if run.reason:
+            print(run.reason)
+        if run.model_file:
+            print(f"Model file {run.model_file}, sha256 {run.model_sha256}.")
+        for line in [*run.refused, *run.notes]:
+            print(line)
+        for line in run.errors:
+            print(f"{_C['yellow']}estate model{_C['reset']}: {line}", file=sys.stderr)
+        print(f"The store recorded fit {run.fit_id}. `soc-ai estate-model show` prints it.")
+        return 0
+
+    return asyncio.run(_go())
+
+
+def _register_estate_model(sub: Any) -> None:
+    """Register ``estate-model show`` and ``estate-model run``."""
+    p_em = sub.add_parser(
+        "estate-model",
+        help="Show the newest estate model fit, or fit the estate model once now",
+    )
+    em_sub = p_em.add_subparsers(dest="estate_model_cmd")
+    p_show = em_sub.add_parser(
+        "show",
+        help="Print the newest fit: the time, the state, the hosts, the groups, the "
+        "outliers, the model file, the hash and the drift index. Reads the local "
+        "store only",
+    )
+    p_show.add_argument("--json", action="store_true", help="Print the fit as JSON")
+    p_show.set_defaults(func=_estate_model_show)
+    p_run = em_sub.add_parser(
+        "run",
+        help="Fit the estate model once, now. It runs with estate_model_enabled off "
+        "and says so. It refuses in a demo. The daily loop takes the dossier slot "
+        "in the server process. This command cannot take that slot, so run it "
+        "when no dossier sweep runs",
+    )
+    p_run.set_defaults(func=_estate_model_run)
+    # `soc-ai estate-model` with no subcommand: print the group help instead of serving.
+    p_em.set_defaults(func=lambda _a: (p_em.print_help(), 2)[1])
 
 
 def _spec_run(args: argparse.Namespace) -> int:
@@ -1864,7 +2282,7 @@ def _spec_sweep(args: argparse.Namespace) -> int:
                 # The effective catalog, not the files alone: a retired
                 # analytic must stop running and a local one in shadow must
                 # start, and both facts live in the database.
-                tiers = await effective_catalog(session)
+                tiers = await effective_catalog(session, seed=True)
                 result = await sweep_catalog(
                     tiers.specs,
                     session=session,
@@ -1939,7 +2357,10 @@ def _priors(args: argparse.Namespace) -> int:
                     effective_catalog,
                 )
 
-                tiers = await effective_catalog(session)
+                # A run that records writes the shadow row of a shipped
+                # analytic that ships in shadow. A read-only run writes nothing
+                # and reads the same status.
+                tiers = await effective_catalog(session, seed=bool(args.record))
                 sweep = await run_prior_sweep(
                     elastic=elastic,
                     settings=settings,
@@ -1950,7 +2371,9 @@ def _priors(args: argparse.Namespace) -> int:
                     catalog=tiers.specs,
                     shadow_ids=tiers.shadow_ids,
                 )
-            print(format_sweep(sweep))
+            # The status of each row from the same effective catalog the
+            # sweep ran. A shadow detector and a live analytic read the same.
+            print(format_sweep(sweep, catalog=tiers))
             return 5 if sweep.errors else 0
         finally:
             # aclose, named directly. `getattr(elastic, "close", None)` was the
@@ -1989,6 +2412,140 @@ def _register_priors(sub: Any) -> None:
         "the next run concludes. soc-ai records leads in shadow either way.",
     )
     p_pr.set_defaults(func=_priors)
+
+
+def _spec_replay(args: argparse.Namespace) -> int:
+    """Replay the tier 2 detectors against the grid, into a scratch store, and report.
+
+    Exit codes:
+      0   the report is written and every measured analytic is within budget
+      2   the replay refused to run: the store is the live store or exists,
+          an analytic or an evaluator is unknown, or the end is later than
+          the present hour
+      3   at least one analytic is over budget
+      4   no analytic is over budget, and at least one has too few host-days.
+          Its Wilson upper bound is over the budget.
+      5   at least one hour is unread, or no analytic measured a host
+
+    ``--dry-run`` prints the plan and sends no search. It creates no store.
+    """
+    import asyncio  # noqa: PLC0415 - lazy
+
+    from soc_ai.hunting import spec_replay  # noqa: PLC0415 - lazy
+    from soc_ai.so_client.elastic import ElasticClient  # noqa: PLC0415 - lazy
+
+    settings = get_settings()
+
+    def _refused(exc: Exception) -> int:
+        print(f"{_C['red']}spec-replay refused{_C['reset']}: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        plan = spec_replay.plan_replay(
+            settings,
+            days=int(args.days),
+            end=args.end,
+            analytics=list(args.analytic or ()),
+            evaluators=list(args.evaluator or ()),
+            store=args.store,
+            out=args.out,
+            hosts_from_census=bool(args.hosts_from_census),
+        )
+    except spec_replay.ReplayRefused as exc:
+        return _refused(exc)
+
+    if args.dry_run:
+        census: tuple[int, int] | None = None
+        if plan.hosts_from_census:
+            try:
+                census = asyncio.run(spec_replay.census_size(settings))
+            except Exception as exc:
+                print(f"The census size is unknown: {exc}", file=sys.stderr)
+        print(spec_replay.describe_plan(plan, census=census))
+        return 0
+
+    async def _go() -> Any:
+        estate = await spec_replay.read_live_estate(settings, census=plan.hosts_from_census)
+        elastic = ElasticClient(settings)
+        try:
+            return await spec_replay.run_replay(elastic, settings, plan, estate=estate)
+        finally:
+            await elastic.aclose()
+
+    try:
+        report = asyncio.run(_go())
+    except spec_replay.ReplayRefused as exc:
+        return _refused(exc)
+    json_path, md_path = spec_replay.write_report(report, plan.out)
+    for line in spec_replay.summary_lines(report):
+        print(line)
+    print(f"Report: {json_path} and {md_path}")
+    print(f"Scratch store: {plan.store}")
+    return int(report.exit_code)
+
+
+def _register_spec_replay(sub: Any) -> None:
+    """Register the ``spec-replay`` subparser."""
+    p_rp = sub.add_parser(
+        "spec-replay",
+        help="Replay the profile analytics and the learned detectors hour by hour against "
+        "the grid, into a scratch store, and report the hits per 100 host-days. The live "
+        "store is read-only.",
+    )
+    p_rp.add_argument(
+        "--days",
+        type=_positive_int,
+        default=7,
+        help="How many days to replay. The default is 7. The budget asks for 30.",
+    )
+    p_rp.add_argument(
+        "--end",
+        default=None,
+        help="The end of the window, as ISO 8601 UTC. The default is the present hour. "
+        "The replay rounds it down to a whole hour.",
+    )
+    p_rp.add_argument(
+        "--evaluator",
+        action="append",
+        default=None,
+        metavar="{profile,model}",
+        help="An evaluator to replay: profile or model. Repeat the flag for both. The "
+        "default is both. The model evaluator runs the learned detectors. The catalog sweep "
+        "runs the match analytics, so the replay leaves them out.",
+    )
+    p_rp.add_argument(
+        "--analytic",
+        action="append",
+        default=None,
+        help="An analytic to replay. Repeat the flag for more. The default is every shipped "
+        "analytic of each evaluator that the replay runs. The report notes name the "
+        "analytics that the replay leaves out.",
+    )
+    p_rp.add_argument(
+        "--store",
+        default=None,
+        help="The scratch store, a SQLite file that does not exist yet. The default is "
+        "<data dir>/replay/<timestamp>.db. The replay refuses the live store.",
+    )
+    p_rp.add_argument(
+        "--hosts-from-census",
+        action="store_true",
+        help="Copy the host census, the roles and the machines from the live store "
+        "into the scratch store before the first build. The live store is read-only.",
+    )
+    p_rp.add_argument(
+        "--out",
+        default=None,
+        help="The directory for report.json and report.md. The default is the store "
+        "path without its suffix.",
+    )
+    p_rp.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the plan: the hours, the builds and the searches estimated. "
+        "Send no search and create no store.",
+    )
+    p_rp.set_defaults(func=_spec_replay)
 
 
 def format_lead_quality(report: Any) -> str:
@@ -2089,9 +2646,61 @@ def _register_leads(sub: Any) -> None:
         type=_positive_int,
         default=4,
         help="How many ISO weeks to report, newest first. The default is 4. A "
-        "threshold moves on a week of data, never on a day.",
+        "threshold moves only on a week of data.",
     )
     p_le.set_defaults(func=_leads)
+
+
+def _usage(args: argparse.Namespace) -> int:
+    """Print what each entry point spends per run.
+
+    Exit codes:
+      0   the report printed
+
+    Reads the local store only. No model and no grid.
+    """
+    import asyncio  # noqa: PLC0415 - lazy
+
+    from soc_ai.config import get_settings  # noqa: PLC0415 - lazy
+    from soc_ai.store.db import (  # noqa: PLC0415 - lazy
+        make_engine,
+        make_sessionmaker,
+        run_migrations,
+    )
+    from soc_ai.store.run_usage import format_usage, usage_report  # noqa: PLC0415 - lazy
+
+    settings = get_settings()
+
+    async def _go() -> int:
+        engine = make_engine(settings)
+        await run_migrations(engine)
+        try:
+            async with make_sessionmaker(engine)() as session:
+                report = await usage_report(session, days=int(args.days))
+            print(format_usage(report))
+            return 0
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(_go())
+
+
+def _register_usage(sub: Any) -> None:
+    """Register the ``usage`` subparser."""
+    p_us = sub.add_parser(
+        "usage",
+        help="Print what each entry point spends per run: the tokens, the model "
+        "requests, the tool calls, the grid searches, the wall time and the "
+        "outcome shares. No model is called.",
+    )
+    p_us.add_argument(
+        "--days",
+        type=_positive_int,
+        default=7,
+        help="How many days back the report reads, by run start time. The default "
+        "is 7. Compare two windows of the same length.",
+    )
+    p_us.set_defaults(func=_usage)
 
 
 def _register_spec_sweep(sub: Any) -> None:
@@ -2353,6 +2962,7 @@ def main() -> None:  # noqa: PLR0915 - linear subparser registration, one statem
 
     _register_doctor(sub)
     _register_backup(sub)
+    _register_store(sub)
     _register_audit(sub)
 
     p_val = sub.add_parser(
@@ -2457,13 +3067,24 @@ def main() -> None:  # noqa: PLR0915 - linear subparser registration, one statem
             "(--n) is unaffected; without --synth-set this flag is a no-op."
         ),
     )
+    p_vb.add_argument(
+        "--local",
+        action="store_true",
+        help=(
+            "Skip the oracle grade (zero cloud egress). The investigation runs and "
+            "the bundle is saved; agreement_rate stays empty. The synth stratum "
+            "still scores, because it grades a verdict against the planted truth."
+        ),
+    )
     p_vb.set_defaults(func=_validate_batch)
 
     _register_eval_nightly(sub)
     _register_spec_run(sub)
     _register_spec_sweep(sub)
     _register_priors(sub)
+    _register_spec_replay(sub)
     _register_leads(sub)
+    _register_usage(sub)
 
     p_er = sub.add_parser(
         "eval-report",
@@ -2505,6 +3126,9 @@ def main() -> None:  # noqa: PLR0915 - linear subparser registration, one statem
     # Default to serve if no subcommand given (backward compat with v1).
     if not getattr(args, "func", None):
         args = parser.parse_args(["serve"])
+    if args.func is not _serve:
+        # A CLI command only. `serve` runs the server, whose log keeps the line.
+        _quiet_grid_tls_warning()
     raise SystemExit(args.func(args))
 
 

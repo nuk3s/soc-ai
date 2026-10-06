@@ -182,6 +182,65 @@ describe('LeadDetail', () => {
     expect(within(row).queryByText(/seen 3 times/)).toBeNull();
   });
 
+  it('dates an observation by its event time and keeps the record time in the hover', async () => {
+    const event = new Date(Date.now() - 20 * 3_600_000).toISOString();
+    const recorded = new Date(Date.now() - 5 * 60_000).toISOString();
+    vi.mocked(getLead).mockResolvedValue({
+      ...LEAD,
+      observations: [
+        { ...LEAD.observations[1], born_at: recorded, observed_at: event },
+        { ...LEAD.observations[0], id: 3, born_at: recorded, observed_at: null },
+      ],
+    } as never);
+    mount();
+    const dated = await screen.findByTestId('observation-time-2');
+    expect(dated.textContent).toBe('20h ago');
+    expect(dated.getAttribute('title')).toMatch(/^Event time .+\. Recorded .+\.$/);
+    // Negative control: no document time on record, so the row reads the
+    // record time and says it has no event time.
+    const recordOnly = screen.getByTestId('observation-time-3');
+    expect(recordOnly.textContent).toBe('5m ago');
+    expect(recordOnly.getAttribute('title')).toMatch(/No document time is on record\.$/);
+  });
+
+  // The observation carries its statistic and a query. The page states the
+  // numbers and offers the query to the console, so the analyst and the hunt
+  // read the departure and do not search for it again.
+  it('states the statistic and offers the query to the console', async () => {
+    const query = 'destination.ip:"192.0.2.45" AND destination.port:4444 | groupby source.ip';
+    vi.mocked(getLead).mockResolvedValue({
+      ...LEAD,
+      observations: [
+        {
+          ...LEAD.observations[1],
+          statistic: 'documents',
+          statistic_value: 6,
+          baseline_value: 2,
+          document_ids: ['doc-a', 'doc-b'],
+          rerun_query: query,
+        },
+        LEAD.observations[0],
+      ],
+    } as never);
+    mount();
+    const line = await screen.findByTestId('observation-statistic-2');
+    expect(line.textContent).toBe(
+      '6 documents in the recent window. The set it is new to holds 2 members.',
+    );
+    const row = screen.getByTestId('observation-query-2');
+    expect(within(row).getByText(query)).toBeTruthy();
+    const link = within(row).getByRole('link', { name: 'Run this query' });
+    const href = link.getAttribute('href') ?? '';
+    expect(href.startsWith('/hunts?new=1&objective=')).toBe(true);
+    expect(decodeURIComponent(href.split('objective=')[1])).toContain(query);
+    // The column ids lead the evidence chips.
+    const evidence = screen.getByTestId('observation-2');
+    expect(within(evidence).getByText('doc-a')).toBeTruthy();
+    // Negative control: a row with no statistic and no query states neither.
+    expect(screen.queryByTestId('observation-statistic-1')).toBeNull();
+    expect(screen.queryByTestId('observation-query-1')).toBeNull();
+  });
+
   // An alert verdict writes the observation, and an alert has no analytic. The
   // row linked its `spec_id` anyway, so `/hunts?tab=analytics&open=alert`
   // opened a drawer titled "alert / alert" reading "Could not read the

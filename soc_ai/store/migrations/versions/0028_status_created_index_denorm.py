@@ -59,6 +59,9 @@ def upgrade() -> None:
     op.add_column("hunts", sa.Column("findings_count", sa.Integer(), nullable=True))
 
     bind = op.get_bind()
+    if bind.dialect.name != "sqlite":
+        _backfill_postgresql(bind)
+        return
     # is_fallback mirrors is_pipeline_fallback(report): resolution.provenance ==
     # 'pipeline_fallback'. json_extract returns NULL for any unresolvable path
     # (report NULL, scalar, or non-object), so CASE folds every non-fallback —
@@ -76,6 +79,28 @@ def upgrade() -> None:
     bind.execute(
         sa.text(
             "UPDATE hunts SET findings_count = COALESCE(json_array_length(report, '$.findings'), 0)"
+        )
+    )
+
+
+def _backfill_postgresql(bind: sa.Connection) -> None:
+    """The same two backfills in PostgreSQL's JSON operators.
+
+    ``#>>`` returns NULL for a path the value does not have, as
+    ``json_extract`` does. ``json_array_length`` raises on a non-array, where
+    SQLite returns 0, so the type is checked first.
+    """
+    bind.execute(
+        sa.text(
+            "UPDATE investigations SET is_fallback = "
+            "COALESCE(report #>> '{resolution,provenance}', '') = 'pipeline_fallback'"
+        )
+    )
+    bind.execute(
+        sa.text(
+            "UPDATE hunts SET findings_count = CASE "
+            "WHEN json_typeof(report -> 'findings') = 'array' "
+            "THEN json_array_length(report -> 'findings') ELSE 0 END"
         )
     )
 

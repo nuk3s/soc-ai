@@ -128,6 +128,21 @@ WHERE he.kind IN ('chat_user', 'chat_assistant')
   AND COALESCE(json_extract(he.payload, '$.content'), '') != ''
 """
 
+# The same backfill in PostgreSQL's JSON operators. ``->>`` returns text, as
+# ``json_extract`` does for a string, and SQL NULL for a missing key.
+_BACKFILL_HUNT_CHATS_POSTGRESQL = """
+INSERT INTO chat_memory (source, thread_id, role, content, created_at)
+SELECT 'hunt', he.hunt_id,
+       CASE he.kind WHEN 'chat_user' THEN 'user' ELSE 'assistant' END,
+       he.payload ->> 'content',
+       COALESCE(h.created_at, timezone('utc', statement_timestamp()))
+FROM hunt_events AS he
+LEFT JOIN hunts AS h ON h.id = he.hunt_id
+WHERE he.kind IN ('chat_user', 'chat_assistant')
+  AND he.payload ->> 'status' = 'done'
+  AND COALESCE(he.payload ->> 'content', '') != ''
+"""
+
 _BACKFILL_FTS = """
 INSERT INTO chat_memory_fts(rowid, content)
 SELECT id, content FROM chat_memory
@@ -151,30 +166,36 @@ def upgrade() -> None:
     # Backfill BEFORE creating the FTS objects, then index everything in one
     # explicit pass (the 0017 shape) — clearer than relying on the insert
     # trigger to observe the backfill, and identical in outcome.
+    sqlite = op.get_bind().dialect.name == "sqlite"
     op.execute(sa.text(_BACKFILL_INVESTIGATION_CHATS))
-    op.execute(sa.text(_BACKFILL_HUNT_CHATS))
+    op.execute(sa.text(_BACKFILL_HUNT_CHATS if sqlite else _BACKFILL_HUNT_CHATS_POSTGRESQL))
 
     # FTS index + sync triggers — guarded: an FTS5-less SQLite must complete
     # the migration cleanly with nothing FTS created (retrieval returns no
     # snippets at query time). The guard probes the CREATE itself; triggers +
     # backfill only run when it succeeded, so a partial state is impossible.
-    try:
-        op.execute(sa.text(_CREATE_FTS))
-    except OperationalError:
-        # "no such module: fts5" — this install keeps the projection only.
-        _LOGGER.warning("SQLite lacks FTS5 — skipping chat_memory_fts (chat memory disabled)")
-    else:
-        for ddl in _CREATE_TRIGGERS:
-            op.execute(sa.text(ddl))
-        op.execute(sa.text(_BACKFILL_FTS))
+    # FTS5 is a SQLite module: a PostgreSQL store keeps the projection only,
+    # and retrieval ranks it with PostgreSQL text search at query time.
+    if sqlite:
+        try:
+            op.execute(sa.text(_CREATE_FTS))
+        except OperationalError:
+            # "no such module: fts5" — this install keeps the projection only.
+            _LOGGER.warning("SQLite lacks FTS5 — skipping chat_memory_fts (chat memory disabled)")
+        else:
+            for ddl in _CREATE_TRIGGERS:
+                op.execute(sa.text(ddl))
+            op.execute(sa.text(_BACKFILL_FTS))
 
 
 def downgrade() -> None:
     # IF EXISTS: the upgrade may have skipped the FTS objects on an FTS5-less
-    # SQLite, and DROP TRIGGER/TABLE IF EXISTS is safe either way.
-    op.execute(sa.text("DROP TRIGGER IF EXISTS chat_memory_fts_au"))
-    op.execute(sa.text("DROP TRIGGER IF EXISTS chat_memory_fts_ad"))
-    op.execute(sa.text("DROP TRIGGER IF EXISTS chat_memory_fts_ai"))
-    op.execute(sa.text("DROP TABLE IF EXISTS chat_memory_fts"))
+    # SQLite, and DROP TRIGGER/TABLE IF EXISTS is safe either way. PostgreSQL
+    # never had them.
+    if op.get_bind().dialect.name == "sqlite":
+        op.execute(sa.text("DROP TRIGGER IF EXISTS chat_memory_fts_au"))
+        op.execute(sa.text("DROP TRIGGER IF EXISTS chat_memory_fts_ad"))
+        op.execute(sa.text("DROP TRIGGER IF EXISTS chat_memory_fts_ai"))
+        op.execute(sa.text("DROP TABLE IF EXISTS chat_memory_fts"))
     op.drop_index("ix_chat_memory_thread_id", table_name="chat_memory")
     op.drop_table("chat_memory")

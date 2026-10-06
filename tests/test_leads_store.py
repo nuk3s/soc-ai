@@ -879,6 +879,99 @@ async def test_a_clean_hunt_with_a_failed_tool_call_does_not_close_its_lead(
     assert leads_store.hold_reason_of(partial) == leads_store.HOLD_PARTIAL_READ
 
 
+async def _settle_with_events(
+    settings: Settings, hunt_id: str, events: list[dict[str, Any]]
+) -> tuple[str, Lead]:
+    """Settle a clean hunt (one observation finding) whose trace holds *events*."""
+    from soc_ai.store import hunts as hunt_svc
+
+    _engine, maker = await _db(settings)
+    async with maker() as db:
+        lead = await _lead_row(db, hunt_id=hunt_id)
+        hunt = await _hunt_row(db, hunt_id=hunt_id, lead_id=lead.id, findings=[_OBSERVATION])
+        await hunt_svc.append_events(db, hunt_id, events)
+        assert leads_store.hunt_outcome_of(hunt) == "clean"
+        outcome = await leads_store.settle_after_hunt(db, hunt)
+        lead = await leads_store.get(db, lead.id)
+    return outcome, lead
+
+
+async def test_a_partial_done_event_holds_the_lead_whatever_the_runner_wrote(
+    settings_kratos: Settings,
+) -> None:
+    """The ``partial`` flag on the done event is the fact. The runner's note is
+    reworded here, and no finding names the budget. The lead still waits."""
+    outcome, lead = await _settle_with_events(
+        settings_kratos,
+        "01REWORDED",
+        [
+            {
+                "kind": "model_response",
+                "sequence": 7,
+                "payload": {"text": "The budget ran out. A partial report follows."},
+            },
+            {"kind": "done", "sequence": 9, "payload": {"degraded": False, "partial": True}},
+        ],
+    )
+    assert outcome == "waits"
+    assert lead.status == "hunting"
+    assert leads_store.hold_reason_of(lead) == leads_store.HOLD_PARTIAL_READ
+
+
+async def test_a_full_read_that_quotes_the_budget_words_closes_its_lead(
+    settings_kratos: Settings,
+) -> None:
+    """Negative control on the path the old string match took: a full read
+    (done.partial False) whose model text happens to open with the runner's old
+    budget words. The text decides nothing, so the clean hunt closes its lead."""
+    outcome, lead = await _settle_with_events(
+        settings_kratos,
+        "01QUOTED",
+        [
+            {
+                "kind": "model_response",
+                "sequence": 7,
+                "payload": {
+                    "text": (
+                        "Reached the hunt's exploration budget question first: the "
+                        "lead asks about two ports, and both are mail DNS source ports."
+                    )
+                },
+            },
+            {"kind": "done", "sequence": 9, "payload": {"degraded": False, "partial": False}},
+        ],
+    )
+    assert outcome == "closed"
+    assert lead.status == "dismissed"
+    assert lead.dismissed_reason == leads_store.HUNT_CLEAN_REASON
+
+
+async def test_a_row_from_before_the_partial_flag_keeps_its_stored_note(
+    settings_kratos: Settings,
+) -> None:
+    """A hunt recorded before 2026-10-01 has no partial key on its done event.
+    The stored note is its only record of the budget synthesis, so it still holds."""
+    outcome, lead = await _settle_with_events(
+        settings_kratos,
+        "01LEGACY",
+        [
+            {
+                "kind": "model_response",
+                "sequence": 7,
+                "payload": {
+                    "text": (
+                        "Reached the hunt's exploration budget. Writing a partial "
+                        "report from the evidence gathered so far."
+                    )
+                },
+            },
+            {"kind": "done", "sequence": 9, "payload": {"finding_count": 1}},
+        ],
+    )
+    assert outcome == "waits"
+    assert leads_store.hold_reason_of(lead) == leads_store.HOLD_PARTIAL_READ
+
+
 async def test_threat_findings_and_a_visibility_gap_leave_the_lead_on_the_analyst(
     settings_kratos: Settings,
 ) -> None:

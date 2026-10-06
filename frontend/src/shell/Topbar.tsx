@@ -20,6 +20,7 @@ import {
 import type { Notification, Workspace } from '../lib/types';
 import { useSession } from './Session';
 import { useShell } from './ShellContext';
+import { isMachineKey } from '../lib/hostDossier';
 
 const TONE: Record<Notification['tone'], string> = {
   danger: '#f04438',
@@ -77,11 +78,15 @@ function useBreadcrumb(): { crumb: string; crumb2?: string } {
 }
 
 export function Topbar() {
-  const { openPalette, ws, setWs } = useShell();
+  const { openPalette, ws, setWs, crumbName } = useShell();
   // Every read below is a protected endpoint. Hold them until /me answers, so
   // a signed-out visit does not fire a burst of 401s before the redirect (D14).
   const ready = useSession().status === 'ready';
   const { crumb, crumb2 } = useBreadcrumb();
+  // A machine page names its machine. The raw key "agent:<uuid>" rides in the
+  // tooltip only.
+  const crumb2Name = crumb2 && crumbName?.key === crumb2 ? crumbName.name : null;
+  const crumb2Key = !!crumb2 && crumb.startsWith('Hosts') && isMachineKey(crumb2);
   const navigate = useNavigate();
   const [wsOpen, setWsOpen] = useState(false);
   const [notifOpen, setNotifOpen] = useState(false);
@@ -343,7 +348,13 @@ export function Topbar() {
         {crumb2 && (
           <>
             <span className="text-ghost">/</span>
-            <span className="truncate whitespace-nowrap font-mono text-[12px] text-dim">{crumb2}</span>
+            <span
+              data-testid="topbar-crumb2"
+              className={`truncate whitespace-nowrap text-dim ${crumb2Name ? 'text-[12.5px]' : 'font-mono text-[12px]'}`}
+              title={crumb2Name || crumb2Key ? crumb2 : undefined}
+            >
+              {crumb2Name ?? (crumb2Key ? 'machine' : crumb2)}
+            </span>
           </>
         )}
       </div>

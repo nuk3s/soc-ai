@@ -27,6 +27,12 @@ one deliberate difference: a multi-token term (an IP like ``10.0.0.1``) becomes
 a quoted PHRASE ("10 0 0 1"), because FTS5's unicode61 tokenizer splits on the
 dots — a phrase matches the IP exactly where OR'd single octets would match
 almost any text containing small numbers.
+
+A PostgreSQL store has no FTS5. There the same tokens rank the projection with
+PostgreSQL text search (:data:`_PG_SQL`). The content is folded to the FTS5
+token rule first, so a dotted IP matches the phrase of its octets on both
+dialects. The ranker is ``ts_rank``, which orders hits like BM25 does but gives
+other numbers.
 """
 
 from __future__ import annotations
@@ -40,6 +46,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from soc_ai.store.auth import utcnow
+from soc_ai.store.dialect import is_sqlite
 from soc_ai.store.models import ChatMemory
 
 # The two chat sources. thread_id is the investigation / hunt ULID.
@@ -71,6 +78,24 @@ SELECT rowid AS id, -bm25(chat_memory_fts) AS score
 FROM chat_memory_fts
 WHERE chat_memory_fts MATCH :match
 ORDER BY score DESC
+LIMIT :candidates
+"""
+
+# The PostgreSQL candidate pass. ``regexp_replace`` folds the content to the
+# FTS5 token rule (runs of [a-z0-9]), and the 'simple' configuration keeps every
+# token as it is: no stemming, no stop words, as unicode61 does. The ONLY
+# runtime parameters are the token-built tsquery and the candidate bound. The
+# projection has no text-search index, so the pass reads every row.
+_PG_SQL = """
+SELECT m.id AS id, ts_rank(m.doc, q.query) AS score
+FROM (
+    SELECT id,
+           to_tsvector('simple', regexp_replace(lower(content), '[^a-z0-9]+', ' ', 'g')) AS doc
+    FROM chat_memory
+) AS m,
+to_tsquery('simple', :query) AS q(query)
+WHERE m.doc @@ q.query
+ORDER BY score DESC, m.id DESC
 LIMIT :candidates
 """
 
@@ -155,6 +180,49 @@ def _fts_match_expr(query_terms: list[str]) -> str:
     return " OR ".join(phrases)
 
 
+def _pg_tsquery(query_terms: list[str]) -> str:
+    """The PostgreSQL twin of :func:`_fts_match_expr`.
+
+    The same tokens and the same rules: a multi-token term is a phrase
+    (``10 <-> 0 <-> 0 <-> 1``), a single token shorter than 2 chars is dropped,
+    and the terms are OR'd. Every token is ``[a-z0-9]+``, so no tsquery
+    operator from the caller can reach the parser.
+    """
+    phrases: list[str] = []
+    for term in query_terms:
+        tokens = _TOKEN_RE.findall(term.lower())
+        if not tokens:
+            continue
+        if len(tokens) == 1:
+            if len(tokens[0]) < 2:
+                continue
+            phrases.append(tokens[0])
+        else:
+            phrases.append("(" + " <-> ".join(tokens) + ")")
+    return " | ".join(phrases)
+
+
+async def _candidates(db: AsyncSession, query_terms: list[str]) -> dict[int, float] | None:
+    """Ranked ``{chat_memory.id: score}`` candidates; ``None`` when nothing to ask."""
+    if not is_sqlite(db):
+        query = _pg_tsquery(query_terms)
+        if not query:
+            return None
+        rows = await db.execute(text(_PG_SQL), {"query": query, "candidates": _FTS_CANDIDATES})
+        return {int(rid): float(score) for rid, score in rows.all()}
+    match = _fts_match_expr(query_terms)
+    if not match:
+        return None
+    try:
+        rows = await db.execute(text(_FTS_SQL), {"match": match, "candidates": _FTS_CANDIDATES})
+    except OperationalError:
+        # "no such table: chat_memory_fts" / "no such module: fts5" — this
+        # install has no chat index; memory just contributes nothing.
+        await db.rollback()
+        return None
+    return {int(rid): float(score) for rid, score in rows.all()}
+
+
 def _snippet(content: str, *, max_chars: int = _SNIPPET_CHARS) -> str:
     """Collapse + truncate message content into a compact single-line snippet.
 
@@ -187,7 +255,9 @@ async def relevant_chat_snippets(
     Two passes, mirroring :mod:`soc_ai.store.runbooks`' FTS path:
 
     1. BM25 over ``chat_memory_fts`` (candidates bounded at ``_FTS_CANDIDATES``)
-       with the injection-proof MATCH from :func:`_fts_match_expr`;
+       with the injection-proof MATCH from :func:`_fts_match_expr`; on a
+       PostgreSQL store, ``ts_rank`` over the projection with the tsquery
+       from :func:`_pg_tsquery`;
     2. an ORM filter over the projection — ``created_at`` inside
        ``window_days``, minus ``exclude_thread`` (the caller's own thread must
        never echo back into its own prompt), minus empties — then best-score
@@ -206,17 +276,7 @@ async def relevant_chat_snippets(
     """
     if limit <= 0 or not query_terms:
         return []
-    match = _fts_match_expr(query_terms)
-    if not match:
-        return []
-    try:
-        rows = await db.execute(text(_FTS_SQL), {"match": match, "candidates": _FTS_CANDIDATES})
-    except OperationalError:
-        # "no such table: chat_memory_fts" / "no such module: fts5" — this
-        # install has no chat index; memory just contributes nothing.
-        await db.rollback()
-        return []
-    scores = {int(rid): float(score) for rid, score in rows.all()}
+    scores = await _candidates(db, query_terms)
     if not scores:
         return []
 

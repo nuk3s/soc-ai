@@ -20,6 +20,7 @@ import asyncio
 import json
 import os
 import shutil
+import uuid
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
@@ -169,6 +170,21 @@ def migrated_store_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 @pytest.fixture(autouse=True)
+def reset_oracle_breaker() -> Iterator[None]:
+    """Each test starts with every Oracle route closed.
+
+    The route breaker (soc_ai.oracle.breaker) is process state. A test that
+    feeds a fake gateway three server errors pauses the route, and the next
+    test in the same worker would otherwise make no Oracle call at all.
+    """
+    from soc_ai.oracle.breaker import BREAKER
+
+    BREAKER.reset()
+    yield
+    BREAKER.reset()
+
+
+@pytest.fixture(autouse=True)
 def fast_app_boot(monkeypatch: pytest.MonkeyPatch, migrated_store_template: Path) -> None:
     """Take the migration chain out of an app boot.
 
@@ -187,7 +203,8 @@ def fast_app_boot(monkeypatch: pytest.MonkeyPatch, migrated_store_template: Path
 
     async def _migrate_or_copy(engine: AsyncEngine) -> None:
         database = engine.url.database
-        store = Path(database) if database and database != ":memory:" else None
+        sqlite_file = engine.dialect.name == "sqlite" and database and database != ":memory:"
+        store = Path(database) if sqlite_file and database else None
         if store is None or store.exists():
             await store_db.run_migrations(engine)
             return
@@ -195,6 +212,98 @@ def fast_app_boot(monkeypatch: pytest.MonkeyPatch, migrated_store_template: Path
         shutil.copyfile(migrated_store_template, store)
 
     monkeypatch.setattr(soc_ai_main, "run_migrations", _migrate_or_copy)
+
+
+# ── The PostgreSQL store run ──────────────────────────────────────────────────
+#
+# The store test modules below carry the ``postgres`` marker. In a normal run
+# they use SQLite, like every other test. When SOC_AI_TEST_DATABASE_URL names a
+# PostgreSQL server, each marked test gets a fresh, empty database on that
+# server, and SOC_AI_DATABASE_URL points the test's Settings at it. The run then
+# proves the same assertions on the second dialect:
+#
+#   SOC_AI_TEST_DATABASE_URL=postgresql+asyncpg://postgres:pw@127.0.0.1:5432/postgres \
+#       pytest -m postgres
+#
+# The URL names a maintenance database. The role must be allowed to create
+# databases. Read here, at import, because clean_env strips every SOC_AI_ name.
+POSTGRES_TEST_URL = os.environ.get("SOC_AI_TEST_DATABASE_URL", "").strip()
+
+POSTGRES_MODULES = frozenset(
+    {
+        "test_store.py",
+        "test_store_investigations.py",
+        "test_leads_store.py",
+        "test_host_dossier_store.py",
+        "test_host_machines_store.py",
+        "test_hunts_store.py",
+        "test_entity_profiles_store.py",
+        "test_migrations_parity.py",
+        # The other head canaries.
+        "test_escalations_store.py",
+        "test_quality_snapshot_provenance.py",
+        "test_store_dialect.py",
+        "test_store_postgres.py",
+        "test_store_copy.py",
+        # The saved-view cap leaned on SQLite's writer lock under concurrent saves.
+        "test_saved_views.py",
+    }
+)
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    # tryfirst: the marker has to be on the item before `-m postgres` selects.
+    for item in items:
+        if item.path.name in POSTGRES_MODULES:
+            item.add_marker(pytest.mark.postgres)
+
+
+def _postgres_admin_url() -> Any:
+    return store_db.parse_store_url(POSTGRES_TEST_URL)
+
+
+async def _postgres_admin(statement: str) -> None:
+    import asyncpg  # only the PostgreSQL run needs the driver
+
+    url = _postgres_admin_url()
+    conn = await asyncpg.connect(
+        host=url.host,
+        port=url.port or 5432,
+        user=url.username,
+        password=url.password,
+        database=url.database,
+    )
+    try:
+        await conn.execute(statement)
+    finally:
+        await conn.close()
+
+
+@pytest.fixture(autouse=True)
+def postgres_store(
+    request: pytest.FixtureRequest, clean_env: None, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[str | None]:
+    """A fresh PostgreSQL database for a ``postgres`` test, when the run has a server.
+
+    Yields the database URL, or ``None`` on a SQLite run. A test marked
+    ``sqlite_only`` reads SQLite internals (the file, a pragma, the FTS5
+    tables) and skips on the PostgreSQL run.
+    """
+    if not POSTGRES_TEST_URL or request.node.get_closest_marker("postgres") is None:
+        yield None
+        return
+    if request.node.get_closest_marker("sqlite_only") is not None:
+        pytest.skip("The test reads SQLite internals. The PostgreSQL run skips it.")
+    name = f"socai_test_{uuid.uuid4().hex[:16]}"
+    asyncio.run(_postgres_admin(f'CREATE DATABASE "{name}"'))
+    url = _postgres_admin_url().set(database=name).render_as_string(hide_password=False)
+    monkeypatch.setenv("SOC_AI_DATABASE_URL", url)
+    get_settings.cache_clear()
+    try:
+        yield url
+    finally:
+        asyncio.run(_postgres_admin(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'))
 
 
 @pytest.fixture

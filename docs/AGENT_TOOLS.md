@@ -1,4 +1,4 @@
-# What the soc-ai agent can do
+# Agent tools
 
 This page states the complete capability of the triage agent. It names the tools the
 agent can call, the enrichments that run on every alert before the agent runs, and the
@@ -6,7 +6,7 @@ guardrails. SO means Security Onion.
 
 > **Trust boundary:** every read tool is read-only. A write tool changes Security Onion
 > state. A write tool runs only if a person executes it from the report's recommended
-> actions in the UI. The actions API is the single write path. The agent recommends a
+> actions in the console. The actions API is the single write path. The agent recommends a
 > write. The agent never executes a write on its own.
 >
 > The third class is the proposal tool. A proposal tool changes nothing. It puts a control
@@ -31,10 +31,10 @@ A read tool runs without human approval.
 | `enrich_domain` | Enrich a domain with a local blocklist lookup. MISP is optional. | Vendored blocklists / MISP |
 | `enrich_hash` | Enrich a file hash with a local blocklist lookup. MISP is optional. | Vendored blocklists / MISP |
 | `get_event_raw` / `t_get_event_raw` | Fetch the full raw JSON of one event by id. Use it if the summarized context is not enough. | Elasticsearch events index |
-| `t_describe_dataset` / `t_field_values` | Discover the telemetry on demand. One tool describes the shape of a dataset. The other lists the observed values of a field. The agent learns what *this* grid holds, and it does not assume a fixed schema. | Elasticsearch (terms aggregations) |
+| `t_describe_dataset` / `t_field_values` | Discover the telemetry on demand. One tool describes the shape of a dataset. The other lists the observed values of a field. The agent learns the data that *this* grid holds. It assumes no fixed schema. | Elasticsearch (terms aggregations) |
 | `t_host_summary` | Summarize the recent activity of a host on the internal side of a flow. The summary names the datasets seen, the top peers and the notable events. | Elasticsearch |
-| `t_origin_chain` | Who controlled this host? The tool lists the inbound remote-access sessions over SSH, RDP, WinRM and SMB to an internal host in the window before the activity. The list is time-ordered, and it flags the closest preceding session as the likely driver. Call this tool before you attribute hostile behaviour to an internal host. A host with an inbound session is a waypoint, so attribute the behaviour upstream. An empty result is also decisive, because the host acted on its own. | Elasticsearch |
-| `t_host_dossier` | What is this host, and is this normal for it? The dossier is the durable asset record that the network sweep keeps for an internal IP address. It holds the hostname, the OS, the inferred role, the services the host offers, the behavioural baseline, the operator-set criticality and the site policy. The inferred role is hypervisor, domain controller, security appliance, server, workstation, network device or IoT. Every field carries its provenance, its evidence and the date of its last confirmation, and an operator value outranks an inferred value. `t_host_summary` returns a fresh 24 h snapshot, and the dossier is the stored record that the sweep builds over a much wider window. A field with no value states why: `no_signal`, `low_confidence` or `stale`. A missing dossier means the sweep has no record of the address, and it is not evidence that the address is benign. | Local store (built from Elasticsearch by the dossier sweep) |
+| `t_origin_chain` | Find the session that controlled this host. The tool lists the inbound remote-access sessions over SSH, RDP, WinRM and SMB to an internal host in the window before the activity. The list is time-ordered, and it flags the closest preceding session as the likely driver. Call this tool before you attribute hostile behaviour to an internal host. A host with an inbound session is a waypoint, so attribute the behaviour upstream. An empty result is also decisive, because the host acted on its own. | Elasticsearch |
+| `t_host_dossier` | Read what this host is and what is normal for it. The dossier is the durable asset record that the network sweep keeps for an internal IP address. It holds the hostname, the OS, the inferred role, the services the host offers, the behavioural baseline, the operator-set criticality and the site policy. The inferred role is hypervisor, domain controller, security appliance, server, workstation, network device or IoT. Every field carries its provenance, its evidence and the date of its last confirmation, and an operator value outranks an inferred value. `t_host_summary` returns a fresh 24 h snapshot, and the dossier is the stored record that the sweep builds over a much wider window. A field with no value states why: `no_signal`, `low_confidence` or `stale`. A missing dossier means the sweep has no record of the address. It is no evidence that the address is benign. | Local store (built from Elasticsearch by the dossier sweep) |
 | `t_prevalence` / `t_rule_prevalence` | Measure how common one indicator or one rule is across the grid and the window. A rare indicator and a noisy indicator lead to different false-positive calls. Both tools separate a spread-out baseline from a single burst, and neither averages one into the other. | Elasticsearch (aggregations) |
 | `t_suggest_rule_tuning` | Suggest a tuning for a noisy detection. The analyst applies the tuning in Detection Tuning. The agent never changes a rule. | Local store + Elasticsearch |
 | `t_shodan_internetdb` / `t_shodan_host` / `t_greynoise` / `t_cve_lookup` | Look up the external reputation of one indicator. The sources are Shodan InternetDB, the Shodan host API, GreyNoise and the CIRCL CVE DB. Shodan InternetDB is free, and the Shodan host API needs a paid key. These tools send traffic out of the network, and the hunt and chat agents use them. Only the indicator leaves the network, and an alert payload never does. See `docs/SAFETY_MODEL.md` → external-intel egress. | Public Shodan / GreyNoise / CIRCL APIs |
@@ -70,7 +70,7 @@ Dashboard assistant can propose a hunt, and it cannot propose a verdict.
 
 ## Write tools
 
-The analyst executes a write tool from the report in the UI.
+The analyst executes a write tool from the report in the console.
 
 | Tool | What it does |
 |------|--------------|
@@ -81,7 +81,7 @@ The analyst executes a write tool from the report in the UI.
 ## Enrichments on every alert
 
 These enrichments run before the agent runs. They run locally in the prefetch stage, with
-no LLM and no runtime egress. The prefetch gives the results to the agent as part of
+no model call and no runtime egress. The prefetch gives the results to the agent as part of
 the alert context.
 
 - **Blocklist match:** the vendored threat feeds are URLhaus, ThreatFox, Feodo Tracker
@@ -96,8 +96,8 @@ the alert context.
 - **MISP IOC match:** if you configure a MISP instance with `MISP_URL`, soc-ai checks the
   indicators against it.
 
-The UI shows these enrichments on the alert context and on the investigation timeline, so
-an analyst can see which enrichments fired.
+The console shows these enrichments on the alert context and on the investigation timeline,
+so an analyst can see which enrichments fired.
 
 ## Known gaps
 

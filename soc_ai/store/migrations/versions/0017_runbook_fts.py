@@ -92,15 +92,18 @@ def upgrade() -> None:
     # migration cleanly with nothing FTS created (search() falls back to the
     # legacy scorer at query time). The guard probes the CREATE itself; triggers
     # + backfill only run when it succeeded, so a partial state is impossible.
-    try:
-        op.execute(sa.text(_CREATE_FTS))
-    except OperationalError:
-        # "no such module: fts5" — leave this install on the legacy scorer.
-        _LOGGER.warning("SQLite lacks FTS5 — skipping runbook_fts (legacy scorer stays)")
-    else:
-        for ddl in _CREATE_TRIGGERS:
-            op.execute(sa.text(ddl))
-        op.execute(sa.text(_BACKFILL))
+    # FTS5 is a SQLite module: a PostgreSQL store gets no runbook_fts, and
+    # search() uses the legacy scorer there, as on an FTS5-less SQLite.
+    if op.get_bind().dialect.name == "sqlite":
+        try:
+            op.execute(sa.text(_CREATE_FTS))
+        except OperationalError:
+            # "no such module: fts5" — leave this install on the legacy scorer.
+            _LOGGER.warning("SQLite lacks FTS5 — skipping runbook_fts (legacy scorer stays)")
+        else:
+            for ddl in _CREATE_TRIGGERS:
+                op.execute(sa.text(ddl))
+            op.execute(sa.text(_BACKFILL))
 
     # Semantic-tier side table (opt-in gateway embeddings). Unconditional: plain
     # table, no FTS dependency. One row per runbook; `model` records WHICH
@@ -125,7 +128,10 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.drop_table("runbook_embedding")
     # IF EXISTS: the upgrade may have skipped the FTS objects on an FTS5-less
-    # SQLite, and DROP TRIGGER/TABLE IF EXISTS is safe either way.
+    # SQLite, and DROP TRIGGER/TABLE IF EXISTS is safe either way. PostgreSQL
+    # never had them.
+    if op.get_bind().dialect.name != "sqlite":
+        return
     op.execute(sa.text("DROP TRIGGER IF EXISTS runbook_fts_au"))
     op.execute(sa.text("DROP TRIGGER IF EXISTS runbook_fts_ad"))
     op.execute(sa.text("DROP TRIGGER IF EXISTS runbook_fts_ai"))

@@ -154,6 +154,9 @@ _HUNT_TL_SKIP = {
     "tool_result",
     "model_response",
     "done",
+    # The model usage of the hunt agent run. It feeds the run counters on the
+    # hunt row. It is not a step the analyst reads.
+    "usage",
     "chat_user",
     "chat_assistant",
     "citation_validation",
@@ -2242,6 +2245,10 @@ class LeadObservationOut(BaseModel):
     occurrences: int
     born_at: str | None
     first_seen_at: str | None
+    # The newest document timestamp the observation cites. ``born_at`` is the
+    # time soc-ai wrote the row. The page shows this one when present, and the
+    # live weight decays from it. None when the writer had no document time.
+    observed_at: str | None = None
     # Which adapter wrote it, and whether its analytic is live.
     source: str = "profile"
     shadow: bool = False
@@ -2327,6 +2334,15 @@ class LeadObservationDetailOut(LeadObservationOut):
     # adapter, so the timeline row links to no analytic. Six of thirteen leads
     # on the range linked to a drawer that could not be read.
     analytic_exists: bool = False
+    # Migration 0057. The statistic that departed, its value and the value of
+    # the baseline it departed from. None on a row that predates them.
+    statistic: str | None = None
+    statistic_value: float | None = None
+    baseline_value: float | None = None
+    # Up to 10 document ids the observation cites, and the OQL query that
+    # shows the departure again. The page offers the query to the console.
+    document_ids: list[str] = []
+    rerun_query: str | None = None
 
 
 class LeadKindWeightOut(BaseModel):
@@ -2542,6 +2558,7 @@ async def list_leads(request: Request, status: str = "open", limit: int = 50) ->
                     occurrences=int(o.occurrences or 1),
                     born_at=_iso(o.born_at),
                     first_seen_at=_iso(o.first_seen_at),
+                    observed_at=_iso(o.observed_at),
                     source=observation_source(o.source),
                     shadow=bool(o.shadow),
                 )
@@ -2649,6 +2666,7 @@ def _lead_detail(
     the weight at formation, because a lead that has gone quiet reads the same
     as a fresh one without both numbers.
     """
+    from soc_ai.hunting.leads import decays_from  # noqa: PLC0415 - lazy
     from soc_ai.hunting.weight import (  # noqa: PLC0415 - lazy
         lead_total,
         live_weight,
@@ -2666,7 +2684,7 @@ def _lead_detail(
     for o in rows:
         w = live_weight(
             float(o.birth_weight or 0.0),
-            born_at=o.born_at,
+            born_at=decays_from(o.observed_at, o.born_at),
             count=int(o.occurrences or 1),
             now=now,
         )
@@ -2681,12 +2699,18 @@ def _lead_detail(
                 occurrences=int(o.occurrences or 1),
                 born_at=_iso(o.born_at),
                 first_seen_at=_iso(o.first_seen_at),
+                observed_at=_iso(o.observed_at),
                 source=observation_source(o.source),
                 shadow=bool(o.shadow),
                 weight_now=round(w, 3),
                 birth_weight=float(o.birth_weight or 0.0),
                 evidence=o.evidence_json if isinstance(o.evidence_json, dict) else None,
                 analytic_exists=o.spec_id in (analytics or set()),
+                statistic=o.statistic,
+                statistic_value=o.statistic_value,
+                baseline_value=o.baseline_value,
+                document_ids=[str(i) for i in (o.document_ids or []) if i],
+                rerun_query=o.rerun_query,
             )
         )
     # The same capped total formation wrote. Summed plainly, the page said 25
@@ -2973,7 +2997,7 @@ async def reopen_lead(request: Request, lead_id: int) -> LeadDetailOut:
 
 # The one sentence the block states, built from the constants themselves so
 # the page cannot say one number while the rule uses another.
-LEAD_QUALITY_NOTE = "A threshold moves on a week of data, never on a day."
+LEAD_QUALITY_NOTE = "A threshold moves only on a week of data."
 
 # The label for a lead whose row carries no observation types.
 NO_TYPES_RECORDED = "none recorded"

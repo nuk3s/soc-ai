@@ -52,6 +52,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from soc_ai.rag import runbook_embeddings as rag_svc
+from soc_ai.store.dialect import is_sqlite
 from soc_ai.store.models import Runbook
 
 if TYPE_CHECKING:
@@ -269,7 +270,14 @@ async def _fts_hits(
     missing (migration 0017 skipped it on an FTS5-less SQLite) or the module
     itself is absent — which tells :func:`search` to use the legacy scorer.
     The session is rolled back on that error so it stays usable.
+
+    A PostgreSQL store has no ``runbook_fts`` (FTS5 is a SQLite module), so
+    it takes the legacy scorer without the query. On PostgreSQL a failed
+    statement aborts the whole transaction, and the error is not an
+    ``OperationalError``, so asking first is the only safe probe.
     """
+    if not is_sqlite(db):
+        return None
     try:
         rows = await db.execute(text(_FTS_SQL), {"match": _fts_match_expr(tokens), "limit": limit})
     except OperationalError:

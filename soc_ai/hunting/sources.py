@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import ipaddress
 from collections.abc import Iterable, Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import delete, select
@@ -85,6 +85,17 @@ def internal_hosts(values: Iterable[str | None]) -> list[str]:
         ):
             out.append(text)
     return out
+
+
+def _event_time(value: str | None) -> datetime | None:
+    """An Elasticsearch date string as an aware datetime, or None if unreadable."""
+    if not value:
+        return None
+    try:
+        stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return stamp if stamp.tzinfo is not None else stamp.replace(tzinfo=UTC)
 
 
 async def observe_catalog_hits(
@@ -165,6 +176,13 @@ async def observe_catalog_hits(
             # made the two facts one field that could only say one of them.
             source="catalog",
             shadow=shadow,
+            # The newest matched document. The hit decays from the event,
+            # not from the sweep that found it.
+            observed_at=_event_time(candidate.last_seen),
+            # A catalog hit is a count of the documents that matched. The
+            # analytic is the query, and the lead page links to it.
+            statistic="documents",
+            statistic_value=float(candidate.doc_count),
         )
         touched.add((entity_kind, candidate.scope_key))
     if not touched:

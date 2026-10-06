@@ -17,6 +17,13 @@ description: >
 
 level: low
 evaluator: profile
+# The tier 2 budget is one hit per 100 host-days. The seven day production
+# replay of 2026-10-05 read 1.8 hits per 100 host-days for this analytic. On
+# about 130 measured hosts the budget is close to one hit a day. The self-healing
+# hold moves the analytic to shadow past three hits in a day or under a precision
+# of 0.25 on its hunted leads, and an analyst approves it back to live.
+fire_budget_per_day: 3
+precision_floor: 0.25
 scope_field: host.name
 scope_kind: host
 

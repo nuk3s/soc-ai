@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Iterator
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -1155,7 +1156,7 @@ def test_hunt_manager_forces_allow_so_writes_false_for_hunt_kind(promoted_kind: 
     async def run() -> str | None:
         with (
             patch.object(hm, "run_recorded", fake_run_recorded),
-            patch.object(hm, "ctx_from_state", lambda _s: object()),
+            patch.object(hm, "ctx_from_state", lambda _s: SimpleNamespace()),
         ):
             mgr = hm.HuntManager()
             inv_id = await mgr.start(
@@ -1191,7 +1192,7 @@ def test_hunt_manager_leaves_allow_so_writes_true_for_non_hunt_kind() -> None:
     async def run() -> str | None:
         with (
             patch.object(hm, "run_recorded", fake_run_recorded),
-            patch.object(hm, "ctx_from_state", lambda _s: object()),
+            patch.object(hm, "ctx_from_state", lambda _s: SimpleNamespace()),
         ):
             mgr = hm.HuntManager()
             inv_id = await mgr.start(object(), alert_id="ev-plain", started_by="tester")

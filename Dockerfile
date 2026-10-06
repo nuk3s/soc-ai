@@ -40,7 +40,12 @@ COPY pyproject.toml uv.lock ./
 # --frozen: honour the lock file exactly (no re-resolution).
 # --no-install-project: don't attempt to install the not-yet-copied source.
 # --no-dev: skip [dependency-groups.dev].
-RUN uv sync --frozen --no-install-project --no-dev
+# --extra postgres: asyncpg, for a store in PostgreSQL (SOC_AI_DATABASE_URL and
+# the compose "postgres" profile). SQLite stays the default and needs nothing.
+# --extra ml: scikit-learn and numpy, for the tier 3 estate model
+# (estate_model_enabled, off by default). About 220 MB of site-packages on
+# 2026-10-04. The app imports them only when the estate model runs.
+RUN uv sync --frozen --no-install-project --no-dev --extra postgres --extra ml
 
 
 # ── Stage 2: frontend build (React SPA → /fe/dist) ────────────────────────────

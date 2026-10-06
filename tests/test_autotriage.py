@@ -27,6 +27,7 @@ from soc_ai.config import Settings
 from soc_ai.main import create_app
 from soc_ai.store import investigations as inv_svc
 from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
+from soc_ai.triage_models import PIPELINE_FALLBACK_PROVENANCE
 
 ADMIN_PW = "test-at-pw"
 
@@ -122,7 +123,12 @@ def _seed_investigation(
     alert_es_id: str,
     src_ip: str | None = None,
     dest_ip: str | None = None,
+    fallback: bool = False,
 ) -> str:
+    """Seed a COMPLETE run on a pair. ``fallback=True`` writes the shape the
+    orchestrator's synth-failure path writes: a placeholder needs_more_info at
+    0.3 with the pipeline-fallback marker in the report."""
+
     async def _go() -> str:
         engine = make_engine(settings)
         await run_migrations(engine)
@@ -136,14 +142,29 @@ def _seed_investigation(
                 dest_ip=dest_ip,
             )
             await inv_svc.set_rule_name(db, inv.id, rule_name)
-            await inv_svc.finalize(
-                db,
-                inv.id,
-                status="complete",
-                verdict="false_positive",
-                confidence=0.9,
-                rationale="Internal scanner.",
-            )
+            if fallback:
+                await inv_svc.finalize(
+                    db,
+                    inv.id,
+                    status="complete",
+                    verdict="needs_more_info",
+                    confidence=0.3,
+                    rationale="Synthesis failed.",
+                    report={
+                        "verdict": "needs_more_info",
+                        "confidence": 0.3,
+                        "resolution": {"provenance": PIPELINE_FALLBACK_PROVENANCE},
+                    },
+                )
+            else:
+                await inv_svc.finalize(
+                    db,
+                    inv.id,
+                    status="complete",
+                    verdict="false_positive",
+                    confidence=0.9,
+                    rationale="Internal scanner.",
+                )
         await engine.dispose()
         return inv.id
 
@@ -601,6 +622,76 @@ class TestInheritedFpAutoAck:
         assert mock_write.await_args.args[1] == {"alert_id": "ev-low"}
         assert status.inherited_acked == 1
         assert status.inherited_refused == {"high_stakes": 1}
+
+
+class TestFallbackIsNotAnInheritedVerdict:
+    """A pipeline fallback is a failure wearing ``complete``. It must never be the
+    source of an inherited verdict, and the scheduler must re-run it like any
+    failed run. Production since 2026-08-20: the scheduler re-ran 0 of its own 11
+    fallbacks, because ``latest_for_pairs`` handed each one back as the pair's
+    verdict and the planner skipped the cluster as ``inherited``."""
+
+    @staticmethod
+    def _plan(settings: Settings) -> tuple[list[Any], int, list[Any]]:
+        from soc_ai.webui import autotriage as at
+
+        es = AsyncMock()
+        es.search.side_effect = _make_es_side_effect()
+        state = _FakeState(settings, es)
+        return asyncio.run(at.plan_targets(state, time_range="24h", oql=None))
+
+    def test_a_fallback_on_the_pair_does_not_cover_a_new_alert(self, at_settings: Settings) -> None:
+        _seed_investigation(
+            at_settings,
+            rule_name="ET SCAN thing",
+            alert_es_id="other-ev",
+            src_ip="10.0.0.41",
+            dest_ip="10.0.0.1",
+            fallback=True,
+        )
+        targets, skipped, acks = self._plan(at_settings)
+        assert [t.alert_es_id for t in targets] == ["ev1"]
+        assert skipped == 0
+        assert acks == []
+
+    def test_the_scheduler_reruns_its_own_fallback(self, at_settings: Settings) -> None:
+        """The fallback sits on the SAME alert the sweep sees again. The direct
+        check already lets it through (blocks_rehunt); the pair check must too."""
+        _seed_investigation(
+            at_settings,
+            rule_name="ET SCAN thing",
+            alert_es_id="ev1",
+            src_ip="10.0.0.41",
+            dest_ip="10.0.0.1",
+            fallback=True,
+        )
+        targets, skipped, acks = self._plan(at_settings)
+        assert [t.alert_es_id for t in targets] == ["ev1"]
+        assert skipped == 0
+        assert acks == []
+
+    def test_an_older_real_verdict_still_covers_the_pair(self, at_settings: Settings) -> None:
+        """Negative control: the filter drops the fallback, not the pair. A real
+        verdict in the window under a newer fallback still covers the cluster,
+        the way it covers a pair whose later run errored."""
+        _seed_investigation(
+            at_settings,
+            rule_name="ET SCAN thing",
+            alert_es_id="older-ev",
+            src_ip="10.0.0.41",
+            dest_ip="10.0.0.1",
+        )
+        _seed_investigation(
+            at_settings,
+            rule_name="ET SCAN thing",
+            alert_es_id="other-ev",
+            src_ip="10.0.0.41",
+            dest_ip="10.0.0.1",
+            fallback=True,
+        )
+        targets, skipped, _acks = self._plan(at_settings)
+        assert targets == []
+        assert skipped == 1
 
 
 class TestInheritedAckEvidenceBar:
@@ -2821,10 +2912,16 @@ class TestStartConfigSweep:
             return targets, 2, []
 
         async def _run(
-            _s: Any, *, targets: Any, started_by: str, inherited_acks: Any = None
+            _s: Any,
+            *,
+            targets: Any,
+            started_by: str,
+            inherited_acks: Any = None,
+            apply_rule_prior: bool = False,
         ) -> None:
             ran["targets"] = targets
             ran["started_by"] = started_by
+            ran["apply_rule_prior"] = apply_rule_prior
 
         with (
             patch("soc_ai.webui.autotriage.plan_targets", _plan),
@@ -2841,6 +2938,8 @@ class TestStartConfigSweep:
 
         assert ran["targets"] == targets
         assert ran["started_by"] == "auto-triage:scheduler"
+        # The scheduler's sweep is the one path the rule prior serves.
+        assert ran["apply_rule_prior"] is True
 
 
 class TestResolveRuleNames:

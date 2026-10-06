@@ -63,12 +63,36 @@ rsync -az --delete \
   --exclude='.superpowers/' --exclude='.claude/' --exclude='.remember/' \
   ./ "${TARGET}:${DEST}/"
 
+# Stamp the commit into the range's .env, the way scripts/deploy.sh does for
+# production. The unit reads .env through EnvironmentFile, so the app reports
+# the commit in GET /api/v1/about and in the console About section. The range
+# has no git binary, so nothing else names the build it runs. The sed drops
+# only an older SOC_AI_COMMIT line and keeps every other line. A last line with
+# no newline gets one first, so the new line never joins it.
+COMMIT="$(git -C "${_root}" rev-parse HEAD)"
+ssh "${TARGET}" "cd ${DEST} && touch .env && sed -i '/^SOC_AI_COMMIT=/d' .env && \
+  if [ -s .env ] && [ -n \"\$(tail -c1 .env)\" ]; then echo >> .env; fi && \
+  printf 'SOC_AI_COMMIT=%s\n' '${COMMIT}' >> .env"
+echo "commit ${COMMIT} stamped"
+
 # Ownership, reinstall, restart, then WAIT for a real answer. A restart that
 # returns 0 says systemd accepted the job, not that the app started; the unit
 # above exits 3 on a failed startup and would otherwise deploy "successfully".
+# The locked dependency set, with the optional extras the range runs. The
+# range has no uv, so the lock is exported here and installed there with pip.
+# A plain "pip install .[ml]" on the range would copy the project into
+# site-packages beside the editable install, and the console script would
+# then import that copy: the OQL primer path broke that way on 2026-10-05.
+uv export --extra postgres --extra ml --no-dev --no-hashes --no-emit-project \
+  -o /tmp/soc-ai-range-requirements.txt --quiet
+rsync -az /tmp/soc-ai-range-requirements.txt "${TARGET}:${DEST}/requirements-range.txt"
+
 ssh "${TARGET}" "set -e
   chown -R ${SVC_USER}:${SVC_USER} ${DEST}
+  cd ${DEST} && .venv/bin/python -m pip install -q -r requirements-range.txt
   cd ${DEST} && .venv/bin/python -m pip install -e . --no-deps -q
+  # An editable install must be the only soc_ai on the path.
+  test ! -d .venv/lib/python3.12/site-packages/soc_ai || { echo 'a non-editable soc_ai copy sits in site-packages' >&2; exit 1; }
   systemctl restart soc-ai
   ok=0
   for i in \$(seq 1 20); do

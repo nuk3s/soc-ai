@@ -1,7 +1,7 @@
 import { Disc, FlaskConical, Wrench } from 'lucide-react';
 
 import { HUNT_KIND, KIND, SEVERITY, VERDICT } from '../lib/tokens';
-import { detectionKindTitle } from '../lib/tooltips';
+import { CHIP_RUN_CLASS, detectionKindTitle } from '../lib/tooltips';
 import type { DetectionKind, HuntKind, Severity, Verdict } from '../lib/types';
 
 // ---- "In development" badge — marks features that aren't wired up yet -------
@@ -156,6 +156,34 @@ export function SyntheticEvalBadge() {
     >
       <FlaskConical size={9} strokeWidth={2.5} />
       Synthetic evaluation data
+    </span>
+  );
+}
+
+// ---- run class chip ---------------------------------------------------------
+// The budget class a run ran in: cheap, standard, deep or rule prior. The row,
+// the drawer and the page show it so an analyst can tell a one-request verdict
+// from a loop. A run stored before the classes existed carries no class and
+// renders nothing: an absent chip says "not recorded", never a guess. A class
+// this build does not know renders nothing rather than throwing.
+export function RunClassChip({ runClass, testId }: { runClass?: string | null; testId?: string }) {
+  if (!runClass) return null;
+  const c = CHIP_RUN_CLASS[runClass];
+  if (!c) return null;
+  const tone =
+    runClass === 'rule_prior'
+      ? { color: '#f5a623', borderColor: 'rgba(245,166,35,.4)', background: 'rgba(245,166,35,.09)' }
+      : runClass === 'deep'
+        ? { color: '#63b4ff', borderColor: 'rgba(99,180,255,.4)', background: 'rgba(99,180,255,.08)' }
+        : undefined;
+  return (
+    <span
+      data-testid={testId ?? 'run-class-chip'}
+      title={c.title}
+      className="flex-none rounded-badge border border-border-2 bg-surface-2 px-[6px] py-[2px] font-mono text-[10.5px] text-dim"
+      style={tone}
+    >
+      {c.label}
     </span>
   );
 }

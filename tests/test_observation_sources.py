@@ -390,3 +390,37 @@ async def test_resolve_to_false_positive_removes_the_alert_observation(
         )
         rows = await _rows(db)
     assert rows == []
+
+
+async def test_a_catalog_hit_records_the_time_of_its_newest_document(
+    settings_kratos: Settings,
+) -> None:
+    """The catalog sweep writes the hit's newest matched document as the event
+    time. ``born_at`` stays the sweep, and the hit decays from the event."""
+    _engine, maker = await _db(settings_kratos)
+    hit = replace(_candidate("198.51.100.7"), last_seen="2026-09-17T16:00:00.000Z")
+    async with maker() as db:
+        await observe_catalog_hits(db, spec=_spec(False), candidates=[hit], now=_NOW)
+        rows = await _rows(db)
+    assert rows[0].born_at == _NOW.replace(tzinfo=None)
+    assert rows[0].observed_at == datetime(2026, 9, 17, 16, 0)
+
+
+async def test_a_catalog_hit_with_no_document_time_keeps_the_record_time(
+    settings_kratos: Settings,
+) -> None:
+    """Negative control: no ``last_seen`` and an unreadable one both leave the
+    event time empty. The hit decays from the sweep, as before."""
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        await observe_catalog_hits(
+            db,
+            spec=_spec(False),
+            candidates=[
+                replace(_candidate("198.51.100.7"), last_seen=None),
+                replace(_candidate("198.51.100.8"), last_seen="yesterday"),
+            ],
+            now=_NOW,
+        )
+        rows = await _rows(db)
+    assert [r.observed_at for r in rows] == [None, None]

@@ -7,21 +7,21 @@ an arbitrary command.
 
 > **⚠ The grid can delete this user.** An operator creates `socpcap` by hand on the
 > sensor. A Salt highstate, an SO upgrade or a re-image can remove the user, its sudoers
-> file or its `authorized_keys` file. PCAP fetch then breaks silently. A backlog item
-> covers the *detection* of this state and a prompt to create the user again. Until that
-> item lands, run the setup below again if PCAP stops working.
+> file or its `authorized_keys` file. PCAP fetch then fails, and no screen reports it. A
+> planned change detects this state and asks you to create the user again. Until that
+> change ships, run the setup below again if PCAP stops working.
 >
 > **Create the user again through a SENSOR ADMIN path.** Use the SO console or your own
-> admin SSH account. Do not use the soc-ai `so_pcap` key. That key now belongs to
-> `socpcap`, it runs tcpdump only, and it *cannot* create itself.
+> admin SSH account. Do not use the soc-ai `so_pcap` key. That key belongs to
+> `socpcap`. It runs tcpdump only, and it cannot create the user.
 
-## What the setup establishes
+## Setup components
 
 | Piece | Value |
 |-------|-------|
 | User | `socpcap`. It is a normal system user. SSH needs a shell and a home directory for it. |
 | Group | `socore`. It grants read and traverse on `so_suripcap_dir`. That directory is `/nsm/suripcap`, mode 775, owner `suricata:socore`. The `find` step can then list the pcap files. |
-| Sudo | `/etc/sudoers.d/socpcap` holds `socpcap ALL=(root) NOPASSWD: /usr/sbin/tcpdump` only. Arbitrary sudo is blocked. |
+| Sudo | `/etc/sudoers.d/socpcap` holds `socpcap ALL=(root) NOPASSWD: /usr/sbin/tcpdump` only. The file allows no other sudo command. |
 | Key | The soc-ai `so_pcap` public key sits in `~socpcap/.ssh/authorized_keys`. A `from="<soc-ai host IP>"` restriction limits it. |
 
 On the soc-ai side, set these values in `.env` on the soc-ai host: `SO_SSH_USER=socpcap`,
@@ -58,7 +58,7 @@ Run these steps on the SENSOR as an admin with sudo.
    sudo visudo -cf /etc/sudoers.d/socpcap     # must print "parsed OK"
    ```
 
-   > Confirm the `tcpdump` path with `command -v tcpdump`. On this grid the path is
+   > Confirm the `tcpdump` path with `command -v tcpdump`. The usual path is
    > `/usr/sbin/tcpdump`.
    > Confirm `so_suripcap_dir` against `SO_SURIPCAP_DIR` in soc-ai's `.env`. The default
    > is `/nsm/suripcap`.
@@ -81,8 +81,8 @@ Then test the path end to end through soc-ai. Run a hunt that calls `t_get_pcap`
 
 ## History
 
-- An earlier setup authorized PCAP access with a key on a root-capable account under
-  `NOPASSWD:ALL`. Prefer the dedicated, de-privileged `socpcap` account. Scope its sudo
-  to `tcpdump` only, so a compromised PCAP key cannot escalate. Confirm that a separate
-  admin path still works before you migrate from a root-capable key. Back up the
-  `authorized_keys` file of the existing account before you remove the old entry.
+- An earlier setup gave PCAP access to a key on a root-capable account under
+  `NOPASSWD:ALL`. Use the dedicated `socpcap` account. It has no other privilege. Limit
+  its sudo to `tcpdump`. A stolen PCAP key then cannot escalate. Before you move off a
+  root-capable key, confirm that a separate admin path still works. Back up the
+  `authorized_keys` file of the old account before you remove the old entry.

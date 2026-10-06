@@ -1,17 +1,17 @@
 # Changelog
 
-The full, versioned changelog is maintained in the repository and rendered on GitHub:
+The full changelog lives in the repository, and GitHub renders it:
 
 [:octicons-arrow-right-24: **CHANGELOG.md on GitHub**](https://github.com/nuk3s/soc-ai/blob/main/CHANGELOG.md)
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and the project
 follows [Semantic Versioning](https://semver.org/) from 1.0 onward.
 
-## Recent highlights
+## Highlights
 
 - **1.5.2**: The TLS release. A Caddy overlay terminates TLS in front of soc-ai and renews the
-  certificate. On the direct path, soc-ai validates its certificate, shows it on the Config screen
-  and in `soc-ai doctor`, and warns 30, 14 and 7 days before it expires. `PROXY_TRUSTED_IPS`
+  certificate. On the direct path, soc-ai validates its certificate and shows it on the Config
+  screen and in `soc-ai doctor`. It warns 30, 14 and 7 days before the certificate expires. `PROXY_TRUSTED_IPS`
   accepts CIDR blocks. See the [1.5.2 release notes](../releases/1.5.2.md).
 - **1.5.1**: The review release. A review of the full repository produced 61 fixes. Each fix has
   a test that failed before the fix. The changes are in the evidence gates, the Oracle redaction,
@@ -46,47 +46,64 @@ follows [Semantic Versioning](https://semver.org/) from 1.0 onward.
 - **1.2.7**: The lesser-model release. soc-ai adapts to the analyst backend behind the gateway
   by configuration and measurement, with no code change. Failed pipeline runs explain
   themselves.
-- **1.2.6**: About page (running version, repo/license links, sidebar version line) with an opt-in, off-by-default GitHub update check that follows the zero-egress discipline; Config page rebuilt master-detail (~36 screens → ~2) with settings search in-page and in the command palette, an Apply bar that names each staged change as a clickable chip, and identifier lists that filter, page, and bulk-edit.
-- **1.2.5**: Visual refresh of the alert workspace (design-token theming, a filter bar that morphs into bulk actions instead of shifting the table, toast notifications with a one-click clear, and freshness markers that flag a stalled poll), a code-review remediation across the 1.2.x line, and a batch of dogfood fixes. Also stops DNS-SD/SRV service records from polluting the auto-detected internal-domain inventory.
-- **1.2.4**: Dogfood patch: the Hunt Console says plainly when scheduled hunts are paused, the triage pipeline retries a transient grid blip instead of dropping the investigation, the nightly regression alarm no longer pages on one flipped verdict at small sample sizes, and the config console groups each integration's switch with its key.
-- **1.2.3**: Per-alert verdict inheritance now respects the configured inherit window (webui_inherit_window_days): the alerts feed no longer inherits a rule's stale standing verdict onto fresh alerts.
-- **1.2.2**: Security and correctness patch from a full code review of 1.2.1: evidence-gate integrity, oracle-redaction leak fixes, opt-in/bound auto-acknowledge, SSRF and denial-of-service caps, audit and auth hygiene, and supply-chain pinning.
-- **1.2.1**: Accuracy and honesty patch: pipeline errors now record *why* each
-  model retry failed (and the schema tolerates the stringified-JSON wobble that
-  caused most of them), hunts gained telemetry-first latitude (the corroboration
-  gate credits Zeek evidence found through broad queries, and generic sweeps no
-  longer re-triage the alert stream), plus a documentation refresh and the
-  public roadmap.
-- **1.2.0**: The dogfood release: a full analyst shift on the live deployment
-  produced fourteen findings, and this release fixed all of them — notifications,
-  entity search, a maintenance panel, pipeline-error visibility with one-click
-  dismiss, group acknowledge, deep re-run, and the verdict-quality eval now
-  schedulable straight from the dashboard.
-- **1.1.1**: Re-hunt and multi-select on the Hunts page, plus a delta-review
-  hardening pass.
-- **1.1.0**: The measurement release: nightly quality trend with a regression
-  alarm, highlighted redaction previews, and a real runbooks workspace so the
-  agent grounds verdicts in your own procedures.
-- **1.0.8**: Trust, workflow, and threat-hunting: fallback verdicts are labeled
-  as such, hunt findings must cite evidence, assignment states and keyboard
-  triage speed up the queue, and hunts gain scheduling.
-- **1.0.7**: Fixes from the first week of production triage: SO write-token
-  expiry, export auth, re-hunt caps, and CLI auth.
-- **1.0.6**: Retired the Tampermonkey userscript; soc-ai is now driven entirely from its web console (`/app`) and the Hunt Console.
-- **1.0.5**: Patch: the auto-triage scheduler now fires its first sweep on a
-  freshly-booted host (a monotonic-clock sentinel bug), plus Node 24-native CI
-  workflow actions.
-- **1.0.4**: Slow-stack resilience + detection: wall-clock timeouts on every long path
-  (hunts/investigations degrade gracefully to a partial verdict), a malware-label payload
-  gate, fast-path domain reputation, inventory-first hunts with correlation + lateral-movement
-  recipes, a first-run "not connected" banner, and a settled-verdict Acknowledge/Escalate bar.
-- **1.0.3**: Dogfood + detection + resilience release: dataset-agnostic grid discovery,
-  behavioral-summary detections (beaconing + DNS tunneling), a docs site, operator
-  runbooks, one-click "request more info" on any verdict, and a sweep of resilience /
-  performance / flow hardening.
-- **1.0.2**: Trust + reliability release: model reasoning visible on every investigation,
-  signed decision-record exports, benign synthetic eval scenarios (precision + true-negative
-  rate), and a resilient LLM gateway transport with retry/backoff.
-- **1.0.1**: The **Hunt Console** and a **backtest harness** land, alongside a full
-  correctness / security / performance review that hardened the engine.
-- **1.0.0**: First public release: the triage engine and the always-on web console.
+- **1.2.6**: An About page shows the running version, the repo and license links, and a
+  sidebar version line. Its GitHub update check is opt-in and off by default, so nothing
+  leaves the box. The Config page is now a master-detail screen. It went from about 36
+  screens to about 2. Settings search works on the page and in the command palette. An Apply
+  bar names each staged change as a clickable chip. The identifier lists filter, page and
+  bulk-edit.
+- **1.2.5**: A visual refresh of the alert workspace. It added design-token theming and a
+  filter bar that turns into bulk actions without shifting the table. It added toast
+  notifications with a one-click clear, and freshness markers that flag a stalled poll. The
+  release also holds a code-review remediation across the 1.2.x line and a batch of dogfood
+  fixes. DNS-SD and SRV service records no longer pollute the auto-detected internal-domain
+  inventory.
+- **1.2.4**: A dogfood patch. The Hunt Console says when scheduled hunts are paused. The
+  triage pipeline retries a transient grid error. Before, it dropped the investigation. The
+  nightly regression alarm no longer pages on one flipped verdict at a small sample size. The
+  config console groups the switch of each integration with its key.
+- **1.2.3**: Per-alert verdict inheritance now respects the inherit window,
+  `webui_inherit_window_days`. The alerts feed no longer puts the stale standing verdict of a
+  rule on fresh alerts.
+- **1.2.2**: A security and correctness patch from a full code review of 1.2.1. It covers
+  evidence-gate integrity, Oracle redaction leaks, an opt-in and bounded auto-acknowledge, SSRF
+  and denial-of-service caps, audit and auth hygiene, and supply-chain pinning.
+- **1.2.1**: An accuracy patch. A pipeline error now records why each model retry failed. The
+  schema accepts the stringified JSON that caused most of those failures. Hunts gained a
+  telemetry-first scope. The corroboration gate credits Zeek evidence from broad queries, and a
+  generic sweep no longer re-triages the alert stream. The release also refreshed the docs and
+  published the roadmap.
+- **1.2.0**: The dogfood release. A full analyst shift on the live deployment produced
+  fourteen findings, and this release fixed all of them. It added notifications, entity
+  search, a maintenance panel, and pipeline-error visibility with a one-click dismiss. It added
+  group acknowledge and a deep re-run. The dashboard can schedule the verdict-quality eval.
+- **1.1.1**: Re-hunt and multi-select on the Hunts page, and a hardening pass from a delta
+  review.
+- **1.1.0**: The measurement release. It added a nightly quality trend with a regression alarm
+  and highlighted redaction previews. It added a runbooks workspace, so the agent grounds
+  verdicts in your own procedures.
+- **1.0.8**: Trust, workflow and hunting. A fallback verdict carries a label. A hunt finding
+  must cite evidence. Assignment states and keyboard triage speed up the queue. Hunts gained a
+  schedule.
+- **1.0.7**: Fixes from the first week of production triage: SO write-token expiry, export
+  auth, re-hunt caps, and CLI auth.
+- **1.0.6**: The Tampermonkey userscript is retired. The console at `/app` and the Hunt
+  Console now drive all of soc-ai.
+- **1.0.5**: A patch. The auto-triage scheduler now fires its first sweep on a freshly booted
+  host. The cause was a monotonic-clock sentinel bug. The CI workflow actions now run natively
+  on Node 24.
+- **1.0.4**: Slow-stack resilience and detection. Every long path has a wall-clock timeout,
+  and a hunt or an investigation that hits it ends in a partial verdict. The release added a
+  malware-label payload gate and a fast-path domain reputation. It added inventory-first hunts
+  with correlation and lateral-movement recipes. It added a first-run "not connected" banner
+  and an Acknowledge and Escalate bar on a settled verdict.
+- **1.0.3**: Dogfood, detection and resilience. It added dataset-agnostic grid discovery, and
+  behavioral-summary detections for beaconing and DNS tunneling. It added a docs site,
+  operator runbooks, and a one-click "request more info" on any verdict. A sweep hardened
+  resilience, performance and flow.
+- **1.0.2**: Trust and reliability. The model reasoning is visible on every investigation.
+  Decision-record exports are signed. Benign synthetic eval scenarios measure the precision
+  and the true-negative rate. The gateway transport retries with backoff.
+- **1.0.1**: The Hunt Console and a backtest harness. A full review of correctness, security
+  and performance hardened the engine.
+- **1.0.0**: The first public release: the triage engine and the always-on console.

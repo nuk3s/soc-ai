@@ -12,6 +12,7 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from soc_ai.run_meter import RunMeter, SearchMeter
 from soc_ai.so_client.fields import detection_kind_of_alert_payload
 from soc_ai.store import investigations as inv_svc
 
@@ -104,6 +105,13 @@ class InvestigationRecorder:
         # at birth so the row says what it was about even if the run dies
         # before its first event.
         self._subject = subject
+        # What the run costs: read off the same events this recorder persists,
+        # so the counters on the row and the trail cannot disagree.
+        self._meter = RunMeter()
+
+    def attach_search_meter(self, meter: SearchMeter) -> None:
+        """Count the grid reads of the run this recorder tees (see run_meter)."""
+        self._meter.attach_search_meter(meter)
 
     async def start(self) -> str | None:
         try:
@@ -130,6 +138,7 @@ class InvestigationRecorder:
     async def record(self, kind: str, sequence: int, payload: dict[str, Any]) -> None:
         if self.investigation_id is None:
             return
+        self._meter.observe(kind, payload)
         self._buffer.append({"kind": kind, "sequence": sequence, "payload": payload})
         if kind in ("alert_context", "enriched_alert_context"):
             if self._rule_name is None:
@@ -223,6 +232,7 @@ class InvestigationRecorder:
                     rationale=_first_rationale(report) if report else None,
                     summary=report.get("summary"),
                     report=report or None,
+                    counters=self._meter.finish(),
                 )
         except Exception:
             _LOGGER.exception("investigation recorder finalize failed")

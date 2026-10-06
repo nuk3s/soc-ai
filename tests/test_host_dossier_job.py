@@ -49,8 +49,10 @@ from soc_ai.store.models import (
     HostMachine,
 )
 from soc_ai.tools._synth_scope import synth_scope_must_not
-from sqlalchemy import func, select, update
+from sqlalchemy import event, func, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
+
+from tests.es_doubles import composite_page
 
 _HYPERVISOR = "192.168.10.202"
 _LAPTOP = "192.168.10.77"
@@ -330,10 +332,11 @@ class _FakeES:
                 aggregations={"src": self._buckets(self.src), "dst": self._buckets(self.dst)},
             )
         if kind == "agent":
+            # The inventory pages a composite aggregation over host.name.
             return EsSearchResult(
                 total=sum(int(b["doc_count"]) for b in self.agents),
                 took_ms=2,
-                aggregations={"hosts": {"buckets": self.agents}},
+                aggregations={"hosts": composite_page((aggs or {})["hosts"], self.agents)},
             )
         if kind == "dns":
             return EsSearchResult(
@@ -2810,4 +2813,71 @@ async def test_nothing_is_expired_when_the_build_reports_an_error(
     async with maker() as db:
         old = await ep.load_profiles(db, entity_kind="host", entity_key="10.0.0.9")
     assert set(old) == {"served_ports"}
+    await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# The census record writes in batches
+# ---------------------------------------------------------------------------
+
+
+def _census_candidates(ips: list[str]) -> dict[str, Any]:
+    return {
+        ip: job._Candidate(ip=ip, events=n + 1, first_seen=_FIRST_SEEN, last_seen=_LAST_SEEN)
+        for n, ip in enumerate(ips)
+    }
+
+
+async def test_the_census_record_reads_the_table_once_per_chunk(
+    settings_kratos: Settings,
+) -> None:
+    """450 addresses cost three SELECTs, one per chunk, never one per address.
+
+    One upsert per address was most of the census record stage at 20,000
+    hosts.
+    """
+    ips = [f"{net}{n}" for net in ("192.0.2.", "198.51.100.") for n in range(1, 226)]
+    engine, maker = await _db(settings_kratos)
+    selects: list[str] = []
+
+    def _record(conn: Any, cursor: Any, statement: str, *args: Any) -> None:
+        if statement.lstrip().upper().startswith("SELECT"):
+            selects.append(statement)
+
+    summary = job.DossierSummary()
+    event.listen(engine.sync_engine, "before_cursor_execute", _record)
+    try:
+        await job._record_census(maker, _census_candidates(ips), summary)
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", _record)
+
+    assert len(selects) == 3, len(selects)
+    assert summary.errors == []
+    async with maker() as db:
+        by_ip = {row.ip: row for row in (await db.scalars(select(HostDossier))).all()}
+    assert len(by_ip) == 450
+    assert by_ip[ips[-1]].event_count == 450
+    assert by_ip[ips[0]].first_seen == _FIRST_SEEN.replace(tzinfo=None)
+    assert by_ip[ips[0]].last_seen == _LAST_SEEN.replace(tzinfo=None)
+    await engine.dispose()
+
+
+async def test_a_bad_census_address_costs_its_own_row_and_nothing_else(
+    settings_kratos: Settings,
+) -> None:
+    """The store refuses one address. The census records one error and writes the rest.
+
+    The batch refuses the whole chunk when one entry is bad. The census then
+    writes the chunk again one address at a time, as it did before the batch.
+    """
+    ips = ["192.0.2.1", "192.0.2.2", "not-an-address", "192.0.2.3"]
+    engine, maker = await _db(settings_kratos)
+    summary = job.DossierSummary()
+    await job._record_census(maker, _census_candidates(ips), summary)
+
+    assert len(summary.errors) == 1, summary.errors
+    assert summary.errors[0].startswith("census upsert not-an-address: ValueError")
+    async with maker() as db:
+        stored = sorted(row.ip for row in (await db.scalars(select(HostDossier))).all())
+    assert stored == ["192.0.2.1", "192.0.2.2", "192.0.2.3"]
     await engine.dispose()

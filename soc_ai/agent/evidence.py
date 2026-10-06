@@ -434,7 +434,11 @@ def _loop_evidence_marker(
 # a decode of a string the model INVENTED could otherwise satisfy the override
 # gate's "back a flip with ≥1 successful tool call" and flip a verdict class with
 # zero grid access. Same argument, same fix: the tool name is the contract.
-NON_EVIDENTIAL_TOOLS = frozenset({"t_host_dossier", "t_decode_payload"})
+#
+# `search_tools` is pydantic-ai's loader for a deferred tool (the standard budget
+# class, soc_ai.agent.budget). Its return is a list of tool names and
+# descriptions. It reads nothing about the alert, so it is never evidence.
+NON_EVIDENTIAL_TOOLS = frozenset({"t_host_dossier", "t_decode_payload", "search_tools"})
 
 
 # Keys on a tool result that are bookkeeping / classification flags, NOT gathered

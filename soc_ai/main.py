@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
 import json
 import logging
 import os
 import re
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -39,7 +40,7 @@ from soc_ai.api.webui_api import open_router as api_v1_open_router
 from soc_ai.api.webui_api import router as api_v1_router
 from soc_ai.audit.logger import AuditLogger
 from soc_ai.bootstrap_credential import bootstrap_credential_path
-from soc_ai.config import get_settings
+from soc_ai.config import SERVE_BIND_ENV, get_settings
 from soc_ai.hunting.window import sweep_window
 from soc_ai.so_client.auth import make_auth
 from soc_ai.so_client.elastic import ElasticClient
@@ -52,7 +53,7 @@ from soc_ai.store import investigations as inv_svc
 from soc_ai.store import leads as leads_store
 from soc_ai.store.auth import bootstrap_admin, purge_expired_sessions
 from soc_ai.store.config_overrides import apply_to_settings, load_overrides
-from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
+from soc_ai.store.db import describe_store, make_engine, make_sessionmaker, run_migrations
 from soc_ai.store.secret_box import make_secret_box
 from soc_ai.tools.enrichment import MispClient
 
@@ -179,6 +180,53 @@ async def _reaper_loop(db_sessionmaker: Any, settings: Any) -> None:
             raise
         except Exception:
             _LOGGER.exception("dashboard chat reaper iteration failed; continuing")
+
+
+def _is_loopback_host(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def auth_off_warning(settings: Any, environ: Mapping[str, str] | None = None) -> str | None:
+    """The start line for ``API_AUTH_REQUIRED=false``, or None when authentication is on.
+
+    The line states what the app knows, and nothing more. ``soc-ai serve``
+    writes its bind into :data:`SERVE_BIND_ENV` before it starts uvicorn, so on
+    that path the line names the real bind. Under a bare uvicorn command (the
+    systemd unit, the container image) the bind is a uvicorn argument the app
+    cannot see. The old line read ``SOC_AI_HOST`` there, which defaults to
+    127.0.0.1, and said "loopback bind 127.0.0.1" while the unit passed
+    ``--host 0.0.0.0`` and the port was open to the network (range dogfood,
+    2026-10-05). The network branch could never fire on the systemd path.
+    """
+    if settings.api_auth_required:
+        return None
+    env = os.environ if environ is None else environ
+    bind = (env.get(SERVE_BIND_ENV) or "").strip()
+    head = (
+        "API_AUTH_REQUIRED=false. Authentication is off. A caller that reaches the port "
+        "can use the admin routes with no login."
+    )
+    if not bind:
+        return (
+            f"{head} The bind is the server's. soc-ai cannot see it. Run `soc-ai doctor` "
+            "to list the addresses that listen on the port. Set API_AUTH_REQUIRED=true "
+            "for a shared deployment."
+        )
+    host = bind.rsplit(":", 1)[0].strip("[]")
+    if _is_loopback_host(host):
+        return (
+            f"{head} The server binds to {bind}. Only this host can reach it. Set "
+            "API_AUTH_REQUIRED=true before you open the port."
+        )
+    return (
+        f"{head} The server binds to {bind}. Other hosts can reach that address. Set "
+        "API_AUTH_REQUIRED=true for a shared deployment."
+    )
 
 
 def _discovery_due(last_scan_iso: str | None, interval_hours: int) -> bool:
@@ -316,9 +364,11 @@ async def _hunt_spec_sweep_loop(app: FastAPI) -> None:
             window.say_if_widened(_LOGGER)
             # The effective catalog, not the files alone: a retired analytic
             # must stop running and a local one in shadow must start, and both
-            # facts live in the database.
+            # facts live in the database. ``seed`` writes the shadow row of a
+            # shipped analytic that ships in shadow, so an approval has a row
+            # to move.
             async with app.state.db_sessionmaker() as db:
-                tiers = await effective_catalog(db)
+                tiers = await effective_catalog(db, seed=True)
             catalog = tiers.specs
             if not catalog:
                 continue
@@ -338,6 +388,9 @@ async def _hunt_spec_sweep_loop(app: FastAPI) -> None:
             # Stamped only after a completed sweep, so a crash mid-sweep retries
             # on the next wake rather than skipping a whole interval.
             last_run = now
+            # The hits this sweep wrote are in the store now. The hold reads
+            # them against each live analytic's budget.
+            await _run_self_heal(app, settings)
 
             if result.hunts or result.blind or result.errored or result.gaps_cleared:
                 _LOGGER.info(
@@ -368,6 +421,34 @@ async def _hunt_spec_sweep_loop(app: FastAPI) -> None:
             raise
         except Exception as exc:
             _LOGGER.warning("spec sweep loop: %s: %s", type(exc).__name__, exc)
+
+
+async def _run_self_heal(app: FastAPI, settings: Any) -> None:
+    """Run the self-healing hold after a completed sweep. Never raises.
+
+    Both sweep loops call it, so a deployment with only one loop on still
+    checks every live analytic. The check reads the store and writes only a
+    demotion. One run at a time: the two loops share a lock on ``app.state``,
+    so they cannot both read an analytic as live and both demote it.
+    """
+    if not getattr(settings, "analytic_self_heal_enabled", True):
+        return
+    from soc_ai.hunting.self_heal import run_self_heal  # noqa: PLC0415
+
+    lock = getattr(app.state, "self_heal_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        app.state.self_heal_lock = lock
+    try:
+        async with lock, app.state.db_sessionmaker() as db:
+            result = await run_self_heal(db)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        _LOGGER.warning("self-healing hold: %s: %s", type(exc).__name__, exc)
+        return
+    for analytic_id, why in result.skipped.items():
+        _LOGGER.info("self-healing hold: %s left as it is: %s", analytic_id, why)
 
 
 # The shortest interval the profile sweep will accept. A sweep makes no model
@@ -466,9 +547,18 @@ async def _refresh_profiles_if_stale(app: FastAPI, settings: Any, now: datetime)
     before = await profile_job.freshness(app.state.db_sessionmaker)
     age = _profile_age(before.newest_built_at, now)
     reason = _unmeasurable_reason(before.unmeasurable)
-    if not _profiles_are_stale(before.newest_built_at, now, _profile_stale_after(settings)):
+    # A release that changes the stored profile shape makes a build due at
+    # once, whatever the age of the rows. Without this, a live analytic that
+    # reads the new shape stays blind on every host until the age rule fires,
+    # most of a day after the upgrade (production and the range, 2026-10-05).
+    reshape = profile_job.shape_due(before)
+    if reshape is None and not _profiles_are_stale(
+        before.newest_built_at, now, _profile_stale_after(settings)
+    ):
         _LOGGER.info("prior sweep: profiles %s", age)
         return ProfileState(built_at=before.newest_built_at, stale=False, reason=reason)
+    if reshape:
+        _LOGGER.info("prior sweep: profiles %s; %s", age, reshape)
 
     status = _get_dossier_status(app.state)
     if status.running:
@@ -574,7 +664,7 @@ async def _prior_sweep_loop(app: FastAPI) -> None:
                 # The effective catalog, for the same reason the spec sweep
                 # reads it: a retired prior must stop running and a local one
                 # in shadow must start.
-                tiers = await effective_catalog(db)
+                tiers = await effective_catalog(db, seed=True)
                 sweep = await run_prior_sweep(
                     elastic=app.state.elastic,
                     settings=settings,
@@ -589,8 +679,9 @@ async def _prior_sweep_loop(app: FastAPI) -> None:
             # Stamped only after a sweep that returned, so a failure retries on
             # the next wake rather than skipping the whole interval.
             app.state.prior_sweep_last_run = now
+            await _run_self_heal(app, settings)
 
-            observations = sum(len(r.departures) for r in sweep.results)
+            observations = sum(len(r.departures) + len(r.hits) for r in sweep.results)
             leads = len(sweep.leads.formed) if sweep.leads is not None else 0
             blind = sweep.coverage_counts().get(COVERAGE_BLIND, 0)
             # Said every run, not only when something departed. A quiet sweep
@@ -1602,7 +1693,7 @@ async def _init_store(db_engine: Any, settings: Any, secret_box: Any = None) -> 
         _LOGGER.exception(
             "store migration failed — DB at %s is corrupt or newer than this build; "
             "back up/remove the file or upgrade soc-ai",
-            settings.soc_ai_data_dir / "soc-ai.db",
+            describe_store(settings),
         )
         await db_engine.dispose()
         raise
@@ -1632,6 +1723,18 @@ async def _init_store(db_engine: Any, settings: Any, secret_box: Any = None) -> 
             _LOGGER.info("seeded/refreshed %d builtin hunt template(s)", seeded)
     except Exception:
         _LOGGER.warning("builtin hunt-template seed failed; continuing", exc_info=True)
+
+    # A shipped analytic that ships in shadow gets its shadow row on the first
+    # catalog load. The catalog reads it as shadow without the row, so a seed
+    # failure costs the approval route its row and never runs the analytic
+    # live. Fail-soft for that reason.
+    try:
+        from soc_ai.hunting.catalog_tiers import effective_catalog  # noqa: PLC0415
+
+        async with db_sessionmaker() as db:
+            await effective_catalog(db, seed=True)
+    except Exception:
+        _LOGGER.warning("shipped shadow analytic seed failed; continuing", exc_info=True)
 
     # Demo mode: seed the sanitized recorded-run fixtures so the UI has
     # investigations/hunts/backtests to browse. Idempotent per row (restart-safe)
@@ -1718,23 +1821,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: PLR0915 — li
 
     # Loud warning when API auth is disabled — with auth off, require_admin_api is
     # a no-op, so secret mutation, user creation, and token minting are open to any
-    # caller that can reach the port. Acceptable for loopback-only dev; a real risk
-    # if the bind is non-loopback (the docker default is 0.0.0.0).
-    if not settings.api_auth_required:
-        _loopback = {"127.0.0.1", "::1", "localhost", ""}
-        if str(settings.soc_ai_host) not in _loopback:
-            _LOGGER.warning(
-                "API_AUTH_REQUIRED=false AND bind host is non-loopback (%s) — admin "
-                "endpoints (secret edit, user/token creation) are UNAUTHENTICATED and "
-                "reachable on the network. Set API_AUTH_REQUIRED=true for any shared deploy.",
-                settings.soc_ai_host,
-            )
-        else:
-            _LOGGER.warning(
-                "API_AUTH_REQUIRED=false — running unauthenticated (loopback bind %s). "
-                "Dev/lab only; set API_AUTH_REQUIRED=true before exposing the port.",
-                settings.soc_ai_host,
-            )
+    # caller that can reach the port. See auth_off_warning for what the line may
+    # claim about the bind.
+    auth_line = auth_off_warning(settings)
+    if auth_line is not None:
+        _LOGGER.warning("%s", auth_line)
 
     auth = make_auth(settings)
     elastic = ElasticClient(settings)
@@ -1789,6 +1880,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: PLR0915 — li
     eval_nightly_task = asyncio.create_task(_eval_nightly_loop(app, settings))
     spec_sweep_task = asyncio.create_task(_hunt_spec_sweep_loop(app))
     prior_sweep_task = asyncio.create_task(_prior_sweep_loop(app))
+    # The estate model: a daily fit beside the profile build, off by default.
+    from soc_ai.hunting.estate_model.schedule import estate_model_loop  # noqa: PLC0415
+
+    estate_model_task = asyncio.create_task(estate_model_loop(app))
     audit_verify_task = asyncio.create_task(_audit_verify_loop(app, settings))
     tls_expiry_task = asyncio.create_task(_tls_expiry_loop(app, settings))
     health_probe_task = asyncio.create_task(_health_probe_loop(app, settings))
@@ -1824,6 +1919,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: PLR0915 — li
         prior_sweep_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await prior_sweep_task
+        estate_model_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await estate_model_task
         health_probe_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await health_probe_task

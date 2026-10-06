@@ -433,9 +433,17 @@ function TemplatePicker({
   );
 }
 
-export function NewHuntDrawer({ onClose }: { onClose: () => void }) {
+export function NewHuntDrawer({
+  onClose,
+  initialObjective = '',
+}: {
+  onClose: () => void;
+  /** The objective the drawer opens with. The "Run this query" link of an
+   *  observation fills it with the query, and the analyst starts the hunt. */
+  initialObjective?: string;
+}) {
   const navigate = useNavigate();
-  const [objective, setObjective] = useState('');
+  const [objective, setObjective] = useState(initialObjective.slice(0, MAX_OBJECTIVE_CHARS));
   // The starter a chip picked, if any. Sent as `startHuntConsole`'s third
   // argument so the server can run the starter's analytics first. Cleared the
   // moment the analyst edits the text by hand: a hand-edited objective is no

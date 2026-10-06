@@ -7,6 +7,7 @@ import { NumberField, Select, Toggle } from '../components/Controls';
 import { ManagedList } from '../components/ManagedList';
 import { SectionTitle } from '../components/Panel';
 import { DemoDisabledState, ErrorState, LoadingState, Spinner } from '../components/States';
+import { DoctorList } from '../components/DoctorList';
 import { AgentToolsPanel } from './AgentToolsPanel';
 import { ApiKeysPanel } from './ApiKeysPanel';
 import { DataSourcesPanel } from './DataSourcesPanel';
@@ -2298,6 +2299,9 @@ export function Config() {
               </span>
             )}
           </div>
+          {/* Every doctor row. The Setup health card shows FAIL and WARN
+              only, and the INFO and PASS rows had no other surface. */}
+          <DoctorList />
         </div>
       </CollapsibleConfigSection>
   );

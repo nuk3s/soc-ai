@@ -58,10 +58,12 @@ if TYPE_CHECKING:
 __all__ = [
     "DEFAULT_SPAN_CAP",
     "HUB_LEAD_LIMIT",
+    "MAX_DOCUMENT_IDS",
     "SINGLE_SIGNAL_THRESHOLD",
     "LeadOutcome",
     "WeighedObservation",
     "content_fingerprint",
+    "decays_from",
     "form_leads",
     "purge_out_of_scope_observations",
     "record_observation",
@@ -238,6 +240,12 @@ async def record_observation(
     source: str = "profile",
     shadow: bool = False,
     weight: float | None = None,
+    observed_at: datetime | None = None,
+    statistic: str | None = None,
+    statistic_value: float | None = None,
+    baseline_value: float | None = None,
+    document_ids: Sequence[str] | None = None,
+    rerun_query: str | None = None,
 ) -> EntityObservation:
     """Write one observation, or refresh the existing one for the same content.
 
@@ -272,9 +280,29 @@ async def record_observation(
     The summary and the evidence are rewritten on every repeat. The wording
     changes between builds, and the row reads in today's words on the next
     sweep whether or not that sweep saw a new document.
+
+    ``observed_at`` is the newest document timestamp the observation cites.
+    ``born_at`` is the time soc-ai wrote the row, and an observation used to
+    decay from it: an event twenty hours old read as fresh on the sweep that
+    found it. The decay reads ``observed_at`` when the row has one (see
+    :func:`decays_from`). It is bounded by the record time, because a grid
+    clock ahead of soc-ai's would otherwise date an event in the future. A
+    fresh sighting moves it to the newer of the two event times. A fresh
+    sighting with no event time clears it, so the row decays from the new
+    record time and not from an older event. A re-read of the same documents
+    fills it on a row that has none.
+
+    ``statistic``, ``statistic_value`` and ``baseline_value`` are the numbers
+    the departure is made of. ``rerun_query`` is the OQL query that shows it
+    again. A repeat writes the newest of each, as it writes the summary.
+    ``document_ids`` are the documents the row cites, up to ten. With none
+    passed they are read from ``evidence``. A repeat keeps the newest first
+    and the older ones after them, so the first sighting stays citable.
     """
     at = (now or datetime.now(UTC)).replace(tzinfo=None)
     born = birth_weight(kind) if weight is None else float(weight)
+    event = _bounded_event_time(observed_at, at)
+    cited = _document_ids(evidence, document_ids)
 
     existing = (
         await db.execute(
@@ -296,6 +324,15 @@ async def record_observation(
             existing.born_at = at
             existing.occurrences = int(existing.occurrences or 0) + 1
             existing.read_at = None
+            existing.observed_at = (
+                None
+                if event is None
+                else max(event, existing.observed_at)
+                if existing.observed_at is not None
+                else event
+            )
+        elif existing.observed_at is None and event is not None:
+            existing.observed_at = event
         existing.birth_weight = born
         # The flag and the read mark answer two different questions. The flag
         # asks what the analytic is now. The read mark asks whether the analyst
@@ -310,6 +347,14 @@ async def record_observation(
             existing.summary = summary
         if evidence is not None:
             existing.evidence_json = evidence
+        if statistic is not None:
+            existing.statistic = statistic
+            existing.statistic_value = statistic_value
+            existing.baseline_value = baseline_value
+        if rerun_query is not None:
+            existing.rerun_query = rerun_query
+        if cited:
+            existing.document_ids = _merged_ids(cited, existing.document_ids)
         await db.commit()
         if flipped and lead_id:
             await resync_lead_shadow(db, lead_id)
@@ -324,15 +369,76 @@ async def record_observation(
         birth_weight=born,
         born_at=at,
         first_seen_at=at,
+        observed_at=event,
         occurrences=1,
         summary=summary,
         evidence_json=evidence,
         source=source,
         shadow=shadow,
+        statistic=statistic,
+        statistic_value=statistic_value,
+        baseline_value=baseline_value,
+        document_ids=cited or None,
+        rerun_query=rerun_query,
     )
     db.add(row)
     await db.commit()
     return row
+
+
+# How many document ids one observation keeps in its column.
+MAX_DOCUMENT_IDS = 10
+
+
+def _document_ids(evidence: Any, explicit: Sequence[str] | None) -> list[str]:
+    """The documents one sighting cites, in citation order, at most ten.
+
+    The anchor and the alert come first, because they are the documents the
+    row is about. The samples, the citations and the matched ids follow.
+    """
+    ordered: list[str] = []
+    if explicit is not None:
+        ordered.extend(str(i) for i in explicit if i)
+    elif isinstance(evidence, dict):
+        for key in ("anchor_id", "alert_id"):
+            if evidence.get(key):
+                ordered.append(str(evidence[key]))
+        for key in ("sample_ids", "citations", "matched_ids"):
+            ordered.extend(str(c) for c in (evidence.get(key) or []) if c)
+        receipts = evidence.get("receipts")
+        if isinstance(receipts, dict):
+            ordered.extend(str(c) for c in (receipts.get("matched_ids") or []) if c)
+    return _merged_ids(ordered, None)
+
+
+def _merged_ids(newest: Sequence[str], older: Any) -> list[str]:
+    """The newest ids first, then the older ones, without repeats, at most ten."""
+    out: list[str] = []
+    for one in (*newest, *(older if isinstance(older, list) else ())):
+        text = str(one)
+        if text and text not in out:
+            out.append(text)
+        if len(out) >= MAX_DOCUMENT_IDS:
+            break
+    return out
+
+
+def _bounded_event_time(observed_at: datetime | None, at: datetime) -> datetime | None:
+    """The event time as the store keeps it: naive UTC, never after *at*."""
+    if observed_at is None:
+        return None
+    if observed_at.tzinfo is not None:
+        observed_at = observed_at.astimezone(UTC).replace(tzinfo=None)
+    return min(observed_at, at)
+
+
+def decays_from(observed_at: datetime | None, born_at: datetime) -> datetime:
+    """The clock an observation decays on: the event time when the row has one.
+
+    ``born_at`` is the record time. Decaying from it made an event read as
+    fresh on the sweep that found it, however old the event was.
+    """
+    return observed_at if observed_at is not None else born_at
 
 
 async def resync_lead_shadow(db: AsyncSession, lead_id: int) -> bool:
@@ -399,7 +505,7 @@ async def weigh_entity(
     for row in rows:
         weight = live_weight(
             float(row.birth_weight or 0.0),
-            born_at=row.born_at,
+            born_at=decays_from(row.observed_at, row.born_at),
             count=int(row.occurrences or 1),
             now=at,
             half_life_hours=half_life_hours,
@@ -409,7 +515,7 @@ async def weigh_entity(
             continue
         stack = live_weight(
             float(row.birth_weight or 0.0),
-            born_at=row.born_at,
+            born_at=decays_from(row.observed_at, row.born_at),
             count=int(row.occurrences or 1),
             now=at,
             half_life_hours=half_life_hours,
@@ -743,7 +849,7 @@ async def _lead_shape(
         shadow = shadow or bool(row.shadow)
         weight = live_weight(
             float(row.birth_weight or 0.0),
-            born_at=row.born_at,
+            born_at=decays_from(row.observed_at, row.born_at),
             count=int(row.occurrences or 1),
             now=at,
             half_life_hours=half_life_hours,
@@ -753,6 +859,124 @@ async def _lead_shape(
             continue
         kinds.add(str(row.kind))
     return kinds, subjects, shadow
+
+
+# A condition is WHAT was noticed, across entities: the kind and the content
+# fingerprint. A profile fingerprint is the dimension and the member, so port
+# 4444 newly served on three hosts is one condition on three subjects.
+_Condition = tuple[str, str]
+
+
+def _counts_toward_span(source: str | None, kind: str, birth: float) -> bool:
+    """Whether an observation's condition can make a fleet condition.
+
+    Only a profile departure. A catalog fingerprint carries the entity and an
+    alert's is the alert id, so neither is shared across hosts. A promoted hunt
+    finding names its hosts on purpose. A finding-grade observation forms a
+    lead wherever it lands: the same finding on many hosts is an outbreak far
+    more often than a deployment, and a fleet status keeps the loop from
+    hunting it.
+    """
+    if (source or "profile") != "profile":
+        return False
+    try:
+        return not is_finding_grade(Kind(kind), birth)
+    except ValueError:
+        return False
+
+
+async def _condition_span(
+    db: AsyncSession,
+    conditions: set[_Condition],
+    *,
+    at: datetime,
+    half_life_hours: float,
+    floor: float,
+) -> int:
+    """The most subjects that hold one of these conditions live. 0 for none.
+
+    This is the span the cap reads. Counting the observations of the one
+    entity being weighed made the span 1 at every formation, so a fleet
+    condition was unreachable and one condition on N hosts formed N leads.
+    Only LIVE rows count: a sighting past the decay horizon is history.
+    """
+    if not conditions:
+        return 0
+    rows = (
+        (
+            await db.execute(
+                select(EntityObservation).where(
+                    EntityObservation.fingerprint.in_(sorted({fp for _k, fp in conditions}))
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    holders: dict[_Condition, set[tuple[str, str]]] = {}
+    for row in rows:
+        condition = (str(row.kind), str(row.fingerprint))
+        if condition not in conditions:
+            continue
+        if not _counts_toward_span(row.source, str(row.kind), float(row.birth_weight or 0.0)):
+            continue
+        weight = live_weight(
+            float(row.birth_weight or 0.0),
+            born_at=decays_from(row.observed_at, row.born_at),
+            count=int(row.occurrences or 1),
+            now=at,
+            half_life_hours=half_life_hours,
+            floor=floor,
+        )
+        if weight <= 0.0:
+            continue
+        holders.setdefault(condition, set()).add((row.entity_kind, row.entity_key))
+    return max((len(h) for h in holders.values()), default=0)
+
+
+def _conditions_of(observations: Sequence[WeighedObservation]) -> set[_Condition]:
+    """The span-bearing conditions among these weighed observations."""
+    return {
+        (o.kind.value, o.fingerprint)
+        for o in observations
+        if _counts_toward_span(o.source, o.kind.value, o.birth_weight)
+    }
+
+
+async def _lead_conditions(
+    db: AsyncSession,
+    lead_id: int,
+    *,
+    at: datetime,
+    half_life_hours: float,
+    floor: float,
+) -> set[_Condition]:
+    """The span-bearing conditions of the LIVE observations attached to a lead.
+
+    Read from every attached row, as :func:`_lead_shape` reads them, so a lead
+    about two entities is not re-measured from whichever the sweep reached last.
+    """
+    rows = (
+        (await db.execute(select(EntityObservation).where(EntityObservation.lead_id == lead_id)))
+        .scalars()
+        .all()
+    )
+    out: set[_Condition] = set()
+    for row in rows:
+        birth = float(row.birth_weight or 0.0)
+        if not _counts_toward_span(row.source, str(row.kind), birth):
+            continue
+        weight = live_weight(
+            birth,
+            born_at=decays_from(row.observed_at, row.born_at),
+            count=int(row.occurrences or 1),
+            now=at,
+            half_life_hours=half_life_hours,
+            floor=floor,
+        )
+        if weight > 0.0:
+            out.add((str(row.kind), str(row.fingerprint)))
+    return out
 
 
 async def _new_lead(
@@ -773,7 +997,8 @@ async def _new_lead(
     ``entities`` is what the lead NAMES: the entity the observations are about
     and the ones they mentioned. ``span`` counts only the first sort, because
     the span cap asks how many subjects share one condition and a hit that
-    names eight machines is one subject, not nine.
+    names eight machines is one subject, not nine. The caller counts the
+    subjects of the CONDITION, across entities (:func:`_condition_span`).
 
     The subject comes first in the list. It was sorted, so a host a hit merely
     mentioned could lead a lead about an account, and every surface reads the
@@ -823,6 +1048,10 @@ async def _extend_lead(
     unattached, and the strip showed a lead of two while the host held three.
 
     A merge always re-fires: the lead now holds an entity it did not hold.
+
+    The span is measured as at formation: the subjects that share one of the
+    lead's conditions, across entities. The status does not change here. A
+    lead that is open or hunting stays the analyst's and the loop's to settle.
     """
     previous_kinds = set(lead.kinds_json or [])
     previous_names = {tuple(e) for e in (lead.entities_json or []) if len(e) == 2}
@@ -835,7 +1064,13 @@ async def _extend_lead(
     # front of the account a lead was opened on.
     named = previous_names | {entity} | set(related)
     names = [*sorted(subjects & named), *sorted(named - subjects)]
-    span = len(subjects)
+    conditions = await _lead_conditions(
+        db, lead.id, at=at, half_life_hours=half_life_hours, floor=floor
+    )
+    span = max(
+        len(subjects),
+        await _condition_span(db, conditions, at=at, half_life_hours=half_life_hours, floor=floor),
+    )
     changed = (
         live_kinds != previous_kinds
         or set(names) != previous_names
@@ -939,7 +1174,20 @@ async def form_leads(
 
         if lead is None:
             # A new lead names this entity and the ones its observations
-            # mentioned. The span counts the subjects only. See _new_lead.
+            # mentioned. The span counts the subjects only, and it counts the
+            # subjects of each CONDITION across the estate. Counting this
+            # entity's own observations made the span 1 at every formation,
+            # and the fleet status unreachable. See _condition_span.
+            span = max(
+                len({(o.entity_kind, o.entity_key) for o in observations}),
+                await _condition_span(
+                    db,
+                    _conditions_of(observations),
+                    at=at,
+                    half_life_hours=half_life_hours,
+                    floor=floor,
+                ),
+            )
             new_lead = await _new_lead(
                 db,
                 observations,
@@ -947,7 +1195,7 @@ async def form_leads(
                 total=total,
                 kind_values=sorted(k.value for k in kinds),
                 entities=[entity, *sorted(set(related) - {entity})],
-                span=len({(o.entity_kind, o.entity_key) for o in observations}),
+                span=span,
                 span_cap=span_cap,
                 shadow=shadow or any_shadow,
                 single_signal=single_signal,

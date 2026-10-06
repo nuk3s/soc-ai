@@ -9,14 +9,21 @@ quiet host is exactly where a careful attacker lives.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import pytest
+from soc_ai.dossier.profile_math import HOURS_PER_WEEK
 from soc_ai.hunting.priors import (
     COVERAGE_BLIND,
+    COVERAGE_LEARNING,
     COVERAGE_MEASURED,
     COVERAGE_NOT_APPLICABLE,
     LINUX_EPHEMERAL_START,
     evaluate_prior,
+    known_members,
+    member_days,
     served_port_counts,
 )
 from soc_ai.hunting.spec import CATALOG_DIR, HuntSpec, load_catalog
@@ -100,6 +107,96 @@ def test_an_unknown_role_is_blind_not_a_free_pass() -> None:
     )
     assert result.coverage == COVERAGE_BLIND
     assert result.departures == ()
+
+
+# N2 of the 2026-10-05 verification. The blind notes reach the console as the
+# reason under the coverage count. They read "cannot apply role priors: role
+# unknown or below the confidence gate (0.50 < 0.90)" and "no connection_rate
+# profile has been built for this entity". The operator read the data model.
+_INTERNAL_WORDS = ("role priors", "confidence gate", "<", "_", "entity", "spec ", "profile block")
+
+
+def _plain(note: str) -> None:
+    for word in _INTERNAL_WORDS:
+        assert word not in note, (word, note)
+
+
+def test_the_role_gate_note_states_the_confidence_and_the_gate_in_words() -> None:
+    result = evaluate_prior(
+        _spec(roles=["network_device"]),
+        profile=_profile(),
+        observed={"445": _seen(4)},
+        role="network_device",
+        role_confidence=0.5,
+    )
+    assert result.note == (
+        "the role of this host is not known well enough. The confidence is 0.50 and the gate "
+        "is 0.90."
+    )
+    _plain(result.note)
+
+
+def test_the_unknown_role_note_states_a_confidence_of_zero() -> None:
+    result = evaluate_prior(
+        _spec(roles=["network_device"]),
+        profile=_profile(),
+        observed={"445": _seen(4)},
+        role=None,
+        role_confidence=None,
+    )
+    assert "The confidence is 0.00 and the gate is 0.90." in result.note
+    _plain(result.note)
+
+
+@pytest.mark.parametrize(
+    ("dimension", "words"),
+    [
+        ("connection_rate", "connection rate"),
+        ("active_hours", "active hours"),
+        ("served_ports", "served port"),
+        ("dns_names", "DNS name"),
+    ],
+)
+def test_the_no_baseline_note_names_the_dimension_in_words(dimension: str, words: str) -> None:
+    result = evaluate_prior(
+        _spec(dimension=dimension),
+        profile=None,
+        observed={"445": _seen(4)},
+        role=None,
+        role_confidence=None,
+    )
+    assert result.coverage == COVERAGE_BLIND
+    assert result.note == f"no {words} baseline exists for this host yet."
+    _plain(result.note)
+
+
+def test_the_unscorable_baseline_note_names_the_dimension_in_words() -> None:
+    result = evaluate_prior(
+        _spec(dimension="connection_rate"),
+        profile=_profile(coverage="stale", dimension="connection_rate"),
+        observed={"work": _seen(4)},
+        role=None,
+        role_confidence=None,
+    )
+    assert result.coverage == COVERAGE_BLIND
+    assert result.note == "the connection rate baseline of this host is stale."
+    _plain(result.note)
+
+
+def test_the_not_applicable_note_names_both_roles() -> None:
+    result = evaluate_prior(
+        _spec(roles=["domain_controller", "server"]),
+        profile=_profile(),
+        observed={"445": _seen(4)},
+        role="workstation",
+        role_confidence=0.9,
+    )
+    assert result.coverage == COVERAGE_NOT_APPLICABLE
+    assert result.note == (
+        "the analytic applies to the role domain controller or server. "
+        "This host has the role workstation."
+    )
+    _plain(result.note)
 
 
 def test_a_high_confidence_role_evaluates_normally() -> None:
@@ -435,147 +532,224 @@ def test_a_host_with_no_measured_active_hours_is_not_departing_from_nothing() ->
     assert result.departures == ()
 
 
-def test_a_rate_far_above_its_own_median_is_a_departure() -> None:
-    spec = _spec(dimension="connection_rate", test="above", threshold=3.0)
-    result = evaluate_prior(
-        spec,
-        profile=_rate_profile({"work": {"median": 40.0, "dispersion": 2.0, "samples": 200}}),
-        observed={"work": {"value": 400.0}},
+# The rate tests read an hourly series. Four weeks of it, from a Monday.
+_SERIES_START = datetime(2026, 8, 3, tzinfo=UTC)
+assert _SERIES_START.weekday() == 0
+
+
+def _series_profile(
+    count_at: Callable[[datetime], float], *, weeks: int = 4, **kw: Any
+) -> ProfileRow:
+    """A rate profile whose hourly series is ``count_at`` for every hour."""
+    counts = [count_at(_SERIES_START + timedelta(hours=n)) for n in range(weeks * HOURS_PER_WEEK)]
+    return _rate_profile(
+        {
+            "work": {"median": 100.0, "dispersion": 0.0, "samples": 200},
+            "hourly": {"start": _SERIES_START.isoformat(), "counts": counts},
+        },
+        **kw,
+    )
+
+
+def _recent(start: datetime, counts: list[float], **extra: Any) -> dict[str, Any]:
+    """Recent hours from ``start``, one entry per hour, keyed by its UTC start."""
+    return {
+        (start + timedelta(hours=n)).isoformat(): {
+            "count": c,
+            "sample_ids": [f"h{n}"],
+            **extra,
+        }
+        for n, c in enumerate(counts)
+    }
+
+
+def _flat(_at: datetime) -> float:
+    return 100.0
+
+
+def _monday_morning(at: datetime) -> float:
+    """1000 every Monday from 09:00 to 12:59 UTC, 100 at every other hour."""
+    return 1000.0 if at.weekday() == 0 and 9 <= at.hour < 13 else 100.0
+
+
+# The week after the series: a Monday, then a Wednesday.
+_MONDAY = _SERIES_START + timedelta(weeks=4)
+_WEDNESDAY = _MONDAY + timedelta(days=2)
+
+
+def _day(base: datetime, burst: dict[int, float], *, usual: float = 100.0) -> dict[str, Any]:
+    """24 recent hours from midnight of ``base``: ``usual`` an hour, or the burst."""
+    return _recent(base, [burst.get(h, usual) for h in range(24)])
+
+
+def _rate(test: str, profile: ProfileRow, observed: dict[str, Any], **kw: Any) -> Any:
+    return evaluate_prior(
+        _spec(dimension="connection_rate", test=test, threshold=3.0),
+        profile=profile,
+        observed=observed,
         role="server",
         role_confidence=0.9,
+        **kw,
     )
-    assert [d.member for d in result.departures] == ["work"]
 
 
-def test_a_rate_departure_carries_the_numbers_behind_it() -> None:
-    """The observation said one median and the host page said another.
-
-    The summary read "far above" over a median of its own, while the profile
-    panel showed the baseline median for the same cell. Two numbers for one
-    thing, and neither said how far apart they were.
-    """
-    spec = _spec(dimension="connection_rate", test="above", threshold=3.0)
-    result = evaluate_prior(
-        spec,
-        profile=_rate_profile({"work": {"median": 40.0, "dispersion": 2.0, "samples": 200}}),
-        observed={"work": {"value": 400.0}},
-        role="server",
-        role_confidence=0.9,
+def test_a_four_hour_burst_on_a_flat_host_departs() -> None:
+    """The recent median of 24 hours did not move for a burst of four. Each
+    hour is tested now, against the expected count of its hour of the week,
+    with a dispersion of at least the square root of that count."""
+    result = _rate(
+        "above",
+        _series_profile(_flat),
+        _day(_WEDNESDAY, {14: 1000.0, 15: 1000.0, 16: 1000.0, 17: 1000.0}),
     )
-    departure = result.departures[0]
-    assert departure.observed_value == 400.0
-    assert departure.baseline_median == 40.0
+    (departure,) = result.departures
+    assert departure.member == "work"
+    assert departure.run_hours == 4
+    assert departure.observed_value == 1000.0
+    assert departure.baseline_median == 100.0
     assert departure.ratio == 10.0
-    assert "400 per hour" in result.note
-    assert "The median is 40 per hour" in result.note
-    assert "10.0 times the median" in result.note
+    assert departure.statistic == "residual_z"
+    # A flat host has a pooled MAD of zero. The floor is the square root of
+    # the expected count: (1000 - 100) / 10.
+    assert departure.statistic_value == 90.0
+    assert departure.run_start == _WEDNESDAY + timedelta(hours=14)
+    assert departure.run_end == _WEDNESDAY + timedelta(hours=18)
+    assert departure.peak_label == "Wednesday 14:00"
+    assert departure.sample_ids == ("h14", "h15", "h16", "h17")
+    assert "on Wednesday 14:00 is 1000 per hour" in result.note
+    assert "The baseline expects 100 per hour at that hour of the week" in result.note
+    assert "The departure lasted 4 hours" in result.note
+
+
+def test_the_same_burst_on_a_host_whose_monday_morning_is_like_that_does_not() -> None:
+    """Negative control: the same four hours of 1000, on the Monday morning
+    this host always spends at 1000. The expected count of that hour of the
+    week is 1000, and nothing departed."""
+    burst = {9: 1000.0, 10: 1000.0, 11: 1000.0, 12: 1000.0}
+    profile = _series_profile(_monday_morning)
+    assert _rate("above", profile, _day(_MONDAY, burst)).departures == ()
+    # The same burst on the Wednesday is a departure for the same host.
+    assert _rate("above", profile, _day(_WEDNESDAY, burst)).departures != ()
+
+
+def test_the_hour_of_the_week_is_named_in_the_deployment_zone() -> None:
+    """A burst from 20:00 to 23:59 UTC on a Wednesday starts at 16:00 in New
+    York, inside working hours there. The cell and the label are local."""
+    burst = {20: 1000.0, 21: 1000.0, 22: 1000.0, 23: 1000.0}
+    profile = _series_profile(_flat)
+    local = _rate("above", profile, _day(_WEDNESDAY, burst), tz="America/New_York")
+    utc = _rate("above", profile, _day(_WEDNESDAY, burst), tz="UTC")
+    assert [(d.member, d.peak_label) for d in local.departures] == [("work", "Wednesday 16:00")]
+    assert [(d.member, d.peak_label) for d in utc.departures] == [("off", "Wednesday 20:00")]
+
+
+def test_one_hour_just_over_the_bar_needs_a_second_hour() -> None:
+    """A run of two hours, or one hour twice as far out. One odd hour at
+    the bar stays quiet."""
+    profile = _series_profile(lambda _at: 1.0)
+    one = _rate("above", profile, _day(_WEDNESDAY, {14: 4.0}, usual=1.0))
+    two = _rate("above", profile, _day(_WEDNESDAY, {14: 4.0, 15: 4.0}, usual=1.0))
+    far = _rate("above", profile, _day(_WEDNESDAY, {14: 40.0}, usual=1.0))
+    # z of 3 and four times the expected count: over the bar, but alone.
+    assert one.departures == ()
+    assert [d.run_hours for d in two.departures] == [2]
+    assert [d.run_hours for d in far.departures] == [1]
 
 
 def test_a_small_move_against_a_tight_baseline_is_not_far_above() -> None:
-    """13 % is not "far above", whatever the dispersion says.
-
-    The range read 2446 per hour against a median of 2216 as a departure,
-    because the cell's samples sat close together and the robust z was 7.8. A
-    distance in dispersions is not a distance an analyst can read, so the ratio
-    must clear the spec's threshold as well.
-    """
-    spec = _spec(dimension="connection_rate", test="above", threshold=3.0)
-    result = evaluate_prior(
-        spec,
-        profile=_rate_profile({"work": {"median": 2216.0, "dispersion": 20.0, "samples": 200}}),
-        observed={"work": {"value": 2446.0}},
-        role="server",
-        role_confidence=0.9,
-    )
-    assert result.coverage == COVERAGE_MEASURED
-    assert result.departures == ()
+    """13 % is not "far above", whatever the dispersion says. The range read
+    2446 per hour against 2216 as a departure. The count must also clear the
+    threshold as a multiple of the expected count."""
+    profile = _series_profile(lambda _at: 2216.0)
+    observed = _recent(_WEDNESDAY, [2446.0] * 24)
+    assert _rate("above", profile, observed).departures == ()
+    assert _rate("below", profile, _recent(_WEDNESDAY, [1900.0] * 24)).departures == ()
 
 
-def test_a_small_drop_against_a_tight_baseline_is_not_far_below() -> None:
-    spec = _spec(dimension="connection_rate", test="below", threshold=3.0)
-    result = evaluate_prior(
-        spec,
-        profile=_rate_profile({"work": {"median": 2216.0, "dispersion": 20.0, "samples": 200}}),
-        observed={"work": {"value": 1900.0}},
-        role="server",
-        role_confidence=0.9,
-    )
-    assert result.departures == ()
+def test_an_hour_with_no_count_and_no_spread_is_unmeasurable() -> None:
+    """An hour of the week the host never used, on a host whose hours never
+    vary: the expected count is zero and the pooled MAD is zero. The hour
+    cannot say how surprising a count is. It is unmeasurable, never a
+    departure."""
+
+    def office(at: datetime) -> float:
+        return 100.0 if 8 <= at.hour < 18 else 0.0
+
+    profile = _series_profile(office)
+    night_burst = {h: office(_WEDNESDAY + timedelta(hours=h)) for h in range(24)}
+    night_burst.update({2: 500.0, 3: 500.0, 4: 500.0})
+    night = _rate("above", profile, _recent(_WEDNESDAY, [night_burst[h] for h in range(24)]))
+    assert night.coverage == COVERAGE_MEASURED
+    assert night.departures == ()
+    # The same hours on a host whose counts vary have a dispersion to read.
+    varied = _series_profile(lambda at: office(at) + at.day % 3)
+    departures = _rate(
+        "above", varied, _recent(_WEDNESDAY, [night_burst[h] for h in range(24)])
+    ).departures
+    assert [(d.member, d.run_hours) for d in departures] == [("off", 3)]
 
 
-def test_a_median_of_zero_cannot_produce_a_ratio_or_a_departure() -> None:
-    # Nothing is a multiple of zero. A departure that cannot say how far it
-    # travelled is not one an analyst can read.
-    spec = _spec(dimension="connection_rate", test="above", threshold=3.0)
-    result = evaluate_prior(
-        spec,
-        profile=_rate_profile({"work": {"median": 0.0, "dispersion": 2.0, "samples": 200}}),
-        observed={"work": {"value": 400.0}},
-        role="server",
-        role_confidence=0.9,
-    )
-    assert result.departures == ()
-
-
-def test_a_rate_far_below_its_own_median_is_a_departure() -> None:
-    # A backup that stops is as interesting as one that doubles. The clean
-    # state must not be the attacker's goal state.
-    spec = _spec(dimension="connection_rate", test="below", threshold=3.0)
-    result = evaluate_prior(
-        spec,
-        profile=_rate_profile({"work": {"median": 40.0, "dispersion": 2.0, "samples": 200}}),
-        observed={"work": {"value": 0.0}},
-        role="server",
-        role_confidence=0.9,
-    )
-    assert [d.member for d in result.departures] == ["work"]
+def test_a_host_that_stops_departs_below() -> None:
+    """A backup that stops is as interesting as one that doubles."""
+    result = _rate("below", _series_profile(_flat), _day(_WEDNESDAY, {10: 0.0, 11: 0.0, 12: 0.0}))
+    (departure,) = result.departures
+    assert departure.member == "work"
+    assert departure.run_hours == 3
+    assert departure.observed_value == 0.0
+    assert departure.ratio == 0.0
+    assert departure.statistic_value == -10.0
 
 
 def test_above_does_not_fire_on_a_drop_and_below_does_not_fire_on_a_spike() -> None:
-    # The z is signed; reading its absolute value would make the two tests
-    # identical and 'below' would stop meaning anything.
-    high = {"work": {"value": 400.0}}
-    low = {"work": {"value": 0.0}}
-    cells = _rate_profile({"work": {"median": 40.0, "dispersion": 2.0, "samples": 200}})
-    kw = dict(role="server", role_confidence=0.9)
-    assert (
-        evaluate_prior(
-            _spec(dimension="connection_rate", test="above"), profile=cells, observed=low, **kw
-        ).departures
-        == ()
-    )
-    assert (
-        evaluate_prior(
-            _spec(dimension="connection_rate", test="below"), profile=cells, observed=high, **kw
-        ).departures
-        == ()
-    )
+    profile = _series_profile(_flat)
+    high = _day(_WEDNESDAY, {14: 1000.0, 15: 1000.0})
+    low = _day(_WEDNESDAY, {14: 0.0, 15: 0.0})
+    assert _rate("above", profile, low).departures == ()
+    assert _rate("below", profile, high).departures == ()
 
 
-def test_a_cell_with_no_dispersion_cannot_produce_a_departure() -> None:
-    # robust_z returns None there. Treating None as "very far from the median"
-    # makes every cell whose samples happen to be identical fire on anything.
-    spec = _spec(dimension="connection_rate", test="above")
-    result = evaluate_prior(
-        spec,
-        profile=_rate_profile({"work": {"median": 40.0, "dispersion": 0.0, "samples": 200}}),
-        observed={"work": {"value": 4000.0}},
-        role="server",
-        role_confidence=0.9,
+def test_a_rate_baseline_with_no_hourly_series_is_blind_until_the_next_build() -> None:
+    """A baseline built before the hourly series holds the three cells only.
+    The prior says so. It does not fall back to a median it no longer
+    trusts, and it does not read as clean."""
+    result = _rate(
+        "above",
+        _rate_profile({"work": {"median": 40.0, "dispersion": 2.0, "samples": 200}}),
+        _day(_WEDNESDAY, {14: 1000.0, 15: 1000.0}),
     )
+    assert result.coverage == COVERAGE_BLIND
+    assert "no hourly series yet" in result.note
+
+
+def test_a_host_with_no_history_stays_learning() -> None:
+    result = _rate(
+        "above",
+        _series_profile(_flat, weeks=1, coverage="learning", support_days=3),
+        _day(_WEDNESDAY, {14: 1000.0, 15: 1000.0}),
+    )
+    assert result.coverage == COVERAGE_LEARNING
     assert result.departures == ()
 
 
-def test_a_cell_the_profile_never_measured_cannot_produce_a_departure() -> None:
-    spec = _spec(dimension="connection_rate", test="above")
-    result = evaluate_prior(
-        spec,
-        profile=_rate_profile({"work": {"median": None, "dispersion": None, "samples": 0}}),
-        observed={"work": {"value": 4000.0}},
-        role="server",
-        role_confidence=0.9,
-    )
-    assert result.departures == ()
+def test_a_window_an_investigation_confirmed_stays_out_of_the_rate_baseline() -> None:
+    """The baseline learnt a burst on the Wednesday of week two. That window
+    was an attack. Left in, the next Wednesday burst reads as half usual."""
+
+    def poisoned(at: datetime) -> float:
+        return 1000.0 if at.weekday() == 2 and 14 <= at.hour < 18 and at.day in (12, 19) else 100.0
+
+    profile = _series_profile(poisoned)
+    burst = _day(_WEDNESDAY, {14: 1000.0, 15: 1000.0, 16: 1000.0, 17: 1000.0})
+    windows = [
+        (datetime(2026, 8, 12, 13, tzinfo=UTC), datetime(2026, 8, 12, 19, tzinfo=UTC)),
+        (datetime(2026, 8, 19, 13, tzinfo=UTC), datetime(2026, 8, 19, 19, tzinfo=UTC)),
+    ]
+    # With the attack in the baseline, two of four Wednesdays held the burst
+    # and the expected count sits between them.
+    learnt = _rate("above", profile, burst)
+    clean = _rate("above", profile, burst, exclude=windows)
+    assert learnt.departures == ()
+    assert [d.run_hours for d in clean.departures] == [4]
 
 
 # ---------------------------------------------------------------------------
@@ -678,18 +852,6 @@ def test_an_hour_departure_carries_the_documents_seen_in_that_hour() -> None:
         role_confidence=0.9,
     )
     assert result.departures[0].sample_ids == ("h1", "h2")
-
-
-def test_a_rate_departure_carries_the_documents_of_its_cell() -> None:
-    spec = _spec(dimension="connection_rate", test="above", threshold=3.0)
-    result = evaluate_prior(
-        spec,
-        profile=_rate_profile({"work": {"median": 40.0, "dispersion": 2.0, "samples": 200}}),
-        observed={"work": {"value": 400.0, "sample_ids": ["r1", "r2", "r3"]}},
-        role="server",
-        role_confidence=0.9,
-    )
-    assert result.departures[0].sample_ids == ("r1", "r2", "r3")
 
 
 # ---------------------------------------------------------------------------
@@ -810,3 +972,230 @@ def test_one_document_reads_in_the_singular() -> None:
         window_hours=24,
     )
     assert "1 document in the last 24 h" in result.note
+
+
+# ---------------------------------------------------------------------------
+# Member patterns: a prior that names the members it is about
+# ---------------------------------------------------------------------------
+
+_REMOTE_TOOLING_ID = "prior-workstation-remote-execution-tooling"
+
+
+def _remote_tooling_members(observed: dict[str, Any]) -> list[str]:
+    """The members the shipped remote-tooling prior fires on, for a measured
+    workstation whose process baseline holds two ordinary names."""
+    spec = load_catalog(CATALOG_DIR)[_REMOTE_TOOLING_ID]
+    result = evaluate_prior(
+        spec,
+        profile=_profile(
+            dimension="process_names",
+            vector={"explorer.exe": {"count": 50}, "svchost.exe": {"count": 50}},
+        ),
+        observed=observed,
+        role="workstation",
+        role_confidence=0.95,
+    )
+    assert result.coverage == COVERAGE_MEASURED
+    return [d.member for d in result.departures]
+
+
+def test_remote_tooling_prior_ignores_updater_names() -> None:
+    """Negative control: the range wrote five observations in three days, all
+    Edge and Defender updater names. Each is a new process name, so a prior
+    that reads any new name fires on every update. These are the shapes the
+    range saw, each seen often enough to pass the recurrence floor."""
+    updaters = {
+        "MicrosoftEdgeUpdate.exe": {"count": 6},
+        "MicrosoftEdgeUpdateSetup_X86_1.3.275.13.exe": {"count": 4},
+        "MicrosoftEdge_X64_154.0.4258.53_154.0.4258.48.exe": {"count": 3},
+        "mpam-d_bd_1.459.428.0.exe": {"count": 5},
+        "AM_Delta_Patch_1.459.498.0.exe": {"count": 3},
+    }
+    assert _remote_tooling_members(updaters) == []
+
+
+def test_remote_tooling_prior_fires_on_the_psexec_service() -> None:
+    """The positive: the PsExec service on the target is remote execution, in
+    the case the sensor writes it. An updater beside it still does not fire."""
+    members = _remote_tooling_members(
+        {
+            "PSEXESVC.exe": {"count": 2},
+            "MicrosoftEdgeUpdate.exe": {"count": 6},
+        }
+    )
+    assert members == ["PSEXESVC.exe"]
+
+
+def test_remote_tooling_prior_names_its_tools() -> None:
+    """Each tool the description names is in the list: PsExec on both ends,
+    WMIC, the WinRM shell, and the PowerShell remoting host."""
+    for name in (
+        "psexesvc.exe",
+        "PsExec.exe",
+        "PsExec64.exe",
+        "WMIC.exe",
+        "winrs.exe",
+        "winrshost.exe",
+        "wsmprovhost.exe",
+    ):
+        assert _remote_tooling_members({name: {"count": 2}}) == [name], name
+
+
+def test_member_patterns_read_the_base_name_of_a_path() -> None:
+    """A plane that writes the image path still matches on the file name."""
+    spec = _spec(dimension="process_names", member_patterns=["psexesvc*.exe"])
+    result = evaluate_prior(
+        spec,
+        profile=_profile(dimension="process_names", vector={"explorer.exe": {"count": 9}}),
+        observed={
+            "C:\\Windows\\PSEXESVC.exe": {"count": 2},
+            "/opt/psexesvc.exe.bak": {"count": 2},
+        },
+        role=None,
+        role_confidence=None,
+    )
+    assert [d.member for d in result.departures] == ["C:\\Windows\\PSEXESVC.exe"]
+
+
+def test_a_prior_without_member_patterns_still_reads_every_member() -> None:
+    """The list is opt-in. A prior that declares none keeps reading any new
+    member, so the port priors do not go quiet."""
+    result = evaluate_prior(
+        _spec(),
+        profile=_profile(),
+        observed={"4444": _seen(3), "8443": _seen(3)},
+        role=None,
+        role_confidence=None,
+    )
+    assert sorted(d.member for d in result.departures) == ["4444", "8443"]
+
+
+def test_member_patterns_belong_to_the_novelty_test_only() -> None:
+    """A list on an hour or rate test would be ignored, and an ignored list
+    reads like a narrowed prior. The spec refuses it, and an empty pattern."""
+    import pytest
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="member_patterns"):
+        _spec(dimension="active_hours", test="outside_active_hours", member_patterns=["1*"])
+    with pytest.raises(ValidationError, match="member_patterns"):
+        _spec(dimension="process_names", member_patterns=["  "])
+
+
+# ---------------------------------------------------------------------------
+# Baseline hygiene: known after two days, and never from a confirmed attack
+# ---------------------------------------------------------------------------
+
+
+def _logon(first: str, last: str, count: int = 3) -> dict[str, Any]:
+    return {"count": count, "first_seen": first, "last_seen": last}
+
+
+_LOGONS = {
+    # Seen through the whole window: a real user of this host.
+    "administrator": _logon("2026-08-01T08:00:00Z", "2026-08-30T17:00:00Z", 900),
+    # Seen once, twenty days before the sweep, inside one hour.
+    "svc_legacy": _logon("2026-08-10T02:00:00Z", "2026-08-10T02:40:00Z", 2),
+}
+
+
+def _logon_prior(**kw: Any) -> Any:
+    return _spec(dimension="logon_users", test="novel_for", **kw)
+
+
+def test_a_member_the_baseline_saw_on_one_day_is_still_new() -> None:
+    """One sighting a month ago made a member known for good. The range DC
+    logon set held the three accounts the attack created, and their next
+    logon read as ordinary."""
+    result = evaluate_prior(
+        _logon_prior(),
+        profile=_profile(vector=_LOGONS, dimension="logon_users"),
+        observed={"svc_legacy": _seen(4), "administrator": _seen(40)},
+        role="domain_controller",
+        role_confidence=1.0,
+    )
+    assert [d.member for d in result.departures] == ["svc_legacy"]
+
+
+def test_the_known_bar_is_declarable_per_prior() -> None:
+    """Negative control: at one day the old rule holds, and nothing departs."""
+    result = evaluate_prior(
+        _logon_prior(min_known_days=1),
+        profile=_profile(vector=_LOGONS, dimension="logon_users"),
+        observed={"svc_legacy": _seen(4)},
+        role="domain_controller",
+        role_confidence=1.0,
+    )
+    assert result.departures == ()
+
+
+def test_a_member_with_no_dates_stays_known() -> None:
+    """A set from an older build states no dates. Its members stay known, so
+    an upgrade does not make every member new at once."""
+    result = evaluate_prior(
+        _spec(),
+        profile=_profile(vector={"22": {"count": 40}}),
+        observed={"22": _seen(6)},
+        role="network_device",
+        role_confidence=1.0,
+    )
+    assert result.departures == ()
+    assert member_days({"count": 40}) is None
+    assert member_days({"days": 3}) == 3
+    assert member_days(_LOGONS["svc_legacy"]) == 1
+
+
+def test_a_member_first_seen_inside_a_confirmed_attack_is_not_known() -> None:
+    """The account entered the set during an attack an investigation confirmed.
+    Seen on two days, it still is not what this host does."""
+    vector = {
+        **_LOGONS,
+        "domainadmin": _logon("2026-08-10T02:10:00Z", "2026-08-11T03:00:00Z"),
+    }
+    window = [(datetime(2026, 8, 9, tzinfo=UTC), datetime(2026, 8, 12, tzinfo=UTC))]
+    kw = dict(role="domain_controller", role_confidence=1.0)
+    clean = evaluate_prior(
+        _logon_prior(),
+        profile=_profile(vector=vector, dimension="logon_users"),
+        observed={"domainadmin": _seen(4), "administrator": _seen(40)},
+        exclude=window,
+        **kw,
+    )
+    learnt = evaluate_prior(
+        _logon_prior(),
+        profile=_profile(vector=vector, dimension="logon_users"),
+        observed={"domainadmin": _seen(4), "administrator": _seen(40)},
+        **kw,
+    )
+    assert [d.member for d in clean.departures] == ["domainadmin"]
+    assert learnt.departures == ()
+    assert known_members(vector, exclude=window) == {"administrator"}
+
+
+def test_a_peer_test_reads_member_patterns_and_bounds_its_group() -> None:
+    """The peer test reads names like the novelty test. A peer group of one
+    is no group, and a share above one is no share."""
+    import pytest
+    from pydantic import ValidationError
+
+    spec = _spec(dimension="process_names", test="rare_for_peers", member_patterns=["psexe*"])
+    assert spec.profile is not None and spec.profile.reads_member("PSEXESVC.exe")
+    assert spec.profile.min_peers == 5 and spec.profile.max_peer_share == 0.0
+    with pytest.raises(ValidationError, match="min_peers"):
+        _spec(test="rare_for_peers", min_peers=1)
+    with pytest.raises(ValidationError, match="max_peer_share"):
+        _spec(test="rare_for_peers", max_peer_share=1.5)
+
+
+def test_a_peer_test_without_a_peer_group_is_blind() -> None:
+    """No confident role, no group. The test never reads a member as rare
+    against peers it could not read."""
+    result = evaluate_prior(
+        _spec(test="rare_for_peers"),
+        profile=_profile(),
+        observed={"4444": _seen(6)},
+        role=None,
+        role_confidence=None,
+    )
+    assert result.coverage == COVERAGE_BLIND
+    assert result.note.startswith("no peer group:")

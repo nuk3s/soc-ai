@@ -31,6 +31,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import pytest
+from soc_ai.dossier import observe
 from soc_ai.dossier.observe import (
     collect_agent_inventory,
     collect_dns_names,
@@ -47,6 +48,8 @@ from soc_ai.so_client import fields, inventory
 from soc_ai.so_client.elastic import EsSearchResult
 from soc_ai.tools._synth_scope import synth_scope_must_not
 from soc_ai.tools.host_summary import _base_host_query
+
+from tests.es_doubles import composite_page, terms_answer
 
 _IP = "192.168.10.202"
 _INDEX = "logs-*"
@@ -243,6 +246,7 @@ class _FakeES:
         inventory_error: bool = False,
         agent_buckets: list[dict[str, Any]] | None = None,
         agent_error: bool = False,
+        agent_fail_page: int | None = None,
         dns_buckets: list[dict[str, Any]] | None = None,
         dns_error: bool = False,
         dns_other: int = 0,
@@ -258,6 +262,10 @@ class _FakeES:
         self.inventory_error = inventory_error
         self.agent_buckets = list(agent_buckets or [])
         self.agent_error = agent_error
+        # The 1-based agent page that fails. Every agent request body lands in
+        # `agent_pages`, so a test reads how many pages the inventory asked for.
+        self.agent_fail_page = agent_fail_page
+        self.agent_pages: list[dict[str, Any]] = []
         self.dns_buckets = list(dns_buckets or [])
         self.dns_error = dns_error
         # `sum_other_doc_count` on the name terms agg: ES's only signal that
@@ -328,7 +336,18 @@ class _FakeES:
         if kind == "agent":
             if self.agent_error:
                 raise RuntimeError("circuit_breaking_exception on host.name terms")
-            return _result(total=999, aggregations={"hosts": {"buckets": self.agent_buckets}})
+            # The inventory pages a composite aggregation over host.name. A
+            # terms read gets what Elasticsearch gives it: the busiest `size`.
+            body = (aggs or {})["hosts"]
+            page = (
+                composite_page(body, self.agent_buckets)
+                if "composite" in body
+                else terms_answer(body, self.agent_buckets)
+            )
+            self.agent_pages.append(body)
+            if self.agent_fail_page is not None and len(self.agent_pages) == self.agent_fail_page:
+                raise RuntimeError("search_phase_execution_exception on a later page")
+            return _result(total=999, aggregations={"hosts": page})
         if kind == "dns":
             if self.dns_error:
                 raise RuntimeError("circuit_breaking_exception on dns.query.name terms")
@@ -1281,7 +1300,9 @@ async def test_the_agent_inventory_is_one_aggregation_for_the_whole_network() ->
     assert call["size"] == 0, "an aggregation pass must pull no documents"
     assert call["index"] == _INDEX
     hosts = call["aggs"]["hosts"]
-    assert hosts["terms"]["field"] == "host.name"
+    # A composite page over host.name. A network under one page is one search.
+    assert hosts["composite"]["sources"] == [{"key": {"terms": {"field": "host.name"}}}]
+    assert "after" not in hosts["composite"]
     assert hosts["aggs"]["ips"]["terms"]["field"] == "host.ip"
     # Size 1, newest-first: the freshest self-report, as one coherent document.
     assert hosts["aggs"]["latest"]["top_hits"]["size"] == 1
@@ -1471,6 +1492,86 @@ async def test_an_agent_inventory_failure_is_recorded_not_raised() -> None:
 
     assert inventory_.hosts == ()
     assert any("circuit_breaking_exception" in e for e in inventory_.errors)
+
+
+def _fleet(count: int) -> list[dict[str, Any]]:
+    """``count`` agents with one address each and the same document count.
+
+    The same count makes a terms read keep the first 500 names in key order,
+    so the agents it drops are the ones that sort last.
+    """
+    return [
+        _agent_bucket(f"agent-{n:05d}", [f"198.18.{n // 250}.{n % 250 + 1}"], docs=100)
+        for n in range(count)
+    ]
+
+
+async def test_an_agent_past_the_old_500_cap_is_in_the_inventory() -> None:
+    """A network of 600 agents lost 100 of them to a terms read of 500, with no note.
+
+    The last agent in name order is the one a terms read of the busiest 500
+    dropped. Its address joined no machine by agent.
+    """
+    es = _network_es(agent_buckets=_fleet(600))
+
+    inventory_ = await _agent_inventory(es)
+
+    assert len(es.agent_pages) == 1
+    assert len(inventory_.hosts) == 600
+    assert inventory_.unique_claims()["198.18.2.100"].host_name == "agent-00599"
+    assert inventory_.notes == ()
+
+
+async def test_an_inventory_of_2500_agents_reads_three_pages() -> None:
+    es = _network_es(agent_buckets=_fleet(2500))
+
+    inventory_ = await _agent_inventory(es)
+
+    assert [page["composite"]["size"] for page in es.agent_pages] == [1000, 1000, 1000]
+    assert es.agent_pages[1]["composite"]["after"] == {"key": "agent-00999"}
+    assert len(inventory_.hosts) == 2500
+    assert inventory_.errors == ()
+    assert inventory_.notes == ()
+
+
+async def test_an_inventory_past_its_ceiling_says_so_with_the_number(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The agents past the ceiling are missing, and the run row has to say so.
+
+    The ceiling is lowered here so the test reads 301 agents.
+    """
+    monkeypatch.setattr(observe, "_AGENT_HOST_CEILING", 300)
+    es = _network_es(agent_buckets=_fleet(301))
+
+    inventory_ = await _agent_inventory(es)
+
+    assert len(inventory_.hosts) == 300
+    assert "agent-00300" not in {h.host_name for h in inventory_.hosts}
+    assert inventory_.errors == ()
+    assert inventory_.notes == (
+        "the agent inventory stopped at the ceiling of 300 agents. The agents past the "
+        "ceiling in name order have no self-report in this sweep. An address that one "
+        "of them also claims can read as a unique claim.",
+    )
+
+
+async def test_a_failed_later_page_drops_the_whole_inventory() -> None:
+    """A part of the network read as the whole turns a contest into a unique claim.
+
+    The first page names one claimant of a shared address. The second page,
+    which fails, holds the other one.
+    """
+    fleet = _fleet(1500)
+    fleet[1200]["ips"]["buckets"].append({"key": "198.18.0.1", "doc_count": 100})
+    es = _network_es(agent_buckets=fleet, agent_fail_page=2)
+
+    inventory_ = await _agent_inventory(es)
+
+    assert len(es.agent_pages) == 2
+    assert inventory_.hosts == ()
+    assert inventory_.claims == {}
+    assert any("later page" in e for e in inventory_.errors), inventory_.errors
 
 
 async def test_the_collector_threads_this_hosts_slice_into_the_observations() -> None:

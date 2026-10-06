@@ -96,6 +96,25 @@ env_unset(){ local key=$1 tmp line
   cat "$tmp" > .env; rm -f "$tmp"
 }
 
+# COMPOSE_PROFILES is a comma list. The "postgres" profile can sit in it next
+# to "proxy", so these two add or remove one name and keep the others. The
+# list goes away when the last name does.
+profile_list_without(){ local name=$1 out="" p parts=()
+  IFS=',' read -ra parts <<< "$(env_get COMPOSE_PROFILES)" || true
+  for p in "${parts[@]}"; do
+    p=${p//[[:space:]]/}
+    [[ -z $p || $p == "$name" ]] && continue
+    out+="${out:+,}$p"
+  done
+  printf '%s' "$out"
+}
+profile_add(){ local rest; rest=$(profile_list_without "$1")
+  env_set COMPOSE_PROFILES "${rest:+$rest,}$1"
+}
+profile_remove(){ local rest; rest=$(profile_list_without "$1")
+  if [[ -n $rest ]]; then env_set COMPOSE_PROFILES "$rest"; else env_unset COMPOSE_PROFILES; fi
+}
+
 # One backup per run. A second run in the same second gets a numbered name,
 # so no backup overwrites an earlier one.
 backup_env(){ local stamp n=1; stamp=$(date +%Y%m%dT%H%M%S)
@@ -259,7 +278,7 @@ cmd_enable(){
   env_set SOC_AI_BIND 127.0.0.1
   env_set SOC_AI_DOMAIN "$domain"
   env_set SOC_AI_CADDY_TLS "$tls_value"
-  env_set COMPOSE_PROFILES proxy
+  profile_add proxy
   ok "Wrote the proxy settings to .env."
 
   # soc-ai trusts the forwarded headers from the compose network. The subnet
@@ -379,7 +398,7 @@ cmd_disable(){
   env_unset SOC_AI_BIND
   env_unset SOC_AI_DOMAIN
   env_unset SOC_AI_CADDY_TLS
-  env_unset COMPOSE_PROFILES
+  profile_remove proxy
   env_unset PROXY_TRUSTED_IPS
   ok "Wrote the direct path settings to .env."
   info "Stopping and removing Caddy."

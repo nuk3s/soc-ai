@@ -109,11 +109,15 @@ _SNAPSHOT_COLUMNS: tuple[tuple[str, sa.types.TypeEngine[str]], ...] = (
 
 
 def upgrade() -> None:
+    # PostgreSQL's json type has no equality operator, so the JSON text is
+    # compared there. SQLite stores the text itself and compares it directly.
+    sqlite = op.get_bind().dialect.name == "sqlite"
     for table, column in _JSON_COLUMNS:
+        stored = column if sqlite else f"CAST({column} AS TEXT)"
         op.execute(
             sa.text(
                 f"UPDATE {table} SET {column} = NULL "  # noqa: S608 - fixed literals above
-                f"WHERE {column} = 'null'"
+                f"WHERE {stored} = 'null'"
             )
         )
     for name, coltype in _SNAPSHOT_COLUMNS:

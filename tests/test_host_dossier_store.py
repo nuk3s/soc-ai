@@ -30,6 +30,7 @@ migrated to head, isolated per test by the autouse ``clean_env`` fixture.
 
 from __future__ import annotations
 
+import random
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -40,7 +41,7 @@ from soc_ai.dossier.types import DOSSIER_FIELDS, Fact
 from soc_ai.store import host_dossier as store
 from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
 from soc_ai.store.models import HostDossier, HostDossierField
-from sqlalchemy import event, select, text, update
+from sqlalchemy import event, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 # A fixed build clock. Every timestamp in this file is derived from it so a
@@ -2185,4 +2186,342 @@ async def test_get_dossiers_matches_a_differently_spelled_ipv6_address(
     async with maker() as db:
         rows = await store.get_dossiers(db, ["2001:0db8:0000:0000:0000:0000:0000:0001"])
     assert [host.host_key for host, _fields in rows] == ["2001:db8::1"]
+    await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# The batched host header
+# ---------------------------------------------------------------------------
+
+
+def _doc_addresses(count: int) -> list[str]:
+    """*count* documentation addresses (RFC 5737), in a stable order."""
+    nets = ("192.0.2.", "198.51.100.", "203.0.113.")
+    pool = [f"{net}{n}" for net in nets for n in range(1, 255)]
+    assert count <= len(pool)
+    return pool[:count]
+
+
+def _record_statements(engine: AsyncEngine, prefix: str) -> tuple[list[tuple[str, int]], Any]:
+    """Listen for statements that open with *prefix*. Returns the list and the hook."""
+    seen: list[tuple[str, int]] = []
+
+    def _record(conn: Any, cursor: Any, statement: str, parameters: Any, *args: Any) -> None:
+        if statement.lstrip().upper().startswith(prefix):
+            seen.append((statement, len(parameters or ())))
+
+    event.listen(engine.sync_engine, "before_cursor_execute", _record)
+    return seen, _record
+
+
+async def test_upsert_hosts_writes_new_unchanged_and_changed_rows(
+    settings_kratos: Settings,
+) -> None:
+    """One batch of new, unchanged and changed addresses lands as single calls do."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        await store.upsert_host(db, "192.0.2.10", first_seen=T0, last_seen=T0 + HOUR, event_count=5)
+        await store.upsert_host(
+            db,
+            "192.0.2.11",
+            first_seen=T0,
+            last_seen=T0 + HOUR,
+            event_count=5,
+            last_built_at=T0,
+            build_error="es timeout",
+        )
+        await db.commit()
+    async with maker() as db:
+        rows = await store.upsert_hosts(
+            db,
+            [
+                store.HostUpsert(
+                    ip="198.51.100.7", first_seen=T0, last_seen=T0 + HOUR, event_count=3
+                ),
+                store.HostUpsert(
+                    ip="192.0.2.10", first_seen=T0, last_seen=T0 + HOUR, event_count=5
+                ),
+                # A census entry: no build stamp, so the last build outcome stays.
+                store.HostUpsert(
+                    ip="192.0.2.11",
+                    first_seen=T0 - 2 * HOUR,
+                    last_seen=T0 + 9 * HOUR,
+                    event_count=40,
+                ),
+                # The new address again, in the same batch.
+                store.HostUpsert(ip="198.51.100.7", last_seen=T0 + 3 * HOUR, event_count=4),
+            ],
+        )
+        await db.commit()
+        assert [row.ip for row in rows] == [
+            "198.51.100.7",
+            "192.0.2.10",
+            "192.0.2.11",
+            "198.51.100.7",
+        ]
+        assert rows[0] is rows[3]
+    async with maker() as db:
+        by_ip = {row.ip: row for row in (await db.scalars(select(HostDossier))).all()}
+    assert set(by_ip) == {"198.51.100.7", "192.0.2.10", "192.0.2.11"}
+
+    new = by_ip["198.51.100.7"]
+    assert (new.first_seen, new.last_seen, new.event_count) == (T0, T0 + 3 * HOUR, 4)
+    assert new.last_built_at is None
+
+    same = by_ip["192.0.2.10"]
+    assert (same.first_seen, same.last_seen, same.event_count) == (T0, T0 + HOUR, 5)
+
+    moved = by_ip["192.0.2.11"]
+    assert (moved.first_seen, moved.last_seen, moved.event_count) == (
+        T0 - 2 * HOUR,
+        T0 + 9 * HOUR,
+        40,
+    )
+    assert (moved.last_built_at, moved.build_error) == (T0, "es timeout")
+    await engine.dispose()
+
+
+async def test_upsert_hosts_reads_501_addresses_in_two_bounded_selects(
+    settings_kratos: Settings,
+) -> None:
+    """501 addresses cost two SELECTs of at most 500 addresses, never one per address.
+
+    The stored row is the 501st address, so only the second IN list can find
+    it. A batch that dropped the tail of its read would insert the address a
+    second time and break the unique key.
+    """
+    addresses = _doc_addresses(501)
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        stored = await store.upsert_host(
+            db, addresses[-1], first_seen=T0, last_seen=T0, event_count=1
+        )
+        await db.commit()
+        stored_id = stored.id
+
+    selects, hook = _record_statements(engine, "SELECT")
+    try:
+        async with maker() as db:
+            rows = await store.upsert_hosts(
+                db,
+                [
+                    store.HostUpsert(
+                        ip=ip, first_seen=T0 + HOUR, last_seen=T0 + HOUR, event_count=2
+                    )
+                    for ip in addresses
+                ],
+            )
+            await db.commit()
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", hook)
+
+    assert len(rows) == 501
+    assert len(selects) == 2, [statement for statement, _n in selects]
+    assert all(params <= 500 for _statement, params in selects), [n for _s, n in selects]
+    async with maker() as db:
+        assert await db.scalar(select(func.count(HostDossier.id))) == 501
+        tail = await db.scalar(select(HostDossier).where(HostDossier.ip == addresses[-1]))
+    assert tail is not None
+    assert tail.id == stored_id
+    assert (tail.first_seen, tail.last_seen, tail.event_count) == (T0, T0 + HOUR, 2)
+    await engine.dispose()
+
+
+async def test_upsert_hosts_never_moves_first_seen_later_or_last_seen_earlier(
+    settings_kratos: Settings,
+) -> None:
+    """The lifetime only widens, on the two paths a batch can get wrong.
+
+    One stored row sits past the first IN list. One address has no stored row
+    and comes twice in the batch, the second time with a narrower lifetime. A
+    batch that compared only with the stored row, or kept the last entry per
+    address, narrows one of them. A third address widens, so the test also
+    proves that the batch writes a lifetime at all.
+    """
+    addresses = _doc_addresses(501)
+    twice, widened, stored = addresses[0], addresses[1], addresses[-1]
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        await store.upsert_host(db, stored, first_seen=T0, last_seen=T0 + 10 * HOUR)
+        await store.upsert_host(db, widened, first_seen=T0, last_seen=T0 + 10 * HOUR)
+        await db.commit()
+
+    later, earlier = T0 + 5 * HOUR, T0 + HOUR
+    batch = [
+        store.HostUpsert(ip=twice, first_seen=T0, last_seen=T0 + 10 * HOUR),
+        store.HostUpsert(ip=widened, first_seen=T0 - HOUR, last_seen=T0 + 11 * HOUR),
+        *(store.HostUpsert(ip=ip) for ip in addresses[2:-1]),
+        store.HostUpsert(ip=stored, first_seen=later, last_seen=earlier),
+        store.HostUpsert(ip=twice, first_seen=later, last_seen=earlier),
+    ]
+    async with maker() as db:
+        await store.upsert_hosts(db, batch)
+        await db.commit()
+    async with maker() as db:
+        found = await db.scalars(
+            select(HostDossier).where(HostDossier.ip.in_([twice, widened, stored]))
+        )
+        by_ip = {row.ip: row for row in found.all()}
+    for ip in (twice, stored):
+        assert by_ip[ip].first_seen == T0, ip
+        assert by_ip[ip].last_seen == T0 + 10 * HOUR, ip
+    assert by_ip[widened].first_seen == T0 - HOUR
+    assert by_ip[widened].last_seen == T0 + 11 * HOUR
+    await engine.dispose()
+
+
+async def test_upsert_hosts_checks_every_entry_before_it_writes(
+    settings_kratos: Settings,
+) -> None:
+    """A bad entry anywhere in the batch raises, and the batch writes nothing."""
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        with pytest.raises(ValueError):
+            await store.upsert_hosts(
+                db, [store.HostUpsert(ip="192.0.2.1"), store.HostUpsert(ip="not-an-address")]
+            )
+        with pytest.raises(ValueError, match="last_built_at"):
+            await store.upsert_hosts(
+                db,
+                [
+                    store.HostUpsert(ip="192.0.2.1"),
+                    store.HostUpsert(ip="192.0.2.2", build_error="es timeout"),
+                ],
+            )
+        await db.commit()
+        assert await db.scalar(select(func.count(HostDossier.id))) == 0
+        assert await store.upsert_hosts(db, []) == []
+    await engine.dispose()
+
+
+async def test_upsert_hosts_stamps_a_rebind_only_where_a_declaration_stands(
+    settings_kratos: Settings,
+) -> None:
+    """The rebind stamp in a batch follows the single-call rule, in one read.
+
+    Two stored addresses move their hostname part. Only the declared one is
+    stamped. A third declared address only gains its MAC part, which is no
+    rebind.
+    """
+    engine, maker = await _db(settings_kratos)
+    declared, plain, gained = "192.0.2.21", "192.0.2.22", "192.0.2.23"
+    async with maker() as db:
+        for ip in (declared, plain):
+            await store.upsert_host(db, ip, identity_fingerprint=_fp(_NAME_A, _MAC_A), now=T0)
+        await store.upsert_host(db, gained, identity_fingerprint=_fp(_NAME_A), now=T0)
+        await db.commit()
+        await _declare(db, declared)
+        await _declare(db, gained)
+
+    reads, hook = _record_statements(engine, "SELECT")
+    try:
+        async with maker() as db:
+            await store.upsert_hosts(
+                db,
+                [
+                    store.HostUpsert(ip=declared, identity_fingerprint=_fp(_NAME_B, _MAC_A)),
+                    store.HostUpsert(ip=plain, identity_fingerprint=_fp(_NAME_B, _MAC_A)),
+                    store.HostUpsert(ip=gained, identity_fingerprint=_fp(_NAME_A, _MAC_A)),
+                ],
+                now=T0 + HOUR,
+            )
+            await db.commit()
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", hook)
+
+    assert len([s for s, _n in reads if "FROM host_dossier_field " in s]) == 1, reads
+    async with maker() as db:
+        by_ip = {row.ip: row for row in (await db.scalars(select(HostDossier))).all()}
+    assert by_ip[declared].identity_rebound_at == T0 + HOUR
+    assert by_ip[plain].identity_rebound_at is None
+    assert by_ip[gained].identity_rebound_at is None
+    assert by_ip[plain].identity_fingerprint == _fp(_NAME_B, _MAC_A)
+    await engine.dispose()
+
+
+async def test_one_batch_writes_what_the_same_single_calls_write(
+    settings_kratos: Settings,
+) -> None:
+    """A batch of N entries leaves every column as N single calls leave it.
+
+    The same seeded sequence runs twice: one call per entry on one set of
+    addresses, and one batch on a second set. The sequence repeats addresses,
+    moves fingerprints on declared and undeclared rows, and mixes census
+    entries with build outcomes.
+    """
+    rng = random.Random(20261004)
+    slots = 6
+    single = [f"192.0.2.{40 + n}" for n in range(slots)]
+    batched = [f"198.51.100.{40 + n}" for n in range(slots)]
+    prints = (None, _fp(_NAME_A), _fp(_NAME_A, _MAC_A), _fp(_NAME_B, _MAC_A), _fp(_NAME_B, _MAC_B))
+
+    def _when() -> datetime | None:
+        return None if rng.random() < 0.3 else T0 + rng.randint(-50, 50) * HOUR
+
+    entries: list[tuple[int, dict[str, Any]]] = []
+    for _ in range(80):
+        built = rng.random() < 0.3
+        entries.append(
+            (
+                rng.randrange(slots),
+                {
+                    "first_seen": _when(),
+                    "last_seen": _when(),
+                    "last_observed_at": _when(),
+                    "event_count": None if rng.random() < 0.3 else rng.randint(0, 900),
+                    "identity_fingerprint": rng.choice(prints),
+                    "last_built_at": T0 + rng.randint(0, 9) * HOUR if built else None,
+                    "build_error": rng.choice((None, "es timeout")) if built else None,
+                },
+            )
+        )
+
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        # Slots 0 to 3 are stored. Slots 0 and 2 carry a declaration.
+        for ips in (single, batched):
+            for slot in range(4):
+                await store.upsert_host(
+                    db,
+                    ips[slot],
+                    first_seen=T0,
+                    last_seen=T0,
+                    identity_fingerprint=_fp(_NAME_A, _MAC_A),
+                    now=T0,
+                )
+        await db.commit()
+        for ips in (single, batched):
+            await _declare(db, ips[0])
+            await _declare(db, ips[2])
+
+    async with maker() as db:
+        for slot, values in entries:
+            await store.upsert_host(db, single[slot], now=T0 + HOUR, **values)
+        await db.commit()
+    async with maker() as db:
+        await store.upsert_hosts(
+            db,
+            [store.HostUpsert(ip=batched[slot], **values) for slot, values in entries],
+            now=T0 + HOUR,
+        )
+        await db.commit()
+
+    columns = (
+        "first_seen",
+        "last_seen",
+        "last_observed_at",
+        "event_count",
+        "identity_fingerprint",
+        "identity_rebound_at",
+        "last_built_at",
+        "build_error",
+    )
+    async with maker() as db:
+        by_ip = {row.ip: row for row in (await db.scalars(select(HostDossier))).all()}
+    for one, many in zip(single, batched, strict=True):
+        assert {c: getattr(by_ip[one], c) for c in columns} == {
+            c: getattr(by_ip[many], c) for c in columns
+        }, (one, many)
+    # The sequence moved a part on a declared row, so the stamp is in the comparison.
+    assert any(by_ip[ip].identity_rebound_at is not None for ip in batched)
     await engine.dispose()

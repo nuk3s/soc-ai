@@ -2,12 +2,20 @@ id: profile-connection-rate-spiked
 title: A host's connection rate rises far above its own baseline
 description: >
   Scanning, password spraying, staging and exfiltration all raise a host's own
-  traffic volume. This analytic measures the host against its own median for the
-  same time-of-week cell. A fleet-wide number does not work here. A busy proxy
-  and a quiet workstation say nothing about each other's volume.
+  traffic volume. This analytic tests each hour against the host's own
+  expected count for the same hour of the week. A burst of one or two hours
+  moves the test. A fleet-wide number does not work here. A busy proxy and a
+  quiet workstation say nothing about each other's volume.
 
 level: medium
 evaluator: profile
+# The tier 2 budget is one hit per 100 host-days. The seven day production
+# replay of 2026-10-05 read 13.4 hits per 100 host-days for this analytic. On
+# about 130 measured hosts the budget is close to one hit a day. The self-healing
+# hold moves the analytic to shadow past three hits in a day or under a precision
+# of 0.25 on its hunted leads, and an analyst approves it back to live.
+fire_budget_per_day: 3
+precision_floor: 0.25
 scope_field: host.name
 scope_kind: host
 
@@ -15,6 +23,7 @@ profile:
   dimension: connection_rate
   test: above
   threshold: 3.0
+  min_hours: 2
 
 attack:
   - T1046

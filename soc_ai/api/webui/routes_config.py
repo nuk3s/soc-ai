@@ -260,6 +260,9 @@ class ModelFitnessLegOut(BaseModel):
     # enough to measure, and on results cached before this shipped.
     elapsed_s: float | None = None
     backend: str | None = None
+    # "timeout" or "transport" when the leg could not measure the model. Null
+    # on a measured leg and on results cached before the field existed.
+    cause: str | None = None
 
 
 class ModelFitnessOut(BaseModel):

@@ -14,6 +14,7 @@ import {
   type LeadDecisionFields,
 } from '../lib/leadDecisions';
 import { plural } from '../lib/plural';
+import { rerunHref, statisticSentence } from '../lib/statistics';
 import { absTime, ago } from '../lib/timeRange';
 import {
   CHIP_DISMISSED_EVENT,
@@ -21,8 +22,21 @@ import {
   CHIP_TYPE,
   COUNT_OBSERVATIONS,
   OBSERVATION_NO_ANALYTIC,
+  OBSERVATION_RERUN,
+  OBSERVATION_STATISTIC,
   WEIGHT_NOW,
 } from '../lib/tooltips';
+
+/** The hover text of an observation's time: the event time and the record
+ *  time, or the record time alone when the row has no document time. */
+export function observationTimeTitle(o: {
+  observed_at?: string | null;
+  born_at: string | null;
+}): string {
+  return o.observed_at
+    ? `Event time ${absTime(o.observed_at)}. Recorded ${absTime(o.born_at)}.`
+    : `Recorded ${absTime(o.born_at)}. No document time is on record.`;
+}
 
 // ---------------------------------------------------------------------------
 // The timeline of one lead: every observation that formed it, and the
@@ -45,7 +59,16 @@ export function evidenceIds(ev: Record<string, unknown> | null): string[] {
     const v = ev[key];
     if (Array.isArray(v)) out.push(...v.filter((x): x is string => typeof x === 'string'));
   }
-  return Array.from(new Set(out)).slice(0, 8);
+  return Array.from(new Set(out)).slice(0, 10);
+}
+
+/** The documents a row cites: the column first, then the evidence. A row
+ *  written before the column existed holds its ids in the evidence alone. */
+export function observationIds(o: {
+  document_ids?: string[];
+  evidence: Record<string, unknown> | null;
+}): string[] {
+  return Array.from(new Set([...(o.document_ids ?? []), ...evidenceIds(o.evidence)])).slice(0, 10);
 }
 
 /** True when an analyst put a dismissed lead back in the queue. The dismissal
@@ -211,8 +234,14 @@ export function LeadTimeline({
         {lead.observations.map((o) => (
           <li key={o.id} className="px-[15px] py-2.5 text-[13px]" data-testid={`observation-${o.id}`}>
             <div className="flex flex-wrap items-center gap-2">
-              <span className="font-mono text-[11px] text-dim" title={absTime(o.born_at)}>
-                {ago(o.born_at)}
+              {/* The event time when the row has one. The record time
+                  read an event a day old as new on the sweep that found it. */}
+              <span
+                className="font-mono text-[11px] text-dim"
+                title={observationTimeTitle(o)}
+                data-testid={`observation-time-${o.id}`}
+              >
+                {ago(o.observed_at ?? o.born_at)}
               </span>
               <span
                 className="rounded-chip border border-border-strong bg-surface-2 px-1.5 py-px text-[10.5px] text-text-2"
@@ -265,18 +294,45 @@ export function LeadTimeline({
                   </Link>
                 )
               ) : null}
-              {evidenceIds(o.evidence).length > 0 && (
+              {observationIds(o).length > 0 && (
                 <>
                   <span>· evidence</span>
                   {/* The id opens the document. A dashed chip that did nothing
                       was the first state here, and a link into the
                       investigations search was the second. */}
-                  {evidenceIds(o.evidence).map((eid) => (
+                  {observationIds(o).map((eid) => (
                     <DocumentChip key={eid} id={eid} />
                   ))}
                 </>
               )}
             </div>
+            {/* The statistic and the query the observation carries. The
+                numbers lived in the summary sentence, and the hunt searched
+                the grid for the departure again. */}
+            {statisticSentence(o.statistic, o.statistic_value, o.baseline_value) && (
+              <div
+                className="mt-0.5 text-[11.5px] text-text-2"
+                data-testid={`observation-statistic-${o.id}`}
+                title={OBSERVATION_STATISTIC}
+              >
+                {statisticSentence(o.statistic, o.statistic_value, o.baseline_value)}
+              </div>
+            )}
+            {o.rerun_query && (
+              <div
+                className="mt-0.5 flex flex-wrap items-center gap-2 text-[11.5px] text-dim"
+                data-testid={`observation-query-${o.id}`}
+              >
+                <code className="break-all font-mono text-[11px] text-text-2">{o.rerun_query}</code>
+                <Link
+                  to={rerunHref(o.rerun_query, lead.entities[0]?.[1] ?? 'the entity')}
+                  className="text-accent hover:underline"
+                  title={OBSERVATION_RERUN}
+                >
+                  Run this query
+                </Link>
+              </div>
+            )}
           </li>
         ))}
       </ul>

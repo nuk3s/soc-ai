@@ -63,7 +63,7 @@ def _stub_enriched(alert_id: str = "alert-b3") -> Any:
 
     return EnrichedAlertContext(
         alert=SoAlert(id=alert_id, severity_label="medium", source_ip="10.0.0.1"),
-        community_id_events=[],
+        community_id_events=[SoAlert(id="evt-pivot-b3", severity_label="low")],
         host_events=[],
         user_events=[],
         process_events=[],
@@ -88,12 +88,15 @@ def _stub_report(
 
 
 def _verdict_json(verdict: str = "true_positive", confidence: float = 0.60) -> str:
+    # The Oracle cites the stub's prefetched event: a class change needs a citation
+    # that resolves to evidence beyond the alert (2026-10-04).
     return json.dumps(
         {
             "verdict": verdict,
             "confidence": confidence,
             "summary": "Adjudicated.",
             "reasoning": "Because reasons.",
+            "citations": ["evt-pivot-b3"],
         }
     )
 

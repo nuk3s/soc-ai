@@ -143,10 +143,20 @@ def _now() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
-def _freshness(newest: datetime | None, unmeasurable: dict[str, str] | None = None):  # type: ignore[no-untyped-def]
+def _freshness(  # type: ignore[no-untyped-def]
+    newest: datetime | None,
+    unmeasurable: dict[str, str] | None = None,
+    *,
+    newest_shape: int | None = None,
+):
+    from soc_ai.dossier.profile import PROFILE_SHAPE
     from soc_ai.store.entity_profiles import ProfileFreshness
 
-    return ProfileFreshness(newest_built_at=newest, unmeasurable=dict(unmeasurable or {}))
+    return ProfileFreshness(
+        newest_built_at=newest,
+        unmeasurable=dict(unmeasurable or {}),
+        newest_shape=PROFILE_SHAPE if newest_shape is None else newest_shape,
+    )
 
 
 def _build(written: int = 640):  # type: ignore[no-untyped-def]
@@ -495,6 +505,41 @@ async def test_fresh_profiles_are_read_not_rebuilt(
     assert state.built_at == fresh_stamp
     assert state.stale is False
     assert _profile_lines(caplog) == ["prior sweep: profiles 1 h old"]
+
+
+async def test_fresh_profiles_of_an_older_shape_are_rebuilt_at_once(
+    settings_kratos: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A release that changes the stored shape does not wait for the age rule.
+
+    The rows are an hour old, so the age rule says fresh. Their shape is
+    older than the code's, so the build runs now, and the journal says why.
+    The control above this test proves the same age with the current shape
+    reads the rows as they are.
+    """
+    from soc_ai.dossier.profile import PROFILE_SHAPE
+
+    settings = _profile_settings(settings_kratos)
+    fresh_stamp = _now() - timedelta(hours=1)
+    order: list[str] = []
+
+    async def _read(_maker: Any) -> Any:
+        order.append("read")
+        if "build" in order:
+            return _freshness(_now())
+        return _freshness(fresh_stamp, newest_shape=PROFILE_SHAPE - 1)
+
+    async def _builder(*_a: Any, **_k: Any) -> Any:
+        order.append("build")
+        return _build()
+
+    sweeper = AsyncMock(return_value=_sweep(results=(_result(),)))
+    with caplog.at_level(logging.INFO):
+        await _tick_with_profiles(_app(settings), sweeper, freshness=_read, builder=_builder)
+    assert "build" in order
+    sweeper.assert_awaited_once()
+    lines = _profile_lines(caplog)
+    assert any("shape" in line for line in lines), lines
 
 
 async def test_profiles_never_built_are_built(

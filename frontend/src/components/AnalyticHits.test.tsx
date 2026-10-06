@@ -32,6 +32,7 @@ import {
   type AnalyticHit,
 } from '../lib/api';
 import {
+  CHIP_ANALYTIC_REMOVED,
   CHIP_LIVE,
   CHIP_LOCAL,
   CHIP_NO_LEAD,
@@ -148,19 +149,29 @@ describe('the block', () => {
     expect(screen.getByText(/last 7 days · 2/)).toBeTruthy();
     expect(
       screen.getByText(
-        'What the analytics found. Live hits come first. Then shadow hits, unread first.',
+        'What the analytics found. ' +
+          'Unread shadow hits come first, then live hits, then read shadow hits.',
       ),
     ).toBeTruthy();
   });
 
+  // The server puts the unread shadow hit first under All, so the hit
+  // Needs-you counts is in view. The console keeps that order and does not
+  // move the live hit back to the top.
   it('asks the server for the window and reads the hits in the order it answers', async () => {
+    vi.mocked(getAnalyticHits).mockResolvedValue({ hits: [SHADOW, LIVE], counts: COUNTS });
     mount();
     await card(41);
-    expect(getAnalyticHits).toHaveBeenCalledWith({ days: 7, filter: 'all', limit: 50 });
+    expect(getAnalyticHits).toHaveBeenCalledWith({
+      days: 7,
+      filter: 'all',
+      limit: 50,
+      offset: 0,
+    });
     const cards = screen.getAllByTestId(/^analytic-hit-\d+$/);
     expect(cards.map((c) => c.getAttribute('data-testid'))).toEqual([
-      'analytic-hit-41',
       'analytic-hit-42',
+      'analytic-hit-41',
     ]);
   });
 
@@ -173,7 +184,12 @@ describe('the block', () => {
     fireEvent.click(unread);
     await waitFor(() => expect(screen.getByTestId('loc').textContent).toBe('/hunts?hits=unread'));
     await waitFor(() =>
-      expect(getAnalyticHits).toHaveBeenCalledWith({ days: 7, filter: 'unread', limit: 50 }),
+      expect(getAnalyticHits).toHaveBeenCalledWith({
+        days: 7,
+        filter: 'unread',
+        limit: 50,
+        offset: 0,
+      }),
     );
 
     fireEvent.click(screen.getByRole('button', { name: /^All/ }));
@@ -183,7 +199,12 @@ describe('the block', () => {
   it('opens on the filter the address names', async () => {
     mount('/hunts?hits=shadow');
     await card(41);
-    expect(getAnalyticHits).toHaveBeenCalledWith({ days: 7, filter: 'shadow', limit: 50 });
+    expect(getAnalyticHits).toHaveBeenCalledWith({
+      days: 7,
+      filter: 'shadow',
+      limit: 50,
+      offset: 0,
+    });
   });
 
   it('reads a failed list as a failure and never as a quiet week', async () => {
@@ -274,6 +295,115 @@ describe('the block', () => {
       await poll(70_000);
       expect(screen.queryByText(/This data is from/)).toBeNull();
     });
+  });
+});
+
+// N1. Production listed 50 of 148 hits under All, said nothing about the
+// rest and gave no way to read them.
+describe('paging', () => {
+  const liveHit = (n: number): AnalyticHit => ({
+    ...LIVE,
+    id: 1000 + n,
+    entity_key: `host-${n}`,
+    lead_id: null,
+    lead_status: null,
+  });
+  const WINDOW = Array.from({ length: 120 }, (_, n) => liveHit(n));
+  const WINDOW_COUNTS = { all: 120, unread: 0, live: 120, shadow: 0 };
+
+  beforeEach(() => {
+    vi.mocked(getAnalyticHits).mockImplementation(async (opts = {}) => {
+      const from = opts.offset ?? 0;
+      return { hits: WINDOW.slice(from, from + (opts.limit ?? 50)), counts: WINDOW_COUNTS };
+    });
+  });
+
+  const shown = () => screen.getByTestId('analytic-hits-shown').textContent;
+  const cardCount = () => screen.getAllByTestId(/^analytic-hit-\d+$/).length;
+
+  it('states the share of the window the list holds', async () => {
+    mount();
+    await card(1000);
+    expect(cardCount()).toBe(50);
+    expect(shown()).toBe('50 of 120 hits');
+  });
+
+  it('reads the next page on Show more and keeps the pages before it', async () => {
+    mount();
+    await card(1000);
+    fireEvent.click(screen.getByRole('button', { name: 'Show more' }));
+    await waitFor(() => expect(cardCount()).toBe(100));
+    expect(getAnalyticHits).toHaveBeenCalledWith({
+      days: 7,
+      filter: 'all',
+      limit: 50,
+      offset: 50,
+    });
+    expect(shown()).toBe('100 of 120 hits');
+    const ids = screen.getAllByTestId(/^analytic-hit-\d+$/).map((c) => c.dataset.testid);
+    expect(ids.slice(0, 2)).toEqual(['analytic-hit-1000', 'analytic-hit-1001']);
+    expect(ids.slice(49, 51)).toEqual(['analytic-hit-1049', 'analytic-hit-1050']);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Show more' }));
+    await waitFor(() => expect(cardCount()).toBe(120));
+    expect(shown()).toBe('120 of 120 hits');
+    // Negative control: the whole window is on screen, so no control offers more.
+    expect(screen.queryByRole('button', { name: 'Show more' })).toBeNull();
+  });
+
+  it('lists a hit that two pages both hold one time', async () => {
+    // The window moved between two reads, so page 2 starts with the last hit
+    // of page 1.
+    vi.mocked(getAnalyticHits).mockImplementation(async (opts = {}) => {
+      const from = opts.offset ?? 0;
+      const start = from === 0 ? 0 : from - 1;
+      return { hits: WINDOW.slice(start, start + 50), counts: WINDOW_COUNTS };
+    });
+    mount();
+    await card(1000);
+    fireEvent.click(screen.getByRole('button', { name: 'Show more' }));
+    await waitFor(() => expect(cardCount()).toBe(99));
+    expect(screen.getAllByTestId('analytic-hit-1049')).toHaveLength(1);
+  });
+
+  it('offers no Show more when the list holds the whole window', async () => {
+    vi.mocked(getAnalyticHits).mockResolvedValue({ hits: [LIVE, SHADOW], counts: COUNTS });
+    mount();
+    await card(41);
+    expect(shown()).toBe('2 of 2 hits');
+    expect(screen.queryByRole('button', { name: 'Show more' })).toBeNull();
+  });
+
+  it('counts against the filter on screen', async () => {
+    mount('/hunts?hits=live');
+    await card(1000);
+    expect(shown()).toBe('50 of 120 hits');
+    vi.mocked(getAnalyticHits).mockResolvedValue({
+      hits: [SHADOW],
+      counts: { all: 121, unread: 1, live: 120, shadow: 1 },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /^Unread/ }));
+    await card(42);
+    expect(shown()).toBe('1 of 1 hit');
+  });
+
+  it('starts a new filter on its first page', async () => {
+    mount();
+    await card(1000);
+    fireEvent.click(screen.getByRole('button', { name: 'Show more' }));
+    await waitFor(() => expect(cardCount()).toBe(100));
+    vi.mocked(getAnalyticHits).mockClear();
+    fireEvent.click(screen.getByRole('button', { name: /^Live/ }));
+    await waitFor(() =>
+      expect(getAnalyticHits).toHaveBeenCalledWith({
+        days: 7,
+        filter: 'live',
+        limit: 50,
+        offset: 0,
+      }),
+    );
+    await waitFor(() => expect(cardCount()).toBe(50));
+    expect(getAnalyticHits).not.toHaveBeenCalledWith(expect.objectContaining({ offset: 50 }));
   });
 });
 
@@ -560,6 +690,74 @@ describe('deciding on a shadow analytic', () => {
 // analytic" on an analytic the analyst had approved the day before. The chip
 // and the two decisions read the analytic. The half, the border and the weight
 // read the flag.
+// N5 of the 2026-10-05 verification. Six cards named a removed analytic by
+// its raw id with a "live" chip. The hits API sent `analytic_exists: false`.
+describe('a hit whose analytic the catalog no longer lists', () => {
+  const GONE_LIVE: AnalyticHit = {
+    ...LIVE,
+    id: 51,
+    analytic_id: 'prior-retired-from-the-catalog',
+    analytic_title: 'prior-retired-from-the-catalog',
+    analytic_exists: false,
+  };
+  const GONE_SHADOW: AnalyticHit = {
+    ...SHADOW,
+    id: 52,
+    analytic_id: 'local-gone',
+    analytic_title: 'local-gone',
+    analytic_exists: false,
+  };
+
+  it('states the removal in place of the status chip', async () => {
+    vi.mocked(getAnalyticHits).mockResolvedValue({ hits: [GONE_LIVE], counts: COUNTS });
+    mount();
+    const hit = await card(51);
+    expect(within(hit).getByText('analytic removed').getAttribute('title')).toBe(
+      CHIP_ANALYTIC_REMOVED,
+    );
+    expect(within(hit).queryByText('live')).toBeNull();
+    expect(within(hit).queryByText('shadow')).toBeNull();
+  });
+
+  it('names the analytic by its id as text that opens nothing', async () => {
+    vi.mocked(getAnalyticHits).mockResolvedValue({ hits: [GONE_LIVE], counts: COUNTS });
+    mount();
+    const hit = await card(51);
+    const title = within(hit).getByTestId('analytic-hit-title');
+    expect(title.tagName).toBe('SPAN');
+    expect(title.textContent).toBe('prior-retired-from-the-catalog');
+    expect(
+      within(hit).queryByRole('button', { name: 'prior-retired-from-the-catalog' }),
+    ).toBeNull();
+  });
+
+  it('offers no decision on an analytic that is gone', async () => {
+    vi.mocked(getAnalyticHits).mockResolvedValue({ hits: [GONE_SHADOW], counts: COUNTS });
+    mount();
+    const hit = await card(52);
+    expect(within(hit).queryByRole('button', { name: 'Approve analytic' })).toBeNull();
+    expect(within(hit).queryByRole('button', { name: 'Reject analytic' })).toBeNull();
+    // The read state is a fact about the hit, so the hit can still be read.
+    expect(within(hit).getByRole('button', { name: 'Mark read' })).toBeTruthy();
+  });
+
+  it('keeps the status chip and the drawer on an analytic that exists', async () => {
+    // Negative control: true from this server, and absent from an older one.
+    vi.mocked(getAnalyticHits).mockResolvedValue({
+      hits: [{ ...LIVE, analytic_exists: true }, SHADOW],
+      counts: COUNTS,
+    });
+    mount();
+    const live = await card(41);
+    expect(within(live).getByText('live').getAttribute('title')).toBe(CHIP_LIVE);
+    expect(within(live).getByRole('button', { name: LIVE.analytic_title })).toBeTruthy();
+    expect(within(live).queryByText('analytic removed')).toBeNull();
+    const shadow = await card(42);
+    expect(within(shadow).getByText('shadow')).toBeTruthy();
+    expect(within(shadow).queryByText('analytic removed')).toBeNull();
+  });
+});
+
 describe('a hit recorded in shadow whose analytic is live now', () => {
   const APPROVED: AnalyticHit = { ...SHADOW, analytic_status: 'live', recorded_in_shadow: true };
 

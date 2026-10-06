@@ -1,0 +1,63 @@
+id: model-cross-plane-silence
+title: One telemetry plane of a machine falls silent while another plane keeps reporting
+description: >
+  An intruder stops an endpoint agent early in an intrusion. The network
+  sensor keeps reporting the machine's traffic. An agent can also stop one
+  plane, such as its process events, and keep its host logs.
+
+  This detector compares the planes of one machine with each other. The
+  planes are host logs, process events, endpoint network events, Windows
+  security events, osquery, agent self-logs and the network flows of the
+  sensor. Each plane is compared with its own expected count for the same
+  hour of the week. A hit needs two silent hours in a row on one plane and
+  another plane of the same machine at half of its expected count or more.
+
+  A machine with one plane is unmeasurable. A plane with under 7 days of
+  history is learning. A machine whose every plane fell is off, and the
+  detector reports nothing for it.
+
+  This detector is meant to replace the tier 2 analytic
+  profile-connection-rate-collapsed on machines that ship two or more
+  planes. That analytic stays until a shadow week measures both.
+
+level: medium
+evaluator: model
+# A learned detector ships in shadow. An operator approves it to live after a
+# shadow week. The hold moves it back to shadow past 20 hits in a day or
+# under a precision of 0.25 on its hunted leads.
+ships_as: shadow
+fire_budget_per_day: 20
+precision_floor: 0.25
+scope_field: host.name
+scope_kind: host
+
+model:
+  detector: cross_plane_silence
+  params:
+    window_hours: 6
+    baseline_weeks: 4
+    min_history_days: 7
+    min_silent_hours: 2
+    floor_share: 0.1
+    min_expected: 5
+    threshold: 3.0
+    live_share: 0.5
+    grid_share: 0.5
+    grid_min_machines: 3
+
+attack:
+  - T1562.001
+  - T1070.001
+
+false_positives:
+  - An agent upgrade restarts one plane for under an hour. Two silent hours
+    in a row keep most restarts out.
+  - Planned maintenance stops one service on a machine and leaves the
+    others running. Dismiss the lead with the reason known change.
+  - An operator removes an integration from an agent policy. The plane stops
+    on every machine with that policy at once, and the detector holds those
+    hits as a grid condition.
+
+references:
+  - https://attack.mitre.org/techniques/T1562/001/
+  - https://attack.mitre.org/techniques/T1070/001/

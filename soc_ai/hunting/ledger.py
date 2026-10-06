@@ -48,6 +48,10 @@ class Ledger:
     # sweep only, and its rows for a profile analytic predate the split.
     profile_runs: int = 0
     coverage: dict[str, int] = field(default_factory=dict)
+    # Why the newest prior run was blind, when its blind entities share one
+    # reason. None when nothing was blind, or for a run recorded before the
+    # trail carried it. The count alone said "blind 8" and no surface said why.
+    blind_reason: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -66,6 +70,7 @@ class Ledger:
             "sweeps": self.sweeps,
             "profile_runs": self.profile_runs,
             "coverage": dict(self.coverage),
+            "blind_reason": self.blind_reason,
         }
 
 
@@ -178,6 +183,7 @@ async def analytic_ledgers(
         }
         for run in priors
     }
+    by_reason = {str(run.spec_id): run.blind_reason or None for run in priors}
 
     out: dict[str, Ledger] = {}
     for spec in wanted:
@@ -213,5 +219,6 @@ async def analytic_ledgers(
             sweeps=sweeps,
             profile_runs=by_prior_runs.get(spec, 0),
             coverage=by_coverage.get(spec, {}),
+            blind_reason=by_reason.get(spec),
         )
     return out

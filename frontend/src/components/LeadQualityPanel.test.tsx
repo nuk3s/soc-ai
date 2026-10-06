@@ -60,7 +60,7 @@ const QUALITY: LeadQuality = {
     { types: 'novel_destination + off_hours', formed: 4, dismissed: 2, threat: 0, closed_by_hunt: 1 },
   ],
   rule: 'A lead forms at 0.85 over two or more types, at a finding with no benign baseline, or at one type repeated to 1.5.',
-  note: 'A threshold moves on a week of data, never on a day.',
+  note: 'A threshold moves only on a week of data.',
 };
 
 const mount = () =>

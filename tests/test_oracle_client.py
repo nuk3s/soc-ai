@@ -63,7 +63,8 @@ def _stub_enriched(alert_id: str = "alert-001") -> Any:
 
     return EnrichedAlertContext(
         alert=SoAlert(id=alert_id, severity_label="low"),
-        community_id_events=[],
+        # One prefetched event: the evidence a class-changing verdict cites.
+        community_id_events=[SoAlert(id="evt-pivot-001", severity_label="low")],
         host_events=[],
         user_events=[],
         process_events=[],
@@ -77,14 +78,21 @@ def _valid_verdict_json(
     confidence: float = 0.92,
     summary: str = "Traffic from IP_01 matched C2 beacon pattern.",
     reasoning: str = "ET MALWARE rule fired on repeated 4-second beacons.",
+    citations: list[str] | None = None,
 ) -> str:
-    """Return a well-formed OracleVerdict JSON string."""
+    """Return a well-formed OracleVerdict JSON string.
+
+    It cites the stub's prefetched event by default: a verdict that changes the
+    local class needs a citation that resolves to evidence beyond the alert (no
+    override without evidence).
+    """
     return json.dumps(
         {
             "verdict": verdict,
             "confidence": confidence,
             "summary": summary,
             "reasoning": reasoning,
+            "citations": ["evt-pivot-001"] if citations is None else citations,
         }
     )
 
@@ -156,7 +164,7 @@ async def test_adjudicate_success_desanitizes_response() -> None:
 
     enriched_with_ip = EnrichedAlertContext(
         alert=SoAlert(id="alert-001", severity_label="high", source_ip="10.0.0.1"),
-        community_id_events=[],
+        community_id_events=[SoAlert(id="evt-pivot-001", severity_label="low")],
         host_events=[],
         user_events=[],
         process_events=[],
@@ -200,6 +208,7 @@ def _enriched_min() -> Any:
 
     return EnrichedAlertContext(
         alert=SoAlert(id="alert-001", severity_label="high", source_ip="10.0.0.1"),
+        community_id_events=[SoAlert(id="evt-pivot-001", severity_label="low")],
         pivot_summary={"community_id": 0, "host": 0, "user": 0, "process": 0, "file": 0},
     )
 
@@ -1050,7 +1059,7 @@ async def test_oracle_tools_override_gate_blocks_zero_tool_flip() -> None:
     ctx = _real_ctx(_tools_settings())
     local = _stub_report(verdict="false_positive", confidence=0.6)
     model = _script_model(
-        [("verdict", _valid_verdict_json(verdict="true_positive", confidence=0.95))]
+        [("verdict", _valid_verdict_json(verdict="true_positive", confidence=0.95, citations=[]))]
     )
     with _patch_oracle_model(model):
         result = await adjudicate(
@@ -1846,7 +1855,10 @@ async def test_oracle_tools_decode_only_flip_is_withheld() -> None:
     model = _script_model(
         [
             ("tool", ("t_decode_payload", {"data": "48656c6c6f", "encoding": "hex"})),
-            ("verdict", _valid_verdict_json(verdict="true_positive", confidence=0.95)),
+            (
+                "verdict",
+                _valid_verdict_json(verdict="true_positive", confidence=0.95, citations=[]),
+            ),
         ]
     )
     with _patch_oracle_model(model):

@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field, computed_field
 
 from soc_ai.config import Settings
 from soc_ai.demo.guard import assert_loopback_only
+from soc_ai.run_meter import count_search
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -224,6 +225,8 @@ class ElasticClient:
         if track_total_hits is not None:
             body["track_total_hits"] = track_total_hits
 
+        # The run that issued this read pays for it (no-op outside a recorded run).
+        count_search()
         # Be tolerant of index patterns that only partly resolve: a single-node
         # grid has no remote clusters (so the `*:logs-*` half of a both-shapes
         # pattern matches nothing) and a fresh grid may lack an index entirely.
@@ -345,6 +348,7 @@ class ElasticClient:
 
     async def get(self, index: str, doc_id: str) -> dict[str, Any] | None:
         """Fetch a single document by id. Returns ``None`` on 404."""
+        count_search()
         try:
             response = await self._client.get(index=index, id=doc_id)
         except NotFoundError:

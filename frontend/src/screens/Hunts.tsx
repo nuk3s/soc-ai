@@ -716,7 +716,7 @@ export function Hunts() {
     // composer. A parameter that describes a block the analyst cannot see is a
     // filter waiting to surprise them on the way back. The flow drawer goes
     // with them: a tab change is a move, and a drawer does not follow a move.
-    for (const key of ['hits', 'leads', 'new', FLOW_PARAM]) params.delete(key);
+    for (const key of ['hits', 'leads', 'new', 'objective', FLOW_PARAM]) params.delete(key);
     setSearchParams(params, { replace: true });
   };
 
@@ -735,10 +735,16 @@ export function Hunts() {
   // `?new=1` opens the composer. The New hunt button writes it, so a reload
   // keeps the drawer open and closing it takes the parameter out again.
   const newHunt = searchParams.get('new') === '1' && tab === 'hunts';
+  // `?objective=` fills the composer. The "Run this query" link of an
+  // observation writes it beside `new=1`. Closing the drawer takes both out.
+  const newObjective = searchParams.get('objective') ?? '';
   const setNewHunt = (open: boolean) => {
     const params = new URLSearchParams(searchParams);
     if (open) params.set('new', '1');
-    else params.delete('new');
+    else {
+      params.delete('new');
+      params.delete('objective');
+    }
     setSearchParams(params, { replace: true });
   };
 
@@ -1459,7 +1465,9 @@ export function Hunts() {
 
       {/* Mounted only while it is open. `Drawer` registers with the modal
           stack before it renders. */}
-      {newHunt && <NewHuntDrawer onClose={() => setNewHunt(false)} />}
+      {newHunt && (
+        <NewHuntDrawer onClose={() => setNewHunt(false)} initialObjective={newObjective} />
+      )}
         </>
       )}
 

@@ -487,6 +487,54 @@ async def test_check_elasticsearch_says_answered_rather_than_unreachable(
     assert "firewall" not in es.hint
 
 
+def _slow_grid(settings: Settings) -> Any:
+    """A real client whose every search times out at the probe budget."""
+    from unittest.mock import AsyncMock as _AsyncMock
+
+    from elastic_transport import ConnectionTimeout as _ConnectionTimeout
+    from soc_ai.so_client.elastic import ElasticClient as _RealElasticClient
+
+    raw = _AsyncMock()
+    raw.info.return_value = {"cluster_name": "so-grid", "version": {"number": "8.14.3"}}
+    raw.search.side_effect = _ConnectionTimeout("Connection timed out")
+    with patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=raw):
+        return _RealElasticClient(settings)
+
+
+async def test_coverage_check_reads_a_slow_count_as_latency_not_connectivity(
+    tmp_path: Path,
+) -> None:
+    """A count that passed the probe budget on a reachable grid is latency.
+
+    Production read this row as "Fix Elasticsearch connectivity first" on
+    2026-10-05 while the reachability rows of the same run passed. The
+    control: a refused connection keeps the connectivity hint.
+    """
+    settings = _settings(tmp_path)
+    with patch("soc_ai.doctor.ElasticClient", return_value=_slow_grid(settings)):
+        result = await doctor.check_index_pattern_coverage(settings)
+    assert result.status == "WARN"
+    assert "latency" in result.detail
+    assert "connectivity fault" in result.detail
+    assert result.hint is not None and "node load" in result.hint
+    assert "Fix Elasticsearch connectivity" not in (result.hint or "")
+
+    from unittest.mock import AsyncMock as _AsyncMock
+
+    from elastic_transport import ConnectionError as _ConnectionError
+    from soc_ai.so_client.elastic import ElasticClient as _RealElasticClient
+
+    raw = _AsyncMock()
+    raw.search.side_effect = _ConnectionError("Connection refused")
+    with patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=raw):
+        refused = _RealElasticClient(settings)
+    with patch("soc_ai.doctor.ElasticClient", return_value=refused):
+        result = await doctor.check_index_pattern_coverage(settings)
+    assert result.status == "WARN"
+    assert "latency" not in result.detail
+    assert result.hint is not None and "connectivity" in result.hint.lower()
+
+
 async def test_coverage_check_reaches_its_partial_arm_under_the_opt_out(
     tmp_path: Path,
 ) -> None:
@@ -622,6 +670,57 @@ async def test_check_model_fitness_degraded_is_warn(tmp_path: Path) -> None:
     with patch("soc_ai.doctor.probe_model_fitness", probe):
         results = await doctor.check_model_fitness(_settings(tmp_path))
     assert _by_name(results, "model fitness").status == "WARN"
+
+
+def _leg(name: str, grade: str, detail: str, cause: str | None = None) -> dict[str, Any]:
+    return {"name": name, "ok": grade == "pass", "grade": grade, "detail": detail, "cause": cause}
+
+
+@pytest.mark.parametrize("cause", ["timeout", "transport"])
+async def test_check_model_fitness_unmeasured_leg_is_warn_could_not_measure(
+    tmp_path: Path, cause: str
+) -> None:
+    """A leg cut off by the gateway measured nothing. It must not read as an unfit model."""
+    cut = (
+        "structured_output cut off after 30.0 s (budget 30 s). "
+        "It is not a model capability failure."
+    )
+    result = {
+        "grade": "fail",
+        "model": "m",
+        "detail": "m: structured_output=fail, reasoning_budget=degraded",
+        "legs": [
+            _leg("structured_output", "fail", cut, cause),
+            _leg("tool_loop", "pass", "tool invoked + final answer"),
+            _leg("reasoning_budget", "degraded", "timed out", "timeout"),
+        ],
+    }
+    with patch("soc_ai.doctor.probe_model_fitness", AsyncMock(return_value=result)):
+        [row] = await doctor.check_model_fitness(_settings(tmp_path))
+    assert row.status == "WARN"
+    assert row.detail.startswith("could not measure m.")
+    assert cut in row.detail
+    assert "ANALYST_MODEL" not in row.hint and "Point" not in row.hint
+    assert "\u2014" not in row.detail + row.hint and "\u2013" not in row.detail + row.hint
+
+
+async def test_check_model_fitness_capability_failure_beside_a_timeout_is_still_fail(
+    tmp_path: Path,
+) -> None:
+    """Negative control: one leg that measured a failure outranks a leg that could not measure."""
+    result = {
+        "grade": "fail",
+        "model": "m",
+        "detail": "m: structured_output=fail, tool_loop=fail",
+        "legs": [
+            _leg("structured_output", "fail", "cut off", "timeout"),
+            _leg("tool_loop", "fail", "no final answer"),
+        ],
+    }
+    with patch("soc_ai.doctor.probe_model_fitness", AsyncMock(return_value=result)):
+        [row] = await doctor.check_model_fitness(_settings(tmp_path))
+    assert row.status == "FAIL"
+    assert "ANALYST_MODEL" in row.hint
 
 
 # ── check 6: egress posture (INFO only, never pass/fail) ─────────────────────
@@ -883,6 +982,9 @@ async def test_run_doctor_all_green(tmp_path: Path) -> None:
         patch("soc_ai.doctor.list_gateway_models", listing),
         patch("soc_ai.doctor.probe_model_fitness", probe),
         patch("soc_ai.doctor._classify_endpoint", return_value=("", "resolves and connects")),
+        # Auth is off in these settings. A loopback listener keeps the row INFO
+        # whatever this host has open on the port.
+        patch("soc_ai.doctor._read_proc_net", _fake_proc([_proc_line("127.0.0.1", 8443)])),
     ):
         results = await run_doctor(settings)
     bad = [r for r in results if r.status in ("FAIL", "WARN")]
@@ -906,6 +1008,7 @@ async def test_run_doctor_all_green(tmp_path: Path) -> None:
         "model fitness",
         "egress",
         "egress: web_search",
+        "authentication",
         "blocklists",
         "prompt assets",
     } <= names
@@ -1155,3 +1258,255 @@ def test_tls_check_reads_the_proxy_path_as_info_and_a_bare_bind_as_warn(tmp_path
         soc_ai_host="127.0.0.1",
     )
     assert _by_name(doctor.check_tls(local), "tls").status == "INFO"
+
+
+def test_tls_off_row_reads_the_real_listener_not_the_configured_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The systemd unit binds 0.0.0.0 while the setting keeps its loopback default.
+
+    The row names the listener it finds. The control: a loopback listener
+    under a wildcard setting reads INFO, because the socket is the fact.
+    """
+    local_setting = _settings(
+        tmp_path,
+        soc_ai_tls_cert=None,
+        soc_ai_tls_key=None,
+        proxy_trusted_ips=[],
+        soc_ai_host="127.0.0.1",
+    )
+    monkeypatch.setattr(
+        doctor, "listening_addresses", lambda port, read=None: (["0.0.0.0:8443"], [])
+    )
+    row = _by_name(doctor.check_tls(local_setting), "tls")
+    assert row.status == "WARN" and "0.0.0.0" in row.detail
+
+    wildcard_setting = _settings(
+        tmp_path,
+        soc_ai_tls_cert=None,
+        soc_ai_tls_key=None,
+        proxy_trusted_ips=[],
+        soc_ai_host="0.0.0.0",
+    )
+    monkeypatch.setattr(
+        doctor, "listening_addresses", lambda port, read=None: (["127.0.0.1:8443"], [])
+    )
+    assert _by_name(doctor.check_tls(wildcard_setting), "tls").status == "INFO"
+
+
+# ── authentication: the start warning and the doctor row (range M3) ──────────
+#
+# The start line read SOC_AI_HOST, which defaults to 127.0.0.1, and said
+# "loopback bind 127.0.0.1" on a range where the systemd unit passed
+# --host 0.0.0.0 to uvicorn and a remote browser used the API with no login.
+
+_HEADER = (
+    "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt"
+    "   uid  timeout inode"
+)
+
+
+def _proc_line(addr: str, port: int, state: str = "0A") -> str:
+    """One /proc/net/tcp row, encoded the way the kernel prints it on this host."""
+    import ipaddress
+    import struct
+
+    raw = ipaddress.ip_address(addr).packed
+    words = struct.unpack("=" + "I" * (len(raw) // 4), raw)
+    local = "".join(f"{w:08X}" for w in words)
+    remote = "0" * len(local)
+    return (
+        f"   0: {local}:{port:04X} {remote}:0000 {state} 00000000:00000000 "
+        "00:00000000 00000000  1000        0 12345 1 0000000000000000 100 0 0 10 0"
+    )
+
+
+def _fake_proc(tcp: list[str], tcp6: list[str] | None = None) -> Any:
+    tables = {
+        "/proc/net/tcp": "\n".join([_HEADER, *tcp]),
+        "/proc/net/tcp6": "\n".join([_HEADER, *(tcp6 or [])]),
+    }
+
+    def _read(path: str) -> str:
+        return tables[path]
+
+    return _read
+
+
+def test_authentication_row_on_passes(tmp_path: Path) -> None:
+    settings = _settings(tmp_path, api_auth_required=True)
+    [row] = doctor.check_authentication(settings, read=_fake_proc([]), in_container=False)
+    assert (row.status, row.detail) == ("PASS", "on. Each API call needs a session or a token.")
+
+
+def test_authentication_row_off_with_a_loopback_listener_is_info(tmp_path: Path) -> None:
+    settings = _settings(tmp_path, soc_ai_port=8443)
+    read = _fake_proc(
+        # Negative controls: a wildcard listener on another port, and a wildcard
+        # socket on the port that is not in LISTEN state. Neither carries the API.
+        [
+            _proc_line("127.0.0.1", 8443),
+            _proc_line("0.0.0.0", 22),
+            _proc_line("0.0.0.0", 8443, state="01"),
+        ],
+        [_proc_line("::1", 8443)],
+    )
+    [row] = doctor.check_authentication(settings, read=read, in_container=False)
+    assert row.status == "INFO"
+    assert row.detail == (
+        "off. Port 8443 listens on 127.0.0.1:8443, [::1]:8443 only. Only this host can "
+        "call the API."
+    )
+
+
+@pytest.mark.parametrize(
+    ("tcp", "tcp6", "shown"),
+    [
+        ([_proc_line("0.0.0.0", 8443)], [], "0.0.0.0:8443"),
+        ([], [_proc_line("::", 8443)], "[::]:8443"),
+        ([_proc_line("127.0.0.1", 8443), _proc_line("192.0.2.10", 8443)], [], "192.0.2.10:8443"),
+    ],
+)
+def test_authentication_row_off_with_a_network_listener_warns(
+    tmp_path: Path, tcp: list[str], tcp6: list[str], shown: str
+) -> None:
+    settings = _settings(tmp_path, soc_ai_port=8443, soc_ai_host="127.0.0.1")
+    [row] = doctor.check_authentication(settings, read=_fake_proc(tcp, tcp6), in_container=False)
+    assert row.status == "WARN"
+    assert row.detail.startswith("off. Port 8443 listens on ")
+    assert shown in row.detail
+    assert "with no login" in row.detail
+    assert "API_AUTH_REQUIRED=true" in row.hint
+
+
+def test_authentication_row_off_in_a_container_names_the_published_port(tmp_path: Path) -> None:
+    settings = _settings(tmp_path, soc_ai_port=8443)
+    read = _fake_proc([_proc_line("0.0.0.0", 8443)])
+    [row] = doctor.check_authentication(settings, read=read, in_container=True)
+    assert row.status == "WARN"
+    assert "The port that the host publishes sets the reach. See SOC_AI_BIND." in row.detail
+
+
+def test_authentication_row_off_with_no_listener_warns(tmp_path: Path) -> None:
+    settings = _settings(tmp_path, soc_ai_port=8443)
+    read = _fake_proc([_proc_line("0.0.0.0", 22)])
+    [row] = doctor.check_authentication(settings, read=read, in_container=False)
+    assert row.status == "WARN"
+    assert row.detail.startswith("off. No socket on this host listens on port 8443.")
+
+
+def test_authentication_row_off_fails_soft_when_proc_is_unreadable(tmp_path: Path) -> None:
+    settings = _settings(tmp_path, soc_ai_port=8443)
+
+    def _denied(path: str) -> str:
+        raise PermissionError(13, "Permission denied", path)
+
+    [row] = doctor.check_authentication(settings, read=_denied, in_container=False)
+    assert row.status == "WARN"
+    assert row.detail.startswith("off. soc-ai could not read the listening sockets:")
+    assert "Permission denied" in row.detail
+    assert "ss -ltn" in row.hint
+
+
+def test_authentication_row_reads_tcp_alone_when_ipv6_is_off(tmp_path: Path) -> None:
+    """A host with IPv6 off has no tcp6 table. One missing table is not an error."""
+    settings = _settings(tmp_path, soc_ai_port=8443)
+    base = _fake_proc([_proc_line("0.0.0.0", 8443)])
+
+    def _no_tcp6(path: str) -> str:
+        if path.endswith("tcp6"):
+            raise FileNotFoundError(2, "No such file or directory", path)
+        return str(base(path))
+
+    [row] = doctor.check_authentication(settings, read=_no_tcp6, in_container=False)
+    assert row.status == "WARN" and "0.0.0.0:8443" in row.detail
+
+
+def test_authentication_rows_carry_no_dash(tmp_path: Path) -> None:
+    settings = _settings(tmp_path, soc_ai_port=8443)
+    for read in (_fake_proc([]), _fake_proc([_proc_line("0.0.0.0", 8443)])):
+        for container in (False, True):
+            [row] = doctor.check_authentication(settings, read=read, in_container=container)
+            assert "—" not in row.detail + row.hint
+            assert "–" not in row.detail + row.hint
+
+
+def test_start_warning_says_nothing_about_the_bind_it_cannot_see(tmp_path: Path) -> None:
+    """The systemd path: SOC_AI_HOST holds its 127.0.0.1 default, uvicorn binds 0.0.0.0."""
+    from soc_ai.main import auth_off_warning
+
+    settings = _settings(tmp_path, soc_ai_host="127.0.0.1")
+    line = auth_off_warning(settings, environ={})
+    assert line is not None
+    assert line.startswith("API_AUTH_REQUIRED=false. Authentication is off.")
+    assert "The bind is the server's." in line
+    assert "loopback" not in line and "127.0.0.1" not in line
+    assert "—" not in line and "–" not in line
+
+
+def test_start_warning_names_the_bind_that_soc_ai_serve_hands_over(tmp_path: Path) -> None:
+    from soc_ai.config import SERVE_BIND_ENV
+    from soc_ai.main import auth_off_warning
+
+    settings = _settings(tmp_path)
+    loop = auth_off_warning(settings, environ={SERVE_BIND_ENV: "127.0.0.1:8443"})
+    wide = auth_off_warning(settings, environ={SERVE_BIND_ENV: "0.0.0.0:8443"})
+    six = auth_off_warning(settings, environ={SERVE_BIND_ENV: "[::]:8443"})
+    assert loop is not None and "binds to 127.0.0.1:8443. Only this host can reach it." in loop
+    assert wide is not None and "binds to 0.0.0.0:8443. Other hosts can reach" in wide
+    assert six is not None and "Other hosts can reach" in six
+    assert auth_off_warning(_settings(tmp_path, api_auth_required=True), environ={}) is None
+
+
+def test_soc_ai_serve_hands_its_bind_to_the_app(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import uvicorn
+    from soc_ai import cli
+    from soc_ai.config import SERVE_BIND_ENV
+
+    monkeypatch.setenv(SERVE_BIND_ENV, "stale")
+    settings = _settings(tmp_path, soc_ai_host="0.0.0.0", soc_ai_port=9443)
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: seen.update(kw))
+    assert cli._serve(Namespace()) == 0
+    assert os.environ[SERVE_BIND_ENV] == "0.0.0.0:9443"
+    assert seen["host"] == "0.0.0.0" and seen["port"] == 9443
+
+
+# ── grid tls (range dogfood C9) ────────────────────────────────────────────────
+
+
+def test_grid_tls_row_states_each_setting_that_is_off(tmp_path: Path) -> None:
+    [es_only] = doctor.check_grid_tls(_settings(tmp_path, es_verify_ssl=False, so_verify_ssl=True))
+    assert (es_only.name, es_only.status) == ("grid tls", "INFO")
+    assert es_only.detail == (
+        "TLS verification to the grid is off. ES_VERIFY_SSL is false. soc-ai accepts any "
+        "certificate from the grid."
+    )
+    [both] = doctor.check_grid_tls(_settings(tmp_path, es_verify_ssl=False, so_verify_ssl=False))
+    assert "ES_VERIFY_SSL and SO_VERIFY_SSL are false." in both.detail
+    assert "—" not in both.detail and "–" not in both.detail
+
+
+def test_grid_tls_row_is_absent_when_verification_is_on(tmp_path: Path) -> None:
+    """Negative control: a verified grid gets no row."""
+    assert doctor.check_grid_tls(_settings(tmp_path, es_verify_ssl=True, so_verify_ssl=True)) == []
+
+
+async def test_grid_tls_row_sits_under_the_grid_row(tmp_path: Path) -> None:
+    settings = _settings(tmp_path, es_verify_ssl=False)
+    await _migrate(settings)
+    _touch_fresh_feeds(settings)
+    with (
+        patch("soc_ai.doctor.make_auth", return_value=_StubAuth()),
+        patch("soc_ai.doctor.ElasticClient", return_value=_StubElastic()),
+        patch("soc_ai.doctor.list_gateway_models", AsyncMock(return_value=([], None))),
+        patch("soc_ai.doctor._classify_endpoint", return_value=("", "resolves and connects")),
+        patch("soc_ai.doctor._read_proc_net", _fake_proc([])),
+    ):
+        results = await run_doctor(settings, include_fitness=False)
+    names = [r.name for r in results]
+    assert names.index("grid tls") == names.index("elasticsearch") + 1
+    assert names.count("grid tls") == 1

@@ -20,13 +20,16 @@ from typing import Any
 
 import pytest
 from soc_ai.config import Settings
-from soc_ai.hunting.prior_sweep import DEFAULT_RECENT_HOURS, RECENT_MAX_ENTITIES, run_prior_sweep
+from soc_ai.hunting import prior_sweep
+from soc_ai.hunting.prior_sweep import DEFAULT_RECENT_HOURS, run_prior_sweep
 from soc_ai.hunting.priors import COVERAGE_BLIND, COVERAGE_MEASURED
 from soc_ai.hunting.spec import HuntSpec
 from soc_ai.so_client.elastic import EsSearchResult
 from soc_ai.store import entity_profiles as ep
 from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
 from soc_ai.store.models import HostDossier, HostDossierField
+
+from tests.es_doubles import composite_page
 
 pytestmark = pytest.mark.asyncio
 
@@ -153,11 +156,19 @@ class _FakeES:
                 self.windows.append(clause["range"]["@timestamp"])
 
         key = next(iter(keys), None)
+        body = (aggs or {}).get(key or "") or {}
+        # The recent read pages a composite aggregation. The page holds the
+        # keys after the last page, in key order, and says where it ended.
+        answer = (
+            composite_page(body, self._buckets())
+            if "composite" in body
+            else {"buckets": self._buckets()}
+        )
         return EsSearchResult(
             total=0,
             took_ms=1,
             hits=[],
-            aggregations={key: {"buckets": self._buckets()}} if key else {},
+            aggregations={key: answer} if key else {},
             total_is_lower_bound=False,
         )
 
@@ -1051,8 +1062,10 @@ async def test_a_recorded_departure_states_documents_in_the_window_it_read(
         )
         row = (await db.execute(select(EntityObservation))).scalars().one()
 
+    # The estate sentence states how many profiled hosts hold the member.
     assert row.summary == (
         "new served port for this host: 445. 6 documents in the last 6 h. "
+        "None of the 1 profiled host holds it. "
         "The baseline holds 1 value over 30 days."
     )
     await engine.dispose()
@@ -1173,10 +1186,14 @@ async def test_a_grid_with_no_plane_for_a_dimension_is_blind_not_quiet(
     await engine.dispose()
 
 
+# Four weeks of 500 flows an hour, ending a day before now. Relative to now,
+# so the series always covers every hour of the week the sweep reads.
+_SERIES_START = (datetime.now(UTC) - timedelta(days=29)).replace(minute=0, second=0, microsecond=0)
 _EVERY_CELL = {
     "work": {"median": 500.0, "dispersion": 20.0, "support_days": 20, "samples": 200},
     "off": {"median": 500.0, "dispersion": 20.0, "support_days": 20, "samples": 200},
     "weekend": {"median": 500.0, "dispersion": 20.0, "support_days": 8, "samples": 80},
+    "hourly": {"start": _SERIES_START.isoformat(), "counts": [500] * (28 * 24)},
 }
 
 
@@ -1210,17 +1227,40 @@ async def test_a_host_that_went_silent_is_a_collapsed_rate_departure(
     assert silent[0].departures, silent[0].note
     assert all(d.observed_value == 0.0 for d in silent[0].departures)
     assert all(d.sample_ids == () for d in silent[0].departures)
+    # Every complete hour of the window read zero.
+    assert max(d.run_hours for d in silent[0].departures) >= 2
+    assert "The sweep did not see the host in the window" in silent[0].note
     await engine.dispose()
 
 
+def _estate_key(i: int) -> str:
+    """The ``i``-th address of a large test estate, in the benchmarking range."""
+    return f"198.18.{i // 250}.{i % 250 + 1}"
+
+
 class _SaturatedES(_ShapedES):
-    """A shaped read that fills the terms bucket: many entities, one hour each."""
+    """A shaped read over ``count`` entities, one hour each, in composite pages.
+
+    ``pages`` holds the composite body of every recent read, so a test can
+    count the pages and read where each one started.
+    """
+
+    def __init__(self, stamp: str, *, count: int, keys: Sequence[str] | None = None) -> None:
+        super().__init__("unused", [(stamp, 1)])
+        self.keys = list(keys) if keys is not None else [_estate_key(i) for i in range(count)]
+        self.pages: list[dict[str, Any]] = []
+
+    async def search(self, index: str, query: dict[str, Any], **kwargs: Any) -> EsSearchResult:
+        for body in (kwargs.get("aggs") or {}).values():
+            if "composite" in body:
+                self.pages.append(body["composite"])
+        return await super().search(index, query, **kwargs)
 
     def _buckets(self) -> list[dict[str, Any]]:
         stamp = self.hourly[0][0]
         return [
             {
-                "key": f"10.2.{i // 250}.{i % 250 + 1}",
+                "key": key,
                 "doc_count": 1,
                 "per_hour": {
                     "buckets": [
@@ -1232,24 +1272,30 @@ class _SaturatedES(_ShapedES):
                     ]
                 },
             }
-            for i in range(RECENT_MAX_ENTITIES)
+            for key in self.keys
         ]
 
 
-async def test_a_saturated_recent_read_does_not_score_absent_hosts_as_silent(
-    settings_kratos: Settings,
-) -> None:
-    """When the recent read is full, a host missing from it may just rank below the cut.
+def _two_hours_ago() -> str:
+    return (datetime.now(UTC) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:00:00.000Z")
 
-    The read holds the busiest RECENT_MAX_ENTITIES entities. On an estate
-    larger than that, a profiled host outside the top set is still talking,
-    so it must not be scored as zero and formed into a collapse lead.
+
+async def test_a_saturated_recent_read_does_not_score_absent_hosts_as_silent(
+    settings_kratos: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the recent read stops at its ceiling, a host past it is still talking.
+
+    The read pages the estate in key order up to RECENT_MAX_ENTITIES. On an
+    estate larger than that, a profiled host past the ceiling is absent from
+    the answer, so it must not be scored as zero and formed into a collapse
+    lead. The ceiling is lowered here so the test reads 301 entities, and the
+    note carries the ceiling's number.
     """
+    monkeypatch.setattr(prior_sweep, "RECENT_MAX_ENTITIES", 300)
     engine, maker = await _db(settings_kratos)
     await _seed_profile(maker, vector=_EVERY_CELL, dimension="connection_rate", shape="numeric")
 
-    recent = (datetime.now(UTC) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:00:00.000Z")
-    es = _SaturatedES("unused", [(recent, 1)])
+    es = _SaturatedES(_two_hours_ago(), count=301)
     async with maker() as db:
         sweep = await run_prior_sweep(
             elastic=es,
@@ -1260,8 +1306,141 @@ async def test_a_saturated_recent_read_does_not_score_absent_hosts_as_silent(
 
     assert sweep.fired == ()
     assert not [r for r in sweep.results if r.entity_key == _SWITCH], sweep.results
-    assert any("did not score silent hosts" in note for note in sweep.notes), sweep.notes
+    silent = [n for n in sweep.notes if "did not score silent hosts" in n]
+    assert silent and "ceiling of 300 entities" in silent[0], sweep.notes
+    ceiling = [n for n in sweep.notes if n.startswith("the recent read for connection_rate")]
+    assert ceiling == [
+        "the recent read for connection_rate stopped at the ceiling of 300 entities. "
+        "The sweep did not score the entities past the ceiling."
+    ], sweep.notes
+    # The 300 entities the read holds are scored. The one past it is not.
+    assert len(sweep.results) == 300
     await engine.dispose()
+
+
+# A profiled host the shaped read never returns: silent, unless the read was cut.
+_SILENT = "198.51.100.20"
+
+
+async def _silent_sweep(
+    settings: Settings,
+    es: _SaturatedES,
+    *,
+    cidrs: Sequence[str] = (),
+    profiled: Sequence[str] = (),
+) -> Any:
+    """Sweep ``es`` with a rate baseline on the silent host and on ``profiled``.
+
+    An entity with no baseline scores as one ``*`` row, so a test that names
+    an entity it expects scored gives it a baseline here.
+    """
+    engine, maker = await _db(settings)
+    for key in (_SILENT, *profiled):
+        await _seed_profile(
+            maker,
+            vector=_EVERY_CELL,
+            dimension="connection_rate",
+            shape="numeric",
+            entity_key=key,
+        )
+    async with maker() as db:
+        sweep = await run_prior_sweep(
+            elastic=es,
+            settings=_settings_like(settings),
+            db=db,
+            catalog=_prior(dimension="connection_rate", test="below", roles=[]),
+            cidrs=cidrs,
+        )
+    await engine.dispose()
+    return sweep
+
+
+async def test_a_recent_read_of_2500_entities_reads_every_page(
+    settings_kratos: Settings,
+) -> None:
+    """The read pages past the old cap of 500 and scores the whole estate.
+
+    A terms read held the busiest 500 entities. On a 2,500-host estate it
+    stopped, said so, and scored no silent host. Three composite pages read
+    all 2,500, so the read is complete and the silent host is scored.
+    """
+    es = _SaturatedES(_two_hours_ago(), count=2500)
+    last = sorted(es.keys)[-1]
+    sweep = await _silent_sweep(settings_kratos, es, profiled=[last])
+
+    assert [page["size"] for page in es.pages] == [1000, 1000, 1000]
+    assert "after" not in es.pages[0]
+    assert es.pages[1]["after"] == {"key": sorted(es.keys)[999]}
+    assert es.pages[2]["after"] == {"key": sorted(es.keys)[1999]}
+    # Every entity read is scored once, and the silent host once more.
+    assert len(sweep.results) == 2501
+    assert [r.coverage for r in sweep.results if r.entity_key == last] == [COVERAGE_MEASURED]
+    assert not [n for n in sweep.notes if "ceiling" in n], sweep.notes
+    # Absence now reads as silence: the profiled host that sent nothing collapsed.
+    silent = [r for r in sweep.results if r.entity_key == _SILENT]
+    assert len(silent) == 1 and silent[0].departures, sweep.results
+
+
+async def test_a_recent_read_of_400_entities_is_one_page_with_no_note(
+    settings_kratos: Settings,
+) -> None:
+    """Negative control: an estate under one page costs one search and no note."""
+    es = _SaturatedES(_two_hours_ago(), count=400)
+    sweep = await _silent_sweep(settings_kratos, es)
+
+    assert len(es.pages) == 1
+    assert not [n for n in sweep.notes if "ceiling" in n], sweep.notes
+    assert len(sweep.results) == 401
+    assert next(r for r in sweep.results if r.entity_key == _SILENT).departures
+
+
+async def test_a_capped_read_the_estate_test_thins_still_scores_no_silent_host(
+    settings_kratos: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ceiling guard reads the pager's own word, not a count of what survived.
+
+    The read stops at the ceiling of 2,000. The estate test then drops the
+    entities outside the estate, so fewer than 2,000 reach the evaluator. A
+    guard that counted them would score the profiled host past the ceiling as
+    silent and form a collapse lead from it.
+    """
+    monkeypatch.setattr(prior_sweep, "RECENT_MAX_ENTITIES", 2000)
+    inside = [f"198.51.{i // 250}.{i % 250 + 1}" for i in range(1900)]
+    outside = [_estate_key(i) for i in range(600)]
+    es = _SaturatedES(_two_hours_ago(), count=0, keys=[*inside, *outside])
+    sweep = await _silent_sweep(settings_kratos, es, cidrs=["198.51.0.0/16"])
+
+    assert len(es.pages) == 2
+    assert len(sweep.results) < 2000
+    assert not [r for r in sweep.results if r.entity_key == _SILENT], sweep.results
+    assert any("ceiling of 2,000 entities" in n for n in sweep.notes), sweep.notes
+    assert any("did not score silent hosts" in n for n in sweep.notes), sweep.notes
+
+
+async def test_a_categorical_recent_read_scores_an_entity_past_the_old_cap(
+    settings_kratos: Settings,
+) -> None:
+    """The member read pages too. An entity on the second page is scored.
+
+    The served-port read held the busiest 500 entities. The rest had no score
+    on any categorical analytic, and the console showed the cap.
+    """
+    recent = {f"198.51.{i // 250}.{i % 250 + 1}": {"445": 3} for i in range(1200)}
+    last = sorted(recent)[-1]
+    es = _FakeES(recent=recent)
+    engine, maker = await _db(settings_kratos)
+    await _seed_profile(maker, vector={"22": {"count": 40}}, entity_key=last)
+    async with maker() as db:
+        sweep = await run_prior_sweep(
+            elastic=es, settings=_settings_like(settings_kratos), db=db, catalog=_prior()
+        )
+    await engine.dispose()
+
+    pages = [agg for agg in es.aggs if "composite" in agg.get("served_ports", {})]
+    assert len(pages) == 2
+    assert len(sweep.results) == 1200
+    assert [r.entity_key for r in sweep.results if r.entity_key != "*"] == [last]
+    assert not [n for n in sweep.notes if "ceiling" in n], sweep.notes
 
 
 async def test_a_silent_plane_does_not_make_every_profiled_host_a_collapse(
@@ -1480,4 +1659,136 @@ async def test_a_shared_hostname_takes_the_strongest_belief(
         roles = await _roles(db)
     assert roles["ws01"] == ("workstation", 1.0)
     assert roles["10.1.10.5"] == (None, 0.0)
+    await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# The event time: the observation carries the newest document it cites
+# ---------------------------------------------------------------------------
+
+
+def _epoch_ms(stamp: datetime) -> int:
+    return int(stamp.timestamp() * 1000)
+
+
+class _SortedES(_FakeES):
+    """The real sample shape: each sampled hit carries its ``@timestamp`` as the
+    sort value, because the samples sort on it. ``stamps`` gives the times, in
+    the order Elasticsearch returns them, newest first."""
+
+    def __init__(self, recent: dict[str, dict[str, int]], stamps: Sequence[datetime]) -> None:
+        super().__init__(recent)
+        self.stamps = list(stamps)
+
+    def _buckets(self) -> list[dict[str, Any]]:
+        buckets = super()._buckets()
+        for bucket in buckets:
+            for member in bucket["members"]["buckets"]:
+                hits = member["samples"]["hits"]["hits"]
+                for hit, stamp in zip(hits, self.stamps, strict=False):
+                    hit["sort"] = [_epoch_ms(stamp)]
+        return buckets
+
+
+async def test_a_departure_records_the_time_of_its_newest_document(
+    settings_kratos: Settings,
+) -> None:
+    """``born_at`` is the sweep. ``observed_at`` is the newest document the
+    observation cites, read off the sample's sort value at no extra cost."""
+    from soc_ai.store.models import EntityObservation
+    from sqlalchemy import select
+
+    engine, maker = await _db(settings_kratos)
+    await _seed_host(maker, role="network_device", operator=True, confidence=0.0)
+    await _seed_profile(maker, vector={"22": {"count": 40}})
+
+    now = datetime.now(UTC)
+    newest = (now - timedelta(hours=20)).replace(microsecond=0)
+    es = _SortedES(
+        {_SWITCH: {"445": 6}},
+        [newest, newest - timedelta(hours=1), newest - timedelta(hours=3)],
+    )
+    async with maker() as db:
+        sweep = await run_prior_sweep(
+            elastic=es,
+            settings=_settings_like(settings_kratos),
+            db=db,
+            catalog=_prior(),
+            record=True,
+        )
+        row = (await db.execute(select(EntityObservation))).scalars().one()
+
+    assert sweep.fired[0].departures[0].observed_at == newest
+    assert row.observed_at == newest.replace(tzinfo=None)
+    assert row.born_at > row.observed_at + timedelta(hours=19)
+    await engine.dispose()
+
+
+async def test_a_shaped_departure_records_the_newest_document_of_its_hour(
+    settings_kratos: Settings,
+) -> None:
+    """An hour departure reads several hourly buckets into one member. The
+    event time is the newest document across them."""
+    from soc_ai.store.models import EntityObservation
+    from sqlalchemy import select
+
+    engine, maker = await _db(settings_kratos)
+    await _seed_host(maker, role="network_device", operator=True, confidence=0.0)
+    await _seed_profile(
+        maker, vector={"9": {"count": 300}, "10": {"count": 280}}, dimension="active_hours"
+    )
+    day = (datetime.now(UTC) - timedelta(days=1)).replace(hour=3, minute=0, second=0, microsecond=0)
+    older = day - timedelta(days=1)
+
+    class _SortedShaped(_ShapedES):
+        def _buckets(self) -> list[dict[str, Any]]:
+            buckets = super()._buckets()
+            for hb in buckets[0]["per_hour"]["buckets"]:
+                start = datetime.fromisoformat(hb["key_as_string"].replace("Z", "+00:00"))
+                for n, hit in enumerate(hb["samples"]["hits"]["hits"]):
+                    hit["sort"] = [_epoch_ms(start + timedelta(minutes=40 - 10 * n))]
+            return buckets
+
+    es = _SortedShaped(
+        _SWITCH,
+        [
+            (day.isoformat().replace("+00:00", "Z"), 5),
+            (older.isoformat().replace("+00:00", "Z"), 4),
+        ],
+    )
+    async with maker() as db:
+        await run_prior_sweep(
+            elastic=es,
+            settings=_settings_like(settings_kratos),
+            db=db,
+            catalog=_prior(dimension="active_hours", test="outside_active_hours"),
+            record=True,
+        )
+        row = (await db.execute(select(EntityObservation))).scalars().one()
+
+    assert row.observed_at == (day + timedelta(minutes=40)).replace(tzinfo=None)
+    await engine.dispose()
+
+
+async def test_a_sample_without_a_sort_value_leaves_the_record_time(
+    settings_kratos: Settings,
+) -> None:
+    """Negative control: a plane that returns no sort value gives no event
+    time. The observation keeps no invented one and decays from the record."""
+    from soc_ai.store.models import EntityObservation
+    from sqlalchemy import select
+
+    engine, maker = await _db(settings_kratos)
+    await _seed_host(maker, role="network_device", operator=True, confidence=0.0)
+    await _seed_profile(maker, vector={"22": {"count": 40}})
+    async with maker() as db:
+        await run_prior_sweep(
+            elastic=_FakeES(recent={_SWITCH: {"445": 6}}),
+            settings=_settings_like(settings_kratos),
+            db=db,
+            catalog=_prior(),
+            record=True,
+        )
+        row = (await db.execute(select(EntityObservation))).scalars().one()
+    assert row.observed_at is None
     await engine.dispose()

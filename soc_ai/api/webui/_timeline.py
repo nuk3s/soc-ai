@@ -108,6 +108,9 @@ _TL_SKIP = {
     # applied state on the action card already tells this story; a generic
     # timeline row would just be noise appended after "done".
     "action_executed",
+    # The Oracle rule shadow ledger. It changes nothing on the run, and
+    # Detection tuning shows the tally.
+    "oracle_shadow",
 }
 _PORT_PROTO = {21: "FTP", 22: "SSH", 53: "DNS", 80: "HTTP", 443: "TLS", 445: "SMB", 3389: "RDP"}
 _ACTION_TITLE = {
@@ -413,8 +416,8 @@ def _tool_outcome(result: Any) -> str:
     if result.get("available") is False:
         reason = str(result.get("reason") or "")
         if "not_configured" in reason:
-            return "skipped (not configured)"
-        return "skipped (online enrichment off)"
+            return "skipped, not configured"
+        return "skipped, online enrichment off"
     # A tool error — a short, distinct failure phrase, never a JSON/traceback dump.
     if result.get("error"):
         msg = result.get("message") or result.get("error")
@@ -511,7 +514,20 @@ def _tool_step(tool_name: str, args: dict[str, Any], result: Any) -> tuple[str, 
 
     lines: list[str] = []
     headline_key: str | None = None
-    if isinstance(result, dict):
+    if isinstance(result, dict) and result.get("error"):
+        # A failed call leads with the failure and its reason. The analytic
+        # tool answers could_not_run with the analytic's own ``status`` beside
+        # the error, so the generic headline below read "result: live" and the
+        # operator never saw why the call failed.
+        code = result["error"]
+        lines.append(f"failed: {_compact(code, 120)}" if isinstance(code, str) else "failed")
+        for k in ("detail", "message", "hint"):
+            reason = result.get(k)
+            if isinstance(reason, str) and reason.strip():
+                headline_key = k
+                lines.append(f"reason: {_compact(reason, 600)}")
+                break
+    elif isinstance(result, dict):
         # The full answer first — generously capped (the title was the clipped one).
         for k in ("summary", "verdict", "status", "note", "hint"):
             if result.get(k):
@@ -550,6 +566,7 @@ _AUTO_ACK_SKIP_REASON = {
     "no_investigation": "the run retrieved nothing",
     "uncited": "no citation resolves",
     "promoted_finding": "a promoted finding has no alert",
+    "oracle_dissent": "the Oracle disagreed without evidence",
 }
 
 
@@ -806,6 +823,9 @@ class OracleOut(BaseModel):
     redacted: bool = False
     redactionNote: str | None = None
     changed: bool = False  # oracleVerdict differs from localVerdict
+    # The Oracle answered another class with no evidence that resolves. Its
+    # answer is an opinion on the run; the local verdict stands.
+    withheld: bool = False
 
 
 class FallbackOut(BaseModel):
@@ -976,8 +996,18 @@ class InvestigationOut(BaseModel):
     groupId: str
     name: str
     kind: str
+    # The source address and the destination address of the alert, as display
+    # strings ("—" when the alert names none). ``host`` held the alert's host
+    # name and ``ip`` fell back to the source address, so a host-reported alert
+    # read "source <host> → destination <source address>".
     host: str
     ip: str
+    # The same two ends, null when the alert names none, and the host that
+    # reported the alert. The page names the reporter "on <host>" and never
+    # puts it in a direction slot.
+    srcIp: str | None = None
+    dstIp: str | None = None
+    reportedBy: str | None = None
     verdict: str
     conf: float
     rationale: str
@@ -1050,6 +1080,13 @@ class InvestigationOut(BaseModel):
     # The id of the newer primary run for the same alert, when a later run
     # superseded this one. None when this run is the primary run.
     supersededBy: str | None = None
+    # The budget class the run ran in (migration 0058): cheap, standard, deep
+    # or rule_prior. None on a run stored before the classes existed. The
+    # console shows it as a chip.
+    runClass: str | None = None
+    # Why the run ended in its class, from the stored report. None when the
+    # report does not say.
+    runClassReason: str | None = None
 
 
 def _host_contexts(profiles: Any) -> list[dict[str, Any]]:
@@ -1237,6 +1274,12 @@ def _build_actions(
                 "Auto-ack is on. This run reached its verdict and retrieved "
                 "nothing. A person must acknowledge it."
             )
+        elif p.get("reason") == "oracle_dissent":
+            ack_pending_note = (
+                "Auto-ack is on. The Oracle answered another verdict and cited no "
+                "evidence that resolves. The local verdict stands. A person must "
+                "acknowledge it."
+            )
         elif p.get("reason") == "uncited":
             # Both shapes read the same way to an analyst — the verdict names
             # nothing that can be checked — so they get one sentence, with the
@@ -1399,6 +1442,7 @@ def _build_oracle(events: list[Any]) -> OracleOut | None:
     redaction_note = _redaction_note(redaction)
     redacted = redaction_note is not None
     changed = bool(oracle_verdict and local_verdict and oracle_verdict != local_verdict)
+    withheld = bool((adj_payload or {}).get("override_withheld"))
     return OracleOut(
         escalated=True,
         reason=reason,
@@ -1410,6 +1454,7 @@ def _build_oracle(events: list[Any]) -> OracleOut | None:
         redacted=redacted,
         redactionNote=redaction_note,
         changed=changed,
+        withheld=withheld,
     )
 
 

@@ -67,7 +67,7 @@ describe('a hunt is the subject of an investigation', () => {
 
   it('states what the subject of a hunt investigation is', () => {
     expect(TIP.CHIP_SUBJECT_HUNT).toBe(
-      "An investigation of a hunt. The subject is the hunt's findings, not one event.",
+      'An investigation of a hunt. Its subject is every finding of the hunt.',
     );
     expect(TIP.SUBJECT_OBJECTIVE).toBe(
       'The objective the hunt ran with. This investigation answers it.',

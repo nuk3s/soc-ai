@@ -213,6 +213,34 @@ def test_about_endpoint_exposes_version_repo_license() -> None:
         assert body["update_check_enabled"] is False
 
 
+def test_about_names_the_commit_from_the_setting() -> None:
+    """Range dogfood C7: the range ran unreleased main as "1.5.2" and named no commit."""
+    sha = "c0fb789d" + "0" * 32
+    for c in _client(_settings(soc_ai_commit=sha)):
+        assert c.get("/api/v1/about").json()["commit"] == sha
+
+
+def test_about_commit_falls_back_to_the_build_stamp_then_to_null(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from soc_ai.api.webui import routes_meta
+
+    monkeypatch.setattr(routes_meta, "__commit__", "feedface")
+    for c in _client(_settings(soc_ai_commit="   ")):
+        assert c.get("/api/v1/about").json()["commit"] == "feedface"
+    # Negative control: no setting and no stamp gives null, never a guess.
+    monkeypatch.setattr(routes_meta, "__commit__", None)
+    for c in _client(_settings()):
+        assert c.get("/api/v1/about").json()["commit"] is None
+
+
+def test_the_commit_setting_reads_soc_ai_commit_from_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SOC_AI_COMMIT", "abc123")
+    assert _settings().soc_ai_commit == "abc123"
+
+
 def test_about_reflects_update_check_toggle() -> None:
     for c in _client(_settings(update_check_enabled=True)):
         assert c.get("/api/v1/about").json()["update_check_enabled"] is True

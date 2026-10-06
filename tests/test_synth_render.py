@@ -412,3 +412,37 @@ def test_render_offset_must_be_integer(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="offset_seconds"):
         render_scenario(scenario, run_time=RUN_TIME)
+
+
+def test_plant_id_overwrites_the_marker_the_template_carries() -> None:
+    """A repeat plant stamps its own scope key over the template's bare id.
+
+    Every scenario file writes ``synth.scenario_id: <its own id>`` into each
+    event. The stamp used ``setdefault``, so the plant id of repeat 1 and up
+    never landed, five plants of one scenario shared one scope key, and the
+    anchor guard refused every repeat past the first. The control at the end
+    proves the bare case still stamps the scenario id.
+    """
+    from soc_ai.eval.synth_render import render_scenario
+
+    scenario = _scenario(
+        [
+            EventTemplate(
+                index="logs-synth-zeek-conn",
+                is_triage_target=True,
+                fields={
+                    "@timestamp": "{{ run_time }}",
+                    "event.dataset": "zeek.conn",
+                    "synth.scenario_id": "test-scenario",
+                    "synth.scenario_version": 1,
+                },
+            ),
+        ]
+    )
+
+    docs = render_scenario(scenario, run_time=RUN_TIME, plant_id="test-scenario::r1")
+    assert [d.body["synth.scenario_id"] for d in docs] == ["test-scenario::r1"]
+    assert docs[0].body["synth.scenario_version"] == 1
+
+    bare = render_scenario(scenario, run_time=RUN_TIME)
+    assert [d.body["synth.scenario_id"] for d in bare] == ["test-scenario"]

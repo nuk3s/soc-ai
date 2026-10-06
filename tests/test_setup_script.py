@@ -535,6 +535,41 @@ def test_auto_triage_off_word_stays_disabled(tmp_path: Path) -> None:
     assert "AUTO_TRIAGE_SCHEDULE_ENABLED" not in env_values(run.env_text)
 
 
+def test_store_postgres_writes_the_url_the_password_and_the_profile(tmp_path: Path) -> None:
+    """Pins the store question: yes on a fresh install puts the store in the
+    compose "postgres" service. The URL must carry the same password the server
+    starts with, or soc-ai cannot log in. The profile goes in COMPOSE_PROFILES
+    outside the managed block, where scripts/tls-proxy.sh can add "proxy" to it.
+    """
+    run = run_setup(tmp_path, BASE_CONF + "STORE_POSTGRES=y\n")
+    assert run.proc.returncode == 0, run.proc.stderr + run.proc.stdout
+    values = env_values(run.env_text)
+    password = values["SOC_AI_POSTGRES_PASSWORD"]
+    assert password == "stubsecret"
+    assert values["SOC_AI_DATABASE_URL"] == (
+        f"postgresql+asyncpg://soc_ai:{password}@postgres:5432/soc_ai"
+    )
+    assert values["COMPOSE_PROFILES"] == "postgres"
+    block_end = run.env_text.index("# <<< soc-ai setup.sh <<<")
+    lines = [m.start() for m in re.finditer(r"^COMPOSE_PROFILES=", run.env_text, re.M)]
+    assert len(lines) == 1 and lines[0] > block_end
+
+
+def test_store_defaults_to_sqlite(tmp_path: Path) -> None:
+    run = run_setup(tmp_path, BASE_CONF)
+    assert run.proc.returncode == 0, run.proc.stderr + run.proc.stdout
+    values = env_values(run.env_text)
+    assert "SOC_AI_DATABASE_URL" not in values or values["SOC_AI_DATABASE_URL"] == ""
+    assert "SOC_AI_POSTGRES_PASSWORD" not in values
+    assert "COMPOSE_PROFILES" not in values
+
+
+def test_store_postgres_refuses_a_password_the_url_cannot_carry(tmp_path: Path) -> None:
+    run = run_setup(tmp_path, BASE_CONF + "STORE_POSTGRES=y\nSOC_AI_POSTGRES_PASSWORD=a@b:c\n")
+    assert run.proc.returncode != 0
+    assert "SOC_AI_POSTGRES_PASSWORD may hold" in run.proc.stderr
+
+
 def test_maxmind_key_written_when_provided(tmp_path: Path) -> None:
     """Pins: a MaxMind key in the conf (`ask MAXMIND_LICENSE_KEY "  MaxMind GeoLite2
     license key..." "${MAXMIND_LICENSE_KEY:-}"`) reaches `.env` verbatim via the

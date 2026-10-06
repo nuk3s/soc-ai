@@ -560,6 +560,14 @@ _FITNESS_TOOL_PROMPT = (
 _TRUNCATION_MARKERS: tuple[str, ...] = ("before any response", "token limit")
 
 
+# Why a leg could not measure the model. A leg with one of these causes holds
+# no capability result: the call never came back with an answer to grade. The
+# doctor reads such a leg as "could not measure", never as an unfit model.
+CAUSE_TIMEOUT = "timeout"
+CAUSE_TRANSPORT = "transport"
+UNMEASURED_CAUSES = frozenset({CAUSE_TIMEOUT, CAUSE_TRANSPORT})
+
+
 def _fitness_leg(
     name: str,
     grade: str,
@@ -568,6 +576,7 @@ def _fitness_leg(
     ok: bool | None = None,
     elapsed_s: float | None = None,
     backend: str | None = None,
+    cause: str | None = None,
 ) -> dict[str, Any]:
     """Build one leg result. ``ok`` defaults to (grade == 'pass'); ``detail`` is
     always scrubbed so a model/gateway error string can never leak a credential.
@@ -577,6 +586,12 @@ def _fitness_leg(
     http://spark-a:8000/v1" tells the operator whether the model is unfit or the
     backend was busy. Both are None only when the leg never got far enough to
     measure (a builder error).
+
+    ``cause`` is set only when the leg could not measure the model: ``timeout``
+    for a cut-off call, ``transport`` for a connection or gateway failure. The
+    grade keeps its old value, so the console chip and the audit history read
+    the same as before. The doctor reads ``cause`` to tell an unfit model from
+    an unmeasured one.
     """
     return {
         "name": name,
@@ -585,6 +600,7 @@ def _fitness_leg(
         "detail": _scrub(detail)[:200],
         "elapsed_s": round(float(elapsed_s), 2) if elapsed_s is not None else None,
         "backend": _scrub(backend)[:120] if backend else None,
+        "cause": cause,
     }
 
 
@@ -634,6 +650,50 @@ def _teardown_artifact(exc: BaseException, *, depth: int = 0) -> str | None:
             if found:
                 return found
     return None
+
+
+# Gateway answers that say the backend was not there to ask: rate limited, a
+# bad gateway, no backend, a gateway timeout. A 500 stays a failure: a model
+# server can raise it on the model's own output.
+_GATEWAY_STATUSES = frozenset({429, 502, 503, 504})
+
+
+def _transport_failure(exc: BaseException, *, depth: int = 0) -> str | None:
+    """Name the transport failure in *exc*'s chain, or None.
+
+    A connection that never opened, a stream that broke, and a gateway status
+    that says no backend answered are each a failure to reach the model. None of
+    them says what the model can do. Walks the chain the way
+    :func:`_teardown_artifact` does, because pydantic-ai wraps the httpx error
+    in its own ``ModelAPIError``.
+    """
+    if depth > 6:
+        return None
+    if isinstance(exc, httpx.TransportError):
+        return type(exc).__name__
+    if type(exc).__name__ == "APIConnectionError":
+        return type(exc).__name__
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and status in _GATEWAY_STATUSES:
+        return f"HTTP {status}"
+    for member in getattr(exc, "exceptions", ()) or ():
+        found = _transport_failure(member, depth=depth + 1)
+        if found:
+            return found
+    for nested in (exc.__cause__, exc.__context__):
+        if nested is not None:
+            found = _transport_failure(nested, depth=depth + 1)
+            if found:
+                return found
+    return None
+
+
+def _transport_detail(name: str, elapsed_s: float, failure: str) -> str:
+    """The one-line story of a leg that could not reach the model."""
+    return (
+        f"{name} could not reach the model after {elapsed_s:.1f} s: {failure}. "
+        "It is not a model capability failure."
+    )
 
 
 def _timeout_detail(name: str, elapsed_s: float, artifact: str | None = None) -> str:
@@ -781,6 +841,18 @@ async def _run_leg(
                 ok=timeout_ok,
                 elapsed_s=elapsed,
                 backend=backend,
+                cause=CAUSE_TIMEOUT,
+            )
+        failure = _transport_failure(exc)
+        if failure is not None:
+            return _fitness_leg(
+                name,
+                timeout_grade,
+                _transport_detail(name, elapsed, failure),
+                ok=timeout_ok,
+                elapsed_s=elapsed,
+                backend=backend,
+                cause=CAUSE_TRANSPORT,
             )
         classified = classify(exc) if classify is not None else None
         if classified is None:
@@ -1023,6 +1095,7 @@ async def probe_model_fitness(settings: Any) -> dict[str, Any]:
             "fail",
             f"the probe exceeded {int(_FITNESS_TOTAL_TIMEOUT_S)} s during the {in_flight[0]} leg",
             elapsed_s=time.monotonic() - started,
+            cause=CAUSE_TIMEOUT,
         )
         return {
             "grade": "fail",

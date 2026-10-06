@@ -342,6 +342,24 @@ _validate_citations = _resolve_citations
 # reported at 0.60-0.68 isn't scored as an under-confident near-miss.
 _ESCALATION_CONF_FLOOR = 0.70
 
+# The confidence a coercing gate caps a verdict at: the hard evidence gate, the
+# decisive-value support gate and the no-benign-baseline refusal all land
+# needs_more_info at min(confidence, 0.4). The citation cap's floor is the same
+# number.
+GATE_COERCE_CONFIDENCE = 0.4
+
+
+def gate_band() -> tuple[float, float]:
+    """The confidence band in which the gates say the verdict is unsettled.
+
+    ``[low, high)``. ``low`` is where a coercing gate parks a verdict it could
+    not ground. ``high`` is the escalation floor: a confirmed true positive is
+    raised to it, and a verdict at or above it is one the gates let stand as
+    confident. The Oracle escalates on a verdict inside this band (stage 1,
+    soc_ai.agent.orchestrator.oracle_escalation_reason).
+    """
+    return GATE_COERCE_CONFIDENCE, _ESCALATION_CONF_FLOOR
+
 
 def _citation_confidence_cap(
     confidence: float,

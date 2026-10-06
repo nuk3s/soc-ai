@@ -49,6 +49,7 @@ import {
   resolveMachine,
 } from '../lib/api';
 import { rememberListUrl } from '../lib/hostsList';
+import { ShellProvider, useShell } from '../shell/ShellContext';
 import { HostDetail } from './HostDetail';
 
 const PRIMARY = '192.0.2.10';
@@ -457,5 +458,59 @@ describe('HostDetail: the way back to the list', () => {
     await screen.findByTestId('host-addresses');
     fireEvent.click(screen.getByTestId('hosts-crumb'));
     expect((await screen.findByTestId('list')).textContent).toBe('/hosts?q=files');
+  });
+});
+
+// The top bar read the raw key "agent:<uuid>" (range dogfood 2026-10-05, C5).
+// The page reports the machine name to the shell, and takes it back when it
+// leaves.
+describe('HostDetail: the top bar name', () => {
+  function CrumbProbe() {
+    const { crumbName } = useShell();
+    return <div data-testid="crumb-name">{crumbName ? `${crumbName.key}=${crumbName.name}` : 'none'}</div>;
+  }
+
+  function Leave() {
+    const navigate = useNavigate();
+    return (
+      <button type="button" onClick={() => navigate('/hosts')}>
+        leave
+      </button>
+    );
+  }
+
+  it('reports the machine name for its key and clears it on leave', async () => {
+    render(
+      <MemoryRouter initialEntries={['/hosts/agent%3Aea2d']}>
+        <ShellProvider>
+          <CrumbProbe />
+          <Leave />
+          <Routes>
+            <Route path="/hosts" element={<ListStub />} />
+            <Route path="/hosts/:key" element={<HostDetail />} />
+          </Routes>
+        </ShellProvider>
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.getByTestId('crumb-name').textContent).toBe('agent:ea2d=files01'));
+    fireEvent.click(screen.getByRole('button', { name: 'leave' }));
+    await waitFor(() => expect(screen.getByTestId('crumb-name').textContent).toBe('none'));
+  });
+
+  it('reports the primary address of a machine with no name', async () => {
+    vi.mocked(getMachine).mockResolvedValue({ ...MACHINE, name: null, name_source: null });
+    render(
+      <MemoryRouter initialEntries={['/hosts/agent%3Aea2d']}>
+        <ShellProvider>
+          <CrumbProbe />
+          <Routes>
+            <Route path="/hosts/:key" element={<HostDetail />} />
+          </Routes>
+        </ShellProvider>
+      </MemoryRouter>,
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId('crumb-name').textContent).toBe(`agent:ea2d=${PRIMARY}`),
+    );
   });
 });

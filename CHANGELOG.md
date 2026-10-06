@@ -11,6 +11,74 @@ production on 2026-10-01. This section holds what they found and what changed.
 
 ### Added
 
+- `soc-ai spec-replay` replays the tier 2 detectors hour by hour against the grid. It writes into a
+  scratch store and reads the live store read-only. For each profile analytic it reports the hits
+  per 100 host-days and the Wilson 95 percent upper bound. It also gives a verdict against the
+  budget of one hit per 100 host-days. `--dry-run` prints the plan and sends no search. The profile build takes a
+  time anchor, so the replay can build a past day.
+- **`soc-ai spec-replay` measures the learned detectors too.** The replay runs the `model`
+  evaluator beside the `profile` evaluator by default. `--evaluator profile` or
+  `--evaluator model` runs one of them. Each analytic runs at its status on the live install. A
+  detector in shadow writes shadow observations, and the replay counts a shadow hit as a hit. The
+  report gives the evaluator and the status of each analytic. It folds the seven detector states
+  into its state columns the way the analytic ledger does. The dry run names the analytics of
+  each evaluator and estimates the searches of the detectors.
+- **A shipped analytic can ship in shadow.** A spec file can declare `ships_as: shadow`. On the
+  first catalog load, soc-ai writes a shadow status row and a version row that says the analytic
+  shipped in shadow. The analyst approves it to live on the Analytics tab. A file without the
+  field stays live. A later release that changes the field does not move a retired analytic or an
+  analytic in shadow. Before this change, a shipped analytic went live on its first deploy,
+  because nothing wrote a status row for it.
+- **soc-ai can move a live analytic back to shadow.** The store function `demote_to_shadow`
+  writes a version row with the system actor, the reason and the evidence. The observations that
+  the analytic wrote stay as they are. A system actor can never approve an analytic to live and can
+  never retire one. The store refuses both. The Analytics tab marks a held analytic "held by
+  soc-ai". The drawer states the reason, and the version row shows a `soc-ai` chip with the
+  evidence.
+- **A live analytic that breaches its own limits moves back to shadow.** A spec can declare
+  `fire_budget_per_day` and `precision_floor`. After each sweep, soc-ai reads the store and checks
+  each live analytic that declares a limit. A breach moves the analytic to shadow with the numbers
+  as evidence, and the bell shows the change. The precision compares two sets of hunted leads over
+  30 days. The first set reached a promoted finding or an investigation. A hunt closed the second
+  set clean. It counts only when 5 or more leads are decided. The window starts at the latest approval
+  to live, so one breach causes one demotion. The new setting `analytic_self_heal_enabled` is on by
+  default. An analytic with no limit never moves.
+- **Learned detectors run in shadow.** An analytic gains a third evaluator, `model`, beside
+  `match` and `profile`. A `model` analytic names a detector and its parameters, and the profile
+  sweep runs it every hour. A hit is an observation with source `model`. It carries the
+  statistic, the baseline value, the documents, an OQL query and a reason sentence. A detector
+  states one of seven states for each entity it reads, and the sweep notes count them. A hit with
+  no document is dropped and counted. Every `model` observation is shadow until the analytic
+  lifecycle work lands. See `docs/HUNTING.md`, "Learned detectors".
+- **`model-cross-plane-silence`.** One telemetry plane of a machine falls silent while another
+  plane of the same machine keeps its expected count. The planes are the six host coverage planes
+  and the sensor's network flows. Each plane is compared with the same hours of the week in the 4
+  earlier weeks. A hit cites the last document of the silent plane and a document of the live
+  plane. The detector is meant to replace `profile-connection-rate-collapsed` on machines that
+  ship two or more planes.
+- **`model-logon-chain`.** A session lands on host B. Within 15 minutes, B makes its first logon
+  attempt to a third host outside its learned edge set. The edge set is learned over
+  30 days from Windows 4624 logons of type 3 and 10 and from sshd Accepted lines. A hit cites the
+  session document and the attempt document.
+- `soc-ai validate-batch --local` runs a batch with no oracle grade and no cloud egress. The synth stratum still scores each verdict against the planted truth.
+- `scripts/eval/run-arm.sh` runs one arm of the two-arm synthetic eval. It runs `synth-clean`, a local `validate-batch` with five repeats of every scenario, and `synth-clean` again. `SOC_AI_CLI` lets a second checkout run its own code.
+- `scripts/eval/compare-arms.py` compares two batch directories. It prints the synth stratum recall and precision, the flip rate and the usage per run of each arm. It also prints the strict passes of each scenario and the change in input tokens.
+
+- **The Oracle rule mode.** The setting `oracle_rule_mode` selects the rule that sends a verdict to
+  the Oracle: `classic`, `shadow` or `uncertainty`. The default is `shadow`. In shadow mode the
+  classic verdict-class rule decides. Each run also records an `oracle_shadow` event with the
+  reason that the uncertainty rule would give. No Oracle call comes from that event. Detection
+  tuning shows the tally of the last 7 days: what each rule sends, by reason, and the overlap. A
+  replay of 30 days of production found 38 cases a month that only the uncertainty rule sends. The
+  Oracle has never seen one of those cases. A shadow week shows the disagreement before the switch.
+- **The Oracle route pauses after a usage limit.** When the gateway answers with a usage limit,
+  soc-ai makes no Oracle call until the reset time that the message or the `Retry-After` header
+  names. When neither names a time, the pause lasts one hour. Three server errors in a row also
+  start a pause of one hour. Each escalation in the pause writes an `oracle_skipped` row with the
+  reset time and keeps its local verdict. The doctor and the preflight gain an "oracle route" row.
+  The bell gets one row for each pause, and the webhook gets one message. The new setting
+  `notify_on_oracle_failure` is on by default. From 2026-09-10 to 2026-09-14, 69 calls went to a
+  route at its weekly limit.
 - **The proxy path takes a private ACME CA.** `scripts/tls-proxy.sh enable <domain> acme
   <directory-url> <root.pem>` puts Caddy on a certificate from an ACME CA on your network,
   for example step-ca or a Caddy `acme_server`. Caddy obtains and renews the certificate. No
@@ -18,12 +86,74 @@ production on 2026-10-01. This section holds what they found and what changed.
   that the served chain ends at it. A new `acme_ca` snippet in the `Caddyfile` carries the
   directory URL and the root. Before this change, a fleet with its own CA had to copy a
   certificate and a key by hand at each renewal.
+- **soc-ai can keep the store in PostgreSQL.** Set `SOC_AI_DATABASE_URL` to a
+  `postgresql+asyncpg://` URL. SQLite stays the default. SQLite has one writer, and at
+  corporate scale the scheduler, the sweeps and the console contend for it. The same
+  migration chain builds both stores, and every timestamp stays naive UTC on both. The compose file
+  has an optional `postgres` service under the `postgres` profile, and `./setup.sh` asks on a
+  fresh install. `soc-ai store migrate --to <url>` copies every table of a store into an empty
+  store in foreign key order, in one transaction. `--dry-run` counts the rows and lists each
+  value that PostgreSQL refuses before the copy writes a row. On PostgreSQL, runbook search
+  uses the keyword ranker and chat memory uses PostgreSQL text search. `soc-ai backup` refuses
+  a PostgreSQL store and names `pg_dump`. Install the driver with the `postgres` extra. The
+  container image includes it. See `docs/DEPLOYMENT.md`, "PostgreSQL".
 
 ### Fixed
 
-- **A hunt closes a lead only after it read its evidence.** A hunt that reports a visibility
-  gap, a failed tool call, an error, a partial read or a budget fallback keeps the lead open
-  under "Needs decision" with the reason. A clean hunt after a hunt that found a threat keeps the
+- The doctor row `index pattern coverage` reads a count that passed the probe budget as grid latency, with the node load as the thing to read. It told the operator to fix connectivity while the reachability rows of the same run passed.
+
+- The doctor `tls` row reads the listening sockets, as the `authentication` row does. It named the configured host, which keeps its loopback default under the systemd unit that binds every address.
+- The replay writes its report and its scratch store into a private directory, and the report files read 0600.
+
+- **A blind analytic states why.** The blind reason now shows beside the blind count. The sweep
+  notes, `soc-ai priors`, the journal and the analytic ledger carry it. The Analytics API carries
+  it in the coverage of a profile analytic. After the deploy of 2026-10-04, the two connection rate analytics were blind on
+  every host for 19 hours. The stored baselines held no hourly series, and no surface said so.
+  Migration 0060 adds `prior_spec_runs.blind_reason`.
+- **A change of the profile shape makes a build due at once.** Each profile row records its shape
+  version. The code holds the current version as `PROFILE_SHAPE`. When no host row holds the
+  current shape, `shape_due` in `soc_ai/dossier/profile_job.py` gives the reason a build is due
+  now. The build reads each host whose rows hold an older shape, whatever their age, and its notes
+  and the journal say so. Migration 0060 adds `entity_profiles.shape_version`.
+- **`soc-ai spec-replay` says within budget only on enough host-days.** Within budget needs the
+  Wilson 95 percent upper bound at or under the budget. A rate over the budget is over budget. The
+  new verdict `not enough host-days` covers the rest, and the command exits with 4. The notes name
+  the 381 host-days with no hit that a within-budget verdict needs. The range replay read 0 hits in
+  7 host-days as within budget, with an upper bound of 35 per 100.
+- The replay report names the evaluators it ran and the analytics it left out, in its notes. It runs
+  the `profile` evaluator only. The two `model` analytics and the `match` analytics have no rate in
+  the report.
+- **`soc-ai priors` counts an unmeasurable entity as blind.** The coverage line and each row have
+  the four columns of the trail. The CLI printed `unmeasurable=N` as a fifth column, and the journal
+  said fewer blind entities than the store. The per-state note keeps the count of each detector
+  state. Each row now states the status of its analytic from the effective catalog. A line
+  names each profile or model analytic that the sweep did not run.
+- The standard class shows `t_query_detections` to the loop. The not-found hint of
+  `t_get_rule_content` names that tool, and each such case cost one `search_tools` call. 6 of the
+  8 `search_tools` calls on the range eval of 2026-10-05 loaded it.
+- The standard class now includes the Windows plane in two cases. In the first, a rule names WMI, DCOM, remote execution, lateral movement, an admin share, pass the hash or Kerberoast. In the second, the session of the alert itself carried DCE-RPC, SMB or Kerberos. The stage 1 eval lost the WMI remote execution scenario because the loop ran without the lateral-movement section.
+
+- A `model` observation is shadow when its analytic is. The evaluator wrote every hit as shadow whatever the status, so an approval to live changed nothing. Both shipped learned detectors declare `ships_as: shadow`, a fire budget and a precision floor.
+
+- A repeated synth plant now carries its own scope key. The renderer kept the bare scenario id that every scenario file writes. The anchor guard refused repeats 1 and up, and repeat 0 read every copy. `--repeats` measured nothing before this fix.
+
+- **A failed Oracle call says what failed.** The `oracle_adjudication_failed` row carries the HTTP
+  status, the error class and the gateway's message. soc-ai masks the gateway key and every
+  credential value in the message. The reason `no_parseable_verdict` now means a 200 answer with no
+  verdict in the body. Production recorded 23 weekly-limit HTTP 500 answers as unparseable.
+- **An Oracle verdict changes the local verdict only with evidence.** The Oracle must cite an id
+  that the local run retrieved beyond the alert. With the tool loop on, a successful tool call of
+  its own also counts. Without evidence, the answer is an opinion on the run and the local verdict
+  stands. The auto-acknowledge skips that run. The single-shot path had no such gate. On
+  production, 6 answers changed needs_more_info to false_positive with no evidence, and soc-ai
+  acknowledged 2 of those alerts.
+- **The egress guard learns a host name from free text only in a host shape.** A name under 3
+  characters, a path, a run of dots or a common English word stays where it is, as a label. It does
+  not join the learned set. A refusal names the rule and the field that a learned name came from.
+  With the code before this change, 4 of the 19 stored Oracle refusals still refused.
+- **A hunt closes a lead only after it read its evidence.** A hunt can report a visibility
+  gap, a failed tool call, an error, a partial read or a budget fallback. Such a hunt keeps the
+  lead open under "Needs decision" with the reason. A clean hunt after a hunt that found a threat keeps the
   lead open too. On the range a hunt that could not read the alert documents had closed a lead
   with two critical findings.
 - **Every lead decision stays in the history.** Dismiss, reopen, promote, hold and close by hunt
@@ -34,14 +164,14 @@ production on 2026-10-01. This section holds what they found and what changed.
 - **The host page joins the hostname.** Observations, leads and baselines keyed on a strong
   hostname now show on the host page of the address. A blind baseline row always states a
   reason.
-- **A dossier sweep keeps a role through a partial read.** A served-port read with a timeout, a
-  shard failure or a port set under half the previous build keeps the previous role, services
-  and management plane. The host reads "Stale read" and the sweep report counts it.
+- **A dossier sweep keeps a role through a partial read.** A served-port read can end in a timeout, a
+  shard failure or a port set under half the previous build. Such a read keeps the previous role,
+  services and management plane. The host reads "Stale read" and the sweep report counts it.
 - **Served ports carry their transport and drop ICMP.** ICMP type numbers no longer read as
   TCP ports. A UDP service reads as udp.
 - **The audit chain check reads the newest window first.** The console and the CLI verify the
-  last 7 days by default, stream one page at a time off the event loop, and keep the newest
-  records under the cap. Duplicate sequence numbers from concurrent writers are their own
+  last 7 days by default. They stream one page at a time off the event loop, and they keep the
+  newest records under the cap. Duplicate sequence numbers from concurrent writers are their own
   condition with exit code 3. The doctor and the preflight gain an "audit chain" row.
 - **Egress counts state why they are unknown.** Each row carries a reason when the audit index
   cannot be aggregated. The doctor lists every egress destination.
@@ -107,6 +237,114 @@ production on 2026-10-01. This section holds what they found and what changed.
 - **Service-discovery names and reverse names are not hostnames.** Broadcast addresses leave
   the census.
 
+### Range console dogfood (2026-10-05)
+
+- **"Hunt with this" shows on a `match` analytic only.** The hunt tool runs a `match` analytic as
+  a grid query. It cannot run a `profile` or a `model` analytic, because the profile sweep runs
+  those every hour. The drawer and the Analytics tab rows now say so on a live analytic of those
+  types. Before this change, the control started a hunt whose first step failed.
+- **A failed hunt step shows its reason.** The expanded step of a failed tool call starts with
+  the failure and the reason the tool gave. The step of a failed analytic run read
+  "result: live", which is the status of the analytic.
+- **The investigation page reads the ends of an alert from the alert.** The endpoints chip
+  shows the source address and the destination address. A host that reported the alert shows as
+  "on" that host. It never sits in a direction slot. A grid node login failure with no
+  destination read "source <host> to destination <source address>".
+- **Config, Diagnostics lists every doctor row.** The new Doctor list shows each row with its
+  status, its name, its detail and its fix line. It reads the newest stored result when the pane
+  opens. Refresh runs the checks again. The Setup health card on the Dashboard shows FAIL and
+  WARN only, so the INFO and PASS rows had no console surface.
+- **The Analytic hits panel lists profile hits.** A departure that a profile analytic writes is
+  now a hit, with its receipts when it is a shadow hit. The panel read "No analytic hit in the last
+  7 days" while three live profile analytics had written ten observations. The Needs-you count,
+  the bell, the shadow band and the hits list now read one shadow clause. An observation that no
+  analytic wrote, for example an alert verdict, is not a hit on any of them.
+- **A learned detector reads as a detector.** The drawer counts the runs of a `model` analytic as
+  "detector runs". Its tooltip says that the detector reads the grid and builds its own baseline.
+  The Analytics tab shows no baseline age for a `model` analytic, because the detector reads no
+  stored host profile. Operate lists the `model` analytics under their own label, "Learned
+  detectors".
+- **The ship row of an analytic shows a neutral chip.** The version row that `system:catalog`
+  writes when an analytic ships in shadow now shows "shipped in shadow". It showed the amber
+  `soc-ai` chip of a demotion. The amber chip stays on a `system:self-heal` demotion.
+- **The top bar names the machine.** On a machine page the top bar shows the machine name. The
+  machine key, for example `agent:<id>`, shows in the tooltip only. The top bar showed the raw key.
+- **The bell names the findings it counts.** A finished hunt notice reads "3 threat findings".
+  It read "3 findings" beside a hunt page that counted 4 findings: 3 threat findings and 1
+  observation.
+- **The Hosts search box shows its whole placeholder.** The box sizes itself to the text
+  "Search name, address, MAC, OS, role, agent". It cut the text at "OS".
+- **The Hosts list says how old its rows are.** With automatic sweeps off, the line under the
+  cards now dates the list: "the list shows the state as of" the last sweep. A row whose agent
+  last reported more than 24 hours ago carries a "stale" marker. Its tooltip says that sweeps are
+  off and when the last sweep ran. The list showed a last seen time of 3 days while the machine
+  page showed live activity from 52 minutes before.
+
+### Console verification (2026-10-05)
+
+- **The Analytic hits list states its share and reads more.** The line under the list states
+  the share, for example "50 of 148 hits". "Show more" reads the next 50 hits. The hits route
+  takes an `offset`. Under All, the unread shadow hits now come first, then the live hits, then
+  the read shadow hits. Production listed 50 of 148 hits with no note. The one unread shadow hit
+  that Needs-you counted was not in those 50.
+- **The blind reason uses plain words.** The coverage cell on the Analytics tab named the column
+  and the gate of the code. It read "no connection_rate profile has been built for this entity"
+  and "cannot apply role priors: role unknown or below the confidence gate (0.50 < 0.90)". It now
+  reads "no connection rate baseline exists for this host yet." and "the role of this host is not
+  known well enough. The confidence is 0.50 and the gate is 0.90." Every reason now opens with
+  its count, for example "35 of 56 blind hosts". A reason that every blind host shares had no
+  count.
+- **The hold box names its controls.** The drawer of an analytic that soc-ai holds in shadow now
+  reads "Then select Approve or Reject". It said "approve it to live or retire it" above the
+  controls "Approve" and "Reject". The "held by soc-ai" chip tooltip uses the same words.
+- **Operate shows the hold.** The Analytics card on Operate now shows the "held by soc-ai" chip
+  on an analytic that soc-ai holds in shadow. It showed the "shadow" chip of an analytic that an
+  analyst put in shadow. `GET /hunt-catalog` now holds the reason of the hold in
+  `held_by_system`.
+- **A hit card says when its analytic is gone.** A hit whose analytic the catalog no longer lists
+  now shows the chip "analytic removed" and the analytic id as text. The card offers no Approve or
+  Reject for it. The card showed the raw id as a link and a "live" chip.
+- **The Hosts "as of" note states its time zone.** The note now reads, for example, "the list
+  shows the state as of Oct 02, 2026, 08:10:28 AM EDT". The shared time formatter takes a `zone`
+  option for a line that dates a list. The note gave the browser time with no zone.
+- **The Hosts role chip keeps a guessed role whole.** A withheld role now shows the guess in the
+  chip and the state words beside it, for example "security appliance" and "low confidence". The
+  pair wraps when the Role column is narrow. One chip cut "low confidence: security appliance" to
+  "security applianc".
+
+### Tier 2 statistics (2026-10-04)
+
+- **A rate departure is tested hour by hour.** The prior sweep reads the expected count for each
+  hour of the week from the hourly series of the host. The dispersion of an hour is the larger of
+  the pooled MAD and the square root of the expected count. A burst of one to four hours now moves
+  the test. The median of the recent hours could not move for it. An hour with an expected count
+  of zero and no spread is unmeasurable. A rate baseline from an older build is blind until the
+  next build.
+- **Zero hours stay in the rate baseline.** The build fills the hours with no document between
+  the first hour and the last with zero. The three cells and the hourly series read them.
+- **Novelty reads how many hosts in the estate know a member.** A new member that fewer than 3
+  hosts know is estate-rare, and its observation is born at 0.6. A new member that more than 20 %
+  of the profiled hosts know is estate-common, and it forms no observation. Two new settings hold
+  the bars: `profile_estate_rare_hosts` and `profile_estate_common_share`. Migration 0057 adds the
+  table `member_prevalence`.
+- **One member new on 3 hosts in one sweep is one condition.** Each host gets a `scope_count`
+  observation that states the spread and how many hosts knew the member before.
+- **A member is known after two days of sightings.** A member the baseline saw on one day is new
+  again. An investigation can confirm a window as a true positive. A member first seen inside that
+  window is not known, and those hours stay out of the rate baseline.
+- **A set at the cap of 200 members reports no novelty.** The analytic is blind on that host, and
+  its note says "set full".
+- **Peer groups read the role.** The refresh after each build writes the role on every profile row.
+  A new member that most peers in the same confident role know is a role trait, and it forms no
+  observation. The new profile test `rare_for_peers` writes a `rare_for_peers` observation for a
+  member its peers do not know. No shipped analytic uses it yet.
+- **An observation carries its evidence.** Migration 0057 adds the statistic, its value, the
+  baseline value, up to 10 document ids and an OQL query to run again. The lead page shows them
+  under each observation, with a "Run this query" link to the console. The host page shows the
+  statistic. The hunt a lead starts reads each statistic and each query first.
+- **The prior sweep takes a time anchor.** `run_prior_sweep(now=...)` reads, records and forms
+  leads at a past hour. A replay over seven days with planted departures runs in the test suite.
+
 ### Host identity (2026-10-02)
 
 The Hosts list showed one row per IP address. On production one proxy had 14 rows, one
@@ -118,7 +356,7 @@ workstation had 10 rows with no name, and 282 of 337 rows had no hostname.
   table and the machine of each address. The per-address dossier stays.
 - **The machine API.** `GET /api/v1/hosts` lists one row per machine. Search reads every name
   from any source, every address, every MAC, the OS, the role and the agent name. An address
-  matches exactly or by prefix and never in the middle. Each column sorts in both directions,
+  matches only exactly or by prefix. Each column sorts in both directions,
   and the address sort is numeric. `GET /api/v1/hosts/summary` counts from the same rows, so each
   card equals the list total of its filter. `GET /api/v1/hosts/resolve` and
   `GET /api/v1/hosts/{key}` name and describe one machine. The `/api/v1/dossiers` routes stay.
@@ -137,7 +375,184 @@ workstation had 10 rows with no name, and 282 of 337 rows had no hostname.
 - **An address unseen for 30 days leaves the census.** `dossier_stale_address_days` sets the
   window. An address with a declaration stays. A sweep whose census failed removes nothing.
 
+### Scale (2026-10-04)
+
+A synthetic estate of 20,000 hosts ran through the sweeps. Five parts held only 500 or
+10,000 hosts, and one step was quadratic.
+
+- **The profile build covers every host.** The build read each dimension with one aggregation
+  of 500 entities, and the other hosts got no profile. The build now reads the census hosts in
+  batches of 500. One search per dimension serves a batch. A last read finds the hosts outside
+  the census. A batch that the grid refuses for its bucket count splits down to one host.
+- **The profile build skips a quiet host.** A quiet host keeps its rows. Its profile is younger
+  than the dossier refresh interval, and its last activity is older than the window of its
+  build. The run row states how many hosts the build skipped, read in batches and read alone.
+- **`profile_build_workers` caps the batches in flight.** The default is 2. The setting applies
+  without a restart.
+- **The census reads past 10,000 addresses.** One census search holds 10,000 addresses per
+  direction. When `dossier_max_hosts` allows more, the census reads the rest in pages. Before
+  this change, half of a 20,000-host estate had no dossier.
+- **The sweep logs each stage.** One line per stage gives the wall time and the searches. The
+  refresh summary carries the same numbers. The profile build runs last, so it reads the census
+  of the same sweep.
+- **The machine clustering is linear.** The merge with the previous sweep took 102 seconds at
+  20,000 hosts. It takes about 1 second now.
+- **The census record and the role stamp write in batches.** The census record sent one SELECT
+  and one flush for each address. It now reads 500 addresses in one SELECT and flushes once for
+  each chunk. The role stamp sent one UPDATE for each changed row. It now sends one UPDATE for
+  each role and each group of 500 rows. At 20,000 hosts the census record fell from 26.5 s to
+  6.3 s, and the role stamp fell from 1.7 s to 0.7 s.
+- **The prior sweep reads the whole estate.** The recent read of each dimension held the 500
+  busiest entities. It now reads pages of 1,000 entities, up to a ceiling of 20,000. A read at
+  the ceiling writes a note with the number, and the sweep scores no silent host for it. On the
+  synthetic estate of 20,000 hosts, the silent server and the novel served port are now
+  observations.
+- **The agent inventory reads past 500 agents.** It reads pages of 1,000 agents, up to a
+  ceiling of 20,000. Before this change, a network of 600 agents lost 100 of them with no note.
+  At the ceiling the dossier run writes a note with the number.
+- **The profile build reads every host outside the census.** The last read of the build held
+  the 500 busiest hosts per dimension. It now reads pages of 1,000 hosts, up to a ceiling of
+  20,000. A read at the ceiling writes a note on the run with the number. With an empty census
+  of 2,000 hosts, the build now writes 21,081 rows. Before this change it wrote 8,059.
+- **A scale harness runs in CI.** `scripts/scale/run.py` builds a synthetic estate and runs the
+  sweep, the clustering, the profile build and the prior sweep against an in-process grid. A
+  CI job runs 2,000 hosts and fails when a stage passes its budget of time, searches or memory.
+
+### Tier 3 estate model (2026-10-04)
+
+Most hosts in a corporate estate have no declared role. The estate model learns the peer groups
+and scores each host against the estate. It runs in shadow only, and it is off by default.
+
+- **The `ml` extra.** scikit-learn 1.9.1 and numpy 2.5.3 come in the optional extra `ml`, with
+  five dependencies. The container image installs it, about 220 MB of site-packages. The
+  dependency audit in CI and in the publish script reads the extras the image ships. The app
+  imports the extra only when the estate model runs.
+- **One behaviour vector per host.** The daily run reduces the stored profiles of each host to
+  numbers. Each set gives its members and its documents per day. The other numbers are the active
+  hours, the night share and the connection rate of each cell. One flag marks each plane, and one
+  flag marks each declared role.
+- **Learned peer groups.** k-means groups the vectors of each key space. The silhouette score
+  picks k from 2 to 10. A group keeps its id from day to day. Migration 0059 adds
+  `estate_model_fits` and `estate_peer_groups`. A host with no confident role reads its learned
+  group as its peer group in the profile tests. This applies while the model is on and its newest
+  fit is measured.
+- **An estate outlier score with a stated reason.** An isolation forest scores each host. A host
+  at 0.55 or more writes a shadow `estate_outlier` observation at 0.3 when three conditions hold.
+  A feature departs from its group by 3 or more. Fewer than 5 other hosts act the same way. The
+  grid returns a current document of the host. The summary names the top three features with the
+  value of the host and the median of its peers.
+- **The model file is trusted by its hash.** The fit writes a JSON file under
+  `models/estate/` in the data directory. The store records its sha256, and the audit chain gets
+  the hash as `estate_model_fit`. The run refuses a file whose hash the store does not record.
+- **States.** Each fit is measured, learning, drifted or held. Drifted means two or more features
+  have a population stability index above 0.25 against the previous fit. Held means more hosts
+  qualify than the fire budget. Only a measured fit writes observations. A new fit is a
+  challenger for 24 hours as a record only. The run scores once.
+- **The doctor and the console.** The doctor row "estate model" states the state and the date of
+  the last fit. The setting `estate_model_enabled` sits under Behavioural profiles. A daily loop
+  fits under the single-flight slot of the dossier sweep.
+- **Measured at scale.** At 20,000 hosts on the scale harness the fit takes 8.8 s and the run
+  15.3 s. See `docs/HUNTING.md`, "The estate model".
+
+### Tier 1 ladder (stage 1, 2026-10-04)
+
+Production spent 163.4 million tokens on 2,051 scheduled triage runs in 30 days, with one true
+positive. These changes put the cheaper rungs first and measure each run.
+`docs/ARCHITECTURE.md` describes the ladder under "Budget classes and the ladder".
+
+- **Every run records what it cost.** A triage run, a hunt and a lead hunt store the model
+  requests, the input and output tokens and the tool calls. They also store the Elasticsearch
+  searches, the wall time and the budget class. Migration 0058 adds the columns. A hunt now records its model
+  usage. Before this change the store held none.
+- **`soc-ai usage --days N` prints the cost per entry point.** The table gives the runs, the
+  median and the 90th percentile of each counter, and the outcome shares. An older run reads its
+  tokens and its tool calls from its stored events. A number the store does not hold prints as a
+  dash.
+- **A run has a budget class.** Cheap is one synthesis request with no loop and no Oracle.
+  Standard is the loop. Deep is the loop with the whole prompt and every tool. The scheduler gets
+  cheap only where a dispositive template cleared the alert. A round-1 verdict that is not a
+  false positive, or that a verdict gate would change, escalates the run to standard. An
+  analyst's Investigate, a re-run and a bulk selection are standard and always run the loop. The
+  Deep re-run is deep. The Investigations list, the drawer and the page show the class as a
+  chip.
+- **The rule prior rung, in shadow.** The rule prior covers a scheduled alert with the verdict
+  of its rule's latest model run when six safeguards hold. `rule_prior_mode` is `off`, `shadow`
+  or `live`, and the default is `shadow`. In shadow the model runs as before, and the new
+  `rule_prior_decisions` table records what the prior would decide beside the real verdict. In
+  live a covered alert gets a rule-prior run with no model call, except a 2% random sample. A
+  real run that disagrees suspends the prior for its rule. The Detection tuning panel shows a
+  Rule prior column with a Clear button. A rule-prior run never acknowledges in Security Onion
+  and never lends its verdict to a sibling alert.
+- **The pipeline runs the web search the loop used to spend its turn on.** When an external
+  indicator has no enrichment answer, the pipeline searches it before the loop and gives the
+  loop the result. The loop spent its one tool turn on this search in 87% of production runs.
+
+### Range dogfood (2026-10-05)
+
+- **The doctor no longer calls an unmeasured model unfit.** A fitness leg that times out or
+  cannot reach the model now reads WARN "could not measure", with the cause. The row gives no
+  advice to replace the model. Only a measured capability failure reads FAIL. Each leg now carries a
+  `cause` field, `timeout` or `transport`. The console chip and the audit record keep the old
+  grade.
+- **The auth-off start line states only what the app knows.** With `API_AUTH_REQUIRED=false`, the
+  line said "loopback bind 127.0.0.1" on the systemd path, where uvicorn bound 0.0.0.0. The line
+  read `SOC_AI_HOST`, and uvicorn holds the real bind. The line now names the bind only under
+  `soc-ai serve`. Otherwise it says "The bind is the server's".
+- **The doctor has an "authentication" row.** It reads on or off. When authentication is off, it
+  lists the addresses that listen on `SOC_AI_PORT`, from `/proc/net/tcp` and `/proc/net/tcp6`. A
+  listener other than loopback reads WARN. A table that soc-ai cannot read also reads WARN.
+- **The estate model row keeps the last fit when the setting is off.** The row now states the
+  date and the state of the last fit. Before, it read "off" with no trace of the fit.
+- **`soc-ai estate-model show` and `soc-ai estate-model run`.** `show` prints the newest fit: the
+  time, the state, the hosts, the groups, the outliers, the model file, the hash and the drift
+  index. `run` fits once, now, with the guards of the daily loop. It runs when the setting is off,
+  and it says so. It refuses in a demo.
+- **HUNTING.md states what a learning fit records.** The States table said a learning fit
+  records groups. Under 20 hosts the model does not fit, so the run records the fit row and no
+  group. The doc now has a row for each learning case. The code stays as it is.
+- **The About section names the commit.** `GET /api/v1/about` has a `commit` field, and the
+  console About section shows it beside the version. The value comes from the `SOC_AI_COMMIT`
+  setting, else from the image stamp. A build that recorded no commit shows none.
+  `scripts/deploy-range.sh` now writes `SOC_AI_COMMIT` into the range `.env`, the way
+  `scripts/deploy.sh` does for production. It keeps every other line of the file.
+- **The CLI no longer opens with the grid TLS warning.** With `ES_VERIFY_SSL=false`, every CLI
+  command printed the two-line elasticsearch `SecurityWarning` first. The CLI entry point now
+  hides that one warning. The library and the server keep it. The doctor states the setting once,
+  in a "grid tls" row under the elasticsearch row.
+- **Only the service user can read the store.** The SQLite store held the password hashes at mode
+  0644 in a 0755 directory. soc-ai now makes the store file and its WAL files mode 0600 and the
+  data directory mode 0700. It tightens an older store when it opens it. `soc-ai restore` does the
+  same for the store it restores. A PostgreSQL store keeps its data directory mode.
+  `soc_ai/store/db.py` has helpers for the other files under the data directory:
+  `make_private_dir`, `restrict_file` and `restrict_sqlite_files`. The systemd unit sets
+  `UMask=0077`.
+
 ### Changed
+
+- **The README is short, and the docs pages hold the detail.** The README went from
+  269 lines to 79. It keeps what soc-ai is, one screenshot, a quick start, one line for each
+  capability, the docs links and the roadmap chart. The rest moved into the quickstart, the docs
+  home page, the console guide and the roadmap. The docs nav sections are now Installation,
+  Operation, Design, Blog and Project.
+- **The shipped prose follows the STE rules.** The docs pages, the blog posts, the Unreleased
+  changelog and the console strings lost their remaining dashes, asides and rhetorical
+  contrasts. The docs pages also split their long sentences and use plain-noun headings. The
+  lead quality note now reads "A threshold moves only on a week of data."
+- The three profile analytics that fire most declare a fire budget of three hits a day and a precision floor of 0.25. The seven day production replay read 1.8 to 13.4 hits per 100 host-days against a budget of 1. The self-healing hold moves an analytic past its budget to shadow with the numbers as evidence, and an analyst approves it back to live.
+
+- **The Oracle reviews an uncertain verdict.** A verdict goes to the Oracle in three cases. Its
+  confidence is from 0.4 to below 0.7. The decision template and the model disagree. A deep run
+  ends needs_more_info. A confident verdict that the template
+  agrees with stays local. The four Oracle settings narrow the rule and never add an
+  escalation. `oracle_escalate_below_confidence` now caps the band, and its default is 0.7. The
+  `oracle_escalation` audit row names the reason. A confident false positive on a malware rule no
+  longer escalates. It escalated 48 times in 30 days on production, and the Oracle confirmed
+  every audited one.
+- **The standard loop gets the prompt and the tools the alert needs.** The prompt keeps the
+  sections that the planes of the alert make useful. These are a flow, an external endpoint, an
+  internal pair, host logs, a payload, a file hash, ICMP and a decoy. The other investigator tools stay registered and
+  load with one `search_tools` call. On a flow to the internet the request carries 15 of 27 tool
+  schemas and 34,948 of 40,018 prompt characters. The deep class keeps everything.
 
 - **A drafted analytic describes a behaviour.** On the range a draft named one host and two
   domains, and it could fire on that case only. The drafter now keeps exact values only for

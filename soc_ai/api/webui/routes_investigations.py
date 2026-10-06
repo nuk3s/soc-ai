@@ -199,6 +199,9 @@ class InvestigationRowOut(BaseModel):
     # hunt). Surfaced wherever the row is displayed — the SPA badges it so a
     # planted attack can never be read as real activity.
     isSynthEval: bool = False
+    # The budget class the run ran in (migration 0058). None on a run stored
+    # before the classes existed, and on a run still in flight.
+    runClass: str | None = None
 
 
 def _elapsed_sec(inv: Investigation) -> int:
@@ -278,6 +281,7 @@ def _row(
             _iso_utc(inv.created_at if latest_run is None else latest_run.created_at)
         ),
         isSynthEval=bool(inv.is_synth_eval),
+        runClass=_run_class_of(inv),
     )
 
 
@@ -626,6 +630,12 @@ async def get_investigation(
         step.detail = scrub_secrets(step.detail)
     nodes, edges, graph_note = _entity_graph(alert_obj, enrichments, inv)
     summary_text = report.get("summary") or inv.summary or ""
+    # The endpoints chip reads the alert's own fields. A host-reported alert
+    # names a source address and a host, and no destination: the host is where
+    # the alert came from, and it is never one end of the flow.
+    src_addr = _str_or_none(alert_obj.get("source_ip")) or _str_or_none(inv.src_ip)
+    dst_addr = _str_or_none(alert_obj.get("destination_ip")) or _str_or_none(inv.dest_ip)
+    reporter = _str_or_none(alert_obj.get("host_name"))
     meta = InvMetaOut(
         model=settings.analyst_model,
         oracle="escalated to Oracle" if has_oracle else "not escalated, local verdict",
@@ -641,8 +651,11 @@ async def get_investigation(
         groupId=inv.alert_es_id or inv.id,
         name=inv.rule_name or f"Alert {(getattr(inv, 'alert_es_id', None) or inv.id)[:12]}…",
         kind=inv.kind,
-        host=alert_obj.get("host_name") or inv.src_ip or "—",
-        ip=inv.dest_ip or inv.src_ip or "—",
+        host=src_addr or "—",
+        ip=dst_addr or "—",
+        srcIp=src_addr,
+        dstIp=dst_addr,
+        reportedBy=reporter,
         verdict=_verdict(inv.verdict),
         conf=inv.confidence if inv.confidence is not None else 0.0,
         rationale=scrub_secrets(inv.rationale or summary_text),
@@ -694,7 +707,25 @@ async def get_investigation(
         alertAcked=alert_acked,
         isSynthEval=bool(inv.is_synth_eval),
         supersededBy=_superseded_by(inv, group_runs),
+        runClass=_run_class_of(inv),
+        runClassReason=_str_or_none(report.get("run_class_reason")),
     )
+
+
+def _str_or_none(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _run_class_of(inv: Investigation) -> str | None:
+    """The budget class the run ran in: the column, else the stored report.
+
+    A run still in flight has no column value yet. Its report has no class
+    either, so the answer is None: the class is not known until the run ends.
+    """
+    if isinstance(inv.run_class, str) and inv.run_class:
+        return inv.run_class
+    report = inv.report if isinstance(inv.report, dict) else {}
+    return _str_or_none(report.get("run_class"))
 
 
 def _superseded_by(inv: Investigation, group_runs: Sequence[inv_svc.RunRef]) -> str | None:

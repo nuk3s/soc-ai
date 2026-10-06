@@ -12,7 +12,7 @@ from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, model_serializer
 from sqlalchemy import select
 
-from soc_ai import __version__
+from soc_ai import __commit__, __version__
 from soc_ai.api.data_sources import DataSourceOut, collect_data_sources
 from soc_ai.api.deps import get_settings_dep
 from soc_ai.api.webui import routes_hunts
@@ -223,7 +223,7 @@ def _audit_chain_notifications(request: Request) -> list[NotificationOut]:
     if not measured:
         ran = ""
     elif measured == "now":
-        ran = " The check ran just now."
+        ran = " The check ran less than a minute ago."
     else:
         ran = f" The check ran {measured} ago."
     dated = f"{detail}{covered}{ran}"
@@ -271,6 +271,39 @@ def _tls_notifications(request: Request) -> list[NotificationOut]:
             title=title,
             when=_ago(since) if since else "just now",
             href="/config#tls",
+        )
+    ]
+
+
+def _oracle_pause_notifications(request: Request) -> list[NotificationOut]:
+    """One bell row while the Oracle route is paused (soc_ai.oracle.breaker).
+
+    Read from the process breaker, so a 15-second poll never reads the store.
+    The id carries the start of the pause: a dismissal holds for that pause,
+    and the next pause arrives undismissed. More skipped escalations in the
+    same pause add no row. ``notify_on_oracle_failure`` turns the row off; the
+    doctor and the preflight still report the pause.
+    """
+    from soc_ai import notify  # noqa: PLC0415 - lazy
+    from soc_ai.oracle import breaker  # noqa: PLC0415 - lazy
+
+    settings = getattr(request.app.state, "settings", None)
+    if settings is None or not bool(getattr(settings, "notify_on_oracle_failure", False)):
+        return []
+    route = breaker.route_key(settings)
+    until = breaker.BREAKER.open_until(route)
+    if until is None:
+        return []
+    state = breaker.BREAKER.state(route)
+    title, _body = notify.oracle_pause_text(pause_reason=state.reason, until=breaker.iso(until))
+    since = breaker.iso(state.opened_at) or ""
+    return [
+        NotificationOut(
+            id=f"oracle-paused:{since}",
+            tone="warn",
+            title=f"{title}. The local verdicts stand.",
+            when=_ago(since) if since else "just now",
+            href="/config#oracle",
         )
     ]
 
@@ -425,6 +458,7 @@ async def _quality_alarm_notifications(request: Request) -> list[NotificationOut
 # night from pushing every investigation and hunt off the panel.
 _SHADOW_HIT_NOTIF_CAP = 20
 _LEAD_NOTIF_CAP = 20
+_HOLD_NOTIF_CAP = 10
 
 
 async def _shadow_hit_notifications(request: Request) -> list[NotificationOut]:
@@ -480,6 +514,46 @@ async def _shadow_hit_notifications(request: Request) -> list[NotificationOut]:
                 # the bell named was one of many.
                 href="/hunts?hits=unread",
                 dismissible=False,
+                group="hunting",
+            )
+        )
+    return out
+
+
+async def _analytic_hold_notifications(request: Request) -> list[NotificationOut]:
+    """One bell entry per analytic that the self-healing hold moved to shadow.
+
+    A standing entry, gated on the transition: it shows while the system
+    demotion is the newest status change of an analytic still in shadow. An
+    approval or a retirement writes a newer row, and the entry goes. The id
+    carries the version row, so a client dismissal holds for that demotion
+    and a later demotion of the same analytic arrives undismissed.
+
+    DB-only and fail-soft, like everything else on this endpoint.
+    """
+    from soc_ai.hunting.catalog_tiers import effective_catalog  # noqa: PLC0415 - lazy
+    from soc_ai.store import analytics as analytics_store  # noqa: PLC0415 - lazy
+
+    try:
+        async with request.app.state.db_sessionmaker() as db:
+            holds = await analytics_store.system_holds(db)
+            cat = await effective_catalog(db) if holds else None
+    except Exception:
+        _LOGGER.warning("notifications: analytic hold read failed (continuing)", exc_info=True)
+        return []
+
+    out: list[NotificationOut] = []
+    newest_first = sorted(holds.items(), key=lambda item: item[1].id, reverse=True)
+    for analytic_id, version in newest_first[:_HOLD_NOTIF_CAP]:
+        spec = cat.listed.get(analytic_id) if cat is not None else None
+        title = spec.title if spec is not None else analytic_id
+        out.append(
+            NotificationOut(
+                id=f"analytic-held:{version.id}",
+                tone="warn",
+                title=f"soc-ai moved {title} to shadow. {version.why or ''}".strip(),
+                when=_ago(version.at.replace(tzinfo=UTC).isoformat()),
+                href=f"/hunts?tab=analytics&open={analytic_id}",
                 group="hunting",
             )
         )
@@ -568,9 +642,11 @@ async def list_notifications(request: Request) -> list[NotificationOut]:
         )
     out.extend(_audit_chain_notifications(request))
     out.extend(_tls_notifications(request))
+    out.extend(_oracle_pause_notifications(request))
     out.extend(await _quality_alarm_notifications(request))
     out.extend(await _dossier_conflict_notifications(request))
     out.extend(await _shadow_hit_notifications(request))
+    out.extend(await _analytic_hold_notifications(request))
     out.extend(await _lead_notifications(request))
     # Column-scoped reads (never the report JSON blob): the bell reads ~5 scalar
     # fields from investigations and a denormalized findings_count from hunts, and
@@ -661,8 +737,13 @@ async def list_notifications(request: Request) -> list[NotificationOut]:
             title = f"{routes_hunts.GAP_NOTIFICATION_TITLE}. {h.objective[:80]}"
             tone = "accent"
         else:
+            # The notice names what it counts. It counted the threat findings
+            # and called them "findings", so "3 findings" sat beside a hunt
+            # page that read "4 findings": 3 threat findings and 1
+            # observation. A row from before the threat count says findings.
             shown = threats if threats is not None else n
-            title = f"Hunt finished, {shown} finding{'' if shown == 1 else 's'}: {h.objective[:80]}"
+            noun = "threat finding" if threats is not None else "finding"
+            title = f"Hunt finished, {shown} {noun}{'' if shown == 1 else 's'}: {h.objective[:80]}"
             tone = "warn" if shown else "accent"
         done.append(
             NotificationOut(
@@ -1490,6 +1571,9 @@ async def health_preflight_detail(request: Request, refresh: bool = False) -> Pr
 
 class AboutOut(BaseModel):
     version: str
+    # The source commit, when the build or the deploy recorded one. Null on a
+    # build that recorded none: a version alone cannot name an unreleased build.
+    commit: str | None = None
     repo_url: str
     license: str
     update_check_enabled: bool
@@ -1524,9 +1608,15 @@ async def about(settings: Settings = Depends(get_settings_dep)) -> AboutOut:
     "Draft detection" affordance (Investigation / hunt-finding screens): off by
     default, so the SPA hides the button rather than rendering one whose first
     click is a guaranteed 403.
+
+    ``commit`` is the ``SOC_AI_COMMIT`` setting, else the value the image
+    stamped. The range ran unreleased main as "1.5.2", the box has no version
+    control tool, and nobody could tell which build ran (range dogfood,
+    2026-10-05).
     """
     return AboutOut(
         version=__version__,
+        commit=(settings.soc_ai_commit or "").strip() or __commit__,
         repo_url=updates_svc.REPO_URL,
         license=updates_svc.LICENSE,
         update_check_enabled=settings.update_check_enabled,

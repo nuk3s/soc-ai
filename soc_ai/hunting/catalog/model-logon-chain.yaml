@@ -1,0 +1,54 @@
+id: model-logon-chain
+title: A host receives a session and then makes its first logon attempt to a new host
+description: >
+  An intruder lands on one host and moves on from it. The second hop leaves
+  two records in order: a session that lands on host B, and minutes later an
+  attempt from B to a host C that B never reached before.
+
+  This detector learns the edge set of the estate from accepted sessions
+  over 30 days: Windows logons of type 3 and 10 with a source address, and
+  sshd Accepted lines. A hit needs a session on B and, within 15 minutes, the
+  first attempt from B to a third host C that is not in the learned edge set
+  of B. The attempt is an accepted or a failed logon on C from an address of
+  B.
+
+  An edge set under 14 days old is learning. A host whose address soc-ai
+  does not know is unmeasurable. C must ship a logon plane. An attempt that
+  only the network flows show is out of scope for this detector.
+
+level: high
+evaluator: model
+# A learned detector ships in shadow. An operator approves it to live after a
+# shadow week. The hold moves it back to shadow past 10 hits in a day or
+# under a precision of 0.25 on its hunted leads.
+ships_as: shadow
+fire_budget_per_day: 10
+precision_floor: 0.25
+scope_field: host.name
+scope_kind: host
+
+model:
+  detector: logon_chain
+  params:
+    window_hours: 2
+    learning_days: 30
+    warm_days: 14
+    chain_minutes: 15
+    max_events: 5000
+
+attack:
+  - T1021.004
+  - T1021.001
+  - T1078
+
+false_positives:
+  - An operator connects to a jump host and from there to a host for the
+    first time. The edge set then holds the new edge, and the next hop
+    through the jump host is quiet.
+  - New automation hops from a head node to a worker it never used. It fires
+    once and then joins the edge set.
+
+references:
+  - https://attack.mitre.org/techniques/T1021/004/
+  - https://attack.mitre.org/techniques/T1021/001/
+  - https://attack.mitre.org/techniques/T1078/

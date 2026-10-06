@@ -334,6 +334,21 @@ export function HostsSummary({
               >
                 automatic sweeps are off
               </Link>
+              {/* The list reads the agent state and the last-seen time from
+                  that sweep. The machine page reads live activity, so the two
+                  disagreed with nothing to say which one was old. */}
+              {summary.last_sweep_at != null && (
+                <>
+                  {' · '}
+                  <span
+                    data-testid="hosts-as-of"
+                    title="The Agent and Last seen columns show the state at the last sweep. The machine page shows live activity."
+                  >
+                    the list shows the state as of{' '}
+                    {absTime(summary.last_sweep_at, { zone: true })}
+                  </span>
+                </>
+              )}
             </>
           )}
         </div>

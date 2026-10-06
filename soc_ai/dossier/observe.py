@@ -62,7 +62,7 @@ import ipaddress
 import logging
 import math
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -83,6 +83,7 @@ from soc_ai.dossier.types import (
 from soc_ai.so_client import fields, inventory
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.so_client.fields import first_present, get_dotted
+from soc_ai.so_client.paging import read_pages
 from soc_ai.tools._synth_scope import synth_scope_must_not
 from soc_ai.tools.host_summary import (
     _agg_time,
@@ -252,16 +253,18 @@ _HOSTLOG_DATASETS: tuple[str, ...] = (
     "windows.sysmon_operational",
 )
 
-# Machines per network, and addresses per machine. The host cap is generous
-# because an agent-shipping network is bounded by installs, not by traffic. The
-# address cap holds a container host: one production agent reported 111
+# Machines per page and per network, and addresses per machine. The machines
+# are read in composite pages, in name order, up to the ceiling. A terms read of
+# the busiest 500 dropped every agent past them, with no note. The address cap
+# holds a container host: one production agent reported 111
 # addresses, 102 of them link-local, and a cap of 40 dropped real addresses
 # from one sweep to the next. The values come in key order, where every IPv4
 # address sorts before every IPv6 one, so link-local IPv6 values fall off the
 # cap first. Elasticsearch cannot drop single values of an `ip` field inside a
 # terms agg (a regex include works on keyword fields only), so the link-local
 # values that do arrive are dropped by `identity_bearing_ip`.
-_AGENT_HOST_AGG_SIZE = 500
+_AGENT_HOST_PAGE = 1_000
+_AGENT_HOST_CEILING = 20_000
 _AGENT_IP_AGG_SIZE = AGENT_ADDRESS_CAP
 
 # Projected out of the newest document per machine. `host.os` is taken as a
@@ -471,9 +474,12 @@ async def collect_agent_inventory(
 
     ONE ``size=0`` aggregation for the whole network, run once per sweep rather
     than once per host: the answer does not vary by address, and the per-host
-    version would cost an extra aggregation for every dossier built.
+    version would cost an extra aggregation for every dossier built. It is read
+    in composite pages of :data:`_AGENT_HOST_PAGE` machines, up to
+    :data:`_AGENT_HOST_CEILING`. A network past the ceiling gets a note: the
+    machines past it in name order have no self-report in this sweep.
 
-    Shape: a ``host.name`` terms agg, each bucket carrying a ``host.ip`` terms
+    Shape: a ``host.name`` composite agg, each bucket carrying a ``host.ip`` terms
     agg (the claim list), min/max ``@timestamp`` (the reporting window), and a
     size-1 newest-first ``top_hits`` (the self-report). The identity fields come
     out of that ONE document on purpose — it is a coherent snapshot, so the name,
@@ -514,49 +520,61 @@ async def collect_agent_inventory(
         }
     }
     try:
-        result = await elastic.search(
-            settings.events_index_pattern, query, size=0, aggs=_agent_aggs()
+        pages = await read_pages(
+            elastic,
+            settings.events_index_pattern,
+            query,
+            name="hosts",
+            field="host.name",
+            aggs=_agent_aggs(),
+            page_size=_AGENT_HOST_PAGE,
+            ceiling=_AGENT_HOST_CEILING,
         )
     except Exception as exc:
+        # The pages before a failed one are dropped. A part of the network read
+        # as the whole turns a contested address into a unique claim.
         _LOGGER.warning("dossier: agent inventory failed: %s", exc)
         return AgentInventory(errors=(f"agent inventory failed: {exc}",))
 
-    buckets = ((result.aggregations or {}).get("hosts") or {}).get("buckets") or []
-    reports = [report for bucket in buckets if (report := _agent_report(bucket)) is not None]
-    return AgentInventory.from_reports(reports)
+    reports = [report for bucket in pages.buckets if (report := _agent_report(bucket)) is not None]
+    agents = AgentInventory.from_reports(reports)
+    if not pages.capped:
+        return agents
+    note = (
+        f"the agent inventory stopped at the ceiling of {_AGENT_HOST_CEILING:,} agents. "
+        "The agents past the ceiling in name order have no self-report in this sweep. "
+        "An address that one of them also claims can read as a unique claim."
+    )
+    return replace(agents, notes=(*agents.notes, note))
 
 
 def _agent_aggs() -> dict[str, Any]:
+    """What each machine bucket of the agent inventory carries."""
     return {
-        "hosts": {
-            "terms": {"field": "host.name", "size": _AGENT_HOST_AGG_SIZE},
-            "aggs": {
-                "ips": {
-                    "terms": {
-                        "field": "host.ip",
-                        "size": _AGENT_IP_AGG_SIZE,
-                        "order": {"_key": "asc"},
-                    },
-                    # The agent's own documents per address: the activity of an
-                    # address no network sensor sees.
-                    "aggs": {
-                        "first_seen": {"min": {"field": "@timestamp"}},
-                        "last_seen": {"max": {"field": "@timestamp"}},
-                    },
-                },
-                # The reporting window, not the build time: an agent-only host
-                # takes its dossier lifetime from these.
-                "first_report": {"min": {"field": "@timestamp"}},
-                "last_report": {"max": {"field": "@timestamp"}},
-                "latest": {
-                    "top_hits": {
-                        "size": 1,
-                        "sort": _NEWEST_FIRST,
-                        "_source": list(_AGENT_READS),
-                    }
-                },
+        "ips": {
+            "terms": {
+                "field": "host.ip",
+                "size": _AGENT_IP_AGG_SIZE,
+                "order": {"_key": "asc"},
             },
-        }
+            # The agent's own documents per address: the activity of an
+            # address no network sensor sees.
+            "aggs": {
+                "first_seen": {"min": {"field": "@timestamp"}},
+                "last_seen": {"max": {"field": "@timestamp"}},
+            },
+        },
+        # The reporting window, not the build time: an agent-only host
+        # takes its dossier lifetime from these.
+        "first_report": {"min": {"field": "@timestamp"}},
+        "last_report": {"max": {"field": "@timestamp"}},
+        "latest": {
+            "top_hits": {
+                "size": 1,
+                "sort": _NEWEST_FIRST,
+                "_source": list(_AGENT_READS),
+            }
+        },
     }
 
 

@@ -13,6 +13,29 @@ import { ago } from './timeRange';
 // the Operate panel, from GET /hunt-catalog.
 // ---------------------------------------------------------------------------
 
+/** The evaluators the hourly profile sweep runs. A `profile` analytic reads a
+ *  stored baseline. A `model` analytic runs a tier 3 detector in the same
+ *  sweep. The backend holds the same set as PRIOR_SWEEP_EVALUATORS. */
+export const PROFILE_SWEEP_EVALUATORS: readonly string[] = ['profile', 'model'];
+
+/** True when the profile sweep runs an analytic of this evaluator. */
+export function runsInProfileSweep(evaluator: string | undefined): boolean {
+  return evaluator !== undefined && PROFILE_SWEEP_EVALUATORS.includes(evaluator);
+}
+
+/** True when a hunt can run an analytic of this evaluator. `t_run_analytic`
+ *  runs a `match` analytic as a grid query. It returns could_not_run for a
+ *  `profile` or a `model` analytic, because the profile sweep answers those.
+ *  A hunt started on one spent its first step on that error and then
+ *  rebuilt the hypothesis by hand for nine minutes. */
+export function huntCanRun(evaluator: string | undefined): boolean {
+  return evaluator === 'match';
+}
+
+/** Why a live analytic that a hunt cannot run has no hunt control. */
+export const NO_HUNT_LINE =
+  'A hunt cannot run this analytic. The profile sweep runs it every hour.';
+
 /** True when the loop that runs an analytic of this evaluator is on and has
  *  run at least once. null when the catalog is not read yet. */
 export function loopRuns(
@@ -20,7 +43,7 @@ export function loopRuns(
   evaluator: string | undefined,
 ): boolean | null {
   if (!catalog) return null;
-  if (evaluator === 'profile') {
+  if (runsInProfileSweep(evaluator)) {
     // An older backend sends no profile-sweep fields. Unknown, never "not running".
     if (catalog.last_prior_run_at === undefined) return null;
     return (catalog.prior_sweeps_enabled ?? true) && !!catalog.last_prior_run_at;

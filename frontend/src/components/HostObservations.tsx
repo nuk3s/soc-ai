@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import { getObservations, type EntityObservation } from '../lib/api';
 import { kindLabel, sourceLabel, sourceTitle } from '../lib/kinds';
 import { plural } from '../lib/plural';
+import { statisticSentence } from '../lib/statistics';
 import { absTime, ago } from '../lib/timeRange';
 import {
   CHIP_IN_LEAD,
@@ -10,6 +11,7 @@ import {
   CHIP_SWEEPS,
   CHIP_TYPE,
   COUNT_OBSERVATIONS,
+  OBSERVATION_STATISTIC,
   UNREAD_DOT,
 } from '../lib/tooltips';
 import { useAsync } from '../lib/useAsync';
@@ -65,7 +67,28 @@ function Row({ observation }: { observation: EntityObservation }) {
       >
         {kindLabel(observation.kind, observation.kind_label)}
       </span>
-      <span className="min-w-0 flex-1 text-text-2">{observation.summary ?? ''}</span>
+      <span className="min-w-0 flex-1 text-text-2">
+        {observation.summary ?? ''}
+        {/* The statistic the row carries. A row written before it existed
+            states none. */}
+        {statisticSentence(
+          observation.statistic,
+          observation.statistic_value,
+          observation.baseline_value,
+        ) && (
+          <span
+            className="block text-[11.5px] text-dim"
+            data-testid={`observation-statistic-${observation.id}`}
+            title={OBSERVATION_STATISTIC}
+          >
+            {statisticSentence(
+              observation.statistic,
+              observation.statistic_value,
+              observation.baseline_value,
+            )}
+          </span>
+        )}
+      </span>
       {observation.occurrences > 1 && (
         <span className="text-[11px] text-dim" title={CHIP_SWEEPS}>
           seen on {plural(observation.occurrences, 'sweep')}

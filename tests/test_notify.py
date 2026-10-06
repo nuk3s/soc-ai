@@ -164,7 +164,7 @@ async def test_slack_format_payload() -> None:
     with ctx:
         await notify.fire(event, _settings(notify_format="slack"), AsyncMock())
     _url, payload = client.posts[0]
-    assert payload == {"text": "Title — Body /app/x"}
+    assert payload == {"text": "Title. Body /app/x"}
 
 
 @pytest.mark.asyncio
@@ -175,7 +175,7 @@ async def test_matrix_format_payload() -> None:
     with ctx:
         await notify.fire(event, _settings(notify_format="matrix"), AsyncMock())
     _url, payload = client.posts[0]
-    assert payload == {"msgtype": "m.text", "body": "Title — Body /app/x"}
+    assert payload == {"msgtype": "m.text", "body": "Title. Body /app/x"}
 
 
 # ── event builders: threshold + toggle gating ────────────────────────────────

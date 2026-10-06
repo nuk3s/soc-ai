@@ -68,13 +68,20 @@ export function ago(iso: string | null | undefined): string {
 }
 
 /** Format an ISO timestamp as a readable absolute LOCAL time ("Jul 06, 2026,
- * 14:23:05"). Falls back to the raw string when unparseable, '—' when empty. */
-export function absTime(iso?: string | null): string {
+ * 14:23:05"). Falls back to the raw string when unparseable, '—' when empty.
+ *
+ * `zone` adds the short name of the browser's time zone ("Jul 06, 2026,
+ * 14:23:05 EDT"). A line of text that dates a list states its zone. The Hosts
+ * note read 08:10 for a sweep that ran at 12:10 UTC, and nothing on the line
+ * said which clock it read. A tooltip sits beside a relative time and can
+ * leave the zone out. */
+export function absTime(iso?: string | null, opts: { zone?: boolean } = {}): string {
   if (!iso) return '—';
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
   return d.toLocaleString(undefined, {
     year: 'numeric', month: 'short', day: '2-digit',
     hour: '2-digit', minute: '2-digit', second: '2-digit',
+    ...(opts.zone ? { timeZoneName: 'short' as const } : {}),
   });
 }

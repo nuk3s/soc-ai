@@ -19,7 +19,7 @@ from typing import Any
 import yaml
 from fastapi import Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from soc_ai.api.deps import get_elastic, get_settings_dep
@@ -33,8 +33,9 @@ from soc_ai.api.webui._shared import (
 from soc_ai.api.webui.kind_labels import kind_label
 from soc_ai.config import Settings
 from soc_ai.hunting.catalog_tiers import Catalog, effective_catalog
+from soc_ai.hunting.leads import decays_from
 from soc_ai.hunting.ledger import Ledger, analytic_ledger
-from soc_ai.hunting.spec import CATALOG_DIR, HuntSpec
+from soc_ai.hunting.spec import CATALOG_DIR, PRIOR_SWEEP_EVALUATORS, HuntSpec
 from soc_ai.hunting.weight import live_weight
 from soc_ai.hunting.wording import reword_legacy_summary
 from soc_ai.so_client.elastic import ElasticClient
@@ -62,8 +63,17 @@ _MAX_ENTITY_OBSERVATIONS = 200
 _MAX_OBSERVATION_DAYS = 90
 
 # The sources that write an analytic hit. ``candidate`` is the retired word
-# for the same adapter, and rows written under it are still hits.
-_HIT_SOURCES = ("catalog", LEGACY_OBSERVATION_SOURCE)
+# for the same adapter, and rows written under it are still hits. A tier 3
+# detector writes every hit as shadow with receipts, so its hits sit in the
+# same list, where the Needs-you count already counts them.
+#
+# A ``profile`` analytic is an analytic too, and its departure is its hit. The
+# list left it out, so the hits panel said "No analytic hit in the last 7
+# days" while the Analytics tab showed ten observations from three live
+# profile analytics. A shadow departure carries receipts, as a catalog hit
+# does. An ``alert`` or a ``hunt`` observation is written under an adapter
+# id and no analytic wrote it, so it stays out.
+_HIT_SOURCES = ("catalog", LEGACY_OBSERVATION_SOURCE, "profile", "model")
 
 
 def _not_found(analytic_id: str) -> HTTPException:
@@ -94,6 +104,10 @@ class AnalyticRowOut(BaseModel):
     # The generalization check's sentences on a drafted analytic that still
     # names the entity of its one case. Empty for every other analytic.
     pinned: list[str] = []
+    # The reason soc-ai moved this analytic from live to shadow, while that
+    # demotion still holds it there. None for every other analytic. The row
+    # and the drawer read it, so a hold never reads as an analyst's shadow.
+    held_by_system: str | None = None
 
 
 class AnalyticsListOut(BaseModel):
@@ -108,6 +122,12 @@ class AnalyticVersionOut(BaseModel):
     at: str
     why: str | None
     has_receipts: bool = False
+    # True when soc-ai made the change: a shipped analytic that shipped in
+    # shadow, or a demotion by the self-healing hold. The ledger names the
+    # hand, so a system change never reads as an analyst's decision.
+    system: bool = False
+    # The numbers a system demotion was taken on. None on every other row.
+    evidence: dict[str, Any] | None = None
 
 
 class AnalyticDetailOut(AnalyticRowOut):
@@ -271,6 +291,7 @@ def _row(
     cat: Catalog,
     ledger: Ledger,
     pinned: list[str] | None = None,
+    held_by_system: str | None = None,
 ) -> AnalyticRowOut:
     tier, status = cat.status_of(spec_id)
     return AnalyticRowOut(
@@ -289,6 +310,9 @@ def _row(
         shadow_hits_7d=ledger.shadow_hits,
         unread_shadow_hits=ledger.unread_shadow_hits,
         pinned=list(pinned or []),
+        # A hold is a fact about the shadow status. Read on any other status
+        # it would be a stale sentence.
+        held_by_system=held_by_system if status == "shadow" else None,
     )
 
 
@@ -348,8 +372,16 @@ async def list_analytics(request: Request) -> AnalyticsListOut:
             now=now,
         )
         pinned = await analytics_store.pinned_analytics(db)
+        holds = await analytics_store.system_holds(db)
     rows = [
-        _row(spec_id, spec, cat, ledgers[spec_id], pinned.get(spec_id))
+        _row(
+            spec_id,
+            spec,
+            cat,
+            ledgers[spec_id],
+            pinned.get(spec_id),
+            holds[spec_id].why if spec_id in holds else None,
+        )
         for spec_id, spec in cat.listed.items()
     ]
     counts: dict[str, int] = {}
@@ -409,6 +441,10 @@ async def get_analytic(request: Request, analytic_id: str) -> AnalyticDetailOut:
             f"The catalog lists '{analytic_id}' and this deployment does not ship its file. "
             "Reinstall the app or retire the analytic.",
         ) from exc
+    # The newest row is the hold when a system demotion is the last word on
+    # the analytic. An approval or a retirement after it ends the hold.
+    newest = versions[-1] if versions else None
+    held = newest.why if newest is not None and analytics_store.is_system_demotion(newest) else None
     return AnalyticDetailOut(
         **_row(
             analytic_id,
@@ -417,6 +453,7 @@ async def get_analytic(request: Request, analytic_id: str) -> AnalyticDetailOut:
             ledger,
             # The first version row is the draft's. A later row never carries pins.
             analytics_store.pins_of(versions[0]) if versions else None,
+            held,
         ).model_dump(),
         description=spec.description,
         spec_text=spec_text,
@@ -434,6 +471,8 @@ async def get_analytic(request: Request, analytic_id: str) -> AnalyticDetailOut:
                 # no receipts.
                 has_receipts=isinstance(version.receipts_json, list)
                 and bool(version.receipts_json),
+                system=analytics_store.is_system_actor(version.who),
+                evidence=analytics_store.evidence_of(version),
             )
             for version in versions
         ],
@@ -445,7 +484,7 @@ async def get_analytic(request: Request, analytic_id: str) -> AnalyticDetailOut:
 
 async def _last_run_at(db: AsyncSession, analytic_id: str, *, evaluator: str) -> datetime | None:
     """The newest trail row of the loop that runs this analytic. None if it never ran."""
-    if evaluator == "profile":
+    if evaluator in PRIOR_SWEEP_EVALUATORS:
         newest: datetime | None = await db.scalar(
             select(func.max(PriorSpecRun.created_at)).where(PriorSpecRun.spec_id == analytic_id)
         )
@@ -458,7 +497,7 @@ async def _last_run_at(db: AsyncSession, analytic_id: str, *, evaluator: str) ->
 
 def _runner_enabled(settings: Any, *, evaluator: str) -> bool:
     """The setting of the loop that runs this analytic."""
-    if evaluator == "profile":
+    if evaluator in PRIOR_SWEEP_EVALUATORS:
         return bool(getattr(settings, "hunting_prior_sweep_enabled", True))
     return bool(getattr(settings, "hunt_spec_sweeps_enabled", False))
 
@@ -516,7 +555,10 @@ async def set_analytic_status(
             "A retirement needs a reason. Type why you retire this analytic.",
         )
     async with request.app.state.db_sessionmaker() as db:
-        cat = await effective_catalog(db)
+        # ``seed``: a shipped analytic that ships in shadow reads shadow before
+        # its row exists, and an approval moves a row. The sweeps write it, and
+        # this route writes it too, so an approval never waits on a sweep.
+        cat = await effective_catalog(db, seed=True)
         if analytic_id not in cat.listed:
             raise _not_found(analytic_id)
         tier, status = cat.status_of(analytic_id)
@@ -541,6 +583,15 @@ async def set_analytic_status(
                 await analytics_store.transition(
                     db, analytic_id, to_status=body.to, by=by, why=body.why, receipts=receipts
                 )
+        except analytics_store.SystemActorRefused as exc:
+            # A person whose user name reads as a system hand. The list of
+            # allowed targets would tell them the move is allowed.
+            raise api_error(
+                422,
+                "system_actor_refused",
+                f"The name '{by}' is a system name. A system name cannot approve or retire "
+                "an analytic. Sign in with an analyst account.",
+            ) from exc
         except ValueError as exc:
             allowed = sorted(analytics_store.allowed_transitions(tier, status))
             targets = ", ".join(allowed) if allowed else "no other status"
@@ -651,8 +702,21 @@ def unread_shadow_hits_where(cat: Catalog) -> tuple[Any, ...]:
     page read zero. One clause is what keeps them from disagreeing.
     """
     return (
-        EntityObservation.shadow.is_(True),
+        *shadow_hits_where(cat),
         EntityObservation.read_at.is_(None),
+    )
+
+
+def shadow_hits_where(cat: Catalog) -> tuple[Any, ...]:
+    """What makes a shadow hit, read or unread.
+
+    The source is part of it. The Needs-you count read every shadow row and
+    the hits list read the hit sources only, so a row the count held could be
+    missing from the list it sent the analyst to.
+    """
+    return (
+        EntityObservation.source.in_(_HIT_SOURCES),
+        EntityObservation.shadow.is_(True),
         EntityObservation.spec_id.not_in(_retired_analytics(cat)),
     )
 
@@ -705,10 +769,7 @@ async def list_shadow_hits(request: Request, limit: int = 50) -> ShadowHitsOut:
         rows = (
             await db.scalars(
                 select(EntityObservation)
-                .where(
-                    EntityObservation.shadow.is_(True),
-                    EntityObservation.spec_id.not_in(_retired_analytics(cat)),
-                )
+                .where(*shadow_hits_where(cat))
                 .order_by(
                     EntityObservation.read_at.is_not(None),
                     EntityObservation.born_at.desc(),
@@ -769,8 +830,10 @@ async def mark_shadow_hit_read(request: Request, obs_id: int) -> dict[str, bool]
 # ---------------------------------------------------------------------------
 #
 # The shadow band showed the shadow half only, so nobody could see what a real
-# hit looks like. This list holds both. The live half comes first and carries
-# the weight. The shadow half is provisional and follows, unread first.
+# hit looks like. This list holds both. A live hit carries the weight on the
+# card. Under the All filter the unread shadow hits lead the order: Needs-you
+# counts them, and a list of 147 live hits pushed the one it counted off the
+# first page. The live half follows, then the read shadow hits.
 #
 # The routes sit here rather than beside the other /hunts routes for the reason
 # the module docstring gives: ``/hunts/{hunt_id}`` in ``routes_hunts`` matches
@@ -779,10 +842,15 @@ async def mark_shadow_hit_read(request: Request, obs_id: int) -> dict[str, bool]
 _HIT_FILTERS = ("all", "unread", "live", "shadow")
 _MAX_HIT_DAYS = 30
 _MAX_HITS = 200
+# A window of 30 days holds far fewer hits than this. The bound keeps a typed
+# offset from asking the store to skip an unbounded number of rows.
+_MAX_HIT_OFFSET = 100_000
 
 
-def _hit_bounds(days: int, hit_filter: str, limit: int) -> tuple[int, str, int]:
-    """Check the three query parameters, or refuse with a reason and a hint."""
+def _hit_bounds(
+    days: int, hit_filter: str, limit: int, offset: int = 0
+) -> tuple[int, str, int, int]:
+    """Check the four query parameters, or refuse with a reason and a hint."""
     if not 1 <= days <= _MAX_HIT_DAYS:
         raise api_error(
             422,
@@ -801,7 +869,14 @@ def _hit_bounds(days: int, hit_filter: str, limit: int) -> tuple[int, str, int]:
             "bad_limit",
             f"Ask for 1 to {_MAX_HITS} hits. The section asks for 50 by default.",
         )
-    return days, hit_filter, limit
+    if not 0 <= offset <= _MAX_HIT_OFFSET:
+        raise api_error(
+            422,
+            "bad_offset",
+            f"Ask for an offset from 0 to {_MAX_HIT_OFFSET}. "
+            "The section asks for 0, then adds the page size for each page.",
+        )
+    return days, hit_filter, limit, offset
 
 
 def _hit_row(
@@ -851,18 +926,25 @@ async def list_analytic_hits(
     days: int = Query(default=7, description="How many days the section covers. 1 to 30."),
     hit_filter: str = Query(default="all", alias="filter"),
     limit: int = Query(default=50),
+    offset: int = Query(default=0, description="How many hits of the order to skip."),
 ) -> AnalyticHitsOut:
     """Every analytic hit from the last ``days`` days, live and shadow.
 
-    Order: live hits first, newest first. Then shadow hits, unread first, then
-    newest first. The live hit is the real signal and it leads the list.
+    Order under ``all``: the unread shadow hits first, newest first. Then the
+    live hits, newest first. Then the read shadow hits, newest first. Needs-you
+    counts the unread shadow hits, so they lead the list it sends the analyst
+    to. The ``live`` filter is newest first. The ``shadow`` filter is unread
+    first, then newest first. The ``unread`` filter is newest first.
+
+    ``limit`` and ``offset`` page through that one order, so a page never
+    repeats a hit of the page before it.
 
     ``counts`` is read over the whole window, not over the returned page. The
     chips would otherwise report the page as the night.
     """
     from soc_ai.store.models import Lead  # noqa: PLC0415 - lazy, as the leads routes do
 
-    days, hit_filter, limit = _hit_bounds(days, hit_filter, limit)
+    days, hit_filter, limit, offset = _hit_bounds(days, hit_filter, limit, offset)
     since = (datetime.now(UTC) - timedelta(days=days)).replace(tzinfo=None)
     async with request.app.state.db_sessionmaker() as db:
         cat = await effective_catalog(db)
@@ -883,36 +965,36 @@ async def list_analytic_hits(
             EntityObservation.shadow.is_(False),
             EntityObservation.spec_id.not_in(retired),
         )
-        live_rows: list[EntityObservation] = []
-        shadow_rows: list[EntityObservation] = []
-        if hit_filter in ("all", "live"):
-            live_rows = list(
-                (
-                    await db.scalars(
-                        select(EntityObservation)
-                        .where(*in_window, *is_live)
-                        .order_by(EntityObservation.born_at.desc(), EntityObservation.id.desc())
-                        .limit(limit)
-                    )
-                ).all()
+        unread_shadow = and_(*is_shadow, EntityObservation.read_at.is_(None))
+        newest = (EntityObservation.born_at.desc(), EntityObservation.id.desc())
+        where: tuple[Any, ...]
+        order: tuple[Any, ...]
+        if hit_filter == "live":
+            where, order = is_live, newest
+        elif hit_filter == "shadow":
+            where, order = is_shadow, (EntityObservation.read_at.is_not(None), *newest)
+        elif hit_filter == "unread":
+            where, order = (unread_shadow,), newest
+        else:
+            # One query and one order, so an offset pages through all three
+            # groups. Two queries joined in Python could not skip into the
+            # second group.
+            where = (or_(and_(*is_live), and_(*is_shadow)),)
+            order = (
+                case((unread_shadow, 0), (EntityObservation.shadow.is_(False), 1), else_=2),
+                *newest,
             )
-        if hit_filter in ("all", "shadow", "unread"):
-            unread_only = (EntityObservation.read_at.is_(None),) if hit_filter == "unread" else ()
-            shadow_rows = list(
-                (
-                    await db.scalars(
-                        select(EntityObservation)
-                        .where(*in_window, *is_shadow, *unread_only)
-                        .order_by(
-                            EntityObservation.read_at.is_not(None),
-                            EntityObservation.born_at.desc(),
-                            EntityObservation.id.desc(),
-                        )
-                        .limit(limit)
-                    )
-                ).all()
-            )
-        rows = (live_rows + shadow_rows)[:limit]
+        rows = list(
+            (
+                await db.scalars(
+                    select(EntityObservation)
+                    .where(*in_window, *where)
+                    .order_by(*order)
+                    .offset(offset)
+                    .limit(limit)
+                )
+            ).all()
+        )
         counts = AnalyticHitCountsOut(
             live=await _count_hits(db, *in_window, *is_live),
             shadow=await _count_hits(db, *in_window, *is_shadow),
@@ -1015,6 +1097,11 @@ class EntityObservationOut(BaseModel):
     # and a promoted hunt finding are recorded under a spec id that names the
     # adapter, so the row links to no analytic.
     analytic_exists: bool = False
+    # Migration 0057. The statistic that departed, its value and the value of
+    # the baseline it departed from. None on a row that predates them.
+    statistic: str | None = None
+    statistic_value: float | None = None
+    baseline_value: float | None = None
 
 
 class EntityObservationsOut(BaseModel):
@@ -1102,7 +1189,7 @@ async def list_observations(
                 weight_now=round(
                     live_weight(
                         float(observation.birth_weight or 0.0),
-                        born_at=observation.born_at,
+                        born_at=decays_from(observation.observed_at, observation.born_at),
                         count=int(observation.occurrences or 1),
                         now=now,
                     ),
@@ -1114,6 +1201,9 @@ async def list_observations(
                 occurrences=int(observation.occurrences or 1),
                 read=observation.read_at is not None,
                 analytic_exists=observation.spec_id in cat.listed,
+                statistic=observation.statistic,
+                statistic_value=observation.statistic_value,
+                baseline_value=observation.baseline_value,
             )
             for observation in rows
         ],

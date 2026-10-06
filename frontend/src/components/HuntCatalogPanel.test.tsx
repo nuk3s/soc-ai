@@ -16,6 +16,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
 }));
 
 import { getHuntCatalog, type HuntCatalog, type HuntCatalogSpec } from '../lib/api';
+import { CHIP_HELD_BY_SYSTEM } from '../lib/tooltips';
 import { HuntCatalogPanel } from './HuntCatalogPanel';
 
 const HOUR = 3_600_000;
@@ -143,6 +144,59 @@ describe('HuntCatalogPanel run state', () => {
     expect(within(profile).getByText('live')).toBeTruthy();
   });
 
+  it('lists a model analytic with the profile sweep, which runs it', async () => {
+    const model: HuntCatalogSpec = {
+      ...PROFILE,
+      id: 'model-cross-plane-silence',
+      title: 'One telemetry plane of a machine goes silent',
+      evaluator: 'model',
+      status: 'shadow',
+    };
+    vi.mocked(getHuntCatalog).mockResolvedValue({
+      ...CATALOG,
+      specs: [SPEC, model],
+      sweeps_enabled: false,
+      last_sweep_at: null,
+      prior_sweeps_enabled: true,
+      last_prior_run_at: iso(HOUR / 6),
+    });
+    mount();
+    // A learned detector reads no stored profile, so it has its own group.
+    const group = await screen.findByTestId('detector-group');
+    expect(group.textContent).toContain('Learned detectors · 1');
+    expect(screen.queryByText(/Evaluated against behavioural profiles/)).toBeNull();
+    // The legend still defines the words on the row.
+    expect(screen.getByTestId('profile-legend')).toBeTruthy();
+    const row = screen.getByText(model.title).closest('li')!;
+    // The profile sweep runs, so the status reads without "not running".
+    expect(within(row).getByTestId('status-dot').textContent).toBe('shadow');
+  });
+
+  it('lists the profile analytics and the learned detectors under two labels', async () => {
+    const model: HuntCatalogSpec = {
+      ...PROFILE,
+      id: 'model-logon-chain',
+      title: 'A logon chain the estate model has not seen',
+      evaluator: 'model',
+      status: 'shadow',
+    };
+    vi.mocked(getHuntCatalog).mockResolvedValue({
+      ...CATALOG,
+      specs: [SPEC, PROFILE, model],
+      prior_sweeps_enabled: true,
+      last_prior_run_at: iso(HOUR / 6),
+    });
+    mount();
+    expect(await screen.findByText(/Evaluated against behavioural profiles · 1/)).toBeTruthy();
+    const group = screen.getByTestId('detector-group');
+    expect(group.textContent).toContain('Learned detectors · 1');
+    expect(group.textContent).toContain('counts are detector-host evaluations');
+    // One legend for both groups.
+    expect(screen.getAllByTestId('profile-legend')).toHaveLength(1);
+    expect(screen.getByText(model.title)).toBeTruthy();
+    expect(screen.getByText(PROFILE.title)).toBeTruthy();
+  });
+
   it('reads the shadow marker from the status, not the trail', async () => {
     vi.mocked(getHuntCatalog).mockResolvedValue({
       ...CATALOG,
@@ -153,6 +207,65 @@ describe('HuntCatalogPanel run state', () => {
     const row = (await screen.findByText(PROFILE.title)).closest('li')!;
     expect(within(row).getByText('live')).toBeTruthy();
     expect(within(row).queryByText('shadow')).toBeNull();
+  });
+
+  // N4 of the 2026-10-05 verification. Operate showed a held analytic with
+  // the same "shadow" chip as an analyst's shadow. The Analytics tab said
+  // "held by soc-ai" for the same three analytics.
+  it('marks an analytic soc-ai holds in shadow apart from an analyst shadow', async () => {
+    const REASON = 'The analytic wrote 18 hits in 24 hours. Its fire budget is 3 a day.';
+    const held = {
+      ...PROFILE,
+      id: 'profile-held',
+      title: 'A held profile analytic',
+      status: 'shadow',
+      held_by_system: REASON,
+    };
+    const chosen = {
+      ...PROFILE,
+      id: 'profile-chosen',
+      title: 'A profile analytic an analyst put in shadow',
+      status: 'shadow',
+      held_by_system: null,
+    };
+    const heldMatch = {
+      ...SPEC,
+      id: 'match-held',
+      title: 'A held match analytic',
+      status: 'shadow',
+      held_by_system: REASON,
+    };
+    vi.mocked(getHuntCatalog).mockResolvedValue({
+      ...CATALOG,
+      specs: [heldMatch, held, chosen],
+      last_prior_run_at: iso(HOUR / 6),
+    });
+    mount();
+    const heldRow = (await screen.findByText(held.title)).closest('li')!;
+    const chip = within(heldRow).getByTestId('catalog-held-profile-held');
+    expect(chip.textContent).toBe('held by soc-ai');
+    expect(chip.title).toBe(`${CHIP_HELD_BY_SYSTEM} ${REASON}`);
+    // The status stays. The amber "shadow" chip of an analyst's shadow goes.
+    expect(within(heldRow).getAllByText('shadow')).toHaveLength(1);
+
+    const matchRow = screen.getByText(heldMatch.title).closest('li')!;
+    expect(within(matchRow).getByTestId('catalog-held-match-held')).toBeTruthy();
+
+    // Negative control: an analyst's shadow keeps its chip and gets no hold.
+    const chosenRow = screen.getByText(chosen.title).closest('li')!;
+    expect(within(chosenRow).queryByText('held by soc-ai')).toBeNull();
+    expect(within(chosenRow).getAllByText('shadow')).toHaveLength(2);
+  });
+
+  it('shows no hold on an analytic that is no longer in shadow', async () => {
+    vi.mocked(getHuntCatalog).mockResolvedValue({
+      ...CATALOG,
+      specs: [{ ...PROFILE, status: 'live', held_by_system: 'an old reason' }],
+      last_prior_run_at: iso(HOUR / 6),
+    });
+    mount();
+    const row = (await screen.findByText(PROFILE.title)).closest('li')!;
+    expect(within(row).queryByText('held by soc-ai')).toBeNull();
   });
 
   it('says a coverage at the cap is capped', async () => {

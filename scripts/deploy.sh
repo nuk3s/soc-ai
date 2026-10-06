@@ -31,6 +31,9 @@ DEST="${2:-/opt/soc-ai}"
 rsync -az --delete \
   --exclude='.env' --exclude='.env.*' \
   --exclude='/data/' \
+  `#  a backup archive left beside the compose file. Two of them vanished on` \
+  `#  2026-10-05 when a deploy ran minutes after the backup.` \
+  --exclude='*.tar.gz' --exclude='/backups/' \
   --exclude='.ssh/' \
   --exclude='certs/' --exclude='caddy-root.crt' \
   --exclude='docker-compose.override.yml' \
@@ -41,6 +44,16 @@ rsync -az --delete \
   --exclude='.superpowers/' --exclude='.claude/' --exclude='.remember/' \
   ./ "${TARGET}:${DEST}/"
 
+# Tag the build with the date and the commit, and stamp the image with the
+# commit, so the VM never runs an image called ":latest". Both values go into
+# the VM's .env, so a later plain `docker compose up -d` (the TLS script, a
+# restart by hand) keeps the same tag and never pulls the public release image
+# over the deployed build. The three newest dev tags stay; older ones go.
+COMMIT="$(git -C "$(dirname "$0")/.." rev-parse HEAD)"
+TAG="dev-$(date -u +%Y%m%d)-${COMMIT:0:8}"
+ssh "${TARGET}" "cd ${DEST} && touch .env && sed -i '/^SOC_AI_IMAGE_TAG=/d;/^SOC_AI_COMMIT=/d' .env && \
+  printf 'SOC_AI_IMAGE_TAG=%s\nSOC_AI_COMMIT=%s\n' '${TAG}' '${COMMIT}' >> .env"
+
 # Rebuild + replace the container, then wait for the app to answer on 8443.
 # The health-wait must FAIL the deploy if the app never comes up — a bare
 # `for … break` loop always exits 0, so a container that crash-loops would be
@@ -48,4 +61,5 @@ rsync -az --delete \
 ssh "${TARGET}" "cd ${DEST} && sudo docker compose up -d --build && \
   ok=0; for i in \$(seq 1 20); do if curl -ksf https://127.0.0.1:8443/healthz >/dev/null || curl -sf http://127.0.0.1:8443/healthz >/dev/null; then ok=1; break; fi; sleep 3; done; \
   if [ \"\$ok\" != 1 ]; then echo 'DEPLOY HEALTHCHECK FAILED: app did not answer /healthz after ~60s' >&2; exit 1; fi; \
-  echo 'healthy'"
+  echo 'healthy'; \
+  sudo docker images ghcr.io/nuk3s/soc-ai --format '{{.Tag}}' | grep '^dev-' | sort -r | tail -n +4 | xargs -r -I{} sudo docker rmi ghcr.io/nuk3s/soc-ai:{} >/dev/null 2>&1 || true"

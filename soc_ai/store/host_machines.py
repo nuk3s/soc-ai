@@ -46,9 +46,9 @@ import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
-from sqlalchemy import select, update
+from sqlalchemy import Table, bindparam, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from soc_ai.dossier.resolve import resolve_field
@@ -462,15 +462,25 @@ class _Clusterer:
                 self._draft(f"mac:{lease.mac}").mac = lease.mac
                 self._place(ip, f"mac:{lease.mac}", "dhcp")
         # Every machine keeps the leases that name it: for an agent the leases
-        # of the MACs it owns, for a MAC machine the leases of its MAC.
+        # of the MACs it owns, for a MAC machine the leases of its MAC. Indexed
+        # by MAC: a scan of every lease per machine is quadratic, and on an
+        # estate of 20,000 machines it was most of the clustering.
+        positions: dict[str, list[int]] = {}
+        for position, lease in enumerate(clean):
+            positions.setdefault(lease.mac, []).append(position)
+        sole: dict[str, set[str]] = {}
+        for mac, ids in owners.items():
+            if len(ids) == 1:
+                sole.setdefault(next(iter(ids)), set()).add(mac)
         for target in self.drafts.values():
             owned: set[str] = set()
             if target.agent is not None:
-                mine = {target.agent.agent_id}
-                owned = {mac for mac, ids in owners.items() if ids == mine}
+                owned = sole.get(target.agent.agent_id, set())
             elif target.mac is not None:
                 owned = {target.mac}
-            target.leases.extend(lease for lease in clean if lease.mac in owned)
+            # The lease order stays the order of `clean`, as the scan kept it.
+            picked = sorted(i for mac in owned for i in positions.get(mac, ()))
+            target.leases.extend(clean[i] for i in picked)
 
     def place_names(self) -> None:
         """Rule 4. A strong DNS name whose short name only one agent machine holds."""
@@ -659,6 +669,17 @@ def _merge_prior(
     merged: dict[str, str] = {}
     extra_from: dict[str, set[str]] = {m.key: set() for m in machines}
     first_seen: dict[str, datetime | None] = {m.key: m.first_seen for m in machines}
+    # Which machines hold each address and each MAC. The merge reads overlaps
+    # through these: a scan of every machine per earlier machine is quadratic,
+    # and the sweep after 6,783 agents appeared on a 20,000-host estate spent
+    # 102 seconds in it.
+    by_ip: dict[str, list[str]] = {}
+    by_mac: dict[str, list[str]] = {}
+    for machine in machines:
+        for member in {a.ip for a in machine.members}:
+            by_ip.setdefault(member, []).append(machine.key)
+        for hardware in set(machine.macs):
+            by_mac.setdefault(hardware, []).append(machine.key)
     for old in prior:
         if old.key in by_key:
             extra_from[old.key].update(old.merged_from)
@@ -670,16 +691,20 @@ def _merge_prior(
             held = normalize_mac(old.key.split(":", 1)[1])
             if held is not None:
                 old_macs.add(held)
+        overlaps: dict[str, int] = {}
+        for member in old_ips:
+            for key in by_ip.get(member, ()):
+                overlaps[key] = overlaps.get(key, 0) + 1
+        for hardware in old_macs:
+            for key in by_mac.get(hardware, ()):
+                overlaps[key] = overlaps.get(key, 0) + 1
+        old_rank = _KEY_RANK.get(_key_kind(old.key), -1)
         best: tuple[int, int, str] | None = None
-        for machine in machines:
-            if _KEY_RANK.get(_key_kind(machine.key), -1) <= _KEY_RANK.get(_key_kind(old.key), -1):
+        for key, overlap in overlaps.items():
+            key_rank = _KEY_RANK.get(_key_kind(key), -1)
+            if key_rank <= old_rank:
                 continue
-            overlap = len(old_ips & {a.ip for a in machine.members}) + len(
-                old_macs & set(machine.macs)
-            )
-            if overlap == 0:
-                continue
-            rank = (overlap, _KEY_RANK.get(_key_kind(machine.key), -1), machine.key)
+            rank = (overlap, key_rank, key)
             if best is None or rank > best:
                 best = rank
         if best is None:
@@ -917,24 +942,32 @@ async def _retire(
 async def _point_addresses(
     db: AsyncSession, machines: Sequence[Machine], rows: Mapping[str, HostMachine]
 ) -> None:
-    """Set every address row's machine and kind. One UPDATE per (machine, kind)."""
+    """Set every address row's machine and kind. One executemany UPDATE for all.
+
+    One statement per (machine, kind) was 20,000 round trips on a large
+    estate. The address rows are keyed on ``host_key``, which is unique.
+    """
     await db.execute(
         update(HostDossier)
         .values(machine_id=None, address_kind=None)
         .execution_options(synchronize_session=False)
     )
-    for machine in machines:
-        row = rows[machine.key]
-        by_kind: dict[str, list[str]] = {}
-        for address in machine.addresses:
-            by_kind.setdefault(address.kind, []).append(address.ip)
-        for kind, ips in by_kind.items():
-            await db.execute(
-                update(HostDossier)
-                .where(HostDossier.host_key.in_(ips))
-                .values(machine_id=row.id, address_kind=kind)
-                .execution_options(synchronize_session=False)
-            )
+    params = [
+        {"k": address.ip, "m": rows[machine.key].id, "a": address.kind}
+        for machine in machines
+        for address in machine.addresses
+    ]
+    if not params:
+        return
+    # The Core table, not the mapped class: an ORM UPDATE with a list of
+    # parameter sets is the bulk-by-primary-key path, which takes no WHERE.
+    table = cast("Table", HostDossier.__table__)
+    statement = (
+        update(table)
+        .where(table.c.host_key == bindparam("k"))
+        .values(machine_id=bindparam("m"), address_kind=bindparam("a"))
+    )
+    await db.execute(statement, params)
 
 
 async def persist_clustering(
@@ -956,6 +989,11 @@ async def persist_clustering(
     stamp = _ts(now)
     by_ip = {fact.ip: fact for fact in facts}
     existing = {row.machine_key: row for row in (await db.scalars(select(HostMachine))).all()}
+    # Each machine's absorbed keys, read once. A scan of the merge map per
+    # machine is quadratic on the sweep where thousands of agents appear.
+    absorbed: dict[str, list[str]] = {}
+    for old_key, new_key in clustering.merged.items():
+        absorbed.setdefault(new_key, []).append(old_key)
     produced: dict[str, HostMachine] = {}
     for machine in clustering.machines:
         row = existing.get(machine.key)
@@ -963,8 +1001,8 @@ async def persist_clustering(
             row = HostMachine(machine_key=machine.key)
             db.add(row)
         held: list[Mapping[str, Any]] = list(row.addresses_json or [])
-        for old_key, new_key in clustering.merged.items():
-            if new_key == machine.key and old_key in existing:
+        for old_key in absorbed.get(machine.key, ()):
+            if old_key in existing:
                 held.extend(existing[old_key].addresses_json or [])
         _fill(row, machine, by_ip, held, stamp)
         produced[machine.key] = row

@@ -146,8 +146,8 @@ describe('formatNotificationWhen', () => {
   // appends "ago" — except under a minute, where the backend already returns
   // the word "now" and the append produced "now ago" (F61, fixed on the Topbar
   // bell and missed on the pane, which shows the SAME rows).
-  it('reads "just now" under a minute, never "now ago"', () => {
-    expect(formatNotificationWhen('now')).toBe('just now');
+  it('reads "now" under a minute, never "now ago"', () => {
+    expect(formatNotificationWhen('now')).toBe('now');
   });
 
   it('appends "ago" to a magnitude', () => {

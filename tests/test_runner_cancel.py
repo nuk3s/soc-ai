@@ -23,6 +23,9 @@ class _FakeRecorder:
     async def start(self) -> str:
         return "INV-1"
 
+    def attach_search_meter(self, meter: Any) -> None:
+        return None
+
     async def record(self, *a: Any, **k: Any) -> None:
         return None
 

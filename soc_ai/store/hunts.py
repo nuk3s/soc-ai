@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ulid import ULID
 
 from soc_ai.hunting.findings import threat_finding_count
+from soc_ai.run_meter import RunCounters, apply_counters
 from soc_ai.secret_scrub import (
     MODEL_TEXT_EVENT_KINDS,
     scrub_optional,
@@ -163,11 +164,14 @@ async def finalize(
     status: str,
     narrative: str | None = None,
     report: dict[str, Any] | None = None,
+    counters: RunCounters | None = None,
 ) -> None:
     hunt = await db.get(Hunt, hunt_id)
     if hunt is None:
         return
     hunt.status = status
+    # What the run cost and its budget class (migration 0058).
+    apply_counters(hunt, counters)
     # Credential values never reach the store: the narrative and the findings
     # are model-written text that every console user reads.
     if narrative is not None:

@@ -22,6 +22,18 @@ interface ShellState {
   /** triggered by command palette / bulk bar to kick the alerts auto-triage strip */
   triageNonce: number;
   requestTriage: () => void;
+  /** The name a person reads for the record a page shows, keyed by the route
+   *  key. The top bar shows the name in place of the key. A machine page set
+   *  it, because the top bar read "agent:<uuid>" over a page titled with the
+   *  machine name. */
+  crumbName: CrumbName | null;
+  setCrumbName: (value: CrumbName | null) => void;
+}
+
+/** A route key and the name to show for it. */
+export interface CrumbName {
+  key: string;
+  name: string;
 }
 
 const Ctx = createContext<ShellState | null>(null);
@@ -32,6 +44,7 @@ export function ShellProvider({ children }: { children: ReactNode }) {
   const [modalCount, setModalCount] = useState(0);
   const [ws, setWs] = useState('');
   const [triageNonce, setTriageNonce] = useState(0);
+  const [crumbName, setCrumbName] = useState<CrumbName | null>(null);
 
   // hydrate persisted sidebar state
   useEffect(() => {
@@ -79,8 +92,11 @@ export function ShellProvider({ children }: { children: ReactNode }) {
       setWs,
       triageNonce,
       requestTriage,
+      crumbName,
+      setCrumbName,
     }),
     [
+      crumbName,
       collapsed,
       toggleNav,
       paletteOpen,
@@ -103,4 +119,10 @@ export function useShell(): ShellState {
   const ctx = useContext(Ctx);
   if (!ctx) throw new Error('useShell must be used within ShellProvider');
   return ctx;
+}
+
+/** The shell, or null outside one. A page that only reports to the shell, and
+ *  that tests mount without it, reads this one. */
+export function useOptionalShell(): ShellState | null {
+  return useContext(Ctx);
 }

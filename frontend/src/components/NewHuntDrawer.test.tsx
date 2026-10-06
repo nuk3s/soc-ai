@@ -123,4 +123,29 @@ describe('NewHuntDrawer', () => {
     fireEvent.keyDown(window, { key: 'Escape' });
     await waitFor(() => expect(onClose).toHaveBeenCalledTimes(2));
   });
+
+  // The "Run this query" link of an observation opens the drawer with the
+  // query in the objective. The analyst reads it and starts the hunt.
+  it('opens with the objective a link hands it', async () => {
+    render(
+      <MemoryRouter initialEntries={['/hunts']}>
+        <ShellProvider>
+          <Routes>
+            <Route
+              path="/hunts"
+              element={
+                <NewHuntDrawer onClose={onClose} initialObjective="Run this OQL query: source.ip:x" />
+              }
+            />
+          </Routes>
+        </ShellProvider>
+      </MemoryRouter>,
+    );
+    expect((box() as HTMLTextAreaElement).value).toBe('Run this OQL query: source.ip:x');
+  });
+
+  it('opens empty with no objective handed to it', () => {
+    mount();
+    expect((box() as HTMLTextAreaElement).value).toBe('');
+  });
 });

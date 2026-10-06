@@ -96,6 +96,7 @@ from soc_ai.dossier.observe import (
     collect_dns_names,
     collect_host_observations,
 )
+from soc_ai.dossier.stages import StageClock, counting
 from soc_ai.dossier.types import (
     AgentInventory,
     AgentSelfReport,
@@ -140,8 +141,9 @@ _MAX_CENSUS_AGG_SIZE = 10_000
 # remaining hosts are worth more than waiting for this one.
 _PER_HOST_TIMEOUT_SECONDS = 20.0
 
-# Census upserts per transaction. One transaction over 4,000 rows holds a write
-# lock for the length of the pass; one per row is 4,000 commits.
+# Census addresses per batched upsert and per transaction. One transaction
+# over 4,000 rows holds a write lock for the length of the pass; one per row is
+# 4,000 commits.
 _CENSUS_COMMIT_CHUNK = 200
 
 # `dossier_run` rows kept. An operations trail, not an archive.
@@ -204,6 +206,9 @@ class DossierSummary:
     partial_reason: str | None = None
     # Machines the sweep wrote at its end. 0 when it kept the previous ones.
     machines: int = 0
+    # Wall time and searches per stage, in run order. The log carries the same
+    # numbers, one line per stage. The run row has no column for them.
+    stages: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -360,11 +365,19 @@ async def _census(
     summary: DossierSummary,
     *,
     agg_size: int,
+    page_cap: int = 0,
 ) -> dict[str, _Candidate]:
     """Enumerate the internal network. One round trip, no documents.
 
     A failed census is recorded and returns nothing: the sweep still runs its
     bookkeeping (and rebuilds already-known hosts) rather than raising.
+
+    The one search holds at most :data:`_MAX_CENSUS_AGG_SIZE` addresses per
+    direction, whatever ``dossier_max_hosts`` says. When a direction fills it
+    and ``page_cap`` is larger, that direction is read again in composite
+    pages, up to ``page_cap`` addresses. An estate of 20,000 hosts lost half
+    its addresses to the cap, and the note told the operator to raise a
+    setting that could not raise it.
 
     The recorded reason and the log line both changed wording on this branch
     ("estate pass" / "dossier: estate aggregation failed" became "census"), and
@@ -391,12 +404,92 @@ async def _census(
         _LOGGER.warning("dossier: census aggregation failed: %s", exc)
         return {}
 
-    aggs = result.aggregations or {}
+    aggs = dict(result.aggregations or {})
     candidates: dict[str, _Candidate] = {}
-    for key in ("src", "dst"):
-        _ingest_buckets(list((aggs.get(key) or {}).get("buckets") or []), cidrs, candidates)
+    for key, field_name in (("src", "source.ip"), ("dst", "destination.ip")):
+        agg = aggs.get(key) or {}
+        if int(agg.get("sum_other_doc_count") or 0) > 0 and page_cap > agg_size:
+            paged = await _census_pages(
+                es_client, index, cidrs, lookback_days, field_name, cap=page_cap, summary=summary
+            )
+            if paged is not None:
+                aggs[key] = agg = paged
+                if paged["capped"]:
+                    _record_note(
+                        summary,
+                        f"census stopped at {page_cap} addresses on {field_name}. "
+                        "Raise dossier_max_hosts or narrow internal_cidrs.",
+                    )
+        _ingest_buckets(list(agg.get("buckets") or []), cidrs, candidates)
     _note_truncation(aggs, summary, agg_size=agg_size)
     return candidates
+
+
+# Addresses per composite page of the census. Each address carries up to
+# seven sub-buckets, so a page stays under a quarter of the default
+# ``search.max_buckets``.
+_CENSUS_PAGE = 2000
+
+
+async def _census_pages(
+    es_client: Any,
+    index: str,
+    cidrs: list[Any],
+    lookback_days: int,
+    field_name: str,
+    *,
+    cap: int,
+    summary: DossierSummary,
+) -> dict[str, Any] | None:
+    """Every internal address on one side of the flows, read in composite pages.
+
+    Returns the buckets in the shape of the terms read, and ``capped`` True
+    when ``cap`` stopped the paging. Returns ``None`` when a page fails: the
+    caller keeps the terms read it has, and its truncation note stands.
+
+    The query keeps to internal addresses on ``field_name``. A page of
+    internet addresses is a page the census drops.
+    """
+    base = _census_query(cidrs, lookback_days)
+    query = {
+        "bool": {
+            "filter": [base, {"terms": {field_name: [str(net) for net in cidrs]}}],
+        }
+    }
+    sub_aggs = _endpoint_agg(field_name, _CENSUS_PAGE)["aggs"]
+    buckets: list[dict[str, Any]] = []
+    after: dict[str, Any] | None = None
+    capped = False
+    while True:
+        composite: dict[str, Any] = {
+            "size": _CENSUS_PAGE,
+            "sources": [{"ip": {"terms": {"field": field_name}}}],
+        }
+        if after is not None:
+            composite["after"] = after
+        try:
+            result = await es_client.search(
+                index,
+                query,
+                size=0,
+                aggs={"page": {"composite": composite, "aggs": sub_aggs}},
+            )
+        except Exception as exc:
+            _record_error(summary, f"census page on {field_name}: {type(exc).__name__}: {exc}")
+            _LOGGER.warning("dossier: census page on %s failed: %s", field_name, exc)
+            return None
+        page = (result.aggregations or {}).get("page") or {}
+        rows = list(page.get("buckets") or [])
+        for bucket in rows:
+            buckets.append({**bucket, "key": (bucket.get("key") or {}).get("ip")})
+        after = page.get("after_key")
+        if not rows or after is None:
+            break
+        if len(buckets) >= cap:
+            # The table cannot hold more. The caller notes the stop.
+            capped = True
+            break
+    return {"buckets": buckets[:cap], "sum_other_doc_count": 0, "capped": capped}
 
 
 def _note_truncation(aggs: dict[str, Any], summary: DossierSummary, *, agg_size: int) -> None:
@@ -539,26 +632,35 @@ async def _record_census(
     sweep whose per-host budget runs out still leaves the overflow discoverable
     and correctly prioritised (``last_built_at IS NULL`` sorts first) for the
     next one.
+
+    One batched upsert and one commit per chunk of addresses. One upsert per
+    address was most of this stage at 20,000 hosts. A chunk the batch refuses
+    is written again one address at a time, so a bad address costs its own row
+    and its own error line, and the rest of the chunk still lands.
     """
-    pending = 0
+    rows = [
+        dossier_store.HostUpsert(
+            ip=candidate.ip,
+            first_seen=candidate.first_seen,
+            last_seen=candidate.last_seen,
+            event_count=candidate.events,
+        )
+        for candidate in candidates.values()
+    ]
     async with db_sessionmaker() as db:
-        for candidate in candidates.values():
+        for start in range(0, len(rows), _CENSUS_COMMIT_CHUNK):
+            chunk = rows[start : start + _CENSUS_COMMIT_CHUNK]
             try:
-                await dossier_store.upsert_host(
-                    db,
-                    candidate.ip,
-                    first_seen=candidate.first_seen,
-                    last_seen=candidate.last_seen,
-                    event_count=candidate.events,
-                )
-            except Exception as exc:
-                _record_error(summary, f"census upsert {candidate.ip}: {type(exc).__name__}: {exc}")
-                continue
-            pending += 1
-            if pending >= _CENSUS_COMMIT_CHUNK:
-                await db.commit()
-                pending = 0
-        await db.commit()
+                await dossier_store.upsert_hosts(db, chunk)
+            except Exception:
+                for row in chunk:
+                    try:
+                        await dossier_store.upsert_hosts(db, [row])
+                    except Exception as exc:
+                        _record_error(
+                            summary, f"census upsert {row.ip}: {type(exc).__name__}: {exc}"
+                        )
+            await db.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -1479,7 +1581,30 @@ async def _sweep(
     summary: DossierSummary,
     audit: AuditLogger | None = None,
 ) -> None:
-    """The body of one sweep, with the run row already claimed."""
+    """The body of one sweep, with the run row already claimed.
+
+    Each stage is timed and its searches counted. The numbers go to the log,
+    one INFO line per stage, and to :attr:`DossierSummary.stages`.
+    """
+    grid = counting(es_client)
+    clock = StageClock(label="dossier sweep", grid=grid, logger=_LOGGER)
+    try:
+        await _sweep_stages(
+            grid, db_sessionmaker, settings, summary=summary, audit=audit, clock=clock
+        )
+    finally:
+        summary.stages = clock.as_dicts()
+
+
+async def _sweep_stages(  # noqa: PLR0915 - one procedure, read top to bottom
+    es_client: Any,
+    db_sessionmaker: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    *,
+    summary: DossierSummary,
+    audit: AuditLogger | None,
+    clock: StageClock,
+) -> None:
     async with db_sessionmaker() as db:
         cidrs = (await effective_internal_identifiers(db, settings)).cidrs
     if not cidrs:
@@ -1496,15 +1621,21 @@ async def _sweep(
     # need them: the census adopts the addresses they name, and every host build
     # reads its own slice out of them. Per-host they would be two extra
     # aggregations per address, for answers that do not vary by address.
-    agent_inventory = await collect_agent_inventory(
-        elastic=es_client, settings=settings, window_hours=window_hours
-    )
-    dns_names = await collect_dns_names(
-        elastic=es_client, settings=settings, window_hours=window_hours, cidrs=cidrs
-    )
-    leases = await collect_dhcp_leases(
-        elastic=es_client, settings=settings, window_hours=window_hours, cidrs=cidrs
-    )
+    with clock.stage("agent inventory") as stage:
+        agent_inventory = await collect_agent_inventory(
+            elastic=es_client, settings=settings, window_hours=window_hours
+        )
+        stage.detail = f"{len(agent_inventory.hosts)} agents"
+    with clock.stage("dns names") as stage:
+        dns_names = await collect_dns_names(
+            elastic=es_client, settings=settings, window_hours=window_hours, cidrs=cidrs
+        )
+        stage.detail = f"{len(dns_names.claims)} claims"
+    with clock.stage("dhcp leases") as stage:
+        leases = await collect_dhcp_leases(
+            elastic=es_client, settings=settings, window_hours=window_hours, cidrs=cidrs
+        )
+        stage.detail = f"{len(leases.leases)} leases"
     for detail in (*agent_inventory.errors, *dns_names.errors, *leases.errors):
         _record_error(summary, detail)
     # The DNS/agent passes' truncation notes ride the notes channel, never the
@@ -1512,52 +1643,58 @@ async def _sweep(
     for note in (*agent_inventory.notes, *dns_names.notes, *leases.notes):
         _record_note(summary, note)
 
-    build = await profile_job.build_profiles(es_client, db_sessionmaker, settings, cidrs)
-    for detail in build.errors:
-        _record_error(summary, detail)
-    for note in build.notes:
-        _record_note(summary, note)
-
-    candidates = await _census(
-        es_client, index, cidrs, lookback_days, summary, agg_size=_census_agg_size(settings)
-    )
-    _ingest_agent_claims(agent_inventory, cidrs, candidates)
-    _ingest_dns_names(dns_names, cidrs, candidates)
-    _drop_broadcast(candidates, cidrs)
-    # A row an older census wrote for a broadcast address goes too.
-    try:
-        async with db_sessionmaker() as db:
-            await dossier_store.delete_hosts(db, sorted(_broadcast_addresses(cidrs)))
-    except Exception as exc:
-        _record_error(summary, f"broadcast cleanup: {type(exc).__name__}: {exc}")
-    summary.hosts_seen = len(candidates)
-    if candidates:
-        await _record_census(db_sessionmaker, candidates, summary)
-    _note_cadence(settings, summary)
-    if not _census_failed(summary):
-        # Before the builds, so the sweep spends no host budget on an address
-        # that left the network weeks ago.
-        await _prune_stale(db_sessionmaker, settings, set(candidates), summary)
-
-    for ip in await _due_hosts(db_sessionmaker, int(settings.dossier_max_hosts_per_run)):
+    with clock.stage("census") as stage:
+        candidates = await _census(
+            es_client,
+            index,
+            cidrs,
+            lookback_days,
+            summary,
+            agg_size=_census_agg_size(settings),
+            page_cap=int(settings.dossier_max_hosts),
+        )
+        _ingest_agent_claims(agent_inventory, cidrs, candidates)
+        _ingest_dns_names(dns_names, cidrs, candidates)
+        _drop_broadcast(candidates, cidrs)
+        stage.detail = f"{len(candidates)} addresses"
+    with clock.stage("census record"):
+        # A row an older census wrote for a broadcast address goes too.
         try:
-            await _build_host(
-                es_client,
-                db_sessionmaker,
-                settings,
-                ip,
-                cidrs=cidrs,
-                window_hours=window_hours,
-                summary=summary,
-                audit=audit,
-                agent_inventory=agent_inventory,
-                dns_names=dns_names,
-            )
+            async with db_sessionmaker() as db:
+                await dossier_store.delete_hosts(db, sorted(_broadcast_addresses(cidrs)))
         except Exception as exc:
-            detail = f"{ip}: {type(exc).__name__}: {exc}"
-            _record_error(summary, detail)
-            _LOGGER.warning("dossier: build failed for %s: %s", ip, exc)
-            await _record_build_error(db_sessionmaker, ip, detail)
+            _record_error(summary, f"broadcast cleanup: {type(exc).__name__}: {exc}")
+        summary.hosts_seen = len(candidates)
+        if candidates:
+            await _record_census(db_sessionmaker, candidates, summary)
+        _note_cadence(settings, summary)
+        if not _census_failed(summary):
+            # Before the builds, so the sweep spends no host budget on an address
+            # that left the network weeks ago.
+            await _prune_stale(db_sessionmaker, settings, set(candidates), summary)
+
+    with clock.stage("host builds") as stage:
+        due = await _due_hosts(db_sessionmaker, int(settings.dossier_max_hosts_per_run))
+        for ip in due:
+            try:
+                await _build_host(
+                    es_client,
+                    db_sessionmaker,
+                    settings,
+                    ip,
+                    cidrs=cidrs,
+                    window_hours=window_hours,
+                    summary=summary,
+                    audit=audit,
+                    agent_inventory=agent_inventory,
+                    dns_names=dns_names,
+                )
+            except Exception as exc:
+                detail = f"{ip}: {type(exc).__name__}: {exc}"
+                _record_error(summary, detail)
+                _LOGGER.warning("dossier: build failed for %s: %s", ip, exc)
+                await _record_build_error(db_sessionmaker, ip, detail)
+        stage.detail = f"{len(due)} hosts"
 
     if summary.partial_reads:
         # An error, not a note: the run did not read the grid in full, and the
@@ -1568,25 +1705,41 @@ async def _sweep(
             f"previous role and services. First reason: {summary.partial_reason}",
         )
 
-    try:
-        async with db_sessionmaker() as db:
-            summary.hosts_pruned += await dossier_store.prune(
-                db, max_hosts=int(settings.dossier_max_hosts)
-            )
-    except Exception as exc:
-        _record_error(summary, f"prune: {type(exc).__name__}: {exc}")
-        _LOGGER.warning("dossier: prune failed: %s", exc)
+    with clock.stage("prune"):
+        try:
+            async with db_sessionmaker() as db:
+                summary.hosts_pruned += await dossier_store.prune(
+                    db, max_hosts=int(settings.dossier_max_hosts)
+                )
+        except Exception as exc:
+            _record_error(summary, f"prune: {type(exc).__name__}: {exc}")
+            _LOGGER.warning("dossier: prune failed: %s", exc)
 
-    # Last, over the table as the builds and the prunes left it.
-    await _build_machines(
-        db_sessionmaker,
-        settings,
-        agent_inventory=agent_inventory,
-        leases=leases,
-        dns_names=dns_names,
-        sightings=_sightings(candidates, agent_inventory),
-        summary=summary,
-    )
+    # Over the table as the builds and the prunes left it.
+    with clock.stage("machines") as stage:
+        await _build_machines(
+            db_sessionmaker,
+            settings,
+            agent_inventory=agent_inventory,
+            leases=leases,
+            dns_names=dns_names,
+            sightings=_sightings(candidates, agent_inventory),
+            summary=summary,
+        )
+        stage.detail = f"{summary.machines} machines"
+
+    # Last, so the build reads this sweep's census and machines. The build
+    # batches its searches by the hosts the census holds, and it skips a host
+    # whose profile is fresh and whose last activity the census dates. Run
+    # before the census, it read the previous sweep's dates and missed the
+    # hosts this sweep found.
+    with clock.stage("profile build") as stage:
+        build = await profile_job.build_profiles(es_client, db_sessionmaker, settings, cidrs)
+        stage.detail = f"{build.written} rows"
+    for detail in build.errors:
+        _record_error(summary, detail)
+    for note in build.notes:
+        _record_note(summary, note)
 
 
 __all__ = ["DossierSummary", "latest_run_started_at", "run_dossier_refresh"]

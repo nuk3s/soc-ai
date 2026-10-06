@@ -335,6 +335,28 @@ def test_disable_restores_the_direct_path(tmp_path: Path) -> None:
     assert "200" in r.proc.stdout
 
 
+def test_the_proxy_keeps_the_postgres_profile(tmp_path: Path) -> None:
+    """COMPOSE_PROFILES is a list, and the PostgreSQL store sits in it too.
+
+    The script used to write COMPOSE_PROFILES=proxy and unset the key on
+    disable. With the store in the compose "postgres" profile, either step
+    dropped the profile, and the next `docker compose up -d` left soc-ai
+    without its store server.
+    """
+    workdir = make_workdir(tmp_path)
+    with (workdir / ".env").open("a") as env:
+        env.write("COMPOSE_PROFILES=postgres\n")
+    r = run(tmp_path, workdir, "enable", DOMAIN, "internal")
+    assert r.proc.returncode == 0, r.proc.stderr + r.proc.stdout
+    assert env_values(r.env_text)["COMPOSE_PROFILES"] == "postgres,proxy"
+    r = run(tmp_path, workdir, "status")
+    assert "Mode:    proxy" in r.proc.stdout
+    r = run(tmp_path, workdir, "disable")
+    assert r.proc.returncode == 0, r.proc.stderr + r.proc.stdout
+    assert env_values(r.env_text)["COMPOSE_PROFILES"] == "postgres"
+    assert len(re.findall(r"^COMPOSE_PROFILES=", r.env_text, re.M)) == 1
+
+
 def test_dry_run_disable_changes_nothing(tmp_path: Path) -> None:
     workdir = make_workdir(tmp_path)
     run(tmp_path, workdir, "enable", DOMAIN, "internal")

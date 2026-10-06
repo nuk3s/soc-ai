@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from soc_ai.config import Settings
@@ -20,9 +20,23 @@ pytestmark = pytest.mark.asyncio
 
 
 def _app(settings: Settings) -> SimpleNamespace:
-    """Just enough app.state for the loop; it touches nothing else."""
+    """Just enough app.state for the loop; it touches nothing else.
+
+    The catalog read seeds the shadow row of a shipped analytic that ships in
+    shadow, so the session must answer a read with an empty result. A bare
+    AsyncMock answers ``.all()`` with a coroutine, the seed raises, the loop
+    logs and never sweeps, and a test with no sleep spins forever.
+    """
     session = AsyncMock()
     session.commit = AsyncMock()
+    empty = MagicMock()
+    empty.all.return_value = []
+    empty.first.return_value = None
+    empty.scalar_one_or_none.return_value = None
+    empty.scalars.return_value.all.return_value = []
+    session.scalars = AsyncMock(return_value=empty)
+    session.execute = AsyncMock(return_value=empty)
+    session.scalar = AsyncMock(return_value=None)
     maker = lambda: _CM(session)  # noqa: E731
     return SimpleNamespace(
         state=SimpleNamespace(settings=settings, db_sessionmaker=maker, elastic=AsyncMock())

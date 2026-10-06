@@ -152,6 +152,19 @@ class InvestigationContext:
     # Set once the effective sets above have been resolved (so a legitimate
     # (None, None) — no DB — is not re-resolved on every tool call).
     _egress_idents_resolved: bool = False
+    # The budget class the caller asks for (soc_ai.agent.budget): "standard"
+    # for an analyst's run, "deep" for the deep re-run. None is the
+    # scheduler's request: the rungs of the ladder decide. Per run, set by the
+    # caller that builds this context.
+    requested_run_class: str | None = None
+    # The read tools the investigator loop sees this run (the standard class,
+    # soc_ai.agent.budget.standard_visible_tools). Every other investigator
+    # tool registers with deferred loading: it stays callable through one
+    # ``search_tools`` call and its schema is not sent. None sends them all.
+    # The orchestrator sets it per loop run.
+    loop_visible_tools: frozenset[str] | None = None
+    # The tools the registration deferred, for the prompt's "more tools" line.
+    deferred_tool_names: list[str] = field(default_factory=list)
 
 
 class StepEvent(BaseModel):

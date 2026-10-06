@@ -105,6 +105,11 @@ export const TAB_ALL = 'Every lead, in every state.';
 
 export const CHIP_LIVE = 'Live: the analytic runs on every sweep. Its hits count and can form leads.';
 
+/** The chip on a hit whose analytic the catalog no longer lists. */
+export const CHIP_ANALYTIC_REMOVED =
+  'The catalog no longer lists this analytic. The hit stays on record. ' +
+  'No drawer can open the analytic, and no decision can change it.';
+
 export const CHIP_SHADOW =
   'Shadow: the analytic runs on every sweep, and its hits are recorded and shown. ' +
   'It raises nothing. Approve it to make it live.';
@@ -132,7 +137,7 @@ export const CHIP_NO_BENIGN_BASELINE =
 
 export const CHIP_NO_LEAD = 'This hit formed no lead and joined none.';
 
-export const CHIP_CATALOG_RUN = 'A row the analytic sweep wrote for an analytic hit. Not an agent run.';
+export const CHIP_CATALOG_RUN = 'A row the analytic sweep wrote for an analytic hit. No agent ran.';
 
 export const CHIP_DISMISS_REASON = 'The dismissal reason the analyst chose.';
 export const CHIP_CLOSED_BY_HUNT = 'soc-ai closed this lead after its hunt. No analyst chose a reason.';
@@ -224,7 +229,7 @@ export const CHIP_LEVEL = 'The level the analytic gives a hit of its own.';
 export const ENTITY_ADDRESS = 'An IP address. This page holds what the grid records about it.';
 
 export const ENTITY_NAME =
-  'A name, not an address. It may be a host or an account, and this grid does not say which.';
+  'A name. It may be a host or an account. This grid does not say which.';
 
 export const CHIP_NOT_SWEPT =
   'The analytic sweep has never reached this analytic. A count of zero would read as a clean grid.';
@@ -238,6 +243,14 @@ export const CHIP_IN_LEAD = 'This observation is part of a lead. Open the lead t
  *  an alert has no analytic, so there is nothing to open. */
 export const OBSERVATION_NO_ANALYTIC =
   'The source of this observation. No analytic in this deployment carries the id, so there is nothing to open.';
+
+/** The statistic line under an observation. */
+export const OBSERVATION_STATISTIC =
+  'The statistic that departed and the baseline value it departed from.';
+
+/** The link that opens the console with the query of one observation. */
+export const OBSERVATION_RERUN =
+  'Open a new hunt with this query in the objective. The hunt reads the departure again.';
 
 export const CHIP_DISMISSED_EVENT =
   'An analyst closed this lead here. The dismissal stays on the record.';
@@ -350,6 +363,23 @@ export const LEDGER_VERSION = 'The status changes on record for this analytic.';
 
 export const CHIP_VERSION = 'The version this analytic reached at this status change.';
 
+/** The chip on a status change soc-ai made. soc-ai moves an analytic to
+ *  shadow, and it never approves one to live or retires one. */
+export const CHIP_SYSTEM_CHANGE =
+  'soc-ai made this status change. soc-ai can move an analytic to shadow. ' +
+  'Only an analyst approves an analytic to live or retires it.';
+
+/** The chip on the version row that soc-ai writes when a shipped analytic
+ *  ships in shadow. It is no demotion, so it wears no amber. */
+export const CHIP_SHIPPED_IN_SHADOW =
+  'soc-ai wrote this row when the analytic shipped. A new shipped analytic starts in shadow. ' +
+  'An analyst approves it to live after the shadow week.';
+
+/** The chip on an analytic that a system demotion holds in shadow. */
+export const CHIP_HELD_BY_SYSTEM =
+  'soc-ai moved this analytic from live to shadow. It breached its fire budget or its ' +
+  'precision floor. Read the evidence. Then select Approve or Reject.';
+
 // ── The detection type chips ────────────────────────────────────────────────
 //
 // One chip per thing that raised the alert an investigation started from. The
@@ -447,9 +477,83 @@ export const ACTION_HUNT_NOW = 'Start the hunt now. The lead does not wait for t
 export const PROMOTE_NEEDS_HUNT =
   "Hunt this lead first. The investigation reads the hunt's findings.";
 
+/** The budget class chip on an investigation: what the run was allowed to spend. */
+export const CHIP_RUN_CLASS: Record<string, { label: string; title: string }> = {
+  cheap: {
+    label: 'cheap',
+    title:
+      'Cheap class. The model wrote the verdict from the prefetch in one request. ' +
+      'No tool loop ran. The Oracle did not review it. A decision template cleared the alert first.',
+  },
+  standard: {
+    label: 'standard',
+    title:
+      'Standard class. The model investigated with the read tools at the standard budget. ' +
+      'The Oracle reviews an uncertain verdict.',
+  },
+  deep: {
+    label: 'deep',
+    title:
+      'Deep class. An analyst asked for a deep re-run. The model investigated with every read tool ' +
+      'at the full budget. The Oracle reviews an uncertain verdict.',
+  },
+  rule_prior: {
+    label: 'rule prior',
+    title:
+      'Rule prior. No model ran on this alert. Recent runs of the rule all ended false positive, ' +
+      'so the alert took the verdict of the latest model run. Re-run it to investigate this alert.',
+  },
+};
+
+/** Why a verdict went to the Oracle. The codes the uncertainty rule and the
+ * classic rule write. */
+export const ORACLE_REASON: Record<string, string> = {
+  confidence_in_band: 'The confidence sits in the gate band, from 0.4 to below 0.7.',
+  template_split: 'The decision template and the model disagree on the verdict.',
+  deep_needs_more_info: 'A deep re-run ended with needs_more_info.',
+  needs_more_info: 'The local verdict is needs_more_info.',
+  malware_non_tp: 'A malware or attack rule has a local verdict other than true_positive.',
+  below_confidence: 'The local confidence is below 0.6.',
+};
+
+/** The Oracle rule shadow tally in the Detection tuning panel. */
+export const ORACLE_SHADOW_CAPTION =
+  'The Oracle rule mode is shadow. The classic rule decides which verdicts go to the Oracle. ' +
+  'This table counts what the uncertainty rule would send. No Oracle call comes from it.';
+
+/** The Rule prior column of the Detection tuning panel. */
+export const RULE_PRIOR_COLUMN =
+  'The rule prior gives a scheduled alert the verdict of its rule\'s latest model run. ' +
+  'The column counts the alerts it covered in the last 30 days. It counts how many real verdicts agreed.';
+
+export const RULE_PRIOR_SUSPENDED =
+  'A real run disagreed with the rule prior on this rule. The prior stays off for the rule. ' +
+  'Read the disagreeing run. Then clear the suspension.';
+
+export const RULE_PRIOR_UNCHECKED =
+  'Covered alerts that got no real run. Live mode skips the model on a covered alert unless the sample picks it.';
+
+/** Why the rule prior held back on the newest alert of a rule it did not cover. */
+export const RULE_PRIOR_REASON: Record<string, string> = {
+  no_rule: 'The alert names no rule.',
+  critical_severity: 'The alert is critical.',
+  severity_unknown: 'The alert carries no severity label.',
+  no_flow_endpoints: 'The alert has no source or no destination address.',
+  external_endpoint: 'An endpoint is outside the estate.',
+  nomination_unavailable: 'The grid could not list the nominated rules.',
+  not_nominated: 'Detection tuning did not nominate the rule.',
+  analyst_override: 'An analyst overrode a verdict of this rule.',
+  suspended: 'A real run disagreed with the prior.',
+  non_false_positive_in_window: 'A model run of the rule this week was not a false positive.',
+  too_few_runs: 'The rule has too few model false positives this week.',
+  lapsed: 'No model ran on the rule in the last 24 hours.',
+  open_lead_or_fresh_observation: 'A host carries an open lead or a fresh observation.',
+  evaluation_failed: 'The prior could not read its inputs.',
+};
+
 /** The type chip on an investigation whose subject is a hunt. */
 export const CHIP_SUBJECT_HUNT =
-  "An investigation of a hunt. The subject is the hunt's findings, not one event.";
+  'An investigation of a hunt. Its subject is every finding of the hunt.';
 
 export const SUBJECT_OBJECTIVE =
   'The objective the hunt ran with. This investigation answers it.';

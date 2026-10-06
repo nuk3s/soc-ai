@@ -637,15 +637,76 @@ def test_the_hits_list_holds_the_live_half_and_the_shadow_half(client: TestClien
     assert by_id[ids["unread"]]["tier"] == "local"
 
 
-def test_the_live_hit_leads_and_the_unread_shadow_hit_follows(client: TestClient) -> None:
-    """Live first, newest first. Then shadow, unread first, then newest first.
+def test_the_unread_shadow_hit_leads_then_live_then_read(client: TestClient) -> None:
+    """Under All: unread shadow first, then live, then read shadow.
 
-    The live hit here is the OLDEST of the three. It still leads, because the
-    real signal is never ranked below a provisional one.
+    Needs-you counts the unread shadow hits and links to this list. Production
+    had 147 live hits ahead of the one unread shadow hit, so the hit Needs-you
+    counted sat outside the first page of 50.
     """
     ids = _seed_three_hits(client)
     body = client.get("/api/v1/hunts/hits").json()
-    assert [h["id"] for h in body["hits"]] == [ids["live"], ids["unread"], ids["read"]]
+    assert [h["id"] for h in body["hits"]] == [ids["unread"], ids["live"], ids["read"]]
+
+
+def test_an_old_unread_shadow_hit_leads_a_page_of_newer_live_hits(client: TestClient) -> None:
+    """The unread shadow hit is the OLDEST row. It still opens the first page.
+
+    The read shadow hit is the negative control. It is newer than every live
+    hit, and it still sorts after them, so the rule keys on the read state.
+    """
+    _shadow_analytic(client)
+    live = [
+        _insert_observation(
+            client,
+            spec_id=_SHIPPED,
+            fingerprint=f"fp-live-{i}",
+            source="catalog",
+            shadow=False,
+            born_at=_ago(10 + i),
+        )
+        for i in range(4)
+    ]
+    unread = _insert_observation(
+        client, fingerprint="fp-old-unread", source="catalog", shadow=True, born_at=_ago(100)
+    )
+    read = _insert_observation(
+        client,
+        fingerprint="fp-new-read",
+        source="catalog",
+        shadow=True,
+        born_at=_ago(1),
+        read_at=_ago(1),
+    )
+    page = client.get("/api/v1/hunts/hits?limit=2").json()
+    assert [h["id"] for h in page["hits"]] == [unread, live[0]]
+    full = client.get("/api/v1/hunts/hits").json()
+    assert [h["id"] for h in full["hits"]] == [unread, *live, read]
+
+
+def test_the_offset_pages_through_one_order_with_no_repeat(client: TestClient) -> None:
+    ids = _seed_three_hits(client)
+    pages = [
+        [h["id"] for h in client.get(f"/api/v1/hunts/hits?limit=1&offset={n}").json()["hits"]]
+        for n in range(4)
+    ]
+    assert pages == [[ids["unread"]], [ids["live"]], [ids["read"]], []]
+    # A page past the end is empty. The counts still read the whole window, so
+    # the console can state "3 of 3" under the list it built.
+    past = client.get("/api/v1/hunts/hits?offset=3").json()
+    assert past["hits"] == []
+    assert past["counts"]["all"] == 3
+    # Each filter pages through its own order.
+    shadow = [
+        [
+            h["id"]
+            for h in client.get(f"/api/v1/hunts/hits?filter=shadow&limit=1&offset={n}").json()[
+                "hits"
+            ]
+        ]
+        for n in range(2)
+    ]
+    assert shadow == [[ids["unread"]], [ids["read"]]]
 
 
 def test_each_hit_filter_returns_its_own_rows(client: TestClient) -> None:
@@ -654,7 +715,7 @@ def test_each_hit_filter_returns_its_own_rows(client: TestClient) -> None:
     def listed(name: str) -> list[int]:
         return [h["id"] for h in client.get(f"/api/v1/hunts/hits?filter={name}").json()["hits"]]
 
-    assert listed("all") == [ids["live"], ids["unread"], ids["read"]]
+    assert listed("all") == [ids["unread"], ids["live"], ids["read"]]
     assert listed("live") == [ids["live"]]
     assert listed("shadow") == [ids["unread"], ids["read"]]
     assert listed("unread") == [ids["unread"]]
@@ -858,11 +919,157 @@ def test_a_hit_outside_the_window_is_not_listed(client: TestClient) -> None:
     assert client.get("/api/v1/hunts/hits?days=30").json()["counts"]["all"] == 2
 
 
-def test_an_observation_from_another_source_is_not_an_analytic_hit(client: TestClient) -> None:
-    """A profile departure is an observation. It is not an analytic hit."""
+def test_an_observation_no_analytic_wrote_is_not_an_analytic_hit(client: TestClient) -> None:
+    """An alert verdict and a hunt finding are written under an adapter id. No
+    analytic wrote them, so the hits list and the Needs-you count leave them
+    out, even with the shadow flag set on the row."""
     _shadow_analytic(client)
-    _insert_observation(client, fingerprint="fp-profile", source="profile", born_at=_ago(1))
-    assert client.get("/api/v1/hunts/hits").json()["hits"] == []
+    _insert_observation(
+        client,
+        spec_id="alert",
+        fingerprint="fp-alert",
+        source="alert",
+        shadow=True,
+        born_at=_ago(1),
+    )
+    _insert_observation(
+        client,
+        spec_id="hunt",
+        fingerprint="fp-hunt",
+        source="hunt",
+        shadow=True,
+        born_at=_ago(1),
+    )
+    body = client.get("/api/v1/hunts/hits").json()
+    assert body["hits"] == []
+    assert body["counts"] == {"all": 0, "unread": 0, "live": 0, "shadow": 0}
+    assert client.get("/api/v1/hunts/needs-you").json()["unread_shadow_hits"] == 0
+    assert client.get("/api/v1/hunts/shadow-hits").json() == {"hits": [], "unread": 0}
+
+
+_PROFILE = "profile-activity-outside-measured-hours"
+_PROFILE_RECEIPTS = {
+    "matched_ids": ["p1", "p2"],
+    "matched_fields": ["hour_of_day"],
+    "dry_run": None,
+    "overlap": [],
+    "baseline": {"support_days": 21, "members": 14},
+    "complete": True,
+    "missing": [],
+}
+_MODEL_RECEIPTS = {
+    "matched_ids": ["m1", "m2"],
+    "matched_fields": ["logon"],
+    "dry_run": None,
+    "overlap": [],
+    "baseline": {"edges": 9},
+    "complete": True,
+    "missing": [],
+}
+
+
+def _seed_profile_and_model_hits(client: TestClient) -> dict[str, int]:
+    """One live profile hit, one unread shadow profile hit and one unread model hit.
+
+    The range had three live profile analytics with ten observations in a week,
+    and the hits panel read "No analytic hit in the last 7 days".
+    """
+    live = _insert_observation(
+        client,
+        spec_id="profile-connection-rate-collapsed",
+        fingerprint="fp-profile-live",
+        source="profile",
+        shadow=False,
+        born_at=_ago(5),
+        summary="The connection rate fell to 0 an hour.",
+        evidence_json={"sample_ids": ["c1", "c2", "c3"], "baseline": {"median": 40}},
+    )
+    shadow = _insert_observation(
+        client,
+        spec_id=_PROFILE,
+        fingerprint="fp-profile-shadow",
+        source="profile",
+        shadow=True,
+        born_at=_ago(2),
+        summary="Activity at 03:00, an hour the baseline never saw.",
+        evidence_json={"sample_ids": ["p1", "p2"], "receipts": _PROFILE_RECEIPTS},
+    )
+    model = _insert_observation(
+        client,
+        spec_id="model-logon-chain",
+        fingerprint="fp-model",
+        source="model",
+        shadow=True,
+        born_at=_ago(1),
+        summary="A session on one host led to a first logon to a third host.",
+        evidence_json={"sample_ids": ["m1", "m2"], "receipts": _MODEL_RECEIPTS},
+    )
+    return {"live": live, "shadow": shadow, "model": model}
+
+
+def test_profile_and_model_hits_are_listed_with_their_receipts(client: TestClient) -> None:
+    ids = _seed_profile_and_model_hits(client)
+    body = client.get("/api/v1/hunts/hits").json()
+    by_id = {h["id"]: h for h in body["hits"]}
+    assert set(by_id) == set(ids.values())
+    # The two unread shadow hits lead, newest first. The live profile hit follows.
+    assert [h["id"] for h in body["hits"]] == [ids["model"], ids["shadow"], ids["live"]]
+
+    live = by_id[ids["live"]]
+    assert live["recorded_in_shadow"] is False
+    assert live["state"] == "hit"
+    assert live["read"] is None
+    assert live["document_count"] == 3
+    assert live["analytic_exists"] is True
+
+    shadow = by_id[ids["shadow"]]
+    assert shadow["recorded_in_shadow"] is True
+    assert shadow["state"] == "hit"
+    assert shadow["read"] is False
+    assert shadow["receipts"]["baseline"] == {"support_days": 21, "members": 14}
+    assert shadow["receipts"]["matched_ids"] == ["p1", "p2"]
+
+    model = by_id[ids["model"]]
+    assert model["state"] == "hit"
+    assert model["receipts"]["matched_ids"] == ["m1", "m2"]
+
+    assert body["counts"] == {"all": 3, "unread": 2, "live": 1, "shadow": 2}
+
+
+def test_needs_you_and_the_hits_list_count_the_same_unread_shadow_hits(
+    client: TestClient,
+) -> None:
+    """A shadow hit counts as unread shadow on every surface. The Needs-you
+    count, the hits list and the shadow band read one clause."""
+    _seed_profile_and_model_hits(client)
+    # A shadow row no analytic wrote. The Needs-you count held it and the hits
+    # list did not.
+    _insert_observation(
+        client,
+        spec_id="alert",
+        fingerprint="fp-alert",
+        source="alert",
+        shadow=True,
+        born_at=_ago(1),
+    )
+    hits = client.get("/api/v1/hunts/hits").json()
+    unread_list = client.get("/api/v1/hunts/hits?filter=unread").json()
+    needs = client.get("/api/v1/hunts/needs-you").json()
+    band = client.get("/api/v1/hunts/shadow-hits").json()
+    assert needs["unread_shadow_hits"] == 2
+    assert hits["counts"]["unread"] == needs["unread_shadow_hits"]
+    assert len(unread_list["hits"]) == needs["unread_shadow_hits"]
+    assert band["unread"] == needs["unread_shadow_hits"]
+    assert {h["analytic_id"] for h in band["hits"]} == {_PROFILE, "model-logon-chain"}
+
+
+def test_a_read_profile_hit_leaves_the_unread_count(client: TestClient) -> None:
+    ids = _seed_profile_and_model_hits(client)
+    assert client.post(f"/api/v1/hunts/shadow-hits/{ids['shadow']}/read").status_code == 200
+    assert client.get("/api/v1/hunts/needs-you").json()["unread_shadow_hits"] == 1
+    body = client.get("/api/v1/hunts/hits").json()
+    assert body["counts"]["unread"] == 1
+    assert {h["id"]: h["read"] for h in body["hits"]}[ids["shadow"]] is True
 
 
 def test_a_hit_says_whether_its_analytic_can_be_opened(client: TestClient) -> None:
@@ -912,13 +1119,22 @@ def test_the_hits_query_bounds_refuse_with_a_reason_and_a_hint(client: TestClien
         res = client.get(f"/api/v1/hunts/hits?limit={limit}")
         assert res.status_code == 422, limit
         assert _detail(res)["reason"] == "bad_limit"
+    for offset in (-1, 100_001):
+        res = client.get(f"/api/v1/hunts/hits?offset={offset}")
+        assert res.status_code == 422, offset
+        assert _detail(res)["reason"] == "bad_offset"
     res = client.get("/api/v1/hunts/hits?filter=bogus")
     assert res.status_code == 422
     detail = _detail(res)
     assert detail["reason"] == "bad_filter"
     # "type", not "kind": the word the analyst reads on every surface.
     assert "type" in detail["hint"]
-    for ok in ("/api/v1/hunts/hits?days=30", "/api/v1/hunts/hits?limit=200"):
+    for ok in (
+        "/api/v1/hunts/hits?days=30",
+        "/api/v1/hunts/hits?limit=200",
+        "/api/v1/hunts/hits?offset=0",
+        "/api/v1/hunts/hits?offset=100000",
+    ):
         assert client.get(ok).status_code == 200, ok
 
 

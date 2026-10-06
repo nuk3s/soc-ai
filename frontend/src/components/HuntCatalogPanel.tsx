@@ -12,13 +12,19 @@ import { useState } from 'react';
 import { Link } from 'react-router-dom';
 
 import { getHuntCatalog, type HuntCatalog, type HuntCatalogSpec } from '../lib/api';
-import { loopRuns } from '../lib/analyticRuns';
+import { loopRuns, runsInProfileSweep } from '../lib/analyticRuns';
 import { useDemo } from '../lib/demo';
 import { SEVERITY, tint } from '../lib/tokens';
 import { absTime, ago } from '../lib/timeRange';
 import type { Severity } from '../lib/types';
 import { useAsync } from '../lib/useAsync';
-import { CHIP_LEVEL, CHIP_LOCAL, CHIP_NOT_SWEPT, CHIP_SHIPPED } from '../lib/tooltips';
+import {
+  CHIP_HELD_BY_SYSTEM,
+  CHIP_LEVEL,
+  CHIP_LOCAL,
+  CHIP_NOT_SWEPT,
+  CHIP_SHIPPED,
+} from '../lib/tooltips';
 import { AnalyticDrawer, StatusDot } from './AnalyticDrawer';
 import { StatusTag } from './Badges';
 import { Panel, PanelHeader } from './Panel';
@@ -79,8 +85,25 @@ function TierStatus({ spec, running }: { spec: HuntCatalogSpec; running: boolean
       <span className="flex-none text-[11.5px] text-dim">
         <StatusDot status={spec.status ?? 'live'} running={running} />
       </span>
+      {/* A hold by soc-ai reads apart from an analyst's shadow, as it does on
+          the Analytics tab. Operate showed both with one "shadow" chip. */}
+      {heldBySystem(spec) && (
+        <span
+          data-testid={`catalog-held-${spec.id}`}
+          className="flex-none whitespace-nowrap rounded-chip border px-1.5 py-px text-[10px] text-warn"
+          style={{ borderColor: 'rgba(210,153,34,.45)' }}
+          title={`${CHIP_HELD_BY_SYSTEM} ${spec.held_by_system}`}
+        >
+          held by soc-ai
+        </span>
+      )}
     </>
   );
+}
+
+/** True when a system demotion holds this analytic in shadow now. */
+function heldBySystem(spec: HuntCatalogSpec): boolean {
+  return spec.status === 'shadow' && Boolean(spec.held_by_system);
 }
 
 function LevelPill({ level }: { level: string }) {
@@ -268,6 +291,9 @@ function sweepOverdue(data: HuntCatalog, now: number): boolean {
 const PROFILE_ROW_TITLE =
   'A stored behavioural profile of a host answers this analytic, so the analytic sweep does not run it. The hourly profile sweep runs it. This panel has no trail for that loop, so it reports nothing here. A count of zero would read as \u201cswept, found nothing\u201d.';
 
+const DETECTOR_ROW_TITLE =
+  'A learned detector answers this analytic. It reads the grid and builds its own baseline. The analytic sweep does not run it. The hourly profile sweep runs it. This panel has no trail for that loop, so it reports nothing here.';
+
 const COVERAGE_TITLE =
   'The newest run of the profile sweep, counted in analytic-entity evaluations. measured: soc-ai scored the entity against a real baseline. learning: the entity has under 7 days of history. blind: no baseline, no confident role, or no telemetry on the grid that can answer. n/a: the host\u2019s role is outside the analytic\u2019s scope. fired: evaluations that produced a departure.';
 
@@ -402,10 +428,13 @@ function ProfileSpecRow({
   spec,
   running,
   onOpen,
+  rowTitle = PROFILE_ROW_TITLE,
 }: {
   spec: HuntCatalogSpec;
   running: boolean | null;
   onOpen: (id: string) => void;
+  /** What answers the analytic, for a row the sweep has not run yet. */
+  rowTitle?: string;
 }) {
   const c = spec.coverage;
   return (
@@ -414,7 +443,7 @@ function ProfileSpecRow({
       <LevelPill level={spec.level} />
       <TierStatus spec={spec} running={running} />
       {c === null ? (
-        <span className="flex-none text-[12px] text-dim" title={PROFILE_ROW_TITLE}>
+        <span className="flex-none text-[12px] text-dim" title={rowTitle}>
           not yet run · <code className="font-mono text-[11.5px]">soc-ai priors</code>
         </span>
       ) : (
@@ -432,10 +461,11 @@ function ProfileSpecRow({
           <span className="flex-none text-[12px] text-dim" title={c.last_run_at ? absTime(c.last_run_at) : undefined}>
             last run {ago(c.last_run_at)}
           </span>
-          {spec.status === 'shadow' && (
+          {spec.status === 'shadow' && !heldBySystem(spec) && (
             // The analytic's status, the one source the Hunts tab reads too.
             // The trail's own flag said shadow on every live prior, so this
-            // screen showed "live" and "shadow" on one row.
+            // screen showed "live" and "shadow" on one row. A held analytic
+            // wears the "held by soc-ai" chip beside its status.
             <span
               className="inline-flex flex-none items-center gap-1 whitespace-nowrap rounded-chip border px-1.5 py-px text-[9.5px] font-semibold tracking-[.02em]"
               style={{ color: AMBER, borderColor: tint(AMBER, 0.35), background: tint(AMBER, 0.09) }}
@@ -526,10 +556,36 @@ export function HuntCatalogPanel() {
   const data = catalog.data;
   // An unknown evaluator is treated as swept: this panel describes the sweep,
   // and a spec a newer backend adds should appear with its trail rather than
-  // being silently reclassified into a group that reports nothing.
+  // being silently reclassified into a group that reports nothing. A `model`
+  // spec runs in the profile sweep and leaves the same trail. It reads no
+  // stored profile, so it sits in its own group: the list put the learned
+  // detectors under "Evaluated against behavioural profiles".
   const specs = data?.specs ?? [];
-  const profiled = specs.filter((s) => s.evaluator === 'profile');
-  const swept = specs.filter((s) => s.evaluator !== 'profile');
+  const detectors = specs.filter((s) => s.evaluator === 'model');
+  const profiled = specs.filter((s) => runsInProfileSweep(s.evaluator) && s.evaluator !== 'model');
+  const swept = specs.filter((s) => !runsInProfileSweep(s.evaluator));
+  // The three words on the profile sweep rows, each defined once, above the
+  // first group that holds such rows. `n/a` had no definition anywhere in the
+  // app.
+  const legend = (
+    <div
+      data-testid="profile-legend"
+      className="border-b border-border-faint px-[15px] py-1.5 text-[11px] leading-[1.6] text-faint"
+    >
+      <div>
+        <span className="font-semibold text-dim">unscored</span>: the host has under
+        7 days of history, or no telemetry the analytic can read.
+      </div>
+      <div>
+        <span className="font-semibold text-dim">n/a</span>: the host&rsquo;s role is
+        outside the analytic&rsquo;s scope.
+      </div>
+      <div>
+        <span className="font-semibold text-dim">shadow</span>: the analytic would
+        have fired. soc-ai wrote it down and raised nothing.
+      </div>
+    </div>
+  );
   return (
     <Panel id="catalog" className="md:col-span-2">
       <PanelHeader
@@ -607,25 +663,7 @@ export function HuntCatalogPanel() {
                   </div>
                   {/* The two chips on these rows are the vocabulary of the
                       layer, and a reader meets them here first. */}
-                  {/* The three words on these rows, each defined once. `n/a`
-                      had no definition anywhere in the app. */}
-                  <div
-                    data-testid="profile-legend"
-                    className="border-b border-border-faint px-[15px] py-1.5 text-[11px] leading-[1.6] text-faint"
-                  >
-                    <div>
-                      <span className="font-semibold text-dim">unscored</span>: the host has under
-                      7 days of history, or no telemetry the analytic can read.
-                    </div>
-                    <div>
-                      <span className="font-semibold text-dim">n/a</span>: the host&rsquo;s role is
-                      outside the analytic&rsquo;s scope.
-                    </div>
-                    <div>
-                      <span className="font-semibold text-dim">shadow</span>: the analytic would
-                      have fired. soc-ai wrote it down and raised nothing.
-                    </div>
-                  </div>
+                  {legend}
                   <ul className="divide-y divide-border">
                     {profiled.map((spec) => (
                       <ProfileSpecRow
@@ -633,6 +671,35 @@ export function HuntCatalogPanel() {
                         spec={spec}
                         running={loopRuns(data, 'profile')}
                         onOpen={setOpenId}
+                      />
+                    ))}
+                  </ul>
+                </>
+              )}
+              {detectors.length > 0 && (
+                <>
+                  {/* The learned detectors run in the same sweep and read no
+                      stored profile, so they carry their own label. */}
+                  <div
+                    data-testid="detector-group"
+                    className="flex items-center justify-between gap-2 border-y border-border-faint bg-surface-2/40 px-[15px] py-1.5 text-[11px] text-dim"
+                  >
+                    <span>Learned detectors · {detectors.length}</span>
+                    <span title={DETECTOR_ROW_TITLE}>
+                      {data.prior_sweeps_enabled === false
+                        ? 'The profile sweep is off. These detectors do not run.'
+                        : 'run by the hourly profile sweep · counts are detector-host evaluations'}
+                    </span>
+                  </div>
+                  {profiled.length === 0 && legend}
+                  <ul className="divide-y divide-border">
+                    {detectors.map((spec) => (
+                      <ProfileSpecRow
+                        key={spec.id}
+                        spec={spec}
+                        running={loopRuns(data, 'model')}
+                        onOpen={setOpenId}
+                        rowTitle={DETECTOR_ROW_TITLE}
                       />
                     ))}
                   </ul>

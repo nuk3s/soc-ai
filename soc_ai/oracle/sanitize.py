@@ -53,6 +53,7 @@ from soc_ai.oracle._cred_data import (
     CRED_KEYS,
     CRED_VALUE_STOPSET,
     plausible_credential_value,
+    plausible_learned_host,
     plausible_netbios_domain,
 )
 
@@ -201,22 +202,53 @@ class Mapping:
         forward: real value → opaque label (``IP_01``, …).
         reverse: opaque label → real value (for rehydration).
         counters: per-category allocation counter.
+        sources: real value → where a free-text rule learned it, for a host
+            name learned from text. The refusal reason names it; the value
+            itself is never logged.
+        in_place_only: host names a free-text rule labelled where they stand
+            but kept OUT of the learned set, because they fail
+            :func:`~soc_ai.oracle._cred_data.plausible_learned_host`: a token
+            under 3 characters, a path, junk with a run of dots, or a common
+            English word. They are not propagated to other fields, and the
+            residue net does not search for them as learned values.
+        scan_field: the field path the global scan is on, read by ``sources``.
     """
 
     forward: dict[str, str] = field(default_factory=dict)
     reverse: dict[str, str] = field(default_factory=dict)
     counters: dict[str, int] = field(default_factory=dict)
+    sources: dict[str, str] = field(default_factory=dict)
+    in_place_only: set[str] = field(default_factory=set)
+    scan_field: str = ""
 
-    def label_for(self, original: str, category: str) -> str:
-        """Return (and allocate if needed) the opaque label for *original*."""
+    def label_for(self, original: str, category: str, *, text_rule: str = "") -> str:
+        """Return (and allocate if needed) the opaque label for *original*.
+
+        ``text_rule`` names the free-text rule that found a HOST value (``UNC``,
+        ``logon domain`` ...). Such a value is marked with its source, and a
+        new one that fails the learned-host shape rule stays in place only.
+        A value any other rule labels (a structured field, a shape rule) joins
+        the learned set, even when a text rule saw it first.
+        """
+        if text_rule and category == "HOST":
+            where = self.scan_field or "free text"
+            self.sources.setdefault(original, f"the {text_rule} rule in {where}")
         if original in self.forward:
+            if not text_rule:
+                self.in_place_only.discard(original)
             return self.forward[original]
         idx = self.counters.get(category, 0) + 1
         self.counters[category] = idx
         label = f"{category}_{idx:02d}"
         self.forward[original] = label
         self.reverse[label] = original
+        if text_rule and category == "HOST" and not plausible_learned_host(original):
+            self.in_place_only.add(original)
         return label
+
+    def learned_values(self) -> tuple[str, ...]:
+        """The real values in the learned set: every value but the in-place ones."""
+        return tuple(v for v in self.reverse.values() if v not in self.in_place_only)
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +365,7 @@ def _sanitize_str(
     host_re = _build_host_re(suffixes, extra_hosts)
 
     def _host(m: re.Match[str]) -> str:
-        return mapping.label_for(m.group(0).lower(), "HOST")
+        return mapping.label_for(m.group(0).lower(), "HOST", text_rule="internal host name")
 
     text = host_re.sub(_host, text)
 
@@ -372,7 +404,12 @@ def _sanitize_str(
         host = m.group(1)
         if _LABEL_FULLMATCH_RE.fullmatch(host):
             return m.group(0)
-        return f"\\\\{mapping.label_for(host, 'HOST')}"
+        # A host has no run of dots and no dot at an end. A UNC-shaped run of
+        # packet printables (``\\aB..c..1\``) is no host: leave it, and the
+        # residue net applies the same rule.
+        if not plausible_netbios_domain(host):
+            return m.group(0)
+        return f"\\\\{mapping.label_for(host, 'HOST', text_rule='UNC')}"
 
     text = _UNC_HOST_RE.sub(_unc, text)
 
@@ -1099,6 +1136,11 @@ def _residue_unc_hosts(text: str, allow: set[str]) -> list[str]:
             continue
         seen.add(key)
         if _OPAQUE_LABEL_RE.fullmatch(host):
+            continue
+        # The shared host shape (soc_ai.oracle._cred_data): a run of dots or a
+        # dot at an end is packet junk, never a host. The redacter leaves it,
+        # so this net leaves it too.
+        if not plausible_netbios_domain(host):
             continue
         if host in allow or key in allow:
             continue

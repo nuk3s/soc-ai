@@ -27,6 +27,7 @@ from soc_ai.agent.orchestrator import (
 )
 from soc_ai.agent.prompts import FocusOrigin
 from soc_ai.api.recorder import InvestigationRecorder
+from soc_ai.run_meter import start_search_meter
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -100,6 +101,12 @@ async def recorded_run(
     inv_id = await recorder.start()
 
     yield "investigation_created", {"investigation_id": inv_id}
+
+    # Meter the grid reads from HERE, in whichever task drains the rest of the
+    # stream. The hunt manager reads the first event in the request task and
+    # hands the generator to a background task; a meter set before the yield
+    # above would sit in the request task's context, not the run's.
+    recorder.attach_search_meter(start_search_meter())
 
     # Whole-run wall-clock backstop. The per-turn timeouts inside the orchestrator
     # bound each model turn, but a slow-but-progressing multi-turn run (or a wedged

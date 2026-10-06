@@ -345,8 +345,17 @@ export interface Investigation {
   groupId: string;
   name: string;
   kind: DetectionKind;
+  /** The source address of the alert as a display string. */
   host: string;
+  /** The destination address of the alert as a display string. */
   ip: string;
+  /** The source address, null when the alert names none. Absent from an
+   *  older server. */
+  srcIp?: string | null;
+  /** The destination address, null when the alert names none. */
+  dstIp?: string | null;
+  /** The host that reported the alert. It is never one end of the flow. */
+  reportedBy?: string | null;
   verdict: Verdict;
   conf: number;
   rationale: string;
@@ -411,6 +420,11 @@ export interface Investigation {
   /** synthetic-evaluation marker (migration 0032): this run investigated PLANTED
    * synthetic attack scenarios — badged so it can never be read as real activity. */
   isSynthEval?: boolean;
+  /** The budget class the run ran in: cheap, standard, deep or rule_prior.
+   *  Null on a run stored before the classes existed, and while the run is in flight. */
+  runClass?: string | null;
+  /** Why the run ended in its class. Null when the report does not say. */
+  runClassReason?: string | null;
 }
 
 /** One citation of the report. `kind` is 'id', 'run', 'path', 'tool' or 'unknown'. */
@@ -467,6 +481,9 @@ export interface OracleAdjudication {
   redacted?: boolean;
   redactionNote?: string;
   changed?: boolean;
+  /** The Oracle answered another verdict and cited no evidence that resolves.
+   * Its answer is an opinion on the run. The local verdict stands. */
+  withheld?: boolean;
 }
 
 export type SummarySegment =
@@ -509,6 +526,9 @@ export interface InvestigationRow {
    *  backend that predates the subject column, and the row then reads as an
    *  alert, which is what every row before this release was. */
   subjectType?: 'alert' | 'hunt';
+  /** The budget class the run ran in: cheap, standard, deep or rule_prior.
+   *  Null on a run stored before the classes existed, and while it runs. */
+  runClass?: string | null;
 }
 
 /** One SQL page of GET /api/v1/investigations — the /dossiers list shape.
@@ -871,6 +891,12 @@ export interface ConnTestResult {
  *  has to know BEFORE it renders. */
 export interface AboutInfo {
   version: string;
+  /**
+   * The source commit of the running build, when the image or the deploy
+   * recorded one. Null on a build that recorded none. OPTIONAL because an
+   * older backend omits it. A version alone cannot name an unreleased build.
+   */
+  commit?: string | null;
   repo_url: string;
   license: string;
   update_check_enabled: boolean;

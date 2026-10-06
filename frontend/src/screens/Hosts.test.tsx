@@ -336,11 +336,43 @@ describe('Hosts table: one row per machine', () => {
     await ready();
     expect(within(rowOf(PROXY)).getByText('server')).toBeTruthy();
     expect(within(rowOf(PROXY)).getByText('inferred')).toBeTruthy();
-    expect(within(rowOf(UNNAMED)).getByTestId('role-low-confidence').textContent).toBe(
-      'low confidence: hypervisor',
-    );
-    expect(within(rowOf(PRINTER)).getByTestId('role-stale').textContent).toBe('stale 8d: IoT device');
+    // The guess is whole in the chip, and the state words follow it.
+    const low = within(rowOf(UNNAMED)).getByTestId('role-low-confidence');
+    expect(within(low).getByTestId('role-guess').textContent).toBe('hypervisor');
+    expect(within(low).getByTestId('role-qualifier').textContent).toBe('low confidence');
+    const stale = within(rowOf(PRINTER)).getByTestId('role-stale');
+    expect(within(stale).getByTestId('role-guess').textContent).toBe('IoT device');
+    expect(within(stale).getByTestId('role-qualifier').textContent).toBe('stale 8d');
     expect(screen.getByTestId('role-unknown').textContent).toBe('unknown');
+  });
+
+  // N7 of the 2026-10-05 verification. The Role column cut "low confidence:
+  // security appliance" to "security applianc". jsdom has no layout, so the
+  // test pins the parts and the classes that decide the cut.
+  it('keeps a long guessed role whole and lets it wrap', async () => {
+    const appliance = machine('agent:appliance', {
+      primary_ip: '192.0.2.77',
+      role: {
+        value: null,
+        label: null,
+        state: 'low_confidence',
+        guess: 'security_appliance',
+        confidence: 0.5,
+        stale_hours: null,
+      },
+    });
+    vi.mocked(listMachines).mockResolvedValue(page([PROXY, appliance]));
+    mount();
+    await ready();
+    const cell = within(rowOf(appliance)).getByTestId('role-low-confidence');
+    const chip = within(cell).getByTestId('role-guess');
+    expect(chip.textContent).toBe('security appliance');
+    expect(within(cell).getByTestId('role-qualifier').textContent).toBe('low confidence');
+    expect(chip.className).not.toContain('truncate');
+    expect(chip.className).toContain('whitespace-normal');
+    expect(cell.className).toContain('flex-wrap');
+    // The hover still says why the role is withheld.
+    expect(cell.getAttribute('title')).toContain('The evidence is too thin to assert it.');
   });
 
   it('gives each row one tab stop, a link to the machine page', async () => {
@@ -367,7 +399,7 @@ describe('Hosts table: one row per machine', () => {
   it('opens the machine page from a row click', async () => {
     mount();
     await ready();
-    fireEvent.click(within(rowOf(PRINTER)).getByText('stale 8d: IoT device'));
+    fireEvent.click(within(rowOf(PRINTER)).getByText('IoT device'));
     expect((await screen.findByTestId('here')).textContent).toBe('/hosts/ip%3A192.0.2.30');
   });
 
@@ -565,9 +597,75 @@ describe('Hosts header filters', () => {
   });
 });
 
+// ---- the age of a row -------------------------------------------------------
+
+// The list showed agent state from a sweep 61 h old while the machine page
+// read live activity (range dogfood 2026-10-05, M5 and C8). A row whose agent
+// last reported more than a day ago carries a stale marker.
+describe('Hosts stale agent marker', () => {
+  const hoursAgo = (h: number) => new Date(Date.now() - h * 3_600_000).toISOString();
+  const OLD = machine('agent:old', {
+    name: 'old01',
+    primary_ip: '192.0.2.41',
+    addresses: ['192.0.2.41'],
+    agent: { id: 'old', name: 'old01', os: 'Debian 12', last_report: hoursAgo(61) },
+  });
+  const FRESH = machine('agent:fresh', {
+    name: 'fresh01',
+    primary_ip: '192.0.2.42',
+    addresses: ['192.0.2.42'],
+    agent: { id: 'fresh', name: 'fresh01', os: 'Debian 12', last_report: hoursAgo(2) },
+  });
+
+  beforeEach(() => {
+    vi.mocked(listMachines).mockResolvedValue(page([OLD, FRESH]));
+    vi.mocked(getMachineSummary).mockResolvedValue({ ...SUMMARY, last_sweep_at: hoursAgo(61), stale_hours: 61 });
+  });
+
+  it('marks a row whose agent report is older than a day, and says the sweep is off', async () => {
+    mount();
+    const marker = await screen.findByTestId('agent-stale-agent:old');
+    expect(marker.textContent).toBe('stale');
+    await waitFor(() => expect(marker.getAttribute('title')).toContain('Automatic sweeps are off.'));
+    expect(marker.getAttribute('title')).toContain('The last sweep ran 61 h ago.');
+    expect(marker.getAttribute('title')).toContain('The agent last reported 61 h ago.');
+  });
+
+  it('marks no row whose agent reported in the last day', async () => {
+    mount();
+    await screen.findByTestId('agent-stale-agent:old');
+    expect(screen.queryByTestId('agent-stale-agent:fresh')).toBeNull();
+  });
+
+  it('says when the sweep ran and not that it is off when the schedule runs', async () => {
+    vi.mocked(getDossierSummary).mockResolvedValue({ ...CENSUS, schedule_enabled: true });
+    vi.mocked(getMachineSummary).mockResolvedValue({ ...SUMMARY, last_sweep_at: hoursAgo(3), stale_hours: 3 });
+    mount();
+    const marker = await screen.findByTestId('agent-stale-agent:old');
+    await waitFor(() => expect(marker.getAttribute('title')).toContain('The last sweep ran 3 h ago.'));
+    expect(marker.getAttribute('title')).not.toContain('Automatic sweeps are off.');
+  });
+
+  it('dates the list beside the sweeps-off line', async () => {
+    mount();
+    expect((await screen.findByTestId('hosts-as-of')).textContent).toMatch(
+      /^the list shows the state as of /,
+    );
+  });
+});
+
 // ---- search -----------------------------------------------------------------
 
 describe('Hosts search', () => {
+  // The box cut its placeholder at "OS" (range dogfood 2026-10-05, C9).
+  it('sizes the search box to show the whole placeholder', async () => {
+    mount();
+    const box = (await screen.findByLabelText('Search hosts')) as HTMLInputElement;
+    const placeholder = 'Search name, address, MAC, OS, role, agent…';
+    expect(box.placeholder).toBe(placeholder);
+    expect(box.style.width).toBe(`calc(${placeholder.length}ch + 40px)`);
+  });
+
   it('asks the server over the whole census, debounced, in one request from page 1', async () => {
     mount('/hosts?page=2');
     await waitFor(() => expect(lastQuery()).toMatchObject({ offset: 50 }));

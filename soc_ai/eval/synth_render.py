@@ -186,8 +186,14 @@ def _stamp_synth_metadata(body: dict[str, Any], scenario: Scenario, plant_id: st
     ``synth.scenario_id`` — the exact string the per-run ``SynthScope`` filter
     term-matches. Repeated plants of one scenario pass a distinct plant id per
     copy so each run sees only its OWN planted documents.
+
+    The stamp overwrites a value the template carries. Every scenario file
+    writes its own bare id into ``synth.scenario_id``, and a ``setdefault``
+    kept that bare id on every repeat: five plants of one scenario shared one
+    scope key, repeat 0 read all five, and the anchor guard refused repeats 1
+    and up (the stage 1 eval of 2026-10-04, 33 of 40 runs with no verdict).
     """
-    body.setdefault("synth.scenario_id", plant_id or scenario.id)
+    body["synth.scenario_id"] = plant_id or scenario.id
     body.setdefault("synth.scenario_version", scenario.version)
 
 

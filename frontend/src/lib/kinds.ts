@@ -22,10 +22,13 @@ export const KIND_LABEL: Record<string, string> = {
   below_baseline: 'rate collapsed',
   above_baseline: 'rate spiked',
   scope_count: 'across many hosts',
+  estate_outlier: 'estate outlier',
   alert: 'alert',
   prior_no_baseline: 'finding with no benign baseline',
   catalog_match: 'analytic match',
   hunt_finding: 'hunt finding',
+  telemetry_silence: 'telemetry plane silent',
+  logon_chain: 'logon chain',
 };
 
 /** The label for one kind. A label the API sends wins, because the server
@@ -45,6 +48,7 @@ const SOURCE_LABEL: Record<string, string> = {
   candidate: 'catalog',
   alert: 'alert',
   hunt: 'hunt',
+  model: 'model',
 };
 
 /** The one word the source chip carries. A shadow observation reads "shadow",
@@ -61,6 +65,8 @@ const SOURCE_TITLE: Record<string, string> = {
   alert:
     'A triage verdict on an alert produced this observation. A false positive is not recorded.',
   hunt: 'An analyst promoted a hunt finding on this entity.',
+  model:
+    'A learned detector produced this observation. The profile sweep ran it. The detector calls no model.',
 };
 
 /** What the source chip means. A shadow chip names the source it came from,

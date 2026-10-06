@@ -57,6 +57,11 @@ describe('getAnalyticHits', () => {
     expect(url()).toBe('/api/v1/hunts/hits?days=7&filter=unread&limit=20');
   });
 
+  it('names the offset of a later page', async () => {
+    await getAnalyticHits({ days: 7, filter: 'all', limit: 50, offset: 100 });
+    expect(url()).toBe('/api/v1/hunts/hits?days=7&filter=all&limit=50&offset=100');
+  });
+
   it('passes the hits and the counts through', async () => {
     const body = {
       hits: [

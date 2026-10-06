@@ -107,6 +107,7 @@ _ICON: dict[str, str] = {
     "oracle_escalation": "🔮",
     "oracle_adjudication": "🔮",
     "oracle_adjudication_failed": "🔮",
+    "oracle_skipped": "🔮",
     "investigation_transcript": "📝",
     "auto_ack": "☑",
     "inherited_ack": "☑",
@@ -319,7 +320,7 @@ def _tool_result_title(p: dict[str, Any]) -> str:
         return "Verdict synthesized"
     skip = _skip_reason(result)
     if skip is not None:  # neutral, not an error: "GreyNoise: skipped (…)"
-        return f"{_tool_label(name)}: skipped ({skip})"
+        return f"{_tool_label(name)}: skipped, {skip}"
     err = _error_phrase(result)
     if err is not None:
         return f"{_tool_label(name)} failed: {err}"
@@ -556,7 +557,41 @@ def _t_oracle_adjudication(p: dict[str, Any]) -> str:
     v = _humanize(p.get("oracle_verdict"))
     conf = p.get("oracle_confidence")
     suffix = f" ({conf})" if conf is not None else ""
+    if p.get("override_withheld") and v:
+        return f"Oracle opinion: {v}{suffix}. No evidence resolved. The local verdict stands"
     return f"Oracle verdict: {v}{suffix}" if v else f"Oracle adjudicated{suffix}"
+
+
+# What an Oracle failure class means, as the operator reads it
+# (soc_ai.oracle.failures).
+_ORACLE_FAILURE_PHRASE = {
+    "quota": "the Oracle route hit a usage limit",
+    "5xx": "the gateway answered with a server error",
+    "4xx": "the gateway refused the request",
+    "timeout": "the call timed out",
+    "transport": "the gateway did not answer",
+    "refused": "the egress guard refused the payload",
+    "unparseable": "the answer held no verdict",
+    "serialization": "the payload could not be serialized",
+    "blocked": "demo mode blocks the Oracle",
+    "paused": "Oracle calls are paused",
+}
+
+
+def _t_oracle_failed(p: dict[str, Any]) -> str:
+    phrase = _ORACLE_FAILURE_PHRASE.get(str(p.get("error_class") or ""))
+    status = p.get("http_status")
+    if phrase is None:
+        return "Oracle second opinion failed. The local verdict stands"
+    if isinstance(status, int) and status != 200:
+        phrase = f"{phrase}, HTTP {status}"
+    return f"Oracle second opinion failed: {phrase}. The local verdict stands"
+
+
+def _t_oracle_skipped(p: dict[str, Any]) -> str:
+    until = p.get("paused_until")
+    when = f" until {str(until).replace('T', ' ').replace('Z', '')} UTC" if until else ""
+    return f"Oracle call skipped: Oracle calls are paused{when}. The local verdict stands"
 
 
 def _t_auto_ack(p: dict[str, Any]) -> str:
@@ -645,7 +680,6 @@ _STATIC_TITLES: dict[str, str] = {
     ),
     "fast_path_escalation": "Fast path escalated to a full investigation",
     "oracle_escalation": "Asked the Oracle for a second opinion",
-    "oracle_adjudication_failed": ("Oracle second opinion failed. The local verdict stands"),
     "investigation_transcript": "Investigation notes compiled",
     "model_response": "Model reasoning",
     "llm_request": "Model prompt sent",
@@ -680,6 +714,8 @@ _DYNAMIC_TITLES: dict[str, Callable[[dict[str, Any]], str]] = {
     "self_consistency_vote": _t_vote,
     "recommended_actions_blocked": _t_actions_blocked,
     "oracle_adjudication": _t_oracle_adjudication,
+    "oracle_adjudication_failed": _t_oracle_failed,
+    "oracle_skipped": _t_oracle_skipped,
     "auto_ack": _t_auto_ack,
     "inherited_ack": _t_inherited_ack,
     "triage_report": _t_triage_report,

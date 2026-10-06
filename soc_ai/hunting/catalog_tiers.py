@@ -5,6 +5,10 @@ analytics are rows with spec text. A shipped analytic is live unless a state
 row retires it, or holds it in shadow on its way back from retirement. A local
 analytic runs only in shadow or live.
 
+A shipped analytic whose file says ``ships_as: shadow`` and that has no row
+reads as shadow. The first load with ``seed=True`` writes its shadow row, and
+from then on the row decides, as it does for every other analytic.
+
 The sweeps read ``specs`` and ``shadow_ids``. The routes read ``listed`` and
 ``status_of``. The two sets differ on purpose: an analytic the analyst must see
 is not the same as an analytic the loop must run, and a catalog that returned
@@ -44,21 +48,34 @@ class Catalog:
     def status_of(self, analytic_id: str) -> tuple[str, str]:
         """The tier and the status of one analytic.
 
-        A shipped analytic with no state row is shipped and live. That is the
-        default for the whole catalog, which is why the table holds only the
-        analytics that depart from it.
+        A shipped analytic with no state row is shipped and live, unless its
+        file ships it in shadow. That is the default for the whole catalog,
+        which is why the table holds only the analytics that depart from it.
         """
         return self.tiers.get(analytic_id, ("shipped", "live"))
 
 
-async def effective_catalog(db: AsyncSession | None) -> Catalog:
+async def effective_catalog(db: AsyncSession | None, *, seed: bool = False) -> Catalog:
     """Compose the catalog from the files on disk and the state table.
 
     ``db`` is None for a caller with no store, for example the CLI. The
-    catalog is then the shipped tier, every analytic live. A local tier with
-    no table to read it from is empty, and that is the honest answer.
+    catalog is then the shipped tier, each analytic at the status its file
+    ships it with. A local tier with no table to read it from is empty, and
+    that is the honest answer.
+
+    ``seed`` writes the shadow row of each shipped analytic that ships in
+    shadow and has none, and commits. The sweeps, the startup and the status
+    route pass it. A read route does not: it must not commit a session it
+    does not own, and it reads the same status without the row.
     """
     shipped = load_catalog(CATALOG_DIR)
+    if seed and db is not None:
+        seeded = await analytics_store.seed_shipped_shadow(db, shipped)
+        if seeded:
+            _LOGGER.info(
+                "shipped analytic(s) %s start in shadow. An analyst approves each to live.",
+                ", ".join(seeded),
+            )
     states = await analytics_store.states(db) if db is not None else {}
     specs: dict[str, HuntSpec] = {}
     listed: dict[str, HuntSpec] = {}
@@ -69,8 +86,10 @@ async def effective_catalog(db: AsyncSession | None) -> Catalog:
         state = states.get(spec_id)
         # Only a SHIPPED state row speaks for a shipped analytic. A local row
         # that took the id would otherwise retire the file on disk, or run its
-        # own logic under the shipped title.
-        status = state.status if state is not None and state.tier == "shipped" else "live"
+        # own logic under the shipped title. With no row, the file decides how
+        # the analytic starts: a detector that ships in shadow never runs live
+        # before its row exists.
+        status = state.status if state is not None and state.tier == "shipped" else spec.ships_as
         tiers[spec_id] = ("shipped", status)
         listed[spec_id] = spec
         # A reinstated shipped analytic dry-runs in shadow like a local one.

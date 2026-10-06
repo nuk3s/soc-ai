@@ -4,6 +4,7 @@
 // outbound call is possible), which is the privacy-preserving default.
 import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
+import type { AboutInfo } from '../lib/types';
 
 const STATE = vi.hoisted(() => ({
   about: {
@@ -11,7 +12,7 @@ const STATE = vi.hoisted(() => ({
     repo_url: 'https://github.com/nuk3s/soc-ai',
     license: 'Apache-2.0',
     update_check_enabled: true,
-  },
+  } as AboutInfo,
   update: {
     enabled: true,
     ok: true,
@@ -44,6 +45,37 @@ describe('AboutPanel', () => {
     expect(screen.getByText(/Apache-2\.0/)).toBeTruthy();
     const link = screen.getByRole('link', { name: /github/i }) as HTMLAnchorElement;
     expect(link.href).toContain('github.com/nuk3s/soc-ai');
+  });
+
+  it('shows the commit of the running build when the backend names one', async () => {
+    // Range dogfood C7: the range ran unreleased main as 1.5.2 and named no commit.
+    const sha = 'c0fb789d1234567890abcdef1234567890abcdef';
+    STATE.about = {
+      version: '1.5.2',
+      commit: sha,
+      repo_url: 'https://github.com/nuk3s/soc-ai',
+      license: 'Apache-2.0',
+      update_check_enabled: false,
+    };
+    render(<AboutPanel />);
+    const chip = await screen.findByText('commit c0fb789d1234');
+    expect(chip.getAttribute('title')).toBe(sha);
+  });
+
+  it('shows no commit chip when the build recorded none', async () => {
+    for (const commit of [null, undefined]) {
+      STATE.about = {
+        version: '1.5.2',
+        commit,
+        repo_url: 'https://github.com/nuk3s/soc-ai',
+        license: 'Apache-2.0',
+        update_check_enabled: false,
+      };
+      const { unmount } = render(<AboutPanel />);
+      await screen.findByText(/1\.5\.2/);
+      expect(screen.queryByText(/^commit /)).toBeNull();
+      unmount();
+    }
   });
 
   it('hides the update-check button when the check is disabled', async () => {

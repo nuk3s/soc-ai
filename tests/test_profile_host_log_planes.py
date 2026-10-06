@@ -26,6 +26,8 @@ from soc_ai.hunting.spec import load_spec
 from soc_ai.so_client.elastic import EsSearchResult
 from soc_ai.store.entity_profiles import ProfileRow
 
+from tests.es_doubles import composite_page
+
 pytestmark = pytest.mark.asyncio
 
 _ANCHOR = datetime(2026, 9, 15, 12, 0, tzinfo=UTC)
@@ -86,7 +88,13 @@ class _FakeES:
             )
         for key in aggs:
             if key in self.payloads:
-                return EsSearchResult(total=1, took_ms=1, aggregations={key: self.payloads[key]})
+                # The sweep's recent read pages a composite aggregation.
+                answer = (
+                    composite_page(aggs[key], self.payloads[key].get("buckets") or [])
+                    if "composite" in aggs[key]
+                    else self.payloads[key]
+                )
+                return EsSearchResult(total=1, took_ms=1, aggregations={key: answer})
         return EsSearchResult(total=0, took_ms=1, aggregations={})
 
 

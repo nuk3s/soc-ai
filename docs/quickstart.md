@@ -4,7 +4,7 @@ This page goes from `git clone` to a verdict on one of your own alerts in about
 30 minutes. The one-time Security Onion prerequisites take most of that time.
 Try the demo first, because it takes 5 minutes.
 
-## 0. See it working first
+## 0. Demo
 
 The demo takes 5 minutes. It needs no Security Onion grid and no model.
 
@@ -19,17 +19,18 @@ It runs the same console that you connect to your grid later. The demo also
 carries a week of hunt catalog sweeps. The catalog panel on the Operate hub and
 the Catalog preset on the Hunts screen show the declarative catalog at work.
 No data leaves the box. The hosted copy is
-[the live demo](https://soc-ai-demo.onrender.com/).
+[the live demo](https://soc-ai-demo.onrender.com/). It needs no install and no
+login.
 
-## 1. What you need
+## 1. Requirements
 
 - A **Linux host** with `git` and `curl`. `setup.sh` installs Docker itself if
-  the host needs it, and it does so on RHEL, Rocky and Alma 10 as well.
+  the host needs it. It does so on RHEL, Rocky and Alma 10 too.
 - **Network reach** to your Security Onion grid. The host needs the Security
   Onion web UI and Elasticsearch on TCP 9200. Open a pinhole for the IP address
   of this host through the Security Onion firewall. See
   [SO prerequisites](SECURITY-ONION-SETUP.md).
-- **An AI model on one of two routes.** The installer asks which route you use.
+- **A model on one of two routes.** The installer asks which route you use.
 
 | Route | What it is | Day-1 cost |
 | --- | --- | --- |
@@ -37,17 +38,17 @@ No data leaves the box. The hosted copy is
 | **Cloud API key** | OpenRouter or another OpenAI-compatible provider. The installer turns on redacted egress and prints what the provider sees. Redacted egress tokenizes internal IP addresses, hostnames, usernames, MAC addresses and internal-domain emails before anything leaves. The reversal map stays on your host. | An API key. Redacted alert data leaves your network |
 
 ```bash
-# minimal images lack git/curl:
+# minimal images lack git and curl:
 sudo dnf install -y git curl    # RHEL / Rocky / Alma / Fedora
 sudo apt install -y git curl    # Debian / Ubuntu
 ```
 
-## 2. The Security Onion step that people skip
+## 2. Audit grant
 
-The tamper-evident audit log needs an Elasticsearch write grant that the stock
-`analyst` role does not have. The audit log **fails closed**. Without the grant
-every acknowledge, escalate and comment aborts, and it aborts silently. Run one
-command against your Security Onion manager:
+The tamper-evident audit log needs an Elasticsearch write grant. The stock
+`analyst` role does not have it. The audit log **fails closed**. Without the
+grant, every acknowledge, escalate and comment aborts and appears to do
+nothing. Run one command against your Security Onion manager:
 
 ```bash
 ssh <admin>@<so-manager> 'sudo bash -s' < scripts/setup-audit-index.sh
@@ -75,36 +76,60 @@ The installer does the following:
 6. It generates the secrets and a TLS certificate.
 7. It starts the stack.
 8. It runs the **doctor**.
+9. It prints the URL and the admin password.
 
-The doctor prints a pass and fail table over every dependency. It covers
-connectivity at the DNS, TCP and TLS layers, the Elasticsearch privileges
-*including the audit grant*, the index-pattern coverage, and the measured
-fitness of the model against the triage contract. Every failing line names its
-fix.
+![soc-ai install: git clone, the guided ./setup.sh with the Security Onion connection check, the model route, the model pick, the day-1 prompts, the build and the doctor, then the banner with the URL and the admin password](img/install-walkthrough.gif)
+
+`setup.sh` builds the image from the Dockerfile in place. To skip the build, run
+`./setup.sh --prebuilt`. It pulls the image from
+[GHCR](https://github.com/nuk3s/soc-ai/pkgs/container/soc-ai), pinned to the
+release version. Set `SOC_AI_IMAGE_TAG=<x.y.z>` to pin another version. The
+versions are on [the releases page](https://github.com/nuk3s/soc-ai/releases).
+If the registry refuses the pull, `setup.sh` says so. Then it offers to build
+from source in the same run.
+
+The doctor prints a pass and fail table over every dependency. It checks the
+config, the local store and its migrations, and connectivity at the DNS, TCP and
+TLS layers. It checks Security Onion, the gateway, and the Elasticsearch
+privileges *including the audit grant*. It checks the index-pattern coverage and
+the measured fitness of the model against the triage contract. Every failing
+line names its fix.
 
 Run the doctor again at any time with
-`docker exec soc-ai python -m soc_ai doctor`.
+`docker exec soc-ai python -m soc_ai doctor`. From a source checkout, run
+`uv run soc-ai doctor`.
 
 !!! tip "Unattended installs"
     Fill in `setup.conf` once. Then run `./setup.sh --auto` on the next host.
 
-## 4. Work an alert
+## 4. First alert
 
 1. Open `https://<host>:8443/app`.
 2. Accept the self-signed certificate.
 3. Sign in as `admin` with the printed password.
 4. Pick a detection and press **Investigate**.
 
-The agent pulls the context of the alert, enriches the indicators, and lands a
-verdict that cites its evidence. Each write-back waits for your click. If you
-turned on auto-triage, the backlog drains on its own. Look again after 5
-minutes.
+The agent then works in front of you. It pulls the alert with its Zeek and PCAP
+context, enriches the indicators, and lands a verdict that cites its evidence.
+Each write-back waits for your click. If you turned on auto-triage, the backlog
+drains on its own. Look again after 5 minutes.
 
-![soc-ai web UI: an investigation showing the verdict, confidence, reasoning, recommended actions, and the agent's evidence timeline](img/screenshot-investigation.png)
+![The soc-ai console: an investigation showing the verdict, confidence, reasoning, recommended actions, and the agent's evidence timeline](img/screenshot-investigation.png)
 
-Next steps:
+The picture shows an example detection on synthetic data. The real alerts on
+your grid look the same.
 
-- [Web console guide](WEBUI_GUIDE.md): triage, auto-triage, investigations and config
-- [Running on a lesser model](LESSER_MODELS.md): how to start a backend, and how to qualify a small or slow model
+## 5. Backup
+
+`soc-ai backup` writes the live store into a portable tar.gz file. The store
+holds the investigations, the audit history, the runbooks and the config. The
+backup is safe while the app runs. `soc-ai restore` puts the data back. See
+[Backup and restore](DOCKER.md#backup-and-restore).
+
+## Next steps
+
+- [Console guide](WEBUI_GUIDE.md): triage, auto-triage, investigations and config
+- [Lesser models](LESSER_MODELS.md): how to start a backend, and how to qualify a small or slow model
 - [Agent tools](AGENT_TOOLS.md) · [Safety model](SAFETY_MODEL.md)
-- [Docker deployment](DOCKER.md): mounts, SELinux, TLS trust and port conflicts
+- [Docker deployment](DOCKER.md): the required mounts, SELinux relabeling, upstream TLS trust through `*_VERIFY_SSL`, the port 8443 conflict with the Security Onion nginx, and the manual, rsync and systemd paths
+- [Security Onion setup](SECURITY-ONION-SETUP.md): the Security Onion account, the role and the firewall

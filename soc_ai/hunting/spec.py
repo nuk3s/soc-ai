@@ -28,12 +28,14 @@ the predicate form needs no tuning at all.
 from __future__ import annotations
 
 import re
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
+from soc_ai.hunting.detectors.params import ModelTest
 from soc_ai.so_client.oql import get_whitelist
 from soc_ai.tools._provenance import LIVE, Provenance, provenance_must_not
 from soc_ai.tools._synth_scope import SynthScope, synth_scope_must_not
@@ -75,6 +77,11 @@ DEFAULT_TOP_K = 10
 # to answer it with. The precondition is an exact count over whatever window it
 # is given, so the number is also a cost.
 MAX_PRECONDITION_LOOKBACK_MINUTES = 365 * 24 * 60
+
+# The ceiling on a fire budget. A budget above this is no budget: the
+# observation store refreshes one row per entity and fingerprint, so a day of
+# more hits than this is a fleet condition, and the hold exists to catch one.
+MAX_FIRE_BUDGET_PER_DAY = 100_000
 
 Op = Literal[
     "equals", "one_of", "exists", "contains", "prefix", "wildcard", "gt", "gte", "lt", "lte"
@@ -415,7 +422,11 @@ class ProfileTest(BaseModel):
     # outside_active_hours:  activity in an hour this entity has never used.
     # below:                 a rate has fallen well under its own median.
     # above:                 …and the mirror image, for rates that spike.
-    test: Literal["novel_for", "outside_active_hours", "below", "above"] = "novel_for"
+    # rare_for_peers:        a member new to the entity that its peers in the
+    #                        same confident role do not hold either.
+    test: Literal["novel_for", "outside_active_hours", "below", "above", "rare_for_peers"] = (
+        "novel_for"
+    )
 
     # Empty means "every role". A named role restricts the prior to entities
     # the dossier has placed in it.
@@ -430,8 +441,15 @@ class ProfileTest(BaseModel):
     # behaviour the inversion exists to remove, and it would do so silently.
     min_role_confidence: float = 0.9
 
-    # For the numeric tests, how many MAD-derived sigmas count as a departure.
+    # For the numeric tests, how many dispersions count as a departure. The
+    # count must also be this many times the expected count, or this fraction
+    # of it for ``below``.
     threshold: float = 3.0
+
+    # For the numeric tests, how many hours in a row must cross the bar. One
+    # hour twice as far out departs alone. The recent median could not see a
+    # burst of one to four hours, and a run of two keeps one odd hour quiet.
+    min_hours: int = Field(default=2, ge=1, le=24)
 
     # How many times a novel member must be observed before it is a departure.
     #
@@ -446,10 +464,63 @@ class ProfileTest(BaseModel):
     # occurrence IS the finding.
     min_observations: int = 2
 
+    # How many days of sightings make a baseline member known. One sighting
+    # a month ago made a member known for good, and the range DC logon set
+    # held the three accounts the attack created. ``novel_for`` only.
+    min_known_days: int = Field(default=2, ge=1, le=30)
+
+    # The peer group: the hosts in the same role at the confidence gate. Below
+    # ``min_peers`` peers a group says nothing about the role, and
+    # ``rare_for_peers`` is blind. ``max_peer_share`` is the largest share of
+    # peers that may hold a member it calls rare.
+    min_peers: int = Field(default=5, ge=2, le=1000)
+    max_peer_share: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    # The members this prior is about, as case-insensitive glob patterns on the
+    # member's base name. Empty means every member, which is right for a port
+    # or a peer: any new one is the question. It is wrong for a prior about a
+    # named class of tool. ``process_names`` on a workstation gains a new name
+    # with every browser and antivirus update, and the remote-execution prior
+    # fired 52 times in three days on the range, every observation an Edge or
+    # Defender updater. The prior is about PsExec, WMIC and remoting, so it
+    # names them and reads nothing else.
+    #
+    # ``novel_for`` only. An hour or a rate cell is not a name, and a list the
+    # test would ignore reads like a narrowed prior that is not narrowed.
+    member_patterns: list[str] = Field(default_factory=list)
+
     @field_validator("roles")
     @classmethod
     def _roles_are_in_the_vocabulary(cls, v: list[str]) -> list[str]:
         return _check_roles(v, what="prior")
+
+    @field_validator("member_patterns")
+    @classmethod
+    def _patterns_are_names(cls, v: list[str]) -> list[str]:
+        out = [p.strip().lower() for p in v]
+        if any(not p for p in out):
+            raise ValueError("member_patterns: a pattern must not be empty")
+        return out
+
+    @model_validator(mode="after")
+    def _patterns_need_the_novelty_test(self) -> ProfileTest:
+        if self.member_patterns and self.test not in {"novel_for", "rare_for_peers"}:
+            raise ValueError(
+                f"member_patterns apply to the novel_for and rare_for_peers tests only; "
+                f"this prior is {self.test!r}, which would ignore them"
+            )
+        return self
+
+    def reads_member(self, member: str) -> bool:
+        """Whether this prior is about *member*.
+
+        The base name is matched, so a plane that writes the image path and one
+        that writes the file name agree.
+        """
+        if not self.member_patterns:
+            return True
+        name = member.replace("\\", "/").rsplit("/", 1)[-1].lower()
+        return any(fnmatchcase(name, pattern) for pattern in self.member_patterns)
 
 
 Level = Literal["informational", "low", "medium", "high", "critical"]
@@ -545,6 +616,17 @@ class SeverityFrom(BaseModel):
 
 RoleVerdict = Literal["in_scope", "out_of_scope", "unconfirmed"]
 
+Evaluator = Literal["match", "profile", "model"]
+
+# The evaluators the hourly prior sweep runs. A ``profile`` spec reads a stored
+# baseline and a ``model`` spec runs a tier 3 detector. Neither compiles to a
+# query, so the catalog sweep skips both. Every surface that asks which loop
+# runs an analytic reads this set.
+PRIOR_SWEEP_EVALUATORS: frozenset[str] = frozenset({"profile", "model"})
+
+# Which block each evaluator reads.
+_BLOCK_OF: dict[str, str] = {"match": "detection", "profile": "profile", "model": "model"}
+
 
 class HuntSpec(BaseModel):
     """One declarative hunt."""
@@ -555,13 +637,15 @@ class HuntSpec(BaseModel):
     title: str
     description: str = ""
     level: Level = "medium"
-    evaluator: Literal["match", "profile"] = "match"
+    evaluator: Evaluator = "match"
 
     # Exactly one of these is set, enforced below and keyed off ``evaluator``.
-    # A spec carrying both is ambiguous about which one decides, and the query
+    # A spec carrying two is ambiguous about which one decides, and the query
     # builder and the evaluator resolved that ambiguity differently.
     detection: Detection | None = None
     profile: ProfileTest | None = None
+    # The tier 3 detector a ``model`` spec runs, and its parameters.
+    model: ModelTest | None = None
 
     # The precondition answers "is this spec blind, or is the grid clean?".
     # Zero candidates from a spec whose precondition also returns zero is a
@@ -628,6 +712,24 @@ class HuntSpec(BaseModel):
     provenance: Provenance = LIVE
     top_k: int = DEFAULT_TOP_K
 
+    # The status a SHIPPED analytic takes on a deployment that holds no status
+    # row for it. ``live`` is the behaviour every file had before the field
+    # existed. ``shadow`` makes the catalog write a shadow row on first load,
+    # with a version row that says so, so a new detector does not run live on
+    # first deploy. Once a row exists, the row decides: a later release that
+    # flips the field to ``live`` does not move an analytic that an analyst
+    # retired or that still waits in shadow. A local analytic always has a row
+    # and starts as a candidate, so the store refuses the field on one.
+    ships_as: Literal["live", "shadow"] = "live"
+
+    # The self-healing hold (soc_ai.hunting.self_heal). A live analytic that
+    # writes more hits than ``fire_budget_per_day`` in 24 hours, or whose
+    # hunted leads fall below ``precision_floor`` over 30 days, moves back to
+    # shadow with a version row that holds the numbers. None is no budget and
+    # no floor: an analytic that declares neither is never moved.
+    fire_budget_per_day: int | None = None
+    precision_floor: float | None = None
+
     attack: list[str] = Field(default_factory=list)
     false_positives: list[str] = Field(default_factory=list)
     references: list[str] = Field(default_factory=list)
@@ -656,6 +758,22 @@ class HuntSpec(BaseModel):
             raise ValueError(f"top_k must be between 1 and {MAX_CANDIDATES}")
         return v
 
+    @field_validator("fire_budget_per_day")
+    @classmethod
+    def _budget_is_positive(cls, v: int | None) -> int | None:
+        # Zero would demote the analytic on its first hit. An analytic that
+        # must never fire is a retirement, and a retirement needs a reason.
+        if v is not None and not 1 <= v <= MAX_FIRE_BUDGET_PER_DAY:
+            raise ValueError(f"fire_budget_per_day must be between 1 and {MAX_FIRE_BUDGET_PER_DAY}")
+        return v
+
+    @field_validator("precision_floor")
+    @classmethod
+    def _floor_is_a_share(cls, v: float | None) -> float | None:
+        if v is not None and not 0.0 < v <= 1.0:
+            raise ValueError("precision_floor must be above 0 and at most 1")
+        return v
+
     @field_validator("precondition_lookback_minutes")
     @classmethod
     def _lookback_is_bounded(cls, v: int) -> int:
@@ -668,31 +786,35 @@ class HuntSpec(BaseModel):
 
     @model_validator(mode="after")
     def _the_evaluator_decides_which_block_is_required(self) -> HuntSpec:
-        """Exactly one of ``detection`` / ``profile``, chosen by ``evaluator``.
+        """Exactly one of ``detection`` / ``profile`` / ``model``, chosen by ``evaluator``.
 
         The first cut required a detection block on every spec, so each prior
         carried a dummy clause that then had to be excluded from every query
-        path. Allowing both is worse: the query builder read one and the
+        path. Allowing two is worse: the query builder read one and the
         evaluator read the other, and nothing reconciled them.
         """
-        if self.evaluator == "match":
-            if self.detection is None:
-                raise ValueError("a 'match' spec needs a detection block")
-            if self.profile is not None:
+        wanted = _BLOCK_OF[self.evaluator]
+        if getattr(self, wanted) is None:
+            raise ValueError(f"a {self.evaluator!r} spec needs a {wanted} block")
+        for other in _BLOCK_OF.values():
+            if other == wanted or getattr(self, other) is None:
+                continue
+            if self.evaluator == "match":
                 raise ValueError(
-                    "a 'match' spec carries a profile block that would be parsed, "
+                    f"a 'match' spec carries a {other} block that would be parsed, "
                     "validated and then ignored by the query path"
                 )
-        else:
-            if self.profile is None:
-                raise ValueError(f"a {self.evaluator!r} spec needs a profile block")
-            if self.detection is not None:
-                raise ValueError(
-                    f"a {self.evaluator!r} spec carries a detection block; which of the "
-                    "two decides is then ambiguous, and the query path and the "
-                    "evaluator answer it differently"
-                )
+            raise ValueError(
+                f"a {self.evaluator!r} spec carries a {other} block; which of the "
+                "two decides is then ambiguous, and the query path and the "
+                "evaluator answer it differently"
+            )
         return self
+
+    @property
+    def runs_in_prior_sweep(self) -> bool:
+        """Whether the hourly prior sweep runs this spec. The catalog sweep runs the rest."""
+        return self.evaluator in PRIOR_SWEEP_EVALUATORS
 
     @field_validator("roles")
     @classmethod
@@ -864,13 +986,14 @@ class HuntSpec(BaseModel):
             )
         if self.detection is None:
             # A ``profile`` spec compiles to no query at all: it is answered
-            # from the entity's stored baseline, not from a search. Raising
-            # here rather than returning an empty query, because an empty query
-            # matches everything and a caller that reached this line has
-            # confused the two evaluators.
+            # from the entity's stored baseline, not from a search. A ``model``
+            # spec runs a detector. Raising here rather than returning an empty
+            # query, because an empty query matches everything and a caller
+            # that reached this line has confused the evaluators.
+            answered = "a tier 3 detector" if self.evaluator == "model" else "the entity profile"
             raise ValueError(
                 f"spec {self.id!r} uses the {self.evaluator!r} evaluator and has no "
-                "detection to compile; it is answered from the entity profile, not "
+                f"detection to compile; it is answered from {answered}, not "
                 "from a query"
             )
 
@@ -1017,11 +1140,14 @@ __all__ = [
     "MAX_CANDIDATES",
     "MAX_CLAUSES",
     "MAX_DETAIL_FIELDS",
+    "MAX_FIRE_BUDGET_PER_DAY",
     "MAX_PRECONDITION_LOOKBACK_MINUTES",
+    "PRIOR_SWEEP_EVALUATORS",
     "Absent",
     "Clause",
     "DetailField",
     "Detection",
+    "Evaluator",
     "HuntSpec",
     "ProfileTest",
     "RoleVerdict",

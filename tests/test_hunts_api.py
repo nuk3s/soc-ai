@@ -651,6 +651,105 @@ def test_list_and_get_hunt(client: TestClient) -> None:
     assert all(s["id"] != "h3" for s in body["timeline"])
 
 
+def _seed_hunt_with_tool(client: TestClient, tool_name: str, result: dict[str, Any]) -> str:
+    """Insert a complete hunt whose one step is ``tool_name`` returning ``result``."""
+
+    async def _go() -> str:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            hunt = await hunt_svc.create(db, objective="run an analytic", started_by="admin")
+            await hunt_svc.append_events(
+                db,
+                hunt.id,
+                [
+                    {
+                        "sequence": 1,
+                        "kind": "tool_call",
+                        "payload": {
+                            "tool_name": tool_name,
+                            "args": {"analytic_id": "model-logon-chain", "window_days": 30},
+                            "tool_call_id": "c1",
+                        },
+                    },
+                    {
+                        "sequence": 2,
+                        "kind": "tool_result",
+                        "payload": {"tool_name": tool_name, "result": result, "tool_call_id": "c1"},
+                    },
+                ],
+            )
+            await hunt_svc.finalize(db, hunt.id, status="complete", narrative="seeded")
+            return hunt.id
+
+    return asyncio.run(_go())
+
+
+def _tool_row(client: TestClient, hunt_id: str) -> dict[str, Any]:
+    body = client.get(f"/api/v1/hunts/{hunt_id}").json()
+    rows = [s for s in body["timeline"] if s["group"] == "Tool calls"]
+    assert len(rows) == 1
+    return rows[0]
+
+
+def test_a_failed_analytic_run_shows_its_reason_on_the_step(client: TestClient) -> None:
+    """The analytic tool answers could_not_run with the analytic's own status
+    beside the error. The expanded step read "result: live", so the operator
+    never saw why the call failed. The reason now leads the detail."""
+    reason = (
+        "spec 'model-logon-chain' uses the 'model' evaluator; it is run by "
+        "`soc-ai priors`, not by a catalog sweep"
+    )
+    hunt_id = _seed_hunt_with_tool(
+        client,
+        "t_run_analytic",
+        {
+            "analytic": "model-logon-chain",
+            "status": "live",
+            "error": "could_not_run",
+            "detail": reason,
+            "provenance": "live",
+        },
+    )
+    row = _tool_row(client, hunt_id)
+    lines = row["detail"].splitlines()
+    assert lines[0] == "failed: could_not_run"
+    assert lines[1] == f"reason: {reason}"
+    assert "result: live" not in row["detail"]
+    assert "could_not_run" in row["title"]
+
+
+def test_an_unknown_analytic_shows_the_hint_as_its_reason(client: TestClient) -> None:
+    hunt_id = _seed_hunt_with_tool(
+        client,
+        "t_run_analytic",
+        {
+            "error": "unknown_analytic",
+            "hint": "This analytic is not live or in shadow. Choose one from the list.",
+            "available": ["a: A"],
+        },
+    )
+    detail = _tool_row(client, hunt_id)["detail"]
+    assert detail.splitlines()[:2] == [
+        "failed: unknown_analytic",
+        "reason: This analytic is not live or in shadow. Choose one from the list.",
+    ]
+    # The hint is the reason, so it is not said a second time below the query.
+    assert detail.count("Choose one from the list") == 1
+
+
+def test_a_successful_analytic_run_keeps_its_result_line(client: TestClient) -> None:
+    """Negative control: a call with no error keeps the result headline."""
+    hunt_id = _seed_hunt_with_tool(
+        client,
+        "t_run_analytic",
+        {"analytic": "a", "status": "live", "matched_docs": 0, "candidates": []},
+    )
+    detail = _tool_row(client, hunt_id)["detail"]
+    assert detail.splitlines()[0] == "result: live"
+    assert "failed" not in detail
+    assert "reason:" not in detail
+
+
 def _seed_hunt_with_report(client: TestClient, report: dict[str, Any], **create: Any) -> str:
     """Insert a complete hunt carrying exactly ``report``, as stored."""
 
@@ -666,6 +765,53 @@ def _seed_hunt_with_report(client: TestClient, report: dict[str, Any], **create:
             return hunt.id
 
     return asyncio.run(_go())
+
+
+def test_the_bell_names_the_threat_findings_it_counts(client: TestClient) -> None:
+    """The bell read "Hunt finished, 3 findings" for a hunt whose page read "4
+    findings": 3 threat findings and 1 observation. The notice now says what it
+    counts."""
+    hunt_id = _seed_hunt_with_report(
+        client,
+        {
+            "findings": [
+                {"title": "beacon one", "category": "threat"},
+                {"title": "beacon two", "category": "threat"},
+                {"title": "beacon three", "category": "threat"},
+                {"title": "a new admin tool on one host", "category": "observation"},
+            ]
+        },
+        objective="sweep for beacons",
+        started_by="admin",
+    )
+    notices = {n["id"]: n for n in client.get("/api/v1/notifications").json()}
+    title = notices[f"hunt-done:{hunt_id}"]["title"]
+    assert title == "Hunt finished, 3 threat findings: sweep for beacons"
+    page = client.get(f"/api/v1/hunts/{hunt_id}").json()
+    # The page counts every finding. The notice names the threat ones.
+    assert len(page["findings"]) == 4
+    assert sum(1 for f in page["findings"] if f["category"] == "threat") == 3
+
+
+def test_a_notice_from_before_the_threat_count_says_findings(client: TestClient) -> None:
+    """Negative control: a row with no threat count names all its findings."""
+    hunt_id = _seed_hunt_with_report(
+        client,
+        {"findings": [{"title": "a", "category": "threat"}, {"title": "b", "category": "threat"}]},
+        objective="old sweep",
+        started_by="admin",
+    )
+
+    async def _clear() -> None:
+        async with client.app.state.db_sessionmaker() as db:
+            row = await db.get(Hunt, hunt_id)
+            assert row is not None
+            row.threat_findings_count = None
+            await db.commit()
+
+    asyncio.run(_clear())
+    notices = {n["id"]: n for n in client.get("/api/v1/notifications").json()}
+    assert notices[f"hunt-done:{hunt_id}"]["title"] == "Hunt finished, 2 findings: old sweep"
 
 
 def test_a_report_with_no_confidence_reads_null_on_the_detail_as_on_the_list(
@@ -3915,6 +4061,135 @@ def _seed_lead(client: TestClient) -> int:
     return asyncio.run(go())
 
 
+def test_the_lead_page_shows_and_decays_from_the_event_time(client: TestClient) -> None:
+    """An observation written now for an event twenty hours old. The page reads
+    the event time beside the record time, and its live weight is the weight of
+    a twenty-hour-old event. It read as new on the sweep that found it."""
+    import asyncio
+    from datetime import UTC, datetime
+
+    from soc_ai.hunting.leads import content_fingerprint, form_leads, record_observation
+    from soc_ai.hunting.weight import DEFAULT_HALF_LIFE_HOURS, Kind, birth_weight
+
+    now = datetime.now(UTC)
+    event = now - timedelta(hours=20)
+
+    async def go() -> int:
+        async with client.app.state.db_sessionmaker() as db:
+            await record_observation(
+                db,
+                entity_kind="host",
+                entity_key="192.0.2.44",
+                kind=Kind.NOVEL_SERVED_PORT,
+                spec_id="s",
+                fingerprint=content_fingerprint("served_ports", "4444"),
+                summary="port 4444 is new on this host",
+                now=now,
+                observed_at=event,
+            )
+            await record_observation(
+                db,
+                entity_kind="host",
+                entity_key="192.0.2.44",
+                kind=Kind.NOVEL_DESTINATION,
+                spec_id="p",
+                fingerprint=content_fingerprint("peers_out", "203.0.113.9"),
+                summary="new outbound peer 203.0.113.9",
+                now=now,
+            )
+            outcome = await form_leads(db, entity_keys=[("host", "192.0.2.44")], now=now)
+            return outcome.formed[0]
+
+    lead_id = asyncio.run(go())
+    body = client.get(f"/api/v1/hunts/leads/{lead_id}").json()
+    by_kind = {o["kind"]: o for o in body["observations"]}
+    port = by_kind["novel_served_port"]
+    assert port["observed_at"] is not None
+    assert datetime.fromisoformat(port["observed_at"]) == event
+    assert datetime.fromisoformat(port["born_at"]) == now
+    expected = birth_weight(Kind.NOVEL_SERVED_PORT) * 0.5 ** (20 / DEFAULT_HALF_LIFE_HOURS)
+    assert port["weight_now"] == pytest.approx(expected, abs=0.01)
+    # The observation with no event time keeps the record time as its clock.
+    assert by_kind["novel_destination"]["observed_at"] is None
+    assert by_kind["novel_destination"]["weight_now"] == pytest.approx(0.5, abs=0.01)
+    # The page lists the newest EVENT first.
+    assert [o["kind"] for o in body["observations"]] == ["novel_destination", "novel_served_port"]
+
+    strip = client.get("/api/v1/leads?status=all").json()
+    assert isinstance(strip, list), strip
+    listed = next(lead for lead in strip if lead["id"] == lead_id)
+    assert {o["kind"]: o["observed_at"] is not None for o in listed["observations"]} == {
+        "novel_served_port": True,
+        "novel_destination": False,
+    }
+
+
+def test_the_lead_page_and_the_host_page_carry_the_statistic_and_the_query(
+    client: TestClient,
+) -> None:
+    """The observation carries its evidence in columns. The lead page reads the
+    statistic, the documents and the query. The host page reads the statistic."""
+    import asyncio
+    from datetime import UTC, datetime
+
+    from soc_ai.hunting.leads import content_fingerprint, form_leads, record_observation
+    from soc_ai.hunting.weight import Kind
+
+    now = datetime.now(UTC)
+    query = 'destination.ip:"192.0.2.45" AND destination.port:4444 | groupby source.ip'
+
+    async def go() -> int:
+        async with client.app.state.db_sessionmaker() as db:
+            await record_observation(
+                db,
+                entity_kind="host",
+                entity_key="192.0.2.45",
+                kind=Kind.NOVEL_SERVED_PORT,
+                spec_id="s",
+                fingerprint=content_fingerprint("served_ports", "4444"),
+                summary="port 4444 is new on this host",
+                evidence={"sample_ids": ["doc-1", "doc-2"]},
+                now=now,
+                statistic="documents",
+                statistic_value=6.0,
+                baseline_value=2.0,
+                rerun_query=query,
+            )
+            await record_observation(
+                db,
+                entity_kind="host",
+                entity_key="192.0.2.45",
+                kind=Kind.NOVEL_DESTINATION,
+                spec_id="p",
+                fingerprint=content_fingerprint("peers_out", "203.0.113.9"),
+                summary="new outbound peer 203.0.113.9",
+                now=now,
+            )
+            outcome = await form_leads(db, entity_keys=[("host", "192.0.2.45")], now=now)
+            return outcome.formed[0]
+
+    lead_id = asyncio.run(go())
+    body = client.get(f"/api/v1/hunts/leads/{lead_id}").json()
+    by_kind = {o["kind"]: o for o in body["observations"]}
+    port = by_kind["novel_served_port"]
+    assert port["statistic"] == "documents"
+    assert port["statistic_value"] == 6.0
+    assert port["baseline_value"] == 2.0
+    assert port["document_ids"] == ["doc-1", "doc-2"]
+    assert port["rerun_query"] == query
+    # Negative control: a row with no statistic carries none.
+    peer = by_kind["novel_destination"]
+    assert peer["statistic"] is None and peer["rerun_query"] is None
+    assert peer["document_ids"] == []
+
+    host = client.get("/api/v1/hunts/observations?entity=192.0.2.45").json()
+    rows = {o["kind"]: o for o in host["observations"]}
+    assert rows["novel_served_port"]["statistic"] == "documents"
+    assert rows["novel_served_port"]["statistic_value"] == 6.0
+    assert rows["novel_served_port"]["baseline_value"] == 2.0
+    assert rows["novel_destination"]["statistic"] is None
+
+
 def test_lead_detail_carries_the_timeline_and_the_live_weight(client: TestClient) -> None:
     lead_id = _seed_lead(client)
     res = client.get(f"/api/v1/hunts/leads/{lead_id}")
@@ -5989,7 +6264,7 @@ def test_the_lead_quality_block_counts_two_weeks_and_two_type_pairs(
         "A lead forms at 0.85 over two or more types, on a finding with no benign "
         "baseline, or on one type repeated to 1.5."
     )
-    assert body["note"] == "A threshold moves on a week of data, never on a day."
+    assert body["note"] == "A threshold moves only on a week of data."
 
 
 def test_the_lead_quality_block_reads_a_quiet_week_as_a_measurement(
@@ -6009,7 +6284,13 @@ def test_the_lead_quality_block_splits_hunt_closures_from_dismissals(
 ) -> None:
     """A closure in the rule's hand is not an analyst's lesson. The two are counted apart."""
     now = datetime.now(UTC).replace(tzinfo=None)
-    this_week = now - timedelta(hours=1)
+    # Stay inside the current ISO week. An hour before now falls into the
+    # previous week during the first hour of a Monday, and the block for one
+    # week then reads a week with nothing in it.
+    week_start = (now - timedelta(days=now.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    this_week = max(now - timedelta(hours=1), week_start + timedelta(minutes=1))
     year, week, _day = this_week.isocalendar()
     _seed_quality_lead(
         client,

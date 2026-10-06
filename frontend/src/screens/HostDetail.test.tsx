@@ -1396,7 +1396,7 @@ describe('HostDetail — the traffic pattern renders as a chart', () => {
     // Measured: one bar per hour of day.
     expect(profile.querySelectorAll('svg rect').length).toBe(24);
     expect(profile.textContent).toContain('typical request 1.4 KB');
-    expect(profile.textContent).toContain('typical response 5 KB (up to 891 KB)');
+    expect(profile.textContent).toContain('typical response 5 KB, up to 891 KB');
     // The summary the builder already wrote stays the headline.
     expect(within(profile).getByText(/busiest hours 02:00, 03:00, 14:00 UTC/)).toBeTruthy();
   });

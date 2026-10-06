@@ -43,13 +43,13 @@ reference. For local-only work you can point `SO_HOST`, `ES_HOSTS` and
 `LITELLM_BASE_URL` at a lab grid and gateway. Once the file is filled in,
 `uv run soc-ai doctor` checks the whole dependency surface.
 
-## The checks that CI enforces
+## CI checks
 
 `.github/workflows/ci.yml` gates every push and every pull request. Run the same
 commands locally before you open one:
 
 ```bash
-# Backend — must all pass
+# Backend: every check must pass
 uv run ruff check soc_ai/ tests/ scripts/
 uv run ruff format --check soc_ai/ tests/ scripts/
 uv run mypy soc_ai/                  # strict mode (configured in pyproject.toml)
@@ -65,10 +65,10 @@ Frontend unit tests use vitest and Testing Library. They live in
 
 `pre-commit` hooks are available: `uv run pre-commit install`.
 
-### Browser smoke (E2E)
+### Browser smoke test
 
-The Playwright smoke drives the seeded demo stack against the app serving
-`frontend/dist`. It walks login, alerts, investigation, hunt and config. The
+The Playwright smoke test drives the seeded demo stack against the app that
+serves `frontend/dist`. It walks login, alerts, investigation, hunt and config. The
 default pytest run excludes it, because the coverage-gated `addopts` carries
 `--ignore=tests/browser`. It runs in its own CI job. To run it locally:
 
@@ -112,8 +112,16 @@ release notes, UI strings, API hints and commit messages.
 
 `tests/test_prose_style.py` fails when a prose file, a console string or a backend string gains an
 em dash or an en dash. `tests/prose_style_baseline.json` records the older counts. Lower a count
-when you remove a dash. The `commit-msg` hook rejects a dash in a commit message; install it with
+when you remove a dash. The `commit-msg` hook rejects a dash in a commit message. Install it with
 `uv run pre-commit install --hook-type commit-msg`.
+
+## Docs site
+
+The docs site is built from `mkdocs.yml` and the Markdown files under `docs/`. Serve it on your
+host with `uv run --group docs mkdocs serve`, then open <http://127.0.0.1:8000/>. Run
+`uv run --group docs mkdocs build --strict` before you push a docs change. A new top-level page
+also goes into the `nav` in `mkdocs.yml` and into `PUBLIC_DOCS` in
+`scripts/build-public-mirror.sh`.
 
 ## Architecture pointers
 

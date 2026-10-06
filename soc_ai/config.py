@@ -50,6 +50,12 @@ DEFAULT_ALERTS_QUERY: str = " OR ".join(DEFAULT_ALERT_LABELS)
 # the Config console option list, and the login client that picks a flow.
 SO_LOGIN_FLOWS: tuple[str, ...] = ("auto", "browser", "api")
 
+# ``soc-ai serve`` writes the address it hands to uvicorn into this variable, so
+# the app can name its own bind at start. It is not a setting. Under a bare
+# uvicorn command (the systemd unit, the container) the bind is a uvicorn
+# argument, the variable is unset, and the app does not claim to know the bind.
+SERVE_BIND_ENV = "SOC_AI_SERVE_BIND"
+
 
 class Settings(BaseSettings):
     """Top-level configuration for soc-ai."""
@@ -555,6 +561,39 @@ class Settings(BaseSettings):
     on the range that produced 656 evaluations, zero findings, and no visible
     bug anywhere. The window ends where the recent window begins."""
 
+    profile_build_workers: int = 2
+    """Profile batches the build reads at once.
+
+    The build splits the estate into batches of up to 500 hosts. Each batch
+    makes one search per dimension, one after the other. This many batches run
+    at the same time. Two keeps the grid's search queue short on a large
+    estate and still halves the wall time against one."""
+
+    profile_estate_rare_hosts: int = 3
+    """Below this many hosts holding a member, a new member is estate-rare.
+
+    A new member that fewer hosts in the estate hold says more than one that
+    other hosts hold, so its observation is born heavier. The same number is
+    the floor of an estate-common member: one host is not a trait of the
+    estate, however small the estate is."""
+
+    profile_estate_common_share: float = 0.2
+    """Above this share of the profiled hosts, a new member is estate-common.
+
+    An estate-common member is a trait of the estate. It forms no
+    observation, and the prior note counts it. A member must also clear the
+    rare bar of hosts to be common."""
+
+    estate_model_enabled: bool = False
+    """Whether the estate model fits once a day, in shadow.
+
+    The model groups the hosts that act alike and scores each host against
+    the estate (soc_ai.hunting.estate_model). Its observations are always
+    shadow. When it is on, a host with no confident role reads its learned
+    group as its peer group. OFF by default: it needs the ``ml`` extra, and a
+    learned group changes which members the profile tests call a trait of the
+    peers."""
+
     dossier_max_hosts_per_run: int = 200
     """Hosts built per sweep. Each host costs up to seven ES round trips, built
     sequentially — 200 is roughly 3.5 minutes of wall clock. Overflow is not
@@ -631,6 +670,10 @@ class Settings(BaseSettings):
     soc_ai_port: int = 8443
     soc_ai_tls_cert: Path | None = None
     soc_ai_tls_key: Path | None = None
+    # The source commit of this build. The image stamps it at build time, and
+    # both deploy scripts write it into .env. Blank means unknown, never a guess.
+    # GET /api/v1/about and the console About section show it.
+    soc_ai_commit: str | None = None
     log_level: str = "INFO"
 
     @field_validator("log_level", mode="before")
@@ -655,6 +698,19 @@ class Settings(BaseSettings):
 
     # --- Web UI / local store -------------------------------------------
     soc_ai_data_dir: Path = Path("data")
+
+    soc_ai_database_url: SecretStr | None = None
+    """The store URL. Empty keeps the store in the SQLite file ``soc-ai.db`` in
+    ``SOC_AI_DATA_DIR``. A ``postgresql+asyncpg://user:password@host:5432/soc_ai``
+    URL keeps the store in PostgreSQL. ``postgresql://`` means the same driver.
+    The URL holds a password, so the value is a secret. Env-only. A change takes
+    effect at the next start. The engine checks the URL at start and names the
+    driver in the error, never the URL. See docs/DEPLOYMENT.md, "PostgreSQL"."""
+
+    soc_ai_database_pool_size: int = Field(default=10, ge=1, le=200)
+    """The PostgreSQL connections soc-ai keeps open. Under load the pool opens
+    the same number again, and closes the extra connections when they go idle.
+    SQLite ignores the value. Env-only."""
 
     soc_ai_demo: bool = False
     """Read-only public demo mode. Seeds the sanitized fixture set at startup,
@@ -752,6 +808,32 @@ class Settings(BaseSettings):
     of opening a fresh investigation, so triaging every incoming alert stays tenable.
     Turn OFF to investigate every cluster independently. Editable live."""
 
+    rule_prior_mode: Literal["off", "shadow", "live"] = "shadow"
+    """The rule prior rung of the tier 1 ladder (soc_ai.agent.rule_prior).
+
+    The rule prior covers a scheduled alert with the verdict of its rule's
+    latest model-backed run when every safeguard holds: both endpoints inside
+    the estate, at least ``rule_prior_min_runs`` model-backed false positives
+    of the rule in the last 7 days and one in the last 24 hours, no open lead
+    and no fresh observation on either host, not critical, a rule the
+    detection tuning panel nominates, and no analyst override in the rule's
+    history. It never acknowledges in Security Onion.
+
+    ``off`` evaluates nothing. ``shadow`` (the default) runs the model as
+    before and records what the prior would have decided beside the real
+    verdict. ``live`` skips the model on a covered alert, except a random
+    ``rule_prior_sample_rate`` share. A sampled run that disagrees suspends
+    the prior for its rule until an analyst clears it. Editable live."""
+
+    rule_prior_min_runs: int = Field(default=5, ge=5)
+    """How many model-backed false-positive runs of a rule in the last 7 days
+    the rule prior needs. Five or more."""
+
+    rule_prior_sample_rate: float = Field(default=0.02, ge=0.0, le=1.0)
+    """The share of prior-covered alerts that still get a real run in live
+    mode, chosen at random. A sampled run that disagrees with the prior
+    suspends the prior for that rule."""
+
     auto_triage_schedule_enabled: bool = False
     """Continuously auto-triage the backlog. When on, a background scheduler
     periodically sweeps every untriaged detection at/above ``auto_triage_min_
@@ -835,6 +917,21 @@ class Settings(BaseSettings):
 
     OFF stops the sweep. The profile lane in the host dossier still builds the
     baselines, and ``soc-ai priors`` still reads them by hand."""
+
+    analytic_self_heal_enabled: bool = True
+    """Move a live analytic back to shadow when it breaches its own budget.
+
+    ON by default. The check runs after each analytic sweep and each profile
+    sweep. It reads the store only: the live hits of the last 24 hours against
+    the spec's ``fire_budget_per_day``, and the precision of the hunted leads
+    of the last 30 days against the spec's ``precision_floor``. A breach writes
+    a system version row with the numbers and raises a bell entry.
+
+    An analytic that declares neither field is never moved, so the default
+    changes nothing until a spec declares a budget. soc-ai never approves an
+    analytic to live and never retires one. OFF stops the check. A hold that
+    is already written stays until an analyst approves or retires the
+    analytic."""
 
     hunting_prior_sweep_interval_minutes: int = 60
     """Minutes between profile sweeps. Floor of 15.
@@ -1414,6 +1511,12 @@ class Settings(BaseSettings):
     """Notify when the certificate soc-ai serves with enters the 30, 14 or 7 day
     band before expiry, or expires. Inert unless ``notify_enabled`` is on. The
     bell in the app carries it either way."""
+    notify_on_oracle_failure: bool = True
+    """Put one row in the bell when the Oracle route pauses: it answered with a
+    usage limit, or with three server errors in a row
+    (:mod:`soc_ai.oracle.breaker`). The webhook gets the same message once when
+    ``notify_enabled`` is on. The doctor and the preflight report the pause
+    whatever this setting is."""
 
     # --- crawl4ai (deep page read) ------------------------------------
     crawl4ai_enabled: bool = False
@@ -1574,25 +1677,49 @@ class Settings(BaseSettings):
     oracle_timeout_s: float = 120.0
     """Per-call HTTP timeout for the Oracle adjudication request (seconds)."""
 
+    oracle_rule_mode: Literal["classic", "shadow", "uncertainty"] = "shadow"
+    """Which rule sends a local verdict to the Oracle.
+
+    ``classic`` is the verdict-class rule that ran before stage 1: a
+    needs_more_info verdict, a verdict other than true_positive on a malware or
+    attack rule, or a confidence below 0.6
+    (``soc_ai.agent.orchestrator.classic_oracle_escalation_reason``).
+    ``uncertainty`` is the stage 1 rule
+    (``soc_ai.agent.orchestrator.oracle_escalation_reason``). ``shadow`` lets
+    the classic rule decide and records on an ``oracle_shadow`` event what the
+    uncertainty rule would have done, so a week of production shows the
+    disagreement before the switch. The default is shadow. A replay of 30 days
+    of production (2026-10-04) found that the uncertainty rule sends 38 cases a
+    month the Oracle has never seen."""
+
     oracle_escalate_needs_more_info: bool = True
-    """Escalate to Oracle when local verdict is needs_more_info."""
+    """Allow the Oracle to review a needs_more_info verdict.
+
+    Since stage 1 the Oracle escalates on uncertainty: a confidence in the gate
+    band, a split between the decision template and the model, or a deep run
+    that ended needs_more_info (``soc_ai.agent.orchestrator.
+    oracle_escalation_reason``). This opt-in narrows that rule: off, no
+    needs_more_info verdict reaches the Oracle. It never adds an escalation."""
 
     oracle_escalate_malware_non_tp: bool = True
-    """Escalate to Oracle when the rule signals malware/exploit AND the local
-    verdict is not a high-confidence true_positive (confidence ≥ 0.7)."""
+    """Allow the Oracle to review a verdict other than true_positive on a
+    malware, exploit or attack-class rule. Off, such a verdict stays local. It
+    narrows the uncertainty rule and never adds an escalation. A true positive
+    on such a rule always stays local."""
 
     oracle_skip_after_confident_loop: float = 0.8
-    """Cost gate: skip the malware/attack-non-TP escalation (condition 2) when
-    the investigation loop RAN and reached at least this confidence. A confident
-    verdict after a real tool-driven investigation is trustworthy — the Oracle
-    double-check is redundant. The zero-tool fast path (loop did NOT run) still
-    escalates regardless (the QVOD/BPFDoor safety net), and low-confidence or
-    needs_more_info verdicts still escalate via conditions 1 and 3. Set to 1.0
-    to always escalate (restore the prior always-double-check behavior)."""
+    """Keep a malware or attack-class verdict local when the investigation loop
+    ran and reached at least this confidence. It narrows the uncertainty rule.
+    It matters for a split between the decision template and the model, the one
+    trigger that can fire above the gate band."""
 
-    oracle_escalate_below_confidence: float = 0.6
-    """Escalate to Oracle when local confidence falls below this threshold,
-    regardless of verdict or rule class."""
+    oracle_escalate_below_confidence: float = 0.7
+    """The highest confidence at which an in-band verdict goes to the Oracle.
+
+    The gate band is ``[0.4, 0.7)`` (``soc_ai.agent.gates.gate_band``). The
+    default 0.7 is the top of the band, so the whole band escalates. A lower
+    value narrows it. A template split and a deep needs_more_info verdict
+    escalate whatever this value."""
 
     # --- Oracle read-only tool loop (opt-in inside oracle_enabled) ------
     oracle_tools_enabled: bool = False

@@ -18,7 +18,7 @@
   <rect x="0" y="0" width="880" height="400" rx="12" fill="#0d1117"/>
 
   <text x="40" y="48" class="title">Where soc-ai is, and where it&#8217;s going</text>
-  <text x="40" y="70" class="subtitle">Updated September 2026 &#183; current release 1.5.0</text>
+  <text x="40" y="70" class="subtitle">Updated October 2026 &#183; current release 1.5.2</text>
 
   <!-- legend -->
   <circle cx="590" cy="44" r="5" fill="#3fb950"/>
@@ -62,7 +62,7 @@
   <text x="316" y="228" text-anchor="middle" class="date">Jul 2026</text>
   <text x="316" y="250" text-anchor="middle" class="theme">Operations</text>
   <text x="316" y="268" text-anchor="middle" class="detail">notifications, search</text>
-  <text x="316" y="283" text-anchor="middle" class="detail">honest when degraded</text>
+  <text x="316" y="283" text-anchor="middle" class="detail">clear when degraded</text>
 
   <!-- 1.3 -->
   <circle cx="439" cy="170" r="9" fill="#3fb950"/>
@@ -89,7 +89,7 @@
   <text x="685" y="228" text-anchor="middle" class="date">today</text>
   <text x="685" y="250" text-anchor="middle" class="theme">Proactive hunting</text>
   <text x="685" y="268" text-anchor="middle" class="detail">hits become leads</text>
-  <text x="685" y="283" text-anchor="middle" class="detail">a lead hunts itself</text>
+  <text x="685" y="283" text-anchor="middle" class="detail">a lead starts a hunt</text>
 
   <!-- 1.6 planned -->
   <circle cx="808" cy="170" r="9" fill="none" stroke="#8b949e" stroke-width="2" stroke-dasharray="3,3"/>
@@ -100,6 +100,6 @@
   <text x="808" y="283" text-anchor="middle" class="detail">measured lead thresholds</text>
 
   <!-- caption -->
-  <text x="40" y="348" class="caption">Already in the box behind default-off switches: semantic runbook search, chat memory, a cloud second opinion and</text>
+  <text x="40" y="348" class="caption">Built, tested and off by default: semantic runbook search, chat memory, the Oracle second opinion and</text>
   <text x="40" y="366" class="caption">its tool loop, scheduled auto-triage, recurring hunts, catalog sweeps, Sigma drafting, and PCAP decode.</text>
 </svg>

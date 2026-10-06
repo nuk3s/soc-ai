@@ -41,10 +41,12 @@ import contextlib
 import ipaddress
 import socket
 import ssl
+import struct
 import time
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
 
@@ -53,17 +55,26 @@ from elastic_transport import ConnectionTimeout as EsConnectionTimeout
 from elasticsearch import ApiError, AuthenticationException
 from pydantic import ValidationError
 from sqlalchemy import text
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from soc_ai.config import DEFAULT_ALERTS_QUERY, Settings
 from soc_ai.errors import OqlValidationError, SoAuthError
 from soc_ai.so_client.auth import make_auth
 from soc_ai.so_client.elastic import ElasticClient, GridPartialResultsError
-from soc_ai.store.db import _migration_config, make_engine
+from soc_ai.store.db import (
+    SQLITE_FILENAME,
+    _migration_config,
+    describe_store,
+    is_postgres_url,
+    make_engine,
+    make_sessionmaker,
+    store_url,
+)
 from soc_ai.webui import alerts_query as aq
 from soc_ai.webui.probes import (
     PROBE_BUDGET_S,
+    UNMEASURED_CAUSES,
     _safe_reason,
     _scrub,
     list_gateway_models,
@@ -129,6 +140,7 @@ _AUDIT_TIMEOUT_S = 8.0  # one _has_privileges call — same cost profile as the 
 _COVERAGE_TIMEOUT_S = 8.0  # 3 CONCURRENT searches — worst case is ~one 5s round trip, not 3x
 _ALERT_FILTER_TIMEOUT_S = 8.0  # same shape: 4 CONCURRENT size=0 counts, one round trip
 _GATEWAY_TIMEOUT_S = 12.0  # list_gateway_models carries its own 10s HTTP timeout
+_ORACLE_ROUTE_TIMEOUT_S = 10.0  # one indexed read of the store, newest first
 _FITNESS_TIMEOUT_S = 150.0  # probes._FITNESS_TOTAL_TIMEOUT_S (130s) + headroom
 # The audit chain row verifies the last 24 h under its own short bound and
 # reports INFO "not checked" when the grid is slow. The _isolated wrapper sits
@@ -217,10 +229,15 @@ async def apply_persisted_overrides(settings: Settings) -> list[str]:
     )
     from soc_ai.store.db import make_sessionmaker  # noqa: PLC0415
 
-    if not (settings.soc_ai_data_dir / "soc-ai.db").exists():
-        return []
+    # A SQLite store that does not exist yet has no overrides. A PostgreSQL
+    # store has no file to ask, so the read below answers, and fails soft.
     engine = None
     try:
+        if (
+            not is_postgres_url(store_url(settings))
+            and not (settings.soc_ai_data_dir / SQLITE_FILENAME).exists()
+        ):
+            return []
         engine = make_engine(settings)
         async with make_sessionmaker(engine)() as db:
             overrides = await load_overrides(db)
@@ -429,8 +446,15 @@ async def check_store(settings: Settings) -> list[CheckResult]:
     back to the legacy keyword ranker (see ``soc_ai.store.runbooks``). So is a
     store at head whose FTS tables are missing: SQLite having the module says
     nothing about a store that was migrated before it did.
+
+    A PostgreSQL store (``SOC_AI_DATABASE_URL``) is named by its URL without
+    the password, and its search row is INFO: FTS5 is a SQLite module.
     """
-    db_path = settings.soc_ai_data_dir / "soc-ai.db"
+    # The SQLite path, or the PostgreSQL URL without its password.
+    db_path = describe_store(settings)
+    postgres = settings.soc_ai_database_url is not None and bool(
+        settings.soc_ai_database_url.get_secret_value().strip()
+    )
     code_head = ScriptDirectory.from_config(_migration_config()).get_current_head() or "?"
     try:
         engine = make_engine(settings)
@@ -440,7 +464,11 @@ async def check_store(settings: Settings) -> list[CheckResult]:
                 "store",
                 "FAIL",
                 f"soc-ai cannot open the store at {db_path}. {_safe_reason(exc)}",
-                hint="Check that SOC_AI_DATA_DIR exists. This user must be able to write to it.",
+                hint=(
+                    "Check SOC_AI_DATABASE_URL. soc-ai supports postgresql+asyncpg URLs."
+                    if postgres
+                    else "Check that SOC_AI_DATA_DIR exists. This user must be able to write to it."
+                ),
             )
         ]
     results: list[CheckResult] = []
@@ -449,8 +477,11 @@ async def check_store(settings: Settings) -> list[CheckResult]:
             try:
                 row = await conn.execute(text("SELECT version_num FROM alembic_version"))
                 db_head = row.scalar_one_or_none()
-            except OperationalError:
-                db_head = None  # fresh store — no alembic_version table yet
+            except (OperationalError, ProgrammingError):
+                # fresh store — no alembic_version table yet. PostgreSQL raises
+                # ProgrammingError and aborts the transaction, so roll it back.
+                await conn.rollback()
+                db_head = None
             if db_head is None:
                 results.append(
                     CheckResult(
@@ -476,6 +507,16 @@ async def check_store(settings: Settings) -> list[CheckResult]:
                         "A DB ahead of the code means this checkout is older than the store.",
                     )
                 )
+            if conn.dialect.name != "sqlite":
+                results.append(
+                    CheckResult(
+                        "store fts5",
+                        "INFO",
+                        "The store is PostgreSQL. FTS5 is a SQLite module. Runbook search "
+                        "uses the keyword ranker. Chat memory uses PostgreSQL text search.",
+                    )
+                )
+                return results
             # FTS5 availability — informational: the app falls back without it.
             has_fts5: bool | None
             try:
@@ -531,8 +572,13 @@ async def check_store(settings: Settings) -> list[CheckResult]:
                 "store",
                 "FAIL",
                 _safe_reason(exc),
-                hint=f"Check the permissions on the store DB file at {db_path}. The file "
-                "can also be corrupt.",
+                hint=(
+                    f"Check that the PostgreSQL server at {db_path} is up, and that "
+                    "the role in SOC_AI_DATABASE_URL can log in."
+                    if postgres
+                    else f"Check the permissions on the store DB file at {db_path}. The file "
+                    "can also be corrupt."
+                ),
             )
         )
     finally:
@@ -821,8 +867,8 @@ async def check_audit_write_privileges(settings: Settings) -> CheckResult:
             f"soc-ai could not query _has_privileges: {_safe_reason(exc)}",
             hint=(
                 "Fix Elasticsearch connectivity first. Then run the doctor again. "
-                "If ack, escalate or comment fail silently once ES answers, the "
-                f"grant can be missing. {fix}"
+                "If ack, escalate or comment fail without an error once ES answers, "
+                f"the grant can be missing. {fix}"
             ),
         )
     finally:
@@ -846,7 +892,7 @@ async def check_audit_write_privileges(settings: Settings) -> CheckResult:
             "the _has_privileges response has an unexpected shape. soc-ai cannot tell "
             "whether the audit grant is present.",
             hint="This is not a confirmed problem. If ack, escalate or comment ever fail "
-            "silently, check the grant by hand. See docs/SECURITY-ONION-SETUP.md, "
+            "without an error, check the grant by hand. See docs/SECURITY-ONION-SETUP.md, "
             "section 3.",
         )
     if bool(body["has_all_requested"]):
@@ -957,6 +1003,23 @@ async def check_index_pattern_coverage(settings: Settings) -> CheckResult:
             f"Some shards failed. The counts are unreliable: {_safe_reason(exc)}",
             hint="Check Elasticsearch shard health. Then run the doctor again. The counts "
             "above are undercounts. Do not narrow or widen the pattern on them.",
+        )
+    except EsConnectionTimeout:
+        # The reachability rows of the same run answered, so the grid is up.
+        # This row fires three counts at once with the probe budget and no
+        # retry, and a production grid of 361 backing indices answers in
+        # 5 to 6 s on a slow minute. That is latency, and the connectivity
+        # remedy sends the operator to the wrong system (2026-10-05).
+        from soc_ai.webui.probes import probe_budget_s  # noqa: PLC0415 - lazy
+
+        return CheckResult(
+            name,
+            "WARN",
+            f"the count under {pattern!r} took longer than the probe budget of "
+            f"{probe_budget_s(settings):g} s. The grid answered the reachability rows "
+            "of this run. This is grid latency, not a connectivity fault.",
+            hint="Run the doctor again. If the warning repeats, read the Elasticsearch "
+            "node load: CPU, heap and the search thread pool queue.",
         )
     except Exception as exc:
         return CheckResult(
@@ -1326,7 +1389,157 @@ async def check_gateway(settings: Settings) -> list[CheckResult]:
     return results
 
 
+# ── Check 4b: the Oracle route ───────────────────────────────────────────────
+
+# How each failure class reads on the doctor row (soc_ai.oracle.failures).
+_ORACLE_CLASS_PHRASE = {
+    "quota": "a usage limit",
+    "5xx": "a server error",
+    "4xx": "a client error",
+    "timeout": "a timeout",
+    "transport": "no answer",
+    "paused": "the pause",
+}
+
+
+def _oracle_pause_row(pause_reason: str, until: str | None, message: str) -> CheckResult:
+    when = f"{until.replace('T', ' ').replace('Z', '')} UTC" if until else "the reset time"
+    if pause_reason == "quota":
+        detail = (
+            f"the Oracle route answered with a usage limit. soc-ai makes no Oracle call "
+            f"until {when}."
+        )
+        hint = (
+            "The pause ends at the reset time. Check the quota of the account behind the "
+            "Oracle route, or set ORACLE_MODEL to a route with quota."
+        )
+    else:
+        detail = (
+            f"the Oracle route answered with three server errors in a row. soc-ai makes no "
+            f"Oracle call until {when}."
+        )
+        hint = "Check the gateway and the provider behind the Oracle route."
+    if message:
+        detail += f" The gateway said: {message}"
+    return CheckResult("oracle route", "WARN", detail, hint=hint)
+
+
+async def check_oracle_route(
+    settings: Settings, *, now: datetime | None = None
+) -> list[CheckResult]:
+    """The Oracle route: PASS when the last call answered, WARN while it is paused.
+
+    INFO when the Oracle is off. The pause of THIS process comes from the
+    route breaker (:mod:`soc_ai.oracle.breaker`). The CLI doctor runs in
+    another process, so the row also reads the newest stored Oracle event: a
+    pause recorded there with a reset time still ahead is a WARN too.
+    """
+    if not settings.oracle_enabled:
+        return [
+            CheckResult("oracle route", "INFO", "the Oracle is off. soc-ai makes no Oracle call.")
+        ]
+    from soc_ai.oracle import breaker  # noqa: PLC0415 - lazy, the doctor stays light
+    from soc_ai.store import oracle_ledger  # noqa: PLC0415
+
+    now = now or breaker._now()
+    route = breaker.route_key(settings)
+    until = breaker.BREAKER.open_until(route, now=now)
+    if until is not None:
+        state = breaker.BREAKER.state(route)
+        return [_oracle_pause_row(state.reason, breaker.iso(until), state.message)]
+
+    try:
+        engine = make_engine(settings)
+        try:
+            async with make_sessionmaker(engine)() as db:
+                outcome = await oracle_ledger.latest_route_outcome(db)
+        finally:
+            await engine.dispose()
+    except Exception as exc:
+        return [
+            CheckResult(
+                "oracle route",
+                "WARN",
+                f"soc-ai cannot read the Oracle record in the store. {_safe_reason(exc)}",
+                hint="Run the store check above. The Oracle route state is unknown.",
+            )
+        ]
+    if outcome is None:
+        return [CheckResult("oracle route", "INFO", "no Oracle call is on record yet.")]
+    p = outcome.payload
+    paused_until = p.get("paused_until")
+    if isinstance(paused_until, str) and paused_until:
+        try:
+            end = datetime.fromisoformat(paused_until.replace("Z", "+00:00"))
+        except ValueError:
+            end = None
+        if end is not None and end > now:
+            pause_reason = str(p.get("pause_reason") or p.get("error_class") or "quota")
+            return [_oracle_pause_row(pause_reason, paused_until, str(p.get("message") or ""))]
+        if outcome.kind == "oracle_skipped" or p.get("error_class") in ("quota", "5xx"):
+            ended = paused_until.replace("T", " ").replace("Z", "")
+            return [
+                CheckResult(
+                    "oracle route",
+                    "INFO",
+                    f"the last Oracle pause ended at {ended} UTC. The next escalation calls "
+                    "the Oracle.",
+                )
+            ]
+    if outcome.kind == "oracle_adjudication":
+        return [CheckResult("oracle route", "PASS", "the last Oracle call answered.")]
+    error_class = str(p.get("error_class") or "")
+    if error_class == "unparseable":
+        return [
+            CheckResult(
+                "oracle route",
+                "PASS",
+                "the last Oracle call answered. The answer held no verdict.",
+            )
+        ]
+    status = p.get("http_status")
+    if error_class:
+        phrase = _ORACLE_CLASS_PHRASE.get(error_class, error_class)
+        detail = f"the last Oracle call failed with {phrase}"
+        if isinstance(status, int):
+            detail += f", HTTP {status}"
+        detail += "."
+        message = str(p.get("message") or "")
+        if message:
+            detail += f" The gateway said: {message}"
+    else:
+        detail = (
+            f"the last Oracle call failed: {p.get('reason') or 'unknown'}. The event holds no "
+            "HTTP status. soc-ai recorded it before the failure class existed."
+        )
+    return [
+        CheckResult(
+            "oracle route",
+            "WARN",
+            detail,
+            hint="Check the gateway and the Oracle model. The next escalation tries again.",
+        )
+    ]
+
+
 # ── Check 5: model fitness (the E1.1 probe) ──────────────────────────────────
+
+
+def _unmeasured_legs(fitness: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """The failed legs when every one of them failed to measure, else None.
+
+    A leg that timed out or could not reach the model holds no capability
+    result. When those are the only failed legs, the probe measured nothing
+    that says the model is unfit. A probe result with no leg list (an older
+    cache, a test double) gives None, and the grade stands.
+    """
+    legs = [leg for leg in fitness.get("legs") or [] if isinstance(leg, dict)]
+    failed = [leg for leg in legs if leg.get("grade") == "fail"]
+    if not failed:
+        return None
+    if all(leg.get("cause") in UNMEASURED_CAUSES for leg in failed):
+        return failed
+    return None
 
 
 async def check_model_fitness(settings: Settings) -> list[CheckResult]:
@@ -1335,12 +1548,31 @@ async def check_model_fitness(settings: Settings) -> list[CheckResult]:
     This is the "silent all-fallback verdicts" trap: a model that lists on the
     gateway but can't hold structured output degrades EVERY investigation to a
     fallback needs_more_info verdict, and nothing else surfaces it.
+
+    Only a capability failure reads FAIL. A leg that timed out or could not
+    reach the model measured nothing, so it reads WARN "could not measure",
+    with the cause and no advice to replace the model. On the range the doctor
+    told the operator to replace a model after a 30 s gateway timeout, while
+    the same model landed 10 of 10 eval verdicts in the same minute.
     """
     fitness = await probe_model_fitness(settings)
     grade = str(fitness.get("grade", "fail"))
     detail = str(fitness.get("detail", ""))
     if grade == "pass":
         return [CheckResult("model fitness", "PASS", detail)]
+    unmeasured = _unmeasured_legs(fitness) if grade == "fail" else None
+    if unmeasured:
+        model = str(fitness.get("model") or "") or "the analyst model"
+        causes = " ".join(str(leg.get("detail") or leg.get("name") or "") for leg in unmeasured)
+        return [
+            CheckResult(
+                "model fitness",
+                "WARN",
+                f"could not measure {model}. {causes}",
+                hint="The call to the model did not finish. This is not a model capability "
+                "result. Read the gateway row, then run the doctor again when the load drops.",
+            )
+        ]
     if grade == "degraded":
         return [
             CheckResult(
@@ -1531,6 +1763,142 @@ def _open_proxy_blocks(proxies: list[str]) -> list[str]:
     return found
 
 
+# ── Authentication and the listening sockets ────────────────────────────────
+
+# The kernel's TCP socket tables. Column 2 is the local address, column 4 the
+# state, and 0A is LISTEN. Each address word is the hex of a native-order u32.
+_PROC_NET_TCP: tuple[str, ...] = ("/proc/net/tcp", "/proc/net/tcp6")
+_TCP_LISTEN = "0A"
+
+
+def _read_proc_net(path: str) -> str:
+    """One socket table. A seam for the tests: they hand the doctor a fake table."""
+    with open(path, encoding="ascii") as fh:
+        return fh.read()
+
+
+def _decode_proc_address(hex_addr: str) -> str:
+    """``0100007F`` to ``127.0.0.1``, and the 32-digit IPv6 form to its text."""
+    words = [int(hex_addr[i : i + 8], 16) for i in range(0, len(hex_addr), 8)]
+    packed = struct.pack("=" + "I" * len(words), *words)
+    family = socket.AF_INET if len(words) == 1 else socket.AF_INET6
+    return socket.inet_ntop(family, packed)
+
+
+def listening_addresses(
+    port: int, *, read: Callable[[str], str] | None = None
+) -> tuple[list[str], list[str]]:
+    """The local addresses with a LISTEN socket on *port*, and the read errors.
+
+    Reads ``/proc/net/tcp`` and ``/proc/net/tcp6``. A host with IPv6 off has no
+    tcp6 table, so one missing table is not an error. Both unreadable gives no
+    address and two errors, and the caller says it could not read them.
+    """
+    reader = read or _read_proc_net
+    found: list[str] = []
+    errors: list[str] = []
+    for path in _PROC_NET_TCP:
+        try:
+            text = reader(path)
+        except OSError as exc:
+            errors.append(f"{path}: {exc.strerror or type(exc).__name__}")
+            continue
+        for line in text.splitlines()[1:]:
+            cols = line.split()
+            if len(cols) < 4 or cols[3] != _TCP_LISTEN or ":" not in cols[1]:
+                continue
+            addr_hex, port_hex = cols[1].rsplit(":", 1)
+            try:
+                if int(port_hex, 16) != port:
+                    continue
+                addr = _decode_proc_address(addr_hex)
+            except (ValueError, OSError, struct.error):
+                continue
+            shown = f"[{addr}]:{port}" if ":" in addr else f"{addr}:{port}"
+            if shown not in found:
+                found.append(shown)
+    if len(errors) < len(_PROC_NET_TCP):
+        errors = []
+    return found, errors
+
+
+def _is_loopback_listener(shown: str) -> bool:
+    host = shown.rsplit(":", 1)[0].strip("[]")
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    mapped = getattr(ip, "ipv4_mapped", None)
+    return bool(ip.is_loopback or (mapped is not None and mapped.is_loopback))
+
+
+def check_authentication(
+    settings: Settings,
+    *,
+    read: Callable[[str], str] | None = None,
+    in_container: bool | None = None,
+) -> list[CheckResult]:
+    """Authentication on or off, and when off, the addresses that carry the port.
+
+    The app cannot see uvicorn's bind. The start warning read ``SOC_AI_HOST``
+    and said "loopback bind 127.0.0.1" on a range where the systemd unit bound
+    0.0.0.0 and a remote browser used the API with no login. The doctor reads
+    the kernel's socket tables, which hold the real bind, and fails soft when
+    it cannot read them.
+    """
+    name = "authentication"
+    if settings.api_auth_required:
+        return [CheckResult(name, "PASS", "on. Each API call needs a session or a token.")]
+    port = int(settings.soc_ai_port)
+    addresses, errors = listening_addresses(port, read=read)
+    container = Path("/.dockerenv").exists() if in_container is None else in_container
+    note = (
+        " soc-ai runs in a container. The port that the host publishes sets the reach. "
+        "See SOC_AI_BIND."
+        if container
+        else ""
+    )
+    fix = "Set API_AUTH_REQUIRED=true for a shared deployment."
+    if errors:
+        return [
+            CheckResult(
+                name,
+                "WARN",
+                f"off. soc-ai could not read the listening sockets: {'; '.join(errors)}.{note}",
+                hint=f"Run `ss -ltn` to list them. {fix}",
+            )
+        ]
+    if not addresses:
+        return [
+            CheckResult(
+                name,
+                "WARN",
+                f"off. No socket on this host listens on port {port}. soc-ai cannot tell "
+                f"which addresses the server binds.{note}",
+                hint=f"Start the server, or check SOC_AI_PORT. {fix}",
+            )
+        ]
+    listed = ", ".join(addresses)
+    if all(_is_loopback_listener(a) for a in addresses):
+        return [
+            CheckResult(
+                name,
+                "INFO",
+                f"off. Port {port} listens on {listed} only. Only this host can call the API."
+                f"{note}",
+            )
+        ]
+    return [
+        CheckResult(
+            name,
+            "WARN",
+            f"off. Port {port} listens on {listed}. Another host that reaches this host can "
+            f"call the API with no login.{note}",
+            hint=f"{fix} Or bind the server to 127.0.0.1.",
+        )
+    ]
+
+
 def check_tls(settings: Settings, *, now: datetime | None = None) -> list[CheckResult]:
     """The certificate soc-ai serves with, or the reason it serves plain HTTP."""
     proxies = [str(p) for p in (getattr(settings, "proxy_trusted_ips", None) or [])]
@@ -1557,7 +1925,6 @@ def _tls_mode_row(settings: Settings, proxies: list[str], *, now: datetime | Non
 
     status = inspect_tls(settings.soc_ai_tls_cert, settings.soc_ai_tls_key, now=now)
     if status.mode == "off":
-        host = str(getattr(settings, "soc_ai_host", "127.0.0.1"))
         if proxies:
             return CheckResult(
                 "tls",
@@ -1566,7 +1933,19 @@ def _tls_mode_row(settings: Settings, proxies: list[str], *, now: datetime | Non
                 f"forwarded headers from {', '.join(proxies)}. "
                 "Confirm SOC_AI_BIND=127.0.0.1 so port 8443 stays on the host loopback.",
             )
-        if host in {"127.0.0.1", "::1", "localhost"}:
+        # The real listeners, not the configured host: the systemd unit and
+        # the container pass their own bind to the server, and the setting
+        # keeps its loopback default there.
+        addresses, _errors = listening_addresses(int(settings.soc_ai_port))
+        # With no listener on the port, for example from the CLI while the
+        # service is down, the configured host is the only fact there is.
+        if addresses:
+            on_loopback = all(_is_loopback_listener(a) for a in addresses)
+            host = ", ".join(sorted(addresses))
+        else:
+            host = str(settings.soc_ai_host)
+            on_loopback = host in {"127.0.0.1", "::1", "localhost"}
+        if on_loopback:
             return CheckResult("tls", "INFO", "TLS is off. soc-ai serves plain HTTP on loopback.")
         return CheckResult(
             "tls",
@@ -1758,7 +2137,171 @@ def check_prompt_assets() -> list[CheckResult]:
     ]
 
 
+# ── Check 9: the estate model (tier 3, in shadow) ────────────────────────────
+
+# A fit older than this, with the model on, reads as stale. The loop fits once
+# a day, so two missed fits in a row.
+_ESTATE_STALE_AFTER = timedelta(hours=48)
+
+
+def _fit_day(at: datetime) -> str:
+    return at.strftime("%Y-%m-%d %H:%M UTC")
+
+
+async def _latest_estate_fit(settings: Settings) -> Any:
+    """The newest estate model fit in the store, or None. Raises on a read error."""
+    from soc_ai.store import estate_model as estate_store  # noqa: PLC0415
+
+    engine = make_engine(settings)
+    try:
+        async with make_sessionmaker(engine)() as db:
+            return await estate_store.latest_fit(db)
+    finally:
+        await engine.dispose()
+
+
+async def _last_fit_when_off(settings: Settings) -> Any:
+    """The newest fit for the "off" row, or None. Never raises and never creates a store.
+
+    A setting turned off does not erase the fit it made. The row used to drop
+    it: on the range a learning fit ran at 01:50, the setting went back off,
+    and the row read "off" with no trace of the fit.
+    """
+    try:
+        if (
+            not is_postgres_url(store_url(settings))
+            and not (settings.soc_ai_data_dir / SQLITE_FILENAME).exists()
+        ):
+            return None
+        return await _latest_estate_fit(settings)
+    except Exception:
+        return None
+
+
+async def check_estate_model(
+    settings: Settings, *, now: datetime | None = None
+) -> list[CheckResult]:
+    """The estate model: unavailable, off, learning, measured, drifted or held.
+
+    The row never imports the extra. An import of scikit-learn costs memory
+    for the life of the process, and the in-app preflight runs the doctor.
+    ``ml_installed`` asks the import system whether the packages exist.
+    """
+    from soc_ai.hunting.estate_model import ml_installed  # noqa: PLC0415 - lazy, no numpy
+    from soc_ai.store import estate_model as estate_store  # noqa: PLC0415
+
+    name = "estate model"
+    enabled = bool(getattr(settings, "estate_model_enabled", False))
+    if not ml_installed():
+        if not enabled:
+            return [
+                CheckResult(
+                    name,
+                    "INFO",
+                    "unavailable. The ml extra is not installed. The estate model is off.",
+                )
+            ]
+        return [
+            CheckResult(
+                name,
+                "WARN",
+                "unavailable. The estate model is on, and the ml extra is not installed. "
+                "soc-ai fits no estate model.",
+                hint="Install the extra with `uv sync --extra ml`, or run the container "
+                "image. The image includes it.",
+            )
+        ]
+    if not enabled:
+        last = await _last_fit_when_off(settings)
+        if last is None:
+            return [CheckResult(name, "INFO", "off. The ml extra is installed.")]
+        return [
+            CheckResult(
+                name,
+                "INFO",
+                f"off. The ml extra is installed. The last fit ran on "
+                f"{_fit_day(last.fitted_at)}, in state {last.state}.",
+            )
+        ]
+    try:
+        fit = await _latest_estate_fit(settings)
+    except Exception as exc:
+        return [
+            CheckResult(
+                name,
+                "WARN",
+                f"soc-ai cannot read the estate model record in the store. {_safe_reason(exc)}",
+                hint="Run the store check above. The estate model state is unknown.",
+            )
+        ]
+    if fit is None:
+        return [
+            CheckResult(
+                name, "INFO", "learning. No fit is on record yet. The first fit runs within a day."
+            )
+        ]
+    at = (now or datetime.now(UTC)).astimezone(UTC).replace(tzinfo=None)
+    day = _fit_day(fit.fitted_at)
+    if at - fit.fitted_at > _ESTATE_STALE_AFTER:
+        return [
+            CheckResult(
+                name,
+                "WARN",
+                f"stale. The last fit ran on {day}, in state {fit.state}.",
+                hint="Read the app log for lines that start with `estate model:`.",
+            )
+        ]
+    if fit.state == estate_store.STATE_MEASURED:
+        return [
+            CheckResult(
+                name,
+                "PASS",
+                f"measured. The last fit ran on {day}. It read {fit.hosts} hosts in "
+                f"{fit.groups} groups and wrote {fit.observations} shadow observations.",
+            )
+        ]
+    reason = f" {fit.reason}" if fit.reason else ""
+    return [CheckResult(name, "INFO", f"{fit.state}. The last fit ran on {day}.{reason}")]
+
+
 # ── Runner ───────────────────────────────────────────────────────────────────
+
+
+def check_grid_tls(settings: Settings) -> list[CheckResult]:
+    """One line when TLS verification to the grid is off, else no row.
+
+    The CLI hides the elasticsearch SecurityWarning about ``verify_certs=False``,
+    because the operator chose the setting and the warning headed every
+    command. This row keeps the fact in view, once, under the grid row.
+    """
+    off = [
+        name
+        for name, verify in (
+            ("ES_VERIFY_SSL", settings.es_verify_ssl),
+            ("SO_VERIFY_SSL", settings.so_verify_ssl),
+        )
+        if not verify
+    ]
+    if not off:
+        return []
+    names = " and ".join(off)
+    verb = "is" if len(off) == 1 else "are"
+    return [
+        CheckResult(
+            "grid tls",
+            "INFO",
+            f"TLS verification to the grid is off. {names} {verb} false. soc-ai accepts "
+            "any certificate from the grid.",
+        )
+    ]
+
+
+def _insert_after(results: list[CheckResult], name: str, rows: list[CheckResult]) -> None:
+    """Put *rows* after the last row named *name*, or at the end when there is none."""
+    if not rows:
+        return
+    at = max((i for i, r in enumerate(results) if r.name == name), default=len(results) - 1)
+    results[at + 1 : at + 1] = rows
 
 
 async def _solo(coro: Awaitable[CheckResult]) -> list[CheckResult]:
@@ -1866,13 +2409,17 @@ async def run_doctor(
         ),
         _isolated("audit chain", _solo(check_audit_chain(settings)), _AUDIT_CHAIN_WRAP_S),
         _isolated("gateway", check_gateway(settings), _GATEWAY_TIMEOUT_S),
+        _isolated("oracle route", check_oracle_route(settings), _ORACLE_ROUTE_TIMEOUT_S),
+        _isolated("estate model", check_estate_model(settings), _STORE_TIMEOUT_S),
     ]
     if include_fitness:
         checks.append(_isolated("model fitness", check_model_fitness(settings), _FITNESS_TIMEOUT_S))
     batches = await asyncio.gather(*checks)
     for batch in batches:
         results.extend(batch)
+    _insert_after(results, "elasticsearch", check_grid_tls(settings))
     results.extend(check_egress_posture(settings))
+    results.extend(check_authentication(settings))
     results.extend(check_tls(settings))
     results.extend(check_blocklists(settings))
     results.extend(check_prompt_assets())

@@ -73,6 +73,18 @@ dependencies = [
     "packaging>=24.0",
 ]
 
+[project.optional-dependencies]
+# The PostgreSQL store (SOC_AI_DATABASE_URL). SQLite needs nothing extra.
+# The container image installs it, so the compose `postgres` profile works.
+postgres = ["asyncpg>=0.30"]
+# The tier 3 estate model (soc_ai/hunting/estate_model): peer groups by
+# clustering and an estate outlier score per host. The container image
+# installs it. The app imports it only when the estate model runs, and the
+# job logs one line and does nothing when the extra is absent. The major is
+# capped like the other wide dependencies here: a fresh resolve must not cross
+# into a breaking 2.x of scikit-learn or a 3.x of numpy with no diff to review.
+ml = ["scikit-learn>=1.5,<2", "numpy>=2.0,<3"]
+
 [project.urls]
 Homepage = "https://github.com/nuk3s/soc-ai"
 Repository = "https://github.com/nuk3s/soc-ai"
@@ -187,17 +199,30 @@ ignore_missing_imports = true
 module = ["dpkt"]
 ignore_missing_imports = true
 
+# scikit-learn ships no py.typed and no stub package. numpy and scipy ship
+# types, but all three come from the optional `ml` extra, and a checkout
+# without the extra must still type-check. The estate model converts every
+# value it returns to a builtin type, so an untyped import loses nothing.
+[[tool.mypy.overrides]]
+module = ["sklearn.*", "numpy", "numpy.*", "scipy.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 # `--ignore=tests/browser` keeps the default coverage-gated run from collecting
 # the Playwright E2E smoke: it needs the seeded demo stack + chromium and would
 # tank coverage. It runs in a DEDICATED CI job (`browser-smoke`) via `-m browser`.
-addopts = "-ra --strict-markers --strict-config --cov=soc_ai --cov-report=term-missing --cov-fail-under=80 --ignore=tests/browser"
+# `--ignore=tests/scale` does the same for the scale harness. It runs a
+# 2,000-host estate for minutes, in its own CI job (`scale`) via `-m scale`.
+addopts = "-ra --strict-markers --strict-config --cov=soc_ai --cov-report=term-missing --cov-fail-under=80 --ignore=tests/browser --ignore=tests/scale"
 testpaths = ["tests"]
 markers = [
     "slow: marks tests as slow",
     "integration: requires a live SO grid (skipped in CI)",
     "browser: marks browser/E2E smoke tests (own CI job; needs the demo stack + chromium)",
+    "scale: marks the scale harness budget tests (own CI job; a synthetic estate of 2,000 hosts)",
+    "postgres: store tests that also run on PostgreSQL when SOC_AI_TEST_DATABASE_URL is set",
+    "sqlite_only: reads SQLite internals; the PostgreSQL run skips it",
 ]
 
 [tool.coverage.run]

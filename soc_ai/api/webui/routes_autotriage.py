@@ -60,6 +60,9 @@ class AutoTriageStatusOut(BaseModel):
     # (never the exception text — that carries the grid's host:port).
     degraded: bool = False
     grid_errors: list[str] = []
+    # Targets the rule prior covered with no model run this sweep (live mode).
+    # They are not in ``hunted``: no model investigated them.
+    prior_covered: int = 0
 
 
 def _at_status(status: Any, note: str | None = None) -> AutoTriageStatusOut:
@@ -80,6 +83,7 @@ def _at_status(status: Any, note: str | None = None) -> AutoTriageStatusOut:
         skipped_reasons=dict(getattr(status, "skipped_reasons", {}) or {}),
         degraded=bool(getattr(status, "degraded", False)),
         grid_errors=list(getattr(status, "grid_errors", []) or []),
+        prior_covered=int(getattr(status, "prior_covered", 0) or 0),
     )
 
 
@@ -289,7 +293,14 @@ async def start_auto_triage(request: Request, body: AutoTriageIn) -> AutoTriageS
     status.reset(active=True, total=len(targets), skipped=skipped, severities=chosen)
     status._task = asyncio.create_task(
         at.run_auto_triage(
-            state, targets=targets, started_by=started_by, inherited_acks=inherited_acks
+            state,
+            targets=targets,
+            started_by=started_by,
+            inherited_acks=inherited_acks,
+            # An analyst's explicit selection is a manual Investigate of each
+            # alert: the standard class. A band sweep lets the rungs decide,
+            # as the scheduler does.
+            requested_class="standard" if selected else None,
         )
     )
     return _at_status(

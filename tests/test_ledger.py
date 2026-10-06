@@ -165,6 +165,8 @@ async def test_the_batch_ledger_agrees_with_the_single_one(
                 measured=3,
                 learning=1,
                 blind=2,
+                blind_reason="2 of 2 blind hosts: no connection rate baseline exists for this "
+                "host yet.",
             )
         )
         db.add(
@@ -174,6 +176,7 @@ async def test_the_batch_ledger_agrees_with_the_single_one(
                 measured=9,
                 learning=0,
                 blind=1,
+                blind_reason="1 of 1 blind host: the baseline holds no hourly series yet.",
             )
         )
         await db.commit()
@@ -192,6 +195,12 @@ async def test_the_batch_ledger_agrees_with_the_single_one(
     assert many["a-1"].dismissed == {"known_change": 1}
     # The newest prior run, not the sum of the window.
     assert many["p-1"].coverage == {"measured": 9, "learning": 0, "blind": 1}
+    # The blind reason of the newest run rides beside its count. The older
+    # run's reason is gone with its count.
+    newest = "1 of 1 blind host: the baseline holds no hourly series yet."
+    assert many["p-1"].blind_reason == newest
+    assert many["p-1"].as_dict()["blind_reason"] == newest
+    assert many["a-1"].blind_reason is None and many["never-run"].blind_reason is None
     assert many["p-1"].shadow_hits == 2 and many["p-1"].unread_shadow_hits == 2
     assert many["never-run"].observations == 0 and many["never-run"].coverage == {}
 

@@ -166,4 +166,24 @@ describe('HostObservations', () => {
       screen.getByText(/No observations on this host in the last 7 days/),
     ).toBeTruthy();
   });
+
+  // The row states the statistic it carries. The numbers lived only in the
+  // summary sentence.
+  it('states the statistic a row carries and none for a row without one', async () => {
+    vi.mocked(getObservations).mockResolvedValue({
+      entity: '10.1.2.3',
+      days: 7,
+      observations: [
+        { ...ROWS[1], id: 6, statistic: 'documents', statistic_value: 6, baseline_value: 2 },
+        { ...ROWS[0], id: 7 },
+      ],
+    });
+    mount();
+    const line = await screen.findByTestId('observation-statistic-6');
+    expect(line.textContent).toBe(
+      '6 documents in the recent window. The set it is new to holds 2 members.',
+    );
+    // Negative control: a row with no statistic states none.
+    expect(screen.queryByTestId('observation-statistic-7')).toBeNull();
+  });
 });

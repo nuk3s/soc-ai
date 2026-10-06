@@ -19,12 +19,12 @@ comes to read as a host with nothing unusual on it.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from soc_ai.store.models import EntityProfile
@@ -38,14 +38,17 @@ __all__ = [
     "COVERAGE_LEARNING",
     "COVERAGE_MEASURED",
     "COVERAGE_UNMEASURABLE",
+    "UNSTAMPED_SHAPE",
     "ProfileFreshness",
     "ProfileRow",
     "freshness",
+    "load_dimension",
     "load_profiles",
     "profiles_for_role",
     "purge_entity",
     "purge_older_than",
     "purge_out_of_scope",
+    "stamp_roles",
     "upsert_profile",
 ]
 
@@ -63,6 +66,11 @@ COVERAGE_UNMEASURABLE = "unmeasurable"
 # right to call anything unusual, and for the second the dimension has moved
 # to the proxy, so absence here says nothing about the host.
 _SCORABLE = frozenset({COVERAGE_MEASURED})
+
+# Row ids per IN list in :func:`stamp_roles`. SQLite builds before 3.32 cap a
+# statement at 999 bound variables, and the UPDATE binds the role and the
+# confidence too.
+_STAMP_CHUNK = 500
 
 
 def _utcnow() -> datetime:
@@ -144,12 +152,17 @@ async def upsert_profile(
     window_days: int = 30,
     first_seen: datetime | None = None,
     last_seen: datetime | None = None,
+    shape_version: int | None = None,
 ) -> None:
     """Write one profile, replacing any previous one for the same dimension.
 
     Replacing rather than appending: the sweep runs repeatedly, and a table
     that grows a row per sweep forces every reader to work out which row is
     current — a question with no right answer once two sweeps overlap.
+
+    ``shape_version`` is the shape the caller wrote. None states no shape,
+    and the reader takes the row for shape 1. The build writes through
+    ``soc_ai.dossier.profile_job`` and stamps the current shape there.
     """
     existing = (
         await db.execute(
@@ -179,6 +192,7 @@ async def upsert_profile(
                 first_seen=first_seen,
                 last_seen=last_seen,
                 built_at=_utcnow(),
+                shape_version=shape_version,
             )
         )
     else:
@@ -194,6 +208,7 @@ async def upsert_profile(
         existing.first_seen = first_seen
         existing.last_seen = last_seen
         existing.built_at = _utcnow()
+        existing.shape_version = shape_version
 
     await db.commit()
 
@@ -241,27 +256,111 @@ async def load_profiles(
     return out
 
 
-async def profiles_for_role(db: AsyncSession, *, role: str, dimension: str) -> list[ProfileRow]:
-    """Every scorable profile for one role and dimension — the peer group.
+async def load_dimension(
+    db: AsyncSession,
+    *,
+    entity_kind: str,
+    dimension: str,
+    entity_keys: Sequence[str],
+) -> dict[str, ProfileRow]:
+    """One dimension for many entities, in one query, keyed by entity key.
 
-    Unscorable members are excluded rather than counted as empty. A blind peer
-    contributes no evidence about what is normal for the role, and leaving it
-    in the denominator makes every membership look rarer than it is — which
-    pushes shrinkage toward calling ordinary things novel.
+    The prior sweep scores every entity its recent read returned. One
+    :func:`load_profiles` per entity and analytic was about 10,000 queries on
+    a 2,000-host estate, and about 60 percent of the sweep's own time. The caller
+    passes a bounded slice of keys. A rate vector holds every hour of the
+    window, so the rows of one dimension for 20,000 hosts are hundreds of
+    megabytes. The caller holds one slice at a time.
     """
+    if not entity_keys:
+        return {}
     rows = (
         (
             await db.execute(
                 select(EntityProfile).where(
-                    EntityProfile.role == role,
+                    EntityProfile.entity_kind == entity_kind,
                     EntityProfile.dimension == dimension,
+                    EntityProfile.entity_key.in_(list(entity_keys)),
                 )
             )
         )
         .scalars()
         .all()
     )
+    return {model.entity_key: _row(model) for model in rows}
+
+
+async def profiles_for_role(
+    db: AsyncSession, *, role: str, dimension: str, min_confidence: float = 0.0
+) -> list[ProfileRow]:
+    """Every scorable profile for one role and dimension — the peer group.
+
+    Unscorable members are excluded rather than counted as empty. A blind peer
+    contributes no evidence about what is normal for the role, and leaving it
+    in the denominator makes every membership look rarer than it is — which
+    pushes shrinkage toward calling ordinary things novel.
+
+    ``min_confidence`` keeps the peers whose role the dossier is sure of. A
+    peer at 0.5 is a guess, and a group of guesses says nothing about a role.
+    The role column is written by :func:`stamp_roles` after each build.
+    """
+    query = select(EntityProfile).where(
+        EntityProfile.entity_kind == "host",
+        EntityProfile.role == role,
+        EntityProfile.dimension == dimension,
+    )
+    # With no bar, a row that states no confidence still counts, as it did
+    # before the bar existed.
+    if min_confidence > 0.0:
+        query = query.where(EntityProfile.role_confidence >= min_confidence)
+    rows = (await db.execute(query)).scalars().all()
     return [row for model in rows if (row := _row(model)).is_scorable]
+
+
+async def stamp_roles(db: AsyncSession, role_of: Callable[[str], tuple[str | None, float]]) -> int:
+    """Write the role and its confidence on every host row. Returns how many changed.
+
+    The build writes each row with no role, so the column was empty on every
+    row of both estates, and a peer group could never be read. ``role_of``
+    maps a host key to the role the dossier holds for it, and to the
+    confidence behind it. A host with no role reads ``(None, 0.0)``.
+
+    Only the two columns move. ``built_at`` stays the time of the build, so
+    the stamp does not make the rows look newer than the build that wrote them.
+
+    The changed rows are grouped by the pair they take, and each group is one
+    UPDATE per 500 ids. An estate with a role on every host changes about
+    200,000 rows after each build, and one UPDATE per row made the stamp grow
+    with the row count.
+    """
+    rows = (
+        await db.execute(
+            select(
+                EntityProfile.id,
+                EntityProfile.entity_key,
+                EntityProfile.role,
+                EntityProfile.role_confidence,
+            ).where(EntityProfile.entity_kind == "host")
+        )
+    ).all()
+    groups: dict[tuple[str | None, float | None], list[int]] = {}
+    for row_id, entity_key, role, confidence in rows:
+        new_role, believed = role_of(str(entity_key))
+        new_confidence = float(believed) if new_role is not None else None
+        if role == new_role and confidence == new_confidence:
+            continue
+        groups.setdefault((new_role, new_confidence), []).append(int(row_id))
+    changed = 0
+    for (new_role, new_confidence), ids in groups.items():
+        for start in range(0, len(ids), _STAMP_CHUNK):
+            await db.execute(
+                update(EntityProfile)
+                .where(EntityProfile.id.in_(ids[start : start + _STAMP_CHUNK]))
+                .values(role=new_role, role_confidence=new_confidence)
+            )
+        changed += len(ids)
+    await db.commit()
+    return changed
 
 
 async def purge_out_of_scope(db: AsyncSession, *, cidrs: Sequence[Any]) -> int:
@@ -292,15 +391,20 @@ async def purge_out_of_scope(db: AsyncSession, *, cidrs: Sequence[Any]) -> int:
         _is_ip_literal,
     )
 
+    # The id and the key only. A whole row carries its vector, and on an
+    # estate of 20,000 hosts the table holds 200,000 of them.
     rows = (
-        (await db.execute(select(EntityProfile).where(EntityProfile.entity_kind == "host")))
-        .scalars()
-        .all()
-    )
+        await db.execute(
+            select(EntityProfile.id, EntityProfile.entity_key).where(
+                EntityProfile.entity_kind == "host"
+            )
+        )
+    ).all()
+    nets = list(cidrs)
     doomed = [
-        r.id
-        for r in rows
-        if _is_ip_literal(r.entity_key) and not _is_internal_ip(r.entity_key, list(cidrs))
+        int(row_id)
+        for row_id, key in rows
+        if _is_ip_literal(key) and not _is_internal_ip(key, nets)
     ]
     if not doomed:
         return 0
@@ -343,11 +447,42 @@ class ProfileFreshness:
 
     newest_built_at: datetime | None
     unmeasurable: dict[str, str]
+    # The newest shape any host row holds, and how many host rows hold a
+    # shape older than the one the caller asked about. A row with no stamp
+    # holds shape 1. None when the table holds no host row.
+    newest_shape: int | None = None
+    outdated: int = 0
 
 
-async def freshness(db: AsyncSession) -> ProfileFreshness:
-    """The newest ``built_at`` and every unmeasurable dimension's reason."""
+# The shape of a row built before the build stamped one.
+UNSTAMPED_SHAPE = 1
+
+
+async def freshness(db: AsyncSession, *, shape: int | None = None) -> ProfileFreshness:
+    """The newest ``built_at``, every unmeasurable dimension's reason, and the shapes.
+
+    ``shape`` is the shape the code writes. With it, ``outdated`` counts the
+    host rows that hold an older one. Host rows only: the build writes and
+    expires host rows, and a row it never rewrites must not make a build due
+    on every wake.
+    """
     newest = (await db.execute(select(func.max(EntityProfile.built_at)))).scalar_one_or_none()
+    stamped = func.coalesce(EntityProfile.shape_version, UNSTAMPED_SHAPE)
+    newest_shape = (
+        await db.execute(select(func.max(stamped)).where(EntityProfile.entity_kind == "host"))
+    ).scalar_one_or_none()
+    outdated = 0
+    if shape is not None:
+        outdated = int(
+            (
+                await db.execute(
+                    select(func.count(EntityProfile.id)).where(
+                        EntityProfile.entity_kind == "host", stamped < shape
+                    )
+                )
+            ).scalar_one()
+            or 0
+        )
     rows = (
         await db.execute(
             select(EntityProfile.dimension, EntityProfile.coverage_reason)
@@ -358,7 +493,12 @@ async def freshness(db: AsyncSession) -> ProfileFreshness:
     reasons: dict[str, str] = {}
     for dimension, reason in rows:
         reasons.setdefault(str(dimension), str(reason or ""))
-    return ProfileFreshness(newest_built_at=newest, unmeasurable=reasons)
+    return ProfileFreshness(
+        newest_built_at=newest,
+        unmeasurable=reasons,
+        newest_shape=int(newest_shape) if newest_shape is not None else None,
+        outdated=outdated,
+    )
 
 
 async def purge_older_than(db: AsyncSession, *, built_before: datetime) -> int:

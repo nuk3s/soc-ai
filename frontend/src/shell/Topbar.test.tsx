@@ -6,7 +6,8 @@
 // immediate refresh on return to visible so the bell is current the moment the
 // analyst looks again (the house guard, lib/useAsync.ts:118).
 import { act, fireEvent, render, screen, within } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
+import { useEffect } from 'react';
+import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../lib/api', async (importOriginal) => ({
@@ -25,7 +26,7 @@ vi.mock('react-router-dom', async (importOriginal) => ({
 }));
 
 import { emitNeedsYouChanged, getHealth, getNotifications, getWorkspaces } from '../lib/api';
-import { ShellProvider } from './ShellContext';
+import { ShellProvider, useShell } from './ShellContext';
 import { Topbar, notificationSummary } from './Topbar';
 
 const NOTIF_MS = 15_000;
@@ -402,5 +403,69 @@ describe('Workspace avatar', () => {
     await flush();
     expect(screen.queryByTestId('ws-glyph-ip')).toBeNull();
     expect(screen.getByTitle('Current workspace').textContent).toBe('Ssoc-east');
+  });
+});
+
+// The machine page read "agent:<uuid>" in the top bar over a page titled with
+// the machine name (range dogfood 2026-10-05, C5). The top bar shows the name
+// the page reports, and the key rides in the tooltip only.
+describe('Topbar breadcrumb on a machine page', () => {
+  const KEY = 'agent:9c53d823-8137-47c0-b78e-38e2314e5dcd';
+
+  function NameSetter({ name }: { name: { key: string; name: string } | null }) {
+    const { setCrumbName } = useShell();
+    useEffect(() => setCrumbName(name), [name, setCrumbName]);
+    return null;
+  }
+
+  const mountAt = (path: string, name: { key: string; name: string } | null) =>
+    render(
+      <MemoryRouter initialEntries={[path]}>
+        <ShellProvider>
+          <Routes>
+            <Route
+              path="/hosts/:key"
+              element={
+                <>
+                  <Topbar />
+                  <NameSetter name={name} />
+                </>
+              }
+            />
+            <Route path="/investigation/:id" element={<Topbar />} />
+          </Routes>
+        </ShellProvider>
+      </MemoryRouter>,
+    );
+
+  it('shows the machine name and keeps the key in the tooltip', async () => {
+    mountAt(`/hosts/${encodeURIComponent(KEY)}`, { key: KEY, name: 'web-01' });
+    await flush();
+    const crumb = screen.getByTestId('topbar-crumb2');
+    expect(crumb.textContent).toBe('web-01');
+    expect(crumb.getAttribute('title')).toBe(KEY);
+  });
+
+  it('shows no raw key before the name arrives', async () => {
+    mountAt(`/hosts/${encodeURIComponent(KEY)}`, null);
+    await flush();
+    const crumb = screen.getByTestId('topbar-crumb2');
+    expect(crumb.textContent).toBe('machine');
+    expect(crumb.textContent).not.toContain('agent:');
+    expect(crumb.getAttribute('title')).toBe(KEY);
+  });
+
+  it('ignores a name reported for another key', async () => {
+    mountAt(`/hosts/${encodeURIComponent(KEY)}`, { key: 'agent:other', name: 'db-02' });
+    await flush();
+    expect(screen.getByTestId('topbar-crumb2').textContent).toBe('machine');
+  });
+
+  it('keeps the id of a page that is not a machine page', async () => {
+    mountAt('/investigation/01M44S6F4JPXDCK7FC19KVS0D9', null);
+    await flush();
+    const crumb = screen.getByTestId('topbar-crumb2');
+    expect(crumb.textContent).toBe('01M44S6F4JPXDCK7FC19KVS0D9');
+    expect(crumb.getAttribute('title')).toBeNull();
   });
 });

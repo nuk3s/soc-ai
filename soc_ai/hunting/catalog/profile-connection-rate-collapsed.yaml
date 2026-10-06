@@ -5,12 +5,20 @@ description: >
   analytic that looks only for more activity misses these cases. An intruder
   silences telemetry early in an intrusion.
 
-  This analytic measures the host against its own median for the same
-  time-of-week cell. A server that is quiet every weekend is therefore not
-  reported every weekend.
+  This analytic tests each hour against the host's own expected count for
+  the same hour of the week. A server that is quiet every weekend is
+  therefore not reported every weekend. Two hours in a row must fall to a
+  third of the expected count.
 
 level: medium
 evaluator: profile
+# The tier 2 budget is one hit per 100 host-days. The seven day production
+# replay of 2026-10-05 read 8.3 hits per 100 host-days for this analytic. On
+# about 130 measured hosts the budget is close to one hit a day. The self-healing
+# hold moves the analytic to shadow past three hits in a day or under a precision
+# of 0.25 on its hunted leads, and an analyst approves it back to live.
+fire_budget_per_day: 3
+precision_floor: 0.25
 scope_field: host.name
 scope_kind: host
 
@@ -18,6 +26,7 @@ profile:
   dimension: connection_rate
   test: below
   threshold: 3.0
+  min_hours: 2
 
 attack:
   - T1562.001

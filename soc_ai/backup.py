@@ -72,7 +72,7 @@ from alembic.script import ScriptDirectory
 
 from soc_ai import __version__
 from soc_ai.bootstrap_credential import bootstrap_credential_path
-from soc_ai.store.db import _migration_config
+from soc_ai.store.db import _migration_config, make_private_dir, restrict_file
 
 MANIFEST_VERSION = 1
 DB_FILENAME = "soc-ai.db"
@@ -447,7 +447,9 @@ def restore_backup(
     elif live_msg:
         warnings.append(f"{live_msg}. --yes is given, so the restore continues.")
 
-    data_dir.mkdir(parents=True, exist_ok=True)
+    # The store holds the password hashes. A restore makes the directory 0700
+    # and the store 0600, whatever mode the archived file carried.
+    make_private_dir(data_dir)
     with tempfile.TemporaryDirectory(prefix="soc-ai-restore-") as td:
         try:
             with tarfile.open(archive, "r:gz") as tar:
@@ -465,6 +467,7 @@ def restore_backup(
         for suffix in ("-wal", "-shm"):
             db_path.with_name(db_path.name + suffix).unlink(missing_ok=True)
         _install_file(src_db, db_path)
+        restrict_file(db_path)
 
         restored_sidecars: list[str] = []
         for p in sorted((extracted / "data").iterdir()):

@@ -10,6 +10,7 @@ import { render, screen, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { describe, expect, it } from 'vitest';
 import { listHref } from '../lib/hostsList';
+import { absTime } from '../lib/timeRange';
 import type { MachineSummary } from '../lib/types';
 import { HostsSummary, roleSlices } from './HostsSummary';
 
@@ -153,6 +154,34 @@ describe('HostsSummary — the counts are dated, once', () => {
       'href',
       '/config#host-dossier',
     );
+  });
+
+  // The list reads the last sweep and the machine page reads live activity.
+  // The line dates the list (range dogfood 2026-10-05, M5).
+  it('dates the list beside the schedule line when the schedule is off', () => {
+    mount(SUMMARY, { scheduleEnabled: false });
+    const asOf = screen.getByTestId('hosts-as-of');
+    expect(asOf.textContent).toMatch(/^the list shows the state as of /);
+    expect(asOf.getAttribute('title')).toContain('The machine page shows live activity.');
+  });
+
+  // N6 of the 2026-10-05 verification. The note read "Oct 02, 2026, 08:10:28
+  // AM" for a sweep at 12:10 UTC, with no zone.
+  it('states the time zone of the date it gives', () => {
+    mount(SUMMARY, { scheduleEnabled: false });
+    const asOf = screen.getByTestId('hosts-as-of');
+    expect(asOf.textContent).toBe(
+      `the list shows the state as of ${absTime(SUMMARY.last_sweep_at, { zone: true })}`,
+    );
+    const zone = new Intl.DateTimeFormat(undefined, { timeZoneName: 'short' })
+      .formatToParts(new Date(SUMMARY.last_sweep_at!))
+      .find((p) => p.type === 'timeZoneName')!.value;
+    expect(asOf.textContent!.endsWith(zone)).toBe(true);
+  });
+
+  it('adds no date when the schedule runs', () => {
+    mount(SUMMARY, { scheduleEnabled: true });
+    expect(screen.queryByTestId('hosts-as-of')).toBeNull();
   });
 
   it('stays quiet about the schedule when it runs, or when the screen does not know', () => {

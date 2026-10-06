@@ -96,12 +96,12 @@ def _partial_read_hint(exc: GridPartialResultsError) -> str:
         # partial read's advice, never the unreachable-grid advice.
         parts.append("did not read every shard")
     cause = _es_failure_type(exc.reason)
-    detail = f" (first shard failure: {cause})" if cause else ""
+    detail = f" The first shard failure is {cause}." if cause else ""
     return (
-        f"The Security Onion grid answered, but the search {' and '.join(parts)}{detail}. "
-        "These results are incomplete, not empty — a short or missing answer here means "
-        "unknown. Repeating the search returns the same partial read until Elasticsearch "
-        "shard health recovers; check the cluster's shard allocation."
+        f"The Security Onion grid answered, but the search {' and '.join(parts)}.{detail} "
+        "These results are incomplete. A short or missing answer here means unknown. "
+        "The same search returns the same partial read until the Elasticsearch shards "
+        "recover. Check the shard allocation of the cluster."
     )
 
 
@@ -209,7 +209,7 @@ def _es_api_error_http(exc: ApiError) -> HTTPException:
             status_code=400,
             detail={
                 "reason": "bad_query",
-                "hint": "Elasticsearch rejected the query — check the fields and time range.",
+                "hint": "Elasticsearch rejected the query. Check the fields and the time range.",
             },
         )
     return HTTPException(status_code=503, detail=_GRID_UNAVAILABLE)
@@ -632,9 +632,9 @@ async def alerts_empty_reason(
         return AlertsEmptyReasonOut(
             reason="bad_filter",
             hint=(
-                f"WEBUI_ALERTS_QUERY is not valid OQL ({exc}), so the alerts feed is "
-                f"empty whatever the grid holds. Set it to {DEFAULT_ALERTS_QUERY} in "
-                "Config → Queries, or run `soc-ai doctor` for the count under every "
+                f"WEBUI_ALERTS_QUERY is not valid OQL. The parser says: {exc}. The alerts "
+                f"feed is empty whatever the grid holds. Set it to {DEFAULT_ALERTS_QUERY} "
+                "in Config → Queries. Run `soc-ai doctor` for the count under every "
                 "label on your grid."
             ),
         )
@@ -690,10 +690,10 @@ async def alerts_empty_reason(
     return AlertsEmptyReasonOut(
         reason="filter_mismatch",
         hint=(
-            f"The alerts feed matched nothing in this window, but {better} matches "
+            f"The alerts feed matched nothing in this window. {better} matches "
             f"{better_count} that the feed cannot see. The queue is empty because of "
-            "the filter, not because the grid is quiet. Set WEBUI_ALERTS_QUERY="
-            f"{aq.widen_alert_filter(configured, better)} in Config → Queries, or run "
+            "the filter. The grid is not quiet. Set WEBUI_ALERTS_QUERY="
+            f"{aq.widen_alert_filter(configured, better)} in Config → Queries. Run "
             "`soc-ai doctor` for the count under every label."
         ),
     )
@@ -876,13 +876,13 @@ def _pick_representative(
 
     if not src_ip and not dst_ip:
         # Never render "— → —": these events observed no flow, they didn't lose one.
-        shape = "No network flow on these events (host-shaped detection)"
+        shape = "These events carry no network flow. The detection is host-shaped."
     else:
         dst_label = f"{dst_ip or '—'}:{dst_port}" if dst_port is not None else (dst_ip or "—")
-        shape = f"Most common flow {src_ip or '—'} → {dst_label}"
+        shape = f"The most common flow is {src_ip or '—'} → {dst_label}."
     reason = (
-        f"{shape} — {max_count} of {len(events)} events;"
-        f" representative = newest ({representative.timestamp})."
+        f"{shape} {max_count} of {len(events)} events match it."
+        f" The representative is the newest of them, from {representative.timestamp}."
     )
     return representative, max_count, reason
 

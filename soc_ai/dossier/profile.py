@@ -34,13 +34,15 @@ import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from dataclasses import field as dc_field
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from soc_ai.dossier.profile_math import (
     GUARDED_PORT_DIMENSIONS,
+    SET_CAP,
     served_port_counts,
     summarise_cells,
+    zero_filled,
 )
 from soc_ai.enrichment.discovery import _is_internal_ip, _is_ip_literal
 from soc_ai.so_client.elastic import DEFAULT_MAX_BUCKETS, ElasticClient
@@ -52,8 +54,10 @@ __all__ = [
     "DNS_CANDIDATES",
     "EPHEMERAL_PORT_FLOOR",
     "FLOW_CANDIDATES",
+    "HOURLY_KEY",
     "MIN_SUPPORT_DAYS",
     "PROCESS_CANDIDATES",
+    "PROFILE_SHAPE",
     "BuiltProfile",
     "ProfileSweep",
     "collect_entity_profiles",
@@ -66,6 +70,19 @@ _LOGGER = logging.getLogger(__name__)
 # The design's floor: below this an entity has not earned the right to call
 # anything unusual, and the profile reads "learning, day N of 7".
 MIN_SUPPORT_DAYS = 7
+
+# The version of the shape a build stores. The build stamps it on every row it
+# writes, in ``entity_profiles.shape_version``. Bump it in the same change
+# that makes a reader need something an older build did not write.
+#
+# 1  the three time cells of a rate, and the sets. A row with no stamp.
+# 2  the hourly series of the connection rate, beside the cells.
+#
+# The rate test of shape 2 reads the series, and a row of shape 1 reads blind
+# until a build rewrites it. The age rule alone left it blind for most of a
+# day after the upgrade. When no host row holds this shape, a build is due at
+# once, and the build rebuilds each host that holds an older one.
+PROFILE_SHAPE = 2
 
 # Candidate planes per logical role, most-specific first. Order is only a
 # tie-break for reporting; every candidate that carries the field is used, so a
@@ -132,7 +149,7 @@ _ALT_MEMBERS = "members_alt_"
 # definition not ordinary — but the bound is here because an unbounded nested
 # terms agg on a 3.8M-document plane is how you take an Elasticsearch down.
 _MAX_ENTITIES = 500
-_MAX_MEMBERS = 200
+_MAX_MEMBERS = SET_CAP
 # The most slices the shaped entity terms will be cut into. At 32 slices of
 # 500 entities the ladder has tried 16,000 entity buckets per request down to
 # 500, and a grid that still refuses is telling us its limit, not ours.
@@ -794,6 +811,8 @@ _SHAPED: tuple[tuple[str, str], ...] = (
     ("connection_rate", "numeric"),
 )
 _SHAPED_DIMENSIONS: tuple[str, ...] = tuple(d for d, _ in _SHAPED)
+# The key of the hourly series inside a rate vector, beside the three cells.
+HOURLY_KEY = "hourly"
 _SHAPED_CANDIDATES = FLOW_CANDIDATES
 _SHAPED_PROBE_FIELD = "destination.ip"
 _SHAPED_ENTITY_FIELD = "source.ip"
@@ -1001,16 +1020,34 @@ def _active_hours_vector(bucket: dict[str, Any], *, tz: str) -> dict[str, Any]:
 
 
 def _rate_vector(bucket: dict[str, Any], *, tz: str) -> dict[str, Any]:
-    """The three local-time cells for a numeric dimension."""
-    samples: list[tuple[datetime, float]] = []
+    """The three local-time cells for a numeric dimension, and the hourly series.
+
+    The aggregation drops hours with no document. Those hours are filled with
+    zero from the entity's first active hour to its last, so the cells and
+    the hourly expectation both measure the rate in every hour, and not the
+    rate in active hours.
+
+    ``hourly`` holds the series itself: the UTC start of its first hour and
+    one count per hour. The prior sweep reads the expected count per hour of
+    the week from it. It keeps the series, and not the expectation, so a
+    window an investigation confirmed as an attack can be left out when the
+    sweep reads it.
+    """
+    counts: dict[datetime, float] = {}
     for hour_bucket in ((bucket.get("hours") or {}).get("buckets")) or []:
         stamp = _parse_stamp(hour_bucket.get("key_as_string"))
         if stamp is None:
             continue
-        samples.append((stamp, float(hour_bucket.get("doc_count") or 0)))
+        counts[stamp] = counts.get(stamp, 0.0) + float(hour_bucket.get("doc_count") or 0)
 
+    start, series = zero_filled(counts)
+    samples = (
+        [(start + timedelta(hours=n), value) for n, value in enumerate(series)]
+        if start is not None
+        else []
+    )
     cells = summarise_cells(samples, tz=tz)
-    return {
+    vector: dict[str, Any] = {
         cell.value: {
             "median": summary.median,
             "dispersion": summary.dispersion,
@@ -1019,6 +1056,12 @@ def _rate_vector(bucket: dict[str, Any], *, tz: str) -> dict[str, Any]:
         }
         for cell, summary in cells.items()
     }
+    if start is not None:
+        vector[HOURLY_KEY] = {
+            "start": start.isoformat(),
+            "counts": [int(v) if float(v).is_integer() else v for v in series],
+        }
+    return vector
 
 
 def _parse_stamp(value: Any) -> datetime | None:

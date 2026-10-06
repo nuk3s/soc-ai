@@ -365,3 +365,99 @@ def test_the_page_never_shows_a_credential_from_the_trace_or_a_tool_result(
     assert "Zq8vL2mX9pR4tY7w" not in text
     assert "svc-portal password: [redacted]" in text
     assert any("[redacted]" in r for r in body["reasoning"])
+
+
+# ── the endpoints chip (range dogfood 2026-10-05, D2) ───────────────────────
+
+
+def _seed_alert(client: TestClient, alert: dict[str, Any], **create: Any) -> str:
+    """Seed a complete run whose stored alert context is ``alert``."""
+    from soc_ai.store import investigations as inv_svc
+
+    async def _go() -> str:
+        async with client.app.state.db_sessionmaker() as db:  # type: ignore[attr-defined]
+            inv = await inv_svc.create(
+                db, alert_es_id="ev-ends", started_by="tester", rule_name="R", **create
+            )
+            await inv_svc.append_events(
+                db,
+                inv.id,
+                [{"sequence": 1, "kind": "enriched_alert_context", "payload": {"alert": alert}}],
+            )
+            await inv_svc.finalize(
+                db,
+                inv.id,
+                status="complete",
+                verdict="false_positive",
+                confidence=0.7,
+                rationale="r",
+                report={"verdict": "false_positive"},
+            )
+            return inv.id
+
+    return asyncio.run(_go())
+
+
+def test_a_host_reported_alert_keeps_its_source_and_names_the_host_apart(
+    client: TestClient,
+) -> None:
+    """A grid node SSH login failure names a source address and a host, and no
+    destination. The chip read "source <host> to destination <source address>".
+    The source is the source address, the destination is empty, and the host
+    is the reporter."""
+    inv_id = _seed_alert(
+        client,
+        {
+            "rule_name": "Grid Node Login Failure (SSH)",
+            "source_ip": "192.0.2.226",
+            "host_name": "gridnode",
+        },
+        src_ip="192.0.2.226",
+    )
+    body = client.get(f"/api/v1/investigations/{inv_id}").json()
+    assert body["srcIp"] == "192.0.2.226"
+    assert body["dstIp"] is None
+    assert body["reportedBy"] == "gridnode"
+    assert body["host"] == "192.0.2.226"
+    # The host name is never put in a direction slot.
+    assert "gridnode" not in (body["host"], body["ip"])
+    assert body["ip"] != "192.0.2.226"
+
+
+def test_a_flow_alert_keeps_both_ends_in_their_slots(client: TestClient) -> None:
+    """Negative control: a flow alert with both ends and a sensor host name.
+    The source stays the source, the destination stays the destination, and
+    the sensor is the reporter."""
+    inv_id = _seed_alert(
+        client,
+        {
+            "rule_name": "ET Probe",
+            "source_ip": "192.0.2.10",
+            "destination_ip": "198.51.100.7",
+            "host_name": "sensor-a",
+        },
+        src_ip="192.0.2.10",
+        dest_ip="198.51.100.7",
+    )
+    body = client.get(f"/api/v1/investigations/{inv_id}").json()
+    assert (body["srcIp"], body["dstIp"], body["reportedBy"]) == (
+        "192.0.2.10",
+        "198.51.100.7",
+        "sensor-a",
+    )
+    assert (body["host"], body["ip"]) == ("192.0.2.10", "198.51.100.7")
+
+
+def test_a_run_with_no_alert_context_reads_the_stored_ends(client: TestClient) -> None:
+    from soc_ai.store import investigations as inv_svc
+
+    async def _go() -> str:
+        async with client.app.state.db_sessionmaker() as db:  # type: ignore[attr-defined]
+            inv = await inv_svc.create(
+                db, alert_es_id="ev-bare", started_by="tester", src_ip="192.0.2.5"
+            )
+            return inv.id
+
+    inv_id = asyncio.run(_go())
+    body = client.get(f"/api/v1/investigations/{inv_id}").json()
+    assert (body["srcIp"], body["dstIp"], body["reportedBy"]) == ("192.0.2.5", None, None)

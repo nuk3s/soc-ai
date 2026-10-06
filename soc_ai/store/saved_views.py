@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from sqlalchemy.engine import CursorResult
 
-from soc_ai.store.models import SavedView
+from soc_ai.store.models import SavedView, User
 
 # The list screens that can hold a view. A screen not on this list is a typo or
 # a stale client, and either way saving against it would create a row nothing
@@ -142,6 +142,12 @@ async def upsert_view(
     # transaction commits or rolls back, and then counts a table that already
     # includes this row. So insert first, count second, and undo if the count
     # says this row was one too many.
+    #
+    # PostgreSQL has no store-wide writer lock: two savers each count their own
+    # new row, both stay under the cap, and both commit. Locking the user's row
+    # first queues the savers of one user, so the second counts after the first
+    # commits. SQLite drops FOR UPDATE, and its writer lock does the queueing.
+    await db.execute(select(User.id).where(User.id == user_id).with_for_update())
     row = SavedView(user_id=user_id, screen=screen, name=name, query_json=query)
     db.add(row)
     await db.flush()

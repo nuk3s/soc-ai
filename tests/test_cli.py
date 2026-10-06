@@ -900,6 +900,68 @@ def test_validate_batch_wires_repeats_into_batch_config(
     assert captured["cfg"].synth_repeats == 4
 
 
+@pytest.mark.parametrize("local", [True, False])
+def test_validate_batch_local_skips_the_oracle_grade(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+    settings_kratos: Settings,
+    local: bool,
+) -> None:
+    """--local hands run_batch a runner bound to grade=False; without it the
+    runner grades. The runner is the only wire that carries the choice."""
+    import functools
+
+    import soc_ai.eval.batch as batch_mod
+    import soc_ai.so_client.elastic as elastic_mod
+    from soc_ai.eval.batch import BatchConfig, BatchSummary
+
+    captured: dict[str, Any] = {}
+
+    async def fake_run_batch(cfg: BatchConfig, **kw: Any) -> BatchSummary:
+        captured["runner"] = kw.get("runner")
+        return BatchSummary(
+            batch_dir=tmp_path,
+            n_planned=1,
+            n_attempted=1,
+            n_ok=1,
+            n_error=0,
+            aborted_reason=None,
+            elapsed_s=1,
+        )
+
+    class _FakeElastic:
+        def __init__(self, _settings: Settings) -> None:
+            pass
+
+        async def aclose(self) -> None:
+            pass
+
+    monkeypatch.setattr(batch_mod, "run_batch", fake_run_batch)
+    monkeypatch.setattr(elastic_mod, "ElasticClient", _FakeElastic)
+    monkeypatch.setattr(cli, "get_settings", lambda: settings_kratos)
+
+    args = argparse.Namespace(
+        oql="q",
+        n=1,
+        concurrency=1,
+        diversity_keys="rule.name",
+        time_range_minutes=60,
+        out_dir=str(tmp_path),
+        resume=False,
+        per_run_timeout_s=10,
+        max_consecutive_failures=3,
+        synth_set=None,
+        repeats=1,
+        no_aggregate=True,
+        no_meta=True,
+        local=local,
+    )
+    assert cli._validate_batch(args) == 0
+    runner = captured["runner"]
+    assert isinstance(runner, functools.partial)
+    assert runner.keywords == {"grade": not local}
+
+
 def test_spec_sweep_runs_the_command_the_console_prints(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1267,14 +1329,14 @@ def test_format_lead_quality_prints_the_weeks_the_types_and_the_rule() -> None:
             LeadQualityTypesOut(types="catalog_match+off_hours", formed=2, dismissed=1, threat=1)
         ],
         rule="A lead forms at 0.85 over two or more types.",
-        note="A threshold moves on a week of data, never on a day.",
+        note="A threshold moves only on a week of data.",
     )
     out = _strip_ansi(cli.format_lead_quality(report))
     assert "2026-W38" in out and "2026-W37" in out
     assert "expected_for_role=1" in out
     assert "catalog_match+off_hours" in out
     assert "rule: A lead forms at 0.85 over two or more types." in out
-    assert "note: A threshold moves on a week of data, never on a day." in out
+    assert "note: A threshold moves only on a week of data." in out
     # A week with nothing in it prints a dash, not an empty column.
     assert out.splitlines()[2].endswith("-")
 
@@ -1473,3 +1535,345 @@ def test_audit_verify_help_documents_exit_3(capsys: pytest.CaptureFixture[str]) 
     assert "2 could not verify" in text
     assert "3 duplicate sequence numbers only" in text
     assert "--all" in text
+
+
+def test_priors_prints_the_status_and_counts_unmeasurable_as_blind(
+    monkeypatch: pytest.MonkeyPatch,
+    settings_kratos: Settings,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``soc-ai priors`` printed a fifth column, ``unmeasurable=2``, where the
+    ledger, the store and docs/HUNTING.md count that entity as blind. It also
+    printed no status, so a shadow detector and a live analytic read the same.
+
+    The status comes from the effective catalog the sweep ran. A learned
+    detector ships in shadow. A profile analytic ships live.
+    """
+    import soc_ai.config as config_mod
+    import soc_ai.hunting.prior_sweep as sweep_mod
+    import soc_ai.so_client.elastic as elastic_mod
+    from soc_ai.hunting.prior_sweep import PriorSweep
+    from soc_ai.hunting.priors import PriorResult
+
+    seen: dict[str, Any] = {}
+
+    def _result(spec: str, key: str, coverage: str, note: str = "") -> PriorResult:
+        return PriorResult(
+            spec_id=spec, entity_kind="host", entity_key=key, coverage=coverage, note=note
+        )
+
+    async def fake_sweep(**kw: Any) -> PriorSweep:
+        seen.update(kw)
+        return PriorSweep(
+            results=(
+                _result("model-cross-plane-silence", "192.0.2.1", "measured"),
+                _result("model-cross-plane-silence", "192.0.2.2", "unmeasurable", "one plane"),
+                _result("profile-connection-rate-spiked", "192.0.2.1", "blind", "no series"),
+            ),
+            notes=(
+                "model-cross-plane-silence: entity states: measured 1, learning 0, blind 0, "
+                "unmeasurable 1, stale 0, drifted 0, held 0.",
+            ),
+        )
+
+    class _FakeElastic:
+        def __init__(self, _settings: Settings) -> None:
+            pass
+
+        async def aclose(self) -> None:
+            pass
+
+    monkeypatch.setattr(sweep_mod, "run_prior_sweep", fake_sweep)
+    monkeypatch.setattr(elastic_mod, "ElasticClient", _FakeElastic)
+    monkeypatch.setattr(config_mod, "get_settings", lambda: settings_kratos)
+
+    assert cli._priors(argparse.Namespace(recent_hours=24, record=False)) == 0
+    out = capsys.readouterr().out
+
+    assert "  coverage: blind=2, measured=1\n" in out
+    assert "unmeasurable=" not in out
+    # The count of the detector state stays in the per-state note.
+    assert "unmeasurable 1, stale 0" in out
+    assert f"{'model-cross-plane-silence':48} shadow    blind=1, measured=1" in out
+    assert f"{'profile-connection-rate-spiked':48} live      blind=1" in out
+    assert "model-cross-plane-silence" in seen["shadow_ids"]
+    assert "profile-connection-rate-spiked" not in seen["shadow_ids"]
+
+
+# ── `soc-ai estate-model show | run` (range dogfood C4) ────────────────────────
+#
+# No command read the estate fit and none ran it once. The setting toggle and the
+# next wake of the loop were the only path, and a second toggle in one day did
+# not fit again.
+
+
+def _estate_settings(tmp_path: Any, **update: Any) -> Settings:
+    base = _cli_settings().model_copy(update={"soc_ai_data_dir": tmp_path / "data"})
+    return base.model_copy(update=update) if update else base
+
+
+async def _estate_store(settings: Settings) -> Any:
+    from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
+
+    engine = make_engine(settings)
+    await run_migrations(engine)
+    return engine, make_sessionmaker(engine)
+
+
+def _estate_args(cmd: str, **overrides: Any) -> argparse.Namespace:
+    base: dict[str, Any] = {"estate_model_cmd": cmd, "json": False}
+    base.update(overrides)
+    return argparse.Namespace(**base)
+
+
+def test_estate_model_parser_registers_show_and_run() -> None:
+    parser = argparse.ArgumentParser(prog="soc-ai")
+    sub = parser.add_subparsers(dest="cmd")
+    cli._register_store(sub)
+    show = parser.parse_args(["estate-model", "show", "--json"])
+    run = parser.parse_args(["estate-model", "run"])
+    assert show.func is cli._estate_model_show and show.json is True
+    assert run.func is cli._estate_model_run
+
+
+def test_estate_model_show_with_no_fit(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    settings = _estate_settings(tmp_path)
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    assert cli._estate_model_show(_estate_args("show")) == 0
+    out = capsys.readouterr().out
+    assert out == ("The setting estate_model_enabled is off.\nNo estate model fit is on record.\n")
+
+
+def test_estate_model_show_prints_every_field_of_the_newest_fit(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json as _json
+    from datetime import datetime
+
+    from soc_ai.store import estate_model as estate_store
+
+    settings = _estate_settings(tmp_path)
+
+    async def _seed() -> None:
+        engine, maker = await _estate_store(settings)
+        async with maker() as db:
+            await estate_store.record_fit(
+                db, fitted_at=datetime(2026, 10, 4, 1, 0), state="learning", hosts=12
+            )
+            fit_id = await estate_store.record_fit(
+                db,
+                fitted_at=datetime(2026, 10, 5, 1, 50),
+                state="learning",
+                reason="Learning, day 6 of 7. The median host has 6 days of profiles.",
+                model_sha256="7c2aa66b" + "0" * 56,
+                model_file="estate-20261005T015051Z-7c2aa66b001a.json",
+                hosts=31,
+                features=23,
+                groups=3,
+                silhouette=0.455,
+                support_days=6,
+                psi=0.31,
+                drifted=[{"feature": "dns.members", "psi": 0.31}],
+            )
+            await estate_store.update_fit(
+                db,
+                fit_id,
+                outliers=7,
+                unexplained=5,
+                shared=0,
+                no_documents=0,
+                observations=0,
+                audited=True,
+            )
+        await engine.dispose()
+
+    asyncio.run(_seed())
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    assert cli._estate_model_show(_estate_args("show")) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("The setting estate_model_enabled is off.\nThe newest fit, fit 2:")
+    for text in (
+        "fitted at     2026-10-05 01:50 UTC",
+        "state         learning. Learning, day 6 of 7.",
+        "role          challenger until 2026-10-06 01:50 UTC",
+        "hosts         31",
+        "groups        3, silhouette 0.455",
+        "outliers      7 above the threshold, 5 with no stated reason, 0 shared with a "
+        "subgroup, 0 with no document",
+        "observations  0",
+        "model file    estate-20261005T015051Z-7c2aa66b001a.json",
+        "sha256        7c2aa66b",
+        "drift index   0.31. Drifted: dns.members 0.31",
+        "audited       yes",
+    ):
+        assert text in out, text
+    assert "—" not in out and "–" not in out
+
+    assert cli._estate_model_show(_estate_args("show", json=True)) == 0
+    body = _json.loads(capsys.readouterr().out)
+    assert body["enabled"] is False
+    assert body["fit"]["hosts"] == 31 and body["fit"]["fitted_at"] == "2026-10-05T01:50:00"
+
+
+def test_estate_model_run_with_the_setting_off_fits_once_and_says_so(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A real one-shot fit on an empty store: learning, recorded, with the setting off."""
+    pytest.importorskip("sklearn")
+    from soc_ai.store import estate_model as estate_store
+
+    settings = _estate_settings(tmp_path)
+    assert settings.estate_model_enabled is False
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    assert cli._estate_model_run(_estate_args("run")) == 0
+    out = capsys.readouterr().out
+    assert out.startswith(
+        "The setting estate_model_enabled is off. This one fit runs because you asked for "
+        "it. The daily loop stays off.\n"
+    )
+    assert "estate model: learning. 0 hosts." in out
+    assert "The store recorded fit 1." in out
+    assert settings.estate_model_enabled is False  # the one-shot run changed no setting
+
+    async def _latest() -> Any:
+        engine, maker = await _estate_store(settings)
+        async with maker() as db:
+            fit = await estate_store.latest_fit(db)
+        await engine.dispose()
+        return fit
+
+    fit = asyncio.run(_latest())
+    assert fit is not None and fit.state == "learning" and fit.hosts == 0
+
+
+def test_estate_model_run_with_the_setting_on_in_the_console_prints_no_notice(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Negative control: the console override turns the setting on, so no off notice."""
+    from soc_ai.hunting.estate_model import job
+    from soc_ai.store.config_overrides import set_override
+
+    settings = _estate_settings(tmp_path)
+
+    async def _seed() -> None:
+        engine, maker = await _estate_store(settings)
+        async with maker() as db:
+            await set_override(db, "estate_model_enabled", True, updated_by=None)
+        await engine.dispose()
+
+    asyncio.run(_seed())
+    seen: list[bool] = []
+
+    async def _fake_run(**kwargs: Any) -> Any:
+        seen.append(bool(kwargs["settings"].estate_model_enabled))
+        return job.EstateRun(status=job.STATUS_FITTED, state="learning", fit_id=7)
+
+    monkeypatch.setattr(job, "run_estate_model", _fake_run)
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    assert cli._estate_model_run(_estate_args("run")) == 0
+    out = capsys.readouterr().out
+    assert "is off" not in out
+    assert "The store recorded fit 7." in out
+    assert seen == [True]
+
+
+def test_estate_model_run_refuses_in_a_demo(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from soc_ai.hunting.estate_model import job
+
+    called: list[int] = []
+
+    async def _fake_run(**_kw: Any) -> Any:
+        called.append(1)
+        return job.EstateRun(status=job.STATUS_FITTED)
+
+    monkeypatch.setattr(job, "run_estate_model", _fake_run)
+    settings = _estate_settings(tmp_path, soc_ai_demo=True)
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    assert cli._estate_model_run(_estate_args("run")) == 2
+    assert "demo" in _strip_ansi(capsys.readouterr().err)
+    assert called == []
+
+
+def test_estate_model_run_without_the_extra_exits_3(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from soc_ai.hunting.estate_model import job
+
+    monkeypatch.setattr(job, "load_ml", lambda: None)
+    settings = _estate_settings(tmp_path)
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    assert cli._estate_model_run(_estate_args("run")) == 3
+    err = capsys.readouterr().err
+    assert job.UNAVAILABLE_LINE in err
+    assert "uv sync --extra ml" in err
+
+
+# ── The grid TLS warning (range dogfood C9) ────────────────────────────────────
+#
+# Every CLI command started with the two-line elasticsearch SecurityWarning about
+# verify_certs=False, a setting the operator chose. The CLI entry point hides that
+# one warning. The library and the server keep it.
+
+
+def test_the_cli_filter_hides_only_the_grid_tls_warning() -> None:
+    import warnings
+
+    from elastic_transport import SecurityWarning
+    from elasticsearch import AsyncElasticsearch
+
+    message = (
+        "Connecting to 'https://grid.example:9200' using TLS with verify_certs=False is insecure"
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        cli._quiet_grid_tls_warning()
+        AsyncElasticsearch("https://127.0.0.1:9200", verify_certs=False)
+        # Negative controls. The same class with another message stays. The same
+        # message raised outside the elasticsearch package stays.
+        warnings.warn_explicit(
+            "another security fact", SecurityWarning, "x.py", 1, module="elasticsearch._async"
+        )
+        warnings.warn_explicit(message, SecurityWarning, "x.py", 2, module="soc_ai.so_client")
+        warnings.warn_explicit(message, UserWarning, "x.py", 3, module="elasticsearch._async")
+    shown = [(type(w.message).__name__, str(w.message)) for w in caught]
+    assert ("SecurityWarning", "another security fact") in shown
+    assert ("SecurityWarning", message) in shown
+    assert ("UserWarning", message) in shown
+    assert not any("127.0.0.1:9200" in text for _, text in shown)
+
+
+def test_the_library_keeps_the_grid_tls_warning() -> None:
+    """Negative control: with no CLI filter the client still warns."""
+    import warnings
+
+    from elasticsearch import AsyncElasticsearch
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        AsyncElasticsearch("https://127.0.0.1:9200", verify_certs=False)
+    assert any("verify_certs=False is insecure" in str(w.message) for w in caught)
+
+
+def test_main_sets_the_filter_for_a_cli_command_and_not_for_serve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+
+    calls: list[str] = []
+    monkeypatch.setattr(cli, "_quiet_grid_tls_warning", lambda: calls.append("quiet"))
+    monkeypatch.setattr(cli, "_doctor", lambda _a: 0)
+    monkeypatch.setattr(cli, "_serve", lambda _a: 0)
+
+    monkeypatch.setattr(sys, "argv", ["soc-ai", "doctor"])
+    with pytest.raises(SystemExit):
+        cli.main()
+    assert calls == ["quiet"]
+
+    monkeypatch.setattr(sys, "argv", ["soc-ai", "serve"])
+    with pytest.raises(SystemExit):
+        cli.main()
+    assert calls == ["quiet"]

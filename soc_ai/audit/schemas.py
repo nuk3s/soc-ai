@@ -128,6 +128,13 @@ AuditKind = Literal[
     # indistinguishable from an adjudication that never happened. Payload
     # carries the client-reported reason + the retained local verdict.
     "oracle_adjudication_failed",
+    # oracle_rule_mode=shadow: the classic rule decided, and this row records
+    # what the uncertainty rule would have done. No Oracle call comes from it.
+    "oracle_shadow",
+    # An escalation that made no call: the Oracle route was paused after a
+    # usage limit or a run of server errors (soc_ai.oracle.breaker). Payload
+    # carries the pause reason and the reset time.
+    "oracle_skipped",
     # model-fitness preflight probe (soc_ai/webui/probes.probe_model_fitness):
     # emitted by GET /config/model-fitness with the overall grade so an operator
     # switching analyst_model to an unfit model leaves an audit trail of the
@@ -237,6 +244,12 @@ AuditKind = Literal[
     "host_dossier",
     "dossier_override",
     "dossier_conflict_nudge",
+    # The estate model (soc_ai/hunting/estate_model): one record per daily fit
+    # that wrote a model file. The payload carries the sha256 of the file, its
+    # name, the fit time and the state. soc-ai loads a model file only by the
+    # hash its own store recorded, and this record puts the same hash in the
+    # tamper-evident chain (condition 2 of the tier 3 dependency policy).
+    "estate_model_fit",
     "done",
     "error",
 ]

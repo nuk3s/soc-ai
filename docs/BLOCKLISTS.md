@@ -44,7 +44,7 @@ This job never fetches 2 configured sources over the network:
 
 URLhaus, ThreatFox and Feodo need this key.
 
-Since 2024, abuse.ch gates its CSV and JSON data exports behind a free Auth-Key. The
+Since 2024, abuse.ch requires a free Auth-Key for its CSV and JSON data exports. The
 client sends the key in the `Auth-Key` HTTP header. To get a key:
 
 1. Sign in at <https://auth.abuse.ch/> with an X, LinkedIn, Google or GitHub login.
@@ -68,7 +68,7 @@ Behaviour:
 
 The free community API is fair-use. Commercial use can need a paid abuse.ch subscription.
 
-## Running the job
+## Refresh command
 
 Refresh every enabled feed and the cloud-provider prefix lists:
 
@@ -84,9 +84,9 @@ soc-ai blocklists refresh --source urlhaus
 ```
 
 The output reports `ok`, `FAIL` or `skip` for each feed. The exit code is non-zero only
-if a feed failed with an HTTP error, a write error, or a body that the loader cannot
-turn into at least one indicator. A skipped abuse.ch feed means
-that you set no Auth-Key. That state is expected, and it keeps the exit code 0.
+if a feed failed. A feed fails on an HTTP error, on a write error, or on a body that the
+loader cannot turn into at least one indicator. A skipped abuse.ch feed means that you
+set no Auth-Key. That state is expected, and the exit code stays 0.
 
 The job writes only to the configured `blocklist_data_dir` and `cloud_prefix_data_dir`.
 `BLOCKLIST_DATA_DIR` sets the first one, and its default is `/var/lib/soc-ai/blocklists`.
@@ -130,7 +130,7 @@ cron entry works as well. The block below sources the host venv at `/opt/soc-ai/
 It is not valid on the Docker deploy.
 
 ```cron
-# /etc/cron.d/soc-ai-blocklists — runs daily at 03:30 as the soc-ai user.
+# /etc/cron.d/soc-ai-blocklists: runs daily at 03:30 as the soc-ai user.
 30 3 * * * soc-ai cd /opt/soc-ai && set -a && . ./.env && set +a && \
     /opt/soc-ai/.venv/bin/soc-ai blocklists refresh >> /var/log/soc-ai-blocklists.log 2>&1
 ```
@@ -140,16 +140,16 @@ process. cron does not read `.env` on its own.
 
 **Docker deploy:** this deploy has no host venv to source. Run the refresh inside the
 container with `python -m soc_ai blocklists refresh`. See the
-[`docker compose exec` cron example in DOCKER.md](DOCKER.md#blocklist-refresh-has-no-scheduler-in-the-docker-path).
+[`docker compose exec` cron example in DOCKER.md](DOCKER.md#blocklist-refresh-schedule).
 
 ## Synth-eval reproducibility
 
-The synthetic-eval catalogue was built against a pinned blocklist snapshot. A refresh of
-the live `blocklist_data_dir` must NOT change synth-eval results from run to run.
+The synthetic-eval set uses a pinned blocklist snapshot. A refresh of the live
+`blocklist_data_dir` must NOT change synth-eval results from run to run.
 
-The refresh job writes only to the configured live `blocklist_data_dir`. The rule
-follows from that. **Point the eval harness at its own frozen snapshot dir.** Keep that
-dir separate from the live dir. For an eval run, override the data dir to a pinned copy:
+The refresh job writes only to the configured live `blocklist_data_dir`. **Point the eval
+harness at its own frozen snapshot dir.** Keep that dir separate from the live dir. For an
+eval run, set the data dir to a pinned copy:
 
 ```bash
 BLOCKLIST_DATA_DIR=/var/lib/soc-ai/blocklists-synth-snapshot \
@@ -157,11 +157,11 @@ BLOCKLIST_DATA_DIR=/var/lib/soc-ai/blocklists-synth-snapshot \
 ```
 
 `soc-ai blocklists refresh` never touches that snapshot dir. The command reads
-`BLOCKLIST_DATA_DIR` from the production `.env`. That value names the live dir. The synth
-catalogue stays reproducible, and the live dir refreshes daily for real triage.
+`BLOCKLIST_DATA_DIR` from the production `.env`. That value names the live dir. The
+synthetic-eval set stays reproducible. The live dir refreshes daily for triage.
 
 > Do not run `soc-ai blocklists refresh` against the synth snapshot dir. To re-pin the
-> snapshot, copy the live dir explicitly with
+> snapshot, copy the live dir by hand with
 > `cp -a /var/lib/soc-ai/blocklists /var/lib/soc-ai/blocklists-synth-snapshot`. Record
 > the date.
 
@@ -196,5 +196,5 @@ docker compose restart soc-ai
 ```
 
 Without the files, GeoIP and ASN enrichment return nothing. Everything else still
-works. Repeat the download when you want newer data. The refresh job does not do it
-for you.
+works. Repeat the download if you want newer data. The refresh job does not download
+the files.

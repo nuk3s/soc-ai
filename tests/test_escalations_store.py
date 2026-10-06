@@ -8,13 +8,14 @@ groups land in it; the unique index does not.
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from soc_ai.config import Settings
 from soc_ai.store import escalations as esc
 from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
-from sqlalchemy import inspect, text
+from soc_ai.store.models import AlertEscalation
+from sqlalchemy import inspect, text, update
 
 pytestmark = pytest.mark.asyncio
 
@@ -38,7 +39,7 @@ async def test_migration_creates_the_ledger(settings_kratos: Settings) -> None:
         # A SECOND head canary, despite the note in tests/test_hunts_store.py
         # claiming the repo keeps exactly one. Bump both when a migration lands.
         row = await conn.execute(text("SELECT version_num FROM alembic_version"))
-        assert row.scalar_one() == "0055"
+        assert row.scalar_one() == "0060"
     await engine.dispose()
 
 
@@ -162,13 +163,13 @@ async def test_releasing_a_claim_frees_the_alert_to_be_escalated(
 
 async def _age(maker, alert_id: str, *, minutes: int) -> None:  # type: ignore[no-untyped-def]
     """Backdate a claim, since ``claim`` always stamps it now."""
+    # Through the ORM, so the stamp has the store's naive UTC shape on both dialects.
+    aged = datetime.now(UTC).replace(tzinfo=None) - timedelta(minutes=minutes)
     async with maker() as db:
         await db.execute(
-            text(
-                "UPDATE alert_escalations "
-                "SET created_at = datetime('now', :delta) WHERE alert_id = :a"
-            ),
-            {"delta": f"-{minutes} minutes", "a": alert_id},
+            update(AlertEscalation)
+            .where(AlertEscalation.alert_id == alert_id)
+            .values(created_at=aged)
         )
         await db.commit()
 

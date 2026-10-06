@@ -147,12 +147,12 @@ OBSERVED_BAD_CASES: list[tuple[str, dict[str, Any], str]] = [
     (
         "tool_result",
         {"tool_name": "t_greynoise", "result": _ENRICHMENT_OFF},
-        "GreyNoise: skipped (online enrichment off)",
+        "GreyNoise: skipped, online enrichment off",
     ),
     (
         "tool_result",
         {"tool_name": "t_shodan_internetdb", "result": _ENRICHMENT_OFF},
-        "Shodan InternetDB: skipped (online enrichment off)",
+        "Shodan InternetDB: skipped, online enrichment off",
     ),
     (
         "tool_result",
@@ -164,7 +164,7 @@ OBSERVED_BAD_CASES: list[tuple[str, dict[str, Any], str]] = [
                 "hint": "set SHODAN_API_KEY in .env to enable this provider",
             },
         },
-        "Shodan host details: skipped (not configured)",
+        "Shodan host details: skipped, not configured",
     ),
     # 3. auto_ack fell through to the raw humanized kind ("auto ack").
     (

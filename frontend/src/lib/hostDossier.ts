@@ -379,7 +379,7 @@ export function activityProfileView(payload: unknown, scalar?: string | null): A
   if (reqTypical != null) {
     lines.push(
       `typical request ${fmtBytes(reqTypical)}` +
-        (reqLarge != null ? ` (up to ${fmtBytes(reqLarge)})` : ''),
+        (reqLarge != null ? `, up to ${fmtBytes(reqLarge)}` : ''),
     );
   }
   const respTypical = num('resp_bytes_p50');
@@ -387,7 +387,7 @@ export function activityProfileView(payload: unknown, scalar?: string | null): A
   if (respTypical != null) {
     lines.push(
       `typical response ${fmtBytes(respTypical)}` +
-        (respLarge != null ? ` (up to ${fmtBytes(respLarge)})` : ''),
+        (respLarge != null ? `, up to ${fmtBytes(respLarge)}` : ''),
     );
   }
   const ja3 = num('distinct_ja3');
@@ -420,7 +420,7 @@ export function relativeAge(iso: string | null | undefined, now = Date.now()): s
   if (!iso) return 'never';
   const ms = now - new Date(iso).getTime();
   if (!Number.isFinite(ms)) return '—';
-  if (ms < 60_000) return 'just now';
+  if (ms < 60_000) return 'now';
   const minutes = ms / 60_000;
   if (minutes < 60) return `${Math.round(minutes)}m ago`;
   const hours = minutes / 60;
@@ -676,6 +676,12 @@ export interface MachineRoleView {
   state: MachineRoleState;
   /** One or two sentences for the hover. */
   title: string;
+  /** A withheld role in two parts, for a narrow cell: the guess, whole, and
+   *  the state words that qualify it ("low confidence", "stale 8d"). The list
+   *  cut "low confidence: security appliance" to "security applianc". Null
+   *  when the state names no guess. */
+  guess?: string | null;
+  qualifier?: string | null;
 }
 
 /**
@@ -710,6 +716,8 @@ export function machineRoleView(role: MachineRole | null | undefined): MachineRo
       note: null,
       accent: null,
       state,
+      guess: guess ?? null,
+      qualifier: 'low confidence',
       title: guess
         ? `The sweep guessed ${guess}. The evidence is too thin to assert it. Declare the role to settle it.`
         : 'The sweep has a faint signal. The evidence is too thin to name a role.',
@@ -723,6 +731,8 @@ export function machineRoleView(role: MachineRole | null | undefined): MachineRo
       note: null,
       accent: null,
       state,
+      guess: guess ?? null,
+      qualifier: head,
       title: `The sweep inferred ${guess ?? 'a role'}. The evidence is ${age ? `${age} old` : 'old'}. Run a sweep to confirm it.`,
     };
   }

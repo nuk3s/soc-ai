@@ -917,6 +917,8 @@ _HUNTING_CLI_REGISTRARS = {
     "spec-sweep": "_register_spec_sweep",
     "priors": "_register_priors",
     "leads": "_register_leads",
+    # `store` registers `estate-model` beside itself (main() is at its budget).
+    "estate-model": "_register_store",
 }
 
 

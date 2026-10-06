@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from time import monotonic as _monotonic
@@ -384,23 +385,134 @@ def identity_rebound(known: str | None, current: str | None) -> bool:
     )
 
 
-async def _holds_declaration(db: AsyncSession, row: HostDossier) -> bool:
-    """True when an operator value stands on any field of this address."""
-    held = await db.scalar(
-        select(func.count(HostDossierField.id)).where(
-            HostDossierField.dossier_id == row.id,
-            or_(
-                HostDossierField.operator_value.is_not(None),
-                HostDossierField.operator_value_json.is_not(None),
-            ),
+# Addresses per IN list in the batched host writes. SQLite builds before 3.32
+# cap a statement at 999 bound variables, and 500 stays clear of that with room
+# for the other parameters.
+_UPSERT_CHUNK = 500
+
+
+async def _declared_ids(db: AsyncSession, ids: list[int]) -> set[int]:
+    """The ids among *ids* whose address holds an operator value on any field."""
+    held: set[int] = set()
+    for start in range(0, len(ids), _UPSERT_CHUNK):
+        chunk = ids[start : start + _UPSERT_CHUNK]
+        held.update(
+            int(dossier_id)
+            for dossier_id in (
+                await db.scalars(
+                    select(distinct(HostDossierField.dossier_id)).where(
+                        HostDossierField.dossier_id.in_(chunk),
+                        or_(
+                            HostDossierField.operator_value.is_not(None),
+                            HostDossierField.operator_value_json.is_not(None),
+                        ),
+                    )
+                )
+            ).all()
         )
-    )
-    return bool(held)
+    return held
 
 
 # ---------------------------------------------------------------------------
 # Host header
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class HostUpsert:
+    """One host header write for :func:`upsert_hosts`.
+
+    The fields are the keyword arguments of :func:`upsert_host`, with the same
+    meaning. A field left at ``None`` leaves its column as it stands.
+    """
+
+    ip: str
+    first_seen: datetime | None = None
+    last_seen: datetime | None = None
+    last_observed_at: datetime | None = None
+    event_count: int | None = None
+    identity_fingerprint: str | None = None
+    last_built_at: datetime | None = None
+    build_error: str | None = None
+
+
+async def upsert_hosts(
+    db: AsyncSession, rows: Sequence[HostUpsert], *, now: datetime | None = None
+) -> list[HostDossier]:
+    """Insert or refresh many host headers. Flushes; the caller commits.
+
+    The batched form of :func:`upsert_host`, and the one place the header rules
+    live. The census writes every address of the estate through it, and one
+    SELECT plus one flush per address was most of the census record stage at
+    20,000 hosts. Here one SELECT per 500 addresses reads the rows that exist,
+    one ``add_all`` adds the rest, and one flush writes both.
+
+    Returns one row per entry of *rows*, in order. Two entries for one address
+    apply in order to one row, as two calls to :func:`upsert_host` would.
+
+    Every entry is checked before the session changes: an address that will not
+    parse, or a ``build_error`` without its ``last_built_at``, raises
+    ``ValueError`` and the batch writes nothing. The rules per field are the
+    rules :func:`upsert_host` states.
+    """
+    for entry in rows:
+        if entry.build_error is not None and entry.last_built_at is None:
+            raise ValueError(
+                "build_error requires last_built_at: a build outcome is one atomic "
+                "fact, and an error without its stamp would be silently discarded"
+            )
+    keys = [normalize_host_key(entry.ip) for entry in rows]
+    if not keys:
+        return []
+    stamp = _naive_utc(now) or utcnow()
+
+    held: dict[str, HostDossier] = {}
+    wanted = list(dict.fromkeys(keys))
+    for start in range(0, len(wanted), _UPSERT_CHUNK):
+        chunk = wanted[start : start + _UPSERT_CHUNK]
+        found = await db.scalars(select(HostDossier).where(HostDossier.host_key.in_(chunk)))
+        held.update((row.host_key, row) for row in found.all())
+
+    fresh: list[HostDossier] = []
+    # Rows whose fingerprint moved a part. The stamp waits for one read of the
+    # declarations, after the loop.
+    rebound: list[HostDossier] = []
+    out: list[HostDossier] = []
+    for key, entry in zip(keys, rows, strict=True):
+        row = held.get(key)
+        if row is None:
+            row = HostDossier(host_key=key, ip=key)
+            held[key] = row
+            fresh.append(row)
+
+        row.first_seen = _min_dt(row.first_seen, _naive_utc(entry.first_seen))
+        row.last_seen = _max_dt(row.last_seen, _naive_utc(entry.last_seen))
+        if entry.last_observed_at is not None:
+            row.last_observed_at = _naive_utc(entry.last_observed_at)
+        if entry.event_count is not None:
+            row.event_count = entry.event_count
+        if entry.identity_fingerprint is not None:
+            if row.id is not None and identity_rebound(
+                row.identity_fingerprint, entry.identity_fingerprint
+            ):
+                rebound.append(row)
+            row.identity_fingerprint = entry.identity_fingerprint
+        if entry.last_built_at is not None:
+            row.last_built_at = _naive_utc(entry.last_built_at)
+            row.build_error = entry.build_error
+        out.append(row)
+
+    db.add_all(fresh)
+    if rebound:
+        # A row this batch inserted holds no declaration yet, so only a stored
+        # row can need the stamp.
+        declared = await _declared_ids(db, sorted({row.id for row in rebound}))
+        for row in rebound:
+            if row.id in declared:
+                row.identity_rebound_at = stamp
+
+    await db.flush()
+    return out
 
 
 async def upsert_host(
@@ -446,35 +558,26 @@ async def upsert_host(
     null, which to the caller looks like a column that does not persist. No
     production caller passes that combination (both build paths pass the pair),
     so the loud refusal costs nothing and ends the silent-drop trap.
+
+    The write is :func:`upsert_hosts` over a batch of one, so these rules live
+    in one place for the single and the batched caller.
     """
-    if build_error is not None and last_built_at is None:
-        raise ValueError(
-            "build_error requires last_built_at: a build outcome is one atomic "
-            "fact, and an error without its stamp would be silently discarded"
-        )
-    key = normalize_host_key(ip)
-    stamp = _naive_utc(now) or utcnow()
-    row = await _get_host(db, key)
-    if row is None:
-        row = HostDossier(host_key=key, ip=key)
-        db.add(row)
-
-    row.first_seen = _min_dt(row.first_seen, _naive_utc(first_seen))
-    row.last_seen = _max_dt(row.last_seen, _naive_utc(last_seen))
-    if last_observed_at is not None:
-        row.last_observed_at = _naive_utc(last_observed_at)
-    if event_count is not None:
-        row.event_count = event_count
-    if identity_fingerprint is not None:
-        known = row.identity_fingerprint
-        if identity_rebound(known, identity_fingerprint) and await _holds_declaration(db, row):
-            row.identity_rebound_at = stamp
-        row.identity_fingerprint = identity_fingerprint
-    if last_built_at is not None:
-        row.last_built_at = _naive_utc(last_built_at)
-        row.build_error = build_error
-
-    await db.flush()
+    (row,) = await upsert_hosts(
+        db,
+        [
+            HostUpsert(
+                ip=ip,
+                first_seen=first_seen,
+                last_seen=last_seen,
+                last_observed_at=last_observed_at,
+                event_count=event_count,
+                identity_fingerprint=identity_fingerprint,
+                last_built_at=last_built_at,
+                build_error=build_error,
+            )
+        ],
+        now=now,
+    )
     return row
 
 
@@ -1395,19 +1498,21 @@ async def list_dossiers(
     if q:
         needle = q.strip()
         if needle:
+            # icontains: SQLite LIKE ignores ASCII case and PostgreSQL LIKE does
+            # not, so the search lowers both sides to match the same rows on both.
             hostname_hit = (
                 select(HostDossierField.id)
                 .where(
                     HostDossierField.dossier_id == HostDossier.id,
                     HostDossierField.field == "hostname",
                     or_(
-                        HostDossierField.operator_value.contains(needle, autoescape=True),
-                        HostDossierField.inferred_value.contains(needle, autoescape=True),
+                        HostDossierField.operator_value.icontains(needle, autoescape=True),
+                        HostDossierField.inferred_value.icontains(needle, autoescape=True),
                     ),
                 )
                 .exists()
             )
-            conditions.append(or_(HostDossier.ip.contains(needle, autoescape=True), hostname_hit))
+            conditions.append(or_(HostDossier.ip.icontains(needle, autoescape=True), hostname_hit))
     if role:
         # The summary's own role expression, so a bucket on the ROLES bar and
         # the rows its filter lists are one set. The two withheld buckets are

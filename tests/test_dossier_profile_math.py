@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import math
+from datetime import UTC, datetime, timedelta
 
 from soc_ai.dossier.profile_math import (
+    HOURS_PER_WEEK,
     Cell,
     TimeCell,
     cell_for,
+    hour_of_week,
     mad,
     median,
     robust_z,
+    seasonal_baseline,
+    seasonal_from_samples,
     summarise_cells,
+    zero_filled,
 )
 
 
@@ -125,3 +131,83 @@ def test_support_days_are_counted_in_local_time_too() -> None:
     ]
     cells = summarise_cells(samples, tz="America/New_York")
     assert cells[TimeCell.OFF].support_days == 1
+
+
+# ---------------------------------------------------------------------------
+# The hour-of-week expectation
+# ---------------------------------------------------------------------------
+
+_MONDAY = datetime(2026, 8, 3, tzinfo=UTC)
+
+
+def test_the_hour_of_the_week_counts_from_monday_midnight_local() -> None:
+    assert hour_of_week(_MONDAY, tz="UTC") == 0
+    assert hour_of_week(_MONDAY + timedelta(days=6, hours=23), tz="UTC") == 167
+    # 00:00 UTC on a Monday is 20:00 on the Sunday in New York.
+    assert hour_of_week(_MONDAY, tz="America/New_York") == 6 * 24 + 20
+
+
+def test_zero_filled_fills_the_quiet_hours_between_the_first_and_the_last() -> None:
+    start, series = zero_filled({_MONDAY + timedelta(hours=1): 5, _MONDAY + timedelta(hours=4): 2})
+    assert start == _MONDAY + timedelta(hours=1)
+    assert series == [5.0, 0.0, 0.0, 2.0]
+    assert zero_filled({}) == (None, [])
+
+
+def test_the_expected_count_is_the_median_of_its_own_hour_of_the_week() -> None:
+    counts = [100.0 if n % HOURS_PER_WEEK != 9 else 1000.0 for n in range(4 * HOURS_PER_WEEK)]
+    seasonal = seasonal_baseline(_MONDAY, counts, tz="UTC")
+    assert seasonal.expected[9] == 1000.0
+    assert seasonal.expected[10] == 100.0
+    assert seasonal.samples[9] == 4
+    assert seasonal.support_days == 28
+    # Every sample sits on its own median: the pooled MAD is zero, and the
+    # floor is the square root of the expected count.
+    assert seasonal.mad == 0.0
+    assert seasonal.sigma(10) == 10.0
+
+
+def test_a_zero_expectation_with_no_spread_is_unmeasurable() -> None:
+    """Negative control: an hour that never held a document, on a host whose
+    hours never vary, has no dispersion to read. It is None, never zero."""
+    counts = [0.0 if n % 24 < 8 else 50.0 for n in range(2 * HOURS_PER_WEEK)]
+    seasonal = seasonal_baseline(_MONDAY, counts, tz="UTC")
+    assert seasonal.expected[3] == 0.0
+    assert seasonal.sigma(3) is None
+    assert seasonal.sigma(12) == math.sqrt(50.0)
+
+
+def test_the_pooled_spread_reads_every_hour_against_its_own_median() -> None:
+    counts = [100.0 + (n // HOURS_PER_WEEK) * 10.0 for n in range(4 * HOURS_PER_WEEK)]
+    seasonal = seasonal_baseline(_MONDAY, counts, tz="UTC")
+    # Each hour holds 100, 110, 120, 130: a median of 115 and residuals of 5 and 15.
+    assert seasonal.expected[0] == 115.0
+    assert seasonal.mad == 10.0
+    assert seasonal.sigma(0) == 10.0 / 0.6745
+
+
+def test_sparse_samples_give_the_same_expectation_as_the_series() -> None:
+    """The tier 3 silence detector reads the same hours in earlier weeks only.
+    The helper it calls is the arithmetic of the series, not a second copy."""
+    counts = [100.0 + (n // HOURS_PER_WEEK) * 10.0 for n in range(4 * HOURS_PER_WEEK)]
+    whole = seasonal_baseline(_MONDAY, counts, tz="UTC")
+    # Hours 9 and 10 of each Monday, out of order.
+    hours = [w * HOURS_PER_WEEK + h for w in (3, 0, 2, 1) for h in (10, 9)]
+    sparse = seasonal_from_samples(
+        ((_MONDAY + timedelta(hours=n), counts[n]) for n in hours), tz="UTC"
+    )
+    assert sparse.expected[9] == whole.expected[9] == 115.0
+    assert sparse.expected[10] == whole.expected[10]
+    assert sparse.expected[11] is None
+    assert sparse.samples[9] == 4
+    assert sparse.mad == whole.mad == 10.0
+
+
+def test_an_excluded_window_is_left_out_of_the_expectation() -> None:
+    counts = [100.0] * (4 * HOURS_PER_WEEK)
+    counts[HOURS_PER_WEEK + 9] = 5000.0
+    window = (_MONDAY + timedelta(weeks=1, hours=8), _MONDAY + timedelta(weeks=1, hours=11))
+    learnt = seasonal_baseline(_MONDAY, counts, tz="UTC")
+    clean = seasonal_baseline(_MONDAY, counts, tz="UTC", exclude=[window])
+    assert learnt.samples[9] == 4 and clean.samples[9] == 3
+    assert clean.expected[9] == 100.0

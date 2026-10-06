@@ -16,6 +16,8 @@ describe('kindLabel', () => {
     expect(kindLabel('prior_no_baseline')).toBe('finding with no benign baseline');
     expect(kindLabel('catalog_match')).toBe('analytic match');
     expect(kindLabel('hunt_finding')).toBe('hunt finding');
+    expect(kindLabel('telemetry_silence')).toBe('telemetry plane silent');
+    expect(kindLabel('logon_chain')).toBe('logon chain');
   });
 
   it('prefers the label the API sends', () => {
@@ -53,5 +55,8 @@ describe('sourceLabel', () => {
     expect(sourceLabel('catalog')).toBe('catalog');
     expect(sourceLabel('alert')).toBe('alert');
     expect(sourceLabel('hunt')).toBe('hunt');
+    expect(sourceLabel('model')).toBe('model');
+    expect(sourceTitle('model')).toContain('learned detector');
+    expect(sourceLabel('model', true)).toBe('shadow');
   });
 });

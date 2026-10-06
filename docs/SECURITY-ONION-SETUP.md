@@ -1,9 +1,8 @@
 # Security Onion account requirements
 
-soc-ai connects to a Security Onion 3.0 grid in 3 distinct ways, and each way needs a
-*different* privilege. SO means Security Onion in this document. A wrong privilege is the
-largest single source of install-time troubleshooting. This document states what the
-account behind each path needs.
+soc-ai connects to a Security Onion 3.0 grid in 3 ways. Each way needs a different
+privilege. SO means Security Onion in this document. A wrong privilege is the most common
+install problem. This document states what the account behind each path needs.
 
 | Path | What it does | How it authenticates | Privilege needed |
 |------|--------------|----------------------|------------------|
@@ -16,7 +15,7 @@ The rest of this document explains each row. The network comes first.
 
 ---
 
-## 0. Pinhole soc-ai's IP in Security Onion's firewall
+## 0. Firewall pinhole for the soc-ai host
 
 soc-ai's host must *reach* the grid before any credential matters. Security Onion
 firewalls all of its services by default. A host outside the allow-list cannot open a
@@ -32,25 +31,25 @@ Add soc-ai's source IP to SO's firewall so it can reach:
 - **A sensor over SSH, TCP 22**, only if you enable PCAP fetch.
 
 **Allow-list the host IP under Docker.** The default Docker bridge network NATs the
-container's traffic out of the Docker host's address, so SO sees the Docker host's IP.
-Pinhole that address. An internal `172.x` container address does not work. A
+traffic of the container out of the address of the Docker host. SO then sees the IP of the
+Docker host. Pinhole that address. An internal `172.x` container address does not work. A
 host-networked deployment uses the host IP anyway. This rule holds for both methods
 below.
 
 **Recommended: use the SOC web UI.** On the SO manager, open Administration →
 Configuration → Firewall. Pick a host group that may reach Elasticsearch REST and the
 analyst and web ports, or add one. On a stock SO 3.0 grid the `analyst` host group
-covers the web UI. A normal analyst workstation lacks access to
-Elasticsearch on `:9200`, and soc-ai needs that access, so confirm that your group opens
-`9200`. Add soc-ai's source IP to that group and apply the change. This path is
+covers the web UI. A normal analyst workstation has no access to Elasticsearch on
+`:9200`. soc-ai needs that access. Confirm that your group opens `9200`. Add soc-ai's
+source IP to that group and apply the change. This path is
 supported, and it survives an upgrade.
 
-An equivalent CLI exists. The host-group semantics changed across SO versions, so the
-exact group name is grid-specific. Prefer the UI above unless you already know the host
+An equivalent CLI exists. The host-group semantics changed across SO versions. The
+exact group name is therefore grid-specific. Prefer the UI above unless you already know the host
 groups of your grid.
 
 ```bash
-# <hostgroup> is grid-specific — list yours first, then add the IP to one that
+# <hostgroup> is grid-specific. List yours first, then add the IP to one that
 # opens Elasticsearch REST (9200) and the analyst/web ports:
 sudo so-firewall list-hostgroups       # inspect the available groups (newer SO builds)
 sudo so-firewall includehost <hostgroup> <soc-ai-host-ip>
@@ -69,7 +68,7 @@ A *timeout* points at the firewall.
 
 ---
 
-## 1. Reads go through Elasticsearch basic auth
+## 1. Read access through Elasticsearch basic auth
 
 soc-ai reads alerts and enrichment context from Elasticsearch with the `ES_USERNAME` and
 `ES_PASSWORD` basic-auth credentials in `.env`. These credentials are normally your SO
@@ -80,8 +79,8 @@ analyst login. The account needs:
   `EVENTS_INDEX_PATTERN=logs-*` on a single-node grid. On a multi-node or distributed
   deployment the pattern is `*:logs-*` for cross-cluster search. Set the pattern in
   `.env`. `setup.sh` detects the cluster prefix and writes the concrete value. The old
-  `*:so-*` form is wrong, because it matches the old-style `so-*` admin indices and not
-  the `logs-*` data streams, so the alerts console comes up empty.
+  `*:so-*` form is wrong. It matches the old-style `so-*` admin indices. It misses the
+  `logs-*` data streams, so the alert queue in the console comes up empty.
 
   **Leave it as `logs-*`.** The grant must cover every data stream that soc-ai reads, and
   the pattern must cover them too. Some of those data streams do not belong to Security
@@ -95,10 +94,10 @@ triages with no extra grant.
 
 ---
 
-## 2. Write-back goes through the SO *web API*
+## 2. Write-back through the SO web API
 
-Acknowledging an alert, escalating it to a case and adding a case comment do not write
-to Elasticsearch directly. They go through Security Onion's own web API, for example
+An acknowledge, an escalate to a case and a case comment do not write to Elasticsearch
+directly. They go through Security Onion's own web API, for example
 `POST /api/events/ack`. The SO web UI calls that same endpoint if you click the bell
 icon. Your SO login authenticates the call through a Kratos session cookie.
 
@@ -119,26 +118,26 @@ Two consequences:
 This path replaces the older, paywalled SO Connect API. The web path is always available
 on an OSS grid.
 
-### Security Onion 3.3 needs the browser login flow
+### Browser login flow for Security Onion 3.3
 
-Kratos offers two login flows. The API flow returns a session token, which the caller
-sends in an `X-Session-Token` header. The browser flow returns a login page document
-with a CSRF token, and it sets an `ory_kratos_session` cookie that the caller sends on
-every later request.
+Kratos offers two login flows. The API flow returns a session token. The caller sends
+the token in an `X-Session-Token` header. The browser flow returns a login page document
+with a CSRF token. It also sets an `ory_kratos_session` cookie, and the caller sends that
+cookie on every later request.
 
 Security Onion 3.3 stopped accepting the API-flow session token. The login itself still
 succeeds, so nothing looks wrong until the first write. Then SOC refuses the session on
-every call with HTTP 401 and the reason "Missing or invalid authorization header for
+every call with HTTP 401. The reason reads "Missing or invalid authorization header for
 bearer token". Acknowledge, escalate, case creation and case comments all fail that way.
 Reads keep working, because they read Elasticsearch with the `ES_USERNAME` credential.
 
-soc-ai now logs in the way the Security Onion web interface does. It reads the login flow
+soc-ai now logs in the way the Security Onion web UI does. It reads the login flow
 document, submits the credentials with the flow's CSRF token, and lets its cookie jar
 carry the session cookie. The srv-token handling and `SO_KRATOS_PATH_PREFIX` are
 unchanged.
 
-One build works on every Security Onion release. The setting Security Onion login flow
-(`so_login_flow`) takes three values:
+One build works on every Security Onion release. The `so_login_flow` setting takes three
+values. The console labels it Security Onion login flow.
 
 | Value | What it does |
 |---|---|
@@ -150,22 +149,27 @@ One build works on every Security Onion release. The setting Security Onion logi
 SO_LOGIN_FLOW=auto
 ```
 
-`auto` falls back for four reasons: the browser endpoint is absent, the flow document
-holds no CSRF token, the login answers a 4xx that is not a credential rejection, or SOC
-refuses the cookie session on `/api/info` while it accepts the same account's API-flow
-session. A wrong password never causes the fallback, because the same password fails on
-both flows. soc-ai keeps the flow that worked for the life of the process, so a fallback
-costs one extra login. The setting applies at the next restart, and one log line names
-the flow at the first login that Security Onion accepts.
+`auto` falls back to the API flow in four cases:
+
+- The browser endpoint is absent.
+- The flow document holds no CSRF token.
+- The login answers a 4xx that is not a credential rejection.
+- SOC refuses the cookie session on `/api/info` and accepts the API-flow session of the
+  same account.
+
+A wrong password never causes the fallback, because the same password fails on both
+flows. soc-ai keeps the flow that worked for the life of the process. A fallback therefore
+costs one extra login. The setting applies at the next restart. One log line names the
+flow at the first login that Security Onion accepts.
 
 `soc-ai doctor` names the flow in use on its `security onion` PASS line. The header status
 indicator in the console says the same.
 
 ---
 
-## 3. The audit log needs an Elasticsearch write grant
+## 3. Elasticsearch write grant for the audit log
 
-This is the requirement that costs people an afternoon.
+This requirement costs the most install time.
 
 soc-ai keeps a tamper-evident audit log. The log is a hash-chained record of every
 action that soc-ai takes. soc-ai writes it directly to Elasticsearch, into daily indices
@@ -182,15 +186,16 @@ The audit write authenticates as the Elasticsearch basic-auth identity in `ES_US
 It does not use the Kratos web login. Grant the `soc-ai-audit-*` privilege to that ES
 account.
 
-### Why this breaks ack and escalate
+### Effect on ack and escalate
 
 soc-ai ships with `AUDIT_FAIL_CLOSED=true`. That is the 1.x default. Under fail-closed,
 soc-ai writes the audit record for a *mutating* action before the action proceeds. If the
 audit write returns a 403, soc-ai aborts the mutating action. Ack, escalate-to-case and
-add-comment then fail silently. You lose the action as well as its forensic record.
+add-comment then fail, and they appear to do nothing. You lose the action and its
+forensic record.
 
-Read-only triage still works. soc-ai absorbs an audit failure on a read by design. An
-investigation still completes, and it loses its audit entries.
+Read-only triage still works. By design, an audit failure on a read does not stop the
+read. An investigation still completes, and it loses its audit entries.
 
 ### Two fixes
 
@@ -200,19 +205,19 @@ privileges are `auto_configure`, `create_index`, `index`, `read`, `view_index_me
 and `write`. The script also creates today's audit index.
 
 ```bash
-# From the soc-ai repo root (so the relative script path resolves), piping the
-# script over SSH to the SO manager:
+# Run from the soc-ai repo root, so that the relative script path resolves. This
+# pipes the script over SSH to the SO manager:
 ssh <admin>@<so-manager> 'sudo bash -s' < scripts/setup-audit-index.sh
 
-# Or interactively on the SO box itself (copy the script over first — e.g.
-# `scp scripts/setup-audit-index.sh <admin>@<so-manager>:` , or on a Docker
-# deploy `docker compose cp soc-ai:/opt/soc-ai/scripts/setup-audit-index.sh .`):
+# Or run it on the SO box itself. Copy the script over first, for example with
+# `scp scripts/setup-audit-index.sh <admin>@<so-manager>:`. On a Docker deploy, use
+# `docker compose cp soc-ai:/opt/soc-ai/scripts/setup-audit-index.sh .`:
 sudo bash setup-audit-index.sh
 ```
 
 The script uses `so-elasticsearch-query`. That command authenticates against the local ES
-through the root-only `curl.config`, so the script must run on the manager as root or
-under sudo. After the script runs, test an ack or an escalate again. The 403 disappears
+through the root-only `curl.config`. Run the script on the manager as root or under
+sudo. After the script runs, test an ack or an escalate again. The 403 disappears
 immediately, and the action goes through.
 
 **The trap: the Superuser toggle.** SO does not expose Elasticsearch role editing in its
@@ -223,13 +228,13 @@ that account can then read and write *everything* in Elasticsearch. Prefer the
 least-privilege script.
 
 If you use the toggle, allow for the ~15-minute Salt propagation lag. Salt pushes the
-role change, so the change is not effective at the moment you set the switch. Set the
+role change. The change therefore does not apply at the moment you set the switch. Set the
 switch, then wait ~15 minutes before you test again. An immediate retry looks like a
 toggle that did nothing. That is the most common false "it's still broken" report.
 
 ---
 
-## 4. PCAP fetch uses SSH
+## 4. SSH access for PCAP fetch
 
 PCAP fetch is optional, and it uses no ES role and no SO role. If you enable full
 packet-capture retrieval with `PCAP_ENABLED=true`, soc-ai connects to a sensor over SSH
@@ -248,8 +253,8 @@ This deploy triages only. It has no ack, no escalate and no audit log. The stock
 `analyst` account is enough. You need no grant script and no superuser toggle.
 
 - `ES_USERNAME` and `ES_PASSWORD` hold your SO analyst login.
-- Nothing else is required. You get full investigations and recommendations. The UI shows
-  the recommended write actions, and you apply them by hand in SO.
+- Nothing else is required. You get full investigations and recommendations. The console
+  shows the recommended write actions, and you apply them by hand in SO.
 - `AUDIT_FAIL_CLOSED=false` removes the audit 403 noise from the logs, and it grants
   nothing. Under that setting a failed audit write no longer blocks a write. Use it only
   on a read-only deploy.
@@ -346,8 +351,8 @@ To let soc-ai ack, escalate and comment, and to keep a forensic trail:
 > creation and case comments all fail. The role grants are not the cause.
 >
 > soc-ai 1.5.0 and later log in with the Kratos browser flow and send the session cookie.
-> On `SO_LOGIN_FLOW=auto`, the default, soc-ai runs the browser flow first and needs no
-> change. Set `SO_LOGIN_FLOW=browser` to force it, and restart. Section 2 covers the three
+> `SO_LOGIN_FLOW=auto` is the default. With it, soc-ai runs the browser flow first and
+> needs no change. Set `SO_LOGIN_FLOW=browser` to force it, and restart. Section 2 covers the three
 > values.
 >
 > Confirm the fix with `soc-ai doctor`. Its `security onion` PASS line names the flow in
@@ -355,16 +360,16 @@ To let soc-ai ack, escalate and comment, and to keep a forensic trail:
 
 > **The log fills with `Kratos login flow init failed: Expecting value: line 1 column 1`.**
 >
-> Security Onion sheds repeated logins by redirecting them to its own login page. Older
+> Security Onion answers repeated logins with a redirect to its own login page. Older
 > soc-ai builds read that page as JSON and reported a login that never started. That
 > report hid the real cause. The message now says that SO throttled the login and gives
 > the status code.
 >
-> A refused session now backs off. The hold starts at 30 seconds and doubles to a ceiling
-> of ten minutes, and the next accepted call clears it. Fix the login flow above, then
-> wait one hold period for the log to go quiet.
+> A refused session now backs off. The hold starts at 30 seconds and doubles up to ten
+> minutes. The next accepted call clears it. Fix the login flow above. Then wait one hold
+> period, and the log stops.
 
-> **ack/escalate "succeeds" in the UI but the alert is unchanged in SO**
+> **ack/escalate "succeeds" in the console, and the alert is unchanged in SO**
 >
 > If the audit write fails under `AUDIT_FAIL_CLOSED=true`, soc-ai aborts the action
 > before it reaches SO. See the entry above. Fix the audit grant first.

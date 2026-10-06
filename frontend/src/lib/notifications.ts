@@ -72,7 +72,7 @@ export function formatNotificationTitle(title: string): string {
  */
 export function formatNotificationWhen(when: string | null | undefined): string | null {
   if (!when) return null;
-  return when === 'now' ? 'just now' : `${when} ago`;
+  return when === 'now' ? 'now' : `${when} ago`;
 }
 
 // ── What produced this notification ────────────────────────────────────────

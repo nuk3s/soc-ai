@@ -65,6 +65,14 @@ vi.mock('../lib/api', async (importOriginal) => ({
   getModelFitness: vi.fn().mockResolvedValue({ grade: 'pass', model: 'x', legs: [], detail: 'ok' }),
   getModelBattery: vi.fn(),
   verifyAuditChain: vi.fn(),
+  getPreflightDetail: vi.fn().mockResolvedValue({
+    checked_at: new Date().toISOString(),
+    rows: [
+      { name: 'estate model', status: 'INFO', detail: 'off. The ml extra is installed.', hint: '' },
+      { name: 'prompt assets', status: 'PASS', detail: '2 assets are present', hint: '' },
+    ],
+  }),
+  refreshPreflight: vi.fn(),
 }));
 
 import { Config } from './Config';
@@ -488,5 +496,15 @@ describe('Diagnostics — Verify audit chain', () => {
     expect(await screen.findByText(/could not verify/i)).toBeTruthy();
     expect(screen.getByText(/forbidden/i)).toBeTruthy();
     expectOnlyOutcome('error');
+  });
+});
+
+// The INFO and PASS doctor rows had no console surface (range dogfood
+// 2026-10-05, D3). The Diagnostics pane reads them when it opens.
+describe('Diagnostics, the doctor list', () => {
+  it('shows the INFO and PASS rows when the pane opens', async () => {
+    renderDiagnostics();
+    expect(await screen.findByTestId('doctor-row-estate model')).toBeTruthy();
+    expect(screen.getByTestId('doctor-row-prompt assets')).toBeTruthy();
   });
 });

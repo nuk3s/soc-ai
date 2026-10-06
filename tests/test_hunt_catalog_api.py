@@ -119,6 +119,7 @@ def test_every_catalog_spec_appears_even_when_never_swept(client: TestClient) ->
         "evaluator": "match",
         "tier": "shipped",
         "status": "live",
+        "held_by_system": None,
         "coverage": None,
         "last_swept_at": None,
         "last_fired_at": None,
@@ -434,9 +435,52 @@ def test_each_spec_reports_which_loop_runs_it(client: TestClient) -> None:
     assert by_id, "the catalog returned no specs"
 
     evaluators = {s["evaluator"] for s in body["specs"]}
-    assert evaluators == {"match", "profile"}, evaluators
+    assert evaluators == {"match", "profile", "model"}, evaluators
     assert by_id["identity-4769-rc4-service-ticket"]["evaluator"] == "match"
     assert by_id["prior-hypervisor-novel-served-port"]["evaluator"] == "profile"
+    assert by_id["model-cross-plane-silence"]["evaluator"] == "model"
+
+
+def test_a_model_spec_reads_the_prior_sweep_trail(client: TestClient) -> None:
+    """A model analytic runs in the prior sweep. Its trail fields come from
+    that sweep: read from the catalog sweep's table, it showed no run under
+    an hourly sweep that ran it."""
+    import asyncio
+
+    from soc_ai.hunting.prior_sweep import PriorSweep
+    from soc_ai.hunting.priors import PriorResult
+    from soc_ai.store import prior_spec_runs
+
+    spec_id = "model-cross-plane-silence"
+    before = {s["id"]: s for s in client.get("/api/v1/hunt-catalog").json()["specs"]}
+    assert before[spec_id]["last_swept_at"] is None
+    assert before[spec_id]["coverage"] is None
+
+    sweep = PriorSweep(
+        results=(
+            PriorResult(
+                spec_id=spec_id, entity_kind="host", entity_key="app-01", coverage="measured"
+            ),
+            PriorResult(
+                spec_id=spec_id, entity_kind="host", entity_key="app-02", coverage="unmeasurable"
+            ),
+        ),
+        evaluated_specs=(spec_id,),
+    )
+
+    async def _seed() -> None:
+        async with client.app.state.db_sessionmaker() as db:
+            await prior_spec_runs.record_sweep(db, sweep, shadow_ids=frozenset({spec_id}))
+
+    asyncio.run(_seed())
+    after = {s["id"]: s for s in client.get("/api/v1/hunt-catalog").json()["specs"]}
+    model = after[spec_id]
+    assert model["last_swept_at"] is not None
+    assert model["sweeps_24h"] == 1
+    assert model["shadow_24h"] == 1
+    cov = model["coverage"]
+    # Unmeasurable folds into blind on the trail's four columns.
+    assert (cov["measured"], cov["blind"], cov["shadow"]) == (1, 1, True)
 
 
 def test_a_profile_spec_cannot_set_the_header_timestamp(client: TestClient) -> None:
@@ -472,19 +516,30 @@ def test_a_profile_spec_carries_the_prior_sweeps_coverage(client: TestClient) ->
     from soc_ai.store import prior_spec_runs
 
     spec_id = "prior-hypervisor-novel-served-port"
+    reason = "no served port baseline exists for this host yet."
     sweep = PriorSweep(
         results=tuple(  # noqa: RUF005
             PriorResult(
-                spec_id=spec_id, entity_kind="host", entity_key=f"10.0.0.{n}", coverage="blind"
+                spec_id=spec_id,
+                entity_kind="host",
+                entity_key=f"10.0.0.{n}",
+                coverage="blind",
+                note=reason,
             )
             for n in range(1, 6)
         )
         + (
+            # Negative control: the note of an entity that is not blind is no
+            # blind reason.
             PriorResult(
                 spec_id=spec_id,
                 entity_kind="host",
                 entity_key="10.0.0.9",
                 coverage="not_applicable",
+                note=(
+                    "the analytic applies to the role hypervisor. "
+                    "This host has the role workstation."
+                ),
             ),
         ),
         evaluated_specs=(spec_id, "prior-workstation-account-first-logon-to-dc"),
@@ -502,11 +557,14 @@ def test_a_profile_spec_carries_the_prior_sweeps_coverage(client: TestClient) ->
     assert cov["blind"] == 5 and cov["not_applicable"] == 1 and cov["measured"] == 0
     assert cov["shadow"] is True
     assert cov["last_run_at"] is not None
+    # The count says how many. The reason says why, after the count it covers.
+    assert cov["blind_reason"] == f"5 of 5 blind hosts: {reason}"
 
     # A spec the sweep considered but had nothing to score gets a row of zeros
     # -- a fact about the run -- rather than reading as never-run.
     zeros = by_id["prior-workstation-account-first-logon-to-dc"]["coverage"]
     assert zeros is not None and zeros["measured"] == 0 and zeros["blind"] == 0
+    assert zeros["blind_reason"] is None
 
     # A match spec has no prior coverage at all.
     assert by_id[DCSYNC]["coverage"] is None
@@ -641,7 +699,8 @@ def test_a_match_spec_still_reads_the_catalog_sweeps_error(client: TestClient) -
 
 def test_a_coverage_at_the_recent_cap_says_it_is_capped(client: TestClient) -> None:
     """H5. A served-port prior reported 500 evaluations on a 336-host estate.
-    500 is the recent read's cap, and the totals have to say so."""
+    500 was the recent read's cap, and the totals have to say so. The cap is
+    the read's ceiling now, 20,000."""
     from soc_ai.hunting.prior_sweep import RECENT_MAX_ENTITIES
 
     now = _now()

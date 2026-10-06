@@ -1,6 +1,7 @@
 // The Hosts list URL: one spelling for the list, the cards and the breadcrumb.
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
+  agentStaleTitle,
   listHref,
   listUrlToReturnTo,
   machineHref,
@@ -90,5 +91,36 @@ describe('the way back', () => {
     expect(listUrlToReturnTo()).toBe('/hosts');
     sessionStorage.setItem('soc-ai:hosts-list:url', 'https://example.test/hosts');
     expect(listUrlToReturnTo()).toBe('/hosts');
+  });
+});
+
+// The list reads the agent state from the last sweep (range dogfood
+// 2026-10-05, M5 and C8). A report older than a day is marked.
+describe('agentStaleTitle', () => {
+  const NOW = Date.now();
+  const hoursAgo = (h: number) => new Date(NOW - h * 3_600_000).toISOString();
+
+  it('marks a report older than 24 h and says the sweep is off and when it ran', () => {
+    const title = agentStaleTitle(hoursAgo(61), { scheduleEnabled: false, staleHours: 61.4 }, NOW);
+    expect(title).toBe(
+      'The agent last reported 61 h ago. The list shows the state at the last sweep. ' +
+        'Automatic sweeps are off. The last sweep ran 61 h ago. The machine page shows live activity.',
+    );
+  });
+
+  it('says when the sweep ran and nothing about a schedule that is on', () => {
+    const title = agentStaleTitle(hoursAgo(30), { scheduleEnabled: true, staleHours: 2 }, NOW);
+    expect(title).toContain('The last sweep ran 2 h ago.');
+    expect(title).not.toContain('Automatic sweeps are off.');
+  });
+
+  it('marks no report from the last 24 h', () => {
+    expect(agentStaleTitle(hoursAgo(23), { scheduleEnabled: false, staleHours: 61 }, NOW)).toBeNull();
+    expect(agentStaleTitle(hoursAgo(1), { scheduleEnabled: false, staleHours: 61 }, NOW)).toBeNull();
+  });
+
+  it('marks nothing it cannot date', () => {
+    expect(agentStaleTitle(null, { scheduleEnabled: false, staleHours: 61 }, NOW)).toBeNull();
+    expect(agentStaleTitle('not a time', { scheduleEnabled: false, staleHours: 61 }, NOW)).toBeNull();
   });
 });

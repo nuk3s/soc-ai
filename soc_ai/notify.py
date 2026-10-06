@@ -56,6 +56,7 @@ NOTIFY_KINDS: tuple[str, ...] = (
     "quality_regression",
     "audit_chain_break",
     "tls_expiry",
+    "oracle_paused",
     "test",
 )
 
@@ -127,7 +128,7 @@ def _build_payload(event: NotifyEvent, fmt: str) -> dict[str, Any]:
     ``slack``/``matrix`` collapse to a single human line; ``json`` (and any
     unknown format, defensively) is the generic structured dict.
     """
-    line = f"{event.title} — {event.body}"
+    line = f"{event.title}. {event.body}"
     if event.url:
         line = f"{line} {event.url}"
     if fmt == "slack":
@@ -175,6 +176,7 @@ def _trigger_enabled(settings: Any, kind: str) -> bool:
         "quality_regression": "notify_on_quality_regression",
         "audit_chain_break": "notify_on_audit_chain_break",
         "tls_expiry": "notify_on_tls_expiry",
+        "oracle_paused": "notify_on_oracle_failure",
     }.get(kind)
     if flag is None:
         return False
@@ -398,7 +400,7 @@ def event_for_quality_regression(
     if not reasons:
         return None
     mode_label = (
-        "The oracle graded this run." if mode == "graded" else "soc-ai measured this run locally."
+        "The Oracle graded this run." if mode == "graded" else "soc-ai measured this run locally."
     )
     body = f"The nightly micro-eval found a regression. {mode_label} " + ". ".join(reasons)
     return NotifyEvent(
@@ -490,6 +492,46 @@ def event_for_tls_expiry(
         body=body,
         url=f"/app/config?band={band}#tls",
         severity=severity,
+    )
+
+
+def oracle_pause_text(*, pause_reason: str, until: str | None) -> tuple[str, str]:
+    """The title and the body of an Oracle pause, for the bell and the webhook."""
+    when = f"{until.replace('T', ' ').replace('Z', '')} UTC" if until else "the reset time"
+    title = f"Oracle calls paused until {when}"
+    if pause_reason == "quota":
+        body = (
+            "The Oracle route answered with a usage limit. soc-ai makes no Oracle call "
+            f"until {when}. Each escalation in the pause keeps its local verdict and is "
+            "recorded as oracle_skipped."
+        )
+    else:
+        body = (
+            "The Oracle route answered with three server errors in a row. soc-ai makes "
+            f"no Oracle call until {when}. Each escalation in the pause keeps its local "
+            "verdict and is recorded as oracle_skipped."
+        )
+    return title, body
+
+
+def event_for_oracle_paused(
+    *, pause_reason: str, until: str | None, settings: Any
+) -> NotifyEvent | None:
+    """The Oracle route paused, or None when the trigger is off.
+
+    Fired once, when the pause opens (soc_ai.oracle.breaker returns the
+    transition). The permalink is the Oracle section of the config page. The
+    pause start rides in the URL, so the hourly dedup keys per pause.
+    """
+    if not bool(getattr(settings, "notify_on_oracle_failure", False)):
+        return None
+    title, body = oracle_pause_text(pause_reason=pause_reason, until=until)
+    return NotifyEvent(
+        kind="oracle_paused",
+        title=title,
+        body=body,
+        url=f"/app/config?oracle_paused={until or ''}#oracle",
+        severity="warning",
     )
 
 

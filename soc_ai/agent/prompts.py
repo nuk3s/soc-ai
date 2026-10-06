@@ -17,6 +17,8 @@ investigator's prompt only (the synthesizer never writes OQL).
 from __future__ import annotations
 
 import logging
+import re
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -824,15 +826,178 @@ def oql_primer_block(flavor: str = "triage") -> str:
     return "\n\n" + _load_oql_primer(flavor)
 
 
-def build_investigator_prompt(*, emits_report: bool = False) -> str:
+# ── Plane-conditional sections (stage 1, item 5) ─────────────────────────────
+#
+# The standard class sends only the sections the alert's planes make useful
+# (soc_ai.agent.budget.alert_planes). Each entry names a section by the start
+# of its bullet or step and the planes that keep it: the section stays when the
+# alert has ANY of them. A section with no entry always stays. The deep class
+# and every caller that passes no planes get the whole prompt, unchanged.
+_EVIDENCE_BULLET_PLANES: dict[str, frozenset[str]] = {
+    "**Volume and confirmed behavior": frozenset({"network"}),
+    "**A reputation hit plus a completed connection": frozenset({"external"}),
+    "**Internal-to-internal is NOT exculpatory": frozenset({"windows"}),
+    "**Stacked first-seen on an attack-class signature": frozenset({"windows", "hostile"}),
+    "**A behavioral-summary aggregate": frozenset({"network"}),
+    "**A decoy has no benign baseline": frozenset({"decoy"}),
+    "**Never infer an indicator's owner": frozenset({"external"}),
+    "**ICMP echo direction is decisive": frozenset({"icmp"}),
+}
+_STEP_PLANES: dict[str, frozenset[str]] = {
+    "**Pivot via `network.community_id`**": frozenset({"network"}),
+    "**Research an external indicator": frozenset({"external"}),
+}
+# Hard rules about one tool stay only while the loop sees that tool.
+_HARD_RULE_TOOLS: dict[str, str] = {
+    "**`t_get_pcap` gives real packet evidence": "t_get_pcap",
+    "**`t_decode_payload` decodes bytes": "t_decode_payload",
+}
+# The OQL primer's Active Directory examples (Kerberoasting, PsExec).
+_PRIMER_WINDOWS_START = "### 11. Kerberoasting"
+_PRIMER_WINDOWS_END = "### 13. Successful SSH logins"
+
+
+def _split_top_bullets(block: str) -> tuple[str, list[str]]:
+    """Split a block into its head and its top-level ``- **`` bullets.
+
+    ``head + "\\n".join(bullets)`` gives the block back byte for byte.
+    """
+    idx = block.find("\n- **")
+    if idx < 0:
+        return block, []
+    head, body = block[: idx + 1], block[idx + 1 :]
+    parts = body.split("\n- **")
+    return head, [parts[0], *("- **" + p for p in parts[1:])]
+
+
+def _rejoin(head: str, kept: list[str], trailing: str, sep: str = "\n") -> str:
+    """Join kept sections, ending with the block's own trailing newlines."""
+    if not kept:
+        return head.rstrip("\n") + trailing
+    body = [*kept[:-1], kept[-1].rstrip("\n")]
+    return head + sep.join(body) + trailing
+
+
+def _keep_bullets(block: str, keep: Callable[[str], bool]) -> str:
+    head, bullets = _split_top_bullets(block)
+    if not bullets:
+        return block
+    trailing = block[len(block.rstrip("\n")) :]
+    return _rejoin(head, [b for b in bullets if keep(b)], trailing)
+
+
+def _planes_keep(
+    prefixes: dict[str, frozenset[str]], planes: frozenset[str]
+) -> Callable[[str], bool]:
+    def keep(section: str) -> bool:
+        body = section.lstrip("- ").lstrip("0123456789. ")
+        for prefix, wanted in prefixes.items():
+            if body.startswith(prefix):
+                return bool(wanted & planes)
+        return True
+
+    return keep
+
+
+def _keep_steps(block: str, planes: frozenset[str]) -> str:
+    """Keep the numbered steps the planes need, renumbered from 1."""
+    pieces = re.split(r"\n(?=\d+\. \*\*)", block)
+    head, steps = pieces[0], pieces[1:]
+    if not steps:
+        return block
+    keep = _planes_keep(_STEP_PLANES, planes)
+    kept = [s for s in steps if keep(s)]
+    renumbered = [re.sub(r"^\d+\.", f"{i}.", s, count=1) for i, s in enumerate(kept, start=1)]
+    trailing = block[len(block.rstrip("\n")) :]
+    return _rejoin(head + "\n", renumbered, trailing)
+
+
+def _trim_primer(primer: str, planes: frozenset[str]) -> str:
+    if "windows" in planes:
+        return primer
+    start = primer.find(_PRIMER_WINDOWS_START)
+    end = primer.find(_PRIMER_WINDOWS_END)
+    if start < 0 or end <= start:
+        return primer
+    return primer[:start] + primer[end:]
+
+
+def build_investigator_prompt(
+    *,
+    emits_report: bool = False,
+    planes: frozenset[str] | None = None,
+    visible_tools: frozenset[str] | None = None,
+) -> str:
     """Investigator prompt = rubric + OQL primer (only the investigator runs OQL).
 
     ``emits_report`` (W3) swaps in the report-writing rubric: the loop writes
     the ``TriageReport`` itself, so its system prompt says so and carries the
     synthesizer's verdict policy.
+
+    ``planes`` (the standard class, soc_ai.agent.budget.alert_planes) keeps
+    only the sections the alert's planes make useful: no Kerberos and ADMIN$
+    rule and no PsExec example for a flow to the internet, no community_id
+    step for a host log. ``visible_tools`` drops a hard rule about a tool the
+    loop does not see. None, the default, is the whole prompt.
     """
-    rubric = _INVESTIGATOR_REPORT_RUBRIC if emits_report else _INVESTIGATOR_RUBRIC
-    return rubric + _load_oql_primer()
+    if planes is None:
+        rubric = _INVESTIGATOR_REPORT_RUBRIC if emits_report else _INVESTIGATOR_RUBRIC
+        return rubric + _load_oql_primer()
+    evidence = _keep_bullets(VERDICT_EVIDENCE_RULES, _planes_keep(_EVIDENCE_BULLET_PLANES, planes))
+    steps = _keep_steps(_INVESTIGATOR_STEPS, planes)
+
+    def keep_hard_rule(section: str) -> bool:
+        body = section.lstrip("- ")
+        for prefix, tool in _HARD_RULE_TOOLS.items():
+            if body.startswith(prefix):
+                return visible_tools is None or tool in visible_tools
+        return True
+
+    hard_rules = _keep_bullets(_INVESTIGATOR_HARD_RULES, keep_hard_rule)
+    if emits_report:
+        rubric = (
+            _INVESTIGATOR_REPORT_ROLE
+            + WRITING_STYLE_RULE
+            + _stop_rule("TriageReport")
+            + DISCONFIRMING_RECORD_RULE
+            + evidence
+            + steps
+            + _TRIAGE_REPORT_OUTPUT_RULES.replace(
+                "from the investigator's `evidence`.",
+                "from your tool results and the pre-loaded alert.",
+            )
+            + _TRIAGE_REPORT_HARD_RULES
+            + hard_rules
+        )
+    else:
+        rubric = (
+            _INVESTIGATOR_ROLE
+            + WRITING_STYLE_RULE
+            + _stop_rule("InvestigationTranscript")
+            + DISCONFIRMING_RECORD_RULE
+            + steps
+            + _INVESTIGATOR_OUTPUT_TRANSCRIPT
+            + hard_rules
+        )
+    return rubric + _trim_primer(_load_oql_primer(), planes)
+
+
+def format_more_tools_block(deferred: Sequence[str]) -> str:
+    """Name the read tools the standard loop does not see, and how to load one.
+
+    The standard class sends the schemas of the tools the alert's planes make
+    useful. The others stay registered: one ``search_tools`` call with a tool's
+    name loads it for the next turn.
+    """
+    names = sorted({str(n) for n in deferred if n})
+    if not names:
+        return ""
+    listed = ", ".join(f"`{n}`" for n in names)
+    return (
+        "\n## More read tools\n\n"
+        f"These read tools exist and are not loaded: {listed}. To use one, call "
+        "`search_tools` with its name. The tool loads on your next turn.\n"
+    )
 
 
 def build_synthesizer_prompt() -> str:
@@ -1460,6 +1625,45 @@ def case_conditions(
         ),
         rule_content=claims_malware and not rule_body_in_alert(alert),
         playbooks=playbooks_available,
+    )
+
+
+def unresolved_external_indicator(enriched: Any) -> str | None:
+    """The external indicator the web-search condition is about, or None.
+
+    The same predicate :func:`case_conditions` reads for ``web_search``: an
+    enrichment entry that is not internal and that the prefetch enrichment
+    left unanswered. The first such indicator, in the prefetch's order.
+    """
+    enrichments = getattr(enriched, "enrichments", None) or {}
+    for indicator, entry in enrichments.items():
+        if getattr(entry, "internal", None) is False and not _enrichment_answered(entry):
+            text = str(indicator).strip()
+            if text:
+                return text
+    return None
+
+
+def format_prefetched_web_search_block(indicator: str, result: Any) -> str:
+    """The web search the pipeline ran before the loop, for the loop's message.
+
+    The loop used to spend its one tool turn on this search in 87% of
+    production runs, with a condition the code computes. The code now makes
+    the call and hands the loop the result, so the loop does not repeat it.
+    """
+    import json  # noqa: PLC0415 - lazy: only a loop with the condition needs it
+
+    try:
+        body = json.dumps(result, default=str, ensure_ascii=False)
+    except (TypeError, ValueError):
+        body = str(result)
+    return (
+        "\n## Web search already run\n\n"
+        f"soc-ai searched the web for the unresolved external indicator `{indicator}` "
+        "before this loop. The result is below. Do not call `t_web_search` for this "
+        "indicator again. Cite the result as `(tool t_web_search)`. An empty result means "
+        "the reputation is unknown. It is not evidence that the indicator is benign.\n\n"
+        f"```json\n{body}\n```\n"
     )
 
 

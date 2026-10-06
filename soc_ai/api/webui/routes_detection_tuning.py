@@ -8,7 +8,7 @@ from typing import Any
 
 from elastic_transport import TransportError
 from elasticsearch import ApiError
-from fastapi import Depends, HTTPException, Request
+from fastapi import Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from soc_ai.api.deps import get_settings_dep
@@ -20,6 +20,8 @@ from soc_ai.api.webui._shared import (
 from soc_ai.api.webui.routes_alerts import _es_api_error_http, _grid_unavailable
 from soc_ai.config import Settings
 from soc_ai.store import detection_overrides as override_svc
+from soc_ai.store import oracle_ledger
+from soc_ai.store import rule_prior as rule_prior_store
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -43,6 +45,17 @@ class DetectionNominationOut(BaseModel):
     override_fp: int = 0
     chat_resolved: int = 0
     manual_resolved: int = 0
+    # The rule prior's record on this rule over the last 30 days
+    # (soc_ai.agent.rule_prior): alerts it covered, how many real verdicts
+    # agreed and disagreed, covered alerts with no real run, and whether a
+    # disagreement suspends it until an analyst clears it.
+    prior_covered: int = 0
+    prior_agreements: int = 0
+    prior_disagreements: int = 0
+    prior_unchecked: int = 0
+    prior_suspended: bool = False
+    # Why the prior held back on the newest alert of the rule it did not cover.
+    prior_last_reason: str | None = None
 
 
 class DetectionOverrideOut(BaseModel):
@@ -141,10 +154,110 @@ async def get_detection_tuning(
     nominations = await _nominate(request, settings)
     async with request.app.state.db_sessionmaker() as db:
         overrides = await override_svc.list_active(db)
+        prior = await rule_prior_store.stats_by_rule(db, [n["rule_name"] for n in nominations])
     return DetectionTuningOut(
-        nominations=[DetectionNominationOut(**n) for n in nominations],
+        nominations=[
+            DetectionNominationOut(**n, **_prior_fields(prior.get(n["rule_name"])))
+            for n in nominations
+        ],
         overrides=[_override_out(o) for o in overrides],
     )
+
+
+def _prior_fields(stats: rule_prior_store.RulePriorStats | None) -> dict[str, Any]:
+    if stats is None:
+        return {}
+    return {
+        "prior_covered": stats.covered,
+        "prior_agreements": stats.agreements,
+        "prior_disagreements": stats.disagreements,
+        "prior_unchecked": stats.unchecked,
+        "prior_suspended": stats.suspended,
+        "prior_last_reason": stats.last_reason,
+    }
+
+
+class OracleShadowReasonOut(BaseModel):
+    """One reason of one Oracle rule in the shadow tally."""
+
+    rule: str  # 'uncertainty' | 'classic'
+    reason: str
+    count: int
+    # Runs of this row that the other rule sends too.
+    overlap: int
+
+
+class OracleShadowTallyOut(BaseModel):
+    """What the uncertainty rule would send beside what the classic rule sent.
+
+    Read from the ``oracle_shadow`` events of the last ``days`` days. The rows
+    exist only while ``oracle_rule_mode`` is shadow, so ``mode`` rides along:
+    a zero under another mode means no shadow ran, not that the rules agree.
+    """
+
+    mode: str
+    days: int
+    recorded: int
+    would_escalate: int
+    classic: int
+    both: int
+    by_reason: list[OracleShadowReasonOut]
+
+
+@router.get(
+    "/detection-tuning/oracle-shadow",
+    response_model=OracleShadowTallyOut,
+    dependencies=[Depends(require_admin_api)],
+)
+async def get_oracle_shadow_tally(
+    request: Request,
+    settings: Settings = Depends(get_settings_dep),
+    days: int = Query(7, ge=1, le=90),
+) -> OracleShadowTallyOut:
+    """The Oracle rule shadow tally (store only, no grid read)."""
+    async with request.app.state.db_sessionmaker() as db:
+        tally = await oracle_ledger.shadow_tally(db, days=days)
+    return OracleShadowTallyOut(
+        mode=str(settings.oracle_rule_mode),
+        days=tally.days,
+        recorded=tally.recorded,
+        would_escalate=tally.would_escalate,
+        classic=tally.classic,
+        both=tally.both,
+        by_reason=[
+            OracleShadowReasonOut(rule=r.rule, reason=r.reason, count=r.count, overlap=r.overlap)
+            for r in tally.by_reason
+        ],
+    )
+
+
+class RulePriorClearIn(BaseModel):
+    rule_name: str = Field(min_length=1, max_length=512)
+
+
+class RulePriorClearOut(BaseModel):
+    rule_name: str
+    cleared: int
+
+
+@router.post(
+    "/detection-tuning/rule-prior/clear",
+    response_model=RulePriorClearOut,
+    dependencies=[Depends(require_admin_api)],
+)
+async def clear_rule_prior_suspension(
+    request: Request, body: RulePriorClearIn
+) -> RulePriorClearOut:
+    """Clear the rule prior's suspension of a rule after an analyst looked.
+
+    A real run that disagreed with the prior suspends it for the rule. The
+    rows stay on record with the clearance stamped on them. Clearing does not
+    make the prior apply: every other safeguard still decides.
+    """
+    cleared_by = await identify_caller(request)
+    async with request.app.state.db_sessionmaker() as db:
+        cleared = await rule_prior_store.clear_suspension(db, body.rule_name, by=cleared_by)
+    return RulePriorClearOut(rule_name=body.rule_name, cleared=cleared)
 
 
 class DetectionTuningSummaryOut(BaseModel):

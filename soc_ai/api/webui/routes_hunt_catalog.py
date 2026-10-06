@@ -24,6 +24,7 @@ from soc_ai.api.webui._shared import _iso_z, router
 from soc_ai.hunting.catalog_tiers import effective_catalog
 from soc_ai.hunting.prior_sweep import RECENT_MAX_ENTITIES
 from soc_ai.hunting.window import sweep_window
+from soc_ai.store import analytics as analytics_store
 from soc_ai.store import hunt_spec_sweeps as sweeps_svc
 from soc_ai.store import prior_spec_runs
 
@@ -51,6 +52,10 @@ class PriorCoverageOut(BaseModel):
     profiles_built_at: str | None = None
     profiles_stale: bool = False
     profiles_reason: str | None = None
+    # Why the blind entities of this run were blind, when they share one
+    # reason. When they do not, the reason of the most of them with their
+    # count. None when nothing was blind or the run predates the column.
+    blind_reason: str | None = None
     # The recent read returns at most ``recent_cap`` entities per dimension.
     # ``capped`` is true when this run's evaluations reached the cap, so the
     # totals are the cap and not the size of the estate.
@@ -91,6 +96,11 @@ class HuntCatalogSpecOut(BaseModel):
     # reads as one that has simply gone quiet.
     tier: str = "shipped"
     status: str = "live"
+    # The reason of a system demotion that holds this analytic in shadow now.
+    # None when an analyst put it in shadow, or when it is not in shadow.
+    # Operate showed a held analytic with the same "shadow" chip as one an
+    # analyst put there, while the Analytics tab said "held by soc-ai".
+    held_by_system: str | None = None
     # The prior sweep's newest verdict for a ``profile`` spec; None for a
     # ``match`` spec or a profile spec that has never been run.
     coverage: PriorCoverageOut | None = None
@@ -173,6 +183,7 @@ def _coverage_out(run: Any) -> PriorCoverageOut | None:
         profiles_built_at=_iso_z(built) if built is not None else None,
         profiles_stale=bool(getattr(run, "profiles_stale", False)),
         profiles_reason=getattr(run, "profiles_reason", None) or None,
+        blind_reason=getattr(run, "blind_reason", None) or None,
         capped=(
             int(run.measured or 0)
             + int(run.learning or 0)
@@ -184,7 +195,13 @@ def _coverage_out(run: Any) -> PriorCoverageOut | None:
 
 
 def _profile_spec_out(
-    spec: Any, *, tier: str, status: str, run: Any, trail: Any
+    spec: Any,
+    *,
+    tier: str,
+    status: str,
+    run: Any,
+    trail: Any,
+    held_by_system: str | None = None,
 ) -> HuntCatalogSpecOut:
     """One profile analytic, every trail field read from the prior sweep's trail."""
     return HuntCatalogSpecOut(
@@ -196,6 +213,7 @@ def _profile_spec_out(
         evaluator=spec.evaluator,
         tier=tier,
         status=status,
+        held_by_system=held_by_system,
         coverage=_coverage_out(run),
         last_swept_at=_iso_z(trail.last_run_at) if trail else None,
         last_fired_at=_iso_z(trail.last_fired_at) if trail else None,
@@ -227,16 +245,21 @@ async def get_hunt_catalog(request: Request) -> HuntCatalogOut:
         status = await sweeps_svc.catalog_status(db, now=now)
         prior_runs = await prior_spec_runs.newest(db)
         prior_status = await prior_spec_runs.catalog_status(db, now=now)
+        # The one answer the Analytics tab, the drawer and the bell read.
+        holds = await analytics_store.system_holds(db)
 
     catalog = cat.listed
     specs: list[HuntCatalogSpecOut] = []
     for spec in catalog.values():
         tier, spec_status = cat.status_of(spec.id)
-        if spec.evaluator == "profile":
+        hold = holds.get(spec.id)
+        held = hold.why if hold is not None and spec_status == "shadow" else None
+        if spec.runs_in_prior_sweep:
             # A profile analytic is run by the prior sweep, and its trail is
             # ``prior_spec_runs``. The catalog sweep's rows for it are from
             # before the split: reading them showed a 2026-09-15 error on
-            # every prior under an hourly sweep that ran fine.
+            # every prior under an hourly sweep that ran fine. A model
+            # analytic runs in the same sweep and leaves the same trail.
             specs.append(
                 _profile_spec_out(
                     spec,
@@ -244,6 +267,7 @@ async def get_hunt_catalog(request: Request) -> HuntCatalogOut:
                     status=spec_status,
                     run=prior_runs.get(spec.id),
                     trail=prior_status.get(spec.id),
+                    held_by_system=held,
                 )
             )
             continue
@@ -258,6 +282,7 @@ async def get_hunt_catalog(request: Request) -> HuntCatalogOut:
                 evaluator=spec.evaluator,
                 tier=tier,
                 status=spec_status,
+                held_by_system=held,
                 coverage=_coverage_out(prior_runs.get(spec.id)),
                 last_swept_at=_iso_z(s.last_swept_at) if s else None,
                 last_fired_at=_iso_z(s.last_fired_at) if s else None,

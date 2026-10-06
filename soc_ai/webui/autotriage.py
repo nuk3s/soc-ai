@@ -15,17 +15,21 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
 from elasticsearch import ApiError
 
+from soc_ai.agent import rule_prior
 from soc_ai.api.deps import ctx_from_state
 from soc_ai.api.runner import run_recorded
 from soc_ai.errors import OqlValidationError
 from soc_ai.so_client.fields import get_dotted
 from soc_ai.store import investigations as inv_svc
+from soc_ai.store import rule_prior as rule_prior_store
+from soc_ai.triage_models import is_pipeline_fallback
 from soc_ai.webui import alerts_query as aq
 
 _LOGGER = logging.getLogger(__name__)
@@ -47,6 +51,11 @@ class Target:
     rule_name: str
     src_ip: str
     dst_ip: str
+    # The event's severity label and machine name, for the rule prior's
+    # safeguards. Empty when the planner did not read them (an explicit
+    # selection): the prior then holds, because it cannot rule out critical.
+    severity: str = ""
+    host_name: str = ""
 
 
 @dataclass
@@ -107,6 +116,9 @@ class AutoTriageStatus:
     # A sweep that could not look must not report a drained queue: while this is
     # non-empty the dashboard tile says "degraded", not "0 investigated".
     grid_errors: list[str] = field(default_factory=list)
+    # Targets the rule prior covered this run with no model call (live mode).
+    # Kept apart from ``hunted``: no model investigated them.
+    prior_covered: int = 0
     # set by the stop endpoint; the worker checks it between targets and aborts.
     cancelled: bool = False
     # internal: keep a reference to the running task to prevent GC
@@ -140,6 +152,7 @@ class AutoTriageStatus:
         self.tool_calls = 0
         self.inherited_acked = 0
         self.inherited_refused = {}
+        self.prior_covered = 0
         self.cancelled = False
 
 
@@ -480,6 +493,8 @@ async def plan_targets(
                 rule_name=rule_name,
                 src_ip=src_ip,
                 dst_ip=dst_ip,
+                severity=ev.severity or "",
+                host_name=ev.subject_host or "",
             )
         )
 
@@ -877,6 +892,196 @@ async def _persist_inherited_acks(
         _LOGGER.exception("auto-triage: could not record the inherited-ack fan-out")
 
 
+def _prior_rng() -> random.Random:
+    """The sampling draw of the rule prior. A seam for the tests."""
+    return random.Random()  # noqa: S311 - a sampling draw, not a secret
+
+
+def _prior_target(target: Target) -> rule_prior.PriorTarget:
+    return rule_prior.PriorTarget(
+        rule_name=target.rule_name,
+        alert_es_id=target.alert_es_id,
+        src_ip=target.src_ip,
+        dst_ip=target.dst_ip,
+        severity=target.severity,
+        host_name=target.host_name,
+    )
+
+
+class _RulePriorSweep:
+    """The rule prior's inputs for one scheduled sweep, read once.
+
+    The mode, the estate's address space and the detection tuning
+    nominations are read at the first target and held for the sweep, so a
+    sweep of 25 targets asks the grid for the nominations once. A failure to
+    read either one fails closed: the prior then holds for every target.
+    """
+
+    def __init__(self, state: Any, mode: str) -> None:
+        self._state = state
+        self.mode = mode
+        self._rng = _prior_rng()
+        self._cidrs: list[Any] | None = None
+        self._nominated: frozenset[str] | None = None
+        self._nominated_read = False
+
+    async def _estate(self) -> list[Any]:
+        settings = self._state.settings
+        if self._cidrs is None:
+            try:
+                from soc_ai.oracle.identifiers import (  # noqa: PLC0415 - heavy
+                    effective_internal_identifiers,
+                )
+
+                async with self._state.db_sessionmaker() as db:
+                    self._cidrs = list((await effective_internal_identifiers(db, settings)).cidrs)
+            except Exception:
+                _LOGGER.warning("rule prior: estate CIDRs unreadable; using settings")
+                self._cidrs = list(getattr(settings, "internal_cidrs", []) or [])
+        return self._cidrs
+
+    async def _nominations(self) -> frozenset[str] | None:
+        if not self._nominated_read:
+            self._nominated_read = True
+            try:
+                from soc_ai.webui import detection_tuning as dt  # noqa: PLC0415
+
+                self._nominated = frozenset(
+                    str(n["rule_name"]) for n in await dt.nominate(self._state)
+                )
+            except Exception:
+                # The grid could not say which rules it nominates. The prior
+                # holds for every target ("nomination_unavailable").
+                _LOGGER.warning("rule prior: nominations unreadable; the prior holds")
+                self._nominated = None
+        return self._nominated
+
+    async def evaluate(self, target: Target) -> rule_prior.PriorDecision:
+        prior_target = _prior_target(target)
+        cidrs = await self._estate()
+        # The checks that need no grid first: a target the prior can never
+        # cover costs no read of the nominations.
+        held = rule_prior.precheck(prior_target, cidrs)
+        if held is not None:
+            return held
+        nominated = await self._nominations()
+        async with self._state.db_sessionmaker() as db:
+            return await rule_prior.evaluate(
+                db,
+                prior_target,
+                settings=self._state.settings,
+                cidrs=cidrs,
+                nominated=nominated,
+                now=datetime.now(UTC).replace(tzinfo=None),
+                rng=self._rng,
+            )
+
+    async def record(
+        self,
+        target: Target,
+        decision: rule_prior.PriorDecision,
+        *,
+        investigation_id: str | None = None,
+    ) -> int | None:
+        """Record the decision. Never raises: a lost row must not stop the sweep."""
+        try:
+            async with self._state.db_sessionmaker() as db:
+                row = await rule_prior_store.record_decision(
+                    db,
+                    rule_name=target.rule_name[:512],
+                    alert_es_id=target.alert_es_id[:128],
+                    mode=self.mode,
+                    applies=decision.applies,
+                    reason=decision.reason[:64],
+                    sampled=decision.sampled,
+                    source_investigation_id=decision.source_id,
+                    would_verdict=decision.would_verdict,
+                    would_confidence=decision.would_confidence,
+                    investigation_id=investigation_id,
+                )
+                return row.id
+        except Exception:
+            _LOGGER.exception("rule prior: could not record the decision for %s", target.rule_name)
+            return None
+
+    async def settle(
+        self, decision_id: int | None, *, investigation_id: str | None, real_verdict: str | None
+    ) -> None:
+        if decision_id is None:
+            return
+        try:
+            async with self._state.db_sessionmaker() as db:
+                await rule_prior_store.settle_decision(
+                    db, decision_id, investigation_id=investigation_id, real_verdict=real_verdict
+                )
+        except Exception:
+            _LOGGER.exception("rule prior: could not settle decision %s", decision_id)
+
+    async def gate(
+        self, target: Target, started_by: str, status: AutoTriageStatus
+    ) -> tuple[bool, int | None]:
+        """Run the rung on one target. Returns (covered with no model call, decision id).
+
+        A covered run in live mode that could not land falls back to the model,
+        and its decision is recorded against the real verdict like any other.
+        """
+        decision = await self.evaluate(target)
+        if decision.applies and self.mode == rule_prior.MODE_LIVE and not decision.sampled:
+            covered_id = await self.cover(target, decision, started_by)
+            if covered_id is not None:
+                await self.record(target, decision, investigation_id=covered_id)
+                status.prior_covered += 1
+                return True, None
+        return False, await self.record(target, decision)
+
+    async def cover(
+        self, target: Target, decision: rule_prior.PriorDecision, started_by: str
+    ) -> str | None:
+        """Land the rule-prior run for a covered alert. None when it could not."""
+        try:
+            async with self._state.db_sessionmaker() as db:
+                return await rule_prior.record_prior_run(
+                    db, _prior_target(target), decision, started_by=started_by
+                )
+        except Exception:
+            _LOGGER.exception("rule prior: could not land the covered run for %s", target.rule_name)
+            return None
+
+
+@dataclass
+class _TargetRun:
+    """What the sweep reads off one target's event stream."""
+
+    errored: bool = False
+    run_id: str | None = None
+    report: dict[str, Any] | None = None
+
+    def observe(self, name: str, data: Any, status: AutoTriageStatus) -> None:
+        if name == "error":
+            self.errored = True
+        elif name == "tool_call":
+            status.tool_calls += 1
+        elif name == "investigation_created" and isinstance(data, dict):
+            self.run_id = data.get("investigation_id")
+        elif name == "triage_report" and isinstance(data, dict):
+            payload = data.get("payload")
+            self.report = payload if isinstance(payload, dict) else None
+
+
+def _real_verdict(report: dict[str, Any] | None) -> str | None:
+    """The verdict a real run reached, or None when it reached none.
+
+    A pipeline fallback is a failure wearing a needs_more_info verdict. It is
+    nothing to compare the prior with.
+    """
+    if not isinstance(report, dict):
+        return None
+    if is_pipeline_fallback(report):
+        return None
+    verdict = report.get("verdict")
+    return verdict if isinstance(verdict, str) and verdict else None
+
+
 # Headroom the outer per-target cap keeps over the inner whole-run backstop, so
 # the inner one always wins the race and lands a diagnosable error. Proportional
 # rather than a fixed number of seconds so the invariant holds at any scale — a
@@ -909,12 +1114,14 @@ def _effective_per_target_timeout(settings: Any) -> float:
     return max(configured, inner * _PER_TARGET_HEADROOM_RATIO)
 
 
-async def run_auto_triage(
+async def run_auto_triage(  # noqa: PLR0915 - one linear per-target flow, guards inline
     state: Any,
     *,
     targets: list[Target],
     started_by: str,
     inherited_acks: list[InheritedAck] | None = None,
+    requested_class: str | None = None,
+    apply_rule_prior: bool = False,
 ) -> None:
     """Sequential worker: hunt each target, update status, never raise.
 
@@ -922,11 +1129,23 @@ async def run_auto_triage(
     they never abort the remaining targets.  Sets ``active=False`` and
     ``finished_at`` when done. Inherited-FP ack candidates (see
     :class:`InheritedAck`) are processed first — they need no LLM.
+
+    ``requested_class`` is the budget class every target asks for
+    (soc_ai.agent.budget). None lets the rungs of the ladder decide, which is
+    what a sweep wants. An analyst's explicit selection passes "standard".
+
+    ``apply_rule_prior`` runs the rule prior rung on each target
+    (soc_ai.agent.rule_prior). Only the scheduler's sweep passes it. In shadow
+    the model runs as before and the decision lands beside the real verdict.
+    In live a covered, unsampled target lands a rule-prior run and no model
+    call.
     """
     status = get_status(state)
     try:
         ctx = ctx_from_state(state)
         per_target_timeout = _effective_per_target_timeout(state.settings)
+        prior_mode = rule_prior.mode_of(state.settings) if apply_rule_prior else rule_prior.MODE_OFF
+        prior = None if prior_mode == rule_prior.MODE_OFF else _RulePriorSweep(state, prior_mode)
 
         try:
             await _ack_inherited_fps(state, ctx, inherited_acks or [], status)
@@ -939,6 +1158,13 @@ async def run_auto_triage(
                 break
             label = target.rule_name if target.rule_name else target.alert_es_id
             status.current = label
+            # ----- The rule prior rung (stage 1, soc_ai.agent.rule_prior) -----
+            decision_id: int | None = None
+            if prior is not None:
+                covered, decision_id = await prior.gate(target, started_by, status)
+                if covered:
+                    status.current = None
+                    continue
             # Fresh per-target context. InvestigationContext carries per-run tool
             # state (default_time_anchor, dedup, prefetched community ids) that the
             # orchestrator only resets on the investigation-loop path — a target
@@ -947,8 +1173,9 @@ async def run_auto_triage(
             # centred on the wrong alert's timestamp. ctx_from_state only rebinds
             # the shared app.state clients, so this is cheap.
             ctx = ctx_from_state(state)
+            ctx.requested_run_class = requested_class
+            run = _TargetRun()
             try:
-                stream_errored = False
                 # Hold the generator so we can guarantee it is closed if the
                 # wall-clock backstop fires mid-stream — a hung LLM read would
                 # otherwise leak the coroutine and stall the whole sweep.
@@ -963,11 +1190,8 @@ async def run_auto_triage(
                 )
                 try:
                     async with asyncio.timeout(per_target_timeout):
-                        async for name, _data in stream:
-                            if name == "error":
-                                stream_errored = True
-                            elif name == "tool_call":
-                                status.tool_calls += 1
+                        async for name, data in stream:
+                            run.observe(name, data, status)
                 finally:
                     # run_recorded is an async generator at runtime; aclose()
                     # cancels a mid-stream read cleanly on timeout. It is typed
@@ -976,7 +1200,7 @@ async def run_auto_triage(
                     aclose = getattr(stream, "aclose", None)
                     if aclose is not None:
                         await aclose()
-                if stream_errored:
+                if run.errored:
                     _LOGGER.warning("auto-triage: stream error for alert_id=%s", target.alert_es_id)
                     status.failed += 1
                 else:
@@ -995,6 +1219,12 @@ async def run_auto_triage(
                 status.failed += 1
             finally:
                 status.current = None
+            if prior is not None:
+                # The real verdict beside the decision. A disagreement on a
+                # covered alert suspends the prior for its rule.
+                await prior.settle(
+                    decision_id, investigation_id=run.run_id, real_verdict=_real_verdict(run.report)
+                )
     finally:
         status.active = False
         status.finished_at = datetime.now(UTC).isoformat()
@@ -1075,7 +1305,12 @@ async def start_config_sweep(state: Any, *, started_by: str) -> int:
     status.reset(active=True, total=len(targets), skipped=skipped, severities=band)
     status._task = asyncio.create_task(
         run_auto_triage(
-            state, targets=targets, started_by=started_by, inherited_acks=inherited_acks
+            state,
+            targets=targets,
+            started_by=started_by,
+            inherited_acks=inherited_acks,
+            # The scheduler's sweep is the one path the rule prior serves.
+            apply_rule_prior=True,
         )
     )
     return len(targets)

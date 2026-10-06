@@ -39,6 +39,7 @@ __all__ = [
     "DEFAULT_HALF_LIFE_HOURS",
     "DEFAULT_LEAD_THRESHOLD",
     "DEFAULT_MIN_KINDS",
+    "ESTATE_RARE_WEIGHT",
     "KIND_FOR_DIMENSION",
     "KIND_WEIGHT_CAP",
     "Kind",
@@ -50,6 +51,7 @@ __all__ = [
     "kind_for_dimension",
     "lead_total",
     "live_weight",
+    "novelty_weight",
     "stacked",
     "weight_by_kind",
 ]
@@ -131,6 +133,9 @@ class Kind(Enum):
     # One spec touched many distinct scopes inside the window. A sweep across
     # forty hosts is a second KIND, not forty refreshes of one observation.
     SCOPE_COUNT = "scope_count"
+    # The estate model scored this host far from the estate, and named the
+    # features that depart from its learned group. Tier 3, in shadow.
+    ESTATE_OUTLIER = "estate_outlier"
     # A triaged alert, weighted by its verdict elsewhere.
     ALERT = "alert"
     # A catalog query analytic matched, and the analytic has a benign
@@ -141,6 +146,13 @@ class Kind(Enum):
     HUNT_FINDING = "hunt_finding"
     # A prior that declares no benign population. Born a finding.
     PRIOR_NO_BASELINE = "prior_no_baseline"
+
+    # --- the tier 3 detectors, one kind each ------------------------------
+    # One telemetry plane of a machine fell silent while another plane of the
+    # same machine kept its rate.
+    TELEMETRY_SILENCE = "telemetry_silence"
+    # A host received a session and then made its first attempt to a new host.
+    LOGON_CHAIN = "logon_chain"
 
 
 # The novelty kinds all share the strongest weight, per the design: "a novel
@@ -161,7 +173,17 @@ _BIRTH_WEIGHTS: dict[Kind, float] = {
     Kind.NOVEL_PROCESS_PAIR: _NOVELTY,
     Kind.NOVEL_BINDING: _NOVELTY,
     Kind.RARE_FOR_PEERS: 0.45,
+    # Chosen on 2026-10-04 with the model evaluator. Not yet validated in
+    # shadow. A logon chain cites two documents on two hosts in order, which
+    # a written analytic earns, so it weighs as a catalog match. A silent
+    # plane weighs above a collapsed rate: the live plane shows that the
+    # machine is up.
+    Kind.LOGON_CHAIN: 0.7,
+    Kind.TELEMETRY_SILENCE: 0.45,
     Kind.SCOPE_COUNT: 0.4,
+    # A multivariate score, the weakest tier 3 weight in the survey. No tier 3
+    # type is finding grade: a second type forms the lead.
+    Kind.ESTATE_OUTLIER: 0.3,
     Kind.BELOW_BASELINE: 0.35,
     Kind.ABOVE_BASELINE: 0.35,
     Kind.ALERT: 0.35,
@@ -201,6 +223,37 @@ def kind_for_dimension(dimension: str) -> Kind:
 def birth_weight(kind: Kind) -> float:
     """What an observation of this kind is worth when it is new."""
     return _BIRTH_WEIGHTS[kind]
+
+
+# A novelty that fewer than the rare bar of hosts hold, across the estate. A
+# new member no other host holds says more than a new member that other hosts
+# hold, so it is born heavier. 0.6 forms a lead with an off-hours departure
+# (0.3) inside a working day, where a plain novelty (0.5) does not. It stays
+# below a catalog match (0.7), which a written analytic earned.
+ESTATE_RARE_WEIGHT = 0.6
+"""Chosen on 2026-10-04 with the prevalence change. Not yet validated in shadow."""
+
+_NOVELTY_KINDS = frozenset(
+    {
+        Kind.NOVEL_DESTINATION,
+        Kind.NOVEL_SERVED_PORT,
+        Kind.NOVEL_CONSUMED_PORT,
+        Kind.NOVEL_PROCESS,
+        Kind.NOVEL_PROCESS_PAIR,
+        Kind.NOVEL_BINDING,
+    }
+)
+
+
+def novelty_weight(kind: Kind, *, estate_rare: bool) -> float:
+    """The birth weight of a departure, heavier for an estate-rare novelty.
+
+    Only the novelty kinds take the rare weight. A prior that declares no
+    benign population is born a finding, and nothing here lowers it.
+    """
+    if estate_rare and kind in _NOVELTY_KINDS:
+        return max(birth_weight(kind), ESTATE_RARE_WEIGHT)
+    return birth_weight(kind)
 
 
 # An alert observation is weighted by its triage verdict. A false positive is

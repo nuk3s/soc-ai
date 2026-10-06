@@ -3,7 +3,31 @@
 // skew can never exclude a just-created hunt), while a custom range sends both
 // edges. Bounds are inclusive [from, to], matching inRange.
 import { describe, expect, it } from 'vitest';
-import { ago, rangeToSinceUntil } from './timeRange';
+import { absTime, ago, rangeToSinceUntil } from './timeRange';
+
+describe('absTime', () => {
+  const at = '2026-10-02T12:10:28Z';
+  // The zone the test machine runs in, in the short form the formatter uses.
+  const zone = new Intl.DateTimeFormat(undefined, { timeZoneName: 'short' })
+    .formatToParts(new Date(at))
+    .find((p) => p.type === 'timeZoneName')!.value;
+
+  it('states the time zone when it is asked to', () => {
+    const text = absTime(at, { zone: true });
+    expect(text.endsWith(zone)).toBe(true);
+    expect(text.startsWith(absTime(at))).toBe(true);
+  });
+
+  it('leaves the zone out by default', () => {
+    // Negative control: the tooltips keep the short form.
+    expect(absTime(at).endsWith(zone)).toBe(false);
+  });
+
+  it('keeps the dash and the raw string with the zone option', () => {
+    expect(absTime(null, { zone: true })).toBe('—');
+    expect(absTime('not-a-date', { zone: true })).toBe('not-a-date');
+  });
+});
 
 describe('ago', () => {
   const at = (ms: number) => new Date(Date.now() - ms).toISOString();

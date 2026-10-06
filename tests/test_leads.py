@@ -348,18 +348,128 @@ async def test_decay_can_take_a_lead_back_below_the_threshold(
     assert outcome.formed == ()
 
 
-async def test_a_span_past_the_cap_is_a_fleet_condition_not_a_lead(
+async def _two_kinds_on(
+    db: Any,
+    host: str,
+    *,
+    port: str,
+    destination: str,
+    at: datetime = _NOW,
+) -> None:
+    """A host with a new served port and a new destination: two novelty kinds,
+    1.0 together, so the host forms a lead on its own."""
+    await record_observation(
+        db,
+        entity_kind="host",
+        entity_key=host,
+        kind=Kind.NOVEL_SERVED_PORT,
+        spec_id="prior-served",
+        fingerprint=content_fingerprint("served_ports", port),
+        now=at,
+    )
+    await record_observation(
+        db,
+        entity_kind="host",
+        entity_key=host,
+        kind=Kind.NOVEL_DESTINATION,
+        spec_id="prior-peers",
+        fingerprint=content_fingerprint("peers_out", destination),
+        now=at,
+    )
+
+
+_FLEET_HOSTS = ("192.0.2.31", "192.0.2.32", "192.0.2.33")
+
+
+async def test_one_new_served_port_on_three_hosts_is_a_fleet_condition(
     settings_kratos: Settings,
 ) -> None:
-    # A thing happening on forty hosts at once is a software deployment far
-    # more often than an attacker, and reporting it as a lead sends an analyst
-    # hunting for an intruder inside one.
+    """The span counts the subjects that hold the same condition, not the
+    observations of one entity. That made the span 1 at every formation, so
+    ``fleet_condition`` was unreachable and one condition on N hosts formed N
+    leads. Three hosts serve the same new port; with a cap of two, none of the
+    three is an intrusion lead."""
     _engine, maker = await _db(settings_kratos)
-    hosts = [("host", f"10.1.10.{n}") for n in range(20, 20 + DEFAULT_SPAN_CAP + 3)]
+    hosts = [("host", h) for h in _FLEET_HOSTS]
     async with maker() as db:
-        # One shared lead: give every host the same two kinds, then attach them
-        # to a single lead by forming on the first and extending the span.
-        for _kind, key in ((Kind.NOVEL_DESTINATION, h[1]) for h in hosts):
+        for n, host in enumerate(_FLEET_HOSTS):
+            await _two_kinds_on(db, host, port="4444", destination=f"203.0.113.{10 + n}")
+        outcome = await form_leads(db, entity_keys=hosts, now=_NOW, span_cap=2)
+        leads = (await db.execute(select(Lead))).scalars().all()
+
+    assert outcome.formed == ()
+    assert len(outcome.fleet_conditions) == len(_FLEET_HOSTS)
+    assert {lead.status for lead in leads} == {STATUS_FLEET}
+    assert {int(lead.scope_count) for lead in leads} == {3}
+
+
+async def test_the_condition_span_survives_the_next_sweep(settings_kratos: Settings) -> None:
+    """A re-sweep rebuilds the lead's shape. It must count the same span, not
+    fall back to the subjects of the lead alone."""
+    _engine, maker = await _db(settings_kratos)
+    hosts = [("host", h) for h in _FLEET_HOSTS]
+    async with maker() as db:
+        for n, host in enumerate(_FLEET_HOSTS):
+            await _two_kinds_on(db, host, port="4444", destination=f"203.0.113.{10 + n}")
+        await form_leads(db, entity_keys=hosts, now=_NOW, span_cap=2)
+        again = await form_leads(db, entity_keys=hosts, now=_NOW + timedelta(hours=1), span_cap=2)
+        leads = (await db.execute(select(Lead))).scalars().all()
+
+    assert again.formed == ()
+    assert {int(lead.scope_count) for lead in leads} == {3}
+    assert {lead.status for lead in leads} == {STATUS_FLEET}
+
+
+async def test_the_same_kind_with_different_members_is_not_one_condition(
+    settings_kratos: Settings,
+) -> None:
+    """Negative control: three hosts each serve a DIFFERENT new port. The kind
+    is the same and the condition is not. Counting by kind would mark three
+    unrelated departures as a deployment and hide each lead."""
+    _engine, maker = await _db(settings_kratos)
+    hosts = [("host", h) for h in _FLEET_HOSTS]
+    async with maker() as db:
+        for n, host in enumerate(_FLEET_HOSTS):
+            await _two_kinds_on(db, host, port=str(4440 + n), destination=f"203.0.113.{10 + n}")
+        outcome = await form_leads(db, entity_keys=hosts, now=_NOW, span_cap=2)
+        leads = (await db.execute(select(Lead))).scalars().all()
+
+    assert len(outcome.formed) == len(_FLEET_HOSTS)
+    assert outcome.fleet_conditions == ()
+    assert {lead.status for lead in leads} == {STATUS_OPEN}
+    assert {int(lead.scope_count) for lead in leads} == {1}
+
+
+async def test_a_decayed_sighting_elsewhere_does_not_widen_the_span(
+    settings_kratos: Settings,
+) -> None:
+    """Negative control: the span counts LIVE observations. Two hosts served
+    the port ten days ago, past the decay horizon; the third serves it now."""
+    _engine, maker = await _db(settings_kratos)
+    old = _NOW - timedelta(days=10)
+    async with maker() as db:
+        await _two_kinds_on(db, _FLEET_HOSTS[0], port="4444", destination="203.0.113.10", at=old)
+        await _two_kinds_on(db, _FLEET_HOSTS[1], port="4444", destination="203.0.113.11", at=old)
+        await _two_kinds_on(db, _FLEET_HOSTS[2], port="4444", destination="203.0.113.12")
+        outcome = await form_leads(
+            db, entity_keys=[("host", _FLEET_HOSTS[2])], now=_NOW, span_cap=2
+        )
+        lead = (await db.execute(select(Lead))).scalars().one()
+
+    assert len(outcome.formed) == 1
+    assert lead.status == STATUS_OPEN
+    assert int(lead.scope_count) == 1
+
+
+async def test_a_finding_on_many_hosts_stays_a_lead(settings_kratos: Settings) -> None:
+    """Negative control: a finding-grade observation forms a lead wherever it
+    lands. The same no-baseline condition on more hosts than the cap is an
+    outbreak far more often than a deployment, and a fleet status would keep
+    the loop from hunting it."""
+    _engine, maker = await _db(settings_kratos)
+    hosts = [("host", f"198.51.100.{n}") for n in range(20, 20 + DEFAULT_SPAN_CAP + 3)]
+    async with maker() as db:
+        for _kind, key in hosts:
             await record_observation(
                 db,
                 entity_kind="host",
@@ -372,11 +482,31 @@ async def test_a_span_past_the_cap_is_a_fleet_condition_not_a_lead(
         outcome = await form_leads(db, entity_keys=hosts, now=_NOW)
         leads = (await db.execute(select(Lead))).scalars().all()
 
-    # Each host forms its own single-entity lead here; the cap is exercised by
-    # the span recorded on each, which must never exceed what was observed.
-    assert all(int(lead.scope_count) <= DEFAULT_SPAN_CAP for lead in leads)
-    assert all(lead.status in {STATUS_OPEN, STATUS_FLEET} for lead in leads)
     assert len(outcome.formed) == len(hosts)
+    assert outcome.fleet_conditions == ()
+    assert {lead.status for lead in leads} == {STATUS_OPEN}
+
+
+async def test_a_span_past_the_cap_is_a_fleet_condition_not_a_lead(
+    settings_kratos: Settings,
+) -> None:
+    # A thing happening on forty hosts at once is a software deployment far
+    # more often than an attacker, and reporting it as a lead sends an analyst
+    # hunting for an intruder inside one. This test used to pin the defect:
+    # it asserted that eleven hosts with one condition formed eleven leads.
+    _engine, maker = await _db(settings_kratos)
+    hosts = [("host", f"198.51.100.{n}") for n in range(20, 20 + DEFAULT_SPAN_CAP + 3)]
+    async with maker() as db:
+        for n, (_kind, key) in enumerate(hosts):
+            await _two_kinds_on(db, key, port="8530", destination=f"203.0.113.{40 + n}")
+        outcome = await form_leads(db, entity_keys=hosts, now=_NOW)
+        leads = (await db.execute(select(Lead))).scalars().all()
+
+    assert outcome.formed == ()
+    assert len(outcome.fleet_conditions) == len(hosts)
+    assert all(lead.status == STATUS_FLEET for lead in leads)
+    assert all(int(lead.scope_count) == len(hosts) for lead in leads)
+    assert any("fleet condition" in note for note in outcome.notes)
 
 
 async def test_out_of_scope_observations_are_purged(settings_kratos: Settings) -> None:
@@ -1967,3 +2097,138 @@ async def test_an_analyst_dismissal_is_never_rejoined_or_reopened_by_the_rule(
     assert second.formed == () and second.updated == ()
     assert lead.status == "dismissed" and lead.dismissed_by == "ann"
     assert len(loose) == 1
+
+
+# ---------------------------------------------------------------------------
+# The event time: an observation decays from the event it cites
+# ---------------------------------------------------------------------------
+
+
+async def _one_row(db: Any) -> EntityObservation:
+    return (await db.execute(select(EntityObservation))).scalars().one()
+
+
+async def test_an_observation_decays_from_its_event_time(settings_kratos: Settings) -> None:
+    """Written at T for an event at T minus 20 hours, the observation is 20
+    hours old at T. It decayed from the record time, so the sweep that found an
+    old event weighed it as new."""
+    from soc_ai.hunting.weight import DEFAULT_HALF_LIFE_HOURS, birth_weight
+
+    _engine, maker = await _db(settings_kratos)
+    event = _NOW - timedelta(hours=20)
+    async with maker() as db:
+        await record_observation(
+            db,
+            entity_kind="host",
+            entity_key=_HOST[1],
+            kind=Kind.NOVEL_SERVED_PORT,
+            spec_id="s",
+            fingerprint=content_fingerprint("served_ports", "4444"),
+            now=_NOW,
+            observed_at=event,
+        )
+        row = await _one_row(db)
+        weighed = await weigh_entity(db, entity_kind="host", entity_key=_HOST[1], now=_NOW)
+
+    # born_at stays the record time. observed_at holds the event time.
+    assert row.born_at == _NOW.replace(tzinfo=None)
+    assert row.observed_at == event.replace(tzinfo=None)
+    expected = birth_weight(Kind.NOVEL_SERVED_PORT) * 0.5 ** (20 / DEFAULT_HALF_LIFE_HOURS)
+    assert len(weighed) == 1
+    assert weighed[0].weight == pytest.approx(expected, rel=1e-6)
+    assert weighed[0].weight < birth_weight(Kind.NOVEL_SERVED_PORT)
+
+
+async def test_an_event_past_the_horizon_forms_no_lead_on_the_day_it_is_recorded(
+    settings_kratos: Settings,
+) -> None:
+    """Two kinds recorded on one sweep, one of them for an event ten days old.
+    The old event is history. Weighed from the record time it was fresh, and
+    the pair formed a lead out of an event and a silence weeks apart."""
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        await record_observation(
+            db,
+            entity_kind="host",
+            entity_key=_HOST[1],
+            kind=Kind.NOVEL_SERVED_PORT,
+            spec_id="s",
+            fingerprint=content_fingerprint("served_ports", "4444"),
+            now=_NOW,
+            observed_at=_NOW - timedelta(days=10),
+        )
+        await record_observation(
+            db,
+            entity_kind="host",
+            entity_key=_HOST[1],
+            kind=Kind.NOVEL_DESTINATION,
+            spec_id="s2",
+            fingerprint=content_fingerprint("peers_out", "203.0.113.9"),
+            now=_NOW,
+            observed_at=_NOW - timedelta(hours=1),
+        )
+        outcome = await form_leads(db, entity_keys=[_HOST], now=_NOW)
+    assert outcome.formed == ()
+
+
+async def test_an_event_time_ahead_of_the_record_time_is_bounded(
+    settings_kratos: Settings,
+) -> None:
+    """A grid clock ahead of soc-ai's dates an event in the future. The store
+    keeps the record time then, and the weight is the birth weight."""
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        await record_observation(
+            db,
+            entity_kind="host",
+            entity_key=_HOST[1],
+            kind=Kind.OFF_HOURS,
+            spec_id="s",
+            fingerprint=content_fingerprint("active_hours", "3"),
+            now=_NOW,
+            observed_at=_NOW + timedelta(hours=2),
+        )
+        row = await _one_row(db)
+    assert row.observed_at == _NOW.replace(tzinfo=None)
+
+
+async def test_a_fresh_sighting_moves_the_event_time_and_one_without_clears_it(
+    settings_kratos: Settings,
+) -> None:
+    """A new document moves the event time to the newer one. A new document
+    with no time leaves the row on its record time, never on an older event.
+    A re-read of the same documents fills the time on a row that has none."""
+    _engine, maker = await _db(settings_kratos)
+    fingerprint = content_fingerprint("served_ports", "4444")
+
+    async def sight(ids: list[str], at: datetime, event: datetime | None) -> EntityObservation:
+        await record_observation(
+            db,
+            entity_kind="host",
+            entity_key=_HOST[1],
+            kind=Kind.NOVEL_SERVED_PORT,
+            spec_id="s",
+            fingerprint=fingerprint,
+            evidence={"sample_ids": ids},
+            now=at,
+            observed_at=event,
+        )
+        return await _one_row(db)
+
+    async with maker() as db:
+        first = _NOW - timedelta(hours=30)
+        row = await sight(["d1"], _NOW - timedelta(hours=6), first)
+        assert row.observed_at == first.replace(tzinfo=None)
+
+        newer = _NOW - timedelta(hours=2)
+        row = await sight(["d1", "d2"], _NOW, newer)
+        assert row.observed_at == newer.replace(tzinfo=None)
+        assert row.occurrences == 2
+
+        row = await sight(["d3"], _NOW + timedelta(hours=1), None)
+        assert row.observed_at is None
+        assert row.born_at == (_NOW + timedelta(hours=1)).replace(tzinfo=None)
+
+        row = await sight(["d3"], _NOW + timedelta(hours=2), newer)
+        assert row.observed_at == newer.replace(tzinfo=None)
+        assert row.occurrences == 3, "the same documents are not a new sighting"

@@ -11,7 +11,7 @@
 //   F40 — Drawer's Escape handler is gated on the shared paletteOpen signal.
 //   F59 — per-event selection is cleared when the filter that discarded its rows
 //         changes.
-//   F61 — sub-minute notification time renders "just now", not "now ago".
+//   F61 — sub-minute notification time renders "now", never "now ago".
 //   F62 — the sidebar lights "Investigations" on /investigation/:id and /entity.
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter, useLocation } from 'react-router-dom';
@@ -428,8 +428,8 @@ describe('F40 — Drawer Escape is gated on the command palette', () => {
   });
 });
 
-describe('F61 — sub-minute notification time reads "just now"', () => {
-  it('renders "just now" instead of "now ago" for when === "now"', async () => {
+describe('F61 — sub-minute notification time reads "now"', () => {
+  it('renders "now" in place of "now ago" for when === "now"', async () => {
     vi.mocked(getNotifications).mockResolvedValue([
       { id: 'n1', title: 'Investigating: ET SCAN', when: 'now', tone: 'accent' },
     ]);
@@ -442,7 +442,7 @@ describe('F61 — sub-minute notification time reads "just now"', () => {
     );
     await waitFor(() => expect(getNotifications).toHaveBeenCalled());
     fireEvent.click(screen.getByLabelText('Notifications'));
-    expect(await screen.findByText('just now')).toBeInTheDocument();
+    expect(await screen.findByText('now')).toBeInTheDocument();
     expect(screen.queryByText('now ago')).toBeNull();
   });
 });

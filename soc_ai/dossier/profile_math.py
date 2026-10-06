@@ -13,27 +13,45 @@ median at all.
 Everything here is bucketed in the deployment's LOCAL time. Bucketing in UTC
 mislabels an entire timezone's working day as off hours, and "activity outside
 business hours" is one of the loudest dimensions in the profile.
+
+The rate test reads the hour of the week after all, in a form that survives
+four or five samples per bin. Each bin gives an expected count, the median of
+its samples. The dispersion is pooled: one MAD of every residual against its
+own bin, so 720 samples measure it and not five. And the dispersion has a
+floor of the square root of the expected count, the spread of a count that
+arrives at random. A host whose hours are identical has a pooled MAD of zero,
+and the floor still says how far a burst of one hour went. Zero hours stay in
+the series: a baseline that drops them measures the rate in active hours.
 """
 
 from __future__ import annotations
 
+import math
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 __all__ = [
     "GUARDED_PORT_DIMENSIONS",
+    "HOURS_PER_WEEK",
     "LINUX_EPHEMERAL_START",
+    "SET_CAP",
     "Cell",
+    "Seasonal",
     "TimeCell",
     "cell_for",
+    "hour_of_week",
     "mad",
     "median",
     "robust_z",
+    "seasonal_baseline",
+    "seasonal_from_samples",
     "served_port_counts",
     "summarise_cells",
+    "zero_filled",
 ]
 
 # Makes MAD comparable to a standard deviation for normally distributed data,
@@ -152,6 +170,135 @@ def summarise_cells(samples: list[tuple[datetime, float]], *, tz: str) -> dict[T
         )
         for cell, values in grouped.items()
     }
+
+
+HOURS_PER_WEEK = 168
+
+# The inverse of _MAD_TO_SIGMA: one MAD reads as this many standard deviations.
+_MAD_SCALE = 1.0 / _MAD_TO_SIGMA
+
+
+def hour_of_week(at: datetime, *, tz: str) -> int:
+    """The local hour of the week, 0 for Monday 00:00 and 167 for Sunday 23:00."""
+    local = at.astimezone(_zone(tz))
+    return local.weekday() * 24 + local.hour
+
+
+def zero_filled(counts: dict[datetime, float]) -> tuple[datetime | None, list[float]]:
+    """An hourly series from its first hour to its last, with the empty hours as zero.
+
+    The aggregation returns only the hours that hold a document. An hour with
+    none is a measurement of zero, and a series that drops it measures the
+    rate in active hours. Hours before the first document and after the last
+    are not filled: the host may not have existed then.
+    """
+    if not counts:
+        return None, []
+    hours = {_hour_start(at): float(n) for at, n in counts.items()}
+    first, last = min(hours), max(hours)
+    span = int((last - first).total_seconds() // 3600) + 1
+    return first, [hours.get(first + timedelta(hours=n), 0.0) for n in range(span)]
+
+
+def _hour_start(at: datetime) -> datetime:
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=UTC)
+    return at.astimezone(UTC).replace(minute=0, second=0, microsecond=0)
+
+
+@dataclass(frozen=True)
+class Seasonal:
+    """The expected count for each hour of the week, and how far counts stray.
+
+    ``expected[h]`` is None for an hour of the week with no sample. ``mad`` is
+    the pooled MAD of every sample against its own hour, in counts.
+    """
+
+    expected: tuple[float | None, ...]
+    samples: tuple[int, ...]
+    mad: float
+    support_days: int
+
+    def sigma(self, how: int) -> float | None:
+        """The dispersion of one hour of the week: the larger of the pooled
+        spread and the square root of the expected count.
+
+        None when the hour has no expectation, and when both are zero. A host
+        whose every sample is zero at an hour with a pooled MAD of zero cannot
+        say how surprising a count is: that hour is unmeasurable, never a
+        departure.
+        """
+        expected = self.expected[how]
+        if expected is None:
+            return None
+        spread = max(_MAD_SCALE * self.mad, math.sqrt(max(0.0, expected)))
+        return spread if spread > 0.0 else None
+
+
+def seasonal_baseline(
+    start: datetime,
+    counts: Sequence[float],
+    *,
+    tz: str,
+    exclude: Sequence[tuple[datetime, datetime]] = (),
+) -> Seasonal:
+    """The expected count per hour of the week from an hourly series.
+
+    ``start`` is the UTC start of the first hour of ``counts``. An hour inside
+    one of the ``exclude`` windows is left out: a window an investigation
+    confirmed as an attack is not what this host does.
+    """
+    first = _hour_start(start)
+    return seasonal_from_samples(
+        ((first + timedelta(hours=n), float(value)) for n, value in enumerate(counts)),
+        tz=tz,
+        exclude=exclude,
+    )
+
+
+def seasonal_from_samples(
+    samples: Iterable[tuple[datetime, float]],
+    *,
+    tz: str,
+    exclude: Sequence[tuple[datetime, datetime]] = (),
+) -> Seasonal:
+    """The expected count per hour of the week from hourly samples in any order.
+
+    The same arithmetic as :func:`seasonal_baseline`, for a caller that holds
+    only some hours: the same hours of the week in earlier weeks, say. Each
+    sample is the UTC start of one hour and its count. An hour with no sample
+    is no measurement. A caller that knows an hour held nothing passes zero.
+    """
+    bins: list[list[float]] = [[] for _ in range(HOURS_PER_WEEK)]
+    days: set[str] = set()
+    zone = _zone(tz)
+    windows = [(_hour_start(a), _aware(b)) for a, b in exclude]
+    for raw_at, value in samples:
+        at = _hour_start(raw_at)
+        if any(lo <= at < hi for lo, hi in windows):
+            continue
+        bins[hour_of_week(at, tz=tz)].append(float(value))
+        days.add(at.astimezone(zone).date().isoformat())
+    expected = tuple(median(b) for b in bins)
+    residuals = [
+        abs(v - e) for b, e in zip(bins, expected, strict=True) if e is not None for v in b
+    ]
+    return Seasonal(
+        expected=expected,
+        samples=tuple(len(b) for b in bins),
+        mad=median(residuals) or 0.0,
+        support_days=len(days),
+    )
+
+
+def _aware(at: datetime) -> datetime:
+    return at if at.tzinfo is not None else at.replace(tzinfo=UTC)
+
+
+# How many members one set dimension keeps per entity: the top 200 by
+# document count. A set at the cap cannot say whether a member is new or
+# ranked past the cut, so novelty against it is unmeasurable.
+SET_CAP = 200
 
 
 # The port range Linux hands out per connection. The IANA dynamic floor

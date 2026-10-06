@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from soc_ai.hunting.weight import (
     ALERT_WEIGHT_BY_VERDICT,
+    ESTATE_RARE_WEIGHT,
     Kind,
     alert_weight,
     birth_weight,
     is_finding_grade,
+    novelty_weight,
 )
 
 
@@ -30,3 +32,13 @@ def test_finding_grade_is_a_no_baseline_prior_or_a_true_positive_alert() -> None
     assert not is_finding_grade(Kind.ALERT, 0.5)
     assert not is_finding_grade(Kind.CATALOG_MATCH, 0.7)
     assert not is_finding_grade(Kind.NOVEL_DESTINATION, 0.5)
+
+
+def test_an_estate_rare_novelty_is_born_heavier_and_nothing_else_moves() -> None:
+    assert novelty_weight(Kind.NOVEL_SERVED_PORT, estate_rare=True) == ESTATE_RARE_WEIGHT == 0.6
+    assert novelty_weight(Kind.NOVEL_SERVED_PORT, estate_rare=False) == 0.5
+    # Negative controls: a rare mark on a kind that is not a novelty changes
+    # nothing. A finding stays a finding. A rate stays a rate.
+    assert novelty_weight(Kind.PRIOR_NO_BASELINE, estate_rare=True) == 1.0
+    assert novelty_weight(Kind.ABOVE_BASELINE, estate_rare=True) == 0.35
+    assert novelty_weight(Kind.SCOPE_COUNT, estate_rare=True) == 0.4

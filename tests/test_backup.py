@@ -176,6 +176,27 @@ async def test_backup_restore_round_trip(tmp_path: Path) -> None:
     assert (dst_dir / "known_hosts").read_text() == KNOWN_HOSTS
 
 
+async def test_restore_makes_the_store_0600_in_a_0700_directory(tmp_path: Path) -> None:
+    """Range dogfood 2026-10-05: the store held the password hashes at mode 0644.
+
+    The umask is set to 022, the range's, so the archived store carries 0644 and
+    a plain mkdir makes 0755. The restore must not keep either.
+    """
+    old_umask = os.umask(0o022)
+    try:
+        src_dir = tmp_path / "src"
+        await _seed_store(_settings(src_dir))
+        (src_dir / DB_FILENAME).chmod(0o644)
+        archive = tmp_path / "backup.tar.gz"
+        create_backup(src_dir, archive)
+        dst_dir = tmp_path / "dst"
+        restore_backup(archive, dst_dir)
+    finally:
+        os.umask(old_umask)
+    assert stat.S_IMODE((dst_dir / DB_FILENAME).stat().st_mode) == 0o600
+    assert stat.S_IMODE(dst_dir.stat().st_mode) == 0o700
+
+
 async def test_backup_archive_is_private_and_excludes_bootstrap_credential(
     tmp_path: Path,
 ) -> None:

@@ -1116,15 +1116,28 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
         # tests/test_tool_surface.py. For the three original roles _in_role
         # returns True for every tool they already registered, so their surfaces
         # are byte-identical.
-        if not _in_role(getattr(fn, "__name__", ""), role):
+        name = getattr(fn, "__name__", "")
+        if not _in_role(name, role):
             return fn
+        # The standard class (soc_ai.agent.budget): an investigator tool outside
+        # the run's visible set registers with deferred loading. It stays
+        # registered and callable, its schema stays off the wire, and one
+        # ``search_tools`` call loads it. None (deep, every other role) sends all.
+        visible = getattr(ctx, "loop_visible_tools", None) if role == "investigator" else None
+        # Only a real set trims the surface. Anything else, a test double's
+        # attribute included, registers every tool as before.
+        deferred = isinstance(visible, (set, frozenset)) and name not in visible
+        if deferred:
+            ctx.deferred_tool_names.append(name)
         # EVERY registered tool routes through the egress guard so a cloud
         # analyst / oracle model never sees a raw tool result (and its
         # label-bearing arguments are restored before execution). With no guard
         # on the ctx (the default), _guarded returns fn unchanged and this is
         # exactly agent.tool_plain(fn). The cast mirrors _guarded's: tool_plain
         # hands back the (wrapped) function it was given.
-        return cast("F", agent.tool_plain(_progress(ctx, _guarded(ctx, fn))))
+        return cast(
+            "F", agent.tool_plain(defer_loading=deferred)(_progress(ctx, _guarded(ctx, fn)))
+        )
 
     async def t_query_events_oql(
         query: str,

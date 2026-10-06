@@ -1,7 +1,7 @@
 import { AlertTriangle, Check, ChevronDown, ChevronRight, CornerDownRight, MessageSquare, RefreshCw, Trash2, X } from 'lucide-react';
 import { Fragment, useEffect, useRef, useState } from 'react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
-import { KindBadge, PipelineErrorChip, SyntheticEvalBadge, VerdictPill } from '../components/Badges';
+import { KindBadge, PipelineErrorChip, RunClassChip, SyntheticEvalBadge, VerdictPill } from '../components/Badges';
 import { FlowBadge } from '../components/FlowBadge';
 import { ListToolbar } from '../components/ListToolbar';
 import { MultiSelect } from '../components/MultiSelect';
@@ -977,6 +977,9 @@ export function Investigations() {
                 {/* A run against planted synthetic scenarios must never read
                     as a real one — badge it wherever the row appears. */}
                 {r.isSynthEval && <SyntheticEvalBadge />}
+                {/* What the run was allowed to spend: cheap, standard, deep
+                    or rule prior. */}
+                <RunClassChip runClass={r.runClass} testId={`run-class-${r.id}`} />
                 {/* A real link, not a span: the row's onClick serves the
                     mouse, and this is what serves the keyboard, a screen
                     reader, a middle-click and a copied address. */}
@@ -1120,6 +1123,7 @@ export function Investigations() {
                           earlier run
                         </Link>
                         {rt.isSynthEval && <SyntheticEvalBadge />}
+                        <RunClassChip runClass={rt.runClass} testId={`run-class-${rt.id}`} />
                       </div>
                       <div>{rt.fallback ? <PipelineErrorChip /> : rt.verdict === 'untriaged' ? <span className="text-faint">—</span> : <VerdictPill verdict={rt.verdict} />}</div>
                       <div className="font-mono text-[12px] text-faint">{rt.conf != null ? rt.conf.toFixed(2) : '—'}</div>

@@ -43,14 +43,22 @@ async def record_sweep(
     the observations were written under. It has no default. A default of
     ``True`` marked every row of a live prior as shadow, so the catalog
     reported live priors as shadow for weeks.
+
+    Each row carries the blind reason of its spec, when the sweep has one.
+    See :func:`soc_ai.hunting.prior_sweep.blind_reasons`.
     """
+    from soc_ai.hunting.prior_sweep import clip_reason  # noqa: PLC0415 - lazy, avoids a cycle
+
     at = (now or datetime.now(UTC)).replace(tzinfo=None)
+    reasons = sweep.blind_reasons()
     per_spec: dict[str, dict[str, int]] = {}
     for r in sweep.results:
         bucket = per_spec.setdefault(
             r.spec_id, {"measured": 0, "learning": 0, "blind": 0, "not_applicable": 0, "fired": 0}
         )
-        bucket[r.coverage] = bucket.get(r.coverage, 0) + 1
+        # A detector state outside the four columns folds into one of them.
+        # Counted under its own name, it was written to no column at all.
+        bucket[r.trail_state] = bucket.get(r.trail_state, 0) + 1
         if r.fired:
             bucket["fired"] += 1
     for spec_id in sweep.evaluated_specs:
@@ -73,6 +81,7 @@ async def record_sweep(
                 profiles_built_at=profiles.built_at if profiles else None,
                 profiles_stale=bool(profiles.stale) if profiles else False,
                 profiles_reason=(profiles.reason or None) if profiles else None,
+                blind_reason=clip_reason(reasons.get(spec_id)),
             )
         )
         written += 1

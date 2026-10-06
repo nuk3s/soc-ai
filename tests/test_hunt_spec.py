@@ -1109,6 +1109,11 @@ def test_the_shipped_catalog_loads() -> None:
         "profile-connection-rate-collapsed",
         "profile-connection-rate-spiked",
     }
+    # The tier 3 detectors.
+    assert {k for k, v in catalog.items() if v.evaluator == "model"} == {
+        "model-cross-plane-silence",
+        "model-logon-chain",
+    }
 
 
 def test_every_shipped_spec_has_a_precondition() -> None:
@@ -1119,11 +1124,12 @@ def test_every_shipped_spec_has_a_precondition() -> None:
     loud error.
     """
     for spec in load_catalog(CATALOG).values():
-        if spec.evaluator == "profile":
+        if spec.evaluator != "match":
             # A prior answers from a stored baseline, not from a query, so it
             # has no precondition to run. It tells blind from clean through the
             # profile's own coverage column instead, which carries the same
-            # distinction — see tests/test_hunting_priors.py.
+            # distinction — see tests/test_hunting_priors.py. A model spec
+            # states one detector state per entity instead.
             continue
         assert spec.precondition is not None, f"{spec.id} cannot tell blind from clean"
 

@@ -31,7 +31,7 @@ from soc_ai.eval.oracle_client import OracleError, OracleResponse, call_oracle
 from soc_ai.eval.prompt import SYSTEM_PROMPT, architecture_block, build_user_message
 from soc_ai.so_client.auth import make_auth
 from soc_ai.so_client.elastic import ElasticClient
-from soc_ai.store.db import make_engine, make_sessionmaker
+from soc_ai.store.db import is_postgres_url, make_engine, make_sessionmaker, store_url
 from soc_ai.tools.enrichment import MispClient
 
 if TYPE_CHECKING:
@@ -348,8 +348,9 @@ def _store_sessionmaker(
     engine.
     """
     try:
+        # A PostgreSQL store has no file to look for; the app created it.
         db_path = settings.soc_ai_data_dir / "soc-ai.db"
-        if not db_path.is_file():
+        if not is_postgres_url(store_url(settings)) and not db_path.is_file():
             return None, None
         engine = make_engine(settings)
         return engine, make_sessionmaker(engine)

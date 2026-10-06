@@ -9,13 +9,14 @@ machine with its predecessor's history.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
 from soc_ai.config import Settings
 from soc_ai.store import entity_profiles as ep
 from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
 from soc_ai.store.models import EntityProfile
-from sqlalchemy import inspect, text, update
+from sqlalchemy import event, func, inspect, select, text, update
 
 pytestmark = pytest.mark.asyncio
 
@@ -38,12 +39,48 @@ async def test_migration_creates_the_table(settings_kratos: Settings) -> None:
             lambda sc: {c["name"] for c in inspect(sc).get_columns("prior_spec_runs")}
         )
         row = await conn.execute(text("SELECT version_num FROM alembic_version"))
-        assert row.scalar_one() == "0055"
+        assert row.scalar_one() == "0060"
     # Why a dimension could not be measured, and what the sweep knew about
     # its baselines. Without the first, a refused query wrote no row and read
     # as blind; without the second, coverage counts implied "now".
     assert "coverage_reason" in profile_cols
     assert {"profiles_built_at", "profiles_stale", "profiles_reason"} <= run_cols
+    await engine.dispose()
+
+
+async def test_one_dimension_loads_for_many_entities_in_one_read(
+    settings_kratos: Settings,
+) -> None:
+    """The scoring loop reads one dimension for a slice of entities at a time.
+
+    Only the asked dimension and the asked keys come back. A key with no row
+    on the dimension is absent, the same answer one load per entity gave.
+    """
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        for key in ("198.51.100.1", "198.51.100.2", "198.51.100.3"):
+            for dimension in ("served_ports", "peers_out"):
+                await ep.upsert_profile(
+                    db,
+                    entity_kind="host",
+                    entity_key=key,
+                    dimension=dimension,
+                    shape="categorical",
+                    vector={"445": {"count": 3}},
+                    support_days=10,
+                )
+        loaded = await ep.load_dimension(
+            db,
+            entity_kind="host",
+            dimension="served_ports",
+            entity_keys=["198.51.100.1", "198.51.100.3", "198.51.100.9"],
+        )
+        empty = await ep.load_dimension(
+            db, entity_kind="host", dimension="served_ports", entity_keys=[]
+        )
+    assert empty == {}
+    assert set(loaded) == {"198.51.100.1", "198.51.100.3"}
+    assert {row.dimension for row in loaded.values()} == {"served_ports"}
     await engine.dispose()
 
 
@@ -590,3 +627,187 @@ async def test_purging_keeps_host_rows_keyed_on_a_hostname(settings_kratos: Sett
     assert set(dc) == {"logon_users"}
     assert set(ws) == {"process_names"}
     assert gone == {}
+
+
+# ---------------------------------------------------------------------------
+# The role stamp
+# ---------------------------------------------------------------------------
+
+
+def _built_at() -> datetime:
+    """A build three days ago. Relative to now, so the seed does not age out."""
+    return datetime.now(UTC).replace(tzinfo=None, microsecond=0) - timedelta(days=3)
+
+
+def _stamp_row(
+    key: str,
+    *,
+    built_at: datetime,
+    dimension: str = "served_ports",
+    role: str | None = None,
+    confidence: float | None = None,
+    kind: str = "host",
+) -> EntityProfile:
+    return EntityProfile(
+        entity_kind=kind,
+        entity_key=key,
+        dimension=dimension,
+        shape="categorical",
+        vector_json={},
+        role=role,
+        role_confidence=confidence,
+        built_at=built_at,
+    )
+
+
+# 501 workstations fill one IN list and spill one row into a second. Three
+# servers are a second group. Two hosts already hold their role.
+_WORKSTATIONS = [f"ws{n:04d}.example.test" for n in range(501)]
+_SERVERS = ["srv1.example.test", "srv2.example.test", "srv3.example.test"]
+_SETTLED = {
+    "ws-settled.example.test": ("workstation", 0.9),
+    "srv-settled.example.test": ("server", 0.8),
+}
+
+
+def _estate_role(key: str) -> tuple[str | None, float]:
+    if key in _SETTLED:
+        return _SETTLED[key]
+    if key.startswith("ws"):
+        return ("workstation", 0.9)
+    if key.startswith("srv"):
+        return ("server", 0.8)
+    return (None, 0.0)
+
+
+async def _seed_stamp_estate(maker: Any) -> dict[str, datetime]:
+    """Write the estate above with no role on the moving rows. Returns built_at per key.
+
+    Every row has its own built_at, so a stamp that writes any one value is seen.
+    """
+    base = _built_at()
+    seeded: dict[str, datetime] = {}
+    rows: list[EntityProfile] = []
+    for n, key in enumerate([*_WORKSTATIONS, *_SERVERS]):
+        seeded[key] = base - timedelta(minutes=n)
+        rows.append(_stamp_row(key, built_at=seeded[key]))
+    for n, (key, (role, confidence)) in enumerate(_SETTLED.items()):
+        seeded[key] = base - timedelta(days=1, minutes=n)
+        rows.append(_stamp_row(key, built_at=seeded[key], role=role, confidence=confidence))
+    async with maker() as db:
+        db.add_all(rows)
+        await db.commit()
+    return seeded
+
+
+async def test_stamp_roles_writes_new_changed_and_cleared_roles_and_skips_the_rest(
+    settings_kratos: Settings,
+) -> None:
+    """New, changed and cleared roles move. A settled row and a user row stay."""
+    roles: dict[str, tuple[str | None, float]] = {
+        "192.0.2.1": ("workstation", 0.9),
+        "192.0.2.2": ("server", 0.8),
+        "192.0.2.3": ("server", 0.7),
+        "192.0.2.4": ("printer", 0.95),
+        # A principal never takes a host role, whatever the map says.
+        "analyst@example.test": ("server", 0.9),
+    }
+    built = _built_at()
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        db.add_all(
+            [
+                _stamp_row("192.0.2.1", built_at=built, role="workstation", confidence=0.9),
+                _stamp_row("192.0.2.2", built_at=built),
+                _stamp_row("192.0.2.2", built_at=built, dimension="peers_out"),
+                _stamp_row("192.0.2.3", built_at=built, role="workstation", confidence=0.9),
+                _stamp_row("192.0.2.4", built_at=built, role="printer", confidence=0.6),
+                _stamp_row("192.0.2.5", built_at=built, role="server", confidence=0.8),
+                _stamp_row("192.0.2.6", built_at=built),
+                _stamp_row("analyst@example.test", built_at=built, kind="user"),
+            ]
+        )
+        await db.commit()
+        changed = await ep.stamp_roles(db, lambda key: roles.get(key, (None, 0.0)))
+    # 192.0.2.2 on two dimensions, then .3, .4 and the cleared .5.
+    assert changed == 5
+
+    async with maker() as db:
+        got = {
+            (row.entity_kind, row.entity_key, row.dimension): (row.role, row.role_confidence)
+            for row in (await db.scalars(select(EntityProfile))).all()
+        }
+        again = await ep.stamp_roles(db, lambda key: roles.get(key, (None, 0.0)))
+    assert got == {
+        ("host", "192.0.2.1", "served_ports"): ("workstation", 0.9),
+        ("host", "192.0.2.2", "served_ports"): ("server", 0.8),
+        ("host", "192.0.2.2", "peers_out"): ("server", 0.8),
+        ("host", "192.0.2.3", "served_ports"): ("server", 0.7),
+        ("host", "192.0.2.4", "served_ports"): ("printer", 0.95),
+        ("host", "192.0.2.5", "served_ports"): (None, None),
+        ("host", "192.0.2.6", "served_ports"): (None, None),
+        ("user", "analyst@example.test", "served_ports"): (None, None),
+    }
+    assert again == 0
+
+
+async def test_stamp_roles_updates_501_rows_in_bounded_statements(
+    settings_kratos: Settings,
+) -> None:
+    """504 changed rows in two groups cost three UPDATEs, never one per row.
+
+    The 501st workstation sits in the second IN list of its group, so a stamp
+    that dropped the tail leaves it with no role.
+    """
+    engine, maker = await _db(settings_kratos)
+    await _seed_stamp_estate(maker)
+    updates: list[int] = []
+
+    def _record(conn: Any, cursor: Any, statement: str, parameters: Any, *args: Any) -> None:
+        if statement.lstrip().upper().startswith("UPDATE"):
+            updates.append(len(parameters or ()))
+
+    event.listen(engine.sync_engine, "before_cursor_execute", _record)
+    try:
+        async with maker() as db:
+            changed = await ep.stamp_roles(db, _estate_role)
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", _record)
+
+    assert changed == 504
+    assert len(updates) == 3, updates
+    assert all(params <= 502 for params in updates), updates
+    async with maker() as db:
+        tail = await db.scalar(
+            select(EntityProfile).where(EntityProfile.entity_key == _WORKSTATIONS[-1])
+        )
+        unstamped = await db.scalar(
+            select(func.count(EntityProfile.id)).where(EntityProfile.role.is_(None))
+        )
+    assert tail is not None
+    assert (tail.role, tail.role_confidence) == ("workstation", 0.9)
+    assert unstamped == 0
+    await engine.dispose()
+
+
+async def test_stamp_roles_leaves_built_at_where_the_build_put_it(
+    settings_kratos: Settings,
+) -> None:
+    """The stamp moves the role and its confidence. ``built_at`` stays on every row.
+
+    The rows sit in both IN lists of the first group, in the second group and
+    among the rows that do not change. A stamp that wrote ``built_at`` would
+    make the rows look newer than the build that wrote them.
+    """
+    engine, maker = await _db(settings_kratos)
+    seeded = await _seed_stamp_estate(maker)
+    async with maker() as db:
+        assert await ep.stamp_roles(db, _estate_role) == 504
+    async with maker() as db:
+        rows = (await db.scalars(select(EntityProfile))).all()
+    assert len(rows) == len(seeded)
+    for row in rows:
+        assert row.built_at == seeded[row.entity_key], row.entity_key
+        # The stamp did write the row, so an unchanged built_at means something.
+        assert (row.role, row.role_confidence) == _estate_role(row.entity_key), row.entity_key
+    await engine.dispose()

@@ -23,7 +23,7 @@ from typing import Any
 
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import UsageLimitExceeded
-from pydantic_ai.usage import UsageLimits
+from pydantic_ai.usage import RunUsage, UsageLimits
 
 from soc_ai.agent._partial_replay import (
     repair_dangling_tool_calls,
@@ -50,6 +50,7 @@ from soc_ai.agent.toolset import GRID_BACKED_TOOLS, GRID_UNAVAILABLE_REASON
 from soc_ai.api.hunt_recorder import HuntRecorder
 from soc_ai.api.runner import CancelToken
 from soc_ai.dossier.prompt import host_dossier_prompt_block, internal_ips_in_text
+from soc_ai.run_meter import start_search_meter
 from soc_ai.so_client.inventory import inventory_prompt_block
 
 _LOGGER = logging.getLogger(__name__)
@@ -233,6 +234,37 @@ async def _synthesize_partial_hunt(
     )
 
 
+def _hunt_usage_event(ev_factory: Any, source: Any, *, phase: str) -> StepEvent | None:
+    """A ``usage`` event for one hunt model run, or None when it reports none.
+
+    ``source`` is the agent run (on any exit) or a synthesis result. Same
+    payload shape as the triage pipeline's usage event, so one meter reads
+    both. A hunt recorded no usage before the run counters: the survey of
+    2026-10-04 counted ``model_response`` events as a stand-in.
+    """
+    if source is None:
+        return None
+    try:
+        # A property since pydantic-ai 1.107; the call form still exists on a
+        # test double or an older release.
+        u = source.usage
+        if not isinstance(u, RunUsage) and callable(u):
+            u = u()
+        payload = {
+            "phase": phase,
+            "round": 1,
+            "tool_calls": int(u.tool_calls or 0),
+            "requests": int(u.requests or 0),
+            "input_tokens": int(u.input_tokens or 0),
+            "output_tokens": int(u.output_tokens or 0),
+            "total_tokens": int(u.total_tokens or 0),
+        }
+    except Exception:
+        return None
+    event: StepEvent = ev_factory("usage", payload)
+    return event
+
+
 async def _stream_node(
     node: Any,
     ev_factory: Any,
@@ -279,7 +311,7 @@ async def _stream_node(
         yield disp
 
 
-async def run_hunt(
+async def run_hunt(  # noqa: PLR0915 - one linear streaming flow, like the triage pipeline
     ctx: InvestigationContext,
     *,
     objective: str,
@@ -329,6 +361,9 @@ async def run_hunt(
     # report's citations), so a finding citing an id the hunt never pulled is caught.
     gathered_tool_results: list[Any] = []
     budget_exhausted = False
+    # The agent run, kept past the block so its model usage can be recorded on
+    # every exit: a hunt stored no usage at all before the run counters.
+    agent_run: Any = None
     try:
         # Whole-hunt wall-clock safety net: a HUNG LLM stream has no budget-based
         # stopping point and would otherwise stall the background task forever.
@@ -338,6 +373,7 @@ async def run_hunt(
             asyncio.timeout(ctx.settings.hunt_run_timeout_s),
             agent.iter(user_msg, usage_limits=usage_limits) as run,
         ):
+            agent_run = run
             async for node in run:
                 async for disp in _stream_node(node, _ev, guard, gathered, gathered_tool_results):
                     yield disp
@@ -356,8 +392,12 @@ async def run_hunt(
         budget_exhausted = True
     except BaseException as e:
         _LOGGER.exception("hunt agent run failed")
+        if (usage_ev := _hunt_usage_event(_ev, agent_run, phase="hunt")) is not None:
+            yield usage_ev
         yield _ev("error", {"message": str(e), "type": type(e).__name__})
         return
+    if (usage_ev := _hunt_usage_event(_ev, agent_run, phase="hunt")) is not None:
+        yield usage_ev
 
     # True ONLY when the report below came from the budget/timeout partial path —
     # gates the deterministic humility clamp (a full-run report is never clamped).
@@ -389,6 +429,10 @@ async def run_hunt(
                 },
             )
             return
+        if (
+            synth_usage_ev := _hunt_usage_event(_ev, result, phase="hunt_partial_synth")
+        ) is not None:
+            yield synth_usage_ev
 
     if result is None:
         yield _ev("error", {"message": "hunt produced no report", "type": "EmptyResult"})
@@ -858,6 +902,10 @@ async def hunt_recorded_run(
     hunt_id = await recorder.start()
 
     yield "hunt_created", {"hunt_id": hunt_id}
+
+    # Meter the grid reads in the task that drains the rest of the stream, for
+    # the reason soc_ai.api.runner.recorded_run gives.
+    recorder.attach_search_meter(start_search_meter())
 
     # Set from the terminal ``done`` event when the runner's deterministic
     # evidence-count gate fired: the run made not one successful grid read —

@@ -292,3 +292,26 @@ describe('ListToolbar', () => {
     expect(screen.getByText('Deleted 2 investigations')).toBeInTheDocument();
   });
 });
+
+// The Hosts box cut its placeholder at "OS" (range dogfood 2026-10-05, C9).
+describe('ListToolbar search width', () => {
+  const PLACEHOLDER = 'Search name, address, MAC, OS, role, agent…';
+
+  it('sizes the box to its placeholder when asked', () => {
+    render(
+      <ListToolbar search={{ value: '', onChange: () => {}, placeholder: PLACEHOLDER, fitPlaceholder: true }} />,
+    );
+    const box = screen.getByRole('searchbox');
+    expect(box.getAttribute('placeholder')).toBe(PLACEHOLDER);
+    expect(box.style.width).toBe(`calc(${PLACEHOLDER.length}ch + 40px)`);
+    expect(box.style.minWidth).toBe('240px');
+    expect(box.className).not.toContain('w-[240px]');
+  });
+
+  it('keeps the fixed width by default', () => {
+    render(<ListToolbar search={{ value: '', onChange: () => {}, placeholder: PLACEHOLDER }} />);
+    const box = screen.getByRole('searchbox');
+    expect(box.className).toContain('w-[240px]');
+    expect(box.style.width).toBe('');
+  });
+});

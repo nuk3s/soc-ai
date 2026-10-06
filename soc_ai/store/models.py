@@ -1,7 +1,8 @@
 """SQLAlchemy models for the soc-ai local store.
 
-Timestamps are naive UTC throughout (SQLite has no timezone type);
-``soc_ai.store.auth.utcnow`` is the one producer of comparison values.
+Timestamps are naive UTC throughout, on SQLite and on PostgreSQL;
+``soc_ai.store.auth.utcnow`` is the one producer of comparison values. The
+contract and the dialect differences sit in :mod:`soc_ai.store.dialect`.
 """
 
 from __future__ import annotations
@@ -12,7 +13,6 @@ from typing import Any
 from sqlalchemy import (
     JSON,
     Boolean,
-    DateTime,
     Float,
     ForeignKey,
     Index,
@@ -25,6 +25,12 @@ from sqlalchemy import (
     func,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+# Every ``DateTime()`` column below is the store's UTC type: a bind value with a
+# timezone is stored as naive UTC, which asyncpg requires and SQLite needs for a
+# correct wall clock. Importing it under the SQLAlchemy name keeps each column
+# declaration as it was, and a new column gets the contract without a choice.
+from soc_ai.store.dialect import UtcDateTime as DateTime
 
 
 def _utcnow() -> datetime:
@@ -179,6 +185,18 @@ class Investigation(Base):
     # subject, not one of its cited documents. Readers treat NULL as the alert
     # subject; see ``soc_ai.agent.context.HuntSubject``.
     subject_json: Mapped[dict[str, Any] | None] = mapped_column(NULLABLE_JSON, default=None)
+    # What the run cost (migration 0058), stamped at finalize by the recorder
+    # from the run's own events (soc_ai.run_meter). NULL on a row written
+    # before the counters existed: a reader derives what it can from the
+    # stored events and says "unknown" for the rest. ``run_class`` is the
+    # budget class the run ended in: cheap, standard, deep or rule_prior.
+    run_class: Mapped[str | None] = mapped_column(String(16), default=None)
+    model_requests: Mapped[int | None] = mapped_column(Integer, default=None)
+    input_tokens: Mapped[int | None] = mapped_column(Integer, default=None)
+    output_tokens: Mapped[int | None] = mapped_column(Integer, default=None)
+    tool_calls: Mapped[int | None] = mapped_column(Integer, default=None)
+    es_searches: Mapped[int | None] = mapped_column(Integer, default=None)
+    wall_ms: Mapped[int | None] = mapped_column(Integer, default=None)
 
 
 class InvestigationEvent(Base):
@@ -250,6 +268,15 @@ class Hunt(Base):
     lead_id: Mapped[int | None] = mapped_column(Integer, default=None, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+    # What the run cost (migration 0058). Same columns and same meaning as on
+    # Investigation. A hunt stored no model usage before these existed.
+    run_class: Mapped[str | None] = mapped_column(String(16), default=None)
+    model_requests: Mapped[int | None] = mapped_column(Integer, default=None)
+    input_tokens: Mapped[int | None] = mapped_column(Integer, default=None)
+    output_tokens: Mapped[int | None] = mapped_column(Integer, default=None)
+    tool_calls: Mapped[int | None] = mapped_column(Integer, default=None)
+    es_searches: Mapped[int | None] = mapped_column(Integer, default=None)
+    wall_ms: Mapped[int | None] = mapped_column(Integer, default=None)
 
 
 class HuntEvent(Base):
@@ -1291,6 +1318,123 @@ class EntityProfile(Base):
     built_at: Mapped[datetime] = mapped_column(
         DateTime(), default=_utcnow, server_default=func.now()
     )
+    # Migration 0060. The version of the stored shape that the build wrote,
+    # from soc_ai.dossier.profile.PROFILE_SHAPE. Null on a row built before
+    # the column, which soc-ai reads as shape 1. A row with an older shape is
+    # due for a build at once, whatever its age.
+    shape_version: Mapped[int | None] = mapped_column(Integer, default=None)
+
+
+class MemberPrevalence(Base):
+    """How many hosts in the estate hold one member of one set dimension.
+
+    Migration 0057. Read from the stored host profiles after a build, so it
+    costs no search. A new member that forty hosts hold is a trait of the
+    estate. A member no other host holds is estate-rare. Novelty fired on
+    first sight with no weight for how common a member is.
+
+    One row per (dimension, member). The row with dimension ``*`` and an empty
+    member is the stamp of the last refresh: ``built_at`` says which build it
+    read, and ``hosts`` says how many host rows it read.
+    """
+
+    __tablename__ = "member_prevalence"
+    __table_args__ = (UniqueConstraint("dimension", "member", name="uq_member_prevalence_member"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    dimension: Mapped[str] = mapped_column(String(64))
+    member: Mapped[str] = mapped_column(String(255))
+    hosts: Mapped[int] = mapped_column(Integer, default=0)
+    built_at: Mapped[datetime] = mapped_column(
+        DateTime(), default=_utcnow, server_default=func.now()
+    )
+
+
+class EstateModelFit(Base):
+    """One daily fit of the estate model: the record soc-ai trusts a model file by.
+
+    Migration 0059. The estate model groups hosts that act alike and scores each
+    host against the estate (soc_ai.hunting.estate_model). A fit writes one JSON
+    model file under ``<data dir>/models/estate/`` and one row here. The row
+    holds the sha256 of the file. soc-ai loads a model file only when the hash
+    of its bytes is the hash a row here records for that file name, so a file
+    that soc-ai did not write is never read.
+
+    ``state`` is ``measured``, ``learning``, ``drifted`` or ``held``. ``role``
+    is the challenger record: a fit is a ``challenger`` for its first 24 hours
+    and then the ``champion``. soc-ai scores once, with the newest fit. The
+    challenger state is a record only.
+    """
+
+    __tablename__ = "estate_model_fits"
+    __table_args__ = (
+        Index("ix_estate_model_fit_at", "fitted_at"),
+        Index("ix_estate_model_fit_sha", "model_sha256"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    fitted_at: Mapped[datetime] = mapped_column(DateTime(), default=_utcnow)
+    # measured | learning | drifted | held
+    state: Mapped[str] = mapped_column(String(16))
+    # Why the state is not measured, or what the fit refused. Null when measured.
+    reason: Mapped[str | None] = mapped_column(Text, default=None)
+    # Null when the fit wrote no model file: too few hosts to fit.
+    model_sha256: Mapped[str | None] = mapped_column(String(64), default=None)
+    # The file name inside models/estate/. Never a path.
+    model_file: Mapped[str | None] = mapped_column(String(255), default=None)
+    hosts: Mapped[int] = mapped_column(Integer, default=0)
+    features: Mapped[int] = mapped_column(Integer, default=0)
+    groups: Mapped[int] = mapped_column(Integer, default=0)
+    silhouette: Mapped[float | None] = mapped_column(Float, default=None)
+    # The median of the hosts' support days. Under 7 the model is learning.
+    support_days: Mapped[int | None] = mapped_column(Integer, default=None)
+    # The largest population stability index of one feature against the
+    # previous fit, and every feature above the drift bar. Null on a first fit.
+    psi: Mapped[float | None] = mapped_column(Float, default=None)
+    drifted_json: Mapped[Any | None] = mapped_column(NULLABLE_JSON, default=None)
+    # Per group: the id, the size, the centroid features, the median features
+    # and the median outlier score.
+    groups_json: Mapped[Any | None] = mapped_column(NULLABLE_JSON, default=None)
+    # Hosts above the score threshold, those without a stated reason, those
+    # that share their behaviour with a subgroup, those whose documents the
+    # grid did not return, and the observations written.
+    outliers: Mapped[int] = mapped_column(Integer, default=0)
+    unexplained: Mapped[int] = mapped_column(Integer, default=0)
+    shared: Mapped[int] = mapped_column(Integer, default=0)
+    no_documents: Mapped[int] = mapped_column(Integer, default=0)
+    observations: Mapped[int] = mapped_column(Integer, default=0)
+    # challenger | champion | retired
+    role: Mapped[str] = mapped_column(String(16), default="challenger")
+    challenger_until: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+    # The fit handed its hash to the audit chain.
+    audited: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+
+
+class EstatePeerGroup(Base):
+    """The learned peer group of one host, from the newest estate model fit.
+
+    Migration 0059. A second peer source beside the declared role: a host with
+    no confident role reads the hosts of its learned group as its peers. The
+    centroid features of the group live on the fit row, keyed by ``group_id``.
+    The table is replaced whole by each fit.
+    """
+
+    __tablename__ = "estate_peer_groups"
+    __table_args__ = (
+        UniqueConstraint("entity_kind", "entity_key", name="uq_estate_peer_group_entity"),
+        Index("ix_estate_peer_group_group", "group_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    entity_kind: Mapped[str] = mapped_column(String(16), default="host")
+    entity_key: Mapped[str] = mapped_column(String(255))
+    group_id: Mapped[int] = mapped_column(Integer)
+    # Euclidean distance to the group centroid, in standardized feature units.
+    distance: Mapped[float] = mapped_column(Float, default=0.0)
+    # The estate outlier score of the host in the same fit.
+    score: Mapped[float | None] = mapped_column(Float, default=None)
+    model_sha256: Mapped[str] = mapped_column(String(64))
+    fitted_at: Mapped[datetime] = mapped_column(DateTime(), default=_utcnow)
 
 
 class EntityObservation(Base):
@@ -1338,9 +1482,27 @@ class EntityObservation(Base):
     fingerprint: Mapped[str] = mapped_column(String(64))
 
     birth_weight: Mapped[float] = mapped_column(Float, default=0.0)
+    # The time soc-ai wrote (or refreshed) the row. It is the record time.
     born_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
+    # Migration 0056. The newest document timestamp the observation cites,
+    # bounded by the record time. The decay and the lead page read it when
+    # present. Null when the writer had no document time: an alert verdict, a
+    # hunt finding, a silent host, or a row written before 0056.
+    observed_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
     occurrences: Mapped[int] = mapped_column(Integer, default=1)
+
+    # Migration 0057. The evidence of the observation, in columns. The name of
+    # the statistic that departed, its value, and the value of the baseline it
+    # departed from. The lead hunt read these numbers as prose in the summary.
+    statistic: Mapped[str | None] = mapped_column(String(32), default=None)
+    statistic_value: Mapped[float | None] = mapped_column(Float, default=None)
+    baseline_value: Mapped[float | None] = mapped_column(Float, default=None)
+    # Up to 10 document ids the observation cites, from every source.
+    document_ids: Mapped[list[str] | None] = mapped_column(NULLABLE_JSON, default=None)
+    # An OQL query the agent can run again to read the departure. Null for a
+    # source with no query to state, such as an alert verdict.
+    rerun_query: Mapped[str | None] = mapped_column(Text, default=None)
 
     # A short human sentence and the document ids behind it, so a lead can cite
     # evidence rather than assert it.
@@ -1456,6 +1618,10 @@ class PriorSpecRun(Base):
     profiles_built_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
     profiles_stale: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     profiles_reason: Mapped[str | None] = mapped_column(String(255), default=None)
+    # Migration 0060. Why the blind entities of this spec were blind, when
+    # they share one reason. When they do not, the reason of the most of them
+    # with their count. Null when nothing was blind.
+    blind_reason: Mapped[str | None] = mapped_column(String(255), default=None)
 
 
 class AnalyticState(Base):
@@ -1505,3 +1671,49 @@ class AnalyticVersion(Base):
     spec_after: Mapped[str | None] = mapped_column(Text, default=None)
     # The receipts an analyst read before an approval to live.
     receipts_json: Mapped[Any | None] = mapped_column(NULLABLE_JSON, default=None)
+
+
+class RulePriorDecision(Base):
+    """What the rule prior decided for one scheduled alert, beside the real verdict.
+
+    Migration 0058. The rule prior is the rung of the tier 1 ladder that can
+    cover a scheduled alert with the verdict of its rule's latest model-backed
+    run (soc_ai.agent.rule_prior). It ships in shadow: the model still runs,
+    and this row records what the prior would have decided, why it did or did
+    not apply, and whether the real verdict agreed. In live mode a covered
+    alert that was not sampled records the prior's verdict and no real one.
+
+    A disagreement on a covered alert suspends the prior for its rule until an
+    analyst clears it on the Detection tuning panel: ``cleared_at`` is that
+    clearance. The suspension is the set of disagreeing rows with no
+    clearance, so it needs no second table.
+    """
+
+    __tablename__ = "rule_prior_decisions"
+    __table_args__ = (Index("ix_rule_prior_decisions_rule", "rule_name", "created_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
+    rule_name: Mapped[str] = mapped_column(String(512))
+    alert_es_id: Mapped[str] = mapped_column(String(128))
+    # shadow | live: the mode the decision was taken in.
+    mode: Mapped[str] = mapped_column(String(8))
+    # True when every safeguard held and the prior covered the alert.
+    applies: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Why the prior did or did not apply: "covered", or the first safeguard
+    # that held it back ("external_endpoint", "lapsed", ...).
+    reason: Mapped[str] = mapped_column(String(64))
+    # In the random sample: a covered alert that still got a real run.
+    sampled: Mapped[bool] = mapped_column(Boolean, default=False)
+    # The model-backed run the prior would inherit its verdict from.
+    source_investigation_id: Mapped[str | None] = mapped_column(String(32), default=None)
+    would_verdict: Mapped[str | None] = mapped_column(String(32), default=None)
+    would_confidence: Mapped[float | None] = mapped_column(Float, default=None)
+    # The run this alert got: the real run, or the rule-prior run in live mode.
+    investigation_id: Mapped[str | None] = mapped_column(String(32), default=None)
+    real_verdict: Mapped[str | None] = mapped_column(String(32), default=None)
+    # NULL when there is nothing to compare: the prior did not apply, the real
+    # run failed, or a live covered alert had no real run.
+    agree: Mapped[bool | None] = mapped_column(Boolean, default=None)
+    cleared_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+    cleared_by: Mapped[str | None] = mapped_column(String(80), default=None)

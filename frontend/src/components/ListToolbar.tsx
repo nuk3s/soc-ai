@@ -49,6 +49,9 @@ export interface ListToolbarSearch {
   placeholder?: string;
   /** Accessible name; defaults to the placeholder. */
   label?: string;
+  /** Size the box to its placeholder, at 240 px or more. The Hosts box cut
+   *  "Search name, address, MAC, OS, role, agent…" at "OS". */
+  fitPlaceholder?: boolean;
 }
 
 export interface ListToolbarSelection {
@@ -406,7 +409,15 @@ export function ListToolbar({
               onChange={(e) => search.onChange(e.target.value)}
               placeholder={search.placeholder ?? 'Search…'}
               aria-label={search.label ?? search.placeholder ?? 'Search'}
-              className="w-[240px] rounded-control border border-border-input bg-bg py-[7px] pl-[28px] pr-3 text-[12.5px] text-text outline-none focus:border-accent"
+              style={
+                search.fitPlaceholder && search.placeholder
+                  ? { width: `calc(${search.placeholder.length}ch + 40px)`, minWidth: 240, maxWidth: '100%' }
+                  : undefined
+              }
+              className={cn(
+                !(search.fitPlaceholder && search.placeholder) && 'w-[240px]',
+                'rounded-control border border-border-input bg-bg py-[7px] pl-[28px] pr-3 text-[12.5px] text-text outline-none focus:border-accent',
+              )}
             />
           </span>
         )}

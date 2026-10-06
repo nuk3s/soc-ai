@@ -578,6 +578,8 @@ def test_hunt_manager_threads_synth_eval_marker_into_run_recorded() -> None:
     """The middle hop: HuntManager.start passes the marker through to
     run_recorded (and defaults it OFF for every caller that omits it) —
     mirrors test_finding_promotion's allow_so_writes force test."""
+    from types import SimpleNamespace
+
     from soc_ai.webui import hunt_manager as hm
 
     captured: dict[str, Any] = {}
@@ -589,7 +591,9 @@ def test_hunt_manager_threads_synth_eval_marker_into_run_recorded() -> None:
     async def run(**start_kwargs: Any) -> str | None:
         with (
             patch.object(hm, "run_recorded", fake_run_recorded),
-            patch.object(hm, "ctx_from_state", lambda _s: object()),
+            # A namespace, not object(): the manager stamps the run's budget
+            # class on the context it builds.
+            patch.object(hm, "ctx_from_state", lambda _s: SimpleNamespace()),
         ):
             mgr = hm.HuntManager()
             inv_id = await mgr.start(

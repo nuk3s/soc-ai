@@ -43,8 +43,8 @@ async def create_token(request: Request, body: TokenCreateIn) -> dict[str, str]:
             detail={
                 "reason": "no_session_user",
                 "hint": (
-                    "Minting an API token requires an authenticated admin session; "
-                    "log in at /app/login (bearer-token callers cannot mint tokens)."
+                    "Minting an API token requires a signed-in admin session. "
+                    "Log in at /app/login. A bearer-token caller cannot mint a token."
                 ),
             },
         )
@@ -172,7 +172,7 @@ async def create_user_endpoint(request: Request, body: CreateUserIn) -> dict[str
                 status_code=400,
                 detail={
                     "reason": "password_too_long",
-                    "hint": "Password must be at most 72 bytes (bcrypt's limit).",
+                    "hint": "The password must be at most 72 bytes. That is the bcrypt limit.",
                 },
             ) from exc
     return {"ok": True}
@@ -240,9 +240,9 @@ async def reset_user_password_endpoint(request: Request, user_id: int) -> dict[s
             detail={
                 "reason": "no_session_user",
                 "hint": (
-                    "Resetting a password requires an authenticated admin session; "
-                    "log in at /app/login (anonymous or bearer-token callers "
-                    "cannot reset passwords)."
+                    "Resetting a password requires a signed-in admin session. "
+                    "Log in at /app/login. An anonymous or bearer-token caller "
+                    "cannot reset a password."
                 ),
             },
         )
