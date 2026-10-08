@@ -3,7 +3,7 @@
 //     used to read "1 pending" while the only card said "✓ Auto-acknowledged".
 // (2) Opening chat on a message-less investigation shows a starter hint with
 //     suggested questions instead of a blank void.
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { describe, expect, it, vi } from 'vitest';
 import type { Investigation as Inv, RecommendedAction } from '../lib/types';
@@ -15,6 +15,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
 }));
 
 import { Investigation } from './Investigation';
+import { WithChat } from '../test/chatHarness';
 
 const baseInv = (over: Partial<Inv>): Inv =>
   ({
@@ -54,9 +55,9 @@ describe('recommended-actions pending count', () => {
         <Investigation inv={baseInv({ actions: [appliedAction] })} layout="page" />
       </MemoryRouter>,
     );
-    // header meta: "human-in-the-loop · 0 pending"
-    expect(screen.getByText(/0 pending/)).toBeTruthy();
-    expect(screen.queryByText(/1 pending/)).toBeNull();
+    // header meta: "0 actions wait for you"
+    expect(screen.getByText(/0 actions wait for you/)).toBeTruthy();
+    expect(screen.queryByText(/1 action waits for you/)).toBeNull();
   });
 
   it('still counts a genuinely un-executed action', () => {
@@ -68,7 +69,7 @@ describe('recommended-actions pending count', () => {
         />
       </MemoryRouter>,
     );
-    expect(screen.getByText(/1 pending/)).toBeTruthy();
+    expect(screen.getByText(/1 action waits for you/)).toBeTruthy();
   });
 });
 
@@ -76,9 +77,13 @@ describe('empty investigation chat', () => {
   it('renders suggested starter questions when the thread is empty', () => {
     render(
       <MemoryRouter>
-        <Investigation inv={baseInv({ seedChat: [] })} layout="drawer" />
+        <WithChat>
+          <Investigation inv={baseInv({ seedChat: [] })} layout="drawer" />
+        </WithChat>
       </MemoryRouter>,
     );
+    // The chat is the Ask soc-ai panel. The drawer header opens it.
+    fireEvent.click(screen.getAllByRole('button', { name: 'Ask soc-ai about this investigation' })[0]);
     expect(screen.getByText('Why not a true positive?')).toBeTruthy();
     expect(screen.getByText(/Ask a follow-up about this investigation/i)).toBeTruthy();
   });

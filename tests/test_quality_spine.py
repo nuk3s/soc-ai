@@ -2217,6 +2217,92 @@ async def test_journey_runner_complete_journey_exits_zero(
     assert inv.status == "complete"
 
 
+def _beacon_report(hit_ids: list[str]) -> dict[str, Any]:
+    return {
+        "narrative": "Suspicious: one internal host beacons on a regular cadence.",
+        "findings": [
+            {
+                "title": "Regular-cadence TLS beacon",
+                "detail": "10.0.0.42 -> 198.51.100.7 on a fixed cadence with TLS metadata.",
+                "severity": "medium",
+                "category": "threat",
+                "hosts": ["10.0.0.42"],
+                "citations": hit_ids,
+            }
+        ],
+        "affected_hosts": ["10.0.0.42"],
+        "confidence": 0.7,
+    }
+
+
+async def _journey_runs(settings: Settings, hunt_id: str) -> list[Investigation]:
+    from soc_ai.store.db import make_engine, make_sessionmaker
+    from sqlalchemy import select
+
+    engine = make_engine(settings)
+    try:
+        async with make_sessionmaker(engine)() as db:
+            rows = await db.scalars(select(Investigation).where(Investigation.hunt_id == hunt_id))
+            return list(rows.all())
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_journey_scores_the_investigation_the_hunt_opened(
+    settings_kratos: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The hunt investigates its subject findings as part of the hunt. The
+    journey's promotion finds that run (one investigation per subject) and
+    scores it. It does not start a second one."""
+    from soc_ai.eval.journey import JourneyStage
+    from soc_ai.eval.journey_runner import run_journey
+
+    elastic, _fake_es = _journey_grid(settings_kratos)
+    monkeypatch.setattr(
+        "soc_ai.api.hunt_runner.build_investigator_model",
+        lambda _settings: _scripted_hunt_model(_beacon_report),
+    )
+    monkeypatch.setattr("soc_ai.api.runner.investigate", _scripted_investigate("true_positive"))
+
+    outcome = await run_journey(settings_kratos, _runner_scenario(), elastic=elastic)
+
+    assert outcome.exit_code == 0
+    assert outcome.result is not None
+    assert outcome.result.reached is JourneyStage.COMPLETE
+    assert outcome.hunt_id is not None
+    runs = await _journey_runs(settings_kratos, outcome.hunt_id)
+    assert [r.id for r in runs] == [outcome.investigation_id]
+    assert runs[0].started_by == "system:hunt"
+    assert runs[0].is_synth_eval is True
+
+
+@pytest.mark.asyncio
+async def test_journey_promotes_by_itself_when_the_hunt_investigates_nothing(
+    settings_kratos: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Control: with the switch off the hunt opens no investigation, and the
+    journey's own promotion runs as before."""
+    from soc_ai.eval.journey import JourneyStage
+    from soc_ai.eval.journey_runner import STARTED_BY, run_journey
+
+    settings = settings_kratos.model_copy(update={"hunt_findings_investigate": False})
+    elastic, _fake_es = _journey_grid(settings)
+    monkeypatch.setattr(
+        "soc_ai.api.hunt_runner.build_investigator_model",
+        lambda _settings: _scripted_hunt_model(_beacon_report),
+    )
+    monkeypatch.setattr("soc_ai.api.runner.investigate", _scripted_investigate("true_positive"))
+
+    outcome = await run_journey(settings, _runner_scenario(), elastic=elastic)
+
+    assert outcome.result is not None
+    assert outcome.result.reached is JourneyStage.COMPLETE
+    assert outcome.hunt_id is not None
+    runs = await _journey_runs(settings, outcome.hunt_id)
+    assert [r.started_by for r in runs] == [STARTED_BY]
+
+
 @pytest.mark.asyncio
 async def test_journey_runner_hunt_found_nothing_exits_nonzero(
     settings_kratos: Settings, monkeypatch: pytest.MonkeyPatch

@@ -1,8 +1,9 @@
-// F40 — the Investigation component instance is reused across investigations
+// F40: the Investigation component instance is reused across investigations
 // (the Alerts drawer and the permalink route both re-render it with a new
 // `inv` prop on re-hunt / request-more-info). If a chat send is still in
 // flight when the parent swaps `inv` to a different investigation, the
 // eventual response must not clobber the newly-shown investigation's chat.
+// The chat is the shell's Ask soc-ai panel now: the swap moves its scope.
 import { fireEvent, render, screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { describe, expect, it, vi } from 'vitest';
@@ -18,6 +19,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
 
 import { Investigation } from './Investigation';
 import { postChat } from '../lib/api';
+import { WithChat } from '../test/chatHarness';
 
 const baseInv = (over: Partial<Inv>): Inv =>
   ({
@@ -54,10 +56,13 @@ describe('chat identity across an inv swap (F40)', () => {
 
     const { rerender } = render(
       <MemoryRouter>
-        <Investigation inv={invA} layout="drawer" />
+        <WithChat>
+          <Investigation inv={invA} layout="drawer" />
+        </WithChat>
       </MemoryRouter>,
     );
 
+    fireEvent.click(screen.getAllByRole('button', { name: 'Ask soc-ai about this investigation' })[0]);
     await screen.findByText('Seed A');
     fireEvent.change(screen.getByPlaceholderText(/ask a follow-up/i), { target: { value: 'question to A' } });
     fireEvent.click(screen.getByLabelText('Send'));
@@ -67,7 +72,9 @@ describe('chat identity across an inv swap (F40)', () => {
     // before A's chat turn resolves.
     rerender(
       <MemoryRouter>
-        <Investigation inv={invB} layout="drawer" />
+        <WithChat>
+          <Investigation inv={invB} layout="drawer" />
+        </WithChat>
       </MemoryRouter>,
     );
     await screen.findByText('Seed B');
@@ -88,5 +95,7 @@ describe('chat identity across an inv swap (F40)', () => {
 
     expect(screen.queryByText('Reply to A')).toBeNull();
     expect(screen.getByText('Seed B')).toBeTruthy();
+    // The panel followed the swap: its scope line names B's investigation.
+    expect(screen.getByTestId('ask-scope-name').textContent).toBe(invB.name);
   });
 });

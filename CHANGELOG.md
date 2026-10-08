@@ -9,8 +9,290 @@ All notable changes to this project are documented here. The format is based on
 A fleet of twelve browser and API dogfood agents ran on the development range and on
 production on 2026-10-01. This section holds what they found and what changed.
 
+### Owner's pass 2026-10-07
+
+- **One chat on every page.** The chat bubble on the investigation, host and hunt pages and the
+  Dashboard chat panel are now one Ask soc-ai panel. The panel slides in from the right. It has
+  the same width and header on every page. The button at the right end of the top bar opens it.
+  The label names the object of the page, for example "Ask soc-ai about this host". The panel
+  keeps one thread for each scope, states the scope at the top and has a switch to the general
+  thread. The key `c` opens the panel, and Esc closes it. The Dashboard slot holds a card with
+  the three starter questions. A lead page has a chat now, on the new routes `GET`, `POST` and
+  `DELETE /api/v1/hunts/leads/{id}/chat`. The setting `general_chat_enabled` is now labelled
+  "General chat".
+- **The peer diagram and the hunt map use a graph library.** Both diagrams now draw through one
+  `Graph` component on React Flow 12.12.0, with a d3-force layout. Each label shows whole, and no
+  label overlaps another. The host page puts the host in the centre and its peers on a ring. The
+  size of a peer and the width of its line show the connection events. A peer that an alert names
+  is red. The hunt map joins each finding to the hosts it names, and a threat finding draws red
+  lines. A node opens its page, and a hover card states its facts. "Reset view" fits the diagram
+  to the panel. The investigation graph uses the same component and loads on demand.
+The owner asked two questions: "What is the difference between hunt and promote?" and "What is
+the user flow?" This section holds what changed on the screen.
+
+- **A lead offers one verb.** The lead button reads "Hunt this lead". The lead page states the
+  verb under its actions: "Hunt this lead. The hunt investigates what it finds and brings back the
+  verdicts." The hover states what a hunt returns. It also states that a hunt takes no action in
+  Security Onion.
+- **"Open an investigation" is the manual control on a finding.** The hunt page shows it on a
+  finding with no investigation. "Promote" is gone from the lead page, the lead row and the lead
+  bar of the hunt page. The lead bar offers "Dismiss lead". The API routes keep their names.
+- **A link to an investigation reads "View investigation".** "Open investigation" was one article
+  away from "Open an investigation".
+- **The lead timeline names the act.** The store keeps the decision word `promoted`. The timeline
+  reads "dan opened an investigation on this lead", and the chip reads "investigation opened".
+  The refusal of a closed lead uses the same words.
+- **A flow strip names where each object sits.** The alert drawer, the investigation page, the
+  lead page and the hunt page carry one line under the header. The line names each step of the
+  flow and its state: done, current, next or not yet. A done step links to its object. The next
+  step names the control that moves the flow, for example "Hunt this lead", "Acknowledge" or
+  "Re-run investigation". The line wraps on a narrow window.
+- **The chain of each object.** An alert reads Alert, Investigation, Verdict, Action in Security
+  Onion. A lead reads Hit, Lead, Hunt, Investigations, Verdicts, Actions. A manual hunt starts at
+  its objective. The Investigations step counts the findings with a finished investigation, for
+  example "2 of 3 done". A failed run names "Re-run investigation" and never shows a verdict.
+- **The strip reads the hunt investigation fields.** It reads `findingsInvestigated` and
+  `findingsTotal` on the hunt. It reads `investigationId`, `verdict`, `investigationStatus` and
+  `pendingActions` on each finding. An older server sends the `investigation` block of a finding,
+  and the strip reads that block.
+- **The landing page is the Overview.** The page title reads "Overview". Under the Needs you tile
+  one sentence states the flow: "Alerts and sweeps come in. soc-ai triages, hunts, and
+  investigates what the hunts find. You decide in Needs you. Your actions go to Security Onion."
+  The "How this flows" link follows it. The tile shows no ellipsis while the count loads.
+- **The chart draws both paths.** The "How this flows" chart draws the alert path beside the sweep
+  path. Both paths end in an investigation, a verdict and an action in Security Onion. The chart
+  uses the words of the controls: "Hunt this lead", "Open an investigation" and "hit". It defines
+  the two verbs. The drawer title is "How this flows", the name of the link.
+  `tests/test_hunting_flow_chart.py` keeps the console copy and the docs copy identical.
+- **The guide states the flow.** `docs/WEBUI_GUIDE.md` opens with a section, "The flow". It names
+  the alert path, the sweep path, the one queue and the two verbs. `docs/HUNTING.md` states hunt
+  and open an investigation in two sentences in its lead section. Both state the rule: a hunt is
+  not finished until its findings are investigated.
+- **The tags have their own column.** The chips of a row sat beside its title. Each title
+  started at a different place, and the list looked jagged. The chips now sit in one Tags column
+  at the end of the row. The column has one width and one order on the Investigations list, the
+  Alerts list, the Hunts table and the Dashboard recent list. The order is type, hunt subject,
+  hunt kind, depth, synthetic evaluation, backtest replay, handled counts, dismissed, superseded,
+  related runs and chat count. The title cell holds the title only, and the whole title wraps in
+  it. Each table fits a window of 1280 pixels. A narrower window scrolls the table sideways.
+- **The console shows the whole text.** The owner banned the ellipsis. A title, a rule name, a
+  host name, an address and a notice no longer stop at "…". The text wraps in its cell. The
+  console has no `truncate` class, no line clamp and no middle cut of a rule name. A loading line
+  reads "Loading" or "Reading the leads" beside a spinner. A count in progress reads "counting". A
+  sentence names the whole investigation ID, and the About panel names the whole commit.
+- **The backend sends the whole text.** Titles, reasons, errors, doctor lines, bell lines and
+  webhook bodies no longer stop at a character count with "…". A progress line such as
+  "Searching" has no dots. A text that goes to the model keeps its bound, and the cut ends in
+  "[truncated]". A database column or an external API keeps its bound too, with no ellipsis.
+- **Two tests hold the ban.** `frontend/src/noEllipsis.test.ts` reads every console string. It
+  fails on "…", on "..." and on a class that draws an ellipsis. `tests/test_no_ellipsis.py` reads
+  every backend string. It fails on a string that ends in "..." or holds "…". Five model prompts
+  keep a placeholder, and the test names each one with the reason.
+### Hunts investigate their findings (2026-10-07)
+
+- **A hunt investigates its findings.** After the report lands, the hunt opens one investigation
+  for each finding that names an entity. A visibility gap, a failed query and a clean observation
+  are not investigated. The actor is `system:hunt`. The investigation runs on the document the
+  finding cites, else on the evidence of the lead. A finding with no document reads failed with
+  that reason. The first range re-hunt reported a threat finding with two hosts and no citation,
+  and a citation rule left it uninvestigated.
+- **The lead pages read the hunt by its verdicts.** The lead list and the lead page label a hunt
+  with the counts the hunt page prints, "2 of 2 findings are threats". A lead the hunt closed on
+  those verdicts reads the hunt tail in its flow strip.
+- **The hunt reads Investigating until the last one ends.** Two investigations run at a time, the
+  highest severity first. The findings section reads "Investigating 2 of 3 findings". A failed
+  investigation counts as ended. A cancel of the hunt stops its investigations.
+- **The cap is a setting.** `hunt_findings_investigate_max` caps one hunt at 20 by default. A
+  finding past the cap reads "Over the cap, open by hand." `hunt_findings_investigate` turns the
+  phase off. Both apply live from the Config screen.
+- **One investigation per subject.** A running or complete investigation of the same alert or the
+  same subject from the last 7 days is reused. A re-hunt of a lead opens no second investigation
+  for an unchanged finding. A failed run, a fallback and a backtest replay are never reused.
+- **The outcome reads the verdicts.** A hunt reads "2 of 3 findings are threats" or "No threat
+  confirmed". The bell reads "Hunt finished: 2 of 3 findings are threats".
+- **The lead closes itself.** When every finding of a lead hunt has a verdict, the lead closes as
+  promoted in the hand of `system:hunt`, with each verdict recorded. A finding with no verdict
+  leaves the lead to the analyst.
+- **Each finding card shows its investigation.** The card shows the verdict, the confidence word,
+  the actions that wait and a link. The API carries `findingsInvestigated` and `findingsTotal` on
+  the hunt, and `investigationId`, `verdict`, `confidence`, `investigationStatus` and
+  `pendingActions` on each finding. Migration 0063 adds the columns.
+- **The usage report counts them.** `soc-ai usage` lists the entry "Hunt finding investigation" and
+  prints `hunt findings investigated: N`.
+
+### Dogfood 2026-10-06, the investigation page
+
+- **The ack card states its scope.** "Acknowledge alert" acknowledged every unacknowledged alert of
+  the rule from the last 7 days on one click. The card now states the scope before the click, for
+  example "Acknowledge 9 alerts of this rule from the last 7 days, on 2 hosts." A confirm step
+  follows, with "Acknowledge this alert only". The receipt states the count. The group ack leaves
+  an alert with a true positive or a needs more info verdict open. The new route
+  `GET /investigations/{id}/actions/{index}/scope` returns the plan, and the execute route takes
+  `{"scope": "group" | "alert"}`.
+- **Every write asks first.** Escalate and Dismiss on a recommended action, the settled bar and the
+  Alerts list Escalate have a confirm step. The escalate confirm says "Open one Security Onion
+  case for this alert". The Alerts list confirm names the count of cases.
+- **A dismissal is stored.** Dismiss goes to the server with the actor and the time. A reload and a
+  second analyst see it. The card offers "Undo". The new routes are
+  `POST /investigations/{id}/actions/{index}/dismiss` and `.../restore`.
+- **An executed action names who and when.** The card reads "Executed by auto-ack at 03:12" or
+  "Executed by <user> at <time>". When Security Onion shows the alert as not acknowledged, the
+  ack card does not say executed. It offers the ack again and names the earlier write.
+- **A replaced run says so.** "Request more info" and "Re-run" start a new run. The older page now
+  shows "A newer run on this alert reached true positive (0.65). Open it." Its actions are off.
+  The detail carries `supersededRun`.
+- **An override replaces the headline and the actions.** The headline reads "Verdict set by
+  <user>: <reason>". A true positive gets one escalate and no ack. The model paragraph folds
+  under "soc-ai said before the override". A toast confirms the save. The dialog lists the
+  verdicts as labels and preselects nothing.
+- **Each entity is a link.** The ends of the alert, the Alert details, the Host context, the
+  Entity scope and the entities the rationale names link to their pages through `EntityLink`.
+- **The confidence has a word.** Under the number the card reads High, Medium or Low confidence.
+  The tooltip names the thresholds, 0.80 and 0.70. The rule severity sits in its own row.
+- **The open question comes from the rationale.** A run with no recorded question shows the
+  sentence of the rationale that names the gap.
+- **A slow document read shows a spinner.** After 2 s the drawer reads "Fetching the raw event
+  from Security Onion".
+- **A failed check folds.** A failed tool call reads "A follow-up check could not run" with the
+  error behind a toggle. The OQL whitelist adds `system.auth.ssh.event` and
+  `system.auth.ssh.method`. The parser maps the alert names the model sees, such as
+  `event_action`, to their grid fields.
+- **The headline names evidence in words.** Field paths move to the cited evidence chips. A tool
+  id reads in words. The report prompt asks the model for a plain first rationale.
+- **The chat acts.** "Resolve in chat" opens the chat and asks "What would resolve this
+  verdict?". A starter chip asks on click. A proposal equal to the current verdict offers no
+  Apply. A true positive proposal offers "Escalate to case" inline.
+- **The Oracle row explains itself.** It reads, for example, "Oracle review: not needed.
+  Confidence 0.70 is above the review band." With the Oracle off it says so. The failed run page
+  no longer names `investigation_run_timeout_s`. The model reasoning is "Model scratch work",
+  folded, with a note that it is not evidence.
+- **A promoted investigation names its finding first.** The page shows "Promoted finding: F2,
+  <title>" with its evidence and its hosts. The hunt prompt sits behind "Show objective".
+- **The drawer moves to the next alert.** The drawer has "Next", and j and the down arrow open the
+  next report. The drawer shows Alert details: rule, source, destination and user.
+- **A running run names its step.** The page reads "Now <step>" and states how long runs on this
+  grid take, from the median of the newest finished runs.
+- **The page uses plain words.** The timeline groups read "Context gathered", "Intel look-ups", "Follow-up
+  queries", "Checks", "Verdict" and "Oracle review". The page title is the rule name, and Delete
+  moves to a More menu. An Alerts row that cannot count its handled alerts shows one "uncounted"
+  chip in place of two "?" chips.
+- **A backtest replay offers no write.** The settled bar does not render on a replay, and the
+  closed actions of a replay read grey.
+
+### Dogfood 2026-10-06, hosts and entities
+
+- **Each entity is a link.** The new `EntityLink` component links a host, an address, a user or a
+  domain to the page for it. A machine opens its page. Any other value opens the entity page.
+  The investigation API sends an `entities` list with the type, the machine key and the link of
+  each value the run names.
+- **The entity page says who the value is.** The page states the type of the value: an internal
+  address, an external address, a host name, a user account or a domain. It counts the open
+  leads and the true-positive verdicts that name the value. It gives the first and the last
+  sighting. A value with no record gets the sentence "soc-ai knows nothing about it yet." The
+  leads and the observations on the value show for every type.
+- **An address with no machine opens the entity page.** The `/entity` route sent each private
+  address to the host page before it read anything. An address that no machine holds then
+  opened the "never seen" card. The entity page now asks which machine holds the value. The
+  "never seen" card links the entity page.
+- **The palette finds users, domains, addresses and hunts.** The new route
+  `GET /search/entities` searches the accounts that leads and observations name, the domains of
+  the machines, the addresses that no machine holds, and the hunt ids and objectives. Each
+  palette result has a second line, so two results with the same name read apart. A result set
+  from the previous query no longer stays on screen after the query changes.
+- **The host page opens on its open work.** The first lines state the open leads and their
+  state, for example "Lead 11 waits on a decision. Its hunt found threats." The alert verdicts of
+  the last 7 days follow, then the identity sentence. The sentence "Nothing else is known about
+  it yet" shows only when the host has no open lead, no verdict and no identity fact. The leads
+  and the observations sit above the peer graph.
+- **The Alerts card names its two systems.** The card reads "Alerts raised · 7d". A second line
+  counts the alert verdicts on the host. The card says that it always counts 7 days. The Peers
+  panel no longer shows the verdict of the latest investigation.
+- **The profile panel reads the profile setting.** With profiles on, a host with no profile reads
+  "This host has too few events for a profile." The dossier API sends `profiles_enabled`.
+- **The agent banner agrees with the header.** The banner "No agent reports from this machine"
+  shows only when no agent ever reported. A late agent reads "The agent last reported 4 days
+  ago." The header and the primary row of the address table show one last-seen time.
+- **The Hosts search finds an address by its last parts.** ".31" and "2.31" find 192.0.2.31. A
+  cut through the middle of a part still finds nothing.
+- **Each summary card lists what it counts.** The Needs attention card reads "37 need
+  attention: 34 out of date, 3 never built", and each number links the machines it counts. The
+  list takes the filters `health=attention`, `health=stale`, `health=broken` and
+  `conflict=yes`. The summary API adds `out_of_date`. A card at 0 opens an empty filtered list.
+  The address view of broken builds is gone. A machine with no clean build states the sweep
+  error on its row.
+- **The Hosts list names its populations.** The role bar reads "across all 37 machines, quiet
+  ones too" and groups the three buckets under "No confirmed role": weak guess, old guess and
+  no role. The Role menu says which list its counts cover. The panel title reads "Showing 18
+  active machines of 37. Show all." While a search is active, a line says that the cards count
+  every machine.
+- **A click anywhere on a Hosts row opens the machine.** The name link covers the row. The stale
+  chip no longer stops the click.
+- **A sweep failure reads as a sentence.** "192.0.2.46: TimeoutError:" now reads "The sweep could
+  not read 192.0.2.46: the grid timed out." on the host page, on the Hosts list and in the sweep
+  error lists.
+- **The host page cards name their windows.** The Services card reads "Services · 30d" or
+  "Services · last sweep", and says that the 24h and 7d buttons do not change it.
+- **The host page explains its words.** A legend under the profile heading defines measured,
+  learning, blind and stale. The evidence lines name records in words: "zeek.conn records"
+  reads "network connection records". The observations panel says "a sighting counts half as
+  much after 48 hours". The leads note defines a shadow lead. A lead card gives its weight at
+  formation beside the weight at which a lead forms. A withheld role states its confidence on
+  a scale of 1.00 with a word.
+- **The facts counter and the identity sentence count inferred facts.** A guess that the
+  resolver withholds for age or weak evidence counts, and the sentence says that part of it
+  rests on old or weak evidence. A machine with no OS fact reads the OS its agent reports.
+- **The Operator note form has one box.** The second Note box is gone from that form.
+- **Small fixes on the host page.** A lead card says "alert" once. The role chip shows a mark
+  and a help pointer for its tooltip. Three near-equal connection rates read as one number,
+  and the tooltip keeps the three.
+### Dogfood 2026-10-06, hunt page and analytics
+
+- A hunt has one outcome on every surface. The API field `outcome` holds `threat_found`,
+  `no_threat`, `no_answer`, `could_not_run` or `running`. The field `outcome_label` holds the
+  words, and `outcome_headline` holds the reason or the gap. The hunt list, the hunt page, the
+  lead pill and the bell read the same field.
+- A hunt that could not run reads "Could not run" with a grey chip. A hunt that could not answer
+  reads "No answer" and names the gap. A run that did not test its objective shows no confidence
+  ring, no severity chip and no Promote button.
+- The bell reads "Analytic could not run: <title>. <reason>." with the warn tone. The catalog runs
+  of one sweep that share an outcome fold into one line. An agent hunt that ended in an error now
+  reaches the bell.
+- A catalog run reads "<analytic>, last 24 h". A lead hunt reads "Lead 6 hunt: domainadmin on
+  SR-DC01" when the dossier names the host. The API field `title` holds the plain title.
+- The hunt list holds the catalog runs. The row field `starter` reads `catalog`, and
+  `kind=catalog` filters to them.
+- A lead hunt page shows "Lead 6 waits on you." with Promote and Dismiss. Delete moves into a menu
+  on every hunt page.
+- The draft confirm box shows the title, the logic in one sentence, the YAML and the false
+  positives. It states how many documents of the source finding the logic matches. It warns when
+  the logic only repeats alert rule names. A second draft of one finding keeps the first id.
+- The hunt page numbers the findings from F1. The version note of a drafted analytic uses the
+  same number. A draft offers Discard.
+- The approve box states the shadow record and the end of the shadow week. An approval before the
+  end of the week asks a second confirm. The drawer names the end of the shadow week.
+- A running hunt states its step, the usual run time on this grid and what it does now. Each search
+  names what it looked for. A tool error of a known shape reads as plain sentences.
+- The finding button reads Promote. The help line names the detection control only while
+  detection authoring is on. The flow chart calls a hit a hit.
+- The investigation API carries `promotedFinding`: the finding number, the title, the hosts, the
+  attacker and the victim.
+- The alert-only severity note reads "Severity held at medium. The finding cites alerts only. An
+  investigation can raise it." An ATT&CK technique shows only beside a threat finding. The hosts
+  panel reads "Hosts named" when the hunt found no threat. A step for the operator moves to the
+  API field `operatorActions`.
+- The Analytics tab explains "paused by soc-ai" and has a view for it. A candidate reads "Draft".
+  An analytic that the loop has not run yet waits for the next sweep. The filters read Source,
+  Method and Applies to. The Operate panel uses the same three method words.
+- The origin chain summary reads as plain sentences. A tool citation on a finding reads in words.
+
 ### Added
 
+- **The Dashboard panels move and resize.** The panels sit on a grid of 12 columns from
+  react-grid-layout. Click Edit layout, then drag a panel by its handle or resize it from its
+  bottom right corner. The arrow keys move a panel and Shift with an arrow key resizes it. Reset
+  layout puts back the shipped layout, which is the arrangement from before the grid. soc-ai keeps
+  one layout for each user account. With authentication off, the browser keeps the layout.
+  Migration 0061 adds the `dashboard_layout` table.
 - `soc-ai spec-replay` replays the tier 2 detectors hour by hour against the grid. It writes into a
   scratch store and reads the live store read-only. For each profile analytic it reports the hits
   per 100 host-days and the Wilson 95 percent upper bound. It also gives a verdict against the
@@ -99,6 +381,24 @@ production on 2026-10-01. This section holds what they found and what changed.
   container image includes it. See `docs/DEPLOYMENT.md`, "PostgreSQL".
 
 ### Fixed
+
+- The investigation page waits at most 0.75 s for the live acknowledged state of its alert. It waited 3 s on every open while a slow grid answered an id lookup across the whole index pattern.
+
+- A backtest replay never teaches the rule prior and never shows on a host or entity timeline. The fence of the replay reaches both readers.
+
+- multidict moves to 6.9.1 for CVE-2026-104874. The dependency audit of the public mirror found it.
+- **The console shows the whole hunt title.** The hunt page header cut the title at 80
+  characters with an ellipsis. The header now wraps the title and never cuts it. The Hunts list,
+  the scheduled hunts and the re-hunt result wrap an objective to two lines. The bell clamps a
+  notice to three lines. A hover on each clamped title shows the whole text. The bell names a hunt
+  by the whole head line of its objective. The API cut the objective at 80 characters in the
+  middle of a word. The investigation page names its source hunt the same way. The API sent that
+  objective cut at 160 characters. The Investigations list wraps a name that came from a hunt.
+- **The store keeps the whole finding title.** The catalog writer cut a finding title to 60
+  characters before the store. The development range held titles such as "Directory replication
+  requested by a non-machin…". The hunt agent cut a model title at 90 characters. Both writers now
+  keep the title whole under a safety cap of 500 characters. A finding from before this release
+  keeps its cut title.
 
 - The doctor row `index pattern coverage` reads a count that passed the probe budget as grid latency, with the node load as the thing to read. It told the operator to fix connectivity while the reachability rows of the same run passed.
 
@@ -236,6 +536,201 @@ production on 2026-10-01. This section holds what they found and what changed.
   attention.
 - **Service-discovery names and reverse names are not hostnames.** Broadcast addresses leave
   the census.
+
+### Backtest replays (2026-10-06)
+
+- **A backtest replay writes no observation and forms no lead.** A replay is a measurement on an
+  alert that an analyst already closed. Before this change, the verdict of a replay wrote an alert
+  observation like a live run. On the development range, a lead formed 74 seconds after the
+  replay of the same rule. The store now writes no observation for a replay. At startup, soc-ai
+  marks each lead that formed from replays only with the decision `formed_from_backtest`. The
+  mark changes no status.
+- **A backtest replay sends no notification and writes nothing to Security Onion.** The replay
+  runs with auto-acknowledge off. The webhook and the bell skip it. The page of a replay shows
+  each recommended action as not executable, and the execute route refuses it with
+  `backtest_replay`.
+- **The verdict of a replay is not the verdict of its alert.** The Alerts screen, the Dashboard
+  true-positive tile and the auto-triage sweep read the live runs only. No other alert inherits
+  the verdict of a replay. Before this change, an inherited false positive from a replay could
+  acknowledge a live alert. A replay stands alone in the list and takes no primacy from a live
+  run of its alert.
+- **The Investigations list hides backtest replays by default.** On the development range, 12
+  of the 14 true positives of one week were replays. The list and its header figures now count
+  live runs only, and the header names the replays it left out. Turn on **Show backtest
+  replays** to add them. A grey **Backtest replay** chip marks a replay on the list and on its
+  page. `GET /api/v1/investigations` takes `include_backtest=true`. Each row carries `ranBy`, and
+  the page carries `backtestReplays`.
+### Dogfood 2026-10-06, hunts and leads
+
+- **The leads come first on the Hunts page.** The page reads Needs you, Leads, Analytic hits,
+  then Hunts. With no unread hit, Analytic hits is one line: "12 hits in 7 days. None waits on
+  you. Show hits."
+- **Show evidence lists the documents of a hit.** The hits route sends the document ids of each
+  hit, and each id opens the Document drawer. A hit that stores no id has no button. It reads
+  "Open lead 7 to read the documents."
+- **A hit can be marked benign.** A live hit with no lead offers "Mark benign" beside "Hunt this
+  entity". The reason comes from the lead dismissal list. A benign observation counts toward no
+  lead, and a repeat keeps the mark. Migration 0062 adds the dismissal columns to
+  `entity_observations`. The route is `POST /api/v1/hunts/observations/{id}/benign`.
+- **A hit with no lead says why.** The hover states the rule in numbers: "One type at weight
+  0.35. A lead needs 0.85 over 2 types, or 1.50 on one type." A removed analytic shows its title.
+- **The lead page gives each hunt its answer.** Under "Hunts on this lead" each hunt states the
+  first sentence of its narrative and what it could not check. A hunt reads "Lead hunt · 17 steps
+  · 6 min · 0 threat findings". The id moves to the hover.
+- **The lead pill states the worst hunt outcome on record.** A lead whose earlier hunt found a
+  threat reads "Hunted · An earlier hunt found a threat" in red. The lead page adds "3 of 4 hunts
+  found a threat. The newest hunt found none." The pill reads its words and colours from
+  `lib/labels.ts`.
+- **A promoted finding's verdict comes back to its lead.** The lead page lists the findings
+  promoted from its hunts, with the verdict of each investigation. A strip asks to close the lead
+  as promoted. `POST /api/v1/hunts/leads/{id}/close-promoted` closes it, and the lead leaves
+  Needs you. `POST /api/v1/hunts/leads/{id}/keep-open` records the other answer.
+- **The lead header says why this is a lead.** One sentence counts the observations by type, the
+  host and the span. The weights and the z scores sit behind a Scoring toggle. A rate departure
+  reads as a multiple: "That is 14 times the expected rate."
+- **The lead title names the machine.** It reads "Lead 7 · `<name>` · `<address>` · `<role>`" from
+  the hosts resolve route. Each profile observation names the count it measures.
+- **The lead timeline has one order and one clock.** Observations, decisions and promoted
+  findings read newest first. Each observation states its event window in UTC. A reopen names the
+  hand and the cause.
+- **A stale hunt says so.** "The hunt ran 17 days ago. 2 observations are newer than the hunt.
+  Hunt again to read them."
+- **The query of an observation has two acts.** "Copy query" copies it. "Hunt with this query"
+  opens a hunt whose objective names the host and the hours. It names no tool.
+- **Promote states why it waits, under the button.** An observation whose analytic was retired
+  reads "analytic retired on 2026-10-06".
+- **Dismiss opens with no reason chosen.** Four reasons join the list: "Authorized test or scan",
+  "Duplicate of another lead or investigation", "The analytic logic is wrong" and "Lab or test
+  host". After a dismissal the page states the store rule. The observations on the lead and their
+  repeats form no new lead. A new observation can form a new lead at once. No time window
+  applies.
+- **A lead from a backtest replay carries a grey chip.** The timeline row reads the stored note.
+- **New hunt states the range, the cap and the run time.** A time range control reads "The grid
+  answers up to 30 days back." The line "A hunt takes 5 to 8 minutes." reads the run time of the
+  last 50 finished hunts from `GET /api/v1/hunts/composer`. The starters name no tool. A builtin
+  keeps its tool hint in the agent's prompt. A starter that does not apply states its reason.
+- **Small fixes.** A note that ends in a stop reads one stop. The lead header counts hosts and
+  accounts, not entities. The status column of the hunt list is 160 px wide.
+
+### Dogfood 2026-10-06, labels, times and views
+
+- **One map gives each verdict, hunt outcome and run status its label and colour.** The new
+  module `frontend/src/lib/labels.ts` holds one label, one tone, one colour and one chip class
+  for each stored word. needs_more_info reads "Needs more info" on every surface. A false
+  positive is grey, because green means a clean hunt. An error, a cancel and a restart read
+  "Failed". The tooltip names the cause.
+- **The override select lists verdicts in words.** It printed the stored keys, such as
+  `true_positive`. The Detection tuning column and the Runbooks verdict mix spell out "needs
+  more info".
+- **Confidence prints two decimals, with a word for the band.** `confidenceWord` returns High at
+  0.80 and above, Medium from 0.70 to 0.79 and Low under 0.70. The bands follow the server. At
+  0.80 the server keeps a malware verdict local after the investigation loop. Under 0.70 the
+  Oracle reviews a verdict, and no false positive is acknowledged on its own.
+- **One time formatter.** A relative time reads in days from 24 hours on, "4d ago". An absolute
+  time reads "2026-10-01 08:18 EDT" in the browser zone with the zone named. A duration reads
+  "3m 19s". Runbooks, Backtest, the Investigations list and the list freshness marker use it.
+- **Saved views say why they are off.** With authentication off, the list toolbar shows the Save
+  view control disabled. The line beside it reads "Saved views need a signed-in session. This
+  deployment has authentication off."
+- **The Investigations list names its window.** The list opens on all time when the newest run
+  is older than 30 days, and a line says why the window is wider than 24 hours. A search with no
+  match names its window and offers "Search all time".
+- **A host-log alert names its machine.** The flow cell reads "on `<host>` · host log". It read
+  an address, an arrow and a dash. The list API sends the machine as `hostName`.
+- **A row with no verdict says why.** It reads "Running", "Failed. A later run replaced it.",
+  "Failed. An earlier run holds the verdict." or "Failed. No run reached a verdict."
+- **The not-found pages name the absence.** An investigation that does not exist offers "Back
+  to Investigations". The page title and the top bar read "No such investigation" or "No such
+  lead" in place of the id.
+- **Chips and tooltips use plain words.** The run class chip reads "Depth: quick", "Depth:
+  standard" or "Depth: deep", on every row or on none. The rule prior chip reads "rule history".
+  The tooltips say auto-hunt, daily hit limit, minimum precision, draft and paused by soc-ai. An
+  estate outlier reads "unusual across all hosts". The hunt map count reads "1 finding · 0
+  hosts". The severity chip names a rule severity or a finding severity.
+- **The estate model help names an extra package.** The Config help and the Diagnostics row said
+  "the ml extra". They now say that the model needs an extra package that a deployment may not
+  have installed, and that Diagnostics shows whether it is present.
+
+### Dogfood 2026-10-06, the work count and the navigation
+
+- **One "Needs you" count.** `GET /api/v1/needs-you` states five parts and their total: leads
+  that wait on a decision, unread shadow hits, alert groups with no verdict, verdicts that need
+  more info and pending recommended actions. The pending-action count is new. A part that soc-ai
+  cannot read is null, and the total is then a floor.
+- **The Needs-you tile leads the Dashboard.** It states the total with one link for each part. It
+  takes the place of "Awaiting investigation", which said "queue clear" while 11 leads waited.
+- **The sidebar badges state the parts.** Alerts counts the alert groups with no verdict.
+  Investigations counts the verdicts that need more info and the pending actions. Hunts counts the
+  leads and the unread shadow hits.
+- **The bell states the same total.** Its header reads "11 need you · 8 events". The bell lists
+  every open or hunting lead in the warn tone, with no 24 h window. Past five leads, one row
+  states how many more are open.
+- **The bell names each hunt by its outcome.** A hunt row carries an `outcome` field and a chip
+  from `lib/labels.ts`. A run that could not run reads "Analytic could not run: <title>.
+  <reason>." in the warn tone. A hunt that stopped on an error now reaches the bell.
+- **A failed run files its error under "Error".** The timeline put the error step under
+  Validators with a green check. The new group has a warning icon.
+- **The Dashboard shows "…" for a window it has not read.** It showed "0" and "No alerts in the
+  last 30d" while the 30d read ran.
+- **A slow grid reads amber.** The banner reads "Elasticsearch is slow. Counts can be late." when
+  the probe answered late. Each tile that reads the grid says "May be incomplete." Red stays for
+  a probe that did not answer.
+- **The true positives tile counts investigations.** It reads the count of the Investigations
+  list query over the Dashboard window, and links to that list. It read 0 for 7 days while the
+  list said 15.
+- **Status shows a failed analytic run.** A row whose last run failed reads "last run failed 7h
+  ago". The counters have legend lines. The panel states the analytic hits of the last 7 days.
+- **The escalation list names the alert.** Each row names the rule and the host, and reads
+  "Escalation sent 5 days ago. Security Onion has not confirmed a case."
+- **The navigation names.** The groups read Analyst and Operator. Config reads Settings, and
+  Operate reads Status. Notifications left the sidebar. The bell link "View all notifications"
+  opens the page.
+- **Breadcrumbs and help.** A lead page reads "Hunts / Lead 18", and Hunts stays lit. The Status
+  page and an entity page have breadcrumbs. The help button opens the guide. The command palette
+  offers the keyboard shortcuts and the guide.
+- **The top bar.** The workspace switcher shows only when more than one workspace exists. The
+  wordmark reads "soc-ai". `ShellContext.previousPage` holds the page the analyst left, for a back
+  link.
+- **The Alerts empty state.** An empty list offers "Show the last 7 days". On a plain landing an
+  empty 24 h list reads 7 d and 30 d once and lands on the narrowest window that holds a group.
+  The quiet-grid hint no longer says "The configuration is sound."
+- **An alert group row shows its worst verdict.** The row counts the verdicts of its alerts, for
+  example "1 true positive, 8 false positives". The worst verdict opens its investigation. Each
+  event chip names its verdict, for example "True positive 0.62, 4d ago".
+- **An alert group row names who is involved.** It shows the flow of the latest alert, the count
+  of other sources and the machine or the sensor.
+- **Settings, Diagnostics.** A "2 warnings" chip filters the doctor list to its WARN rows.
+- **The layout toggle reads "Done" while editing.** A window under 1024 px says "Widen the window
+  to move or resize panels."
+- **An unknown address says so.** It reads "No page at this address." with a link to the
+  Dashboard. It redirected to the Dashboard with no word.
+
+### Dogfood 2026-10-06, the seams between the branches
+
+- **The hunt list reads one outcome and one title.** A row reads the `title` the server writes. The
+  status dot and the findings cell read the outcome from `lib/labels.ts`. A run that could not run
+  is grey and states no finding count. A run that found a threat is red. The list compared the
+  old codes `failed` and `gap`, so a run that could not run wore the green dot of a clean hunt.
+  The status column is 220 px wide, so "No threat found, visibility gap" fits on one line.
+- **The type chips include Catalog.** The analytic sweep records a run when an analytic cannot read
+  its data. The bell links a folded sweep line to the chip.
+- **The lead surfaces read the outcome labels.** A lead that the settle rule closed reads "Closed.
+  No threat found." The pill and the hunt record read both outcome vocabularies through
+  `lib/labels.ts`. The type chip states the lead rule. Two or more types form a lead at 0.85. One
+  type forms a lead alone when its repeats reach 1.50. The weight hover reads "A sighting
+  counts half as much after 48 hours." on the lead page and the host page.
+- **The investigation page goes back to the page the analyst left.** The back link reads
+  `previousPage` from the shell, with its search, for example "Back to Alerts" or "Back to Lead
+  18". With no page before it, the link reads "Back to Investigations".
+- **The Dashboard reads the status words of `lib/labels.ts`.** A recent investigation that runs
+  reads "Running", and a run that stopped reads "Failed". The hover names the cause. Before this
+  change, the rows read "Investigating" and "Error" from a second map.
+- **A demotion reason reads the console words.** It reads "The analytic wrote 5 hits in 24 hours.
+  Its daily hit limit is 3." and "Its minimum precision is 0.50." The spec fields keep their names,
+  `fire_budget_per_day` and `precision_floor`.
+- **A dismissed recommendation leaves the needs-you count.** The pending-action part reads the
+  stored dismissal of the action card. An undo counts the action again. The console reads the count
+  again after a dismissal and after an undo.
 
 ### Range console dogfood (2026-10-05)
 

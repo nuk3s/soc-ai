@@ -1,4 +1,4 @@
-import { GitBranch } from 'lucide-react';
+import { GitBranch, History } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 
@@ -8,16 +8,19 @@ import {
   getLeads,
   getNeedsYou,
   huntLead,
-  promoteLead,
   reopenLead,
   type Lead,
   type LeadStatusFilter,
 } from '../lib/api';
 import { entityPath } from '../lib/entityPath';
 import { kindLabel, sourceLabel, sourceTitle } from '../lib/kinds';
+import { huntOutcome, outcomeLabel, outcomeMeta } from '../lib/labels';
+import { formedFromBacktest } from '../lib/leadDecisions';
+import { entityCountWords } from '../lib/leadWords';
 import { plural } from '../lib/plural';
 import { absTime, ago } from '../lib/timeRange';
 import {
+  ACTION_HUNT,
   ACTION_HUNT_NOW,
   ACTION_REOPEN,
   CHIP_ANALYTIC_MATCH,
@@ -27,6 +30,7 @@ import {
   CHIP_NO_BENIGN_BASELINE,
   CHIP_ONE_SIGNAL_REPEATED,
   CHIP_RELATED,
+  CHIP_SWEEPS,
   INVESTIGATION_GONE,
   LEADS_NOTE_AUTO_HUNT,
   LEGEND_AUTO_HUNT,
@@ -37,7 +41,6 @@ import {
   PILL_IN_PROGRESS,
   PILL_NEW,
   PILL_PROMOTED,
-  PROMOTE_NEEDS_HUNT,
   TAB_ALL,
   TAB_CLOSED,
   TAB_IN_PROGRESS,
@@ -47,6 +50,7 @@ import {
 import { useAsync } from '../lib/useAsync';
 import { Definition } from './Definition';
 import { CollapseChevron } from './Panel';
+import { LoadingInline } from './States';
 
 // ---------------------------------------------------------------------------
 // Leads — several observations that together are worth looking at.
@@ -66,6 +70,11 @@ import { CollapseChevron } from './Panel';
  *  link still reaches the header of a folded section. */
 const LEADS_BODY_ID = 'leads-body';
 
+/** The live weight at which a lead forms (soc_ai/hunting/weight.py,
+ *  DEFAULT_LEAD_THRESHOLD). The card states it beside the weight at formation,
+ *  so the number has a scale (dogfood 2026-10-06). */
+export const LEAD_FORMS_AT = 0.85;
+
 /** One label per dismissal reason. The lead page reads the same map, so one
  *  reason reads the same word wherever an analyst meets it. */
 export const REASON_LABEL: Record<string, string> = {
@@ -73,8 +82,26 @@ export const REASON_LABEL: Record<string, string> = {
   known_change: 'A known change',
   benign_repeat: 'A benign repeat',
   bad_baseline: 'The baseline is wrong',
+  authorized_test: 'Authorized test or scan',
+  duplicate: 'Duplicate of another lead or investigation',
+  bad_analytic_logic: 'The analytic logic is wrong',
+  lab_host: 'Lab or test host',
   other: 'Other',
 };
+
+/** What a dismissal by an analyst does to the observations, in one line.
+ *
+ *  The store consumes the observations of a closed lead, and a repeat of one
+ *  refreshes the same row, so the repeats stay on the closed lead. A new
+ *  observation is a new row, and it can form a new lead at once. No time
+ *  window applies. `entity` names the host or the account. */
+export function dismissEffect(entity: string | null): string {
+  const on = entity ? ` on ${entity}` : '';
+  return (
+    'The observations on this lead and their repeats form no new lead. ' +
+    `A new observation${on} can form a new lead. Select Reopen to undo.`
+  );
+}
 
 /** The reasons the server accepts. The strip has no lead detail to read them
  *  from, so it carries the list the route validates against. */
@@ -84,7 +111,10 @@ export const DISMISS_REASONS = Object.keys(REASON_LABEL);
  *  clean hunt. It is not in REASON_LABEL: the form never offers it, and the
  *  pill reads the sentence below instead of a reason. */
 export const HUNT_CLEAN_REASON = 'hunt_clean';
-export const HUNT_CLOSED_LABEL = 'Closed. The hunt found no threat.';
+/** The settle rule closes a lead on a clean hunt only, so the closure names
+ *  that outcome in the words of lib/labels.ts. */
+export const HUNT_CLOSED_OUTCOME = `${outcomeLabel('no_threat')}.`;
+export const HUNT_CLOSED_LABEL = `Closed. ${HUNT_CLOSED_OUTCOME}`;
 /** The hand the server signs that closure with reads as the product on screen. */
 export const HUNT_CLOSED_ACTOR = 'soc-ai';
 
@@ -112,9 +142,6 @@ export function leadStatusLabel(status: string): string {
  *  statuses drifted from it, and a cancelled or interrupted hunt sat on the
  *  Needs decision tab while the pill read "In progress" and hid every act. */
 const HUNT_RUNNING = new Set(['running', 'queued']);
-
-/** The outcome label that makes a benign repeat the right reason to dismiss. */
-const NO_THREAT = 'No threat observed';
 
 /** The five states of a lead. The state is what the pill says and what the
  *  actions follow. */
@@ -161,6 +188,8 @@ const LEAD_STATE_STYLE: Record<LeadState, { color: string; border: string; backg
     border: 'rgba(75,139,245,.45)',
     background: 'rgba(75,139,245,.10)',
   },
+  // The colour of a lead whose hunt outcome is not on record. A known outcome
+  // reads its colour from lib/labels.ts, so a threat is never green.
   hunted: { color: '#3fb950', border: 'rgba(63,185,80,.45)', background: 'rgba(63,185,80,.10)' },
   dismissed: { color: '#8b949e', border: 'rgba(139,148,158,.45)', background: 'rgba(139,148,158,.10)' },
   promoted: { color: '#a371f7', border: 'rgba(163,113,247,.45)', background: 'rgba(163,113,247,.10)' },
@@ -192,6 +221,23 @@ export function leftToYou(
   return autoHunt && lead.hunt_queued === false && lead.status === 'open' && !lead.hunt_id;
 }
 
+/** The words the pill states for a lead whose newest hunt found no threat
+ *  while an earlier hunt on the same lead found one. */
+export const EARLIER_THREAT_LABEL = 'An earlier hunt found a threat';
+
+/** True when an earlier hunt on the lead found a threat and the newest did not.
+ *  The pill read the newest hunt alone, so a lead that held a true-positive
+ *  exploit read "No threat observed" in green. The worst outcome on record
+ *  wins. */
+export function earlierThreat(lead: {
+  hunt_threat_count?: number;
+  hunt_outcome?: string | null;
+}): boolean {
+  return (
+    (lead.hunt_threat_count ?? 0) > 0 && huntOutcome({ outcome: lead.hunt_outcome }) !== 'threat_found'
+  );
+}
+
 /** The state pill of one lead. The strip and the lead page render this one
  *  component, so a lead never wears two different words. */
 export function LeadStatePill({
@@ -202,18 +248,33 @@ export function LeadStatePill({
     hunt_status?: string | null;
     hunt_id?: string | null;
     hunt_outcome_label?: string | null;
+    hunt_outcome?: string | null;
+    hunt_threat_count?: number;
     hunt_queued?: boolean;
     dismissed_reason?: string | null;
   };
 }) {
   const state = leadState(lead);
-  const style = LEAD_STATE_STYLE[state];
   const queued = huntQueued(lead);
   const byHunt = closedByHunt(lead);
+  // The outcome of the attached hunt, in the words and the colour of the one
+  // label map. An earlier threat on record outranks a newer clean answer.
+  const key = huntOutcome({ status: lead.hunt_status, outcome: lead.hunt_outcome });
+  const worst = state === 'hunted' && earlierThreat(lead);
+  const toned = state === 'hunted' && (worst || key) ? outcomeMeta(worst ? 'threat_found' : key) : null;
+  const style = toned
+    ? { color: toned.color, border: toned.border, background: toned.bg }
+    : LEAD_STATE_STYLE[state];
   // The tail of the pill names who holds the lead next. A finished hunt names
-  // its outcome. A queued hunt names the loop. A closure by the rule is one
-  // sentence, with no tail.
-  const outcome = state === 'hunted' && lead.hunt_outcome_label ? ` · ${lead.hunt_outcome_label}` : '';
+  // the worst outcome on record. A queued hunt names the loop. A closure by
+  // the rule is one sentence, with no tail. An older server sends the label
+  // alone, and the pill then prints it.
+  const outcomeWords = worst
+    ? EARLIER_THREAT_LABEL
+    : key
+      ? outcomeLabel(key)
+      : lead.hunt_outcome_label;
+  const outcome = state === 'hunted' && outcomeWords ? ` · ${outcomeWords}` : '';
   const tail = byHunt ? '' : queued ? ' · hunt queued' : outcome;
   const title = byHunt ? PILL_CLOSED_BY_HUNT : queued ? PILL_HUNT_QUEUED : LEAD_STATE_TITLE[state];
   return (
@@ -231,24 +292,50 @@ export function LeadStatePill({
   );
 }
 
+/** The hover of the backtest chip, in the words of the mark the server stores. */
+export const CHIP_FORMED_FROM_BACKTEST =
+  'This lead formed from a backtest replay. A backtest replay is a measurement on an alert ' +
+  'an analyst already closed. It is not live evidence.';
+
+/** A grey chip on a lead that formed from backtest replays only. The strip and
+ *  the lead page render this one chip. */
+export function FormedFromBacktestChip({ testId }: { testId?: string }) {
+  return (
+    <span
+      data-testid={testId ?? 'lead-backtest-chip'}
+      title={CHIP_FORMED_FROM_BACKTEST}
+      className="inline-flex flex-none items-center gap-1 whitespace-nowrap rounded-chip border border-border-strong bg-surface-2 px-1.5 py-px text-[10.5px] font-medium text-dim"
+    >
+      <History size={10} strokeWidth={2.5} />
+      Formed from a backtest replay
+    </span>
+  );
+}
+
 /** The name of each action on a lead. The strip and the lead page read the
  *  same words: "Start a hunt" here and "Hunt this lead" there taught an analyst
- *  that the two screens did different things. */
+ *  that the two screens did different things.
+ *
+ *  A lead offers no "Open an investigation". The hunt investigates what it
+ *  finds, so the one manual control of that name sits on a finding with no
+ *  investigation (owner, 2026-10-07). "Promote" beside "Hunt" read as two
+ *  words for one act. */
 export const LEAD_ACTION = {
-  hunt: 'Hunt',
+  hunt: 'Hunt this lead',
   /** The same act on a lead whose hunt the loop already owns. The word is
    *  different because the act is: it does not wait for the loop. */
   huntNow: 'Hunt now',
   dismiss: 'Dismiss',
-  promote: 'Promote',
   viewHunt: 'View hunt',
   readHunt: 'Read hunt',
   huntAgain: 'Hunt again',
   reopen: 'Reopen',
-  openInvestigation: 'Open investigation',
+  /** A link to an investigation that exists. "Open investigation" sat one
+   *  article away from the control that starts one. */
+  viewInvestigation: 'View investigation',
 } as const;
 
-/** What a promoted lead reads in place of the Open investigation link when the
+/** What a promoted lead reads in place of the View investigation link when the
  *  investigation it names has gone. A label, not a sentence, so it sits with
  *  the other action words; its sentence is `INVESTIGATION_GONE`. */
 export const INVESTIGATION_GONE_LABEL = 'The investigation no longer exists';
@@ -256,24 +343,15 @@ export const INVESTIGATION_GONE_LABEL = 'The investigation no longer exists';
 /** The actions a New lead offers while its hunt sits in the loop's queue.
  *  Hunt drops to a secondary act under its own word, because the hunt is
  *  already coming and this button only makes it come sooner. */
-export const LEAD_QUEUED_ACTIONS: string[] = [
-  LEAD_ACTION.dismiss,
-  LEAD_ACTION.promote,
-  LEAD_ACTION.huntNow,
-];
+export const LEAD_QUEUED_ACTIONS: string[] = [LEAD_ACTION.dismiss, LEAD_ACTION.huntNow];
 
 /** The actions each state offers, in the order they are read. */
 export const LEAD_STATE_ACTIONS: Record<LeadState, string[]> = {
-  new: [LEAD_ACTION.hunt, LEAD_ACTION.dismiss, LEAD_ACTION.promote],
+  new: [LEAD_ACTION.hunt, LEAD_ACTION.dismiss],
   in_progress: [LEAD_ACTION.viewHunt],
-  hunted: [
-    LEAD_ACTION.readHunt,
-    LEAD_ACTION.promote,
-    LEAD_ACTION.dismiss,
-    LEAD_ACTION.huntAgain,
-  ],
+  hunted: [LEAD_ACTION.readHunt, LEAD_ACTION.dismiss, LEAD_ACTION.huntAgain],
   dismissed: [LEAD_ACTION.reopen],
-  promoted: [LEAD_ACTION.reopen, LEAD_ACTION.openInvestigation],
+  promoted: [LEAD_ACTION.reopen, LEAD_ACTION.viewInvestigation],
 };
 
 /** The four tabs, in the order an analyst reads them: what waits on a
@@ -294,7 +372,8 @@ const isLeadTab = (v: unknown): v is LeadTab => LEAD_TABS.some((t) => t.id === v
 export const STATUS_LEGEND =
   'New: nobody has acted. In progress: a hunt is running. ' +
   'Hunted: the hunt finished, and the lead waits on a decision. ' +
-  'Closed: an analyst dismissed or promoted the lead, or a clean hunt closed it.';
+  'Closed: an analyst dismissed the lead or opened an investigation on it, or a clean hunt ' +
+  'closed it.';
 
 /** The legend, with the sentence auto-hunt adds. With the loop on, New no
  *  longer means "hunt it": it means the hunt is coming. */
@@ -365,16 +444,15 @@ export function DismissLeadForm({
   leadId,
   reasons,
   onDone,
-  initialReason,
 }: {
   leadId: number;
   reasons: string[];
   onDone: () => void;
-  /** The reason the form opens on. A hunt that observed no threat makes the
-   *  lead a benign repeat, and the analyst had to pick that reason again. */
-  initialReason?: string;
 }) {
-  const [reason, setReason] = useState(initialReason ?? '');
+  // No reason is chosen when the form opens. The form chose "A benign repeat"
+  // after a clean hunt, and one click then dismissed a lead with a reason the
+  // analyst had not read.
+  const [reason, setReason] = useState('');
   const [note, setNote] = useState('');
   const [busy, setBusy] = useState(false);
   const [failed, setFailed] = useState<string | null>(null);
@@ -453,7 +531,6 @@ function LeadRow({
   const [failed, setFailed] = useState<string | null>(null);
   const state = leadState(lead);
   const queued = huntQueued(lead);
-  const benignRepeat = state === 'hunted' && lead.hunt_outcome_label === NO_THREAT;
   const huntPath = lead.hunt_id ? `/hunts/${lead.hunt_id}` : `/leads/${lead.id}`;
 
   const run = async (work: () => Promise<void>, message: string) => {
@@ -479,17 +556,14 @@ function LeadRow({
       navigate(`/hunts/${r.hunt_id}`);
     }, 'The hunt did not start. Try again.');
 
-  const promote = () =>
-    run(async () => {
-      const r = await promoteLead(lead.id);
-      navigate(`/investigation/${encodeURIComponent(r.investigation_id)}`);
-    }, 'The lead was not promoted. Try again.');
-
   const reopen = () =>
     run(async () => {
       await reopenLead(lead.id);
       onChanged();
     }, 'The lead was not reopened. Try again.');
+
+  // The words the type chips on this card already say.
+  const typeChipWords = new Set(lead.kinds.map((k, i) => kindLabel(k, lead.kind_labels?.[i])));
 
   return (
     <li
@@ -509,6 +583,9 @@ function LeadRow({
       </Link>
       {/* The pill is the state. The tab is a filter. */}
       <LeadStatePill lead={lead} />
+      {/* A replay is a measurement on an alert an analyst already closed. A
+          lead it formed reads as live work without the mark. */}
+      {formedFromBacktest(lead) && <FormedFromBacktestChip testId={`lead-backtest-chip-${lead.id}`} />}
       {/* The note above says the loop starts a hunt on every new lead but
           three. This is the row that carries one of the three, and without it
           the analyst waits for a hunt that never comes. */}
@@ -541,7 +618,8 @@ function LeadRow({
       )}
       {lead.entities.length > 1 && (
         <span className="text-[11.5px] text-dim">
-          +{plural(lead.entities.length - 1, 'more entity', 'more entities')}
+          {/* K6: counted by what they are. "entity" is the data model. */}
+          and {entityCountWords(lead.entities.slice(1))} more
         </span>
       )}
       {/* One entity is one lead, and a coordinated attack is several leads. The
@@ -577,7 +655,8 @@ function LeadRow({
         </span>
       )}
       <span className="font-mono text-[11px] text-dim" title={WEIGHT_AT_FORMATION}>
-        weight at formation {lead.weight_at_formation.toFixed(2)}
+        weight at formation {lead.weight_at_formation.toFixed(2)} · a lead forms at{' '}
+        {LEAD_FORMS_AT.toFixed(2)}
       </span>
       <span
         className="text-[11.5px] text-dim"
@@ -603,9 +682,9 @@ function LeadRow({
           "Hunt this lead", which starts a second one. A closed lead offered
           actions the server answers 409 to. */}
       <span className="ml-auto flex items-center gap-2">
-        {/* A queued lead is one the loop has taken. The analyst closes it or
-            takes it further, and Hunt drops to a secondary act under its own
-            word for the case where the loop is behind. */}
+        {/* A queued lead is one the loop has taken. The analyst closes it,
+            and Hunt drops to a secondary act under its own word for the case
+            where the loop is behind. */}
         {state === 'new' && queued && (
           <>
             <button
@@ -615,18 +694,6 @@ function LeadRow({
               className={ACTION_CLASS}
             >
               {LEAD_ACTION.dismiss}
-            </button>
-            {/* An investigation of a lead reads the hunt's findings, so the
-                server refuses a promotion before a hunt has run. The lead
-                page disabled the button and said why; the row let the analyst
-                click and read the refusal in red. */}
-            <button
-              type="button"
-              disabled
-              title={PROMOTE_NEEDS_HUNT}
-              className={PRIMARY_CLASS}
-            >
-              {LEAD_ACTION.promote}
             </button>
             <button
               type="button"
@@ -641,7 +708,13 @@ function LeadRow({
         )}
         {state === 'new' && !queued && (
           <>
-            <button type="button" disabled={busy} onClick={hunt} className={PRIMARY_CLASS}>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={hunt}
+              title={ACTION_HUNT}
+              className={PRIMARY_CLASS}
+            >
               {LEAD_ACTION.hunt}
             </button>
             <button
@@ -651,14 +724,6 @@ function LeadRow({
               className={ACTION_CLASS}
             >
               {LEAD_ACTION.dismiss}
-            </button>
-            <button
-              type="button"
-              disabled
-              title={PROMOTE_NEEDS_HUNT}
-              className={ACTION_CLASS}
-            >
-              {LEAD_ACTION.promote}
             </button>
           </>
         )}
@@ -672,9 +737,6 @@ function LeadRow({
             <Link to={huntPath} className={LINK_CLASS}>
               {LEAD_ACTION.readHunt}
             </Link>
-            <button type="button" disabled={busy} onClick={promote} className={PRIMARY_CLASS}>
-              {LEAD_ACTION.promote}
-            </button>
             <button
               type="button"
               disabled={busy}
@@ -718,7 +780,7 @@ function LeadRow({
               to={`/investigation/${encodeURIComponent(lead.investigation_id)}`}
               className={LINK_CLASS}
             >
-              {LEAD_ACTION.openInvestigation}
+              {LEAD_ACTION.viewInvestigation}
             </Link>
           ))}
       </span>
@@ -751,7 +813,6 @@ function LeadRow({
           <DismissLeadForm
             leadId={lead.id}
             reasons={DISMISS_REASONS}
-            initialReason={benignRepeat ? 'benign_repeat' : undefined}
             onDone={() => {
               setDismissing(false);
               onChanged();
@@ -762,14 +823,28 @@ function LeadRow({
       {lead.observations.length > 0 && (
         <ul className="basis-full pl-1 text-[11.5px] leading-[1.6] text-dim">
           {lead.observations.slice(0, 4).map((o, i) => (
-            <li key={i} className="truncate" title={o.summary ?? undefined}>
+            <li
+              key={i}
+              className="break-words"
+              title={
+                o.occurrences > 1
+                  ? `${o.summary ?? ''} ${CHIP_SWEEPS}`.trim()
+                  : (o.summary ?? undefined)
+              }
+            >
               ·{' '}
-              <span
-                className="mr-1 rounded-chip border border-border-faint px-1 text-[10px] text-faint"
-                title={sourceTitle(o.source, o.shadow)}
-              >
-                {sourceLabel(o.source, o.shadow)}
-              </span>
+              {/* The source chip, unless the card already wears the word as a
+                  type chip. "alert" read twice, one line apart (dogfood
+                  2026-10-06). */}
+              {!typeChipWords.has(sourceLabel(o.source, o.shadow)) && (
+                <span
+                  data-testid="lead-observation-source"
+                  className="mr-1 rounded-chip border border-border-faint px-1 text-[10px] text-faint"
+                  title={sourceTitle(o.source, o.shadow)}
+                >
+                  {sourceLabel(o.source, o.shadow)}
+                </span>
+              )}
               {/* The summary ends in a stop. The sweep count follows it with a
                   comma, so drop the stop and the line does not read "days., seen". */}
               {o.occurrences > 1 && o.summary
@@ -988,7 +1063,7 @@ export function LeadsStrip({
         <div id={LEADS_BODY_ID}>
           {!leads.data ? (
             <div className="px-[15px] py-2.5 text-[12.5px] text-dim">
-              {leads.error ? 'Could not read the leads.' : 'Reading the leads…'}
+              {leads.error ? 'Could not read the leads.' : <LoadingInline>Reading the leads</LoadingInline>}
             </div>
           ) : rows.length === 0 ? (
             // Absence is stated, with the reason it is not an all-clear.

@@ -106,7 +106,7 @@ export function Login() {
               disabled={pending}
               className="w-full rounded-control bg-accent py-[11px] text-[14px] font-semibold text-white hover:bg-accent-deep disabled:opacity-60 disabled:cursor-not-allowed"
             >
-              {pending ? 'Signing in…' : 'Sign in'}
+              {pending ? 'Signing in' : 'Sign in'}
             </button>
 
             <div className="mt-4 flex items-center gap-2 font-mono text-[11.5px] text-faint">

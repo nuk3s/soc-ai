@@ -80,13 +80,107 @@ export function sweepsNotice(catalog: HuntCatalog | null | undefined): string[] 
   return out;
 }
 
-/** The status word, with the run state when the loop does not run it. */
-export function statusLabel(status: string, running: boolean | null | undefined): string {
-  if (running === false && (status === 'live' || status === 'shadow')) {
-    return `${status}, not running`;
+/** The run state of an analytic: the loop runs it, the loop is on and has
+ *  not run it yet, or the loop is off. `undefined` and `null` are unknown. */
+export type RunState = boolean | 'waiting' | null | undefined;
+
+/** True when the loop that runs an analytic of this evaluator is on and has
+ *  not run yet. The analytic then waits for the next sweep. */
+export function loopWaits(
+  catalog: HuntCatalog | null | undefined,
+  evaluator: string | undefined,
+): boolean {
+  if (!catalog) return false;
+  if (runsInProfileSweep(evaluator)) {
+    return (catalog.prior_sweeps_enabled ?? true) && catalog.last_prior_run_at === null;
   }
-  return status;
+  return catalog.sweeps_enabled && catalog.last_sweep_at === null;
+}
+
+/** The run state for a list row, from the catalog. */
+export function runState(
+  catalog: HuntCatalog | null | undefined,
+  evaluator: string | undefined,
+): RunState {
+  const runs = loopRuns(catalog, evaluator);
+  return runs === false && loopWaits(catalog, evaluator) ? 'waiting' : runs;
+}
+
+// The screen words of the stored analytic fields (dogfood 2026-10-06 C6).
+// "tier", "evaluator" and "scope" needed the manual. The stored values do not
+// change: the address bar and the API keep them.
+
+/** The status words. A candidate reads "draft": it is written and never ran. */
+export const STATUS_WORD: Record<string, string> = {
+  candidate: 'draft',
+  live: 'live',
+  shadow: 'shadow',
+  retired: 'retired',
+};
+/** Where the analytic comes from. The stored field is `tier`. */
+export const SOURCE_WORD: Record<string, string> = {
+  shipped: 'shipped with soc-ai',
+  local: 'written here',
+};
+/** How the analytic decides. The stored field is `evaluator`. */
+export const METHOD_WORD: Record<string, string> = {
+  match: 'query',
+  profile: 'baseline',
+  model: 'learned',
+};
+/** What one hit is about. The stored field is `scope_kind`. */
+export const APPLIES_WORD: Record<string, string> = {
+  host: 'host',
+  ip: 'address',
+  user: 'account',
+  cloud_identity: 'cloud account',
+  mailbox: 'mailbox',
+  decoy: 'decoy',
+  rule: 'rule',
+  dataset: 'dataset',
+};
+
+const word = (map: Record<string, string>, key: string | undefined): string =>
+  key ? (map[key] ?? key.replace(/_/g, ' ')) : '';
+
+export const statusWord = (status: string | undefined): string => word(STATUS_WORD, status);
+export const sourceWord = (tier: string | undefined): string => word(SOURCE_WORD, tier);
+export const methodWord = (evaluator: string | undefined): string => word(METHOD_WORD, evaluator);
+export const appliesWord = (scope: string | undefined): string => word(APPLIES_WORD, scope);
+
+/** "every hour", "every 2 h", "every 30 min", "every day". */
+export function intervalWords(minutes: number | null | undefined): string {
+  if (!minutes || minutes <= 0) return '';
+  if (minutes === 60) return 'every hour';
+  if (minutes === 1440) return 'every day';
+  if (minutes % 60 === 0) return `every ${minutes / 60} h`;
+  return `every ${minutes} min`;
+}
+
+/** A window in minutes as words: 1440 reads "24 h", 43200 reads "30 days". */
+export function windowWords(minutes: number | null | undefined): string {
+  if (minutes == null || minutes <= 0) return '';
+  if (minutes >= 2880 && minutes % 1440 === 0) return `${minutes / 1440} days`;
+  if (minutes >= 60 && minutes % 60 === 0) return `${minutes / 60} h`;
+  return `${minutes} min`;
+}
+
+/** The status word, with the run state when the loop does not run it. An
+ *  analytic the loop has not run yet waits for the next sweep. It read
+ *  "shadow, not running" after "Run in shadow", and looked broken. */
+export function statusLabel(status: string, running: RunState, every = 'every hour'): string {
+  const shown = statusWord(status);
+  if (status === 'live' || status === 'shadow') {
+    if (running === 'waiting') {
+      return `${shown}, waits for the next sweep${every ? `, ${every}` : ''}`;
+    }
+    if (running === false) return `${shown}, not running`;
+  }
+  return shown;
 }
 
 export const NOT_RUNNING_TITLE =
   'The sweep that runs this analytic is off, or it has not run yet. The analytic has read no document.';
+
+export const WAITING_TITLE =
+  'The sweep that runs this analytic is on. It has not run this analytic yet. The next sweep runs it.';

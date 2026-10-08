@@ -258,6 +258,12 @@ async def test_the_doctor_says_unavailable_when_the_extra_is_absent(
     assert off.status == "INFO" and off.detail.startswith("unavailable.")
     assert on.status == "WARN" and on.detail.startswith("unavailable.")
     assert "uv sync --extra ml" in on.hint
+    # The row names an extra package. "The ml extra" was a packaging word no
+    # operator reads (dogfood 2026-10-06, operator 5.3). The install command
+    # stays in the hint, where an operator copies it.
+    for row in (off, on):
+        assert "extra package" in row.detail
+        assert "ml extra" not in row.detail
 
 
 async def test_the_doctor_says_off_learning_measured_and_drifted_with_the_date(
@@ -265,7 +271,10 @@ async def test_the_doctor_says_off_learning_measured_and_drifted_with_the_date(
 ) -> None:
     monkeypatch.setattr(estate_model, "ml_installed", lambda: True)
     [off] = await doctor.check_estate_model(settings_kratos)
-    assert (off.status, off.detail) == ("INFO", "off. The ml extra is installed.")
+    assert (off.status, off.detail) == (
+        "INFO",
+        "off. The extra package that the estate model needs is installed.",
+    )
 
     settings = _with(settings_kratos, estate_model_enabled=True)
     engine, maker = await _maker(settings)
@@ -309,7 +318,10 @@ async def test_the_doctor_off_row_keeps_the_last_fit(
     # Negative control first: no store on disk. The row reads plain "off", and the
     # doctor does not create a store to find that out.
     [bare] = await doctor.check_estate_model(settings)
-    assert (bare.status, bare.detail) == ("INFO", "off. The ml extra is installed.")
+    assert (bare.status, bare.detail) == (
+        "INFO",
+        "off. The extra package that the estate model needs is installed.",
+    )
     assert not (tmp_path / "data" / "soc-ai.db").exists()
 
     engine, maker = await _maker(settings)
@@ -326,7 +338,8 @@ async def test_the_doctor_off_row_keeps_the_last_fit(
     [off] = await doctor.check_estate_model(settings)
     assert off.status == "INFO"
     assert off.detail == (
-        "off. The ml extra is installed. The last fit ran on 2026-10-05 01:50 UTC, "
+        "off. The extra package that the estate model needs is installed. "
+        "The last fit ran on 2026-10-05 01:50 UTC, "
         "in state learning."
     )
 
@@ -342,7 +355,11 @@ def test_the_setting_is_off_by_default_and_in_the_console() -> None:
     assert spec.type == "bool"
     assert spec.hot
     assert spec.section == "Behavioural profiles"
-    assert "ml extra" in spec.help
+    assert (
+        "The model needs an extra package your deployment may not have installed. "
+        "Diagnostics shows whether it is present." in spec.help
+    )
+    assert "ml extra" not in spec.help
     assert "—" not in spec.help and "–" not in spec.help
     for sentence in spec.help.split(". "):
         assert len(sentence.split()) <= 25, sentence

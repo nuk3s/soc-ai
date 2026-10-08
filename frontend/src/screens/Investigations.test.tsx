@@ -80,7 +80,7 @@ describe('Investigations server-side query', () => {
   it('sends a Status filter change to the server and resets the page', async () => {
     mount('/investigations');
     fireEvent.click(await screen.findByRole('button', { name: 'Status' }));
-    fireEvent.click(screen.getByLabelText('Error'));
+    fireEvent.click(screen.getByLabelText('Failed: error'));
     await waitFor(() => {
       const q = listInvestigations.mock.calls[listInvestigations.mock.calls.length - 1][0];
       expect(q.status).toEqual(['error']);
@@ -225,7 +225,7 @@ describe('Investigations pipeline_error deep link', () => {
   it('names the search when the search emptied the list', async () => {
     listInvestigations.mockResolvedValue(list([], { total: 0, totalAll: 42 }));
     mount('/investigations?q=nothing-matches');
-    expect(await screen.findByText('No investigation matches the search.')).toBeTruthy();
+    expect(await screen.findByText('No investigation matches the search in the last 24 hours.')).toBeTruthy();
     expect(screen.queryByText(/Widen the time range/)).toBeNull();
   });
 
@@ -458,7 +458,7 @@ describe('Investigations retry tucking', () => {
     expect(screen.getAllByText('GPL ICMP Large ICMP Packet')).toHaveLength(1);
     const reveal = screen.getByRole('button', { name: /1 earlier/ });
     fireEvent.click(reveal);
-    expect(screen.getByText('earlier run')).toBeTruthy();
+    expect(screen.getByText('superseded run')).toBeTruthy();
   });
 });
 
@@ -476,8 +476,8 @@ describe('Investigations verdict filter options', () => {
     expect(screen.getByLabelText('Pipeline error')).toBeTruthy();
 
     fireEvent.click(screen.getByRole('button', { name: 'Status' }));
-    expect(screen.getByLabelText('Error')).toBeTruthy();
-    expect(screen.getByLabelText('Interrupted')).toBeTruthy();
+    expect(screen.getByLabelText('Failed: error')).toBeTruthy();
+    expect(screen.getByLabelText('Failed: interrupted')).toBeTruthy();
   });
 });
 
@@ -549,7 +549,7 @@ describe('Investigations rows open without a mouse', () => {
     mount('/investigations');
     await screen.findAllByText('GPL ICMP Large ICMP Packet');
     fireEvent.click(screen.getByRole('button', { name: /1 earlier/ }));
-    const link = screen.getByRole('link', { name: /earlier run/ });
+    const link = screen.getByRole('link', { name: /superseded run/ });
     expect(link.getAttribute('href')).toBe('/investigation/INV-RETRY');
   });
 

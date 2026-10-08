@@ -4,6 +4,7 @@
 // classes still come from tailwind.config tokens elsewhere.
 // ---------------------------------------------------------------------------
 
+import { VERDICT_LABELS } from './labels';
 import { CHIP_CATALOG_RUN, TYPE_LEAD, TYPE_MANUAL, TYPE_SCHEDULE } from './tooltips';
 import type { DetectionKind, HuntKind, Severity, Verdict } from './types';
 
@@ -37,15 +38,20 @@ export interface VerdictMeta {
   border: string;
   wash: string;
 }
+// The words and colours come from lib/labels.ts, the one map every screen
+// reads. This record keeps the older shape for the screens that index it.
+// needs_more_info read "Needs info" here and "Needs more info" on the override
+// select; a false positive wore sage green, the colour of a clean hunt.
+function verdictToken(v: Verdict): VerdictMeta {
+  const m = VERDICT_LABELS[v];
+  return { label: m.label, color: m.color, bg: m.bg, border: m.border, wash: m.bg.replace(/,\.\d+\)$/, ',.07)') };
+}
 export const VERDICT: Record<Verdict, VerdictMeta> = {
-  true_positive: { label: 'True positive', color: '#f04438', bg: 'rgba(240,68,56,.10)', border: 'rgba(240,68,56,.32)', wash: 'rgba(240,68,56,.07)' },
-  false_positive: { label: 'False positive', color: '#7ba893', bg: 'rgba(123,168,147,.10)', border: 'rgba(123,168,147,.32)', wash: 'rgba(123,168,147,.07)' },
-  needs_more_info: { label: 'Needs info', color: '#f5a623', bg: 'rgba(245,166,35,.10)', border: 'rgba(245,166,35,.32)', wash: 'rgba(245,166,35,.07)' },
-  // Self-consistency vote didn't converge — "the model could not decide", a
-  // terminal hedge distinct from needs_more_info's "needs YOUR input" amber.
-  // Gold matches the interrupted/warning tone used elsewhere (#d29922).
-  inconclusive: { label: 'Inconclusive', color: '#d29922', bg: 'rgba(210,153,34,.10)', border: 'rgba(210,153,34,.32)', wash: 'rgba(210,153,34,.07)' },
-  untriaged: { label: 'Untriaged', color: '#6b7484', bg: 'rgba(107,116,132,.08)', border: 'rgba(107,116,132,.25)', wash: 'rgba(107,116,132,.05)' },
+  true_positive: verdictToken('true_positive'),
+  false_positive: verdictToken('false_positive'),
+  needs_more_info: verdictToken('needs_more_info'),
+  inconclusive: verdictToken('inconclusive'),
+  untriaged: verdictToken('untriaged'),
 };
 
 export interface KindMeta {
@@ -116,6 +122,8 @@ export const TIMELINE_GROUP_COLOR: Record<string, string> = {
   Decision: '#f79009',
   Validators: '#3fb950',
   Oracle: '#e0a83a',
+  // A failed run, in the warning tone. It sat under Validators in green.
+  Error: '#f5a623',
 };
 
 export function tint(hex: string, a = 0.12): string {

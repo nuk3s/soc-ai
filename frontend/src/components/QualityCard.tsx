@@ -146,15 +146,15 @@ export function gradeBreakdown(p: QualityPoint): string | null {
  * repointing a route at a different backend moves the numbers with the code
  * unchanged, which is the exact failure this subsystem was built for.
  *
- * The commit is truncated to 12 characters, the length everything else that
- * shows one uses; the full value is in the title attribute at the call site.
+ * The commit shows whole. A 12-character cut hid the rest of it, and the
+ * owner banned the cut on 2026-10-07. The line wraps where it is long.
  * Null when the row carries none of the three, so a pre-0040 point keeps
  * exactly the layout it had, rather than gaining a line of em-dashes.
  */
 export function measuredOn(p: QualityPoint): string | null {
   const parts: string[] = [];
   if (p.app_version) parts.push(`v${p.app_version}`);
-  if (p.code_commit) parts.push(p.code_commit.slice(0, 12));
+  if (p.code_commit) parts.push(p.code_commit);
   if (p.analyst_model) parts.push(p.analyst_model);
   return parts.length > 0 ? parts.join(' · ') : null;
 }
@@ -507,7 +507,7 @@ export function QualityCard({
   }
   if (points.length === 0) {
     return loading ? (
-      <LoadingState label="Loading…" />
+      <LoadingState label="Loading" />
     ) : (
       <div className="px-[15px] py-3.5 text-[12.5px] leading-[1.6] text-dim">
         {/* With the nightly already on, "enable it" sends the operator to a
@@ -622,7 +622,7 @@ export function QualityCard({
       {measured && (
         <div
           data-testid="quality-measured-on"
-          className="mt-1 truncate text-[11px] text-faint"
+          className="mt-1 break-words text-[11px] text-faint"
           title={`Measured on: ${[latest.app_version && `soc-ai ${latest.app_version}`, latest.code_commit && `commit ${latest.code_commit}`, latest.analyst_model && `analyst model ${latest.analyst_model}`].filter(Boolean).join(', ')}`}
         >
           {measured}

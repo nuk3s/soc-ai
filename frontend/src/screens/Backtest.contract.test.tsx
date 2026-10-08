@@ -117,6 +117,23 @@ describe('Backtest result claims', () => {
     ).toBeTruthy();
   });
 
+  it('dates the run with the shared formatter, relative and absolute with its zone', async () => {
+    // Three date formats sat on three pages. This one read "Aug 08, 2026,
+    // 07:00:00" with no zone.
+    await mount(scored(1, 2));
+    const ran = await screen.findByTestId('backtest-ran-at');
+    expect(ran.textContent).toMatch(/^Ran \d+d ago, at 2026-08-0[78] \d{2}:\d{2} \S+$/);
+    expect(ran.textContent).not.toMatch(/Aug/);
+  });
+
+  it('names a needs more info verdict in the words of every other page', async () => {
+    const d = scored(1, 2);
+    d.results!.metrics.n_needs_more_info = 1;
+    await mount(d);
+    expect(await screen.findByText(/soc-ai returned Needs more info on 1 alert/)).toBeTruthy();
+    expect(screen.queryByText(/Needs info\b/)).toBeNull();
+  });
+
   it('says why fewer alerts were replayed than requested', async () => {
     await mount(scored(1, 2));
     expect(await screen.findByTestId('backtest-skipped')).toHaveTextContent(/3 distinct pairs/);

@@ -1,5 +1,4 @@
 import {
-  Bell,
   BookOpen,
   ChevronDown,
   ChevronRight,
@@ -17,7 +16,8 @@ import {
 } from 'lucide-react';
 import { NavLink, useLocation } from 'react-router-dom';
 import { type ReactNode, useEffect, useState } from 'react';
-import { getAbout, getMe, getNeedsYou, onNeedsYouChanged } from '../lib/api';
+import { getAbout, getMe } from '../lib/api';
+import { needsYouPart, useNeedsYouCount } from '../lib/needsYou';
 import type { AboutInfo, Me } from '../lib/types';
 import { ScopeMark, Wordmark } from '../components/Logo';
 import { AccountMenu } from './AccountMenu';
@@ -45,7 +45,8 @@ interface NavGroup {
 
 const NAV_GROUPS: NavGroup[] = [
   {
-    label: 'Investigate',
+    // The analyst's loop. Always open.
+    label: 'Analyst',
     items: [
       { to: '/dashboard', label: 'Dashboard', icon: <LayoutDashboard size={16} /> },
       { to: '/alerts', label: 'Alerts', icon: <Triangle size={16} /> },
@@ -53,8 +54,10 @@ const NAV_GROUPS: NavGroup[] = [
       // Sits beside Investigations rather than under Config: the dossier is a
       // network view an analyst pivots INTO from an alert, not a settings panel.
       { to: '/hosts', label: 'Hosts', icon: <Server size={16} />, match: ['/hosts'] },
-      { to: '/notifications', label: 'Notifications', icon: <Bell size={16} /> },
-      { to: '/hunts', label: 'Hunts', icon: <Crosshair size={16} />, match: ['/hunts'] },
+      // A lead lives on the Hunts page, so a lead page keeps Hunts lit.
+      // Notifications left the sidebar: the bell opens the same list, and
+      // its "View all notifications" link opens the page.
+      { to: '/hunts', label: 'Hunts', icon: <Crosshair size={16} />, match: ['/hunts', '/leads'] },
     ],
   },
   {
@@ -62,14 +65,15 @@ const NAV_GROUPS: NavGroup[] = [
     // chain are trustworthy, replay history, configure. Collapsed by default
     // (see OPERATE_NAV_KEY) so a first-run session reads as an analyst tool,
     // not a cockpit — Wave-2 progressive disclosure.
-    label: 'Operate',
+    label: 'Operator',
     collapsible: true,
     items: [
-      // The hub entry leads the group (route lives in App.tsx).
-      { to: '/operate', label: 'Operate', icon: <Wrench size={16} /> },
+      // The hub entry leads the group (route lives in App.tsx). The group and
+      // its first page both read "Operate", so the page is "Status" now.
+      { to: '/operate', label: 'Status', icon: <Wrench size={16} /> },
       { to: '/runbooks', label: 'Runbooks', icon: <BookOpen size={16} /> },
       { to: '/backtest', label: 'Backtest', icon: <History size={16} /> },
-      { to: '/config', label: 'Config', icon: <Settings size={16} /> },
+      { to: '/config', label: 'Settings', icon: <Settings size={16} /> },
     ],
   },
 ];
@@ -93,6 +97,45 @@ function readStoredOperateCollapsed(): boolean {
   }
 }
 
+/** One badge on a nav entry: a part of the needs-you count. */
+interface NavBadge {
+  testId: string;
+  /** The count, or null when the server could not read it. */
+  value: number | null;
+  title: string;
+}
+
+/** "7d" as "7 days", "24h" as "24 hours", for a badge tooltip. */
+function windowWords(range: string): string {
+  const m = range.match(/^(\d+)([mhd])$/);
+  if (!m) return range;
+  const n = Number(m[1]);
+  const unit = m[2] === 'm' ? 'minute' : m[2] === 'h' ? 'hour' : 'day';
+  return `${n} ${unit}${n === 1 ? '' : 's'}`;
+}
+
+function NeedsYouBadge({ badge, failed, loaded }: { badge: NavBadge; failed: boolean; loaded: boolean }) {
+  // Unknown reads as "?", grey. Zero reads as nothing, because a standing "0"
+  // teaches the eye to skip the badge. Nothing shows before the first read.
+  if (!loaded && !failed) return null;
+  const unknown = failed || badge.value === null;
+  if (!unknown && !badge.value) return null;
+  return (
+    <span
+      data-testid={badge.testId}
+      className="rounded-chip border px-1.5 py-px text-[10px] font-semibold tabular-nums"
+      style={
+        unknown
+          ? { color: '#8b949e', borderColor: 'rgba(139,148,158,.45)', background: 'rgba(139,148,158,.1)' }
+          : { color: '#d29922', borderColor: 'rgba(210,153,34,.45)', background: 'rgba(210,153,34,.1)' }
+      }
+      title={unknown ? 'Could not read what needs you. Open the page to try again.' : badge.title}
+    >
+      {unknown ? '?' : badge.value}
+    </span>
+  );
+}
+
 export function Sidebar() {
   const { collapsed, toggleNav } = useShell();
   const location = useLocation();
@@ -107,39 +150,34 @@ export function Sidebar() {
   // since there's no SSR concern for this value).
   const [operateStoredCollapsed, setOperateStoredCollapsed] = useState<boolean>(readStoredOperateCollapsed);
 
-  // What waits on the analyst: the unread shadow hits plus the leads that wait
-  // on a decision. The Needs-you strip at the top of the Hunts page states the
-  // same number, so the nav and the page cannot disagree.
-  // A failed read is not a zero. The badge went away on a 503, and the nav then
-  // read exactly like a quiet day.
-  const [needsYou, setNeedsYou] = useState(0);
-  const [needsYouFailed, setNeedsYouFailed] = useState(false);
+  // What waits on the analyst, as badges on the three entries that hold it.
+  // Every badge is a part of the one needs-you count, which the Dashboard tile
+  // and the bell read from the same provider, so the badges add up to the
+  // number those two surfaces state. A failed read is not a zero. The badge
+  // went away on a 503, and the nav then read exactly like a quiet day.
+  const needsYou = useNeedsYouCount();
+  const badges: Record<string, NavBadge> = {
+    '/alerts': {
+      testId: 'sidebar-needs-you-alerts',
+      value: needsYouPart(needsYou.data, 'untriaged_groups'),
+      title: `Alert groups with no verdict in the last ${windowWords(needsYou.data?.alert_window ?? '7d')}. The count hides acknowledged groups.`,
+    },
+    '/investigations': {
+      testId: 'sidebar-needs-you-investigations',
+      value: needsYouPart(needsYou.data, 'needs_more_info', 'pending_actions'),
+      title: `Verdicts that need more info, plus recommended actions that wait for you, in the last ${windowWords(needsYou.data?.verdict_window ?? '30d')}.`,
+    },
+    '/hunts': {
+      testId: 'sidebar-needs-you',
+      value: needsYouPart(needsYou.data, 'unread_shadow_hits', 'leads_needing_decision'),
+      title: 'Unread shadow hits, plus leads that wait on a decision. Open Hunts to read them.',
+    },
+  };
 
   useEffect(() => {
     if (!ready) return;
     getMe().then(setMe).catch(() => {/* keep placeholder */});
     getAbout().then(setAbout).catch(() => {/* version line just stays hidden */});
-  }, [ready]);
-
-  useEffect(() => {
-    if (!ready) return;
-    const read = () =>
-      getNeedsYou()
-        .then((r) => {
-          setNeedsYou(r.total);
-          setNeedsYouFailed(false);
-        })
-        .catch(() => setNeedsYouFailed(true));
-    read();
-    const timer = window.setInterval(read, 60_000);
-    // The API emits the change the moment a hit is read or a lead moves.
-    // Without this the badge held the old count for up to 60 s beside a page
-    // that had already cleared it.
-    const stop = onNeedsYouChanged(read);
-    return () => {
-      window.clearInterval(timer);
-      stop();
-    };
   }, [ready]);
 
   // Force-expand: while the active route lives inside the Operate group, it
@@ -231,23 +269,12 @@ export function Sidebar() {
                           {n.label}
                         </span>
                       )}
-                      {!collapsed && n.to === '/hunts' && (needsYou > 0 || needsYouFailed) && (
-                        <span
-                          data-testid="sidebar-needs-you"
-                          className="rounded-chip border px-1.5 py-px text-[10px] font-semibold tabular-nums"
-                          style={
-                            needsYouFailed
-                              ? { color: '#8b949e', borderColor: 'rgba(139,148,158,.45)', background: 'rgba(139,148,158,.1)' }
-                              : { color: '#d29922', borderColor: 'rgba(210,153,34,.45)', background: 'rgba(210,153,34,.1)' }
-                          }
-                          title={
-                            needsYouFailed
-                              ? 'Could not read what needs you. Open Hunts to try again.'
-                              : 'Unread shadow hits, plus leads that wait on a decision. Open Hunts to read them.'
-                          }
-                        >
-                          {needsYouFailed ? '?' : needsYou}
-                        </span>
+                      {!collapsed && badges[n.to] && (
+                        <NeedsYouBadge
+                          badge={badges[n.to]}
+                          failed={needsYou.failed && !needsYou.data}
+                          loaded={needsYou.data !== null}
+                        />
                       )}
                       {!collapsed && n.dev && (
                         <span

@@ -20,6 +20,7 @@ vi.mock('../lib/api', () => ({
   getInvestigations: vi.fn(() => Promise.resolve([])),
   getConfig: vi.fn(() => Promise.resolve({ groups: [], tokens: [], users: [], dangerHost: '' })),
   listMachines: vi.fn(() => Promise.resolve({ rows: [], total: 0, limit: 8, offset: 0, sort: 'last_seen', dir: 'desc' })),
+  searchEntityIndex: vi.fn(() => Promise.resolve({ q: '', hits: [] })),
   signOut: vi.fn(),
 }));
 

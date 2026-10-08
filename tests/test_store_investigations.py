@@ -1390,10 +1390,12 @@ async def test_prior_outcomes_rationale_digest_truncates_on_word_boundary(
 
         got = await _lookup(db)
         digest = got[0]["rationale_digest"]
-        assert digest is not None and digest.endswith("…")
-        assert len(digest) <= 281  # 280 + the ellipsis
-        # Word boundary: the last token before the ellipsis is a whole word.
-        assert digest[:-1].rstrip().split()[-1] in long_rationale.split()
+        assert digest is not None and digest.endswith(" [truncated]")
+        assert "…" not in digest
+        body = digest.removesuffix(" [truncated]")
+        assert len(body) <= 280
+        # Word boundary: the last token before the marker is a whole word.
+        assert body.rstrip().split()[-1] in long_rationale.split()
         # Short rationales pass through with whitespace collapsed; None stays None.
         assert got[1]["rationale_digest"] == "short note"
         assert got[2]["rationale_digest"] is None

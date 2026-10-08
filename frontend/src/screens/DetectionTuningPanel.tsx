@@ -1,5 +1,4 @@
 import { useState } from 'react';
-import { middleEllipsis } from '../lib/text';
 import {
   clearRulePrior,
   type DetectionNomination,
@@ -21,7 +20,7 @@ import { useAsync } from '../lib/useAsync';
 
 // The nominations grid. One template for the header and the rows, so the
 // columns cannot drift apart.
-const NOMINATION_COLS = 'grid-cols-[1fr_80px_120px_170px_110px_90px]';
+const NOMINATION_COLS = 'grid-cols-[1fr_80px_150px_170px_110px_90px]';
 
 /**
  * The Rule prior cell: what the rule prior did on this rule. Covered alerts
@@ -188,7 +187,9 @@ export function DetectionTuningPanel({
         <div className={`grid ${NOMINATION_COLS} gap-2 border-b border-border bg-surface-2 px-3.5 py-2 text-[10.5px] font-semibold uppercase tracking-[.06em] text-faint`}>
           <div>Rule</div>
           <div>Alerts</div>
-          <div>FP / TP / NMI</div>
+          <div title="False positive, true positive and needs more info verdicts on the rule.">
+            FP / TP / Needs more info
+          </div>
           <div title={RULE_PRIOR_COLUMN}>Rule prior</div>
           <div>Recommend</div>
           <div />
@@ -214,8 +215,8 @@ export function DetectionTuningPanel({
                 className={`grid ${NOMINATION_COLS} items-center gap-2 border-b border-border-faint px-3.5 py-3 last:border-b-0`}
               >
                 <div className="min-w-0">
-                  <div className="truncate text-[13px] font-medium" title={n.rule_name}>
-                    {middleEllipsis(n.rule_name)}
+                  <div className="break-words text-[13px] font-medium" title={n.rule_name}>
+                    {n.rule_name}
                   </div>
                   <div className="mt-0.5 text-[11px] leading-[1.4] text-faint">{n.reason}</div>
                   {analystSignal(n) && (
@@ -290,14 +291,14 @@ export function DetectionTuningPanel({
             className="grid grid-cols-[1fr_140px_90px] items-center gap-2 border-b border-border-faint px-3.5 py-3 last:border-b-0"
           >
             <div className="min-w-0">
-              <div className="truncate text-[13px] font-medium" title={o.rule_name}>
-                {middleEllipsis(o.rule_name)}
+              <div className="break-words text-[13px] font-medium" title={o.rule_name}>
+                {o.rule_name}
               </div>
               {o.reason && (
                 <div className="mt-0.5 text-[11px] leading-[1.4] text-faint">{o.reason}</div>
               )}
             </div>
-            <div className="truncate text-[11.5px] text-dim" title={o.created_by}>
+            <div className="break-words text-[11.5px] text-dim" title={o.created_by}>
               {o.created_by}
             </div>
             <div className="text-right">

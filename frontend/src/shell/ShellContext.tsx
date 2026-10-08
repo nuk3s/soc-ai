@@ -13,6 +13,9 @@ interface ShellState {
   /** True when ANY modal surface is open (drawer(s) or the palette). Generalizes
    * `paletteOpen` so keyboard layers can disarm on any modal. */
   modalOpen: boolean;
+  /** How many modal surfaces are open. The Ask soc-ai panel compares it with
+   *  the count at its own open, so Escape goes to the newest layer. */
+  modalCount: number;
   /** Increment/decrement the open-modal count. Drawers + palette call these on
    * open/close so `modalOpen` reflects the whole modal stack. */
   pushModal: () => void;
@@ -28,6 +31,25 @@ interface ShellState {
    *  machine name. */
   crumbName: CrumbName | null;
   setCrumbName: (value: CrumbName | null) => void;
+  /** The in-shell page the analyst was on before this one, with its search,
+   *  or null on the first page of a visit. A back link reads it: the
+   *  investigation page said "Back to Alerts" to an analyst who came from
+   *  Investigations. Pages that open a record default to their own list
+   *  when it is null. */
+  previousPage: PreviousPage | null;
+  setPreviousPage: (value: PreviousPage | null) => void;
+  /** The keyboard shortcut sheet, opened from the command palette. */
+  shortcutsOpen: boolean;
+  openShortcuts: () => void;
+  closeShortcuts: () => void;
+}
+
+/** The page before this one: where a back link goes, and the words on it. */
+export interface PreviousPage {
+  /** The path with its search, e.g. "/alerts?range=30d". */
+  path: string;
+  /** The page name for the link, e.g. "Alerts", "Hunt", "Lead 18". */
+  label: string;
 }
 
 /** A route key and the name to show for it. */
@@ -45,6 +67,8 @@ export function ShellProvider({ children }: { children: ReactNode }) {
   const [ws, setWs] = useState('');
   const [triageNonce, setTriageNonce] = useState(0);
   const [crumbName, setCrumbName] = useState<CrumbName | null>(null);
+  const [previousPage, setPreviousPage] = useState<PreviousPage | null>(null);
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
 
   // hydrate persisted sidebar state
   useEffect(() => {
@@ -73,6 +97,8 @@ export function ShellProvider({ children }: { children: ReactNode }) {
   const requestTriage = useCallback(() => setTriageNonce((n) => n + 1), []);
   const pushModal = useCallback(() => setModalCount((n) => n + 1), []);
   const popModal = useCallback(() => setModalCount((n) => Math.max(0, n - 1)), []);
+  const openShortcuts = useCallback(() => setShortcutsOpen(true), []);
+  const closeShortcuts = useCallback(() => setShortcutsOpen(false), []);
   // Palette is tracked by its own flag; OR it in so an empty modal count with the
   // palette open still reads as "a modal is open".
   const modalOpen = modalCount > 0 || paletteOpen;
@@ -86,6 +112,7 @@ export function ShellProvider({ children }: { children: ReactNode }) {
       closePalette,
       togglePalette,
       modalOpen,
+      modalCount,
       pushModal,
       popModal,
       ws,
@@ -94,9 +121,18 @@ export function ShellProvider({ children }: { children: ReactNode }) {
       requestTriage,
       crumbName,
       setCrumbName,
+      previousPage,
+      setPreviousPage,
+      shortcutsOpen,
+      openShortcuts,
+      closeShortcuts,
     }),
     [
       crumbName,
+      previousPage,
+      shortcutsOpen,
+      openShortcuts,
+      closeShortcuts,
       collapsed,
       toggleNav,
       paletteOpen,
@@ -104,6 +140,7 @@ export function ShellProvider({ children }: { children: ReactNode }) {
       closePalette,
       togglePalette,
       modalOpen,
+      modalCount,
       pushModal,
       popModal,
       ws,

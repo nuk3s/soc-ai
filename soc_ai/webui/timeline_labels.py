@@ -4,8 +4,8 @@ Deterministic mapping from an investigation event (kind + payload) to a short
 title an operator can read at a glance; the raw JSON stays available behind a
 per-row expander. No LLM — labels must be instant and never hallucinate. JSON is
 fine for the record (the ``detail`` field), NEVER for the title: humans don't
-read JSON, machines do. Titles target ≤ ~80 chars; anything longer belongs in
-the expander.
+read JSON, machines do. A title is never cut; a builder keeps it short, and
+the raw record stays in the expander.
 """
 
 from __future__ import annotations
@@ -14,9 +14,7 @@ import json
 from collections.abc import Callable
 from typing import Any
 
-_TITLE_MAX = 120  # hard ceiling; individual phrases are capped well below this
-
-# What each tool "checks", for "Checking X…" / "Checked X" phrasing. Keys are
+# What each tool "checks", for "Checking X" / "Checked X" phrasing. Keys are
 # bare tool names (any leading ``t_`` is stripped first). Cover every registered
 # tool (soc_ai.tools) so the _humanize fallthrough is rare.
 _TOOL_NOUN: dict[str, str] = {
@@ -50,18 +48,18 @@ _TOOL_NOUN: dict[str, str] = {
     "add_case_comment": "case comment",
 }
 
-# Write tools read badly as "Checking case escalation…" — give them real verbs.
+# Write tools read badly as "Checking case escalation" — give them real verbs.
 # bare name → (in-progress title, completed title)
 _WRITE_TOOL_PHRASES: dict[str, tuple[str, str]] = {
     "ack_alert": (
-        "Acknowledging the alert in Security Onion…",
+        "Acknowledging the alert in Security Onion",
         "Alert acknowledged in Security Onion",
     ),
     "escalate_to_case": (
-        "Escalating to a Security Onion case…",
+        "Escalating to a Security Onion case",
         "Escalated to a Security Onion case",
     ),
-    "add_case_comment": ("Adding a case comment…", "Case comment added"),
+    "add_case_comment": ("Adding a case comment", "Case comment added"),
 }
 
 _ICON: dict[str, str] = {
@@ -166,12 +164,11 @@ def _tool_label(name: str) -> str:
     return noun if noun[:1].isupper() else noun[:1].upper() + noun[1:]
 
 
-def _clip(s: str, n: int) -> str:
-    return s if len(s) <= n else s[: n - 1] + "…"
+def _phrase(v: Any) -> str:
+    """Coerce ANY value to a single-line, human phrase — never JSON.
 
-
-def _phrase(v: Any, n: int = 60) -> str:
-    """Coerce ANY value to a short, single-line, human phrase — never JSON.
+    The phrase is whole. A cut with an ellipsis hid the rest of the text, so
+    the owner banned it (2026-10-07). The console wraps a long title.
 
     Dicts pick their most message-like field; lists pick their first element;
     strings are whitespace-collapsed (tracebacks become one line) and stripped
@@ -180,8 +177,7 @@ def _phrase(v: Any, n: int = 60) -> str:
     if v is None:
         return ""
     if isinstance(v, str):
-        s = " ".join(v.replace("{", " ").replace("}", " ").split())
-        return _clip(s, n)
+        return " ".join(v.replace("{", " ").replace("}", " ").split())
     if isinstance(v, bool):
         return str(v).lower()
     if isinstance(v, int | float):
@@ -189,14 +185,14 @@ def _phrase(v: Any, n: int = 60) -> str:
     if isinstance(v, dict):
         for key in ("message", "error", "reason", "detail", "summary", "hint"):
             if v.get(key):
-                return _phrase(v[key], n)
+                return _phrase(v[key])
         for val in v.values():
             if isinstance(val, str | int | float) and not isinstance(val, bool) and val != "":
-                return _phrase(val, n)
+                return _phrase(val)
         return "see details"
     if isinstance(v, list):
-        return _phrase(v[0], n) if v else ""
-    return _phrase(str(v), n)
+        return _phrase(v[0]) if v else ""
+    return _phrase(str(v))
 
 
 def _call_hint(args: Any) -> str:
@@ -208,7 +204,7 @@ def _call_hint(args: Any) -> str:
         if val:
             if isinstance(val, list):
                 val = ", ".join(str(x) for x in val)
-            return f" ({_phrase(val, 50)})"
+            return f" ({_phrase(val)})"
     return ""
 
 
@@ -235,9 +231,9 @@ def _error_phrase(result: Any) -> str | None:
     """A short failure phrase if the tool result is an actual error, else None."""
     if isinstance(result, dict):
         if result.get("error"):
-            return _phrase(result["error"], 60)
+            return _phrase(result["error"])
         if result.get("success") is False:
-            return _phrase(result.get("message") or result.get("reason"), 60) or "unsuccessful"
+            return _phrase(result.get("message") or result.get("reason")) or "unsuccessful"
     return None
 
 
@@ -271,10 +267,10 @@ def _result_hint(result: Any) -> str:
         for key in ("classification", "sni", "summary", "verdict", "status", "note"):
             v = result.get(key)
             if isinstance(v, str) and v:
-                return f" · {_phrase(v, 50)}"
+                return f" · {_phrase(v)}"
         if result.get("error"):
-            return f" · failed: {_phrase(result['error'], 50)}"
-        # Unknown dict: surface up to two scalar fields, verbatim-but-clipped.
+            return f" · failed: {_phrase(result['error'])}"
+        # Unknown dict: surface up to two scalar fields, verbatim.
         bits: list[str] = []
         for k, v in result.items():
             if isinstance(v, bool) or k in ("available", "reason", "hint"):
@@ -282,7 +278,7 @@ def _result_hint(result: Any) -> str:
             if isinstance(v, int | float):
                 bits.append(f"{_humanize(k)} {v}")
             elif isinstance(v, str) and 0 < len(v) <= 40 and "{" not in v:
-                bits.append(f"{_humanize(k)} {_phrase(v, 40)}")
+                bits.append(f"{_humanize(k)} {_phrase(v)}")
             if len(bits) == 2:
                 break
         return f" · {', '.join(bits)}" if bits else ""
@@ -293,7 +289,7 @@ def _result_hint(result: Any) -> str:
             else f" · {len(result)} result{'' if len(result) == 1 else 's'}"
         )
     if isinstance(result, str) and result:
-        return f" · {_phrase(result, 50)}"
+        return f" · {_phrase(result)}"
     return ""
 
 
@@ -306,10 +302,10 @@ def _tool_call_title(p: dict[str, Any]) -> str:
     name = str(p.get("tool_name") or p.get("name") or "tool")
     bare = _strip_t(name)
     if bare == "final_result":  # pydantic-ai structured-output "tool"
-        return "Synthesizing verdict…"
+        return "Synthesizing verdict"
     if bare in _WRITE_TOOL_PHRASES:
         return _WRITE_TOOL_PHRASES[bare][0]
-    return f"Checking {_tool_noun(name)}…{_call_hint(p.get('args'))}"
+    return f"Checking {_tool_noun(name)}{_call_hint(p.get('args'))}"
 
 
 def _tool_result_title(p: dict[str, Any]) -> str:
@@ -337,7 +333,7 @@ def _t_classification(p: dict[str, Any]) -> str:
 def _t_targeted_dispatch(p: dict[str, Any]) -> str:
     q = p.get("question")
     if q:
-        return f"Follow-up check: {_phrase(q, 60)}"
+        return f"Follow-up check: {_phrase(q)}"
     tool = p.get("tool_name")
     if tool:
         return f"Follow-up check via {_tool_noun(str(tool))}"
@@ -351,7 +347,7 @@ def _t_targeted_tool_result(p: dict[str, Any]) -> str:
 
 def _t_retask(p: dict[str, Any]) -> str:
     q = p.get("gap_question")
-    return f"Re-tasked: {_phrase(q, 60)}" if q else "Re-tasked the agent to close an evidence gap"
+    return f"Re-tasked: {_phrase(q)}" if q else "Re-tasked the agent to close an evidence gap"
 
 
 def _t_template_match(p: dict[str, Any]) -> str:
@@ -632,7 +628,7 @@ def _t_approval_decision(p: dict[str, Any]) -> str:
         return "Approval declined"
     decision = p.get("decision") or p.get("status")
     if decision:
-        return f"Approval decision: {_phrase(decision, 40)}"
+        return f"Approval decision: {_phrase(decision)}"
     return "Approval decision recorded"
 
 
@@ -642,7 +638,7 @@ def _t_done(p: dict[str, Any]) -> str:
 
 
 def _t_error(p: dict[str, Any]) -> str:
-    return "Error: " + (_phrase(p.get("message") or p.get("error"), 90) or "see details")
+    return "Error: " + (_phrase(p.get("message") or p.get("error")) or "see details")
 
 
 def _t_usage(p: dict[str, Any]) -> str:
@@ -729,13 +725,13 @@ _DYNAMIC_TITLES: dict[str, Callable[[dict[str, Any]], str]] = {
 
 
 def title_for(kind: str, p: dict[str, Any]) -> str:
-    """The human title for one event. Short (target ≤ ~80 chars), never JSON."""
+    """The human title for one event. Never cut, never JSON."""
     static = _STATIC_TITLES.get(kind)
     if static is not None:
         return static
     build = _DYNAMIC_TITLES.get(kind)
     if build is not None:
-        return _clip(build(p), _TITLE_MAX)
+        return build(p)
     return _humanize(kind)
 
 

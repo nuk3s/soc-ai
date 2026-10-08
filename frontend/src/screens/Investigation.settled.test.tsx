@@ -101,6 +101,7 @@ describe('what the settled-action bar reports', () => {
     });
     mountDrawer();
     fireEvent.click(screen.getByRole('button', { name: /escalate to case/i }));
+    fireEvent.click(screen.getByRole('button', { name: /confirm escalate/i }));
     const msg = await screen.findByText(/nothing attached/i);
     expect(msg).toHaveTextContent('case-9f3');
     expect(msg).toHaveTextContent(/Opened no cases/i);
@@ -122,6 +123,7 @@ describe('what the settled-action bar reports', () => {
     });
     mountDrawer();
     fireEvent.click(screen.getByRole('button', { name: /escalate to case/i }));
+    fireEvent.click(screen.getByRole('button', { name: /confirm escalate/i }));
     const msg = await screen.findByText(/already on a case/i);
     expect(msg).toHaveTextContent(/3 alerts already on a case, no second case opened/i);
     expect(msg).toHaveTextContent(/5 alerts already acknowledged in Security Onion, skipped/i);
@@ -141,6 +143,7 @@ describe('what the settled-action bar reports', () => {
     });
     mountDrawer();
     fireEvent.click(screen.getByRole('button', { name: /^acknowledge$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /confirm acknowledge/i }));
     const msg = await screen.findByText(/already acknowledged in Security Onion/i);
     expect(msg).toHaveTextContent(/so they stay listed/i);
   });
@@ -157,8 +160,31 @@ describe('what the settled-action bar reports', () => {
     });
     mountDrawer();
     fireEvent.click(screen.getByRole('button', { name: /escalate to case/i }));
+    fireEvent.click(screen.getByRole('button', { name: /confirm escalate/i }));
     await waitFor(() => expect(escalateGroup).toHaveBeenCalledTimes(1));
     const msg = await screen.findByText(/Opened 2 cases/i);
     expect(msg.textContent).toBe('Opened 2 cases for GPL ICMP Large ICMP Packet');
+  });
+});
+
+// Dogfood 2026-10-06, investigation S2: the settled bar asked nothing before
+// it wrote to the whole detection group. It now asks first.
+describe('the settled bar confirm step', () => {
+  it('writes nothing on the first click or on Cancel', () => {
+    vi.mocked(escalateGroup).mockClear();
+    vi.mocked(ackGroup).mockClear();
+    mountDrawer();
+    fireEvent.click(screen.getByRole('button', { name: /escalate to case/i }));
+    expect(escalateGroup).not.toHaveBeenCalled();
+    expect(screen.getByTestId('settled-confirm').textContent).toContain(
+      'Open one Security Onion case for each alert of this rule.',
+    );
+    fireEvent.click(screen.getByRole('button', { name: /^cancel$/i }));
+    expect(screen.queryByTestId('settled-confirm')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /^acknowledge$/i }));
+    expect(ackGroup).not.toHaveBeenCalled();
+    expect(screen.getByTestId('settled-confirm').textContent).toContain(
+      'Acknowledge every unacknowledged alert of this rule.',
+    );
   });
 });

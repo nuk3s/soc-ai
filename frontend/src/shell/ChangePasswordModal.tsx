@@ -203,7 +203,7 @@ export function ChangePasswordModal({ open, onClose, returnFocusRef }: Props) {
               disabled={saving}
               className="rounded-control bg-accent px-3 py-[7px] text-[12.5px] font-semibold text-white outline-none hover:bg-accent-deep disabled:cursor-not-allowed disabled:opacity-60 focus-visible:ring-1 focus-visible:ring-accent"
             >
-              {saving ? 'Changing…' : 'Change password'}
+              {saving ? 'Changing' : 'Change password'}
             </button>
           </div>
         </form>

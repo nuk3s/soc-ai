@@ -526,7 +526,7 @@ def _synth_failure_fallback_report(
             f"Synth-first pipeline fallback: {phase} raised "
             f"{type(exc).__name__}. The alert is recorded as "
             f"needs_more_info pending investigator-path retry. "
-            f"Underlying error: {str(exc)[:200]}"
+            f"Underlying error: {exc}"
         ),
         citations=["synth_first_failure"],
         recommended_actions=[],
@@ -4509,7 +4509,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                             "withheld_reason": "no_resolving_evidence",
                             "local_verdict": local_triage_final.verdict,
                             # The opinion, kept on the run for the analyst.
-                            "oracle_summary": (oracle_result.raw_oracle_summary or "")[:1500],
+                            "oracle_summary": oracle_result.raw_oracle_summary or "",
                         }
                         if oracle_result.override_withheld
                         else {}

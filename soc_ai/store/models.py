@@ -277,6 +277,18 @@ class Hunt(Base):
     tool_calls: Mapped[int | None] = mapped_column(Integer, default=None)
     es_searches: Mapped[int | None] = mapped_column(Integer, default=None)
     wall_ms: Mapped[int | None] = mapped_column(Integer, default=None)
+    # The investigations the hunt opens for its subject findings (migration
+    # 0063). ``findings_total`` counts the subject findings, and
+    # ``findings_investigated`` counts those whose investigation ended. A failed
+    # investigation counts as ended. ``finding_investigations`` maps the
+    # finding ordinal, as a string, to ``{investigation_id, state, origin}``
+    # (soc_ai.webui.hunt_findings). It names a reused investigation of another
+    # hunt, whose own row names the other hunt.
+    findings_total: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    findings_investigated: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    finding_investigations: Mapped[dict[str, Any] | None] = mapped_column(
+        NULLABLE_JSON, default=None
+    )
 
 
 class HuntEvent(Base):
@@ -1256,6 +1268,26 @@ class SavedView(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
 
 
+class DashboardLayout(Base):
+    """One user's arrangement of the Dashboard panels.
+
+    One row per user, keyed by the user. ``panels_json`` is a list of slots,
+    ``{"id", "x", "y", "w", "h"}``, on the console's grid of 12 columns. The
+    console owns what a slot means. :mod:`soc_ai.store.dashboard_layout` checks
+    the shape on write and drops what the console cannot place on read. A user
+    with no row sees the shipped layout, so Reset layout deletes the row.
+    """
+
+    __tablename__ = "dashboard_layout"
+
+    # The layout dies with the account, like a saved view.
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    panels_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
+
+
 class EntityProfile(Base):
     """What is normal for one entity on one dimension.
 
@@ -1518,6 +1550,15 @@ class EntityObservation(Base):
     # When an analyst opened the receipts of this shadow hit. Null means
     # unread, which is what the band, the bell and the sidebar count.
     read_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+
+    # Migration 0062. An analyst marked this observation benign, in the shape
+    # a lead dismissal takes: a reason from the fixed list, a note, the hand
+    # and the time. A dismissed observation counts toward no lead, and a
+    # repeat of the same content keeps the mark.
+    dismissed_reason: Mapped[str | None] = mapped_column(String(32), default=None)
+    dismissed_note: Mapped[str | None] = mapped_column(Text, default=None)
+    dismissed_by: Mapped[str | None] = mapped_column(String(80), default=None)
+    dismissed_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
 
     lead_id: Mapped[int | None] = mapped_column(
         ForeignKey("leads.id", ondelete="SET NULL"), default=None

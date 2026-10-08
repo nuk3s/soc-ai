@@ -22,12 +22,12 @@ export const KIND_LABEL: Record<string, string> = {
   below_baseline: 'rate collapsed',
   above_baseline: 'rate spiked',
   scope_count: 'across many hosts',
-  estate_outlier: 'estate outlier',
+  estate_outlier: 'unusual across all hosts',
   alert: 'alert',
   prior_no_baseline: 'finding with no benign baseline',
   catalog_match: 'analytic match',
   hunt_finding: 'hunt finding',
-  telemetry_silence: 'telemetry plane silent',
+  telemetry_silence: 'log source went silent',
   logon_chain: 'logon chain',
 };
 

@@ -1,7 +1,10 @@
 import { Bell, Check, ChevronDown, HelpCircle, Network, Search, Settings, X } from 'lucide-react';
 import { type RefObject, useEffect, useRef, useState } from 'react';
-import { useLocation, useNavigate, useParams } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
+import { AskSocAiButton } from '../components/AskPanel';
 import { DevBadge, SyntheticEvalBadge } from '../components/Badges';
+import { HuntOutcomeChip } from '../components/HuntOutcomeChip';
+import { LoadingInline } from '../components/States';
 import {
   type Health,
   getHealth,
@@ -18,6 +21,8 @@ import {
   getDismissed,
 } from '../lib/notifications';
 import type { Notification, Workspace } from '../lib/types';
+import { useNeedsYouCount } from '../lib/needsYou';
+import { type Crumb, GUIDE_URL, crumbFor } from './pages';
 import { useSession } from './Session';
 import { useShell } from './ShellContext';
 import { isMachineKey } from '../lib/hostDossier';
@@ -46,12 +51,32 @@ export function WorkspaceGlyph({ name, size = 11 }: { name: string; size?: numbe
   return <>{name[0].toUpperCase()}</>;
 }
 
-/** The panel header line for the bell: the badge counts only the rows that ask
- *  for action, so the header says how the two numbers relate (D4, RD8). */
-export function notificationSummary(total: number, actionable: number): string {
-  const rest = total - actionable;
-  const head = actionable > 0 ? `${actionable} need${actionable === 1 ? 's' : ''} attention` : 'None need attention';
-  return rest > 0 ? `${head} · ${rest} more` : head;
+/** The bell rows that are part of the needs-you count: the leads and the
+ *  unread shadow hits. Every other row is an event. */
+const NEEDS_YOU_ROWS = new Set(['lead', 'lead-more', 'shadow-hit']);
+
+export function isNeedsYouRow(n: { id: string }): boolean {
+  return NEEDS_YOU_ROWS.has(n.id.split(':', 1)[0]);
+}
+
+/** The panel header line for the bell: "11 need you · 8 events".
+ *
+ *  The first number is the needs-you count, the one the Dashboard tile and the
+ *  sidebar badges state. The bell counted its own rows and said "None need
+ *  attention" while 10 leads waited. `need` is null when the count could not
+ *  be read, and `floor` marks a count that misses a part the server could not
+ *  read. `undefined` is a count still being read. The second number counts
+ *  the other rows on the list. */
+export function notificationSummary(need: number | null | undefined, events: number, floor = false): string {
+  const head =
+    need === undefined
+      ? 'Reading what needs you'
+      : need === null
+        ? 'Could not read what needs you'
+        : need === 0
+          ? 'Nothing needs you'
+          : `${need}${floor ? '+' : ''} need${need === 1 && !floor ? 's' : ''} you`;
+  return events > 0 ? `${head} · ${events} event${events === 1 ? '' : 's'}` : head;
 }
 
 function isInside(target: EventTarget | null, refs: RefObject<HTMLElement | null>[]): boolean {
@@ -59,22 +84,8 @@ function isInside(target: EventTarget | null, refs: RefObject<HTMLElement | null
   return refs.some((r) => r.current?.contains(target));
 }
 
-function useBreadcrumb(): { crumb: string; crumb2?: string } {
-  const { pathname } = useLocation();
-  const params = useParams();
-  if (pathname.startsWith('/dashboard')) return { crumb: 'Dashboard' };
-  if (pathname.startsWith('/alerts')) return { crumb: 'Alerts' };
-  if (pathname.startsWith('/investigations')) return { crumb: 'Investigations' };
-  if (pathname.startsWith('/investigation')) return { crumb: 'Investigation', crumb2: params.id };
-  if (pathname.startsWith('/hunts') && params.id) return { crumb: 'Hunts', crumb2: params.id };
-  if (pathname.startsWith('/hunts')) return { crumb: 'Hunts' };
-  if (pathname.startsWith('/hosts') && params.key) return { crumb: 'Hosts', crumb2: params.key };
-  if (pathname.startsWith('/hosts')) return { crumb: 'Hosts' };
-  if (pathname.startsWith('/notifications')) return { crumb: 'Notifications' };
-  if (pathname.startsWith('/backtest')) return { crumb: 'Backtest' };
-  if (pathname.startsWith('/runbooks')) return { crumb: 'Runbooks' };
-  if (pathname.startsWith('/config')) return { crumb: 'Config' };
-  return { crumb: '' };
+function useBreadcrumb(): Crumb {
+  return crumbFor(useLocation().pathname);
 }
 
 export function Topbar() {
@@ -244,18 +255,46 @@ export function Topbar() {
     };
   }, [menusOpen, notifOpen, healthOpen]);
 
-  // The badge is a call to action, so it counts only items that ARE one:
-  // danger (true positives) and warn (needs-info, hunts with findings,
-  // dependency-down). `accent` completions — the "FP closed itself" firehose —
-  // stay in the dropdown and on /notifications but never light the badge.
-  const actionable = notifs.filter((n) => n.tone !== 'accent');
+  // The badge states the needs-you count, the number the Dashboard tile and
+  // the sidebar badges state. The bell used to count its own danger and warn
+  // rows, with a 24 h window on leads and only shadow leads in warn, so it said
+  // "None need attention" while 10 leads waited (dogfood 2026-10-06).
+  // Two fallbacks keep the bell honest. With no count to read, the badge counts
+  // the danger and warn rows, the old rule. With nothing needing the analyst
+  // and a danger row on the list, such as a dependency down or a failed
+  // triage, the badge shows "!" so a fault still lights the bell.
+  const needsYou = useNeedsYouCount();
+  const events = notifs.filter((n) => !isNeedsYouRow(n));
+  const faults = events.filter((n) => n.tone === 'danger').length;
+  const need = needsYou.data ? needsYou.data.total : null;
+  const floor = (needsYou.data?.unknown.length ?? 0) > 0;
+  const fallback = notifs.filter((n) => n.tone !== 'accent').length;
+  const badge: string | null =
+    need === null
+      ? fallback > 0
+        ? String(fallback)
+        : null
+      : need > 0
+        ? `${need}${floor ? '+' : ''}`
+        : faults > 0
+          ? '!'
+          : null;
   const bellName =
-    actionable.length > 0 ? `Notifications, ${actionable.length} need${actionable.length === 1 ? 's' : ''} attention` : 'Notifications';
+    need !== null && need > 0
+      ? `Notifications, ${need} need${need === 1 ? 's' : ''} you`
+      : badge === '!'
+        ? `Notifications, ${faults} urgent`
+        : need === null && fallback > 0
+          ? `Notifications, ${fallback} need${fallback === 1 ? 's' : ''} attention`
+          : 'Notifications';
+  const showSummary = notifs.length > 0 || (need ?? 0) > 0 || needsYou.failed;
 
   return (
     <div className="relative z-30 flex h-[52px] flex-none items-center gap-[11px] border-b border-border bg-[rgba(11,14,19,.7)] py-0 pl-4 pr-3.5 backdrop-blur-[8px]">
-      {/* workspace switcher — dropdown only when >1 workspace exists */}
-      {workspaces.length > 1 ? (
+      {/* Workspace switcher, only when more than one workspace exists. One
+          workspace has nothing to switch to, and the chip showed a bare grid
+          address that read as a page name (dogfood 2026-10-06). */}
+      {workspaces.length > 1 && (
         <button
           ref={wsBtnRef}
           aria-haspopup="dialog"
@@ -274,24 +313,11 @@ export function Topbar() {
           >
             <WorkspaceGlyph name={ws} />
           </div>
-          <span className="whitespace-nowrap text-[12.5px] font-semibold">{ws || '…'}</span>
+          <span className="whitespace-nowrap text-[12.5px] font-semibold">{ws || 'Workspace'}</span>
           <span className="flex text-faint">
             <ChevronDown size={12} />
           </span>
         </button>
-      ) : (
-        <div
-          title="Current workspace"
-          className="flex flex-none items-center gap-2 rounded-control border border-border-2 bg-surface-1 px-[9px] py-[5px]"
-        >
-          <div
-            className="flex h-5 w-5 items-center justify-center rounded-[5px] text-[10px] font-bold text-white"
-            style={{ background: 'linear-gradient(135deg,#4b8bf5,#2c5fd0)' }}
-          >
-            <WorkspaceGlyph name={ws} />
-          </div>
-          <span className="whitespace-nowrap text-[12.5px] font-semibold">{ws || '…'}</span>
-        </div>
       )}
 
       {/* workspace dropdown — only shown when multiple workspaces exist */}
@@ -315,7 +341,7 @@ export function Topbar() {
               >
                 <WorkspaceGlyph name={w.name} size={12} />
               </div>
-              <div className="min-w-0 flex-1 truncate text-left text-[12.5px] font-semibold">{w.name}</div>
+              <div className="min-w-0 flex-1 break-words text-left text-[12.5px] font-semibold">{w.name}</div>
               <span
                 className="h-[7px] w-[7px] rounded-full"
                 title={w.env}
@@ -340,17 +366,19 @@ export function Topbar() {
         </div>
       )}
 
-      <div className="h-[18px] w-px flex-none bg-border-2" />
+      {workspaces.length > 1 && <div className="h-[18px] w-px flex-none bg-border-2" />}
 
       {/* breadcrumb */}
       <div className="flex min-w-0 items-center gap-[7px] text-[13px] text-dim">
-        <span className="whitespace-nowrap font-semibold text-text">{crumb}</span>
+        <span data-testid="topbar-crumb" className="whitespace-nowrap font-semibold text-text">
+          {crumb}
+        </span>
         {crumb2 && (
           <>
             <span className="text-ghost">/</span>
             <span
               data-testid="topbar-crumb2"
-              className={`truncate whitespace-nowrap text-dim ${crumb2Name ? 'text-[12.5px]' : 'font-mono text-[12px]'}`}
+              className={`min-w-0 break-words text-dim ${crumb2Name ? 'text-[12.5px]' : 'font-mono text-[12px]'}`}
               title={crumb2Name || crumb2Key ? crumb2 : undefined}
             >
               {crumb2Name ?? (crumb2Key ? 'machine' : crumb2)}
@@ -371,7 +399,7 @@ export function Topbar() {
         <span className="flex">
           <Search size={14} />
         </span>
-        <span className="flex-1 truncate whitespace-nowrap text-left text-[12.5px]">Search or jump to…</span>
+        <span className="flex-1 break-words text-left text-[12.5px]">Search or jump to</span>
         <kbd className="rounded-[4px] border border-border-input px-[5px] py-px font-mono text-[10px] text-dim">⌘K</kbd>
       </button>
 
@@ -392,7 +420,7 @@ export function Topbar() {
           className="h-1.5 w-1.5 rounded-full"
           style={{ background: healthColor, boxShadow: `0 0 8px ${healthColor}` }}
         />
-        {healthFailed ? 'unreachable' : health === null ? 'checking…' : healthOk ? 'connected' : `${healthDown} degraded`}
+        {healthFailed ? 'unreachable' : health === null ? 'checking' : healthOk ? 'connected' : `${healthDown} degraded`}
       </button>
       {/* health dropdown: ES / LLM / Security Onion / PCAP, with the PCAP hint */}
       {healthOpen && (
@@ -405,10 +433,10 @@ export function Topbar() {
             Upstream health
           </div>
           {healthFailed && (
-            <div className="px-3.5 py-6 text-center text-[12px] text-warn">The API is unreachable. Retrying…</div>
+            <div className="px-3.5 py-6 text-center text-[12px] text-warn">The API is unreachable. The console tries again.</div>
           )}
           {!healthFailed && health === null && (
-            <div className="px-3.5 py-6 text-center text-[12px] text-faint">Checking…</div>
+            <div className="px-3.5 py-6 text-center text-[12px] text-faint"><LoadingInline>Checking</LoadingInline></div>
           )}
           {([
             ['Elasticsearch', health?.es],
@@ -456,12 +484,12 @@ export function Topbar() {
         className="relative flex h-[34px] w-[34px] flex-none items-center justify-center rounded-control border border-border-2 text-dim hover:border-border-strong hover:text-text"
       >
         <Bell size={16} />
-        {actionable.length > 0 && (
+        {badge !== null && (
           <span
             data-testid="notif-badge"
             className="absolute -right-[5px] -top-[5px] flex h-4 min-w-[16px] items-center justify-center rounded-lg border-2 border-surface-1 bg-danger px-[3px] font-mono text-[9px] font-bold text-white"
           >
-            {actionable.length}
+            {badge}
           </span>
         )}
       </button>
@@ -478,9 +506,9 @@ export function Topbar() {
           className="absolute right-[46px] top-12 z-[33] w-[332px] animate-fadeUp overflow-hidden rounded-panel border border-border-input bg-surface-card shadow-dropdown">
           <div className="flex items-baseline gap-2 border-b border-border-2 px-3.5 py-3">
             <span className="text-[13px] font-semibold">Notifications</span>
-            {notifs.length > 0 && (
+            {showSummary && (
               <span data-testid="notif-summary" className="ml-auto text-[11.5px] text-faint">
-                {notificationSummary(notifs.length, actionable.length)}
+                {notificationSummary(needsYou.data ? need : needsYou.failed ? null : undefined, events.length, floor)}
               </span>
             )}
           </div>
@@ -491,7 +519,24 @@ export function Topbar() {
             const body = (
               <>
                 <div className="text-[12.5px] leading-[1.45]">
-                  {formatNotificationTitle(nt.title)}
+                  {/* The notice names a hunt by its whole head line. The
+                      dropdown is narrow, so the browser clamps the title to
+                      three lines and the hover holds the whole text. The
+                      server cut the objective at 80 characters, mid-word. */}
+                  <span
+                    data-testid="bell-title"
+                    className="break-words"
+                    title={formatNotificationTitle(nt.title)}
+                  >
+                    {formatNotificationTitle(nt.title)}
+                  </span>
+                  {/* How a hunt ended, from its outcome field. */}
+                  {nt.outcome && (
+                    <>
+                      {' '}
+                      <HuntOutcomeChip outcome={nt.outcome} />
+                    </>
+                  )}
                   {/* A run against planted synthetic scenarios must never read
                       as a real one — badge it wherever the row appears. */}
                   {nt.isSynthEval && (
@@ -562,16 +607,23 @@ export function Topbar() {
         </div>
       )}
 
-      {/* help */}
-      <button
-        onClick={openPalette}
-        title="Help & shortcuts"
-        aria-label="Help and shortcuts"
+      {/* The guide. The button opened the command palette, and the guide had
+          no link in the console (dogfood 2026-10-06). The palette holds the
+          keyboard shortcuts. */}
+      <a
+        href={GUIDE_URL}
+        target="_blank"
+        rel="noopener noreferrer"
+        title="Open the guide in a new tab"
+        aria-label="Open the guide"
         className="flex h-[34px] w-[34px] flex-none items-center justify-center rounded-control border border-border-2 text-dim hover:border-border-strong hover:text-text"
       >
         <HelpCircle size={16} />
-      </button>
+      </a>
 
+      {/* The one chat, at the right end on every page. The label names the
+          object the page shows. */}
+      <AskSocAiButton />
     </div>
   );
 }

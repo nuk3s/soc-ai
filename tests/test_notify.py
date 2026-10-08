@@ -499,3 +499,30 @@ def test_tls_expiry_event_respects_its_toggle() -> None:
     assert soft.url == "/app/config?band=30#tls"
     off = SimpleNamespace(notify_on_tls_expiry=False)
     assert event_for_tls_expiry(subject="x", days_left=6, band=7, settings=off) is None
+
+
+# ── Hunt outcome tones ──────────────────────────────────────────────────────
+
+
+def test_a_hunt_that_could_not_run_reads_warn_and_a_threat_reads_danger() -> None:
+    """The bell said "no threat observed" for analytic runs that could not run."""
+    from soc_ai.notify import hunt_outcome_tone
+
+    assert hunt_outcome_tone("threat_found") == "danger"
+    assert hunt_outcome_tone("could_not_run") == "warn"
+    assert hunt_outcome_tone("no_answer") == "warn"
+
+
+def test_a_clean_or_running_hunt_stays_informational() -> None:
+    """NEGATIVE CONTROL. A hunt that looked and found nothing lights nothing."""
+    from soc_ai.notify import hunt_outcome_tone
+
+    assert hunt_outcome_tone("no_threat") == "accent"
+    assert hunt_outcome_tone("no_threat_gap") == "accent"
+    assert hunt_outcome_tone("running") == "accent"
+
+
+def test_an_unknown_hunt_outcome_never_reads_as_clean() -> None:
+    from soc_ai.notify import hunt_outcome_tone
+
+    assert hunt_outcome_tone("something_new") == "warn"

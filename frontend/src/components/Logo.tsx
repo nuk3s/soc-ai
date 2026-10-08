@@ -44,7 +44,7 @@ export function Wordmark({ size = 14.5, className = '' }: WordmarkProps) {
       className={`font-mono font-semibold whitespace-nowrap ${className}`}
       style={{ fontSize: size, letterSpacing: '-0.01em' }}
     >
-      soc<span className="text-accent">_</span>ai
+      soc<span className="text-accent">-</span>ai
     </div>
   );
 }

@@ -45,6 +45,7 @@ ENTRY_ORDER: tuple[str, ...] = (
     "Analyst re-run",
     "Analyst deep re-run",
     "Promotion",
+    "Hunt finding investigation",
     "Backtest",
     "Eval",
     "Hunt, analyst",
@@ -59,6 +60,10 @@ _SWEEP_PREFIX = "auto-triage:"
 _BACKTEST_ACTOR = "backtest"
 _EVAL_ACTORS = frozenset({"journey-eval"})
 _AUTO_HUNT_ACTOR = "auto-hunt"
+# The actor of the investigations a hunt opens for its own subject findings
+# (soc_ai.webui.hunt_findings). The report counts them apart, so their cost
+# reads as the hunt's and not as an analyst's promotion.
+_HUNT_FINDINGS_ACTOR = "system:hunt"
 _PROMOTED_KINDS = frozenset({"hunt", "lead"})
 
 
@@ -91,6 +96,8 @@ class UsageReport:
     days: int
     since: datetime
     entries: list[EntryUsage]
+    # The investigations hunts opened for their own findings in the window.
+    hunt_findings_investigated: int = 0
 
     @property
     def runs(self) -> int:
@@ -186,6 +193,8 @@ def investigation_entry(inv: Investigation, *, earlier_run: bool) -> str:
         return "Eval"
     if started_by == _BACKTEST_ACTOR:
         return "Backtest"
+    if started_by == _HUNT_FINDINGS_ACTOR:
+        return "Hunt finding investigation"
     if inv.kind in _PROMOTED_KINDS or subject.get("type") == "hunt":
         return "Promotion"
     if started_by == _SCHEDULER_ACTOR:
@@ -326,7 +335,8 @@ async def usage_report(db: AsyncSession, *, days: int, now: datetime | None = No
         grouped[hunt_entry(hunt)].append((cost, hunt_outcome(hunt)))
 
     entries = [_fold(name, grouped[name]) for name in ENTRY_ORDER if grouped.get(name)]
-    return UsageReport(days=days, since=since, entries=entries)
+    by_hunts = sum(1 for inv in invs if (inv.started_by or "") == _HUNT_FINDINGS_ACTOR)
+    return UsageReport(days=days, since=since, entries=entries, hunt_findings_investigated=by_hunts)
 
 
 def _fmt_number(value: float | None, *, tokens: bool = False) -> str:
@@ -391,9 +401,12 @@ def format_usage(report: UsageReport) -> str:
     ]
     if not rows:
         lines.append("No run in this window.")
+        lines.append(f"hunt findings investigated: {report.hunt_findings_investigated}")
         return "\n".join(lines)
     lines.append(_line(header))
     lines.extend(_line(r) for r in rows)
+    lines.append("")
+    lines.append(f"hunt findings investigated: {report.hunt_findings_investigated}")
     lines.append("")
     lines.append(
         f"Counters on {report.with_counters} of {report.runs} runs. An older run "

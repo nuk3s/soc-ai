@@ -645,8 +645,9 @@ def test_list_and_get_hunt(client: TestClient) -> None:
     assert "Tool calls" in groups  # the tool_call row
     assert "Objective" in groups  # the hunt_started row
     assert "Findings" in groups  # the hunt_report row
-    # the tool_result merged into its tool_call: the row shows the outcome
-    assert any("Event search" in t for t in titles)
+    # the tool_result merged into its tool_call: the row shows the outcome.
+    # W10: the search names what it looked for and what it found.
+    assert "Searched for zeek.conn events: 3 events" in titles
     # tool_result is not a standalone timeline row
     assert all(s["id"] != "h3" for s in body["timeline"])
 
@@ -814,6 +815,94 @@ def test_a_notice_from_before_the_threat_count_says_findings(client: TestClient)
     assert notices[f"hunt-done:{hunt_id}"]["title"] == "Hunt finished, 2 findings: old sweep"
 
 
+# A 180 character objective on one line. The bell cut the objective at 80
+# characters in the middle of a word, with no mark of the cut.
+_OBJECTIVE_180 = (
+    "Hunt for internal hosts that beacon to rare external addresses on a fixed "
+    "cadence, name each destination, and state the interval and the jitter of "
+    "every beacon in this hunt window."
+)
+
+
+def test_the_bell_names_the_hunt_by_its_whole_objective(client: TestClient) -> None:
+    assert len(_OBJECTIVE_180) == 180
+    hunt_id = _seed_hunt_with_report(
+        client,
+        {"findings": [{"title": "beacon one", "category": "threat"}]},
+        objective=_OBJECTIVE_180,
+        started_by="admin",
+    )
+    notices = {n["id"]: n for n in client.get("/api/v1/notifications").json()}
+    title = notices[f"hunt-done:{hunt_id}"]["title"]
+    assert title == f"Hunt finished, 1 threat finding: {_OBJECTIVE_180}"
+    assert not title.endswith("…")
+
+
+def test_the_bell_names_a_lead_hunt_by_its_head_sentence(client: TestClient) -> None:
+    """A lead objective is a head sentence over a list. The notice takes the
+    head sentence whole and leaves the list on the hunt page."""
+    head = (
+        "[lead 7] Investigate 192.0.2.10. The lead formed from a new destination "
+        "and off hours and a collapsed rate."
+    )
+    objective = head + "\nObservations:\n- first connection to 198.51.100.4\n- active at 03:00"
+    hunt_id = _seed_hunt_with_report(
+        client,
+        {"findings": [{"title": "a gap", "category": "visibility_gap"}]},
+        objective=objective,
+        started_by="admin",
+    )
+    notices = {n["id"]: n for n in client.get("/api/v1/notifications").json()}
+    title = notices[f"hunt-done:{hunt_id}"]["title"]
+    # The head sentence reads as a plain title (operator 3.1, K3). The list
+    # under it stays on the hunt page.
+    assert title == "Hunt finished: no answer. Lead 7 hunt: 192.0.2.10"
+    assert "Observations" not in title
+    assert "[lead" not in title
+
+
+def test_the_objective_headline_never_cuts_a_line() -> None:
+    """The owner banned the ellipsis cut on 2026-10-07. A long line stays whole."""
+    from soc_ai.api.webui.routes_hunts import objective_headline
+
+    assert objective_headline("sweep for beacons") == "sweep for beacons"
+    assert objective_headline(_OBJECTIVE_180) == _OBJECTIVE_180
+    long_line = " ".join([_OBJECTIVE_180] * 4)
+    assert len(long_line) > 500
+    assert objective_headline(long_line) == long_line
+    # Negative control: the head line still ends at the first line break.
+    assert objective_headline(f"{long_line}\nsecond line") == long_line
+
+
+def test_the_objective_step_holds_the_whole_objective(client: TestClient) -> None:
+    """The Objective step cut a lead objective at 400 characters."""
+    objective = "\n".join(
+        [
+            "[lead 9] Investigate 192.0.2.20. The lead formed from a collapsed rate.",
+            "Observations:",
+            *[f"- the rate on day {i} is 0 per hour, the median is 85" for i in range(12)],
+            "Decide whether these observations together describe malicious activity.",
+        ]
+    )
+    assert len(objective) > 400
+
+    async def _go() -> str:
+        async with client.app.state.db_sessionmaker() as db:
+            hunt = await hunt_svc.create(db, objective=objective, started_by="admin")
+            await hunt_svc.append_events(
+                db,
+                hunt.id,
+                [{"sequence": 1, "kind": "hunt_started", "payload": {"objective": objective}}],
+            )
+            await hunt_svc.finalize(db, hunt.id, status="complete", narrative="seeded")
+            return hunt.id
+
+    hunt_id = asyncio.run(_go())
+    steps = client.get(f"/api/v1/hunts/{hunt_id}").json()["timeline"]
+    (step,) = [s for s in steps if s["title"] == "Objective"]
+    assert step["detail"] == objective
+
+
 def test_a_report_with_no_confidence_reads_null_on_the_detail_as_on_the_list(
     client: TestClient,
 ) -> None:
@@ -912,15 +1001,19 @@ def test_list_hunts_kind_filter(client: TestClient) -> None:
     """``kind`` narrows to chat | scheduled | triggered. An unknown value is
     ignored (no filter), the same treatment an unknown ``status`` gets.
 
-    No param lists the agent runs. It leaves out the catalog runs: a hit is an
-    observation, and the Analytic hits section shows it."""
+    No param lists every run, catalog runs included (W13): the bell was the
+    only path to a catalog run before."""
     chat = _seed_complete_hunt(client)
     triggered = _seed_complete_hunt(client, kind="triggered")
     scheduled = _seed_complete_hunt(client, kind="scheduled")
 
-    # no param → agent runs only
+    # no param → every run
     rows = client.get("/api/v1/hunts").json()
-    assert {r["id"] for r in rows} == {chat, scheduled}
+    assert {r["id"] for r in rows} == {chat, scheduled, triggered}
+    # "catalog" is the type the filter names. It reaches the triggered rows.
+    rows = client.get("/api/v1/hunts", params={"kind": "catalog"}).json()
+    assert [r["id"] for r in rows] == [triggered]
+    assert rows[0]["starter"] == "catalog"
 
     rows = client.get("/api/v1/hunts", params={"kind": "triggered"}).json()
     assert [r["id"] for r in rows] == [triggered]
@@ -930,12 +1023,11 @@ def test_list_hunts_kind_filter(client: TestClient) -> None:
     rows = client.get("/api/v1/hunts", params={"kind": "chat"}).json()
     assert [r["id"] for r in rows] == [chat]
 
-    # unknown kind → no kind filter, exactly as an unknown status is treated,
-    # and the catalog runs stay out.
+    # unknown kind → no kind filter, exactly as an unknown status is treated.
     rows = client.get("/api/v1/hunts", params={"kind": "bogus"}).json()
-    assert {r["id"] for r in rows} == {chat, scheduled}
+    assert {r["id"] for r in rows} == {chat, scheduled, triggered}
     rows = client.get("/api/v1/hunts", params={"kind": "bogus", "status": "nonsense"}).json()
-    assert {r["id"] for r in rows} == {chat, scheduled}
+    assert {r["id"] for r in rows} == {chat, scheduled, triggered}
 
     # kind combines with status
     rows = client.get("/api/v1/hunts", params={"kind": "triggered", "status": "complete"}).json()
@@ -944,20 +1036,18 @@ def test_list_hunts_kind_filter(client: TestClient) -> None:
     assert rows == []
 
 
-def test_a_catalog_run_is_left_out_of_the_list_and_the_counts(client: TestClient) -> None:
-    """The subtitle counts agent runs. A catalog run is a recorded analytic hit.
-
-    The exclusion is a SQL clause, so a page of agent runs is never short
-    because catalog runs filled the limit ahead of them.
+def test_a_catalog_run_is_in_the_list_and_out_of_the_counts(client: TestClient) -> None:
+    """W13: the list holds every run, with the catalog type on the row. The
+    subtitle counts agent runs, so a catalog gap does not count as a finding.
     """
     chat = _seed_complete_hunt(client)
     triggered = _seed_complete_hunt(client, kind="triggered")
 
-    rows = client.get("/api/v1/hunts").json()
-    assert [r["id"] for r in rows] == [chat]
-    assert [r["id"] for r in client.get("/api/v1/hunts", params={"kind": "triggered"}).json()] == [
-        triggered
-    ]
+    rows = {r["id"]: r for r in client.get("/api/v1/hunts").json()}
+    assert set(rows) == {chat, triggered}
+    assert rows[triggered]["starter"] == "catalog"
+    # Negative control: an agent run keeps its own starter.
+    assert rows[chat]["starter"] == "analyst"
 
     labels = {s["label"]: s["value"] for s in client.get("/api/v1/hunts/stats").json()}
     assert labels["Hunts"] == "1"
@@ -1744,43 +1834,56 @@ def test_the_partial_hunt_clamp_ranks_an_unknown_severity_the_same_way() -> None
     assert clamped.confidence <= 0.5
 
 
-def test_validate_hunt_findings_clamps_overlong_title() -> None:
-    """An overlong machine-generated title (> 90 chars) is word-boundary truncated
-    with a trailing ellipsis; a compliant title passes through untouched."""
+# A sentence-length title, 200 characters. The clamp was 90 characters, and a
+# title like this one was stored cut with an ellipsis, so no surface could
+# show the rest of it.
+_TITLE_200 = (
+    "Sustained periodic beaconing from an internal workstation to a rare external "
+    "IP with low data volume and a highly regular sixty-second cadence over the "
+    "whole lookback window of the hunt, seen at night"
+)
+
+
+def test_validate_hunt_findings_keeps_a_200_character_title_whole() -> None:
+    """A 200 character title is stored whole. The console wraps it."""
     from soc_ai.agent.hunt_gates import _validate_hunt_findings
 
-    long_title = (
-        "Sustained periodic beaconing from an internal workstation to a rare external "
-        "IP with low data volume and a highly regular sixty-second cadence"
-    )
-    assert len(long_title) > 90
+    assert len(_TITLE_200) == 200
     findings = [
-        HuntFinding(title=long_title, detail="A host beacons on a 60s cadence."),
+        HuntFinding(title=_TITLE_200, detail="A host beacons on a 60s cadence."),
         HuntFinding(title="Beaconing to rare external IP", detail="Compliant title."),
     ]
     validated, _ = _validate_hunt_findings(findings, [])
 
-    clamped = validated[0].title
-    assert len(clamped) <= 90
-    assert clamped.endswith("…")
-    # cut on a word boundary: the kept text is a prefix of the original that
-    # ended exactly at a space (no mid-word chop)
-    kept = clamped[:-1]
-    assert long_title.startswith(kept)
-    assert long_title[len(kept)] == " "
-    # compliant title untouched
+    assert validated[0].title == _TITLE_200
+    assert not validated[0].title.endswith("…")
+    # Negative control: a short title passes through unchanged.
     assert validated[1].title == "Beaconing to rare external IP"
 
 
-def test_validate_hunt_findings_clamps_unbroken_title() -> None:
-    """A single overlong token (no word boundary to cut at) is hard-cut to the
-    ceiling rather than left to overflow."""
+def test_validate_hunt_findings_keeps_a_very_long_title_whole() -> None:
+    """No title is cut. The owner banned the ellipsis cut on 2026-10-07."""
     from soc_ai.agent.hunt_gates import _validate_hunt_findings
 
-    findings = [HuntFinding(title="x" * 200, detail="d")]
+    long_title = " ".join([_TITLE_200] * 4)
+    assert len(long_title) > 500
+    validated, _ = _validate_hunt_findings([HuntFinding(title=long_title, detail="d")], [])
+
+    assert validated[0].title == long_title
+    assert "…" not in validated[0].title
+
+
+def test_validate_hunt_findings_keeps_an_unbroken_title_whole() -> None:
+    """A single long token is whole too. Only the surrounding whitespace goes."""
+    from soc_ai.agent.hunt_gates import _validate_hunt_findings
+
+    findings = [
+        HuntFinding(title="x" * 600, detail="d"),
+        HuntFinding(title="  " + "y" * 200 + " ", detail="d"),
+    ]
     validated, _ = _validate_hunt_findings(findings, [])
-    assert len(validated[0].title) <= 90
-    assert validated[0].title.endswith("…")
+    assert validated[0].title == "x" * 600
+    assert validated[1].title == "y" * 200
 
 
 def test_run_hunt_gate_strips_fabricated_citation_end_to_end(settings_kratos: Settings) -> None:
@@ -2096,22 +2199,27 @@ def test_validate_hunt_charts_caps_at_four() -> None:
     assert counts["charts_dropped"] == 2
 
 
-def test_validate_hunt_charts_clamps_overlong_title() -> None:
-    """A kept chart's overlong title gets the same word-boundary clamp as findings."""
+def test_validate_hunt_charts_keeps_a_very_long_title_whole() -> None:
+    """A kept chart's title is never cut, the same as a finding's. A 200
+    character chart title is kept whole too."""
     from soc_ai.agent.hunt_gates import _validate_hunt_charts
 
-    long_title = (
+    sentence = (
         "Distribution of beacon intervals observed between the internal workstation "
         "and the rare external destination over the whole lookback window"
     )
-    assert len(long_title) > 90
+    long_title = " ".join([sentence] * 5)
+    assert len(long_title) > 500
     tool_results = [_tool_result({"hits": [{"_id": "sREAL_PULLED_ID_42"}]})]
-    charts = [_chart(title=long_title, source_citations=["sREAL_PULLED_ID_42"])]
+    charts = [
+        _chart(title=long_title, source_citations=["sREAL_PULLED_ID_42"]),
+        _chart(title=_TITLE_200, source_citations=["sREAL_PULLED_ID_42"]),
+    ]
     kept, _ = _validate_hunt_charts(charts, tool_results)
-    assert len(kept) == 1
-    assert len(kept[0].title) <= 90
-    assert kept[0].title.endswith("…")
-    assert long_title.startswith(kept[0].title[:-1])
+    assert len(kept) == 2
+    assert kept[0].title == long_title
+    assert "…" not in kept[0].title
+    assert kept[1].title == _TITLE_200
 
 
 def test_run_hunt_chart_gate_end_to_end(settings_kratos: Settings) -> None:
@@ -2598,11 +2706,20 @@ def test_every_outcome_carries_one_label_the_screen_can_print(client: TestClient
 
     ids = _asyncio.run(seed())
     rows = {h["id"]: h for h in client.get("/api/v1/hunts").json()}
-    assert rows[ids["threats"]]["outcome_label"] == "Threat findings"
-    assert rows[ids["clean"]]["outcome_label"] == "No threat observed"
-    assert rows[ids["gap"]]["outcome_label"] == "No threat observed · visibility gap"
+    # One field, five values (S1). The label is the same word on every surface.
+    assert rows[ids["threats"]]["outcome"] == "threat_found"
+    assert rows[ids["threats"]]["outcome_label"] == "Threat found"
+    assert rows[ids["clean"]]["outcome"] == "no_threat"
+    assert rows[ids["clean"]]["outcome_label"] == "No threat found"
+    # A hunt that saw only blindness did not test its objective.
+    assert rows[ids["gap"]]["outcome"] == "no_answer"
+    assert rows[ids["gap"]]["outcome_label"] == "No answer"
+    assert rows[ids["failed"]]["outcome"] == "could_not_run"
     assert rows[ids["failed"]]["outcome_label"] == "Could not run"
-    assert rows[ids["error"]]["outcome"] == "" and rows[ids["error"]]["outcome_label"] == ""
+    # A stopped hunt could not run either. The row says so.
+    assert rows[ids["error"]]["outcome"] == "could_not_run"
+    assert rows[ids["error"]]["outcome_label"] == "Could not run"
+    assert rows[ids["error"]]["outcome_headline"] == "The hunt failed."
 
 
 def test_an_errored_hunt_stores_why_it_failed(settings_kratos: Settings) -> None:
@@ -2641,8 +2758,8 @@ def test_an_errored_hunt_stores_why_it_failed(settings_kratos: Settings) -> None
     asyncio.run(engine.dispose())  # type: ignore[union-attr]
 
 
-def test_an_errored_hunt_shows_its_reason_and_keeps_an_empty_outcome(client: TestClient) -> None:
-    """The detail page reads the narrative. The list row's outcome stays empty."""
+def test_an_errored_hunt_shows_its_reason_and_could_not_run(client: TestClient) -> None:
+    """The detail page reads the narrative. The list row says the hunt could not run."""
 
     async def seed() -> str:
         async with client.app.state.db_sessionmaker() as db:
@@ -2661,8 +2778,10 @@ def test_an_errored_hunt_shows_its_reason_and_keeps_an_empty_outcome(client: Tes
     detail = client.get(f"/api/v1/hunts/{hunt_id}").json()
     assert detail["status"] == "error"
     assert detail["narrative"].startswith("The data source did not answer in time")
+    assert detail["outcome"] == "could_not_run"
     row = next(h for h in client.get("/api/v1/hunts").json() if h["id"] == hunt_id)
-    assert row["outcome"] == ""
+    assert row["outcome"] == "could_not_run"
+    assert row["outcome_headline"] == detail["outcome_headline"]
 
 
 # ── Corroboration gate: a high threat citing ONLY detector alerts is capped ──
@@ -2711,7 +2830,7 @@ def test_validate_hunt_findings_caps_high_threat_citing_only_alerts() -> None:
     assert f.severity == "medium"  # capped from high — cited only the alert
     assert f.citations == ["sALERT_DOC_7Zk"]  # citation still resolves (it exists)
     assert f.validator_note is not None
-    assert "cites only detector alerts" in f.validator_note.lower()
+    assert "cites alerts only" in f.validator_note.lower()
     assert counts["findings_capped"] == 1
     # the citation resolved, so nothing was stripped
     assert counts["citations_stripped"] == 0
@@ -2821,7 +2940,7 @@ def test_validate_hunt_findings_get_event_raw_refetching_alert_is_not_corroborat
 
     f = validated[0]
     assert f.severity == "medium"  # capped — a refetched alert doc is not corroboration
-    assert "cites only detector alerts" in (f.validator_note or "").lower()
+    assert "cites alerts only" in (f.validator_note or "").lower()
     assert counts["findings_capped"] == 1
 
 
@@ -2881,7 +3000,7 @@ def test_validate_hunt_findings_rule_content_is_not_corroboration() -> None:
 
     f = validated[0]
     assert f.severity == "medium"  # critical → medium: no non-alert corroboration
-    assert "cites only detector alerts" in (f.validator_note or "").lower()
+    assert "cites alerts only" in (f.validator_note or "").lower()
     assert counts["findings_capped"] == 1
 
 
@@ -3014,7 +3133,7 @@ def test_run_hunt_gathers_labeled_evidence_and_caps_alert_only_threat(
     report_ev = next(e for e in events if e.kind == "hunt_report")
     f = report_ev.payload["findings"][0]
     assert f["severity"] == "medium"  # capped: cited only the detector alert
-    assert "cites only detector alerts" in (f["validator_note"] or "").lower()
+    assert "cites alerts only" in (f["validator_note"] or "").lower()
 
 
 # ── Layer 3: deterministic partial-report humility ───────────────────────────
@@ -4207,6 +4326,10 @@ def test_lead_detail_carries_the_timeline_and_the_live_weight(client: TestClient
         "known_change",
         "benign_repeat",
         "bad_baseline",
+        "authorized_test",
+        "duplicate",
+        "bad_analytic_logic",
+        "lab_host",
         "other",
     ]
     assert client.get("/api/v1/hunts/leads/999999").status_code == 404
@@ -4223,6 +4346,27 @@ def test_dismissing_a_lead_needs_a_reason(client: TestClient) -> None:
     assert res.status_code == 200
     assert res.json()["status"] == "dismissed"
     assert res.json()["dismissed_reason"] == "known_change"
+
+
+@pytest.mark.parametrize(
+    "reason", ["authorized_test", "duplicate", "bad_analytic_logic", "lab_host"]
+)
+def test_the_four_analyst_reasons_dismiss_a_lead(client: TestClient, reason: str) -> None:
+    # C9: the reasons an analyst uses besides the baseline ones. Each fits the
+    # 32-character column and reaches the record as given.
+    lead_id = _seed_lead(client)
+    res = client.post(f"/api/v1/hunts/leads/{lead_id}/dismiss", json={"reason": reason})
+    assert res.status_code == 200
+    assert res.json()["dismissed_reason"] == reason
+    assert res.json()["decisions"][-1]["reason"] == reason
+
+
+def test_a_reason_close_to_a_real_one_is_still_refused(client: TestClient) -> None:
+    # Negative control for the list above: the route checks the exact word.
+    lead_id = _seed_lead(client)
+    res = client.post(f"/api/v1/hunts/leads/{lead_id}/dismiss", json={"reason": "lab host"})
+    assert res.status_code == 422
+    assert "lab_host" in res.json()["detail"]["hint"]
 
 
 def test_hunting_a_lead_starts_a_lead_hunt_and_marks_the_lead(
@@ -4369,7 +4513,7 @@ def test_a_lead_hunt_that_finds_no_threat_closes_the_lead(
     assert detail is not None and detail["status"] == "dismissed"
     assert detail["dismissed_reason"] == "hunt_clean" and detail["dismissed_by"] == "auto-hunt"
     assert detail["hunt_id"] == hunt_id and detail["hunt_status"] == "complete"
-    assert detail["hunt_outcome_label"] == "No threat observed"
+    assert detail["hunt_outcome_label"] == "No threat found"
     assert lead_id in _lead_set(client, "closed")
     assert lead_id not in _lead_set(client, "needs_decision")
     # What a second click does depends on whether the hunt has finished:
@@ -5135,7 +5279,7 @@ def _timeline_events(stamp: str | None) -> list[Any]:
         ("cancelled", "Findings synthesis: stopped by a cancel request"),
         ("interrupted", "Findings synthesis: stopped by a service restart"),
         ("error", "Findings synthesis: did not finish"),
-        ("running", "Findings synthesis: running…"),
+        ("running", "Findings synthesis: running"),
     ],
 )
 def test_the_synthesis_step_settles_with_the_hunt(status: str, synth: str) -> None:
@@ -5151,7 +5295,7 @@ def test_the_synthesis_step_settles_with_the_hunt(status: str, synth: str) -> No
     assert titles[-1] == synth
     assert not any("Verdict" in t for t in titles)
     if status != "running":
-        assert not any("running…" in t for t in titles), titles
+        assert not any(t.endswith(": running") for t in titles), titles
         assert titles[1].endswith("no result recorded")
     assert all(s.time == "" for s in steps)
 
@@ -5931,7 +6075,7 @@ def test_a_lead_the_hunt_closed_is_on_the_closed_tab_with_its_reason(client: Tes
     closed = client.get("/api/v1/leads?status=closed").json()
     row = next(lead for lead in closed if lead["id"] == lead_id)
     assert row["status"] == "dismissed" and row["dismissed_reason"] == "hunt_clean"
-    assert row["hunt_status"] == "complete" and row["hunt_outcome_label"] == "No threat observed"
+    assert row["hunt_status"] == "complete" and row["hunt_outcome_label"] == "No threat found"
     detail = client.get(f"/api/v1/hunts/leads/{lead_id}").json()
     assert detail["dismissed_by"] == "auto-hunt"
     # The analyst's list does not grow. The closure is the rule's word, not a choice.
@@ -5940,6 +6084,10 @@ def test_a_lead_the_hunt_closed_is_on_the_closed_tab_with_its_reason(client: Tes
         "known_change",
         "benign_repeat",
         "bad_baseline",
+        "authorized_test",
+        "duplicate",
+        "bad_analytic_logic",
+        "lab_host",
         "other",
     ]
     assert client.get("/api/v1/hunts/needs-you").json()["leads_needing_decision"] == 0
@@ -6057,7 +6205,7 @@ def test_a_related_row_carries_the_state_of_its_own_hunt(client: TestClient) -> 
     row = client.get(f"/api/v1/hunts/leads/{mine}").json()["related"][0]
     assert row["lead_id"] == hunted
     assert row["hunt_status"] == "complete"
-    assert row["hunt_outcome_label"] == "Threat findings"
+    assert row["hunt_outcome_label"] == "Threat found"
 
     # The other side of the pair has no hunt, so it claims none.
     back = client.get(f"/api/v1/hunts/leads/{hunted}").json()["related"][0]

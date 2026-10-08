@@ -9,13 +9,13 @@
 // BOTH resolutions inline (the old page scattered that decision across an
 // amber box, a grey box above it and a collapsed drawer below).
 
-import { AlertTriangle, Check, EyeOff, Undo2 } from 'lucide-react';
+import { AlertTriangle, Check, Clock, EyeOff, Undo2 } from 'lucide-react';
 import { useState } from 'react';
 import { clearDossierOverride, snoozeDossierConflict } from '../lib/api';
 import { cn } from '../lib/cn';
-import { fieldLabel, isResolved, relativeAge } from '../lib/hostDossier';
+import { ageInWords, fieldLabel, isResolved, relativeAge, selfReportedFields } from '../lib/hostDossier';
 import { absTime } from '../lib/timeRange';
-import type { Dossier, DossierField } from '../lib/types';
+import type { Dossier, DossierField, MachineAgent } from '../lib/types';
 import { useDossierWrite } from '../lib/useDossierWrite';
 import { Spinner } from './States';
 import { FactRow } from './HostFacts';
@@ -149,9 +149,21 @@ export interface HostBriefingProps {
   canDeclare: boolean;
   onApplied: (next: Dossier) => void;
   focusField: string | null;
+  /** The agent of the machine, from the machine read. The header names it;
+   *  the banner must agree with the header. Null when no agent reported, and
+   *  absent on the record page of one address. */
+  agent?: MachineAgent | null;
 }
 
-export function HostBriefing({ dossier, canDeclare, onApplied, focusField }: HostBriefingProps) {
+/** The sentence for an agent that reported once and is quiet now. */
+export function lateAgentText(lastReport: string | null | undefined, now = Date.now()): string {
+  const age = ageInWords(lastReport, now);
+  return age
+    ? `The agent last reported ${age}. The facts from the agent are as old as that report.`
+    : 'The agent has stopped reporting. The facts from the agent are as old as its last report.';
+}
+
+export function HostBriefing({ dossier, canDeclare, onApplied, focusField, agent }: HostBriefingProps) {
   const conflicts = dossier.fields.filter((f) => f.conflict != null);
   const criticality = dossier.fields.find((f) => f.field === 'criticality' && isResolved(f));
   const policy = dossier.fields.find((f) => f.field === 'policy_notes' && isResolved(f));
@@ -159,9 +171,17 @@ export function HostBriefing({ dossier, canDeclare, onApplied, focusField }: Hos
   // belongs here, in words, because it changes how every number below reads.
   // `reporting` is the wire's answer, computed under overrides and the
   // staleness gates the client does not hold.
-  const noAgent = !dossier.reporting;
+  //
+  // The banner said "No agent reports from this machine" under a header that
+  // named the agent and its last report (dogfood 2026-10-06, S4). `reporting`
+  // goes false when the agent is late, and a late agent is not an absent one.
+  // The banner now reads the same agent the header reads: "no agent" only when
+  // no agent ever reported, and the age of the last report otherwise.
+  const everReported = agent != null || selfReportedFields(dossier.fields).length > 0;
+  const lateAgent = !dossier.reporting && everReported;
+  const noAgent = !dossier.reporting && !everReported;
 
-  if (conflicts.length === 0 && !criticality && !policy && !noAgent) return null;
+  if (conflicts.length === 0 && !criticality && !policy && !noAgent && !lateAgent) return null;
 
   return (
     <section data-testid="host-briefing" className="mb-3 flex flex-col gap-2">
@@ -199,8 +219,22 @@ export function HostBriefing({ dossier, canDeclare, onApplied, focusField }: Hos
         <ConflictCard key={f.field} ip={dossier.ip} f={f} canDeclare={canDeclare} onApplied={onApplied} />
       ))}
 
+      {lateAgent && (
+        <div
+          data-testid="host-agent-late"
+          className="flex items-start gap-2 rounded-card border border-warn/30 bg-warn/[0.05] px-3.5 py-2.5 text-[12.5px] leading-[1.5] text-text-2"
+          title={agent?.last_report ? absTime(agent.last_report) : undefined}
+        >
+          <Clock size={13} className="mt-0.5 flex-none text-warn" />
+          <span>{lateAgentText(agent?.last_report)}</span>
+        </div>
+      )}
+
       {noAgent && (
-        <div className="flex items-start gap-2 rounded-card border border-border bg-surface-1 px-3.5 py-2.5 text-[12.5px] leading-[1.5] text-dim">
+        <div
+          data-testid="host-no-agent"
+          className="flex items-start gap-2 rounded-card border border-border bg-surface-1 px-3.5 py-2.5 text-[12.5px] leading-[1.5] text-dim"
+        >
           <EyeOff size={13} className="mt-0.5 flex-none text-faint" />
           <span>
             No agent reports from this machine. This page cannot show its processes, its users or

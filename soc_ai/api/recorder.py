@@ -32,7 +32,7 @@ def _first_rationale(report: dict[str, Any]) -> str | None:
         return str(actions[0]["rationale"])
     summary = str(report.get("summary") or "")
     if summary:
-        return summary.split(". ", maxsplit=1)[0][:300]
+        return summary.split(". ", maxsplit=1)[0]
     return None
 
 

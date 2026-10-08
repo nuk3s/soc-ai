@@ -4,7 +4,7 @@ soc-ai triages the alerts your grid raises. It also looks for the attacks that r
 This guide covers that second half. The analytics run over the grid and write hits. Leads form
 from the hits. Hunts answer the leads, and investigations end in a verdict.
 
-![How hunting flows: analytic, hit, lead, hunt, investigation](img/hunting-flow.svg)
+![How this flows: the alert path and the sweep path, from an analytic hit and an alert to an action in Security Onion](img/hunting-flow.svg)
 
 ## The five nouns
 
@@ -16,7 +16,7 @@ soc-ai uses one word for one thing. These five carry the whole pipeline.
   stored as an observation. The lead page and the host page call it an observation.
 - **Lead:** the observations on one entity that are worth one decision.
 - **Hunt:** one agent run with an objective. An analyst, a schedule or a lead starts it. A hunt
-  ends in findings and a narrative. It states no verdict.
+  ends in findings and a narrative. It states no verdict. soc-ai investigates its findings.
 - **Investigation:** one agent run that ends in a verdict. Its subject is one alert, or one hunt
   with all of its findings.
 
@@ -189,8 +189,11 @@ departure lasted. Its statistic is the residual z of the furthest hour.
 
 Every observation records the event time, the statistic, its value and the baseline value it
 departed from. It also records up to 10 document ids and an OQL query that shows the departure
-again. The lead page shows the statistic and the query under each observation. **Run this query** opens a new hunt with
-the query in the objective. The host page shows the statistic on each row. The hunt a lead starts
+again. The lead page shows the statistic and the query under each observation. **Copy query** puts
+the query on the clipboard. **Hunt with this query** opens a new hunt. Its objective names the host
+and the hours in the analyst's words, and the query follows. A rate departure reads as a multiple
+of the expected rate. The z score is behind **Scoring**. The host page shows the statistic on each
+row. The hunt a lead starts
 reads each statistic and each query first, so it reads the departure and does not search for it
 again.
 
@@ -299,10 +302,10 @@ per-state note names the `unmeasurable`, `stale`, `drifted` and `held` counts.
 Every hit cites at least one document. soc-ai drops a hit with no document, counts it, and states
 the count in the sweep notes. The lead hunt skips a lead with no cited document.
 
-A learned detector ships in shadow. Its spec declares `ships_as: shadow`, a fire budget and a
-precision floor. Its observations are shadow observations until an analyst approves the analytic to
-live. The self-healing hold moves a live detector back to shadow if it passes its fire budget or
-falls under its precision floor. See "Automatic status changes".
+A learned detector ships in shadow. Its spec declares `ships_as: shadow`, a daily hit limit and a
+minimum precision. Its observations are shadow observations until an analyst approves the analytic
+to live. The self-healing hold moves a live detector back to shadow if it passes its daily hit limit
+or falls under its minimum precision. See "Automatic status changes".
 
 ### Cross-plane silence
 
@@ -494,6 +497,11 @@ off, the row still states the date and the state of the last fit.
 
 ## Lead hunts
 
+Hunt a lead to learn what is here. Open an investigation to decide and act. A hunt is not finished
+until its findings are investigated. The hunt investigates what it finds and brings back the
+verdicts. The lead offers **Hunt this lead**. The hunt page offers **Open an investigation** on a
+finding with no investigation.
+
 With `lead_auto_hunt` on, a loop wakes every 60 s. It starts the hunt for each open lead that has
 no hunt, oldest lead first, up to `lead_auto_hunt_concurrency` hunts at a time. The lead then reads
 "New · hunt queued".
@@ -529,7 +537,7 @@ A lead settles when its hunt finishes. What the hunt found decides where the lea
   earlier hunt found a threat."
 - The hunt found a **threat**, or it reported a **visibility gap**. The lead waits on you under
   Needs decision as "Hunted · Threat findings" or "Hunted · No threat observed · visibility gap".
-  Read the hunt, then promote or dismiss.
+  Read the verdicts that the hunt brought back, or dismiss the lead.
 - The hunt **could not run**: an error, a cancel, an interrupted process, or a query that raised.
   The lead returns to open and keeps the hunt. The loop starts one more hunt. If that one cannot
   run either, the lead waits on you as "Hunted · Could not run" and offers Hunt again.
@@ -542,8 +550,9 @@ soc-ai signs a hunt closure as soc-ai even if you started the hunt by hand. A le
 yourself and then reopened is never closed by a hunt. A clean hunt on it waits on you.
 
 The lead page lists every decision on the lead in order. The decisions are each dismissal, each
-reopen, the promotion, the close by a clean hunt and a hold. A reopen clears the current dismissal. The old
-dismissal stays in the list.
+reopen, an investigation opened on the lead, the close by a clean hunt and a hold. A reopen clears
+the current dismissal. The old dismissal stays in the list. The store keeps the word `promoted`
+for an investigation opened on the lead. The lead page shows it as "opened an investigation".
 
 A closed lead keeps its history. A type that the hunt already cleared can show up again while the
 lead's observations are still live. The new observation then joins the closed lead as history. Nothing
@@ -552,13 +561,77 @@ forms and nothing re-hunts. A new type reopens the lead in place, and the loop h
 A lead that an earlier release left in hunting settles at the next start. With `lead_auto_hunt` on,
 the loop also settles finished hunts at each wake, before it picks the next leads.
 
-## Hunt promotion
+A lead hunt that investigates its findings settles by the rule in [Hunt findings](#hunt-findings).
 
-Press **Promote** on a hunted lead, or promote one finding from the hunt page. soc-ai then runs an
-investigation whose subject is the hunt.
+## Hunt findings
+
+A hunt investigates its findings as part of the hunt. After the hunt lands its report, soc-ai opens
+one investigation for each subject finding. The investigation runs the same way as one you open by
+hand. Its actor is `system:hunt`.
+
+A finding is a subject when it names a host, an address, a user or a domain. A visibility gap, a
+failed query and a clean observation are not subjects. The investigation runs on the document the
+finding cites. When the finding cites none, it runs on the evidence of the lead. When there is no
+document at all, the finding reads "Investigation failed" with that reason, and you decide.
+
+- Two investigations of one hunt run at a time. The finding with the highest severity goes first.
+  Findings of equal severity go in report order.
+- `hunt_findings_investigate_max` caps the investigations of one hunt. The default is 20. A finding
+  past the cap reads "Over the cap, open by hand." Use Open an investigation on that finding.
+- The hunt reads **Investigating** while the investigations run. The findings section reads
+  "Investigating 2 of 3 findings". The hunt is complete when the last investigation ends.
+- A failed investigation counts as ended. Its finding reads "Investigation failed, re-run." Use
+  Open an investigation on that finding.
+- A cancel of the hunt stops its investigations. A queued one never starts, and a running one stops.
+- A restart completes an investigating hunt. A finding whose investigation never started reads failed.
+- The hunt's own investigations record no observation. An observation for each finding would form a
+  new lead on the host of every lead hunt.
+
+Each finding card shows the verdict, the confidence word, the actions that wait and a link to the
+investigation.
+
+### One investigation per subject
+
+Before soc-ai opens an investigation, it looks for a running or complete one from the last 7 days.
+A match investigated the same alert, or it has the same subject fingerprint. The fingerprint is the
+entity set and the cited document ids of the finding. It does not depend on the hunt. A match is
+reused: the finding links to it, and no new run starts. A re-hunt of a lead therefore reuses the
+investigations of the first hunt for the findings that did not change.
+
+A failed run, a pipeline fallback and a backtest replay are never reused.
+
+### Outcomes after the investigations
+
+The outcome of the hunt then reads the verdicts.
+
+| Outcome | Label | When |
+|---|---|---|
+| `investigating` | Investigating 2 of 3 findings | The investigations of the findings run. |
+| `threats_confirmed` | 2 of 3 findings are threats | At least one investigation reached the verdict true positive. |
+| `no_threat_confirmed` | No threat confirmed | The investigations reached verdicts, and none is a true positive. |
+
+A hunt whose investigations reached no verdict keeps the outcome of its report. So does a hunt with
+no subject finding. The bell reads "Hunt finished: 2 of 3 findings are threats".
+
+### The lead of the hunt
+
+When every subject finding of a lead hunt has a verdict, soc-ai closes the lead as promoted. The
+decision names `system:hunt` and records the verdict of each finding. A finding with no verdict
+leaves the lead to you. A lead hunt with no subject finding settles by the rules in
+[Hunt outcomes](#hunt-outcomes).
+
+`soc-ai usage` counts the hunt's own investigations under the entry "Hunt finding investigation". It
+prints the line `hunt findings investigated: N` for the window.
+
+## Investigations of hunt findings
+
+A hunt is not finished until its findings are investigated. The hunt investigates what it finds and
+brings back the verdicts. A finding with no investigation offers **Open an investigation** on the
+hunt page. That control starts the investigation by hand. The subject of the investigation is the
+hunt.
 
 The run reads the hunt's objective, its narrative, every finding, and every document those findings
-cite, up to 40. The promoted finding's documents come first and the rest follow newest first. A lead
+cite, up to 40. The documents of the chosen finding come first and the rest follow newest first. A lead
 hunt also carries the lead's observations and its related leads. soc-ai loads the cited documents as
 evidence before the investigation starts. A verdict that cites one of them then resolves against a
 document the run holds.
@@ -575,8 +648,8 @@ egress guard, the Oracle escalation and the session gate. Two things do not run.
 templates do not. Each template matches an alert rule class, and a hunt has none. The unattended
 acknowledge does not either. Security Onion holds no hunt to acknowledge.
 
-The server refuses Promote on a lead with no finished hunt, with HTTP 409 `lead_not_hunted`. Hunt
-the lead first. The investigation reads the hunt's findings.
+The route `POST /hunts/leads/{id}/promote` stays for API clients. The console offers no control
+for it. The server refuses it on a lead with no finished hunt, with HTTP 409 `lead_not_hunted`.
 
 ## Related leads
 
@@ -638,8 +711,8 @@ A shadow hit stays unread until you open its evidence or act on it. A live hit h
 ### 3. Leads
 
 Four tabs, named by what you must do: **Needs decision**, **In progress**, **Closed**, **All**. The
-block opens on Needs decision. Closed holds the leads you dismissed or promoted and the leads a
-hunt closed.
+block opens on Needs decision. Closed holds the leads you dismissed or opened an investigation on,
+and the leads a hunt closed.
 
 Every row carries a state pill: `New`, `In progress`, `Hunted · <outcome>`, `Dismissed`,
 `Closed. The hunt found no threat.`, `Promoted`. A new lead whose hunt the loop has taken reads
@@ -648,14 +721,19 @@ pill is the state. The tab is a filter.
 
 | State | Actions |
 |---|---|
-| New | Hunt now, Dismiss |
+| New | Hunt this lead, Dismiss. A queued lead offers Hunt now and Dismiss. |
 | In progress | View hunt |
-| Hunted | Read hunt, Promote, Dismiss, Hunt again |
-| Dismissed, Closed by the hunt, Promoted | Reopen. A promoted lead also offers Open investigation. |
+| Hunted | Read hunt, Dismiss, Hunt again |
+| Dismissed, Closed by the hunt, Promoted | Reopen. A promoted lead also offers View investigation. |
 
-A dismissal needs a reason: `expected_for_role`, `known_change`, `benign_repeat`, `bad_baseline` or
-`other`. Free text is optional. The lead quality report counts the reasons, so pick the reason
-that is true.
+A dismissal needs a reason: `expected_for_role`, `known_change`, `benign_repeat`, `bad_baseline`,
+`authorized_test`, `duplicate`, `bad_analytic_logic`, `lab_host` or `other`. The form opens with no
+reason chosen. Free text is optional. The lead quality report counts the reasons, so pick the
+reason that is true.
+
+A dismissal closes the lead. The observations on the lead and their repeats form no new lead. A
+new observation on the same host can form a new lead at once. No time window applies. Select
+Reopen to undo the dismissal.
 
 ### 4. Hunts
 
@@ -831,14 +909,19 @@ and one evidence line for each breach. Read the evidence. Then select Approve or
 puts the analytic back to live. Reject retires it. The store refuses a system actor that tries to
 approve an analytic to live or to retire one.
 
-### Fire budget and precision floor
+### Daily hit limit and minimum precision
 
-A spec can declare two limits. Both are off by default.
+A spec can declare two limits. Both are off by default. The console calls them the daily hit limit
+and the minimum precision.
 
 | Field | What it limits |
 |---|---|
-| `fire_budget_per_day` | The hits the analytic can write in 24 hours. A hit is an observation that the analytic wrote or refreshed live in the window. |
-| `precision_floor` | The lowest share of hunted leads over 30 days that reach a promoted finding or an investigation. The other leads in the share are the leads that a hunt closed clean. |
+| `fire_budget_per_day` | The daily hit limit: the hits the analytic can write in 24 hours. A hit is an observation that the analytic wrote or refreshed live in the window. |
+| `precision_floor` | The minimum precision: the lowest share of hunted leads over 30 days that reach a promoted finding or an investigation. The other leads in the share are the leads that a hunt closed clean. |
+
+The reason of a demotion names the numbers, for example "The analytic wrote 5 hits in 24 hours.
+Its daily hit limit is 3." or "1 of 5 hunted leads reached a finding or an investigation. The
+precision is 0.20. Its minimum precision is 0.50."
 
 After each analytic sweep and each profile sweep, soc-ai checks each live analytic that declares a
 limit. The check reads the store only. It makes no grid query and no model call. A breach moves the
@@ -864,6 +947,8 @@ The setting `analytic_self_heal_enabled` turns the check on and off. It is on by
 |---|---|---|---|
 | `lead_auto_hunt` | on | A lead that has never had a hunt starts one when it forms. | live |
 | `lead_auto_hunt_concurrency` | 2 | How many lead hunts the loop runs at once. The floor is 1. | live |
+| `hunt_findings_investigate` | on | A hunt opens one investigation for each subject finding. The hunt is complete when the last one ends. Off, the hunt completes when its report lands. | live |
+| `hunt_findings_investigate_max` | 20 | The most findings one hunt investigates by itself. A finding past the cap waits for you to open its investigation. | live |
 | `entity_profiles_enabled` | off | Build a behavioural baseline for each host. The profile sweep rebuilds it when it is older than the dossier refresh interval, and a dossier refresh rebuilds it too. The profile sweep reads every host as blind until this is on. Turn it on for the shadow week. | live |
 | `profile_estate_rare_hosts` | 3 | Below this many hosts that know a member, a new member is estate-rare. Its observation is born at 0.6. A member must also reach this many hosts to be estate-common. | live |
 | `profile_estate_common_share` | 0.2 | Above this share of the profiled hosts, a new member is estate-common. It forms no observation. | live |
@@ -871,7 +956,7 @@ The setting `analytic_self_heal_enabled` turns the check on and off. It is on by
 | `hunt_spec_sweeps_enabled` | off | Run every live analytic as a grid query on a schedule. A matching document becomes an observation on the host it names. Observations can form a lead. No model call. Turn this on last, after the shadow week. | live |
 | `hunt_spec_sweep_interval_minutes` | 60 | Minutes between analytic sweeps. The floor is 5. | live |
 | `hunt_spec_sweep_window_minutes` | 1440 | How far back each analytic sweep reads. Keep it wider than the interval. | live |
-| `analytic_self_heal_enabled` | on | Move a live analytic to shadow when it breaches the fire budget or the precision floor in its spec. An analytic with neither field never moves. | live |
+| `analytic_self_heal_enabled` | on | Move a live analytic to shadow when it passes the daily hit limit or falls under the minimum precision in its spec. An analytic with neither field never moves. | live |
 | `catalog_hunt_rows` | off | Add an entry to the Hunts list for each analytic hit, as the sweep did before 1.5.0. | live |
 | `investigator_emits_report` | on | The investigation loop writes the verdict report itself. | next run |
 | `synth_round1_always` | off | Run the first-pass synthesis even when it cannot close the alert. | next run |
@@ -909,10 +994,11 @@ Every route sits under `/api/v1`. The console uses these, and an integrator can 
 | `GET /leads/quality` | The lead rule, the noise floor rule, and what the rule produced per ISO week and per observation-type pair, with `closed_by_hunt` counted apart from `dismissed`. `weeks` sets the window. |
 | `GET /hunts/leads/{id}` | One lead: its observations, its entities, its related leads and whether its investigation still exists. |
 | `POST /hunts/leads/{id}/hunt` | Start the lead hunt by hand. While the attached hunt runs, it returns that hunt. After a hunt has finished, it starts a new one. |
-| `POST /hunts/leads/{id}/promote` | Promote the lead to an investigation of its hunt. Answers 409 `lead_not_hunted` when no hunt has finished. |
+| `POST /hunts/leads/{id}/promote` | Open an investigation of the lead's hunt. The console offers no control for this route. Answers 409 `lead_not_hunted` when no hunt has finished. |
 | `POST /hunts/leads/{id}/dismiss` | Dismiss the lead with a reason from the fixed list. |
 | `POST /hunts/leads/{id}/reopen` | Reopen a closed lead. The loop does not hunt it again. |
-| `POST /hunts/{hunt_id}/findings/{ordinal}/investigate` | Promote one finding of a hunt to an investigation of that hunt. |
+| `POST /hunts/{hunt_id}/findings/{ordinal}/investigate` | Open an investigation on one finding of a hunt. The subject is the hunt. The console control is **Open an investigation**. When a running or complete investigation of the same subject exists, the route returns it. |
+| `GET /hunts` and `GET /hunts/{id}` | A hunt row carries `findingsInvestigated` and `findingsTotal`. Each finding of the detail carries `investigationId`, `verdict`, `confidence`, `investigationStatus` and `pendingActions`. `investigationStatus` is `queued`, `running`, `complete`, `failed`, `cancelled` or `over_cap`. |
 | `GET /hunts/observations` | The observations on one entity, from every source, for the host page. |
 | `GET /hunts/shadow-hits` | The shadow half on its own, for the bell and the Dashboard card. |
 | `POST /hunts/shadow-hits/{obs_id}/read` | Mark one shadow hit read. |

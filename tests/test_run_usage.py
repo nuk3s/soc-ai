@@ -203,3 +203,39 @@ def test_the_cli_prints_the_table(
     assert "Auto-triage, scheduler" in out
     assert "tokens p50/p90" in out
     assert "Counters on 2 of 6 runs" in out
+
+
+async def test_the_investigations_of_hunt_findings_count_for_the_hunt(
+    settings_kratos: Settings,
+) -> None:
+    """A hunt opens one investigation per subject finding. The report reads
+    those runs as the hunt's, apart from an analyst's promotion, and counts
+    them on one line."""
+    engine = make_engine(settings_kratos)
+    await run_migrations(engine)
+    maker = make_sessionmaker(engine)
+    async with maker() as db:
+        db.add(_inv("hf1", started_by="system:hunt", kind="hunt", hunt_id="h9", finding_ordinal=0))
+        db.add(_inv("hf2", started_by="system:hunt", kind="hunt", hunt_id="h9", finding_ordinal=1))
+        # Control: an analyst's promotion of a finding stays a promotion.
+        db.add(_inv("pr1", started_by="admin", kind="hunt", hunt_id="h9", finding_ordinal=2))
+        await db.commit()
+    async with maker() as db:
+        report = await usage_report(db, days=7)
+    await engine.dispose()
+    entries = {e.entry: e.runs for e in report.entries}
+    assert entries["Hunt finding investigation"] == 2
+    assert entries["Promotion"] == 1
+    assert report.hunt_findings_investigated == 2
+    assert "hunt findings investigated: 2" in format_usage(report)
+
+
+async def test_an_empty_window_states_no_hunt_finding_investigation(
+    settings_kratos: Settings,
+) -> None:
+    engine = make_engine(settings_kratos)
+    await run_migrations(engine)
+    async with make_sessionmaker(engine)() as db:
+        report = await usage_report(db, days=1)
+    await engine.dispose()
+    assert "hunt findings investigated: 0" in format_usage(report)

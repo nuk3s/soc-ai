@@ -1,4 +1,4 @@
-// The "Awaiting investigation" KPI and the Untriaged bar of the outcome
+// The alert line of the Needs-you tile and the Untriaged bar of the outcome
 // breakdown count ALERT GROUPS with no standing investigation. Both used to
 // link to /investigations?verdict=untriaged, which lists investigation ROWS —
 // a group nobody has investigated has no row, and cannot get one while it
@@ -55,6 +55,18 @@ vi.mock('../lib/api', async (importOriginal) => ({
   getMe: vi.fn().mockResolvedValue({ username: 'ana', role: 'analyst', status: '' }),
   getPreflight: vi.fn().mockResolvedValue({ status: 'green', failing: 0, warned: 0, checked_at: '2026-08-19T00:00:00+00:00' }),
   getPreflightDetail: vi.fn().mockResolvedValue({ rows: [], checked_at: '2026-08-19T00:00:00+00:00' }),
+  getNeedsYouCount: vi.fn().mockResolvedValue({
+    leads_needing_decision: 0,
+    unread_shadow_hits: 0,
+    untriaged_groups: 1,
+    needs_more_info: 0,
+    pending_actions: 0,
+    total: 1,
+    unknown: [],
+    alert_window: '7d',
+    verdict_window: '30d',
+    alert_floor: false,
+  }),
 }));
 
 import { queueOf } from '../test/alertQueue';
@@ -101,7 +113,7 @@ describe('Dashboard outcome breakdown — where each verdict lands', () => {
   // does, on the same unit and window.
   it.each([
     ['True positive', 'true_positive'],
-    ['Needs info', 'needs_more_info'],
+    ['Needs more info', 'needs_more_info'],
     ['Inconclusive', 'inconclusive'],
     ['False positive', 'false_positive'],
   ])('sends %s to the Alerts list in the same window', async (label, value) => {
@@ -172,25 +184,23 @@ describe('Dashboard outcome breakdown — where each verdict lands', () => {
 // Dashboard cannot know that: the sweep may be running fine and simply skipping
 // the group (severity floor, already acked, schedule off). Naming a culprit it
 // can't verify sent the operator to the scheduler config instead of to the row.
-describe('Dashboard "Awaiting investigation" subline', () => {
+// The Needs-you tile names the groups and links to the list that holds them.
+describe('Dashboard Needs-you alert line', () => {
   it('does not blame an idle sweep when a group is untriaged', async () => {
     await mount();
-    await screen.findByText('Awaiting investigation');
-    // queryAll, not query: the matcher would otherwise also hit every ancestor
-    // of the subline. (The auto-triage panel's "Idle — no auto-investigate
-    // batch has run yet" is a different, true claim and stays.)
+    await screen.findByTestId('needs-you-line-alerts');
     expect(screen.queryAllByText(/auto-investigate idle/i)).toHaveLength(0);
   });
 
   it('points at the screen where the group can actually be triaged', async () => {
     await mount();
-    fireEvent.click(await screen.findByText(/triage from Alerts/i));
-    // Parsed, not substring-matched: query-param ORDER carries no meaning, and
-    // pinning it made an unrelated refactor of the link builder fail here for
-    // no reason a reader could act on.
+    fireEvent.click(await screen.findByText('1 alert group has no verdict'));
+    // Parsed, not substring-matched: query-param ORDER carries no meaning.
     const dest = new URL(here()!, 'http://x');
     expect(dest.pathname).toBe('/alerts');
     expect(dest.searchParams.get('verdict')).toBe('untriaged');
+    // The window of the count, so the list shows the number the line states.
+    expect(dest.searchParams.get('range')).toBe('7d');
   });
 });
 

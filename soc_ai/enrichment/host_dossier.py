@@ -881,7 +881,7 @@ def _partial_port_read(
     """
     for error in observations.errors:
         if error.startswith(_MAIN_PASS_PREFIXES) and _DEGRADED_RE.search(error):
-            return f"the served-port read was partial: {error[:200]}"
+            return f"the served-port read was partial: {error}"
     held = prior.get("services_offered")
     before = _port_count(held.inferred_value_json) if held is not None else None
     fact = facts.get("services_offered")
@@ -1475,7 +1475,9 @@ def _record_error(summary: DossierSummary, detail: str) -> None:
     if len(summary.errors) < _MAX_RECORDED_ERRORS:
         summary.errors.append(detail)
     elif len(summary.errors) == _MAX_RECORDED_ERRORS:
-        summary.errors.append(f"... further failures suppressed after {_MAX_RECORDED_ERRORS}")
+        summary.errors.append(
+            f"soc-ai keeps the first {_MAX_RECORDED_ERRORS} failures and drops the rest."
+        )
 
 
 def _record_note(summary: DossierSummary, detail: str) -> None:
@@ -1489,7 +1491,9 @@ def _record_note(summary: DossierSummary, detail: str) -> None:
     if len(summary.notes) < _MAX_RECORDED_ERRORS:
         summary.notes.append(detail)
     elif len(summary.notes) == _MAX_RECORDED_ERRORS:
-        summary.notes.append(f"... further notes suppressed after {_MAX_RECORDED_ERRORS}")
+        summary.notes.append(
+            f"soc-ai keeps the first {_MAX_RECORDED_ERRORS} notes and drops the rest."
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -835,3 +835,37 @@ def test_a_press_that_opens_nothing_names_no_case(client: TestClient) -> None:
     assert second["escalated"] == 0
     assert second["already_escalated"] == 1
     assert second["cases"] == []
+
+
+def test_a_stranded_claim_names_the_rule_and_the_host(client: TestClient) -> None:
+    """The panel listed raw alert ids (dogfood 2026-10-06). The newest
+    investigation of the alert names its rule and its host."""
+    import asyncio
+
+    from soc_ai.store.models import Investigation
+
+    async def seed() -> None:
+        async with client.app.state.db_sessionmaker() as db:  # type: ignore[attr-defined]
+            db.add(
+                Investigation(
+                    id="INV-ESC",
+                    alert_es_id="ev-named",
+                    rule_name="ET MALWARE Beacon",
+                    src_ip="192.0.2.10",
+                    status="complete",
+                    verdict="true_positive",
+                )
+            )
+            await db.commit()
+
+    asyncio.run(seed())
+    _hold(client, "ev-named", None)
+    _hold(client, "ev-bare", None)
+    _backdate(client, "ev-named", minutes=90)
+    _backdate(client, "ev-bare", minutes=90)
+    claims = {c["alert_id"]: c for c in client.get("/api/v1/escalations/stranded").json()["claims"]}
+    assert claims["ev-named"]["rule_name"] == "ET MALWARE Beacon"
+    assert claims["ev-named"]["host"] == "192.0.2.10"
+    # NEGATIVE CONTROL. An alert no investigation names keeps its id and no guess.
+    assert claims["ev-bare"]["rule_name"] is None
+    assert claims["ev-bare"]["host"] is None

@@ -1201,3 +1201,24 @@ def test_error_state_leaves_an_ordinary_list_query_alone(client: TestClient) -> 
     ids = {r["id"] for r in body["rows"]}
     assert f"{2:026d}" in ids  # dismissed
     assert f"{3:026d}" in ids  # superseded
+
+
+def test_row_names_the_machine_a_host_log_alert_fired_on(client: TestClient) -> None:
+    """A host-log alert has a source address and no destination. The list read
+    "<address> -> " and a dash. The row now carries the machine name, so the
+    console can say "on <host>, host log"."""
+    now = utcnow()
+    host_log = _mk(1, status="complete", verdict="false_positive", dst="", created_at=now)
+    host_log.dest_ip = None
+    host_log.host_name = "WS-07.example.test"
+    flow = _mk(
+        2, status="complete", verdict="false_positive", created_at=now - timedelta(minutes=1)
+    )
+    _seed_route(client, [host_log, flow])
+
+    rows = {r["id"]: r for r in client.get("/api/v1/investigations").json()["rows"]}
+    assert rows[f"{1:026d}"]["hostName"] == "WS-07.example.test"
+    assert rows[f"{1:026d}"]["dst"] is None
+    # Negative control: a row whose alert named no machine carries None, never
+    # an address in its place.
+    assert rows[f"{2:026d}"]["hostName"] is None

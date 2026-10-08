@@ -711,16 +711,17 @@ def _unknown_text(field: ResolvedField) -> str:
 
 
 def _clip(value: str | None, limit: int = _VALUE_CHARS) -> str:
-    """Bound one rendered value, marking the cut.
+    """Bound one rendered value, marking the cut with ``[truncated]``.
 
     Applied to every value including the ones truncation never drops: keeping a
     field is a promise about which facts survive, not a licence for one field to
-    consume the prompt.
+    consume the prompt. The marker is a word: the owner banned the ellipsis
+    (2026-10-07), and the timeline shows this block to the analyst.
     """
     text = " ".join(str(value or "").split())
     if len(text) <= limit:
         return text
-    return text[: limit - 1].rstrip() + "…"
+    return text[:limit].rstrip() + " [truncated]"
 
 
 def _port_list(value: Any) -> tuple[list[str], int] | None:

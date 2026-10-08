@@ -40,7 +40,12 @@ import {
   getLead,
   promoteFinding,
 } from '../lib/api';
-import { CHIP_LEAD, DISPOSITION, STATUS_COMPLETE } from '../lib/tooltips';
+import {
+  ACTION_OPEN_INVESTIGATION,
+  CHIP_LEAD,
+  DISPOSITION,
+  STATUS_COMPLETE,
+} from '../lib/tooltips';
 import { HuntDetail } from './HuntDetail';
 
 const about = (sigmaOn: boolean): AboutInfo => ({
@@ -171,7 +176,7 @@ describe('HuntDetail — Investigate a finding', () => {
     await screen.findByText(f0.title);
     // f0 (never promoted, citable), f1 (never promoted, nothing citable), f4
     // (promoted but errored — slot freed, so it's citable and live too).
-    const buttons = screen.getAllByRole('button', { name: /investigate/i });
+    const buttons = screen.getAllByRole('button', { name: /^open an investigation$/i });
     expect(buttons).toHaveLength(3);
     expect(buttons[0]).not.toBeDisabled();
     expect(buttons[1]).toBeDisabled();
@@ -186,7 +191,7 @@ describe('HuntDetail — Investigate a finding', () => {
     vi.mocked(promoteFinding).mockResolvedValue({ investigation_id: 'inv-1' });
     mount();
     await screen.findByText(f0.title);
-    const [btn0] = screen.getAllByRole('button', { name: /investigate/i });
+    const [btn0] = screen.getAllByRole('button', { name: /^open an investigation$/i });
     fireEvent.click(btn0);
 
     await waitFor(() => expect(promoteFinding).toHaveBeenCalledWith(HUNT_ID, 0));
@@ -203,7 +208,7 @@ describe('HuntDetail — Investigate a finding', () => {
     );
     mount();
     await screen.findByText(f0.title);
-    const [btn0] = screen.getAllByRole('button', { name: /investigate/i });
+    const [btn0] = screen.getAllByRole('button', { name: /^open an investigation$/i });
     fireEvent.click(btn0);
 
     await screen.findByText(/no promotable evidence/i);
@@ -223,7 +228,7 @@ describe('HuntDetail — Investigate a finding', () => {
   // navigated, and the address could not be read before the click.
   it('shows Open + a verdict chip for an already-promoted, complete finding, and does not re-promote on click', async () => {
     mount();
-    const openLink = await screen.findByRole('link', { name: /^open$/i });
+    const openLink = await screen.findByRole('link', { name: /^view investigation$/i });
     expect(openLink.getAttribute('href')).toBe('/investigation/inv-9');
     expect(screen.getByText(/false positive/i)).toBeInTheDocument();
     expect(screen.getByText('0.81')).toBeInTheDocument();
@@ -235,7 +240,7 @@ describe('HuntDetail — Investigate a finding', () => {
 
   it('shows "Investigating…" for an already-promoted, running finding, and links to it', async () => {
     mount();
-    const investigatingLink = await screen.findByRole('link', { name: /Investigating…/i });
+    const investigatingLink = await screen.findByRole('link', { name: /^investigation running$/i });
     expect(investigatingLink.getAttribute('href')).toBe('/investigation/inv-10');
     fireEvent.click(investigatingLink);
     expect(promoteFinding).not.toHaveBeenCalled();
@@ -244,7 +249,7 @@ describe('HuntDetail — Investigate a finding', () => {
   it('leaves an unpromoted finding free to promote as before, even alongside promoted siblings', async () => {
     vi.mocked(promoteFinding).mockResolvedValue({ investigation_id: 'inv-fresh' });
     mount();
-    const [btn0] = await screen.findAllByRole('button', { name: /investigate/i });
+    const [btn0] = await screen.findAllByRole('button', { name: /^open an investigation$/i });
     fireEvent.click(btn0);
 
     await waitFor(() => expect(promoteFinding).toHaveBeenCalledWith(HUNT_ID, 0));
@@ -261,7 +266,7 @@ describe('HuntDetail — Investigate a finding', () => {
     // f0, f1, f4 are the only findings that render an "Investigate"-named
     // button (f2/f3 render Open/Investigating…) — f4 is last in the fixture,
     // so it's the third and final match, in DOM order.
-    const buttons = await screen.findAllByRole('button', { name: /investigate/i });
+    const buttons = await screen.findAllByRole('button', { name: /^open an investigation$/i });
     expect(buttons).toHaveLength(3);
     const errBtn = buttons[2];
     expect(errBtn).not.toBeDisabled();
@@ -360,22 +365,35 @@ describe('HuntDetail — journey wayfinding line', () => {
     vi.mocked(getAbout).mockResolvedValue(about(false));
   });
 
-  it('renders the promote→confirm→draft line on a completed hunt with findings', async () => {
+  it('renders the promote and draft line on a completed hunt with findings', async () => {
     vi.mocked(getHunt).mockResolvedValue(huntFixture());
     mount();
     await screen.findByText(f0.title);
-    expect(
-      screen.getByText(
-        /Promote a finding to investigate it\. Draft a detection from a confirmed true positive\./i,
+    // C1: detection authoring is off here, so the line names no detection
+    // control the page does not show.
+    expect(screen.getByTestId('findings-help').textContent).toBe(
+      'Open an investigation on a finding that has none. Draft an analytic from any threat finding.',
+    );
+  });
+
+  it('names the detection control while detection authoring is on', async () => {
+    vi.mocked(getAbout).mockResolvedValue(about(true));
+    vi.mocked(getHunt).mockResolvedValue(huntFixture());
+    mount();
+    await screen.findByText(f0.title);
+    await waitFor(() =>
+      expect(screen.getByTestId('findings-help').textContent).toBe(
+        'Open an investigation on a finding that has none. Draft a detection from a confirmed true positive. ' +
+          'Draft an analytic from any threat finding.',
       ),
-    ).toBeInTheDocument();
+    );
   });
 
   it('does not render the line when the hunt completed with no findings', async () => {
     vi.mocked(getHunt).mockResolvedValue(huntFixture([]));
     mount();
     await screen.findByText(/No findings\. The hunt found nothing notable/i);
-    expect(screen.queryByText(/Promote a finding to investigate it/i)).toBeNull();
+    expect(screen.queryByText(/Open an investigation on a finding that has none/i)).toBeNull();
   });
 });
 
@@ -520,5 +538,69 @@ describe('HuntDetail — a hunt started from a lead', () => {
     expect(screen.queryByTestId('hunt-lead-chip')).toBeNull();
     expect(screen.queryByTestId('hunt-lead-timeline')).toBeNull();
     expect(getLead).not.toHaveBeenCalled();
+  });
+});
+
+// The owner asked what the difference between hunt and promote is
+// (2026-10-07). A finding offers "Open an investigation" when it has none, and
+// a link to the one it has. No control on the page reads "Promote".
+describe('HuntDetail — the labels on a finding', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getHunt).mockResolvedValue(huntFixture());
+    vi.mocked(getAbout).mockResolvedValue(about(false));
+  });
+
+  it('names the manual control "Open an investigation" and says what it starts', async () => {
+    mount();
+    await screen.findByText(f0.title);
+    const [open] = screen.getAllByRole('button', { name: 'Open an investigation' });
+    expect(open.getAttribute('title')).toBe(ACTION_OPEN_INVESTIGATION);
+    expect(screen.queryAllByRole('button', { name: /promot/i })).toHaveLength(0);
+    expect(screen.queryAllByRole('link', { name: /promot/i })).toHaveLength(0);
+  });
+
+  it('names a link to an investigation that exists, with no ellipsis', async () => {
+    mount();
+    expect((await screen.findByRole('link', { name: 'View investigation' })).getAttribute('href')).toBe(
+      '/investigation/inv-9',
+    );
+    expect(screen.getByRole('link', { name: 'Investigation running' }).getAttribute('href')).toBe(
+      '/investigation/inv-10',
+    );
+  });
+
+  it('reads "Starting the investigation" while the request runs, with no ellipsis', async () => {
+    vi.mocked(promoteFinding).mockReturnValue(new Promise(() => {}));
+    mount();
+    await screen.findByText(f0.title);
+    const [open] = screen.getAllByRole('button', { name: 'Open an investigation' });
+    fireEvent.click(open);
+    await waitFor(() => expect(open.textContent).toBe('Starting the investigation'));
+    expect(open.textContent).not.toMatch(/…|\.\.\./);
+  });
+
+  // The flow strip under the header. A manual hunt starts at its objective,
+  // and the hunt is the current step.
+  it('carries the flow strip with the hunt as the current step', async () => {
+    mount();
+    const strip = await screen.findByTestId('flow-strip');
+    const items = within(strip).getAllByRole('listitem');
+    expect(items.map((li) => li.dataset.testid)).toEqual([
+      'flow-step-objective',
+      'flow-step-hunt',
+      'flow-step-investigations',
+      'flow-step-verdicts',
+      'flow-step-actions',
+    ]);
+    expect(within(strip).getByTestId('flow-step-hunt').getAttribute('aria-current')).toBe('step');
+    // Five threat findings, one investigation complete. The next control is
+    // the one the finding cards show.
+    expect(within(strip).getByTestId('flow-step-investigations').textContent).toContain(
+      '1 of 5 done',
+    );
+    expect(within(strip).getByTestId('flow-control-investigations').textContent).toBe(
+      '· Open an investigation',
+    );
   });
 });

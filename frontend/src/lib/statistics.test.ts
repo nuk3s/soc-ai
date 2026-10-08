@@ -3,7 +3,40 @@
 // pins the backend sentences to these.
 import { describe, expect, it } from 'vitest';
 
-import { rerunHref, rerunObjective, statisticSentence } from './statistics';
+import {
+  isZScore,
+  rateMultipleSentence,
+  rerunHref,
+  rerunObjective,
+  statisticSentence,
+} from './statistics';
+
+// C2: a z score reads as a multiple of the rate it departed from.
+describe('rateMultipleSentence', () => {
+  it('states the count, the expectation and the multiple', () => {
+    expect(rateMultipleSentence('residual_z', 7, 0.5)).toBe(
+      '7 per hour against an expected 0.5. That is 14 times the expected rate.',
+    );
+    expect(rateMultipleSentence('residual_z', 3, 2)).toBe(
+      '3 per hour against an expected 2. That is 1.5 times the expected rate.',
+    );
+    expect(rateMultipleSentence('residual_z', 1, 8)).toBe(
+      '1 per hour against an expected 8. That is 0.13 of the expected rate.',
+    );
+    expect(rateMultipleSentence('robust_z', 40, 4)).toBe(
+      '40 per hour against a median of 4. That is 10 times the median.',
+    );
+  });
+
+  // Negative controls: no count, no positive baseline, or not a z score.
+  it('states nothing it cannot compute', () => {
+    expect(rateMultipleSentence('residual_z', null, 0.5)).toBe('');
+    expect(rateMultipleSentence('residual_z', 7, 0)).toBe('');
+    expect(rateMultipleSentence('documents', 7, 2)).toBe('');
+    expect(isZScore('documents')).toBe(false);
+    expect(isZScore('residual_z')).toBe(true);
+  });
+});
 
 describe('statisticSentence', () => {
   it('states each statistic the sweep writes', () => {
@@ -45,6 +78,35 @@ describe('statisticSentence', () => {
 
   it('names a statistic it does not know with its value', () => {
     expect(statisticSentence('something_new', 2.5, 1)).toBe('something_new 2.5 against a baseline of 1.');
+  });
+});
+
+// W6: the objective names what to explain, on which host, over which hours.
+describe('rerunObjective in analyst words', () => {
+  const query =
+    'source.ip:"192.0.2.10" AND @timestamp:["2026-10-05T04:00:00Z" TO "2026-10-05T05:00:00Z"] | groupby destination.ip';
+
+  it('names the host, the hours and the query', () => {
+    expect(rerunObjective(query, '192.0.2.10', { dimension: 'connection_rate' })).toBe(
+      'Explain the connections from 192.0.2.10 between 04:00 and 05:00 UTC on 2026-10-05. ' +
+        `The query below shows the events.\n\n${query}`,
+    );
+  });
+
+  it('names the member of a set departure and a window across midnight', () => {
+    const q = 'destination.ip:"192.0.2.10" AND @timestamp:["2026-10-04T22:00:00Z" TO "2026-10-05T01:00:00Z"]';
+    expect(rerunObjective(q, '192.0.2.10', { dimension: 'served_ports', member: '445' })).toBe(
+      'Explain the connections to port 445 on 192.0.2.10 between 2026-10-04 22:00 and ' +
+        `2026-10-05 01:00 UTC. The query below shows the events.\n\n${q}`,
+    );
+  });
+
+  // Negative control: the objective names no tool and no tool argument.
+  it('names no tool', () => {
+    for (const dimension of [null, 'connection_rate', 'dns_names', 'logon_users']) {
+      const text = rerunObjective(query, '192.0.2.10', { dimension, member: 'x' });
+      expect(text).not.toMatch(/\bt_[a-z_]+|time_range_minutes|OQL/);
+    }
   });
 });
 

@@ -14,12 +14,12 @@ export function FlowBadge({
   if (!src && !dst) return <span className="text-faint">—</span>;
   return (
     <span
-      className={`inline-flex min-w-0 items-center gap-1 font-mono text-[12px] ${className}`}
+      className={`inline-flex min-w-0 flex-wrap items-center gap-x-1 font-mono text-[12px] ${className}`}
       title={`${src ?? '—'} → ${dst ?? '—'}`}
     >
-      <span className="truncate text-mono-amber">{src ?? '—'}</span>
+      <span className="min-w-0 break-all text-mono-amber">{src ?? '—'}</span>
       <span className="flex-none text-faint">→</span>
-      <span className="truncate text-mono-green">{dst ?? '—'}</span>
+      <span className="min-w-0 break-all text-mono-green">{dst ?? '—'}</span>
     </span>
   );
 }

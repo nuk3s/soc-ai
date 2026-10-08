@@ -12,6 +12,9 @@ They differ only in what they are ANCHORED to, and in what they may propose:
 * :data:`GENERAL_CHAT_SYSTEM_PROMPT` — the Dashboard's general chat: no alert at
   all, seeded with THE GRID (:func:`build_general_context_block`); may
   ``propose_hunt``.
+* :data:`HOST_CHAT_SYSTEM_PROMPT` and :data:`LEAD_CHAT_SYSTEM_PROMPT`: the host
+  page and the lead page: ONE object, seeded with its own facts; may
+  ``propose_hunt``.
 
 The trust rules are SHARED TEXT, not a copy (``_HARD_RULE_NEVER_INVENT``,
 ``_EXTERNAL_INDICATOR_RULE``, ``_ANSWER_SHAPE``, ``_BEHAVIOUR_RULE``): the hunt
@@ -292,6 +295,48 @@ this host you must pull with a tool before you say it.
 )
 
 
+# ── The lead page chat ("Ask soc-ai about this lead") ──────────────────────
+
+LEAD_CHAT_SYSTEM_PROMPT = (
+    """You are soc-ai's SOC assistant. You answer an analyst on the page of ONE \
+lead of THIS Security Onion deployment. A lead is a set of observations on one or \
+more entities. Together the observations are worth a look. Every question is about \
+that lead unless the analyst clearly names another subject. You are READ-ONLY. You \
+investigate and explain. You do not take actions.
+"""
+    # The style contract comes before every other instruction about how to
+    # write, because the model copies the register of what it reads.
+    + WRITING_STYLE_RULE
+    + """
+## The lead under discussion
+{context}
+
+Everything above is established fact you may cite directly. ANYTHING ELSE about \
+this lead or its entities you must pull with a tool before you say it.
+
+"""
+    + _ANSWER_SHAPE
+    + f"- Stay scoped to this lead, its entities and their traffic. {_EXTERNAL_INDICATOR_RULE}\n"
+    + _CITE_RULE
+    + _HARD_RULE_NEVER_INVENT.format(
+        seed_name="lead context",
+        seed_parts=(
+            "the lead line, its observations, its evidence documents and the dossier of its hosts"
+        ),
+    )
+    + _HUNT_PROPOSAL_RULE.format(
+        answerable=(
+            "why the lead formed, what an observation means, what its entities did, "
+            "whether the pattern is normal here"
+        )
+    )
+    + _INTERNAL_HOST_PLAYBOOK
+    + _EVENT_RAW_PARAGRAPH.format(seen_where="lead evidence, the conversation or a tool result")
+    + HOST_NAMING_RULE
+    + _BEHAVIOUR_RULE
+)
+
+
 # ── Seed context blocks ─────────────────────────────────────────────────────
 
 # Bounds on the general seed block. The grid is the anchor, but it is also
@@ -341,6 +386,41 @@ def build_host_context_block(*, ip: str) -> str:
         f"Host page: `{ip}`. The analyst opened this chat from this host's page. "
         "Questions are about this host unless they clearly name another."
     )
+
+
+# Observations a lead seed lists. A lead holds a handful; past this the seed
+# spends the turn on its own preamble. The hunt objective caps at the same 12.
+_MAX_LEAD_OBSERVATIONS = 12
+
+
+def build_lead_context_block(
+    *,
+    lead_id: int,
+    status: str,
+    entities: Sequence[tuple[str, str]],
+    kinds: Sequence[str],
+    observations: Sequence[str],
+) -> str:
+    """Render the lead chat's anchor: WHICH lead this thread is about, and what it holds.
+
+    The lines are the facts the lead page shows: the entities, the kinds in the
+    analyst's words, the status and one line per observation. They go into
+    ``seed_context``, the corpus the grounding gate grades against, so an
+    answer that restates why the lead formed is grounded by construction. The
+    evidence documents and the host dossier follow from the manager.
+    """
+    names = ", ".join(f"{kind} `{key}`" for kind, key in entities) or "no entity recorded"
+    lines = [
+        f"Lead page: lead {lead_id}. The analyst opened this chat from this lead's page. "
+        "Questions are about this lead unless they clearly name another subject.",
+        f"Entities: {names}.",
+        f"Formed from: {', '.join(kinds) or 'several observations'}.",
+        f"Status: {status}.",
+    ]
+    if observations:
+        lines.append("Observations:")
+        lines.extend(f"- {o}" for o in observations[:_MAX_LEAD_OBSERVATIONS])
+    return "\n".join(lines)
 
 
 def _capped(values: Sequence[str], *, cap: int = _MAX_IDENTIFIERS_PER_KIND) -> str:

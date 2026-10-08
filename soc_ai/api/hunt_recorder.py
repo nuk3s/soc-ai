@@ -21,11 +21,6 @@ from soc_ai.store.models import Hunt
 
 _LOGGER = logging.getLogger(__name__)
 
-# How much of a raw exception message the narrative keeps. Enough to name the
-# index, the host or the field that broke. Short enough that a stack trace
-# pasted into a message does not become the hunt's whole write-up.
-_ERROR_MESSAGE_CHARS = 200
-
 
 def error_narrative(message: str | None, exc_type: str | None) -> str:
     """One sentence that says why a hunt failed.
@@ -36,7 +31,7 @@ def error_narrative(message: str | None, exc_type: str | None) -> str:
 
     A known exception shape gets the plain sentence
     :func:`soc_ai.hunting.findings.plain_error` writes for the catalog path.
-    Anything else names the exception and keeps the start of its message.
+    Anything else names the exception and keeps its whole message.
     """
     raw = (message or "").strip()
     plain = plain_error(raw)
@@ -45,7 +40,7 @@ def error_narrative(message: str | None, exc_type: str | None) -> str:
     name = (exc_type or "").strip() or "Error"
     if not raw:
         return f"The hunt failed: {name}."
-    return f"The hunt failed: {name}. {raw[:_ERROR_MESSAGE_CHARS]}"
+    return f"The hunt failed: {name}. {raw}"
 
 
 # Flush after every event so the running hunt's activity timeline populates LIVE
@@ -90,6 +85,8 @@ class HuntRecorder:
         self._error: dict[str, Any] | None = None
         self._finished = False
         self.hunt_id: str | None = None
+        # The status finish() landed, or None before it ran.
+        self.final_status: str | None = None
         # What the run costs, read off the events this recorder persists. A
         # hunt runs the hunt budget, which is its standard class.
         self._meter = RunMeter()
@@ -154,7 +151,20 @@ class HuntRecorder:
         except Exception:
             _LOGGER.exception("hunt recorder flush failed")
 
-    async def finish(self, status: str) -> None:
+    @property
+    def report(self) -> dict[str, Any] | None:
+        """The HuntReport the run landed, or None before it lands one."""
+        return self._report
+
+    async def finish(
+        self, status: str, *, finding_plan: dict[str, dict[str, Any]] | None = None
+    ) -> None:
+        """Land the row's terminal status, the report and the counters.
+
+        ``finding_plan`` is the per-finding plan of a hunt that investigates
+        its subject findings. With it, a complete hunt lands
+        ``investigating`` and :attr:`final_status` says so.
+        """
         if self._finished or self.hunt_id is None:
             return
         self._finished = True
@@ -165,6 +175,13 @@ class HuntRecorder:
         final_status = status
         if status == "complete" and not report:
             final_status = "error"
+        # A complete hunt with subject findings goes on to investigate them.
+        # It reads "investigating" until the last investigation ends, and its
+        # lead settles then (soc_ai.webui.hunt_findings).
+        plan = finding_plan if final_status == "complete" and finding_plan else None
+        if plan is not None:
+            final_status = hunt_svc.STATUS_INVESTIGATING
+        self.final_status = final_status
         narrative = report.get("narrative")
         if final_status == "error" and not narrative:
             # A hunt that says only "error" makes the analyst read the server
@@ -184,13 +201,19 @@ class HuntRecorder:
                     narrative=narrative,
                     report=report or None,
                     counters=self._meter.finish(),
+                    finding_plan=plan,
                 )
         except Exception:
             _LOGGER.exception("hunt recorder finalize failed")
+            # The row did not take the plan. Nothing will investigate, so the
+            # caller must not start the phase on a hunt that is not waiting.
+            self.final_status = status
         # The lead the hunt was started on settles now, in the same breath as
         # the hunt row. Its own try block: the hunt is finalized whatever
         # happens here, and a settle failure must read as a settle failure.
-        if self._lead_id is None:
+        # A hunt that investigates its findings settles its lead at the end
+        # of that phase. settle_after_hunt reads it as still running.
+        if self._lead_id is None or plan is not None:
             return
         try:
             async with self._maker() as db:

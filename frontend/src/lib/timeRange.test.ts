@@ -3,7 +3,7 @@
 // skew can never exclude a just-created hunt), while a custom range sends both
 // edges. Bounds are inclusive [from, to], matching inRange.
 import { describe, expect, it } from 'vitest';
-import { absTime, ago, rangeToSinceUntil } from './timeRange';
+import { absTime, absoluteTime, ago, agoFromLabel, formatDuration, rangeToSinceUntil, timeLabel } from './timeRange';
 
 describe('absTime', () => {
   const at = '2026-10-02T12:10:28Z';
@@ -45,6 +45,86 @@ describe('ago', () => {
     expect(ago(null)).toBe('never');
     expect(ago('')).toBe('never');
     expect(ago('not-a-date')).toBe('—');
+  });
+
+  it('reads in days from 24 hours on', () => {
+    // "27h ago" sat beside "3d ago" on one page.
+    const now = Date.UTC(2026, 9, 6, 12, 0, 0);
+    const before = (ms: number) => new Date(now - ms).toISOString();
+    expect(ago(before(23 * 3_600_000 + 59 * 60_000), now)).toBe('23h ago');
+    expect(ago(before(24 * 3_600_000), now)).toBe('1d ago');
+    expect(ago(before(27 * 3_600_000), now)).toBe('1d ago');
+    expect(ago(before(4 * 86_400_000 + 5 * 3_600_000), now)).toBe('4d ago');
+    // Negative control: under an hour stays in minutes.
+    expect(ago(before(59 * 60_000), now)).toBe('59m ago');
+  });
+
+  it('takes an epoch number too', () => {
+    const now = Date.UTC(2026, 9, 6, 12, 0, 0);
+    expect(ago(now - 2 * 86_400_000, now)).toBe('2d ago');
+  });
+});
+
+describe('absoluteTime', () => {
+  it('prints year first, the minute and the zone', () => {
+    expect(absoluteTime('2026-10-01T12:18:40Z', { timeZone: 'America/New_York' })).toBe(
+      '2026-10-01 08:18 EDT',
+    );
+    expect(absoluteTime('2026-12-01T12:18:00Z', { timeZone: 'America/New_York' })).toBe(
+      '2026-12-01 07:18 EST',
+    );
+    expect(absoluteTime('2026-10-01T00:05:00Z', { timeZone: 'UTC' })).toBe('2026-10-01 00:05 UTC');
+  });
+
+  it('uses the browser zone by default and names it', () => {
+    const at = '2026-10-02T12:10:28Z';
+    const zone = new Intl.DateTimeFormat('en-US', { timeZoneName: 'short' })
+      .formatToParts(new Date(at))
+      .find((p) => p.type === 'timeZoneName')!.value;
+    expect(absoluteTime(at).endsWith(` ${zone}`)).toBe(true);
+    expect(absoluteTime(at)).toMatch(/^2026-10-0[12] \d{2}:\d{2} /);
+  });
+
+  it('reads an empty value as empty and junk as itself', () => {
+    expect(absoluteTime(null)).toBe('');
+    expect(absoluteTime('')).toBe('');
+    expect(absoluteTime('not-a-date')).toBe('not-a-date');
+  });
+});
+
+describe('formatDuration', () => {
+  it('prints minutes and seconds, never a clock face', () => {
+    expect(formatDuration(199)).toBe('3m 19s');
+    expect(formatDuration(42)).toBe('42s');
+    expect(formatDuration(0)).toBe('0s');
+    expect(formatDuration(3_840)).toBe('1h 04m');
+    expect(formatDuration(2 * 86_400 + 3 * 3_600)).toBe('2d 3h');
+    // Negative control: "03:19" is the form this replaces.
+    expect(formatDuration(199)).not.toMatch(/:/);
+  });
+
+  it('prints nothing for a missing or negative span', () => {
+    expect(formatDuration(null)).toBe('');
+    expect(formatDuration(-1)).toBe('');
+    expect(formatDuration(Number.NaN)).toBe('');
+  });
+});
+
+describe('timeLabel and agoFromLabel', () => {
+  it('pairs the relative text with the absolute title', () => {
+    const now = Date.UTC(2026, 9, 6, 12, 0, 0);
+    const iso = new Date(now - 4 * 86_400_000).toISOString();
+    const label = timeLabel(iso, now);
+    expect(label.text).toBe('4d ago');
+    expect(label.title).toBe(absoluteTime(iso));
+  });
+
+  it('adds "ago" to a server label and leaves other text alone', () => {
+    expect(agoFromLabel('4d')).toBe('4d ago');
+    expect(agoFromLabel('9m')).toBe('9m ago');
+    expect(agoFromLabel('now')).toBe('now');
+    expect(agoFromLabel('4d ago')).toBe('4d ago');
+    expect(agoFromLabel('')).toBe('');
   });
 });
 

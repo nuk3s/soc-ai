@@ -103,7 +103,7 @@ export function huntProposalRow(m: ChatMessage, i: number, launch: HuntLaunch): 
           style={{ background: 'rgba(75,139,245,.14)', borderColor: 'rgba(75,139,245,.4)' }}
         >
           {launch.starting === i && <Spinner size={12} />}
-          {launch.starting === i ? 'Starting…' : 'Start this hunt'}
+          {launch.starting === i ? 'Starting' : 'Start this hunt'}
         </button>
         {launch.startError[i] && (
           <div className="mt-1.5 break-words text-[11.5px] text-danger">{launch.startError[i]}</div>

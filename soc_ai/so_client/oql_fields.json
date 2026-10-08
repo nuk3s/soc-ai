@@ -135,6 +135,8 @@
     "winlog.event_data.LogonProcessName",
     "winlog.event_data.LmPackageName",
     "winlog.logon.type",
+    "system.auth.ssh.event",
+    "system.auth.ssh.method",
     "winlog.event_data.WorkstationName",
     "winlog.event_data.IpAddress",
     "winlog.event_data.MemberName",

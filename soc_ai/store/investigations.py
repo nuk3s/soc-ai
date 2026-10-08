@@ -75,10 +75,14 @@ def is_hunt_subject(inv: Any) -> bool:
 def alert_group_id(inv: Any) -> str | None:
     """The alert this run groups under, or None when the run stands alone.
 
-    The row-level twin of :func:`not_hunt_subject`. A caller that groups runs
-    keys on this, never on ``alert_es_id`` itself.
+    The row-level twin of :func:`not_hunt_subject` and :func:`not_backtest`.
+    A caller that groups runs keys on this, never on ``alert_es_id`` itself.
+    A backtest replay stands alone: it is a measurement of the model on an
+    alert an analyst already closed, and it is not that alert's run.
     """
-    return None if is_hunt_subject(inv) else getattr(inv, "alert_es_id", None)
+    if is_hunt_subject(inv) or is_backtest(inv):
+        return None
+    return getattr(inv, "alert_es_id", None)
 
 
 def not_hunt_subject(model: Any = Investigation) -> Any:
@@ -92,6 +96,40 @@ def not_hunt_subject(model: Any = Investigation) -> Any:
     ``->>`` on PostgreSQL; both return SQL NULL for a NULL column.
     """
     return func.coalesce(model.subject_json["type"].as_string(), "") != HUNT_SUBJECT_TYPE
+
+
+# The actor a backtest replay records in ``started_by``. The backtest worker
+# (soc_ai.webui.backtest) writes it, and every reader below that must not
+# treat a replay as live work asks :func:`is_backtest` or :func:`not_backtest`.
+BACKTEST_ACTOR = "backtest"
+
+
+def is_backtest(inv: Any) -> bool:
+    """Whether this run is a backtest replay.
+
+    A backtest replays the agent over alerts an analyst already closed and
+    scores the verdicts. The replay is a measurement. It writes no
+    observation, forms no lead, sends no notification, writes nothing to
+    Security Onion and lends its verdict to no other alert. The 2026-10-06
+    dogfood found 12 of 14 true positives of one week to be replays, each
+    offering "Escalate to case", and a lead formed from one.
+    """
+    return getattr(inv, "started_by", None) == BACKTEST_ACTOR
+
+
+def is_backtest_actor(started_by: str | None) -> bool:
+    """:func:`is_backtest` for a caller that holds the actor and no row."""
+    return started_by == BACKTEST_ACTOR
+
+
+def not_backtest(model: Any = Investigation) -> Any:
+    """The SQL for a run that is not a backtest replay.
+
+    The coalesce keeps a row with a NULL actor in the set: a NULL compared to
+    a string is NULL, which is not true. ``model`` takes an alias of
+    :class:`Investigation` for a correlated subquery.
+    """
+    return func.coalesce(model.started_by, "") != BACKTEST_ACTOR
 
 
 # The stored statuses the primacy rule prefers: a run that is still going or
@@ -122,11 +160,15 @@ def superseded_sql() -> Any:
     return and_(
         Investigation.alert_es_id != "",
         not_hunt_subject(),
+        # A backtest replay stands alone (:func:`alert_group_id`): it neither
+        # supersedes a live run of its alert nor is superseded by one.
+        not_backtest(),
         select(other.id)
         .where(
             other.alert_es_id == Investigation.alert_es_id,
             other.id != Investigation.id,
             not_hunt_subject(other),
+            not_backtest(other),
             or_(
                 and_(other_live, or_(~this_live, other_newer)),
                 and_(~this_live, other_newer),
@@ -144,6 +186,13 @@ async def _observe_verdict(db: AsyncSession, inv: Investigation) -> None:
     cycle.
     """
     if not inv.alert_es_id:
+        return
+    if is_backtest(inv):
+        # A replay re-reads an alert an analyst already closed, to score the
+        # model. Its verdict is a measurement. Recorded as an observation it
+        # formed leads on the range: lead 18 formed 74 s after the replay of
+        # the same rule (dogfood 2026-10-06). The analyst override of a
+        # replay's verdict takes this path too, and writes nothing either.
         return
     if is_promoted(inv):
         # The verdict is on the hunt, not on the anchor document. The hunt's
@@ -585,8 +634,11 @@ async def _latest_by(
 
 async def latest_for_rules(db: AsyncSession, rule_names: list[str]) -> dict[str, Investigation]:
     """Most recent investigation per rule name, ANY status (used to detect an
-    in-flight re-hunt for the Triaging… flag — NOT for the verdict badge)."""
-    return await _latest_by(db, Investigation.rule_name, rule_names)
+    in-flight re-hunt for the Triaging… flag — NOT for the verdict badge).
+
+    A backtest replay is left out: a running replay is not the rule's live
+    triage, and a failed one is not the rule's last attempt."""
+    return await _latest_by(db, Investigation.rule_name, rule_names, where=not_backtest())
 
 
 async def latest_complete_for_rules(
@@ -612,6 +664,10 @@ async def latest_complete_for_rules(
         Investigation.rule_name.in_(rule_names),
         Investigation.status == "complete",
         Investigation.verdict.is_not(None),
+        # A backtest replay is a measurement. As a standing verdict it put
+        # replayed true positives on the Alerts grid and in the Dashboard's
+        # true-positive count, and lent them to fresh alerts of the rule.
+        not_backtest(),
     ]
     if window_days is not None:
         conds.append(Investigation.created_at >= utcnow() - timedelta(days=window_days))
@@ -807,9 +863,32 @@ async def latest_for_alerts(db: AsyncSession, alert_ids: list[str]) -> dict[str,
     """Most recent investigation per alert _id (badge on event rows).
 
     A hunt-subject run is left out: it anchors on a cited document and is not
-    that alert's run (:func:`is_hunt_subject`).
+    that alert's run (:func:`is_hunt_subject`). A backtest replay is left out
+    for the same reason: it is a measurement, and the alert grid, the drawer
+    and the auto-triage sweep read this answer as the alert's live verdict.
     """
-    return await _latest_by(db, Investigation.alert_es_id, alert_ids, where=not_hunt_subject())
+    return await _latest_by(
+        db,
+        Investigation.alert_es_id,
+        alert_ids,
+        where=and_(not_hunt_subject(), not_backtest()),
+    )
+
+
+async def latest_replays_for_alerts(
+    db: AsyncSession, alert_ids: list[str]
+) -> dict[str, Investigation]:
+    """Most recent backtest replay per alert _id.
+
+    The backtest reads its own verdict back with this. Every other reader asks
+    :func:`latest_for_alerts`, which leaves the replays out.
+    """
+    return await _latest_by(
+        db,
+        Investigation.alert_es_id,
+        alert_ids,
+        where=and_(not_hunt_subject(), ~not_backtest()),
+    )
 
 
 async def complete_for_alert(db: AsyncSession, alert_id: str) -> Investigation | None:
@@ -899,17 +978,7 @@ async def latest_per_finding(db: AsyncSession, hunt_id: str) -> dict[int, Invest
     """
     rows = await db.scalars(
         select(Investigation)
-        .options(
-            load_only(
-                Investigation.id,
-                Investigation.finding_ordinal,
-                Investigation.status,
-                Investigation.verdict,
-                Investigation.confidence,
-                Investigation.created_at,
-                raiseload=True,
-            )
-        )
+        .options(_finding_card_columns())
         .where(Investigation.hunt_id == hunt_id, Investigation.finding_ordinal.is_not(None))
         .order_by(Investigation.created_at.desc(), Investigation.id.desc())
     )
@@ -919,6 +988,35 @@ async def latest_per_finding(db: AsyncSession, hunt_id: str) -> dict[int, Invest
         if ordinal is not None and ordinal not in out:
             out[ordinal] = inv
     return out
+
+
+def _finding_card_columns() -> Any:
+    """The columns a finding card reads. The blob columns stay unloaded."""
+    return load_only(
+        Investigation.id,
+        Investigation.finding_ordinal,
+        Investigation.status,
+        Investigation.verdict,
+        Investigation.confidence,
+        Investigation.is_fallback,
+        Investigation.created_at,
+        raiseload=True,
+    )
+
+
+async def finding_runs_by_id(db: AsyncSession, ids: Sequence[str]) -> dict[str, Investigation]:
+    """The finding-card columns of the named runs, keyed by id.
+
+    The hunt page reads a reused investigation through it: the run belongs to
+    another hunt, so :func:`latest_per_finding` does not see it.
+    """
+    wanted = sorted({i for i in ids if i})
+    if not wanted:
+        return {}
+    rows = await db.scalars(
+        select(Investigation).options(_finding_card_columns()).where(Investigation.id.in_(wanted))
+    )
+    return {inv.id: inv for inv in rows}
 
 
 def blocks_rehunt(inv: Investigation) -> bool:
@@ -950,6 +1048,64 @@ def blocks_rehunt(inv: Investigation) -> bool:
     # the canonical predicate every other consumer derives from. A row written
     # before the column existed carries the marker only in the report.
     return not (inv.is_fallback is True or is_pipeline_fallback(inv.report))
+
+
+# How far back the one-investigation-per-subject rule looks for a run to reuse.
+SUBJECT_REUSE_DAYS = 7
+# The key of the hunt-independent subject fingerprint in ``subject_json``
+# (soc_ai.hunting.findings.subject_fingerprint). The promotion of a finding
+# writes it, so a later hunt that finds the same subject can name the run.
+SUBJECT_FINGERPRINT_KEY = "subject_fingerprint"
+
+
+async def reusable_for_subject(
+    db: AsyncSession,
+    *,
+    alert_id: str | None,
+    fingerprint: str | None,
+    is_synth_eval: bool = False,
+    now: datetime | None = None,
+    window_days: int = SUBJECT_REUSE_DAYS,
+) -> Investigation | None:
+    """A running or complete investigation of the same subject, or None.
+
+    One investigation per subject. A run matches when it started in the last
+    ``window_days`` days and either investigated the same alert or carries the
+    same subject fingerprint. The alert test reads an alert run only: a
+    hunt-subject run holds a cited document as its time anchor, and that
+    document is not its subject (:func:`is_hunt_subject`).
+
+    A run that cannot answer is never reused: a failed run, a pipeline
+    fallback (:func:`blocks_rehunt`) and a backtest replay
+    (:func:`not_backtest`). A synthetic-evaluation run matches only a
+    synthetic-evaluation caller, and a real run only a real caller.
+    """
+    clauses: list[Any] = []
+    if alert_id:
+        clauses.append(and_(Investigation.alert_es_id == alert_id, not_hunt_subject()))
+    if fingerprint:
+        clauses.append(
+            Investigation.subject_json[SUBJECT_FINGERPRINT_KEY].as_string() == fingerprint
+        )
+    if not clauses:
+        return None
+    cutoff = (now or utcnow()) - timedelta(days=window_days)
+    rows = await db.scalars(
+        select(Investigation)
+        .where(
+            or_(*clauses),
+            Investigation.created_at >= cutoff,
+            Investigation.status.in_(_LIVE_STATUSES),
+            not_backtest(),
+            Investigation.is_synth_eval == bool(is_synth_eval),
+        )
+        .order_by(Investigation.created_at.desc(), Investigation.id.desc())
+        .limit(20)
+    )
+    for inv in rows.all():
+        if blocks_rehunt(inv):
+            return inv
+    return None
 
 
 async def delete(db: AsyncSession, inv_id: str) -> bool:
@@ -1056,6 +1212,10 @@ async def list_recent_notifications(
         Investigation.finished_at,
         Investigation.is_synth_eval,
         Investigation.error_dismissed_at,
+    ).where(
+        # A backtest replay sends no notification. One backtest is up to 50
+        # replays, and each one landed in the bell as a verdict to read.
+        not_backtest()
     )
     if status is not None:
         q = q.where(_display_status_sql() == status)
@@ -1180,6 +1340,9 @@ class InvestigationPage:
     true_positives: int
     total_all: int
     active: bool
+    # The backtest replays the other filters match. With replays left out of
+    # the page (the default), this is the count the page does not show.
+    backtest_replays: int = 0
 
 
 async def query_page(
@@ -1192,8 +1355,14 @@ async def query_page(
     q: str | None = None,
     limit: int = 100,
     offset: int = 0,
+    include_backtest: bool = False,
 ) -> InvestigationPage:
     """The investigations list as a real query: filters, counts and paging in SQL.
+
+    ``include_backtest`` puts the backtest replays (:func:`is_backtest`) into
+    the rows and the counts. Off by default: a replay is a measurement, and
+    the list is the live work. ``backtest_replays`` counts the replays the
+    other filters match either way, so the screen can say what it hid.
 
     This exists because the screen used to filter a newest-100
     :func:`list_recent` page client-side — on a deployment whose newest 100 runs
@@ -1224,8 +1393,9 @@ async def query_page(
     prevent. ``autoescape`` keeps a typed ``%`` a percent sign rather than
     "match everything".
 
-    Three queries: the page, one aggregate over the filter set (total / running
-    / true-positive), one over the whole table (total_all / active). The
+    Four queries: the page, one aggregate over the filter set (total / running
+    / true-positive), one count of the backtest replays the other filters
+    match, one over the whole table (total_all / active). The
     ``(status, created_at)`` index (migration 0028) serves the ORDER BY.
     Fallback membership reads the persisted ``is_fallback`` column — stamped at
     finalize/resolve — rather than ``json_extract``'ing every row's report blob
@@ -1264,6 +1434,14 @@ async def query_page(
                 Investigation.dest_ip.icontains(needle, autoescape=True),
             )
         )
+
+    # The replays the other filters match, counted before the replay filter
+    # joins ``conds``: the figure says what the default page leaves out.
+    backtest_replays = int(
+        await db.scalar(select(func.count(Investigation.id)).where(*conds, ~not_backtest())) or 0
+    )
+    if not include_backtest:
+        conds.append(not_backtest())
 
     limit = max(1, min(limit, MAX_PAGE_LIMIT))
     offset = max(0, offset)
@@ -1320,6 +1498,7 @@ async def query_page(
         true_positives=int(true_positives),
         total_all=int(total_all),
         active=int(running_all) > 0,
+        backtest_replays=backtest_replays,
     )
 
 
@@ -1368,7 +1547,13 @@ async def runs_for_alerts(db: AsyncSession, alert_ids: Sequence[str]) -> list[Ru
             Investigation.status,
             Investigation.created_at,
         )
-        .where(Investigation.alert_es_id.in_(list(alert_ids)), not_hunt_subject())
+        .where(
+            Investigation.alert_es_id.in_(list(alert_ids)),
+            not_hunt_subject(),
+            # A backtest replay stands alone (:func:`alert_group_id`). In the
+            # group, a newer replay took primacy from the live run.
+            not_backtest(),
+        )
         .order_by(Investigation.created_at.desc(), Investigation.id.desc())
     )
     return [RunRef(*row) for row in rows.all()]
@@ -1398,6 +1583,8 @@ async def for_entity(db: AsyncSession, value: str, *, limit: int = 50) -> list[I
         select(Investigation)
         .where((Investigation.src_ip == value) | (Investigation.dest_ip == value))
         .where(Investigation.is_synth_eval.is_(False))
+        # A backtest replay is not a run on the entity's own timeline.
+        .where(not_backtest())
         .order_by(Investigation.created_at.desc(), Investigation.id.desc())
         .limit(limit)
     )
@@ -1543,6 +1730,10 @@ async def latest_for_pairs(
                 # the whole inherit window and authorize acknowledgements nobody
                 # investigated. The prior never acknowledges, so it never lends.
                 func.coalesce(Investigation.run_class, "") != "rule_prior",
+                # A backtest replay is a measurement on an alert an analyst
+                # already closed. Lent along a pair, a replayed false positive
+                # would authorize unattended acknowledgements of live alerts.
+                not_backtest(),
             )
             .order_by(Investigation.created_at.desc(), Investigation.id.desc())
         )
@@ -1569,7 +1760,7 @@ def _digest_rationale(rationale: str | None, *, max_chars: int = _PRIOR_DIGEST_C
 
     All whitespace (including newlines) collapses to single spaces so one digest
     is one prompt line. Over-long text is cut at the last WORD BOUNDARY at or
-    before ``max_chars`` and marked with an ellipsis — a mid-word fragment reads
+    before ``max_chars`` and marked with ``[truncated]`` — a mid-word fragment reads
     like corruption to both analysts and models. Falls back to a hard cut only
     when the boundary would discard more than half the budget (one enormous
     unbroken token, e.g. a base64 blob). ``None``/empty stays ``None`` so the
@@ -1583,7 +1774,7 @@ def _digest_rationale(rationale: str | None, *, max_chars: int = _PRIOR_DIGEST_C
     cut = text.rfind(" ", 0, max_chars + 1)
     if cut < max_chars // 2:
         cut = max_chars
-    return text[:cut].rstrip() + "…"
+    return text[:cut].rstrip() + " [truncated]"
 
 
 async def prior_outcomes(
@@ -1812,6 +2003,10 @@ async def running_for_pairs(
     a promotion's ``rule_name`` is a finding title that can collide with a live
     rule's name, and an in-flight promotion must not suppress the sweep from
     investigating that rule's real alerts.
+
+    A backtest replay is excluded too. The planner skips a running pair because
+    the run's verdict covers the pair when it lands, and a replay's verdict
+    covers nothing (:func:`is_backtest`).
     """
     if not pairs:
         return set()
@@ -1822,6 +2017,7 @@ async def running_for_pairs(
                 Investigation.rule_name.in_(rules),
                 Investigation.status == "running",
                 Investigation.kind != "hunt",
+                not_backtest(),
             )
         )
     ).all()

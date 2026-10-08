@@ -1083,6 +1083,76 @@ async def test_a_dismissed_lead_does_not_absorb_a_later_observation(
     assert sorted(leads[1].kinds_json) == ["alert", "novel_destination", "novel_process"]
 
 
+async def test_an_observation_marked_benign_counts_toward_no_lead(
+    settings_kratos: Settings,
+) -> None:
+    # C7: "Mark benign" on a hit. The observation weighs nothing toward a
+    # lead, and a repeat of the same content keeps the mark.
+    from soc_ai.store import leads as leads_store
+
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        await _observe(db, Kind.NOVEL_DESTINATION, "1.1.1.1", ids=("d1",))
+        await _observe(db, Kind.RARE_FOR_PEERS, "psexec.exe", ids=("d2",))
+        rows = (await db.execute(select(EntityObservation))).scalars().all()
+        marked = next(r for r in rows if r.kind == "rare_for_peers")
+        await leads_store.dismiss_observation(
+            db, marked.id, reason="known_change", note=None, by="analyst", now=_NOW
+        )
+        await _observe(db, Kind.RARE_FOR_PEERS, "psexec.exe", ids=("d3",))
+        await _observe(db, Kind.OFF_HOURS, "03:14", ids=("d4",))
+        weighed = await weigh_entity(db, entity_kind=_HOST[0], entity_key=_HOST[1], now=_NOW)
+        outcome = await form_leads(db, entity_keys=[_HOST], now=_NOW)
+    assert {o.kind for o in weighed} == {Kind.NOVEL_DESTINATION, Kind.OFF_HOURS}
+    # 0.50 + 0.30 stays under 0.85. Negative control below: unmarked, it forms.
+    assert outcome.formed == ()
+
+
+async def test_the_same_observations_unmarked_form_a_lead(settings_kratos: Settings) -> None:
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        await _observe(db, Kind.NOVEL_DESTINATION, "1.1.1.1", ids=("d1",))
+        await _observe(db, Kind.RARE_FOR_PEERS, "psexec.exe", ids=("d2",))
+        await _observe(db, Kind.OFF_HOURS, "03:14", ids=("d4",))
+        outcome = await form_leads(db, entity_keys=[_HOST], now=_NOW)
+    assert len(outcome.formed) == 1
+
+
+async def test_a_repeat_of_a_dismissed_lead_observation_forms_no_lead(
+    settings_kratos: Settings,
+) -> None:
+    # The lead page says this after a dismissal: "The observations on this
+    # lead and their repeats form no new lead." A repeat refreshes the same
+    # row, and the row stays on the closed lead. No time window ends it.
+    from soc_ai.store import leads as leads_store
+
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        await _observe(db, Kind.NOVEL_DESTINATION, "1.1.1.1", ids=("d1",))
+        await _observe(db, Kind.RARE_FOR_PEERS, "psexec.exe", ids=("d2",))
+        await _observe(db, Kind.OFF_HOURS, "03:14", ids=("d3",))
+        first = await form_leads(db, entity_keys=[_HOST], now=_NOW)
+        await leads_store.dismiss(
+            db, first.formed[0], reason="lab_host", note=None, by="analyst", now=_NOW
+        )
+        # The same three observations a day later, each on a new document.
+        later = _NOW + timedelta(days=1)
+        await _observe(db, Kind.NOVEL_DESTINATION, "1.1.1.1", now=later, ids=("d4",))
+        await _observe(db, Kind.RARE_FOR_PEERS, "psexec.exe", now=later, ids=("d5",))
+        await _observe(db, Kind.OFF_HOURS, "03:14", now=later, ids=("d6",))
+        repeat = await form_leads(db, entity_keys=[_HOST], now=later)
+        # Negative control: a new observation on the same host does form.
+        await _observe(db, Kind.NOVEL_PROCESS, "rundll32.exe", now=later, ids=("d7",))
+        await _observe(db, Kind.ALERT, "a-1", now=later, ids=("d8",))
+        fresh = await form_leads(db, entity_keys=[_HOST], now=later)
+        rows = (await db.execute(select(EntityObservation))).scalars().all()
+    assert repeat.formed == () and repeat.updated == ()
+    assert len(fresh.formed) == 1
+    on_dismissed = [r for r in rows if r.lead_id == first.formed[0]]
+    assert len(on_dismissed) == 3
+    assert all(r.occurrences == 2 for r in on_dismissed)
+
+
 # ---------------------------------------------------------------------------
 # What a refresh may change, and what it may not
 # ---------------------------------------------------------------------------

@@ -157,13 +157,13 @@ describe('HuntDetail — draft an analytic from a finding', () => {
 
     const dialog = await screen.findByRole('dialog');
     expect(dialog.textContent).toContain(
-      'Save the analytic local-rc4-ticket-from-workstation as a candidate?',
+      'Save the analytic local-rc4-ticket-from-workstation as a draft?',
     );
-    expect(dialog.textContent).toContain('A candidate does not run.');
+    expect(dialog.textContent).toContain('A draft does not run.');
     expect(dialog.textContent).toContain('Dry run over 30 days: 3 matches.');
     expect(screen.queryByRole('button', { name: /draft an analytic/i })).toBeNull();
 
-    fireEvent.click(screen.getByRole('button', { name: /save candidate/i }));
+    fireEvent.click(screen.getByRole('button', { name: /save draft/i }));
     await waitFor(() =>
       expect(draftAnalytic).toHaveBeenLastCalledWith(HUNT_ID, 0, { specYaml: DRAFT.spec_yaml }),
     );
@@ -268,7 +268,7 @@ describe('HuntDetail — draft an analytic from a finding', () => {
       dialog.textContent!.indexOf('Dry run over 30 days'),
     );
     expect(dialog.textContent).toContain('Dry run over 30 days: 3 matches. 1 host matched in 30 days.');
-    expect(screen.queryByRole('button', { name: /save candidate/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /save draft/i })).toBeNull();
 
     fireEvent.click(screen.getByRole('button', { name: 'Save anyway' }));
     await waitFor(() =>
@@ -293,7 +293,7 @@ describe('HuntDetail — draft an analytic from a finding', () => {
     const dialog = await screen.findByRole('dialog');
     expect(screen.queryByTestId('draft-analytic-pins')).toBeNull();
     expect(dialog.textContent).toContain('4 addresses matched in 30 days.');
-    expect(screen.getByRole('button', { name: /save candidate/i })).toBeTruthy();
+    expect(screen.getByRole('button', { name: /save draft/i })).toBeTruthy();
   });
 });
 
@@ -341,7 +341,9 @@ describe('HuntDetail — why an errored hunt failed', () => {
     mount();
     const line = await screen.findByTestId('hunt-failure-reason');
     expect(line.textContent).toBe(sentence);
-    expect(screen.queryByTestId('hunt-disposition')).toBeNull();
+    // One outcome on every surface (S1): the list and the bell say "Could
+    // not run", and so does the page. The status pill names the stop.
+    expect(screen.getByTestId('hunt-disposition').textContent).toBe('Could not run');
     expect(screen.queryByText(/No findings yet/)).toBeNull();
     expect(screen.queryByText(/failed/i)).toBeNull();
     expect(screen.getByText('The hunt stopped before it recorded a finding.')).toBeInTheDocument();

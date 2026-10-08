@@ -183,12 +183,12 @@ def check_config() -> tuple[Settings | None, CheckResult]:
     except ValidationError as exc:
         problems = ". ".join(
             f"{'.'.join(str(p) for p in err['loc']) or 'settings'}: {err['msg']}"
-            for err in exc.errors()[:5]
+            for err in exc.errors()
         )
         return None, CheckResult(
             "config",
             "FAIL",
-            _scrub(f"the settings failed validation. {problems}")[:300],
+            _scrub(f"the settings failed validation. {problems}"),
             hint="Fix the named fields in .env. See .env.example for the full surface.",
         )
     except Exception as exc:  # unreadable .env, bad encoding, … — still a graded FAIL
@@ -641,7 +641,7 @@ async def check_so_api(settings: Settings) -> list[CheckResult]:
             )
         ]
     except SoAuthError as exc:
-        msg = _scrub(str(exc))[:200]
+        msg = _scrub(str(exc))
         if "rejected credentials" in msg:
             return [
                 CheckResult(
@@ -736,7 +736,7 @@ async def check_elasticsearch(settings: Settings) -> list[CheckResult]:
             )
         ]
     except AuthenticationException as exc:
-        msg = _scrub(str(getattr(exc, "message", "") or ""))[:120]
+        msg = _scrub(str(getattr(exc, "message", "") or ""))
         return [
             CheckResult(
                 name,
@@ -760,7 +760,7 @@ async def check_elasticsearch(settings: Settings) -> list[CheckResult]:
         ]
     except ApiError as exc:
         status = getattr(getattr(exc, "meta", None), "status", "?")
-        msg = _scrub(str(getattr(exc, "message", "") or ""))[:120]
+        msg = _scrub(str(getattr(exc, "message", "") or ""))
         return [
             CheckResult(
                 name,
@@ -2178,6 +2178,11 @@ async def _last_fit_when_off(settings: Settings) -> Any:
         return None
 
 
+# The doctor row named "the ml extra", a packaging word no operator reads. The
+# row names the fact: an extra package, and whether this deployment has it.
+_ESTATE_EXTRA_PRESENT = "The extra package that the estate model needs is installed."
+
+
 async def check_estate_model(
     settings: Settings, *, now: datetime | None = None
 ) -> list[CheckResult]:
@@ -2198,15 +2203,16 @@ async def check_estate_model(
                 CheckResult(
                     name,
                     "INFO",
-                    "unavailable. The ml extra is not installed. The estate model is off.",
+                    "unavailable. The estate model needs an extra package, and this "
+                    "deployment has not installed it. The estate model is off.",
                 )
             ]
         return [
             CheckResult(
                 name,
                 "WARN",
-                "unavailable. The estate model is on, and the ml extra is not installed. "
-                "soc-ai fits no estate model.",
+                "unavailable. The estate model is on. It needs an extra package, and "
+                "this deployment has not installed it. soc-ai fits no estate model.",
                 hint="Install the extra with `uv sync --extra ml`, or run the container "
                 "image. The image includes it.",
             )
@@ -2214,12 +2220,12 @@ async def check_estate_model(
     if not enabled:
         last = await _last_fit_when_off(settings)
         if last is None:
-            return [CheckResult(name, "INFO", "off. The ml extra is installed.")]
+            return [CheckResult(name, "INFO", f"off. {_ESTATE_EXTRA_PRESENT}")]
         return [
             CheckResult(
                 name,
                 "INFO",
-                f"off. The ml extra is installed. The last fit ran on "
+                f"off. {_ESTATE_EXTRA_PRESENT} The last fit ran on "
                 f"{_fit_day(last.fitted_at)}, in state {last.state}.",
             )
         ]

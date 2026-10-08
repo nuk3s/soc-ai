@@ -90,7 +90,7 @@ export function MaintenancePanel({
                     key={b.name}
                     className="flex items-center gap-3 border-b border-border-faint px-3.5 py-2 text-[12px] last:border-0"
                   >
-                    <span className="min-w-0 flex-1 truncate font-mono">{b.name}</span>
+                    <span className="min-w-0 flex-1 break-all font-mono">{b.name}</span>
                     <span className="flex-none text-faint">{fmtSize(b.size_bytes)}</span>
                     <span className="flex-none text-faint">{absTime(b.modified)}</span>
                   </div>

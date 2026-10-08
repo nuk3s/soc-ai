@@ -11,7 +11,17 @@ import {
   type HuntCatalog,
   type PriorCoverage,
 } from '../lib/api';
-import { loopRuns, sweepsNotice } from '../lib/analyticRuns';
+import {
+  type RunState,
+  appliesWord,
+  intervalWords,
+  methodWord,
+  runState,
+  runsInProfileSweep,
+  sourceWord,
+  sweepsNotice,
+  windowWords,
+} from '../lib/analyticRuns';
 import { useDemo } from '../lib/demo';
 import { plural } from '../lib/plural';
 import { ago } from '../lib/timeRange';
@@ -59,13 +69,24 @@ export const ANALYTIC_FILTER_PARAMS = [
   'q',
 ] as const;
 
+// "Paused by soc-ai" is a view of the shadow analytics that a system demotion
+// holds. The word was nowhere on the screen (dogfood 2026-10-06 C6). A
+// candidate reads "Draft": it is written and has never run.
 const STATUS_CHIPS: { id: string; label: string }[] = [
   { id: 'all', label: 'All' },
   { id: 'live', label: 'Live' },
   { id: 'shadow', label: 'Shadow' },
-  { id: 'candidate', label: 'Candidate' },
+  { id: 'held', label: 'Paused by soc-ai' },
+  { id: 'candidate', label: 'Draft' },
   { id: 'retired', label: 'Retired' },
 ];
+
+/** True for the rows the status view shows. "held" is the paused view. */
+function inStatusView(a: AnalyticRow, status: string): boolean {
+  if (status === 'all') return true;
+  if (status === 'held') return Boolean(a.held_by_system);
+  return a.status === status;
+}
 
 const LEVELS = ['critical', 'high', 'medium', 'low'];
 
@@ -104,7 +125,7 @@ export function filterAnalytics(rows: AnalyticRow[], f: AnalyticFilters): Analyt
   const q = f.q.trim().toLowerCase();
   return rows.filter(
     (a) =>
-      (f.status === 'all' || a.status === f.status) &&
+      inStatusView(a, f.status) &&
       (!f.tier || a.tier === f.tier) &&
       (!f.level || a.level === f.level) &&
       (!f.evaluator || a.evaluator === f.evaluator) &&
@@ -126,7 +147,9 @@ function valuesOf(rows: AnalyticRow[], key: 'tier' | 'evaluator' | 'scope_kind')
 const LEGEND =
   'live: the sweep runs it and raises what it finds. ' +
   'shadow: the sweep runs it and records what it finds. ' +
-  'candidate: the sweep has never run it. ' +
+  'paused by soc-ai: soc-ai moved a live analytic to shadow. It fired too often or was often ' +
+  'wrong. You decide. ' +
+  'draft: the sweep has never run it. ' +
   'retired: the analytic keeps its ledger and its reason. ' +
   'Rejected = retired with a reason.';
 
@@ -134,7 +157,7 @@ const TIER_TITLE =
   'Where the analytic is stored. A shipped analytic is a file in the repository. A local analytic is a row in this deployment.';
 
 const WEEK_TITLE =
-  'What this analytic did over the last 7 days. obs is observations written. leads is the leads it fed.';
+  'What this analytic did over the last 7 days: the observations it wrote and the leads it fed.';
 
 /** How fresh the baseline the sweep scored against was, or why a dimension
  *  could not be measured. Empty for a backend that does not say. */
@@ -159,7 +182,8 @@ export function capNote(coverage: PriorCoverage): string {
  *  the build time of those profiles says nothing about it. The cell read
  *  "baseline 13 h old" on a detector that builds its own baseline. */
 function coverageCell(coverage: PriorCoverage | null | undefined, evaluator?: string): string {
-  if (!coverage) return '—';
+  // A query analytic reads no baseline. The cell said a dash (K2).
+  if (!coverage) return 'not measured';
   const baseline = evaluator === 'model' ? '' : baselineNote(coverage);
   return `${coverage.measured} measured · ${coverage.blind} blind${capNote(coverage)}${baseline}`;
 }
@@ -213,7 +237,7 @@ function SweepsNotice({ catalog }: { catalog: HuntCatalog | null | undefined }) 
 function sweepLine(catalog: HuntCatalog | null | undefined): string {
   if (!catalog) return '';
   const when = catalog.last_sweep_at ? ago(catalog.last_sweep_at) : 'never';
-  return `last sweep ${when} · window ${catalog.sweep_window_minutes} min`;
+  return `last sweep ${when} · looks back ${windowWords(catalog.sweep_window_minutes)}`;
 }
 
 function NewAnalyticBox({ onCreated }: { onCreated: () => void }) {
@@ -254,7 +278,7 @@ function NewAnalyticBox({ onCreated }: { onCreated: () => void }) {
         value={text}
         onChange={(e) => setText(e.target.value)}
         rows={8}
-        placeholder="Paste the analytic as YAML. It is stored as a candidate. Put it in shadow to run it."
+        placeholder="Paste the analytic as YAML. It is stored as a draft. Put it in shadow to run it."
         className="w-full rounded-control border border-border bg-surface-2 p-2 font-mono text-[11.5px]"
       />
       {hint && <div className="text-[11.5px] text-warn">{hint}</div>}
@@ -265,7 +289,7 @@ function NewAnalyticBox({ onCreated }: { onCreated: () => void }) {
           onClick={submit}
           className="rounded-control bg-accent px-3 py-1 text-[11.5px] font-semibold text-white disabled:opacity-50"
         >
-          Store as candidate
+          Store as draft
         </button>
         <button type="button" onClick={() => setOpen(false)} className="text-[11.5px] text-dim">
           Cancel
@@ -280,13 +304,17 @@ function Row({
   coverage,
   blind,
   running,
+  every,
   onOpen,
   onChanged,
 }: {
   analytic: AnalyticRow;
   coverage: PriorCoverage | null | undefined;
-  /** False when the loop that runs this analytic is off or has never run. */
-  running: boolean | null;
+  /** False when the loop that runs this analytic is off, 'waiting' when it is
+   *  on and has not run yet. */
+  running: RunState;
+  /** How often the loop runs, as words. */
+  every: string;
   /** The newest sweep found nothing the analytic reads. Its zero row is the
    *  absence of telemetry, and it read as an analytic that found nothing. */
   blind: boolean;
@@ -306,7 +334,7 @@ function Row({
         {/* The id under the title: two analytics on one subject read the same
             from the title alone, and the id is what an objective and a CLI
             call take. */}
-        <div className="mt-0.5 truncate font-mono text-[11px] text-faint">{analytic.id}</div>
+        <div className="mt-0.5 break-all font-mono text-[11px] text-faint">{analytic.id}</div>
         <div className="mt-1 flex flex-wrap items-center gap-1.5">
           <span className="rounded-chip border border-border-strong px-1.5 py-px text-[10px] uppercase tracking-[.04em] text-dim">
             {analytic.level}
@@ -332,10 +360,11 @@ function Row({
         </div>
       </td>
       <td className="whitespace-nowrap px-2 py-2.5 text-[11.5px] text-dim" title={TIER_TITLE}>
-        {analytic.tier}
+        {sourceWord(analytic.tier)}
+        <div className="text-faint">method: {methodWord(analytic.evaluator)}</div>
       </td>
       <td className="whitespace-nowrap px-2 py-2.5 text-[12px]">
-        <StatusDot status={analytic.status} running={running} />
+        <StatusDot status={analytic.status} running={running} every={every} />
         {/* A hold by soc-ai reads apart from an analyst's shadow. The reason
             is on the chip, and the drawer holds the evidence. */}
         {analytic.held_by_system && (
@@ -345,13 +374,13 @@ function Row({
             style={{ borderColor: 'rgba(210,153,34,.45)' }}
             title={`${CHIP_HELD_BY_SYSTEM} ${analytic.held_by_system}`}
           >
-            held by soc-ai
+            Paused by soc-ai
           </div>
         )}
       </td>
       <td className="px-2 py-2.5 font-mono text-[11px] text-dim" title={WEEK_TITLE}>
-        {analytic.observations_7d} obs · {plural(analytic.leads_7d, 'lead')} · {analytic.hunted_7d}{' '}
-        hunted ·{' '}
+        {plural(analytic.observations_7d, 'observation')} · {plural(analytic.leads_7d, 'lead')} ·{' '}
+        {analytic.hunted_7d} hunted ·{' '}
         {analytic.dismissed_7d} dismissed
         {analytic.status === 'shadow' && (
           <div>
@@ -469,7 +498,7 @@ export function AnalyticsPanel({
           list.error ? (
             <div className="px-[15px] py-3 text-[13px] text-dim">Could not read the analytics.</div>
           ) : (
-            <LoadingState label="Reading the analytics…" />
+            <LoadingState label="Reading the analytics" />
           )
         ) : (
           <>
@@ -482,21 +511,26 @@ export function AnalyticsPanel({
                 : `${all.length} analytics`}
               {' · '}
               {counts.live ?? 0} live · {counts.shadow ?? 0} shadow · {counts.candidate ?? 0}{' '}
-              candidate · {counts.retired ?? 0} retired
+              draft · {counts.retired ?? 0} retired
             </div>
             <div className="border-b border-border-faint px-[15px] py-2">
               <ListToolbar
                 presets={STATUS_CHIPS.map((c) => ({
                   id: c.id,
                   label: c.label,
-                  count: c.id === 'all' ? all.length : (counts[c.id] ?? 0),
+                  count:
+                    c.id === 'all'
+                      ? all.length
+                      : c.id === 'held'
+                        ? all.filter((a) => a.held_by_system).length
+                        : (counts[c.id] ?? 0),
                   active: filters.status === c.id,
                 }))}
                 onPreset={(id) => setFilter('status', id)}
                 search={{
                   value: filters.q,
                   onChange: (v) => setFilter('q', v),
-                  placeholder: 'Search title or id…',
+                  placeholder: 'Search title or id',
                   label: 'Search analytics',
                 }}
                 trailing={
@@ -511,11 +545,16 @@ export function AnalyticsPanel({
                   ) : undefined
                 }
               >
+                {/* The words a reader knows (C6). The address keeps the
+                    stored names: tier, evaluator, scope. */}
                 <Select
-                  label="Tier"
+                  label="Source"
                   value={filters.tier}
                   onChange={(v) => setFilter('tier', v)}
-                  options={[{ value: '', label: 'tier: any' }, ...valuesOf(all, 'tier')]}
+                  options={[
+                    { value: '', label: 'Source: any' },
+                    ...valuesOf(all, 'tier').map((v) => ({ value: v, label: `Source: ${sourceWord(v)}` })),
+                  ]}
                 />
                 <Select
                   label="Level"
@@ -524,16 +563,28 @@ export function AnalyticsPanel({
                   options={[{ value: '', label: 'level: any' }, ...LEVELS]}
                 />
                 <Select
-                  label="Evaluator"
+                  label="Method"
                   value={filters.evaluator}
                   onChange={(v) => setFilter('evaluator', v)}
-                  options={[{ value: '', label: 'evaluator: any' }, ...valuesOf(all, 'evaluator')]}
+                  options={[
+                    { value: '', label: 'Method: any' },
+                    ...valuesOf(all, 'evaluator').map((v) => ({
+                      value: v,
+                      label: `Method: ${methodWord(v)}`,
+                    })),
+                  ]}
                 />
                 <Select
-                  label="Scope"
+                  label="Applies to"
                   value={filters.scope}
                   onChange={(v) => setFilter('scope', v)}
-                  options={[{ value: '', label: 'scope: any' }, ...valuesOf(all, 'scope_kind')]}
+                  options={[
+                    { value: '', label: 'Applies to: any' },
+                    ...valuesOf(all, 'scope_kind').map((v) => ({
+                      value: v,
+                      label: `Applies to: ${appliesWord(v)}`,
+                    })),
+                  ]}
                 />
                 <label
                   className="flex cursor-pointer items-center gap-1.5 text-[12px] text-dim"
@@ -587,7 +638,7 @@ export function AnalyticsPanel({
                 <thead>
                   <tr className="text-[10.5px] font-semibold uppercase tracking-[.05em] text-faint">
                     <th className="px-[15px] py-1.5">Analytic</th>
-                    <th className="px-2 py-1.5">Tier</th>
+                    <th className="px-2 py-1.5">Source</th>
                     <th className="px-2 py-1.5">Status</th>
                     <th className="px-2 py-1.5">Last 7 days</th>
                     <th className="px-2 py-1.5">Coverage</th>
@@ -603,7 +654,12 @@ export function AnalyticsPanel({
                       analytic={analytic}
                       coverage={coverageOf.get(analytic.id)}
                       blind={blindOf.get(analytic.id) === true}
-                      running={loopRuns(catalog.data, analytic.evaluator)}
+                      running={runState(catalog.data, analytic.evaluator)}
+                      every={intervalWords(
+                        runsInProfileSweep(analytic.evaluator)
+                          ? 60
+                          : catalog.data?.sweep_interval_minutes,
+                      )}
                       onOpen={() => setOpenId(analytic.id)}
                       onChanged={changed}
                     />

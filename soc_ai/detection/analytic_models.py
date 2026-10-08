@@ -36,6 +36,25 @@ class Generalization(BaseModel):
     retried: bool = False
 
 
+class DraftReview(BaseModel):
+    """The draft in words, for the confirm box (soc_ai.hunting.draft_review).
+
+    The box showed the id and one dry-run line, and the definition was
+    readable only after the save.
+    """
+
+    title: str
+    # The detection as one sentence.
+    logic: str
+    false_positives: list[str] = []
+    # "Source finding: 0 of 3 documents match. They are older than the 30-day
+    # dry run." None when the check did not run.
+    source: str | None = None
+    # "This analytic repeats 2 Suricata rules. They raise alerts already."
+    # None when a clause tests a behaviour of its own.
+    repeats_alerts: str | None = None
+
+
 class AnalyticDraftOut(BaseModel):
     """What the route returns: the stored candidate and its dry run."""
 
@@ -50,3 +69,5 @@ class AnalyticDraftOut(BaseModel):
     notes: list[str] = []
     # None when the check found nothing on the first draft.
     generalization: Generalization | None = None
+    # The draft in words. Set on a preview.
+    review: DraftReview | None = None

@@ -10,9 +10,7 @@ import {
   Crosshair,
   GitBranch,
   LayoutTemplate,
-  Loader2,
   type LucideIcon,
-  MessageSquare,
   RotateCw,
   Scale,
   Shield,
@@ -25,7 +23,7 @@ import {
 } from 'lucide-react';
 import { type ReactNode, useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { ChatDockShell, ChatPanelShell, DOCK_SAFE_AREA_CLASS } from '../components/ChatDock';
+import { AskSocAiButton, investigationStarters } from '../components/AskPanel';
 import { ConfidenceRing } from '../components/ConfidenceRing';
 import { DocumentChip } from '../components/DocumentDrawer';
 import { DraftDetectionPane } from '../components/DraftDetectionPane';
@@ -33,27 +31,36 @@ import { Markdown } from '../components/Markdown';
 import { EntityGraph } from '../components/EntityGraph';
 import { Panel } from '../components/Panel';
 import { KindBadge, RecordedRunChip, RunClassChip, SeverityTag, SyntheticEvalBadge, VerdictPill } from '../components/Badges';
+import { BacktestReplayChip, isBacktestReplay } from '../components/BacktestReplayChip';
 import { Spinner } from '../components/States';
+import { ActionCard, type ActionDecision, type ActionDismissalState } from '../components/ActionCard';
+import { EntityLink, EntityRefLink } from '../components/EntityLink';
+import { FlowStrip } from '../components/FlowStrip';
+import { investigationFlow } from '../lib/flowSteps';
+import { guessEntityType } from '../lib/entityPath';
 import {
   ApiError,
   ackGroup,
+  dismissAction,
   dismissInvestigationError,
   draftInvestigationDetection,
   escalateGroup,
   executeAction,
   getAbout,
-  getChatThread,
   downloadInvestigationExport,
   overrideVerdict as submitOverride,
-  postChat,
   getMe,
   requestMoreInfo,
-  resolveInvestigation,
+  restoreAction,
   startHunt,
 } from '../lib/api';
 import { ackMessage, escalateMessage } from '../lib/groupWriteMessages';
 import { plural } from '../lib/plural';
-import { firstSentence } from '../lib/text';
+import { firstSentence, objectiveHeadline } from '../lib/text';
+import { VERDICT_OPTIONS, confidenceWord, verdictLabel } from '../lib/labels';
+import { useToast } from '../lib/toast';
+import { gapSentence } from '../lib/openQuestions';
+import { plainHeadline } from '../lib/headline';
 import {
   CHIP_SUBJECT_HUNT,
   ORACLE_REASON,
@@ -64,16 +71,15 @@ import {
   SUBJECT_OBJECTIVE,
 } from '../lib/tooltips';
 import { useAsync } from '../lib/useAsync';
-import { useChatThread } from '../lib/useChatThread';
+import { useChat, useChatScope } from '../lib/chatScope';
 import { citedEventIds, splitEventIds } from '../lib/eventIds';
 import { demoBlocked, useDemo } from '../lib/demo';
 import { absTime } from '../lib/timeRange';
 import { SEVERITY, TIMELINE_GROUP_COLOR, VERDICT, tint } from '../lib/tokens';
 import type {
-  ActionTag,
   AlertMeta,
-  ChatMessage,
   DetectionKind,
+  EntityRef,
   HostSignal,
   Investigation as Inv,
   InvestigationSubject,
@@ -103,20 +109,15 @@ interface InvestigationProps {
   onAcked?: (ruleName: string) => void;
 }
 
-const ACTION_ICON: Record<ActionTag, LucideIcon> = {
-  ack: Check,
-  escalate: Triangle,
-  comment: MessageSquare,
-};
-const ACTION_ICON_COLOR: Record<ActionTag, string> = {
-  ack: '#7ba893',
-  escalate: '#f04438',
-  comment: '#4b8bf5',
-};
-const ACTION_TAG_COLOR: Record<ActionTag, { color: string; bg: string }> = {
-  ack: { color: '#8b94a3', bg: '#161c25' },
-  escalate: { color: '#f04438', bg: 'rgba(240,68,56,.12)' },
-  comment: { color: '#4b8bf5', bg: 'rgba(75,139,245,.12)' },
+/** The timeline groups in analyst words (dogfood 2026-10-06, first hour C2).
+ *  The stored keys stay as they are: the colours and the counts read them. */
+export const TIMELINE_GROUP_LABEL: Record<string, string> = {
+  'Prefetch & pivots': 'Context gathered',
+  'Indicator enrichment': 'Intel look-ups',
+  'Tool calls': 'Follow-up queries',
+  Validators: 'Checks',
+  Decision: 'Verdict',
+  Oracle: 'Oracle review',
 };
 
 const STEP_ICON: Record<string, LucideIcon> = {
@@ -126,6 +127,7 @@ const STEP_ICON: Record<string, LucideIcon> = {
   Decision: LayoutTemplate,
   Validators: CheckCircle2,
   Oracle: Sparkles,
+  Error: AlertTriangle,
 };
 
 function fmt(s: number) {
@@ -140,6 +142,62 @@ function durationLabel(s: number) {
   const x = s % 60;
   return m > 0 ? `${m}m ${x}s` : `${x}s`;
 }
+
+/** The banner on a run a newer run replaced (dogfood 2026-10-06,
+ *  investigation S1). "Request more info" and "Re-run" start a new run, and
+ *  the older page kept its verdict and its live buttons at a bookmarked URL. */
+export function supersededSentence(run: Pick<Inv, 'supersededRun'>['supersededRun']): string {
+  if (run?.status === 'complete' && run.verdict) {
+    const conf = run.conf != null ? ` (${run.conf.toFixed(2)})` : '';
+    return `A newer run on this alert reached ${verdictLabel(run.verdict).toLowerCase()}${conf}.`;
+  }
+  if (run?.status === 'running') return 'A newer run on this alert is in progress.';
+  return 'A newer run on this alert replaced this run.';
+}
+
+/** Why every action on a replaced run is off. */
+export const SUPERSEDED_LOCK = 'A newer run replaced this run. Act on the newer run.';
+
+/** "Verdict changed to true positive. Recorded under alice." */
+export function overrideToast(verdict: string, by: string): string {
+  return `Verdict changed to ${verdictLabel(verdict).toLowerCase()}. Recorded under ${by}.`;
+}
+
+/** The thresholds behind the confidence word, in the tooltip. */
+export const CONFIDENCE_TIP =
+  'The confidence of the verdict. High is 0.80 and above. Medium is 0.70 to 0.79. ' +
+  'Low is under 0.70. Under 0.70 the Oracle can review the verdict, and soc·ai ' +
+  'acknowledges no false positive by itself.';
+
+/** What the severity chip on the verdict card is. */
+export const RULE_SEVERITY_TIP =
+  'Rule severity. The detection rule sets it. It is not the confidence of the verdict.';
+
+/** The four Alert details rows the drawer shows first. */
+const BRIEF_ROWS = new Set(['rule', 'source', 'dest', 'user']);
+
+/** How long a run takes on this grid, in one or two sentences. */
+export function runEstimate(t: Inv['typicalRun']): string {
+  if (!t) return 'A run takes 1 to 5 minutes.';
+  const span =
+    t.lowMin === t.highMin
+      ? `about ${t.medianMin} minute${t.medianMin === 1 ? '' : 's'}`
+      : `${t.lowMin} to ${t.highMin} minutes`;
+  return `A run on this grid takes ${span}. The median of the last ${t.samples} runs is ${t.medianMin} minute${t.medianMin === 1 ? '' : 's'}.`;
+}
+
+/** What the Oracle is, on hover of the word. */
+export const ORACLE_TIP =
+  'The Oracle is a second model. soc·ai sends it a verdict to review when the confidence is low.';
+
+/** The question "Resolve in chat" asks. */
+export const RESOLVE_PROMPT = 'What would resolve this verdict?';
+
+/** What each settled-bar write does, said in its confirm step. */
+const SETTLED_SCOPE: Record<'ack' | 'escalate', string> = {
+  ack: 'Acknowledge every unacknowledged alert of this rule.',
+  escalate: 'Open one Security Onion case for each alert of this rule.',
+};
 
 /** Why Re-run is off while a run is in flight (fleet P4, 2026-10-01). */
 export const RERUN_BUSY_REASON =
@@ -185,8 +243,84 @@ export function toolCallCount(inv: Pick<Inv, 'timeline'>): number {
   return inv.timeline.filter((s) => s.group === 'Tool calls').length;
 }
 
-/** Text with each document id rendered as a control that opens the document. */
-function CitedText({ text, ids }: { text: string; ids: string[] }) {
+/** The hunt a promoted finding came from, named by the head line of its
+ *  objective. The API cut the objective at 160 characters in the middle of a
+ *  word, with no mark of the cut. The link shows the head line whole and the
+ *  hover holds the whole objective. A deleted hunt reads as its id. */
+function SourceHuntLink({ huntId, objective }: { huntId: string; objective?: string | null }) {
+  const headline = objectiveHeadline(objective);
+  return (
+    <Link
+      to={`/hunts/${huntId}`}
+      data-testid="source-hunt-link"
+      title={objective || undefined}
+      className="break-words font-mono text-text-2 underline hover:text-text"
+    >
+      {headline || huntId}
+    </Link>
+  );
+}
+
+/** An IPv4 address inside running text. */
+const IPV4_IN_TEXT = /\b(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}\b/;
+
+function escapeRe(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** Split running text on the entities it names: every IPv4 address, and
+ *  every value the run names (a host, a user, a domain) of three or more
+ *  characters. Exported for tests. */
+export function splitEntities(
+  text: string,
+  known: EntityRef[] = [],
+): { t: 'text' | 'entity'; v: string; ref?: EntityRef }[] {
+  const values = known.map((e) => e.value).filter((v) => v && v.length >= 3);
+  const parts = [IPV4_IN_TEXT.source, ...values.sort((a, b) => b.length - a.length).map(escapeRe)];
+  const re = new RegExp(`(${parts.join('|')})`, 'g');
+  const out: { t: 'text' | 'entity'; v: string; ref?: EntityRef }[] = [];
+  let last = 0;
+  for (const m of text.matchAll(re)) {
+    const at = m.index ?? 0;
+    // A value inside a longer word is not that value: "dc01" in "dc01x".
+    const before = text[at - 1] ?? ' ';
+    const after = text[at + m[0].length] ?? ' ';
+    if (/[\w.-]/.test(before) && !/^\d/.test(m[0])) continue;
+    if (/[\w-]/.test(after) && !/^\d/.test(m[0])) continue;
+    if (at > last) out.push({ t: 'text', v: text.slice(last, at) });
+    out.push({ t: 'entity', v: m[0], ref: known.find((e) => e.value === m[0]) });
+    last = at + m[0].length;
+  }
+  if (last < text.length) out.push({ t: 'text', v: text.slice(last) });
+  return out;
+}
+
+/** Text with each entity it names as a link to its page. */
+function EntityText({ text, entities }: { text: string; entities?: EntityRef[] }) {
+  return (
+    <>
+      {splitEntities(text, entities).map((seg, i) =>
+        seg.t === 'entity' ? (
+          <EntityLink
+            key={i}
+            value={seg.v}
+            type={seg.ref?.type}
+            hostKey={seg.ref?.host_key}
+            stopPropagation
+            className="font-[inherit] text-[inherit]"
+          />
+        ) : (
+          <span key={i}>{seg.v}</span>
+        ),
+      )}
+    </>
+  );
+}
+
+/** Text with each document id rendered as a control that opens the document,
+ *  and each entity it names as a link to its page (dogfood 2026-10-06,
+ *  hosts F1). */
+function CitedText({ text, ids, entities }: { text: string; ids: string[]; entities?: EntityRef[] }) {
   return (
     <>
       {splitEventIds(text, ids).map((seg, i) =>
@@ -197,10 +331,28 @@ function CitedText({ text, ids }: { text: string; ids: string[] }) {
             className="rounded-chip border border-border-strong bg-surface-2 px-1 py-px align-baseline font-mono text-[0.72em] font-normal tracking-normal text-accent hover:bg-surface-3"
           />
         ) : (
-          <span key={i}>{seg.v}</span>
+          <EntityText key={i} text={seg.v} entities={entities} />
         ),
       )}
     </>
+  );
+}
+
+/** The entity ref the server sent for one value, when it sent one. */
+function refFor(inv: Pick<Inv, 'entities'>, value: string | null | undefined): EntityRef | undefined {
+  if (!value) return undefined;
+  return inv.entities?.find((e) => e.value === value);
+}
+
+/** One end of the alert as a link: the server's ref when it sent one, else
+ *  the value with its type read from its shape. */
+function EndLink({ inv, value, className }: { inv: Pick<Inv, 'entities'>; value: string; className?: string }) {
+  const ref = refFor(inv, value);
+  const cls = `font-[inherit] ${className ?? ''}`;
+  return ref ? (
+    <EntityRefLink entity={ref} className={cls} />
+  ) : (
+    <EntityLink value={value} stopPropagation className={cls} />
   );
 }
 
@@ -223,29 +375,29 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   const about = useAsync(getAbout, []);
   const sigmaAuthoringEnabled = about.data?.sigma_authoring_enabled === true;
   const demo = useDemo(); // demo deployment → label the verdict as a recorded run
-  const [actions, setActions] = useState<
-    Record<string, 'approved' | 'rejected' | 'executing' | 'failed'>
-  >({});
+  const [actions, setActions] = useState<Record<string, ActionDecision>>({});
   const [actionMsg, setActionMsg] = useState<Record<string, string>>({});
+  // Dismissals this tab made or undid, over the server's record until the
+  // next poll carries it. `null` is an undo.
+  const [dismissals, setDismissals] = useState<Record<string, ActionDismissalState | null>>({});
+  const [dismissMsg, setDismissMsg] = useState<Record<string, string>>({});
   // Settled-verdict fallback action bar: when a complete run recommended no
   // write actions, the analyst can still ack/escalate the whole group directly.
   const [settledAction, setSettledAction] = useState<'ack' | 'escalate' | null>(null);
   const [settledMsg, setSettledMsg] = useState<{ tone: 'ok' | 'err'; text: string } | null>(null);
+  // The settled bar writes to the whole detection group. It asks first, the
+  // way Override verdict does (dogfood 2026-10-06, investigation S2).
+  const [settledConfirm, setSettledConfirm] = useState<'ack' | 'escalate' | null>(null);
   const [openSteps, setOpenSteps] = useState<Record<string, boolean>>({});
   const [flashStep, setFlashStep] = useState<string | null>(null);
   const [timelineOpen, setTimelineOpen] = useState(true);
   const [reasoningOpen, setReasoningOpen] = useState(false);
-  // The chat transport (mount fetch, pending-only poll, send, draft) lives in
-  // useChatThread so the Dashboard general chat runs the identical loop instead
-  // of a third near-copy. The investigation-specific parts stay here: the
-  // subject is the investigation id (so a drawer swap resets the thread and
-  // drops a late reply), and the endpoints are the per-investigation ones.
-  const chat = useChatThread({
-    subject: inv.id,
-    seed: inv.seedChat,
-    fetchThread: getChatThread,
-    sendMessage: postChat,
-  });
+  // A request from the chat to open the confirm of one action card.
+  const [confirmRequest, setConfirmRequest] = useState<{ id: string; n: number } | null>(null);
+  // The one chat panel lives in the shell. This page lends it the
+  // investigation scope (useChatScope below) and opens it from "Resolve in
+  // chat". The thread transport and the proposal cards live in the panel.
+  const chatPanel = useChat();
   const [elapsed, setElapsed] = useState(0);
   // Client-side stuck-guard: flips true if the run is still 'investigating'
   // after a generous cap, so the spinner can't hang forever even if the backend
@@ -275,12 +427,30 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   const diedWithNoVerdict = inv.status === 'error' && inv.verdict === 'untriaged';
   // Only spin while genuinely in-flight (not once we've decided it's stuck).
   const running = investigating && !stuck;
+  // A newer run replaced this one. The page stays a record: it names the
+  // newer run and its verdict, and every write on it is off. A failed run
+  // has its own forward link in the failure panel.
+  const supersededLock = inv.supersededBy && !failed ? SUPERSEDED_LOCK : null;
   // A verdict the model did not commit to. It never reads as settled, and it
   // always offers the two ways forward (fleet P2).
   const unsettledVerdict = inv.verdict === 'needs_more_info' || inv.verdict === 'inconclusive';
   const isFallback =
     !!inv.fallback || FALLBACK_SUMMARY_RE.test(inv.rationale ?? '');
   const citedIds = citedEventIds(inv.citations);
+  // The headline in plain words: field paths out, tool ids named in words.
+  const headline = plainHeadline(inv.rationale ?? '');
+  const citedPaths = Array.from(
+    new Set([
+      ...(inv.citations ?? []).filter((c) => c.kind === 'path').map((c) => c.target || c.text),
+      ...headline.paths,
+    ]),
+  ).filter(Boolean);
+  // The gap the rationale or the summary names, for an unsettled verdict
+  // with no recorded question.
+  const gapFromText = gapSentence(
+    inv.rationale,
+    inv.summary.map((seg) => ('v' in seg ? seg.v : '')).join(' '),
+  );
   const tools = toolCallCount(inv);
 
   // elapsed ticker while running
@@ -313,13 +483,15 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
 
   // reset transient state only when the investigation IDENTITY changes (drawer
   // reuse / re-hunt) — never on a poll refresh of the same investigation. The
-  // chat half of this reset (thread, pending, draft, poll timer) is keyed on
-  // the same id inside useChatThread.
+  // chat panel keys its thread on the same id.
   useEffect(() => {
     setActions({});
     setActionMsg({});
+    setDismissals({});
+    setDismissMsg({});
     setSettledAction(null);
     setSettledMsg(null);
+    setSettledConfirm(null);
     setOpenSteps({});
     setStuck(false);
     setErrDismiss('idle');
@@ -330,7 +502,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     setGraphOpen(false); // always start collapsed — the bar narrative carries the gist
     setTimelineOpen(true);
     setOverrideOpen(false);
-    setOverrideVerdictVal(inv.verdict);
+    setOverrideVerdictVal('');
     setOverrideRationale('');
     setOverrideError(null);
     setReRunError(null);
@@ -340,10 +512,16 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
 
   const [reHunting, setReHunting] = useState(false);
   const [overrideOpen, setOverrideOpen] = useState(false);
-  const [overrideVerdictVal, setOverrideVerdictVal] = useState<string>(inv.verdict);
+  // Nothing preselected: a confirm on the current verdict changed nothing
+  // and still read as an override (dogfood 2026-10-06, first hour C5).
+  const [overrideVerdictVal, setOverrideVerdictVal] = useState<string>('');
   const [overrideRationale, setOverrideRationale] = useState('');
   const [overriding, setOverriding] = useState(false);
   const [overrideError, setOverrideError] = useState<string | null>(null);
+  const { toast } = useToast();
+  // An analyst set the verdict. The model's paragraph folds under a label.
+  const overridden = inv.resolution?.resolved_via === 'manual';
+  const [priorOpen, setPriorOpen] = useState(false);
 
   // Dismiss (acknowledge) a pipeline-error run: the Dashboard KPI stops counting
   // it, while the run itself stays a fallback under the Pipeline-error filter.
@@ -384,7 +562,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
       className="flex items-center gap-1.5 rounded-control border border-border-strong bg-surface-3 px-4 py-2 text-[12.5px] font-semibold text-dim hover:border-accent hover:text-text disabled:opacity-60"
     >
       {errDismiss === 'busy' ? <Spinner size={13} /> : <X size={13} />}
-      {errDismiss === 'busy' ? 'Dismissing…' : 'Dismiss'}
+      {errDismiss === 'busy' ? 'Dismissing' : 'Dismiss'}
     </button>
   );
 
@@ -479,6 +657,11 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
       .finally(() => setRequestingInfo(false));
   };
 
+  // "Resolve in chat" opens the chat and asks the question (dogfood
+  // 2026-10-06, C3). The panel sends it once the thread read lands, and a
+  // turn already running gets the question in the box.
+  const resolveInChat = () => chatPanel?.openChat({ ask: RESOLVE_PROMPT });
+
   // A citation [n] in the narrative points at the n-th timeline step — its
   // evidence. Clicking jumps there, expands the step, and flashes it.
   const goToCite = (n: number) => {
@@ -496,7 +679,12 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   // Genuinely-pending = no local decision AND not already carried out by the
   // system (auto-ack). An applied action renders as a terminal "✓ done" card, so
   // counting it as pending contradicted the card (dogfood FP-run finding).
-  const pendingCount = inv.actions.filter((a) => !actions[a.id] && a.applied !== true).length;
+  const pendingCount = inv.actions.filter(
+    (a) =>
+      actions[a.id] !== 'approved' &&
+      a.applied !== true &&
+      !(a.id in dismissals ? dismissals[a.id] : a.dismissed),
+  ).length;
   const graphInteresting =
     inv.edges.some((e) => e.kind === 'lateral') || inv.nodes.some((n) => n.kind === 'compromised');
 
@@ -510,13 +698,28 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   const ends = alertEnds(inv);
 
   // ── composable section blocks (arranged differently per layout) ──────────
+  // The flow, under the header of the drawer and the page (owner,
+  // 2026-10-07): Alert, Investigation, Verdict, Action in Security Onion. The
+  // strip reads the run's own state, so a failed run names Re-run and never a
+  // verdict.
+  const flowEl = (
+    <FlowStrip
+      steps={investigationFlow(inv, {
+        failed,
+        actedHere:
+          Object.values(actions).some((d) => d === 'approved') || settledMsg?.tone === 'ok',
+        noWrites: isBacktestReplay(inv.meta?.ranBy),
+      })}
+      className="mb-3"
+    />
+  );
   const toolbarEl = (
     <div className="mb-3.5 flex items-center gap-2.5">
       <div className="text-[11px] font-semibold uppercase tracking-[.06em] text-faint">soc·ai verdict</div>
       <div className="flex-1" />
       {!running && (
         <button
-          onClick={() => { setOverrideVerdictVal(inv.verdict); setOverrideRationale(''); setOverrideError(null); setOverrideOpen(true); }}
+          onClick={() => { setOverrideVerdictVal(''); setOverrideRationale(''); setOverrideError(null); setOverrideOpen(true); }}
           className="flex items-center gap-1.5 rounded-control border border-border-strong bg-surface-3 px-[11px] py-1.5 text-[12px] font-semibold text-dim hover:border-warn hover:text-text"
         >
           <Scale size={13} />
@@ -535,7 +738,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
           className="flex items-center gap-1.5 rounded-control border border-border-strong bg-surface-3 px-[11px] py-1.5 text-[12px] font-semibold text-dim hover:border-accent hover:text-text disabled:opacity-60"
         >
           {reHunting ? <Spinner size={13} /> : <RotateCw size={13} />}
-          {reHunting ? 'Re-running…' : 'Re-run investigation'}
+          {reHunting ? 'Re-running' : 'Re-run investigation'}
         </button>
       )}
       {inv.kind !== 'hunt' && running && (
@@ -563,6 +766,9 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
         <Download size={13} />
         Export decision record
       </button>
+      {/* The drawer covers the top bar and its Ask soc-ai button, so the
+          drawer's own header row carries the same button. */}
+      {layout === 'drawer' && <AskSocAiButton />}
     </div>
   );
 
@@ -593,6 +799,68 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     ? startFailureStrip(reRunError, () => setReRunError(null), 'mb-3.5')
     : null;
 
+  // The finding the analyst promoted, first (dogfood 2026-10-06, hunting C4).
+  // The page read as a hunt of the whole lead, with the raw model prompt as
+  // its objective.
+  const pf = inv.promotedFinding;
+  const promotedFindingEl = pf ? (
+    <div
+      data-testid="promoted-finding"
+      className="mb-3.5 rounded-card border px-3.5 py-3"
+      style={{ borderColor: 'rgba(244,114,182,.35)', background: 'rgba(244,114,182,.06)' }}
+    >
+      <div className="text-[13.5px] font-semibold text-text">
+        <span style={{ color: '#f472b6' }}>Promoted finding:</span> {pf.label}, {pf.title}
+      </div>
+      {pf.detail && (
+        <div className="mt-1 text-[12.5px] leading-[1.5] text-text-2">
+          <EntityText text={pf.detail} entities={inv.entities} />
+        </div>
+      )}
+      {pf.attacker && pf.victim ? (
+        <div data-testid="promoted-direction" className="mt-1.5 font-mono text-[12px] text-dim">
+          <EntityLink value={pf.attacker} className="text-mono-amber" />
+          <span className="text-faint"> → </span>
+          <EntityLink value={pf.victim} className="text-mono-green" />
+        </div>
+      ) : (pf.hosts?.length ?? 0) > 0 ? (
+        <div data-testid="promoted-hosts" className="mt-1.5 flex flex-wrap items-center gap-2 text-[12px] text-dim">
+          <span>Hosts the finding names:</span>
+          {pf.hosts!.map((h) => (
+            <EntityLink key={h} value={h} />
+          ))}
+        </div>
+      ) : null}
+      {(pf.citations?.length ?? 0) > 0 && (
+        <div data-testid="promoted-evidence" className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[12px] text-faint">
+          <span>Evidence:</span>
+          {pf.citations!.map((id) => (
+            <DocumentChip key={id} id={id} />
+          ))}
+        </div>
+      )}
+    </div>
+  ) : null;
+
+  const supersededEl =
+    supersededLock && inv.supersededBy ? (
+      <div
+        role="status"
+        data-testid="superseded-banner"
+        className="mb-3.5 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-card border px-3.5 py-2.5 text-[13px]"
+        style={{ borderColor: 'rgba(75,139,245,.4)', background: 'rgba(75,139,245,.08)' }}
+      >
+        <span className="text-text-2">{supersededSentence(inv.supersededRun)}</span>
+        <Link
+          to={`/investigation/${inv.supersededBy}`}
+          className="font-semibold text-accent underline hover:opacity-80"
+        >
+          Open it.
+        </Link>
+        <span className="text-dim">This page is a record. Its actions are off.</span>
+      </div>
+    ) : null;
+
   const runningEl = (
     <div
       className="relative mb-[18px] overflow-hidden rounded-panel-lg border p-[18px]"
@@ -603,7 +871,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
       </div>
       <div className="flex items-center gap-[11px]">
         <Spinner size={17} />
-        <div className="text-[15px] font-semibold">Investigating…</div>
+        <div className="text-[15px] font-semibold">Investigating</div>
         <div className="flex-1" />
         <div className="font-mono text-[12.5px] text-dim">
           elapsed <span className="text-text">{fmt(elapsed)}</span>
@@ -620,9 +888,15 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
             <span className="text-success">✓</span> {s.title}
           </div>
         ))}
-        <div className="flex items-center gap-2 text-text-2">
-          <Spinner size={11} /> Working…
+        <div data-testid="running-now" className="flex items-center gap-2 text-text-2">
+          <Spinner size={11} />{' '}
+          {inv.currentStep ? `Now ${inv.currentStep}.` : 'Working'}
         </div>
+      </div>
+      {/* How long a run takes here, from the store (dogfood 2026-10-06,
+          first hour W11). The display sat on "Working" for minutes. */}
+      <div data-testid="running-estimate" className="mt-3 text-[12px] leading-[1.5] text-dim">
+        {runEstimate(inv.typicalRun)} You can close this page. Notifications tells you when the run ends.
       </div>
     </div>
   );
@@ -634,13 +908,11 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   // hunt page — with the same link idiom as the provenance strip.
   const reRunOrPromoteLine = (className: string) => (
     <div className={className}>
-      Re-promote this finding from its hunt to re-run it.
+      Open an investigation on this finding again from its hunt.
       {inv.huntId && (
         <>
           {' '}
-          <Link to={`/hunts/${inv.huntId}`} className="font-mono text-text-2 underline hover:text-text">
-            {inv.huntObjective || inv.huntId}
-          </Link>
+          <SourceHuntLink huntId={inv.huntId} objective={inv.huntObjective} />
         </>
       )}
     </div>
@@ -654,7 +926,9 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   const failure = inv.status === 'error' ? inv.failure ?? null : null;
   const noRerunAdvice = !!inv.supersededBy || !!failure?.permanent;
   const tryAgain =
-    inv.kind === 'hunt' ? 'Re-promote it from its hunt to try again.' : 'Re-run it to try again.';
+    inv.kind === 'hunt'
+      ? 'Open an investigation on it again from its hunt.'
+      : 'Re-run it to try again.';
   const failureSentence = failure?.permanent
       ? 'The run reached no verdict. A re-run cannot change the recorded cause.'
       : failure
@@ -698,11 +972,11 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
           ? 'The run reached no verdict.'
           : interrupted
           ? inv.kind === 'hunt'
-            ? 'There is no verdict. The service restarted during the run. soc·ai re-investigates this finding if Auto-Investigate is on. Re-promote it from its hunt to try again.'
+            ? 'There is no verdict. The service restarted during the run. soc·ai re-investigates this finding if Auto-Investigate is on. Open an investigation on it again from its hunt.'
             : 'There is no verdict. The service restarted during the run. soc·ai re-investigates this alert if Auto-Investigate is on. Re-run it now to get a verdict.'
           : cancelled
             ? inv.kind === 'hunt'
-              ? 'The run reached no verdict. An operator cancel or a service restart stopped the run before it finished. Re-promote it from its hunt to try again.'
+              ? 'The run reached no verdict. An operator cancel or a service restart stopped the run before it finished. Open an investigation on it again from its hunt.'
               : 'The run reached no verdict. An operator cancel or a service restart stopped the run before it finished. Re-run it to get a verdict.'
             : stuck && inv.status === 'investigating'
               ? `The run made no progress for 5 minutes. It may have stalled. ${tryAgain}`
@@ -736,7 +1010,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
             className="flex items-center gap-1.5 rounded-control border border-danger bg-[rgba(240,68,56,.1)] px-4 py-2 text-[13px] font-semibold text-[#fca5a5] hover:bg-[rgba(240,68,56,.18)] disabled:opacity-60"
           >
             {reHunting ? <Spinner size={13} color="#fca5a5" /> : <RotateCw size={13} />}
-            {reHunting ? 'Re-running…' : 'Re-run investigation'}
+            {reHunting ? 'Re-running' : 'Re-run investigation'}
           </button>
         )}
         {/* Only where there is something to clear. A cancel was asked for and a
@@ -765,6 +1039,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
       <div className="absolute left-0 top-0 h-full w-[3px]" style={{ background: v.color }} />
       <div className="mb-3.5 flex flex-wrap items-center gap-2.5">
         <VerdictPill verdict={inv.verdict} large />
+        {isBacktestReplay(inv.meta?.ranBy) && <BacktestReplayChip />}
         {/* A run against planted synthetic scenarios must never read as a
             real one — badged right beside the verdict. */}
         {inv.isSynthEval && <SyntheticEvalBadge />}
@@ -782,7 +1057,9 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
               className="min-w-0 max-w-full text-[12.5px] text-dim"
               title={SUBJECT_OBJECTIVE}
             >
-              {firstSentence(huntSubject.objective)}
+              {inv.promotedFinding
+                ? `${inv.promotedFinding.label}, ${inv.promotedFinding.title}`
+                : firstSentence(huntSubject.objective)}
             </span>
             {huntSubject.lead_id != null && (
               <Link
@@ -795,9 +1072,36 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
               </Link>
             )}
           </>
-        ) : (
-          <>
-            {inv.sev && <SeverityTag sev={inv.sev} />}
+        ) : null}
+        {inv.oracle?.escalated && (
+          <OracleBadge oracle={inv.oracle} />
+        )}
+        {inv.status === 'complete' && inv.meta?.toolCalls === 0 && <HeuristicBadge />}
+        <div className="flex-1" />
+        <div className="flex items-center gap-[9px]" title={CONFIDENCE_TIP}>
+          <ConfidenceRing conf={inv.conf} color={v.color} />
+          <div>
+            <div className="font-mono text-[18px] font-bold leading-none">{inv.conf.toFixed(2)}</div>
+            {/* The word under the number (dogfood 2026-10-06, W1): 0.62 read
+                like 0.90. The thresholds are the server's. */}
+            <div data-testid="confidence-word" className="text-[10.5px] uppercase tracking-[.05em] text-faint">
+              {confidenceWord(inv.conf)} confidence
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* What the alert is: the rule's severity and the two ends. It sits
+          apart from the verdict row, so the rule severity never reads as
+          the verdict confidence (dogfood 2026-10-06, C2). */}
+      {!huntSubject && (inv.sev || ends) && (
+        <div data-testid="verdict-context" className="mb-3 flex flex-wrap items-center gap-2.5">
+            {inv.sev && (
+              <span data-testid="rule-severity" title={RULE_SEVERITY_TIP} className="inline-flex cursor-help items-center gap-1.5">
+                <span className="text-[10.5px] uppercase tracking-[.05em] text-faint">rule severity</span>
+                <SeverityTag sev={inv.sev} />
+              </span>
+            )}
             {/* min-w-0 + max-w-full + break-all: the badge may use the whole
                 header row and wraps internally when genuinely out of space —
                 the FULL destination is always visible, never clipped to a
@@ -810,63 +1114,83 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
               >
                 {ends.src && ends.dst ? (
                   <>
-                    <span data-testid="endpoint-src" className="break-all text-mono-amber">{ends.src}</span>
+                    <span data-testid="endpoint-src" className="break-all text-mono-amber"><EndLink inv={inv} value={ends.src} /></span>
                     <span className="text-faint"> → </span>
-                    <span data-testid="endpoint-dst" className="break-all text-mono-green">{ends.dst}</span>
+                    <span data-testid="endpoint-dst" className="break-all text-mono-green"><EndLink inv={inv} value={ends.dst} /></span>
                   </>
                 ) : ends.src ? (
                   <>
                     <span className="text-faint">from </span>
-                    <span data-testid="endpoint-src" className="break-all text-mono-amber">{ends.src}</span>
+                    <span data-testid="endpoint-src" className="break-all text-mono-amber"><EndLink inv={inv} value={ends.src} /></span>
                   </>
                 ) : ends.dst ? (
                   <>
                     <span className="text-faint">to </span>
-                    <span data-testid="endpoint-dst" className="break-all text-mono-green">{ends.dst}</span>
+                    <span data-testid="endpoint-dst" className="break-all text-mono-green"><EndLink inv={inv} value={ends.dst} /></span>
                   </>
                 ) : null}
                 {ends.on && (
                   <>
                     <span className="text-faint">{ends.src || ends.dst ? ' on ' : 'on '}</span>
-                    <span data-testid="endpoint-on" className="break-all text-text-2">{ends.on}</span>
+                    <span data-testid="endpoint-on" className="break-all text-text-2"><EndLink inv={inv} value={ends.on} /></span>
                   </>
                 )}
               </span>
             )}
-          </>
-        )}
-        {inv.oracle?.escalated && (
-          <OracleBadge oracle={inv.oracle} />
-        )}
-        {inv.status === 'complete' && inv.meta?.toolCalls === 0 && <HeuristicBadge />}
-        <div className="flex-1" />
-        <div className="flex items-center gap-[9px]">
-          <ConfidenceRing conf={inv.conf} color={v.color} />
-          <div>
-            <div className="font-mono text-[18px] font-bold leading-none">{inv.conf.toFixed(2)}</div>
-            <div className="text-[10.5px] uppercase tracking-[.05em] text-faint">confidence</div>
-          </div>
         </div>
-      </div>
+      )}
 
       {/* rationale as headline */}
       <div className="text-[21px] font-semibold leading-[1.32] tracking-[-.015em]" style={{ textWrap: 'pretty' }}>
-        {isFallback ? FALLBACK_HEADLINE : <CitedText text={inv.rationale ?? ''} ids={citedIds} />}
+        {isFallback ? FALLBACK_HEADLINE : <CitedText text={headline.text} ids={citedIds} entities={inv.entities} />}
       </div>
 
       {/* summary with citations. A fallback's stored summary is the exception
           text; the pipeline-error panel below says what an analyst needs. */}
-      {!isFallback && (
+      {!isFallback && !overridden && (
         <p className="mt-3.5 text-[13.5px] leading-[1.6] text-[#aeb6c2]" style={{ textWrap: 'pretty' }}>
-          <Summary segments={inv.summary} onCite={goToCite} ids={citedIds} />
+          <Summary segments={inv.summary} onCite={goToCite} ids={citedIds} entities={inv.entities} />
         </p>
       )}
+      {/* After an analyst override the model's paragraph no longer explains
+          the verdict. It stays readable, folded, under a label that says
+          whose text it is (dogfood 2026-10-06, first hour S3). */}
+      {!isFallback && overridden && (
+        <div data-testid="pre-override-summary" className="mt-3.5 text-[12.5px] text-dim">
+          <button
+            onClick={() => setPriorOpen((o) => !o)}
+            aria-expanded={priorOpen}
+            className="flex items-center gap-1.5 font-semibold hover:text-text"
+          >
+            <ChevronDown size={13} style={{ transform: priorOpen ? 'rotate(180deg)' : 'none' }} />
+            soc·ai said before the override
+          </button>
+          {priorOpen && (
+            <p className="mt-1.5 leading-[1.6] text-[#8b94a3]" style={{ textWrap: 'pretty' }}>
+              <Summary segments={inv.summary} onCite={goToCite} ids={citedIds} entities={inv.entities} />
+            </p>
+          )}
+        </div>
+      )}
       {/* Every document the report cites, each one opens the event (P3). */}
-      {!isFallback && citedIds.length > 0 && (
+      {!isFallback && (citedIds.length > 0 || citedPaths.length > 0) && (
         <div data-testid="cited-evidence" className="mt-3 flex flex-wrap items-center gap-1.5 text-[12px] text-faint">
           <span>Cited evidence:</span>
           {citedIds.map((id) => (
             <DocumentChip key={id} id={id} />
+          ))}
+          {/* A field of the alert the verdict cites. The headline names the
+              evidence in words, and the path stays here (dogfood
+              2026-10-06, C1). */}
+          {citedPaths.map((path) => (
+            <span
+              key={path}
+              data-testid="cited-path"
+              title="A field of the alert that the verdict cites."
+              className="rounded-chip border border-border-strong bg-surface-2 px-1.5 py-px font-mono text-[11px] text-text-2"
+            >
+              {path}
+            </span>
           ))}
         </div>
       )}
@@ -908,7 +1232,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
               real verdict, so this sentence must agree with it instead of
               also instructing "re-run" for a row the API refuses to re-run. */}
           {inv.kind === 'hunt'
-            ? ' Re-promote it from its hunt to try again.'
+            ? ' Open an investigation on it again from its hunt.'
             : ' Re-run it to get a real verdict.'}
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -921,7 +1245,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
               className="flex items-center gap-1.5 rounded-control border border-danger bg-[rgba(240,68,56,.1)] px-4 py-2 text-[12.5px] font-semibold text-[#fca5a5] hover:bg-[rgba(240,68,56,.18)] disabled:opacity-60"
             >
               {reHunting ? <Spinner size={13} color="#fca5a5" /> : <RotateCw size={13} />}
-              {reHunting ? 'Re-running…' : 'Re-run investigation'}
+              {reHunting ? 'Re-running' : 'Re-run investigation'}
             </button>
           )}
           {dismissControl}
@@ -956,10 +1280,21 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
             {inv.openQuestions!.map((q, i) => <li key={i} className="mb-0.5">{q}</li>)}
           </ul>
         ) : inv.kind !== 'hunt' ? (
-          <div className="mb-2.5 text-[13px] text-text-2">
-            {inv.verdict === 'needs_more_info'
-              ? 'The model needs more evidence to settle this verdict. The run recorded no open questions. Start a focused re-investigation. You can also resolve it in chat.'
-              : 'The model could not converge on a verdict. Start a focused re-investigation. You can also resolve it in chat.'}
+          <div data-testid="open-question-gap" className="mb-2.5 text-[13px] text-text-2">
+            {/* The run recorded no question. The rationale names the gap, so
+                the block shows that sentence (dogfood 2026-10-06, W2). */}
+            {gapFromText ? (
+              <ul className="list-disc pl-5">
+                <li>{gapFromText}</li>
+              </ul>
+            ) : inv.verdict === 'needs_more_info' ? (
+              'The model needs more evidence to settle this verdict.'
+            ) : (
+              'The model could not converge on a verdict.'
+            )}
+            <div className="mt-1.5 text-[12.5px] text-dim">
+              Start a focused re-investigation. You can also resolve it in chat.
+            </div>
           </div>
         ) : null}
         {/* Honest wayfinding for a promoted finding: every re-run affordance
@@ -969,8 +1304,9 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
             screen. Say what actually refines a promoted finding instead. */}
         {inv.kind === 'hunt' && (
           <div className="mb-2.5 text-[13px] text-text-2">
-            Re-promote this finding from its hunt to refine it. You can also ask a follow-up
-            below. This screen cannot re-run a promoted finding.
+            Open an investigation on this finding again from its hunt to refine it. You can
+            also ask a follow-up in Ask soc-ai. This screen cannot re-run the investigation of
+            a finding.
           </div>
         )}
         <div className="flex flex-wrap items-center gap-2">
@@ -980,17 +1316,18 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
           {inv.kind !== 'hunt' && (
             <button
               onClick={requestInfo}
-              disabled={requestingInfo}
-              title="This button starts a new investigation. The new investigation targets the open questions above."
+              disabled={requestingInfo || !!supersededLock}
+              title={supersededLock ?? 'This button starts a new investigation. The new investigation targets the open questions above.'}
               className="flex items-center gap-1.5 rounded-[7px] border px-[11px] py-1.5 text-[12.5px] font-semibold text-[#0b0f16] disabled:opacity-60"
               style={{ background: '#f5a623', borderColor: '#f5a623' }}
             >
               {requestingInfo ? <Spinner size={13} /> : <Crosshair size={13} />}
-              {requestingInfo ? 'Requesting…' : 'Request more info'}
+              {requestingInfo ? 'Requesting' : 'Request more info'}
             </button>
           )}
           <button
-            onClick={() => document.querySelector('[data-chat-panel]')?.scrollIntoView({ behavior: 'smooth' })}
+            onClick={resolveInChat}
+            title={`Open Ask soc-ai and ask: ${RESOLVE_PROMPT}`}
             className="flex items-center gap-1.5 rounded-[7px] border px-[11px] py-1.5 text-[12.5px] font-semibold text-[#cfe0ff]"
             style={{ background: 'rgba(75,139,245,.14)', borderColor: 'rgba(75,139,245,.4)' }}
           >
@@ -1010,9 +1347,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
       >
         <span style={{ color: '#f472b6' }}>Promoted from hunt</span>
         {': '}
-        <Link to={`/hunts/${inv.huntId}`} className="font-mono text-text-2 underline hover:text-text">
-          {inv.huntObjective || inv.huntId}
-        </Link>
+        <SourceHuntLink huntId={inv.huntId} objective={inv.huntObjective} />
       </div>
     )}
     {inv.resolution?.resolved_via === 'manual' && (
@@ -1020,10 +1355,12 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
         className="rounded-card border px-3.5 py-2.5 text-[12px] text-dim"
         style={{ borderColor: 'rgba(245,166,35,.35)', background: 'rgba(245,166,35,.06)' }}
       >
-        <span style={{ color: '#f5a623' }}>Manually overridden</span> by{' '}
+        <span style={{ color: '#f5a623' }}>Analyst verdict</span>
+        {'. Set by '}
         <span className="font-mono text-text-2">{inv.resolution.resolved_by}</span>
         {'. Previous verdict: '}
-        <span className="font-mono text-text-2">{inv.resolution.original_verdict}</span>
+        <span className="text-text-2">{verdictLabel(inv.resolution.original_verdict)}</span>
+        {'.'}
       </div>
     )}
     {inv.validatorNote && (
@@ -1046,6 +1383,17 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     inv.graphNote ??
     `The graph has ${inv.nodes.length} entities and ${inv.edges.length} relationships.${graphInteresting ? ' The graph shows lateral movement.' : ''}`;
   const graphHeight = layout === 'page' ? 320 : 240;
+  // Every entity the run names, as links: the server's refs when it sent
+  // them, else the labels of the graph nodes.
+  const scopeEntities: EntityRef[] = inv.entities?.length
+    ? inv.entities
+    : Array.from(new Set(inv.nodes.map((n) => n.label).filter((l) => l && l !== '?'))).map((v) => ({
+        value: v,
+        type: guessEntityType(v),
+        role: '',
+        host_key: null,
+        href: '',
+      }));
   const entityEl = (
     <Panel>
       <button
@@ -1072,6 +1420,13 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
           <ChevronDown size={15} />
         </span>
       </button>
+      {scopeEntities.length > 0 && (
+        <div data-testid="entity-scope-links" className="flex flex-wrap items-center gap-x-2.5 gap-y-1 border-t border-border-faint px-[15px] py-[8px] text-[12px]">
+          {scopeEntities.map((e) => (
+            <EntityRefLink key={`${e.type}:${e.value}`} entity={e} />
+          ))}
+        </div>
+      )}
       {graphOpen && (
         <div className="border-t border-border">
           <EntityGraph nodes={inv.nodes} edges={inv.edges} highlight={inv.host} height={graphHeight} showLegend={layout === 'page'} />
@@ -1080,23 +1435,22 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     </Panel>
   );
 
-  // Token-gated actions execute when the approval is approved; advisory ones (a
-  // completed run's recommendations) execute on demand through the same write
-  // path. The card's explicit Approve click IS the human consent — these write
-  // to the live Security Onion grid.
-  const runAdvisory = (a: RecommendedAction, index: number) => {
+  // Advisory actions (a completed run's recommendations) execute on demand.
+  // The card states the write and asks for a confirm first. The confirm IS
+  // the human consent. These write to the live Security Onion grid.
+  const runAdvisory = (a: RecommendedAction, index: number, scope: 'group' | 'alert') => {
     const blocked = demoBlocked(demo);
     if (blocked) { setActionMsg((m) => ({ ...m, [a.id]: blocked })); return; } // demo: no doomed grid write
     setActions((s) => ({ ...s, [a.id]: 'executing' }));
     setActionMsg((m) => ({ ...m, [a.id]: '' }));
-    executeAction(inv.id, index)
+    executeAction(inv.id, index, a.tag === 'ack' ? scope : undefined)
       .then((res) => {
         if (res.status === 'executed') {
           setActions((s) => ({ ...s, [a.id]: 'approved' }));
           setActionMsg((m) => ({ ...m, [a.id]: res.detail }));
-          // The backend ack is group-scoped — let the Alerts list hide the
+          // A group ack covers the detection. Let the Alerts list hide the
           // whole detection optimistically while the ES agg catches up.
-          if (a.tag === 'ack') onAcked?.(inv.name);
+          if (a.tag === 'ack' && scope === 'group') onAcked?.(inv.name);
         } else {
           setActions((s) => ({ ...s, [a.id]: 'failed' }));
           setActionMsg((m) => ({ ...m, [a.id]: res.error ?? 'execution failed' }));
@@ -1107,31 +1461,65 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
         setActionMsg((m) => ({ ...m, [a.id]: e instanceof Error ? e.message : 'request failed' }));
       });
   };
+  // Dismiss and its undo go to the server, with the actor and the time
+  // (dogfood 2026-10-06, first hour S4). The card changes when the server
+  // answers. A failure leaves the card as it was and says why.
+  const setDismissal = (a: RecommendedAction, index: number, dismiss: boolean) => {
+    const blocked = demoBlocked(demo);
+    if (blocked) { setDismissMsg((m) => ({ ...m, [a.id]: blocked })); return; }
+    setActions((s) => ({ ...s, [a.id]: 'dismissing' }));
+    setDismissMsg((m) => ({ ...m, [a.id]: '' }));
+    (dismiss ? dismissAction(inv.id, index) : restoreAction(inv.id, index))
+      .then((r) =>
+        setDismissals((d) => ({ ...d, [a.id]: r.dismissed ? { by: r.by, at: r.at } : null })),
+      )
+      .catch((e) =>
+        setDismissMsg((m) => ({
+          ...m,
+          [a.id]: e instanceof Error ? e.message : 'soc-ai did not store the change. Try again.',
+        })),
+      )
+      .finally(() =>
+        setActions((s) => {
+          const { [a.id]: _drop, ...rest } = s;
+          return rest;
+        }),
+      );
+  };
+  // The standing dismissal of one action: this tab's change, else the server's.
+  const dismissalOf = (a: RecommendedAction): ActionDismissalState | null => {
+    if (a.id in dismissals) return dismissals[a.id];
+    return a.dismissed ? { by: a.dismissedBy ?? 'an analyst', at: a.dismissedAt ?? null } : null;
+  };
   // A promoted finding's recommended actions (ack/escalate/comment) each map
-  // to an Approve/Execute that IS an SO write — the server refuses every one
-  // of them (Task 6, WRITE_TOOLS covers all three tags). Render Approve
-  // disabled with an explanation rather than let the analyst click into a
-  // 400. Reject/Dismiss is untouched: ActionCard's onReject only flips local
-  // `actions` state (never reaches the server), so it stays clickable even
-  // for a hunt-kind row.
+  // to a write the server refuses (Task 6, WRITE_TOOLS covers all three
+  // tags). The write button is off with an explanation. Dismiss stays: it
+  // writes nothing to Security Onion.
   const actionsDisabledReason =
-    inv.kind === 'hunt' ? 'A promoted finding has no Security Onion alert to act on' : undefined;
+    inv.kind === 'hunt' ? 'A promoted finding has no Security Onion alert to act on.' : undefined;
   const actionsEl = (
     <CollapsibleSection
       title="Recommended actions"
-      meta={`human-in-the-loop · ${pendingCount} pending`}
+      meta={pendingCount === 1 ? '1 action waits for you' : `${pendingCount} actions wait for you`}
     >
       <div className="flex flex-col gap-2.5">
         {inv.actions.map((a, i) => (
           <ActionCard
             key={a.id}
             action={a}
+            index={i}
+            invId={inv.id}
             decision={actions[a.id]}
             message={actionMsg[a.id]}
             executedBy={me ?? 'you'}
-            onApprove={() => runAdvisory(a, i)}
-            onReject={() => setActions((s) => ({ ...s, [a.id]: 'rejected' }))}
+            dismissal={dismissalOf(a)}
+            dismissError={dismissMsg[a.id]}
+            onExecute={(scope) => runAdvisory(a, i, scope)}
+            onDismiss={() => setDismissal(a, i, true)}
+            onUndoDismiss={() => setDismissal(a, i, false)}
             disabledReason={actionsDisabledReason}
+            lockedReason={supersededLock ?? undefined}
+            confirmRequest={confirmRequest?.id === a.id ? confirmRequest.n : undefined}
           />
         ))}
       </div>
@@ -1182,7 +1570,10 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     inv.actions.length === 0 &&
     !isFallback &&
     !unsettledVerdict &&
-    inv.kind !== 'hunt' ? (
+    inv.kind !== 'hunt' &&
+    // A backtest replay measures the model on an alert an analyst already
+    // closed. Its page offers no write, so no group ack and no escalate.
+    !isBacktestReplay(inv.meta?.ranBy) ? (
       <div
         className="rounded-card border px-3.5 py-3"
         style={{ borderColor: 'rgba(245,166,35,.35)', background: 'rgba(245,166,35,.06)' }}
@@ -1201,24 +1592,59 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
           </p>
         )}
         <div className="flex flex-wrap items-center gap-2">
+          {settledConfirm ? (
+            <div
+              data-testid="settled-confirm"
+              className="w-full rounded-[7px] border px-3 py-2.5"
+              style={{ borderColor: 'rgba(245,166,35,.35)', background: 'rgba(245,166,35,.07)' }}
+            >
+              <div className="mb-2.5 flex items-start gap-2 text-[12.5px] leading-[1.5] text-warn">
+                <AlertTriangle size={13} className="mt-px flex-none" />
+                <span>This writes to Security Onion. {SETTLED_SCOPE[settledConfirm]}</span>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  onClick={() => {
+                    const kind = settledConfirm;
+                    setSettledConfirm(null);
+                    runSettled(kind);
+                  }}
+                  className="flex items-center gap-1.5 rounded-[7px] border border-warn bg-[rgba(245,166,35,.12)] px-[11px] py-1.5 text-[12.5px] font-semibold text-warn hover:bg-[rgba(245,166,35,.2)]"
+                >
+                  <Check size={13} /> {settledConfirm === 'ack' ? 'Confirm acknowledge' : 'Confirm escalate'}
+                </button>
+                <button
+                  onClick={() => setSettledConfirm(null)}
+                  className="rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-1.5 text-[12.5px] font-semibold text-text-2 hover:text-text"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          ) : (
+          <>
           <button
-            onClick={() => runSettled('ack')}
-            disabled={settledAction !== null}
+            onClick={() => setSettledConfirm('ack')}
+            disabled={settledAction !== null || !!supersededLock}
+            title={supersededLock ?? undefined}
             className="flex items-center gap-1.5 rounded-[7px] border px-[11px] py-1.5 text-[12.5px] font-semibold text-text-2 hover:text-text disabled:opacity-60"
             style={{ borderColor: 'rgba(123,168,147,.4)', background: 'rgba(123,168,147,.10)' }}
           >
             {settledAction === 'ack' ? <Spinner size={13} /> : <Check size={13} />}
-            {settledAction === 'ack' ? 'Acknowledging…' : 'Acknowledge'}
+            {settledAction === 'ack' ? 'Acknowledging' : 'Acknowledge'}
           </button>
           <button
-            onClick={() => runSettled('escalate')}
-            disabled={settledAction !== null}
+            onClick={() => setSettledConfirm('escalate')}
+            disabled={settledAction !== null || !!supersededLock}
+            title={supersededLock ?? undefined}
             className="flex items-center gap-1.5 rounded-[7px] border px-[11px] py-1.5 text-[12.5px] font-semibold disabled:opacity-60"
             style={{ borderColor: 'rgba(240,68,56,.4)', background: 'rgba(240,68,56,.10)', color: '#fca5a5' }}
           >
             {settledAction === 'escalate' ? <Spinner size={13} /> : <Triangle size={13} />}
-            {settledAction === 'escalate' ? 'Escalating…' : 'Escalate to case'}
+            {settledAction === 'escalate' ? 'Escalating' : 'Escalate to case'}
           </button>
+          </>
+          )}
           {settledMsg && (
             <span
               className="text-[12px] font-semibold"
@@ -1252,9 +1678,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
         inv.huntId ? (
           <div className="text-[12px] text-dim">
             This detection comes from a promoted finding. The hunt is{' '}
-            <Link to={`/hunts/${inv.huntId}`} className="font-mono text-text-2 underline hover:text-text">
-              {inv.huntObjective || inv.huntId}
-            </Link>
+            <SourceHuntLink huntId={inv.huntId} objective={inv.huntObjective} />
           </div>
         ) : undefined
       }
@@ -1301,13 +1725,19 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   const reasoningEl =
     reasoning.length > 0 ? (
       <CollapsibleSection
-        title="Model reasoning"
-        meta={`${reasoning.length} step${reasoning.length === 1 ? '' : 's'} · why it decided`}
+        title="Model scratch work"
+        meta={`${reasoning.length} turn${reasoning.length === 1 ? '' : 's'} · notes, not evidence`}
         open={reasoningOpen}
         onToggle={() => setReasoningOpen((o) => !o)}
       >
         <Panel>
-          <div className="flex flex-col gap-3 p-1">
+          {/* The raw monologue carried the weight of the narrative (dogfood
+              2026-10-06). It is marked as the model's notes and stays folded. */}
+          <div data-testid="scratch-note" className="border-b border-border-faint px-3 py-2 text-[12px] text-dim">
+            The model wrote these notes while it worked. They are not the verdict and not
+            evidence. The verdict and the cited evidence are above.
+          </div>
+          <div className="flex flex-col gap-3 p-1 opacity-80">
             {reasoning.map((r, i) => (
               <div key={i} className="rounded-control border border-border-2 bg-bg p-2.5">
                 <div className="mb-1 font-mono text-[10.5px] uppercase tracking-[.06em] text-faint">
@@ -1325,20 +1755,38 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
       </CollapsibleSection>
     ) : null;
 
-  const onResolved = () =>
-    chat.refresh().catch(() => {}).finally(() => onVerdictApplied?.());
-  const chatProps = {
-    messages: chat.messages,
-    pending: chat.pending,
-    progressTools: chat.progressTools,
-    draft: chat.draft,
-    onDraft: chat.setDraft,
-    onSend: chat.send,
-    invId: inv.id,
-    onResolved,
-    verdict: inv.verdict,
-    linkIds: citedIds,
-  };
+  // The escalate a chat answer points at, inline in the chat (C4). It opens
+  // the confirm of the escalate card, or of the settled bar.
+  const escalateCard = inv.actions.find((a) => a.tag === 'escalate' && !a.applied && !a.dismissed);
+  const canSettledEscalate =
+    inv.status === 'complete' && inv.actions.length === 0 && !isFallback && inv.kind !== 'hunt';
+  const escalateFromChat =
+    supersededLock || inv.kind === 'hunt' || (!escalateCard && !canSettledEscalate)
+      ? undefined
+      : () => {
+          if (escalateCard) {
+            setConfirmRequest({ id: escalateCard.id, n: Date.now() });
+            requestAnimationFrame(() =>
+              document
+                .querySelector(`[data-testid="action-card-${inv.actions.indexOf(escalateCard)}"]`)
+                ?.scrollIntoView({ behavior: 'smooth', block: 'center' }),
+            );
+          } else {
+            setSettledConfirm('escalate');
+          }
+        };
+  // The panel's investigation scope: the verdict a proposal compares with,
+  // the ids an answer may cite, and the two page actions it can call.
+  useChatScope({
+    scope: { kind: 'investigation', id: inv.id, name: inv.name },
+    investigation: {
+      verdict: inv.verdict,
+      linkIds: citedIds,
+      seed: inv.seedChat,
+      onVerdictApplied,
+      onEscalate: escalateFromChat,
+    },
+  });
 
   // ── Override verdict modal ────────────────────────────────────────────────
   const overrideModalEl = overrideOpen ? (
@@ -1364,8 +1812,8 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
           style={{ borderColor: 'rgba(240,68,56,.35)', background: 'rgba(240,68,56,.07)', color: '#fca5a5' }}
         >
           <AlertTriangle size={13} className="mt-px flex-none" />
-          <span><span className="font-semibold">WARNING:</span> This override replaces the current verdict.
-          soc·ai records the override permanently with your name.</span>
+          <span><span className="font-semibold">WARNING:</span> This override replaces the current verdict
+          and its recommended actions. soc·ai records the override with your name. You can override again later.</span>
         </div>
         <div className="mb-3">
           <label className="mb-1.5 block text-[12px] font-semibold text-dim">New verdict</label>
@@ -1374,9 +1822,14 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
             onChange={(e) => setOverrideVerdictVal(e.target.value)}
             className="w-full rounded-control border border-border-input bg-bg px-3 py-2 text-[13px] text-text outline-none focus:border-accent"
           >
-            <option value="true_positive">true_positive</option>
-            <option value="false_positive">false_positive</option>
-            <option value="needs_more_info">needs_more_info</option>
+            <option value="" disabled>
+              Choose a verdict
+            </option>
+            {VERDICT_OPTIONS.map((o) => (
+              <option key={o.value} value={o.value} disabled={o.value === inv.verdict}>
+                {o.value === inv.verdict ? `${o.label} (the current verdict)` : o.label}
+              </option>
+            ))}
           </select>
         </div>
         <div className="mb-5">
@@ -1404,14 +1857,23 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
             Cancel
           </button>
           <button
-            disabled={overriding}
+            disabled={overriding || !overrideVerdictVal}
             onClick={() => {
               const blocked = demoBlocked(demo);
               if (blocked) { setOverrideError(blocked); return; } // demo: no doomed write
               setOverriding(true);
               setOverrideError(null);
-              submitOverride(inv.id, overrideVerdictVal, overrideRationale || undefined)
-                .then(() => { setOverrideOpen(false); onVerdictApplied?.(); })
+              const chosen = overrideVerdictVal;
+              submitOverride(inv.id, chosen, overrideRationale || undefined)
+                .then((r) => {
+                  setOverrideOpen(false);
+                  // The save is confirmed where the analyst looks (first hour S3).
+                  toast({
+                    tone: 'success',
+                    message: overrideToast(chosen, r.resolvedBy ?? me ?? 'you'),
+                  });
+                  onVerdictApplied?.();
+                })
                 .catch((err: unknown) => {
                   const msg = err instanceof Error ? err.message : 'The override failed. Try again.';
                   setOverrideError(msg);
@@ -1421,7 +1883,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
             className="flex items-center gap-1.5 rounded-control border border-warn bg-[rgba(245,166,35,.12)] px-4 py-2 text-[13px] font-semibold text-warn hover:bg-[rgba(245,166,35,.2)] disabled:opacity-60"
           >
             {overriding ? <Spinner size={13} /> : <Check size={13} />}
-            {overriding ? 'Applying…' : 'Confirm override'}
+            {overriding ? 'Applying' : 'Confirm override'}
           </button>
         </div>
       </div>
@@ -1430,9 +1892,9 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
 
   // analyst-context rail panels (only render when the data is present).
   const alertEl = huntSubject ? (
-    <HuntSubjectPanel subject={huntSubject} />
+    <HuntSubjectPanel subject={huntSubject} promotedOrdinal={inv.promotedFinding?.ordinal} />
   ) : inv.alert ? (
-    <AlertDetailsPanel alert={inv.alert} sev={inv.sev} kind={inv.kind} />
+    <AlertDetailsPanel alert={inv.alert} sev={inv.sev} kind={inv.kind} entities={inv.entities} />
   ) : null;
   // One panel per end of the alert, each named. A run stored before the per-end
   // split has only the pooled list, so its panel says it covers both ends.
@@ -1467,15 +1929,16 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   // Verdict spans full width as the hero. The wide main column carries the
   // analyst's first-class surfaces — the blast-radius graph (collapsed), actions,
   // and the timeline. The right rail holds collapsible reference panels (alert,
-  // host, metadata). Chat is a floating dock (bottom-right), so it costs no
-  // layout space and stays reachable however far you've scrolled.
+  // host, metadata). The chat is the shell's Ask soc-ai panel, opened from
+  // the top bar, so it costs no layout space.
   if (layout === 'page') {
     return (
-      // The reservation at the foot keeps the floating dock off the action
-      // controls at the right edge, the same way the host page does it.
-      <div className={`mx-auto max-w-workstation font-sans text-text ${DOCK_SAFE_AREA_CLASS}`}>
+      <div className="mx-auto max-w-workstation font-sans text-text">
+        {flowEl}
         {toolbarEl}
         {reRunErrorEl}
+        {supersededEl}
+        {promotedFindingEl}
         {failed ? (
           <>
             {failedEl}
@@ -1500,7 +1963,6 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
                 {metaEl}
               </div>
             </div>
-            <ChatDock {...chatProps} />
           </>
         )}
         {overrideModalEl}
@@ -1511,8 +1973,11 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   // ── DRAWER: compact single column ────────────────────────────────────────
   return (
     <div className="font-sans text-text" style={{ padding: '18px 18px 30px' }}>
+      {flowEl}
       {toolbarEl}
       {reRunErrorEl}
+      {supersededEl}
+      {promotedFindingEl}
       {failed ? (
         <>
           {failedEl}
@@ -1523,14 +1988,16 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
         <>
           {running && runningEl}
           {showVerdict && verdictEl}
+          {!huntSubject && inv.alert && (
+            <div data-testid="drawer-alert-details" className="mt-[18px]">
+              <AlertDetailsPanel alert={inv.alert} sev={inv.sev} kind={inv.kind} entities={inv.entities} brief />
+            </div>
+          )}
           {inv.nodes.length > 0 && <div className="mt-[18px]">{entityEl}</div>}
           <div className="mt-[18px]">{inv.actions.length > 0 ? actionsEl : settledActionEl}</div>
           {draftDetectionEl && <div className="mt-[18px]">{draftDetectionEl}</div>}
           <div className="mt-5">{timelineEl}</div>
           {reasoningEl && <div className="mt-5">{reasoningEl}</div>}
-          <div className="mt-5">
-            <ChatPanel {...chatProps} />
-          </div>
         </>
       )}
       {overrideModalEl}
@@ -1538,168 +2005,8 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   );
 }
 
-// Scoped follow-up chat. `fill` makes it stretch to its parent's height (the
-// viewport-tall sticky rail) with an internally-scrolling message list; without
-// it the message list is a fixed 260–460px band (the compact drawer).
-// Rendering (header, bubbles, typing dots, input row) is the shared
-// ChatPanelShell; this wrapper adds the investigation-specific bits — the
-// data-chat-panel scroll target and the chat-proposed-verdict cards.
-function ChatPanel({
-  messages,
-  pending,
-  progressTools,
-  draft,
-  onDraft,
-  onSend,
-  fill,
-  onClose,
-  invId,
-  onResolved,
-  verdict,
-  linkIds,
-}: {
-  messages: ChatMessage[];
-  pending: boolean;
-  progressTools?: string[];
-  draft: string;
-  onDraft: (v: string) => void;
-  onSend: () => void;
-  fill?: boolean;
-  onClose?: () => void;
-  invId: string;
-  onResolved: () => void;
-  verdict?: Inv['verdict'];
-  linkIds?: string[];
-}) {
-  // Apply-verdict feedback, keyed by the proposal's message index: which one is
-  // mid-apply, and a per-message error string so a failed apply surfaces (and
-  // re-enables the button) instead of being silently swallowed.
-  const [applyingIdx, setApplyingIdx] = useState<number | null>(null);
-  const [applyError, setApplyError] = useState<Record<number, string>>({});
-
-  const applyProposal = (idx: number, messageId: number | null | undefined, token: string | undefined) => {
-    if (messageId == null || !token || applyingIdx != null) return;
-    setApplyingIdx(idx);
-    setApplyError((e) => {
-      const { [idx]: _drop, ...rest } = e;
-      return rest;
-    });
-    resolveInvestigation(invId, messageId, token)
-      .then(onResolved)
-      .catch((err: unknown) => {
-        setApplyError((e) => ({
-          ...e,
-          [idx]: err instanceof Error ? err.message : 'soc·ai could not apply the verdict. Try again.',
-        }));
-      })
-      .finally(() => setApplyingIdx(null));
-  };
-
-  return (
-    // wrapper carries the scroll target; h-full in fill mode preserves the
-    // height chain ChatDock relies on (Panel's h-full resolves against it)
-    <div data-chat-panel className={fill ? 'h-full' : undefined}>
-      <ChatPanelShell
-        title="Chat about this investigation"
-        scopeLabel="scoped to this investigation"
-        placeholder="Ask a follow-up. Example: why not a false positive?"
-        emptyHint={
-          <div className="flex flex-col gap-2.5 py-2 text-[12.5px]">
-            <div className="flex items-center gap-1.5 text-faint">
-              <MessageSquare size={13} />
-              No messages yet. Ask a follow-up about this investigation.
-            </div>
-            <div className="flex flex-wrap gap-1.5">
-              {starterQuestions(verdict).map((q) => (
-                <button
-                  key={q}
-                  type="button"
-                  onClick={() => onDraft(q)}
-                  className="rounded-pill border border-border-input bg-surface-3 px-2.5 py-1 text-[12px] text-text-2 hover:border-accent hover:text-text"
-                >
-                  {q}
-                </button>
-              ))}
-            </div>
-          </div>
-        }
-        listSizeClass={fill ? 'min-h-0 flex-1' : 'max-h-[460px] min-h-[260px]'}
-        linkIds={linkIds ?? []}
-        messages={messages}
-        pending={pending}
-        progressTools={progressTools}
-        draft={draft}
-        onDraft={onDraft}
-        onSend={onSend}
-        fill={fill}
-        onClose={onClose}
-        // A verdict card REPLACES its row: the proposal's rationale is the
-        // model's answer restated, so showing the prose too would say it twice.
-        // The Dashboard's hunt card composes ChatDock's AssistantBubble instead
-        // — there the answer and the proposed sweep are different halves of the
-        // reply. Both go through renderSpecial; only this one drops the bubble.
-        renderSpecial={(m, i) =>
-          m.role !== 'user' && m.kind === 'verdict_proposal' && m.proposal ? (
-            <div key={i} className="max-w-[88%] min-w-0 self-start break-words rounded-card border px-3 py-2.5"
-                 style={{ borderColor: 'rgba(75,139,245,.35)', background: 'rgba(75,139,245,.06)' }}>
-              <div className="mb-1 flex items-center gap-2 text-[12px] font-semibold text-text-2">
-                Proposed verdict
-                <VerdictPill verdict={m.proposal.verdict} conf={m.proposal.confidence} />
-              </div>
-              <div className="mb-2 text-[13px] text-text-2">{m.proposal.rationale}</div>
-              {m.validation === 'pass' && !m.applied ? (
-                <>
-                  <button
-                    disabled={applyingIdx === i}
-                    onClick={() => applyProposal(i, m.messageId, m.token)}
-                    className="flex items-center gap-1.5 rounded-[7px] border px-[11px] py-1.5 text-[12.5px] font-semibold text-[#cfe0ff] disabled:opacity-60"
-                    style={{ background: 'rgba(75,139,245,.14)', borderColor: 'rgba(75,139,245,.4)' }}
-                  >
-                    {applyingIdx === i && <Spinner size={12} />}
-                    {applyingIdx === i ? 'Applying…' : 'Apply verdict'}
-                  </button>
-                  {applyError[i] && (
-                    <div className="mt-1.5 text-[11.5px] text-danger">{applyError[i]}</div>
-                  )}
-                </>
-              ) : m.applied ? (
-                <div className="text-[12px] font-semibold text-success">✓ Applied</div>
-              ) : (
-                <div className="text-[12px] text-warn">Not evidence-backed{m.objection ? `. ${m.objection}` : ''}</div>
-              )}
-            </div>
-          ) : null
-        }
-      />
-    </div>
-  );
-}
-
-type ChatPanelProps = Parameters<typeof ChatPanel>[0];
-
-/** Starter questions that fit the verdict. "Why not a false positive?" on a
- *  false positive verdict asks the chat to argue against itself (P16). */
-export function starterQuestions(verdict: Inv['verdict'] | undefined): string[] {
-  const first =
-    verdict === 'false_positive'
-      ? 'Why not a true positive?'
-      : verdict === 'true_positive'
-        ? 'Why not a false positive?'
-        : 'What evidence would settle this verdict?';
-  return [first, 'What evidence supports this verdict?', 'What should I check next?'];
-}
-
-// Floating chat: a launcher pinned bottom-right of the viewport that opens the
-// scoped chat as a docked panel. Costs no layout space and stays reachable no
-// matter how far you've scrolled the evidence.
-function ChatDock(props: Omit<ChatPanelProps, 'fill' | 'onClose'>) {
-  const msgCount = props.messages.length;
-  return (
-    <ChatDockShell label={msgCount > 0 ? `Chat · ${msgCount}` : 'Chat about this'}>
-      {(close) => <ChatPanel {...props} fill onClose={close} />}
-    </ChatDockShell>
-  );
-}
+/** Starter questions that fit the verdict. The Ask soc-ai panel owns them. */
+export const starterQuestions = investigationStarters;
 
 // ── analyst-context rail panels (page layout) ──────────────────────────────
 
@@ -1712,7 +2019,16 @@ function ChatDock(props: Omit<ChatPanelProps, 'fill' | 'onClose'>) {
  * hunt started from. The panel states all four, and every one of them is a
  * link or a count the analyst can check.
  */
-function HuntSubjectPanel({ subject }: { subject: InvestigationSubject }) {
+function HuntSubjectPanel({
+  subject,
+  promotedOrdinal,
+}: {
+  subject: InvestigationSubject;
+  /** The finding the analyst promoted. Its objective is the raw prompt of the
+   *  hunt, so it folds behind "Show objective". */
+  promotedOrdinal?: number;
+}) {
+  const [objectiveOpen, setObjectiveOpen] = useState(promotedOrdinal == null);
   const findings = subject.finding_ordinals.map((ordinal, i) => {
     // The title is what an analyst reads. A backend that sends the ordinals
     // alone still says which findings were read, and a made-up title would be
@@ -1733,15 +2049,27 @@ function HuntSubjectPanel({ subject }: { subject: InvestigationSubject }) {
     >
       <div data-testid="investigation-subject" className="flex flex-col">
         <div className="border-b border-border-faint px-[15px] py-[9px]">
-          <div className="text-[10.5px] font-semibold uppercase tracking-[.05em] text-faint">
+          <div className="flex items-center gap-2 text-[10.5px] font-semibold uppercase tracking-[.05em] text-faint">
             objective
+            {promotedOrdinal != null && (
+              <button
+                data-testid="show-objective"
+                onClick={() => setObjectiveOpen((o) => !o)}
+                aria-expanded={objectiveOpen}
+                className="font-sans normal-case tracking-normal text-accent hover:underline"
+              >
+                {objectiveOpen ? 'Hide objective' : 'Show objective'}
+              </button>
+            )}
           </div>
-          <div
-            className="mt-1 text-[12.5px] leading-[1.5] text-text-2"
-            title={SUBJECT_OBJECTIVE}
-          >
-            {subject.objective}
-          </div>
+          {objectiveOpen && (
+            <div
+              className="mt-1 text-[12.5px] leading-[1.5] text-text-2"
+              title={SUBJECT_OBJECTIVE}
+            >
+              {subject.objective}
+            </div>
+          )}
         </div>
         <div className="border-b border-border-faint px-[15px] py-[9px]">
           <div className="text-[10.5px] font-semibold uppercase tracking-[.05em] text-faint">
@@ -1753,7 +2081,17 @@ function HuntSubjectPanel({ subject }: { subject: InvestigationSubject }) {
             className="mt-1 flex flex-col gap-1 text-[12.5px] leading-[1.5] text-text-2"
           >
             {findings.map((f) => (
-              <li key={f.ordinal}>{f.label}</li>
+              <li key={f.ordinal}>
+                {f.label}
+                {f.ordinal === promotedOrdinal && (
+                  <span
+                    data-testid="subject-promoted"
+                    className="ml-1.5 rounded-badge border border-border-input px-1.5 py-px text-[10.5px] font-semibold text-accent"
+                  >
+                    promoted
+                  </span>
+                )}
+              </li>
             ))}
           </ul>
         </div>
@@ -1783,8 +2121,41 @@ function HuntSubjectPanel({ subject }: { subject: InvestigationSubject }) {
   );
 }
 
-function AlertDetailsPanel({ alert, sev, kind }: { alert: AlertMeta; sev?: Severity; kind: DetectionKind }) {
+/** "192.0.2.1:443" splits into the address and the port. The address is the
+ *  entity. Any other shape stays whole. */
+export function splitEndpoint(value: string): { addr: string; port: string | null } {
+  const m = value.match(/^(\d{1,3}(?:\.\d{1,3}){3}):(\d+)$/);
+  return m ? { addr: m[1], port: m[2] } : { addr: value, port: null };
+}
+
+/** One end of the alert in Alert details: the address as a link, the port as text. */
+function EndpointValue({ value, entities }: { value: string; entities?: EntityRef[] }) {
+  const { addr, port } = splitEndpoint(value);
+  return (
+    <>
+      <EndLink inv={{ entities }} value={addr} />
+      {port && <span className="text-faint">:{port}</span>}
+    </>
+  );
+}
+
+function AlertDetailsPanel({
+  alert,
+  sev,
+  kind,
+  entities,
+  brief = false,
+}: {
+  alert: AlertMeta;
+  sev?: Severity;
+  kind: DetectionKind;
+  entities?: EntityRef[];
+  /** The drawer form: four lines, rule, source, destination and user, with
+   *  the other fields behind a toggle (dogfood 2026-10-06, first hour W4). */
+  brief?: boolean;
+}) {
   const [copied, setCopied] = useState(false);
+  const [allFields, setAllFields] = useState(!brief);
 
   const copyId = () => {
     if (!alert.id) return;
@@ -1799,8 +2170,10 @@ function AlertDetailsPanel({ alert, sev, kind }: { alert: AlertMeta; sev?: Sever
     ['sid', alert.sid],
     ['classtype', alert.classtype],
     ['category', alert.category],
-    ['source', <span className="text-mono-amber">{alert.src}</span>],
-    ['dest', <span className="text-mono-green">{alert.dst}</span>],
+    ['source', <span className="text-mono-amber"><EndpointValue value={alert.src} entities={entities} /></span>],
+    ['dest', <span className="text-mono-green"><EndpointValue value={alert.dst} entities={entities} /></span>],
+    ['user', alert.user ? <EntityLink value={alert.user} type="user" /> : null],
+    ['host', alert.host ? <EndLink inv={{ entities }} value={alert.host} /> : null],
     ['proto', alert.proto],
     ['action', alert.action],
     ['alert time', <span title={alert.time ?? undefined}>{absTime(alert.time)}</span>],
@@ -1819,7 +2192,7 @@ function AlertDetailsPanel({ alert, sev, kind }: { alert: AlertMeta; sev?: Sever
       summary={alert.rule}
     >
       <div className="flex flex-col">
-        {alert.id && (
+        {alert.id && allFields && (
           <div className="flex gap-3 border-b border-border-faint px-[15px] py-[7px] text-[12px]">
             <div className="w-[72px] flex-none text-faint">alert id</div>
             <div className="flex min-w-0 flex-1 items-center gap-1.5">
@@ -1837,13 +2210,30 @@ function AlertDetailsPanel({ alert, sev, kind }: { alert: AlertMeta; sev?: Sever
             </div>
           </div>
         )}
-        {rows.map(([k, val]) =>
-          val == null ? null : (
-            <div key={k} className="flex gap-3 border-b border-border-faint px-[15px] py-[7px] text-[12px] last:border-0">
-              <div className="w-[72px] flex-none text-faint">{k}</div>
-              <div className="min-w-0 flex-1 break-words font-mono text-text-2">{val}</div>
-            </div>
-          )
+        {rows
+          .filter(([k]) => allFields || BRIEF_ROWS.has(k))
+          .map(([k, val]) =>
+            val == null ? (
+              brief && !allFields && k === 'user' ? (
+                <div key={k} className="flex gap-3 border-b border-border-faint px-[15px] py-[7px] text-[12px]">
+                  <div className="w-[72px] flex-none text-faint">{k}</div>
+                  <div className="min-w-0 flex-1 text-faint">The alert names no user.</div>
+                </div>
+              ) : null
+            ) : (
+              <div key={k} className="flex gap-3 border-b border-border-faint px-[15px] py-[7px] text-[12px] last:border-0">
+                <div className="w-[72px] flex-none text-faint">{k}</div>
+                <div className="min-w-0 flex-1 break-words font-mono text-text-2">{val}</div>
+              </div>
+            )
+          )}
+        {brief && (
+          <button
+            onClick={() => setAllFields((o) => !o)}
+            className="px-[15px] py-[7px] text-left text-[12px] font-semibold text-accent hover:underline"
+          >
+            {allFields ? 'Show four fields' : 'Show all fields'}
+          </button>
         )}
       </div>
     </CollapsiblePanel>
@@ -1870,7 +2260,11 @@ function HostContextPanel({
       right={
         <div className="flex items-center gap-1.5 text-[11px]">
           {role ? <span className="text-faint">{role}</span> : null}
-          <span className="font-mono text-mono-amber">{host}</span>
+          {host === 'Both ends' ? (
+            <span className="font-mono text-mono-amber">{host}</span>
+          ) : (
+            <span className="font-mono text-mono-amber"><EntityLink value={host} stopPropagation className="font-[inherit] text-[inherit]" /></span>
+          )}
         </div>
       }
       summary={summary}
@@ -1886,7 +2280,7 @@ function HostContextPanel({
               <div key={i}>
                 <div className="flex items-center gap-2 text-[12px]">
                   <span className="font-mono text-faint">{s.time}</span>
-                  <span className="min-w-0 flex-1 truncate text-text-2" title={s.label}>{s.label}</span>
+                  <span className="min-w-0 flex-1 break-words text-text-2" title={s.label}>{s.label}</span>
                   <span className="flex-none font-mono text-[10.5px]" style={{ color: SEV_COLOR[s.tone] }}>{s.sev}</span>
                 </div>
                 <div className="mt-1 h-1 overflow-hidden rounded-full bg-surface-3">
@@ -2065,8 +2459,23 @@ function InvMetaPanel({ meta, id, toolCalls }: { meta: InvMeta; id: string; tool
       <div className="flex flex-col">
         {rows.map(([k, val]) => (
           <div key={k} className="flex gap-3 border-b border-border-faint px-[15px] py-[7px] text-[12px] last:border-0">
-            <div className="w-[72px] flex-none text-faint">{k}</div>
-            <div className="min-w-0 flex-1 break-words font-mono text-text-2">{val}</div>
+            {k === 'oracle' ? (
+              <div
+                data-testid="oracle-term"
+                title={ORACLE_TIP}
+                className="w-[72px] flex-none cursor-help text-faint underline decoration-dotted"
+              >
+                {k}
+              </div>
+            ) : (
+              <div className="w-[72px] flex-none text-faint">{k}</div>
+            )}
+            <div
+              data-testid={k === 'oracle' ? 'oracle-line' : undefined}
+              className={`min-w-0 flex-1 break-words text-text-2 ${k === 'oracle' ? '' : 'font-mono'}`}
+            >
+              {val}
+            </div>
           </div>
         ))}
       </div>
@@ -2113,7 +2522,7 @@ function CollapsiblePanel({
             )}
           </div>
           {!open && summary != null && (
-            <div className="mt-1 truncate text-[12px] leading-[1.5] text-dim">{summary}</div>
+            <div className="mt-1 break-words text-[12px] leading-[1.5] text-dim">{summary}</div>
           )}
         </div>
         <span className="flex pt-0.5 text-ghost transition-transform" style={{ transform: open ? 'rotate(180deg)' : 'rotate(0deg)' }}>
@@ -2164,10 +2573,12 @@ function Summary({
   segments,
   onCite,
   ids = [],
+  entities,
 }: {
   segments: SummarySegment[];
   onCite: (n: number) => void;
   ids?: string[];
+  entities?: EntityRef[];
 }) {
   return (
     <>
@@ -2175,7 +2586,7 @@ function Summary({
         if (seg.t === 'text')
           return (
             <span key={i}>
-              <CitedText text={seg.v} ids={ids} />
+              <CitedText text={seg.v} ids={ids} entities={entities} />
             </span>
           );
         if (seg.t === 'mono')
@@ -2208,136 +2619,12 @@ function Summary({
   );
 }
 
-function ActionCard({
-  action,
-  decision,
-  message,
-  executedBy,
-  onApprove,
-  onReject,
-  disabledReason,
-}: {
-  action: RecommendedAction;
-  decision?: 'approved' | 'rejected' | 'executing' | 'failed';
-  message?: string;
-  /** current username, for the just-executed attribution line. */
-  executedBy?: string;
-  onApprove: () => void;
-  onReject: () => void;
-  /** set when this action has no SO target to act on (a promoted hunt
-   * finding) — renders the Approve button disabled with this as the
-   * explanatory title, instead of letting the click reach a 400. Reject is
-   * NOT gated by this: it only sets local state, never an SO write. */
-  disabledReason?: string;
-}) {
-  const Icon = ACTION_ICON[action.tag];
-  const tagStyle = ACTION_TAG_COLOR[action.tag];
-  // The system already carried this out (e.g. auto-ack). Render it done — never
-  // offer the analyst an Approve/Execute button for an already-applied action.
-  const applied = action.applied === true && !decision;
-  const eff = applied ? 'approved' : decision;
-  const base =
-    eff === 'rejected'
-      ? { border: '#2a3645', bg: '#0c0f15' }
-      : eff === 'failed'
-        ? { border: 'rgba(240,68,56,.35)', bg: 'rgba(240,68,56,.05)' }
-        : eff === 'approved'
-          ? { border: 'rgba(63,185,80,.32)', bg: 'rgba(63,185,80,.05)' }
-          : { border: '#1c232e', bg: '#0b0e13' };
-  const opacity = eff === 'rejected' ? 0.6 : 1;
-  // 'failed' returns to the button row so the analyst can retry; 'executing'
-  // shows an in-flight state; an applied/approved/rejected action is terminal.
-  const showButtons = !applied && (!decision || decision === 'failed');
-
-  return (
-    <div
-      className="rounded-panel border p-[14px_15px] transition-opacity"
-      style={{ borderColor: base.border, background: base.bg, opacity }}
-    >
-      <div className="flex items-start gap-[11px]">
-        <span className="mt-px flex" style={{ color: ACTION_ICON_COLOR[action.tag] }}>
-          <Icon size={16} />
-        </span>
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2">
-            <span className="text-[14px] font-semibold">{action.title}</span>
-            <span
-              className="rounded-chip px-1.5 py-[1.5px] font-mono text-[10px] uppercase"
-              style={{ color: tagStyle.color, background: tagStyle.bg }}
-            >
-              {action.tag}
-            </span>
-          </div>
-          <div className="mt-1 text-[12.5px] leading-[1.5] text-dim">{action.rationale}</div>
-        </div>
-      </div>
-
-      {decision === 'failed' && message && (
-        <div className="mt-[10px] pl-[31px] font-mono text-[11.5px] leading-[1.5] text-danger">
-          {message}
-        </div>
-      )}
-
-      {showButtons ? (
-        <>
-          {action.pendingNote && (
-            <div className="mt-[10px] pl-[31px] text-[12px] leading-[1.5] text-faint">
-              {action.pendingNote}
-            </div>
-          )}
-          <div className="mt-[13px] flex gap-[9px] pl-[31px]">
-          <button
-            onClick={onApprove}
-            disabled={!!disabledReason}
-            title={disabledReason}
-            className="flex items-center gap-1.5 rounded-control border border-success-btn-border bg-success-btn px-4 py-2 text-[13px] font-semibold text-[#eafff2] hover:bg-[#22824c] disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-success-btn"
-          >
-            <Check size={15} /> {decision === 'failed' ? 'Retry' : action.token ? 'Approve' : 'Execute'}
-          </button>
-          {!action.token && decision === 'failed' ? null : (
-            <button
-              onClick={onReject}
-              className="flex items-center gap-1.5 rounded-control border border-border-strong bg-surface-3 px-4 py-2 text-[13px] font-semibold text-text-2 hover:border-danger hover:text-danger disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:border-border-strong disabled:hover:text-text-2"
-            >
-              <X size={15} /> {action.token ? 'Reject' : 'Dismiss'}
-            </button>
-          )}
-          </div>
-        </>
-      ) : decision === 'executing' ? (
-        <div
-          className="mt-[11px] flex items-center gap-2 pl-[31px] text-[12.5px] font-semibold"
-          style={{ color: '#d29922' }}
-        >
-          <Loader2 size={14} className="animate-spin" /> Writing to Security Onion…
-        </div>
-      ) : (
-        <div className="mt-[11px] pl-[31px]">
-          <div
-            className="flex items-center gap-2 text-[12.5px] font-semibold"
-            style={{ color: eff === 'approved' ? '#3fb950' : '#f04438' }}
-          >
-            {applied
-              ? `✓ ${action.appliedNote ?? 'Auto-acknowledged'}`
-              : eff === 'approved'
-                ? '✓ Executed'
-                : '✕ Rejected'}{' '}
-            {/* appliedNote carries its own attribution ("Executed · analyst",
-                "Already acknowledged") — only the auto-ack default needs the
-                system suffix. */}
-            {(!applied || !action.appliedNote) && (
-              <span className="font-mono text-[11px] font-normal text-faint">
-                {applied ? '· system · automatic' : `· ${executedBy ?? 'you'} · now`}
-              </span>
-            )}
-          </div>
-          {eff === 'approved' && message && (
-            <div className="mt-1 text-[12px] leading-[1.5] text-dim">{message}</div>
-          )}
-        </div>
-      )}
-    </div>
-  );
+/** A tool call that failed: "Event search: failed: unknown or forbidden
+ *  field ...". Returns the tool noun, or null for any other step. */
+export function failedToolStep(step: Pick<TimelineStep, 'group' | 'title'>): { tool: string } | null {
+  if (step.group !== 'Tool calls') return null;
+  const m = step.title.match(/^(.+?): failed(?::|$)/);
+  return m ? { tool: m[1] } : null;
 }
 
 function TimelineRow({
@@ -2355,6 +2642,7 @@ function TimelineRow({
 }) {
   const color = TIMELINE_GROUP_COLOR[step.group];
   const Icon = STEP_ICON[step.group] ?? GitBranch;
+  const failedCheck = failedToolStep(step);
   return (
     <button
       id={`tl-${step.id}`}
@@ -2373,18 +2661,34 @@ function TimelineRow({
       </div>
       <div className="min-w-0 flex-1 pt-[3px]">
         <div className="flex items-center gap-[9px]">
-          <span className="text-[10px] font-semibold uppercase tracking-[.05em]" style={{ color }}>
-            {step.group}
+          <span data-testid="timeline-group" className="text-[10px] font-semibold uppercase tracking-[.05em]" style={{ color }}>
+            {TIMELINE_GROUP_LABEL[step.group] ?? step.group}
           </span>
           <div className="flex-1" />
           <span className="font-mono text-[11px] text-faint">{step.time}</span>
         </div>
-        <div className="mt-[3px] text-[13.5px] font-medium" style={{ textWrap: 'pretty' }}>
-          {step.title}
-        </div>
+        {failedCheck ? (
+          // A failed query folds (dogfood 2026-10-06, W4). The raw tool
+          // error read as a fault of the run. soc·ai went on without it.
+          <>
+            <div data-testid="failed-check" className="mt-[3px] text-[13.5px] font-medium text-text-2">
+              A follow-up check could not run
+            </div>
+            <div className="mt-0.5 text-[12px] text-dim">
+              {failedCheck.tool}. soc·ai went on with the other checks.{' '}
+              <span className="text-faint underline decoration-dotted">
+                {open ? 'Hide the error' : 'Show the error'}
+              </span>
+            </div>
+          </>
+        ) : (
+          <div className="mt-[3px] text-[13.5px] font-medium" style={{ textWrap: 'pretty' }}>
+            {step.title}
+          </div>
+        )}
         {open && (
           <pre className="mt-[9px] animate-fadeUp-slow whitespace-pre-wrap rounded-control border border-border bg-bg px-3 py-2.5 font-mono text-[11.5px] leading-[1.6] text-dim">
-            {step.detail}
+            {failedCheck ? `${step.title}\n${step.detail}` : step.detail}
           </pre>
         )}
       </div>

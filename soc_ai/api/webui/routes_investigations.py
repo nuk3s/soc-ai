@@ -16,7 +16,7 @@ from sqlalchemy import select
 
 from soc_ai.api.deps import get_elastic, get_settings_dep
 from soc_ai.api.security import identify_caller
-from soc_ai.api.webui import _timeline, routes_hunts
+from soc_ai.api.webui import _timeline, routes_entity, routes_hunts
 from soc_ai.api.webui._errors import api_error
 from soc_ai.api.webui._shared import (
     _ago,
@@ -29,6 +29,7 @@ from soc_ai.api.webui._shared import (
 from soc_ai.api.webui._timeline import (
     InvestigationOut,
     InvMetaOut,
+    SupersededRunOut,
     _alert_meta,
     _build_actions,
     _build_oracle,
@@ -40,6 +41,7 @@ from soc_ai.api.webui._timeline import (
 )
 from soc_ai.api.webui.routes_alerts import _es_api_error_http, _grid_unavailable
 from soc_ai.config import Settings
+from soc_ai.hunting.step_words import current_activity
 from soc_ai.secret_scrub import scrub_secrets, scrub_value
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.store import chat as chat_svc
@@ -156,6 +158,10 @@ class InvestigationRowOut(BaseModel):
     # Destination IP — paired with ``host`` (the source) so the list shows the
     # full source → destination flow, not just one end.
     dst: str | None = None
+    # The machine the alert fired on (migration 0039). A host-log alert has no
+    # destination, so the list names the machine and says "host log" in place
+    # of an address and a dash. None on a legacy row.
+    hostName: str | None = None
     status: str
     when: str
     ts: str = ""
@@ -202,6 +208,10 @@ class InvestigationRowOut(BaseModel):
     # The budget class the run ran in (migration 0058). None on a run stored
     # before the classes existed, and on a run still in flight.
     runClass: str | None = None
+    # Who started the run: an analyst's name, the scheduler, a sweep, or
+    # "backtest" for a backtest replay. The console marks a replay with a chip,
+    # because a replay is a measurement and the list is the live work.
+    ranBy: str = ""
 
 
 def _elapsed_sec(inv: Investigation) -> int:
@@ -252,7 +262,7 @@ def _row(
     )
     return InvestigationRowOut(
         id=inv.id,
-        name=inv.rule_name or f"Alert {(inv.alert_es_id or inv.id)[:12]}…",
+        name=inv.rule_name or f"Alert {inv.alert_es_id or inv.id}",
         # Persisted since migration 0031. Legacy rows were backfilled
         # kind='suricata' regardless of their feed doc's real kind. The list
         # route corrects them from the stored alert context before this runs
@@ -263,6 +273,7 @@ def _row(
         conf=inv.confidence,
         host=inv.src_ip or "—",
         dst=inv.dest_ip,
+        hostName=inv.host_name,
         status=_row_status(inv),
         when=_ago(_iso_utc(inv.created_at)),
         # tz-AWARE ISO so the browser localizes correctly (naive → parsed as local).
@@ -282,6 +293,7 @@ def _row(
         ),
         isSynthEval=bool(inv.is_synth_eval),
         runClass=_run_class_of(inv),
+        ranBy=inv.started_by or "",
     )
 
 
@@ -435,6 +447,13 @@ class InvestigationListOut(BaseModel):
     # is a fact about an alert's whole run group rather than a column. A count
     # that silently stops being a count is the failure this flag exists for.
     partial: bool = False
+    # The backtest replays the other filters match. With ``include_backtest``
+    # off (the default) the rows and the figures above leave them out, and
+    # this is the count the console names beside them. With it on, the rows
+    # and the figures include them, and this says how many of them are replays.
+    backtestReplays: int = 0
+    # Echo of the request: whether the rows and the figures include replays.
+    includesBacktest: bool = False
 
 
 @router.get("/investigations", response_model=InvestigationListOut)
@@ -448,6 +467,7 @@ async def list_investigations(
     error_state: str | None = None,
     limit: int = 100,
     offset: int = 0,
+    include_backtest: bool = False,
 ) -> InvestigationListOut:
     """Investigation rows, newest first — filtered, counted and paged in SQL.
 
@@ -473,6 +493,11 @@ async def list_investigations(
     alert's whole run group rather than a column, so it is decided in Python
     over one capped read and the response says when the set outgrew that cap.
     An unknown value is refused with 422, like an unknown ``verdict`` member.
+
+    ``include_backtest`` puts the backtest replays into the rows and the
+    figures. Off by default: a replay is a measurement on an alert an analyst
+    already closed, and the list and the Dashboard count live work. Each row
+    carries ``ranBy``, so the console can mark a replay when it shows one.
     """
     statuses = _csv_filter("status", status, inv_svc.DISPLAY_STATUSES)
     verdicts = _csv_filter("verdict", verdict, _VERDICT_FILTERS)
@@ -508,6 +533,7 @@ async def list_investigations(
             q=needle or None,
             limit=read_limit,
             offset=read_offset,
+            include_backtest=include_backtest,
         )
         # A row stored with the old "suricata" default shows the type its alert
         # document names (RL5). Corrected once, in place.
@@ -550,6 +576,8 @@ async def list_investigations(
             active=page.active,
             limit=limit,
             offset=offset,
+            backtestReplays=page.backtest_replays,
+            includesBacktest=include_backtest,
         )
     kept = [r for r in rows if _needs_retry(r) == (wanted_state == "live")]
     return InvestigationListOut(
@@ -565,6 +593,10 @@ async def list_investigations(
         limit=limit,
         offset=offset,
         partial=page.total > len(page.rows),
+        # Counted over the partition like the figures above. With replays
+        # left out, the partition holds none.
+        backtestReplays=sum(1 for r in kept if inv_svc.is_backtest_actor(r.ranBy)),
+        includesBacktest=include_backtest,
     )
 
 
@@ -590,6 +622,16 @@ async def get_investigation(
         chat = await chat_svc.list_messages(db, inv.id)
         group_id = inv_svc.alert_group_id(inv)
         group_runs = await inv_svc.runs_for_alerts(db, [group_id]) if group_id else []
+        # The newer run that replaced this one, read whole: the page names its
+        # verdict in a banner, so a bookmarked older run never reads as the
+        # current answer (dogfood 2026-10-06, investigation S1).
+        superseded_by = _superseded_by(inv, group_runs)
+        newer = await db.get(Investigation, superseded_by) if superseded_by else None
+        typical = (
+            routes_hunts._typical_run(await _recent_run_seconds(db))
+            if inv.status == "running"
+            else None
+        )
         # Promotion provenance: hunt_id has no FK (the referenced hunt may be
         # deleted — see the Investigation model note), so this must degrade
         # gracefully rather than 404/500 when the row is gone.
@@ -604,8 +646,18 @@ async def get_investigation(
     # Live acked state so an ack performed OUTSIDE this run (group-ack, another
     # run's auto-ack, the SO web UI) marks the ack action applied. False on any
     # ES error — the action is simply offered as before.
-    alert_acked = await _timeline._alert_currently_acked(elastic, settings, inv.alert_es_id)
-    actions = _build_actions(events, report, alert_acked=alert_acked)
+    ack_state = await _timeline._alert_ack_state(elastic, settings, inv.alert_es_id)
+    alert_acked = ack_state is True
+    actions = _build_actions(
+        events,
+        report,
+        alert_acked=alert_acked,
+        # The grid answered and the alert is not acknowledged: an ack the
+        # record calls done reads as pending, so the card and the grid agree.
+        alert_unacked=ack_state is False,
+        ran_at=_iso_utc(inv.finished_at or inv.created_at) or None,
+        replay=inv_svc.is_backtest(inv),
+    )
 
     # The enriched-alert-context event carries the alert, the host's alert
     # profile, and indicator enrichments — everything the rail + graph need.
@@ -636,9 +688,20 @@ async def get_investigation(
     src_addr = _str_or_none(alert_obj.get("source_ip")) or _str_or_none(inv.src_ip)
     dst_addr = _str_or_none(alert_obj.get("destination_ip")) or _str_or_none(inv.dest_ip)
     reporter = _str_or_none(alert_obj.get("host_name"))
+    # Each host, address, user and domain the run names, with the page that
+    # answers for it. The page renders each one as a link.
+    async with request.app.state.db_sessionmaker() as db:
+        entities = await routes_entity.investigation_entities(
+            db,
+            settings,
+            src=src_addr,
+            dst=dst_addr,
+            reporter=reporter or _str_or_none(inv.host_name),
+            subject=_subject_out(inv, hunt),
+        )
     meta = InvMetaOut(
         model=settings.analyst_model,
-        oracle="escalated to Oracle" if has_oracle else "not escalated, local verdict",
+        oracle=_oracle_line(settings, inv, has_oracle),
         ranBy=inv.started_by or "—",
         # tz-AWARE ISO (with +00:00) so the value is unambiguous UTC — the raw
         # naive string had no offset, so it couldn't be localized/interpreted.
@@ -649,7 +712,7 @@ async def get_investigation(
     return InvestigationOut(
         id=inv.id,
         groupId=inv.alert_es_id or inv.id,
-        name=inv.rule_name or f"Alert {(getattr(inv, 'alert_es_id', None) or inv.id)[:12]}…",
+        name=inv.rule_name or f"Alert {getattr(inv, 'alert_es_id', None) or inv.id}",
         kind=inv.kind,
         host=src_addr or "—",
         ip=dst_addr or "—",
@@ -703,12 +766,17 @@ async def get_investigation(
         errorDismissed=inv.error_dismissed_at is not None,
         subject=_subject_out(inv, hunt),
         huntId=inv.hunt_id,
-        huntObjective=(hunt.objective[:160] if hunt else None),
+        huntObjective=(hunt.objective if hunt else None),
+        promotedFinding=_with_evidence(routes_hunts.promoted_finding_out(inv, hunt), inv, hunt),
         alertAcked=alert_acked,
         isSynthEval=bool(inv.is_synth_eval),
-        supersededBy=_superseded_by(inv, group_runs),
+        supersededBy=superseded_by,
+        supersededRun=_superseded_run_out(newer),
+        currentStep=current_activity(events) if inv.status == "running" else None,
+        typicalRun=typical.model_dump() if typical is not None else None,
         runClass=_run_class_of(inv),
         runClassReason=_str_or_none(report.get("run_class_reason")),
+        entities=entities,
     )
 
 
@@ -726,6 +794,86 @@ def _run_class_of(inv: Investigation) -> str | None:
         return inv.run_class
     report = inv.report if isinstance(inv.report, dict) else {}
     return _str_or_none(report.get("run_class"))
+
+
+def _str_list(value: Any) -> list[str]:
+    return [str(v) for v in value if isinstance(v, str | int)] if isinstance(value, list) else []
+
+
+def _with_evidence(
+    finding: dict[str, Any] | None, inv: Investigation, hunt: Hunt | None
+) -> dict[str, Any] | None:
+    """The promoted finding with its detail and its cited documents.
+
+    The page shows the finding's evidence first (dogfood 2026-10-06, hunting
+    C4). The finding stores both, so they are read from the same report.
+    """
+    if finding is None or hunt is None:
+        return finding
+    findings = routes_hunts._hunt_report(hunt).get("findings") or []
+    ordinal = finding.get("ordinal")
+    f = findings[ordinal] if isinstance(ordinal, int) and 0 <= ordinal < len(findings) else None
+    if not isinstance(f, dict):
+        return finding
+    return {
+        **finding,
+        "detail": str(f.get("detail") or ""),
+        "citations": _str_list(f.get("citations")),
+    }
+
+
+async def _recent_run_seconds(db: Any, *, limit: int = 20) -> list[float]:
+    """The wall time of the newest finished investigations, in seconds."""
+    rows = (
+        await db.execute(
+            select(Investigation.created_at, Investigation.finished_at)
+            .where(
+                Investigation.status == "complete",
+                Investigation.finished_at.is_not(None),
+            )
+            .order_by(Investigation.finished_at.desc())
+            .limit(limit)
+        )
+    ).all()
+    return [
+        (finished - created).total_seconds()
+        for created, finished in rows
+        if created is not None and finished is not None
+    ]
+
+
+def _oracle_line(settings: Settings, inv: Investigation, has_oracle: bool) -> str:
+    """One sentence on the Oracle review of this verdict.
+
+    Every row read "not escalated, local verdict", on a deployment where the
+    Oracle was off, with no word on what the Oracle is (dogfood 2026-10-06,
+    O1). The line now says why no review ran, or that the Oracle is off.
+    """
+    if has_oracle:
+        return "Oracle review: done. The Oracle card shows its answer."
+    if not settings.oracle_enabled:
+        return "The Oracle is off on this deployment. No verdict goes to a review."
+    conf = inv.confidence
+    band = settings.oracle_escalate_below_confidence
+    if inv.status != "complete" or conf is None:
+        return "Oracle review: none. The run has no verdict to review."
+    if conf >= band:
+        return f"Oracle review: not needed. Confidence {conf:.2f} is above the review band."
+    return f"Oracle review: not run. Confidence {conf:.2f} is under {band:.2f}."
+
+
+def _superseded_run_out(newer: Investigation | None) -> SupersededRunOut | None:
+    """What the newer run reached: its status, and its verdict once it has one."""
+    if newer is None:
+        return None
+    status = _row_status(newer)
+    complete = status == "complete" and bool(newer.verdict)
+    return SupersededRunOut(
+        id=newer.id,
+        status=status,
+        verdict=_verdict(newer.verdict) if complete else None,
+        conf=newer.confidence if complete else None,
+    )
 
 
 def _superseded_by(inv: Investigation, group_runs: Sequence[inv_svc.RunRef]) -> str | None:

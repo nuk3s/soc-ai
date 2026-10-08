@@ -47,23 +47,24 @@ class _Builtin:
     required_datasets: tuple[str, ...]
 
 
-# The seven builtin templates. `objective_template` text is VERBATIM from the
-# frontend PRESETS (frontend/src/screens/Hunts.tsx) so the picker is a superset of
-# the old static pills — same objectives, now availability-annotated. Each names
-# the `event.dataset` values it correlates over; a grid missing one flags the
-# template rather than hiding it (honesty over hiding). Four objectives also name
-# the analytics tools (t_beacon_profile / t_dns_entropy_scan / t_first_seen /
-# t_dcerpc_histogram) the hunt agent should reach for — the objective text is the
-# agent's prompt, so naming the tool there is how a template steers tool choice.
+# The seven builtin templates. Each names the `event.dataset` values it
+# correlates over; a grid missing one flags the template rather than hiding it
+# (honesty over hiding).
+#
+# The objective is the analyst's text: the chip fills the box with it, and the
+# hunt page shows it. It names no tool. Four objectives named the analytics
+# tools the agent should reach for, and the analyst read "Use t_beacon_profile"
+# in the box (dogfood 2026-10-06). The tools now ride in BUILTIN_TOOL_HINTS,
+# which the start route adds to the agent's prompt when the hunt starts from
+# the builtin, so the steer stays.
 _BUILTINS: tuple[_Builtin, ...] = (
     _Builtin(
         name="Beaconing to rare IPs",
         objective_template=(
             "Hunt for internal hosts that beacon to rare external IP addresses in "
-            "the last 24 h. Look for a regular cadence, a low data volume and novel "
-            "destinations. Use t_beacon_profile to measure the cadence. Use "
-            "t_first_seen to find the novel destinations. Reach a conclusion after "
-            "both tools run."
+            "the last 24 h. Look for a regular cadence, a low data volume and new "
+            "destinations. Measure the cadence of each candidate, and find the "
+            "destinations that are new to the host."
         ),
         required_datasets=("zeek.conn|network_traffic.flow|endpoint.events.network",),
     ),
@@ -95,9 +96,8 @@ _BUILTINS: tuple[_Builtin, ...] = (
         name="DNS / C2 exfiltration",
         objective_template=(
             "Hunt for DNS tunneling and C2 exfiltration. Look for high-entropy DNS, "
-            "high-volume DNS, long TXT records and beacons over DNS. Use "
-            "t_dns_entropy_scan to measure the qname entropy and the volume. Reach "
-            "a conclusion after the tool runs."
+            "high-volume DNS, long TXT records and beacons over DNS. Measure the "
+            "entropy of the queried names and the query volume of each host."
         ),
         required_datasets=("zeek.dns|network_traffic.dns",),
     ),
@@ -105,10 +105,9 @@ _BUILTINS: tuple[_Builtin, ...] = (
         name="New external services",
         objective_template=(
             "Hunt for internal hosts that expose or reach a new external service "
-            "this week. The host must never have used that service before. Use "
-            "t_first_seen to compare the recent destinations against its trailing "
-            "baseline. The behavioural profile on the host page holds the same peer "
-            "set. A destination absent from that peer set is the signal."
+            "this week. The host must never have used that service before. Compare "
+            "the recent destinations of each host with its baseline of 30 days. A "
+            "destination that is not in the host's peer set is the signal."
         ),
         required_datasets=("zeek.conn|network_traffic.flow|endpoint.events.network",),
     ),
@@ -131,12 +130,40 @@ _BUILTINS: tuple[_Builtin, ...] = (
         objective_template=(
             "Hunt for domain-controller attack patterns in DCE-RPC. Look for "
             "Zerologon-style NetrServerAuthenticate floods, DCSync through "
-            "DRSGetNCChanges, and remote service creation. Run t_dcerpc_histogram "
-            "first. Investigate every flagged or rare dangerous operation."
+            "DRSGetNCChanges, and remote service creation. Count the DCE-RPC "
+            "operations first. Investigate every flagged or rare dangerous operation."
         ),
         required_datasets=("zeek.dce_rpc",),
     ),
 )
+
+
+# The tools a builtin steers the agent to, keyed by builtin NAME, the key
+# `seed_builtins` upserts on. The start route appends the hint to the agent's
+# objective when the hunt starts from the builtin. The analyst's text in the
+# box stays free of tool names.
+BUILTIN_TOOL_HINTS: dict[str, str] = {
+    "Beaconing to rare IPs": (
+        "Use t_beacon_profile to measure the cadence. Use t_first_seen to find the "
+        "novel destinations. Reach a conclusion after both tools run."
+    ),
+    "DNS / C2 exfiltration": (
+        "Use t_dns_entropy_scan to measure the qname entropy and the volume. Reach a "
+        "conclusion after the tool runs."
+    ),
+    "New external services": (
+        "Use t_first_seen to compare the recent destinations against the trailing "
+        "baseline. The behavioural profile on the host page holds the same peer set."
+    ),
+    "DCE-RPC abuse / DC attacks": "Run t_dcerpc_histogram first.",
+}
+
+
+def tool_hint_for(name: str | None, builtin: bool) -> str:
+    """The tool hint of a builtin starter, or "". A custom starter has none."""
+    if not builtin or not name:
+        return ""
+    return BUILTIN_TOOL_HINTS.get(name, "")
 
 
 # ── Environment fit (the SECOND annotation axis) ─────────────────────────────

@@ -12,6 +12,7 @@ import {
   formatNotificationWhen,
   getDismissed,
   describeNotifications,
+  huntOutcomeChip,
   notificationKind,
 } from './notifications';
 
@@ -57,7 +58,7 @@ describe('formatNotificationTitle', () => {
     expect(formatNotificationTitle('Verdict true_positive: Suspicious PowerShell')).toBe(
       'True positive: Suspicious PowerShell',
     );
-    expect(formatNotificationTitle('Verdict needs_more_info: INV-42')).toBe('Needs info: INV-42');
+    expect(formatNotificationTitle('Verdict needs_more_info: INV-42')).toBe('Needs more info: INV-42');
   });
 
   it('passes non-verdict titles through unchanged', () => {
@@ -79,6 +80,8 @@ describe('notificationKind', () => {
     expect(notificationKind({ id: 'inv:01ABC' })).toBe('investigation');
     expect(notificationKind({ id: 'inv-done:01ABC' })).toBe('investigation');
     expect(notificationKind({ id: 'hunt-done:01ABC' })).toBe('hunting');
+    // The folded line of one catalog sweep is a hunt line too.
+    expect(notificationKind({ id: 'hunt-sweep:no_threat:01ABC' })).toBe('hunting');
     expect(notificationKind({ id: 'dossier-conflict:10.0.0.14:hostname:2' })).toBe('host');
     expect(notificationKind({ id: 'dep-down:es:20260812234343' })).toBe('system');
   });
@@ -120,7 +123,7 @@ describe('describeNotifications', () => {
   it('names only the row types present, with a count each', () => {
     expect(
       describeNotifications([{ id: 'lead:1' }, { id: 'inv-done:a' }, { id: 'inv-done:b' }], false),
-    ).toBe('3 items from the last 24 h: 1 lead and 2 completed investigations.');
+    ).toBe('3 items: 1 lead and 2 completed investigations. Finished runs cover the last 24 h.');
   });
 
   it('states the cap on the last type when the API list is full', () => {
@@ -130,14 +133,49 @@ describe('describeNotifications', () => {
       ...Array.from({ length: 10 }, (_, i) => ({ id: `inv-done:${i}` })),
     ];
     expect(describeNotifications(rows, true)).toBe(
-      '12 items from the last 24 h: 2 shadow hits and the 10 newest completed investigations.',
+      '12 items: 2 shadow hits and the 10 newest completed investigations. Finished runs cover the last 24 h.',
     );
   });
 
   it('counts an unknown source as a system notice', () => {
     expect(describeNotifications([{ id: 'dep-down:es:1' }], false)).toBe(
-      '1 item from the last 24 h: 1 system notice.',
+      '1 item: 1 system notice.',
     );
+  });
+});
+
+// Two branches filed the hunt rows of the bell: one by the folded sweep id
+// `hunt-sweep:<outcome>:<id>`, one by the `outcome` field with a running row
+// `hunt:<id>` and a count row `lead-more`. One filing holds every row.
+describe('the hunt rows of the bell', () => {
+  const OUTCOMES = ['threat_found', 'no_threat', 'no_threat_gap', 'no_answer', 'could_not_run', 'running'];
+
+  it('files every hunt row under hunting, for every outcome', () => {
+    for (const outcome of OUTCOMES) {
+      expect(notificationKind({ id: `hunt-sweep:${outcome}:01ABC` })).toBe('hunting');
+    }
+    expect(notificationKind({ id: 'hunt:01ABC' })).toBe('hunting');
+    expect(notificationKind({ id: 'lead-more' })).toBe('hunting');
+  });
+
+  it('gives every outcome a chip in words, the visibility gap too', () => {
+    const labels = OUTCOMES.map((o) => huntOutcomeChip(o)?.label);
+    expect(labels).toEqual([
+      'Threat found',
+      'No threat found',
+      'No threat found, visibility gap',
+      'No answer',
+      'Could not run',
+      'Running',
+    ]);
+  });
+
+  it('names a folded sweep and a running hunt in the header', () => {
+    expect(
+      describeNotifications([{ id: 'hunt-sweep:could_not_run:01A' }, { id: 'hunt:01B' }], false),
+    ).toBe('2 items: 1 catalog sweep and 1 running hunt. Finished runs cover the last 24 h.');
+    // A running hunt alone has no window.
+    expect(describeNotifications([{ id: 'hunt:01B' }], false)).toBe('1 item: 1 running hunt.');
   });
 });
 

@@ -38,8 +38,11 @@ def test_the_image_and_both_audits_carry_the_extra() -> None:
     assert re.search(r"^RUN uv sync --frozen .*--extra ml", dockerfile, re.M)
     ci = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     assert "--no-dev --extra postgres --extra ml" in ci
-    publish = (REPO_ROOT / "scripts" / "github-update.sh").read_text(encoding="utf-8")
-    assert "--extra postgres --extra ml" in publish
+    # The publish script stays out of the public mirror, so the mirror's CI
+    # has no file to read. The check holds where the file is.
+    publish_path = REPO_ROOT / "scripts" / "github-update.sh"
+    if publish_path.is_file():
+        assert "--extra postgres --extra ml" in publish_path.read_text(encoding="utf-8")
 
 
 def test_mypy_treats_the_extra_as_untyped_when_it_is_absent() -> None:

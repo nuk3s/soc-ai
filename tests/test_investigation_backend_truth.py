@@ -55,7 +55,7 @@ def client(settings_kratos: Settings) -> Iterator[TestClient]:
         patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=AsyncMock()),
         patch("soc_ai.main.make_auth", return_value=AsyncMock()),
         patch("soc_ai.main.get_settings", return_value=settings_kratos),
-        patch("soc_ai.api.webui._timeline._alert_currently_acked", AsyncMock(return_value=False)),
+        patch("soc_ai.api.webui._timeline._alert_ack_state", AsyncMock(return_value=None)),
     ):
         app = create_app()
         with TestClient(app) as c:
@@ -331,3 +331,17 @@ def test_bell_lists_only_primary_failures_and_detail_links_the_newer_run(
     assert superseded_by("01D1B1000000000000000000000") is None
     assert superseded_by("01D1C1000000000000000000000") == "01D1C2000000000000000000000"
     assert superseded_by("01D1C2000000000000000000000") is None
+
+
+def test_the_acked_probe_waits_under_a_second_at_the_default_budget() -> None:
+    """The detail page waited 3 s on every open while a slow grid answered an
+    id lookup. The probe is one optional badge; it waits under a second and the
+    page shows the stored state after that. The control: a budget of 60 s
+    still gives the probe a slice, never the whole."""
+    from types import SimpleNamespace
+
+    from soc_ai.api.webui import _timeline
+
+    assert _timeline._acked_probe_timeout_s(SimpleNamespace(webui_grid_timeout_s=12)) < 1.0
+    assert _timeline._acked_probe_timeout_s(SimpleNamespace(webui_grid_timeout_s=2)) == 0.5
+    assert _timeline._acked_probe_timeout_s(SimpleNamespace(webui_grid_timeout_s=60)) == 3.75

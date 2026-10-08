@@ -84,7 +84,7 @@ export function LeadQualityPanel() {
         quality.error ? (
           <div className="px-[15px] py-3 text-[13px] text-dim">Could not read the lead quality.</div>
         ) : (
-          <LoadingState label="Reading the lead quality…" />
+          <LoadingState label="Reading the lead quality" />
         )
       ) : (
         <>

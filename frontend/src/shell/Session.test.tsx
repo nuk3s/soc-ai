@@ -10,13 +10,13 @@ vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
   getMe: vi.fn(),
   getAbout: vi.fn(() => new Promise(() => {})),
-  getNeedsYou: vi.fn(() => Promise.resolve({ total: 0 })),
+  getNeedsYouCount: vi.fn(() => Promise.resolve({ total: 0, unknown: [] })),
   getWorkspaces: vi.fn(() => Promise.resolve([])),
   getNotifications: vi.fn(() => Promise.resolve([])),
   getHealth: vi.fn(() => new Promise(() => {})),
 }));
 
-import { getAbout, getHealth, getMe, getNeedsYou, getNotifications, getWorkspaces } from '../lib/api';
+import { getAbout, getHealth, getMe, getNeedsYouCount, getNotifications, getWorkspaces } from '../lib/api';
 import { AppShell } from './AppShell';
 import { ShellProvider } from './ShellContext';
 
@@ -40,7 +40,7 @@ function renderShell() {
   );
 }
 
-const protectedReads = () => [getAbout, getNeedsYou, getWorkspaces, getNotifications, getHealth];
+const protectedReads = () => [getAbout, getNeedsYouCount, getWorkspaces, getNotifications, getHealth];
 
 beforeEach(() => {
   vi.clearAllMocks();

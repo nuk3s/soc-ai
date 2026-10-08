@@ -127,6 +127,14 @@ async function pressEscalateKey() {
   await act(async () => {
     fireEvent.keyDown(window, { key: 'e' });
   });
+  // Every escalate asks first (dogfood 2026-10-06, investigation S2). The
+  // confirm renders at once, but a loaded box can take over a second to paint
+  // the Alerts screen, so the wait is wider than the default.
+  fireEvent.click(
+    within(await screen.findByTestId('escalate-confirm', {}, { timeout: 5000 })).getByRole('button', {
+      name: /^Open/,
+    }),
+  );
 }
 
 const timedOut = () => new RequestTimeoutError(SO_WRITE_TIMEOUT_MS, WRITE_TIMEOUT_NOTE);
@@ -215,6 +223,11 @@ describe('the escalate toast names its cases (RL7)', () => {
     fireEvent.click(screen.getByRole('checkbox', { name: 'Select NTLM Session Setup' }));
     const strip = await screen.findByTestId('list-toolbar-selection');
     fireEvent.click(within(strip).getByRole('button', { name: 'Escalate to cases' }));
+    // Negative control: the bulk button asks first and writes nothing yet.
+    expect(escalateGroup).not.toHaveBeenCalled();
+    fireEvent.click(
+      within(await screen.findByTestId('escalate-confirm')).getByRole('button', { name: /^Open/ }),
+    );
     await waitFor(() => expect(escalateGroup).toHaveBeenCalledTimes(1));
     expect(vi.mocked(escalateGroup).mock.calls[0][0].name).toBe('NTLM Session Setup');
   });

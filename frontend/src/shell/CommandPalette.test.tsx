@@ -66,6 +66,7 @@ vi.mock('../lib/api', () => ({
   getInvestigations: vi.fn(() => Promise.resolve([])),
   getConfig: () => getConfigMock(),
   listMachines: vi.fn(),
+  searchEntityIndex: vi.fn(() => Promise.resolve({ q: '', hits: [] })),
   signOut: vi.fn(),
 }));
 
@@ -95,11 +96,22 @@ describe('CommandPalette', () => {
     vi.mocked(listMachines).mockResolvedValue({ rows: [], total: 0, limit: 8, offset: 0, sort: 'last_seen', dir: 'desc' });
   });
 
-  it('offers Go-to entries for every primary route, incl. Dashboard/Notifications/Backtest/Operate', async () => {
+  it('offers Go-to entries for every primary route, incl. Dashboard/Notifications/Backtest/Status', async () => {
     await openPalette();
-    for (const label of ['Dashboard', 'Notifications', 'Backtest', 'Alerts', 'Investigations', 'Hunts', 'Operate', 'Runbooks', 'Config']) {
+    for (const label of ['Dashboard', 'Notifications', 'Backtest', 'Alerts', 'Investigations', 'Hunts', 'Status', 'Runbooks', 'Settings']) {
       expect(screen.getByRole('option', { name: new RegExp(`${label}\\s+Go to`) })).toBeInTheDocument();
     }
+    // The old names are gone: one page, one name (dogfood 2026-10-06).
+    expect(screen.queryByRole('option', { name: /^Config\s+Go to/ })).toBeNull();
+    expect(screen.queryByRole('option', { name: /^Operate\s+Go to/ })).toBeNull();
+  });
+
+  // The help button opened the palette and the palette held no help. The
+  // shortcut sheet opened only with "?" on Alerts (dogfood 2026-10-06).
+  it('offers the keyboard shortcuts and the guide', async () => {
+    await openPalette();
+    expect(screen.getByRole('option', { name: /Keyboard shortcuts\s+Help/ })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: /Open the guide\s+Help/ })).toBeInTheDocument();
   });
 
   it('exposes combobox/listbox semantics with aria-activedescendant tracking the highlight', async () => {
@@ -172,11 +184,14 @@ describe('CommandPalette', () => {
     type('inherit');
     await screen.findByRole('option', { name: /Verdict inheritance window · Triage/ });
 
+    // A setting hit is named "<setting> · <section> Settings". The Go-to
+    // entry for the Settings page is "Settings Go to" and is not a hit.
+    const settingHits = () => screen.queryAllByRole('option', { name: /Settings$/ });
     type('i');
-    expect(screen.queryAllByText('Settings')).toHaveLength(0);
+    expect(settingHits()).toHaveLength(0);
 
     type('');
-    expect(screen.queryAllByText('Settings')).toHaveLength(0);
+    expect(settingHits()).toHaveLength(0);
   });
 
   it('asks the machine search the Hosts list uses, 8 rows, and opens the machine page', async () => {

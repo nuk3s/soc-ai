@@ -146,3 +146,13 @@ describe('DetectionTuningPanel nominated count', () => {
     expect(await screen.findByText('Nominated rules (—)')).toBeTruthy();
   });
 });
+
+describe('DetectionTuningPanel verdict column', () => {
+  // "NMI" was one of five spellings of needs_more_info. The header spells it.
+  it('names the needs more info count in words', async () => {
+    getDetectionTuningMock.mockResolvedValue(EMPTY);
+    render(<DetectionTuningPanel />);
+    expect(await screen.findByText('FP / TP / Needs more info')).toBeTruthy();
+    expect(screen.queryByText(/NMI/)).toBeNull();
+  });
+});

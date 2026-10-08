@@ -161,10 +161,9 @@ def _bucket_counts(result: Any, kinds: list[str]) -> dict[str, int] | None:
     return counts
 
 
-def _short(exc: BaseException) -> str:
+def _error_text(exc: BaseException) -> str:
+    """The exception as one line, whole. The console wraps a long reason."""
     text = " ".join(str(exc).split())
-    if len(text) > 200:
-        text = text[:197] + "..."
     return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
 
 
@@ -218,7 +217,7 @@ async def audit_counts_with_reason(
                 leg.index,
                 exc,
             )
-            return _unknown(kinds, f"The grid refused the audit count. {_short(exc)}")
+            return _unknown(kinds, f"The grid refused the audit count. {_error_text(exc)}")
         found = _bucket_counts(result, kinds)
         if found is None:
             _LOGGER.warning("audit count aggregation returned no buckets on %s", leg.index)

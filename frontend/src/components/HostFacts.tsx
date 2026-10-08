@@ -19,7 +19,10 @@ import { cn } from '../lib/cn';
 import { criticalityAccent } from '../lib/hostColors';
 import {
   activityProfileView,
+  confidencePhrase,
+  factsCounter,
   fieldLabel,
+  plainEvidence,
   isJsonField,
   isWithheldGuess,
   partitionFields,
@@ -170,17 +173,23 @@ export function DeclareEditor({
           )}
         </>
       )}
-      <label className="text-[11.5px] font-semibold text-dim" htmlFor={`declare-note-${f.field}`}>
-        Note <span className="font-normal text-faint">· optional · recorded with your name</span>
-      </label>
-      <input
-        id={`declare-note-${f.field}`}
-        aria-label={`Note for ${label}`}
-        value={note}
-        onChange={(e) => setNote(e.target.value)}
-        placeholder="Optional. How you know this."
-        className="w-full rounded-control border border-border-input bg-bg px-3 py-2 text-[13px] text-text outline-none focus:border-accent"
-      />
+      {/* The Operator note fact is a note. A second Note box under its value
+          read as a duplicate (dogfood 2026-10-06), so that form has one box. */}
+      {f.field !== 'policy_notes' && (
+        <>
+          <label className="text-[11.5px] font-semibold text-dim" htmlFor={`declare-note-${f.field}`}>
+            Note <span className="font-normal text-faint">· optional · recorded with your name</span>
+          </label>
+          <input
+            id={`declare-note-${f.field}`}
+            aria-label={`Note for ${label}`}
+            value={note}
+            onChange={(e) => setNote(e.target.value)}
+            placeholder="Optional. How you know this."
+            className="w-full rounded-control border border-border-input bg-bg px-3 py-2 text-[13px] text-text outline-none focus:border-accent"
+          />
+        </>
+      )}
       <div className="flex items-center gap-2">
         <button
           disabled={busy}
@@ -490,8 +499,8 @@ function WhyDrawer({
               {strings.length > 0 && (
                 <ul className="ml-1 flex flex-col gap-0.5">
                   {strings.map((line, i) => (
-                    <li key={i} className="text-[12px] leading-[1.5] text-dim">
-                      · {String(line)}
+                    <li key={i} className="text-[12px] leading-[1.5] text-dim" title={String(line)}>
+                      · {plainEvidence(String(line))}
                     </li>
                   ))}
                 </ul>
@@ -727,8 +736,12 @@ function WithheldRoleRow({
           </span>
         </div>
         {f.inferred_confidence != null && (
-          <span className="flex-none font-mono text-[11.5px] text-faint">
-            confidence {f.inferred_confidence.toFixed(2)}
+          <span
+            data-testid="withheld-confidence"
+            className="flex-none font-mono text-[11.5px] text-faint"
+            title="The confidence of the sweep in its guess, from 0.00 to 1.00. Below the gate the page does not assert the guess."
+          >
+            {confidencePhrase(f.inferred_confidence)}
           </span>
         )}
         {canDeclare && !editing && (
@@ -815,7 +828,7 @@ export function HostFacts({
                   {`primary address ${address} · `}
                 </span>
               )}
-              {known.length} of {dossier.fields.length} facts
+              <span data-testid="host-facts-count">{factsCounter(dossier.fields)}</span>
             </span>
           }
         />

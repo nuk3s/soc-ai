@@ -1,10 +1,10 @@
-// The host page chat dock (task #65): the same bottom-right bubble the
-// investigation page carries, scoped to ONE machine. What these pin:
+// The host page chat (task #65), now the console's one Ask soc-ai panel on
+// the host scope (owner, 2026-10-07). What these pin:
 //
-//   * the dock mounts on the host page and opens the shared chat panel —
-//     labelled with the thread size once there is one;
-//   * the scope label is the name a human uses (the resolved hostname) and
-//     only falls back to the address when nothing named the host;
+//   * the top bar's button reads "Ask soc-ai about this host" on a loaded
+//     host page and opens the panel, whose header counts the shared thread;
+//   * the scope line names the host by the name a human uses (the resolved
+//     hostname) and only falls back to the address when nothing named it;
 //   * sending goes through the host endpoints with the page's ip;
 //   * a transport failure renders the honest error bubble, not a hang;
 //   * the hunt-proposal card is the SHARED HuntProposalCard — it renders, it
@@ -44,6 +44,7 @@ import {
   startHuntConsole,
 } from '../lib/api';
 import { HostDetail } from './HostDetail';
+import { WithChat } from '../test/chatHarness';
 
 // The page resolves an address to its machine first. These tests are about
 // the dock on the page of one address, so no machine holds it.
@@ -159,16 +160,18 @@ function Here() {
 const mount = (url = `/hosts/${IP}`) =>
   render(
     <MemoryRouter initialEntries={[url]}>
-      <Routes>
-        <Route path="/hosts/:key" element={<HostDetail />} />
-        <Route path="*" element={null} />
-      </Routes>
-      <Here />
+      <WithChat>
+        <Routes>
+          <Route path="/hosts/:key" element={<HostDetail />} />
+          <Route path="*" element={null} />
+        </Routes>
+        <Here />
+      </WithChat>
     </MemoryRouter>,
   );
 
 const openDock = async () => {
-  fireEvent.click(await screen.findByRole('button', { name: /chat/i }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Ask soc-ai about this host' }));
   return screen.findByPlaceholderText(/ask about this host/i);
 };
 
@@ -199,14 +202,15 @@ beforeEach(() => {
   vi.mocked(startHuntConsole).mockResolvedValue({ hunt_id: 'H-1' });
 });
 
-describe('HostChatDock — mounting on the host page', () => {
-  it('floats the launcher on a loaded host page, worded for a first question', async () => {
+describe('the host scope: opening from the host page', () => {
+  it('names the host in the top bar button on a loaded host page', async () => {
     mount();
-    const launcher = await screen.findByRole('button', { name: /chat about this host/i });
-    expect(launcher).toBeTruthy();
+    expect(await screen.findByRole('button', { name: 'Ask soc-ai about this host' })).toBeTruthy();
+    // Negative control: the floating launcher of the old dock is gone.
+    expect(screen.queryByRole('button', { name: /chat about this host/i })).toBeNull();
   });
 
-  it('counts the existing shared thread on the launcher', async () => {
+  it('counts the existing shared thread in the panel header', async () => {
     // The thread is per-HOST, so a colleague's conversation about this box is
     // this conversation — the label says there is one to read.
     vi.mocked(getHostChat).mockResolvedValue(
@@ -216,40 +220,37 @@ describe('HostChatDock — mounting on the host page', () => {
       ]),
     );
     mount();
-    expect(await screen.findByRole('button', { name: /chat · 2/i })).toBeTruthy();
+    await openDock();
+    expect(await screen.findByText('2 msgs')).toBeTruthy();
   });
 
   it('opens the panel scoped to the resolved hostname', async () => {
     mount();
     await openDock();
-    expect(screen.getByText('Chat about this host')).toBeTruthy();
-    // The panel header's scope label (the hero also says "web-01", so pick the
-    // faint mono label rather than any mention).
-    const scope = screen
-      .getAllByText('web-01')
-      .filter((el) => el.className.includes('text-faint'));
-    expect(scope.length).toBe(1);
+    expect(screen.getByRole('heading', { name: 'Ask soc-ai' })).toBeTruthy();
+    expect(screen.getByTestId('ask-scope-title').textContent).toBe('This host');
+    // The scope line, not the hero, which also says "web-01".
+    expect(screen.getByTestId('ask-scope-name').textContent).toBe('web-01');
   });
 
   it('falls back to the address when nothing has named the host', async () => {
     vi.mocked(getDossier).mockResolvedValue(dossier());
     mount();
     await openDock();
-    // The scope label in the panel header — the address is the honest name.
-    const scope = screen
-      .getAllByText(IP)
-      .filter((el) => el.className.includes('text-faint'));
-    expect(scope.length).toBeGreaterThan(0);
+    // The scope line names the address when nothing named the host.
+    expect(screen.getByTestId('ask-scope-name').textContent).toBe(IP);
   });
 
-  it('mounts no dock when the segment names no machine', async () => {
+  it('offers no host scope when the segment names no machine', async () => {
     mount('/hosts/not-a-host');
     await screen.findByTestId('host-unknown-name');
-    expect(screen.queryByRole('button', { name: /chat/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Ask soc-ai about this host' })).toBeNull();
+    // Control: the page has no object, so the button opens the general thread.
+    expect(screen.getByRole('button', { name: 'Ask soc-ai' })).toBeTruthy();
   });
 });
 
-describe('HostChatDock — the send flow', () => {
+describe('the host scope: the send flow', () => {
   it('sends through the host endpoints with the page ip and renders the reply', async () => {
     vi.mocked(postHostChat).mockResolvedValue(
       thread([
@@ -290,7 +291,7 @@ describe('HostChatDock — the send flow', () => {
   });
 });
 
-describe('HostChatDock — the shared hunt-proposal card', () => {
+describe('the host scope: the shared hunt-proposal card', () => {
   it('renders the proposal beside the prose and never starts it alone', async () => {
     vi.mocked(getHostChat).mockResolvedValue(
       thread([proposed(`Sweep zeek.conn for every peer of ${IP} over 7d`, 'a week needs a sweep')]),

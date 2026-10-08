@@ -3,18 +3,13 @@ import { clearChatDraft, loadChatDraft, saveChatDraft } from './chatDraft';
 import type { ChatThread } from './api';
 import type { ChatMessage } from './types';
 
-// The soc-ai chat surfaces (investigation follow-up, Dashboard general chat,
-// and eventually the hunt console) all speak the same transport: GET the
-// thread, POST a message, poll while the backend runs the turn in the
-// background. Forking that slice per screen is what left the hunt chat without
-// tool progress, without the grounding loop, and without draft persistence —
-// it drifted because it was a copy, not a caller. This hook is the one
-// implementation; a surface joins by calling it.
-//
-// HuntDetail's HuntChatPanel is still its own copy. Retrofitting it is a caller
-// change plus one type fix: `HuntChatMessage.tools` is `string | null` where
-// `ChatMessage.tools` is `string | undefined`, so the hunt thread isn't
-// assignable to this hook's `ChatThread` until that null goes.
+// Every chat scope (investigation, host, lead, hunt and the general thread)
+// speaks the same transport: GET the thread, POST a message, poll while the
+// backend runs the turn in the background. Forking that slice per screen is
+// what left the hunt chat without tool progress, without the grounding loop,
+// and without draft persistence. It drifted because it was a copy, not a
+// caller. This hook is the one implementation, and the Ask soc-ai panel
+// (components/AskPanel.tsx) is its one caller.
 
 /** How long between polls of an in-flight turn. */
 const POLL_MS = 1500;
@@ -63,6 +58,10 @@ export interface ChatThreadState {
   pending: boolean;
   /** Tools the in-flight turn has called so far (empty while idle). */
   progressTools: string[];
+  /** The mount read has settled, with an answer or a failure. Until then
+   *  `pending` is a guess: a queued question waits for it, or a send into a
+   *  thread with a turn already running comes back 409. */
+  synced: boolean;
   draft: string;
   setDraft: (text: string) => void;
   /** Send the trimmed draft, or `textOverride` when given (starter chips). No-op
@@ -98,6 +97,7 @@ export function useChatThread({
   const [messages, setMessages] = useState<ChatMessage[]>(seed);
   const [pending, setPending] = useState(false);
   const [progressTools, setProgressTools] = useState<string[]>([]);
+  const [synced, setSynced] = useState(false);
   // Restore any draft saved before this surface last unmounted (drawer close,
   // or navigating off the Dashboard and back).
   const [draft, setDraft] = useState(() => loadChatDraft(subject));
@@ -154,6 +154,7 @@ export function useChatThread({
     currentSubjectRef.current = subject;
     setMessages(seed);
     setPending(false);
+    setSynced(false);
     // Restore this subject's saved draft (a reused surface must not bleed the
     // previous conversation's text through) — but ONLY on a real subject
     // change. The initial draft is already loaded by useState above, so on
@@ -195,7 +196,10 @@ export function useChatThread({
         // messages or an in-flight turn to restore.
         if (t.messages.length > 0 || t.pending) applyThread(t);
       })
-      .catch(() => undefined); // the seed already rendered — a failed sync is cosmetic
+      .catch(() => undefined) // the seed already rendered, so a failed sync is cosmetic
+      .finally(() => {
+        if (aliveRef.current && currentSubjectRef.current === subject) setSynced(true);
+      });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [subject]);
 
@@ -273,5 +277,5 @@ export function useChatThread({
 
   const refresh = () => fetchRef.current(subject).then(applyThread);
 
-  return { messages, pending, progressTools, draft, setDraft, send, refresh };
+  return { messages, pending, progressTools, synced, draft, setDraft, send, refresh };
 }

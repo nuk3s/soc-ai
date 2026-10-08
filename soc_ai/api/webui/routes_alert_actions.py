@@ -923,6 +923,11 @@ class StrandedClaimOut(BaseModel):
     # matters: a claim from four minutes ago is a request in flight, and one
     # from four days ago is an alert nobody can escalate.
     claimed_at: str
+    # The rule and the host of the alert, from the newest investigation of
+    # it. The panel listed raw alert ids, which name nothing an operator can
+    # act on (dogfood 2026-10-06). None when no investigation names the alert.
+    rule_name: str | None = None
+    host: str | None = None
 
 
 class StrandedClaimsOut(BaseModel):
@@ -966,16 +971,23 @@ async def list_stranded_escalations(request: Request) -> StrandedClaimsOut:
     now = datetime.now(UTC).replace(tzinfo=None)
     async with request.app.state.db_sessionmaker() as db:
         rows, total = await esc_svc.stranded(db, now=now)
-    return StrandedClaimsOut(
-        claims=[
+        runs = await inv_svc.latest_for_alerts(db, [row.alert_id for row in rows])
+    claims: list[StrandedClaimOut] = []
+    for row in rows:
+        run = runs.get(row.alert_id)
+        claims.append(
             StrandedClaimOut(
                 alert_id=row.alert_id,
                 escalated_by=row.escalated_by,
                 # Never None: the column is NOT NULL with a server default.
                 claimed_at=_iso_z(row.created_at) or "",
+                rule_name=(run.rule_name or None) if run is not None else None,
+                # The machine the alert fired on, else the source of its flow.
+                host=(run.host_name or run.src_ip or None) if run is not None else None,
             )
-            for row in rows
-        ],
+        )
+    return StrandedClaimsOut(
+        claims=claims,
         total=total,
         settling_minutes=int(esc_svc.SETTLING.total_seconds() // 60),
     )

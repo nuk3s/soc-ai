@@ -147,7 +147,7 @@ const mount = () =>
 async function declareLowOnBoth() {
   mount();
   fireEvent.click(await screen.findByLabelText(/select all hosts/i));
-  fireEvent.change(await screen.findByDisplayValue('choose…'), { target: { value: 'low' } });
+  fireEvent.change(await screen.findByDisplayValue('choose'), { target: { value: 'low' } });
   fireEvent.click(screen.getByRole('button', { name: /declare \(2\)/i }));
 }
 

@@ -240,7 +240,9 @@ def _fire_breach(hits: int, budget: int, *, start: datetime, now: datetime) -> B
     span = "24 hours" if hours == 24 else f"{hours} hours since its approval to live"
     return Breach(
         rule=RULE_FIRE_BUDGET,
-        sentence=(f"The analytic wrote {hits} hits in {span}. Its fire budget is {budget} a day."),
+        # The console words: "daily hit limit" (frontend/src/lib/tooltips.ts).
+        # The spec field keeps its name, fire_budget_per_day.
+        sentence=f"The analytic wrote {hits} hits in {span}. Its daily hit limit is {budget}.",
         evidence={
             "rule": RULE_FIRE_BUDGET,
             "hits": hits,
@@ -264,7 +266,8 @@ def _precision_breach(
         rule=RULE_PRECISION_FLOOR,
         sentence=(
             f"{reached} of {outcomes.decided} hunted leads reached a finding or an "
-            f"investigation. The precision is {precision:.2f}. Its floor is {floor:.2f}."
+            f"investigation. The precision is {precision:.2f}. "
+            f"Its minimum precision is {floor:.2f}."
         ),
         evidence={
             "rule": RULE_PRECISION_FLOOR,

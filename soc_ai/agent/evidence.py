@@ -834,8 +834,9 @@ def _materialize_prefetch_evidence(alert_ctx: Any) -> list[str]:
         evidence.append(f"rule_name={alert.rule_name!r} (path alert.rule_name)")
     payload = getattr(alert, "payload_printable", None)
     if payload:
-        # Clip to a short excerpt — keeps the evidence list dense.
-        excerpt = payload[:80] + "…" if len(payload) > 80 else payload
+        # A short prefix keeps the evidence list dense in the synth prompt. The
+        # bullet says "contains", which a prefix makes true, so no cut marker.
+        excerpt = payload[:80]
         evidence.append(f"payload_printable contains {excerpt!r} (path alert.payload_printable)")
 
     # Community-id pivots — cite each by its ES _id, AND surface the DECISIVE

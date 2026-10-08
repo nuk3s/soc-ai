@@ -223,8 +223,10 @@ async def test_raise_arg_type_error_clamps_long_repr(
     result = await run_targeted_investigation(gap, ctx=_StubCtx())
 
     assert isinstance(result, str), "result must be a string error message"
-    # The clamp marker must appear in the error string.
-    assert "…" in result, "clamp ellipsis must appear when repr exceeds 400 chars"
+    # The clamp marker must appear in the error string. It is a word, never an
+    # ellipsis: the owner banned the ellipsis on 2026-10-07.
+    assert "[truncated]" in result, "clamp marker must appear when repr exceeds 400 chars"
+    assert "…" not in result
     # The error string itself must be bounded — repr({'domain': 'x'*500}) is ~506 chars,
     # so without clamping the result would be much longer. With the 400-char clamp,
     # the total error string must be well under 600 chars.

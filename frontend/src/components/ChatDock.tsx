@@ -1,16 +1,14 @@
-import { MessageSquare, Send, Wrench, X } from 'lucide-react';
-import { type ReactNode, useEffect, useRef, useState } from 'react';
+import { Send, Wrench } from 'lucide-react';
+import { type ReactNode, useEffect, useRef } from 'react';
 import { DocumentChip } from './DocumentDrawer';
 import { Markdown } from './Markdown';
 import { findEventIds } from '../lib/eventIds';
-import { Panel, PanelHeader } from './Panel';
 
 // ---------------------------------------------------------------------------
-// Shared chat rendering, used by the investigation chat (Investigation.tsx),
-// the hunt chat (HuntDetail.tsx) and the Dashboard assistant
-// (GeneralChatPanel.tsx) so the surfaces can't drift visually. The THREAD state
-// (loading, polling while the assistant works, posting a turn) lives in
-// useChatThread or, for the hunt chat, still in the screen.
+// Shared chat rendering. The console has one chat, the Ask soc-ai panel
+// (AskPanel.tsx), and every scope renders its thread through ChatThreadView
+// below. The THREAD state (loading, polling while the assistant works,
+// posting a turn) lives in useChatThread.
 // ---------------------------------------------------------------------------
 
 /** The message shape the shared renderer needs; screens may carry richer types. */
@@ -20,10 +18,9 @@ export interface ChatDockMessage {
   tools?: string | null;
 }
 
-interface ChatPanelShellProps<M extends ChatDockMessage> {
-  title: string;
-  /** Small mono label in the header, e.g. "scoped to this investigation". */
-  scopeLabel: string;
+interface ChatThreadViewProps<M extends ChatDockMessage> {
+  /** The accessible name of the message list. */
+  label: string;
   placeholder: string;
   messages: M[];
   pending: boolean;
@@ -32,16 +29,8 @@ interface ChatPanelShellProps<M extends ChatDockMessage> {
   draft: string;
   onDraft: (v: string) => void;
   onSend: () => void;
-  /** Stretch to the parent's height (dock mode) instead of a fixed band. */
-  fill?: boolean;
-  onClose?: () => void;
-  /** Screen-specific size classes for the scrolling message list. */
-  listSizeClass: string;
   /** Optional hint rendered when the thread is empty and idle. */
   emptyHint?: ReactNode;
-  /** Screen-specific header action (e.g. "Clear conversation"), placed with the
-   *  msg count and scope label rather than orphaned below the panel. */
-  headerRight?: ReactNode;
   /**
    * Screen-specific message kinds (e.g. the investigation chat's verdict
    * proposals): return a node (carrying its own key) to replace the default
@@ -49,20 +38,18 @@ interface ChatPanelShellProps<M extends ChatDockMessage> {
    *
    * It replaces the WHOLE row, so a card that should appear ALONGSIDE the
    * agent's prose composes {@link AssistantBubble} itself rather than
-   * re-implementing it — the Dashboard chat's hunt proposal rides on the same
-   * row as the answer, and dropping that prose would throw away the half of the
-   * reply the analyst judges the proposal by.
+   * re-implementing it. The hunt proposal rides on the same row as the
+   * answer, and dropping that prose would throw away the half of the reply
+   * the analyst judges the proposal by.
    */
   renderSpecial?: (m: M, i: number) => ReactNode | null;
   /** Document ids the scope already cites. An answer that names one, or any
    *  id with the Elasticsearch shape, lists it as a control that opens it. */
   linkIds?: string[];
+  /** Move the focus into the input on mount. The panel opens with it. */
+  autoFocus?: boolean;
 }
 
-/**
- * Chat panel chrome: header, scrolling bubble list (with autoscroll and a
- * fade-in on messages that arrive after mount), typing indicator, input row.
- */
 // Tool name -> what the analyst would call it. Unknown tools fall back to a
 // de-prefixed, de-underscored form so a new tool still reads sensibly.
 const TOOL_LABELS: Record<string, string> = {
@@ -194,9 +181,13 @@ export function AssistantBubble({
   );
 }
 
-export function ChatPanelShell<M extends ChatDockMessage>({
-  title,
-  scopeLabel,
+/**
+ * One thread: the scrolling bubble list (with autoscroll and a fade-in on
+ * messages that arrive after mount), the typing indicator and the input row.
+ * It fills its parent. The panel owns the header.
+ */
+export function ChatThreadView<M extends ChatDockMessage>({
+  label,
   placeholder,
   messages,
   pending,
@@ -204,14 +195,11 @@ export function ChatPanelShell<M extends ChatDockMessage>({
   draft,
   onDraft,
   onSend,
-  fill,
-  onClose,
-  listSizeClass,
   emptyHint,
-  headerRight,
   renderSpecial,
   linkIds,
-}: ChatPanelShellProps<M>) {
+  autoFocus,
+}: ChatThreadViewProps<M>) {
   const listRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const didMountRef = useRef(false);
@@ -230,6 +218,10 @@ export function ChatPanelShell<M extends ChatDockMessage>({
     if (el) el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
   }, [messages.length, pending]);
 
+  useEffect(() => {
+    if (autoFocus) inputRef.current?.focus();
+  }, [autoFocus]);
+
   // Grow the draft box with its content (up to a cap) so a long question stays
   // fully visible instead of scrolling off a single line.
   useEffect(() => {
@@ -240,40 +232,15 @@ export function ChatPanelShell<M extends ChatDockMessage>({
   }, [draft]);
 
   return (
-    <Panel className={`flex min-h-0 flex-col${fill ? ' h-full' : ''}`}>
-      <PanelHeader
-        icon={<MessageSquare size={15} />}
-        title={title}
-        right={
-          <div className="flex items-center gap-2.5">
-            {messages.length > 0 && (
-              <span className="font-mono text-[11px] text-accent">
-                {messages.length} msg{messages.length !== 1 ? 's' : ''}
-              </span>
-            )}
-            <div className="font-mono text-[11px] text-faint">{scopeLabel}</div>
-            {headerRight}
-            {onClose && (
-              <button
-                onClick={onClose}
-                aria-label="Close chat"
-                className="flex text-dim hover:text-text"
-              >
-                <X size={15} />
-              </button>
-            )}
-          </div>
-        }
-        className="py-[11px]"
-      />
+    <div className="flex min-h-0 flex-1 flex-col">
       {/* role="log" makes the list a polite live region: a screen reader
           announces each new answer without moving focus (fleet P13). */}
       <div
         ref={listRef}
         role="log"
         aria-live="polite"
-        aria-label={title}
-        className={`flex flex-col gap-3 overflow-y-auto p-[15px] ${listSizeClass}`}
+        aria-label={label}
+        className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-[15px]"
       >
         {emptyHint != null && messages.length === 0 && !pending && emptyHint}
         {messages.map((m, i) => {
@@ -322,6 +289,7 @@ export function ChatPanelShell<M extends ChatDockMessage>({
         <textarea
           ref={inputRef}
           rows={1}
+          aria-label="Your question"
           value={draft}
           onChange={(e) => onDraft(e.target.value)}
           onKeyDown={(e) => {
@@ -341,56 +309,6 @@ export function ChatPanelShell<M extends ChatDockMessage>({
           <Send size={16} />
         </button>
       </div>
-    </Panel>
-  );
-}
-
-/**
- * The bottom padding a screen that mounts the dock owes its own content.
- *
- * The launcher is fixed to the viewport, so it draws over whatever the scroll
- * position puts under it. On the host page that was an Edit control at the
- * right edge of the facts panel, at 1024 and at 1280: the page ended 60px
- * below its last row, the launcher stands 44px tall 24px above the viewport
- * floor, and no amount of scrolling could free the control (dogfood
- * 2026-09-17). 84px is that 68px plus 16px of clearance.
- *
- * The reservation lifts at 1440px. Above it the content column stops short of
- * the launcher, so the padding would only add dead space.
- */
-export const DOCK_SAFE_AREA_CLASS = 'pb-[84px] [@media(min-width:1440px)]:pb-[60px]';
-
-/**
- * Floating "Chat about this" dock: a launcher pinned bottom-right of the
- * viewport that opens the chat as a docked overlay panel. Costs no layout
- * space and stays reachable however far the evidence has been scrolled.
- * `children` renders the opened panel and receives a close callback.
- *
- * A screen that mounts this owes its content {@link DOCK_SAFE_AREA_CLASS}, or
- * the launcher sits on whatever the page ends with.
- */
-export function ChatDockShell({
-  label,
-  children,
-}: {
-  label: ReactNode;
-  children: (close: () => void) => ReactNode;
-}) {
-  const [open, setOpen] = useState(false);
-  if (!open) {
-    return (
-      <button
-        onClick={() => setOpen(true)}
-        className="fixed bottom-6 right-6 z-40 flex items-center gap-2 rounded-pill border border-accent-deep bg-accent px-[18px] py-3 text-[13px] font-semibold text-white shadow-[0_12px_34px_rgba(75,139,245,.42)] transition-transform hover:-translate-y-0.5 hover:bg-accent-deep"
-      >
-        <MessageSquare size={16} />
-        {label}
-      </button>
-    );
-  }
-  return (
-    <div className="fixed bottom-6 right-6 z-40 h-[560px] max-h-[calc(100vh-96px)] w-[400px] max-w-[calc(100vw-32px)] animate-fadeUp drop-shadow-[0_24px_70px_rgba(0,0,0,.6)]">
-      {children(() => setOpen(false))}
     </div>
   );
 }

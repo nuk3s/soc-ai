@@ -41,7 +41,7 @@ the report. The analyst executes them through the actions API at
 
 > **Security posture:** the JSON API requires authentication if
 > `API_AUTH_REQUIRED=true`. It accepts a session cookie from the web login, or a
-> bearer API token as `Authorization: Bearer scai_…`. `require_api_auth` in
+> bearer API token as `Authorization: Bearer scai_<token>`. `require_api_auth` in
 > `soc_ai/api/security.py` enforces this. An admin-only route sits behind a
 > separate admin gate.
 >
@@ -146,7 +146,9 @@ final report. Read the section below.
 
 A triage run has a budget class. The class says how much the run may spend. The
 console shows it as a chip on the Investigations list, the drawer and the page.
-The run row stores it in `run_class`.
+The chip reads "Depth: quick" for `cheap`, "Depth: standard", "Depth: deep",
+and "rule history" for `rule_prior`. The list shows the chip on every row or on
+none. The run row stores the class in `run_class`.
 
 | Class | What the run does | Who gets it |
 |---|---|---|

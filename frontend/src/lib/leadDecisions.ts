@@ -38,14 +38,34 @@ export const HOLD_SENTENCE: Record<string, string> = {
   earlier_threat: 'An earlier hunt found a threat.',
 };
 
-/** The chip word for each decision. */
+/** The chip word for each decision. The store keeps the word `promoted`.
+ *  The console names the act by its control, so the chip reads "investigation
+ *  opened" (owner, 2026-10-07). */
 export const DECISION_WORD: Record<string, string> = {
   dismissed: 'dismissed',
   reopened: 'reopened',
-  promoted: 'promoted',
+  promoted: 'investigation opened',
   closed_by_hunt: 'closed',
   held: 'needs a decision',
+  kept_open: 'kept open',
+  formed_from_backtest: 'backtest replay',
 };
+
+/** The decision the server records on a lead that formed from backtest
+ *  replays only (soc_ai.store.leads.BACKTEST_DECISION). */
+export const BACKTEST_DECISION = 'formed_from_backtest';
+
+/** True when the lead formed from backtest replays only. The list sends the
+ *  flag. The lead page also reads the decision, for an older list. */
+export function formedFromBacktest(lead: {
+  formed_from_backtest?: boolean;
+  decisions?: { action: string }[];
+}): boolean {
+  return (
+    lead.formed_from_backtest === true ||
+    (lead.decisions ?? []).some((d) => d.action === BACKTEST_DECISION)
+  );
+}
 
 export function decisionsOf(lead: LeadDecisionFields): LeadDecision[] | null {
   return Array.isArray(lead.decisions) ? lead.decisions : null;

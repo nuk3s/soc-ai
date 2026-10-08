@@ -571,7 +571,7 @@ def _clamp_tool_result[T](value: T) -> T:
         return cast("T", _clip_plain_dict(value, len(encoded)))
     # Strings / numbers — stringify + clip.
     text = str(value)
-    return cast("T", text[: _TOOL_RESULT_BUDGET_BYTES - 100] + " …[truncated]")
+    return cast("T", text[: _TOOL_RESULT_BUDGET_BYTES - 100] + " [truncated]")
 
 
 # Per-leaf cap for a plain dict with no list to slice. t_get_event_raw's raw
@@ -616,7 +616,7 @@ def _clip_string_leaves(value: Any, cap: int, path: str, clipped: list[str]) -> 
         if len(value) <= cap:
             return value
         clipped.append(path)
-        return f"{value[:cap]}…[clipped {len(value) - cap} chars]"
+        return f"{value[:cap]} [clipped {len(value) - cap} chars]"
     if isinstance(value, dict):
         return {
             k: _clip_string_leaves(v, cap, f"{path}.{k}" if path else str(k), clipped)

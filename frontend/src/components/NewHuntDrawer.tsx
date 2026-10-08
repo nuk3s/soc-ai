@@ -6,6 +6,7 @@ import {
   MAX_OBJECTIVE_CHARS,
   createHuntTemplate,
   deleteHuntTemplate,
+  getHuntComposer,
   getHuntTemplates,
   startHuntConsole,
   type HuntTemplate,
@@ -26,6 +27,40 @@ import { Drawer } from './Drawer';
 // the Start hunt button. The page keeps nothing of it.
 // ---------------------------------------------------------------------------
 
+/** Why a starter does not apply here, in one visible line. W11: "Not
+ *  applicable here · 2" hid two starters on a range with domain controllers,
+ *  and no chip said which data was missing. */
+export function notApplicableReason(t: {
+  available: boolean;
+  availabilityKnown?: boolean;
+  missingDatasets: string[];
+  applicable?: boolean;
+  missingEnvironment: string[];
+}): string {
+  const parts: string[] = [];
+  if (t.availabilityKnown !== false && !t.available && t.missingDatasets.length > 0) {
+    const data = t.missingDatasets.map((m) => m.split('|').join(' or ')).join(', ');
+    parts.push(`Needs ${data}. This grid has none.`);
+  }
+  if (t.applicable === false) {
+    const needs = t.missingEnvironment.length
+      ? t.missingEnvironment.join(' and ')
+      : 'machinery that this network has not shown';
+    parts.push(`Needs ${needs}. The network shows none.`);
+  }
+  return parts.join(' ');
+}
+
+/** The ranges the dialog offers, in days, up to the cap the server states. */
+const RANGE_DAYS = [1, 3, 7, 14, 30];
+
+/** The run time line, or '' when too few hunts finished to state one. */
+export function runTimeLine(low: number | null, high: number | null): string {
+  if (low === null || high === null) return '';
+  if (low === high) return `A hunt takes about ${low} ${low === 1 ? 'minute' : 'minutes'}.`;
+  return `A hunt takes ${low} to ${high} minutes.`;
+}
+
 // Fallback pills — the seven canned hunts, used ONLY when the template API is
 // unreachable or empty (a fresh store before the builtin seed). Normally the
 // picker is fed by GET /hunt-templates (curated + availability-annotated). Kept
@@ -34,7 +69,7 @@ const FALLBACK_PRESETS: { label: string; objective: string }[] = [
   {
     label: 'Beaconing to rare IPs',
     objective:
-      'Hunt for internal hosts that beacon to rare external IPs in the last 24 h. Look for a regular cadence, a low data volume and a novel destination. Use t_beacon_profile to measure the cadence. Use t_first_seen to find the novel destinations.',
+      'Hunt for internal hosts that beacon to rare external IPs in the last 24 h. Look for a regular cadence, a low data volume and a new destination. Measure the cadence of each candidate, and find the destinations that are new to the host.',
   },
   {
     label: 'Credential abuse / lockouts',
@@ -49,12 +84,12 @@ const FALLBACK_PRESETS: { label: string; objective: string }[] = [
   {
     label: 'DNS / C2 exfiltration',
     objective:
-      'Hunt for DNS tunneling and C2 exfiltration. Look for high-entropy DNS, high-volume DNS, long TXT records and beaconing over DNS. Use t_dns_entropy_scan to measure the qname entropy and the volume.',
+      'Hunt for DNS tunneling and C2 exfiltration. Look for high-entropy DNS, high-volume DNS, long TXT records and beaconing over DNS. Measure the entropy of the queried names and the query volume of each host.',
   },
   {
     label: 'New external services',
     objective:
-      'Hunt for internal hosts that expose or reach a new external service this week. The host must never have used that service before. Use t_first_seen to compare the recent destinations against the baseline of 30 days.',
+      'Hunt for internal hosts that expose or reach a new external service this week. The host must never have used that service before. Compare the recent destinations of each host with its baseline of 30 days.',
   },
   {
     label: 'Suspicious PowerShell / LOLBins',
@@ -64,7 +99,7 @@ const FALLBACK_PRESETS: { label: string; objective: string }[] = [
   {
     label: 'DCE-RPC abuse / DC attacks',
     objective:
-      'Hunt for attacks on a domain controller in DCE-RPC. Look for Zerologon style NetrServerAuthenticate floods, DCSync calls to DRSGetNCChanges and remote service creation. Use t_dcerpc_histogram first. Investigate every flagged operation and every rare dangerous operation.',
+      'Hunt for attacks on a domain controller in DCE-RPC. Look for Zerologon style NetrServerAuthenticate floods, DCSync calls to DRSGetNCChanges and remote service creation. Count the DCE-RPC operations first. Investigate every flagged operation and every rare dangerous operation.',
   },
 ];
 
@@ -318,7 +353,7 @@ function TemplatePicker({
           demoted.map((t) => {
             const flagged = telemetryMissing(t);
             return (
-              <span key={t.id} className="inline-flex items-center" data-demoted="true">
+              <span key={t.id} className="inline-flex flex-wrap items-center gap-1" data-demoted="true">
                 <button
                   type="button"
                   onClick={() => onPick(t.objectiveTemplate, { id: t.id, analytics: t.analytics })}
@@ -335,6 +370,15 @@ function TemplatePicker({
                   {flagged && <AlertTriangle size={11} className="flex-none" />}
                   {t.name}
                 </button>
+                {/* The reason in plain view. It lived in the hover alone. */}
+                {notApplicableReason(t) && (
+                  <span
+                    data-testid={`starter-reason-${t.id}`}
+                    className="text-[10.5px] text-faint"
+                  >
+                    {notApplicableReason(t)}
+                  </span>
+                )}
                 {!t.builtin && (
                   <button
                     type="button"
@@ -402,7 +446,7 @@ function TemplatePicker({
           <input
             value={objective}
             onChange={(e) => setObjective(e.target.value)}
-            placeholder="The objective the chip loads…"
+            placeholder="The objective the chip loads"
             className="min-w-[220px] flex-1 rounded-control border border-border-input bg-bg px-2.5 py-1.5 text-[12px] text-text outline-none focus:border-accent"
           />
           <input
@@ -438,7 +482,7 @@ export function NewHuntDrawer({
   initialObjective = '',
 }: {
   onClose: () => void;
-  /** The objective the drawer opens with. The "Run this query" link of an
+  /** The objective the drawer opens with. The "Hunt with this query" link of an
    *  observation fills it with the query, and the analyst starts the hunt. */
   initialObjective?: string;
 }) {
@@ -453,13 +497,24 @@ export function NewHuntDrawer({
   const [starting, setStarting] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
   const objectiveRef = useRef<HTMLTextAreaElement | null>(null);
+  // W11: the time range, the cap the grid answers to, and the run time. The
+  // dialog said none of them, and a hunt over data older than the cap ran
+  // seven minutes and could not answer. 0 leaves the range to the objective.
+  const [rangeDays, setRangeDays] = useState(0);
+  const composer = useAsync(() => getHuntComposer().catch(() => null), []);
+  const maxDays = composer.data?.max_range_days ?? null;
+  const ranges = RANGE_DAYS.filter((d) => maxDays === null || d <= maxDays);
+  const runLine = runTimeLine(
+    composer.data?.run_minutes_low ?? null,
+    composer.data?.run_minutes_high ?? null,
+  );
 
   const launch = () => {
     const obj = objective.trim();
     if (!obj || starting) return;
     setStarting(true);
     setStartError(null);
-    startHuntConsole(obj, undefined, pickedTemplateId ?? undefined)
+    startHuntConsole(obj, undefined, pickedTemplateId ?? undefined, rangeDays || undefined)
       .then((r) => {
         setObjective('');
         setPickedTemplateId(null);
@@ -526,6 +581,34 @@ export function NewHuntDrawer({
             narrative. The agent is read-only. Press Shift+Enter for a new line. A detailed brief
             gets a better hunt. Name the scope, the exclusions and the behaviors.
           </div>
+          <div className="mt-3 flex flex-wrap items-center gap-2 text-[12px]">
+            <label htmlFor="new-hunt-range" className="text-[10.5px] font-semibold uppercase tracking-[.06em] text-faint">
+              Time range
+            </label>
+            <select
+              id="new-hunt-range"
+              value={rangeDays}
+              onChange={(e) => setRangeDays(Number(e.target.value))}
+              className="rounded-control border border-border-input bg-bg px-2 py-1 text-[12px] text-text"
+            >
+              <option value={0}>As the objective states</option>
+              {ranges.map((d) => (
+                <option key={d} value={d}>
+                  {d === 1 ? 'Last day' : `Last ${d} days`}
+                </option>
+              ))}
+            </select>
+            {maxDays !== null && (
+              <span data-testid="new-hunt-range-cap" className="text-[11px] text-faint">
+                {`The grid answers up to ${maxDays} days back.`}
+              </span>
+            )}
+          </div>
+          {runLine && (
+            <div data-testid="new-hunt-run-time" className="mt-1 text-[11px] text-faint">
+              {runLine}
+            </div>
+          )}
           {objective.length > MAX_OBJECTIVE_CHARS * 0.8 && (
             <div className="mt-1 text-right text-[11px] text-faint">
               {objective.length.toLocaleString()} / {MAX_OBJECTIVE_CHARS.toLocaleString()} characters
@@ -554,7 +637,7 @@ export function NewHuntDrawer({
             className="flex flex-none items-center gap-1.5 rounded-control bg-accent px-[15px] py-2 text-[13px] font-semibold text-white hover:bg-accent-deep disabled:cursor-not-allowed disabled:opacity-50"
           >
             {starting ? <Loader2 size={15} className="animate-spin" /> : <Plus size={15} />}
-            {starting ? 'Starting…' : 'Start hunt'}
+            {starting ? 'Starting' : 'Start hunt'}
           </button>
           <span className="text-[11.5px] text-faint">
             The hunt starts at once. It appears in the hunt list as Running.

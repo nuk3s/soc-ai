@@ -32,7 +32,7 @@ const SUMMARY: MachineSummary = {
 
 const mount = (
   summary: MachineSummary | null,
-  { failed = false, scheduleEnabled = false as boolean | null } = {},
+  { failed = false, scheduleEnabled = false as boolean | null, searchActive = false } = {},
 ) =>
   render(
     <MemoryRouter>
@@ -40,9 +40,8 @@ const mount = (
         summary={summary}
         failed={failed}
         linkFor={(patch) => listHref(patch)}
-        brokenHref="/hosts?health=broken"
-        conflictsHref="/hosts?conflicts=1"
         scheduleEnabled={scheduleEnabled}
+        searchActive={searchActive}
       />
     </MemoryRouter>,
   );
@@ -62,8 +61,9 @@ describe('HostsSummary — the cards', () => {
     expect(href('card-with-agent')).toBe('/hosts?agent=yes&activity=all');
     expect(href('card-without-agent')).toBe('/hosts?agent=no&activity=all');
     expect(href('card-new')).toBe('/hosts?seen=new&activity=all');
-    expect(href('card-attention')).toBe('/hosts?health=broken');
-    expect(href('card-conflicts')).toBe('/hosts?conflicts=1');
+    expect(href('attention-all')).toBe('/hosts?health=attention&activity=all');
+    // A card at 0 is a filter too, so its click shows an empty list.
+    expect(href('card-conflicts')).toBe('/hosts?conflict=yes&activity=all');
     // The card names its number for a screen reader.
     expect(screen.getByRole('link', { name: /^With an agent: 12\./ })).toBeTruthy();
   });
@@ -73,8 +73,52 @@ describe('HostsSummary — the cards', () => {
     // counted them again (U17). The wire's needs_attention is the number.
     mount(SUMMARY);
     expect(within(screen.getByTestId('sum-attention')).getByText('5')).toBeTruthy();
-    expect(screen.getByTestId('sum-attention').textContent).toMatch(/3 broken or never built/);
     expect(within(screen.getByTestId('sum-conflicts')).getByText('2')).toBeTruthy();
+  });
+});
+
+// Dogfood 2026-10-06: the card read "37" with the sub "3 broken or never
+// built", and its click listed the 3. The number now lists the machines it
+// counts, and each part lists its own.
+describe('HostsSummary: Needs attention lists what it counts', () => {
+  it('splits the number into its two linked parts', () => {
+    mount({ ...SUMMARY, needs_attention: 37, out_of_date: 34, never_built: 3 });
+    const card = screen.getByTestId('sum-attention');
+    expect(card.textContent).toMatch(/34 out of date, 3 never built/);
+    expect(card.getAttribute('title')).toBe(
+      '37 need attention: 34 out of date, 3 never built. Each number lists its machines.',
+    );
+    expect(screen.getByTestId('attention-all').textContent).toBe('37');
+    expect(screen.getByTestId('attention-stale').getAttribute('href')).toBe('/hosts?health=stale&activity=all');
+    expect(screen.getByTestId('attention-broken').getAttribute('href')).toBe('/hosts?health=broken&activity=all');
+  });
+
+  it('derives the out-of-date part from an older server', () => {
+    const { out_of_date: _ignored, ...older } = { ...SUMMARY, out_of_date: undefined };
+    mount({ ...older, needs_attention: 7, never_built: 2 });
+    expect(screen.getByTestId('attention-stale').textContent).toBe('5 out of date');
+  });
+
+  it('nests no link in a link', () => {
+    // NEGATIVE CONTROL: three links in one card, so the card is not a link.
+    mount({ ...SUMMARY, needs_attention: 37, out_of_date: 34, never_built: 3 });
+    expect(screen.getByTestId('card-attention').tagName).toBe('DIV');
+    expect(screen.getByTestId('card-attention').querySelectorAll('a a')).toHaveLength(0);
+  });
+});
+
+describe('HostsSummary: the search does not filter the cards', () => {
+  it('says so while a search is active', () => {
+    mount(SUMMARY, { searchActive: true });
+    expect(screen.getByTestId('hosts-summary-scope').textContent).toBe(
+      'The cards and the role bar count every machine. The search does not filter them.',
+    );
+  });
+
+  it('says nothing without a search', () => {
+    // NEGATIVE CONTROL
+    mount(SUMMARY);
+    expect(screen.queryByTestId('hosts-summary-scope')).toBeNull();
   });
 });
 
@@ -109,7 +153,23 @@ describe('HostsSummary — the role bar', () => {
     expect(screen.getByTestId('role-legend-low_confidence').getAttribute('href')).toBe(
       '/hosts?role=low_confidence&activity=all',
     );
-    expect(screen.getByTestId('role-legend-low_confidence').textContent).toMatch(/low confidence\s*9/);
+    expect(screen.getByTestId('role-legend-low_confidence').textContent).toMatch(/weak guess\s*9/);
+  });
+
+  it('names its population and lists no bucket as a role', () => {
+    // Dogfood 2026-10-06: "stale 6 · unknown 31" read as two roles, beside a
+    // menu that counted another population.
+    mount(SUMMARY);
+    expect(screen.getByTestId('role-bar-scope').textContent).toBe(
+      'across all 144 machines, quiet ones too',
+    );
+    const unconfirmed = screen.getByTestId('role-bar-unconfirmed');
+    expect(unconfirmed.textContent).toMatch(/^No confirmed role:/);
+    expect(within(unconfirmed).getByTestId('role-legend-stale').textContent).toMatch(/old guess\s*2/);
+    expect(within(unconfirmed).getByTestId('role-legend-unknown').textContent).toMatch(/no role\s*103/);
+    // NEGATIVE CONTROL: a real role stays outside the unconfirmed group.
+    expect(within(unconfirmed).queryByTestId('role-legend-server')).toBeNull();
+    expect(screen.getByTestId('role-bar').textContent).not.toMatch(/\bstale\b/);
   });
 
   it('draws no bar over an empty census', () => {

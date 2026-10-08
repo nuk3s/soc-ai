@@ -606,7 +606,7 @@ def _truncate_token_safe(text: str, limit: int) -> str:
     # unbroken token is cut hard (nothing recognisable survives either way).
     if ws > limit - 200:
         cut = cut[:ws]
-    return cut + " …[truncated]"
+    return cut + " [truncated]"
 
 
 def _shrink_value(value: Any, *, str_limit: int, list_limit: int, _depth: int = 0) -> Any:
@@ -619,7 +619,7 @@ def _shrink_value(value: Any, *, str_limit: int, list_limit: int, _depth: int = 
     truncated with explicit markers.
     """
     if _depth >= _MAX_SHRINK_DEPTH:
-        return "…[nested content elided]"
+        return "[nested content elided]"
     if isinstance(value, str):
         return _truncate_token_safe(value, str_limit)
     if isinstance(value, dict):
@@ -633,7 +633,7 @@ def _shrink_value(value: Any, *, str_limit: int, list_limit: int, _depth: int = 
             for v in value[:list_limit]
         ]
         if len(value) > list_limit:
-            shrunk.append(f"…[{len(value) - list_limit} more items elided]")
+            shrunk.append(f"[{len(value) - list_limit} more items elided]")
         return shrunk
     if isinstance(value, tuple):
         return _shrink_value(list(value), str_limit=str_limit, list_limit=list_limit, _depth=_depth)
@@ -729,7 +729,7 @@ def _bound_transcript(text: str) -> str:
     ws = tail.find(" ")
     if 0 <= ws < 200:
         tail = tail[ws + 1 :]
-    return f"{head}\n…[transcript middle elided for size]…\n{tail}"
+    return f"{head}\n[transcript middle elided for size]\n{tail}"
 
 
 def _bound_evidence_bullets(bullets: list[str] | None) -> list[str]:

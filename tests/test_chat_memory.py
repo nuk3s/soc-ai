@@ -440,9 +440,11 @@ async def test_snippet_truncates_on_word_boundary(settings_kratos: Settings) -> 
             db, query_terms=["heartbeat"], exclude_thread=None, window_days=90, limit=5
         )
     snippet = hits[0]["snippet"]
-    assert snippet.endswith("…")
-    assert len(snippet) <= 241  # 240 + the ellipsis
-    assert all(w in ("heartbeat", "filler") for w in snippet[:-1].split())  # no cut words
+    assert snippet.endswith(" [truncated]")
+    assert "…" not in snippet
+    body = snippet.removesuffix(" [truncated]")
+    assert len(body) <= 240
+    assert all(w in ("heartbeat", "filler") for w in body.split())  # no cut words
     await engine.dispose()
 
 

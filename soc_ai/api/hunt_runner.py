@@ -50,8 +50,11 @@ from soc_ai.agent.toolset import GRID_BACKED_TOOLS, GRID_UNAVAILABLE_REASON
 from soc_ai.api.hunt_recorder import HuntRecorder
 from soc_ai.api.runner import CancelToken
 from soc_ai.dossier.prompt import host_dossier_prompt_block, internal_ips_in_text
+from soc_ai.hunting.outcome import FindingVerdicts
 from soc_ai.run_meter import start_search_meter
 from soc_ai.so_client.inventory import inventory_prompt_block
+from soc_ai.store import hunts as hunt_svc
+from soc_ai.webui import hunt_findings
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -928,7 +931,24 @@ async def hunt_recorded_run(
                     "payload": ev.payload,
                 },
             )
-        await recorder.finish("error" if grid_blind else "complete")
+        # The hunt investigates its subject findings as part of the hunt
+        # (soc_ai.webui.hunt_findings). A blind hunt investigates nothing: its
+        # findings rest on no grid read.
+        settings = getattr(state, "settings", None) or ctx.settings
+        plan = None if grid_blind else hunt_findings.plan_findings(recorder.report, settings)
+        await recorder.finish(
+            "error" if grid_blind else "complete",
+            finding_plan=plan.as_column() if plan is not None else None,
+        )
+        verdicts = None
+        if (
+            plan is not None
+            and recorder.hunt_id is not None
+            and recorder.final_status == hunt_svc.STATUS_INVESTIGATING
+        ):
+            verdicts = await hunt_findings.investigate_findings(
+                state, hunt_id=recorder.hunt_id, ctx=ctx, plan=plan
+            )
         # E2.4 notification trigger — a completed hunt whose report contains a
         # threat-category finding pings on-call. THIN + fail-soft: build a
         # NotifyEvent from the recorder's captured report and fire it (a hard
@@ -939,7 +959,7 @@ async def hunt_recorded_run(
         # no successful grid read has nothing behind it, and waking on-call for it
         # is the blindness generating the alarm.
         if not grid_blind:
-            await _maybe_notify_hunt(state, recorder)
+            await _maybe_notify_hunt(state, recorder, verdicts)
     except asyncio.CancelledError:
         # Only an EXPLICIT operator cancel is 'cancelled'; any other cancellation
         # (SSE client disconnect, app/container shutdown) is an interrupted run
@@ -971,25 +991,32 @@ async def hunt_recorded_run(
         await asyncio.shield(recorder.finish("error"))
 
 
-async def _maybe_notify_hunt(state: Any, recorder: HuntRecorder) -> None:
+async def _maybe_notify_hunt(
+    state: Any, recorder: HuntRecorder, verdicts: FindingVerdicts | None = None
+) -> None:
     """Fire the E2.4 hunt-threat notification for a finalized hunt (fail-soft).
 
     Reads the recorder's captured HuntReport + hunt id, builds a NotifyEvent iff
     the report has a threat-category finding (per settings), and fires it. Every
     failure mode is swallowed — a notification must NEVER break the just-finalized
     hunt. Zero egress unless notifications are enabled + a webhook is configured.
+
+    ``verdicts`` is the summary of the investigations of the hunt's subject
+    findings. When one of them reached a verdict, the notice reads the
+    verdicts and not the hunt's own claim.
     """
     try:
         from soc_ai import notify  # noqa: PLC0415 - local, keeps import graph light
 
         hunt_id = recorder.hunt_id
-        report = recorder._report  # the captured hunt_report payload (or None)
+        report = recorder.report  # the captured hunt_report payload (or None)
         if hunt_id is None or not report:
             return
         event = notify.event_for_hunt(
             hunt_id=hunt_id,
             report=report,
             settings=state.settings,
+            verdicts=verdicts,
         )
         if event is not None:
             await notify.fire_safe(event, state.settings, getattr(state, "audit", None))

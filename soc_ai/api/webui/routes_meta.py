@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from fastapi import Depends, HTTPException, Request
-from pydantic import BaseModel, ConfigDict, Field, model_serializer
-from sqlalchemy import select
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_serializer
+from sqlalchemy import func, not_, select
 
 from soc_ai import __commit__, __version__
 from soc_ai.api.data_sources import DataSourceOut, collect_data_sources
@@ -29,7 +30,10 @@ from soc_ai.bootstrap_credential import clear_bootstrap_credential
 from soc_ai.config import Settings
 from soc_ai.demo.guard import is_demo
 from soc_ai.doctor import CheckResult, run_doctor
+from soc_ai.hunting.outcome import FindingVerdicts
+from soc_ai.notify import hunt_outcome_tone
 from soc_ai.store import auth as auth_svc
+from soc_ai.store import dashboard_layout as layout_svc
 from soc_ai.store import host_dossier as dossier_svc
 from soc_ai.store import hunts as hunts_svc
 from soc_ai.store import investigations as inv_svc
@@ -114,6 +118,12 @@ class NotificationOut(BaseModel):
     # different sections and a renamed title moved an entry. "hunting" is the
     # leads and the shadow hits. Everything else is "system".
     group: str = "system"
+    # How a hunt ended, on a hunt row and on a folded sweep row: one of
+    # soc_ai.hunting.outcome.OUTCOMES (threat_found, no_threat, no_answer,
+    # could_not_run or running). None on every other row. The words are keys of
+    # frontend/src/lib/labels.ts. The console paints the row from this field
+    # and never from the title text.
+    outcome: str | None = None
 
 
 @router.get("/workspaces", response_model=list[WorkspaceOut])
@@ -164,8 +174,8 @@ def _conflict_line(host: Any, field: Any) -> str:
     elif field.conflict_kind == "retracted":
         detail = "the evidence behind your value is gone"
     else:
-        inferred = (field.inferred_value or "?")[:40]
-        operator = (field.operator_value or "?")[:40]
+        inferred = field.inferred_value or "?"
+        operator = field.operator_value or "?"
         detail = f'telemetry says "{inferred}", yours says "{operator}"'
     return f"Dossier conflict on {host.ip}, {field.field}: {detail}"
 
@@ -457,7 +467,8 @@ async def _quality_alarm_notifications(request: Request) -> list[NotificationOut
 # Notifications screen holds the full list, so these caps only stop one noisy
 # night from pushing every investigation and hunt off the panel.
 _SHADOW_HIT_NOTIF_CAP = 20
-_LEAD_NOTIF_CAP = 20
+# The leads that get a bell row each. The rest fold into one row with a count.
+_LEAD_NOTIF_ROWS = 5
 _HOLD_NOTIF_CAP = 10
 
 
@@ -561,25 +572,33 @@ async def _analytic_hold_notifications(request: Request) -> list[NotificationOut
 
 
 async def _lead_notifications(request: Request) -> list[NotificationOut]:
-    """One bell entry per lead formed in the window.
+    """One bell entry per open or hunting lead, whenever it formed.
 
     The id carries the lead id, so a client-side dismissal holds for that lead
-    and the bell announces one lead once. A shadow lead reads warn because it
-    still needs a read. A shadow lead starts nothing by itself.
+    and the bell announces one lead once. Every such lead reads warn, because a
+    lead waits on the analyst until somebody decides it. The feed used to read
+    the last 24 h only and to mark only a shadow lead warn. The bell then said
+    "None need attention" while 10 leads waited on Hunts.
+
+    The newest :data:`_LEAD_NOTIF_ROWS` leads get a row each. One more row
+    states how many others are open, so a busy week cannot push every hunt and
+    investigation off the bell. That row has no dismiss control: its number is
+    live, and the Hunts page is where the leads are decided.
     """
     from soc_ai.store.models import Lead  # noqa: PLC0415 - lazy
 
-    cutoff = auth_svc.utcnow() - _NOTIF_WINDOW
     try:
         async with request.app.state.db_sessionmaker() as db:
+            open_leads = Lead.status.in_(("open", "hunting"))
             rows = (
                 await db.scalars(
                     select(Lead)
-                    .where(Lead.formed_at >= cutoff, Lead.status.in_(("open", "hunting")))
-                    .order_by(Lead.formed_at.desc())
-                    .limit(_LEAD_NOTIF_CAP)
+                    .where(open_leads)
+                    .order_by(Lead.formed_at.desc(), Lead.id.desc())
+                    .limit(_LEAD_NOTIF_ROWS)
                 )
             ).all()
+            total = int((await db.scalar(select(func.count(Lead.id)).where(open_leads))) or 0)
     except Exception:
         _LOGGER.warning("notifications: lead read failed (continuing)", exc_info=True)
         return []
@@ -595,10 +614,24 @@ async def _lead_notifications(request: Request) -> list[NotificationOut]:
         out.append(
             NotificationOut(
                 id=f"lead:{lead.id}",
-                tone="warn" if lead.shadow else "accent",
+                tone="warn",
                 title=f"Lead {lead.id} formed on {', '.join(entities) or 'an entity'}: {kinds}",
                 when=_ago(lead.formed_at.replace(tzinfo=UTC).isoformat()),
                 href=f"/leads/{lead.id}",
+                group="hunting",
+            )
+        )
+    rest = total - len(out)
+    if rest > 0:
+        noun = "lead is" if rest == 1 else "leads are"
+        out.append(
+            NotificationOut(
+                id="lead-more",
+                tone="warn",
+                title=f"{rest} more {noun} open. Open Hunts to decide.",
+                when="",
+                href="/hunts#leads",
+                dismissible=False,
                 group="hunting",
             )
         )
@@ -671,8 +704,21 @@ async def list_notifications(request: Request) -> list[NotificationOut]:
             primary_only=True,
         )
         hunts_done = await hunts_svc.list_recent_notifications(
-            db, status="complete", limit=10, finished_since=cutoff
+            db, statuses=_HUNT_NOTIF_STATUSES, limit=20, finished_since=cutoff
         )
+        # The hunts in flight. Each gets a row in the running tone. A hunt
+        # that investigates its findings is in flight too.
+        hunts_running = await hunts_svc.list_recent_notifications(
+            db, statuses=hunts_svc.OPEN_STATUSES, limit=5
+        )
+        # The findings and the narrative of the hunts the threat count cannot
+        # settle: a hunt with no threat is clean, unanswered or a failed run.
+        hunt_inputs = await hunts_svc.outcome_inputs(
+            db, [h.id for h in hunts_done if not h.threat_findings_count]
+        )
+        # What the investigations of the hunts' findings decided. A verdict
+        # outranks the hunt's own claim on the bell, as on the hunt list.
+        hunt_verdicts = await hunts_svc.finding_verdicts(db, [h.id for h in hunts_done])
     # A triage that died goes with the standing entries, not the completions:
     # it is the same class of fact as a dependency being down, and putting it
     # behind a busy hour's verdicts is how it stays unseen. Ten weeks of these
@@ -723,39 +769,434 @@ async def list_notifications(request: Request) -> list[NotificationOut]:
                 isSynthEval=bool(inv.is_synth_eval),
             )
         )
-    for h in hunts_done:
-        # Denormalized counts (migrations 0028, 0044) — no report blob here.
-        n = h.findings_count or 0
-        threats = h.threat_findings_count
-        if n and threats == 0:
-            # Every finding is a gap or an observation. "1 finding" over a
-            # timed-out query was the most alarming line the app can print,
-            # meaning nothing; the count is dropped because counting gaps as
-            # findings is how it got there.
-            # One phrase for this outcome, from routes_hunts. The list, the
-            # bell and the hunt page must not each invent their own words.
-            title = f"{routes_hunts.GAP_NOTIFICATION_TITLE}. {h.objective[:80]}"
-            tone = "accent"
-        else:
-            # The notice names what it counts. It counted the threat findings
-            # and called them "findings", so "3 findings" sat beside a hunt
-            # page that read "4 findings": 3 threat findings and 1
-            # observation. A row from before the threat count says findings.
-            shown = threats if threats is not None else n
-            noun = "threat finding" if threats is not None else "finding"
-            title = f"Hunt finished, {shown} {noun}{'' if shown == 1 else 's'}: {h.objective[:80]}"
-            tone = "warn" if shown else "accent"
-        done.append(
-            NotificationOut(
-                id=f"hunt-done:{h.id}",
-                tone=tone,
-                title=title,
-                when=_ago((h.finished_at or h.created_at).isoformat()),
-                href=f"/hunts/{h.id}",
-                isSynthEval=bool(h.is_synth_eval),
-            )
-        )
+    for h in hunts_running:
+        done.append(_hunt_in_flight(h))
+    done.extend(_hunt_notifications(hunts_done, hunt_inputs, hunt_verdicts))
     return (out + done)[:12]
+
+
+def _hunt_in_flight(h: hunts_svc.HuntNotifRow) -> NotificationOut:
+    """The bell line of a hunt that has not ended.
+
+    "Hunt running: <title>" while the model hunts, and "Investigating 2 of 3
+    findings: <title>" while the investigations of its findings run.
+    """
+    from soc_ai.hunting.outcome import outcome_label  # noqa: PLC0415 - lazy
+
+    title = routes_hunts.objective_headline(h.objective)
+    if h.status == hunts_svc.STATUS_INVESTIGATING:
+        counts = FindingVerdicts(total=h.findings_total, investigated=h.findings_investigated)
+        line = f"{outcome_label('investigating', counts)}: {title}"
+        outcome = "investigating"
+    else:
+        line = f"Hunt running: {title}"
+        outcome = "running"
+    return NotificationOut(
+        id=f"hunt:{h.id}",
+        tone=hunt_outcome_tone(outcome),
+        title=line,
+        when=_ago(h.created_at.isoformat()),
+        href=f"/hunts/{h.id}",
+        isSynthEval=bool(h.is_synth_eval),
+        outcome=outcome,
+    )
+
+
+# The hunt rows the bell reads. A cancel is the analyst's own act and needs no
+# notice. An error and a restart do: the hunt could not run.
+_HUNT_NOTIF_STATUSES: tuple[str, ...] = ("complete", "error", "interrupted")
+
+# Two catalog runs one sweep recorded finish minutes apart. A gap this long
+# starts a new sweep.
+_SWEEP_GAP = timedelta(minutes=15)
+
+# The catalog sweep's actor (soc_ai.hunting.sweep.SWEEP_ACTOR).
+_CATALOG_ACTOR = "hunt-catalog"
+
+
+def _is_catalog_run(h: hunts_svc.HuntNotifRow) -> bool:
+    return h.kind == "triggered" or h.started_by == _CATALOG_ACTOR
+
+
+def _one_line(text: str) -> str:
+    """A reason sentence on one line, whole. The bell wraps a long line."""
+    return " ".join(text.split())
+
+
+def _hunt_outcome_of(
+    h: hunts_svc.HuntNotifRow,
+    inputs: dict[str, tuple[list[Any], str]],
+    verdicts: FindingVerdicts | None = None,
+) -> tuple[str, str]:
+    """(outcome, headline) of one bell row: the same words the hunt list prints.
+
+    ``verdicts`` is what the investigations of the hunt's findings decided.
+    A verdict outranks the hunt's own threat count.
+    """
+    from soc_ai.hunting import outcome as hunt_outcome  # noqa: PLC0415 - lazy
+
+    if verdicts is not None and verdicts.decided and h.status == "complete":
+        return hunt_outcome.public_outcome(h.status, [], None, verdicts), ""
+    if h.threat_findings_count:
+        return "threat_found", ""
+    findings, narrative = inputs.get(h.id, ([], ""))
+    outcome = hunt_outcome.public_outcome(h.status, findings, narrative)
+    headline = hunt_outcome.outcome_headline(outcome, h.status, findings, narrative) or ""
+    return outcome, headline
+
+
+def _hunt_line(
+    h: hunts_svc.HuntNotifRow,
+    outcome: str,
+    headline: str,
+    verdicts: FindingVerdicts | None = None,
+) -> str:
+    """The title of one hunt in the bell.
+
+    The hunt is named through the one title builder,
+    :func:`routes_hunts.objective_headline`. The tone comes from
+    :data:`soc_ai.notify.HUNT_OUTCOME_TONE`, so the bell and the webhook agree.
+    A hunt whose findings an investigation confirmed reads "Hunt finished: 2
+    of 3 findings are threats".
+    """
+    title = routes_hunts.objective_headline(h.objective)
+    if outcome == "threats_confirmed":
+        from soc_ai.hunting.outcome import outcome_label  # noqa: PLC0415 - lazy
+
+        return f"Hunt finished: {outcome_label(outcome, verdicts)}. {title}"
+    if outcome == "could_not_run":
+        noun = "Analytic" if _is_catalog_run(h) else "Hunt"
+        reason = f" {_one_line(headline)}" if headline else ""
+        return f"{noun} could not run: {title.rstrip('.')}.{reason}"
+    if outcome == "threat_found":
+        # The notice names what it counts. It counted the threat findings and
+        # called them "findings", so "3 findings" sat beside a hunt page that
+        # read "4 findings". A row from before the threat count says findings.
+        threats = h.threat_findings_count
+        shown = threats if threats is not None else (h.findings_count or 0)
+        noun = "threat finding" if threats is not None else "finding"
+        return f"Hunt finished, {shown} {noun}{'' if shown == 1 else 's'}: {title}"
+    # The outcome's own label (soc_ai.hunting.outcome.OUTCOME_LABEL), the word
+    # the list and the hunt page print.
+    from soc_ai.hunting.outcome import OUTCOME_LABEL  # noqa: PLC0415 - lazy
+
+    word = OUTCOME_LABEL.get(outcome, OUTCOME_LABEL["no_threat"]).lower()
+    return f"Hunt finished: {word}. {title}"
+
+
+def _hunt_notifications(
+    hunts: list[hunts_svc.HuntNotifRow],
+    inputs: dict[str, tuple[list[Any], str]],
+    verdicts: dict[str, FindingVerdicts] | None = None,
+) -> list[NotificationOut]:
+    """The bell lines for finished hunts, newest first.
+
+    One outcome per hunt, from soc_ai.hunting.outcome, so the bell and the
+    hunt list never disagree. The catalog runs of one sweep that share an
+    outcome other than a threat fold into one line, at the place of the newest
+    run: the bell listed eight lines that each said the same thing about eight
+    analytics, and a threat or a lead fell off the twelve-line panel. A run
+    with a threat keeps its own line.
+    """
+    decided = verdicts or {}
+    rated = [(h, *_hunt_outcome_of(h, inputs, decided.get(h.id))) for h in hunts]
+    # Cluster the foldable runs per outcome. The rows arrive newest first, so
+    # a run joins the cluster of the newer run before it when the two finished
+    # inside one sweep gap.
+    cluster_of: dict[str, list[tuple[hunts_svc.HuntNotifRow, str, str]]] = {}
+    open_cluster: dict[str, list[tuple[hunts_svc.HuntNotifRow, str, str]]] = {}
+    for h, outcome, headline in rated:
+        if not _is_catalog_run(h) or outcome in ("threat_found", "threats_confirmed"):
+            continue
+        current = open_cluster.get(outcome)
+        if current is None or _stamp(current[-1][0]) - _stamp(h) > _SWEEP_GAP:
+            current = []
+            open_cluster[outcome] = current
+        current.append((h, outcome, headline))
+        cluster_of[h.id] = current
+
+    out: list[NotificationOut] = []
+    for h, outcome, headline in rated:
+        members = cluster_of.get(h.id)
+        if members is None or len(members) == 1:
+            out.append(_hunt_notice(h, outcome, headline, decided.get(h.id)))
+        elif members[0][0].id == h.id:
+            out.append(_folded_notice(members))
+    return out
+
+
+def _stamp(h: hunts_svc.HuntNotifRow) -> datetime:
+    return h.finished_at or h.created_at
+
+
+def _hunt_notice(
+    h: hunts_svc.HuntNotifRow,
+    outcome: str,
+    headline: str,
+    verdicts: FindingVerdicts | None = None,
+) -> NotificationOut:
+    return NotificationOut(
+        id=f"hunt-done:{h.id}",
+        tone=hunt_outcome_tone(outcome),
+        title=_hunt_line(h, outcome, headline, verdicts),
+        when=_ago(_stamp(h).isoformat()),
+        href=f"/hunts/{h.id}",
+        isSynthEval=bool(h.is_synth_eval),
+        outcome=outcome,
+    )
+
+
+def _folded_notice(group: list[tuple[hunts_svc.HuntNotifRow, str, str]]) -> NotificationOut:
+    """One line for the catalog runs of one sweep that share an outcome."""
+    from soc_ai.hunting.outcome import OUTCOME_LABEL  # noqa: PLC0415 - lazy
+
+    newest, outcome, _headline = group[0]
+    oldest = group[-1][0]
+    n = len(group)
+    if outcome == "could_not_run":
+        reasons = {headline for _h, _o, headline in group}
+        reason = (
+            _one_line(next(iter(reasons)))
+            if len(reasons) == 1 and "" not in reasons
+            else ("Open the Hunts page to read why.")
+        )
+        title = f"{n} analytics could not run. {reason}"
+    else:
+        title = f"{n} catalog hunts finished: {OUTCOME_LABEL.get(outcome, outcome).lower()}"
+    return NotificationOut(
+        # Keyed on the first run of the sweep, so the line keeps its id while
+        # the sweep adds runs, and a dismissal holds.
+        id=f"hunt-sweep:{outcome}:{oldest.id}",
+        tone=hunt_outcome_tone(outcome),
+        title=title,
+        when=_ago(_stamp(newest).isoformat()),
+        href="/hunts?kind=triggered",
+        isSynthEval=any(bool(h.is_synth_eval) for h, _o, _hl in group),
+        outcome=outcome,
+    )
+
+
+# ── The needs-you count ────────────────────────────────────────────────────
+
+# The window of the two investigation parts. The console links the
+# needs-more-info part to the Investigations list with a verdict filter, and
+# that list opens on 30 days when a link names a verdict.
+_NEEDS_YOU_VERDICT_DAYS = 30
+# How long one grid read of the alert part serves every caller. The read is an
+# aggregation, and every open tab polls this count from three surfaces.
+_NEEDS_YOU_ALERT_TTL_S = 30.0
+# The most true-positive runs the pending-action part reads.
+_PENDING_ACTION_SCAN = 500
+# The event kinds that decide whether a recommended action is still pending.
+# A dismissal and its undo are events too (the action card stores them).
+_ACTION_EVENT_KINDS = (
+    "action_executed",
+    "action_dismissed",
+    "action_restored",
+    "auto_ack",
+    "auto_ack_skipped",
+    "approval_request",
+    "approval_required",
+)
+
+
+class NeedsYouCountOut(BaseModel):
+    """What waits on the analyst now: one total, and the five parts of it.
+
+    The Dashboard tile, the sidebar badges and the bell read this one answer,
+    so the three surfaces cannot state different numbers. The landing page
+    said "queue clear" while 11 leads waited, because each surface counted its
+    own part and the Dashboard counted none of the hunting work.
+
+    A part is ``None`` when the server could not read it. ``unknown`` names
+    those parts, and ``total`` is then the sum of the parts it could read, a
+    floor. A failed read is never a zero.
+    """
+
+    leads_needing_decision: int | None = 0
+    unread_shadow_hits: int | None = 0
+    untriaged_groups: int | None = 0
+    needs_more_info: int | None = 0
+    pending_actions: int | None = 0
+    total: int = 0
+    unknown: list[str] = Field(default_factory=list)
+    # The windows of the parts that have one, in the console's range words.
+    alert_window: str = "7d"
+    verdict_window: str = f"{_NEEDS_YOU_VERDICT_DAYS}d"
+    # True when the alert part is a floor: the grid capped the group list.
+    alert_floor: bool = False
+
+
+async def _cached_untriaged_groups(request: Request) -> tuple[int, bool]:
+    """The alert part, read from the grid at most once per TTL."""
+    from soc_ai.api.webui import routes_alerts  # noqa: PLC0415 - lazy
+
+    state = request.app.state
+    cached = getattr(state, "_needs_you_alert_cache", None)
+    now = time.monotonic()
+    if cached is not None and now - cached[0] < _NEEDS_YOU_ALERT_TTL_S:
+        return cached[1], cached[2]
+    count, floor = await routes_alerts.untriaged_group_count(request)
+    state._needs_you_alert_cache = (now, count, floor)
+    return count, floor
+
+
+async def _pending_action_count(request: Request, *, since: datetime) -> int:
+    """Recommended actions that wait for a person, on the standing true positives.
+
+    The rule is the action card's own (:func:`_timeline._build_actions`): an
+    action is pending when no execution receipt and no auto-ack carried it out,
+    and no analyst dismissed it.
+    Only the alert's primary run counts, because a later run replaced the
+    others. Only a true positive counts. A false positive recommends an
+    acknowledgement, and that housekeeping would drown the count. A
+    needs-more-info verdict recommends nothing. A run from the old approval gate
+    offers nothing to execute, so it counts nothing.
+
+    The card also reads the live acknowledged flag of the alert from the grid.
+    This count does not, because one grid read per run is too much for a poll.
+    An alert that Security Onion acknowledged outside soc-ai can still count.
+    """
+    from soc_ai.store.models import Investigation  # noqa: PLC0415 - lazy
+
+    async with request.app.state.db_sessionmaker() as db:
+        runs = (
+            await db.scalars(
+                select(Investigation)
+                .where(
+                    Investigation.status == "complete",
+                    Investigation.verdict == "true_positive",
+                    Investigation.is_fallback.isnot(True),
+                    Investigation.created_at >= since,
+                    not_(inv_svc.superseded_sql()),
+                )
+                .order_by(Investigation.created_at.desc())
+                .limit(_PENDING_ACTION_SCAN)
+            )
+        ).all()
+        by_run = await pending_actions_by_run(db, runs)
+    return sum(by_run.values())
+
+
+async def pending_actions_by_run(db: Any, runs: Sequence[Any]) -> dict[str, int]:
+    """The pending recommended actions of each run, keyed by run id.
+
+    The caller picks the runs. This applies the rest of the needs-you rule
+    (:func:`_pending_action_count`): an action is pending when no receipt and
+    no auto-ack carried it out and no analyst dismissed it, and a run from
+    the old approval gate counts nothing. A run with no recommended action is
+    left out. The hunt page reads it for the investigation of each finding.
+    """
+    from soc_ai.api.webui._timeline import _build_actions  # noqa: PLC0415 - lazy
+    from soc_ai.store.models import InvestigationEvent  # noqa: PLC0415 - lazy
+
+    with_actions = [
+        run
+        for run in runs
+        if isinstance(run.report, dict) and run.report.get("recommended_actions")
+    ]
+    if not with_actions:
+        return {}
+    events = (
+        await db.scalars(
+            select(InvestigationEvent)
+            .where(
+                InvestigationEvent.investigation_id.in_([run.id for run in with_actions]),
+                InvestigationEvent.kind.in_(_ACTION_EVENT_KINDS),
+            )
+            .order_by(InvestigationEvent.sequence, InvestigationEvent.id)
+        )
+    ).all()
+    by_run: dict[str, list[Any]] = {}
+    for event in events:
+        by_run.setdefault(event.investigation_id, []).append(event)
+    pending: dict[str, int] = {}
+    for run in with_actions:
+        run_events = by_run.get(run.id, [])
+        if any(e.kind in ("approval_request", "approval_required") for e in run_events):
+            continue
+        report = run.report if isinstance(run.report, dict) else {}
+        pending[run.id] = sum(
+            1
+            for action in _build_actions(run_events, report)
+            if not action.applied and not action.dismissed
+        )
+    return pending
+
+
+@router.get("/needs-you", response_model=NeedsYouCountOut)
+async def needs_you_count(request: Request) -> NeedsYouCountOut:
+    """The needs-you count: every part, and the total.
+
+    * ``leads_needing_decision`` and ``unread_shadow_hits``: the Hunts page
+      count (``GET /hunts/needs-you``), read through its own route.
+    * ``untriaged_groups``: alert groups with no verdict in ``alert_window``,
+      acknowledged groups hidden, read through the Alerts list.
+    * ``needs_more_info``: runs with that verdict in ``verdict_window``, the
+      count the Investigations list shows for that filter.
+    * ``pending_actions``: recommended actions that wait on the standing true
+      positives in ``verdict_window``.
+
+    Each part fails alone. A grid outage takes the alert part and leaves the
+    four database parts standing.
+    """
+    from soc_ai.api.webui import (  # noqa: PLC0415 - lazy
+        routes_alerts,
+        routes_analytics,
+        routes_investigations,
+    )
+
+    out = NeedsYouCountOut(alert_window=routes_alerts.NEEDS_YOU_ALERT_RANGE)
+    try:
+        hunting = await routes_analytics.needs_you(request)
+        out.leads_needing_decision = hunting.leads_needing_decision
+        out.unread_shadow_hits = hunting.unread_shadow_hits
+    except Exception:
+        _LOGGER.warning("needs-you: the hunting part failed (continuing)", exc_info=True)
+        out.leads_needing_decision = None
+        out.unread_shadow_hits = None
+        out.unknown += ["leads_needing_decision", "unread_shadow_hits"]
+    try:
+        out.untriaged_groups, out.alert_floor = await _cached_untriaged_groups(request)
+    except Exception:
+        _LOGGER.warning("needs-you: the alert part failed (continuing)", exc_info=True)
+        out.untriaged_groups = None
+        out.unknown.append("untriaged_groups")
+    since = datetime.now(UTC) - timedelta(days=_NEEDS_YOU_VERDICT_DAYS)
+    try:
+        page = await routes_investigations.list_investigations(
+            request,
+            status=None,
+            verdict="needs_more_info",
+            q=None,
+            since=since,
+            until=None,
+            error_state=None,
+            limit=1,
+            offset=0,
+        )
+        out.needs_more_info = page.total
+    except Exception:
+        _LOGGER.warning("needs-you: the needs-more-info part failed (continuing)", exc_info=True)
+        out.needs_more_info = None
+        out.unknown.append("needs_more_info")
+    try:
+        out.pending_actions = await _pending_action_count(request, since=since.replace(tzinfo=None))
+    except Exception:
+        _LOGGER.warning("needs-you: the pending-action part failed (continuing)", exc_info=True)
+        out.pending_actions = None
+        out.unknown.append("pending_actions")
+    out.total = sum(
+        part or 0
+        for part in (
+            out.leads_needing_decision,
+            out.unread_shadow_hits,
+            out.untriaged_groups,
+            out.needs_more_info,
+            out.pending_actions,
+        )
+    )
+    return out
 
 
 # ── Scheduled maintenance (backup + blocklist cron visibility) ─────────────
@@ -1079,11 +1520,14 @@ def _view_out(row: Any) -> SavedViewOut:
     )
 
 
-async def _require_user(request: Request) -> Any:
+async def _require_user(
+    request: Request, hint: str = "Saved views belong to a signed-in user."
+) -> Any:
     """The signed-in user, or a 401 in the house shape.
 
     A saved view belongs to a person, so there is no dev fallback here: a
     bearer-token caller and a no-auth dev session have no user row to own one.
+    The Dashboard layout is the same, and passes its own ``hint``.
     """
     user = await current_user(request)
     if user is None:
@@ -1091,7 +1535,7 @@ async def _require_user(request: Request) -> Any:
             status_code=401,
             detail={
                 "reason": "no_session",
-                "hint": "Saved views belong to a signed-in user.",
+                "hint": hint,
             },
         )
     return user
@@ -1162,6 +1606,91 @@ async def delete_my_view(request: Request, view_id: int) -> dict[str, bool]:
     if not gone:
         raise HTTPException(status_code=404, detail={"reason": "not_found"})
     return {"ok": True}
+
+
+# ── Dashboard layout (per user) ───────────────────────────────────────────────
+
+
+class LayoutPanelIO(BaseModel):
+    """One panel's slot. Strict integers: 1.5 columns and ``true`` are refused."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=64)
+    x: StrictInt
+    y: StrictInt
+    w: StrictInt
+    h: StrictInt
+
+
+class DashboardLayoutIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    panels: list[LayoutPanelIO] = Field(max_length=64)
+
+
+class DashboardLayoutOut(BaseModel):
+    # None when the user keeps the shipped layout.
+    panels: list[LayoutPanelIO] | None
+    updated_at: str | None = None
+
+
+_LAYOUT_HINT = (
+    "A Dashboard layout belongs to a signed-in user. "
+    "With authentication off, the browser keeps the layout."
+)
+
+
+def _layout_out(row: Any) -> DashboardLayoutOut:
+    if row is None:
+        return DashboardLayoutOut(panels=None)
+    panels = layout_svc.sanitize_panels(row.panels_json)
+    return DashboardLayoutOut(
+        panels=[LayoutPanelIO(**p) for p in panels],
+        updated_at=_iso_utc(row.updated_at) or None,
+    )
+
+
+@router.get("/me/dashboard-layout", response_model=DashboardLayoutOut)
+async def get_my_dashboard_layout(request: Request) -> DashboardLayoutOut:
+    """This user's Dashboard layout. ``panels`` is null for the shipped layout.
+
+    A slot for a panel this build does not have is dropped on the way out.
+    """
+    user = await _require_user(request, hint=_LAYOUT_HINT)
+    async with request.app.state.db_sessionmaker() as db:
+        row = await layout_svc.get_layout(db, user.id)
+    return _layout_out(row)
+
+
+@router.put("/me/dashboard-layout", response_model=DashboardLayoutOut)
+async def put_my_dashboard_layout(request: Request, body: DashboardLayoutIn) -> DashboardLayoutOut:
+    """Keep this user's Dashboard layout, replacing the one before."""
+    user = await _require_user(request, hint=_LAYOUT_HINT)
+    slots: list[layout_svc.PanelSlot] = [
+        {"id": p.id, "x": p.x, "y": p.y, "w": p.w, "h": p.h} for p in body.panels
+    ]
+    try:
+        panels = layout_svc.validate_panels(slots)
+    except layout_svc.LayoutInvalidError as exc:
+        raise HTTPException(
+            status_code=400, detail={"reason": exc.reason, "hint": exc.hint}
+        ) from exc
+    async with request.app.state.db_sessionmaker() as db:
+        row = await layout_svc.put_layout(db, user.id, panels)
+    return _layout_out(row)
+
+
+@router.delete("/me/dashboard-layout")
+async def delete_my_dashboard_layout(request: Request) -> dict[str, bool]:
+    """Reset this user's Dashboard to the shipped layout.
+
+    Idempotent: a user with no saved layout gets ``removed: false``.
+    """
+    user = await _require_user(request, hint=_LAYOUT_HINT)
+    async with request.app.state.db_sessionmaker() as db:
+        removed = await layout_svc.delete_layout(db, user.id)
+    return {"ok": True, "removed": removed}
 
 
 # ── Upstream health (ES / LLM / PCAP) — drives the live status indicator ───────

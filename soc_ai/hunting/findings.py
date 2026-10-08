@@ -29,6 +29,9 @@ whole sentence it has always had.
 
 from __future__ import annotations
 
+import hashlib
+import ipaddress
+import json
 import re
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -48,8 +51,11 @@ _LEVEL_TO_SEVERITY = {
 }
 
 
-# HuntFinding's own style rule: ~8 words / 60 characters, scannable in a list.
-_TITLE_BUDGET = 60
+# A finding title is never cut. The spec title is reviewed YAML and the console
+# wraps a long title. The budget was 60 characters, then 500, and the store held
+# titles such as "Directory replication requested by a non-machin… — localuser".
+# The rest of the title was then nowhere, because the cut happened before the
+# store. The owner banned the ellipsis cut (2026-10-07).
 
 
 # The runner records the exception as it was raised ("precondition:
@@ -82,20 +88,13 @@ def plain_error(text: str | None) -> str:
 
 
 def _title(spec: HuntSpec, scope_key: str) -> str:
-    """``<spec title> — <entity>``, trimming the TITLE rather than the entity.
+    """``<spec title> — <entity>``, both whole.
 
     The entity is the most identifying part: two findings from the same spec are
     told apart only by it. A first version truncated the composed string, which
     cut ``localuser`` down to ``local`` and made the two indistinguishable.
     """
-    tail = f" — {scope_key}"
-    room = _TITLE_BUDGET - len(tail)
-    if room < 12:
-        # A pathologically long entity gets the whole budget; a truncated title
-        # is recoverable from the finding body, a truncated entity is not.
-        return scope_key[:_TITLE_BUDGET]
-    head = spec.title if len(spec.title) <= room else spec.title[: room - 1].rstrip() + "…"
-    return f"{head}{tail}"
+    return f"{spec.title} — {scope_key}"
 
 
 def _sentence(spec: HuntSpec) -> str:
@@ -239,7 +238,7 @@ def candidate_findings(spec: HuntSpec, run: SpecRun) -> list[dict[str, Any]]:
         # be attributed is precisely the one worth reading.
         findings.append(
             {
-                "title": f"Unattributable matches for {spec.id}"[:60],
+                "title": f"Unattributable matches for {spec.id}",
                 "spec_rationale": _sentence(spec),
                 "detail": (
                     f"{_sentence(spec)} {run.unattributed_docs} document(s) matched this "
@@ -266,7 +265,7 @@ def candidate_findings(spec: HuntSpec, run: SpecRun) -> list[dict[str, Any]]:
         # see.
         findings.append(
             {
-                "title": f"Unevaluated exclusions for {spec.id}"[:60],
+                "title": f"Unevaluated exclusions for {spec.id}",
                 "spec_rationale": _sentence(spec),
                 "detail": (
                     f"{_sentence(spec)} {run.undecided_docs} document(s) matched this "
@@ -292,7 +291,7 @@ def candidate_findings(spec: HuntSpec, run: SpecRun) -> list[dict[str, Any]]:
         hosts = ", ".join(run.role_unconfirmed_hosts) or "unnamed hosts"
         findings.append(
             {
-                "title": f"Unconfirmed host role for {spec.id}"[:60],
+                "title": f"Unconfirmed host role for {spec.id}",
                 "spec_rationale": _sentence(spec),
                 "detail": (
                     f"{_sentence(spec)} {run.role_unconfirmed_docs} document(s) matched "
@@ -312,7 +311,7 @@ def candidate_findings(spec: HuntSpec, run: SpecRun) -> list[dict[str, Any]]:
     if run.truncated_docs:
         findings.append(
             {
-                "title": f"Too many scopes for {spec.id}"[:60],
+                "title": f"Too many scopes for {spec.id}",
                 "spec_rationale": _sentence(spec),
                 "detail": (
                     f"{_sentence(spec)} Elasticsearch returned the bucket ceiling. It left "
@@ -353,6 +352,11 @@ def candidate_findings(spec: HuntSpec, run: SpecRun) -> list[dict[str, Any]]:
                 "severity": _LEVEL_TO_SEVERITY.get(candidate.level or spec.level, "medium"),
                 "category": "threat",
                 "hosts": [candidate.scope_key] if candidate.scope_kind in {"host", "ip"} else [],
+                # The entity the candidate is about, in the scope's own type.
+                # ``hosts`` holds only a host or an address, so a user-scoped
+                # candidate named its user in the title alone, and the subject
+                # rule below could not read it.
+                "entities": [{"kind": candidate.scope_kind, "value": candidate.scope_key}],
                 # Real document ids. The promotion route resolves one of these
                 # to an anchor and runs triage on it, so a synthesised or
                 # placeholder citation would break the whole path.
@@ -492,11 +496,199 @@ def hunt_outcome(status: str, findings: Any) -> tuple[int, str]:
     return 0, "gap" if len(gaps) == len(rows) else "clean"
 
 
+# ── The subject rule: which findings the hunt investigates ──────────────────
+#
+# The owner's decision (2026-10-07): a hunt investigates its findings as part
+# of the hunt. A finding is a subject when it names an entity, cites a
+# document, and is not a visibility gap, a failed run or a clean "nothing
+# here" result. Every test below reads a structured field. The one exception
+# is the clean test, which reads the title of an ``observation`` finding only:
+# the schema has no field that says "nothing was found", and a threat finding
+# is a subject whatever its title says.
+
+# An Elasticsearch document id, the shape the promotion anchor accepts. A
+# finding also cites prose and tool calls, and those are not documents.
+DOCUMENT_ID_RE = re.compile(r"^[A-Za-z0-9_\-:.]{12,128}$")
+
+# The entity types a subject can name, keyed by the word a finding or a scope
+# uses for them. A rule, a dataset and a decoy name no entity to investigate.
+_ENTITY_KINDS: dict[str, str] = {
+    "host": "host",
+    "ip": "address",
+    "address": "address",
+    "user": "user",
+    "cloud_identity": "user",
+    "mailbox": "user",
+    "domain": "domain",
+}
+
+# The title of an observation that states a clean result.
+_CLEAN_TITLE_RE = re.compile(
+    r"^\s*(?:no|nothing|none)\b"
+    r"|\bno (?:evidence|sign|signs|indication|indications|trace|activity)\b"
+    r"|\bnot (?:observed|found|detected|seen)\b"
+    r"|\bfound nothing\b|\ball[- ]clear\b",
+    re.IGNORECASE,
+)
+
+# The severity ladder, lowest first. An unknown severity ranks as medium: the
+# order only decides which subject waits, never whether one is investigated.
+_SEVERITY_ORDER = ("info", "low", "medium", "high", "critical")
+_SEVERITY_RANK = {s: i for i, s in enumerate(_SEVERITY_ORDER)}
+
+
+def _address_or_host(value: str) -> str:
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return "host"
+    return "address"
+
+
+def _scalar(value: Any) -> str | None:
+    """A stripped, lowercased string for a str or int value, else None."""
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return None
+    text = str(value).strip().lower()
+    return text or None
+
+
+def finding_entities(finding: Mapping[str, Any]) -> list[tuple[str, str]]:
+    """The entities one finding names, as ``(type, value)`` pairs without repeats.
+
+    ``hosts`` holds a host name or an address. ``entities`` holds typed pairs,
+    as a dict ``{"kind", "value"}`` or a two-item list. ``users`` and
+    ``domains`` hold plain values. A value is stripped and lowercased, so two
+    findings that name one host in two cases name one entity.
+    """
+    pairs: list[tuple[str, Any]] = []
+    hosts = finding.get("hosts")
+    for host in hosts if isinstance(hosts, list) else []:
+        text = _scalar(host)
+        if text is not None:
+            pairs.append((_address_or_host(text), text))
+    entities = finding.get("entities")
+    for item in entities if isinstance(entities, list) else []:
+        if isinstance(item, Mapping):
+            raw_kind, value = item.get("kind"), item.get("value")
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            raw_kind, value = item[0], item[1]
+        else:
+            continue
+        kind = _ENTITY_KINDS.get(str(raw_kind or "").strip().lower())
+        if kind is not None:
+            pairs.append((kind, value))
+    for key, kind in (("users", "user"), ("domains", "domain")):
+        values = finding.get(key)
+        for value in values if isinstance(values, list) else []:
+            pairs.append((kind, value))
+    out: list[tuple[str, str]] = []
+    for kind, value in pairs:
+        text = _scalar(value)
+        if text is not None and (kind, text) not in out:
+            out.append((kind, text))
+    return out
+
+
+def finding_document_ids(finding: Mapping[str, Any]) -> list[str]:
+    """The document ids a finding cites, in order, without repeats."""
+    citations = finding.get("citations")
+    out: list[str] = []
+    for c in citations if isinstance(citations, list) else []:
+        if isinstance(c, bool) or not isinstance(c, (str, int)):
+            continue
+        text = str(c).strip()
+        if DOCUMENT_ID_RE.match(text) and text not in out:
+            out.append(text)
+    return out
+
+
+def is_clean_finding(finding: Mapping[str, Any]) -> bool:
+    """True for an observation that states a clean "nothing here" result."""
+    if finding_category(finding) != "observation":
+        return False
+    return bool(_CLEAN_TITLE_RE.search(str(finding.get("title") or "")))
+
+
+def is_run_failure_finding(finding: Mapping[str, Any]) -> bool:
+    """True for the finding that records a failed query and nothing else."""
+    title = str(finding.get("title") or "")
+    return finding_category(finding) == "visibility_gap" and title.endswith(": could not run")
+
+
+def finding_is_subject(finding: Any) -> bool:
+    """Whether the hunt investigates this finding.
+
+    A subject names at least one entity (a host, an address, a user or a
+    domain). A visibility gap, a failed run and a clean observation are never
+    subjects: a gap and a failure name no activity, and a clean result names
+    nothing to check.
+
+    A citation is not required. The investigation runs on the document the
+    finding cites, else on the evidence of the lead the hunt was started on.
+    A finding with no document to run on is still a subject: the phase
+    reports that it could not open the investigation, and the analyst sees
+    why. A threat the model named without a citation is the one to check,
+    not the one to skip (owner, 2026-10-07).
+    """
+    if not isinstance(finding, Mapping):
+        return False
+    if finding_category(finding) == "visibility_gap" or is_run_failure_finding(finding):
+        return False
+    if is_clean_finding(finding):
+        return False
+    return bool(finding_entities(finding))
+
+
+def subject_fingerprint(finding: Mapping[str, Any]) -> str | None:
+    """The hunt-independent identity of a finding's subject, or None.
+
+    The entity set and the cited document ids, sorted, hashed. Two hunts of
+    one lead that find the same activity on the same documents share it, so
+    the second hunt reuses the first one's investigation. None when the
+    finding names no entity and cites no document.
+    """
+    entities = sorted({f"{kind}:{value}" for kind, value in finding_entities(finding)})
+    documents = sorted(set(finding_document_ids(finding)))
+    if not entities and not documents:
+        return None
+    body = json.dumps({"entities": entities, "documents": documents}, sort_keys=True)
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()[:32]
+
+
+def severity_rank(severity: Any) -> int:
+    """The rank of a severity on the ladder. An unknown value ranks as medium."""
+    return _SEVERITY_RANK.get(str(severity or "").strip().lower(), _SEVERITY_RANK["medium"])
+
+
+def subject_ordinals(findings: Any) -> list[int]:
+    """The ordinals of the subject findings, in priority order.
+
+    The highest severity first, then the report's own order.
+    """
+    if not isinstance(findings, list):
+        return []
+    subjects = [
+        (i, f) for i, f in enumerate(findings) if isinstance(f, Mapping) and finding_is_subject(f)
+    ]
+    subjects.sort(key=lambda pair: (-severity_rank(pair[1].get("severity")), pair[0]))
+    return [i for i, _f in subjects]
+
+
 __all__ = [
+    "DOCUMENT_ID_RE",
     "candidate_findings",
     "detail_sentence",
     "finding_category",
+    "finding_document_ids",
+    "finding_entities",
+    "finding_is_subject",
     "hunt_outcome",
+    "is_clean_finding",
+    "is_run_failure_finding",
+    "severity_rank",
     "spec_report",
+    "subject_fingerprint",
+    "subject_ordinals",
     "threat_finding_count",
 ]

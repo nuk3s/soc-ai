@@ -93,7 +93,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
 import { getShadowHits, publishShadowHitsChanged } from '../lib/api';
 import {
   COUNT_ALERT_EVENTS,
-  COUNT_AWAITING,
+  COUNT_NEEDS_YOU,
   COUNT_RUNNING,
   COUNT_TRUE_POSITIVES,
   COUNT_UNREAD_SHADOW_HITS,
@@ -112,7 +112,7 @@ describe('Dashboard recent investigations', () => {
       '[data-testid="recent-investigation"]',
     )! as HTMLElement;
     expect(within(fbRow).getByText('Pipeline error')).toBeTruthy();
-    expect(within(fbRow).queryByText('Needs info')).toBeNull();
+    expect(within(fbRow).queryByText('Needs more info')).toBeNull();
   });
 
   it('keeps the Needs-info pill on a genuine needs_more_info run', async () => {
@@ -124,7 +124,7 @@ describe('Dashboard recent investigations', () => {
     const nmiRow = (await screen.findByText('ET Genuine NMI')).closest(
       '[data-testid="recent-investigation"]',
     )! as HTMLElement;
-    expect(within(nmiRow).getByText('Needs info')).toBeTruthy();
+    expect(within(nmiRow).getByText('Needs more info')).toBeTruthy();
     expect(within(nmiRow).queryByText('Pipeline error')).toBeNull();
   });
 
@@ -173,8 +173,8 @@ describe('Dashboard recent investigations', () => {
 });
 
 // The KPI tiles state four numbers and named none of them. A tile called
-// "Awaiting investigation" says what it counts; it did not say what it counts
-// OVER, which is the question a figure that disagrees with a list raises.
+// "Needs you" says what it counts; it must also say what it counts OVER, which
+// is the question a figure that disagrees with a list raises.
 describe('Dashboard KPI sentences', () => {
   it('states what each headline number counts', async () => {
     render(
@@ -184,7 +184,7 @@ describe('Dashboard KPI sentences', () => {
     );
     await screen.findByText('ET Genuine NMI');
     expect(screen.getByTitle(COUNT_ALERT_EVENTS)).toBeTruthy();
-    expect(screen.getByTitle(COUNT_AWAITING)).toBeTruthy();
+    expect(screen.getByTitle(COUNT_NEEDS_YOU)).toBeTruthy();
     expect(screen.getByTitle(COUNT_TRUE_POSITIVES)).toBeTruthy();
     expect(screen.getByTitle(COUNT_RUNNING)).toBeTruthy();
   });
@@ -233,21 +233,23 @@ describe('Dashboard recent-investigations row layout', () => {
     expect(name.textContent!.length).toBeGreaterThan(40);
   });
 
-  it('stacks the name above the endpoints below lg, so the flow yields width, not the name', async () => {
+  it('stacks the name above the endpoints, so the flow yields width, not the name', async () => {
     const name = await row();
-    // jsdom has no layout engine, so the pixel proof of "legible at 900px" is
-    // the render gate. What is checkable here is the contract that produced the
-    // clipped row: the name and the flow sharing one line while only the flow
-    // had a width floor. Now they share a SLOT that is a column below `lg`…
+    // happy-dom has no layout engine, so the pixel proof of "legible at 900px"
+    // is the render gate. What is checkable here is the contract that produced
+    // the clipped row: the name and the flow sharing one line while only the
+    // flow had a width floor. Now they share a SLOT that is a column at every
+    // width, and the name wraps whole in it.
     const slot = name.parentElement!;
     expect(slot.className).toContain('flex-col');
-    expect(slot.className).toContain('lg:flex-row');
-    // …and the 230px two-IPv4 floor only applies where there is room for it.
+    expect(slot.className).not.toContain('lg:flex-row');
+    expect(name.className).toContain('break-words');
+    expect(name.className).not.toMatch(/\btruncate\b/);
+    // No width floor on the flow at any size.
     const flow = name.nextElementSibling as HTMLElement;
-    expect(flow.className).toContain('lg:min-w-[230px]');
-    expect(flow.className).not.toMatch(/(^|\s)min-w-\[230px\]/);
-    // The endpoints are not dropped to buy the width at tablet/laptop sizes —
-    // they move to the second line and both facts stay on the row.
+    expect(flow.className).not.toMatch(/min-w-\[230px\]/);
+    // The endpoints are not dropped to buy the width at tablet/laptop sizes.
+    // They sit on the second line and both facts stay on the row.
     expect(within(flow).getByTitle('192.0.2.70 → 10.0.0.40')).toBeTruthy();
   });
 });

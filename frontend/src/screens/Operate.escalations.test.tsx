@@ -22,6 +22,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
   getHuntCatalog: vi.fn(),
   getStrandedEscalations: vi.fn(),
+  getAnalyticHits: vi.fn().mockResolvedValue({ hits: [], counts: { all: 0, unread: 0, live: 0, shadow: 0 } }),
 }));
 
 import { getHuntCatalog, getStrandedEscalations, type StrandedClaims } from '../lib/api';
@@ -86,7 +87,11 @@ describe('Operate escalation-ledger panel', () => {
     // The age, not the timestamp: two hours is a request that may still be in
     // flight and four days is an alert nobody can escalate, and the row has to
     // separate those without arithmetic.
-    expect(within(row).getByText(/claimed 4d ago/i)).toBeInTheDocument();
+    expect(
+      within(row).getByText('Escalation sent 4 days ago. Security Onion has not confirmed a case.'),
+    ).toBeInTheDocument();
+    // An alert no investigation names keeps its id, and says so.
+    expect(within(row).getByText(/An alert with no investigation/)).toBeInTheDocument();
     expect(screen.getByText('token:autotriage')).toBeInTheDocument();
   });
 
@@ -137,5 +142,33 @@ describe('Operate escalation-ledger panel', () => {
     // an absence must not be reported as an all-clear.
     expect(await screen.findByText(/could not read the escalation ledger/i)).toBeInTheDocument();
     expect(screen.queryByText(/all escalations have an answer/i)).toBeNull();
+  });
+});
+
+// The panel listed raw alert ids, which name nothing an operator can act on
+// (dogfood 2026-10-06). A claim names the rule and the host of its alert.
+describe('Operate escalation-ledger panel names the alert', () => {
+  it('names the rule and the host, and keeps the id in the tooltip', async () => {
+    vi.mocked(getStrandedEscalations).mockResolvedValue({
+      claims: [
+        {
+          alert_id: 'ev-named',
+          escalated_by: 'analyst',
+          claimed_at: iso(120 * HOUR),
+          rule_name: 'ET MALWARE Beacon',
+          host: '192.0.2.10',
+        },
+      ],
+      total: 1,
+      settling_minutes: 15,
+    });
+    mount();
+    const rule = await screen.findByText('ET MALWARE Beacon');
+    const row = rule.closest('li') as HTMLElement;
+    expect(row.textContent).toContain('ET MALWARE Beacon on 192.0.2.10');
+    expect(row.textContent).toContain('Escalation sent 5 days ago. Security Onion has not confirmed a case.');
+    // The raw id is not on the row. It is in the tooltip for a search.
+    expect(within(row).queryByText('ev-named')).toBeNull();
+    expect(row.querySelector('[title="Alert ev-named"]')).not.toBeNull();
   });
 });

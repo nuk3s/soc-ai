@@ -160,7 +160,7 @@ function OracleSample() {
   const { data, loading, error } = useAsync(getRedactionPreview, []);
   return (
     <>
-      {loading && <LoadingState label="Loading preview…" />}
+      {loading && <LoadingState label="Loading preview" />}
       {error && <ErrorState error={error} />}
       {data && (
         <>
@@ -197,7 +197,7 @@ function AnalystPath() {
   return (
     <>
       <div className="mb-3">
-        {invs.loading && <LoadingState label="Loading investigations…" />}
+        {invs.loading && <LoadingState label="Loading investigations" />}
         {invs.error && <ErrorState error={invs.error} />}
         {invs.data && (
           <select
@@ -209,7 +209,7 @@ function AnalystPath() {
             <option value="">
               {complete.length === 0
                 ? 'No completed investigations yet'
-                : 'Pick a completed investigation…'}
+                : 'Pick a completed investigation'}
             </option>
             {complete.map((r) => (
               <option key={r.id} value={r.id}>
@@ -224,7 +224,7 @@ function AnalystPath() {
         )}
       </div>
 
-      {invId && preview.loading && <LoadingState label="Rebuilding analyst prompt…" />}
+      {invId && preview.loading && <LoadingState label="Rebuilding analyst prompt" />}
       {invId && preview.error && <ErrorState error={preview.error} />}
 
       {/* Non-fatal outcomes (events_missing / context_unparseable): the run

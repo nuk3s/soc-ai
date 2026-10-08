@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Literal
 from weakref import WeakValueDictionary
 
 from fastapi import Depends, HTTPException, Request
@@ -14,6 +15,7 @@ from soc_ai.api.deps import get_elastic, get_settings_dep
 from soc_ai.api.security import identify_caller
 from soc_ai.api.webui import _timeline
 from soc_ai.api.webui._shared import (
+    _iso_utc,
     router,
 )
 from soc_ai.api.webui._timeline import (
@@ -26,6 +28,7 @@ from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.store import chat as chat_svc
 from soc_ai.store import escalations as esc_svc
 from soc_ai.store import investigations as inv_svc
+from soc_ai.store.auth import utcnow
 from soc_ai.store.models import Investigation
 from soc_ai.tools.write_exec import WRITE_TOOLS, execute_write_tool
 from soc_ai.webui import alerts_query as aq
@@ -36,6 +39,8 @@ _LOGGER = logging.getLogger(__name__)
 # window the Alerts screen is showing, so use a generous fixed one — wide
 # enough to cover any realistic queue view, still bounded by _ACK_CAP.
 _GROUP_ACK_RANGE = "7d"
+# The same window, in the words the card and the receipt use.
+_GROUP_ACK_RANGE_LABEL = "the last 7 days"
 
 
 # ── Advisory action execution ──────────────────────────────────────────────
@@ -51,6 +56,9 @@ class ExecuteActionResult(BaseModel):
     title: str
     detail: str = ""
     error: str | None = None
+    # How many alerts the write reached, when it wrote to alerts. The card
+    # reports it after the write (dogfood 2026-10-06, first hour S2).
+    count: int | None = None
 
 
 def _case_id_from_result(result: Any) -> str:
@@ -142,30 +150,104 @@ def _action_detail(tool_name: str, result: Any) -> str:
     return ""
 
 
-async def _group_ack_result(
+@dataclass(frozen=True)
+class _AckPlan:
+    """What a group ack will write, worked out before the write.
+
+    The card used to say "Acknowledge alert" and the server acknowledged every
+    unacknowledged alert of the rule from the last 7 days, a true positive
+    among them (dogfood 2026-10-06, first hour S2). The plan is what the card
+    states before the click and what the write then does, so the two agree.
+    """
+
+    ids: list[str]
+    # Distinct hosts among the alerts the plan writes.
+    hosts: int
+    # Alerts the plan leaves alone because a person has to look at them.
+    held: int
+
+
+# Verdicts a group ack does not close. A true positive needs a case, and a
+# needs more info verdict waits on a person.
+_HELD_VERDICTS = frozenset({"true_positive", "needs_more_info"})
+
+
+def _event_attr(ev: aq.AlertEvent, name: str) -> str | None:
+    """One address field of an alert, read defensively: a test double or an
+    older event shape may not carry it."""
+    value = getattr(ev, name, None)
+    return value if isinstance(value, str) and value else None
+
+
+def _event_host(ev: aq.AlertEvent) -> str | None:
+    """The host one alert concerns: its source address, else its machine."""
+    return (
+        _event_attr(ev, "src_ip") or _event_attr(ev, "host_ip") or _event_attr(ev, "subject_host")
+    )
+
+
+async def _held_alert_ids(
+    request: Request, settings: Settings, rule_name: str, events: list[aq.AlertEvent]
+) -> set[str]:
+    """The alerts whose own verdict is one a group ack must not close.
+
+    The verdict of an alert is the one the Alerts grid shows on its event row:
+    the run of that exact alert, else the run of the same rule and the same
+    pair of addresses. A rule-wide standing verdict is not one of these. It is
+    the verdict the ack acts on.
+    """
+    async with request.app.state.db_sessionmaker() as db:
+        direct = await inv_svc.latest_for_alerts(db, [ev.es_id for ev in events])
+        keys = {
+            ev.es_id: inv_svc.pair_key(
+                rule_name,
+                _event_attr(ev, "src_ip"),
+                _event_attr(ev, "dst_ip"),
+                _event_attr(ev, "subject_host"),
+            )
+            for ev in events
+        }
+        pairs = await inv_svc.latest_for_pairs(
+            db, list(set(keys.values())), window_days=settings.webui_inherit_window_days
+        )
+    held: set[str] = set()
+    for ev in events:
+        run = direct.get(ev.es_id)
+        if run is None or run.status != "complete":
+            run = pairs.get(keys[ev.es_id])
+        if run is not None and (run.verdict or "") in _HELD_VERDICTS:
+            held.add(ev.es_id)
+    return held
+
+
+async def _group_ack_plan(
     request: Request,
     *,
     rule_name: str,
     settings: Settings,
     elastic: ElasticClient,
-    user: str,
-) -> tuple[str, int] | None:
-    """Group-scoped ack: acknowledge every unacked event of *rule_name*.
+    own_alert_id: str | None,
+) -> _AckPlan | None:
+    """Group-scoped ack: the unacked alerts of *rule_name* the ack will write.
 
     The recommendation card says "Acknowledge alert", but the analyst's intent
     is "this detection is handled" — a single-event ack left the rest of the
     group sitting in the queue after a successful "Executed ✓" (dogfood
     2026-07-15). Same contract as the settled bar / POST /alerts/ack-group.
 
-    Returns ``(detail, acked)`` when the group fetch found unacked events and
-    acked them. Returns ``None`` — so the caller falls back to the single-alert
-    ack — both when the group fetch FAILED and when it came back EMPTY: an empty
-    result is ambiguous (an already-clear Suricata group, OR a wrong-field miss on
-    a non-Suricata detection, since ``kind`` is hardcoded ``suricata`` and a Zeek
+    Two rules from dogfood 2026-10-06: an alert with a true positive or a needs
+    more info verdict of its own is left alone, and the alert of this run is in
+    the plan even when it sits outside the window, because the ack the analyst
+    asked for must reach it.
+
+    Returns ``None`` — so the caller falls back to the single-alert ack — both
+    when the group fetch FAILED and when it came back EMPTY: an empty result is
+    ambiguous (an already-clear Suricata group, OR a wrong-field miss on a
+    non-Suricata detection, since ``kind`` is hardcoded ``suricata`` and a Zeek
     notice's name lives in ``notice.note``, not ``rule.name``). The single-alert
     path is dataset-agnostic and idempotent, so it is correct for both (F28).
     """
-    from soc_ai.api.webui.routes_alert_actions import _ACK_CAP, _ack_many  # noqa: PLC0415
+    from soc_ai.api.webui.routes_alert_actions import _ACK_CAP  # noqa: PLC0415
 
     try:
         events = await aq.fetch_group_events(
@@ -191,20 +273,62 @@ async def _group_ack_result(
         # F28). Fall back to the single-alert ack keyed on this investigation's own
         # alert_es_id, which is dataset-agnostic and idempotent.
         return None
-    acked, failed = await _ack_many(
-        request,
-        [ev.es_id for ev in events],
-        session_id=f"action-ack-group:{rule_name}",
-        caller=user,
-    )
+    try:
+        held = await _held_alert_ids(request, settings, rule_name, events)
+    except Exception:
+        # The store did not answer. Hold nothing back and say nothing about
+        # verdicts: the plan still names the count the analyst confirms.
+        _LOGGER.warning("group ack: verdict lookup failed for rule %r", rule_name, exc_info=True)
+        held = set()
+    keep = [ev for ev in events if ev.es_id not in held]
+    ids = [ev.es_id for ev in keep]
+    if (
+        own_alert_id
+        and own_alert_id not in {ev.es_id for ev in events}
+        and not await _timeline._alert_currently_acked(elastic, settings, own_alert_id)
+    ):
+        ids.append(own_alert_id)
+    hosts = {h for h in (_event_host(ev) for ev in keep) if h}
+    return _AckPlan(ids=ids, hosts=len(hosts), held=len(held))
+
+
+def _alerts(n: int) -> str:
+    return f"{n} alert{'s' if n != 1 else ''}"
+
+
+def _ack_scope_sentence(plan: _AckPlan) -> str:
+    """What the group ack will do, said before the click."""
+    if not plan.ids:
+        head = f"soc-ai has no alert of this rule to acknowledge from {_GROUP_ACK_RANGE_LABEL}."
+    else:
+        hosts = f", on {plan.hosts} host{'s' if plan.hosts != 1 else ''}" if plan.hosts else ""
+        head = (
+            f"Acknowledge {_alerts(len(plan.ids))} of this rule from "
+            f"{_GROUP_ACK_RANGE_LABEL}{hosts}."
+        )
+    if plan.held:
+        head += (
+            f" soc-ai leaves {_alerts(plan.held)} with a true positive or needs more "
+            "info verdict open."
+        )
+    return head
+
+
+def _ack_done_sentence(plan: _AckPlan, acked: int, failed: int) -> str:
+    """What the group ack did, said after the write."""
     if failed:
-        detail = (
-            f"Acknowledged {acked} of {acked + failed} alerts in this "
-            f"detection group. {failed} failed."
+        text = (
+            f"Acknowledged {acked} of {_alerts(acked + failed)} of this rule from "
+            f"{_GROUP_ACK_RANGE_LABEL}. {failed} failed."
         )
     else:
-        detail = f"Acknowledged {acked} alert{'s' if acked != 1 else ''} in this detection group."
-    return (detail, acked)
+        text = f"Acknowledged {_alerts(acked)} of this rule from {_GROUP_ACK_RANGE_LABEL}."
+    if plan.held:
+        text += (
+            f" soc-ai left {_alerts(plan.held)} with a true positive or needs more "
+            "info verdict open."
+        )
+    return text
 
 
 async def _reserve_escalate(
@@ -319,12 +443,15 @@ async def _persist_action_executed(
     card applied. Best-effort: the write already happened in SO, so a failed
     bookkeeping insert must not turn the response into an error.
     """
+    # Every receipt names its time (dogfood 2026-10-06, S3). The actor is the
+    # caller's ``by``, which every call site sets.
+    stamped = {**payload, "at": payload.get("at") or _now_iso()}
     try:
         async with request.app.state.db_sessionmaker() as db:
             await inv_svc.append_events(
                 db,
                 inv_real_id,
-                [{"sequence": sequence, "kind": "action_executed", "payload": payload}],
+                [{"sequence": sequence, "kind": "action_executed", "payload": stamped}],
             )
     except Exception:
         _LOGGER.warning(
@@ -332,6 +459,11 @@ async def _persist_action_executed(
             inv_real_id,
             exc_info=True,
         )
+
+
+def _now_iso() -> str:
+    """Now, as the ISO UTC string the console localizes."""
+    return _iso_utc(utcnow())
 
 
 # Per-(inv_id, index) execution locks serialize concurrent execute-action calls
@@ -363,6 +495,75 @@ def _action_lock(inv_id: str, index: int) -> asyncio.Lock:
     return lock
 
 
+@dataclass(frozen=True)
+class _LoadedAction:
+    """One recommended action and the run it belongs to, read under one session."""
+
+    inv_real_id: str
+    alert_es_id: str | None
+    rule_name: str | None
+    events: list[Any]
+    next_seq: int
+    anchors_a_hunt: bool
+    rec: dict[str, Any]
+    action_key: str
+    tool_name: str
+    title: str
+
+
+async def _load_action(request: Request, inv_id: str, index: int) -> _LoadedAction:
+    """Read the run and its ``index``-th recommended action, or raise 404."""
+    async with request.app.state.db_sessionmaker() as db:
+        got = await inv_svc.get_with_events(db, inv_id)
+        if got is None:
+            by_alert = await inv_svc.latest_for_alerts(db, [inv_id])
+            inv0 = by_alert.get(inv_id)
+            if inv0 is not None:
+                got = await inv_svc.get_with_events(db, inv0.id)
+        if got is None:
+            raise HTTPException(status_code=404, detail={"reason": "not_found"})
+        inv, events = got
+        report = inv.report or {}
+        alert_es_id = inv.alert_es_id
+        # Anchor-keyed hunt check: a fresh non-hunt row over a promoted
+        # finding's or lead's anchor (a POST /investigate re-run) must not
+        # launder the document past the kind-keyed guard below — the anchor is
+        # still cited telemetry with no SO alert behind it, whatever THIS
+        # row's kind says.
+        anchors_a_hunt = inv_svc.is_promoted(inv) or (
+            alert_es_id is not None and bool(await inv_svc.hunt_anchor_ids(db, [alert_es_id]))
+        )
+        # Every action route refuses a replay: the execute, the scope and the
+        # dismissal. A replay's actions are closed on the page.
+        _refuse_a_replay(inv)
+    recs = report.get("recommended_actions") or []
+    if index < 0 or index >= len(recs):
+        raise HTTPException(status_code=404, detail={"reason": "no_such_action"})
+    rec = recs[index]
+    tool_name = rec.get("tool_name", "")
+    return _LoadedAction(
+        inv_real_id=inv.id,
+        alert_es_id=alert_es_id,
+        rule_name=inv.rule_name,
+        events=list(events),
+        next_seq=max((e.sequence for e in events), default=0) + 1,
+        anchors_a_hunt=anchors_a_hunt,
+        rec=rec,
+        # Idempotency identity is the action's CONTENT, not its list position: a
+        # chat-resolve can replace recommended_actions and shift indexes (F04).
+        action_key=_action_identity(rec),
+        tool_name=tool_name,
+        title=_ACTION_TITLE.get(tool_name, tool_name or "Action"),
+    )
+
+
+class ExecuteActionIn(BaseModel):
+    """What the analyst confirmed. ``group`` is the plan the card stated;
+    ``alert`` is "Acknowledge this alert only". Only an ack reads it."""
+
+    scope: Literal["group", "alert"] = "group"
+
+
 @router.post(
     "/investigations/{inv_id}/actions/{index}/execute",
     response_model=ExecuteActionResult,
@@ -371,6 +572,7 @@ async def execute_action(
     request: Request,
     inv_id: str,
     index: int,
+    body: ExecuteActionIn | None = None,
     settings: Settings = Depends(get_settings_dep),
     elastic: ElasticClient = Depends(get_elastic),
 ) -> ExecuteActionResult:
@@ -390,7 +592,33 @@ async def execute_action(
     # call's persisted marker — so it never fires a duplicate write.
     async with _action_lock(inv_id, index):
         return await _execute_action_locked(
-            request, inv_id=inv_id, index=index, settings=settings, elastic=elastic
+            request,
+            inv_id=inv_id,
+            index=index,
+            scope=(body or ExecuteActionIn()).scope,
+            settings=settings,
+            elastic=elastic,
+        )
+
+
+def _refuse_a_replay(inv: Investigation) -> None:
+    """Refuse every write a backtest replay recommends.
+
+    A backtest replay is a measurement on an alert an analyst already closed.
+    Its recommendations are part of what the backtest measured, and none of
+    them is a write to make. The detail page closes every action of a replay.
+    This refusal holds for a client that skips the page.
+    """
+    if inv_svc.is_backtest(inv):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "reason": "backtest_replay",
+                "hint": (
+                    "This run is a backtest replay. soc-ai executes no action for a "
+                    "replay. Open the live investigation of the alert to act on it."
+                ),
+            },
         )
 
 
@@ -399,6 +627,7 @@ async def _execute_action_locked(  # noqa: PLR0915 — linear single-analyst wri
     *,
     inv_id: str,
     index: int,
+    scope: str = "group",
     settings: Settings,
     elastic: ElasticClient,
 ) -> ExecuteActionResult:
@@ -408,47 +637,16 @@ async def _execute_action_locked(  # noqa: PLR0915 — linear single-analyst wri
     AFTER the caller acquired the lock, so a concurrent double-click can't pass the
     "already executed?" check on a stale pre-write snapshot.
     """
-    async with request.app.state.db_sessionmaker() as db:
-        got = await inv_svc.get_with_events(db, inv_id)
-        if got is None:
-            by_alert = await inv_svc.latest_for_alerts(db, [inv_id])
-            inv0 = by_alert.get(inv_id)
-            if inv0 is not None:
-                got = await inv_svc.get_with_events(db, inv0.id)
-        if got is None:
-            raise HTTPException(status_code=404, detail={"reason": "not_found"})
-        inv, events = got
-        report = inv.report or {}
-        alert_es_id = inv.alert_es_id
-        rule_name = inv.rule_name
-        inv_real_id = inv.id
-        next_seq = max((e.sequence for e in events), default=0) + 1
-        # Anchor-keyed hunt check: a fresh non-hunt row over a promoted
-        # finding's or lead's anchor (a POST /investigate re-run) must not
-        # launder the document past the kind-keyed guard below — the anchor is
-        # still cited telemetry with no SO alert behind it, whatever THIS
-        # row's kind says.
-        anchors_a_hunt = inv_svc.is_promoted(inv) or (
-            alert_es_id is not None and bool(await inv_svc.hunt_anchor_ids(db, [alert_es_id]))
-        )
-
-    recs = report.get("recommended_actions") or []
-    if index < 0 or index >= len(recs):
-        raise HTTPException(status_code=404, detail={"reason": "no_such_action"})
-
-    rec = recs[index]
-    # Idempotency identity is the action's CONTENT, not its list position: a
-    # chat-resolve can replace recommended_actions and shift indexes (F04).
-    action_key = _action_identity(rec)
-    tool_name = rec.get("tool_name", "")
-    title = _ACTION_TITLE.get(tool_name, tool_name or "Action")
+    act = await _load_action(request, inv_id, index)
+    events, action_key, tool_name, title = act.events, act.action_key, act.tool_name, act.title
+    alert_es_id, inv_real_id, next_seq = act.alert_es_id, act.inv_real_id, act.next_seq
     if tool_name not in WRITE_TOOLS:
         raise HTTPException(
             status_code=400,
             detail={"reason": "not_executable", "tool": tool_name},
         )
 
-    if anchors_a_hunt:
+    if act.anchors_a_hunt:
         # A promoted finding's anchor is cited telemetry, not an SO alert —
         # there is nothing to ack/escalate, and the rule-keyed group ack below
         # must never see a finding title as a rule_name. Keyed off the ANCHOR
@@ -465,17 +663,22 @@ async def _execute_action_locked(  # noqa: PLR0915 — linear single-analyst wri
             },
         )
 
+    # "Acknowledge this alert only" acts on the grid state, not on the record:
+    # an earlier group ack can leave this alert open (dogfood 2026-10-06, S3),
+    # and an ack of one alert is idempotent. Every other press checks the record.
+    only_this_alert = tool_name == "ack_alert" and scope == "alert"
+
     # Already executed through this endpoint? Never write twice (the escalate
     # case would open a duplicate SO case) — confirm instead.
     executed = _executed_actions(events)
-    if action_key in executed or f"#idx:{index}" in executed:
+    if not only_this_alert and (action_key in executed or f"#idx:{index}" in executed):
         return ExecuteActionResult(
             status="executed",
             title=title,
             detail="Already executed. soc-ai did not repeat it.",
         )
 
-    tool_args = dict(rec.get("tool_args") or {})
+    tool_args = dict(act.rec.get("tool_args") or {})
     # SECURITY (F07): the write TARGET is bound server-side, never taken from the
     # model. ``RecommendedAction.tool_args`` is fully model-authored (no
     # validator) and assembled from attacker-influenceable enriched-alert context,
@@ -503,34 +706,58 @@ async def _execute_action_locked(  # noqa: PLR0915 — linear single-analyst wri
         tool_args["case_id"] = bound_case_id
 
     user = await identify_caller(request)
+    receipt: dict[str, Any] = {
+        "index": index,
+        "action_key": action_key,
+        "tool_name": tool_name,
+        "title": title,
+    }
 
     # Group-scoped ack (rule-keyed): the analyst's intent is "this detection is
     # handled", not "ack one event of it" — a single-event ack left the rest of
     # the group in the queue after a successful "Executed ✓". Falls back to the
     # single-alert ack when the run has no rule_name or the group fetch fails.
-    if tool_name == "ack_alert" and rule_name:
-        group = await _group_ack_result(
-            request, rule_name=rule_name, settings=settings, elastic=elastic, user=user
+    if tool_name == "ack_alert" and act.rule_name and not only_this_alert:
+        from soc_ai.api.webui.routes_alert_actions import _ack_many  # noqa: PLC0415
+
+        plan = await _group_ack_plan(
+            request,
+            rule_name=act.rule_name,
+            settings=settings,
+            elastic=elastic,
+            own_alert_id=alert_es_id,
         )
-        if group is not None:
-            detail, acked = group
+        if plan is not None:
+            if not plan.ids:
+                # Every alert the window holds waits on a person. Nothing was
+                # written, so nothing is recorded and the card stays open.
+                return ExecuteActionResult(
+                    status="executed", title=title, detail=_ack_scope_sentence(plan), count=0
+                )
+            acked, failed = await _ack_many(
+                request,
+                plan.ids,
+                session_id=f"action-ack-group:{act.rule_name}",
+                caller=user,
+            )
+            detail = _ack_done_sentence(plan, acked, failed)
+            if acked == 0:
+                return ExecuteActionResult(status="error", title=title, error=detail, count=0)
             await _persist_action_executed(
                 request,
                 inv_real_id,
                 next_seq,
                 {
-                    "index": index,
-                    "action_key": action_key,
-                    "tool_name": tool_name,
-                    "title": title,
+                    **receipt,
                     "success": True,
                     "by": user,
                     "detail": detail,
                     "group": True,
                     "acked": acked,
+                    "held": plan.held,
                 },
             )
-            return ExecuteActionResult(status="executed", title=title, detail=detail)
+            return ExecuteActionResult(status="executed", title=title, detail=detail, count=acked)
 
     # Acking an alert that is ALREADY acked in SO (group-ack, auto-ack of
     # another run, the SO web UI): ok-with-note, and persist the execution so
@@ -543,20 +770,13 @@ async def _execute_action_locked(  # noqa: PLR0915 — linear single-analyst wri
             request,
             inv_real_id,
             next_seq,
-            {
-                "index": index,
-                "action_key": action_key,
-                "tool_name": tool_name,
-                "title": title,
-                "success": True,
-                "by": user,
-                "note": "already_acknowledged",
-            },
+            {**receipt, "success": True, "by": user, "note": "already_acknowledged"},
         )
         return ExecuteActionResult(
             status="executed",
             title=title,
             detail="This alert is already acknowledged in Security Onion.",
+            count=0,
         )
 
     if tool_name == "escalate_to_case":
@@ -571,13 +791,7 @@ async def _execute_action_locked(  # noqa: PLR0915 — linear single-analyst wri
             user=user,
             inv_real_id=inv_real_id,
             sequence=next_seq,
-            receipt={
-                "index": index,
-                "action_key": action_key,
-                "tool_name": tool_name,
-                "title": title,
-                "note": "already_escalated",
-            },
+            receipt={**receipt, "note": "already_escalated"},
         )
         if refused is not None:
             return refused
@@ -599,14 +813,13 @@ async def _execute_action_locked(  # noqa: PLR0915 — linear single-analyst wri
     # persisted receipt and which ledger row is written.
     escalated = tool_name != "escalate_to_case" or _escalate_outcome(result)[0]
     exec_payload: dict[str, Any] = {
-        "index": index,
-        "action_key": action_key,
-        "tool_name": tool_name,
-        "title": title,
+        **receipt,
         "success": escalated,
         "by": user,
         "detail": detail,
     }
+    if only_this_alert:
+        exec_payload["scope"] = "alert"
     if tool_name == "escalate_to_case":
         # Persist the SO-created case id so a later add_case_comment can bind its
         # write target to a case THIS investigation opened (F07). Recorded on an
@@ -625,7 +838,162 @@ async def _execute_action_locked(  # noqa: PLR0915 — linear single-analyst wri
     await _persist_action_executed(request, inv_real_id, next_seq, exec_payload)
     if not escalated:
         return ExecuteActionResult(status="error", title=title, error=detail)
-    return ExecuteActionResult(status="executed", title=title, detail=detail)
+    return ExecuteActionResult(
+        status="executed",
+        title=title,
+        detail=detail,
+        count=1 if tool_name in ("ack_alert", "escalate_to_case") else None,
+    )
+
+
+# ── What a write will do, before the click ─────────────────────────────────
+
+
+class ActionScopeOut(BaseModel):
+    """What one recommended action will write, stated before the analyst confirms.
+
+    ``scope`` is "group" for a rule-wide ack, "alert" for a write to the one
+    alert of this run, and "case" for a comment on the case this run opened.
+    ``count`` and ``hosts`` are None when the grid did not answer.
+    """
+
+    tool: str
+    scope: str
+    count: int | None = None
+    hosts: int | None = None
+    held: int = 0
+    rangeLabel: str = ""
+    sentence: str
+
+
+_ALERT_ONLY_ACK = "Acknowledge this alert in Security Onion."
+_ESCALATE_SENTENCE = "Open one Security Onion case for this alert."
+_COMMENT_SENTENCE = "Add a comment to the Security Onion case this investigation opened."
+
+
+@router.get(
+    "/investigations/{inv_id}/actions/{index}/scope",
+    response_model=ActionScopeOut,
+)
+async def action_scope(
+    request: Request,
+    inv_id: str,
+    index: int,
+    settings: Settings = Depends(get_settings_dep),
+    elastic: ElasticClient = Depends(get_elastic),
+) -> ActionScopeOut:
+    """What the ``index``-th action will write, in the words the card shows.
+
+    The ack plan is the one the execute route then writes, from the same
+    helper, so the count on the card is the count of the write. The grid can
+    move between the two reads. The receipt then states the real count.
+    """
+    act = await _load_action(request, inv_id, index)
+    if act.tool_name == "escalate_to_case":
+        return ActionScopeOut(
+            tool=act.tool_name, scope="alert", count=1, sentence=_ESCALATE_SENTENCE
+        )
+    if act.tool_name == "add_case_comment":
+        return ActionScopeOut(tool=act.tool_name, scope="case", sentence=_COMMENT_SENTENCE)
+    if act.tool_name != "ack_alert" or act.anchors_a_hunt:
+        raise HTTPException(
+            status_code=400,
+            detail={"reason": "not_executable", "tool": act.tool_name},
+        )
+    plan = (
+        await _group_ack_plan(
+            request,
+            rule_name=act.rule_name,
+            settings=settings,
+            elastic=elastic,
+            own_alert_id=act.alert_es_id,
+        )
+        if act.rule_name
+        else None
+    )
+    if plan is None:
+        return ActionScopeOut(tool=act.tool_name, scope="alert", count=1, sentence=_ALERT_ONLY_ACK)
+    return ActionScopeOut(
+        tool=act.tool_name,
+        scope="group",
+        count=len(plan.ids),
+        hosts=plan.hosts,
+        held=plan.held,
+        rangeLabel=_GROUP_ACK_RANGE_LABEL,
+        sentence=_ack_scope_sentence(plan),
+    )
+
+
+# ── Dismiss a recommendation, and undo it ──────────────────────────────────
+
+
+class ActionDismissOut(BaseModel):
+    dismissed: bool
+    by: str
+    at: str
+
+
+async def _record_dismissal(
+    request: Request, inv_id: str, index: int, *, kind: str
+) -> ActionDismissOut:
+    """Store a dismissal (or its undo) of one recommendation, with the actor and time.
+
+    Dismiss changed the card in one tab and nowhere else: a reload, a second
+    tab or the next analyst saw the action pending again (dogfood 2026-10-06,
+    first hour S4). The record is an investigation event, keyed on the
+    action's identity like the execute receipt, so it follows the action
+    across a chat-resolve re-index.
+    """
+    async with _action_lock(inv_id, index):
+        act = await _load_action(request, inv_id, index)
+        executed = _executed_actions(act.events)
+        if act.action_key in executed or f"#idx:{index}" in executed:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "reason": "already_executed",
+                    "hint": "soc-ai already executed this action. You cannot dismiss it.",
+                },
+            )
+        user = await identify_caller(request)
+        at = _now_iso()
+        async with request.app.state.db_sessionmaker() as db:
+            await inv_svc.append_events(
+                db,
+                act.inv_real_id,
+                [
+                    {
+                        "sequence": act.next_seq,
+                        "kind": kind,
+                        "payload": {
+                            "index": index,
+                            "action_key": act.action_key,
+                            "tool_name": act.tool_name,
+                            "by": user,
+                            "at": at,
+                        },
+                    }
+                ],
+            )
+    return ActionDismissOut(dismissed=kind == "action_dismissed", by=user, at=at)
+
+
+@router.post(
+    "/investigations/{inv_id}/actions/{index}/dismiss",
+    response_model=ActionDismissOut,
+)
+async def dismiss_action(request: Request, inv_id: str, index: int) -> ActionDismissOut:
+    """Dismiss one recommendation. Nothing is written to Security Onion."""
+    return await _record_dismissal(request, inv_id, index, kind="action_dismissed")
+
+
+@router.post(
+    "/investigations/{inv_id}/actions/{index}/restore",
+    response_model=ActionDismissOut,
+)
+async def restore_action(request: Request, inv_id: str, index: int) -> ActionDismissOut:
+    """Undo a dismissal. The recommendation is pending again."""
+    return await _record_dismissal(request, inv_id, index, kind="action_restored")
 
 
 # ── Chat verdict resolution ────────────────────────────────────────────────
@@ -677,6 +1045,52 @@ async def resolve_investigation(request: Request, inv_id: str, body: ResolveIn) 
 _VALID_VERDICTS = {"true_positive", "false_positive", "needs_more_info"}
 
 
+def _override_headline(user: str, reason: str | None) -> str:
+    """The rationale headline after an analyst override.
+
+    The headline used to keep the model's text when the analyst gave no
+    reason, and the old benign sentence then stood over a true positive
+    (dogfood 2026-10-06, first hour S3).
+    """
+    text = (reason or "").strip().rstrip(".")
+    return f"Verdict set by {user}: {text}." if text else f"Verdict set by {user}."
+
+
+def _override_actions(
+    verdict: str, *, user: str, rule_name: str | None, headline: str
+) -> list[dict[str, Any]]:
+    """The recommended actions that fit an analyst's verdict.
+
+    A true positive gets one escalate and never an ack. A false positive gets
+    one ack. A needs more info verdict gets none: the page offers Request
+    more info. The case title and the description are bound here, from the
+    rule and the analyst's words, because the escalate needs both.
+    """
+    if verdict == "true_positive":
+        return [
+            {
+                "tool_name": "escalate_to_case",
+                "tool_args": {
+                    "case_title": rule_name or "soc-ai investigation",
+                    "case_description": headline,
+                },
+                "rationale": (
+                    f"{user} set the verdict to true positive. "
+                    "Open a Security Onion case for this alert."
+                ),
+            }
+        ]
+    if verdict == "false_positive":
+        return [
+            {
+                "tool_name": "ack_alert",
+                "tool_args": {},
+                "rationale": f"{user} set the verdict to false positive. Acknowledge the alert.",
+            }
+        ]
+    return []
+
+
 class OverrideVerdictIn(BaseModel):
     verdict: str
     rationale: str | None = None
@@ -711,17 +1125,27 @@ async def override_verdict(
                     "hint": "Wait for the investigation to complete before you override.",
                 },
             )
+        headline = _override_headline(resolved_by, body.rationale)
         updated = await inv_svc.resolve(
             db,
             inv_id,
             verdict=body.verdict,
             confidence=body.confidence if body.confidence is not None else 1.0,
-            rationale=body.rationale,
-            recommended_actions=None,
+            rationale=headline,
+            # The actions follow the new verdict. A true positive kept the
+            # model's "Acknowledge alert" and its benign reason.
+            recommended_actions=_override_actions(
+                body.verdict, user=resolved_by, rule_name=inv.rule_name, headline=headline
+            ),
             resolved_by=resolved_by,
             resolved_via="manual",
             source_message_id=None,
         )
         if updated is None:
             raise HTTPException(status_code=404, detail={"reason": "not_found"})
-    return {"ok": True, "verdict": body.verdict, "confidence": updated.confidence}
+    return {
+        "ok": True,
+        "verdict": body.verdict,
+        "confidence": updated.confidence,
+        "resolvedBy": resolved_by,
+    }

@@ -3,7 +3,7 @@
 // viewer, so the one thing that settles "did this analytic match the right
 // thing" was unreadable. These tests pin the two states that decide that: a
 // chip opens the document, and an id the grid no longer holds says so.
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../lib/api', async (importOriginal) => ({
@@ -13,7 +13,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
 
 import { ApiError, getEvent, type EventDocument } from '../lib/api';
 import { ShellProvider } from '../shell/ShellContext';
-import { DocumentChip, DocumentDrawer } from './DocumentDrawer';
+import { DocumentChip, DocumentDrawer, SLOW_READ_MS } from './DocumentDrawer';
 
 const DOC: EventDocument = {
   id: '7Kq2c1',
@@ -144,5 +144,42 @@ describe('DocumentDrawer with no id', () => {
     expect(await screen.findByText('No document id was given.')).toBeTruthy();
     expect(getEvent).not.toHaveBeenCalled();
     expect(screen.queryByText(/The grid holds no document/)).toBeNull();
+  });
+});
+
+// Dogfood 2026-10-06, W3: a read of 3 to 15 s showed a still line of text.
+// After two seconds the drawer shows a spinner and says where the time goes.
+// The negative control: a fast read never shows the slow line.
+describe('a slow read', () => {
+  it('says the grid is fetching the raw event after two seconds', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(getEvent).mockReturnValue(new Promise(() => {}));
+      render(
+        <ShellProvider>
+          <DocumentDrawer documentId="slow-1" onClose={() => {}} />
+        </ShellProvider>,
+      );
+      expect(screen.getByText('Reading the document')).toBeTruthy();
+      expect(screen.queryByTestId('document-slow')).toBeNull();
+      await act(async () => {
+        vi.advanceTimersByTime(SLOW_READ_MS + 10);
+      });
+      expect(screen.getByTestId('document-slow').textContent).toContain(
+        'Fetching the raw event from Security Onion',
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('control: a fast read shows the document and no slow line', async () => {
+    render(
+      <ShellProvider>
+        <DocumentDrawer documentId="7Kq2c1" onClose={() => {}} />
+      </ShellProvider>,
+    );
+    await screen.findByText('svc_sql');
+    expect(screen.queryByTestId('document-slow')).toBeNull();
   });
 });

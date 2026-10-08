@@ -1,7 +1,8 @@
 import { Disc, FlaskConical, Wrench } from 'lucide-react';
 
+import { confidenceText, verdictMeta } from '../lib/labels';
 import { HUNT_KIND, KIND, SEVERITY, VERDICT } from '../lib/tokens';
-import { CHIP_RUN_CLASS, detectionKindTitle } from '../lib/tooltips';
+import { CHIP_RUN_CLASS, CHIP_RUN_CLASS_NONE, CHIP_RUN_CLASS_PENDING, detectionKindTitle, severityTitle } from '../lib/tooltips';
 import type { DetectionKind, HuntKind, Severity, Verdict } from '../lib/types';
 
 // ---- "In development" badge — marks features that aren't wired up yet -------
@@ -52,7 +53,11 @@ export function KindBadge({ kind }: { kind: DetectionKind }) {
 }
 
 // ---- Severity dot + label --------------------------------------------------
-export function SeverityTag({ sev }: { sev: Severity }) {
+// The one severity chip. Alerts, the investigation header and the entity page
+// draw it, and a hunt finding draws it with `source="finding"`. The console
+// had three severity styles and none said whose level it showed. The tooltip
+// names it: rule severity, or finding severity.
+export function SeverityTag({ sev, source = 'rule' }: { sev: Severity; source?: 'rule' | 'finding' }) {
   // A value off the union renders as "unknown" rather than crashing the row it
   // sits in. `SEVERITY[sev]` was an unguarded index, so one unrecognized
   // severity from the API took out every alert row on the screen with it.
@@ -61,7 +66,12 @@ export function SeverityTag({ sev }: { sev: Severity }) {
   // ramp as the four rungs reads as a level, and this is the absence of one.
   const hollow = s === SEVERITY.unknown;
   return (
-    <span className="inline-flex items-center gap-1.5 text-[11.5px] font-semibold" style={{ color: s.color }}>
+    <span
+      data-testid="severity-tag"
+      title={severityTitle(s.label, source)}
+      className="inline-flex items-center gap-1.5 text-[11.5px] font-semibold"
+      style={{ color: s.color }}
+    >
       <span
         className="h-[7px] w-[7px] rounded-[2px]"
         style={
@@ -88,7 +98,10 @@ interface VerdictPillProps {
   showInherited?: boolean;
 }
 export function VerdictPill({ verdict, conf, inherited, large, showConf = true, showInherited = true }: VerdictPillProps) {
-  const v = VERDICT[verdict];
+  // The words and colours come from lib/labels.ts through VERDICT. A verdict
+  // off the union reads as its own words in grey and does not take the row
+  // down with it.
+  const v = VERDICT[verdict] ?? verdictMeta(verdict);
   return (
     <span
       className={
@@ -111,7 +124,7 @@ export function VerdictPill({ verdict, conf, inherited, large, showConf = true, 
       {v.label}
       {inherited && showInherited && ' · inherited'}
       {showConf && conf != null && (
-        <span className="font-mono opacity-80">{conf.toFixed(2)}</span>
+        <span className="font-mono opacity-80">{confidenceText(conf)}</span>
       )}
     </span>
   );
@@ -161,15 +174,42 @@ export function SyntheticEvalBadge() {
 }
 
 // ---- run class chip ---------------------------------------------------------
-// The budget class a run ran in: cheap, standard, deep or rule prior. The row,
-// the drawer and the page show it so an analyst can tell a one-request verdict
-// from a loop. A run stored before the classes existed carries no class and
-// renders nothing: an absent chip says "not recorded", never a guess. A class
-// this build does not know renders nothing rather than throwing.
-export function RunClassChip({ runClass, testId }: { runClass?: string | null; testId?: string }) {
-  if (!runClass) return null;
-  const c = CHIP_RUN_CLASS[runClass];
-  if (!c) return null;
+// The depth a run ran at: "Depth: quick / standard / deep", or "rule history"
+// when no model ran. The row, the drawer and the page show it so an analyst
+// can tell a one-request verdict from a loop. A run stored before the depths
+// existed carries none and renders nothing by default: an absent chip never
+// guesses. A class this build does not know renders nothing rather than
+// throwing.
+//
+// A list shows the chip on every row or on none. `placeholder` asks for the
+// "Depth: not recorded" chip on a row with no depth, or "Depth: pending" on a
+// run in progress, so a list where some rows have a depth draws one on each.
+export function RunClassChip({
+  runClass,
+  testId,
+  placeholder = false,
+  running = false,
+}: {
+  runClass?: string | null;
+  testId?: string;
+  placeholder?: boolean;
+  running?: boolean;
+}) {
+  const known = runClass ? CHIP_RUN_CLASS[runClass] : undefined;
+  if (!known) {
+    if (!placeholder) return null;
+    const p = running ? CHIP_RUN_CLASS_PENDING : CHIP_RUN_CLASS_NONE;
+    return (
+      <span
+        data-testid={testId ?? 'run-class-chip'}
+        title={p.title}
+        className="flex-none rounded-badge border border-dashed border-border-2 bg-transparent px-[6px] py-[2px] font-mono text-[10.5px] text-faint"
+      >
+        {p.label}
+      </span>
+    );
+  }
+  const c = known;
   const tone =
     runClass === 'rule_prior'
       ? { color: '#f5a623', borderColor: 'rgba(245,166,35,.4)', background: 'rgba(245,166,35,.09)' }

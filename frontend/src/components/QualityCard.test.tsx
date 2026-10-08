@@ -56,7 +56,7 @@ describe('measuredOn', () => {
           analyst_model: 'soc-ai-analyst',
         }),
       ),
-    ).toBe('v1.5.0 · 0123456789ab · soc-ai-analyst');
+    ).toBe('v1.5.0 · 0123456789abcdef0123 · soc-ai-analyst');
   });
 
   it('drops what was not recorded rather than printing a placeholder', () => {

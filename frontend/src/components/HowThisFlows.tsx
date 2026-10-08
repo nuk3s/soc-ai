@@ -8,16 +8,20 @@ import {
   DEFINE_HUNT,
   DEFINE_LEAD,
   DEFINE_SCHEDULE,
+  OVERVIEW_FLOW,
 } from '../lib/tooltips';
 import { Drawer } from './Drawer';
 
 // ---------------------------------------------------------------------------
-// How hunting flows — the chart behind every definition line.
+// How this flows: the chart behind every definition line.
 //
 // The Hunts page reads as the pipeline and never drew it: an analytic finds a
-// hit, hits on one entity form a lead, a lead starts a hunt, a promoted lead
-// becomes an investigation. The chart states each step and names the screen
-// that holds it.
+// hit, hits on one entity form a lead, a lead starts a hunt, and the hunt
+// investigates what it finds. The chart draws the alert path beside the sweep
+// path, because both end in an investigation, a verdict and an action in
+// Security Onion (owner, 2026-10-07). The chart states each step and names
+// the screen that holds it. Its words are the words of the controls: "Hunt
+// this lead", "Open an investigation", "hit".
 //
 // The drawer carries the address parameter `?flow=1`, the way the composer
 // carries `?new=1`: a reload keeps it open, closing takes the parameter out,
@@ -32,16 +36,20 @@ export const FLOW_PARAM = 'flow';
  *  and at the end of every definition line. */
 export const FLOW_LINK_LABEL = 'How this flows';
 
-/** The chart for a reader who cannot see it. A chart of five boxes and their
+/** The chart for a reader who cannot see it. A chart of boxes and their
  *  arrows says nothing as "hunting-flow.svg". */
 export const FLOW_ALT =
-  'The hunting pipeline, left to right. An analytic runs on every sweep and finds a hit. ' +
-  'Hits on one entity form a lead. You hunt, dismiss or promote the lead. A hunt ends in ' +
-  'findings. A promoted lead becomes an investigation, which ends in a ' +
-  'verdict. The chart also names what waits on you, and one word per thing.';
+  'The flow, left to right and then down. Two inputs enter on the left. On the sweep path an ' +
+  'analytic runs on every hourly sweep and finds a hit. Hits on one entity form a lead. The ' +
+  'lead starts its own hunt, or you press Hunt this lead. A hunt returns findings and ' +
+  'investigates each one. On the alert path soc-ai triages an alert. Both paths end in an ' +
+  'investigation, which ends in a verdict. In Needs you, you agree with the verdict or ' +
+  'override it. Your action goes to Security Onion. The chart also defines the two verbs.';
 
-/** The five sentences under the chart, in the order the chart reads. */
+/** The sentences under the chart: the flow in one line, then the five
+ *  definitions in the order the chart reads. */
 const SENTENCES = [
+  OVERVIEW_FLOW,
   DEFINE_ANALYTIC,
   DEFINE_HIT,
   DEFINE_LEAD,
@@ -82,7 +90,7 @@ export function HowThisFlowsDrawer({ open, onClose }: { open: boolean; onClose: 
       size="wide"
       header={
         <div className="flex min-w-0 flex-1 items-center justify-between gap-2.5">
-          <span className="text-[13.5px] font-semibold">How hunting flows</span>
+          <span className="text-[13.5px] font-semibold">{FLOW_LINK_LABEL}</span>
           <button
             type="button"
             onClick={onClose}
@@ -101,9 +109,9 @@ export function HowThisFlowsDrawer({ open, onClose }: { open: boolean; onClose: 
           className="w-full rounded-panel border border-border"
           style={{ maxWidth: '100%' }}
         />
-        {/* The same five sentences the page carries. A reader who cannot see
-            the chart still gets the words, and a reader who can gets them
-            twice, which is how a definition is learned. */}
+        {/* The flow line and the five sentences the page carries. A reader
+            who cannot see the chart still gets the words, and a reader who can
+            gets them twice, which is how a definition is learned. */}
         <ul
           data-testid="flow-definitions"
           className="mt-4 flex flex-col gap-2 text-[12.5px] leading-[1.6] text-text-2"

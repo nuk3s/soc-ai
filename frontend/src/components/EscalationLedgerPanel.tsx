@@ -1,7 +1,7 @@
 import { Link2Off } from 'lucide-react';
 
 import { getStrandedEscalations, type StrandedClaim } from '../lib/api';
-import { absTime, ago } from '../lib/timeRange';
+import { absTime, agoWords } from '../lib/timeRange';
 import { tint } from '../lib/tokens';
 import { useAsync } from '../lib/useAsync';
 import { Panel, PanelHeader } from './Panel';
@@ -40,21 +40,31 @@ import { EmptyState, Freshness, LoadingState } from './States';
 const AMBER = '#f5a623';
 
 function ClaimRow({ claim }: { claim: StrandedClaim }) {
+  // The rule and the host, then the sentence. The row was a raw alert id with
+  // "claimed 5d ago" beside it, which names nothing an operator can act on
+  // (dogfood 2026-10-06). The id stays in the tooltip for a search.
   return (
-    <li className="flex items-center gap-2.5 px-[15px] py-2.5 text-[13px]">
-      <span
-        className="min-w-0 flex-1 truncate font-mono text-[11.5px] text-text-2"
-        title={claim.alert_id}
-      >
-        {claim.alert_id}
-      </span>
+    <li data-testid="stranded-claim" className="flex items-start gap-2.5 px-[15px] py-2.5 text-[13px]">
+      <div className="min-w-0 flex-1" title={`Alert ${claim.alert_id}`}>
+        <div className="break-words text-text-2">
+          {claim.rule_name ? (
+            <>
+              <span className="font-semibold">{claim.rule_name}</span>
+              {claim.host && <span className="text-dim"> on {claim.host}</span>}
+            </>
+          ) : (
+            <span className="text-dim">
+              An alert with no investigation, <span className="font-mono text-[11.5px]">{claim.alert_id}</span>
+            </span>
+          )}
+        </div>
+        {/* The age is the fact: four minutes is a request in flight, and five
+            days is an alert nobody can escalate. */}
+        <div className="mt-0.5 text-[12px] text-dim" title={absTime(claim.claimed_at)}>
+          Escalation sent {agoWords(claim.claimed_at)}. Security Onion has not confirmed a case.
+        </div>
+      </div>
       <span className="flex-none text-[12px] text-dim">{claim.escalated_by}</span>
-      {/* The age, not the timestamp: "claimed 4m ago" is a request that may
-          still be in flight and "claimed 6d ago" is an alert nobody can
-          escalate, and those need different reactions from the same row. */}
-      <span className="flex-none text-[12px] text-dim" title={absTime(claim.claimed_at)}>
-        claimed {ago(claim.claimed_at)}
-      </span>
     </li>
   );
 }
@@ -111,7 +121,7 @@ export function EscalationLedgerPanel() {
             Could not read the escalation ledger.
           </div>
         ) : (
-          <LoadingState label="Reading the escalation ledger…" />
+          <LoadingState label="Reading the escalation ledger" />
         )
       ) : data.claims.length === 0 ? (
         <EmptyState title="Nothing is waiting.">

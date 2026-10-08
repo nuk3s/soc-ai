@@ -16,7 +16,7 @@ docker compose -f docker-compose.demo.yml up --build
 
 The demo replays recorded investigations, hunts and a backtest on canned data.
 It runs the same console that you connect to your grid later. The demo also
-carries a week of hunt catalog sweeps. The catalog panel on the Operate hub and
+carries a week of hunt catalog sweeps. The catalog panel on the Status page and
 the Catalog preset on the Hunts screen show the declarative catalog at work.
 No data leaves the box. The hosted copy is
 [the live demo](https://soc-ai-demo.onrender.com/). It needs no install and no

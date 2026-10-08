@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 
 from soc_ai.store.auth import utcnow
-from soc_ai.store.investigations import PROMOTED_KINDS, not_hunt_subject
+from soc_ai.store.investigations import PROMOTED_KINDS, not_backtest, not_hunt_subject
 from soc_ai.store.leads import CLOSED_STATUSES
 from soc_ai.store.models import EntityObservation, Investigation, Lead, RulePriorDecision
 
@@ -37,7 +37,8 @@ async def model_backed_runs(
     Model-backed means a model wrote the verdict. A rule-prior run did not,
     so it never feeds the prior that produced it. A pipeline fallback is a
     failure, not a verdict. A promotion and a synthetic evaluation are not
-    runs of the rule at all.
+    runs of the rule at all. A backtest replay is a measurement on an alert
+    an analyst already closed, so it never teaches the prior.
     """
     rows = await db.scalars(
         select(Investigation)
@@ -61,6 +62,7 @@ async def model_backed_runs(
             Investigation.kind.not_in(PROMOTED_KINDS),
             Investigation.is_synth_eval.isnot(True),
             not_hunt_subject(),
+            not_backtest(),
         )
         .order_by(Investigation.created_at.desc(), Investigation.id.desc())
     )

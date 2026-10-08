@@ -6,6 +6,7 @@ import {
   FileCode2,
   GitBranch,
   Loader2,
+  MoreHorizontal,
   RotateCw,
   ShieldAlert,
   Sparkles,
@@ -15,8 +16,7 @@ import {
 } from 'lucide-react';
 import { type ReactNode, Suspense, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
-import { HuntKindBadge, RecordedRunChip, SyntheticEvalBadge, VerdictPill } from '../components/Badges';
-import { ChatDockShell, ChatPanelShell } from '../components/ChatDock';
+import { HuntKindBadge, RecordedRunChip, SyntheticEvalBadge } from '../components/Badges';
 import { ConfidenceRing } from '../components/ConfidenceRing';
 import { Definition } from '../components/Definition';
 import { DocumentChip } from '../components/DocumentDrawer';
@@ -36,27 +36,41 @@ import { AnalyticPins, entityLine } from '../components/AnalyticPins';
 import {
   ApiError,
   type AnalyticDraftResult,
-  type ChatThread,
-  type HuntChatThread,
+  type AnalyticDraftReview,
+  type LeadDetail,
   cancelHuntConsole,
   deleteHunt,
   draftAnalytic,
   draftFindingDetection,
   getAbout,
   getHunt,
-  getHuntChat,
   getHunts,
   getLead,
   isNotFound,
-  postHuntChat,
   promoteFinding,
   startHuntConsole,
 } from '../lib/api';
+import { DISMISS_REASONS, DismissLeadForm } from '../components/LeadsStrip';
+import { FlowStrip } from '../components/FlowStrip';
+import { type FlowFinding, type FlowHunt, findingInvestigation, huntFlow } from '../lib/flowSteps';
 import { useDemo } from '../lib/demo';
 import { entityPath } from '../lib/entityPath';
 import { HUNT_STATUS } from '../lib/statusMeta';
-import { HUNT_KIND, SEVERITY, TIMELINE_GROUP_COLOR, VERDICT, tint } from '../lib/tokens';
 import {
+  type HuntOutcomeKey,
+  chipProps,
+  confidenceText,
+  confidenceWord,
+  huntOutcome,
+  outcomeLabel,
+  outcomeMeta,
+  verdictLabel,
+  verdictMeta,
+} from '../lib/labels';
+import { objectiveHeadline } from '../lib/text';
+import { HUNT_KIND, SEVERITY, TIMELINE_GROUP_COLOR, tint } from '../lib/tokens';
+import {
+  ACTION_OPEN_INVESTIGATION,
   CHIP_LEAD,
   CHIP_MITRE,
   CHIP_SEVERITY,
@@ -74,15 +88,15 @@ import {
 } from '../lib/tooltips';
 import { useAsync } from '../lib/useAsync';
 import { lazyWithReload } from '../lib/lazyWithReload';
-import { useChatThread } from '../lib/useChatThread';
+import { useChatScope } from '../lib/chatScope';
 import type {
+  FindingInvestigationStatus,
   HuntDetailData,
   HuntDiff,
   HuntFinding,
   HuntStatus,
   Severity,
   TimelineStep,
-  Verdict,
 } from '../lib/types';
 
 // Derived from the single app-wide severity ramp (lib/tokens) — no second palette.
@@ -132,17 +146,25 @@ function StatusPill({ status }: { status: HuntStatus }) {
 }
 
 // Strip the leading imperative from a free-text objective so the hero shows a
-// short, scannable TITLE (like an investigation's rule name) instead of the raw
+// scannable TITLE (like an investigation's rule name) instead of the raw
 // prompt. The full objective is still shown beneath + in the tooltip.
+//
+// The title is the objective's head line, whole. It was cut at 80 characters
+// with an ellipsis, and the owner could not read the hunt's own name on its
+// own page. The header has room, so the text wraps. A lead objective is a head
+// sentence over a list of observations, and the list opens on a click.
 const HUNT_TITLE_STRIP =
   /^(please\s+)?(look\s+for|look\s+into|hunt\s+for|hunt|search\s+for|search|find|check\s+for|check|investigate|show\s+me|scan\s+for|scan)\s+/i;
 function huntTitle(objective: string): string {
-  const raw = (objective || '').trim();
+  const raw = objectiveHeadline(objective);
   if (!raw) return 'Hunt';
-  let s = raw.replace(HUNT_TITLE_STRIP, '').replace(/^(for|into|at|the)\s+/i, '').trim() || raw;
-  s = s.charAt(0).toUpperCase() + s.slice(1);
-  return s.length > 80 ? `${s.slice(0, 79).trimEnd()}…` : s;
+  const s = raw.replace(HUNT_TITLE_STRIP, '').replace(/^(for|into|at|the)\s+/i, '').trim() || raw;
+  return s.charAt(0).toUpperCase() + s.slice(1);
 }
+
+// A long title steps down a size, so a paragraph-length objective reads as
+// text and not as a wall of headline type.
+const LONG_TITLE_CHARS = 140;
 
 // The actor the catalog sweep loop stamps on every hunt it records
 // (`SWEEP_ACTOR` in soc_ai/hunting/sweep.py). A hunt carrying it was produced
@@ -217,40 +239,53 @@ function splitCatalogDetail(f: HuntFinding): CatalogDetail | null {
   return { rationale: m[1], run: m[2], matched: Number(m[3]) };
 }
 
-// A hunt has no true/false-positive verdict — it has findings. Derive a
-// disposition BADGE (like the alerts verdict pill) from the worst finding
-// severity + status, so the analyst sees the conclusion at a glance up top.
-//
-// ONLY 'threat' findings may claim malicious/suspicious activity: a critical
-// VISIBILITY GAP is a coverage statement, and headlining it "Malicious
-// activity found" tells the analyst something the hunt never observed.
-const _SEV_ORDER = ['info', 'low', 'medium', 'high', 'critical'];
-//
-// A hunt that stopped (cancelled, interrupted, error) has no disposition. The
-// status pill names the stop and one sentence says why. The badge read
-// INCONCLUSIVE beside "Cancelled", and the page said the same stop four ways.
-function huntDisposition(
-  status: HuntStatus | undefined,
-  findings: HuntFinding[],
-): { label: string; color: string } | null {
-  if (status === 'running') return { label: 'Hunting…', color: '#4b8bf5' };
-  if (status !== 'complete') return null;
-  const threats = findings.filter((f) => (f.category ?? 'threat') === 'threat');
-  const gaps = findings.filter((f) => f.category === 'visibility_gap');
-  const worst = threats.reduce(
-    (w, f) => Math.max(w, _SEV_ORDER.indexOf((f.severity || 'info').toLowerCase())),
-    -1,
-  );
-  if (worst >= 3) return { label: 'Malicious activity found', color: '#f85149' }; // high/critical
-  if (worst === 2) return { label: 'Suspicious activity found', color: '#d29922' }; // medium
-  if (worst === 1) return { label: 'Low-severity findings', color: '#d29922' }; // low
-  // No threat evidence. Gaps mean the objective could not be fully tested —
-  // an honest grey "could not see", never a green all-clear.
-  // One phrase for a gap, here and on the hunts list. The two read differently
-  // and an analyst had to decide whether they meant the same thing.
-  if (gaps.length > 0) return { label: 'No threat observed · visibility gap', color: '#8b949e' };
-  return { label: 'No malicious activity found', color: '#3fb950' }; // observations-only or clean
+// A hunt has no true/false-positive verdict. It has one outcome, and the
+// backend names it (soc_ai/hunting/outcome.py) so the list, this page and the
+// bell print the same word. A hunt that could not run read "No threat
+// observed" with a green Complete chip, and a hunt that could not answer read
+// the same with a 0.75 confidence ring (dogfood 2026-10-06 S1). The label and
+// the colour come from lib/labels.ts, the one map every surface reads.
+
+/** The finding that records a failed query and nothing else. The catalog
+ *  composer titles it "<analytic>: could not run". It has no severity to act
+ *  on, no evidence to promote and no behaviour to draft from. */
+export function isRunFailure(f: Pick<HuntFinding, 'title' | 'category'>): boolean {
+  return f.category === 'visibility_gap' && /: could not run$/.test(f.title);
 }
+
+/** The outcome the server sent (lib/labels.ts huntOutcome), or the same rule
+ *  over the report when an older server sent none. */
+export function pageOutcome(
+  data: Pick<HuntDetailData, 'status' | 'findings' | 'outcome'>,
+): HuntOutcomeKey {
+  const sent = huntOutcome(data);
+  if (sent) return sent;
+  const findings = data.findings;
+  if (findings.some((f) => (f.category ?? 'threat') === 'threat')) return 'threat_found';
+  if (findings.length > 0 && findings.every(isRunFailure)) return 'could_not_run';
+  if (findings.length > 0 && findings.every((f) => f.category === 'visibility_gap')) {
+    return 'no_answer';
+  }
+  return 'no_threat';
+}
+
+function huntDisposition(
+  outcome: HuntOutcomeKey,
+  serverLabel?: string | null,
+): { label: string; color: string } {
+  const meta = outcomeMeta(outcome);
+  // The server's label carries the counts, "2 of 3 findings are threats".
+  return { label: serverLabel || outcomeLabel(outcome), color: meta.color };
+}
+
+/** The outcomes where the hunt tested its objective. Only these carry a
+ *  confidence. A run that did not test it has nothing to be confident in. */
+const TESTED: ReadonlySet<HuntOutcomeKey> = new Set<HuntOutcomeKey>([
+  'threat_found',
+  'no_threat',
+  'threats_confirmed',
+  'no_threat_confirmed',
+]);
 
 // The one sentence a stopped hunt shows. An error carries the stored reason.
 // A cancel and a restart are their own reason, so the stored text is not
@@ -329,7 +364,7 @@ function DiffList({ title, entries, color }: { title: string; entries: HuntDiff[
             <span className="h-1.5 w-1.5 flex-none rounded-full" style={{ background: color }} />
             {/* Machine-generated finding titles run long — give them two lines
                 before the ellipsis; the tooltip carries the full text. */}
-            <span className="min-w-0 line-clamp-2" style={{ textWrap: 'pretty' }} title={e.title}>
+            <span className="break-words min-w-0" style={{ textWrap: 'pretty' }} title={e.title}>
               {e.title}
             </span>
             <span className="ml-auto flex-none font-mono text-[10px] uppercase text-faint">
@@ -399,6 +434,159 @@ function HuntDiffStrip({ diff }: { diff: HuntDiff }) {
   );
 }
 
+// The draft in words: its title, its logic in one sentence, the YAML on a
+// click, the false positives the drafter named, and two checks the server ran
+// (dogfood 2026-10-06 W8).
+function DraftReviewBlock({ review, yaml }: { review: AnalyticDraftReview; yaml: string }) {
+  const [yamlOpen, setYamlOpen] = useState(false);
+  return (
+    <div data-testid="draft-analytic-review" className="mt-2 flex flex-col gap-1.5">
+      <div className="text-text">{review.title}</div>
+      <div className="text-dim" data-testid="draft-analytic-logic">
+        {review.logic}
+      </div>
+      {review.repeats_alerts && (
+        <div data-testid="draft-analytic-repeats" className="text-warn">
+          {review.repeats_alerts}
+        </div>
+      )}
+      {review.source && (
+        <div data-testid="draft-analytic-source" className="text-warn">
+          {review.source}
+        </div>
+      )}
+      {review.false_positives.length > 0 && (
+        <div className="text-dim">
+          <span className="font-semibold text-text-2">False positives: </span>
+          {review.false_positives.join(' ')}
+        </div>
+      )}
+      <div>
+        <button
+          type="button"
+          onClick={() => setYamlOpen((v) => !v)}
+          aria-expanded={yamlOpen}
+          className="text-[11.5px] font-semibold text-accent hover:underline"
+        >
+          {yamlOpen ? 'Hide the YAML' : 'Show the YAML'}
+        </button>
+        {yamlOpen && (
+          <pre
+            data-testid="draft-analytic-yaml"
+            className="mt-1 max-h-[240px] overflow-auto rounded-control border border-border bg-bg p-2 font-mono text-[11px] leading-[1.5] text-text-2"
+          >
+            {yaml}
+          </pre>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── The investigation of each finding ─────────────────────────────────────
+// A hunt investigates its subject findings as part of the hunt (2026-10-07).
+// Each finding card states where its investigation is, in one line.
+
+const LEGACY_RUN_STATUS: Record<string, FindingInvestigationStatus> = {
+  running: 'running',
+  complete: 'complete',
+  error: 'failed',
+  interrupted: 'failed',
+  cancelled: 'cancelled',
+};
+
+/** Where the investigation of one finding is. An older server sends only the
+ *  `investigation` card, and its run status answers. */
+export function findingInvestigationStatus(f: HuntFinding): FindingInvestigationStatus | null {
+  if (f.investigationStatus) return f.investigationStatus;
+  const status = f.investigation?.status;
+  return status ? (LEGACY_RUN_STATUS[status] ?? 'failed') : null;
+}
+
+/** "No action waits", "1 action waits", "2 actions wait". */
+export function pendingActionsText(n: number): string {
+  if (n <= 0) return 'No action waits';
+  return n === 1 ? '1 action waits' : `${n} actions wait`;
+}
+
+/** The line above the findings while the hunt investigates them. */
+export function findingsProgressLine(
+  data: Pick<HuntDetailData, 'findingsInvestigated' | 'findingsTotal'>,
+): string {
+  return outcomeLabel('investigating', {
+    investigated: data.findingsInvestigated,
+    total: data.findingsTotal,
+  });
+}
+
+// The sentence for a finding with no verdict. The manual control on the card
+// opens an investigation by hand.
+const NO_VERDICT_LINE: Partial<Record<FindingInvestigationStatus, string>> = {
+  running: 'The investigation runs.',
+  queued: 'The investigation waits for a free slot.',
+  failed: 'Investigation failed, re-run.',
+  cancelled: 'Investigation cancelled, re-run.',
+  over_cap: 'Over the cap, open by hand.',
+};
+
+function FindingInvestigationLine({ f, huntId }: { f: HuntFinding; huntId: string }) {
+  const status = findingInvestigationStatus(f);
+  if (!status) return null;
+  const invId = f.investigationId ?? f.investigation?.id ?? null;
+  const verdict = f.verdict ?? f.investigation?.verdict ?? null;
+  const conf = f.confidence ?? f.investigation?.conf ?? null;
+  const link = invId ? (
+    <Link
+      to={`/investigation/${invId}`}
+      state={{ from: `/hunts/${huntId}` }}
+      data-testid="finding-investigation-link"
+      className="font-semibold text-accent hover:underline"
+    >
+      Open the investigation
+    </Link>
+  ) : null;
+  if (status === 'complete' && verdict) {
+    const pending = f.pendingActions ?? 0;
+    return (
+      <div
+        data-testid="finding-investigation"
+        data-status={status}
+        className="mb-1.5 flex flex-wrap items-center gap-2 font-sans text-[11.5px] text-dim"
+      >
+        <span
+          data-testid="finding-verdict"
+          {...chipProps(verdictMeta(verdict), { title: 'The verdict of the investigation.' })}
+        >
+          {verdictLabel(verdict)}
+          {conf != null && <span className="font-mono opacity-80">{confidenceText(conf)}</span>}
+        </span>
+        {conf != null && (
+          <span data-testid="finding-confidence">{`${confidenceWord(conf)} confidence`}</span>
+        )}
+        <span
+          data-testid="finding-pending-actions"
+          className={pending > 0 ? 'font-semibold text-warn' : undefined}
+        >
+          {pendingActionsText(pending)}
+        </span>
+        {link}
+      </div>
+    );
+  }
+  const line = NO_VERDICT_LINE[status] ?? 'The investigation reached no verdict.';
+  const failed = status === 'failed' || status === 'cancelled';
+  return (
+    <div
+      data-testid="finding-investigation"
+      data-status={status}
+      className="mb-1.5 flex flex-wrap items-center gap-2 font-sans text-[11.5px] text-dim"
+    >
+      <span className={failed ? 'font-semibold text-warn' : undefined}>{line}</span>
+      {status === 'running' && link}
+    </div>
+  );
+}
+
 // Rich finding card — mirrors the investigation timeline rows: a severity dot,
 // the title, prose detail, and mono host/citation chips.
 function FindingCard({
@@ -429,7 +617,11 @@ function FindingCard({
    *  probe shows neither the button nor the pointer. */
   sigmaOff: boolean;
 }) {
-  const color = SEV_COLOR[f.severity] ?? SEV_COLOR.info;
+  // A failed query is the record that the run did not run. It has no severity
+  // to act on and no evidence to promote, so the card shows neither: the
+  // "medium" chip and the Investigate button on one read as a finding.
+  const runFailure = isRunFailure(f);
+  const color = runFailure ? '#8b949e' : (SEV_COLOR[f.severity] ?? SEV_COLOR.info);
   // Only a catalog finding's detail is a composed string with a known seam.
   const spec = catalog ? splitCatalogDetail(f) : null;
   const navigate = useNavigate();
@@ -473,11 +665,12 @@ function FindingCard({
   // the analyst got no signal that a verdict may already exist). An
   // errored/cancelled/interrupted promotion frees the slot server-side
   // (mirrors inv_svc.blocks_rehunt), so only running/complete change the button.
-  const inv = f.investigation ?? null;
+  // The hunt investigates its findings (owner, 2026-10-07), and the server
+  // names the investigation on the finding. An older server sends the
+  // `investigation` block, and the helper reads either.
+  const inv = findingInvestigation(f as FlowFinding);
   const invRunning = inv != null && inv.status === 'running';
   const invComplete = inv != null && inv.status === 'complete';
-  const chipVerdict: Verdict | null =
-    invComplete && inv?.verdict && inv.verdict in VERDICT ? (inv.verdict as Verdict) : null;
   // Confirm-first doctrine: a detection may be drafted ONLY from a finding
   // whose promoted investigation completed AND confirmed true_positive. An
   // unpromoted, running, or non-TP finding gets no draft affordance — the
@@ -492,16 +685,36 @@ function FindingCard({
       <div className="absolute left-0 top-0 h-full w-[3px]" style={{ background: color }} />
       <div className="mb-1.5 flex items-center gap-2">
         <span className="h-2 w-2 flex-none rounded-full" style={{ background: color }} />
+        {/* The finding's number, the one the analytic's version note and the
+            promoted investigation print. The note read "finding 1" for the
+            second card. */}
+        <span
+          data-testid="finding-number"
+          className="flex-none font-mono text-[11px] font-semibold text-faint"
+          title="The number of this finding in the hunt report."
+        >
+          F{ordinal + 1}
+        </span>
         <span className="text-[13.5px] font-semibold text-text" style={{ textWrap: 'pretty' }}>
           {f.title}
         </span>
-        {f.category === 'visibility_gap' && (
+        {runFailure ? (
           <span
+            data-testid="finding-could-not-run"
             className="flex-none rounded-chip border border-border-2 bg-surface-3 px-1.5 py-px text-[10px] font-semibold uppercase tracking-[.04em] text-dim"
-            title="A visibility gap names a type of telemetry that this grid or this host does not ship. The finding title names the type. The hunt observed no malicious activity here."
+            title="A query of this run failed. The result is unknown. Hunt again when the grid is healthy."
           >
-            visibility gap
+            could not run
           </span>
+        ) : (
+          f.category === 'visibility_gap' && (
+            <span
+              className="flex-none rounded-chip border border-border-2 bg-surface-3 px-1.5 py-px text-[10px] font-semibold uppercase tracking-[.04em] text-dim"
+              title="A visibility gap names a type of telemetry that this grid or this host does not ship. The finding title names the type. The hunt observed no malicious activity here."
+            >
+              visibility gap
+            </span>
+          )
         )}
         {f.category === 'observation' && (
           <span
@@ -511,7 +724,7 @@ function FindingCard({
             observation
           </span>
         )}
-        {(invRunning || invComplete) && inv ? (
+        {runFailure ? null : (invRunning || invComplete) && inv ? (
           // Already promoted. The investigation is a page, so this is a link:
           // it never re-promotes, and the address can be read before the click.
           <Link
@@ -519,22 +732,24 @@ function FindingCard({
             state={{ from: `/hunts/${huntId}` }}
             title={
               invRunning
-                ? 'An investigation of this finding already runs. Open it to watch the progress.'
-                : 'This finding has an investigation. Open it to read the verdict.'
+                ? 'An investigation of this finding runs now. View it to follow the progress.'
+                : 'This finding has an investigation. View it to read the verdict.'
             }
             className="ml-auto inline-flex items-center gap-1.5 font-sans text-[11px] font-semibold text-accent hover:underline"
           >
             <Sparkles size={12} />
-            {invRunning ? 'Investigating…' : 'Open'}
+            {invRunning ? 'Investigation running' : 'View investigation'}
           </Link>
         ) : (
-          // Investigate: promotes this finding's cited evidence into a full
-          // investigation (E1.3 authoring bridge). Idempotent server-side — a
-          // re-click on an already-promoted finding lands on the same
+          // Open an investigation: the manual control on a finding with no
+          // investigation (owner, 2026-10-07). The hunt investigates what it
+          // finds, so this is for a finding it left. It starts a full
+          // investigation of the finding's cited evidence (E1.3 authoring
+          // bridge). Idempotent server-side: a re-click lands on the same
           // investigation rather than minting a duplicate. Disabled when the
           // finding has no citations left to investigate (the post-hunt
           // citation gate can strip every one), since that request can only
-          // ever 422.
+          // ever 422. The route keeps its name, /findings/{n}/investigate.
           <button
             type="button"
             onClick={(e) => {
@@ -551,13 +766,13 @@ function FindingCard({
             title={
               f.citations.length === 0
                 ? 'This finding has no linked evidence events. An investigation needs at least one event.'
-                : 'Run a full investigation of the evidence that this finding cites.'
+                : ACTION_OPEN_INVESTIGATION
             }
             className="ml-auto inline-flex items-center gap-1.5 rounded-badge border px-[9px] py-[3px] font-sans text-[11px] font-semibold text-accent disabled:opacity-50"
             style={{ borderColor: 'rgba(75,139,245,.3)', background: 'rgba(75,139,245,.07)' }}
           >
             <Sparkles size={12} />
-            {busy ? 'Starting…' : 'Investigate'}
+            {busy ? 'Starting the investigation' : 'Open an investigation'}
           </button>
         )}
         {sigmaOn && confirmedTP && !draftOpen && (
@@ -600,12 +815,12 @@ function FindingCard({
                 .finally(() => setAnalyticBusy(false));
             }}
             disabled={analyticBusy}
-            title="Draft a catalog analytic from this threat finding. You read the draft and confirm before soc-ai stores it as a candidate. A candidate does not run."
+            title="Draft a catalog analytic from this threat finding. You read the draft and confirm before soc-ai stores it. A draft does not run."
             className="inline-flex items-center gap-1.5 rounded-badge border px-[9px] py-[3px] font-sans text-[11px] font-semibold text-accent disabled:opacity-50"
             style={{ borderColor: 'rgba(75,139,245,.3)', background: 'rgba(75,139,245,.07)' }}
           >
             <Crosshair size={12} />
-            {analyticBusy ? 'Drafting…' : 'Draft an analytic'}
+            {analyticBusy ? 'Drafting' : 'Draft an analytic'}
           </button>
         )}
         {sigmaOff && confirmedTP && (
@@ -623,15 +838,20 @@ function FindingCard({
             </Link>
           </span>
         )}
-        {chipVerdict && <VerdictPill verdict={chipVerdict} conf={inv?.conf} />}
-        <span
-          title={CHIP_SEVERITY}
-          className="flex-none rounded-chip border px-1.5 py-px text-[10px] font-semibold uppercase tracking-[.04em]"
-          style={{ color, borderColor: `${color}55`, background: `${color}14` }}
-        >
-          {f.severity}
-        </span>
+        {!runFailure && (
+          <span
+            data-testid="finding-severity"
+            title={CHIP_SEVERITY}
+            className="flex-none rounded-chip border px-1.5 py-px text-[10px] font-semibold uppercase tracking-[.04em]"
+            style={{ color, borderColor: `${color}55`, background: `${color}14` }}
+          >
+            {f.severity}
+          </span>
+        )}
       </div>
+      {/* The investigation the hunt opened for this finding: its verdict, the
+          confidence word, the actions that wait and the link. */}
+      {!runFailure && <FindingInvestigationLine f={f} huntId={huntId} />}
       {promoteErr && (
         <div className="mb-1.5 font-mono text-[11px] text-danger">{promoteErr}</div>
       )}
@@ -650,11 +870,15 @@ function FindingCard({
         >
           <div className="font-semibold">
             Save the analytic <span className="font-mono">{analyticPreview.analytic_id}</span> as a
-            candidate?
+            draft?
           </div>
           <div className="mt-1 text-dim">
-            A candidate does not run. Move it to shadow in the Analytics tab to run it.
+            A draft does not run. Move it to shadow in the Analytics tab to run it.
           </div>
+          {/* The draft itself, before the save (W8). The box showed the id
+              and one dry-run line, and the definition was readable only
+              after the save. */}
+          {analyticPreview.review && <DraftReviewBlock review={analyticPreview.review} yaml={analyticPreview.spec_yaml} />}
           {/* The pins sit above the dry run: a dry run of a pinned clause
               counts the one case again, and reads as proof. */}
           <AnalyticPins
@@ -700,10 +924,10 @@ function FindingCard({
               className="rounded-control border border-accent bg-[rgba(75,139,245,.14)] px-[10px] py-1 text-[11.5px] font-semibold text-[#cfe0ff] disabled:opacity-60"
             >
               {analyticBusy
-                ? 'Saving…'
+                ? 'Saving'
                 : analyticPreview.generalization?.pinned.length
                   ? 'Save anyway'
-                  : 'Save candidate'}
+                  : 'Save draft'}
             </button>
             <button
               type="button"
@@ -719,7 +943,7 @@ function FindingCard({
       {savedAnalytic && (
         // One line, and the link to the candidate itself.
         <div data-testid="draft-analytic-saved" className="mb-1.5 font-sans text-[11.5px] text-dim">
-          {analyticDraft ? 'Candidate ' : 'Analytic '}
+          {analyticDraft ? 'Draft ' : 'Analytic '}
           <Link
             to={`/hunts?tab=analytics&open=${encodeURIComponent(savedAnalytic)}`}
             className="font-mono underline hover:text-text-2"
@@ -787,9 +1011,23 @@ function FindingCard({
               because the app had no document viewer to open an Elasticsearch
               _id in. A citation is the proof the finding is real, so each one
               opens its document in the drawer. */}
-          {f.citations.map((c) => (
-            <DocumentChip key={c} id={c} />
-          ))}
+          {f.citations.map((c) => {
+            // A model can cite a tool call, "t_origin_chain(10.99.0.40)". It
+            // is no document, so it reads in words and opens nothing (K4).
+            const words = citationWords(c);
+            return words ? (
+              <span
+                key={c}
+                data-testid="citation-words"
+                title={`The finding cites a tool result: ${c}`}
+                className="rounded-chip border border-border-2 bg-surface-3 px-1.5 py-px font-sans text-[11px] text-dim"
+              >
+                {words}
+              </span>
+            ) : (
+              <DocumentChip key={c} id={c} />
+            );
+          })}
           {/* Three ids beside a narrative saying four documents matched, with
               nothing accounting for the fourth. execute.py caps top_hits at
               MAX_SAMPLE_IDS = 3 per bucket, so a candidate over three
@@ -807,6 +1045,215 @@ function FindingCard({
       {draftOpen && (
         <div className="mt-2.5">
           <DraftDetectionPane autoRun onDraft={() => draftFindingDetection(huntId, ordinal)} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+// The nouns of the tools a model cites by name. A tool this map does not hold
+// reads as its own words.
+const CITED_TOOL: Record<string, string> = {
+  origin_chain: 'Origin chain',
+  decode_payload: 'Decoded payload',
+  host_dossier: 'Host dossier',
+  host_summary: 'Host summary',
+  query_events_oql: 'Event search',
+  query_zeek_logs: 'Zeek logs',
+  get_event_raw: 'Document',
+  get_alert_context: 'Alert context',
+  get_rule_content: 'Rule text',
+  prevalence: 'Prevalence',
+  rule_prevalence: 'Rule prevalence',
+  first_seen: 'First sighting',
+  beacon_profile: 'Beacon profile',
+  dns_entropy_scan: 'DNS entropy scan',
+  run_analytic: 'Analytic run',
+  enrich_ip: 'Reputation',
+  enrich_domain: 'Domain reputation',
+  enrich_hash: 'File-hash reputation',
+};
+const TOOL_CITATION = /^t_([a-z0-9_]+)\s*\((.*)\)\s*$/i;
+
+/** A tool citation in words: "t_origin_chain(10.99.0.40)" reads "Origin chain
+ *  of 10.99.0.40". null for a document id, which opens in the drawer. */
+export function citationWords(citation: string): string | null {
+  const m = citation.trim().match(TOOL_CITATION);
+  if (!m) return null;
+  const name = m[1].toLowerCase();
+  const noun =
+    CITED_TOOL[name] ?? name.replace(/_/g, ' ').replace(/^./, (ch) => ch.toUpperCase());
+  const args = m[2]
+    .split(',')
+    .map((a) => a.replace(/^\s*[a-z_]+\s*=\s*/i, '').replace(/^["']|["']$/g, '').trim())
+    .filter(Boolean);
+  return args.length ? `${noun} of ${args.join(', ')}` : noun;
+}
+
+/** The help line over the finding cards. Each sentence names a control the
+ *  page shows: the detection sentence only while detection authoring is on. */
+export function findingsHelp(detectionAuthoring: boolean): string {
+  return [
+    'Open an investigation on a finding that has none.',
+    detectionAuthoring ? 'Draft a detection from a confirmed true positive.' : null,
+    'Draft an analytic from any threat finding.',
+  ]
+    .filter(Boolean)
+    .join(' ');
+}
+
+/** "Step 8 · hunts on this grid take 5 to 8 minutes · now: the model reads
+ *  the results". A part the server did not send is left out. */
+export function runningLine(
+  data: Pick<HuntDetailData, 'timeline' | 'currentStep' | 'typicalRun'>,
+): string {
+  const steps = data.timeline.filter((s) => s.group === 'Tool calls').length;
+  const parts = [`Step ${Math.max(1, steps)}`];
+  const t = data.typicalRun;
+  if (t) {
+    parts.push(
+      t.lowMin === t.highMin
+        ? `hunts on this grid take about ${t.lowMin} minute${t.lowMin === 1 ? '' : 's'}`
+        : `hunts on this grid take ${t.lowMin} to ${t.highMin} minutes`,
+    );
+  }
+  if (data.currentStep) parts.push(`now: ${data.currentStep}`);
+  return parts.join(' · ');
+}
+
+// The decision a lead hunt exists for. The hunt page offered Re-hunt and
+// Delete, and the analyst went back to the lead to dismiss it (dogfood
+// 2026-10-06 W4). The bar calls the lead route the lead page calls. It shows
+// while the lead is open and the hunt has ended: a running hunt has nothing
+// for the analyst to decide yet.
+//
+// The bar offers no "Open an investigation" (owner, 2026-10-07). The hunt
+// investigates its findings, and the manual control sits on a finding with no
+// investigation.
+export function LeadDecisionBar({
+  lead,
+  onChanged,
+}: {
+  lead: Pick<LeadDetail, 'id' | 'status' | 'dismiss_reasons'>;
+  onChanged: () => void;
+}) {
+  const [dismissing, setDismissing] = useState(false);
+  if (lead.status !== 'open' && lead.status !== 'hunting') return null;
+  const btn =
+    'flex items-center gap-1.5 rounded-control border px-[11px] py-1.5 text-[12px] font-semibold disabled:opacity-60';
+  return (
+    <div
+      data-testid="hunt-lead-decision"
+      role="region"
+      aria-label={`Lead ${lead.id} decision`}
+      className="mt-[18px] flex flex-col gap-2 rounded-panel-lg border px-[18px] py-3"
+      style={{ borderColor: 'rgba(75,139,245,.35)', background: 'rgba(75,139,245,.06)' }}
+    >
+      <div className="flex flex-wrap items-center gap-2.5">
+        <span className="text-[13px] font-semibold text-text">Lead {lead.id} waits on you.</span>
+        <span className="text-[12px] text-dim">
+          Read each finding and the verdict of its investigation. Dismiss the lead if it is noise.
+        </span>
+        <div className="flex-1" />
+        <button
+          type="button"
+          data-testid="hunt-lead-dismiss"
+          onClick={() => setDismissing((v) => !v)}
+          aria-expanded={dismissing}
+          className={`${btn} border-border-strong bg-surface-3 text-dim hover:text-text`}
+        >
+          Dismiss lead
+        </button>
+      </div>
+      {dismissing && (
+        <DismissLeadForm
+          leadId={lead.id}
+          reasons={lead.dismiss_reasons?.length ? lead.dismiss_reasons : DISMISS_REASONS}
+          onDone={() => {
+            setDismissing(false);
+            onChanged();
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function ActionRow({ title, rationale }: { title: string; rationale: string }) {
+  return (
+    <div className="border-l-2 border-border-2 pl-3">
+      <div className="text-[12.5px] font-semibold text-text">{title}</div>
+      <div className="mt-0.5 text-[11.5px] leading-[1.5] text-dim" style={{ textWrap: 'pretty' }}>
+        {rationale}
+      </div>
+    </div>
+  );
+}
+
+// The steps the console cannot take: a wider window, a replayed corpus, a
+// sensor to turn on. The page listed them as recommended actions (C5).
+function OperatorSteps({ steps }: { steps: { title: string; rationale: string }[] }) {
+  const [open, setOpen] = useState(false);
+  const n = steps.length;
+  return (
+    <div data-testid="hunt-operator-steps">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        className="text-[11.5px] font-semibold text-accent hover:underline"
+      >
+        {n === 1 ? '1 step needs the operator' : `${n} steps need the operator`}
+      </button>
+      {open && (
+        <div className="mt-2 flex flex-col gap-3">
+          <div className="text-[11.5px] text-dim">
+            The console cannot take these steps. They need the grid, the sensors or the data
+            pipeline.
+          </div>
+          {steps.map((a, i) => (
+            <ActionRow key={i} title={a.title} rationale={a.rationale} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// The actions an analyst seldom takes, behind one control. Delete sat beside
+// Re-hunt at the same weight on every hunt page (dogfood 2026-10-06 W4).
+function OverflowMenu({ onDelete }: { onDelete: () => void }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        data-testid="hunt-more"
+        aria-label="More actions"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+        className="flex items-center rounded-control border border-border-strong bg-surface-3 px-[9px] py-1.5 text-dim hover:text-text"
+      >
+        <MoreHorizontal size={14} />
+      </button>
+      {open && (
+        <div
+          role="menu"
+          className="absolute right-0 top-full z-10 mt-1 min-w-[150px] rounded-control border border-border-strong bg-surface-2 py-1 shadow-lg"
+        >
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              setOpen(false);
+              onDelete();
+            }}
+            className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] text-dim hover:bg-surface-hover hover:text-danger"
+          >
+            <Trash2 size={13} />
+            Delete hunt
+          </button>
         </div>
       )}
     </div>
@@ -943,8 +1390,10 @@ export function HuntDetail() {
       // enumerating the terminal set missed 'interrupted', which then polled
       // every 3s forever. Gate on a known status that is not 'running' so a new
       // terminal status can never reintroduce the leak.
+      // An investigating hunt is live too: the investigations of its findings
+      // run, and the findings section counts them.
       const s = statusRef.current;
-      return s !== undefined && s !== 'running';
+      return s !== undefined && s !== 'running' && s !== 'investigating';
     },
   });
   statusRef.current = data?.status;
@@ -1010,11 +1459,36 @@ export function HuntDetail() {
   // Terminal hunts (complete or errored/cancelled/interrupted) can be deleted
   // and support the read-only follow-up chat.
   const terminal = complete || failed;
-  const statusColor = status ? (HUNT_STATUS[status]?.color ?? '#8b949e') : '#8b949e';
-  const disp = data ? huntDisposition(data.status, data.findings) : null;
-  const title = data ? huntTitle(data.objective) : '';
+  const outcome: HuntOutcomeKey | null = data ? pageOutcome(data) : null;
+  const disp = outcome ? huntDisposition(outcome, data?.outcome_label) : null;
+  // The hero wears the outcome's colour once the hunt ended. A run that could
+  // not reach the grid wore the green of "Complete".
+  const statusColor =
+    outcome && outcome !== 'running'
+      ? outcomeMeta(outcome).color
+      : status
+        ? (HUNT_STATUS[status]?.color ?? '#8b949e')
+        : '#8b949e';
+  // The sentence under the outcome: why the hunt could not run, or the gap it
+  // could not answer. The server writes it. A stopped hunt from an older
+  // server falls back to its stop sentence.
+  const outcomeHeadline =
+    data?.outcome_headline || (failed ? stopSentence(data?.status, data?.narrative) : '');
+  // The server's plain title: a catalog run reads "<analytic>, last 24 h" and
+  // a lead hunt "Lead 6 hunt: domainadmin on SR-DC01". The bell and the list
+  // read the same words. An older server sends none.
+  const title = data ? huntTitle(data.title || data.objective) : '';
+  // The findings the charts may count. A failed query is no finding of the
+  // hunt: the breakdown counted one as "medium 1" on a run that never ran.
+  const charted = data ? data.findings.filter((f) => !isRunFailure(f)) : [];
   // Declarative-spec run: no model touched this hunt at any point.
   const catalog = data?.startedBy === CATALOG_ACTOR;
+  // The Ask soc-ai panel's hunt scope. The hunt chat answers from the report,
+  // so a running hunt has no scope yet, and the panel offers the general
+  // thread until the hunt ends.
+  useChatScope(
+    data && terminal ? { scope: { kind: 'hunt', id: data.id, name: title || data.objective } } : null,
+  );
 
   return (
     <div className="px-[22px] pb-[60px] pt-[18px] font-sans text-text">
@@ -1035,7 +1509,7 @@ export function HuntDetail() {
       <Definition of="hunt" className="mb-3.5" />
 
       {loading && !data ? (
-        <LoadingState label="Loading hunt…" />
+        <LoadingState label="Loading hunt" />
       ) : /* A 404 is an answer, not an incident — and retrying one just fails
              again. Only a real failure keeps the alarm card and its Retry.
 
@@ -1079,6 +1553,10 @@ export function HuntDetail() {
               className="mb-3"
             />
           ) : null}
+          {/* The flow, under the header (owner, 2026-10-07). The hunt is the
+              current step. A lead hunt reads Hit, Lead, Hunt, Investigations,
+              Verdicts, Actions. A manual hunt starts at its objective. */}
+          <FlowStrip steps={huntFlow(data as FlowHunt, leadId)} className="mb-3" />
           {/* ── hero: objective headline, meta strip, confidence ring ────── */}
           <div
             className="relative overflow-hidden rounded-panel-lg border p-5"
@@ -1101,7 +1579,9 @@ export function HuntDetail() {
                 {/* verdict-style disposition badge + status — up top, like alerts */}
                 <div className="mb-2.5 flex flex-wrap items-center gap-2.5">
                   {disp && <DispositionBadge label={disp.label} color={disp.color} />}
-                  <StatusPill status={data.status} />
+                  {/* A run whose every query failed is not "Complete". The
+                      green chip beside it was the false all-clear. */}
+                  {!(complete && outcome === 'could_not_run') && <StatusPill status={data.status} />}
                   <HuntKindBadge kind={data.kind} />
                   {/* The lead that asked for this hunt. The page named the
                       kind and not the lead, so the hunt and the lead were two
@@ -1126,18 +1606,24 @@ export function HuntDetail() {
                     objective in a banner that named no cause. The backend
                     stores the sentence that names the failure, so it goes
                     directly under the word it explains. */}
-                {failed && (
+                {outcomeHeadline && (
                   <div
-                    data-testid="hunt-failure-reason"
+                    data-testid={failed ? 'hunt-failure-reason' : 'hunt-outcome-headline'}
                     className="mb-2.5 text-[13px] leading-[1.55] text-warn"
                     style={{ textWrap: 'pretty' }}
                   >
-                    {stopSentence(data.status, data.narrative)}
+                    {outcomeHeadline}
                   </div>
                 )}
-                {/* generated title (from the objective) as the hero headline */}
+                {/* generated title (from the objective) as the hero headline.
+                    It wraps and never cuts. */}
                 <div
-                  className="text-[21px] font-semibold leading-[1.32] tracking-[-.015em]"
+                  data-testid="hunt-title"
+                  className={`break-words font-semibold tracking-[-.015em] ${
+                    title.length > LONG_TITLE_CHARS
+                      ? 'text-[17px] leading-[1.4]'
+                      : 'text-[21px] leading-[1.32]'
+                  }`}
                   style={{ textWrap: 'pretty' }}
                   title={data.objective}
                 >
@@ -1181,8 +1667,11 @@ export function HuntDetail() {
                   dial used to render that absence as 0.00 in 18px type beside
                   the disposition, which reads as "the system has zero
                   confidence in this" rather than "nothing scored this". A
-                  zero is a measurement and keeps its dial. */}
-              {complete && data.confidence !== null && (
+                  zero is a measurement and keeps its dial. A hunt that did
+                  not test its objective (no answer, could not run) shows no
+                  dial: a 0.75 beside "cannot be confirmed or ruled out" read
+                  as an answer. */}
+              {complete && data.confidence !== null && outcome && TESTED.has(outcome) && (
                 <div className="flex flex-none items-center gap-[9px]">
                   <ConfidenceRing conf={data.confidence} color={statusColor} />
                   <div>
@@ -1232,7 +1721,7 @@ export function HuntDetail() {
                   }
                 >
                   {rehunting ? <Spinner size={13} /> : <RotateCw size={13} />}
-                  {rehunting ? 'Starting…' : 'Re-hunt'}
+                  {rehunting ? 'Starting' : 'Re-hunt'}
                 </button>
               )}
               {rehuntError && (
@@ -1247,7 +1736,7 @@ export function HuntDetail() {
                   className="flex items-center gap-1.5 rounded-control border border-border-strong bg-surface-3 px-[11px] py-1.5 text-[12px] font-semibold text-dim hover:border-danger hover:text-danger disabled:opacity-60"
                 >
                   {cancelling ? <Spinner size={13} /> : <X size={13} />}
-                  {cancelling ? 'Cancelling…' : 'Cancel hunt'}
+                  {cancelling ? 'Cancelling' : 'Cancel hunt'}
                 </button>
               )}
               {terminal &&
@@ -1263,7 +1752,7 @@ export function HuntDetail() {
                       className="flex items-center gap-1.5 rounded-control border border-danger bg-[rgba(240,68,56,.1)] px-[11px] py-1.5 text-[12px] font-semibold text-[#fca5a5] hover:bg-[rgba(240,68,56,.18)] disabled:opacity-60"
                     >
                       {deleting ? <Spinner size={13} color="#fca5a5" /> : <Trash2 size={13} />}
-                      {deleting ? 'Deleting…' : 'Confirm delete'}
+                      {deleting ? 'Deleting' : 'Confirm delete'}
                     </button>
                     <button
                       onClick={() => {
@@ -1277,24 +1766,28 @@ export function HuntDetail() {
                     </button>
                   </div>
                 ) : (
-                  <button
-                    onClick={() => setConfirmDelete(true)}
-                    className="flex items-center gap-1.5 rounded-control border border-border-strong bg-surface-3 px-[11px] py-1.5 text-[12px] font-semibold text-dim hover:border-danger hover:text-danger"
-                  >
-                    <Trash2 size={13} />
-                    Delete
-                  </button>
+                  <OverflowMenu onDelete={() => setConfirmDelete(true)} />
                 ))}
             </div>
           </div>
 
+          {/* The lead decision, on the page that holds the hunt's answer. */}
+          {terminal && lead.data && (
+            <LeadDecisionBar lead={lead.data} onChanged={lead.refetch} />
+          )}
+
           {/* running banner */}
+          {/* W10: the step, the time a hunt takes on this grid, and what the
+              hunt does now. The banner said one fixed sentence, and the
+              newest step sat at the bottom of the timeline. */}
           {running && (
-            <Panel className="mt-[18px] flex items-center gap-2 px-4 py-3 text-[13px] text-dim">
-              <Loader2 size={15} className="animate-spin text-accent" />
-              The hunt runs. It correlates events, enriches indicators, and maps them to MITRE. This
-              view updates live.
-            </Panel>
+            <div
+              data-testid="hunt-running-line"
+              className="mt-[18px] flex items-center gap-2 overflow-hidden rounded-panel border border-border bg-surface-1 px-4 py-3 text-[13px] text-dim"
+            >
+              <Loader2 size={15} className="flex-none animate-spin text-accent" />
+              {runningLine(data)}
+            </div>
           )}
 
           {/* What a stopped hunt left behind. The reason sits under the
@@ -1356,11 +1849,11 @@ export function HuntDetail() {
               {/* Deterministic charts from the findings — only once the hunt has
                   concluded WITH findings (a running or empty hunt has nothing
                   to plot, and a chart must never render from nothing). */}
-              {complete && data.findings.length > 0 && (
+              {complete && charted.length > 0 && (
                 <CollapsibleSection title="Visual summary">
                   <Suspense fallback={<VisualsSkeleton />}>
                     <HuntVisuals
-                      findings={data.findings}
+                      findings={charted}
                       affectedHosts={data.affectedHosts}
                       charts={data.charts}
                     />
@@ -1390,12 +1883,28 @@ export function HuntDetail() {
                   </Panel>
                 ) : (
                   <div className="flex flex-col gap-2.5">
+                    {/* The hunt investigates its findings as part of the hunt.
+                        While the investigations run, one line counts them. */}
+                    {data.status === 'investigating' && (
+                      <div
+                        data-testid="findings-progress"
+                        className="flex items-center gap-2 rounded-panel border border-border bg-surface-1 px-3.5 py-2.5 text-[12.5px] text-dim"
+                      >
+                        <Loader2 size={14} className="flex-none animate-spin text-accent" />
+                        {findingsProgressLine(data)}
+                      </div>
+                    )}
                     {/* Journey wayfinding: what these cards are FOR. One quiet
                         line, only once the hunt has concluded with findings. */}
+                    {/* The detection sentence names a button that shows only
+                        while detection authoring is on (C1). */}
                     {complete && (
-                      <div className="text-[12px] leading-[1.5] text-faint" style={{ textWrap: 'pretty' }}>
-                        Promote a finding to investigate it. Draft a detection from a confirmed true
-                        positive. Draft an analytic from any threat finding.
+                      <div
+                        data-testid="findings-help"
+                        className="text-[12px] leading-[1.5] text-faint"
+                        style={{ textWrap: 'pretty' }}
+                      >
+                        {findingsHelp(sigmaOn)}
                       </div>
                     )}
                     {data.findings.map((f, i) => (
@@ -1456,7 +1965,10 @@ export function HuntDetail() {
                 <Panel>
                   <PanelHeader
                     icon={<Crosshair size={15} />}
-                    title="Affected hosts"
+                    // A hunt that found no threat names hosts. It affected
+                    // none (C5): "Affected hosts 2" sat over a hunt that
+                    // found no traffic.
+                    title={outcome === 'threat_found' ? 'Affected hosts' : 'Hosts named'}
                     right={
                       <span className="font-mono text-[11px] text-accent" title={COUNT_AFFECTED_HOSTS}>
                         {data.affectedHosts.length}
@@ -1482,7 +1994,10 @@ export function HuntDetail() {
                 </Panel>
               )}
 
-              {data.mitreTechniques.length > 0 && (
+              {/* A technique shows only beside a threat finding (C5). The
+                  server sends none without one. An older server sent the
+                  analytic's techniques whatever the run found. */}
+              {outcome === 'threat_found' && data.mitreTechniques.length > 0 && (
                 <Panel>
                   <PanelHeader
                     icon={<ShieldAlert size={15} />}
@@ -1507,111 +2022,28 @@ export function HuntDetail() {
                 </Panel>
               )}
 
-              {data.recommendedActions.length > 0 && (
+              {/* The panel lists what the analyst can do from the console
+                  (C5). A step that needs the grid or the sensors sits apart,
+                  behind a toggle. */}
+              {(data.recommendedActions.length > 0 ||
+                (data.operatorActions?.length ?? 0) > 0) && (
                 <Panel>
                   <PanelHeader title="Recommended actions" />
                   <div className="flex flex-col gap-3 p-4">
                     {data.recommendedActions.map((a, i) => (
-                      <div key={i} className="border-l-2 border-border-2 pl-3">
-                        <div className="text-[12.5px] font-semibold text-text">{a.title}</div>
-                        <div
-                          className="mt-0.5 text-[11.5px] leading-[1.5] text-dim"
-                          style={{ textWrap: 'pretty' }}
-                        >
-                          {a.rationale}
-                        </div>
-                      </div>
+                      <ActionRow key={i} title={a.title} rationale={a.rationale} />
                     ))}
+                    {(data.operatorActions?.length ?? 0) > 0 && (
+                      <OperatorSteps steps={data.operatorActions ?? []} />
+                    )}
                   </div>
                 </Panel>
               )}
             </div>
           </div>
 
-          {/* Read-only follow-up chat — a floating "Chat about this" dock, same
-              UX as the investigation page. Only on a terminal hunt. */}
-          {terminal && <HuntChatDock huntId={data.id} />}
         </div>
       )}
     </div>
-  );
-}
-
-// ── Read-only follow-up chat about a completed hunt ─────────────────────────
-// Same rendering as the investigation chat (the shared ChatPanelShell) and now
-// the same TRANSPORT (useChatThread) as every other chat surface. Strictly
-// read-only: it can only answer questions — it can't ack, escalate, or change a
-// verdict.
-
-// Normalise the hunt thread's wire shape to the shared hook's ChatThread. The
-// only difference is HuntChatMessage.tools is `string | null` where
-// ChatMessage.tools is `string | undefined`, so drop the null. progress_tools
-// carries straight through — the hunt chat now runs on the shared turn engine,
-// so its thread exposes live tool progress like every other chat surface.
-function toChatThread(t: HuntChatThread): ChatThread {
-  return {
-    messages: t.messages.map((m) => ({ role: m.role, text: m.text, tools: m.tools ?? undefined })),
-    pending: t.pending,
-    progress_tools: t.progress_tools,
-  };
-}
-
-export function HuntChatPanel({
-  huntId,
-  fill,
-  onClose,
-}: {
-  huntId: string;
-  fill?: boolean;
-  onClose?: () => void;
-}) {
-  // The shared transport slice — mount fetch, a poll that re-arms ONLY while a
-  // turn is pending, send, and per-subject drafts. This panel used to keep its
-  // own copy, and that copy re-armed the 1.5s poll from applyThread with no
-  // alive guard: a response resolving after unmount re-armed a loop nothing
-  // would ever clear, polling the endpoint (and setState-ing an unmounted
-  // panel) forever. useChatThread's aliveRef closes that (lib/useChatThread.ts).
-  // Live tool progress now flows: the hunt chat runs on the shared turn engine,
-  // so its thread carries progress_tools (toChatThread passes it through) and the
-  // ChatPanelShell footer renders what the agent is DOING during a long turn.
-  const chat = useChatThread({
-    subject: huntId,
-    fetchThread: (id) => getHuntChat(id).then(toChatThread),
-    sendMessage: (id, text) => postHuntChat(id, text).then(toChatThread),
-  });
-
-  return (
-    <ChatPanelShell
-      title="Chat about this hunt"
-      scopeLabel="read-only"
-      placeholder="Ask a follow-up question. Example: which host was worst?"
-      listSizeClass={fill ? 'flex-1' : 'max-h-[460px] min-h-[180px]'}
-      emptyHint={
-        <div className="text-[12.5px] leading-[1.55] text-dim" style={{ textWrap: 'pretty' }}>
-          Ask a follow-up question about this hunt. Example: “which host was worst?” or “show me
-          the DNS for host X”. The assistant answers from the evidence of this hunt. The assistant
-          cannot change the result.
-        </div>
-      }
-      messages={chat.messages}
-      pending={chat.pending}
-      progressTools={chat.progressTools}
-      draft={chat.draft}
-      onDraft={chat.setDraft}
-      onSend={chat.send}
-      fill={fill}
-      onClose={onClose}
-    />
-  );
-}
-
-// Floating "Chat about this" dock — a bottom-right launcher that opens the
-// hunt chat as an overlay, sharing ChatDockShell with the investigation page
-// so the follow-up-chat UX is identical across investigations and hunts.
-function HuntChatDock({ huntId }: { huntId: string }) {
-  return (
-    <ChatDockShell label="Chat about this hunt">
-      {(close) => <HuntChatPanel huntId={huntId} fill onClose={close} />}
-    </ChatDockShell>
   );
 }

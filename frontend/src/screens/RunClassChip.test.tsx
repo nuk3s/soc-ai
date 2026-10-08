@@ -6,7 +6,7 @@
 import { render, screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { RunClassChip } from '../components/Badges';
+import { RunClassChip, SeverityTag } from '../components/Badges';
 import { CHIP_RUN_CLASS, ORACLE_REASON } from '../lib/tooltips';
 import type { Investigation as Inv, InvestigationList, InvestigationRow } from '../lib/types';
 
@@ -116,7 +116,7 @@ describe('Investigations list: run class chip', () => {
     );
     await screen.findByText('ET INFO STUN Binding Request');
     const chip = screen.getByTestId('run-class-INV-1');
-    expect(chip).toHaveTextContent('rule prior');
+    expect(chip).toHaveTextContent('rule history');
     expect(chip).toHaveAttribute('title', CHIP_RUN_CLASS.rule_prior.title);
   });
 
@@ -130,6 +130,54 @@ describe('Investigations list: run class chip', () => {
     await screen.findByText('ET INFO STUN Binding Request');
     expect(screen.queryByTestId('run-class-INV-1')).toBeNull();
   });
+
+  // Every row or none (dogfood 2026-10-06). A chip on some rows only read as a
+  // property the other rows lack.
+  it('shows a depth chip on every row once one row has a depth', async () => {
+    vi.mocked(listInvestigations).mockResolvedValue(
+      invList([
+        invRow({ id: 'A', alertId: 'ev-a', runClass: 'standard' }),
+        invRow({ id: 'B', alertId: 'ev-b', runClass: null }),
+        invRow({ id: 'C', alertId: 'ev-c', runClass: null, status: 'running', verdict: 'untriaged' }),
+      ]),
+    );
+    render(
+      <MemoryRouter initialEntries={['/investigations']}>
+        <Investigations />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByTestId('run-class-A')).toHaveTextContent('Depth: standard');
+    expect(screen.getByTestId('run-class-B')).toHaveTextContent('Depth: not recorded');
+    expect(screen.getByTestId('run-class-C')).toHaveTextContent('Depth: pending');
+  });
+
+  it('NEGATIVE CONTROL: shows no depth chip on any row when no row has a depth', async () => {
+    vi.mocked(listInvestigations).mockResolvedValue(
+      invList([
+        invRow({ id: 'A', alertId: 'ev-a', runClass: null }),
+        invRow({ id: 'B', alertId: 'ev-b', runClass: 'turbo' }),
+      ]),
+    );
+    render(
+      <MemoryRouter initialEntries={['/investigations']}>
+        <Investigations />
+      </MemoryRouter>,
+    );
+    await screen.findAllByText('ET INFO STUN Binding Request');
+    expect(screen.queryByTestId('run-class-A')).toBeNull();
+    expect(screen.queryByTestId('run-class-B')).toBeNull();
+  });
+});
+
+describe('SeverityTag', () => {
+  it('names whose severity it shows', () => {
+    const { rerender } = render(<SeverityTag sev="high" />);
+    expect(screen.getByTestId('severity-tag').getAttribute('title')).toMatch(/^Rule severity: High\./);
+    rerender(<SeverityTag sev="high" source="finding" />);
+    expect(screen.getByTestId('severity-tag').getAttribute('title')).toMatch(/^Finding severity: High\./);
+    rerender(<SeverityTag sev="unknown" />);
+    expect(screen.getByTestId('severity-tag').getAttribute('title')).toMatch(/no severity label/);
+  });
 });
 
 describe('Investigation drawer and page: run class chip', () => {
@@ -139,7 +187,7 @@ describe('Investigation drawer and page: run class chip', () => {
         <Investigation inv={invDetail({ runClass: 'cheap' })} layout={layout} />
       </MemoryRouter>,
     );
-    expect(screen.getByTestId('run-class-chip')).toHaveTextContent('cheap');
+    expect(screen.getByTestId('run-class-chip')).toHaveTextContent('Depth: quick');
   });
 
   it('keeps the class on a run that failed before its verdict', () => {
@@ -148,7 +196,7 @@ describe('Investigation drawer and page: run class chip', () => {
         <Investigation inv={invDetail({ runClass: 'deep', status: 'error' })} layout="page" />
       </MemoryRouter>,
     );
-    expect(screen.getByTestId('run-class-chip')).toHaveTextContent('deep');
+    expect(screen.getByTestId('run-class-chip')).toHaveTextContent('Depth: deep');
   });
 
   it('says in a sentence why the verdict went to the Oracle', () => {

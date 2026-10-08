@@ -1952,7 +1952,7 @@ async def _run_battery_task(
             _LOGGER.exception("model-battery audit write failed (result persisted)")
     except Exception as exc:
         _LOGGER.exception("model battery failed for model=%s", model)
-        status.error = " ".join(str(exc).split())[:300]
+        status.error = " ".join(str(exc).split())
     finally:
         status.running = False
         status.current_config = None

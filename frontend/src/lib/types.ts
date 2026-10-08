@@ -82,6 +82,10 @@ export interface AlertEvent {
    * the backend stamps it on the group badge today; kept here for parity so a
    * future per-event marker degrades cleanly. */
   lastAttempt?: LastAttempt | null;
+  /** The verdict and the confidence that apply to this event. Absent while
+   *  the run is in flight, and on an event no investigation covers. */
+  verdict?: string | null;
+  conf?: number | null;
 }
 
 /** A grouped-by-detection row in the Alerts console. */
@@ -131,6 +135,19 @@ export interface AlertGroup {
    * small red "· last retry failed {ago}" hint next to the verdict chip and a
    * retry affordance on the row. None when the newest run IS the standing verdict. */
   lastAttempt?: LastAttempt | null;
+  /** How many alerts of this rule each verdict holds, one count per alert
+   *  with its newest verdict. Absent on an older server. */
+  verdictCounts?: Record<string, number>;
+  /** The machine the latest alert fired on, or the sensor that reported it,
+   *  and how many distinct sources the group holds. Absent on an older
+   *  server. */
+  host?: string | null;
+  srcCount?: number | null;
+  /** The worst verdict among those alerts, when it is worse than `verdict`,
+   *  and the run that holds it. */
+  worstVerdict?: string | null;
+  worstConf?: number | null;
+  worstInvId?: string | null;
 }
 
 /** Returned by GET /api/v1/alerts/empty-reason: why the queue is showing nothing.
@@ -166,7 +183,8 @@ export type TimelineGroup =
   | 'Tool calls'
   | 'Decision'
   | 'Validators'
-  | 'Oracle';
+  | 'Oracle'
+  | 'Error';
 
 export interface TimelineStep {
   id: string;
@@ -194,6 +212,17 @@ export interface RecommendedAction {
   /** why a PENDING ack is waiting for a human while auto-ack is armed
    * (severity/exploit-class guard, or confidence below threshold). */
   pendingNote?: string | null;
+  /** Who or what carried the action out: "auto-ack" or a user name. Also set
+   *  on an ack the grid no longer shows acknowledged, to name the earlier write. */
+  appliedBy?: string | null;
+  /** When the action was carried out, ISO UTC. */
+  appliedAt?: string | null;
+  /** What the write did, from the stored receipt. */
+  appliedDetail?: string | null;
+  /** An analyst dismissed the recommendation. The server stores it. */
+  dismissed?: boolean;
+  dismissedBy?: string | null;
+  dismissedAt?: string | null;
 }
 
 export interface ResolutionProvenance {
@@ -321,6 +350,27 @@ export interface GraphEdge {
  * Absent on an alert investigation and on a backend that predates the subject
  * column, so every consumer treats absence as "an alert subject".
  */
+/** The finding an investigation was promoted from (routes_hunts.promoted_finding_out). */
+export interface PromotedFinding {
+  /** The index in the hunt report, from 0. */
+  ordinal: number;
+  /** The number the hunt page prints: "F2". */
+  label: string;
+  title: string;
+  hosts: string[];
+  /** The other end of the anchor flow. null when the finding names no end of it. */
+  attacker: string | null;
+  /** The host the finding names. */
+  victim: string | null;
+  huntId: string;
+  /** The plain title of the hunt, the one the bell and the list read. */
+  huntTitle: string;
+  /** What the finding observed. */
+  detail?: string;
+  /** The documents the finding cites. */
+  citations?: string[];
+}
+
 export interface InvestigationSubject {
   type: 'hunt';
   hunt_id: string;
@@ -397,6 +447,16 @@ export interface Investigation {
   failure?: InvestigationFailure | null;
   /** The id of a later run that replaced this one, when there is one. */
   supersededBy?: string | null;
+  /** What that later run reached: its status, and its verdict once it has one. */
+  supersededRun?: SupersededRun | null;
+  /** A run in flight: what it does now, in words. */
+  currentStep?: string | null;
+  /** A run in flight: how long runs on this grid take, from the newest
+   *  finished runs. Null while the store holds fewer than three. */
+  typicalRun?: { lowMin: number; highMin: number; medianMin: number; samples: number } | null;
+  /** Every host, address, user and domain the run names, each with its
+   *  page. Render each with `EntityLink`. Absent from an older server. */
+  entities?: EntityRef[];
   /** Manual or chat provenance — present when the AI verdict was overridden. */
   resolution?: ResolutionProvenance;
   /** Post-validator override note — present when a validator auto-corrected the verdict. */
@@ -414,6 +474,10 @@ export interface Investigation {
    *  (no FK server-side — the link may dangle). */
   huntId?: string | null;
   huntObjective?: string | null;
+  /** The finding the analyst promoted, for the page to name first:
+   *  "Promoted finding: F2, <title>" and attacker to victim from the finding.
+   *  null on a run no finding promoted, and when the hunt is gone. */
+  promotedFinding?: PromotedFinding | null;
   /** What this run investigated, when the subject is a whole hunt rather than
    *  one alert. Absent on an alert investigation. */
   subject?: InvestigationSubject;
@@ -434,6 +498,14 @@ export interface InvestigationCitation {
   target?: string | null;
   /** The validator's answer. Null when the run recorded no validation. */
   resolved?: boolean | null;
+}
+
+/** The newer run of the same alert that replaced a run. */
+export interface SupersededRun {
+  id: string;
+  status: string;
+  verdict?: Verdict | null;
+  conf?: number | null;
 }
 
 /** The recorded cause of a failed run. `permanent`: a re-run cannot change it. */
@@ -457,6 +529,10 @@ export interface AlertMeta {
   /** The alert's own @timestamp (ISO) — when the detection actually fired. */
   time?: string | null;
   count: number;
+  /** The account the alert names. */
+  user?: string | null;
+  /** The machine the alert names. */
+  host?: string | null;
 }
 
 /** How the verdict was produced — the investigation provenance panel. */
@@ -500,6 +576,10 @@ export interface InvestigationRow {
   host: string;
   /** destination IP — paired with `host` (source) for the full flow. */
   dst?: string | null;
+  /** The machine the alert fired on. A host-log alert has no destination, and
+   *  the list names this machine in place of a flow. Absent on an older
+   *  backend and null on a row whose alert named no machine. */
+  hostName?: string | null;
   status: 'complete' | 'running' | 'error' | 'cancelled' | 'interrupted';
   when: string;
   ts?: string;
@@ -529,6 +609,9 @@ export interface InvestigationRow {
   /** The budget class the run ran in: cheap, standard, deep or rule_prior.
    *  Null on a run stored before the classes existed, and while it runs. */
   runClass?: string | null;
+  /** Who started the run: an analyst, the scheduler, a sweep, or "backtest"
+   *  for a backtest replay. The list marks a replay with a chip. */
+  ranBy?: string;
 }
 
 /** One SQL page of GET /api/v1/investigations — the /dossiers list shape.
@@ -551,6 +634,11 @@ export interface InvestigationList {
   /** Set when an `errorState` partition was decided over a capped read the
    *  filter set outgrew, which makes `total` a FLOOR rather than a count. */
   partial?: boolean;
+  /** The backtest replays the other filters match. With replays left out
+   *  (the default) the rows and the figures do not count them. With
+   *  `includesBacktest` they do. An older server sends neither field. */
+  backtestReplays?: number;
+  includesBacktest?: boolean;
 }
 
 // ---- Hunts -----------------------------------------------------------------
@@ -558,7 +646,38 @@ export interface InvestigationList {
 // free-form objective and lands findings + a narrative (a HuntReport), not a
 // single-alert verdict. These mirror the /api/v1/hunts* JSON shapes.
 
-export type HuntStatus = 'running' | 'complete' | 'error' | 'cancelled' | 'interrupted';
+/** `investigating`: the hunt landed its report and the investigations of its
+ *  subject findings run (2026-10-07). The hunt has not ended. */
+export type HuntStatus =
+  | 'running'
+  | 'investigating'
+  | 'complete'
+  | 'error'
+  | 'cancelled'
+  | 'interrupted';
+/** The one outcome of a hunt. The last three come from the investigations of
+ *  the hunt's subject findings (soc_ai/hunting/outcome.py). */
+export type HuntOutcome =
+  | 'threat_found'
+  | 'no_threat'
+  | 'no_answer'
+  | 'could_not_run'
+  | 'running'
+  | 'investigating'
+  | 'threats_confirmed'
+  | 'no_threat_confirmed';
+/** Where the investigation of one finding is. `failed` covers an error, a
+ *  restart, a pipeline fallback and a run that never started. `over_cap` is a
+ *  finding past the hunt's cap, which the analyst opens by hand. */
+export type FindingInvestigationStatus =
+  | 'queued'
+  | 'running'
+  | 'complete'
+  | 'failed'
+  | 'cancelled'
+  | 'over_cap';
+/** The four codes a backend before 2026-10-06 sends. */
+export type LegacyHuntOutcome = 'threats' | 'clean' | 'gap' | 'failed' | '';
 export type HuntKind = 'chat' | 'scheduled' | 'triggered' | 'lead';
 
 /** One row in the Hunts list. */
@@ -570,12 +689,19 @@ export interface HuntRow {
   findingCount: number;
   /** Findings that claim a threat (visibility gaps and observations excluded). */
   threatFindingCount?: number;
-  /** How a complete hunt ended: threats | clean | gap (no telemetry) | failed (could not run). */
-  outcome?: 'threats' | 'clean' | 'gap' | 'failed' | '';
-  /** The status word the backend wrote for a complete hunt. The client derived
-   *  its own from `outcome`, and the two disagreed on the hunt page. The
-   *  backend's word wins. Absent on a row an older backend answered. */
+  /** How the hunt ended (soc_ai/hunting/outcome.py). The list row, the hunt
+   *  page and the bell read this one field. The legacy codes are what a
+   *  backend before 2026-10-06 sends. */
+  outcome?: HuntOutcome | LegacyHuntOutcome;
+  /** The words every surface prints for `outcome`. The backend's word wins.
+   *  Absent on a row an older backend answered. */
   outcome_label?: string;
+  /** Why a hunt could not run, or the gap a hunt could not answer. Empty when
+   *  the label says it all. */
+  outcome_headline?: string;
+  /** The plain title of the hunt: a catalog run reads "<analytic>, last 24 h"
+   *  and a lead hunt "Lead 6 hunt: domainadmin on SR-DC01". */
+  title?: string;
   affectedHosts: number;
   confidence: number | null;
   startedBy: string;
@@ -590,6 +716,11 @@ export interface HuntRow {
   /** synthetic-evaluation marker (migration 0032): this hunt ran against PLANTED
    * synthetic attack scenarios — badged so it can never be read as real activity. */
   isSynthEval?: boolean;
+  /** The investigations of the subject findings (migration 0063): how many of
+   *  the subject findings have an ended investigation, a failed one included,
+   *  and how many subject findings there are. 0 and 0 on a hunt with none. */
+  findingsInvestigated?: number;
+  findingsTotal?: number;
 }
 
 export interface HuntStat {
@@ -630,6 +761,15 @@ export interface HuntFinding {
    *  though this is non-null — status is what decides the card's state, not
    *  presence alone. */
   investigation?: { id: string; status: string; verdict?: string | null; conf?: number | null } | null;
+  /** The investigation of this finding, flat (2026-10-07). The hunt opens one
+   *  for each subject finding, or reuses the run of the same subject. Null on
+   *  a finding with none. Absent from an older backend. */
+  investigationId?: string | null;
+  verdict?: string | null;
+  confidence?: number | null;
+  investigationStatus?: FindingInvestigationStatus | null;
+  /** Recommended actions of the investigation that wait for a person. */
+  pendingActions?: number;
 }
 
 // ---- Detection bridge (1.3 slice 3): draft-detection review pane ----------
@@ -722,6 +862,9 @@ export interface HuntDetailData {
   affectedHosts: string[];
   mitreTechniques: string[];
   recommendedActions: HuntAction[];
+  /** The recommended steps the console cannot take: a wider window, a
+   *  replayed corpus, a sensor to turn on. Absent from an older backend. */
+  operatorActions?: HuntAction[];
   /** null when nothing scored the hunt: a catalog hunt is one query from a
    *  written spec and its report carries no confidence at all. 0 is a
    *  measurement (a model that landed on zero) and renders as 0.00. */
@@ -742,6 +885,22 @@ export interface HuntDetailData {
   /** synthetic-evaluation marker (migration 0032): this hunt ran against PLANTED
    * synthetic attack scenarios — badged so it can never be read as real activity. */
   isSynthEval?: boolean;
+  /** The outcome, its label and its sentence. The same three the list row
+   *  carries. Absent from an older backend. */
+  outcome?: HuntOutcome;
+  outcome_label?: string;
+  outcome_headline?: string;
+  /** The plain title, the one the bell and the list read. */
+  title?: string;
+  /** What a running hunt does now: "the model reads the results". null on a
+   *  hunt that has ended. */
+  currentStep?: string | null;
+  /** How long agent hunts on this grid take: the middle half of the recent
+   *  finished runs, in whole minutes. null while the store holds too few. */
+  typicalRun?: { lowMin: number; highMin: number; medianMin: number; samples: number } | null;
+  /** The investigations of the subject findings. See HuntRow. */
+  findingsInvestigated?: number;
+  findingsTotal?: number;
 }
 
 export interface HostContextEnd {
@@ -788,7 +947,19 @@ export interface EntitySummary {
   investigationCount: number;
   huntFindingCount: number;
   latestVerdict?: Verdict | null;
+  /** Investigations with a true-positive verdict. Absent from an older server. */
+  truePositiveCount?: number;
+  /** Every lead that names the entity, and the ones still open. */
+  leadCount?: number;
+  openLeadCount?: number;
+  /** Observations on the entity in the last 30 days, from every source. */
+  observationCount?: number;
 }
+
+/** What an entity value is. `address` is inside the internal ranges and
+ *  `external_address` is outside them. `name` is a name soc-ai knows nothing
+ *  about yet. */
+export type EntityType = 'address' | 'external_address' | 'host' | 'user' | 'domain' | 'name';
 
 /** An entity's full pivot view: value + kind + merged newest-first timeline. */
 export interface EntityDetail {
@@ -799,6 +970,37 @@ export interface EntityDetail {
   /** The address of the one host the dossier knows by this name. Null when no
    *  host, or more than one, answers to it. Absent from an older server. */
   host_ip?: string | null;
+  /** The machine that holds this address or name. Null when none does. */
+  host_key?: string | null;
+  /** What the value is. Absent from an older server. */
+  type?: EntityType;
+  /** The first and the last time soc-ai recorded the entity. */
+  first_seen?: string | null;
+  last_seen?: string | null;
+  /** For a domain: the addresses joined to it. */
+  domain_machines?: number | null;
+}
+
+/** One host, address, user or domain a record names, with the page that
+ *  answers for it. `role` says where the record names it. */
+export interface EntityRef {
+  value: string;
+  type: EntityType;
+  role: 'source' | 'destination' | 'reporter' | 'lead' | string;
+  /** The machine that holds the value, when one does. */
+  host_key: string | null;
+  /** The in-app path. A machine opens its page in one step. */
+  href: string;
+}
+
+/** One palette hit from GET /search/entities. Two hits never share both
+ *  lines. */
+export interface EntitySearchHit {
+  type: 'user' | 'domain' | 'address' | 'external_address' | 'hunt';
+  value: string;
+  label: string;
+  detail: string;
+  href: string;
 }
 
 // ---- Config ----------------------------------------------------------------
@@ -980,6 +1182,11 @@ export interface Notification {
    * own hash. Those rows carry no dismiss control and "Clear all" steps over
    * them, because a tamper alarm that one click can sweep away is not one. */
   dismissible?: boolean;
+  /** How a hunt ended, on a hunt row: threat_found, no_threat, no_answer,
+   *  could_not_run or running. Absent on every other row. */
+  outcome?: string | null;
+  /** Which section of the Notifications screen holds the row. */
+  group?: string;
 }
 
 // ── Backtest ("prove it on my last N days") ─────────────────────────────────
@@ -1288,6 +1495,9 @@ export interface Dossier extends DossierRow {
    *  first label no other host shares. Observations and leads written under the
    *  host name belong on this page. Absent from an older server. */
   aliases?: string[];
+  /** Whether the profile sweep runs on this deployment. Absent from an older
+   *  server, and the profile panel then names both causes. */
+  profiles_enabled?: boolean | null;
 }
 
 export interface DossierList {
@@ -1466,6 +1676,9 @@ interface MachineBase {
 /** One machine in the list. `addresses` holds the first five, primary first. */
 export interface MachineRow extends MachineBase {
   addresses: string[];
+  /** The sweep error on the primary address of a machine with no clean
+   *  build. Absent from an older server. */
+  build_error?: string | null;
 }
 
 export interface MachineList {
@@ -1492,6 +1705,9 @@ export interface MachineSummary {
    *  buckets. */
   roles: Record<string, number>;
   needs_attention: number;
+  /** The clean builds older than the staleness window. With `never_built` it
+   *  sums to `needs_attention`. Absent from an older server. */
+  out_of_date?: number;
   conflicts: number;
   never_built: number;
   last_sweep_at: string | null;
@@ -1620,6 +1836,23 @@ export interface SavedView {
   name: string;
   query: SavedViewQuery;
   created_at: string | null;
+}
+
+/** One Dashboard panel's slot on the 12 column grid, as the API carries it.
+ *  `x` and `w` count columns, `y` and `h` count grid rows. */
+export interface DashboardLayoutPanel {
+  id: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+/** GET/PUT /me/dashboard-layout. `panels` is null while the user keeps the
+ *  shipped layout. */
+export interface DashboardLayoutWire {
+  panels: DashboardLayoutPanel[] | null;
+  updated_at?: string | null;
 }
 
 // ── Preflight (setup-health) ────────────────────────────────────────────────

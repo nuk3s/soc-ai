@@ -9,12 +9,18 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
   getHuntTemplates: vi.fn(),
+  getHuntComposer: vi.fn(),
   startHuntConsole: vi.fn(),
 }));
 
-import { getHuntTemplates, startHuntConsole, type HuntTemplate } from '../lib/api';
+import {
+  getHuntComposer,
+  getHuntTemplates,
+  startHuntConsole,
+  type HuntTemplate,
+} from '../lib/api';
 import { ShellProvider } from '../shell/ShellContext';
-import { NewHuntDrawer } from './NewHuntDrawer';
+import { NewHuntDrawer, notApplicableReason, runTimeLine } from './NewHuntDrawer';
 
 const TEMPLATE: HuntTemplate = {
   id: 3,
@@ -51,6 +57,89 @@ beforeEach(() => {
   onClose.mockReset();
   vi.mocked(getHuntTemplates).mockReset().mockResolvedValue([TEMPLATE]);
   vi.mocked(startHuntConsole).mockReset().mockResolvedValue({ hunt_id: 'H7' });
+  vi.mocked(getHuntComposer).mockReset().mockResolvedValue({
+    max_range_days: 30,
+    run_minutes_low: 5,
+    run_minutes_high: 8,
+    run_sample: 12,
+  });
+});
+
+// W11: the dialog states the range, the cap the grid answers to, the run time
+// and the reason a starter does not apply. It stated none of them.
+describe('NewHuntDrawer range, cap and run time (W11)', () => {
+  it('states the cap and the run time, and sends the range the analyst chose', async () => {
+    mount();
+    expect((await screen.findByTestId('new-hunt-range-cap')).textContent).toBe(
+      'The grid answers up to 30 days back.',
+    );
+    expect(screen.getByTestId('new-hunt-run-time').textContent).toBe(
+      'A hunt takes 5 to 8 minutes.',
+    );
+    const range = screen.getByLabelText('Time range') as HTMLSelectElement;
+    const offered = Array.from(range.options).map((o) => o.textContent);
+    expect(offered).toEqual([
+      'As the objective states',
+      'Last day',
+      'Last 3 days',
+      'Last 7 days',
+      'Last 14 days',
+      'Last 30 days',
+    ]);
+    fireEvent.change(range, { target: { value: '7' } });
+    fireEvent.change(box(), { target: { value: 'hunt for beacons' } });
+    fireEvent.click(screen.getByText('Start hunt'));
+    await waitFor(() =>
+      expect(startHuntConsole).toHaveBeenCalledWith('hunt for beacons', undefined, undefined, 7),
+    );
+  });
+
+  // Negative control: too few finished hunts, and no composer answer.
+  it('states no run time it cannot read, and no cap it was not sent', async () => {
+    vi.mocked(getHuntComposer).mockRejectedValue(new Error('down'));
+    mount();
+    await screen.findByLabelText('Time range');
+    expect(screen.queryByTestId('new-hunt-range-cap')).toBeNull();
+    expect(screen.queryByTestId('new-hunt-run-time')).toBeNull();
+    expect(runTimeLine(null, null)).toBe('');
+    expect(runTimeLine(6, 6)).toBe('A hunt takes about 6 minutes.');
+  });
+
+  it('names the reason a starter does not apply, in plain view', async () => {
+    vi.mocked(getHuntTemplates).mockResolvedValue([
+      TEMPLATE,
+      {
+        ...TEMPLATE,
+        id: 9,
+        name: 'DCE-RPC abuse / DC attacks',
+        builtin: true,
+        available: false,
+        missingDatasets: ['zeek.dce_rpc'],
+      },
+    ]);
+    mount();
+    fireEvent.click(await screen.findByText(/Not applicable here/));
+    expect(screen.getByTestId('starter-reason-9').textContent).toBe(
+      'Needs zeek.dce_rpc. This grid has none.',
+    );
+    expect(
+      notApplicableReason({
+        available: true,
+        missingDatasets: [],
+        applicable: false,
+        missingEnvironment: ['a domain-joined host'],
+      }),
+    ).toBe('Needs a domain-joined host. The network shows none.');
+  });
+
+  it('offers starters that name no tool when the starter list cannot be read', async () => {
+    vi.mocked(getHuntTemplates).mockRejectedValue(new Error('down'));
+    mount();
+    for (const label of ['Beaconing to rare IPs', 'DNS / C2 exfiltration', 'New external services', 'DCE-RPC abuse / DC attacks']) {
+      fireEvent.click(await screen.findByText(label));
+      expect((box() as HTMLTextAreaElement).value).not.toMatch(/\bt_[a-z_]+/);
+    }
+  });
 });
 
 describe('NewHuntDrawer', () => {
@@ -82,7 +171,7 @@ describe('NewHuntDrawer', () => {
     fireEvent.change(box(), { target: { value: 'hunt for lateral movement' } });
     fireEvent.click(screen.getByRole('button', { name: 'Start hunt' }));
     await waitFor(() =>
-      expect(startHuntConsole).toHaveBeenCalledWith('hunt for lateral movement', undefined, undefined),
+      expect(startHuntConsole).toHaveBeenCalledWith('hunt for lateral movement', undefined, undefined, undefined),
     );
     expect(await screen.findByText('HUNT DETAIL')).toBeTruthy();
   });
@@ -93,7 +182,7 @@ describe('NewHuntDrawer', () => {
     expect((box() as HTMLTextAreaElement).value).toBe(TEMPLATE.objectiveTemplate);
     fireEvent.click(screen.getByRole('button', { name: 'Start hunt' }));
     await waitFor(() =>
-      expect(startHuntConsole).toHaveBeenCalledWith(TEMPLATE.objectiveTemplate, undefined, 3),
+      expect(startHuntConsole).toHaveBeenCalledWith(TEMPLATE.objectiveTemplate, undefined, 3, undefined),
     );
   });
 
@@ -103,7 +192,7 @@ describe('NewHuntDrawer', () => {
     fireEvent.change(box(), { target: { value: 'my own words' } });
     fireEvent.click(screen.getByRole('button', { name: 'Start hunt' }));
     await waitFor(() =>
-      expect(startHuntConsole).toHaveBeenCalledWith('my own words', undefined, undefined),
+      expect(startHuntConsole).toHaveBeenCalledWith('my own words', undefined, undefined, undefined),
     );
   });
 

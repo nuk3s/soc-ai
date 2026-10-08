@@ -1,9 +1,8 @@
 import { Suspense, useEffect, useState } from 'react';
-import { Navigate, Route, Routes, useParams } from 'react-router-dom';
+import { Link, Navigate, Route, Routes, useLocation, useParams } from 'react-router-dom';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { RouteFallback } from './components/States';
 import { getMe } from './lib/api';
-import { isIpKey, isPrivateIp } from './lib/ip';
 import { lazyWithReload } from './lib/lazyWithReload';
 import { AppShell } from './shell/AppShell';
 
@@ -36,33 +35,49 @@ const Runbooks = lazyWithReload(() => import('./screens/Runbooks').then((m) => (
 /**
  * The /entity/:value route.
  *
- * The host page absorbed the entity view for addresses the dossier can actually
- * describe — and that is INTERNAL addresses only. The census gates on
- * `_is_internal_ip` (soc_ai/enrichment/host_dossier.py), so a public address is
- * guaranteed `found:false`, which renders "the network sweep has never seen this
- * address, so there is nothing to report about it". That sentence is false the
- * moment the entity timeline holds an investigation or a hunt finding naming
- * that IP — exactly the case for a C2 or a suspicious destination — and the
- * timeline would simultaneously be unreachable, since Entity is the only merged
- * investigations + hunt-findings view an address has.
+ * The route used to send every private address to the host page before
+ * anything was read. An address an investigation named that no machine holds
+ * then opened "the network sweep has never seen this address", and the
+ * investigations that named it were one more click away (dogfood 2026-10-06,
+ * S2). The entity page now asks which machine holds the value: a machine
+ * opens its page, and any other value stays on the entity page.
  *
- * Every pivot in the app hands this a raw IP and many of them are public: the
- * blast-radius graph's `c2` nodes, the alert source/destination pivots, the hunt
- * finding host chips, and the host page's own external peers. So the gate is
- * internal-shaped, not merely address-shaped.
- *
- * The check happens HERE, above the lazy boundary, so a redirect does not first
- * download the screen it is redirecting away from. `replace` keeps the entity
- * URL out of history: Back should return where the analyst came from, not
- * bounce them through the redirect again.
+ * The key is keyed on the value, so a link to a second entity remounts the
+ * page with no state left over from the first.
  */
 function EntityRoute() {
   const { value = '' } = useParams();
-  const key = value.trim();
-  if (isIpKey(key) && isPrivateIp(key)) {
-    return <Navigate to={`/hosts/${encodeURIComponent(key)}`} replace />;
-  }
-  return <Entity />;
+  return <Entity key={value} />;
+}
+
+/**
+ * An address that is no page. It redirected to the Dashboard and said
+ * nothing, so a mistyped or stale link read as a link to the Dashboard
+ * (dogfood 2026-10-06). The page says so, names the address and offers the
+ * Dashboard. It renders inside the shell, so the sidebar and the search stay.
+ */
+function UnknownRoute() {
+  const { pathname } = useLocation();
+  return (
+    <div className="px-[22px] pb-[60px] pt-5">
+      <div
+        data-testid="unknown-route"
+        className="mx-auto flex max-w-[560px] flex-col items-center gap-2 rounded-card border border-border bg-surface-1 px-4 py-8 text-center"
+      >
+        <div className="text-[13.5px] font-semibold text-text-2">No page at this address.</div>
+        <div className="text-[12.5px] leading-[1.6] text-faint">
+          The console has no page at <span className="font-mono text-dim">{pathname}</span>. The link
+          is wrong or out of date.
+        </div>
+        <Link
+          to="/dashboard"
+          className="mt-1 rounded-control border border-border-strong bg-surface-3 px-3 py-1.5 text-[12px] font-semibold text-text-2 hover:border-accent hover:text-text"
+        >
+          Open the Dashboard
+        </Link>
+      </div>
+    </div>
+  );
 }
 
 /**
@@ -114,9 +129,9 @@ export function App() {
             <Route path="/backtest" element={<Backtest />} />
             <Route path="/runbooks" element={<Runbooks />} />
             <Route path="/config" element={<Config />} />
+            <Route path="*" element={<UnknownRoute />} />
           </Route>
           <Route path="/" element={<RootRoute />} />
-          <Route path="*" element={<Navigate to="/dashboard" replace />} />
         </Routes>
       </ErrorBoundary>
     </Suspense>

@@ -6,28 +6,20 @@
 //
 // happy-dom (see vite.config.ts) lets us redefine window.location, which jsdom
 // forbids — the 401 path asserts on window.location.href.
-import { fireEvent, render } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
+import { MemoryRouter, Route, Routes, useParams } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { getNotifications, POST_LOGIN_REDIRECT_KEY, takePostLoginRedirect } from './api';
 import { dismissNotification, getDismissed } from './notifications';
 
-// EntityGraph calls useNavigate() — stub it so we can assert the pivot target.
-const navigateMock = vi.fn();
-vi.mock('react-router-dom', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('react-router-dom')>();
-  return { ...actual, useNavigate: () => navigateMock };
-});
-
-// Imported AFTER the mock is registered (vi.mock is hoisted regardless).
 import { EntityGraph } from '../components/EntityGraph';
 import type { GraphNode } from './types';
 
 describe('EntityGraph node click (F42)', () => {
-  afterEach(() => vi.clearAllMocks());
-
-  it('pivots to the entity id, not the display label', () => {
+  it('pivots to the entity id, not the display label', async () => {
     // Source node: identity is the IP, label is the hostname (host.name case).
+    // The node is a link now, so the pivot is its href, and a click follows it.
     const node: GraphNode = {
       id: '192.0.2.8',
       x: 20,
@@ -35,12 +27,23 @@ describe('EntityGraph node click (F42)', () => {
       kind: 'host',
       label: 'sensor-host',
     };
-    const { container } = render(<EntityGraph nodes={[node]} edges={[]} showLegend={false} />);
-    const clickable = container.querySelector('g[style*="cursor"]');
-    expect(clickable).not.toBeNull();
-    fireEvent.click(clickable as Element);
-    expect(navigateMock).toHaveBeenCalledWith('/entity/192.0.2.8');
-    expect(navigateMock).not.toHaveBeenCalledWith('/entity/sensor-host');
+    function EntityPage() {
+      return <div>entity page for {useParams().id}</div>;
+    }
+    render(
+      <MemoryRouter>
+        <Routes>
+          <Route path="/" element={<EntityGraph nodes={[node]} edges={[]} showLegend={false} />} />
+          <Route path="/entity/:id" element={<EntityPage />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    // EntityGraph loads Graph on demand.
+    const link = await screen.findByTestId('graph-node');
+    expect(link.getAttribute('href')).toBe('/entity/192.0.2.8');
+    expect(link.getAttribute('href')).not.toBe('/entity/sensor-host');
+    fireEvent.click(link);
+    expect(screen.getByText('entity page for 192.0.2.8')).toBeTruthy();
   });
 });
 

@@ -226,7 +226,7 @@ def test_tee_route_seeds_rule_name_when_stream_crashes_before_context(
 ) -> None:
     """The /investigate route resolves the rule name up front and seeds the row, so
     a stream that crashes BEFORE emitting any alert_context event is still named —
-    the userscript path no longer produces a nameless 'Alert <id>…' row."""
+    the userscript path no longer produces a nameless 'Alert <id>' row."""
     with (
         patch(
             "soc_ai.api.routes.resolve_alert_for_hunt",
@@ -338,7 +338,7 @@ async def test_seeded_rule_name_survives_run_with_no_alert_context(
 ) -> None:
     """THE FIX: a recorder seeded with a rule_name names the row at creation, so a
     run that reaches a terminal state BEFORE emitting any alert_context event
-    (e.g. an ES prefetch failure) is still named — never the 'Alert <id>…'
+    (e.g. an ES prefetch failure) is still named — never the 'Alert <id>'
     fallback. This is the exact regression the user reported."""
     from soc_ai.api.recorder import InvestigationRecorder
 

@@ -4,7 +4,7 @@ import { Link, useSearchParams } from 'react-router-dom';
 import { getNeedsYou, onNeedsYouChanged } from '../lib/api';
 import { plural } from '../lib/plural';
 import { useAsync } from '../lib/useAsync';
-import { StaleNotice } from './States';
+import { LoadingInline, StaleNotice } from './States';
 
 // ---------------------------------------------------------------------------
 // Needs you — the first line of the Hunts page.
@@ -56,7 +56,7 @@ export function NeedsYouStrip() {
       </span>
       {!data ? (
         <span className="text-[12.5px] text-dim">
-          {needs.error ? 'Could not read what needs you.' : 'Reading what needs you…'}
+          {needs.error ? 'Could not read what needs you.' : <LoadingInline>Reading what needs you</LoadingInline>}
         </span>
       ) : data.total === 0 ? (
         <>

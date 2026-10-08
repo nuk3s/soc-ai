@@ -5,7 +5,11 @@
 // nothing on the tile said the two were counting different things.
 //
 // Every number in the tile now names the unit and the window it answers for.
-import { render, screen } from '@testing-library/react';
+//
+// Dogfood 2026-10-06 (S6): the tile read "0 of 2 detection groups" for 7 days
+// while the Investigations list said 15 true positives for the same 7 days.
+// The tile now reads the list's own count, from the list's own query.
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { describe, expect, it, vi } from 'vitest';
 import type { AlertGroup, InvestigationList, InvestigationRow, Verdict } from '../lib/types';
@@ -79,10 +83,18 @@ const fallback = (id: string): InvestigationRow => ({
   fallback: true,
 });
 
+/** The list query of the tile: a window and one row, no verdict filter. */
+const isTileQuery = (q: { verdict?: string[]; limit?: number; since?: string } = {}) =>
+  !q.verdict?.length && q.limit === 1 && !!q.since;
+
 const mount = async (pipelineErrors: InvestigationRow[] = []) => {
   vi.mocked(getAlerts).mockResolvedValue(queueOf(GROUPS.map(([id, v]) => group(id, v))));
-  listInvestigations.mockImplementation(async (q: { verdict?: string[] } = {}) =>
-    q.verdict?.length ? { ...empty(), rows: pipelineErrors, total: pipelineErrors.length } : empty(),
+  listInvestigations.mockImplementation(async (q: { verdict?: string[]; limit?: number; since?: string } = {}) =>
+    q.verdict?.length
+      ? { ...empty(), rows: pipelineErrors, total: pipelineErrors.length }
+      : isTileQuery(q)
+        ? { ...empty(), total: 37, truePositives: 15 }
+        : empty(),
   );
   render(
     <MemoryRouter>
@@ -97,18 +109,48 @@ const tpTile = async () =>
   (await screen.findByText('True positives · 24h')).closest('.rounded-panel')!;
 
 describe('Dashboard true-positives tile — every number answers one question', () => {
-  it('names the unit its number counts, and the set it is one of', async () => {
+  it('reads the count of the Investigations list query, over the window', async () => {
     await mount();
     const tile = await tpTile();
-    // The number is 1. The investigations list over the same window says 3,
-    // because it counts runs. Naming the unit is what makes both readable.
-    expect(tile.textContent).toContain('of 3 detection groups');
+    // 15 true positives among 37 investigations: the list's own header count.
+    await waitFor(() => expect(tile.textContent).toContain('15'));
+    expect(tile.textContent).toContain('of 37 investigations');
+    const query = listInvestigations.mock.calls.map((c) => c[0]).find(isTileQuery);
+    expect(query).toBeTruthy();
+    // The 24h window, as the list computes it.
+    const since = Date.parse(query.since);
+    expect(Math.abs(Date.now() - since - 24 * 3_600_000)).toBeLessThan(60_000);
   });
 
-  it('keeps the needs-info clause on the same unit and window', async () => {
+  it('links to the list it counts, with the window and the verdict filter', async () => {
     await mount();
     const tile = await tpTile();
-    expect(tile.textContent).toContain('1 need more info');
+    await waitFor(() => expect(tile.textContent).toContain('Open them'));
+    const link = screen.getByRole('link', { name: 'Open them' });
+    expect(link.getAttribute('href')).toBe('/investigations?range=24h&verdict=true_positive');
+  });
+
+  it('reads the new window when the range changes', async () => {
+    await mount();
+    await tpTile();
+    fireEvent.click(screen.getByText('7d'));
+    expect(await screen.findByText('True positives · 7d')).toBeTruthy();
+    await waitFor(() => {
+      const sinces = listInvestigations.mock.calls
+        .map((c) => c[0])
+        .filter(isTileQuery)
+        .map((q) => Date.now() - Date.parse(q.since));
+      expect(sinces.some((ms) => Math.abs(ms - 7 * 86_400_000) < 60_000)).toBe(true);
+    });
+  });
+
+  // NEGATIVE CONTROL. The alert groups in the window no longer decide the
+  // tile. The outcomes chart still counts them, on its own unit.
+  it('does not count alert groups', async () => {
+    await mount();
+    const tile = await tpTile();
+    await waitFor(() => expect(tile.textContent).toContain('15'));
+    expect(tile.textContent).not.toContain('detection groups');
   });
 
   it('labels the pipeline-error clause with its OWN window and unit', async () => {

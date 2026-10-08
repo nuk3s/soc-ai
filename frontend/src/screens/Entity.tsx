@@ -1,15 +1,25 @@
 import { ChevronLeft, Crosshair, Server, ShieldAlert } from 'lucide-react';
-import { Link, useParams } from 'react-router-dom';
+import { Link, Navigate, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { SeverityTag, VerdictPill } from '../components/Badges';
 import { HostObservations } from '../components/HostObservations';
 import { LeadsStrip } from '../components/LeadsStrip';
 import { EmptyState, ErrorState, LoadingState } from '../components/States';
 import { getEntity, isNotFound, resolveMachine } from '../lib/api';
+import {
+  ENTITY_TYPE_LABEL,
+  entityType,
+  identityLine,
+  nothingKnown,
+  nothingKnownLine,
+  worryLines,
+} from '../lib/entityIdentity';
+import { relativeAge } from '../lib/hostDossier';
 import { machineHref } from '../lib/hostsList';
 import { isIpKey } from '../lib/ip';
+import { plural } from '../lib/plural';
 import { absTime } from '../lib/timeRange';
 import { ENTITY_ADDRESS, ENTITY_NAME } from '../lib/tooltips';
-import type { EntityTimelineItem, Severity, Verdict } from '../lib/types';
+import type { EntityDetail, EntityTimelineItem, Severity, Verdict } from '../lib/types';
 import { useAsync } from '../lib/useAsync';
 
 // The narrow frontend severity union the pill understands; a hunt finding can
@@ -48,7 +58,7 @@ function TimelineCard({ item }: { item: EntityTimelineItem }) {
           </span>
           <span className="font-mono text-[10.5px] text-faint">{absTime(item.ts)}</span>
         </div>
-        <div className="mt-1 truncate text-[13px] font-medium text-text group-hover:text-white">
+        <div className="mt-1 break-words text-[13px] font-medium text-text group-hover:text-white">
           {item.title || (isInv ? 'Investigation' : 'Hunt finding')}
         </div>
       </div>
@@ -63,48 +73,75 @@ function TimelineCard({ item }: { item: EntityTimelineItem }) {
   );
 }
 
-/** Entity pivot page (E3.5): "what do we know about <host-or-ip>" — its
- *  investigations + hunt findings on one newest-first timeline. Reached from
- *  every host chip. Read-only. */
+/** The machine read: a key, "no machine", or a read that failed. Each answer
+ *  carries the value it answers for, because useAsync keeps the last answer
+ *  while the next one loads. */
+interface MachineRead {
+  value: string;
+  key: string | null;
+  primaryIp: string | null;
+}
+
+/**
+ * Entity page: "who is this, and should I worry" for one address, host name,
+ * user or domain (dogfood 2026-10-06, S1, S2, S5).
+ *
+ * Every entity link in the console opens this route. A value a machine holds
+ * moves on to the machine page: that page is the answer for a machine. An
+ * address no machine holds, an external address, a user and a domain stay
+ * here. `?view=entity` keeps a machine's value on this page, for its timeline.
+ * `?type=user` or `?type=domain` says what the value is, so an account that
+ * shares a name with a machine never opens the machine.
+ */
 export function Entity() {
   const { value = '' } = useParams();
-  const { data, loading, error, refetch } = useAsync(() => getEntity(value), [value]);
+  const [params] = useSearchParams();
+  const navigate = useNavigate();
+  const hint = params.get('type');
+  const stay = params.get('view') === 'entity';
+  const notMachine = hint === 'user' || hint === 'domain';
+  const trimmed = value.trim();
+
   // The machine this name or address belongs to. A value that names no
-  // machine is a 404 and shows no link.
-  const machineRead = useAsync(
+  // machine is a 404. A failed read keeps the entity page.
+  const machineRead = useAsync<MachineRead>(
     () =>
-      resolveMachine(value.trim()).then(
-        (r) => ({ value, r }),
-        (err: unknown) => {
-          if (isNotFound(err)) return { value, r: null };
-          throw err;
-        },
-      ),
-    [value],
+      notMachine || !trimmed
+        ? Promise.resolve({ value, key: null, primaryIp: null })
+        : resolveMachine(trimmed).then(
+            (r) => ({ value, key: r.key, primaryIp: r.primary_ip }),
+            (err: unknown) => {
+              if (isNotFound(err)) return { value, key: null, primaryIp: null };
+              throw err;
+            },
+          ),
+    [value, notMachine],
   );
-  const machine = machineRead.data?.value === value ? machineRead.data.r : null;
-  // The machine page, or the host page of the address the entity read joined
-  // the name to when the machine read had no answer. That page resolves the
-  // address to its machine.
-  const hostLink = machine
-    ? { to: machineHref(machine.key), ip: machine.primary_ip }
-    : data?.host_ip
-      ? { to: `/hosts/${encodeURIComponent(data.host_ip)}`, ip: data.host_ip }
-      : null;
-  // A user account reaches this page and nothing else on it. The observations
-  // and the leads on the account were written, and the page that names the
-  // account did not list them. An address keeps the host page for both.
-  const account = value.trim() !== '' && !isIpKey(value.trim());
+  const machine = machineRead.data?.value === value ? machineRead.data : null;
+  const machineSettled = !!machine || (!!machineRead.error && !machineRead.loading);
+  const { data, loading, error, refetch } = useAsync(
+    () => getEntity(value, notMachine ? hint : null),
+    [value, hint],
+  );
+
+  // A machine holds the value: its page is the answer.
+  if (machine?.key && !stay) {
+    const address = isIpKey(trimmed) ? `?address=${encodeURIComponent(trimmed)}` : '';
+    return <Navigate to={`${machineHref(machine.key)}${address}`} replace />;
+  }
+
+  const hostLink = machine?.key ? { to: machineHref(machine.key), ip: machine.primaryIp ?? '' } : null;
 
   return (
     <div className="px-[22px] pb-[60px] pt-[18px] font-sans text-text">
       <div className="mb-3.5 flex flex-wrap items-center gap-3">
-        <Link
-          to="/alerts"
+        <button
+          type="button"
+          onClick={() => navigate(-1)}
           className="flex items-center gap-1.5 text-[12.5px] text-dim hover:text-text"
         >
-          <ChevronLeft size={13} /> Alerts
-        </Link>
+          <ChevronLeft size={13} /> Back
+        </button>
         <span className="text-ghost">/</span>
         {/* The crumb names the entity. "Alerts / Entity" named the screen. */}
         <div data-testid="entity-crumb" className="font-mono text-[15px] font-semibold">
@@ -113,103 +150,129 @@ export function Entity() {
       </div>
 
       <div className="mx-auto max-w-workstation">
-        {loading && !data ? (
-          <LoadingState label="Loading entity…" />
+        {!machineSettled || (loading && !data) ? (
+          <LoadingState label="Loading entity" />
         ) : error ? (
           <ErrorState error={error} onRetry={refetch} label="this entity" />
         ) : !data ? (
           <ErrorState error={new Error('Entity not found')} />
         ) : (
-          <>
-            {/* Header: the entity value + kind + summary counts. */}
-            <div className="mb-4 rounded-panel-lg border border-border bg-surface-2 px-5 py-4">
-              <div className="flex flex-wrap items-center gap-3">
-                <span className="text-dim">
-                  <Server size={18} />
-                </span>
-                <span className="font-mono text-[17px] font-semibold text-white">{data.value}</span>
-                {/* The server calls anything that is not an address a host, so
-                    this chip read "host" over a user account. It states what
-                    the page knows: an address, or a name of some sort. */}
-                <span
-                  data-testid="entity-type"
-                  title={data.kind === 'ip' ? ENTITY_ADDRESS : ENTITY_NAME}
-                  className="rounded-chip border border-border-input bg-surface-3 px-1.5 py-0.5 font-mono text-[9.5px] font-semibold uppercase tracking-[.04em] text-dim"
-                >
-                  {data.kind === 'ip' ? 'address' : 'name'}
-                </span>
-                {/* No "host dossier →" chip: the only IPs that still reach this
-                    screen are EXTERNAL ones (App's EntityRoute redirects internal
-                    addresses to /hosts/:ip), and the dossier census is
-                    internal-CIDR-only — so the link would dead-end on "the network
-                    sweep has never seen this address" for essentially every host
-                    that could click it. An operator who has declared a public
-                    CIDR internal still reaches those hosts from the Hosts screen.
-                    A NAME the dossier knows is the exception: it has a host
-                    page, and the link goes there. */}
-                {hostLink && (
-                  <Link
-                    data-testid="entity-host-link"
-                    to={hostLink.to}
-                    title="This entity belongs to a machine. The machine page holds its addresses, profile, observations and leads."
-                    className="rounded-chip border border-accent/40 bg-accent/10 px-2 py-0.5 text-[11.5px] font-semibold text-accent hover:bg-accent/20"
-                  >
-                    machine {hostLink.ip} →
-                  </Link>
-                )}
-              </div>
-              <div className="mt-2.5 flex flex-wrap items-center gap-4 text-[12px] text-dim">
-                <span>
-                  <span className="font-semibold text-text">{data.summary.investigationCount}</span>{' '}
-                  investigation{data.summary.investigationCount === 1 ? '' : 's'}
-                </span>
-                <span>
-                  <span className="font-semibold text-text">{data.summary.huntFindingCount}</span>{' '}
-                  hunt finding{data.summary.huntFindingCount === 1 ? '' : 's'}
-                </span>
-                {data.summary.latestVerdict && (
-                  <span className="flex items-center gap-1.5">
-                    latest verdict
-                    <VerdictPill verdict={data.summary.latestVerdict as Verdict} showConf={false} />
-                  </span>
-                )}
-              </div>
-            </div>
-
-            {/* Timeline: merged investigations + hunt findings, newest first. */}
-            {data.timeline.length === 0 ? (
-              <EmptyState>
-                The timeline for <span className="font-mono text-dim">{data.value}</span> is empty.
-                No investigation or hunt finding names this entity.
-                {hostLink && (
-                  <>
-                    {' '}
-                    <Link to={hostLink.to} className="text-accent hover:underline">
-                      Open the machine page for {hostLink.ip}.
-                    </Link>
-                  </>
-                )}
-              </EmptyState>
-            ) : (
-              <div className="flex flex-col gap-2">
-                {data.timeline.map((item, i) => (
-                  <TimelineCard key={`${item.kind}-${item.link}-${i}`} item={item} />
-                ))}
-              </div>
-            )}
-
-            {/* The observations and the leads on this account. Both were
-                written against the account and neither was readable from the
-                page that names it. */}
-            {account && (
-              <div data-testid="entity-hunting">
-                <HostObservations entityKey={value} noun="entity" />
-                <LeadsStrip entityKey={value} status="all" noun="entity" className="mt-4" />
-              </div>
-            )}
-          </>
+          <EntityBody data={data} hostLink={hostLink} />
         )}
       </div>
     </div>
+  );
+}
+
+function EntityBody({
+  data,
+  hostLink,
+}: {
+  data: EntityDetail;
+  hostLink: { to: string; ip: string } | null;
+}) {
+  const type = entityType(data);
+  const empty = nothingKnown(data);
+  const worry = worryLines(data);
+  const s = data.summary;
+  return (
+    <>
+      {/* Header: the value, what it is, and the answer to "should I worry". */}
+      <div
+        data-testid="entity-header"
+        className="mb-4 rounded-panel-lg border border-border bg-surface-2 px-5 py-4"
+      >
+        <div className="flex flex-wrap items-center gap-3">
+          <span className="text-dim">
+            <Server size={18} />
+          </span>
+          <span className="font-mono text-[17px] font-semibold text-white">{data.value}</span>
+          <span
+            data-testid="entity-type"
+            title={type === 'address' || type === 'external_address' ? ENTITY_ADDRESS : ENTITY_NAME}
+            className="rounded-chip border border-border-input bg-surface-3 px-1.5 py-0.5 font-mono text-[9.5px] font-semibold uppercase tracking-[.04em] text-dim"
+          >
+            {ENTITY_TYPE_LABEL[type]}
+          </span>
+          {hostLink && (
+            <Link
+              data-testid="entity-host-link"
+              to={hostLink.to}
+              title="This entity belongs to a machine. The machine page holds its addresses, profile, observations and leads."
+              className="rounded-chip border border-accent/40 bg-accent/10 px-2 py-0.5 text-[11.5px] font-semibold text-accent hover:bg-accent/20"
+            >
+              machine {hostLink.ip} →
+            </Link>
+          )}
+        </div>
+        <p data-testid="entity-identity" className="mt-2.5 text-[14px] leading-[1.6] text-text-2">
+          {identityLine(data)}
+        </p>
+        {empty ? (
+          <p data-testid="entity-nothing-known" className="mt-1 text-[13px] leading-[1.6] text-dim">
+            {nothingKnownLine(data.value)}
+          </p>
+        ) : (
+          <ul data-testid="entity-worry" className="mt-1 text-[13px] leading-[1.6] text-text-2">
+            {worry.map((line) => (
+              <li key={line}>{line}</li>
+            ))}
+          </ul>
+        )}
+        <div
+          data-testid="entity-seen"
+          className="mt-2.5 flex flex-wrap items-center gap-x-4 gap-y-1 font-mono text-[11px] text-faint"
+        >
+          <span title={data.first_seen ? absTime(data.first_seen) : undefined}>
+            first seen {data.first_seen ? relativeAge(data.first_seen) : 'never'}
+          </span>
+          <span title={data.last_seen ? absTime(data.last_seen) : undefined}>
+            last seen {data.last_seen ? relativeAge(data.last_seen) : 'never'}
+          </span>
+          <span>{plural(s.investigationCount, 'investigation')}</span>
+          <span>{plural(s.huntFindingCount, 'hunt finding')}</span>
+          <span>{plural(s.leadCount ?? 0, 'lead')}</span>
+          <span title="Observations in the last 30 days, from every source.">
+            {plural(s.observationCount ?? 0, 'observation')}
+          </span>
+          {s.latestVerdict && (
+            <span className="flex items-center gap-1.5 font-sans">
+              latest verdict
+              <VerdictPill verdict={s.latestVerdict as Verdict} showConf={false} />
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* The leads and the observations that name the entity come first:
+          they are the open work. The timeline is the history. */}
+      <div data-testid="entity-hunting">
+        <LeadsStrip entityKey={data.value} status="all" noun="entity" className="mb-4" />
+        <HostObservations entityKey={data.value} noun="entity" />
+      </div>
+
+      <div className="mt-4">
+        {data.timeline.length === 0 ? (
+          <EmptyState>
+            No investigation or hunt finding names{' '}
+            <span className="font-mono text-dim">{data.value}</span>.
+            {hostLink && (
+              <>
+                {' '}
+                <Link to={hostLink.to} className="text-accent hover:underline">
+                  Open the machine page for {hostLink.ip}.
+                </Link>
+              </>
+            )}
+          </EmptyState>
+        ) : (
+          <div className="flex flex-col gap-2">
+            {data.timeline.map((item, i) => (
+              <TimelineCard key={`${item.kind}-${item.link}-${i}`} item={item} />
+            ))}
+          </div>
+        )}
+      </div>
+    </>
   );
 }

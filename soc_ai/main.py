@@ -1627,6 +1627,13 @@ async def _reap_orphans_at_startup(db_sessionmaker: Any) -> None:
     if orphaned_hunts:
         _LOGGER.info("reaped %d orphaned 'running' hunt(s) at startup", orphaned_hunts)
 
+    # A hunt that investigated its findings when the process stopped. Its
+    # report stands and its investigations were reaped above, so it completes.
+    async with db_sessionmaker() as db:
+        investigating = await hunt_svc.reap_investigating(db)
+    if investigating:
+        _LOGGER.info("completed %d 'investigating' hunt(s) at startup", investigating)
+
     # Leads: a lead whose hunt finished with no process there to settle it,
     # and every lead an older release left in 'hunting'. Runs after the hunt
     # reaper, so an orphaned hunt is terminal by the time the rule reads it.
@@ -1679,6 +1686,24 @@ async def _reap_orphans_at_startup(db_sessionmaker: Any) -> None:
         purged_sessions = await purge_expired_sessions(db)
     if purged_sessions:
         _LOGGER.info("purged %d expired session(s) at startup", purged_sessions)
+
+
+async def _mark_backtest_leads(db_sessionmaker: Any) -> None:
+    """Mark the leads that formed from backtest replays. A one-time repair.
+
+    Before 2026-10-06 a backtest replay wrote an alert observation like a live
+    run, so a replay could form a lead. The store writes none now. This marks
+    the leads that formed before that. Idempotent: a marked lead is not marked
+    again, and no new replay forms a lead, so a later start finds nothing to
+    do. Fail-soft: the mark is a note on a lead and must not block serving.
+    """
+    try:
+        async with db_sessionmaker() as db:
+            marked = await leads_store.mark_backtest_leads(db)
+        if marked:
+            _LOGGER.info("marked %d lead(s) that formed from backtest replays", marked)
+    except Exception:
+        _LOGGER.warning("backtest lead repair failed; continuing", exc_info=True)
 
 
 async def _init_store(db_engine: Any, settings: Any, secret_box: Any = None) -> Any:
@@ -1735,6 +1760,8 @@ async def _init_store(db_engine: Any, settings: Any, secret_box: Any = None) -> 
             await effective_catalog(db, seed=True)
     except Exception:
         _LOGGER.warning("shipped shadow analytic seed failed; continuing", exc_info=True)
+
+    await _mark_backtest_leads(db_sessionmaker)
 
     # Demo mode: seed the sanitized recorded-run fixtures so the UI has
     # investigations/hunts/backtests to browse. Idempotent per row (restart-safe)
@@ -2055,7 +2082,8 @@ _DEMO_WRITE_ALLOW: set[tuple[str, str]] = {
 # exact-match set above — match them by (method, pattern). In demo mode these
 # POSTs are turned into canned, ZERO-EGRESS replies by the demo branches in the
 # chat/hunt route handlers and managers (soc_ai/api/webui/routes_chat.py,
-# soc_ai/webui/chat_manager.py, host_chat_manager.py, hunt_console_manager.py);
+# soc_ai/webui/chat_manager.py, host_chat_manager.py, lead_chat_manager.py,
+# hunt_console_manager.py);
 # ``/api/v1/hunts/chat`` (hunt-start) is wired to a fixture replay in a later
 # task. The host chat's DELETE is the one non-POST: like the general chat's
 # DELETE it backs the panel's "Clear conversation" control and, on a demo,
@@ -2069,6 +2097,9 @@ _DEMO_WRITE_ALLOW_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("POST", re.compile(r"^/api/v1/hunts/chat$")),  # hunt-start → seeded hunt id (ephemeral)
     ("POST", re.compile(r"^/api/v1/dossiers/[^/]+/chat$")),
     ("DELETE", re.compile(r"^/api/v1/dossiers/[^/]+/chat$")),
+    # The lead chat: the host chat's two verbs, for the host chat's reasons.
+    ("POST", re.compile(r"^/api/v1/hunts/leads/[^/]+/chat$")),
+    ("DELETE", re.compile(r"^/api/v1/hunts/leads/[^/]+/chat$")),
 )
 
 
@@ -2163,7 +2194,11 @@ def _validation_hint(err: dict[str, Any]) -> str:
         return sentence
     value = str(err.get("input"))
     if len(value) > _HINT_VALUE_CHARS:
-        value = value[:_HINT_VALUE_CHARS] + "…"
+        # A long value is named by its start and its length, with no ellipsis.
+        return (
+            f"{sentence} soc-ai got a value of {len(value)} characters that starts "
+            f"with '{value[:_HINT_VALUE_CHARS]}'."
+        )
     return f"{sentence} soc-ai got '{value}'."
 
 

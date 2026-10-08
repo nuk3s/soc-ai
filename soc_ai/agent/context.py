@@ -245,6 +245,11 @@ class HuntSubject(BaseModel):
     # evidence: the pipeline hands them to the prefetch bundle so the evidence
     # gate resolves a citation of any of them.
     documents: list[SoAlert] = Field(default_factory=list)
+    # The hunt-independent fingerprint of the promoted finding's subject
+    # (soc_ai.hunting.findings.subject_fingerprint). The row stores it, so a
+    # later hunt that finds the same subject reuses this run. None for a lead
+    # promotion, which promotes no one finding.
+    subject_fingerprint: str | None = None
 
     @property
     def finding_ordinals(self) -> list[int]:
@@ -267,7 +272,7 @@ class HuntSubject(BaseModel):
         rides along so the page still names the findings after the hunt row is
         deleted.
         """
-        return {
+        record: dict[str, Any] = {
             "type": "hunt",
             "hunt_id": self.hunt_id,
             "objective": self.objective,
@@ -277,6 +282,9 @@ class HuntSubject(BaseModel):
             "document_ids": self.document_ids,
             "observation_ids": self.observation_ids,
         }
+        if self.subject_fingerprint:
+            record["subject_fingerprint"] = self.subject_fingerprint
+        return record
 
     def render_block(self) -> str:
         """The subject block for the investigator prompt.

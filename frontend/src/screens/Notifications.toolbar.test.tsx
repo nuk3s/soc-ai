@@ -319,7 +319,7 @@ describe('Notifications — what the header says the list holds', () => {
     await screen.findByText(/ET SCAN Suspicious inbound/);
     // Only the types on the list, each with its count (D3).
     expect(container.textContent).toContain(
-      '5 items from the last 24 h: 1 system notice, 1 host disagreement, 1 running investigation, 1 completed investigation and 1 finished hunt.',
+      '5 items: 1 system notice, 1 host disagreement, 1 running investigation, 1 completed investigation and 1 finished hunt. Finished runs cover the last 24 h.',
     );
     expect(container.textContent).not.toMatch(/shadow hit|lead/);
   });

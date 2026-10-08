@@ -61,7 +61,7 @@ export function OracleShadowTally() {
             className={`grid ${COLS} items-center gap-2 border-b border-border-faint px-3.5 py-2 last:border-b-0`}
           >
             <div className="text-[12px] text-dim">{ruleLabel(r.rule)}</div>
-            <div className="truncate font-mono text-[11.5px]" title={ORACLE_REASON[r.reason] ?? r.reason}>
+            <div className="break-all font-mono text-[11.5px]" title={ORACLE_REASON[r.reason] ?? r.reason}>
               {r.reason}
             </div>
             <div className="font-mono text-[12px] text-dim">{r.count}</div>

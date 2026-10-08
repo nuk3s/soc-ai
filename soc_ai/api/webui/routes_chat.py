@@ -1,4 +1,4 @@
-"""Analyst chat endpoints: per-investigation, and the Dashboard's general chat.
+"""Analyst chat endpoints: per investigation, per host, per lead, and the general chat.
 
 Both surfaces speak the SAME wire format (:class:`ChatThreadOut` built by
 :func:`_thread`) even though they read different tables, because the SPA has one
@@ -22,6 +22,7 @@ from fastapi import HTTPException, Request
 from pydantic import BaseModel, Field
 
 from soc_ai.api.security import identify_caller
+from soc_ai.api.webui._errors import api_error
 from soc_ai.api.webui._shared import (
     router,
 )
@@ -38,6 +39,7 @@ from soc_ai.webui import (
     chat_manager,
     general_chat_manager,
     host_chat_manager,
+    lead_chat_manager,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -369,6 +371,89 @@ async def clear_host_chat(request: Request, ip: str) -> ChatThreadOut:
     if is_demo(request.app.state.settings):
         return _thread([])
     async with request.app.state.db_sessionmaker() as db:
+        await gc_svc.trim_thread(db, key, keep_last=0)
+        msgs = await gc_svc.list_messages(db, key)
+    return _thread(msgs)
+
+
+# ── The lead page chat ──────────────────────────────────────────────────────
+# One SHARED thread per lead, the host chat's shape: the rows live in the same
+# GeneralChatMessage table under a ``lead:<id>`` key. A lead id is an integer,
+# so the key fits the String(64) column with no migration. Gated like the host
+# chat: the lead must exist (404 otherwise), and ``general_chat_enabled`` does
+# not touch it.
+
+
+async def _require_lead(db: Any, lead_id: int) -> None:
+    """404 an unknown lead, in the words the lead routes use."""
+    from soc_ai.store import leads as leads_store  # noqa: PLC0415 - lazy, as in routes_hunts
+
+    if await leads_store.get(db, lead_id) is None:
+        raise api_error(
+            404,
+            "lead_not_found",
+            f"No lead has the id {lead_id}. The Hunts page lists the open leads.",
+        )
+
+
+@router.get("/hunts/leads/{lead_id}/chat", response_model=ChatThreadOut)
+async def get_lead_chat(request: Request, lead_id: int) -> ChatThreadOut:
+    """Poll target: this lead's shared thread, pending flag while a turn runs.
+
+    On the public demo it is always empty. See :func:`_demo_thread`.
+    """
+    async with request.app.state.db_sessionmaker() as db:
+        await _require_lead(db, lead_id)
+        if is_demo(request.app.state.settings):
+            return _thread([])
+        msgs = await gc_svc.list_messages(db, lead_chat_manager.thread_key_for(lead_id))
+    return _thread(msgs)
+
+
+@router.post("/hunts/leads/{lead_id}/chat", response_model=ChatThreadOut)
+async def post_lead_chat(request: Request, lead_id: int, body: ChatIn) -> ChatThreadOut:
+    """Ask about this lead. Writes the user turn and a pending assistant turn,
+    spawns the background turn, and returns the thread (poll GET until
+    ``!pending``).
+
+    On the public demo it neither writes nor spawns anything. See
+    :func:`_demo_thread`.
+    """
+    text = body.message.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail={"reason": "empty_message"})
+    key = lead_chat_manager.thread_key_for(lead_id)
+    async with request.app.state.db_sessionmaker() as db:
+        await _require_lead(db, lead_id)
+        if is_demo(request.app.state.settings):
+            # After validation, so the demo rejects the same requests a real
+            # deployment does.
+            return _demo_thread(text, lead_chat_manager.DEMO_REPLY)
+        existing = await gc_svc.list_messages(db, key)
+        if any(m.status == "pending" for m in existing):
+            # One in-flight turn per thread, the guard every chat surface carries.
+            raise HTTPException(status_code=409, detail={"reason": "chat_busy"})
+        await gc_svc.add_user_message(db, key, text)
+        pending = await gc_svc.create_pending_assistant(db, key)
+        msgs = await gc_svc.list_messages(db, key)
+    lead_chat_manager.get_manager(request.app.state).start(
+        request.app.state, lead_id=lead_id, assistant_msg_id=pending.id
+    )
+    return _thread(msgs)
+
+
+@router.delete("/hunts/leads/{lead_id}/chat", response_model=ChatThreadOut)
+async def clear_lead_chat(request: Request, lead_id: int) -> ChatThreadOut:
+    """Start over. Deletes THIS lead's thread only, and returns it empty.
+
+    Safe while a turn is in flight, for the host chat's reason. On the public
+    demo it deletes nothing.
+    """
+    key = lead_chat_manager.thread_key_for(lead_id)
+    async with request.app.state.db_sessionmaker() as db:
+        await _require_lead(db, lead_id)
+        if is_demo(request.app.state.settings):
+            return _thread([])
         await gc_svc.trim_thread(db, key, keep_last=0)
         msgs = await gc_svc.list_messages(db, key)
     return _thread(msgs)

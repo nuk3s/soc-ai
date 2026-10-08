@@ -1,6 +1,8 @@
-// Investigate is the analyst loop (unchanged order); Operate shelves the
-// ops/config surfaces behind a collapsible group, collapsed by default so a
-// first-run session reads as an analyst tool, not a cockpit. Regression
+// Analyst is the analyst loop (unchanged order); Operator shelves the
+// ops/settings surfaces behind a collapsible group, collapsed by default so a
+// first-run session reads as an analyst tool, not a cockpit. The groups were
+// "Investigate" and "Operate", and "Operate" named both the group and its
+// first page (dogfood 2026-10-06). Regression
 // coverage for: default-collapsed, click-to-expand-and-persist, force-expand
 // when the active route lives inside the group, and that the icon rail never
 // hides navigation regardless of group collapse.
@@ -19,6 +21,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
       update_check_enabled: false,
     }),
   ),
+  getNeedsYouCount: vi.fn(() => Promise.reject(new Error('not in this test'))),
 }));
 
 import { ShellProvider } from './ShellContext';
@@ -42,34 +45,34 @@ beforeEach(() => {
 });
 
 describe('Sidebar nav groups', () => {
-  it('groups nav into Investigate and Operate with Operate collapsed by default', async () => {
+  it('groups nav into Analyst and Operator with Operator collapsed by default', async () => {
     renderAt('/dashboard');
 
-    expect(await screen.findByText('Investigate')).toBeInTheDocument();
-    expect(screen.getByText('Operate')).toBeInTheDocument();
+    expect(await screen.findByText('Analyst')).toBeInTheDocument();
+    expect(screen.getByText('Operator')).toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'Dashboard' })).toBeInTheDocument();
     // Operate's items stay folded until the group is opened.
-    expect(screen.queryByRole('link', { name: 'Config' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'Settings' })).not.toBeInTheDocument();
     expect(screen.queryByRole('link', { name: 'Runbooks' })).not.toBeInTheDocument();
   });
 
-  it('expands Operate on heading click and persists', async () => {
+  it('expands Operator on heading click and persists', async () => {
     renderAt('/dashboard');
 
-    const heading = await screen.findByRole('button', { name: /operate/i });
-    expect(screen.queryByRole('link', { name: 'Config' })).not.toBeInTheDocument();
+    const heading = await screen.findByRole('button', { name: /operator/i });
+    expect(screen.queryByRole('link', { name: 'Settings' })).not.toBeInTheDocument();
 
     fireEvent.click(heading);
 
-    expect(await screen.findByRole('link', { name: 'Config' })).toBeInTheDocument();
+    expect(await screen.findByRole('link', { name: 'Settings' })).toBeInTheDocument();
     expect(localStorage.getItem(OPERATE_KEY)).toBe('0');
   });
 
-  it('renders Operate expanded when the active route lives inside it', async () => {
+  it('renders Operator expanded when the active route lives inside it', async () => {
     renderAt('/config');
 
     // No click needed — the current location is inside the Operate group.
-    expect(await screen.findByRole('link', { name: 'Config' })).toBeInTheDocument();
+    expect(await screen.findByRole('link', { name: 'Settings' })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'Runbooks' })).toBeInTheDocument();
   });
 
@@ -83,15 +86,41 @@ describe('Sidebar nav groups', () => {
 
       // Sanity: the rail really did collapse (labels/headings hidden) —
       // mirrors AccountMenu.test.tsx's collapsed-rail sanity check.
-      await waitFor(() => expect(screen.queryByText('Operate')).not.toBeInTheDocument());
+      await waitFor(() => expect(screen.queryByText('Operator')).not.toBeInTheDocument());
 
       // Operate's own group-collapse state is still default-collapsed here,
       // yet every item — including the ones the group would otherwise fold —
       // renders as an icon-only link in the 64px rail.
-      expect(screen.getByTitle('Config')).toBeInTheDocument();
+      expect(screen.getByTitle('Settings')).toBeInTheDocument();
       expect(screen.getByTitle('Runbooks')).toBeInTheDocument();
       expect(screen.getByTitle('Backtest')).toBeInTheDocument();
-      expect(screen.getByTitle('Operate')).toBeInTheDocument();
+      expect(screen.getByTitle('Status')).toBeInTheDocument();
     });
+  });
+});
+
+describe('Sidebar entries', () => {
+  // The bell opens the same list, and its "View all notifications" link keeps
+  // the page reachable.
+  it('has no Notifications entry', async () => {
+    renderAt('/dashboard');
+    await screen.findByRole('link', { name: 'Dashboard' });
+    expect(screen.queryByRole('link', { name: 'Notifications' })).toBeNull();
+  });
+
+  // A lead lives on the Hunts page.
+  it('marks Hunts active on a lead page', async () => {
+    renderAt('/leads/18');
+    const hunts = await screen.findByRole('link', { name: /^Hunts/ });
+    expect(hunts.querySelector('span')?.getAttribute('style')).toContain('#4b8bf5');
+    // NEGATIVE CONTROL. Alerts is not lit on a lead page.
+    const alerts = screen.getByRole('link', { name: /^Alerts/ });
+    expect(alerts.querySelector('span')?.getAttribute('style')).not.toContain('#4b8bf5');
+  });
+
+  it('reads the wordmark as soc-ai', async () => {
+    renderAt('/dashboard');
+    await screen.findByRole('link', { name: 'Dashboard' });
+    expect(screen.getByText((_, el) => el?.textContent === 'soc-ai' && el.className.includes('font-mono'))).toBeTruthy();
   });
 });

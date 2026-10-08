@@ -65,6 +65,8 @@ __all__ = [
     "content_fingerprint",
     "decays_from",
     "form_leads",
+    "no_lead_reasons",
+    "no_lead_sentence",
     "purge_out_of_scope_observations",
     "record_observation",
     "resync_lead_shadow",
@@ -486,6 +488,9 @@ async def weigh_entity(
     Observations below the floor are dropped rather than returned at zero: they
     are history, and a caller that sums what it is given must not have to
     remember to filter first.
+
+    An observation an analyst marked benign is not live (migration 0062). It
+    counts toward no lead, the way the observations of a dismissed lead do.
     """
     at = now or datetime.now(UTC)
     rows = (
@@ -494,6 +499,7 @@ async def weigh_entity(
                 select(EntityObservation).where(
                     EntityObservation.entity_kind == entity_kind,
                     EntityObservation.entity_key == entity_key,
+                    EntityObservation.dismissed_at.is_(None),
                 )
             )
         )
@@ -549,6 +555,42 @@ async def weigh_entity(
                 related=_related_entities(row.evidence_json),
             )
         )
+    return out
+
+
+def no_lead_sentence(observations: Sequence[WeighedObservation]) -> str:
+    """Why the observations on one entity form no lead, in the rule's numbers.
+
+    The hits card said "This hit formed no lead and joined none." and gave no
+    cause. The sentence states the types, their live weight and what the
+    formation rule asks for. The numbers come from the constants that decide.
+    """
+    if not observations:
+        return "The observation has decayed. It weighs nothing now and forms no lead."
+    total = lead_total((o.kind, o.weight) for o in observations)
+    kinds = {o.kind for o in observations}
+    if len(kinds) == 1:
+        return (
+            f"One type at weight {total:.2f}. A lead needs {DEFAULT_LEAD_THRESHOLD:.2f} over "
+            f"{DEFAULT_MIN_KINDS} types, or {SINGLE_SIGNAL_THRESHOLD:.2f} on one type."
+        )
+    return (
+        f"{len(kinds)} types at weight {total:.2f}. "
+        f"A lead needs {DEFAULT_LEAD_THRESHOLD:.2f} over {DEFAULT_MIN_KINDS} types."
+    )
+
+
+async def no_lead_reasons(
+    db: AsyncSession,
+    entities: Sequence[tuple[str, str]],
+    *,
+    now: datetime | None = None,
+) -> dict[tuple[str, str], str]:
+    """:func:`no_lead_sentence` for each entity, one weighing per entity."""
+    out: dict[tuple[str, str], str] = {}
+    for entity_kind, entity_key in dict.fromkeys(entities):
+        weighed = await weigh_entity(db, entity_kind=entity_kind, entity_key=entity_key, now=now)
+        out[(entity_kind, entity_key)] = no_lead_sentence(weighed)
     return out
 
 

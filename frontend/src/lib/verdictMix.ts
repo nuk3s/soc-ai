@@ -3,12 +3,15 @@
 // "Draft it" button. A pure seam (extracted from Runbooks.tsx) so the display
 // contract is unit-testable without mounting the screen.
 import type { PromotableRule } from './api';
+import { verdictLabel } from './labels';
 
-/** Short badge label per verdict bucket (the SOC-conventional initialisms). */
+/** Short badge label per verdict bucket. FP and TP are the SOC initialisms
+ *  every analyst reads. needs_more_info is spelled out: "NMI" was one of its
+ *  five spellings and no analyst outside this code base knows it. */
 const BUCKETS: Array<{ key: 'false_positive' | 'true_positive' | 'needs_more_info'; label: string }> = [
   { key: 'false_positive', label: 'FP' },
   { key: 'true_positive', label: 'TP' },
-  { key: 'needs_more_info', label: 'NMI' },
+  { key: 'needs_more_info', label: verdictLabel('needs_more_info').toLowerCase() },
 ];
 
 /**
@@ -27,7 +30,12 @@ export function formatVerdictMix(
 
 /** Human label for the dominant verdict chip ("mostly FP" / "mostly TP" …). */
 export function dominantVerdictLabel(dominant: string): string {
-  const short =
-    dominant === 'false_positive' ? 'FP' : dominant === 'true_positive' ? 'TP' : 'NMI';
+  const short = BUCKETS.find((b) => b.key === dominant)?.label ?? verdictLabel(dominant).toLowerCase();
   return `mostly ${short}`;
+}
+
+/** The title of the dominant verdict chip, in words. It printed the stored
+ *  key, "dominant verdict: needs_more_info". */
+export function dominantVerdictTitle(dominant: string): string {
+  return `Most verdicts on this rule: ${verdictLabel(dominant)}.`;
 }

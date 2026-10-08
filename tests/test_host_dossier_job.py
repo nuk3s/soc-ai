@@ -607,7 +607,7 @@ async def test_the_recorded_errors_are_bounded(
     assert summary.hosts_seen == 60
     assert summary.hosts_built == 0
     assert len(summary.errors) == 51
-    assert summary.errors[-1].startswith("... further failures suppressed")
+    assert summary.errors[-1] == "soc-ai keeps the first 50 failures and drops the rest."
     # Every host still carries its own reason on its own row.
     assert (await _host_row(maker, "192.168.10.60")).build_error is not None
     await engine.dispose()

@@ -1105,3 +1105,57 @@ def test_shipped_default_is_the_union_of_its_named_labels() -> None:
     # Every default label is one the doctor actually counts, or the row could
     # recommend a label it has no number for.
     assert set(DEFAULT_ALERT_LABELS) <= set(aq.ALERT_LABEL_CANDIDATES)
+
+
+# ---------------------------------------------------------------------------
+# The source and the host on a group row (dogfood 2026-10-06, W3). The row
+# showed the rule and the count and no machine.
+
+
+def _bucket_with(source: dict[str, Any], sources: int | None) -> dict[str, Any]:
+    out = copy.deepcopy(GROUP_BUCKETS)
+    bucket = out["aggregations"]["rules"]["buckets"][0]
+    bucket["latest"]["hits"]["hits"][0]["_source"].update(source)
+    if sources is not None:
+        bucket["sources"] = {"value": sources}
+    return out
+
+
+async def test_a_group_names_its_source_and_its_host(settings_kratos: Settings) -> None:
+    elastic = _fake_elastic(
+        _bucket_with({"source": {"ip": "192.0.2.26"}, "host": {"name": "ws-01"}}, 3)
+    )
+    page = await aq.fetch_groups(elastic, _suricata_only(settings_kratos), time_range="24h")
+    g = page.groups[0]
+    assert g.src_ip == "192.0.2.26"
+    assert g.host == "ws-01"
+    assert g.source_count == 3
+    aggs = elastic.search.call_args.kwargs["aggs"]["rules"]["aggs"]
+    assert aggs["sources"] == {"cardinality": {"field": "source.ip"}}
+    assert "host.name" in aggs["latest"]["top_hits"]["_source"]
+
+
+async def test_a_network_alert_names_its_sensor(settings_kratos: Settings) -> None:
+    elastic = _fake_elastic(_bucket_with({"observer": {"name": "so-sensor"}}, 1))
+    page = await aq.fetch_groups(elastic, _suricata_only(settings_kratos), time_range="24h")
+    assert page.groups[0].host == "so-sensor"
+
+
+async def test_a_host_log_reads_its_machine_from_the_envelope(settings_kratos: Settings) -> None:
+    elastic = _fake_elastic(
+        _bucket_with(
+            {"event_data": {"host": {"name": "dc-01"}, "source": {"ip": "10.0.0.5"}}}, None
+        )
+    )
+    page = await aq.fetch_groups(elastic, _suricata_only(settings_kratos), time_range="24h")
+    g = page.groups[0]
+    assert g.host == "dc-01"
+    assert g.src_ip == "10.0.0.5"
+
+
+async def test_a_group_with_no_host_and_no_count_claims_neither(settings_kratos: Settings) -> None:
+    """NEGATIVE CONTROL. Nothing on the document, nothing on the row."""
+    elastic = _fake_elastic(GROUP_BUCKETS)
+    page = await aq.fetch_groups(elastic, _suricata_only(settings_kratos), time_range="24h")
+    assert page.groups[0].host is None
+    assert page.groups[0].source_count is None

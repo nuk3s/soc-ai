@@ -70,7 +70,7 @@ _ROLE_BUCKETS: tuple[str, ...] = ("unknown", "low_confidence", "stale")
 _YES_NO: tuple[str, ...] = ("yes", "no")
 _ACTIVITY: tuple[str, ...] = ("active", "all")
 _SEEN: tuple[str, ...] = ("new",)
-_HEALTH: tuple[str, ...] = ("broken", "attention")
+_HEALTH: tuple[str, ...] = ("broken", "attention", "stale")
 
 RoleState = Literal["declared", "inferred", "low_confidence", "stale", "unknown"]
 _AsMatched = Literal["address", "name", "mac", "agent"]
@@ -138,6 +138,9 @@ class MachineRowOut(BaseModel):
     first_seen: str | None = None
     last_seen: str | None = None
     flags: MachineFlagsOut = Field(default_factory=MachineFlagsOut)
+    # The error the last sweep stored on the primary address, when the build
+    # failed. The list states it as a sentence on a machine with no clean build.
+    build_error: str | None = None
 
 
 class MachineListOut(BaseModel):
@@ -161,6 +164,9 @@ class MachineSummaryOut(BaseModel):
     unnamed: int = 0
     roles: dict[str, int] = Field(default_factory=dict)
     needs_attention: int = 0
+    # The two parts of needs_attention: a clean build older than the
+    # staleness window, and no clean build at all. They sum to it.
+    out_of_date: int = 0
     conflicts: int = 0
     never_built: int = 0
     last_sweep_at: str | None = None
@@ -233,6 +239,7 @@ class _View:
     build_stale: bool
     new: bool
     rebound: bool
+    build_error: str | None = None
     search_rank: int | None = field(default=None)
 
     @property
@@ -460,6 +467,7 @@ async def _estate(db: AsyncSession, knobs: _Knobs) -> list[_View]:
                 rebound=primary is not None
                 and primary.identity_rebound_at is not None
                 and primary.id in declared_ids,
+                build_error=primary.build_error if primary is not None else None,
             )
         )
     return out
@@ -494,14 +502,38 @@ def _text_rank(value: str | None, needle: str) -> int | None:
     return None
 
 
+def _whole_part_match(address: str, needle: str) -> bool:
+    """True when *needle* covers whole parts of *address* where it is cut.
+
+    ".31" and "2.31" find 192.0.2.31: an analyst half remembers the last
+    parts of an address. A cut through the middle of a part does not match:
+    "0.1" must not find 10.40.0.119, and "8.1" must not find 192.168.1.123.
+    A needle that starts or ends with the separator states its own cut.
+    """
+    sep = ":" if ":" in address else "."
+    core = needle.strip(sep)
+    if not core:
+        return False
+    start = address.find(core)
+    while start != -1:
+        end = start + len(core)
+        left = start == 0 or address[start - 1] == sep
+        right = end == len(address) or address[end] == sep
+        if left and right:
+            return True
+        start = address.find(core, start + 1)
+    return False
+
+
 def _search_rank(view: _View, q: str) -> int | None:
     """The match tier of one machine for the search box, or ``None``.
 
     Tier 0: a name or an address equals the query. Tier 1: a name or an
     address starts with it. Tier 2: any other match. Names from every source
     and the agent name match exactly, by prefix or as a substring. An address
-    matches exactly or by prefix and never in the middle: "8.1" must not find
-    192.0.8.123's neighbours. A MAC is an address too and matches exactly or by
+    matches exactly, by prefix, or as a run of whole parts: ".31" finds
+    192.0.2.31. A cut through the middle of a part never matches: "8.1" must
+    not find 192.168.1.123. A MAC is an address too and matches exactly or by
     prefix in any written form. The OS and the role describe a machine and
     never name it, so a match there is tier 2 whatever its shape.
     """
@@ -519,6 +551,8 @@ def _search_rank(view: _View, q: str) -> int | None:
     is_prefix = bool(_V4_PREFIX.match(needle) or (":" in needle and _V6_PREFIX.match(needle)))
     if is_prefix and any(ip.casefold().startswith(needle) for ip in addresses):
         ranks.append(1)
+    elif is_prefix and any(_whole_part_match(ip.casefold(), needle) for ip in addresses):
+        ranks.append(2)
     texts = [value for value, _ in view.names]
     if view.row.agent_name:
         texts.append(view.row.agent_name)
@@ -584,6 +618,8 @@ def _keep(view: _View, filters: _Filters) -> bool:
     if filters.health == "broken" and not view.broken:
         return False
     if filters.health == "attention" and not view.needs_attention:
+        return False
+    if filters.health == "stale" and not (view.build_stale and not view.broken):
         return False
     if not _yes(filters.conflict, view.conflict):
         return False
@@ -688,6 +724,7 @@ def _row_out(view: _View) -> MachineRowOut:
             new=view.new,
             rebound=view.rebound,
         ),
+        build_error=view.build_error if view.broken else None,
     )
 
 
@@ -717,7 +754,7 @@ async def list_machines(
     """One row per machine, searched, filtered, sorted and paged.
 
     ``q`` matches every machine name from any source, every address (exact,
-    then prefix, never in the middle), every MAC, the OS, the role and the
+    then prefix, then a run of whole parts), every MAC, the OS, the role and the
     agent name. It ignores the activity filter. A search orders by match tier
     first and by the requested column inside a tier. Every column sorts in both
     directions and nulls sort last. An unknown filter value is a 422 that
@@ -812,6 +849,7 @@ async def machine_summary(
         unnamed=len(views) - named,
         roles=roles,
         needs_attention=sum(1 for view in views if view.needs_attention),
+        out_of_date=sum(1 for view in views if view.build_stale and not view.broken),
         conflicts=sum(1 for view in views if view.conflict),
         never_built=sum(1 for view in views if view.broken),
         last_sweep_at=_ts(last_sweep),

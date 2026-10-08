@@ -28,6 +28,7 @@ from soc_ai.agent.orchestrator import (
 from soc_ai.agent.prompts import FocusOrigin
 from soc_ai.api.recorder import InvestigationRecorder
 from soc_ai.run_meter import start_search_meter
+from soc_ai.store import investigations as inv_svc
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -168,7 +169,12 @@ async def recorded_run(
         # (notify.fire is a hard no-op unless notifications are enabled + a webhook
         # is configured, so this is zero-egress by default). Wrapped so a webhook
         # can never break the finalized investigation.
-        await _maybe_notify_investigation(state, recorder)
+        #
+        # A backtest replay sends no notification: it re-reads an alert an
+        # analyst already closed, to score the model, and a page about it would
+        # call a measurement a live true positive.
+        if not inv_svc.is_backtest_actor(started_by):
+            await _maybe_notify_investigation(state, recorder)
     except TimeoutError:
         # Whole-run backstop tripped: land the partial run as error and tell the
         # client, rather than propagating (mirrors the generic-crash handler below).

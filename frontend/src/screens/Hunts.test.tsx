@@ -5,7 +5,7 @@
 // `masterSwitchEnabled` alongside the rows so the panel can render an honest
 // state: a persistent banner with a real deep-link into Config, and a muted
 // "on (paused)" pill instead of the plain accent "on".
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DemoProvider } from '../lib/demo';
@@ -153,7 +153,7 @@ describe('ScheduledHunts demo guard', () => {
     renderHunts(true);
 
     await screen.findByText('No scheduled hunts. Add one below.');
-    fireEvent.change(screen.getByPlaceholderText('New recurring hunt objective…'), {
+    fireEvent.change(screen.getByPlaceholderText('New recurring hunt objective'), {
       target: { value: 'find beacons' },
     });
     fireEvent.click(screen.getByText('Add'));
@@ -497,14 +497,21 @@ describe('Hunts list — kind filter chips', () => {
     expect(chip('All').getAttribute('aria-pressed')).toBe('true');
   });
 
-  it('holds no Catalog chip, because the sweep records no hunt row now', async () => {
+  // The analytic sweep records a run when an analytic cannot read its data,
+  // and the bell links a folded sweep line to this chip. The address alone
+  // reached those rows.
+  it('holds a Catalog chip that lists the runs the sweep recorded', async () => {
     vi.mocked(getHunts).mockImplementation(serverByKind(MIXED));
     renderHunts();
     await screen.findByText('typed by an analyst');
-    expect(screen.queryByText('Catalog')).toBeNull();
-    for (const label of ['All', 'Manual', 'Schedule', 'Lead']) {
+    for (const label of ['All', 'Manual', 'Schedule', 'Lead', 'Catalog']) {
       expect(chip(label)).toBeTruthy();
     }
+    fireEvent.click(chip('Catalog'));
+    await waitFor(() => expect(lastQuery()).toMatchObject({ kind: 'triggered' }));
+    await waitFor(() => expect(screen.queryByText('typed by an analyst')).toBeNull());
+    expect(screen.getByText('recorded by a spec')).toBeTruthy();
+    expect(chip('Catalog').getAttribute('aria-pressed')).toBe('true');
   });
 
   it('shows a catalog hunt the capped All page never held', async () => {
@@ -522,9 +529,6 @@ describe('Hunts list — kind filter chips', () => {
 
     renderHunts(false, '/hunts?kind=triggered');
     expect(await screen.findByText('older than the whole page')).toBeTruthy();
-    // The chip comes back for that address alone, so the page says which rows
-    // it is showing.
-    expect(screen.getByText('Catalog run', { exact: false })).toBeTruthy();
   });
 
   it('only the active chip carries a count', async () => {
@@ -640,40 +644,35 @@ describe('Hunts kind chip lives in the URL', () => {
 });
 
 // A catalog hunt's objective is stored as "[catalog] <spec-id>: <title>
-// (<since> → <until>)" (hunting/sweep.py spells it). In a truncating list cell
-// the machine prefix survived and the sentence did not: "[catalog]
-// decoy-opencanary-interaction: Something connected to a de…". The prefix says
-// nothing the row's catalog badge does not, so the LIST drops it at render
-// time. The stored objective is untouched: it is the durable record of what
-// ran and over what window, and re-hunt still sends it whole.
-describe('Hunts list — catalog objective reads as its title', () => {
+// (<since> → <until>)" (hunting/sweep.py spells it). The server writes one
+// plain title for the list, the hunt page and the bell
+// (soc_ai/hunting/hunt_words.py). The row reads that title. The stored
+// objective is untouched: it is the durable record of what ran and over what
+// window, re-hunt still sends it whole, and the hover holds it.
+describe('Hunts list — a row reads the title the server wrote', () => {
   const STORED =
-    '[catalog] decoy-opencanary-interaction: Something connected to a decoy (2026-09-04T00:00:00Z → 2026-09-05T00:00:00Z)';
-  const SHOWN = 'Something connected to a decoy (2026-09-04T00:00:00Z → 2026-09-05T00:00:00Z)';
+    '[catalog] decoy-opencanary-interaction: Something connected to a decoy (now-1440m → now)';
+  const TITLE = 'Something connected to a decoy, last 24 h';
 
-  it('drops the machine prefix from a badged catalog row and keeps the window', async () => {
+  it('reads the server title on a catalog row and holds the objective on the hover', async () => {
     vi.mocked(getHunts).mockResolvedValue([
-      kindRow({ id: 'h-c1', objective: STORED, kind: 'triggered' }),
+      kindRow({ id: 'h-c1', objective: STORED, title: TITLE, kind: 'triggered' }),
     ]);
     renderHunts();
-    const cell = await screen.findByText(SHOWN);
+    const cell = await screen.findByText(TITLE);
     expect(screen.queryByText(STORED)).toBeNull();
-    // The full stored objective is one hover away.
     expect(cell.getAttribute('title')).toBe(STORED);
     // The badge is still there to say where the row came from.
     expect(screen.getByTitle(CATALOG_TITLE)).toBeTruthy();
   });
 
-  it('leaves a manual hunt alone even when its text looks like the prefix', async () => {
-    // An analyst can type anything, including this shape. Only a row that
-    // carries the catalog badge is stripped, so the badge and the trimmed
-    // title are never seen apart.
+  it('reads the objective whole when an older server sends no title', async () => {
     vi.mocked(getHunts).mockResolvedValue([
       kindRow({ id: 'h-m1', objective: STORED, kind: 'chat' }),
     ]);
     renderHunts();
     expect(await screen.findByText(STORED)).toBeTruthy();
-    expect(screen.queryByText(SHOWN)).toBeNull();
+    expect(screen.queryByText(TITLE)).toBeNull();
   });
 
   it('shows a catalog row whose objective has no prefix as it is', async () => {
@@ -722,9 +721,9 @@ describe('Hunts header names the kinds under All', () => {
     renderHunts();
     const line = await screen.findByTestId('hunt-stats-line');
     await waitFor(() => expect(line.textContent).toContain('4 hunts'));
-    // The API answers the plain list with agent runs only, so the breakdown
-    // names the three types an agent produces.
-    expect(line.textContent).toContain('(2 manual, 1 scheduled)');
+    // The plain list holds every run, catalog runs included, so the breakdown
+    // names the catalog runs too.
+    expect(line.textContent).toContain('(2 manual, 1 scheduled, 1 catalog)');
     // The manual rows are still unbadged; the line is where they are named.
     expect(screen.queryByText('manual')).toBeNull();
   });
@@ -747,7 +746,7 @@ describe('Hunts header names the kinds under All', () => {
     );
     renderHunts();
     const line = await screen.findByTestId('hunt-stats-line');
-    await waitFor(() => expect(line.textContent).toContain('(1 manual)'));
+    await waitFor(() => expect(line.textContent).toContain('(1 manual, 1 catalog)'));
 
     fireEvent.click(chip('Manual'));
     await waitFor(() => expect(line.textContent).toContain('1 hunt'));
@@ -953,6 +952,7 @@ describe('Hunts list lead rows', () => {
   const LEAD_ROW = {
     id: 'H-LEAD',
     objective: LEAD_OBJECTIVE,
+    title: 'Lead 3 hunt: 10.1.10.21',
     kind: 'lead',
     status: 'complete',
     findingCount: 1,
@@ -980,21 +980,23 @@ describe('Hunts list lead rows', () => {
   // own link in the Started by cell.
   it('names the lead and its entity, and links to the hunt', async () => {
     await show([LEAD_ROW]);
-    const link = await screen.findByRole('link', { name: 'Lead 3 on 10.1.10.21' });
+    const link = await screen.findByRole('link', { name: 'Lead 3 hunt: 10.1.10.21' });
     expect(link.getAttribute('href')).toBe('/hunts/H-LEAD');
     expect(screen.getByRole('link', { name: 'lead 3' }).getAttribute('href')).toBe('/leads/3');
   });
 
   it('keeps the whole objective on the cell for a hover', async () => {
     await show([LEAD_ROW]);
-    const link = await screen.findByRole('link', { name: 'Lead 3 on 10.1.10.21' });
+    const link = await screen.findByRole('link', { name: 'Lead 3 hunt: 10.1.10.21' });
     expect(link.getAttribute('title')).toBe(LEAD_OBJECTIVE);
   });
 
   it('titles a truncated objective on every other row', async () => {
     const objective =
       'Hunt for internal hosts that beacon to rare external IPs in the last 24 h and name the cadence.';
-    await show([{ ...LEAD_ROW, id: 'H2', kind: 'chat', starter: 'analyst', leadId: null, objective }]);
+    await show([
+      { ...LEAD_ROW, id: 'H2', kind: 'chat', starter: 'analyst', leadId: null, objective, title: objective },
+    ]);
     expect((await screen.findByText(objective)).getAttribute('title')).toBe(objective);
   });
 
@@ -1035,23 +1037,66 @@ describe('Hunts list status word', () => {
     expect(await screen.findByText('No telemetry to read')).toBeTruthy();
   });
 
-  it('falls back to the client word when the backend sends none', async () => {
+  it('falls back to the word of lib/labels.ts when the backend sends none', async () => {
     await show({ ...base, outcome: 'gap' });
-    expect(await screen.findByText('No telemetry')).toBeTruthy();
+    expect(await screen.findByText('No threat found, visibility gap')).toBeTruthy();
   });
 
   it('names the gap in the findings tooltip with the one phrase', async () => {
-    await show({ ...base, outcome: 'gap' });
-    const cell = (await screen.findByText('No telemetry')).closest('.grid')!;
-    const findings = within(cell as HTMLElement).getByTitle(
-      /No threat observed · visibility gap/,
-    );
-    expect(findings).toBeTruthy();
+    await show({ ...base, outcome: 'gap', outcome_headline: 'The hunt could not see the DNS logs.' });
+    const cell = (await screen.findByText('No threat found, visibility gap')).closest('.grid')!;
+    const findings = within(cell as HTMLElement).getByTitle(/^No threat found, visibility gap\./);
+    expect(findings.textContent).toBe('—');
     // A gap is a gap in one type of telemetry. "found no telemetry" read as a
     // host with no telemetry at all on a host that shipped host logs.
     const title = findings.getAttribute('title') ?? '';
     expect(title).not.toMatch(/found no telemetry for/);
-    expect(title).toMatch(/The gap finding names the type\./);
+    expect(title).toContain('The hunt could not see the DNS logs.');
+  });
+
+  // The list compared the legacy codes 'failed' and 'gap'. The server sends
+  // the five outcome keys, so a could-not-run row wore the green dot of a
+  // clean hunt and counted its failed query as a finding.
+  it('paints a could-not-run row grey and states no count', async () => {
+    await show({
+      ...base,
+      findingCount: 1,
+      outcome: 'could_not_run',
+      outcome_label: 'Could not run',
+      outcome_headline: 'The grid did not accept a connection.',
+    });
+    const status = await screen.findByTestId('hunt-status');
+    expect(status.textContent).toBe('Could not run');
+    expect(status.getAttribute('data-tone')).toBe('muted');
+    const row = status.closest('.grid') as HTMLElement;
+    const findings = within(row).getByTitle(/^Could not run\./);
+    expect(findings.textContent).toBe('—');
+    expect(findings.getAttribute('title')).toContain('The grid did not accept a connection.');
+  });
+
+  it('paints a threat row red and counts its threat findings', async () => {
+    await show({
+      ...base,
+      findingCount: 2,
+      threatFindingCount: 1,
+      outcome: 'threat_found',
+      outcome_label: 'Threat found',
+    });
+    const status = await screen.findByTestId('hunt-status');
+    expect(status.textContent).toBe('Threat found');
+    expect(status.getAttribute('data-tone')).toBe('danger');
+    expect(within(status.closest('.grid') as HTMLElement).getByText('2 · 1 threat')).toBeTruthy();
+  });
+
+  it('paints a clean row green and a stopped row grey', async () => {
+    await show({ ...base, outcome: 'no_threat', outcome_label: 'No threat found' });
+    expect((await screen.findByTestId('hunt-status')).getAttribute('data-tone')).toBe('ok');
+    cleanup();
+    await show({ ...base, status: 'error', outcome: '' });
+    const stopped = await screen.findByTestId('hunt-status');
+    expect(stopped.textContent).toBe('Could not run');
+    expect(stopped.getAttribute('data-tone')).toBe('muted');
+    expect(stopped.getAttribute('title')).toBe('An error stopped the run before it finished.');
   });
 });
 
@@ -1145,7 +1190,7 @@ describe('Hunts list navigation rule', () => {
     const catalogRow = (await screen.findByText('recorded by the sweep')).closest(
       '.grid',
     ) as HTMLElement;
-    const leadRow = screen.getByText('Lead 5').closest('.grid') as HTMLElement;
+    const leadRow = screen.getByText('started from a lead').closest('.grid') as HTMLElement;
     expect(within(catalogRow).getByTitle(CHIP_CATALOG_RUN).textContent).toBe('catalog');
     expect(within(leadRow).getByTitle(TYPE_LEAD).textContent).toBe('lead');
   });
@@ -1156,13 +1201,14 @@ describe('Hunts list navigation rule', () => {
       kindRow({
         id: 'H2',
         objective: '[lead 5] Investigate 10.1.99.5. The lead formed on two types.',
+        title: 'Lead 5 hunt: 10.1.99.5',
         kind: 'lead',
         starter: 'lead',
         leadId: 5,
       }),
     ]);
     renderHunts();
-    const objective = await screen.findByText('Lead 5 on 10.1.99.5');
+    const objective = await screen.findByText('Lead 5 hunt: 10.1.99.5');
     expect(objective.closest('a')?.getAttribute('href')).toBe('/hunts/H2');
     expect(outsideTheBlocks('lead 5').closest('a')?.getAttribute('href')).toBe('/leads/5');
   });

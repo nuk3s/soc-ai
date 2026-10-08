@@ -20,6 +20,13 @@ exactly like auto-triage: each sampled alert is a full agent investigation, then
 its persisted :class:`Investigation` verdict is read back and compared. A
 single-flight :class:`BacktestStatus` on ``app.state`` drives the background job;
 :func:`start_backtest` plans + launches and never raises.
+
+A replay is a measurement, and the run records it as one: ``started_by`` is
+:data:`soc_ai.store.investigations.BACKTEST_ACTOR`. The store then writes no
+observation for its verdict, so no lead forms. The runner sends no
+notification. The list and the Dashboard leave it out, no other alert inherits
+its verdict, and its recommended actions cannot be executed. The replay runs
+with auto-acknowledge off, so it writes nothing to Security Onion.
 """
 
 from __future__ import annotations
@@ -501,6 +508,21 @@ def _severity_filter(min_severity: str | None) -> dict[str, Any] | None:
 # ---------------------------------------------------------------------------
 
 
+def replay_context(ctx: Any) -> Any:
+    """The investigation context a replay runs with: auto-acknowledge off.
+
+    Auto-acknowledge is the one write the pipeline makes to Security Onion
+    unattended. A replayed false positive would acknowledge an alert an
+    analyst already closed, or one an analyst escalated. The copy leaves the
+    live settings alone, so a sweep that runs beside the backtest keeps the
+    operator's choice.
+    """
+    settings = getattr(ctx, "settings", None)
+    if settings is None or not getattr(settings, "auto_ack_fp_enabled", False):
+        return ctx
+    return replace(ctx, settings=settings.model_copy(update={"auto_ack_fp_enabled": False}))
+
+
 async def _replay_one(state: Any, ctx: Any, sample: BacktestSample) -> str | None:
     """Replay one sampled alert through the agent, return soc-ai's verdict.
 
@@ -509,13 +531,12 @@ async def _replay_one(state: Any, ctx: Any, sample: BacktestSample) -> str | Non
     or ``None`` if the run errored / produced no verdict. Never raises — the
     caller counts a failure and moves on so one bad alert can't abort the run.
     """
-    started_by = "backtest"
     try:
         async for name, _data in run_recorded(
             state,
             ctx=ctx,
             alert_id=sample.alert_es_id,
-            started_by=started_by,
+            started_by=inv_svc.BACKTEST_ACTOR,
             rule_name=sample.rule_name or None,
         ):
             if name == "error":
@@ -524,10 +545,11 @@ async def _replay_one(state: Any, ctx: Any, sample: BacktestSample) -> str | Non
         _LOGGER.exception("backtest: replay failed for alert_id=%s", sample.alert_es_id)
         return None
 
-    # Read the just-recorded verdict back off the Investigation row.
+    # Read the just-recorded verdict back off the Investigation row. The
+    # replays are not in latest_for_alerts: that is the alert's LIVE verdict.
     try:
         async with state.db_sessionmaker() as db:
-            latest = await inv_svc.latest_for_alerts(db, [sample.alert_es_id])
+            latest = await inv_svc.latest_replays_for_alerts(db, [sample.alert_es_id])
     except Exception:
         _LOGGER.exception("backtest: verdict read-back failed for alert_id=%s", sample.alert_es_id)
         return None
@@ -554,7 +576,7 @@ async def run_backtest(
     status = get_status(state)
     rows: list[dict[str, Any]] = []
     try:
-        ctx = ctx_from_state(state)
+        ctx = replay_context(ctx_from_state(state))
         for sample in samples:
             label = sample.rule_name or sample.alert_es_id
             status.current = label

@@ -1295,3 +1295,57 @@ def test_the_needs_you_total_is_the_sum_of_the_two_counts(client: TestClient) ->
         "total": 3,
         "lead_auto_hunt": True,
     }
+
+
+def test_a_hit_lists_the_document_ids_it_counts(client: TestClient) -> None:
+    # W2: a live hit carries no receipts, so "Show evidence" read "No evidence."
+    # over a row that counted three documents. The hit now lists its ids.
+    ids = _seed_three_hits(client)
+    by_id = {h["id"]: h for h in client.get("/api/v1/hunts/hits").json()["hits"]}
+    live = by_id[ids["live"]]
+    assert live["receipts"] is None
+    assert live["document_ids"] == ["d1", "d2", "d3"]
+    assert live["document_count"] == 3
+    # Negative control: a hit that stores no id lists none.
+    assert by_id[ids["read"]]["document_ids"] == []
+
+
+def test_a_hit_with_no_lead_states_the_cause_in_the_rule_numbers(client: TestClient) -> None:
+    # C7: the card said "This hit formed no lead and joined none." The hit
+    # now states the types, the live weight and what a lead needs.
+    ids = _seed_three_hits(client)
+    by_id = {h["id"]: h for h in client.get("/api/v1/hunts/hits").json()["hits"]}
+    reason = by_id[ids["live"]]["no_lead_reason"]
+    assert reason.startswith("One type at weight ")
+    assert reason.endswith("A lead needs 0.85 over 2 types, or 1.50 on one type.")
+    assert by_id[ids["live"]]["dismissed_reason"] is None
+
+
+def test_mark_benign_records_the_reason_and_the_hit_says_so(client: TestClient) -> None:
+    ids = _seed_three_hits(client)
+    res = client.post(
+        f"/api/v1/hunts/observations/{ids['live']}/benign",
+        json={"reason": "known_change", "note": "Windows update."},
+    )
+    assert res.status_code == 200
+    assert res.json()["dismissed_reason"] == "known_change"
+    assert res.json()["dismissed_note"] == "Windows update."
+    # A second mark keeps the first reason.
+    again = client.post(
+        f"/api/v1/hunts/observations/{ids['live']}/benign", json={"reason": "other"}
+    )
+    assert again.status_code == 200 and again.json()["dismissed_reason"] == "known_change"
+    hit = {h["id"]: h for h in client.get("/api/v1/hunts/hits").json()["hits"]}[ids["live"]]
+    assert hit["dismissed_reason"] == "known_change"
+    assert hit["dismissed_at"] is not None
+    # A benign hit counts toward no lead, so it states no weighing.
+    assert hit["no_lead_reason"] is None
+
+
+def test_mark_benign_refuses_a_bad_reason_and_an_unknown_id(client: TestClient) -> None:
+    ids = _seed_three_hits(client)
+    bad = client.post(f"/api/v1/hunts/observations/{ids['live']}/benign", json={"reason": "meh"})
+    assert bad.status_code == 422
+    assert "known_change" in bad.json()["detail"]["hint"]
+    gone = client.post("/api/v1/hunts/observations/999999/benign", json={"reason": "other"})
+    assert gone.status_code == 404

@@ -216,7 +216,7 @@ export function NotificationsPanel({
                     disabled={testing}
                     className="flex-none rounded-[7px] border border-accent px-[11px] py-[5px] text-[11.5px] font-semibold text-accent hover:bg-accent/15 disabled:opacity-50"
                   >
-                    {testing ? 'Sending…' : 'Send test'}
+                    {testing ? 'Sending' : 'Send test'}
                   </button>
                 )}
               </div>
@@ -227,7 +227,7 @@ export function NotificationsPanel({
                     autoComplete="new-password"
                     value={value}
                     onChange={(e) => setValue(e.target.value)}
-                    placeholder="https://hooks.example.com/…"
+                    placeholder="https://hooks.example.com/your-hook"
                     className="w-[300px] rounded-control border border-border-input bg-bg px-3 py-1.5 font-mono text-[12.5px] text-text outline-none focus:border-accent"
                   />
                   <button
@@ -237,7 +237,7 @@ export function NotificationsPanel({
                     disabled={busy || !value.trim()}
                     className="rounded-[7px] border border-accent px-[11px] py-1.5 text-[12px] font-semibold text-accent disabled:opacity-50"
                   >
-                    {busy ? 'Saving…' : 'Save'}
+                    {busy ? 'Saving' : 'Save'}
                   </button>
                   <button
                     onClick={() => {

@@ -1,8 +1,9 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 
 import { ApiError, getEvent, type EventDocument } from '../lib/api';
 import { useAsync } from '../lib/useAsync';
 import { Drawer } from './Drawer';
+import { LoadingInline, Spinner } from './States';
 
 // ---------------------------------------------------------------------------
 // One document from the grid, as the sensor wrote it.
@@ -124,6 +125,27 @@ function Body({ doc }: { doc: EventDocument }) {
   );
 }
 
+/** How long a read runs before the drawer says where the time goes. */
+export const SLOW_READ_MS = 2000;
+
+/** The read in progress. The grid can take 3 to 15 s for one raw event, and a
+ *  still line of text read as a stuck drawer (dogfood 2026-10-06, W3). After
+ *  two seconds a spinner and the source of the wait appear. */
+function SlowRead() {
+  const [slow, setSlow] = useState(false);
+  useEffect(() => {
+    const t = window.setTimeout(() => setSlow(true), SLOW_READ_MS);
+    return () => window.clearTimeout(t);
+  }, []);
+  return slow ? (
+    <span data-testid="document-slow" className="flex items-center gap-2">
+      <Spinner size={13} /> Fetching the raw event from Security Onion
+    </span>
+  ) : (
+    <LoadingInline size={13}>Reading the document</LoadingInline>
+  );
+}
+
 /** The drawer for one document id. `documentId` null keeps it closed and reads
  *  nothing, so a chip can mount it and never fetch until it is clicked. */
 export function DocumentDrawer({
@@ -153,7 +175,7 @@ export function DocumentDrawer({
       header={
         <span className="min-w-0 flex-1">
           <span className="block text-[13.5px] font-semibold">Document</span>
-          <span data-testid="document-id" className="block truncate font-mono text-[11px] text-faint">
+          <span data-testid="document-id" className="block break-all font-mono text-[11px] text-faint">
             {documentId ?? ''}
           </span>
         </span>
@@ -161,7 +183,7 @@ export function DocumentDrawer({
     >
       {!data ? (
         <div className="p-4 text-[12.5px] text-dim">
-          {blank ? NO_ID : doc.error ? (gone ? NOT_FOUND : READ_FAILED) : 'Reading the document…'}
+          {blank ? NO_ID : doc.error ? (gone ? NOT_FOUND : READ_FAILED) : <SlowRead key={documentId} />}
         </div>
       ) : (
         <Body doc={data} />

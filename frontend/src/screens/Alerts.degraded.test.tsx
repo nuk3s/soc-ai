@@ -365,7 +365,7 @@ describe('Alerts telling a quiet grid apart from a filter that matched nothing',
     // the night it means something.
     vi.mocked(getAlertsEmptyReason).mockResolvedValue({
       reason: 'quiet',
-      hint: 'No alert label matches anything in this window. The grid is quiet. The configuration is sound.',
+      hint: 'No alert label matches anything in this window. The grid is quiet.',
     });
     mount();
     await screen.findByText('No open detection in this window. The list hides acknowledged and escalated groups. Widen the time range.');

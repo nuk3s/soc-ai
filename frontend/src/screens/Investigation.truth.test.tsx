@@ -208,7 +208,7 @@ describe('small truths (P16)', () => {
   it('shows no placeholder verdict card while a run is in flight', () => {
     const { container } = mount({ status: 'investigating', verdict: 'untriaged', conf: 0 });
     expect(container.textContent).not.toMatch(/0\.00\s*confidence/i);
-    expect(screen.getByText('Investigating…')).toBeTruthy();
+    expect(screen.getByText('Investigating')).toBeTruthy();
   });
 
   it('picks starter questions that fit the verdict', () => {

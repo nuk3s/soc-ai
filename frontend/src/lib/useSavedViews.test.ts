@@ -22,7 +22,7 @@ vi.mock('./api', async (importOriginal) => ({
   getMe,
 }));
 
-import { useSavedViews } from './useSavedViews';
+import { AUTH_OFF, TOKEN_CALLER, useSavedViews } from './useSavedViews';
 
 const view = (over: Partial<SavedView> = {}): SavedView => ({
   id: 1,
@@ -243,14 +243,32 @@ describe('useSavedViews — the session probe', () => {
     expect(listSavedViews).not.toHaveBeenCalled();
   });
 
-  // The notice tells the reader to sign in. With authentication off there is
-  // nothing to sign in to, so the line was standing advice nobody could take
-  // on four list screens (dogfood 2026-09-17). A refused READ keeps it: there
-  // the advice works.
-  it('says nothing about signing in when there is nobody to sign in as', async () => {
+  // With authentication off the toolbar showed no control and no line, so the
+  // analyst read saved views as a feature the product does not have (dogfood
+  // 2026-10-06, operator 4.1). The line states the cause. It gives no advice
+  // to sign in, because there is nothing to sign in to (dogfood 2026-09-17).
+  it('says why there is no save control on a deployment with authentication off', async () => {
     getMe.mockResolvedValue({ username: 'anonymous', role: 'admin', status: '', signed_in: false });
     const { result } = renderHook(() => useSavedViews('alerts', {}, () => {}));
-    await waitFor(() => expect(result.current.onSaveView).toBeUndefined());
+    await waitFor(() => expect(result.current.unavailable).toBe(AUTH_OFF));
+    expect(result.current.onSaveView).toBeUndefined();
+    expect(AUTH_OFF).toBe(
+      'Saved views need a signed-in session. This deployment has authentication off.',
+    );
+    expect(result.current.unavailable).not.toMatch(/sign in\b/i);
+  });
+
+  it('names the API token when a token caller has no user row', async () => {
+    getMe.mockResolvedValue({ username: 'token:ci', role: 'token', status: '', signed_in: false });
+    const { result } = renderHook(() => useSavedViews('alerts', {}, () => {}));
+    await waitFor(() => expect(result.current.unavailable).toBe(TOKEN_CALLER));
+  });
+
+  it('NEGATIVE CONTROL: a signed-in session keeps the save control and no reason', async () => {
+    getMe.mockResolvedValue({ username: 'analyst', role: 'analyst', status: '', signed_in: true });
+    const { result } = renderHook(() => useSavedViews('alerts', {}, () => {}));
+    await waitFor(() => expect(listSavedViews).toHaveBeenCalled());
+    await waitFor(() => expect(result.current.onSaveView).toBeDefined());
     expect(result.current.unavailable).toBeNull();
   });
 

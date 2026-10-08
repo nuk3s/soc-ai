@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 import { ApiError, getPreflightDetail, refreshPreflight } from '../lib/api';
 import type { PreflightDetail, PreflightRow } from '../lib/types';
 import { absTime, ago } from '../lib/timeRange';
+import { LoadingInline } from './States';
 
 // ---------------------------------------------------------------------------
 // Every doctor row, in the order the doctor writes them.
@@ -66,7 +67,21 @@ function readFailure(e: unknown): string {
   return 'The doctor read failed. The result is unknown. Select Refresh to try again.';
 }
 
-export function DoctorList() {
+/** The WARN rows of a doctor read. The Diagnostics header counts these. */
+export function warnRows(rows: PreflightRow[]): PreflightRow[] {
+  return rows.filter((r) => r.status.toUpperCase() === 'WARN');
+}
+
+export function DoctorList({
+  warnOnly = false,
+  onRows,
+}: {
+  /** Show the WARN rows only. The "2 warnings" chip in the Diagnostics header
+   *  sets it, because 2 WARN rows sat among 31 (dogfood 2026-10-06). */
+  warnOnly?: boolean;
+  /** Called with the rows of each read, so the header can count them. */
+  onRows?: (rows: PreflightRow[]) => void;
+} = {}) {
   const [detail, setDetail] = useState<PreflightDetail | null>(null);
   const [failed, setFailed] = useState<string | null>(null);
   const [busy, setBusy] = useState(true);
@@ -102,6 +117,12 @@ export function DoctorList() {
   };
 
   const rows = detail?.rows ?? [];
+  useEffect(() => {
+    if (detail) onRows?.(detail.rows);
+    // onRows is a setter from the caller. A new closure must not read again.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detail]);
+  const shown = warnOnly ? warnRows(rows) : rows;
   return (
     <div data-testid="doctor-list" className="border-t border-border-faint">
       <div className="flex flex-wrap items-center gap-2 px-4 py-2.5">
@@ -120,7 +141,7 @@ export function DoctorList() {
           className="flex items-center gap-1 rounded px-2.5 py-1 text-[11.5px] font-medium border border-border bg-surface-2 hover:bg-surface-3 transition-colors disabled:opacity-60"
         >
           <RotateCw size={11} />
-          {busy ? 'Reading…' : 'Refresh'}
+          {busy ? 'Reading' : 'Refresh'}
         </button>
       </div>
       {failed && (
@@ -129,14 +150,17 @@ export function DoctorList() {
         </div>
       )}
       {!detail && !failed && busy && (
-        <div className="px-4 pb-3 text-[12px] text-dim">Reading the doctor rows…</div>
+        <div className="px-4 pb-3 text-[12px] text-dim"><LoadingInline>Reading the doctor rows</LoadingInline></div>
       )}
       {detail && rows.length === 0 && (
         <div className="px-4 pb-3 text-[12px] text-dim">The doctor returned no row.</div>
       )}
-      {rows.length > 0 && (
+      {warnOnly && detail && shown.length === 0 && (
+        <div className="px-4 pb-3 text-[12px] text-dim">No row is WARN.</div>
+      )}
+      {shown.length > 0 && (
         <ul className="divide-y divide-border-faint border-t border-border-faint">
-          {rows.map((r, i) => {
+          {shown.map((r, i) => {
             const grade = gradeOf(r.status);
             return (
               <li

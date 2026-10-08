@@ -179,6 +179,8 @@ describe('TemplatePicker three-state catalogue', () => {
       'Hunt for lateral movement.',
       undefined,
       THREE[2].id,
+      // The range the dialog offers. Unset, the objective states its own.
+      undefined,
     );
     expect(await screen.findByText('HUNT DETAIL')).toBeTruthy();
   });
@@ -302,6 +304,8 @@ describe('TemplatePicker starter analytics', () => {
       'Hunt for credential abuse.',
       undefined,
       withAnalytics.id,
+      // The range the dialog offers. Unset, the objective states its own.
+      undefined,
     );
     expect(await screen.findByText('HUNT DETAIL')).toBeTruthy();
   });

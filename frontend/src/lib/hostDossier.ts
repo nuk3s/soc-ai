@@ -432,6 +432,64 @@ export function relativeAge(iso: string | null | undefined, now = Date.now()): s
   return `${Math.round(days / 365.25)}y ago`;
 }
 
+// ---- plain words for the analyst --------------------------------------------
+
+/** Dataset names the sweep writes into its evidence, in the analyst's words.
+ *  "1,261 zeek.conn records" named a log field that an analyst who never ran
+ *  Zeek does not know (dogfood 2026-10-06). */
+const DATASET_WORDS: [RegExp, string][] = [
+  [/\bzeek\.conn records\b/g, 'network connection records'],
+  [/\bzeek\.conn\b/g, 'network connections'],
+  [/\bzeek\.dns\b/g, 'DNS lookups'],
+  [/\bzeek\.dhcp\b/g, 'DHCP leases'],
+  [/\bzeek\.ssl\b/g, 'TLS sessions'],
+  [/\bzeek\.x509\b/g, 'TLS certificates'],
+  [/\bzeek\.http\b/g, 'HTTP requests'],
+  [/\bzeek\.ssh\b/g, 'SSH sessions'],
+  [/\bzeek\.kerberos\b/g, 'Kerberos tickets'],
+  [/\bzeek\.ntlm\b/g, 'NTLM logons'],
+  [/\bzeek\.smb_[a-z_]+\b/g, 'SMB activity'],
+  [/\bzeek\.software\b/g, 'software banners'],
+  [/\bzeek\.[a-z_]+\b/g, 'network records'],
+  [/\bsuricata\.alert\b/g, 'IDS alerts'],
+];
+
+/** One evidence line with the dataset names in plain words. */
+export function plainEvidence(text: string): string {
+  return DATASET_WORDS.reduce((out, [pattern, words]) => out.replace(pattern, words), text);
+}
+
+/** "confidence 0.50 of 1.00, too low to assert": the number with its scale
+ *  and what it means here. A bare "confidence 0.50" said nothing about what
+ *  counts as high (dogfood 2026-10-06). */
+export function confidencePhrase(confidence: number): string {
+  const word = confidence >= 0.85 ? 'high' : confidence >= 0.6 ? 'medium' : 'low';
+  return `confidence ${confidence.toFixed(2)} of 1.00, ${word}`;
+}
+
+/** The newer of two ISO stamps, either of which may be absent. The machine
+ *  header and the primary row of the address table both read it, so the two
+ *  state one last-seen time (dogfood 2026-10-06, S4). */
+export function newerStamp(a: string | null | undefined, b: string | null | undefined): string | null {
+  if (!a) return b ?? null;
+  if (!b) return a;
+  return new Date(a).getTime() >= new Date(b).getTime() ? a : b;
+}
+
+/** "4 days ago", "5 hours ago", "12 minutes ago": an age in words, for a
+ *  sentence. */
+export function ageInWords(iso: string | null | undefined, now = Date.now()): string | null {
+  if (!iso) return null;
+  const ms = now - new Date(iso).getTime();
+  if (!Number.isFinite(ms)) return null;
+  const minutes = Math.max(0, Math.round(ms / 60_000));
+  if (minutes < 60) return minutes <= 1 ? 'a minute ago' : `${minutes} minutes ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return hours === 1 ? '1 hour ago' : `${hours} hours ago`;
+  const days = Math.round(hours / 24);
+  return `${days} days ago`;
+}
+
 // ---- the identity sentence --------------------------------------------------
 
 export interface SentencePart {
@@ -461,6 +519,33 @@ export function scalarOf(fields: DossierFieldBrief[], name: DossierFieldName): s
   if (!f || !isResolved(f)) return null;
   const v = (f.value ?? '').trim();
   return v.length > 0 ? v : null;
+}
+
+/** The sweep's guess under a withheld field: older than the staleness window,
+ *  or below the confidence gate. Null for a resolved field, a declaration, or
+ *  no guess. The identity sentence and the facts counter read it, so a rich
+ *  agent host whose evidence went old no longer reads "0 of 12 facts" and
+ *  "Nothing else is known" (dogfood 2026-10-06). */
+export function guessOf(fields: DossierFieldBrief[], name: DossierFieldName): string | null {
+  const f = fieldOf(fields, name);
+  if (!f || isResolved(f) || f.overridden) return null;
+  if (f.reason !== 'stale' && f.reason !== 'low_confidence') return null;
+  const v = (f.inferred_value ?? '').trim();
+  return v && v.toLowerCase() !== 'unknown' ? v : null;
+}
+
+/** The fields the resolver withheld that still hold a guess. */
+export function withheldFacts<T extends DossierFieldBrief>(fields: T[]): T[] {
+  return fields.filter((f) => guessOf(fields, f.field) != null);
+}
+
+/** "5 of 12 facts · 3 from old or weak evidence". The counter counted the
+ *  confirmed facts alone and read "0 of 12" on a rich agent host. */
+export function factsCounter(fields: DossierFieldBrief[]): string {
+  const known = fields.filter((f) => isResolved(f)).length;
+  const withheld = withheldFacts(fields).length;
+  const head = `${known + withheld} of ${fields.length} facts`;
+  return withheld > 0 ? `${head} · ${withheld} from old or weak evidence` : head;
 }
 
 const startsWithVowel = (word: string): boolean => /^[aeiou]/i.test(word);
@@ -508,15 +593,33 @@ export function identitySentence(
   // from the strongest source on any address; the primary address's own
   // hostname field may be empty while the agent names the box.
   name?: string | null,
+  // True when the page holds other facts about the host: an open lead or an
+  // alert verdict. "Nothing else is known" is then false, and the sentence
+  // says only that the identity is unknown (dogfood 2026-10-06, S3).
+  //
+  // `os` is the agent's own report of the system, for a machine whose OS
+  // fields hold nothing.
+  opts: { othersKnown?: boolean; os?: string | null } = {},
 ): SentencePart[] {
   const { fields } = host;
-  const subject = (name ?? '').trim() || scalarOf(fields, 'hostname') || host.ip;
+  // A withheld guess counts too, with a sentence that says so. The page
+  // read "Nothing else is known" two lines under a header that named the
+  // OS and the role (dogfood 2026-10-06).
+  let guessed = false;
+  const read = (field: DossierFieldName): string | null => {
+    const value = scalarOf(fields, field);
+    if (value) return value;
+    const guess = guessOf(fields, field);
+    if (guess) guessed = true;
+    return guess;
+  };
+  const subject = (name ?? '').trim() || read('hostname') || host.ip;
   const parts: SentencePart[] = [{ text: subject, strong: true }];
 
   type Clause = SentencePart[];
   const clauses: Clause[] = [];
 
-  const rawRole = scalarOf(fields, 'role');
+  const rawRole = read('role');
   const role = rawRole && rawRole.toLowerCase() !== 'unknown' ? roleLabel(rawRole) : null;
   if (role) {
     clauses.push([
@@ -525,15 +628,19 @@ export function identitySentence(
     ]);
   }
 
-  const osDetail = scalarOf(fields, 'os_detail');
-  const osFamily = scalarOf(fields, 'os_family');
-  const os = osDetail ?? (osFamily ? OS_FAMILY_LABELS[osFamily.toLowerCase()] ?? osFamily : null);
+  const osDetail = read('os_detail');
+  const osFamily = osDetail ? null : read('os_family');
+  const agentOs = (opts.os ?? '').trim() || null;
+  const os =
+    osDetail ??
+    (osFamily ? OS_FAMILY_LABELS[osFamily.toLowerCase()] ?? osFamily : null) ??
+    agentOs;
   if (os) clauses.push([{ text: 'running ' }, { text: os, strong: true }]);
 
-  const domain = scalarOf(fields, 'domain_membership');
+  const domain = read('domain_membership');
   if (domain) clauses.push([{ text: 'joined to ' }, { text: domain, strong: true }]);
 
-  const addressing = scalarOf(fields, 'is_static_addressed');
+  const addressing = read('is_static_addressed');
   if (addressing === 'yes') clauses.push([{ text: 'at a fixed address' }]);
   else if (addressing === 'no') clauses.push([{ text: 'on a DHCP-assigned address' }]);
 
@@ -555,7 +662,11 @@ export function identitySentence(
   }
 
   if (clauses.length === 0) {
-    parts.push({ text: ' has appeared on the network. Nothing else is known about it yet.' });
+    parts.push({
+      text: opts.othersKnown
+        ? ' has no known role or system yet.'
+        : ' has appeared on the network. Nothing else is known about it yet.',
+    });
     return parts;
   }
 
@@ -569,6 +680,7 @@ export function identitySentence(
     parts.push(...clause);
   });
   parts.push({ text: '.' });
+  if (guessed) parts.push({ text: ' Part of this rests on old or weak evidence.' });
   return parts;
 }
 

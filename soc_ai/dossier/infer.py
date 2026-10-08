@@ -195,9 +195,8 @@ _PROTO = "tcp"
 _MAX_SERVICES = 20
 # Hostnames shorter than this are parsing artifacts, not names.
 _HOSTNAME_MIN_LEN = 3
-# Raw signal strings (User-Agents especially) are long; a conflict string has to
-# stay readable in a prompt block and a UI chip.
-_MAX_SIGNAL_CHARS = 80
+# A conflict string names each raw signal whole. A User-Agent is long, and the
+# console wraps it. The prompt block bounds its own values (dossier.prompt).
 
 # A UUID/GUID as the entire first label — Windows/Apple mDNS/LLMNR per-device
 # names ("05bc0f86-f13e-4904-a92b-11dee17856a1.local" or the bare GUID). Same
@@ -1412,14 +1411,8 @@ def _os_conflict(winner: _OsCandidate, candidates: Sequence[_OsCandidate]) -> st
     ]
     if not losers:
         return None
-    sides = " vs ".join(
-        f"{c.label}={c.family or 'mixed'} ({_truncate(c.signal)})" for c in (winner, *losers)
-    )
+    sides = " vs ".join(f"{c.label}={c.family or 'mixed'} ({c.signal})" for c in (winner, *losers))
     return f"OS family disagreement: {sides}"
-
-
-def _truncate(text: str) -> str:
-    return text if len(text) <= _MAX_SIGNAL_CHARS else text[:_MAX_SIGNAL_CHARS] + "..."
 
 
 # ---------------------------------------------------------------------------

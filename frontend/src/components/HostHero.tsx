@@ -9,7 +9,8 @@
 // keeps answering while Security Onion is unreachable; the live half of the
 // page is fetched separately and degrades on its own.
 
-import { Server } from 'lucide-react';
+import { Info, Server } from 'lucide-react';
+import { Link } from 'react-router-dom';
 import { cn } from '../lib/cn';
 import { provenanceChip, roleAccent, roleRail } from '../lib/hostColors';
 import {
@@ -18,10 +19,12 @@ import {
   isResolved,
   machineRoleView,
   nameSourceTitle,
+  newerStamp,
   relativeAge,
   roleLabel,
   selfReportedFields,
 } from '../lib/hostDossier';
+import type { SituationLine } from '../lib/hostSituation';
 import { absTime } from '../lib/timeRange';
 import type { Dossier, MachineDetail, MachineNameSource } from '../lib/types';
 
@@ -38,14 +41,41 @@ export interface HostHeroProps {
    *  ago" beside 55,665 connections in 24 h read the sweep's stamp as the
    *  host's. The newer of the two wins. */
   lastActivity?: string | null;
+  /** The open leads and the alert verdicts of the last seven days, as
+   *  sentences. They lead the hero, above the identity sentence. */
+  situation?: SituationLine[];
 }
 
-/** The newer of two ISO stamps, either of which may be absent. */
-function newer(a: string | null | undefined, b: string | null | undefined): string | null {
-  if (!a) return b ?? null;
-  if (!b) return a;
-  return new Date(a).getTime() >= new Date(b).getTime() ? a : b;
+/**
+ * What waits on this host and what the verdicts found, before what the host
+ * is. A host with a hunted lead opened on "Nothing else is known about it
+ * yet." (dogfood 2026-10-06, S3).
+ */
+function Situation({ lines }: { lines: SituationLine[] }) {
+  if (lines.length === 0) return null;
+  return (
+    <ul data-testid="host-situation" className="mt-2.5 max-w-[860px] text-[14px] leading-[1.65]">
+      {lines.map((line) => (
+        <li
+          key={line.text}
+          data-tone={line.tone}
+          className={cn('font-semibold', line.tone === 'alarm' ? 'text-danger' : 'text-text')}
+        >
+          {line.to ? (
+            <Link to={line.to} className="hover:underline">
+              {line.text}
+            </Link>
+          ) : (
+            line.text
+          )}
+        </li>
+      ))}
+    </ul>
+  );
 }
+
+/** The newer of two ISO stamps. One rule with the address table. */
+const newer = newerStamp;
 
 const NAME_SOURCE_PHRASES: Record<MachineNameSource, string> = {
   declared: 'name declared by an operator',
@@ -66,15 +96,20 @@ function MachineHero({
   dossier,
   adminBlocked,
   lastActivity,
+  situation = [],
 }: {
   machine: MachineDetail;
   dossier: Dossier;
   adminBlocked: boolean;
   lastActivity?: string | null;
+  situation?: SituationLine[];
 }) {
   const lastSeen = newer(machine.last_seen, lastActivity);
   const role = machineRoleView(machine.role);
-  const sentence = identitySentence(dossier, machine.name);
+  const sentence = identitySentence(dossier, machine.name, {
+    othersKnown: situation.length > 0,
+    os: machine.agent?.os,
+  });
   const source = machine.name_source ? NAME_SOURCE_PHRASES[machine.name_source] : null;
   const others = Math.max(0, machine.addresses.length - 1);
   return (
@@ -121,12 +156,15 @@ function MachineHero({
                 data-testid="hero-role"
                 title={role.title}
                 className={cn(
-                  'inline-flex flex-none items-center gap-1.5 rounded-pill border px-2.5 py-[3px] font-mono text-[11.5px] font-semibold',
+                  'inline-flex flex-none cursor-help items-center gap-1.5 rounded-pill border px-2.5 py-[3px] font-mono text-[11.5px] font-semibold',
                   roleAccent(role.accent),
                 )}
               >
                 {role.text}
                 <span className="font-sans text-[10px] font-normal opacity-80">{role.note}</span>
+                {/* The mark says the chip has more to say on hover (dogfood
+                    2026-10-06). */}
+                <Info size={10} aria-hidden="true" data-testid="hero-role-more" className="opacity-70" />
               </span>
             ) : role.state === 'unknown' ? (
               <span
@@ -140,9 +178,10 @@ function MachineHero({
               <span
                 data-testid="hero-role"
                 title={role.title}
-                className="inline-flex flex-none items-center rounded-pill border border-warn/40 bg-warn/[0.08] px-2.5 py-[3px] font-mono text-[11.5px] font-semibold text-warn"
+                className="inline-flex flex-none cursor-help items-center gap-1.5 rounded-pill border border-warn/40 bg-warn/[0.08] px-2.5 py-[3px] font-mono text-[11.5px] font-semibold text-warn"
               >
                 {role.text}
+                <Info size={10} aria-hidden="true" data-testid="hero-role-more" className="opacity-70" />
               </span>
             )}
           </div>
@@ -184,6 +223,8 @@ function MachineHero({
           )}
         </div>
 
+        <Situation lines={situation} />
+
         <p data-testid="host-sentence" className="mt-2.5 max-w-[860px] text-[14px] leading-[1.65] text-text-2">
           {sentence.map((part, i) =>
             part.strong ? (
@@ -221,7 +262,7 @@ function MachineHero({
   );
 }
 
-export function HostHero({ dossier, machine, adminBlocked, lastActivity }: HostHeroProps) {
+export function HostHero({ dossier, machine, adminBlocked, lastActivity, situation }: HostHeroProps) {
   if (machine) {
     return (
       <MachineHero
@@ -229,13 +270,21 @@ export function HostHero({ dossier, machine, adminBlocked, lastActivity }: HostH
         dossier={dossier}
         adminBlocked={adminBlocked}
         lastActivity={lastActivity}
+        situation={situation}
       />
     );
   }
-  return <AddressHero dossier={dossier} adminBlocked={adminBlocked} lastActivity={lastActivity} />;
+  return (
+    <AddressHero
+      dossier={dossier}
+      adminBlocked={adminBlocked}
+      lastActivity={lastActivity}
+      situation={situation}
+    />
+  );
 }
 
-function AddressHero({ dossier, adminBlocked, lastActivity }: HostHeroProps) {
+function AddressHero({ dossier, adminBlocked, lastActivity, situation = [] }: HostHeroProps) {
   const lastSeen = newer(dossier.last_seen, lastActivity);
   const hostnameField = dossier.fields.find((f) => f.field === 'hostname');
   const roleField = dossier.fields.find((f) => f.field === 'role');
@@ -243,7 +292,7 @@ function AddressHero({ dossier, adminBlocked, lastActivity }: HostHeroProps) {
     hostnameField && isResolved(hostnameField) ? (hostnameField.value ?? '').trim() || null : null;
   const role = roleField && isResolved(roleField) ? (roleField.value ?? '').trim() || null : null;
   const selfReported = selfReportedFields(dossier.fields);
-  const sentence = identitySentence(dossier);
+  const sentence = identitySentence(dossier, null, { othersKnown: situation.length > 0 });
 
   return (
     <section
@@ -330,6 +379,8 @@ function AddressHero({ dossier, adminBlocked, lastActivity }: HostHeroProps) {
             )}
           </div>
         </div>
+
+        <Situation lines={situation} />
 
         {/* The composed answer. Bold nouns, plain connective tissue. */}
         <p data-testid="host-sentence" className="mt-2.5 max-w-[860px] text-[14px] leading-[1.65] text-text-2">

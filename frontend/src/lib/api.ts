@@ -30,6 +30,7 @@ import type {
   DossierSortKey,
   DossierSummary,
   EntityDetail,
+  EntitySearchHit,
   HostActivity,
   HostActivityRange,
   HuntBulkDeleteResult,
@@ -52,6 +53,8 @@ import type {
   PreflightSummary,
   RehuntResult,
   RepresentativeOut,
+  DashboardLayoutPanel,
+  DashboardLayoutWire,
   SavedView,
   SavedViewQuery,
   SavedViewScreen,
@@ -74,11 +77,12 @@ function post<T>(path: string, body?: unknown, opts?: RequestOpts): Promise<T> {
 }
 
 /** JSON-body PUT helper. */
-function put<T>(path: string, body?: unknown): Promise<T> {
+function put<T>(path: string, body?: unknown, opts?: RequestOpts): Promise<T> {
   return request<T>(path, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),
+    ...opts,
   });
 }
 
@@ -463,6 +467,10 @@ export interface InvestigationListQuery {
    *  Omitted means the whole set. The Dashboard tile and the list it deep-links
    *  to send the same value, which is what stops the two disagreeing. */
   errorState?: string;
+  /** Put the backtest replays into the rows and the figures. The server
+   *  leaves them out by default: a replay measures the model on an alert an
+   *  analyst already closed, and the list counts live work. */
+  includeBacktest?: boolean;
   limit?: number;
   offset?: number;
 }
@@ -476,6 +484,7 @@ export function listInvestigations(q: InvestigationListQuery = {}): Promise<Inve
   if (q.status?.length) p.set('status', q.status.join(','));
   if (q.q?.trim()) p.set('q', q.q.trim());
   if (q.errorState) p.set('error_state', q.errorState);
+  if (q.includeBacktest) p.set('include_backtest', 'true');
   if (q.limit != null) p.set('limit', String(q.limit));
   if (q.offset != null) p.set('offset', String(q.offset));
   const qs = p.toString();
@@ -605,8 +614,17 @@ export function draftInvestigationDetection(invId: string): Promise<SigmaDraft> 
  * unknown entity resolves with an empty timeline (200), not an error.
  * ``value`` may contain dots (IPs) — encoded so the path param captures it whole.
  */
-export function getEntity(value: string): Promise<EntityDetail> {
-  return request<EntityDetail>(`/entity/${encodeURIComponent(value)}`);
+export function getEntity(value: string, type?: string | null): Promise<EntityDetail> {
+  const hint = type ? `?type=${encodeURIComponent(type)}` : '';
+  return request<EntityDetail>(`/entity/${encodeURIComponent(value)}${hint}`);
+}
+
+/** The palette's server half: users, domains, addresses no machine holds,
+ *  and hunts. Machines come from `listMachines`. */
+export function searchEntityIndex(q: string): Promise<{ q: string; hits: EntitySearchHit[] }> {
+  return request<{ q: string; hits: EntitySearchHit[] }>(
+    `/search/entities?q=${encodeURIComponent(q)}`,
+  );
 }
 
 /**
@@ -627,6 +645,7 @@ export function startHuntConsole(
   objective: string,
   priorHuntId?: string,
   templateId?: number,
+  rangeDays?: number,
 ): Promise<{ hunt_id: string }> {
   return post<{ hunt_id: string }>(
     '/hunts/chat',
@@ -636,9 +655,26 @@ export function startHuntConsole(
       // The starter the objective came from. The server reads it for the
       // analytics that starter names, and renders them into the objective.
       template_id: templateId ?? null,
+      // The time range the analyst chose, in days. The server states it in
+      // the objective. Absent, the objective states its own range.
+      ...(rangeDays ? { range_days: rangeDays } : {}),
     },
     { timeoutMs: RUN_START_TIMEOUT_MS, timeoutNote: HUNT_START_NOTE },
   );
+}
+
+/** What the New hunt dialog states before a hunt starts: how far back the
+ *  grid answers, and how long recent hunts took. The run time is null below
+ *  five finished hunts. */
+export interface HuntComposer {
+  max_range_days: number;
+  run_minutes_low: number | null;
+  run_minutes_high: number | null;
+  run_sample: number;
+}
+
+export function getHuntComposer(): Promise<HuntComposer> {
+  return request<HuntComposer>('/hunts/composer');
 }
 
 /** Cancel an in-flight Hunt Console hunt (marks it cancelled). */
@@ -1793,9 +1829,33 @@ export function clearHostChat(ip: string): Promise<ChatThread> {
   return del<ChatThread>(`/dossiers/${encodeURIComponent(ip)}/chat`);
 }
 
+// ── The lead page chat ──────────────────────────────────────────────────────
+// One SHARED thread per lead ("lead:<id>" server-side), the host chat's shape.
+
+/** This lead's shared thread; also the poll target while a turn runs. */
+export function getLeadChat(id: string | number): Promise<ChatThread> {
+  return request<ChatThread>(`/hunts/leads/${encodeURIComponent(String(id))}/chat`);
+}
+
+/** Ask about this lead. 409 while a turn is already in flight on its thread. */
+export function postLeadChat(id: string | number, message: string): Promise<ChatThread> {
+  return post<ChatThread>(`/hunts/leads/${encodeURIComponent(String(id))}/chat`, { message });
+}
+
+/** Discard this lead's thread (this lead's only). Resolves with it empty. */
+export function clearLeadChat(id: string | number): Promise<ChatThread> {
+  return del<ChatThread>(`/hunts/leads/${encodeURIComponent(String(id))}/chat`);
+}
+
 /** Apply a validated chat verdict proposal. */
 export function resolveInvestigation(invId: string, messageId: number, token: string): Promise<unknown> {
-  return post(`/investigations/${encodeURIComponent(invId)}/resolve`, { message_id: messageId, token });
+  return post(`/investigations/${encodeURIComponent(invId)}/resolve`, { message_id: messageId, token }).then(
+    (answer) => {
+      // A new verdict moves the needs-you count.
+      emitNeedsYouChanged();
+      return answer;
+    },
+  );
 }
 
 /** Manually override a completed investigation's verdict. */
@@ -1804,11 +1864,18 @@ export function overrideVerdict(
   verdict: string,
   rationale?: string,
   confidence?: number,
-): Promise<{ ok: boolean; verdict: string; confidence: number }> {
-  return post(`/investigations/${encodeURIComponent(invId)}/override`, {
-    verdict,
-    rationale: rationale ?? null,
-    confidence: confidence ?? null,
+): Promise<{ ok: boolean; verdict: string; confidence: number; resolvedBy?: string }> {
+  return post<{ ok: boolean; verdict: string; confidence: number; resolvedBy?: string }>(
+    `/investigations/${encodeURIComponent(invId)}/override`,
+    {
+      verdict,
+      rationale: rationale ?? null,
+      confidence: confidence ?? null,
+    },
+  ).then((answer) => {
+    // A new verdict moves the needs-you count.
+    emitNeedsYouChanged();
+    return answer;
   });
 }
 
@@ -1817,13 +1884,70 @@ export interface ExecuteActionResult {
   title: string;
   detail: string;
   error: string | null;
+  /** How many alerts the write reached, when it wrote to alerts. */
+  count?: number | null;
 }
 
-/** Execute one advisory (report-recommended) write action against Security Onion. */
-export function executeAction(invId: string, index: number): Promise<ExecuteActionResult> {
+/** Execute one advisory (report-recommended) write action against Security Onion.
+ *  `scope: 'alert'` is "Acknowledge this alert only". Only an ack reads it. */
+export function executeAction(
+  invId: string,
+  index: number,
+  scope?: 'group' | 'alert',
+): Promise<ExecuteActionResult> {
   return post<ExecuteActionResult>(
     `/investigations/${encodeURIComponent(invId)}/actions/${index}/execute`,
+    scope ? { scope } : undefined,
+  ).then((answer) => {
+    // An executed action leaves the pending-action part of the needs-you count.
+    emitNeedsYouChanged();
+    return answer;
+  });
+}
+
+/** What one recommended action will write, stated before the analyst confirms. */
+export interface ActionScope {
+  tool: string;
+  /** 'group' for a rule-wide ack, 'alert' for this alert, 'case' for a comment. */
+  scope: 'group' | 'alert' | 'case';
+  count: number | null;
+  hosts: number | null;
+  held: number;
+  rangeLabel: string;
+  sentence: string;
+}
+
+export function getActionScope(invId: string, index: number): Promise<ActionScope> {
+  return request<ActionScope>(
+    `/investigations/${encodeURIComponent(invId)}/actions/${index}/scope`,
   );
+}
+
+export interface ActionDismissal {
+  dismissed: boolean;
+  by: string;
+  at: string;
+}
+
+/** Dismiss one recommendation. The server stores the actor and the time. A
+ *  dismissed action leaves the pending-action part of the needs-you count. */
+export function dismissAction(invId: string, index: number): Promise<ActionDismissal> {
+  return post<ActionDismissal>(
+    `/investigations/${encodeURIComponent(invId)}/actions/${index}/dismiss`,
+  ).then((answer) => {
+    emitNeedsYouChanged();
+    return answer;
+  });
+}
+
+/** Undo a dismissal. The action is pending again, and the count says so. */
+export function restoreAction(invId: string, index: number): Promise<ActionDismissal> {
+  return post<ActionDismissal>(
+    `/investigations/${encodeURIComponent(invId)}/actions/${index}/restore`,
+  ).then((answer) => {
+    emitNeedsYouChanged();
+    return answer;
+  });
 }
 
 export function setSetting(
@@ -2091,6 +2215,10 @@ export interface StrandedClaim {
    *  minutes is a request in flight, four days is an alert nobody can
    *  escalate. */
   claimed_at: string;
+  /** The rule and the host of the alert, from its newest investigation. Null
+   *  when no investigation names the alert. Absent on an older server. */
+  rule_name?: string | null;
+  host?: string | null;
 }
 
 /** GET /escalations/stranded — what the escalation ledger is holding that
@@ -2548,6 +2676,11 @@ export interface MachineQuery {
   /** `new`: first seen in the last 7 days. */
   seen?: 'new';
   declared?: 'yes' | 'no';
+  /** `attention`: no clean build, or a clean build past the staleness window.
+   *  `stale`: the second part alone. `broken`: the first part alone. */
+  health?: 'attention' | 'stale' | 'broken';
+  /** `yes`: an operator declaration and the sweep disagree. */
+  conflict?: 'yes';
   limit?: number;
   offset?: number;
 }
@@ -2563,6 +2696,8 @@ export function listMachines(query: MachineQuery = {}): Promise<MachineList> {
   if (query.activity) p.set('activity', query.activity);
   if (query.seen) p.set('seen', query.seen);
   if (query.declared) p.set('declared', query.declared);
+  if (query.health) p.set('health', query.health);
+  if (query.conflict) p.set('conflict', query.conflict);
   if (query.limit != null) p.set('limit', String(query.limit));
   if (query.offset != null) p.set('offset', String(query.offset));
   const qs = p.toString();
@@ -2698,6 +2833,30 @@ export function deleteSavedView(id: number): Promise<{ ok: boolean }> {
   return del<{ ok: boolean }>(`/me/views/${id}`, { skipLoginRedirect: true });
 }
 
+// ── Dashboard layout (per user, server-held) ─────────────────────────────────
+//
+// The same 401 contract as the saved views above: a layout belongs to a user
+// row, so a deployment with authentication off answers 401, and the console
+// keeps the layout in the browser (lib/useDashboardLayout.ts). The opt-out
+// keeps that answer from sending the Dashboard to a login page.
+
+/** This user's Dashboard layout. `panels` is null for the shipped layout. */
+export function getDashboardLayout(): Promise<DashboardLayoutWire> {
+  return request<DashboardLayoutWire>('/me/dashboard-layout', { skipLoginRedirect: true });
+}
+
+/** Keep this user's Dashboard layout, replacing the one before. */
+export function putDashboardLayout(panels: DashboardLayoutPanel[]): Promise<DashboardLayoutWire> {
+  return put<DashboardLayoutWire>('/me/dashboard-layout', { panels }, { skipLoginRedirect: true });
+}
+
+/** Reset this user's Dashboard to the shipped layout. */
+export function deleteDashboardLayout(): Promise<{ ok: boolean; removed: boolean }> {
+  return del<{ ok: boolean; removed: boolean }>('/me/dashboard-layout', {
+    skipLoginRedirect: true,
+  });
+}
+
 // ── Leads (hunting release, phase 2) ─────────────────────────────────────────
 
 export interface LeadObservation {
@@ -2765,6 +2924,35 @@ export interface Lead {
    *  address or a technique with this one. Absent on a route that sends none,
    *  and the row then carries no related chip. */
   related_count?: number;
+  /** Every hunt on record for this lead, and how many of them found a threat.
+   *  The pill read the newest hunt alone. Absent on an older server. */
+  hunt_count?: number;
+  hunt_threat_count?: number;
+  /** The outcome code of the attached hunt: threats, clean, gap or failed.
+   *  `hunt_outcome_label` is the words for it. */
+  hunt_outcome?: string | null;
+  /** True when the lead formed from backtest replays only. A replay is a
+   *  measurement on an alert an analyst already closed, not live evidence. */
+  formed_from_backtest?: boolean;
+}
+
+/** One hunt on a lead, with its answer. The page labelled a hunt by its id
+ *  and gave none of its answer. */
+export interface LeadHunt {
+  id: string;
+  status: string;
+  outcome: string;
+  outcome_label: string;
+  threat_findings: number;
+  /** The steps the hunt page lists. */
+  steps: number;
+  elapsed_sec: number;
+  started_at: string | null;
+  started_by: string;
+  /** The first sentence of the narrative. Empty until the hunt completes. */
+  answer: string;
+  /** One sentence per visibility gap the hunt recorded. */
+  not_checked: string[];
 }
 
 /** One open lead that relates to the lead on screen. Computed on read, so the
@@ -2809,6 +2997,9 @@ export interface LeadObservationDetail extends LeadObservation {
   document_ids?: string[];
   /** The OQL query that shows the departure again. */
   rerun_query?: string | null;
+  /** When an analyst retired the analytic that wrote the row. The row kept
+   *  its shadow chip after a reject, and nothing said the analytic was gone. */
+  analytic_retired_at?: string | null;
 }
 
 /** The live weight of one type on a lead. One type saturates at `cap`, so a
@@ -2841,6 +3032,27 @@ export interface LeadDetail extends Lead {
    *  backend that computes nothing reads as "no related lead", which is an
    *  answer the deployment has not given. */
   related?: RelatedLead[];
+  /** Every hunt on the lead, newest first, each with its answer. Absent on an
+   *  older server, and the page then names the hunt the lead record holds. */
+  hunts?: LeadHunt[];
+  /** The findings of those hunts that an analyst promoted, newest first,
+   *  each with the verdict its investigation reached. */
+  promoted_findings?: LeadPromotedFinding[];
+}
+
+/** One finding of a hunt on the lead that an analyst promoted. The
+ *  investigation reached a verdict, and the lead page said nothing of it. */
+export interface LeadPromotedFinding {
+  investigation_id: string;
+  hunt_id: string;
+  /** The index of the finding in the hunt report. The page names it F1, F2. */
+  finding_ordinal: number;
+  finding_title: string;
+  promoted_by: string;
+  promoted_at: string | null;
+  status: string;
+  verdict: string | null;
+  confidence: number | null;
 }
 
 /** Open leads, newest first, each with the observations that formed it. */
@@ -2902,6 +3114,22 @@ export function promoteLead(id: number): Promise<{ investigation_id: string }> {
   return post<{ investigation_id: string }>(`/hunts/leads/${id}/promote`, {}, {
     timeoutMs: RUN_START_TIMEOUT_MS,
     timeoutNote: INVESTIGATION_START_NOTE,
+  }).then(leadChanged);
+}
+
+/** Close the lead as promoted on the verdict of a promoted hunt finding. The
+ *  lead then names that finding's investigation and leaves Needs you. */
+export function closeLeadAsPromoted(id: number, investigationId: string): Promise<LeadDetail> {
+  return post<LeadDetail>(`/hunts/leads/${id}/close-promoted`, {
+    investigation_id: investigationId,
+  }).then(leadChanged);
+}
+
+/** Keep the lead open over the verdict of a promoted hunt finding. The answer
+ *  is recorded, so the lead page does not ask again. */
+export function keepLeadOpen(id: number, investigationId: string): Promise<LeadDetail> {
+  return post<LeadDetail>(`/hunts/leads/${id}/keep-open`, {
+    investigation_id: investigationId,
   }).then(leadChanged);
 }
 
@@ -2992,6 +3220,20 @@ export interface AnalyticGeneralization {
 }
 
 /** One drafted analytic, already stored as a candidate. */
+/** The draft in words, for the confirm box. The server sends it on a preview. */
+export interface AnalyticDraftReview {
+  title: string;
+  /** The detection as one sentence. */
+  logic: string;
+  false_positives: string[];
+  /** "Source finding: 0 of 3 documents match. They are older than the 30-day
+   *  dry run." null when the check did not run. */
+  source: string | null;
+  /** "This analytic repeats 2 Suricata rules. They raise alerts already."
+   *  null when a clause tests a behaviour of its own. */
+  repeats_alerts: string | null;
+}
+
 export interface AnalyticDraftResult {
   analytic_id: string;
   spec_yaml: string;
@@ -3000,6 +3242,8 @@ export interface AnalyticDraftResult {
   status: string;
   /** null when the first draft described a behaviour. Absent from an older server. */
   generalization?: AnalyticGeneralization | null;
+  /** The draft in words. Absent from an older server and on a save. */
+  review?: AnalyticDraftReview | null;
 }
 
 /** Draft a catalog analytic from one threat hunt finding, by ordinal.
@@ -3116,6 +3360,32 @@ export interface AnalyticHit {
    *  the list, and its title opens no drawer. Absent from an older server,
    *  which reads as true. */
   analytic_exists?: boolean;
+  /** The document ids the hit cites, at most ten. A live hit carries no
+   *  receipts, and these are the documents it counts. */
+  document_ids?: string[];
+  /** Why the hit formed no lead, in the numbers of the formation rule. Null
+   *  on a hit a lead holds and on a hit an analyst marked benign. */
+  no_lead_reason?: string | null;
+  /** An analyst marked the hit benign: the reason, the hand and the time. */
+  dismissed_reason?: string | null;
+  dismissed_by?: string | null;
+  dismissed_at?: string | null;
+}
+
+/** Mark one observation benign with a reason from the dismissal list. The
+ *  observation then counts toward no lead. */
+export function markObservationBenign(
+  id: number,
+  reason: string,
+  note?: string,
+): Promise<{ id: number; dismissed_reason: string; dismissed_by: string }> {
+  return post<{ id: number; dismissed_reason: string; dismissed_by: string }>(
+    `/hunts/observations/${id}/benign`,
+    { reason, note: note ?? null },
+  ).then((answer) => {
+    emitNeedsYouChanged();
+    return answer;
+  });
 }
 
 /** One count per filter chip. A chip states the number it would show. */
@@ -3256,6 +3526,16 @@ export interface AnalyticDetail extends AnalyticRow {
   last_run_at?: string | null;
   /** The setting of the loop that runs this analytic. */
   runner_enabled?: boolean;
+  /** How often that loop runs, in minutes. Absent from an older backend. */
+  sweep_interval_minutes?: number | null;
+  /** The shadow record of an analytic in shadow. null on any other status.
+   *  Absent from an older backend. */
+  shadow_since?: string | null;
+  /** When the shadow week ends: seven days after the shadow began. */
+  shadow_ends_at?: string | null;
+  /** Sweeps and hits since the shadow began. */
+  shadow_sweeps?: number | null;
+  shadow_hits?: number | null;
 }
 
 /** One observation on one entity, from any source. `weight_now` decays with a
@@ -3283,6 +3563,9 @@ export interface EntityObservation {
   statistic?: string | null;
   statistic_value?: number | null;
   baseline_value?: number | null;
+  /** The triage verdict an alert observation records. Null for any other
+   *  source, and absent from an older server. */
+  verdict?: string | null;
 }
 
 export interface EntityObservations {
@@ -3318,6 +3601,34 @@ export function getAnalyticHits(
 /** The count the sidebar badge and the Needs-you strip read. */
 export function getNeedsYou(): Promise<NeedsYou> {
   return request<NeedsYou>('/hunts/needs-you');
+}
+
+/**
+ * What waits on the analyst now, part by part (GET /needs-you).
+ *
+ * The Dashboard tile, the sidebar badges and the bell read this one answer.
+ * A part is null when the server could not read it. `unknown` names those
+ * parts, and `total` is then the sum of the parts it could read.
+ */
+export interface NeedsYouCount {
+  leads_needing_decision: number | null;
+  unread_shadow_hits: number | null;
+  untriaged_groups: number | null;
+  needs_more_info: number | null;
+  pending_actions: number | null;
+  total: number;
+  unknown: string[];
+  /** The window of the alert part, in range words ("7d"). */
+  alert_window: string;
+  /** The window of the two investigation parts ("30d"). */
+  verdict_window: string;
+  /** True when the grid capped the group list, so the alert part is a floor. */
+  alert_floor: boolean;
+}
+
+/** The needs-you count: every part and the total. */
+export function getNeedsYouCount(): Promise<NeedsYouCount> {
+  return request<NeedsYouCount>('/needs-you');
 }
 
 /** Mark one shadow hit read. Opening its receipts is what reads it. */

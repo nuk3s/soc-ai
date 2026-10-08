@@ -1,4 +1,4 @@
-// How hunting flows — the chart behind every definition line.
+// How this flows: the chart behind every definition line.
 //
 // The owner asked for the flow to be visible from the page that runs it. The
 // drawer renders the chart and repeats the five sentences under it, so a reader
@@ -30,7 +30,8 @@ const mount = (onClose = () => {}) =>
 describe('HowThisFlowsDrawer', () => {
   it('names itself and renders the chart at the full width of the drawer', async () => {
     mount();
-    expect(await screen.findByText('How hunting flows')).toBeTruthy();
+    // The drawer and the link read one name for one thing.
+    expect(await screen.findByText('How this flows')).toBeTruthy();
     const chart = screen.getByTestId('hunting-flow-chart');
     expect(chart.getAttribute('src')).toMatch(/hunting-flow\.svg/);
     expect(chart.style.maxWidth).toBe('100%');

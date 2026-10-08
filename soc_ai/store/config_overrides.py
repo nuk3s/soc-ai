@@ -372,14 +372,16 @@ WHITELIST: tuple[SettingSpec, ...] = (
         key="general_chat_enabled",
         attr="general_chat_enabled",
         type="bool",
-        label="Dashboard chat",
+        label="General chat",
         section="Agent",
         hot=True,
         help=(
-            "The Dashboard answers a question in one turn. It proposes a hunt if "
-            "the question needs a sweep. The default is on. Nothing runs until an "
-            "analyst asks. Turn it off to reclaim model capacity and to remove the "
-            "box from the screen. This setting applies live."
+            "Ask soc-ai answers a general question in one turn on any page. It "
+            "proposes a hunt if the question needs a sweep. The default is on. "
+            "Nothing runs until an analyst asks. Turn it off to reclaim model "
+            "capacity. The general scope and the Dashboard card then leave the "
+            "console. The investigation, host, lead and hunt scopes stay on. "
+            "This setting applies live."
         ),
     ),
     SettingSpec(
@@ -750,13 +752,13 @@ WHITELIST: tuple[SettingSpec, ...] = (
         hot=True,
         help=(
             "soc-ai checks each live analytic after every sweep. An analytic that "
-            "writes more hits in 24 hours than its fire budget moves to shadow. An "
-            "analytic whose hunted leads fall below its precision floor over 30 days "
-            "also moves to shadow. The version row records the reason and the "
+            "writes more hits in 24 hours than its daily hit limit moves to shadow. "
+            "An analytic whose hunted leads fall below its minimum precision over 30 "
+            "days also moves to shadow. The version row records the reason and the "
             "numbers, and the bell shows the change. An analyst approves the analytic "
             "to live again. soc-ai never approves or retires an analytic. An analytic "
-            "with no budget and no floor in its spec never moves. This setting "
-            "applies live."
+            "with no daily hit limit and no minimum precision in its spec never "
+            "moves. This setting applies live."
         ),
     ),
     SettingSpec(
@@ -798,12 +800,41 @@ WHITELIST: tuple[SettingSpec, ...] = (
         hot=True,
         help=(
             "This setting is how many lead hunts soc-ai runs at the same time. "
-            "It counts the hunts the loop started. A hunt an analyst started by "
+            "It counts the hunts that auto-hunt started. A hunt an analyst started by "
             "hand does not count. To stop every lead hunt, turn the setting "
             "above off."
         ),
         min_value=1,
         max_value=10,
+    ),
+    SettingSpec(
+        key="hunt_findings_investigate",
+        attr="hunt_findings_investigate",
+        type="bool",
+        label="A hunt investigates its findings",
+        section="Hunting",
+        hot=True,
+        help=(
+            "A hunt opens one investigation for each finding that names an entity "
+            "and cites a document. The hunt is complete when the last investigation "
+            "ends. Off, the hunt completes when its report lands, and an analyst "
+            "opens each investigation by hand. This setting applies live."
+        ),
+    ),
+    SettingSpec(
+        key="hunt_findings_investigate_max",
+        attr="hunt_findings_investigate_max",
+        type="int",
+        label="Findings one hunt investigates",
+        section="Hunting",
+        hot=True,
+        help=(
+            "This setting is the most findings one hunt investigates by itself. "
+            "A finding past the cap waits for an analyst to open its investigation "
+            "by hand. Two investigations of one hunt run at a time."
+        ),
+        min_value=1,
+        max_value=100,
     ),
     SettingSpec(
         key="sigma_authoring_enabled",
@@ -830,9 +861,8 @@ WHITELIST: tuple[SettingSpec, ...] = (
         help=(
             "soc-ai drafts a catalog analytic from a threat hunt finding. It "
             "validates the analytic and runs a dry run over the last 30 days. It "
-            "stores the analytic in the local tier as a candidate. A candidate "
-            "does not run until an analyst moves it to shadow. This setting "
-            "applies live."
+            "stores the analytic in the local tier as a draft. A draft does not "
+            "run until an analyst moves it to shadow. This setting applies live."
         ),
     ),
     SettingSpec(
@@ -1434,10 +1464,11 @@ WHITELIST: tuple[SettingSpec, ...] = (
         section="Behavioural profiles",
         hot=True,
         help=(
-            "The dossier sweep builds a per-host model of normal. The model holds "
-            "the served ports, the peers, the processes, the active hours and the "
-            "connection rate. The role priors and the leads score a departure "
-            "against the model. The default is off until you read a shadow week."
+            "The dossier sweep builds a model of normal activity for each host. The "
+            "model holds the served ports, the peers, the processes, the active "
+            "hours and the connection rate. soc-ai compares new activity with the "
+            "model. A departure from it becomes an observation. The default is off. "
+            "Read a week of shadow observations before you rely on it."
         ),
     ),
     SettingSpec(
@@ -1528,8 +1559,9 @@ WHITELIST: tuple[SettingSpec, ...] = (
             "soc-ai fits a model of the estate once a day. The model groups the "
             "hosts that act alike. It scores each host against the estate. Its "
             "observations stay in shadow. A host with no confident role reads its "
-            "learned group as its peer group. The model needs the ml extra. The "
-            "container image includes it. The default is off."
+            "learned group as its peer group. The model needs an extra package "
+            "your deployment may not have installed. Diagnostics shows whether it "
+            "is present. The container image includes it. The default is off."
         ),
     ),
     SettingSpec(
@@ -1798,8 +1830,8 @@ WHITELIST: tuple[SettingSpec, ...] = (
         hot=True,
         help=(
             "This setting selects the webhook body format. json sends a compact "
-            'generic object. slack sends {"text": …}. matrix sends '
-            '{"msgtype":"m.text","body":…}. Match the format to your receiver.'
+            'generic object. slack sends {"text": "<message>"}. matrix sends '
+            '{"msgtype":"m.text","body":"<message>"}. Match the format to your receiver.'
         ),
     ),
     SettingSpec(

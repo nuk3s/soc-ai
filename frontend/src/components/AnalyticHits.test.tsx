@@ -323,6 +323,8 @@ describe('paging', () => {
 
   it('states the share of the window the list holds', async () => {
     mount();
+    // W1: every hit here is read, so the block opens on one line.
+    fireEvent.click(await screen.findByRole('button', { name: 'Show hits' }));
     await card(1000);
     expect(cardCount()).toBe(50);
     expect(shown()).toBe('50 of 120 hits');
@@ -330,6 +332,8 @@ describe('paging', () => {
 
   it('reads the next page on Show more and keeps the pages before it', async () => {
     mount();
+    // W1: every hit here is read, so the block opens on one line.
+    fireEvent.click(await screen.findByRole('button', { name: 'Show hits' }));
     await card(1000);
     fireEvent.click(screen.getByRole('button', { name: 'Show more' }));
     await waitFor(() => expect(cardCount()).toBe(100));
@@ -360,6 +364,8 @@ describe('paging', () => {
       return { hits: WINDOW.slice(start, start + 50), counts: WINDOW_COUNTS };
     });
     mount();
+    // W1: every hit here is read, so the block opens on one line.
+    fireEvent.click(await screen.findByRole('button', { name: 'Show hits' }));
     await card(1000);
     fireEvent.click(screen.getByRole('button', { name: 'Show more' }));
     await waitFor(() => expect(cardCount()).toBe(99));
@@ -389,6 +395,8 @@ describe('paging', () => {
 
   it('starts a new filter on its first page', async () => {
     mount();
+    // W1: every hit here is read, so the block opens on one line.
+    fireEvent.click(await screen.findByRole('button', { name: 'Show hits' }));
     await card(1000);
     fireEvent.click(screen.getByRole('button', { name: 'Show more' }));
     await waitFor(() => expect(cardCount()).toBe(100));
@@ -415,7 +423,8 @@ describe('the card', () => {
     expect(within(live).getByRole('button', { name: LIVE.analytic_title })).toBeTruthy();
     expect(within(live).getByText('Hit:')).toBeTruthy();
     const entity = within(live).getByText('domainadmin');
-    expect(entity.getAttribute('href')).toBe('/entity/domainadmin');
+    // The user carries its type, so a machine of the same name never opens.
+    expect(entity.getAttribute('href')).toBe('/entity/domainadmin?type=user');
     expect(within(live).getByText('2 documents')).toBeTruthy();
     expect(within(live).getByText(/first seen 6h ago/)).toBeTruthy();
     expect(within(live).getByText(/seen 3 times/)).toBeTruthy();
@@ -719,16 +728,30 @@ describe('a hit whose analytic the catalog no longer lists', () => {
     expect(within(hit).queryByText('shadow')).toBeNull();
   });
 
-  it('names the analytic by its id as text that opens nothing', async () => {
+  // C7: the card showed the slug. A summary with no title leaves the id in
+  // words, and the hover keeps the id.
+  it('names the analytic in words, as text that opens nothing', async () => {
     vi.mocked(getAnalyticHits).mockResolvedValue({ hits: [GONE_LIVE], counts: COUNTS });
     mount();
     const hit = await card(51);
     const title = within(hit).getByTestId('analytic-hit-title');
     expect(title.tagName).toBe('SPAN');
-    expect(title.textContent).toBe('prior-retired-from-the-catalog');
-    expect(
-      within(hit).queryByRole('button', { name: 'prior-retired-from-the-catalog' }),
-    ).toBeNull();
+    expect(title.textContent).toBe('Prior retired from the catalog');
+    expect(title.getAttribute('title')).toBe('Analytic prior-retired-from-the-catalog');
+    expect(within(hit).queryByRole('button', { name: /retired from the catalog/i })).toBeNull();
+  });
+
+  it('reads the title of a removed analytic from the summary the sweep wrote', async () => {
+    vi.mocked(getAnalyticHits).mockResolvedValue({
+      hits: [{ ...GONE_LIVE, summary: 'Defender adjudicates a threat on a server: domainadmin (2 documents)' }],
+      counts: COUNTS,
+    });
+    mount();
+    const hit = await card(51);
+    expect(within(hit).getByTestId('analytic-hit-title').textContent).toBe(
+      'Defender adjudicates a threat on a server',
+    );
+    expect(within(hit).getByText('analytic removed')).toBeTruthy();
   });
 
   it('offers no decision on an analytic that is gone', async () => {

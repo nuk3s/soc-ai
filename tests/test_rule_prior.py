@@ -228,6 +228,25 @@ async def test_one_true_positive_this_week_holds_the_prior(settings_kratos: Sett
     assert (decision.applies, decision.reason) == (False, "non_false_positive_in_window")
 
 
+async def test_a_backtest_replay_never_teaches_the_prior(settings_kratos: Settings) -> None:
+    """A replay measures the model on a closed alert. It is not a run of the rule.
+
+    Three live runs sit in the window; the control counts them. Three replays
+    beside them add nothing, so the prior still sees three.
+    """
+    settings = _settings(settings_kratos)
+    engine, maker = await _store(settings)
+    async with maker() as db:
+        for i in range(3):
+            db.add(_run(i, hours_ago=1 + i))
+        for i in range(3, 6):
+            db.add(_run(i, hours_ago=1 + i, started_by="backtest"))
+        await db.commit()
+    decision = await _decide(maker, settings)
+    await engine.dispose()
+    assert decision.runs_in_window == 3
+
+
 async def test_rule_prior_runs_and_fallbacks_never_count_as_model_runs(
     settings_kratos: Settings,
 ) -> None:

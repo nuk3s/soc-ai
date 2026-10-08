@@ -287,7 +287,7 @@ def test_export_scrubs_a_row_stored_before_the_scrub(client: TestClient) -> None
     canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str)
     assert hashlib.sha256(canonical.encode()).hexdigest() == rec["integrity"]["hash"]
 
-    with patch("soc_ai.api.webui._timeline._alert_currently_acked", AsyncMock(return_value=False)):
+    with patch("soc_ai.api.webui._timeline._alert_ack_state", AsyncMock(return_value=None)):
         detail = client.get(f"/api/v1/investigations/{inv_id}")
     assert detail.status_code == 200
     d = detail.json()

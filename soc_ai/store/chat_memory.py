@@ -228,8 +228,9 @@ def _snippet(content: str, *, max_chars: int = _SNIPPET_CHARS) -> str:
 
     Mirrors the E4.2 rationale digest: whitespace (incl. newlines) collapses to
     single spaces so one snippet is one prompt line; over-long text is cut at
-    the last WORD BOUNDARY at or before ``max_chars`` and marked with an
-    ellipsis (a mid-word fragment reads like corruption). Falls back to a hard
+    the last WORD BOUNDARY at or before ``max_chars`` and marked with
+    ``[truncated]`` (a mid-word fragment reads like corruption; the owner
+    banned the ellipsis on 2026-10-07). Falls back to a hard
     cut only when the boundary would discard more than half the budget (one
     enormous unbroken token, e.g. a pasted base64 blob).
     """
@@ -239,7 +240,7 @@ def _snippet(content: str, *, max_chars: int = _SNIPPET_CHARS) -> str:
     cut = collapsed.rfind(" ", 0, max_chars + 1)
     if cut < max_chars // 2:
         cut = max_chars
-    return collapsed[:cut].rstrip() + "…"
+    return collapsed[:cut].rstrip() + " [truncated]"
 
 
 async def relevant_chat_snippets(

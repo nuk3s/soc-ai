@@ -116,7 +116,7 @@ describe('Dashboard setup-health card', () => {
     expect(screen.getByText(/all checks pass/i)).toBeTruthy();
   });
 
-  it('shows a distinct errored state on a persistently rejecting preflight read, not an endless "Checking…"', async () => {
+  it('shows a distinct errored state on a persistently rejecting preflight read, not an endless "Checking"', async () => {
     // Pins the calm-looking-hang regression: `!summary` alone used to render
     // "Checking setup health…" forever on a getPreflight that rejects (500,
     // a proxy 504, an old backend without this route) rather than merely

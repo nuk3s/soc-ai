@@ -144,7 +144,11 @@ async def test_a_weekly_limit_500_is_a_quota_gateway_error_with_its_message() ->
     # Secret-scrubbed: the configured key, the bearer token and a credential value.
     assert GATEWAY_KEY not in failure["message"]
     assert "hunter2-planted" not in failure["message"]
-    assert len(failure["message"]) <= failures.MESSAGE_LIMIT
+    # The message is whole and carries no ellipsis: its first and last words survive.
+    assert failure["message"].startswith("litellm.InternalServerError")
+    assert "Received Authorization: Bearer" in failure["message"]
+    assert "password=" in failure["message"]
+    assert "…" not in failure["message"] and not failure["message"].endswith("...")
 
 
 async def test_a_200_with_prose_is_the_only_unparseable_answer() -> None:

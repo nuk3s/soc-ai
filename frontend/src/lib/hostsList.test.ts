@@ -24,8 +24,23 @@ describe('the list URL', () => {
       activity: 'active',
       seen: '',
       declared: '',
+      health: '',
+      conflict: '',
       page: 1,
     });
+  });
+
+  it('reads the health and conflict filters, and drops a value it does not know', () => {
+    // Dogfood 2026-10-06: each part of Needs attention, and the Conflicts
+    // card, is a filter on the machine list.
+    const state = readListState(new URLSearchParams('health=stale&conflict=yes'));
+    expect(state.health).toBe('stale');
+    expect(state.conflict).toBe('yes');
+    expect(machineQuery(state)).toMatchObject({ health: 'stale', conflict: 'yes' });
+    // NEGATIVE CONTROL: a value the API would refuse reads as the default.
+    const odd = readListState(new URLSearchParams('health=sideways&conflict=maybe'));
+    expect(odd.health).toBe('');
+    expect(odd.conflict).toBe('');
   });
 
   it('round-trips every control', () => {

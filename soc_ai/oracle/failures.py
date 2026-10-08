@@ -56,8 +56,6 @@ _QUOTA_RE = re.compile(
 # name: a bare ``sk-...`` key or a long opaque token after ``Bearer``.
 _TOKEN_RE = re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_\-]{8,}\b|(?<=Bearer )[A-Za-z0-9._\-]{8,}")
 
-MESSAGE_LIMIT = 300
-
 
 def is_quota_message(text: str) -> bool:
     """True when *text* names a usage, rate or weekly limit."""
@@ -99,28 +97,25 @@ def gateway_message(body: str) -> str:
     return text
 
 
-def scrub_message(text: str, *, secrets: tuple[str, ...] = (), limit: int = MESSAGE_LIMIT) -> str:
-    """Secret-scrub and bound a gateway message for the store and the console.
+def scrub_message(text: str, *, secrets: tuple[str, ...] = ()) -> str:
+    """Secret-scrub a gateway message for the store and the console.
 
     Masks credential values (:func:`soc_ai.secret_scrub.scrub_secrets`), bare
     API-key and bearer tokens, and every literal in *secrets* (the configured
-    gateway key). Collapses whitespace and cuts at *limit* characters.
+    gateway key). Collapses whitespace. The message is never cut: the owner
+    banned the ellipsis cut (2026-10-07). The caller bounds the raw body.
     """
     out = scrub_secrets(text or "")
     for secret in secrets:
         if secret and len(secret) >= 6:
             out = out.replace(secret, REDACTED)
     out = _TOKEN_RE.sub(REDACTED, out)
-    out = " ".join(out.split())
-    if len(out) > limit:
-        out = out[: limit - 3].rstrip() + "..."
-    return out
+    return " ".join(out.split())
 
 
 __all__ = [
     "BLOCKED",
     "CLIENT",
-    "MESSAGE_LIMIT",
     "PAUSED",
     "QUOTA",
     "REFUSED",

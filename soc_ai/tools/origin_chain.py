@@ -131,11 +131,13 @@ def _empty(ip: str, lookback_minutes: int) -> dict[str, Any]:
         "inbound_sessions": [],
         "closest_preceding": None,
         "lookback_minutes": lookback_minutes,
+        # Three sentences (dogfood 2026-10-06 K2). The hunt page printed the
+        # summary with an em dash and an aside in parentheses.
         "summary": (
             f"no inbound remote-access sessions to {ip} in the {lookback_minutes} "
-            "minutes before the activity — nothing was observed driving this host, "
-            "so its behavior appears self-originated (or the driving session is not "
-            "covered by current telemetry)"
+            "minutes before the activity. Nothing was observed driving this host. "
+            "Its behavior appears self-originated, or current telemetry does not "
+            "cover the driving session."
         ),
     }
 
@@ -347,8 +349,7 @@ async def origin_chain(  # noqa: PLR0915 - one function reads as one procedure
                 if closest.get("seconds_before") is not None
                 else ""
             )
-            + f" ({closest.get('dataset')}). This host may be a WAYPOINT rather than "
-            "the origin — attribute upstream and pivot on that source before "
-            "blaming this host."
+            + f" ({closest.get('dataset')}). This host can be a WAYPOINT. Look upstream "
+            "and pivot on that source before you blame this host."
         ),
     }

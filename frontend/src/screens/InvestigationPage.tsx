@@ -1,9 +1,10 @@
-import { ChevronLeft, Trash2 } from 'lucide-react';
+import { ChevronLeft, MoreHorizontal, Trash2 } from 'lucide-react';
 import { useRef, useState } from 'react';
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { deleteInvestigation, getInvestigation, isNotFound } from '../lib/api';
 import { useAsync } from '../lib/useAsync';
-import { ErrorState, LoadingState, NotFoundState, StaleNotice } from '../components/States';
+import { ErrorState, LoadingState, NotFoundState, StaleNotice, notFoundTitle } from '../components/States';
+import { useOptionalShell } from '../shell/ShellContext';
 import { Investigation } from './Investigation';
 
 /** Investigation permalink: /investigation/:id — wide workstation layout. */
@@ -31,22 +32,18 @@ export function InvestigationPage() {
     },
   });
   statusRef.current = inv?.status;
-  // Where the breadcrumb goes, and the word on it. A run whose subject is a
-  // hunt has no alert behind it, so "Alerts" there sent the analyst to a
-  // console that holds nothing the run read. An origin the analyst came from
-  // still wins: it names the page they left.
-  const huntSubject = inv?.subject?.type === 'hunt';
-  const backTo =
-    fromHunt ??
-    (from === '/investigations' ? '/investigations' : huntSubject ? '/hunts' : '/alerts');
-  const backLabel = fromHunt
-    ? 'Hunt'
-    : from === '/investigations'
-      ? 'Investigations'
-      : huntSubject
-        ? 'Hunts'
-        : 'Alerts';
+  // Where the back link goes, and the word on it: the page the analyst left,
+  // with its search, from the shell. The page said "Back to Alerts" to an
+  // analyst who came from Investigations. A hunt page that opened a promoted
+  // finding also sends its path in the router state, and that state outlives
+  // a reload. With neither, the way out is the list of investigations, which
+  // holds every run, a run that does not exist included.
+  const previousPage = useOptionalShell()?.previousPage ?? null;
+  const missing = !inv && !!error && isNotFound(error);
+  const backTo = previousPage?.path ?? fromHunt ?? '/investigations';
+  const backLabel = previousPage?.label ?? (fromHunt ? 'Hunt' : 'Investigations');
   const [confirmDel, setConfirmDel] = useState(false);
+  const [moreOpen, setMoreOpen] = useState(false);
   const [delErr, setDelErr] = useState('');
 
   const doDelete = async () => {
@@ -75,11 +72,20 @@ export function InvestigationPage() {
     <div className="px-[22px] pb-[60px] pt-[18px]">
       <div className="mx-auto mb-4 flex max-w-workstation items-center gap-3">
         <Link to={backTo} className="flex items-center gap-1.5 text-[12.5px] text-dim hover:text-text">
-          <ChevronLeft size={13} /> {backLabel}
+          <ChevronLeft size={13} /> Back to {backLabel}
         </Link>
         <span className="text-ghost">/</span>
-        <div className="text-[14px] font-semibold">Investigation</div>
-        <span className="rounded-badge border border-border-2 bg-surface-1 px-2 py-0.5 font-mono text-[11.5px] text-dim">
+        {/* The title is the rule name. The id was the title, and the rule name
+            sat in a side panel (dogfood 2026-10-06, first hour C10). The id
+            stays beside it, smaller. */}
+        <div className="min-w-0 break-words text-[14px] font-semibold" data-testid="investigation-page-title" title={inv?.name}>
+          {missing ? notFoundTitle('investigation') : inv?.name || 'Investigation'}
+        </div>
+        <span
+          data-testid="investigation-page-id"
+          title="The investigation id"
+          className="flex-none rounded-badge border border-border-2 bg-surface-1 px-2 py-0.5 font-mono text-[10.5px] text-faint"
+        >
           {inv?.id ?? id}
         </span>
         <div className="flex-1" />
@@ -108,6 +114,8 @@ export function InvestigationPage() {
             </div>
           ))}
         {inv && inv.status !== 'investigating' && (
+          // Delete lives in a "More" menu with a confirm step. It sat next to
+          // the status as a plain button.
           confirmDel ? (
             <div className="flex items-center gap-1.5">
               <button
@@ -124,13 +132,37 @@ export function InvestigationPage() {
               </button>
             </div>
           ) : (
-            <button
-              onClick={() => setConfirmDel(true)}
-              title="This button deletes the investigation. Only an admin can delete an investigation."
-              className="flex items-center gap-1.5 rounded-badge border border-border-strong px-2.5 py-[3px] text-[11.5px] font-semibold text-dim hover:border-danger hover:text-danger"
-            >
-              <Trash2 size={12} /> Delete
-            </button>
+            <div className="relative">
+              <button
+                data-testid="investigation-more"
+                onClick={() => setMoreOpen((o) => !o)}
+                aria-expanded={moreOpen}
+                aria-haspopup="menu"
+                aria-label="More actions"
+                title="More actions"
+                className="flex items-center rounded-badge border border-border-strong px-2 py-[3px] text-dim hover:text-text"
+              >
+                <MoreHorizontal size={14} />
+              </button>
+              {moreOpen && (
+                <div
+                  role="menu"
+                  className="absolute right-0 top-full z-20 mt-1 w-[220px] rounded-card border border-border-2 bg-surface-1 p-1 shadow-palette"
+                >
+                  <button
+                    role="menuitem"
+                    onClick={() => {
+                      setMoreOpen(false);
+                      setConfirmDel(true);
+                    }}
+                    title="This button deletes the investigation. Only an admin can delete an investigation."
+                    className="flex w-full items-center gap-1.5 rounded-control px-2.5 py-1.5 text-left text-[12.5px] font-semibold text-dim hover:bg-surface-hover hover:text-danger"
+                  >
+                    <Trash2 size={12} /> Delete investigation
+                  </button>
+                </div>
+              )}
+            </div>
           )
         )}
       </div>
@@ -142,7 +174,7 @@ export function InvestigationPage() {
           page subtree, causing the flicker + scanline reset). */}
       {loading && !inv && (
         <div className="mx-auto max-w-workstation">
-          <LoadingState label="Loading investigation…" />
+          <LoadingState label="Loading investigation" />
         </div>
       )}
       {/* A 404 is an answer, not an incident: "this run doesn't exist" and "the

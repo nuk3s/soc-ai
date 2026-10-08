@@ -68,8 +68,10 @@ vi.mock('../lib/api', async (importOriginal) => ({
   getPreflightDetail: vi.fn().mockResolvedValue({
     checked_at: new Date().toISOString(),
     rows: [
-      { name: 'estate model', status: 'INFO', detail: 'off. The ml extra is installed.', hint: '' },
+      { name: 'estate model', status: 'INFO', detail: 'off. The extra package that the estate model needs is installed.', hint: '' },
       { name: 'prompt assets', status: 'PASS', detail: '2 assets are present', hint: '' },
+      { name: 'blocklists', status: 'WARN', detail: 'no feed is loaded', hint: '' },
+      { name: 'auth', status: 'WARN', detail: 'sign-in is off', hint: '' },
     ],
   }),
   refreshPreflight: vi.fn(),
@@ -506,5 +508,23 @@ describe('Diagnostics, the doctor list', () => {
     renderDiagnostics();
     expect(await screen.findByTestId('doctor-row-estate model')).toBeTruthy();
     expect(screen.getByTestId('doctor-row-prompt assets')).toBeTruthy();
+  });
+});
+
+// The 2 WARN rows sat among 31 with no filter (dogfood 2026-10-06, 5.6).
+describe('Diagnostics, the warnings chip', () => {
+  it('counts the WARN rows and filters the list to them', async () => {
+    renderDiagnostics();
+    const chip = await screen.findByTestId('doctor-warn-chip');
+    expect(chip.textContent).toBe('2 warnings');
+    expect(chip).toHaveAttribute('aria-pressed', 'false');
+    fireEvent.click(chip);
+    expect(chip).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByTestId('doctor-row-blocklists')).toBeTruthy();
+    expect(screen.getByTestId('doctor-row-auth')).toBeTruthy();
+    expect(screen.queryByTestId('doctor-row-estate model')).toBeNull();
+    // A second press shows every row again.
+    fireEvent.click(chip);
+    expect(screen.getByTestId('doctor-row-estate model')).toBeTruthy();
   });
 });

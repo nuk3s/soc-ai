@@ -172,7 +172,7 @@ describe('folding a section of the Hunts tab', () => {
 
     await waitFor(() => expect(screen.queryByText(SCHEDULE.objective)).toBeNull());
     expect(screen.getByTestId('define-schedule')).toBeTruthy();
-    expect(screen.queryByPlaceholderText('New recurring hunt objective…')).toBeNull();
+    expect(screen.queryByPlaceholderText('New recurring hunt objective')).toBeNull();
   });
 
   it('writes the fold to this browser and reads it on the next visit', async () => {

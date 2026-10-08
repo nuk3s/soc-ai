@@ -87,8 +87,7 @@ beforeEach(() => {
 });
 import { roleAccent, roleRail } from '../lib/hostColors';
 import type { HostActivity } from '../lib/types';
-import { peerGraph } from '../components/HostActivityRow';
-import { DOCK_SAFE_AREA_CLASS } from '../components/ChatDock';
+import { peerGraphView } from '../lib/peerGraph';
 import { alertsHref } from '../components/HostKpis';
 import { HostDetail } from './HostDetail';
 
@@ -2060,13 +2059,18 @@ describe('HostDetail — the activity row', () => {
     vi.mocked(getHostActivity).mockResolvedValue(seeded());
     mount();
     const graph = await screen.findByTestId('host-peer-graph');
+    // One edge per peer. The alerted one is the red one.
+    const edges = Array.from(graph.querySelectorAll('[data-testid="graph-edge"]'));
+    expect(edges.length).toBe(2);
     const strokes = new Set(
-      Array.from(graph.querySelectorAll('line')).map((l) => l.getAttribute('stroke')),
+      edges.map((e) => e.querySelector('path:not([stroke="transparent"])')?.getAttribute('stroke')),
     );
     expect(strokes.size).toBe(2);
-    const alerted = peerGraph(IP, seeded().peers).edges.filter((e) => e.kind === 'lateral');
+    const red = edges.filter((e) => e.getAttribute('data-threat') === 'true');
+    expect(red.map((e) => e.getAttribute('data-edge-id'))).toEqual([`${IP}->198.51.100.7`]);
+    const alerted = peerGraphView(IP, seeded().peers).edges.filter((e) => e.threat);
     expect(alerted.length).toBe(1);
-    expect(alerted[0].to).toBe('198.51.100.7');
+    expect(alerted[0].target).toBe('198.51.100.7');
   });
 
   it('labels a two-way alerted peer once, not twice on the same baseline', async () => {
@@ -2080,11 +2084,15 @@ describe('HostDetail — the activity row', () => {
     );
     mount();
     const graph = await screen.findByTestId('host-peer-graph');
-    const labels = Array.from(graph.querySelectorAll('text')).filter(
+    // The layout settles after the panel mounts, so wait for the edge.
+    const edges = await within(graph).findAllByTestId('graph-edge');
+    const labels = Array.from(graph.querySelectorAll('span')).filter(
       (t) => t.textContent === 'alerted',
     );
     expect(labels.length).toBe(1);
-    expect(graph.querySelectorAll('line').length).toBe(2);
+    // A two-way peer is one line with an arrowhead at each end.
+    expect(edges.length).toBe(1);
+    expect(edges[0].getAttribute('data-arrows')).toBe('both');
   });
 
   it('will not turn "no host logs in this window" into "nobody logged in"', async () => {
@@ -2129,7 +2137,10 @@ describe('HostDetail — the activity row', () => {
     expect(screen.queryByTestId('activity-degraded')).toBeNull();
   });
 
-  it('links the latest investigation and shows the verdict it reached', async () => {
+  it('puts no verdict chip on the peer graph', async () => {
+    // Dogfood 2026-10-06, S3: a "latest False positive" chip on the Peers
+    // header read as the verdict on the host. The first lines of the page
+    // carry the leads and the verdicts.
     vi.mocked(getDossier).mockResolvedValue(dossier());
     vi.mocked(getHostActivity).mockResolvedValue(
       activity({
@@ -2140,9 +2151,9 @@ describe('HostDetail — the activity row', () => {
       }),
     );
     mount();
-    const link = await screen.findByRole('link', { name: /latest/i });
-    expect(link).toHaveAttribute('href', '/investigation/inv-1');
-    expect(link).toHaveTextContent(/true positive/i);
+    await screen.findByTestId('host-peer-graph');
+    expect(screen.queryByRole('link', { name: /latest/i })).toBeNull();
+    expect(document.querySelector('a[href="/investigation/inv-1"]')).toBeNull();
   });
 
   it('says when the peer list it drew is a busiest-N, from the wire flag alone', async () => {
@@ -2289,7 +2300,8 @@ describe('HostDetail — the Services card', () => {
     mount();
     const card = await screen.findByTestId('kpi-services');
     expect(within(card).getByText('2')).toBeTruthy();
-    expect(card.textContent).toContain('dossier');
+    // The card names the read it came from, and its window.
+    expect(card.textContent).toContain('Services · last sweep');
     expect(card.textContent).not.toContain('from the profile');
   });
 
@@ -2303,28 +2315,23 @@ describe('HostDetail — the Services card', () => {
 });
 
 // ---------------------------------------------------------------------------
-// The floating chat dock and the controls underneath it
+// No floating chat over the controls
 // ---------------------------------------------------------------------------
 
-describe('HostDetail — room under the floating chat dock', () => {
-  // The dock is fixed to the bottom-right corner of the VIEWPORT, so it lands
-  // on whatever is drawn there. At 1024 and at 1280 that was an Edit control
-  // on the facts panel: the page stopped 60px below its last row while the
-  // dock needs 68px, so the control could never be scrolled clear of it
-  // (dogfood 2026-09-17). The page now reserves the dock's own height.
-  it('reserves the dock height at the foot of the page', async () => {
+describe('HostDetail: no floating chat over the controls', () => {
+  // A floating dock fixed to the bottom-right corner of the VIEWPORT once sat
+  // on an Edit control on the facts panel (dogfood 2026-09-17), and the page
+  // reserved 84px at its foot for it. The chat is now the shell's Ask soc-ai
+  // panel, opened from the top bar, so nothing floats over the page and the
+  // reservation is gone with the dock.
+  it('mounts no floating launcher and reserves no room for one', async () => {
     vi.mocked(getDossier).mockResolvedValue(rich());
     const { container } = mount();
     await screen.findByTestId('host-facts');
 
-    // The CLASS, not a measurement: jsdom loads no stylesheet, so what the
-    // page asks the browser for is the only thing a unit test can read.
+    expect(screen.queryByRole('button', { name: /chat about this host/i })).toBeNull();
     const root = container.firstElementChild as HTMLElement;
-    for (const cls of DOCK_SAFE_AREA_CLASS.split(' ')) {
-      expect(root.classList.contains(cls)).toBe(true);
-    }
-    // The reservation only earns its place on a page that mounts the dock.
-    expect(screen.getByText('Chat about this host')).toBeTruthy();
+    expect(root.className).not.toMatch(/pb-\[84px\]/);
   });
 });
 

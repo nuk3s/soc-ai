@@ -17,8 +17,6 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
   Dossier,
   DossierConflicts,
-  DossierList,
-  DossierRow,
   DossierSummary,
   MachineList,
   MachineRow,
@@ -474,9 +472,9 @@ describe('Hosts header filters', () => {
       'any role',
       'server20',
       'workstation7',
-      'low confidence9',
-      'stale2',
-      'unknown103',
+      'weak guess9',
+      'old guess2',
+      'no role103',
     ]);
     // A role no machine holds is not offered.
     expect(within(menu).queryByText('hypervisor')).toBeNull();
@@ -499,7 +497,11 @@ describe('Hosts header filters', () => {
       .map((i) => (i.textContent ?? '').replace(/\s+/g, ' ').trim());
     // The stale bucket stays on offer at 0. A missing option reads as a
     // broken filter, and the count says the list is empty.
-    expect(roleItems).toEqual(['any role', 'server16', 'workstation5', 'low confidence8', 'stale0', 'unknown81']);
+    expect(roleItems).toEqual(['any role', 'server16', 'workstation5', 'weak guess8', 'old guess0', 'no role81']);
+    // The menu names the population its counts cover (dogfood 2026-10-06).
+    expect(within(roleMenu).getByTestId('filter-group-note').textContent).toBe(
+      `Counts in this list of ${ACTIVE_SUMMARY.machines} machines with events.`,
+    );
     fireEvent.keyDown(document, { key: 'Escape' });
     fireEvent.click(screen.getByRole('button', { name: 'Filter by agent' }));
     expect(await screen.findByRole('menuitemradio', { name: /^without an agent/ })).toHaveProperty(
@@ -531,11 +533,11 @@ describe('Hosts header filters', () => {
     mount('/hosts?page=2');
     await ready();
     fireEvent.click(screen.getByRole('button', { name: 'Filter by role' }));
-    fireEvent.click(await screen.findByRole('menuitemradio', { name: /^unknown/ }));
+    fireEvent.click(await screen.findByRole('menuitemradio', { name: /^no role/ }));
     await waitFor(() => expect(lastQuery()).toMatchObject({ role: 'unknown', offset: 0 }));
     expect(url()).toBe('/hosts?role=unknown');
     expect(screen.getByRole('button', { name: 'Filter by role' }).getAttribute('data-active')).toBe('true');
-    expect(screen.getByRole('button', { name: /Remove the filter Role: unknown/ })).toBeTruthy();
+    expect(screen.getByRole('button', { name: /Remove the filter Role: no role/ })).toBeTruthy();
   });
 
   it('opens the menu at the button, outside the clipped table panel', async () => {
@@ -661,7 +663,7 @@ describe('Hosts search', () => {
   it('sizes the search box to show the whole placeholder', async () => {
     mount();
     const box = (await screen.findByLabelText('Search hosts')) as HTMLInputElement;
-    const placeholder = 'Search name, address, MAC, OS, role, agent…';
+    const placeholder = 'Search name, address, MAC, OS, role, agent';
     expect(box.placeholder).toBe(placeholder);
     expect(box.style.width).toBe(`calc(${placeholder.length}ch + 40px)`);
   });
@@ -929,46 +931,96 @@ describe('Hosts empty states', () => {
   });
 });
 
-// ---- the broken-builds view --------------------------------------------------
+// Dogfood 2026-10-06: the Needs attention card read 37 and its click listed 3
+// addresses in another table. Each part of the card is now a filter on the
+// machine list, so the click lists the machines the number counts.
+describe('Hosts needs-attention filters', () => {
+  it('lists the machines with no clean build, each failure in a sentence', async () => {
+    const broken = machine('ip:192.0.2.140', {
+      primary_ip: '192.0.2.140',
+      addresses: ['192.0.2.140'],
+      flags: { ...NO_FLAGS, broken: true },
+      build_error: '192.0.2.140: TimeoutError:',
+    });
+    vi.mocked(listMachines).mockResolvedValue(page([broken]));
+    mount('/hosts?health=broken&activity=all');
+    expect(
+      (await screen.findByTestId('machine-build-error-ip:192.0.2.140')).textContent,
+    ).toBe('The sweep could not read 192.0.2.140: the grid timed out.');
+    expect(lastQuery()).toMatchObject({ health: 'broken', activity: 'all', offset: 0 });
+    // The filter shows as a chip, and the chip clears it.
+    fireEvent.click(screen.getByRole('button', { name: /Remove the filter Never built/ }));
+    await waitFor(() => expect(lastQuery().health).toBeUndefined());
+  });
 
-const brokenRow = (ip: string, over: Partial<DossierRow> = {}): DossierRow => ({
-  ip,
-  found: true,
-  fields: [],
-  first_seen: null,
-  last_seen: null,
-  last_built_at: null,
-  last_observed_at: null,
-  event_count: 0,
-  identity_rebound_at: null,
-  build_error: null,
-  override_count: 0,
-  conflict_count: 0,
-  reporting: false,
-  ...over,
+  it('sends the out-of-date part as its own filter', async () => {
+    mount('/hosts?health=stale&activity=all');
+    await waitFor(() => expect(lastQuery()).toMatchObject({ health: 'stale' }));
+    expect(screen.getByRole('button', { name: /Remove the filter Out of date/ })).toBeTruthy();
+  });
+
+  it('ignores a health value the list does not know', async () => {
+    // NEGATIVE CONTROL: a hand-edited link cannot put the list in an error.
+    mount('/hosts?health=sideways');
+    await waitFor(() => expect(listMachines).toHaveBeenCalled());
+    expect(lastQuery().health).toBeUndefined();
+  });
+
+  it('shows an empty filtered list for a filter at 0, never the whole list', async () => {
+    vi.mocked(listMachines).mockImplementation((q) =>
+      Promise.resolve(q?.conflict === 'yes' ? page([], 0) : page([PROXY, UNNAMED, PRINTER])),
+    );
+    mount('/hosts?conflict=yes&activity=all');
+    await waitFor(() => expect(lastQuery()).toMatchObject({ conflict: 'yes' }));
+    expect(await screen.findByText(/No machines match the current filters/)).toBeTruthy();
+    expect(screen.queryByTestId(`machine-row-${PROXY.key}`)).toBeNull();
+    expect(
+      screen.getByRole('button', { name: /Remove the filter A declaration and the sweep disagree/ }),
+    ).toBeTruthy();
+  });
 });
 
-describe('Hosts broken-builds view', () => {
-  it('lists the addresses with no clean build, from the Needs attention card', async () => {
-    const list: DossierList = {
-      rows: [
-        brokenRow('192.0.2.140', { build_error: 'elasticsearch: ConnectionTimeout', last_built_at: '2026-10-01T00:00:00+00:00' }),
-        brokenRow('192.0.2.77'),
-      ],
-      total: 2,
-      limit: 50,
-      offset: 0,
-    };
-    vi.mocked(listDossiers).mockResolvedValue(list);
-    mount('/hosts?health=broken');
-    expect(await screen.findByText('192.0.2.140')).toBeTruthy();
-    expect(vi.mocked(listDossiers).mock.calls[0][0]).toMatchObject({ health: 'broken', offset: 0 });
-    expect(screen.getByText('never built')).toBeTruthy();
-    expect(screen.getByText(/not getting through/i)).toBeTruthy();
-    // The machine list is not asked for under this view.
-    expect(listMachines).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole('button', { name: /show all machines/i }));
-    await waitFor(() => expect(listMachines).toHaveBeenCalled());
+describe('Hosts list scope', () => {
+  it('says the list shows the active machines of the census', async () => {
+    vi.mocked(listMachines).mockResolvedValue(page([PROXY, UNNAMED, PRINTER], 18));
+    vi.mocked(getMachineSummary).mockResolvedValue({ ...SUMMARY, machines: 37 });
+    mount();
+    await waitFor(() =>
+      expect(screen.getByTestId('hosts-list-scope').textContent).toBe(
+        'Showing 18 active machines of 37. Show all.',
+      ),
+    );
+    fireEvent.click(within(screen.getByTestId('hosts-list-scope')).getByRole('button', { name: 'Show all.' }));
+    await waitFor(() => expect(lastQuery()).toMatchObject({ activity: 'all' }));
+  });
+
+  it('reads plain when the list shows every machine', async () => {
+    // NEGATIVE CONTROL
+    vi.mocked(listMachines).mockResolvedValue(page([PROXY, UNNAMED, PRINTER], 37));
+    vi.mocked(getMachineSummary).mockResolvedValue({ ...SUMMARY, machines: 37 });
+    mount('/hosts?activity=all');
+    await waitFor(() => expect(screen.getByTestId('hosts-list-scope').textContent).toBe('Machines · 37'));
+  });
+});
+
+describe('Hosts row: one pointer target', () => {
+  it('stretches the name link over the row and lets the stale chip open the machine', async () => {
+    const hoursAgo = (h: number) => new Date(Date.now() - h * 3_600_000).toISOString();
+    const late = machine('agent:late', {
+      name: 'late01',
+      primary_ip: '192.0.2.43',
+      addresses: ['192.0.2.43'],
+      agent: { id: 'late', name: 'late01', os: null, last_report: hoursAgo(61) },
+    });
+    vi.mocked(listMachines).mockResolvedValue(page([late]));
+    mount();
+    const link = await screen.findByTestId('machine-link-agent:late');
+    expect(link.className).toContain('after:absolute');
+    expect(link.className).toContain('after:inset-0');
+    expect(rowOf(late).className).toContain('relative');
+    // The stale chip no longer swallows the click.
+    fireEvent.click(await screen.findByTestId('agent-stale-agent:late'));
+    expect((await screen.findByTestId('here')).textContent).toBe('/hosts/agent%3Alate');
   });
 });
 
@@ -1056,7 +1108,7 @@ describe('Hosts bulk declare', () => {
     mount();
     fireEvent.click(await screen.findByLabelText(/select all hosts/i));
     expect(await screen.findByText(/machines selected/i)).toBeTruthy();
-    fireEvent.change(await screen.findByDisplayValue('choose…'), { target: { value: 'low' } });
+    fireEvent.change(await screen.findByDisplayValue('choose'), { target: { value: 'low' } });
     fireEvent.click(screen.getByRole('button', { name: /declare \(3\)/i }));
     await waitFor(() =>
       expect(vi.mocked(bulkSetDossierOverride)).toHaveBeenCalledWith(
@@ -1077,7 +1129,7 @@ describe('Hosts bulk declare', () => {
     });
     mount();
     fireEvent.click(await screen.findByLabelText(/select all hosts/i));
-    fireEvent.change(await screen.findByDisplayValue('choose…'), { target: { value: 'high' } });
+    fireEvent.change(await screen.findByDisplayValue('choose'), { target: { value: 'high' } });
     fireEvent.click(screen.getByRole('button', { name: /declare \(3\)/i }));
     expect(await screen.findByText(/1 not swept yet: 192\.0\.2\.30/)).toBeTruthy();
     expect(screen.getByText(/1 failed: 192\.0\.2\.20\. Try those again/)).toBeTruthy();

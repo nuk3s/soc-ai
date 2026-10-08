@@ -377,7 +377,8 @@ describe('AnalyticDrawer entity links', () => {
     });
     mount();
     const link = await screen.findByRole('link', { name: 'svc_sql' });
-    expect(link.getAttribute('href')).toBe('/entity/svc_sql');
+    // The user carries its type, so a machine of the same name never opens.
+    expect(link.getAttribute('href')).toBe('/entity/svc_sql?type=user');
   });
 
   it('keeps a host entity on the host page', async () => {
@@ -425,7 +426,7 @@ describe('AnalyticDrawer wording', () => {
 // a shadow week an analyst started.
 describe('AnalyticDrawer, a system demotion', () => {
   const REASON =
-    'The analytic wrote 42 hits in 24 hours. Its fire budget is 10 a day.';
+    'The analytic wrote 42 hits in 24 hours. Its daily hit limit is 10.';
   const HELD: AnalyticDetail = {
     ...DETAIL,
     status: 'shadow',

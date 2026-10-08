@@ -16,6 +16,40 @@ operator screens.
 > warning before you sign in. If you do not, the browser refuses the connection
 > with an opaque `TypeError: Failed to fetch`.
 
+## The flow
+
+![How this flows: the alert path and the sweep path](img/hunting-flow.svg)
+
+Work comes in on two paths. Each path ends in a verdict and an action in Security Onion.
+
+- **The alert path:** Security Onion raises an alert. soc-ai triages the alert to a verdict.
+  Auto-Investigate starts the triage, or you press **Investigate** on the Alerts screen. The chain
+  is Alert, Investigation, Verdict, Action in Security Onion.
+- **The sweep path:** a sweep runs every hour. An analytic hit writes an observation. Observations
+  on one entity form a lead. A new lead starts its own hunt. The hunt investigates what it finds
+  and brings back the verdicts. The chain is Hit, Lead, Hunt, Investigations, Verdicts, Actions.
+
+Needs you is the one queue. It holds the leads that wait on a decision, the unread shadow hits,
+the alert groups with no verdict, the verdicts that need more info and the recommended actions
+that wait for you. You decide on one object at a time: agree, override, acknowledge, escalate,
+dismiss or open an investigation. Your actions go to Security Onion. You tune an analytic with
+approve, reject and draft.
+
+Two verbs move the flow:
+
+- **Hunt this lead:** a hunt is one agent run with an objective. It returns findings and a
+  narrative. The hunt itself writes no verdict and takes no action. soc-ai investigates each
+  finding and brings back the verdicts. A hunt is not finished until its findings are
+  investigated.
+- **Open an investigation:** an investigation ends in a verdict, recommended actions and an audit
+  record. Its actions go to Security Onion. The hunt page offers this control on a finding with no
+  investigation.
+
+Each detail page carries a flow strip under its header: the alert drawer, the investigation page,
+the lead page and the hunt page. The strip names each step and its state: done, current, next or
+not yet. A done step links to its object. The next step names the control that moves the flow.
+The Overview and the Hunts page link to the chart, **How this flows**.
+
 ## Sign in
 
 `/app/login` takes a username and a password. There are two roles:
@@ -41,30 +75,172 @@ at startup. Read it then with `journalctl -u soc-ai | grep -i password` or with
 `docker compose logs soc-ai | grep -i password`. On the normal path the log holds
 a pointer line and no password.
 
-Change the password after the first login. Use Config → Users → reset password.
+Change the password after the first login. Use Settings → Users → reset password.
 Then delete the sidecar file, because nothing needs it and the volume must not
 keep it.
 
 ## Navigation
 
-The sidebar has two groups. Investigate holds Dashboard, Alerts,
-Investigations, Hosts, Notifications and Hunts. It stays open, because most of a
-shift runs in that loop. Operate holds the Operate hub, Runbooks, Backtest and
-Config. It starts collapsed, because you reach those screens once a shift or
-once a week.
+The sidebar has two groups. Analyst holds Dashboard, Alerts, Investigations,
+Hosts and Hunts. It stays open, because most of a shift runs in that loop.
+Operator holds Status, Runbooks, Backtest and Settings. It starts collapsed,
+because you reach those screens once a shift or once a week.
 
-Click the Operate heading to expand the group, or go straight to one of its
-screens. Operate expands itself if the current page lives inside it, so no closed
-group hides your screen.
+Click the Operator heading to expand the group, or go straight to one of its
+screens. Operator expands itself if the current page lives inside it, so no
+closed group hides your screen.
+
+The bell in the top bar holds the notifications. Its "View all notifications"
+link opens the Notifications page at `/app/notifications`. The sidebar has no
+entry for that page.
+
+The Alerts, Investigations and Hunts entries carry a badge for the work that
+waits on you there. The badges are parts of the Needs-you count. The
+Needs-you tile on the Dashboard and the bell state the same total.
+
+The help button in the top bar opens this guide in a new tab. The command
+palette holds the keyboard shortcuts. Press ⌘K and type "shortcuts".
+
+The Ask soc-ai button at the right end of the top bar opens the chat. See
+[Ask soc-ai](#ask-soc-ai).
+
+The top bar shows the workspace switcher only when more than one workspace
+exists. A lead page reads "Hunts / Lead 18" in the breadcrumb, and the Hunts
+entry stays lit.
+
+## Ask soc-ai
+
+Ask soc-ai is the chat of the console. It answers in one turn with the read
+tools of an investigation. A turn takes as long as one investigation turn.
+
+### Open and close
+
+- The **Ask soc-ai** button is at the right end of the top bar on every page.
+- The label names the object of the page: "Ask soc-ai about this
+  investigation", "about this host", "about this lead" or "about this hunt".
+  A page with no object reads "Ask soc-ai".
+- Press `c` to open the panel from any page. The key does nothing while you
+  type in a field. The shortcut sheet lists it.
+- The panel slides in from the right, over the page. It has the same width and
+  the same header on every page.
+- The focus moves into the question box when the panel opens.
+- Press Esc or the close button to close the panel. The focus goes back to the
+  control that opened it.
+- The page under the panel stays live. You can scroll it and use its controls.
+- The report drawer on the Alerts page covers the top bar. The top row of the
+  report holds the same button. Esc closes the panel first and the drawer second.
+
+### Scopes
+
+The scope is the subject of a thread. The line under the panel header names
+the scope and the object.
+
+| Scope | Page | Thread |
+|-------|------|--------|
+| This investigation | An investigation page, or the report drawer on Alerts | One thread for each investigation. All analysts share it. |
+| This host | A host page | One thread for each host. All analysts share it. |
+| This lead | A lead page | One thread for each lead. All analysts share it. |
+| This hunt | A hunt page, after the hunt ends | One thread for each hunt. All analysts share it. |
+| General | Every page | One thread for each analyst. Two analysts do not see each other's questions. |
+
+- **Switch to general** on the scope line opens your general thread.
+- **Back to this host** returns to the thread of the page. The words name the
+  object of the page.
+- The panel follows the page. Open another host, and the panel shows the thread
+  of that host.
+- soc-ai stores each thread on the server. A reload, a restart and a second tab
+  show the same thread.
+- The browser tab keeps an unsent question for each scope. The question stays in
+  the box when you close the panel, switch the scope or reload the page.
+- **Clear conversation** discards the thread of the general scope, a host or a
+  lead. A thread about an investigation or a hunt stays.
+
+### Starter questions
+
+An empty thread shows three starter questions. A click on a starter sends it.
+While a turn runs, the click puts the question in the box.
+
+The Dashboard holds an **Ask soc-ai** card with the three general starters. A
+click on a starter opens the panel on the general scope and sends the question.
+**Open** opens the panel with no question. The card keeps the `assistant` slot
+of a saved Dashboard layout.
+
+### Proposals
+
+- **A verdict:** on an investigation, the chat can propose a verdict. The
+  answer then shows **Apply verdict**. The control appears only if evidence
+  backs the proposal. A proposal of the current verdict reads "This is the
+  current verdict."
+- **An escalation:** a proposed true positive also shows **Escalate to case**.
+  The control opens the escalate confirm on the page. It writes nothing itself.
+- **A hunt:** on the general scope, a host or a lead, a question can need a
+  sweep across many hosts or a long window. The answer then shows a Start hunt
+  card. The card holds an objective that the agent wrote and a line on what the
+  sweep settles. Press **Start hunt** to run that objective and open the
+  running hunt.
+- **The hunt scope:** it answers from the report of the hunt. It proposes nothing,
+  and it cannot change the result.
+
+### Limits
+
+The chat has read tools only. It runs no write action. It never acknowledges or
+escalates an alert. Apply verdict, Escalate to case and Start hunt are controls
+that you press.
+
+### General chat switch
+
+Open Settings → Models & Reasoning → Agent → *General chat*. The setting turns
+the general scope off. It takes effect with no restart. The console reads it
+when a page loads.
+
+With the switch off, a page with no object shows no Ask soc-ai button. The
+Dashboard hides its card, and the panel offers no switch to general. The scopes
+of an investigation, a host, a lead and a hunt stay on.
+
+    Turn it off if the triage backlog already saturates a shared analyst model.
+    The general scope is open on every page. It is the easiest place in the
+    console to spend inference capacity by accident. Nothing runs while nobody
+    types. The stored threads survive the change.
 
 ## Dashboard
 
-The Dashboard is at `/app/dashboard`. A sign-in lands you here. The Dashboard shows what the grid does now and what
-soc-ai made of it. A box on the screen answers questions about either one.
+The Dashboard is at `/app/dashboard`. Its title reads "Overview". A sign-in lands you here. The
+Dashboard shows what the grid does now and what soc-ai made of it. The Ask soc-ai card opens the
+chat on either one.
+
+### Needs you
+
+The first tile states the work that waits on you. It has one line for each
+part, and each line opens the list that holds that work:
+
+- the leads that wait on a decision,
+- the unread shadow hits,
+- the alert groups with no verdict in the last 7 days,
+- the verdicts that need more info in the last 30 days,
+- the recommended actions that wait for you on the true positives of the
+  last 30 days.
+
+The sidebar badges and the bell state the same total. A part that soc-ai cannot
+read shows its own line with the reason, and the total then reads "11+". The
+tile says "Nothing needs you" only when it read every part and each part is
+zero.
+
+Under the tile one sentence states the flow: "Alerts and sweeps come in. soc-ai triages, hunts,
+and investigates what the hunts find. You decide in Needs you. Your actions go to Security
+Onion." The **How this flows** link after it opens the chart on the Hunts page.
+
+The true positives tile counts the investigations with a true positive verdict
+in the Dashboard window. The Investigations list counts the same runs with the
+same query. "Open them" opens that list.
+
+When Elasticsearch answers the health probe late, an amber banner reads
+"Elasticsearch is slow. Counts can be late." Each tile that reads the grid then
+says "May be incomplete." A red banner means that the probe got no answer.
 
 ### Setup health
 
-A persistent card sits at the top of the side column on the Dashboard.
+In the shipped layout, a persistent card sits at the top of the side column on
+the Dashboard.
 Persistent means the card never hides itself. The panels below it do hide if
 they have nothing to review.
 
@@ -74,36 +250,11 @@ with its detail and a hint if one exists. The card also carries a Re-check
 button. Re-check forces a fresh check past the 10 minute cache. Use it after you
 fix a problem. A re-check that fails reads "The re-check failed. Try again." It
 leaves the last known-good rows on screen. An analyst sees a count and a pointer
-to Config → Diagnostics. An analyst never sees the row names.
+to Settings → Diagnostics. An analyst never sees the row names.
 
 The card reads the same checks as the doctor, without the model fitness probe.
 That probe can take a few minutes, and a dashboard poll cannot wait that long.
-Fitness stays on the model battery in Config.
-
-### Ask soc-ai
-
-A chat answers in one turn. It uses the same read tools as the investigation
-chat and takes about as long. Ask it which datasets you have, which rule was noisiest
-overnight, or what a host did.
-
-- **One rolling thread per analyst:** the thread survives navigation and
-  restarts. Two analysts do not see each other's questions. Clear discards
-  your thread.
-- **It proposes a hunt and never starts one.** If an answer needs a sweep across
-  many hosts or a long window, the turn returns a Start hunt card. The card
-  holds an objective that the agent wrote from what it read, and a line on what
-  the sweep would settle. You see both before you decide. Press Start hunt to
-  run that objective and to open the running hunt.
-- **What it cannot do:** it runs no write action, it changes no verdict, and it
-  never acknowledges or escalates an alert. It has read tools only.
-- **How to turn it off:** open Config → Models & Reasoning → Agent →
-  *Dashboard chat*. The setting is hot, so it takes effect with no restart. The
-  Dashboard then hides the box, so no question can fail in it.
-
-    Turn it off if the triage backlog already saturates a shared analyst model.
-    The assistant sits on the screen that everyone lands on, so it is the easiest
-    place in the product to spend inference capacity by accident. Nothing runs
-    while nobody types, and the stored threads survive the change.
+Fitness stays on the model battery in Settings.
 
 ### Outcome and severity tiles
 
@@ -140,6 +291,43 @@ If a point alarms, the card prints the path to the eval bundle of that run. That
 directory holds the oracle critiques. The critiques are the only evidence for or
 against the alarm. The card prints a file path on the soc-ai host. Read the
 file with `docker exec soc-ai cat <path>/report.md`.
+
+### Dashboard layout
+
+The Dashboard panels sit on a grid of 12 columns. You can move and resize each
+panel. The shipped layout puts each panel in the place and the width it had
+before the grid.
+
+To change the layout:
+
+1. Click **Edit layout**. Each panel shows a dashed outline, a handle on its
+   top edge and a corner mark at its bottom right.
+2. Drag a panel by its handle. The other panels move to make room.
+3. Drag the bottom right corner to change the width or the height of a panel.
+4. Click **Done** to stop. The console keeps each change when you make it.
+
+Outside edit mode, a drag does nothing. Edit mode is available in a window of
+1024 pixels or wider. A narrower window stacks the panels in reading order and
+says "Widen the window to move or resize panels."
+
+A panel is never shorter than its content. A layout therefore cannot clip a
+failing check or a warning. You can make a panel taller than its content.
+
+To use the keyboard, move the focus to a handle. The arrow keys move the panel.
+Shift and an arrow key change its width or its height. A screen reader
+announces each step.
+
+**Reset layout** puts every panel back in its shipped place and size.
+
+soc-ai keeps one layout for each user account. The layout follows you to
+another workstation. The routes are `GET`, `PUT` and `DELETE` on
+`/api/v1/me/dashboard-layout`. With authentication off, no user account owns a
+layout. The browser then keeps the layout in local storage under the key
+`soc-ai.dashboard.layout`. Another browser shows the shipped layout. The help
+line in edit mode says which store holds your layout.
+
+A release can remove a panel. A saved layout then loses the slot of that
+panel. A panel that a release adds appears at the bottom of its column.
 
 ## Triage console
 
@@ -186,6 +374,12 @@ row as `error`, because the worker for that row died with the previous process. 
 periodic sweep then marks any run that stays `running` past
 `investigation_reaper_minutes`. That setting defaults to 30. You never have to
 clear an orphan by hand.
+
+**Backtest replays:** the list hides the investigations that a backtest ran. The
+header figures do not count them. The header line names how many replays it left
+out. Turn on **Show backtest replays** to add them to the list and to the figures.
+A grey **Backtest replay** chip marks each replay. The Dashboard counts never
+include a replay. The [Backtest](#backtest) section gives the reason.
 
 ## Hunts
 
@@ -332,7 +526,7 @@ interval, and a scheduled dossier refresh rebuilds it too.
 
 - **Rebuild now** on the Hosts screen runs a sweep in the background and reports
   what it built. Only an admin sees the button.
-- Config → Host dossier turns on the schedule and sets its interval. Every
+- Settings → Host dossier turns on the schedule and sets its interval. Every
   setting there is hot, so it needs no restart and the next sweep reads it.
 
 ### Host identity
@@ -416,11 +610,11 @@ values.
 | `seen` | `new` keeps the machines first seen in the last 7 days. |
 | `health` | `broken` keeps the machines whose primary address has no clean build. `attention` adds the machines whose build is older than the staleness window. |
 
-## Operate hub
+## Status
 
-![The Operate hub: the Analytics panel with its sweep status line and one row for each analytic](img/screenshot-operate.png)
+![The Status page: the Analytics panel with its sweep status line and one row for each analytic](img/screenshot-operate.png)
 
-The Operate hub is at `/app/operate`. It maps the trust instruments of the
+The Status page is at `/app/operate`. The sidebar names it Status. It maps the trust instruments of the
 console. It holds 6 cards. Each card
 names one thing that soc-ai can prove and links to the screen where you prove it.
 The cards carry no live status of their own. The setup-health card on the
@@ -467,11 +661,11 @@ A spec that the loop never reached reads "not yet swept". A row of zeros means
 "swept, saw nothing". The panel refreshes itself every 5 minutes.
 
 - **Model fitness** proves the analyst model is fit before triage depends on it.
-  It links to Config → Agent.
+  It links to Settings → Agent.
 - **Verdict quality** proves the verdicts held up. It carries the nightly
-  micro-eval trend and links to Config → Quality.
+  micro-eval trend and links to Settings → Quality.
 - **Audit chain** proves the tamper-evident record is intact. It links to
-  Config → Diagnostics, and that screen carries a Verify audit chain button.
+  Settings → Diagnostics, and that screen carries a Verify audit chain button.
   Press it and it reports one of 5 outcomes:
   - intact. A green check. soc-ai verified the records.
   - partial verification. Amber. The scan stopped at the start of the chain and
@@ -492,9 +686,38 @@ A spec that the loop never reached reads "not yet swept". A row of zeros means
 - **Backtest** replays history against the current pipeline. It links to
   Backtest.
 - **Diagnostics** is the doctor's view from inside the app. It links to
-  Config → Diagnostics.
+  Settings → Diagnostics.
 - **Runbooks** holds the procedures that ground every verdict. It links to
   Runbooks.
+
+## Backtest
+
+The Backtest screen is at `/app/backtest`. It replays the agent over alerts that
+your analysts already closed in Security Onion. Then it compares each verdict of
+soc-ai with the decision of the analyst. An escalated alert counts as a true
+positive. An acknowledged alert that nobody escalated counts as a false positive.
+
+Each replay is a full investigation, and soc-ai keeps it. A replay is a
+measurement of the model. soc-ai applies these rules to every replay:
+
+- The replay writes nothing to Security Onion. Auto-acknowledge is off for the
+  replay.
+- The page of a replay shows the recommended actions as not executable. The
+  execute route refuses them.
+- The verdict of a replay writes no observation. A replay therefore forms no
+  lead.
+- A replay sends no notification. The bell does not list it.
+- The verdict of a replay is not the verdict of its alert. The Alerts screen,
+  the Dashboard counts and the auto-triage sweep read the live runs only.
+- No other alert inherits the verdict of a replay.
+- The Investigations list hides the replays by default. A grey **Backtest
+  replay** chip marks each replay on the list and on its page.
+
+Before this release, the verdict of a replay wrote an observation like a live
+run. A replay could then form a lead. At startup, soc-ai marks each lead that
+formed from replays only. The lead page lists the mark as the decision
+`formed_from_backtest`. The mark changes no status. Dismiss the lead when no
+other evidence supports it.
 
 ## Runbooks
 
@@ -512,7 +735,7 @@ read a runbook. Only an admin can create, edit or delete one.
   write and preview toggle sits on the content field. A linked rule is a
   detection rule name or UUID that this runbook applies to. A rule link is the
   strongest retrieval signal, so this runbook wins if that rule fires.
-- **Import files…**: import your existing `.md` procedures from your wiki or repo
+- **Import files**: import your existing `.md` procedures from your wiki or repo
   in bulk. The optional YAML front-matter fields are `title:`, `tags:` and
   `rules:`. The parser is lenient. It ignores malformed metadata and still
   imports the body. A missing title falls back to the first `#` heading, then to
@@ -526,14 +749,14 @@ read a runbook. Only an admin can create, edit or delete one.
   Edit the seeded copies as you want, because your edits stay.
 - If you configure the optional Retrieval embeddings tier, each row shows its
   embed status: `embedded`, `not embedded` or `stale embedding`. The
-  catch-up pass lives at Config → Retrieval → "Re-embed runbooks".
+  catch-up pass lives at Settings → Retrieval → "Re-embed runbooks".
 
 The Config page keeps a compact summary next to the Retrieval settings. The
 summary holds a count and a manage link.
 
-## Config console
+## Settings
 
-The Config console is at `/app/config`. Only an admin can use it. It configures
+The Settings page is at `/app/config`. The sidebar names it Settings. Only an admin can use it. It configures
 soc-ai from the console. A non-admin who reaches it gets a clean 403 and no login
 loop.
 
@@ -576,8 +799,8 @@ These keys are editable:
   the home of the Oracle toggle.
 - **Agent**: `investigate_when_unsure` and `general_chat_enabled`.
   `investigate_when_unsure` runs the bounded investigation loop if evidence does
-  not back the fast round-1 verdict. `general_chat_enabled` controls the Ask
-  soc-ai box on the Dashboard, and it is on by default.
+  not back the fast round-1 verdict. `general_chat_enabled` controls the
+  general scope of Ask soc-ai and the Dashboard card. It is on by default.
 - **PCAP**: `pcap_enabled` fetches and decodes raw packets on demand from the
   Suricata pcap ring on the Security Onion sensor.
 
@@ -627,7 +850,7 @@ cannot disable or demote the last enabled admin.
 
 ### API tokens
 
-Mint an API token here, and revoke one here. soc-ai shows the `scai_…` value once
+Mint an API token here, and revoke one here. soc-ai shows the `scai_` token once
 at creation, so copy it then. soc-ai stores only the hash of the token. A token
 gives programmatic API access for automation and integrations after you
 enable `API_AUTH_REQUIRED`.

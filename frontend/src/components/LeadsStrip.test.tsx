@@ -20,19 +20,21 @@ import {
   PILL_IN_PROGRESS,
   PILL_NEW,
   PILL_PROMOTED,
-  PROMOTE_NEEDS_HUNT,
   TAB_ALL,
   TAB_CLOSED,
   TAB_IN_PROGRESS,
   TAB_NEEDS_DECISION,
   WEIGHT_AT_FORMATION,
 } from '../lib/tooltips';
+import { outcomeLabel } from '../lib/labels';
 import {
   DISMISS_REASONS,
   HUNT_CLEAN_REASON,
+  HUNT_CLOSED_LABEL,
   LEAD_ACTION,
   LeadsStrip,
   REASON_LABEL,
+  earlierThreat,
   leadState,
 } from './LeadsStrip';
 
@@ -160,6 +162,19 @@ describe('LeadsStrip', () => {
 // whether or not a shadow analytic wrote anything on it, and an observation
 // from an analytic in shadow carried the word "candidate", which is a status
 // and not a source. Both readings told an analyst the wrong thing.
+describe('a lead formed from a backtest replay', () => {
+  it('carries a grey chip on the row', async () => {
+    vi.mocked(getLeads).mockResolvedValue([LEAD, { ...LEAD, id: 8, formed_from_backtest: true }]);
+    mount();
+    const marked = await screen.findByTestId('lead-8');
+    expect(within(marked).getByTestId('lead-backtest-chip-8').textContent).toBe(
+      'Formed from a backtest replay',
+    );
+    // Negative control: a live lead carries no chip.
+    expect(within(screen.getByTestId('lead-7')).queryByTestId('lead-backtest-chip-7')).toBeNull();
+  });
+});
+
 describe('LeadsStrip shadow semantics', () => {
   it('leaves the shadow chip off a lead that holds no shadow observation', async () => {
     vi.mocked(getLeads).mockResolvedValue([{ ...LEAD, shadow: false }]);
@@ -260,7 +275,8 @@ describe('LeadsStrip tabs', () => {
     expect(legend.textContent).toBe(
       'New: nobody has acted. In progress: a hunt is running. ' +
         'Hunted: the hunt finished, and the lead waits on a decision. ' +
-        'Closed: an analyst dismissed or promoted the lead, or a clean hunt closed it.',
+        'Closed: an analyst dismissed the lead or opened an investigation on it, or a clean ' +
+        'hunt closed it.',
     );
   });
 
@@ -376,6 +392,49 @@ describe('LeadsStrip state pills', () => {
   const DISMISSED: Lead = { ...LEAD, id: 9, status: 'dismissed', dismissed_reason: 'expected_for_role' };
   const PROMOTED: Lead = { ...LEAD, id: 11, status: 'promoted', investigation_id: 'INV-7' };
 
+  // S3: three earlier hunts found a threat and the newest found none. The
+  // pill read the newest hunt alone and said "No threat observed".
+  it('states the worst hunt outcome on record in the pill', async () => {
+    vi.mocked(getLeads).mockResolvedValue([
+      { ...HUNTED, hunt_outcome: 'clean', hunt_count: 4, hunt_threat_count: 3 },
+    ]);
+    mount();
+    const row = await screen.findByTestId('lead-14');
+    const pill = within(row).getByTestId('lead-status');
+    expect(pill.textContent).toBe('Hunted · An earlier hunt found a threat');
+    expect(pill.style.color).toBe('#f04438');
+  });
+
+  // Negative controls: no threat on record, and a newest hunt that found one.
+  it.each([
+    [{ hunt_outcome: 'clean', hunt_count: 2, hunt_threat_count: 0 }, 'Hunted · No threat found', 'ok'],
+    [
+      { hunt_outcome: 'threats', hunt_count: 2, hunt_threat_count: 2 },
+      'Hunted · Threat found',
+      'danger',
+    ],
+  ])('keeps the newest outcome when it is the worst on record (%#)', async (extra, words, tone) => {
+    vi.mocked(getLeads).mockResolvedValue([{ ...HUNTED, ...extra }]);
+    mount();
+    const row = await screen.findByTestId('lead-14');
+    const pill = within(row).getByTestId('lead-status');
+    expect(pill.textContent).toBe(words);
+    // The colour comes from lib/labels.ts. A threat is never green.
+    expect(pill.style.color).toBe(tone === 'danger' ? '#f04438' : '#3fb950');
+  });
+
+  // The hunt routes send the public key threat_found. The rule compared the
+  // lead store code 'threats' alone, so a newest hunt with a threat read as an
+  // earlier one.
+  it('reads the newest threat through lib/labels.ts in both vocabularies', () => {
+    expect(earlierThreat({ hunt_outcome: 'threat_found', hunt_threat_count: 2 })).toBe(false);
+    expect(earlierThreat({ hunt_outcome: 'threats', hunt_threat_count: 2 })).toBe(false);
+    expect(earlierThreat({ hunt_outcome: 'no_threat', hunt_threat_count: 2 })).toBe(true);
+    expect(earlierThreat({ hunt_outcome: 'clean', hunt_threat_count: 0 })).toBe(false);
+    // The closure words are the label of the clean outcome.
+    expect(HUNT_CLOSED_LABEL).toBe(`Closed. ${outcomeLabel('no_threat')}.`);
+  });
+
   it('derives the state from the record', () => {
     expect(leadState(LEAD)).toBe('new');
     expect(leadState(RUNNING)).toBe('in_progress');
@@ -384,15 +443,16 @@ describe('LeadsStrip state pills', () => {
     expect(leadState(PROMOTED)).toBe('promoted');
   });
 
-  it('reads a lead nobody has acted on as New, and offers three actions', async () => {
+  it('reads a lead nobody has acted on as New, and offers two actions', async () => {
     mount();
     const row = await screen.findByTestId('lead-7');
     const pill = within(row).getByTestId('lead-status');
     expect(pill.textContent).toBe('New');
     expect(pill.getAttribute('title')).toBe(PILL_NEW);
-    for (const action of [LEAD_ACTION.hunt, LEAD_ACTION.dismiss, LEAD_ACTION.promote]) {
+    for (const action of [LEAD_ACTION.hunt, LEAD_ACTION.dismiss]) {
       expect(within(row).getByRole('button', { name: action })).toBeTruthy();
     }
+    expect(LEAD_ACTION.hunt).toBe('Hunt this lead');
   });
 
   it('starts the hunt from the New pill', async () => {
@@ -402,23 +462,19 @@ describe('LeadsStrip state pills', () => {
     await waitFor(() => expect(huntLead).toHaveBeenCalledWith(7));
   });
 
-  // An investigation of a lead reads the hunt's findings, so Promote waits on
-  // a hunt. The row let the analyst click it and read a 409 in red, while the
-  // lead page disabled the same button and said why.
-  it('refuses the promotion of a lead with no hunt, and says why', async () => {
+  // The hunt investigates what it finds and brings back the verdicts, so a
+  // lead offers no investigation of its own (owner, 2026-10-07). The row
+  // offered "Promote" beside "Hunt", and the owner could not tell them apart.
+  it('offers no investigation of its own, before or after the hunt', async () => {
+    vi.mocked(getLeads).mockResolvedValue([LEAD, HUNTED]);
     mount();
-    const row = await screen.findByTestId('lead-7');
-    const promote = within(row).getByRole('button', { name: LEAD_ACTION.promote });
-    expect((promote as HTMLButtonElement).disabled).toBe(true);
-    expect(promote.getAttribute('title')).toBe(PROMOTE_NEEDS_HUNT);
-  });
-
-  it('promotes the lead once its hunt has finished', async () => {
-    vi.mocked(getLeads).mockResolvedValue([HUNTED]);
-    mount();
-    const row = await screen.findByTestId('lead-14');
-    fireEvent.click(within(row).getByRole('button', { name: LEAD_ACTION.promote }));
-    await waitFor(() => expect(promoteLead).toHaveBeenCalledWith(14));
+    for (const id of ['lead-7', 'lead-14']) {
+      const row = await screen.findByTestId(id);
+      expect(
+        within(row).queryByRole('button', { name: /Open an investigation|Promote/ }),
+      ).toBeNull();
+    }
+    expect(promoteLead).not.toHaveBeenCalled();
   });
 
   it('reads a running hunt as In progress and offers only the hunt', async () => {
@@ -433,7 +489,7 @@ describe('LeadsStrip state pills', () => {
     expect(within(row).queryByRole('button', { name: LEAD_ACTION.dismiss })).toBeNull();
   });
 
-  it('reads a finished hunt as Hunted, names the outcome and offers four actions', async () => {
+  it('reads a finished hunt as Hunted, names the outcome and offers three actions', async () => {
     vi.mocked(getLeads).mockResolvedValue([HUNTED]);
     mount();
     const row = await screen.findByTestId('lead-14');
@@ -441,7 +497,7 @@ describe('LeadsStrip state pills', () => {
     expect(pill.textContent).toBe('Hunted · No threat observed');
     expect(pill.getAttribute('title')).toBe(PILL_HUNTED);
     expect(within(row).getByText(LEAD_ACTION.readHunt).getAttribute('href')).toBe('/hunts/H-LEAD-4');
-    for (const action of [LEAD_ACTION.promote, LEAD_ACTION.dismiss, LEAD_ACTION.huntAgain]) {
+    for (const action of [LEAD_ACTION.dismiss, LEAD_ACTION.huntAgain]) {
       expect(within(row).getByRole('button', { name: action })).toBeTruthy();
     }
   });
@@ -457,13 +513,37 @@ describe('LeadsStrip state pills', () => {
     await waitFor(() => expect(huntLead).toHaveBeenCalledWith(14));
   });
 
-  it('opens the dismissal on a benign repeat after a hunt found no threat', async () => {
+  // C9: the form chose "A benign repeat" after a clean hunt, and one click
+  // then dismissed a lead with a reason the analyst had not read.
+  it('opens the dismissal with no reason chosen after a hunt found no threat', async () => {
     vi.mocked(getLeads).mockResolvedValue([HUNTED]);
     mount();
     const row = await screen.findByTestId('lead-14');
     fireEvent.click(within(row).getByRole('button', { name: LEAD_ACTION.dismiss }));
     const select = within(row).getByLabelText('Reason') as HTMLSelectElement;
-    expect(select.value).toBe('benign_repeat');
+    expect(select.value).toBe('');
+    expect(
+      (within(row).getByRole('button', { name: 'Confirm dismiss' }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+  });
+
+  it('offers the four reasons an analyst uses besides the baseline ones', async () => {
+    vi.mocked(getLeads).mockResolvedValue([HUNTED]);
+    mount();
+    const row = await screen.findByTestId('lead-14');
+    fireEvent.click(within(row).getByRole('button', { name: LEAD_ACTION.dismiss }));
+    const select = within(row).getByLabelText('Reason') as HTMLSelectElement;
+    const words = Array.from(select.options).map((o) => o.textContent);
+    for (const word of [
+      'Authorized test or scan',
+      'Duplicate of another lead or investigation',
+      'The analytic logic is wrong',
+      'Lab or test host',
+    ]) {
+      expect(words).toContain(word);
+    }
+    // Other stays last.
+    expect(words[words.length - 1]).toBe('Other');
   });
 
   it('leaves the reason unchosen when the hunt found threats', async () => {
@@ -510,7 +590,7 @@ describe('LeadsStrip state pills', () => {
     const pill = within(row).getByTestId('lead-status');
     expect(pill.textContent).toBe('Promoted');
     expect(pill.getAttribute('title')).toBe(PILL_PROMOTED);
-    expect(within(row).getByText(LEAD_ACTION.openInvestigation).getAttribute('href')).toBe(
+    expect(within(row).getByText(LEAD_ACTION.viewInvestigation).getAttribute('href')).toBe(
       '/investigation/INV-7',
     );
     expect(within(row).getByRole('button', { name: LEAD_ACTION.reopen })).toBeTruthy();
@@ -524,7 +604,7 @@ describe('LeadsStrip state pills', () => {
     mount();
     const row = await screen.findByTestId('lead-11');
     expect(within(row).getByText('The investigation no longer exists')).toBeTruthy();
-    expect(within(row).queryByText(LEAD_ACTION.openInvestigation)).toBeNull();
+    expect(within(row).queryByText(LEAD_ACTION.viewInvestigation)).toBeNull();
     expect(within(row).getByRole('button', { name: LEAD_ACTION.reopen })).toBeTruthy();
   });
 
@@ -532,7 +612,7 @@ describe('LeadsStrip state pills', () => {
     vi.mocked(getLeads).mockResolvedValue([PROMOTED]);
     mount();
     const row = await screen.findByTestId('lead-11');
-    expect(within(row).getByText(LEAD_ACTION.openInvestigation)).toBeTruthy();
+    expect(within(row).getByText(LEAD_ACTION.viewInvestigation)).toBeTruthy();
     expect(within(row).queryByText('The investigation no longer exists')).toBeNull();
   });
 
@@ -584,8 +664,9 @@ describe('LeadsStrip user entities', () => {
     vi.mocked(getLeads).mockResolvedValue([{ ...LEAD, id: 21, entities: [['user', 'svc_sql']] }]);
     mount();
     const row = await screen.findByTestId('lead-21');
+    // The user carries its type, so a machine of the same name never opens.
     expect(within(row).getByRole('link', { name: 'svc_sql' }).getAttribute('href')).toBe(
-      '/entity/svc_sql',
+      '/entity/svc_sql?type=user',
     );
   });
 
@@ -670,7 +751,7 @@ describe('a lead the hunt closed', () => {
     mount();
     const row = await screen.findByTestId('lead-21');
     const pill = within(row).getByTestId('lead-status');
-    expect(pill.textContent).toBe('Closed. The hunt found no threat.');
+    expect(pill.textContent).toBe('Closed. No threat found.');
     expect(pill.getAttribute('title')).toBe(PILL_CLOSED_BY_HUNT);
     expect(pill.getAttribute('data-lead-state')).toBe('dismissed');
     expect(within(row).getByText('closed by soc-ai')).toBeTruthy();
@@ -681,12 +762,16 @@ describe('a lead the hunt closed', () => {
     expect(within(row).queryByRole('button', { name: LEAD_ACTION.huntAgain })).toBeNull();
   });
 
-  it('keeps the five analyst reasons and never offers the closure as one', () => {
+  it('keeps the analyst reasons the server accepts and never offers the closure as one', () => {
     expect(DISMISS_REASONS).toEqual([
       'expected_for_role',
       'known_change',
       'benign_repeat',
       'bad_baseline',
+      'authorized_test',
+      'duplicate',
+      'bad_analytic_logic',
+      'lab_host',
       'other',
     ]);
     expect(HUNT_CLEAN_REASON in REASON_LABEL).toBe(false);

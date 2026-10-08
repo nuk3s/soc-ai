@@ -81,9 +81,9 @@ def _safe_reason(exc: BaseException) -> str:
     2026-08-14, D11).
     """
     name = type(exc).__name__
-    msg = _scrub(str(exc)).strip()
-    # Bound the length so a chatty upstream can't bloat the response.
-    msg = msg[:160]
+    # The reason is whole. A cut hid the end of the upstream message, and
+    # the owner banned the ellipsis cut (2026-10-07).
+    msg = " ".join(_scrub(str(exc)).split())
     if not msg:
         return name
     return msg if msg.lower().startswith(name.lower()) else f"{name}: {msg}"
@@ -160,7 +160,7 @@ def _grid_failure(exc: BaseException) -> tuple[str, str]:
         # (review of batch A, 2026-08-14). Whether waiting helps is the whole
         # point of the line, and the two causes have opposite answers.
         total, failed = exc.shards_total, exc.shards_failed
-        because = f" ({_scrub(str(exc.reason))[:100]})" if exc.reason else ""
+        because = f" ({_scrub(str(exc.reason))})" if exc.reason else ""
         if failed:
             read = f"read only {total - failed} of {total} shards" if total else "read partially"
             timed_out = " and the search timed out" if exc.timed_out else ""
@@ -191,7 +191,7 @@ def _grid_failure(exc: BaseException) -> tuple[str, str]:
     if isinstance(exc, TimeoutError) or "timeout" in name.lower():
         return KIND_TIMEOUT, f"the grid took the query and did not answer in time ({name})"
     if isinstance(exc, ConnectionError | OSError) or "connection" in name.lower():
-        return KIND_REFUSED, f"the grid could not be reached: {_scrub(_cause_text(exc))[:120]}"
+        return KIND_REFUSED, f"the grid could not be reached: {_scrub(_cause_text(exc))}"
     return "", _safe_reason(exc)
 
 
@@ -391,7 +391,7 @@ def _so_failure(exc: BaseException) -> tuple[str, str]:
     and the remedy is a setting, not the network.
     """
     if isinstance(exc, SoAuthError):
-        msg = _scrub(str(exc))[:160]
+        msg = _scrub(str(exc))
         if "rejected credentials" in msg:
             return "", f"the API rejected the configured credentials: {msg}"
         # The login works and SOC then refuses the session it issued. The API
@@ -405,7 +405,7 @@ def _so_failure(exc: BaseException) -> tuple[str, str]:
     if isinstance(exc, TimeoutError | httpx.TimeoutException) or "timeout" in name.lower():
         return KIND_TIMEOUT, f"the API took the request and did not answer in time ({name})"
     if isinstance(exc, ConnectionError | OSError) or "connect" in name.lower():
-        return KIND_REFUSED, f"the API could not be reached: {_scrub(_cause_text(exc))[:120]}"
+        return KIND_REFUSED, f"the API could not be reached: {_scrub(_cause_text(exc))}"
     return "", _safe_reason(exc)
 
 
@@ -597,9 +597,9 @@ def _fitness_leg(
         "name": name,
         "ok": ok if ok is not None else (grade == "pass"),
         "grade": grade,
-        "detail": _scrub(detail)[:200],
+        "detail": _scrub(detail),
         "elapsed_s": round(float(elapsed_s), 2) if elapsed_s is not None else None,
-        "backend": _scrub(backend)[:120] if backend else None,
+        "backend": _scrub(backend) if backend else None,
         "cause": cause,
     }
 
@@ -1120,7 +1120,7 @@ async def probe_model_fitness(settings: Any) -> dict[str, Any]:
         "grade": grade,
         "model": model_id,
         "legs": legs,
-        "detail": _scrub(detail)[:200],
+        "detail": _scrub(detail),
         "served_backend": _served_backend(legs),
     }
 
@@ -1175,9 +1175,9 @@ async def probe_pcap(settings: Any) -> dict[str, Any]:
             ver = next((ln for ln in lines if "tcpdump version" in ln.lower()), "")
             return {
                 "ok": True,
-                "detail": f"the sensor is reachable: {ver.strip()[:120] or 'tcpdump ok'}",
+                "detail": f"the sensor is reachable: {ver.strip() or 'tcpdump ok'}",
             }
         why = (lines[0].strip() if lines else "") or f"exit {proc.returncode}"
-        return {"ok": False, "detail": f"{_PCAP_BROKEN_HINT} [{why[:120]}]"}
+        return {"ok": False, "detail": f"{_PCAP_BROKEN_HINT} [{why}]"}
     except Exception as exc:  # a probe failure is a normal ✗ result, never a raise
         return {"ok": False, "detail": _safe_reason(exc)}

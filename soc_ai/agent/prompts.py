@@ -642,8 +642,11 @@ _TRIAGE_REPORT_OUTPUT_RULES = """
   A negative finding IS legal evidence. The validator REJECTS a hallucinated path
   or a tool ref that is not in the bundle.
 - **`recommended_actions`** lists write-tool invocations for the analyst to
-  execute. Each `rationale` must reference at least one citation. The available
-  tools and the args each one REQUIRES are:
+  execute. Each `rationale` must rest on at least one citation. The first
+  `rationale` is the headline the analyst reads first. Write it as one plain
+  sentence. Name the evidence in words, such as "the rule tags" or "the cited
+  event". Keep field paths, document ids and tool names out of it. They belong
+  in `citations`. The available tools and the args each one REQUIRES are:
     - `ack_alert(alert_id, comment?)`. The alert under triage's id is the one in
       the user message header. You MUST include `"alert_id"` in `tool_args`.
     - `escalate_to_case(alert_id, case_title, case_description)`. Use the same
@@ -669,7 +672,8 @@ _TRIAGE_REPORT_HARD_RULES = """
   that returned empty. The validator checks that the reference exists in the
   bundle. **Do not fabricate one.**
 - **DO NOT SUGGEST A WRITE YOU ARE NOT WILLING TO DEFEND.** Each recommended
-  action's `rationale` must reference at least one citation.
+  action's `rationale` must rest on at least one citation. Name it in words.
+  A field path, a document id or a tool name stays in `citations`.
 - **CONFIDENCE BELOW 0.6 = needs_more_info.** Do not guess. An open question
   lowers the verdict only when it names a record that could change the verdict
   and no evidence item answers it. A hypothesis about the environment is not

@@ -23,8 +23,8 @@ describe('ListToolbar', () => {
 
   it('renders an opt-in search box and reports every keystroke', () => {
     const onChange = vi.fn();
-    render(<ListToolbar search={{ value: '', onChange, placeholder: 'Search runs…' }} />);
-    const box = screen.getByPlaceholderText('Search runs…');
+    render(<ListToolbar search={{ value: '', onChange, placeholder: 'Search runs' }} />);
+    const box = screen.getByPlaceholderText('Search runs');
     fireEvent.change(box, { target: { value: 'ssh' } });
     expect(onChange).toHaveBeenCalledWith('ssh');
   });
@@ -205,14 +205,14 @@ describe('ListToolbar', () => {
     // selection — as the only way back to the controls.
     const onChange = vi.fn();
     const { rerender } = render(
-      <ListToolbar search={{ value: 'ssh', onChange, placeholder: 'Search runs…' }}>
+      <ListToolbar search={{ value: 'ssh', onChange, placeholder: 'Search runs' }}>
         <button>Verdict</button>
       </ListToolbar>,
     );
     expect(screen.getByText('Verdict')).toBeInTheDocument();
     rerender(
       <ListToolbar
-        search={{ value: 'ssh', onChange, placeholder: 'Search runs…' }}
+        search={{ value: 'ssh', onChange, placeholder: 'Search runs' }}
         selection={{ count: 1, onClear: vi.fn() }}
       >
         <button>Verdict</button>
@@ -220,9 +220,9 @@ describe('ListToolbar', () => {
     );
     expect(screen.getByText('Verdict')).toBeInTheDocument();
     // The term is still applied server-side, so it must still be on screen.
-    expect(screen.getByPlaceholderText('Search runs…')).toHaveValue('ssh');
+    expect(screen.getByPlaceholderText('Search runs')).toHaveValue('ssh');
     // …and still editable, without discarding the selection first.
-    fireEvent.change(screen.getByPlaceholderText('Search runs…'), { target: { value: 'ssh key' } });
+    fireEvent.change(screen.getByPlaceholderText('Search runs'), { target: { value: 'ssh key' } });
     expect(onChange).toHaveBeenCalledWith('ssh key');
     expect(screen.getByText(/selected/i)).toBeInTheDocument();
   });
@@ -295,7 +295,7 @@ describe('ListToolbar', () => {
 
 // The Hosts box cut its placeholder at "OS" (range dogfood 2026-10-05, C9).
 describe('ListToolbar search width', () => {
-  const PLACEHOLDER = 'Search name, address, MAC, OS, role, agent…';
+  const PLACEHOLDER = 'Search name, address, MAC, OS, role, agent';
 
   it('sizes the box to its placeholder when asked', () => {
     render(

@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ulid import ULID
 
 from soc_ai.hunting.findings import threat_finding_count
+from soc_ai.hunting.outcome import FindingVerdicts
 from soc_ai.run_meter import RunCounters, apply_counters
 from soc_ai.secret_scrub import (
     MODEL_TEXT_EVENT_KINDS,
@@ -30,10 +31,30 @@ from soc_ai.secret_scrub import (
 )
 from soc_ai.store import chat_memory
 from soc_ai.store.auth import utcnow
-from soc_ai.store.models import Hunt, HuntEvent, HuntSpecState, Lead
+from soc_ai.store.models import Hunt, HuntEvent, HuntSpecState, Investigation, Lead
 
 STATUS_RUNNING = "running"
 STATUS_COMPLETE = "complete"
+# The hunt landed its report and its subject findings are under
+# investigation (migration 0063). The hunt has not ended.
+STATUS_INVESTIGATING = "investigating"
+# The statuses of a hunt that has not ended.
+OPEN_STATUSES: tuple[str, ...] = (STATUS_RUNNING, STATUS_INVESTIGATING)
+
+# The state of one subject finding on the hunt (``finding_investigations``).
+LINK_QUEUED = "queued"
+LINK_INVESTIGATING = "investigating"
+LINK_ENDED = "ended"
+LINK_OVER_CAP = "over_cap"
+LINK_FAILED = "failed"
+LINK_CANCELLED = "cancelled"
+# The states that count as an ended investigation. A failed one ended too.
+LINK_ENDED_STATES: frozenset[str] = frozenset({LINK_ENDED, LINK_FAILED, LINK_CANCELLED})
+# Who put the investigation on the finding: the hunt opened it, the hunt
+# reused an investigation of the same subject, or an analyst opened it.
+ORIGIN_OPENED = "opened"
+ORIGIN_REUSED = "reused"
+ORIGIN_MANUAL = "manual"
 
 _WS_RE = re.compile(r"\s+")
 
@@ -165,11 +186,22 @@ async def finalize(
     narrative: str | None = None,
     report: dict[str, Any] | None = None,
     counters: RunCounters | None = None,
+    finding_plan: dict[str, dict[str, Any]] | None = None,
 ) -> None:
+    """Land the hunt's report and its status.
+
+    ``finding_plan`` is the per-finding plan of a hunt that goes on to
+    investigate its subject findings (status ``investigating``): one entry per
+    subject, keyed by the ordinal as a string. ``findings_total`` is its size.
+    """
     hunt = await db.get(Hunt, hunt_id)
     if hunt is None:
         return
     hunt.status = status
+    if finding_plan is not None:
+        hunt.finding_investigations = finding_plan
+        hunt.findings_total = len(finding_plan)
+        hunt.findings_investigated = _ended_count(finding_plan)
     # What the run cost and its budget class (migration 0058).
     apply_counters(hunt, counters)
     # Credential values never reach the store: the narrative and the findings
@@ -186,6 +218,216 @@ async def finalize(
         hunt.threat_findings_count = threat_finding_count(findings)
     hunt.finished_at = utcnow()
     await db.commit()
+
+
+# ── The investigations of the subject findings (migration 0063) ────────────
+
+
+class FindingLink(NamedTuple):
+    """One subject finding's entry on the hunt row."""
+
+    ordinal: int
+    state: str
+    investigation_id: str | None = None
+    origin: str | None = None
+    reason: str | None = None
+
+
+def _ended_count(plan: dict[str, Any]) -> int:
+    return sum(
+        1
+        for entry in plan.values()
+        if isinstance(entry, dict) and entry.get("state") in LINK_ENDED_STATES
+    )
+
+
+def finding_links(hunt: Any) -> dict[int, FindingLink]:
+    """The per-finding entries of a hunt, keyed by ordinal. Empty on an older row."""
+    return finding_links_from(getattr(hunt, "finding_investigations", None))
+
+
+def finding_links_from(raw: Any) -> dict[int, FindingLink]:
+    """The per-finding entries of a stored ``finding_investigations`` value.
+
+    The column is stored JSON and is not schema-enforced, so an entry with a
+    key that is not an ordinal, or a value that is not a dict, is dropped.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[int, FindingLink] = {}
+    for key, entry in raw.items():
+        try:
+            ordinal = int(key)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(entry, dict) or ordinal < 0:
+            continue
+        inv_id = entry.get("investigation_id")
+        out[ordinal] = FindingLink(
+            ordinal=ordinal,
+            state=str(entry.get("state") or LINK_QUEUED),
+            investigation_id=str(inv_id) if inv_id else None,
+            origin=str(entry["origin"]) if entry.get("origin") else None,
+            reason=str(entry["reason"]) if entry.get("reason") else None,
+        )
+    return out
+
+
+def plan_entry(
+    state: str,
+    *,
+    investigation_id: str | None = None,
+    origin: str | None = None,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    """One entry of ``finding_investigations``, as the column stores it."""
+    entry: dict[str, Any] = {"state": state}
+    if investigation_id:
+        entry["investigation_id"] = investigation_id
+    if origin:
+        entry["origin"] = origin
+    if reason:
+        entry["reason"] = reason
+    return entry
+
+
+async def set_finding_link(
+    db: AsyncSession,
+    hunt_id: str,
+    ordinal: int,
+    state: str,
+    *,
+    investigation_id: str | None = None,
+    origin: str | None = None,
+    reason: str | None = None,
+) -> Hunt | None:
+    """Write one finding's entry and recount the ended investigations.
+
+    The dict is written back whole. The JSON column does not track an
+    in-place change, and an entry the session did not see is lost.
+    """
+    hunt = await db.get(Hunt, hunt_id)
+    if hunt is None:
+        return None
+    plan = dict(hunt.finding_investigations or {})
+    plan[str(ordinal)] = plan_entry(
+        state, investigation_id=investigation_id, origin=origin, reason=reason
+    )
+    hunt.finding_investigations = plan
+    hunt.findings_investigated = _ended_count(plan)
+    await db.commit()
+    return hunt
+
+
+async def complete_investigating(db: AsyncSession, hunt_id: str) -> Hunt | None:
+    """End the investigation phase: the hunt is complete.
+
+    ``finished_at`` moves to now, because the hunt ends when its last
+    investigation ends. A hunt in any other status is left alone, so a second
+    call changes nothing.
+    """
+    hunt = await db.get(Hunt, hunt_id)
+    if hunt is None or hunt.status != STATUS_INVESTIGATING:
+        return hunt
+    plan = dict(hunt.finding_investigations or {})
+    hunt.findings_investigated = _ended_count(plan)
+    hunt.status = STATUS_COMPLETE
+    hunt.finished_at = utcnow()
+    await db.commit()
+    return hunt
+
+
+async def reap_investigating(db: AsyncSession) -> int:
+    """Complete every hunt a restart left ``investigating``. Returns the count.
+
+    The process that ran the investigations is gone. Its investigations were
+    reaped as ``interrupted``, so an entry that names one has ended and reads
+    as failed. An entry that never started an investigation is failed too.
+    The report stands, so the hunt is complete.
+    """
+    rows = list((await db.scalars(select(Hunt).where(Hunt.status == STATUS_INVESTIGATING))).all())
+    now = utcnow()
+    for hunt in rows:
+        plan: dict[str, Any] = {}
+        for key, stored in (hunt.finding_investigations or {}).items():
+            if not isinstance(stored, dict):
+                continue
+            state = stored.get("state")
+            if state == LINK_QUEUED:
+                plan[str(key)] = {**stored, "state": LINK_FAILED, "reason": "restart"}
+            elif state == LINK_INVESTIGATING:
+                plan[str(key)] = {**stored, "state": LINK_ENDED}
+            else:
+                plan[str(key)] = stored
+        hunt.finding_investigations = plan
+        hunt.findings_investigated = _ended_count(plan)
+        hunt.status = STATUS_COMPLETE
+        hunt.finished_at = now
+    if rows:
+        await db.commit()
+    return len(rows)
+
+
+async def finding_verdicts(db: AsyncSession, hunt_ids: Sequence[str]) -> dict[str, FindingVerdicts]:
+    """The verdict summary of each hunt's subject findings. One query per table.
+
+    A hunt with no subject finding is left out. The verdicts are read live from
+    the investigations, so an analyst's override of a verdict moves the
+    hunt's outcome with it.
+    """
+    wanted = [i for i in hunt_ids if i]
+    if not wanted:
+        return {}
+    rows = (
+        await db.execute(
+            select(
+                Hunt.id,
+                Hunt.findings_total,
+                Hunt.findings_investigated,
+                Hunt.finding_investigations,
+            ).where(Hunt.id.in_(wanted), Hunt.findings_total > 0)
+        )
+    ).all()
+    links_by_hunt = {
+        str(hunt_id): (int(total or 0), int(done or 0), finding_links_from(raw))
+        for hunt_id, total, done, raw in rows
+    }
+    inv_ids = sorted(
+        {
+            link.investigation_id
+            for _total, _done, links in links_by_hunt.values()
+            for link in links.values()
+            if link.investigation_id
+        }
+    )
+    runs: dict[str, tuple[str, str | None, bool]] = {}
+    for start in range(0, len(inv_ids), 500):
+        chunk = inv_ids[start : start + 500]
+        found = await db.execute(
+            select(
+                Investigation.id,
+                Investigation.status,
+                Investigation.verdict,
+                Investigation.is_fallback,
+            ).where(Investigation.id.in_(chunk))
+        )
+        for inv_id, status, verdict, fallback in found.all():
+            runs[str(inv_id)] = (str(status or ""), verdict, bool(fallback))
+    out: dict[str, FindingVerdicts] = {}
+    for hunt_id, (total, done, links) in links_by_hunt.items():
+        decided = threats = 0
+        for link in links.values():
+            run = runs.get(link.investigation_id or "")
+            if run is None:
+                continue
+            status, verdict, fallback = run
+            if status == "complete" and not fallback and verdict:
+                decided += 1
+                threats += verdict == "true_positive"
+        out[hunt_id] = FindingVerdicts(
+            total=total, investigated=done, decided=decided, threats=threats
+        )
+    return out
 
 
 async def get_with_events(db: AsyncSession, hunt_id: str) -> tuple[Hunt, list[HuntEvent]] | None:
@@ -257,12 +499,21 @@ class HuntNotifRow(NamedTuple):
     findings_count: int | None
     threat_findings_count: int | None
     is_synth_eval: bool
+    # The storage kind and the actor. The bell names a catalog run
+    # "Analytic" and folds the runs of one sweep into one line.
+    kind: str = "chat"
+    started_by: str = ""
+    # The investigation phase counts (migration 0063), for the line of an
+    # investigating hunt: "Investigating 2 of 3 findings".
+    findings_total: int = 0
+    findings_investigated: int = 0
 
 
 async def list_recent_notifications(
     db: AsyncSession,
     *,
     status: str | None = None,
+    statuses: Sequence[str] | None = None,
     limit: int = 100,
     finished_since: datetime | None = None,
 ) -> list[HuntNotifRow]:
@@ -287,9 +538,15 @@ async def list_recent_notifications(
         Hunt.findings_count,
         Hunt.threat_findings_count,
         Hunt.is_synth_eval,
+        Hunt.kind,
+        Hunt.started_by,
+        Hunt.findings_total,
+        Hunt.findings_investigated,
     )
     if status is not None:
         q = q.where(Hunt.status == status)
+    if statuses:
+        q = q.where(Hunt.status.in_(tuple(statuses)))
     if finished_since is not None:
         q = q.where(Hunt.finished_at >= finished_since).order_by(
             Hunt.finished_at.desc(), Hunt.id.desc()
@@ -298,6 +555,56 @@ async def list_recent_notifications(
         q = q.order_by(Hunt.created_at.desc(), Hunt.id.desc())
     q = q.limit(limit)
     return [HuntNotifRow(*row) for row in (await db.execute(q)).all()]
+
+
+async def recent_run_seconds(db: AsyncSession, *, limit: int = 20) -> list[float]:
+    """The wall time of the newest finished agent hunts, in seconds.
+
+    A running hunt page states how long hunts on this grid take. Catalog runs
+    are one query each and leave the count out.
+    """
+    rows = (
+        await db.execute(
+            select(Hunt.created_at, Hunt.finished_at)
+            .where(
+                Hunt.status == "complete",
+                Hunt.finished_at.is_not(None),
+                Hunt.kind != "triggered",
+            )
+            .order_by(Hunt.finished_at.desc())
+            .limit(limit)
+        )
+    ).all()
+    return [
+        (finished - created).total_seconds()
+        for created, finished in rows
+        if created is not None and finished is not None
+    ]
+
+
+async def outcome_inputs(db: AsyncSession, ids: Sequence[str]) -> dict[str, tuple[list[Any], str]]:
+    """The findings and the narrative of a few hunts, for the bell's outcome.
+
+    The bell reads the scalar columns first and calls this only for the hunts
+    whose outcome the threat count cannot decide: a hunt with no threat can
+    be clean, unanswered or a failed run, and only the findings and the
+    narrative tell those apart. Bounded by the bell's own row cap.
+    """
+    wanted = [i for i in ids if i]
+    if not wanted:
+        return {}
+    rows = (
+        await db.execute(select(Hunt.id, Hunt.report, Hunt.narrative).where(Hunt.id.in_(wanted)))
+    ).all()
+    out: dict[str, tuple[list[Any], str]] = {}
+    for hunt_id, report, narrative in rows:
+        body = report if isinstance(report, dict) else {}
+        findings = body.get("findings")
+        out[str(hunt_id)] = (
+            findings if isinstance(findings, list) else [],
+            str(narrative or body.get("narrative") or ""),
+        )
+    return out
 
 
 async def findings_for_entity(

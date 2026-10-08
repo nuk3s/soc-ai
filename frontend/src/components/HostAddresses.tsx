@@ -16,6 +16,7 @@ import {
   addressKindLabel,
   addressKindTitle,
   fieldLabel,
+  newerStamp,
   partitionFields,
   provenancePhrase,
   valueText,
@@ -45,7 +46,7 @@ function AddressFacts({
     <div data-testid={`address-facts-${ip}`} className="px-[15px] pb-3 pt-1">
       {read.loading && !d ? (
         <div className="flex items-center gap-2 text-[12px] text-dim">
-          <Spinner size={12} /> Reading the facts for this address…
+          <Spinner size={12} /> Reading the facts for this address
         </div>
       ) : read.error && !d ? (
         <div className="flex flex-wrap items-center gap-2 text-[12px] text-danger">
@@ -198,15 +199,22 @@ function ContainerRow({ c }: { c: MachineContainer }) {
 
 export interface HostAddressesProps {
   machine: MachineDetail;
+  /** The newest activity the live read saw on the primary address. The
+   *  machine header reads the newer of it and the sweep stamp, and the
+   *  primary row reads the same, so the two show one time. */
+  lastActivity?: string | null;
   /** The address the URL names (`?address=`). It opens expanded and in view. */
   focusAddress: string | null;
   /** The field the URL names (`?field=`), highlighted in the focused facts. */
   focusField: string | null;
 }
 
-export function HostAddresses({ machine, focusAddress, focusField }: HostAddressesProps) {
-  // Primary first, then the newest.
-  const addresses = [...machine.addresses].sort(
+export function HostAddresses({ machine, focusAddress, focusField, lastActivity }: HostAddressesProps) {
+  // Primary first, then the newest. The primary row takes the live stamp the
+  // header reads (dogfood 2026-10-06, S4: "last seen 2m" over a row of "4d").
+  const addresses = machine.addresses
+    .map((a) => (a.primary ? { ...a, last_seen: newerStamp(a.last_seen, lastActivity) } : a))
+    .sort(
     (a, b) =>
       Number(b.primary) - Number(a.primary) || (b.last_seen ?? '').localeCompare(a.last_seen ?? ''),
   );

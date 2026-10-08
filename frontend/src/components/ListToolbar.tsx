@@ -142,7 +142,7 @@ function Chip({
         )}
       >
         {icon}
-        <span className="max-w-[220px] truncate">{label}</span>
+        <span className="max-w-[220px] break-words">{label}</span>
         {count != null && (
           <span className="rounded-chip bg-surface-3 px-1.5 py-px font-mono text-[10.5px] text-dim">
             {count}
@@ -188,7 +188,7 @@ function DeleteConfirm({
       role="group"
       aria-label={`Delete the saved view "${name}"?`}
     >
-      <span className="max-w-[160px] truncate">Delete "{name}"?</span>
+      <span className="max-w-[160px] break-words">Delete "{name}"?</span>
       <button
         type="button"
         autoFocus
@@ -328,7 +328,7 @@ export function ListToolbar({
                       setNaming(false);
                     }
                   }}
-                  placeholder="Name this view…"
+                  placeholder="Name this view"
                   aria-label="Name this view"
                   className="w-[190px] rounded-control border border-border-input bg-bg px-2.5 py-[5px] text-[12px] text-text outline-none focus:border-accent"
                 />
@@ -338,7 +338,7 @@ export function ListToolbar({
                   disabled={saving}
                   className="rounded-control border border-accent/50 bg-accent/10 px-2.5 py-[5px] text-[12px] font-semibold text-[#cfe0ff] disabled:opacity-60"
                 >
-                  {saving ? 'Saving…' : 'Save'}
+                  {saving ? 'Saving' : 'Save'}
                 </button>
                 <button
                   type="button"
@@ -407,7 +407,7 @@ export function ListToolbar({
               type="search"
               value={search.value}
               onChange={(e) => search.onChange(e.target.value)}
-              placeholder={search.placeholder ?? 'Search…'}
+              placeholder={search.placeholder ?? 'Search'}
               aria-label={search.label ?? search.placeholder ?? 'Search'}
               style={
                 search.fitPlaceholder && search.placeholder

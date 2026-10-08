@@ -449,6 +449,56 @@ def _parse_pipe_stage(text: str) -> PipeStage:
     )
 
 
+# soc-ai's own names for grid fields. The prefetched alert shows the model
+# the alert in snake case (``event_action``, ``source_ip``), and the model
+# then queried those names as fields: "unknown or forbidden field:
+# 'event_action'" (dogfood 2026-10-06, investigation W4). Each name maps to
+# the grid field it was read from (soc_ai.so_client.models.SoAlert), so the
+# query runs on the field the model meant. None of them is a grid field.
+SOC_AI_FIELD_ALIASES: dict[str, str] = {
+    "event_action": "event.action",
+    "event_module": "event.module",
+    "event_dataset": "event.dataset",
+    "event_category": "event.category",
+    "source_ip": "source.ip",
+    "source_port": "source.port",
+    "destination_ip": "destination.ip",
+    "destination_port": "destination.port",
+    "host_name": "host.name",
+    "user_name": "user.name",
+    "network_community_id": "network.community_id",
+    "process_entity_id": "process.entity_id",
+    "file_hash_sha256": "file.hash.sha256",
+}
+
+
+def _alias(name: str) -> str:
+    return SOC_AI_FIELD_ALIASES.get(name, name)
+
+
+def _alias_filter(node: FilterNode) -> FilterNode:
+    """The filter with every soc-ai field name replaced by its grid field."""
+    if isinstance(node, MatchAll):
+        return node
+    if isinstance(node, Term):
+        return Term(field=_alias(node.field), value=node.value)
+    if isinstance(node, And):
+        return And(children=tuple(_alias_filter(c) for c in node.children))
+    if isinstance(node, Or):
+        return Or(children=tuple(_alias_filter(c) for c in node.children))
+    if isinstance(node, Not):
+        return Not(child=_alias_filter(node.child))
+    assert_never(node)
+
+
+def _alias_pipe(stage: PipeStage) -> PipeStage:
+    if isinstance(stage, GroupBy):
+        return GroupBy(fields=tuple(_alias(f) for f in stage.fields))
+    if isinstance(stage, SortBy):
+        return SortBy(field=_alias(stage.field), direction=stage.direction)
+    return stage
+
+
 def parse_oql(query: str) -> OqlAst:
     """Parse a full OQL query string into an :class:`OqlAst`.
 
@@ -472,8 +522,8 @@ def parse_oql(query: str) -> OqlAst:
     else:
         filter_ast = _parse_filter_with_fallback(filter_text)
 
-    pipes = tuple(_parse_pipe_stage(p) for p in parts[1:])
-    return OqlAst(filter_=filter_ast, pipes=pipes)
+    pipes = tuple(_alias_pipe(_parse_pipe_stage(p)) for p in parts[1:])
+    return OqlAst(filter_=_alias_filter(filter_ast), pipes=pipes)
 
 
 def _parse_filter_with_fallback(filter_text: str) -> FilterNode:
@@ -527,7 +577,7 @@ def _syntax_error_sentence(err: LarkError, text: str) -> str:
             "Close every parenthesis and every quote."
         )
     if isinstance(err, UnexpectedToken):
-        near = str(err.token)[:40]
+        near = str(err.token)
         return (
             f"The filter has a syntax error at column {err.column} near '{near}'. "
             "Check the field name and the quotes."

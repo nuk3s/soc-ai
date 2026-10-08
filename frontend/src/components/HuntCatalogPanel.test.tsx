@@ -74,7 +74,7 @@ describe('HuntCatalogPanel', () => {
     const row = (await screen.findByText(SPEC.title)).closest('li')!;
     // The fixture carries neither field. A shipped analytic with no state row
     // is shipped and live, which is the backend's default for the catalog.
-    expect(within(row).getByText('shipped')).toBeTruthy();
+    expect(within(row).getByText('shipped with soc-ai')).toBeTruthy();
     expect(within(row).getByText('live')).toBeTruthy();
   });
 
@@ -85,7 +85,7 @@ describe('HuntCatalogPanel', () => {
     });
     mount();
     const row = (await screen.findByText(SPEC.title)).closest('li')!;
-    expect(within(row).getByText('local')).toBeTruthy();
+    expect(within(row).getByText('written here')).toBeTruthy();
     expect(within(row).getByText('shadow')).toBeTruthy();
     expect(within(row).queryByText('live')).toBeNull();
   });
@@ -163,8 +163,8 @@ describe('HuntCatalogPanel run state', () => {
     mount();
     // A learned detector reads no stored profile, so it has its own group.
     const group = await screen.findByTestId('detector-group');
-    expect(group.textContent).toContain('Learned detectors · 1');
-    expect(screen.queryByText(/Evaluated against behavioural profiles/)).toBeNull();
+    expect(group.textContent).toContain('Method: learned · 1');
+    expect(screen.queryByText(/Method: baseline/)).toBeNull();
     // The legend still defines the words on the row.
     expect(screen.getByTestId('profile-legend')).toBeTruthy();
     const row = screen.getByText(model.title).closest('li')!;
@@ -187,9 +187,9 @@ describe('HuntCatalogPanel run state', () => {
       last_prior_run_at: iso(HOUR / 6),
     });
     mount();
-    expect(await screen.findByText(/Evaluated against behavioural profiles · 1/)).toBeTruthy();
+    expect(await screen.findByText(/Method: baseline · 1/)).toBeTruthy();
     const group = screen.getByTestId('detector-group');
-    expect(group.textContent).toContain('Learned detectors · 1');
+    expect(group.textContent).toContain('Method: learned · 1');
     expect(group.textContent).toContain('counts are detector-host evaluations');
     // One legend for both groups.
     expect(screen.getAllByTestId('profile-legend')).toHaveLength(1);
@@ -243,7 +243,7 @@ describe('HuntCatalogPanel run state', () => {
     mount();
     const heldRow = (await screen.findByText(held.title)).closest('li')!;
     const chip = within(heldRow).getByTestId('catalog-held-profile-held');
-    expect(chip.textContent).toBe('held by soc-ai');
+    expect(chip.textContent).toBe('Paused by soc-ai');
     expect(chip.title).toBe(`${CHIP_HELD_BY_SYSTEM} ${REASON}`);
     // The status stays. The amber "shadow" chip of an analyst's shadow goes.
     expect(within(heldRow).getAllByText('shadow')).toHaveLength(1);
@@ -253,7 +253,7 @@ describe('HuntCatalogPanel run state', () => {
 
     // Negative control: an analyst's shadow keeps its chip and gets no hold.
     const chosenRow = screen.getByText(chosen.title).closest('li')!;
-    expect(within(chosenRow).queryByText('held by soc-ai')).toBeNull();
+    expect(within(chosenRow).queryByText('Paused by soc-ai')).toBeNull();
     expect(within(chosenRow).getAllByText('shadow')).toHaveLength(2);
   });
 
@@ -265,7 +265,7 @@ describe('HuntCatalogPanel run state', () => {
     });
     mount();
     const row = (await screen.findByText(PROFILE.title)).closest('li')!;
-    expect(within(row).queryByText('held by soc-ai')).toBeNull();
+    expect(within(row).queryByText('Paused by soc-ai')).toBeNull();
   });
 
   it('says a coverage at the cap is capped', async () => {

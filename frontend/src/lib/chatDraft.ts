@@ -1,7 +1,8 @@
-// Persist the in-progress chat draft for an investigation so it survives the
-// drawer/component unmounting (close + reopen) — without lifting state into a
-// parent. Scoped per investigation id and stored in sessionStorage so it lives
-// for the tab session and never leaks across investigations or to disk.
+// Persist the in-progress chat draft for one chat scope so it survives the
+// Ask soc-ai panel closing, a scope switch and a reload, without lifting state
+// into a parent. Keyed on the scope key ("general", "host:<ip>",
+// "investigation:<id>" and so on) and stored in sessionStorage, so it lives for
+// the tab session and never leaks across scopes or to disk.
 
 const KEY = (invId: string) => `soc-ai:chat-draft:${invId}`;
 

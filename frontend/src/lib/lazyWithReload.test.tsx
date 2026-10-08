@@ -41,7 +41,7 @@ describe('lazyWithReload', () => {
   it('first import failure sets the one-shot flag and reloads, holding the Suspense fallback', async () => {
     const Lazy = lazyWithReload(() => Promise.reject(new Error('404 stale chunk')));
     render(
-      <Suspense fallback={<div>loading…</div>}>
+      <Suspense fallback={<div>loading</div>}>
         <Lazy />
       </Suspense>,
     );
@@ -49,7 +49,7 @@ describe('lazyWithReload', () => {
     expect(sessionStorage.getItem(FLAG)).toBe('1');
     // The importer never resolves after triggering the reload, so nothing
     // stale (or error-shaped) flashes while the reload is in flight.
-    expect(screen.getByText('loading…')).toBeInTheDocument();
+    expect(screen.getByText('loading')).toBeInTheDocument();
   });
 
   it('second failure (flag already set) rethrows to the error boundary — no reload loop', async () => {
@@ -59,7 +59,7 @@ describe('lazyWithReload', () => {
     const Lazy = lazyWithReload(() => Promise.reject(new Error('server really down')));
     render(
       <Catcher>
-        <Suspense fallback={<div>loading…</div>}>
+        <Suspense fallback={<div>loading</div>}>
           <Lazy />
         </Suspense>
       </Catcher>,
@@ -74,7 +74,7 @@ describe('lazyWithReload', () => {
       Promise.resolve({ default: () => <div>screen loaded</div> }),
     );
     render(
-      <Suspense fallback={<div>loading…</div>}>
+      <Suspense fallback={<div>loading</div>}>
         <Lazy />
       </Suspense>,
     );

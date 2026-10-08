@@ -963,8 +963,25 @@ class Settings(BaseSettings):
     analyst. The floor is 1: an operator who wants no lead hunts turns
     ``lead_auto_hunt`` off, which says so on the Config screen."""
 
+    hunt_findings_investigate: bool = True
+    """A hunt opens one investigation for each subject finding.
+
+    ON by default. The owner's rule: a hunt that finds a sign of an attack
+    also checks it. A subject finding names an entity and cites a document
+    (soc_ai.hunting.findings.finding_is_subject). The hunt reads
+    ``investigating`` while the investigations run and ``complete`` when the
+    last one ends. OFF restores the older behaviour: the hunt completes when
+    its report lands, and the analyst opens each investigation by hand."""
+
+    hunt_findings_investigate_max: int = 20
+    """The most subject findings one hunt investigates by itself.
+
+    A finding past the cap is recorded as over the cap, and the analyst opens
+    its investigation by hand. The cap bounds the model time one hunt can
+    claim. Two investigations of one hunt run at a time."""
+
     general_chat_enabled: bool = True
-    """Master switch for the Dashboard's general chat (the "Ask soc-ai" box).
+    """Master switch for the general chat: the general scope of the Ask soc-ai panel.
 
     Governs whether the landing screen offers a one-turn agent thread that
     answers with the read tools and PROPOSES a hunt when a question needs a

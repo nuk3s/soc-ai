@@ -16,8 +16,18 @@ describe('kindLabel', () => {
     expect(kindLabel('prior_no_baseline')).toBe('finding with no benign baseline');
     expect(kindLabel('catalog_match')).toBe('analytic match');
     expect(kindLabel('hunt_finding')).toBe('hunt finding');
-    expect(kindLabel('telemetry_silence')).toBe('telemetry plane silent');
+    expect(kindLabel('telemetry_silence')).toBe('log source went silent');
     expect(kindLabel('logon_chain')).toBe('logon chain');
+  });
+
+  // "estate outlier" and "plane" are model words. The analyst reads what
+  // happened (dogfood 2026-10-06).
+  it('names the estate model and the silent source in plain words', () => {
+    expect(kindLabel('estate_outlier')).toBe('unusual across all hosts');
+    expect(kindLabel('telemetry_silence')).toBe('log source went silent');
+    for (const label of Object.values(KIND_LABEL)) {
+      expect(label).not.toMatch(/\bestate\b|\bplane\b/);
+    }
   });
 
   it('prefers the label the API sends', () => {

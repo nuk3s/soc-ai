@@ -619,6 +619,42 @@ async def run_spec(
     )
 
 
+async def count_cited_matches(
+    spec: HuntSpec,
+    *,
+    elastic: ElasticClient,
+    settings: Settings,
+    ids: list[str],
+    since: str,
+    until: str,
+) -> int | None:
+    """How many of ``ids`` the spec's detection matches inside the window.
+
+    The draft confirm box reads it. A draft whose dry run found nothing over
+    the source finding's own documents is either older than the window or
+    describes something those documents do not hold, and the analyst has to
+    know which before the save. None when the spec has no detection, no id is
+    given, or the grid did not answer. Never raises.
+    """
+    if spec.evaluator != "match" or spec.detection is None or not ids:
+        return None
+    query = {
+        "bool": {
+            "filter": [
+                spec.to_query(since=since, until=until),
+                {"ids": {"values": list(ids)[:100]}},
+            ]
+        }
+    }
+    try:
+        result = await elastic.search(
+            settings.events_index_pattern, query, size=0, track_total_hits=True
+        )
+    except Exception:
+        return None
+    return _total(result)
+
+
 def _total(result: EsSearchResult) -> int:
     """Document count. ``EsSearchResult.total`` is already a plain int.
 
@@ -639,5 +675,6 @@ __all__ = [
     "RoleOf",
     "SpecRun",
     "apply_role_gate",
+    "count_cited_matches",
     "run_spec",
 ]

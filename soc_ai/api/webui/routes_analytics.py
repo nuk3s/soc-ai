@@ -13,6 +13,7 @@ name order, so these two land on the shared router first.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -33,7 +34,7 @@ from soc_ai.api.webui._shared import (
 from soc_ai.api.webui.kind_labels import kind_label
 from soc_ai.config import Settings
 from soc_ai.hunting.catalog_tiers import Catalog, effective_catalog
-from soc_ai.hunting.leads import decays_from
+from soc_ai.hunting.leads import decays_from, no_lead_reasons
 from soc_ai.hunting.ledger import Ledger, analytic_ledger
 from soc_ai.hunting.spec import CATALOG_DIR, PRIOR_SWEEP_EVALUATORS, HuntSpec
 from soc_ai.hunting.weight import live_weight
@@ -144,6 +145,19 @@ class AnalyticDetailOut(AnalyticRowOut):
     # were off, and the two cases need two sentences.
     last_run_at: str | None = None
     runner_enabled: bool = True
+    # How often that loop runs, in minutes. The drawer says "waits for the
+    # next sweep, every hour" for an analytic the loop has not run yet. It
+    # said "not running", and the analytic looked broken (dogfood 2026-10-06 C6).
+    sweep_interval_minutes: int | None = None
+    # The shadow record of an analytic in shadow: when the shadow started,
+    # when the shadow week ends, and the sweeps and hits since the start. The
+    # approve box reads them. An analytic went live after 0 sweeps with a box
+    # that asked for a reason and nothing else (dogfood 2026-10-06 W9). None
+    # on any other status, and on a shadow row with no version on record.
+    shadow_since: str | None = None
+    shadow_ends_at: str | None = None
+    shadow_sweeps: int | None = None
+    shadow_hits: int | None = None
 
 
 class AnalyticCreateIn(BaseModel):
@@ -261,6 +275,18 @@ class AnalyticHitOut(BaseModel):
     # analytic was renamed or removed stays on the surface, so the card has to
     # know that the title opens no drawer.
     analytic_exists: bool = False
+    # The document ids the hit cites: the column, then the evidence. A live
+    # hit carries no receipts, so "Show evidence" read "No evidence." over a
+    # row that counted three documents.
+    document_ids: list[str] = []
+    # Why the hit formed no lead, in the rule's numbers. Null on a hit a lead
+    # holds. The card said "formed no lead and joined none" and gave no cause.
+    no_lead_reason: str | None = None
+    # Migration 0062. An analyst marked the hit benign: the reason, the hand
+    # and the time. Null on a hit nobody marked.
+    dismissed_reason: str | None = None
+    dismissed_by: str | None = None
+    dismissed_at: str | None = None
 
 
 class AnalyticHitCountsOut(BaseModel):
@@ -419,6 +445,14 @@ async def get_analytic(request: Request, analytic_id: str) -> AnalyticDetailOut:
             )
         ).all()
         last_run_at = await _last_run_at(db, analytic_id, evaluator=spec.evaluator)
+        shadow_since = (
+            _shadow_since(versions) if cat.status_of(analytic_id)[1] == "shadow" else None
+        )
+        shadow_record = (
+            await _shadow_record(db, analytic_id, evaluator=spec.evaluator, since=shadow_since)
+            if shadow_since is not None
+            else None
+        )
     state = states.get(analytic_id)
     by_entity: dict[str, dict[str, Any]] = {}
     for observation in recent_rows:
@@ -465,7 +499,7 @@ async def get_analytic(request: Request, analytic_id: str) -> AnalyticDetailOut:
                 to_status=version.to_status,
                 who=version.who,
                 at=_iso(version.at) or "",
-                why=version.why,
+                why=_version_why(version.why),
                 # Receipts are a list. The first row of a drafted analytic
                 # carries its generalization pins as a mapping, and those are
                 # no receipts.
@@ -479,7 +513,76 @@ async def get_analytic(request: Request, analytic_id: str) -> AnalyticDetailOut:
         recent=list(by_entity.values())[:_MAX_RECENT_ENTITIES],
         last_run_at=_iso(last_run_at),
         runner_enabled=_runner_enabled(request.app.state.settings, evaluator=spec.evaluator),
+        sweep_interval_minutes=_runner_interval(
+            request.app.state.settings, evaluator=spec.evaluator
+        ),
+        shadow_since=_iso(shadow_since),
+        shadow_ends_at=_iso(shadow_since + timedelta(days=SHADOW_WEEK_DAYS))
+        if shadow_since is not None
+        else None,
+        shadow_sweeps=shadow_record[0] if shadow_record is not None else None,
+        shadow_hits=shadow_record[1] if shadow_record is not None else None,
     )
+
+
+# The shadow week: an analyst approves a shadow analytic to live after it.
+SHADOW_WEEK_DAYS = 7
+
+
+def _shadow_since(versions: Any) -> datetime | None:
+    """When the current shadow began: the newest version row that moved to shadow."""
+    for version in reversed(list(versions)):
+        if version.to_status == "shadow":
+            at: datetime | None = version.at
+            return at
+    return None
+
+
+async def _shadow_record(
+    db: AsyncSession, analytic_id: str, *, evaluator: str, since: datetime
+) -> tuple[int, int]:
+    """(sweeps, hits) of one analytic since its shadow began."""
+    naive = since.replace(tzinfo=None) if since.tzinfo is not None else since
+    if evaluator in PRIOR_SWEEP_EVALUATORS:
+        sweeps = await db.scalar(
+            select(func.count())
+            .select_from(PriorSpecRun)
+            .where(PriorSpecRun.spec_id == analytic_id, PriorSpecRun.created_at >= naive)
+        )
+    else:
+        sweeps = await db.scalar(
+            select(func.count())
+            .select_from(HuntSpecSweep)
+            .where(HuntSpecSweep.spec_id == analytic_id, HuntSpecSweep.created_at >= naive)
+        )
+    hits = await db.scalar(
+        select(func.count())
+        .select_from(EntityObservation)
+        .where(
+            EntityObservation.spec_id == analytic_id,
+            EntityObservation.shadow.is_(True),
+            EntityObservation.first_seen_at >= naive,
+        )
+    )
+    return int(sweeps or 0), int(hits or 0)
+
+
+# The stored key of a drafted analytic's first version row
+# (soc_ai.store.analytics.drafted_from). The ordinal in it counts from 0.
+_DRAFTED_FROM_RE = re.compile(r"^drafted from hunt (?P<hunt>\S+) finding (?P<ordinal>\d+)$")
+
+
+def _version_why(why: str | None) -> str | None:
+    """The reason on a version row, in the words the hunt page uses.
+
+    The stored key counts findings from 0, and the hunt page numbers them
+    from F1. The version note read "finding 1" for the second finding on
+    the page. The key stays as stored: the draft route looks it up.
+    """
+    m = _DRAFTED_FROM_RE.match(why or "")
+    if m is None:
+        return why
+    return f"Drafted from finding F{int(m.group('ordinal')) + 1} of hunt {m.group('hunt')}."
 
 
 async def _last_run_at(db: AsyncSession, analytic_id: str, *, evaluator: str) -> datetime | None:
@@ -500,6 +603,17 @@ def _runner_enabled(settings: Any, *, evaluator: str) -> bool:
     if evaluator in PRIOR_SWEEP_EVALUATORS:
         return bool(getattr(settings, "hunting_prior_sweep_enabled", True))
     return bool(getattr(settings, "hunt_spec_sweeps_enabled", False))
+
+
+def _runner_interval(settings: Any, *, evaluator: str) -> int | None:
+    """How often the loop that runs this analytic runs, in minutes."""
+    name = (
+        "hunting_prior_sweep_interval_minutes"
+        if evaluator in PRIOR_SWEEP_EVALUATORS
+        else "hunt_spec_sweep_interval_minutes"
+    )
+    value = getattr(settings, name, None)
+    return int(value) if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 @router.post("/analytics", status_code=201, response_model=AnalyticRowOut)
@@ -756,6 +870,20 @@ def _document_count(observation: EntityObservation) -> int:
     return len(ids) if isinstance(ids, list) else 0
 
 
+def _hit_document_ids(observation: EntityObservation) -> list[str]:
+    """The documents a hit cites, deduplicated, at most ten: the column first."""
+    evidence = _evidence_of(observation)
+    ids: list[str] = [str(i) for i in (observation.document_ids or []) if i]
+    for key in ("anchor_id", "alert_id"):
+        if isinstance(evidence.get(key), str):
+            ids.append(evidence[key])
+    for key in ("sample_ids", "citations"):
+        value = evidence.get(key)
+        if isinstance(value, list):
+            ids.extend(str(i) for i in value if isinstance(i, str) and i)
+    return list(dict.fromkeys(ids))[:10]
+
+
 @router.get("/hunts/shadow-hits", response_model=ShadowHitsOut)
 async def list_shadow_hits(request: Request, limit: int = 50) -> ShadowHitsOut:
     """Shadow hits, unread first and then newest first.
@@ -880,7 +1008,10 @@ def _hit_bounds(
 
 
 def _hit_row(
-    observation: EntityObservation, cat: Catalog, lead_status: str | None
+    observation: EntityObservation,
+    cat: Catalog,
+    lead_status: str | None,
+    no_lead_reason: str | None = None,
 ) -> AnalyticHitOut:
     """One hit as the card renders it."""
     receipts = _receipts_of(observation)
@@ -917,6 +1048,15 @@ def _hit_row(
         lead_status=lead_status,
         document_count=_document_count(observation),
         analytic_exists=spec is not None,
+        document_ids=_hit_document_ids(observation),
+        no_lead_reason=(
+            no_lead_reason
+            if observation.lead_id is None and observation.dismissed_at is None
+            else None
+        ),
+        dismissed_reason=observation.dismissed_reason,
+        dismissed_by=observation.dismissed_by,
+        dismissed_at=_iso(observation.dismissed_at),
     )
 
 
@@ -1010,8 +1150,26 @@ async def list_analytic_hits(
                 int(lead.id): str(lead.status)
                 for lead in (await db.scalars(select(Lead).where(Lead.id.in_(lead_ids)))).all()
             }
+        # Why each hit with no lead formed none. One weighing per entity, for
+        # the page on screen only.
+        reasons = await no_lead_reasons(
+            db,
+            [
+                (r.entity_kind, r.entity_key)
+                for r in rows
+                if r.lead_id is None and r.dismissed_at is None
+            ],
+        )
     return AnalyticHitsOut(
-        hits=[_hit_row(r, cat, lead_status.get(int(r.lead_id or 0))) for r in rows],
+        hits=[
+            _hit_row(
+                r,
+                cat,
+                lead_status.get(int(r.lead_id or 0)),
+                reasons.get((r.entity_kind, r.entity_key)),
+            )
+            for r in rows
+        ],
         counts=counts,
     )
 
@@ -1102,6 +1260,10 @@ class EntityObservationOut(BaseModel):
     statistic: str | None = None
     statistic_value: float | None = None
     baseline_value: float | None = None
+    # The triage verdict an alert observation records. The host page counts
+    # the verdicts of the last seven days in its first sentence. None for any
+    # other source.
+    verdict: str | None = None
 
 
 class EntityObservationsOut(BaseModel):
@@ -1204,7 +1366,16 @@ async def list_observations(
                 statistic=observation.statistic,
                 statistic_value=observation.statistic_value,
                 baseline_value=observation.baseline_value,
+                verdict=_alert_verdict(observation),
             )
             for observation in rows
         ],
     )
+
+
+def _alert_verdict(observation: EntityObservation) -> str | None:
+    """The verdict an alert observation records, or None."""
+    if observation.source != "alert" or not isinstance(observation.evidence_json, dict):
+        return None
+    verdict = observation.evidence_json.get("verdict")
+    return verdict if isinstance(verdict, str) and verdict else None

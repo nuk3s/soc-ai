@@ -1,11 +1,9 @@
 import { AlertTriangle, ChevronLeft, RotateCw, Server } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { Link, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { DOCK_SAFE_AREA_CLASS } from '../components/ChatDock';
 import { HostActivityRow } from '../components/HostActivityRow';
 import { HostAddresses } from '../components/HostAddresses';
 import { HostBriefing } from '../components/HostBriefing';
-import { HostChatDock } from '../components/HostChatDock';
 import { HostFacts, HostUnknowns } from '../components/HostFacts';
 import { HostHero } from '../components/HostHero';
 import { HostKpis } from '../components/HostKpis';
@@ -23,19 +21,23 @@ import {
   getDossierRefreshStatus,
   getDossierSummary,
   getHostActivity,
+  getLeads,
   getMachine,
   getMe,
+  getObservations,
   isNotFound,
   resolveMachine,
   startDossierRefresh,
 } from '../lib/api';
+import { useChatScope } from '../lib/chatScope';
 import { cn } from '../lib/cn';
 import { activityState } from '../lib/hostActivity';
 import { isMachineKey, isResolved, portsView, roleVocabulary } from '../lib/hostDossier';
+import { alertVerdicts, leadLines, leadTouches, verdictLines } from '../lib/hostSituation';
 import { listUrlToReturnTo, machineHref, type HostsLocationState } from '../lib/hostsList';
 import { isIpKey } from '../lib/ip';
 import { plural } from '../lib/plural';
-import { SHOWN_ERRORS, sweepErrorList } from '../lib/sweepErrors';
+import { SHOWN_ERRORS, sweepErrorList, sweepFailureSentence } from '../lib/sweepErrors';
 import { absTime } from '../lib/timeRange';
 import type { Dossier, DossierRefreshStatus, HostActivityRange, MachineDetail } from '../lib/types';
 import { useAsync } from '../lib/useAsync';
@@ -323,9 +325,37 @@ export function HostDetail() {
   useEffect(() => setApplied(null), [data]);
   const dossier = applied ?? data;
 
-  // The chat dock's scope label prefers the name a human uses — the SAME
-  // derivation HostHero applies, so the header and the dock cannot disagree
-  // about what this machine is called. The address is the honest fallback.
+  // The first screen leads with what waits on this host and what the
+  // verdicts of the last seven days found (dogfood 2026-10-06, S3). The leads
+  // strip and the observations panel below read the same two sources; these
+  // reads feed the hero sentence and the Alerts card. A failed read leaves
+  // the lines out and the panels below say why.
+  const situationKey = dossier?.found ? ip : '';
+  const leadsRead = useAsync(
+    () => (situationKey ? getLeads('all').then((rows) => ({ key: situationKey, rows })) : Promise.resolve(null)),
+    [situationKey],
+    { refetchInterval: 60_000 },
+  );
+  const observationsRead = useAsync(
+    () =>
+      situationKey
+        ? getObservations(situationKey, 7).then((res) => ({ key: situationKey, rows: res.observations }))
+        : Promise.resolve(null),
+    [situationKey],
+    { refetchInterval: 300_000 },
+  );
+  const hostLeads =
+    leadsRead.data && leadsRead.data.key === situationKey
+      ? leadsRead.data.rows.filter((lead) => leadTouches(lead, situationKey, dossier?.aliases ?? []))
+      : [];
+  const hostObservations =
+    observationsRead.data && observationsRead.data.key === situationKey ? observationsRead.data.rows : [];
+  const situation = [...leadLines(hostLeads), ...verdictLines(hostObservations)];
+  const verdictCount = alertVerdicts(hostObservations).length;
+
+  // The chat panel's scope line prefers the name a human uses: the SAME
+  // derivation HostHero applies, so the header and the panel cannot disagree
+  // about what this machine is called. The address is the fallback.
   const hostnameField = dossier?.fields.find((f) => f.field === 'hostname');
   const hostname =
     (machine?.name ?? '').trim() ||
@@ -542,10 +572,14 @@ export function HostDetail() {
     return () => setCrumbName(null);
   }, [setCrumbName, param, crumbName]);
 
+  // The Ask soc-ai panel's host scope. Present for a never-seen host too:
+  // "has this address appeared in the logs at all?" is a question the agent
+  // can still answer from the grid. Absent only when there is no host to be
+  // about (not an address, or the dossier read failed).
+  useChatScope(dossier && ip ? { scope: { kind: 'host', id: ip, name: hostname ?? ip } } : null);
+
   return (
-    // The dock at the bottom right is fixed to the viewport. Without the
-    // reservation it draws over the last Edit control on the facts panel.
-    <div className={cn('px-[22px] pt-[18px] font-sans text-text', DOCK_SAFE_AREA_CLASS)}>
+    <div className="px-[22px] pt-[18px] font-sans text-text">
       <div className="mb-3.5 flex flex-wrap items-center gap-3">
         <Link
           to={backTo}
@@ -650,7 +684,7 @@ export function HostDetail() {
         ) : nameResolveFailed ? (
           <ErrorState error={resolution.error!} onRetry={resolution.refetch} label="this host" />
         ) : settling || (loading && !dossier) ? (
-          <LoadingState label="Loading host…" />
+          <LoadingState label="Loading host" />
         ) : error && !dossier && isNotFound(error) ? (
           // The route itself 404'd. That is a different answer from "the sweep
           // has never seen this address" (200 + found:false, below), and from
@@ -710,8 +744,8 @@ export function HostDetail() {
                       {sweepErrors.length > 0 && (
                         <ul className="mt-1.5 space-y-0.5 text-[11.5px] text-dim">
                           {sweepErrors.slice(0, SHOWN_ERRORS).map((e, i) => (
-                            <li key={i} className="truncate font-mono" title={e}>
-                              {e}
+                            <li key={i} className="break-words" title={e}>
+                              {sweepFailureSentence(e)}
                             </li>
                           ))}
                           {sweepErrors.length > SHOWN_ERRORS && (
@@ -765,6 +799,20 @@ export function HostDetail() {
                     </div>
                   </>
                 )}
+                {/* The investigations, leads and observations that name an
+                    address live on the entity page, census or no census
+                    (dogfood 2026-10-06, S2). */}
+                <div data-testid="host-never-seen-entity" className="mt-2 text-[12.5px] leading-[1.6]">
+                  <Link
+                    to={`/entity/${encodeURIComponent(ip)}?view=entity`}
+                    className="font-semibold text-accent hover:underline"
+                  >
+                    Open the entity page for {ip}
+                  </Link>
+                  <span className="text-faint">
+                    . The entity page lists the investigations, leads and observations that name it.
+                  </span>
+                </div>
                 {/* THE OTHER LANE, on the one page with no room for it. The
                     copy above is about the sweep's DATABASE and survives an
                     outage; this page also put a LIVE question to Security Onion
@@ -870,8 +918,15 @@ export function HostDetail() {
                   <div className="font-semibold text-danger">
                     The last sweep failed on this host. The facts below may be out of date.
                   </div>
-                  <div className="mt-0.5 break-words font-mono text-[12px] text-text-2">
-                    {dossier.build_error}
+                  {/* A sentence, with the stored string in the tooltip. The
+                      banner printed "<address>: TimeoutError:" (dogfood
+                      2026-10-06). */}
+                  <div
+                    data-testid="host-build-error"
+                    className="mt-0.5 break-words text-[12.5px] text-text-2"
+                    title={dossier.build_error}
+                  >
+                    {sweepFailureSentence(dossier.build_error)}
                   </div>
                   {sweepNote && <div className="mt-1 text-[12px] text-dim">{sweepNote}</div>}
                 </div>
@@ -931,6 +986,7 @@ export function HostDetail() {
               machine={machine}
               adminBlocked={adminBlocked}
               lastActivity={newestActivity(shown?.volume)}
+              situation={situation}
             />
 
             {/* The cards lead (the owner's ask: KPIs and charts at the top),
@@ -943,9 +999,11 @@ export function HostDetail() {
               ip={dossier.ip}
               services={profileServedPorts(dossier) ?? servicePorts(dossier)}
               servicesSource={profileServedPorts(dossier) != null ? 'profile' : 'dossier'}
+              servicesWindowDays={dossier.profile?.[0]?.window_days}
               activity={shown}
               state={state}
               range={shownRange}
+              alertVerdicts={verdictCount}
             />
 
             <HostBriefing
@@ -953,11 +1011,26 @@ export function HostDetail() {
               canDeclare={canDeclare}
               onApplied={setApplied}
               focusField={primaryFocusField}
+              agent={machine ? machine.agent : undefined}
             />
+
+            {/* The leads and the observations sit above the peer graph: they
+                are the open work on this host, and the graph is context
+                (dogfood 2026-10-06, architecture change 4). All leads, not
+                New. A lead under a hunt and a lead already closed both
+                belong to this host. A repeated single signal is visible in
+                the observations before it forms a lead. */}
+            <LeadsStrip entityKey={ip} aliases={dossier.aliases} status="all" className="mb-3" />
+            <HostObservations entityKey={ip} className="mb-3" />
 
             {/* Every address of the machine, and its containers. */}
             {machine && (
-              <HostAddresses machine={machine} focusAddress={focusAddress} focusField={focusField} />
+              <HostAddresses
+                machine={machine}
+                focusAddress={focusAddress}
+                focusField={focusField}
+                lastActivity={newestActivity(shown?.volume)}
+              />
             )}
 
             <HostActivityRow
@@ -983,14 +1056,10 @@ export function HostDetail() {
                 it is the same shape of claim with better provenance -- and
                 because the two are currently computed separately and an
                 analyst needs to see both to notice when they disagree. */}
-            <BehaviouralProfile profile={dossier.profile ?? []} />
-            {/* Every observation on this host, from every source. A repeated
-                single signal is visible here before it forms a lead, so the
-                panel sits between the profile and the leads it may feed. */}
-            <HostObservations entityKey={ip} />
-            {/* All, not New. A lead under a hunt and a lead already closed
-                both belong to this host, and the host page listed neither. */}
-            <LeadsStrip entityKey={ip} aliases={dossier.aliases} status="all" className="mt-4" />
+            <BehaviouralProfile
+              profile={dossier.profile ?? []}
+              profilesEnabled={dossier.profiles_enabled}
+            />
 
             <HostUnknowns
               dossier={dossier}
@@ -1003,12 +1072,6 @@ export function HostDetail() {
         )}
       </div>
 
-      {/* Floating scoped chat, mounted the way Investigation mounts its dock:
-          bottom-right, costing no layout space. Present for a never-seen host
-          too — "has this address appeared in the logs at all?" is a question
-          the agent can still answer from the grid. Absent only when there is
-          no host to be about (not an address / the dossier read failed). */}
-      {dossier && <HostChatDock ip={ip} hostname={hostname} />}
     </div>
   );
 }

@@ -1,13 +1,15 @@
-import { Activity, ArrowUpRight, Crosshair, Database, Gauge, Ghost, RotateCw, Server, ShieldAlert, ShieldCheck, Stethoscope, WifiOff, X } from 'lucide-react';
+import { Activity, ArrowUpRight, Crosshair, Database, Gauge, Ghost, Inbox, RotateCw, Server, ShieldCheck, Stethoscope, WifiOff, X } from 'lucide-react';
 import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { KindBadge, PipelineErrorChip, StatusTag, SyntheticEvalBadge, VerdictPill } from '../components/Badges';
+import { PipelineErrorChip, StatusTag, VerdictPill } from '../components/Badges';
+import { DashboardGrid, LAYOUT_HELP_ID, LayoutControls } from '../components/DashboardGrid';
 import { FlowBadge } from '../components/FlowBadge';
-import { GeneralChatPanel } from '../components/GeneralChatPanel';
+import { AskSocAiCard } from '../components/AskPanel';
+import { FlowLink } from '../components/HowThisFlows';
+import { RowTags, TAGS_COLUMN } from '../components/RowTags';
 import { QualityCard } from '../components/QualityCard';
-import { INV_STATUS } from '../lib/statusMeta';
 import { Panel, PanelHeader } from '../components/Panel';
-import { EmptyState, ErrorState, Freshness, LoadingState, StaleNotice } from '../components/States';
+import { EmptyState, ErrorState, Freshness, LoadingInline, LoadingState, StaleNotice } from '../components/States';
 import { TimeRangeFilter, type CustomRange } from '../components/TimeRangeFilter';
 import { demoBlocked, useDemo } from '../lib/demo';
 import {
@@ -35,16 +37,19 @@ import {
   startQualityEval,
 } from '../lib/api';
 import { PIPELINE_ERRORS_URL, livePipelineErrors } from '../lib/investigationFilters';
+import { statusDetail, statusMeta } from '../lib/labels';
 import { formatSkipReasons } from '../lib/skipReasons';
+import { COUNTING } from '../lib/text';
 import { rangeToSinceUntil } from '../lib/timeRange';
 import { VERDICT } from '../lib/tokens';
 import {
   COUNT_AGE,
   COUNT_ALERT_EVENTS,
-  COUNT_AWAITING,
+  COUNT_NEEDS_YOU,
   COUNT_RUNNING,
   COUNT_TRUE_POSITIVES,
   COUNT_UNREAD_SHADOW_HITS,
+  OVERVIEW_FLOW,
   STATUS_INVESTIGATION,
 } from '../lib/tooltips';
 import type {
@@ -58,6 +63,9 @@ import type {
   Verdict,
 } from '../lib/types';
 import { useAsync } from '../lib/useAsync';
+import { useDashboardLayout } from '../lib/useDashboardLayout';
+import { type NeedsYouState, needsYouLinks, useNeedsYouCount } from '../lib/needsYou';
+import { WIDE_QUERY, useMediaQuery } from '../lib/useMediaQuery';
 
 // Status presentation mirrors the Investigations screen so a verdict reads the
 
@@ -145,6 +153,16 @@ function recentScope(shown: number, total: number | undefined): string {
   return `of the ${n} newest`;
 }
 
+/** The Investigations list the true-positive tile counts: the same window and
+ *  the verdict filter. A custom window has no preset to name, so the list
+ *  opens on its own window with the filter. */
+function truePositiveDestination(range: string): string {
+  const p = new URLSearchParams();
+  if (range !== 'custom') p.set('range', range);
+  p.set('verdict', 'true_positive');
+  return `/investigations?${p}`;
+}
+
 function severityDestination(sev: string, range: string, custom: CustomRange | null): string {
   const p = alertsWindowParams(range, custom);
   p.set('sev', sev);
@@ -206,6 +224,7 @@ function StatCard({
   color = '#e6e9ef',
   icon,
   title,
+  incomplete = false,
 }: {
   label: string;
   value: ReactNode;
@@ -215,6 +234,8 @@ function StatCard({
   /** One sentence stating what the number counts, and over what. A tile that
    *  disagrees with a list is the first thing an analyst asks about. */
   title?: string;
+  /** True while the grid banner shows: the count can be late or short. */
+  incomplete?: boolean;
 }) {
   return (
     <Panel className="px-4 py-3.5">
@@ -234,7 +255,159 @@ function StatCard({
         {value}
       </div>
       {sub && <div className="mt-1.5 text-[11.5px] leading-[1.4] text-dim">{sub}</div>}
+      {incomplete && <IncompleteMark />}
     </Panel>
+  );
+}
+
+/** The mark on a count while the grid banner shows. The tiles said "queue
+ *  clear" under a banner that said the grid was slow (dogfood 2026-10-06). */
+function IncompleteMark() {
+  return (
+    <div data-testid="tile-incomplete" className="mt-1 text-[11px] font-semibold text-warn">
+      May be incomplete.
+    </div>
+  );
+}
+
+/** "7d" as "7 days", for a line that names its window. */
+function windowWords(range: string): string {
+  const m = range.match(/^(\d+)([mhd])$/);
+  if (!m) return range;
+  const n = Number(m[1]);
+  const unit = m[2] === 'm' ? 'minute' : m[2] === 'h' ? 'hour' : 'day';
+  return `${n} ${unit}${n === 1 ? '' : 's'}`;
+}
+
+interface NeedsYouLine {
+  key: string;
+  count: number | null;
+  one: string;
+  many: string;
+  /** What to say when the server could not read the part. */
+  unknown: string;
+  to: string;
+  window?: string;
+}
+
+/**
+ * Needs you: the first tile, and the total of the work that waits on the
+ * analyst. The landing page said "Awaiting investigation 0 · queue clear"
+ * while 11 leads waited on Hunts (dogfood 2026-10-06), because the tile
+ * counted alert groups and nothing else. The tile now states the one count the
+ * sidebar badges and the bell state, with one line per part, and each line is
+ * a link to the list that holds the work.
+ *
+ * "Nothing needs you" is said only when every part was read and every part is
+ * zero. A failed read is "?", and a part the server could not read keeps its
+ * line with the reason.
+ */
+function NeedsYouTile({ state, incomplete = false }: { state: NeedsYouState; incomplete?: boolean }) {
+  const { data, failed } = state;
+  const links = needsYouLinks(data);
+  const floor = (data?.unknown.length ?? 0) > 0;
+  const value = data ? `${data.total.toLocaleString()}${floor ? '+' : ''}` : failed ? '?' : COUNTING;
+  const lines: NeedsYouLine[] = data
+    ? [
+        {
+          key: 'leads',
+          count: data.leads_needing_decision,
+          one: 'lead waits on a decision',
+          many: 'leads wait on a decision',
+          unknown: 'Could not count the leads.',
+          to: links.leads,
+        },
+        {
+          key: 'hits',
+          count: data.unread_shadow_hits,
+          one: 'shadow hit is unread',
+          many: 'shadow hits are unread',
+          unknown: 'Could not count the shadow hits.',
+          to: links.shadowHits,
+        },
+        {
+          key: 'alerts',
+          count: data.untriaged_groups,
+          one: 'alert group has no verdict',
+          many: 'alert groups have no verdict',
+          unknown: 'Could not count the alert groups. The grid did not answer.',
+          to: links.untriaged,
+          window: data.alert_window,
+        },
+        {
+          key: 'nmi',
+          count: data.needs_more_info,
+          one: 'verdict needs more info',
+          many: 'verdicts need more info',
+          unknown: 'Could not count the verdicts that need more info.',
+          to: links.needsMoreInfo,
+          window: data.verdict_window,
+        },
+        {
+          key: 'actions',
+          count: data.pending_actions,
+          one: 'recommended action waits for you',
+          many: 'recommended actions wait for you',
+          unknown: 'Could not count the recommended actions.',
+          to: links.pendingActions,
+          window: data.verdict_window,
+        },
+      ].filter((line) => line.count === null || line.count > 0)
+    : [];
+  const color = !data ? '#8b949e' : data.total > 0 || floor ? '#f5a623' : '#3fb950';
+  return (
+    <div data-testid="kpi-needs-you">
+      <Panel className="px-4 py-3.5">
+        <div className="flex items-start justify-between">
+          <div className="text-[10.5px] font-semibold uppercase tracking-[.06em] text-faint">Needs you</div>
+          <span className="flex" style={{ color }}>
+            <Inbox size={16} />
+          </span>
+        </div>
+        <div
+          data-testid="needs-you-total"
+          className="mt-2 text-[27px] font-semibold leading-none tabular-nums"
+          style={{ color }}
+          title={COUNT_NEEDS_YOU}
+        >
+          {value}
+        </div>
+        <div className="mt-1.5 text-[11.5px] leading-[1.5] text-dim">
+          {!data ? (
+            failed ? 'Could not read what needs you.' : <LoadingInline>Reading what needs you</LoadingInline>
+          ) : lines.length === 0 ? (
+            'Nothing needs you.'
+          ) : (
+            <ul className="flex flex-col gap-0.5">
+              {lines.map((line) => (
+                <li key={line.key} data-testid={`needs-you-line-${line.key}`}>
+                  {line.count === null ? (
+                    <span className="text-faint">{line.unknown}</span>
+                  ) : (
+                    <Link to={line.to} className="text-accent hover:underline">
+                      {line.count.toLocaleString()} {line.count === 1 ? line.one : line.many}
+                      {line.key === 'alerts' && data.alert_floor ? ' or more' : ''}
+                    </Link>
+                  )}
+                  {line.window && line.count !== null && (
+                    <span className="text-faint"> · last {windowWords(line.window)}</span>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+        {incomplete && <IncompleteMark />}
+        {/* The flow in one sentence, under the count the analyst works from.
+            The link opens the chart on the Hunts page. */}
+        <div
+          data-testid="needs-you-flow"
+          className="mt-2.5 border-t border-border-faint pt-2 text-[11.5px] leading-[1.5] text-dim"
+        >
+          {OVERVIEW_FLOW} <FlowLink />
+        </div>
+      </Panel>
+    </div>
   );
 }
 
@@ -358,7 +531,7 @@ function AutoTriageDegradedNote({ s }: { s: AutoTriageStatus }) {
 }
 
 function AutoTriagePanel({ s, loading }: { s: AutoTriageStatus | null; loading: boolean }) {
-  if (!s) return loading ? <LoadingState label="Checking…" /> : <EmptyState>No investigation activity.</EmptyState>;
+  if (!s) return loading ? <LoadingState label="Checking" /> : <EmptyState>No investigation activity.</EmptyState>;
   const done = s.hunted + s.skipped + s.failed;
   const pct = s.total ? Math.round((done / s.total) * 100) : 0;
   if (s.active) {
@@ -374,7 +547,7 @@ function AutoTriagePanel({ s, loading }: { s: AutoTriageStatus | null; loading: 
         <div className="mt-2.5 h-2 w-full overflow-hidden rounded-pill bg-surface-3">
           <div className="h-full rounded-pill bg-accent transition-[width] duration-500" style={{ width: `${pct}%` }} />
         </div>
-        {s.current && <div className="mt-2 truncate font-mono text-[11px] text-faint">{s.current}</div>}
+        {s.current && <div className="mt-2 break-all font-mono text-[11px] text-faint">{s.current}</div>}
       </div>
     );
   }
@@ -438,7 +611,7 @@ function EnrichmentPanel({
     );
   }
   if (!sources.length) {
-    return loading ? <LoadingState label="Loading…" /> : <EmptyState>No data sources.</EmptyState>;
+    return loading ? <LoadingState label="Loading" /> : <EmptyState>No data sources.</EmptyState>;
   }
   const local = sources.filter((s) => s.category === 'Local feed');
   const online = sources.filter((s) => s.category === 'Online lookup');
@@ -552,7 +725,7 @@ function SetupHealthCard({
           // is "could not tell", not a confirmed degraded state.
           <div className="px-[15px] py-3 text-[13px] text-dim">The setup health read failed. The result is unknown.</div>
         ) : (
-          <div className="px-[15px] py-3 text-[13px] text-dim">Checking setup health…</div>
+          <div className="px-[15px] py-3 text-[13px] text-dim"><LoadingInline>Checking setup health</LoadingInline></div>
         )
       ) : clean ? (
         <div className="px-[15px] py-3 text-[13px] text-text-2">All checks pass.</div>
@@ -574,7 +747,7 @@ function SetupHealthCard({
             )}
           </div>
           {detailLoading && !detailRows.length ? (
-            <div className="mt-2 text-[12px] text-faint">Loading details…</div>
+            <div className="mt-2 text-[12px] text-faint"><LoadingInline>Loading details</LoadingInline></div>
           ) : (
             failingRows.map((r) => (
               <div key={r.name} className="mt-2.5 text-[12.5px] leading-[1.5]">
@@ -599,7 +772,7 @@ function SetupHealthCard({
               className="flex items-center gap-1 text-[12px] font-semibold text-accent hover:underline disabled:opacity-60"
             >
               <RotateCw size={11} />
-              {rechecking ? 'Re-checking…' : 'Re-check'}
+              {rechecking ? 'Re-checking' : 'Re-check'}
             </button>
             {recheckFailed && !rechecking && (
               <span className="text-[11.5px] text-faint">The re-check failed. Try again.</span>
@@ -608,7 +781,7 @@ function SetupHealthCard({
         </div>
       ) : (
         <div className="px-[15px] py-3 text-[13px] text-text-2">
-          {checkCountLabel(failing, warned)}. An admin can see the details in Config →
+          {checkCountLabel(failing, warned)}. An admin can see the details in Settings →
           Diagnostics.
         </div>
       )}
@@ -639,6 +812,8 @@ interface DownDep {
   label: string;
   detail: string;
   headline: string;
+  /** Amber for a probe that answered late, red for one that did not answer. */
+  tone: 'warn' | 'danger';
 }
 
 // The probe's failure class, when it could name one. Optional on the wire: an
@@ -655,7 +830,12 @@ function depKind(c: HealthComponent): string {
 // 429 is a REPLY — the grid is up, shedding load, and the request will succeed
 // once it recovers. "Not reachable" sends a 3am analyst to check connectivity,
 // firewalls and whether the manager is down, none of which is the fault.
-function depHeadline(label: string, kind: string): string {
+function depHeadline(label: string, kind: string, key: DownDep['key']): string {
+  // The probe answered inside its budget, but late. The grid is up, so the
+  // headline is amber and says the counts can be late. It read "not
+  // reachable" in red over "answered in 4.3 s, budget 5 s" (dogfood
+  // 2026-10-06).
+  if (kind === 'slow') return key === 'es' ? 'Elasticsearch is slow. Counts can be late.' : `${label} is slow.`;
   if (kind === 'overloaded') return `${label} is overloaded. Retry later.`;
   if (kind === 'partial') return `${label} reads are incomplete.`;
   return `${label} is not reachable.`;
@@ -674,7 +854,8 @@ function downDeps(h: Health | null): DownDep[] {
     key,
     label,
     detail: c.detail,
-    headline: depHeadline(label, depKind(c)),
+    headline: depHeadline(label, depKind(c), key),
+    tone: depKind(c) === 'slow' ? 'warn' : 'danger',
   });
   if (!h.es.ok) out.push(dep('es', 'Security Onion (Elasticsearch)', h.es));
   if (!h.llm.ok) out.push(dep('llm', 'AI gateway (LLM)', h.llm));
@@ -689,6 +870,15 @@ function downDeps(h: Health | null): DownDep[] {
 export function Dashboard() {
   const navigate = useNavigate();
   const demo = useDemo(); // read-only demo: eval-run shows a note, never POST
+  // The panel layout. Edit mode is a deliberate switch so a stray drag never
+  // moves a panel, and it exists only at the width where the panels form a grid.
+  const dashLayout = useDashboardLayout();
+  // The one count of what waits on the analyst. The sidebar badges and the
+  // bell read the same provider, so the tile cannot disagree with them.
+  const needsYou = useNeedsYouCount();
+  const wide = useMediaQuery(WIDE_QUERY);
+  const [editingRequested, setEditingRequested] = useState(false);
+  const editingLayout = editingRequested && wide && dashLayout.editable;
   const [range, setRange] = useState('24h');
   const [custom, setCustom] = useState<CustomRange | null>(null);
   const rangeLabel = range === 'custom' ? 'custom range' : `last ${range}`;
@@ -757,6 +947,14 @@ export function Dashboard() {
     return { rows: pipeErr.rows, total: pipeErr.total, partial: pipeErr.partial === true };
   };
   const pipeErr = useAsync(fetchPipelineErrors, [], { refetchInterval: 300_000 });
+  // The true-positive count: the Investigations list query over this window,
+  // one row, for its server-side count. The list applies its own defaults on
+  // the server, so the tile and the list count the same runs.
+  const tpRead = useAsync(
+    () => listInvestigations({ ...rangeToSinceUntil(range, custom), limit: 1 }),
+    [range, custom?.from, custom?.to],
+    { refetchInterval: 30_000 },
+  );
   const triageActiveRef = useRef(false);
   const triageTick = useRef(0);
   const triage = useAsync(getAutoTriageStatus, [], {
@@ -911,12 +1109,12 @@ export function Dashboard() {
         preflightDetail.refetch();
       });
   };
-  // The Dashboard assistant's kill switch, read from /about (one mount GET; a
-  // flip takes effect on the next load). Gating on a SETTLED probe is the point:
-  // rendering the panel optimistically would fire a GET /chat that 403s on
-  // exactly the deployments that switched the assistant off. A failed probe
-  // fails OPEN — the setting defaults on, so an /about hiccup must not delete
-  // the feature.
+  // The general chat's kill switch, read from /about (one mount GET; a flip
+  // takes effect on the next load). Gating on a SETTLED probe is the point: a
+  // card that opened the panel optimistically would fire a GET /chat that 403s
+  // on exactly the deployments that switched the assistant off. A failed probe
+  // fails OPEN, because the setting defaults on and an /about hiccup must not
+  // delete the feature.
   const about = useAsync(getAbout, []);
   const chatEnabled =
     (!!about.data || !!about.error) && about.data?.general_chat_enabled !== false;
@@ -979,8 +1177,25 @@ export function Dashboard() {
   const pipelineErrorsTruncated =
     pipeErr.data?.partial === true || (pipeErr.data?.total ?? 0) > pipelineErrorRows.length;
 
-  const a = (n: number): string => (alerts.data ? n.toLocaleString() : alerts.error ? '—' : '…');
-  const i = (n: number): string => (invs.data ? n.toLocaleString() : invs.error ? '—' : '…');
+  // Which window the counts on screen came from. A range change keeps the old
+  // counts while the new window loads, and the tiles read "0 · No alerts in
+  // the last 30d" for a window with 388 groups (dogfood 2026-10-06). A window
+  // that is still being read shows "…" on every count, the way Alerts does.
+  const windowKey = [range, custom?.from ?? '', custom?.to ?? ''].join('|');
+  const [dataWindow, setDataWindow] = useState(windowKey);
+  useEffect(() => {
+    if (alerts.lastUpdated != null) setDataWindow(windowKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [alerts.lastUpdated]);
+  const switchingWindow = alerts.loading && !!alerts.data && dataWindow !== windowKey;
+  const counted = !!alerts.data && !switchingWindow;
+  const a = (n: number): string => (counted ? n.toLocaleString() : alerts.error ? '—' : COUNTING);
+  // The counts that read the grid can be late or short while its banner
+  // shows. The running count and the shadow hits come from the store, so
+  // they carry no mark.
+  const esDegraded = down.some((d) => d.key === 'es');
+  const i = (n: number): string => (invs.data ? n.toLocaleString() : invs.error ? '—' : COUNTING);
+  const tpCount = (n: number): string => (tpRead.data ? n.toLocaleString() : tpRead.error ? '?' : COUNTING);
   // Is this KPI row still showing counts from a grid that has since gone dark?
   // A failed BACKGROUND poll keeps the last-good data on screen and never sets
   // `error` — deliberate, so a blip doesn't blank a working console — which
@@ -1006,11 +1221,16 @@ export function Dashboard() {
         <div
           key={d.key}
           role="alert"
+          data-tone={d.tone}
           className="mb-3.5 flex items-start gap-2.5 rounded-card border px-3.5 py-2.5 text-[13px]"
-          style={{ borderColor: 'rgba(240,68,56,.35)', background: 'rgba(240,68,56,.08)' }}
+          style={
+            d.tone === 'warn'
+              ? { borderColor: 'rgba(245,166,35,.35)', background: 'rgba(245,166,35,.08)' }
+              : { borderColor: 'rgba(240,68,56,.35)', background: 'rgba(240,68,56,.08)' }
+          }
         >
-          <span className="mt-px flex flex-shrink-0" style={{ color: '#f04438' }}>
-            <WifiOff size={15} />
+          <span className="mt-px flex flex-shrink-0" style={{ color: d.tone === 'warn' ? '#f5a623' : '#f04438' }}>
+            {d.tone === 'warn' ? <Gauge size={15} /> : <WifiOff size={15} />}
           </span>
           <div className="min-w-0 flex-1">
             <div className="font-semibold text-text-2">{d.headline}</div>
@@ -1029,10 +1249,10 @@ export function Dashboard() {
       <div className="flex flex-wrap items-end justify-between gap-2">
         <div>
           <div className="flex items-baseline gap-3">
-            <div className="text-[20px] font-semibold tracking-[-.015em]">Dashboard</div>
+            <div className="text-[20px] font-semibold tracking-[-.015em]">Overview</div>
             <Freshness at={alerts.lastUpdated} />
           </div>
-          <div className="mt-0.5 text-[13px] text-dim">Live investigation overview · {rangeLabel}</div>
+          <div className="mt-0.5 text-[13px] text-dim">Live investigation counts · {rangeLabel}</div>
         </div>
         <span className="mb-1 flex items-center gap-1.5 text-[11.5px] text-faint">
           <span className="h-1.5 w-1.5 animate-pulseDot rounded-full bg-success" />
@@ -1050,7 +1270,33 @@ export function Dashboard() {
             if (r) setCustom(r);
           }}
         />
+        {/* Under 1024 px the panels stack in one column and cannot move. The
+            control went away with no word on why (dogfood 2026-10-06). */}
+        {!wide && (
+          <span data-testid="layout-narrow" className="ml-auto text-[11.5px] text-faint">
+            Widen the window to move or resize panels.
+          </span>
+        )}
+        {wide && (
+          <LayoutControls
+            editing={editingLayout}
+            onToggle={() => setEditingRequested(!editingLayout)}
+            onReset={dashLayout.reset}
+            saved={dashLayout.saved}
+            editable={dashLayout.editable}
+            lockedReason={dashLayout.lockedReason}
+            error={dashLayout.error}
+          />
+        )}
       </div>
+      {editingLayout && (
+        <div id={LAYOUT_HELP_ID} className="-mt-1.5 mb-4 text-[12px] leading-[1.5] text-dim">
+          Drag a panel by the handle on its top edge. Drag the bottom right corner of a panel to
+          change its size. A panel is never shorter than its content. On the keyboard, move the
+          focus to a handle. The arrow keys move the panel. Shift and an arrow key change its
+          size. {dashLayout.storeNote}
+        </div>
+      )}
 
       {/* The counts below are the last ones the grid answered, and both ways of
           losing the next read leave them frozen with nothing on the screen
@@ -1084,64 +1330,25 @@ export function Dashboard() {
           full-width chat composer, which took the largest above-the-fold band
           and pushed both the tiles and the outcomes chart under it (dogfood
           B2b, 2026-08-11): the assistant outranking the answer the analyst
-          opened the app for. The chat now leads the right-hand rail. */}
-      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+          opened the app for. The card of the Ask soc-ai panel sits in the right-hand rail. */}
+      <DashboardGrid
+        layout={dashLayout.layout}
+        editing={editingLayout}
+        wide={wide}
+        onCommit={dashLayout.commit}
+      >
+        {/* The panel id predates the tile: a saved layout keeps the slot it
+            gave "Awaiting investigation", and the Needs-you tile holds it. */}
+        <NeedsYouTile key="kpi-awaiting" state={needsYou} incomplete={esDegraded} />
         <StatCard
+          key="kpi-alert-events"
           label={`Alert events · ${range}`}
           value={a(m.events)}
           sub={`${a(m.groups)} detection groups`}
           color="#4b8bf5"
           icon={<Activity size={16} />}
           title={COUNT_ALERT_EVENTS}
-        />
-        <StatCard
-          label="Awaiting investigation"
-          value={a(m.verdict.untriaged)}
-          sub={
-            // The failed-read branch comes FIRST, ahead of every count-derived
-            // caption. `untriaged` is 0 after a failed fetch exactly as it is on
-            // a drained queue, so the caption fell through to "queue clear"
-            // under an honest em-dash value (dogfood 2026-08-14, D3): "—" says
-            // unknown, "queue clear" says safe, and during an outage those are
-            // opposite statements. The rule is the one the Auto-Investigate tile
-            // already follows thirty lines up — key off degraded, never off a
-            // zero — and it is only "clear" when a successful read returned none.
-            //
-            // A grid that dies with the tab open takes the second branch: the
-            // poll loop keeps the last-good count on screen and never sets
-            // `error`, so the caption went on calling a queue clear that was
-            // last read minutes ago, under a red banner saying the grid was
-            // down. Last-known is not current, and "clear" is a claim about now.
-            alerts.error
-              ? 'The backlog is unknown. The grid read failed.'
-              : alertsStale
-                ? 'The backlog is unknown. The grid stopped answering.'
-                : triage.data?.active
-                  ? `Auto-Investigate active · ${triage.data.hunted}/${triage.data.total}`
-                  : !alerts.data
-                    ? 'checking the queue…'
-                    : m.verdict.untriaged > 0
-                      ? (
-                          // This used to read "auto-investigate idle", which blamed
-                          // the sweep and sent the operator to the scheduler config.
-                          // The sweep is not necessarily idle — the group may simply
-                          // be outside its queue (below the severity floor, already
-                          // acked, schedule off), and this screen cannot tell which.
-                          // So it makes no claim about the sweep at all and offers
-                          // the one thing it knows: where to triage it by hand.
-                          <button
-                            onClick={() => navigate(verdictDestination('untriaged', range, custom))}
-                            title="Show these detections on the Alerts list"
-                            className="cursor-pointer text-left underline decoration-dim/50 underline-offset-2 hover:decoration-dim"
-                          >
-                            triage from Alerts
-                          </button>
-                        )
-                      : 'queue clear'
-          }
-          color="#f5a623"
-          icon={<ShieldAlert size={16} />}
-          title={COUNT_AWAITING}
+          incomplete={esDegraded}
         />
         {/* Three numbers used to sit in this tile answering three different
             questions under one heading: a count of DETECTION GROUPS, a second
@@ -1151,13 +1358,31 @@ export function Dashboard() {
             said the two were counting different things (dogfood 2026-09-07, D4).
             Now the group figures name their unit and their denominator, and the
             run figure carries its own window and unit on its own line. */}
+        {/* One count of true positives, from the query the Investigations
+            list runs. The tile counted alert groups still in the window and
+            read 0 while the list said 15 for the same 7 days (dogfood
+            2026-10-06, S6). It now reads the list's own count, through the
+            same route and its defaults, and links to that list. */}
         <StatCard
+          key="kpi-true-positives"
           label={`True positives · ${range}`}
-          value={a(m.verdict.true_positive)}
+          value={tpCount(tpRead.data?.truePositives ?? 0)}
           sub={
             <>
               <div>
-                of {a(m.groups)} detection groups · {a(m.verdict.needs_more_info)} need more info
+                {tpRead.data ? (
+                  <>
+                    of {tpRead.data.total.toLocaleString()} investigation
+                    {tpRead.data.total === 1 ? '' : 's'} ·{' '}
+                    <Link to={truePositiveDestination(range)} className="text-accent hover:underline">
+                      Open them
+                    </Link>
+                  </>
+                ) : tpRead.error ? (
+                  'Could not count the investigations.'
+                ) : (
+                  <LoadingInline>Counting the investigations</LoadingInline>
+                )}
               </div>
               {pipelineErrors > 0 && (
                 <div>
@@ -1180,11 +1405,13 @@ export function Dashboard() {
               )}
             </>
           }
-          color={m.verdict.true_positive > 0 ? '#f04438' : '#8b949e'}
+          color={(tpRead.data?.truePositives ?? 0) > 0 ? '#f04438' : '#8b949e'}
           icon={<ShieldCheck size={16} />}
           title={COUNT_TRUE_POSITIVES}
+          incomplete={esDegraded}
         />
         <StatCard
+          key="kpi-running"
           label="Investigations running"
           value={i(running)}
           sub={triage.data?.active ? 'Auto-Investigate active' : recentScope(rows.length, invs.data?.total)}
@@ -1199,7 +1426,7 @@ export function Dashboard() {
           // The whole card was a button that navigated. A link goes to a page,
           // so the words that name the destination carry the click and the
           // address can be read, copied and opened in a tab.
-          <div data-testid="kpi-shadow-hits">
+          <div key="kpi-shadow-hits" data-testid="kpi-shadow-hits">
             <StatCard
               label="Shadow hits · unread"
               value={
@@ -1227,20 +1454,17 @@ export function Dashboard() {
             />
           </div>
         )}
-      </div>
 
-      {/* main grid */}
-      <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-3">
         {/* left: outcomes + recent investigations */}
-        <div className="flex flex-col gap-4 lg:col-span-2">
-          <Panel>
+        <>
+          <Panel key="outcomes">
             <PanelHeader
               icon={<Activity size={15} />}
               title="Investigation outcomes"
               right={<span className="text-[11.5px] text-faint">{a(m.groups)} detection {m.groups === 1 ? 'group' : 'groups'}</span>}
             />
-            {alerts.loading && !alerts.data ? (
-              <LoadingState />
+            {(alerts.loading && !alerts.data) || switchingWindow ? (
+              <LoadingState label={switchingWindow ? `Loading the ${rangeLabel} window` : undefined} />
             ) : alerts.error ? (
               <div className="p-3.5">
                 <ErrorState error={alerts.error} onRetry={alerts.refetch} label="the alert counts" />
@@ -1263,7 +1487,7 @@ export function Dashboard() {
             )}
           </Panel>
 
-          <Panel>
+          <Panel key="recent">
             <PanelHeader
               icon={<Crosshair size={15} />}
               title="Recent investigations"
@@ -1288,7 +1512,10 @@ export function Dashboard() {
             ) : (
               <div>
                 {recent.map((r) => {
-                  const st = INV_STATUS[r.status];
+                  // The status words of lib/labels.ts, as on the
+                  // Investigations list: a running run reads "Running" and a
+                  // stopped run reads "Failed", with the cause in the title.
+                  const st = statusMeta(r.status);
                   return (
                     // The row was one button that navigated. No row is
                     // clickable as a whole: the name is the link, and the
@@ -1298,43 +1525,33 @@ export function Dashboard() {
                       data-testid="recent-investigation"
                       className="flex w-full items-center gap-3 border-b border-border-faint px-[15px] py-2.5 text-left last:border-0 hover:bg-surface-3"
                     >
-                      <KindBadge kind={r.kind} />
-                      {/* A run against planted synthetic scenarios must never
-                          read as a real one — badge it wherever the row appears. */}
-                      {r.isSynthEval && <SyntheticEvalBadge />}
-                      {/* Detection name + flow share one slot. Below `lg` they
-                          STACK — name on its own line, endpoints under it —
-                          because side by side they cannot both fit: the flow
-                          carries a 230px floor (two full IPv4s + the arrow, the
-                          Investigations column fix) and at 900px that left the
-                          name about one character wide, rendering
-                          "SURICATA │ E… │ 192.0.2.70 → 10.0.0.40" (dogfood,
-                          2026-08-12) — a row that names no detection. Stacking
-                          is what lets the endpoints yield the WIDTH without
-                          being dropped: both stay legible, the row just costs a
-                          second line at narrow sizes. At `lg`+ it is a row
-                          again with the same 1.4 : 1 split as before (the
-                          wrapper's 2.4 is their sum), so the wide layout is
-                          byte-for-byte the one that shipped. */}
-                      <span className="flex min-w-0 flex-[2.4] flex-col gap-0.5 lg:flex-row lg:items-center lg:gap-3">
+                      {/* Detection name + flow share one slot, name on its own
+                          line and the endpoints under it. Side by side they
+                          cannot both fit: the flow carries a 230px floor and
+                          at 900px that left the name about one character wide
+                          (dogfood, 2026-08-12). The chips sit in the tags
+                          column at the end of the row, so every name starts
+                          at the same x, and the whole name shows and wraps
+                          (owner, 2026-10-07). */}
+                      <span data-testid="recent-title-cell" className="flex min-w-0 flex-1 flex-col gap-0.5">
                         <Link
                           to={`/investigation/${r.id}`}
                           title={r.name}
-                          className="min-w-0 truncate text-[13px] font-medium text-accent hover:underline lg:min-w-[180px] lg:flex-[1.4]"
+                          className="min-w-0 whitespace-normal break-words text-[13px] font-medium leading-[1.4] text-accent hover:underline"
                         >
                           {r.name}
                         </Link>
                         {/* Still dropped below `sm`, as before: on a phone-width
                             column the second line is itself too narrow to hold
                             two IPv4s, and the name wants the whole row. */}
-                        <span className="hidden min-w-0 overflow-hidden sm:block lg:min-w-[230px] lg:flex-1">
+                        <span className="hidden min-w-0 sm:block">
                           <FlowBadge src={r.host === '—' ? null : r.host} dst={r.dst} className="text-[11px]" />
                         </span>
                       </span>
                       <span className="flex-none">
                         {/* A running/awaiting/errored row has no verdict yet — the
                             status tag carries that. Showing an "untriaged" pill
-                            beside "Investigating" reads as a contradiction. A
+                            beside "Running" reads as a contradiction. A
                             fallback (E1.2) replaces the amber NMI pill with the
                             pipeline-error chip, matching the Investigations list. */}
                         {r.fallback ? (
@@ -1356,9 +1573,9 @@ export function Dashboard() {
                           these two show only once there is room for all of it. */}
                       <span
                         className="hidden w-[120px] flex-none 2xl:block"
-                        title={STATUS_INVESTIGATION}
+                        title={`${STATUS_INVESTIGATION} ${statusDetail(r.status)}`}
                       >
-                        <StatusTag color={st.color} label={st.label} pulse={st.pulse} />
+                        <StatusTag color={st.color} label={st.label} pulse={r.status === 'running'} />
                       </span>
                       <span
                         className="hidden w-[64px] flex-none text-right font-mono text-[10.5px] text-faint 2xl:block"
@@ -1366,17 +1583,24 @@ export function Dashboard() {
                       >
                         {r.when}
                       </span>
+                      {/* The tags, in the one order of every list. The
+                          synthetic mark keeps a planted attack from reading
+                          as real activity. */}
+                      <span className="flex-none" style={{ width: TAGS_COLUMN }}>
+                        <RowTags testId={`recent-tags-${r.id}`} kind={r.kind} synthetic={r.isSynthEval} />
+                      </span>
                     </div>
                   );
                 })}
               </div>
             )}
           </Panel>
-        </div>
+        </>
 
         {/* right: the assistant, then live activity + enrichment posture.
-            Below `lg` the grid collapses to one column and source order IS
-            reading order, so this rail reads AFTER the outcomes chart and the
+            Below `lg` the grid stacks the panels in reading order (the XY cut
+            in lib/dashboardLayout.ts), and the shipped layout reads in this
+            source order, so this rail reads AFTER the outcomes chart and the
             recent-investigations list. That is deliberate. An earlier pass gave
             the rail `order-first` to keep the chat near the top, but that
             promoted the whole rail — chat, Auto-Investigate, quality, posture —
@@ -1386,13 +1610,14 @@ export function Dashboard() {
             reading in source order — it is the very next thing after the two
             number surfaces, and those two are the reason the screen exists. At
             `lg`+ the columns sit side by side and order is moot. */}
-        <div className="flex flex-col gap-4">
+        <>
           {/* Setup health — PERSISTENT, unlike every other panel in this rail
               (which hide themselves when there's nothing to review). Placed
               first, above the assistant, so a degraded integration is the
               first thing seen rather than something discovered later via a
               mysteriously-empty triage run. */}
           <SetupHealthCard
+            key="setup-health"
             summary={preflight.data}
             error={preflight.error}
             detailRows={preflightDetail.data?.rows ?? []}
@@ -1404,22 +1629,19 @@ export function Dashboard() {
             onOpenDiagnostics={() => navigate('/config#diagnostics')}
           />
 
-          {/* Ask soc-ai — the Dashboard assistant. This slot used to hold a box
-              that prefilled the Hunt Console's objective and navigated, which
-              turned every question into a multi-minute background job ("a cheap
-              copy-paste of the hunt page", owner 2026-08-06). It now ANSWERS
-              here, and proposes a hunt — for the analyst to confirm — when a
-              question needs a sweep. Rail-width and second in the reading order
-              rather than full-width and first: the analyst's numbers lead, and
-              the box is still the first thing in the column they reach for. */}
-          {chatEnabled && <GeneralChatPanel />}
+          {/* Ask soc-ai. The slot holds a short card with the three starter
+              questions. The chat itself is the shell's one panel on the general
+              scope, the panel every page opens from the top bar (owner,
+              2026-10-07). The slot keeps the `assistant` id, so a saved layout
+              keeps its place. */}
+          {chatEnabled && <AskSocAiCard key="assistant" />}
 
-          <Panel>
+          <Panel key="auto-investigate">
             <PanelHeader icon={<Activity size={15} />} title="Auto-Investigate" />
             <AutoTriagePanel s={triage.data} loading={triage.loading && !triage.data} />
           </Panel>
 
-          <Panel>
+          <Panel key="verdict-quality">
             <PanelHeader
               icon={<Gauge size={15} />}
               title="Verdict quality"
@@ -1433,7 +1655,7 @@ export function Dashboard() {
                     title="Run the quality micro-eval now. The run uses real investigations and takes minutes."
                     className="flex items-center gap-1 text-[12px] font-semibold text-accent hover:underline disabled:opacity-60"
                   >
-                    {evalRunning ? 'Evaluating…' : 'Run now'}
+                    {evalRunning ? 'Evaluating' : 'Run now'}
                   </button>
                 ) : undefined
               }
@@ -1452,7 +1674,7 @@ export function Dashboard() {
             )}
           </Panel>
 
-          <Panel>
+          <Panel key="enrichment">
             <PanelHeader icon={<Database size={15} />} title="Enrichment posture" />
             <EnrichmentPanel
               sources={sources.data?.sources ?? []}
@@ -1468,7 +1690,7 @@ export function Dashboard() {
               benign rules (dogfood 2026-07-15). Admin-gated endpoint — a 403 or
               zero pending simply hides the panel. */}
           {(tuning.data?.pending ?? 0) > 0 && (
-            <Panel>
+            <Panel key="detection-tuning">
               <PanelHeader icon={<Gauge size={15} />} title="Detection tuning" />
               <div className="flex items-center justify-between gap-3 px-[15px] py-3">
                 <div className="text-[13px] text-text-2">
@@ -1494,7 +1716,7 @@ export function Dashboard() {
               table is not what this count is about. Admin-gated endpoint, so a
               403 or an empty queue simply hides the panel. */}
           {dossierPending > 0 && (
-            <Panel>
+            <Panel key="host-dossier">
               <PanelHeader icon={<Server size={15} />} title="Host dossier" />
               <div className="flex items-center justify-between gap-3 px-[15px] py-3">
                 <div className="text-[13px] text-text-2">
@@ -1514,8 +1736,8 @@ export function Dashboard() {
               </div>
             </Panel>
           )}
-        </div>
-      </div>
+        </>
+      </DashboardGrid>
     </div>
   );
 }

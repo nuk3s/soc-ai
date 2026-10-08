@@ -188,12 +188,12 @@ describe('hunt-kind error-state re-run', () => {
       </MemoryRouter>,
     );
     expect(screen.queryByRole('button', { name: /Re-run investigation/i })).toBeNull();
-    expect(container.textContent).toContain('Re-promote this finding from its hunt to re-run it.');
+    expect(container.textContent).toContain('Open an investigation on this finding again from its hunt.');
     // The prose right above that pointer must not ALSO instruct "re-run it" —
     // two different meanings ("click a button" vs "go re-promote from the
     // hunt") stacked at the same spot is the bug under test here.
     expect(container.textContent).toContain(
-      'soc·ai recorded no cause. Re-promote it from its hunt to try again.',
+      'soc·ai recorded no cause. Open an investigation on it again from its hunt.',
     );
     expect(container.textContent).not.toContain('Re-run it to try again.');
     const link = screen.getByRole('link', { name: 'Sweep for beaconing to rare external IPs' });
@@ -209,7 +209,7 @@ describe('hunt-kind error-state re-run', () => {
     // Two: the toolbar's own Re-run plus failedEl's — both are ordinary for
     // a suricata-kind run; only the count (not zero) is under test here.
     expect(screen.getAllByRole('button', { name: /Re-run investigation/i }).length).toBeGreaterThan(0);
-    expect(container.textContent).not.toContain('Re-promote this finding');
+    expect(container.textContent).not.toContain('Open an investigation on this finding again');
     // The suricata copy names the missing cause and keeps the re-run advice.
     expect(container.textContent).toContain(
       'soc·ai recorded no cause. Re-run it to try again.',
@@ -236,11 +236,11 @@ describe('hunt-kind pipeline-fallback re-run', () => {
       </MemoryRouter>,
     );
     expect(screen.queryByRole('button', { name: /Re-run investigation/i })).toBeNull();
-    expect(container.textContent).toContain('Re-promote this finding from its hunt to re-run it.');
+    expect(container.textContent).toContain('Open an investigation on this finding again from its hunt.');
     // Same copy-tension fix as failedEl: the sentence above the pointer must
     // agree with it instead of also saying "re-run it".
     expect(container.textContent).toContain(
-      'soc·ai recorded it as needs_more_info as a placeholder. Re-promote it from its hunt to try again.',
+      'soc·ai recorded it as needs_more_info as a placeholder. Open an investigation on it again from its hunt.',
     );
     expect(container.textContent).not.toContain('placeholder. Re-run it to get a real verdict.');
     // Two identical links here by design: the fallback panel's own pointer AND
@@ -299,7 +299,7 @@ describe('hunt-kind inconclusive/needs_more_info wayfinding', () => {
       </MemoryRouter>,
     );
     expect(container.textContent).toContain(
-      'Re-promote this finding from its hunt to refine it. You can also ask a follow-up below. This screen cannot re-run a promoted finding.',
+      'Open an investigation on this finding again from its hunt to refine it. You can also ask a follow-up in Ask soc-ai. This screen cannot re-run the investigation of a finding.',
     );
     expect(container.textContent).not.toContain('focused re-investigation');
     // No re-run affordance anywhere on this shape — the copy and the buttons
@@ -317,10 +317,11 @@ describe('hunt-kind inconclusive/needs_more_info wayfinding', () => {
         />
       </MemoryRouter>,
     );
+    expect(container.textContent).toContain('The model could not converge on a verdict.');
     expect(container.textContent).toContain(
-      'The model could not converge on a verdict. Start a focused re-investigation. You can also resolve it in chat.',
+      'Start a focused re-investigation. You can also resolve it in chat.',
     );
-    expect(container.textContent).not.toContain('This screen cannot re-run a promoted finding');
+    expect(container.textContent).not.toContain('This screen cannot re-run the investigation of a finding');
   });
 
   it('adds the wayfinding line beside the open questions on a hunt-kind needs_more_info run', () => {
@@ -340,14 +341,14 @@ describe('hunt-kind inconclusive/needs_more_info wayfinding', () => {
     );
     expect(screen.getByText(/Is this host normally this chatty at night\?/i)).toBeTruthy();
     expect(container.textContent).toContain(
-      'Re-promote this finding from its hunt to refine it. You can also ask a follow-up below. This screen cannot re-run a promoted finding.',
+      'Open an investigation on this finding again from its hunt to refine it. You can also ask a follow-up in Ask soc-ai. This screen cannot re-run the investigation of a finding.',
     );
     expect(screen.queryByRole('button', { name: /Request more info/i })).toBeNull();
   });
 });
 
 describe('hunt-kind recommended actions', () => {
-  it('disables the Approve/Execute button with the explanatory title, but leaves Reject clickable (local-only, not an SO write)', () => {
+  it('disables the Approve/Execute button with the explanatory title, but leaves Dismiss clickable (no SO write)', () => {
     render(
       <MemoryRouter>
         <Investigation
@@ -356,9 +357,9 @@ describe('hunt-kind recommended actions', () => {
         />
       </MemoryRouter>,
     );
-    const approve = screen.getByRole('button', { name: /Approve|Execute/i });
+    const approve = screen.getByRole('button', { name: /^Acknowledge$/i });
     expect(approve).toBeDisabled();
-    expect(approve).toHaveAttribute('title', 'A promoted finding has no Security Onion alert to act on');
+    expect(approve).toHaveAttribute('title', 'A promoted finding has no Security Onion alert to act on.');
     const reject = screen.getByRole('button', { name: /Reject|Dismiss/i });
     expect(reject).not.toBeDisabled();
   });
@@ -369,7 +370,7 @@ describe('hunt-kind recommended actions', () => {
         <Investigation inv={baseInv({ kind: 'suricata', actions: [ackAction] })} layout="page" />
       </MemoryRouter>,
     );
-    const approve = screen.getByRole('button', { name: /Approve|Execute/i });
+    const approve = screen.getByRole('button', { name: /^Acknowledge$/i });
     expect(approve).not.toBeDisabled();
   });
 
@@ -382,7 +383,7 @@ describe('hunt-kind recommended actions', () => {
         />
       </MemoryRouter>,
     );
-    const approve = screen.getByRole('button', { name: /Approve|Execute/i });
+    const approve = screen.getByRole('button', { name: /^Acknowledge$/i });
     fireEvent.click(approve);
     // Still disabled, no "Writing to Security Onion…" transition.
     expect(screen.queryByText(/Writing to Security Onion/i)).toBeNull();

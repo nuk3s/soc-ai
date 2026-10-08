@@ -161,7 +161,7 @@ _SSE_BODY = 'event: done\ndata: {"payload": {"recommended_count": 0, "rounds": 1
 _NO_SESSION_401_BODY = {
     "detail": {
         "reason": "no_session",
-        "hint": "Log in at /app/login or send 'Authorization: Bearer scai_…'.",
+        "hint": "Log in at /app/login or send 'Authorization: Bearer scai_<token>'.",
     }
 }
 

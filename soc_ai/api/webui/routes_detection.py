@@ -54,7 +54,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
+import re
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -74,7 +75,12 @@ from soc_ai.api.webui.routes_alerts import _es_api_error_http, _grid_unavailable
 from soc_ai.api.webui.routes_hunts import _ID_SHAPED, _hunt_report
 from soc_ai.config import Settings
 from soc_ai.detection.analytic_drafter import draft_analytic
-from soc_ai.detection.analytic_models import AnalyticDraftOut, Generalization
+from soc_ai.detection.analytic_models import (
+    AnalyticDraft,
+    AnalyticDraftOut,
+    DraftReview,
+    Generalization,
+)
 from soc_ai.detection.drafter import draft_detection
 from soc_ai.detection.models import DryRunResult, SigmaDraft
 from soc_ai.detection.untrusted import neutralize_untrusted
@@ -84,8 +90,9 @@ from soc_ai.detection.validators import (
     validate_sigma_yaml,
 )
 from soc_ai.hunting.catalog_tiers import effective_catalog
-from soc_ai.hunting.execute import run_spec
-from soc_ai.hunting.spec import parse_spec
+from soc_ai.hunting.draft_review import alert_rule_repeats, logic_sentence, source_sentence
+from soc_ai.hunting.execute import count_cited_matches, run_spec
+from soc_ai.hunting.spec import HuntSpec, parse_spec
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.so_client.fields import get_dotted
 from soc_ai.store import analytics as analytics_store
@@ -277,9 +284,7 @@ def _build_evidence(finding: dict[str, Any], cited_docs: list[dict[str, Any]]) -
         listed = [
             neutralize_untrusted(c, cap=_MAX_VALUE_CHARS) for c in cite_ids[:_MAX_CITED_IDS_LISTED]
         ]
-        suffix = (
-            f", … and {len(cite_ids) - len(listed)} more" if len(cite_ids) > len(listed) else ""
-        )
+        suffix = f", and {len(cite_ids) - len(listed)} more" if len(cite_ids) > len(listed) else ""
         lines.append("Cited evidence (ES document ids): " + ", ".join(listed) + suffix)
     else:
         lines.append("No cited evidence ids on this finding.")
@@ -737,6 +742,104 @@ async def _store_drafted(
     return state.analytic_id
 
 
+# The ids the previews of one finding took, keyed by (hunt id, ordinal). The
+# process holds them: a restart between two previews of one finding is rare,
+# and the cost of a miss is one more id. Bounded so the map cannot grow.
+_DRAFT_IDS_ATTR = "_analytic_draft_ids"
+_DRAFT_IDS_CAP = 500
+_ID_LINE = re.compile(r"(?m)^id:[ \t]*\S+[ \t]*$")
+
+
+def _stable_draft_id(
+    request: Request,
+    hunt_id: str,
+    ordinal: int,
+    draft: AnalyticDraft,
+    spec: HuntSpec,
+    catalog_ids: list[str],
+) -> tuple[AnalyticDraft, HuntSpec]:
+    """The draft with the id the first preview of this finding took.
+
+    The model names the id, and it named it again on each draft. An id the
+    catalog already holds is never taken: a retired analytic keeps its id.
+    """
+    ids: dict[tuple[str, int], str] = getattr(request.app.state, _DRAFT_IDS_ATTR, None) or {}
+    setattr(request.app.state, _DRAFT_IDS_ATTR, ids)
+    key = (hunt_id, int(ordinal))
+    first = ids.get(key)
+    if first is None or first == spec.id or first in catalog_ids:
+        if len(ids) >= _DRAFT_IDS_CAP:
+            ids.pop(next(iter(ids)))
+        ids[key] = spec.id
+        return draft, spec
+    text, n = _ID_LINE.subn(f"id: {first}", draft.spec_yaml, count=1)
+    if n != 1:
+        return draft, spec
+    return draft.model_copy(update={"spec_yaml": text}), spec.model_copy(update={"id": first})
+
+
+async def _draft_review(
+    spec: HuntSpec,
+    *,
+    finding: dict[str, Any],
+    cited_docs: list[dict[str, Any]],
+    elastic: ElasticClient,
+    settings: Settings,
+) -> DraftReview:
+    """The draft in words: title, logic, false positives and two checks.
+
+    The source check counts the finding's own documents that the logic
+    matches inside the dry-run window, and the ones older than it. A grid that
+    does not answer leaves the check out. It never fails the draft.
+    """
+    ids = [c for c in _citation_ids(finding) if _ID_SHAPED.match(c)]
+    matched: int | None = None
+    if ids:
+        try:
+            async with asyncio.timeout(settings.webui_grid_timeout_s):
+                matched = await count_cited_matches(
+                    spec,
+                    elastic=elastic,
+                    settings=settings,
+                    ids=ids,
+                    since=f"now-{_DRY_RUN_DAYS}d",
+                    until="now",
+                )
+        except TimeoutError:
+            matched = None
+    cutoff = datetime.now(UTC) - timedelta(days=_DRY_RUN_DAYS)
+    older = 0
+    for doc in cited_docs:
+        stamp = _doc_time(doc)
+        if stamp is not None and stamp < cutoff:
+            older += 1
+    return DraftReview(
+        title=spec.title,
+        logic=logic_sentence(spec),
+        false_positives=[str(f) for f in spec.false_positives],
+        source=source_sentence(
+            cited=len(ids), matched=matched, older=older, window_days=_DRY_RUN_DAYS
+        ),
+        repeats_alerts=alert_rule_repeats(spec),
+    )
+
+
+def _doc_time(doc: dict[str, Any]) -> datetime | None:
+    source = doc.get("_source")
+    raw = source.get("@timestamp") if isinstance(source, dict) else None
+    if not isinstance(raw, str):
+        return None
+    try:
+        stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return stamp if stamp.tzinfo is not None else stamp.replace(tzinfo=UTC)
+
+
+# The dry run reads 30 days. The draft review states the same window.
+_DRY_RUN_DAYS = 30
+
+
 @router.post("/hunts/{hunt_id}/findings/{ordinal}/draft-analytic")
 async def draft_hunt_finding_analytic(  # noqa: PLR0915 - one linear path, each failure maps to one answer
     request: Request,
@@ -912,6 +1015,12 @@ async def draft_hunt_finding_analytic(  # noqa: PLR0915 - one linear path, each 
         raise _es_api_error_http(exc) from exc
 
     if body.preview:
+        # One id per finding. Two drafts of one finding got two ids, and the
+        # analyst could not tell whether they were one analytic or two.
+        draft, spec = _stable_draft_id(request, hunt_id, ordinal, draft, spec, catalog_ids)
+        review = await _draft_review(
+            spec, finding=finding, cited_docs=cited_docs, elastic=elastic, settings=settings
+        )
         return AnalyticDraftOut(
             analytic_id=spec.id,
             spec_yaml=draft.spec_yaml,
@@ -920,6 +1029,7 @@ async def draft_hunt_finding_analytic(  # noqa: PLR0915 - one linear path, each 
             status="preview",
             notes=notes,
             generalization=_generalization_of(result.generalization),
+            review=review,
         )
     analytic_id = await _store_drafted(
         request,

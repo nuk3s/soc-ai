@@ -568,8 +568,7 @@ def check_narrative_grounding(
 
     reason = (
         "answer asserts per-event fact(s) "
-        + ", ".join(repr(a) for a in ungrounded[:6])
-        + (" …" if len(ungrounded) > 6 else "")
+        + ", ".join(repr(a) for a in ungrounded)
         + " that appear in neither a tool result nor the investigation context"
     )
     return NarrativeGrounding(

@@ -85,6 +85,26 @@ const HUNT_ON_LEAD = {
   chatCount: 0,
 };
 
+/** One hunt on the lead as the server names it, with its answer. */
+const HUNT_ROW = {
+  id: 'H-LEAD-1',
+  status: 'complete',
+  outcome: 'clean',
+  outcome_label: 'No threat observed',
+  threat_findings: 0,
+  steps: 17,
+  elapsed_sec: 360,
+  started_at: '2026-09-18T11:00:00Z',
+  started_by: 'auto-hunt',
+  answer: 'The two events are attribute writes. No replication right appears.',
+  not_checked: ['DCE-RPC traffic. This grid has no zeek.dce_rpc data.'],
+};
+
+/** C2: the weights sit behind the Scoring toggle. Open it. */
+async function openScoring() {
+  fireEvent.click(await screen.findByRole('button', { name: 'Scoring' }));
+}
+
 function mount(at = '/leads/12') {
   return render(
     <MemoryRouter initialEntries={[at]}>
@@ -114,6 +134,7 @@ describe('LeadDetail', () => {
   it('shows the entity, both weights, and the timeline with evidence ids', async () => {
     mount();
     await waitFor(() => expect(screen.getByText('10.1.2.3')).toBeTruthy());
+    await openScoring();
     expect(screen.getByText(/weight now 1\.28/)).toBeTruthy();
     expect(screen.getByText(/at formation 1\.30/)).toBeTruthy();
     expect(screen.getByText(/Directory replication requested by/)).toBeTruthy();
@@ -130,6 +151,7 @@ describe('LeadDetail', () => {
   // described the weight now. The number that never moves wore it too.
   it('gives each weight on the meta line its own sentence', async () => {
     mount();
+    await openScoring();
     expect((await screen.findByText(/weight now 1\.28/)).getAttribute('title')).toBe(WEIGHT_NOW);
     expect(screen.getByText(/at formation 1\.30/).getAttribute('title')).toBe(WEIGHT_AT_FORMATION);
   });
@@ -146,6 +168,7 @@ describe('LeadDetail', () => {
       ],
     } as never);
     mount();
+    await openScoring();
     const row = await screen.findByTestId('weight-kind-novel_served_port');
     expect(row.textContent).toBe('new served port 1.70 of 1.70, saturated');
     expect(row.getAttribute('title')).toBe(WEIGHT_BY_TYPE);
@@ -160,6 +183,7 @@ describe('LeadDetail', () => {
       ],
     } as never);
     mount();
+    await openScoring();
     const row = await screen.findByTestId('weight-kind-off_hours');
     expect(row.textContent).toBe('off hours 0.28 of 1.70');
   });
@@ -229,7 +253,9 @@ describe('LeadDetail', () => {
     );
     const row = screen.getByTestId('observation-query-2');
     expect(within(row).getByText(query)).toBeTruthy();
-    const link = within(row).getByRole('link', { name: 'Run this query' });
+    // W6: the link names the act. It starts a hunt, and it runs no query.
+    const link = within(row).getByRole('link', { name: 'Hunt with this query' });
+    expect(within(row).getByRole('button', { name: 'Copy query' })).toBeTruthy();
     const href = link.getAttribute('href') ?? '';
     expect(href.startsWith('/hunts?new=1&objective=')).toBe(true);
     expect(decodeURIComponent(href.split('objective=')[1])).toContain(query);
@@ -284,11 +310,13 @@ describe('LeadDetail', () => {
     expect(screen.getByText('outside measured hours')).toBeTruthy();
   });
 
-  it('offers the three actions on a new lead', async () => {
+  // The owner could not tell "Hunt" from "Promote" (2026-10-07). A lead
+  // offers one verb. The hunt investigates what it finds.
+  it('offers the two actions on a new lead', async () => {
     mount();
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Hunt' })).toBeTruthy());
-    expect(screen.getByRole('button', { name: 'Promote' })).toBeTruthy();
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Hunt this lead' })).toBeTruthy());
     expect(screen.getByRole('button', { name: 'Dismiss' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /Open an investigation|Promote/ })).toBeNull();
   });
 
   // The page uses the words the strip uses. "Start a hunt" here and "Hunt"
@@ -304,20 +332,35 @@ describe('LeadDetail', () => {
 // first hunt forever, and "Hunt this lead" started a third from a page that
 // said nothing about the other two.
 describe('LeadDetail hunts on the lead', () => {
+  const SERVER_HUNTS = [
+    {
+      ...HUNT_ROW,
+      id: 'H-LEAD-2',
+      status: 'running',
+      outcome: '',
+      outcome_label: '',
+      steps: 3,
+      answer: '',
+      not_checked: [],
+    },
+    HUNT_ROW,
+  ];
+
   it('lists every hunt on the lead with its status and a link', async () => {
-    vi.mocked(getHunts).mockResolvedValue([
-      HUNT_ON_LEAD as never,
-      { ...HUNT_ON_LEAD, id: 'H-LEAD-2', status: 'running', outcome: '' } as never,
-      { ...HUNT_ON_LEAD, id: 'H-OTHER', leadId: 99 } as never,
-    ]);
-    vi.mocked(getLead).mockResolvedValue({ ...LEAD, status: 'hunting', hunt_id: 'H-LEAD-1' } as never);
+    vi.mocked(getLead).mockResolvedValue({
+      ...LEAD,
+      status: 'hunting',
+      hunt_id: 'H-LEAD-2',
+      hunt_status: 'running',
+      hunts: SERVER_HUNTS,
+    } as never);
     mount();
     const panel = await screen.findByTestId('lead-hunts');
-    expect(within(panel).getByRole('link', { name: /H-LEAD-1/ }).getAttribute('href')).toBe(
-      '/hunts/H-LEAD-1',
-    );
-    expect(within(panel).getByRole('link', { name: /H-LEAD-2/ })).toBeTruthy();
-    expect(within(panel).queryByText(/H-OTHER/)).toBeNull();
+    const done = within(panel).getByRole('link', {
+      name: 'Lead hunt · 17 steps · 6 min · 0 threat findings',
+    });
+    expect(done.getAttribute('href')).toBe('/hunts/H-LEAD-1');
+    expect(within(panel).getByRole('link', { name: 'Lead hunt · 3 steps · running' })).toBeTruthy();
     expect(within(panel).getByText('Running')).toBeTruthy();
     // The status word states what it means. "complete" was the raw API word.
     // The sentence names the count this row carries, not the findings COLUMN:
@@ -326,16 +369,109 @@ describe('LeadDetail hunts on the lead', () => {
     expect(within(panel).getByText('Complete').getAttribute('title')).not.toBe(STATUS_COMPLETE);
   });
 
+  // K5: the id said nothing an analyst can use. It stays in the hover only.
+  it('labels a hunt by its type, steps, run time and threat findings, not by its id', async () => {
+    vi.mocked(getLead).mockResolvedValue({ ...LEAD, status: 'hunting', hunts: SERVER_HUNTS } as never);
+    mount();
+    const panel = await screen.findByTestId('lead-hunts');
+    expect(within(panel).queryByText('H-LEAD-1')).toBeNull();
+    expect(within(panel).queryByText(/H-LEAD-2/)).toBeNull();
+    const link = within(panel).getByRole('link', { name: /0 threat findings/ });
+    expect(link.getAttribute('title')).toBe('Open hunt H-LEAD-1.');
+  });
+
+  // S3: one screen gave three statements about lead 8. The record states the
+  // count and the newest answer in one line, and the pill names the worst.
+  it('states how many hunts found a threat and what the newest found', async () => {
+    const threat = { ...HUNT_ROW, outcome: 'threats', outcome_label: 'Threat findings', threat_findings: 2 };
+    vi.mocked(getLead).mockResolvedValue({
+      ...LEAD,
+      status: 'hunting',
+      hunt_id: 'H-LEAD-1',
+      hunt_status: 'complete',
+      hunt_outcome: 'clean',
+      hunt_outcome_label: 'No threat observed',
+      hunt_count: 4,
+      hunt_threat_count: 3,
+      hunts: [
+        HUNT_ROW,
+        { ...threat, id: 'H-3' },
+        { ...threat, id: 'H-2' },
+        { ...threat, id: 'H-1' },
+      ],
+    } as never);
+    mount();
+    const record = await screen.findByTestId('lead-hunt-record');
+    expect(record.textContent).toBe('3 of 4 hunts found a threat. The newest hunt found none.');
+    expect(screen.getByTestId('lead-status').textContent).toBe(
+      'Hunted · An earlier hunt found a threat',
+    );
+  });
+
+  // W5: the only hunt ran before two of the observations arrived.
+  it('warns when observations are newer than the newest hunt', async () => {
+    const hour = 3_600_000;
+    const at = (h: number) => new Date(Date.now() - h * hour).toISOString();
+    vi.mocked(getLead).mockResolvedValue({
+      ...LEAD,
+      status: 'hunting',
+      hunt_id: 'H-LEAD-1',
+      hunt_status: 'complete',
+      hunts: [{ ...HUNT_ROW, started_at: at(17 * 24) }],
+      observations: [
+        { ...LEAD.observations[0], born_at: at(6) },
+        { ...LEAD.observations[1], born_at: at(20) },
+      ],
+    } as never);
+    mount();
+    const line = await screen.findByTestId('lead-stale-hunt');
+    expect(line.textContent).toBe(
+      'The hunt ran 17 days ago. 2 observations are newer than the hunt. Hunt again to read them.',
+    );
+  });
+
+  // Negative control: a closed lead offers no hunt, so it carries no warning.
+  it('carries no stale-hunt warning on a closed lead', async () => {
+    vi.mocked(getLead).mockResolvedValue({
+      ...LEAD,
+      status: 'dismissed',
+      dismissed_reason: 'lab_host',
+      dismissed_by: 'alice',
+      dismissed_at: new Date().toISOString(),
+      hunts: [{ ...HUNT_ROW, started_at: '2026-01-01T00:00:00Z' }],
+      observations: [{ ...LEAD.observations[0], born_at: new Date().toISOString() }],
+    } as never);
+    mount();
+    await screen.findByTestId('lead-status');
+    expect(screen.queryByTestId('lead-stale-hunt')).toBeNull();
+  });
+
+  // W3: the answer and the gap under each finished hunt.
+  it('states the answer of each finished hunt and what it could not check', async () => {
+    vi.mocked(getLead).mockResolvedValue({ ...LEAD, status: 'hunting', hunts: SERVER_HUNTS } as never);
+    mount();
+    const answer = await screen.findByTestId('lead-hunt-answer-H-LEAD-1');
+    expect(answer.textContent).toBe(
+      'Answer: The two events are attribute writes. No replication right appears.',
+    );
+    expect(screen.getByTestId('lead-hunt-gaps-H-LEAD-1').textContent).toBe(
+      'Not checked: DCE-RPC traffic. This grid has no zeek.dce_rpc data.',
+    );
+    // Negative control: a running hunt has no answer to state.
+    expect(screen.queryByTestId('lead-hunt-answer-H-LEAD-2')).toBeNull();
+    expect(screen.queryByTestId('lead-hunt-gaps-H-LEAD-2')).toBeNull();
+  });
+
   // The list answers the newest hundred lead hunts. An older lead's own hunt
   // sits outside that window, and the row the page built for it said
   // "Complete · 0 threat findings" whatever the hunt was doing. The lead
   // record states the status and the outcome, so the row reads those.
   it.each([
     ['running', 'Running'],
-    ['error', 'Error'],
-    ['interrupted', 'Interrupted'],
-  ])('states the lead\'s own %s hunt when the list left it out', async (status, label) => {
-    vi.mocked(getHunts).mockResolvedValue([]);
+    // The label map reads every stop as "Failed". The hover names the cause.
+    ['error', 'Failed'],
+    ['interrupted', 'Failed'],
+  ])('states the lead\'s own %s hunt when the server sends no list', async (status, label) => {
     vi.mocked(getLead).mockResolvedValue({
       ...LEAD,
       status: 'hunting',
@@ -344,7 +480,7 @@ describe('LeadDetail hunts on the lead', () => {
     } as never);
     mount();
     const panel = await screen.findByTestId('lead-hunts');
-    expect(within(panel).getByRole('link', { name: /H-OLD/ }).getAttribute('href')).toBe(
+    expect(within(panel).getByRole('link', { name: 'Lead hunt' }).getAttribute('href')).toBe(
       '/hunts/H-OLD',
     );
     expect(within(panel).getByText(label)).toBeTruthy();
@@ -353,18 +489,21 @@ describe('LeadDetail hunts on the lead', () => {
   });
 
   it('carries the outcome, not a count it never read, on a finished hunt the list left out', async () => {
-    vi.mocked(getHunts).mockResolvedValue([]);
     vi.mocked(getLead).mockResolvedValue({
       ...LEAD,
       status: 'hunting',
       hunt_id: 'H-OLD',
       hunt_status: 'complete',
+      hunt_outcome: 'threats',
       hunt_outcome_label: 'Threat findings',
     } as never);
     mount();
     const panel = await screen.findByTestId('lead-hunts');
     expect(within(panel).getByText('Complete')).toBeTruthy();
-    expect(within(panel).getByText('Threat findings')).toBeTruthy();
+    // The outcome in the words and the tone of lib/labels.ts.
+    const chip = within(panel).getByTestId('lead-hunt-outcome-H-OLD');
+    expect(chip.textContent).toBe('Threat found');
+    expect(chip.getAttribute('data-tone')).toBe('danger');
     expect(within(panel).queryByText(/0 threat findings/)).toBeNull();
   });
 
@@ -381,7 +520,7 @@ describe('LeadDetail hunts on the lead', () => {
     mount();
     const link = await screen.findByRole('link', { name: 'View hunt' });
     expect(link.getAttribute('href')).toBe('/hunts/H-LEAD-1');
-    expect(screen.queryByRole('button', { name: 'Hunt' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Hunt this lead' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Hunt again' })).toBeNull();
   });
 
@@ -425,6 +564,37 @@ describe('LeadDetail dismissal and reopen', () => {
     expect(event.textContent).toContain('Reopened.');
   });
 
+  // C9: after the dismiss, the page says what happens next, in the store's
+  // own rule. No time window applies, so the line names none.
+  it('states what the dismissal does next on a lead an analyst dismissed', async () => {
+    vi.mocked(getLead).mockResolvedValue(DISMISSED as never);
+    mount();
+    const line = await screen.findByTestId('lead-dismiss-effect');
+    expect(line.textContent).toBe(
+      'Dismissed. The observations on this lead and their repeats form no new lead. ' +
+        'A new observation on 10.1.2.3 can form a new lead. Select Reopen to undo.',
+    );
+    expect(line.textContent).not.toMatch(/\d+ days/);
+  });
+
+  // Negative control: a lead the hunt closed is not the analyst's dismissal,
+  // and an open lead has no dismissal at all.
+  it('says nothing of a dismissal on a lead the hunt closed or on an open lead', async () => {
+    vi.mocked(getLead).mockResolvedValue({
+      ...DISMISSED,
+      dismissed_reason: 'hunt_clean',
+      dismissed_by: 'auto-hunt',
+    } as never);
+    const first = mount();
+    await screen.findByTestId('lead-status');
+    expect(screen.queryByTestId('lead-dismiss-effect')).toBeNull();
+    first.unmount();
+    vi.mocked(getLead).mockResolvedValue(LEAD as never);
+    mount();
+    await screen.findByTestId('lead-status');
+    expect(screen.queryByTestId('lead-dismiss-effect')).toBeNull();
+  });
+
   it('does not claim a reopen while the lead is still dismissed', async () => {
     vi.mocked(getLead).mockResolvedValue(DISMISSED as never);
     mount();
@@ -436,8 +606,8 @@ describe('LeadDetail dismissal and reopen', () => {
     vi.mocked(getLead).mockResolvedValue(DISMISSED as never);
     mount();
     await waitFor(() => expect(screen.getByRole('button', { name: 'Reopen' })).toBeTruthy());
-    expect(screen.queryByRole('button', { name: 'Hunt' })).toBeNull();
-    expect(screen.queryByRole('button', { name: 'Promote' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Hunt this lead' })).toBeNull();
+    expect(screen.queryByRole('button', { name: /Open an investigation|Promote/ })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Dismiss' })).toBeNull();
   });
 
@@ -454,10 +624,10 @@ describe('LeadDetail dismissal and reopen', () => {
     } as never);
     mount();
     const chip = await screen.findByTestId('lead-status');
-    expect(chip.textContent).toBe('Closed. The hunt found no threat.');
+    expect(chip.textContent).toBe('Closed. No threat found.');
     expect(screen.getByTestId('lead-closed-reason').textContent).toBe('closed by soc-ai');
     const event = screen.getByTestId('lead-dismissal');
-    expect(event.textContent).toContain('by soc-ai. The hunt found no threat.');
+    expect(event.textContent).toContain('by soc-ai. No threat found.');
     expect(event.textContent).not.toContain('auto-hunt');
     expect(event.textContent).not.toContain('hunt_clean');
     expect(screen.getByRole('button', { name: 'Reopen' })).toBeTruthy();
@@ -479,9 +649,9 @@ describe('LeadDetail dismissal and reopen', () => {
     mount();
     await waitFor(() => expect(screen.getByRole('button', { name: 'Reopen' })).toBeTruthy());
     expect(
-      screen.getByRole('link', { name: 'Open investigation' }).getAttribute('href'),
+      screen.getByRole('link', { name: 'View investigation' }).getAttribute('href'),
     ).toBe('/investigation/INV-1');
-    expect(screen.queryByRole('button', { name: 'Hunt' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Hunt this lead' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Dismiss' })).toBeNull();
   });
 
@@ -496,7 +666,7 @@ describe('LeadDetail dismissal and reopen', () => {
     } as never);
     mount();
     expect(await screen.findByText('The investigation no longer exists')).toBeTruthy();
-    expect(screen.queryByRole('link', { name: 'Open investigation' })).toBeNull();
+    expect(screen.queryByRole('link', { name: 'View investigation' })).toBeNull();
     expect(screen.getByRole('button', { name: 'Reopen' })).toBeTruthy();
   });
 
@@ -519,8 +689,11 @@ describe('LeadDetail counting', () => {
       observations: [LEAD.observations[1]],
     } as never);
     mount();
+    await openScoring();
     await waitFor(() => expect(screen.getByText(/1 type ·/)).toBeTruthy());
-    expect(screen.getByText(/1 entity named/)).toBeTruthy();
+    // K6: the header counts hosts, not entities.
+    expect(screen.getByText(/1 host$/)).toBeTruthy();
+    expect(screen.queryByText(/entity named/)).toBeNull();
     expect(screen.getByText('Timeline · 1 observation')).toBeTruthy();
   });
 
@@ -533,7 +706,8 @@ describe('LeadDetail counting', () => {
       scope_count: 1,
     } as never);
     mount();
-    await waitFor(() => expect(screen.getByText(/2 entities named/)).toBeTruthy());
+    await openScoring();
+    await waitFor(() => expect(screen.getByText(/2 hosts$/)).toBeTruthy());
     expect(screen.queryByText(/with observations/)).toBeNull();
   });
 
@@ -564,7 +738,8 @@ describe('LeadDetail decisions', () => {
     { action: 'promoted', at: '2026-09-24T10:00:00Z', by: 'dan', reason: null, note: null, hunt_id: null, investigation_id: 'INV-9' },
   ];
 
-  it('renders every decision in order, and no stale dismissal in the header', async () => {
+  // C3: one order on the whole timeline, newest first.
+  it('renders every decision newest first, and no stale dismissal in the header', async () => {
     vi.mocked(getLead).mockResolvedValue({
       ...LEAD,
       status: 'promoted',
@@ -575,14 +750,17 @@ describe('LeadDetail decisions', () => {
     mount();
     const rows = await screen.findAllByTestId('lead-decision');
     expect(rows.map((r) => r.textContent)).toEqual([
-      expect.stringContaining('Closed by soc-ai. The hunt found no threat.'),
-      expect.stringContaining('Reopened by ann.'),
+      expect.stringContaining('dan opened an investigation on this lead.'),
+      expect.stringContaining('Reopened by cat. The analyst put the lead back to decide again.'),
       expect.stringContaining('Dismissed by bob: A benign repeat. seen before.'),
-      expect.stringContaining('Reopened by cat.'),
-      expect.stringContaining('Promoted by dan to an investigation.'),
+      expect.stringContaining('Reopened by ann.'),
+      expect.stringContaining('Closed by soc-ai. No threat found.'),
     ]);
-    expect(within(rows[4]).getByText('INV-9').getAttribute('href')).toBe('/investigation/INV-9');
-    expect(within(rows[0]).getByText('H-1').getAttribute('href')).toBe('/hunts/H-1');
+    expect(within(rows[0]).getByText('INV-9').getAttribute('href')).toBe('/investigation/INV-9');
+    // K5: the link names the act, and the hunt id moves to the hover.
+    const read = within(rows[4]).getByRole('link', { name: 'Read the hunt' });
+    expect(read.getAttribute('href')).toBe('/hunts/H-1');
+    expect(within(rows[4]).queryByText('H-1')).toBeNull();
     expect(screen.queryByTestId('lead-dismissal')).toBeNull();
     expect(screen.queryByTestId('lead-closed-reason')).toBeNull();
   });
@@ -726,18 +904,20 @@ describe('LeadDetail hunted leads', () => {
     expect(chip.textContent).toBe('In progress');
   });
 
-  // A finished hunt is a lead waiting on an analyst. The four acts are read
-  // the hunt, promote it, dismiss it, or hunt it again.
-  it('offers the four acts on a hunted lead', async () => {
+  // A finished hunt is a lead waiting on an analyst. The three acts are read
+  // the hunt, dismiss it, or hunt it again. The hunt investigated what it
+  // found, so the lead offers no investigation of its own.
+  it('offers the three acts on a hunted lead', async () => {
     vi.mocked(getLead).mockResolvedValue(HUNTED as never);
     vi.mocked(getHunts).mockResolvedValue([HUNT_ON_LEAD] as never);
     mount();
     const link = await screen.findByRole('link', { name: 'Read hunt' });
     expect(link.getAttribute('href')).toBe('/hunts/H-LEAD-1');
-    expect(screen.getByRole('button', { name: 'Promote' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /Open an investigation|Promote/ })).toBeNull();
     expect(screen.getByRole('button', { name: 'Hunt again' })).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
-    expect((screen.getByLabelText('Reason') as HTMLSelectElement).value).toBe('benign_repeat');
+    // C9: no reason is chosen for the analyst.
+    expect((screen.getByLabelText('Reason') as HTMLSelectElement).value).toBe('');
   });
 
   // A cancelled or interrupted hunt has stopped, and the server counts the
@@ -753,7 +933,6 @@ describe('LeadDetail hunted leads', () => {
     mount();
     const chip = await screen.findByTestId('lead-status');
     expect(chip.textContent).toMatch(/^Hunted/);
-    expect(screen.getByRole('button', { name: 'Promote' })).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Dismiss' })).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Hunt again' })).toBeTruthy();
     expect(screen.queryByRole('link', { name: 'View hunt' })).toBeNull();
@@ -821,6 +1000,7 @@ describe('LeadDetail weight', () => {
       investigation_id: 'INV-1',
     } as never);
     mount();
+    await openScoring();
     await waitFor(() => expect(screen.getByText(/at formation 1\.30/)).toBeTruthy());
     expect(screen.queryByText(/weight now/)).toBeNull();
   });
@@ -829,9 +1009,10 @@ describe('LeadDetail weight', () => {
   // line also holds the formation weight, which never moves.
   it('says on the meta strip how the live weight moves', async () => {
     mount();
+    await openScoring();
     await screen.findByTestId('lead-meta');
     expect(screen.getByText(/weight now 1\.28/).getAttribute('title')).toBe(
-      'The live weight decays with a 48 h half-life. A new sighting adds weight.',
+      'A sighting counts half as much after 48 hours. A new sighting adds weight.',
     );
   });
 });

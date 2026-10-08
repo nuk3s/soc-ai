@@ -1,17 +1,11 @@
 /**
- * Middle-ellipsize: keep the head and the tail of a long name. The tail is the
- * differentiating part of Suricata rule names ("… from Backup Intermediate,
- * E2"), which CSS end-truncation always cuts first. Callers keep the Tailwind
- * `truncate` class on the element as the backstop for widths where even the
- * shortened string overflows.
+ * The word a count shows while the console still reads it.
+ *
+ * The console showed "…" in its place. The owner banned the ellipsis on
+ * 2026-10-07: it hides information and reads as a cut. A count that the
+ * console asked for and did not get still reads as a dash.
  */
-export function middleEllipsis(s: string, max = 72): string {
-  const chars = Array.from(s); // code points — never split a surrogate pair
-  if (chars.length <= max) return s;
-  const head = Math.ceil((max - 1) * 0.6);
-  const tail = max - 1 - head;
-  return `${chars.slice(0, head).join('').trimEnd()}…${chars.slice(chars.length - tail).join('').trimStart()}`;
-}
+export const COUNTING = 'counting';
 
 /**
  * The first sentence of a paragraph.
@@ -26,4 +20,19 @@ export function firstSentence(s: string): string {
   const text = s.trim();
   const end = text.match(/[.!?](?=\s|$)/);
   return end?.index === undefined ? text : text.slice(0, end.index + 1);
+}
+
+/**
+ * The line that names a hunt: its objective up to the first line break.
+ *
+ * A lead hunt's objective is a head sentence over a list of observations. The
+ * head sentence names the hunt, and the list stays on the hunt page. An
+ * analyst's objective is one line, and it comes back whole. The function
+ * never cuts at a character count. A surface that must stay narrow clamps the
+ * line with CSS and holds the whole objective in a `title` attribute.
+ */
+export function objectiveHeadline(objective: string | null | undefined): string {
+  const text = (objective ?? '').trim();
+  const end = text.search(/\r?\n/);
+  return (end === -1 ? text : text.slice(0, end)).trim();
 }

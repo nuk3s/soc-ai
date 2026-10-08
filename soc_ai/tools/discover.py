@@ -61,7 +61,7 @@ _EXAMPLE_CLIP = 120
 def _clip(value: Any) -> Any:
     """Truncate a long scalar example so a describe result stays compact."""
     if isinstance(value, str) and len(value) > _EXAMPLE_CLIP:
-        return value[:_EXAMPLE_CLIP] + "…"
+        return value[:_EXAMPLE_CLIP] + " [truncated]"
     return value
 
 

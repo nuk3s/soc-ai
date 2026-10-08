@@ -125,11 +125,13 @@ export function Operate() {
       <div className="mb-5">
         <div className="flex items-center gap-2">
           <Wrench size={19} className="text-accent" />
-          <div className="text-[20px] font-semibold tracking-[-.015em]">Operate</div>
+          {/* "Status": the group and its first page both read "Operate". */}
+          <div className="text-[20px] font-semibold tracking-[-.015em]">Status</div>
         </div>
         <div className="mt-0.5 max-w-[720px] text-[13px] text-dim">
-          The operator's loop. Prove the model and the audit chain are trustworthy. Replay
-          history. Open the runbooks and the diagnostics behind every verdict.
+          The state of the machinery that runs without you. Check that the analytics run and that
+          each escalation has an answer. Open the proof that the model and the audit chain are
+          sound.
         </div>
       </div>
 

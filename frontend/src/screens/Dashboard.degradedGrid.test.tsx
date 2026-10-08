@@ -4,7 +4,9 @@
 // awaiting-investigation tile printed an honest "—" for its value and then
 // "queue clear" underneath it, in all four degraded states — "—" says unknown
 // and "queue clear" says safe, and during an outage those are opposite
-// statements. And the connection banner announced a grid answering 429 as "not
+// statements. The Needs-you tile took its place (dogfood 2026-10-06) and keeps
+// the rule: "Nothing needs you" only after every part was read and every part
+// is zero. And the connection banner announced a grid answering 429 as "not
 // reachable" directly above its own circuit-breaker detail line, sending the
 // analyst to check connectivity and firewalls when the grid was up and shedding
 // load.
@@ -34,11 +36,12 @@ vi.mock('../lib/api', async (importOriginal) => ({
   getMe: vi.fn().mockResolvedValue({ username: 'ana', role: 'analyst', status: '' }),
   getPreflight: vi.fn().mockResolvedValue({ status: 'green', failing: 0, warned: 0, checked_at: '2026-08-19T00:00:00+00:00' }),
   getPreflightDetail: vi.fn().mockResolvedValue({ rows: [], checked_at: '2026-08-19T00:00:00+00:00' }),
+  getNeedsYouCount: vi.fn(),
 }));
 
 import { queueOf } from '../test/alertQueue';
 import { Dashboard } from './Dashboard';
-import { getAlerts, getHealth } from '../lib/api';
+import { getAlerts, getHealth, getNeedsYouCount, type NeedsYouCount } from '../lib/api';
 
 const mount = async () => {
   render(
@@ -49,17 +52,28 @@ const mount = async () => {
   await screen.findByText('Investigation outcomes');
 };
 
-/** The whole KPI card, so the assertions cover its value AND its caption —
+/** The whole Needs-you tile, so the assertions cover its value AND its lines:
  *  the defect was the two disagreeing with each other. */
-const awaitingTile = async (): Promise<HTMLElement> => {
-  const label = await screen.findByText('Awaiting investigation');
-  return label.parentElement!.parentElement!;
-};
+const needsYouTile = async (): Promise<HTMLElement> => screen.findByTestId('kpi-needs-you');
 
-/** Same card, read synchronously — for the fake-timer suite, which settles the
+/** The Alert events tile, read synchronously. The fake-timer suite settles the
  *  render itself and must not hand control back to a real-clock wait. */
-const awaitingTileNow = (): HTMLElement =>
-  screen.getByText('Awaiting investigation').parentElement!.parentElement!;
+const eventsTileNow = (): HTMLElement =>
+  screen.getByText(/^Alert events/).parentElement!.parentElement!;
+
+const zeroCount = (parts: Partial<NeedsYouCount> = {}): NeedsYouCount => ({
+  leads_needing_decision: 0,
+  unread_shadow_hits: 0,
+  untriaged_groups: 0,
+  needs_more_info: 0,
+  pending_actions: 0,
+  total: 0,
+  unknown: [],
+  alert_window: '7d',
+  verdict_window: '30d',
+  alert_floor: false,
+  ...parts,
+});
 
 const untriagedGroup: AlertGroup = {
   id: 'g-unt',
@@ -77,54 +91,57 @@ const untriagedGroup: AlertGroup = {
 beforeEach(() => {
   vi.mocked(getAlerts).mockResolvedValue(queueOf([]));
   vi.mocked(getHealth).mockResolvedValue(null as unknown as Health);
+  vi.mocked(getNeedsYouCount).mockResolvedValue(zeroCount());
 });
 
-describe('Dashboard awaiting-investigation tile — unknown is not zero', () => {
-  it('does not call the queue clear when the read that would prove it failed', async () => {
-    vi.mocked(getAlerts).mockRejectedValue(new Error('grid_unavailable'));
+describe('Dashboard Needs-you tile — unknown is not zero', () => {
+  it('does not say nothing needs you when the read that would prove it failed', async () => {
+    vi.mocked(getNeedsYouCount).mockRejectedValue(new Error('needs-you unavailable'));
     await mount();
-    const tile = await awaitingTile();
-    // The string this whole exercise exists to catch. Asserting the em-dash
-    // value instead would pass today: the VALUE was already honest.
-    expect(tile.textContent).not.toContain('queue clear');
+    const tile = await needsYouTile();
+    await waitFor(() => expect(tile.textContent).toContain('Could not read what needs you.'));
+    // The string this whole exercise exists to catch.
+    expect(tile.textContent).not.toContain('Nothing needs you');
     // …and no number is asserted either, since none was read.
     expect(tile.textContent).not.toMatch(/\d/);
-    // The error card names the read that failed. The rest of the page loaded.
+    expect(screen.getByTestId('needs-you-total').textContent).toBe('?');
+  });
+
+  it('says nothing needs you when every part was read and every part is zero', async () => {
+    await mount();
+    const tile = await needsYouTile();
+    await waitFor(() => expect(tile.textContent).toContain('Nothing needs you.'));
+    expect(screen.getByTestId('needs-you-total').textContent).toBe('0');
+  });
+
+  it('keeps a line for the part the grid could not answer, and marks the total a floor', async () => {
+    vi.mocked(getNeedsYouCount).mockResolvedValue(
+      zeroCount({ leads_needing_decision: 2, untriaged_groups: null, total: 2, unknown: ['untriaged_groups'] }),
+    );
+    await mount();
+    const tile = await needsYouTile();
+    await waitFor(() => expect(tile.textContent).toContain('Could not count the alert groups.'));
+    expect(tile.textContent).not.toContain('Nothing needs you');
+    expect(screen.getByTestId('needs-you-total').textContent).toBe('2+');
+  });
+
+  // NEGATIVE CONTROL. A failed ALERTS read takes the alert counts off the page
+  // and leaves the Needs-you tile alone: the two reads are separate, and the
+  // tile's alert part has its own grid read on the server.
+  it('keeps the Needs-you count when only the alert counts failed', async () => {
+    vi.mocked(getAlerts).mockRejectedValue(new Error('grid_unavailable'));
+    vi.mocked(getNeedsYouCount).mockResolvedValue(zeroCount({ leads_needing_decision: 3, total: 3 }));
+    await mount();
     expect(await screen.findByText('Could not load the alert counts')).toBeTruthy();
     expect(screen.queryByText('Could not load the dashboard')).toBeNull();
+    await waitFor(() => expect(screen.getByTestId('needs-you-total').textContent).toBe('3'));
   });
 
-  it('still says queue clear when the queue really was read and really is empty', async () => {
-    await mount();
-    const tile = await awaitingTile();
-    expect(tile.textContent).toContain('queue clear');
-  });
-
-  it('still offers the hand-triage link when a group really is waiting', async () => {
+  it('counts one group as one group', async () => {
     vi.mocked(getAlerts).mockResolvedValue(queueOf([untriagedGroup]));
     await mount();
-    expect(await screen.findByText(/triage from Alerts/i)).toBeTruthy();
     // One group reads as one group. The header said "1 detection groups".
-    expect(screen.getByText('1 detection group')).toBeTruthy();
-  });
-
-  it('keeps the calm caption when the probe is degraded but this read succeeded', async () => {
-    // The over-correction control, and a deliberate NON-implementation: the
-    // caption is keyed on the alerts read, never on /health. The probe reads an
-    // unfiltered match_all across the whole index pattern precisely so a cold
-    // red shard cannot be skipped, while these counts come from a time-filtered
-    // query that may never touch it — so "probe partial, alerts complete" is the
-    // expected state for one old red shard, not a corner case. A successful
-    // alerts read has proved itself (the client raises on any search whose
-    // shards failed), so the count is a complete answer to the question asked.
-    // Disclaiming it would leave the screen permanently uncertain on a grid the
-    // analyst can in fact read.
-    vi.mocked(getHealth).mockResolvedValue(
-      health({ ok: false, kind: 'partial', detail: 'the grid read only 2 of 4 shards' }),
-    );
-    vi.mocked(getAlerts).mockResolvedValue(queueOf([]));
-    await mount();
-    expect((await awaitingTile()).textContent).toContain('queue clear');
+    expect(await screen.findByText('1 detection group')).toBeTruthy();
   });
 });
 
@@ -228,19 +245,6 @@ describe('Dashboard KPI row — a grid that dies with the tab open', () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
 
-  it('stops calling the queue clear once the polls that would prove it are failing', async () => {
-    outageAfterFirstLoad();
-    await mountAndSettle();
-    // The control: the first read really did succeed, and really was empty.
-    expect(awaitingTileNow().textContent).toContain('queue clear');
-
-    // Two 30s poll ticks later the grid has answered nothing for a minute.
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(65_000);
-    });
-    expect(awaitingTileNow().textContent).not.toContain('queue clear');
-  });
-
   it('dates the counts it is still showing instead of passing them off as current', async () => {
     outageAfterFirstLoad();
     await mountAndSettle();
@@ -267,7 +271,7 @@ describe('Dashboard KPI row — a grid that dies with the tab open', () => {
       await vi.advanceTimersByTimeAsync(35_000);
     });
     expect(screen.queryByText(/This data is from/)).toBeNull();
-    expect(awaitingTileNow().textContent).toContain('queue clear');
+    expect(eventsTileNow().textContent).toContain('0');
   });
 
   it('answers a Refresh clicked from the stale line, even when that refresh fails too', async () => {
@@ -308,10 +312,10 @@ describe('Dashboard KPI row — a refresh the analyst asked for and did not get'
     // so it can return while the alerts read is still in flight and the tile is
     // still showing its loading caption. Asserting straight after it passed on an
     // idle box and failed on a loaded CI runner, where the assertion won the race:
-    // "expected 'Awaiting investigation…checking the queue…' to contain '1'".
+    // "expected 'Alert events…' to contain '3'".
     // waitFor retries, so this tracks the fetch instead of racing a wall clock —
     // the same fix that finally killed the generalChat flake.
-    await waitFor(() => expect(awaitingTileNow().textContent).toContain('1'));
+    await waitFor(() => expect(eventsTileNow().textContent).toContain('3'));
 
     vi.mocked(getAlerts).mockRejectedValue(new Error('grid_unavailable'));
     await act(async () => {
@@ -320,6 +324,6 @@ describe('Dashboard KPI row — a refresh the analyst asked for and did not get'
 
     expect(await screen.findByText(/Refresh failed/)).toBeTruthy();
     // Still the best account of the network anyone has — marked, not deleted.
-    expect(awaitingTileNow().textContent).toContain('1');
+    expect(eventsTileNow().textContent).toContain('3');
   });
 });

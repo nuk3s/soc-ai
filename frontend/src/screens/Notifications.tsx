@@ -2,6 +2,7 @@ import { Bell, X } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { SyntheticEvalBadge } from '../components/Badges';
+import { HuntOutcomeChip } from '../components/HuntOutcomeChip';
 import { ListToolbar } from '../components/ListToolbar';
 import { MultiSelect } from '../components/MultiSelect';
 import { ErrorState, Freshness, LoadingState, StaleNotice } from '../components/States';
@@ -217,6 +218,8 @@ export function Notifications() {
           ) : (
             formatNotificationTitle(nt.title)
           )}
+          {/* How a hunt ended, from its outcome field. */}
+          <HuntOutcomeChip outcome={nt.outcome} />
           {/* A run against planted synthetic scenarios must never read as a
               real one — badge it wherever the row appears. */}
           {nt.isSynthEval && <SyntheticEvalBadge />}

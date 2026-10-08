@@ -50,7 +50,7 @@ describe('the lead pills', () => {
       'In progress: a hunt is running on this lead. View the hunt to follow it.',
     );
     expect(PILL_HUNTED).toBe(
-      'Hunted: the hunt on this lead finished. Read the hunt, then promote or dismiss the lead.',
+      'Hunted: the hunt on this lead finished. Read the verdicts it brought back, or dismiss the lead.',
     );
     expect(PILL_DISMISSED).toBe(
       'Dismissed: an analyst closed this lead with a reason. Reopen puts it back in the queue.',
@@ -123,11 +123,13 @@ describe('the filters and the statuses', () => {
   });
 
   it('states each hunt type', () => {
-    expect(TYPE_ALL).toBe('Every hunt an agent ran.');
+    expect(TYPE_ALL).toBe('Every hunt in the window. The catalog runs are included.');
     expect(TYPE_MANUAL).toBe('Hunts an analyst started from an objective.');
     expect(TYPE_SCHEDULE).toBe('Hunts a schedule started.');
     expect(TYPE_LEAD).toBe('Hunts started from a lead.');
-    expect(TYPE_CATALOG).toBe('Rows the analytic sweep wrote. Recorded before this release.');
+    expect(TYPE_CATALOG).toBe(
+      'Runs the analytic sweep recorded. The sweep records a run when an analytic cannot read its data.',
+    );
   });
 
   it('states each hunt status and the unread dot', () => {
@@ -153,7 +155,7 @@ describe('tooltips', () => {
       'In progress: a hunt is running on this lead. View the hunt to follow it.',
     );
     expect(TIP.PILL_HUNTED).toBe(
-      'Hunted: the hunt on this lead finished. Read the hunt, then promote or dismiss the lead.',
+      'Hunted: the hunt on this lead finished. Read the verdicts it brought back, or dismiss the lead.',
     );
     expect(TIP.PILL_DISMISSED).toBe(
       'Dismissed: an analyst closed this lead with a reason. Reopen puts it back in the queue.',
@@ -214,5 +216,24 @@ describe('tooltips', () => {
       expect(value.includes('\n'), name).toBe(false);
       expect(/[.:]$/.test(value), name).toBe(true);
     }
+  });
+});
+
+// The lead legend said "Two types on one entity form a lead". The rule in
+// soc_ai/hunting/leads.py also forms a lead on one type whose repeats reach
+// SINGLE_SIGNAL_THRESHOLD. The weight sentence named a "48 h half-life".
+describe('the lead rule and the weight', () => {
+  it('states the one-type rule beside the two-type rule', () => {
+    expect(TIP.CHIP_TYPE).toBe(
+      'The type of observation. Two or more types on one entity form a lead at a weight of 0.85. ' +
+        'One type forms a lead alone when its repeats reach a weight of 1.50.',
+    );
+    expect(TIP.CHIP_TYPE).not.toMatch(/^The type of observation\. Two types on one entity form a lead\.$/);
+  });
+
+  it('says how a sighting ages in plain words on every weight', () => {
+    expect(TIP.SIGHTING_HALF_WEIGHT).toBe('A sighting counts half as much after 48 hours.');
+    expect(TIP.WEIGHT_NOW).toBe('A sighting counts half as much after 48 hours. A new sighting adds weight.');
+    expect(TIP.WEIGHT_NOW).not.toMatch(/half-life/);
   });
 });

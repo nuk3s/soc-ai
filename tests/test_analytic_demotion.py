@@ -29,7 +29,7 @@ from tests.test_analytics_store import SPEC_TEXT
 _LOCAL = "local-svc-ticket-from-workstation"
 _SHIPPED = "identity-4662-dcsync-nonmachine"
 _NOW = datetime(2026, 10, 4, 12, 0, tzinfo=UTC)
-_REASON = "The analytic wrote 42 hits in 24 hours. Its fire budget is 10 a day."
+_REASON = "The analytic wrote 42 hits in 24 hours. Its daily hit limit is 10."
 _EVIDENCE: dict[str, Any] = {
     "breaches": [{"rule": "fire_budget", "hits": 42, "budget": 10}],
 }

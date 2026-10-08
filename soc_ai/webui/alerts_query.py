@@ -208,6 +208,13 @@ class AlertGroup:
     # row can show BOTH hosts (source → destination) without expanding.
     src_ip: str | None = None
     dst_ip: str | None = None
+    # The machine the latest alert fired on, or the sensor that reported it.
+    # A group row showed the rule and the count and no machine, so the analyst
+    # expanded every row to see who was involved (dogfood 2026-10-06, W3).
+    host: str | None = None
+    # How many distinct source addresses the group holds. An approximate
+    # count from the grid, exact for small groups. None when the grid sent none.
+    source_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -569,9 +576,19 @@ def _bucket_aggs() -> dict[str, Any]:
                     "event.dataset",
                     "source.ip",
                     "destination.ip",
+                    "host.name",
+                    "observer.name",
+                    # The endpoint document a host log nests. The row reads
+                    # its source and its machine from there when the top
+                    # level has none, as the event rows do.
+                    f"{ENVELOPE_FIELD}.source.ip",
+                    f"{ENVELOPE_FIELD}.destination.ip",
+                    f"{ENVELOPE_FIELD}.host.name",
                 ],
             }
         },
+        # Distinct sources, for "192.0.2.26 +2" on the row.
+        "sources": {"cardinality": {"field": "source.ip"}},
         "datasets": {
             "terms": {
                 "field": "event.dataset",
@@ -709,7 +726,26 @@ def _group_from_bucket(bucket: dict[str, Any], *, kind: str | None = None) -> Al
         ),
         src_ip=_first_ip(_ev(src, env, "source.ip")),
         dst_ip=_first_ip(_ev(src, env, "destination.ip")),
+        host=_group_host(src, env),
+        source_count=_source_count(bucket),
     )
+
+
+def _group_host(source: dict[str, Any], env: Mapping[str, Any]) -> str | None:
+    """The machine a group's latest alert fired on, else the sensor that saw it.
+
+    A host log names its machine in ``host.name``. A network alert names no
+    host, and the sensor identity rides ``observer.name`` (see
+    :func:`_host_name`). The row names whichever the document carries.
+    """
+    name = _ev(source, env, "host.name") or _dig(source, "observer.name")
+    return str(name) if name else None
+
+
+def _source_count(bucket: dict[str, Any]) -> int | None:
+    """The distinct-source count of a bucket, or None when the grid sent none."""
+    value = (bucket.get("sources") or {}).get("value")
+    return int(value) if isinstance(value, int | float) else None
 
 
 async def fetch_groups(

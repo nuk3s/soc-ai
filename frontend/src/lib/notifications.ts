@@ -4,6 +4,7 @@
 // (`inv:<id>` / `approval:<token>`), so a dismissed item stays dismissed and new
 // ones still surface.
 
+import { OUTCOME_LABELS, TONE, humanize, outcomeMeta } from './labels';
 import { VERDICT } from './tokens';
 import type { Verdict } from './types';
 
@@ -129,8 +130,12 @@ export function notificationKind(n: { id: string; group?: unknown }): Notificati
     // under "System" while the Investigations chip held verdicts only (D7).
     case 'inv-failed':
       return 'investigation';
+    case 'hunt':
     case 'hunt-done':
+    // One line for the catalog runs of one sweep that share an outcome.
+    case 'hunt-sweep':
     case 'lead':
+    case 'lead-more':
     case 'shadow-hit':
       return 'hunting';
     case 'dossier-conflict':
@@ -148,6 +153,9 @@ const ROW_NOUN: Record<string, [string, string]> = {
   'inv-failed': ['failed triage', 'failed triages'],
   'inv-done': ['completed investigation', 'completed investigations'],
   'hunt-done': ['finished hunt', 'finished hunts'],
+  'hunt-sweep': ['catalog sweep', 'catalog sweeps'],
+  hunt: ['running hunt', 'running hunts'],
+  'lead-more': ['count of more leads', 'counts of more leads'],
   'dossier-conflict': ['host disagreement', 'host disagreements'],
 };
 const SYSTEM_NOUN: [string, string] = ['system notice', 'system notices'];
@@ -160,9 +168,13 @@ const SYSTEM_NOUN: [string, string] = ['system notice', 'system notices'];
  * cap cut, so it reads "the N newest". The header said "shadow hits, leads,
  * hunts and investigations from the last 24 h" whatever the list held, over
  * 10 completed investigations out of 65 (D3).
+ *
+ * Only finished runs have a window. A lead stays on the list until somebody
+ * decides it, whenever it formed, so the window is said once, after the list,
+ * and only when the list holds a finished run.
  */
 export function describeNotifications(rows: ReadonlyArray<{ id: string }>, capped: boolean): string {
-  if (rows.length === 0) return '0 items from the last 24 h.';
+  if (rows.length === 0) return '0 items.';
   const order: string[] = [];
   const counts = new Map<string, number>();
   for (const r of rows) {
@@ -180,5 +192,20 @@ export function describeNotifications(rows: ReadonlyArray<{ id: string }>, cappe
   });
   const list =
     parts.length === 1 ? parts[0] : `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}`;
-  return `${rows.length} item${rows.length === 1 ? '' : 's'} from the last 24 h: ${list}.`;
+  const finished = rows.some((r) => FINISHED_RUNS.has(r.id.split(':', 1)[0]));
+  const window = finished ? ' Finished runs cover the last 24 h.' : '';
+  return `${rows.length} item${rows.length === 1 ? '' : 's'}: ${list}.${window}`;
+}
+
+/** The rows that report a finished run. Only these have a 24 h window. */
+const FINISHED_RUNS = new Set(['inv-done', 'inv-failed', 'hunt-done', 'hunt-sweep']);
+
+/** The label and colour of a hunt outcome, from lib/labels.ts, or null for
+ *  a row with none. An outcome this build does not know keeps its own words
+ *  in amber, so a newer server cannot make a hunt read as clean. */
+export function huntOutcomeChip(outcome: string | null | undefined): { label: string; color: string } | null {
+  if (!outcome) return null;
+  const m = outcomeMeta(outcome);
+  if (m.label === humanize(outcome) && !(outcome in OUTCOME_LABELS)) return { label: m.label, color: TONE.warn.color };
+  return { label: m.label, color: m.color };
 }

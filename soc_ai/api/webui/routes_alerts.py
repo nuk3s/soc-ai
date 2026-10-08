@@ -6,12 +6,14 @@ import asyncio
 import logging
 import re
 from collections import Counter
-from typing import Literal
+from datetime import UTC, datetime, timedelta
+from typing import Any, Literal
 
 from elastic_transport import TransportError
 from elasticsearch import ApiError
 from fastapi import Depends, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict
+from sqlalchemy import func, select
 
 from soc_ai.api.deps import get_elastic, get_settings_dep
 from soc_ai.api.webui._errors import api_error, oql_refusal
@@ -239,6 +241,12 @@ class AlertEventOut(BaseModel):
     # The inheritedReason string also embeds it, but a structured field lets the row
     # render the investigation's time next to the alert's own time without regex.
     investigatedAt: str | None = None
+    # The verdict and the confidence of that investigation. The chip said
+    # "inherited 4d ago" with no verdict, so a true positive inside a group
+    # read like every other event (dogfood 2026-10-06, S5). None while the run
+    # is in flight and on an event no investigation covers.
+    verdict: str | None = None
+    conf: float | None = None
 
 
 class LastAttemptOut(BaseModel):
@@ -275,6 +283,11 @@ class AlertGroupOut(BaseModel):
     # the collapsed row shows BOTH hosts at a glance instead of hiding them.
     src: str | None = None
     dst: str | None = None
+    # The machine the latest alert fired on, or the sensor that reported it,
+    # and how many distinct sources the group holds. The row showed neither
+    # (dogfood 2026-10-06, W3).
+    host: str | None = None
+    srcCount: int | None = None
     events: list[AlertEventOut] = []
     # The investigation whose verdict this badge shows — the drawer opens it
     # directly (None when the rule has never been investigated).
@@ -307,6 +320,16 @@ class AlertGroupOut(BaseModel):
     # older genuine verdict still stands. None when the newest run IS the standing
     # verdict (no failed retry) — surfaces the "stayed at Needs Info" mystery.
     lastAttempt: LastAttemptOut | None = None
+    # How many alerts of this rule each verdict holds: the newest complete run
+    # of each alert, over the list window and the inheritance window. The row
+    # said "False positive" over a group whose events held a true positive
+    # (dogfood 2026-10-06, S5).
+    verdictCounts: dict[str, int] = {}
+    # The worst of those verdicts, when it is worse than the standing verdict,
+    # and the run that holds it. None when the standing verdict is the worst.
+    worstVerdict: str | None = None
+    worstConf: float | None = None
+    worstInvId: str | None = None
 
 
 # Terminal statuses that mean a run FAILED without landing a verdict — the
@@ -366,8 +389,7 @@ def _inherited_reason(inv: Investigation) -> str:
     when = _ago(inv.created_at.isoformat()) if inv.created_at else "?"
     flow = f" on {inv.src_ip or '?'} → {inv.dest_ip or '?'}" if (inv.src_ip or inv.dest_ip) else ""
     return (
-        f"Inherited from the same detection, investigated {when} ago{flow}. "
-        f"Investigation {inv.id[:8]}…"
+        f"Inherited from the same detection, investigated {when} ago{flow}. Investigation {inv.id}."
     )
 
 
@@ -400,8 +422,125 @@ class AlertQueueOut(BaseModel):
     other_docs: int = 0
 
 
+# The order of the verdicts, worst first. A group row names the worst verdict
+# among its alerts, because one true positive in a group of false positives is
+# the alert the analyst has to see.
+_VERDICT_RANK: dict[str, int] = {
+    "true_positive": 4,
+    "needs_more_info": 3,
+    "inconclusive": 2,
+    "false_positive": 1,
+}
+
+# The length of each preset window, for the start of the verdict mix.
+_RANGE_SPAN: dict[str, timedelta] = {
+    "15m": timedelta(minutes=15),
+    "1h": timedelta(hours=1),
+    "4h": timedelta(hours=4),
+    "24h": timedelta(hours=24),
+    "3d": timedelta(days=3),
+    "7d": timedelta(days=7),
+    "30d": timedelta(days=30),
+}
+
+
+def _mix_since(range_: str, from_: str | None, inherit_days: int) -> datetime:
+    """The start of the verdict mix: the earlier of the list window and the
+    inheritance window, as a naive UTC time.
+
+    An event in the window can carry the verdict of a run older than the
+    window, through inheritance, so the mix reaches back as far as that.
+    """
+    now = datetime.now(UTC).replace(tzinfo=None)
+    start = now - _RANGE_SPAN.get(range_, timedelta(hours=24))
+    if range_ == "custom" and from_:
+        try:
+            parsed = datetime.fromisoformat(from_.replace("Z", "+00:00"))
+            start = parsed.astimezone(UTC).replace(tzinfo=None) if parsed.tzinfo else parsed
+        except ValueError:
+            pass
+    return min(start, now - timedelta(days=inherit_days))
+
+
+async def _verdict_mix(
+    db: Any, rule_names: list[str], since: datetime
+) -> tuple[dict[str, dict[str, int]], dict[str, Investigation]]:
+    """Per rule: the verdict counts over its alerts, and the worst run.
+
+    One alert counts once, with the verdict of its newest complete run. A
+    pipeline fallback and a hunt-subject run decide nothing about an alert, so
+    they are left out, as the verdict filter of the list leaves them out.
+    """
+    if not rule_names:
+        return {}, {}
+    ranked = (
+        select(
+            Investigation.id.label("id"),
+            Investigation.rule_name.label("rule_name"),
+            Investigation.verdict.label("verdict"),
+            Investigation.created_at.label("created_at"),
+            func.row_number()
+            .over(
+                partition_by=Investigation.alert_es_id,
+                order_by=(Investigation.created_at.desc(), Investigation.id.desc()),
+            )
+            .label("rn"),
+        )
+        .where(
+            Investigation.rule_name.in_(rule_names),
+            Investigation.status == "complete",
+            Investigation.verdict.is_not(None),
+            Investigation.is_fallback.isnot(True),
+            Investigation.created_at >= since,
+            Investigation.alert_es_id != "",
+            inv_svc.not_hunt_subject(),
+        )
+        .subquery()
+    )
+    rows = (
+        await db.execute(
+            select(ranked.c.id, ranked.c.rule_name, ranked.c.verdict, ranked.c.created_at).where(
+                ranked.c.rn == 1
+            )
+        )
+    ).all()
+    counts: dict[str, dict[str, int]] = {}
+    worst_id: dict[str, tuple[int, datetime, str]] = {}
+    for run_id, rule, verdict, created in rows:
+        if not rule or not verdict:
+            continue
+        bucket = counts.setdefault(rule, {})
+        bucket[verdict] = bucket.get(verdict, 0) + 1
+        key = (_VERDICT_RANK.get(verdict, 0), created, run_id)
+        if rule not in worst_id or key > worst_id[rule]:
+            worst_id[rule] = key
+    worst: dict[str, Investigation] = {}
+    if worst_id:
+        found = (
+            await db.scalars(
+                select(Investigation).where(Investigation.id.in_([k[2] for k in worst_id.values()]))
+            )
+        ).all()
+        by_id = {inv.id: inv for inv in found}
+        worst = {rule: by_id[k[2]] for rule, k in worst_id.items() if k[2] in by_id}
+    return counts, worst
+
+
+def _worse_than(
+    worst_run: Investigation | None, standing: str, *, fallback: bool
+) -> tuple[str | None, float | None, str | None]:
+    """(verdict, confidence, run id) of the worst run, when it is worse than
+    the standing verdict. A fallback standing verdict keeps its own chip."""
+    if worst_run is None or fallback:
+        return None, None, None
+    worst = _verdict(worst_run.verdict)
+    if _VERDICT_RANK.get(worst, 0) <= _VERDICT_RANK.get(standing, 0):
+        return None, None, None
+    return worst, worst_run.confidence, worst_run.id
+
+
 @router.get("/alerts", response_model=AlertQueueOut)
-async def list_alerts(
+async def list_alerts(  # noqa: PLR0915 - one linear join of the grid rows and the store
     request: Request,
     range_: str = Query("24h", alias="range"),
     severity: str | None = None,
@@ -454,6 +593,8 @@ async def list_alerts(
     # verdict came from a different alert than this group's latest event.
     # badge per rule: (verdict, conf, cross_alert_inherited, inv_id, investigated_pair)
     badges: dict[str, tuple[str, float | None, bool, str, str]] = {}
+    mix: dict[str, dict[str, int]] = {}
+    worst_runs: dict[str, Investigation] = {}
     assignments: dict[str, dict[str, str]] = {}
     verdicts: dict[str, Investigation] = {}
     # Newest run of ANY status per rule — drives the "Triaging…" flag AND the E2.1
@@ -469,6 +610,11 @@ async def list_alerts(
             latest_any = await inv_svc.latest_for_rules(db, rule_names)
             assignments = await assign_svc.assignments_for_rules(db, rule_names)
             muted_rules = await override_svc.muted_rule_names(db)
+            mix, worst_runs = await _verdict_mix(
+                db,
+                rule_names,
+                _mix_since(range_, from_, settings.webui_inherit_window_days),
+            )
         # The id of the in-flight run per rule, so a "Triaging…" row links straight
         # to its live investigation (a running row has no completed verdict, so its
         # id never lands in `badges`/`verdicts`) — fixes the "only a Hunt link" gap.
@@ -511,6 +657,9 @@ async def list_alerts(
             reason = _inherited_reason(_inv)
         elif inv_id and g.count > 1:
             reason = f"Verdict from 1 of {g.count} events investigated"
+        worst_verdict, worst_conf, worst_inv = _worse_than(
+            worst_runs.get(g.rule_name), verdict, fallback=is_fallback
+        )
         out.append(
             AlertGroupOut(
                 id=g.latest_id or g.rule_name,
@@ -527,6 +676,8 @@ async def list_alerts(
                 state=(assignments.get(g.rule_name) or {}).get("state"),
                 src=g.src_ip,
                 dst=g.dst_ip,
+                host=g.host,
+                srcCount=g.source_count,
                 events=[],
                 # Completed verdict's investigation if there is one, else the
                 # in-flight run's id so a "Triaging…" row opens its live drawer.
@@ -544,6 +695,10 @@ async def list_alerts(
                 muted=is_muted,
                 fallback=is_fallback,
                 lastAttempt=last_attempt,
+                verdictCounts=mix.get(g.rule_name, {}),
+                worstVerdict=worst_verdict,
+                worstConf=worst_conf,
+                worstInvId=worst_inv,
             )
         )
     return AlertQueueOut(groups=out, truncated=page.truncated, other_docs=page.other_docs)
@@ -586,9 +741,9 @@ class AlertsEmptyReasonOut(BaseModel):
     hint: str
 
 
-_QUIET_HINT = (
-    "No alert label matches anything in this window. The grid is quiet. The configuration is sound."
-)
+# The hint states what the counts show and nothing more. It said "The
+# configuration is sound.", which no count can prove (dogfood 2026-10-06).
+_QUIET_HINT = "No alert label matches anything in this window. The grid is quiet."
 
 
 @router.get("/alerts/empty-reason", response_model=AlertsEmptyReasonOut)
@@ -797,21 +952,34 @@ async def list_group_events(
         # for "re-ran ON this alert but the pill still says inherited": the fresh
         # re-run's alert_es_id == this event's es_id, so it lands here and clears
         # the inherited flag.
+        # The verdict the chip shows. A run in flight has none yet, and a
+        # pipeline fallback reached none. The pair tier reads complete,
+        # non-fallback runs only, and loads only the columns it names, so its
+        # verdict is read as is.
+        source: Investigation | None = None
         if direct_inv is not None and direct_inv.status in ("complete", "running"):
             base.investigated = True
             base.invId = direct_inv.id
             base.inheritedReason = None
             base.investigatedAt = _inv_ago(direct_inv)
+            if direct_inv.status == "complete" and direct_inv.is_fallback is not True:
+                source = direct_inv
         elif pair_inv is not None:
             base.investigated = False
             base.invId = pair_inv.id
             base.inheritedReason = _inherited_reason(pair_inv)
             base.investigatedAt = _inv_ago(pair_inv)
+            source = pair_inv
         elif rule_inv is not None:  # already complete + verdict-bearing
             base.investigated = False
             base.invId = rule_inv.id
             base.inheritedReason = _inherited_reason(rule_inv)
             base.investigatedAt = _inv_ago(rule_inv)
+            if rule_inv.is_fallback is not True:
+                source = rule_inv
+        if source is not None and source.verdict:
+            base.verdict = _verdict(source.verdict)
+            base.conf = source.confidence
         out.append(base)
     return out
 
@@ -954,3 +1122,43 @@ async def get_representative(
         total=len(events),
         reason=reason,
     )
+
+
+# ── The alert part of the needs-you count ──────────────────────────────────
+
+# The window the needs-you count reads alert groups over. The console links the
+# count to the Alerts list on the same window, with acknowledged groups hidden,
+# so the number on the badge is the number the list shows.
+NEEDS_YOU_ALERT_RANGE = "7d"
+
+
+async def untriaged_group_count(
+    request: Request, *, range_: str = NEEDS_YOU_ALERT_RANGE
+) -> tuple[int, bool]:
+    """Alert groups with no verdict in the window, and whether that is a floor.
+
+    The count reads the Alerts list itself: the same grid query, the same mute
+    rule and the same verdict join. A second query written for the count would
+    drift from the list it links to. Acknowledged groups are hidden, as on the
+    list the console opens. A group with a run in flight counts, because the
+    list shows it under the "Untriaged" filter too.
+
+    A grid failure raises, like the list does. The caller decides how to say
+    that one part of the count is unknown.
+    """
+    settings = request.app.state.settings
+    queue = await list_alerts(
+        request,
+        range_=range_,
+        severity=None,
+        q=None,
+        sort="count",
+        from_=None,
+        to=None,
+        hide_acked=True,
+        include_muted=False,
+        settings=settings,
+        elastic=get_elastic(request),
+    )
+    count = sum(1 for g in queue.groups if g.verdict == "untriaged" and not g.fallback)
+    return count, queue.truncated

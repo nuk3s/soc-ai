@@ -235,14 +235,19 @@ describe('AnalyticsPanel when the sweeps do not run', () => {
 describe('AnalyticsPanel', () => {
   it('states the counts and the legend', async () => {
     mount();
-    await screen.findByText(/3 analytics · 1 live · 1 shadow · 1 candidate · 0 retired/);
+    await screen.findByText(/3 analytics · 1 live · 1 shadow · 1 draft · 0 retired/);
     // Each status says what the sweep does and what happens to what it finds.
     // "runs, recorded, not raised" named neither actor.
     const legend = screen.getByTestId('analytics-legend');
     expect(legend.textContent).toContain('live: the sweep runs it and raises what it finds.');
     expect(legend.textContent).toContain('shadow: the sweep runs it and records what it finds.');
-    expect(legend.textContent).toContain('candidate: the sweep has never run it.');
+    expect(legend.textContent).toContain('draft: the sweep has never run it.');
     expect(legend.textContent).toContain('retired: the analytic keeps its ledger and its reason.');
+    // C6: the paused status was nowhere on the screen.
+    expect(legend.textContent).toContain(
+      'paused by soc-ai: soc-ai moved a live analytic to shadow. It fired too often or was ' +
+        'often wrong. You decide.',
+    );
   });
 
   // Two analytics on one subject read the same from the title alone, and the
@@ -292,21 +297,23 @@ describe('AnalyticsPanel', () => {
     });
     mount();
     const chip = await screen.findByTestId(`analytic-held-${SHIPPED_LIVE.id}`);
-    expect(chip.textContent).toBe('held by soc-ai');
+    expect(chip.textContent).toBe('Paused by soc-ai');
     expect(chip.getAttribute('title')).toContain('soc-ai moved this analytic from live to shadow.');
     expect(chip.getAttribute('title')).toContain(reason);
     expect(screen.queryByTestId(`analytic-held-${LOCAL_SHADOW.id}`)).toBeNull();
     expect(screen.queryByTestId(`analytic-held-${LOCAL_CANDIDATE.id}`)).toBeNull();
   });
 
-  it('gives every row its status word and its tier', async () => {
+  it('gives every row its status word, its source and its method', async () => {
     mount();
     const live = await screen.findByTestId(`analytic-${SHIPPED_LIVE.id}`);
     expect(within(live).getByText('live')).toBeTruthy();
-    expect(within(live).getByText('shipped')).toBeTruthy();
+    // C6: the source and the method in words, not "shipped" and "match".
+    expect(within(live).getByText(/shipped with soc-ai/)).toBeTruthy();
+    expect(within(live).getByText(/method: /)).toBeTruthy();
     const shadow = screen.getByTestId(`analytic-${LOCAL_SHADOW.id}`);
     expect(within(shadow).getByText('shadow')).toBeTruthy();
-    expect(within(shadow).getByText('local')).toBeTruthy();
+    expect(within(shadow).getByText(/written here/)).toBeTruthy();
     expect(within(shadow).getByText(/3 shadow hits · 2 unread/)).toBeTruthy();
   });
 
@@ -446,14 +453,14 @@ describe('AnalyticsPanel sweep', () => {
     vi.mocked(getHuntCatalog).mockResolvedValue(SWEPT as never);
     mount();
     const line = await screen.findByTestId('analytics-sweep');
-    expect(line.textContent).toBe('last sweep 10m ago · window 61 min');
+    expect(line.textContent).toBe('last sweep 10m ago · looks back 61 min');
   });
 
   it('says never when no sweep has run', async () => {
     vi.mocked(getHuntCatalog).mockResolvedValue({ ...RAN, last_sweep_at: null });
     mount();
     const line = await screen.findByTestId('analytics-sweep');
-    expect(line.textContent).toBe('last sweep never · window 61 min');
+    expect(line.textContent).toBe('last sweep never · looks back 61 min');
   });
 
   it('marks a row the newest sweep could not see', async () => {
@@ -627,21 +634,22 @@ describe('AnalyticsPanel filters', () => {
   it('searches the title and the id', async () => {
     mount();
     await screen.findByTestId(`analytic-${SHIPPED_LIVE.id}`);
-    const box = screen.getByPlaceholderText('Search title or id…');
+    const box = screen.getByPlaceholderText('Search title or id');
     fireEvent.change(box, { target: { value: 'rare-parent' } });
     await waitFor(() => expect(rowIds()).toEqual([LOCAL_CANDIDATE.id]));
     fireEvent.change(box, { target: { value: 'kerberos' } });
     await waitFor(() => expect(rowIds()).toEqual([LOCAL_SHADOW.id]));
   });
 
-  it('filters on the tier and offers only the tiers the list carries', async () => {
+  it('filters on the source and offers only the sources the list carries', async () => {
     mount();
     await screen.findByTestId(`analytic-${SHIPPED_LIVE.id}`);
-    const tier = screen.getByRole('combobox', { name: 'Tier' });
+    // C6: "tier" needed the manual. The address keeps the stored name.
+    const tier = screen.getByRole('combobox', { name: 'Source' });
     expect([...tier.querySelectorAll('option')].map((o) => o.textContent)).toEqual([
-      'tier: any',
-      'local',
-      'shipped',
+      'Source: any',
+      'Source: written here',
+      'Source: shipped with soc-ai',
     ]);
     fireEvent.change(tier, { target: { value: 'local' } });
     await waitFor(() => expect(rowIds()).toEqual([LOCAL_SHADOW.id, LOCAL_CANDIDATE.id]));

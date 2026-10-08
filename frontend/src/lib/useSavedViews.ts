@@ -21,6 +21,12 @@ import type { SavedView, SavedViewQuery, SavedViewScreen } from './types';
  * no chips, no save control and no error, and an analyst reads that as a
  * feature the product does not have (dogfood 2026-09-07, D3).
  *
+ * That cure covered a refused read only. A deployment with authentication off
+ * still got no control and no line, the same defect on the commonest lab
+ * setup (dogfood 2026-10-06, operator 4.1). It now gets the reason too. The
+ * reason states the fact and gives no advice to sign in, because there is
+ * nothing to sign in to.
+ *
  * The latch is scoped to AUTH failures: a transient 500 used to remove "Save
  * view" for the rest of the mount, which is a working feature deleted by one
  * bad response.
@@ -71,8 +77,25 @@ function readableError(err: unknown, fallback: string): string {
   return msg || fallback;
 }
 
-/** One sentence for the one state: this deployment has nobody to own a view. */
+/** One sentence for a refused read: this session has nobody to own a view. */
 const NO_SESSION = 'Saved views need a signed-in session.';
+
+/** The same fact on a deployment with authentication off. */
+export const AUTH_OFF =
+  'Saved views need a signed-in session. This deployment has authentication off.';
+
+/** The same fact for a caller that holds an API token. A token has no user
+ *  row, and a view belongs to a user. */
+export const TOKEN_CALLER =
+  'Saved views need a signed-in session. An API token has no user to own a view.';
+
+/** The line beside the disabled control. Null while the reason is unknown. */
+function unavailableReason(absence: 'no_user' | 'token' | 'no_session' | null): string | null {
+  if (absence === 'no_user') return AUTH_OFF;
+  if (absence === 'token') return TOKEN_CALLER;
+  if (absence === 'no_session') return NO_SESSION;
+  return null;
+}
 
 export function useSavedViews(
   screen: SavedViewScreen,
@@ -81,13 +104,11 @@ export function useSavedViews(
 ): SavedViewsBinding {
   const [views, setViews] = useState<SavedView[]>([]);
   const [available, setAvailable] = useState(true);
-  // WHY the control is gone, which decides whether anything is said about it.
-  // 'no_user' is a deployment with nobody to own a view — authentication off,
-  // or a bearer-token caller. There is no session to sign in to, so a line
-  // telling the operator to sign in is advice nobody can take, on every list
-  // screen, forever. 'no_session' is a refused read, where signing in IS the
-  // fix and the line is worth its space.
-  const [absence, setAbsence] = useState<'no_user' | 'no_session' | null>(null);
+  // WHY the control is gone, which decides what the line beside it says.
+  // 'no_user' is a deployment with authentication off. 'token' is a caller
+  // with an API token and no user row. 'no_session' is a refused read, where
+  // signing in IS the fix.
+  const [absence, setAbsence] = useState<'no_user' | 'token' | 'no_session' | null>(null);
   const [activeViewId, setActiveViewId] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -118,7 +139,7 @@ export function useSavedViews(
         if (me.signed_in === false) {
           setViews([]);
           setAvailable(false);
-          setAbsence('no_user');
+          setAbsence(me.role === 'token' ? 'token' : 'no_user');
           return null;
         }
         return listSavedViews(screen);
@@ -223,7 +244,7 @@ export function useSavedViews(
     onDeleteView,
     onSaveView: available ? onSaveView : undefined,
     error,
-    unavailable: available || absence !== 'no_session' ? null : NO_SESSION,
+    unavailable: available ? null : unavailableReason(absence),
     clearActive,
   };
 }

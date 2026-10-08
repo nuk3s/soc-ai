@@ -1,8 +1,11 @@
-import { ArrowUpRight, Check, ChevronRight, Filter, Sparkles, X, Zap } from 'lucide-react';
+import { AlertTriangle, ArrowUpRight, Check, ChevronRight, Filter, Sparkles, X, Zap } from 'lucide-react';
+import { KeyHelpOverlay } from '../components/KeyHelpOverlay';
+import { chipProps, confidenceText, verdictLabel, verdictMeta } from '../lib/labels';
 import { type Dispatch, type RefObject, type SetStateAction, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { KindBadge, PipelineErrorChip, SeverityTag, VerdictPill } from '../components/Badges';
 import { FlowBadge } from '../components/FlowBadge';
+import { RowTags, TAGS_COLUMN, TagsHeader } from '../components/RowTags';
 import { Checkbox } from '../components/Controls';
 import { ListToolbar } from '../components/ListToolbar';
 import { useListSelection } from '../lib/useListSelection';
@@ -10,7 +13,7 @@ import { useSavedViews } from '../lib/useSavedViews';
 import { Drawer } from '../components/Drawer';
 import { MultiSelect } from '../components/MultiSelect';
 import { TimeRangeFilter, type CustomRange } from '../components/TimeRangeFilter';
-import { ErrorState, Freshness, LoadingState, Spinner } from '../components/States';
+import { ErrorState, Freshness, LoadingInline, LoadingState, Spinner } from '../components/States';
 import { hideOptimisticallyAcked } from '../lib/alertFilters';
 import { MIN_BUCKET, bucketEvents } from '../lib/alertEventBuckets';
 import {
@@ -37,7 +40,7 @@ import {
 import { DEMO_ACTION_NOTE, demoBlocked, useDemo } from '../lib/demo';
 import { ackMessage, ackTail, escalateLinks, escalateMessage } from '../lib/groupWriteMessages';
 import { plural } from '../lib/plural';
-import { middleEllipsis } from '../lib/text';
+import { COUNTING } from '../lib/text';
 import { type ToastTone, useToast } from '../lib/toast';
 import { useAsync } from '../lib/useAsync';
 import { isEditableTarget, nextFocusIndex, resolveTriageKey } from '../lib/triageKeys';
@@ -66,7 +69,15 @@ type SortKey = 'count' | 'detection' | 'sev' | 'verdict' | 'conf' | 'latest';
 // count is now a subtle inline chip. `actions` fits Done + "Open report" on one
 // line and the cell flex-wraps, so an owned row's third button drops BELOW
 // instead of overlapping the "Last seen" column.
-const GRID = '28px minmax(240px,1fr) 104px 136px 48px 40px 100px 170px';
+// The chips of a group sit in the tags column before the actions: the type,
+// the handled counts and the "uncounted" mark. The detection cell holds the
+// name and the flow line, so every name starts at the same x (owner,
+// 2026-10-07). The name wraps whole, so its floor is lower than when it held
+// the chips. The table fits a 1280px window and scrolls sideways under the sum
+// of the floors.
+const GRID = `28px minmax(160px,1fr) 96px 128px 44px 40px 84px ${TAGS_COLUMN} 166px`;
+/** The sum of the column floors, the gaps and the row padding. */
+const GRID_MIN_WIDTH = 998;
 
 // Per-alert (expanded) event row: checkbox | alert time (abs+rel) | sev |
 // src→dst:port | host (+ its address) | verdict provenance (+ when) |
@@ -76,7 +87,7 @@ const GRID = '28px minmax(240px,1fr) 104px 136px 48px 40px 100px 170px';
 // column stacks its second line (the endpoint agent's IP, host detections only)
 // rather than taking a column of its own: it is absent on every flow alert, so a
 // column would be empty on the common case.
-const EVENT_GRID = '16px 132px 76px minmax(150px,1fr) 116px 172px 92px';
+const EVENT_GRID = '16px 132px 76px minmax(150px,1fr) 116px 196px 92px';
 
 // Page size for an expanded group's events ("Load more" pulls one page at a time).
 const EVENTS_PAGE_SIZE = 50;
@@ -300,27 +311,18 @@ function HandledChip({
   icon,
   colour,
   known,
-  unknown,
 }: {
   count: number | null | undefined;
   icon: React.ReactNode;
   colour: { borderColor: string; background: string; color: string };
   known: (n: number) => string;
-  unknown: string;
 }) {
   const cls =
     'inline-flex flex-shrink-0 items-center gap-[3px] rounded-chip border px-[5px] py-[2px] font-mono text-[10px] font-semibold';
-  if (count === null) {
-    return (
-      <span
-        title={unknown}
-        className={cls}
-        style={{ borderColor: 'rgba(148,163,184,.32)', background: 'rgba(148,163,184,.08)', color: '#94a3b8' }}
-      >
-        {icon}?
-      </span>
-    );
-  }
+  // An unknown count draws no chip of its own. Two "?" chips on every
+  // endpoint row explained nothing (dogfood 2026-10-06, first hour C7). The
+  // row shows one "uncounted" chip in their place, with the reason.
+  if (count === null) return null;
   if (!count || count <= 0) return null;
   return (
     <span title={known(count)} className={cls} style={colour}>
@@ -329,6 +331,11 @@ function HandledChip({
     </span>
   );
 }
+
+/** Why a row shows no handled counts: the index of the detector cannot search
+ *  the flags. */
+export const COUNTS_UNKNOWN =
+  "Security Onion cannot count the acknowledged and escalated alerts of this detection. This detector's index cannot search the flags. Expand the group to see what each event says.";
 
 /** Derive 1-2 char avatar initials from a username or token:<name> string. */
 function toInitials(owner: string): string {
@@ -410,13 +417,26 @@ function ProvenanceBadge({ ev, onOpen }: { ev: AlertEvent; onOpen: (id: string) 
   const kind = ev.investigated ? 'investigated' : ev.inheritedReason ? 'inherited' : null;
   if (!kind) return <span className="text-faint">—</span>;
   const green = kind === 'investigated';
-  const label = when ? `${kind} ${when}` : kind;
-  const tone = green
-    ? { borderColor: 'rgba(34,197,94,.35)', background: 'rgba(34,197,94,.08)', color: '#4ade80' }
-    : { borderColor: 'rgba(148,163,184,.25)', background: 'rgba(148,163,184,.07)', color: '#94a3b8' };
-  const title = ev.inheritedReason ?? 'The investigation covers this exact event. Open the report.';
+  // The verdict leads the chip, in its own colour: "True positive 0.62, 4d
+  // ago". The chip said "inherited 4d ago" with no verdict, so a true
+  // positive inside a group read like every other event (dogfood 2026-10-06).
+  const verdict = ev.verdict ? verdictMeta(ev.verdict) : null;
+  const label = verdict
+    ? `${verdict.label}${ev.conf != null ? ` ${confidenceText(ev.conf)}` : ''}${when ? `, ${when}` : ''}`
+    : when
+      ? `${kind} ${when}`
+      : kind;
+  const tone = verdict
+    ? { borderColor: verdict.border, background: verdict.bg, color: verdict.color }
+    : green
+      ? { borderColor: 'rgba(34,197,94,.35)', background: 'rgba(34,197,94,.08)', color: '#4ade80' }
+      : { borderColor: 'rgba(148,163,184,.25)', background: 'rgba(148,163,184,.07)', color: '#94a3b8' };
+  const how = green ? 'The investigation covers this exact event. Open the report.' : null;
+  const title = verdict
+    ? `${ev.inheritedReason ?? how ?? ''} ${green ? 'Investigated directly.' : 'Inherited.'}`.trim()
+    : ev.inheritedReason ?? how ?? '';
   const cls =
-    'inline-flex min-w-0 max-w-full items-center gap-0.5 truncate rounded-chip border px-[6px] py-[2px] font-mono text-[9.5px] font-semibold';
+    'inline-flex min-w-0 max-w-full items-center gap-0.5 flex-wrap rounded-chip border px-[6px] py-[2px] font-mono text-[9.5px] font-semibold';
   if (ev.invId) {
     return (
       <button
@@ -426,14 +446,63 @@ function ProvenanceBadge({ ev, onOpen }: { ev: AlertEvent; onOpen: (id: string) 
         className={`${cls} hover:brightness-125`}
         style={tone}
       >
-        <span className="truncate">{label}</span>
+        <span className="break-words">{label}</span>
         <ArrowUpRight size={9} strokeWidth={2.5} className="flex-shrink-0" />
       </button>
     );
   }
   return (
     <span title={title} className={`${cls} cursor-help`} style={tone}>
-      <span className="truncate">{label}</span>
+      <span className="break-words">{label}</span>
+    </span>
+  );
+}
+
+/** "1 true positive, 8 false positives": the verdict counts of a group, worst
+ *  first, in the words lib/labels.ts gives each verdict. */
+export function verdictCountsLine(counts: Record<string, number> | undefined): string {
+  const order = ['true_positive', 'needs_more_info', 'inconclusive', 'false_positive'];
+  const keys = Object.keys(counts ?? {}).sort(
+    (a, b) => (order.indexOf(a) + 1 || 99) - (order.indexOf(b) + 1 || 99),
+  );
+  return keys
+    .filter((k) => (counts?.[k] ?? 0) > 0)
+    .map((k) => {
+      const n = counts![k];
+      const word = verdictLabel(k).toLowerCase();
+      // "needs more info" reads "need more info" for more than one.
+      const noun = n === 1 ? word : word === 'needs more info' ? 'need more info' : `${word}s`;
+      return `${n} ${noun}`;
+    })
+    .join(', ');
+}
+
+/** The worst verdict of a group, as a chip that opens its run, and the counts
+ *  of each verdict. Nothing when the group holds one verdict only. */
+function VerdictMix({ g, onOpen }: { g: AlertGroup; onOpen: (id: string) => void }) {
+  const counts = g.verdictCounts ?? {};
+  const kinds = Object.values(counts).filter((n) => n > 0).length;
+  if (!g.worstVerdict && kinds < 2) return null;
+  const line = verdictCountsLine(counts);
+  const worst = g.worstVerdict ? verdictMeta(g.worstVerdict) : null;
+  return (
+    <span className="flex min-w-0 flex-wrap items-center gap-1" data-testid="verdict-mix">
+      {worst && (
+        <button
+          type="button"
+          disabled={!g.worstInvId}
+          onClick={(e) => {
+            e.stopPropagation();
+            if (g.worstInvId) onOpen(g.worstInvId);
+          }}
+          title={`${counts[g.worstVerdict!] ?? 1} ${worst.label.toLowerCase()} in this group. Open the investigation.`}
+          {...chipProps(worst, { className: 'enabled:hover:brightness-125 disabled:cursor-default' })}
+        >
+          {worst.label}
+          {g.worstConf != null ? ` ${confidenceText(g.worstConf)}` : ''}
+        </button>
+      )}
+      {line && <span className="break-all font-mono text-[10.5px] text-faint">{line}</span>}
     </span>
   );
 }
@@ -450,9 +519,9 @@ function LastRetryHint({ attempt }: { attempt: NonNullable<AlertGroup['lastAttem
   return (
     <span
       title={`The last re-run of this detection ${outcome} ${attempt.ago} ago. The standing verdict comes from an earlier run.`}
-      className="flex min-w-0 items-center truncate font-mono text-[10.5px] font-semibold text-danger"
+      className="flex min-w-0 items-center flex-wrap font-mono text-[10.5px] font-semibold text-danger"
     >
-      <span className="truncate">· last retry {label} {attempt.ago} ago</span>
+      <span className="break-words">· last retry {label} {attempt.ago} ago</span>
     </span>
   );
 }
@@ -564,7 +633,7 @@ function EventRow({ ev, g, selEvents, setSelEvents, navigate, openDrawer, huntEv
       </div>
       {/* this alert's OWN timestamp: clock time + relative age */}
       <div className="flex min-w-0 flex-col leading-tight" title={absTime(ev.ts) ?? ev.ts ?? ''}>
-        <span className="truncate text-text-2">{clockTime(ev.ts) || '—'}</span>
+        <span className="break-words text-text-2">{clockTime(ev.ts) || '—'}</span>
         {ev.ago && <span className="text-[10px] text-faint">{ev.ago} ago</span>}
       </div>
       {/* severity */}
@@ -573,7 +642,7 @@ function EventRow({ ev, g, selEvents, setSelEvents, navigate, openDrawer, huntEv
           The backend sends BARE endpoints (the pivot value); the
           destination port renders exactly once here, hugging the
           dst (inside the same span group, outside the flex gap). */}
-      <div className="flex min-w-0 items-center gap-1.5 truncate">
+      <div className="flex min-w-0 items-center gap-1.5 flex-wrap">
         {srcPivot ? (
           <span
             className="cursor-pointer text-mono-green hover:underline"
@@ -586,10 +655,10 @@ function EventRow({ ev, g, selEvents, setSelEvents, navigate, openDrawer, huntEv
           <span className="text-mono-green">{ev.src}</span>
         )}
         <span className="text-ghost">→</span>
-        <span className="flex min-w-0 items-center truncate">
+        <span className="flex min-w-0 items-center flex-wrap">
           {dstPivot ? (
             <span
-              className="cursor-pointer truncate text-mono-amber hover:underline"
+              className="cursor-pointer break-words text-mono-amber hover:underline"
               onClick={() => navigate(`/entity/${encodeURIComponent(dstPivot)}`)}
               title={`Pivot to ${dstPivot}`}
             >
@@ -615,18 +684,18 @@ function EventRow({ ev, g, selEvents, setSelEvents, navigate, openDrawer, huntEv
       <div className="flex min-w-0 flex-col leading-tight">
         {hostPivot ? (
           <span
-            className="cursor-pointer truncate text-dim hover:text-text hover:underline"
+            className="cursor-pointer break-words text-dim hover:text-text hover:underline"
             title={`Pivot to ${hostPivot}`}
             onClick={() => navigate(`/entity/${encodeURIComponent(hostPivot)}`)}
           >
             {ev.host}
           </span>
         ) : (
-          <span className="truncate text-dim">{ev.host}</span>
+          <span className="break-words text-dim">{ev.host}</span>
         )}
         {hostIpPivot && (
           <span
-            className="cursor-pointer truncate text-[10px] text-faint hover:text-dim hover:underline"
+            className="cursor-pointer break-words text-[10px] text-faint hover:text-dim hover:underline"
             title={`Pivot to ${hostIpPivot}`}
             onClick={() => navigate(`/entity/${encodeURIComponent(hostIpPivot)}`)}
           >
@@ -654,6 +723,25 @@ function EventRow({ ev, g, selEvents, setSelEvents, navigate, openDrawer, huntEv
 }
 
 const WIDEST_RANGE = '30d';
+
+/** The windows the screen may widen to on landing, narrowest first. */
+const LANDING_WINDOWS = ['7d', '30d'] as const;
+
+/** The next wider window an empty list offers, or null at the widest. */
+export function widerWindow(range: string): '7d' | '30d' | null {
+  if (range === '7d') return '30d';
+  if (range === WIDEST_RANGE) return null;
+  return '7d';
+}
+
+/** "7d" as "7 days", "24h" as "24 hours", for a sentence. */
+function windowWords(range: string): string {
+  const m = range.match(/^(\d+)([mhd])$/);
+  if (!m) return 'the window you chose';
+  const n = Number(m[1]);
+  const unit = m[2] === 'm' ? 'minute' : m[2] === 'h' ? 'hour' : 'day';
+  return `${n} ${unit}${n === 1 ? '' : 's'}`;
+}
 
 /** "14:05", the local clock time of a read. */
 function hhmm(ms: number): string {
@@ -759,9 +847,23 @@ export function Alerts() {
   // Frozen at mount: an explicit ?range= IS an operator choice (made on the
   // Dashboard), so the demo widening above must not overwrite it.
   const rangeFromLink = useRef(seed.range != null);
+  // True once a link, a saved view, the demo or the analyst picked the window.
+  // The landing widening below leaves a chosen window alone.
+  const windowChosen = useRef(seed.range != null);
   useEffect(() => {
-    if (demo && !rangeFromLink.current) setFilterTime('30d');
+    if (demo && !rangeFromLink.current) {
+      windowChosen.current = true;
+      setFilterTime('30d');
+    }
   }, [demo]);
+  // The window the screen widened from on landing, for the note that says so.
+  const [widenedFrom, setWidenedFrom] = useState<string | null>(null);
+  /** The analyst picked a window. The landing note no longer applies. */
+  const chooseWindow = (range: string) => {
+    windowChosen.current = true;
+    setWidenedFrom(null);
+    setFilterTime(range);
+  };
   const [customRange, setCustomRange] = useState<CustomRange | null>(seed.custom);
   const [filterSevs, setFilterSevs] = useState<string[]>(seed.sevs); // [] = all
   const [filterVerdicts, setFilterVerdicts] = useState<string[]>(seed.verdicts); // [] = all
@@ -827,6 +929,46 @@ export function Alerts() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lastUpdated]);
   const switchingWindow = loading && !!queue && dataWindow !== windowKey;
+
+  // The landing window. A real grid's open alerts are often days old, and the
+  // screen opened on an empty 24 h list with a 30 d window of 4 groups behind
+  // it (dogfood 2026-10-06). When the default window comes back empty on a
+  // plain landing, the screen reads 7 d and then 30 d, once, and lands on the
+  // narrowest window that holds a group, the way Investigations does. A link,
+  // a saved view or a pick by the analyst names the window, and nothing is
+  // probed then.
+  const plainLanding = useRef(
+    !seed.verdicts.length && !seed.sevs.length && !seed.q && !searchParams.get('view'),
+  );
+  const probed = useRef(false);
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+  useEffect(() => {
+    if (!plainLanding.current || windowChosen.current || probed.current) return;
+    if (loading || error || !queue || filterTime !== DEFAULT_RANGE) return;
+    probed.current = true;
+    if (queue.groups.length > 0) return;
+    void (async () => {
+      for (const wider of LANDING_WINDOWS) {
+        const found = await getAlerts({ ...alertQuery, range: wider }).catch(() => null);
+        // A failed probe leaves the default window. The list reports its
+        // own read, and a second error line about a probe adds nothing.
+        if (!mounted.current || windowChosen.current || !found) return;
+        if (found.groups.length > 0) {
+          setWidenedFrom(DEFAULT_RANGE);
+          setFilterTime(wider);
+          return;
+        }
+      }
+    })();
+    // alertQuery is rebuilt every render; the probe reads it once.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [queue, loading, error, filterTime]);
 
   // The rows, and separately whether they are all the rows. The grid caps every
   // terms aggregation, so past the cap these are a floor — see `truncated`.
@@ -1356,7 +1498,22 @@ export function Alerts() {
         );
     });
   };
-  const escalateOneGroup = (g: AlertGroup) => escalateGroups([g]);
+  // Every escalate asks first, with the count of cases it opens (dogfood
+  // 2026-10-06, investigation S2). The server opens one case for each alert,
+  // so a 16-alert group is 16 cases. The key `e`, the bulk bar and the drawer
+  // all come through here.
+  const [escalateAsk, setEscalateAsk] = useState<{
+    targets: GroupRef[];
+    query: AlertQuery;
+    onConfirm?: () => void;
+  } | null>(null);
+  const askEscalate = (targets: GroupRef[], query: AlertQuery = alertQuery, onConfirm?: () => void) => {
+    const fresh = targets.filter((g) => !escalating[groupKey(g)]);
+    if (!fresh.length) return;
+    setEscalateAsk({ targets: fresh, query, onConfirm });
+  };
+  const escalateAskCount = escalateAsk ? escalateAlertCount(escalateAsk.targets, groups ?? []) : null;
+  const escalateOneGroup = (g: AlertGroup) => askEscalate([g]);
   const escalatingNames = Object.values(escalating);
 
   // Toggle a single group's selection (keyboard `x`) into the same `selected`
@@ -1520,6 +1677,34 @@ export function Alerts() {
     [faceted, view, me, sort],
   );
 
+  // The next alert with a report, after the one the drawer shows (dogfood
+  // 2026-10-06, first hour W1). Each alert took two clicks: close the
+  // drawer, then Open report on the next row. The list stays as it is.
+  const nextReport = drawerId ? nextReportAfter(visible, drawerId, drawerRowKeyRef.current) : null;
+  const openNextReport = () => {
+    if (!nextReport?.invId) return;
+    const key = groupKey(nextReport);
+    drawerRowKeyRef.current = key;
+    setFocusedKey(key);
+    openDrawer(nextReport.invId);
+  };
+  // j and ArrowDown open the next report while the drawer is open. The row
+  // keys stay off behind the drawer; these two are the drawer's own.
+  useEffect(() => {
+    if (!drawerId) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (escalateAsk || e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.key !== 'j' && e.key !== 'ArrowDown') return;
+      if (isEditableTarget(e.target as HTMLElement | null)) return;
+      if (!nextReport) return;
+      e.preventDefault();
+      openNextReport();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [drawerId, nextReport, escalateAsk]);
+
   // Which empty this is. An alerts filter that matches nothing looks exactly
   // like a quiet network, and on a measured grid it hid 22 unreviewed endpoint
   // alerts behind a screen that read as a calm night. Fetched only when the
@@ -1587,6 +1772,8 @@ export function Alerts() {
       // it, so short-circuit the whole layer while the drawer is open (the same
       // precondition the palette establishes for these keys).
       if (drawerId) return;
+      // The escalate confirm is a modal surface too. Its own handler owns Esc.
+      if (escalateAsk) return;
       const g = focusedIndex >= 0 ? visible[focusedIndex] : undefined;
       const action = resolveTriageKey(e, {
         paletteOpen,
@@ -1636,7 +1823,7 @@ export function Alerts() {
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [paletteOpen, modalOpen, keyHelpOpen, visible, focusedIndex, drawerId]);
+  }, [paletteOpen, modalOpen, keyHelpOpen, visible, focusedIndex, drawerId, escalateAsk]);
   const selCount = sel.count;
   const selectedEventIds = Object.entries(selEvents).filter(([, v]) => v).map(([k]) => k);
   const hasSelection = selCount > 0 || selectedEventIds.length > 0;
@@ -1725,7 +1912,7 @@ export function Alerts() {
   // While a new window loads, the rows on screen are the OLD window's, so a
   // count of them is a count of the wrong window: it reads as still asking.
   const counted = !!groups && !switchingWindow;
-  const num = (n: number): string => (counted ? n.toLocaleString() : error ? '—' : '…');
+  const num = (n: number): string => (counted ? n.toLocaleString() : error ? '—' : COUNTING);
   const countOf = (n: number, one: string, many = `${one}s`): string =>
     counted ? plural(n, one, many) : `${num(n)} ${many}`;
   // A chip badge is one glyph wide with no room for that distinction, so an
@@ -1785,6 +1972,8 @@ export function Alerts() {
     setFilterSevs(Array.isArray(saved.sevs) ? (saved.sevs as string[]) : []);
     setFilterVerdicts(Array.isArray(saved.verdicts) ? (saved.verdicts as string[]) : []);
     setHideAcked(typeof saved.hideAcked === 'boolean' ? saved.hideAcked : DEFAULT_HIDE_ACKED);
+    windowChosen.current = true;
+    setWidenedFrom(null);
     setFilterTime(typeof saved.range === 'string' ? saved.range : DEFAULT_RANGE);
     setCustomRange((saved.custom as CustomRange | null) ?? null);
   });
@@ -1812,7 +2001,7 @@ export function Alerts() {
             )}
             {switchingWindow && (
               <span className="ml-1.5 inline-flex items-center gap-1.5 text-accent" role="status">
-                <Spinner size={11} /> Loading the {filterTime === 'custom' ? 'custom' : filterTime} window…
+                <Spinner size={11} /> Loading the {filterTime === 'custom' ? 'custom' : filterTime} window
               </span>
             )}
           </div>
@@ -1881,7 +2070,6 @@ export function Alerts() {
               <div className="text-[13px] font-semibold">
                 Bulk Investigate runs
                 {triageStatus?.severities?.length ? ` on ${triageStatus.severities.join(', ')}` : ''}
-                …
               </div>
               <div className="font-mono text-[12px] text-dim">
                 {(() => {
@@ -1918,7 +2106,7 @@ export function Alerts() {
           {escalatingNames.length > 0 && (
             <div className="flex items-center gap-2.5 text-[13px]" role="status">
               <Spinner size={14} />
-              <span className="min-w-0 truncate font-semibold text-text-2">
+              <span className="min-w-0 break-words font-semibold text-text-2">
                 Security Onion opens cases for {escalatingNames.length === 1 ? escalatingNames[0] : plural(escalatingNames.length, 'group')}.
               </span>
             </div>
@@ -2138,9 +2326,10 @@ export function Alerts() {
                     <button
                       onClick={() => {
                         const targets = selectedGroups;
-                        escalateGroups(targets);
-                        sel.clear();
-                        dropEventsOutside(targets, []);
+                        askEscalate(targets, alertQuery, () => {
+                          sel.clear();
+                          dropEventsOutside(targets, []);
+                        });
                       }}
                       disabled={selectedGroups.every((g) => !!escalating[groupKey(g)])}
                       title="Open a Security Onion case for each alert in the selected groups"
@@ -2174,7 +2363,7 @@ export function Alerts() {
                       }}
                       className="rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-1.5 text-[12.5px] font-semibold text-text hover:border-success-btn-border hover:text-success disabled:opacity-50"
                     >
-                      {ackingEvents ? 'Acknowledging…' : `Acknowledge ${looseEventIds.length} event${looseEventIds.length !== 1 ? 's' : ''}`}
+                      {ackingEvents ? 'Acknowledging' : `Acknowledge ${looseEventIds.length} event${looseEventIds.length !== 1 ? 's' : ''}`}
                     </button>
                   )}
                   </>
@@ -2187,7 +2376,7 @@ export function Alerts() {
           value={filterTime}
           custom={customRange}
           onChange={(v, r) => {
-            setFilterTime(v);
+            chooseWindow(v);
             if (r) setCustomRange(r);
             views.clearActive();
           }}
@@ -2253,7 +2442,7 @@ export function Alerts() {
             className="flex max-w-[420px] items-center gap-1.5 rounded-control border border-accent/40 bg-accent/10 px-[10px] py-[7px] text-[12px] text-accent"
           >
             <Filter size={12} className="flex-none" />
-            <span className="min-w-0 truncate font-mono text-[11.5px]">{filterQ}</span>
+            <span className="min-w-0 break-all font-mono text-[11.5px]">{filterQ}</span>
             <button
               onClick={() => {
                 setFilterQ(null);
@@ -2278,7 +2467,7 @@ export function Alerts() {
       {huntReason && (
         <div className="-mt-2 mb-3.5 flex items-center gap-1.5 text-[12px] text-dim">
           <span className="flex flex-shrink-0" style={{ color: '#a78bfa' }}><Sparkles size={12} /></span>
-          <span className="min-w-0 truncate">{huntReason}</span>
+          <span className="min-w-0 break-words">{huntReason}</span>
           <button
             onClick={() => setHuntReason(null)}
             className="flex-shrink-0 text-faint hover:text-text"
@@ -2292,8 +2481,8 @@ export function Alerts() {
       <div className="overflow-x-auto overflow-y-hidden rounded-card border border-border bg-surface-1">
         {/* header */}
         <div
-          className="grid items-center gap-2.5 border-b border-border bg-surface-2 px-3.5 py-[9px] text-[10.5px] font-semibold uppercase tracking-[.06em] text-faint"
-          style={{ gridTemplateColumns: GRID, minWidth: 720 }}
+          className="grid items-center gap-2 border-b border-border bg-surface-2 px-3.5 py-[9px] text-[10.5px] font-semibold uppercase tracking-[.06em] text-faint"
+          style={{ gridTemplateColumns: GRID, minWidth: GRID_MIN_WIDTH }}
         >
           <div className="flex items-center">
             <Checkbox checked={allSelected} onClick={toggleSelectAll} title="Select all" aria-label="Select all detections" />
@@ -2314,10 +2503,11 @@ export function Alerts() {
           <div className={`text-right ${hdrCls('latest')}`} onClick={() => toggleSort('latest')}>
             Last seen{caret('latest')}
           </div>
+          <TagsHeader />
           <div />
         </div>
 
-        {loading && !groups && <LoadingState label="Loading detections…" />}
+        {loading && !groups && <LoadingState label="Loading detections" />}
         {/* A filter the server refused is the analyst's to fix, not an outage.
             The generic card hid the reason under Details and offered a Retry
             that sent the same 400 again (P7, RL8). */}
@@ -2347,6 +2537,16 @@ export function Alerts() {
             Showing the last good read from {hhmm(lastUpdated)}. The grid did not answer.
           </div>
         )}
+        {widenedFrom && groups && groups.length > 0 && (
+          <div
+            role="status"
+            data-testid="alerts-widened"
+            className="mx-3 mt-2 rounded-card border border-border-faint bg-surface-2 px-3 py-1.5 text-[12px] text-text-2"
+          >
+            The last {windowWords(widenedFrom)} held no open detection. The list shows the last{' '}
+            {windowWords(filterTime)}.
+          </div>
+        )}
         {isEmpty && (
           <div
             className="px-4 py-10 text-center text-[13px] text-faint"
@@ -2368,6 +2568,18 @@ export function Alerts() {
             {emptyReason && emptyReason.reason !== 'not_empty' && emptyReason.hint ? (
               <div className="mx-auto mt-2 max-w-xl">{emptyReason.hint}</div>
             ) : null}
+            {/* The way out, as a control. "Widen the time range" pointed at a
+                filter bar and offered nothing to press (dogfood 2026-10-06). */}
+            {widerWindow(filterTime) && (
+              <button
+                type="button"
+                data-testid="alerts-widen"
+                onClick={() => chooseWindow(widerWindow(filterTime)!)}
+                className="mt-3 rounded-control border border-border-strong bg-surface-3 px-3 py-1.5 text-[12px] font-semibold text-text-2 hover:border-accent hover:text-text"
+              >
+                Show the last {windowWords(widerWindow(filterTime)!)}
+              </button>
+            )}
           </div>
         )}
 
@@ -2387,10 +2599,10 @@ export function Alerts() {
             >
               <div
                 onClick={() => toggleExpand(g)}
-                className={`relative grid cursor-pointer items-center gap-2.5 border-b border-border-faint hover:bg-surface-hover${
+                className={`relative grid cursor-pointer items-center gap-2 border-b border-border-faint hover:bg-surface-hover${
                   kbFocused ? ' bg-surface-hover ring-1 ring-inset ring-accent' : ''
                 }`}
-                style={{ gridTemplateColumns: GRID, minWidth: 720, padding: rowPad }}
+                style={{ gridTemplateColumns: GRID, minWidth: GRID_MIN_WIDTH, padding: rowPad }}
               >
                 {/* keyboard-focus accent bar (E2.5) */}
                 {kbFocused && (
@@ -2425,45 +2637,51 @@ export function Alerts() {
                     </div>
                   );
                 })()}
-                <div className="flex min-w-0 items-center gap-[9px]">
-                  <span className="flex text-faint transition-transform" style={{ transform: isExp ? 'rotate(90deg)' : 'rotate(0deg)' }}>
+                {/* The name and the flow line, and no chip: the chips sit in
+                    the tags column, so every name starts at the same x. The
+                    whole name shows and wraps. A middle cut hid the words
+                    that tell two rules apart (owner, 2026-10-07). */}
+                <div data-testid="alert-title-cell" className="flex min-w-0 items-start gap-[9px]">
+                  <span className="mt-[3px] flex flex-none text-faint transition-transform" style={{ transform: isExp ? 'rotate(90deg)' : 'rotate(0deg)' }}>
                     <ChevronRight size={13} />
                   </span>
-                  <KindBadge kind={g.kind} />
                   <div className="flex min-w-0 flex-1 flex-col gap-px">
-                    <div className="flex min-w-0 items-center gap-1.5">
-                      <span title={g.name} className="truncate text-[13.5px] font-medium">
-                        {middleEllipsis(g.name)}
-                      </span>
+                    <div className="min-w-0 whitespace-normal break-words text-[13.5px] font-medium leading-[1.4]">
+                      <span data-testid="alert-name">{g.name}</span>
                       {g.count > 1 && (
                         <span
-                          className="flex-shrink-0 font-mono text-[10.5px] text-faint"
+                          className="ml-1.5 whitespace-nowrap font-mono text-[10.5px] font-normal text-faint"
                           title={`This detection fired ${g.count.toLocaleString()} times in the window. Expand the row to see each event.`}
                         >
                           ×{g.count.toLocaleString()}
                         </span>
                       )}
                     </div>
-                    {(g.src || g.dst) && (
-                      <div className="flex min-w-0 items-center">
-                        <FlowBadge src={g.src} dst={g.dst} className="text-[10.5px]" />
+                    {/* Who is involved: the flow of the latest alert, how many
+                        other sources the group holds, and the machine. The row
+                        showed none of it until it was expanded (dogfood
+                        2026-10-06, W3). A host log has no flow, and says so. */}
+                    {(g.src || g.dst || g.host) && (
+                      <div data-testid="group-who" className="flex min-w-0 flex-wrap items-center gap-x-1.5 font-mono text-[10.5px] text-faint">
+                        {g.src || g.dst ? (
+                          <FlowBadge src={g.src} dst={g.dst} className="text-[10.5px]" />
+                        ) : null}
+                        {(g.srcCount ?? 0) > 1 && (
+                          <span
+                            className="flex-none"
+                            title={`The group holds ${g.srcCount} source addresses. Expand the row to see each event.`}
+                          >
+                            +{(g.srcCount ?? 1) - 1}
+                          </span>
+                        )}
+                        {g.host && (
+                          <span className="min-w-0 break-all">
+                            {g.src || g.dst ? `· on ${g.host}` : `on ${g.host} · host log`}
+                          </span>
+                        )}
                       </div>
                     )}
                   </div>
-                  <HandledChip
-                    count={g.ackedCount}
-                    icon={<Check size={9} strokeWidth={2.5} />}
-                    colour={{ borderColor: 'rgba(34,197,94,.35)', background: 'rgba(34,197,94,.08)', color: '#4ade80' }}
-                    known={(n) => `${n} acknowledged`}
-                    unknown="The acknowledged count is unknown. This detector's index cannot search the flag. Security Onion cannot count it. Expand the group to see what each event says."
-                  />
-                  <HandledChip
-                    count={g.escalatedCount}
-                    icon={<ArrowUpRight size={9} strokeWidth={2.5} />}
-                    colour={{ borderColor: 'rgba(251,146,60,.35)', background: 'rgba(251,146,60,.08)', color: '#fb923c' }}
-                    known={(n) => `${n} escalated`}
-                    unknown="The escalated count is unknown. This detector's index cannot search the flag. Security Onion cannot count it. Expand the group to see what each event says."
-                  />
                 </div>
                 <div><SeverityTag sev={g.sev} /></div>
                 {/* flex-wrap (not overflow-hidden): the E2.3 StateChip drops to
@@ -2484,7 +2702,7 @@ export function Alerts() {
                       className="inline-flex items-center gap-1.5 rounded-chip border border-[rgba(251,191,36,.35)] bg-[rgba(251,191,36,.10)] px-2 py-[3px] text-[11px] font-semibold text-[#fbbf24] enabled:hover:bg-[rgba(251,191,36,.18)] disabled:cursor-default"
                     >
                       <Spinner size={10} color="#fbbf24" />
-                      Investigating…
+                      Investigating
                     </button>
                   ) : g.fallback ? (
                     // Pipeline fallback (E1.2): the standing verdict came from a
@@ -2518,8 +2736,8 @@ export function Alerts() {
                       className="group/inh flex min-w-0 items-center gap-1.5 rounded-pill text-left enabled:hover:opacity-90 disabled:cursor-default"
                     >
                       <VerdictPill verdict={g.verdict} conf={g.conf} inherited showConf={false} showInherited={false} />
-                      <span className="flex min-w-0 items-center gap-0.5 truncate font-mono text-[10.5px] text-faint group-enabled/inh:group-hover/inh:text-accent">
-                        <span className="truncate">
+                      <span className="flex min-w-0 items-center gap-0.5 flex-wrap font-mono text-[10.5px] text-faint group-enabled/inh:group-hover/inh:text-accent">
+                        <span className="break-words">
                           · inherited{inheritedWhen(g.inheritedReason) ? ` ${inheritedWhen(g.inheritedReason)}` : ''}
                         </span>
                         {g.invId && <ArrowUpRight size={10} className="flex-shrink-0" />}
@@ -2528,6 +2746,11 @@ export function Alerts() {
                   ) : (
                     <VerdictPill verdict={g.verdict} conf={g.conf} inherited={false} showConf={false} showInherited={false} />
                   )}
+                  {/* The worst verdict among the alerts of the group, when it
+                      is worse than the standing one, and the count of each
+                      verdict. The row said "False positive" over a group that
+                      held a true positive (dogfood 2026-10-06, S5). */}
+                  {!g.triaging && <VerdictMix g={g} onOpen={openDrawer} />}
                   {/* E2.1: a later re-run failed on top of the standing verdict —
                       a secondary red hint; the verdict chip above stays primary.
                       Backend nulls this for triaging + fallback-standing rows. */}
@@ -2581,6 +2804,39 @@ export function Alerts() {
                 >
                   {g.latest || '—'}
                 </div>
+                {/* The tags, in the one order of every list: the type, then
+                    the handled counts. An unknown count draws one
+                    "uncounted" chip with the reason in its tooltip. */}
+                <RowTags
+                  testId={`alert-tags-${g.id}`}
+                  kind={g.kind}
+                  counts={
+                    <>
+                      <HandledChip
+                        count={g.ackedCount}
+                        icon={<Check size={9} strokeWidth={2.5} />}
+                        colour={{ borderColor: 'rgba(34,197,94,.35)', background: 'rgba(34,197,94,.08)', color: '#4ade80' }}
+                        known={(n) => `${n} acknowledged`}
+                      />
+                      <HandledChip
+                        count={g.escalatedCount}
+                        icon={<ArrowUpRight size={9} strokeWidth={2.5} />}
+                        colour={{ borderColor: 'rgba(251,146,60,.35)', background: 'rgba(251,146,60,.08)', color: '#fb923c' }}
+                        known={(n) => `${n} escalated`}
+                      />
+                      {(g.ackedCount === null || g.escalatedCount === null) && (
+                        <span
+                          data-testid="counts-unknown"
+                          title={COUNTS_UNKNOWN}
+                          className="inline-flex flex-shrink-0 cursor-help items-center rounded-chip border px-[5px] py-[2px] text-[10px] font-semibold"
+                          style={{ borderColor: 'rgba(148,163,184,.32)', background: 'rgba(148,163,184,.08)', color: '#94a3b8' }}
+                        >
+                          uncounted
+                        </span>
+                      )}
+                    </>
+                  }
+                />
                 {/* flex-wrap keeps the action pills INSIDE this cell: when an
                     owned row shows all three (Review/Done/Open report) the
                     overflow wraps to a second line below, never left into the
@@ -2694,14 +2950,14 @@ export function Alerts() {
               {isExp && (
                 <div className="animate-fadeUp-slow border-b border-border-faint bg-bg pb-1.5 pt-1">
                   {eventsLoading[gk] && (
-                    <div className="py-2.5 pl-[50px] font-mono text-[11.5px] text-faint">Loading events…</div>
+                    <div className="py-2.5 pl-[50px] font-mono text-[11.5px] text-faint"><LoadingInline size={11}>Loading events</LoadingInline></div>
                   )}
                   {!eventsLoading[gk] && eventsError[gk] && (
                     <div
                       role="alert"
                       className="flex items-center gap-2.5 py-2.5 pl-[50px] pr-3.5 font-mono text-[11.5px] text-danger"
                     >
-                      <span className="min-w-0 truncate">Could not load the events for this group. {eventsError[gk]}</span>
+                      <span className="min-w-0 break-words">Could not load the events for this group. {eventsError[gk]}</span>
                       <button
                         onClick={() => fetchFirstPage(g)}
                         className="flex-shrink-0 rounded-control border border-border-strong bg-surface-3 px-2 py-0.5 font-sans text-[11px] font-semibold text-text hover:border-accent"
@@ -2756,16 +3012,16 @@ export function Alerts() {
                         </div>
                         {/* span of the collapsed run: oldest–newest clock time */}
                         <div className="flex min-w-0 flex-col leading-tight" title={`${absTime(b.first) ?? ''} to ${absTime(b.last) ?? ''}`}>
-                          <span className="truncate text-text-2">{clockTime(b.first) || '—'} to {clockTime(b.last) || '—'}</span>
+                          <span className="break-words text-text-2">{clockTime(b.first) || '—'} to {clockTime(b.last) || '—'}</span>
                           {b.head.ago && <span className="text-[10px] text-faint">newest {b.head.ago} ago</span>}
                         </div>
                         {/* severity */}
                         <div><SeverityTag sev={(b.head.sev ?? 'unknown') as Severity} /></div>
                         {/* src → dst:port, plus the collapsed count */}
-                        <div className="flex min-w-0 items-center gap-1.5 truncate">
+                        <div className="flex min-w-0 items-center gap-1.5 flex-wrap">
                           <span className="text-mono-green">{b.head.src}</span>
                           <span className="text-ghost">→</span>
-                          <span className="truncate text-mono-amber">{b.head.dst}</span>
+                          <span className="break-words text-mono-amber">{b.head.dst}</span>
                           {b.head.port != null && <span className="text-faint">:{b.head.port}</span>}
                           <span className="flex-shrink-0 text-faint" title={`This row holds ${b.events.length} identical events.`}>
                             ×{b.events.length}
@@ -2773,7 +3029,7 @@ export function Alerts() {
                         </div>
                         {/* host the detection fired on */}
                         <div className="flex min-w-0 flex-col leading-tight">
-                          <span className="truncate text-dim">{b.head.host}</span>
+                          <span className="break-words text-dim">{b.head.host}</span>
                         </div>
                         {/* verdict provenance, shared by every event in the run */}
                         <div className="flex min-w-0 items-center">
@@ -2807,7 +3063,7 @@ export function Alerts() {
                         style={{ background: 'rgba(148,163,184,.06)' }}
                       >
                         {eventsLoadingMore[gk] ? <Spinner size={11} /> : <ChevronRight size={12} className="rotate-90" />}
-                        {eventsLoadingMore[gk] ? 'Loading…' : 'Load more'}
+                        {eventsLoadingMore[gk] ? 'Loading' : 'Load more'}
                       </button>
                     </div>
                   )}
@@ -2839,65 +3095,126 @@ export function Alerts() {
           // The drawer's investigation may sit outside the screen's filter, so
           // its escalate takes the server's default window, as the settled bar
           // in the report does.
-          escalateGroups([drawerGroup(inv)], {})
+          askEscalate([drawerGroup(inv)], {})
         }
         escalatingNames={escalatingNames}
+        nextName={nextReport?.name ?? null}
+        onNext={openNextReport}
       />
+
+      {escalateAsk && (
+        <EscalateConfirm
+          targets={escalateAsk.targets}
+          alerts={escalateAskCount}
+          onCancel={() => setEscalateAsk(null)}
+          onConfirm={() => {
+            const ask = escalateAsk;
+            setEscalateAsk(null);
+            escalateGroups(ask.targets, ask.query);
+            ask.onConfirm?.();
+          }}
+        />
+      )}
     </div>
   );
 }
 
-// ── keyboard cheatsheet overlay (E2.5) ──────────────────────────────────────
-// A small centered card + backdrop reusing the command-palette overlay styling.
-// Lists the Alerts-only row shortcuts AND the global ones (`/`, Cmd+K, `?`) so
-// one panel maps the whole keyboard surface. Closable via Esc (handled by the
-// Alerts keydown effect) or a backdrop click.
-const KEY_HELP: Array<{ keys: string; label: string }> = [
-  { keys: 'j / k', label: 'Move focus down / up' },
-  { keys: '↓ / ↑', label: 'Move focus down / up' },
-  { keys: 'o  ↵', label: 'Open the focused detection' },
-  { keys: 'a', label: 'Acknowledge the focused group' },
-  { keys: 'e', label: 'Escalate the focused group to a case' },
-  { keys: 'i', label: 'Investigate the focused group' },
-  { keys: 'x', label: 'Select / deselect the focused group' },
-  { keys: '/', label: 'Open the command palette to search' },
-  { keys: '⌘K', label: 'Toggle the command palette' },
-  { keys: '?', label: 'Show this shortcut help' },
-  { keys: 'esc', label: 'Close help / palette / drawer' },
-];
+/** The next row after the drawer's row that has a report to open. */
+export function nextReportAfter(
+  list: AlertGroup[],
+  drawerId: string,
+  rowKey: string | null,
+): AlertGroup | null {
+  let i = list.findIndex((g) => g.invId === drawerId);
+  if (i < 0 && rowKey) i = list.findIndex((g) => groupKey(g) === rowKey);
+  if (i < 0) return null;
+  return list.slice(i + 1).find((g) => !!g.invId) ?? null;
+}
 
-function KeyHelpOverlay({ onClose }: { onClose: () => void }) {
+/** The alerts an escalate of these groups covers: one case for each. Null
+ *  when a group is not on the page and its count is unknown. */
+export function escalateAlertCount(targets: GroupRef[], groups: AlertGroup[]): number | null {
+  let total = 0;
+  for (const t of targets) {
+    const g = groups.find((x) => groupKey(x) === groupKey(t));
+    if (!g || g.count == null) return null;
+    total += g.count;
+  }
+  return total;
+}
+
+/** The sentence an escalate confirm shows. */
+export function escalateConfirmText(targets: GroupRef[], alerts: number | null): string {
+  const what = targets.length === 1 ? targets[0].name : `${targets.length} detections`;
+  if (alerts == null) {
+    return `Open one Security Onion case for each alert of ${what}.`;
+  }
+  return alerts === 1
+    ? `Open 1 Security Onion case, for the one alert of ${what}.`
+    : `Open ${alerts} Security Onion cases, one for each alert of ${what}.`;
+}
+
+function EscalateConfirm({
+  targets,
+  alerts,
+  onCancel,
+  onConfirm,
+}: {
+  targets: GroupRef[];
+  alerts: number | null;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  // Esc cancels. Capture phase, so the drawer behind does not also close.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      e.stopPropagation();
+      onCancel();
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [onCancel]);
   return (
-    <>
-      <div onClick={onClose} className="fixed inset-0 z-[60] bg-[rgba(4,6,9,.55)] backdrop-blur-[2px]" />
+    <div
+      className="fixed inset-0 z-[70] flex items-center justify-center"
+      style={{ background: 'rgba(0,0,0,.65)' }}
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onCancel();
+      }}
+    >
       <div
         role="dialog"
         aria-modal="true"
-        aria-label="Keyboard shortcuts"
-        className="fixed left-1/2 top-1/2 z-[61] -translate-x-1/2 -translate-y-1/2 animate-fadeUp overflow-hidden rounded-panel-lg border border-border-input bg-surface-card shadow-palette"
-        style={{ width: 'min(440px,92vw)' }}
+        aria-label="Confirm escalate"
+        data-testid="escalate-confirm"
+        className="relative w-[460px] max-w-[calc(100vw-32px)] rounded-panel-lg border p-6"
+        style={{ background: '#0e1117', borderColor: '#1c232e' }}
       >
-        <div className="flex items-center justify-between border-b border-border-2 px-4 py-[13px]">
-          <span className="text-[14px] font-semibold text-text">Keyboard shortcuts</span>
-          <button onClick={onClose} aria-label="Close" className="flex text-faint hover:text-text">
-            <X size={15} />
+        <div className="mb-4 text-[14px] font-semibold">Escalate to Security Onion</div>
+        <div
+          className="mb-5 flex items-start gap-2 rounded-[7px] border px-3 py-2.5 text-[12.5px] leading-[1.5]"
+          style={{ borderColor: 'rgba(240,68,56,.35)', background: 'rgba(240,68,56,.07)', color: '#fca5a5' }}
+        >
+          <AlertTriangle size={13} className="mt-px flex-none" />
+          <span>This writes to Security Onion. {escalateConfirmText(targets, alerts)}</span>
+        </div>
+        <div className="flex justify-end gap-2.5">
+          <button
+            onClick={onCancel}
+            className="rounded-control border border-border-strong bg-surface-3 px-4 py-2 text-[13px] font-semibold text-text-2 hover:text-text"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onConfirm}
+            className="rounded-control border border-danger bg-[rgba(240,68,56,.1)] px-4 py-2 text-[13px] font-semibold text-[#fca5a5] hover:bg-[rgba(240,68,56,.18)]"
+          >
+            {alerts == null ? 'Open the cases' : alerts === 1 ? 'Open 1 case' : `Open ${alerts} cases`}
           </button>
         </div>
-        <div className="max-h-[60vh] overflow-y-auto p-2">
-          {KEY_HELP.map((k) => (
-            <div key={k.keys + k.label} className="flex items-center gap-3 rounded-control px-2.5 py-[7px]">
-              <kbd className="min-w-[42px] rounded-[4px] border border-border-input bg-surface-3 px-1.5 py-px text-center font-mono text-[11px] text-text-2">
-                {k.keys}
-              </kbd>
-              <span className="text-[13px] text-dim">{k.label}</span>
-            </div>
-          ))}
-        </div>
-        <div className="border-t border-border-2 px-4 py-[9px] font-mono text-[10.5px] text-faint">
-          Row shortcuts act on the highlighted detection. The shortcuts do not fire while you type in a filter.
-        </div>
       </div>
-    </>
+    </div>
   );
 }
 
@@ -2926,6 +3243,8 @@ function AlertDrawer({
   onAcked,
   onEscalate,
   escalatingNames = [],
+  nextName = null,
+  onNext,
 }: {
   drawerId: string | null;
   starting: AlertGroup | null;
@@ -2937,6 +3256,9 @@ function AlertDrawer({
   onAcked?: (ruleName: string) => void;
   onEscalate?: (inv: Inv) => void;
   escalatingNames?: string[];
+  /** The rule of the next alert with a report, or null at the end of the list. */
+  nextName?: string | null;
+  onNext?: () => void;
 }) {
   const [tick, setTick] = useState(0);
   const [cancelling, setCancelling] = useState(false);
@@ -2981,8 +3303,8 @@ function AlertDrawer({
               blue whatever kind it printed, so a hunt-promoted or generic-alert
               investigation still opened wearing a Suricata colour. */}
           <KindBadge kind={inv?.kind ?? starting?.kind ?? 'alert'} />
-          <div className="flex-1 truncate text-[14px] font-semibold" title={inv?.name ?? starting?.name ?? 'Investigation'}>
-            {middleEllipsis(inv?.name ?? starting?.name ?? 'Investigation')}
+          <div className="min-w-0 flex-1 break-words text-[14px] font-semibold" title={inv?.name ?? starting?.name ?? 'Investigation'}>
+            {inv?.name ?? starting?.name ?? 'Investigation'}
           </div>
           {inv?.status === 'investigating' && !demo && (
             <button
@@ -2996,7 +3318,7 @@ function AlertDrawer({
               }}
               className="flex items-center gap-1.5 text-[12px] text-dim hover:text-danger disabled:opacity-50"
             >
-              <X size={13} /> {cancelling ? 'Cancelling…' : 'Cancel'}
+              <X size={13} /> {cancelling ? 'Cancelling' : 'Cancel'}
             </button>
           )}
           {inv && onEscalate && drawerCanEscalate(inv) && (
@@ -3007,7 +3329,22 @@ function AlertDrawer({
               className="flex items-center gap-1.5 text-[12px] font-semibold text-[#fca5a5] hover:text-danger disabled:opacity-50"
             >
               {escalatingNames.includes(inv.name) ? <Spinner size={12} /> : null}
-              {escalatingNames.includes(inv.name) ? 'Escalating…' : 'Escalate'}
+              {escalatingNames.includes(inv.name) ? 'Escalating' : 'Escalate'}
+            </button>
+          )}
+          {onNext && (
+            <button
+              data-testid="drawer-next"
+              onClick={onNext}
+              disabled={!nextName}
+              title={
+                nextName
+                  ? `Open the next alert: ${nextName}. Keys: j or the down arrow.`
+                  : 'No later alert in this list has a report.'
+              }
+              className="flex items-center gap-1 text-[12px] font-semibold text-dim hover:text-accent disabled:opacity-40"
+            >
+              Next <ChevronRight size={13} />
             </button>
           )}
           {inv && (
@@ -3024,8 +3361,8 @@ function AlertDrawer({
         </>
       }
     >
-      {isStarting && <LoadingState label={`Starting investigation on ${starting?.name}…`} />}
-      {drawerId && loading && !inv && <LoadingState label="Loading investigation…" />}
+      {isStarting && <LoadingState label={`Starting the investigation of ${starting?.name}`} />}
+      {drawerId && loading && !inv && <LoadingState label="Loading investigation" />}
       {error && <div className="p-4"><ErrorState error={error} onRetry={refetch} /></div>}
       {inv && <Investigation inv={inv} layout="drawer" onReHunt={onReHunt} onVerdictApplied={() => setTick((x) => x + 1)} onAcked={onAcked} />}
     </Drawer>

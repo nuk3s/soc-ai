@@ -1,41 +1,77 @@
-import { AlertTriangle, Check, ChevronDown, ChevronRight, CornerDownRight, MessageSquare, RefreshCw, Trash2, X } from 'lucide-react';
-import { Fragment, useEffect, useRef, useState } from 'react';
-import { Link, useLocation, useNavigate } from 'react-router-dom';
-import { KindBadge, PipelineErrorChip, RunClassChip, SyntheticEvalBadge, VerdictPill } from '../components/Badges';
-import { FlowBadge } from '../components/FlowBadge';
-import { ListToolbar } from '../components/ListToolbar';
-import { MultiSelect } from '../components/MultiSelect';
-import { TimeRangeFilter, type CustomRange } from '../components/TimeRangeFilter';
-import { rangeToSinceUntil } from '../lib/timeRange';
-// Shared with the Dashboard — single source of truth for status colour/label/pulse.
-import { INV_STATUS as STATUS } from '../lib/statusMeta';
-import { Checkbox } from '../components/Controls';
-import { EmptyState, ErrorState, Freshness, LoadingState, StaleNotice } from '../components/States';
-import { deleteInvestigation, listInvestigations, rehuntInvestigations } from '../lib/api';
-import { errorStateFromSearch, verdictFilterFromSearch } from '../lib/investigationFilters';
-import { plural } from '../lib/plural';
-import { middleEllipsis } from '../lib/text';
-import { CHIP_SUBJECT_HUNT } from '../lib/tooltips';
-import { demoBlocked, useDemo } from '../lib/demo';
-import { useAsync } from '../lib/useAsync';
-import { useListSelection } from '../lib/useListSelection';
-import { useSavedViews } from '../lib/useSavedViews';
-import { type SortDir, useSort } from '../lib/useSort';
-import type { InvestigationRow, RehuntResult, SavedViewQuery, Verdict } from '../lib/types';
+import {
+  AlertTriangle,
+  Check,
+  ChevronDown,
+  ChevronRight,
+  CornerDownRight,
+  RefreshCw,
+  Trash2,
+  X,
+} from "lucide-react";
+import { Fragment, useEffect, useRef, useState } from "react";
+import { Link, useLocation, useNavigate } from "react-router-dom";
+import { PipelineErrorChip, VerdictPill } from "../components/Badges";
+import { isBacktestReplay } from "../components/BacktestReplayChip";
+import { FlowBadge } from "../components/FlowBadge";
+import { RowTags, TAGS_COLUMN, TagsHeader } from "../components/RowTags";
+import { ListToolbar } from "../components/ListToolbar";
+import { MultiSelect } from "../components/MultiSelect";
+import {
+  TimeRangeFilter,
+  type CustomRange,
+} from "../components/TimeRangeFilter";
+import { confidenceText, statusDetail, statusMeta } from "../lib/labels";
+import {
+  ago,
+  agoFromLabel,
+  rangeToSinceUntil,
+  timeLabel,
+} from "../lib/timeRange";
+import { Checkbox } from "../components/Controls";
+import {
+  EmptyState,
+  ErrorState,
+  Freshness,
+  LoadingState,
+  StaleNotice,
+} from "../components/States";
+import {
+  deleteInvestigation,
+  listInvestigations,
+  rehuntInvestigations,
+} from "../lib/api";
+import {
+  errorStateFromSearch,
+  verdictFilterFromSearch,
+} from "../lib/investigationFilters";
+import { plural } from "../lib/plural";
+import { CHIP_RUN_CLASS } from "../lib/tooltips";
+import { demoBlocked, useDemo } from "../lib/demo";
+import { useAsync } from "../lib/useAsync";
+import { useListSelection } from "../lib/useListSelection";
+import { useSavedViews } from "../lib/useSavedViews";
+import { type SortDir, useSort } from "../lib/useSort";
+import type {
+  InvestigationRow,
+  RehuntResult,
+  SavedViewQuery,
+  Verdict,
+} from "../lib/types";
 
 // Raw rehunt skip-reason codes (routes_investigations.py::bulk_rehunt) → friendly
 // text. Unknown codes fall through to the raw code so a new backend reason is
 // never silently swallowed.
 const REHUNT_SKIP_REASONS: Record<string, string> = {
-  not_found: 'not found',
-  no_alert: 'no alert to hunt',
-  could_not_start: 'could not start',
+  not_found: "not found",
+  no_alert: "no alert to hunt",
+  could_not_start: "could not start",
   // Defense in depth — the checkbox for a promoted finding is disabled, so
   // this code should be unreachable from the UI, but a server refusal still
   // deserves a readable reason if it ever fires (e.g. a stale selection).
-  hunt_kind: 'promoted finding. Re-promote it from the hunt page',
+  hunt_kind: "promoted finding. Re-promote it from the hunt page",
 };
-const rehuntSkipReason = (code: string): string => REHUNT_SKIP_REASONS[code] ?? code;
+const rehuntSkipReason = (code: string): string =>
+  REHUNT_SKIP_REASONS[code] ?? code;
 
 /**
  * The per-alert latest-run fields the list endpoint carries (`latestRunId`,
@@ -50,11 +86,13 @@ type WithLatestRun = InvestigationRow & {
 };
 
 // How a run that reached no verdict is described when it is somebody ELSE's
-// newest run — the phrasing on the row that outlived it.
+// newest run — the phrasing on the row that outlived it. One word for the
+// three stops, the word the Status column uses. The chip title names the
+// cause.
 const LATEST_RUN_FAILURE: Record<string, string> = {
-  error: 'newest run failed',
-  cancelled: 'newest run cancelled',
-  interrupted: 'newest run interrupted',
+  error: "newest run failed",
+  cancelled: "newest run failed",
+  interrupted: "newest run failed",
 };
 
 /**
@@ -75,19 +113,31 @@ const LATEST_RUN_FAILURE: Record<string, string> = {
  */
 function latestRunFailure(
   row: InvestigationRow,
-): { id: string; label: string; when: string } | null {
+): { id: string; label: string; when: string; status: string } | null {
   const r = row as WithLatestRun;
   if (!r.latestRunId || r.latestRunId === row.id) return null;
-  const label = LATEST_RUN_FAILURE[r.latestRunStatus ?? ''];
+  const label = LATEST_RUN_FAILURE[r.latestRunStatus ?? ""];
   if (!label) return null;
-  return { id: r.latestRunId, label, when: r.latestRunWhen ?? '' };
+  return {
+    id: r.latestRunId,
+    label,
+    when: r.latestRunWhen ?? "",
+    status: r.latestRunStatus ?? "",
+  };
 }
 
 // select | detection | verdict | conf | source→dest | status | when | delete.
 // Source→Dest gets a real minimum (two full IPv4s + arrow ≈ 220px at 12px mono)
 // and grows with spare width — the old fixed 120px clipped the destination to a
 // fragment while the verdict/conf/when gutters sat unused (register FR).
-const GRID = '28px minmax(0,1.4fr) 132px 64px minmax(230px,1fr) 110px 96px 44px';
+// The chips of a row sit in the tags column before the delete gutter. The
+// detection cell holds the name and nothing else, so every name starts at the
+// same x (owner, 2026-10-07). The flow wraps its two ends onto two lines,
+// so its floor holds one address. The table fits a 1280px window and scrolls
+// sideways under the sum of the floors.
+const GRID = `28px minmax(160px,1.4fr) 132px 52px minmax(120px,1fr) 96px 96px ${TAGS_COLUMN} 44px`;
+/** The sum of the column floors, the gaps and the row padding. */
+const GRID_MIN_WIDTH = 996;
 
 // One SQL page. The server clamps to its own cap and echoes what it used; this
 // is only the size the screen ASKS for.
@@ -97,8 +147,7 @@ const PAGE_SIZE = 50;
 // Matches the Hosts screen's cadence.
 const SEARCH_DEBOUNCE_MS = 250;
 
-
-type SortKey = 'name' | 'verdict' | 'conf' | 'host' | 'status' | 'when';
+type SortKey = "name" | "verdict" | "conf" | "host" | "status" | "when";
 
 const VERDICT_ORDER: Record<Verdict, number> = {
   true_positive: 0,
@@ -108,7 +157,7 @@ const VERDICT_ORDER: Record<Verdict, number> = {
   untriaged: 4,
 };
 
-const STATUS_ORDER: Record<InvestigationRow['status'], number> = {
+const STATUS_ORDER: Record<InvestigationRow["status"], number> = {
   running: 0,
   error: 2,
   interrupted: 3,
@@ -116,31 +165,36 @@ const STATUS_ORDER: Record<InvestigationRow['status'], number> = {
   complete: 5,
 };
 
-function cmpRows(a: InvestigationRow, b: InvestigationRow, key: SortKey, dir: SortDir): number {
+function cmpRows(
+  a: InvestigationRow,
+  b: InvestigationRow,
+  key: SortKey,
+  dir: SortDir,
+): number {
   let result = 0;
   switch (key) {
-    case 'name':
+    case "name":
       result = a.name.localeCompare(b.name);
       break;
-    case 'verdict':
+    case "verdict":
       result = VERDICT_ORDER[a.verdict] - VERDICT_ORDER[b.verdict];
       break;
-    case 'conf':
+    case "conf":
       result = (a.conf ?? -1) - (b.conf ?? -1);
       break;
-    case 'host':
-      result = (a.host ?? '').localeCompare(b.host ?? '');
+    case "host":
+      result = (a.host ?? "").localeCompare(b.host ?? "");
       break;
-    case 'status':
+    case "status":
       result = STATUS_ORDER[a.status] - STATUS_ORDER[b.status];
       break;
-    case 'when':
+    case "when":
       // Sort by raw ISO timestamp for correct chronological order; fall back to
       // empty string (treats missing ts as oldest) if the field is absent.
-      result = (a.ts ?? '').localeCompare(b.ts ?? '');
+      result = (a.ts ?? "").localeCompare(b.ts ?? "");
       break;
   }
-  return dir === 'asc' ? result : -result;
+  return dir === "asc" ? result : -result;
 }
 
 // ---------------------------------------------------------------------------
@@ -149,9 +203,9 @@ function cmpRows(a: InvestigationRow, b: InvestigationRow, key: SortKey, dir: So
 
 /** The windows the screen may land on, narrowest first, with their spans. */
 const LANDING_WINDOWS: ReadonlyArray<readonly [string, number]> = [
-  ['24h', 24 * 3_600_000],
-  ['7d', 7 * 24 * 3_600_000],
-  ['30d', 30 * 24 * 3_600_000],
+  ["24h", 24 * 3_600_000],
+  ["7d", 7 * 24 * 3_600_000],
+  ["30d", 30 * 24 * 3_600_000],
 ];
 
 /**
@@ -162,27 +216,179 @@ const LANDING_WINDOWS: ReadonlyArray<readonly [string, number]> = [
  * 2026-09-17). Null when there is no run to hold: an empty store keeps the
  * default, and its own empty state explains that in different words.
  *
- * A run older than every window gets the widest one. The list is then empty
- * and says "widen the time range", which is true and reachable, where 24h
- * would say the same thing about a window nobody chose.
+ * A run older than every preset window gets all time. The widest preset left
+ * the list empty over a store that holds runs (dogfood 2026-10-06).
  */
-export function landingWindow(newest: string | null | undefined, now = Date.now()): string | null {
+export function landingWindow(
+  newest: string | null | undefined,
+  now = Date.now(),
+): string | null {
   if (!newest) return null;
   const age = now - new Date(newest).getTime();
   if (!Number.isFinite(age)) return null;
   for (const [preset, span] of LANDING_WINDOWS) if (age <= span) return preset;
-  return LANDING_WINDOWS[LANDING_WINDOWS.length - 1][0];
+  return ALL_TIME;
 }
+
+/** The window with no lower edge. The query sends no `since`. */
+export const ALL_TIME = "all";
+
+/** The presets this list offers: the shared ones and all time. */
+const PRESETS = ["15m", "1h", "4h", "24h", "3d", "7d", "30d", ALL_TIME];
 
 /** The active window in words, for the count line. A count with no window
  *  beside it is read as a count of everything. */
 export function windowPhrase(range: string): string {
-  if (range === 'custom') return 'the window you chose';
+  if (range === ALL_TIME) return "all time";
+  if (range === "custom") return "the window you chose";
   const parsed = range.match(/^(\d+)([mhd])$/);
-  if (!parsed) return 'this window';
+  if (!parsed) return "this window";
   const n = Number(parsed[1]);
-  const unit = parsed[2] === 'm' ? 'minute' : parsed[2] === 'h' ? 'hour' : 'day';
-  return `the last ${n} ${unit}${n === 1 ? '' : 's'}`;
+  const unit =
+    parsed[2] === "m" ? "minute" : parsed[2] === "h" ? "hour" : "day";
+  return `the last ${n} ${unit}${n === 1 ? "" : "s"}`;
+}
+
+/** The figures over the list, with the backtest replays they leave out or
+ *  hold. A backtest replay measures the model on an alert an analyst already
+ *  closed. The server leaves replays out of the rows and the figures by
+ *  default, and the line names how many it left out. With the replays shown,
+ *  the line names how many of the counted runs are replays. On the range, 12
+ *  of 14 "true positives" in a week were replays (dogfood 2026-10-06). Over all
+ *  time the window reads "in total". */
+export function countLine(p: {
+  total: number;
+  running: number;
+  truePositives: number;
+  range: string;
+  replays: number;
+  includesReplays: boolean;
+}): string {
+  const window =
+    p.range === ALL_TIME ? "in total" : `in ${windowPhrase(p.range)}`;
+  const base =
+    `${plural(p.total, "investigation")} ${window} · ` +
+    `${p.running.toLocaleString()} in progress · ${plural(p.truePositives, "true positive")}`;
+  if (p.replays <= 0) return base;
+  return p.includesReplays
+    ? `${base} · includes ${plural(p.replays, "backtest replay")}`
+    : `${base} · ${plural(p.replays, "backtest replay")} not counted`;
+}
+
+/** What the verdict cell says on a row with no verdict. A dash read as "no
+ *  data" on a run that failed, and as nothing on a run still going.
+ *
+ *  A failed run that is not its alert's primary run has a sibling: a later
+ *  run, or an earlier complete one. The row says which. */
+export function noVerdictText(r: InvestigationRow): string {
+  if (r.status === "running") return "Running";
+  const latest = (r as WithLatestRun).latestRunId;
+  if (r.isPrimary === false) {
+    return latest && latest !== r.id
+      ? "Failed. A later run replaced it."
+      : "Failed. An earlier run holds the verdict.";
+  }
+  return "Failed. No run reached a verdict.";
+}
+
+/** A host-log alert: a Sigma alert, or any alert on a named machine, with no
+ *  destination. Its flow cell read "<address> → " and a dash, which looked
+ *  like a lost destination. The cell names the machine. */
+export function hostLogMachine(r: InvestigationRow): string | null {
+  if (r.dst) return null;
+  if (r.kind === "hunt" || r.subjectType === "hunt") return null;
+  if (r.hostName) return r.hostName;
+  const address = r.host && r.host !== "—" ? r.host : null;
+  return r.kind === "sigma" ? address : null;
+}
+
+/** The flow cell. A host-log alert names its machine. A flow keeps the pair. */
+function FlowCell({ r, dim = false }: { r: InvestigationRow; dim?: boolean }) {
+  const machine = hostLogMachine(r);
+  if (machine) {
+    return (
+      <span
+        data-testid={`host-log-${r.id}`}
+        title={`A host-log alert on ${machine}. It has no network flow.`}
+        className={`inline-flex min-w-0 max-w-full flex-wrap items-center gap-x-1 text-[12px] ${dim ? "opacity-70" : ""}`}
+      >
+        <span className="flex-none text-faint">on</span>{" "}
+        <span className="break-all font-mono text-mono-amber">{machine}</span>{" "}
+        <span className="flex-none text-faint">· host log</span>
+      </span>
+    );
+  }
+  return (
+    <span className={dim ? "opacity-70" : ""}>
+      <FlowBadge src={r.host === "—" ? null : r.host} dst={r.dst} />
+    </span>
+  );
+}
+
+/** The verdict cell. A row with no verdict says why in words. */
+function VerdictCell({ r }: { r: InvestigationRow }) {
+  if (r.fallback) return <PipelineErrorChip />;
+  if (r.verdict !== "untriaged") return <VerdictPill verdict={r.verdict} />;
+  return (
+    <span
+      data-testid={`no-verdict-${r.id}`}
+      title={statusDetail(r.status)}
+      className="block text-[11.5px] leading-[1.3] text-faint"
+    >
+      {noVerdictText(r)}
+    </span>
+  );
+}
+
+/** The status cell. Error, cancelled and interrupted read "Failed", and the
+ *  title names the cause. */
+function StatusCell({
+  status,
+  small = false,
+}: {
+  status: InvestigationRow["status"];
+  small?: boolean;
+}) {
+  const st = statusMeta(status);
+  const pulse = status === "running";
+  return (
+    <span
+      data-testid="status-cell"
+      className={`inline-flex items-center gap-1.5 ${small ? "text-[11px]" : "text-[11.5px]"}`}
+      style={{ color: st.color }}
+      title={statusDetail(status)}
+    >
+      <span
+        className={
+          "h-1.5 w-1.5 rounded-full " + (pulse ? "animate-pulseDot" : "")
+        }
+        style={{ background: st.color }}
+      />
+      {st.label}
+    </span>
+  );
+}
+
+/** The When cell: the shared relative time, and the absolute time with its
+ *  zone in the title. The server's own label is the fallback for a row with
+ *  no timestamp. */
+function WhenCell({
+  r,
+  className,
+}: {
+  r: InvestigationRow;
+  className: string;
+}) {
+  const t = r.ts ? timeLabel(r.ts) : { text: agoFromLabel(r.when), title: "" };
+  return (
+    <div
+      className={className}
+      title={t.title || undefined}
+      data-testid={`when-${r.id}`}
+    >
+      {t.text}
+    </div>
+  );
 }
 
 export function Investigations() {
@@ -210,35 +416,49 @@ export function Investigations() {
   const [errorState, setErrorState] = useState<string | null>(() =>
     errorStateFromSearch(location.search),
   );
+  // Backtest replays are off by default: a replay measures the model on an
+  // alert an analyst already closed, and this list is the live work. The
+  // server leaves them out of the rows and the header figures unless asked.
+  const [showReplays, setShowReplays] = useState(false);
   // Free text, matched SERVER-side against rule name, source and destination.
   // Alerts had a search box and this screen did not, which is half of why the
   // two never read as the same product (dogfood A3). Client-side filtering was
   // never an option here: it is the exact defect the server-side query
   // replaced.
-  const [q, setQ] = useState(() => new URLSearchParams(location.search).get('q') ?? '');
-  const [debouncedQ, setDebouncedQ] = useState(() => new URLSearchParams(location.search).get('q') ?? '');
+  const [q, setQ] = useState(
+    () => new URLSearchParams(location.search).get("q") ?? "",
+  );
+  const [debouncedQ, setDebouncedQ] = useState(
+    () => new URLSearchParams(location.search).get("q") ?? "",
+  );
   // A deep link widens the window to the widest preset: the Dashboard KPI counts
   // its 100 most recent runs with NO time filter, so landing on the default 24h
   // could show an empty list for the very rows the link promised.
   const [range, setRange] = useState(() => {
     // A link may name the window it counted over (`?range=30d`), so the page
     // opens on the rows the link promised instead of an empty 24h.
-    const wanted = new URLSearchParams(location.search).get('range');
-    if (wanted && /^\d+[mhd]$/.test(wanted)) return wanted;
-    return verdictFilterFromSearch(location.search).length ? '30d' : '24h';
+    const wanted = new URLSearchParams(location.search).get("range");
+    if (wanted && (wanted === ALL_TIME || /^\d+[mhd]$/.test(wanted)))
+      return wanted;
+    return verdictFilterFromSearch(location.search).length ? "30d" : "24h";
   });
   // True while the landing window is still the screen's own guess. A link that
   // named a window, and every later pick, owns it instead.
   const [autoWindow] = useState(() => {
-    const wanted = new URLSearchParams(location.search).get('range');
-    if (wanted && /^\d+[mhd]$/.test(wanted)) return false;
+    const wanted = new URLSearchParams(location.search).get("range");
+    if (wanted && (wanted === ALL_TIME || /^\d+[mhd]$/.test(wanted)))
+      return false;
     return verdictFilterFromSearch(location.search).length === 0;
   });
+  // The start time of the newest run when the screen widened its own window
+  // to hold it. The header says why the window is not 24 hours. Cleared when
+  // the analyst picks a window.
+  const [widenedFor, setWidenedFor] = useState<string | null>(null);
   const windowChosen = useRef(false);
   useEffect(() => {
     if (demo) {
       windowChosen.current = true;
-      setRange('30d');
+      setRange("30d");
     }
   }, [demo]);
   const [custom, setCustom] = useState<CustomRange | null>(null);
@@ -264,7 +484,7 @@ export function Investigations() {
       setFilterVerdicts(fromUrl);
       setErrorState(errorStateFromSearch(location.search));
       windowChosen.current = true;
-      setRange('30d');
+      setRange("30d");
       setOffset(0);
     }
   }, [location.search]);
@@ -283,21 +503,23 @@ export function Investigations() {
   const { data, loading, error, lastUpdated, failCount, refetch } = useAsync(
     () =>
       listInvestigations({
-        ...rangeToSinceUntil(range, custom),
+        ...(range === ALL_TIME ? {} : rangeToSinceUntil(range, custom)),
         verdict: filterVerdicts,
         status: filterStatuses,
         q: debouncedQ || undefined,
         errorState: errorState ?? undefined,
+        includeBacktest: showReplays || undefined,
         limit: PAGE_SIZE,
         offset,
       }),
     [
       range,
       custom,
-      filterVerdicts.join(','),
-      filterStatuses.join(','),
+      filterVerdicts.join(","),
+      filterStatuses.join(","),
       debouncedQ,
-      errorState ?? '',
+      errorState ?? "",
+      showReplays,
       offset,
     ],
     {
@@ -321,9 +543,11 @@ export function Investigations() {
     listInvestigations({ limit: 1, offset: 0 })
       .then((newest) => {
         if (!alive || windowChosen.current) return;
-        const wider = landingWindow(newest.rows[0]?.ts ?? null);
+        const newestTs = newest.rows[0]?.ts ?? null;
+        const wider = landingWindow(newestTs);
         if (wider && wider !== range) {
           setRange(wider);
+          setWidenedFor(newestTs);
           setOffset(0);
         }
       })
@@ -341,23 +565,25 @@ export function Investigations() {
   useEffect(() => {
     const onFocus = () => refetch();
     const onVisible = () => {
-      if (document.visibilityState === 'visible') refetch();
+      if (document.visibilityState === "visible") refetch();
     };
-    window.addEventListener('focus', onFocus);
-    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onVisible);
     return () => {
-      window.removeEventListener('focus', onFocus);
-      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onVisible);
     };
   }, []);
   // Shared sort mechanics; clicking a new column here starts it ascending.
   const { sort, toggleSort, caret, headerCls, ariaSort } = useSort<SortKey>(
-    { key: 'when', dir: 'desc' },
-    'asc',
+    { key: "when", dir: "desc" },
+    "asc",
   );
-  const [groupBy, setGroupBy] = useState<'none' | 'detection'>('none');
+  const [groupBy, setGroupBy] = useState<"none" | "detection">("none");
   // Alert ids whose earlier (non-primary) runs are expanded inline.
-  const [expandedAlerts, setExpandedAlerts] = useState<Record<string, boolean>>({});
+  const [expandedAlerts, setExpandedAlerts] = useState<Record<string, boolean>>(
+    {},
+  );
 
   const [rehunting, setRehunting] = useState(false);
   const [rehuntMsg, setRehuntMsg] = useState<string | null>(null);
@@ -410,6 +636,7 @@ export function Investigations() {
   const totalAll = data?.totalAll ?? 0;
   const running = data?.running ?? 0;
   const tps = data?.truePositives ?? 0;
+  const replays = data?.backtestReplays ?? 0;
 
   // Cluster retries of the SAME alert: surface the canonical (primary) run and
   // tuck earlier/errored/cancelled re-runs under it, so the one that WORKED is
@@ -422,10 +649,10 @@ export function Investigations() {
   // 2026-07-15 pipeline_error; 2026-08-05 needs_more_info — this rule is those
   // two special cases generalized).
   const primaryAlertsOnPage = new Set(
-    visible.filter((r) => r.isPrimary !== false).map((r) => r.alertId ?? ''),
+    visible.filter((r) => r.isPrimary !== false).map((r) => r.alertId ?? ""),
   );
   const promoted = (r: InvestigationRow): boolean =>
-    r.isPrimary === false && !primaryAlertsOnPage.has(r.alertId ?? '');
+    r.isPrimary === false && !primaryAlertsOnPage.has(r.alertId ?? "");
   const retriesByAlert = new Map<string, InvestigationRow[]>();
   for (const r of visible) {
     if (r.isPrimary === false && r.alertId && !promoted(r)) {
@@ -439,16 +666,17 @@ export function Investigations() {
   // When grouping, cluster rows by detection name (keeping the user's sort within
   // each group) and precompute per-group counts for the headers.
   const displayRows =
-    groupBy === 'detection'
+    groupBy === "detection"
       ? [...primaries].sort(
           (a, b) =>
-            (a.name || '').localeCompare(b.name || '') || cmpRows(a, b, sort.key, sort.dir),
+            (a.name || "").localeCompare(b.name || "") ||
+            cmpRows(a, b, sort.key, sort.dir),
         )
       : primaries;
   const groupCounts = new Map<string, number>();
-  if (groupBy === 'detection') {
+  if (groupBy === "detection") {
     for (const r of displayRows) {
-      const k = r.name || '(unnamed detection)';
+      const k = r.name || "(unnamed detection)";
       groupCounts.set(k, (groupCounts.get(k) ?? 0) + 1);
     }
   }
@@ -460,7 +688,13 @@ export function Investigations() {
   // skips those rows and the strip's count can never disagree with what the
   // bulk action actually submits (the server's `hunt_kind` rehunt-skip guard
   // stays a defense in depth, not the only guard).
-  const bulkEligible = visible.filter((r) => r.kind !== 'hunt');
+  const bulkEligible = visible.filter((r) => r.kind !== "hunt");
+
+  // The depth chip shows on every row or on none. A chip on some rows only
+  // read as a property the other rows lack (dogfood 2026-10-06).
+  const showDepth = visible.some(
+    (r) => !!r.runClass && r.runClass in CHIP_RUN_CLASS,
+  );
   const sel = useListSelection(bulkEligible.map((r) => r.id));
   const selCount = sel.count;
 
@@ -479,16 +713,25 @@ export function Investigations() {
   // default, never to whatever happened to be on screen a moment ago. That is
   // also what makes the chip a real toggle — clicking an active chip applies
   // the EMPTY query, which is this screen unfiltered.
-  const views = useSavedViews('investigations', currentQuery, (saved) => {
-    setFilterVerdicts(Array.isArray(saved.verdict) ? (saved.verdict as string[]) : []);
-    setFilterStatuses(Array.isArray(saved.status) ? (saved.status as string[]) : []);
+  const views = useSavedViews("investigations", currentQuery, (saved) => {
+    setFilterVerdicts(
+      Array.isArray(saved.verdict) ? (saved.verdict as string[]) : [],
+    );
+    setFilterStatuses(
+      Array.isArray(saved.status) ? (saved.status as string[]) : [],
+    );
     // Same widening the demo gets at mount: the seeded runs span a couple of
     // hours, so resetting the demo to a flat 24h would empty the list.
     windowChosen.current = true;
-    setRange(typeof saved.range === 'string' ? saved.range : demo ? '30d' : '24h');
+    setWidenedFor(null);
+    setRange(
+      typeof saved.range === "string" ? saved.range : demo ? "30d" : "24h",
+    );
     setCustom((saved.custom as CustomRange | null) ?? null);
-    setQ(typeof saved.q === 'string' ? saved.q : '');
-    setGroupBy(saved.groupBy === 'detection' ? 'detection' : 'none');
+    setQ(typeof saved.q === "string" ? saved.q : "");
+    setGroupBy(saved.groupBy === "detection" ? "detection" : "none");
+    // A view names no replay facet, so the screen default applies: off.
+    setShowReplays(false);
     setOffset(0);
   });
 
@@ -496,7 +739,10 @@ export function Investigations() {
     const ids = sel.ids;
     if (!ids.length) return;
     const blocked = demoBlocked(demo);
-    if (blocked) { setRehuntMsg(blocked); return; } // demo: no doomed write
+    if (blocked) {
+      setRehuntMsg(blocked);
+      return;
+    } // demo: no doomed write
     setRehunting(true);
     setRehuntMsg(null);
     setRehuntResult(null);
@@ -508,7 +754,9 @@ export function Investigations() {
       sel.clear();
       refetch();
     } catch (err) {
-      setRehuntMsg(`Re-investigate failed: ${err instanceof Error ? err.message : String(err)}`);
+      setRehuntMsg(
+        `Re-investigate failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
     } finally {
       setRehunting(false);
     }
@@ -519,12 +767,18 @@ export function Investigations() {
   const deleteOne = async (id: string) => {
     setRehuntMsg(null);
     const blocked = demoBlocked(demo);
-    if (blocked) { setRehuntMsg(blocked); setPendingDelete(null); return; } // demo: no doomed write
+    if (blocked) {
+      setRehuntMsg(blocked);
+      setPendingDelete(null);
+      return;
+    } // demo: no doomed write
     try {
       await deleteInvestigation(id);
-      setRehuntMsg('Investigation deleted');
+      setRehuntMsg("Investigation deleted");
     } catch {
-      setRehuntMsg('Delete failed. Cancel a running investigation first. Only an admin can delete.');
+      setRehuntMsg(
+        "Delete failed. Cancel a running investigation first. Only an admin can delete.",
+      );
     }
     setPendingDelete(null);
     refetch();
@@ -534,7 +788,11 @@ export function Investigations() {
     const ids = sel.ids;
     if (!ids.length) return;
     const blocked = demoBlocked(demo);
-    if (blocked) { setRehuntMsg(blocked); setConfirmDelete(false); return; } // demo: no doomed write
+    if (blocked) {
+      setRehuntMsg(blocked);
+      setConfirmDelete(false);
+      return;
+    } // demo: no doomed write
     setDeleting(true);
     setRehuntMsg(null);
     let ok = 0;
@@ -548,10 +806,10 @@ export function Investigations() {
       }
     }
     setRehuntMsg(
-      `Deleted ${ok} investigation${ok !== 1 ? 's' : ''}` +
+      `Deleted ${ok} investigation${ok !== 1 ? "s" : ""}` +
         (failed
           ? ` · ${failed} failed. Cancel a running investigation first. Only an admin can delete.`
-          : '')
+          : ""),
     );
     sel.clear();
     setConfirmDelete(false);
@@ -568,11 +826,33 @@ export function Investigations() {
       {/* Server-side counts over the active filter set — never the page's.
           The window rides with the count, because the screen may have chosen
           it and a number read as the store's is how "5" becomes "5 ever". */}
-      <div className="mb-4 mt-0.5 text-[13px] text-dim">
-        {plural(total, 'investigation')} in {windowPhrase(range)} ·{' '}
-        {running.toLocaleString()} in progress · {plural(tps, 'true positive')}
+      <div
+        data-testid="investigations-count"
+        className="mb-4 mt-0.5 text-[13px] text-dim"
+      >
+        <div>
+          {countLine({
+            total,
+            running,
+            truePositives: tps,
+            range,
+            replays,
+            includesReplays: data?.includesBacktest ?? showReplays,
+          })}
+        </div>
+        {widenedFor && (
+          <div
+            data-testid="window-widened"
+            className="mt-0.5 text-[12px] text-faint"
+          >
+            No run started in the last 24 hours. The newest run started{" "}
+            {ago(widenedFor)}, so the list shows {windowPhrase(range)}.
+          </div>
+        )}
       </div>
-      {failCount >= 2 && <StaleNotice since={lastUpdated} onRefresh={refetch} className="mb-3" />}
+      {failCount >= 2 && (
+        <StaleNotice since={lastUpdated} onRefresh={refetch} className="mb-3" />
+      )}
 
       {/* The shared list toolbar: saved-view chips, the search box, this
           screen's own facets, and the selection strip that takes the facet
@@ -591,8 +871,8 @@ export function Investigations() {
             setQ(v);
             views.clearActive();
           },
-          placeholder: 'Search detection, host or IP…',
-          label: 'Search investigations',
+          placeholder: "Search detection, host or IP",
+          label: "Search investigations",
         }}
         note={rehuntMsg}
         selection={{
@@ -604,22 +884,32 @@ export function Investigations() {
             <>
               <button
                 disabled={rehunting}
-                onClick={() => { void handleRehunt(); }}
+                onClick={() => {
+                  void handleRehunt();
+                }}
                 className="flex items-center gap-1.5 rounded-[7px] border px-[11px] py-1.5 text-[12.5px] font-semibold text-[#cfe0ff] disabled:opacity-50"
-                style={{ background: 'rgba(75,139,245,.14)', borderColor: 'rgba(75,139,245,.4)' }}
+                style={{
+                  background: "rgba(75,139,245,.14)",
+                  borderColor: "rgba(75,139,245,.4)",
+                }}
               >
-                <RefreshCw size={12} className={rehunting ? 'animate-spin' : ''} />
-                {rehunting ? 'Starting…' : `Re-investigate (${selCount})`}
+                <RefreshCw
+                  size={12}
+                  className={rehunting ? "animate-spin" : ""}
+                />
+                {rehunting ? "Starting" : `Re-investigate (${selCount})`}
               </button>
               {confirmDelete ? (
                 <>
                   <button
                     disabled={deleting}
-                    onClick={() => { void handleDelete(); }}
+                    onClick={() => {
+                      void handleDelete();
+                    }}
                     className="flex items-center gap-1.5 rounded-[7px] border border-danger px-[11px] py-1.5 text-[12.5px] font-semibold text-danger disabled:opacity-50"
                   >
                     <Trash2 size={12} />
-                    {deleting ? 'Deleting…' : `Confirm delete (${selCount})`}
+                    {deleting ? "Deleting" : `Confirm delete (${selCount})`}
                   </button>
                   <button
                     onClick={() => setConfirmDelete(false)}
@@ -644,8 +934,10 @@ export function Investigations() {
         <TimeRangeFilter
           value={range}
           custom={custom}
+          presets={PRESETS}
           onChange={(v, r) => {
             windowChosen.current = true;
+            setWidenedFor(null);
             setRange(v);
             if (r) setCustom(r);
             setOffset(0);
@@ -655,13 +947,13 @@ export function Investigations() {
         <MultiSelect
           label="Verdict"
           options={[
-            { value: 'true_positive', label: 'True positive' },
-            { value: 'false_positive', label: 'False positive' },
-            { value: 'needs_more_info', label: 'Needs more info' },
-            { value: 'inconclusive', label: 'Inconclusive' },
+            { value: "true_positive", label: "True positive" },
+            { value: "false_positive", label: "False positive" },
+            { value: "needs_more_info", label: "Needs more info" },
+            { value: "inconclusive", label: "Inconclusive" },
             // No 'Untriaged' option — see VERDICT_FILTER_VALUES: an
             // uninvestigated group has no row on this list at all.
-            { value: 'pipeline_error', label: 'Pipeline error' },
+            { value: "pipeline_error", label: "Pipeline error" },
           ]}
           value={filterVerdicts}
           onChange={(v) => {
@@ -673,11 +965,13 @@ export function Investigations() {
         <MultiSelect
           label="Status"
           options={[
-            { value: 'complete', label: 'Complete' },
-            { value: 'running', label: 'Investigating' },
-            { value: 'error', label: 'Error' },
-            { value: 'interrupted', label: 'Interrupted' },
-            { value: 'cancelled', label: 'Cancelled' },
+            // The rows read "Failed" for all three stops. The filter keeps
+            // them apart, and each option starts with the word the row shows.
+            { value: "complete", label: statusMeta("complete").label },
+            { value: "running", label: statusMeta("running").label },
+            { value: "error", label: "Failed: error" },
+            { value: "interrupted", label: "Failed: interrupted" },
+            { value: "cancelled", label: "Failed: cancelled" },
           ]}
           value={filterStatuses}
           onChange={(v) => {
@@ -691,13 +985,27 @@ export function Investigations() {
             "handled" means anything. The Dashboard tile links straight to
             "Needs retry", so its number and this list's header now come off the
             same server query (dogfood 2026-09-07, D2). */}
-        {filterVerdicts.includes('pipeline_error') && (
+        {filterVerdicts.includes("pipeline_error") && (
           <div className="flex items-center gap-1 rounded-[7px] border border-border-strong p-[2px]">
-            {([
-              ['live', 'Needs retry', 'These runs produced no usable verdict. No operator has handled them. The Dashboard tile counts these runs.'],
-              ['handled', 'Handled', 'An operator dismissed the run, or a later run reached a verdict.'],
-              [null, 'All errors', 'Every run that produced no usable verdict. The list includes the handled runs.'],
-            ] as const).map(([value, label, hint]) => (
+            {(
+              [
+                [
+                  "live",
+                  "Needs retry",
+                  "These runs produced no usable verdict. No operator has handled them. The Dashboard tile counts these runs.",
+                ],
+                [
+                  "handled",
+                  "Handled",
+                  "An operator dismissed the run, or a later run reached a verdict.",
+                ],
+                [
+                  null,
+                  "All errors",
+                  "Every run that produced no usable verdict. The list includes the handled runs.",
+                ],
+              ] as const
+            ).map(([value, label, hint]) => (
               <button
                 key={label}
                 aria-pressed={errorState === value}
@@ -708,10 +1016,10 @@ export function Investigations() {
                   views.clearActive();
                 }}
                 className={
-                  'rounded-[5px] px-[9px] py-[3px] text-[12px] font-semibold ' +
+                  "rounded-[5px] px-[9px] py-[3px] text-[12px] font-semibold " +
                   (errorState === value
-                    ? 'bg-surface-3 text-text'
-                    : 'text-dim hover:text-text')
+                    ? "bg-surface-3 text-text"
+                    : "text-dim hover:text-text")
                 }
               >
                 {label}
@@ -721,18 +1029,36 @@ export function Investigations() {
         )}
         <button
           onClick={() => {
-            setGroupBy((g) => (g === 'detection' ? 'none' : 'detection'));
+            setGroupBy((g) => (g === "detection" ? "none" : "detection"));
             views.clearActive();
           }}
           title="Group investigations by detection rule"
           className={
-            'rounded-[7px] border px-[11px] py-1.5 text-[12.5px] font-semibold ' +
-            (groupBy === 'detection'
-              ? 'border-accent text-accent'
-              : 'border-border-strong text-dim hover:text-text')
+            "rounded-[7px] border px-[11px] py-1.5 text-[12.5px] font-semibold " +
+            (groupBy === "detection"
+              ? "border-accent text-accent"
+              : "border-border-strong text-dim hover:text-text")
           }
         >
-          Group by detection{groupBy === 'detection' ? ' ✓' : ''}
+          Group by detection{groupBy === "detection" ? " ✓" : ""}
+        </button>
+        <button
+          data-testid="show-backtest-replays"
+          aria-pressed={showReplays}
+          onClick={() => {
+            setShowReplays((v) => !v);
+            setOffset(0);
+            views.clearActive();
+          }}
+          title="Show the investigations that a backtest ran. A replay measures the model on an alert that an analyst closed before. The figures then count the replays."
+          className={
+            "rounded-[7px] border px-[11px] py-1.5 text-[12.5px] font-semibold " +
+            (showReplays
+              ? "border-accent text-accent"
+              : "border-border-strong text-dim hover:text-text")
+          }
+        >
+          Show backtest replays{showReplays ? " ✓" : ""}
         </button>
       </ListToolbar>
 
@@ -740,70 +1066,97 @@ export function Investigations() {
           header expands to the per-id detail the API already returns — WHICH
           detections re-ran and WHY each skip happened — so a mixed batch is
           never an opaque count. */}
-      {rehuntResult && (() => {
-        const started = rehuntResult.started;
-        const skipped = rehuntResult.skipped;
-        const total = started.length + skipped.length;
-        return (
-          <div
-            className="mb-3.5 overflow-hidden rounded-card border"
-            style={{ borderColor: 'rgba(75,139,245,.30)', background: 'rgba(75,139,245,.06)' }}
-          >
-            <div className="flex items-center gap-2.5 px-3.5 py-2.5 text-[13px]">
-              <RefreshCw size={13} className="flex-none text-accent" />
-              <button
-                onClick={() => total > 0 && setRehuntExpanded((v) => !v)}
-                disabled={total === 0}
-                className="flex min-w-0 flex-1 items-center gap-2.5 text-left"
-              >
-                <span className="min-w-0 truncate font-semibold text-text-2">
-                  Started {started.length} re-investigation{started.length !== 1 ? 's' : ''}
-                  {skipped.length > 0 ? ` · ${skipped.length} skipped` : ''}
-                </span>
-                {total > 0 && (
-                  <span className="flex flex-none items-center gap-1 text-[11.5px] text-dim">
-                    {rehuntExpanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-                    {rehuntExpanded ? 'Hide detail' : 'Show detail'}
+      {rehuntResult &&
+        (() => {
+          const started = rehuntResult.started;
+          const skipped = rehuntResult.skipped;
+          const total = started.length + skipped.length;
+          return (
+            <div
+              className="mb-3.5 overflow-hidden rounded-card border"
+              style={{
+                borderColor: "rgba(75,139,245,.30)",
+                background: "rgba(75,139,245,.06)",
+              }}
+            >
+              <div className="flex items-center gap-2.5 px-3.5 py-2.5 text-[13px]">
+                <RefreshCw size={13} className="flex-none text-accent" />
+                <button
+                  onClick={() => total > 0 && setRehuntExpanded((v) => !v)}
+                  disabled={total === 0}
+                  className="flex min-w-0 flex-1 items-center gap-2.5 text-left"
+                >
+                  <span className="min-w-0 break-words font-semibold text-text-2">
+                    Started {started.length} re-investigation
+                    {started.length !== 1 ? "s" : ""}
+                    {skipped.length > 0 ? ` · ${skipped.length} skipped` : ""}
                   </span>
-                )}
-              </button>
-              <button
-                onClick={() => { setRehuntResult(null); setRehuntExpanded(false); }}
-                className="flex flex-none text-dim hover:text-text"
-                aria-label="Dismiss"
-              >
-                <X size={14} />
-              </button>
-            </div>
-            {rehuntExpanded && total > 0 && (
-              <div className="border-t border-border-faint px-3.5 py-2 text-[12.5px]">
-                {started.map((s) => (
-                  <div key={s.invId} className="flex items-center gap-2 py-[3px]">
-                    <Check size={12} className="flex-none text-success" />
-                    <span className="min-w-0 truncate text-text-2">{labelForInv(s.invId)}</span>
-                    <span className="flex-none text-faint">→ new run</span>
-                  </div>
-                ))}
-                {skipped.map((s) => (
-                  <div key={s.invId} className="flex items-center gap-2 py-[3px]">
-                    <X size={12} className="flex-none text-faint" />
-                    <span className="min-w-0 truncate text-dim">{labelForInv(s.invId)}</span>
-                    <span className="flex-none text-faint">{rehuntSkipReason(s.reason)}</span>
-                  </div>
-                ))}
+                  {total > 0 && (
+                    <span className="flex flex-none items-center gap-1 text-[11.5px] text-dim">
+                      {rehuntExpanded ? (
+                        <ChevronDown size={13} />
+                      ) : (
+                        <ChevronRight size={13} />
+                      )}
+                      {rehuntExpanded ? "Hide detail" : "Show detail"}
+                    </span>
+                  )}
+                </button>
+                <button
+                  onClick={() => {
+                    setRehuntResult(null);
+                    setRehuntExpanded(false);
+                  }}
+                  className="flex flex-none text-dim hover:text-text"
+                  aria-label="Dismiss"
+                >
+                  <X size={14} />
+                </button>
               </div>
-            )}
-          </div>
-        );
-      })()}
+              {rehuntExpanded && total > 0 && (
+                <div className="border-t border-border-faint px-3.5 py-2 text-[12.5px]">
+                  {started.map((s) => (
+                    <div
+                      key={s.invId}
+                      className="flex items-center gap-2 py-[3px]"
+                    >
+                      <Check size={12} className="flex-none text-success" />
+                      <span className="min-w-0 break-words text-text-2">
+                        {labelForInv(s.invId)}
+                      </span>
+                      <span className="flex-none text-faint">→ new run</span>
+                    </div>
+                  ))}
+                  {skipped.map((s) => (
+                    <div
+                      key={s.invId}
+                      className="flex items-center gap-2 py-[3px]"
+                    >
+                      <X size={12} className="flex-none text-faint" />
+                      <span className="min-w-0 break-words text-dim">
+                        {labelForInv(s.invId)}
+                      </span>
+                      <span className="flex-none text-faint">
+                        {rehuntSkipReason(s.reason)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })()}
 
-      <div className="overflow-hidden rounded-card border border-border bg-surface-1">
+      <div className="overflow-x-auto overflow-y-hidden rounded-card border border-border bg-surface-1">
         <div
           role="row"
           className="grid gap-2.5 border-b border-border bg-surface-2 px-3.5 py-[9px] text-[10.5px] font-semibold uppercase tracking-[.06em] text-faint"
-          style={{ gridTemplateColumns: GRID }}
+          style={{ gridTemplateColumns: GRID, minWidth: GRID_MIN_WIDTH }}
         >
-          <div className="flex items-center" onClick={(e) => e.stopPropagation()}>
+          <div
+            className="flex items-center"
+            onClick={(e) => e.stopPropagation()}
+          >
             <Checkbox
               checked={sel.allVisibleSelected}
               indeterminate={!sel.allVisibleSelected && sel.someVisibleSelected}
@@ -811,76 +1164,85 @@ export function Investigations() {
               disabled={bulkEligible.length === 0}
               title={
                 bulkEligible.length === 0
-                  ? 'A bulk re-investigation skips a promoted finding. Re-promote it from the hunt page.'
-                  : 'Select all visible'
+                  ? "A bulk re-investigation skips a promoted finding. Re-promote it from the hunt page."
+                  : "Select all visible"
               }
             />
           </div>
-          <div role="columnheader" aria-sort={ariaSort('name')}>
+          <div role="columnheader" aria-sort={ariaSort("name")}>
             <button
               type="button"
               aria-label="Sort by Detection"
-              className={`text-left uppercase ${headerCls('name')}`}
-              onClick={() => toggleSort('name')}
+              className={`text-left uppercase ${headerCls("name")}`}
+              onClick={() => toggleSort("name")}
             >
-              Detection{caret('name')}
+              Detection{caret("name")}
             </button>
           </div>
-          <div role="columnheader" aria-sort={ariaSort('verdict')}>
+          <div role="columnheader" aria-sort={ariaSort("verdict")}>
             <button
               type="button"
               aria-label="Sort by Verdict"
-              className={`text-left uppercase ${headerCls('verdict')}`}
-              onClick={() => toggleSort('verdict')}
+              className={`text-left uppercase ${headerCls("verdict")}`}
+              onClick={() => toggleSort("verdict")}
             >
-              Verdict{caret('verdict')}
+              Verdict{caret("verdict")}
             </button>
           </div>
-          <div role="columnheader" aria-sort={ariaSort('conf')}>
+          <div role="columnheader" aria-sort={ariaSort("conf")}>
             <button
               type="button"
               aria-label="Sort by Conf"
-              className={`text-left uppercase ${headerCls('conf')}`}
-              onClick={() => toggleSort('conf')}
+              className={`text-left uppercase ${headerCls("conf")}`}
+              onClick={() => toggleSort("conf")}
             >
-              Conf{caret('conf')}
+              Conf{caret("conf")}
             </button>
           </div>
-          <div role="columnheader" aria-sort={ariaSort('host')}>
+          <div role="columnheader" aria-sort={ariaSort("host")}>
             <button
               type="button"
               aria-label="Sort by Source → Dest"
-              className={`text-left uppercase ${headerCls('host')}`}
-              onClick={() => toggleSort('host')}
+              className={`text-left uppercase ${headerCls("host")}`}
+              onClick={() => toggleSort("host")}
             >
-              Source → Dest{caret('host')}
+              Source → Dest{caret("host")}
             </button>
           </div>
-          <div role="columnheader" aria-sort={ariaSort('status')}>
+          <div role="columnheader" aria-sort={ariaSort("status")}>
             <button
               type="button"
               aria-label="Sort by Status"
-              className={`text-left uppercase ${headerCls('status')}`}
-              onClick={() => toggleSort('status')}
+              className={`text-left uppercase ${headerCls("status")}`}
+              onClick={() => toggleSort("status")}
             >
-              Status{caret('status')}
+              Status{caret("status")}
             </button>
           </div>
-          <div role="columnheader" aria-sort={ariaSort('when')}>
+          <div role="columnheader" aria-sort={ariaSort("when")}>
             <button
               type="button"
               aria-label="Sort by When"
-              className={`text-left uppercase ${headerCls('when')}`}
-              onClick={() => toggleSort('when')}
+              className={`text-left uppercase ${headerCls("when")}`}
+              onClick={() => toggleSort("when")}
             >
-              When{caret('when')}
+              When{caret("when")}
             </button>
           </div>
+          <TagsHeader className="uppercase" />
           <div />
         </div>
 
         {loading && <LoadingState />}
-        {error && <div className="p-3"><ErrorState error={error} onRetry={refetch} label="investigations" /></div>}
+        {error && (
+          <div className="p-3">
+            <ErrorState
+              error={error}
+              onRetry={refetch}
+              label="investigations"
+            />
+          </div>
+        )}
         {/* `totalAll` (whole store) tells an empty STORE apart from a filter
             that matched nothing — the filtered page alone cannot. */}
         {!loading && !error && displayRows.length === 0 && totalAll === 0 && (
@@ -895,253 +1257,329 @@ export function Investigations() {
               </Link>
             }
           >
-            soc-ai runs an investigation on a detection. The investigation pulls the evidence,
-            reasons over the evidence and reaches a verdict. Pick a detection on the Alerts
-            screen. Auto-Investigate can also work the backlog.
+            soc-ai runs an investigation on a detection. The investigation pulls
+            the evidence, reasons over the evidence and reaches a verdict. Pick
+            a detection on the Alerts screen. Auto-Investigate can also work the
+            backlog.
           </EmptyState>
         )}
         {!loading && !error && displayRows.length === 0 && totalAll > 0 && (
-          <EmptyState>
+          <EmptyState
+            action={
+              range !== ALL_TIME ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    windowChosen.current = true;
+                    setWidenedFor(null);
+                    setRange(ALL_TIME);
+                    setOffset(0);
+                    views.clearActive();
+                  }}
+                  className="rounded-control border border-accent bg-accent/10 px-3.5 py-1.5 text-[12.5px] font-semibold text-accent hover:bg-accent/20"
+                >
+                  {debouncedQ ? "Search all time" : "Show all time"}
+                </button>
+              ) : undefined
+            }
+          >
             {/* Named after the filter in force. "Widen the time range" read as
-                the cure also when the cause was the search text (RL13). */}
-            {debouncedQ
-              ? 'No investigation matches the search.'
-              : filterVerdicts.length
-                ? 'No investigation matches the verdict filter in this time range.'
-                : filterStatuses.length
-                  ? 'No investigation matches the status filter in this time range.'
-                  : errorState
-                    ? 'No investigation matches the pipeline error filter in this time range.'
-                    : range === '30d' && !custom
-                      ? 'No investigations in the last 30 days.'
-                      : 'No investigations in this time range. Widen the time range above.'}
+                the cure also when the cause was the search text (RL13). The
+                search names its window too: a search for a run older than the
+                window read as a run that does not exist (dogfood 2026-10-06). */}
+            {!showReplays && replays > 0
+              ? `Only ${plural(replays, "backtest replay")} ${replays === 1 ? "matches" : "match"}. Turn on "Show backtest replays" to see ${replays === 1 ? "it" : "them"}.`
+              : debouncedQ
+                ? range === ALL_TIME
+                  ? "No investigation matches the search."
+                  : `No investigation matches the search in ${windowPhrase(range)}.`
+                : filterVerdicts.length
+                  ? "No investigation matches the verdict filter in this time range."
+                  : filterStatuses.length
+                    ? "No investigation matches the status filter in this time range."
+                    : errorState
+                      ? "No investigation matches the pipeline error filter in this time range."
+                      : range === "30d" && !custom
+                        ? "No investigations in the last 30 days."
+                        : "No investigations in this time range. Widen the time range above."}
           </EmptyState>
         )}
         {displayRows.map((r, i) => {
-          const st = STATUS[r.status] ?? STATUS.error;
           const failedNewer = latestRunFailure(r);
-          const retries = retriesByAlert.get(r.alertId ?? '') ?? [];
-          const expanded = !!expandedAlerts[r.alertId ?? ''];
-          const groupName = r.name || '(unnamed detection)';
+          const retries = retriesByAlert.get(r.alertId ?? "") ?? [];
+          const expanded = !!expandedAlerts[r.alertId ?? ""];
+          const groupName = r.name || "(unnamed detection)";
           const showHeader =
-            groupBy === 'detection' &&
-            (i === 0 || (displayRows[i - 1].name || '(unnamed detection)') !== groupName);
+            groupBy === "detection" &&
+            (i === 0 ||
+              (displayRows[i - 1].name || "(unnamed detection)") !== groupName);
           return (
             <Fragment key={r.id}>
               {showHeader && (
                 <div className="flex items-center gap-2 border-b border-border bg-surface-2 px-3.5 py-2 text-[12px] font-semibold text-text-2">
-                  <span title={groupName} className="min-w-0 truncate">
-                    {middleEllipsis(groupName)}
+                  <span title={groupName} className="min-w-0 break-words">
+                    {groupName}
                   </span>
-                  <span className="font-mono text-[11px] text-faint">{groupCounts.get(groupName)}</span>
+                  <span className="font-mono text-[11px] text-faint">
+                    {groupCounts.get(groupName)}
+                  </span>
                 </div>
               )}
               <div
-                onClick={() => navigate(`/investigation/${r.id}`, { state: { from: '/investigations' } })}
-              className="group grid cursor-pointer items-center gap-2.5 border-b border-border-faint px-3.5 py-[11px] hover:bg-surface-hover"
-              style={{ gridTemplateColumns: GRID }}
-            >
-              <div
-                className="flex items-center"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  if (r.kind === 'hunt') return;
-                  sel.toggle(r.id);
-                }}
+                onClick={() =>
+                  navigate(`/investigation/${r.id}`, {
+                    state: { from: "/investigations" },
+                  })
+                }
+                className="group grid cursor-pointer items-center gap-2.5 border-b border-border-faint px-3.5 py-[11px] hover:bg-surface-hover"
+                style={{ gridTemplateColumns: GRID, minWidth: GRID_MIN_WIDTH }}
               >
-                <Checkbox
-                  checked={sel.isSelected(r.id)}
-                  disabled={r.kind === 'hunt'}
-                  title={
-                    r.kind === 'hunt'
-                      ? 'A bulk re-investigation skips a promoted finding. Re-promote it from the hunt page.'
-                      : 'Select'
-                  }
-                />
-              </div>
-              <div className="flex min-w-0 items-center gap-[9px]">
-                <KindBadge kind={r.kind} />
-                {/* What the run read, beside what raised it. A hunt
-                    investigation has no detector and no single event: its
-                    subject is the hunt's findings, and the row read as an
-                    ordinary alert run without this. */}
-                {r.subjectType === 'hunt' && (
-                  <span
-                    data-testid={`subject-type-${r.id}`}
-                    title={CHIP_SUBJECT_HUNT}
-                    className="flex-none rounded-badge border border-border-2 bg-surface-2 px-[6px] py-[2px] font-mono text-[10.5px] text-dim"
-                  >
-                    hunt
-                  </span>
-                )}
-                {/* A run against planted synthetic scenarios must never read
-                    as a real one — badge it wherever the row appears. */}
-                {r.isSynthEval && <SyntheticEvalBadge />}
-                {/* What the run was allowed to spend: cheap, standard, deep
-                    or rule prior. */}
-                <RunClassChip runClass={r.runClass} testId={`run-class-${r.id}`} />
-                {/* A real link, not a span: the row's onClick serves the
-                    mouse, and this is what serves the keyboard, a screen
-                    reader, a middle-click and a copied address. */}
-                <Link
-                  to={`/investigation/${r.id}`}
-                  state={{ from: '/investigations' }}
-                  onClick={(e) => e.stopPropagation()}
-                  title={r.name}
-                  className="min-w-0 flex-1 truncate text-[13px] font-medium hover:text-accent"
+                <div
+                  className="flex items-center"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (r.kind === "hunt") return;
+                    sel.toggle(r.id);
+                  }}
                 >
-                  {middleEllipsis(r.name)}
-                </Link>
-                {/* Why this row is NOT one the Dashboard tile counts. Without
-                    it a run dismissed seconds earlier rendered exactly like a
-                    live one, so the tile went nine, eight, seven while the list
-                    sat at twenty (dogfood 2026-09-07, D2). Both markers are
-                    unconditional: a row's history is true whatever filter is
-                    set. */}
-                {r.errorDismissed && (
-                  <span
-                    title="An operator dismissed this failure. The Dashboard does not count it."
-                    className="flex-none rounded-badge border border-border-2 bg-surface-2 px-[6px] py-[2px] font-mono text-[10.5px] text-faint"
+                  <Checkbox
+                    checked={sel.isSelected(r.id)}
+                    disabled={r.kind === "hunt"}
+                    title={
+                      r.kind === "hunt"
+                        ? "A bulk re-investigation skips a promoted finding. Re-promote it from the hunt page."
+                        : "Select"
+                    }
+                  />
+                </div>
+                {/* The name and nothing else. The chips of the row sit in the
+                  tags column, so every name starts at the same x.
+                  A real link, not a span: the row's onClick serves the
+                  mouse, and this is what serves the keyboard, a screen
+                  reader, a middle-click and a copied address.
+                  The whole name shows and wraps in its cell. A character
+                  count cut a rule name in the middle, and the browser cut a
+                  finding title at the cell width. Both hid the words that
+                  tell two rows apart (owner, 2026-10-07). */}
+                <div className="min-w-0" data-testid={`inv-title-cell-${r.id}`}>
+                  <Link
+                    to={`/investigation/${r.id}`}
+                    state={{ from: "/investigations" }}
+                    onClick={(e) => e.stopPropagation()}
+                    title={r.name}
+                    data-testid={`inv-name-${r.id}`}
+                    className="block min-w-0 whitespace-normal break-words text-[13px] font-medium leading-[1.4] hover:text-accent"
                   >
-                    Dismissed
-                  </span>
-                )}
-                {r.isPrimary === false && (
-                  <span
-                    title="A later run of this alert reached a verdict. A re-run already fixed this run."
-                    className="flex-none rounded-badge border border-border-2 bg-surface-2 px-[6px] py-[2px] font-mono text-[10.5px] text-faint"
-                  >
-                    Superseded
-                  </span>
-                )}
-                {/* The row is representative but not current. Says so on the
-                    row itself, because the "N earlier" chip beside it does not
-                    — and on a filtered page the failed run may not be here to
-                    expand to at all. Clicking opens the run that failed. */}
-                {failedNewer && (
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      navigate(`/investigation/${failedNewer.id}`, {
-                        state: { from: '/investigations' },
-                      });
-                    }}
-                    title="A newer run of this alert reached no verdict. Open the newer run."
-                    className="flex flex-none items-center gap-[4px] rounded-badge border px-[6px] py-[2px] text-[10.5px] font-semibold"
-                    style={{
-                      borderColor: 'rgba(240,68,56,.45)',
-                      background: 'rgba(240,68,56,.1)',
-                      color: '#fca5a5',
-                    }}
-                  >
-                    <AlertTriangle size={10} />
-                    {failedNewer.label}
-                    {failedNewer.when && (
-                      <span className="font-mono text-faint">{failedNewer.when}</span>
-                    )}
-                  </button>
-                )}
-                {retries.length > 0 && (
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setExpandedAlerts((prev) => ({ ...prev, [r.alertId ?? '']: !prev[r.alertId ?? ''] }));
-                    }}
-                    title={`${retries.length} earlier run${retries.length === 1 ? '' : 's'} of this alert`}
-                    className="flex flex-none items-center gap-[3px] rounded-badge border border-border-2 bg-surface-2 px-[6px] py-[2px] font-mono text-[10.5px] text-faint hover:text-text-2"
-                  >
-                    {expanded ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
-                    {retries.length} earlier
-                  </button>
-                )}
-                {(r.chatCount ?? 0) > 0 && (
-                  <span
-                    className="flex flex-none items-center gap-[4px] rounded-badge border border-border-2 bg-surface-2 px-[6px] py-[2px] font-mono text-[10.5px] text-accent"
-                    title={`${r.chatCount} chat message${r.chatCount === 1 ? '' : 's'}`}
-                  >
-                    <MessageSquare size={10} />
-                    {r.chatCount}
-                  </span>
-                )}
-              </div>
-              {/* Only a finished run has a verdict. For running/awaiting/error/
+                    {r.name}
+                  </Link>
+                </div>
+                {/* Only a finished run has a verdict. For running/awaiting/error/
                   cancelled/interrupted rows the Status column carries the state —
                   an "untriaged" pill there reads as a contradiction. A pipeline
                   fallback (E1.2) replaces the amber NMI pill with a distinct
                   pipeline-error chip so infra failures aren't mistaken for
                   genuine "needs more info". */}
-              <div>{r.fallback ? <PipelineErrorChip /> : r.verdict === 'untriaged' ? <span className="text-faint">—</span> : <VerdictPill verdict={r.verdict} />}</div>
-              <div className="font-mono text-[12.5px] text-text-2">{r.conf != null ? r.conf.toFixed(2) : '—'}</div>
-              <div className="min-w-0 overflow-hidden"><FlowBadge src={r.host === '—' ? null : r.host} dst={r.dst} /></div>
-              <div>
-                <span className="inline-flex items-center gap-1.5 text-[11.5px]" style={{ color: st.color }}>
-                  <span className={'h-1.5 w-1.5 rounded-full ' + (st.pulse ? 'animate-pulseDot' : '')} style={{ background: st.color }} />
-                  {st.label}
-                </span>
-              </div>
-              <div className="font-mono text-[12px] text-dim">{r.when}</div>
-              <div className="flex justify-end" onClick={(e) => e.stopPropagation()}>
-                {pendingDelete === r.id ? (
-                  <div className="flex items-center gap-1.5">
-                    <button onClick={() => { void deleteOne(r.id); }} title="Confirm delete" className="flex text-danger hover:opacity-80">
-                      <Check size={14} />
+                <div>
+                  <VerdictCell r={r} />
+                </div>
+                <div className="font-mono text-[12.5px] text-text-2">
+                  {confidenceText(r.conf, "")}
+                </div>
+                <div className="min-w-0 overflow-hidden">
+                  <FlowCell r={r} />
+                </div>
+                <div>
+                  <StatusCell status={r.status} />
+                </div>
+                <WhenCell r={r} className="font-mono text-[12px] text-dim" />
+                {/* The tags, in the one order of every list. The type and
+                  the hunt subject say what raised the run and what it read.
+                  The synthetic mark keeps a planted attack from reading as
+                  real activity. A backtest replay is a measurement. The
+                  depth is on every row or on none. Dismissed and Superseded
+                  say why the Dashboard tile does not count the row
+                  (dogfood 2026-09-07, D2). The newer-run chip says the row is
+                  representative but not current, and opens the run that
+                  failed. The "N earlier" chip unfolds the earlier runs. */}
+                <RowTags
+                  testId={`inv-tags-${r.id}`}
+                  kind={r.kind}
+                  subjectHunt={r.subjectType === "hunt"}
+                  subjectTestId={`subject-type-${r.id}`}
+                  depth={{
+                    runClass: r.runClass,
+                    testId: `run-class-${r.id}`,
+                    placeholder: showDepth,
+                    running: r.status === "running",
+                  }}
+                  synthetic={r.isSynthEval}
+                  replay={isBacktestReplay(r.ranBy)}
+                  replayTestId={`backtest-replay-${r.id}`}
+                  dismissed={r.errorDismissed}
+                  superseded={
+                    r.isPrimary === false
+                      ? r.status === "complete"
+                        ? "A newer run of this alert replaced this run. The newer verdict is the current verdict."
+                        : "A later run of this alert reached a verdict. A re-run already fixed this run."
+                      : null
+                  }
+                  links={
+                    <>
+                      {failedNewer && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            navigate(`/investigation/${failedNewer.id}`, {
+                              state: { from: "/investigations" },
+                            });
+                          }}
+                          title={`A newer run of this alert reached no verdict. ${statusDetail(failedNewer.status)} Open the newer run.`}
+                          className="flex flex-none items-center gap-[4px] rounded-badge border px-[6px] py-[2px] text-[10.5px] font-semibold"
+                          style={{
+                            borderColor: "rgba(240,68,56,.45)",
+                            background: "rgba(240,68,56,.1)",
+                            color: "#fca5a5",
+                          }}
+                        >
+                          <AlertTriangle size={10} />
+                          {failedNewer.label}
+                          {failedNewer.when && (
+                            <span className="font-mono text-faint">
+                              {agoFromLabel(failedNewer.when)}
+                            </span>
+                          )}
+                        </button>
+                      )}
+                      {retries.length > 0 && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setExpandedAlerts((prev) => ({
+                              ...prev,
+                              [r.alertId ?? ""]: !prev[r.alertId ?? ""],
+                            }));
+                          }}
+                          title={`${retries.length} earlier run${retries.length === 1 ? "" : "s"} of this alert`}
+                          className="flex flex-none items-center gap-[3px] rounded-badge border border-border-2 bg-surface-2 px-[6px] py-[2px] font-mono text-[10.5px] text-faint hover:text-text-2"
+                        >
+                          {expanded ? (
+                            <ChevronDown size={11} />
+                          ) : (
+                            <ChevronRight size={11} />
+                          )}
+                          {retries.length} earlier
+                        </button>
+                      )}
+                    </>
+                  }
+                  chatCount={r.chatCount}
+                />
+                <div
+                  className="flex justify-end"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  {pendingDelete === r.id ? (
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        onClick={() => {
+                          void deleteOne(r.id);
+                        }}
+                        title="Confirm delete"
+                        className="flex text-danger hover:opacity-80"
+                      >
+                        <Check size={14} />
+                      </button>
+                      <button
+                        onClick={() => setPendingDelete(null)}
+                        title="Cancel"
+                        className="flex text-faint hover:text-text"
+                      >
+                        <X size={14} />
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      onClick={() => setPendingDelete(r.id)}
+                      title="Delete investigation"
+                      className="flex text-faint opacity-0 transition-opacity hover:text-danger group-hover:opacity-100"
+                    >
+                      <Trash2 size={13} />
                     </button>
-                    <button onClick={() => setPendingDelete(null)} title="Cancel" className="flex text-faint hover:text-text">
-                      <X size={14} />
-                    </button>
-                  </div>
-                ) : (
-                  <button
-                    onClick={() => setPendingDelete(r.id)}
-                    title="Delete investigation"
-                    className="flex text-faint opacity-0 transition-opacity hover:text-danger group-hover:opacity-100"
-                  >
-                    <Trash2 size={13} />
-                  </button>
-                )}
-              </div>
+                  )}
+                </div>
               </div>
               {expanded &&
                 retries.map((rt) => {
-                  const rtSt = STATUS[rt.status] ?? STATUS.error;
                   return (
                     <div
                       key={rt.id}
-                      onClick={() => navigate(`/investigation/${rt.id}`, { state: { from: '/investigations' } })}
+                      onClick={() =>
+                        navigate(`/investigation/${rt.id}`, {
+                          state: { from: "/investigations" },
+                        })
+                      }
                       className="group grid cursor-pointer items-center gap-2.5 border-b border-border-faint bg-surface-2/30 px-3.5 py-[8px] hover:bg-surface-hover"
-                      style={{ gridTemplateColumns: GRID }}
+                      style={{ gridTemplateColumns: GRID, minWidth: GRID_MIN_WIDTH }}
                     >
                       <div />
                       <div className="flex min-w-0 items-center gap-[7px] pl-3 text-faint">
                         <CornerDownRight size={12} className="flex-none" />
                         <Link
                           to={`/investigation/${rt.id}`}
-                          state={{ from: '/investigations' }}
+                          state={{ from: "/investigations" }}
                           onClick={(e) => e.stopPropagation()}
-                          className="truncate text-[12px] hover:text-accent"
+                          title="A newer run of this alert replaced this run."
+                          className="min-w-0 break-words text-[12px] hover:text-accent"
                         >
-                          earlier run
+                          superseded run
                         </Link>
-                        {rt.isSynthEval && <SyntheticEvalBadge />}
-                        <RunClassChip runClass={rt.runClass} testId={`run-class-${rt.id}`} />
                       </div>
-                      <div>{rt.fallback ? <PipelineErrorChip /> : rt.verdict === 'untriaged' ? <span className="text-faint">—</span> : <VerdictPill verdict={rt.verdict} />}</div>
-                      <div className="font-mono text-[12px] text-faint">{rt.conf != null ? rt.conf.toFixed(2) : '—'}</div>
-                      <div className="min-w-0 overflow-hidden opacity-70"><FlowBadge src={rt.host === '—' ? null : rt.host} dst={rt.dst} /></div>
                       <div>
-                        <span className="inline-flex items-center gap-1.5 text-[11px]" style={{ color: rtSt.color }}>
-                          <span className="h-1.5 w-1.5 rounded-full" style={{ background: rtSt.color }} />
-                          {rtSt.label}
-                        </span>
+                        <VerdictCell r={rt} />
                       </div>
-                      <div className="font-mono text-[12px] text-faint">{rt.when}</div>
-                      <div className="flex justify-end" onClick={(e) => e.stopPropagation()}>
+                      <div className="font-mono text-[12px] text-faint">
+                        {confidenceText(rt.conf, "")}
+                      </div>
+                      <div className="min-w-0 overflow-hidden">
+                        <FlowCell r={rt} dim />
+                      </div>
+                      <div>
+                        <StatusCell status={rt.status} small />
+                      </div>
+                      <WhenCell
+                        r={rt}
+                        className="font-mono text-[12px] text-faint"
+                      />
+                      <RowTags
+                        testId={`inv-tags-${rt.id}`}
+                        depth={{
+                          runClass: rt.runClass,
+                          testId: `run-class-${rt.id}`,
+                          placeholder: showDepth,
+                          running: rt.status === "running",
+                        }}
+                        synthetic={rt.isSynthEval}
+                      />
+                      <div
+                        className="flex justify-end"
+                        onClick={(e) => e.stopPropagation()}
+                      >
                         {pendingDelete === rt.id ? (
                           <div className="flex items-center gap-1.5">
-                            <button onClick={() => { void deleteOne(rt.id); }} title="Confirm delete" className="flex text-danger hover:opacity-80">
+                            <button
+                              onClick={() => {
+                                void deleteOne(rt.id);
+                              }}
+                              title="Confirm delete"
+                              className="flex text-danger hover:opacity-80"
+                            >
                               <Check size={14} />
                             </button>
-                            <button onClick={() => setPendingDelete(null)} title="Cancel" className="flex text-faint hover:text-text">
+                            <button
+                              onClick={() => setPendingDelete(null)}
+                              title="Cancel"
+                              className="flex text-faint hover:text-text"
+                            >
                               <X size={14} />
                             </button>
                           </div>

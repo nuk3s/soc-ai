@@ -181,7 +181,7 @@ OBSERVED_BAD_CASES: list[tuple[str, dict[str, Any], str]] = [
     ("investigation_transcript", {}, "Investigation notes compiled"),
     # 5. "Final synthesis: running…" leftover — final_result is the structured-
     #    output pseudo-tool; give it verdict-synthesis phrasing.
-    ("tool_call", {"tool_name": "final_result", "args": {}}, "Synthesizing verdict…"),
+    ("tool_call", {"tool_name": "final_result", "args": {}}, "Synthesizing verdict"),
     ("tool_result", {"tool_name": "final_result", "result": None}, "Verdict synthesized"),
 ]
 
@@ -232,8 +232,10 @@ def test_error_results_read_negative_but_short() -> None:
     trace = "Traceback (most recent call last):\n  File x.py\nTimeoutError: read timed out"
     t3 = title_for("tool_result", {"tool_name": "t_query_zeek_logs", "result": {"error": trace}})
     assert "\n" not in t3
-    assert len(t3) <= 90
-    assert t3.startswith("Zeek logs failed: ")
+    assert t3 == (
+        "Zeek logs failed: Traceback (most recent call last): File x.py "
+        "TimeoutError: read timed out"
+    )
 
 
 def test_zero_matches_is_neutral_not_negative() -> None:
@@ -247,7 +249,7 @@ def test_zero_matches_is_neutral_not_negative() -> None:
 def test_write_tool_phrasing() -> None:
     assert (
         title_for("tool_call", {"tool_name": "ack_alert", "args": {}})
-        == "Acknowledging the alert in Security Onion…"
+        == "Acknowledging the alert in Security Onion"
     )
     assert (
         title_for("tool_result", {"tool_name": "ack_alert", "result": {"success": True}})
@@ -271,7 +273,7 @@ def test_unknown_dict_results_never_render_json() -> None:
         {"tool_name": "t_query_events_oql", "result": {"weird": {"nested": 1}, "flag": True}},
     )
     assert t == "Checked events"
-    # at most a couple of scalar fields, verbatim-but-clipped
+    # at most a couple of scalar fields, verbatim
     t2 = title_for(
         "tool_result",
         {"tool_name": "t_describe_dataset", "result": {"dataset": "zeek.ssh", "fields": 42}},
@@ -280,15 +282,18 @@ def test_unknown_dict_results_never_render_json() -> None:
     assert "{" not in t2 and "}" not in t2
 
 
-def test_titles_target_80_chars_for_common_rows() -> None:
+def test_a_long_argument_or_error_reaches_the_title_whole() -> None:
+    """No title is cut. The owner banned the ellipsis cut on 2026-10-07."""
     long_oql = "event.dataset:zeek.conn AND source.ip:198.51.100.24 AND destination.port:445 " * 3
     t = title_for("tool_call", {"tool_name": "t_query_events_oql", "args": {"oql": long_oql}})
-    assert len(t) <= 80
+    assert " ".join(long_oql.split()) in t
+    assert "…" not in t and not t.endswith("...")
     long_err = "read timed out connecting to elasticsearch at 198.51.100.253:9200 " * 4
     t2 = title_for(
         "tool_result", {"tool_name": "t_query_events_oql", "result": {"error": long_err}}
     )
-    assert len(t2) <= 80
+    assert " ".join(long_err.split()) in t2
+    assert "…" not in t2 and not t2.endswith("...")
 
 
 def test_downgrade_kinds_read_human_not_jargon() -> None:

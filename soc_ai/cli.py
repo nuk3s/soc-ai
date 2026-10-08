@@ -129,9 +129,19 @@ def _label(kind: str) -> str:
     return f"{color}{kind}{_C['reset']}"
 
 
-def _short(s: str, n: int = 280) -> str:
-    s = s.replace("\n", " ").strip()
-    return s if len(s) <= n else s[: n - 1] + "…"
+def _one_line(s: str) -> str:
+    """Prose on one line, whole. The terminal wraps a long line."""
+    return s.replace("\n", " ").strip()
+
+
+def _raw_prefix(s: str, n: int = 160) -> str:
+    """The start of a raw JSON dump, with a count of what the line leaves out.
+
+    A tool result can run to kilobytes. The stream shows its start and names
+    the length of the rest. The full record is in the investigation.
+    """
+    s = _one_line(s)
+    return s if len(s) <= n else f"{s[:n]} [{len(s) - n} more characters]"
 
 
 def _render_event(kind: str, payload: dict[str, Any]) -> str:
@@ -150,16 +160,16 @@ def _render_event(kind: str, payload: dict[str, Any]) -> str:
         args = payload.get("args")
         if not isinstance(args, str):
             args = json.dumps(args)
-        return f"{_label(kind)} {payload.get('tool_name')}({_short(args, 160)})"
+        return f"{_label(kind)} {payload.get('tool_name')}({_raw_prefix(args)})"
     if kind == "tool_result":
         result = payload.get("result")
         body = json.dumps(result) if not isinstance(result, str) else result
-        return f"{_label(kind)} {payload.get('tool_name')} → {_short(body, 160)}"
+        return f"{_label(kind)} {payload.get('tool_name')} → {_raw_prefix(body)}"
     if kind == "model_response":
-        line = f"{_label(kind)} {_short(payload.get('content', ''), 220)}"
+        line = f"{_label(kind)} {_one_line(payload.get('content', ''))}"
         trace = payload.get("reasoning_trace")
         if trace:
-            line += f"\n   {_C['dim']}<think>{_short(trace, 200)}{_C['reset']}"
+            line += f"\n   {_C['dim']}<think>{_raw_prefix(trace, 200)}{_C['reset']}"
         return line
     if kind == "investigation_transcript":
         rnd = payload.get("round")
@@ -168,7 +178,7 @@ def _render_event(kind: str, payload: dict[str, Any]) -> str:
         return (
             f"{_label(kind)} round={rnd} evidence={ev_count} "
             f"open_questions={oq_count}\n   "
-            f"{_C['dim']}{_short(payload.get('tentative_summary', ''), 180)}{_C['reset']}"
+            f"{_C['dim']}{_one_line(payload.get('tentative_summary', ''))}{_C['reset']}"
         )
     if kind == "usage":
         return (
@@ -185,7 +195,7 @@ def _render_event(kind: str, payload: dict[str, Any]) -> str:
     if kind == "triage_report":
         verdict = payload.get("verdict") or "?"
         conf = payload.get("confidence")
-        summary = _short(payload.get("summary") or "", 320)
+        summary = _one_line(payload.get("summary") or "")
         cites = ", ".join((payload.get("citations") or [])[:6])
         out = [
             f"{_label(kind)} {verdict.upper()}  confidence={conf}",
@@ -194,7 +204,7 @@ def _render_event(kind: str, payload: dict[str, Any]) -> str:
         ]
         actions = payload.get("recommended_actions") or []
         for a in actions:
-            rendered_rationale = _short(a.get("rationale", ""), 200)
+            rendered_rationale = _one_line(a.get("rationale", ""))
             out.append(
                 f"   {_C['yellow']}→ {a.get('tool_name')} ({rendered_rationale}){_C['reset']}"
             )
@@ -214,7 +224,7 @@ def _render_event(kind: str, payload: dict[str, Any]) -> str:
             line += f"\n   {_C['yellow']}hint: {payload['hint']}{_C['reset']}"
         return line
     # Fallback for unknown kinds — dump the payload.
-    return f"{_label(kind)} {_short(json.dumps(payload), 160)}"
+    return f"{_label(kind)} {_raw_prefix(json.dumps(payload))}"
 
 
 async def _stream_investigation(
@@ -399,7 +409,7 @@ def _print_401_hint_if_no_token(status_code: int, token: str | None) -> None:
     if status_code == 401 and not token:
         print(
             f"{_C['yellow']}hint{_C['reset']}: this deployment requires authentication. "
-            "Set SOC_AI_API_TOKEN, or pass --token scai_... . Mint a token in the web "
+            "Set SOC_AI_API_TOKEN, or pass --token scai_<token>. Mint a token in the web "
             "UI under Config → API tokens.",
             file=sys.stderr,
         )
@@ -522,7 +532,7 @@ def _validate(args: argparse.Namespace) -> int:
 
     print(
         f"{_C['dim']}eval harness · alert={args.alert_id!r} · "
-        f"investigating + sanitizing + asking the oracle…{_C['reset']}",
+        f"investigating + sanitizing + asking the oracle{_C['reset']}",
         file=sys.stderr,
         flush=True,
     )
@@ -991,7 +1001,7 @@ def _eval_report(args: argparse.Namespace) -> int:
     aggregates_dict = aggregates_to_json(agg)
 
     print(
-        f"{_C['dim']}running meta-analysis (model={settings.claude_oracle_model})…{_C['reset']}",
+        f"{_C['dim']}running meta-analysis (model={settings.claude_oracle_model}){_C['reset']}",
         file=sys.stderr,
         flush=True,
     )
@@ -2910,7 +2920,7 @@ def _add_api_client_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--token",
         default=None,
-        help="API bearer token (scai_...) for a secured deployment. "
+        help="API bearer token for a secured deployment. A token starts with scai_. "
         "api_auth_required=true is the shipped default. The CLI falls back to the "
         "SOC_AI_API_TOKEN environment variable. Omit both only if the server "
         "allows unauthenticated access.",

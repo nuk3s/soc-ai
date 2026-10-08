@@ -175,7 +175,7 @@ export function ApiKeysPanel({
                     disabled={busy || !value.trim()}
                     className="rounded-[7px] border border-accent px-[11px] py-1.5 text-[12px] font-semibold text-accent disabled:opacity-50"
                   >
-                    {busy ? 'Saving…' : 'Save'}
+                    {busy ? 'Saving' : 'Save'}
                   </button>
                   <button
                     onClick={cancel}

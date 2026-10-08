@@ -12,9 +12,16 @@ import {
 import {
   NO_HUNT_LINE,
   NOT_RUNNING_TITLE,
+  type RunState,
+  WAITING_TITLE,
+  appliesWord,
   huntCanRun,
+  intervalWords,
+  methodWord,
   runsInProfileSweep,
+  sourceWord,
   statusLabel,
+  statusWord,
 } from '../lib/analyticRuns';
 import { entityPath } from '../lib/entityPath';
 import { plural } from '../lib/plural';
@@ -42,6 +49,7 @@ import {
 import { useAsync } from '../lib/useAsync';
 import { Definition } from './Definition';
 import { Drawer } from './Drawer';
+import { LoadingInline } from './States';
 
 // ---------------------------------------------------------------------------
 // One analytic, its history and what it earned.
@@ -83,12 +91,24 @@ export const STATUS_TITLE: Record<string, string> = {
 /** The status dot. `running` false means the loop that runs the analytic is
  *  off or has not run: the dot goes grey and the word says so. A green "live"
  *  over an analytic no sweep has run is a false all-clear. */
-export function StatusDot({ status, running }: { status: string; running?: boolean | null }) {
-  const idle = running === false && (status === 'live' || status === 'shadow');
+export function StatusDot({
+  status,
+  running,
+  every,
+}: {
+  status: string;
+  running?: RunState;
+  /** How often the loop runs, as words: "every hour". */
+  every?: string;
+}) {
+  const live = status === 'live' || status === 'shadow';
+  const idle = (running === false || running === 'waiting') && live;
   return (
     <span
       className="inline-flex items-center gap-1.5 whitespace-nowrap"
-      title={idle ? NOT_RUNNING_TITLE : STATUS_TITLE[status]}
+      title={
+        !idle ? STATUS_TITLE[status] : running === 'waiting' ? WAITING_TITLE : NOT_RUNNING_TITLE
+      }
       data-testid="status-dot"
     >
       <span
@@ -99,7 +119,7 @@ export function StatusDot({ status, running }: { status: string; running?: boole
             : { background: STATUS_COLOR[status] ?? '#8b949e' }
         }
       />
-      {statusLabel(status, running)}
+      {statusLabel(status, running, every)}
     </span>
   );
 }
@@ -134,7 +154,44 @@ const REASON_PLACEHOLDER: Record<string, string> = {
   live: 'Why it goes live',
   retired: 'Why it is retired',
   shadow: 'Why it runs in shadow',
+  discard: 'Why you discard it',
 };
+
+/** The status each asked action moves to. Discard retires a candidate. */
+const ASK_TARGET: Record<string, string> = { discard: 'retired' };
+
+/** The shadow record an approval is taken on. */
+export interface ShadowRecord {
+  sweeps: number;
+  hits: number;
+  /** ISO time the shadow week ends, or null when no shadow start is on record. */
+  endsAt: string | null;
+}
+
+/** The record the server sent on the analytic, or null when it sent none. */
+export function shadowRecordOf(a: Partial<AnalyticDetail>): ShadowRecord | null {
+  if (a.shadow_sweeps == null && a.shadow_ends_at == null) return null;
+  return {
+    sweeps: a.shadow_sweeps ?? 0,
+    hits: a.shadow_hits ?? 0,
+    endsAt: a.shadow_ends_at ?? null,
+  };
+}
+
+/** True while the shadow week still runs. */
+export function shadowWeekOpen(record: ShadowRecord | null, now = Date.now()): boolean {
+  return !!record?.endsAt && Date.parse(record.endsAt) > now;
+}
+
+/** "Shadow record: 0 sweeps, 0 hits. The shadow week ends on 2026-10-12." */
+export function shadowRecordLine(record: ShadowRecord, now = Date.now()): string {
+  const head = `Shadow record: ${plural(record.sweeps, 'sweep')}, ${plural(record.hits, 'hit')}.`;
+  if (!record.endsAt) return head;
+  const day = record.endsAt.slice(0, 10);
+  return shadowWeekOpen(record, now)
+    ? `${head} The shadow week ends on ${day}.`
+    : `${head} The shadow week ended on ${day}.`;
+}
 
 /** The analyst actions on one analytic. Shared by the Analytics tab and this
  *  drawer, so one analytic offers one set of actions wherever it is read.
@@ -165,6 +222,22 @@ export function AnalyticActions({
   // analytic only. The control on a profile or a model analytic started a
   // hunt whose first step failed.
   const hunts = huntCanRun(analytic.evaluator);
+  // The shadow record: the drawer's analytic carries it, and a list row asks
+  // the server for it when the analyst selects Approve.
+  const [fetched, setFetched] = useState<ShadowRecord | null>(null);
+  const [second, setSecond] = useState(false);
+  const record = shadowRecordOf(analytic as Partial<AnalyticDetail>) ?? fetched;
+  const early = shadowWeekOpen(record);
+
+  const askApprove = () => {
+    setAsking('live');
+    setSecond(false);
+    if (shadowRecordOf(analytic as Partial<AnalyticDetail>) === null) {
+      getAnalytic(analytic.id)
+        .then((d) => setFetched(shadowRecordOf(d)))
+        .catch(() => undefined);
+    }
+  };
 
   const move = async (to: string, reason?: string) => {
     setBusy(true);
@@ -173,6 +246,7 @@ export function AnalyticActions({
       await setAnalyticStatus(analytic.id, to, reason);
       setAsking(null);
       setWhy('');
+      setSecond(false);
       onChanged?.();
     } catch (e) {
       setFailed(e instanceof Error ? e.message : 'The status did not change.');
@@ -207,13 +281,26 @@ export function AnalyticActions({
     <div className={compact ? 'flex flex-wrap items-center gap-1.5' : 'flex flex-col gap-2'}>
       <div className="flex flex-wrap items-center gap-1.5">
         {analytic.status === 'candidate' && (
-          <button type="button" disabled={busy} className={btn} onClick={() => move('shadow')}>
-            Run in shadow
-          </button>
+          <>
+            <button type="button" disabled={busy} className={btn} onClick={() => move('shadow')}>
+              Run in shadow
+            </button>
+            {/* A draft the analyst will not ship had no way out but shadow
+                (W8). Discard retires it with a reason, and the finding can
+                be drafted again. */}
+            <button
+              type="button"
+              disabled={busy}
+              className={btn}
+              onClick={() => setAsking('discard')}
+            >
+              Discard
+            </button>
+          </>
         )}
         {analytic.status === 'shadow' && (
           <>
-            <button type="button" disabled={busy} className={btn} onClick={() => setAsking('live')}>
+            <button type="button" disabled={busy} className={btn} onClick={askApprove}>
               Approve
             </button>
             <button
@@ -255,31 +342,54 @@ export function AnalyticActions({
         </div>
       )}
       {asking && (
-        <div className="flex flex-wrap items-center gap-2 text-[12px]">
-          <input
-            value={why}
-            onChange={(e) => setWhy(e.target.value)}
-            placeholder={REASON_PLACEHOLDER[asking] ?? 'Why'}
-            className="min-w-[220px] flex-1 rounded-control border border-border bg-surface-2 px-2 py-1"
-          />
-          <button
-            type="button"
-            disabled={!why || busy}
-            onClick={() => move(asking, why)}
-            className="rounded-control bg-accent px-3 py-1 font-semibold text-white disabled:opacity-50"
-          >
-            Confirm
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              setAsking(null);
-              setWhy('');
-            }}
-            className="text-dim"
-          >
-            Cancel
-          </button>
+        <div className="flex flex-col gap-1.5 text-[12px]">
+          {/* The record an approval is taken on (W9). An analytic went live
+              after 0 sweeps with a box that asked for a reason and nothing
+              else. */}
+          {asking === 'live' && record && (
+            <div data-testid="approve-shadow-record" className="text-dim">
+              {shadowRecordLine(record)}
+            </div>
+          )}
+          {asking === 'live' && early && second && (
+            <div data-testid="approve-early" role="alert" className="text-warn">
+              The shadow week is not over. Select Approve anyway to put the analytic live now.
+            </div>
+          )}
+          <div className="flex flex-wrap items-center gap-2">
+            <input
+              value={why}
+              onChange={(e) => setWhy(e.target.value)}
+              placeholder={REASON_PLACEHOLDER[asking] ?? 'Why'}
+              className="min-w-[220px] flex-1 rounded-control border border-border bg-surface-2 px-2 py-1"
+            />
+            <button
+              type="button"
+              disabled={!why || busy}
+              onClick={() => {
+                // An approval before the shadow week ends asks twice.
+                if (asking === 'live' && early && !second) {
+                  setSecond(true);
+                  return;
+                }
+                void move(ASK_TARGET[asking] ?? asking, why);
+              }}
+              className="rounded-control bg-accent px-3 py-1 font-semibold text-white disabled:opacity-50"
+            >
+              {asking === 'live' && early && second ? 'Approve anyway' : 'Confirm'}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setAsking(null);
+                setWhy('');
+                setSecond(false);
+              }}
+              className="text-dim"
+            >
+              Cancel
+            </button>
+          </div>
         </div>
       )}
       {failed && <div className="text-[11.5px] text-warn">{failed}</div>}
@@ -328,7 +438,8 @@ function dismissedLine(dismissed: Record<string, number>): string {
 }
 
 function coverageLine(coverage: Record<string, number>): string {
-  if (!Object.keys(coverage).length) return '—';
+  // A query analytic reads no baseline. The cell said a dash (K2).
+  if (!Object.keys(coverage).length) return 'not measured';
   return `${coverage.measured ?? 0} measured · ${coverage.blind ?? 0} blind`;
 }
 
@@ -403,14 +514,27 @@ function Body({ detail, onChanged }: { detail: AnalyticDetail; onChanged?: () =>
     <div className="flex flex-col gap-4 p-4">
       <div>
         <div className="text-[12px] text-dim">
-          <span title={detail.tier === 'local' ? CHIP_LOCAL : CHIP_SHIPPED}>{detail.tier}</span> ·{' '}
-          <span title={STATUS_TITLE[detail.status]}>{detail.status}</span> · {detail.evaluator}{' '}
-          analytic · {detail.level} · scope: {detail.scope_kind}
+          {/* The words of the filters (C6). "shipped · live · match analytic ·
+              scope: host" needed the manual. */}
+          <span title={detail.tier === 'local' ? CHIP_LOCAL : CHIP_SHIPPED}>
+            {sourceWord(detail.tier)}
+          </span>{' '}
+          · <span title={STATUS_TITLE[detail.status]}>{statusWord(detail.status)}</span> · method:{' '}
+          {methodWord(detail.evaluator)} · {detail.level} · applies to:{' '}
+          {appliesWord(detail.scope_kind)}
         </div>
         <div className="mt-1.5 text-[13px] text-text-2">{detail.description}</div>
         {detail.no_benign_baseline && (
           <div className="mt-1.5 text-[11.5px] text-dim" title={CHIP_NO_BENIGN_BASELINE}>
             no benign baseline
+          </div>
+        )}
+        {/* The shadow week has an end. The shipped analytic said "an analyst
+            approves it to live after the shadow week" and the drawer named
+            no date (W9). */}
+        {detail.status === 'shadow' && shadowRecordOf(detail) && (
+          <div data-testid="analytic-shadow-week" className="mt-1.5 text-[11.5px] text-dim">
+            {shadowRecordLine(shadowRecordOf(detail) as ShadowRecord)}
           </div>
         )}
         {detail.held_by_system ? (
@@ -560,7 +684,7 @@ function Body({ detail, onChanged }: { detail: AnalyticDetail; onChanged?: () =>
                   v{number}
                 </span>
                 <span className="text-text-2">
-                  {v.from_status ?? 'new'} → {v.to_status}
+                  {v.from_status ? statusWord(v.from_status) : 'new'} → {statusWord(v.to_status)}
                 </span>
                 {/* The ship row is soc-ai's too, and it is no demotion. The
                     amber chip on it read as a move to shadow. */}
@@ -610,6 +734,14 @@ function Body({ detail, onChanged }: { detail: AnalyticDetail; onChanged?: () =>
   );
 }
 
+/** The run state of the drawer's analytic, from its own trail. The loop is on
+ *  and has not run this analytic yet: it waits for the next sweep. */
+export function drawerRunState(d: AnalyticDetail): RunState {
+  if (d.last_run_at === undefined) return undefined;
+  if (d.runner_enabled === false) return false;
+  return d.last_run_at === null ? 'waiting' : true;
+}
+
 export function AnalyticDrawer({
   analyticId,
   onClose,
@@ -639,17 +771,18 @@ export function AnalyticDrawer({
               same from the title alone, and the id is what an objective and a
               CLI call take. */}
           <span className="min-w-0 flex-1">
-            <span className="block truncate text-[13.5px] font-semibold">
+            <span className="block break-words text-[13.5px] font-semibold">
               {data?.title ?? analyticId ?? ''}
             </span>
-            <span data-testid="analytic-id" className="block truncate font-mono text-[11px] text-faint">
+            <span data-testid="analytic-id" className="block break-all font-mono text-[11px] text-faint">
               {analyticId ?? ''}
             </span>
           </span>
           {data && (
             <StatusDot
               status={data.status}
-              running={data.last_run_at === undefined ? undefined : data.last_run_at !== null && data.runner_enabled !== false}
+              running={drawerRunState(data)}
+              every={intervalWords(data.sweep_interval_minutes)}
             />
           )}
         </div>
@@ -660,7 +793,7 @@ export function AnalyticDrawer({
       <Definition of="analytic" className="border-b border-border px-4 py-2.5" />
       {!data ? (
         <div className="p-4 text-[12.5px] text-dim">
-          {detail.error ? 'Could not read the analytic.' : 'Reading the analytic…'}
+          {detail.error ? 'Could not read the analytic.' : <LoadingInline>Reading the analytic</LoadingInline>}
         </div>
       ) : (
         <Body detail={data} onChanged={changed} />

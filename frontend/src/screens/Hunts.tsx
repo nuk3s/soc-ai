@@ -6,7 +6,6 @@ import {
   ChevronRight,
   Crosshair,
   Loader2,
-  MessageSquare,
   Pencil,
   Plus,
   RefreshCw,
@@ -23,7 +22,7 @@ import { ListToolbar } from '../components/ListToolbar';
 import { useListSelection } from '../lib/useListSelection';
 import { useSavedViews } from '../lib/useSavedViews';
 import { CollapseChevron, Panel } from '../components/Panel';
-import { HuntKindBadge, SyntheticEvalBadge } from '../components/Badges';
+import { RowTags, TAGS_COLUMN, TagsHeader } from '../components/RowTags';
 import { EmptyState, ErrorState, Freshness, LoadingState, StaleNotice } from '../components/States';
 import { TimeRangeFilter, type CustomRange } from '../components/TimeRangeFilter';
 import { demoBlocked, useDemo } from '../lib/demo';
@@ -42,10 +41,9 @@ import {
   updateHuntSchedule,
 } from '../lib/api';
 import type { HuntSchedule, HuntScheduleList, Lead } from '../lib/api';
-import { HUNT_STATUS } from '../lib/statusMeta';
+import { huntOutcome, outcomeLabel, outcomeMeta, statusDetail, statusMeta } from '../lib/labels';
 import { HUNT_KIND } from '../lib/tokens';
 import {
-  CHIP_WINDOW,
   STATUS_COMPLETE,
   STATUS_COULD_NOT_RUN,
   STATUS_RUNNING,
@@ -113,11 +111,21 @@ const MIN_INTERVAL_MINUTES = 60;
 //
 // The objective was the only `1fr` track, so below 1100px it took the whole
 // shortfall and the row read "Hunt for hosts b…" while Findings and Hosts each
-// held their full width for one digit. The objective now has a 260px floor,
-// and the two counters carry floors well under their preferred width, so the
+// held their full width for one digit. The objective now has a floor, and
+// the two counters carry floors well under their preferred width, so the
 // browser takes the shortfall from them first.
-const GRID =
-  '28px minmax(260px, 1fr) 120px minmax(52px, 100px) minmax(48px, 90px) 100px 110px 72px';
+// K7: the status column fits the longest outcome, "No threat found, visibility
+// gap", on one line. At 100 px an outcome wrapped onto two lines in every row
+// that held it. In a narrow window the words wrap under the dot.
+export const STATUS_COLUMN = '220px';
+// The chips of a hunt sit in the tags column before the actions: the hunt
+// kind, the synthetic mark and the chat count. The objective cell holds the
+// objective and nothing else, so every objective starts at the same x
+// (owner, 2026-10-07). The objective wraps whole, so its floor is lower than
+// when it held the chips. The table fits a 1280px window and scrolls
+// sideways under the sum of the floors.
+const GRID = `28px minmax(170px, 1fr) 88px minmax(52px, 100px) minmax(48px, 90px) ${STATUS_COLUMN} 72px ${TAGS_COLUMN} 56px`;
+const GRID_MIN_WIDTH = 1006;
 
 // The window this screen lands on, and the one a saved view that names no
 // window restores. Named so the two cannot drift apart.
@@ -148,37 +156,28 @@ function windowWords(range: string): string {
 // lists the schedules themselves, so "No scheduled hunts" directly above three
 // of them read as a contradiction.
 //
-// The catalog sweep no longer writes a hunt row. The rows it wrote before this
-// release stay in the database, so `?kind=triggered` still lists them and the
-// section then says where they came from. The chip leaves the row: a type an
-// analyst can no longer produce is not a filter, it is history.
+// Catalog lists the runs the analytic sweep recorded. The list with no type
+// holds them too, and the bell links a folded sweep line to this chip. The
+// storage kind of a catalog run is `triggered`.
 type HuntKindFilter = HuntKind | 'all';
 const DEFAULT_KIND: HuntKindFilter = 'all';
 type KindChip = { id: HuntKindFilter; label: string; empty: string; title: string };
-const KIND_CHIPS: KindChip[] = [
-  { id: 'all', label: 'All', empty: 'hunts', title: TYPE_ALL },
-  { id: 'chat', label: 'Manual', empty: 'manual hunts', title: TYPE_MANUAL },
-  { id: 'scheduled', label: 'Schedule', empty: 'scheduled runs', title: TYPE_SCHEDULE },
-  { id: 'lead', label: 'Lead', empty: 'lead hunts', title: TYPE_LEAD },
-];
-/** The rows the catalog sweep recorded before this release. The address reaches
- *  them. No chip does. */
+/** The runs the analytic sweep recorded. */
 const CATALOG_KIND: KindChip = {
   id: 'triggered',
   label: 'Catalog',
   empty: 'catalog runs',
   title: TYPE_CATALOG,
 };
-const ALL_KINDS: KindChip[] = [...KIND_CHIPS, CATALOG_KIND];
-const isKindFilter = (v: unknown): v is HuntKindFilter => ALL_KINDS.some((c) => c.id === v);
+const KIND_CHIPS: KindChip[] = [
+  { id: 'all', label: 'All', empty: 'hunts', title: TYPE_ALL },
+  { id: 'chat', label: 'Manual', empty: 'manual hunts', title: TYPE_MANUAL },
+  { id: 'scheduled', label: 'Schedule', empty: 'scheduled runs', title: TYPE_SCHEDULE },
+  { id: 'lead', label: 'Lead', empty: 'lead hunts', title: TYPE_LEAD },
+  CATALOG_KIND,
+];
+const isKindFilter = (v: unknown): v is HuntKindFilter => KIND_CHIPS.some((c) => c.id === v);
 
-// A catalog hunt's objective is stored as "[catalog] <spec-id>: <title>
-// (<since> → <until>)" (hunting/sweep.py spells it; the demo seed and the
-// backend tests depend on that shape). In a truncating cell the machine prefix
-// survived and the sentence did not. The prefix says nothing the row's catalog
-// badge does not, so the LIST drops it at render time, and only on a row that
-// wears the badge: an analyst can type anything, including this shape. The
-// stored objective is the durable record and is what re-hunt sends.
 // Who started the hunt. The starter is the CLASS; startedBy is the actor
 // name. A row the sweep wrote before the starter column existed reads
 // "catalog run", because no person started it.
@@ -201,45 +200,11 @@ const starterText = (h: HuntRow): ReactNode => {
   }
 };
 
-const CATALOG_OBJECTIVE_PREFIX = /^\[catalog\] [^\s:]+: /;
-const displayObjective = (h: Pick<HuntRow, 'objective' | 'kind'>): string =>
-  h.kind === 'triggered' ? h.objective.replace(CATALOG_OBJECTIVE_PREFIX, '') : h.objective;
-
-// A lead hunt's objective is the whole lead written out: the entities, the
-// kinds and up to twelve observation summaries. Truncated to one cell it read
-// "[lead 3] Investigate 10.1.2.3. The lead formed…" and offered no way back to
-// the lead it came from. The cell names the lead and links to it instead. The
-// store writes the head (soc_ai/store/leads.py::objective_for), so the entity
-// comes from the sentence and the id comes from the row.
-// An entity key carries dots, so the sentence ends at the first full stop that
-// a space or the end of the line follows.
-const LEAD_OBJECTIVE_HEAD = /^\[lead \d+\] Investigate (.+?)\.(?:\s|$)/;
-
-function leadEntity(objective: string): string | null {
-  const m = objective.match(LEAD_OBJECTIVE_HEAD);
-  if (!m) return null;
-  return m[1].split(',')[0].trim() || null;
-}
-
-/** "Lead 3 on 10.1.10.21", or "Lead 3" when the head does not parse. */
-function leadCellText(h: HuntRow): string {
-  const entity = leadEntity(h.objective);
-  return entity ? `Lead ${h.leadId} on ${entity}` : `Lead ${h.leadId}`;
-}
-
-// A catalog objective ends in the window it ran over, "(now-1440m → now)".
-// Two runs of one spec over different windows were identical rows, because
-// the window is exactly the part the ellipsis eats. It gets its own chip.
-const OBJECTIVE_WINDOW = /\s*\((now-(\d+)([mhd]))\s*→\s*now\)\s*$/;
-function splitWindow(text: string): { text: string; window: string | null } {
-  const m = OBJECTIVE_WINDOW.exec(text);
-  if (!m) return { text, window: null };
-  const n = Number(m[2]);
-  const unit = m[3];
-  const window =
-    unit === 'm' && n % 1440 === 0 ? `${n / 1440}d` : unit === 'm' && n % 60 === 0 ? `${n / 60}h` : `${n}${unit}`;
-  return { text: text.slice(0, m.index), window };
-}
+/** The plain title of a hunt. The server writes it once for the list, the
+ *  hunt page and the bell: a catalog run reads "<analytic>, last 24 h" and a
+ *  lead hunt "Lead 6 hunt: domainadmin on SR-DC01". An older server sends no
+ *  title, and the row then reads the objective. */
+const rowTitle = (h: Pick<HuntRow, 'objective' | 'title'>): string => h.title || h.objective;
 
 // Raw rehunt skip-reason codes (routes_hunts.py::bulk_rehunt) → friendly text.
 // Unknown codes fall through to the raw code so a new backend reason is never
@@ -264,11 +229,16 @@ const statNoun = (s: { label: string; value: string | number }): string => {
   return label.toLowerCase();
 };
 
+/** The outcomes that did not test the objective. A count of their findings
+ *  counts gaps and failed queries, so the cell states none. */
+const NO_COUNT_OUTCOMES = new Set(['could_not_run', 'no_answer', 'no_threat_gap']);
+
 /** F4: the cell and the header counted threat findings under the word
  *  Findings, so a hunt with one finding read 0 and one with six read 1. The
- *  cell states both counts. */
+ *  cell states both counts. The outcome comes from lib/labels.ts. */
 function findingsCellText(h: HuntRow): string {
-  if (h.outcome === 'failed' || h.outcome === 'gap') return '—';
+  const outcome = huntOutcome(h);
+  if (outcome && NO_COUNT_OUTCOMES.has(outcome)) return '—';
   const total = h.findingCount ?? 0;
   // A row recorded before the threat count existed states the total only.
   const threats = h.threatFindingCount;
@@ -282,11 +252,15 @@ function lastHuntOf(s: HuntSchedule): string | null {
 }
 
 function findingsCellTitle(h: HuntRow): string | undefined {
-  if (h.outcome === 'failed') return 'The hunt did not run. The result is unknown.';
-  // One phrase for a gap, here and on the hunt page. The two read differently
-  // and an analyst had to decide whether they meant the same thing.
-  if (h.outcome === 'gap')
-    return 'No threat observed · visibility gap. The hunt found no telemetry of one type that its objective needs. The gap finding names the type.';
+  const outcome = huntOutcome(h);
+  if (outcome && NO_COUNT_OUTCOMES.has(outcome)) {
+    // The outcome in the words of lib/labels.ts, then the reason the server
+    // wrote, then where the findings are.
+    const reason = h.outcome_headline ? ` ${h.outcome_headline}` : '';
+    const n = h.findingCount ?? 0;
+    const where = n > 0 ? ` The hunt page lists its ${n} finding${n === 1 ? '' : 's'}.` : '';
+    return `${outcomeLabel(outcome)}.${reason}${where}`;
+  }
   const threats = h.threatFindingCount ?? h.findingCount;
   const other = h.findingCount - threats;
   return other > 0 ? `${threats} threat finding${threats === 1 ? '' : 's'} · ${other} other finding${other === 1 ? '' : 's'}: visibility gaps and observations` : undefined;
@@ -295,43 +269,50 @@ function findingsCellTitle(h: HuntRow): string | undefined {
 function StatusDot({
   status,
   outcome,
-  outcomeLabel,
+  outcomeLabel: serverLabel,
 }: {
   status: HuntStatus;
   outcome?: HuntRow['outcome'];
   outcomeLabel?: string;
 }) {
-  // A hunt that finished without running is not "Complete": its one finding is
-  // the record that it could not run, and a green dot on that row is the false
-  // all-clear the second dogfood found six times on one screen.
-  const derived =
-    status === 'complete' && outcome === 'failed'
-      ? { label: 'Could not run', color: '#d29922', pulse: false }
-      : status === 'complete' && outcome === 'gap'
-        ? { label: 'No telemetry', color: '#8b949e', pulse: false }
-        : (HUNT_STATUS[status] ?? HUNT_STATUS.error);
-  // One sentence per status, the words of Frame 7. A status the three do not
-  // name states itself and carries none.
+  // One outcome per hunt, in the words and the colour of lib/labels.ts. A hunt
+  // that could not run is grey and a hunt that found a threat is red. The list
+  // compared the legacy codes, so a could-not-run row wore the green dot of a
+  // clean hunt. A complete row from an older server with no outcome reads its
+  // status.
+  const key = huntOutcome({ status, outcome });
+  const m = key ? outcomeMeta(key) : statusMeta(status);
+  // One sentence per status, the words of Frame 7. A stopped hunt names its
+  // stop.
   const title =
     status === 'running'
       ? STATUS_RUNNING
-      : status === 'complete' && (outcome === 'failed' || outcome === 'gap')
-        ? STATUS_COULD_NOT_RUN
+      : key === 'could_not_run'
+        ? status === 'complete'
+          ? STATUS_COULD_NOT_RUN
+          : statusDetail(status)
         : status === 'complete'
           ? STATUS_COMPLETE
           : undefined;
   // The backend names the outcome of a complete hunt. Its word wins, because
-  // the client word disagreed with the hunt page beside it. The colour stays
-  // the client's: it keys on the outcome code, which the backend still sends.
-  const m =
-    status === 'complete' && outcomeLabel ? { ...derived, label: outcomeLabel } : derived;
+  // the client word disagreed with the hunt page beside it.
+  // An investigating hunt also carries its count, "Investigating 2 of 3
+  // findings", which the client word cannot state.
+  const label =
+    (status === 'complete' || status === 'investigating') && serverLabel ? serverLabel : m.label;
   return (
-    <span className="flex items-center gap-1.5 text-[12px]" style={{ color: m.color }} title={title}>
+    <span
+      className="flex items-start gap-1.5 text-[12px] leading-[1.35]"
+      style={{ color: m.color }}
+      title={title}
+      data-testid="hunt-status"
+      data-tone={m.tone}
+    >
       <span
-        className={`h-1.5 w-1.5 rounded-full${m.pulse ? ' animate-pulse' : ''}`}
+        className={`mt-[5px] h-1.5 w-1.5 flex-none rounded-full${status === 'running' ? ' animate-pulse' : ''}`}
         style={{ background: m.color }}
       />
-      {m.label}
+      {label}
     </span>
   );
 }
@@ -494,7 +475,7 @@ function ScheduledHunts() {
       ) : (
         <div id={SCHEDULES_BODY_ID}>
       {loading && !data ? (
-        <LoadingState label="Loading schedules…" />
+        <LoadingState label="Loading schedules" />
       ) : error ? (
         <ErrorState error={error} onRetry={reload} />
       ) : (
@@ -526,7 +507,13 @@ function ScheduledHunts() {
                   {!s.enabled ? 'paused' : masterSwitchOn ? 'on' : 'on (paused)'}
                 </button>
                 <div className="min-w-0 flex-1">
-                  <div className="truncate text-[13px] text-text">{s.objective}</div>
+                  <div
+                    data-testid={`schedule-objective-${s.id}`}
+                    className="break-words text-[13px] leading-[1.4] text-text"
+                    title={s.objective}
+                  >
+                    {s.objective}
+                  </div>
                   <div className="mt-0.5 text-[11.5px] text-faint">
                     every {intervalLabel(s.intervalMinutes)}
                     {/* F17: "last ran" was plain text. It links the hunt the
@@ -599,7 +586,7 @@ function ScheduledHunts() {
                 if (e.key === 'Enter') void save();
               }}
               placeholder={
-                editing !== null ? 'Edit the hunt objective…' : 'New recurring hunt objective…'
+                editing !== null ? 'Edit the hunt objective' : 'New recurring hunt objective'
               }
               className="min-w-[240px] flex-1 rounded-control border border-border-input bg-bg px-3 py-2 text-[13px] text-text outline-none focus:border-accent"
             />
@@ -735,7 +722,7 @@ export function Hunts() {
   // `?new=1` opens the composer. The New hunt button writes it, so a reload
   // keeps the drawer open and closing it takes the parameter out again.
   const newHunt = searchParams.get('new') === '1' && tab === 'hunts';
-  // `?objective=` fills the composer. The "Run this query" link of an
+  // `?objective=` fills the composer. The "Hunt with this query" link of an
   // observation writes it beside `new=1`. Closing the drawer takes both out.
   const newObjective = searchParams.get('objective') ?? '';
   const setNewHunt = (open: boolean) => {
@@ -1060,20 +1047,21 @@ export function Hunts() {
         <AnalyticsPanel shared={analytics} onChanged={analyticsChanged} />
       ) : (
         <>
-      {/* The page is the pipeline, top to bottom: what needs the analyst, what
-          the analytics found, what is worth pursuing, what was pursued. Each
-          item appears once. */}
+      {/* The page reads by the work, top to bottom: what needs the analyst,
+          the leads that wait on a decision, what the analytics found, what
+          was pursued. Each item appears once. W1: the leads started 1,977 px
+          down a 900 px screen, under 12 hits that waited on nobody. */}
       <NeedsYouStrip />
-      <AnalyticHits
-        onAnalyticChanged={analyticsChanged}
-        collapsed={hitsFold.collapsed}
-        onToggleCollapsed={hitsFold.toggle}
-      />
       <LeadsStrip
         paramBound
         onRows={setLeadRows}
         collapsed={leadsFold.collapsed}
         onToggleCollapsed={leadsFold.toggle}
+      />
+      <AnalyticHits
+        onAnalyticChanged={analyticsChanged}
+        collapsed={hitsFold.collapsed}
+        onToggleCollapsed={hitsFold.toggle}
       />
 
       {/* The hunt section: agent runs only. The catalog sweep writes an
@@ -1092,13 +1080,6 @@ export function Hunts() {
         >
           {visible.length}
         </span>
-        {/* The rows the catalog sweep wrote before this release are reached by
-            the address alone, so the header says where they came from. */}
-        {kind === 'triggered' && (
-          <span className="text-[11.5px] text-dim">
-            Catalog runs recorded before this release
-          </span>
-        )}
         <span className="ml-auto">
           <button
             type="button"
@@ -1127,7 +1108,7 @@ export function Hunts() {
           new place. The active count is the rows the table shows. */}
       <ListToolbar
         presetsLabel="Type"
-        presets={(kind === 'triggered' ? ALL_KINDS : KIND_CHIPS).map((c) => ({
+        presets={KIND_CHIPS.map((c) => ({
           id: c.id,
           label: c.label,
           title: c.title,
@@ -1162,7 +1143,7 @@ export function Hunts() {
                 style={{ background: 'rgba(75,139,245,.14)', borderColor: 'rgba(75,139,245,.4)' }}
               >
                 <RefreshCw size={12} className={rehunting ? 'animate-spin' : ''} />
-                {rehunting ? 'Starting…' : `Re-hunt selected (${selCount})`}
+                {rehunting ? 'Starting' : `Re-hunt selected (${selCount})`}
               </button>
               {confirmDelete ? (
                 <>
@@ -1172,7 +1153,7 @@ export function Hunts() {
                     className="flex items-center gap-1.5 rounded-[7px] border border-danger px-[11px] py-1.5 text-[12.5px] font-semibold text-danger disabled:opacity-50"
                   >
                     <Trash2 size={12} />
-                    {bulkDeleting ? 'Deleting…' : `Confirm delete (${selCount})`}
+                    {bulkDeleting ? 'Deleting' : `Confirm delete (${selCount})`}
                   </button>
                   <button
                     onClick={() => setConfirmDelete(false)}
@@ -1225,7 +1206,7 @@ export function Hunts() {
                 disabled={total === 0}
                 className="flex min-w-0 flex-1 items-center gap-2.5 text-left"
               >
-                <span className="min-w-0 truncate font-semibold text-text-2">
+                <span className="min-w-0 break-words font-semibold text-text-2">
                   Started {started.length} re-hunt{started.length !== 1 ? 's' : ''}
                   {skipped.length > 0 ? ` · ${skipped.length} skipped` : ''}
                 </span>
@@ -1249,14 +1230,20 @@ export function Hunts() {
                 {started.map((s) => (
                   <div key={s.old_id} className="flex items-center gap-2 py-[3px]">
                     <Check size={12} className="flex-none text-success" />
-                    <span className="min-w-0 truncate text-text-2">{s.objective}</span>
+                    <span
+                      data-testid={`rehunt-objective-${s.new_id}`}
+                      className="min-w-0 break-words text-text-2"
+                      title={s.objective}
+                    >
+                      {s.objective}
+                    </span>
                     <span className="flex-none text-faint">→ new hunt</span>
                   </div>
                 ))}
                 {skipped.map((s) => (
                   <div key={s.id} className="flex items-center gap-2 py-[3px]">
                     <X size={12} className="flex-none text-faint" />
-                    <span className="min-w-0 truncate text-dim">{s.id}</span>
+                    <span className="min-w-0 break-words text-dim">{s.id}</span>
                     <span className="flex-none text-faint">{rehuntSkipReason(s.reason)}</span>
                   </div>
                 ))}
@@ -1275,9 +1262,10 @@ export function Hunts() {
         />
       )}
       <Panel>
+        <div className="overflow-x-auto">
         <div
-          className="grid items-center gap-3 border-b border-border px-4 py-2.5 text-[11px] font-semibold uppercase tracking-[.04em] text-dim"
-          style={{ gridTemplateColumns: GRID }}
+          className="grid items-center gap-2.5 border-b border-border px-4 py-2.5 text-[11px] font-semibold uppercase tracking-[.04em] text-dim"
+          style={{ gridTemplateColumns: GRID, minWidth: GRID_MIN_WIDTH }}
         >
           <div className="flex items-center" onClick={(e) => e.stopPropagation()}>
             <Checkbox
@@ -1293,11 +1281,12 @@ export function Hunts() {
           <div>Hosts</div>
           <div>Status</div>
           <div>Started</div>
+          <TagsHeader />
           <div />
         </div>
 
         {loading && !data ? (
-          <LoadingState label="Loading hunts…" />
+          <LoadingState label="Loading hunts" />
         ) : error ? (
           <ErrorState error={error} onRetry={() => setReloadKey((k) => k + 1)} />
         ) : !data || visible.length === 0 ? (
@@ -1311,7 +1300,7 @@ export function Hunts() {
             // The unwindowed stats cannot say whether widening will find any,
             // so the copy names the control that could, not a promise.
             <EmptyState>
-              No {ALL_KINDS.find((c) => c.id === kind)?.empty} in this window. Widen the time
+              No {KIND_CHIPS.find((c) => c.id === kind)?.empty} in this window. Widen the time
               range above.
             </EmptyState>
           ) : huntsExist ? (
@@ -1345,8 +1334,8 @@ export function Hunts() {
           visible.map((h) => (
             <div
               key={h.id}
-              className="group grid w-full items-center gap-3 border-b border-border px-4 py-3 text-left last:border-0 hover:bg-surface-2"
-              style={{ gridTemplateColumns: GRID }}
+              className="group grid w-full items-center gap-2.5 border-b border-border px-4 py-3 text-left last:border-0 hover:bg-surface-2"
+              style={{ gridTemplateColumns: GRID, minWidth: GRID_MIN_WIDTH }}
             >
               <div className="flex items-center" onClick={() => sel.toggle(h.id)}>
                 <Checkbox checked={sel.isSelected(h.id)} title="Select" />
@@ -1355,44 +1344,24 @@ export function Hunts() {
                   hunt in the row. No row is clickable as a whole: the whole
                   row navigated, so the word that names the hunt was the one
                   word an analyst could not copy or open in a tab. The lead a
-                  hunt came from is reached from the Started by cell. */}
-              <div className="flex items-center gap-2 truncate">
-                <Crosshair size={14} className="flex-none text-accent" />
+                  hunt came from is reached from the Started by cell.
+                  The whole objective shows and wraps in its cell. One
+                  truncated line read "Hunt for hosts b" and hid the hunt,
+                  and a two-line clamp hid the rest (owner, 2026-10-07). The
+                  chips sit in the tags column, so every objective starts at
+                  the same x. */}
+              <div data-testid="hunt-title-cell" className="flex min-w-0 items-start gap-2">
+                <Crosshair size={14} className="mt-[2px] flex-none text-accent" />
                 <Link
                   to={`/hunts/${h.id}`}
-                  className="truncate text-[13px] text-accent hover:underline"
+                  data-testid="hunt-row-objective"
+                  className="min-w-0 whitespace-normal break-words text-[13px] leading-[1.4] text-accent hover:underline"
                   title={h.objective}
                 >
-                  {h.starter === 'lead' && h.leadId != null
-                    ? leadCellText(h)
-                    : splitWindow(displayObjective(h)).text}
+                  {rowTitle(h)}
                 </Link>
-                {h.starter !== 'lead' && splitWindow(displayObjective(h)).window && (
-                  <span
-                    className="flex-none rounded-chip border border-border-strong bg-surface-2 px-1.5 py-px font-mono text-[10.5px] text-dim"
-                    title={CHIP_WINDOW}
-                  >
-                    {splitWindow(displayObjective(h)).window}
-                  </span>
-                )}
-                {/* Scheduled and catalog-recorded hunts are badged; a manual
-                    hunt is the default and wears nothing. The header line's
-                    per-kind breakdown is where the plain rows are named. */}
-                <HuntKindBadge kind={h.kind} />
-                {/* A hunt run against planted synthetic scenarios must never
-                    read as a real one — badge it wherever the row appears. */}
-                {h.isSynthEval && <SyntheticEvalBadge />}
-                {(h.chatCount ?? 0) > 0 && (
-                  <span
-                    className="flex flex-none items-center gap-[4px] rounded-badge border border-border-2 bg-surface-2 px-[6px] py-[2px] font-mono text-[10.5px] text-accent"
-                    title={`${h.chatCount} chat message${h.chatCount === 1 ? '' : 's'}`}
-                  >
-                    <MessageSquare size={10} />
-                    {h.chatCount}
-                  </span>
-                )}
               </div>
-              <div className="truncate text-[12px] text-dim" title="Who or what started this hunt.">
+              <div className="min-w-0 break-words text-[12px] text-dim" title="Who or what started this hunt.">
                 {starterText(h)}
               </div>
               <div className="text-[13px] tabular-nums text-text-2" title={findingsCellTitle(h)}>
@@ -1403,6 +1372,16 @@ export function Hunts() {
                 <StatusDot status={h.status} outcome={h.outcome} outcomeLabel={h.outcome_label} />
               </div>
               <div className="text-[12px] text-dim" title={h.ts}>{h.when}</div>
+              {/* The tags, in the one order of every list. Scheduled and
+                  catalog-recorded hunts carry a kind chip. A manual hunt is
+                  the default and carries none. The synthetic mark keeps a
+                  planted attack from reading as real activity. */}
+              <RowTags
+                testId={`hunt-tags-${h.id}`}
+                huntKind={h.kind}
+                synthetic={h.isSynthEval}
+                chatCount={h.chatCount}
+              />
               <div className="flex items-center justify-end gap-2">
                 {/* Re-hunt: a clean re-run of this objective as a fresh hunt.
                     Nothing to re-run while still running. Prominent (always
@@ -1456,6 +1435,7 @@ export function Hunts() {
             </div>
           ))
         )}
+        </div>
       </Panel>
         </div>
       )}

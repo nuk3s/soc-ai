@@ -33,7 +33,7 @@ export function EgressPolicyPanel({
       </SectionTitle>
       {!collapsed && (
         <div className="overflow-hidden rounded-card border border-border bg-surface-1 p-[15px]">
-          {loading && <LoadingState label="Loading egress policy…" />}
+          {loading && <LoadingState label="Loading egress policy" />}
           {error && <ErrorState error={error} />}
           {data && (
             <>

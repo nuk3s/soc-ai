@@ -127,7 +127,10 @@ async def test_a_breach_demotes_with_the_numbers_as_evidence(settings_kratos: Se
     demotion = versions[-1]
     assert (demotion.from_status, demotion.to_status) == ("live", "shadow")
     assert demotion.who == analytics_store.SYSTEM_ACTOR
-    assert demotion.why == ("The analytic wrote 5 hits in 24 hours. Its fire budget is 3 a day.")
+    # The reason reads the console words. "fire budget" stays the name of the
+    # spec field and the rule code, and never reaches the analyst.
+    assert demotion.why == "The analytic wrote 5 hits in 24 hours. Its daily hit limit is 3."
+    assert "fire budget" not in demotion.why
     evidence = analytics_store.evidence_of(demotion)
     assert evidence is not None
     (breach,) = evidence["breaches"]
@@ -263,8 +266,7 @@ async def test_a_new_breach_after_an_approval_demotes_again(settings_kratos: Set
     await engine.dispose()
     assert len(again.demoted) == 1
     assert again.demoted[0].reason == (
-        "The analytic wrote 4 hits in 3 hours since its approval to live. "
-        "Its fire budget is 3 a day."
+        "The analytic wrote 4 hits in 3 hours since its approval to live. Its daily hit limit is 3."
     )
     assert len([v for v in versions if analytics_store.is_system_demotion(v)]) == 2
 
@@ -359,7 +361,7 @@ async def test_a_precision_breach_demotes_with_the_lead_numbers(
     demotion = versions[-1]
     assert demotion.why == (
         "1 of 5 hunted leads reached a finding or an investigation. "
-        "The precision is 0.20. Its floor is 0.50."
+        "The precision is 0.20. Its minimum precision is 0.50."
     )
     evidence = analytics_store.evidence_of(demotion)
     assert evidence is not None
@@ -528,7 +530,7 @@ def test_a_hold_raises_a_bell_entry_until_the_analyst_acts(client: TestClient) -
     assert entry["group"] == "hunting"
     assert entry["tone"] == "warn"
     assert entry["title"].startswith("soc-ai moved A Kerberos ticket request names a service")
-    assert "Its fire budget is 2 a day." in entry["title"]
+    assert "Its daily hit limit is 2." in entry["title"]
     assert entry["href"] == f"/hunts?tab=analytics&open={_ID}"
 
     res = client.post(f"/api/v1/analytics/{_ID}/status", json={"to": "live", "why": "read"})

@@ -127,3 +127,48 @@
     @apply border-accent;
   }
 }
+
+/* Dashboard grid (components/DashboardGrid.tsx). The gap under a panel lives
+   inside its cell, so a grid row is exactly 4 px and a cell is exactly as tall
+   as its rows. Outside edit mode nothing animates: a panel that grows as its
+   data lands must not slide the panels under it. */
+.dash-cell {
+  position: relative;
+  padding-bottom: 16px;
+}
+.dash-tile {
+  display: flex;
+  flex-direction: column;
+}
+.dash-tile > * {
+  flex: 1 0 auto;
+}
+.dash-grid:not(.dash-grid--editing) .react-grid-layout,
+.dash-grid:not(.dash-grid--editing) .react-grid-item {
+  transition: none;
+}
+.dash-grid .react-grid-item > .react-resizable-handle {
+  z-index: 5;
+  width: 18px;
+  height: 18px;
+  opacity: 1;
+}
+.dash-grid .react-grid-item > .react-resizable-handle.react-resizable-handle-se {
+  right: 0;
+  bottom: 16px;
+}
+.dash-grid .react-grid-item > .react-resizable-handle::after {
+  right: 4px;
+  bottom: 4px;
+  width: 8px;
+  height: 8px;
+  border-right: 2px solid rgb(var(--accent));
+  border-bottom: 2px solid rgb(var(--accent));
+}
+.dash-grid .react-grid-item.react-grid-placeholder {
+  padding-bottom: 16px;
+  border-radius: 12px;
+  background: rgb(var(--accent) / 0.14);
+  background-clip: content-box;
+  opacity: 1;
+}

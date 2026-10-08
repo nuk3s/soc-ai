@@ -5,7 +5,7 @@
 // the clock. These pin the fix: no poll while the tab is hidden, and one
 // immediate refresh on return to visible so the bell is current the moment the
 // analyst looks again (the house guard, lib/useAsync.ts:118).
-import { act, fireEvent, render, screen, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { useEffect } from 'react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -15,6 +15,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
   getWorkspaces: vi.fn(),
   getNotifications: vi.fn(),
   getHealth: vi.fn(),
+  getNeedsYouCount: vi.fn(),
 }));
 
 // The Topbar calls useNavigate() to follow a notification — stub it so a test
@@ -25,11 +26,33 @@ vi.mock('react-router-dom', async (importOriginal) => ({
   useNavigate: () => navigateMock,
 }));
 
-import { emitNeedsYouChanged, getHealth, getNotifications, getWorkspaces } from '../lib/api';
+import {
+  emitNeedsYouChanged,
+  getHealth,
+  getNeedsYouCount,
+  getNotifications,
+  getWorkspaces,
+  type NeedsYouCount,
+} from '../lib/api';
 import { ShellProvider, useShell } from './ShellContext';
 import { Topbar, notificationSummary } from './Topbar';
 
 const NOTIF_MS = 15_000;
+
+/** A needs-you answer with the given total, split over the leads. */
+const needsYou = (total: number, extra: Partial<NeedsYouCount> = {}): NeedsYouCount => ({
+  leads_needing_decision: total,
+  unread_shadow_hits: 0,
+  untriaged_groups: 0,
+  needs_more_info: 0,
+  pending_actions: 0,
+  total,
+  unknown: [],
+  alert_window: '7d',
+  verdict_window: '30d',
+  alert_floor: false,
+  ...extra,
+});
 
 // happy-dom derives document.hidden from visibilityState; shadow it with a
 // mutable getter so a test can park and un-park the tab.
@@ -66,6 +89,8 @@ beforeEach(() => {
   Object.defineProperty(document, 'hidden', { configurable: true, get: () => hidden });
   vi.mocked(getWorkspaces).mockResolvedValue([]);
   vi.mocked(getNotifications).mockResolvedValue([]);
+  // No count to read: the bell falls back to its own danger and warn rows.
+  vi.mocked(getNeedsYouCount).mockRejectedValue(new Error('503'));
   vi.mocked(getHealth).mockResolvedValue({
     es: { ok: true, detail: 'ok' },
     llm: { ok: true, detail: 'ok' },
@@ -161,26 +186,76 @@ describe('Topbar health pill covers every upstream it claims', () => {
   });
 });
 
-describe('Topbar badge counts actionable notifications only', () => {
-  it('does not badge when every notification is informational (accent)', async () => {
-    vi.mocked(getNotifications).mockResolvedValue([
-      { id: 'inv-done:1', tone: 'accent', title: 'Verdict false_positive: ET INFO X', when: '2m', href: '/investigation/1' },
-      { id: 'inv-done:2', tone: 'accent', title: 'Verdict false_positive: ET INFO Y', when: '5m', href: '/investigation/2' },
-    ]);
+// The bell states the needs-you count: the number on the Dashboard tile and the
+// sum of the sidebar badges. It counted its own rows, with a 24 h window on
+// leads and only shadow leads in warn, and said "None need attention" while 10
+// leads waited (dogfood 2026-10-06).
+describe('Topbar badge states the needs-you count', () => {
+  const hunts = Array.from({ length: 8 }, (_, i) => ({
+    id: `hunt-done:${i}`,
+    tone: 'accent' as const,
+    title: `Hunt finished: no threat found. Sweep ${i}`,
+    when: '1h',
+    href: `/hunts/${i}`,
+  }));
+  const leads = [
+    { id: 'lead:18', tone: 'warn' as const, title: 'Lead 18 formed on host-a: rare process', when: '3d', href: '/leads/18' },
+    { id: 'lead-more', tone: 'warn' as const, title: '10 more leads are open. Open Hunts to decide.', when: '', href: '/hunts#leads', dismissible: false },
+  ];
+
+  it('badges the needs-you total and states it beside the events', async () => {
+    vi.mocked(getNeedsYouCount).mockResolvedValue(needsYou(11));
+    vi.mocked(getNotifications).mockResolvedValue([...leads, ...hunts]);
+    const { container } = mount();
+    await flush();
+    expect(container.querySelector('[data-testid="notif-badge"]')?.textContent).toBe('11');
+    act(() => bell().click());
+    expect(screen.getByTestId('notif-summary').textContent).toBe('11 need you · 8 events');
+    expect(bell()).toHaveAccessibleName('Notifications, 11 need you');
+  });
+
+  // NEGATIVE CONTROL. Accent rows alone, with nothing waiting, light nothing.
+  it('does not badge when nothing needs the analyst and no row is urgent', async () => {
+    vi.mocked(getNeedsYouCount).mockResolvedValue(needsYou(0));
+    vi.mocked(getNotifications).mockResolvedValue(hunts);
     const { container } = mount();
     await flush();
     expect(container.querySelector('[data-testid="notif-badge"]')).toBeNull();
+    act(() => bell().click());
+    expect(screen.getByTestId('notif-summary').textContent).toBe('Nothing needs you · 8 events');
   });
 
-  it('badges only the danger/warn count when informational items are mixed in', async () => {
+  it('still lights the bell for a fault when nothing needs the analyst', async () => {
+    vi.mocked(getNeedsYouCount).mockResolvedValue(needsYou(0));
+    vi.mocked(getNotifications).mockResolvedValue([
+      { id: 'dep-down:es:20261006', tone: 'danger', title: 'Elasticsearch not answering.', when: '2m', href: null },
+    ]);
+    const { container } = mount();
+    await flush();
+    expect(container.querySelector('[data-testid="notif-badge"]')?.textContent).toBe('!');
+    expect(bell()).toHaveAccessibleName('Notifications, 1 urgent');
+  });
+
+  it('marks a count that misses a part the server could not read', async () => {
+    vi.mocked(getNeedsYouCount).mockResolvedValue(
+      needsYou(4, { untriaged_groups: null, unknown: ['untriaged_groups'] }),
+    );
+    const { container } = mount();
+    await flush();
+    expect(container.querySelector('[data-testid="notif-badge"]')?.textContent).toBe('4+');
+  });
+
+  it('falls back to the danger and warn rows when the count cannot be read', async () => {
     vi.mocked(getNotifications).mockResolvedValue([
       { id: 'inv-done:1', tone: 'accent', title: 'Verdict false_positive: ET INFO X', when: '2m', href: null },
       { id: 'inv-done:2', tone: 'danger', title: 'Verdict true_positive: ET MALWARE Z', when: '3m', href: null },
-      { id: 'hunt-done:3', tone: 'warn', title: 'Hunt finished — 2 findings: sweep', when: '4m', href: null },
+      { id: 'hunt-done:3', tone: 'warn', title: 'Hunt finished, 2 threat findings: sweep', when: '4m', href: null },
     ]);
     const { container } = mount();
     await flush();
     expect(container.querySelector('[data-testid="notif-badge"]')?.textContent).toBe('2');
+    act(() => bell().click());
+    expect(screen.getByTestId('notif-summary').textContent).toBe('Could not read what needs you · 3 events');
   });
 });
 
@@ -307,15 +382,17 @@ describe('Topbar dropdowns close like the account menu', () => {
   });
 
   it('names the count on the bell and states its state', async () => {
+    vi.mocked(getNeedsYouCount).mockResolvedValue(needsYou(2));
     mount();
     await flush();
-    const b = screen.getByRole('button', { name: 'Notifications, 2 need attention' });
+    const b = screen.getByRole('button', { name: 'Notifications, 2 need you' });
     expect(b).toHaveAttribute('aria-haspopup', 'dialog');
     expect(b).toHaveAttribute('aria-expanded', 'false');
     act(() => b.click());
     expect(b).toHaveAttribute('aria-expanded', 'true');
-    // The badge counts two rows and the panel shows three: the header says so.
-    expect(screen.getByTestId('notif-summary').textContent).toBe('2 need attention · 1 more');
+    // The badge states the needs-you count and the panel shows three other
+    // rows: the header says so.
+    expect(screen.getByTestId('notif-summary').textContent).toBe('2 need you · 3 events');
   });
 
   it('closes the bell on Escape and gives focus back to the bell', async () => {
@@ -367,7 +444,7 @@ describe('Topbar dropdowns close like the account menu', () => {
     await flush();
     act(() => bell().click());
     const panel = screen.getByRole('dialog', { name: 'Notifications' });
-    const help = screen.getByRole('button', { name: 'Help and shortcuts' });
+    const help = screen.getByRole('link', { name: 'Open the guide' });
     // DOCUMENT_POSITION_FOLLOWING: the argument comes after the reference.
     expect(bell().compareDocumentPosition(panel) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(panel.compareDocumentPosition(help) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
@@ -375,20 +452,29 @@ describe('Topbar dropdowns close like the account menu', () => {
 });
 
 describe('notificationSummary', () => {
-  it('relates the badge count to the row count', () => {
-    expect(notificationSummary(12, 2)).toBe('2 need attention · 10 more');
-    expect(notificationSummary(1, 1)).toBe('1 needs attention');
-    expect(notificationSummary(4, 0)).toBe('None need attention · 4 more');
+  it('states the needs-you count beside the other rows', () => {
+    expect(notificationSummary(11, 8)).toBe('11 need you · 8 events');
+    expect(notificationSummary(1, 1)).toBe('1 needs you · 1 event');
+    expect(notificationSummary(0, 4)).toBe('Nothing needs you · 4 events');
+    expect(notificationSummary(3, 0)).toBe('3 need you');
+    expect(notificationSummary(1, 0, true)).toBe('1+ need you');
+    expect(notificationSummary(null, 2)).toBe('Could not read what needs you · 2 events');
+    expect(notificationSummary(undefined, 0)).toBe('Reading what needs you');
   });
 });
 
 // The avatar for a workspace named by its address showed the first digit, which
 // read as a count (RD15).
 describe('Workspace avatar', () => {
+  const healthy = { es: { ok: true, detail: '' }, llm: { ok: true, detail: '' } } as never;
+
   it('shows a glyph for an address-named workspace', async () => {
-    vi.mocked(getWorkspaces).mockResolvedValue([{ name: '192.0.2.46', env: 'prod' }] as never);
+    vi.mocked(getWorkspaces).mockResolvedValue([
+      { name: '192.0.2.46', env: 'prod' },
+      { name: 'soc-west', env: 'lab' },
+    ] as never);
     vi.mocked(getNotifications).mockResolvedValue([]);
-    vi.mocked(getHealth).mockResolvedValue({ es: { ok: true, detail: '' }, llm: { ok: true, detail: '' } } as never);
+    vi.mocked(getHealth).mockResolvedValue(healthy);
     mount();
     await flush();
     // The avatar box holds the glyph and no digit.
@@ -396,14 +482,83 @@ describe('Workspace avatar', () => {
   });
 
   it('keeps the first letter for a named workspace', async () => {
-    vi.mocked(getWorkspaces).mockResolvedValue([{ name: 'soc-east', env: 'prod' }] as never);
+    vi.mocked(getWorkspaces).mockResolvedValue([
+      { name: 'soc-east', env: 'prod' },
+      { name: 'soc-west', env: 'lab' },
+    ] as never);
     vi.mocked(getNotifications).mockResolvedValue([]);
-    vi.mocked(getHealth).mockResolvedValue({ es: { ok: true, detail: '' }, llm: { ok: true, detail: '' } } as never);
+    vi.mocked(getHealth).mockResolvedValue(healthy);
     mount();
     await flush();
     expect(screen.queryByTestId('ws-glyph-ip')).toBeNull();
-    expect(screen.getByTitle('Current workspace').textContent).toBe('Ssoc-east');
+    expect(screen.getByTitle('Switch workspace').textContent).toBe('Ssoc-east');
   });
+
+  // One workspace has nothing to switch to. The chip showed a bare grid
+  // address that read as a page name (dogfood 2026-10-06).
+  it('shows no workspace chip when one workspace exists', async () => {
+    vi.mocked(getWorkspaces).mockResolvedValue([{ name: '192.0.2.46', env: 'prod' }] as never);
+    vi.mocked(getNotifications).mockResolvedValue([]);
+    vi.mocked(getHealth).mockResolvedValue(healthy);
+    mount();
+    await flush();
+    expect(screen.queryByTitle('Current workspace')).toBeNull();
+    expect(screen.queryByTitle('Switch workspace')).toBeNull();
+    expect(screen.queryByText('192.0.2.46')).toBeNull();
+  });
+});
+
+// The help button opened the command palette, and the guide had no link in
+// the console (dogfood 2026-10-06).
+describe('Topbar help', () => {
+  it('opens the guide in a new tab', async () => {
+    mount();
+    await flush();
+    const help = screen.getByRole('link', { name: 'Open the guide' });
+    expect(help.getAttribute('href')).toBe('/app/guide/');
+    expect(help.getAttribute('target')).toBe('_blank');
+  });
+});
+
+// Breadcrumbs for the pages that had none (dogfood 2026-10-06).
+describe('Topbar breadcrumbs', () => {
+  const at = (path: string) =>
+    render(
+      <MemoryRouter initialEntries={[path]}>
+        <ShellProvider>
+          <Topbar />
+        </ShellProvider>
+      </MemoryRouter>,
+    );
+  const crumbText = () => screen.getByTestId('topbar-crumb').textContent;
+
+  it('reads Hunts / Lead 18 on a lead page', async () => {
+    at('/leads/18');
+    await flush();
+    expect(crumbText()).toBe('Hunts');
+    expect(screen.getByTestId('topbar-crumb2').textContent).toBe('Lead 18');
+  });
+
+  it('reads Status on the status page and Settings on the settings page', async () => {
+    at('/operate');
+    await flush();
+    expect(crumbText()).toBe('Status');
+    cleanupAndAt('/config');
+    await flush();
+    expect(crumbText()).toBe('Settings');
+  });
+
+  it('reads Hosts / <value> on an entity page', async () => {
+    at('/entity/198.51.100.7');
+    await flush();
+    expect(crumbText()).toBe('Hosts');
+    expect(screen.getByTestId('topbar-crumb2').textContent).toBe('198.51.100.7');
+  });
+
+  function cleanupAndAt(path: string) {
+    cleanup();
+    at(path);
+  }
 });
 
 // The machine page read "agent:<uuid>" in the top bar over a page titled with

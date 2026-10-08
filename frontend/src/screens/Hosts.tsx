@@ -16,10 +16,15 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { Link, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { StatusTag } from '../components/Badges';
 import { Checkbox, Select } from '../components/Controls';
-import { DOSSIER_CONFIG_HREF, HostsSummary, ROLE_BUCKETS } from '../components/HostsSummary';
+import {
+  DOSSIER_CONFIG_HREF,
+  HostsSummary,
+  ROLE_BUCKETS,
+  ROLE_BUCKET_LABELS,
+} from '../components/HostsSummary';
 import { ListToolbar } from '../components/ListToolbar';
 import { Panel, PanelHeader } from '../components/Panel';
-import { EmptyState, ErrorState, Freshness, LoadingState, StaleNotice } from '../components/States';
+import { EmptyState, ErrorState, Freshness, LoadingInline, LoadingState, StaleNotice } from '../components/States';
 import {
   bulkSetDossierOverride,
   clearDossierOverride,
@@ -29,7 +34,6 @@ import {
   getDossierSummary,
   getMachineSummary,
   getMe,
-  listDossiers,
   listMachines,
   setDossierOverride,
   startDossierRefresh,
@@ -64,7 +68,7 @@ import {
   type ListSweep,
 } from '../lib/hostsList';
 import { plural } from '../lib/plural';
-import { SHOWN_ERRORS, sweepErrorList } from '../lib/sweepErrors';
+import { SHOWN_ERRORS, sweepErrorList, sweepFailureSentence } from '../lib/sweepErrors';
 import { absTime, ago } from '../lib/timeRange';
 import { useListSelection } from '../lib/useListSelection';
 import { useSavedViews } from '../lib/useSavedViews';
@@ -168,11 +172,6 @@ const CONFLICT_KIND_HELP: Record<DossierConflictKind, string> = {
   rebound: 'A different host answers on this address now.',
 };
 
-/** The broken-builds view: the addresses with no clean build. Build health
- *  is a fact about an address dossier, so this view lists addresses. */
-const BROKEN_HREF = '/hosts?health=broken';
-const CONFLICTS_HREF = '/hosts?conflicts=1';
-
 function absolute(iso: string | null): string {
   if (!iso) return 'never seen';
   const d = new Date(iso);
@@ -211,11 +210,11 @@ function ConflictRow({ c }: { c: DossierConflictRow }) {
       )}
       <span className="flex min-w-0 items-center gap-1.5">
         <span className="flex-none text-[11px] text-faint">yours</span>
-        <span className="min-w-0 truncate font-mono text-[11.5px] text-text-2">{yours ?? 'none'}</span>
+        <span className="min-w-0 break-all font-mono text-[11.5px] text-text-2">{yours ?? 'none'}</span>
       </span>
       <span className="flex min-w-0 items-center gap-1.5">
         <span className="flex-none text-[11px] text-faint">sweep</span>
-        <span className="min-w-0 truncate font-mono text-[11.5px] text-text-2">{theirs ?? 'none'}</span>
+        <span className="min-w-0 break-all font-mono text-[11.5px] text-text-2">{theirs ?? 'none'}</span>
       </span>
       <span
         className="flex-none text-[11px] text-faint"
@@ -246,6 +245,8 @@ interface FilterOption {
 interface FilterGroup {
   /** The group heading, when a menu holds more than one group. */
   label?: string;
+  /** One line under the heading: the population the counts cover. */
+  note?: string;
   value: string;
   /** The first option is the default: the filter is off. */
   options: FilterOption[];
@@ -346,6 +347,11 @@ function HeaderFilter({
               {g.label && (
                 <div className="px-2 pb-0.5 pt-1.5 text-[10px] font-semibold uppercase tracking-[.06em] text-faint">
                   {g.label}
+                </div>
+              )}
+              {g.note && (
+                <div data-testid="filter-group-note" className="px-2 pb-1 text-[10.5px] text-faint">
+                  {g.note}
                 </div>
               )}
               {g.options.map((o) => (
@@ -535,7 +541,7 @@ function RoleCell({ row }: { row: MachineRow }) {
     <span className="inline-flex max-w-full items-baseline gap-1.5" title={view.title}>
       <span
         className={cn(
-          'inline-flex max-w-full truncate rounded-chip border px-1.5 py-px text-[12px] font-medium',
+          'inline-flex max-w-full flex-wrap rounded-chip border px-1.5 py-px text-[12px] font-medium',
           roleAccent(view.accent),
         )}
       >
@@ -553,7 +559,7 @@ function AddressCell({ row }: { row: MachineRow }) {
   const tip = `${others.join(', ')}${unlisted > 0 ? `${others.length ? ', ' : ''}and ${plural(unlisted, 'more address', 'more addresses')}` : ''}`;
   return (
     <span className="inline-flex min-w-0 items-baseline gap-1.5">
-      <span className="truncate font-mono text-[12.5px] text-text">{row.primary_ip}</span>
+      <span className="break-all font-mono text-[12.5px] text-text">{row.primary_ip}</span>
       {more > 0 && (
         <span
           data-testid="address-more"
@@ -590,6 +596,11 @@ function MachineTableRow({
   const href = machineHref(row.key);
   const source = nameSourceLabel(row.name_source);
   const staleTitle = row.agent ? agentStaleTitle(row.agent.last_report, sweep) : null;
+  // One pointer target for the whole row (dogfood 2026-10-06). The name link
+  // stretches over the row, so a click anywhere opens the machine, and a
+  // middle click opens it in a new tab. The few controls with a tooltip or an
+  // action of their own sit above the stretch; a click on them still reaches
+  // the row handler below.
   return (
     <tr
       data-testid={`machine-row-${row.key}`}
@@ -597,11 +608,11 @@ function MachineTableRow({
         onOpen();
         navigate(href, { state: linkState });
       }}
-      className="cursor-pointer border-b border-border-faint last:border-0 hover:bg-surface-hover"
+      className="relative cursor-pointer border-b border-border-faint last:border-0 hover:bg-surface-hover"
     >
       {selectable && (
         <td
-          className="w-[28px] px-2.5 py-[9px] align-middle"
+          className="relative z-[1] w-[28px] px-2.5 py-[9px] align-middle"
           onClick={(e) => {
             e.stopPropagation();
             onToggle();
@@ -626,28 +637,44 @@ function MachineTableRow({
               onOpen();
             }}
             aria-label={`${row.name ?? 'No name'}, ${row.primary_ip}`}
+            data-testid={`machine-link-${row.key}`}
             className={cn(
-              'min-w-0 truncate text-[12.5px] hover:text-accent focus-visible:text-accent',
+              "min-w-0 break-words text-[12.5px] after:absolute after:inset-0 after:content-[''] hover:text-accent focus-visible:text-accent",
               row.name ? 'font-mono text-text' : 'italic text-faint',
             )}
           >
             {row.name ?? 'no name'}
           </Link>
-          <RowFlags row={row} />
+          <span className="relative z-[1]">
+            <RowFlags row={row} />
+          </span>
         </div>
         {row.name && source && (
           <div className="text-[10.5px] text-faint" title={nameSourceTitle(row.name_source)}>
             {source}
           </div>
         )}
+        {/* The sweep failure, in a sentence. The view printed
+            "<address>: TimeoutError:" (dogfood 2026-10-06). */}
+        {row.build_error && (
+          <div
+            data-testid={`machine-build-error-${row.key}`}
+            className="relative z-[1] text-[11px] leading-[1.4] text-danger"
+            title={row.build_error}
+          >
+            {sweepFailureSentence(row.build_error)}
+          </div>
+        )}
       </td>
       <td className="min-w-0 px-2.5 py-[9px] align-middle">
-        <AddressCell row={row} />
+        <span className="relative z-[1]">
+          <AddressCell row={row} />
+        </span>
       </td>
       <td className="min-w-0 px-2.5 py-[9px] align-middle">
         {row.agent ? (
           <div
-            className="min-w-0"
+            className="relative z-[1] min-w-0"
             title={
               row.agent.last_report
                 ? `The agent last reported ${absTime(row.agent.last_report)}.`
@@ -655,20 +682,19 @@ function MachineTableRow({
             }
           >
             <div className="flex min-w-0 items-center gap-1">
-              <span className="truncate font-mono text-[12px] text-text-2">{row.agent.name}</span>
+              <span className="break-all font-mono text-[12px] text-text-2">{row.agent.name}</span>
               {staleTitle && (
                 <span
                   data-testid={`agent-stale-${row.key}`}
-                  className="flex-none rounded-chip border px-1 py-px text-[9.5px] font-semibold text-warn"
+                  className="relative z-[1] flex-none rounded-chip border px-1 py-px text-[9.5px] font-semibold text-warn"
                   style={{ borderColor: 'rgba(210,153,34,.45)' }}
                   title={staleTitle}
-                  onClick={(e) => e.stopPropagation()}
                 >
                   stale
                 </span>
               )}
             </div>
-            {row.agent.os && <div className="truncate text-[10.5px] text-faint">{row.agent.os}</div>}
+            {row.agent.os && <div className="break-words text-[10.5px] text-faint">{row.agent.os}</div>}
           </div>
         ) : (
           <span className="text-[12px] text-faint" title="No agent reports from this machine.">
@@ -677,106 +703,24 @@ function MachineTableRow({
         )}
       </td>
       <td className="min-w-0 px-2.5 py-[9px] align-middle">
-        <RoleCell row={row} />
+        <span className="relative z-[1]">
+          <RoleCell row={row} />
+        </span>
       </td>
       <td className="px-2.5 py-[9px] text-right align-middle font-mono text-[12px] text-dim">
         {row.events.toLocaleString()}
       </td>
-      <td
-        className="px-2.5 py-[9px] text-right align-middle font-mono text-[11.5px] text-faint"
-        title={absolute(row.first_seen)}
-      >
-        {ago(row.first_seen)}
+      <td className="px-2.5 py-[9px] text-right align-middle font-mono text-[11.5px] text-faint">
+        <span className="relative z-[1]" title={absolute(row.first_seen)}>
+          {ago(row.first_seen)}
+        </span>
       </td>
-      <td
-        className="px-2.5 py-[9px] text-right align-middle font-mono text-[11.5px] text-faint"
-        title={absolute(row.last_seen)}
-      >
-        {ago(row.last_seen)}
+      <td className="px-2.5 py-[9px] text-right align-middle font-mono text-[11.5px] text-faint">
+        <span className="relative z-[1]" title={absolute(row.last_seen)}>
+          {ago(row.last_seen)}
+        </span>
       </td>
     </tr>
-  );
-}
-
-// ---- the broken-builds view -------------------------------------------------
-
-/**
- * The addresses the sweep is not getting through to: a build never ran, or
- * the last build failed. Build health is a fact about one address dossier, so
- * this view lists addresses. Each address links to its machine page.
- */
-function BrokenBuilds({ page, onPage }: { page: number; onPage: (page: number) => void }) {
-  const list = useAsync(
-    () =>
-      listDossiers({
-        health: 'broken',
-        limit: HOSTS_PAGE_SIZE,
-        offset: (page - 1) * HOSTS_PAGE_SIZE,
-      }),
-    [page],
-  );
-  const rows = list.data?.rows ?? [];
-  const total = list.data?.total ?? 0;
-  const from = total === 0 ? 0 : (page - 1) * HOSTS_PAGE_SIZE + 1;
-  const to = Math.min(page * HOSTS_PAGE_SIZE, total);
-  return (
-    <Panel>
-      <PanelHeader
-        icon={<AlertTriangle size={15} />}
-        title={list.data ? `Addresses with no clean build · ${total.toLocaleString()}` : 'Addresses with no clean build'}
-      />
-      {list.loading && !list.data ? (
-        <LoadingState label="Loading addresses…" />
-      ) : list.error ? (
-        <div className="p-3.5">
-          <ErrorState error={list.error} onRetry={list.refetch} label="the broken builds" />
-        </div>
-      ) : rows.length === 0 ? (
-        <EmptyState>Every address has a clean build.</EmptyState>
-      ) : (
-        <>
-          <table className="w-full table-fixed text-[12.5px]">
-            <thead className="border-b border-border bg-surface-2 text-[10.5px] uppercase tracking-[.06em] text-faint">
-              <tr>
-                <th scope="col" className="w-[22%] px-[15px] py-[9px] text-left font-semibold">
-                  Address
-                </th>
-                <th scope="col" className="px-2.5 py-[9px] text-left font-semibold">
-                  Build
-                </th>
-                <th scope="col" className="w-[14%] px-[15px] py-[9px] text-right font-semibold">
-                  Last built
-                </th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((r) => (
-                <tr key={r.ip} className="border-b border-border-faint last:border-0">
-                  <td className="px-[15px] py-[9px]">
-                    <Link
-                      to={`/hosts/${encodeURIComponent(r.ip)}`}
-                      className="font-mono text-text hover:text-accent"
-                    >
-                      {r.ip}
-                    </Link>
-                  </td>
-                  <td className="min-w-0 truncate px-2.5 py-[9px] font-mono text-[11.5px] text-text-2" title={r.build_error ?? undefined}>
-                    {r.build_error ?? (r.last_built_at == null ? 'never built' : 'failed')}
-                  </td>
-                  <td
-                    className="px-[15px] py-[9px] text-right font-mono text-[11.5px] text-faint"
-                    title={absolute(r.last_built_at)}
-                  >
-                    {r.last_built_at ? ago(r.last_built_at) : 'never'}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-          <Pager from={from} to={to} total={total} page={page} onPage={onPage} />
-        </>
-      )}
-    </Panel>
   );
 }
 
@@ -822,11 +766,28 @@ function Pager({
 
 // ---- filter vocabulary ------------------------------------------------------
 
-const BUCKET_LABELS: Record<string, string> = {
-  low_confidence: 'low confidence',
-  stale: 'stale',
-  unknown: 'unknown',
+/** The chip of each health filter. Each one is a part of Needs attention. */
+const HEALTH_CHIPS: Record<'attention' | 'stale' | 'broken', string> = {
+  attention: 'Needs attention',
+  stale: 'Out of date',
+  broken: 'Never built',
 };
+
+/**
+ * The panel title: the population the list shows. "37 machines" sat beside
+ * "Machines · 18" with nothing to say that the 18 were the active ones
+ * (dogfood 2026-10-06).
+ */
+export function listScope(total: number | null, machines: number | null, activeOnly: boolean): string {
+  if (total == null) return 'Machines';
+  if (machines == null || total === machines) return `Machines · ${total.toLocaleString()}`;
+  if (activeOnly) {
+    return `Showing ${total.toLocaleString()} active ${total === 1 ? 'machine' : 'machines'} of ${machines.toLocaleString()}.`;
+  }
+  return `Showing ${total.toLocaleString()} of ${plural(machines, 'machine')}.`;
+}
+
+const BUCKET_LABELS: Record<string, string> = ROLE_BUCKET_LABELS;
 
 function roleFilterLabel(role: string): string {
   return BUCKET_LABELS[role] ?? roleLabel(role);
@@ -896,9 +857,6 @@ export function Hosts() {
   const location = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
   const state = readListState(searchParams);
-  // The broken-builds view lives in the URL so the Needs attention card can be
-  // a door and the view can be shared.
-  const health = searchParams.get('health') === 'broken' ? ('broken' as const) : undefined;
 
   // One URL write per change. A change to anything but the page resets the
   // page to 1 in the same write, so a search from page 3 is one request.
@@ -933,10 +891,7 @@ export function Hosts() {
   }, [qInput]);
 
   const queryKey = JSON.stringify(machineQuery(state));
-  const list = useAsync(
-    () => (health ? Promise.resolve(null) : listMachines(machineQuery(state))),
-    [queryKey, health],
-  );
+  const list = useAsync(() => listMachines(machineQuery(state)), [queryKey]);
 
   // The cards: counts over the whole census, never the page.
   const kpis = useAsync(() => getMachineSummary(), []);
@@ -963,12 +918,15 @@ export function Hosts() {
   // queue, not this page.
   const conflicts = useAsync(() => getDossierConflicts(), []);
   const pending = conflicts.data?.pending ?? 0;
-  // The Dashboard nudge and the Conflicts card deep-link with ?conflicts=1.
-  const [showConflicts, setShowConflicts] = useState(() => searchParams.get('conflicts') === '1');
+  // The Dashboard nudge deep-links with ?conflicts=1. The Conflicts card
+  // filters the list with conflict=yes and opens the queue too.
+  const [showConflicts, setShowConflicts] = useState(
+    () => searchParams.get('conflicts') === '1' || state.conflict === 'yes',
+  );
   const conflictsParam = searchParams.get('conflicts');
   useEffect(() => {
-    if (conflictsParam === '1') setShowConflicts(true);
-  }, [conflictsParam]);
+    if (conflictsParam === '1' || state.conflict === 'yes') setShowConflicts(true);
+  }, [conflictsParam, state.conflict]);
 
   // The SPA's only role source. The mutating dossier routes are admin-gated.
   const [me, setMe] = useState<Me | null>(null);
@@ -1238,7 +1196,7 @@ export function Hosts() {
   const wireRoles = census.data?.role_vocabulary;
   const bulkRoleOptions = useMemo(
     () => [
-      { value: '', label: 'choose…' },
+      { value: '', label: 'choose' },
       ...[...roleVocabulary(wireRoles)].sort().map((r) => ({ value: r, label: roleLabel(r) })),
     ],
     [wireRoles],
@@ -1279,16 +1237,18 @@ export function Hosts() {
     update({ sort: key, dir });
     views.clearActive();
   };
-  const clearHealth = () => {
-    const next = new URLSearchParams(searchParams);
-    next.delete('health');
-    next.delete('page');
-    setSearchParams(next, { replace: true });
-  };
   const clearFilters = () => {
     setQInput('');
     lastWritten.current = '';
-    setFilter({ q: null, role: null, agent: null, seen: null, declared: null });
+    setFilter({
+      q: null,
+      role: null,
+      agent: null,
+      seen: null,
+      declared: null,
+      health: null,
+      conflict: null,
+    });
   };
 
   const summary = refresh.data?.summary ?? null;
@@ -1316,7 +1276,15 @@ export function Hosts() {
   // CENSUS, never on the page's own total. A census that is swept but quiet is
   // "no machines match", not "the sweep hasn't run". A failed list read is an
   // error with Retry, never the first-run panel.
-  const narrowed = !!(state.q || state.role || state.agent || state.seen || state.declared || health);
+  const narrowed = !!(
+    state.q ||
+    state.role ||
+    state.agent ||
+    state.seen ||
+    state.declared ||
+    state.health ||
+    state.conflict
+  );
   const firstRun = !!census.data && census.data.hosts === 0 && !narrowed && !list.error;
 
   const showSweepErrors = !running && sweepDegraded;
@@ -1330,6 +1298,8 @@ export function Hosts() {
   if (state.declared) {
     activeChips.push({ key: 'declared', label: state.declared === 'yes' ? 'Declared by an operator' : 'Not declared' });
   }
+  if (state.health) activeChips.push({ key: 'health', label: HEALTH_CHIPS[state.health] });
+  if (state.conflict) activeChips.push({ key: 'conflict', label: 'A declaration and the sweep disagree' });
 
   const machines = kpis.data?.machines;
   const addresses = kpis.data?.addresses;
@@ -1347,7 +1317,7 @@ export function Hosts() {
             ? `${plural(machines, 'machine')} · ${plural(addresses, 'address', 'addresses')}`
             : kpis.error
               ? 'The machine count could not be read.'
-              : 'Counting machines…'}
+              : <LoadingInline>Counting machines</LoadingInline>}
         </div>
         <div className="mt-0.5 max-w-[760px] text-[13px] text-dim">
           One row is one machine. A machine holds every address that soc-ai ties to one device.
@@ -1361,7 +1331,7 @@ export function Hosts() {
 
       {/* The shared list toolbar. Hidden on first run. The toolbar holds the
           bulk bar and stays on screen while the operator selects rows. */}
-      {!firstRun && !health && (
+      {!firstRun && (
         <div
           data-testid="hosts-toolbar"
           className={cn(selecting && 'sticky top-0 z-20 bg-bg pb-1 shadow-[0_1px_0_rgba(0,0,0,.4)]')}
@@ -1380,7 +1350,7 @@ export function Hosts() {
                 setQInput(v);
                 views.clearActive();
               },
-              placeholder: 'Search name, address, MAC, OS, role, agent…',
+              placeholder: 'Search name, address, MAC, OS, role, agent',
               label: 'Search hosts',
               fitPlaceholder: true,
             }}
@@ -1408,7 +1378,7 @@ export function Hosts() {
                           <Select
                             value={bulkValue}
                             options={[
-                              { value: '', label: 'choose…' },
+                              { value: '', label: 'choose' },
                               ...CRITICALITIES.map((c) => ({ value: c, label: c })),
                             ]}
                             onChange={setBulkValue}
@@ -1432,7 +1402,7 @@ export function Hosts() {
                           style={{ background: 'rgba(75,139,245,.14)', borderColor: 'rgba(75,139,245,.4)' }}
                         >
                           <UserCheck size={12} />
-                          {bulkBusy ? 'Declaring…' : `Declare (${sel.count})`}
+                          {bulkBusy ? 'Declaring' : `Declare (${sel.count})`}
                         </button>
                       </>
                     ),
@@ -1453,7 +1423,7 @@ export function Hosts() {
                       className="flex items-center gap-1.5 rounded-[7px] border border-warn/40 px-[11px] py-1.5 text-[12.5px] font-semibold text-warn hover:bg-warn/10 disabled:opacity-60"
                     >
                       {undoBusy
-                        ? 'Undoing…'
+                        ? 'Undoing'
                         : `Undo ${lastBulk.field} "${lastBulk.value}" (${lastBulk.prior.length})`}
                     </button>
                   )}
@@ -1466,7 +1436,7 @@ export function Hosts() {
                     className="flex items-center gap-1.5 rounded-[7px] border border-border-strong px-[11px] py-1.5 text-[12.5px] font-semibold text-dim hover:text-text disabled:opacity-60"
                   >
                     <RefreshCw size={12} className={running || starting ? 'animate-spin' : ''} />
-                    {running ? 'Rebuilding…' : 'Rebuild now'}
+                    {running ? 'Rebuilding' : 'Rebuild now'}
                   </button>
                 </>
               ) : undefined
@@ -1543,8 +1513,8 @@ export function Hosts() {
               {sweepErrors.length > 0 && (
                 <ul className="mt-1.5 max-w-[760px] space-y-0.5 text-[11.5px] text-dim">
                   {sweepErrors.slice(0, SHOWN_ERRORS).map((e, i) => (
-                    <li key={i} className="truncate font-mono" title={e}>
-                      {e}
+                    <li key={i} className="break-words" title={e}>
+                      {sweepFailureSentence(e)}
                     </li>
                   ))}
                   {sweepErrors.length > SHOWN_ERRORS && (
@@ -1574,9 +1544,8 @@ export function Hosts() {
           summary={kpis.data}
           failed={kpis.error != null}
           linkFor={(patch) => listHref({ sort: state.sort, dir: state.dir, ...patch })}
-          brokenHref={BROKEN_HREF}
-          conflictsHref={CONFLICTS_HREF}
           scheduleEnabled={census.data ? census.data.schedule_enabled : null}
+          searchActive={!!state.q}
         />
       )}
 
@@ -1589,7 +1558,7 @@ export function Hosts() {
               onClick={() => setShowConflicts((v) => !v)}
               className="flex min-w-0 flex-1 items-center gap-2.5 text-left"
             >
-              <span className="min-w-0 truncate font-semibold text-text-2">
+              <span className="min-w-0 break-words font-semibold text-text-2">
                 {pending} disagreement{pending === 1 ? '' : 's'} need{pending === 1 ? 's' : ''}{' '}
                 review
               </span>
@@ -1612,23 +1581,6 @@ export function Hosts() {
               )}
             </div>
           )}
-        </div>
-      )}
-
-      {/* The broken-builds view names itself, with the way back. */}
-      {health && (
-        <div className="mb-3.5 flex flex-wrap items-center gap-3 rounded-card border border-danger/30 bg-danger/[0.05] px-3.5 py-2.5 text-[12.5px] text-text-2">
-          <AlertTriangle size={13} className="flex-none text-danger" />
-          <span className="min-w-0 flex-1">
-            This view shows the addresses the sweep is not getting through to. A build never ran,
-            or the last build failed.
-          </span>
-          <button
-            onClick={clearHealth}
-            className="flex-none rounded-control border border-border-strong bg-surface-3 px-2.5 py-1 text-[11.5px] font-semibold text-text-2 hover:text-text"
-          >
-            Show all machines
-          </button>
         </div>
       )}
 
@@ -1683,7 +1635,7 @@ export function Hosts() {
                 >
                   <RefreshCw size={12} className={sweepInFlight ? 'animate-spin' : ''} />
                   {sweepInFlight
-                    ? 'Sweeping…'
+                    ? 'Sweeping'
                     : sweepDegraded
                       ? 'Try the sweep again'
                       : sweepUnreadable
@@ -1706,13 +1658,31 @@ export function Hosts() {
             </div>
           </EmptyState>
         </Panel>
-      ) : health ? (
-        <BrokenBuilds page={state.page} onPage={(page) => update({ page })} />
       ) : (
         <Panel>
           <PanelHeader
             icon={<Server size={15} />}
-            title={listData ? `Machines · ${total.toLocaleString()}` : 'Machines'}
+            title={
+              <span data-testid="hosts-list-scope">
+                {listScope(listData ? total : null, machines ?? null, state.activity === 'active' && !narrowed)}
+                {listData &&
+                  machines != null &&
+                  total < machines &&
+                  state.activity === 'active' &&
+                  !narrowed && (
+                    <>
+                      {' '}
+                      <button
+                        type="button"
+                        onClick={() => setFilter({ activity: 'all' })}
+                        className="normal-case text-accent underline-offset-2 hover:underline"
+                      >
+                        Show all.
+                      </button>
+                    </>
+                  )}
+              </span>
+            }
           />
           <div className="overflow-x-auto">
             <table data-testid="hosts-table" className="w-full table-fixed border-collapse text-[12.5px]">
@@ -1742,6 +1712,12 @@ export function Hosts() {
                             groups={[
                               {
                                 label: 'Role',
+                                note:
+                                  menuCounts == null
+                                    ? undefined
+                                    : menuActivity === 'active'
+                                      ? `Counts in this list of ${plural(menuCounts.machines, 'machine')} with events.`
+                                      : `Counts across all ${plural(menuCounts.machines, 'machine')}.`,
                                 value: state.role,
                                 options: roleOptions(menuCounts, state.role),
                                 onChange: (v) => setFilter({ role: v || null }),
@@ -1813,7 +1789,7 @@ export function Hosts() {
                 {list.loading && !listData ? (
                   <tr>
                     <td colSpan={COLUMNS.length + (isAdmin ? 1 : 0)}>
-                      <LoadingState label="Loading machines…" />
+                      <LoadingState label="Loading machines" />
                     </td>
                   </tr>
                 ) : list.error ? (

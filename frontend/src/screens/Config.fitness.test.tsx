@@ -388,7 +388,7 @@ describe('a staged, unapplied model pick is not graded', () => {
       await act(() => vi.advanceTimersByTimeAsync(700));
       // The mount probe for the applied model is in flight…
       expect(vi.mocked(getModelFitness)).toHaveBeenCalledTimes(1);
-      expect(screen.getByText('Checking fitness…')).toBeTruthy();
+      expect(screen.getByText('Checking fitness')).toBeTruthy();
 
       // …when the operator moves the dropdown to a staged pick, and only then
       // does the old answer arrive.
@@ -398,7 +398,7 @@ describe('a staged, unapplied model pick is not graded', () => {
       });
 
       expect(screen.queryByTestId('fitness-chip')).toBeNull();
-      expect(screen.queryByText('Checking fitness…')).toBeNull();
+      expect(screen.queryByText('Checking fitness')).toBeNull();
     } finally {
       vi.useRealTimers();
     }

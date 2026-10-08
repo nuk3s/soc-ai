@@ -252,6 +252,21 @@ def test_search_never_matches_an_address_in_the_middle(estate: TestClient) -> No
     assert _list(estate, q="1.13")["total"] == 0
 
 
+def test_search_matches_whole_parts_of_an_address(estate: TestClient) -> None:
+    """Dogfood 2026-10-06: ".31" found nothing beside 192.0.2.31.
+
+    An analyst half remembers the last parts of an address. A run of whole
+    parts matches anywhere in it, below a prefix match.
+    """
+    assert _keys(_list(estate, q=".119")) == ["agent:a-proxy"]
+    assert _keys(_list(estate, q="0.119")) == ["agent:a-proxy"]
+    assert _keys(_list(estate, q="99.1")) == ["agent:a-proxy"]
+    assert _keys(_list(estate, q="1.135")) == ["mac:02:00:5e:10:00:27"]
+    # NEGATIVE CONTROL: a part cut through the middle still finds nothing.
+    assert _list(estate, q=".11")["total"] == 0
+    assert _list(estate, q="9.1")["total"] == 0
+
+
 def test_search_reads_the_mac_the_os_the_role_and_the_agent(estate: TestClient) -> None:
     assert _keys(_list(estate, q="02-00-5E-10")) == ["mac:02:00:5e:10:00:27"]
     assert _keys(_list(estate, q="02:00:5e:10:00:27")) == ["mac:02:00:5e:10:00:27"]
@@ -446,6 +461,8 @@ def test_every_summary_count_equals_its_list_total(estate: TestClient) -> None:
     assert summary["unnamed"] == total(named="no")
     assert summary["needs_attention"] == total(health="attention")
     assert summary["never_built"] == total(health="broken")
+    assert summary["out_of_date"] == total(health="stale")
+    assert summary["needs_attention"] == summary["out_of_date"] + summary["never_built"]
     assert summary["conflicts"] == total(conflict="yes")
     for slug, count in summary["roles"].items():
         assert count == total(role=slug), slug
@@ -456,6 +473,38 @@ def test_every_summary_count_equals_its_list_total(estate: TestClient) -> None:
     assert summary["addresses"] == 7
     assert summary["conflicts"] == 1
     assert summary["never_built"] == 1
+
+
+def test_the_out_of_date_part_is_a_clean_build_past_the_window(estate: TestClient) -> None:
+    """The Needs attention card read "37" over a click that listed 3 rows.
+
+    Its two parts list on their own: the quiet machine was built nine days
+    ago, and the unnamed address was never built.
+    """
+    assert _keys(_list(estate, activity="all", health="stale")) == ["ip:10.60.0.9"]
+    assert _keys(_list(estate, activity="all", health="broken")) == ["ip:10.60.0.10"]
+    # NEGATIVE CONTROL: a never-built machine is not also out of date.
+    assert "ip:10.60.0.10" not in _keys(_list(estate, activity="all", health="stale"))
+
+
+def test_a_failed_build_rides_on_the_machine_row(estate: TestClient) -> None:
+    """The list states the sweep error of a machine with no clean build."""
+
+    async def _run() -> None:
+        maker = estate.app.state.db_sessionmaker  # type: ignore[attr-defined]
+        async with maker() as db:
+            await db.execute(
+                update(HostDossier)
+                .where(HostDossier.ip == "10.60.0.10")
+                .values(build_error="10.60.0.10: TimeoutError:")
+            )
+            await db.commit()
+
+    asyncio.run(_run())
+    rows = {row["key"]: row for row in _list(estate, activity="all")["rows"]}
+    assert rows["ip:10.60.0.10"]["build_error"] == "10.60.0.10: TimeoutError:"
+    # NEGATIVE CONTROL: a machine with a clean build carries no error.
+    assert rows["agent:a-proxy"]["build_error"] is None
 
 
 def test_the_summary_counts_under_the_list_activity(estate: TestClient) -> None:

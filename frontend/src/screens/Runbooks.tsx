@@ -14,11 +14,11 @@ import {
   updateRunbook,
 } from '../lib/api';
 import { Markdown } from '../components/Markdown';
-import { middleEllipsis } from '../lib/text';
 import { mdToPlainExcerpt } from '../lib/mdExcerpt';
 import { ErrorState, LoadingState, Spinner } from '../components/States';
+import { absoluteTime, ago } from '../lib/timeRange';
 import { useAsync } from '../lib/useAsync';
-import { dominantVerdictLabel, formatVerdictMix } from '../lib/verdictMix';
+import { dominantVerdictLabel, dominantVerdictTitle, formatVerdictMix } from '../lib/verdictMix';
 
 // ---------------------------------------------------------------------------
 // Runbooks — the first-class authoring space for the org's own triage
@@ -425,7 +425,7 @@ export function Runbooks() {
             className="rounded-[7px] border px-[13px] py-1.5 text-[12px] font-semibold disabled:cursor-not-allowed disabled:opacity-50"
             style={{ borderColor: '#f5a623', color: '#f5a623' }}
           >
-            {busy ? 'Working…' : 'Approve'}
+            {busy ? 'Working' : 'Approve'}
           </button>
         </div>
       )}
@@ -497,7 +497,7 @@ export function Runbooks() {
           disabled={busy || !draft.title.trim()}
           className="rounded-[7px] border border-accent px-[13px] py-1.5 text-[12px] font-semibold text-accent disabled:cursor-not-allowed disabled:opacity-50"
         >
-          {busy ? 'Saving…' : editing === 'new' ? 'Create runbook' : 'Save changes'}
+          {busy ? 'Saving' : editing === 'new' ? 'Create runbook' : 'Save changes'}
         </button>
         <button
           onClick={cancel}
@@ -551,7 +551,7 @@ export function Runbooks() {
           className={toolbarBtnCls}
         >
           <FileUp size={13} />
-          Import files…
+          Import files
         </button>
         <button
           onClick={() => void loadPack()}
@@ -605,8 +605,8 @@ export function Runbooks() {
               key={r.rule_name}
               className="flex flex-wrap items-center gap-2.5 border-t border-border-faint py-2 first:border-t-0"
             >
-              <span className="min-w-0 flex-1 truncate text-[12.5px] font-medium" title={r.rule_name}>
-                {middleEllipsis(r.rule_name)}
+              <span className="min-w-0 flex-1 break-words text-[12.5px] font-medium" title={r.rule_name}>
+                {r.rule_name}
               </span>
               <span className="text-[11.5px] text-faint">
                 {r.investigations} investigation{r.investigations === 1 ? '' : 's'} ·{' '}
@@ -614,7 +614,7 @@ export function Runbooks() {
               </span>
               <span
                 className="rounded border border-border-strong bg-surface-3 px-1.5 py-0.5 text-[10.5px] text-dim"
-                title={`dominant verdict: ${r.dominant_verdict}`}
+                title={dominantVerdictTitle(r.dominant_verdict)}
               >
                 {dominantVerdictLabel(r.dominant_verdict)}
               </span>
@@ -629,7 +629,7 @@ export function Runbooks() {
                 className={toolbarBtnCls}
               >
                 {draftingRule === r.rule_name ? <Spinner size={12} /> : <History size={13} />}
-                {draftingRule === r.rule_name ? 'Drafting…' : 'Draft it'}
+                {draftingRule === r.rule_name ? 'Drafting' : 'Draft it'}
               </button>
             </div>
           ))}
@@ -671,7 +671,7 @@ export function Runbooks() {
           <input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder={`Search ${runbooks.length} runbook${runbooks.length === 1 ? '' : 's'}…`}
+            placeholder={`Search ${runbooks.length} runbook${runbooks.length === 1 ? '' : 's'}`}
             className="mb-2 w-full flex-none rounded-control border border-border-input bg-bg px-3 py-1.5 text-[12.5px] text-text outline-none focus:border-accent"
           />
           <div className="overflow-hidden rounded-card border border-border bg-surface-1 lg:flex-1 lg:overflow-y-auto">
@@ -711,18 +711,30 @@ export function Runbooks() {
                       className="min-w-0 flex-1 text-left disabled:cursor-default"
                     >
                       <div className="flex flex-wrap items-center gap-2">
-                        <span className="truncate text-[13px] font-medium" title={rb.title}>
+                        <span className="break-words text-[13px] font-medium" title={rb.title}>
                           {rb.title}
                         </span>
                         {rb.draft && <DraftChip />}
                         <EmbedChip rb={rb} />
-                        <span className="text-[10.5px] text-faint">
-                          updated {new Date(rb.updated_at).toLocaleString()}
+                        <span
+                          className="text-[10.5px] text-faint"
+                          title={absoluteTime(rb.updated_at)}
+                          data-testid={`runbook-updated-${rb.id}`}
+                        >
+                          updated {ago(rb.updated_at)}
                         </span>
                       </div>
                       {preview && (
-                        <div className="mt-0.5 line-clamp-2 text-[11.5px] leading-[1.4] text-faint">
-                          {/* a 2-line clamp is no place for raw markdown syntax */}
+                        // The body of a runbook runs to pages, so the row
+                        // shows its first three lines and the hover holds the
+                        // whole text. The box stops at the line edge and draws
+                        // no ellipsis (owner, 2026-10-07). The row opens the
+                        // runbook.
+                        <div
+                          data-testid={`runbook-preview-${rb.id}`}
+                          title={preview}
+                          className="mt-0.5 max-h-[4.2em] overflow-hidden break-words text-[11.5px] leading-[1.4] text-faint"
+                        >
                           {preview}
                         </div>
                       )}

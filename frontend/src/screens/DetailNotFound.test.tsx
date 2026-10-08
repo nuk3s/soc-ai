@@ -106,11 +106,11 @@ describe('an unknown id is a calm answer, not an alarm', () => {
   it('investigation: a 404 explains and offers the list, with no Retry', async () => {
     vi.mocked(getInvestigation).mockImplementation(notFound);
     mountInvestigation();
-    const card = (await screen.findByText(/No such investigation/i)).parentElement!;
+    const card = (await screen.findByText(/Nothing here has the id/i)).parentElement!;
     // The id the analyst typed or bookmarked, echoed back — "no such thing" is
     // only useful if it names the thing.
     expect(card.textContent).toContain('INV-nope');
-    expect(card.textContent).toMatch(/Back to Alerts/);
+    expect(card.textContent).toMatch(/Back to Investigations/);
     expect(screen.queryByText(/Could not load/i)).toBeNull();
     expect(screen.queryByRole('button', { name: /retry/i })).toBeNull();
   });

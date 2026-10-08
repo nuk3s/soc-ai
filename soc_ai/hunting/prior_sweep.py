@@ -419,12 +419,17 @@ def _log_blind(notes: dict[str, str], reasons: dict[str, str]) -> None:
 
 
 def clip_reason(reason: str | None) -> str | None:
-    """A reason cut to the length the trail column holds. None for nothing."""
+    """A reason cut to the length the trail column holds. None for nothing.
+
+    The column is ``String(255)``, so a longer reason is cut at the last word
+    that fits. No ellipsis goes on: the owner banned it (2026-10-07).
+    """
     if not reason:
         return None
     if len(reason) <= _REASON_CHARS:
         return reason
-    return reason[: _REASON_CHARS - 3] + "..."
+    cut = reason[:_REASON_CHARS]
+    return (cut.rpartition(" ")[0] or cut).rstrip()
 
 
 @dataclass(frozen=True)

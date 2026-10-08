@@ -125,9 +125,9 @@ BUDGET_PER_100_HOST_DAYS = 1.0
 # The normal quantile of a two-sided 95 percent interval.
 _Z95 = 1.959963984540054
 # How many hosts the report names per analytic, and how many errors per hour.
+# Each kept error is whole.
 _TOP_HOSTS = 5
 _ERRORS_KEPT = 3
-_ERROR_CHARS = 300
 # Rows per insert when the census is copied into the scratch store.
 _SEED_CHUNK = 500
 
@@ -953,10 +953,6 @@ def _naive(at: datetime) -> datetime:
     return at.astimezone(UTC).replace(tzinfo=None)
 
 
-def _short(text: str) -> str:
-    return text if len(text) <= _ERROR_CHARS else text[: _ERROR_CHARS - 3] + "..."
-
-
 def _capped(row: AnalyticRow, notes: set[str]) -> bool:
     """Whether a read of the analytic stopped at its entity ceiling on this sweep.
 
@@ -1018,9 +1014,7 @@ class _Tally:
             self.unread_hour(hour, list(sweep.errors))
 
     def unread_hour(self, hour: datetime, errors: Sequence[str]) -> None:
-        self.unread.append(
-            {"hour": hour.isoformat(), "errors": [_short(e) for e in errors[:_ERRORS_KEPT]]}
-        )
+        self.unread.append({"hour": hour.isoformat(), "errors": list(errors[:_ERRORS_KEPT])})
 
     async def close_day(
         self, maker: async_sessionmaker[Any], start: datetime, end: datetime
@@ -1083,7 +1077,7 @@ class _Run:
                 )
                 stage.detail = f"{build.written} rows, {len(build.errors)} errors"
             day.build_rows = build.written
-            day.build_errors = [_short(e) for e in build.errors[:_ERRORS_KEPT]]
+            day.build_errors = list(build.errors[:_ERRORS_KEPT])
         unread_before = len(self.tally.unread)
         with clock.stage("sweeps") as stage:
             for offset in range(24):

@@ -1,9 +1,10 @@
-import { useState, type ReactNode } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 
 import {
   getAnalyticHits,
   getHuntCatalog,
+  markObservationBenign,
   markShadowHitRead,
   setAnalyticStatus,
   startHuntConsole,
@@ -33,10 +34,11 @@ import {
 } from '../lib/tooltips';
 import { useAsync } from '../lib/useAsync';
 import { AnalyticDrawer } from './AnalyticDrawer';
+import { DISMISS_REASONS, REASON_LABEL } from './LeadsStrip';
 import { Definition } from './Definition';
 import { DocumentChip } from './DocumentDrawer';
 import { CollapseChevron, Panel } from './Panel';
-import { StaleNotice } from './States';
+import { LoadingInline, StaleNotice } from './States';
 
 // ---------------------------------------------------------------------------
 // Analytic hits — every hit an analytic wrote in the last 7 days, live and
@@ -225,6 +227,97 @@ function keyPath(kind: string, key: string): string {
   return pathOfEntity(kind, key);
 }
 
+/** The documents a hit counts: the receipts of a shadow hit, else the ids
+ *  the server stores on the row. W2: a live hit carries no receipts, so
+ *  "Show evidence" read "No evidence." over a row that counted three
+ *  documents. */
+export function hitDocumentIds(hit: AnalyticHit): string[] {
+  const matched = hit.receipts?.matched_ids ?? [];
+  return matched.length > 0 ? matched : (hit.document_ids ?? []);
+}
+
+/** The title of an analytic the catalog no longer lists. The sweep wrote the
+ *  title at the head of the summary: "<title>: <entity> (n documents)". A
+ *  summary in another shape leaves the id in words. C7: the card showed the
+ *  slug "prior-defender-adjudication-on-server". */
+export function removedAnalyticTitle(hit: AnalyticHit): string {
+  const summary = (hit.summary ?? '').trim();
+  const cut = summary.indexOf(`: ${hit.entity_key}`);
+  if (cut > 0) return summary.slice(0, cut);
+  const words = hit.analytic_id.replace(/[-_]+/g, ' ').trim();
+  return words ? words.charAt(0).toUpperCase() + words.slice(1) : hit.analytic_id;
+}
+
+/** The reason form for "Mark benign". It opens with no reason chosen, and it
+ *  offers the reasons a lead dismissal offers, so the sharpening loop reads
+ *  one list. */
+function BenignForm({
+  hitId,
+  onDone,
+  onCancel,
+}: {
+  hitId: number;
+  onDone: () => void;
+  onCancel: () => void;
+}) {
+  const [reason, setReason] = useState('');
+  const [note, setNote] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [failed, setFailed] = useState<string | null>(null);
+  const selectId = `benign-reason-${hitId}`;
+  const confirm = async () => {
+    setBusy(true);
+    setFailed(null);
+    try {
+      await markObservationBenign(hitId, reason, note || undefined);
+      onDone();
+    } catch (e) {
+      setFailed(e instanceof Error && e.message ? e.message : 'The hit was not marked benign.');
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="col-span-2 flex flex-wrap items-center gap-2 text-[12px]" data-testid="benign-form">
+      <span className="basis-full text-[11.5px] text-dim">
+        The hit is marked benign with this reason. It counts toward no lead.
+      </span>
+      <label htmlFor={selectId}>Reason</label>
+      <select
+        id={selectId}
+        value={reason}
+        onChange={(e) => setReason(e.target.value)}
+        className="rounded-control border border-border bg-surface-2 px-2 py-1"
+      >
+        <option value="">Choose a reason</option>
+        {DISMISS_REASONS.map((r) => (
+          <option key={r} value={r}>
+            {REASON_LABEL[r] ?? r}
+          </option>
+        ))}
+      </select>
+      <input
+        value={note}
+        onChange={(e) => setNote(e.target.value)}
+        placeholder="Note, optional"
+        className="min-w-[200px] flex-1 rounded-control border border-border bg-surface-2 px-2 py-1"
+      />
+      <button
+        type="button"
+        disabled={!reason || busy}
+        onClick={() => void confirm()}
+        className="rounded-control bg-accent px-3 py-1 font-semibold text-white disabled:opacity-50"
+      >
+        Confirm benign
+      </button>
+      <button type="button" onClick={onCancel} className="text-dim">
+        Cancel
+      </button>
+      {failed && <span className="basis-full text-[11.5px] text-danger">{failed}</span>}
+    </div>
+  );
+}
+
 /** One labelled group inside the evidence panel. The panel was three
  *  unlabelled lines, so an analyst could not tell the dry run from the
  *  overlap. */
@@ -245,11 +338,11 @@ function Group({ label, children }: { label: string; children: ReactNode }) {
  * an overlapping analytic reaches its drawer on the Analytics tab.
  */
 function Evidence({ hit }: { hit: AnalyticHit }) {
-  const r = hit.receipts!;
-  const ids = r.matched_ids ?? [];
-  const dry = r.dry_run;
+  const r = hit.receipts;
+  const ids = hitDocumentIds(hit);
+  const dry = r?.dry_run;
   const entities = dry?.entities ?? [];
-  const overlap = r.overlap ?? [];
+  const overlap = r?.overlap ?? [];
   return (
     <div
       data-testid="analytic-hit-evidence"
@@ -292,7 +385,7 @@ function Evidence({ hit }: { hit: AnalyticHit }) {
           ))}
         </Group>
       )}
-      {r.baseline && (
+      {r?.baseline && (
         <Group label="Baseline">
           <span className="whitespace-pre-wrap break-all font-mono text-dim">
             {JSON.stringify(r.baseline)}
@@ -352,6 +445,7 @@ function HitCard({
   const [open, setOpen] = useState(false);
   const [approving, setApproving] = useState(false);
   const [rejecting, setRejecting] = useState(false);
+  const [markingBenign, setMarkingBenign] = useState(false);
   const [why, setWhy] = useState('');
   const [busy, setBusy] = useState(false);
   const [failed, setFailed] = useState<string | null>(null);
@@ -373,6 +467,8 @@ function HitCard({
   // receipts is not a reason to call its hit unproven.
   const provable = hit.state === 'hit' && (recordedLive || (hit.receipts?.complete ?? false));
   const unread = !recordedLive && !read;
+  // An analyst marked the hit benign. It counts toward no lead.
+  const benign = Boolean(hit.dismissed_at);
 
   // A shadow hit is unread until the analyst opens its evidence or acts on it.
   // Every path calls this, so an analyst who hunts the entity without reading
@@ -435,6 +531,8 @@ function HitCard({
   // The stored summary first: the analytic wrote it about this instance. When
   // it repeats the two lines above it, the dry run is the fact that does not.
   const summary = summaryBody(hit) ?? dryRunLine(hit);
+  // The panel has something to show: receipts, or the ids of the documents.
+  const hasEvidence = Boolean(hit.receipts) || hitDocumentIds(hit).length > 0;
   const when = hit.first_seen_at ?? hit.born_at;
 
   return (
@@ -466,8 +564,12 @@ function HitCard({
           {removed ? (
             // No drawer can open an analytic the catalog does not list, so
             // the id is text and not a control.
-            <span data-testid="analytic-hit-title" className="font-mono text-[12.5px] text-dim">
-              {hit.analytic_id}
+            <span
+              data-testid="analytic-hit-title"
+              className="text-[13px] text-dim"
+              title={`Analytic ${hit.analytic_id}`}
+            >
+              {removedAnalyticTitle(hit)}
             </span>
           ) : (
             <button
@@ -549,13 +651,20 @@ function HitCard({
               </Link>
             </>
           ) : (
-            <Chip label="no lead" title={CHIP_NO_LEAD} tone="faint" />
+            <Chip label="no lead" title={hit.no_lead_reason ?? CHIP_NO_LEAD} tone="faint" />
           )}
         </div>
 
         {summary && (
           <div data-testid="analytic-hit-summary" className="mt-1.5 text-[12.5px] text-text-2">
             {summary}
+          </div>
+        )}
+        {benign && (
+          <div data-testid="analytic-hit-benign" className="mt-1.5 text-[11.5px] text-dim">
+            {`Marked benign${hit.dismissed_by ? ` by ${hit.dismissed_by}` : ''}: ${
+              REASON_LABEL[hit.dismissed_reason ?? ''] ?? hit.dismissed_reason
+            }. It counts toward no lead.`}
           </div>
         )}
         {!provable && (
@@ -566,16 +675,28 @@ function HitCard({
         )}
 
         <div className="mt-2 flex flex-wrap items-center gap-2">
-          <button
-            type="button"
-            onClick={toggleEvidence}
-            className="rounded-control border border-border-strong px-3 py-1 text-[11.5px] font-semibold"
-          >
-            {open ? 'Hide evidence' : 'Show evidence'}
-          </button>
-          <span className="text-[11px] text-dim">
-            {plural(hit.document_count, 'document id')}
-          </span>
+          {hasEvidence ? (
+            <>
+              <button
+                type="button"
+                onClick={toggleEvidence}
+                className="rounded-control border border-border-strong px-3 py-1 text-[11.5px] font-semibold"
+              >
+                {open ? 'Hide evidence' : 'Show evidence'}
+              </button>
+              <span className="text-[11px] text-dim">
+                {plural(hitDocumentIds(hit).length || hit.document_count, 'document id')}
+              </span>
+            </>
+          ) : (
+            // No id is stored, so a button would open an empty panel. The
+            // lead holds the documents when one holds the hit.
+            <span data-testid="analytic-hit-no-ids" className="text-[11.5px] text-dim">
+              {hit.lead_id !== null
+                ? `Open lead ${hit.lead_id} to read the documents.`
+                : 'soc-ai stored no document id for this hit.'}
+            </span>
+          )}
         </div>
         {failed && <div className="mt-1.5 text-[11.5px] text-warn">{failed}</div>}
       </div>
@@ -596,14 +717,28 @@ function HitCard({
             </span>
           </>
         ) : (
-          <button
-            type="button"
-            disabled={busy}
-            onClick={hunt}
-            className="rounded-control bg-accent px-3 py-1 text-[11.5px] font-semibold text-white disabled:opacity-50"
-          >
-            Hunt this entity
-          </button>
+          <>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={hunt}
+              className="rounded-control bg-accent px-3 py-1 text-[11.5px] font-semibold text-white disabled:opacity-50"
+            >
+              Hunt this entity
+            </button>
+            {/* C7: a live hit the analyst reads as benign. The only act was
+                a hunt, and five Windows updates each asked for one. */}
+            {recordedLive && !benign && (
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => setMarkingBenign((v) => !v)}
+                className="rounded-control border border-border-strong px-3 py-1 text-[11.5px] font-semibold disabled:opacity-50"
+              >
+                Mark benign
+              </button>
+            )}
+          </>
         )}
         {/* The decisions are about the analytic, so they follow its status.
             The card offered the approval on an analytic an analyst had approved
@@ -649,7 +784,17 @@ function HitCard({
         )}
       </div>
 
-      {open && (hit.receipts ? <Evidence hit={hit} /> : <div className="col-span-2 text-[11.5px] text-dim">No evidence.</div>)}
+      {open && hasEvidence && <Evidence hit={hit} />}
+      {markingBenign && (
+        <BenignForm
+          hitId={hit.id}
+          onCancel={() => setMarkingBenign(false)}
+          onDone={() => {
+            setMarkingBenign(false);
+            onChange();
+          }}
+        />
+      )}
       {(approving || rejecting) && (
         <div className="col-span-2 flex flex-wrap items-center gap-2 text-[12px]">
           {/* "Reject" named no outcome. The analytic is retired, it stops
@@ -746,6 +891,19 @@ export function AnalyticHits({
   const counts = served
     ? { ...served, unread: Math.max(0, served.unread - readHere) }
     : undefined;
+  // W1: with no unread hit the block folds to one line. The analyst opens
+  // the hits on request. A filter in the address is a request already, and a
+  // list with no hit keeps its empty-state sentence.
+  // The fold reads the server's counts. A hit read in this session does not
+  // fold the list under the hand that read it, and a list that once held an
+  // unread hit stays open.
+  const [showQuiet, setShowQuiet] = useState(false);
+  const servedUnread = served?.unread;
+  useEffect(() => {
+    if ((servedUnread ?? 0) > 0) setShowQuiet(true);
+  }, [servedUnread]);
+  const quiet =
+    !showQuiet && !wanted && served !== undefined && served.unread === 0 && served.all > 0;
   const markedRead = (id: number) =>
     setReadIds((prev) => {
       const next = new Set(prev);
@@ -796,6 +954,23 @@ export function AnalyticHits({
 
       {collapsed ? (
         <div id={BODY_ID} className="pb-2" />
+      ) : quiet ? (
+        // W1: no hit waits on the analyst, so the block is one line. Twelve
+        // read hits pushed the leads two screens down.
+        <div
+          id={BODY_ID}
+          data-testid="analytic-hits-quiet"
+          className="flex flex-wrap items-center gap-2 px-[15px] py-2.5 text-[12.5px] text-dim"
+        >
+          <span>{`${plural(counts?.all ?? 0, 'hit')} in 7 days. None waits on you.`}</span>
+          <button
+            type="button"
+            onClick={() => setShowQuiet(true)}
+            className="text-[12px] font-semibold text-accent hover:underline"
+          >
+            Show hits
+          </button>
+        </div>
       ) : (
         <div id={BODY_ID}>
       <div className="flex flex-wrap items-center gap-1.5 px-[15px] py-2">
@@ -837,7 +1012,7 @@ export function AnalyticHits({
 
       {!hits.data ? (
         <div className="px-[15px] py-2.5 text-[12.5px] text-dim">
-          {hits.error ? 'Could not read the analytic hits.' : 'Reading the analytic hits…'}
+          {hits.error ? 'Could not read the analytic hits.' : <LoadingInline>Reading the analytic hits</LoadingInline>}
         </div>
       ) : rows.length === 0 ? (
         // Absence is stated, with the reason it is not an all-clear.
@@ -877,7 +1052,7 @@ export function AnalyticHits({
                 title={SHOW_MORE_TOOLTIP}
                 className="rounded-control border border-border-strong px-3 py-1 text-[11.5px] font-semibold disabled:opacity-50"
               >
-                {hits.loading ? 'Reading…' : 'Show more'}
+                {hits.loading ? 'Reading' : 'Show more'}
               </button>
             )}
           </div>

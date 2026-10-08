@@ -1,99 +1,126 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="760" viewBox="0 0 1600 760" font-family="Inter, system-ui, -apple-system, Segoe UI, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="876" viewBox="0 0 1600 876" font-family="Inter, system-ui, -apple-system, Segoe UI, sans-serif">
 <defs><marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#58a6ff"/></marker><marker id="arrow-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#d29922"/></marker><marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3fb950"/></marker><marker id="arrow-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#a371f7"/></marker></defs>
-<rect width="1600" height="760" fill="#0d1117"/>
-<text x="32" y="40" font-size="22" font-weight="700" fill="#e6edf3">How hunting flows: analytic, hit, lead, hunt, investigation</text>
-<text x="32" y="60" font-size="13" fill="#8b949e">Left to right is the pipeline. Each box states what the thing is in one sentence. Blue: the flow. Purple: the verdict path. Green: a loop back to observations. Amber: what waits on you.</text>
-<rect x="32" y="92" width="280" height="228" rx="10" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
-<text x="48" y="120" font-size="18" font-weight="700" fill="#e6edf3">Analytic</text>
-<text x="296" y="119" font-size="11" font-weight="700" fill="#58a6ff" text-anchor="end" letter-spacing="1">RUNS</text>
-<text x="48" y="142" font-size="13" font-weight="600" fill="#e6edf3">One detection logic, as YAML.</text>
-<text x="48" y="164" font-size="12.5" fill="#8b949e">Runs on every sweep over the grid.</text>
-<text x="48" y="181" font-size="12.5" fill="#e6edf3">live: its hits count and form leads.</text>
-<text x="48" y="198" font-size="12.5" fill="#e6edf3">shadow: its hits are recorded and shown.</text>
-<text x="48" y="215" font-size="12.5" fill="#e6edf3">It raises nothing until you approve it.</text>
-<text x="48" y="232" font-size="12.5" fill="#8b949e">candidate → shadow → live → retired</text>
-<text x="48" y="249" font-size="12.5" fill="#8b949e">Screen: Hunts › Analytics tab.</text>
-<rect x="360" y="92" width="280" height="228" rx="10" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
-<text x="376" y="120" font-size="18" font-weight="700" fill="#e6edf3">Hit</text>
-<text x="624" y="119" font-size="11" font-weight="700" fill="#58a6ff" text-anchor="end" letter-spacing="1">FOUND</text>
-<text x="376" y="142" font-size="13" font-weight="600" fill="#e6edf3">One thing one analytic found</text>
-<text x="376" y="160" font-size="13" font-weight="600" fill="#e6edf3">on one entity.</text>
-<text x="376" y="182" font-size="12.5" fill="#8b949e">An observation with documents behind it.</text>
-<text x="376" y="199" font-size="12.5" fill="#e6edf3">A live hit counts. A shadow hit waits</text>
-<text x="376" y="216" font-size="12.5" fill="#e6edf3">for you: read it, then approve or</text>
-<text x="376" y="233" font-size="12.5" fill="#e6edf3">reject the analytic that wrote it.</text>
-<text x="376" y="250" font-size="12.5" fill="#8b949e">Alert verdicts and hunt findings write</text>
-<text x="376" y="267" font-size="12.5" fill="#8b949e">observations too, into the same table.</text>
-<text x="376" y="284" font-size="12.5" fill="#8b949e">Screen: Hunts › Analytic hits.</text>
-<rect x="688" y="92" width="280" height="228" rx="10" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
-<text x="704" y="120" font-size="18" font-weight="700" fill="#e6edf3">Lead</text>
-<text x="952" y="119" font-size="11" font-weight="700" fill="#58a6ff" text-anchor="end" letter-spacing="1">DECIDE</text>
-<text x="704" y="142" font-size="13" font-weight="600" fill="#e6edf3">Observations on one entity that</text>
-<text x="704" y="160" font-size="13" font-weight="600" fill="#e6edf3">are worth one decision.</text>
-<text x="704" y="182" font-size="12.5" fill="#8b949e">Forms at weight 0.85 over 2 types, or</text>
-<text x="704" y="199" font-size="12.5" fill="#8b949e">on a finding with no benign baseline,</text>
-<text x="704" y="216" font-size="12.5" fill="#8b949e">or on one type that repeats.</text>
-<text x="704" y="233" font-size="12.5" fill="#e6edf3">Its hunt starts on its own. You decide</text>
-<text x="704" y="250" font-size="12.5" fill="#e6edf3">after: Dismiss, or Promote.</text>
-<text x="704" y="267" font-size="12.5" fill="#8b949e">Related leads: same analytic, address</text>
-<text x="704" y="284" font-size="12.5" fill="#8b949e">or technique in the last 7 days.</text>
-<text x="704" y="301" font-size="12.5" fill="#8b949e">Screen: Hunts › Leads, the lead page.</text>
-<rect x="1016" y="92" width="280" height="228" rx="10" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
-<text x="1032" y="120" font-size="18" font-weight="700" fill="#e6edf3">Hunt</text>
-<text x="1280" y="119" font-size="11" font-weight="700" fill="#58a6ff" text-anchor="end" letter-spacing="1">RUN</text>
-<text x="1032" y="142" font-size="13" font-weight="600" fill="#e6edf3">One agent run with an objective.</text>
-<text x="1032" y="164" font-size="12.5" fill="#8b949e">Started by a lead, a schedule or you.</text>
-<text x="1032" y="181" font-size="12.5" fill="#e6edf3">Ends in findings and a narrative.</text>
-<text x="1032" y="198" font-size="12.5" fill="#e6edf3">It gives findings, not a verdict.</text>
-<text x="1032" y="215" font-size="12.5" fill="#8b949e">A finding names an entity and cites</text>
-<text x="1032" y="232" font-size="12.5" fill="#8b949e">documents, or names a gap.</text>
-<text x="1032" y="249" font-size="12.5" fill="#8b949e">Screen: Hunts › Hunts, the hunt page.</text>
-<rect x="1344" y="92" width="224" height="228" rx="10" fill="#161b22" stroke="#a371f7" stroke-width="1.5"/>
-<text x="1360" y="120" font-size="18" font-weight="700" fill="#e6edf3">Investigation</text>
-<text x="1552" y="119" font-size="11" font-weight="700" fill="#a371f7" text-anchor="end" letter-spacing="1">VERDICT</text>
-<text x="1360" y="142" font-size="13" font-weight="600" fill="#e6edf3">One agent run that ends</text>
-<text x="1360" y="160" font-size="13" font-weight="600" fill="#e6edf3">in a verdict.</text>
-<text x="1360" y="182" font-size="12.5" fill="#8b949e">true positive · false positive ·</text>
-<text x="1360" y="199" font-size="12.5" fill="#8b949e">needs more info, with confidence.</text>
-<text x="1360" y="216" font-size="12.5" fill="#e6edf3">Its subject is one alert, or one</text>
-<text x="1360" y="233" font-size="12.5" fill="#e6edf3">hunt with all its findings.</text>
-<text x="1360" y="250" font-size="12.5" fill="#8b949e">Triage is the run. This is its record.</text>
-<text x="1360" y="267" font-size="12.5" fill="#8b949e">Screen: Investigations.</text>
-<path d="M 312,187 L 360,187" fill="none" stroke="#58a6ff" stroke-width="2" marker-end="url(#arrow-blue)"/>
-<text x="336" y="178" font-size="12" fill="#58a6ff" text-anchor="middle">finds</text>
-<path d="M 640,187 L 688,187" fill="none" stroke="#58a6ff" stroke-width="2" marker-end="url(#arrow-blue)"/>
-<text x="664" y="178" font-size="12" fill="#58a6ff" text-anchor="middle">forms</text>
-<path d="M 968,187 L 1016,187" fill="none" stroke="#58a6ff" stroke-width="2" marker-end="url(#arrow-blue)"/>
-<text x="992" y="178" font-size="12" fill="#58a6ff" text-anchor="middle">Hunt</text>
-<path d="M 1296,187 L 1344,187" fill="none" stroke="#58a6ff" stroke-width="2" marker-end="url(#arrow-blue)"/>
-<text x="1320" y="176" font-size="12" fill="#58a6ff" text-anchor="middle">Promote</text>
-<path d="M 828,92 L 828,80 L 1456,80 L 1456,92" fill="none" stroke="#58a6ff" stroke-width="2" marker-end="url(#arrow-blue)"/>
-<text x="1142" y="77" font-size="12" fill="#58a6ff" text-anchor="middle">Promote a lead</text>
-<rect x="32" y="340" width="280" height="120" rx="10" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
-<text x="48" y="368" font-size="18" font-weight="700" fill="#e6edf3">Alert</text>
-<text x="296" y="367" font-size="11" font-weight="700" fill="#58a6ff" text-anchor="end" letter-spacing="1">INPUT</text>
-<text x="48" y="390" font-size="13" font-weight="600" fill="#e6edf3">A detection the grid raised.</text>
-<text x="48" y="412" font-size="12.5" fill="#8b949e">Suricata · Sigma · notice.</text>
-<text x="48" y="429" font-size="12.5" fill="#e6edf3">soc-ai investigates it. The verdict</text>
-<text x="48" y="446" font-size="12.5" fill="#e6edf3">writes an observation (TP 1.0, NMI 0.5).</text>
-<path d="M 312,400 L 1456,400 L 1456,320" fill="none" stroke="#a371f7" stroke-width="2" marker-end="url(#arrow-purple)"/>
-<text x="900" y="391" font-size="12" fill="#a371f7" text-anchor="middle">investigate</text>
-<path d="M 500,340 L 500,320" fill="none" stroke="#3fb950" stroke-width="2" marker-end="url(#arrow-green)"/>
-<text x="488" y="336" font-size="12" fill="#3fb950" text-anchor="end">a verdict writes an observation</text>
-<path d="M 1156,320 L 1156,480 L 560,480 L 560,320" fill="none" stroke="#3fb950" stroke-width="2" marker-end="url(#arrow-green)"/>
-<text x="860" y="496" font-size="12" fill="#3fb950" text-anchor="middle">a threat finding writes an observation (0.7)</text>
-<path d="M 1236,320 L 1236,530 L 336,530 L 336,250 L 312,250" fill="none" stroke="#3fb950" stroke-width="2" marker-end="url(#arrow-green)"/>
-<text x="790" y="546" font-size="12" fill="#3fb950" text-anchor="middle">draft an analytic from a finding (candidate)</text>
-<rect x="32" y="570" width="760" height="160" rx="10" fill="#161b22" stroke="#d29922" stroke-width="1.5"/>
-<text x="48" y="598" font-size="15" font-weight="700" fill="#d29922">What waits on you (the Needs-you strip)</text>
-<text x="48" y="624" font-size="12.5" fill="#e6edf3">Unread shadow hits: read the evidence, then approve or reject the analytic.</text>
-<text x="48" y="646" font-size="12.5" fill="#e6edf3">Leads that need a decision: Hunted, with the hunt's outcome. Dismiss or Promote.</text>
-<text x="48" y="668" font-size="12.5" fill="#8b949e">Nothing else needs you. Live hits count on their own. A new lead starts its own hunt.</text>
-<text x="48" y="690" font-size="12.5" fill="#8b949e">The sidebar badge and the strip show the same count. The bell lists the items.</text>
-<rect x="816" y="570" width="752" height="160" rx="10" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
-<text x="832" y="598" font-size="15" font-weight="700" fill="#e6edf3">One word per thing</text>
-<text x="832" y="624" font-size="12.5" fill="#8b949e">hit = an observation that an analytic wrote. Every page calls it an observation.</text>
-<text x="832" y="646" font-size="12.5" fill="#8b949e">type = the kind of observation or hunt. Storage keeps the column name kind; the screen says type.</text>
-<text x="832" y="668" font-size="12.5" fill="#8b949e">Manual · Schedule · Lead = who started a hunt. The analytic sweep starts none. It writes observations.</text>
-<text x="832" y="690" font-size="12.5" fill="#8b949e">Investigate, triage, investigation = one thing. The run and its record.</text>
+<rect width="1600" height="876" fill="#0d1117"/>
+<text x="32" y="40" font-size="22" font-weight="700" fill="#e6edf3">How this flows: from an alert or a sweep to an action in Security Onion</text>
+<text x="32" y="62" font-size="13" fill="#8b949e">Two inputs enter on the left. Each box states what the thing is. Blue: the sweep path. Purple: the alert path and the investigation. Amber: what waits on you. Green: a loop back to observations.</text>
+<text x="32" y="96" font-size="11" font-weight="700" fill="#58a6ff" letter-spacing="1">THE SWEEP PATH · EVERY HOUR</text>
+<rect x="32" y="104" width="236" height="216" rx="10" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+<text x="48" y="132" font-size="18" font-weight="700" fill="#e6edf3">Analytic</text>
+<text x="252" y="131" font-size="11" font-weight="700" fill="#58a6ff" text-anchor="end" letter-spacing="1">RUNS</text>
+<text x="48" y="154" font-size="13" font-weight="600" fill="#e6edf3">One detection logic.</text>
+<text x="48" y="176" font-size="12.5" fill="#e6edf3">It runs on every hourly sweep.</text>
+<text x="48" y="193" font-size="12.5" fill="#e6edf3">live: its hits count.</text>
+<text x="48" y="210" font-size="12.5" fill="#e6edf3">shadow: its hits wait for you.</text>
+<text x="48" y="227" font-size="12.5" fill="#8b949e">draft → shadow → live → retired</text>
+<text x="48" y="244" font-size="12.5" fill="#e6edf3">You tune it: approve, reject</text>
+<text x="48" y="261" font-size="12.5" fill="#e6edf3">or draft.</text>
+<text x="48" y="294" font-size="12.5" fill="#8b949e">Screen: Hunts › Analytics.</text>
+<rect x="324" y="104" width="236" height="216" rx="10" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+<text x="340" y="132" font-size="18" font-weight="700" fill="#e6edf3">Hit</text>
+<text x="544" y="131" font-size="11" font-weight="700" fill="#58a6ff" text-anchor="end" letter-spacing="1">FOUND</text>
+<text x="340" y="154" font-size="13" font-weight="600" fill="#e6edf3">One thing one analytic found</text>
+<text x="340" y="171" font-size="13" font-weight="600" fill="#e6edf3">on one entity.</text>
+<text x="340" y="193" font-size="12.5" fill="#8b949e">An observation with documents</text>
+<text x="340" y="210" font-size="12.5" fill="#8b949e">behind it.</text>
+<text x="340" y="227" font-size="12.5" fill="#e6edf3">A live hit counts. A shadow hit</text>
+<text x="340" y="244" font-size="12.5" fill="#e6edf3">waits for you to read it.</text>
+<text x="340" y="294" font-size="12.5" fill="#8b949e">Screen: Hunts › Analytic hits.</text>
+<rect x="616" y="104" width="236" height="216" rx="10" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+<text x="632" y="132" font-size="18" font-weight="700" fill="#e6edf3">Lead</text>
+<text x="836" y="131" font-size="11" font-weight="700" fill="#58a6ff" text-anchor="end" letter-spacing="1">HUNT IT</text>
+<text x="632" y="154" font-size="13" font-weight="600" fill="#e6edf3">Observations on one entity</text>
+<text x="632" y="171" font-size="13" font-weight="600" fill="#e6edf3">that are worth one decision.</text>
+<text x="632" y="193" font-size="12.5" fill="#e6edf3">A new lead starts its own hunt.</text>
+<text x="632" y="210" font-size="12.5" fill="#e6edf3">Or press Hunt this lead.</text>
+<text x="632" y="227" font-size="12.5" fill="#e6edf3">Dismiss a lead that is noise.</text>
+<text x="632" y="244" font-size="12.5" fill="#8b949e">Related leads share an analytic,</text>
+<text x="632" y="261" font-size="12.5" fill="#8b949e">an address or a technique.</text>
+<text x="632" y="294" font-size="12.5" fill="#8b949e">Screen: Hunts › Leads.</text>
+<rect x="956" y="104" width="236" height="216" rx="10" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+<text x="972" y="132" font-size="18" font-weight="700" fill="#e6edf3">Hunt</text>
+<text x="1176" y="131" font-size="11" font-weight="700" fill="#58a6ff" text-anchor="end" letter-spacing="1">LEARN</text>
+<text x="972" y="154" font-size="13" font-weight="600" fill="#e6edf3">One agent run with</text>
+<text x="972" y="171" font-size="13" font-weight="600" fill="#e6edf3">an objective.</text>
+<text x="972" y="193" font-size="12.5" fill="#e6edf3">It returns findings, then</text>
+<text x="972" y="210" font-size="12.5" fill="#e6edf3">investigates each finding.</text>
+<text x="972" y="227" font-size="12.5" fill="#e6edf3">It is not finished until its</text>
+<text x="972" y="244" font-size="12.5" fill="#e6edf3">findings are investigated.</text>
+<text x="972" y="261" font-size="12.5" fill="#e6edf3">It takes no action itself.</text>
+<text x="972" y="278" font-size="12.5" fill="#8b949e">A finding with none offers</text>
+<text x="972" y="295" font-size="12.5" fill="#8b949e">Open an investigation.</text>
+<rect x="1332" y="104" width="236" height="432" rx="10" fill="#161b22" stroke="#a371f7" stroke-width="1.5"/>
+<text x="1348" y="132" font-size="18" font-weight="700" fill="#e6edf3">Investigation</text>
+<text x="1552" y="131" font-size="11" font-weight="700" fill="#a371f7" text-anchor="end" letter-spacing="1">DECIDE</text>
+<text x="1348" y="154" font-size="13" font-weight="600" fill="#e6edf3">One agent run that ends</text>
+<text x="1348" y="171" font-size="13" font-weight="600" fill="#e6edf3">in a verdict.</text>
+<text x="1348" y="193" font-size="12.5" fill="#e6edf3">Its subject is one alert, or</text>
+<text x="1348" y="210" font-size="12.5" fill="#e6edf3">a hunt and its findings.</text>
+<text x="1348" y="227" font-size="12.5" fill="#e6edf3">It recommends actions and</text>
+<text x="1348" y="244" font-size="12.5" fill="#e6edf3">writes an audit record.</text>
+<text x="1348" y="266" font-size="12.5" fill="#8b949e">true positive, false positive</text>
+<text x="1348" y="283" font-size="12.5" fill="#8b949e">or needs more info, with a</text>
+<text x="1348" y="300" font-size="12.5" fill="#8b949e">confidence.</text>
+<text x="1348" y="322" font-size="12.5" fill="#8b949e">Triage is the run. The</text>
+<text x="1348" y="339" font-size="12.5" fill="#8b949e">investigation is its record.</text>
+<text x="1348" y="400" font-size="12.5" fill="#e6edf3">Each finding of a hunt gets</text>
+<text x="1348" y="417" font-size="12.5" fill="#e6edf3">its own investigation.</text>
+<text x="1348" y="434" font-size="12.5" fill="#e6edf3">An alert gets one when</text>
+<text x="1348" y="451" font-size="12.5" fill="#e6edf3">soc-ai triages it.</text>
+<text x="1348" y="510" font-size="12.5" fill="#8b949e">Screen: Investigations.</text>
+<path d="M 268,204 L 324,204" fill="none" stroke="#58a6ff" stroke-width="2" marker-end="url(#arrow-blue)"/>
+<text x="296" y="196" font-size="12" fill="#58a6ff" text-anchor="middle">finds</text>
+<path d="M 560,204 L 616,204" fill="none" stroke="#58a6ff" stroke-width="2" marker-end="url(#arrow-blue)"/>
+<text x="588" y="196" font-size="12" fill="#58a6ff" text-anchor="middle">forms</text>
+<path d="M 852,204 L 956,204" fill="none" stroke="#58a6ff" stroke-width="2" marker-end="url(#arrow-blue)"/>
+<text x="904" y="196" font-size="12" fill="#58a6ff" text-anchor="middle">Hunt this lead</text>
+<text x="904" y="222" font-size="11" fill="#58a6ff" text-anchor="middle">or auto-hunt</text>
+<path d="M 1192,204 L 1332,204" fill="none" stroke="#58a6ff" stroke-width="2" marker-end="url(#arrow-blue)"/>
+<text x="1262" y="196" font-size="12" fill="#58a6ff" text-anchor="middle">investigates</text>
+<text x="1262" y="222" font-size="12" fill="#58a6ff" text-anchor="middle">each finding</text>
+<path d="M 1074,320 L 1074,336 L 442,336 L 442,320" fill="none" stroke="#3fb950" stroke-width="2" marker-end="url(#arrow-green)"/>
+<text x="758" y="350" font-size="12" fill="#3fb950" text-anchor="middle">a threat finding writes an observation</text>
+<path d="M 1332,364 L 400,364 L 400,320" fill="none" stroke="#3fb950" stroke-width="2" marker-end="url(#arrow-green)"/>
+<text x="1060" y="378" font-size="12" fill="#3fb950" text-anchor="middle">a verdict writes an observation</text>
+<text x="32" y="388" font-size="11" font-weight="700" fill="#a371f7" letter-spacing="1">THE ALERT PATH · EVERY ALERT</text>
+<rect x="32" y="396" width="236" height="140" rx="10" fill="#161b22" stroke="#a371f7" stroke-width="1.5"/>
+<text x="48" y="424" font-size="18" font-weight="700" fill="#e6edf3">Alert</text>
+<text x="252" y="423" font-size="11" font-weight="700" fill="#a371f7" text-anchor="end" letter-spacing="1">INPUT</text>
+<text x="48" y="446" font-size="13" font-weight="600" fill="#e6edf3">A detection the grid raised.</text>
+<text x="48" y="463" font-size="12.5" fill="#8b949e">Suricata · Sigma · notice.</text>
+<text x="48" y="480" font-size="12.5" fill="#e6edf3">Auto-Investigate triages it,</text>
+<text x="48" y="497" font-size="12.5" fill="#e6edf3">or you press Investigate.</text>
+<text x="48" y="520" font-size="12.5" fill="#8b949e">Screen: Alerts.</text>
+<path d="M 268,466 L 1332,466" fill="none" stroke="#a371f7" stroke-width="2" marker-end="url(#arrow-purple)"/>
+<text x="800" y="456" font-size="12" fill="#a371f7" text-anchor="middle">soc-ai triages the alert</text>
+<path d="M 1450,536 L 1450,576" fill="none" stroke="#a371f7" stroke-width="2" marker-end="url(#arrow-purple)"/>
+<text x="1462" y="561" font-size="12" fill="#a371f7">ends in</text>
+<rect x="1332" y="576" width="236" height="100" rx="10" fill="#161b22" stroke="#a371f7" stroke-width="1.5"/>
+<text x="1348" y="604" font-size="18" font-weight="700" fill="#e6edf3">Verdict</text>
+<text x="1348" y="626" font-size="12.5" fill="#e6edf3">The answer of an investigation.</text>
+<text x="1348" y="643" font-size="12.5" fill="#e6edf3">Agree, or override it.</text>
+<text x="1348" y="660" font-size="12.5" fill="#8b949e">Request more info on a gap.</text>
+<path d="M 1450,676 L 1450,716" fill="none" stroke="#a371f7" stroke-width="2" marker-end="url(#arrow-purple)"/>
+<text x="1462" y="701" font-size="12" fill="#a371f7">you act</text>
+<rect x="1332" y="716" width="236" height="130" rx="10" fill="#161b22" stroke="#a371f7" stroke-width="1.5"/>
+<text x="1348" y="743" font-size="15" font-weight="700" fill="#e6edf3">Action in Security Onion</text>
+<text x="1348" y="765" font-size="12.5" fill="#e6edf3">Acknowledge, escalate to a</text>
+<text x="1348" y="782" font-size="12.5" fill="#e6edf3">case, or add a comment.</text>
+<text x="1348" y="804" font-size="12.5" fill="#8b949e">soc-ai writes it to Security</text>
+<text x="1348" y="821" font-size="12.5" fill="#8b949e">Onion and keeps a receipt.</text>
+<rect x="32" y="576" width="868" height="140" rx="10" fill="#161b22" stroke="#d29922" stroke-width="1.5"/>
+<text x="48" y="604" font-size="15" font-weight="700" fill="#d29922">Needs you: the one queue</text>
+<text x="48" y="628" font-size="12.5" fill="#e6edf3">Leads that wait on a decision, unread shadow hits, alert groups with no verdict,</text>
+<text x="48" y="646" font-size="12.5" fill="#e6edf3">verdicts that need more info, and recommended actions that wait for you.</text>
+<text x="48" y="664" font-size="12.5" fill="#e6edf3">You decide on one object: agree, override, acknowledge, escalate, dismiss, or open an investigation.</text>
+<text x="48" y="688" font-size="12.5" fill="#8b949e">The sidebar badge, the bell and the Overview tile show the same count.</text>
+<path d="M 900,612 L 1332,612" fill="none" stroke="#d29922" stroke-width="2" marker-end="url(#arrow-amber)"/>
+<text x="1116" y="604" font-size="12" fill="#d29922" text-anchor="middle">agree or override the verdict</text>
+<path d="M 900,662 L 1300,662 L 1300,781 L 1332,781" fill="none" stroke="#d29922" stroke-width="2" marker-end="url(#arrow-amber)"/>
+<text x="1100" y="654" font-size="12" fill="#d29922" text-anchor="middle">acknowledge or escalate</text>
+<rect x="32" y="732" width="868" height="114" rx="10" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+<text x="48" y="760" font-size="15" font-weight="700" fill="#e6edf3">Two verbs</text>
+<text x="48" y="784" font-size="12.5" fill="#e6edf3">Hunt this lead: learn what is here. The hunt returns findings and investigates each one.</text>
+<text x="48" y="802" font-size="12.5" fill="#e6edf3">Open an investigation: decide and act. It is the manual control on a finding with no investigation.</text>
+<text x="48" y="820" font-size="12.5" fill="#8b949e">An investigation ends in a verdict, recommended actions and an audit record.</text>
+<text x="48" y="838" font-size="12.5" fill="#8b949e">A hunt is not finished until its findings are investigated.</text>
 </svg>

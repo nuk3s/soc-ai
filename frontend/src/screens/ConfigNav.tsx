@@ -111,7 +111,7 @@ export function ConfigNavSelect({ groups, activeId, onNavigate }: ConfigNavProps
         className="min-w-0 flex-1 rounded-control border border-border-input bg-bg px-2.5 py-1.5 text-[12.5px] font-normal normal-case tracking-normal text-text outline-none focus:border-accent"
       >
         <option value="" disabled>
-          Choose a section…
+          Choose a section
         </option>
         {groups.map((g) => (
           <optgroup key={g.label} label={g.label}>

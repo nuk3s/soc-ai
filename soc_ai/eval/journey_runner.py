@@ -121,6 +121,49 @@ def _best_promotable_ordinal(
     return best if coverage[best] else None
 
 
+async def existing_investigation(
+    db: Any, *, hunt: Hunt, ordinal: int, anchor_id: str
+) -> str | None:
+    """The investigation that already answers finding ``ordinal``, or None.
+
+    The rule the hunt runner applies, one investigation per subject: the run
+    the hunt names for the finding, then a run promoted from this finding,
+    then a run of the same alert or the same subject fingerprint from the
+    last seven days. A run that cannot answer, failed or a fallback, is not
+    one.
+
+    The journey takes a run of THIS finding only. The scorer refuses a run
+    whose join keys name another hunt (:func:`soc_ai.eval.journey.score_journey`),
+    so a run the hunt reused from another hunt is promoted again.
+    """
+    from soc_ai.hunting.findings import subject_fingerprint  # noqa: PLC0415 - lazy
+    from soc_ai.store import hunts as hunt_svc  # noqa: PLC0415 - lazy
+    from soc_ai.store import investigations as inv_svc  # noqa: PLC0415 - lazy
+
+    def answers(inv: Investigation) -> bool:
+        return (
+            inv.hunt_id == hunt.id and inv.finding_ordinal == ordinal and inv_svc.blocks_rehunt(inv)
+        )
+
+    link = hunt_svc.finding_links(hunt).get(ordinal)
+    if link is not None and link.investigation_id:
+        linked = await db.get(Investigation, link.investigation_id)
+        if linked is not None and answers(linked):
+            return str(linked.id)
+    own = await inv_svc.latest_for_finding(db, hunt.id, ordinal)
+    if own is not None and answers(own):
+        return str(own.id)
+    findings = (hunt.report or {}).get("findings") or []
+    finding = findings[ordinal] if 0 <= ordinal < len(findings) else None
+    same = await inv_svc.reusable_for_subject(
+        db,
+        alert_id=anchor_id,
+        fingerprint=subject_fingerprint(finding) if isinstance(finding, dict) else None,
+        is_synth_eval=bool(hunt.is_synth_eval),
+    )
+    return str(same.id) if same is not None and answers(same) else None
+
+
 async def _promote_and_investigate(
     state: _RunnerState,
     ctx: Any,
@@ -155,6 +198,15 @@ async def _promote_and_investigate(
     if anchor_id is None:
         emit(f"finding {ordinal}: no citation resolves to a grid doc — cannot promote")
         return None
+
+    # One investigation per subject. The hunt investigates its subject
+    # findings as part of the hunt, so the runner often investigated this one
+    # already. The promotion finds that run, and the journey scores it.
+    async with state.db_sessionmaker() as db:
+        existing = await existing_investigation(db, hunt=hunt, ordinal=ordinal, anchor_id=anchor_id)
+    if existing is not None:
+        emit(f"finding {ordinal}: the hunt investigated it already, investigation {existing}")
+        return existing
 
     title = str(finding.get("title") or "Hunt finding")
     detail = str(finding.get("detail") or "")

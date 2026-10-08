@@ -11,8 +11,14 @@ import {
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
 
-import { getHuntCatalog, type HuntCatalog, type HuntCatalogSpec } from '../lib/api';
-import { loopRuns, runsInProfileSweep } from '../lib/analyticRuns';
+import { getAnalyticHits, getHuntCatalog, type HuntCatalog, type HuntCatalogSpec } from '../lib/api';
+import {
+  intervalWords,
+  loopRuns,
+  runsInProfileSweep,
+  sourceWord,
+  windowWords,
+} from '../lib/analyticRuns';
 import { useDemo } from '../lib/demo';
 import { SEVERITY, tint } from '../lib/tokens';
 import { absTime, ago } from '../lib/timeRange';
@@ -28,7 +34,7 @@ import {
 import { AnalyticDrawer, StatusDot } from './AnalyticDrawer';
 import { StatusTag } from './Badges';
 import { Panel, PanelHeader } from './Panel';
-import { EmptyState, Freshness, LoadingState, StaleNotice } from './States';
+import { EmptyState, Freshness, LoadingInline, LoadingState, StaleNotice } from './States';
 
 // ---------------------------------------------------------------------------
 // The analytic catalog — every declarative analytic and what its sweep trail
@@ -80,7 +86,7 @@ function TierStatus({ spec, running }: { spec: HuntCatalogSpec; running: boolean
         className="flex-none rounded-chip border border-border-faint px-1.5 py-px text-[10px] text-faint"
         title={(spec.tier ?? 'shipped') === 'local' ? CHIP_LOCAL : CHIP_SHIPPED}
       >
-        {spec.tier ?? 'shipped'}
+        {sourceWord(spec.tier ?? 'shipped')}
       </span>
       <span className="flex-none text-[11.5px] text-dim">
         <StatusDot status={spec.status ?? 'live'} running={running} />
@@ -94,7 +100,7 @@ function TierStatus({ spec, running }: { spec: HuntCatalogSpec; running: boolean
           style={{ borderColor: 'rgba(210,153,34,.45)' }}
           title={`${CHIP_HELD_BY_SYSTEM} ${spec.held_by_system}`}
         >
-          held by soc-ai
+          Paused by soc-ai
         </span>
       )}
     </>
@@ -249,18 +255,21 @@ function TruncatedMarker({ count }: { count: number }) {
   );
 }
 
-// Red, the PipelineErrorChip tone: the sweep itself broke on this spec. The
-// error text lives in the tooltip because it is a Python exception string,
-// useful to whoever fixes it and noise to everyone else scanning the list.
-function ErrorMarker({ error }: { error: string }) {
+// Red, the PipelineErrorChip tone: the newest sweep of this analytic failed.
+// The row read "live · fired 0 · last fired never" over 8 runs that could not
+// reach their data source (dogfood 2026-10-06), so the chip says when the last
+// run failed. The error text lives in the tooltip because it is an exception
+// string, useful to whoever fixes it and noise to everyone else.
+function FailedRunMarker({ error, at }: { error: string; at: string | null }) {
   return (
     <span
+      data-testid="last-run-failed"
       className="inline-flex flex-none items-center gap-1 whitespace-nowrap rounded-chip border px-1.5 py-px text-[9.5px] font-semibold tracking-[.02em]"
       style={{ color: '#fca5a5', borderColor: 'rgba(240,68,56,.35)', background: 'rgba(240,68,56,.09)' }}
       title={error}
     >
       <AlertTriangle size={9} strokeWidth={2.5} />
-      error
+      last run failed {ago(at)}
     </span>
   );
 }
@@ -269,8 +278,9 @@ function ErrorMarker({ error }: { error: string }) {
  *  reports the clamped window, which is what the trail rows record),
  *  collapsing to hours only past two hours and only on the hour. */
 function minutesLabel(m: number): string {
-  if (m >= 120 && m % 60 === 0) return `${m / 60}h`;
-  return `${m}m`;
+  // "24 h", "60 min" (C6). The panel printed "1440 min" and "24h" for one
+  // window on two screens.
+  return windowWords(m) || `${m} min`;
 }
 
 // "Sweeps on" is the config flag. Whether the loop is ALIVE is a different
@@ -335,7 +345,7 @@ function SweepsFacts({ data }: { data: HuntCatalog }) {
           enabled" keeps the number (it is what the flag will start) and ties
           it to the hint that follows. */}
       <span className="text-dim">
-        · every {minutesLabel(data.sweep_interval_minutes)}
+        · {intervalWords(data.sweep_interval_minutes) || `every ${minutesLabel(data.sweep_interval_minutes)}`}
         {!on && ' once enabled'}
       </span>
       <span className="text-dim">· looks back {minutesLabel(data.sweep_window_minutes)}</span>
@@ -368,7 +378,7 @@ function SweepsLine({ data, demo }: { data: HuntCatalog; demo: boolean }) {
           <span className="text-dim">
             · run <code className="font-mono text-[12px]">soc-ai spec-sweep --shadow</code>, then turn them on in{' '}
             <Link to="/config#triage-automation" className="font-semibold text-accent hover:underline">
-              Config → Triage automation
+              Settings → Triage automation
             </Link>
           </span>
         ))}
@@ -416,7 +426,7 @@ function RowTitle({ spec, onOpen }: { spec: HuntCatalogSpec; onOpen: (id: string
     <button
       type="button"
       onClick={() => onOpen(spec.id)}
-      className="min-w-0 flex-1 text-left text-text-2 line-clamp-2 hover:text-accent hover:underline xl:line-clamp-1"
+      className="break-words min-w-0 flex-1 text-left text-text-2 hover:text-accent hover:underline"
       title={spec.title}
     >
       {spec.title}
@@ -521,15 +531,21 @@ function SpecRow({
               means one thing checked two minutes ago and another checked
               last week, and the row is where an operator asks "was anyone
               looking, and when". */}
-          <span className="flex-none text-[12px] text-dim" title={absTime(spec.last_swept_at)}>
-            last swept {ago(spec.last_swept_at)}
-          </span>
-          <span
-            className="flex-none text-[12px] text-dim"
-            title={spec.last_fired_at ? absTime(spec.last_fired_at) : undefined}
-          >
-            last fired {ago(spec.last_fired_at)}
-          </span>
+          {/* A failed last run swept nothing, and "last fired never" over
+              it reads as a quiet analytic. The failed-run chip says it. */}
+          {!spec.last_error && (
+            <>
+              <span className="flex-none text-[12px] text-dim" title={absTime(spec.last_swept_at)}>
+                last swept {ago(spec.last_swept_at)}
+              </span>
+              <span
+                className="flex-none text-[12px] text-dim"
+                title={spec.last_fired_at ? absTime(spec.last_fired_at) : undefined}
+              >
+                last fired {ago(spec.last_fired_at)}
+              </span>
+            </>
+          )}
         </>
       )}
       {spec.shadow_24h > 0 && <ShadowMarker count={spec.shadow_24h} />}
@@ -541,8 +557,36 @@ function SpecRow({
       {spec.unattributed_docs > 0 && <UnattributedMarker count={spec.unattributed_docs} />}
       {spec.truncated_docs > 0 && <TruncatedMarker count={spec.truncated_docs} />}
       {spec.blind && <BlindMarker />}
-      {spec.last_error && <ErrorMarker error={spec.last_error} />}
+      {spec.last_error && <FailedRunMarker error={spec.last_error} at={spec.last_swept_at} />}
     </li>
+  );
+}
+
+/**
+ * The analytic hits of the last 7 days, the number the Hunts page counts.
+ *
+ * This panel counts sweeps over 24 h and the Hunts page counts hits over 7
+ * days, on two pages side by side with no shared label (dogfood 2026-10-06).
+ * The line states the Hunts number in the Hunts units, so the two pages share
+ * one figure. A failed read says so. It is not a zero.
+ */
+function HitsWeek() {
+  const hits = useAsync(() => getAnalyticHits({ days: 7, limit: 1 }), [], { refetchInterval: 300_000 });
+  const counts = hits.data?.counts;
+  return (
+    <div data-testid="hits-week" className="mb-2 text-[12px] text-dim">
+      {counts ? (
+        <>
+          Analytic hits in the last 7 days:{' '}
+          <span className="font-semibold text-text-2">{counts.all.toLocaleString()}</span> ({counts.live.toLocaleString()}{' '}
+          live, {counts.shadow.toLocaleString()} shadow). The Hunts page counts the same hits.
+        </>
+      ) : hits.error ? (
+        'Could not read the analytic hits of the last 7 days.'
+      ) : (
+        <LoadingInline>Reading the analytic hits of the last 7 days</LoadingInline>
+      )}
+    </div>
   );
 }
 
@@ -573,6 +617,18 @@ export function HuntCatalogPanel() {
       className="border-b border-border-faint px-[15px] py-1.5 text-[11px] leading-[1.6] text-faint"
     >
       <div>
+        <span className="font-semibold text-dim">measured</span>: soc-ai scored the host
+        against a real baseline.
+      </div>
+      <div>
+        <span className="font-semibold text-dim">learning</span>: the host has under 7
+        days of history.
+      </div>
+      <div>
+        <span className="font-semibold text-dim">blind</span>: the host has no baseline,
+        no confident role or no telemetry on the grid.
+      </div>
+      <div>
         <span className="font-semibold text-dim">unscored</span>: the host has under
         7 days of history, or no telemetry the analytic can read.
       </div>
@@ -601,7 +657,7 @@ export function HuntCatalogPanel() {
           // not a confirmed bad state. Same rule as the setup-health card.
           <div className="px-[15px] py-3 text-[13px] text-dim">Could not read the hunt catalog.</div>
         ) : (
-          <LoadingState label="Reading the hunt catalog…" />
+          <LoadingState label="Reading the hunt catalog" />
         )
       ) : (
         <>
@@ -633,9 +689,32 @@ export function HuntCatalogPanel() {
             <>
               {/* One legend for the list: the window is a fact about every
                   row, so it is said once where the eye lands before the
-                  rows, and the definitions ride on its tooltip. */}
-              <div className="flex justify-end border-b border-border-faint px-[15px] py-1.5 text-[11px] text-dim">
+                  rows. The method word is one of the three the Analytics tab
+                  filters on (C6): query, baseline, learned. */}
+              <div className="flex items-center justify-between gap-2 border-b border-border-faint px-[15px] py-1.5 text-[11px] text-dim">
+                <span data-testid="method-query">
+                  Method: query · {swept.length} · run by the analytic sweep
+                </span>
                 <span title={COUNTS_TITLE}>fired, fresh and handled cover the last 24 h</span>
+              </div>
+              {/* The three words, each on its own line. The tooltip held them,
+                  and nobody hovers a legend (dogfood 2026-10-06). */}
+              <div
+                data-testid="counts-legend"
+                className="border-b border-border-faint px-[15px] py-1.5 text-[11px] leading-[1.6] text-faint"
+              >
+                <div>
+                  <span className="font-semibold text-dim">fired</span>: a live sweep matched
+                  and wrote an observation.
+                </div>
+                <div>
+                  <span className="font-semibold text-dim">fresh</span>: a match no observation
+                  had covered.
+                </div>
+                <div>
+                  <span className="font-semibold text-dim">handled</span>: a match an earlier
+                  observation already covered.
+                </div>
               </div>
               <ul className="divide-y divide-border">
                 {swept.map((spec) => (
@@ -654,7 +733,9 @@ export function HuntCatalogPanel() {
                       vocabulary: every column on a swept row is a fact about
                       the catalog sweep, and none of them apply here. */}
                   <div className="flex items-center justify-between gap-2 border-y border-border-faint bg-surface-2/40 px-[15px] py-1.5 text-[11px] text-dim">
-                    <span>Evaluated against behavioural profiles · {profiled.length}</span>
+                    <span data-testid="method-baseline">
+                      Method: baseline · {profiled.length} · each host against its own baseline
+                    </span>
                     <span title={PROFILE_ROW_TITLE}>
                       {data.prior_sweeps_enabled === false
                         ? 'The profile sweep is off. These analytics do not run.'
@@ -684,7 +765,7 @@ export function HuntCatalogPanel() {
                     data-testid="detector-group"
                     className="flex items-center justify-between gap-2 border-y border-border-faint bg-surface-2/40 px-[15px] py-1.5 text-[11px] text-dim"
                   >
-                    <span>Learned detectors · {detectors.length}</span>
+                    <span>Method: learned · {detectors.length} · learned detectors</span>
                     <span title={DETECTOR_ROW_TITLE}>
                       {data.prior_sweeps_enabled === false
                         ? 'The profile sweep is off. These detectors do not run.'
@@ -708,6 +789,7 @@ export function HuntCatalogPanel() {
             </>
           )}
           <div className="border-t border-border px-[15px] py-3">
+            <HitsWeek />
             {/* The sweep writes an observation. An observation from an
                 analytic is an analytic hit, and the hits block at the top of
                 the Hunts tab holds every one. The panel linked to the hunt

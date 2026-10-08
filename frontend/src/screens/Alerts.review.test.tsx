@@ -422,7 +422,7 @@ describe('F40 — Drawer Escape is gated on the command palette', () => {
     );
     // Open the palette, then press Escape (which should dismiss only the palette).
     fireEvent.keyDown(window, { key: 'k', metaKey: true });
-    await screen.findByPlaceholderText('Search commands, screens, hosts…');
+    await screen.findByPlaceholderText('Search commands, screens, hosts');
     fireEvent.keyDown(window, { key: 'Escape' });
     expect(onClose).not.toHaveBeenCalled();
   });

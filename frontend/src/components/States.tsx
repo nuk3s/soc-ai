@@ -1,6 +1,8 @@
 import { AlertTriangle, ArrowLeft, RotateCw, SearchX } from 'lucide-react';
 import { useEffect, useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
+import { absoluteTime, ago } from '../lib/timeRange';
+import { useOptionalShell } from '../shell/ShellContext';
 
 /** Spinner — the 2px ring with a transparent top, as used throughout. */
 export function Spinner({ size = 15, color = '#4b8bf5' }: { size?: number; color?: string }) {
@@ -28,7 +30,19 @@ export function RouteFallback() {
   );
 }
 
-export function LoadingState({ label = 'Loading…' }: { label?: string }) {
+/** A loading line inside running text: a spinner and the words. A line
+ *  read "Reading the leads…" before, and the owner banned the ellipsis on
+ *  2026-10-07. The spinner says the read goes on. */
+export function LoadingInline({ children, size = 12 }: { children: ReactNode; size?: number }) {
+  return (
+    <span className="inline-flex items-center gap-2">
+      <Spinner size={size} />
+      <span>{children}</span>
+    </span>
+  );
+}
+
+export function LoadingState({ label = 'Loading' }: { label?: string }) {
   return (
     <div className="flex items-center gap-3 px-1 py-10 text-[13px] text-dim">
       <Spinner />
@@ -94,6 +108,11 @@ export function DemoDisabledState({ what }: { what: string }) {
   );
 }
 
+/** The page title of a not-found page: "No such lead". */
+export function notFoundTitle(what: string): string {
+  return `No such ${what}`;
+}
+
 /**
  * The id asked for isn't there — a calm answer, not an incident.
  *
@@ -102,6 +121,10 @@ export function DemoDisabledState({ what }: { what: string }) {
  * so the analyst could not tell "this run doesn't exist" from "the grid is
  * down" (dogfood B3, 2026-08-11). Neutral chrome, and no Retry — retrying a
  * 404 just fails again. The way out is the list it came from.
+ *
+ * The page title in the top bar names the absence too. The breadcrumb read the
+ * raw id over a card that said the id holds nothing (dogfood 2026-10-06). The
+ * shell shows `notFoundTitle(what)` in place of the id while the card is up.
  */
 export function NotFoundState({
   what,
@@ -114,12 +137,18 @@ export function NotFoundState({
   backTo: string;
   backLabel: string;
 }) {
+  const setCrumbName = useOptionalShell()?.setCrumbName;
+  useEffect(() => {
+    if (!setCrumbName || !id) return;
+    setCrumbName({ key: id, name: notFoundTitle(what) });
+    return () => setCrumbName(null);
+  }, [setCrumbName, id, what]);
   return (
     <div className="flex flex-col items-center gap-2 rounded-card border border-border bg-surface-1 px-4 py-8 text-center">
       <span className="text-faint">
         <SearchX size={20} />
       </span>
-      <div className="text-[13.5px] font-semibold text-text-2">No such {what}</div>
+      <div className="text-[13.5px] font-semibold text-text-2">{notFoundTitle(what)}</div>
       <div className="max-w-[460px] text-[12.5px] leading-[1.6] text-faint">
         {id ? (
           <>
@@ -172,12 +201,14 @@ export function EmptyState({
   );
 }
 
+// Seconds under a minute, because a poll lands every few seconds and "now" for
+// fifty of them hides a stalled one. From a minute on it is the shared `ago`,
+// so the toolbar and the lists read one scale.
 function agoLabel(at: number): string {
   const s = Math.max(0, Math.round((Date.now() - at) / 1000));
   if (s < 5) return 'now';
   if (s < 60) return `${s}s ago`;
-  if (s < 3600) return `${Math.round(s / 60)}m ago`;
-  return `${Math.round(s / 3600)}h ago`;
+  return ago(at);
 }
 
 /**
@@ -199,7 +230,7 @@ export function Freshness({ at, className = '' }: { at: number | null; className
   return (
     <span
       className={`font-mono text-[11px] text-faint ${className}`}
-      title={`Last updated ${new Date(at).toLocaleTimeString()}`}
+      title={`Last updated ${absoluteTime(at)}`}
     >
       updated {agoLabel(at)}
     </span>

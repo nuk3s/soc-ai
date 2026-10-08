@@ -1,6 +1,6 @@
 // Deterministic "Visual summary" for a concluded hunt: a findings-by-severity
-// breakdown, a host-involvement chart, and a dependency-free SVG map linking
-// findings to the hosts they name (EntityGraph's visual language). Pure
+// breakdown, a host-involvement chart, and a map that links each finding to
+// the hosts it names (components/Graph.tsx, shaped by lib/huntGraph.ts). Pure
 // presentational — every aggregation is computed here from the findings the
 // page already fetched; the parent only mounts this when the hunt is complete
 // AND has findings, so a chart can never render from nothing.
@@ -20,10 +20,12 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { useNavigate } from 'react-router-dom';
-import type { ReactNode } from 'react';
+import { useMemo, type ReactNode } from 'react';
 import type { HuntChart, HuntFinding, Severity } from '../lib/types';
 import { SEVERITY } from '../lib/tokens';
+import { huntGraphView } from '../lib/huntGraph';
+import { mapCountLabel } from '../lib/tooltips';
+import { Graph } from './Graph';
 import { Panel, PanelHeader } from './Panel';
 
 // Hunt severity colors derive from the single app-wide ramp (lib/tokens) — no
@@ -47,8 +49,11 @@ const sevKey = (s: string | undefined): string => {
 };
 const sevRank = (s: string): number => SEV_ORDER.indexOf(s);
 
-// truncate for axis/canvas text; the full value stays in the hover tooltip
-const clip = (s: string, max: number) => (s.length > max ? s.slice(0, max - 1) + '…' : s);
+// Axis text shows whole. The hover tooltip repeats the value. A cut at a
+// character count hid the end of a host name (owner, 2026-10-07).
+const MONO_CHAR_PX = 6.4;
+const hostAxisWidth = (rows: { host: string }[]) =>
+  Math.min(300, Math.max(118, Math.round(Math.max(0, ...rows.map((r) => r.host.length)) * MONO_CHAR_PX + 14)));
 
 // recharts defaults assume a light theme — style ticks/axes/tooltips
 // explicitly against the dark surface tokens.
@@ -274,9 +279,8 @@ function HostChart({ rows }: { rows: HostRow[] }) {
         <YAxis
           type="category"
           dataKey="host"
-          width={118}
+          width={hostAxisWidth(rows)}
           tick={MONO_TICK}
-          tickFormatter={(h: string) => clip(h, 16)}
           axisLine={AXIS_LINE}
           tickLine={false}
         />
@@ -290,112 +294,6 @@ function HostChart({ rows }: { rows: HostRow[] }) {
         </Bar>
       </BarChart>
     </ResponsiveContainer>
-  );
-}
-
-// ── Host–finding map (dependency-free SVG, EntityGraph's visual language) ────
-
-function HostFindingMap({ findings, hosts }: { findings: HuntFinding[]; hosts: HostRow[] }) {
-  const navigate = useNavigate();
-  const VW = 600;
-  const mx = 46;
-  const my = 26;
-  const rows = Math.max(findings.length, hosts.length);
-  const VH = Math.max(rows * 34 + 2 * my, 150);
-  // even vertical spacing per column — counts are small (findings ≤ ~10,
-  // hosts ≤ 8 after the top-8 cut), so no layout engine is needed
-  const yAt = (i: number, n: number) => (n === 1 ? VH / 2 : my + (i / (n - 1)) * (VH - 2 * my));
-  const FX = mx + 144; // finding column (labels to the left)
-  const HX = VW - mx - 134; // host column (labels to the right)
-  const hostIdx: Record<string, number> = Object.fromEntries(hosts.map((h, i) => [h.host, i]));
-
-  const edges: { fi: number; hi: number }[] = [];
-  findings.forEach((f, fi) => {
-    for (const h of f.hosts) {
-      const hi = hostIdx[h];
-      if (hi !== undefined) edges.push({ fi, hi });
-    }
-  });
-
-  return (
-    <div className="font-sans">
-      <svg
-        viewBox={`0 0 ${VW} ${VH}`}
-        width="100%"
-        style={{ height: 'auto', display: 'block' }}
-        preserveAspectRatio="xMidYMid meet"
-      >
-        {/* edges first so nodes draw over them */}
-        {edges.map((e, i) => {
-          const sev = sevKey(findings[e.fi].severity);
-          return (
-            <g key={'e' + i}>
-              <title>{`F${e.fi + 1} → ${hosts[e.hi].host}`}</title>
-              <line
-                x1={FX + 12}
-                y1={yAt(e.fi, findings.length)}
-                x2={HX - 13}
-                y2={yAt(e.hi, hosts.length)}
-                stroke={SEV_COLOR[sev] ?? SEV_COLOR.info}
-                strokeWidth={1.5}
-                opacity={0.45}
-              />
-            </g>
-          );
-        })}
-        {/* finding nodes — small severity squares, numbered F1/F2/…; a finding
-            with no hosts simply sits unlinked in the column */}
-        {findings.map((f, i) => {
-          const sev = sevKey(f.severity);
-          const c = SEV_COLOR[sev] ?? SEV_COLOR.info;
-          const y = yAt(i, findings.length);
-          const tip = [
-            `F${i + 1}: ${f.title}`,
-            `${sev} · ${f.category ?? 'threat'}`,
-            f.hosts.length ? `hosts: ${f.hosts.join(', ')}` : 'no hosts named',
-          ].join('\n');
-          return (
-            <g key={'f' + i}>
-              <title>{tip}</title>
-              <rect x={FX - 9} y={y - 9} width={18} height={18} rx={4} fill="#0b0e13" stroke={c} strokeWidth={2} />
-              <rect x={FX - 5} y={y - 5} width={10} height={10} rx={2} fill={c} opacity={0.22} />
-              <text x={FX} y={y + 3} fill={c} fontSize={8} fontWeight={700} fontFamily="JetBrains Mono, monospace" textAnchor="middle">
-                F{i + 1}
-              </text>
-              <text x={FX - 17} y={y + 3} fill="#8b94a3" fontSize={9.5} fontFamily="JetBrains Mono, monospace" textAnchor="end">
-                {clip(f.title, 24)}
-              </text>
-            </g>
-          );
-        })}
-        {/* host nodes — circles, mono label; a count-0 host (affected but never
-            named by a finding) renders dim + unlinked */}
-        {hosts.map((h, i) => {
-          const c = h.count > 0 ? '#4b8bf5' : '#6b7484';
-          const y = yAt(i, hosts.length);
-          const tip =
-            h.count > 0
-              ? `${h.host}\nnamed in ${h.count} finding${h.count === 1 ? '' : 's'} · worst ${h.worst}`
-              : `${h.host}\naffected host · no finding names it`;
-          return (
-            // Clicking a host node pivots to its entity page (what we know about
-            // this box). SVG <g> takes onClick; cursor signals it's interactive.
-            <g
-              key={'h' + i}
-              onClick={() => navigate(`/entity/${encodeURIComponent(h.host)}`)}
-              style={{ cursor: 'pointer' }}
-            >
-              <title>{tip}</title>
-              <circle cx={HX} cy={y} r={10} fill="#0b0e13" stroke={c} strokeWidth={2} />
-              <circle cx={HX} cy={y} r={6} fill={c} opacity={0.22} />
-              <text x={HX + 19} y={y + 3} fill="#8b94a3" fontSize={9.5} fontFamily="JetBrains Mono, monospace">
-                {clip(h.host, 18)}
-              </text>
-            </g>
-          );
-        })}
-      </svg>
-    </div>
   );
 }
 
@@ -432,7 +330,7 @@ function AgentChart({ chart, color }: { chart: HuntChart; color: string }) {
       <XAxis
         dataKey="x"
         tick={MONO_TICK}
-        tickFormatter={(x: string) => clip(String(x), 12)}
+        tickFormatter={(x: string) => String(x)}
         axisLine={AXIS_LINE}
         tickLine={false}
         interval="preserveStartEnd"
@@ -445,7 +343,7 @@ function AgentChart({ chart, color }: { chart: HuntChart; color: string }) {
         width={44}
         label={
           chart.yLabel
-            ? { value: clip(chart.yLabel, 22), angle: -90, position: 'insideLeft', fill: '#8b94a3', fontSize: 10.5 }
+            ? { value: chart.yLabel, angle: -90, position: 'insideLeft', fill: '#8b94a3', fontSize: 10.5 }
             : undefined
         }
       />
@@ -457,9 +355,8 @@ function AgentChart({ chart, color }: { chart: HuntChart; color: string }) {
       <PanelHeader
         icon={isBar ? <BarChart3 size={15} /> : <LineChartIcon size={15} />}
         title={
-          // Machine-generated chart titles run long — two lines before the
-          // ellipsis; the tooltip carries the full text.
-          <span className="line-clamp-2" title={chart.title || 'Chart'}>
+          // A machine-generated chart title runs long. It wraps and shows whole.
+          <span className="break-words" title={chart.title || 'Chart'}>
             {chart.title || 'Chart'}
           </span>
         }
@@ -494,12 +391,12 @@ function AgentChart({ chart, color }: { chart: HuntChart; color: string }) {
       </div>
       <TableDisclosure
         caption={`${chart.title || 'Chart'} · data table`}
-        columns={[chart.xLabel ? clip(chart.xLabel, 24) : 'x', chart.yLabel ? clip(chart.yLabel, 24) : 'value']}
+        columns={[chart.xLabel || 'x', chart.yLabel || 'value']}
         rows={data.map((p) => [String(p.x), typeof p.y === 'number' ? p.y : String(p.y ?? '')])}
       />
       {chart.xLabel && (
         <div className="border-t border-border px-3.5 py-[7px] font-mono text-[10.5px] text-dim">
-          {clip(chart.xLabel, 60)}
+          {chart.xLabel}
         </div>
       )}
     </Panel>
@@ -525,13 +422,9 @@ export function HuntVisuals({ findings, affectedHosts = [], charts = [] }: HuntV
   // says "top 8 of N" instead of a bare (capped) count.
   const hostsNamed = new Set(findings.flatMap((f) => f.hosts)).size;
 
-  // the map's right column: the chart's top-8 hosts, backfilled (under the
-  // same cap) with affected hosts no finding names
-  const mapHosts = [...hostR];
-  for (const h of affectedHosts) {
-    if (mapHosts.length >= 8) break;
-    if (!mapHosts.some((r) => r.host === h)) mapHosts.push({ host: h, count: 0, worst: 'info' });
-  }
+  // The map draws every host a finding names, then the affected hosts no
+  // finding names, up to MAX_MAP_HOSTS. lib/huntGraph.ts shapes it.
+  const map = useMemo(() => huntGraphView(findings, affectedHosts), [findings, affectedHosts]);
 
   const gaps = sevRows.reduce((n, r) => n + r.visibility_gap, 0);
   const obs = sevRows.reduce((n, r) => n + r.observation, 0);
@@ -616,23 +509,22 @@ export function HuntVisuals({ findings, affectedHosts = [], charts = [] }: HuntV
             title="Host and finding map"
             right={
               <span className="font-mono text-[11px] text-accent">
-                {findings.length}F · {mapHosts.length}H
+                {mapCountLabel(map.findings, map.hosts)}
               </span>
             }
           />
-          {mapHosts.length === 0 ? (
-            <div className="px-4 py-3.5 text-[12.5px] text-dim">
-              No hosts to map. No finding names a host.
+          <Graph
+            view={map.view}
+            ariaLabel="Host and finding map of this hunt"
+            emptyText="No hosts to map. No finding names a host."
+          />
+          {map.hostsCut > 0 && (
+            <div className="border-t border-border px-3.5 py-2 text-[11px] text-faint">
+              The map draws the {map.hosts} hosts that the most findings name. It leaves off {map.hostsCut} more.
             </div>
-          ) : (
+          )}
+          {map.hosts > 0 && (
             <>
-              <HostFindingMap findings={findings} hosts={mapHosts} />
-              <LegendRow
-                items={[
-                  { swatch: SEV_COLOR.high, label: 'finding · severity color' },
-                  { swatch: '#4b8bf5', round: true, label: 'host' },
-                ]}
-              />
               <TableDisclosure
                 caption="Host and finding map · each finding and the hosts it names"
                 columns={['Finding', 'Severity', 'Category', 'Hosts']}

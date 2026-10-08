@@ -1,6 +1,6 @@
-// The Hunts page reads top to bottom as the pipeline: what needs the analyst,
-// what the analytics found (Analytic hits), what is worth pursuing (Leads),
-// what was pursued (Hunts). Each item appears once.
+// The Hunts page reads top to bottom by the work: what needs the analyst,
+// the leads that wait on a decision (Leads), what the analytics found
+// (Analytic hits), what was pursued (Hunts). Each item appears once.
 //
 // These tests pin the ANATOMY, because a pixel offset is not something the DOM
 // can measure: the order of the blocks, the one-line header, and the composer
@@ -37,7 +37,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
 }));
 
 import { ShellProvider } from '../shell/ShellContext';
-import { Hunts } from './Hunts';
+import { Hunts, STATUS_COLUMN } from './Hunts';
 
 const ROW: HuntRow = {
   id: 'H1',
@@ -82,7 +82,9 @@ const follows = (a: Element, b: Element) =>
 const composer = () => screen.queryByPlaceholderText(/hunt for beaconing to rare external IPs/i);
 
 describe('Hunts page anatomy', () => {
-  it('reads as the pipeline, top to bottom', async () => {
+  // W1: the leads start directly under Needs you. They started 1,977 px down
+  // a 900 px screen, under twelve hits that waited on nobody.
+  it('reads by the work, top to bottom', async () => {
     renderHunts();
     await screen.findByText(ROW.objective);
 
@@ -96,10 +98,24 @@ describe('Hunts page anatomy', () => {
     const objectiveHeader = screen.getByText('Objective');
 
     expect(follows(stats, needsYou)).toBe(true);
-    expect(follows(needsYou, hits)).toBe(true);
-    expect(follows(hits, leads)).toBe(true);
-    expect(follows(leads, section)).toBe(true);
+    expect(follows(needsYou, leads)).toBe(true);
+    expect(follows(leads, hits)).toBe(true);
+    expect(follows(hits, section)).toBe(true);
     expect(follows(section, objectiveHeader)).toBe(true);
+  });
+
+  // K7: "No threat observed" wrapped onto two lines in a 100 px column. The
+  // longest outcome is now "No threat found, visibility gap".
+  it('gives the status column room for the longest one-line outcome', async () => {
+    renderHunts();
+    await screen.findByText(ROW.objective);
+    const header = screen.getByText('Status').parentElement as HTMLElement;
+    const columns = header.style.gridTemplateColumns.split(' ');
+    // Status, Started, Tags, actions: the status column is fourth from the end.
+    expect(columns[columns.length - 4]).toBe(STATUS_COLUMN);
+    // Negative control: the old width is gone.
+    expect(STATUS_COLUMN).not.toBe('100px');
+    expect(Number.parseInt(STATUS_COLUMN, 10)).toBeGreaterThanOrEqual(210);
   });
 
   it('heads the hunt list with the shared toolbar', async () => {
@@ -169,12 +185,15 @@ describe('Hunts page anatomy', () => {
 describe('Hunts list column widths', () => {
   const gridOf = (el: HTMLElement) => el.style.gridTemplateColumns;
 
-  it('floors the objective at 260px and lets the counters shrink first', async () => {
+  // The objective held the chips until 2026-10-07. The chips moved to the
+  // tags column and the objective wraps whole, so the floor dropped from
+  // 260px to 170px and the table fits a 1280px window.
+  it('floors the objective at 170px and lets the counters shrink first', async () => {
     renderHunts();
     await screen.findByText(ROW.objective);
     const header = screen.getByText('Objective').parentElement as HTMLElement;
     const template = gridOf(header);
-    expect(template).toContain('minmax(260px, 1fr)');
+    expect(template).toContain('minmax(170px, 1fr)');
     // Findings and Hosts carry a floor well under their preferred width, so
     // they are the tracks the browser takes the shortfall from.
     expect(template).toMatch(/minmax\(52px, 100px\)/);
@@ -194,6 +213,6 @@ describe('Hunts list column widths', () => {
     const words = Array.from(header.children)
       .map((c) => c.textContent?.trim())
       .filter(Boolean);
-    expect(words).toEqual(['Objective', 'Started by', 'Findings', 'Hosts', 'Status', 'Started']);
+    expect(words).toEqual(['Objective', 'Started by', 'Findings', 'Hosts', 'Status', 'Started', 'Tags']);
   });
 });

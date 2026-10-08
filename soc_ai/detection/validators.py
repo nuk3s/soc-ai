@@ -485,7 +485,7 @@ async def dry_run_detection(
 
     def _not_run(error: str) -> SigmaDraft:
         return draft.model_copy(
-            update={"dry_run": DryRunResult(ran=False, window_days=window_days, error=error[:200])}
+            update={"dry_run": DryRunResult(ran=False, window_days=window_days, error=error)}
         )
 
     oql = _strip_result_stages(draft.oql.strip())

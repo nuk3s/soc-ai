@@ -203,9 +203,9 @@ shadow starts a hunt.
 
 A lead starts its own hunt. A loop picks up each open lead within 60 s and runs
 the hunt that the Hunt button runs. The hunt reads the lead's own documents
-before it queries the grid. You decide after the hunt lands. Promote then runs an
-investigation whose subject is the hunt. The subject holds the objective, every
-finding, and every document those findings cite, up to 40.
+before it queries the grid. The hunt then investigates its findings. The subject
+of each investigation is the hunt. The subject holds the objective, every finding,
+and every document those findings cite, up to 40.
 
 A lead also names the open leads that relate to it over the last 7 days. A
 related lead shares an analytic, an alert rule, an external network or an ATT&CK

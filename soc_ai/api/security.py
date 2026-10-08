@@ -151,7 +151,7 @@ async def require_csrf_safe(request: Request) -> None:
             "reason": "bad_origin",
             "hint": (
                 "Cross-origin cookie-authenticated write rejected. Send the request "
-                "from the app's own origin, or use 'Authorization: Bearer scai_…'."
+                "from the app's own origin, or use 'Authorization: Bearer scai_<token>'."
             ),
         },
     )
@@ -198,6 +198,6 @@ async def require_api_auth(request: Request) -> None:
         status_code=401,
         detail={
             "reason": "no_session",
-            "hint": "Log in at /app/login or send 'Authorization: Bearer scai_…'.",
+            "hint": "Log in at /app/login or send 'Authorization: Bearer scai_<token>'.",
         },
     )

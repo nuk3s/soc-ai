@@ -24,7 +24,6 @@ vi.mock('../lib/api', async (importOriginal) => ({
 }));
 
 import {
-  ApiError,
   getLeads,
   getNeedsYou,
   huntLead,
@@ -33,13 +32,13 @@ import {
   type NeedsYou,
 } from '../lib/api';
 import {
+  ACTION_HUNT,
   CHIP_LEFT_TO_YOU,
   CHIP_RELATED,
   LEADS_NOTE_AUTO_HUNT,
   LEGEND_AUTO_HUNT,
   PILL_HUNT_QUEUED,
   PILL_NEW,
-  PROMOTE_NEEDS_HUNT,
 } from '../lib/tooltips';
 import { LEAD_ACTION, LeadsStrip } from './LeadsStrip';
 
@@ -112,16 +111,17 @@ describe('a queued hunt on a new lead', () => {
     expect(pill.getAttribute('title')).toBe(PILL_NEW);
   });
 
-  // The two acts left to an analyst are to close the lead or to take it
-  // further. Hunt is still there for the case where the loop is behind, and it
-  // says so: "Hunt now" is a different act from "Hunt".
-  it('offers Dismiss and Promote, with Hunt now as the secondary act', async () => {
+  // The act left to an analyst is to close the lead. Hunt is still there for
+  // the case where the loop is behind, and it says so: "Hunt now" is a
+  // different act from "Hunt this lead". The hunt investigates what it finds,
+  // so the row offers no investigation of its own (owner, 2026-10-07).
+  it('offers Dismiss, with Hunt now as the secondary act', async () => {
     mount();
     const row = await screen.findByTestId('lead-7');
     expect(within(row).getByRole('button', { name: LEAD_ACTION.dismiss })).toBeTruthy();
-    expect(within(row).getByRole('button', { name: LEAD_ACTION.promote })).toBeTruthy();
     expect(within(row).getByRole('button', { name: LEAD_ACTION.huntNow })).toBeTruthy();
     expect(within(row).queryByRole('button', { name: LEAD_ACTION.hunt })).toBeNull();
+    expect(within(row).queryByRole('button', { name: /Open an investigation|Promote/ })).toBeNull();
   });
 
   it('starts the hunt from Hunt now rather than waiting for the loop', async () => {
@@ -197,74 +197,28 @@ describe('a lead the loop leaves to the analyst', () => {
   });
 });
 
-// The server refuses a promotion of a lead that has never been hunted, because
-// the investigation reads the hunt's findings. The refusal carries a sentence,
-// and the row printed "The lead was not promoted. Try again." over it, which
-// told the analyst to repeat the act that had just been refused.
-describe('a refused promotion', () => {
-  it('shows the sentence the server sent', async () => {
-    vi.mocked(getLeads).mockResolvedValue([HUNTED]);
-    vi.mocked(promoteLead).mockRejectedValue(
-      new ApiError(
-        "Hunt this lead first. The investigation reads the hunt's findings.",
-        409,
-        'lead_not_hunted',
-      ),
-    );
-    mount();
-    const row = await screen.findByTestId('lead-7');
-    fireEvent.click(within(row).getByRole('button', { name: LEAD_ACTION.promote }));
-    await waitFor(() =>
-      expect(
-        within(row).getByText(
-          "Hunt this lead first. The investigation reads the hunt's findings.",
-        ),
-      ).toBeTruthy(),
-    );
-  });
-
-  it('keeps its own words for a failure the server did not name', async () => {
-    vi.mocked(getLeads).mockResolvedValue([HUNTED]);
-    vi.mocked(promoteLead).mockRejectedValue(new Error('Network error.'));
-    mount();
-    const row = await screen.findByTestId('lead-7');
-    fireEvent.click(within(row).getByRole('button', { name: LEAD_ACTION.promote }));
-    await waitFor(() =>
-      expect(within(row).getByText('The lead was not promoted. Try again.')).toBeTruthy(),
-    );
-  });
-});
-
-// An investigation of a lead reads the hunt's findings, and the server
-// refuses a promotion before a hunt has run. The lead page disabled Promote
-// and said why; the row let the analyst click and read a refusal in red. One
-// lead, two behaviours.
-describe('Promote waits on a hunt', () => {
-  it('refuses on a new lead and says why', async () => {
+// A lead offers no "Open an investigation" (owner, 2026-10-07). The hunt
+// investigates what it finds and brings back the verdicts. The one manual
+// control of that name sits on a finding with no investigation, on the hunt
+// page. "Promote" beside "Hunt" read as two words for one act.
+describe('a lead row offers no investigation of its own', () => {
+  it('names the hunt "Hunt this lead" and says what a hunt returns', async () => {
     vi.mocked(getLeads).mockResolvedValue([LEAD]);
     mount();
     const row = await screen.findByTestId('lead-7');
-    const promote = within(row).getByRole('button', { name: LEAD_ACTION.promote });
-    expect((promote as HTMLButtonElement).disabled).toBe(true);
-    expect(promote.getAttribute('title')).toBe(PROMOTE_NEEDS_HUNT);
+    const hunt = within(row).getByRole('button', { name: 'Hunt this lead' });
+    expect(hunt.getAttribute('title')).toBe(ACTION_HUNT);
+    expect(within(row).queryByRole('button', { name: /Open an investigation|Promote/ })).toBeNull();
   });
 
-  it('refuses on a lead whose hunt is queued', async () => {
-    mount();
-    const row = await screen.findByTestId('lead-7');
-    const promote = within(row).getByRole('button', { name: LEAD_ACTION.promote });
-    expect((promote as HTMLButtonElement).disabled).toBe(true);
-    expect(promote.getAttribute('title')).toBe(PROMOTE_NEEDS_HUNT);
-  });
-
-  it('opens once the hunt has finished', async () => {
+  it('offers none on a hunted lead, and starts none', async () => {
     vi.mocked(getLeads).mockResolvedValue([HUNTED]);
     mount();
     const row = await screen.findByTestId('lead-7');
-    const promote = within(row).getByRole('button', { name: LEAD_ACTION.promote });
-    expect((promote as HTMLButtonElement).disabled).toBe(false);
-    fireEvent.click(promote);
-    await waitFor(() => expect(promoteLead).toHaveBeenCalledWith(7));
+    expect(within(row).getByRole('link', { name: LEAD_ACTION.readHunt })).toBeTruthy();
+    expect(within(row).getByRole('button', { name: LEAD_ACTION.dismiss })).toBeTruthy();
+    expect(within(row).queryByRole('button', { name: /Open an investigation|Promote/ })).toBeNull();
+    expect(promoteLead).not.toHaveBeenCalled();
   });
 });
 

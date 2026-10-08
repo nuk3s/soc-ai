@@ -53,10 +53,31 @@ def test_a_candidate_becomes_a_finding_with_real_citations() -> None:
     assert "T1003.006" in finding["mitre_techniques"]
 
 
-def test_the_title_stays_within_the_analyst_scannable_budget() -> None:
-    """HuntFinding's own style rule: ~60 characters, scannable in a list."""
+def test_the_title_holds_the_whole_spec_title_and_the_entity() -> None:
+    """The title was cut to 60 characters before the store, so the range held
+    "Directory replication requested by a non-machin… — localuser". The console
+    wraps a long title, so the store keeps the spec title whole."""
     (finding,) = candidate_findings(DCSYNC, _run())
-    assert len(finding["title"]) <= 60
+    assert finding["title"] == f"{DCSYNC.title} — localuser"
+    assert "…" not in finding["title"]
+
+
+def test_a_200_character_spec_title_survives_the_store() -> None:
+    title = ("A non-machine account requests directory replication on a domain controller " * 3)[
+        :200
+    ].strip()
+    spec = DCSYNC.model_copy(update={"title": title})
+    (finding,) = candidate_findings(spec, _run())
+    assert finding["title"] == f"{title} — localuser"
+    assert len(finding["title"]) > 200
+
+
+def test_a_very_long_spec_title_is_stored_whole_with_the_entity() -> None:
+    """No title is cut. The owner banned the ellipsis cut on 2026-10-07."""
+    spec = DCSYNC.model_copy(update={"title": "directory replication " * 40})
+    (finding,) = candidate_findings(spec, _run())
+    assert finding["title"] == f"{spec.title} — localuser"
+    assert "…" not in finding["title"]
 
 
 def test_the_detail_is_the_spec_authors_prose_not_a_generated_sentence() -> None:
@@ -393,7 +414,7 @@ def test_every_shipped_spec_produces_a_renderable_finding() -> None:
             ],
         )
         (finding,) = candidate_findings(spec, run)
-        assert finding["title"] and len(finding["title"]) <= 60
+        assert finding["title"] == f"{spec.title} — x"
         assert len(finding["detail"]) > 40
         assert finding["severity"] in {"info", "low", "medium", "high", "critical"}
 

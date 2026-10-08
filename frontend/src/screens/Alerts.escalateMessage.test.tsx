@@ -9,7 +9,7 @@
 // Three things the operator now has to be able to tell apart: cases opened,
 // cases withheld because one already exists, and alerts skipped because
 // Security Onion had already acknowledged them.
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { ToastProvider } from '../lib/toast';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -62,7 +62,7 @@ import {
   listSavedViews,
 } from '../lib/api';
 import { queueOf } from '../test/alertQueue';
-import { Alerts } from './Alerts';
+import { Alerts, escalateAlertCount, escalateConfirmText } from './Alerts';
 import { ShellProvider } from '../shell/ShellContext';
 
 const GROUP: AlertGroup = {
@@ -118,6 +118,10 @@ async function pressEscalate() {
   await act(async () => {
     fireEvent.keyDown(window, { key: 'e' });
   });
+  // Every escalate asks first (dogfood 2026-10-06, investigation S2).
+  fireEvent.click(
+    within(await screen.findByTestId('escalate-confirm')).getByRole('button', { name: /^Open/ }),
+  );
   await waitFor(() => expect(escalateGroup).toHaveBeenCalled());
 }
 
@@ -247,5 +251,45 @@ describe('the escalate strip', () => {
     expect(strip.textContent).not.toMatch(/left/);
     expect(strip.textContent).not.toMatch(/failed/);
     expect(strip.textContent).not.toMatch(/nothing attached/);
+  });
+});
+
+// Dogfood 2026-10-06, investigation S2: the list's Escalate opened one case per
+// alert on the first key press. It now asks first and names the count.
+describe('the escalate confirm', () => {
+  it('names the count of cases and writes nothing before the confirm', async () => {
+    render(
+      <ToastProvider>
+        <MemoryRouter initialEntries={['/alerts']}>
+          <ShellProvider>
+            <Alerts />
+          </ShellProvider>
+        </MemoryRouter>
+      </ToastProvider>,
+    );
+    await screen.findByText(GROUP.name);
+    await act(async () => {
+      fireEvent.keyDown(window, { key: 'j' });
+    });
+    await act(async () => {
+      fireEvent.keyDown(window, { key: 'e' });
+    });
+    const dialog = await screen.findByTestId('escalate-confirm');
+    expect(dialog.textContent).toContain(
+      `Open 18 Security Onion cases, one for each alert of ${GROUP.name}.`,
+    );
+    expect(within(dialog).getByRole('button', { name: 'Open 18 cases' })).toBeTruthy();
+    expect(escalateGroup).not.toHaveBeenCalled();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByTestId('escalate-confirm')).toBeNull();
+    expect(escalateGroup).not.toHaveBeenCalled();
+  });
+
+  it('says "each alert" when a group is not on the page', () => {
+    expect(escalateAlertCount([{ name: 'X', kind: 'suricata' }], [GROUP])).toBeNull();
+    expect(escalateAlertCount([{ name: GROUP.name, kind: GROUP.kind }], [GROUP])).toBe(18);
+    expect(escalateConfirmText([{ name: 'X', kind: 'suricata' }], null)).toBe(
+      'Open one Security Onion case for each alert of X.',
+    );
   });
 });

@@ -50,11 +50,11 @@ describe('ManagedList — no optional props (unchanged behaviour)', () => {
     render(<ManagedList {...baseProps()} rows={manyRows(6)} onDismiss={vi.fn()} />);
 
     expect(visibleValues()).toHaveLength(6);
-    expect(screen.queryByPlaceholderText('Filter…')).not.toBeInTheDocument();
+    expect(screen.queryByPlaceholderText('Filter')).not.toBeInTheDocument();
     expect(screen.queryAllByRole('checkbox')).toHaveLength(0);
     expect(screen.queryByRole('button', { name: /^Show /})).not.toBeInTheDocument();
     // the existing add input and per-row dismiss survive
-    expect(screen.getByPlaceholderText('add value…')).toBeInTheDocument();
+    expect(screen.getByPlaceholderText('add value')).toBeInTheDocument();
     expect(screen.getAllByRole('button', { name: 'Dismiss' })).toHaveLength(6);
   });
 
@@ -83,7 +83,7 @@ describe('ManagedList — searchable', () => {
     expect(visibleValues()).toHaveLength(3);
     expect(screen.queryByText('3 of 3 shown')).not.toBeInTheDocument();
 
-    await user.type(screen.getByPlaceholderText('Filter…'), 'beta');
+    await user.type(screen.getByPlaceholderText('Filter'), 'beta');
     expect(visibleValues()).toEqual(['BETA-001.example.internal']);
     expect(screen.getByText('1 of 3 shown')).toBeInTheDocument();
   });
@@ -92,7 +92,7 @@ describe('ManagedList — searchable', () => {
     const user = userEvent.setup();
     render(<ManagedList {...baseProps()} rows={mixed} searchable />);
 
-    const input = screen.getByPlaceholderText('Filter…');
+    const input = screen.getByPlaceholderText('Filter');
     await user.type(input, 'alpha');
     expect(visibleValues()).toHaveLength(2);
     await user.clear(input);
@@ -104,7 +104,7 @@ describe('ManagedList — searchable', () => {
     const user = userEvent.setup();
     render(<ManagedList {...baseProps()} rows={mixed} searchable />);
 
-    await user.type(screen.getByPlaceholderText('Filter…'), 'gamma');
+    await user.type(screen.getByPlaceholderText('Filter'), 'gamma');
     expect(screen.queryAllByRole('switch')).toHaveLength(0);
     expect(screen.getByText('0 of 3 shown')).toBeInTheDocument();
   });
@@ -135,7 +135,7 @@ describe('ManagedList — pageSize', () => {
     const rows = [...manyRows(30, 'alpha', 1), ...manyRows(12, 'beta', 100)];
     render(<ManagedList {...baseProps()} rows={rows} searchable pageSize={10} />);
 
-    const input = screen.getByPlaceholderText('Filter…');
+    const input = screen.getByPlaceholderText('Filter');
     await user.type(input, 'beta');
     expect(visibleValues()).toHaveLength(10);
     expect(screen.getByText('12 of 42 shown')).toBeInTheDocument();

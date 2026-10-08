@@ -209,7 +209,7 @@ export function ManagedList({
       {searchable && (
         <div className="mb-1.5 flex items-center gap-2.5">
           <input
-            placeholder="Filter…"
+            placeholder="Filter"
             value={filter}
             onChange={(e) => {
               setFilter(e.target.value);
@@ -329,7 +329,7 @@ export function ManagedList({
                   <div className="flex flex-wrap items-center gap-2">
                     <span
                       className={
-                        'truncate font-mono text-[12.5px] ' + (active ? 'text-text' : 'text-faint')
+                        'break-all font-mono text-[12.5px] ' + (active ? 'text-text' : 'text-faint')
                       }
                     >
                       {row.value}
@@ -411,7 +411,7 @@ export function ManagedList({
       {/* + add inline input */}
       <div className="mt-2 flex items-center gap-2">
         <input
-          placeholder={addPlaceholder ?? 'add value…'}
+          placeholder={addPlaceholder ?? 'add value'}
           value={value}
           onChange={(e) => setValue(e.target.value)}
           onKeyDown={(e) => {

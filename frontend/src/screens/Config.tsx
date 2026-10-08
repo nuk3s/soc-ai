@@ -6,8 +6,8 @@ import { ApplyBadge, RoleChip, SourceBadge, StatusTag } from '../components/Badg
 import { NumberField, Select, Toggle } from '../components/Controls';
 import { ManagedList } from '../components/ManagedList';
 import { SectionTitle } from '../components/Panel';
-import { DemoDisabledState, ErrorState, LoadingState, Spinner } from '../components/States';
-import { DoctorList } from '../components/DoctorList';
+import { DemoDisabledState, ErrorState, LoadingInline, LoadingState, Spinner } from '../components/States';
+import { DoctorList, warnRows } from '../components/DoctorList';
 import { AgentToolsPanel } from './AgentToolsPanel';
 import { ApiKeysPanel } from './ApiKeysPanel';
 import { DataSourcesPanel } from './DataSourcesPanel';
@@ -249,7 +249,7 @@ function ModelFitnessChip({
   return (
     <div className="flex flex-col items-end gap-0.5">
     <div className="flex items-center gap-2">
-      {loading && !view && <span className="text-[11px] text-faint">Checking fitness…</span>}
+      {loading && !view && <span className="text-[11px] text-faint"><LoadingInline size={10}>Checking fitness</LoadingInline></span>}
       {!loading && staged && (
         <span
           data-testid="fitness-staged"
@@ -273,13 +273,13 @@ function ModelFitnessChip({
       )}
       {loading && view && (
         <span data-testid="fitness-checking" className="text-[11px] text-faint">
-          checking…
+          checking
         </span>
       )}
       {!loading && view && view.detail && (
         <span
           data-testid="fitness-detail"
-          className="max-w-[190px] truncate text-[11px] text-dim"
+          className="max-w-[190px] break-words text-[11px] text-dim"
           title={view.title}
         >
           {view.detail}
@@ -382,8 +382,8 @@ function ModelBatteryPanel({
       <div className="flex items-center gap-2">
         {running && (
           <span className="text-[11px] text-faint">
-            Model battery: {battery?.current_config ?? '…'} · {(battery?.completed ?? 0) + 1} of{' '}
-            {battery?.total ?? 4}…
+            Model battery: {battery?.current_config ?? 'starting'} · {(battery?.completed ?? 0) + 1} of{' '}
+            {battery?.total ?? 4}
           </span>
         )}
         {!running && result?.configs && battery?.stored_at && (
@@ -471,12 +471,12 @@ function ModelBatteryPanel({
         </div>
       )}
       {!running && battery?.error && (
-        <span className="max-w-[280px] truncate text-[11px] text-danger" title={battery.error}>
+        <span className="max-w-[280px] break-words text-[11px] text-danger" title={battery.error}>
           The model battery failed: {battery.error}
         </span>
       )}
       {!running && startError && (
-        <span className="max-w-[280px] truncate text-[11px] text-danger" title={startError}>
+        <span className="max-w-[280px] break-words text-[11px] text-danger" title={startError}>
           The model battery could not start: {startError}
         </span>
       )}
@@ -511,6 +511,9 @@ export function Config() {
   }, [collapsed]);
   const toggleSection = (title: string) =>
     setCollapsed((c) => ({ ...c, [title]: !c[title] }));
+  // The WARN rows of the doctor list, and whether the list shows only them.
+  const [doctorWarnings, setDoctorWarnings] = useState(0);
+  const [doctorWarnOnly, setDoctorWarnOnly] = useState(false);
   // Advanced folds (day1 tier, Wave 2) don't have ONE fixed default: a mixed
   // section (some day1 items, some not) starts collapsed, but an all-advanced
   // section starts OPEN (see advCollapsed in renderGroup below — the single
@@ -1189,7 +1192,7 @@ export function Config() {
     return stagedBool('auto_ack_fp_enabled', s.value as boolean);
   };
 
-  if (loading && !data) return <div className="p-6"><LoadingState label="Loading settings…" /></div>;
+  if (loading && !data) return <div className="p-6"><LoadingState label="Loading settings" /></div>;
   // The hosted demo refuses admin-gated reads outright (403 `demo_mode` — the
   // read-side mirror of its write lock). That is policy, not an incident, and
   // it must not wear the alarm-red outage card: it is the first thing a demo
@@ -1402,7 +1405,7 @@ export function Config() {
         { value: '', label: '(off)' },
         ...(current !== '' && !custom && !gatewayModels.includes(current) ? [current] : []),
         ...gatewayModels,
-        { value: OTHER_MODEL_OPTION, label: 'Other…' },
+        { value: OTHER_MODEL_OPTION, label: 'Other' },
       ];
       control = (
         <div className="flex flex-col items-end gap-1.5">
@@ -1721,7 +1724,7 @@ export function Config() {
             className="inline-flex items-center gap-1.5 rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-[5px] text-[11.5px] font-semibold text-text hover:border-accent disabled:opacity-60 disabled:cursor-not-allowed"
           >
             {scanInFlight && <Spinner size={11} />}
-            {scanInFlight ? 'Scanning…' : 'Scan now'}
+            {scanInFlight ? 'Scanning' : 'Scan now'}
           </button>
         </div>
       }
@@ -1756,7 +1759,7 @@ export function Config() {
               on Security Onion for something Security Onion will never fix. */}
           <ul className="mt-1.5 space-y-0.5 text-[11.5px] text-dim">
             {scanErrors.slice(0, SHOWN_ERRORS).map((e, i) => (
-              <li key={i} className="truncate font-mono" title={e}>
+              <li key={i} className="break-all font-mono" title={e}>
                 {e}
               </li>
             ))}
@@ -1772,7 +1775,7 @@ export function Config() {
       {identError && <div className="mb-2 text-[12px] text-danger">{identError}</div>}
 
       {idents == null && !identError ? (
-        <LoadingState label="Loading internal identifiers…" />
+        <LoadingState label="Loading internal identifiers" />
       ) : idents ? (
         (['suffix', 'host', 'cidr'] as const).map((kind) => {
           const group = idents.groups.find((g) => g.kind === kind);
@@ -1846,7 +1849,7 @@ export function Config() {
               className="inline-flex items-center gap-1.5 rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-[5px] text-[11.5px] font-semibold text-text hover:border-accent disabled:opacity-60 disabled:cursor-not-allowed"
             >
               {reembedding && <Spinner size={11} />}
-              {reembedding ? 'Re-embedding…' : 'Re-embed runbooks'}
+              {reembedding ? 'Re-embedding' : 'Re-embed runbooks'}
             </button>
           </div>
         </div>
@@ -2050,7 +2053,7 @@ export function Config() {
                     )}
                   </div>
                   {u.status && (
-                    <div className="mt-0.5 truncate text-[11px] italic text-faint">{u.status}</div>
+                    <div className="mt-0.5 break-words text-[11px] italic text-faint">{u.status}</div>
                   )}
                 </div>
                 <div className="flex items-center gap-2 flex-none">
@@ -2240,6 +2243,27 @@ export function Config() {
         title="Diagnostics"
         collapsed={!!collapsed['Diagnostics']}
         onToggle={() => toggleSection('Diagnostics')}
+        right={
+          // The WARN rows sat among 31 doctor rows with no filter (dogfood
+          // 2026-10-06). The chip shows the WARN rows only, and again all of
+          // them on a second press.
+          doctorWarnings > 0 && !collapsed['Diagnostics'] ? (
+            <button
+              type="button"
+              data-testid="doctor-warn-chip"
+              aria-pressed={doctorWarnOnly}
+              onClick={() => setDoctorWarnOnly((on) => !on)}
+              title={doctorWarnOnly ? 'Show every doctor row.' : 'Show the WARN rows only.'}
+              className={`rounded-chip border px-2 py-px text-[11px] font-semibold ${
+                doctorWarnOnly
+                  ? 'border-warn bg-[rgba(245,166,35,.16)] text-warn'
+                  : 'border-[rgba(245,166,35,.45)] text-warn hover:bg-[rgba(245,166,35,.1)]'
+              }`}
+            >
+              {doctorWarnings} warning{doctorWarnings === 1 ? '' : 's'}
+            </button>
+          ) : undefined
+        }
       >
         <div className="text-[12px] text-dim mb-2">These checks are read-only. They are safe to run at any time.</div>
         <div className="overflow-hidden rounded-card border border-border bg-surface-1">
@@ -2253,7 +2277,7 @@ export function Config() {
                     onClick={() => handleConnTest(target)}
                     disabled={res?.loading}
                   >
-                    {res?.loading ? 'Testing…' : `Test ${target.toUpperCase()}`}
+                    {res?.loading ? 'Testing' : `Test ${target.toUpperCase()}`}
                   </button>
                   {res && !res.loading && (
                     <span className="text-[11px]" style={{ color: res.ok ? '#12b76a' : '#f04438' }}>
@@ -2283,7 +2307,7 @@ export function Config() {
               onClick={handleVerifyChain}
               disabled={auditVerify.loading}
             >
-              {auditVerify.loading ? 'Verifying…' : 'Verify audit chain'}
+              {auditVerify.loading ? 'Verifying' : 'Verify audit chain'}
             </button>
             {auditVerify.result && !auditVerify.loading && (
               <span
@@ -2301,7 +2325,7 @@ export function Config() {
           </div>
           {/* Every doctor row. The Setup health card shows FAIL and WARN
               only, and the INFO and PASS rows had no other surface. */}
-          <DoctorList />
+          <DoctorList warnOnly={doctorWarnOnly} onRows={(rows) => setDoctorWarnings(warnRows(rows).length)} />
         </div>
       </CollapsibleConfigSection>
   );
@@ -2335,7 +2359,7 @@ export function Config() {
 
         {/* Settings rows */}
         {collapsed['Danger Zone'] ? null : dangerLoading ? (
-          <div className="px-4 py-6 text-[12px] text-text-muted">Loading…</div>
+          <div className="px-4 py-6 text-[12px] text-text-muted"><LoadingInline>Loading</LoadingInline></div>
         ) : dangerError ? (
           <div className="px-4 py-4 text-[12px] text-faint">{dangerError}</div>
         ) : (
@@ -2432,7 +2456,7 @@ export function Config() {
                           onClick={() => handleDangerSave(s.key)}
                           disabled={!confirmOk || !dangerEditValue || dangerSaving}
                         >
-                          {dangerSaving ? 'Saving…' : 'Save'}
+                          {dangerSaving ? 'Saving' : 'Save'}
                         </button>
                         <button
                           className="rounded px-3 py-1 text-[11.5px] border border-border bg-surface-2 hover:bg-surface-3 transition-colors"
@@ -2615,7 +2639,9 @@ export function Config() {
       </aside>
       <div className="min-w-0 max-w-permalink flex-1">
       <ConfigNavSelect groups={layout} activeId={effectiveId} onNavigate={navigateToSection} />
-      <div className="text-[20px] font-semibold tracking-[-.015em]">Config</div>
+      {/* The nav entry and the page share one name. The nav said "Config"
+          over a page the guide called "Settings" (dogfood 2026-10-06). */}
+      <div className="text-[20px] font-semibold tracking-[-.015em]">Settings</div>
       <div className="mb-[14px] mt-0.5 text-[13px] text-dim">
         Runtime settings · users · API tokens. A source badge names the origin of a value. The
         origin is the database or an environment variable.
@@ -2712,7 +2738,7 @@ export function Config() {
             className="inline-flex items-center gap-1.5 rounded-[7px] border border-accent bg-accent/15 px-[13px] py-[6px] text-[12px] font-semibold text-accent hover:bg-accent/25 disabled:opacity-40 disabled:cursor-not-allowed"
           >
             {applying && <Spinner size={12} />}
-            {applying ? 'Applying…' : `Apply changes${isDirty ? ` (${dirtyKeys.length})` : ''}`}
+            {applying ? 'Applying' : `Apply changes${isDirty ? ` (${dirtyKeys.length})` : ''}`}
           </button>
         </div>
       )}

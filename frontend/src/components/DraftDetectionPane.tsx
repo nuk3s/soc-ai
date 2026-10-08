@@ -141,7 +141,7 @@ export function DraftDetectionPane({ onDraft, provenance, autoRun = false }: Dra
             style={{ background: 'rgba(75,139,245,.14)', borderColor: 'rgba(75,139,245,.4)' }}
           >
             {loading ? <Spinner size={13} /> : <FileCode2 size={13} />}
-            {loading ? 'Drafting…' : 'Draft detection'}
+            {loading ? 'Drafting' : 'Draft detection'}
           </button>
         )}
       </div>
@@ -165,7 +165,7 @@ export function DraftDetectionPane({ onDraft, provenance, autoRun = false }: Dra
             )}
             {loading && !draft && (
               <div className="flex items-center gap-2 text-[12.5px] text-dim">
-                <Spinner size={13} /> Drafting a detection…
+                <Spinner size={13} /> Drafting a detection
               </div>
             )}
             {draft && (

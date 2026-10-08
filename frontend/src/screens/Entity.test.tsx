@@ -110,12 +110,14 @@ describe('Entity hunting panels', () => {
     expect(screen.getByRole('button', { name: 'Closed' })).toBeTruthy();
   });
 
-  it('leaves the panels off an address, because the host page holds them', async () => {
+  it('shows the panels on an address no machine holds too', async () => {
+    // Dogfood 2026-10-06, S2: an address an investigation named had no host
+    // page. The entity page is its page, and the leads and observations on it
+    // belong here.
     vi.mocked(getEntity).mockResolvedValue({ ...ENTITY, value: '8.8.8.8', kind: 'ip' } as never);
     mount('8.8.8.8');
-    await waitFor(() => expect(getEntity).toHaveBeenCalled());
-    expect(screen.queryByTestId('entity-hunting')).toBeNull();
-    expect(getObservations).not.toHaveBeenCalled();
+    expect(await screen.findByTestId('entity-hunting')).toBeTruthy();
+    await waitFor(() => expect(getObservations).toHaveBeenCalledWith('8.8.8.8', 7));
   });
 });
 
@@ -136,5 +138,86 @@ describe('Entity header chip', () => {
     const chip = await screen.findByTestId('entity-type');
     expect(chip.textContent).toBe('address');
     expect(chip.getAttribute('title')).toBe(ENTITY_ADDRESS);
+  });
+});
+
+// "Who is this and should I worry" (dogfood 2026-10-06, S5). The page held a
+// timeline and two counts, and said nothing about what the value was.
+describe('Entity identity and worry lines', () => {
+  it('says an external address is outside the internal ranges', async () => {
+    vi.mocked(getEntity).mockResolvedValue({
+      ...ENTITY,
+      value: '8.8.4.4',
+      kind: 'ip',
+      type: 'external_address',
+      summary: {
+        investigationCount: 2,
+        huntFindingCount: 0,
+        latestVerdict: 'true_positive',
+        truePositiveCount: 2,
+        leadCount: 1,
+        openLeadCount: 1,
+        observationCount: 0,
+      },
+      first_seen: iso(48 * HOUR),
+      last_seen: iso(2 * HOUR),
+    } as never);
+    mount('8.8.4.4');
+    expect((await screen.findByTestId('entity-identity')).textContent).toBe(
+      '8.8.4.4 is an external address. It is outside the internal ranges.',
+    );
+    const worry = screen.getByTestId('entity-worry').textContent ?? '';
+    expect(worry).toContain('1 open lead names it.');
+    expect(worry).toContain('2 investigations reached a true-positive verdict.');
+    expect(screen.getByTestId('entity-type').textContent).toBe('external address');
+    const seen = screen.getByTestId('entity-seen').textContent ?? '';
+    expect(seen).toContain('first seen 2d ago');
+    expect(seen).toContain('last seen 2h ago');
+    expect(screen.queryByTestId('entity-nothing-known')).toBeNull();
+  });
+
+  it('says when nothing is known', async () => {
+    vi.mocked(getEntity).mockResolvedValue({
+      ...ENTITY,
+      value: 'ghost',
+      type: 'name',
+      summary: { investigationCount: 0, huntFindingCount: 0, leadCount: 0, observationCount: 0 },
+      first_seen: null,
+      last_seen: null,
+    } as never);
+    mount('ghost');
+    expect((await screen.findByTestId('entity-nothing-known')).textContent).toBe(
+      'soc-ai knows nothing about ghost yet. No investigation, hunt finding, lead or observation names it.',
+    );
+    expect(screen.queryByTestId('entity-worry')).toBeNull();
+    expect(screen.getByTestId('entity-seen').textContent).toContain('first seen never');
+  });
+
+  it('does not say nothing is known when a lead names the value', async () => {
+    // NEGATIVE CONTROL: an empty timeline is not an empty record.
+    vi.mocked(getEntity).mockResolvedValue({
+      ...ENTITY,
+      type: 'user',
+      summary: { investigationCount: 0, huntFindingCount: 0, leadCount: 1, openLeadCount: 0, observationCount: 0 },
+    } as never);
+    mount();
+    expect((await screen.findByTestId('entity-identity')).textContent).toBe('svc_sql is a user account.');
+    expect(screen.queryByTestId('entity-nothing-known')).toBeNull();
+    expect(screen.getByTestId('entity-worry').textContent).toBe(
+      'No open lead names it. No investigation reached a true-positive verdict.',
+    );
+  });
+
+  it('counts the addresses joined to a domain', async () => {
+    vi.mocked(getEntity).mockResolvedValue({
+      ...ENTITY,
+      value: 'corp.example',
+      type: 'domain',
+      domain_machines: 3,
+    } as never);
+    mount('corp.example');
+    expect((await screen.findByTestId('entity-identity')).textContent).toBe(
+      'corp.example is a domain. 3 addresses are joined to it.',
+    );
   });
 });

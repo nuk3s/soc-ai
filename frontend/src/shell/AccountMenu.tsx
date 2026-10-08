@@ -122,10 +122,10 @@ export function AccountMenu({ me, onMe }: Props) {
         {!collapsed && (
           <>
             <span className="min-w-0 flex-1">
-              <span className="block truncate text-[12.5px] font-semibold text-text">
+              <span className="block break-words text-[12.5px] font-semibold text-text">
                 {me.username}
               </span>
-              <span className="block truncate text-[10.5px] text-faint">
+              <span className="block break-words text-[10.5px] text-faint">
                 {noUser ? sessionLine : me.status || me.role}
               </span>
             </span>
@@ -147,7 +147,7 @@ export function AccountMenu({ me, onMe }: Props) {
             style={{ left: anchor.left, bottom: anchor.bottom }}
           >
             <div className="border-b border-border-2 px-3.5 py-3">
-              <div className="truncate text-[13px] font-semibold text-text">{me.username}</div>
+              <div className="break-words text-[13px] font-semibold text-text">{me.username}</div>
               <div className="mt-1.5 flex items-center gap-1.5">
                 <RoleChip role={me.role} />
                 <span className="text-[11px] text-faint">role</span>
@@ -176,16 +176,16 @@ export function AccountMenu({ me, onMe }: Props) {
                     if (e.key === 'Enter') commitEdit();
                   }}
                   className="w-full rounded-control border border-border-input bg-bg px-2 py-1 text-[12px] text-text outline-none focus:border-accent"
-                  placeholder="Set status…"
+                  placeholder="Set status"
                 />
               ) : (
                 <button
                   type="button"
                   onClick={startEdit}
                   aria-label={me.status ? `Status: ${me.status}. Set status` : 'Set status'}
-                  className="w-full truncate rounded-control px-0 py-px text-left text-[12px] text-dim outline-none hover:text-text focus-visible:ring-1 focus-visible:ring-accent"
+                  className="w-full break-words rounded-control px-0 py-px text-left text-[12px] text-dim outline-none hover:text-text focus-visible:ring-1 focus-visible:ring-accent"
                 >
-                  {me.status || <span className="italic text-faint">Set status…</span>}
+                  {me.status || <span className="italic text-faint">Set status</span>}
                 </button>
               )}
             </div>

@@ -83,7 +83,7 @@ def test_executed_marker_follows_action_across_reindex() -> None:
     actions = _build_actions([marker], report_v2)
     assert actions[0].applied is False  # the new escalate is untouched
     assert actions[1].applied is True  # the executed ack is still applied
-    assert actions[1].appliedNote == "Executed · alice"
+    assert actions[1].appliedBy == "alice" and actions[1].appliedNote is None
 
 
 # ── F06: Phase-D dispatches count as tool calls ────────────────────────────

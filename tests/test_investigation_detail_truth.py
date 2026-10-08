@@ -461,3 +461,24 @@ def test_a_run_with_no_alert_context_reads_the_stored_ends(client: TestClient) -
     inv_id = asyncio.run(_go())
     body = client.get(f"/api/v1/investigations/{inv_id}").json()
     assert (body["srcIp"], body["dstIp"], body["reportedBy"]) == ("192.0.2.5", None, None)
+
+
+# ── the error step ──────────────────────────────────────────────────────────
+
+
+def test_an_error_event_files_under_error_and_not_validators() -> None:
+    """A failed run showed its error under VALIDATORS with a green check (dogfood 2026-10-06)."""
+    events = [
+        _ev(1, "session_start", {}),
+        _ev(2, "error", {"message": "the model gateway did not answer"}),
+    ]
+    timeline, *_ = _timeline._build_timeline(events)
+    error = next(s for s in timeline if s.id == "e2")
+    assert error.group == "Error"
+    assert not [s for s in timeline if s.group == "Validators"]
+
+
+def test_a_validator_step_stays_a_validator() -> None:
+    """NEGATIVE CONTROL. Only the error event moved."""
+    assert _timeline._tl_group("citation_validation") == "Validators"
+    assert _timeline._tl_group("error") == "Error"

@@ -16,7 +16,8 @@
 //
 // Two panels are the admitted exceptions, both reading because they answer a
 // question about unattended machinery with no other owner: the hunt catalog
-// (GET /hunt-catalog — is the sweep loop running at all) and the escalation
+// (GET /hunt-catalog — is the sweep loop running at all, and GET /hunts/hits
+// for the 7-day hit total the Hunts page counts) and the escalation
 // ledger (GET /escalations/stranded — which alerts are held by a claim that
 // never got an answer). Operate.catalog.test.tsx and
 // Operate.escalations.test.tsx cover the panels themselves. The guard below is
@@ -39,6 +40,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
   getBacktest: vi.fn(),
   getHuntCatalog: vi.fn(),
   getStrandedEscalations: vi.fn(),
+  getAnalyticHits: vi.fn().mockResolvedValue({ hits: [], counts: { all: 0, unread: 0, live: 0, shadow: 0 } }),
 }));
 
 import {

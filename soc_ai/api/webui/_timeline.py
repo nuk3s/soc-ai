@@ -43,7 +43,11 @@ _TL_GROUP = {
     "citation_cap": "Validators",
     "confidence_floor_raise": "Validators",
     "evidence_gate_pivot_exemption": "Validators",
-    "error": "Validators",
+    # A run that failed is not a check that passed. The error sat under
+    # "Validators" with a green check, on a run that reached no verdict
+    # (dogfood 2026-10-06). It has its own group, and the page draws it with
+    # a warning icon.
+    "error": "Error",
     # A taken action (auto-ack on a high-confidence FP) is a verdict
     # consequence, not an investigative tool call — a "no tools" heuristic run
     # must not grow a "Tool calls" timeline section from its own auto-ack.
@@ -108,6 +112,10 @@ _TL_SKIP = {
     # applied state on the action card already tells this story; a generic
     # timeline row would just be noise appended after "done".
     "action_executed",
+    # An analyst dismissed a recommendation or undid the dismissal. The card
+    # shows it, with the actor and the time.
+    "action_dismissed",
+    "action_restored",
     # The Oracle rule shadow ledger. It changes nothing on the run, and
     # Detection tuning shows the tally.
     "oracle_shadow",
@@ -129,9 +137,12 @@ def _tl_group(kind: str) -> str:
     return _TL_GROUP.get(kind, "Decision")
 
 
-def _compact(obj: Any, limit: int = 160) -> str:
-    s = obj if isinstance(obj, str) else json.dumps(obj, default=str, ensure_ascii=False)
-    return s if len(s) <= limit else s[: limit - 1] + "…"
+def _compact(obj: Any) -> str:
+    """``obj`` as one string, whole. The console wraps a long line.
+
+    A cut with an ellipsis hid the rest of the text (owner, 2026-10-07).
+    """
+    return obj if isinstance(obj, str) else json.dumps(obj, default=str, ensure_ascii=False)
 
 
 def _ep(ip: Any, port: Any) -> str:
@@ -171,6 +182,10 @@ def _alert_meta(
         # with the alert (an alert triaged hours later showed the triage time).
         "time": alert.get("timestamp"),
         "count": int(host_profile.get(rule, 1) or 1),
+        # The account and the machine the alert names, for the drawer's
+        # four-line Alert details (dogfood 2026-10-06, first hour W4).
+        "user": alert.get("user_name") or None,
+        "host": alert.get("host_name") or None,
     }
 
 
@@ -328,7 +343,7 @@ def _entity_graph(
         edges.append(edge)
     note = f"{label or src} contacted {n} peer{'' if n == 1 else 's'}." + (
         f" Enrichment flagged {len(flagged_names)} of them as malicious: "
-        f"{_compact(', '.join(flagged_names), 60)}."
+        f"{_compact(', '.join(flagged_names))}."
         if flagged_names
         else ""
     )
@@ -401,15 +416,15 @@ def _trim_summary_label(s: str) -> str:
 def _tool_outcome(result: Any) -> str:
     """A short, tool-aware outcome — the point of the step (vs 'total: 0')."""
     if result is None:
-        return "running…"
+        return "running"
     if isinstance(result, list):
         return (
             "no results" if not result else f"{len(result)} result{'' if len(result) == 1 else 's'}"
         )
     if isinstance(result, str):
-        return _compact(result, 80)
+        return _compact(result)
     if not isinstance(result, dict):
-        return _compact(result, 80)
+        return _compact(result)
     # An online tool that short-circuited (online enrichment off / no API key):
     # a neutral "skipped" outcome, NOT the multi-line config lecture the tool
     # returns for the model to read (that stays in the expander).
@@ -426,8 +441,8 @@ def _tool_outcome(result: Any) -> str:
         # Query errors often already read as failures ("failed to parse
         # filter…") — prefixing again would stutter "failed: failed to…".
         if msg.lstrip().lower().startswith(("failed", "error", "could not", "cannot", "unable")):
-            return _compact(msg, 80)
-        return "failed: " + _compact(msg, 60)
+            return _compact(msg)
+        return "failed: " + _compact(msg)
     # Host summary: "<ip> — 699 events", not the raw {ip, event_count} dict.
     if "event_count" in result and ("ip" in result or "host" in result):
         who = result.get("ip") or result.get("host")
@@ -469,7 +484,7 @@ def _tool_outcome(result: Any) -> str:
             val = result[k]
             if k == "summary" and isinstance(val, str):
                 val = _trim_summary_label(val)
-            return _compact(val, 120)
+            return _compact(val)
     # No known field — a bare, human outcome rather than a JSON dump of the dict
     # (machines read the full JSON in the row expander; humans read this line).
     return "done"
@@ -505,7 +520,7 @@ def _tool_step(tool_name: str, args: dict[str, Any], result: Any) -> tuple[str, 
     """Title carries the point (tool + a short outcome); detail (shown on expand)
     carries the FULL headline result first, then the query and any enrichment chips.
 
-    The collapsed title is necessarily clipped, so the expanded row is where the
+    The collapsed title holds a short outcome, so the expanded row is where the
     analyst reads the whole answer — never just the arguments (the old behaviour).
     """
     noun = _TOOL_NOUN.get(tool_name, _humanize_id(tool_name).capitalize())
@@ -520,21 +535,21 @@ def _tool_step(tool_name: str, args: dict[str, Any], result: Any) -> tuple[str, 
         # the error, so the generic headline below read "result: live" and the
         # operator never saw why the call failed.
         code = result["error"]
-        lines.append(f"failed: {_compact(code, 120)}" if isinstance(code, str) else "failed")
+        lines.append(f"failed: {_compact(code)}" if isinstance(code, str) else "failed")
         for k in ("detail", "message", "hint"):
             reason = result.get(k)
             if isinstance(reason, str) and reason.strip():
                 headline_key = k
-                lines.append(f"reason: {_compact(reason, 600)}")
+                lines.append(f"reason: {_compact(reason)}")
                 break
     elif isinstance(result, dict):
-        # The full answer first — generously capped (the title was the clipped one).
+        # The full answer first. The title holds only the short outcome.
         for k in ("summary", "verdict", "status", "note", "hint"):
             if result.get(k):
                 headline_key = k
-                lines.append(f"result: {_compact(result[k], 600)}")
+                lines.append(f"result: {_compact(result[k])}")
                 break
-    lines.append(f"query: {_compact(args, 200)}" if args else "no arguments")
+    lines.append(f"query: {_compact(args)}" if args else "no arguments")
     if isinstance(result, dict):
         extra = []
         geo = result.get("geoip") if isinstance(result.get("geoip"), dict) else None
@@ -547,7 +562,7 @@ def _tool_step(tool_name: str, args: dict[str, Any], result: Any) -> tuple[str, 
             extra.append(str(result["cloud_provider"]))
         # Don't repeat the hint if it was already the headline line.
         if headline_key != "hint" and result.get("hint"):
-            extra.append(_compact(result["hint"], 120))
+            extra.append(_compact(result["hint"]))
         if extra:
             lines.append(" · ".join(extra))
     return title, "\n".join(lines)
@@ -595,7 +610,7 @@ def _dossier_event_detail(p: dict[str, Any]) -> str:
         body = [ln for ln in block.strip().splitlines() if not ln.lstrip().startswith("#")]
         text = "\n".join(body).strip()
         if text:
-            lines.append(_compact(text, 1200))
+            lines.append(_compact(text))
     return "\n".join(lines) or "The dossier block was empty."
 
 
@@ -616,7 +631,7 @@ def _citation_detail(p: dict[str, Any]) -> str:
     for item in per if isinstance(per, list) else []:
         if isinstance(item, dict) and item.get("citation"):
             mark = "valid" if item.get("resolved") else "not resolved"
-            lines.append(f"{mark}: {_compact(str(item['citation']), 160)}")
+            lines.append(f"{mark}: {_compact(str(item['citation']))}")
     return "\n".join(lines)
 
 
@@ -683,7 +698,7 @@ def _detail_for(kind: str, p: dict[str, Any] | None, result: Any = None) -> str:
             f"{p.get('round1_confidence')}."
         ).strip()
     if kind == "triage_report":
-        return f"{p.get('verdict')} ({p.get('confidence')})\n{_compact(p.get('summary', ''), 300)}"
+        return f"{p.get('verdict')} ({p.get('confidence')})\n{_compact(p.get('summary', ''))}"
     if kind == "template_grounds_adopted":
         cites = p.get("citations") or []
         return f"{p.get('template_id')} grounds recorded as the citations: {', '.join(cites)}"
@@ -698,11 +713,11 @@ def _detail_for(kind: str, p: dict[str, Any] | None, result: Any = None) -> str:
         ev = p.get("evidence") or []
         return f"{p.get('tentative_summary', '')}\nevidence gathered: {len(ev)} item(s)".strip()
     if kind == "error":
-        return _compact(p.get("message") or p.get("error") or "", 240)
+        return _compact(p.get("message") or p.get("error") or "")
     if kind == "session_start":
         return f"pipeline: {p.get('pipeline', '?')}"
     if kind == "context_trimmed":
-        return _compact(p.get("detail") or "", 300)
+        return _compact(p.get("detail") or "")
     if kind == "prior_outcomes":
         # E4.2 memory recall: compact verdict/tier chips, framed the way the
         # prompt frames them — context the model saw, never evidence.
@@ -744,7 +759,7 @@ def _detail_for(kind: str, p: dict[str, Any] | None, result: Any = None) -> str:
             f"Context only. This is never evidence. The synthesizer saw "
             f"{p.get('count')} past chat excerpt(s) within {p.get('window_days')} days: {chips}"
         )
-    return _compact(p, 220)
+    return _compact(p)
 
 
 class RecommendedActionOut(BaseModel):
@@ -771,6 +786,21 @@ class RecommendedActionOut(BaseModel):
     # apply. Two identical-looking ack cards behaving differently with no
     # explanation was a dogfood trust finding (2026-07-15).
     pendingNote: str | None = None
+    # Who or what carried the action out, and when (dogfood 2026-10-06, S3).
+    # "auto-ack" for the unattended ack, else the caller the execute route
+    # recorded. ``appliedAt`` is ISO UTC. Both stay set on an ack the grid
+    # no longer shows acknowledged, so the card can name the earlier write
+    # while it offers the ack again.
+    appliedBy: str | None = None
+    appliedAt: str | None = None
+    # What the write did, from the stored receipt ("Acknowledged 9 alerts of
+    # this rule from the last 7 days.").
+    appliedDetail: str | None = None
+    # An analyst dismissed the recommendation (dogfood 2026-10-06, first hour
+    # S4). Stored, so a reload and a second analyst see it. An undo clears it.
+    dismissed: bool = False
+    dismissedBy: str | None = None
+    dismissedAt: str | None = None
 
 
 class TimelineStepOut(BaseModel):
@@ -967,6 +997,21 @@ _PERMANENT_ERROR_TYPES = frozenset({"SoNotFoundError"})
 _PERMANENT_ERROR_PREFIXES = ("alert not found", "hunt not found")
 
 
+# The analyst sentence for a failure phase. A stored hint named the setting
+# ``investigation_run_timeout_s``, which an analyst cannot act on (dogfood
+# 2026-10-06). The stored rows keep their text, and the page reads this.
+_FAILURE_HINTS: dict[str, str] = {
+    "run_cancelled": (
+        "This run stopped before a verdict. A sweep time limit, a restart or a closed "
+        "connection stops a run. Re-run it to get a verdict."
+    ),
+    "whole_run_backstop": (
+        "This run hit its time limit before a verdict. A slow model backend is the usual "
+        "cause. The operator can check the model gateway."
+    ),
+}
+
+
 def _failure_out(status: str | None, events: list[Any]) -> FailureOut | None:
     """The recorded cause of an errored run, from its last ``error`` event."""
     if status != "error":
@@ -982,13 +1027,42 @@ def _failure_out(status: str | None, events: list[Any]) -> FailureOut | None:
         permanent = err_type in _PERMANENT_ERROR_TYPES or message.lower().startswith(
             _PERMANENT_ERROR_PREFIXES
         )
-        hint = p.get("hint")
+        hint = _FAILURE_HINTS.get(str(p.get("phase") or ""), p.get("hint"))
         return FailureOut(
-            cause=_compact(message, 240),
+            cause=_compact(message),
             hint=hint if isinstance(hint, str) and hint.strip() else None,
             permanent=permanent,
         )
     return None
+
+
+class SupersededRunOut(BaseModel):
+    """The newer run of the same alert that replaced a run."""
+
+    id: str
+    # The list's status word: complete, running, error, cancelled, interrupted.
+    status: str
+    # The verdict and confidence of a complete run. None while it runs.
+    verdict: str | None = None
+    conf: float | None = None
+
+
+class EntityRefOut(BaseModel):
+    """One entity the investigation names, with the page that answers for it.
+
+    The console renders each one as a link. ``type`` says what the value is:
+    ``address`` (internal), ``external_address``, ``host`` (a host name),
+    ``user`` or ``domain``. ``host_key`` is the machine that holds the value,
+    when one does, so the link opens the machine page in one step. ``role``
+    says where the investigation names it: ``source``, ``destination``,
+    ``reporter`` or ``lead``.
+    """
+
+    value: str
+    type: str
+    role: str
+    host_key: str | None = None
+    href: str
 
 
 class InvestigationOut(BaseModel):
@@ -1062,11 +1136,18 @@ class InvestigationOut(BaseModel):
     subject: dict[str, Any] | None = None
     # Promotion provenance (migration 0031) — set only when kind == "hunt".
     huntId: str | None = None
-    # First 160 chars of the source hunt's objective. None when the hunt was
+    # The source hunt's whole objective. The console shows its head line and
+    # holds the whole text on a hover. None when the hunt was
     # never set OR has since been deleted — hunt_id carries no FK (a promoted
     # investigation must survive hunt deletion), so this degrades gracefully
     # rather than 404ing the whole drawer.
     huntObjective: str | None = None
+    # The finding the analyst promoted, for the page to name first: "Promoted
+    # finding: F2, <title>", and attacker to victim from the finding. The
+    # page read "Subject: hunt" with six findings and the raw model prompt
+    # (dogfood 2026-10-06 C4). None on a run that no finding promoted, and
+    # when the hunt is gone. Built by routes_hunts.promoted_finding_out.
+    promotedFinding: dict[str, Any] | None = None
     # Migration 0032's synthetic-evaluation marker: this run investigated
     # PLANTED synthetic attack scenarios (directly, or promoted from a marked
     # hunt). The drawer badges it so a planted attack can never be read as
@@ -1080,6 +1161,17 @@ class InvestigationOut(BaseModel):
     # The id of the newer primary run for the same alert, when a later run
     # superseded this one. None when this run is the primary run.
     supersededBy: str | None = None
+    # What that newer run reached, so the page can say it: "A newer run on
+    # this alert reached true positive (0.65)." None when no run replaced
+    # this one.
+    supersededRun: SupersededRunOut | None = None
+    # A run in flight: what it does now, and how long runs on this grid take
+    # (dogfood 2026-10-06, first hour W11). The display stayed on "Working"
+    # for minutes with no estimate. Both None once the run ends.
+    currentStep: str | None = None
+    # {lowMin, highMin, medianMin, samples}, from the newest finished runs.
+    # None while the store holds fewer than three.
+    typicalRun: dict[str, Any] | None = None
     # The budget class the run ran in (migration 0058): cheap, standard, deep
     # or rule_prior. None on a run stored before the classes existed. The
     # console shows it as a chip.
@@ -1087,6 +1179,10 @@ class InvestigationOut(BaseModel):
     # Why the run ended in its class, from the stored report. None when the
     # report does not say.
     runClassReason: str | None = None
+    # Every host, address, user and domain the run names, each with the page
+    # that answers for it. The console makes each one a link. Empty from an
+    # older server.
+    entities: list[EntityRefOut] = []
 
 
 def _host_contexts(profiles: Any) -> list[dict[str, Any]]:
@@ -1134,20 +1230,36 @@ def _collect_reasoning(events: list[Any]) -> list[str]:
 # Share of ``webui_grid_timeout_s`` the discardable acked-state probe may spend.
 # It is one optional badge on a page built mostly from the DB, and its documented
 # failure mode is "return False and offer the action anyway" — so it gets a slice
-# of the console budget, not all of it. Floored at 1 s so a small
+# of the console budget, not all of it. Floored at 0.5 s so a small
 # ``webui_grid_timeout_s`` can never round the probe down to an instant expiry.
-_ACKED_PROBE_BUDGET = 0.25
+# The slice was a quarter, 3 s at the default budget. An id lookup across the
+# whole index pattern takes that long on a slow grid, and the detail page
+# waited the full 3 s on every open (range smoke, 2026-10-06). The page now
+# waits at most 0.75 s at the default and shows the stored state after that.
+_ACKED_PROBE_BUDGET = 0.0625
 
 
 def _acked_probe_timeout_s(settings: Settings) -> float:
     """Wall-clock bound for the acked-state probe, derived from the console budget."""
-    return max(1.0, settings.webui_grid_timeout_s * _ACKED_PROBE_BUDGET)
+    return max(0.5, settings.webui_grid_timeout_s * _ACKED_PROBE_BUDGET)
 
 
 async def _alert_currently_acked(
     elastic: ElasticClient, settings: Settings, alert_es_id: str | None
 ) -> bool:
+    """``True`` when the grid says the alert is acknowledged. See :func:`_alert_ack_state`."""
+    return await _alert_ack_state(elastic, settings, alert_es_id) is True
+
+
+async def _alert_ack_state(
+    elastic: ElasticClient, settings: Settings, alert_es_id: str | None
+) -> bool | None:
     """Live ``event.acknowledged`` state of one alert in the SO index.
+
+    ``True`` or ``False`` when the grid answered, ``None`` when it did not
+    (no id, no hit, an error, the time budget). The investigation page needs
+    the third answer: an ack the grid does not show must not read as
+    executed, but a grid that did not answer proves nothing either way.
 
     Same ``ids`` lookup shape as :func:`resolve_alert_for_hunt`, reading the
     same ``event.acknowledged`` field the alerts list aggregates on
@@ -1164,7 +1276,7 @@ async def _alert_currently_acked(
     only re-offers an idempotent ack.
     """
     if not alert_es_id:
-        return False
+        return None
     try:
         async with asyncio.timeout(_acked_probe_timeout_s(settings)):
             lookup = await elastic.search(
@@ -1174,11 +1286,11 @@ async def _alert_currently_acked(
                 source=["event.acknowledged"],
             )
         if not lookup.hits:
-            return False
+            return None
         source = lookup.hits[0].get("_source", {})
         return bool(get_dotted(source, "event.acknowledged"))
     except Exception:  # never break the detail page on an acked-state probe
-        return False
+        return None
 
 
 def _action_identity(action: dict[str, Any]) -> str:
@@ -1232,24 +1344,8 @@ def _executed_actions(events: list[Any]) -> dict[str, dict[str, Any]]:
     return out
 
 
-def _build_actions(
-    events: list[Any],
-    report: dict[str, Any],
-    *,
-    alert_acked: bool = False,
-) -> list[RecommendedActionOut]:
-    """Recommended actions from historical approval events or report recommendations.
-
-    An ack action already carried out by auto-ack is flagged ``applied`` so the UI
-    never offers an "Acknowledge" button for an alert the system already acked.
-    ``alert_acked`` (the alert's LIVE acked state in ES) and persisted
-    ``action_executed`` events extend the same applied concept to acks performed
-    outside this run and to analyst-executed advisory actions (FR-030).
-    """
-    # Auto-ack fired successfully? Then any ack action is already done.
-    auto_acked = any(e.kind == "auto_ack" and (e.payload or {}).get("success") for e in events)
-    executed = _executed_actions(events)
-
+def _ack_pending_note(events: list[Any]) -> str | None:
+    """Why a pending ack waits for a person while auto-ack is armed, or None."""
     # Auto-ack armed but held back? Explain the pending ack instead of leaving
     # the analyst to guess why THIS one needs a click.
     ack_pending_note: str | None = None
@@ -1289,6 +1385,98 @@ def _build_actions(
                 "anything this run retrieved. A person must acknowledge it."
             )
         break
+    return ack_pending_note
+
+
+# The note on every recommended action of a backtest replay. The console
+# renders an action that carries a note as closed, with no Execute button.
+REPLAY_ACTION_NOTE = "Not executable. This run is a backtest replay."
+
+
+# Why an ack the record calls done is offered again: the grid answered and
+# shows the alert unacknowledged (dogfood 2026-10-06, S3). The card and the
+# record must agree, so the card does not say "Executed".
+_ACK_NOT_ON_GRID_GROUP = (
+    "An earlier ack covered other alerts of this rule. Security Onion shows "
+    "this alert as not acknowledged."
+)
+_ACK_NOT_ON_GRID = "Security Onion shows this alert as not acknowledged."
+
+
+def _dismissals(events: list[Any]) -> dict[str, dict[str, Any]]:
+    """action-identity -> the payload of its standing dismissal.
+
+    The newest record wins: a dismissal followed by an undo is not dismissed.
+    Keyed like :func:`_executed_actions`, with the position key for a record
+    that names no identity.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    ordered = sorted(
+        (e for e in events if e.kind in ("action_dismissed", "action_restored")),
+        key=lambda e: int(getattr(e, "sequence", 0) or 0),
+    )
+    for e in ordered:
+        p = e.payload or {}
+        key = p.get("action_key")
+        if not isinstance(key, str) or not key:
+            idx = p.get("index")
+            if not isinstance(idx, int):
+                continue
+            key = f"#idx:{idx}"
+        if e.kind == "action_dismissed":
+            out[key] = p
+        else:
+            out.pop(key, None)
+    return out
+
+
+def _build_actions(
+    events: list[Any],
+    report: dict[str, Any],
+    *,
+    alert_acked: bool = False,
+    alert_unacked: bool = False,
+    ran_at: str | None = None,
+    replay: bool = False,
+) -> list[RecommendedActionOut]:
+    """Recommended actions from historical approval events or report recommendations.
+
+    An ack action already carried out by auto-ack is flagged ``applied`` so the UI
+    never offers an "Acknowledge" button for an alert the system already acked.
+    ``alert_acked`` (the alert's LIVE acked state in ES) and persisted
+    ``action_executed`` events extend the same applied concept to acks performed
+    outside this run and to analyst-executed advisory actions (FR-030).
+
+    ``alert_unacked`` is the other answer of the same probe: the grid answered
+    and the alert is NOT acknowledged. An ack the record calls done then reads
+    as pending again, with the earlier write named. ``ran_at`` is when the run
+    finished, the time of an auto-ack, which records no time of its own.
+
+    ``replay`` marks the run as a backtest replay. The page still shows what
+    the model recommended, because that is part of what the backtest
+    measured. Every action is closed with :data:`REPLAY_ACTION_NOTE`, so the
+    console offers no Execute button, and the execute route refuses the write.
+    """
+    if replay:
+        return [
+            action.model_copy(
+                update={
+                    "applied": True,
+                    "appliedNote": REPLAY_ACTION_NOTE,
+                    "pendingNote": None,
+                    "appliedBy": None,
+                    "appliedAt": None,
+                    "dismissed": False,
+                }
+            )
+            for action in _build_actions(events, report, alert_acked=alert_acked)
+        ]
+    # Auto-ack fired successfully? Then any ack action is already done.
+    auto_acked = any(e.kind == "auto_ack" and (e.payload or {}).get("success") for e in events)
+    executed = _executed_actions(events)
+    dismissed = _dismissals(events)
+
+    ack_pending_note = _ack_pending_note(events)
 
     def _ack_note(tn: str) -> str | None:
         # Only the NEW already-acked case gets a note; auto-ack keeps the UI's
@@ -1327,15 +1515,35 @@ def _build_actions(
         exec_p = executed.get(_action_identity(a)) or executed.get(f"#idx:{i}")
         applied = exec_p is not None or ((auto_acked or alert_acked) and tn == "ack_alert")
         note: str | None = None
+        by: str | None = None
+        at: str | None = None
+        detail: str | None = None
         if exec_p is not None:
+            by = str(exec_p.get("by") or "analyst")
+            at = _str_or_none(exec_p.get("at"))
+            detail = _str_or_none(exec_p.get("detail"))
             # An "execution" that found the alert pre-acked reads as such, not
             # as if the analyst wrote anything.
             if exec_p.get("note") == "already_acknowledged":
                 note = "Already acknowledged"
-            else:
-                note = f"Executed · {exec_p.get('by') or 'analyst'}"
+        elif tn == "ack_alert" and auto_acked:
+            by, at = "auto-ack", ran_at
         elif applied:
             note = _ack_note(tn)
+        pending_note = ack_pending_note if tn == "ack_alert" and not applied else None
+        if tn == "ack_alert" and applied and alert_unacked:
+            # The record says done and the grid says not done. The card follows
+            # the grid, and names the earlier write so nothing is hidden.
+            applied = False
+            note = None
+            pending_note = (
+                _ACK_NOT_ON_GRID_GROUP
+                if exec_p is not None and exec_p.get("group")
+                else _ACK_NOT_ON_GRID
+            )
+        dis = (
+            None if applied else (dismissed.get(_action_identity(a)) or dismissed.get(f"#idx:{i}"))
+        )
         out.append(
             RecommendedActionOut(
                 id=f"a{i}",
@@ -1344,10 +1552,20 @@ def _build_actions(
                 rationale=a.get("rationale", ""),
                 applied=applied,
                 appliedNote=note,
-                pendingNote=(ack_pending_note if tn == "ack_alert" and not applied else None),
+                pendingNote=pending_note,
+                appliedBy=by,
+                appliedAt=at,
+                appliedDetail=detail,
+                dismissed=dis is not None,
+                dismissedBy=_str_or_none(dis.get("by")) if dis else None,
+                dismissedAt=_str_or_none(dis.get("at")) if dis else None,
             )
         )
     return out
+
+
+def _str_or_none(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
 
 
 # Sanitizer categories (soc_ai.oracle.sanitize) in the order they are read out,

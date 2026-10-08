@@ -20,6 +20,7 @@ import { plural } from '../lib/plural';
 import { absTime, ago } from '../lib/timeRange';
 import type { MachineSummary } from '../lib/types';
 import { Kpi, UNKNOWN, UNKNOWN_TONE } from './Kpi';
+import { LoadingInline } from './States';
 
 /** The Config anchor for the dossier's master switch and its schedule. Both
  *  are off by default, so every dead end on this screen points here. */
@@ -28,6 +29,15 @@ export const DOSSIER_CONFIG_HREF = '/config#host-dossier';
 /** The bucket keys the summary's `roles` carries beside the role slugs. Each
  *  is also a value of the list's `role` filter. */
 export const ROLE_BUCKETS = ['low_confidence', 'stale', 'unknown'] as const;
+
+/** The words for the three buckets. None of them is a role: the bar read
+ *  "stale 6" as if stale were a role (dogfood 2026-10-06). The bar groups
+ *  them under "No confirmed role", and the Role menu reads the same words. */
+export const ROLE_BUCKET_LABELS: Record<string, string> = {
+  low_confidence: 'weak guess',
+  stale: 'old guess',
+  unknown: 'no role',
+};
 
 // ---- the role bar -----------------------------------------------------------
 
@@ -53,7 +63,7 @@ export function roleSlices(summary: MachineSummary): RoleSlice[] {
   for (const bucket of ROLE_BUCKETS) {
     const count = summary.roles?.[bucket] ?? 0;
     if (count > 0) {
-      tail.push({ filter: bucket, label: bucket.replace(/_/g, ' '), count, bucket: true });
+      tail.push({ filter: bucket, label: ROLE_BUCKET_LABELS[bucket], count, bucket: true });
     }
   }
   return [...known, ...tail];
@@ -86,14 +96,38 @@ function RoleBar({
   const hrefOf = (s: RoleSlice) => linkFor({ role: s.filter, activity: 'all' });
   const titleOf = (s: RoleSlice) =>
     `${s.label}: ${plural(s.count, 'machine')}. Show these machines.${BUCKET_TITLES[s.filter] ? ` ${BUCKET_TITLES[s.filter]}` : ''}`;
+  const roles = slices.filter((s) => !s.bucket);
+  const buckets = slices.filter((s) => s.bucket);
+  const legendLink = (s: RoleSlice) => (
+    <Link
+      key={s.filter}
+      to={hrefOf(s)}
+      data-testid={`role-legend-${s.filter}`}
+      title={titleOf(s)}
+      className="flex items-center gap-1.5 text-[11.5px] text-dim hover:text-text"
+    >
+      <span className={cn('h-2 w-2 flex-none rounded-full', sliceRail(s))} />
+      {s.label}
+      <span className="font-mono text-[11px] font-semibold text-text-2">
+        {s.count.toLocaleString()}
+      </span>
+    </Link>
+  );
   return (
     <div data-testid="role-bar" className="mt-3 rounded-panel border border-border bg-surface-1 px-4 py-3">
       <div className="mb-2 flex items-baseline justify-between gap-2">
         <span className="text-[10.5px] font-semibold uppercase tracking-[.06em] text-faint">
           Roles
         </span>
-        <span className="text-[11px] text-faint" title="The role of each machine. An operator declaration wins over the sweep.">
-          across {plural(summary.machines, 'machine')}
+        {/* The population, named. The Role menu in the table counts the list
+            on screen, and the two read "unknown 31" and "unknown 12" with
+            nothing to say why (dogfood 2026-10-06). */}
+        <span
+          data-testid="role-bar-scope"
+          className="text-[11px] text-faint"
+          title="The role of each machine. An operator declaration wins over the sweep."
+        >
+          across all {plural(summary.machines, 'machine')}, quiet ones too
         </span>
       </div>
       {/* Each segment is a link to the machines it counts. The legend below
@@ -112,21 +146,16 @@ function RoleBar({
         ))}
       </div>
       <div className="mt-2 flex flex-wrap items-center gap-x-3.5 gap-y-1">
-        {slices.map((s) => (
-          <Link
-            key={s.filter}
-            to={hrefOf(s)}
-            data-testid={`role-legend-${s.filter}`}
-            title={titleOf(s)}
-            className="flex items-center gap-1.5 text-[11.5px] text-dim hover:text-text"
+        {roles.map(legendLink)}
+        {buckets.length > 0 && (
+          <span
+            data-testid="role-bar-unconfirmed"
+            className="flex flex-wrap items-center gap-x-3.5 gap-y-1 border-l border-border pl-3.5"
           >
-            <span className={cn('h-2 w-2 flex-none rounded-full', sliceRail(s))} />
-            {s.label}
-            <span className="font-mono text-[11px] font-semibold text-text-2">
-              {s.count.toLocaleString()}
-            </span>
-          </Link>
-        ))}
+            <span className="text-[11px] text-faint">No confirmed role:</span>
+            {buckets.map(legendLink)}
+          </span>
+        )}
       </div>
     </div>
   );
@@ -165,27 +194,51 @@ export interface HostsSummaryProps {
   failed: boolean;
   /** A list URL that applies these filters. The screen owns the URL shape. */
   linkFor: (patch: Record<string, string | null>) => string;
-  /** The broken-builds view. */
-  brokenHref: string;
-  /** The disagreement queue. */
-  conflictsHref: string;
   /** False when sweeps do not run on a schedule. Null when unknown. */
   scheduleEnabled?: boolean | null;
+  /** True while the list holds a search. The cards count every machine, and
+   *  the strip says so (dogfood 2026-10-06). */
+  searchActive?: boolean;
+}
+
+/** The two parts of Needs attention. An older server sends no `out_of_date`;
+ *  the part is then the remainder. */
+export function attentionParts(summary: MachineSummary): { outOfDate: number; neverBuilt: number } {
+  const neverBuilt = summary.never_built;
+  const outOfDate = summary.out_of_date ?? Math.max(0, summary.needs_attention - neverBuilt);
+  return { outOfDate, neverBuilt };
+}
+
+/** "37 need attention: 34 out of date, 3 never built". */
+export function attentionSentence(summary: MachineSummary): string {
+  const { outOfDate, neverBuilt } = attentionParts(summary);
+  if (summary.needs_attention === 0) return 'No machine needs attention.';
+  return `${summary.needs_attention.toLocaleString()} need attention: ${outOfDate.toLocaleString()} out of date, ${neverBuilt.toLocaleString()} never built`;
 }
 
 export function HostsSummary({
   summary,
   failed,
   linkFor,
-  brokenHref,
-  conflictsHref,
   scheduleEnabled,
+  searchActive = false,
 }: HostsSummaryProps) {
   const n = (v: number | undefined) => (summary == null || v == null ? UNKNOWN : v.toLocaleString());
   const tone = (good: string) => (summary == null ? UNKNOWN_TONE : good);
+  const parts = summary ? attentionParts(summary) : null;
   return (
     <div data-testid="hosts-summary" className="mb-3.5">
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
+      {searchActive && (
+        <div data-testid="hosts-summary-scope" className="mb-1.5 text-[11.5px] text-faint">
+          The cards and the role bar count every machine. The search does not filter them.
+        </div>
+      )}
+      <div
+        className={cn(
+          'grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6',
+          searchActive && 'opacity-70',
+        )}
+      >
         <CardLink
           to={linkFor({ activity: 'all' })}
           testId="card-machines"
@@ -253,21 +306,54 @@ export function HostsSummary({
             tone={tone(summary && summary.new_7d > 0 ? 'text-accent' : 'text-text-2')}
           />
         </CardLink>
-        <CardLink
-          to={brokenHref}
-          testId="card-attention"
-          label={`Needs attention: ${n(summary?.needs_attention)}. Show the addresses with a broken build.`}
-        >
+        {/* The number lists the machines it counts, and each part lists its
+            own. The card read "37" over a link that listed 3 addresses
+            (dogfood 2026-10-06). Three links in one card, so the card itself
+            is not a link. */}
+        <div data-testid="card-attention" className="rounded-panel">
           <Kpi
             testId="sum-attention"
             label="Needs attention"
-            value={n(summary?.needs_attention)}
+            value={
+              summary == null ? (
+                UNKNOWN
+              ) : (
+                <Link
+                  to={linkFor({ health: 'attention', activity: 'all' })}
+                  data-testid="attention-all"
+                  aria-label={`${attentionSentence(summary)}. Show these machines.`}
+                  className="hover:underline"
+                >
+                  {summary.needs_attention.toLocaleString()}
+                </Link>
+              )
+            }
             sub={
-              summary == null
-                ? UNKNOWN
-                : summary.never_built > 0
-                  ? `${summary.never_built.toLocaleString()} broken or never built`
-                  : 'no broken builds'
+              summary == null || parts == null ? (
+                UNKNOWN
+              ) : summary.needs_attention === 0 ? (
+                'every build is clean and current'
+              ) : (
+                <>
+                  <Link
+                    to={linkFor({ health: 'stale', activity: 'all' })}
+                    data-testid="attention-stale"
+                    className="underline decoration-dim/50 underline-offset-2 hover:text-text"
+                    title="A clean build older than the staleness window. A sweep confirms it again."
+                  >
+                    {parts.outOfDate.toLocaleString()} out of date
+                  </Link>
+                  {', '}
+                  <Link
+                    to={linkFor({ health: 'broken', activity: 'all' })}
+                    data-testid="attention-broken"
+                    className="underline decoration-dim/50 underline-offset-2 hover:text-text"
+                    title="No clean build: the sweep never built the machine, or the last build failed."
+                  >
+                    {parts.neverBuilt.toLocaleString()} never built
+                  </Link>
+                </>
+              )
             }
             icon={<AlertTriangle size={16} />}
             tone={
@@ -279,13 +365,20 @@ export function HostsSummary({
                     ? 'text-warn'
                     : 'text-mono-green'
             }
-            title="Machines the sweep cannot build, or builds from old evidence. The link opens the addresses with no clean build."
+            title={
+              summary == null
+                ? 'Machines the sweep cannot build, or builds from old evidence.'
+                : `${attentionSentence(summary)}. Each number lists its machines.`
+            }
           />
-        </CardLink>
+        </div>
+        {/* A filter on the list, at 0 too: the click shows an empty list
+            and says so. The queue link left the default list on screen and
+            looked like a dead card (dogfood 2026-10-06). */}
         <CardLink
-          to={conflictsHref}
+          to={linkFor({ conflict: 'yes', activity: 'all' })}
           testId="card-conflicts"
-          label={`Conflicts: ${n(summary?.conflicts)}. Open the review queue.`}
+          label={`Conflicts: ${n(summary?.conflicts)}. Show these machines.`}
         >
           <Kpi
             testId="sum-conflicts"
@@ -296,7 +389,7 @@ export function HostsSummary({
                 ? UNKNOWN
                 : summary.conflicts === 0
                   ? 'the two sources agree'
-                  : 'open the review queue'
+                  : 'a declaration and the sweep disagree'
             }
             icon={<Scale size={16} />}
             tone={
@@ -314,7 +407,7 @@ export function HostsSummary({
         <div className="mt-1.5 text-[12px] text-dim">
           {failed
             ? 'The counts could not be read. The machine list below is a separate query. The list still works.'
-            : 'Counting the network…'}
+            : <LoadingInline>Counting the network</LoadingInline>}
         </div>
       ) : (
         <div className="mt-1.5 text-[11.5px] text-faint">

@@ -27,7 +27,7 @@ _WAIT_MS = 15000
 # of the honest disposition labels so a data tweak doesn't spuriously break the
 # smoke — the point is that A disposition rendered, not which one.
 _DISPOSITION_RE = re.compile(
-    r"No threat observed|No malicious activity found|Malicious activity found"
+    r"Threat found|No threat found|No answer|Could not run|Running"
     r"|Suspicious activity found|Low-severity findings",
     re.IGNORECASE,
 )

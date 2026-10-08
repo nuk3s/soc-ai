@@ -57,7 +57,7 @@ def neutralize_untrusted(text: str, *, cap: int, keep_newlines: bool = False) ->
     Escapes control characters to visible ``\\n``/``\\x1b``-style sequences
     (evidence fidelity: the model still sees that the byte was there),
     defuses fence-marker punctuation, and truncates to *cap* characters with
-    a visible ellipsis. ``keep_newlines=True`` preserves ``\\n`` for
+    a visible ``[truncated]`` marker. ``keep_newlines=True`` preserves ``\\n`` for
     multi-line prose (the finding detail) while still escaping everything
     else — safe only INSIDE the fence, where the markers are unforgeable.
     """
@@ -66,5 +66,5 @@ def neutralize_untrusted(text: str, *, cap: int, keep_newlines: bool = False) ->
     # Defuse marker punctuation AFTER escaping (escaping never mints ``<``).
     out = out.replace("<<<", "< <<").replace(">>>", ">> >")
     if len(out) > cap:
-        out = out[:cap] + "…"
+        out = out[:cap] + " [truncated]"
     return out

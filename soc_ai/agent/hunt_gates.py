@@ -8,8 +8,8 @@ against the evidence the hunt ACTUALLY gathered (the ``tool_result`` payloads
 that streamed this run). A finding whose citations resolve to nothing has its
 non-resolving citations stripped and its severity capped; a high/critical
 finding that cites nothing at all is capped too. Finding and chart ``title``s
-are also clamped to a display-safe length (:func:`_clamp_title`) — the schema
-asks the model for short headlines, but the clamp is what guarantees it. No LLM
+lose their surrounding whitespace (:func:`_clean_title`) and are never cut. A
+long title is stored whole and the console wraps it. No LLM
 calls — this is the trust layer, one layer down from the investigation citation
 gate.
 
@@ -78,9 +78,11 @@ _UNRESOLVED_NOTE = (
 _HIGH_NO_CITE_NOTE = (
     "This high-severity finding has no citations, so soc-ai lowered the severity to medium."
 )
+# Three sentences in the analyst's terms (dogfood 2026-10-06 C5). The stored
+# rows of older builds carry two other phrasings, and the hunt page rewords
+# both (soc_ai.hunting.hunt_words.validator_note).
 _ALERT_ONLY_NOTE = (
-    "This finding cites only detector alerts, so soc-ai lowered the severity to medium. "
-    "Corroborate it before you claim a compromise."
+    "Severity held at medium. The finding cites alerts only. An investigation can raise it."
 )
 
 # ── Corroboration gate: alert-query vs corroborating-evidence tools ───────────
@@ -138,26 +140,16 @@ _NON_THREAT_CATEGORIES: frozenset[str] = frozenset({"visibility_gap", "observati
 # risk, so beyond this ceiling extras are dropped even if they'd otherwise resolve.
 _MAX_CHARTS = 4
 
-# Title clamp — the HuntReport schema + prompt ask for <= ~60-char headlines, but a
-# model can't be trusted to comply, and an overlong title just ellipsizes in the UI.
-# This is the deterministic backstop: anything past the ceiling is word-boundary
-# truncated here so the model can't overflow the display regardless.
-_MAX_TITLE_CHARS = 90
+# Title cleanup. The HuntReport schema and the prompt ask for short headlines,
+# and the console wraps a long one. A title was once cut at 90 characters with
+# an ellipsis, and later at 500. The full text was then nowhere, because the
+# cut happened before the store. The owner banned the ellipsis cut
+# (2026-10-07), so the title is stored whole.
 
 
-def _clamp_title(title: str) -> str:
-    """Word-boundary truncate ``title`` to at most :data:`_MAX_TITLE_CHARS` chars.
-
-    A compliant title passes through untouched (modulo surrounding whitespace).
-    An overlong one is cut at the last word boundary that fits and gets a
-    trailing ellipsis; a single overlong token is hard-cut (no boundary to use).
-    """
-    text = (title or "").strip()
-    if len(text) <= _MAX_TITLE_CHARS:
-        return text
-    cut = text[: _MAX_TITLE_CHARS - 1]  # leave room for the ellipsis
-    head = cut.rpartition(" ")[0].rstrip()
-    return f"{head or cut.rstrip()}…"
+def _clean_title(title: str) -> str:
+    """``title`` with the surrounding whitespace removed, never cut."""
+    return (title or "").strip()
 
 
 def _severity_rank(severity: str) -> int:
@@ -507,9 +499,8 @@ def _validate_hunt_findings(
       or a threat below high, keeps its severity (only the loud high/critical
       alert-title write-up is the trust failure this closes).
 
-    Independently of citations, every finding's ``title`` is clamped via
-    :func:`_clamp_title` — an overlong machine headline is word-boundary
-    truncated so the UI never has to ellipsize it.
+    Independently of citations, every finding's ``title`` goes through
+    :func:`_clean_title`. The title is never cut.
 
     Returns ``(validated_findings, counts)`` where ``counts`` carries per-hunt
     tallies for the ``citation_validation`` audit event:
@@ -540,14 +531,14 @@ def _validate_hunt_findings(
     }
 
     for raw_finding in findings:
-        # Deterministic title clamp (independent of citations): the schema/prompt
-        # ask for short headlines, but the clamp is what guarantees it.
+        # Deterministic title cleanup (independent of citations). The title is
+        # stored whole.
         title = str(getattr(raw_finding, "title", None) or "")
-        clamped_title = _clamp_title(title)
+        clean_title = _clean_title(title)
         finding = (
             raw_finding
-            if clamped_title == title
-            else raw_finding.model_copy(update={"title": clamped_title})
+            if clean_title == title
+            else raw_finding.model_copy(update={"title": clean_title})
         )
 
         citations = list(getattr(finding, "citations", None) or [])
@@ -665,8 +656,8 @@ def _validate_hunt_charts(
 
     Surviving charts are capped at :data:`_MAX_CHARTS` (extras beyond the ceiling
     are dropped) — bias is toward DROPPING; a chart that can't be traced to
-    evidence is never rendered. Kept charts get their ``title`` clamped via
-    :func:`_clamp_title` (same word-boundary truncation as findings).
+    evidence is never rendered. Kept charts get their ``title`` cleaned via
+    :func:`_clean_title` (the same cleanup as findings, never a cut).
 
     Returns ``(kept_charts, counts)`` where ``counts`` carries per-hunt tallies
     for the ``citation_validation`` audit event:
@@ -692,11 +683,11 @@ def _validate_hunt_charts(
         if not any(_citation_resolves(c, evidence_text, retrieved_ids) for c in citations):
             counts["charts_dropped"] += 1
             continue
-        # Same deterministic title clamp as findings — only for kept charts.
+        # Same deterministic title cleanup as findings, only for kept charts.
         title = str(getattr(chart, "title", None) or "")
-        clamped_title = _clamp_title(title)
+        clean_title = _clean_title(title)
         kept.append(
-            chart if clamped_title == title else chart.model_copy(update={"title": clamped_title})
+            chart if clean_title == title else chart.model_copy(update={"title": clean_title})
         )
 
     return kept, counts
@@ -777,7 +768,7 @@ def _rewrite_host_gap(finding: Any, covered: list[tuple[str, HostCoverage]]) -> 
         planes = " or ".join(plane_phrase(p) for p in lacking[:2])
         return finding.model_copy(
             update={
-                "title": _clamp_title(f"No {planes} telemetry on {label}"),
+                "title": _clean_title(f"No {planes} telemetry on {label}"),
                 "detail": new_detail,
                 "validator_note": _append_note(
                     getattr(finding, "validator_note", None), _HOST_GAP_REWRITE_NOTE
@@ -786,7 +777,7 @@ def _rewrite_host_gap(finding: Any, covered: list[tuple[str, HostCoverage]]) -> 
         )
     return finding.model_copy(
         update={
-            "title": _clamp_title(f"Host telemetry present on {label}"),
+            "title": _clean_title(f"Host telemetry present on {label}"),
             "detail": new_detail,
             "category": "observation",
             "validator_note": _append_note(

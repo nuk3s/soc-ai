@@ -24,6 +24,8 @@ from soc_ai.store.models import EntityObservation, Hunt, HuntEvent, Lead
 __all__ = [
     "AUTO_HUNT_ACTOR",
     "AUTO_HUNT_RETRY_LIMIT",
+    "BACKTEST_DECISION",
+    "BACKTEST_DECISION_NOTE",
     "CLOSED_STATUSES",
     "DISMISS_REASONS",
     "HOLD_EARLIER_THREAT",
@@ -32,6 +34,8 @@ __all__ = [
     "HUNT_CLEAN_REASON",
     "HUNT_FAILED_STATUSES",
     "HUNT_RUNNING_STATUSES",
+    "KEPT_OPEN",
+    "PROMOTED_FINDING_REASON",
     "RELATED_WINDOW_DAYS",
     "RelatedLead",
     "analyst_dismissed",
@@ -39,13 +43,17 @@ __all__ = [
     "decisions_of",
     "derived_hold_reason",
     "dismiss",
+    "dismiss_observation",
     "evidence_block_for",
+    "formed_from_backtest",
     "get",
     "hold_reason_of",
     "hunt_did_not_run",
     "hunt_is_queued",
     "hunt_outcome_of",
     "in_progress_clause",
+    "keep_open",
+    "mark_backtest_leads",
     "mark_hunting",
     "mark_promoted",
     "needs_decision_clause",
@@ -61,11 +69,18 @@ __all__ = [
 
 _LOGGER = logging.getLogger(__name__)
 
+# The reasons an analyst may give for a dismissal. ``other`` stays last: the
+# form lists them in this order. The sharpening loop reads the reason, so a
+# new reason is added here and nowhere else. The column holds 32 characters.
 DISMISS_REASONS: tuple[str, ...] = (
     "expected_for_role",
     "known_change",
     "benign_repeat",
     "bad_baseline",
+    "authorized_test",
+    "duplicate",
+    "bad_analytic_logic",
+    "lab_host",
     "other",
 )
 
@@ -96,6 +111,30 @@ HOLD_SENTENCES: dict[str, str] = {
     HOLD_PARTIAL_READ: "The hunt could not read all evidence.",
     HOLD_EARLIER_THREAT: "An earlier hunt found a threat.",
 }
+
+# The decision an analyst records when an investigation of one of the lead's
+# hunt findings reached a verdict and the lead stays open all the same. The
+# lead page asks once per investigation, and this entry is the answer.
+KEPT_OPEN = "kept_open"
+# The reason a promotion carries when the analyst closed the lead on the
+# verdict of a promoted finding, and not by promoting the lead itself.
+PROMOTED_FINDING_REASON = "finding_verdict"
+
+# The decision that marks a lead formed from backtest replays only. Before
+# 2026-10-06 a replay's verdict wrote an alert observation like a live run,
+# and on the range a lead formed 74 s after the replay of the same rule.
+# The store writes no such observation now. :func:`mark_backtest_leads` marks
+# the leads that formed before that. The mark is a note on the lead: it
+# changes no status, and :func:`hold_reason_of` reads past it.
+BACKTEST_DECISION = "formed_from_backtest"
+BACKTEST_DECISION_ACTOR = "soc-ai"
+BACKTEST_DECISION_NOTE = (
+    "This lead formed from a backtest replay. A backtest replay is a measurement "
+    "on an alert an analyst already closed. It is not live evidence."
+)
+# Decisions that annotate the lead and decide nothing. A reader that asks for
+# the last decision skips them.
+_ANNOTATION_ACTIONS: frozenset[str] = frozenset({BACKTEST_DECISION, KEPT_OPEN})
 
 # The ``done`` event key the runner sets when the budget synthesizer wrote the
 # report. It is the fact the settle rule reads. The runner has written it on
@@ -133,8 +172,13 @@ _KIND_WORDS: dict[str, str] = {
 
 
 # A hunt that has not finished. Anything else is terminal: complete, error,
-# cancelled and interrupted all leave the analyst a decision to take.
-HUNT_RUNNING_STATUSES: tuple[str, ...] = ("running", "queued")
+# cancelled and interrupted all leave the analyst a decision to take. An
+# ``investigating`` hunt landed its report and still investigates its subject
+# findings (migration 0063), so its lead waits for the verdicts.
+HUNT_RUNNING_STATUSES: tuple[str, ...] = ("running", "queued", "investigating")
+
+# The hand the hunt signs a close with when its findings decided the lead.
+SYSTEM_HUNT_ACTOR = "system:hunt"
 
 
 def _has_a_hunt() -> Any:
@@ -313,7 +357,9 @@ def hold_reason_of(lead: Lead) -> str | None:
     names now. A hold on an older hunt is history, and a later decision on
     the lead answers it.
     """
-    history = decisions_of(lead)
+    # An annotation decides nothing. A kept-open entry answers the question
+    # an investigation verdict asks, not the hold, so the hold stays in force.
+    history = [d for d in decisions_of(lead) if d.get("action") not in _ANNOTATION_ACTIONS]
     if not history or not lead.hunt_id:
         return None
     last = history[-1]
@@ -378,13 +424,31 @@ async def mark_promoted(
     investigation_id: str,
     by: str | None = None,
     now: datetime | None = None,
+    reason: str | None = None,
+    verdicts: Sequence[dict[str, Any]] | None = None,
+    hunt_id: str | None = None,
 ) -> Lead:
-    """Close the lead as promoted. A promoted lead carries no dismissal."""
+    """Close the lead as promoted. A promoted lead carries no dismissal.
+
+    ``reason`` is :data:`PROMOTED_FINDING_REASON` when the analyst closed the
+    lead on the verdict of a promoted hunt finding. The lead then names that
+    finding's investigation.
+
+    ``verdicts`` records the verdict of each subject finding when the hunt
+    closed the lead itself (:func:`settle_after_hunt`), with the hunt.
+    """
     lead = await db.get(Lead, int(lead_id))
     if lead is None:
         raise LookupError(lead_id)
     _refuse_if_closed(lead)
     at = (now or datetime.now(UTC)).replace(tzinfo=None)
+    extra: dict[str, Any] = {}
+    if reason:
+        extra["reason"] = reason
+    if verdicts is not None:
+        extra["verdicts"] = [dict(v) for v in verdicts]
+    if hunt_id:
+        extra["hunt_id"] = hunt_id
     # The history first: a row with no history yet keeps its old dismissal.
     record_decision(
         lead,
@@ -392,10 +456,81 @@ async def mark_promoted(
         at,
         by=(by or "")[:80] or None,
         investigation_id=investigation_id,
+        **extra,
     )
     lead.status = "promoted"
     lead.investigation_id = investigation_id
     _clear_dismissal(lead)
+    lead.updated_at = at
+    await db.commit()
+    await db.refresh(lead)
+    return lead
+
+
+async def dismiss_observation(
+    db: AsyncSession,
+    observation_id: int,
+    *,
+    reason: str,
+    note: str | None,
+    by: str,
+    now: datetime | None = None,
+) -> EntityObservation:
+    """Mark one observation benign, in the shape a lead dismissal takes.
+
+    The reason comes from :data:`DISMISS_REASONS`, so the sharpening loop
+    reads one list. The observation then counts toward no lead (see
+    ``soc_ai.hunting.leads.weigh_entity``), and a repeat of the same content
+    refreshes the same row, so the mark holds for the repeats.
+
+    A second mark answers with the row as it stands. The first reason and the
+    first hand stay. ``LookupError`` for an id no row holds and ``ValueError``
+    for a reason the list does not name.
+    """
+    if reason not in DISMISS_REASONS:
+        raise ValueError(f"unknown dismissal reason: {reason}")
+    row = await db.get(EntityObservation, int(observation_id))
+    if row is None:
+        raise LookupError(observation_id)
+    if row.dismissed_at is not None:
+        return row
+    at = (now or datetime.now(UTC)).replace(tzinfo=None)
+    row.dismissed_reason = reason
+    row.dismissed_note = (note or "").strip()[:2000] or None
+    row.dismissed_by = by[:80]
+    row.dismissed_at = at
+    await db.commit()
+    await db.refresh(row)
+    _LOGGER.info("observation %s marked benign by %s: %s", row.id, by[:80], reason)
+    return row
+
+
+async def keep_open(
+    db: AsyncSession,
+    lead_id: int,
+    *,
+    investigation_id: str,
+    by: str,
+    now: datetime | None = None,
+) -> Lead:
+    """Record that the analyst keeps the lead open over an investigation verdict.
+
+    The lead page asks once per investigation whether to close the lead as
+    promoted. This entry is the answer "no", so the page does not ask again.
+    The status does not change. A second answer for the same investigation
+    changes nothing.
+    """
+    lead = await db.get(Lead, int(lead_id))
+    if lead is None:
+        raise LookupError(lead_id)
+    _refuse_if_closed(lead)
+    if any(
+        d.get("action") == KEPT_OPEN and d.get("investigation_id") == investigation_id
+        for d in decisions_of(lead)
+    ):
+        return lead
+    at = (now or datetime.now(UTC)).replace(tzinfo=None)
+    record_decision(lead, KEPT_OPEN, at, by=by[:80], investigation_id=investigation_id)
     lead.updated_at = at
     await db.commit()
     await db.refresh(lead)
@@ -556,6 +691,51 @@ async def derived_hold_reason(db: AsyncSession, lead: Lead) -> str | None:
     return await _clean_close_blocker(db, hunt)
 
 
+async def _subject_verdicts(db: AsyncSession, hunt: Hunt) -> list[dict[str, Any]] | None:
+    """The verdict of every subject finding of the hunt, or None when one has none.
+
+    One entry per subject finding, in ordinal order: the ordinal, the
+    investigation, its verdict and its confidence. Only a complete run that is
+    not a pipeline fallback carries a verdict.
+    """
+    from soc_ai.store.hunts import finding_links  # noqa: PLC0415 - avoids an import cycle
+    from soc_ai.store.models import Investigation  # noqa: PLC0415 - local, like the hunt reads
+
+    links = finding_links(hunt)
+    if not links:
+        return None
+    ids = [link.investigation_id for link in links.values() if link.investigation_id]
+    if len(ids) < len(links):
+        return None
+    rows = await db.execute(
+        select(
+            Investigation.id,
+            Investigation.status,
+            Investigation.verdict,
+            Investigation.confidence,
+            Investigation.is_fallback,
+        ).where(Investigation.id.in_(ids))
+    )
+    runs = {str(r[0]): r for r in rows.all()}
+    out: list[dict[str, Any]] = []
+    for ordinal in sorted(links):
+        run = runs.get(links[ordinal].investigation_id or "")
+        if run is None:
+            return None
+        _id, status, verdict, confidence, fallback = run
+        if status != "complete" or fallback is True or not verdict:
+            return None
+        out.append(
+            {
+                "ordinal": ordinal,
+                "investigation_id": str(_id),
+                "verdict": str(verdict),
+                "confidence": confidence,
+            }
+        )
+    return out
+
+
 async def settle_after_hunt(db: AsyncSession, hunt: Hunt, *, now: datetime | None = None) -> str:
     """Move the lead the hunt was started on, once the hunt has finished.
 
@@ -584,6 +764,30 @@ async def settle_after_hunt(db: AsyncSession, hunt: Hunt, *, now: datetime | Non
     if hunt.status in HUNT_RUNNING_STATUSES:
         return "none"
     at = (now or datetime.now(UTC)).replace(tzinfo=None)
+    # The hunt investigated its subject findings (2026-10-07). When every one
+    # of them has a verdict, the verdicts answer the lead: it closes as
+    # promoted, in the hunt's hand, with each verdict recorded. A subject with
+    # no verdict, a failed run or one past the cap, leaves the lead to the
+    # analyst. A hunt with no subject settles by the rules below, as before.
+    if hunt.status == "complete" and int(getattr(hunt, "findings_total", 0) or 0) > 0:
+        if analyst_dismissed(lead):
+            return "waits"
+        decided = await _subject_verdicts(db, hunt)
+        if decided is None:
+            return "waits"
+        first = next((v for v in decided if v["verdict"] == "true_positive"), decided[0])
+        await mark_promoted(
+            db,
+            lead.id,
+            investigation_id=str(first["investigation_id"]),
+            by=SYSTEM_HUNT_ACTOR,
+            now=at,
+            reason=PROMOTED_FINDING_REASON,
+            verdicts=decided,
+            hunt_id=hunt.id,
+        )
+        _LOGGER.info("lead %s closed: every finding of hunt %s has a verdict", lead.id, hunt.id)
+        return "closed"
     outcome = hunt_outcome_of(hunt)
     if outcome in ("threats", "gap"):
         return "waits"
@@ -644,6 +848,89 @@ async def settle_finished_hunts(db: AsyncSession, *, now: datetime | None = None
         if await settle_after_hunt(db, hunt, now=now) in ("closed", "reopened"):
             moved += 1
     return moved
+
+
+def formed_from_backtest(lead: Lead) -> bool:
+    """Whether :func:`mark_backtest_leads` marked this lead."""
+    return any(d.get("action") == BACKTEST_DECISION for d in decisions_of(lead))
+
+
+async def mark_backtest_leads(db: AsyncSession, *, now: datetime | None = None) -> int:
+    """Mark each lead whose observations all came from backtest replays.
+
+    A one-time repair, run at startup. Before 2026-10-06 a replay's verdict
+    wrote an alert observation like a live run did, so a replay could form a
+    lead. The store writes no such observation now (see
+    ``soc_ai.store.investigations._observe_verdict``), and this finds the
+    leads that formed before that.
+
+    An alert observation names its alert in ``fingerprint``. It came from a
+    replay when every run of that alert that holds a verdict is a backtest
+    replay. A run that holds no verdict wrote no observation. When a live run
+    also holds a verdict, the observation may be the live run's, and the lead
+    is left alone. A lead with any other observation type is left alone too:
+    that observation is live evidence. So is a lead with no observation left,
+    because nothing then says where it came from.
+
+    The mark is a decision on the lead (:data:`BACKTEST_DECISION`), which the
+    lead page lists with the others. It changes no status. Idempotent: a lead
+    that holds the mark is not marked again. Returns how many leads it marked.
+    """
+    from soc_ai.hunting.sources import ALERT_SPEC_ID  # noqa: PLC0415 - avoids an import cycle
+    from soc_ai.store.investigations import (  # noqa: PLC0415 - avoids an import cycle
+        is_backtest_actor,
+        not_hunt_subject,
+    )
+    from soc_ai.store.models import Investigation  # noqa: PLC0415 - kept beside its query
+
+    observed = await db.execute(
+        select(
+            EntityObservation.lead_id, EntityObservation.spec_id, EntityObservation.fingerprint
+        ).where(EntityObservation.lead_id.is_not(None))
+    )
+    by_lead: dict[int, list[tuple[str, str]]] = {}
+    for lead_id, spec_id, fingerprint in observed.all():
+        by_lead.setdefault(int(lead_id), []).append((str(spec_id), str(fingerprint or "")))
+    alert_ids = sorted(
+        {fp for rows in by_lead.values() for spec, fp in rows if spec == ALERT_SPEC_ID and fp}
+    )
+    if not alert_ids:
+        return 0
+    runs = await db.execute(
+        select(Investigation.alert_es_id, Investigation.started_by).where(
+            Investigation.alert_es_id.in_(alert_ids),
+            Investigation.verdict.is_not(None),
+            not_hunt_subject(),
+        )
+    )
+    replay_flags: dict[str, set[bool]] = {}
+    for alert_id, started_by in runs.all():
+        replay_flags.setdefault(str(alert_id), set()).add(is_backtest_actor(started_by))
+    replay_only = {alert_id for alert_id, flags in replay_flags.items() if flags == {True}}
+    candidates = sorted(
+        lead_id
+        for lead_id, rows in by_lead.items()
+        if rows and all(spec == ALERT_SPEC_ID and fp in replay_only for spec, fp in rows)
+    )
+    if not candidates:
+        return 0
+    at = (now or datetime.now(UTC)).replace(tzinfo=None)
+    marked = 0
+    for lead in (await db.scalars(select(Lead).where(Lead.id.in_(candidates)))).all():
+        if formed_from_backtest(lead):
+            continue
+        record_decision(
+            lead,
+            BACKTEST_DECISION,
+            at,
+            by=BACKTEST_DECISION_ACTOR,
+            reason="backtest_replay",
+            note=BACKTEST_DECISION_NOTE,
+        )
+        marked += 1
+    if marked:
+        await db.commit()
+    return marked
 
 
 def _entity_names(entities: Any) -> list[str]:

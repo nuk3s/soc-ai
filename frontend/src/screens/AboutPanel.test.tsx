@@ -58,7 +58,8 @@ describe('AboutPanel', () => {
       update_check_enabled: false,
     };
     render(<AboutPanel />);
-    const chip = await screen.findByText('commit c0fb789d1234');
+    // The whole commit shows. A 12-character cut hid the rest (owner, 2026-10-07).
+    const chip = await screen.findByText(`commit ${sha}`);
     expect(chip.getAttribute('title')).toBe(sha);
   });
 

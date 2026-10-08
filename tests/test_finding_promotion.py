@@ -226,9 +226,9 @@ def kind_client(settings_kratos: Settings) -> Iterator[TestClient]:
     yield from _client(settings_kratos)
 
 
-# >160 chars (205) so the detail route's `hunt.objective[:160]` slice is
-# exercised for real — a short fixture would pass the length assertion
-# whether or not the truncation actually fired.
+# >160 chars (205). The detail route cut the objective at 160 characters, and
+# the console showed the cut text as the hunt's name. The route now sends the
+# whole objective, and a short fixture would pass whether or not a cut fired.
 _LONG_OBJECTIVE = (
     "Sweep for beaconing to rare external IPs over 72h. Cross-reference DNS "
     "lookups, TLS SNI fields, and firewall egress logs for any host exhibiting "
@@ -304,8 +304,8 @@ def test_investigations_list_and_detail_speak_stored_kind(kind_client: TestClien
     assert body["huntId"] == hunt_id
     assert body["huntObjective"] is not None
     assert body["huntObjective"].startswith("Sweep for beaconing")
-    assert body["huntObjective"] == _LONG_OBJECTIVE[:160]
-    assert len(body["huntObjective"]) == 160
+    assert body["huntObjective"] == _LONG_OBJECTIVE
+    assert len(body["huntObjective"]) > 160
 
     plain_detail = kind_client.get(f"/api/v1/investigations/{plain_id}")
     assert plain_detail.status_code == 200
@@ -457,7 +457,7 @@ def test_promote_finding_409_still_running(kind_client: TestClient) -> None:
     assert resp.json()["detail"]["reason"] == "still_running"
     assert (
         resp.json()["detail"]["hint"]
-        == "The hunt is still running. Findings promote after it lands its report."
+        == "The hunt is still running. Open an investigation after the hunt lands its report."
     )
 
 

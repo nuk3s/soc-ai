@@ -467,8 +467,8 @@ def test_investigations_list(client: TestClient) -> None:
     assert rows["ET X"]["verdict"] == "false_positive"
     assert rows["ET X"]["host"] == "10.0.0.5"
     assert rows["ET X"]["status"] == "complete"
-    # None rule_name -> identify by (the first 12 chars of) the alert id.
-    running = rows["Alert ev-run-abcde…"]
+    # None rule_name -> identify by the whole alert id.
+    running = rows["Alert ev-run-abcdef"]
     assert running["verdict"] == "untriaged"  # None verdict -> untriaged
     assert running["status"] == "running"
     # Neither row is a pipeline fallback (no marker on either report).
@@ -2437,6 +2437,7 @@ def test_build_actions_marks_ack_applied_when_alert_acked_in_es() -> None:
     ack_ev = SimpleNamespace(kind="auto_ack", payload={"success": True})
     auto = _build_actions([ack_ev], report, alert_acked=True)[0]
     assert auto.applied is True and auto.appliedNote is None
+    assert auto.appliedBy == "auto-ack"
 
 
 def test_build_actions_marks_persisted_execution_applied() -> None:
@@ -2458,7 +2459,7 @@ def test_build_actions_marks_persisted_execution_applied() -> None:
     actions = _build_actions([exec_ev], report)
     assert actions[0].applied is False  # untouched sibling stays actionable
     assert actions[1].applied is True
-    assert actions[1].appliedNote == "Executed · alice"
+    assert actions[1].appliedBy == "alice" and actions[1].appliedNote is None
     # a FAILED execution must not suppress the offer
     failed = SimpleNamespace(
         kind="action_executed",
@@ -2856,7 +2857,8 @@ def test_execute_ack_action_acks_whole_detection_group(client: TestClient) -> No
     ):
         body = client.post(f"/api/v1/investigations/{inv_id}/actions/0/execute").json()
     assert body["status"] == "executed"
-    assert body["detail"] == "Acknowledged 3 alerts in this detection group."
+    assert body["detail"] == "Acknowledged 3 alerts of this rule from the last 7 days."
+    assert body["count"] == 3
     assert {c["alert_id"] for c in calls} == {"es-grp-1", "es-grp-2", "es-grp-3"}
 
 
@@ -3037,7 +3039,7 @@ def test_execute_action_persists_and_suppresses_reoffer(client: TestClient) -> N
         # Reload: the persisted execution marks the action applied — not re-offered.
         detail = client.get(f"/api/v1/investigations/{inv_id}").json()
         assert detail["actions"][0]["applied"] is True
-        assert (detail["actions"][0]["appliedNote"] or "").startswith("Executed")
+        assert detail["actions"][0]["appliedBy"] and detail["actions"][0]["appliedAt"]
 
         # Repeat execute: ok-with-note, and the write tool was NOT called again.
         second = client.post(f"/api/v1/investigations/{inv_id}/actions/0/execute").json()
@@ -3136,7 +3138,7 @@ def test_execute_action_ack_already_acked_in_es_is_idempotent(client: TestClient
     calls: list[dict] = []
     with (
         patch(
-            "soc_ai.api.webui._timeline._alert_currently_acked",
+            "soc_ai.api.webui._timeline._alert_ack_state",
             AsyncMock(return_value=True),
         ),
         patch(
@@ -3171,7 +3173,7 @@ def test_get_investigation_marks_ack_applied_from_live_es_state(client: TestClie
         )
     )
     with patch(
-        "soc_ai.api.webui._timeline._alert_currently_acked",
+        "soc_ai.api.webui._timeline._alert_ack_state",
         AsyncMock(return_value=True),
     ):
         body = client.get(f"/api/v1/investigations/{inv_id}").json()
@@ -3180,10 +3182,10 @@ def test_get_investigation_marks_ack_applied_from_live_es_state(client: TestClie
     assert body["actions"][0]["appliedNote"] == "Already acknowledged"
     assert body["actions"][1]["applied"] is False  # non-ack actions still offered
 
-    # ES probe failure (helper returns False) — current behavior preserved.
+    # ES probe failure (the probe answers None): current behavior preserved.
     with patch(
-        "soc_ai.api.webui._timeline._alert_currently_acked",
-        AsyncMock(return_value=False),
+        "soc_ai.api.webui._timeline._alert_ack_state",
+        AsyncMock(return_value=None),
     ):
         body = client.get(f"/api/v1/investigations/{inv_id}").json()
     assert body["alertAcked"] is False
@@ -3373,7 +3375,7 @@ def test_get_investigation_null_rule_name_partial_enrichment_200(client: TestCli
     body = resp.json()
     # Null rule_name no longer falls back to the bare "Investigation" literal —
     # it now identifies the alert by id so the row/detail is never anonymous.
-    assert body["name"] == "Alert es-no-rule…"
+    assert body["name"] == "Alert es-no-rule"
     assert body["hostContext"] == []
 
 
@@ -7369,23 +7371,44 @@ def test_failed_run_is_countable_and_clearable(client: TestClient) -> None:
 def test_the_bell_does_not_call_a_visibility_gap_a_finding(client: TestClient) -> None:
     """ "Hunt finished — 1 finding: RC4 service ticket…" led to a banner reading
     NO THREAT OBSERVED and a finding titled "could not run". The most alarming
-    line the app can print, meaning a timed-out query (dogfood 2026-09-16)."""
+    line the app can print, meaning a timed-out query (dogfood 2026-09-16).
+
+    The bell names each outcome by the hunt's ``outcome``. A run that could not
+    reach its data source said "no threat observed" until 2026-10-06, so it
+    reads "could not run" in the warn tone now. A run that only saw gaps has no
+    answer. Neither is a finding."""
     import asyncio
 
     from soc_ai.store import hunts as hunts_svc
 
-    async def _seed() -> tuple[str, str, str]:
+    async def _seed() -> tuple[str, str, str, str]:
         maker = client.app.state.db_sessionmaker
         async with maker() as db:
-            gap = await hunts_svc.create(db, objective="RC4 service ticket", started_by="t")
+            failed = await hunts_svc.create(db, objective="RC4 service ticket", started_by="t")
+            await hunts_svc.finalize(
+                db,
+                failed.id,
+                status="complete",
+                report={
+                    "findings": [
+                        {
+                            "title": "Kerberoasting: could not run",
+                            "detail": (
+                                "The kerberoast hunt spec failed against the grid. The result "
+                                "is unknown. The data source did not accept a connection."
+                            ),
+                            "category": "visibility_gap",
+                        }
+                    ]
+                },
+            )
+            gap = await hunts_svc.create(db, objective="DNS tunnel sweep", started_by="t")
             await hunts_svc.finalize(
                 db,
                 gap.id,
                 status="complete",
                 report={
-                    "findings": [
-                        {"title": "Kerberoasting: could not run", "category": "visibility_gap"}
-                    ]
+                    "findings": [{"title": "No telemetry for dns", "category": "visibility_gap"}]
                 },
             )
             threat = await hunts_svc.create(db, objective="find beacons", started_by="t")
@@ -7408,26 +7431,137 @@ def test_the_bell_does_not_call_a_visibility_gap_a_finding(client: TestClient) -
                 # No category field at all: the title heuristic decides.
                 report={"findings": [{"title": "visibility gap: no zeek.dns in window"}]},
             )
-            return gap.id, threat.id, legacy.id
+            return failed.id, gap.id, threat.id, legacy.id
 
-    gap_id, threat_id, legacy_id = asyncio.run(_seed())
+    failed_id, gap_id, threat_id, legacy_id = asyncio.run(_seed())
     by_id = {n["id"]: n for n in client.get("/api/v1/notifications").json()}
+
+    # A run whose every finding is a failed query could not run (dogfood
+    # 2026-10-06 S1). It never reads "no threat observed". The bell names the
+    # hunt through the one title builder and the reason through the outcome.
+    failed = by_id[f"hunt-done:{failed_id}"]
+    assert failed["outcome"] == "could_not_run"
+    assert failed["title"] == (
+        "Hunt could not run: RC4 service ticket. The grid did not accept a connection. "
+        "Hunt again when the grid is healthy."
+    )
+    assert failed["tone"] == "warn"
+    assert "no threat" not in failed["title"]
 
     gap = by_id[f"hunt-done:{gap_id}"]
     assert "finding" not in gap["title"], gap["title"]
-    # One phrase for this outcome, on every surface that names it.
-    assert gap["title"].startswith("Hunt finished: no threat observed · visibility gap")
-    assert gap["tone"] == "accent"
+    # A run that saw only gaps did not test its objective. It has no answer,
+    # and the analyst has to act, so it reads warn.
+    assert gap["outcome"] == "no_answer"
+    assert gap["title"] == "Hunt finished: no answer. DNS tunnel sweep"
+    assert gap["tone"] == "warn"
 
     # A threat alongside a gap is announced by the THREAT count, not the total.
-    assert "1 threat finding:" in by_id[f"hunt-done:{threat_id}"]["title"]
-    assert by_id[f"hunt-done:{threat_id}"]["tone"] == "warn"
+    threat = by_id[f"hunt-done:{threat_id}"]
+    assert "1 threat finding:" in threat["title"]
+    assert threat["outcome"] == "threat_found"
+    assert threat["tone"] == "danger"
 
-    # Legacy shape, classified by title.
-    assert "no threat observed" in by_id[f"hunt-done:{legacy_id}"]["title"]
+    # Legacy shape, classified by title. A hunt that saw only a gap has no answer.
+    assert by_id[f"hunt-done:{legacy_id}"]["title"] == "Hunt finished: no answer. old report"
+    assert by_id[f"hunt-done:{legacy_id}"]["outcome"] == "no_answer"
 
     # A hunt completion is not a hunting-section entry. The default holds.
     assert gap["group"] == "system"
+
+
+def test_the_bell_says_an_analytic_run_could_not_run(client: TestClient) -> None:
+    """A catalog sweep that could not reach its data source names the analytic."""
+    import asyncio
+
+    from soc_ai.hunting.sweep import SWEEP_ACTOR
+    from soc_ai.store import hunts as hunts_svc
+
+    async def _seed() -> str:
+        async with client.app.state.db_sessionmaker() as db:
+            hunt = await hunts_svc.create(
+                db,
+                objective=(
+                    "[catalog] svc-ticket: Service ticket from a workstation (now-1440m → now)"
+                ),
+                started_by=SWEEP_ACTOR,
+                kind="triggered",
+            )
+            await hunts_svc.finalize(
+                db,
+                hunt.id,
+                status="complete",
+                report={
+                    "findings": [
+                        {
+                            "title": "Service ticket from a workstation: could not run",
+                            "detail": (
+                                "The svc-ticket hunt spec failed against the grid. The "
+                                "result is unknown. The data source did not accept a "
+                                "connection."
+                            ),
+                            "category": "visibility_gap",
+                        }
+                    ]
+                },
+            )
+            return hunt.id
+
+    hunt_id = asyncio.run(_seed())
+    row = {n["id"]: n for n in client.get("/api/v1/notifications").json()}[f"hunt-done:{hunt_id}"]
+    assert row["title"] == (
+        "Analytic could not run: Service ticket from a workstation, last 24 h. "
+        "The grid did not accept a connection. Hunt again when the grid is healthy."
+    )
+    assert row["tone"] == "warn"
+    assert row["outcome"] == "could_not_run"
+
+
+def test_the_bell_says_a_stopped_hunt_could_not_run(client: TestClient) -> None:
+    """A hunt that errored said nothing on the bell: it read completed hunts only."""
+    import asyncio
+
+    from soc_ai.store import hunts as hunts_svc
+
+    async def _seed() -> tuple[str, str]:
+        async with client.app.state.db_sessionmaker() as db:
+            errored = await hunts_svc.create(db, objective="find beacons", started_by="t")
+            await hunts_svc.finalize(db, errored.id, status="error", report=None)
+            running = await hunts_svc.create(db, objective="find tunnels", started_by="t")
+            return errored.id, running.id
+
+    errored_id, running_id = asyncio.run(_seed())
+    by_id = {n["id"]: n for n in client.get("/api/v1/notifications").json()}
+    errored = by_id[f"hunt-done:{errored_id}"]
+    assert errored["title"] == (
+        "Hunt could not run: find beacons. "
+        "The hunt ended in an error. The server recorded no reason."
+    )
+    assert errored["outcome"] == "could_not_run"
+    assert errored["tone"] == "warn"
+    running = by_id[f"hunt:{running_id}"]
+    assert running["outcome"] == "running"
+    assert running["title"] == "Hunt running: find tunnels"
+    assert running["tone"] == "accent"
+
+
+def test_a_clean_hunt_is_no_threat_and_quiet(client: TestClient) -> None:
+    """NEGATIVE CONTROL. A hunt that looked and found nothing stays informational."""
+    import asyncio
+
+    from soc_ai.store import hunts as hunts_svc
+
+    async def _seed() -> str:
+        async with client.app.state.db_sessionmaker() as db:
+            hunt = await hunts_svc.create(db, objective="find beacons", started_by="t")
+            await hunts_svc.finalize(db, hunt.id, status="complete", report={"findings": []})
+            return hunt.id
+
+    hunt_id = asyncio.run(_seed())
+    row = {n["id"]: n for n in client.get("/api/v1/notifications").json()}[f"hunt-done:{hunt_id}"]
+    assert row["outcome"] == "no_threat"
+    assert row["title"] == "Hunt finished: no threat found. find beacons"
+    assert row["tone"] == "accent"
 
 
 def test_the_bell_carries_unread_shadow_hits_and_new_leads(client: TestClient) -> None:

@@ -106,7 +106,7 @@ describe('a range change shows that the new window is loading (P5)', () => {
 
     expect(await screen.findByText(/Loading the 30d window/)).toBeTruthy();
     expect(headerLine()).not.toContain('1 detection');
-    expect(headerLine()).toContain('…');
+    expect(headerLine()).toContain('counting');
   });
 
   it('NEGATIVE CONTROL: a background poll does not flash the loading line', async () => {
@@ -220,5 +220,57 @@ describe('the empty state names the filter that emptied the list (D16, P9, RL13)
     vi.mocked(getAlerts).mockResolvedValue(queueOf([]));
     mount('/alerts?range=1h&hide_acked=false');
     expect(await screen.findByText('No detection fired in this window. Widen the time range.')).toBeTruthy();
+  });
+});
+
+// The default 24 h list was empty and pointed nowhere, while the last 30 days
+// held 4 groups (dogfood 2026-10-06, W2).
+describe('the empty state offers the wider window, and the landing widens to the newest row', () => {
+  const byRange = (rows: Record<string, AlertGroup[]>) =>
+    vi.mocked(getAlerts).mockImplementation((q) => Promise.resolve(queueOf(rows[q?.range ?? ''] ?? [])));
+
+  it('offers "Show the last 7 days" on an empty narrow window, and reads that window on a press', async () => {
+    vi.mocked(getAlerts).mockResolvedValue(queueOf([]));
+    mount('/alerts?range=1h');
+    const widen = await screen.findByTestId('alerts-widen');
+    expect(widen.textContent).toBe('Show the last 7 days');
+    fireEvent.click(widen);
+    await waitFor(() =>
+      expect(vi.mocked(getAlerts).mock.calls.some((c) => c[0]?.range === '7d')).toBe(true),
+    );
+    await waitFor(() => expect(screen.getByTestId('alerts-widen').textContent).toBe('Show the last 30 days'));
+  });
+
+  it('offers no wider window at the widest one', async () => {
+    vi.mocked(getAlerts).mockResolvedValue(queueOf([]));
+    mount('/alerts?range=30d');
+    await screen.findByText(/No open detection in this window/);
+    expect(screen.queryByTestId('alerts-widen')).toBeNull();
+  });
+
+  it('lands on the narrowest window that holds a group, and says so', async () => {
+    byRange({ '30d': [mkGroup({ name: 'ET OLD Detection' })] });
+    mount('/alerts');
+    expect(await screen.findByText('ET OLD Detection')).toBeTruthy();
+    expect(screen.getByTestId('alerts-widened').textContent).toBe(
+      'The last 24 hours held no open detection. The list shows the last 30 days.',
+    );
+    expect(vi.mocked(getAlerts).mock.calls.some((c) => c[0]?.range === '7d')).toBe(true);
+  });
+
+  // NEGATIVE CONTROL. A link names its window, and the screen keeps it.
+  it('keeps a window a link named, empty or not', async () => {
+    byRange({ '30d': [mkGroup({ name: 'ET OLD Detection' })] });
+    mount('/alerts?range=24h');
+    await screen.findByText(/No open detection in this window/);
+    expect(vi.mocked(getAlerts).mock.calls.every((c) => c[0]?.range === '24h')).toBe(true);
+    expect(screen.queryByTestId('alerts-widened')).toBeNull();
+  });
+
+  // NEGATIVE CONTROL. A list with rows reads nothing more.
+  it('reads no wider window when the default one has a group', async () => {
+    mount('/alerts');
+    await screen.findByText('ET SCAN Test Detection');
+    expect(vi.mocked(getAlerts).mock.calls.every((c) => c[0]?.range === '24h')).toBe(true);
   });
 });

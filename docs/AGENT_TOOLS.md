@@ -59,14 +59,15 @@ A proposal tool is available in chat only. It is neither a read tool nor a write
 changes nothing anywhere. It puts a control in front of you. The agent has already read
 the evidence, so the proposal arrives filled in. You still press the button.
 
-Each tool appears only on the screen it belongs to, so the model cannot select the wrong
-one. The investigation chat can propose a verdict, and it cannot propose a hunt. The
-Dashboard assistant can propose a hunt, and it cannot propose a verdict.
+Each tool appears only in the chat scope it belongs to, so the model cannot select the
+wrong one. Ask soc-ai on an investigation can propose a verdict, and it cannot propose a
+hunt. Ask soc-ai on the general scope, a host or a lead can propose a hunt, and it cannot
+propose a verdict. Ask soc-ai on a hunt proposes nothing.
 
 | Tool | Where | What happens |
 |------|-------|--------------|
-| `propose_verdict` | Investigation chat | The agent proposes `true_positive` or `false_positive` with a confidence, a rationale and citations. The stored verdict does not change. An Apply control appears, and it appears only if evidence backs the proposal. |
-| `propose_hunt` | Dashboard assistant | Some questions need a sweep across many hosts or a long window. The agent writes the hunt objective from the evidence it has read, and it states what the sweep settles. Nothing starts. A Start hunt control appears, and you confirm it. |
+| `propose_verdict` | Ask soc-ai, investigation scope | The agent proposes `true_positive` or `false_positive` with a confidence, a rationale and citations. The stored verdict does not change. An Apply control appears, and it appears only if evidence backs the proposal. |
+| `propose_hunt` | Ask soc-ai, general, host and lead scopes | Some questions need a sweep across many hosts or a long window. The agent writes the hunt objective from the evidence it has read, and it states what the sweep settles. Nothing starts. A Start hunt control appears, and you confirm it. |
 
 ## Write tools
 

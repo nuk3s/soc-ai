@@ -394,9 +394,9 @@ def test_hunt_finding_route_citation_fetch_bounded_and_list_elided(
     assert fetched_ids == citations[:5]
     assert mock_draft.await_args is not None
     evidence = mock_draft.await_args.kwargs["evidence"]
-    assert "… and 5 more" in evidence
+    assert ", and 5 more" in evidence
     assert citations[19] in evidence
-    assert citations[20] not in evidence.split("… and 5 more")[0]
+    assert citations[20] not in evidence.split(", and 5 more")[0]
 
 
 def test_hunt_finding_route_dry_run_anchored_on_cited_timestamp(

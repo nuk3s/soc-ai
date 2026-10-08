@@ -27,12 +27,12 @@ export const DEFINE_HIT =
   'waits for you to read it and to approve or reject the analytic that wrote it.';
 
 export const DEFINE_LEAD =
-  'A lead is a set of observations on one entity that are worth one decision: hunt it, ' +
-  'dismiss it, or promote it to an investigation.';
+  'A lead is a set of observations on one entity that are worth one decision: hunt it or ' +
+  'dismiss it.';
 
 export const DEFINE_HUNT =
-  'A hunt is one agent run with an objective. It ends in findings. You, a schedule or a ' +
-  'lead can start one.';
+  'A hunt is one agent run with an objective. It returns findings. A hunt is not finished ' +
+  'until its findings are investigated. You, a schedule or a lead can start one.';
 
 export const DEFINE_SCHEDULE =
   'A schedule starts a hunt on an interval and writes a hunt row on every run.';
@@ -53,8 +53,8 @@ export const EXPAND_SECTION = 'Expand this section.';
 
 // ── The lead state pills ────────────────────────────────────────────────────
 
-/** The pill offered Promote. The server refuses a promotion until a hunt has
- *  finished, so the sentence named an act the analyst cannot take. */
+/** The pill named an act the analyst cannot take before a hunt has finished,
+ *  so the sentence names the acts a new lead offers. */
 export const PILL_NEW =
   'New: nobody has acted on this lead. Its hunt starts on its own, or hunt it by hand. ' +
   'Dismiss it if it is noise.';
@@ -63,7 +63,7 @@ export const PILL_IN_PROGRESS =
   'In progress: a hunt is running on this lead. View the hunt to follow it.';
 
 export const PILL_HUNTED =
-  'Hunted: the hunt on this lead finished. Read the hunt, then promote or dismiss the lead.';
+  'Hunted: the hunt on this lead finished. Read the verdicts it brought back, or dismiss the lead.';
 
 export const PILL_DISMISSED =
   'Dismissed: an analyst closed this lead with a reason. Reopen puts it back in the queue.';
@@ -97,7 +97,8 @@ export const TAB_NEEDS_DECISION =
 export const TAB_IN_PROGRESS = 'Leads with a hunt running. Nothing waits on you here.';
 
 export const TAB_CLOSED =
-  'Leads an analyst dismissed or promoted, and leads a clean hunt closed. Reopen puts one back.';
+  'Leads an analyst dismissed or opened an investigation on, and leads a clean hunt closed. ' +
+  'Reopen puts one back.';
 
 export const TAB_ALL = 'Every lead, in every state.';
 
@@ -176,7 +177,7 @@ export const HIT_FILTERS =
 
 // ── The hunt type chips ─────────────────────────────────────────────────────
 
-export const TYPE_ALL = 'Every hunt an agent ran.';
+export const TYPE_ALL = 'Every hunt in the window. The catalog runs are included.';
 
 export const TYPE_MANUAL = 'Hunts an analyst started from an objective.';
 
@@ -184,11 +185,15 @@ export const TYPE_SCHEDULE = 'Hunts a schedule started.';
 
 export const TYPE_LEAD = 'Hunts started from a lead.';
 
-export const TYPE_CATALOG = 'Rows the analytic sweep wrote. Recorded before this release.';
+export const TYPE_CATALOG =
+  'Runs the analytic sweep recorded. The sweep records a run when an analytic cannot read its data.';
 
 // ── The hunt statuses and the unread dot ────────────────────────────────────
 
 export const STATUS_RUNNING = 'The hunt is running now.';
+
+export const STATUS_INVESTIGATING =
+  'The hunt landed its report. The investigations of its findings run now.';
 
 export const STATUS_COMPLETE = 'The hunt finished. The findings column counts its threat findings.';
 
@@ -211,10 +216,13 @@ export const UNREAD_DOT = 'Unread. Open the evidence or act on the hit to mark i
 export const LEAD_LEGEND =
   'New: nobody has acted. In progress: a hunt is running. ' +
   'Hunted: the hunt finished, and the lead waits on a decision. ' +
-  'Closed: an analyst dismissed or promoted the lead, or a clean hunt closed it.';
+  'Closed: an analyst dismissed the lead or opened an investigation on it, or a clean hunt ' +
+  'closed it.';
 
+/** The chip on an analytic in the stored status `candidate`. The screen word
+ *  is "draft": the analytic is written and has never run. */
 export const CHIP_CANDIDATE =
-  'Candidate: the analytic has never run. Put it in shadow to see what it would find.';
+  'Draft: the analytic is written and has never run. Put it in shadow to see what it would find.';
 
 export const CHIP_RETIRED =
   'Retired: the analytic no longer runs. It keeps its ledger and its reason.';
@@ -244,13 +252,15 @@ export const CHIP_IN_LEAD = 'This observation is part of a lead. Open the lead t
 export const OBSERVATION_NO_ANALYTIC =
   'The source of this observation. No analytic in this deployment carries the id, so there is nothing to open.';
 
-/** The statistic line under an observation. */
+/** The statistic line under an observation. A departure is the gap between
+ *  what soc-ai measured and what is usual for the entity. The sentence said
+ *  "the statistic that departed", which explains the word with itself. */
 export const OBSERVATION_STATISTIC =
-  'The statistic that departed and the baseline value it departed from.';
+  'What soc-ai measured, and the usual value for this entity. The gap between the two is the departure.';
 
 /** The link that opens the console with the query of one observation. */
 export const OBSERVATION_RERUN =
-  'Open a new hunt with this query in the objective. The hunt reads the departure again.';
+  'Open a new hunt with this query in the objective. The hunt measures the value again.';
 
 export const CHIP_DISMISSED_EVENT =
   'An analyst closed this lead here. The dismissal stays on the record.';
@@ -258,17 +268,25 @@ export const CHIP_DISMISSED_EVENT =
 export const CHIP_SHADOW_LEAD =
   'Recorded in shadow. No hunt starts from this lead by itself.';
 
-export const CHIP_TYPE = 'The type of observation. Two types on one entity form a lead.';
+/** How a sighting ages. One sentence for every surface that shows a weight.
+ *  The words "48 h half-life" named the scoring machinery in analyst text. */
+export const SIGHTING_HALF_WEIGHT = 'A sighting counts half as much after 48 hours.';
+
+/** The lead rule of soc_ai/hunting/leads.py: two or more types reach 0.85
+ *  together, or one type repeats to 1.50 alone (SINGLE_SIGNAL_THRESHOLD). */
+export const LEAD_RULE =
+  'Two or more types on one entity form a lead at a weight of 0.85. One type forms a lead alone when its repeats reach a weight of 1.50.';
+
+export const CHIP_TYPE = `The type of observation. ${LEAD_RULE}`;
 
 export const CHIP_SEEN = 'The analytic matched this entity again. The repeat adds weight.';
 
 /** The sweep count. A sweep counts when it cites a document the row had not
  *  cited. A re-read of the same documents is not a sighting. */
 export const CHIP_SWEEPS =
-  'The number of sweeps that saw a new document for this observation. Each one adds weight.';
+  'The number of sweeps that saw a new document for this observation. Each one adds weight. A signal seen on many sweeps repeats. It is not more severe.';
 
-export const WEIGHT_NOW =
-  'The live weight decays with a 48 h half-life. A new sighting adds weight.';
+export const WEIGHT_NOW = `${SIGHTING_HALF_WEIGHT} A new sighting adds weight.`;
 
 /** The weight the lead reached at formation. It is a record of one moment and
  *  it never moves, so it cannot wear the sentence of the decaying weight. */
@@ -290,9 +308,9 @@ export const FILTER_SCHEDULE = 'Hunts a schedule started.';
 
 export const FILTER_LEAD = 'Hunts started from a lead.';
 
-export const FILTER_ALL = 'Every hunt an agent ran.';
+export const FILTER_ALL = TYPE_ALL;
 
-export const FILTER_CATALOG = 'Rows the analytic sweep wrote. Recorded before this release.';
+export const FILTER_CATALOG = TYPE_CATALOG;
 
 export const STATUS_INVESTIGATION =
   'Where the investigation is. A run that is still going has no verdict yet.';
@@ -305,6 +323,7 @@ export const STATUS_INVESTIGATION =
  *  looking for it. */
 export function huntStatusTitle(status: string, where: 'list' | 'row' = 'list'): string {
   if (status === 'running') return STATUS_RUNNING;
+  if (status === 'investigating') return STATUS_INVESTIGATING;
   if (status === 'complete') return where === 'row' ? STATUS_COMPLETE_ROW : STATUS_COMPLETE;
   return STATUS_COULD_NOT_RUN;
 }
@@ -336,6 +355,26 @@ export const DISPOSITION =
 export const CHIP_LEAD = 'The lead that asked for this hunt. Open it to decide.';
 
 export const CHIP_SEVERITY = 'The severity of this finding, as the hunt reported it.';
+
+/** The tooltip of a severity chip. Two things carry a severity: the rule that
+ *  raised an alert, and a hunt finding. The console drew three chip styles
+ *  for them and named neither, so a reader could not tell whose level it was.
+ *  `label` is the screen word, "High". */
+export function severityTitle(label: string, source: 'rule' | 'finding' = 'rule'): string {
+  if (source === 'finding') return `Finding severity: ${label}. The hunt reported it.`;
+  if (label.toLowerCase() === 'unknown') {
+    return 'Rule severity: none. The alert document carries no severity label.';
+  }
+  return `Rule severity: ${label}. The detection rule that raised the alert sets it.`;
+}
+
+/** The count beside the host and finding map of a hunt. It read "1F · 0H",
+ *  a code the reader had to decode. */
+export function mapCountLabel(findings: number, hosts: number): string {
+  const f = `${findings} finding${findings === 1 ? '' : 's'}`;
+  const h = `${hosts} host${hosts === 1 ? '' : 's'}`;
+  return `${f} · ${h}`;
+}
 
 export const CHIP_MITRE = 'A MITRE ATT&CK technique a finding of this hunt names.';
 
@@ -375,10 +414,12 @@ export const CHIP_SHIPPED_IN_SHADOW =
   'soc-ai wrote this row when the analytic shipped. A new shipped analytic starts in shadow. ' +
   'An analyst approves it to live after the shadow week.';
 
-/** The chip on an analytic that a system demotion holds in shadow. */
+/** The chip on an analytic that a system demotion holds in shadow. The chip
+ *  reads "paused by soc-ai". The sentence named the "fire budget" and the
+ *  "precision floor", two spec field names no analyst reads. */
 export const CHIP_HELD_BY_SYSTEM =
-  'soc-ai moved this analytic from live to shadow. It breached its fire budget or its ' +
-  'precision floor. Read the evidence. Then select Approve or Reject.';
+  'Paused by soc-ai. soc-ai moved this analytic from live to shadow. It went over its daily ' +
+  'hit limit, or its precision fell under the minimum. Read the evidence. Then select Approve or Reject.';
 
 // ── The detection type chips ────────────────────────────────────────────────
 //
@@ -411,11 +452,18 @@ export function detectionKindTitle(kind: string): string {
 export const COUNT_ALERT_EVENTS =
   'The alert documents the grid holds in this window, and the detection groups they fall into.';
 
-export const COUNT_AWAITING =
-  'Detection groups in this window with no verdict yet. soc-ai has not investigated them.';
+/** The flow in the analyst's words, under the Needs you tile (owner,
+ *  2026-10-07: "What is the user flow?"). The "How this flows" link follows
+ *  it. */
+export const OVERVIEW_FLOW =
+  'Alerts and sweeps come in. soc-ai triages, hunts, and investigates what the hunts find. ' +
+  'You decide in Needs you. Your actions go to Security Onion.';
+
+export const COUNT_NEEDS_YOU =
+  'The work that waits on you: leads to decide, unread shadow hits, alert groups with no verdict, verdicts that need more info and recommended actions. The sidebar badges and the bell state the same count.';
 
 export const COUNT_TRUE_POSITIVES =
-  'Detection groups in this window soc-ai called a true positive.';
+  'Investigations in this window with a true positive verdict. The Investigations list counts the same runs with the same query.';
 
 export const COUNT_RUNNING = 'Investigations soc-ai is working now.';
 
@@ -458,61 +506,93 @@ export const LEGEND_AUTO_HUNT = 'A new lead starts its own hunt.';
  *  came. */
 export const LEADS_NOTE_AUTO_HUNT =
   'soc-ai starts a hunt on every new lead, except a shadow lead, a reopened lead and a ' +
-  'lead with no documents. You decide what the hunt found.';
+  'lead with no documents. A shadow lead comes from an analytic in trial mode. ' +
+  'You decide what the hunt found.';
 
 /** The chip beside the pill on a New lead the loop leaves to the analyst. The
- *  note above states the exclusions, and this states which lead carries one. */
+ *  note above states the exclusions, and this states which lead carries one.
+ *  The screen word for the loop is "auto-hunt", the name of its setting. */
 export const CHIP_LEFT_TO_YOU =
-  'The loop starts no hunt here: a shadow lead, a reopened lead, or a lead with no ' +
-  'documents. Hunt it by hand.';
+  'Auto-hunt starts no hunt here: a shadow lead, a reopened lead, or a lead with no ' +
+  'documents. A shadow lead comes from an analytic in trial mode. Hunt it by hand.';
 
 /** The secondary act on a lead whose hunt is queued. The loop starts it within
  *  a minute, and this button does not wait for the loop. */
-export const ACTION_HUNT_NOW = 'Start the hunt now. The lead does not wait for the loop.';
+export const ACTION_HUNT_NOW = 'Start the hunt now. The lead does not wait for auto-hunt.';
 
 // ── The hunt as a subject ───────────────────────────────────────────────────
 
-/** The refusal an analyst reads on Promote before a hunt has run. The server
- *  answers the same sentence as a 409, so the button and the refusal agree. */
-export const PROMOTE_NEEDS_HUNT =
-  "Hunt this lead first. The investigation reads the hunt's findings.";
+/** The hover of "Hunt this lead": what a hunt returns, and what it does not
+ *  do. The owner could not tell a hunt from an investigation (2026-10-07). */
+export const ACTION_HUNT =
+  'Start a hunt on this lead. The hunt returns findings and a narrative. soc-ai investigates ' +
+  'the findings and brings back the verdicts. The hunt takes no action in Security Onion.';
 
-/** The budget class chip on an investigation: what the run was allowed to spend. */
+/** The line under the actions of a lead. The two verbs of the flow, once. */
+export const LEAD_ACTIONS_LINE =
+  'Hunt this lead. The hunt investigates what it finds and brings back the verdicts.';
+
+/** The hover of "Open an investigation" on a finding that has no
+ *  investigation. The hunt investigates its findings, and this is the manual
+ *  control for a finding it left. */
+export const ACTION_OPEN_INVESTIGATION =
+  'Open an investigation on this finding. soc-ai investigates the evidence that the finding ' +
+  'cites. The investigation ends in a verdict and recommended actions.';
+
+/** The depth chip on an investigation: how far the run was allowed to go.
+ *
+ *  The stored keys stay cheap, standard, deep and rule_prior. The screen says
+ *  "Depth: quick / standard / deep". "class" and "cheap" were budget words,
+ *  and "rule prior" named a mechanism where the analyst needs the source of
+ *  the verdict: the history of the rule. */
 export const CHIP_RUN_CLASS: Record<string, { label: string; title: string }> = {
   cheap: {
-    label: 'cheap',
+    label: 'Depth: quick',
     title:
-      'Cheap class. The model wrote the verdict from the prefetch in one request. ' +
+      'Quick. The model wrote the verdict from the context soc-ai gathered, in one request. ' +
       'No tool loop ran. The Oracle did not review it. A decision template cleared the alert first.',
   },
   standard: {
-    label: 'standard',
+    label: 'Depth: standard',
     title:
-      'Standard class. The model investigated with the read tools at the standard budget. ' +
+      'Standard. The model investigated with the read tools at the standard budget. ' +
       'The Oracle reviews an uncertain verdict.',
   },
   deep: {
-    label: 'deep',
+    label: 'Depth: deep',
     title:
-      'Deep class. An analyst asked for a deep re-run. The model investigated with every read tool ' +
+      'Deep. An analyst asked for a deep re-run. The model investigated with every read tool ' +
       'at the full budget. The Oracle reviews an uncertain verdict.',
   },
   rule_prior: {
-    label: 'rule prior',
-    title:
-      'Rule prior. No model ran on this alert. Recent runs of the rule all ended false positive, ' +
-      'so the alert took the verdict of the latest model run. Re-run it to investigate this alert.',
+    label: 'rule history',
+    title: 'No model ran. soc-ai copied the latest model verdict of this rule.',
   },
 };
 
+/** The depth chip on a row with no recorded depth, on a list where other rows
+ *  have one. A list shows the chip on every row or on none: a chip on some
+ *  rows only read as a property the other rows lack. */
+export const CHIP_RUN_CLASS_NONE = {
+  label: 'Depth: not recorded',
+  title: 'soc-ai recorded no depth for this run. A run from before depths existed has none.',
+};
+
+/** The same chip on a run still in progress. The depth is written when it ends. */
+export const CHIP_RUN_CLASS_PENDING = {
+  label: 'Depth: pending',
+  title: 'The run is in progress. soc-ai records its depth when it ends.',
+};
+
 /** Why a verdict went to the Oracle. The codes the uncertainty rule and the
- * classic rule write. */
+ * classic rule write. The sentences name a verdict in the words the console
+ * shows, never as a stored key. */
 export const ORACLE_REASON: Record<string, string> = {
   confidence_in_band: 'The confidence sits in the gate band, from 0.4 to below 0.7.',
   template_split: 'The decision template and the model disagree on the verdict.',
-  deep_needs_more_info: 'A deep re-run ended with needs_more_info.',
-  needs_more_info: 'The local verdict is needs_more_info.',
-  malware_non_tp: 'A malware or attack rule has a local verdict other than true_positive.',
+  deep_needs_more_info: 'A deep re-run ended with the verdict Needs more info.',
+  needs_more_info: 'The local verdict is Needs more info.',
+  malware_non_tp: 'A malware or attack rule has a local verdict other than True positive.',
   below_confidence: 'The local confidence is below 0.6.',
 };
 

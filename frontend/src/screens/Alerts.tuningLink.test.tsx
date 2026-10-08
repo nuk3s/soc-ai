@@ -87,7 +87,7 @@ describe('Alerts — tune-rule deep-link into detection tuning', () => {
     fireEvent.click(link);
     // Events are lazy-fetched only on expand (toggleExpand) — its absence is
     // the visible proof the row's own onClick never ran behind the link's.
-    expect(screen.queryByText('Loading events…')).toBeNull();
+    expect(screen.queryByText('Loading events')).toBeNull();
   });
 
   it('renders exactly one tune-rule link per group row, not per event', async () => {
@@ -101,7 +101,7 @@ describe('Alerts — tune-rule deep-link into detection tuning', () => {
     // inside the per-event map instead of the per-group row, this count
     // would grow past two once the events render.
     fireEvent.click(screen.getByText(GROUP_A.name));
-    await waitFor(() => expect(screen.queryByText('Loading events…')).toBeNull());
+    await waitFor(() => expect(screen.queryByText('Loading events')).toBeNull());
     expect(screen.getAllByRole('button', { name: /tune rule/i })).toHaveLength(2);
   });
 });

@@ -8,110 +8,14 @@
 // the first is a finding and the second is an outage.
 
 import { Activity as ActivityIcon, AlertTriangle, RotateCw, Share2, Users } from 'lucide-react';
-import { Link } from 'react-router-dom';
 import { cn } from '../lib/cn';
 import type { ActivityState } from '../lib/hostActivity';
-import { isPrivateIp } from '../lib/ip';
 import { absTime } from '../lib/timeRange';
-import type {
-  EdgeKind,
-  EntityKind,
-  GraphEdge,
-  GraphNode,
-  HostActivity,
-  HostActivityRange,
-  HostPeer,
-  Verdict,
-  VolumePoint,
-} from '../lib/types';
-import { VerdictPill } from './Badges';
-import { EntityGraph } from './EntityGraph';
+import type { HostActivity, HostActivityRange, VolumePoint } from '../lib/types';
+import { PeerGraph } from './PeerGraph';
 import { Panel, PanelHeader } from './Panel';
 import { sparklinePoints } from './QualityCard';
-
-// ---- the peer graph ---------------------------------------------------------
-
-/**
- * Lay the host and its peers out for EntityGraph.
- *
- * A pure seam, so the mapping decisions can be pinned without rendering SVG: the
- * subject on the left, its peers stacked down the right, one edge per direction
- * of traffic. Two things are deliberate.
- *
- * `alerted` maps to the `lateral` edge kind. That is EntityGraph's DANGER-styled
- * edge, and the style is what is being asked for — the word "lateral" is not a
- * claim this code is making about the traffic, which is why the edge is also
- * labelled "alerted" so the graph says what it means.
- *
- * A `both` peer gets two edges rather than one. EntityGraph has no bidirectional
- * arrow, and drawing one arrow for two-way traffic would pick a direction the
- * data does not.
- */
-export function peerGraph(ip: string, peers: HostPeer[]): { nodes: GraphNode[]; edges: GraphEdge[] } {
-  const nodes: GraphNode[] = [
-    { id: ip, x: 8, y: 50, kind: 'host', label: ip, sub: 'this host' },
-  ];
-  const edges: GraphEdge[] = [];
-
-  // The subject is never its own peer. The server filters this too (the right
-  // layer), but a self-referential row would render here as a second node with
-  // the same id and a zero-length edge from a node to itself, so the mapping is
-  // independently correct about it rather than trusting its input.
-  const others = peers.filter((peer) => peer.ip !== ip);
-
-  others.forEach((peer, i) => {
-    // One peer sits on the centre line; several spread evenly down the column.
-    const y = others.length === 1 ? 50 : 8 + (84 * i) / (others.length - 1);
-    // Internal peers are the square "internal host"; everything else takes the
-    // warmer "outside the network" node style. That style's stock legend label is
-    // "C2 / external", which would accuse every CDN of being command-and-control
-    // — the graph is rendered with a `kindLabels` override that renames it.
-    const kind: EntityKind = isPrivateIp(peer.ip) ? 'internal' : 'c2';
-    nodes.push({
-      id: peer.ip,
-      x: 76,
-      y,
-      kind,
-      // The network's name for the peer when it has one; the address otherwise.
-      // A blank label would lose the only handle the reader has on the node.
-      label: peer.hostname ?? peer.ip,
-      sub: peer.ports.length > 0 ? peer.ports.slice(0, 3).join(', ') : undefined,
-    });
-
-    const edgeKind: EdgeKind = peer.alerted ? 'lateral' : 'flow';
-    const label = peer.alerted ? 'alerted' : undefined;
-    const inbound = peer.direction === 'in' || peer.direction === 'both';
-    const outbound = peer.direction === 'out' || peer.direction === 'both';
-    // EXACTLY ONE of the two edges carries the label. EntityGraph centres a
-    // label on its own edge's midpoint, and a `both` peer's two edges are
-    // collinear — the midpoints differ only by the arrowhead pullback, so
-    // labelling both stacks the same word twice on one baseline about 19px
-    // apart, and "alerted" is wider than that at fontSize 9. It renders as
-    // smeared, doubled text. The outbound edge carries it when there is one;
-    // an inbound-only peer would otherwise lose its label entirely.
-    if (inbound) {
-      edges.push({ from: peer.ip, to: ip, kind: edgeKind, label: outbound ? undefined : label });
-    }
-    if (outbound) {
-      edges.push({ from: ip, to: peer.ip, kind: edgeKind, label });
-    }
-  });
-
-  return { nodes, edges };
-}
-
-/** Tall enough that peers do not collide, short enough that a two-peer host does
- *  not get a page of whitespace.
- *
- *  46px of pitch per peer against a 34px node diameter. The server caps the
- *  list at 12 (MAX_PEERS in soc_ai/webui/host_activity.py), which wants 622 —
- *  so the upper clamp sits just above that rather than below it. A 560 cap
- *  would have squeezed a full list to 38px of pitch, which is 4px of air
- *  between nodes; the clamp is defence against the server's cap changing, not
- *  something that fires today. */
-function graphHeight(peerCount: number): number {
-  return Math.min(640, Math.max(240, peerCount * 46 + 70));
-}
+import { LoadingInline } from './States';
 
 // ---- the volume sparkline ---------------------------------------------------
 
@@ -234,7 +138,7 @@ function UsersCard({
     <div className="flex flex-col divide-y divide-border">
       {users.map((user) => (
         <div key={user.name} className="flex items-baseline gap-2 px-[15px] py-2">
-          <span className="min-w-0 flex-1 truncate font-mono text-[12.5px] text-text-2">
+          <span className="min-w-0 flex-1 break-all font-mono text-[12.5px] text-text-2">
             {user.name}
           </span>
           <span className="flex-none font-mono text-[11px] text-faint" title="Authentication events">
@@ -324,13 +228,10 @@ export function HostActivityRow({
   if (state === 'loading' || !activity) {
     return (
       <div className="mb-3 flex min-h-[300px] items-center justify-center rounded-panel border border-border bg-surface-1 px-4 text-[12.5px] text-faint">
-        Reading this host's activity from the grid…
+        <LoadingInline>Reading this host's activity from the grid</LoadingInline>
       </div>
     );
   }
-
-  const { nodes, edges } = peerGraph(ip, activity.peers);
-  const latest = activity.latest_investigation;
 
   return (
     <>
@@ -361,30 +262,11 @@ export function HostActivityRow({
 
       <div className="mb-3 grid grid-cols-1 gap-3 lg:grid-cols-3">
         <Panel className={cn('lg:col-span-2', loading && 'opacity-60')}>
-          <PanelHeader
-            icon={<Share2 size={15} />}
-            title={`Peers · ${range}`}
-            right={
-              latest ? (
-                <Link
-                  to={`/investigation/${encodeURIComponent(latest.id)}`}
-                  title={`Most recent investigation naming this host · ${absTime(latest.ts)}`}
-                  className="flex items-center gap-2 text-[11.5px] text-dim hover:text-text"
-                >
-                  latest
-                  {/* A run links before it concludes, so a null verdict is "still
-                      going", not "untriaged" — different things, different chips. */}
-                  {latest.verdict ? (
-                    <VerdictPill verdict={latest.verdict as Verdict} showConf={false} />
-                  ) : (
-                    <span className="rounded-pill border border-accent/40 bg-accent/10 px-2 py-px text-[11px] font-semibold text-accent">
-                      investigating
-                    </span>
-                  )}
-                </Link>
-              ) : null
-            }
-          />
+          {/* No verdict chip here. A "latest False positive" chip on the
+              peer graph read as the verdict on the host, beside an Alerts
+              card that said nothing fired (dogfood 2026-10-06, S3). The
+              first lines of the page carry the leads and the verdicts. */}
+          <PanelHeader icon={<Share2 size={15} />} title={`Peers · ${range}`} />
           {activity.peers.length === 0 ? (
             <div className="px-[15px] py-8 text-center text-[12.5px] leading-[1.6] text-dim">
               No peer traffic for this host in the last {range}.
@@ -394,16 +276,9 @@ export function HostActivityRow({
             </div>
           ) : (
             <div data-testid="host-peer-graph">
-              <EntityGraph
-              nodes={nodes}
-              edges={edges}
-              height={graphHeight(activity.peers.length)}
-              // The `c2` STYLE is right for "outside the network" and its label is
-              // not: on this page every non-RFC1918 peer is a CDN, a package
-              // mirror or a resolver until something says otherwise. Same
-              // separation of style from claim as the `lateral` edge above.
-              kindLabels={{ c2: 'external', internal: 'internal', host: 'this host' }}
-            />
+              {/* Who this host talks to, how much, and which peers an alert
+                  names. lib/peerGraph.ts shapes the diagram. */}
+              <PeerGraph ip={ip} peers={activity.peers} />
               {/* The server ranks by traffic and cuts the list, and the wire
                   says when it did — so this footnote appears exactly when
                   peers fell off the end, not whenever the list happens to be

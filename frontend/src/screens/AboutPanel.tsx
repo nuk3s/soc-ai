@@ -77,9 +77,9 @@ export function AboutPanel({
                 {data.commit && (
                   <span
                     title={data.commit}
-                    className="rounded-chip border border-border bg-surface-2 px-2 py-0.5 font-mono text-[12px] text-text-2"
+                    className="break-all rounded-chip border border-border bg-surface-2 px-2 py-0.5 font-mono text-[12px] text-text-2"
                   >
-                    commit {data.commit.slice(0, 12)}
+                    commit {data.commit}
                   </span>
                 )}
               </div>
@@ -114,7 +114,7 @@ export function AboutPanel({
                       disabled={checking}
                       className="rounded-control border border-border-strong bg-surface-3 px-3 py-1.5 text-[12px] font-semibold text-text hover:border-accent disabled:opacity-60"
                     >
-                      {checking ? 'Checking…' : 'Check for updates'}
+                      {checking ? 'Checking' : 'Check for updates'}
                     </button>
                     {result && <span className={`text-[12px] ${resultTone(result)}`}>{result.detail}</span>}
                   </div>

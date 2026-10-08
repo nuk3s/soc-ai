@@ -218,6 +218,10 @@ class DossierOut(DossierRowOut):
     # machine shares. Observations, leads and the host-log profile rows key on
     # ``host.name``, so a page that read the address alone showed none of them.
     aliases: list[str] = Field(default_factory=list)
+    # Whether the profile sweep runs on this deployment. The profile panel
+    # said "Turn profiles on in Config" over a host with too few events while
+    # profiles were on. None from a route that does not read the setting.
+    profiles_enabled: bool | None = None
 
 
 class DossierListOut(BaseModel):
@@ -1529,7 +1533,9 @@ async def _current_dossier(request: Request, key: str, settings: Settings) -> Do
         if _needs_plane_read(merged, reporting=resolved.reporting)
         else None
     )
-    return _dossier_out(resolved, merged, aliases, shipped)
+    out = _dossier_out(resolved, merged, aliases, shipped)
+    out.profiles_enabled = bool(getattr(settings, "entity_profiles_enabled", False))
+    return out
 
 
 # The two fields a bulk declare constrains to a closed vocabulary — one word

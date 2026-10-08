@@ -14,7 +14,7 @@ import asyncio
 import logging
 from typing import Any
 
-from soc_ai.agent.context import HuntSubject
+from soc_ai.agent.context import HuntSubject, InvestigationContext
 from soc_ai.agent.prompts import FocusOrigin
 from soc_ai.api.deps import ctx_from_state
 from soc_ai.api.runner import CancelToken, run_recorded
@@ -50,6 +50,7 @@ class HuntManager:
         focus_origin: FocusOrigin = "rerun",
         is_synth_eval: bool = False,
         subject: HuntSubject | None = None,
+        ctx: InvestigationContext | None = None,
     ) -> str | None:
         """Create the investigation row and spawn a background drainer task.
 
@@ -88,6 +89,10 @@ class HuntManager:
         promoted synth finding can never be read as a real one. No request
         model carries it — only the promotion route ever passes it.
 
+        ``ctx`` (optional): the context the run uses. None builds a fresh one
+        from ``state``. The hunt runner passes a copy of its own context, so
+        an investigation of an evaluation hunt sees what the hunt saw.
+
         Returns the investigation id, or None if the generator ended or
         errored before emitting ``investigation_created``.
         """
@@ -99,7 +104,8 @@ class HuntManager:
             # hole — a promoted finding's or lead's anchor never has an SO alert
             # to ack.
             allow_so_writes = False
-        ctx = ctx_from_state(state)
+        if ctx is None:
+            ctx = ctx_from_state(state)
         # Every run started here is one an analyst asked for: Investigate, a
         # re-run, request-more-info, a promotion. That is the standard class,
         # which runs the tool loop; the "Deep re-run" is the deep class. The
@@ -174,6 +180,25 @@ class HuntManager:
             token.requested = True
         task.cancel()
         return True
+
+    def is_live(self, inv_id: str) -> bool:
+        """Whether this manager runs the investigation now."""
+        task = self._tasks.get(inv_id)
+        return task is not None and not task.done()
+
+    async def wait(self, inv_id: str) -> None:
+        """Wait until the background task of ``inv_id`` ends. Returns at once if none runs.
+
+        A cancel of the caller does not cancel the investigation, because
+        ``asyncio.wait`` does not cancel what it waits on. The caller decides
+        that through :meth:`cancel`, so the run lands ``cancelled`` and not
+        ``error``. A cancel of the investigation itself ends the wait and does
+        not raise in the caller.
+        """
+        task = self._tasks.get(inv_id)
+        if task is None or task.done():
+            return
+        await asyncio.wait({task})
 
 
 async def _drain(

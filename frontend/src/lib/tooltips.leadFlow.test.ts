@@ -17,27 +17,43 @@ describe('a lead starts its own hunt', () => {
     expect(TIP.LEGEND_AUTO_HUNT).toBe('A new lead starts its own hunt.');
     expect(TIP.LEADS_NOTE_AUTO_HUNT).toBe(
       'soc-ai starts a hunt on every new lead, except a shadow lead, a reopened lead and a ' +
-        'lead with no documents. You decide what the hunt found.',
+        'lead with no documents. A shadow lead comes from an analytic in trial mode. ' +
+        'You decide what the hunt found.',
     );
-    expect(TIP.ACTION_HUNT_NOW).toBe('Start the hunt now. The lead does not wait for the loop.');
+    expect(TIP.ACTION_HUNT_NOW).toBe('Start the hunt now. The lead does not wait for auto-hunt.');
   });
 
   // The note states the exclusions, and the lead that carries one states it on
   // the row. An analyst who read the note over a shadow lead waited for a hunt
-  // that never came.
-  it('states why the loop leaves one lead alone', () => {
+  // that never came. "The loop" is code vocabulary. The setting is auto-hunt.
+  it('states why auto-hunt leaves one lead alone', () => {
     expect(TIP.CHIP_LEFT_TO_YOU).toBe(
-      'The loop starts no hunt here: a shadow lead, a reopened lead, or a lead with no ' +
-        'documents. Hunt it by hand.',
+      'Auto-hunt starts no hunt here: a shadow lead, a reopened lead, or a lead with no ' +
+        'documents. A shadow lead comes from an analytic in trial mode. Hunt it by hand.',
     );
   });
 });
 
 describe('a hunt is the subject of an investigation', () => {
-  it('states why Promote waits on a hunt', () => {
-    expect(TIP.PROMOTE_NEEDS_HUNT).toBe(
-      "Hunt this lead first. The investigation reads the hunt's findings.",
+  // The owner could not tell a hunt from an investigation (2026-10-07). The
+  // hunt button says what a hunt returns and what it does not do.
+  it('states what a hunt returns, and that it takes no action', () => {
+    expect(TIP.ACTION_HUNT).toBe(
+      'Start a hunt on this lead. The hunt returns findings and a narrative. soc-ai investigates ' +
+        'the findings and brings back the verdicts. The hunt takes no action in Security Onion.',
     );
+    expect(TIP.LEAD_ACTIONS_LINE).toBe(
+      'Hunt this lead. The hunt investigates what it finds and brings back the verdicts.',
+    );
+    expect(TIP.ACTION_OPEN_INVESTIGATION).toBe(
+      'Open an investigation on this finding. soc-ai investigates the evidence that the finding ' +
+        'cites. The investigation ends in a verdict and recommended actions.',
+    );
+    expect(TIP.DEFINE_HUNT).toContain('A hunt is not finished until its findings are investigated.');
+    // Negative control: no sentence offers "promote" as an act.
+    for (const s of [TIP.ACTION_HUNT, TIP.LEAD_ACTIONS_LINE, TIP.DEFINE_LEAD, TIP.DEFINE_HUNT]) {
+      expect(s).not.toMatch(/promot/i);
+    }
   });
 
   // The chip on the Investigations list read "The detector that raised this

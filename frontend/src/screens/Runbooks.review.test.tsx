@@ -48,6 +48,15 @@ describe('Runbooks list rows', () => {
     expect(preview.textContent).not.toMatch(/Beaconing Triage/);
   });
 
+  // The row printed the browser's locale string with no zone. It reads the
+  // shared relative time, and the title holds the absolute time with its zone.
+  it('dates a runbook with the shared formatter', async () => {
+    render(<Runbooks />);
+    const updated = await screen.findByTestId('runbook-updated-42');
+    expect(updated.textContent).toMatch(/^updated \d+d ago$/);
+    expect(updated.getAttribute('title')).toMatch(/^2026-07-1[34] \d{2}:\d{2} \S+$/);
+  });
+
   // The intro named the internal tool. The operator reads what the model does.
   it('describes the runbook search without the internal tool name', async () => {
     render(<Runbooks />);

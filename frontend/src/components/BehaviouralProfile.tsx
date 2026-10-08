@@ -74,6 +74,37 @@ function CoverageChip({ coverage, days }: { coverage: string; days: number }) {
   );
 }
 
+/** One line under the header that says what each status word means. Four
+ *  words sat on the rows with no definition, and "blind" read as an alarm
+ *  (dogfood 2026-10-06). */
+export const PROFILE_LEGEND =
+  'measured: a real baseline, and a departure from it counts. ' +
+  'learning: under 7 days of history, so nothing scores yet. ' +
+  'blind: no log source on the grid can measure this row for this host. It marks a gap in coverage and raises no alarm. ' +
+  'stale: the evidence is older than the staleness window.';
+
+/**
+ * A connection rate whose three numbers are nearly the same, as one number.
+ * "work 124 · off 124 · weekend 122" told the analyst nothing to act on
+ * (dogfood 2026-10-06). Within 10 percent of each other, the row reads
+ * "about 124 per hour at all times" and the tooltip keeps the three.
+ * Null when the numbers differ, or the summary has another shape.
+ */
+export function collapsedRate(summary: string): string | null {
+  const pick = (word: string) => {
+    const m = summary.match(new RegExp(`\\b${word} (\\d+(?:\\.\\d+)?)\\b`));
+    return m ? Number(m[1]) : null;
+  };
+  const values = [pick('work'), pick('off'), pick('weekend')];
+  if (values.some((v) => v == null)) return null;
+  const nums = values as number[];
+  const hi = Math.max(...nums);
+  const lo = Math.min(...nums);
+  if (hi <= 0 || (hi - lo) / hi > 0.1) return null;
+  const typical = Math.round(nums.reduce((a, b) => a + b, 0) / nums.length);
+  return `about ${typical.toLocaleString()} per hour at all times`;
+}
+
 const PREVIEW = 8;
 const MORE = /\s\+\d+ more$/;
 
@@ -99,6 +130,18 @@ function ProfileSummary({ d }: { d: ProfileDimension }) {
   const [open, setOpen] = useState(false);
   const members = d.shape === 'categorical' ? d.top : [];
   const fallback = fallbackFor(d);
+  const rate = d.dimension === 'connection_rate' ? collapsedRate(d.summary) : null;
+  if (rate) {
+    return (
+      <span
+        data-testid="profile-rate-collapsed"
+        className="min-w-0 flex-1 break-words text-text-2"
+        title={d.summary}
+      >
+        {rate}
+      </span>
+    );
+  }
   if (members.length <= PREVIEW) {
     return (
       <span className="min-w-0 flex-1 break-words text-text-2" title={d.summary}>
@@ -140,16 +183,37 @@ function ProfileSummary({ d }: { d: ProfileDimension }) {
   );
 }
 
-export function BehaviouralProfile({ profile }: { profile: ProfileDimension[] }) {
+/** Why a host has no profile, from the setting the dossier read carries. */
+export function noProfileText(profilesEnabled: boolean | null | undefined): string {
+  if (profilesEnabled === true) {
+    // The panel said "Turn profiles on in Config" while profiles were on
+    // (dogfood 2026-10-06). The cause on a deployment that runs them is the
+    // host's own history.
+    return 'This host has too few events for a profile. The profile sweep builds one from up to 30 days of history. soc-ai scores nothing here until then.';
+  }
+  if (profilesEnabled === false) {
+    return 'No profile exists for this host. Profiles are off. Turn them on in Config › Behavioural profiles. soc-ai scores nothing here until then.';
+  }
+  return 'No profile exists for this host yet. The host has too few events, or profiles are off in Config › Behavioural profiles. soc-ai scores nothing here until then.';
+}
+
+export function BehaviouralProfile({
+  profile,
+  profilesEnabled,
+}: {
+  profile: ProfileDimension[];
+  /** Whether the profile sweep runs on this deployment. Null or absent when
+   *  the server does not say. */
+  profilesEnabled?: boolean | null;
+}) {
   if (profile.length === 0) {
     // Absence is a fact the page must state. A missing panel is
     // indistinguishable from "this host has no unusual behaviour".
     return (
       <Panel className="mt-4">
         <PanelHeader icon={<Activity size={16} />} title="Behavioural profile" />
-        <div className="px-[15px] py-3 text-[13px] text-dim">
-          No profile exists for this host yet. The dossier sweep builds one from up to 30 days of history.
-          Turn profiles on in Config › Behavioural profiles. soc-ai scores nothing here until then.
+        <div data-testid="profile-empty" className="px-[15px] py-3 text-[13px] text-dim">
+          {noProfileText(profilesEnabled)}
         </div>
       </Panel>
     );
@@ -166,6 +230,9 @@ export function BehaviouralProfile({ profile }: { profile: ProfileDimension[] })
           </span>
         }
       />
+      <div data-testid="profile-legend" className="border-b border-border px-[15px] py-2 text-[11px] leading-[1.5] text-faint">
+        {PROFILE_LEGEND}
+      </div>
       <ul className="divide-y divide-border" data-testid="behavioural-profile">
         {profile.map((d) => (
           <li key={d.dimension} className="flex items-start gap-3 px-[15px] py-2.5 text-[13px]">

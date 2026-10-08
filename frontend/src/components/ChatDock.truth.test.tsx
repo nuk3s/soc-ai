@@ -4,7 +4,7 @@ import { fireEvent, render, screen } from '@testing-library/react';
 import { useRef, useState } from 'react';
 import { describe, expect, it } from 'vitest';
 import { ShellProvider } from '../shell/ShellContext';
-import { AssistantBubble, ChatPanelShell, toolsSummary } from './ChatDock';
+import { AssistantBubble, ChatThreadView, toolsSummary } from './ChatDock';
 import { Drawer } from './Drawer';
 
 describe('the tools footer (P11)', () => {
@@ -43,16 +43,14 @@ describe('ids in an answer (P3)', () => {
 describe('the message list (P13)', () => {
   it('is a polite live region', () => {
     render(
-      <ChatPanelShell
-        title="Chat about this investigation"
-        scopeLabel="scope"
+      <ChatThreadView
+        label="Ask soc-ai, this investigation"
         placeholder="Ask"
         messages={[{ role: 'assistant', text: 'An answer.' }]}
         pending={false}
         draft=""
         onDraft={() => {}}
         onSend={() => {}}
-        listSizeClass=""
       />,
     );
     const log = screen.getByRole('log');

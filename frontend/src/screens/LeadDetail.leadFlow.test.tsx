@@ -1,10 +1,10 @@
 // The lead page under the 2026-09-22 design.
 //
 // Three things change here. The lead's own hunt may already be queued, so the
-// page wears the strip's pill and the strip's words. An investigation of a
-// lead reads the hunt's findings, so Promote waits on a hunt and says why.
-// And a lead relates to other open leads, so the page lists them: one entity
-// is one lead, and a coordinated attack is several.
+// page wears the strip's pill and the strip's words. The hunt investigates
+// what it finds, so the lead offers no investigation of its own (owner,
+// 2026-10-07). And a lead relates to other open leads, so the page lists
+// them: one entity is one lead, and a coordinated attack is several.
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -21,6 +21,7 @@ vi.mock('../lib/api', async () => {
     promoteLead: vi.fn(),
     reopenLead: vi.fn(),
     getEvent: vi.fn(),
+    getHunt: vi.fn(),
   };
 });
 
@@ -29,17 +30,20 @@ import {
   getHunts,
   getLead,
   getNeedsYou,
+  getHunt,
   huntLead,
   promoteLead,
+  reopenLead,
   type NeedsYou,
 } from '../lib/api';
 import { LEAD_ACTION } from '../components/LeadsStrip';
 import {
+  ACTION_HUNT,
   ACTION_HUNT_NOW,
   CHIP_LEFT_TO_YOU,
+  LEAD_ACTIONS_LINE,
   LEGEND_AUTO_HUNT,
   PILL_HUNT_QUEUED,
-  PROMOTE_NEEDS_HUNT,
   RELATED_REASON,
 } from '../lib/tooltips';
 import { ShellProvider } from '../shell/ShellContext';
@@ -103,6 +107,8 @@ beforeEach(() => {
   vi.mocked(getNeedsYou).mockReset().mockResolvedValue(NEEDS_YOU);
   vi.mocked(huntLead).mockReset().mockResolvedValue({ hunt_id: 'H-NEW' });
   vi.mocked(promoteLead).mockReset().mockResolvedValue({ investigation_id: 'INV-9' });
+  vi.mocked(reopenLead).mockReset().mockResolvedValue(LEAD as never);
+  vi.mocked(getHunt).mockReset().mockRejectedValue(new ApiError('not mocked here', 500));
 });
 
 describe('a queued hunt on the lead page', () => {
@@ -114,14 +120,14 @@ describe('a queued hunt on the lead page', () => {
     expect(pill.getAttribute('title')).toBe(PILL_HUNT_QUEUED);
   });
 
-  it('offers Dismiss and Promote, with Hunt now as the secondary act', async () => {
+  it('offers Dismiss, with Hunt now as the secondary act', async () => {
     vi.mocked(getLead).mockResolvedValue({ ...LEAD, hunt_queued: true } as never);
     mount();
     const now = await screen.findByRole('button', { name: LEAD_ACTION.huntNow });
     expect(now.getAttribute('title')).toBe(ACTION_HUNT_NOW);
     expect(screen.getByRole('button', { name: LEAD_ACTION.dismiss })).toBeTruthy();
-    expect(screen.getByRole('button', { name: LEAD_ACTION.promote })).toBeTruthy();
     expect(screen.queryByRole('button', { name: LEAD_ACTION.hunt })).toBeNull();
+    expect(screen.queryByRole('button', { name: /Open an investigation|Promote/ })).toBeNull();
   });
 
   it('starts the hunt from Hunt now', async () => {
@@ -179,86 +185,149 @@ describe('a queued hunt on the lead page', () => {
     vi.mocked(getNeedsYou).mockResolvedValue({ ...NEEDS_YOU, lead_auto_hunt: true });
     vi.mocked(getLead).mockResolvedValue({ ...LEAD, hunt_queued: true } as never);
     mount();
-    await screen.findByTestId('lead-meta');
+    // The why line is always on screen. The weights sit behind Scoring.
+    await screen.findByTestId('lead-why');
     expect(screen.queryByTestId('lead-left-to-you')).toBeNull();
   });
 });
 
-// An investigation of a lead reads the hunt's findings. Promoting a lead that
-// has never been hunted starts an investigation of nothing, and the button
-// that offered it said nothing about why the server refuses.
-describe('Promote waits on a hunt', () => {
-  it('refuses on a lead with no finished hunt and says why', async () => {
+// The owner could not tell "Hunt" from "Promote" (2026-10-07). The hunt
+// investigates what it finds and brings back the verdicts, so the lead page
+// offers one verb, "Hunt this lead", and states it under the actions. The one
+// manual "Open an investigation" sits on a finding, on the hunt page.
+describe('the lead page offers one verb', () => {
+  it('names the hunt "Hunt this lead" and says what a hunt returns', async () => {
     mount();
-    const promote = await screen.findByRole('button', { name: LEAD_ACTION.promote });
-    expect((promote as HTMLButtonElement).disabled).toBe(true);
-    expect(promote.getAttribute('title')).toBe(PROMOTE_NEEDS_HUNT);
-  });
-
-  it('opens once the hunt has finished', async () => {
-    vi.mocked(getLead).mockResolvedValue(HUNTED as never);
-    mount();
-    const promote = await screen.findByRole('button', { name: LEAD_ACTION.promote });
-    expect((promote as HTMLButtonElement).disabled).toBe(false);
-    fireEvent.click(promote);
-    await waitFor(() => expect(promoteLead).toHaveBeenCalledWith(12));
-  });
-
-  // The click landed and the page said nothing. The API already held the
-  // promotion and the running investigation, and the page still read
-  // "Hunted · Threat findings" with Promote live.
-  it('says the promotion landed and links the investigation', async () => {
-    vi.mocked(getLead).mockResolvedValue(HUNTED as never);
-    mount();
-    fireEvent.click(await screen.findByRole('button', { name: LEAD_ACTION.promote }));
-    const note = await screen.findByTestId('lead-promoted');
-    expect(note.textContent).toContain('Promoted. The investigation is running.');
-    expect(within(note).getByRole('link', { name: LEAD_ACTION.openInvestigation })).toHaveAttribute(
-      'href',
-      '/investigation/INV-9',
+    const hunt = await screen.findByRole('button', { name: 'Hunt this lead' });
+    expect(hunt.getAttribute('title')).toBe(ACTION_HUNT);
+    expect(screen.getByTestId('lead-actions-line').textContent).toBe(
+      'Hunt this lead. The hunt investigates what it finds and brings back the verdicts.',
     );
+    expect(LEAD_ACTIONS_LINE).toBe(screen.getByTestId('lead-actions-line').textContent);
   });
 
-  it('reads the lead again, so the page catches up with the record', async () => {
-    vi.mocked(getLead).mockResolvedValue(HUNTED as never);
+  it('offers no investigation of its own, before or after the hunt', async () => {
+    for (const lead of [LEAD, { ...LEAD, hunt_queued: true }, HUNTED]) {
+      vi.mocked(getLead).mockResolvedValue(lead as never);
+      const { unmount } = mount();
+      await screen.findByTestId('lead-why');
+      expect(screen.queryByRole('button', { name: /Open an investigation|Promote/ })).toBeNull();
+      unmount();
+    }
+    expect(promoteLead).not.toHaveBeenCalled();
+  });
+
+  // Negative control: a closed lead takes no hunt, so it states no verb.
+  it('states no verb on a closed lead', async () => {
+    vi.mocked(getLead).mockResolvedValue({
+      ...LEAD,
+      status: 'dismissed',
+      dismissed_reason: 'other',
+      dismissed_at: '2026-09-21T12:00:00Z',
+    } as never);
     mount();
-    fireEvent.click(await screen.findByRole('button', { name: LEAD_ACTION.promote }));
-    await waitFor(() => expect(vi.mocked(getLead).mock.calls.length).toBeGreaterThan(1));
+    await screen.findByRole('button', { name: LEAD_ACTION.reopen });
+    expect(screen.queryByTestId('lead-actions-line')).toBeNull();
   });
 
-  // The re-read behind the note is a second request, and it can fail on its
+  // The re-read behind an act is a second request, and it can fail on its
   // own. The page answered that failure with "This lead does not exist" over
-  // a lead that was on screen a moment ago and had just been promoted.
-  it('keeps the page and the note when the re-read fails', async () => {
+  // a lead that was on screen a moment ago.
+  it('keeps the page when the re-read behind Reopen fails', async () => {
     vi.mocked(getLead)
-      .mockResolvedValueOnce(HUNTED as never)
+      .mockResolvedValueOnce({
+        ...LEAD,
+        status: 'dismissed',
+        dismissed_reason: 'other',
+        dismissed_at: '2026-09-21T12:00:00Z',
+      } as never)
       .mockRejectedValueOnce(new ApiError('500 Internal Server Error', 500));
     mount();
-    fireEvent.click(await screen.findByRole('button', { name: LEAD_ACTION.promote }));
-    await screen.findByTestId('lead-promoted');
+    fireEvent.click(await screen.findByRole('button', { name: LEAD_ACTION.reopen }));
+    await waitFor(() => expect(reopenLead).toHaveBeenCalledWith(12));
     await waitFor(() => expect(vi.mocked(getLead).mock.calls.length).toBeGreaterThan(1));
     await waitFor(() => expect(screen.getByRole('status').textContent).toMatch(/Refresh failed/));
-    expect(screen.getByTestId('lead-promoted')).toBeTruthy();
     expect(screen.getByRole('heading', { level: 1 }).textContent).toContain('Lead 12');
     expect(screen.queryByText(/does not exist/)).toBeNull();
   });
+});
 
-  it('shows the sentence the server sent on a refusal', async () => {
+// The flow strip under the header (owner, 2026-10-07): Hit, Lead, Hunt,
+// Investigations, Verdicts, Actions. The lead is the current step.
+describe('the flow strip on the lead page', () => {
+  it('names the lead as current and "Hunt this lead" as the next control', async () => {
+    mount();
+    const strip = await screen.findByTestId('flow-strip');
+    expect(
+      within(strip)
+        .getAllByRole('listitem')
+        .map((li) => `${li.dataset.testid?.replace('flow-step-', '')}:${li.dataset.state}`),
+    ).toEqual([
+      'hit:done',
+      'lead:current',
+      'hunt:next',
+      'investigations:not_yet',
+      'verdicts:not_yet',
+      'actions:not_yet',
+    ]);
+    expect(within(strip).getByTestId('flow-control-hunt').textContent).toBe('· Hunt this lead');
+    // The strip names the control the page shows.
+    expect(screen.getByRole('button', { name: 'Hunt this lead' })).toBeTruthy();
+  });
+
+  it('reads the hunt the lead points at: Hunt done, and the investigations it ran', async () => {
     vi.mocked(getLead).mockResolvedValue(HUNTED as never);
-    vi.mocked(promoteLead).mockRejectedValue(
-      new ApiError(
-        "Hunt this lead first. The investigation reads the hunt's findings.",
-        409,
-        'lead_not_hunted',
+    vi.mocked(getHunt).mockResolvedValue({
+      id: 'H-LEAD-1',
+      objective: 'o',
+      kind: 'lead',
+      status: 'complete',
+      narrative: 'n',
+      findings: [
+        { title: 'a', detail: 'd', severity: 'high', category: 'threat', hosts: [], citations: ['x'], investigationId: 'I-1', investigationStatus: 'complete', verdict: 'true_positive' },
+        { title: 'b', detail: 'd', severity: 'high', category: 'threat', hosts: [], citations: ['y'], investigationId: 'I-2', investigationStatus: 'running' },
+        { title: 'c', detail: 'd', severity: 'high', category: 'threat', hosts: [], citations: ['z'] },
+      ],
+      findingsInvestigated: 1,
+      findingsTotal: 3,
+      affectedHosts: [],
+      mitreTechniques: [],
+      recommendedActions: [],
+      confidence: 0.8,
+      startedBy: 'auto-hunt',
+      elapsedLabel: '2m',
+      elapsedSec: 120,
+      ts: '2026-09-21T10:00:00Z',
+      timeline: [],
+    } as never);
+    mount();
+    const strip = await screen.findByTestId('flow-strip');
+    const hunt = within(strip).getByTestId('flow-step-hunt');
+    expect(hunt.dataset.state).toBe('done');
+    expect(within(hunt).getByRole('link', { name: 'Hunt' }).getAttribute('href')).toBe(
+      '/hunts/H-LEAD-1',
+    );
+    await waitFor(() =>
+      expect(within(strip).getByTestId('flow-step-investigations').textContent).toContain(
+        '1 of 3 done',
       ),
     );
+    expect(getHunt).toHaveBeenCalledWith('H-LEAD-1');
+  });
+
+  // Negative control: the hunt read failed. The strip keeps what the lead
+  // record proves and claims no investigation.
+  it('claims no investigation when the hunt cannot be read', async () => {
+    vi.mocked(getLead).mockResolvedValue(HUNTED as never);
     mount();
-    fireEvent.click(await screen.findByRole('button', { name: LEAD_ACTION.promote }));
-    await waitFor(() =>
-      expect(
-        screen.getByText("Hunt this lead first. The investigation reads the hunt's findings."),
-      ).toBeTruthy(),
+    const strip = await screen.findByTestId('flow-strip');
+    await waitFor(() => expect(getHunt).toHaveBeenCalled());
+    expect(within(strip).getByTestId('flow-step-hunt').dataset.state).toBe('done');
+    expect(within(strip).getByTestId('flow-step-investigations').dataset.state).toBe('next');
+    expect(within(strip).getByTestId('flow-control-investigations').textContent).toBe(
+      '· Read hunt',
     );
+    expect(within(strip).getByTestId('flow-step-verdicts').dataset.state).toBe('not_yet');
   });
 });
 
@@ -348,7 +417,8 @@ describe('related leads', () => {
   // answer nobody made.
   it('shows no panel at all when the API sends none', async () => {
     mount();
-    await screen.findByTestId('lead-meta');
+    // The why line is always on screen. The weights sit behind Scoring.
+    await screen.findByTestId('lead-why');
     expect(screen.queryByTestId('lead-related')).toBeNull();
   });
 });

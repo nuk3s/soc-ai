@@ -37,6 +37,7 @@ from typing import Any
 import httpx
 
 from soc_ai.demo.guard import assert_egress_allowed
+from soc_ai.hunting.outcome import FindingVerdicts, outcome_label
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -59,6 +60,37 @@ NOTIFY_KINDS: tuple[str, ...] = (
     "oracle_paused",
     "test",
 )
+
+# The tone of each hunt outcome on the bell and the Notifications screen. A
+# hunt that found a threat reads like a true positive. A hunt that could not run
+# reads warn, because its result is unknown and somebody has to look. The bell
+# said "Hunt finished: no threat observed" for 8 analytic runs that could not
+# reach the data source. A hunt with no answer reads warn for the same reason.
+# The two clean outcomes and a running hunt are informational. The webhook fires
+# on a threat only (:func:`event_for_hunt`).
+HUNT_OUTCOME_TONE: dict[str, str] = {
+    "threat_found": "danger",
+    "could_not_run": "warn",
+    # The hunt ran and did not test its objective, so the analyst has to act.
+    "no_answer": "warn",
+    "no_threat_gap": "accent",
+    "no_threat": "accent",
+    "running": "accent",
+    # The investigations of the hunt's findings decided. A true positive among
+    # them reads like a true positive.
+    "threats_confirmed": "danger",
+    "no_threat_confirmed": "accent",
+    "investigating": "accent",
+}
+
+
+def hunt_outcome_tone(outcome: str) -> str:
+    """The bell tone of a hunt outcome. An unknown outcome reads warn.
+
+    An outcome a newer build adds must not read as a quiet, clean result.
+    """
+    return HUNT_OUTCOME_TONE.get(outcome, "warn")
+
 
 # Per-send bound. Short: a webhook is fire-and-forget on-call plumbing, not on the
 # investigation's critical path — a slow endpoint must not stall the trigger.
@@ -325,24 +357,46 @@ def event_for_investigation(
     return NotifyEvent(
         kind="tp",
         title="True positive found",
-        body=body[:500],
+        body=body,
         url=f"/app/investigation/{investigation_id}",
         severity="critical",
     )
 
 
-def event_for_hunt(*, hunt_id: str, report: dict[str, Any], settings: Any) -> NotifyEvent | None:
+def event_for_hunt(
+    *,
+    hunt_id: str,
+    report: dict[str, Any],
+    settings: Any,
+    verdicts: FindingVerdicts | None = None,
+) -> NotifyEvent | None:
     """Build a hunt-threat NotifyEvent from a finalized hunt report, or None.
 
     Returns None unless ``notify_on_hunt_threat`` is on AND the report has at least
     one finding with ``category == 'threat'``. The body names the threat count +
     the worst finding's title; the permalink is ``/app/hunts/<id>``.
+
+    ``verdicts`` is the summary of the investigations of the hunt's subject
+    findings. When one of them reached a verdict, the verdicts decide: the
+    notice fires on a true positive only, and its title states the count
+    ("Hunt finished: 2 of 3 findings are threats").
     """
     if not bool(getattr(settings, "notify_on_hunt_threat", False)):
         return None
     findings = report.get("findings")
     if not isinstance(findings, list):
         return None
+    if verdicts is not None and verdicts.decided:
+        if not verdicts.threats:
+            return None
+        label = outcome_label("threats_confirmed", verdicts)
+        return NotifyEvent(
+            kind="hunt_threat",
+            title=f"Hunt finished: {label}",
+            body=f"{label}. The investigations of the findings decided it."[:500],
+            url=f"/app/hunts/{hunt_id}",
+            severity="critical",
+        )
     threats = [
         f for f in findings if isinstance(f, dict) and str(f.get("category") or "") == "threat"
     ]
@@ -354,7 +408,7 @@ def event_for_hunt(*, hunt_id: str, report: dict[str, Any], settings: Any) -> No
     return NotifyEvent(
         kind="hunt_threat",
         title="Hunt found a threat",
-        body=body[:500],
+        body=body,
         url=f"/app/hunts/{hunt_id}",
         severity="critical",
     )
@@ -377,7 +431,7 @@ def event_for_model_fitness(*, result: dict[str, Any], settings: Any) -> NotifyE
     return NotifyEvent(
         kind="model_fitness_fail",
         title=f"Analyst model unfit: {model}",
-        body=(detail or "The model fitness probe graded this model FAIL.")[:500],
+        body=detail or "The model fitness probe graded this model FAIL.",
         url="",
         severity="warning",
     )
@@ -406,7 +460,7 @@ def event_for_quality_regression(
     return NotifyEvent(
         kind="quality_regression",
         title="Verdict quality regression",
-        body=body[:500],
+        body=body,
         url="/app/",
         severity="warning",
     )
@@ -453,7 +507,7 @@ def event_for_audit_chain_break(
     return NotifyEvent(
         kind="audit_chain_break",
         title=f"Audit chain broken: {kind or 'unknown'} in {scope}",
-        body=body[:500],
+        body=body,
         url="/app/config",
         severity="critical",
     )

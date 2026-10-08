@@ -1,13 +1,15 @@
-// The Dashboard's "Ask soc-ai" box was a hand-off: it prefilled the Hunt
+// The Ask soc-ai panel on the general scope: one rolling thread per analyst.
+//
+// The Dashboard's "Ask soc-ai" box was a hand-off once: it prefilled the Hunt
 // Console's objective and navigated, so "what datasets do I have?" became a
-// multi-minute background job producing a formal report. This panel answers in
+// multi-minute background job producing a formal report. The chat answers in
 // the turn instead, and when a question genuinely needs a sweep the agent
 // PROPOSES one that the analyst confirms.
 //
 // The properties pinned here are the ones that make it more than a chat window:
-// the answer lands on the Dashboard, a long turn shows what the agent is doing
-// (a bare typing indicator reads as "hung" — dogfood 2026-08-06), and the
-// proposed hunt never starts itself.
+// the answer lands in the panel, on the page the analyst is on, a long turn
+// shows what the agent is doing (a bare typing indicator reads as "hung",
+// dogfood 2026-08-06), and the proposed hunt never starts itself.
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, useLocation } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -21,8 +23,8 @@ vi.mock('../lib/api', async (importOriginal) => ({
   startHuntConsole: vi.fn(),
 }));
 
-import { GeneralChatPanel } from './GeneralChatPanel';
 import { clearGeneralChat, getGeneralChat, postGeneralChat, startHuntConsole } from '../lib/api';
+import { WithChat } from '../test/chatHarness';
 
 type Msg = ChatThread['messages'][number];
 
@@ -53,13 +55,18 @@ function Here() {
 
 const here = () => screen.getByTestId('here').textContent;
 
-const mount = () =>
-  render(
+/** A page with no object: the panel opens on the general scope. */
+const mount = () => {
+  const view = render(
     <MemoryRouter initialEntries={['/dashboard']}>
-      <GeneralChatPanel />
-      <Here />
+      <WithChat>
+        <Here />
+      </WithChat>
     </MemoryRouter>,
   );
+  fireEvent.click(screen.getByRole('button', { name: 'Ask soc-ai' }));
+  return view;
+};
 
 const ask = (text: string) => {
   fireEvent.change(screen.getByPlaceholderText(/ask/i), { target: { value: text } });
@@ -75,7 +82,7 @@ beforeEach(() => {
   vi.mocked(startHuntConsole).mockResolvedValue({ hunt_id: 'H-1' });
 });
 
-describe('GeneralChatPanel — the answer arrives here', () => {
+describe('the general scope: the answer arrives here', () => {
   it('restores the rolling thread on mount', async () => {
     // Persistent per-analyst thread: the Dashboard is a launcher screen and the
     // analyst navigates away constantly, so history has to survive the mount.
@@ -106,7 +113,7 @@ describe('GeneralChatPanel — the answer arrives here', () => {
   });
 });
 
-describe('GeneralChatPanel — the hunt proposal', () => {
+describe('the general scope: the hunt proposal', () => {
   it('shows the objective and why the sweep is needed, alongside the answer', async () => {
     vi.mocked(getGeneralChat).mockResolvedValue(
       thread([proposed('Sweep zeek.conn for periodic egress over 7d', 'one turn cannot cover a week')]),
@@ -170,7 +177,7 @@ describe('GeneralChatPanel — the hunt proposal', () => {
   });
 });
 
-describe('GeneralChatPanel — starting over', () => {
+describe('the general scope: starting over', () => {
   it('offers no clear control on a thread with nothing in it', async () => {
     mount();
     await screen.findByPlaceholderText(/ask/i);
@@ -192,8 +199,8 @@ describe('GeneralChatPanel — starting over', () => {
   });
 });
 
-describe('GeneralChatPanel — starter chips', () => {
-  it('a starter chip submits the question immediately — no second click on Send', async () => {
+describe('the general scope: starter chips', () => {
+  it('a starter chip submits the question immediately, with no second click on Send', async () => {
     vi.mocked(postGeneralChat).mockResolvedValue(
       thread([{ role: 'user', text: 'What datasets do I have?' }], { pending: true }),
     );

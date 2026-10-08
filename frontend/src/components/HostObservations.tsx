@@ -1,6 +1,7 @@
 import { Link } from 'react-router-dom';
 
 import { getObservations, type EntityObservation } from '../lib/api';
+import { plainEvidence } from '../lib/hostDossier';
 import { kindLabel, sourceLabel, sourceTitle } from '../lib/kinds';
 import { plural } from '../lib/plural';
 import { statisticSentence } from '../lib/statistics';
@@ -11,7 +12,9 @@ import {
   CHIP_SWEEPS,
   CHIP_TYPE,
   COUNT_OBSERVATIONS,
+  LEAD_RULE,
   OBSERVATION_STATISTIC,
+  SIGHTING_HALF_WEIGHT,
   UNREAD_DOT,
 } from '../lib/tooltips';
 import { useAsync } from '../lib/useAsync';
@@ -29,8 +32,13 @@ import { LoadingState } from './States';
 
 const DAYS = 7;
 
-const WEIGHT_TITLE =
-  'The weight of this observation now. Observations decay with a 48 h half-life, so an old one is worth less than its birth weight.';
+// "live weight decays with a 48 h half-life" named the scoring machinery in
+// analyst text (dogfood 2026-10-06). The sentence says what it means, in the
+// words of lib/tooltips.ts that the lead page reads too.
+const WEIGHT_TITLE = `The weight of this observation now, from 0.00 to its weight at first sighting. ${SIGHTING_HALF_WEIGHT} ${LEAD_RULE}`;
+
+/** The header note: what the weight means, in one plain sentence. */
+export const WEIGHT_NOTE = `all sources · ${SIGHTING_HALF_WEIGHT.charAt(0).toLowerCase()}${SIGHTING_HALF_WEIGHT.slice(1, -1)}`;
 
 function Row({ observation }: { observation: EntityObservation }) {
   return (
@@ -68,7 +76,7 @@ function Row({ observation }: { observation: EntityObservation }) {
         {kindLabel(observation.kind, observation.kind_label)}
       </span>
       <span className="min-w-0 flex-1 text-text-2">
-        {observation.summary ?? ''}
+        {plainEvidence(observation.summary ?? '')}
         {/* The statistic the row carries. A row written before it existed
             states none. */}
         {statisticSentence(
@@ -90,7 +98,7 @@ function Row({ observation }: { observation: EntityObservation }) {
         )}
       </span>
       {observation.occurrences > 1 && (
-        <span className="text-[11px] text-dim" title={CHIP_SWEEPS}>
+        <span className="text-[11px] text-dim" title={CHIP_SWEEPS} data-testid={`observation-sweeps-${observation.id}`}>
           seen on {plural(observation.occurrences, 'sweep')}
           {observation.first_seen_at ? `, first seen ${ago(observation.first_seen_at)}` : ''}
         </span>
@@ -123,18 +131,20 @@ function Row({ observation }: { observation: EntityObservation }) {
 export function HostObservations({
   entityKey,
   noun = 'host',
+  className = 'mt-4',
 }: {
   entityKey: string;
   /** The word for the thing the panel is mounted on. A user account is not a
    *  host, and the heading said host on both. */
   noun?: string;
+  className?: string;
 }) {
   const data = useAsync(() => getObservations(entityKey, DAYS), [entityKey], {
     refetchInterval: 300_000,
   });
   const rows = data.data?.observations ?? [];
   return (
-    <Panel className="mt-4" >
+    <Panel className={className}>
       <PanelHeader
         title={
           <span title={COUNT_OBSERVATIONS}>
@@ -142,8 +152,8 @@ export function HostObservations({
           </span>
         }
         right={
-          <span className="text-[11px] text-dim" title={WEIGHT_TITLE}>
-            all sources · live weight decays with a 48 h half-life
+          <span data-testid="observations-weight-note" className="text-[11px] text-dim" title={WEIGHT_TITLE}>
+            {WEIGHT_NOTE}
           </span>
         }
       />
@@ -153,7 +163,7 @@ export function HostObservations({
             Could not read the observations.
           </div>
         ) : (
-          <LoadingState label="Reading the observations…" />
+          <LoadingState label="Reading the observations" />
         )
       ) : rows.length === 0 ? (
         <div className="px-[15px] py-3 text-[12.5px] text-dim">

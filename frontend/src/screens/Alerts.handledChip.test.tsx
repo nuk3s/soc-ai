@@ -115,17 +115,23 @@ describe('the handled-count chips', () => {
   it('shows nothing when the grid counted zero', async () => {
     await showGroup({ ...GROUP, ackedCount: 0, escalatedCount: 0 });
     expect(screen.queryByTitle(/^\d+ acknowledged$/)).toBeNull();
-    expect(screen.queryByTitle(/^The acknowledged count is unknown/)).toBeNull();
+    expect(screen.queryByTestId('counts-unknown')).toBeNull();
   });
 
-  it('says the count is unknown rather than drawing nothing', async () => {
-    // null, not 0 — the row must not read as untouched.
+  it('says the counts are unknown in one chip, with the reason', async () => {
+    // null, not 0: the row must not read as untouched. One "uncounted" chip
+    // replaces the two "?" chips (dogfood 2026-10-06, first hour C7).
     await showGroup({ ...GROUP, ackedCount: null, escalatedCount: null });
-    const acked = screen.getByTitle(/^The acknowledged count is unknown/);
-    expect(acked.textContent).toBe('?');
-    expect(acked.getAttribute('title')).toMatch(/cannot search the flag/);
-    expect(screen.getByTitle(/^The escalated count is unknown/)).toBeTruthy();
-    // And it must not have invented a number to put beside the question mark.
+    const chip = screen.getByTestId('counts-unknown');
+    expect(chip.textContent).toBe('uncounted');
+    expect(chip.getAttribute('title')).toMatch(/cannot search the flags/);
+    expect(screen.queryByText('?')).toBeNull();
+    // And it must not have invented a number.
     expect(screen.queryByTitle(/^0 acknowledged/)).toBeNull();
+  });
+
+  it('control: a counted row has no "uncounted" chip', async () => {
+    await showGroup({ ...GROUP, ackedCount: 3, escalatedCount: 0 });
+    expect(screen.queryByTestId('counts-unknown')).toBeNull();
   });
 });

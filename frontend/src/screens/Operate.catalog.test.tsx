@@ -19,9 +19,16 @@ vi.mock('../lib/api', async (importOriginal) => ({
   getHuntCatalog: vi.fn(),
   // A click on an analytic title opens the drawer, which reads the analytic.
   getAnalytic: vi.fn(),
+  getAnalyticHits: vi.fn(),
 }));
 
-import { getAnalytic, getHuntCatalog, type HuntCatalog, type HuntCatalogSpec } from '../lib/api';
+import {
+  getAnalytic,
+  getAnalyticHits,
+  getHuntCatalog,
+  type HuntCatalog,
+  type HuntCatalogSpec,
+} from '../lib/api';
 import { DemoProvider } from '../lib/demo';
 import { ShellProvider } from '../shell/ShellContext';
 import { Operate } from './Operate';
@@ -232,6 +239,9 @@ const mount = (demo = false) =>
 
 beforeEach(() => {
   vi.mocked(getHuntCatalog).mockReset().mockResolvedValue(ON);
+  vi.mocked(getAnalyticHits)
+    .mockReset()
+    .mockResolvedValue({ hits: [], counts: { all: 0, unread: 0, live: 0, shadow: 0 } });
 });
 
 describe('Operate hunt-catalog panel', () => {
@@ -406,14 +416,54 @@ describe('Operate hunt-catalog panel', () => {
     for (const row of rows.slice(1)) expect(within(row).queryByText(/shadow/i)).toBeNull();
   });
 
-  it('shows the error marker with the error text in its tooltip, on that row only', async () => {
+  // The row read "live · fired 0 · last fired never" over a run that could not
+  // reach its data source (dogfood 2026-10-06). It says when the last run
+  // failed, and the swept and fired times that say nothing true go.
+  it('says when the last run failed, with the error text in its tooltip, on that row only', async () => {
     mount();
     await screen.findByText(SPECS[2].title);
     const rows = screen.getAllByRole('listitem');
     const err = within(rows[2]).getByTitle('ConnectionError: grid down');
-    expect(err).toHaveTextContent(/error/i);
-    expect(within(rows[0]).queryByText(/^error$/i)).toBeNull();
-    expect(within(rows[1]).queryByText(/^error$/i)).toBeNull();
+    expect(err).toHaveTextContent('last run failed 1h ago');
+    expect(within(rows[2]).queryByText(/last fired/i)).toBeNull();
+    expect(within(rows[2]).queryByText(/last swept/i)).toBeNull();
+    // NEGATIVE CONTROL. A row whose last run worked wears no chip.
+    expect(within(rows[0]).queryByTestId('last-run-failed')).toBeNull();
+    expect(within(rows[1]).queryByTestId('last-run-failed')).toBeNull();
+  });
+
+  it('defines fired, fresh and handled on lines of their own', async () => {
+    mount();
+    await screen.findByText(SPECS[0].title);
+    const legend = screen.getByTestId('counts-legend');
+    expect(legend.textContent).toContain('fired: a live sweep matched and wrote an observation.');
+    expect(legend.textContent).toContain('fresh: a match no observation had covered.');
+    expect(legend.textContent).toContain('handled: a match an earlier observation already covered.');
+  });
+
+  // Operate counted sweeps over 24 h beside a Hunts page that counted hits
+  // over 7 days, with no shared label (dogfood 2026-10-06).
+  it('states the Hunts 7-day hit total in hits', async () => {
+    vi.mocked(getAnalyticHits).mockResolvedValue({
+      hits: [],
+      counts: { all: 34, unread: 3, live: 12, shadow: 22 },
+    });
+    mount();
+    const line = await screen.findByTestId('hits-week');
+    await waitFor(() =>
+      expect(line.textContent).toBe(
+        'Analytic hits in the last 7 days: 34 (12 live, 22 shadow). The Hunts page counts the same hits.',
+      ),
+    );
+    expect(getAnalyticHits).toHaveBeenCalledWith({ days: 7, limit: 1 });
+  });
+
+  // A failed read is not a zero.
+  it('says it could not read the hit total, and states no number', async () => {
+    vi.mocked(getAnalyticHits).mockRejectedValue(new Error('503'));
+    mount();
+    const line = await screen.findByTestId('hits-week');
+    await waitFor(() => expect(line.textContent).toBe('Could not read the analytic hits of the last 7 days.'));
   });
 
   it('sweeps on: the status line names the cadence, the window and the last sweep', async () => {
@@ -422,8 +472,8 @@ describe('Operate hunt-catalog panel', () => {
     // old, which is a loop that is landing on schedule.
     const tag = await screen.findByText(/^sweeps on$/i);
     expect(tag).toHaveStyle({ color: '#3fb950' });
-    expect(screen.getByText(/every 60m/)).toBeInTheDocument();
-    expect(screen.getByText(/looks back 24h/)).toBeInTheDocument();
+    expect(screen.getByText(/every hour/)).toBeInTheDocument();
+    expect(screen.getByText(/looks back 24 h/)).toBeInTheDocument();
     expect(screen.getByText(/last sweep 1h ago/i)).toBeInTheDocument();
     expect(screen.queryByText(/spec-sweep --shadow/)).toBeNull();
     // "once enabled" is the off branch's qualifier; on, the cadence is live.
@@ -441,7 +491,7 @@ describe('Operate hunt-catalog panel', () => {
     expect(screen.queryByText(/^sweeps on$/i)).toBeNull();
     // The cadence and the stale timestamp stay on the line: they are how the
     // operator sizes the gap.
-    expect(screen.getByText(/every 60m/)).toBeInTheDocument();
+    expect(screen.getByText(/every hour/)).toBeInTheDocument();
     expect(screen.getByText(/last sweep 3d ago/i)).toBeInTheDocument();
   });
 
@@ -477,11 +527,11 @@ describe('Operate hunt-catalog panel', () => {
     vi.mocked(getHuntCatalog).mockResolvedValue({ ...OFF, last_sweep_at: iso(1 * HOUR) });
     mount();
     expect(await screen.findByText(/sweeps off/i)).toBeInTheDocument();
-    expect(screen.getByText(/looks back 24h/)).toBeInTheDocument();
+    expect(screen.getByText(/looks back 24 h/)).toBeInTheDocument();
     expect(screen.getByText(/last sweep 1h ago/i)).toBeInTheDocument();
     // The interval is a schedule that is not running, so the line says so
     // rather than claiming a cadence.
-    expect(screen.getByText(/every 60m once enabled/)).toBeInTheDocument();
+    expect(screen.getByText(/every hour once enabled/)).toBeInTheDocument();
     // The call to action stays: the facts do not replace it.
     expect(screen.getByText(/soc-ai spec-sweep --shadow/)).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /triage automation/i })).toHaveAttribute(
@@ -494,7 +544,7 @@ describe('Operate hunt-catalog panel', () => {
     vi.mocked(getHuntCatalog).mockResolvedValue({ ...OFF, last_sweep_at: iso(1 * HOUR) });
     mount(true);
     expect(await screen.findByText(/sweeps off/i)).toBeInTheDocument();
-    expect(screen.getByText(/every 60m once enabled/)).toBeInTheDocument();
+    expect(screen.getByText(/every hour once enabled/)).toBeInTheDocument();
     expect(screen.getByText(/last sweep 1h ago/i)).toBeInTheDocument();
     expect(screen.getByText(/operator turns sweeps on/i)).toBeInTheDocument();
   });
@@ -514,7 +564,7 @@ describe('Operate hunt-catalog panel', () => {
     expect(link).toHaveAttribute('href', '/hunts');
   });
 
-  it('names a failed read instead of sitting on "Reading…" forever', async () => {
+  it('names a failed read instead of sitting on "Reading" forever', async () => {
     vi.mocked(getHuntCatalog).mockRejectedValue(new Error('500'));
     mount();
     expect(await screen.findByText(/could not read the hunt catalog/i)).toBeInTheDocument();
@@ -636,8 +686,8 @@ describe('Operate hunt-catalog panel — profile specs', () => {
 
   it('groups them apart from the specs this loop sweeps', async () => {
     mount();
-    expect(await screen.findByText(/Evaluated against behavioural profiles/)).toBeTruthy();
-    expect(screen.getByText(/Evaluated against behavioural profiles · 1/)).toBeTruthy();
+    expect(await screen.findByText(/Method: baseline/)).toBeTruthy();
+    expect(screen.getByText(/Method: baseline · 1/)).toBeTruthy();
   });
 
   it('shows the prior sweep’s coverage instead of this loop’s counters', async () => {

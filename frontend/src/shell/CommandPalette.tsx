@@ -1,22 +1,55 @@
-import { Bell, BookOpen, ChevronsLeft, Crosshair, History, Info, LayoutDashboard, Search, Server, Settings, SlidersHorizontal, Triangle, Wrench, Zap } from 'lucide-react';
+import { AtSign, Bell, BookOpen, ChevronsLeft, Crosshair, Globe, History, Info, Keyboard, LayoutDashboard, Search, Server, Settings, SlidersHorizontal, Triangle, User, Wrench, Zap } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { getAlerts, getConfig, getInvestigations, listMachines, signOut } from '../lib/api';
+import { getAlerts, getConfig, getInvestigations, listMachines, searchEntityIndex, signOut } from '../lib/api';
 import { buildConfigLayout, keyToSectionId } from '../lib/configLayout';
 import type { ConfigParent } from '../lib/configLayout';
 import { machineHref } from '../lib/hostsList';
-import { machineHitLabel, searchEntities } from '../lib/paletteSearch';
-import type { AlertGroup, InvestigationRow, MachineRow } from '../lib/types';
+import {
+  SERVER_HIT_GROUP,
+  machineHitDetail,
+  machineHitLabel,
+  rowsFor,
+  searchEntities,
+  type QueryResult,
+} from '../lib/paletteSearch';
+import type { AlertGroup, EntitySearchHit, InvestigationRow, MachineRow } from '../lib/types';
 import { isSignedOut, useSession } from './Session';
 import { useShell } from './ShellContext';
+import { GUIDE_URL } from './pages';
 
 interface Command {
-  group: 'Go to' | 'Action' | 'View' | 'Account' | 'Investigations' | 'Alerts' | 'Settings' | 'Hosts';
+  group:
+    | 'Go to'
+    | 'Help'
+    | 'Action'
+    | 'View'
+    | 'Account'
+    | 'Investigations'
+    | 'Alerts'
+    | 'Settings'
+    | 'Hosts'
+    | 'Users'
+    | 'Domains'
+    | 'Addresses'
+    | 'Hunts';
   label: string;
+  /** The second line. Two results with the same label read apart on it. */
+  detail?: string;
   icon: ReactNode;
   run: () => void;
 }
+
+const NO_RESULT: QueryResult<never> = { q: '', rows: [] };
+
+const SERVER_HIT_ICON: Record<EntitySearchHit['type'], ReactNode> = {
+  user: <User size={15} />,
+  domain: <AtSign size={15} />,
+  address: <Server size={15} />,
+  external_address: <Globe size={15} />,
+  hunt: <Crosshair size={15} />,
+};
 
 /** One Config-page hit: a single setting (carries `key`, so the Config page can
  * flash the exact row) or a whole section (no key — just the anchor). */
@@ -80,8 +113,17 @@ const FOCUSABLE =
   'a[href],button:not([disabled]),textarea:not([disabled]),input:not([disabled]),select:not([disabled]),[tabindex]:not([tabindex="-1"])';
 
 export function CommandPalette() {
-  const { paletteOpen, openPalette, closePalette, togglePalette, collapsed, toggleNav, pushModal, popModal } =
-    useShell();
+  const {
+    paletteOpen,
+    openPalette,
+    closePalette,
+    togglePalette,
+    collapsed,
+    toggleNav,
+    pushModal,
+    popModal,
+    openShortcuts,
+  } = useShell();
   // With sign-in off there is no session to end. Sign out stranded the analyst
   // on a login page with no credentials to use (RD2).
   const signedOut = isSignedOut(useSession().me);
@@ -105,11 +147,11 @@ export function CommandPalette() {
       { group: 'Go to', label: 'Hosts', icon: <Server size={15} />, run: go('/hosts') },
       { group: 'Go to', label: 'Notifications', icon: <Bell size={15} />, run: go('/notifications') },
       { group: 'Go to', label: 'Hunts', icon: <Crosshair size={15} />, run: go('/hunts') },
-      // Operate group, sidebar order: the hub first, then its three items.
-      { group: 'Go to', label: 'Operate', icon: <Wrench size={15} />, run: go('/operate') },
+      // Operator group, sidebar order: the hub first, then its three items.
+      { group: 'Go to', label: 'Status', icon: <Wrench size={15} />, run: go('/operate') },
       { group: 'Go to', label: 'Runbooks', icon: <BookOpen size={15} />, run: go('/runbooks') },
       { group: 'Go to', label: 'Backtest', icon: <History size={15} />, run: go('/backtest') },
-      { group: 'Go to', label: 'Config', icon: <Settings size={15} />, run: go('/config') },
+      { group: 'Go to', label: 'Settings', icon: <Settings size={15} />, run: go('/config') },
       { group: 'Go to', label: 'About soc-ai', icon: <Info size={15} />, run: go('/config#about') },
       {
         group: 'Action',
@@ -123,6 +165,24 @@ export function CommandPalette() {
         run: () => {
           closePalette();
           navigate('/alerts', { state: { autoTriage: true } });
+        },
+      },
+      {
+        group: 'Help',
+        label: 'Keyboard shortcuts',
+        icon: <Keyboard size={15} />,
+        run: () => {
+          closePalette();
+          openShortcuts();
+        },
+      },
+      {
+        group: 'Help',
+        label: 'Open the guide',
+        icon: <BookOpen size={15} />,
+        run: () => {
+          closePalette();
+          window.open(GUIDE_URL, '_blank', 'noopener');
         },
       },
       {
@@ -154,7 +214,7 @@ export function CommandPalette() {
           ] satisfies Command[])),
     ];
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [collapsed, navigate, closePalette, toggleNav, signedOut]);
+  }, [collapsed, navigate, closePalette, toggleNav, signedOut, openShortcuts]);
 
   // Entity corpus for the search half of "Search or jump to": fetched once per
   // palette open (fail-soft — a fetch error just means command-only results).
@@ -173,22 +233,39 @@ export function CommandPalette() {
   // search the Hosts list uses, so the palette and the list give one answer
   // (dogfood 2026-10-02, U7). The search reads every machine, quiet ones too.
   // 150ms debounce, fail-soft like the other corpora.
-  const [hostRows, setHostRows] = useState<MachineRow[]>([]);
+  //
+  // Each result set carries the query it answers, and the list shows a set
+  // only while the box still holds that query. A set from the previous query
+  // stayed on screen above "No matches" until the next answer landed
+  // (dogfood 2026-10-06, 7.5).
+  const [hostResult, setHostResult] = useState<QueryResult<MachineRow>>(NO_RESULT);
+  // Users, domains, addresses no machine holds and hunts: the server's index
+  // (dogfood 2026-10-06, 7.2 and 7.4). Same debounce, same rule.
+  const [indexResult, setIndexResult] = useState<QueryResult<EntitySearchHit>>(NO_RESULT);
   useEffect(() => {
-    if (!paletteOpen || q.trim().length < 2) {
-      setHostRows([]);
+    const term = q.trim();
+    if (!paletteOpen || term.length < 2) {
+      setHostResult(NO_RESULT);
+      setIndexResult(NO_RESULT);
       return;
     }
     let alive = true;
     const t = setTimeout(() => {
-      listMachines({ q: q.trim(), limit: 8 })
+      listMachines({ q: term, limit: 8 })
         .then((res) => {
-          if (alive) setHostRows(res.rows);
+          if (alive) setHostResult({ q: term, rows: res.rows });
         })
         // Unlike the client-filtered corpora, a kept-on-error page here would
         // show hits for a query the user is no longer typing — clear instead.
         .catch(() => {
-          if (alive) setHostRows([]);
+          if (alive) setHostResult({ q: term, rows: [] });
+        });
+      searchEntityIndex(term)
+        .then((res) => {
+          if (alive) setIndexResult({ q: term, rows: res.hits });
+        })
+        .catch(() => {
+          if (alive) setIndexResult({ q: term, rows: [] });
         });
     }, 150);
     return () => {
@@ -196,6 +273,8 @@ export function CommandPalette() {
       clearTimeout(t);
     };
   }, [paletteOpen, q]);
+  const hostRows = rowsFor(hostResult, q);
+  const indexHits = rowsFor(indexResult, q);
 
   const filtered = useMemo(() => {
     const query = q.toLowerCase();
@@ -207,15 +286,27 @@ export function CommandPalette() {
     const hostCmds = hostRows.map<Command>((h) => ({
       group: 'Hosts',
       label: machineHitLabel(h),
+      detail: machineHitDetail(h),
       icon: <Server size={15} />,
       run: () => {
         closePalette();
         navigate(machineHref(h.key));
       },
     }));
+    const indexCmds = indexHits.map<Command>((h) => ({
+      group: SERVER_HIT_GROUP[h.type],
+      label: h.label,
+      detail: h.detail,
+      icon: SERVER_HIT_ICON[h.type],
+      run: () => {
+        closePalette();
+        navigate(h.href);
+      },
+    }));
     const entities = searchEntities(q, invs, groups).map<Command>((h) => ({
       group: h.group,
       label: h.label,
+      detail: h.detail,
       icon: h.group === 'Investigations' ? <Search size={15} /> : <Triangle size={15} />,
       run: () => {
         closePalette();
@@ -236,9 +327,9 @@ export function CommandPalette() {
         else navigate(h.to);
       },
     }));
-    return [...base, ...hostCmds, ...entities, ...settings];
+    return [...base, ...hostCmds, ...indexCmds, ...entities, ...settings];
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [q, commands, hostRows, invs, groups, layout]);
+  }, [q, commands, hostResult, indexResult, invs, groups, layout]);
 
   // reset query + selection on open; focus the input; refresh the entity corpus;
   // count into the shared modal stack and restore focus to the opener on close.
@@ -344,7 +435,7 @@ export function CommandPalette() {
               setQ(e.target.value);
               setIdx(0);
             }}
-            placeholder="Search commands, screens, hosts…"
+            placeholder="Search commands, screens, hosts"
             className="flex-1 border-none bg-transparent text-[15px] text-text outline-none"
             role="combobox"
             aria-autocomplete="list"
@@ -357,7 +448,7 @@ export function CommandPalette() {
         <div className="max-h-[344px] overflow-y-auto p-1.5" role="listbox" id="palette-listbox" aria-label="Results">
           {filtered.map((c, i) => (
             <button
-              key={c.group + c.label}
+              key={`${c.group}:${c.label}:${c.detail ?? ''}:${i}`}
               id={`palette-opt-${i}`}
               role="option"
               aria-selected={i === idx}
@@ -367,7 +458,17 @@ export function CommandPalette() {
               style={{ background: i === idx ? '#141b25' : 'transparent' }}
             >
               <span className="flex w-4 justify-center text-dim">{c.icon}</span>
-              <span className="flex-1 text-[13.5px] text-text">{c.label}</span>
+              <span className="min-w-0 flex-1">
+                <span className="block break-words text-[13.5px] text-text">{c.label}</span>
+                {c.detail && (
+                  <span
+                    data-testid="palette-detail"
+                    className="block break-all font-mono text-[11px] text-faint"
+                  >
+                    {c.detail}
+                  </span>
+                )}
+              </span>
               <span className="rounded-chip border border-border-2 bg-surface-3 px-[7px] py-px font-mono text-[10px] text-faint">
                 {c.group}
               </span>

@@ -51,6 +51,7 @@ import {
 import { rememberListUrl } from '../lib/hostsList';
 import { ShellProvider, useShell } from '../shell/ShellContext';
 import { HostDetail } from './HostDetail';
+import { WithChat } from '../test/chatHarness';
 
 const PRIMARY = '192.0.2.10';
 const BRIDGE = '198.51.100.1';
@@ -341,11 +342,24 @@ describe('HostDetail: the machine header', () => {
   });
 
   it('reads the activity, observations and chat of the primary address', async () => {
-    mount(['/hosts/agent%3Aea2d']);
+    // The chat is the shell's Ask soc-ai panel. The page lends it the host
+    // scope, and the panel reads the thread of the primary address on open.
+    render(
+      <MemoryRouter initialEntries={['/hosts/agent%3Aea2d']}>
+        <WithChat>
+          <Routes>
+            <Route path="/hosts/:key" element={<HostDetail />} />
+          </Routes>
+        </WithChat>
+      </MemoryRouter>,
+    );
     await screen.findByTestId('host-addresses');
     await waitFor(() => expect(getHostActivity).toHaveBeenCalledWith(PRIMARY, '24h'));
     await waitFor(() => expect(getObservations).toHaveBeenCalledWith(PRIMARY, expect.anything()));
-    expect(getHostChat).toHaveBeenCalledWith(PRIMARY);
+    // A closed panel reads no thread.
+    expect(getHostChat).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Ask soc-ai about this host' }));
+    await waitFor(() => expect(getHostChat).toHaveBeenCalledWith(PRIMARY));
     expect(screen.getByTestId('host-facts-address').textContent).toMatch(/primary address 192\.0\.2\.10/);
   });
 });

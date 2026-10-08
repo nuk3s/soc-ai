@@ -1,13 +1,16 @@
 // The Dashboard's Ask box handed every question to the Hunt Console with the
-// objective prefilled — "just a cheap copy-paste of the hunt page" (owner,
-// 2026-08-06). The slot now holds the general chat: it ANSWERS, and proposes a
-// hunt only when the question needs a sweep.
+// objective prefilled, "just a cheap copy-paste of the hunt page" (owner,
+// 2026-08-06). The general chat ANSWERS, and proposes a hunt only when the
+// question needs a sweep. Since the owner's pass of 2026-10-07 the chat is the
+// shell's one Ask soc-ai panel, and the Dashboard slot holds a short card with
+// the three starter questions.
 //
-// Two Dashboard-level properties are pinned here, both about the slot rather
-// than the chat itself (GeneralChatPanel.test.tsx covers the panel): asking no
-// longer navigates anywhere, and a deployment with the kill switch off renders
-// no box at all — rather than one whose first GET is a guaranteed 403.
-import { act, fireEvent, render, screen } from '@testing-library/react';
+// Dashboard-level properties pinned here (AskPanel.general.test.tsx covers the
+// panel): the top bar button opens the panel on the general scope, a starter
+// on the card asks outright and never navigates, the card keeps the
+// `assistant` slot, and a deployment with the kill switch off renders no card
+// and fires no doomed GET.
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter, useLocation } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AboutInfo } from '../lib/types';
@@ -37,6 +40,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
 
 import { Dashboard } from './Dashboard';
 import { getAbout, getGeneralChat, postGeneralChat } from '../lib/api';
+import { WithChat } from '../test/chatHarness';
 
 const about = (generalChatEnabled: boolean): AboutInfo & { general_chat_enabled: boolean } => ({
   version: '1.2.6',
@@ -54,8 +58,10 @@ function Here() {
 const mount = () =>
   render(
     <MemoryRouter initialEntries={['/dashboard']}>
-      <Dashboard />
-      <Here />
+      <WithChat>
+        <Dashboard />
+        <Here />
+      </WithChat>
     </MemoryRouter>,
   );
 
@@ -73,8 +79,28 @@ beforeEach(() => {
 });
 
 describe('Dashboard "Ask soc-ai" slot', () => {
+  it('opens the panel on the general scope from the top bar button', async () => {
+    mount();
+    fireEvent.click(screen.getByRole('button', { name: 'Ask soc-ai' }));
+    expect(screen.getByTestId('ask-scope-title').textContent).toBe('General');
+    // Negative control: the general scope offers no switch to itself.
+    expect(screen.queryByRole('button', { name: 'Switch to general' })).toBeNull();
+  });
+
+  it('a starter on the card opens the panel and asks the question', async () => {
+    mount();
+    const card = await screen.findByTestId('ask-card');
+    await act(async () => {
+      fireEvent.click(within(card).getByRole('button', { name: 'What did overnight look like?' }));
+    });
+    expect(screen.getByRole('dialog', { name: 'Ask soc-ai' })).toBeTruthy();
+    await waitFor(() => expect(postGeneralChat).toHaveBeenCalledWith('What did overnight look like?'));
+    expect(screen.getByTestId('here').textContent).toBe('/dashboard');
+  });
+
   it('answers in place instead of handing the question to the Hunt Console', async () => {
     mount();
+    fireEvent.click(within(await screen.findByTestId('ask-card')).getByRole('button', { name: 'Open' }));
     const box = await screen.findByPlaceholderText(/ask/i);
     vi.mocked(postGeneralChat).mockResolvedValue({
       messages: [
@@ -112,15 +138,17 @@ describe('Dashboard "Ask soc-ai" slot', () => {
     expect(screen.getByTestId('here').textContent).toBe('/dashboard');
   });
 
-  it('sits below the numbers it used to outrank', async () => {
+  it('keeps the card below the numbers it used to outrank', async () => {
     // Dogfood B2b (2026-08-11): the composer held the largest above-the-fold
     // band on the landing screen, pushing the KPI tiles and the outcomes chart
     // under it — the assistant outranking the answer the analyst opened the app
     // for. Hierarchy, not demotion: the box is still on the screen and still
     // works (the test above), it just no longer leads.
     mount();
-    const composer = await screen.findByPlaceholderText(/ask about your environment/i);
-    const kpi = screen.getByText('Awaiting investigation');
+    const composer = await screen.findByTestId('ask-card');
+    // The card holds starters and no composer: the composer is the panel's.
+    expect(within(composer).queryByRole('textbox')).toBeNull();
+    const kpi = screen.getByText('Needs you');
     const outcomes = screen.getByText('Investigation outcomes');
     const recent = screen.getByText('Recent investigations');
 
@@ -137,7 +165,11 @@ describe('Dashboard "Ask soc-ai" slot', () => {
     // 2026-08-12). CSS order is invisible to this assertion, so it is pinned
     // directly: no `order-*` utility may lift the rail past the numbers.
     expect(leads(recent, composer)).toBe(true);
-    const rail = composer.closest('.flex-col.gap-4')!;
+    // The panels now sit on a grid (components/DashboardGrid.tsx), one cell
+    // each, in reading order. The rail container is gone, so the guard moves to
+    // the cells: none may carry an `order-*` utility or a CSS `order`, the two
+    // ways to lift a panel past the numbers without moving it in the DOM.
+    //
     // The `:` in the character class matches ANY variant prefix (lg:, md:,
     // max-lg:, …), not just `lg:`. The NARROW variants are the ones that bite:
     // `max-lg:order-first` — the natural way to "lift the chat below lg without
@@ -146,15 +178,23 @@ describe('Dashboard "Ask soc-ai" slot', () => {
     // assertion is the sole guard on the fix, since the DOM-order checks above
     // pass either way (CSS order never moves the DOM), so it must cover the
     // whole family.
-    expect(rail.className).not.toMatch(/(^|[\s:])order-/);
+    const cell = composer.closest<HTMLElement>('[data-panel]')!;
+    expect(cell.dataset.panel).toBe('assistant');
+    const cells = Array.from(document.querySelectorAll<HTMLElement>('[data-panel]'));
+    expect(cells.length).toBeGreaterThan(1);
+    for (const el of cells) {
+      expect(el.className).not.toMatch(/(^|[\s:])order-/);
+      expect(el.style.order).toBe('');
+    }
   });
 
-  it('renders no chat box, and no doomed GET, when the kill switch is off', async () => {
+  it('renders no card, and no doomed GET, when the kill switch is off', async () => {
     vi.mocked(getAbout).mockResolvedValue(about(false));
     mount();
     await screen.findByText('Investigation outcomes');
     await settle();
 
+    expect(screen.queryByTestId('ask-card')).toBeNull();
     expect(screen.queryByPlaceholderText(/ask/i)).toBeNull();
     // GET /api/v1/chat 403s when general_chat_enabled is off — an operator who
     // switched the assistant off must not get an error bubble on their landing

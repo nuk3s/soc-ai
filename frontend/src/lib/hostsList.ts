@@ -50,9 +50,17 @@ export interface HostsListState {
   activity: 'active' | 'all';
   seen: '' | 'new';
   declared: '' | 'yes' | 'no';
+  /** `attention`: no clean build, or a clean build past the staleness window.
+   *  `stale`: the second part. `broken`: the first part. Each is a filter on
+   *  the machine list, so a summary card lists the rows it counts. */
+  health: '' | 'attention' | 'stale' | 'broken';
+  /** `yes`: an operator declaration and the sweep disagree. */
+  conflict: '' | 'yes';
   /** 1-based. */
   page: number;
 }
+
+const HEALTH_VALUES = ['attention', 'stale', 'broken'] as const;
 
 /** The list state the URL names. A value the API would refuse reads as the
  *  default, so a hand-edited link cannot put the list into an error. */
@@ -63,6 +71,7 @@ export function readListState(params: URLSearchParams): HostsListState {
   const dir: SortDir = dirRaw === 'asc' || dirRaw === 'desc' ? dirRaw : FIRST_DIR[sort];
   const agent = params.get('agent');
   const declared = params.get('declared');
+  const health = params.get('health');
   const page = Number.parseInt(params.get('page') ?? '', 10);
   return {
     q: (params.get('q') ?? '').trim(),
@@ -73,13 +82,29 @@ export function readListState(params: URLSearchParams): HostsListState {
     activity: params.get('activity') === 'all' ? 'all' : 'active',
     seen: params.get('seen') === 'new' ? 'new' : '',
     declared: declared === 'yes' || declared === 'no' ? declared : '',
+    health: (HEALTH_VALUES as readonly string[]).includes(health ?? '')
+      ? (health as HostsListState['health'])
+      : '',
+    conflict: params.get('conflict') === 'yes' ? 'yes' : '',
     page: Number.isFinite(page) && page > 1 ? page : 1,
   };
 }
 
-/** The keys this module owns. Other params (`conflicts`, `health`) pass
- *  through a write untouched. */
-const OWNED = ['q', 'sort', 'dir', 'role', 'agent', 'activity', 'seen', 'declared', 'page'];
+/** The keys this module owns. Another param (`conflicts`, the queue the
+ *  Dashboard nudge opens) passes through a write untouched. */
+const OWNED = [
+  'q',
+  'sort',
+  'dir',
+  'role',
+  'agent',
+  'activity',
+  'seen',
+  'declared',
+  'health',
+  'conflict',
+  'page',
+];
 
 /**
  * Apply a patch to the list URL. A patch that changes anything but `page`
@@ -125,6 +150,8 @@ export function machineQuery(state: HostsListState): MachineQuery {
     activity: state.activity,
     seen: state.seen || undefined,
     declared: state.declared || undefined,
+    health: state.health || undefined,
+    conflict: state.conflict || undefined,
     limit: HOSTS_PAGE_SIZE,
     offset: (state.page - 1) * HOSTS_PAGE_SIZE,
   };

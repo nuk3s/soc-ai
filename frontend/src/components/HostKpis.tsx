@@ -128,21 +128,33 @@ export interface HostKpisProps {
    *  card that named the wrong one sent readers hunting for a defect that was
    *  really two honest answers. */
   servicesSource?: 'dossier' | 'profile';
+  /** The days the profile reads, for the Services card label. */
+  servicesWindowDays?: number;
   activity: HostActivity | null;
   /** The one discriminant, shared with the activity row so the strip and the row
    *  can never describe the live half differently. */
   state: ActivityState;
   range: HostActivityRange;
+  /** The alert verdicts the observations of the last 7 days hold for this
+   *  host. The grid count and the verdicts are two systems: the tile read "0,
+   *  nothing fired" over six verdicts (dogfood 2026-10-06, S3). */
+  alertVerdicts?: number;
 }
 
 export function HostKpis({
   ip,
   services,
   servicesSource = 'dossier',
+  servicesWindowDays,
   activity,
   state,
   range,
+  alertVerdicts = 0,
 }: HostKpisProps) {
+  // The two cards that do not follow the 24h and 7d buttons name their own
+  // window. The Services card read no window and the Alerts card read 7d
+  // beside two cards that read 24h (dogfood 2026-10-06).
+  const profileDays = servicesWindowDays && servicesWindowDays > 0 ? servicesWindowDays : 30;
   // One sentence for the state the live numbers are in, reused by all three so
   // they cannot drift apart. `stale` keeps its numbers: an error WITH data behind
   // it is a failed refresh, not an absence, and blanking them would throw away a
@@ -153,7 +165,7 @@ export function HostKpis({
       : state === 'stale'
         ? 'could not refresh · last good read'
         : state === 'loading'
-          ? 'reading the grid…'
+          ? 'reading the grid'
           : null;
 
   const users = activity?.users ?? null;
@@ -170,7 +182,12 @@ export function HostKpis({
     <div className="mb-3 grid grid-cols-2 gap-3 lg:grid-cols-4">
       <Kpi
         testId="kpi-services"
-        label={servicesSource === 'profile' ? 'Services' : 'Services · dossier'}
+        label={servicesSource === 'profile' ? `Services · ${profileDays}d` : 'Services · last sweep'}
+        title={
+          servicesSource === 'profile'
+            ? `The ports this host serves, from the profile of up to ${profileDays} days. The 24h and 7d buttons do not change this card.`
+            : 'The ports this host serves, from the last sweep. The 24h and 7d buttons do not change this card.'
+        }
         value={services == null ? UNKNOWN : services.length.toLocaleString()}
         sub={
           services == null ? (
@@ -242,9 +259,12 @@ export function HostKpis({
       />
       <Kpi
         testId="kpi-alerts"
-        label="Alerts · 7d"
+        label="Alerts raised · 7d"
         // Fixed at 7 days whatever the activity window is — an alert count is
         // the one number a shorter window would make less useful, not more.
+        // The card says so, because the three cards beside it follow the
+        // window buttons (dogfood 2026-10-06, W items).
+        title="Alerts the grid raised on this host in the last 7 days. This card always counts 7 days. The 24h and 7d buttons do not change it."
         value={activity == null ? UNKNOWN : activity.alerts_7d.toLocaleString()}
         sub={
           <>
@@ -252,6 +272,21 @@ export function HostKpis({
               {liveSub ??
                 (activity && activity.alerts_7d > 0 ? 'detections naming this host' : 'nothing fired')}
             </div>
+            {alertVerdicts > 0 && (
+              <div
+                data-testid="kpi-alert-verdicts"
+                className="font-semibold text-text-2"
+                title="Triage verdicts on alerts that name this host, from the observations of the last 7 days. The panel below lists them."
+              >
+                {alertVerdicts.toLocaleString()} alert verdict{alertVerdicts === 1 ? '' : 's'} on this
+                host
+              </div>
+            )}
+            {range !== '7d' && (
+              <div data-testid="kpi-alerts-fixed" className="text-faint">
+                always 7 days
+              </div>
+            )}
             {/* Only under a number the grid actually answered: a link beneath a
                 dash invites a click on a figure that does not exist. */}
             {activity != null && (

@@ -116,9 +116,11 @@ def _raise_arg_type_error(tool_name: str, args: dict[str, Any], cause: TypeError
     args, and the exception — letting synth round 2 re-call with corrected
     types instead of silently missing the evidence.
     """
+    # The message lands in the round-2 synth prompt, so a huge argument dump
+    # is bounded. The bracket marker tells the model the repr is cut.
     args_repr = repr(args)
     if len(args_repr) > 400:
-        args_repr = args_repr[:400] + "…"
+        args_repr = args_repr[:400] + " [truncated]"
     raise TypeError(
         f"tool {tool_name} rejected arguments {args_repr}: {cause}"
         " — re-call with corrected argument types"

@@ -105,7 +105,7 @@ async def _run_once(agent: Any, prompt: str) -> tuple[str, str]:
         out = result.output
         return ("OK", f"{out.verdict} conf={out.confidence}")
     except Exception as exc:
-        detail = " ".join(str(exc).split())[:300]
+        detail = " ".join(str(exc).split())
         return (classify_probe_exception(exc), detail)
 
 

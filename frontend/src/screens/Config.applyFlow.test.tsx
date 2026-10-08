@@ -200,7 +200,7 @@ describe('the "Applied" notice leaves (RC13)', () => {
 });
 
 describe('Check fitness keeps the previous grade and names an abort (RC3)', () => {
-  it('shows the old chip with "checking…" during the run, and one error line on abort', async () => {
+  it('shows the old chip with "checking" during the run, and one error line on abort', async () => {
     renderConfig('#agent');
     const chip = await screen.findByTestId('fitness-chip', {}, { timeout: 3000 });
     expect(chip.textContent).toBeTruthy();

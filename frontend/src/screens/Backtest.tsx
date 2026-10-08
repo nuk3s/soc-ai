@@ -1,10 +1,10 @@
 import { AlertTriangle, CheckCircle2, History, Loader2, Play, ShieldCheck } from 'lucide-react';
 import { useRef, useState } from 'react';
 import { Panel } from '../components/Panel';
-import { middleEllipsis } from '../lib/text';
 import { ErrorState } from '../components/States';
 import { getBacktest, startBacktest } from '../lib/api';
-import { absTime } from '../lib/timeRange';
+import { verdictLabel, verdictMeta } from '../lib/labels';
+import { absoluteTime, ago } from '../lib/timeRange';
 import { useAsync } from '../lib/useAsync';
 import type {
   Backtest as BacktestData,
@@ -34,19 +34,22 @@ const SEVERITIES = [
   { label: 'Critical only', value: 'critical' },
 ];
 
+// The words and colours of a verdict come from lib/labels.ts, the map every
+// screen reads. This page said "Needs info" where the others said "Needs more
+// info". `no_verdict` is this page's own bucket and reads as "No verdict".
 const VERDICT_LABEL: Record<SocVerdict, string> = {
-  true_positive: 'True positive',
-  false_positive: 'False positive',
-  needs_more_info: 'Needs info',
-  inconclusive: 'Inconclusive',
+  true_positive: verdictLabel('true_positive'),
+  false_positive: verdictLabel('false_positive'),
+  needs_more_info: verdictLabel('needs_more_info'),
+  inconclusive: verdictLabel('inconclusive'),
   no_verdict: 'No verdict',
 };
 const VERDICT_COLOR: Record<SocVerdict, string> = {
-  true_positive: '#f04438',
-  false_positive: '#7ba893',
-  needs_more_info: '#f5a623',
-  inconclusive: '#d29922',
-  no_verdict: '#6b7484',
+  true_positive: verdictMeta('true_positive').color,
+  false_positive: verdictMeta('false_positive').color,
+  needs_more_info: verdictMeta('needs_more_info').color,
+  inconclusive: verdictMeta('inconclusive').color,
+  no_verdict: verdictMeta('untriaged').color,
 };
 const DISPOSITION_LABEL: Record<HumanDisposition, string> = {
   true_positive: 'Escalated (TP)',
@@ -199,7 +202,7 @@ export function Backtest() {
             ) : (
               <Play size={15} />
             )}
-            {running ? 'Running…' : starting ? 'Starting…' : 'Run backtest'}
+            {running ? 'Running' : starting ? 'Starting' : 'Run backtest'}
           </button>
         </div>
         <div className="mt-2.5 text-[11.5px] text-faint">
@@ -216,7 +219,7 @@ export function Backtest() {
             <div data-testid="backtest-sampling">
               <div className="mb-1 flex items-center gap-2 text-[13px] font-semibold text-accent">
                 <Loader2 size={15} className="animate-spin" />
-                soc-ai reads Security Onion for the alerts your analysts closed…
+                soc-ai reads Security Onion for the alerts your analysts closed
               </div>
               <div className="text-[12px] text-dim">
                 soc-ai has replayed no alert yet. soc-ai still samples the window.
@@ -226,7 +229,7 @@ export function Backtest() {
             <>
               <div className="mb-2 flex items-center gap-2 text-[13px] font-semibold text-accent">
                 <Loader2 size={15} className="animate-spin" />
-                soc-ai replays {data.total} closed alert{data.total === 1 ? '' : 's'}…
+                soc-ai replays {data.total} closed alert{data.total === 1 ? '' : 's'}
               </div>
               <ProgressBar done={data.replayed + data.failed} total={data.total} />
               <div className="mt-2 text-[12px] text-dim">
@@ -360,7 +363,9 @@ function Results({ data }: { data: BacktestData }) {
       {/* When this backtest actually ran — without it the results read as
           current no matter how stale they are (dogfood 2026-07-15). */}
       {data.finished_at && (
-        <div className="mb-3 text-[12px] text-faint">Ran {absTime(data.finished_at)}</div>
+        <div className="mb-3 text-[12px] text-faint" data-testid="backtest-ran-at">
+          Ran {ago(data.finished_at)}, at {absoluteTime(data.finished_at)}
+        </div>
       )}
       {/* Coverage before score. A rate over rows soc-ai never judged is not a
           statement about soc-ai, so say how many it judged first. */}
@@ -524,8 +529,8 @@ function MissedTpCard({
       {!safe && rows.length > 0 && (
         <ul className="mt-2 space-y-0.5 text-[11.5px]" style={{ color: '#e88' }}>
           {rows.slice(0, 4).map((row) => (
-            <li key={row.alert_id} className="truncate" title={row.rule_name || row.alert_id}>
-              • {middleEllipsis(row.rule_name || row.alert_id)}
+            <li key={row.alert_id} className="break-words" title={row.rule_name || row.alert_id}>
+              • {row.rule_name || row.alert_id}
             </li>
           ))}
           {rows.length > 4 && <li className="text-faint">+ {rows.length - 4} more</li>}
@@ -599,8 +604,8 @@ function RowsTable({ rows }: { rows: BacktestRow[] }) {
             const verdict: SocVerdict = row.soc_ai_verdict ?? 'no_verdict';
             return (
               <tr key={row.alert_id} className="border-b border-border last:border-0">
-                <td className="max-w-[280px] truncate px-4 py-2 text-text" title={row.rule_name}>
-                  {middleEllipsis(row.rule_name || row.alert_id)}
+                <td className="max-w-[280px] break-words px-4 py-2 text-text" title={row.rule_name}>
+                  {row.rule_name || row.alert_id}
                 </td>
                 <td className="px-4 py-2" style={{ color: VERDICT_COLOR[row.human_disposition] }}>
                   {DISPOSITION_LABEL[row.human_disposition]}
