@@ -5,6 +5,7 @@ import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import {
   ApiError,
   dismissLead,
+  getLeadCount,
   getLeads,
   getNeedsYou,
   huntLead,
@@ -412,6 +413,17 @@ const EMPTY_STATE: Record<LeadTab, string> = {
   in_progress: 'No hunt is running on a lead.',
   closed: 'No closed leads. No analyst closed a lead, and no clean hunt closed one.',
   all: 'No leads. No entity has observations of two types, a finding, or a repeated single type.',
+};
+
+/** The scope of each tab, in visible words. The Hunts page and the host page
+ *  both have a time filter, and the leads follow neither: a backlog keeps its
+ *  full scope. The two tabs of open work say "all open". The two tabs that
+ *  hold closed leads say "all time". */
+export const TAB_SCOPE: Record<LeadTab, string> = {
+  needs_decision: 'all open',
+  in_progress: 'all open',
+  closed: 'all time',
+  all: 'all time',
 };
 
 /** The count beside the heading, in the tab's own word. */
@@ -869,7 +881,6 @@ function LeadRow({
 
 export function LeadsStrip({
   entityKey,
-  aliases,
   className,
   status: firstTab = 'needs_decision',
   noun = 'host',
@@ -878,11 +889,10 @@ export function LeadsStrip({
   collapsed = false,
   onToggleCollapsed,
 }: {
+  /** The entity the strip is mounted on. The server keeps the leads that name
+   *  it, under every key of its machine: a lead on the host name belongs on
+   *  the address's page too. */
   entityKey?: string;
-  /** The other keys the same machine is stored under: its strong hostnames.
-   *  A lead on the host name belongs on the address's page too. A host alias
-   *  matches a host entity only, in any case. */
-  aliases?: string[];
   className?: string;
   /** The tab the strip opens on. A host page opens on All, because a lead
    *  under a hunt and a lead already closed both belong to the host. */
@@ -927,23 +937,36 @@ export function LeadsStrip({
   // 60 s, the cadence the hits block runs at. A lead forms on the profile sweep
   // and on every triage verdict, so 5 minutes was long enough for the strip to
   // disagree with the block beside it.
-  const leads = useAsync(() => getLeads(tab as LeadStatusFilter), [tab, reload], {
-    refetchInterval: 60_000,
-  });
+  //
+  // On a host page the server keeps the leads that touch this host. The strip
+  // read the newest 50 leads of the estate and filtered them here, so a host
+  // lead older than those 50 never showed (2026-10-14).
+  const leads = useAsync(
+    () =>
+      entityKey
+        ? getLeads(tab as LeadStatusFilter, { entity: entityKey })
+        : getLeads(tab as LeadStatusFilter),
+    [tab, reload, entityKey],
+    { refetchInterval: 60_000 },
+  );
+  // The true total of the tab. The rows stop at the server's limit, and the
+  // heading counted the rows, so it never said more than 50. A failed count
+  // leaves the heading on the rows. `async` turns a throw into a rejection.
+  const total = useAsync(
+    async () =>
+      entityKey
+        ? getLeadCount(tab as LeadStatusFilter, { entity: entityKey })
+        : getLeadCount(tab as LeadStatusFilter),
+    [tab, reload, entityKey],
+    { refetchInterval: 60_000 },
+  );
   // The caller's callback, held in a ref so an inline arrow function in the
   // parent does not re-fire the effect below on every render.
   const onRowsRef = useRef(onRows);
   onRowsRef.current = onRows;
-  // On a host page the strip shows only the leads that touch this host: the
-  // lead points at the host, and the host page pointed at nothing.
-  const aliasKeys = new Set((aliases ?? []).map((a) => a.toLowerCase()));
-  const rows = (leads.data ?? []).filter(
-    (lead) =>
-      !entityKey ||
-      lead.entities.some(
-        (e) => e[1] === entityKey || (e[0] === 'host' && aliasKeys.has(String(e[1]).toLowerCase())),
-      ),
-  );
+  const rows = leads.data ?? [];
+  const totalCount =
+    total.data && total.data.status === tab ? Math.max(total.data.total, rows.length) : rows.length;
   // The rows, to the block that asked for them. The effect keys on the loaded
   // list, so a render the poll did not change does not re-announce it.
   const loaded = leads.data;
@@ -987,7 +1010,8 @@ export function LeadsStrip({
             {onHost ? `Leads on this ${noun}` : 'Leads'}
             {leads.data && (
               <span className="font-mono normal-case tracking-normal">
-                · {countText(tab, rows.length)}
+                · {countText(tab, totalCount)} ·{' '}
+                <span data-testid="leads-scope">{TAB_SCOPE[tab]}</span>
               </span>
             )}
           </span>
@@ -1069,16 +1093,26 @@ export function LeadsStrip({
             // Absence is stated, with the reason it is not an all-clear.
             <div className="px-[15px] py-2.5 text-[12.5px] text-dim">{EMPTY_STATE[tab]}</div>
           ) : (
-            <ul className="divide-y divide-border-faint">
-              {rows.map((lead) => (
-                <LeadRow
-                  key={lead.id}
-                  lead={lead}
-                  autoHunt={autoHunt}
-                  onChanged={() => setReload((n) => n + 1)}
-                />
-              ))}
-            </ul>
+            <>
+              <ul className="divide-y divide-border-faint">
+                {rows.map((lead) => (
+                  <LeadRow
+                    key={lead.id}
+                    lead={lead}
+                    autoHunt={autoHunt}
+                    onChanged={() => setReload((n) => n + 1)}
+                  />
+                ))}
+              </ul>
+              {totalCount > rows.length && (
+                <div
+                  data-testid="leads-capped"
+                  className="border-t border-border-faint px-[15px] py-2 text-[11.5px] text-faint"
+                >
+                  The list shows the newest {rows.length} of {plural(totalCount, 'lead')}.
+                </div>
+              )}
+            </>
           )}
         </div>
       )}

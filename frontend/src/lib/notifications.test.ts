@@ -126,14 +126,17 @@ describe('describeNotifications', () => {
     ).toBe('3 items: 1 lead and 2 completed investigations. Finished runs cover the last 24 h.');
   });
 
-  it('states the cap on the last type when the API list is full', () => {
+  // The header said "the 10 newest" over a list the API cut at 12 rows, and
+  // no control could load the rest (production 2026-10-14). It now states the
+  // loaded count and says that more exist.
+  it('states the loaded count and that more exist when the API list is full', () => {
     const rows = [
-      { id: 'shadow-hit:1' },
-      { id: 'shadow-hit:2' },
+      { id: 'inv:1' },
+      { id: 'inv:2' },
       ...Array.from({ length: 10 }, (_, i) => ({ id: `inv-done:${i}` })),
     ];
     expect(describeNotifications(rows, true)).toBe(
-      '12 items: 2 shadow hits and the 10 newest completed investigations. Finished runs cover the last 24 h.',
+      '12 items loaded: 2 running investigations and 10 completed investigations. More items exist. Select Show more to load them. Finished runs cover the last 24 h.',
     );
   });
 

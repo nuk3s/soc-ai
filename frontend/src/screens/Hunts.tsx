@@ -36,11 +36,13 @@ import {
   getHunts,
   getHuntSchedules,
   getHuntStats,
+  getHuntTotals,
+  HUNTS_PAGE_CAP,
   rehuntHunts,
   startHuntConsole,
   updateHuntSchedule,
 } from '../lib/api';
-import type { HuntSchedule, HuntScheduleList, Lead } from '../lib/api';
+import type { HuntKindTotals, HuntSchedule, HuntScheduleList, Lead } from '../lib/api';
 import { huntOutcome, outcomeLabel, outcomeMeta, statusDetail, statusMeta } from '../lib/labels';
 import { HUNT_KIND } from '../lib/tokens';
 import {
@@ -808,6 +810,22 @@ export function Hunts() {
       pauseWhen: () => !activeRef.current,
     },
   );
+  // The counts of the whole window. The list route caps a page at 100 rows,
+  // and the header, the section badge and the type chip counted that page: a
+  // window of 140 hunts read "100 hunts". The key tags each answer with its
+  // window, so a count of the old window never sits over the new one.
+  const huntWindowKey = [range, custom?.from ?? '', custom?.to ?? ''].join('|');
+  const totalsRead = useAsync(
+    async () => ({
+      totals: await getHuntTotals(rangeToSinceUntil(range, custom)),
+      key: huntWindowKey,
+    }),
+    [reloadKey, range, custom],
+    {
+      refetchInterval: 8000,
+      pauseWhen: () => !activeRef.current,
+    },
+  );
   const stats = useAsync(getHuntStats, [reloadKey], {
     refetchInterval: 8000,
     pauseWhen: () => !activeRef.current,
@@ -830,13 +848,15 @@ export function Hunts() {
   // it, so none of them can disagree.
   const visible = useMemo(() => data ?? [], [data]);
 
-  // The header describes the rows the table shows — the window and the kind
-  // chip, as the server answered them — so header and table can never
-  // disagree. The unwindowed `stats` poll stays: `huntsExist` needs "any hunts
-  // EVER" (a quiet window must not flip the screen to onboarding). Counts
-  // describe the fetched page: the backend caps rows (default 100), so a huge
-  // window undercounts — but consistently with the table below, which is the
-  // invariant that matters.
+  // The header describes the window and the kind chip, as the server
+  // answered them. The unwindowed `stats` poll stays: `huntsExist` needs "any
+  // hunts EVER" (a quiet window must not flip the screen to onboarding).
+  //
+  // The counts come from GET /hunts/totals, which counts the whole window.
+  // They counted the fetched page, and the backend caps the page at 100 rows,
+  // so a window of 140 read "100 hunts". When the totals are not available
+  // the counts fall back to the page, and a full page marks each count with
+  // "+": the window can hold more rows than the page.
   //
   // Under All the hunt count is broken down by kind, manual included: "12
   // hunts (9 manual, 2 scheduled, 1 catalog)". A manual hunt wears no badge
@@ -845,27 +865,52 @@ export function Hunts() {
   // for. Under a kind chip the chip names the kind and the breakdown would
   // only repeat it. Kinds come in chip order, spelled as the badges and the
   // detail page spell them, and a kind with no rows is not listed.
+  const windowTotals = totalsRead.data?.key === huntWindowKey ? totalsRead.data.totals : null;
+  // The totals of the type on screen. A type with no hunt in the window is
+  // absent from `by_kind`, and it counts zero.
+  const scopedTotals: HuntKindTotals | null = windowTotals
+    ? kind === 'all'
+      ? windowTotals
+      : (windowTotals.by_kind[kind] ?? { hunts: 0, findings: 0, threat_findings: 0, running: 0 })
+    : null;
+  // With no totals, a full page means the counts are a floor.
+  const pageFloor = !scopedTotals && visible.length >= HUNTS_PAGE_CAP;
+  const huntCount = scopedTotals
+    ? String(scopedTotals.hunts)
+    : `${visible.length}${pageFloor ? '+' : ''}`;
   const windowStats = useMemo(() => {
     const rows = visible;
+    const mark = (n: number): string => `${n}${pageFloor ? '+' : ''}`;
+    const kindCount = (k: HuntKind): number =>
+      windowTotals ? (windowTotals.by_kind[k]?.hunts ?? 0) : rows.filter((h) => h.kind === k).length;
     const byKind =
-      kind === 'all' && rows.length > 0
+      kind === 'all' && (windowTotals ? windowTotals.hunts > 0 : rows.length > 0)
         ? KIND_CHIPS.filter((c) => c.id !== 'all')
-            .map((c) => ({ n: rows.filter((h) => h.kind === c.id).length, label: HUNT_KIND[c.id as HuntKind].label }))
+            .map((c) => ({ n: kindCount(c.id as HuntKind), label: HUNT_KIND[c.id as HuntKind].label }))
             .filter((c) => c.n > 0)
-            .map((c) => `${c.n} ${c.label}`)
+            .map((c) => `${mark(c.n)} ${c.label}`)
             .join(', ')
         : '';
+    const findings = scopedTotals
+      ? scopedTotals.findings
+      : rows.reduce((n, h) => n + (h.findingCount ?? 0), 0);
+    const threats = scopedTotals
+      ? scopedTotals.threat_findings
+      : rows.reduce((n, h) => n + (h.threatFindingCount ?? h.findingCount ?? 0), 0);
+    const running = scopedTotals
+      ? scopedTotals.running
+      : rows.filter((h) => h.status === 'running').length;
     return [
-      { label: 'Hunts', value: rows.length, sub: 'in window', detail: byKind ? `(${byKind})` : '' },
       {
-        label: 'Findings',
-        value: rows.reduce((n, h) => n + (h.findingCount ?? 0), 0),
-        sub: `${rows.reduce((n, h) => n + (h.threatFindingCount ?? h.findingCount ?? 0), 0)} threat`,
-        detail: '',
+        label: 'Hunts',
+        value: scopedTotals ? String(scopedTotals.hunts) : mark(rows.length),
+        sub: 'in window',
+        detail: byKind ? `(${byKind})` : '',
       },
-      { label: 'In progress', value: rows.filter((h) => h.status === 'running').length, sub: 'running now', detail: '' },
+      { label: 'Findings', value: mark(findings), sub: `${mark(threats)} threat`, detail: '' },
+      { label: 'In progress', value: mark(running), sub: 'running now', detail: '' },
     ];
-  }, [visible, kind]);
+  }, [visible, kind, windowTotals, scopedTotals, pageFloor]);
 
   // A hunt started elsewhere won't appear while this list is idle — force one
   // refetch when the tab regains focus.
@@ -1078,7 +1123,7 @@ export function Hunts() {
           className="rounded-chip border border-border-strong bg-surface-2 px-1.5 py-px font-mono text-[11px] tabular-nums text-dim"
           title="The hunts in the window and the type on screen."
         >
-          {visible.length}
+          {huntCount}
         </span>
         <span className="ml-auto">
           <button
@@ -1103,16 +1148,15 @@ export function Hunts() {
       {/* The shared list toolbar — same placement as the other lists: directly
           above the table. The kind chips are its presets; the header line
           above follows whatever they leave in the table. Only the ACTIVE chip
-          carries a count: one fetch cannot yield both the All count and each
-          kind's, and a number the page cannot back would be the old lie in a
-          new place. The active count is the rows the table shows. */}
+          carries a count. The count is the window total of that type, the
+          number the header states. */}
       <ListToolbar
         presetsLabel="Type"
         presets={KIND_CHIPS.map((c) => ({
           id: c.id,
           label: c.label,
           title: c.title,
-          count: kind === c.id ? visible.length : undefined,
+          count: kind === c.id ? huntCount : undefined,
           active: kind === c.id,
         }))}
         onPreset={(id) => {
@@ -1437,6 +1481,13 @@ export function Hunts() {
         )}
         </div>
       </Panel>
+      {/* The counts above state the window. The table holds the newest page
+          of it, so the line says how much of the window the table shows. */}
+      {scopedTotals && data && scopedTotals.hunts > visible.length && (
+        <div data-testid="hunts-page-note" className="mt-1.5 text-[12px] text-dim">
+          The table shows the {visible.length} newest of {scopedTotals.hunts} hunts in this window.
+        </div>
+      )}
         </div>
       )}
 

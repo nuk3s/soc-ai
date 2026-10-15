@@ -21,6 +21,7 @@ import {
   getDossierRefreshStatus,
   getDossierSummary,
   getHostActivity,
+  getLeadCount,
   getLeads,
   getMachine,
   getMe,
@@ -33,7 +34,7 @@ import { useChatScope } from '../lib/chatScope';
 import { cn } from '../lib/cn';
 import { activityState } from '../lib/hostActivity';
 import { isMachineKey, isResolved, portsView, roleVocabulary } from '../lib/hostDossier';
-import { alertVerdicts, leadLines, leadTouches, verdictLines } from '../lib/hostSituation';
+import { VERDICT_DAYS, alertVerdicts, leadLines, verdictLines } from '../lib/hostSituation';
 import { listUrlToReturnTo, machineHref, type HostsLocationState } from '../lib/hostsList';
 import { isIpKey } from '../lib/ip';
 import { plural } from '../lib/plural';
@@ -330,27 +331,50 @@ export function HostDetail() {
   // strip and the observations panel below read the same two sources; these
   // reads feed the hero sentence and the Alerts card. A failed read leaves
   // the lines out and the panels below say why.
+  //
+  // The server keeps the open leads on this host, under every key of the
+  // machine, before its row limit. The page read the newest 50 leads of the
+  // estate and kept the ones on this host, so an older host lead never
+  // reached the hero (2026-10-14). The count is the true total of the open
+  // leads, and each line states its scope in words: the 24h and 7d buttons
+  // do not change these lines.
   const situationKey = dossier?.found ? ip : '';
   const leadsRead = useAsync(
-    () => (situationKey ? getLeads('all').then((rows) => ({ key: situationKey, rows })) : Promise.resolve(null)),
+    () =>
+      situationKey
+        ? getLeads('open_or_hunting', { entity: situationKey, limit: 200 }).then((rows) => ({
+            key: situationKey,
+            rows,
+          }))
+        : Promise.resolve(null),
+    [situationKey],
+    { refetchInterval: 60_000 },
+  );
+  const leadTotal = useAsync(
+    async () =>
+      situationKey
+        ? getLeadCount('open_or_hunting', { entity: situationKey }).then((res) => ({
+            key: situationKey,
+            total: res.total,
+          }))
+        : null,
     [situationKey],
     { refetchInterval: 60_000 },
   );
   const observationsRead = useAsync(
     () =>
       situationKey
-        ? getObservations(situationKey, 7).then((res) => ({ key: situationKey, rows: res.observations }))
+        ? getObservations(situationKey, VERDICT_DAYS).then((res) => ({ key: situationKey, rows: res.observations }))
         : Promise.resolve(null),
     [situationKey],
     { refetchInterval: 300_000 },
   );
-  const hostLeads =
-    leadsRead.data && leadsRead.data.key === situationKey
-      ? leadsRead.data.rows.filter((lead) => leadTouches(lead, situationKey, dossier?.aliases ?? []))
-      : [];
+  const hostLeads = leadsRead.data && leadsRead.data.key === situationKey ? leadsRead.data.rows : [];
+  const hostLeadTotal =
+    leadTotal.data && leadTotal.data.key === situationKey ? leadTotal.data.total : null;
   const hostObservations =
     observationsRead.data && observationsRead.data.key === situationKey ? observationsRead.data.rows : [];
-  const situation = [...leadLines(hostLeads), ...verdictLines(hostObservations)];
+  const situation = [...leadLines(hostLeads, hostLeadTotal), ...verdictLines(hostObservations)];
   const verdictCount = alertVerdicts(hostObservations).length;
 
   // The chat panel's scope line prefers the name a human uses: the SAME
@@ -1020,7 +1044,7 @@ export function HostDetail() {
                 New. A lead under a hunt and a lead already closed both
                 belong to this host. A repeated single signal is visible in
                 the observations before it forms a lead. */}
-            <LeadsStrip entityKey={ip} aliases={dossier.aliases} status="all" className="mb-3" />
+            <LeadsStrip entityKey={ip} status="all" className="mb-3" />
             <HostObservations entityKey={ip} className="mb-3" />
 
             {/* Every address of the machine, and its containers. */}
@@ -1030,6 +1054,7 @@ export function HostDetail() {
                 focusAddress={focusAddress}
                 focusField={focusField}
                 lastActivity={newestActivity(shown?.volume)}
+                windowDays={dossier.lookback_days}
               />
             )}
 

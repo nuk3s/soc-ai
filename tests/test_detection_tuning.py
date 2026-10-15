@@ -494,8 +494,24 @@ def test_detection_tuning_summary_counts_actionable_mutes(client: TestClient) ->
     with patch("soc_ai.webui.detection_tuning.nominate", AsyncMock(return_value=noms)):
         resp = client.get("/api/v1/detection-tuning/summary")
     assert resp.status_code == 200
-    # Three nominated rules, one of them a pending mute (D10).
-    assert resp.json() == {"pending": 1, "nominated": 3}
+    # Three nominated rules, one of them a pending mute (D10). The window of
+    # the alert volume rides along, so the nudge can state it.
+    assert resp.json() == {"pending": 1, "nominated": 3, "volume_window": "7d"}
+
+
+async def test_nominate_reads_the_volume_over_the_window_the_summary_names(
+    settings_kratos: Settings,
+) -> None:
+    """The Dashboard nudge prints the window of the alert volume. The words
+    come from the summary, and the summary names the window nominate reads."""
+    engine, maker = await _db(settings_kratos)
+    fetch = AsyncMock(return_value=GroupPage([], 0))
+    state = SimpleNamespace(settings=settings_kratos, elastic=AsyncMock(), db_sessionmaker=maker)
+    with patch("soc_ai.webui.detection_tuning.aq.fetch_groups", fetch):
+        await dt.nominate(state)
+    assert fetch.await_args is not None
+    assert fetch.await_args.kwargs["time_range"] == dt.VOLUME_RANGE == "7d"
+    await engine.dispose()
 
 
 def test_summary_answers_a_down_grid_with_503_not_an_unhandled_500(client: TestClient) -> None:

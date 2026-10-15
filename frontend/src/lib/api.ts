@@ -365,6 +365,9 @@ export interface AlertQuery {
 function alertQueryParams(query: AlertQuery, base: Record<string, string> = {}): string {
   const p = new URLSearchParams(base);
   if (query.range === 'custom' && query.from && query.to) {
+    // The bounds travel with range=custom. Sent alone, they left the alerts
+    // route on its default 24 hours for the verdict counts of each group.
+    p.set('range', 'custom');
     p.set('from', query.from);
     p.set('to', query.to);
   } else if (query.range) {
@@ -550,6 +553,34 @@ export function getHunts(query: HuntsQuery = {}): Promise<HuntRow[]> {
   if (query.kind) p.set('kind', query.kind);
   const qs = p.toString();
   return request<HuntRow[]>('/hunts' + (qs ? `?${qs}` : ''));
+}
+
+/** The rows GET /hunts answers when the caller names no limit. */
+export const HUNTS_PAGE_CAP = 100;
+
+/** The counts of the hunts of one type in a window. */
+export interface HuntKindTotals {
+  hunts: number;
+  findings: number;
+  threat_findings: number;
+  /** Hunts with the status running: the "In progress" count. */
+  running: number;
+}
+
+/** The counts of every hunt in a window, with no row cap, and per type.
+ *  `by_kind` is keyed by the stored kind. A type with no hunt is absent. */
+export interface HuntTotals extends HuntKindTotals {
+  by_kind: Partial<Record<HuntKind, HuntKindTotals>>;
+}
+
+/** The counts of the whole window GET /hunts pages through. That route caps a
+ *  page at HUNTS_PAGE_CAP rows, so a header that counts the page undercounts. */
+export function getHuntTotals(query: Pick<HuntsQuery, 'since' | 'until'> = {}): Promise<HuntTotals> {
+  const p = new URLSearchParams();
+  if (query.since) p.set('since', query.since);
+  if (query.until) p.set('until', query.until);
+  const qs = p.toString();
+  return request<HuntTotals>('/hunts/totals' + (qs ? `?${qs}` : ''));
 }
 
 export function getHuntStats(): Promise<HuntStat[]> {
@@ -1618,8 +1649,25 @@ export function getWorkspaces(): Promise<Workspace[]> {
   return request<Workspace[]>('/workspaces');
 }
 
-export function getNotifications(): Promise<Notification[]> {
-  return request<Notification[]>('/notifications');
+/** What to ask GET /notifications for. Every field is optional, and the API
+ *  default is 12 rows of every type. */
+export interface NotificationQuery {
+  /** The most rows to return, 1 to 200. */
+  limit?: number;
+  /** Leave out the shadow-hit and lead rows. The Needs-you block counts them. */
+  eventsOnly?: boolean;
+  /** The moment of the last Dismiss all. The API leaves out every dismissible
+   *  row at or before it, so hidden rows take no place in the limit. */
+  after?: string | null;
+}
+
+export function getNotifications(query: NotificationQuery = {}): Promise<Notification[]> {
+  const params = new URLSearchParams();
+  if (query.limit !== undefined) params.set('limit', String(query.limit));
+  if (query.eventsOnly) params.set('events_only', 'true');
+  if (query.after) params.set('after', query.after);
+  const qs = params.toString();
+  return request<Notification[]>(qs ? `/notifications?${qs}` : '/notifications');
 }
 
 export interface HealthComponent {
@@ -2116,13 +2164,20 @@ export function severitiesAtOrAbove(floor: string): string[] {
  *  - `alertIds` — triages exactly that selection (already-verdicted skipped).
  *  - `minSeverity` — sweeps all detections at or above this severity floor;
  *    omit to let the backend use its configured default (auto_triage_min_severity).
- *  - Both omitted — backend uses its configured default. */
-export function startAutoTriage(opts?: { alertIds?: string[]; minSeverity?: string }): Promise<AutoTriageStatus> {
+ *  - Both omitted — backend uses its configured default.
+ *  - `range` is the window of a sweep, in range words ("24h"). It is sent
+ *    only with no selection and only when set. The server default is 24 hours. */
+export function startAutoTriage(opts?: {
+  alertIds?: string[];
+  minSeverity?: string;
+  range?: string;
+}): Promise<AutoTriageStatus> {
   const body: Record<string, unknown> = {};
   if (opts?.alertIds?.length) {
     body.alert_ids = opts.alertIds;
-  } else if (opts?.minSeverity) {
-    body.severities = severitiesAtOrAbove(opts.minSeverity);
+  } else {
+    if (opts?.minSeverity) body.severities = severitiesAtOrAbove(opts.minSeverity);
+    if (opts?.range) body.range = opts.range;
   }
   return post<AutoTriageStatus>('/auto-triage', body);
 }
@@ -2448,8 +2503,17 @@ export function getQualityEvalStatus(): Promise<QualityEvalStatus> {
  * Count of pending detection-tuning mute recommendations (admin-gated).
  * Feeds the Dashboard nudge; callers treat a 403/error as "hide the nudge".
  */
-export function getDetectionTuningSummary(): Promise<{ pending: number }> {
-  return request<{ pending: number }>('/detection-tuning/summary');
+/** The Dashboard tuning nudge. `nominated` and `volume_window` are absent on
+ *  an older backend. `volume_window` is the window of the alert counts in
+ *  range words ("7d"). The verdict counts read every investigation. */
+export interface DetectionTuningSummary {
+  pending: number;
+  nominated?: number;
+  volume_window?: string;
+}
+
+export function getDetectionTuningSummary(): Promise<DetectionTuningSummary> {
+  return request<DetectionTuningSummary>('/detection-tuning/summary');
 }
 
 /** Launch a background discovery scan; returns the (running) status. */
@@ -3061,7 +3125,8 @@ export interface LeadPromotedFinding {
  *
  *  The spine adds two words that name what the analyst must do rather than
  *  what the record holds. `needs_decision` is a lead with no hunt, or a lead
- *  whose hunt has finished. `in_progress` is a lead whose hunt still runs. */
+ *  whose hunt has finished. `in_progress` is a lead whose hunt still runs.
+ *  `open_or_hunting` is the open work: the host page counts these. */
 export type LeadStatusFilter =
   | 'open'
   | 'hunting'
@@ -3071,10 +3136,44 @@ export type LeadStatusFilter =
   | 'new'
   | 'all'
   | 'needs_decision'
-  | 'in_progress';
+  | 'in_progress'
+  | 'open_or_hunting';
 
-export function getLeads(status: LeadStatusFilter = 'open'): Promise<Lead[]> {
-  return request<Lead[]>(`/leads?status=${status}`);
+/** The filters GET /leads takes beside the status. */
+export interface LeadQuery {
+  /** Keep the leads that name this entity, under every key of its machine.
+   *  The server filters before its row limit, so a host keeps a lead that is
+   *  older than the newest 50 of the estate. */
+  entity?: string;
+  /** The row limit. The server default is 50 and its ceiling is 200. */
+  limit?: number;
+}
+
+function leadQueryString(status: LeadStatusFilter, query?: LeadQuery): string {
+  const p = new URLSearchParams({ status });
+  if (query?.entity) p.set('entity', query.entity);
+  if (query?.limit) p.set('limit', String(query.limit));
+  return p.toString();
+}
+
+export function getLeads(status: LeadStatusFilter = 'open', query?: LeadQuery): Promise<Lead[]> {
+  return request<Lead[]>(`/leads?${leadQueryString(status, query)}`);
+}
+
+/** What GET /leads/count answers: the whole match set of one filter. */
+export interface LeadCount {
+  status: string;
+  entity: string | null;
+  total: number;
+}
+
+/** The true total for a filter of GET /leads. The list stops at its row
+ *  limit, and a heading that counted the rows could never pass 50. */
+export function getLeadCount(
+  status: LeadStatusFilter = 'open',
+  query?: Pick<LeadQuery, 'entity'>,
+): Promise<LeadCount> {
+  return request<LeadCount>(`/leads/count?${leadQueryString(status, query)}`);
 }
 
 /** One lead with its timeline and its live weight. */
@@ -3634,6 +3733,20 @@ export function getNeedsYouCount(): Promise<NeedsYouCount> {
 /** Mark one shadow hit read. Opening its receipts is what reads it. */
 export function markShadowHitRead(id: number): Promise<{ ok: boolean }> {
   return post<{ ok: boolean }>(`/hunts/shadow-hits/${id}/read`, {}).then((answer) => {
+    publishShadowHitsChanged();
+    emitNeedsYouChanged();
+    return answer;
+  });
+}
+
+/** Mark every unread shadow hit born at or before `before` read, in one write.
+ *  Dismiss all sends the moment it loaded the count. The server records the
+ *  act in the audit trail and answers with the number of hits it read. */
+/** `expected` is the count the confirm step showed. The server marks nothing
+ *  and answers 409 `shadow_hits_changed` when it would mark more. */
+export function markAllShadowHitsRead(before: string, expected?: number): Promise<{ read: number }> {
+  const body = expected === undefined ? { before } : { before, expected };
+  return post<{ read: number }>('/hunts/shadow-hits/read-all', body).then((answer) => {
     publishShadowHitsChanged();
     emitNeedsYouChanged();
     return answer;

@@ -149,14 +149,14 @@ describe('F11 — selection survives the ES-id churn of a background poll', () =
       // row) — this is the selection an analyst makes before a new event lands.
       fireEvent.click(screen.getByTitle('Select all'));
       // Bulk bar is up.
-      expect(screen.getAllByRole('button', { name: 'Bulk Investigate' }).length).toBe(2);
+      expect(screen.getAllByRole('button', { name: /^Bulk Investigate/ }).length).toBe(2);
 
       // A poll lands with the fresh id.
       capturePoll(intervalSpy)();
       await waitFor(() => expect(getAlerts).toHaveBeenCalledTimes(2));
 
       // Fire the bulk-bar Bulk Investigate.
-      const buttons = screen.getAllByRole('button', { name: 'Bulk Investigate' });
+      const buttons = screen.getAllByRole('button', { name: /^Bulk Investigate/ });
       fireEvent.click(buttons[buttons.length - 1]);
 
       // The payload must be the CURRENT representative id (es-2). Pre-fix this

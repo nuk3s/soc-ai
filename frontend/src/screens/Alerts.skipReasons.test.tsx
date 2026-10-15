@@ -81,7 +81,7 @@ describe('auto-triage skip-reason labels', () => {
     vi.mocked(startAutoTriage).mockResolvedValue(finished({ already_triaged: 2, no_ip: 1 }));
     await sweep();
 
-    await screen.findByText('2 investigated · 3 skipped (2 already triaged, 1 no ip)');
+    await screen.findByText('Last 24 hours: 2 investigated · 3 skipped (2 already triaged, 1 no ip)');
     expect(screen.queryByText(/no source\/dest IP/)).toBeNull();
   });
 
@@ -89,7 +89,7 @@ describe('auto-triage skip-reason labels', () => {
     vi.mocked(startAutoTriage).mockResolvedValue(finished({ some_new_reason: 3 }));
     await sweep();
 
-    await screen.findByText('2 investigated · 3 skipped (3 some new reason)');
+    await screen.findByText('Last 24 hours: 2 investigated · 3 skipped (3 some new reason)');
   });
 
   // "not_found" carried a hand-written label whose text the humanizing fallback
@@ -99,7 +99,7 @@ describe('auto-triage skip-reason labels', () => {
     vi.mocked(startAutoTriage).mockResolvedValue(finished({ not_found: 3 }));
     await sweep();
 
-    await screen.findByText('2 investigated · 3 skipped (3 not found)');
+    await screen.findByText('Last 24 hours: 2 investigated · 3 skipped (3 not found)');
   });
 
   it('still spells out the reasons the planner does emit', async () => {
@@ -109,7 +109,7 @@ describe('auto-triage skip-reason labels', () => {
     await sweep();
 
     await screen.findByText(
-      '2 investigated · 4 skipped (2 already triaged, 1 in progress, 1 covered by a prior verdict)',
+      'Last 24 hours: 2 investigated · 4 skipped (2 already triaged, 1 in progress, 1 covered by a prior verdict)',
     );
   });
 });

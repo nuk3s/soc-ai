@@ -14,8 +14,8 @@ from collections.abc import Sequence
 from datetime import datetime, timedelta
 from typing import Any, NamedTuple
 
+from sqlalchemy import and_, case, func, not_, select
 from sqlalchemy import delete as sa_delete
-from sqlalchemy import func, select
 from sqlalchemy import update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 from ulid import ULID
@@ -481,6 +481,67 @@ async def list_recent(
         q = q.where(Hunt.created_at <= until)
     q = q.limit(limit)
     return list((await db.scalars(q)).all())
+
+
+class WindowTotals(NamedTuple):
+    """The counts of one hunt type over a window. The Hunts page header reads them."""
+
+    hunts: int = 0
+    findings: int = 0
+    threat_findings: int = 0
+    running: int = 0
+
+
+async def window_totals(
+    db: AsyncSession,
+    *,
+    since: datetime | None = None,
+    until: datetime | None = None,
+) -> dict[str, WindowTotals]:
+    """The counts of every hunt in a window, per stored ``kind``.
+
+    The window is the one :func:`list_recent` applies, inclusive on both ends,
+    and it has no row cap. The list route caps a page at 100 rows, so a header
+    that counted the page read "100 hunts" over a window of 140.
+
+    The finding counts come from the denormalized columns, so no report blob is
+    read for a stamped row. A row that holds a report and no stamped counts (a
+    demo fixture, or a row written outside :func:`finalize`) is counted from
+    its report, the way the list row counts it.
+    """
+    window: list[Any] = []
+    if since is not None:
+        window.append(Hunt.created_at >= since)
+    if until is not None:
+        window.append(Hunt.created_at <= until)
+    stamped = and_(Hunt.findings_count.is_not(None), Hunt.threat_findings_count.is_not(None))
+    rows = await db.execute(
+        select(
+            Hunt.kind,
+            func.count(Hunt.id),
+            func.sum(case((stamped, Hunt.findings_count), else_=0)),
+            func.sum(case((stamped, Hunt.threat_findings_count), else_=0)),
+            func.sum(case((Hunt.status == STATUS_RUNNING, 1), else_=0)),
+        )
+        .where(*window)
+        .group_by(Hunt.kind)
+    )
+    out: dict[str, WindowTotals] = {
+        str(kind): WindowTotals(int(n or 0), int(f or 0), int(t or 0), int(r or 0))
+        for kind, n, f, t, r in rows.all()
+    }
+    unstamped = await db.execute(
+        select(Hunt.kind, Hunt.report).where(*window, Hunt.report.is_not(None), not_(stamped))
+    )
+    for kind, report in unstamped.all():
+        findings = report.get("findings") if isinstance(report, dict) else None
+        counted = len(findings) if isinstance(findings, list) else 0
+        base = out.get(str(kind), WindowTotals())
+        out[str(kind)] = base._replace(
+            findings=base.findings + counted,
+            threat_findings=base.threat_findings + threat_finding_count(findings),
+        )
+    return out
 
 
 class HuntNotifRow(NamedTuple):

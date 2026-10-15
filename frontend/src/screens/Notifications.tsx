@@ -2,23 +2,29 @@ import { Bell, X } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { SyntheticEvalBadge } from '../components/Badges';
+import { DismissAllControl } from '../components/DismissAllControl';
 import { HuntOutcomeChip } from '../components/HuntOutcomeChip';
 import { ListToolbar } from '../components/ListToolbar';
 import { MultiSelect } from '../components/MultiSelect';
+import { NeedsYouBlock } from '../components/NeedsYouBlock';
 import { ErrorState, Freshness, LoadingState, StaleNotice } from '../components/States';
 import { getNotifications } from '../lib/api';
+import { useNeedsYouCount } from '../lib/needsYou';
 import {
   NOTIFICATIONS_CAP,
   NOTIFICATIONS_DISMISSED_EVENT,
   NOTIFICATION_KINDS,
   NO_NOTIFICATIONS,
   describeNotifications,
-  dismissMany,
   dismissNotification,
   formatNotificationTitle,
   formatNotificationWhen,
-  getDismissed,
+  getClearedAt,
+  hasMoreNotifications,
+  isNeedsYouRow,
+  nextNotificationLimit,
   notificationKind,
+  visibleNotifications,
   type NotificationKind,
 } from '../lib/notifications';
 import {
@@ -62,7 +68,14 @@ const TONE_TITLE: Record<Notification['tone'], string> = {
 const GROUP_TITLE: Partial<Record<NotificationKind, string>> = { hunting: GROUP_HUNTING };
 
 /**
- * Notifications — the same list toolbar its neighbours wear.
+ * Notifications: the Needs-you block, then the events under the same list
+ * toolbar its neighbours wear.
+ *
+ * The Needs-you block states every part of the count the bell badge shows,
+ * with its scope, as the bell panel does. The events are the rows the API
+ * returns with `events_only`: the leads and the shadow hits are in the block,
+ * so one unit never shows twice. "Show more" loads 20 more rows, and "Dismiss
+ * all" is the bell's own (lib/notifications.ts::dismissAll).
  *
  * The list round gave Alerts, Investigations, Hunts and Hosts one shared
  * toolbar and skipped this screen, which sits in the same nav group and is just
@@ -76,25 +89,33 @@ const GROUP_TITLE: Partial<Record<NotificationKind, string>> = { hunting: GROUP_
  *   • URGENCY, as the facet row's multi-select — the row dot's own axis.
  *
  * No search box: a notification title is a sentence this app generated from a
- * rule name or an objective, over a list the API caps at 12 rows, so a third
- * control would filter nothing the two chips cannot already reach.
+ * rule name or an objective, over a list the API cuts at 12 rows until "Show
+ * more" asks for more, so a third control would filter nothing the two chips
+ * cannot already reach.
  *
  * No saved views either, and that is a judgement rather than an omission. A
  * saved view is a durable name for a query worth re-running; this list is
- * derived fresh from live state on every poll, holds a rolling 24 hours, and is
- * capped at 12 rows. There is no query here to be worth naming — one chip and
- * one multi-select IS the whole filter state, and it resets every shift. The
+ * derived fresh from live state on every poll and holds a rolling 24 hours of
+ * runs. There is no query here to be worth naming. One chip and one
+ * multi-select IS the whole filter state, and it resets every shift. The
  * preset chips give the chip row its content, so the screen still opens with the
  * two-row toolbar its siblings do.
  */
 export function Notifications() {
-  const { data, loading, error, lastUpdated, failCount, refetch } = useAsync(getNotifications, [], {
-    refetchInterval: 15000,
-  });
-  // Bump to re-read localStorage after a dismissal. The dismissed set is
-  // re-read on every render (not snapshotted at mount) so this screen and the
-  // Topbar bell — which polls the same store — can never disagree about what
-  // is dismissed (the badge/panel mismatch from dogfood 2026-07-15).
+  // The rows the screen asks for. "Show more" adds 20, up to the API maximum.
+  const [limit, setLimit] = useState(NOTIFICATIONS_CAP);
+  // `after` is read at each call, so the poll sends the moment of the last
+  // Dismiss all, and hidden rows take no place in the limit.
+  const { data, loading, error, lastUpdated, failCount, refetch } = useAsync(
+    () => getNotifications({ limit, eventsOnly: true, after: getClearedAt() }),
+    [limit],
+    { refetchInterval: 15000 },
+  );
+  const needsYou = useNeedsYouCount();
+  // Bump to re-read localStorage after a dismissal. The hidden rows are read
+  // again on every render (not snapshotted at mount) so this screen and the
+  // Topbar bell, which reads the same store, can never disagree about what is
+  // hidden (the badge/panel mismatch from dogfood 2026-07-15).
   const [dismissTick, setDismissTick] = useState(0);
   void dismissTick;
   // A dismiss from another view (the Topbar bell) also fires this event; re-read
@@ -104,14 +125,16 @@ export function Notifications() {
     window.addEventListener(NOTIFICATIONS_DISMISSED_EVENT, bump);
     return () => window.removeEventListener(NOTIFICATIONS_DISMISSED_EVENT, bump);
   }, []);
-  const dismissed = getDismissed();
-
   const [kind, setKind] = useState<NotificationKind | 'all'>('all');
   const [urgency, setUrgency] = useState<string[]>([]);
 
-  // Every undismissed notification. The header count, "Clear all" and the bell
-  // badge all read THIS — a filter narrows what is shown, never what is active.
-  const items = (data ?? []).filter((n) => !dismissed.has(n.id));
+  // Every event the analyst has not hidden. The header count and "Dismiss all"
+  // read THIS: a filter narrows what is shown, never what is active. The leads
+  // and the shadow hits are in the Needs-you block, so an older server that
+  // sends them anyway does not show one unit twice.
+  const items = visibleNotifications(data ?? []).filter((n) => !isNeedsYouRow(n));
+  // A full answer can have more rows behind it.
+  const more = hasMoreNotifications(data?.length ?? 0, limit);
 
   const matchesUrgency = (n: Notification) => urgency.length === 0 || urgency.includes(n.tone);
 
@@ -129,7 +152,7 @@ export function Notifications() {
   // count just went to zero — which is itself the answer) and still drops a kind
   // this install never produces.
   //
-  // No memo on any of this, deliberately: the API caps the list at 12 rows, and
+  // No memo on any of this, deliberately: the list holds at most 200 rows, and
   // every input here is an array rebuilt on each render, so a useMemo would
   // recompute anyway while implying it does not.
   const byKind = new Map<NotificationKind, { ever: number; underUrgency: number }>();
@@ -154,18 +177,6 @@ export function Notifications() {
 
   const dismiss = (id: string) => {
     dismissNotification(id);
-    setDismissTick((t) => t + 1);
-  };
-
-  // "Clear all" steps over anything the server marked undismissible. One click
-  // that sweeps away a tamper finding is not a tamper alarm.
-  const clearable = items.filter((n) => n.dismissible !== false);
-  // Clear all asks once. A dismissal has no undo and no dismissed view, so one
-  // stray click emptied the list for good (D8).
-  const [confirmClear, setConfirmClear] = useState(false);
-  const clearAll = () => {
-    dismissMany(clearable.map((n) => n.id));
-    setConfirmClear(false);
     setDismissTick((t) => t + 1);
   };
 
@@ -257,42 +268,32 @@ export function Notifications() {
                 is the phantom-badge bug all over again. When a filter is on, say
                 how much of it is on screen instead of quietly restating it. */}
             {filtered && `${visible.length} of ${items.length} shown. `}
-            {/* Names only the row types on the list, and the cap when the API
-                hit it (D3). */}
-            {describeNotifications(items, (data?.length ?? 0) >= NOTIFICATIONS_CAP)}
+            {/* Names only the row types on the list, the loaded count, and
+                whether more exist (D3). */}
+            {describeNotifications(items, more)}
           </div>
         </div>
-        {clearable.length > 0 && !confirmClear && (
-          <button
-            onClick={() => setConfirmClear(true)}
-            title="Dismiss every active notification. The filter does not limit this action."
-            className="mt-1 flex-none rounded-control border border-border-strong bg-surface-3 px-3 py-1.5 text-[12px] font-semibold text-dim hover:border-accent hover:text-text"
-          >
-            Clear all
-          </button>
-        )}
-        {clearable.length > 0 && confirmClear && (
-          <div role="group" aria-label="Confirm clear all" className="mt-1 flex flex-none items-center gap-2">
-            <span className="text-[12px] text-dim">
-              Dismiss {clearable.length} notification{clearable.length === 1 ? '' : 's'}? You cannot undo this.
-            </span>
-            <button
-              onClick={clearAll}
-              autoFocus
-              className="rounded-control border border-danger bg-surface-3 px-3 py-1.5 text-[12px] font-semibold text-danger hover:bg-[rgba(240,68,56,.08)]"
-            >
-              Dismiss all
-            </button>
-            <button
-              onClick={() => setConfirmClear(false)}
-              className="rounded-control border border-border-strong px-3 py-1.5 text-[12px] font-semibold text-dim hover:border-accent hover:text-text"
-            >
-              Cancel
-            </button>
-          </div>
-        )}
+        {/* Dismiss all covers every event, whatever the filter shows, and
+            the unread shadow hits. It steps over a row the server marks
+            undismissible: one click that sweeps away a tamper finding is not
+            a tamper alarm. */}
+        <div className="flex max-w-[460px] flex-none flex-col items-end">
+          <DismissAllControl
+            rows={items}
+            more={more}
+            needsYou={needsYou}
+            loadedAt={lastUpdated}
+            onDone={refetch}
+          />
+        </div>
       </div>
       {failCount >= 2 && <StaleNotice since={lastUpdated} onRefresh={refetch} className="mb-3" />}
+
+      {/* Every part of the count the bell badge shows, with its scope. */}
+      <NeedsYouBlock
+        state={needsYou}
+        className="mb-4 rounded-card border border-border bg-surface-1 px-4 py-3"
+      />
 
       {/* The shared list toolbar, in its sibling placement: directly above the
           list, chip row over facet row, so the four screens in this nav group
@@ -354,6 +355,16 @@ export function Notifications() {
             ))
           : visible.map(row)}
       </div>
+      {/* The API cut the list at the limit. A full answer can have more
+          behind it, so the control loads 20 more rows. */}
+      {more && !error && (
+        <button
+          onClick={() => setLimit((l) => nextNotificationLimit(l))}
+          className="mt-3 rounded-control border border-border-strong px-3 py-1.5 text-[12px] font-semibold text-dim hover:border-accent hover:text-text"
+        >
+          Show more
+        </button>
+      )}
     </div>
   );
 }

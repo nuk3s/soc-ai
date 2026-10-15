@@ -856,3 +856,13 @@ export function machineRoleView(role: MachineRole | null | undefined): MachineRo
     title: 'The sweep has no role for this machine.',
   };
 }
+
+/** The days a sweep count covers, in words: "last 14 days". A sweep counts
+ *  the events of the `dossier_lookback_days` window, and the 24h and 7d
+ *  buttons of the host page do not change the count. An older server sends
+ *  no number, and the words then name the sweep window. */
+export function sweepWindowWords(days: number | null | undefined): string {
+  return typeof days === 'number' && days > 0
+    ? `last ${days} ${days === 1 ? 'day' : 'days'}`
+    : 'sweep window';
+}

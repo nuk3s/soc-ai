@@ -3,7 +3,7 @@
 // Pinned here — same style as api.dossier.test.ts — so a mistyped path segment
 // or a swapped verb reads as a failing test, not a 404 an analyst hits later.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { getHunts, promoteFinding } from './api';
+import { getHunts, getHuntTotals, promoteFinding, startAutoTriage } from './api';
 
 let fetchMock: ReturnType<typeof vi.fn>;
 
@@ -53,5 +53,37 @@ describe('getHunts kind param', () => {
   it('threads kind into the query string when given', async () => {
     await getHunts({ kind: 'triggered' });
     expect(url()).toBe('/api/v1/hunts?kind=triggered');
+  });
+});
+
+// The Hunts header reads the counts of the whole window from GET
+// /hunts/totals. It names the window the list reads and nothing else.
+describe('getHuntTotals', () => {
+  it('sends the window bounds of the list', async () => {
+    await getHuntTotals({ since: '2026-09-05T00:00:00Z', until: '2026-09-06T00:00:00Z' });
+    expect(url()).toBe(
+      '/api/v1/hunts/totals?since=2026-09-05T00%3A00%3A00Z&until=2026-09-06T00%3A00%3A00Z',
+    );
+  });
+
+  it('sends no query string with no bounds', async () => {
+    await getHuntTotals();
+    expect(url()).toBe('/api/v1/hunts/totals');
+  });
+});
+
+// The header sweep names its window to the server, so the request and the
+// words on the button come from one constant. A selection sends no range.
+describe('startAutoTriage range', () => {
+  const body = (): Record<string, unknown> => JSON.parse(String(init().body));
+
+  it('sends the range of a sweep', async () => {
+    await startAutoTriage({ minSeverity: 'high', range: '24h' });
+    expect(body()).toEqual({ severities: ['critical', 'high', 'unknown'], range: '24h' });
+  });
+
+  it('sends no range with a selection', async () => {
+    await startAutoTriage({ alertIds: ['es-1'], range: '24h' });
+    expect(body()).toEqual({ alert_ids: ['es-1'] });
   });
 });

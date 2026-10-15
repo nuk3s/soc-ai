@@ -51,6 +51,26 @@ const mount = () =>
     </MemoryRouter>,
   );
 
+const mountAt = (url: string) =>
+  render(
+    <MemoryRouter initialEntries={[url]}>
+      <ShellProvider>
+        <Alerts />
+      </ShellProvider>
+    </MemoryRouter>,
+  );
+
+const PLAIN_FP: AlertGroup = {
+  ...GROUP,
+  id: 'g2',
+  name: 'ET INFO Plain false positive',
+  invId: 'INV-FP2',
+  verdictCounts: { false_positive: 9 },
+  worstVerdict: null,
+  worstConf: null,
+  worstInvId: null,
+};
+
 const row = async () =>
   (await screen.findByText(GROUP.name)).closest('[data-group-key]') as HTMLElement;
 
@@ -122,5 +142,36 @@ describe('each event chip names its verdict', () => {
     // NEGATIVE CONTROL. An older server sends no verdict, and the chip keeps
     // its old words.
     expect(screen.getByText('inherited 4d ago')).toBeTruthy();
+  });
+});
+
+// The verdict filter and the verdict sort read the verdict the group counts
+// under, which the Dashboard breakdown also reads (prod 2026-10-13). The
+// "True positive" tile of the breakdown opens this list with
+// ?verdict=true_positive, and the list must hold the group the tile counted.
+describe('the verdict filter and sort read the worst verdict of a group', () => {
+  it('lists a group under the true positive among its false positives', async () => {
+    vi.mocked(getAlerts).mockResolvedValue(queueOf([PLAIN_FP, GROUP]));
+    mountAt('/alerts?range=24h&hide_acked=false&verdict=true_positive');
+    expect(await screen.findByText(GROUP.name)).toBeTruthy();
+    expect(screen.queryByText(PLAIN_FP.name)).toBeNull();
+  });
+
+  it('does not list that group under false positive', async () => {
+    // NEGATIVE CONTROL. Each group counts under one verdict only.
+    vi.mocked(getAlerts).mockResolvedValue(queueOf([PLAIN_FP, GROUP]));
+    mountAt('/alerts?range=24h&hide_acked=false&verdict=false_positive');
+    expect(await screen.findByText(PLAIN_FP.name)).toBeTruthy();
+    expect(screen.queryByText(GROUP.name)).toBeNull();
+  });
+
+  it('sorts that group with the true positives', async () => {
+    vi.mocked(getAlerts).mockResolvedValue(queueOf([PLAIN_FP, GROUP]));
+    mountAt('/alerts?range=24h&sort=verdict:desc');
+    const worst = await screen.findByText(GROUP.name);
+    const plain = screen.getByText(PLAIN_FP.name);
+    // The plain group comes first in the response, so only the sort can move
+    // the other group above it.
+    expect(worst.compareDocumentPosition(plain) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 });

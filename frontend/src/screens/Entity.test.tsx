@@ -88,13 +88,17 @@ describe('Entity hunting panels', () => {
     expect(screen.getByText('4769 for svc_sql from a workstation')).toBeTruthy();
   });
 
-  it('reads every lead and keeps the ones that name this entity', async () => {
+  it('asks the server for the leads that name this entity', async () => {
+    // The server filters before its row limit. The strip read the newest 50
+    // leads of the estate and kept the ones that named the entity, so an
+    // older lead never showed. tests/test_leads_host_window.py pins the
+    // negative control: the leads of another entity stay out.
+    vi.mocked(getLeads).mockResolvedValue([LEAD]);
     mount();
-    await waitFor(() => expect(getLeads).toHaveBeenCalledWith('all'));
+    await waitFor(() => expect(getLeads).toHaveBeenCalledWith('all', { entity: 'svc_sql' }));
     const strip = await screen.findByTestId('leads-strip');
     expect(within(strip).getByText(/Leads on this entity/)).toBeTruthy();
     expect(within(strip).getByTestId('lead-12')).toBeTruthy();
-    expect(within(strip).queryByTestId('lead-13')).toBeNull();
   });
 
   it('links each lead row to the lead', async () => {

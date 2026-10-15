@@ -9,6 +9,11 @@ follows [Semantic Versioning](https://semver.org/) from 1.0 onward.
 
 ## Highlights
 
+- **1.5.3**: The detection ladder release. Cheaper detection steps run before the model
+  investigation, and each run records its cost. The Hosts list shows one row per machine. A hunt
+  investigates its own findings. The runs inside the page window decide the verdict of an alert
+  group. The bell accounts for every unit of its badge. See the
+  [1.5.3 release notes](../releases/1.5.3.md).
 - **1.5.2**: The TLS release. A Caddy overlay terminates TLS in front of soc-ai and renews the
   certificate. On the direct path, soc-ai validates its certificate and shows it on the Config
   screen and in `soc-ai doctor`. It warns 30, 14 and 7 days before the certificate expires. `PROXY_TRUSTED_IPS`

@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/license-Apache%202.0-4b8bf5" alt="Apache 2.0">
   <img src="https://img.shields.io/badge/python-3.12-4b8bf5" alt="Python 3.12">
   <img src="https://img.shields.io/badge/Security%20Onion-3.0-3fb950" alt="Security Onion 3.0">
-  <img src="https://img.shields.io/badge/status-1.5.2-3fb950" alt="1.5.2">
+  <img src="https://img.shields.io/badge/status-1.5.3-3fb950" alt="1.5.3">
   <a href="https://soc-ai-demo.onrender.com/"><img src="https://img.shields.io/badge/live%20demo-online-3fb950" alt="Live demo"></a>
 </p>
 
@@ -59,7 +59,7 @@ The [docs site](https://nuk3s.github.io/soc-ai/) holds the same pages, with sear
 - Installation: [Quickstart](docs/quickstart.md) · [Security Onion setup](docs/SECURITY-ONION-SETUP.md) · [Docker deployment](docs/DOCKER.md) · [Bare-metal deployment](docs/DEPLOYMENT.md) · [Blocklists](docs/BLOCKLISTS.md) · [Sensor PCAP setup](docs/SENSOR_PCAP_SETUP.md)
 - Operation: [Console guide](docs/WEBUI_GUIDE.md) · [Hunting](docs/HUNTING.md) · [Agent tools](docs/AGENT_TOOLS.md) · [OQL primer](docs/OQL_PRIMER.md) · [OQL hunting examples](docs/OQL_HUNT_EXAMPLES.md) · [Test PCAPs](docs/TEST_PCAPS.md)
 - Design: [Architecture](docs/ARCHITECTURE.md) · [Safety model](docs/SAFETY_MODEL.md) · [Audit chain breaks](docs/AUDIT-CHAIN.md) · [Lesser models](docs/LESSER_MODELS.md)
-- Project: [Roadmap](docs/ROADMAP.md) · Release notes [1.5.2](docs/releases/1.5.2.md), [1.5.1](docs/releases/1.5.1.md) and [1.5.0](docs/releases/1.5.0.md) · [Changelog](CHANGELOG.md) · [Security policy](.github/SECURITY.md)
+- Project: [Roadmap](docs/ROADMAP.md) · Release notes [1.5.3](docs/releases/1.5.3.md), [1.5.2](docs/releases/1.5.2.md), [1.5.1](docs/releases/1.5.1.md) and [1.5.0](docs/releases/1.5.0.md) · [Changelog](CHANGELOG.md) · [Security policy](.github/SECURITY.md)
 - Blog: [soc-ai hunts on its own now](docs/blog/2026-10-soc-ai-hunts-on-its-own-now.md) · [Getting an LLM to show its work](docs/blog/2026-07-getting-an-llm-to-show-its-work.md)
 
 ## Roadmap

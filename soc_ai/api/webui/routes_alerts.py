@@ -6,8 +6,9 @@ import asyncio
 import logging
 import re
 from collections import Counter
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 from typing import Any, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from elastic_transport import TransportError
 from elasticsearch import ApiError
@@ -20,6 +21,7 @@ from soc_ai.api.webui._errors import api_error, oql_refusal
 from soc_ai.api.webui._shared import (
     _ago,
     _inv_ago,
+    _iso_utc,
     _kind,
     _sev,
     _verdict,
@@ -320,13 +322,26 @@ class AlertGroupOut(BaseModel):
     # older genuine verdict still stands. None when the newest run IS the standing
     # verdict (no failed retry) — surfaces the "stayed at Needs Info" mystery.
     lastAttempt: LastAttemptOut | None = None
+    # The ISO time of the run behind the standing verdict. The console states
+    # the age of an inherited verdict from it. None when the rule has no
+    # complete verdict.
+    verdictAt: str | None = None
     # How many alerts of this rule each verdict holds: the newest complete run
-    # of each alert, over the list window and the inheritance window. The row
-    # said "False positive" over a group whose events held a true positive
-    # (dogfood 2026-10-06, S5).
+    # of each alert, made inside the page window. The row said "False
+    # positive" over a group whose events held a true positive (dogfood
+    # 2026-10-06, S5).
     verdictCounts: dict[str, int] = {}
-    # The worst of those verdicts, when it is worse than the standing verdict,
-    # and the run that holds it. None when the standing verdict is the worst.
+    # The window verdict: the worst of those verdicts and the run that holds
+    # it. Runs made inside the page window decide the verdict of a group
+    # (owner rule, 2026-10-14). None when the group has no run in the window.
+    # The group then keeps its standing verdict, and the console marks it
+    # inherited.
+    windowVerdict: str | None = None
+    windowConf: float | None = None
+    windowInvId: str | None = None
+    # The window verdict again, only when it is worse than the standing
+    # verdict. Kept for an older console. Since 2026-10-14 it reads the runs
+    # of the page window only, the same as the window verdict.
     worstVerdict: str | None = None
     worstConf: float | None = None
     worstInvId: str | None = None
@@ -443,36 +458,67 @@ _RANGE_SPAN: dict[str, timedelta] = {
     "30d": timedelta(days=30),
 }
 
+# The longest custom window the grid query reads. The mix clamps the start
+# the same way, so it counts the runs of the window the grid answered for.
+_MAX_MIX_WINDOW = timedelta(days=366)
 
-def _mix_since(range_: str, from_: str | None, inherit_days: int) -> datetime:
-    """The start of the verdict mix: the earlier of the list window and the
-    inheritance window, as a naive UTC time.
 
-    An event in the window can carry the verdict of a run older than the
-    window, through inheritance, so the mix reaches back as far as that.
+def _naive_utc(value: str, zone_name: str) -> datetime | None:
+    """A custom bound as a naive UTC time, the form the store keeps.
+
+    A bound without an offset is a wall time in ``so_timezone``. The grid
+    query reads it in that zone, so the mix reads it the same way. None for a
+    value that is not ISO 8601. The grid query refuses such a value first.
     """
-    now = datetime.now(UTC).replace(tzinfo=None)
-    start = now - _RANGE_SPAN.get(range_, timedelta(hours=24))
-    if range_ == "custom" and from_:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
         try:
-            parsed = datetime.fromisoformat(from_.replace("Z", "+00:00"))
-            start = parsed.astimezone(UTC).replace(tzinfo=None) if parsed.tzinfo else parsed
-        except ValueError:
-            pass
-    return min(start, now - timedelta(days=inherit_days))
+            zone: tzinfo = ZoneInfo(zone_name)
+        except (ZoneInfoNotFoundError, ValueError):
+            zone = UTC
+        parsed = parsed.replace(tzinfo=zone)
+    return parsed.astimezone(UTC).replace(tzinfo=None)
+
+
+def _mix_window(
+    range_: str, from_: str | None, to: str | None, zone_name: str
+) -> tuple[datetime, datetime | None]:
+    """The page window for the verdict mix, as naive UTC times.
+
+    Runs made inside the page window decide the verdict of a group (owner
+    rule, 2026-10-14). A custom window gives both bounds. The bounds alone
+    make the window custom, the same as for the grid query: the console sent
+    them without ``range=custom``, and the mix read the default 24 hours. A
+    preset window starts its span before now and has no upper bound, because
+    no run is newer than now.
+    """
+    if from_ and to:
+        start, end = _naive_utc(from_, zone_name), _naive_utc(to, zone_name)
+        if start is not None and end is not None:
+            return max(start, end - _MAX_MIX_WINDOW), end
+    now = datetime.now(UTC).replace(tzinfo=None)
+    return now - _RANGE_SPAN.get(range_, timedelta(hours=24)), None
 
 
 async def _verdict_mix(
-    db: Any, rule_names: list[str], since: datetime
+    db: Any, rule_names: list[str], since: datetime, until: datetime | None = None
 ) -> tuple[dict[str, dict[str, int]], dict[str, Investigation]]:
     """Per rule: the verdict counts over its alerts, and the worst run.
 
-    One alert counts once, with the verdict of its newest complete run. A
-    pipeline fallback and a hunt-subject run decide nothing about an alert, so
-    they are left out, as the verdict filter of the list leaves them out.
+    Only runs made in ``[since, until]`` count. One alert counts once, with
+    the verdict of its newest complete run in that window. A pipeline
+    fallback and a hunt-subject run decide nothing about an alert, so they
+    are left out, as the verdict filter of the list leaves them out. A
+    backtest replay is a measurement, and the standing verdict skips it too.
     """
     if not rule_names:
         return {}, {}
+    bounds = [Investigation.created_at >= since]
+    if until is not None:
+        bounds.append(Investigation.created_at <= until)
     ranked = (
         select(
             Investigation.id.label("id"),
@@ -491,9 +537,10 @@ async def _verdict_mix(
             Investigation.status == "complete",
             Investigation.verdict.is_not(None),
             Investigation.is_fallback.isnot(True),
-            Investigation.created_at >= since,
+            *bounds,
             Investigation.alert_es_id != "",
             inv_svc.not_hunt_subject(),
+            inv_svc.not_backtest(),
         )
         .subquery()
     )
@@ -527,11 +574,18 @@ async def _verdict_mix(
 
 
 def _worse_than(
-    worst_run: Investigation | None, standing: str, *, fallback: bool
+    worst_run: Investigation | None, standing: str
 ) -> tuple[str | None, float | None, str | None]:
     """(verdict, confidence, run id) of the worst run, when it is worse than
-    the standing verdict. A fallback standing verdict keeps its own chip."""
-    if worst_run is None or fallback:
+    the standing verdict.
+
+    A fallback standing verdict keeps its own chip, and a worse run still
+    shows beside it. The stored needs_more_info of a fallback ranks below a
+    true positive only, so a true positive is the one verdict that shows. A
+    later pipeline error must not hide a true positive from the row or from
+    the Dashboard breakdown, which counts the group under this verdict.
+    """
+    if worst_run is None:
         return None, None, None
     worst = _verdict(worst_run.verdict)
     if _VERDICT_RANK.get(worst, 0) <= _VERDICT_RANK.get(standing, 0):
@@ -611,9 +665,7 @@ async def list_alerts(  # noqa: PLR0915 - one linear join of the grid rows and t
             assignments = await assign_svc.assignments_for_rules(db, rule_names)
             muted_rules = await override_svc.muted_rule_names(db)
             mix, worst_runs = await _verdict_mix(
-                db,
-                rule_names,
-                _mix_since(range_, from_, settings.webui_inherit_window_days),
+                db, rule_names, *_mix_window(range_, from_, to, settings.so_timezone)
             )
         # The id of the in-flight run per rule, so a "Triaging…" row links straight
         # to its live investigation (a running row has no completed verdict, so its
@@ -657,9 +709,8 @@ async def list_alerts(  # noqa: PLR0915 - one linear join of the grid rows and t
             reason = _inherited_reason(_inv)
         elif inv_id and g.count > 1:
             reason = f"Verdict from 1 of {g.count} events investigated"
-        worst_verdict, worst_conf, worst_inv = _worse_than(
-            worst_runs.get(g.rule_name), verdict, fallback=is_fallback
-        )
+        window_run = worst_runs.get(g.rule_name)
+        worst_verdict, worst_conf, worst_inv = _worse_than(window_run, verdict)
         out.append(
             AlertGroupOut(
                 id=g.latest_id or g.rule_name,
@@ -695,7 +746,11 @@ async def list_alerts(  # noqa: PLR0915 - one linear join of the grid rows and t
                 muted=is_muted,
                 fallback=is_fallback,
                 lastAttempt=last_attempt,
+                verdictAt=_iso_utc(getattr(_inv, "created_at", None)) or None,
                 verdictCounts=mix.get(g.rule_name, {}),
+                windowVerdict=_verdict(window_run.verdict) if window_run is not None else None,
+                windowConf=window_run.confidence if window_run is not None else None,
+                windowInvId=window_run.id if window_run is not None else None,
                 worstVerdict=worst_verdict,
                 worstConf=worst_conf,
                 worstInvId=worst_inv,

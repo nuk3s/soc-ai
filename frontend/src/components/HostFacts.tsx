@@ -37,6 +37,7 @@ import {
   ROLE_VOCABULARY,
   unresolvedPhrase,
   roleLabel,
+  sweepWindowWords,
 } from '../lib/hostDossier';
 import { absTime } from '../lib/timeRange';
 import type { Dossier, DossierField, DossierFieldName } from '../lib/types';
@@ -225,8 +226,20 @@ export function DeclareEditor({
 // ---- payload rows -----------------------------------------------------------
 
 /** A structured payload as readable rows. The drawer printed
- *  `[{"port":389,…}]` and `{"hour_of_day":…}` verbatim. */
-function PayloadRows({ field, payload }: { field: DossierFieldName; payload: unknown }) {
+ *  `[{"port":389,…}]` and `{"hour_of_day":…}` verbatim.
+ *
+ *  `windowDays` is the sweep window. The connection counts cover it, and the
+ *  24h and 7d buttons of the host page do not change them, so the rows say
+ *  which days they cover. */
+function PayloadRows({
+  field,
+  payload,
+  windowDays,
+}: {
+  field: DossierFieldName;
+  payload: unknown;
+  windowDays?: number | null;
+}) {
   if (field === 'activity_profile') {
     const view = activityProfileView(payload);
     if (view) {
@@ -243,8 +256,17 @@ function PayloadRows({ field, payload }: { field: DossierFieldName; payload: unk
   }
   const entries = Array.isArray(payload) ? payload : portsView(payload)?.ports ?? null;
   if (entries) {
+    const counted = entries.some(
+      (entry) =>
+        !!entry && typeof entry === 'object' && typeof (entry as Record<string, unknown>).count === 'number',
+    );
     return (
       <ul data-testid="why-payload" className="ml-1 flex flex-col gap-0.5 text-[12px] text-dim">
+        {counted && (
+          <li data-testid="why-payload-window" className="text-faint">
+            The connection counts cover the {sweepWindowWords(windowDays)}.
+          </li>
+        )}
         {entries.map((entry, i) => {
           const rec = entry && typeof entry === 'object' ? (entry as Record<string, unknown>) : null;
           const count = rec && typeof rec.count === 'number' ? rec.count : null;
@@ -429,11 +451,13 @@ function WhyDrawer({
   canDeclare,
   busy,
   onRemove,
+  windowDays,
 }: {
   f: DossierField;
   canDeclare: boolean;
   busy: boolean;
   onRemove: () => void;
+  windowDays?: number | null;
 }) {
   const sources = Object.entries(f.evidence ?? {});
   if (sources.length === 0 && !f.overridden) return null;
@@ -522,7 +546,7 @@ function WhyDrawer({
         {/* The structured payload, as rows. Raw JSON is no answer to "says
             who?" (F8, and the 2026-10-01 dogfood). */}
         {isJsonField(f.field) && f.value_json != null && (
-          <PayloadRows field={f.field} payload={f.value_json} />
+          <PayloadRows field={f.field} payload={f.value_json} windowDays={windowDays} />
         )}
 
         {/* The way OUT of a declaration, labelled with its consequence. The old
@@ -558,6 +582,9 @@ export interface FactRowProps {
   variant?: 'row' | 'strip';
   /** Passed to the declare editor's role datalist; see DeclareEditorProps. */
   roleVocabulary?: readonly string[];
+  /** The days of events each sweep counts. The Why drawer states it beside
+   *  the connection counts. */
+  windowDays?: number | null;
 }
 
 export function FactRow({
@@ -568,6 +595,7 @@ export function FactRow({
   onApplied,
   variant = 'row',
   roleVocabulary,
+  windowDays,
 }: FactRowProps) {
   const { busy, err, setErr, run } = useDossierWrite(onApplied);
   const [editing, setEditing] = useState(false);
@@ -636,6 +664,7 @@ export function FactRow({
         canDeclare={canDeclare}
         busy={busy}
         onRemove={() => run(() => clearDossierOverride(ip, f.field))}
+        windowDays={windowDays}
       />
 
       {editing && (
@@ -857,6 +886,7 @@ export function HostFacts({
                 highlight={focusField === f.field}
                 onApplied={onApplied}
                 roleVocabulary={roleVocabulary}
+                windowDays={dossier.lookback_days}
               />
             ))}
           </>

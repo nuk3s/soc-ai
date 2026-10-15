@@ -4,11 +4,16 @@
 // (`inv:<id>` / `approval:<token>`), so a dismissed item stays dismissed and new
 // ones still surface.
 
+import { emitNeedsYouChanged, markAllShadowHitsRead, type NeedsYouCount } from './api';
 import { OUTCOME_LABELS, TONE, humanize, outcomeMeta } from './labels';
 import { VERDICT } from './tokens';
-import type { Verdict } from './types';
+import type { Notification, Verdict } from './types';
 
 const KEY = 'soc-ai:dismissed-notifications';
+
+/** The moment of the last Dismiss all, as ISO-8601. Every dismissible row at or
+ *  before it is hidden, the rows the list never loaded too. */
+const CLEARED_AT_KEY = 'soc-ai:notifications-cleared-at';
 
 /** Broadcast when the dismissed set changes so cross-component listeners (the
  * Topbar bell, the Notifications pane) can re-read immediately instead of
@@ -102,8 +107,188 @@ export const NOTIFICATION_KINDS: ReadonlyArray<{ id: NotificationKind; label: st
  *  said "No notifications." and "No active notifications." (D8). */
 export const NO_NOTIFICATIONS = 'No active notifications.';
 
-/** The most rows GET /notifications returns (routes_meta.list_notifications). */
+/** The rows that are part of the needs-you count: the leads and the unread
+ *  shadow hits. Every other row is an event. The bell panel and the
+ *  Notifications screen show the count in a Needs-you block and ask the API
+ *  for the events only, so these rows arrive only from an older server. Both
+ *  surfaces leave them out, so one unit never shows twice. */
+const NEEDS_YOU_ROWS = new Set(['lead', 'lead-more', 'shadow-hit']);
+
+export function isNeedsYouRow(n: { id: string }): boolean {
+  return NEEDS_YOU_ROWS.has(n.id.split(':', 1)[0]);
+}
+
+/** The rows GET /notifications returns when the console names no limit
+ *  (routes_meta.NOTIF_DEFAULT_LIMIT). The bell and the screen open on it. */
 export const NOTIFICATIONS_CAP = 12;
+
+/** How many rows "Show more" adds. */
+export const NOTIFICATIONS_STEP = 20;
+
+/** The most rows GET /notifications returns (routes_meta.NOTIF_MAX_LIMIT). */
+export const NOTIFICATIONS_MAX = 200;
+
+/** The limit after one "Show more". */
+export function nextNotificationLimit(limit: number): number {
+  return Math.min(limit + NOTIFICATIONS_STEP, NOTIFICATIONS_MAX);
+}
+
+/** Whether more rows can exist past the ones loaded. The API cuts the list at
+ *  the limit, so a full answer can have more behind it and a short one cannot. */
+export function hasMoreNotifications(received: number, limit: number): boolean {
+  return received >= limit && limit < NOTIFICATIONS_MAX;
+}
+
+// ── Dismiss all ────────────────────────────────────────────────────────────
+
+/** The moment of the last Dismiss all, or null when there was none. */
+export function getClearedAt(): string | null {
+  try {
+    const raw = localStorage.getItem(CLEARED_AT_KEY);
+    return raw && !Number.isNaN(Date.parse(raw)) ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
+type Hideable = { id: string; dismissible?: boolean; at?: string | null };
+
+/**
+ * Whether the console hides a row.
+ *
+ * A row dismissed by its id is hidden. A dismissible row whose moment is at or
+ * before the last Dismiss all is hidden too, so a row the list never loaded is
+ * covered. A row the server marks undismissible is never hidden by the moment:
+ * that is the tamper finding, and no local click may hide it.
+ */
+export function isHiddenNotification(
+  n: Hideable,
+  dismissed: ReadonlySet<string>,
+  clearedAt: string | null,
+): boolean {
+  if (dismissed.has(n.id)) return true;
+  if (n.dismissible === false || !n.at || !clearedAt) return false;
+  const at = Date.parse(n.at);
+  return !Number.isNaN(at) && at <= Date.parse(clearedAt);
+}
+
+/** The rows the console shows: every row the analyst has not hidden. */
+export function visibleNotifications<T extends Hideable>(rows: ReadonlyArray<T>): T[] {
+  const dismissed = getDismissed();
+  const clearedAt = getClearedAt();
+  return rows.filter((n) => !isHiddenNotification(n, dismissed, clearedAt));
+}
+
+/** The parts of the needs-you count that are decisions. Dismiss all leaves them. */
+export type DecisionPart = 'leads_needing_decision' | 'untriaged_groups' | 'needs_more_info' | 'pending_actions';
+
+const DECISION_PARTS: ReadonlyArray<[DecisionPart, string]> = [
+  ['leads_needing_decision', 'leads'],
+  ['untriaged_groups', 'alert groups with no verdict'],
+  ['needs_more_info', 'verdicts that need more info'],
+  ['pending_actions', 'recommended actions'],
+];
+
+/** The decisions that stay after a Dismiss all: the parts above zero, or every
+ *  part when the count could not be read. */
+export function decisionsThatStay(data: NeedsYouCount | null): DecisionPart[] {
+  return DECISION_PARTS.map(([key]) => key).filter((key) => {
+    if (!data) return true;
+    const value = data[key];
+    return value === null || value > 0;
+  });
+}
+
+function joinWords(words: string[]): string {
+  if (words.length <= 1) return words.join('');
+  return `${words.slice(0, -1).join(', ')} and ${words[words.length - 1]}`;
+}
+
+/**
+ * The confirm sentence of Dismiss all. It states what is hidden, what is
+ * marked read on the server and what stays.
+ *
+ * `events` is the dismissible event rows on the list, `more` says the list was
+ * cut, `shadowHits` is the unread count (null when it could not be read),
+ * `stay` the decisions that stay and `fixed` the rows nobody can dismiss.
+ */
+export function dismissAllPrompt(p: {
+  events: number;
+  more: boolean;
+  shadowHits: number | null;
+  stay: ReadonlyArray<DecisionPart>;
+  fixed: number;
+}): string {
+  const acts: string[] = [];
+  if (p.events > 0) {
+    const noun = p.events === 1 ? 'event' : 'events';
+    acts.push(p.more ? `hide ${p.events} ${noun} and every older event` : `hide ${p.events} ${noun}`);
+  }
+  if (p.shadowHits === null) acts.push('mark every unread shadow hit read');
+  else if (p.shadowHits > 0) {
+    acts.push(`mark ${p.shadowHits} shadow hit${p.shadowHits === 1 ? '' : 's'} read`);
+  }
+  const ask = acts.length > 0 ? `${acts.join(' and ')}?` : 'nothing to dismiss.';
+  const sentences = [ask.charAt(0).toUpperCase() + ask.slice(1)];
+  const stay = DECISION_PARTS.filter(([key]) => p.stay.includes(key)).map(([, words]) => words);
+  if (stay.length > 0) {
+    const list = joinWords(stay);
+    sentences.push(`${list.charAt(0).toUpperCase()}${list.slice(1)} stay.`);
+  }
+  if (p.fixed > 0) {
+    sentences.push(
+      p.fixed === 1 ? '1 notice you cannot dismiss stays.' : `${p.fixed} notices you cannot dismiss stay.`,
+    );
+  }
+  return sentences.join(' ');
+}
+
+/**
+ * Dismiss all: one helper for the bell panel and the Notifications screen.
+ *
+ * 1. Store `loadedAt` as the moment of the last Dismiss all. Every dismissible
+ *    row at or before it is hidden, the rows the list never loaded too. The
+ *    moment never moves back.
+ * 2. Dismiss the loaded dismissible rows by id as well, so a server clock
+ *    ahead of this one cannot keep a row the analyst saw.
+ * 3. Mark every unread shadow hit born at or before the moment read on the
+ *    server, which writes an audit record. A hit born later was not in the
+ *    count the analyst saw, so it stays unread. No call is made when the
+ *    count says no hit is unread.
+ * 4. Tell every surface that counts what needs the analyst to read it again.
+ *
+ * Leads, alert groups, runs that need more info and recommended actions are
+ * decisions. Nothing here touches them.
+ *
+ * Resolves with the number of hits the server read, or null when no call was
+ * made. Rejects when the server call fails. The rows stay hidden then.
+ */
+export async function dismissAll(p: {
+  rows: ReadonlyArray<Notification>;
+  loadedAt: number;
+  shadowHits: number | null;
+}): Promise<number | null> {
+  const before = new Date(p.loadedAt).toISOString();
+  const previous = getClearedAt();
+  if (!previous || Date.parse(previous) < p.loadedAt) {
+    try {
+      localStorage.setItem(CLEARED_AT_KEY, before);
+    } catch {
+      // Writes can be blocked. The per-id dismissal below still holds for the
+      // rows on screen.
+    }
+  }
+  const ids = p.rows.filter((n) => n.dismissible !== false).map((n) => n.id);
+  if (ids.length > 0) dismissMany(ids);
+  else if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent(NOTIFICATIONS_DISMISSED_EVENT));
+  try {
+    if (p.shadowHits === 0) return null;
+    const answer = await markAllShadowHitsRead(before, p.shadowHits ?? undefined);
+    return answer.read;
+  } finally {
+    emitNeedsYouChanged();
+  }
+}
 
 /**
  * The source of a notification, off the id prefix the API mints.
@@ -164,16 +349,20 @@ const SYSTEM_NOUN: [string, string] = ['system notice', 'system notices'];
  * The header line of the Notifications screen.
  *
  * It names only the row types that are present, in list order, with a count
- * each. When the API answered with a full list, the last type is the one the
- * cap cut, so it reads "the N newest". The header said "shadow hits, leads,
- * hunts and investigations from the last 24 h" whatever the list held, over
- * 10 completed investigations out of 65 (D3).
+ * each. The header said "shadow hits, leads, hunts and investigations from the
+ * last 24 h" whatever the list held, over 10 completed investigations out of
+ * 65 (D3).
+ *
+ * `more` is true when the API answered with a full list, so more rows can
+ * exist. The header then says the count is what was loaded, and that "Show
+ * more" loads the rest. It said "the 10 newest" over a list cut at 12 rows,
+ * and nothing could load the rest (production 2026-10-14).
  *
  * Only finished runs have a window. A lead stays on the list until somebody
  * decides it, whenever it formed, so the window is said once, after the list,
  * and only when the list holds a finished run.
  */
-export function describeNotifications(rows: ReadonlyArray<{ id: string }>, capped: boolean): string {
+export function describeNotifications(rows: ReadonlyArray<{ id: string }>, more: boolean): string {
   if (rows.length === 0) return '0 items.';
   const order: string[] = [];
   const counts = new Map<string, number>();
@@ -183,18 +372,17 @@ export function describeNotifications(rows: ReadonlyArray<{ id: string }>, cappe
     if (!counts.has(key)) order.push(key);
     counts.set(key, (counts.get(key) ?? 0) + 1);
   }
-  const parts = order.map((key, i) => {
+  const parts = order.map((key) => {
     const n = counts.get(key)!;
     const [one, many] = ROW_NOUN[key] ?? SYSTEM_NOUN;
-    const noun = n === 1 ? one : many;
-    if (!(capped && i === order.length - 1)) return `${n} ${noun}`;
-    return n === 1 ? `the newest ${noun}` : `the ${n} newest ${noun}`;
+    return `${n} ${n === 1 ? one : many}`;
   });
-  const list =
-    parts.length === 1 ? parts[0] : `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}`;
+  const list = joinWords(parts);
   const finished = rows.some((r) => FINISHED_RUNS.has(r.id.split(':', 1)[0]));
   const window = finished ? ' Finished runs cover the last 24 h.' : '';
-  return `${rows.length} item${rows.length === 1 ? '' : 's'}: ${list}.${window}`;
+  const count = `${rows.length} item${rows.length === 1 ? '' : 's'}`;
+  if (!more) return `${count}: ${list}.${window}`;
+  return `${count} loaded: ${list}. More items exist. Select Show more to load them.${window}`;
 }
 
 /** The rows that report a finished run. Only these have a 24 h window. */

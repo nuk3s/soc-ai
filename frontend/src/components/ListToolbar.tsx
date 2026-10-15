@@ -31,7 +31,7 @@ import { cn } from '../lib/cn';
 export interface ToolbarPreset {
   id: string;
   label: string;
-  count?: number;
+  count?: number | string;
   active: boolean;
   /** One sentence that states what the chip filters to. */
   title?: string;
@@ -118,7 +118,7 @@ function Chip({
   deleteLabel,
 }: {
   label: string;
-  count?: number;
+  count?: number | string;
   active: boolean;
   onClick: () => void;
   icon?: ReactNode;

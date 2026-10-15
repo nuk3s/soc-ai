@@ -1,16 +1,20 @@
-// A lead on the host name belongs on the address's page. The page keyed by IP
-// listed leads 3 to 6 and missed lead 14, which named the machine by host
-// name (dogfood 2026-10-01, RO1).
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+// One machine under two keys: the address and the host name. The strip read
+// the newest 50 leads of the estate and kept the ones that named the host on
+// the client, so a host lead older than the newest 50 never showed. The
+// server now reads every key of the machine and filters before its row limit.
+// tests/test_leads_host_window.py pins the join and its negative controls: a
+// user named like the host and another host's leads stay out.
 vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
   getLeads: vi.fn(),
+  getLeadCount: vi.fn(),
 }));
 
-import { getLeads, type Lead } from '../lib/api';
+import { getLeadCount, getLeads, type Lead } from '../lib/api';
 import { LeadsStrip } from './LeadsStrip';
 
 const iso = new Date(Date.now() - 3_600_000).toISOString();
@@ -31,36 +35,33 @@ const lead = (id: number, entities: [string, string][]): Lead => ({
 });
 
 beforeEach(() => {
+  // What the server answers for the address: the lead on the address and
+  // the lead stored under the host name.
   vi.mocked(getLeads)
     .mockReset()
-    .mockResolvedValue([
-      lead(3, [['host', '192.0.2.10']]),
-      lead(14, [['host', 'DC01']]),
-      lead(15, [['user', 'dc01']]),
-      lead(16, [['host', 'dc02']]),
-    ]);
+    .mockResolvedValue([lead(3, [['host', '192.0.2.10']]), lead(14, [['host', 'DC01']])]);
+  vi.mocked(getLeadCount).mockReset().mockResolvedValue({ status: 'all', entity: '192.0.2.10', total: 2 });
 });
 
-describe('LeadsStrip — one machine under two keys', () => {
-  it('lists the leads on the address and on the host name, in any case', async () => {
+describe('LeadsStrip: one machine under two keys', () => {
+  it('asks the server for the leads of the entity', async () => {
     render(
       <MemoryRouter>
-        <LeadsStrip entityKey="192.0.2.10" aliases={['dc01.example.test', 'dc01']} status="all" />
+        <LeadsStrip entityKey="192.0.2.10" status="all" />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(getLeads).toHaveBeenCalledWith('all', { entity: '192.0.2.10' }));
+    expect(getLeadCount).toHaveBeenCalledWith('all', { entity: '192.0.2.10' });
+  });
+
+  it('lists the leads on the address and on the host name', async () => {
+    render(
+      <MemoryRouter>
+        <LeadsStrip entityKey="192.0.2.10" status="all" />
       </MemoryRouter>,
     );
     expect(await screen.findByTestId('lead-3')).toBeTruthy();
+    // The server joined the host name. The strip does not drop it again.
     expect(screen.getByTestId('lead-14')).toBeTruthy();
-  });
-
-  it('never joins a user account or another host through an alias', async () => {
-    // Negative control: a user named like the host, and a different host.
-    render(
-      <MemoryRouter>
-        <LeadsStrip entityKey="192.0.2.10" aliases={['dc01']} status="all" />
-      </MemoryRouter>,
-    );
-    await screen.findByTestId('lead-3');
-    expect(screen.queryByTestId('lead-15')).toBeNull();
-    expect(screen.queryByTestId('lead-16')).toBeNull();
   });
 });

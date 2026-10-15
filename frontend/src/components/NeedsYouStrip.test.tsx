@@ -40,7 +40,7 @@ describe('NeedsYouStrip', () => {
 
   it('sets the hit filter and the lead tab from the links', async () => {
     mount();
-    const hits = await screen.findByText('2 shadow hits are unread');
+    const hits = await screen.findByRole('link', { name: 'Read the last 7 days' });
     expect(hits.getAttribute('href')).toBe('/hunts?hits=unread#analytic-hits');
     const leads = screen.getByText('2 leads wait on a decision');
     expect(leads.getAttribute('href')).toBe('/hunts?leads=needs_decision#leads');
@@ -48,8 +48,34 @@ describe('NeedsYouStrip', () => {
 
   it('keeps the parameters the address already carries', async () => {
     mount('/hunts?range=7d');
-    const hits = await screen.findByText('2 shadow hits are unread');
+    const hits = await screen.findByRole('link', { name: 'Read the last 7 days' });
     expect(hits.getAttribute('href')).toBe('/hunts?range=7d&hits=unread#analytic-hits');
+  });
+
+  // The strip does not read the page window. The owner rule: a part of a page
+  // that the time filter does not filter says so in visible words. The count
+  // holds every unread hit and every open lead, and the hits block the link
+  // opens lists the last 7 days.
+  it('states the scope of each line, and the window the hit link opens', async () => {
+    mount();
+    expect((await screen.findByTestId('needs-you-hits')).textContent).toBe(
+      '2 shadow hits are unread · all unread · Read the last 7 days',
+    );
+    expect(screen.getByTestId('needs-you-leads').textContent).toBe(
+      '2 leads wait on a decision · all open',
+    );
+  });
+
+  it('names the scope when nothing waits', async () => {
+    vi.mocked(getNeedsYou).mockResolvedValue({
+      unread_shadow_hits: 0,
+      leads_needing_decision: 0,
+      total: 0,
+    });
+    mount();
+    expect((await screen.findByTestId('needs-you-scope')).textContent).toBe(
+      'The count covers all unread shadow hits and all open leads.',
+    );
   });
 
   it('counts one hit and one lead in the singular', async () => {

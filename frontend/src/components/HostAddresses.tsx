@@ -19,6 +19,7 @@ import {
   newerStamp,
   partitionFields,
   provenancePhrase,
+  sweepWindowWords,
   valueText,
 } from '../lib/hostDossier';
 import { plural } from '../lib/plural';
@@ -207,9 +208,19 @@ export interface HostAddressesProps {
   focusAddress: string | null;
   /** The field the URL names (`?field=`), highlighted in the focused facts. */
   focusField: string | null;
+  /** The days of events each sweep counts. The Events columns say it in
+   *  their header, because the 24h and 7d buttons do not change them. */
+  windowDays?: number | null;
 }
 
-export function HostAddresses({ machine, focusAddress, focusField, lastActivity }: HostAddressesProps) {
+export function HostAddresses({
+  machine,
+  focusAddress,
+  focusField,
+  lastActivity,
+  windowDays,
+}: HostAddressesProps) {
+  const eventsHeader = `Events, ${sweepWindowWords(windowDays)}`;
   // Primary first, then the newest. The primary row takes the live stamp the
   // header reads (dogfood 2026-10-06, S4: "last seen 2m" over a row of "4d").
   const addresses = machine.addresses
@@ -274,7 +285,7 @@ export function HostAddresses({ machine, focusAddress, focusField, lastActivity 
                 Last seen
               </th>
               <th scope="col" className="px-2.5 py-2 text-right font-semibold">
-                Events
+                {eventsHeader}
               </th>
               <th scope="col" className="px-[15px] py-2 text-right font-semibold">
                 <span className="sr-only">Facts</span>
@@ -316,7 +327,7 @@ export function HostAddresses({ machine, focusAddress, focusField, lastActivity 
                     Last seen
                   </th>
                   <th scope="col" className="px-[15px] py-1.5 text-right font-semibold">
-                    Events
+                    {eventsHeader}
                   </th>
                 </tr>
               </thead>

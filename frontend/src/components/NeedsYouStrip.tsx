@@ -64,6 +64,9 @@ export function NeedsYouStrip() {
           <span className="text-[11.5px] text-dim">
             No unread shadow hit. No lead waits on a decision.
           </span>
+          <span data-testid="needs-you-scope" className="text-[11.5px] text-faint">
+            The count covers all unread shadow hits and all open leads.
+          </span>
         </>
       ) : (
         <>
@@ -74,26 +77,36 @@ export function NeedsYouStrip() {
           >
             {data.total}
           </span>
+          {/* The strip does not read the page window, so each line states
+              its scope in visible words. The hit count holds every unread
+              hit, and the hits block lists the last 7 days, so the link
+              names the 7 days it opens. */}
           {data.unread_shadow_hits > 0 && (
-            <Link
-              to={to('hits', 'unread', HITS_ANCHOR)}
-              className="text-[12.5px] text-accent hover:underline"
-            >
-              {plural(data.unread_shadow_hits, 'shadow hit')}{' '}
-              {data.unread_shadow_hits === 1 ? 'is' : 'are'} unread
-            </Link>
+            <span data-testid="needs-you-hits" className="text-[12.5px]">
+              <span className="text-text-2">
+                {plural(data.unread_shadow_hits, 'shadow hit')}{' '}
+                {data.unread_shadow_hits === 1 ? 'is' : 'are'} unread
+              </span>
+              <span className="text-faint"> · all unread · </span>
+              <Link to={to('hits', 'unread', HITS_ANCHOR)} className="text-accent hover:underline">
+                Read the last 7 days
+              </Link>
+            </span>
           )}
           {data.unread_shadow_hits > 0 && data.leads_needing_decision > 0 && (
             <span className="text-faint">·</span>
           )}
           {data.leads_needing_decision > 0 && (
-            <Link
-              to={to('leads', 'needs_decision', LEADS_ANCHOR)}
-              className="text-[12.5px] text-accent hover:underline"
-            >
-              {plural(data.leads_needing_decision, 'lead')}{' '}
-              {data.leads_needing_decision === 1 ? 'waits' : 'wait'} on a decision
-            </Link>
+            <span data-testid="needs-you-leads" className="text-[12.5px]">
+              <Link
+                to={to('leads', 'needs_decision', LEADS_ANCHOR)}
+                className="text-accent hover:underline"
+              >
+                {plural(data.leads_needing_decision, 'lead')}{' '}
+                {data.leads_needing_decision === 1 ? 'waits' : 'wait'} on a decision
+              </Link>
+              <span className="text-faint"> · all open</span>
+            </span>
           )}
           <span className="text-[11.5px] text-faint">Each link jumps to the block below.</span>
         </>

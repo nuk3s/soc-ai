@@ -269,6 +269,10 @@ class DetectionTuningSummaryOut(BaseModel):
     # counts. It said "29 mute suggestions" over a Review list of 39 rules, with
     # nothing to say how the two relate (dogfood 2026-10-01, D10).
     nominated: int = 0
+    # The window of the alert volume behind the nominations, in range words.
+    # The verdict trend reads every completed investigation. The nudge states
+    # both scopes, because the Dashboard window covers neither.
+    volume_window: str = "7d"
 
 
 @router.get(
@@ -288,7 +292,11 @@ async def get_detection_tuning_summary(
     pending = sum(
         1 for n in nominations if n.get("recommendation") == "mute" and not n.get("already_muted")
     )
-    return DetectionTuningSummaryOut(pending=pending, nominated=len(nominations))
+    from soc_ai.webui import detection_tuning as dt  # noqa: PLC0415 - lazy
+
+    return DetectionTuningSummaryOut(
+        pending=pending, nominated=len(nominations), volume_window=dt.VOLUME_RANGE
+    )
 
 
 @router.post(

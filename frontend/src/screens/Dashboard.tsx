@@ -36,6 +36,7 @@ import {
   refreshPreflight,
   startQualityEval,
 } from '../lib/api';
+import { outcomeOf } from '../lib/alertFilters';
 import { PIPELINE_ERRORS_URL, livePipelineErrors } from '../lib/investigationFilters';
 import { statusDetail, statusMeta } from '../lib/labels';
 import { formatSkipReasons } from '../lib/skipReasons';
@@ -153,6 +154,16 @@ function recentScope(shown: number, total: number | undefined): string {
   return `of the ${n} newest`;
 }
 
+/** How many rows the recent list reads. It shows seven, after it drops the
+ *  cancelled and interrupted runs. */
+const RECENT_READ_LIMIT = 50;
+
+/** The Investigations list on the window of the recent list. A custom window
+ *  has no preset to name, so the list opens on its own window. */
+function recentDestination(range: string): string {
+  return range === 'custom' ? '/investigations' : `/investigations?range=${range}`;
+}
+
 /** The Investigations list the true-positive tile counts: the same window and
  *  the verdict filter. A custom window has no preset to name, so the list
  *  opens on its own window with the filter. */
@@ -175,6 +186,8 @@ interface Metrics {
   verdict: Record<Verdict, number>;
   sev: Record<Severity, number>;
   triaging: number;
+  /** Groups counted under a verdict from a run before the window. */
+  inherited: number;
 }
 
 function computeMetrics(groups: AlertGroup[]): Metrics {
@@ -195,24 +208,32 @@ function computeMetrics(groups: AlertGroup[]): Metrics {
   };
   let events = 0;
   let triaging = 0;
+  let inherited = 0;
   for (const g of groups) {
     events += g.count || 0;
     sev[g.sev] = (sev[g.sev] ?? 0) + 1;
+    // The worst verdict among the runs of the group inside the window. A newer
+    // false positive, a run in flight or a pipeline fallback must not hide a
+    // true positive (prod 2026-10-13). A group with no run in the window keeps
+    // its older verdict, and the panel states how many groups do (owner rule,
+    // 2026-10-14).
+    const o = outcomeOf(g);
+    const outcome = o.verdict;
+    if (g.triaging) triaging += 1;
     // A group with a live investigation is "in flight", not "awaiting triage".
     // It still reads verdict=untriaged in the DB until the run lands, so counting
     // it as untriaged is what inflated "Awaiting triage" above the running count.
-    if (g.triaging) {
-      triaging += 1;
-      continue;
-    }
+    // A group in flight that already holds a verdict keeps counting under it.
+    if (g.triaging && outcome === 'untriaged') continue;
     // A pipeline fallback (E1.2) reads verdict=needs_more_info in the DB but the
     // pipeline never reasoned to it (model truncation / gateway 5xx). Excluding
     // it from the NMI bucket keeps the "need more info" KPI honest — those are
     // infra failures to retry, counted separately as "pipeline errors" below.
-    if (g.fallback) continue;
-    verdict[g.verdict] = (verdict[g.verdict] ?? 0) + 1;
+    if (outcome === null) continue;
+    verdict[outcome] = (verdict[outcome] ?? 0) + 1;
+    if (o.inherited) inherited += 1;
   }
-  return { events, groups: groups.length, verdict, sev, triaging };
+  return { events, groups: groups.length, verdict, sev, triaging, inherited };
 }
 
 // ---- small building blocks -------------------------------------------------
@@ -287,7 +308,24 @@ interface NeedsYouLine {
   /** What to say when the server could not read the part. */
   unknown: string;
   to: string;
-  window?: string;
+  /** The scope of the count, in visible words: "all open", "last 7 days". */
+  scope: string;
+}
+
+/** "7d" as "last 7 days": the scope words of a part that has a window. */
+function lastWords(range: string): string {
+  return `last ${windowWords(range)}`;
+}
+
+/**
+ * The scope of the whole count, for the tile with no line to carry it. The
+ * total mixes four scopes, so "Nothing needs you" must say over what.
+ */
+function needsYouScopeSentence(alertWindow: string, verdictWindow: string): string {
+  return (
+    'The count covers all open leads, all unread shadow hits, alert groups of the ' +
+    `${lastWords(alertWindow)}, and verdicts and actions of the ${lastWords(verdictWindow)}.`
+  );
 }
 
 /**
@@ -301,6 +339,11 @@ interface NeedsYouLine {
  * "Nothing needs you" is said only when every part was read and every part is
  * zero. A failed read is "?", and a part the server could not read keeps its
  * line with the reason.
+ *
+ * The tile does not read the page window. Each line states its own scope in
+ * visible words, and the total says it is the sum of those lines. The owner
+ * rule: a part of a page that the page window does not filter says so on
+ * screen, and a tooltip is not enough (2026-10-14).
  */
 function NeedsYouTile({ state, incomplete = false }: { state: NeedsYouState; incomplete?: boolean }) {
   const { data, failed } = state;
@@ -316,6 +359,7 @@ function NeedsYouTile({ state, incomplete = false }: { state: NeedsYouState; inc
           many: 'leads wait on a decision',
           unknown: 'Could not count the leads.',
           to: links.leads,
+          scope: 'all open',
         },
         {
           key: 'hits',
@@ -324,6 +368,7 @@ function NeedsYouTile({ state, incomplete = false }: { state: NeedsYouState; inc
           many: 'shadow hits are unread',
           unknown: 'Could not count the shadow hits.',
           to: links.shadowHits,
+          scope: 'all unread',
         },
         {
           key: 'alerts',
@@ -332,7 +377,7 @@ function NeedsYouTile({ state, incomplete = false }: { state: NeedsYouState; inc
           many: 'alert groups have no verdict',
           unknown: 'Could not count the alert groups. The grid did not answer.',
           to: links.untriaged,
-          window: data.alert_window,
+          scope: lastWords(data.alert_window),
         },
         {
           key: 'nmi',
@@ -341,7 +386,7 @@ function NeedsYouTile({ state, incomplete = false }: { state: NeedsYouState; inc
           many: 'verdicts need more info',
           unknown: 'Could not count the verdicts that need more info.',
           to: links.needsMoreInfo,
-          window: data.verdict_window,
+          scope: lastWords(data.verdict_window),
         },
         {
           key: 'actions',
@@ -350,7 +395,7 @@ function NeedsYouTile({ state, incomplete = false }: { state: NeedsYouState; inc
           many: 'recommended actions wait for you',
           unknown: 'Could not count the recommended actions.',
           to: links.pendingActions,
-          window: data.verdict_window,
+          scope: lastWords(data.verdict_window),
         },
       ].filter((line) => line.count === null || line.count > 0)
     : [];
@@ -372,11 +417,27 @@ function NeedsYouTile({ state, incomplete = false }: { state: NeedsYouState; inc
         >
           {value}
         </div>
+        {/* The total mixes the scopes of the lines, so it says so in words.
+            The tooltip alone left "15" reading as a count of the page window. */}
+        {/* A line with no count states no scope. When no line holds a
+            count, the caption names every scope itself. */}
+        {data && lines.length > 0 && (
+          <div data-testid="needs-you-total-scope" className="mt-1 text-[11px] leading-[1.4] text-faint">
+            {lines.some((line) => line.count !== null)
+              ? 'The sum of the lines below. Each line states its scope.'
+              : needsYouScopeSentence(data.alert_window, data.verdict_window)}
+          </div>
+        )}
         <div className="mt-1.5 text-[11.5px] leading-[1.5] text-dim">
           {!data ? (
             failed ? 'Could not read what needs you.' : <LoadingInline>Reading what needs you</LoadingInline>
           ) : lines.length === 0 ? (
-            'Nothing needs you.'
+            <>
+              Nothing needs you.
+              <div data-testid="needs-you-total-scope" className="mt-1 text-[11px] leading-[1.4] text-faint">
+                {needsYouScopeSentence(data.alert_window, data.verdict_window)}
+              </div>
+            </>
           ) : (
             <ul className="flex flex-col gap-0.5">
               {lines.map((line) => (
@@ -389,9 +450,7 @@ function NeedsYouTile({ state, incomplete = false }: { state: NeedsYouState; inc
                       {line.key === 'alerts' && data.alert_floor ? ' or more' : ''}
                     </Link>
                   )}
-                  {line.window && line.count !== null && (
-                    <span className="text-faint"> · last {windowWords(line.window)}</span>
-                  )}
+                  {line.count !== null && <span className="text-faint"> · {line.scope}</span>}
                 </li>
               ))}
             </ul>
@@ -414,10 +473,13 @@ function NeedsYouTile({ state, incomplete = false }: { state: NeedsYouState; inc
 function VerdictBreakdown({
   verdict,
   total,
+  inherited,
   onSelect,
 }: {
   verdict: Record<Verdict, number>;
   total: number;
+  /** Groups with no run in the window, counted under an older verdict. */
+  inherited: number;
   onSelect: (v: Verdict) => void;
 }) {
   return (
@@ -458,6 +520,19 @@ function VerdictBreakdown({
           </button>
         ))}
       </div>
+      {/* Runs inside the window decide each count. A group with no run in
+          the window counts under an older verdict, and this line says how
+          many groups do (owner rule, 2026-10-14). */}
+      {inherited > 0 && (
+        <div
+          data-testid="outcome-inherited"
+          title="These groups have no investigation run in this window. Each one counts under the verdict of its newest earlier run."
+          className="mt-2.5 text-[11.5px] leading-[1.4] text-dim"
+        >
+          {inherited.toLocaleString()} of {total.toLocaleString()} {total === 1 ? 'group' : 'groups'}: verdict inherited
+          from a run before this window.
+        </div>
+      )}
     </div>
   );
 }
@@ -904,8 +979,9 @@ export function Dashboard() {
   };
   const invsActiveRef = useRef(false);
   const invsTick = useRef(0);
-  // The recent sample for the overview list, on the live 10s poll. The
-  // pipeline-error KPI used to ride this same fetch (a second, 500-row page
+  // The newest 100 runs with no window, on the live 10s poll. The running
+  // tile counts them and states that scope. The pipeline-error KPI used to
+  // ride this same fetch (a second, 500-row page
   // every tick), but that number changes only a few times a day, so it now
   // polls on its own slow cadence below.
   const fetchDashboardInvestigations = async (): Promise<{
@@ -920,6 +996,27 @@ export function Dashboard() {
     refetchInterval: 10_000,
     pauseWhen: idleThrottle(invsActiveRef, invsTick, 3), // ~30s when idle
   });
+  // The recent list reads the page window. It listed the newest of the read
+  // above, which has no window, so a 15 minute Dashboard showed runs from two
+  // days back. The running tile keeps that read: it counts what runs now, and
+  // it states its own scope. The key tags each answer with its window, so a
+  // window change shows a loading line and not the rows of the old window.
+  const recentTick = useRef(0);
+  const recentWindowKey = [range, custom?.from ?? '', custom?.to ?? ''].join('|');
+  const recentRead = useAsync(
+    async () => {
+      const page = await listInvestigations({
+        ...rangeToSinceUntil(range, custom),
+        limit: RECENT_READ_LIMIT,
+      });
+      return { rows: page.rows, key: recentWindowKey };
+    },
+    [range, custom?.from, custom?.to],
+    {
+      refetchInterval: 10_000,
+      pauseWhen: idleThrottle(invsActiveRef, recentTick, 3), // ~30s when idle
+    },
+  );
   // Pipeline-error KPI, split onto its OWN 300s poll (like the tuning/dossier
   // nudges below): the count changes a few times a day, so refetching up to 500
   // rows on the 10s overview cadence was ~100 KB transferred-and-discarded every
@@ -1146,14 +1243,23 @@ export function Dashboard() {
   const m = useMemo(() => computeMetrics(groups), [groups]);
   // Recent = real triage activity. Cancelled/interrupted runs are noise (a stop
   // press or a restart cut them off, no verdict) — keep them off the overview.
+  const recentRows = useMemo(() => recentRead.data?.rows ?? [], [recentRead.data]);
   const recent = useMemo(
     () =>
-      [...rows]
+      [...recentRows]
         .filter((r) => r.status !== 'cancelled' && r.status !== 'interrupted')
         .sort((a, b) => (b.ts ?? '').localeCompare(a.ts ?? ''))
         .slice(0, 7),
-    [rows],
+    [recentRows],
   );
+  const recentSwitching =
+    recentRead.loading && !!recentRead.data && recentRead.data.key !== recentWindowKey;
+  // An empty list names the window. The first-run sentence stays for a store
+  // with no investigation at all, which the unwindowed read can tell.
+  const noRecentSentence =
+    invs.data && invs.data.total === 0
+      ? 'No investigations yet. Investigate an alert to start one.'
+      : `No investigations in the ${range === 'custom' ? 'custom range' : lastWords(range)}.`;
   const running = rows.filter((r) => r.status === 'running').length;
   // Pipeline errors: runs that produced no usable verdict. Two shapes. One is the
   // E1.2 fallback (a needs_more_info the pipeline never reasoned to, excluded from
@@ -1414,7 +1520,14 @@ export function Dashboard() {
           key="kpi-running"
           label="Investigations running"
           value={i(running)}
-          sub={triage.data?.active ? 'Auto-Investigate active' : recentScope(rows.length, invs.data?.total)}
+          // The scope stays on screen while a sweep runs. The sweep line
+          // used to replace it, and the count then named no scope.
+          sub={
+            <>
+              <div>{recentScope(rows.length, invs.data?.total)}</div>
+              {triage.data?.active && <div>Auto-Investigate active</div>}
+            </>
+          }
           color="#2dd4bf"
           icon={<Crosshair size={16} />}
           title={COUNT_RUNNING}
@@ -1428,7 +1541,7 @@ export function Dashboard() {
           // address can be read, copied and opened in a tab.
           <div key="kpi-shadow-hits" data-testid="kpi-shadow-hits">
             <StatCard
-              label="Shadow hits · unread"
+              label="Shadow hits · all unread"
               value={
                 shadowHitsFailed ? (
                   '?'
@@ -1440,10 +1553,12 @@ export function Dashboard() {
                 shadowHitsFailed ? (
                   'Could not read the shadow hits.'
                 ) : (
+                  // The count holds every unread hit. The hits block on Hunts
+                  // lists the last 7 days, so the link says what it opens.
                   <>
                     from analytics in shadow.{' '}
                     <Link to="/hunts?hits=unread" className="text-accent hover:underline">
-                      Read them on Hunts
+                      Read the last 7 days on Hunts
                     </Link>
                     .
                   </>
@@ -1476,6 +1591,7 @@ export function Dashboard() {
                 <VerdictBreakdown
                   verdict={m.verdict}
                   total={m.groups}
+                  inherited={m.inherited}
                   onSelect={(v) => navigate(verdictDestination(v, range, custom))}
                 />
                 <SeverityBreakdown
@@ -1493,7 +1609,7 @@ export function Dashboard() {
               title="Recent investigations"
               right={
                 <Link
-                  to="/investigations?range=30d"
+                  to={recentDestination(range)}
                   className="flex items-center gap-1 text-[12px] font-semibold text-accent hover:underline"
                 >
                   View all
@@ -1501,14 +1617,14 @@ export function Dashboard() {
                 </Link>
               }
             />
-            {invs.loading && !invs.data ? (
-              <LoadingState />
-            ) : invs.error ? (
+            {(recentRead.loading && !recentRead.data) || recentSwitching ? (
+              <LoadingState label={recentSwitching ? `Loading the ${rangeLabel} window` : undefined} />
+            ) : recentRead.error ? (
               <div className="p-3.5">
-                <ErrorState error={invs.error} />
+                <ErrorState error={recentRead.error} />
               </div>
             ) : recent.length === 0 ? (
-              <EmptyState>No investigations yet. Investigate an alert to start one.</EmptyState>
+              <EmptyState>{noRecentSentence}</EmptyState>
             ) : (
               <div>
                 {recent.map((r) => {
@@ -1698,6 +1814,13 @@ export function Dashboard() {
                     {tuningNudgeLine(tuning.data!)}
                   </span>
                   . Noisy rules with zero true positives consume investigations.
+                  {/* The nudge does not read the page window. Its alert
+                      counts come from a fixed window and its verdicts from
+                      every investigation, and the words say so. */}
+                  <div data-testid="tuning-nudge-scope" className="mt-0.5 text-[11.5px] text-faint">
+                    Alert counts cover the {lastWords(tuning.data!.volume_window ?? '7d')}. Verdict
+                    counts cover all investigations.
+                  </div>
                 </div>
                 <button
                   onClick={() => navigate('/config#detection-tuning')}

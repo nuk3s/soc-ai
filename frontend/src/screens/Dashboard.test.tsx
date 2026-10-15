@@ -144,14 +144,15 @@ describe('Dashboard recent investigations', () => {
     expect(row.querySelector('button')).toBeNull();
   });
 
-  it('links View all to the investigations list', async () => {
+  // The list reads the page window, so View all opens the same window.
+  it('links View all to the investigations list on the page window', async () => {
     render(
       <MemoryRouter>
         <Dashboard />
       </MemoryRouter>,
     );
     const link = await screen.findByRole('link', { name: /View all/ });
-    expect(link.getAttribute('href')).toBe('/investigations?range=30d');
+    expect(link.getAttribute('href')).toBe('/investigations?range=24h');
   });
 
   // Every chip and count carries a sentence. The type chip on a row carried the
@@ -292,9 +293,9 @@ describe('Dashboard shadow-hit KPI', () => {
       </MemoryRouter>,
     );
     const tile = await screen.findByTestId('kpi-shadow-hits');
-    expect(within(tile).getByText('Shadow hits · unread')).toBeTruthy();
+    expect(within(tile).getByText('Shadow hits · all unread')).toBeTruthy();
     expect(within(tile).getByText('2')).toBeTruthy();
-    expect(within(tile).getByText(/Read them on Hunts/)).toBeTruthy();
+    expect(within(tile).getByText(/Read the last 7 days on Hunts/)).toBeTruthy();
   });
 
   // The whole card was a button that navigated. The click is on the words that
@@ -308,7 +309,7 @@ describe('Dashboard shadow-hit KPI', () => {
     );
     const tile = await screen.findByTestId('kpi-shadow-hits');
     expect(tile.tagName).toBe('DIV');
-    expect(within(tile).getByRole('link', { name: /Read them on Hunts/ }).getAttribute('href')).toBe(
+    expect(within(tile).getByRole('link', { name: /Read the last 7 days on Hunts/ }).getAttribute('href')).toBe(
       '/hunts?hits=unread',
     );
     expect(within(tile).getByText('2').getAttribute('title')).toBe(COUNT_UNREAD_SHADOW_HITS);

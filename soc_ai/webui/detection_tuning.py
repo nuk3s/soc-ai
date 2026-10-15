@@ -47,9 +47,15 @@ __all__ = [
     "MIN_TRIAGED",
     "MUTE_MIN_ALERTS",
     "OVERRIDE_FP_SIGNAL",
+    "VOLUME_RANGE",
     "assess",
     "nominate",
 ]
+
+# The window of the alert volume, in the range words of the alerts feed. The
+# verdict trend has no window: it reads every completed investigation. The
+# Dashboard nudge states both scopes, and it reads this one from the summary.
+VOLUME_RANGE = "7d"
 
 
 async def nominate(state: Any) -> list[dict[str, Any]]:
@@ -77,7 +83,7 @@ async def nominate(state: Any) -> list[dict[str, Any]]:
         await aq.fetch_groups(
             elastic,
             settings,
-            time_range="7d",
+            time_range=VOLUME_RANGE,
             sort="count",
         )
     ).groups

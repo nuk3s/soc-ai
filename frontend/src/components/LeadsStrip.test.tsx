@@ -695,7 +695,7 @@ describe('LeadsStrip user entities', () => {
     );
     // The address of a host page describes the host, so the strip there does
     // not read the leads parameter of another screen.
-    await waitFor(() => expect(getLeads).toHaveBeenCalledWith('all'));
+    await waitFor(() => expect(getLeads).toHaveBeenCalledWith('all', { entity: 'svc_sql' }));
   });
 });
 

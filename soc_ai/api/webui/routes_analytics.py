@@ -15,12 +15,12 @@ from __future__ import annotations
 import logging
 import re
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import yaml
 from fastapi import Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, case, func, or_, select
+from sqlalchemy import and_, case, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from soc_ai.api.deps import get_elastic, get_settings_dep
@@ -43,6 +43,9 @@ from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.store import analytics as analytics_store
 from soc_ai.store import host_machines
 from soc_ai.store.models import EntityObservation, HuntSpecSweep, PriorSpecRun
+
+if TYPE_CHECKING:
+    from sqlalchemy.engine import CursorResult
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -951,6 +954,97 @@ async def mark_shadow_hit_read(request: Request, obs_id: int) -> dict[str, bool]
             row.read_at = datetime.now(UTC).replace(tzinfo=None)
             await db.commit()
     return {"ok": True}
+
+
+# The session id of the audit record a bulk read writes. The record names no
+# investigation, so it gets a fixed id the audit search can find.
+_READ_ALL_SESSION = "shadow-hits"
+
+
+class ShadowHitsReadAllIn(BaseModel):
+    # An ISO-8601 moment. A string, so a bad value gets a hint that names the
+    # form, and a number is not taken as seconds since 1970.
+    before: str
+    # How many unread hits the analyst was shown in the confirm step. When
+    # set, the route marks nothing and answers 409 if the write would mark
+    # more. A sweep stamps ``born_at`` before it commits, so a hit born before
+    # the mark can land after the count was read.
+    expected: int | None = Field(default=None, ge=0)
+
+
+class ShadowHitsReadAllOut(BaseModel):
+    read: int
+
+
+def _read_all_mark(raw: str) -> datetime:
+    """The moment of a bulk read, as the naive UTC the store holds."""
+    try:
+        mark = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except ValueError:
+        mark = None
+    if mark is None:
+        raise api_error(
+            422,
+            "bad_before",
+            "Send 'before' as an ISO-8601 time, such as 2026-10-14T09:30:00Z. "
+            "The console sends the time it loaded the count.",
+        )
+    if mark.tzinfo is not None:
+        mark = mark.astimezone(UTC).replace(tzinfo=None)
+    return mark
+
+
+@router.post("/hunts/shadow-hits/read-all", response_model=ShadowHitsReadAllOut)
+async def mark_all_shadow_hits_read(
+    request: Request, body: ShadowHitsReadAllIn
+) -> ShadowHitsReadAllOut:
+    """Mark every unread shadow hit born up to ``before`` as read, in one write.
+
+    "Dismiss all" in the bell sends the moment it loaded the count. A hit born
+    after that moment was not in the count the analyst saw, so it stays
+    unread. The rows are the ones :func:`unread_shadow_hits_where` names, the
+    rows the needs-you count holds, so a hit of a retired analytic is not
+    touched.
+
+    The read is committed first. The audit record follows, and a failed audit
+    write does not undo the read, the rule the dossier writes follow.
+    """
+    mark = _read_all_mark(body.before)
+    now = datetime.now(UTC).replace(tzinfo=None)
+    async with request.app.state.db_sessionmaker() as db:
+        cat = await effective_catalog(db)
+        result = await db.execute(
+            update(EntityObservation)
+            .where(*unread_shadow_hits_where(cat), EntityObservation.born_at <= mark)
+            .values(read_at=now)
+            .execution_options(synchronize_session=False)
+        )
+        # cast: AsyncSession.execute is typed Result, but an UPDATE returns a
+        # CursorResult, whose rowcount is the number of rows changed.
+        read = int(cast("CursorResult[Any]", result).rowcount or 0)
+        if body.expected is not None and read > body.expected:
+            # More hits than the confirm step named. The write and the check
+            # are one transaction, so the rollback leaves every hit unread.
+            await db.rollback()
+            raise api_error(
+                409,
+                "shadow_hits_changed",
+                f"{read - body.expected} new shadow hits arrived after the count. "
+                "Open the list again and confirm the new count.",
+            )
+        await db.commit()
+    try:
+        audit = getattr(request.app.state, "audit", None)
+        if audit is not None:
+            await audit.log_kind(
+                _READ_ALL_SESSION,
+                "shadow_hits_read",
+                {"read": read, "before": mark.replace(tzinfo=UTC).isoformat()},
+                user=await identify_caller(request),
+            )
+    except Exception:
+        _LOGGER.warning("shadow-hit read-all audit write failed (continuing)", exc_info=True)
+    return ShadowHitsReadAllOut(read=read)
 
 
 # ---------------------------------------------------------------------------

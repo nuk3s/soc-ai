@@ -929,6 +929,56 @@ async def hunt_stats(request: Request) -> list[HuntStatOut]:
     ]
 
 
+class HuntKindTotalsOut(BaseModel):
+    """The counts of the hunts of one type in a window."""
+
+    hunts: int = 0
+    findings: int = 0
+    threat_findings: int = 0
+    # Hunts with the status ``running``: the "In progress" count of the page.
+    running: int = 0
+
+
+class HuntTotalsOut(HuntKindTotalsOut):
+    """The counts of every hunt in a window, and the counts per type.
+
+    ``by_kind`` is keyed by the stored kind (chat, scheduled, triggered, lead),
+    the ids the type chips of the Hunts page use. A type with no hunt in the
+    window is absent.
+    """
+
+    by_kind: dict[str, HuntKindTotalsOut] = Field(default_factory=dict)
+
+
+@router.get("/hunts/totals", response_model=HuntTotalsOut)
+async def hunt_totals(
+    request: Request,
+    since: datetime | None = None,
+    until: datetime | None = None,
+) -> HuntTotalsOut:
+    """The counts of the whole window that ``GET /hunts`` pages through.
+
+    The list route caps a page at 100 rows, and the Hunts page header counted
+    that page. A window of 140 hunts read "100 hunts". This route takes the
+    same ``since`` and ``until`` and counts every hunt in the window, with no
+    cap, so the header, the section badge and the type chip state the window.
+    The list route keeps its shape: it is a JSON array, and a field added to
+    it would break every reader of that array.
+    """
+    async with request.app.state.db_sessionmaker() as db:
+        per_kind = await hunt_svc.window_totals(
+            db, since=_naive_utc(since), until=_naive_utc(until)
+        )
+    by_kind = {kind: HuntKindTotalsOut(**t._asdict()) for kind, t in sorted(per_kind.items())}
+    return HuntTotalsOut(
+        hunts=sum(t.hunts for t in per_kind.values()),
+        findings=sum(t.findings for t in per_kind.values()),
+        threat_findings=sum(t.threat_findings for t in per_kind.values()),
+        running=sum(t.running for t in per_kind.values()),
+        by_kind=by_kind,
+    )
+
+
 # ── E3.4: hunt diffing ("what changed since the last run of this objective") ──
 #
 # Finding identity is a FUZZY match on (normalized title + hosts set): a finding
@@ -3000,7 +3050,7 @@ def _iso(dt: Any) -> str | None:
 
 
 # Every value GET /leads takes for ``status``: the stored values, ``all`` and
-# the four tab aliases. Anything else used to fall through to a WHERE on a
+# the five aliases. Anything else used to fall through to a WHERE on a
 # status no row holds and answer [], which reads as "no leads".
 _LEAD_STATUS_FILTERS = (
     "open",
@@ -3012,53 +3062,175 @@ _LEAD_STATUS_FILTERS = (
     "closed",
     "needs_decision",
     "in_progress",
+    "open_or_hunting",
 )
 
 
-@router.get("/leads", response_model=list[LeadOut])
-async def list_leads(request: Request, status: str = "open", limit: int = 50) -> list[LeadOut]:
-    """Leads, newest first, each with the observations that formed it.
-
-    ``status`` takes a stored value (``open``, ``hunting``, ``dismissed``,
-    ``promoted``), ``all``, or one of four aliases the tabs read:
-
-    - ``new``: the same rows as ``open``.
-    - ``closed``: dismissed or promoted.
-    - ``needs_decision``: a hunt that finished, or a lead no loop will hunt.
-    - ``in_progress``: hunting with a hunt that runs or is queued.
-
-    The last two name what the analyst must do, so the tab and the Needs-you
-    strip read the same rule. The rule itself lives in the lead store, and it
-    reads the ``lead_auto_hunt`` setting: with the loop on, a new lead waits
-    on soc-ai rather than on the analyst.
-    """
-    from soc_ai.store import leads as leads_store  # noqa: PLC0415 - lazy
-    from soc_ai.store.models import EntityObservation, Lead  # noqa: PLC0415 - lazy
-
+def _check_lead_status(status: str) -> None:
     if status not in _LEAD_STATUS_FILTERS:
         raise api_error(
             422,
             "bad_filter",
             f"status accepts one of these values: {', '.join(_LEAD_STATUS_FILTERS)}.",
         )
+
+
+def _check_lead_entity(entity: str | None) -> str | None:
+    """The entity filter, stripped. None when the caller sent none.
+
+    A blank value is refused. It used to be possible for a page with no key
+    yet to send one, and a blank filter that matched every lead would list
+    the whole estate on one host page.
+    """
+    if entity is None:
+        return None
+    entity = entity.strip()
+    if not entity:
+        raise api_error(
+            422,
+            "entity_required",
+            "Name the entity in the 'entity' parameter, or leave the parameter out.",
+        )
+    return entity
+
+
+def _where_lead_status(stmt: Any, status: str, *, auto_hunt: bool) -> Any:
+    """The status rule of GET /leads, on any select over the lead table.
+
+    The list and the count both read it, so the heading count and the rows
+    under it come from one rule.
+    """
+    from soc_ai.store import leads as leads_store  # noqa: PLC0415 - lazy
+    from soc_ai.store.models import Lead  # noqa: PLC0415 - lazy
+
+    if status == "closed":
+        return stmt.where(Lead.status.in_(("dismissed", "promoted")))
+    if status == "new":
+        return stmt.where(Lead.status == "open")
+    if status == "open_or_hunting":
+        return stmt.where(Lead.status.in_(("open", "hunting")))
+    if status == "needs_decision":
+        return stmt.outerjoin(Hunt, Hunt.id == Lead.hunt_id).where(
+            leads_store.needs_decision_clause(auto_hunt=auto_hunt)
+        )
+    if status == "in_progress":
+        return stmt.outerjoin(Hunt, Hunt.id == Lead.hunt_id).where(leads_store.in_progress_clause())
+    if status != "all":
+        return stmt.where(Lead.status == status)
+    return stmt
+
+
+def _lead_names(entities: Any, key: str, host_keys: set[str]) -> bool:
+    """Whether a lead's entities name this entity.
+
+    The key as asked matches any entity type. Every key of the entity's
+    machine joins a host entity only, in any case: a user account named like
+    a host is a different thing. The observations route reads the same rule.
+    """
+    for entry in entities or []:
+        if isinstance(entry, list | tuple) and len(entry) >= 2:
+            kind, value = str(entry[0] or ""), str(entry[1] or "")
+        elif isinstance(entry, dict):
+            kind, value = str(entry.get("kind") or ""), str(entry.get("key") or "")
+        else:
+            continue
+        if value == key or (kind == "host" and value.casefold() in host_keys):
+            return True
+    return False
+
+
+async def _lead_ids_naming(db: Any, entity: str, status: str, *, auto_hunt: bool) -> list[int]:
+    """The ids of every lead under ``status`` that names ``entity``, newest first.
+
+    Scanned rather than queried: ``entities_json`` is a JSON array. The scan
+    reads two columns of every lead under the status, with no row limit. A
+    limit here is the defect this filter fixes: the host page kept the leads
+    of the newest 50 overall, and an older lead on the host never showed.
+    """
+    from soc_ai.store import host_machines  # noqa: PLC0415 - lazy
+    from soc_ai.store.models import Lead  # noqa: PLC0415 - lazy
+
+    keys = await host_machines.entity_expansion(db, entity)
+    host_keys = {k.casefold() for k in keys} | {entity.casefold()}
+    stmt = _where_lead_status(
+        select(Lead.id, Lead.entities_json).order_by(Lead.formed_at.desc(), Lead.id.desc()),
+        status,
+        auto_hunt=auto_hunt,
+    )
+    rows = (await db.execute(stmt)).all()
+    return [int(lead_id) for lead_id, entities in rows if _lead_names(entities, entity, host_keys)]
+
+
+class LeadCountOut(BaseModel):
+    """How many leads GET /leads would list with no row limit."""
+
+    status: str
+    entity: str | None = None
+    total: int
+
+
+@router.get("/leads/count", response_model=LeadCountOut)
+async def count_leads(
+    request: Request, status: str = "open", entity: str | None = None
+) -> LeadCountOut:
+    """The true total for one ``status`` and ``entity`` filter of GET /leads.
+
+    The list stops at its ``limit``. A heading that counted the rows it held
+    could never say more than 50. This route counts the whole match set.
+    """
+    from soc_ai.store.models import Lead  # noqa: PLC0415 - lazy
+
+    _check_lead_status(status)
+    key = _check_lead_entity(entity)
+    auto_hunt = _auto_hunt(request)
+    async with request.app.state.db_sessionmaker() as db:
+        if key is not None:
+            total = len(await _lead_ids_naming(db, key, status, auto_hunt=auto_hunt))
+        else:
+            stmt = _where_lead_status(select(func.count(Lead.id)), status, auto_hunt=auto_hunt)
+            total = int((await db.scalar(stmt)) or 0)
+    return LeadCountOut(status=status, entity=key, total=total)
+
+
+@router.get("/leads", response_model=list[LeadOut])
+async def list_leads(
+    request: Request, status: str = "open", limit: int = 50, entity: str | None = None
+) -> list[LeadOut]:
+    """Leads, newest first, each with the observations that formed it.
+
+    ``status`` takes a stored value (``open``, ``hunting``, ``dismissed``,
+    ``promoted``), ``all``, or one of five aliases:
+
+    - ``new``: the same rows as ``open``.
+    - ``closed``: dismissed or promoted.
+    - ``needs_decision``: a hunt that finished, or a lead no loop will hunt.
+    - ``in_progress``: hunting with a hunt that runs or is queued.
+    - ``open_or_hunting``: open or hunting. The host page counts these as the
+      open work on the host.
+
+    ``needs_decision`` and ``in_progress`` name what the analyst must do, so
+    the tab and the Needs-you strip read the same rule. The rule itself lives
+    in the lead store, and it reads the ``lead_auto_hunt`` setting. With the
+    loop on, a new lead waits on soc-ai. It does not wait on the analyst.
+
+    ``entity`` keeps the leads that name one entity, under every key of its
+    machine. The filter runs before ``limit``, so a host keeps a lead that
+    is older than the newest 50 overall. GET /leads/count answers the total.
+    """
+    from soc_ai.store import leads as leads_store  # noqa: PLC0415 - lazy
+    from soc_ai.store.models import EntityObservation, Lead  # noqa: PLC0415 - lazy
+
+    _check_lead_status(status)
+    key = _check_lead_entity(entity)
     limit = max(1, min(int(limit), 200))
     auto_hunt = _auto_hunt(request)
     async with request.app.state.db_sessionmaker() as db:
         stmt = select(Lead).order_by(Lead.formed_at.desc(), Lead.id.desc()).limit(limit)
-        if status == "closed":
-            stmt = stmt.where(Lead.status.in_(("dismissed", "promoted")))
-        elif status == "new":
-            stmt = stmt.where(Lead.status == "open")
-        elif status == "needs_decision":
-            stmt = stmt.outerjoin(Hunt, Hunt.id == Lead.hunt_id).where(
-                leads_store.needs_decision_clause(auto_hunt=auto_hunt)
-            )
-        elif status == "in_progress":
-            stmt = stmt.outerjoin(Hunt, Hunt.id == Lead.hunt_id).where(
-                leads_store.in_progress_clause()
-            )
-        elif status != "all":
-            stmt = stmt.where(Lead.status == status)
+        if key is not None:
+            ids = (await _lead_ids_naming(db, key, status, auto_hunt=auto_hunt))[:limit]
+            stmt = stmt.where(Lead.id.in_(ids))
+        else:
+            stmt = _where_lead_status(stmt, status, auto_hunt=auto_hunt)
         leads = (await db.scalars(stmt)).all()
         if not leads:
             return []

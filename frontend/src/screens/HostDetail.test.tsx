@@ -2347,7 +2347,8 @@ describe('HostDetail — the leads on this host', () => {
 
   it('reads every lead on the host, whatever its status', async () => {
     mount();
-    await waitFor(() => expect(getLeads).toHaveBeenCalledWith('all'));
+    // The strip opens on All, and the server keeps the leads on this host.
+    await waitFor(() => expect(getLeads).toHaveBeenCalledWith('all', { entity: IP }));
   });
 
   it('offers the status filter on the strip', async () => {

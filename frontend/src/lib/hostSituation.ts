@@ -21,23 +21,22 @@ export interface SituationLine {
   to?: string;
   /** `alarm` for a threat or a true positive, else `info`. */
   tone: 'alarm' | 'info';
+  /** The scope of the line, in visible words. The page has a 24h and a 7d
+   *  button, and these lines follow neither, so each line says what it
+   *  covers. A hover title is not a label. */
+  scope?: string;
 }
+
+/** The scope words of the lead lines. A backlog keeps its full scope. */
+export const SCOPE_OPEN_LEADS = 'all open leads';
+/** The scope words of the verdict lines. The observations read is 7 days,
+ *  the window of the Alerts card. */
+export const VERDICT_DAYS = 7;
+export const SCOPE_VERDICTS = `last ${VERDICT_DAYS} days`;
 
 /** The lead statuses that still wait on soc-ai or on the analyst. */
 const OPEN = new Set(['open', 'hunting']);
 const HUNT_RUNNING = new Set(['running', 'queued']);
-
-/** Does this lead name the host? The lead strip reads the same rule. */
-export function leadTouches(
-  lead: Pick<Lead, 'entities'>,
-  key: string,
-  aliases: readonly string[] = [],
-): boolean {
-  const names = new Set(aliases.map((a) => a.toLowerCase()));
-  return lead.entities.some(
-    (e) => e[1] === key || (e[0] === 'host' && names.has(String(e[1]).toLowerCase())),
-  );
-}
 
 type OpenState = 'decision' | 'new' | 'queued' | 'hunting';
 
@@ -92,16 +91,21 @@ export function openLeads(leads: readonly Lead[]): Lead[] {
     .sort((a, b) => URGENCY[openState(a)] - URGENCY[openState(b)] || b.id - a.id);
 }
 
-/** The lead lines: the most urgent lead in full, then a count of the rest. */
-export function leadLines(leads: readonly Lead[]): SituationLine[] {
+/** The lead lines: the most urgent lead in full, then a count of the rest.
+ *
+ *  `total` is the server's count of the open leads on the host. The rows
+ *  stop at a limit, and the count does not. Without it the rows count. */
+export function leadLines(leads: readonly Lead[], total?: number | null): SituationLine[] {
   const open = openLeads(leads);
   if (open.length === 0) return [];
-  const lines = [leadLine(open[0])];
-  if (open.length > 1) {
-    const rest = open.length - 1;
+  const lines = [{ ...leadLine(open[0]), scope: SCOPE_OPEN_LEADS }];
+  const all = typeof total === 'number' ? Math.max(total, open.length) : open.length;
+  if (all > 1) {
+    const rest = all - 1;
     lines.push({
       text: `${plural(rest, 'more open lead')} ${rest === 1 ? 'names' : 'name'} this host.`,
       tone: 'info',
+      scope: SCOPE_OPEN_LEADS,
     });
   }
   return lines;
@@ -146,6 +150,7 @@ export function verdictLines(
     lines.push({
       text: `${plural(tp.length, 'true-positive alert')}, ${whenPhrase(tp, now)}.`,
       tone: 'alarm',
+      scope: SCOPE_VERDICTS,
     });
   }
   const nmi = verdicts.filter((o) => o.verdict === 'needs_more_info');
@@ -153,6 +158,7 @@ export function verdictLines(
     lines.push({
       text: `${plural(nmi.length, 'alert')} ${nmi.length === 1 ? 'needs' : 'need'} more information, ${whenPhrase(nmi, now)}.`,
       tone: 'info',
+      scope: SCOPE_VERDICTS,
     });
   }
   return lines;

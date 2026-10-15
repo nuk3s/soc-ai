@@ -990,7 +990,8 @@ Every route sits under `/api/v1`. The console uses these, and an integrator can 
 |---|---|
 | `GET /hunts/hits` | Every analytic hit from the last `days` days. Under `all`: unread shadow hits, then live hits, then read shadow hits. `filter` takes `all`, `unread`, `live` or `shadow`. `limit` and `offset` page through the order. |
 | `GET /hunts/needs-you` | The one number the sidebar badge and the Needs-you strip show: unread shadow hits plus leads that wait on a decision. |
-| `GET /leads` | The lead list. `status` takes a stored value, `all`, or one of the tab aliases `new`, `closed`, `needs_decision` and `in_progress`. |
+| `GET /leads` | The lead list, newest first. `status` takes a stored value, `all`, or one of the aliases `new`, `closed`, `needs_decision`, `in_progress` and `open_or_hunting`. `entity` keeps the leads that name one entity, under every key of its machine. The filter runs before `limit`. |
+| `GET /leads/count` | The total for the same `status` and `entity` filter. The list stops at `limit`. The count does not. |
 | `GET /leads/quality` | The lead rule, the noise floor rule, and what the rule produced per ISO week and per observation-type pair, with `closed_by_hunt` counted apart from `dismissed`. `weeks` sets the window. |
 | `GET /hunts/leads/{id}` | One lead: its observations, its entities, its related leads and whether its investigation still exists. |
 | `POST /hunts/leads/{id}/hunt` | Start the lead hunt by hand. While the attached hunt runs, it returns that hunt. After a hunt has finished, it starts a new one. |
@@ -999,9 +1000,11 @@ Every route sits under `/api/v1`. The console uses these, and an integrator can 
 | `POST /hunts/leads/{id}/reopen` | Reopen a closed lead. The loop does not hunt it again. |
 | `POST /hunts/{hunt_id}/findings/{ordinal}/investigate` | Open an investigation on one finding of a hunt. The subject is the hunt. The console control is **Open an investigation**. When a running or complete investigation of the same subject exists, the route returns it. |
 | `GET /hunts` and `GET /hunts/{id}` | A hunt row carries `findingsInvestigated` and `findingsTotal`. Each finding of the detail carries `investigationId`, `verdict`, `confidence`, `investigationStatus` and `pendingActions`. `investigationStatus` is `queued`, `running`, `complete`, `failed`, `cancelled` or `over_cap`. |
+| `GET /hunts/totals` | The counts of every hunt in a window: hunts, findings, threat findings and running hunts. It gives each count in total and per type. `since` and `until` set the window, as on `GET /hunts`. It has no row cap. The Hunts page header reads it. |
 | `GET /hunts/observations` | The observations on one entity, from every source, for the host page. |
 | `GET /hunts/shadow-hits` | The shadow half on its own, for the bell and the Dashboard card. |
 | `POST /hunts/shadow-hits/{obs_id}/read` | Mark one shadow hit read. |
+| `POST /hunts/shadow-hits/read-all` | Mark every unread shadow hit born at or before `before` (ISO-8601) as read, in one write. "Dismiss all" in the bell sends the time it loaded the count. Writes a `shadow_hits_read` audit record and answers `{"read": <count>}`. A hit of a retired analytic is not touched. |
 | `GET /analytics` | The catalog, both tiers, with status and tier on each row. `held_by_system` holds the reason of a system demotion while it holds the analytic in shadow. |
 | `GET /analytics/{id}` | One analytic with its version history, its outcome ledger and its recent observations. A version row carries `system` for a change soc-ai made, and `evidence` for a system demotion. |
 | `POST /analytics/{id}/status` | Move an analytic between candidate, shadow, live and retired, with a reason. |

@@ -6,8 +6,128 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
-A fleet of twelve browser and API dogfood agents ran on the development range and on
-production on 2026-10-01. This section holds what they found and what changed.
+## [1.5.3] - 2026-10-15
+
+1.5.3 is the detection ladder release. It holds the work from 2026-10-01 to 2026-10-14. The
+release note is [docs/releases/1.5.3.md](docs/releases/1.5.3.md). The work started with a fleet
+of twelve browser and API dogfood agents on 2026-10-01. The sections below hold what they found
+and what changed after.
+
+### Alert verdicts follow the time filter (2026-10-14)
+
+- **Runs inside the page window decide the verdict of an alert group.** Everything on a page
+  follows the time filter of that page. The verdict counts of a group reached back seven days
+  past a 24-hour window. The alerts API now counts only the runs made inside the window. It
+  names the worst of them as the window verdict.
+- **A group with no run in the window keeps its older verdict.** The Alerts row marks that
+  verdict "inherited" and states its age. The Dashboard outcome panel states how many groups
+  carry an inherited verdict.
+- **The Dashboard and the Alerts list read one verdict.** The verdict filter, the verdict sort,
+  the "untriaged" count and the "Needs decision" chip read the verdict that the Dashboard
+  breakdown counts. A tile opens a list that holds the same groups. The row pill and the
+  confidence column show that verdict too.
+- **A custom window reaches the server as a custom window.** The console sent the two bounds
+  without `range=custom`, and the verdict counts read the default 24 hours. The console now sends
+  the marker. The server also reads the two bounds alone as a custom window. A bound without an
+  offset reads in `so_timezone`. The grid query reads it in that zone too.
+- **A backtest replay does not decide a window verdict.** The standing verdict already skipped a
+  replay. The verdict counts of a group now skip it too.
+- **The alerts API adds four fields.** `GET /api/v1/alerts` adds `windowVerdict`, `windowConf`,
+  `windowInvId` and `verdictAt` to each group. `verdictCounts`, `worstVerdict`, `worstConf` and `worstInvId` now
+  read the runs of the window only. `verdict` keeps its meaning: the standing verdict of the rule.
+### Host page window (2026-10-14)
+
+The owner set a rule for every page. The time filter of a page filters everything on it. A
+number that the filter does not change says its scope in words on the screen. A hover title is
+not a label.
+
+- **The host page shows every open lead on the host.** The page read the newest 50 leads of all
+  hosts and kept the leads on this host. A host lead older than those 50 did not show in the
+  first lines or in the leads list. The server now filters the leads by host before the row
+  limit. The filter reads every address and every name of the machine.
+- **The lead counts read the whole set.** `GET /leads/count` gives the total for a filter. The
+  first lines and the leads heading on the host page and on the Hunts page use this total. The
+  heading said at most 50 before. When the list holds fewer leads than the total, a line under
+  the list says so.
+- **Each count says its scope.** The leads heading says "all open" on the Needs decision and In
+  progress tabs, and "all time" on the Closed and All tabs. The first lines of the host page say
+  "all open leads" beside a lead and "last 7 days" beside a verdict count.
+- **The sweep counts say their window.** The event count in the host header, the Events columns
+  of the Addresses table and the connection counts under Why? say "last 14 days". The number is
+  the "Dossier window (days)" setting. `GET /dossiers/{ip}` gives it as `lookback_days`.
+- **`GET /leads` takes `entity` and the status `open_or_hunting`.** A blank `entity` gets the
+  answer 422 `entity_required`.
+### Page windows (2026-10-14)
+
+The owner set a rule for every page. The time filter of a page filters everything on it. A part
+that the filter does not filter states its scope in visible words. A tooltip is not a label.
+
+- **The Needs-you tile states the scope of each line.** Leads read "all open" and shadow hits
+  read "all unread". Alert groups read "last 7 days", and verdicts and actions read "last 30
+  days". The total says that it is the sum of the lines below. With no work, the tile names
+  every scope in one sentence.
+- **The shadow-hit tile reads "all unread".** Its link reads "Read the last 7 days on Hunts",
+  because the hits block on Hunts lists 7 days.
+- **The recent list on the Dashboard obeys the page window.** It listed the newest runs of any
+  age. An empty window now reads "No investigations in the last 15 minutes." View all opens the
+  same window. The running tile keeps its scope words while Auto-Investigate runs.
+- **The tuning nudge states its two scopes.** Alert counts cover the last 7 days. Verdict counts
+  cover all investigations. The summary route sends the window as `volume_window`.
+- **The Hunts header counts the whole window.** The header, the section badge and the type chip
+  counted one page of 100 rows, so a window of 140 hunts read "100 hunts". The new route
+  `GET /hunts/totals` counts every hunt in the window, per type. A line under the table states
+  how many hunts of the window the table shows. When the totals do not load and the page is
+  full, the counts read "100+".
+- **The Needs-you strip on Hunts states its scope.** Shadow hits read "all unread" and leads
+  read "all open". The hit link reads "Read the last 7 days", because the hits block lists 7
+  days.
+- **Bulk Investigate names its window.** The header sweep reads the last 24 hours, whatever the
+  list window is. The button, the progress line and the summary now say "last 24 hours". The
+  console sends the range to the server. A selection names no window.
+### Notifications (2026-10-14)
+
+- **The bell panel accounts for every unit of the badge.** In production the badge read 309 and
+  the panel listed 12 rows, all shadow hits. A "Needs you" block now sits above the events. It
+  states each part of the count with its scope, and links to its list. Examples are "300 shadow
+  hits are unread, all unread" and "2 verdicts need more info, last 30 days". The words match
+  the Needs-you tile on the Dashboard. The parts add up to the badge. A
+  part the server could not read says so.
+- **The panel lists events only.** The block holds the leads and the shadow hits, so the panel and
+  the Notifications page do not show them again as rows. `GET /notifications` takes
+  `events_only=true` for this.
+- **Show more loads more rows.** `GET /notifications` takes a `limit` from 1 to 200. The default
+  stays 12. The cap of each source grows with the limit, so a larger limit returns more rows.
+  The panel and the Notifications page load 20 more rows for each click.
+- **Dismiss all replaces Clear all.** The confirm step states what happens. Dismiss all hides every
+  event up to the moment the panel loaded. This includes the events that the panel did not load.
+  It marks every unread shadow hit up to that moment as read on the server. Leads, alert groups
+  with no verdict, verdicts that need more info and recommended actions are decisions, and they
+  stay. An altered audit record stays too, because the server marks that notice undismissible.
+- **Dismiss all marks only the hits it named.** The confirm step names a count of shadow hits,
+  and the call sends that count. A sweep can commit a hit after the count was read. When the
+  write would mark more hits than the count, the server marks none and answers 409
+  `shadow_hits_changed`. The panel then asks the analyst to check the new count.
+- **A new route marks the shadow hits read.** `POST /hunts/shadow-hits/read-all` takes a `before`
+  time. It marks every unread shadow hit born at or before that time as read, in one write, and
+  writes a `shadow_hits_read` audit record. A hit born later stays unread.
+- **Each notification row carries its time.** The `at` field holds the moment the row describes,
+  as ISO-8601 UTC. `GET /notifications` takes `after`, the time of the last Dismiss all, and
+  leaves out the dismissible rows up to it. Hidden rows then take no place in the limit.
+- **The Notifications page header states the loaded count.** It said "the 10 newest". It now says
+  how many items loaded and whether more exist.
+
+### Dashboard true positives (2026-10-13)
+
+- **The outcome breakdown counts a group under its worst verdict.** A group took the verdict of
+  the newest run of its rule. In production, the rule "GPL SHELLCODE x86 setuid 0" held one true
+  positive and five later false positives on other sources. The breakdown read "True positive 0",
+  and the true-positive tile read 1. The breakdown now uses the worst verdict, which the Alerts
+  row already shows as a chip.
+- **The Alerts list filters and sorts by the same verdict.** The "True positive" tile opens the
+  Alerts list with that filter. The list now holds the group that the tile counted.
+- **A run in flight and a pipeline fallback do not hide a verdict.** A group with a running
+  investigation counts under the verdict it holds. A group whose newest run fell back still
+  names an older true positive.
 
 ### Owner's pass 2026-10-07
 
@@ -5540,7 +5660,8 @@ The first public release. Highlights:
     positives is **capped** to low-stakes alerts (a prompt-injected verdict can
     no longer auto-acknowledge a malware/exploit/high-severity alert).
 
-[Unreleased]: https://github.com/nuk3s/soc-ai/compare/v1.5.2...HEAD
+[Unreleased]: https://github.com/nuk3s/soc-ai/compare/v1.5.3...HEAD
+[1.5.3]: https://github.com/nuk3s/soc-ai/compare/v1.5.2...v1.5.3
 [1.5.2]: https://github.com/nuk3s/soc-ai/compare/v1.5.1...v1.5.2
 [1.5.1]: https://github.com/nuk3s/soc-ai/compare/v1.5.0...v1.5.1
 [1.0.0]: https://github.com/nuk3s/soc-ai/releases/tag/v1.0.0

@@ -144,10 +144,20 @@ export interface AlertGroup {
   host?: string | null;
   srcCount?: number | null;
   /** The worst verdict among those alerts, when it is worse than `verdict`,
-   *  and the run that holds it. */
+   *  and the run that holds it. Since 2026-10-14 the server reads the runs of
+   *  the page window only. */
   worstVerdict?: string | null;
   worstConf?: number | null;
   worstInvId?: string | null;
+  /** The window verdict: the worst verdict among the runs made inside the
+   *  page window, and the run that holds it. null when the group has no run
+   *  in the window. Absent on an older server. */
+  windowVerdict?: string | null;
+  windowConf?: number | null;
+  windowInvId?: string | null;
+  /** The ISO time of the run behind the standing verdict `verdict`. The row
+   *  states the age of an inherited verdict from it. */
+  verdictAt?: string | null;
 }
 
 /** Returned by GET /api/v1/alerts/empty-reason: why the queue is showing nothing.
@@ -1187,6 +1197,11 @@ export interface Notification {
   outcome?: string | null;
   /** Which section of the Notifications screen holds the row. */
   group?: string;
+  /** The moment the row describes, as ISO-8601 UTC: the finish of a run, the
+   *  start of a run in flight, the start of an outage. Null on a row with no
+   *  moment. Dismiss all hides every dismissible row at or before its own
+   *  moment, the rows it never loaded too. */
+  at?: string | null;
 }
 
 // ── Backtest ("prove it on my last N days") ─────────────────────────────────
@@ -1498,6 +1513,11 @@ export interface Dossier extends DossierRow {
   /** Whether the profile sweep runs on this deployment. Absent from an older
    *  server, and the profile panel then names both causes. */
   profiles_enabled?: boolean | null;
+  /** The days of events each sweep counts: the `dossier_lookback_days`
+   *  setting. The event and connection counts on the host page cover this
+   *  window, and the page says so beside each count. Absent from an older
+   *  server, and the page then names the sweep window without a number. */
+  lookback_days?: number | null;
 }
 
 export interface DossierList {

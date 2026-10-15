@@ -14,7 +14,8 @@ import { Drawer } from '../components/Drawer';
 import { MultiSelect } from '../components/MultiSelect';
 import { TimeRangeFilter, type CustomRange } from '../components/TimeRangeFilter';
 import { ErrorState, Freshness, LoadingInline, LoadingState, Spinner } from '../components/States';
-import { hideOptimisticallyAcked } from '../lib/alertFilters';
+import { groupOutcome, hideOptimisticallyAcked, outcomeOf } from '../lib/alertFilters';
+import { ago } from '../lib/timeRange';
 import { MIN_BUCKET, bucketEvents } from '../lib/alertEventBuckets';
 import {
   type AlertQuery,
@@ -53,6 +54,7 @@ import type {
   SavedViewQuery,
   Severity,
   TriageState,
+  Verdict,
 } from '../lib/types';
 import { useShell } from '../shell/ShellContext';
 import { Investigation } from './Investigation';
@@ -112,6 +114,13 @@ const TRIAGE_SKIP_REASONS: Record<string, string> = {
 // An unmapped code is humanized rather than printed raw: a new backend reason is
 // surfaced instead of silently dropped, and a RETIRED one (a historical status
 // row can still hold "no_ip") reads as words, not as wire format.
+/** The window the header Bulk Investigate sweeps, whatever window the list
+ *  shows. The button, the progress line and the summary state it in words,
+ *  because the page time filter does not apply to the sweep. */
+const SWEEP_RANGE = '24h';
+const SWEEP_WORDS = 'last 24 hours';
+const SWEEP_HEAD = 'Last 24 hours';
+
 function triageSkipDetail(s: AutoTriageStatus): string {
   const reasons = s.skipped_reasons;
   if (!reasons) return '';
@@ -136,7 +145,11 @@ const VERDICT_RANK: Record<string, number> = { true_positive: 6, false_positive:
 // in the DB) but should not interleave with genuinely-untriaged rows when sorting
 // by verdict — rank it just above untriaged so triaging rows cluster together.
 const TRIAGING_RANK = 2;
-const verdictRank = (g: AlertGroup): number => (g.triaging ? TRIAGING_RANK : VERDICT_RANK[g.verdict] ?? 0);
+// The verdict sort reads the verdict the group counts under, so a true
+// positive that later false positives followed sorts with the true positives.
+// Runs inside the page window decide that verdict (owner rule, 2026-10-14).
+const verdictRank = (g: AlertGroup): number =>
+  g.triaging ? TRIAGING_RANK : VERDICT_RANK[groupOutcome(g) ?? g.verdict] ?? 0;
 
 // ---- deep-link seeding ------------------------------------------------------
 // Allow-lists for the URL-seeded filters. A value outside its set is DROPPED,
@@ -477,32 +490,113 @@ export function verdictCountsLine(counts: Record<string, number> | undefined): s
     .join(', ');
 }
 
-/** The worst verdict of a group, as a chip that opens its run, and the counts
- *  of each verdict. Nothing when the group holds one verdict only. */
-function VerdictMix({ g, onOpen }: { g: AlertGroup; onOpen: (id: string) => void }) {
+/** What the row pill of a group shows. A group counts under the worst verdict
+ *  among its runs in the page window (owner rule, 2026-10-14), and the pill
+ *  shows that verdict. A group with no run in the window shows its standing
+ *  verdict, inherited, with the age of the run behind it.
+ *
+ *  An older server sends no window verdict. The pill then keeps the standing
+ *  verdict, and "inherited" means that the run investigated another alert of
+ *  the group. */
+interface RowPill {
+  verdict: Verdict;
+  conf: number | null;
+  /** The run the pill opens. */
+  invId: string | null;
+  inherited: boolean;
+  /** "3d ago", the age of an inherited verdict. */
+  when: string | null;
+  title: string | undefined;
+}
+
+function rowPill(g: AlertGroup): RowPill {
+  const o = outcomeOf(g);
+  if (g.windowVerdict === undefined || o.verdict === null) {
+    return {
+      verdict: g.verdict,
+      conf: g.conf,
+      invId: g.invId ?? null,
+      inherited: g.inherited,
+      when: inheritedWhen(g.inheritedReason),
+      title: g.inherited
+        ? g.inheritedReason ?? 'This verdict comes from an earlier investigation of this detection.'
+        : undefined,
+    };
+  }
+  if (o.inherited) {
+    const when = o.at ? ago(o.at) : null;
+    return {
+      verdict: o.verdict,
+      conf: o.conf,
+      invId: o.invId,
+      inherited: true,
+      when,
+      title:
+        'No investigation of this detection ran in this window. The verdict comes from the newest ' +
+        `earlier run${when ? `, ${when}` : ''}. Open the investigation.`,
+    };
+  }
+  return {
+    verdict: o.verdict,
+    conf: o.conf,
+    invId: o.invId,
+    inherited: false,
+    when: null,
+    title: 'The worst verdict among the runs in this window. Open the investigation.',
+  };
+}
+
+/** The confidence column of a row: the confidence of the verdict on the pill. */
+function rowConf(g: AlertGroup): number | null {
+  return g.fallback ? g.conf : rowPill(g).conf;
+}
+
+/** The window verdict of a group as a chip that opens its run, when the pill
+ *  shows something else, and the count of each verdict. Both describe the
+ *  runs inside the page window only. Nothing when the group holds one verdict
+ *  and the pill already shows it. */
+function VerdictMix({
+  g,
+  shown,
+  onOpen,
+}: {
+  g: AlertGroup;
+  /** The verdict on the pill, or null for the pipeline-error chip. */
+  shown: Verdict | null;
+  onOpen: (id: string) => void;
+}) {
   const counts = g.verdictCounts ?? {};
   const kinds = Object.values(counts).filter((n) => n > 0).length;
-  if (!g.worstVerdict && kinds < 2) return null;
+  const o = outcomeOf(g);
+  const chipVerdict = o.verdict && o.verdict !== 'untriaged' && !o.inherited && o.verdict !== shown ? o.verdict : null;
+  if (!chipVerdict && kinds < 2) return null;
   const line = verdictCountsLine(counts);
-  const worst = g.worstVerdict ? verdictMeta(g.worstVerdict) : null;
+  const chip = chipVerdict ? verdictMeta(chipVerdict) : null;
   return (
     <span className="flex min-w-0 flex-wrap items-center gap-1" data-testid="verdict-mix">
-      {worst && (
+      {chip && chipVerdict && (
         <button
           type="button"
-          disabled={!g.worstInvId}
+          disabled={!o.invId}
           onClick={(e) => {
             e.stopPropagation();
-            if (g.worstInvId) onOpen(g.worstInvId);
+            if (o.invId) onOpen(o.invId);
           }}
-          title={`${counts[g.worstVerdict!] ?? 1} ${worst.label.toLowerCase()} in this group. Open the investigation.`}
-          {...chipProps(worst, { className: 'enabled:hover:brightness-125 disabled:cursor-default' })}
+          title={`${counts[chipVerdict] ?? 1} ${chip.label.toLowerCase()} in this window. Open the investigation.`}
+          {...chipProps(chip, { className: 'enabled:hover:brightness-125 disabled:cursor-default' })}
         >
-          {worst.label}
-          {g.worstConf != null ? ` ${confidenceText(g.worstConf)}` : ''}
+          {chip.label}
+          {o.conf != null ? ` ${confidenceText(o.conf)}` : ''}
         </button>
       )}
-      {line && <span className="break-all font-mono text-[10.5px] text-faint">{line}</span>}
+      {line && (
+        <span
+          className="break-all font-mono text-[10.5px] text-faint"
+          title="The verdict of each alert of this group with a run in this window."
+        >
+          {line}
+        </span>
+      )}
     </span>
   );
 }
@@ -567,13 +661,17 @@ function cmpGroups(a: AlertGroup, b: AlertGroup, key: SortKey, dir: SortDir): nu
     case 'verdict':
       result = verdictRank(a) - verdictRank(b);
       break;
-    case 'conf':
-      // null sorts last in either direction
-      if (a.conf == null && b.conf == null) result = 0;
-      else if (a.conf == null) result = 1;
-      else if (b.conf == null) result = -1;
-      else result = a.conf - b.conf;
+    case 'conf': {
+      // The confidence on screen, the one of the verdict on the pill. null
+      // sorts last in either direction.
+      const ac = rowConf(a);
+      const bc = rowConf(b);
+      if (ac == null && bc == null) result = 0;
+      else if (ac == null) result = 1;
+      else if (bc == null) result = -1;
+      else result = ac - bc;
       break;
+    }
     case 'latest':
       // ISO strings sort chronologically; empty string sorts last
       result = (a.latestTs ?? '').localeCompare(b.latestTs ?? '');
@@ -592,9 +690,13 @@ function matchView(g: AlertGroup, view: ViewId, me: string): boolean {
       return g.state === 'in_review';
     case 'critical':
       return g.sev === 'critical';
-    case 'decision':
-      // Non-committed verdicts: NMI + inconclusive (terminal hedges) + untriaged.
-      return g.verdict === 'needs_more_info' || g.verdict === 'inconclusive' || g.verdict === 'untriaged';
+    case 'decision': {
+      // Non-committed verdicts: NMI + inconclusive (terminal hedges) + untriaged,
+      // by the verdict the group counts under in this window. A pipeline error
+      // counts under no verdict, and it still waits on the analyst.
+      const v = groupOutcome(g);
+      return v === null || v === 'needs_more_info' || v === 'inconclusive' || v === 'untriaged';
+    }
     default:
       return true;
   }
@@ -1082,6 +1184,9 @@ export function Alerts() {
   const [triaging, setTriaging] = useState(false);
   const [pct, setPct] = useState(0);
   const [triageStatus, setTriageStatus] = useState<AutoTriageStatus | null>(null);
+  // True while the batch on screen is the header sweep over SWEEP_RANGE. A
+  // selection names no window, so its lines say none.
+  const [triageSweep, setTriageSweep] = useState(false);
   const triageTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   // Whether this screen is still on the page. The start POST can outlive it
   // (api.ts gives the request 20s; the analyst may navigate away sooner), and
@@ -1157,7 +1262,12 @@ export function Alerts() {
   // Pass alertIds to triage exactly that selection; omit for the global sweep.
   // minSeverity only applies to the global sweep (ignored when alertIds given).
   const startTriage = (alertIds?: string[], minSeverity?: string) => {
+    const sweep = !alertIds?.length;
+    // The summary of a sweep names its window, because the list on screen can
+    // show another one.
+    const scoped = (msg: string): string => (sweep ? `${SWEEP_HEAD}: ${msg}` : msg);
     setTriaging(true);
+    setTriageSweep(sweep);
     setTriageError(null);
     setPct(0);
     if (triageTimer.current) clearInterval(triageTimer.current);
@@ -1179,17 +1289,19 @@ export function Alerts() {
           const done = s.hunted + s.failed;
           setPct(s.total ? Math.round((100 * done) / s.total) : 0);
           setTriageStatus(s);
-          if (!s.active) finish(triageSummary(s));
+          if (!s.active) finish(scoped(triageSummary(s)));
         })
         .catch(() => finish('The status check for Bulk Investigate failed'));
     };
-    startAutoTriage(alertIds?.length ? { alertIds } : { minSeverity })
+    // The sweep names its window to the server. The server default is the
+    // same 24 hours, and the words on the button come from the same constant.
+    startAutoTriage(sweep ? { minSeverity, range: SWEEP_RANGE } : { alertIds })
       .then((s) => {
         // Landed after the analyst left: nothing to show, and no poll to start.
         if (!mountedRef.current) return;
         if (!s.active) {
           // nothing to hunt, or the batch already wrapped up — show why
-          finish(s.note || (s.total ? triageSummary(s) : 'Nothing to investigate'));
+          finish(scoped(s.note || (s.total ? triageSummary(s) : 'Nothing to investigate')));
           return;
         }
         // Surface the backend's start note up-front (e.g. "triaging 6 selected
@@ -1649,11 +1761,13 @@ export function Alerts() {
   // fallback group matches it regardless of its (needs_more_info) verdict, and —
   // since the chip REPLACES the NMI pill — a fallback group is NOT matched by
   // selecting 'needs_more_info' alone.
+  // A group matches the verdict it counts under on the Dashboard breakdown,
+  // so the tile that opens this list and the list hold the same groups.
   const matchesVerdict = (g: AlertGroup): boolean => {
     if (!filterVerdicts.length) return true;
     if (filterVerdicts.includes('pipeline_error') && g.fallback) return true;
-    if (g.fallback) return false;
-    return filterVerdicts.includes(g.verdict);
+    const outcome = groupOutcome(g);
+    return outcome !== null && filterVerdicts.includes(outcome);
   };
   // Every facet the analyst set EXCEPT the preset itself. Split out so the
   // preset chips can be counted against it: a chip badge answers "how many rows
@@ -1890,7 +2004,8 @@ export function Alerts() {
   const { shown, untriaged, totalEvents } = useMemo(
     () => ({
       shown: visible.length,
-      untriaged: visible.filter((g) => g.verdict === 'untriaged').length,
+      // The verdict each group counts under, as on the Dashboard breakdown.
+      untriaged: visible.filter((g) => groupOutcome(g) === 'untriaged').length,
       totalEvents: visible.reduce((a, g) => a + g.count, 0),
     }),
     [visible],
@@ -2026,6 +2141,9 @@ export function Alerts() {
             className="flex items-center gap-1.5 rounded-r-control border border-border-strong bg-surface-3 px-[13px] py-2 text-[13px] font-semibold text-text hover:border-accent hover:bg-[#141b25] disabled:opacity-50"
           >
             <span className="flex" style={{ color: '#facc15' }}><Zap size={14} /></span> Bulk Investigate
+            {/* The sweep reads its own window. The list filter above does
+                not apply to it, so the button says which window it reads. */}
+            <span className="font-normal text-dim">· {SWEEP_WORDS}</span>
           </button>
         </div>
       </div>
@@ -2067,9 +2185,10 @@ export function Alerts() {
           {triaging && (
             <div className="flex items-center gap-[13px]">
               <Spinner size={15} />
-              <div className="text-[13px] font-semibold">
+              <div data-testid="bulk-investigate-progress" className="text-[13px] font-semibold">
                 Bulk Investigate runs
                 {triageStatus?.severities?.length ? ` on ${triageStatus.severities.join(', ')}` : ''}
+                {triageSweep && <span className="font-normal text-dim"> · {SWEEP_WORDS}</span>}
               </div>
               <div className="font-mono text-[12px] text-dim">
                 {(() => {
@@ -2585,6 +2704,7 @@ export function Alerts() {
 
         {visible.map((g, rowIdx) => {
           const gk = groupKey(g);
+          const pill = rowPill(g);
           const isExp = !!expanded[gk];
           const owner = ownerOf(g);
           const seld = sel.isSelected(gk);
@@ -2721,36 +2841,51 @@ export function Alerts() {
                     >
                       <PipelineErrorChip />
                     </button>
-                  ) : g.inherited ? (
+                  ) : pill.inherited ? (
                     // Inherited verdict: make the whole thing a link to the source
-                    // investigation (when + which is in the enriched reason), so the
-                    // analyst can see WHERE this verdict came from and jump to it.
+                    // investigation, so the analyst can see WHERE this verdict came
+                    // from and jump to it. With a window verdict from the server,
+                    // inherited means that no run of the group is in the window.
                     <button
                       type="button"
-                      disabled={!g.invId}
+                      disabled={!pill.invId}
                       onClick={(e) => {
                         e.stopPropagation();
-                        if (g.invId) openDrawer(g.invId);
+                        if (pill.invId) openDrawer(pill.invId);
                       }}
-                      title={g.inheritedReason ?? 'This verdict comes from an earlier investigation of this detection.'}
+                      title={pill.title}
                       className="group/inh flex min-w-0 items-center gap-1.5 rounded-pill text-left enabled:hover:opacity-90 disabled:cursor-default"
                     >
-                      <VerdictPill verdict={g.verdict} conf={g.conf} inherited showConf={false} showInherited={false} />
+                      <VerdictPill verdict={pill.verdict} conf={pill.conf} inherited showConf={false} showInherited={false} />
                       <span className="flex min-w-0 items-center gap-0.5 flex-wrap font-mono text-[10.5px] text-faint group-enabled/inh:group-hover/inh:text-accent">
                         <span className="break-words">
-                          · inherited{inheritedWhen(g.inheritedReason) ? ` ${inheritedWhen(g.inheritedReason)}` : ''}
+                          · inherited{pill.when ? ` ${pill.when}` : ''}
                         </span>
-                        {g.invId && <ArrowUpRight size={10} className="flex-shrink-0" />}
+                        {pill.invId && <ArrowUpRight size={10} className="flex-shrink-0" />}
                       </span>
                     </button>
+                  ) : pill.invId && pill.invId !== g.invId ? (
+                    // The window verdict comes from another run than the standing
+                    // verdict. The pill opens that run.
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (pill.invId) openDrawer(pill.invId);
+                      }}
+                      title={pill.title}
+                      className="flex min-w-0 items-center rounded-pill text-left hover:opacity-90"
+                    >
+                      <VerdictPill verdict={pill.verdict} conf={pill.conf} inherited={false} showConf={false} showInherited={false} />
+                    </button>
                   ) : (
-                    <VerdictPill verdict={g.verdict} conf={g.conf} inherited={false} showConf={false} showInherited={false} />
+                    <VerdictPill verdict={pill.verdict} conf={pill.conf} inherited={false} showConf={false} showInherited={false} />
                   )}
-                  {/* The worst verdict among the alerts of the group, when it
-                      is worse than the standing one, and the count of each
-                      verdict. The row said "False positive" over a group that
-                      held a true positive (dogfood 2026-10-06, S5). */}
-                  {!g.triaging && <VerdictMix g={g} onOpen={openDrawer} />}
+                  {/* The counts of each verdict among the runs in the window, and
+                      the window verdict as a chip when the pill shows something
+                      else. The row said "False positive" over a group that held
+                      a true positive (dogfood 2026-10-06, S5). */}
+                  {!g.triaging && <VerdictMix g={g} shown={g.fallback ? null : pill.verdict} onOpen={openDrawer} />}
                   {/* E2.1: a later re-run failed on top of the standing verdict —
                       a secondary red hint; the verdict chip above stays primary.
                       Backend nulls this for triaging + fallback-standing rows. */}
@@ -2761,7 +2896,10 @@ export function Alerts() {
                   {g.owner && <StateChip state={g.state} />}
                 </div>
                 <div className="text-right font-mono text-[12px] text-dim">
-                  {g.conf != null ? g.conf.toFixed(2) : '—'}
+                  {(() => {
+                    const conf = rowConf(g);
+                    return conf != null ? conf.toFixed(2) : '—';
+                  })()}
                 </div>
                 <div className="flex items-center">
                   {ownerPending[gk] ? (

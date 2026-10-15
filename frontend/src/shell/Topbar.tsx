@@ -3,7 +3,9 @@ import { type RefObject, useEffect, useRef, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { AskSocAiButton } from '../components/AskPanel';
 import { DevBadge, SyntheticEvalBadge } from '../components/Badges';
+import { DismissAllControl } from '../components/DismissAllControl';
 import { HuntOutcomeChip } from '../components/HuntOutcomeChip';
+import { NeedsYouBlock } from '../components/NeedsYouBlock';
 import { LoadingInline } from '../components/States';
 import {
   type Health,
@@ -13,15 +15,20 @@ import {
   onNeedsYouChanged,
 } from '../lib/api';
 import {
+  NOTIFICATIONS_CAP,
   NOTIFICATIONS_DISMISSED_EVENT,
   NO_NOTIFICATIONS,
   dismissNotification,
   formatNotificationTitle,
   formatNotificationWhen,
-  getDismissed,
+  getClearedAt,
+  hasMoreNotifications,
+  isNeedsYouRow,
+  nextNotificationLimit,
+  visibleNotifications,
 } from '../lib/notifications';
 import type { Notification, Workspace } from '../lib/types';
-import { useNeedsYouCount } from '../lib/needsYou';
+import { needsYouLines, useNeedsYouCount } from '../lib/needsYou';
 import { type Crumb, GUIDE_URL, crumbFor } from './pages';
 import { useSession } from './Session';
 import { useShell } from './ShellContext';
@@ -49,14 +56,6 @@ export function WorkspaceGlyph({ name, size = 11 }: { name: string; size?: numbe
     );
   }
   return <>{name[0].toUpperCase()}</>;
-}
-
-/** The bell rows that are part of the needs-you count: the leads and the
- *  unread shadow hits. Every other row is an event. */
-const NEEDS_YOU_ROWS = new Set(['lead', 'lead-more', 'shadow-hit']);
-
-export function isNeedsYouRow(n: { id: string }): boolean {
-  return NEEDS_YOU_ROWS.has(n.id.split(':', 1)[0]);
 }
 
 /** The panel header line for the bell: "11 need you · 8 events".
@@ -104,6 +103,16 @@ export function Topbar() {
   const [healthOpen, setHealthOpen] = useState(false);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [notifs, setNotifs] = useState<Notification[]>([]);
+  // The rows the panel asks for. "Show more" adds 20. The poll keeps the
+  // limit while the panel is open, and a closed panel goes back to 12.
+  const [limit, setLimit] = useState(NOTIFICATIONS_CAP);
+  const limitRef = useRef(NOTIFICATIONS_CAP);
+  // How many rows the last answer held, before the hidden ones left, and when
+  // it landed. A full answer can have more behind it. Dismiss all hides up to
+  // the moment of the answer the analyst read.
+  const [received, setReceived] = useState(0);
+  const [loadedAt, setLoadedAt] = useState<number | null>(null);
+  const loadRef = useRef<() => void>(() => {});
   const [health, setHealth] = useState<Health | null>(null);
   const [healthFailed, setHealthFailed] = useState(false);
 
@@ -117,14 +126,21 @@ export function Topbar() {
         if (list.length > 0) setWs(list[0].name);
       })
       .catch(() => {});
+    // The events only: the Needs-you block states the leads and the shadow
+    // hits as counts. With 300 unread hits the first 12 rows were all hits,
+    // and every event behind them was off the panel (production 2026-10-14).
+    // `after` is the last Dismiss all, so hidden rows take no place in the
+    // limit.
     const load = () =>
-      getNotifications()
+      getNotifications({ limit: limitRef.current, eventsOnly: true, after: getClearedAt() })
         .then((list) => {
           if (!alive) return;
-          const dismissed = getDismissed();
-          setNotifs(list.filter((n) => !dismissed.has(n.id)));
+          setReceived(list.length);
+          setLoadedAt(Date.now());
+          setNotifs(visibleNotifications(list));
         })
         .catch(() => {});
+    loadRef.current = load;
     load();
     // Topbar mounts on every in-shell route, so this poll runs for the whole
     // session. Skip a backgrounded tab (the house guard, lib/useAsync.ts:118) —
@@ -159,6 +175,19 @@ export function Topbar() {
     dismissNotification(id);
     setNotifs((ns) => ns.filter((n) => n.id !== id));
   };
+  const showMore = () => {
+    const next = nextNotificationLimit(limitRef.current);
+    limitRef.current = next;
+    setLimit(next);
+    loadRef.current();
+  };
+  // A closed panel polls the default list again. The longer list is for the
+  // analyst who asked for it, while the panel is open.
+  useEffect(() => {
+    if (notifOpen || limitRef.current === NOTIFICATIONS_CAP) return;
+    limitRef.current = NOTIFICATIONS_CAP;
+    setLimit(NOTIFICATIONS_CAP);
+  }, [notifOpen]);
   const openNotif = (n: Notification) => {
     if (n.href) {
       navigate(n.href);
@@ -288,6 +317,9 @@ export function Topbar() {
           ? `Notifications, ${fallback} need${fallback === 1 ? 's' : ''} attention`
           : 'Notifications';
   const showSummary = notifs.length > 0 || (need ?? 0) > 0 || needsYou.failed;
+  // The parts of the badge, shown above the events. They add up to the badge.
+  const needsYouParts = needsYouLines(needsYou.data);
+  const more = hasMoreNotifications(received, limit);
 
   return (
     <div className="relative z-30 flex h-[52px] flex-none items-center gap-[11px] border-b border-border bg-[rgba(11,14,19,.7)] py-0 pl-4 pr-3.5 backdrop-blur-[8px]">
@@ -504,18 +536,40 @@ export function Topbar() {
           role="dialog"
           aria-label="Notifications"
           className="absolute right-[46px] top-12 z-[33] w-[332px] animate-fadeUp overflow-hidden rounded-panel border border-border-input bg-surface-card shadow-dropdown">
-          <div className="flex items-baseline gap-2 border-b border-border-2 px-3.5 py-3">
+          <div className="flex flex-wrap items-baseline gap-2 border-b border-border-2 px-3.5 py-3">
             <span className="text-[13px] font-semibold">Notifications</span>
             {showSummary && (
               <span data-testid="notif-summary" className="ml-auto text-[11.5px] text-faint">
                 {notificationSummary(needsYou.data ? need : needsYou.failed ? null : undefined, events.length, floor)}
               </span>
             )}
+            <DismissAllControl
+              compact
+              rows={events}
+              more={more}
+              needsYou={needsYou}
+              loadedAt={loadedAt}
+            />
           </div>
-          {notifs.length === 0 && (
-            <div className="px-3.5 py-6 text-center text-[12px] text-faint">{NO_NOTIFICATIONS}</div>
+          {/* Every unit of the badge, part by part, with its scope. The panel
+              listed 12 shadow hits under a badge of 309 (production
+              2026-10-14). */}
+          {needsYouParts.length > 0 && (
+            <NeedsYouBlock
+              state={needsYou}
+              onFollow={() => setNotifOpen(false)}
+              className="border-b border-border-2 px-3.5 py-2.5"
+            />
           )}
-          {notifs.map((nt) => {
+          {/* The events scroll inside the panel, so "Show more" cannot push the
+              panel past the bottom of the window. */}
+          <div className="max-h-[min(60vh,560px)] overflow-y-auto">
+          {events.length === 0 && (
+            <div className="px-3.5 py-6 text-center text-[12px] text-faint">
+              {needsYouParts.length > 0 ? 'No events.' : NO_NOTIFICATIONS}
+            </div>
+          )}
+          {events.map((nt) => {
             const body = (
               <>
                 <div className="text-[12.5px] leading-[1.45]">
@@ -595,6 +649,17 @@ export function Topbar() {
               </div>
             );
           })}
+          {/* The API cut the list at the limit. A full answer can have more
+              behind it, so the control loads 20 more rows. */}
+          {more && (
+            <button
+              onClick={showMore}
+              className="w-full px-3.5 py-2 text-left text-[12px] font-semibold text-dim hover:bg-[#141b25] hover:text-text"
+            >
+              Show more
+            </button>
+          )}
+          </div>
           <button
             onClick={() => {
               navigate('/notifications');

@@ -94,6 +94,16 @@ The bell in the top bar holds the notifications. Its "View all notifications"
 link opens the Notifications page at `/app/notifications`. The sidebar has no
 entry for that page.
 
+The bell badge states the Needs-you count. The "Needs you" block at the top of
+the bell panel and of the Notifications page lists each part of that count,
+with its scope and a link to its list. The parts add up to the badge. The
+events follow the block. "Show more" loads 20 more events.
+
+"Dismiss all" hides every event up to the moment the list loaded. It also
+marks every unread shadow hit up to that moment as read, and the audit trail
+records it. Leads, alert groups with no verdict, verdicts that need more info and
+recommended actions are decisions. Dismiss all does not touch them.
+
 The Alerts, Investigations and Hunts entries carry a badge for the work that
 waits on you there. The badges are parts of the Needs-you count. The
 Needs-you tile on the Dashboard and the bell state the same total.
@@ -258,11 +268,14 @@ Fitness stays on the model battery in Settings.
 
 ### Outcome and severity tiles
 
-The verdict tiles count alert groups over the range that you picked. The four
-settled verdicts open the Investigations list filtered to that verdict.
-Untriaged opens `/app/alerts`, because a group that nobody investigated has no
-investigation row to show. That link carries your range and
-un-hides acknowledged groups, so the destination holds what the tile counted.
+The verdict tiles count alert groups over the range that you picked. Each group
+counts under the worst verdict among its runs inside that range. A group with no
+run in the range counts under its older verdict. That verdict is inherited, and
+the panel states how many groups carry one.
+
+Each tile opens `/app/alerts` with the same verdict filter. That link carries
+your range and un-hides acknowledged groups, so the destination holds what the
+tile counted.
 
 The severity bars open the same list, filtered to that severity.
 
@@ -344,12 +357,14 @@ by rule and shows the newest first.
   investigation runs as a background task. It survives a closed drawer, it runs
   beside other investigations, and soc-ai records every run. Live progress streams into the drawer: the phase, the
   elapsed time, the tools called and the enrichments.
-- **Verdict badges:** each group and each alert shows its latest investigation
-  verdict: true_positive, false_positive, needs_more_info, running or error. A
-  dashed badge with an "inherited" tooltip means the verdict came from a similar
-  alert. A similar alert has the same rule and the same src/dst pair, inside the
-  inherit window. The badge appears at the individual level and at the group
-  level.
+- **Verdict badges:** each group and each alert shows an investigation verdict:
+  true_positive, false_positive, needs_more_info, running or error. A group
+  shows the worst verdict among its runs inside the time range, with the count
+  of each verdict. A group with no run in the range shows its older verdict as
+  a dashed "inherited" badge with the age of that verdict. An alert shows the
+  verdict of its latest run. A dashed alert badge means the verdict came from a
+  similar alert. A similar alert has the same rule and the same src/dst pair,
+  inside the inherit window.
 - **Permalinks:** every investigation has a URL that you can share,
   `/app/investigation/{id}`. soc-ai creates the URL while the investigation
   still runs.

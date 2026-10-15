@@ -38,7 +38,10 @@ rsync -az --delete \
   --exclude='certs/' --exclude='caddy-root.crt' \
   --exclude='docker-compose.override.yml' \
   --exclude='.venv/' --exclude='evals/' \
-  --exclude='node_modules/' --exclude='.git/' \
+  `# No trailing slash: a worktree has a .git FILE and a node_modules symlink.` \
+  `# The slash form matched directories only, and a deploy from a worktree` \
+  `# left a stray .git file in the destination (2026-10-13).` \
+  --exclude='node_modules' --exclude='.git' \
   --exclude='.coverage*' --exclude='.pytest_cache/' --exclude='.mypy_cache/' \
   --exclude='.ruff_cache/' --exclude='__pycache__/' --exclude='.worktrees/' \
   --exclude='.superpowers/' --exclude='.claude/' --exclude='.remember/' \

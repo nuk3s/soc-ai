@@ -250,6 +250,12 @@ AuditKind = Literal[
     # hash its own store recorded, and this record puts the same hash in the
     # tamper-evident chain (condition 2 of the tier 3 dependency policy).
     "estate_model_fit",
+    # "Dismiss all" in the bell marked every unread shadow hit up to a moment
+    # as read (POST /hunts/shadow-hits/read-all). One click takes hundreds of
+    # hits off the needs-you count, so who did it, when, up to which moment and
+    # how many rows it read belongs on the record. Must be a valid audit kind
+    # or _audit drops it, the trap the downgrade kinds above document.
+    "shadow_hits_read",
     "done",
     "error",
 ]

@@ -68,6 +68,20 @@ vi.mock('react-router-dom', async (importOriginal) => ({
 vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
   getNotifications: vi.fn().mockResolvedValue(ROWS),
+  // Nothing waits on the analyst, so Dismiss all has only the events.
+  getNeedsYouCount: vi.fn().mockResolvedValue({
+    leads_needing_decision: 0,
+    unread_shadow_hits: 0,
+    untriaged_groups: 0,
+    needs_more_info: 0,
+    pending_actions: 0,
+    total: 0,
+    unknown: [],
+    alert_window: '7d',
+    verdict_window: '30d',
+    alert_floor: false,
+  }),
+  markAllShadowHitsRead: vi.fn().mockResolvedValue({ read: 0 }),
 }));
 
 import { TONE_URGENT } from '../lib/tooltips';
@@ -81,9 +95,11 @@ function renderNotifications() {
   );
 }
 
-/** Clear all asks once: press it, then confirm. */
-function clearAll() {
-  fireEvent.click(screen.getByRole('button', { name: /clear all/i }));
+/** Dismiss all asks once: press it, then confirm. The trigger waits for the
+ *  count, which says how many shadow hits it reads. */
+async function dismissAllRows() {
+  await screen.findByText('Nothing needs you.');
+  fireEvent.click(screen.getByRole('button', { name: 'Dismiss all' }));
   fireEvent.click(screen.getByRole('button', { name: 'Dismiss all' }));
 }
 
@@ -290,16 +306,16 @@ describe('Notifications — behaviour the toolbar must not have changed', () => 
     );
   });
 
-  it('Clear all clears rows the active filter is hiding, not just the visible ones', async () => {
-    // "Clear all" has always meant every active notification, and the count
-    // beside it is unfiltered too — narrowing it to the filtered subset would
-    // leave the bell badge counting rows this screen claims it just cleared.
+  it('Dismiss all hides rows the active filter is hiding, not just the visible ones', async () => {
+    // Dismiss all (once "Clear all") means every active notification, and the
+    // count beside it is unfiltered too. Narrowing it to the filtered subset
+    // would leave rows behind that this screen claims it just dismissed.
     renderNotifications();
     await screen.findByText(/ET SCAN Suspicious inbound/);
     fireEvent.click(screen.getByRole('button', { name: /^Hunting/ }));
     await waitFor(() => expect(visibleTitles()).toHaveLength(1));
 
-    clearAll();
+    await dismissAllRows();
     await waitFor(() => expect(screen.getByText('No active notifications.')).toBeTruthy());
     const dismissed = JSON.parse(localStorage.getItem('soc-ai:dismissed-notifications')!);
     expect(dismissed).toHaveLength(ROWS.length);
@@ -325,13 +341,16 @@ describe('Notifications — what the header says the list holds', () => {
   });
 
   it('groups a row under the group the API named for it', async () => {
+    // A shadow hit was the example here. The Needs-you block counts the
+    // shadow hits now, so the list holds an analytic hold, a hunting row whose
+    // id prefix alone would file it under System.
     const api = await import('../lib/api');
     vi.mocked(api.getNotifications).mockResolvedValue([
-      { ...ROWS[0], group: 'hunting', id: 'shadow-hit:1', title: 'Shadow hit on a quiet spec' },
+      { ...ROWS[0], group: 'hunting', id: 'analytic-held:1', title: 'soc-ai moved a quiet spec to shadow.' },
       ROWS[2],
     ] as never);
     renderNotifications();
-    await screen.findByText(/Shadow hit on a quiet spec/);
+    await screen.findByText(/moved a quiet spec to shadow/);
     const headers = screen.getAllByTestId('notification-group').map((h) => h.textContent);
     expect(headers).toContain('Hunting');
     expect(headers).toContain('Investigations');
@@ -363,7 +382,7 @@ describe('Notifications: a finding that must not be silenceable', () => {
   // it raises an uncleaable danger notification every day. But a record whose
   // content no longer matches its own hash is someone changing the record of a
   // decision, and there is no version of that which should go away because
-  // somebody clicked an X, least of all "Clear all", which would sweep it up
+  // somebody clicked an X, least of all "Dismiss all", which would sweep it up
   // with the routine rows in one pass. The server marks those rows
   // undismissible; the screen has to honour it.
   const rows = [
@@ -387,7 +406,7 @@ describe('Notifications: a finding that must not be silenceable', () => {
   beforeEach(() => localStorage.clear());
   afterEach(() => localStorage.clear());
 
-  it('renders the row with no dismiss control, and Clear all steps over it', async () => {
+  it('renders the row with no dismiss control, and Dismiss all steps over it', async () => {
     const api = await import('../lib/api');
     vi.mocked(api.getNotifications).mockResolvedValue(rows as never);
     renderNotifications();
@@ -397,7 +416,7 @@ describe('Notifications: a finding that must not be silenceable', () => {
     expect(visibleTitles()).toHaveLength(2);
     expect(screen.getAllByRole('button', { name: 'Dismiss' })).toHaveLength(1);
 
-    clearAll();
+    await dismissAllRows();
     await waitFor(() => expect(visibleTitles()).toHaveLength(1));
     expect(visibleTitles()[0]).toContain('Audit trail broken');
     const dismissed = JSON.parse(localStorage.getItem('soc-ai:dismissed-notifications')!);
@@ -407,27 +426,29 @@ describe('Notifications: a finding that must not be silenceable', () => {
 
 // A lead sat under the HUNTING heading and counted on the "System 1" chip, and
 // a failed triage sat on "System" while "Investigations" held verdicts only
-// (D7, RD7). The chip and the heading now read one field.
+// (D7, RD7). The chip and the heading now read one field. The leads moved to
+// the Needs-you block on 2026-10-14, so an analytic hold, a hunting row by its
+// wire group only, carries the check.
 describe('Notifications: chips and headings agree', () => {
   beforeEach(() => localStorage.clear());
   afterEach(() => localStorage.clear());
 
-  it('files a lead under Hunting and a failed triage under Investigations', async () => {
+  it('files a hunting row under Hunting and a failed triage under Investigations', async () => {
     const api = await import('../lib/api');
     vi.mocked(api.getNotifications).mockResolvedValue([
       ROWS[0],
       { id: 'inv-failed:INV-7', tone: 'danger', title: 'Triage failed, no verdict: ET X', when: '4m', href: '/investigation/INV-7' },
-      { id: 'lead:15', tone: 'warn', title: 'Lead 15 formed on 192.0.2.8: beaconing', when: '6m', href: '/leads/15', group: 'hunting' },
+      { id: 'analytic-held:15', tone: 'warn', title: 'soc-ai moved Beaconing to shadow.', when: '6m', href: '/hunts?tab=analytics', group: 'hunting' },
     ] as never);
     renderNotifications();
-    await screen.findByText(/Lead 15 formed/);
+    await screen.findByText(/moved Beaconing to shadow/);
     const headings = screen.getAllByTestId('notification-group').map((h) => h.textContent);
     expect(headings).toEqual(['System', 'Investigations', 'Hunting']);
     expect(screen.getByRole('button', { name: /^System/ }).textContent).toContain('1');
     expect(screen.getByRole('button', { name: /^Investigations/ }).textContent).toContain('1');
 
     fireEvent.click(screen.getByRole('button', { name: /^Hunting/ }));
-    await waitFor(() => expect(visibleTitles()).toEqual([expect.stringContaining('Lead 15 formed')]));
+    await waitFor(() => expect(visibleTitles()).toEqual([expect.stringContaining('moved Beaconing to shadow')]));
     fireEvent.click(screen.getByRole('button', { name: /^Investigations/ }));
     await waitFor(() => expect(visibleTitles()).toEqual([expect.stringContaining('Triage failed')]));
   });

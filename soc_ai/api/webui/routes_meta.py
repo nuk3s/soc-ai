@@ -7,9 +7,9 @@ import logging
 import time
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from fastapi import Depends, HTTPException, Request
+from fastapi import Depends, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_serializer
 from sqlalchemy import func, not_, select
 
@@ -17,6 +17,7 @@ from soc_ai import __commit__, __version__
 from soc_ai.api.data_sources import DataSourceOut, collect_data_sources
 from soc_ai.api.deps import get_settings_dep
 from soc_ai.api.webui import routes_hunts
+from soc_ai.api.webui._errors import api_error
 from soc_ai.api.webui._shared import (
     _ago,
     _iso_utc,
@@ -124,6 +125,13 @@ class NotificationOut(BaseModel):
     # frontend/src/lib/labels.ts. The console paints the row from this field
     # and never from the title text.
     outcome: str | None = None
+    # The moment the row describes, as ISO-8601 UTC: the finish of a run, the
+    # start of a run in flight, the birth of a shadow hit, the formation of a
+    # lead, the start of an outage. None on a row that describes no moment,
+    # such as the count of more leads. "Dismiss all" in the console stores a
+    # moment and hides every dismissible row up to it, the rows it never
+    # loaded included.
+    at: str | None = None
 
 
 @router.get("/workspaces", response_model=list[WorkspaceOut])
@@ -138,17 +146,55 @@ async def list_workspaces(settings: Settings = Depends(get_settings_dep)) -> lis
 # a history screen. Items are client-dismissible (stable ids → localStorage).
 _NOTIF_WINDOW = timedelta(hours=24)
 
+# The rows GET /notifications returns when the caller names no limit, and the
+# most it returns. The default is the old fixed length, so a console that sends
+# no limit sees the list it always saw. "Show more" asks for more.
+NOTIF_DEFAULT_LIMIT = 12
+NOTIF_MAX_LIMIT = 200
+
+
+def _notif_cap(base: int, limit: int, *, share: int = 1) -> int:
+    """The cap of one source for a list of ``limit`` rows.
+
+    The default list keeps the old cap. A larger list raises the cap to
+    ``limit // share``, so "Show more" can reach rows past the old cap. A
+    ``share`` above 1 keeps a source that floods, such as failed triages in a
+    gateway outage, from filling a long list on its own.
+    """
+    return max(base, limit // share)
+
+
+def _at(value: datetime | str | None) -> str | None:
+    """The ``at`` of a row: one moment as ISO-8601 UTC, or None.
+
+    A stored timestamp is naive UTC. An alarm slot holds an ISO string. A
+    string that does not parse gives None, so the row is never hidden by a
+    moment it does not have.
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC).isoformat()
+
+
 # Host-dossier conflicts shown at once. A standing disagreement is a slow,
 # durable thing — the whole list is on the dossier conflicts screen, and the
-# bell holds 12 items total, so a network-wide re-address must not push every
-# investigation and hunt off it.
+# default list holds 12 rows, so a network-wide re-address must not push every
+# investigation and hunt off it. A longer list raises the cap to a quarter of
+# its rows (see _notif_cap).
 _DOSSIER_NOTIF_CAP = 3
 
 # Failed triages shown at once. A gateway outage can fail dozens of runs in a
-# window, and the bell holds 12 items total, so an outage must not be the whole
-# panel. The Dashboard's pipeline-error tile carries the full standing count and
-# the list behind it is the complete set; this is the "it is happening now"
-# signal, not the ledger.
+# window, and the default list holds 12 rows, so an outage must not be the whole
+# panel. A longer list raises the cap to a quarter of its rows. The Dashboard's
+# pipeline-error tile carries the full standing count and the list behind it is
+# the complete set; this is the "it is happening now" signal, not the ledger.
 _FAILED_NOTIF_CAP = 3
 
 # What to call the trouble, per probe classification (soc_ai.webui.probes). The
@@ -245,6 +291,7 @@ def _audit_chain_notifications(request: Request) -> list[NotificationOut]:
             when=_ago(since) if since else "just now",
             href="/config",
             dismissible=alarm.get("dismissible") is not False,
+            at=_at(since),
         )
     ]
 
@@ -281,6 +328,7 @@ def _tls_notifications(request: Request) -> list[NotificationOut]:
             title=title,
             when=_ago(since) if since else "just now",
             href="/config#tls",
+            at=_at(since),
         )
     ]
 
@@ -314,11 +362,14 @@ def _oracle_pause_notifications(request: Request) -> list[NotificationOut]:
             title=f"{title}. The local verdicts stand.",
             when=_ago(since) if since else "just now",
             href="/config#oracle",
+            at=_at(since),
         )
     ]
 
 
-async def _dossier_conflict_notifications(request: Request) -> list[NotificationOut]:
+async def _dossier_conflict_notifications(
+    request: Request, limit: int = NOTIF_DEFAULT_LIMIT
+) -> list[NotificationOut]:
     """Bell entries for host-dossier prods the sweep has actually fired.
 
     This is the delivery half of the conflict state machine. Firing writes
@@ -345,7 +396,7 @@ async def _dossier_conflict_notifications(request: Request) -> list[Notification
             rows, _total = await dossier_svc.conflicts_due(
                 db,
                 min_observations=int(settings.dossier_conflict_min_observations),
-                limit=_DOSSIER_NOTIF_CAP,
+                limit=_notif_cap(_DOSSIER_NOTIF_CAP, limit, share=4),
             )
     except Exception:
         _LOGGER.warning("notifications: dossier conflict read failed (continuing)", exc_info=True)
@@ -364,6 +415,7 @@ async def _dossier_conflict_notifications(request: Request) -> list[Notification
                 title=_conflict_line(host, field),
                 when=_ago(raised.isoformat()) if raised is not None else "",
                 href=f"/entity/{host.ip}",
+                at=_at(raised),
             )
         )
     return out
@@ -459,20 +511,33 @@ async def _quality_alarm_notifications(request: Request) -> list[NotificationOut
             title=title,
             when=_ago(since),
             href="/dashboard",
+            at=_at(since),
         )
     ]
 
 
-# Shadow hits and leads shown in the bell at once. The panel scrolls and the
-# Notifications screen holds the full list, so these caps only stop one noisy
-# night from pushing every investigation and hunt off the panel.
+# Shadow hits and leads shown in the bell at once, at the default limit. These
+# caps only stop one noisy night from pushing every investigation and hunt off
+# the list. A larger limit raises them (see _notif_cap).
 _SHADOW_HIT_NOTIF_CAP = 20
-# The leads that get a bell row each. The rest fold into one row with a count.
+# The leads that get a bell row each at the default limit. The rest fold into
+# one row with a count.
 _LEAD_NOTIF_ROWS = 5
 _HOLD_NOTIF_CAP = 10
 
 
-async def _shadow_hit_notifications(request: Request) -> list[NotificationOut]:
+def _lead_rows(limit: int) -> int:
+    """The leads that get a row each in a list of ``limit`` rows.
+
+    Five at the default limit, the old fixed number. Every row a larger limit
+    adds can hold one more lead, so "Show more" unfolds the count of more leads.
+    """
+    return _LEAD_NOTIF_ROWS + max(0, limit - NOTIF_DEFAULT_LIMIT)
+
+
+async def _shadow_hit_notifications(
+    request: Request, limit: int = NOTIF_DEFAULT_LIMIT
+) -> list[NotificationOut]:
     """One bell entry per unread shadow hit.
 
     The unread flag is the transition gate: opening the receipts on Hunts sets
@@ -503,7 +568,7 @@ async def _shadow_hit_notifications(request: Request) -> list[NotificationOut]:
                     select(EntityObservation)
                     .where(*unread_shadow_hits_where(cat))
                     .order_by(EntityObservation.born_at.desc())
-                    .limit(_SHADOW_HIT_NOTIF_CAP)
+                    .limit(_notif_cap(_SHADOW_HIT_NOTIF_CAP, limit))
                 )
             ).all()
     except Exception:
@@ -526,12 +591,15 @@ async def _shadow_hit_notifications(request: Request) -> list[NotificationOut]:
                 href="/hunts?hits=unread",
                 dismissible=False,
                 group="hunting",
+                at=_at(observation.born_at),
             )
         )
     return out
 
 
-async def _analytic_hold_notifications(request: Request) -> list[NotificationOut]:
+async def _analytic_hold_notifications(
+    request: Request, limit: int = NOTIF_DEFAULT_LIMIT
+) -> list[NotificationOut]:
     """One bell entry per analytic that the self-healing hold moved to shadow.
 
     A standing entry, gated on the transition: it shows while the system
@@ -555,7 +623,7 @@ async def _analytic_hold_notifications(request: Request) -> list[NotificationOut
 
     out: list[NotificationOut] = []
     newest_first = sorted(holds.items(), key=lambda item: item[1].id, reverse=True)
-    for analytic_id, version in newest_first[:_HOLD_NOTIF_CAP]:
+    for analytic_id, version in newest_first[: _notif_cap(_HOLD_NOTIF_CAP, limit)]:
         spec = cat.listed.get(analytic_id) if cat is not None else None
         title = spec.title if spec is not None else analytic_id
         out.append(
@@ -566,12 +634,15 @@ async def _analytic_hold_notifications(request: Request) -> list[NotificationOut
                 when=_ago(version.at.replace(tzinfo=UTC).isoformat()),
                 href=f"/hunts?tab=analytics&open={analytic_id}",
                 group="hunting",
+                at=_at(version.at),
             )
         )
     return out
 
 
-async def _lead_notifications(request: Request) -> list[NotificationOut]:
+async def _lead_notifications(
+    request: Request, limit: int = NOTIF_DEFAULT_LIMIT
+) -> list[NotificationOut]:
     """One bell entry per open or hunting lead, whenever it formed.
 
     The id carries the lead id, so a client-side dismissal holds for that lead
@@ -580,7 +651,7 @@ async def _lead_notifications(request: Request) -> list[NotificationOut]:
     the last 24 h only and to mark only a shadow lead warn. The bell then said
     "None need attention" while 10 leads waited on Hunts.
 
-    The newest :data:`_LEAD_NOTIF_ROWS` leads get a row each. One more row
+    The newest :func:`_lead_rows` leads get a row each. One more row
     states how many others are open, so a busy week cannot push every hunt and
     investigation off the bell. That row has no dismiss control: its number is
     live, and the Hunts page is where the leads are decided.
@@ -595,7 +666,7 @@ async def _lead_notifications(request: Request) -> list[NotificationOut]:
                     select(Lead)
                     .where(open_leads)
                     .order_by(Lead.formed_at.desc(), Lead.id.desc())
-                    .limit(_LEAD_NOTIF_ROWS)
+                    .limit(_lead_rows(limit))
                 )
             ).all()
             total = int((await db.scalar(select(func.count(Lead.id)).where(open_leads))) or 0)
@@ -619,6 +690,7 @@ async def _lead_notifications(request: Request) -> list[NotificationOut]:
                 when=_ago(lead.formed_at.replace(tzinfo=UTC).isoformat()),
                 href=f"/leads/{lead.id}",
                 group="hunting",
+                at=_at(lead.formed_at),
             )
         )
     rest = total - len(out)
@@ -639,14 +711,55 @@ async def _lead_notifications(request: Request) -> list[NotificationOut]:
 
 
 @router.get("/notifications", response_model=list[NotificationOut])
-async def list_notifications(request: Request) -> list[NotificationOut]:
-    """In-flight runs + last-24h completions (investigations and hunts).
+async def list_notifications(
+    request: Request,
+    limit: Annotated[
+        int,
+        Query(
+            ge=1,
+            le=NOTIF_MAX_LIMIT,
+            description=f"The most rows to return. 1 to {NOTIF_MAX_LIMIT}. The default is 12.",
+        ),
+    ] = NOTIF_DEFAULT_LIMIT,
+    events_only: Annotated[
+        bool,
+        Query(
+            description="Leave out the shadow-hit rows and the lead rows. The console shows "
+            "them as counts from GET /needs-you.",
+        ),
+    ] = False,
+    after: Annotated[
+        str | None,
+        Query(
+            description="The moment of the last Dismiss all, as ISO-8601. Leave out every "
+            "dismissible row whose moment is at or before it.",
+        ),
+    ] = None,
+) -> list[NotificationOut]:
+    """The standing conditions, the runs in flight and the runs of the last 24 h.
 
-    The bell badge counts exactly this list — it must never advertise an item
-    the panel can't show (the dogfood-2026-07-15 "badge=1, panel empty"
-    phantom). Completions are durable, dismissible entries rather than
-    transient in-flight state that vanishes between polls.
+    The standing conditions come first: a dependency that is down, a broken
+    audit chain, an expiring certificate, a paused Oracle, a quality alarm, a
+    dossier conflict, the unread shadow hits, the analytics soc-ai held, the
+    open leads and the failed triages. The runs follow, newest first.
+
+    The bell badge does not count this list. It states the needs-you count
+    (``GET /needs-you``), and the bell panel shows each part of that count
+    above these rows. ``events_only`` leaves out the shadow-hit rows and the
+    lead rows, so the panel does not show one unit twice and 300 unread hits
+    cannot fill the list ahead of the events.
+
+    ``limit`` cuts the list. Each source has a cap under it, so one noisy
+    source cannot fill the list. A larger limit raises the caps, so "Show
+    more" reaches rows past them.
+
+    ``after`` is the moment of the console's last Dismiss all. The console
+    hides every dismissible row up to that moment, so those rows leave the
+    list before the limit cuts it. Without that, the hidden rows filled the
+    list, and "Show more" offered rows the console then hid. A row the server
+    marks undismissible, and a row with no moment, stay.
     """
+    hide_upto = _after_mark(after)
     cutoff = auth_svc.utcnow() - _NOTIF_WINDOW
     out: list[NotificationOut] = []
     # Status notifications (dogfood 2026-08-05): a currently-down dependency is
@@ -671,16 +784,19 @@ async def list_notifications(request: Request) -> list[NotificationOut]:
                 title=f"{_DEP_LABEL.get(dep, dep)} {trouble}. Investigations are degraded.",
                 when=_ago(since.isoformat()),
                 href=None,
+                at=_at(since),
             )
         )
     out.extend(_audit_chain_notifications(request))
     out.extend(_tls_notifications(request))
     out.extend(_oracle_pause_notifications(request))
     out.extend(await _quality_alarm_notifications(request))
-    out.extend(await _dossier_conflict_notifications(request))
-    out.extend(await _shadow_hit_notifications(request))
-    out.extend(await _analytic_hold_notifications(request))
-    out.extend(await _lead_notifications(request))
+    out.extend(await _dossier_conflict_notifications(request, limit))
+    if not events_only:
+        out.extend(await _shadow_hit_notifications(request, limit))
+    out.extend(await _analytic_hold_notifications(request, limit))
+    if not events_only:
+        out.extend(await _lead_notifications(request, limit))
     # Column-scoped reads (never the report JSON blob): the bell reads ~5 scalar
     # fields from investigations and a denormalized findings_count from hunts, and
     # this endpoint is polled every 15s by every open tab. Both completed-runs
@@ -688,14 +804,16 @@ async def list_notifications(request: Request) -> list[NotificationOut]:
     # finished_at, the clock the bell renders — so a run created before the window
     # but finished inside it appears for investigations AND hunts alike.
     async with request.app.state.db_sessionmaker() as db:
-        running = await inv_svc.list_recent_notifications(db, status="running", limit=20)
+        running = await inv_svc.list_recent_notifications(
+            db, status="running", limit=_notif_cap(20, limit)
+        )
         completed = await inv_svc.list_recent_notifications(
-            db, status="complete", limit=20, finished_since=cutoff
+            db, status="complete", limit=_notif_cap(20, limit), finished_since=cutoff
         )
         failed = await inv_svc.list_recent_notifications(
             db,
             status="error",
-            limit=_FAILED_NOTIF_CAP,
+            limit=_notif_cap(_FAILED_NOTIF_CAP, limit, share=4),
             finished_since=cutoff,
             no_verdict=True,
             exclude_dismissed=True,
@@ -704,12 +822,15 @@ async def list_notifications(request: Request) -> list[NotificationOut]:
             primary_only=True,
         )
         hunts_done = await hunts_svc.list_recent_notifications(
-            db, statuses=_HUNT_NOTIF_STATUSES, limit=20, finished_since=cutoff
+            db,
+            statuses=_HUNT_NOTIF_STATUSES,
+            limit=_notif_cap(20, limit),
+            finished_since=cutoff,
         )
         # The hunts in flight. Each gets a row in the running tone. A hunt
         # that investigates its findings is in flight too.
         hunts_running = await hunts_svc.list_recent_notifications(
-            db, statuses=hunts_svc.OPEN_STATUSES, limit=5
+            db, statuses=hunts_svc.OPEN_STATUSES, limit=_notif_cap(5, limit, share=4)
         )
         # The findings and the narrative of the hunts the threat count cannot
         # settle: a hunt with no threat is clean, unanswered or a failed run.
@@ -733,6 +854,7 @@ async def list_notifications(request: Request) -> list[NotificationOut]:
                 when=_ago(stamp.isoformat()),
                 href=f"/investigation/{inv.id}",
                 isSynthEval=bool(inv.is_synth_eval),
+                at=_at(stamp),
             )
         )
     for inv in running:
@@ -744,6 +866,7 @@ async def list_notifications(request: Request) -> list[NotificationOut]:
                 when=_ago(inv.created_at.isoformat()),
                 href=f"/investigation/{inv.id}",
                 isSynthEval=bool(inv.is_synth_eval),
+                at=_at(inv.created_at),
             )
         )
     done: list[NotificationOut] = []
@@ -767,12 +890,39 @@ async def list_notifications(request: Request) -> list[NotificationOut]:
                 when=_ago(fin.isoformat()),
                 href=f"/investigation/{inv.id}",
                 isSynthEval=bool(inv.is_synth_eval),
+                at=_at(fin),
             )
         )
     for h in hunts_running:
         done.append(_hunt_in_flight(h))
     done.extend(_hunt_notifications(hunts_done, hunt_inputs, hunt_verdicts))
-    return (out + done)[:12]
+    rows = out + done
+    if hide_upto is not None:
+        rows = [row for row in rows if not _cleared(row, hide_upto)]
+    return rows[:limit]
+
+
+def _after_mark(raw: str | None) -> datetime | None:
+    """The ``after`` moment as an aware UTC datetime, or None when not sent."""
+    if raw is None or not raw.strip():
+        return None
+    try:
+        mark = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except ValueError:
+        raise api_error(
+            422,
+            "bad_after",
+            "Send 'after' as an ISO-8601 time, such as 2026-10-14T09:30:00Z. "
+            "The console sends the time of its last Dismiss all.",
+        ) from None
+    return mark if mark.tzinfo is not None else mark.replace(tzinfo=UTC)
+
+
+def _cleared(row: NotificationOut, mark: datetime) -> bool:
+    """Whether a Dismiss all at ``mark`` hides the row. The console's own rule."""
+    if not row.dismissible or not row.at:
+        return False
+    return datetime.fromisoformat(row.at) <= mark
 
 
 def _hunt_in_flight(h: hunts_svc.HuntNotifRow) -> NotificationOut:
@@ -799,6 +949,7 @@ def _hunt_in_flight(h: hunts_svc.HuntNotifRow) -> NotificationOut:
         href=f"/hunts/{h.id}",
         isSynthEval=bool(h.is_synth_eval),
         outcome=outcome,
+        at=_at(h.created_at),
     )
 
 
@@ -943,6 +1094,7 @@ def _hunt_notice(
         href=f"/hunts/{h.id}",
         isSynthEval=bool(h.is_synth_eval),
         outcome=outcome,
+        at=_at(_stamp(h)),
     )
 
 
@@ -970,6 +1122,7 @@ def _folded_notice(group: list[tuple[hunts_svc.HuntNotifRow, str, str]]) -> Noti
         tone=hunt_outcome_tone(outcome),
         title=title,
         when=_ago(_stamp(newest).isoformat()),
+        at=_at(_stamp(newest)),
         href="/hunts?kind=triggered",
         isSynthEval=any(bool(h.is_synth_eval) for h, _o, _hl in group),
         outcome=outcome,

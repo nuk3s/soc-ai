@@ -28,6 +28,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
   clearHostChat: vi.fn(),
   getObservations: vi.fn(),
   getLeads: vi.fn(),
+  getLeadCount: vi.fn(),
   getNeedsYou: vi.fn(),
 }));
 
@@ -37,6 +38,7 @@ import {
   getDossierRefreshStatus,
   getHostActivity,
   getHostChat,
+  getLeadCount,
   getLeads,
   getMachine,
   getMe,
@@ -172,6 +174,9 @@ beforeEach(() => {
   vi.mocked(getHostChat).mockReset().mockResolvedValue({ messages: [], pending: false });
   vi.mocked(getObservations).mockReset().mockResolvedValue({ entity: PRIMARY, days: 7, observations: [] });
   vi.mocked(getLeads).mockReset().mockResolvedValue([]);
+  vi.mocked(getLeadCount)
+    .mockReset()
+    .mockImplementation(async (status = 'open', query) => ({ status, entity: query?.entity ?? null, total: 0 }));
   vi.mocked(getNeedsYou).mockReset().mockRejectedValue(new Error('offline'));
 });
 
@@ -273,9 +278,9 @@ describe('HostDetail: the first screen leads with leads and verdicts', () => {
     const lines = await screen.findByTestId('host-situation');
     await waitFor(() =>
       expect(within(lines).getAllByRole('listitem').map((li) => li.textContent)).toEqual([
-        'Lead 11 waits on a decision. Its hunt found threats.',
-        '5 true-positive alerts, 5 days ago.',
-        '1 alert needs more information, 2 days ago.',
+        'Lead 11 waits on a decision. Its hunt found threats. all open leads',
+        '5 true-positive alerts, 5 days ago. last 7 days',
+        '1 alert needs more information, 2 days ago. last 7 days',
       ]),
     );
     expect(within(lines).getByRole('link', { name: /Lead 11/ }).getAttribute('href')).toBe('/leads/11');
@@ -287,6 +292,40 @@ describe('HostDetail: the first screen leads with leads and verdicts', () => {
     expect(
       lines.compareDocumentPosition(screen.getByTestId('host-sentence')) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
+  });
+
+  it('asks the server for the open leads on this host', async () => {
+    mount('/hosts/agent%3Aea2d');
+    await screen.findByTestId('host-situation');
+    // The server filters before its row limit. The page read the newest 50
+    // leads of the estate and kept the ones on this host, so an older lead
+    // on the host never reached the hero.
+    expect(getLeads).toHaveBeenCalledWith('open_or_hunting', { entity: PRIMARY, limit: 200 });
+    expect(getLeadCount).toHaveBeenCalledWith('open_or_hunting', { entity: PRIMARY });
+    expect(getLeads).not.toHaveBeenCalledWith('all');
+  });
+
+  it('counts every open lead on the host, past the rows it read', async () => {
+    vi.mocked(getLeadCount).mockImplementation(async (status = 'open', query) => ({
+      status,
+      entity: query?.entity ?? null,
+      total: status === 'open_or_hunting' ? 5 : 2,
+    }));
+    mount('/hosts/agent%3Aea2d');
+    const lines = await screen.findByTestId('host-situation');
+    await waitFor(() =>
+      expect(within(lines).getByText('4 more open leads name this host.')).toBeTruthy(),
+    );
+  });
+
+  it('states the sweep window on the event counts', async () => {
+    vi.mocked(getMachine).mockResolvedValue(
+      machine({ dossier: dossier(PRIMARY, {}, { lookback_days: 14 }) }),
+    );
+    mount('/hosts/agent%3Aea2d');
+    expect((await screen.findByTestId('hero-events')).textContent).toBe('3,662 events in the last 14 days');
+    const table = await screen.findByTestId('host-addresses');
+    expect(within(table).getByRole('columnheader', { name: 'Events, last 14 days' })).toBeTruthy();
   });
 
   it('counts the alert verdicts under the Alerts card', async () => {

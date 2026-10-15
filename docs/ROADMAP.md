@@ -291,5 +291,5 @@ Plans change if evidence says they should. This page tracks what is real. The
 [1.5.0 release notes](releases/1.5.0.md) hold the measured numbers and the
 upgrade steps. The [1.5.1 release notes](releases/1.5.1.md) list the review
 fixes made after 1.5.0. The [1.5.2 release notes](releases/1.5.2.md) describe the two TLS
-paths. The [hunting guide](HUNTING.md) covers the pipeline. The
+paths. The [1.5.3 release notes](releases/1.5.3.md) describe the detection ladder. The [hunting guide](HUNTING.md) covers the pipeline. The
 [changelog](project/changelog.md) holds the full version-by-version record.

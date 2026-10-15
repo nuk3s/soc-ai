@@ -23,6 +23,7 @@ import {
   relativeAge,
   roleLabel,
   selfReportedFields,
+  sweepWindowWords,
 } from '../lib/hostDossier';
 import type { SituationLine } from '../lib/hostSituation';
 import { absTime } from '../lib/timeRange';
@@ -42,7 +43,8 @@ export interface HostHeroProps {
    *  host's. The newer of the two wins. */
   lastActivity?: string | null;
   /** The open leads and the alert verdicts of the last seven days, as
-   *  sentences. They lead the hero, above the identity sentence. */
+   *  sentences. They lead the hero, above the identity sentence. Each line
+   *  carries its scope in visible words. */
   situation?: SituationLine[];
 }
 
@@ -67,6 +69,19 @@ function Situation({ lines }: { lines: SituationLine[] }) {
             </Link>
           ) : (
             line.text
+          )}
+          {/* The scope, as words on screen. The 24h and 7d buttons do not
+              change these lines, and a hover title is not a label. */}
+          {line.scope && (
+            <>
+              {' '}
+              <span
+                data-testid="situation-scope"
+                className="ml-1 whitespace-nowrap font-mono text-[11px] font-normal text-faint"
+              >
+                {line.scope}
+              </span>
+            </>
           )}
         </li>
       ))}
@@ -238,7 +253,9 @@ function MachineHero({
         </p>
 
         <div data-testid="hero-facts" className="mt-2.5 flex flex-wrap gap-x-5 gap-y-1 font-mono text-[11px] text-faint">
-          <span title="Events on every address of this machine">{machine.events.toLocaleString()} events</span>
+          <span data-testid="hero-events" title="Events on every address of this machine. The sweep counts them. The 24h and 7d buttons do not change this count.">
+            {machine.events.toLocaleString()} events in the {sweepWindowWords(dossier.lookback_days)}
+          </span>
           <span title={absTime(machine.first_seen)}>first seen {relativeAge(machine.first_seen)}</span>
           <span data-testid="hero-last-seen" title={absTime(lastSeen)}>
             last seen {relativeAge(lastSeen)}
@@ -400,8 +417,11 @@ function AddressHero({ dossier, adminBlocked, lastActivity, situation = [] }: Ho
             claims a build that actually completed (F3's "built from 433
             events" beside "last built —"). */}
         <div data-testid="hero-facts" className="mt-2.5 flex flex-wrap gap-x-5 gap-y-1 font-mono text-[11px] text-faint">
-          <span title="Events the sweep has aggregated for this host">
-            {dossier.event_count.toLocaleString()} events
+          <span
+            data-testid="hero-events"
+            title="Events the sweep has aggregated for this host. The 24h and 7d buttons do not change this count."
+          >
+            {dossier.event_count.toLocaleString()} events in the {sweepWindowWords(dossier.lookback_days)}
           </span>
           <span title={absTime(dossier.first_seen)}>first seen {relativeAge(dossier.first_seen)}</span>
           <span data-testid="hero-last-seen" title={absTime(lastSeen)}>
