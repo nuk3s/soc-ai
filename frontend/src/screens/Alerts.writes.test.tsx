@@ -121,20 +121,23 @@ async function poll() {
 
 async function pressEscalateKey() {
   await screen.findByText('NTLM Session Setup');
-  await act(async () => {
-    fireEvent.keyDown(window, { key: 'j' });
-  });
-  await act(async () => {
-    fireEvent.keyDown(window, { key: 'e' });
-  });
-  // Every escalate asks first (dogfood 2026-10-06, investigation S2). The
-  // confirm renders at once, but a loaded box can take over a second to paint
-  // the Alerts screen, so the wait is wider than the default.
-  fireEvent.click(
-    within(await screen.findByTestId('escalate-confirm', {}, { timeout: 5000 })).getByRole('button', {
-      name: /^Open/,
-    }),
+  // The key listener attaches in an effect after the rows paint. On a loaded
+  // runner a key pressed in that gap reaches the listener of the previous
+  // render, which sees no row, and the press does nothing. The 1.5.3 release
+  // run failed here (2026-10-15). So each press repeats until its effect
+  // shows: j until the confirm can open, e until the confirm is up. The list
+  // holds one row, so a repeated j stays on it, and the screen ignores e
+  // while the confirm is open. Every escalate asks first (dogfood
+  // 2026-10-06, investigation S2).
+  const confirm = await waitFor(
+    () => {
+      fireEvent.keyDown(window, { key: 'j' });
+      fireEvent.keyDown(window, { key: 'e' });
+      return screen.getByTestId('escalate-confirm');
+    },
+    { timeout: 5000 },
   );
+  fireEvent.click(within(confirm).getByRole('button', { name: /^Open/ }));
 }
 
 const timedOut = () => new RequestTimeoutError(SO_WRITE_TIMEOUT_MS, WRITE_TIMEOUT_NOTE);

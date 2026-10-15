@@ -13,6 +13,12 @@ release note is [docs/releases/1.5.3.md](docs/releases/1.5.3.md). The work start
 of twelve browser and API dogfood agents on 2026-10-01. The sections below hold what they found
 and what changed after.
 
+### Security (2026-10-15)
+
+- **pydantic-ai-slim 1.107.7.** The lock moves `pydantic-ai-slim` and `pydantic-graph` from
+  1.107.0 to 1.107.7. The new version closes PYSEC-2026-4283 to PYSEC-2026-4291. The dependency
+  audit of the first 1.5.3 release run found them. The pin stays `>=1.0,<2`.
+
 ### Alert verdicts follow the time filter (2026-10-14)
 
 - **Runs inside the page window decide the verdict of an alert group.** Everything on a page
