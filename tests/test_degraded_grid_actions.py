@@ -415,7 +415,13 @@ def test_stalled_grid_is_bounded_by_the_console_budget(
             resp = c.request(method, path, json=body)
             elapsed = time.monotonic() - started
         assert resp.status_code == expected_status
-        assert elapsed < budget * 2, f"{path} took {elapsed:.1f}s against a {budget}s budget"
+        # The guard catches the stalls this test exists for: the ES retry
+        # budget held a route for about 90 s, and an uncached inventory read
+        # for 10 to 12 s. A route here gives up at the budget plus about
+        # 0.2 s on a quiet machine. A loaded CI runner added 1.6 s and failed
+        # the 1.5.3 release run at "budget * 2" (2026-10-15). Five times the
+        # budget still fails every stall above 5 s.
+        assert elapsed < budget * 5, f"{path} took {elapsed:.1f}s against a {budget}s budget"
 
 
 def test_stalled_grid_costs_a_rehunt_batch_one_budget_not_one_per_row(
@@ -468,7 +474,8 @@ def test_stalled_grid_costs_a_rehunt_batch_one_budget_not_one_per_row(
         assert [s["invId"] for s in body["started"]] == [named_id]
         assert [s["invId"] for s in body["skipped"]] == nameless_ids
         assert {s["reason"] for s in body["skipped"]} == {"grid_unavailable"}
-        assert elapsed < budget * 2, (
+        # Five times the budget: the stall is 30 s. See the console-budget test.
+        assert elapsed < budget * 5, (
             f"{len(nameless_ids)} nameless rows spent {elapsed:.1f}s of a {budget}s budget — "
             "the batch is paying one timeout per row"
         )

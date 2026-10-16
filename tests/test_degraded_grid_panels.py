@@ -416,7 +416,9 @@ def test_a_grid_that_accepts_and_never_answers_does_not_hang_the_panel(
         started = time.perf_counter()
         resp = client.get(panel.path, params=panel.params)
         elapsed = time.perf_counter() - started
-        assert elapsed < budget * 2, (
+        # Four times the budget stays under the 6 s stall. A loaded CI runner
+        # added 1.6 s to a 1 s budget on 2026-10-15.
+        assert elapsed < budget * 4, (
             f"{panel.id} took {elapsed:.1f}s against a silent grid — it is waiting on the "
             f"ES retry budget, not on webui_grid_timeout_s={budget}"
         )
@@ -695,7 +697,9 @@ async def test_the_fitness_chip_forgets_its_history_rather_than_freezing_the_pag
     )
     elapsed = time.perf_counter() - started
 
-    assert elapsed < budget * 2, (
+    # Four times the budget stays under the 6 s stall. A loaded CI runner
+    # added 1.6 s to a 1 s budget on 2026-10-15.
+    assert elapsed < budget * 4, (
         f"the fitness history read took {elapsed:.1f}s against a silent grid — it is "
         f"waiting on the ES retry budget, not on webui_grid_timeout_s={budget}"
     )
