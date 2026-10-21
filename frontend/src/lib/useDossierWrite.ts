@@ -24,7 +24,7 @@ export function useDossierWrite(onApplied: (next: Dossier) => void) {
         after?.();
       })
       .catch((e: unknown) => {
-        const msg = e instanceof Error ? e.message : 'That did not go through.';
+        const msg = e instanceof Error ? e.message : 'The change did not save. Try again.';
         // require_admin_api's 403 carries a `reason` and no `hint`, so request()
         // hands back the bare status line. Say what it means instead.
         setErr(/^403\b/.test(msg) ? 'Only an admin can change this.' : msg);

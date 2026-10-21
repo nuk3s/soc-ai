@@ -8,7 +8,7 @@
 # with #. It also ignores anything after a space-then-# on a value line. Quote a
 # value that contains ` #`, as KEY='value'. A blank value falls back to the
 # default shown.
-# setup.conf holds secrets — it is chmod 600 and gitignored; keep it private.
+# setup.conf holds secrets. It is chmod 600 and gitignored. Keep it private.
 
 # ── REQUIRED ──────────────────────────────────────────────────────────────────
 # Security Onion URL
@@ -35,16 +35,17 @@ LITELLM_VERIFY_SSL=true
 
 # ── Grid-specific tuning (defaults fit most single-node grids) ────────────────
 # What the triage queue counts as an alert. SO's own pipelines tag Suricata,
-# Sigma, Wazuh and Strelka `tags:alert`; Elastic Defend endpoint alerts carry
-# ECS `event.kind:alert` instead, so the default unions both. Narrow it (e.g.
-# to event.dataset:suricata.alert) only after checking `soc-ai doctor`.
+# Sigma, Wazuh and Strelka with `tags:alert`. Elastic Defend endpoint alerts
+# carry ECS `event.kind:alert`. The default joins both. Narrow it only after you
+# check `soc-ai doctor`, for example to event.dataset:suricata.alert.
 WEBUI_ALERTS_QUERY=tags:alert OR event.kind:alert
-# Events live in SO 3.x `logs-*` data streams. setup.sh auto-detects the cluster
-# prefix during its ES check and writes the concrete value; leave blank to accept
-# that. Single-node = logs-* ; multi-node / distributed = *:logs-* .
-# Keep the `logs-*` (data-stream name) form. The `.ds-…` form addresses hidden
-# backing indices and forces you to list Elastic Agent namespaces — omit
-# `.ds-logs-*-default-*` and system.auth/system.syslog vanish with no error.
+# Events are in SO 3.x `logs-*` data streams. During its ES check, setup.sh
+# detects the cluster prefix and writes the concrete value. Leave blank to accept
+# that value. Single-node = logs-* ; multi-node or distributed = *:logs-* .
+# Keep the `logs-*` form, which is the data-stream name. The `.ds-…` form
+# addresses hidden backing indices and makes you list each Elastic Agent
+# namespace. If you omit `.ds-logs-*-default-*`, system.auth and system.syslog
+# disappear with no error.
 EVENTS_INDEX_PATTERN=logs-*
 # require a login or token for the API. Recommended.
 API_AUTH_REQUIRED=true

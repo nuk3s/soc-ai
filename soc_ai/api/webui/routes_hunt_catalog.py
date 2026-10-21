@@ -22,6 +22,13 @@ from pydantic import BaseModel
 
 from soc_ai.api.webui._shared import _iso_z, router
 from soc_ai.hunting.catalog_tiers import effective_catalog
+from soc_ai.hunting.loop_health import (
+    OUTCOME_FAILED,
+    OUTCOME_OK,
+    LoopSnapshot,
+    error_sentence,
+    prior_health,
+)
 from soc_ai.hunting.prior_sweep import RECENT_MAX_ENTITIES
 from soc_ai.hunting.window import sweep_window
 from soc_ai.store import analytics as analytics_store
@@ -136,6 +143,36 @@ class HuntCatalogSpecOut(BaseModel):
     undecided_docs: int
     unattributed_docs: int
     truncated_docs: int
+    # The newest failed run of this analytic as one console sentence, or None
+    # when the newest run did not fail. ``last_error`` keeps the raw text for
+    # whoever fixes it. The Analytics tab read "live" and "observed nothing"
+    # over a raw exception it never showed (dogfood 2026-10-19 R3-D1).
+    last_error_text: str | None = None
+    # The failed runs of the window. The counters above read zero over a
+    # failed run, so a day of failures read as a quiet day (R5-D4).
+    failed_24h: int = 0
+    # The first failed run of the current streak of failures, or None when
+    # the newest run did not fail.
+    failing_since: str | None = None
+
+
+class LoopHealthOut(BaseModel):
+    """What one sweep loop did on its recent runs.
+
+    ``last_outcome`` is ``ok``, ``failed`` or ``skipped``. A skipped run is a
+    due profile sweep that the loop did not run because the grid was down.
+    ``runs_24h`` and ``failed_24h`` count the runs since ``counted_since``,
+    at most 24 h back. The profile sweep keeps its record in memory, so after
+    a restart ``counted_since`` is the first run after the restart.
+    """
+
+    last_run_at: str | None
+    last_outcome: str
+    last_error_text: str | None = None
+    runs_24h: int = 0
+    failed_24h: int = 0
+    failing_since: str | None = None
+    counted_since: str | None = None
 
 
 class HuntCatalogOut(BaseModel):
@@ -166,6 +203,42 @@ class HuntCatalogOut(BaseModel):
     # because the profile sweep is.
     prior_sweeps_enabled: bool = True
     last_prior_run_at: str | None = None
+    # How often the profile sweep runs, after its floor. The page reads it to
+    # call a profile sweep overdue, the way it reads the catalog interval.
+    prior_sweep_interval_minutes: int = 60
+    # The result of each loop: the newest run, and the failed runs of the
+    # last day (R5-I3). None for a loop with no run on record.
+    sweep_health: LoopHealthOut | None = None
+    prior_sweep_health: LoopHealthOut | None = None
+
+
+def _prior_health_out(snap: LoopSnapshot | None) -> LoopHealthOut | None:
+    if snap is None:
+        return None
+    return LoopHealthOut(
+        last_run_at=_iso_z(snap.last_at),
+        last_outcome=snap.last_outcome,
+        last_error_text=snap.last_error_text,
+        runs_24h=snap.runs_24h,
+        failed_24h=snap.failed_24h,
+        failing_since=_iso_z(snap.failing_since) if snap.failing_since else None,
+        counted_since=_iso_z(snap.counted_since),
+    )
+
+
+def _profile_error(snap: LoopSnapshot | None, spec_id: str) -> tuple[str | None, str | None]:
+    """The raw error and the console sentence of a profile analytic's last run.
+
+    The last attempt of the loop is the last run of every analytic in it. A
+    failed or skipped attempt is the error of each of them. A completed
+    attempt names its own analytics that failed.
+    """
+    if snap is None:
+        return None, None
+    if snap.last_outcome != OUTCOME_OK:
+        return snap.last_error, snap.last_error_text
+    raw = snap.spec_errors.get(spec_id)
+    return raw, error_sentence(raw)
 
 
 def _coverage_out(run: Any) -> PriorCoverageOut | None:
@@ -202,8 +275,15 @@ def _profile_spec_out(
     run: Any,
     trail: Any,
     held_by_system: str | None = None,
+    health: LoopSnapshot | None = None,
 ) -> HuntCatalogSpecOut:
-    """One profile analytic, every trail field read from the prior sweep's trail."""
+    """One profile analytic, every trail field read from the prior sweep's trail.
+
+    The error fields come from the loop's own record. The trail records the
+    runs that completed, so it holds no error.
+    """
+    raw_error, error_text = _profile_error(health, spec.id)
+    failing = health is not None and health.last_outcome != OUTCOME_OK
     return HuntCatalogSpecOut(
         id=spec.id,
         title=spec.title,
@@ -219,9 +299,14 @@ def _profile_spec_out(
         last_fired_at=_iso_z(trail.last_fired_at) if trail else None,
         # Blindness of a profile analytic is in its coverage counts.
         blind=False,
-        # The prior trail records completed runs only. A run that wrote a row
-        # did not fail on this analytic.
-        last_error=None,
+        last_error=raw_error,
+        last_error_text=error_text,
+        failed_24h=health.failed_24h if health is not None else 0,
+        failing_since=(
+            _iso_z(health.failing_since)
+            if failing and health is not None and health.failing_since
+            else None
+        ),
         sweeps_24h=trail.runs_24h if trail else 0,
         fired_24h=trail.fired_24h if trail else 0,
         fresh_24h=0,
@@ -247,6 +332,9 @@ async def get_hunt_catalog(request: Request) -> HuntCatalogOut:
         prior_status = await prior_spec_runs.catalog_status(db, now=now)
         # The one answer the Analytics tab, the drawer and the bell read.
         holds = await analytics_store.system_holds(db)
+        match_ids = {s.id for s in cat.listed.values() if s.evaluator == "match"}
+        loop = await sweeps_svc.loop_status(db, now=now, spec_ids=match_ids)
+    prior_snap = prior_health(request.app.state).snapshot(now)
 
     catalog = cat.listed
     specs: list[HuntCatalogSpecOut] = []
@@ -268,6 +356,7 @@ async def get_hunt_catalog(request: Request) -> HuntCatalogOut:
                     run=prior_runs.get(spec.id),
                     trail=prior_status.get(spec.id),
                     held_by_system=held,
+                    health=prior_snap,
                 )
             )
             continue
@@ -288,6 +377,9 @@ async def get_hunt_catalog(request: Request) -> HuntCatalogOut:
                 last_fired_at=_iso_z(s.last_fired_at) if s else None,
                 blind=s.blind if s else False,
                 last_error=s.last_error if s else None,
+                last_error_text=error_sentence(s.last_error) if s else None,
+                failed_24h=s.failed_24h if s else 0,
+                failing_since=_iso_z(s.failing_since) if s and s.failing_since else None,
                 sweeps_24h=s.sweeps_24h if s else 0,
                 fired_24h=s.fired_24h if s else 0,
                 fresh_24h=s.fresh_24h if s else 0,
@@ -318,4 +410,27 @@ async def get_hunt_catalog(request: Request) -> HuntCatalogOut:
         last_sweep_at=_iso_z(last_sweep),
         prior_sweeps_enabled=bool(getattr(settings, "hunting_prior_sweep_enabled", True)),
         last_prior_run_at=_iso_z(max((p.last_run_at for p in prior_status.values()), default=None)),
+        prior_sweep_interval_minutes=_prior_interval(settings),
+        sweep_health=_loop_out(loop),
+        prior_sweep_health=_prior_health_out(prior_snap),
     )
+
+
+def _loop_out(loop: sweeps_svc.LoopStatus | None) -> LoopHealthOut | None:
+    if loop is None:
+        return None
+    return LoopHealthOut(
+        last_run_at=_iso_z(loop.last_run_at),
+        last_outcome=OUTCOME_FAILED if loop.last_failed else OUTCOME_OK,
+        last_error_text=error_sentence(loop.last_error) if loop.last_failed else None,
+        runs_24h=loop.runs_24h,
+        failed_24h=loop.failed_24h,
+        failing_since=_iso_z(loop.failing_since) if loop.failing_since else None,
+    )
+
+
+def _prior_interval(settings: Any) -> int:
+    """The profile sweep interval, after the floor the loop applies."""
+    from soc_ai.main import _prior_sweep_interval_minutes  # noqa: PLC0415 - lazy, avoids a cycle
+
+    return _prior_sweep_interval_minutes(settings)

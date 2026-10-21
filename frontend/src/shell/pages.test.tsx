@@ -8,7 +8,7 @@ import { act, render, screen } from '@testing-library/react';
 import { MemoryRouter, useNavigate } from 'react-router-dom';
 import { describe, expect, it } from 'vitest';
 
-import { crumbFor, pageLabel } from './pages';
+import { crumbFor, entityNavSection, pageLabel } from './pages';
 import { PreviousPageTracker } from './PreviousPageTracker';
 import { ShortcutSheet } from './ShortcutSheet';
 import { ShellProvider, useShell } from './ShellContext';
@@ -28,6 +28,25 @@ describe('crumbFor', () => {
 
   it('decodes the record it names', () => {
     expect(crumbFor('/hosts/agent%3A7f3a').crumb2).toBe('agent:7f3a');
+  });
+
+  // Dogfood 2026-10-19, R4-D23: the page of a user account read
+  // "Hosts / svc-backup" beside a server icon.
+  it('names a user and a domain page by their type', () => {
+    expect(crumbFor('/entity/svc-backup', '?type=user')).toEqual({ crumb: 'User', crumb2: 'svc-backup' });
+    expect(crumbFor('/entity/corp.example', '?type=domain')).toEqual({ crumb: 'Domain', crumb2: 'corp.example' });
+    // NEGATIVE CONTROL: an address keeps the Hosts crumb.
+    expect(crumbFor('/entity/198.51.100.7', '?view=entity')).toEqual({ crumb: 'Hosts', crumb2: '198.51.100.7' });
+    expect(pageLabel('/entity/svc-backup?type=user')).toBe('User');
+    expect(pageLabel('/entity/198.51.100.7')).toBe('Host');
+  });
+
+  it('lights the Hosts entry for an address page and no entry for a user page', () => {
+    expect(entityNavSection('/entity/198.51.100.7', '')).toBe('/hosts');
+    expect(entityNavSection('/entity/svc-backup', '?type=user')).toBeNull();
+    expect(entityNavSection('/entity/corp.example', '?type=domain')).toBeNull();
+    // NEGATIVE CONTROL: a page that is no entity page is not this rule's.
+    expect(entityNavSection('/investigations', '')).toBeUndefined();
   });
 
   // NEGATIVE CONTROL. An unknown path has no breadcrumb.

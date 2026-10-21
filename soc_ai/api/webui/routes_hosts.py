@@ -32,7 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from soc_ai.api.deps import get_settings_dep
 from soc_ai.api.webui._errors import api_error
 from soc_ai.api.webui._shared import _iso_utc, router
-from soc_ai.api.webui.routes_dossier import DossierOut, _current_dossier
+from soc_ai.api.webui.routes_dossier import DossierOut, _current_dossier, last_finished_sweep
 from soc_ai.config import Settings
 from soc_ai.dossier.infer import ROLE_VOCABULARY
 from soc_ai.dossier.resolve import (
@@ -43,7 +43,7 @@ from soc_ai.dossier.resolve import (
 from soc_ai.store import host_dossier as dossier_store
 from soc_ai.store import host_machines
 from soc_ai.store.host_machines import address_sort_key, normalize_mac, short_name
-from soc_ai.store.models import DossierRun, HostDossier, HostDossierField, HostMachine
+from soc_ai.store.models import HostDossier, HostDossierField, HostMachine
 
 # "New" means first seen inside this window.
 _NEW_DAYS = 7
@@ -67,6 +67,11 @@ _DEFAULT_DIR: dict[str, str] = {
     "last_seen": "desc",
 }
 _ROLE_BUCKETS: tuple[str, ...] = ("unknown", "low_confidence", "stale")
+# A role filter on a guess the resolver withheld: ``guess:<slug>`` lists the
+# machines whose low-confidence or stale guess is that role. The role menu
+# listed the guesses as two buckets with no role (dogfood 2026-10-19, R4-I6).
+_GUESS_PREFIX = "guess:"
+_GUESS_STATES = ("low_confidence", "stale")
 _YES_NO: tuple[str, ...] = ("yes", "no")
 _ACTIVITY: tuple[str, ...] = ("active", "all")
 _SEEN: tuple[str, ...] = ("new",)
@@ -163,12 +168,23 @@ class MachineSummaryOut(BaseModel):
     named: int = 0
     unnamed: int = 0
     roles: dict[str, int] = Field(default_factory=dict)
+    # Each role the resolver withheld as a guess, low confidence or stale,
+    # with its machine count. A count is the total of ``role=guess:<slug>``.
+    # The same machines sit in the low_confidence and stale buckets above.
+    role_guesses: dict[str, int] = Field(default_factory=dict)
     needs_attention: int = 0
     # The two parts of needs_attention: a clean build older than the
     # staleness window, and no clean build at all. They sum to it.
     out_of_date: int = 0
     conflicts: int = 0
+    # Every machine with no clean build: never built, or the last build
+    # failed. The ``health=broken`` filter lists the same machines. The name
+    # stays for older clients.
     never_built: int = 0
+    # The part of never_built whose primary address holds a build error: the
+    # last build failed. ``never_built - build_failed`` is the count of
+    # machines that were never built.
+    build_failed: int = 0
     last_sweep_at: str | None = None
     stale_hours: float | None = None
 
@@ -596,6 +612,11 @@ class _Filters:
 def _role_matches(view: _View, role: str) -> bool:
     if role in _ROLE_BUCKETS:
         return view.role.state == role
+    if role.startswith(_GUESS_PREFIX):
+        return (
+            view.role.state in _GUESS_STATES
+            and (view.role.guess or "").lower() == role[len(_GUESS_PREFIX) :]
+        )
     return view.role.state in ("declared", "inferred") and (view.role.value or "").lower() == role
 
 
@@ -685,9 +706,11 @@ def _check_role(value: str | None, views: list[_View]) -> str | None:
         return None
     folded = value.strip().lower()
     held = {(v.role.value or "").lower() for v in views if v.role.value}
+    guessed = {(v.role.guess or "").lower() for v in views if v.role.guess}
+    guesses = {f"{_GUESS_PREFIX}{slug}" for slug in {*ROLE_VOCABULARY, *guessed} if slug}
     legal = sorted({*ROLE_VOCABULARY, *_ROLE_BUCKETS, *held} - {""})
-    if folded not in legal:
-        _refuse("role", value, legal)
+    if folded not in legal and folded not in guesses:
+        _refuse("role", value, [*legal, f"{_GUESS_PREFIX}<role>"])
     return folded
 
 
@@ -807,24 +830,22 @@ async def machine_summary(
 
     Each count is the ``total`` of the list with one filter and the same
     ``activity``: ``with_agent`` is ``agent=yes``, ``new_7d`` is ``seen=new``,
-    a role count is ``role=<slug>``, ``unknown`` is ``role=unknown``, ``named``
+    a role count is ``role=<slug>``, a guessed role count is
+    ``role=guess:<slug>``, ``unknown`` is ``role=unknown``, ``named``
     is ``named=yes``, ``never_built`` is ``health=broken``, ``needs_attention``
     is ``health=attention`` and ``conflicts`` is ``conflict=yes``. Needs
     attention does not count conflicts, so no machine is counted twice on the
     cards. ``activity`` defaults to ``all``: the cards count every machine. The
     header menus send the activity of the list, so a menu count is the number
-    of rows the filter shows.
+    of rows the filter shows. ``build_failed`` is the part of ``never_built``
+    whose last build failed, so the card can name the two parts.
     """
     scope = _check("activity", activity, _ACTIVITY) or "all"
     knobs = _knobs(settings)
     async with request.app.state.db_sessionmaker() as db:
         views = [v for v in await _estate(db, knobs) if _keep(v, _Filters(activity=scope))]
-        last_sweep = await db.scalar(
-            select(DossierRun.finished_at)
-            .where(DossierRun.finished_at.is_not(None))
-            .order_by(DossierRun.finished_at.desc())
-            .limit(1)
-        )
+        last_run = await last_finished_sweep(db)
+    last_sweep = last_run.finished_at if last_run is not None else None
     roles: dict[str, int] = {}
     for view in views:
         if view.role.state in ("declared", "inferred") and view.role.value:
@@ -832,6 +853,11 @@ async def machine_summary(
             roles[slug] = roles.get(slug, 0) + 1
     for bucket in _ROLE_BUCKETS:
         roles[bucket] = sum(1 for view in views if view.role.state == bucket)
+    guesses: dict[str, int] = {}
+    for view in views:
+        if view.role.state in _GUESS_STATES and view.role.guess:
+            slug = view.role.guess.lower()
+            guesses[slug] = guesses.get(slug, 0) + 1
     named = sum(1 for view in views if view.name is not None)
     with_agent = sum(1 for view in views if view.row.agent_id is not None)
     stale_hours = (
@@ -848,10 +874,12 @@ async def machine_summary(
         named=named,
         unnamed=len(views) - named,
         roles=roles,
+        role_guesses=guesses,
         needs_attention=sum(1 for view in views if view.needs_attention),
         out_of_date=sum(1 for view in views if view.build_stale and not view.broken),
         conflicts=sum(1 for view in views if view.conflict),
         never_built=sum(1 for view in views if view.broken),
+        build_failed=sum(1 for view in views if view.broken and view.build_error is not None),
         last_sweep_at=_ts(last_sweep),
         stale_hours=stale_hours,
     )

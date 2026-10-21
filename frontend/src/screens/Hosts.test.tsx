@@ -370,7 +370,7 @@ describe('Hosts table: one row per machine', () => {
     expect(chip.className).toContain('whitespace-normal');
     expect(cell.className).toContain('flex-wrap');
     // The hover still says why the role is withheld.
-    expect(cell.getAttribute('title')).toContain('The evidence is too thin to assert it.');
+    expect(cell.getAttribute('title')).toContain('The evidence is too weak to assert it.');
   });
 
   it('gives each row one tab stop, a link to the machine page', async () => {
@@ -903,7 +903,7 @@ describe('Hosts empty states', () => {
     );
     mount();
     expect(await screen.findByText(/No machines match the current filters/)).toBeTruthy();
-    expect(screen.queryByText(/hasn't run yet/i)).toBeNull();
+    expect(screen.queryByText(/has not run yet/i)).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: /show all machines/i }));
     await waitFor(() => expect(lastQuery()).toMatchObject({ activity: 'all' }));
     await screen.findByText('no name');
@@ -915,7 +915,7 @@ describe('Hosts empty states', () => {
     mount();
     expect(await screen.findByText(/could not load the host list/i)).toBeTruthy();
     expect(screen.getByRole('button', { name: /retry/i })).toBeTruthy();
-    expect(screen.queryByText(/hasn't run yet/i)).toBeNull();
+    expect(screen.queryByText(/has not run yet/i)).toBeNull();
     expect(screen.queryByText(/hides quiet machines/i)).toBeNull();
   });
 
@@ -924,7 +924,7 @@ describe('Hosts empty states', () => {
     vi.mocked(listMachines).mockResolvedValue(page([], 0));
     vi.mocked(getDossierSummary).mockResolvedValue({ ...CENSUS, hosts: 0, last_built_at: null });
     mount();
-    expect(await screen.findByText(/hasn't run yet/i)).toBeTruthy();
+    expect(await screen.findByText(/has not run yet/i)).toBeTruthy();
     expect(screen.getByRole('button', { name: /run the first sweep/i })).toBeTruthy();
     expect(screen.queryByLabelText('Search hosts')).toBeNull();
     expect(screen.queryByTestId('hosts-summary')).toBeNull();
@@ -948,8 +948,10 @@ describe('Hosts needs-attention filters', () => {
       (await screen.findByTestId('machine-build-error-ip:192.0.2.140')).textContent,
     ).toBe('The sweep could not read 192.0.2.140: the grid timed out.');
     expect(lastQuery()).toMatchObject({ health: 'broken', activity: 'all', offset: 0 });
-    // The filter shows as a chip, and the chip clears it.
-    fireEvent.click(screen.getByRole('button', { name: /Remove the filter Never built/ }));
+    // The filter shows as a chip, and the chip clears it. The filter lists
+    // failed builds too, so the chip does not say "Never built" (R4-D16).
+    expect(screen.queryByRole('button', { name: /Remove the filter Never built/ })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /Remove the filter No clean build/ }));
     await waitFor(() => expect(lastQuery().health).toBeUndefined());
   });
 
@@ -1000,6 +1002,44 @@ describe('Hosts list scope', () => {
     vi.mocked(getMachineSummary).mockResolvedValue({ ...SUMMARY, machines: 37 });
     mount('/hosts?activity=all');
     await waitFor(() => expect(screen.getByTestId('hosts-list-scope').textContent).toBe('Machines · 37'));
+  });
+
+  // Dogfood 2026-10-19 (R4-D19): under a role filter the header read
+  // "Showing 12 of 37 machines." The 12 are the machines with events, and the
+  // 37 counts quiet machines too. The base is the active count.
+  it('names the active base when a filter narrows the active list', async () => {
+    vi.mocked(listMachines).mockResolvedValue(page([PROXY, UNNAMED, PRINTER], 12));
+    vi.mocked(getMachineSummary).mockImplementation((activity) =>
+      Promise.resolve(activity === 'active' ? { ...SUMMARY, machines: 18 } : { ...SUMMARY, machines: 37 }),
+    );
+    mount('/hosts?role=unknown');
+    await waitFor(() =>
+      expect(screen.getByTestId('hosts-list-scope').textContent).toBe('Showing 12 of 18 active machines.'),
+    );
+  });
+
+  it('keeps the whole census as the base when a filter narrows the full list', async () => {
+    // NEGATIVE CONTROL: with quiet machines shown, 37 is the right base.
+    vi.mocked(listMachines).mockResolvedValue(page([PROXY, UNNAMED, PRINTER], 31));
+    vi.mocked(getMachineSummary).mockImplementation((activity) =>
+      Promise.resolve(activity === 'active' ? { ...SUMMARY, machines: 18 } : { ...SUMMARY, machines: 37 }),
+    );
+    mount('/hosts?role=unknown&activity=all');
+    await waitFor(() =>
+      expect(screen.getByTestId('hosts-list-scope').textContent).toBe('Showing 31 of 37 machines.'),
+    );
+  });
+
+  it('keeps the whole census as the base for a search', async () => {
+    // NEGATIVE CONTROL: a search reads every machine, quiet ones too.
+    vi.mocked(listMachines).mockResolvedValue(page([PROXY], 1));
+    vi.mocked(getMachineSummary).mockImplementation((activity) =>
+      Promise.resolve(activity === 'active' ? { ...SUMMARY, machines: 18 } : { ...SUMMARY, machines: 37 }),
+    );
+    mount('/hosts?q=proxy');
+    await waitFor(() =>
+      expect(screen.getByTestId('hosts-list-scope').textContent).toBe('Showing 1 of 37 machines.'),
+    );
   });
 });
 
@@ -1094,7 +1134,7 @@ describe('Hosts bulk declare', () => {
   it('offers no checkboxes to an analyst', async () => {
     mount();
     await ready();
-    expect(screen.queryByLabelText(/select all hosts/i)).toBeNull();
+    expect(screen.queryByLabelText(/select every machine on this page/i)).toBeNull();
   });
 
   it('declares on the primary address of every selected machine', async () => {
@@ -1106,7 +1146,7 @@ describe('Hosts bulk declare', () => {
       failed: [],
     });
     mount();
-    fireEvent.click(await screen.findByLabelText(/select all hosts/i));
+    fireEvent.click(await screen.findByLabelText(/select every machine on this page/i));
     expect(await screen.findByText(/machines selected/i)).toBeTruthy();
     fireEvent.change(await screen.findByDisplayValue('choose'), { target: { value: 'low' } });
     fireEvent.click(screen.getByRole('button', { name: /declare \(3\)/i }));
@@ -1128,7 +1168,7 @@ describe('Hosts bulk declare', () => {
       failed: [{ ip: '192.0.2.20', reason: 'SQLAlchemyError' }],
     });
     mount();
-    fireEvent.click(await screen.findByLabelText(/select all hosts/i));
+    fireEvent.click(await screen.findByLabelText(/select every machine on this page/i));
     fireEvent.change(await screen.findByDisplayValue('choose'), { target: { value: 'high' } });
     fireEvent.click(screen.getByRole('button', { name: /declare \(3\)/i }));
     expect(await screen.findByText(/1 not swept yet: 192\.0\.2\.30/)).toBeTruthy();

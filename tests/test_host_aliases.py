@@ -349,7 +349,7 @@ def test_a_process_plane_present_now_is_not_called_absent(
 def test_a_host_with_no_agent_skips_the_coverage_read(
     client_es: tuple[TestClient, AsyncMock],
 ) -> None:
-    """The read runs only where a blind row on a reporting host needs it."""
+    """A fresh build that found no agent states the reason alone. No read runs."""
     client, fake_es = client_es
     _host(client, THIRD, None)
     _profile(client, THIRD, "process_names", "blind", None)
@@ -358,6 +358,134 @@ def test_a_host_with_no_agent_skips_the_coverage_read(
 
     assert _dimension(body, "process_names")["coverage_reason"] == "no host log in the window"
     fake_es.search.assert_not_awaited()
+
+
+def _stale_host(client: TestClient, ip: str, hostname: str, *, days: int = 17) -> None:
+    """A dossier whose last build is ``days`` old: the agent fact is stale.
+
+    The resolver then reports the host as not reporting, whatever it ships now.
+    """
+
+    async def work(db: Any) -> None:
+        built = _now() - timedelta(days=days)
+        host = await dossier_store.upsert_host(
+            db, ip, event_count=10, last_built_at=built, now=built
+        )
+        fact = Fact(
+            field="hostname",
+            value=hostname,
+            confidence=0.9,
+            strength="strong",
+            source="hostlog",
+            evidence=[hostname],
+            observed_at=built,
+        )
+        await dossier_store.upsert_inferred(db, host, fact, now=built, min_confidence=0.0)
+
+    _run(client, work)
+    _build_machines(client)
+
+
+_LINUX_HOST_LOGS = {"system.syslog": 5200, "system.auth": 840, "elastic_agent": 47}
+
+
+def test_a_stale_dossier_does_not_call_a_host_log_shipper_blind(
+    client_es: tuple[TestClient, AsyncMock],
+) -> None:
+    """R4-D6: "LOGON USERS cannot be measured: no host log in the window".
+
+    The dossier was 17 days old, so its reporting flag was false. The same
+    page listed 6 accounts from the host's own auth log. The coverage read
+    now runs for a stale dossier, and the reason states what it finds.
+    """
+    client, fake_es = client_es
+    _stale_host(client, DC, "app01.example.test")
+    _profile(client, DC, "logon_users", "blind", None)
+    fake_es.search.return_value = _coverage_answer(_LINUX_HOST_LOGS)
+
+    body = client.get(f"/api/v1/dossiers/{DC}").json()
+    reason = _dimension(body, "logon_users")["coverage_reason"]
+
+    assert body["reporting"] is False
+    assert reason != "no host log in the window"
+    assert reason == (
+        "the last profile sweep found no logon events for this host. "
+        "The host ships them now. The next profile sweep reads them."
+    )
+    fake_es.search.assert_awaited()
+
+
+def test_a_blind_logon_row_names_the_auth_log_the_host_ships(
+    client_es: tuple[TestClient, AsyncMock],
+) -> None:
+    """A Linux host ships its logons in ``system.auth``, a host-log dataset.
+
+    The reason said "this host ships no logon events. It ships host logs.",
+    which is false for a host whose host logs hold its logons.
+    """
+    client, fake_es = client_es
+    _host(client, DC, "app01.example.test")
+    _profile(client, DC, "logon_users", "blind", None)
+    fake_es.search.return_value = _coverage_answer(_LINUX_HOST_LOGS)
+
+    reason = _dimension(client.get(f"/api/v1/dossiers/{DC}").json(), "logon_users")[
+        "coverage_reason"
+    ]
+
+    assert "ships no logon events" not in reason
+    assert "The host ships them now." in reason
+
+
+def test_a_host_with_syslog_and_no_auth_log_ships_no_logon_events(
+    client_es: tuple[TestClient, AsyncMock],
+) -> None:
+    """NEGATIVE CONTROL: host logs without a logon dataset hold no logon events."""
+    client, fake_es = client_es
+    _stale_host(client, DC, "app01.example.test")
+    _profile(client, DC, "logon_users", "blind", None)
+    fake_es.search.return_value = _coverage_answer({"system.syslog": 5200})
+
+    reason = _dimension(client.get(f"/api/v1/dossiers/{DC}").json(), "logon_users")[
+        "coverage_reason"
+    ]
+
+    assert reason == "this host ships no logon events. It ships host logs."
+
+
+def test_a_stale_dossier_with_no_coverage_answer_states_the_profile_sweep(
+    client_es: tuple[TestClient, AsyncMock],
+) -> None:
+    """A failed read leaves the stale flag as the only source. The reason then
+    states the fact that a blind row always holds: the profile sweep and its
+    date. It claims no absence of host logs."""
+    client, fake_es = client_es
+    _stale_host(client, DC, "app01.example.test")
+    _profile(client, DC, "logon_users", "blind", None)
+    fake_es.search.side_effect = RuntimeError("grid down")
+
+    reason = _dimension(client.get(f"/api/v1/dossiers/{DC}").json(), "logon_users")[
+        "coverage_reason"
+    ]
+
+    assert "no host log" not in reason
+    assert reason.startswith("the last profile sweep on 20")
+    assert reason.endswith(" found no logon events for this host")
+
+
+def test_a_stale_dossier_whose_host_ships_nothing_keeps_the_absence(
+    client_es: tuple[TestClient, AsyncMock],
+) -> None:
+    """NEGATIVE CONTROL: the read answered, and the host ships no host log."""
+    client, fake_es = client_es
+    _stale_host(client, DC, "app01.example.test")
+    _profile(client, DC, "logon_users", "blind", None)
+    fake_es.search.return_value = _coverage_answer({"elastic_agent": 12})
+
+    reason = _dimension(client.get(f"/api/v1/dossiers/{DC}").json(), "logon_users")[
+        "coverage_reason"
+    ]
+
+    assert reason == "no host log in the window"
 
 
 def test_a_shared_label_does_not_lend_its_profile(client: TestClient) -> None:

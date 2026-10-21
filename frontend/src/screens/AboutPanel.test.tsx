@@ -3,6 +3,7 @@
 // GitHub. When the check is off the panel says so and shows no button (no
 // outbound call is possible), which is the privacy-preserving default.
 import { fireEvent, render, screen } from '@testing-library/react';
+import { MemoryRouter } from 'react-router-dom';
 import { describe, expect, it, vi } from 'vitest';
 import type { AboutInfo } from '../lib/types';
 
@@ -89,7 +90,26 @@ describe('AboutPanel', () => {
     render(<AboutPanel />);
     await screen.findByText(/1\.2\.5/);
     expect(screen.queryByRole('button', { name: /check for updates/i })).toBeNull();
-    expect(screen.getByText(/no outbound calls/i)).toBeTruthy();
+    // R5-D20 (dogfood 2026-10-19): "makes no outbound calls" was false. Only
+    // the call to GitHub is off.
+    expect(screen.getByText(/soc-ai makes no call to GitHub/)).toBeTruthy();
+    expect(screen.queryByText(/no outbound calls/i)).toBeNull();
+  });
+
+  it('links the Updates section of Settings when the check is off', async () => {
+    STATE.about = {
+      version: '1.2.5',
+      repo_url: 'https://github.com/nuk3s/soc-ai',
+      license: 'Apache-2.0',
+      update_check_enabled: false,
+    };
+    render(
+      <MemoryRouter>
+        <AboutPanel />
+      </MemoryRouter>,
+    );
+    const link = await screen.findByRole('link', { name: 'Settings > Updates' });
+    expect(link.getAttribute('href')).toBe('/config#updates');
   });
 
   it('refetches /about when refreshKey changes, so a live toggle takes effect', async () => {
@@ -100,7 +120,7 @@ describe('AboutPanel', () => {
       update_check_enabled: false,
     };
     const { rerender } = render(<AboutPanel refreshKey={0} />);
-    await screen.findByText(/no outbound calls/i);
+    await screen.findByText(/soc-ai makes no call to GitHub/);
     expect(screen.queryByRole('button', { name: /check for updates/i })).toBeNull();
     // Admin enables the hot toggle and clicks Apply → Config bumps its nonce →
     // refreshKey changes → the panel refetches and the button appears live.

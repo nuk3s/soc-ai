@@ -10,12 +10,14 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
   getAnalytic: vi.fn(),
+  getHuntCatalog: vi.fn(),
   setAnalyticStatus: vi.fn(),
   startHuntConsole: vi.fn(),
 }));
 
 import {
   getAnalytic,
+  getHuntCatalog,
   setAnalyticStatus,
   startHuntConsole,
   type AnalyticDetail,
@@ -83,6 +85,7 @@ const mount = () =>
 
 beforeEach(() => {
   vi.mocked(getAnalytic).mockReset().mockResolvedValue(DETAIL);
+  vi.mocked(getHuntCatalog).mockReset().mockRejectedValue(new Error('no catalog in this test'));
   vi.mocked(setAnalyticStatus).mockReset().mockResolvedValue({ ...DETAIL, status: 'retired' });
   vi.mocked(startHuntConsole).mockReset().mockResolvedValue({ hunt_id: 'H1' });
 });
@@ -230,7 +233,7 @@ describe('AnalyticDrawer', () => {
     mount();
     const versions = await screen.findByTestId('analytic-versions');
     expect(within(versions).getByText('evidence').getAttribute('title')).toBe(
-      'The evidence this decision was taken on is stored on this row.',
+      'This row stores the evidence for this decision.',
     );
     expect(within(versions).queryByText('receipts')).toBeNull();
   });
@@ -561,5 +564,168 @@ describe('breachLine', () => {
 
   it('prints the numbers of a rule this console does not know', () => {
     expect(breachLine({ rule: 'new_rule', score: 3 })).toBe('new rule · score 3');
+  });
+});
+
+
+// Dogfood 2026-10-19 R3-D1. The drawer said "This analytic ran 19m ago and
+// observed nothing in the last 30 days." over an analytic whose every sweep
+// failed. The catalog held the error and the drawer never read it.
+describe('AnalyticDrawer, a failed newest run', () => {
+  const catalogWith = (spec: Record<string, unknown>) => ({
+    specs: [
+      {
+        id: DETAIL.id,
+        title: DETAIL.title,
+        level: 'critical',
+        scope_kind: 'host',
+        attack: [],
+        evaluator: 'match',
+        coverage: null,
+        last_swept_at: iso(13 * 60_000),
+        last_fired_at: null,
+        blind: false,
+        last_error: null,
+        sweeps_24h: 25,
+        fired_24h: 0,
+        fresh_24h: 0,
+        already_handled_24h: 0,
+        shadow_24h: 0,
+        undecided_docs: 0,
+        unattributed_docs: 0,
+        truncated_docs: 0,
+        ...spec,
+      },
+    ],
+    sweeps_enabled: true,
+    sweep_interval_minutes: 60,
+    sweep_window_minutes: 1440,
+    last_sweep_at: iso(13 * 60_000),
+  });
+
+  it('says the last run failed, and why, in place of "observed nothing"', async () => {
+    vi.mocked(getAnalytic).mockResolvedValue({
+      ...DETAIL,
+      recent: [],
+      last_run_at: iso(13 * 60_000),
+      runner_enabled: true,
+    });
+    vi.mocked(getHuntCatalog).mockResolvedValue(
+      catalogWith({
+        last_error: 'precondition: ConnectionError(Cannot connect to host 192.0.2.10:9200)',
+        last_error_text: 'soc-ai could not connect to the grid.',
+      }),
+    );
+    mount();
+    await waitFor(() =>
+      expect(screen.getByTestId('analytic-nothing-observed').textContent).toBe(
+        'The last run of this analytic failed 13m ago. soc-ai could not connect to the grid. ' +
+          'The analytic observed nothing in the last 30 days.',
+      ),
+    );
+    const line = screen.getByTestId('analytic-nothing-observed').textContent ?? '';
+    expect(line).not.toContain('ConnectionError');
+    expect(screen.getByText('live, last run failed')).toBeTruthy();
+  });
+
+  it('says a blind run saw no telemetry', async () => {
+    vi.mocked(getAnalytic).mockResolvedValue({
+      ...DETAIL,
+      recent: [],
+      last_run_at: iso(13 * 60_000),
+      runner_enabled: true,
+    });
+    vi.mocked(getHuntCatalog).mockResolvedValue(catalogWith({ blind: true }));
+    mount();
+    await waitFor(() =>
+      expect(screen.getByTestId('analytic-nothing-observed').textContent).toContain(
+        'matched nothing that this analytic reads',
+      ),
+    );
+    expect(screen.getByText('live, blind on the last run')).toBeTruthy();
+  });
+
+  it('keeps the quiet sentence for a healthy run', async () => {
+    vi.mocked(getAnalytic).mockResolvedValue({
+      ...DETAIL,
+      recent: [],
+      last_run_at: iso(HOUR),
+      runner_enabled: true,
+    });
+    vi.mocked(getHuntCatalog).mockResolvedValue(catalogWith({}));
+    mount();
+    await waitFor(() => expect(getHuntCatalog).toHaveBeenCalled());
+    const line = await screen.findByTestId('analytic-nothing-observed');
+    expect(line.textContent).toBe('This analytic ran 1h ago and observed nothing in the last 30 days.');
+    // Control: a day with no failed run keeps the green dot and its word.
+    const dot = screen.getByTestId('status-dot');
+    expect(dot.dataset.run).toBeUndefined();
+    expect(dot.textContent).toBe('live');
+  });
+
+  // V1-H6: the decoy analytic read "observed nothing" with a green dot after
+  // 22 of 25 runs of the day failed. Its newest run completed.
+  it('states the failed runs of the day after a newest run that completed', async () => {
+    vi.mocked(getAnalytic).mockResolvedValue({
+      ...DETAIL,
+      recent: [],
+      last_run_at: iso(3 * 60_000),
+      runner_enabled: true,
+    });
+    vi.mocked(getHuntCatalog).mockResolvedValue(catalogWith({ failed_24h: 22, failing_since: null }));
+    mount();
+    await waitFor(() =>
+      expect(screen.getByTestId('analytic-nothing-observed').textContent).toBe(
+        'This analytic ran 3m ago and observed nothing in the last 30 days. ' +
+          '22 of 25 runs failed in 24 h. A failed run reads no document.',
+      ),
+    );
+    const dot = screen.getByTestId('status-dot');
+    expect(dot.dataset.run).toBe('failed_runs');
+    expect(dot.textContent).toBe('live, 22 of 25 runs failed');
+    expect(dot.getAttribute('title')).toBe(
+      'The newest run of this analytic completed. 22 of 25 runs failed in 24 h. ' +
+        'A failed run reads no document. A zero here does not show a clean grid.',
+    );
+  });
+});
+
+// Dogfood 2026-10-19 R3 STE 16. The Versions list printed "system:self-heal"
+// and "system:catalog".
+describe('AnalyticDrawer, the actor of a version', () => {
+  it('names soc-ai and never a raw system actor', async () => {
+    vi.mocked(getAnalytic).mockResolvedValue({
+      ...DETAIL,
+      versions: [
+        {
+          from_status: null,
+          to_status: 'shadow',
+          who: 'system:catalog',
+          at: iso(50 * HOUR),
+          why: 'shipped',
+          has_receipts: false,
+          system: true,
+        },
+        { from_status: 'shadow', to_status: 'live', who: 'analyst', at: iso(30 * HOUR), why: 'ok', has_receipts: false },
+        {
+          from_status: 'live',
+          to_status: 'shadow',
+          who: 'system:self-heal',
+          at: iso(HOUR),
+          why: 'too many hits',
+          has_receipts: false,
+          system: true,
+        },
+      ],
+    });
+    mount();
+    const versions = await screen.findByTestId('analytic-versions');
+    expect(versions.textContent).not.toContain('system:');
+    const [heal, analyst, ship] = Array.from(versions.children) as HTMLElement[];
+    expect(within(ship).getByTestId('version-actor').textContent).toBe('soc-ai');
+    expect(within(analyst).getByTestId('version-actor').textContent).toBe('analyst');
+    // The amber chip names soc-ai on the self-heal row, once.
+    expect(within(heal).queryByTestId('version-actor')).toBeNull();
+    expect(within(heal).getByTestId('version-system').textContent).toBe('soc-ai');
   });
 });

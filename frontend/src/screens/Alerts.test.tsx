@@ -42,7 +42,7 @@ import { assignAlert, getAlerts } from '../lib/api';
 
 // Pinned literally (not imported) so a copy edit to the note can't self-approve.
 const NOTE =
-  'Not available in the read-only demo. In a live deployment this action runs for real.';
+  'The read-only demo blocks this action. A live deployment runs it.';
 
 describe('demoBlocked', () => {
   it('returns the note in demo mode', () => {

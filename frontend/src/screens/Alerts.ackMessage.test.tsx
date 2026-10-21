@@ -148,7 +148,13 @@ describe('the acknowledge strip', () => {
 
   it('names the alerts the grid will keep listing however many times it is pressed', async () => {
     // The endpoint-alert case: everything is already acknowledged in Security
-    // Onion and nothing is left to write, yet the group will not shrink.
+    // Onion and nothing is left to write, yet the group will not shrink. The
+    // row has no handled counts there: the index cannot search the flags.
+    // "Acknowledged 0 alerts" under a green check said nothing of that
+    // (dogfood 2026-10-19, R2-D15).
+    vi.mocked(getAlerts).mockResolvedValue(
+      queueOf([{ ...GROUP, ackedCount: null, escalatedCount: null }]),
+    );
     vi.mocked(ackGroup).mockResolvedValue({
       acked: 0,
       failed: 0,
@@ -160,9 +166,9 @@ describe('the acknowledge strip', () => {
 
     await pressAcknowledge();
 
-    const strip = await screen.findByText(/Acknowledged 0 alerts/);
-    expect(strip.textContent).toMatch(/17 alerts already acknowledged in Security Onion/);
-    expect(strip.textContent).toMatch(/stay listed/);
+    const strip = await screen.findByText(/soc-ai wrote nothing/);
+    expect(strip.textContent).toMatch(/The 17 alerts of .* are already acknowledged\./);
+    expect(strip.textContent).toMatch(/They stay listed/);
     // Nothing is outstanding, so it must not ask for another press.
     expect(strip.textContent).not.toMatch(/press again/);
   });

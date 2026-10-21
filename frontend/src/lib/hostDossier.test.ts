@@ -8,6 +8,7 @@
 // composition RULES, not markup: which fields make the sentence, in what order,
 // and what the page claims when an ingredient is missing.
 import { describe, expect, it } from 'vitest';
+import { ago } from './timeRange';
 import type { DossierFieldBrief, DossierFieldName } from './types';
 import {
   activityProfileView,
@@ -107,7 +108,7 @@ describe('identitySentence — the composed answer to "what is this machine?"', 
 
   it('says honestly when nothing at all is known', () => {
     expect(sentenceText(identitySentence(host()))).toBe(
-      '192.0.2.44 has appeared on the network. Nothing else is known about it yet.',
+      '192.0.2.44 is on the network. soc-ai knows no other fact about this host.',
     );
   });
 
@@ -120,7 +121,7 @@ describe('identitySentence — the composed answer to "what is this machine?"', 
   it('treats a role of "unknown" as unclassified, not as a kind of machine', () => {
     // "x is an unknown" would be the classifier's shrug read out as a noun.
     expect(sentenceText(identitySentence(host({ role: val('unknown') })))).toBe(
-      '192.0.2.44 has appeared on the network. Nothing else is known about it yet.',
+      '192.0.2.44 is on the network. soc-ai knows no other fact about this host.',
     );
   });
 
@@ -157,7 +158,7 @@ describe('identitySentence — the composed answer to "what is this machine?"', 
       identitySentence(host({ role: { value: null, reason: 'low_confidence' } })),
     );
     expect(text).not.toContain('null');
-    expect(text).toContain('Nothing else is known');
+    expect(text).toContain('soc-ai knows no other fact about this host');
   });
 
   it('renders os_family tokens as human labels, not internal vocabulary', () => {
@@ -223,10 +224,10 @@ describe('provenancePhrase — where a fact came from, in words', () => {
   });
   it('translates each rung out of the storage vocabulary', () => {
     expect(provenancePhrase({ overridden: false, source: 'hostlog' })).toBe(
-      'reported by the agent on the box',
+      'reported by the agent on the machine',
     );
     expect(provenancePhrase({ overridden: false, source: 'osquery' })).toBe(
-      'reported by the agent on the box',
+      'reported by the agent on the machine',
     );
     expect(provenancePhrase({ overridden: false, source: 'telemetry' })).toBe(
       'seen in DNS/DHCP traffic',
@@ -255,7 +256,7 @@ describe('unresolvedPhrase — why a field is unknown, without blaming machinery
   it('says a stale fact is old, not absent', () => {
     expect(
       unresolvedPhrase({ reason: 'stale', last_run_at: '2026-08-01T06:00:00Z', retracted_at: null }),
-    ).toMatch(/too old to trust/i);
+    ).toMatch(/too old to use/i);
   });
   it('shows the lean behind a low-confidence withhold', () => {
     expect(
@@ -265,7 +266,7 @@ describe('unresolvedPhrase — why a field is unknown, without blaming machinery
         retracted_at: null,
         inferred_value: 'server',
       }),
-    ).toBe('low confidence: "server". The evidence is too thin to say');
+    ).toBe('low confidence: "server". The evidence is too weak to confirm it');
   });
   it('says when the evidence behind a fact went away', () => {
     expect(
@@ -431,6 +432,36 @@ describe('relativeAge — freshness a reader can feel', () => {
   });
   it('says never for a thing that has not happened', () => {
     expect(relativeAge(null, now)).toBe('never');
+  });
+  // Dogfood 2026-10-19, R4-D15: one instant read "16d" on one surface and
+  // "17d" on another. Both rules floor now.
+  it('reads one instant as the same number of days as ago()', () => {
+    const instant = new Date(now - 16.6 * 86_400_000).toISOString();
+    expect(relativeAge(instant, now)).toBe('16d ago');
+    expect(ago(instant, now)).toBe('16d ago');
+    expect(relativeAge(new Date(now - 90 * 60_000).toISOString(), now)).toBe('1h ago');
+  });
+  // Round 2: relativeAge read hours up to 47 h and ago() read days from 24 h.
+  // One instant read "30h ago" on the hero and "1d ago" in the list. They are
+  // one rule now, for every age.
+  it('reads every instant the same as ago()', () => {
+    const HOUR = 3_600_000;
+    for (const back of [
+      30_000,
+      5 * 60_000,
+      23 * HOUR,
+      24 * HOUR,
+      30 * HOUR,
+      47 * HOUR,
+      59 * 24 * HOUR,
+      61 * 24 * HOUR,
+      400 * 24 * HOUR,
+      900 * 24 * HOUR,
+    ]) {
+      const instant = new Date(now - back).toISOString();
+      expect(relativeAge(instant, now), `${back}`).toBe(ago(instant, now));
+    }
+    expect(relativeAge(new Date(now - 30 * HOUR).toISOString(), now)).toBe('1d ago');
   });
 });
 

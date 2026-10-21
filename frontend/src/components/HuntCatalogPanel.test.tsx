@@ -95,7 +95,7 @@ describe('HuntCatalogPanel', () => {
   it('links to the Analytics tab beside the analytic hits link', async () => {
     mount();
     await screen.findByText(SPEC.title);
-    expect(screen.getByText('Open in Hunts').closest('a')!.getAttribute('href')).toBe(
+    expect(screen.getByText('Open the Analytics tab').closest('a')!.getAttribute('href')).toBe(
       '/hunts?tab=analytics',
     );
     expect(screen.getByText('Open analytic hits').closest('a')!.getAttribute('href')).toBe(
@@ -292,5 +292,163 @@ describe('HuntCatalogPanel run state', () => {
     ).toBeTruthy();
     const row = screen.getByText(PROFILE.title).closest('li')!;
     expect(within(row).getByText('live, not running')).toBeTruthy();
+  });
+});
+
+// Dogfood 2026-10-19 R5-D3, R5-D4, R5-D5, R5-I3, H1-D2. Status read a green
+// "Sweeps on" over nine analytics whose last run failed, "fired 0 · fresh 0 ·
+// handled 0" over 24 failed runs, and "live" with zero counts over a profile
+// sweep that could not read the grid.
+describe('HuntCatalogPanel, failed sweeps', () => {
+  const FAILED_SPEC: HuntCatalogSpec = {
+    ...SPEC,
+    last_swept_at: iso(13 * 60_000),
+    last_fired_at: null,
+    fired_24h: 0,
+    fresh_24h: 0,
+    already_handled_24h: 0,
+    sweeps_24h: 25,
+    failed_24h: 24,
+    last_error: 'precondition: ConnectionError(Cannot connect to host 192.0.2.10:9200)',
+    last_error_text: 'soc-ai could not connect to the grid.',
+    failing_since: iso(4 * 24 * HOUR),
+  };
+  const PROFILE: HuntCatalogSpec = {
+    ...SPEC,
+    id: 'prior-hypervisor-novel-served-port',
+    title: 'A hypervisor serves a new port',
+    evaluator: 'profile',
+    last_error: null,
+    coverage: {
+      last_run_at: iso(3 * HOUR),
+      measured: 0,
+      learning: 0,
+      blind: 0,
+      not_applicable: 0,
+      fired: 0,
+      shadow: false,
+    },
+  };
+  const DOWN: HuntCatalog = {
+    ...CATALOG,
+    last_sweep_at: iso(13 * 60_000),
+    specs: [FAILED_SPEC],
+    sweep_health: {
+      last_run_at: iso(13 * 60_000),
+      last_outcome: 'failed',
+      last_error_text: 'soc-ai could not connect to the grid.',
+      runs_24h: 25,
+      failed_24h: 25,
+      failing_since: iso(4 * 24 * HOUR),
+      counted_since: null,
+    },
+  };
+
+  it('reads the tag as failed, never the green "Sweeps on"', async () => {
+    vi.mocked(getHuntCatalog).mockResolvedValue(DOWN);
+    mount();
+    expect(await screen.findByText('Sweeps on, last sweep failed')).toBeTruthy();
+    expect(screen.queryByText('Sweeps on')).toBeNull();
+    expect(screen.getByTestId('catalog-sweep-result').textContent).toBe(
+      'Last sweep failed 13m ago. soc-ai could not connect to the grid. ' +
+        '25 of 25 runs failed in 24 h. First failure 4d ago.',
+    );
+  });
+
+  it('counts the failed runs beside the zero counters', async () => {
+    vi.mocked(getHuntCatalog).mockResolvedValue(DOWN);
+    mount();
+    const row = (await screen.findByText(SPEC.title)).closest('li')!;
+    expect(within(row).getByText(/fired 0 · fresh 0 · handled 0 · failed 24 of 25 runs/)).toBeTruthy();
+    const chip = within(row).getByTestId('last-run-failed');
+    expect(chip.getAttribute('title')).toBe('soc-ai could not connect to the grid.');
+    expect(row.textContent).not.toContain('ConnectionError');
+    expect(within(row).getByText('live, last run failed')).toBeTruthy();
+  });
+
+  it('keeps the green tag for a healthy loop and shows no result line', async () => {
+    vi.mocked(getHuntCatalog).mockResolvedValue({
+      ...CATALOG,
+      sweep_health: {
+        last_run_at: iso(HOUR),
+        last_outcome: 'ok',
+        runs_24h: 24,
+        failed_24h: 0,
+      },
+    });
+    mount();
+    expect(await screen.findByText('Sweeps on')).toBeTruthy();
+    expect(screen.queryByTestId('catalog-sweep-result')).toBeNull();
+  });
+
+  it('says the profile sweep could not read the grid, with the loop result', async () => {
+    vi.mocked(getHuntCatalog).mockResolvedValue({
+      ...CATALOG,
+      specs: [
+        {
+          ...PROFILE,
+          last_error_text: 'The grid did not answer the health check. soc-ai skipped the sweep.',
+        },
+      ],
+      prior_sweeps_enabled: true,
+      last_prior_run_at: iso(3 * HOUR),
+      prior_sweep_interval_minutes: 60,
+      prior_sweep_health: {
+        last_run_at: iso(5 * 60_000),
+        last_outcome: 'skipped',
+        last_error_text: 'The grid did not answer the health check. soc-ai skipped the sweep.',
+        runs_24h: 3,
+        failed_24h: 2,
+        failing_since: iso(2 * HOUR),
+        counted_since: iso(3 * HOUR),
+      },
+    });
+    mount();
+    const row = (await screen.findByText(PROFILE.title)).closest('li')!;
+    const chip = within(row).getByTestId('last-run-failed');
+    expect(chip.textContent).toContain('could not read the grid');
+    expect(within(row).getByText('live, last run failed')).toBeTruthy();
+    expect(screen.getByTestId('profile-sweep-state').textContent).toBe(
+      'Profile sweep: Last sweep did not run 5m ago. The grid did not answer the health check. ' +
+        'soc-ai skipped the sweep. 2 of 3 runs did not complete in the last 3 h. First failure 2h ago.',
+    );
+  });
+
+  it('says a profile run that read no host measured no host', async () => {
+    vi.mocked(getHuntCatalog).mockResolvedValue({
+      ...CATALOG,
+      specs: [PROFILE],
+      prior_sweeps_enabled: true,
+      last_prior_run_at: iso(5 * 60_000),
+    });
+    mount();
+    const row = (await screen.findByText(PROFILE.title)).closest('li')!;
+    expect(within(row).getByTestId('profile-unscored').textContent).toBe('measured no host');
+    expect(within(row).getByText('live, measured no host')).toBeTruthy();
+    expect(within(row).queryByTestId('last-run-failed')).toBeNull();
+  });
+
+  it('calls a profile sweep overdue after two intervals with no run', async () => {
+    vi.mocked(getHuntCatalog).mockResolvedValue({
+      ...CATALOG,
+      specs: [{ ...PROFILE, coverage: { ...PROFILE.coverage!, measured: 4 } }],
+      prior_sweeps_enabled: true,
+      last_prior_run_at: iso(3 * HOUR),
+      prior_sweep_interval_minutes: 60,
+    });
+    mount();
+    const state = await screen.findByTestId('profile-sweep-state');
+    expect(state.textContent).toBe('Profile sweep overdue. The newest run completed 3h ago.');
+  });
+
+  it('counts a method group with its unit and its retired analytics', async () => {
+    vi.mocked(getHuntCatalog).mockResolvedValue({
+      ...CATALOG,
+      specs: [SPEC, { ...SPEC, id: 'r1', title: 'Retired one', status: 'retired' }],
+    });
+    mount();
+    expect((await screen.findByTestId('method-query')).textContent).toBe(
+      'Method: query · 2 analytics, 1 retired · run by the analytic sweep',
+    );
   });
 });

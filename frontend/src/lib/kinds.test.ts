@@ -13,10 +13,10 @@ describe('kindLabel', () => {
     expect(kindLabel('below_baseline')).toBe('rate collapsed');
     expect(kindLabel('above_baseline')).toBe('rate spiked');
     expect(kindLabel('scope_count')).toBe('across many hosts');
-    expect(kindLabel('prior_no_baseline')).toBe('finding with no benign baseline');
+    expect(kindLabel('prior_no_baseline')).toBe('no benign baseline');
     expect(kindLabel('catalog_match')).toBe('analytic match');
     expect(kindLabel('hunt_finding')).toBe('hunt finding');
-    expect(kindLabel('telemetry_silence')).toBe('log source went silent');
+    expect(kindLabel('telemetry_silence')).toBe('events stopped');
     expect(kindLabel('logon_chain')).toBe('logon chain');
   });
 
@@ -24,7 +24,7 @@ describe('kindLabel', () => {
   // happened (dogfood 2026-10-06).
   it('names the estate model and the silent source in plain words', () => {
     expect(kindLabel('estate_outlier')).toBe('unusual across all hosts');
-    expect(kindLabel('telemetry_silence')).toBe('log source went silent');
+    expect(kindLabel('telemetry_silence')).toBe('events stopped');
     for (const label of Object.values(KIND_LABEL)) {
       expect(label).not.toMatch(/\bestate\b|\bplane\b/);
     }
@@ -65,7 +65,7 @@ describe('sourceLabel', () => {
     expect(sourceLabel('catalog')).toBe('catalog');
     expect(sourceLabel('alert')).toBe('alert');
     expect(sourceLabel('hunt')).toBe('hunt');
-    expect(sourceLabel('model')).toBe('model');
+    expect(sourceLabel('model')).toBe('statistics');
     expect(sourceTitle('model')).toContain('learned detector');
     expect(sourceLabel('model', true)).toBe('shadow');
   });

@@ -51,7 +51,9 @@ const AT = '2026-10-06T03:12:00+00:00';
 describe('the executed action record', () => {
   it('formats the actor and the local clock time', () => {
     expect(executedLine('auto-ack', AT)).toBe(`Executed by auto-ack at ${clockTime(AT)}`);
-    expect(clockTime(AT)).toMatch(/^\d{2}:\d{2}$/);
+    // A date, a clock time and a zone (R2-D17).
+    expect(clockTime(AT)).toMatch(/\d{2}:\d{2}/);
+    expect(clockTime(AT)).toMatch(/[A-Z]{2,}|GMT|UTC/);
     // Negative control: no time, no "at".
     expect(executedLine('alice', null)).toBe('Executed by alice');
     expect(clockTime('not a time')).toBeNull();

@@ -1,11 +1,22 @@
 import { AlertTriangle, ChevronLeft, RotateCw, Server } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { Link, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom';
+import { GridGapStrip } from '../components/GridGapStrip';
 import { HostActivityRow } from '../components/HostActivityRow';
 import { HostAddresses } from '../components/HostAddresses';
 import { HostBriefing } from '../components/HostBriefing';
+import {
+  DeclarationUndo,
+  declarationChange,
+  type DeclarationChange,
+} from '../components/DeclarationUndo';
 import { HostFacts, HostUnknowns } from '../components/HostFacts';
 import { HostHero } from '../components/HostHero';
+import {
+  HostInvestigations,
+  investigationsHref,
+  useHostInvestigations,
+} from '../components/HostInvestigations';
 import { HostKpis } from '../components/HostKpis';
 import { Panel, PanelHeader } from '../components/Panel';
 import {
@@ -22,6 +33,7 @@ import {
   getDossierSummary,
   getHostActivity,
   getLeadCount,
+  getGridGaps,
   getLeads,
   getMachine,
   getMe,
@@ -33,14 +45,26 @@ import {
 import { useChatScope } from '../lib/chatScope';
 import { cn } from '../lib/cn';
 import { activityState } from '../lib/hostActivity';
-import { isMachineKey, isResolved, portsView, roleVocabulary } from '../lib/hostDossier';
-import { VERDICT_DAYS, alertVerdicts, leadLines, verdictLines } from '../lib/hostSituation';
+import { isMachineKey, isResolved, portsView, relativeAge, roleVocabulary } from '../lib/hostDossier';
+import {
+  VERDICT_DAYS,
+  alertVerdicts,
+  investigationLines,
+  leadLines,
+  verdictLines,
+} from '../lib/hostSituation';
 import { listUrlToReturnTo, machineHref, type HostsLocationState } from '../lib/hostsList';
 import { isIpKey } from '../lib/ip';
 import { plural } from '../lib/plural';
 import { SHOWN_ERRORS, sweepErrorList, sweepFailureSentence } from '../lib/sweepErrors';
-import { absTime } from '../lib/timeRange';
-import type { Dossier, DossierRefreshStatus, HostActivityRange, MachineDetail } from '../lib/types';
+import { absTime, rangeToSinceUntil } from '../lib/timeRange';
+import type {
+  Dossier,
+  DossierRefreshStatus,
+  HostActivity,
+  HostActivityRange,
+  MachineDetail,
+} from '../lib/types';
 import { useAsync } from '../lib/useAsync';
 import { useOptionalShell } from '../shell/ShellContext';
 import { BehaviouralProfile } from '../components/BehaviouralProfile';
@@ -141,6 +165,36 @@ function servicePorts(dossier: Dossier): string[] | null {
   return portsView(f.value_json)?.ports ?? null;
 }
 
+/** The ports of a services fact the resolver withheld, with the age of the
+ *  sweep that found them. The Services card said "the sweep has no answer"
+ *  while the API held tcp/389, udp/53 and tcp/135 from a 17-day-old sweep
+ *  (dogfood 2026-10-19, R4-D11). Null when the field holds no guess. */
+export function staleServicePorts(dossier: Dossier): { ports: string[]; age: string | null } | null {
+  const f = dossier.fields.find((row) => row.field === 'services_offered');
+  if (!f || isResolved(f) || f.overridden) return null;
+  if (f.reason !== 'stale' && f.reason !== 'low_confidence') return null;
+  const ports = portsView(f.inferred_value_json)?.ports ?? [];
+  if (ports.length === 0) return null;
+  const age = f.reason === 'stale' && f.last_run_at ? relativeAge(f.last_run_at) : null;
+  return { ports, age: f.reason === 'stale' ? age : null };
+}
+
+/** The Services card inputs: the profile's ports, else the sweep's fact,
+ *  else the sweep's withheld guess marked stale. */
+function servicesView(dossier: Dossier): {
+  services: string[] | null;
+  servicesSource: 'profile' | 'dossier';
+  servicesStale: string | null;
+} {
+  const profile = profileServedPorts(dossier);
+  if (profile != null) return { services: profile, servicesSource: 'profile', servicesStale: null };
+  const fact = servicePorts(dossier);
+  if (fact != null) return { services: fact, servicesSource: 'dossier', servicesStale: null };
+  const guess = staleServicePorts(dossier);
+  if (guess == null) return { services: null, servicesSource: 'dossier', servicesStale: null };
+  return { services: guess.ports, servicesSource: 'dossier', servicesStale: guess.age ?? 'low confidence' };
+}
+
 /**
  * The ports the BEHAVIOURAL PROFILE has this host serving, or null when no
  * plane on the grid can answer the dimension.
@@ -164,6 +218,16 @@ function profileServedPorts(dossier: Dossier): string[] | null {
   if (d.coverage !== 'measured' && d.top.length === 0) return null;
   // Busiest first, the order the wire already holds them in.
   return d.top.map(([port]) => port);
+}
+
+/** The last time the live read saw the host: the newest connection record.
+ *  "last seen" read the start of the newest chart bucket, so it said "40m
+ *  ago" for a host with a connection a minute old (dogfood 2026-10-19,
+ *  R4-D9). An older server sends no `newest_event`, and the newest bucket
+ *  stands in. */
+export function lastSeenOf(activity: HostActivity | null | undefined): string | null {
+  if (!activity) return null;
+  return activity.newest_event || newestActivity(activity.volume);
 }
 
 /** The start of the newest volume bar that holds an event, or null. The
@@ -197,7 +261,7 @@ export function HostDetail() {
   const param = rawParam.trim();
   const navigate = useNavigate();
   const location = useLocation();
-  const [searchParams] = useSearchParams();
+  const [searchParams, setSearchParams] = useSearchParams();
   // Deep-link target: the conflicts queue and the reconsider notifications
   // point at one field; landing with no sign of which was meant is the same as
   // not linking at all.
@@ -305,7 +369,15 @@ export function HostDetail() {
   // freshness contracts, so each gets its own request, error and degraded
   // state. Not polled: this is a page you land on to read, and a background
   // poll here is a repeated multi-aggregation grid query per open tab.
-  const [range, setRange] = useState<HostActivityRange>('24h');
+  // The window lives in the URL, so a reload and a shared link keep it
+  // (dogfood 2026-10-19, R4-D17). 24h is the default and leaves no parameter.
+  const range: HostActivityRange = searchParams.get('range') === '7d' ? '7d' : '24h';
+  const setRange = (next: HostActivityRange) => {
+    const params = new URLSearchParams(searchParams);
+    if (next === '24h') params.delete('range');
+    else params.set('range', next);
+    setSearchParams(params, { replace: true, state: location.state });
+  };
   // The response carries the window it was asked for, so a panel is always
   // labelled with the window its data actually describes — not the one just
   // clicked while the request is still in flight.
@@ -319,12 +391,36 @@ export function HostDetail() {
   const shown = activity.data?.payload ?? null;
   const shownRange = activity.data?.range ?? range;
   const state = activityState(shown, activity.error);
+  // The recorded grid gaps of the window. The Connections rate leaves out
+  // their hours (dogfood round 2, V2-1). A failed read leaves the rate as is.
+  const windowGaps = useAsync(
+    () => getGridGaps(rangeToSinceUntil(shownRange)).then((ledger) => ledger.gaps),
+    [shownRange],
+  );
 
   // The last mutation response, which supersedes the fetched copy until a
   // fresh GET lands (the effect drops it when `data` is replaced).
   const [applied, setApplied] = useState<Dossier | null>(null);
   useEffect(() => setApplied(null), [data]);
   const dossier = applied ?? data;
+
+  // A declaration answers with the re-resolved address. The machine read
+  // holds the role badge and the name, so the page re-reads the machine too:
+  // the badge read "stale 17d: server" after a declared domain controller
+  // (dogfood 2026-10-19, R4-D12). The one field the write changed stays
+  // undoable until the next change or a close (R4-I4).
+  const [undo, setUndo] = useState<DeclarationChange | null>(null);
+  useEffect(() => setUndo(null), [param]);
+  const applyDeclaration = (next: Dossier) => {
+    setUndo(declarationChange(dossier, next));
+    setApplied(next);
+    if (machine) refetch();
+  };
+  const applyUndo = (next: Dossier) => {
+    setUndo(null);
+    setApplied(next);
+    if (machine) refetch();
+  };
 
   // The first screen leads with what waits on this host and what the
   // verdicts of the last seven days found (dogfood 2026-10-06, S3). The leads
@@ -374,7 +470,6 @@ export function HostDetail() {
     leadTotal.data && leadTotal.data.key === situationKey ? leadTotal.data.total : null;
   const hostObservations =
     observationsRead.data && observationsRead.data.key === situationKey ? observationsRead.data.rows : [];
-  const situation = [...leadLines(hostLeads, hostLeadTotal), ...verdictLines(hostObservations)];
   const verdictCount = alertVerdicts(hostObservations).length;
 
   // The chat panel's scope line prefers the name a human uses: the SAME
@@ -386,6 +481,26 @@ export function HostDetail() {
     (hostnameField && isResolved(hostnameField)
       ? (hostnameField.value ?? '').trim() || null
       : null);
+
+  // Every investigation of the machine, over all time and every key of the
+  // machine. The page of a domain controller with 6 true positives showed
+  // no investigation at all (dogfood 2026-10-19, R4-D3). The machine key
+  // reads every address and name. An address page reads its address.
+  const investigationKey = machine ? machine.key : situationKey;
+  const investigations = useHostInvestigations(investigationKey);
+  const investigationList =
+    investigations.data && investigations.data.key === investigationKey ? investigations.data.list : null;
+  const situation = [
+    ...leadLines(hostLeads, hostLeadTotal),
+    ...verdictLines(hostObservations),
+    ...(investigationList
+      ? investigationLines(
+          investigationList.total,
+          investigationList.truePositives,
+          investigationsHref(investigationKey, hostname ?? ip),
+        )
+      : []),
+  ];
   // A field named in the URL describes the primary address unless the link
   // also named another address. That address opens in the Addresses section
   // with the field marked there.
@@ -534,7 +649,7 @@ export function HostDetail() {
       const status = await startDossierRefresh();
       if (status.note === 'dossier disabled') {
         // Nothing was started, so there is no run to follow.
-        setSweepNote('No sweep started. The host dossier is off in Config.');
+        setSweepNote('No sweep started. The host dossier is off in Settings.');
       } else if (status.note === 'already running') {
         startedSweep.current = sweepHealth.data?.last_run ?? null;
         setSweepNote('A sweep is already running. This page updates after the sweep finishes.');
@@ -922,7 +1037,7 @@ export function HostDetail() {
               >
                 <AlertTriangle size={14} className="mt-0.5 flex-none" />
                 <span>
-                  A different machine may hold this address now. The rebound time is{' '}
+                  A different machine may hold this address since{' '}
                   {absTime(dossier.identity_rebound_at)}. The declarations below may describe a host
                   that no longer holds this address.
                 </span>
@@ -1009,9 +1124,14 @@ export function HostDetail() {
               dossier={dossier}
               machine={machine}
               adminBlocked={adminBlocked}
-              lastActivity={newestActivity(shown?.volume)}
+              lastActivity={lastSeenOf(shown)}
               situation={situation}
             />
+            <GridGapStrip range={shownRange} className="mb-3" />
+
+            {undo && (
+              <DeclarationUndo change={undo} onUndone={applyUndo} onClose={() => setUndo(null)} />
+            )}
 
             {/* The cards lead (the owner's ask: KPIs and charts at the top),
                 and the why-care strip sits directly under them — still above
@@ -1021,19 +1141,19 @@ export function HostDetail() {
                 card and the profile panel below it count the same ports. */}
             <HostKpis
               ip={dossier.ip}
-              services={profileServedPorts(dossier) ?? servicePorts(dossier)}
-              servicesSource={profileServedPorts(dossier) != null ? 'profile' : 'dossier'}
+              {...servicesView(dossier)}
               servicesWindowDays={dossier.profile?.[0]?.window_days}
               activity={shown}
               state={state}
               range={shownRange}
               alertVerdicts={verdictCount}
+              gaps={windowGaps.data ?? undefined}
             />
 
             <HostBriefing
               dossier={dossier}
               canDeclare={canDeclare}
-              onApplied={setApplied}
+              onApplied={applyDeclaration}
               focusField={primaryFocusField}
               agent={machine ? machine.agent : undefined}
             />
@@ -1044,7 +1164,14 @@ export function HostDetail() {
                 New. A lead under a hunt and a lead already closed both
                 belong to this host. A repeated single signal is visible in
                 the observations before it forms a lead. */}
-            <LeadsStrip entityKey={ip} status="all" className="mb-3" />
+            {investigationKey && (
+              <HostInvestigations
+                entityKey={investigationKey}
+                label={hostname ?? ip}
+                read={investigations}
+              />
+            )}
+            <LeadsStrip entityKey={ip} entityLabel={hostname ?? ip} status="all" className="mb-3" />
             <HostObservations entityKey={ip} className="mb-3" />
 
             {/* Every address of the machine, and its containers. */}
@@ -1053,8 +1180,9 @@ export function HostDetail() {
                 machine={machine}
                 focusAddress={focusAddress}
                 focusField={focusField}
-                lastActivity={newestActivity(shown?.volume)}
+                lastActivity={lastSeenOf(shown)}
                 windowDays={dossier.lookback_days}
+                builtAt={dossier.last_built_at}
               />
             )}
 
@@ -1071,7 +1199,7 @@ export function HostDetail() {
             <HostFacts
               dossier={dossier}
               canDeclare={canDeclare}
-              onApplied={setApplied}
+              onApplied={applyDeclaration}
               focusField={primaryFocusField}
               roleVocabulary={roleVocab}
               address={machine ? dossier.ip : undefined}
@@ -1089,7 +1217,7 @@ export function HostDetail() {
             <HostUnknowns
               dossier={dossier}
               canDeclare={canDeclare}
-              onApplied={setApplied}
+              onApplied={applyDeclaration}
               focusField={primaryFocusField}
               roleVocabulary={roleVocab}
             />

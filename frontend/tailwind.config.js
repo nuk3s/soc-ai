@@ -94,7 +94,12 @@ export default {
         pulseRing: { '0%,100%': { opacity: '.45' }, '50%': { opacity: '.12' } },
         blink: { '0%,100%': { opacity: '.15' }, '50%': { opacity: '1' } },
         slideIn: { from: { transform: 'translateX(24px)', opacity: '0' }, to: { transform: 'translateX(0)', opacity: '1' } },
-        fadeUp: { from: { transform: 'translateY(8px)', opacity: '0' }, to: { transform: 'translateY(0)', opacity: '1' } },
+        // The individual `translate` property, never `transform`. The fill
+        // mode `both` keeps the last frame, and a `transform` frame replaced
+        // the `-translate-x-1/2 -translate-y-1/2` that centres a dialog: the
+        // shortcut help sat half off the screen (dogfood 2026-10-19, R1-D13).
+        // `translate` composes with `transform`, so the centring holds.
+        fadeUp: { from: { translate: '0 8px', opacity: '0' }, to: { translate: '0 0', opacity: '1' } },
         // translateX is relative to the BAR's own width (~35-40%), so the end
         // value must overshoot 100% for the bar to sweep fully across + exit.
         scanline: { '0%': { transform: 'translateX(-120%)' }, '100%': { transform: 'translateX(340%)' } },

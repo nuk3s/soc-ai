@@ -68,6 +68,9 @@ def test_data_source_names_and_notes_have_no_dash(tmp_path: Path) -> None:
         allow_online_enrichment=True,
         greynoise_api_key=None,
         shodan_api_key=None,
+        blocklist_sources=["urlhaus", "threatfox", "feodo", "tor", "internal_seed"],
+        blocklist_stale_threshold_days=7,
+        cloud_prefix_stale_threshold_days=45,
     )
     for source in collect_data_sources(settings):  # type: ignore[arg-type]
         assert not DASH.search(source.name), source.name

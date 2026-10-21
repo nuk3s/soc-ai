@@ -44,7 +44,11 @@ describe('MaintenancePanel', () => {
       blocklist_files: 0,
     };
     render(<MaintenancePanel />);
-    expect(await screen.findByText(/backup cron job did not run/i)).toBeTruthy();
+    // The panel reads one directory. It says what it found there and does not
+    // claim that a job elsewhere did not run (the doctor row "backups" reads
+    // the same directory, dogfood 2026-10-19, R5-D14).
+    expect(await screen.findByText(/soc-ai finds no backup archive in this directory/i)).toBeTruthy();
+    expect(screen.getByText(/The archives are in \/var\/lib\/soc-ai\/data\/backups\./)).toBeTruthy();
     expect(screen.getByText(/refresh cron job did not run/i)).toBeTruthy();
   });
 });

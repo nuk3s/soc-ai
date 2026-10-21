@@ -16,6 +16,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
 }));
 
 import { getNeedsYouCount, getNotifications, markAllShadowHitsRead, type NeedsYouCount } from '../lib/api';
+import { ToastProvider } from '../lib/toast';
 import type { Notification } from '../lib/types';
 import { Notifications } from './Notifications';
 
@@ -95,13 +96,13 @@ describe('Notifications: paging', () => {
     const { container } = renderScreen();
     await screen.findByText(/ET RUN 0$/);
     expect(container.textContent).toContain(
-      '12 items loaded: 12 completed investigations. More items exist. Select Show more to load them.',
+      '12 notifications loaded: 12 completed investigations. More notifications exist. Select Show more to load them.',
     );
     fireEvent.click(screen.getByRole('button', { name: 'Show more' }));
     await waitFor(() => expect(rows()).toHaveLength(15));
     expect(getNotifications).toHaveBeenLastCalledWith({ limit: 32, eventsOnly: true, after: null });
     expect(screen.queryByRole('button', { name: 'Show more' })).toBeNull();
-    expect(container.textContent).toContain('15 items: 15 completed investigations.');
+    expect(container.textContent).toContain('15 notifications: 15 completed investigations.');
   });
 });
 
@@ -114,7 +115,7 @@ describe('Notifications: Dismiss all', () => {
     expect(screen.queryByRole('button', { name: /clear all/i })).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: 'Dismiss all' }));
     expect(screen.getByRole('group', { name: 'Confirm dismiss all' }).textContent).toContain(
-      'Hide 2 events and mark 300 shadow hits read? Leads and verdicts that need more info stay. 1 notice you cannot dismiss stays.',
+      'Hide 2 notifications and mark 300 shadow hits read? Leads and verdicts that need more info stay. 1 notice you cannot dismiss stays.',
     );
   });
 
@@ -157,5 +158,33 @@ describe('Notifications: Dismiss all', () => {
       eventsOnly: true,
       after: localStorage.getItem('soc-ai:notifications-cleared-at'),
     });
+  });
+});
+
+// Dogfood 2026-10-19 R1-I6. The confirm did not say that the shadow hits stay
+// read, and a Dismiss all had no undo for the local hide.
+describe('Notifications: Dismiss all undo', () => {
+  it('states what an Undo cannot restore, and offers Undo in a toast', async () => {
+    vi.mocked(getNotifications).mockResolvedValue(runs(2));
+    render(
+      <MemoryRouter>
+        <ToastProvider>
+          <Notifications />
+        </ToastProvider>
+      </MemoryRouter>,
+    );
+    await screen.findByText(/ET RUN 0$/);
+    await screen.findByTestId('needs-you-part-unread_shadow_hits');
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss all' }));
+    expect(screen.getByRole('group', { name: 'Confirm dismiss all' }).textContent).toContain(
+      'Undo shows the notifications again. The shadow hits stay read.',
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss all' }));
+    await waitFor(() => expect(rows()).toHaveLength(0));
+    const toast = await screen.findByText('Dismiss all hid 2 notifications. 300 shadow hits are read.');
+    expect(toast).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Undo' }));
+    await waitFor(() => expect(rows()).toHaveLength(2));
+    expect(localStorage.getItem('soc-ai:notifications-cleared-at')).toBeNull();
   });
 });

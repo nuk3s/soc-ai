@@ -240,6 +240,7 @@ from soc_ai.api.webui.routes_entity import (
     _classify,
     get_entity,
 )
+from soc_ai.api.webui.routes_escalations import check_escalation_claim  # noqa: F401
 from soc_ai.api.webui.routes_events import EventDocumentOut, get_event  # noqa: F401
 from soc_ai.api.webui.routes_export import (
     RedactionPreviewOut,
@@ -360,6 +361,30 @@ from soc_ai.api.webui.routes_meta import (
     list_workspaces,
     set_my_status,
 )
+
+# isort: split
+# After routes_meta, out of name order: this module imports routes_meta, and
+# routes_meta imports routes_hunts. Imported earlier, it would register the
+# /hunts routes before the modules that must come first.
+from soc_ai.api.webui.routes_grid_gaps import (
+    GridGapHitsOut,
+    mark_grid_gap_hits_benign,
+    record_grid_gap,
+    review_grid_gap_hits,
+)
+
+# isort: split
+# After routes_hunts, which it imports for the hunt-time helpers.
+from soc_ai.api.webui.routes_lead_bulk import (
+    LeadBulkOut,
+    bulk_dismiss_leads,
+    bulk_dismiss_leads_again,
+    bulk_hunt_leads,
+    bulk_reopen_leads,
+    lead_bulk_hunt_plan,
+)
+
+# isort: split
 from soc_ai.api.webui.routes_quality import (
     QualityEvalStatusOut,
     QualityPointOut,
@@ -389,6 +414,10 @@ from soc_ai.api.webui.routes_runbooks import (
     list_runbooks,
     promote_runbook,
     update_runbook,
+)
+from soc_ai.api.webui.routes_status import (
+    AuditVerifyScheduleOut,
+    audit_verify_schedule,
 )
 
 __all__ = [
@@ -436,6 +465,7 @@ __all__ = [
     "ApiTokenOut",
     "AssignIn",
     "AssignOut",
+    "AuditVerifyScheduleOut",
     "AutoTriageIn",
     "AutoTriageStatusOut",
     "BacktestIn",
@@ -470,6 +500,7 @@ __all__ = [
     "EntityTimelineItem",
     "EscalateGroupOut",
     "ExecuteActionResult",
+    "GridGapHitsOut",
     "HealthComponentOut",
     "HealthOut",
     "HuntActionOut",
@@ -497,6 +528,7 @@ __all__ = [
     "InvestigationOut",
     "InvestigationRowOut",
     "LastAttemptOut",
+    "LeadBulkOut",
     "LoginIn",
     "MeOut",
     "NotificationOut",
@@ -619,10 +651,15 @@ __all__ = [
     "api_save_danger_setting",
     "approve_runbook",
     "assign_alert",
+    "audit_verify_schedule",
     "auto_triage_status",
     "backtest_by_id",
     "backtest_status",
+    "bulk_dismiss_leads",
+    "bulk_dismiss_leads_again",
+    "bulk_hunt_leads",
     "bulk_rehunt",
+    "bulk_reopen_leads",
     "cancel_hunt",
     "cancel_hunt_chat",
     "clear_dossier_override",
@@ -668,6 +705,7 @@ __all__ = [
     "health",
     "hunt_stats",
     "install_starter_pack",
+    "lead_bulk_hunt_plan",
     "list_alerts",
     "list_analytics",
     "list_dossier_conflicts",
@@ -683,6 +721,7 @@ __all__ = [
     "list_shadow_hits",
     "list_users_endpoint",
     "list_workspaces",
+    "mark_grid_gap_hits_benign",
     "mark_shadow_hit_read",
     "open_router",
     "oracle_redaction_preview",
@@ -691,12 +730,14 @@ __all__ = [
     "post_general_chat",
     "post_hunt_chat",
     "promote_runbook",
+    "record_grid_gap",
     "remove_detection_override",
     "request_more_info",
     "require_admin_api",
     "reset_user_password_endpoint",
     "resolve_alert_for_hunt",
     "resolve_investigation",
+    "review_grid_gap_hits",
     "revoke_token",
     "router",
     "set_analytic_status",

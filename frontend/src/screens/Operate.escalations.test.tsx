@@ -25,6 +25,11 @@ vi.mock('../lib/api', async (importOriginal) => ({
   getAnalyticHits: vi.fn().mockResolvedValue({ hits: [], counts: { all: 0, unread: 0, live: 0, shadow: 0 } }),
 }));
 
+// The dependency block and the job list have their own suites. Here they would
+// add list items and reads that are not this suite's business.
+vi.mock('../components/StatusDependenciesPanel', () => ({ StatusDependenciesPanel: () => null }));
+vi.mock('../components/StatusJobsPanel', () => ({ StatusJobsPanel: () => null }));
+
 import { getHuntCatalog, getStrandedEscalations, type StrandedClaims } from '../lib/api';
 import { Operate } from './Operate';
 
@@ -102,8 +107,17 @@ describe('Operate escalation-ledger panel', () => {
     // A list of alert ids with no sentence attached is a list an operator
     // scrolls past. The actionable facts are that each row is an alert that
     // cannot be escalated, and that the fix is a press rather than a repair.
-    expect(screen.getByText(/refused by every escalate/i)).toBeInTheDocument();
-    expect(screen.getByText(/will not settle on its own/i)).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /soc-ai refuses a new escalation of each alert until Security Onion confirms the outcome\./,
+      ),
+    ).toBeInTheDocument();
+    // The per-claim check settles a claim whose alert left the queue (R5-I5).
+    expect(
+      screen.getByText(/also settles a claim whose alert has left the queue/i),
+    ).toBeInTheDocument();
+    // "escalate" is a verb. The panel used it as a noun (R5 STE 6).
+    expect(screen.queryByText(/every escalate|later escalate|group escalate/i)).toBeNull();
   });
 
   it('reports the ledger’s total, and says so when the list is only part of it', async () => {
@@ -170,5 +184,51 @@ describe('Operate escalation-ledger panel names the alert', () => {
     // The raw id is not on the row. It is in the tooltip for a search.
     expect(within(row).queryByText('ev-named')).toBeNull();
     expect(row.querySelector('[title="Alert ev-named"]')).not.toBeNull();
+  });
+});
+
+// R5-I5: a stranded claim names an alert the operator has to go and look at.
+// There is no alert detail page, so the link opens the Alerts list on that one
+// alert: the _id clause, acknowledged alerts shown, and a window around the
+// claim. The window starts 31 days before the claim, because the Alerts list
+// reaches back at most 30 days and a zone offset can cost one more. It ends a
+// day after the claim. A preset such as 30d is relative to now, and a claim
+// stays open forever, so a preset loses the alert once the claim is a month old.
+describe('Operate escalation-ledger panel links each claim to its alert', () => {
+  const localInput = (ms: number) => {
+    const d = new Date(ms);
+    const p = (n: number) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+  };
+
+  it('opens the Alerts list on that alert, in a window around the claim', async () => {
+    const claimedAt = iso(40 * 24 * HOUR);
+    vi.mocked(getStrandedEscalations).mockResolvedValue({
+      claims: [{ alert_id: 'PtyMc6AB-x_1', escalated_by: 'analyst', claimed_at: claimedAt }],
+      total: 1,
+      settling_minutes: 15,
+    });
+    mount();
+    const link = await screen.findByRole('link', { name: 'Open alert PtyMc6AB-x_1 in Alerts' });
+    const href = link.getAttribute('href') ?? '';
+    const url = new URL(href, 'http://x');
+    expect(url.pathname).toBe('/alerts');
+    expect(url.searchParams.get('q')).toBe('_id:"PtyMc6AB-x_1"');
+    expect(url.searchParams.get('hide_acked')).toBe('false');
+    expect(url.searchParams.get('range')).toBe('custom');
+    const claim = Date.parse(claimedAt);
+    expect(url.searchParams.get('from')).toBe(localInput(claim - 31 * 24 * HOUR));
+    expect(url.searchParams.get('to')).toBe(localInput(claim + 24 * HOUR));
+  });
+
+  it('offers no link for an id the filter cannot quote', async () => {
+    vi.mocked(getStrandedEscalations).mockResolvedValue({
+      claims: [{ alert_id: 'bad"id', escalated_by: 'analyst', claimed_at: iso(2 * HOUR) }],
+      total: 1,
+      settling_minutes: 15,
+    });
+    mount();
+    await screen.findByText('bad"id');
+    expect(screen.queryByRole('link', { name: /open alert/i })).toBeNull();
   });
 });

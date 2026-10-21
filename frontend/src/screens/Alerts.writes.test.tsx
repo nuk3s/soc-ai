@@ -74,7 +74,7 @@ const mkEvent = (id: string, dst: string): AlertEvent => ({
 });
 
 const TIMEOUT_COPY =
-  'The request did not return in 90 s. The grid is slow. The change may still land. Check the row in a minute.';
+  'The request did not return in 90 s. The grid is slow. The change can still complete. Check the row in a minute.';
 
 let intervalSpy: { mock: { calls: unknown[][] }; mockRestore: () => void };
 
@@ -157,7 +157,7 @@ describe('a write the console stopped waiting for (RL2)', () => {
     await poll();
 
     await waitFor(() => expect(screen.queryByText(/did not return in 90 s/)).toBeNull());
-    expect(screen.getByText('The escalate of NTLM Session Setup landed.')).toBeTruthy();
+    expect(screen.getByText('The escalation of NTLM Session Setup is complete.')).toBeTruthy();
   });
 
   it('NEGATIVE CONTROL: keeps the notice while the poll shows nothing changed', async () => {

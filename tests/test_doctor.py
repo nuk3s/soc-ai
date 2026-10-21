@@ -515,9 +515,9 @@ async def test_coverage_check_reads_a_slow_count_as_latency_not_connectivity(
         result = await doctor.check_index_pattern_coverage(settings)
     assert result.status == "WARN"
     assert "latency" in result.detail
-    assert "connectivity fault" in result.detail
+    assert "connection to the grid works" in result.detail
     assert result.hint is not None and "node load" in result.hint
-    assert "Fix Elasticsearch connectivity" not in (result.hint or "")
+    assert "Fix the grid connection" not in (result.hint or "")
 
     from unittest.mock import AsyncMock as _AsyncMock
 
@@ -532,7 +532,7 @@ async def test_coverage_check_reads_a_slow_count_as_latency_not_connectivity(
         result = await doctor.check_index_pattern_coverage(settings)
     assert result.status == "WARN"
     assert "latency" not in result.detail
-    assert result.hint is not None and "connectivity" in result.hint.lower()
+    assert result.hint is not None and "grid connection" in result.hint.lower()
 
 
 async def test_coverage_check_reaches_its_partial_arm_under_the_opt_out(
@@ -662,7 +662,7 @@ async def test_check_model_fitness_unfit_is_fail(tmp_path: Path) -> None:
         results = await doctor.check_model_fitness(_settings(tmp_path))
     fit = _by_name(results, "model fitness")
     assert fit.status == "FAIL"  # the silent all-fallback-verdicts trap
-    assert "all-fallback" in fit.hint
+    assert "only fallback" in fit.hint
 
 
 async def test_check_model_fitness_degraded_is_warn(tmp_path: Path) -> None:
@@ -834,6 +834,16 @@ async def test_audit_chain_row_warns_on_duplicates_and_fails_on_an_edit(tmp_path
     assert "No record was altered" not in row.detail
 
 
+async def test_audit_chain_row_over_zero_records_is_info(tmp_path: Path) -> None:
+    """A PASS over zero records verified nothing (dogfood 2026-10-19, R5-D27)."""
+    verify = AsyncMock(return_value=_chain_result(records_verified=0))
+    with patch("soc_ai.audit.verify.verify_audit_chain", verify):
+        row = await doctor.check_audit_chain(_settings(tmp_path))
+    assert row.status == "INFO"
+    assert "no audit record" in row.detail
+    assert "Nothing to verify" in row.detail
+
+
 async def test_audit_chain_row_is_not_checked_when_the_grid_is_slow(tmp_path: Path) -> None:
     """A slow grid is INFO "not checked", never PASS and never a chain FAIL."""
 
@@ -890,12 +900,36 @@ def test_blocklist_hint_names_what_would_actually_clear_it(tmp_path: Path) -> No
     hint = _by_name(doctor.check_blocklists(settings), "blocklists").hint
 
     assert "ABUSE_CH_AUTH_KEY is not set" in hint
-    assert "The warning stays until" in hint
     # Both real options, not just the one that needs a third party.
-    assert "auth.abuse.ch" in hint
-    assert "blocklist_sources" in hint
-    # And it must not repeat the advice that does not work here.
-    assert "run `soc-ai blocklists refresh`" not in hint
+    assert "register at https://auth.abuse.ch/" in hint
+    assert "from `blocklist_sources`" in hint
+    # And it must not offer the refresh as the fix for the three it skips.
+    refresh = next((x for x in hint.split(". ") if x.startswith("Run `soc-ai blocklists")), "")
+    assert "URLhaus" not in refresh
+    assert "Feodo" not in refresh and "ThreatFox" not in refresh
+
+
+def test_blocklist_hint_gives_the_step_for_tor_beside_the_key_step(tmp_path: Path) -> None:
+    """Tor needs no key, and a refresh fetches it.
+
+    The range doctor said "never refreshed: urlhaus, threatfox, feodo, tor".
+    The hint named the abuse.ch key and gave no step for tor (dogfood
+    2026-10-19, R1-D21).
+    """
+    settings = _settings(tmp_path)
+    settings.blocklist_sources = ["urlhaus", "threatfox", "feodo", "tor"]
+    settings.blocklist_data_dir.mkdir(parents=True, exist_ok=True)
+    hint = _by_name(doctor.check_blocklists(settings), "blocklists").hint
+
+    # Round 2 (V2-3): the hint read "to fetch tor. feodo, threatfox, urlhaus
+    # need ...": a sentence that starts lowercase, with the config ids as names.
+    assert "Run `soc-ai blocklists refresh` to fetch the Tor feed." in hint
+    assert "The Feodo, ThreatFox and URLhaus feeds need an abuse.ch Auth-Key." in hint
+    assert "Or remove `feodo`, `threatfox` and `urlhaus` from `blocklist_sources`." in hint
+    assert "\u2014" not in hint and "\u2013" not in hint
+    # Every sentence starts with a capital or a code span.
+    for sentence in hint.split(". "):
+        assert sentence[:1].isupper() or sentence.startswith("`"), sentence
 
 
 def test_blocklist_hint_is_the_ordinary_one_when_the_key_is_set(tmp_path: Path) -> None:
@@ -906,8 +940,8 @@ def test_blocklist_hint_is_the_ordinary_one_when_the_key_is_set(tmp_path: Path) 
     settings.blocklist_data_dir.mkdir(parents=True, exist_ok=True)
     hint = _by_name(doctor.check_blocklists(settings), "blocklists").hint
 
-    assert "run `soc-ai blocklists refresh`" in hint
-    assert "The warning stays until" not in hint
+    assert "Run `soc-ai blocklists refresh` to fetch" in hint
+    assert "ABUSE_CH_AUTH_KEY is not set" not in hint
 
 
 def test_blocklist_hint_ignores_a_missing_feed_that_needs_no_key(tmp_path: Path) -> None:
@@ -918,7 +952,7 @@ def test_blocklist_hint_ignores_a_missing_feed_that_needs_no_key(tmp_path: Path)
     settings.blocklist_data_dir.mkdir(parents=True, exist_ok=True)
     hint = _by_name(doctor.check_blocklists(settings), "blocklists").hint
 
-    assert "run `soc-ai blocklists refresh`" in hint
+    assert "Run `soc-ai blocklists refresh` to fetch the Tor feed." in hint
     assert "ABUSE_CH_AUTH_KEY is not set" not in hint
 
 
@@ -967,6 +1001,117 @@ def test_check_prompt_assets_missing_fails_and_names_the_cost(
     assert exit_code(results) == 1
 
 
+# ── admin password (dogfood 2026-10-19, H1-D5) ───────────────────────────────
+
+
+async def _seed_admin(settings: Settings, password: str) -> None:
+    from soc_ai.store import auth as auth_svc
+    from soc_ai.store.db import make_sessionmaker
+
+    engine = make_engine(settings)
+    try:
+        await run_migrations(engine)
+        async with make_sessionmaker(engine)() as db:
+            await auth_svc.create_user(db, "admin", password, role="admin")
+    finally:
+        await engine.dispose()
+
+
+async def test_admin_password_row_warns_while_the_sidecar_password_is_live(
+    tmp_path: Path,
+) -> None:
+    """Only a service-log line said the generated password was still in use."""
+    from soc_ai.bootstrap_credential import bootstrap_credential_path
+
+    settings = _settings(tmp_path, api_auth_required=True)
+    await _seed_admin(settings, "generated-pw-123")
+    sidecar = bootstrap_credential_path(settings)
+    sidecar.write_text("generated-pw-123\n")
+    [row] = await doctor.check_admin_password(settings)
+    assert row.name == "admin password"
+    assert row.status == "WARN"
+    assert str(sidecar) in row.detail
+    assert "Change password" in row.hint
+
+
+async def test_admin_password_row_warns_on_the_env_bootstrap_password(tmp_path: Path) -> None:
+    settings = _settings(
+        tmp_path, api_auth_required=True, bootstrap_admin_password=SecretStr("env-pw-12345")
+    )
+    await _seed_admin(settings, "env-pw-12345")
+    [row] = await doctor.check_admin_password(settings)
+    assert row.status == "WARN"
+    assert "BOOTSTRAP_ADMIN_PASSWORD" in row.detail
+
+
+async def test_admin_password_row_passes_after_a_change(tmp_path: Path) -> None:
+    """The control: the sidecar is still on disk, and the admin changed the password."""
+    from soc_ai.bootstrap_credential import bootstrap_credential_path
+
+    settings = _settings(
+        tmp_path, api_auth_required=True, bootstrap_admin_password=SecretStr("env-pw-12345")
+    )
+    await _seed_admin(settings, "a-password-of-my-own")
+    bootstrap_credential_path(settings).write_text("generated-pw-123\n")
+    [row] = await doctor.check_admin_password(settings)
+    assert row.status == "PASS"
+
+
+async def test_admin_password_row_is_info_with_auth_off(tmp_path: Path) -> None:
+    settings = _settings(tmp_path, bootstrap_admin_password=SecretStr("env-pw-12345"))
+    await _seed_admin(settings, "env-pw-12345")
+    [row] = await doctor.check_admin_password(settings)
+    assert row.status == "INFO"
+
+
+# ── backups (dogfood 2026-10-19, R5-D14) ─────────────────────────────────────
+
+
+def _touch_backup(settings: Settings, *, age_h: float = 1.0) -> Path:
+    import os
+    import time as _time
+
+    backups = settings.soc_ai_data_dir / "backups"
+    backups.mkdir(parents=True, exist_ok=True)
+    archive = backups / "soc-ai-backup-20261019T024700Z.tar.gz"
+    archive.write_bytes(b"x")
+    stamp = _time.time() - age_h * 3600
+    os.utime(archive, (stamp, stamp))
+    return archive
+
+
+def test_backup_row_warns_when_no_archive_is_present(tmp_path: Path) -> None:
+    """Scheduled maintenance said "The backup cron job did not run." while the
+    doctor and the Setup health card stayed green."""
+    settings = _settings(tmp_path)
+    [row] = doctor.check_backups(settings)
+    assert row.name == "backups"
+    assert row.status == "WARN"
+    assert "no backup archive" in row.detail
+    assert str(settings.soc_ai_data_dir / "backups") in row.detail
+    assert "docs/DOCKER.md" in row.hint
+
+
+def test_backup_row_warns_on_an_old_archive_and_passes_a_fresh_one(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    _touch_backup(settings, age_h=80)
+    [old] = doctor.check_backups(settings)
+    assert old.status == "WARN"
+    assert "3 days old" in old.detail
+    _touch_backup(settings, age_h=3)
+    [fresh] = doctor.check_backups(settings)
+    assert fresh.status == "PASS"
+
+
+def test_backup_row_is_info_on_a_postgres_store(tmp_path: Path) -> None:
+    settings = _settings(
+        tmp_path, soc_ai_database_url=SecretStr("postgresql+asyncpg://u:p@db.example.test/soc")
+    )
+    [row] = doctor.check_backups(settings)
+    assert row.status == "INFO"
+    assert "pg_dump" in row.detail
+
+
 # ── run_doctor end to end (all mocked upstreams) ─────────────────────────────
 
 
@@ -974,6 +1119,7 @@ async def test_run_doctor_all_green(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     await _migrate(settings)
     _touch_fresh_feeds(settings)
+    _touch_backup(settings)
     listing = AsyncMock(return_value=([settings.analyst_model], None))
     probe = AsyncMock(return_value=_fitness("pass", "model passed all fitness checks"))
     with (
@@ -1010,6 +1156,7 @@ async def test_run_doctor_all_green(tmp_path: Path) -> None:
         "egress: web_search",
         "authentication",
         "blocklists",
+        "backups",
         "prompt assets",
     } <= names
     assert exit_code(results) == 0

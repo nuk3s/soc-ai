@@ -160,7 +160,9 @@ describe('Topbar health pill covers every upstream it claims', () => {
     await flush();
     const pill = getByTitle('Upstream health');
     expect(pill.textContent).not.toContain('connected');
-    expect(pill.textContent).toContain('1 degraded');
+    // A dependency that does not answer is down. "Degraded" is for one that
+    // answers late or in part (dogfood 2026-10-19, H1-D8).
+    expect(pill.textContent).toContain('1 down');
   });
 
   it('lists Security Onion as its own row in the dropdown', async () => {
@@ -175,7 +177,7 @@ describe('Topbar health pill covers every upstream it claims', () => {
     act(() => {
       getByTitle('Upstream health').click();
     });
-    expect(getByText('Security Onion API')).toBeTruthy();
+    expect(getByText('Grid: Security Onion API')).toBeTruthy();
     expect(getByText(/answered HTTP 403/)).toBeTruthy();
   });
 
@@ -210,7 +212,7 @@ describe('Topbar badge states the needs-you count', () => {
     await flush();
     expect(container.querySelector('[data-testid="notif-badge"]')?.textContent).toBe('11');
     act(() => bell().click());
-    expect(screen.getByTestId('notif-summary').textContent).toBe('11 need you · 8 events');
+    expect(screen.getByTestId('notif-summary').textContent).toBe('11 need you · 8 notifications');
     expect(bell()).toHaveAccessibleName('Notifications, 11 need you');
   });
 
@@ -222,7 +224,7 @@ describe('Topbar badge states the needs-you count', () => {
     await flush();
     expect(container.querySelector('[data-testid="notif-badge"]')).toBeNull();
     act(() => bell().click());
-    expect(screen.getByTestId('notif-summary').textContent).toBe('Nothing needs you · 8 events');
+    expect(screen.getByTestId('notif-summary').textContent).toBe('Nothing needs you · 8 notifications');
   });
 
   it('still lights the bell for a fault when nothing needs the analyst', async () => {
@@ -255,7 +257,7 @@ describe('Topbar badge states the needs-you count', () => {
     await flush();
     expect(container.querySelector('[data-testid="notif-badge"]')?.textContent).toBe('2');
     act(() => bell().click());
-    expect(screen.getByTestId('notif-summary').textContent).toBe('Could not read what needs you · 3 events');
+    expect(screen.getByTestId('notif-summary').textContent).toBe('Could not read what needs you · 3 notifications');
   });
 });
 
@@ -392,7 +394,7 @@ describe('Topbar dropdowns close like the account menu', () => {
     expect(b).toHaveAttribute('aria-expanded', 'true');
     // The badge states the needs-you count and the panel shows three other
     // rows: the header says so.
-    expect(screen.getByTestId('notif-summary').textContent).toBe('2 need you · 3 events');
+    expect(screen.getByTestId('notif-summary').textContent).toBe('2 need you · 3 notifications');
   });
 
   it('closes the bell on Escape and gives focus back to the bell', async () => {
@@ -453,12 +455,12 @@ describe('Topbar dropdowns close like the account menu', () => {
 
 describe('notificationSummary', () => {
   it('states the needs-you count beside the other rows', () => {
-    expect(notificationSummary(11, 8)).toBe('11 need you · 8 events');
-    expect(notificationSummary(1, 1)).toBe('1 needs you · 1 event');
-    expect(notificationSummary(0, 4)).toBe('Nothing needs you · 4 events');
+    expect(notificationSummary(11, 8)).toBe('11 need you · 8 notifications');
+    expect(notificationSummary(1, 1)).toBe('1 needs you · 1 notification');
+    expect(notificationSummary(0, 4)).toBe('Nothing needs you · 4 notifications');
     expect(notificationSummary(3, 0)).toBe('3 need you');
     expect(notificationSummary(1, 0, true)).toBe('1+ need you');
-    expect(notificationSummary(null, 2)).toBe('Could not read what needs you · 2 events');
+    expect(notificationSummary(null, 2)).toBe('Could not read what needs you · 2 notifications');
     expect(notificationSummary(undefined, 0)).toBe('Reading what needs you');
   });
 });

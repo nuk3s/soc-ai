@@ -1,13 +1,21 @@
 import { useState } from 'react';
+import { HelpText } from '../components/HelpText';
 import { CollapseChevron } from '../components/Panel';
 import { ErrorState, LoadingState } from '../components/States';
 import { type ApiKeyField, clearApiKey, getApiKeys, saveApiKey } from '../lib/api';
 import { useAsync } from '../lib/useAsync';
 
+/** The API keys that apply only after a restart. misp_api_key is the one
+ * hot=False key in soc_ai/store/config_overrides.py: the MISP client is built
+ * at startup. GET /config/api-keys sends no apply field, so the panel names it
+ * here. */
+const RESTART_KEYS: ReadonlySet<string> = new Set(['misp_api_key']);
+
 /**
- * API keys — write-only entry for the opt-in online-enrichment provider keys.
- * Values are Fernet-encrypted at rest, never returned to the client, and applied
- * live (no restart). Sits next to Data sources in the config console.
+ * API keys — write-only entry for the provider keys: the enrichment feeds, the
+ * online lookups and the crawl4ai page read. Values are Fernet-encrypted at
+ * rest and never returned to the client. Most apply live; the MISP key applies
+ * at the next restart. Sits next to Data sources in the config console.
  */
 export function ApiKeysPanel({
   collapsed = false,
@@ -28,6 +36,11 @@ export function ApiKeysPanel({
   const [pendingClear, setPendingClear] = useState<string | null>(null);
 
   const keys: ApiKeyField[] = data ?? [];
+  // The server cannot store a key without CONFIG_SECRET_KEY. Set opened a
+  // field, and Save answered 400 (dogfood round 2, V2-4). The rows share one
+  // secret box, so the first row with the flag speaks for all.
+  const noStore = keys.find((k) => k.can_store === false);
+  const storeHint = noStore ? noStore.store_hint || 'The server cannot store an API key.' : null;
   const cancel = () => {
     setEditKey(null);
     setValue('');
@@ -40,7 +53,10 @@ export function ApiKeysPanel({
     setMsg(null);
     try {
       await saveApiKey(k, value.trim());
-      setMsg({ key: k, text: 'soc-ai saved the key. The key applies live.', ok: true });
+      const text = RESTART_KEYS.has(k)
+        ? 'soc-ai saved the key. Restart soc-ai to apply it.'
+        : 'soc-ai saved the key. The key applies live.';
+      setMsg({ key: k, text, ok: true });
       cancel();
       setReload((n) => n + 1);
     } catch (e) {
@@ -78,11 +94,17 @@ export function ApiKeysPanel({
       </div>
       {!collapsed && (
       <>
-      <div className="mb-3 text-[12.5px] leading-[1.5] text-dim">
-        The list holds the provider keys for the opt-in online enrichment tools. soc-ai stores each
-        key encrypted. soc-ai never shows a key again. A new key applies live without a restart.
-        Turn on the master switch under "Online enrichment" to use the keys.
+      <div data-testid="api-keys-intro" className="mb-3 text-[12.5px] leading-[1.5] text-dim">
+        The list holds the keys for the enrichment feeds, the online lookups and the page read tool.
+        soc-ai stores each key encrypted. soc-ai never shows a key again. Most keys apply live. The
+        MISP key applies after a restart.{' '}
+        <HelpText text="The Shodan key and the GreyNoise key also need the switch in Settings > Online enrichment." />
       </div>
+      {storeHint && (
+        <div data-testid="api-keys-store-hint" role="note" className="mb-3 text-[12px] leading-[1.5] text-warn">
+          {storeHint}
+        </div>
+      )}
       <div className="overflow-hidden rounded-card border border-border bg-surface-1">
         {loading && !data && <LoadingState />}
         {error && (
@@ -94,11 +116,13 @@ export function ApiKeysPanel({
           const editing = editKey === k.key;
           const m = msg?.key === k.key ? msg : null;
           return (
-            <div key={k.key} className="border-b border-border-faint px-[15px] py-3 last:border-0">
+            <div key={k.key} data-setting-key={`apikey:${k.key}`} className="border-b border-border-faint px-[15px] py-3 last:border-0">
               <div className="flex items-center gap-3">
                 <div className="min-w-0 flex-1">
                   <div className="text-[13px] font-medium">{k.label}</div>
-                  <div className="mt-0.5 text-[11.5px] leading-[1.4] text-faint">{k.help}</div>
+                  <div className="mt-0.5 text-[11.5px] leading-[1.4] text-faint">
+                    <HelpText text={k.help} />
+                  </div>
                 </div>
                 <span
                   className="flex-none rounded px-1.5 py-0.5 text-[10px] font-semibold"
@@ -122,7 +146,9 @@ export function ApiKeysPanel({
                       setMsg(null);
                       setPendingClear(null);
                     }}
-                    className="flex-none rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-[5px] text-[11.5px] font-semibold text-text hover:border-accent"
+                    disabled={k.can_store === false}
+                    title={k.can_store === false ? (storeHint ?? undefined) : undefined}
+                    className="flex-none rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-[5px] text-[11.5px] font-semibold text-text hover:border-accent disabled:cursor-not-allowed disabled:opacity-50"
                   >
                     {k.isSet ? 'Replace' : 'Set'}
                   </button>

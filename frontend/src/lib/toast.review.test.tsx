@@ -47,3 +47,18 @@ describe('toast (2026-07-31 visual pass)', () => {
     }
   });
 });
+
+describe('toast placement (dogfood 2026-10-19, V1-A8)', () => {
+  it('docks at the bottom center, away from the row actions at the right edge', () => {
+    render(
+      <ToastProvider>
+        <Trigger opts={{ message: 'Acknowledged 1 event.', tone: 'success' }} />
+      </ToastProvider>,
+    );
+    fireEvent.click(screen.getByText('go'));
+    const region = screen.getByRole('region', { name: 'Notifications' });
+    expect(region.getAttribute('data-placement')).toBe('bottom-center');
+    expect(region.className).toContain('left-1/2');
+    expect(region.className).not.toContain('right-4');
+  });
+});

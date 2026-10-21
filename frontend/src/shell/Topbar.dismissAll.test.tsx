@@ -113,7 +113,7 @@ describe('the bell panel accounts for every unit of the badge', () => {
     ]);
     const sum = parts.reduce((s, p) => s + Number(p!.split(' ')[0]), 0);
     expect(String(sum)).toBe(badge());
-    expect(screen.getByTestId('notif-summary').textContent).toBe('309 need you · 2 events');
+    expect(screen.getByTestId('notif-summary').textContent).toBe('309 need you · 2 notifications');
   });
 
   it('asks the server for the events only, and leaves the hit and lead rows to the block', async () => {
@@ -176,7 +176,7 @@ describe('Dismiss all in the bell panel', () => {
     await mount();
     fireEvent.click(within(panel()).getByRole('button', { name: 'Dismiss all' }));
     expect(within(panel()).getByRole('group', { name: 'Confirm dismiss all' }).textContent).toContain(
-      'Hide 2 events and mark 300 shadow hits read? Leads and verdicts that need more info stay. 1 notice you cannot dismiss stays.',
+      'Hide 2 notifications and mark 300 shadow hits read? Leads and verdicts that need more info stay. 1 notice you cannot dismiss stays.',
     );
     expect(markAllShadowHitsRead).not.toHaveBeenCalled();
     expect(localStorage.getItem('soc-ai:notifications-cleared-at')).toBeNull();
@@ -227,7 +227,7 @@ describe('Dismiss all in the bell panel', () => {
     fireEvent.click(within(panel()).getByRole('button', { name: 'Dismiss all' }));
     await flush();
     expect(within(panel()).getByRole('alert').textContent).toBe(
-      'Dismiss all hid the events. It could not mark the shadow hits read. Try again.',
+      'Dismiss all hid the notifications. It could not mark the shadow hits read. Try again.',
     );
     expect(titles()).toEqual([]);
     // The hits are still unread, so the control is there to try again.
@@ -244,7 +244,7 @@ describe('Dismiss all in the bell panel', () => {
     fireEvent.click(within(panel()).getByRole('button', { name: 'Dismiss all' }));
     await flush();
     expect(within(panel()).getByRole('alert').textContent).toBe(
-      'New shadow hits arrived after the count. Dismiss all hid the events and marked no hit read. Check the new count and try again.',
+      'New shadow hits arrived after the count. Dismiss all hid the notifications and marked no hit read. Check the new count and try again.',
     );
     expect(within(panel()).getByRole('button', { name: 'Dismiss all' })).toBeTruthy();
   });

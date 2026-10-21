@@ -1,15 +1,19 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  HUNT_AGAIN_CLOSE,
   agoWords,
   entityCountWords,
+  huntAgainWords,
   huntRecordSentence,
+  moreEntityWords,
   kindCount,
   leadHuntLabel,
   leadWhySentence,
   runTime,
   staleHuntSentence,
 } from './leadWords';
+import { ago } from './timeRange';
 
 describe('entityCountWords (K6)', () => {
   it('counts hosts and accounts by name', () => {
@@ -94,6 +98,18 @@ describe('agoWords', () => {
     ['2026-09-19T12:00:00Z', '17 days ago'],
   ])('reads %s as %s', (iso, words) => {
     expect(agoWords(iso, NOW)).toBe(words);
+  });
+
+  // V1-H5: one hunt read "27 days ago" in the Hunt again confirm and "26d"
+  // in the hunt row. The words now count whole units, the way ago() does.
+  it.each([
+    ['2026-09-09T23:00:00Z', '26 days ago', '26d ago'],
+    ['2026-10-05T10:00:00Z', '1 day ago', '1d ago'],
+    ['2026-10-06T10:31:00Z', '1 hour ago', '1h ago'],
+    ['2026-10-06T11:58:31Z', '1 minute ago', '1m ago'],
+  ])('reads %s as %s, the same count as ago()', (iso, words, short) => {
+    expect(agoWords(iso, NOW)).toBe(words);
+    expect(ago(iso, NOW)).toBe(short);
   });
 });
 
@@ -190,5 +206,39 @@ describe('leadHuntLabel', () => {
     const label = leadHuntLabel({ ...DONE, status: 'error' });
     expect(label).toBe('Lead hunt · 17 steps · 6 min');
     expect(label).not.toContain('threat');
+  });
+});
+
+// R3-I5 and R3 STE 20: the Hunt again confirm named no time and said nothing
+// of the close that follows the new hunt.
+describe('huntAgainWords', () => {
+  const now = Date.parse('2026-10-19T12:00:00Z');
+  it('states when the hunt on record ran and how long it took', () => {
+    expect(
+      huntAgainWords({ started_at: '2026-09-29T12:00:00Z', elapsed_sec: 1060 }, now),
+    ).toEqual({ head: 'This lead has a hunt from 20 days ago.', run: 'That hunt ran 18 min.' });
+  });
+
+  it('states no time the record does not hold', () => {
+    expect(huntAgainWords(null, now)).toEqual({ head: 'This lead has a hunt.', run: null });
+    expect(huntAgainWords({ started_at: null, elapsed_sec: 0 }, now)).toEqual({
+      head: 'This lead has a hunt.',
+      run: null,
+    });
+    expect(HUNT_AGAIN_CLOSE).toBe(
+      'soc-ai closes the lead when the new hunt finds no threat, or when every threat finding ' +
+        'of the hunt that names an entity has a verdict.',
+    );
+  });
+});
+
+describe('moreEntityWords (R3 STE 7)', () => {
+  it('puts "more" before the noun', () => {
+    expect(moreEntityWords([['host', 'a']])).toBe('1 more host');
+    expect(moreEntityWords([['host', 'a'], ['host', 'b']])).toBe('2 more hosts');
+    expect(moreEntityWords([['user', 'u']])).toBe('1 more account');
+    expect(moreEntityWords([['host', 'a'], ['host', 'b'], ['user', 'u']])).toBe(
+      '3 more: 2 hosts and 1 account',
+    );
   });
 });

@@ -1,5 +1,6 @@
 import { Radio, ShieldCheck } from 'lucide-react';
 import { getEgressPolicy } from '../lib/api';
+import { HelpText } from '../components/HelpText';
 import { CollapseChevron, SectionTitle } from '../components/Panel';
 import { ErrorState, LoadingState } from '../components/States';
 import { useAsync } from '../lib/useAsync';
@@ -89,11 +90,13 @@ export function EgressPolicyPanel({
                           {d.enabled ? 'egress on' : 'off'}
                         </span>
                       </div>
-                      <div className="mt-1 text-[12px] text-dim">{d.detail}</div>
+                      <div className="mt-1 text-[12px] text-dim">
+                        <HelpText text={d.detail} />
+                      </div>
                       <div className="mt-1 flex items-center gap-1.5 text-[11.5px] text-faint">
                         <ShieldCheck size={12} className="flex-none" />
                         <span>
-                          redaction: <span className="text-text-2">{d.redaction}</span>
+                          redaction: <HelpText className="text-text-2" text={d.redaction} />
                         </span>
                       </div>
                     </div>

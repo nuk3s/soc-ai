@@ -168,3 +168,74 @@ def test_a_running_hunt_carries_its_step_and_the_typical_run(client: TestClient)
     # Negative control: a finished hunt carries neither.
     finished = client.get(f"/api/v1/hunts/{done_id}").json()
     assert finished["currentStep"] is None and finished["typicalRun"] is None
+
+
+# --- R3 STE 26, 27 and 28: model-facing tool text, in plain words on the page.
+# The tools keep their text: the model reads it. The hunt timeline maps it.
+
+_WILDCARD = (
+    "leading-wildcard patterns are too expensive; anchor the wildcard (write foo*, not *foo) "
+    "- or, for a substring/contains match, use field:~value, which searches the field's "
+    "analyzed text and is the right form for process.command_line and message: '*mimikatz'"
+)
+
+
+def test_a_leading_wildcard_error_reads_as_plain_sentences() -> None:
+    assert translate_tool_error(_WILDCARD) == (
+        "The query starts a pattern with a wildcard. The grid refuses that form. "
+        "Write the pattern as foo*, or use field:~value."
+    )
+
+
+def test_the_timeline_states_a_prevalence_in_plain_words() -> None:
+    result = {
+        "observed": True,
+        "total_events": 99976,
+        "distinct_days": 13,
+        "is_novel": False,
+        "rarity": "common",
+        "summary": "192.0.2.5: common - 99976 event(s) across 13 distinct day(s) (first x).",
+    }
+    trace = [
+        _ev(1, "hunt_started", {"objective": "o"}),
+        _ev(
+            2,
+            "tool_call",
+            {"tool_name": "t_prevalence", "args": {"src_ip": "192.0.2.5"}, "tool_call_id": "p"},
+        ),
+        _ev(3, "tool_result", {"tool_call_id": "p", "result": result}),
+        _ev(
+            4,
+            "tool_call",
+            {"tool_name": "t_rule_prevalence", "args": {"rule": "R"}, "tool_call_id": "r"},
+        ),
+        _ev(
+            5,
+            "tool_result",
+            {
+                "tool_call_id": "r",
+                "result": {
+                    "summary": "'R' fired 4x in 2 min - one burst. That is a single episode, "
+                    "not a background rate, so no per-day rate is reported."
+                },
+            },
+        ),
+    ]
+    titles = [s.title for s in _build_hunt_timeline(trace, "complete")]
+    assert titles[1] == "Indicator prevalence: 192.0.2.5 is common. 99,976 events on 13 days."
+    assert "That is one episode. soc-ai states no rate for each day." in titles[2]
+    assert "background rate" not in titles[2]
+
+
+def test_a_partial_read_reads_as_plain_sentences() -> None:
+    """R3 STE 14: the grid client's partial-read text is the model's. The page
+    states the shards that answered."""
+    raw = (
+        "partial search results from .ds-logs-*-so-*: 244 of 289 shards failed "
+        "(no_shard_available_action_exception). The returned hits are incomplete. An empty "
+        "or short answer here means unknown."
+    )
+    assert translate_tool_error(raw) == (
+        "The grid answered from 45 of 289 shards. The answer is incomplete. An empty answer "
+        "means that the result is unknown."
+    )

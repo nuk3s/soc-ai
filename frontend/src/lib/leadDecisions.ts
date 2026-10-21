@@ -51,6 +51,26 @@ export const DECISION_WORD: Record<string, string> = {
   formed_from_backtest: 'backtest replay',
 };
 
+/** The rule soc-ai closes a lead by when its hunt investigated its findings
+ *  (soc_ai.store.leads.settle_after_hunt), as a clause after "when". The hunt
+ *  investigates a threat finding that names a host, an address, a user or a
+ *  domain. An observation has no verdict. The pages said "every finding" in
+ *  one place and "every threat finding" in another (dogfood 2026-10-19,
+ *  V1-H3). One wording, here. */
+export const CLOSE_RULE_CLAUSE = 'every threat finding of the hunt that names an entity has a verdict';
+
+/** The reason the store records on a close by the verdict of a hunt finding
+ *  (soc_ai.store.leads.PROMOTED_FINDING_REASON). */
+export const FINDING_VERDICT_REASON = 'finding_verdict';
+
+/** The chip word of one decision. A close on the verdicts of a hunt is stored
+ *  as `promoted`, and the chip read "investigation opened" beside the words
+ *  "soc-ai closed the lead" (dogfood 2026-10-19, V1-H2). */
+export function decisionWord(d: { action: string; reason?: string | null }): string {
+  if (d.action === 'promoted' && d.reason === FINDING_VERDICT_REASON) return DECISION_WORD.closed_by_hunt;
+  return DECISION_WORD[d.action] ?? d.action;
+}
+
 /** The decision the server records on a lead that formed from backtest
  *  replays only (soc_ai.store.leads.BACKTEST_DECISION). */
 export const BACKTEST_DECISION = 'formed_from_backtest';
@@ -78,8 +98,19 @@ export function holdSentence(lead: LeadDecisionFields): string | null {
   return null;
 }
 
-/** The hand that took a decision, in the words the page uses for it. */
+/** True for a hand the product signs with: auto-hunt, the catalog sweep, or
+ *  any `system:` actor (system:hunt, system:self-heal, system:catalog). */
+export function isSystemActor(by: string | null | undefined): boolean {
+  if (!by) return false;
+  return by === AUTO_HUNT_ACTOR || by === CATALOG_SWEEP_ACTOR || by.startsWith('system:');
+}
+
+/** The hand the catalog sweep signs its hunts with. */
+export const CATALOG_SWEEP_ACTOR = 'hunt-catalog';
+
+/** The hand that took a decision, in the words the page uses for it. A system
+ *  actor reads as the product: the timeline printed "system:hunt" (R3-D5). */
 export function actorOf(by: string | null, socAi: string): string {
   if (!by) return '';
-  return by === AUTO_HUNT_ACTOR || by === socAi ? socAi : by;
+  return by === socAi || isSystemActor(by) ? socAi : by;
 }

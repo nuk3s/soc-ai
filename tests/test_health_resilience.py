@@ -285,7 +285,9 @@ def test_a_half_read_grid_under_the_opt_out_still_reaches_the_bell(tmp_path):
             notifs = client.get("/api/v1/notifications").json()
     down = [n for n in notifs if n["id"].startswith("dep-down:es:")]
     assert len(down) == 1
-    assert "reading only part of the grid" in down[0]["title"]
+    assert down[0]["title"] == (
+        "The grid returns partial results. Counts and investigations can miss events."
+    )
 
 
 def test_down_dep_kind_is_recorded_and_refreshed_while_down():
@@ -336,7 +338,10 @@ def test_notifications_carry_down_dep_entries(tmp_path):
             saturated = client.get("/api/v1/notifications").json()
             title = next(n["title"] for n in saturated if n["id"].startswith("dep-down:es:"))
             assert "unreachable" not in title
-            assert "shedding load" in title
+            assert title == (
+                "The grid is overloaded and refuses some requests. "
+                "soc-ai cannot run an investigation until it recovers."
+            )
 
             # Recovery: the entry disappears.
             app.state._dep_down_since = {}
@@ -747,7 +752,10 @@ def test_notifications_name_the_security_onion_api(tmp_path):
             notifs = client.get("/api/v1/notifications").json()
     down = [n for n in notifs if n["id"].startswith("dep-down:so:")]
     assert len(down) == 1
-    assert "Security Onion API" in down[0]["title"]
+    assert down[0]["title"] == (
+        "The Security Onion API is unreachable. "
+        "soc-ai cannot acknowledge, escalate or comment until it answers."
+    )
 
 
 async def test_health_is_probed_on_a_schedule_with_no_client_polling() -> None:
@@ -858,3 +866,43 @@ def test_notifications_carry_a_tls_expiry_row_while_the_alarm_stands(tmp_path):
             slot.alarm = None
             after = client.get("/api/v1/notifications").json()
             assert not [r for r in after if r["id"].startswith("tls-expiry:")]
+
+
+def test_the_dependency_notices_use_one_term_for_each_dependency(tmp_path):
+    """One term for one thing: "the grid" and "the model gateway".
+
+    The bell said "Security Onion / Elasticsearch" and "LLM gateway", and every
+    row ended "Investigations are degraded." (dogfood 2026-10-19, H1 STE 19-21).
+    """
+    from fastapi.testclient import TestClient
+    from soc_ai.main import create_app
+    from soc_ai.store import auth as auth_svc
+
+    settings = _settings(db_path=str(tmp_path / "terms.db"))
+    with (
+        patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=AsyncMock()),
+        patch("soc_ai.main.make_auth", return_value=AsyncMock()),
+        patch("soc_ai.main.get_settings", return_value=settings),
+    ):
+        app = create_app()
+        with TestClient(app) as client:
+            now = auth_svc.utcnow()
+            app.state._dep_down_since = {"es": now, "llm": now}
+            app.state._dep_down_kind = {"es": "refused", "llm": "timeout"}
+            notifs = client.get("/api/v1/notifications").json()
+            app.state._dep_down_kind = {"es": "slow", "llm": ""}
+            slow = client.get("/api/v1/notifications").json()
+    titles = {n["id"].split(":")[1]: n["title"] for n in notifs if n["id"].startswith("dep-down:")}
+    assert titles == {
+        "es": "The grid is unreachable. soc-ai cannot run an investigation until it answers.",
+        "llm": (
+            "The model gateway does not answer. "
+            "soc-ai cannot run an investigation until it answers."
+        ),
+    }
+    slow_titles = {
+        n["id"].split(":")[1]: n["title"] for n in slow if n["id"].startswith("dep-down:")
+    }
+    assert slow_titles["es"] == (
+        "The grid is slow to answer. Counts and investigations can be late."
+    )

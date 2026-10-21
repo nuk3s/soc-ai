@@ -367,9 +367,16 @@ def _live(p: _Plane, hour: datetime, params: CrossPlaneSilenceParams, tz: str) -
 
 
 def _silences(
-    planes: list[_Plane], hours: Sequence[datetime], params: CrossPlaneSilenceParams, tz: str
+    planes: list[_Plane],
+    hours: Sequence[datetime],
+    params: CrossPlaneSilenceParams,
+    tz: str,
+    skip: frozenset[datetime] = frozenset(),
 ) -> list[_Silence]:
-    """The longest run per silent plane, with the live plane that held it best."""
+    """The longest run per silent plane, with the live plane that held it best.
+
+    An hour in ``skip`` lies in a grid gap. It is unknown, so it breaks a run.
+    """
     out: list[_Silence] = []
     for silent in planes:
         best: _Silence | None = None
@@ -379,6 +386,11 @@ def _silences(
             run: list[datetime] = []
             runs: list[list[datetime]] = []
             for hour in hours:
+                if hour in skip:
+                    if run:
+                        runs.append(run)
+                        run = []
+                    continue
                 if _silent(silent, hour, params, tz) and _live(live, hour, params, tz):
                     run.append(hour)
                 elif run:
@@ -561,6 +573,8 @@ def _score(
     exclude = windows_for(ctx.windows, machine.name)
     for address in machine.addresses:
         exclude.extend(w for w in windows_for(ctx.windows, address) if w not in exclude)
+    # The grid gaps: the baseline does not learn their hours as zero.
+    exclude.extend(ctx.gaps)
     read = [_plane(machine, p, windows, now=ctx.now, tz=ctx.tz, exclude=exclude) for p in planes]
     measured = [p for p in read if p.history_days >= params.min_history_days]
     learning = [p.plane for p in read if p.history_days < params.min_history_days]
@@ -582,7 +596,13 @@ def _score(
         machine,
         STATE_MEASURED,
         note,
-        silences=_silences(measured, windows.recent, params, ctx.tz),
+        silences=_silences(
+            measured,
+            windows.recent,
+            params,
+            ctx.tz,
+            skip=frozenset(h for h in windows.recent if ctx.in_gap(h)),
+        ),
         measured=[p.plane for p in measured],
     )
 

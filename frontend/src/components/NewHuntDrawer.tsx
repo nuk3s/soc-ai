@@ -1,5 +1,5 @@
 import { AlertTriangle, Check, ChevronDown, ChevronRight, Loader2, Plus, Sparkles, X } from 'lucide-react';
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 
 import {
@@ -45,7 +45,7 @@ export function notApplicableReason(t: {
   if (t.applicable === false) {
     const needs = t.missingEnvironment.length
       ? t.missingEnvironment.join(' and ')
-      : 'machinery that this network has not shown';
+      : 'an environment that this network has not shown';
     parts.push(`Needs ${needs}. The network shows none.`);
   }
   return parts.join(' ');
@@ -234,7 +234,7 @@ function TemplatePicker({
     if (t.applicable === false) {
       const needs = t.missingEnvironment.length
         ? t.missingEnvironment.join(' and ')
-        : 'machinery that this network has not shown';
+        : 'an environment that this network has not shown';
       reasons.push(
         `This hunt needs ${needs}. The network shows none of it. ` +
           'Each dossier sweep checks this again.',
@@ -497,6 +497,14 @@ export function NewHuntDrawer({
   const [starting, setStarting] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
   const objectiveRef = useRef<HTMLTextAreaElement | null>(null);
+  // The objective box takes the first focus. The drawer's modal surface moves
+  // the focus to its first control one task after mount, which was the Close
+  // button in the header (dogfood 2026-10-19, H1-D19). This effect runs after
+  // the drawer's, so its task runs after that move.
+  useEffect(() => {
+    const t = window.setTimeout(() => objectiveRef.current?.focus(), 0);
+    return () => window.clearTimeout(t);
+  }, []);
   // W11: the time range, the cap the grid answers to, and the run time. The
   // dialog said none of them, and a hunt over data older than the cap ran
   // seven minutes and could not answer. 0 leaves the range to the objective.
@@ -577,9 +585,9 @@ export function NewHuntDrawer({
             />
           </div>
           <div className="mt-1.5 text-[11px] text-faint">
-            The agent correlates across the hosts and the time range. It reports findings and a
-            narrative. The agent is read-only. Press Shift+Enter for a new line. A detailed brief
-            gets a better hunt. Name the scope, the exclusions and the behaviors.
+            The agent correlates the events across the hosts and the time range. It reports findings
+            and a narrative. The agent is read-only. Press Shift+Enter for a new line. Name the
+            scope, the exclusions and the behaviors. A detailed objective gives a better hunt.
           </div>
           <div className="mt-3 flex flex-wrap items-center gap-2 text-[12px]">
             <label htmlFor="new-hunt-range" className="text-[10.5px] font-semibold uppercase tracking-[.06em] text-faint">

@@ -483,3 +483,88 @@ async def test_a_healthy_spec_reports_neither_unattributed_nor_truncated(session
     s = (await catalog_status(session, now=NOW))[SPEC]
     assert (s.unattributed_docs, s.truncated_docs) == (0, 0)
     assert s.fired_24h == 1
+
+
+# ---------------------------------------------------------------------------
+# Failed runs (dogfood 2026-10-19 R5-D4, R5-I3). The 24 h counters covered 24
+# failed runs and read "fired 0 · fresh 0 · handled 0". After one good sweep
+# the outage left no trace.
+# ---------------------------------------------------------------------------
+
+
+def _now() -> datetime:
+    return datetime.now(UTC).replace(tzinfo=None, microsecond=0)
+
+
+async def test_status_counts_the_failed_runs_of_the_window(session) -> None:  # type: ignore[no-untyped-def]
+    now = _now()
+    await _record(session, now=now - timedelta(hours=30), error="boom")
+    for hours in (5, 3, 1):
+        await _record(session, now=now - timedelta(hours=hours), error="grid down")
+    await _record(session, now=now - timedelta(hours=2))
+    s = (await catalog_status(session, now=now))[SPEC]
+    assert s.sweeps_24h == 4
+    assert s.failed_24h == 3, "the failed run 30 h ago is outside the window"
+
+
+async def test_status_names_the_first_failure_of_the_current_streak(session) -> None:  # type: ignore[no-untyped-def]
+    now = _now()
+    await _record(session, now=now - timedelta(hours=40), error="old outage")
+    await _record(session, now=now - timedelta(hours=30))
+    for hours in (28, 10, 1):
+        await _record(session, now=now - timedelta(hours=hours), error="grid down")
+    s = (await catalog_status(session, now=now))[SPEC]
+    assert s.failing_since == now - timedelta(hours=28), "the streak starts after the clean run"
+    assert s.failed_24h == 2
+
+
+async def test_a_clean_newest_run_has_no_failure_streak(session) -> None:  # type: ignore[no-untyped-def]
+    now = _now()
+    await _record(session, now=now - timedelta(hours=2), error="grid down")
+    await _record(session, now=now - timedelta(hours=1))
+    s = (await catalog_status(session, now=now))[SPEC]
+    assert s.failing_since is None
+    assert s.failed_24h == 1, "the outage still shows in the window after one good sweep"
+
+
+async def test_the_loop_status_counts_whole_sweeps(session) -> None:  # type: ignore[no-untyped-def]
+    """One sweep is one run of the loop. It failed when every analytic in it failed."""
+    from soc_ai.store.hunt_spec_sweeps import loop_status
+
+    now = _now()
+    first = now - timedelta(hours=3)
+    await _record(session, spec_id=SPEC, now=first)
+    await _record(session, spec_id=OTHER, now=first)
+    for hours in (2, 1):
+        at = now - timedelta(hours=hours)
+        await _record(session, spec_id=SPEC, now=at, error="precondition: ConnectionError(x)")
+        await _record(session, spec_id=OTHER, now=at, error="precondition: ConnectionError(x)")
+    loop = await loop_status(session, now=now, spec_ids={SPEC, OTHER})
+    assert loop is not None
+    assert loop.runs_24h == 3
+    assert loop.failed_24h == 2
+    assert loop.last_run_at == now - timedelta(hours=1)
+    assert loop.last_failed is True
+    assert loop.failing_since == now - timedelta(hours=2)
+    assert loop.last_error == "precondition: ConnectionError(x)"
+
+
+async def test_a_sweep_with_one_good_analytic_did_not_fail(session) -> None:  # type: ignore[no-untyped-def]
+    from soc_ai.store.hunt_spec_sweeps import loop_status
+
+    now = _now()
+    at = now - timedelta(hours=1)
+    await _record(session, spec_id=SPEC, now=at, error="boom")
+    await _record(session, spec_id=OTHER, now=at)
+    loop = await loop_status(session, now=now, spec_ids={SPEC, OTHER})
+    assert loop is not None
+    assert (loop.runs_24h, loop.failed_24h, loop.last_failed) == (1, 0, False)
+    assert loop.failing_since is None
+
+
+async def test_the_loop_status_reads_only_the_named_analytics(session) -> None:  # type: ignore[no-untyped-def]
+    from soc_ai.store.hunt_spec_sweeps import loop_status
+
+    now = _now()
+    await _record(session, spec_id=OTHER, now=now - timedelta(hours=1), error="boom")
+    assert await loop_status(session, now=now, spec_ids={SPEC}) is None

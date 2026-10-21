@@ -29,7 +29,7 @@ from urllib.parse import quote
 
 from fastapi import Depends, Query, Request
 from pydantic import BaseModel
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from soc_ai.api.deps import get_settings_dep
@@ -44,6 +44,7 @@ from soc_ai.api.webui._timeline import EntityRefOut
 from soc_ai.config import Settings
 from soc_ai.store import host_machines
 from soc_ai.store import hunts as hunt_svc
+from soc_ai.store import investigations as inv_svc
 from soc_ai.store.models import (
     EntityObservation,
     HostDossierField,
@@ -90,6 +91,8 @@ class EntityTimelineItem(BaseModel):
 
 
 class EntitySummaryOut(BaseModel):
+    # Every investigation that names the entity or another key of its
+    # machine. A SQL count: the timeline stops at a bound, and this does not.
     investigationCount: int = 0
     huntFindingCount: int = 0
     # The verdict of the most recent investigation touching this entity (if any) —
@@ -128,6 +131,13 @@ class EntityOut(BaseModel):
     # page (`/hosts/<key>`). Null when no machine holds it, or when a name
     # belongs to two machines.
     host_key: str | None = None
+    # The first name of the machine that holds the value, for the page line
+    # "an address of web01". Null when no machine holds it.
+    host_name: str | None = None
+    # Every key the counts and the timeline read: the value first, then the
+    # other addresses, names and the agent of its machine. A value no machine
+    # holds reads itself only.
+    machine_keys: list[str] = []
     # The first and the last time soc-ai recorded the entity: an investigation,
     # a hunt finding, a lead or an observation. Null when nothing names it.
     first_seen: str | None = None
@@ -161,21 +171,50 @@ def _naive(value: datetime | None) -> datetime | None:
     return value.astimezone(UTC).replace(tzinfo=None) if value.tzinfo else value
 
 
-async def _investigations(db: AsyncSession, value: str, *, name: bool) -> list[Investigation]:
-    """Real investigations that name *value*: either end of the flow, or the
-    reporting host for a name. Newest first, bounded. Synth-eval rows never
-    narrate an entity's history (see ``investigations.for_entity``)."""
-    match = (Investigation.src_ip == value) | (Investigation.dest_ip == value)
-    if name:
-        match = match | (func.lower(Investigation.host_name) == value.lower())
+async def _investigations(
+    db: AsyncSession, keys: Sequence[str]
+) -> tuple[list[Investigation], int, int]:
+    """Real investigations that name one of *keys*: either end of the flow for
+    an address, the reporting host for a name.
+
+    Returns ``(the newest rows, bounded; the count of every match; the
+    true-positive count of every match)``. The counts are SQL counts over the
+    whole match set: a count of the bounded rows stops at the bound. The
+    match is the one the Investigations list filter uses
+    (:func:`soc_ai.store.investigations.entity_match_sql`), so the two pages
+    count the same runs. Synth-eval runs and backtest replays never narrate
+    an entity's history.
+    """
+    match = inv_svc.entity_match_sql(keys)
     rows = await db.scalars(
         select(Investigation)
         .where(match)
-        .where(Investigation.is_synth_eval.is_(False))
         .order_by(Investigation.created_at.desc(), Investigation.id.desc())
         .limit(_INV_LIMIT)
     )
-    return list(rows.all())
+    total, true_positives = (
+        await db.execute(
+            select(
+                func.count(Investigation.id),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (
+                                and_(
+                                    Investigation.is_fallback.isnot(True),
+                                    Investigation.verdict == "true_positive",
+                                ),
+                                1,
+                            ),
+                            else_=0,
+                        )
+                    ),
+                    0,
+                ),
+            ).where(match)
+        )
+    ).one()
+    return list(rows.all()), int(total or 0), int(true_positives or 0)
 
 
 def _lead_pairs(lead: Lead) -> list[tuple[str, str]]:
@@ -189,9 +228,19 @@ def _lead_pairs(lead: Lead) -> list[tuple[str, str]]:
     return out
 
 
-async def _leads_naming(db: AsyncSession, value: str) -> list[tuple[Lead, str]]:
-    """The newest leads that name *value*, each with the kind the lead records."""
+async def _leads_naming(
+    db: AsyncSession, value: str, aliases: Sequence[str] = ()
+) -> list[tuple[Lead, str]]:
+    """The newest leads that name *value*, each with the kind the lead records.
+
+    *value* matches an entity of any kind. An alias, another key of the
+    value's machine, matches a host entity only: a user account that shares
+    a host's name is a different thing. The leads route applies the same
+    rule (``routes_hunts._lead_names``), so the count and the leads panel
+    agree.
+    """
     folded = value.casefold()
+    host_keys = {a.casefold() for a in aliases} | {folded}
     rows = (
         await db.scalars(
             select(Lead).order_by(Lead.formed_at.desc(), Lead.id.desc()).limit(_LEAD_SCAN_LIMIT)
@@ -200,18 +249,31 @@ async def _leads_naming(db: AsyncSession, value: str) -> list[tuple[Lead, str]]:
     out: list[tuple[Lead, str]] = []
     for lead in rows:
         for kind, key in _lead_pairs(lead):
-            if key.casefold() == folded:
+            held = key.casefold()
+            if held == folded or (kind == "host" and held in host_keys):
                 out.append((lead, kind))
                 break
     return out
 
 
 async def _observations_naming(
-    db: AsyncSession, value: str, *, since: datetime
+    db: AsyncSession, value: str, *, since: datetime, aliases: Sequence[str] = ()
 ) -> tuple[int, set[str], datetime | None, datetime | None]:
     """How many observations name *value*, the kinds they record, and the
-    first and last time one was written."""
-    keyed = func.lower(EntityObservation.entity_key) == value.lower()
+    first and last time one was written.
+
+    The alias rule is the leads rule: *value* matches any kind, an alias
+    matches a host row only. The observations route reads the same rule.
+    """
+    keyed: Any = func.lower(EntityObservation.entity_key) == value.lower()
+    if aliases:
+        keyed = or_(
+            keyed,
+            and_(
+                EntityObservation.entity_kind == "host",
+                func.lower(EntityObservation.entity_key).in_([a.lower() for a in aliases]),
+            ),
+        )
     row = (
         await db.execute(
             select(
@@ -255,6 +317,59 @@ def _edge(stamps: Iterable[datetime | None], *, newest: bool) -> datetime | None
     return max(held) if newest else min(held)
 
 
+async def _machine_keys(
+    db: AsyncSession, value: str, machine: host_machines.Membership | None
+) -> list[str]:
+    """*value* first, then every other key its machine is stored under.
+
+    The addresses and names come from
+    :func:`soc_ai.store.host_machines.entity_expansion`. The agent id joins
+    them. A value no machine holds expands to itself only.
+    """
+    if machine is None:
+        return [value]
+    keys = await host_machines.entity_expansion(db, value)
+    folded = {k.casefold() for k in keys}
+    for extra in (machine.agent_id, machine.key):
+        if extra and extra.casefold() not in folded:
+            folded.add(extra.casefold())
+            keys.append(extra)
+    return keys
+
+
+def _machine_name(machine: host_machines.Membership | None) -> str | None:
+    """The first name the machine answers to, or ``None``."""
+    if machine is None:
+        return None
+    return (machine.names[0] if machine.names else None) or machine.agent_name
+
+
+def _entity_type(
+    value: str,
+    *,
+    kind: Literal["ip", "host", "unknown"],
+    hint: str,
+    machine: bool,
+    user_named: bool,
+    domain_count: int,
+    settings: Settings,
+) -> EntityType:
+    """What the value is, in the words the page uses."""
+    if kind == "ip":
+        return "address" if is_internal_ip(value, settings) else "external_address"
+    if hint == "user":
+        return "user"
+    if hint == "domain":
+        return "domain"
+    if hint == "host" or machine:
+        return "host"
+    if user_named:
+        return "user"
+    if domain_count > 0:
+        return "domain"
+    return "name"
+
+
 @router.get("/entity/{value}", response_model=EntityOut)
 async def get_entity(
     request: Request,
@@ -292,41 +407,46 @@ async def get_entity(
     hint = hint if hint in _HINTS else ""
     since = datetime.now(UTC).replace(tzinfo=None) - timedelta(days=_OBSERVATION_DAYS)
     async with request.app.state.db_sessionmaker() as db:
-        investigations = await _investigations(db, value, name=kind == "host")
-        findings = await hunt_svc.findings_for_entity(db, value, scan_limit=_HUNT_SCAN_LIMIT)
         # A user or a domain is not a machine, whatever a machine is called.
         machine = (
             None
             if hint in ("user", "domain")
             else await host_machines.resolve_membership(db, value)
         )
-        leads = await _leads_naming(db, value)
+        # Every key the machine is stored under: its addresses, its names and
+        # its agent. The address of a machine and its name read one set of
+        # records (dogfood 2026-10-19, R4-D2). A value no machine holds
+        # reads itself only.
+        keys = await _machine_keys(db, value, machine)
+        aliases = keys[1:]
+        investigations, investigation_total, true_positives = await _investigations(db, keys)
+        leads = await _leads_naming(db, value, aliases)
         observed, observed_kinds, obs_first, obs_last = await _observations_naming(
-            db, value, since=since
+            db, value, since=since, aliases=aliases
         )
         domain_count = (
             await _domain_machines(db, value)
             if kind == "host" and hint in ("", "domain") and machine is None
             else 0
         )
+        entity_type = _entity_type(
+            value,
+            kind=kind,
+            hint=hint,
+            machine=machine is not None,
+            user_named=("user" in observed_kinds or any(k == "user" for _, k in leads)),
+            domain_count=domain_count,
+            settings=settings,
+        )
+        findings = await hunt_svc.findings_for_entity(
+            db,
+            value,
+            scan_limit=_HUNT_SCAN_LIMIT,
+            aliases=aliases,
+            named_in_title=entity_type == "user",
+        )
     host_key = machine.key if machine is not None else None
     host_ip = machine.primary_ip if machine is not None and kind == "host" else None
-
-    entity_type: EntityType
-    if kind == "ip":
-        entity_type = "address" if is_internal_ip(value, settings) else "external_address"
-    elif hint == "user":
-        entity_type = "user"
-    elif hint == "domain":
-        entity_type = "domain"
-    elif hint == "host" or machine is not None:
-        entity_type = "host"
-    elif "user" in observed_kinds or any(k == "user" for _, k in leads):
-        entity_type = "user"
-    elif domain_count > 0:
-        entity_type = "domain"
-    else:
-        entity_type = "name"
 
     items: list[EntityTimelineItem] = []
     for inv in investigations:
@@ -369,16 +489,18 @@ async def get_entity(
         type=entity_type,
         host_ip=host_ip,
         host_key=host_key,
+        host_name=_machine_name(machine),
+        machine_keys=keys,
         timeline=items,
         first_seen=_iso_utc(first_seen) or None,
         last_seen=_iso_utc(last_seen) or None,
         domain_machines=domain_count if entity_type == "domain" else None,
         summary=EntitySummaryOut(
-            investigationCount=len(investigations),
+            investigationCount=investigation_total,
             huntFindingCount=len(findings),
             # investigations came back newest-first.
             latestVerdict=(_verdict(investigations[0].verdict) if investigations else None),
-            truePositiveCount=sum(1 for inv in investigations if inv.verdict == "true_positive"),
+            truePositiveCount=true_positives,
             leadCount=len(leads),
             openLeadCount=sum(1 for lead, _ in leads if _open(lead)),
             observationCount=observed,

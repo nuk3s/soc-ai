@@ -160,6 +160,93 @@ describe('Login error', () => {
     fireEvent.change(screen.getByLabelText('Password'), { target: { value: 'wrong' } });
     fireEvent.click(screen.getByRole('button', { name: /sign in/i }));
     const alert = await screen.findByRole('alert');
-    expect(alert.textContent).toMatch(/invalid username or password/i);
+    expect(alert.textContent).toMatch(/The username or the password is wrong\./);
+  });
+
+  it('shows the server hint, with the lock warning, on a refused sign-in', async () => {
+    fetchMock.mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/demo-status')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ demo: false }) } as Response);
+      }
+      if (url.endsWith('/login')) {
+        const hint =
+          'The username or the password is wrong. 2 more failed sign-ins lock this username for 5 minutes.';
+        return Promise.resolve({
+          ok: false,
+          status: 401,
+          json: () => Promise.resolve({ detail: { reason: 'invalid_credentials', hint } }),
+        } as Response);
+      }
+      return Promise.reject(new TypeError('offline'));
+    });
+    renderLogin();
+    fireEvent.change(screen.getByLabelText('Username'), { target: { value: 'ana' } });
+    fireEvent.change(screen.getByLabelText('Password'), { target: { value: 'wrong' } });
+    fireEvent.click(screen.getByRole('button', { name: /sign in/i }));
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('2 more failed sign-ins lock this username for 5 minutes.');
+  });
+
+  it('asks for the missing field in plain words and sends nothing', async () => {
+    // An empty submit showed "username is empty. Send a value. soc-ai got ''."
+    // (dogfood 2026-10-19, H1-D16).
+    mockDemoStatus(false);
+    renderLogin();
+    fireEvent.click(screen.getByRole('button', { name: /sign in/i }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Enter a username.');
+    fireEvent.change(screen.getByLabelText('Username'), { target: { value: 'ana' } });
+    fireEvent.click(screen.getByRole('button', { name: /sign in/i }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Enter your password.');
+    expect(fetchMock.mock.calls.some(([u]) => String(u).endsWith('/login'))).toBe(false);
+  });
+});
+
+// The form claimed "TLS 1.3 · self-hosted" with a green dot over plain HTTP,
+// and offered a full form on a server with sign-in off (dogfood 2026-10-19,
+// H1-D3, R1-D20).
+describe('Login transport and sign-in state', () => {
+  function mockAuthStatus(authRequired: boolean | 'offline') {
+    fetchMock.mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/demo-status')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ demo: false }) } as Response);
+      }
+      if (url.endsWith('/auth-status') && authRequired !== 'offline') {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ auth_required: authRequired }),
+        } as Response);
+      }
+      return Promise.reject(new TypeError('offline'));
+    });
+  }
+
+  it('names plain HTTP as unencrypted and claims no TLS version', async () => {
+    mockAuthStatus(true);
+    renderLogin();
+    // jsdom serves the page over http://localhost.
+    expect(await screen.findByTestId('login-transport')).toHaveTextContent(
+      'HTTP. The connection is not encrypted.',
+    );
+    expect(screen.queryByText(/TLS 1\.3/)).toBeNull();
+  });
+
+  it('says sign-in is off, offers the console, and hides the form until asked', async () => {
+    mockAuthStatus(false);
+    renderLogin();
+    expect(await screen.findByText('Sign-in is off')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Password')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Open the console' }));
+    expect(navigateMock).toHaveBeenCalledWith('/dashboard', { replace: true });
+    fireEvent.click(screen.getByRole('button', { name: 'Sign in with an account' }));
+    expect(screen.getByLabelText('Password')).toBeInTheDocument();
+  });
+
+  it('shows the form when the sign-in state cannot be read', async () => {
+    mockAuthStatus('offline');
+    renderLogin();
+    expect(await screen.findByLabelText('Password')).toBeInTheDocument();
+    expect(screen.queryByText('Sign-in is off')).toBeNull();
   });
 });

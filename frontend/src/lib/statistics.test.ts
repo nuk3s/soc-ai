@@ -60,7 +60,7 @@ describe('statisticSentence', () => {
 
   it('states the statistics the learned detectors write', () => {
     expect(statisticSentence('plane_documents', 0, 412)).toBe(
-      '0 documents on the silent plane in the silent hours. The baseline expects 412 in those hours.',
+      '0 documents from the log source in the hours it stopped. The baseline expects 412 in those hours.',
     );
     expect(statisticSentence('chain_minutes', 3.5, 2)).toBe(
       'The attempt came 3.5 minutes after the session. The host held 2 learned outbound edges.',

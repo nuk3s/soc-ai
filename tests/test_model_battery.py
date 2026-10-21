@@ -272,6 +272,83 @@ def _client(settings):
     )
 
 
+def _gateway_answers():
+    """The preflight sees a live gateway, so a battery test runs its fake battery."""
+    from unittest.mock import AsyncMock, patch
+
+    return patch(
+        "soc_ai.api.webui.routes_config.probes.gateway_unreachable",
+        AsyncMock(return_value=None),
+    )
+
+
+def test_battery_start_refuses_a_dead_gateway_with_the_reason(tmp_path):
+    """The battery ran 4 configs x 2 calls against a known-dead gateway for
+    50 s and showed "tool 0/2" with no reason (dogfood 2026-10-19, H1-D7)."""
+    from unittest.mock import AsyncMock, patch
+
+    settings = _settings(db_path=str(tmp_path / "dead.db"))
+    p1, p2, p3, TestClient, create_app = _client(settings)
+    run = AsyncMock()
+    reason = "The model gateway at gw.example.test:4000 does not answer: Connection refused."
+    with (
+        p1,
+        p2,
+        p3,
+        patch("soc_ai.model_probe.run_battery", run),
+        patch(
+            "soc_ai.api.webui.routes_config.probes.gateway_unreachable",
+            AsyncMock(return_value=reason),
+        ),
+    ):
+        app = create_app()
+        with TestClient(app) as client:
+            r = client.post("/api/v1/config/model-battery", json={"model": "probe-me"})
+            assert r.status_code == 503, r.text
+            assert r.json()["detail"]["reason"] == "gateway_unreachable"
+            assert r.json()["detail"]["hint"] == reason
+            assert (
+                client.get("/api/v1/config/model-battery?model=probe-me").json()["running"] is False
+            )
+    run.assert_not_called()
+
+
+async def test_gateway_unreachable_names_a_refused_connection_and_passes_an_http_error():
+    """Only a transport failure blocks the battery. A gateway that answers at
+    all, even with an HTTP error, is up: the battery itself grades the rest."""
+    import httpx
+    from soc_ai.webui import probes
+
+    settings = _settings()
+
+    class _Refused:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, *a, **kw):
+            raise httpx.ConnectError("Connection refused")
+
+    class _Answers(_Refused):
+        async def get(self, *a, **kw):
+            return httpx.Response(401, request=httpx.Request("GET", "http://gw.example.test"))
+
+    from unittest.mock import patch
+
+    with patch.object(probes.httpx, "AsyncClient", _Refused):
+        reason = await probes.gateway_unreachable(settings)
+    assert reason is not None
+    assert reason.startswith("The model gateway at ")
+    assert reason.endswith("does not answer. Nothing answers on that port.")
+    with patch.object(probes.httpx, "AsyncClient", _Answers):
+        assert await probes.gateway_unreachable(settings) is None
+
+
 def _fake_battery_result(model="probe-me", rec=None):
     return {
         "model": model,
@@ -296,7 +373,13 @@ def test_battery_api_start_poll_persist(tmp_path):
             on_progress("tool", 1, 4)
         return _fake_battery_result(model or s.analyst_model)
 
-    with p1, p2, p3, patch("soc_ai.model_probe.run_battery", fake_run_battery):
+    with (
+        p1,
+        p2,
+        p3,
+        patch("soc_ai.model_probe.run_battery", fake_run_battery),
+        _gateway_answers(),
+    ):
         app = create_app()
         with TestClient(app) as client:
             r = client.post("/api/v1/config/model-battery", json={"model": "probe-me"})
@@ -324,7 +407,7 @@ def test_battery_api_rejects_concurrent_runs(tmp_path):
         await release.wait()  # hold the battery "running"
         return _fake_battery_result(model)
 
-    with p1, p2, p3, patch("soc_ai.model_probe.run_battery", slow_battery):
+    with p1, p2, p3, patch("soc_ai.model_probe.run_battery", slow_battery), _gateway_answers():
         app = create_app()
         with TestClient(app) as client:
             assert (

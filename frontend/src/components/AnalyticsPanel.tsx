@@ -1,5 +1,5 @@
 import { Plus, Radar } from 'lucide-react';
-import { useState } from 'react';
+import { useState, type KeyboardEvent } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 
 import {
@@ -14,11 +14,13 @@ import {
 import {
   type RunState,
   appliesWord,
+  failureLine,
   intervalWords,
+  loopResultLine,
   methodWord,
-  runState,
   runsInProfileSweep,
   sourceWord,
+  specRunState,
   sweepsNotice,
   windowWords,
 } from '../lib/analyticRuns';
@@ -145,13 +147,13 @@ function valuesOf(rows: AnalyticRow[], key: 'tier' | 'evaluator' | 'scope_kind')
 // recorded, not raised" named neither, so an analyst could not tell whether
 // the sweep or an analyst does the recording.
 const LEGEND =
-  'live: the sweep runs it and raises what it finds. ' +
-  'shadow: the sweep runs it and records what it finds. ' +
-  'paused by soc-ai: soc-ai moved a live analytic to shadow. It fired too often or was often ' +
-  'wrong. You decide. ' +
-  'draft: the sweep has never run it. ' +
+  'live: the sweep runs the analytic and raises what it finds. ' +
+  'shadow: the sweep runs the analytic and records what it finds. ' +
+  'Paused by soc-ai: soc-ai moved a live analytic to shadow. The analytic fired too often or ' +
+  'was often wrong. Approve it or reject it. ' +
+  'draft: the sweep has never run the analytic. ' +
   'retired: the analytic keeps its ledger and its reason. ' +
-  'Rejected = retired with a reason.';
+  'Rejected: the analytic is retired, and the reason is on record.';
 
 const TIER_TITLE =
   'Where the analytic is stored. A shipped analytic is a file in the repository. A local analytic is a row in this deployment.';
@@ -168,7 +170,7 @@ export function baselineNote(coverage: PriorCoverage): string {
     0,
     Math.floor((Date.now() - Date.parse(coverage.profiles_built_at)) / 3_600_000),
   );
-  return ` · baseline ${hours} h old${coverage.profiles_stale ? ', stale' : ''}`;
+  return ` · profiles built ${hours} h ago${coverage.profiles_stale ? ', stale' : ''}`;
 }
 
 /** " · capped at 500" when the run's evaluations reached the recent read's
@@ -224,7 +226,7 @@ function SweepsNotice({ catalog }: { catalog: HuntCatalog | null | undefined }) 
       )}
       {catalog && !catalog.sweeps_enabled && !demo && (
         <Link to="/config#triage-automation" className="font-semibold text-accent hover:underline">
-          Turn on Analytic sweeps in Config, under Triage automation.
+          Turn on Analytic sweeps in Settings, under Triage automation.
         </Link>
       )}
     </div>
@@ -237,11 +239,63 @@ function SweepsNotice({ catalog }: { catalog: HuntCatalog | null | undefined }) 
 function sweepLine(catalog: HuntCatalog | null | undefined): string {
   if (!catalog) return '';
   const when = catalog.last_sweep_at ? ago(catalog.last_sweep_at) : 'never';
-  return `last sweep ${when} · looks back ${windowWords(catalog.sweep_window_minutes)}`;
+  const failed = catalog.sweep_health?.last_outcome === 'failed' ? 'failed ' : '';
+  return `last sweep ${failed}${when} · looks back ${windowWords(catalog.sweep_window_minutes)}`;
 }
 
-function NewAnalyticBox({ onCreated }: { onCreated: () => void }) {
-  const [open, setOpen] = useState(false);
+/** The result line of each loop that ran: the newest run and the failed runs
+ *  of the day. The tab read "last sweep 13m ago" over 25 failed sweeps. */
+function SweepResults({ catalog }: { catalog: HuntCatalog | null | undefined }) {
+  if (!catalog) return null;
+  const lines = [
+    { id: 'match', noun: 'Analytic sweep', health: catalog.sweep_health },
+    { id: 'profile', noun: 'Profile sweep', health: catalog.prior_sweep_health },
+  ]
+    .map((l) => ({ ...l, text: loopResultLine(l.health) }))
+    .filter((l) => l.text && l.health && (l.health.last_outcome !== 'ok' || l.health.failed_24h > 0));
+  if (!lines.length) return null;
+  return (
+    <div
+      data-testid="analytics-sweep-results"
+      role="status"
+      className="border-b border-border-faint px-[15px] py-1.5 text-[12px] text-warn"
+    >
+      {lines.map((l) => (
+        <div key={l.id} data-testid={`analytics-sweep-result-${l.id}`}>
+          {l.noun}: {l.text}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** The control that opens the New analytic box. It sits in the panel header,
+ *  and the box opens as a full-width row under the header. The box opened in
+ *  the right slot of the header as a 200 px textarea, which is too narrow
+ *  for a YAML analytic (dogfood 2026-10-19, V1-H9). */
+function NewAnalyticButton({ open, onToggle }: { open: boolean; onToggle: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      aria-expanded={open}
+      aria-controls="new-analytic-box"
+      className="flex items-center gap-1 rounded-control border border-border-strong px-2.5 py-1 text-[11.5px] font-semibold hover:bg-surface-2"
+    >
+      <Plus size={12} /> New analytic
+    </button>
+  );
+}
+
+function NewAnalyticBox({
+  open,
+  setOpen,
+  onCreated,
+}: {
+  open: boolean;
+  setOpen: (open: boolean) => void;
+  onCreated: () => void;
+}) {
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
   const [hint, setHint] = useState<string | null>(null);
@@ -261,25 +315,30 @@ function NewAnalyticBox({ onCreated }: { onCreated: () => void }) {
     }
   };
 
-  if (!open) {
-    return (
-      <button
-        type="button"
-        onClick={() => setOpen(true)}
-        className="flex items-center gap-1 rounded-control border border-border-strong px-2.5 py-1 text-[11.5px] font-semibold hover:bg-surface-2"
-      >
-        <Plus size={12} /> New analytic
-      </button>
-    );
-  }
+  // Escape closes the box, as it closes every other form on the page. The
+  // text stays, so a second open shows the draft again.
+  const onKeyDown = (e: KeyboardEvent) => {
+    if (e.key !== 'Escape') return;
+    e.stopPropagation();
+    setOpen(false);
+  };
+
+  if (!open) return null;
   return (
-    <div className="flex w-full flex-col gap-1.5">
+    <div
+      id="new-analytic-box"
+      className="flex w-full flex-col gap-1.5 border-b border-border px-[15px] py-2.5"
+      onKeyDown={onKeyDown}
+      data-testid="new-analytic-box"
+    >
       <textarea
+        autoFocus
         value={text}
         onChange={(e) => setText(e.target.value)}
-        rows={8}
+        rows={14}
+        aria-label="The analytic as YAML"
         placeholder="Paste the analytic as YAML. It is stored as a draft. Put it in shadow to run it."
-        className="w-full rounded-control border border-border bg-surface-2 p-2 font-mono text-[11.5px]"
+        className="w-full resize-y rounded-control border border-border bg-surface-2 p-2 font-mono text-[11.5px] leading-[1.5]"
       />
       {hint && <div className="text-[11.5px] text-warn">{hint}</div>}
       <div className="flex items-center gap-2">
@@ -305,10 +364,13 @@ function Row({
   blind,
   running,
   every,
+  failure,
   onOpen,
   onChanged,
 }: {
   analytic: AnalyticRow;
+  /** The failed newest run in one sentence, or null. */
+  failure?: string | null;
   coverage: PriorCoverage | null | undefined;
   /** False when the loop that runs this analytic is off, 'waiting' when it is
    *  on and has not run yet. */
@@ -377,6 +439,14 @@ function Row({
             Paused by soc-ai
           </div>
         )}
+        {failure && (
+          <div
+            data-testid={`analytic-failed-${analytic.id}`}
+            className="mt-1 max-w-[260px] whitespace-normal text-[11px] text-danger"
+          >
+            {failure}
+          </div>
+        )}
       </td>
       <td className="px-2 py-2.5 font-mono text-[11px] text-dim" title={WEEK_TITLE}>
         {plural(analytic.observations_7d, 'observation')} · {plural(analytic.leads_7d, 'lead')} ·{' '}
@@ -384,7 +454,7 @@ function Row({
         {analytic.dismissed_7d} dismissed
         {analytic.status === 'shadow' && (
           <div>
-            {analytic.shadow_hits_7d} shadow hits · {analytic.unread_shadow_hits} unread
+            {plural(analytic.shadow_hits_7d, 'shadow hit')} · {analytic.unread_shadow_hits} unread
           </div>
         )}
       </td>
@@ -402,7 +472,7 @@ function Row({
         {blind && (
           <div
             data-testid={`analytic-blind-${analytic.id}`}
-            title="The newest sweep matched nothing this analytic reads. Its zero is the absence of telemetry."
+            title="The newest sweep matched nothing that this analytic reads. The zero means that the telemetry is absent."
           >
             blind on the last sweep
           </div>
@@ -431,6 +501,8 @@ export function AnalyticsPanel({
   onChanged?: () => void;
 } = {}) {
   const [reload, setReload] = useState(0);
+  // The New analytic box: its button sits in the header, the box under it.
+  const [newOpen, setNewOpen] = useState(false);
   const [searchParams, setSearchParams] = useSearchParams();
   // The open drawer lives in the address, the way the same drawer does when a
   // lead page links to it. A title click held it in component state alone, so
@@ -466,6 +538,16 @@ export function AnalyticsPanel({
   const coverageOf = new Map(
     (catalog.data?.specs ?? []).map((s) => [s.id, s.coverage] as const),
   );
+  const specOf = new Map((catalog.data?.specs ?? []).map((s) => [s.id, s] as const));
+  // When the loop last tried to run an analytic. A failed profile sweep wrote
+  // no trail row, so the loop's own record dates it.
+  const triedAt = (id: string): string | null => {
+    const spec = specOf.get(id);
+    if (!spec) return null;
+    return runsInProfileSweep(spec.evaluator)
+      ? (catalog.data?.prior_sweep_health?.last_run_at ?? spec.last_swept_at)
+      : spec.last_swept_at;
+  };
   const blindOf = new Map((catalog.data?.specs ?? []).map((s) => [s.id, s.blind] as const));
   const sweep = sweepLine(catalog.data);
   const all = data?.analytics ?? [];
@@ -487,11 +569,12 @@ export function AnalyticsPanel({
           title="Analytics"
           right={
             <span className="flex items-center gap-2.5">
-              <NewAnalyticBox onCreated={changed} />
+              <NewAnalyticButton open={newOpen} onToggle={() => setNewOpen((v) => !v)} />
               <Freshness at={list.lastUpdated} />
             </span>
           }
         />
+        <NewAnalyticBox open={newOpen} setOpen={setNewOpen} onCreated={changed} />
         {/* What an analytic is, before the analytics. */}
         <Definition of="analytic" className="border-b border-border px-[15px] py-2.5" />
         {!data ? (
@@ -609,6 +692,7 @@ export function AnalyticsPanel({
                 {sweep}
               </div>
             )}
+            <SweepResults catalog={catalog.data} />
             <SweepsNotice catalog={catalog.data} />
             <div
               data-testid="analytics-legend"
@@ -654,7 +738,12 @@ export function AnalyticsPanel({
                       analytic={analytic}
                       coverage={coverageOf.get(analytic.id)}
                       blind={blindOf.get(analytic.id) === true}
-                      running={runState(catalog.data, analytic.evaluator)}
+                      running={specRunState(
+                        catalog.data,
+                        specOf.get(analytic.id),
+                        analytic.evaluator,
+                      )}
+                      failure={failureLine(specOf.get(analytic.id), triedAt(analytic.id))}
                       every={intervalWords(
                         runsInProfileSweep(analytic.evaluator)
                           ? 60

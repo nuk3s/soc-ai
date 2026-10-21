@@ -1294,3 +1294,89 @@ async def test_the_synth_path_returns_the_row_it_wrote(session, settings_kratos)
     (hunt,) = await _hunts(session)
     assert hunt_id == hunt.id
     assert hunt.is_synth_eval is True
+
+
+# ── A failed analytic leaves a row in every day of the hunt list ───────────
+#
+# Dogfood 2026-10-19 R3-D10: the grid was down for four days. The gap opened
+# on the first failed sweep, and the gate held the 25 failed sweeps of each
+# day after it. The 3 day hunt list read "No hunts in the last 3 days.", the
+# words of a quiet grid.
+
+
+async def _errored_sweep(session, settings, at, error="precondition: ConnectionError(x)"):  # type: ignore[no-untyped-def]
+    from soc_ai.hunting.execute import SpecRun
+
+    with patch("soc_ai.hunting.sweep.run_spec", new=AsyncMock()) as runner:
+        runner.return_value = SpecRun(DCSYNC.id, "a", "b", False, 0, 0, error=error)
+        return await sweep_catalog(
+            {DCSYNC.id: DCSYNC},
+            session=session,
+            elastic=_elastic(settings, []),
+            settings=settings,
+            since="a",
+            until="b",
+            now=at,
+        )
+
+
+def _real_now() -> datetime:
+    return datetime.now(UTC).replace(tzinfo=None, microsecond=0)
+
+
+async def test_a_failure_that_lasts_a_day_reports_again(session, settings_kratos) -> None:
+    now = _real_now()
+    first = await _errored_sweep(session, settings_kratos, now - timedelta(hours=50))
+    assert DCSYNC.id in first.hunts
+    hourly = [
+        await _errored_sweep(session, settings_kratos, now - timedelta(hours=h))
+        for h in (49, 40, 27)
+    ]
+    assert all(DCSYNC.id not in r.hunts for r in hourly), "a failure inside the day is held"
+    day_two = await _errored_sweep(session, settings_kratos, now - timedelta(hours=26))
+    assert DCSYNC.id in day_two.hunts, "a day of failed sweeps left no row in the hunt list"
+    again = await _errored_sweep(session, settings_kratos, now - timedelta(hours=25))
+    assert DCSYNC.id not in again.hunts
+    assert len(await _hunts(session)) == 2
+    (hunt,) = [h for h in await _hunts(session) if h.id == day_two.hunts[DCSYNC.id]]
+    (finding,) = hunt.report["findings"]
+    assert finding["title"].endswith(": could not run")
+
+
+async def test_a_blind_gap_that_turns_into_a_failure_reports_the_failure(
+    session, settings_kratos
+) -> None:
+    """Blind means the analytic ran and saw nothing. Failed means it did not run."""
+    now = _real_now()
+    blind = await sweep_catalog(
+        {DCSYNC.id: DCSYNC},
+        session=session,
+        elastic=_elastic(settings_kratos, [EsSearchResult(total=0, took_ms=1)]),
+        settings=settings_kratos,
+        since="a",
+        until="b",
+        now=now - timedelta(hours=3),
+    )
+    assert blind.blind_reported == 1
+    failed = await _errored_sweep(session, settings_kratos, now - timedelta(hours=2))
+    assert DCSYNC.id in failed.hunts, "the change from blind to failed wrote no row"
+    held = await _errored_sweep(session, settings_kratos, now - timedelta(hours=1))
+    assert DCSYNC.id not in held.hunts
+
+
+async def test_a_blind_gap_does_not_report_every_day(session, settings_kratos) -> None:
+    """Control: a deployment with no decoy is blind on that analytic forever.
+    A row for it each day is the flood the gap gate exists to prevent."""
+    now = _real_now()
+    blind_es = [EsSearchResult(total=0, took_ms=1)]
+    for hours in (60, 30, 2):
+        await sweep_catalog(
+            {DCSYNC.id: DCSYNC},
+            session=session,
+            elastic=_elastic(settings_kratos, list(blind_es)),
+            settings=settings_kratos,
+            since="a",
+            until="b",
+            now=now - timedelta(hours=hours),
+        )
+    assert len(await _hunts(session)) == 1

@@ -37,7 +37,7 @@ export function ConfigNav({ groups, activeId, onNavigate }: ConfigNavProps) {
   return (
     <nav className="sticky top-5 flex max-h-[calc(100vh-40px)] flex-col gap-0.5 overflow-y-auto pr-1">
       <div className="px-2 pb-1.5 text-[10.5px] font-semibold uppercase tracking-[.07em] text-faint">
-        Config
+        Sections
       </div>
       {groups.map((g) => {
         const parentActive = g.children.some((c) => c.id === activeId);

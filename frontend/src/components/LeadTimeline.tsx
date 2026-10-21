@@ -2,21 +2,29 @@ import { useState } from 'react';
 import { Link } from 'react-router-dom';
 
 import { DocumentChip } from './DocumentDrawer';
-import { HUNT_CLOSED_ACTOR, HUNT_CLOSED_OUTCOME, REASON_LABEL, closedByHunt } from './LeadsStrip';
+import {
+  HUNT_CLOSED_ACTOR,
+  HUNT_CLOSED_OUTCOME,
+  REASON_LABEL,
+  benignLine,
+  closedByHunt,
+} from './LeadsStrip';
 import { Panel, PanelHeader } from './Panel';
 import type { LeadDetail, LeadObservationDetail, LeadPromotedFinding } from '../lib/api';
 import { kindLabel, sourceLabel, sourceTitle } from '../lib/kinds';
 import {
   eventWindowText,
+  findingsCovered,
   observationSortTime,
   promotedFindingSentence,
   utcStamp,
   withStop,
 } from '../lib/leadWords';
 import {
-  DECISION_WORD,
+  FINDING_VERDICT_REASON,
   HOLD_SENTENCE,
   actorOf,
+  decisionWord,
   decisionsOf,
   type LeadDecision,
   type LeadDecisionFields,
@@ -32,6 +40,7 @@ import {
 import { ago } from '../lib/timeRange';
 import {
   CHIP_DISMISSED_EVENT,
+  CLOSE_RULE,
   CHIP_SWEEPS,
   CHIP_TYPE,
   COUNT_OBSERVATIONS,
@@ -129,7 +138,9 @@ export function decisionSentence(d: LeadDecision): string {
       // control, so it reads "opened an investigation" (owner, 2026-10-07).
       // S2: the analyst closed the lead on the verdict of a finding's
       // investigation.
-      if (d.reason === 'finding_verdict')
+      if (d.reason === FINDING_VERDICT_REASON && by === HUNT_CLOSED_ACTOR)
+        return `${HUNT_CLOSED_ACTOR} closed the lead. ${CLOSE_RULE}`;
+      if (d.reason === FINDING_VERDICT_REASON)
         return `${by || 'An analyst'} closed the lead on the investigation of a hunt finding.`;
       return `${by || 'An analyst'} opened an investigation on this lead.`;
     case 'kept_open':
@@ -169,7 +180,7 @@ function DecisionRow({ d }: { d: LeadDecision }) {
       <div className="flex flex-wrap items-center gap-2">
         <When at={d.at} />
         <span className={CHIP_CLASS} title={CHIP_DISMISSED_EVENT}>
-          {DECISION_WORD[d.action] ?? d.action}
+          {decisionWord(d)}
         </span>
       </div>
       <div className="mt-0.5 font-medium">
@@ -373,6 +384,13 @@ function ObservationRow({
       <div className="mt-0.5 text-[11.5px] text-dim" data-testid={`observation-window-${o.id}`}>
         {eventWindowText(o)}
       </div>
+      {/* A benign observation counts toward no lead, and its weight reads 0.
+          The row says why, or the 0 reads as a fault. */}
+      {o.dismissed_at && (
+        <div className="mt-0.5 text-[11.5px] text-dim" data-testid={`observation-benign-${o.id}`}>
+          {benignLine(o)}
+        </div>
+      )}
       <div className="mt-0.5 flex flex-wrap items-center gap-1 text-[11.5px] text-dim">
         {/* The id opens the analytic. It was plain text, so a lead named its
             analytic and gave no way to read it.
@@ -498,7 +516,9 @@ export function timelineEntries(lead: LeadDetail & LeadDecisionFields): Entry[] 
  *  said "4 observations" over seven rows. */
 function headerCount(lead: LeadDetail & LeadDecisionFields): string {
   const decisions = decisionsOf(lead)?.length ?? (lead.dismissed_at ? 1 : 0);
-  const findings = lead.promoted_findings?.length ?? 0;
+  // A finding that shares the investigation of another finding is an
+  // investigated finding too. The stepper counts it (R3-D4).
+  const findings = (lead.promoted_findings ?? []).reduce((n, p) => n + findingsCovered(p), 0);
   const parts = [plural(lead.observations.length, 'observation')];
   if (decisions > 0) parts.push(plural(decisions, 'decision'));
   if (findings > 0) parts.push(plural(findings, 'investigated finding'));

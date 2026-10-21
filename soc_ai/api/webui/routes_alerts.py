@@ -30,12 +30,17 @@ from soc_ai.api.webui._shared import (
 from soc_ai.config import DEFAULT_ALERT_LABELS, DEFAULT_ALERTS_QUERY, Settings
 from soc_ai.errors import OqlValidationError
 from soc_ai.so_client.elastic import ElasticClient, GridPartialResultsError
+from soc_ai.so_client.fields import detection_kind
 from soc_ai.store import assignments as assign_svc
 from soc_ai.store import detection_overrides as override_svc
+from soc_ai.store import escalations as esc_svc
+from soc_ai.store import grid_gaps as gaps_svc
 from soc_ai.store import investigations as inv_svc
 from soc_ai.store.models import Investigation
 from soc_ai.triage_models import is_pipeline_fallback
+from soc_ai.webui import alert_siblings as sib
 from soc_ai.webui import alerts_query as aq
+from soc_ai.webui.case_links import case_ids_for_alerts, case_url
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -102,8 +107,8 @@ def _partial_read_hint(exc: GridPartialResultsError) -> str:
     cause = _es_failure_type(exc.reason)
     detail = f" The first shard failure is {cause}." if cause else ""
     return (
-        f"The Security Onion grid answered, but the search {' and '.join(parts)}.{detail} "
-        "These results are incomplete. A short or missing answer here means unknown. "
+        f"The Security Onion grid answered. The search {' and '.join(parts)}.{detail} "
+        "The results are incomplete. A short or empty answer here means unknown. "
         "The same search returns the same partial read until the Elasticsearch shards "
         "recover. Check the shard allocation of the cluster."
     )
@@ -265,6 +270,35 @@ class LastAttemptOut(BaseModel):
     ago: str
 
 
+class AlertSiblingOut(BaseModel):
+    """Another group of the window that shares a flow with a row (R2-I9).
+
+    ``signals`` holds ``flow`` when an alert of each group carries the same
+    ``network.community_id`` within one hour of the other, and ``hosts`` when
+    an alert of each group runs between the same two hosts within five
+    minutes of the other. The rule is in :mod:`soc_ai.webui.alert_siblings`.
+    """
+
+    name: str
+    kind: str
+    # The verdict the row of the sibling shows: the worst verdict of its runs
+    # in the page window, else its standing verdict, else "untriaged". None
+    # for a pipeline error, which reached no verdict.
+    verdict: str | None = None
+    conf: float | None = None
+    # The run behind that verdict. None for an untriaged sibling.
+    invId: str | None = None
+    signals: list[str] = []
+
+
+class CaseLinkOut(BaseModel):
+    """One Security Onion case, and where its console shows it."""
+
+    id: str
+    # None when the settings name no Security Onion host.
+    url: str | None = None
+
+
 class AlertGroupOut(BaseModel):
     id: str
     name: str
@@ -345,6 +379,37 @@ class AlertGroupOut(BaseModel):
     worstVerdict: str | None = None
     worstConf: float | None = None
     worstInvId: str | None = None
+    # The verdict an analyst set on the alert behind the badge, on any run of
+    # it, and that run. A newer model run hid it: the row read "False
+    # positive 0.80" while the analyst true positive stood (dogfood
+    # 2026-10-19, V1-A3). None when no person set a verdict on that alert.
+    analystVerdict: str | None = None
+    analystBy: str | None = None
+    analystInvId: str | None = None
+    # The other groups of the window that share a flow with this one, worst
+    # verdict first, at most _SIBLINGS_SHOWN of them, and how many there are.
+    # Sent when the request asks for links. None means no sibling data: the
+    # request asked for none, or the grid did not answer. An empty list means
+    # the read found none (dogfood 2026-10-19, R2-I9, R2-D9).
+    siblings: list[AlertSiblingOut] | None = None
+    siblingCount: int | None = None
+    # True when a cap of the sibling read cut data that can hold a sibling of
+    # this group, so the list and the count can miss one (V3-N1). None when
+    # there is no sibling data.
+    siblingsPartial: bool | None = None
+    # The Security Onion cases the escalated alerts of the group are on, one
+    # entry per case. soc-ai's escalation ledger answers first, and Security
+    # Onion's case links answer for a case opened in its own console. Sent
+    # when the request asks for links (R2-I2).
+    cases: list[CaseLinkOut] = []
+    # True when ``cases`` covers every escalated alert of the group. The row
+    # reads the ids of the newest escalated alerts only, and an alert can be
+    # on a case nobody can name. False means the list is partial.
+    casesComplete: bool = False
+
+
+# The siblings one row lists. The count names the rest.
+_SIBLINGS_SHOWN = 20
 
 
 # Terminal statuses that mean a run FAILED without landing a verdict — the
@@ -593,6 +658,188 @@ def _worse_than(
     return worst, worst_run.confidence, worst_run.id
 
 
+async def _standing_verdicts(db: Any, rule_names: list[str]) -> dict[str, Investigation]:
+    """The standing run per rule, moved forward to its alert's standing run.
+
+    The rule's newest complete run names an alert. A newer complete run of
+    that same alert can carry another rule name, a lead promotion for one, and
+    then the row opened a run its own page called superseded (dogfood
+    2026-10-19, R2-D3). The row now names the run the alert stands on.
+    """
+    verdicts = await inv_svc.latest_complete_for_rules(db, rule_names)
+    alert_of = {rule: inv_svc.alert_group_id(inv) for rule, inv in verdicts.items()}
+    standing = await inv_svc.standing_for_alerts(db, [a for a in alert_of.values() if a])
+    for rule, inv in list(verdicts.items()):
+        newer = standing.get(alert_of.get(rule) or "")
+        if newer is None or newer.id == inv.id:
+            continue
+        if (newer.created_at, newer.id) > (inv.created_at, inv.id):
+            verdicts[rule] = newer
+    return verdicts
+
+
+def _sibling_cache(request: Request) -> sib.SiblingCache:
+    """The app's page reads of the last minute, made on first use."""
+    cache = getattr(request.app.state, "sibling_cache", None)
+    if not isinstance(cache, sib.SiblingCache):
+        cache = sib.SiblingCache()
+        request.app.state.sibling_cache = cache
+    return cache
+
+
+async def _read_siblings(
+    request: Request,
+    elastic: ElasticClient,
+    settings: Settings,
+    range_: str,
+    from_: str | None,
+    to: str | None,
+) -> sib.SiblingIndex | None:
+    """The same-flow links of the window, or None when the grid did not answer.
+
+    The page polls every 10 s, and each poll of each tab ran the read again.
+    A read stays for a minute per window, so a poll reuses it, and the tabs
+    that ask while a read runs wait for that read. Bounded by the grid
+    timeout. A failure is never the page's failure: the rows then carry no
+    sibling data, and the page answers as before.
+    """
+
+    async def load() -> sib.SiblingIndex | None:
+        try:
+            return await sib.fetch_sibling_index(
+                elastic,
+                settings,
+                time_range=range_,
+                abs_from=from_,
+                abs_to=to,
+                time_zone=settings.so_timezone,
+                timeout_s=settings.webui_grid_timeout_s,
+            )
+        except Exception as exc:
+            _LOGGER.info(
+                "alerts: the same-flow read failed (%s). No sibling data.", type(exc).__name__
+            )
+            return None
+
+    try:
+        key = sib.window_key(
+            settings, time_range=range_, abs_from=from_, abs_to=to, time_zone=settings.so_timezone
+        )
+    except Exception as exc:
+        _LOGGER.info("alerts: the same-flow read failed (%s). No sibling data.", type(exc).__name__)
+        return None
+    return await _sibling_cache(request).read(key, load)
+
+
+def _sibling_verdict(
+    rule: str, verdicts: dict[str, Investigation], window_runs: dict[str, Investigation]
+) -> tuple[str | None, float | None, str | None]:
+    """(verdict, confidence, run id) that the row of ``rule`` shows.
+
+    The order of the console's group outcome: the worst run in the page
+    window, else the standing verdict, else untriaged. A pipeline fallback
+    with no window run has no verdict.
+    """
+    window_run = window_runs.get(rule)
+    if window_run is not None:
+        return _verdict(window_run.verdict), window_run.confidence, window_run.id
+    standing = verdicts.get(rule)
+    if standing is None:
+        return "untriaged", None, None
+    if is_pipeline_fallback(getattr(standing, "report", None)):
+        return None, None, standing.id
+    return _verdict(standing.verdict), standing.confidence, standing.id
+
+
+def _siblings_of(
+    ref: sib.GroupRef,
+    index: sib.SiblingIndex,
+    *,
+    kinds: dict[sib.GroupRef, str],
+    hidden: set[str],
+    verdicts: dict[str, Investigation],
+    window_runs: dict[str, Investigation],
+) -> tuple[list[AlertSiblingOut], int]:
+    """The siblings of one group, worst verdict first, and how many there are.
+
+    ``hidden`` holds the muted rule names the feed leaves out. A row the feed
+    cannot show cannot be linked.
+    """
+    out: list[AlertSiblingOut] = []
+    for other, signals in index.links(ref).items():
+        if other.name in hidden:
+            continue
+        verdict, conf, inv_id = _sibling_verdict(other.name, verdicts, window_runs)
+        kind = kinds.get(other)
+        if kind is None:
+            kind = other.field if other.field != "rule" else detection_kind(index.dataset(other))
+        out.append(
+            AlertSiblingOut(
+                name=other.name,
+                kind=_kind(kind),
+                verdict=verdict,
+                conf=conf,
+                invId=inv_id,
+                signals=[s for s in (sib.FLOW, sib.HOSTS) if s in signals],
+            )
+        )
+    out.sort(
+        key=lambda s: (
+            -_VERDICT_RANK.get(s.verdict or "", 0),
+            sib.FLOW not in s.signals,
+            s.name,
+        )
+    )
+    return out[:_SIBLINGS_SHOWN], len(out)
+
+
+async def _case_links(
+    request: Request,
+    elastic: ElasticClient,
+    settings: Settings,
+    groups: list[aq.AlertGroup],
+) -> dict[str, tuple[list[CaseLinkOut], bool]]:
+    """Per group name: the cases its escalated alerts are on, and whether they
+    cover every escalated alert of the group. Best-effort.
+
+    The ledger answers first. It holds every case soc-ai opened, and it is a
+    store read. Security Onion's case links answer for the rest, in one read
+    for the page, and only when the ledger left an alert without a case.
+    """
+    ids = [i for g in groups for i in g.escalated_ids]
+    if not ids:
+        return {}
+    try:
+        async with request.app.state.db_sessionmaker() as db:
+            ledger = await esc_svc.cases_for_alerts(db, ids)
+    except Exception:
+        _LOGGER.warning("alerts: the escalation ledger could not be read", exc_info=True)
+        ledger = {}
+    known: dict[str, str] = {a: c for a, c in ledger.items() if c}
+    missing = [i for i in dict.fromkeys(ids) if i not in known]
+    if missing:
+        try:
+            async with asyncio.timeout(settings.webui_grid_timeout_s):
+                known.update(await case_ids_for_alerts(elastic, settings, missing))
+        except Exception as exc:
+            _LOGGER.info("alerts: the case links were not read (%s)", type(exc).__name__)
+    out: dict[str, tuple[list[CaseLinkOut], bool]] = {}
+    for g in groups:
+        cases = dict.fromkeys(known[i] for i in g.escalated_ids if i in known)
+        if not cases:
+            continue
+        complete = (
+            g.escalated_count is not None
+            and len(g.escalated_ids) >= g.escalated_count
+            and all(i in known for i in g.escalated_ids)
+        )
+        out[g.rule_name] = (
+            [CaseLinkOut(id=c, url=case_url(settings, c)) for c in cases],
+            complete,
+        )
+    return out
+
+
 @router.get("/alerts", response_model=AlertQueueOut)
 async def list_alerts(  # noqa: PLR0915 - one linear join of the grid rows and the store
     request: Request,
@@ -604,6 +851,7 @@ async def list_alerts(  # noqa: PLR0915 - one linear join of the grid rows and t
     to: str | None = None,
     hide_acked: bool = Query(False),
     include_muted: bool = Query(False),
+    links: bool = Query(False),
     settings: Settings = Depends(get_settings_dep),
     elastic: ElasticClient = Depends(get_elastic),
 ) -> AlertQueueOut:
@@ -611,8 +859,19 @@ async def list_alerts(  # noqa: PLR0915 - one linear join of the grid rows and t
 
     Rules an operator has muted (detection tuning) are EXCLUDED from the default
     feed; pass ``include_muted=true`` to show them (each flagged ``muted: true``).
+
+    ``links=true`` adds what links a row to other records: the groups that
+    share its flow, and the cases its escalated alerts are on. The sibling
+    read costs at most two more searches, run beside the page search, and
+    stays a minute per window. A case-link read runs when the ledger cannot
+    name a case. Only the Alerts page asks for it.
     """
     _check_filters(range_=range_, from_=from_, to=to, severity=severity, sort=sort)
+    sibling_job = (
+        asyncio.ensure_future(_read_siblings(request, elastic, settings, range_, from_, to))
+        if links
+        else None
+    )
     try:
         async with asyncio.timeout(settings.webui_grid_timeout_s):
             page = await aq.fetch_groups(
@@ -626,18 +885,32 @@ async def list_alerts(  # noqa: PLR0915 - one linear join of the grid rows and t
                 abs_to=to,
                 time_zone=settings.so_timezone,
                 hide_acked=hide_acked,
+                escalated_ids=links,
             )
-    except OqlValidationError as exc:
-        raise oql_refusal(exc) from exc
-    except (TimeoutError, TransportError) as exc:
-        # Fail fast with a clean error instead of hanging the console while the
-        # ES client retries a slow/unreachable Security Onion grid.
-        raise HTTPException(status_code=503, detail=_grid_unavailable(exc)) from exc
-    except ApiError as exc:
-        # An ES ApiError (e.g. BadRequestError) is NOT a TransportError — map it
-        # here so a bad query is a 400, not an unhandled 500.
-        raise _es_api_error_http(exc) from exc
+    except BaseException as exc:
+        if sibling_job is not None:
+            sibling_job.cancel()
+        if isinstance(exc, OqlValidationError):
+            raise oql_refusal(exc) from exc
+        if isinstance(exc, TimeoutError | TransportError):
+            # Fail fast with a clean error instead of hanging the console while
+            # the ES client retries a slow/unreachable Security Onion grid.
+            raise HTTPException(status_code=503, detail=_grid_unavailable(exc)) from exc
+        if isinstance(exc, ApiError):
+            # An ES ApiError (e.g. BadRequestError) is NOT a TransportError. Map
+            # it here so a bad query is a 400, not an unhandled 500.
+            raise _es_api_error_http(exc) from exc
+        raise
     groups = page.groups
+    sibling_index = await sibling_job if sibling_job is not None else None
+    case_links = await _case_links(request, elastic, settings, groups) if links else {}
+    # The rows of the page by group identity, and the sibling names off the
+    # page. Their verdicts come from the same store reads as the rows.
+    page_kinds = {sib.group_ref(g.kind, g.rule_name): _kind(g.kind) for g in groups}
+    sibling_names: set[str] = set()
+    if sibling_index is not None:
+        for ref in page_kinds:
+            sibling_names.update(r.name for r in sibling_index.links(ref))
 
     # Verdict badge per rule = the rule's STANDING verdict (its latest COMPLETE,
     # verdict-bearing investigation). A later interrupted run (error/cancelled/
@@ -657,10 +930,15 @@ async def list_alerts(  # noqa: PLR0915 - one linear join of the grid rows and t
     latest_any: dict[str, Investigation] = {}
     running_rules: set[str] = set()
     muted_rules: set[str] = set()
+    analyst_by_alert: dict[str, inv_svc.AnalystVerdict] = {}
     if groups:
-        rule_names = [g.rule_name for g in groups]
+        page_names = [g.rule_name for g in groups]
+        rule_names = page_names + sorted(sibling_names - set(page_names))
         async with request.app.state.db_sessionmaker() as db:
-            verdicts = await inv_svc.latest_complete_for_rules(db, rule_names)
+            verdicts = await _standing_verdicts(db, rule_names)
+            analyst_by_alert = await inv_svc.analyst_verdicts_for_alerts(
+                db, [a for a in (inv_svc.alert_group_id(v) for v in verdicts.values()) if a]
+            )
             latest_any = await inv_svc.latest_for_rules(db, rule_names)
             assignments = await assign_svc.assignments_for_rules(db, rule_names)
             muted_rules = await override_svc.muted_rule_names(db)
@@ -711,6 +989,24 @@ async def list_alerts(  # noqa: PLR0915 - one linear join of the grid rows and t
             reason = f"Verdict from 1 of {g.count} events investigated"
         window_run = worst_runs.get(g.rule_name)
         worst_verdict, worst_conf, worst_inv = _worse_than(window_run, verdict)
+        analyst = (
+            analyst_by_alert.get(inv_svc.alert_group_id(_inv) or "") if _inv is not None else None
+        )
+        siblings: list[AlertSiblingOut] | None = None
+        sibling_count: int | None = None
+        siblings_partial: bool | None = None
+        if sibling_index is not None:
+            siblings_partial = sibling_index.partial(
+                sib.group_ref(g.kind, g.rule_name), latest=_alert_time(g.latest_ts)
+            )
+            siblings, sibling_count = _siblings_of(
+                sib.group_ref(g.kind, g.rule_name),
+                sibling_index,
+                kinds=page_kinds,
+                hidden=set() if include_muted else muted_rules,
+                verdicts=verdicts,
+                window_runs=worst_runs,
+            )
         out.append(
             AlertGroupOut(
                 id=g.latest_id or g.rule_name,
@@ -754,9 +1050,124 @@ async def list_alerts(  # noqa: PLR0915 - one linear join of the grid rows and t
                 worstVerdict=worst_verdict,
                 worstConf=worst_conf,
                 worstInvId=worst_inv,
+                analystVerdict=_verdict(analyst.verdict) if analyst is not None else None,
+                analystBy=analyst.resolved_by if analyst is not None else None,
+                analystInvId=analyst.investigation_id if analyst is not None else None,
+                siblings=siblings,
+                siblingCount=sibling_count,
+                siblingsPartial=siblings_partial,
+                cases=case_links.get(g.rule_name, ([], False))[0],
+                casesComplete=case_links.get(g.rule_name, ([], False))[1],
             )
         )
     return AlertQueueOut(groups=out, truncated=page.truncated, other_docs=page.other_docs)
+
+
+class InvestigationSiblingsOut(BaseModel):
+    """The groups that share the flow of the alert of one report (R2-D9).
+
+    The NTLMv1 report (a false positive) and the WMIExec report (a true
+    positive) covered one attack step 2.6 s apart, and neither named the
+    other. The investigation page names them from this.
+    """
+
+    # Worst verdict first, at most _SIBLINGS_SHOWN. None means no sibling
+    # data, and ``reason`` says why.
+    siblings: list[AlertSiblingOut] | None = None
+    siblingCount: int | None = None
+    # True when the read listed fewer groups than the flow holds. None when
+    # there is no sibling data.
+    partial: bool | None = None
+    # The window the read covered, as ISO UTC. The Show action of the report
+    # opens the Alerts list on it, so the row of each sibling is in the list.
+    windowFrom: str | None = None
+    windowTo: str | None = None
+    # "no_alert": the run investigated no alert, a hunt or a lead. "grid":
+    # the grid did not answer. None when the read answered.
+    reason: Literal["no_alert", "grid"] | None = None
+
+
+def _stored_alert(events: list[Any]) -> dict[str, Any]:
+    """The alert the run stored with its context, or an empty mapping."""
+    for e in events:
+        if e.kind in ("enriched_alert_context", "alert_context"):
+            alert = (e.payload or {}).get("alert")
+            return alert if isinstance(alert, dict) else {}
+    return {}
+
+
+def _alert_time(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+@router.get("/alerts/siblings", response_model=InvestigationSiblingsOut)
+async def investigation_siblings(
+    request: Request,
+    inv_id: str = Query(..., min_length=1, max_length=64),
+    settings: Settings = Depends(get_settings_dep),
+    elastic: ElasticClient = Depends(get_elastic),
+) -> InvestigationSiblingsOut:
+    """The groups that share the flow of the alert of one investigation.
+
+    One grid search, anchored on the stored alert time: its community id
+    within one hour, and the same two hosts within five minutes. The verdict
+    of each sibling is its standing verdict. A failed read answers 200 with
+    no sibling data. Nothing here reaches the model.
+    """
+    async with request.app.state.db_sessionmaker() as db:
+        got = await inv_svc.get_with_events(db, inv_id)
+    if got is None:
+        raise api_error(404, "not_found", "No investigation has this id.")
+    inv, events = got
+    subject = inv.subject_json
+    if (
+        inv.kind in inv_svc.PROMOTED_KINDS
+        or (isinstance(subject, dict) and subject.get("type") == "hunt")
+        or not inv.rule_name
+    ):
+        return InvestigationSiblingsOut(reason="no_alert")
+    alert = _stored_alert(events)
+    own = sib.group_ref(inv.kind, inv.rule_name)
+    community = inv.community_id or alert.get("network_community_id")
+    at = _alert_time(alert.get("timestamp"))
+    around = (inv.created_at or datetime.now(UTC).replace(tzinfo=None)).replace(tzinfo=UTC)
+    try:
+        async with asyncio.timeout(settings.webui_grid_timeout_s):
+            index = await sib.fetch_alert_siblings(
+                elastic,
+                settings,
+                own=own,
+                community_id=str(community) if community else None,
+                src=str(alert.get("source_ip") or inv.src_ip or "") or None,
+                dst=str(alert.get("destination_ip") or inv.dest_ip or "") or None,
+                at=at,
+                around=around,
+            )
+    except Exception as exc:
+        _LOGGER.info("alerts: the same-flow read of %s failed (%s)", inv_id, type(exc).__name__)
+        return InvestigationSiblingsOut(reason="grid")
+    names = sorted(r.name for r in index.links(own))
+    verdicts: dict[str, Investigation] = {}
+    if names:
+        async with request.app.state.db_sessionmaker() as db:
+            verdicts = await _standing_verdicts(db, names)
+    siblings, count = _siblings_of(
+        own, index, kinds={}, hidden=set(), verdicts=verdicts, window_runs={}
+    )
+    lo, hi = sib.alert_window(at, around)
+    return InvestigationSiblingsOut(
+        siblings=siblings,
+        siblingCount=count,
+        partial=index.partial(own),
+        windowFrom=_iso_utc(lo),
+        windowTo=_iso_utc(hi),
+    )
 
 
 class AlertsEmptyReasonOut(BaseModel):
@@ -770,7 +1181,11 @@ class AlertsEmptyReasonOut(BaseModel):
     ``reason`` is the machine half:
 
     * ``not_empty``       the feed is not empty; there is nothing to explain.
-    * ``quiet``           no alert label matches anything in this window.
+    * ``quiet``           no alert in this window matches an alert label.
+    * ``gap``             no alert in this window matches an alert label, and
+      the window overlaps a grid gap. The grid held no data for those hours,
+      so the window is blind there. The hint names the gap hours. Never
+      ``quiet``: a blind window and a quiet one read the same on screen.
     * ``filter_mismatch`` the configured filter matched nothing and another
       label did. The hint names which, how many, and one exact filter to set:
       the configured filter widened with that label, never the label on its
@@ -792,17 +1207,45 @@ class AlertsEmptyReasonOut(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    reason: Literal["not_empty", "quiet", "filter_mismatch", "bad_filter", "unknown"]
+    reason: Literal["not_empty", "quiet", "gap", "filter_mismatch", "bad_filter", "unknown"]
     hint: str
 
 
 # The hint states what the counts show and nothing more. It said "The
 # configuration is sound.", which no count can prove (dogfood 2026-10-06).
-_QUIET_HINT = "No alert label matches anything in this window. The grid is quiet."
+_QUIET_HINT = "No alert in this window matches an alert label. The grid is quiet."
+
+
+async def _gap_hint(
+    request: Request, settings: Settings, range_: str, from_: str | None, to: str | None
+) -> str | None:
+    """The hint for an empty window that overlaps a grid gap, or None.
+
+    The store answers, never the grid. A store that cannot be read gives None,
+    and the route says what it said before.
+    """
+    since, until = _mix_window(range_, from_, to, settings.so_timezone)
+    end = until or datetime.now(UTC).replace(tzinfo=None)
+    try:
+        async with request.app.state.db_sessionmaker() as db:
+            gaps = await gaps_svc.overlapping(db, since=since, until=end)
+    except Exception:
+        _LOGGER.warning("alerts empty-reason: the grid gaps could not be read", exc_info=True)
+        return None
+    if not gaps:
+        return None
+    named = " ".join(gaps_svc.describe(g) for g in gaps[:2])
+    more = len(gaps) - 2
+    rest = f" {more} more grid gaps overlap this window." if more > 0 else ""
+    return (
+        f"No alert in this window matches an alert label. {named}{rest} "
+        "The alert count over those hours is unknown."
+    )
 
 
 @router.get("/alerts/empty-reason", response_model=AlertsEmptyReasonOut)
 async def alerts_empty_reason(
+    request: Request,
     range_: str = Query("24h", alias="range"),
     from_: str | None = Query(None, alias="from"),
     to: str | None = None,
@@ -896,6 +1339,11 @@ async def alerts_empty_reason(
         default=("", 0),
     )
     if better_count == 0:
+        # A window over a grid gap is blind for those hours. It must not read
+        # as a quiet grid (dogfood 2026-10-19, R1-D2, R2-D2).
+        gap_hint = await _gap_hint(request, settings, range_, from_, to)
+        if gap_hint is not None:
+            return AlertsEmptyReasonOut(reason="gap", hint=gap_hint)
         return AlertsEmptyReasonOut(reason="quiet", hint=_QUIET_HINT)
     return AlertsEmptyReasonOut(
         reason="filter_mismatch",
@@ -1164,7 +1612,7 @@ async def get_representative(
     if not events:
         raise HTTPException(
             status_code=404,
-            detail={"reason": "no_events", "hint": "No events in window for this rule."},
+            detail={"reason": "no_events", "hint": "The window holds no events for this rule."},
         )
 
     rep, matched, reason = _pick_representative(events)

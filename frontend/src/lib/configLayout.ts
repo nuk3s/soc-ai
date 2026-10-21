@@ -35,25 +35,30 @@ export interface PanelDef {
   label: string;
   parent: string;
   placement?: { afterGroup?: string; at?: 'start' };
+  /** Words for the Settings search. A panel row is not a setting, so a search
+   *  for "maxmind" or "battery" found nothing (dogfood 2026-10-19, R5-D12). */
+  keywords?: string;
 }
 
 export const PANELS: PanelDef[] = [
-  { id: 'agent-tools', label: 'Agent tools', parent: 'Models & Reasoning' },
-  { id: 'notifications-webhook', label: 'Notification webhook', parent: 'Triage & Workflow', placement: { afterGroup: 'Notifications' } },
-  { id: 'runbooks', label: 'Runbooks', parent: 'Retrieval & Memory' },
-  { id: 'egress-policy', label: 'Egress policy', parent: 'Privacy & Egress', placement: { at: 'start' } },
-  { id: 'internal-identifiers', label: 'Internal identifiers', parent: 'Privacy & Egress', placement: { afterGroup: 'Discovery' } },
-  { id: 'redaction-preview', label: 'Redaction preview', parent: 'Privacy & Egress' },
-  { id: 'data-sources', label: 'Data sources', parent: 'Data & Enrichment', placement: { at: 'start' } },
-  { id: 'detection-tuning', label: 'Detection tuning', parent: 'Data & Enrichment' },
-  { id: 'api-keys', label: 'API keys', parent: 'Data & Enrichment', placement: { afterGroup: 'Online enrichment' } },
-  { id: 'about', label: 'About', parent: 'System', placement: { at: 'start' } },
-  { id: 'users', label: 'Users', parent: 'System' },
-  { id: 'api-tokens', label: 'API tokens', parent: 'System' },
-  { id: 'maintenance', label: 'Scheduled maintenance', parent: 'System' },
-  { id: 'tls', label: 'TLS', parent: 'System' },
-  { id: 'diagnostics', label: 'Diagnostics', parent: 'System' },
-  { id: 'danger-zone', label: 'Danger Zone', parent: 'System' },
+  { id: 'agent-tools', label: 'Agent tools', parent: 'Models & Reasoning', keywords: 'agent tools tool get_pcap pcap get_alert_context event_raw decode_payload rule_content enrich_ip enrich_domain enrich_hash web_search fetch_page shodan cvedb' },
+  { id: 'notifications-webhook', label: 'Notification webhook', parent: 'Triage & Workflow', placement: { afterGroup: 'Notifications' }, keywords: 'webhook slack matrix json notification test url' },
+  { id: 'runbooks', label: 'Runbooks', parent: 'Retrieval & Memory', keywords: 'runbook procedure playbook' },
+  { id: 'egress-policy', label: 'Egress policy', parent: 'Privacy & Egress', placement: { at: 'start' }, keywords: 'egress outbound cloud redaction destination' },
+  { id: 'internal-identifiers', label: 'Internal identifiers', parent: 'Privacy & Egress', placement: { afterGroup: 'Discovery' }, keywords: 'internal identifier domain suffix hostname cidr subnet discovery scan' },
+  { id: 'redaction-preview', label: 'Redaction preview', parent: 'Privacy & Egress', keywords: 'redaction preview sanitize payload' },
+  { id: 'data-sources', label: 'Data sources', parent: 'Data & Enrichment', placement: { at: 'start' }, keywords: 'data source feed blocklist blocklists urlhaus threatfox feodo tor maxmind geoip geolite cloud prefixes greynoise shodan misp refresh' },
+  { id: 'detection-tuning', label: 'Detection tuning', parent: 'Data & Enrichment', keywords: 'detection tuning mute noisy rule prior suppress' },
+  { id: 'api-keys', label: 'API keys', parent: 'Data & Enrichment', placement: { afterGroup: 'Online enrichment' }, keywords: 'api key shodan greynoise misp maxmind license abuse.ch crawl4ai token' },
+  { id: 'about', label: 'About', parent: 'System', placement: { at: 'start' }, keywords: 'about version update github release' },
+  { id: 'users', label: 'Users', parent: 'System', keywords: 'user users password reset role admin analyst disable enable' },
+  { id: 'api-tokens', label: 'API tokens', parent: 'System', keywords: 'api token tokens bearer scai integration revoke' },
+  { id: 'maintenance', label: 'Scheduled maintenance', parent: 'System', keywords: 'maintenance backup backups cron archive blocklist refresh' },
+  { id: 'tls', label: 'TLS', parent: 'System', keywords: 'tls certificate https caddy proxy acme expiry' },
+  { id: 'diagnostics', label: 'Diagnostics', parent: 'System', keywords: 'diagnostics doctor test es llm audit chain verify check health' },
+  // The id stays: links and bookmarks use #danger-zone. The label follows
+  // STE: "Connections" (dogfood 2026-10-19, H1 STE item 12).
+  { id: 'danger-zone', label: 'Connections', parent: 'System', keywords: 'connection connections danger so_host es_hosts elasticsearch security onion grid gateway litellm password credential ssh' },
 ];
 
 /** Ids the group-id generator must never produce: every standalone panel id

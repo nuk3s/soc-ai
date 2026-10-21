@@ -6,7 +6,6 @@ import asyncio
 import logging
 from datetime import UTC, datetime
 from typing import Annotated, Any
-from urllib.parse import quote
 
 from elastic_transport import TransportError
 from elasticsearch import ApiError
@@ -15,6 +14,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from soc_ai.api.deps import get_elastic, get_settings_dep
 from soc_ai.api.security import identify_caller
+from soc_ai.api.webui import action_rules
 from soc_ai.api.webui._errors import oql_refusal
 from soc_ai.api.webui._shared import (
     _iso_z,
@@ -29,7 +29,8 @@ from soc_ai.store import escalations as esc_svc
 from soc_ai.store import investigations as inv_svc
 from soc_ai.tools.write_exec import execute_write_tool
 from soc_ai.webui import alerts_query as aq
-from soc_ai.webui.case_links import case_ids_for_alerts
+from soc_ai.webui import anchor_check
+from soc_ai.webui.case_links import case_ids_for_alerts, case_url
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -152,9 +153,7 @@ class AckGroupIn(BaseModel):
     def _validate_kind(cls, v: str) -> str:
         low = v.strip().lower()
         if low not in _VALID_GROUP_KINDS:
-            raise ValueError(
-                f"unrecognized kind {v!r}; expected one of: {', '.join(_VALID_GROUP_KINDS)}"
-            )
+            raise ValueError(f"Use one of these values: {', '.join(_VALID_GROUP_KINDS)}")
         return low
 
     @field_validator("range")
@@ -162,9 +161,7 @@ class AckGroupIn(BaseModel):
     def _validate_range(cls, v: str) -> str:
         low = v.strip().lower()
         if low not in aq.TIME_RANGES:
-            raise ValueError(
-                f"unrecognized range {v!r}; expected one of: {', '.join(aq.TIME_RANGES)}"
-            )
+            raise ValueError(f"Use one of these values: {', '.join(aq.TIME_RANGES)}")
         return low
 
     @field_validator("severity")
@@ -181,10 +178,7 @@ class AckGroupIn(BaseModel):
         # cannot acknowledge, which is the screen disagreeing with its own
         # controls one level along from the badge this batch fixed.
         if low not in aq.SELECTABLE_SEVERITIES:
-            raise ValueError(
-                f"unrecognized severity {v!r}; "
-                f"expected one of: {', '.join(aq.SELECTABLE_SEVERITIES)}"
-            )
+            raise ValueError(f"Use one of these values: {', '.join(aq.SELECTABLE_SEVERITIES)}")
         return low
 
 
@@ -234,6 +228,7 @@ async def _scan_group(
     body: AckGroupIn,
     *,
     cap: int,
+    hide_acked: bool = True,
 ) -> tuple[list[Any], list[Any], bool]:
     """Page a group, splitting it into the events still worth writing to and the
     events Security Onion says it has already handled.
@@ -280,7 +275,7 @@ async def _scan_group(
             abs_from=body.from_,
             abs_to=body.to,
             time_zone=settings.so_timezone,
-            hide_acked=True,
+            hide_acked=hide_acked,
         )
         if not page:
             return writable, handled, False
@@ -298,6 +293,27 @@ async def _scan_group(
     # Stopped at the scan bound. Whether anything writable is left is unknown,
     # and claiming "nothing" would be the false all-clear this exists to avoid.
     return writable, handled, True
+
+
+async def _scan_handled(
+    elastic: ElasticClient,
+    settings: Settings,
+    body: AckGroupIn,
+    *,
+    cap: int,
+) -> list[Any]:
+    """The group's events Security Onion already handled, when the grid hides them.
+
+    The scan above reads with ``hide_acked``. A grid that maps
+    ``event.acknowledged`` hides every handled event from it, so a second press
+    found nothing and reported "0 acknowledged" with a green check, and
+    ``already_acked`` stayed 0 (dogfood 2026-10-19, R2-D15). Read only when the
+    first scan saw nothing at all: a press that writes knows its own answer.
+    """
+    _writable, handled, _more = await _scan_group(
+        elastic, settings, body, cap=cap, hide_acked=False
+    )
+    return handled
 
 
 class AckGroupOut(BaseModel):
@@ -341,6 +357,8 @@ async def ack_group(
     try:
         async with asyncio.timeout(settings.webui_grid_timeout_s):
             events, handled, more = await _scan_group(elastic, settings, body, cap=_ACK_CAP)
+            if not events and not handled:
+                handled = await _scan_handled(elastic, settings, body, cap=_ACK_CAP)
             already_acked = len(handled)
             # Only worth a query when the scan stopped short; a drained group
             # already knows its answer. Still a read, and still before the
@@ -497,10 +515,8 @@ class EscalatedCase(BaseModel):
 
 
 def _case_url(settings: Settings, case_id: str) -> str | None:
-    host = str(settings.so_host or "").rstrip("/")
-    if not host:
-        return None
-    return f"{host}/#/case/{quote(case_id, safe='')}"
+    """One case URL builder for the escalate answer and the Alerts rows."""
+    return case_url(settings, case_id)
 
 
 class EscalateGroupOut(BaseModel):
@@ -534,6 +550,13 @@ class EscalateGroupOut(BaseModel):
     # the writes returned them. The operator needs the id to find the case, and
     # a toast that says "Opened 2 cases" with no id sends them searching.
     cases: list[EscalatedCase] = []
+    # The cases the already-escalated alerts are on, from soc-ai's own ledger.
+    # A second press said "Opened no cases" and named no case (R2-I2). At most
+    # _EXISTING_CASES_SHOWN entries. A case opened outside soc-ai has no id here.
+    existing_cases: list[EscalatedCase] = []
+
+
+_EXISTING_CASES_SHOWN = 10
 
 
 async def _existing_case_links(
@@ -672,6 +695,8 @@ async def escalate_group(
     try:
         async with asyncio.timeout(settings.webui_grid_timeout_s):
             events, handled, more = await _scan_group(elastic, settings, body, cap=_ESCALATE_CAP)
+            if not events and not handled:
+                handled = await _scan_handled(elastic, settings, body, cap=_ESCALATE_CAP)
             matched = await _count_group(elastic, settings, body) if more else 0
     except OqlValidationError as exc:
         raise oql_refusal(exc) from exc
@@ -706,6 +731,13 @@ async def escalate_group(
             for alert_id, case_id in case_ids.items():
                 await esc_svc.record_case(db, alert_id, case_id)
 
+    claimed = set(reserved.claimed)
+    existing = await _existing_cases(
+        request,
+        [ev.es_id for ev in handled if ev.escalated]
+        + [ev.es_id for ev in events if ev.es_id not in claimed],
+    )
+
     remaining = _remaining(matched, len(handled) + len(events), more=more)
     if more:
         logging.getLogger(__name__).warning(
@@ -730,7 +762,21 @@ async def escalate_group(
             EscalatedCase(id=case_id, url=_case_url(settings, case_id))
             for case_id in dict.fromkeys(case_ids.values())
         ],
+        existing_cases=[EscalatedCase(id=c, url=_case_url(settings, c)) for c in existing],
     )
+
+
+async def _existing_cases(request: Request, alert_ids: list[str]) -> list[str]:
+    """The ledger's case ids for alerts a case already exists for. Best-effort."""
+    if not alert_ids:
+        return []
+    try:
+        async with request.app.state.db_sessionmaker() as db:
+            claims = await esc_svc.cases_for_alerts(db, alert_ids)
+    except Exception:
+        _LOGGER.warning("existing-case lookup failed", exc_info=True)
+        return []
+    return list(dict.fromkeys(c for c in claims.values() if c))[:_EXISTING_CASES_SHOWN]
 
 
 _ES_ID = Annotated[str, Field(max_length=512)]  # ES ``_id`` values are <=512 bytes
@@ -756,20 +802,42 @@ async def ack_events(
     if not ids:
         return AckGroupOut(acked=0, failed=0, total=0)
     # The ids are caller-supplied — unlike the group routes above, nothing ties
-    # them to the alert grid. A promoted hunt finding's anchor is cited
+    # them to the alert grid. A promoted hunt finding's anchor is often cited
     # telemetry, not an SO alert, and the sibling execute-action route refuses
     # exactly that document with 400 hunt_kind_no_so_target; this route must
     # agree, or the id-supplied path acks what the guarded path refuses.
-    # Ordinary alert ids (not hunt anchors) ack normally — that's the job.
+    # Ordinary alert ids (not hunt anchors) ack normally — that's the job. An
+    # anchor that the alert feed holds is a real alert, and it acks too
+    # (dogfood 2026-10-21).
     async with request.app.state.db_sessionmaker() as db:
-        hunt_anchors = await inv_svc.hunt_anchor_ids(db, ids)
-    if hunt_anchors:
+        hunt_anchors = await inv_svc.hunt_anchor_kinds(db, ids)
+    states = await anchor_check.alert_status(request.app.state, sorted(hunt_anchors))
+    telemetry = sorted(i for i in hunt_anchors if states.get(i) == anchor_check.NOT_ALERT)
+    unread = sorted(
+        i for i in hunt_anchors if states.get(i, anchor_check.UNKNOWN) == anchor_check.UNKNOWN
+    )
+    if telemetry:
         raise HTTPException(
             status_code=400,
             detail={
                 "reason": "hunt_kind_no_so_target",
-                "ids": sorted(hunt_anchors),
-                "hint": "A promoted finding has no Security Onion alert to act on.",
+                "ids": telemetry,
+                # The sentence of the action rule for one document, and one
+                # sentence for all of them when the press names more.
+                "hint": (
+                    action_rules.anchor_refusal(hunt_anchors[telemetry[0]])
+                    if len(telemetry) == 1
+                    else action_rules.ANCHORS_REFUSAL
+                ),
+            },
+        )
+    if unread:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "reason": action_rules.CODE_ANCHOR_UNREAD,
+                "ids": unread,
+                "hint": action_rules.ANCHOR_UNREAD,
             },
         )
     acked, failed = await _ack_many(
@@ -883,7 +951,7 @@ async def assign_alert(
                     status_code=404,
                     detail={
                         "reason": "not_assigned",
-                        "hint": "assign an owner before setting a triage state",
+                        "hint": "Assign an owner before you set a triage state.",
                     },
                 )
             record = await assign_svc.assignments_for_rules(db, [body.rule_name])
@@ -962,11 +1030,11 @@ async def list_stranded_escalations(request: Request) -> StrandedClaimsOut:
     pressed escalate, and the person who needs to know an alert cannot be
     escalated is the person trying to escalate it.
 
-    Reconciliation stays where it is — the next group escalate covering the
-    alert settles the claim against the grid's own case links. This route is
-    the surface, not a second write path: an operator-facing "release" button
-    would drop a claim on somebody's opinion rather than on evidence, and a
-    request can fail after Security Onion has already created the case.
+    The next group escalate covering the alert settles the claim against the
+    grid's own case links. POST /escalations/check (routes_escalations.py)
+    settles one claim on demand by the same rule: it reads the grid's case
+    links and never drops a claim on an opinion. This route only lists the
+    claims.
     """
     now = datetime.now(UTC).replace(tzinfo=None)
     async with request.app.state.db_sessionmaker() as db:

@@ -89,7 +89,7 @@ describe('the override dialog', () => {
       }),
     );
     const fold = screen.getByTestId('pre-override-summary');
-    expect(fold.textContent).toContain('soc·ai said before the override');
+    expect(fold.textContent).toContain('soc-ai said before the override');
     expect(screen.queryByText('This is benign MSSQL traffic.')).toBeNull();
     fireEvent.click(within(fold).getByRole('button'));
     expect(screen.getByText('This is benign MSSQL traffic.')).toBeTruthy();

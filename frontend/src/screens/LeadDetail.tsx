@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import {
   LEAD_ACTION as ACTIONS,
@@ -18,7 +18,10 @@ import {
   HUNT_CLOSED_ACTOR,
   REASON_LABEL,
   closedByHunt,
+  closedOnVerdicts,
   dismissEffect,
+  leadFoundThreat,
+  openThreatTitles,
 } from '../components/LeadsStrip';
 import { Panel, PanelHeader } from '../components/Panel';
 import { ErrorState, LoadingState, NotFoundState, StaleNotice } from '../components/States';
@@ -27,18 +30,18 @@ import {
   closeLeadAsPromoted,
   getHunt,
   getLead,
-  getMachine,
   keepLeadOpen,
   getNeedsYou,
   huntLead,
   isNotFound,
   reopenLead,
-  resolveMachine,
+  listMachines,
   type LeadDetail as LeadDetailT,
   type LeadHunt as LeadHuntT,
   type RelatedLead as RelatedLeadT,
 } from '../lib/api';
 import { entityPath } from '../lib/entityPath';
+import { useTabTitle } from '../lib/useTabTitle';
 import { type FlowHunt, leadFlow } from '../lib/flowSteps';
 import { isIpKey } from '../lib/ip';
 import { kindLabel } from '../lib/kinds';
@@ -51,6 +54,8 @@ import {
   staleHuntSentence,
   verdictToDecide,
   verdictWords,
+  HUNT_AGAIN_CLOSE,
+  huntAgainWords,
 } from '../lib/leadWords';
 import { plural } from '../lib/plural';
 import { chipProps, huntOutcome, outcomeLabel, outcomeMeta, statusLabel } from '../lib/labels';
@@ -60,6 +65,7 @@ import {
   ACTION_HUNT_NOW,
   ACTION_REOPEN,
   CHIP_CLOSED_BY_HUNT,
+  CHIP_CLOSED_ON_VERDICTS,
   CHIP_DISMISS_REASON,
   CHIP_LEFT_TO_YOU,
   CHIP_ONE_SIGNAL,
@@ -163,6 +169,13 @@ export function LeadDetail() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [confirmAgain, setConfirmAgain] = useState(false);
+  // Escape closes the Hunt again confirm, and the focus goes back to its
+  // button (V1-H4).
+  const huntAgainRef = useRef<HTMLButtonElement>(null);
+  const closeConfirm = () => {
+    setConfirmAgain(false);
+    huntAgainRef.current?.focus();
+  };
   // C2: the weights and the z scores sit behind this toggle.
   const [scoring, setScoring] = useState(false);
   // A lead id is an integer. Anything else in the address is a wrong link,
@@ -180,10 +193,15 @@ export function LeadDetail() {
   // without the sentence the strip carries. The read is best-effort, because
   // the counts are not what the page is for.
   const needsYou = useAsync(() => getNeedsYou().catch(() => null), [leadId]);
-  // W7: the machine behind the lead's first address, read from the hosts
-  // resolve route. The title named the address alone, so the analyst opened
-  // the host page to learn that 10.1.10.254 is the router. Best-effort: a
-  // value no machine holds keeps the title it has.
+  // W7: the machine behind the lead's first address, read from the machine
+  // list. The title named the address alone, so the analyst opened the host
+  // page to learn that 10.1.10.254 is the router. Best-effort: a value no
+  // machine holds keeps the title it has.
+  //
+  // The list answers an address no machine holds with no row. The resolve
+  // route answers it with a 404, and the browser logged one on every lead of
+  // an address outside the Hosts list (R3-D15). A search can match a longer
+  // address, so the row must hold the address itself.
   const firstEntity = lead.data?.entities[0];
   const machineKey =
     firstEntity && firstEntity[0] === 'host' && isIpKey(String(firstEntity[1]))
@@ -192,14 +210,21 @@ export function LeadDetail() {
   const machine = useAsync(
     () =>
       machineKey
-        ? resolveMachine(machineKey)
-            .then((r) => getMachine(r.key))
+        ? listMachines({ q: machineKey, activity: 'all', limit: 5 })
+            .then(
+              (list) =>
+                list.rows.find(
+                  (r) => r.primary_ip === machineKey || r.addresses.includes(machineKey),
+                ) ?? null,
+            )
             .catch(() => null)
         : Promise.resolve(null),
     [machineKey],
   );
   // The Ask soc-ai panel's lead scope, once the lead is read.
   const leadRead = lead.data ? lead.data.id : null;
+  // The tab names the lead. Every tab read "soc·ai: SOC alert triage".
+  useTabTitle(leadRead != null ? `Lead ${leadRead}` : validId ? `Lead ${leadId}` : null);
   useChatScope(
     leadRead != null ? { scope: { kind: 'lead', id: String(leadRead), name: `Lead ${leadRead}` } } : null,
   );
@@ -258,6 +283,14 @@ export function LeadDetail() {
       : null;
   // The verdict of a promoted finding the analyst has not answered yet.
   const ask = verdictToDecide(d);
+  // R3-I4: the Dismiss form names the open threat findings of the lead's
+  // hunt. The page holds the hunt when it could read it, and the lead record
+  // says whether a hunt found a threat when it could not.
+  const threatTitles = flowHunt.data ? openThreatTitles(flowHunt.data.findings) : [];
+  const dismissThreat =
+    threatTitles.length > 0 || leadFoundThreat(d)
+      ? { huntId: d.hunt_id ?? null, titles: threatTitles }
+      : null;
   const attached = hunts[0] ?? null;
   // The hunt the actions point at. A link goes to the hunt page, so the
   // address is written once.
@@ -351,11 +384,11 @@ export function LeadDetail() {
             reason sat on the timeline alone, below every observation. The word
             is the strip's word: one dismissal read "reason:" there and
             "Closed:" here, which is two names for one fact. */}
-        {closedByHunt(d) ? (
+        {closedByHunt(d) || closedOnVerdicts(d) ? (
           <span
             data-testid="lead-closed-reason"
             className="text-[11.5px] text-dim"
-            title={CHIP_CLOSED_BY_HUNT}
+            title={closedByHunt(d) ? CHIP_CLOSED_BY_HUNT : CHIP_CLOSED_ON_VERDICTS}
           >
             closed by {HUNT_CLOSED_ACTOR}
           </span>
@@ -458,6 +491,7 @@ export function LeadDetail() {
                 {ACTIONS.dismiss}
               </button>
               <button
+                ref={huntAgainRef}
                 type="button"
                 disabled={busy}
                 className={buttonClass}
@@ -671,24 +705,32 @@ export function LeadDetail() {
       {/* A second hunt on one lead is a real thing to want and a common
           mis-click. The confirm names the hunt that already exists. */}
       {confirmAgain && (
-        <div className="mt-3 flex flex-wrap items-center gap-2 rounded-panel border border-border bg-surface-1 p-3 text-[12.5px]">
-          <span>
-            A hunt on this lead already exists.{' '}
+        <div
+          className="mt-3 flex flex-wrap items-center gap-2 rounded-panel border border-border bg-surface-1 p-3 text-[12.5px]"
+          onKeyDown={(e) => {
+            if (e.key !== 'Escape') return;
+            e.stopPropagation();
+            closeConfirm();
+          }}
+        >
+          <span data-testid="lead-hunt-again-confirm">
+            {/* R3-I5: when the hunt on record ran, how long it took, and the
+                close that follows the new hunt. */}
+            {huntAgainWords(attached).head} Read{' '}
             {attached ? (
-              <>
-                Read{' '}
-                <Link
-                  to={`/hunts/${attached.id}`}
-                  className="text-accent hover:underline"
-                  title={`Hunt ${attached.id}`}
-                >
-                  {huntName(attached)}
-                </Link>{' '}
-                before you start another.
-              </>
+              <Link
+                to={`/hunts/${attached.id}`}
+                className="text-accent hover:underline"
+                title={`${huntName(attached)}, hunt ${attached.id}`}
+              >
+                that hunt
+              </Link>
             ) : (
-              'Read it before you start another.'
-            )}
+              'that hunt'
+            )}{' '}
+            first.
+            {huntAgainWords(attached).run ? ` ${huntAgainWords(attached).run}` : ''}{' '}
+            {HUNT_AGAIN_CLOSE}
           </span>
           <button
             type="button"
@@ -704,7 +746,9 @@ export function LeadDetail() {
           >
             Start another hunt
           </button>
-          <button type="button" className="text-dim" onClick={() => setConfirmAgain(false)}>
+          {/* The keyboard lands on Cancel, so Enter starts nothing and
+              Escape closes the confirm. */}
+          <button type="button" autoFocus className="text-dim" onClick={closeConfirm}>
             Cancel
           </button>
         </div>
@@ -716,6 +760,8 @@ export function LeadDetail() {
           <DismissLeadForm
             leadId={d.id}
             reasons={d.dismiss_reasons}
+            threat={dismissThreat}
+            onCancel={() => setDismissing(false)}
             onDone={() => {
               setDismissing(false);
               lead.refetch();

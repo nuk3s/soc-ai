@@ -1,40 +1,39 @@
 """Command-line front-end for soc-ai.
 
-The ``soc-ai`` script in ``pyproject.toml`` dispatches to subcommands:
+The ``soc-ai`` script in ``pyproject.toml`` dispatches to these subcommands:
 
-- ``serve`` (default): boots the FastAPI app under uvicorn (legacy behavior).
-- ``triage <alert_id>``: streams an investigation against the local soc-ai
-  instance, rendering each SSE event to stdout with colorized output. Useful
-  for terminal-first analysts and incident-response work where opening a
-  browser is overhead.
-- ``healthz``: prints the LIVENESS endpoint's JSON. It probes no dependency —
-  ``doctor`` below is the check that answers whether the install works.
-- ``doctor``: checks the whole dependency surface (config, local store +
-  migration head, DNS/TCP/TLS-layered upstream reachability, Security Onion,
-  Elasticsearch — including the audit write grant and index-pattern dataset
-  coverage — gateway, analyst-model fitness, egress posture, blocklist
-  freshness) and prints a pass/fail table. Exit 0 only when every required
-  check passes (warnings don't fail it); ``--json`` emits the results for
-  automation.
-- ``backup`` / ``restore``: snapshot the live SQLite store (+ app-owned
-  sidecar files) into a portable tar.gz, and put one back. Backup is safe
-  while the app runs; restore wants the app stopped and gates every
-  overwrite behind ``--yes``. Logic lives in ``soc_ai.backup``. Both refuse
-  a PostgreSQL store, which ``pg_dump`` backs up.
+- ``serve``: the default, as in earlier versions. It starts the FastAPI app
+  under uvicorn.
+- ``triage <alert_id>``: streams an investigation from the local soc-ai
+  instance. It prints each SSE event to stdout in color. Use it from a
+  terminal when a browser is not at hand.
+- ``healthz``: prints the JSON of the liveness endpoint. It probes no
+  dependency. ``doctor`` checks whether the install works.
+- ``doctor``: checks the whole dependency surface and prints a pass/fail
+  table. The checks cover the config, the local store and its migration head,
+  the DNS, TCP and TLS reachability, Security Onion, Elasticsearch with the
+  audit write grant and the index-pattern coverage, the gateway, the analyst
+  model fitness, the egress posture and the blocklist age. The exit status is
+  0 only when every required check passes. A warning does not fail it.
+  ``--json`` prints the results for automation.
+- ``backup`` / ``restore``: copy the live SQLite store and the app sidecar
+  files into a portable tar.gz, and put one back. A backup is safe while the
+  app runs. A restore needs the app stopped, and every overwrite needs
+  ``--yes``. The logic is in ``soc_ai.backup``. Both refuse a PostgreSQL
+  store. Use ``pg_dump`` for that store.
 - ``store migrate --to <url>``: copy every table of the store into an empty
-  store, for example PostgreSQL. ``--dry-run`` writes nothing. Logic lives in
-  ``soc_ai.store.copy``.
+  store, for example PostgreSQL. ``--dry-run`` writes nothing. The logic is
+  in ``soc_ai.store.copy``.
 - ``spec-replay``: replay the profile analytics and the learned detectors
-  hour by hour against the grid into a scratch store, and report the hits per
-  100 host-days. Logic lives in ``soc_ai.hunting.spec_replay``.
+  hour by hour against the grid into a scratch store. It reports the hits per
+  100 host-days. The logic is in ``soc_ai.hunting.spec_replay``.
 
-The triage subcommand connects via HTTPS to the configured
-``SOC_AI_HOST:SOC_AI_PORT`` and trusts a self-signed cert by default
-(matches the lab posture documented in ``docs/DEPLOYMENT.md``); pass
-``--verify`` or ``--cafile`` to enable TLS verification. Against a
-secured deployment (``api_auth_required=true``, the shipped default),
-authenticate with ``--token scai_...`` or the ``SOC_AI_API_TOKEN``
-environment variable.
+The triage subcommand connects over HTTPS to ``SOC_AI_HOST:SOC_AI_PORT``. By
+default it accepts a self-signed certificate. That matches the lab posture in
+``docs/DEPLOYMENT.md``. Pass ``--verify`` or ``--cafile`` to verify the
+certificate. A secured deployment has ``api_auth_required=true``, which is the
+shipped default. Authenticate with ``--token scai_...`` or with the
+``SOC_AI_API_TOKEN`` environment variable.
 
 Examples::
 
@@ -867,7 +866,7 @@ def _eval_nightly(args: argparse.Namespace) -> int:
             return "—" if v is None else f"{v * 100:.0f}%"
 
         print(
-            f"{_C['bold']}quality snapshot{_C['reset']} ({result.mode}) — "
+            f"{_C['bold']}quality snapshot{_C['reset']} ({result.mode}): "
             f"ok={metrics.n_ok} err={metrics.n_error} · "
             f"agreement={_pct(metrics.agreement_rate)} · "
             f"fallback={_pct(metrics.fallback_rate)} · "
@@ -1175,7 +1174,7 @@ def _print_journey_result(scenario: Any, outcome: Any) -> None:
     headline_color = _C["green"] if complete else _C["red"]
     stage = str(result.reached).upper()
     print(
-        f"{_C['bold']}journey {result.scenario_id}{_C['reset']} — "
+        f"{_C['bold']}journey {result.scenario_id}{_C['reset']}: "
         f"{headline_color}{stage}{_C['reset']}"
     )
     actual = result.actual_verdict if result.actual_verdict is not None else "(none)"
@@ -1254,7 +1253,7 @@ def _discover_internal_identifiers(_args: argparse.Namespace) -> int:
                 await engine.dispose()
 
         print(
-            f"{_C['bold']}internal-identifier discovery{_C['reset']} — "
+            f"{_C['bold']}internal-identifier discovery{_C['reset']}: "
             f"scanned≈{summary.scanned_events} events, "
             f"internal_hosts_seen={summary.internal_hosts_seen}"
         )
@@ -1376,7 +1375,7 @@ def _audit_verify_broken(
         print(f"{_C['dim']}{older_finding}{_C['reset']}", file=sys.stderr)
     if duplicates_only:
         print(
-            f"{_C['yellow']}duplicate sequence numbers; no record was altered."
+            f"{_C['yellow']}Duplicate sequence numbers. No record was altered."
             f"{_C['reset']} Exit 3.",
             file=sys.stderr,
         )
@@ -1482,7 +1481,8 @@ def _audit_verify(args: argparse.Namespace) -> int:
         print(
             f"{_C['red']}audit verify could not run{_C['reset']}: "
             f"{type(e).__name__}: {e} "
-            f"{_C['dim']}(is the ES/audit index reachable?){_C['reset']}",
+            f"{_C['dim']}Check that Elasticsearch and the audit index are reachable."
+            f"{_C['reset']}",
             file=sys.stderr,
         )
         return 2
@@ -1747,8 +1747,8 @@ def _register_backup(sub: Any) -> None:
     """Register the ``backup`` + ``restore`` subparsers (split out for size)."""
     p_bak = sub.add_parser(
         "backup",
-        help="Snapshot the live SQLite store + app-owned sidecar files into a "
-        "portable tar.gz (uses the SQLite backup API — safe while the app runs)",
+        help="Copy the live SQLite store and the app sidecar files into a portable "
+        "tar.gz. The copy uses the SQLite backup API, so it is safe while the app runs",
     )
     p_bak.add_argument(
         "--out",
@@ -2206,7 +2206,7 @@ def _register_spec_run(sub: Any) -> None:
         "spec_id",
         nargs="?",
         default=None,
-        help="Spec id to run; omit to run the whole catalog",
+        help="The spec id to run. Leave it out to run the whole catalog",
     )
     p_sr.add_argument(
         "--since",
@@ -2713,6 +2713,157 @@ def _register_usage(sub: Any) -> None:
     p_us.set_defaults(func=_usage)
 
 
+def _users_list(args: argparse.Namespace) -> int:
+    """Print every user account: name, role and state.
+
+    Exit codes:
+      0   the list printed
+
+    Reads the local store only.
+    """
+    from soc_ai.config import get_settings  # noqa: PLC0415 - lazy
+    from soc_ai.store import auth as auth_svc  # noqa: PLC0415 - lazy
+    from soc_ai.store.db import (  # noqa: PLC0415 - lazy
+        make_engine,
+        make_sessionmaker,
+        run_migrations,
+    )
+
+    settings = get_settings()
+
+    async def _go() -> int:
+        engine = make_engine(settings)
+        await run_migrations(engine)
+        try:
+            async with make_sessionmaker(engine)() as db:
+                users = await auth_svc.list_users(db)
+        finally:
+            await engine.dispose()
+        if not users:
+            print("The store holds no user. soc-ai creates the admin account at the next start.")
+            return 0
+        width = max(len(u.username) for u in users)
+        for u in users:
+            state = "disabled" if u.disabled else "enabled"
+            last = u.last_login_at.strftime("%Y-%m-%d %H:%M UTC") if u.last_login_at else "never"
+            print(f"{u.username:<{width}}  {u.role:<7}  {state:<8}  last sign-in {last}")
+        return 0
+
+    return asyncio.run(_go())
+
+
+def _users_reset_password(args: argparse.Namespace) -> int:
+    """Set a new random password for one account and print it once.
+
+    The recovery path for an admin who cannot sign in. The effect is the same
+    as Reset password in Settings > Users: every session of the account ends,
+    and every API token that the account created is revoked.
+
+    Exit codes:
+      0   the password changed; the new one is on stdout
+      1   the store write failed
+      2   no account has that username
+    """
+    import secrets  # noqa: PLC0415 - lazy
+
+    from sqlalchemy import func, select  # noqa: PLC0415 - lazy
+
+    from soc_ai.bootstrap_credential import clear_bootstrap_credential  # noqa: PLC0415 - lazy
+    from soc_ai.config import get_settings  # noqa: PLC0415 - lazy
+    from soc_ai.store import auth as auth_svc  # noqa: PLC0415 - lazy
+    from soc_ai.store.db import (  # noqa: PLC0415 - lazy
+        make_engine,
+        make_sessionmaker,
+        run_migrations,
+    )
+    from soc_ai.store.models import ApiToken  # noqa: PLC0415 - lazy
+
+    settings = get_settings()
+    username = str(args.username)
+
+    async def _go() -> int:
+        engine = make_engine(settings)
+        await run_migrations(engine)
+        try:
+            async with make_sessionmaker(engine)() as db:
+                users = await auth_svc.list_users(db)
+                target = next((u for u in users if u.username == username), None)
+                if target is None:
+                    names = ", ".join(u.username for u in users) or "none"
+                    print(
+                        f"{_C['red']}No account has the username {username!r}{_C['reset']}. "
+                        f"The accounts are: {names}.",
+                        file=sys.stderr,
+                    )
+                    return 2
+                tokens = int(
+                    await db.scalar(
+                        select(func.count())
+                        .select_from(ApiToken)
+                        .where(ApiToken.created_by == target.id, ApiToken.revoked.is_(False))
+                    )
+                    or 0
+                )
+                new_pw = secrets.token_urlsafe(12)
+                try:
+                    await auth_svc.reset_user_password(db, target.id, new_pw)
+                except Exception as e:
+                    from soc_ai.webui.probes import _safe_reason  # noqa: PLC0415 - lazy
+
+                    print(
+                        f"{_C['red']}the password did not change{_C['reset']}: {_safe_reason(e)}",
+                        file=sys.stderr,
+                    )
+                    return 1
+                disabled = bool(target.disabled)
+        finally:
+            await engine.dispose()
+        # The generated password in the sidecar is dead now, so the file goes.
+        clear_bootstrap_credential(settings, username)
+        print(f"New password for {username}: {new_pw}")
+        print("soc-ai shows this password once. Copy it now.")
+        print(f"Sign in as {username}. Then open the account menu and select Change password.")
+        token_note = (
+            f" soc-ai revoked {tokens} API token{'' if tokens == 1 else 's'} that "
+            f"{username} created."
+            if tokens
+            else ""
+        )
+        print(f"Every session of {username} ended.{token_note}")
+        if disabled:
+            print(
+                f"{_C['yellow']}{username} is disabled.{_C['reset']} An admin must enable "
+                "the account in Settings > Users before it can sign in."
+            )
+        return 0
+
+    return asyncio.run(_go())
+
+
+def _register_users(sub: Any) -> None:
+    """Register the ``users`` command group: ``list`` and ``reset-password``."""
+    p_users = sub.add_parser(
+        "users",
+        help="User account tooling. Subcommands: `list` prints every account. "
+        "`reset-password` sets a new password for an admin who cannot sign in",
+    )
+    users_sub = p_users.add_subparsers(dest="users_cmd")
+    p_list = users_sub.add_parser("list", help="Print every account with its role and state")
+    p_list.set_defaults(func=_users_list)
+    p_reset = users_sub.add_parser(
+        "reset-password",
+        help="Set a new random password for one account and print it once. Every "
+        "session of the account ends, and its API tokens are revoked",
+        description="Set a new random password for one account and print it once. "
+        "Use it when an admin cannot sign in. Exit codes: 0 the password changed. "
+        "1 the store write failed. 2 no account has that username.",
+    )
+    p_reset.add_argument("username", help="The username of the account, for example admin")
+    p_reset.set_defaults(func=_users_reset_password)
+    # `soc-ai users` with no subcommand: print the group help instead of serving.
+    p_users.set_defaults(func=lambda _a: (p_users.print_help(), 2)[1])
+
+
 def _register_spec_sweep(sub: Any) -> None:
     """Register the ``spec-sweep`` subparser."""
     p_ss = sub.add_parser(
@@ -2784,20 +2935,21 @@ def _register_eval_nightly(sub: Any) -> None:
     p_en.add_argument(
         "--oql",
         default=None,
-        help="OQL selecting candidate alerts (default: the web-UI alerts feed "
-        "query, webui_alerts_query — the same population the dashboard shows)",
+        help="The OQL that selects candidate alerts. The default is the alerts feed "
+        "query, webui_alerts_query. The dashboard shows the same alerts",
     )
     nightly_mode = p_en.add_mutually_exclusive_group()
     nightly_mode.add_argument(
         "--graded",
         action="store_true",
-        help="Force oracle grading (one cloud call per alert; agreement_rate joins the trend)",
+        help="Force the Oracle grading. It makes one cloud call per alert, and "
+        "agreement_rate joins the trend",
     )
     nightly_mode.add_argument(
         "--local",
         action="store_true",
-        help="Force zero-egress local mode (no oracle; trends fallback/error "
-        "rates, verdict distribution and latency only)",
+        help="Force the zero-egress local mode. It calls no Oracle. It trends only the "
+        "fallback rate, the error rate, the verdict distribution and the latency",
     )
     p_en.add_argument(
         "--out-dir",
@@ -2806,9 +2958,8 @@ def _register_eval_nightly(sub: Any) -> None:
         # default silently discards every bundle on the next recreate, taking
         # the oracle critiques behind each alarm with it.
         default=None,
-        help="Parent directory for the batch-<ts>/ artifact subdir "
-        "(default: alongside the data dir, e.g. /var/lib/soc-ai/evals; ./evals "
-        "on a host install)",
+        help="The parent directory for the batch-<ts>/ artifacts. The default is next "
+        "to the data dir, for example /var/lib/soc-ai/evals. A host install uses ./evals",
     )
     p_en.add_argument(
         "--per-run-timeout-s",
@@ -2831,7 +2982,7 @@ def _register_doctor(sub: Any) -> None:
     p_doc.add_argument(
         "--json",
         action="store_true",
-        help="Emit the check results as JSON instead of the table (for automation)",
+        help="Print the check results as JSON for automation. The default is a table",
     )
     p_doc.add_argument(
         "--strict",
@@ -2882,9 +3033,10 @@ def _add_model_probe_parser(sub: Any) -> None:
         "model-probe",
         help="Probe a candidate analyst model against the real triage contract",
         description=(
-            "Run the synthesizer agent (same builders and prompt prod uses) N times "
-            "against a canned scenario and tally the outcomes into failure classes. "
-            "The first command to run when evaluating a new/lesser analyst backend."
+            "Run the synthesizer agent N times against a canned scenario. It uses the "
+            "builders and the prompt that production uses. It sorts the outcomes into "
+            "failure classes. Run it first when you evaluate a new or a weaker analyst "
+            "backend."
         ),
     )
     p_probe.add_argument(
@@ -2935,8 +3087,8 @@ def _add_api_client_args(p: argparse.ArgumentParser) -> None:
         "--cafile",
         default=None,
         metavar="PATH",
-        help="CA bundle used to verify the server's TLS certificate "
-        "(implies verification; takes precedence over --verify)",
+        help="The CA bundle that verifies the server TLS certificate. It turns on the "
+        "verification and takes precedence over --verify",
     )
 
 
@@ -2960,7 +3112,8 @@ def main() -> None:  # noqa: PLR0915 - linear subparser registration, one statem
 
     p_health = sub.add_parser(
         "healthz",
-        help="Print the soc-ai /healthz liveness JSON (probes nothing — see `doctor`)",
+        help="Print the soc-ai /healthz liveness JSON. It probes no dependency. Run "
+        "`doctor` for the dependency checks",
     )
     p_health.add_argument(
         "--url",
@@ -2977,7 +3130,8 @@ def main() -> None:  # noqa: PLR0915 - linear subparser registration, one statem
 
     p_val = sub.add_parser(
         "validate",
-        help="Eval an alert: run pipeline → sanitize → ask the oracle (Opus 1M) for critique",
+        help="Evaluate an alert. Run the pipeline, sanitize the result, then ask the "
+        "Oracle (Opus 1M) for a critique",
     )
     p_val.add_argument("alert_id", help="Elasticsearch _id of the alert to evaluate")
     p_val.add_argument(
@@ -2989,7 +3143,8 @@ def main() -> None:  # noqa: PLR0915 - linear subparser registration, one statem
 
     p_vb = sub.add_parser(
         "validate-batch",
-        help="Eval a batch of alerts via OQL; write evals/batch-<ts>/{bundles,index.jsonl}",
+        help="Evaluate a batch of alerts that an OQL query selects. Write "
+        "evals/batch-<ts>/{bundles,index.jsonl}",
     )
     p_vb.add_argument(
         "--oql",
@@ -3069,21 +3224,23 @@ def main() -> None:  # noqa: PLR0915 - linear subparser registration, one statem
         type=_positive_int,
         default=1,
         help=(
-            "Plant + run each --synth-set scenario this many times (default: 1). "
-            "Each repeat is an isolated plant with its own scope key, so repeats "
-            "never see each other's documents; the report then adds per-scenario "
-            "pass-rate/stability and a batch flip-rate, so scenario-level variance "
-            "is measured instead of masquerading as signal. Real-alert sampling "
-            "(--n) is unaffected; without --synth-set this flag is a no-op."
+            "Plant and run each --synth-set scenario this many times. The default "
+            "is 1. Each repeat is an isolated plant with its own scope key, so a "
+            "repeat never sees the documents of another. The report then adds the "
+            "pass rate and the stability per scenario and a flip rate per batch. "
+            "These measure the variance of each scenario, so the variance cannot "
+            "read as signal. The real-alert sampling of --n does not change. "
+            "Without --synth-set this flag does nothing."
         ),
     )
     p_vb.add_argument(
         "--local",
         action="store_true",
         help=(
-            "Skip the oracle grade (zero cloud egress). The investigation runs and "
-            "the bundle is saved; agreement_rate stays empty. The synth stratum "
-            "still scores, because it grades a verdict against the planted truth."
+            "Skip the Oracle grade. This sends nothing to the cloud. The "
+            "investigation runs and soc-ai saves the bundle. agreement_rate stays "
+            "empty. The synth stratum still scores, because it grades a verdict "
+            "against the planted truth."
         ),
     )
     p_vb.set_defaults(func=_validate_batch)
@@ -3095,6 +3252,14 @@ def main() -> None:  # noqa: PLR0915 - linear subparser registration, one statem
     _register_spec_replay(sub)
     _register_leads(sub)
     _register_usage(sub)
+    _register_users(sub)
+
+    # `soc-ai grid-gaps add|list`: record a gap soc-ai did not see.
+    from soc_ai.cli_grid_gaps import (  # noqa: PLC0415
+        register_subparser as _register_grid_gaps,
+    )
+
+    _register_grid_gaps(sub)
 
     p_er = sub.add_parser(
         "eval-report",
@@ -3104,7 +3269,7 @@ def main() -> None:  # noqa: PLR0915 - linear subparser registration, one statem
     p_er.add_argument(
         "--no-meta",
         action="store_true",
-        help="Skip oracle meta-analysis (just (re)build aggregates.json + report.md)",
+        help="Skip the Oracle meta-analysis. Only rebuild aggregates.json and report.md",
     )
     p_er.add_argument(
         "--rerun-meta",

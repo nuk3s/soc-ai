@@ -22,6 +22,11 @@ vi.mock('../lib/api', async (importOriginal) => ({
   getAnalyticHits: vi.fn(),
 }));
 
+// The dependency block and the job list have their own suites. Here they would
+// add list items and reads that are not this suite's business.
+vi.mock('../components/StatusDependenciesPanel', () => ({ StatusDependenciesPanel: () => null }));
+vi.mock('../components/StatusJobsPanel', () => ({ StatusJobsPanel: () => null }));
+
 import {
   getAnalytic,
   getAnalyticHits,
@@ -348,7 +353,7 @@ describe('Operate hunt-catalog panel', () => {
     const marker = within(rows[4]).getByText(/5240 undecided/);
     expect(marker).toHaveStyle({ color: '#f5a623' });
     const title = marker.closest('[title]')?.getAttribute('title') ?? '';
-    expect(title).toMatch(/neither matched nor ruled out/i);
+    expect(title).toMatch(/did not match them and did not rule them out/i);
     expect(title).toMatch(/not a clean result/i);
     // The negative control: four rows that discarded nothing, one of them
     // blind and one errored, wear no marker.
@@ -370,7 +375,7 @@ describe('Operate hunt-catalog panel', () => {
     const marker = within(rows[5]).getByText(/12 unattributed/);
     expect(marker).toHaveStyle({ color: '#f5a623' });
     const title = marker.closest('[title]')?.getAttribute('title') ?? '';
-    expect(title).toMatch(/could not group into any scope/i);
+    expect(title).toMatch(/could not group into a scope/i);
     expect(title).toMatch(/reached no hunt/i);
     // Every other row, including the two unclean for different reasons.
     for (const row of [...rows.slice(0, 5), ...rows.slice(6)]) {
@@ -390,8 +395,8 @@ describe('Operate hunt-catalog panel', () => {
     const marker = within(rows[6]).getByText(/460 truncated/);
     expect(marker).toHaveStyle({ color: '#f5a623' });
     const title = marker.closest('[title]')?.getAttribute('title') ?? '';
-    expect(title).toMatch(/bucket ceiling/i);
-    expect(title).toMatch(/a floor and not a total/i);
+    expect(title).toMatch(/limit of scope buckets/i);
+    expect(title).toMatch(/counts on this row are minimums/i);
     for (const row of rows.slice(0, 6)) {
       expect(within(row).queryByText(/truncated/i)).toBeNull();
     }
@@ -419,11 +424,14 @@ describe('Operate hunt-catalog panel', () => {
   // The row read "live · fired 0 · last fired never" over a run that could not
   // reach its data source (dogfood 2026-10-06). It says when the last run
   // failed, and the swept and fired times that say nothing true go.
-  it('says when the last run failed, with the error text in its tooltip, on that row only', async () => {
+  it('says when the last run failed, with a reason in its tooltip, on that row only', async () => {
     mount();
     await screen.findByText(SPECS[2].title);
     const rows = screen.getAllByRole('listitem');
-    const err = within(rows[2]).getByTitle('ConnectionError: grid down');
+    // An older backend sends the raw error only. The tooltip names no
+    // exception class (dogfood 2026-10-19 H1-D21).
+    const err = within(rows[2]).getByTestId('last-run-failed');
+    expect(err.getAttribute('title')).toBe('The application log holds the reason.');
     expect(err).toHaveTextContent('last run failed 1h ago');
     expect(within(rows[2]).queryByText(/last fired/i)).toBeNull();
     expect(within(rows[2]).queryByText(/last swept/i)).toBeNull();
@@ -837,9 +845,12 @@ describe('Operate analytics vocabulary', () => {
     vi.mocked(getHuntCatalog).mockReset().mockResolvedValue({ ...ON, specs: [...SPECS, PRIOR] });
     mount();
     const legend = await screen.findByTestId('profile-legend');
+    // Learning and unscored had one definition (dogfood 2026-10-19 R5-D26).
     expect(legend.textContent).toContain(
-      'unscored: the host has under 7 days of history, or no telemetry the analytic can read.',
+      'unscored: the sweep read hosts for the analytic and scored none of them.',
     );
+    expect(legend.textContent).toContain('learning: the host has under 7 days of history.');
+    expect(legend.textContent).toContain('measured no host: the sweep read no host for the analytic.');
     expect(legend.textContent).toContain(
       'n/a: the host’s role is outside the analytic’s scope.',
     );

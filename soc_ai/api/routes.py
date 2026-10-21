@@ -39,6 +39,7 @@ from soc_ai.demo.guard import is_demo
 from soc_ai.demo.replay import find_replay, replay_recorded_run
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.store import investigations as inv_svc
+from soc_ai.webui import anchor_check
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -204,9 +205,14 @@ async def investigate_endpoint(
     # the anchor document itself: once any hunt-kind investigation anchors this
     # id, every later run over it keeps SO writes off. Ordinary alerts keep the
     # default (True) — a plain re-investigation still auto-acks as configured.
+    # An anchor that the alert feed holds is a real alert and keeps the
+    # default too. A grid that does not answer keeps writes off.
     async with request.app.state.db_sessionmaker() as db:
         anchors_a_hunt = bool(await inv_svc.hunt_anchor_ids(db, [req.alert_id]))
-    allow_so_writes = not anchors_a_hunt
+    allow_so_writes = not anchors_a_hunt or (
+        (await anchor_check.alert_status(request.app.state, [req.alert_id])).get(req.alert_id)
+        == anchor_check.ALERT
+    )
 
     # Resolve the rule name up front so the investigation row is named at creation
     # — a run that dies before its first alert_context event (e.g. an ES prefetch

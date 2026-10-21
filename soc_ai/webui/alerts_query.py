@@ -10,8 +10,8 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 from collections.abc import Mapping
-from dataclasses import dataclass
-from datetime import datetime, timedelta
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from soc_ai.config import Settings
@@ -62,6 +62,10 @@ GROUP_SORTS = ("count", "latest")
 # rendered as a total. See :class:`GroupPage`.
 MAX_GROUPS = 200
 EVENTS_PER_GROUP = 50
+# The escalated alert ids a group row carries, to name the cases they are on.
+# The escalate route names at most ten existing cases, so the row reads as
+# many alerts.
+ESCALATED_IDS_PER_GROUP = 10
 MAX_EVENTS = 200
 
 # Broaden the triage feed beyond Suricata to SO's other detection
@@ -215,6 +219,10 @@ class AlertGroup:
     # How many distinct source addresses the group holds. An approximate
     # count from the grid, exact for small groups. None when the grid sent none.
     source_count: int | None = None
+    # The ids of the newest escalated alerts of the group, at most
+    # :data:`ESCALATED_IDS_PER_GROUP`. Read only when the caller asks. The row
+    # names the case of each from them (dogfood 2026-10-19, R2-I2).
+    escalated_ids: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -333,6 +341,55 @@ def _parse_abs_ts(value: str, *, bound: str) -> datetime:
         ) from exc
 
 
+def _utc_text(value: datetime) -> str:
+    """An aware time as the ISO text the grid reads: UTC, with a ``Z``."""
+    return value.astimezone(UTC).replace(tzinfo=None).isoformat() + "Z"
+
+
+def feed_sources(settings: Settings) -> list[str]:
+    """The OQL sources of the alert feed: what makes a document an alert.
+
+    The configured alert filter, and Sigma and the Zeek ATTACK notices when
+    the feed reads them. The Alerts page reads these sources in two
+    aggregations, and every surface that asks "is this an alert" reads them
+    here.
+    """
+    sources = [settings.webui_alerts_query]
+    if settings.webui_extra_detections:
+        sources += [SIGMA_SOURCE_OQL, NOTICE_SOURCE_OQL]
+    return sources
+
+
+def _sources_must(sources: list[str]) -> list[dict[str, Any]]:
+    """The ``must`` clause of a source list: one source, or any of several.
+
+    A blank source and ``*`` match every document, so they add no clause.
+    """
+    source_dsls = [_oql_filter_dsl(s) for s in sources if s.strip() and s.strip() != "*"]
+    if len(source_dsls) == 1:
+        return [source_dsls[0]]
+    if source_dsls:
+        return [{"bool": {"should": source_dsls, "minimum_should_match": 1}}]
+    return []
+
+
+def feed_ids_query(settings: Settings, ids: list[str]) -> dict[str, Any]:
+    """The alert feed over a set of document ids, with no time window.
+
+    The question is whether a document is an alert, and the age of the
+    document does not change the answer. The query keeps the synthetic
+    document exclusion of :func:`build_filter`, so a planted document is no
+    alert here either.
+    """
+    return {
+        "bool": {
+            "must": _sources_must(feed_sources(settings)) or [{"match_all": {}}],
+            "filter": [{"ids": {"values": list(ids)}}],
+            "must_not": list(synth_scope_must_not(False)),
+        }
+    }
+
+
 def build_filter(
     settings: Settings,
     *,
@@ -356,13 +413,8 @@ def build_filter(
     @timestamp range (interpreted in ``time_zone``); otherwise the ``time_range``
     preset is used.
     """
-    must: list[dict[str, Any]] = []
     sources = dataset_oqls if dataset_oqls is not None else [settings.webui_alerts_query]
-    source_dsls = [_oql_filter_dsl(s) for s in sources if s.strip() and s.strip() != "*"]
-    if len(source_dsls) == 1:
-        must.append(source_dsls[0])
-    elif source_dsls:
-        must.append({"bool": {"should": source_dsls, "minimum_should_match": 1}})
+    must: list[dict[str, Any]] = _sources_must(sources)
     if oql and oql.strip():
         # Deliberate over-block: rejects "|" even inside quoted values; pipe stages are
         # meaningless here and quoted-pipe rule names are rare. Revisit if it bites.
@@ -374,16 +426,29 @@ def build_filter(
     if abs_from and abs_to:
         lo = _parse_abs_ts(abs_from, bound="from")
         hi = _parse_abs_ts(abs_to, bound="to")
-        gte, lte = abs_from, abs_to
-        # Clamp an oversized span, comparing tz-naive so a mixed-awareness pair
-        # (one bound with an offset, one without) can't raise — the guard is a
-        # coarse cost ceiling, not a tz-exact computation. Only the lower bound
-        # is pulled up; the upper (the analyst's anchor) is preserved.
-        if hi.replace(tzinfo=None) - lo.replace(tzinfo=None) > _MAX_ABS_WINDOW:
-            gte = (hi - _MAX_ABS_WINDOW).isoformat()
-        ts_range: dict[str, Any] = {"gte": gte, "lte": lte}
-        if time_zone:
-            ts_range["time_zone"] = time_zone
+        if lo.tzinfo is not None and hi.tzinfo is not None:
+            # Both bounds name an instant. The grid gets them in UTC and no
+            # zone, so ``time_zone`` cannot move them. The console read the
+            # alert window in ``so_timezone`` and the investigation window in
+            # the browser zone, and the two tiles counted different hours
+            # (dogfood 2026-10-19, R1-D8).
+            lo_utc, hi_utc = lo.astimezone(UTC), hi.astimezone(UTC)
+            if hi_utc - lo_utc > _MAX_ABS_WINDOW:
+                lo_utc = hi_utc - _MAX_ABS_WINDOW
+            ts_range: dict[str, Any] = {"gte": _utc_text(lo_utc), "lte": _utc_text(hi_utc)}
+        else:
+            # A naive bound is a wall time in ``time_zone``: the form an older
+            # console sends. Kept as it was.
+            gte, lte = abs_from, abs_to
+            # Clamp an oversized span, comparing tz-naive so a mixed-awareness pair
+            # (one bound with an offset, one without) can't raise — the guard is a
+            # coarse cost ceiling, not a tz-exact computation. Only the lower bound
+            # is pulled up; the upper (the analyst's anchor) is preserved.
+            if hi.replace(tzinfo=None) - lo.replace(tzinfo=None) > _MAX_ABS_WINDOW:
+                gte = (hi - _MAX_ABS_WINDOW).isoformat()
+            ts_range = {"gte": gte, "lte": lte}
+            if time_zone:
+                ts_range["time_zone"] = time_zone
     else:
         ts_range = {"gte": TIME_RANGES.get(time_range, TIME_RANGES[DEFAULT_RANGE])}
     bool_query: dict[str, Any] = {
@@ -553,8 +618,12 @@ def _other_docs(terms_agg: dict[str, Any]) -> int:
     return int(terms_agg.get("sum_other_doc_count") or 0)
 
 
-def _bucket_aggs() -> dict[str, Any]:
+def _bucket_aggs(*, escalated_ids: bool = False) -> dict[str, Any]:
     """Per-group sub-aggregations: the latest event, and the handled counts.
+
+    ``escalated_ids`` adds the ids of the newest escalated alerts under the
+    escalated count, so the row can name the case each one is on. Off by
+    default: only the Alerts page shows a case.
 
     ``datasets`` is not displayed anywhere. It exists so the two filter
     aggregations below can be read honestly: they can only speak for documents
@@ -564,6 +633,17 @@ def _bucket_aggs() -> dict[str, Any]:
     here, and it is the only way to tell a group that nobody has touched from a
     group nobody can ask about.
     """
+    escalated: dict[str, Any] = {"filter": {"term": {"event.escalated": True}}}
+    if escalated_ids:
+        escalated["aggs"] = {
+            "ids": {
+                "top_hits": {
+                    "size": ESCALATED_IDS_PER_GROUP,
+                    "_source": False,
+                    "sort": [{"@timestamp": {"order": "desc"}}],
+                }
+            }
+        }
     return {
         "latest_ts": {"max": {"field": "@timestamp"}},
         "latest": {
@@ -597,7 +677,7 @@ def _bucket_aggs() -> dict[str, Any]:
             }
         },
         "acked": {"filter": {"term": {"event.acknowledged": True}}},
-        "escalated": {"filter": {"term": {"event.escalated": True}}},
+        "escalated": escalated,
     }
 
 
@@ -624,7 +704,11 @@ def _handled_counts_answerable(bucket: dict[str, Any]) -> bool:
 
 
 def _group_aggs(
-    sort: str, field: str = "rule.name", *, include_unnamed: bool = False
+    sort: str,
+    field: str = "rule.name",
+    *,
+    include_unnamed: bool = False,
+    escalated_ids: bool = False,
 ) -> dict[str, Any]:
     """Terms buckets over ``field``, optionally plus the documents that lack it.
 
@@ -651,7 +735,7 @@ def _group_aggs(
     aggs: dict[str, Any] = {
         "rules": {
             "terms": {"field": field, "size": MAX_GROUPS, "order": order},
-            "aggs": _bucket_aggs(),
+            "aggs": _bucket_aggs(escalated_ids=escalated_ids),
         }
     }
     if include_unnamed:
@@ -665,7 +749,7 @@ def _group_aggs(
                         "order": order,
                         "missing": UNKNOWN_DATASET,
                     },
-                    "aggs": _bucket_aggs(),
+                    "aggs": _bucket_aggs(escalated_ids=escalated_ids),
                 }
             },
         }
@@ -728,7 +812,18 @@ def _group_from_bucket(bucket: dict[str, Any], *, kind: str | None = None) -> Al
         dst_ip=_first_ip(_ev(src, env, "destination.ip")),
         host=_group_host(src, env),
         source_count=_source_count(bucket),
+        escalated_ids=_escalated_ids(bucket),
     )
+
+
+def _escalated_ids(bucket: dict[str, Any]) -> list[str]:
+    """The escalated alert ids under a bucket, or none when the read asked for none."""
+    node: Any = bucket.get("escalated")
+    for key in ("ids", "hits", "hits"):
+        node = node.get(key) if isinstance(node, dict) else None
+    if not isinstance(node, list):
+        return []
+    return [str(h["_id"]) for h in node if isinstance(h, dict) and h.get("_id")]
 
 
 def _group_host(source: dict[str, Any], env: Mapping[str, Any]) -> str | None:
@@ -760,8 +855,12 @@ async def fetch_groups(
     abs_to: str | None = None,
     time_zone: str | None = None,
     hide_acked: bool = False,
+    escalated_ids: bool = False,
 ) -> GroupPage:
     """Grouped view. Returns the rows, the matched total, and what was cut.
+
+    ``escalated_ids`` asks each row for the ids of its newest escalated
+    alerts, for the case links of the Alerts page.
 
     Suricata + Sigma group by ``rule.name`` (one aggregation); Zeek ATTACK
     notices group by ``notice.note`` (a second aggregation) since they carry no
@@ -796,7 +895,7 @@ async def fetch_groups(
         idx,
         qa,
         size=0,
-        aggs=_group_aggs(sort, include_unnamed=True),
+        aggs=_group_aggs(sort, include_unnamed=True, escalated_ids=escalated_ids),
         track_total_hits=True,
     )
     a_aggs = ra.aggregations or {}
@@ -834,7 +933,7 @@ async def fetch_groups(
             idx,
             qb,
             size=0,
-            aggs=_group_aggs(sort, field="notice.note"),
+            aggs=_group_aggs(sort, field="notice.note", escalated_ids=escalated_ids),
             track_total_hits=True,
         )
         b_rules = (rb.aggregations or {}).get("rules") or {}

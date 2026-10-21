@@ -52,7 +52,7 @@ describe('Notifications: Dismiss all', () => {
     renderNotifications();
     await screen.findByText('Investigation A running');
     fireEvent.click(await trigger());
-    expect(screen.getByRole('group', { name: 'Confirm dismiss all' }).textContent).toContain('Hide 2 events?');
+    expect(screen.getByRole('group', { name: 'Confirm dismiss all' }).textContent).toContain('Hide 2 notifications?');
     expect(localStorage.getItem('soc-ai:dismissed-notifications')).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
     expect(screen.getByText('Investigation A running')).toBeTruthy();

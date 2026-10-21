@@ -13,6 +13,8 @@ const state = vi.hoisted(() => ({ current: null as BacktestData | null }));
 vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
   getBacktest: vi.fn(async () => state.current),
+  getBacktestRuns: vi.fn(async () => ({ runs: [] })),
+  getHealth: vi.fn(async () => null),
   startBacktest: vi.fn(),
 }));
 
@@ -106,14 +108,14 @@ describe('Backtest result claims', () => {
     expect(await screen.findByText(/none missed/)).toBeTruthy();
     expect(screen.queryByText('Not measurable')).toBeNull();
     expect(
-      screen.getByText('soc-ai called none of the 2 escalated incidents a false positive.'),
+      screen.getByText('soc-ai called none of the 2 escalated alerts a false positive.'),
     ).toBeTruthy();
   });
 
   it('reads correctly for one escalated incident', async () => {
     await mount(scored(1, 2));
     expect(
-      await screen.findByText('soc-ai did not call the one escalated incident a false positive.'),
+      await screen.findByText('soc-ai did not call the one escalated alert a false positive.'),
     ).toBeTruthy();
   });
 
@@ -122,7 +124,7 @@ describe('Backtest result claims', () => {
     // 07:00:00" with no zone.
     await mount(scored(1, 2));
     const ran = await screen.findByTestId('backtest-ran-at');
-    expect(ran.textContent).toMatch(/^Ran \d+d ago, at 2026-08-0[78] \d{2}:\d{2} \S+$/);
+    expect(ran.textContent).toMatch(/^Ran \d+(?:d|mo|y) ago, at 2026-08-0[78] \d{2}:\d{2} \S+$/);
     expect(ran.textContent).not.toMatch(/Aug/);
   });
 

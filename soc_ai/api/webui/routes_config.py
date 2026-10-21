@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -56,6 +57,15 @@ class SettingOut(BaseModel):
     bounds: str | None = None
     options: list[str] | None = None
     day1: bool = False
+    # The origin under a DB override, and its value. "env" is a value the
+    # process read from the environment or .env; "default" is the code default.
+    # The badge read ENV for both (dogfood 2026-10-19, R5-D7).
+    base_source: str | None = None
+    base_value: bool | float | str | None = None
+    # The code default of the setting.
+    default: bool | float | str | None = None
+    # A restart setting whose saved value is not the running value yet.
+    pending_restart: bool = False
 
 
 class SettingGroupOut(BaseModel):
@@ -90,6 +100,14 @@ class DangerSettingOut(BaseModel):
     isSet: bool  # whether a non-empty value is configured
     source: str  # "env" | "db" | "unset"
     hot: bool  # True = hot-apply, False = restart-required
+    # The current value of a non-secret connection setting. A secret never has
+    # one. The rows showed only "env" and an empty Edit field, so the operator
+    # had to remember the old value (dogfood 2026-10-19, H1-D15).
+    value: str | None = None
+    # soc-ai cannot run without it. An unset optional secret is no fault.
+    required: bool = False
+    # The saved value waits for a restart.
+    pending_restart: bool = False
 
 
 class SaveDangerIn(BaseModel):
@@ -144,6 +162,49 @@ def _override_display(spec: cfg_svc.SettingSpec, raw: Any) -> bool | float | str
     return "" if raw is None else str(raw)
 
 
+def _code_default(spec: cfg_svc.SettingSpec) -> bool | float | str | None:
+    """The code default of a setting, formatted like a live value."""
+    field = Settings.model_fields.get(spec.attr)
+    if field is None:
+        return None
+    try:
+        raw = field.get_default(call_default_factory=True)
+    except Exception:  # a default factory that needs context: show none
+        return None
+    if spec.type == "csv":
+        return ", ".join(str(x) for x in (raw or []))
+    if spec.type == "bool":
+        return bool(raw)
+    if spec.type in ("int", "float"):
+        return raw if isinstance(raw, (int, float)) and not isinstance(raw, bool) else None
+    return "" if raw is None else str(raw)
+
+
+def _baseline(request: Request, settings: Settings) -> Settings:
+    """The settings before any console override; the live object when unknown."""
+    base = getattr(request.app.state, "settings_baseline", None)
+    return base if isinstance(base, Settings) else settings
+
+
+def _base_source(spec: cfg_svc.SettingSpec, baseline: Settings) -> str:
+    """'env' for a value the process read from the environment, else 'default'."""
+    return "env" if spec.attr in baseline.model_fields_set else "default"
+
+
+def _pending_restart(
+    spec: cfg_svc.SettingSpec, overrides: dict[str, Any], settings: Settings, baseline: Settings
+) -> bool:
+    """A restart setting whose intended value differs from the running one."""
+    if spec.hot:
+        return False
+    intended = (
+        _override_display(spec, overrides[spec.key])
+        if spec.key in overrides
+        else _setting_value(spec, baseline)
+    )
+    return intended != _setting_value(spec, settings)
+
+
 def _bounds(spec: cfg_svc.SettingSpec) -> str | None:
     lo, hi = spec.min_value, spec.max_value
     if lo is None and hi is None:
@@ -170,6 +231,7 @@ async def get_config(
             .all()
         )
 
+    baseline = _baseline(request, settings)
     groups: list[SettingGroupOut] = []
     for section in cfg_svc.SECTION_ORDER:
         items = [
@@ -177,7 +239,11 @@ async def get_config(
                 key=spec.key,
                 label=spec.label,
                 help=spec.help,
-                source="db" if spec.key in overrides else "env",
+                source="db" if spec.key in overrides else _base_source(spec, baseline),
+                base_source=_base_source(spec, baseline),
+                base_value=_setting_value(spec, baseline),
+                default=_code_default(spec),
+                pending_restart=_pending_restart(spec, overrides, settings, baseline),
                 apply="hot-apply" if spec.hot else "restart",
                 type=_SETTING_TYPE.get(spec.type, "text"),
                 # Fixed-choice settings: the frontend's select branch keys on
@@ -313,6 +379,20 @@ _FITNESS_ALARM_CONSECUTIVE = 2
 # the fetch (see _recent_fitness_checks). Covers an operator A/B-ing two models
 # without a second round trip.
 _HISTORY_OVERFETCH = 4
+# The grades a measurement can give. An audit record outside this set is a
+# check that measured nothing.
+_GRADED = frozenset({"pass", "degraded", "fail"})
+
+
+def _unmeasured_note(model: str, legs: list[dict[str, Any]]) -> str:
+    """One sentence for a check that could not reach the model, with its cause."""
+    causes: list[str] = []
+    for leg in legs:
+        text = str(leg.get("detail") or "").strip()
+        if text and text not in causes:
+            causes.append(text)
+    cause = " ".join(causes) or "The call to the model did not finish."
+    return f"soc-ai could not measure {model or 'the model'}. {cause} The check measured nothing."
 
 
 def _fitness_history_summary(window: list[dict[str, str]]) -> dict[str, Any]:
@@ -384,6 +464,11 @@ async def _recent_fitness_checks(
         if not isinstance(payload, dict) or str(payload.get("model", "")) != model:
             continue  # another model's checks must not colour this one's history
         grade = str(payload.get("grade", ""))
+        # A check that could not reach the model is no verdict. Older records
+        # wrote it as "fail", and it fed the two-in-a-row alarm (dogfood
+        # 2026-10-19, H1-D6). Newer records write "unmeasured".
+        if grade not in _GRADED or probes.unmeasured_failed_legs(payload) is not None:
+            continue
         at = str(src.get("timestamp", ""))
         if grade and at:
             checks.append({"grade": grade, "at": at})
@@ -449,6 +534,42 @@ async def _fitness_out(
     )
 
 
+async def _unmeasured_fitness_out(
+    request: Request, settings: Settings, model_id: str, unmeasured: list[dict[str, Any]]
+) -> ModelFitnessOut:
+    """The answer for a forced check that could not reach the model.
+
+    The cache keeps the last real verdict, and the chip shows it as the old
+    one. With no real verdict cached, the grade is "unknown". Never an alarm.
+    """
+    from soc_ai.store import model_battery as mb_svc  # noqa: PLC0415
+
+    note = _unmeasured_note(model_id, unmeasured)
+    async with request.app.state.db_sessionmaker() as db:
+        previous = await mb_svc.get_fitness(db, model=model_id)
+    if previous is not None and probes.unmeasured_failed_legs(previous["result"]) is None:
+        out = await _fitness_out(
+            request,
+            settings,
+            result=previous["result"],
+            model_id=model_id,
+            cached=True,
+            checked_at=previous["checked_at"],
+            measured=False,
+            note=note,
+        )
+    else:
+        out = await _fitness_out(
+            request,
+            settings,
+            result={"grade": "unknown", "model": model_id, "legs": [], "detail": note},
+            model_id=model_id,
+            measured=False,
+            note=note,
+        )
+    return out.model_copy(update={"alarm": False})
+
+
 @router.get(
     "/config/model-fitness",
     response_model=ModelFitnessOut,
@@ -494,6 +615,24 @@ async def api_model_fitness(
         # gateway probe (dogfood 2026-08-05: "Checking fitness…" every visit).
         async with request.app.state.db_sessionmaker() as db:
             cached = await mb_svc.get_fitness(db, model=model_id)
+        cached_unmeasured = (
+            probes.unmeasured_failed_legs(cached["result"]) if cached is not None else None
+        )
+        if cached is not None and cached_unmeasured is not None:
+            # A fail cached before the console read transport failures right:
+            # it measured nothing, so it shows as no verdict (R5-D29).
+            note = (
+                _unmeasured_note(model_id, cached_unmeasured)
+                + " Select Check fitness to measure again."
+            )
+            return await _fitness_out(
+                request,
+                settings,
+                result={"grade": "unknown", "model": model_id, "legs": [], "detail": note},
+                model_id=model_id,
+                measured=False,
+                note=note,
+            )
         if cached is not None:
             try:
                 checked = datetime.fromisoformat(cached["checked_at"])
@@ -531,17 +670,25 @@ async def api_model_fitness(
 
     result = await probes.probe_model_fitness(settings)
     checked_at_now = datetime.now(UTC).replace(tzinfo=None).isoformat()
-    try:
-        async with request.app.state.db_sessionmaker() as db:
-            await mb_svc.upsert_fitness(db, model=model_id, result=result)
-    except Exception:  # cache write is best-effort — never fail the diagnostic
-        _LOGGER.warning("model_fitness cache write failed (continuing)", exc_info=True)
+    # A probe whose every failed leg could not reach the model measured
+    # nothing. The doctor reads that as "could not measure"; the console read
+    # it as UNFIT with the alarm raised (dogfood 2026-10-19, H1-D6, R5-D29).
+    unmeasured = probes.unmeasured_failed_legs(result)
+    if unmeasured is None:
+        try:
+            async with request.app.state.db_sessionmaker() as db:
+                await mb_svc.upsert_fitness(db, model=model_id, result=result)
+        except Exception:  # cache write is best-effort — never fail the diagnostic
+            _LOGGER.warning("model_fitness cache write failed (continuing)", exc_info=True)
 
-    # Compose (and read the history) BEFORE the audit write: this run's own
-    # record must not land in its own n-of-m window.
-    out = await _fitness_out(
-        request, settings, result=result, model_id=model_id, checked_at=checked_at_now
-    )
+    if unmeasured is not None:
+        out = await _unmeasured_fitness_out(request, settings, model_id, unmeasured)
+    else:
+        # Compose (and read the history) BEFORE the audit write: this run's own
+        # record must not land in its own n-of-m window.
+        out = await _fitness_out(
+            request, settings, result=result, model_id=model_id, checked_at=checked_at_now
+        )
 
     # Best-effort audit. request.app.state.audit is the shared AuditLogger; its
     # own log() swallows ES write errors for non-mutating events, but we still
@@ -556,7 +703,7 @@ async def api_model_fitness(
                 kind="model_fitness",
                 payload={
                     "model": result.get("model", ""),
-                    "grade": result.get("grade", ""),
+                    "grade": "unmeasured" if unmeasured is not None else result.get("grade", ""),
                     "detail": result.get("detail", ""),
                     "legs": result.get("legs", []),
                 },
@@ -610,6 +757,10 @@ class _AuditVerifyStatus:
 
     last_run: str | None = None
     alarm: dict[str, Any] | None = None
+    # What the last run found: "intact", "broken", or "not_checked" when it
+    # could not read the audit index. None before the first run. The Status
+    # page read a check that could not read the index as a clean one.
+    last_outcome: str | None = None
 
 
 def _get_audit_verify_status(state: Any) -> _AuditVerifyStatus:
@@ -882,15 +1033,20 @@ def _egress_destinations(settings: Settings) -> list[dict[str, Any]]:
     """
     # Analyst redaction posture: off = no redaction; on = best-effort, unless
     # fail-closed is also on (independent residue sweep, E5.1).
+    # Each posture names a setting by its console label and its section, so the
+    # console can link it (dogfood 2026-10-19, R5 STE items 34 and 35).
+    redact_label = cfg_svc.WHITELIST_BY_KEY["analyst_cloud_redaction"].label
     if not settings.analyst_cloud_redaction:
         analyst_redaction = (
-            "none. The model is pointed at your gateway. Enable "
-            "analyst_cloud_redaction if that gateway routes to a cloud model."
+            "none. The model gateway gets the real identifiers. If the gateway "
+            f'routes to a cloud model, turn on "{redact_label}" in Settings > Agent.'
         )
     elif settings.analyst_redaction_fail_closed:
-        analyst_redaction = "sanitized + fail-closed"
+        analyst_redaction = (
+            "pseudonymized. soc-ai blocks a payload that still holds an internal identifier."
+        )
     else:
-        analyst_redaction = "sanitized, best-effort"
+        analyst_redaction = "pseudonymized. An identifier that the redaction misses still goes out."
 
     # The MISP client exists iff misp_url is set — nothing else gates it, so the
     # URL alone is the enable state. A runtime override stores the raw string
@@ -906,7 +1062,10 @@ def _egress_destinations(settings: Settings) -> list[dict[str, Any]]:
             "id": "oracle",
             "label": "The Oracle",
             "enabled": bool(settings.oracle_enabled),
-            "redaction": "sanitized + fail-closed residue gate",
+            "redaction": (
+                "pseudonymized. A residue check blocks a payload that still holds an "
+                "internal identifier."
+            ),
             "detail": (
                 f"The Oracle model {settings.oracle_model} runs through the "
                 "gateway. soc-ai pseudonymizes internal identifiers before egress. "
@@ -939,7 +1098,7 @@ def _egress_destinations(settings: Settings) -> list[dict[str, Any]]:
         },
         {
             "id": "analyst_cloud",
-            "label": "Analyst model",
+            "label": "Investigation model",
             # The analyst model ALWAYS receives payloads — this "destination" is a
             # real egress iff the model is pointed off-box. We can't know the
             # gateway's downstream from here, so "enabled" tracks whether the
@@ -947,8 +1106,9 @@ def _egress_destinations(settings: Settings) -> list[dict[str, Any]]:
             "enabled": bool(settings.analyst_cloud_redaction),
             "redaction": analyst_redaction,
             "detail": (
-                f"The analyst model {settings.analyst_model} itself. This is a real "
-                "egress only if your gateway routes it to a cloud provider."
+                f"soc-ai sends every investigation to the model {settings.analyst_model}. "
+                "That is a real egress only if the gateway routes the model to a cloud "
+                "provider."
             ),
         },
         {
@@ -974,10 +1134,11 @@ def _egress_destinations(settings: Settings) -> list[dict[str, Any]]:
             or bool(settings.rag_rerank_model.strip()),
             "redaction": "none. soc-ai sends runbook text and agent search queries.",
             "detail": (
-                "Opt-in semantic tier for lookup_runbook. Runbooks and search queries "
-                "go to your gateway's embeddings and rerank models: "
-                f"{settings.rag_embed_model or 'unset'} and "
-                f"{settings.rag_rerank_model or 'unset'}. Off means local FTS5 only."
+                "The opt-in semantic tier of lookup_runbook. Runbooks and search queries "
+                "go to the embeddings model and the rerank model on the model gateway. "
+                f"The embeddings model is {settings.rag_embed_model or 'not set'}. "
+                f"The rerank model is {settings.rag_rerank_model or 'not set'}. With "
+                "both empty, runbook search stays local."
             ),
         },
         {
@@ -989,7 +1150,8 @@ def _egress_destinations(settings: Settings) -> list[dict[str, Any]]:
             # points off-box — most MISP instances are operator-run.
             "enabled": settings.misp_url is not None,
             "redaction": (
-                "external indicators only. The lookup skips internal IPs. Sends the MISP API key."
+                "external indicators only. The lookup skips internal IPs. It sends the "
+                "MISP API key."
             ),
             "detail": (
                 (
@@ -1009,12 +1171,13 @@ def _egress_destinations(settings: Settings) -> list[dict[str, Any]]:
             "label": "Release check (GitHub)",
             "enabled": bool(settings.update_check_enabled),
             "redaction": (
-                "none. Sends nothing about the deployment. Fetches the latest "
-                "release tag from api.github.com."
+                "none. soc-ai sends nothing about the deployment. It fetches the "
+                "latest release tag from api.github.com."
             ),
             "detail": (
-                "Opt-in version check behind the Update button. Fetches release "
-                "metadata from api.github.com. Nothing about this deployment leaves."
+                "An opt-in version check behind the Check for updates button in "
+                "Settings > About. soc-ai fetches the release metadata from "
+                "api.github.com. No data about this deployment leaves."
             ),
         },
     ]
@@ -1247,7 +1410,7 @@ async def set_setting(request: Request, body: SettingIn) -> dict[str, Any]:
         raise api_error(
             400,
             "danger_zone",
-            "This setting is in the Danger Zone. Use POST /api/v1/config/danger/setting.",
+            "This setting is in Settings > Connections. Use POST /api/v1/config/danger/setting.",
         )
     if spec.secret:
         # Secrets never go through the plaintext (secret_box=None) path — that
@@ -1291,9 +1454,67 @@ async def set_setting(request: Request, body: SettingIn) -> dict[str, Any]:
     return {"ok": True, "restart_required": not spec.hot}
 
 
+@router.delete("/config/setting/{key}", dependencies=[Depends(require_admin_api)])
+async def clear_setting(key: str, request: Request) -> dict[str, Any]:
+    """Remove the console override of one setting: "Use the default".
+
+    The setting returns to the value under the override: the .env value or the
+    code default. A hot setting takes it at once. A restart setting takes it at
+    the next start, and ``restart_required`` says if the running value differs.
+    The console had no way back to the .env value (dogfood 2026-10-19, R5-D8).
+    Danger Zone settings and secrets keep their own DELETE routes.
+    """
+    if not cfg_svc.is_editable(key):
+        raise api_error(
+            400,
+            "unknown_setting",
+            "soc-ai has no editable setting with this key. "
+            "Read GET /api/v1/config for the list of keys.",
+        )
+    spec = cfg_svc.WHITELIST_BY_KEY[key]
+    if spec.danger:
+        raise api_error(
+            400,
+            "danger_zone",
+            "This setting is in Settings > Connections. "
+            "Use DELETE /api/v1/config/danger/setting/<key>.",
+        )
+    if spec.secret:
+        raise api_error(
+            400,
+            "secret_setting",
+            "This setting is a secret. Use DELETE /api/v1/config/api-keys/<key>.",
+        )
+    settings: Settings = request.app.state.settings
+    baseline = _baseline(request, settings)
+    async with request.app.state.db_sessionmaker() as db:
+        held = key in await cfg_svc.load_overrides(db)
+        if held:
+            await cfg_svc.delete_override(db, key)
+    restart_required = False
+    if held and spec.hot:
+        value = getattr(baseline, spec.attr)
+        try:
+            # Proved on a copy first, the pattern every config write uses.
+            setattr(settings.model_copy(), spec.attr, value)
+            setattr(settings, spec.attr, value)
+        except (ValueError, TypeError, ValidationError):
+            _LOGGER.warning("could not restore %s live; the next start applies it", key)
+            restart_required = True
+    elif held:
+        restart_required = _setting_value(spec, settings) != _setting_value(spec, baseline)
+    if held:
+        user = await current_user(request)
+        _LOGGER.info(
+            "config override %s removed by %s", key, user.username if user else "anonymous"
+        )
+    return {"ok": True, "restart_required": restart_required, "removed": held}
+
+
 @router.get(
     "/config/danger",
     response_model=list[DangerSettingOut],
+    response_model_exclude_unset=True,
     dependencies=[Depends(require_admin_api)],
     tags=["config"],
 )
@@ -1301,7 +1522,11 @@ async def api_get_danger_settings(
     request: Request,
     settings: Settings = Depends(get_settings_dep),
 ) -> list[DangerSettingOut]:
-    """List all danger-zone settings. Secret values are NEVER returned — only isSet status."""
+    """List all danger-zone settings. Secret values are NEVER returned — only isSet status.
+
+    A non-secret row carries its current value: the saved override when one
+    exists, else the running value.
+    """
     # Fetch all DB override keys in one query to avoid N+1.
     async with request.app.state.db_sessionmaker() as db:
         db_row_keys: set[str] = set(
@@ -1315,6 +1540,9 @@ async def api_get_danger_settings(
                 )
             ).all()
         )
+        overrides = await cfg_svc.load_overrides(db) if db_row_keys else {}
+    baseline = _baseline(request, settings)
+    secret_box = getattr(request.app.state, "secret_box", None)
 
     rows: list[DangerSettingOut] = []
     for spec in cfg_svc.WHITELIST_BY_KEY.values():
@@ -1341,16 +1569,41 @@ async def api_get_danger_settings(
         else:
             field_type = "text"
 
-        rows.append(
-            DangerSettingOut(
-                key=spec.key,
-                label=spec.label,
-                type=field_type,
-                isSet=is_set,
-                source=source,
-                hot=spec.hot,
+        value: str | None = None
+        pending = False
+        if not spec.secret:
+            shown = (
+                _override_display(spec, overrides[spec.key])
+                if spec.key in overrides
+                else _setting_value(spec, settings)
             )
+            value = str(shown).lower() if isinstance(shown, bool) else str(shown)
+            pending = _pending_restart(spec, overrides, settings, baseline)
+        elif spec.key in overrides and not spec.hot and secret_box is not None:
+            # Compared on the server only. The plaintext never leaves it.
+            try:
+                intended = str(secret_box.decrypt(str(overrides[spec.key])))
+                live = getattr(settings, spec.attr, None)
+                live_plain = live.get_secret_value() if live is not None else ""
+                pending = intended != live_plain
+            except Exception:
+                pending = False
+
+        row = DangerSettingOut(
+            key=spec.key,
+            label=spec.label,
+            type=field_type,
+            isSet=is_set,
+            source=source,
+            hot=spec.hot,
+            required=spec.key in _DANGER_REQUIRED_KEYS,
+            pending_restart=pending,
         )
+        if not spec.secret:
+            # Set only on a non-secret row. The route excludes unset fields, so
+            # a secret row has no value key at all, not even a null.
+            row.value = value
+        rows.append(row)
     return rows
 
 
@@ -1376,7 +1629,7 @@ async def api_save_danger_setting(
     if body.confirm.strip() != body.key:
         raise HTTPException(
             status_code=400,
-            detail={"reason": "confirm_mismatch", "hint": "confirm must equal the setting key"},
+            detail={"reason": "confirm_mismatch", "hint": "Type the setting key in confirm."},
         )
 
     # 2. Validate key is a known danger spec
@@ -1384,7 +1637,10 @@ async def api_save_danger_setting(
     if spec is None or not spec.danger:
         raise HTTPException(
             status_code=400,
-            detail={"reason": "unknown_danger_key", "hint": "key is not a known danger setting"},
+            detail={
+                "reason": "unknown_danger_key",
+                "hint": "The key is not a known setting of Settings > Connections.",
+            },
         )
 
     # 3. Coerce the string value to the spec's declared type
@@ -1491,7 +1747,10 @@ async def api_clear_danger_setting(key: str, request: Request) -> dict[str, obje
     if spec is None or not spec.danger:
         raise HTTPException(
             status_code=400,
-            detail={"reason": "unknown_danger_key", "hint": "key is not a known danger setting"},
+            detail={
+                "reason": "unknown_danger_key",
+                "hint": "The key is not a known setting of Settings > Connections.",
+            },
         )
     async with request.app.state.db_sessionmaker() as db:
         held = key in await cfg_svc.load_overrides(db)
@@ -1515,6 +1774,17 @@ class ApiKeyOut(BaseModel):
     help: str
     isSet: bool
     source: str  # "db" | "env" | "unset"
+    # Whether a save can store a key: the server holds CONFIG_SECRET_KEY. The
+    # panel offered Set and a Save that answered 400 (dogfood round 2, V2-4).
+    can_store: bool = True
+    store_hint: str | None = None
+
+
+# Why a save cannot store an API key, for the panel and the 400.
+_API_KEY_STORE_HINT = (
+    "Set CONFIG_SECRET_KEY on the server and restart soc-ai. "
+    "soc-ai then stores the API keys encrypted."
+)
 
 
 class SaveApiKeyIn(BaseModel):
@@ -1542,6 +1812,7 @@ async def api_get_api_keys(
                 )
             ).all()
         )
+    can_store = getattr(request.app.state, "secret_box", None) is not None
     out: list[ApiKeyOut] = []
     for spec in specs:
         if spec.key in db_keys:
@@ -1551,7 +1822,15 @@ async def api_get_api_keys(
             is_set = _secret_is_set(attr_val)
             source = "env" if is_set else "unset"
         out.append(
-            ApiKeyOut(key=spec.key, label=spec.label, help=spec.help, isSet=is_set, source=source)
+            ApiKeyOut(
+                key=spec.key,
+                label=spec.label,
+                help=spec.help,
+                isSet=is_set,
+                source=source,
+                can_store=can_store,
+                store_hint=None if can_store else _API_KEY_STORE_HINT,
+            )
         )
     return out
 
@@ -1571,13 +1850,16 @@ async def api_save_api_key(
     if spec is None or not spec.secret or spec.danger:
         raise HTTPException(
             status_code=400,
-            detail={"reason": "unknown_api_key", "hint": "key is not a known API-key setting"},
+            detail={"reason": "unknown_api_key", "hint": "The key is not a known API key setting."},
         )
     value = body.value.strip()
     if not value:
         raise HTTPException(
             status_code=400,
-            detail={"reason": "empty_value", "hint": "send a non-empty value, or DELETE to clear"},
+            detail={
+                "reason": "empty_value",
+                "hint": "Send a value, or use DELETE to clear the key.",
+            },
         )
     user = await current_user(request)
     updated_by: int | None = user.id if user else None
@@ -1590,10 +1872,7 @@ async def api_save_api_key(
     except ValueError as exc:
         raise HTTPException(
             status_code=400,
-            detail={
-                "reason": "no_config_secret_key",
-                "hint": "Set CONFIG_SECRET_KEY to store API keys via the UI.",
-            },
+            detail={"reason": "no_config_secret_key", "hint": _API_KEY_STORE_HINT},
         ) from exc
     # Persist the plaintext onto the live Settings singleton (validate_assignment
     # coerces str → SecretStr). NOT apply_to_settings — that decrypts a stored
@@ -1620,7 +1899,7 @@ async def api_clear_api_key(
     if spec is None or not spec.secret or spec.danger:
         raise HTTPException(
             status_code=400,
-            detail={"reason": "unknown_api_key", "hint": "key is not a known API-key setting"},
+            detail={"reason": "unknown_api_key", "hint": "The key is not a known API key setting."},
         )
     async with request.app.state.db_sessionmaker() as db:
         await cfg_svc.delete_override(db, key)
@@ -1740,7 +2019,10 @@ async def api_save_notify_webhook(
     if not value:
         raise HTTPException(
             status_code=400,
-            detail={"reason": "empty_value", "hint": "send a non-empty URL, or DELETE to clear"},
+            detail={
+                "reason": "empty_value",
+                "hint": "Send a URL, or use DELETE to clear the webhook.",
+            },
         )
     # Reject a non-http(s) scheme up front (SSRF hygiene, same as the URL settings).
     from urllib.parse import urlparse  # noqa: PLC0415
@@ -1819,6 +2101,18 @@ async def api_notify_test(
 
 
 _DANGER_TEST_TARGETS: frozenset[str] = frozenset({"es", "llm"})
+# The connection settings each test can try before a save (H1-I2).
+_DANGER_TEST_KEYS: dict[str, frozenset[str]] = {
+    "llm": frozenset({"litellm_base_url", "litellm_api_key", "litellm_verify_ssl"}),
+    "es": frozenset({"es_hosts", "es_username", "es_password", "es_verify_ssl"}),
+}
+
+
+class ConnTestIn(BaseModel):
+    """An edited connection value to test before a save."""
+
+    key: str
+    value: str = Field(max_length=4096)
 
 
 @router.post(
@@ -1830,6 +2124,7 @@ _DANGER_TEST_TARGETS: frozenset[str] = frozenset({"es", "llm"})
 async def api_danger_test_connection(
     target: str,
     request: Request,
+    body: ConnTestIn | None = None,
     settings: Settings = Depends(get_settings_dep),
 ) -> ConnTestOut:
     """Run a connectivity probe for target ∈ {es, llm}.
@@ -1848,13 +2143,42 @@ async def api_danger_test_connection(
         valid = sorted(_DANGER_TEST_TARGETS)
         raise HTTPException(
             status_code=400,
-            detail={"reason": "unknown_target", "hint": f"target must be one of {valid}"},
+            detail={
+                "reason": "unknown_target",
+                "hint": f"target accepts one of these values: {', '.join(valid)}.",
+            },
         )
+
+    trial: Settings | None = None
+    if body is not None:
+        # Test the edited value before a save. The test used the saved value
+        # only, so a fix cost a save, a restart and a test, and a wrong value a
+        # second restart (dogfood 2026-10-19, H1-I2). The trial copy is
+        # discarded: nothing is saved or applied here.
+        if body.key not in _DANGER_TEST_KEYS[target]:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "reason": "key_not_for_target",
+                    "hint": f"The {target} test cannot try {body.key}.",
+                },
+            )
+        spec = cfg_svc.WHITELIST_BY_KEY[body.key]
+        try:
+            typed = cfg_svc.coerce(body.key, body.value)
+            trial = settings.model_copy()
+            setattr(trial, spec.attr, typed)
+        except ValidationError:
+            return ConnTestOut(ok=False, detail=f"The value is not valid for {spec.label}.")
+        except ValueError as exc:
+            return ConnTestOut(ok=False, detail=str(exc))
 
     if target == "es":
         # The shared probe budget: the header pill and the doctor wait the same
         # time, so Test ES cannot pass in a minute when the pill says down.
         budget = probes.probe_budget_s(settings)
+        if trial is not None:
+            return await _probe_trial_es(trial, budget)
         try:
             async with asyncio.timeout(budget):
                 result = await probes.probe_es(request.app.state.elastic)
@@ -1867,8 +2191,30 @@ async def api_danger_test_connection(
                 ),
             )
     else:
-        result = await probes.probe_llm(settings)
+        result = await probes.probe_llm(trial if trial is not None else settings)
 
+    return ConnTestOut(ok=result["ok"], detail=result["detail"])
+
+
+async def _probe_trial_es(trial: Settings, budget: float) -> ConnTestOut:
+    """Probe Elasticsearch with a client built from the trial settings, then close it."""
+    from soc_ai.so_client.elastic import ElasticClient  # noqa: PLC0415 - lazy
+
+    try:
+        client = ElasticClient(trial)
+    except Exception as exc:
+        return ConnTestOut(ok=False, detail=probes._safe_reason(exc))
+    try:
+        async with asyncio.timeout(budget):
+            result = await probes.probe_es(client, trial)
+    except TimeoutError:
+        return ConnTestOut(
+            ok=False,
+            detail=f"Elasticsearch did not answer within {budget:g} s with the edited value.",
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            await client.aclose()
     return ConnTestOut(ok=result["ok"], detail=result["detail"])
 
 
@@ -1976,7 +2322,21 @@ async def api_start_model_battery(
     """
     status = _battery_status(request.app.state)
     if status.running:
-        raise HTTPException(status_code=409, detail="a model battery is already running")
+        raise HTTPException(
+            status_code=409, detail="A model battery is already running. Wait for it to finish."
+        )
+    # Preflight: eight model calls against a dead gateway cost 50 s and said
+    # nothing (dogfood 2026-10-19, H1-D7). Refuse with the reason.
+    unreachable = await probes.gateway_unreachable(settings)
+    if unreachable is not None:
+        raise HTTPException(
+            status_code=503,
+            detail={"reason": "gateway_unreachable", "hint": unreachable},
+        )
+    if status.running:  # another start won the race during the preflight
+        raise HTTPException(
+            status_code=409, detail="A model battery is already running. Wait for it to finish."
+        )
     status.running = True
     status.model = body.model or settings.analyst_model
     status.completed = 0

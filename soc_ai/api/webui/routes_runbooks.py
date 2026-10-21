@@ -197,7 +197,7 @@ async def install_starter_pack(request: Request) -> StarterPackOut:
             status_code=404,
             detail={
                 "reason": "starter_pack_missing",
-                "hint": f"no runbook files under {runbook_pack.STARTER_PACK_DIR}",
+                "hint": f"soc-ai found no runbook files under {runbook_pack.STARTER_PACK_DIR}.",
             },
         )
     created_by = await identify_caller(request)
@@ -256,7 +256,7 @@ async def update_runbook(request: Request, runbook_id: int, body: RunbookPatch) 
     if row is None:
         raise HTTPException(
             status_code=404,
-            detail={"reason": "not_found", "hint": "no runbook with that id"},
+            detail={"reason": "not_found", "hint": "soc-ai has no runbook with this id."},
         )
     return _runbook_out(row, embed_models=embed_models, rag_model=rag_model)
 
@@ -272,7 +272,7 @@ async def delete_runbook(request: Request, runbook_id: int) -> dict[str, bool]:
     if not ok:
         raise HTTPException(
             status_code=404,
-            detail={"reason": "not_found", "hint": "no runbook with that id"},
+            detail={"reason": "not_found", "hint": "soc-ai has no runbook with this id."},
         )
     return {"deleted": True}
 
@@ -375,7 +375,7 @@ async def promote_runbook(request: Request, body: PromoteIn) -> RunbookOut:
                 status_code=404,
                 detail={
                     "reason": "no_history",
-                    "hint": "no completed non-fallback investigations for that rule",
+                    "hint": "This rule has no completed investigation with a model verdict.",
                 },
             ) from exc
         except EgressResidueError as exc:
@@ -393,7 +393,10 @@ async def promote_runbook(request: Request, body: PromoteIn) -> RunbookOut:
             _LOGGER.warning("runbook promotion failed for %r", body.rule_name, exc_info=True)
             raise HTTPException(
                 status_code=502,
-                detail={"reason": "draft_failed", "hint": "analyst model call failed"},
+                detail={
+                    "reason": "draft_failed",
+                    "hint": "The call to the analyst model failed. Try again.",
+                },
             ) from exc
     # Deliberately NOT embedded here (draft ⇒ invisible to retrieval); the
     # response still carries honest tier status (embedded=False when tier on).
@@ -428,6 +431,6 @@ async def approve_runbook(request: Request, runbook_id: int) -> RunbookOut:
     if row is None:
         raise HTTPException(
             status_code=404,
-            detail={"reason": "not_found", "hint": "no runbook with that id"},
+            detail={"reason": "not_found", "hint": "soc-ai has no runbook with this id."},
         )
     return _runbook_out(row, embed_models=embed_models, rag_model=rag_model)

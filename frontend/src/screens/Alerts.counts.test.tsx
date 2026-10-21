@@ -70,7 +70,7 @@ const mount = (url: string) =>
 
 const headerLine = () => screen.getByText(/untriaged ·/).textContent ?? '';
 const footerLine = () =>
-  screen.getByText(/grouped · click a row to expand events/).textContent ?? '';
+  screen.getByText(/grouped · select a row to expand its events/).textContent ?? '';
 
 /** A chip's text is its label with its badge appended: "All59", or "All". */
 const chipTexts = (): string[] =>
@@ -159,7 +159,7 @@ describe('Alerts says when the queue is bigger than the rows', () => {
     expect(headerLine()).toContain('120+ events in window');
     expect(headerLine()).toContain('more than the queue can show');
     const line = screen.getByText(/untriaged ·/);
-    expect(line.getAttribute('title') ?? '').toMatch(/These numbers are floors/i);
+    expect(line.getAttribute('title') ?? '').toMatch(/These numbers are minimums/i);
   });
 
   it('leaves an uncapped queue alone', async () => {

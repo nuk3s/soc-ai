@@ -36,7 +36,7 @@ describe('Runbooks list rows', () => {
     // open the editor with this runbook loaded.
     fireEvent.click(await screen.findByText('Beaconing Triage'));
     const titleInput = (await screen.findByPlaceholderText(
-      'e.g. Triage an ET SCAN Nmap alert',
+      'Example: Triage an ET SCAN Nmap alert',
     )) as HTMLInputElement;
     expect(titleInput.value).toBe('Beaconing Triage');
   });
@@ -53,7 +53,7 @@ describe('Runbooks list rows', () => {
   it('dates a runbook with the shared formatter', async () => {
     render(<Runbooks />);
     const updated = await screen.findByTestId('runbook-updated-42');
-    expect(updated.textContent).toMatch(/^updated \d+d ago$/);
+    expect(updated.textContent).toMatch(/^updated \d+(?:d|mo|y) ago$/);
     expect(updated.getAttribute('title')).toMatch(/^2026-07-1[34] \d{2}:\d{2} \S+$/);
   });
 

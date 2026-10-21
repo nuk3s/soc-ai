@@ -57,11 +57,103 @@ export function ackTail(r: {
   return parts.length ? ` · ${parts.join(' · ')}` : '';
 }
 
-/** What to say after acknowledging ONE group, wherever the button lives. */
-export function ackMessage(r: AckGroupResult, groupName: string): string {
+/** True when an ack press wrote to no alert: nothing acknowledged and no
+ *  write failed. Such a press must not wear the success check
+ *  (dogfood 2026-10-19, R2-D15). */
+export function ackWroteNothing(r: Pick<AckGroupResult, 'acked' | 'failed'>): boolean {
+  return r.acked === 0 && r.failed === 0;
+}
+
+/** True when an escalate press opened no case and no write failed. An empty
+ *  case counts in `failed`, so it is a failure here. */
+export function escalateWroteNothing(r: Pick<EscalateGroupResult, 'escalated' | 'failed'>): boolean {
+  return r.escalated === 0 && r.failed === 0;
+}
+
+/** "The alert of X is", "The 3 alerts of X are", or, when the count is not
+ *  the whole group, "3 alerts of X are". */
+function subject(n: number, groupName: string, whole: boolean): string {
+  if (whole) {
+    return n === 1
+      ? `The alert of ${groupName} is`
+      : `The ${n.toLocaleString()} alerts of ${groupName} are`;
+  }
+  return `${plural(n, 'alert')} of ${groupName} ${n === 1 ? 'is' : 'are'}`;
+}
+
+/** The sentence for more alerts than one press reached. */
+function leftSentence(remaining: number): string {
+  return `${plural(remaining, 'alert')} left. Press again to continue.`;
+}
+
+/** What to say after acknowledging ONE group, wherever the button lives.
+ *
+ *  `unhidable` is the caller's knowledge that the index of the detection
+ *  cannot search the acknowledged flag (the group row shows no counts), so an
+ *  acknowledged alert stays listed under Hide acknowledged. */
+export function ackMessage(
+  r: AckGroupResult,
+  groupName: string,
+  opts: { unhidable?: boolean } = {},
+): string {
+  if (ackWroteNothing(r)) {
+    // A second press. Before 2026-10-19 this read "Acknowledged 0 alerts in X"
+    // under a green check, and said nothing of what the group still held.
+    const already = r.already_acked ?? 0;
+    const remaining = r.remaining ?? 0;
+    const sentences =
+      already > 0
+        ? [`${subject(already, groupName, remaining === 0)} already acknowledged.`]
+        : [`No alert of ${groupName} waits for an acknowledgement.`];
+    sentences.push('soc-ai wrote nothing.');
+    if (already > 0 && opts.unhidable) {
+      sentences.push(
+        already === 1
+          ? 'The index of this detection cannot hide it. It stays listed.'
+          : 'The index of this detection cannot hide them. They stay listed.',
+      );
+    }
+    if (remaining > 0) sentences.push(leftSentence(remaining));
+    return sentences.join(' ');
+  }
   const parts = [`Acknowledged ${plural(r.acked, 'alert')} in ${groupName}`];
   if (r.failed) parts.push(`${plural(r.failed, 'event')} failed`);
   return parts.join(' · ') + ackTail(r);
+}
+
+/** What to say after an escalate press that opened no case and had no
+ *  failure. Each skip is its own sentence, and the ledger's case ids are
+ *  named (dogfood 2026-10-19, R2-D15, R2-I2). */
+function escalateNothingMessage(r: EscalateGroupResult, groupName: string): string {
+  const onCase = r.already_escalated ?? 0;
+  const acked = r.already_acked ?? 0;
+  const unresolved = r.unresolved ?? 0;
+  const remaining = r.remaining ?? 0;
+  const ids = (r.existing_cases ?? []).map((c) => c.id);
+  // A count is the whole group only when it is the one skip and no press is
+  // left to make.
+  const kinds = [onCase, acked, unresolved].filter((n) => n > 0).length;
+  const whole = kinds === 1 && remaining === 0;
+  const sentences: string[] = [];
+  if (onCase > 0) {
+    if (onCase === 1 && ids.length === 1) {
+      sentences.push(`${subject(1, groupName, whole)} already on case ${ids[0]}.`);
+    } else {
+      sentences.push(`${subject(onCase, groupName, whole)} already on a case.`);
+      if (ids.length === 1) sentences.push(`The soc-ai record names case ${ids[0]}.`);
+      if (ids.length > 1) sentences.push(`The soc-ai record names cases ${ids.join(', ')}.`);
+    }
+  }
+  if (acked > 0) sentences.push(`${subject(acked, groupName, whole)} already acknowledged.`);
+  if (unresolved > 0) {
+    sentences.push(
+      `${plural(unresolved, 'alert')} of ${groupName} ${unresolved === 1 ? 'has' : 'have'} an earlier escalate with an unknown outcome. soc-ai left ${unresolved === 1 ? 'it' : 'them'} alone.`,
+    );
+  }
+  if (!sentences.length) sentences.push(`No alert of ${groupName} waits for a case.`);
+  sentences.push('soc-ai opened no case.');
+  if (remaining > 0) sentences.push(leftSentence(remaining));
+  return sentences.join(' ');
 }
 
 /** What to say after escalating ONE group, wherever the button lives.
@@ -76,6 +168,7 @@ export function ackMessage(r: AckGroupResult, groupName: string): string {
  * Each clause below is a separate fact with a separate source, so each gets its
  * own sentence or none at all. */
 export function escalateMessage(r: EscalateGroupResult, groupName: string): string {
+  if (escalateWroteNothing(r)) return escalateNothingMessage(r, groupName);
   const withheld = r.already_escalated ?? 0;
   const acked = r.already_acked ?? 0;
   const unresolved = r.unresolved ?? 0;
@@ -95,6 +188,10 @@ export function escalateMessage(r: EscalateGroupResult, groupName: string): stri
   }
   if (withheld > 0) {
     parts.push(`${plural(withheld, 'alert')} already on a case, no second case opened`);
+    const existing = (r.existing_cases ?? []).map((c) => c.id);
+    if (existing.length) {
+      parts.push(`Existing ${existing.length === 1 ? 'case' : 'cases'}: ${existing.join(', ')}`);
+    }
   }
   if (acked > 0) {
     parts.push(`${plural(acked, 'alert')} already acknowledged in Security Onion, skipped`);
@@ -110,10 +207,19 @@ export function escalateMessage(r: EscalateGroupResult, groupName: string): stri
   return parts.join(' · ');
 }
 
-/** The toast links for the cases an escalate opened. A case with no console
- *  URL is named in the message and gets no link. */
+/** The toast links for the cases an escalate opened, then for the cases its
+ *  skipped alerts are already on. A case with no console URL is named in the
+ *  message and gets no link. */
 export function escalateLinks(r: EscalateGroupResult): Array<{ label: string; href: string }> {
-  return (r.cases ?? [])
+  const seen = new Set<string>();
+  return [...(r.cases ?? []), ...(r.existing_cases ?? [])]
     .filter((c): c is { id: string; url: string } => !!c.url)
+    .filter((c) => !seen.has(c.id) && !!seen.add(c.id))
     .map((c) => ({ label: `Open case ${c.id}`, href: c.url }));
+}
+
+/** True when the escalate answer names a case id. The toast then stays until
+ *  it is dismissed: a case id is something to copy. */
+export function escalateNamesCase(r: EscalateGroupResult): boolean {
+  return (r.cases?.length ?? 0) > 0 || (r.existing_cases?.length ?? 0) > 0;
 }

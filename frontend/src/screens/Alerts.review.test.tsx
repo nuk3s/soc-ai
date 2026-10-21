@@ -380,9 +380,22 @@ describe('F13 — command palette bulk-investigate carries intent in nav state',
         </ShellProvider>
       </MemoryRouter>,
     );
-    // Open the palette (Cmd+K) and run the action.
+    // Open the palette (Cmd+K) and run the action. The entry asks first
+    // (dogfood 2026-10-19, R1-D14), and the sweep starts from the confirm.
+    vi.mocked(getHealth).mockResolvedValue({
+      es: { ok: true, detail: 'ok' },
+      llm: { ok: true, detail: 'ok' },
+    } as never);
+    // One untriaged high group: the confirm offers no Investigate at 0 groups
+    // (dogfood 2026-10-19, V1-S3).
+    vi.mocked(getAlerts).mockResolvedValue(
+      queueOf([mkGroup({ id: 'g-untriaged', name: 'ET SCAN probe', sev: 'high', verdict: 'untriaged' })]),
+    );
     fireEvent.keyDown(window, { key: 'k', metaKey: true });
-    fireEvent.click(await screen.findByText('Bulk investigate all untriaged'));
+    fireEvent.click(await screen.findByText('Investigate untriaged alerts of the last 24 hours'));
+    const go = await screen.findByRole('button', { name: 'Investigate' });
+    await waitFor(() => expect(go).not.toBeDisabled());
+    fireEvent.click(go);
 
     await waitFor(() => {
       const loc = screen.getByTestId('loc').textContent ?? '';
@@ -451,7 +464,9 @@ describe('F62 — sidebar highlights Investigations on its detail routes', () =>
   const activeBg = (label: string): string =>
     (screen.getByText(label).closest('a') as HTMLElement).style.background;
 
-  it('lights "Investigations" on an /entity pivot', () => {
+  // An address pivot is a host page, so it lights Hosts (dogfood 2026-10-19,
+  // R4-D23). It lit Investigations while the page showed host chrome.
+  it('lights "Hosts" on an /entity pivot of an address', () => {
     render(
       <MemoryRouter initialEntries={['/entity/192.0.2.5']}>
         <ShellProvider>
@@ -459,7 +474,8 @@ describe('F62 — sidebar highlights Investigations on its detail routes', () =>
         </ShellProvider>
       </MemoryRouter>,
     );
-    expect(activeBg('Investigations')).not.toBe('transparent');
+    expect(activeBg('Hosts')).not.toBe('transparent');
+    expect(activeBg('Investigations')).toBe('transparent');
     expect(activeBg('Dashboard')).toBe('transparent');
   });
 

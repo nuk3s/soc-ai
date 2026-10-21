@@ -102,6 +102,23 @@ class SpaStaticFiles(StaticFiles):
         return response
 
 
+def _console_not_found(request: Request, status_code: int) -> bool:
+    """Whether a 404 is a browser asking for a page address the server lacks.
+
+    Such a request goes to the console, where the SPA shows its not-found
+    page. An API path, an ``/app`` path, a write, a caller that does not ask
+    for HTML, and a server with no console build keep the plain 404.
+    """
+    if status_code != 404 or request.method not in ("GET", "HEAD"):
+        return False
+    path = request.url.path
+    if path == "/api" or path.startswith(("/api/", "/app")):
+        return False
+    if "text/html" not in request.headers.get("accept", ""):
+        return False
+    return bool(getattr(request.app.state, "spa_mounted", False))
+
+
 async def _reaper_loop(db_sessionmaker: Any, settings: Any) -> None:
     """Periodically mark stale ``running`` investigations + ``pending`` chat
     turns as ``error``.
@@ -125,7 +142,15 @@ async def _reaper_loop(db_sessionmaker: Any, settings: Any) -> None:
     age_min = settings.investigation_reaper_minutes
     if interval_min <= 0 or age_min <= 0:
         return
-    chat_age = timedelta(seconds=max(int(getattr(settings, "chat_turn_timeout_s", 180)), 1))
+    # A turn that hits its timeout can still write a partial answer from its
+    # tool results, in at most PARTIAL_ANSWER_TIMEOUT_S more. The sweep waits
+    # for that too, so it never reaps a turn while the answer is written.
+    from soc_ai.webui.chat_turn import PARTIAL_ANSWER_TIMEOUT_S  # noqa: PLC0415 - lazy
+
+    chat_age = timedelta(
+        seconds=max(int(getattr(settings, "chat_turn_timeout_s", 180)), 1)
+        + PARTIAL_ANSWER_TIMEOUT_S
+    )
     # Backtests and hunts legitimately run FAR longer than a single investigation,
     # so reaping them at the investigation age (default 30 min) flips an in-flight
     # job to 'error' mid-run. Derive each its own reap age from its real ceiling:
@@ -440,8 +465,10 @@ async def _run_self_heal(app: FastAPI, settings: Any) -> None:
         lock = asyncio.Lock()
         app.state.self_heal_lock = lock
     try:
+        from soc_ai.store.grid_gaps import settle_of  # noqa: PLC0415
+
         async with lock, app.state.db_sessionmaker() as db:
-            result = await run_self_heal(db)
+            result = await run_self_heal(db, settle=settle_of(settings))
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -482,6 +509,23 @@ def _grid_is_known_down(app: FastAPI) -> bool:
     """
     down = getattr(app.state, "_dep_down_since", None) or {}
     return "es" in down
+
+
+def _note_prior_skip(app: FastAPI, settings: Any) -> None:
+    """Record a due profile sweep that the loop skipped because the grid is down.
+
+    The loop recorded nothing on a skip, so four days of outage read as a
+    quiet sweep. The record counts one skip per interval, and only when a run
+    is due: a wake inside the interval had no run to skip.
+    """
+    from soc_ai.hunting.loop_health import SKIP_GRID_DOWN, prior_health  # noqa: PLC0415
+
+    now = datetime.now(UTC).replace(tzinfo=None)
+    every = timedelta(minutes=_prior_sweep_interval_minutes(settings))
+    last_run = getattr(app.state, "prior_sweep_last_run", None)
+    if last_run is not None and now - last_run < every:
+        return
+    prior_health(app.state).note_skip(now, SKIP_GRID_DOWN, every)
 
 
 def _profile_stale_after(settings: Any) -> timedelta:
@@ -629,6 +673,7 @@ async def _prior_sweep_loop(app: FastAPI) -> None:
     coordination is Epoch 6.2, as for the loops above.
     """
     from soc_ai.hunting.catalog_tiers import effective_catalog  # noqa: PLC0415
+    from soc_ai.hunting.loop_health import OUTCOME_FAILED, prior_health  # noqa: PLC0415
     from soc_ai.hunting.prior_sweep import run_prior_sweep  # noqa: PLC0415
     from soc_ai.hunting.priors import COVERAGE_BLIND  # noqa: PLC0415
     from soc_ai.oracle.identifiers import effective_internal_identifiers  # noqa: PLC0415
@@ -644,6 +689,7 @@ async def _prior_sweep_loop(app: FastAPI) -> None:
             if getattr(settings, "soc_ai_demo", False):
                 continue
             if _grid_is_known_down(app):
+                _note_prior_skip(app, settings)
                 continue
 
             now = datetime.now(UTC).replace(tzinfo=None)
@@ -679,6 +725,7 @@ async def _prior_sweep_loop(app: FastAPI) -> None:
             # Stamped only after a sweep that returned, so a failure retries on
             # the next wake rather than skipping the whole interval.
             app.state.prior_sweep_last_run = now
+            prior_health(app.state).note_sweep(now, sweep)
             await _run_self_heal(app, settings)
 
             observations = sum(len(r.departures) + len(r.hits) for r in sweep.results)
@@ -700,6 +747,11 @@ async def _prior_sweep_loop(app: FastAPI) -> None:
             raise
         except Exception as exc:
             _LOGGER.warning("prior sweep loop: %s: %s", type(exc).__name__, exc)
+            prior_health(app.state).note(
+                datetime.now(UTC).replace(tzinfo=None),
+                OUTCOME_FAILED,
+                f"{type(exc).__name__}: {exc}",
+            )
 
 
 async def _eval_nightly_loop(app: FastAPI, settings: Any) -> None:
@@ -865,8 +917,10 @@ async def _audit_verify_loop(app: FastAPI, settings: Any) -> None:
                     exc_info=True,
                 )
                 status.last_run = datetime.now(UTC).isoformat()
+                status.last_outcome = "not_checked"
                 continue
             status.last_run = datetime.now(UTC).isoformat()
+            status.last_outcome = "intact" if result.ok else "broken"
             if result.ok:
                 status.alarm = None
                 _LOGGER.info(
@@ -1588,9 +1642,9 @@ def _require_prompt_assets() -> None:
         return
     detail = "; ".join(f"{asset.name} ({asset.path}): {asset.cost}" for asset in missing)
     raise RuntimeError(
-        f"refusing to start, {len(missing)} prompt asset(s) missing. {detail}. "
-        "The deployment is incomplete; redeploy from an image or install that ships "
-        "the docs/ directory, then run `soc-ai doctor` to confirm."
+        f"soc-ai does not start. {len(missing)} prompt assets are missing: {detail}. "
+        "The deployment is incomplete. Redeploy from an image or an install that "
+        "ships the docs/ directory. Then run `soc-ai doctor` to confirm."
     )
 
 
@@ -1815,6 +1869,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: PLR0915 — li
     # → secret overrides are skipped, env values stand).
     secret_box = make_secret_box(settings)
     db_engine = make_engine(settings)
+    # The values before any console override. GET /config names them as the
+    # .env or default origin of a setting, and "Use the default" restores them
+    # (dogfood 2026-10-19, R5-D7, R5-D8).
+    settings_baseline = settings.model_copy(deep=True)
     db_sessionmaker = await _init_store(db_engine, settings, secret_box)
 
     _LOGGER.info(
@@ -1871,6 +1929,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: PLR0915 — li
         decision_signer = None
 
     app.state.settings = settings
+    app.state.settings_baseline = settings_baseline
     app.state.secret_box = secret_box
     app.state.auth = auth
     app.state.elastic = elastic
@@ -2132,6 +2191,8 @@ def _bounded_sentence(field: str, kind: str, ctx: dict[str, Any]) -> str | None:
     if kind == "too_long" and "max_length" in ctx:
         return f"{field} must hold at most {ctx['max_length']} items."
     if kind == "too_short" and "min_length" in ctx:
+        if ctx["min_length"] == 1:
+            return f"{field} is empty. Send at least one item."
         return f"{field} must hold at least {ctx['min_length']} items."
     if kind == "greater_than_equal" and "ge" in ctx:
         return f"{field} must be {_bound(ctx['ge'])} or more."
@@ -2458,9 +2519,16 @@ def create_app() -> FastAPI:  # noqa: PLR0915 - app factory wires many middlewar
     async def _api_refusal_shape(request: Request, exc: StarletteHTTPException) -> Response:
         """Every refusal under /api/v1 answers ``{"detail": {"reason", "hint"}}``.
 
-        Routes outside the API prefix keep FastAPI's own answer.
+        Routes outside the API prefix keep FastAPI's own answer. One case
+        differs: a browser that asks for an unknown page address goes to the
+        console under ``/app``, and the SPA shows its not-found page in the
+        shell. ``/nope`` answered a browser with raw ``{"detail":"Not Found"}``
+        (dogfood 2026-10-19, R1-D19).
         """
         path = request.url.path
+        if _console_not_found(request, exc.status_code):
+            query = request.url.query
+            return RedirectResponse(f"/app{path}" + (f"?{query}" if query else ""), 307)
         if not path.startswith(_API_V1_PREFIX) or not is_body_allowed_for_status_code(
             exc.status_code
         ):
@@ -2501,7 +2569,9 @@ def create_app() -> FastAPI:  # noqa: PLR0915 - app factory wires many middlewar
                     content={
                         "detail": {
                             "reason": "demo_mode",
-                            "hint": "Demo — read-only replay; this action is disabled.",
+                            "hint": (
+                                "The demo is read-only. It replays stored runs. This action is off."
+                            ),
                         }
                     },
                 )
@@ -2695,9 +2765,12 @@ def create_app() -> FastAPI:  # noqa: PLR0915 - app factory wires many middlewar
     # Bare `/` → the React app front door. The SPA is always built in deployment;
     # if `spa_mounted` is False, /app isn't served (startup logged a warning) and
     # this redirect 404s — which is the correct signal that the build is missing.
+    # The SPA root picks the page: the Dashboard, or sign-in. `/` sent the
+    # reader to Alerts while `/app` opened the Dashboard, so the console had
+    # two home pages (dogfood 2026-10-19, R1-D19).
     @app.get("/", include_in_schema=False)
     async def _root() -> RedirectResponse:
-        return RedirectResponse("/app/alerts", 307)
+        return RedirectResponse("/app/", 307)
 
     return app
 

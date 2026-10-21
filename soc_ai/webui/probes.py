@@ -20,6 +20,7 @@ import re
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -140,6 +141,33 @@ def _cause_text(exc: BaseException) -> str:
     return str(exc).strip()
 
 
+_CONNECT_HOST_RE = re.compile(r"Cannot connect to host (\[[^\]]+\]:\d+|[^\s:]+:\d+)")
+
+
+def _connect_sentence(cause: str, what: str = "") -> str | None:
+    """ "soc-ai cannot connect to <host:port>. <layer>." for a known connect failure.
+
+    The aiohttp and httpx texts name the address after "Cannot connect to host".
+    The sentence keeps that address and drops the class names and the chain
+    (dogfood 2026-10-19, H1-D21). None for a text of another shape, so the
+    caller keeps the scrubbed cause and invents no diagnosis.
+    """
+    match = _CONNECT_HOST_RE.search(cause)
+    if match is None:
+        return None
+    text = cause.lower()
+    if any(m in text for m in ("name or service", "nodename", "name resolution", "getaddrinfo")):
+        why = "The host name does not resolve."
+    elif any(m in text for m in ("certificate", "ssl:true", "sslerror", "tls")):
+        why = "The TLS handshake failed."
+    elif "timed out" in text or "timeout" in text:
+        why = "The connection timed out."
+    else:
+        why = "Nothing answers on that port."
+    target = f"{what} at " if what else ""
+    return f"soc-ai cannot connect to {target}{match.group(1)}. {why}"
+
+
 def _grid_failure(exc: BaseException) -> tuple[str, str]:
     """``(kind, operator-facing reason)`` for a failed Elasticsearch read.
 
@@ -160,25 +188,25 @@ def _grid_failure(exc: BaseException) -> tuple[str, str]:
         # (review of batch A, 2026-08-14). Whether waiting helps is the whole
         # point of the line, and the two causes have opposite answers.
         total, failed = exc.shards_total, exc.shards_failed
-        because = f" ({_scrub(str(exc.reason))})" if exc.reason else ""
+        because = f" Elasticsearch reports: {_scrub(str(exc.reason))}." if exc.reason else ""
         if failed:
-            read = f"read only {total - failed} of {total} shards" if total else "read partially"
-            timed_out = " and the search timed out" if exc.timed_out else ""
+            noun = "shard" if failed == 1 and not total else "shards"
+            shards = f"{failed} of {total} {noun}" if total else f"{failed} {noun}"
+            timed_out = " The search timed out." if exc.timed_out else ""
             return (
                 KIND_PARTIAL,
-                f"the grid {read}{timed_out}{because}. These results are incomplete. "
-                "A retry does not help. To find the cause, check Elasticsearch "
-                "shard health.",
+                f"Elasticsearch did not answer for {shards}.{timed_out}{because} "
+                "The results are incomplete. Check the shard health in Elasticsearch.",
             )
         if exc.timed_out:
             return (
                 KIND_PARTIAL,
-                f"the search timed out before all shards answered{because}. These "
-                "results are incomplete. You can retry, or narrow the time window.",
+                f"the search timed out before all shards answered.{because} The "
+                "results are incomplete. Retry the search, or narrow the time window.",
             )
         return (
             KIND_PARTIAL,
-            f"the grid did not read the whole index{because}. These results are incomplete.",
+            f"the grid did not read the whole index.{because} The results are incomplete.",
         )
     status = _status_code(exc)
     if status == 429 or "circuit_breaking_exception" in str(exc):
@@ -191,7 +219,8 @@ def _grid_failure(exc: BaseException) -> tuple[str, str]:
     if isinstance(exc, TimeoutError) or "timeout" in name.lower():
         return KIND_TIMEOUT, f"the grid took the query and did not answer in time ({name})"
     if isinstance(exc, ConnectionError | OSError) or "connection" in name.lower():
-        return KIND_REFUSED, f"the grid could not be reached: {_scrub(_cause_text(exc))}"
+        cause = _scrub(_cause_text(exc))
+        return KIND_REFUSED, _connect_sentence(cause) or f"the grid could not be reached: {cause}"
     return "", _safe_reason(exc)
 
 
@@ -237,6 +266,60 @@ async def list_gateway_models(settings: Any) -> tuple[list[str], str | None]:
         return ids, None
     except Exception as exc:  # a listing failure is a normal ✗ result, never a raise
         return [], _safe_reason(exc)
+
+
+def _gateway_where(settings: Any) -> str:
+    """host:port of the gateway URL. The scheme, the path and any credential stay out."""
+    try:
+        parts = urlsplit(str(settings.litellm_base_url))
+        host = parts.hostname or ""
+        return f"{host}:{parts.port}" if parts.port else host
+    except ValueError:
+        return "the configured address"
+
+
+async def gateway_unreachable(settings: Any) -> str | None:
+    """One sentence when the model gateway does not answer at all, else None.
+
+    The preflight for a run that costs minutes of model calls. Only a
+    transport failure counts: a refused connection, a DNS failure, a TLS
+    failure or a timeout. A gateway that answers, even with an HTTP error, is
+    up, and the run itself grades the rest. The model battery ran eight calls
+    against a dead gateway for 50 s and showed no reason (dogfood 2026-10-19,
+    H1-D7).
+    """
+    if is_demo(settings):
+        return None
+    base = str(settings.litellm_base_url).rstrip("/")
+    verify = bool(getattr(settings, "litellm_verify_ssl", True))
+    try:
+        async with httpx.AsyncClient(timeout=_PROBE_TIMEOUT_S, verify=verify) as client:
+            await client.get(f"{base}/v1/models")
+    except httpx.TransportError as exc:
+        where = _gateway_where(settings)
+        return f"The model gateway at {where} does not answer. {_transport_why(exc)}"
+    except Exception:  # any other failure is not proof the gateway is down
+        return None
+    return None
+
+
+def transport_why(exc: BaseException) -> str:
+    """One plain sentence for a connection failure, in place of the class name.
+
+    "ClientConnectorError(Cannot connect to host ...)" reached the console as
+    is (dogfood 2026-10-19, H1-D21). The operator needs the layer that failed.
+    """
+    text = str(exc).lower()
+    if isinstance(exc, (httpx.TimeoutException, TimeoutError)) or "timed out" in text:
+        return "The connection timed out."
+    if any(m in text for m in ("name or service", "nodename", "getaddrinfo", "name resolution")):
+        return "The host name does not resolve."
+    if any(m in text for m in ("certificate", "ssl", "tls")):
+        return "The TLS handshake failed."
+    return "Nothing answers on that port."
+
+
+_transport_why = transport_why
 
 
 async def probe_llm(settings: Any) -> dict[str, Any]:
@@ -405,7 +488,10 @@ def _so_failure(exc: BaseException) -> tuple[str, str]:
     if isinstance(exc, TimeoutError | httpx.TimeoutException) or "timeout" in name.lower():
         return KIND_TIMEOUT, f"the API took the request and did not answer in time ({name})"
     if isinstance(exc, ConnectionError | OSError) or "connect" in name.lower():
-        return KIND_REFUSED, f"the API could not be reached: {_scrub(_cause_text(exc))}"
+        cause = _scrub(_cause_text(exc))
+        return KIND_REFUSED, (
+            _connect_sentence(cause, "the API") or f"the API could not be reached: {cause}"
+        )
     return "", _safe_reason(exc)
 
 
@@ -566,6 +652,26 @@ _TRUNCATION_MARKERS: tuple[str, ...] = ("before any response", "token limit")
 CAUSE_TIMEOUT = "timeout"
 CAUSE_TRANSPORT = "transport"
 UNMEASURED_CAUSES = frozenset({CAUSE_TIMEOUT, CAUSE_TRANSPORT})
+
+
+def unmeasured_failed_legs(fitness: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """The failed legs when every one of them failed to measure, else None.
+
+    A leg that timed out or could not reach the model holds no capability
+    result. When those are the only failed legs, the probe measured nothing
+    that says the model is unfit. A probe result with no leg list (an older
+    cache, a test double) gives None, and the grade stands. The doctor and the
+    console fitness route read a result through this one rule.
+    """
+    if str(fitness.get("grade", "")) != "fail":
+        return None
+    legs = [leg for leg in fitness.get("legs") or [] if isinstance(leg, dict)]
+    failed = [leg for leg in legs if leg.get("grade") == "fail"]
+    if not failed:
+        return None
+    if all(leg.get("cause") in UNMEASURED_CAUSES for leg in failed):
+        return failed
+    return None
 
 
 def _fitness_leg(

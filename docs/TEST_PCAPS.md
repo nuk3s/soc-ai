@@ -2,19 +2,19 @@
 
 This page is a catalog of safe, labeled-malicious packet captures that you can download. Use
 them to test the Security Onion detection pipeline end to end, across Suricata and Zeek. Each
-file is an inert network capture. No live malware runs. SOC analysts use this material as
-standard.
+file is an inert network capture. No live malware runs. These captures are standard test
+material for SOC analysts.
 
-Import a capture with `sudo so-import-pcap <file.pcap>` on the sensor. The alerts land in
+Import a capture with `sudo so-import-pcap <file.pcap>` on the sensor. SO writes the alerts to
 the SO 3.0 `logs-*` data streams. They keep the original timestamps of the PCAP and carry an
-`import.id` tag. soc-ai queries those streams through `EVENTS_INDEX_PATTERN`. An example is
-the `.ds-logs-suricata.alerts-so-...` backing indices.
+`import.id` tag. soc-ai queries those streams through `EVENTS_INDEX_PATTERN`. The
+`.ds-logs-suricata.alerts-so-...` backing indices are an example.
 
 > Compiled on 2026-06-16. Every URL passed a live HEAD check on that date.
 
 ## First captures
 
-These captures are small and verified. Each one fires.
+These captures are small and verified. Each one fires an alert.
 
 1. **SMB EICAR:** 4.4 KB, no password. This file is Suricata's own regression fixture. Use it as the file-extraction smoke test. It fires every time. It holds the EICAR test string and no real malware.
    ```bash
@@ -57,5 +57,5 @@ These captures are small and verified. Each one fires.
 - **Stratosphere and MCFP** pcaps are plain libpcap files with no password. Their certificate chain is old. Use `curl -k` for them. The index is at `https://mcfp.felk.cvut.cz/publicDatasets/`.
 - **CTU-13:** use `botnet-capture-*.pcap`. These files carry full payloads, so the content rules fire. Do not use the `*.truncated.pcap` files, because they have no payloads.
 - **GitHub raw** holds the chrissanders, PCAP-ATTACK and suricata-verify samples. They are plaintext and need no password. URL-encode the spaces as `%20` and quote the local paths.
-- A current ruleset will probably not fire the named `ET MALWARE` hits on an old dataset. CTU-13 is from 2011 and IoT-23 is from 2018. On those datasets, the Zeek protocol behaviours are the signal that lasts. The MTA-2026 samples and the GitHub samples are the most likely to fire a named ET signature.
-- The imported alerts keep the original time of the PCAP, so they land in the past. A hunt by `alert_es_id` works on them. Widen the time range to see the alerts in the alerts pane. You can also move the PCAP time to about now with `editcap -t <offset>` before you import it.
+- A current ruleset will probably not fire the named `ET MALWARE` hits on an old dataset. CTU-13 is from 2011 and IoT-23 is from 2018. On those datasets, the Zeek protocol behaviours are the more reliable signal. The MTA-2026 samples and the GitHub samples are the most likely to fire a named ET signature.
+- The imported alerts keep the original time of the PCAP. Thus their timestamps are in the past. A hunt by `alert_es_id` works on them. Widen the time range to see the alerts in the alerts pane. You can also move the PCAP time to about now with `editcap -t <offset>` before you import it.

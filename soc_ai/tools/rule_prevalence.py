@@ -96,6 +96,7 @@ Robustness contract (mirrors ``host_summary`` and the other read tools):
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta
 from typing import Any
 
 from soc_ai.config import Settings
@@ -175,11 +176,28 @@ _NOISY_MIN_HOSTS = 5
 _MAX_LOOKBACK_DAYS = 365
 
 
+def _window_filter(lookback_days: int, anchor: datetime | None) -> dict[str, Any]:
+    """The ``@timestamp`` range of the lookback window.
+
+    With ``anchor`` (the alert's ``@timestamp``) the window is
+    ``[anchor - lookback, anchor]``: the base rate the rule had when the alert
+    fired. Without it the window ends now, for a caller with no alert. A
+    re-triage of an alert older than the window read the window from now, saw
+    nothing, and called the rule first-seen (dogfood 2026-10-19, R2-D11). The
+    sibling :func:`soc_ai.tools.prevalence._lookback_filter` has the same shape.
+    """
+    if anchor is not None:
+        gte = (anchor - timedelta(days=lookback_days)).isoformat()
+        return {"range": {"@timestamp": {"gte": gte, "lte": anchor.isoformat()}}}
+    return {"range": {"@timestamp": {"gte": f"now-{lookback_days}d", "lte": "now"}}}
+
+
 def _rule_match_query(
     rule_name: str,
     lookback_days: int,
     include_synth: SynthScope = False,
     provenance: Provenance = LIVE,
+    anchor: datetime | None = None,
 ) -> dict[str, Any]:
     """Match detection docs whose rule name equals ``rule_name``.
 
@@ -203,9 +221,7 @@ def _rule_match_query(
                 {"terms": {"event.dataset": list(_DETECTION_DATASETS)}},
                 {"bool": {"should": should, "minimum_should_match": 1}},
             ],
-            "filter": [
-                {"range": {"@timestamp": {"gte": f"now-{lookback_days}d", "lte": "now"}}},
-            ],
+            "filter": [_window_filter(lookback_days, anchor)],
             # Synth scope, threaded: prod keeps a real base rate clean of plants;
             # a batch eval scopes to its own scenario so a run measures a rule's
             # prevalence including the plants it is graded on. Provenance scope
@@ -423,6 +439,7 @@ async def rule_prevalence(
     lookback_days: int = 30,
     include_synth: SynthScope = False,
     provenance: Provenance = LIVE,
+    time_anchor: datetime | None = None,
 ) -> dict[str, Any]:
     """How prevalent is a detection rule across the network over a lookback window?
 
@@ -456,6 +473,10 @@ async def rule_prevalence(
         settings: app settings (uses ``events_index_pattern``).
         lookback_days: window size in days. Default 30.
         include_synth: synth-doc visibility (``SynthScope``).
+        time_anchor: when set, the window ends at this timestamp
+            (``[anchor - lookback, anchor]``) instead of now. The tool passes
+            the alert's ``@timestamp`` so the base rate is the one the rule had
+            when the alert fired. A live caller leaves it ``None``.
         provenance: which population the base rate is measured over
             (:mod:`soc_ai.tools._provenance`). ``"live"`` (the default) counts
             only what this grid's own sensors detected, because "how often does
@@ -505,7 +526,7 @@ async def rule_prevalence(
         }
 
     index = settings.events_index_pattern
-    query = _rule_match_query(rule_name, lookback_days, include_synth, provenance)
+    query = _rule_match_query(rule_name, lookback_days, include_synth, provenance, time_anchor)
 
     # cardinality aggs give distinct source/dest host and source-port counts in
     # one round trip; min/max give the active span; the day histogram tells a
@@ -552,7 +573,9 @@ async def rule_prevalence(
         # probe has to ask about; building it any other way would let the two
         # drift and the number would stop being about this rule.
         imported = await count_imports(
-            elastic, index, _rule_match_query(rule_name, lookback_days, include_synth, ANY)
+            elastic,
+            index,
+            _rule_match_query(rule_name, lookback_days, include_synth, ANY, time_anchor),
         )
         return _empty_result(rule_name, lookback_days, provenance, imported)
 

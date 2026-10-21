@@ -421,20 +421,125 @@ def test_bootstrap_sidecar_deleted_on_successful_change(
 def test_admin_reset_of_the_bootstrap_admin_also_retires_the_sidecar(
     settings_kratos: Settings, tmp_path: Path
 ) -> None:
-    """The admin reset path invalidates the file's contents too — so delete it."""
+    """The admin reset path invalidates the file's contents too — so delete it.
+
+    A second admin does the reset: the bootstrap admin cannot reset its own
+    password (see test_admin_cannot_reset_own_password)."""
     settings = settings_kratos.model_copy(
         update={"api_auth_required": True, "soc_ai_data_dir": tmp_path / "data"}
     )
     cred = bootstrap_credential_path(settings)
     for client in _client(settings):
         assert cred.exists()
-        generated = cred.read_text().strip()
-        _login(client, "admin", generated)
         admin_id = _user_id(settings, "admin")
+
+        async def _second_admin(db: Any) -> None:
+            await auth_svc.create_user(db, "ops", "ops-admin-pw-1", role="admin")
+
+        _db_call(settings, _second_admin)
+        _login(client, "ops", "ops-admin-pw-1")
 
         resp = client.post(f"/api/v1/config/users/{admin_id}/reset-password", headers=ORIGIN)
         assert resp.status_code == 200, resp.text
         assert not cred.exists()
+
+
+def test_admin_cannot_reset_own_password(settings_kratos: Settings, tmp_path: Path) -> None:
+    """A self-reset revoked the caller's own session and threw the new password
+    away with the page: the only admin was locked out (dogfood 2026-10-19,
+    H1-D1). The server refuses it and points to Change password."""
+    settings = settings_kratos.model_copy(
+        update={"api_auth_required": True, "soc_ai_data_dir": tmp_path / "data"}
+    )
+    cred = bootstrap_credential_path(settings)
+    for client in _client(settings):
+        generated = cred.read_text().strip()
+        _login(client, "admin", generated)
+        before = _password_hash(settings, "admin")
+
+        resp = client.post(
+            f"/api/v1/config/users/{_user_id(settings, 'admin')}/reset-password",
+            headers=ORIGIN,
+        )
+        assert resp.status_code == 400, resp.text
+        detail = resp.json()["detail"]
+        assert detail["reason"] == "cannot_reset_self"
+        assert "Change password" in detail["hint"]
+        assert "password" not in resp.json()
+        # Nothing changed: the hash, the caller's session and the sidecar stay.
+        assert _password_hash(settings, "admin") == before
+        assert client.get("/api/v1/me").status_code == 200
+        assert cred.exists()
+
+
+def test_new_password_equal_to_current_is_refused(
+    settings_kratos: Settings, tmp_path: Path
+) -> None:
+    """A "change" to the same password deleted the bootstrap sidecar while the
+    generated password stayed live (dogfood 2026-10-19, H1-D4)."""
+    settings = settings_kratos.model_copy(
+        update={"api_auth_required": True, "soc_ai_data_dir": tmp_path / "data"}
+    )
+    cred = bootstrap_credential_path(settings)
+    for client in _client(settings):
+        generated = cred.read_text().strip()
+        _login(client, "admin", generated)
+        resp = client.post(
+            "/api/v1/me/password",
+            json={"current_password": generated, "new_password": generated},
+            headers=ORIGIN,
+        )
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["detail"]["reason"] == "password_unchanged"
+        assert cred.exists(), "a refused change must leave the sidecar in place"
+
+
+def test_me_reports_the_generated_password_until_it_changes(
+    settings_kratos: Settings, tmp_path: Path
+) -> None:
+    """The console had no word that the generated admin password was still in
+    use (dogfood 2026-10-19, H1-D5). /me carries the fact for the signed-in
+    user, and it clears when the password changes."""
+    settings = settings_kratos.model_copy(
+        update={"api_auth_required": True, "soc_ai_data_dir": tmp_path / "data"}
+    )
+    cred = bootstrap_credential_path(settings)
+    for client in _client(settings):
+        generated = cred.read_text().strip()
+        _login(client, "admin", generated)
+        assert client.get("/api/v1/me").json()["password_is_generated"] is True
+
+        ok = client.post(
+            "/api/v1/me/password",
+            json={"current_password": generated, "new_password": NEW_PW},
+            headers=ORIGIN,
+        )
+        assert ok.status_code == 200, ok.text
+        assert client.get("/api/v1/me").json()["password_is_generated"] is False
+
+
+def test_me_reports_the_env_bootstrap_password(
+    auth_client: TestClient, auth_settings: Settings
+) -> None:
+    """setup.sh writes BOOTSTRAP_ADMIN_PASSWORD into .env. That value is a
+    generated password too, and it sits in a plaintext file."""
+    _login(auth_client)
+    assert auth_client.get("/api/v1/me").json()["password_is_generated"] is True
+    ok = auth_client.post(
+        "/api/v1/me/password",
+        json={"current_password": ADMIN_PW, "new_password": NEW_PW},
+        headers=ORIGIN,
+    )
+    assert ok.status_code == 200, ok.text
+    assert auth_client.get("/api/v1/me").json()["password_is_generated"] is False
+
+
+def test_me_never_flags_another_account(auth_client: TestClient, auth_settings: Settings) -> None:
+    """Only the bootstrap admin can hold the generated password. An analyst
+    whose password happens to equal it is not flagged."""
+    _make_analyst(auth_settings, "jordan", ADMIN_PW)
+    _login(auth_client, "jordan", ADMIN_PW)
+    assert auth_client.get("/api/v1/me").json()["password_is_generated"] is False
 
 
 def test_admin_reset_of_another_user_leaves_the_sidecar(

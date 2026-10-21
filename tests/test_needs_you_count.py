@@ -94,6 +94,7 @@ def _seed_run(
     actions: list[dict[str, Any]] | None = None,
     hours_ago: float = 1.0,
     events: list[tuple[str, dict[str, Any]]] | None = None,
+    started_by: str | None = None,
 ) -> None:
     """One complete investigation, and the events the action card reads."""
     from soc_ai.store.models import Investigation, InvestigationEvent
@@ -112,6 +113,7 @@ def _seed_run(
                     report={"verdict": verdict, "recommended_actions": actions or []},
                     created_at=_ago(hours_ago),
                     finished_at=_ago(hours_ago),
+                    started_by=started_by,
                 )
             )
             await db.flush()
@@ -290,6 +292,56 @@ def test_a_replaced_run_is_not_counted(client: TestClient) -> None:
         assert _needs_you(client)["pending_actions"] == 0
 
 
+def test_a_backtest_replay_is_not_counted(client: TestClient) -> None:
+    """NEGATIVE CONTROL. A replay offers no action to execute (dogfood 2026-10-19 R1-D1).
+
+    The range count read 28 while 16 actions could run. The other 12 sat on
+    backtest replays, and each one read "Not executable. This run is a
+    backtest replay." The live run beside the replay keeps the count at one,
+    so the test fails if the filter drops every run.
+    """
+    _seed_run(
+        client,
+        "INV-REPLAY",
+        alert_id="es-replay",
+        verdict="true_positive",
+        actions=[_ESCALATE],
+        started_by="backtest",
+    )
+    _seed_run(client, "INV-LIVE", alert_id="es-tp", verdict="true_positive", actions=[_ESCALATE])
+    with patch("soc_ai.webui.alerts_query.fetch_groups", AsyncMock(return_value=GroupPage([], 0))):
+        assert _needs_you(client)["pending_actions"] == 1
+
+
+def test_pending_actions_by_run_counts_nothing_on_a_replay(client: TestClient) -> None:
+    """The shared rule closes every action of a replay, for every caller.
+
+    The hunt page reads the same helper for the investigation of a finding.
+    """
+    from soc_ai.api.webui.routes_meta import pending_actions_by_run
+    from soc_ai.store.models import Investigation
+    from sqlalchemy import select
+
+    _seed_run(
+        client,
+        "INV-REPLAY",
+        alert_id="es-replay",
+        verdict="true_positive",
+        actions=[_ESCALATE],
+        started_by="backtest",
+    )
+    _seed_run(client, "INV-LIVE", alert_id="es-tp", verdict="true_positive", actions=[_ESCALATE])
+
+    async def go() -> dict[str, int]:
+        async with client.app.state.db_sessionmaker() as db:
+            runs = (await db.scalars(select(Investigation))).all()
+            return await pending_actions_by_run(db, runs)
+
+    by_run = asyncio.run(go())
+    assert by_run.get("INV-REPLAY", 0) == 0
+    assert by_run["INV-LIVE"] == 1
+
+
 def test_a_run_outside_the_window_is_not_counted(client: TestClient) -> None:
     _seed_run(
         client,
@@ -339,3 +391,84 @@ def test_the_bell_adds_no_fold_row_for_five_leads(client: TestClient) -> None:
     rows = client.get("/api/v1/notifications").json()
     assert not [r for r in rows if r["id"] == "lead-more"]
     assert len([r for r in rows if r["id"].startswith("lead:")]) == 5
+
+
+# ── The list behind the pending-action line (R1-I1) ─────────────────────────
+
+
+def _pending_list(client: TestClient, **params: Any) -> dict[str, Any]:
+    res = client.get("/api/v1/investigations", params={"pending_action": "true", **params})
+    assert res.status_code == 200, res.text
+    body: dict[str, Any] = res.json()
+    return body
+
+
+def test_the_pending_action_filter_lists_the_runs_the_count_counts(client: TestClient) -> None:
+    """The line "N recommended actions wait for you" opens a list of those runs.
+
+    It opened the whole Investigations list, and the analyst paged through 16
+    runs to find the actions (dogfood 2026-10-19, R1-I1). Each negative control
+    below is a run the count leaves out, and the list must leave it out too.
+    """
+    _seed_run(client, "INV-WAITS", alert_id="es-tp", verdict="true_positive", actions=[_ESCALATE])
+    _seed_run(
+        client,
+        "INV-REPLAY",
+        alert_id="es-replay",
+        verdict="true_positive",
+        actions=[_ESCALATE],
+        started_by="backtest",
+    )
+    _seed_run(client, "INV-FP", alert_id="es-fp", verdict="false_positive", actions=[_ACK])
+    _seed_run(client, "INV-BARE", alert_id="es-bare", verdict="true_positive")
+    _seed_run(
+        client,
+        "INV-OLD",
+        alert_id="es-swapped",
+        verdict="true_positive",
+        actions=[_ESCALATE],
+        hours_ago=5,
+    )
+    _seed_run(client, "INV-NEW", alert_id="es-swapped", verdict="false_positive", hours_ago=1)
+    with patch("soc_ai.webui.alerts_query.fetch_groups", AsyncMock(return_value=GroupPage([], 0))):
+        count = _needs_you(client)["pending_actions"]
+    since = (datetime.now(UTC) - timedelta(days=30)).isoformat()
+    body = _pending_list(client, since=since)
+    assert [row["id"] for row in body["rows"]] == ["INV-WAITS"]
+    assert body["rows"][0]["pendingActions"] == 1
+    assert body["total"] == count == 1
+    # The replay stays out even when the list asks for replays.
+    with_replays = _pending_list(client, since=since, include_backtest="true")
+    assert [row["id"] for row in with_replays["rows"]] == ["INV-WAITS"]
+
+
+def test_the_pending_action_filter_reads_the_list_window(client: TestClient) -> None:
+    _seed_run(
+        client,
+        "INV-OLD-TP",
+        alert_id="es-old",
+        verdict="true_positive",
+        actions=[_ESCALATE],
+        hours_ago=48,
+    )
+    since = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
+    assert _pending_list(client, since=since)["rows"] == []
+    assert [r["id"] for r in _pending_list(client)["rows"]] == ["INV-OLD-TP"]
+
+
+def test_an_empty_pending_set_lists_nothing(client: TestClient) -> None:
+    """NEGATIVE CONTROL. No run waits, so the filter matches no row.
+
+    An empty id set must not read as "no filter".
+    """
+    _seed_run(client, "INV-FP", alert_id="es-fp", verdict="false_positive", actions=[_ACK])
+    body = _pending_list(client)
+    assert body["rows"] == []
+    assert body["total"] == 0
+
+
+def test_the_plain_list_carries_no_pending_count(client: TestClient) -> None:
+    """Backward compatible: the field is filled only under the filter."""
+    _seed_run(client, "INV-WAITS", alert_id="es-tp", verdict="true_positive", actions=[_ESCALATE])
+    rows = client.get("/api/v1/investigations").json()["rows"]
+    assert rows[0]["pendingActions"] is None

@@ -95,7 +95,9 @@ def test_a_shadow_analytic_carries_its_record_and_its_week(client: TestClient) -
 def test_a_live_analytic_carries_no_shadow_record(client: TestClient) -> None:
     """Negative control: the record is a fact about the shadow status."""
     _seed(client, shadow_days_ago=9)
-    res = client.post(f"/api/v1/analytics/{_LOCAL}/status", json={"to": "live", "why": "ok"})
+    res = client.post(
+        f"/api/v1/analytics/{_LOCAL}/status", json={"to": "live", "why": "ok, the hits are real"}
+    )
     assert res.status_code == 200, res.text
     detail = client.get(f"/api/v1/analytics/{_LOCAL}").json()
     assert detail["status"] == "live"

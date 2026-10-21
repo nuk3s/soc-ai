@@ -112,7 +112,7 @@ describe('One needs-you count on the tile, the badges and the bell', () => {
     // The bell: the badge and the header state the same total.
     await waitFor(() => expect(screen.getByTestId('notif-badge').textContent).toBe('5'));
     act(() => screen.getByRole('button', { name: /^Notifications/ }).click());
-    expect(screen.getByTestId('notif-summary').textContent).toBe('5 need you · 1 event');
+    expect(screen.getByTestId('notif-summary').textContent).toBe('5 need you · 1 notification');
 
     // One read feeds all three. Three surfaces polling apart could each catch
     // a different moment.

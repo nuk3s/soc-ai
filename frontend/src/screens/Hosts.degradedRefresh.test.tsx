@@ -142,7 +142,7 @@ const mountEmpty = async (
     </MemoryRouter>,
   );
   // In the empty state whatever it decides to say above it.
-  await screen.findByText(/turn on scheduled sweeps/);
+  await screen.findByText(/Turn on scheduled sweeps/);
 };
 
 describe('Hosts sweep report — a degraded sweep vs a quiet one', () => {
@@ -279,25 +279,25 @@ describe('Hosts first run — a sweep that died is not a sweep that never ran', 
   it('says the first sweep failed rather than that no sweep has run', async () => {
     // Fresh install against a down grid: the sweep ran, read nothing and built
     // nothing, so the table is empty and the screen takes its first-run branch.
-    // Every word of "hasn't run yet" is false over the catch-all payload, and
+    // Every word of "has not run yet" is false over the catch-all payload, and
     // the operator who just watched the spinner stop is the one reading it.
     await mountEmpty({ errors: ['refresh failed; see server logs'] });
     const note = await screen.findByTestId('sweep-degraded');
     expect(note.textContent).toMatch(/1 error\b/);
     expect(screen.getByTestId('hosts-empty-lead').textContent).toMatch(/could not read/i);
-    expect(screen.queryByText(/sweep hasn't run yet/i)).toBeNull();
+    expect(screen.queryByText(/sweep has not run yet/i)).toBeNull();
   });
 
   it('still says no sweep has run when none has', async () => {
     await mountEmpty(null, null);
-    expect(screen.getByTestId('hosts-empty-lead').textContent).toMatch(/hasn't run yet/i);
+    expect(screen.getByTestId('hosts-empty-lead').textContent).toMatch(/has not run yet/i);
     expect(screen.queryByTestId('sweep-degraded')).toBeNull();
   });
 });
 
 // Degraded-grid sweep, 2026-08-14 (D17). The first sweep of a fresh install was
 // started, the POST answered, the button dimmed and span its spinner — and the
-// sentence above it went on reading "The network sweep hasn't run yet" for as
+// sentence above it went on reading "The network sweep has not run yet" for as
 // long as the sweep took. On a grid that answers slowly that is minutes, and the
 // only thing on screen that contradicted it was a disabled button.
 //
@@ -310,14 +310,14 @@ describe('Hosts first run — a sweep in flight is not a sweep that has not run'
     // is exactly the state the operator who just pressed the button is in.
     await mountEmpty(null, null, true);
     // The status is a second request, so wait for the screen to have READ it —
-    // "hasn't run yet" is also what renders while it is still in flight.
+    // "has not run yet" is also what renders while it is still in flight.
     const lead = await screen.findByTestId('hosts-empty-lead');
     await waitFor(() => expect(lead.textContent).toMatch(/sweep is running now/i));
-    expect(lead.textContent).not.toMatch(/hasn't run yet/i);
-    expect(screen.queryByText(/hasn't run yet/i)).toBeNull();
+    expect(lead.textContent).not.toMatch(/has not run yet/i);
+    expect(screen.queryByText(/has not run yet/i)).toBeNull();
     // The reassurance about what a sweep does survives the rewrite — it is the
     // sentence that answers "is this going to touch my network?".
-    expect(lead.textContent).toMatch(/nothing new touches your network/i);
+    expect(lead.textContent).toMatch(/sends no traffic to your network/i);
   });
 
   it('lets the running sweep supersede the last one’s blind verdict', async () => {
@@ -346,7 +346,7 @@ describe('Hosts first run — a sweep in flight is not a sweep that has not run'
     await mountEmpty(null, null, false);
     const button = screen.getByRole('button', { name: /run the first sweep/i });
     expect(button).not.toBeDisabled();
-    expect(screen.getByTestId('hosts-empty-lead').textContent).toMatch(/hasn't run yet/i);
+    expect(screen.getByTestId('hosts-empty-lead').textContent).toMatch(/has not run yet/i);
   });
 
   it('says it could not check, rather than that none has run, when the status read fails', async () => {
@@ -373,7 +373,7 @@ describe('Hosts first run — a sweep in flight is not a sweep that has not run'
     expect(lead.textContent).toMatch(/503 Service Unavailable/);
     // The negative is proven live by the controls above, where this same regex
     // DOES match the healthy lead.
-    expect(screen.queryByText(/hasn't run yet/i)).toBeNull();
+    expect(screen.queryByText(/has not run yet/i)).toBeNull();
     // The one action survives, under a label that does not claim a first.
     const button = screen.getByRole('button', { name: /^run a sweep$/i });
     expect(button).not.toBeDisabled();
@@ -385,7 +385,7 @@ describe('Hosts first run — a sweep in flight is not a sweep that has not run'
 // The NON-admin read (task #91). GET /dossiers/refresh is admin-gated because
 // `last_summary` carries the sweep's raw failure strings — so until this task
 // the screen never asked ANYTHING for an analyst, and its empty state read
-// "The network sweep hasn't run yet" over a sweep that ran and died: the false
+// "The network sweep has not run yet" over a sweep that ran and died: the false
 // all-clear, served to the role least able to check. A non-admin now reads the
 // CLOSED sweep-health projection (running / degraded / last_run / error COUNT
 // — never the strings), and these tests pin both halves of that decision: the
@@ -441,7 +441,7 @@ describe('Hosts sweep report for a NON-admin — the projection keeps the screen
     mountScreen();
     const lead = await settledLead('blind');
     expect(lead.textContent).toMatch(/could not read/i);
-    expect(screen.queryByText(/hasn't run yet/i)).toBeNull();
+    expect(screen.queryByText(/has not run yet/i)).toBeNull();
     // The verdict and the count travel; the strings do not. The negative
     // selector is proven live by the admin tests above, where the same regex
     // DOES match the rendered strings.
@@ -461,13 +461,13 @@ describe('Hosts sweep report for a NON-admin — the projection keeps the screen
     mountScreen();
     const lead = await settledLead('running');
     expect(lead.textContent).toMatch(/sweep is running now/i);
-    expect(screen.queryByText(/hasn't run yet/i)).toBeNull();
+    expect(screen.queryByText(/has not run yet/i)).toBeNull();
     expect(screen.queryByTestId('sweep-degraded')).toBeNull();
   });
 
   it('keeps the genuine first-run copy on a healthy fresh install (the control)', async () => {
     // A fresh estate whose sweep record is healthy-and-absent must keep the
-    // honest "hasn't run yet" — a projection that always degraded would be the
+    // honest "has not run yet" — a projection that always degraded would be the
     // same false story pointing the other way.
     asAnalyst();
     vi.mocked(listMachines).mockResolvedValue(NO_HOSTS);
@@ -475,7 +475,7 @@ describe('Hosts sweep report for a NON-admin — the projection keeps the screen
     stubSweepHealth({ running: false, degraded: false, last_run: null, error_count: 0 });
     mountScreen();
     const lead = await settledLead('read');
-    expect(lead.textContent).toMatch(/hasn't run yet/i);
+    expect(lead.textContent).toMatch(/has not run yet/i);
     // The analyst's action line survives; the admin's buttons stay hidden.
     expect(screen.getByText(/An admin starts it from this screen/i)).toBeTruthy();
     expect(screen.queryByRole('button', { name: /run the first sweep/i })).toBeNull();
@@ -484,7 +484,7 @@ describe('Hosts sweep report for a NON-admin — the projection keeps the screen
 
   it('says it could not check, rather than that none has run, when the projection read fails', async () => {
     // Review finding on task #91: a transient failure of the sweep-health
-    // fetch at mount left the lead on the definite "hasn't run yet" while the
+    // fetch at mount left the lead on the definite "has not run yet" while the
     // code itself filed the state as unknown — and the paused poll never
     // retried, so the false all-clear stood for the session. The same failure
     // on HostDetail reads "could not check"; this screen now says the same.
@@ -505,7 +505,7 @@ describe('Hosts sweep report for a NON-admin — the projection keeps the screen
     const lead = await settledLead('unreadable');
     expect(lead.textContent).toMatch(/could not check/i);
     // Proven live by the control above, where this regex DOES match the lead.
-    expect(screen.queryByText(/hasn't run yet/i)).toBeNull();
+    expect(screen.queryByText(/has not run yet/i)).toBeNull();
     // Could-not-check is not blind: no degraded banner on a verdict this
     // screen never obtained. The analyst's action line survives.
     expect(screen.queryByTestId('sweep-degraded')).toBeNull();

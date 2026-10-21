@@ -39,7 +39,7 @@ async def test_migration_creates_the_table(settings_kratos: Settings) -> None:
             lambda sc: {c["name"] for c in inspect(sc).get_columns("prior_spec_runs")}
         )
         row = await conn.execute(text("SELECT version_num FROM alembic_version"))
-        assert row.scalar_one() == "0063"
+        assert row.scalar_one() == "0064"
     # Why a dimension could not be measured, and what the sweep knew about
     # its baselines. Without the first, a refused query wrote no row and read
     # as blind; without the second, coverage counts implied "now".

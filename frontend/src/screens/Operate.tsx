@@ -4,6 +4,8 @@ import { Link } from 'react-router-dom';
 import { EscalationLedgerPanel } from '../components/EscalationLedgerPanel';
 import { HuntCatalogPanel } from '../components/HuntCatalogPanel';
 import { Panel, PanelHeader } from '../components/Panel';
+import { StatusDependenciesPanel } from '../components/StatusDependenciesPanel';
+import { StatusJobsPanel } from '../components/StatusJobsPanel';
 
 // ---------------------------------------------------------------------------
 // Operate — the hub for the operator's loop, as opposed to the analyst's
@@ -19,9 +21,16 @@ import { Panel, PanelHeader } from '../components/Panel';
 // WHERE each proof lives. Operate.test.tsx's poller guard pins that for every
 // api fn one of them could be tempted to reach for.
 //
-// The exceptions are the two live panels above them, and they are here for
-// the same reason: each answers a question about unattended machinery that
-// has no other owner in the app.
+// The exceptions are the live panels above them, and they are here for the
+// same reason: each answers a question about unattended machinery that has no
+// other owner in the app.
+//
+// The dependency block and the job list come first (H1-D14, R5-I4). The page
+// showed no dependency state and listed one unattended loop of six, so an
+// operator who opened it during an outage read green analytics rows and no
+// word about the grid. The dependency block reads GET /health, the same probe
+// the header pill reads. The job list reads the existing status route of each
+// job, plus GET /audit/verify-schedule. Both poll on the 5-minute cadence.
 //
 // The hunt catalog runs unattended — a scheduler sweep with no model call and,
 // when nothing fires, no visible trace anywhere else — so this is the one page
@@ -35,8 +44,8 @@ import { Panel, PanelHeader } from '../components/Panel';
 // alert. Reconciliation only happens on a later group press covering the same
 // alert, so a claim whose alert has left the queue is permanent — and until
 // that panel, invisible outside the database. Reads GET /escalations/stranded
-// on the same cadence. The guard in Operate.test.tsx admits exactly those two
-// calls and nothing else.
+// on the same cadence. The guard in Operate.test.tsx admits the panels' reads
+// by name, once each per 5-minute tick, and nothing else.
 // ---------------------------------------------------------------------------
 
 interface CardDef {
@@ -76,37 +85,37 @@ interface CardDef {
 const CARD_DEFS: CardDef[] = [
   {
     title: 'Model fitness',
-    purpose: 'Prove the analyst model is fit before triage depends on it.',
+    purpose: 'Measure if the model is fit for triage.',
     to: '/config#agent',
     icon: <Gauge size={16} />,
   },
   {
     title: 'Verdict quality',
-    purpose: 'Prove the verdicts held up. The nightly micro-eval shows the trend.',
+    purpose: 'Measure the quality of the verdicts. The nightly eval shows the trend.',
     to: '/config#quality',
     icon: <TrendingUp size={16} />,
   },
   {
     title: 'Audit chain',
-    purpose: 'Prove the tamper-evident record is intact.',
+    purpose: 'Verify that the tamper-evident record is intact.',
     to: '/config#diagnostics',
     icon: <ShieldCheck size={16} />,
   },
   {
     title: 'Backtest',
-    purpose: 'Replay history against today’s pipeline.',
+    purpose: 'Replay closed alerts through the current triage.',
     to: '/backtest',
     icon: <History size={16} />,
   },
   {
     title: 'Diagnostics',
-    purpose: 'The view from inside the app.',
+    purpose: 'Run the setup checks and read the results.',
     to: '/config#diagnostics',
     icon: <Stethoscope size={16} />,
   },
   {
     title: 'Runbooks',
-    purpose: 'The procedures that ground every verdict.',
+    purpose: 'Write the procedures that the model cites in a verdict.',
     to: '/runbooks',
     icon: <BookOpen size={16} />,
   },
@@ -129,18 +138,21 @@ export function Operate() {
           <div className="text-[20px] font-semibold tracking-[-.015em]">Status</div>
         </div>
         <div className="mt-0.5 max-w-[720px] text-[13px] text-dim">
-          The state of the machinery that runs without you. Check that the analytics run and that
-          each escalation has an answer. Open the proof that the model and the audit chain are
-          sound.
+          This page shows the state of the automatic work. Check that the grid and the model
+          gateway answer. Check that each job and each analytic runs. Check that each escalation
+          has an answer. Open the checks of the model and the audit chain.
         </div>
       </div>
 
       <div className="grid gap-4 md:grid-cols-2">
-        {/* First and full-width, in the same grid as the link cards rather
-            than a block of its own: it is the only live thing on the page
-            and the reason an operator comes here ("is it running?") is
-            answered before the orientation links, while the page keeps one
-            gutter rhythm instead of two stacked containers. */}
+        {/* First, because every job below needs them: is the grid up, and
+            does the model gateway answer? Then the jobs themselves. */}
+        <StatusDependenciesPanel />
+        <StatusJobsPanel />
+        {/* Full-width, in the same grid as the link cards rather than a
+            block of its own: the reason an operator comes here ("is it
+            running?") is answered before the orientation links, while the
+            page keeps one gutter rhythm instead of two stacked containers. */}
         <HuntCatalogPanel />
         {/* Second, and full-width for the same reason: a stranded claim is an
             alert that cannot be escalated, which is a live operational fact

@@ -1,4 +1,5 @@
 import { Disc, FlaskConical, Wrench } from 'lucide-react';
+import type { CSSProperties } from 'react';
 
 import { confidenceText, verdictMeta } from '../lib/labels';
 import { HUNT_KIND, KIND, SEVERITY, VERDICT } from '../lib/tokens';
@@ -271,16 +272,31 @@ export function RecordedRunChip() {
 }
 
 // ---- source / apply badges (config) ---------------------------------------
-export function SourceBadge({ source }: { source: 'db' | 'env' }) {
-  const db = source === 'db';
+// The origin of a setting value. ENV read for a code default too, so a value
+// set in .env and a default looked the same (dogfood 2026-10-19, R5-D7).
+const SOURCE_STYLE: Record<'db' | 'env' | 'default', { style: CSSProperties; title: string }> = {
+  db: {
+    style: { color: '#4b8bf5', background: 'rgba(75,139,245,.1)', borderColor: 'rgba(75,139,245,.3)' },
+    title: 'You saved this value in the console. It wins over .env and the default.',
+  },
+  env: {
+    style: { color: '#f5a623', background: 'rgba(245,166,35,.1)', borderColor: 'rgba(245,166,35,.3)' },
+    title: 'This value comes from the environment or the .env file.',
+  },
+  default: {
+    style: { color: '#8b949e', background: 'rgba(139,148,158,.08)', borderColor: 'rgba(139,148,158,.3)' },
+    title: 'soc-ai uses its code default for this value.',
+  },
+};
+
+export function SourceBadge({ source }: { source: 'db' | 'env' | 'default' }) {
+  const meta = SOURCE_STYLE[source] ?? SOURCE_STYLE.env;
   return (
     <span
+      data-testid="source-badge"
+      title={meta.title}
       className="rounded-chip border px-1.5 py-[1.5px] font-mono text-[9.5px] font-semibold uppercase"
-      style={
-        db
-          ? { color: '#4b8bf5', background: 'rgba(75,139,245,.1)', borderColor: 'rgba(75,139,245,.3)' }
-          : { color: '#f5a623', background: 'rgba(245,166,35,.1)', borderColor: 'rgba(245,166,35,.3)' }
-      }
+      style={meta.style}
     >
       {source}
     </span>

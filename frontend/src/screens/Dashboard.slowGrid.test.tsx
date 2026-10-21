@@ -91,7 +91,7 @@ describe('Dashboard on a slow grid', () => {
     );
     await mount();
     const banner = await screen.findByRole('alert');
-    expect(banner.textContent).toContain('Elasticsearch is slow. Counts can be late.');
+    expect(banner.textContent).toContain('The grid is slow. Counts can be late.');
     expect(banner.textContent).not.toContain('not reachable');
     expect(banner.getAttribute('data-tone')).toBe('warn');
     // The tiles that read the grid say so.

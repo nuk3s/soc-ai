@@ -5,7 +5,7 @@
 > there, unless you need a bare rsync, systemd and uv deploy. This guide installs
 > soc-ai under a system user, with a hardened systemd unit and a uv-managed venv.
 
-This is the end-to-end deployment guide for soc-ai against a real Security Onion
+This is the end-to-end deployment guide for soc-ai against a Security Onion
 3.x grid. The procedure produces a working install on a fresh VM in 30 minutes
 or less.
 
@@ -13,7 +13,7 @@ or less.
 > `203.0.113.x` and `198.51.100.x` addresses are RFC 5737 documentation ranges.
 > `<soc-ai-host>`, `<so-host>` and `<vm-host>` are placeholders.
 
-The shape of the install is:
+The install has this layout:
 
 ```
                     ┌──────────────────────────────────┐
@@ -56,10 +56,12 @@ The shape of the install is:
   - Port `:443` on the SO manager, for the web UI and Kratos
   - The HTTPS endpoint of the LiteLLM gateway
   - An embeddings model on the gateway, `RAG_EMBED_MODEL`. This one is optional.
-    Add it if you want semantic runbook search above the built-in keyword
-    ranking.
-- **Security Onion 3.0.0** with a non-default analyst account whose password you
-  know. The SO grid creates that account for you.
+    Add it if you want semantic runbook search in addition to the built-in
+    keyword ranking.
+- **Security Onion 3.0.0** with an analyst account whose password you know. The SO
+  grid does not create this account for soc-ai. Create it in SOC under
+  Administration → Users. [SECURITY-ONION-SETUP.md](SECURITY-ONION-SETUP.md) states
+  the privileges that the account needs.
 - **A LiteLLM gateway** with the analyst model alias `soc-ai-analyst`
   configured. You can also set `ANALYST_MODEL` to any model that the gateway
   serves. You need a bearer token for the gateway.
@@ -91,10 +93,10 @@ rsync -av \
     <repo-checkout>/ soc-ai@<vm-host>:/opt/soc-ai/
 ```
 
-> **SELinux trap on Fedora 43:** the managed Python of uv lives in
+> **SELinux on Fedora 43:** the managed Python of uv lives in
 > `$HOME/.local/share/uv/python/...`. That path has an SELinux context that
 > systemd refuses to exec from. Use the system `python3.12` from `/usr/bin`.
-> The first lab install found this trap.
+> The first lab install found this problem.
 
 ```bash
 # As the soc-ai user on the VM:
@@ -185,7 +187,7 @@ AGENT_REQUEST_LIMIT=18
 SYNTHESIS_CONFIDENCE_FLOOR=0.6
 ```
 
-Lock down the permissions:
+Restrict the permissions:
 ```bash
 sudo chmod 600 /opt/soc-ai/.env
 sudo chown soc-ai:soc-ai /opt/soc-ai/.env
@@ -237,7 +239,7 @@ The unit applies the safe hardening set: `PrivateTmp`, `ProtectSystem=full`,
 `MemoryDenyWriteExecute`, and dropped capabilities. See
 `scripts/systemd/soc-ai.service` for the full list and the rationale.
 
-The unit sets `UMask=0077`, so each file the service makes is readable by the service user only.
+The unit sets `UMask=0077`, so only the service user can read a file that the service makes.
 The SQLite store holds the password hashes. soc-ai makes the store file and its WAL files mode
 0600 and the data directory mode 0700. It also tightens an older 0644 store when it opens it.
 A copy of the unit from an older release has no `UMask` line. Copy the unit again after an
@@ -260,9 +262,9 @@ sudo firewall-cmd --reload
 ## 7. Audit-index role grant on the SO manager
 
 Run this step one time. The default SO `analyst` role lacks `auto_configure` and
-`create_index` on `soc-ai-audit-*`. As a result, every audit write from the
-orchestrator fails with a 403. You can verify that in `journalctl -u soc-ai`. A
-read-only investigation still completes, without its forensic trail. A write does not.
+`create_index` on `soc-ai-audit-*`. As a result, every audit write from soc-ai
+fails with a 403. You can verify that in `journalctl -u soc-ai`. A read-only
+investigation still completes, without its forensic trail. soc-ai aborts a write.
 
 soc-ai ships with `AUDIT_FAIL_CLOSED=true`. Under that setting, soc-ai aborts every
 acknowledge, escalate-to-case and add-comment until the grant exists. The tool result
@@ -287,7 +289,7 @@ creates today's audit index.
 **This optional section applies only if your gateway serves a reasoning model that
 emits `<think>`.** The setup is specific to the model. soc-ai carries the `<think>`
 traces of a model into the SSE stream as `model_response.reasoning_trace` payloads. If
-your `ANALYST_MODEL` emits no reasoning, skip this section. Nothing breaks.
+your `ANALYST_MODEL` emits no reasoning, skip this section. soc-ai works without it.
 
 To turn it on, configure the LiteLLM and vLLM gateway to split `<think>` into the
 `reasoning_content` field on the response. Set these:
@@ -333,7 +335,7 @@ uv run soc-ai triage <alert_id> --url https://<soc-ai-host>:8443
 
 The shipped default `API_AUTH_REQUIRED=true` makes these commands authenticate
 too, the same as a browser. Pass `--token scai_...`, or set `SOC_AI_API_TOKEN`.
-Mint a token in the console under Config → API tokens. Without a token, `healthz`
+Create a token in the console under Settings → API tokens. Without a token, `healthz`
 and `triage` get a 401, and the CLI prints a one-line reminder of the fix.
 
 With `API_AUTH_REQUIRED=false`, the doctor row "authentication" lists the addresses that listen
@@ -363,15 +365,36 @@ triage_report  FALSE_POSITIVE  confidence=0.7
 done           recommended_count=1 rounds=1
 ```
 
+### First sign-in and admin recovery
+
+Sign in as `admin` with the bootstrap password. Then change it in the account
+menu with **Change password**. Until you change it, the doctor row
+`admin password` is WARN. The doctor reads the sidecar file and
+`BOOTSTRAP_ADMIN_PASSWORD` in `.env` for that check.
+
+If no admin can sign in, set a new password from the host:
+
+```bash
+uv run soc-ai users reset-password admin
+# Docker deploy
+docker compose exec soc-ai soc-ai users reset-password admin
+```
+
+The command prints a new random password once. It ends every session of the
+account and revokes the API tokens that the account created. Sign in with the
+new password, then change it. A locked username unlocks after 5 minutes.
+`soc-ai users list` prints each account with its role and state.
+
 ---
 
 ## 10. Common errors and fixes
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `audit log write failed (event dropped) … indices:admin/auto_create … unauthorized for [analyst]` | The audit-index role grant is missing. `AUDIT_FAIL_CLOSED=true` is the default. Under it, soc-ai aborts every ack, escalate and comment until the grant lands. | Run `scripts/setup-audit-index.sh` on the SO manager. |
+| `audit log write failed (event dropped) … indices:admin/auto_create … unauthorized for [analyst]` | The audit-index role grant is missing. `AUDIT_FAIL_CLOSED=true` is the default. Under it, soc-ai aborts every ack, escalate and comment until the grant exists. | Run `scripts/setup-audit-index.sh` on the SO manager. |
 | `ContextWindowExceededError … input_tokens 65537` | The accumulated tool results exceeded the 64K serving window. | Lower `AGENT_TOOL_CALLS_LIMIT`. Its default is 25. Or raise `SYNTHESIS_CONFIDENCE_FLOOR`, so the retask happens later. |
 | "writes fail with `Kratos login flow init failed`" | The Kratos auth prefix is wrong for SO 3.0. | Set `SO_KRATOS_PATH_PREFIX=/auth`. That is the default. A write uses the SO web API and the Kratos session. It does not use the Connect API. |
+| `TypeError: Failed to fetch` on the first page load of the console | The browser does not trust the self-signed certificate of section 4. | Open `https://<soc-ai-host>:8443/healthz` once in the same browser. Accept the certificate warning. Load the console again. |
 | The service does not start after a code update | The venv is out of sync. | `cd /opt/soc-ai && uv sync && sudo systemctl restart soc-ai`. |
 
 ---
@@ -436,9 +459,9 @@ example value is `PROXY_TRUSTED_IPS=203.0.113.10`. `PROXY_TRUSTED_IPS` takes add
 and CIDR blocks.
 
 The login throttle and the API rate limit are keyed per client IP address.
-Without this setting, the proxy's own socket IP address stands in for every
-client, so all users share one bucket. A few failed logins across the team can
-then lock everyone out until the cooldown expires.
+Without this setting, soc-ai sees the IP address of the proxy for every client.
+All users then share one rate-limit bucket. A few failed logins across the team
+can then lock out every user until the cooldown expires.
 
 soc-ai trusts `X-Forwarded-For` and `X-Forwarded-Proto` only from a peer on this
 list. Any client can forge these headers. Leave the list empty if clients connect

@@ -49,3 +49,33 @@ def test_the_chart_carries_no_dash_and_no_ellipsis() -> None:
     chart = _chart()
     for mark in ("\u2014", "\u2013", "\u2026", "..."):
         assert mark not in chart, repr(mark)
+
+
+def test_the_chart_uses_the_console_definitions() -> None:
+    # Dogfood 2026-10-19, V1-S2: the chart kept the older definitions and
+    # named the "Overview tile". The console says "Dashboard", "An analytic is
+    # one written detection" and "A hit is one match of one analytic".
+    chart = _chart()
+    for words in (
+        "One written detection.",
+        "One match of one analytic",
+        "One run against",
+        "the Dashboard tile",
+        "threat finding when the hunt ends.",
+    ):
+        assert words in chart, words
+
+
+def test_the_chart_states_no_retired_claim() -> None:
+    # Negative control: a hunt investigates its threat findings, and two
+    # findings can share one investigation. The chart said every finding.
+    chart = _chart()
+    for words in (
+        "Overview",
+        "detection logic",
+        "not finished until",
+        "its own investigation",
+        "investigates each one",
+        ">each finding<",
+    ):
+        assert words not in chart, words

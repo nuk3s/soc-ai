@@ -449,15 +449,13 @@ def test_run_turn_timeout_persists_user_facing_error_row() -> None:
     assert finish_mock.call_args.kwargs.get("status") == "error"
     content = finish_mock.call_args.kwargs.get("content", "")
     # User-facing + actionable, with the real seconds substituted in.
-    assert "ran out of time" in content
-    assert "0.01" in content
-    assert "narrower" in content
+    assert content == "soc-ai stopped after 0.01 seconds with no answer. Ask a narrower question."
 
 
 def test_run_turn_timeout_error_passthrough() -> None:
     """When agent.run itself raises TimeoutError (the asyncio.timeout deadline
     surfaces here), the timeout branch — not the generic-exception branch —
-    fires, producing the user-facing 'ran out of time' message."""
+    fires, producing the user-facing timeout message."""
 
     inv = MagicMock()
     inv.id = "inv-to"
@@ -510,8 +508,7 @@ def test_run_turn_timeout_error_passthrough() -> None:
     finish_mock.assert_called_once()
     assert finish_mock.call_args.kwargs.get("status") == "error"
     content = finish_mock.call_args.kwargs.get("content", "")
-    assert "ran out of time" in content
-    assert "42" in content
+    assert content == "soc-ai stopped after 42 seconds with no answer. Ask a narrower question."
 
 
 def test_run_turn_redacts_fabricated_tool_citations_on_zero_tool_turn() -> None:

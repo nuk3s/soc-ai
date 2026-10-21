@@ -927,6 +927,83 @@ def test_refresh_reports_the_master_switch(client: TestClient) -> None:
         state.settings.dossier_enabled = True
 
 
+def _seed_finished_run(
+    client: TestClient, *, finished_ago: timedelta, errors: list[str] | None = None
+) -> None:
+    """One stored sweep row, as ``_close_run`` leaves it, relative to now."""
+    from soc_ai.store.models import DossierRun
+
+    async def _run() -> None:
+        finished = datetime.now(UTC).replace(tzinfo=None) - finished_ago
+        maker = client.app.state.db_sessionmaker  # type: ignore[attr-defined]
+        async with maker() as db:
+            db.add(
+                DossierRun(
+                    started_at=finished - timedelta(minutes=4),
+                    finished_at=finished,
+                    trigger="schedule",
+                    hosts_seen=1,
+                    hosts_built=1,
+                    errors=errors,
+                )
+            )
+            await db.commit()
+
+    asyncio.run(_run())
+
+
+def test_sweep_health_after_a_restart_names_the_stored_sweep(client: TestClient) -> None:
+    """R4-D22: sweep-health said ``last_run: null`` while hosts/summary named
+    the sweep of 17 days ago. The in-memory status forgets the run on restart.
+    The stored run row does not, and both routes read it."""
+    _seed_host(
+        client,
+        "192.0.2.61",
+        event_count=5,
+        built_at=datetime.now(UTC).replace(tzinfo=None) - timedelta(days=17),
+    )
+    _seed_finished_run(client, finished_ago=timedelta(days=17))
+
+    health = client.get("/api/v1/dossiers/sweep-health").json()
+    summary = client.get("/api/v1/hosts/summary").json()
+    full = client.get("/api/v1/dossiers/refresh").json()
+
+    assert summary["last_sweep_at"] is not None
+    assert health["last_run"] == summary["last_sweep_at"]
+    assert full["last_run"] == summary["last_sweep_at"]
+    assert health["degraded"] is False
+
+
+def test_sweep_health_after_a_restart_keeps_a_failed_sweep_degraded(
+    client: TestClient,
+) -> None:
+    """A restart must not turn the last failed sweep into an all-clear."""
+    _seed_finished_run(
+        client, finished_ago=timedelta(hours=3), errors=["192.0.2.62: TimeoutError:"]
+    )
+
+    health = client.get("/api/v1/dossiers/sweep-health").json()
+
+    assert health["degraded"] is True
+    assert health["error_count"] == 1
+    assert "TimeoutError" not in str(health)
+
+
+def test_sweep_health_prefers_the_run_this_process_saw(client: TestClient) -> None:
+    """NEGATIVE CONTROL: the in-memory status wins when it holds a run."""
+    from soc_ai.api.webui.routes_dossier import _get_dossier_status
+
+    _seed_finished_run(client, finished_ago=timedelta(days=2), errors=["old failure"])
+    status = _get_dossier_status(client.app.state)  # type: ignore[attr-defined]
+    status.last_run = datetime.now(UTC).isoformat()
+    status.last_summary = {"errors": []}
+
+    health = client.get("/api/v1/dossiers/sweep-health").json()
+
+    assert health["last_run"] == status.last_run
+    assert health["degraded"] is False
+
+
 def test_refresh_worker_never_raises() -> None:
     """The background sweep releases the single-flight slot whatever happens —
     a task that died holding it would wedge the Rebuild button until a restart.
@@ -1139,6 +1216,66 @@ def test_activity_returns_peers_volume_users_and_alert_count(
     # copied cap constant. Two peers, no cut.
     assert data["peers_truncated"] is False
     assert data["users_truncated"] is False
+
+
+def test_activity_names_the_auth_datasets_and_the_newest_event(
+    settings_kratos: Settings,
+) -> None:
+    """Dogfood 2026-10-19 (R4-D5, R4-D9): two fields the page needs on the wire.
+
+    ``auth_datasets`` lets the Users card say which logs it read. The card
+    read Linux logs alone and said "no host-log users" on every Windows host.
+    ``newest_event`` is the newest connection record, for "last seen". The
+    page used the start of the newest chart bucket.
+    """
+    from soc_ai.dossier.profile import LOGON_CANDIDATES
+
+    responder = _grid_responder()
+    newest = (datetime.now(UTC) - timedelta(minutes=3)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    async def _search(**kwargs: Any) -> dict[str, Any]:
+        answer = await responder(**kwargs)
+        if "volume" in ((kwargs.get("body") or {}).get("aggs") or {}):
+            answer["aggregations"]["newest"] = {"value": 1.0, "value_as_string": newest}
+        return answer
+
+    for client in _client(settings_kratos, es_search=_search):
+        data = client.get(f"/api/v1/dossiers/{_ACTIVITY_IP}/activity").json()
+        # Named also when no auth document came back: the card says what it read.
+        assert data["users"] is None
+        assert data["auth_datasets"] == list(LOGON_CANDIDATES)
+        assert data["newest_event"] == newest
+
+
+def test_activity_states_the_end_of_its_window(settings_kratos: Settings) -> None:
+    """Dogfood round 2 (V2-1): the page needs the end of the window to prorate.
+
+    The 24h series holds 25 hourly buckets and the 7d series 8 daily ones. The
+    two edge buckets lie partly outside the window, and the rate can only
+    count their part with the time of the read.
+    """
+    responder = _grid_responder()
+    for client in _client(settings_kratos, es_search=responder):
+        before = datetime.now(UTC)
+        data = client.get(f"/api/v1/dossiers/{_ACTIVITY_IP}/activity").json()
+        after = datetime.now(UTC)
+        end = datetime.fromisoformat(data["window_end"].replace("Z", "+00:00"))
+        assert data["window_end"].endswith("Z")
+        assert before - timedelta(seconds=1) <= end <= after + timedelta(seconds=1)
+
+
+def test_every_activity_field_reaches_the_wire() -> None:
+    """The route builds the top-level model field by field, not with ``**asdict``.
+
+    A field added to the dataclass and not to the route would be dropped
+    without an error. This compares the two field sets.
+    """
+    from dataclasses import fields as dataclass_fields
+
+    from soc_ai.api.webui.routes_dossier import HostActivityOut
+    from soc_ai.webui.host_activity import HostActivity
+
+    assert {f.name for f in dataclass_fields(HostActivity)} == set(HostActivityOut.model_fields)
 
 
 def test_activity_names_peers_from_the_dossier(activity_client: TestClient) -> None:

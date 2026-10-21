@@ -183,8 +183,10 @@ def test_config_renders_staged_value_for_non_hot_override(client: TestClient) ->
     'db' badge), not the empty pre-restart live value that made a just-saved URL
     look like it vanished."""
     before = _config_item(client, "misp_url")
-    assert before["source"] == "env"
+    # The fixture does not set MISP_URL: the origin is the code default.
+    assert before["source"] == "default"
     assert before["value"] == ""
+    assert before["pending_restart"] is False
 
     save = client.post(
         "/api/v1/config/setting",
@@ -198,3 +200,5 @@ def test_config_renders_staged_value_for_non_hot_override(client: TestClient) ->
     after = _config_item(client, "misp_url")
     assert after["source"] == "db"
     assert after["value"] == "https://misp.newhost.example"
+    # The saved value waits for a restart, and the row says so (R5-D22).
+    assert after["pending_restart"] is True

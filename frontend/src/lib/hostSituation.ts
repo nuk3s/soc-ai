@@ -51,6 +51,21 @@ function openState(lead: Lead): OpenState {
  *  nobody has touched, what soc-ai is about to hunt, what a hunt holds now. */
 const URGENCY: Record<OpenState, number> = { decision: 0, new: 1, queued: 2, hunting: 3 };
 
+/** The rank of a finished hunt's outcome among the leads that wait on a
+ *  decision: a threat first, then a hunt that could not read part of the
+ *  data, then a hunt that could not run, then a clean hunt. The hero
+ *  headlined a clean lead above a lead whose hunt found a threat (dogfood
+ *  2026-10-19, R4-D7). */
+function outcomeRank(lead: Lead): number {
+  if (openState(lead) !== 'decision') return 0;
+  const code = (lead.hunt_outcome ?? '').toLowerCase();
+  const label = (lead.hunt_outcome_label ?? '').trim().toLowerCase();
+  if (code === 'threats' || (lead.hunt_threat_count ?? 0) > 0 || label.startsWith('threat')) return 0;
+  if (code === 'gap' || label.includes('visibility gap')) return 1;
+  if (code === 'failed' || label.startsWith('could not run')) return 2;
+  return 3;
+}
+
 /** The sentence for the outcome of a finished hunt. */
 export function huntOutcomeSentence(label: string | null | undefined): string {
   const text = (label ?? '').trim();
@@ -88,7 +103,10 @@ export function leadLine(lead: Lead): SituationLine {
 export function openLeads(leads: readonly Lead[]): Lead[] {
   return leads
     .filter((l) => OPEN.has(l.status))
-    .sort((a, b) => URGENCY[openState(a)] - URGENCY[openState(b)] || b.id - a.id);
+    .sort(
+      (a, b) =>
+        URGENCY[openState(a)] - URGENCY[openState(b)] || outcomeRank(a) - outcomeRank(b) || b.id - a.id,
+    );
 }
 
 /** The lead lines: the most urgent lead in full, then a count of the rest.
@@ -109,6 +127,25 @@ export function leadLines(leads: readonly Lead[], total?: number | null): Situat
     });
   }
   return lines;
+}
+
+/** The scope words of the investigation line. The count covers every
+ *  investigation of the machine. */
+export const SCOPE_INVESTIGATIONS = 'all time';
+
+/** The investigation line: the true positives of the machine, over all
+ *  time, with the filtered list as its proof. No line without a true
+ *  positive: the Investigations block below the hero holds the count. */
+export function investigationLines(total: number, truePositives: number, to: string): SituationLine[] {
+  if (total <= 0 || truePositives <= 0) return [];
+  return [
+    {
+      text: `${plural(truePositives, 'investigation')} of this host reached a true-positive verdict.`,
+      to,
+      tone: 'alarm',
+      scope: SCOPE_INVESTIGATIONS,
+    },
+  ];
 }
 
 /** "today", "1 day ago", "5 days ago". */

@@ -14,6 +14,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
 }));
 
 import type { EntityObservation, Lead } from '../lib/api';
+import { sweepWindowWords } from '../lib/hostDossier';
 import { leadLines, verdictLines } from '../lib/hostSituation';
 import type { Dossier, DossierField, DossierFieldName, MachineDetail } from '../lib/types';
 import { HostAddresses } from './HostAddresses';
@@ -221,5 +222,36 @@ describe('the hero lines state their scope', () => {
     );
     const scopes = within(screen.getByTestId('host-situation')).getAllByTestId('situation-scope');
     expect(scopes.map((s) => s.textContent)).toEqual(['all open leads', 'last 7 days']);
+  });
+});
+
+// Dogfood 2026-10-19, R4-D10: "events in the last 14 days" labelled a count
+// from a sweep 17 days old. An old sweep names its age.
+describe('an old sweep names its age', () => {
+  const builtAt = new Date(Date.now() - 17 * DAY).toISOString();
+
+  it('labels the hero count by the sweep age', () => {
+    render(<HostHero dossier={dossier({ lookback_days: 14, last_built_at: builtAt })} adminBlocked={false} />);
+    expect(screen.getByTestId('hero-events').textContent).toBe(
+      '3,662 events in the 14 days before the sweep 17d ago',
+    );
+  });
+
+  it('labels the address table by the sweep age', () => {
+    render(
+      <MemoryRouter>
+        <HostAddresses machine={machine()} focusAddress={null} focusField={null} windowDays={14} builtAt={builtAt} />
+      </MemoryRouter>,
+    );
+    const table = screen.getByTestId('host-addresses');
+    expect(
+      within(table).getAllByRole('columnheader', { name: 'Events, 14 days before the sweep 17d ago' }),
+    ).toHaveLength(2);
+  });
+
+  it('keeps the plain window for a sweep of the last day', () => {
+    // NEGATIVE CONTROL: a fresh sweep counts the last 14 days.
+    expect(sweepWindowWords(14, new Date(Date.now() - 3_600_000).toISOString())).toBe('last 14 days');
+    expect(sweepWindowWords(null, builtAt)).toBe('window of the sweep 17d ago');
   });
 });

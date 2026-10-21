@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Bell } from 'lucide-react';
+import { HelpText } from '../components/HelpText';
 import { CollapseChevron } from '../components/Panel';
 import {
   clearNotifyWebhook,
@@ -13,8 +14,8 @@ import type { NotifyWebhookStatus } from '../lib/api';
  * Notifications — the outbound-webhook secret + a "Send test" validation.
  *
  * The master toggle, per-trigger toggles, format select, and TP threshold are
- * ordinary settings rendered in the "Notifications" settings group above this
- * panel. This panel owns the WEBHOOK URL (a write-only, Fernet-encrypted secret)
+ * ordinary settings rendered in the "Notifications" settings section. The text
+ * links to it. This panel owns the WEBHOOK URL (a write-only, Fernet-encrypted secret)
  * and the Test button.
  *
  * EGRESS: everything here is inert until the operator both sets a webhook URL AND
@@ -131,13 +132,16 @@ export function NotificationsPanel({
       </div>
       {!collapsed && (
         <>
+          {/* The Settings page shows one section at a time, so "above" named a
+              section the operator could not see (dogfood 2026-10-19, R5-D18).
+              HelpText makes each "Settings > <section>" a link. */}
           <div className="mb-3 text-[12.5px] leading-[1.5] text-dim">
-            This webhook is one of the outbound egress paths in soc-ai. The Egress policy section
-            lists every path. soc-ai stores the URL encrypted, applies it live and never shows it
-            again. soc-ai sends nothing until you set
-            this URL <strong>and</strong> turn on "Notifications enabled" above. Use{' '}
+            <HelpText text="This webhook is one of the outbound egress paths in soc-ai. Settings > Egress policy lists every path." />{' '}
+            soc-ai stores the URL encrypted, applies it live and never shows it again. soc-ai
+            sends nothing until you set this URL <strong>and</strong>{' '}
+            <HelpText text={'turn on "Notifications enabled" in Settings > Notifications.'} /> Use{' '}
             <strong>Send test</strong> to check the destination first. The test sends a synthetic
-            message with no internal data. The test does not need the master toggle.
+            message with no internal data. The test does not need "Notifications enabled".
           </div>
           <div className="overflow-hidden rounded-card border border-border bg-surface-1">
             <div className="border-b border-border-faint px-[15px] py-3 last:border-0">
@@ -145,8 +149,7 @@ export function NotificationsPanel({
                 <div className="min-w-0 flex-1">
                   <div className="text-[13px] font-medium">Webhook URL</div>
                   <div className="mt-0.5 text-[11.5px] leading-[1.4] text-faint">
-                    soc-ai sends notifications to this destination. Pick the generic JSON, Slack
-                    or Matrix format above.
+                    <HelpText text="soc-ai sends notifications to this destination. Pick the generic JSON, Slack or Matrix format in Settings > Notifications." />
                   </div>
                 </div>
                 <span

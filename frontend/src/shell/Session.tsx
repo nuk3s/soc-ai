@@ -1,6 +1,6 @@
-import { createContext, useContext, useEffect, useState } from 'react';
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import type { ReactNode } from 'react';
-import { ApiError, getMe } from '../lib/api';
+import { ApiError, PASSWORD_CHANGED_EVENT, getMe } from '../lib/api';
 import type { Me } from '../lib/types';
 
 /**
@@ -23,13 +23,16 @@ interface SessionState {
   status: SessionStatus;
   /** Null until /me answers, and when it failed for a non-401 reason. */
   me: Me | null;
+  /** Read /me again. A password change calls it, so the shell banner for the
+   *  generated password hides (H1-D5). The status stays `ready`. */
+  refresh: () => void;
 }
 
 const Ctx = createContext<SessionState | null>(null);
 
 // Outside a SessionProvider (unit tests that mount one shell piece) the shell
 // runs ungated, the way it did before the gate existed.
-const UNGATED: SessionState = { status: 'ready', me: null };
+const UNGATED: SessionState = { status: 'ready', me: null, refresh: () => {} };
 
 function isUnauthorized(e: unknown): boolean {
   if (e instanceof ApiError) return e.status === 401;
@@ -38,7 +41,11 @@ function isUnauthorized(e: unknown): boolean {
 }
 
 export function SessionProvider({ children }: { children: ReactNode }) {
-  const [state, setState] = useState<SessionState>({ status: 'pending', me: null });
+  const [state, setState] = useState<Omit<SessionState, 'refresh'>>({ status: 'pending', me: null });
+  // Bumped to read /me again. The first read opens the gate. A later read
+  // keeps the gate open and keeps the last answer when it fails.
+  const [reads, setReads] = useState(0);
+  const refresh = useCallback(() => setReads((n) => n + 1), []);
   useEffect(() => {
     let alive = true;
     getMe()
@@ -49,13 +56,19 @@ export function SessionProvider({ children }: { children: ReactNode }) {
         if (!alive) return;
         // A 401 leaves the gate shut: the redirect to login is already running.
         if (isUnauthorized(e)) return;
-        setState({ status: 'ready', me: null });
+        setState((s) => (s.status === 'pending' ? { status: 'ready', me: null } : s));
       });
     return () => {
       alive = false;
     };
-  }, []);
-  return <Ctx.Provider value={state}>{children}</Ctx.Provider>;
+  }, [reads]);
+  // A password change anywhere in the console changes password_is_generated.
+  useEffect(() => {
+    window.addEventListener(PASSWORD_CHANGED_EVENT, refresh);
+    return () => window.removeEventListener(PASSWORD_CHANGED_EVENT, refresh);
+  }, [refresh]);
+  const value = useMemo(() => ({ ...state, refresh }), [state, refresh]);
+  return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }
 
 export function useSession(): SessionState {

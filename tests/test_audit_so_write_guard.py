@@ -7,9 +7,9 @@ refuses (or disarms) a write over a hunt-kind anchor must do the same over a
 lead-kind anchor: ``hunt_anchor_ids`` itself, ``POST /investigate`` (runs with
 SO writes off) and ``POST /alerts/ack-events`` (refuses the id outright).
 
-Known trade-off, the same one already accepted for hunt-kind anchors: a lead
-whose anchor happens to be a real alert document has ack-events refused for
-that id. The analyst acks it from the alert itself.
+The anchors here are not in the alert feed: the mock grid holds no document
+with these ids. An anchor that the alert feed holds is a real alert, and every
+surface writes for it (tests/test_anchor_real_alert.py).
 """
 
 from __future__ import annotations

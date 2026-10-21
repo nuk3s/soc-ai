@@ -132,6 +132,30 @@ def not_backtest(model: Any = Investigation) -> Any:
     return func.coalesce(model.started_by, "") != BACKTEST_ACTOR
 
 
+def entity_match_sql(keys: Sequence[str]) -> Any:
+    """The SQL for a real run that names one of *keys*.
+
+    A key matches either end of the flow, or the reporting host in any case.
+    The caller expands a machine to every key it is stored under
+    (``host_machines.entity_expansion``), so one machine reads one set of
+    runs from any of its keys. Synth-eval runs and backtest replays never
+    match: neither is a run on the machine's own history. An empty key list
+    matches nothing.
+    """
+    held = [k.strip() for k in keys if k and k.strip()]
+    if not held:
+        return literal(False)
+    return and_(
+        or_(
+            Investigation.src_ip.in_(held),
+            Investigation.dest_ip.in_(held),
+            func.lower(Investigation.host_name).in_([k.lower() for k in held]),
+        ),
+        Investigation.is_synth_eval.is_(False),
+        not_backtest(),
+    )
+
+
 # The stored statuses the primacy rule prefers: a run that is still going or
 # that finished. Mirrors ``_primary_run_ids`` in the investigations route.
 _LIVE_STATUSES = ("running", "complete")
@@ -522,6 +546,37 @@ async def resolve(
     return inv
 
 
+async def record_follow_up(
+    db: AsyncSession, inv_id: str, *, follow_up_id: str, requested_by: str
+) -> None:
+    """Stamp the run that answers this one's Request more info.
+
+    The answer is a new run of the same alert, and the alert group links the
+    two on its own. A backtest replay stands alone and has no group, so its
+    page never named the run that answered it (dogfood 2026-10-19, R2-D12).
+    The link lives on the report, so it needs no column.
+    """
+    inv = await db.get(Investigation, inv_id)
+    if inv is None:
+        return
+    report = dict(inv.report or {})
+    report["follow_up"] = {
+        "id": follow_up_id,
+        "requested_by": requested_by,
+        "requested_at": utcnow().isoformat(),
+    }
+    inv.report = report
+    await db.commit()
+
+
+def follow_up_id(inv: Any) -> str | None:
+    """The id of the run that answers this run's Request more info, if any."""
+    report = getattr(inv, "report", None)
+    link = report.get("follow_up") if isinstance(report, dict) else None
+    fid = link.get("id") if isinstance(link, dict) else None
+    return str(fid) if fid else None
+
+
 async def dismiss_error(db: AsyncSession, inv_id: str) -> Investigation | None:
     """Stamp the operator's ack of a pipeline-error run.
 
@@ -875,6 +930,117 @@ async def latest_for_alerts(db: AsyncSession, alert_ids: list[str]) -> dict[str,
     )
 
 
+async def standing_for_alerts(db: AsyncSession, alert_ids: list[str]) -> dict[str, Investigation]:
+    """The newest COMPLETE, verdict-bearing run per alert: its standing verdict.
+
+    The per-alert twin of :func:`latest_complete_for_rules`. A rule-keyed
+    reader finds the newest run OF THE RULE NAME, and a newer run of the same
+    alert can carry another name: a lead promotion of the alert is named for
+    the lead. The Alerts row then opened a run its own page called superseded
+    (dogfood 2026-10-19, R2-D3). Same filters as :func:`latest_for_alerts`,
+    plus the complete-and-verdict rule of the standing verdict.
+    """
+    return await _latest_by(
+        db,
+        Investigation.alert_es_id,
+        alert_ids,
+        where=and_(
+            Investigation.status == "complete",
+            Investigation.verdict.is_not(None),
+            not_hunt_subject(),
+            not_backtest(),
+        ),
+    )
+
+
+# The ``resolved_via`` values :func:`resolve` stamps for a person's verdict: a
+# chat proposal the analyst applied, and a manual override from the UI. A
+# pipeline fallback stamps a resolution too, with no ``resolved_via``, and is
+# never an analyst verdict.
+ANALYST_RESOLUTIONS = ("chat", "manual")
+
+
+@dataclass(frozen=True)
+class AnalystVerdict:
+    """The verdict a person set on an alert, and the run it was set on."""
+
+    investigation_id: str
+    alert_es_id: str
+    verdict: str
+    resolved_via: str
+    resolved_by: str | None
+    resolved_at: str | None
+    rationale: str | None
+
+
+def analyst_resolution(inv: Any) -> dict[str, Any] | None:
+    """The run's resolution when a person set its verdict, else None."""
+    report = getattr(inv, "report", None)
+    resolution = report.get("resolution") if isinstance(report, dict) else None
+    if not isinstance(resolution, dict):
+        return None
+    if resolution.get("resolved_via") not in ANALYST_RESOLUTIONS:
+        return None
+    return resolution
+
+
+async def analyst_verdicts_for_alerts(
+    db: AsyncSession, alert_ids: Sequence[str]
+) -> dict[str, AnalystVerdict]:
+    """The standing analyst verdict per alert, over EVERY run of the alert.
+
+    The newest analyst resolution wins, by ``resolved_at``. The answer is NOT
+    the alert's latest run. A re-run lands a newer model verdict over the run
+    the analyst corrected, and the dogfood of 2026-10-19 (R2-D1) shows the cost:
+    the analyst set true positive, a re-run reached false positive, and the
+    auto-acknowledge closed the alert in Security Onion. A reader that asks only
+    the latest run cannot see the analyst at all.
+
+    A hunt-subject run is left out. Its ``alert_es_id`` names a cited document,
+    and a verdict about a hunt is not a verdict about that document. A backtest
+    replay stays in: an analyst who overrides a replay states a verdict about
+    the alert, and every caller of this function only ever holds a write back.
+    """
+    keys = sorted({a for a in alert_ids if a})
+    if not keys:
+        return {}
+    resolved_via = Investigation.report["resolution"]["resolved_via"].as_string()
+    rows = (
+        await db.scalars(
+            select(Investigation).where(
+                Investigation.alert_es_id.in_(keys),
+                resolved_via.in_(ANALYST_RESOLUTIONS),
+                not_hunt_subject(),
+            )
+        )
+    ).all()
+    out: dict[str, AnalystVerdict] = {}
+    ranks: dict[str, tuple[str, str, str]] = {}
+    for inv in rows:
+        resolution = analyst_resolution(inv)
+        if resolution is None or not inv.verdict:
+            continue
+        resolved_at = resolution.get("resolved_at")
+        rank = (
+            str(resolved_at or ""),
+            inv.created_at.isoformat() if inv.created_at else "",
+            inv.id,
+        )
+        if inv.alert_es_id in ranks and ranks[inv.alert_es_id] >= rank:
+            continue
+        ranks[inv.alert_es_id] = rank
+        out[inv.alert_es_id] = AnalystVerdict(
+            investigation_id=inv.id,
+            alert_es_id=inv.alert_es_id,
+            verdict=inv.verdict,
+            resolved_via=str(resolution.get("resolved_via")),
+            resolved_by=resolution.get("resolved_by"),
+            resolved_at=str(resolved_at) if resolved_at else None,
+            rationale=inv.rationale,
+        )
+    return out
+
+
 async def latest_replays_for_alerts(
     db: AsyncSession, alert_ids: list[str]
 ) -> dict[str, Investigation]:
@@ -964,6 +1130,34 @@ async def hunt_anchor_ids(db: AsyncSession, alert_ids: Sequence[str]) -> set[str
     return set(rows.all())
 
 
+async def hunt_anchor_kinds(db: AsyncSession, alert_ids: Sequence[str]) -> dict[str, str]:
+    """The ids of :func:`hunt_anchor_ids`, each with the promotion that anchors it.
+
+    The value is "lead" when a promoted lead anchors the id, else "finding".
+    The action rule names the promotion in its sentence: the row of a real
+    alert that a promoted lead anchors read "A promoted finding has no
+    Security Onion alert to act on." (dogfood 2026-10-20, V3-N3).
+    """
+    ids = [i for i in alert_ids if i]
+    if not ids:
+        return {}
+    rows = await db.execute(
+        select(Investigation.alert_es_id, Investigation.kind).where(
+            or_(Investigation.kind.in_(PROMOTED_KINDS), ~not_hunt_subject()),
+            Investigation.alert_es_id.in_(ids),
+        )
+    )
+    out: dict[str, str] = {}
+    for alert_id, kind in rows.all():
+        if not alert_id:
+            continue
+        if kind == "lead" or out.get(alert_id) == "lead":
+            out[alert_id] = "lead"
+        else:
+            out[alert_id] = "finding"
+    return out
+
+
 async def latest_per_finding(db: AsyncSession, hunt_id: str) -> dict[int, Investigation]:
     """Newest investigation per promoted finding of one hunt — the hunt page's
     per-card promotion state. One indexed query; first row seen per ordinal
@@ -994,6 +1188,7 @@ def _finding_card_columns() -> Any:
     """The columns a finding card reads. The blob columns stay unloaded."""
     return load_only(
         Investigation.id,
+        Investigation.hunt_id,
         Investigation.finding_ordinal,
         Investigation.status,
         Investigation.verdict,
@@ -1356,8 +1551,19 @@ async def query_page(
     limit: int = 100,
     offset: int = 0,
     include_backtest: bool = False,
+    ids: Sequence[str] | None = None,
+    entity_keys: Sequence[str] | None = None,
 ) -> InvestigationPage:
     """The investigations list as a real query: filters, counts and paging in SQL.
+
+    ``ids`` limits the rows and the counts to those run ids. The route builds
+    the set from a rule that SQL cannot state alone, for example the runs with
+    a pending recommended action. An empty set matches no row. None applies no
+    id filter.
+
+    ``entity_keys`` keeps the real runs that name one of the keys (see
+    :func:`entity_match_sql`). The route expands one entity to every key of
+    its machine, so the host page and the filtered list count the same runs.
 
     ``include_backtest`` puts the backtest replays (:func:`is_backtest`) into
     the rows and the counts. Off by default: a replay is a measurement, and
@@ -1425,6 +1631,11 @@ async def query_page(
         if stored:
             terms.append(and_(not_fallback, Investigation.verdict.in_(stored)))
         conds.append(or_(*terms))
+    if ids is not None:
+        # An empty IN list matches nothing, which is the meaning: no run waits.
+        conds.append(Investigation.id.in_(list(ids)))
+    if entity_keys is not None:
+        conds.append(entity_match_sql(entity_keys))
     needle = (q or "").strip()
     if needle:
         conds.append(
@@ -1903,6 +2114,7 @@ async def session_verdicts(
     *,
     community_id: str,
     exclude_id: str | None = None,
+    exclude_alert_es_id: str | None = None,
     window_minutes: int = SESSION_WINDOW_MINUTES,
     limit: int = 3,
 ) -> list[dict[str, Any]]:
@@ -1929,6 +2141,13 @@ async def session_verdicts(
     An empty ``community_id`` returns nothing rather than matching every row
     whose session is unknown. NULL is the absence of a session, never a shared
     one.
+
+    ``exclude_alert_es_id`` leaves out every run of the alert being triaged. A
+    re-run of an alert found its own earlier run here and read that verdict as
+    a second alert on the same session (dogfood 2026-10-19, R2-D9). The
+    constraint is about OTHER alerts of the session. An earlier run of this
+    alert is the alert's own history, and an analyst verdict on it reaches the
+    run on its own path.
 
     Returns light digests (never full reports)::
 
@@ -1959,6 +2178,8 @@ async def session_verdicts(
     )
     if exclude_id is not None:
         q = q.where(Investigation.id != exclude_id)
+    if exclude_alert_es_id:
+        q = q.where(func.coalesce(Investigation.alert_es_id, "") != exclude_alert_es_id)
     rows = (await db.execute(q)).all()
     return [
         {

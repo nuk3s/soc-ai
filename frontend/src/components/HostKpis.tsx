@@ -9,7 +9,8 @@
 import { Activity, Network, ShieldAlert, Users } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import type { ActivityState } from '../lib/hostActivity';
-import type { HostActivity, HostActivityRange, VolumePoint } from '../lib/types';
+import { plural } from '../lib/plural';
+import type { GridGap, HostActivity, HostActivityRange, VolumePoint } from '../lib/types';
 // The card chrome and the dash live in Kpi.tsx, shared with the host list's
 // strip: the two are one component at two altitudes, not two that look alike.
 import { Kpi, UNKNOWN, UNKNOWN_TONE } from './Kpi';
@@ -73,7 +74,7 @@ function EventsSparkline({ volume, range }: { volume: VolumePoint[]; range: Host
   return (
     <div
       data-testid="kpi-events-spark"
-      title={`Connection volume over the last ${range}. The chart is scaled to its busiest bucket, which is ${peak.toLocaleString()}.`}
+      title={`Connection volume over the last ${range}. The top of the chart is the busiest interval, with ${peak.toLocaleString()} connection events.`}
       className="mt-2"
     >
       <svg
@@ -115,6 +116,110 @@ function peerSub(peers: number, truncated: boolean): { text: string; title: stri
   };
 }
 
+const HOUR_MS = 3_600_000;
+
+/** The connection rate per hour, over the window hours that hold data. */
+export interface ConnectionRate {
+  perHour: number;
+  /** The hours of the window that hold records, outside every grid gap. */
+  hours: number;
+  /** The hours of the window: 24 or 168. */
+  windowHours: number;
+  /** The hours of the window that a recorded grid gap covers. */
+  gapHours: number;
+}
+
+/** Merge the gap spans that overlap [start, end] into sorted disjoint spans. */
+function gapSpans(gaps: readonly GridGap[], start: number, end: number): [number, number][] {
+  const spans = gaps
+    .map((gap): [number, number] => [
+      Math.max(start, Date.parse(gap.started_at)),
+      Math.min(end, gap.ended_at ? Date.parse(gap.ended_at) : end),
+    ])
+    .filter(([a, b]) => Number.isFinite(a) && Number.isFinite(b) && b > a)
+    .sort((x, y) => x[0] - y[0]);
+  const merged: [number, number][] = [];
+  for (const [a, b] of spans) {
+    const last = merged[merged.length - 1];
+    if (last && a <= last[1]) last[1] = Math.max(last[1], b);
+    else merged.push([a, b]);
+  }
+  return merged;
+}
+
+function covered(spans: readonly [number, number][], a: number, b: number): number {
+  let total = 0;
+  for (const [x, y] of spans) total += Math.max(0, Math.min(b, y) - Math.max(a, x));
+  return total;
+}
+
+/** The connection rate per hour, over the window hours that hold data.
+ *
+ *  A grid outage left 23 empty hours in a 24-hour window, and the card divided
+ *  229 connections by 24 (dogfood 2026-10-19, R4-D8). Then the 7d card divided
+ *  by 8 day buckets of 24 hours, 192 hours, on a 168-hour window, and hours
+ *  inside a grid gap with a few stray records counted as hours with data
+ *  (round 2, V2-1).
+ *
+ *  Each bucket that holds records adds the part of its span inside the window,
+ *  so the two edge buckets add a part of an hour or a day. The hours of a
+ *  recorded grid gap leave the count. A bucket that a gap covers whole leaves
+ *  the count with its records. `end` is the end of the window the server read.
+ */
+export function connectionRate(
+  volume: readonly VolumePoint[],
+  range: HostActivityRange,
+  { end = Date.now(), gaps = [] }: { end?: number; gaps?: readonly GridGap[] } = {},
+): ConnectionRate {
+  const windowHours = range === '7d' ? 168 : 24;
+  const step = range === '7d' ? 24 * HOUR_MS : HOUR_MS;
+  const start = end - windowHours * HOUR_MS;
+  const spans = gapSpans(gaps, start, end);
+  let records = 0;
+  let held = 0;
+  for (const point of volume) {
+    const at = Date.parse(point.ts);
+    if (point.events <= 0 || !Number.isFinite(at)) continue;
+    const a = Math.max(at, start);
+    const b = Math.min(at + step, end);
+    if (b <= a) continue;
+    const span = b - a - covered(spans, a, b);
+    if (span <= 0) continue;
+    records += point.events;
+    held += span;
+  }
+  const hours = held / HOUR_MS;
+  const gapHours = covered(spans, start, end) / HOUR_MS;
+  return {
+    perHour: hours > 0 ? Math.round(records / hours) : 0,
+    hours: Math.round(hours * 100) / 100,
+    windowHours,
+    gapHours: Math.round(gapHours * 100) / 100,
+  };
+}
+
+/** "4 hours", or "25 minutes" under one hour. */
+function spanWords(hours: number): string {
+  if (hours >= 1) return plural(Math.round(hours), 'hour');
+  return plural(Math.max(1, Math.round(hours * 60)), 'minute');
+}
+
+/** "100 per hour in and out", and the hours it divides by when some held no data. */
+function rateText(rate: ConnectionRate): string {
+  const head = `${rate.perHour.toLocaleString()} per hour in and out`;
+  if (rate.hours <= 0 || rate.hours >= rate.windowHours - 0.01) return head;
+  return `${head} over the ${spanWords(rate.hours)} with data`;
+}
+
+/** The tooltip of the rate: what it divides by, and the gap hours it leaves out. */
+function rateTitle(rate: ConnectionRate): string {
+  const head =
+    'Connections in and out, per hour, averaged over the window hours that hold connection records. ' +
+    'The profile baseline counts only the connections this host starts.';
+  if (rate.gapHours <= 0) return head;
+  return `${head} The rate leaves out ${spanWords(rate.gapHours)} of grid gaps.`;
+}
+
 export interface HostKpisProps {
   /** The host the strip describes — the Alerts card deep-links on it. */
   ip: string;
@@ -130,6 +235,10 @@ export interface HostKpisProps {
   servicesSource?: 'dossier' | 'profile';
   /** The days the profile reads, for the Services card label. */
   servicesWindowDays?: number;
+  /** Set when `services` is a guess the resolver withheld: the age of the
+   *  sweep that found it ("17d ago"), or "low confidence". The card then marks
+   *  the ports. */
+  servicesStale?: string | null;
   activity: HostActivity | null;
   /** The one discriminant, shared with the activity row so the strip and the row
    *  can never describe the live half differently. */
@@ -139,6 +248,8 @@ export interface HostKpisProps {
    *  host. The grid count and the verdicts are two systems: the tile read "0,
    *  nothing fired" over six verdicts (dogfood 2026-10-06, S3). */
   alertVerdicts?: number;
+  /** The recorded grid gaps in the window. The rate leaves out their hours. */
+  gaps?: readonly GridGap[];
 }
 
 export function HostKpis({
@@ -146,10 +257,12 @@ export function HostKpis({
   services,
   servicesSource = 'dossier',
   servicesWindowDays,
+  servicesStale = null,
   activity,
   state,
   range,
   alertVerdicts = 0,
+  gaps,
 }: HostKpisProps) {
   // The two cards that do not follow the 24h and 7d buttons name their own
   // window. The Services card read no window and the Alerts card read 7d
@@ -170,13 +283,18 @@ export function HostKpis({
 
   const users = activity?.users ?? null;
   // Summed off the same histogram the sparkline plots, so the number and the
-  // chart cannot disagree. No fixed bucket count is assumed: the server sets no
-  // extended_bounds, so a quiet host simply has fewer points.
+  // chart cannot disagree. The server pads the series to the whole window, so
+  // an empty bucket is a zero point. An older server sends fewer points.
   const events = activity ? activity.volume.reduce((total, point) => total + point.events, 0) : null;
   const peerCount = activity ? activity.peers.length : null;
   const peers =
     peerCount == null || activity == null ? null : peerSub(peerCount, activity.peers_truncated);
   const rest = services ? services.length - PORTS_SHOWN : 0;
+  const windowEnd = activity?.window_end ? Date.parse(activity.window_end) : Number.NaN;
+  const rate = connectionRate(activity?.volume ?? [], range, {
+    end: Number.isFinite(windowEnd) ? windowEnd : Date.now(),
+    gaps: gaps ?? [],
+  });
 
   return (
     <div className="mb-3 grid grid-cols-2 gap-3 lg:grid-cols-4">
@@ -191,9 +309,21 @@ export function HostKpis({
         value={services == null ? UNKNOWN : services.length.toLocaleString()}
         sub={
           services == null ? (
-            'the sweep has no answer for this host'
+            'the sweep holds no service data for this host'
           ) : services.length === 0 ? (
-            'nothing answers inbound'
+            'this host serves no ports'
+          ) : servicesStale ? (
+            <span
+              data-testid="kpi-services-stale"
+              title="The sweep found these ports. The evidence is old or weak, so the page does not assert them. A new sweep confirms them."
+            >
+              {services.slice(0, PORTS_SHOWN).join(', ')}
+              {rest > 0 ? ` +${rest} more` : ''}
+              <span className="text-warn">
+                {' · '}
+                {servicesStale === 'low confidence' ? servicesStale : `stale ${servicesStale}`}
+              </span>
+            </span>
           ) : (
             // WHICH ports, not "ports": tcp/8006 answers "is this the Proxmox
             // box?" from the strip, which is the question the count alone
@@ -217,7 +347,7 @@ export function HostKpis({
           // WINDOW-scoped: a host that ships auth logs but was quiet answers null
           // here too, so this may not claim the machine ships no host logs.
           (users == null
-            ? 'no host-log users in this window'
+            ? 'no logon in this window'
             : users.length === 0
               ? 'nobody authenticated'
               : 'accounts seen authenticating')
@@ -235,15 +365,12 @@ export function HostKpis({
           // peers" arrive together — but the strip says one sentence, not "0
           // connection records · 0 peers".
           (peers == null || (events === 0 && peerCount === 0) ? (
-            'silent on the wire'
+            'no connection records'
           ) : (
             <>
               connection records ·{' '}
-              <span
-                data-testid="kpi-events-rate"
-                title="Connections in and out, per hour, averaged over the window. The profile baseline counts only the connections this host starts."
-              >
-                {Math.round((events ?? 0) / (range === '7d' ? 168 : 24)).toLocaleString()} per hour in and out
+              <span data-testid="kpi-events-rate" title={rateTitle(rate)}>
+                {rateText(rate)}
               </span>{' '}
               · <span title={peers.title}>{peers.text}</span>
             </>
@@ -284,7 +411,7 @@ export function HostKpis({
             )}
             {range !== '7d' && (
               <div data-testid="kpi-alerts-fixed" className="text-faint">
-                always 7 days
+                This card counts the last 7 days.
               </div>
             )}
             {/* Only under a number the grid actually answered: a link beneath a

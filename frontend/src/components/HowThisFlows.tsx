@@ -41,8 +41,8 @@ export const FLOW_LINK_LABEL = 'How this flows';
 export const FLOW_ALT =
   'The flow, left to right and then down. Two inputs enter on the left. On the sweep path an ' +
   'analytic runs on every hourly sweep and finds a hit. Hits on one entity form a lead. The ' +
-  'lead starts its own hunt, or you press Hunt this lead. A hunt returns findings and ' +
-  'investigates each one. On the alert path soc-ai triages an alert. Both paths end in an ' +
+  'lead starts its own hunt, or you press Hunt this lead. A hunt returns findings. soc-ai ' +
+  'investigates each threat finding. On the alert path soc-ai triages an alert. Both paths end in an ' +
   'investigation, which ends in a verdict. In Needs you, you agree with the verdict or ' +
   'override it. Your action goes to Security Onion. The chart also defines the two verbs.';
 

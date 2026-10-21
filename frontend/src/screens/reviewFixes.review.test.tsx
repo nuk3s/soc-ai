@@ -44,6 +44,8 @@ const deleteRunbookMock = vi.hoisted(() => vi.fn());
 vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
   getBacktest: vi.fn().mockResolvedValue(IDLE_BACKTEST),
+  getBacktestRuns: vi.fn().mockResolvedValue({ runs: [] }),
+  getHealth: vi.fn().mockResolvedValue(null),
   startBacktest: startBacktestMock,
   getRunbooks: vi.fn().mockResolvedValue([RUNBOOK]),
   deleteRunbook: deleteRunbookMock,
@@ -65,6 +67,8 @@ describe('Backtest start-failure note (F39)', () => {
       </MemoryRouter>,
     );
     fireEvent.click(await screen.findByRole('button', { name: /Run backtest/i }));
+    // The run starts from the cost confirm (dogfood 2026-10-19, R5-I9).
+    fireEvent.click(await screen.findByRole('button', { name: 'Start backtest' }));
     expect(
       await screen.findByText('no dispositioned alerts in the window to replay'),
     ).toBeInTheDocument();

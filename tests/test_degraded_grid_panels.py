@@ -1053,7 +1053,7 @@ def test_planning_that_outruns_its_shared_budget_still_does_not_cry_outage(
 
     assert resp.status_code == 503
     hint = resp.json()["detail"]["hint"]
-    assert f"{budget}s" in hint, f"the refusal does not say what budget it ran out of: {hint!r}"
+    assert f"{budget} s" in hint, f"the refusal does not say what budget it ran out of: {hint!r}"
     assert "narrow" in hint.lower(), f"the refusal offers no move that would fit: {hint!r}"
     # The grid answered every query. Nothing here may be written down as a blind
     # sweep, and nothing may be written down as a completed one either.

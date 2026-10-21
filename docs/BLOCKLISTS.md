@@ -62,7 +62,7 @@ Behaviour:
 
 - The refresh job sends the key only to the abuse.ch feeds. No other job sends it, and
   triage never sends it. soc-ai never logs the key.
-- If `ABUSE_CH_AUTH_KEY` is unset, the job skips the abuse.ch feeds and prints a clear
+- If `ABUSE_CH_AUTH_KEY` is unset, the job skips the abuse.ch feeds and prints a
   message. The job does not fail. The Tor exit list needs no key, so it still refreshes,
   and the job still exits 0.
 
@@ -148,7 +148,7 @@ The synthetic-eval set uses a pinned blocklist snapshot. A refresh of the live
 `blocklist_data_dir` must NOT change synth-eval results from run to run.
 
 The refresh job writes only to the configured live `blocklist_data_dir`. **Point the eval
-harness at its own frozen snapshot dir.** Keep that dir separate from the live dir. For an
+harness at its own pinned snapshot dir.** Keep that dir separate from the live dir. For an
 eval run, set the data dir to a pinned copy:
 
 ```bash
@@ -169,12 +169,13 @@ synthetic-eval set stays reproducible. The live dir refreshes daily for triage.
 
 `soc-ai blocklists refresh` does not read or write the GeoIP data. No other command in
 soc-ai downloads it. The MaxMind GeoLite2 databases need a MaxMind account, and they
-arrive as a tarball. You download the two files by hand:
+arrive as a tarball. Download the two files by hand:
+
 
 1. Create a free MaxMind account and generate a license key at
    <https://www.maxmind.com/en/geolite2/signup>. Put it in `.env` as
    `MAXMIND_LICENSE_KEY=`. soc-ai does not use the key. The Data sources page in
-   Config only shows whether a key is on file.
+   Settings only shows whether a key is on file.
 2. Download the **GeoLite2 City** and **GeoLite2 ASN** databases in `.mmdb` format
    from the GeoLite2 download page of your account. MaxMind's `geoipupdate` tool with
    the same key also downloads them. Each tarball unpacks to a dated directory that

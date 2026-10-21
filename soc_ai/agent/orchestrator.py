@@ -52,13 +52,13 @@ import re
 import uuid
 from collections import Counter
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, cast
 
 from pydantic_ai import Agent, capture_run_messages
 from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.models import Model
-from pydantic_ai.usage import RunUsage, UsageLimits
+from pydantic_ai.usage import RequestUsage, RunUsage, UsageLimits
 
 from soc_ai import metrics
 from soc_ai.agent import budget, context_budget
@@ -124,6 +124,7 @@ from soc_ai.agent.gates import (  # noqa: F401
     _verdict_grounded_in_pivot,
     enforce_session_verdict_consistency,
 )
+from soc_ai.agent.loop_result import SINGLE, SWARM_STRATEGIES, LoopResult, strategy_of
 from soc_ai.agent.models import (
     build_investigator_model,
     build_model,
@@ -212,6 +213,7 @@ def build_investigator(
     *,
     system_prompt: str | None = None,
     emits_report: bool = False,
+    output_type: Any = None,
 ) -> Agent[None, Any]:
     """Investigator agent: fast model + read tools + InvestigationTranscript output.
 
@@ -221,6 +223,10 @@ def build_investigator(
     semantic-only (no auth/elastic/etc. parameters in the schema).
 
     ``system_prompt`` overrides the default :data:`INVESTIGATOR_PROMPT`.
+
+    ``output_type`` overrides the output type. A swarm worker of the swarm
+    triage experiment (:mod:`soc_ai.agent.swarm`) passes its brief model, and
+    passes the system prompt that asks for it. None keeps the two types below.
 
     ``emits_report`` (W3, ``Settings.investigator_emits_report``) swaps the
     output type to :class:`~soc_ai.triage_models.TriageReport`, so the loop's
@@ -245,7 +251,11 @@ def build_investigator(
     """
     agent: Agent[None, Any] = Agent(
         model,
-        output_type=TriageReport if emits_report else InvestigationTranscript,
+        output_type=(
+            output_type
+            if output_type is not None
+            else (TriageReport if emits_report else InvestigationTranscript)
+        ),
         # The report-writing loop reads a system prompt that says it writes
         # the report and carries the verdict policy; the transcript loop keeps
         # the prompt the synthesizer expects it to have followed.
@@ -611,28 +621,28 @@ def build_agent(  # pragma: no cover - thin alias
 
 
 _GATEWAY_BACKEND_HINT = (
-    "the LLM gateway could not reach its model backend (the engine behind the "
-    "LiteLLM route is down, restarting, or returning 5xx). This is NOT an "
-    "Elasticsearch problem. Verify the serving engine is up and the route's "
-    "api_base points at it, then retry."
+    "the LLM gateway could not reach its model backend. The engine behind the "
+    "LiteLLM route is down, is restarting or returns 5xx. Elasticsearch is not "
+    "the cause. Check that the serving engine is up and that the api_base of the "
+    "route points at it. Then retry."
 )
 
 _GATEWAY_UNREACHABLE_HINT = (
-    "the LLM gateway did not answer: soc-ai could not open a connection to it. "
-    "This phase makes no Elasticsearch call, so the grid is not the problem. "
-    "Check the gateway is running and that litellm_base_url points at it, then "
+    "the LLM gateway did not answer. soc-ai could not open a connection to it. "
+    "This phase makes no Elasticsearch call, so the grid is not the cause. "
+    "Check that the gateway runs and that litellm_base_url points at it. Then "
     "retry."
 )
 
 _GRID_UNREACHABLE_HINT = (
-    "elasticsearch / Security Onion unreachable. Verify the SO grid is "
-    "online and ES_HOSTS in soc-ai's .env points at the right node."
+    "Elasticsearch and Security Onion are unreachable. Check that the SO grid is "
+    "online and that ES_HOSTS in the soc-ai .env points at the right node."
 )
 
 _GRID_SLOW_HINT = (
-    "the Security Onion grid did not answer in time. Verify the cluster is "
-    "online and not saturated, then retry; raise es_request_timeout_s if it is "
-    "healthy but slow."
+    "the Security Onion grid did not answer in time. Check that the cluster is "
+    "online and not saturated. Then retry. If the cluster is healthy and slow, "
+    "raise es_request_timeout_s."
 )
 
 # Which dependency a phase can possibly have failed against.
@@ -677,47 +687,47 @@ def _hint_for(exc: BaseException, *, phase: str | None = None) -> str | None:
         # Name only the COUNT/CLASS — never the leaked values (that would defect
         # on the fail-closed block). This hint lands in the report summary.
         return (
-            f"redacted egress blocked: {len(exc.leaked)} internal identifier(s) "
-            "survived sanitization on the outbound analyst payload, so the model "
-            "was not called (analyst_redaction_fail_closed is on). Investigate "
-            "locally or run with a local analyst model."
+            f"redacted egress blocked: {len(exc.leaked)} internal identifiers "
+            "survived sanitization on the outbound analyst payload. soc-ai did not "
+            "call the model, because analyst_redaction_fail_closed is on. Investigate "
+            "locally, or use a local analyst model."
         )
     if isinstance(exc, OqlValidationError):
         frag = getattr(exc, "fragment", None)
-        base = "OQL validator rejected the query"
+        base = "The OQL validator rejected the query."
         if frag:
             return (
-                f"{base}; offending fragment: {frag!r}. "
-                "Common pitfall: use full ECS field names like 'destination.ip', "
-                "not shortened ones like 'dest.ip'."
+                f"{base} The fragment it rejected is {frag!r}. Use the full ECS "
+                "field name, for example 'destination.ip'. A short name such as "
+                "'dest.ip' fails."
             )
-        return f"{base}; check field names against the OQL primer."
+        return f"{base} Check the field names against the OQL primer."
     if isinstance(exc, SoApiError):
-        return "alert id may be wrong; verify it exists in ES."
+        return "The alert id can be wrong. Check that the alert is in the grid."
     msg = str(exc).lower()
     # Pattern-match on the LiteLLM/PydanticAI error strings.
     if "exceeded maximum output retries" in msg or (
         "exceeded maximum retries" in msg and "output validation" in msg
     ):
         return (
-            "the model repeatedly produced output that failed TriageReport "
-            "schema validation until the retry budget ran out. The per-attempt "
-            "validation errors are recorded as retry_causes on this run's error "
-            "event and resolution. Read those. A persistent schema failure "
-            "usually means the analyst model or its gateway route changed shape "
-            "(reasoning/tool-call format). It is rarely a transient fault."
+            "the model output failed the TriageReport schema validation on each "
+            "attempt until the retry budget ran out. The error event and the "
+            "resolution of this run record the validation error of each attempt as "
+            "retry_causes. Read them. A schema failure that repeats usually means "
+            "that the analyst model or its gateway route changed its reasoning or "
+            "tool-call format. A transient fault is a rare cause."
         )
     if "token limit" in msg and "before any response" in msg:
         return (
-            "the model hit its response-token cap while still reasoning, so no "
-            "structured output was produced. Reasoning models can burn the whole "
-            "budget thinking. Raise synthesizer_max_response_tokens (config "
-            "console → Agent) or switch to a less verbose analyst model."
+            "the model hit its response-token cap while it was still reasoning, so "
+            "it produced no structured output. A reasoning model can spend the whole "
+            "budget on reasoning. Raise synthesizer_max_response_tokens in the config "
+            "console under Agent, or use a less verbose analyst model."
         )
     if "contextwindowexceeded" in msg or "context length" in msg:
         return (
-            "context window exceeded; transcript or prompt is too large. "
-            "The alert context or accumulated evidence may exceed the model's window."
+            "The context window is exceeded. The transcript or the prompt is too "
+            "large. The alert context or the evidence can exceed the model window."
         )
     # MUST precede the generic timeout arm: a partial-read error's message reads
     # "the search timed out before all shards answered", which that arm would
@@ -726,10 +736,10 @@ def _hint_for(exc: BaseException, *, phase: str | None = None) -> str | None:
     # which accounted for 8 of 15 recorded prod error events (2026-08-03).
     if "partial search results" in msg:
         return (
-            "the grid answered but did not read all of it. Shards failed or were "
-            "unassigned, or a search gave up mid-flight. The results would have "
-            "been incomplete, so the run stopped. It does not reason from a partial "
-            "view of the network. Check Elasticsearch shard health and retry."
+            "the grid answered and did not read the whole index. Shards failed or "
+            "were unassigned, or a search stopped part-way. The results were "
+            "incomplete, so the run stopped. The run does not reason from a partial "
+            "view of the network. Check the shard health in Elasticsearch. Then retry."
         )
     if "timed out" in msg or "timeout" in msg:
         # Same misdirection, mirrored: an ES ConnectionTimeout raised inside
@@ -737,7 +747,7 @@ def _hint_for(exc: BaseException, *, phase: str | None = None) -> str | None:
         # as a slow LiteLLM gateway, which prefetch never calls.
         if dependency == _GRID:
             return _GRID_SLOW_HINT
-        return "LiteLLM gateway slow or unreachable; retry."
+        return "The LiteLLM gateway is slow or unreachable. Retry."
     # Markers LiteLLM stamps into its OWN error strings. Their presence means the
     # failure was raised by the gateway about a model call, never by the ES client.
     is_gateway = any(
@@ -846,6 +856,79 @@ def _usage_event_payload(
     if served_backend:
         payload["served_backend"] = served_backend
     return payload
+
+
+def _run_usage(run_result: Any) -> RunUsage | None:
+    """The ``RunUsage`` of a pydantic-ai run result, or None for a test double.
+
+    A property since pydantic-ai 1.107; an older release or a stub exposes a
+    method. Anything that is not a ``RunUsage`` reads as None.
+    """
+    try:
+        u = run_result.usage
+        if not isinstance(u, RunUsage) and callable(u):
+            u = u()
+    except Exception:
+        return None
+    return u if isinstance(u, RunUsage) else None
+
+
+# The note a verdict carries when the loop stopped at its budget and the
+# partial synthesis wrote it from the evidence gathered before the cutoff.
+_BUDGET_CUT_NOTE = (
+    " (Investigation stopped at the tool-call budget; "
+    "verdict synthesized from the evidence gathered before "
+    "the cutoff.)"
+)
+
+
+def _cut_short_report(report: Any, note: str, guard: EgressGuard | None) -> Any:
+    """A partial synthesis report, made fit to land as a cut-short verdict.
+
+    One rule for the primary loop and for a vote sample cut short. A cut-short
+    investigation must not assert high confidence (mirrors the hunt humility
+    clamp), never recurses into Phase D, and does not set the failure marker.
+    """
+    out = report.model_copy(
+        update={
+            "confidence": min(report.confidence, 0.6),
+            "summary": (report.summary or "") + note,
+            # Never recurse into Phase D off a cut-short synthesis.
+            "gap_for_investigator": None,
+            # Model output: the failure marker is not its to set.
+            "resolution": None,
+        }
+    )
+    if guard is not None:
+        # Assignment-source restore — the gates below compare this report's
+        # text against RAW enriched/pivot values.
+        out = _desanitize_report(out, guard)
+    return out
+
+
+def _usage_from_messages(messages: Sequence[Any]) -> RunUsage:
+    """The usage of a run that raised, read off the messages it exchanged.
+
+    A run cut short by its budget has no result object to read. Each model
+    response carries the usage of its request, and each tool return is a tool
+    call the run executed. The output tool is not a tool the run executed.
+    """
+    usage = RunUsage()
+    for message in messages:
+        kind = getattr(message, "kind", None)
+        if kind == "response":
+            usage.requests += 1
+            request_usage = getattr(message, "usage", None)
+            if isinstance(request_usage, RequestUsage):
+                usage.incr(request_usage)
+        elif kind == "request":
+            for part in getattr(message, "parts", []) or []:
+                if (
+                    getattr(part, "part_kind", None) == "tool-return"
+                    and getattr(part, "tool_name", None) != "final_result"
+                ):
+                    usage.tool_calls += 1
+    return usage
 
 
 def _error_payload(
@@ -957,6 +1040,69 @@ def _is_high_stakes_alert(alert: SoAlert) -> bool:
     return alert.severity_score is not None and alert.severity_score >= 3
 
 
+async def _standing_analyst_verdict(ctx: InvestigationContext, es_id: str) -> tuple[Any, bool]:
+    """``(verdict, read_ok)``: the analyst verdict that stands on the alert.
+
+    ``verdict`` is an :class:`~soc_ai.store.investigations.AnalystVerdict` or
+    None. ``read_ok`` is False when the store did not answer. No store on the
+    context (CLI, eval, a direct caller) has no analyst verdict to read, so
+    that is ``(None, True)``.
+    """
+    maker = ctx.db_sessionmaker
+    if maker is None or not es_id:
+        return None, True
+    from soc_ai.store.investigations import analyst_verdicts_for_alerts  # noqa: PLC0415
+
+    try:
+        async with maker() as db:
+            found = await analyst_verdicts_for_alerts(db, [es_id])
+    except Exception as exc:
+        _LOGGER.warning("analyst verdict lookup failed for alert %s: %s", es_id, exc)
+        return None, False
+    return found.get(es_id), True
+
+
+async def _analyst_verdict_holds_ack(
+    report: TriageReport,
+    es_id: str,
+    *,
+    ctx: InvestigationContext,
+    emit_ev: Any,
+) -> StepEvent | None:
+    """The ``auto_ack_skipped`` event when an analyst verdict forbids the ack.
+
+    An unattended write never acts against a person. The analyst set the
+    verdict of this alert, on this run or on any earlier run of it, and it is
+    not false positive: the ack waits. The dogfood of 2026-10-19 (R2-D1) found
+    the path. The analyst overrode a false positive to true positive, pressed
+    Re-run, and the new run reached false positive at 0.80 and acknowledged the
+    alert in Security Onion. Nothing on that path read the analyst verdict.
+
+    FAILS CLOSED. A store that does not answer is not permission to write to
+    the analyst's grid.
+    """
+    analyst, read_ok = await _standing_analyst_verdict(ctx, es_id)
+    if read_ok and (analyst is None or analyst.verdict == "false_positive"):
+        return None
+    payload: dict[str, Any] = {
+        "es_id": es_id,
+        "reason": "analyst_verdict" if read_ok else "analyst_verdict_unknown",
+        "confidence": report.confidence,
+        "threshold": ctx.settings.auto_ack_fp_threshold,
+    }
+    if analyst is not None:
+        payload["analyst_verdict"] = analyst.verdict
+        payload["analyst_investigation_id"] = analyst.investigation_id
+        payload["analyst"] = analyst.resolved_by
+    _LOGGER.info(
+        "auto-ack suppressed for alert %s: %s",
+        es_id,
+        f"an analyst set {analyst.verdict}" if analyst is not None else "analyst verdict unknown",
+    )
+    held: StepEvent = emit_ev("auto_ack_skipped", payload)
+    return held
+
+
 async def maybe_auto_ack_fp(
     report: TriageReport,
     es_id: str,
@@ -982,6 +1128,8 @@ async def maybe_auto_ack_fp(
     - the report SUPPORTS ITSELF — it cites something, and what it cites
       resolved (see ``citation_coverage`` below)
     - the alert is NOT high-stakes (see :func:`_is_high_stakes_alert`)
+    - no analyst verdict other than false positive stands on the alert, on
+      this run or on any earlier run of it (see :func:`_analyst_verdict_holds_ack`)
 
     ``citation_coverage`` is the resolved share of the report's citations, as
     :func:`soc_ai.agent.gates._resolve_citations` measured them, or ``None``
@@ -1034,7 +1182,8 @@ async def maybe_auto_ack_fp(
 
     Returns the ``auto_ack`` StepEvent (for the caller to yield into the stream)
     when the write was attempted; an ``auto_ack_skipped`` StepEvent (with
-    ``reason`` = ``below_threshold`` | ``no_investigation`` | ``uncited`` |
+    ``reason`` = ``analyst_verdict`` | ``analyst_verdict_unknown`` |
+    ``below_threshold`` | ``no_investigation`` | ``uncited`` |
     ``high_stakes`` | ``oracle_dissent``)
     when auto-ack was armed for this FP but a guard held it back — recorded so
     the drawer can explain why the pending ack needs a human; or ``None`` when
@@ -1045,6 +1194,9 @@ async def maybe_auto_ack_fp(
         return None
     if report.verdict != "false_positive":
         return None
+    analyst_ev = await _analyst_verdict_holds_ack(report, es_id, ctx=ctx, emit_ev=emit_ev)
+    if analyst_ev is not None:
+        return analyst_ev
     if oracle_dissent:
         # The Oracle answered another class with no evidence that resolves.
         # Its answer is an opinion on the run and the local verdict stands,
@@ -1437,13 +1589,29 @@ def _is_evidence_backed(report: Any, enriched: Any, *, messages: list[Any] | Non
     return False
 
 
-def _definitely_investigate(enriched: Any, candidate: Any) -> bool:
-    """Report-INDEPENDENT investigate triggers.
+# The trigger behind a ``definitely_investigate`` run, recorded on the
+# ``investigation_loop_entered`` event. The timeline named one cause, an
+# exploit or malware signal, for all three triggers. An NTLMv1 alert matched
+# by a provisional template read as malware (dogfood 2026-10-19, V1-A1).
+DI_TRIGGER_MALWARE_RULE = "malware_rule"
+DI_TRIGGER_HOST_THREAT = "host_concurrent_threat"
+DI_TRIGGER_PROVISIONAL_TEMPLATE = "provisional_template"
 
-    True when the case will run the investigation loop REGARDLESS of the round-1
-    verdict — a malware/exploit-signalled rule (the QVOD/beacon/BPFDoor failure
-    mode: a zero-tool synth citing prefetched pivots is not evidence of
-    benignness), or a PROVISIONAL benign decision template.
+
+def _definitely_investigate(enriched: Any, candidate: Any) -> bool:
+    """Whether a report-INDEPENDENT trigger fires. See :func:`_definitely_investigate_trigger`."""
+    return _definitely_investigate_trigger(enriched, candidate) is not None
+
+
+def _definitely_investigate_trigger(enriched: Any, candidate: Any) -> str | None:
+    """Report-INDEPENDENT investigate triggers: the one that fired, or None.
+
+    A trigger fires when the case will run the investigation loop REGARDLESS of
+    the round-1 verdict: a malware/exploit-signalled rule (the QVOD/beacon/BPFDoor
+    failure mode: a zero-tool synth citing prefetched pivots is not evidence of
+    benignness), a threat alert on the same host, or a PROVISIONAL benign
+    decision template. The checks run in that order, and the first that holds
+    names the trigger.
 
     A provisional template proposes a benign verdict it is not entitled to
     settle: its grounds are properties of the endpoints or the absence of a
@@ -1464,18 +1632,20 @@ def _definitely_investigate(enriched: Any, candidate: Any) -> bool:
     )
 
     if _rule_signals_malware(enriched):
-        return True
+        return DI_TRIGGER_MALWARE_RULE
     # Host-context trigger: the focus alert may look benign
     # (internal east-west, INFO) while its host is concurrently beaconing to a
     # C2 — the "context not being considered" failure. A threat-signalling pivot
     # alert on the same host/flow forces a real investigation of this leg.
     if _host_has_concurrent_threat(enriched):
-        return True
-    return (
+        return DI_TRIGGER_HOST_THREAT
+    if (
         candidate is not None
         and getattr(candidate, "verdict", None) == "false_positive"
         and getattr(candidate, "authority", "provisional") != "dispositive"
-    )
+    ):
+        return DI_TRIGGER_PROVISIONAL_TEMPLATE
+    return None
 
 
 def _round1_can_settle(enriched: Any, candidate: Any) -> bool:
@@ -2157,6 +2327,61 @@ def _format_session_prior_block(digests: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+_ANALYST_VERDICT_HEADER = "## Analyst verdict on this alert"
+
+_ANALYST_VERDICT_INSTRUCTION = (
+    "A person read this alert and set this verdict. The verdict is not evidence. "
+    "Do not cite it. If your evidence disagrees with it, state the disagreement "
+    "in the summary."
+)
+
+
+def _analyst_note(rationale: str | None) -> str | None:
+    """The analyst's own words from an override headline, without the name.
+
+    A manual override stores ``Verdict set by <user>: <reason>.``. The prompt
+    carries the reason and leaves the user name out: a name is not a fact
+    about the alert.
+    """
+    text = (rationale or "").strip()
+    if text.startswith("Verdict set by "):
+        _, sep, rest = text.partition(": ")
+        text = rest.strip() if sep else ""
+    return text or None
+
+
+def _format_analyst_verdict_block(analyst: Any) -> str:
+    """Render the standing analyst verdict as one fact for every prompt site.
+
+    R2-D1 (dogfood 2026-10-19): a re-run after an analyst override read
+    nothing of the override and landed the opposite verdict. The block rides
+    the same injection sites and the same sanitize sweep as the same-session
+    constraint.
+    """
+    from soc_ai.store.investigations import _digest_rationale  # noqa: PLC0415
+
+    age = "earlier"
+    resolved_at = getattr(analyst, "resolved_at", None)
+    if resolved_at:
+        from soc_ai.store.auth import utcnow  # noqa: PLC0415
+
+        try:
+            at = datetime.fromisoformat(str(resolved_at))
+            if at.tzinfo is not None:
+                at = at.astimezone(UTC).replace(tzinfo=None)
+            age = _prior_age_phrase(at, utcnow())
+        except ValueError:
+            age = "earlier"
+    line = (
+        f"- {age}: on investigation {analyst.investigation_id}, an analyst set the "
+        f"verdict to {analyst.verdict}."
+    )
+    note = _digest_rationale(_analyst_note(analyst.rationale))
+    if note:
+        line += f" The analyst wrote: {note}"
+    return "\n".join([_ANALYST_VERDICT_HEADER, "", line, "", _ANALYST_VERDICT_INSTRUCTION])
+
+
 # Header framing the E4.2 prior-outcome memory block. The anti-anchoring
 # instruction lives HERE (read before any verdict line), because the whole
 # point of the default-off flag is that prior verdicts can bias the model —
@@ -2803,6 +3028,10 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                     # complete-only, so it cannot self-match — the same reason
                     # prior_outcomes passes no id from inside the pipeline.
                     exclude_id=None,
+                    # An earlier run of THIS alert is not a second alert on
+                    # the session. A re-run read its own earlier verdict as
+                    # one (R2-D9).
+                    exclude_alert_es_id=alert_id,
                     limit=_SESSION_MAX_ITEMS,
                 )
             session_window_minutes = SESSION_WINDOW_MINUTES
@@ -2832,9 +3061,40 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         await _audit(session_ev)
         yield session_ev
 
-    definitely_investigate = ctx.settings.investigate_when_unsure and _definitely_investigate(
-        enriched, candidate
+    # ----- The analyst verdict on this alert (R2-D1) -----
+    # A re-run after an analyst override read nothing of the override. The
+    # standing analyst verdict reaches every prompt site as one fact, on the
+    # same injection path as the session constraint. It is context: the run
+    # may still disagree, and the auto-acknowledge reads the analyst verdict
+    # again on its own (:func:`_analyst_verdict_holds_ack`). A hunt subject
+    # skips it, for the reason it skips the session lookup above. Fail-soft:
+    # a store error leaves the fact out, and the ack guard fails closed.
+    if subject is None and ctx.db_sessionmaker is not None:
+        standing_analyst, _ = await _standing_analyst_verdict(ctx, alert_id)
+        if standing_analyst is not None:
+            analyst_block = _format_analyst_verdict_block(standing_analyst)
+            session_block = (
+                f"{session_block}\n\n{analyst_block}" if session_block else analyst_block
+            )
+            analyst_ev = _ev(
+                "analyst_verdict",
+                {
+                    "id": standing_analyst.investigation_id,
+                    "verdict": standing_analyst.verdict,
+                    "analyst": standing_analyst.resolved_by,
+                    "resolved_via": standing_analyst.resolved_via,
+                    "resolved_at": standing_analyst.resolved_at,
+                },
+            )
+            await _audit(analyst_ev)
+            yield analyst_ev
+
+    di_trigger = (
+        _definitely_investigate_trigger(enriched, candidate)
+        if ctx.settings.investigate_when_unsure
+        else None
     )
+    definitely_investigate = di_trigger is not None
     # ----- Budget class (stage 1, soc_ai.agent.budget) -----
     # The rungs above the model plan the class: an explicit request from the
     # caller, the hunt subject, the session constraint, the decision template.
@@ -2887,6 +3147,13 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
     # cleared (None) on every fallback path so a vote never re-runs a call
     # that just failed.
     final_synth_rerun: tuple[Any, str, Any] | None = None
+    # True when ``final_synth_rerun`` re-runs the investigation loop itself,
+    # tools and all (the W3 report path). A sample of the loop that stops at
+    # its budget then lands a partial verdict and votes, as the loop does.
+    rerun_is_loop = False
+    # True when the primary loop stopped at its budget and its vote is the
+    # partial verdict the partial synthesis wrote.
+    primary_partial = False
     if definitely_investigate or round1_cannot_settle or round1_class_skip:
         triage_round1 = _round1_skipped_report(alert_id)
         if subject is not None:
@@ -2897,7 +3164,10 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             skip_reason = "class_runs_loop"
         else:
             skip_reason = "cannot_settle"
-        skip_ev = _ev("synth_round1_skipped", {"reason": skip_reason})
+        skip_payload: dict[str, Any] = {"reason": skip_reason}
+        if skip_reason == "definitely_investigate":
+            skip_payload["trigger"] = di_trigger
+        skip_ev = _ev("synth_round1_skipped", skip_payload)
         await _audit(skip_ev)
         yield skip_ev
     else:
@@ -3193,6 +3463,12 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
     # the marker never claims a path that did not run. Read back off the stored
     # ``triage_report`` event to compare the two arms.
     report_path: str | None = None
+    # The swarm triage experiment (soc_ai.agent.loop_result): the strategy of
+    # the investigation loop, read once so the loop and the report agree even
+    # if an admin switches it mid-run. The report names it unless it is
+    # ``single``, and carries the swarm counters when a swarm ran.
+    loop_strategy = strategy_of(ctx.settings)
+    swarm_counters: dict[str, Any] | None = None
     # A true positive already stands on this session, so a fast-path close is
     # the exact outcome being prevented and the loop runs whatever the flags
     # say. Deliberately outside the ``investigate_when_unsure`` conjunct: the
@@ -3242,6 +3518,9 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 # The class the loop runs in. A planned cheap run that gets
                 # here escalated to standard.
                 "run_class": budget.ran_class(class_plan, ran_loop=True),
+                # Which of the three triggers sent the alert here, when the
+                # reason is definitely_investigate. The timeline names it.
+                **({"trigger": di_trigger} if loop_reason == "definitely_investigate" else {}),
             },
         )
         await _audit(loop_ev)
@@ -3379,6 +3658,12 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         # exists — never conclude absence without querying" is exactly what
         # sent budget-exhausted runs probing endpoint datasets for hosts with
         # no endpoint agent. Empty string when covered/unknown.
+        inv_tail = (
+            await inventory_prompt_block(ctx.elastic, ctx.settings)
+            + format_endpoint_coverage_block(enriched.prefetch_gaps.get(ENDPOINT_COVERAGE_GAP_KEY))
+            + format_host_coverage_block(enriched.host_coverage, enriched.host_pivot_note)
+            + dossier_block
+        )
         inv_user_msg = (
             _format_investigator_prompt(
                 alert_id,
@@ -3394,10 +3679,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             )
             + web_search_block
             + more_tools_block
-            + await inventory_prompt_block(ctx.elastic, ctx.settings)
-            + format_endpoint_coverage_block(enriched.prefetch_gaps.get(ENDPOINT_COVERAGE_GAP_KEY))
-            + format_host_coverage_block(enriched.host_coverage, enriched.host_pivot_note)
-            + dossier_block
+            + inv_tail
         )
         # The investigator chooses what to retrieve, so it is the one place the
         # constraint can change what gets looked at rather than only how the
@@ -3409,21 +3691,20 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             # names, dossier hostnames and addresses) so the WHOLE investigator
             # prompt crosses the egress boundary sanitized.
             inv_user_msg = guard.sanitize_text(inv_user_msg)
-        inv_result: Any = None
-        # The labeled node messages streamed so far — the budget-partial
-        # synthesis replays these when the loop is cut short (mirrors the hunt
-        # runner's `gathered`).
-        loop_gathered: list[Any] = []
-        budget_exc: BaseException | None = None
-        # Set when the fail-closed residue sweep blocks the loop's first model
-        # call: routes the budget-boundary convergence below to the HONEST
+        # The loop's outputs, whichever strategy runs it (soc_ai.agent.loop_result).
+        # ``loop.gathered`` holds the labeled node messages streamed so far: the
+        # budget-partial synthesis replays them when the loop is cut short
+        # (mirrors the hunt runner's `gathered`). ``loop.egress_blocked`` is set
+        # when the fail-closed residue sweep blocks the loop's first model call:
+        # it routes the budget-boundary convergence below to the HONEST
         # pipeline-fallback (E1.2) instead of preserving a round-1 verdict, so a
         # blocked egress renders as a pipeline error.
-        egress_blocked_exc: EgressResidueError | None = None
-        # Gateway attribution for the multi-turn loop's model calls. Mutable-dict
-        # sink (see capture_backend_attribution): filled per response, read after
-        # the loop for the usage event, valid even if a later turn raised.
-        loop_attr: dict[str, Any] = {}
+        loop = LoopResult(
+            strategy=loop_strategy,
+            # The judge of a swarm writes a TriageReport whatever the W3 flag
+            # says, so the convergence takes the W3 branch for it.
+            emits_report=emits_report or loop_strategy in SWARM_STRATEGIES,
+        )
 
         async def _land_cut_short_verdict(
             exc: BaseException,
@@ -3447,6 +3728,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             gates read).
             """
             nonlocal triage_final, loop_messages, final_synth_rerun
+            nonlocal rerun_is_loop, primary_partial
             partial_report: Any = None
             repaired_history: list[Any] = []
             # ``round1_ok`` is the honest test: the skip paths leave a
@@ -3457,10 +3739,10 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 "false_positive",
             )
             partial_runs: list[Any] = []
-            if not settled_r1 and loop_gathered:
+            if not settled_r1 and loop.gathered:
                 try:
                     partial_report, repaired_history = await _synthesize_partial_triage(
-                        ctx.settings, guard, loop_gathered, result_out=partial_runs
+                        ctx.settings, guard, loop.gathered, result_out=partial_runs
                     )
                 except asyncio.CancelledError:
                     raise  # cooperative cancel — propagate, never swallow
@@ -3483,27 +3765,21 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                     await _audit(partial_usage_ev)
                     yield partial_usage_ev
             if partial_report is not None:
-                triage_final = partial_report.model_copy(
-                    update={
-                        # A cut-short investigation must not assert high
-                        # confidence (mirrors the hunt humility clamp).
-                        "confidence": min(partial_report.confidence, 0.6),
-                        "summary": (partial_report.summary or "") + note,
-                        # Never recurse into Phase D off a cut-short synthesis.
-                        "gap_for_investigator": None,
-                        # Model output: the failure marker is not its to set.
-                        "resolution": None,
-                    }
-                )
-                if guard is not None:
-                    # Assignment-source restore — the gates below compare this
-                    # report's text against RAW enriched/pivot values.
-                    triage_final = _desanitize_report(triage_final, guard)
+                triage_final = _cut_short_report(partial_report, note, guard)
                 # The repaired history feeds the downstream evidence/citation
                 # gates: the partial verdict earns the loop exemption only from
                 # tool results that actually landed (synthetic closures are
                 # error-shaped and never counted).
                 loop_messages = repaired_history
+                if loop.rerun is not None:
+                    # The loop wrote the report (W3) and stopped at its budget.
+                    # With the vote on, its partial verdict is its vote and the
+                    # samples re-run the loop: an ensemble whose first run hit
+                    # the budget still votes. With the vote off, nothing reads
+                    # the rerun.
+                    final_synth_rerun = loop.rerun
+                    rerun_is_loop = True
+                    primary_partial = True
                 return
             triage_final = _round2_failure_fallback(
                 alert_id,
@@ -3514,121 +3790,212 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             )
             await metrics.get_metrics().record_event("fallback_verdict", {})
 
-        try:
-            # Fail-closed residue sweep on the FINAL composed investigator prompt
-            # BEFORE the loop's first model call — if an internal identifier
-            # survived, this raises so the payload never reaches the model.
-            inv_user_msg = _guard_egress(guard, inv_user_msg, ctx.settings)
-            # Stream the run NODE-BY-NODE via agent.iter() so each tool_call /
-            # tool_result / model_response lands in the timeline THE MOMENT it
-            # happens (the recorder persists every event immediately, FLUSH_EVERY=1)
-            # instead of replaying the whole investigation in one burst at the end.
-            # CallToolsNode carries the model's response (text + tool requests);
-            # the following ModelRequestNode carries that step's tool results.
-            node_msg: Any = None
-            with capture_backend_attribution() as loop_attr:
-                async with investigator.iter(
-                    inv_user_msg, usage_limits=loop_usage_limits
-                ) as inv_run:
-                    # Advance NODE-BY-NODE with a PER-TURN wall-clock timeout on each
-                    # iterator step (the model-run await that produces the next node),
-                    # NOT one timeout spanning the whole multi-turn loop. Event
-                    # projection + yielding stays outside the timeout so streaming is
-                    # unchanged. A per-turn TimeoutError propagates to the same
-                    # except-handlers below (error event + honest stop) as any other
-                    # investigator failure.
-                    node_iter = inv_run.__aiter__()
-                    while True:
-                        async with asyncio.timeout(ctx.settings.investigation_turn_timeout_s):
-                            try:
-                                node = await node_iter.__anext__()
-                            except StopAsyncIteration:
-                                break
-                        # CallToolsNode carries the model's response (text + tool
-                        # requests); the following ModelRequestNode carries that
-                        # step's tool results. Detect by attribute so the message is
-                        # projected the moment its node arrives.
-                        node_msg = getattr(node, "model_response", None)
-                        if node_msg is None:
-                            node_msg = getattr(node, "request", None)
-                        if node_msg is not None:
-                            loop_gathered.append(node_msg)
-                            async for ev in _walk_message(
-                                node_msg, _ev, phase="investigation_loop", round_num=1
-                            ):
-                                # The loop converses in label space; restore real
-                                # values in the streamed timeline events (tool
-                                # calls/results, reasoning traces) — they are
-                                # local storage/display, never egress.
-                                out_ev = (
-                                    ev
-                                    if guard is None
-                                    else ev.model_copy(
-                                        update={"payload": guard.desanitize_obj(ev.payload)}
+        async def _run_single_loop() -> AsyncGenerator[StepEvent, None]:  # noqa: PLR0915 - the loop body moved whole
+            """The one investigator: run the loop and fill ``loop``.
+
+            The ``single``, ``spend`` and ``ensemble`` strategies run this. It
+            streams every node as it lands, and it leaves the run's outputs on
+            ``loop`` for the convergence below. The ``usage`` event of a run
+            that ended with a result is the last event it yields, at the point
+            in the stream where the convergence used to emit it.
+            """
+            # Gateway attribution for the multi-turn loop's model calls.
+            # Mutable-dict sink (see capture_backend_attribution): filled per
+            # response, read after the loop for the usage event, valid even if a
+            # later turn raised.
+            loop_attr: dict[str, Any] = {}
+            inv_result: Any = None
+            try:
+                # Fail-closed residue sweep on the FINAL composed investigator prompt
+                # BEFORE the loop's first model call — if an internal identifier
+                # survived, this raises so the payload never reaches the model.
+                guarded_msg = _guard_egress(guard, inv_user_msg, ctx.settings)
+                if loop.emits_report:
+                    # W3: the loop writes the report, so the vote re-runs the
+                    # loop itself, tools and all. Set before the run, so a run
+                    # cut short at its budget can still vote.
+                    loop.rerun = (investigator, guarded_msg, loop_usage_limits)
+                # Stream the run NODE-BY-NODE via agent.iter() so each tool_call /
+                # tool_result / model_response lands in the timeline THE MOMENT it
+                # happens (the recorder persists every event immediately, FLUSH_EVERY=1)
+                # instead of replaying the whole investigation in one burst at the end.
+                # CallToolsNode carries the model's response (text + tool requests);
+                # the following ModelRequestNode carries that step's tool results.
+                node_msg: Any = None
+                with capture_backend_attribution() as loop_attr:
+                    async with investigator.iter(
+                        guarded_msg, usage_limits=loop_usage_limits
+                    ) as inv_run:
+                        # Advance NODE-BY-NODE with a PER-TURN wall-clock timeout on each
+                        # iterator step (the model-run await that produces the next node),
+                        # NOT one timeout spanning the whole multi-turn loop. Event
+                        # projection + yielding stays outside the timeout so streaming is
+                        # unchanged. A per-turn TimeoutError propagates to the same
+                        # except-handlers below (error event + honest stop) as any other
+                        # investigator failure.
+                        node_iter = inv_run.__aiter__()
+                        while True:
+                            async with asyncio.timeout(ctx.settings.investigation_turn_timeout_s):
+                                try:
+                                    node = await node_iter.__anext__()
+                                except StopAsyncIteration:
+                                    break
+                            # CallToolsNode carries the model's response (text + tool
+                            # requests); the following ModelRequestNode carries that
+                            # step's tool results. Detect by attribute so the message is
+                            # projected the moment its node arrives.
+                            node_msg = getattr(node, "model_response", None)
+                            if node_msg is None:
+                                node_msg = getattr(node, "request", None)
+                            if node_msg is not None:
+                                loop.gathered.append(node_msg)
+                                async for ev in _walk_message(
+                                    node_msg, _ev, phase="investigation_loop", round_num=1
+                                ):
+                                    # The loop converses in label space; restore real
+                                    # values in the streamed timeline events (tool
+                                    # calls/results, reasoning traces) — they are
+                                    # local storage/display, never egress.
+                                    out_ev = (
+                                        ev
+                                        if guard is None
+                                        else ev.model_copy(
+                                            update={"payload": guard.desanitize_obj(ev.payload)}
+                                        )
                                     )
-                                )
-                                await _audit(out_ev)
-                                yield out_ev
-            inv_result = inv_run.result
-        except asyncio.CancelledError:
-            raise  # cooperative cancel — propagate, never swallow
-        except EgressResidueError as e:
-            # Fail-closed block on the investigator prompt — the model was NEVER
-            # called. Audit the block (count only) + emit the paired error event,
-            # then route the convergence below to the HONEST pipeline-fallback.
-            async for ev in _emit_egress_blocked("investigation_loop", e):
-                yield ev
-            egress_blocked_exc = e
-        except UsageLimitExceeded as e:
-            # Budget exhaustion is an EXPECTED outcome of a thorough investigation,
-            # NOT an infrastructure failure. The tool calls + model responses
-            # already streamed live above, so don't discard them with status=error
-            # and no verdict: land the round-1 verdict via the same fallback used
-            # when the loop-synth crashes. (This is the "conclude gracefully at the
-            # budget boundary" behaviour, vs. the old "error out" one.)
-            _LOGGER.warning("investigation loop hit budget limit: %s", e)
-            err_ev = _ev("error", _error_payload(e, phase="investigation_loop_budget", round_num=1))
-            await _audit(err_ev)
-            yield err_ev
-            budget_exc = e
-        except TimeoutError as e:
-            # A per-turn wall-clock timeout (investigation_turn_timeout_s) fired
-            # while advancing the investigator on a slow stack. The evidence
-            # gathered before the hung turn already streamed live, so conclude
-            # GRACEFULLY with the round-1 verdict via the same budget-boundary
-            # fallback as UsageLimitExceeded — do NOT discard the run with
-            # status=error. (Mirrors the hunt runner's timeout→partial-report
-            # behaviour; a slow stack is the expected trigger, not an infra fault.)
-            _LOGGER.warning("investigation loop turn timed out: %s", e)
-            err_ev = _ev(
-                "error", _error_payload(e, phase="investigation_loop_timeout", round_num=1)
+                                    await _audit(out_ev)
+                                    yield out_ev
+                inv_result = inv_run.result
+            except asyncio.CancelledError:
+                raise  # cooperative cancel — propagate, never swallow
+            except EgressResidueError as e:
+                # Fail-closed block on the investigator prompt — the model was NEVER
+                # called. Audit the block (count only) + emit the paired error event,
+                # then route the convergence below to the HONEST pipeline-fallback.
+                async for ev in _emit_egress_blocked("investigation_loop", e):
+                    yield ev
+                loop.egress_blocked = e
+                return
+            except UsageLimitExceeded as e:
+                # Budget exhaustion is an EXPECTED outcome of a thorough investigation,
+                # NOT an infrastructure failure. The tool calls + model responses
+                # already streamed live above, so don't discard them with status=error
+                # and no verdict: land the round-1 verdict via the same fallback used
+                # when the loop-synth crashes. (This is the "conclude gracefully at the
+                # budget boundary" behaviour, vs. the old "error out" one.)
+                _LOGGER.warning("investigation loop hit budget limit: %s", e)
+                err_ev = _ev(
+                    "error", _error_payload(e, phase="investigation_loop_budget", round_num=1)
+                )
+                await _audit(err_ev)
+                yield err_ev
+                loop.budget_exc = e
+                return
+            except TimeoutError as e:
+                # A per-turn wall-clock timeout (investigation_turn_timeout_s) fired
+                # while advancing the investigator on a slow stack. The evidence
+                # gathered before the hung turn already streamed live, so conclude
+                # GRACEFULLY with the round-1 verdict via the same budget-boundary
+                # fallback as UsageLimitExceeded — do NOT discard the run with
+                # status=error. (Mirrors the hunt runner's timeout→partial-report
+                # behaviour; a slow stack is the expected trigger, not an infra fault.)
+                _LOGGER.warning("investigation loop turn timed out: %s", e)
+                err_ev = _ev(
+                    "error", _error_payload(e, phase="investigation_loop_timeout", round_num=1)
+                )
+                await _audit(err_ev)
+                yield err_ev
+                loop.budget_exc = e
+                return
+            except BaseException as e:
+                # The investigator could not gather evidence — most often a transient
+                # LLM-gateway connection drop (the openai client has already retried
+                # litellm_max_retries times). Do NOT fabricate a needs_more_info
+                # verdict from an empty transcript: that reads as if the agent
+                # investigated and was unsure. Surface an honest error and stop — the
+                # recorder marks the run 'error' (retryable), not a fake verdict.
+                _LOGGER.exception("investigation loop investigator run failed")
+                err_ev = _ev("error", _error_payload(e, phase="investigation_loop", round_num=1))
+                await _audit(err_ev)
+                yield err_ev
+                loop.stopped = True
+                return
+
+            if inv_result is None:
+                # No End node and no exception: the convergence below lands the
+                # error. ``loop.output`` stays None.
+                return
+            loop.output = inv_result.output
+            loop.messages = inv_result.all_messages()
+            loop.served_backend = _served_backend(loop_attr)
+            loop.usage = _run_usage(inv_result)
+            if loop.emits_report:
+                loop.report_path = "investigator"
+            inv_usage_ev = _usage_ev(1, inv_result, loop.served_backend)
+            if inv_usage_ev is not None:
+                await _audit(inv_usage_ev)
+                yield inv_usage_ev
+
+        if loop.strategy in SWARM_STRATEGIES:
+            # ----- The swarm strategies (arms D and E) -----
+            # soc_ai.agent.swarm fills the same LoopResult. Every step before
+            # this line and after the convergence below is the same for it.
+            from soc_ai.agent.swarm import (  # noqa: PLC0415 - the swarm imports this module
+                SwarmInputs,
+                run_strategy,
             )
-            await _audit(err_ev)
-            yield err_ev
-            budget_exc = e
-        except BaseException as e:
-            # The investigator could not gather evidence — most often a transient
-            # LLM-gateway connection drop (the openai client has already retried
-            # litellm_max_retries times). Do NOT fabricate a needs_more_info
-            # verdict from an empty transcript: that reads as if the agent
-            # investigated and was unsure. Surface an honest error and stop — the
-            # recorder marks the run 'error' (retryable), not a fake verdict.
-            _LOGGER.exception("investigation loop investigator run failed")
-            err_ev = _ev("error", _error_payload(e, phase="investigation_loop", round_num=1))
-            await _audit(err_ev)
-            yield err_ev
+
+            def _swarm_msg(more_tools: str) -> str:
+                # The loop's message with no report block: a worker writes a
+                # brief. Composed and sanitized as the loop's message is.
+                msg = (
+                    _format_investigator_prompt(
+                        alert_id,
+                        enriched_json,
+                        focus_hint=focus_hint,
+                        focus_origin=focus_origin,
+                        conditions=conditions,
+                        emits_report=False,
+                        subject_block=subject_block or None,
+                    )
+                    + web_search_block
+                    + more_tools
+                    + inv_tail
+                )
+                msg = _inject_session_constraint(msg, session_block)
+                return guard.sanitize_text(msg) if guard is not None else msg
+
+            swarm_inputs = SwarmInputs(
+                alert_id=alert_id,
+                ctx=ctx,
+                enriched=enriched,
+                worker_msg=_swarm_msg(more_tools_block),
+                # A plane worker and the judge cannot load a deferred tool.
+                context_msg=_swarm_msg(""),
+                trim_planes=trim_planes,
+                guard=guard,
+                make_ev=_ev,
+            )
+            async for ev in run_strategy(loop, swarm_inputs):
+                await _audit(ev)
+                yield ev
+            swarm_counters = dict(loop.counters)
+        else:
+            async for ev in _run_single_loop():
+                yield ev
+        if loop.stopped:
             return
 
-        if egress_blocked_exc is not None:
+        if loop.egress_blocked is not None:
             # A blocked egress is a pipeline error (the run couldn't safely
             # proceed) — land the HONEST pipeline-fallback (E1.2), NOT the
             # round-1-preserving budget fallback. loop_messages stays None.
             triage_final = _synth_failure_fallback_report(
-                alert_id, "egress_blocked", egress_blocked_exc
+                alert_id, "egress_blocked", loop.egress_blocked
             )
             final_synth_rerun = None  # fallback verdict — never vote on it
             await metrics.get_metrics().record_event("fallback_verdict", {})
-        elif budget_exc is not None:
+        elif loop.budget_exc is not None:
             # A settled round-1 verdict stands (evidence gathered pre-budget is
             # preserved in the streamed timeline). With NO settled round-1
             # (the round-1 call was skipped, or round-1 was itself NMI) the old
@@ -3637,16 +4004,9 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             # and landed nothing. Now: synthesize a PARTIAL verdict from the
             # gathered history (mirrors the hunt runner's budget path); the
             # honest fallback remains the last resort.
-            async for ev in _land_cut_short_verdict(
-                budget_exc,
-                note=(
-                    " (Investigation stopped at the tool-call budget; "
-                    "verdict synthesized from the evidence gathered before "
-                    "the cutoff.)"
-                ),
-            ):
+            async for ev in _land_cut_short_verdict(loop.budget_exc, note=_BUDGET_CUT_NOTE):
                 yield ev
-        elif inv_result is None:
+        elif loop.output is None:
             # The agent run ended without a final result (no End node reached, and
             # no exception raised). Emit an honest error instead of crashing with an
             # UnboundLocalError on loop_transcript below.
@@ -3661,7 +4021,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             await _audit(err_ev)
             yield err_ev
             return
-        elif emits_report:
+        elif loop.emits_report:
             # ----- W3: the loop wrote the report -----
             # The investigator's output type IS TriageReport here, so the run
             # that gathered the evidence is the run that concludes on it. No
@@ -3671,17 +4031,14 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             # round-2 path — the self-consistency vote, every post-synth
             # validator, the Oracle, the session gate and the auto-ack all read
             # ``triage_final`` / ``loop_messages`` and cannot tell the two apart.
-            report_path = "investigator"
-            loop_messages = inv_result.all_messages()
-            inv_usage_ev = _usage_ev(1, inv_result, _served_backend(loop_attr))
-            if inv_usage_ev is not None:
-                await _audit(inv_usage_ev)
-                yield inv_usage_ev
+            # The loop's usage event already streamed with the loop.
+            report_path = loop.report_path
+            loop_messages = loop.messages
 
             # This path hands the privileged failure marker to a tool-using
             # model reading attacker-influenceable text; the strip is the same
             # one every model-authored report gets.
-            loop_report = _strip_model_resolution(inv_result.output)
+            loop_report = _strip_model_resolution(loop.output)
             # The Oracle payload stays in the space the loop ran in (label space
             # under a guard), exactly like the transcript bullets it replaces.
             loop_evidence_bullets = [
@@ -3699,24 +4056,22 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             # The self-consistency vote (OFF by default) re-runs the SAME call
             # that wrote the report. Here that call is the loop itself, tools
             # and all.
-            final_synth_rerun = (investigator, inv_user_msg, loop_usage_limits)
+            final_synth_rerun = loop.rerun
+            rerun_is_loop = loop.rerun is not None
             # The loop replaces Phase D — strip any gap so we don't also
             # dispatch a single-tool targeted round on top of it.
             if triage_final.gap_for_investigator is not None:
                 triage_final = triage_final.model_copy(update={"gap_for_investigator": None})
         else:
-            # Events already streamed live above; land the transcript + usage, and
-            # keep the full message history for the downstream citation/evidence
-            # check (loop_messages feeds _is_evidence_backed / targeted-cite check).
-            loop_transcript = inv_result.output
-            loop_messages = inv_result.all_messages()
+            # Events and the loop's usage already streamed live above; land the
+            # transcript, and keep the full message history for the downstream
+            # citation/evidence check (loop_messages feeds _is_evidence_backed /
+            # targeted-cite check).
+            loop_transcript = loop.output
+            loop_messages = loop.messages
             # Kept in whatever value-space the loop ran in (label space under a
             # guard) — consistent with transcript_text at the Oracle call below.
             loop_evidence_bullets = list(loop_transcript.evidence)
-            inv_usage_ev = _usage_ev(1, inv_result, _served_backend(loop_attr))
-            if inv_usage_ev is not None:
-                await _audit(inv_usage_ev)
-                yield inv_usage_ev
 
             transcript_payload = {
                 "round": 1,
@@ -4047,15 +4402,26 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
     # to the pre-vote pipeline. When >1, re-run the SAME final synthesis
     # (same agent + prompt) N-1 more times and majority-vote the verdict
     # BEFORE the deterministic post-validators (the evidence/citation guards
-    # below still apply to the voted report). Defensive: a failed sample is
-    # dropped; fewer than 2 surviving samples ⇒ no vote (the single available
-    # report stands). Fallback-produced verdicts never vote (rerun is None).
+    # below still apply to the voted report). Fewer than 2 voting samples ⇒ no
+    # vote (the single available report stands). Fallback-produced verdicts
+    # never vote (rerun is None).
+    #
+    # When the rerun is the loop itself (W3), a run that stops at its tool
+    # budget votes with its partial verdict: the primary loop through
+    # _land_cut_short_verdict, a sample here through the same partial
+    # synthesis (one more call, no tools). Only a sample that raises, or that
+    # ends with no verdict, is dropped. Arm C of the swarm triage experiment is
+    # three runs at 8 tool calls each, and a vote that dropped every run cut
+    # at the budget collapsed it into single runs.
     vote_samples = int(getattr(ctx.settings, "verdict_consistency_samples", 1) or 1)
     if vote_samples > 1 and final_synth_rerun is not None:
         sample_agent, sample_msg, sample_limits = final_synth_rerun
         sample_reports: list[TriageReport] = [triage_final]
+        partial_samples = 1 if primary_partial else 0
+        dropped_samples = 0
+        sample_round = 1 if rerun_is_loop else 2
         for _ in range(vote_samples - 1):
-            if report_path == "investigator":
+            if rerun_is_loop:
                 # The sample re-runs the loop, tools and all, against the same
                 # ctx the primary run used. The dedup tracker is per-run state:
                 # inherited, every pivot the primary already made comes back as
@@ -4063,31 +4429,102 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 # after the vote reads the tracker, so a fresh one per sample
                 # is safe (time anchor / prefetched ids stay as set).
                 ctx.dedup = _DedupTracker()
+            sample_number = len(sample_reports)
+            sample_captured: list[Any] = []
+            sample_partial = False
             try:
-                async with asyncio.timeout(ctx.settings.investigation_turn_timeout_s):
-                    if sample_limits is not None:
-                        extra_result = await sample_agent.run(
-                            sample_msg, usage_limits=sample_limits
-                        )
-                    else:
-                        extra_result = await sample_agent.run(sample_msg)
+                with capture_run_messages() as sample_captured:
+                    async with asyncio.timeout(ctx.settings.investigation_turn_timeout_s):
+                        if sample_limits is not None:
+                            extra_result = await sample_agent.run(
+                                sample_msg, usage_limits=sample_limits
+                            )
+                        else:
+                            extra_result = await sample_agent.run(sample_msg)
             except asyncio.CancelledError:
                 raise  # cooperative cancel — propagate, never swallow
+            except (UsageLimitExceeded, TimeoutError) as e:
+                if not (rerun_is_loop and sample_captured):
+                    _LOGGER.warning("self-consistency sample failed (dropped): %s", e)
+                    dropped_samples += 1
+                    continue
+                # The sample ran the loop to its budget. Its usage so far is a
+                # cost of the run, and the partial synthesis is one more call.
+                cut_usage_ev = _ev(
+                    "usage",
+                    {
+                        **_usage_event_payload(sample_round, _usage_from_messages(sample_captured)),
+                        "self_consistency_sample": sample_number,
+                    },
+                )
+                await _audit(cut_usage_ev)
+                yield cut_usage_ev
+                sample_partial_runs: list[Any] = []
+                sample_partial_report: Any = None
+                try:
+                    sample_partial_report, _repaired = await _synthesize_partial_triage(
+                        ctx.settings, guard, list(sample_captured), result_out=sample_partial_runs
+                    )
+                except asyncio.CancelledError:
+                    raise  # cooperative cancel — propagate, never swallow
+                except BaseException as partial_exc:
+                    _LOGGER.warning(
+                        "self-consistency sample cut at its budget wrote no verdict (dropped): %s",
+                        partial_exc,
+                    )
+                for partial_run in sample_partial_runs:
+                    partial_usage = _run_usage(partial_run)
+                    if partial_usage is not None:
+                        partial_usage_ev = _ev(
+                            "usage",
+                            {
+                                **_usage_event_payload(2, partial_usage),
+                                "self_consistency_sample": sample_number,
+                            },
+                        )
+                        await _audit(partial_usage_ev)
+                        yield partial_usage_ev
+                if sample_partial_report is None:
+                    dropped_samples += 1
+                    continue
+                extra_report = _cut_short_report(sample_partial_report, _BUDGET_CUT_NOTE, guard)
+                sample_partial = True
             except BaseException as e:
                 _LOGGER.warning("self-consistency sample failed (dropped): %s", e)
+                dropped_samples += 1
                 continue
-            # Same privileged-field strip as every primary report: a winning
-            # sample's ``resolution`` would be the one the run stores.
-            extra_report = _strip_model_resolution(extra_result.output)
-            if guard is not None:
-                # Samples re-ran the SAME already-sanitized message, so their
-                # outputs are labeled too; restore before the vote so a winning
-                # sample's summary/citations land in real-value space.
-                extra_report = _desanitize_report(extra_report, guard)
+            else:
+                # A sample is a model run too. Its usage joins the run counters
+                # and the arms report, which sums the ``usage`` events: without
+                # it an ensemble arm reads at the cost of its first sample.
+                sample_usage = _run_usage(extra_result)
+                if sample_usage is not None:
+                    sample_usage_ev = _ev(
+                        "usage",
+                        {
+                            **_usage_event_payload(sample_round, sample_usage),
+                            "self_consistency_sample": sample_number,
+                        },
+                    )
+                    await _audit(sample_usage_ev)
+                    yield sample_usage_ev
+                if getattr(extra_result.output, "verdict", None) is None:
+                    _LOGGER.warning("self-consistency sample returned no verdict (dropped)")
+                    dropped_samples += 1
+                    continue
+                # Same privileged-field strip as every primary report: a winning
+                # sample's ``resolution`` would be the one the run stores.
+                extra_report = _strip_model_resolution(extra_result.output)
+                if guard is not None:
+                    # Samples re-ran the SAME already-sanitized message, so their
+                    # outputs are labeled too; restore before the vote so a winning
+                    # sample's summary/citations land in real-value space.
+                    extra_report = _desanitize_report(extra_report, guard)
             # Samples never trigger Phase D — strip any gap defensively.
             if extra_report.gap_for_investigator is not None:
                 extra_report = extra_report.model_copy(update={"gap_for_investigator": None})
             sample_reports.append(extra_report)
+            partial_samples += int(sample_partial)
         if len(sample_reports) >= 2:
             voted_verdict, voted_conf, vote_note = _self_consistency_vote(sample_reports)
             vote_tally = dict(Counter(r.verdict for r in sample_reports))
@@ -4113,6 +4550,13 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                     "tally": vote_tally,
                     "chosen_verdict": voted_verdict,
                     "note": vote_note,
+                    # What the arms report states for each vote: the runs asked
+                    # for, the runs that voted, the votes a partial synthesis
+                    # wrote after a budget cut, and the runs dropped.
+                    "requested": vote_samples,
+                    "voted": len(sample_reports),
+                    "partial": partial_samples,
+                    "dropped": dropped_samples,
                 },
             )
             await _audit(vote_ev)
@@ -4654,6 +5098,11 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             # The recorder stamps it on the row; the console shows it as a chip.
             "run_class": final_run_class,
             "run_class_reason": run_class_reason,
+            # The swarm triage experiment: which arm produced this report. Key
+            # ABSENT for ``single``, so the default report keeps its exact
+            # shape. The swarm counters ride along when a swarm ran.
+            **({"strategy": loop_strategy} if loop_strategy != SINGLE else {}),
+            **({"swarm": swarm_counters} if swarm_counters else {}),
         },
     )
     await _audit(triage_ev)

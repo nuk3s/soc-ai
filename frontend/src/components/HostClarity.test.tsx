@@ -118,7 +118,7 @@ describe('the facts counter and the identity sentence count inferred facts', () 
 
   it('writes the identity from the guesses and says so', () => {
     const text = sentenceText(identitySentence({ ip: '192.0.2.5', fields: fields({ role: STALE('server'), os_detail: STALE('Oracle Linux 9') }) }));
-    expect(text).toBe('192.0.2.5 is a server running Oracle Linux 9. Part of this rests on old or weak evidence.');
+    expect(text).toBe('192.0.2.5 is a server running Oracle Linux 9. Some of these facts come from old or weak evidence.');
     expect(text).not.toMatch(/Nothing else is known/);
   });
 
@@ -190,7 +190,7 @@ describe('the observations panel', () => {
       </MemoryRouter>,
     );
     expect(screen.getByTestId('observations-weight-note').textContent).toBe(
-      'all sources · a sighting counts half as much after 48 hours',
+      'all sources · an observation counts half as much after 48 hours',
     );
     expect(await screen.findByText('responds on tcp/22 with 40 network connection records')).toBeTruthy();
     expect(document.body.textContent).not.toMatch(/half-life|zeek\./);
@@ -200,8 +200,8 @@ describe('the observations panel', () => {
 
 describe('the shadow lead definition', () => {
   it('defines a shadow lead where the note names one', () => {
-    expect(LEADS_NOTE_AUTO_HUNT).toContain('A shadow lead comes from an analytic in trial mode.');
-    expect(CHIP_LEFT_TO_YOU).toContain('A shadow lead comes from an analytic in trial mode.');
+    expect(LEADS_NOTE_AUTO_HUNT).toContain('A shadow lead comes from a shadow analytic.');
+    expect(CHIP_LEFT_TO_YOU).toContain('A shadow lead comes from a shadow analytic.');
   });
 });
 

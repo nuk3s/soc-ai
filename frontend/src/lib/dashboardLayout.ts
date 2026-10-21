@@ -93,17 +93,20 @@ export interface PanelSlot {
  * The shipped layout: the arrangement the Dashboard had before the grid.
  *
  * Four tiles of three columns, the Needs-you tile first because it is the
- * total of the work, the shadow-hit tile under the first of them,
- * then the outcomes chart and the recent list in eight columns on the left and
- * the side column in four on the right. Every floor is one row, so every panel
- * takes the height of its content.
+ * total of the work. The shadow-hit tile spans the eight columns of the left
+ * column under them, then the outcomes chart and the recent list, and the side
+ * column sits in four columns on the right. Every floor is one row, so every
+ * panel takes the height of its content.
+ *
+ * The shadow-hit tile was three columns wide, and it left a hole of five
+ * columns beside it that no panel could fill (dogfood 2026-10-19, R1-D25).
  */
 export const DEFAULT_LAYOUT: readonly PanelSlot[] = Object.freeze([
   { id: 'kpi-alert-events', x: 3, y: 0, w: 3, h: 1 },
   { id: 'kpi-awaiting', x: 0, y: 0, w: 3, h: 1 },
   { id: 'kpi-true-positives', x: 6, y: 0, w: 3, h: 1 },
   { id: 'kpi-running', x: 9, y: 0, w: 3, h: 1 },
-  { id: 'kpi-shadow-hits', x: 0, y: 1, w: 3, h: 1 },
+  { id: 'kpi-shadow-hits', x: 0, y: 1, w: 8, h: 1 },
   { id: 'outcomes', x: 0, y: 2, w: 8, h: 1 },
   { id: 'recent', x: 0, y: 3, w: 8, h: 1 },
   { id: 'setup-health', x: 8, y: 2, w: 4, h: 1 },

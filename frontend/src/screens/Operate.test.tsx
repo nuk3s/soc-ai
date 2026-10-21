@@ -14,18 +14,26 @@
 // satisfy while still leaking a network call under load (the class of gap
 // src/test/setup.ts's fetch guard exists for).
 //
-// Two panels are the admitted exceptions, both reading because they answer a
-// question about unattended machinery with no other owner: the hunt catalog
-// (GET /hunt-catalog — is the sweep loop running at all, and GET /hunts/hits
-// for the 7-day hit total the Hunts page counts) and the escalation
-// ledger (GET /escalations/stranded — which alerts are held by a claim that
-// never got an answer). Operate.catalog.test.tsx and
-// Operate.escalations.test.tsx cover the panels themselves. The guard below is
-// NOT weakened for anything else — it admits those two calls by name, and
-// every other candidate still fails the test if it fires.
-import { render, screen, waitFor } from '@testing-library/react';
+// The live panels are the admitted exceptions, each reading because it answers
+// a question about unattended machinery with no other owner: the dependency
+// block (GET /health), the job list (GET /config, /auto-triage,
+// /dossiers/sweep-health, /discovery/scan, /audit/verify-schedule,
+// /quality/trend, /quality/eval/status, /maintenance), the hunt catalog
+// (GET /hunt-catalog, and GET /hunts/hits for the 7-day hit total the Hunts
+// page counts) and the escalation ledger (GET /escalations/stranded).
+// StatusDependenciesPanel.test.tsx, StatusJobsPanel.test.tsx,
+// Operate.catalog.test.tsx and Operate.escalations.test.tsx cover the panels
+// themselves.
+//
+// The guard below admits those reads by name. Each fires once on mount and
+// once per 5-minute tick, never faster: a panel that re-read on every render
+// or on a short timer fails it. Every other candidate still fails the test if
+// it fires. getHealth, getQualityTrend and getQualityEvalStatus moved from the
+// forbidden list to the admitted list on purpose (H1-D14, R5-I4): the job list
+// and the dependency block need them, and the cards still read nothing.
+import { act, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
@@ -41,12 +49,25 @@ vi.mock('../lib/api', async (importOriginal) => ({
   getHuntCatalog: vi.fn(),
   getStrandedEscalations: vi.fn(),
   getAnalyticHits: vi.fn().mockResolvedValue({ hits: [], counts: { all: 0, unread: 0, live: 0, shadow: 0 } }),
+  getConfig: vi.fn(),
+  getAutoTriageStatus: vi.fn(),
+  getDossierSweepHealth: vi.fn(),
+  getDiscoveryScan: vi.fn(),
+  getAuditVerifySchedule: vi.fn(),
+  getMaintenance: vi.fn(),
 }));
 
 import {
+  getAnalyticHits,
+  getAuditVerifySchedule,
+  getAutoTriageStatus,
   getBacktest,
+  getConfig,
+  getDiscoveryScan,
+  getDossierSweepHealth,
   getHealth,
   getHuntCatalog,
+  getMaintenance,
   getModelBattery,
   getModelFitness,
   getPreflight,
@@ -76,24 +97,111 @@ beforeEach(() => {
     total: 0,
     settling_minutes: 15,
   });
+  // The dependency block and the job list. Their content is their own suites'
+  // business. Here each read only has to answer, so the count can be pinned.
+  vi.mocked(getHealth).mockReset().mockResolvedValue({
+    es: { ok: true, detail: 'es' },
+    llm: { ok: true, detail: 'llm' },
+    so: { ok: true, detail: 'so' },
+  });
+  vi.mocked(getConfig).mockReset().mockResolvedValue({ groups: [], tokens: [], users: [], dangerHost: '' });
+  vi.mocked(getAutoTriageStatus).mockReset().mockResolvedValue({
+    active: false,
+    total: 0,
+    hunted: 0,
+    skipped: 0,
+    failed: 0,
+    finished_at: null,
+    severities: [],
+    note: null,
+    current: null,
+    tool_calls: 0,
+  });
+  vi.mocked(getDossierSweepHealth).mockReset().mockResolvedValue({
+    running: false,
+    degraded: false,
+    last_run: null,
+    error_count: 0,
+  });
+  vi.mocked(getDiscoveryScan).mockReset().mockResolvedValue({
+    running: false,
+    last_scan: null,
+    last_summary: null,
+    note: null,
+  });
+  vi.mocked(getAuditVerifySchedule).mockReset().mockResolvedValue({
+    enabled: true,
+    interval_hours: 24,
+    window_days: 7,
+    last_run: null,
+    broken: false,
+    broken_since: null,
+    detail: null,
+  });
+  vi.mocked(getQualityTrend).mockReset().mockResolvedValue({
+    points: [],
+    freshness: {
+      latest_ts: null,
+      scheduled: false,
+      stale: false,
+      last_attempt_at: null,
+      last_exit_code: null,
+      last_detail: null,
+    },
+  });
+  vi.mocked(getQualityEvalStatus).mockReset().mockResolvedValue({
+    running: false,
+    last_run: null,
+    last_exit_code: null,
+    last_detail: '',
+  });
+  vi.mocked(getMaintenance).mockReset().mockResolvedValue({
+    backups: [],
+    backups_dir: '/data/backups',
+    blocklists_dir: '/data/blocklists',
+    blocklists_refreshed: null,
+    blocklist_files: 0,
+  });
+  for (const fn of FORBIDDEN) vi.mocked(fn).mockReset();
 });
 
 // Every api fn a "live status on this card" addition could plausibly reach
-// for, across all six cards (health/preflight = diagnostics & audit chain,
-// fitness/battery = model fitness, quality = verdict quality, backtest =
-// backtest). Not exhaustive of the whole api surface — just the shapes that
-// would actually tempt someone back toward a poller here.
-const POLL_CANDIDATES = [
-  getHealth,
+// for, across all six cards (preflight = diagnostics & audit chain,
+// fitness/battery = model fitness, backtest = backtest). Not exhaustive of the
+// whole api surface. These are the shapes that would tempt someone back toward
+// a poller here.
+const FORBIDDEN = [
   getPreflight,
   getPreflightDetail,
   refreshPreflight,
   getModelFitness,
   getModelBattery,
-  getQualityTrend,
-  getQualityEvalStatus,
   getBacktest,
 ];
+
+// The reads the live panels make, by name. Each fires once per tick.
+const ADMITTED = {
+  getHealth,
+  getConfig,
+  getAutoTriageStatus,
+  getDossierSweepHealth,
+  getDiscoveryScan,
+  getAuditVerifySchedule,
+  getQualityTrend,
+  getQualityEvalStatus,
+  getMaintenance,
+  getHuntCatalog,
+  getStrandedEscalations,
+  getAnalyticHits,
+};
+
+function callCounts(): Record<string, number> {
+  return Object.fromEntries(
+    Object.entries(ADMITTED).map(([name, fn]) => [name, vi.mocked(fn).mock.calls.length]),
+  );
+}
+
+const every = (n: number) => Object.fromEntries(Object.keys(ADMITTED).map((name) => [name, n]));
 
 function mount() {
   return render(
@@ -149,14 +257,39 @@ describe('Operate hub', () => {
     });
   });
 
-  it('the cards fetch and poll nothing — the Dashboard card owns live health; only the two panels read', async () => {
+  it('the cards fetch and poll nothing; only the live panels read, once each', async () => {
+    vi.mocked(getAnalyticHits).mockClear();
     mount();
-    // The two admitted reads, awaited so the guard below runs AFTER their
-    // effects have fired — a synchronous check would pass trivially before
-    // any effect ran.
-    await waitFor(() => expect(getHuntCatalog).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(getStrandedEscalations).toHaveBeenCalledTimes(1));
-    for (const fn of POLL_CANDIDATES) {
+    // Awaited so the guard below runs AFTER the effects have fired. A
+    // synchronous check would pass trivially before any effect ran.
+    await waitFor(() => expect(callCounts()).toEqual(every(1)));
+    for (const fn of FORBIDDEN) {
+      expect(fn).not.toHaveBeenCalled();
+    }
+  });
+});
+
+// Fake timers scoped to this describe: it is ABOUT the tick.
+describe('Operate hub poll cadence', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('every live read repeats on the 5-minute tick and not before', async () => {
+    vi.mocked(getAnalyticHits).mockClear();
+    mount();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(callCounts()).toEqual(every(1));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(299_000);
+    });
+    expect(callCounts()).toEqual(every(1));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(callCounts()).toEqual(every(2));
+    for (const fn of FORBIDDEN) {
       expect(fn).not.toHaveBeenCalled();
     }
   });

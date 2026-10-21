@@ -64,7 +64,7 @@ export function entityGraphView(
     if (n.label && n.label !== n.id) tooltip.push(n.label);
     if (n.sub) tooltip.push(n.sub);
     if (n.flagged) tooltip.push(`Flagged by: ${(n.flagSources ?? []).join(', ') || 'threat intel'}.`);
-    tooltip.push('Click to open its page.');
+    tooltip.push('Select it to open its page.');
     return {
       id: n.id,
       lines,

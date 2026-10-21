@@ -13,17 +13,21 @@ import { Link } from 'react-router-dom';
 
 import { getAnalyticHits, getHuntCatalog, type HuntCatalog, type HuntCatalogSpec } from '../lib/api';
 import {
+  evaluations,
   intervalWords,
-  loopRuns,
+  loopResultLine,
   runsInProfileSweep,
   sourceWord,
+  specRunState,
   windowWords,
 } from '../lib/analyticRuns';
+import { plural } from '../lib/plural';
 import { useDemo } from '../lib/demo';
 import { SEVERITY, tint } from '../lib/tokens';
 import { absTime, ago } from '../lib/timeRange';
 import type { Severity } from '../lib/types';
 import { useAsync } from '../lib/useAsync';
+import type { RunState } from '../lib/analyticRuns';
 import {
   CHIP_HELD_BY_SYSTEM,
   CHIP_LEVEL,
@@ -79,7 +83,7 @@ const LEVEL_SEVERITY: Record<string, Severity> = {
 // row is shipped and live, which is the default for the whole catalog and the
 // same default the backend applies. Rendered without the status, a retired
 // analytic and a quiet live one are the same row of zeros.
-function TierStatus({ spec, running }: { spec: HuntCatalogSpec; running: boolean | null }) {
+function TierStatus({ spec, running }: { spec: HuntCatalogSpec; running: RunState }) {
   return (
     <>
       <span
@@ -186,10 +190,11 @@ function ShadowMarker({ count }: { count: number }) {
 // second sweep onward forever. Measured on a range: 5,240 documents an hour
 // behind a row that looked clean.
 const undecidedTitle = (n: number) =>
-  `The last sweep found ${n} documents that match the positive clauses of this analytic. It could not ` +
-  'evaluate them against an exclusion, because they carry no value for a field the exclusion reads. ' +
-  'They were neither matched nor ruled out, so this is not a clean result. Open the hunt of this ' +
-  'analytic to see which field. Then pin event.dataset, or declare absent: match on that clause.';
+  `The last sweep found ${n} documents that match the positive clauses of this analytic. The sweep ` +
+  'could not test them against an exclusion. The documents carry no value for a field that the ' +
+  'exclusion reads. The sweep did not match them and did not rule them out. This is not a clean ' +
+  'result. Open the hunt of this analytic to see the field. Then pin event.dataset, or declare ' +
+  'absent: match on that clause.';
 
 function UndecidedMarker({ count }: { count: number }) {
   return (
@@ -212,10 +217,10 @@ function UndecidedMarker({ count }: { count: number }) {
 // against the full candidate set before gating for exactly that reason, so the
 // number here is a real hit nobody was ever told about, not gate arithmetic.
 const unattributedTitle = (n: number) =>
-  `The last sweep matched ${n} documents that it could not group into any scope. They belong ` +
-  'to no candidate and reached no hunt. The analytic found something, and this row cannot show it. ' +
-  "The scope field is usually missing or empty on those documents. Open the hunt of this analytic to " +
-  'see which one. Then pin a scope that the dataset carries, or narrow the detection to that dataset.';
+  `The last sweep matched ${n} documents that it could not group into a scope. They belong to ` +
+  'no candidate and reached no hunt. The analytic found something that this row cannot show. The ' +
+  'scope field is usually missing or empty on those documents. Open the hunt of this analytic to ' +
+  'see the field. Then pin a scope that the dataset carries, or narrow the detection to that dataset.';
 
 function UnattributedMarker({ count }: { count: number }) {
   return (
@@ -238,9 +243,9 @@ function UnattributedMarker({ count }: { count: number }) {
 // "this looks clean and is not"; this one says "this number is smaller than the
 // truth", which is the harder thing to notice and the easier thing to act on.
 const truncatedTitle = (n: number) =>
-  `The last sweep hit its bucket ceiling. ${n} documents sit in scopes the grid never ` +
-  'returned, so the counts on this row are a floor and not a total. The analytic fires more often ' +
-  'than it appears to. Narrow the window or the detection until the grouping fits under the ceiling.';
+  `The last sweep reached its limit of scope buckets. ${n} documents are in scopes that the grid ` +
+  'did not return. The counts on this row are minimums. The analytic fires more often than the row ' +
+  'shows. Narrow the window or the detection until the grid returns every scope.';
 
 function TruncatedMarker({ count }: { count: number }) {
   return (
@@ -258,20 +263,39 @@ function TruncatedMarker({ count }: { count: number }) {
 // Red, the PipelineErrorChip tone: the newest sweep of this analytic failed.
 // The row read "live · fired 0 · last fired never" over 8 runs that could not
 // reach their data source (dogfood 2026-10-06), so the chip says when the last
-// run failed. The error text lives in the tooltip because it is an exception
-// string, useful to whoever fixes it and noise to everyone else.
-function FailedRunMarker({ error, at }: { error: string; at: string | null }) {
+// run failed. The tooltip holds the reason as one sentence. The raw exception
+// text stays in the trail and the log (dogfood 2026-10-19 H1-D21).
+const FAILED_REASON_DEFAULT = 'The application log holds the reason.';
+
+function FailedRunMarker({
+  reason,
+  at,
+  label = 'last run failed',
+}: {
+  reason: string | null | undefined;
+  at: string | null;
+  label?: string;
+}) {
   return (
     <span
       data-testid="last-run-failed"
       className="inline-flex flex-none items-center gap-1 whitespace-nowrap rounded-chip border px-1.5 py-px text-[9.5px] font-semibold tracking-[.02em]"
       style={{ color: '#fca5a5', borderColor: 'rgba(240,68,56,.35)', background: 'rgba(240,68,56,.09)' }}
-      title={error}
+      title={reason || FAILED_REASON_DEFAULT}
     >
       <AlertTriangle size={9} strokeWidth={2.5} />
-      last run failed {ago(at)}
+      {label} {ago(at)}
     </span>
   );
+}
+
+/** "· failed 24 of 25 runs" after the counters, when the window holds a
+ *  failed run. The counters read zero over a failed run, so a day of failed
+ *  sweeps read as a quiet day (R5-D4). */
+function failedRuns(spec: HuntCatalogSpec): string {
+  const failed = spec.failed_24h ?? 0;
+  if (failed <= 0) return '';
+  return ` · failed ${failed} of ${plural(spec.sweeps_24h, 'run')}`;
 }
 
 /** "60m", "61m", "2h", "24h" — minutes as the sweep runs them (the route
@@ -298,22 +322,49 @@ function sweepOverdue(data: HuntCatalog, now: number): boolean {
   );
 }
 
+// The header of the profile group. The rows under it carry counts, and the
+// tooltip said "This panel has no record of the profile sweep" over them
+// (dogfood 2026-10-19 R5-D26).
 const PROFILE_ROW_TITLE =
-  'A stored behavioural profile of a host answers this analytic, so the analytic sweep does not run it. The hourly profile sweep runs it. This panel has no trail for that loop, so it reports nothing here. A count of zero would read as \u201cswept, found nothing\u201d.';
+  'A stored profile of each host answers these analytics. The profile sweep runs them. The analytic sweep does not run them. The counts come from the newest profile sweep.';
 
 const DETECTOR_ROW_TITLE =
-  'A learned detector answers this analytic. It reads the grid and builds its own baseline. The analytic sweep does not run it. The hourly profile sweep runs it. This panel has no trail for that loop, so it reports nothing here.';
+  'A learned detector answers these analytics. Each detector reads the grid and builds its own baseline. The profile sweep runs them. The counts come from the newest profile sweep.';
+
+// A row the profile sweep has not run yet. A count of zero there would read
+// as a sweep that found nothing.
+const PROFILE_NOT_RUN_TITLE =
+  'The profile sweep has not run this analytic yet. The row shows no count. A zero would read as a sweep that found nothing.';
+
+const DETECTOR_NOT_RUN_TITLE =
+  'The profile sweep has not run this learned detector yet. The row shows no count. A zero would read as a sweep that found nothing.';
+
+const MEASURED_NO_HOST_TITLE =
+  'The newest profile sweep read no host for this analytic. It scored nothing. A row of zeros here does not show a clean network.';
 
 const COVERAGE_TITLE =
-  'The newest run of the profile sweep, counted in analytic-entity evaluations. measured: soc-ai scored the entity against a real baseline. learning: the entity has under 7 days of history. blind: no baseline, no confident role, or no telemetry on the grid that can answer. n/a: the host\u2019s role is outside the analytic\u2019s scope. fired: evaluations that produced a departure.';
+  'The newest run of the profile sweep, counted in analytic-entity evaluations. measured: soc-ai scored the entity against its baseline. learning: the entity has under 7 days of history. blind: no baseline, no confident role, or no telemetry on the grid that can answer. n/a: the host\u2019s role is outside the analytic\u2019s scope. fired: evaluations that produced a departure.';
+
+const FAILED_TAG_TITLE =
+  'The newest sweep failed on every analytic. Sweeps are on, and the sweeps run. They read no document.';
 
 const OVERDUE_TITLE =
-  'The newest sweep is more than two intervals old. Sweeps are enabled, and no sweep lands. soc-ai logs a failed sweep and continues, so the flag stays on. Check the application log.';
+  'The newest sweep is more than two intervals old. Sweeps are on, and no sweep completes. soc-ai logs a failed sweep and continues, so the setting stays on. Check the application log.';
 const NO_SWEEP_TITLE =
-  'Sweeps are enabled and the trail has no rows. The first interval has not arrived yet, or no sweep has ever landed.';
+  'Sweeps are on and the sweep record has no rows. The first interval has not arrived yet, or no sweep has completed.';
 
 function SweepsTag({ data }: { data: HuntCatalog }) {
   if (!data.sweeps_enabled) return <StatusTag color="#8b949e" label="Sweeps off" />;
+  // A failed sweep writes a trail row too, so the age of the newest row said
+  // nothing about whether it read the grid. The tag read a green "Sweeps on"
+  // over nine analytics whose last run failed (dogfood 2026-10-19 R5-D3).
+  if (data.sweep_health?.last_outcome === 'failed') {
+    return (
+      <span title={data.sweep_health.last_error_text || FAILED_TAG_TITLE} data-testid="sweeps-failed">
+        <StatusTag color="#f04438" label="Sweeps on, last sweep failed" />
+      </span>
+    );
+  }
   if (!sweepOverdue(data, Date.now())) return <StatusTag color="#3fb950" label="Sweeps on" />;
   if (data.last_sweep_at === null) {
     return (
@@ -362,6 +413,67 @@ function SweepsFacts({ data }: { data: HuntCatalog }) {
     </>
   );
 }
+
+/** The result of one loop, under its status line: the newest run, the failed
+ *  runs of the day and the first failure (R5-I3). Shown when a run of the
+ *  day failed. A healthy day needs no line beside the green tag. */
+function LoopResult({
+  health,
+  testId,
+}: {
+  health: HuntCatalog['sweep_health'];
+  testId: string;
+}) {
+  if (!health || (health.last_outcome === 'ok' && health.failed_24h <= 0)) return null;
+  const line = loopResultLine(health);
+  if (!line) return null;
+  const tone = health.last_outcome === 'ok' ? 'text-dim' : 'text-danger';
+  return (
+    <div data-testid={testId} className={`mt-1 text-[12px] ${tone}`}>
+      {line}
+    </div>
+  );
+}
+
+/** The profile sweep is overdue: its newest completed run is older than two
+ *  intervals. Two intervals, for the reason the catalog sweep uses two. */
+function profileOverdue(data: HuntCatalog, now: number): boolean {
+  if (data.prior_sweeps_enabled === false || !data.last_prior_run_at) return false;
+  const every = data.prior_sweep_interval_minutes ?? 60;
+  return now - Date.parse(data.last_prior_run_at) > 2 * every * 60_000;
+}
+
+/** The state of the profile sweep, over its groups. It had no failed state
+ *  and no overdue state, so four days of a dead grid read as a quiet sweep
+ *  (dogfood 2026-10-19 R5-D5). */
+function ProfileLoopState({ data }: { data: HuntCatalog }) {
+  if (data.prior_sweeps_enabled === false) return null;
+  const health = data.prior_sweep_health;
+  const failing = health && health.last_outcome !== 'ok';
+  const overdue = !failing && profileOverdue(data, Date.now());
+  const showHealth = health && (failing || health.failed_24h > 0);
+  if (!showHealth && !overdue) return null;
+  return (
+    <div
+      data-testid="profile-sweep-state"
+      className="border-b border-border-faint px-[15px] py-1.5 text-[12px]"
+    >
+      {overdue && (
+        <span className="text-warn" title={OVERDUE_PROFILE_TITLE}>
+          Profile sweep overdue. The newest run completed {ago(data.last_prior_run_at)}.
+        </span>
+      )}
+      {showHealth && (
+        <span className={failing ? 'text-danger' : 'text-dim'}>
+          Profile sweep: {loopResultLine(health)}
+        </span>
+      )}
+    </div>
+  );
+}
+
+const OVERDUE_PROFILE_TITLE =
+  'The newest profile sweep run is more than two intervals old. The sweep is on, and no run completes. Check the application log.';
 
 function SweepsLine({ data, demo }: { data: HuntCatalog; demo: boolean }) {
   return (
@@ -413,7 +525,7 @@ const COUNTS_TITLE =
 // for it yet — so the honest row says exactly that and nothing more. An
 // unknown is not a zero.
 const UNSCORED_TITLE =
-  'The profile sweep could not score this analytic against one entity. Every host it applies to is unclassified, below the role confidence gate, or still learning. A row of zeros here is not evidence of a clean network.';
+  'The profile sweep read hosts for this analytic and scored none of them. Each host is still learning, blind or outside the scope. A row of zeros here does not show a clean network.';
 
 /** The analytic's title, and the way into its drawer. Operate listed an
  *  analytic and offered no way to read it. The Analytics tab opens the same
@@ -437,21 +549,35 @@ function RowTitle({ spec, onOpen }: { spec: HuntCatalogSpec; onOpen: (id: string
 function ProfileSpecRow({
   spec,
   running,
+  tried,
   onOpen,
-  rowTitle = PROFILE_ROW_TITLE,
+  rowTitle = PROFILE_NOT_RUN_TITLE,
 }: {
   spec: HuntCatalogSpec;
-  running: boolean | null;
+  running: RunState;
+  /** When the profile sweep last tried to run. A failed run wrote no trail
+   *  row, so the loop's own record dates it. */
+  tried: string | null;
   onOpen: (id: string) => void;
   /** What answers the analytic, for a row the sweep has not run yet. */
   rowTitle?: string;
 }) {
   const c = spec.coverage;
+  const failed = Boolean(spec.last_error_text || spec.last_error);
   return (
     <li className="flex items-center gap-2.5 px-[15px] py-3 text-[13px]">
       <RowTitle spec={spec} onOpen={onOpen} />
       <LevelPill level={spec.level} />
       <TierStatus spec={spec} running={running} />
+      {/* The newest run of the loop failed or did not run. The row read live
+          and quiet over four days of a dead grid (dogfood 2026-10-19). */}
+      {failed && (
+        <FailedRunMarker
+          reason={spec.last_error_text}
+          at={tried}
+          label="could not read the grid"
+        />
+      )}
       {c === null ? (
         <span className="flex-none text-[12px] text-dim" title={rowTitle}>
           not yet run · <code className="font-mono text-[11.5px]">soc-ai priors</code>
@@ -479,7 +605,7 @@ function ProfileSpecRow({
             <span
               className="inline-flex flex-none items-center gap-1 whitespace-nowrap rounded-chip border px-1.5 py-px text-[9.5px] font-semibold tracking-[.02em]"
               style={{ color: AMBER, borderColor: tint(AMBER, 0.35), background: tint(AMBER, 0.09) }}
-              title="Recorded in shadow. soc-ai writes departures as observations and leads. Nothing here triggers a hunt until somebody reads the shadow week."
+              title="Recorded in shadow. soc-ai writes departures as observations and leads. No hunt starts from here until an analyst reads the shadow week."
             >
               <Ghost size={9} strokeWidth={2.5} />
               shadow
@@ -487,12 +613,13 @@ function ProfileSpecRow({
           )}
           {c.measured === 0 && (
             <span
+              data-testid="profile-unscored"
               className="inline-flex flex-none items-center gap-1 whitespace-nowrap rounded-chip border px-1.5 py-px text-[9.5px] font-semibold tracking-[.02em]"
               style={{ color: AMBER, borderColor: tint(AMBER, 0.35), background: tint(AMBER, 0.09) }}
-              title={UNSCORED_TITLE}
+              title={evaluations(c) === 0 ? MEASURED_NO_HOST_TITLE : UNSCORED_TITLE}
             >
               <EyeOff size={9} strokeWidth={2.5} />
-              unscored
+              {evaluations(c) === 0 ? 'measured no host' : 'unscored'}
             </span>
           )}
         </>
@@ -507,7 +634,7 @@ function SpecRow({
   onOpen,
 }: {
   spec: HuntCatalogSpec;
-  running: boolean | null;
+  running: RunState;
   onOpen: (id: string) => void;
 }) {
   return (
@@ -526,6 +653,7 @@ function SpecRow({
         <>
           <span className="flex-none font-mono text-[11.5px] text-dim" title={COUNTS_TITLE}>
             fired {spec.fired_24h} · fresh {spec.fresh_24h} · handled {spec.already_handled_24h}
+            {failedRuns(spec)}
           </span>
           {/* The age, not a boolean: "last fired never" on a critical spec
               means one thing checked two minutes ago and another checked
@@ -557,7 +685,9 @@ function SpecRow({
       {spec.unattributed_docs > 0 && <UnattributedMarker count={spec.unattributed_docs} />}
       {spec.truncated_docs > 0 && <TruncatedMarker count={spec.truncated_docs} />}
       {spec.blind && <BlindMarker />}
-      {spec.last_error && <FailedRunMarker error={spec.last_error} at={spec.last_swept_at} />}
+      {(spec.last_error_text || spec.last_error) && (
+        <FailedRunMarker reason={spec.last_error_text} at={spec.last_swept_at} />
+      )}
     </li>
   );
 }
@@ -608,6 +738,15 @@ export function HuntCatalogPanel() {
   const detectors = specs.filter((s) => s.evaluator === 'model');
   const profiled = specs.filter((s) => runsInProfileSweep(s.evaluator) && s.evaluator !== 'model');
   const swept = specs.filter((s) => !runsInProfileSweep(s.evaluator));
+  // The count of a method group, with its unit. "Method: query · 13" counted
+  // four retired analytics and named no unit (dogfood 2026-10-19 R5-D26).
+  const groupCount = (group: HuntCatalogSpec[]) => {
+    const retired = group.filter((s) => s.status === 'retired').length;
+    return `${plural(group.length, 'analytic')}${retired ? `, ${retired} retired` : ''}`;
+  };
+  // When the profile sweep last tried to run. A failed run wrote no trail
+  // row, so the loop's own record dates it.
+  const profileTried = data?.prior_sweep_health?.last_run_at ?? null;
   // The three words on the profile sweep rows, each defined once, above the
   // first group that holds such rows. `n/a` had no definition anywhere in the
   // app.
@@ -618,7 +757,7 @@ export function HuntCatalogPanel() {
     >
       <div>
         <span className="font-semibold text-dim">measured</span>: soc-ai scored the host
-        against a real baseline.
+        against its baseline.
       </div>
       <div>
         <span className="font-semibold text-dim">learning</span>: the host has under 7
@@ -629,8 +768,12 @@ export function HuntCatalogPanel() {
         no confident role or no telemetry on the grid.
       </div>
       <div>
-        <span className="font-semibold text-dim">unscored</span>: the host has under
-        7 days of history, or no telemetry the analytic can read.
+        <span className="font-semibold text-dim">unscored</span>: the sweep read hosts
+        for the analytic and scored none of them.
+      </div>
+      <div>
+        <span className="font-semibold text-dim">measured no host</span>: the sweep read
+        no host for the analytic.
       </div>
       <div>
         <span className="font-semibold text-dim">n/a</span>: the host&rsquo;s role is
@@ -638,7 +781,7 @@ export function HuntCatalogPanel() {
       </div>
       <div>
         <span className="font-semibold text-dim">shadow</span>: the analytic would
-        have fired. soc-ai wrote it down and raised nothing.
+        have fired. soc-ai recorded it and raised nothing.
       </div>
     </div>
   );
@@ -682,6 +825,7 @@ export function HuntCatalogPanel() {
           ) : null}
           <div className="border-b border-border px-[15px] py-3 text-[13px] text-text-2">
             <SweepsLine data={data} demo={demo} />
+            <LoopResult health={data.sweep_health} testId="catalog-sweep-result" />
           </div>
           {data.specs.length === 0 ? (
             <EmptyState>No analytics are installed.</EmptyState>
@@ -693,7 +837,7 @@ export function HuntCatalogPanel() {
                   filters on (C6): query, baseline, learned. */}
               <div className="flex items-center justify-between gap-2 border-b border-border-faint px-[15px] py-1.5 text-[11px] text-dim">
                 <span data-testid="method-query">
-                  Method: query · {swept.length} · run by the analytic sweep
+                  Method: query · {groupCount(swept)} · run by the analytic sweep
                 </span>
                 <span title={COUNTS_TITLE}>fired, fresh and handled cover the last 24 h</span>
               </div>
@@ -715,13 +859,17 @@ export function HuntCatalogPanel() {
                   <span className="font-semibold text-dim">handled</span>: a match an earlier
                   observation already covered.
                 </div>
+                <div>
+                  <span className="font-semibold text-dim">failed</span>: a run that read no
+                  document. The grid did not answer, or it refused the query.
+                </div>
               </div>
               <ul className="divide-y divide-border">
                 {swept.map((spec) => (
                   <SpecRow
                     key={spec.id}
                     spec={spec}
-                    running={loopRuns(data, spec.evaluator)}
+                    running={specRunState(data, spec)}
                     onOpen={setOpenId}
                   />
                 ))}
@@ -734,7 +882,8 @@ export function HuntCatalogPanel() {
                       the catalog sweep, and none of them apply here. */}
                   <div className="flex items-center justify-between gap-2 border-y border-border-faint bg-surface-2/40 px-[15px] py-1.5 text-[11px] text-dim">
                     <span data-testid="method-baseline">
-                      Method: baseline · {profiled.length} · each host against its own baseline
+                      Method: baseline · {groupCount(profiled)} · each host against its own
+                      baseline
                     </span>
                     <span title={PROFILE_ROW_TITLE}>
                       {data.prior_sweeps_enabled === false
@@ -744,13 +893,15 @@ export function HuntCatalogPanel() {
                   </div>
                   {/* The two chips on these rows are the vocabulary of the
                       layer, and a reader meets them here first. */}
+                  <ProfileLoopState data={data} />
                   {legend}
                   <ul className="divide-y divide-border">
                     {profiled.map((spec) => (
                       <ProfileSpecRow
                         key={spec.id}
                         spec={spec}
-                        running={loopRuns(data, 'profile')}
+                        running={specRunState(data, spec)}
+                        tried={profileTried}
                         onOpen={setOpenId}
                       />
                     ))}
@@ -765,22 +916,24 @@ export function HuntCatalogPanel() {
                     data-testid="detector-group"
                     className="flex items-center justify-between gap-2 border-y border-border-faint bg-surface-2/40 px-[15px] py-1.5 text-[11px] text-dim"
                   >
-                    <span>Method: learned · {detectors.length} · learned detectors</span>
+                    <span>Method: learned · {groupCount(detectors)} · learned detectors</span>
                     <span title={DETECTOR_ROW_TITLE}>
                       {data.prior_sweeps_enabled === false
                         ? 'The profile sweep is off. These detectors do not run.'
                         : 'run by the hourly profile sweep · counts are detector-host evaluations'}
                     </span>
                   </div>
+                  {profiled.length === 0 && <ProfileLoopState data={data} />}
                   {profiled.length === 0 && legend}
                   <ul className="divide-y divide-border">
                     {detectors.map((spec) => (
                       <ProfileSpecRow
                         key={spec.id}
                         spec={spec}
-                        running={loopRuns(data, 'model')}
+                        running={specRunState(data, spec)}
+                        tried={profileTried}
                         onOpen={setOpenId}
-                        rowTitle={DETECTOR_ROW_TITLE}
+                        rowTitle={DETECTOR_NOT_RUN_TITLE}
                       />
                     ))}
                   </ul>
@@ -803,7 +956,7 @@ export function HuntCatalogPanel() {
                   analytic runs and what it can see. The Analytics tab says what
                   it found and lets an analyst change what it does. */}
               <Link to="/hunts?tab=analytics" className="flex w-fit items-center gap-1 text-[12px] font-semibold text-accent hover:underline">
-                Open in Hunts
+                Open the Analytics tab
                 <ArrowUpRight size={13} />
               </Link>
             </div>

@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { ExternalLink } from 'lucide-react';
 import { checkForUpdates, getAbout } from '../lib/api';
 import type { AboutInfo, UpdateCheckResult } from '../lib/types';
+import { HelpText } from '../components/HelpText';
 import { CollapseChevron } from '../components/Panel';
 import { ErrorState, LoadingState } from '../components/States';
 import { Wordmark } from '../components/Logo';
@@ -120,8 +121,7 @@ export function AboutPanel({
                   </div>
                 ) : (
                   <div className="text-[12px] leading-[1.5] text-faint">
-                    Update checks are off. soc-ai makes no outbound calls. An admin can turn on a
-                    manual GitHub release check under Privacy &amp; Egress → Updates.
+                    <HelpText text="Update checks are off. soc-ai makes no call to GitHub. An admin can turn on a manual GitHub release check in Settings > Updates." />
                   </div>
                 )}
               </div>

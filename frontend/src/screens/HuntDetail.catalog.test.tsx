@@ -377,7 +377,7 @@ describe('HuntDetail — the timeline of a hunt that has no steps by constructio
     // "Yet" promises a second act. A catalog hunt is one query; there is none.
     expect(screen.queryByText('No steps yet.')).toBeNull();
     expect(screen.queryByText(/0 steps/)).toBeNull();
-    expect(screen.getByText(/single Elasticsearch query/i)).toBeInTheDocument();
+    expect(screen.getByText(/runs its analytic as one grid query/i)).toBeInTheDocument();
   });
 
   it('still says "yet" for a model hunt whose steps have not landed', async () => {
@@ -395,6 +395,50 @@ describe('HuntDetail — the timeline of a hunt that has no steps by constructio
     mount();
     await screen.findByText(catalogFinding.title);
     expect(screen.getByText('No steps yet.')).toBeInTheDocument();
-    expect(screen.queryByText(/single Elasticsearch query/i)).toBeNull();
+    expect(screen.queryByText(/runs its analytic as one grid query/i)).toBeNull();
+  });
+});
+
+// R3-D13: the catalog composer writes plain text. The narrative renderer read
+// the asterisks of an index pattern as emphasis, and ".ds-logs-*-so-*" read
+// ".ds-logs--so-" in italics. The range row is a run that could not run.
+describe('HuntDetail: a catalog narrative is plain text', () => {
+  it('keeps the asterisks of an index pattern', async () => {
+    const narrative =
+      'A workstation requests a service ticket: the run failed. The result is unknown. ' +
+      'precondition: partial search results from .ds-logs-*-so-*,.ds-logs-*-default-*,' +
+      'logs-synth-*: 244 of 289 shards failed (no_shard_available_action_exception).';
+    const failure = {
+      title: 'A workstation requests a service ticket: could not run',
+      detail: 'The analytic local-svc-ticket could not run on the grid. The result is unknown.',
+      severity: 'medium',
+      category: 'visibility_gap',
+      hosts: [],
+      citations: [],
+    };
+    vi.mocked(getHunt).mockResolvedValue(
+      catalogHunt({
+        narrative,
+        findings: [failure],
+        outcome: 'could_not_run',
+        outcome_label: 'Could not run',
+        outcome_headline: 'The grid answered from part of its shards. Hunt again when the grid is healthy.',
+      }),
+    );
+    mount();
+    expect((await screen.findByTestId('hunt-narrative-plain')).textContent).toBe(narrative);
+    expect(document.querySelector('em')).toBeNull();
+  });
+});
+
+// R3 STE 11: the meta strip read "started by hunt-catalog", the raw actor.
+describe('HuntDetail: the starter of a catalog hunt', () => {
+  it('reads the catalog sweep', async () => {
+    mount();
+    const label = await screen.findByText('started by');
+    expect(label.nextElementSibling?.textContent).toBe('the catalog sweep');
+    expect(screen.queryByText('hunt-catalog')).toBeNull();
+    // R3-D15: the tab named no hunt.
+    expect(document.title).toMatch(/^Hunt: .+ · soc·ai$/);
   });
 });

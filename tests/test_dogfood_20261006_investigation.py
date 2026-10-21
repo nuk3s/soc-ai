@@ -293,6 +293,11 @@ def test_the_escalate_scope_is_one_case_for_this_alert(client: TestClient) -> No
         "held": 0,
         "rangeLabel": "",
         "sentence": "Open one Security Onion case for this alert.",
+        # No case on the grid of this fixture, and none in the ledger. The
+        # grid read of the fixture does not answer, so the list is not
+        # confirmed (2026-10-20, V3-N2).
+        "cases": [],
+        "casesComplete": False,
     }
 
 

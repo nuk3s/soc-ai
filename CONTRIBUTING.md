@@ -5,25 +5,25 @@ Security Onion. It is a companion service. It does not fork Security Onion.
 
 ## Ground rules
 
-- Be excellent to each other. Assume good faith.
+- Be respectful to each other. Assume good faith.
 - By contributing you agree your work is licensed under the project's
   [Apache-2.0](LICENSE) license.
 - **Never commit secrets** or real grid data. That covers `.env`, API keys,
   passwords, TLS keys, SSH keys, host addresses, hostnames and alert dumps. They
   are gitignored. Check `git diff` before you push.
 
-## Scope: privacy first
+## Scope and privacy
 
-The core promise of soc-ai is that **nothing leaves the box by default**. A
-feature must not add default-on egress. Any new network destination has to be
+**By default, soc-ai sends no data off the host.** A feature must not add
+default-on egress. Any new network destination has to be
 opt-in, off by default, and visible on the egress-policy page. A feed, an API, a
 telemetry endpoint and a model call all count as destinations.
 
 [docs/SAFETY_MODEL.md](docs/SAFETY_MODEL.md) documents the trust boundaries: what
 the agent may read, what needs human approval, and what the sanitizer strips
 before anything cloud-facing. Read it before you propose anything that touches
-the agent's tools, the approval gate, or an outbound connection. A PR that routes
-around these boundaries is declined, whatever its code quality.
+the agent's tools, the approval gate, or an outbound connection. The project
+declines a PR that routes around these boundaries, whatever its code quality.
 
 ## Dev setup
 
@@ -41,7 +41,7 @@ cd frontend && npm ci
 Copy `.env.example` to `.env` and fill it in. `soc_ai/config.py` is the field
 reference. For local-only work you can point `SO_HOST`, `ES_HOSTS` and
 `LITELLM_BASE_URL` at a lab grid and gateway. Once the file is filled in,
-`uv run soc-ai doctor` checks the whole dependency surface.
+`uv run soc-ai doctor` checks every dependency.
 
 ## CI checks
 
@@ -82,11 +82,11 @@ uv run pytest --override-ini "addopts=" --no-header -v -m browser tests/browser/
 
 1. Branch off `main`. Keep each PR focused.
 2. Behavior changes need tests. The suite is fast and offline. It reaches no live
-   grid and no live model, so mock the upstreams with `AsyncMock` and `respx`.
+   grid and no live model. Mock the upstreams with `AsyncMock` and `respx`.
 3. Behavior changes need a changelog entry under `[Unreleased]` in
    [CHANGELOG.md](CHANGELOG.md). That file follows
    [Keep a Changelog](https://keepachangelog.com/).
-4. All the checks above must be green.
+4. All the checks above must pass.
 5. Open the PR with a clear description of the change and its motivation.
 
 ## Conventions
@@ -97,7 +97,7 @@ uv run pytest --override-ini "addopts=" --no-header -v -m browser tests/browser/
   reason.
 - **Security boundary:** OQL goes through the field-whitelist validator before
   Elasticsearch. Write tools always go through the human approval gate. Anything
-  sent to the Oracle is sanitized first. Don't route around these.
+  sent to the Oracle is sanitized first. Do not route around these boundaries.
 
 ## Writing style
 

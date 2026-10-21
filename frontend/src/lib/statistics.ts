@@ -52,7 +52,7 @@ export function statisticSentence(
         b === null ? '' : ` ${plural(Math.round(baseline as number), 'host')} held it before.`
       }`;
     case 'plane_documents':
-      return `${plural(Math.round(value), 'document')} on the silent plane in the silent hours.${
+      return `${plural(Math.round(value), 'document')} from the log source in the hours it stopped.${
         b === null ? '' : ` The baseline expects ${b} in those hours.`
       }`;
     case 'chain_minutes':

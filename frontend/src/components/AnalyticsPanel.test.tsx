@@ -239,14 +239,14 @@ describe('AnalyticsPanel', () => {
     // Each status says what the sweep does and what happens to what it finds.
     // "runs, recorded, not raised" named neither actor.
     const legend = screen.getByTestId('analytics-legend');
-    expect(legend.textContent).toContain('live: the sweep runs it and raises what it finds.');
-    expect(legend.textContent).toContain('shadow: the sweep runs it and records what it finds.');
-    expect(legend.textContent).toContain('draft: the sweep has never run it.');
+    expect(legend.textContent).toContain('live: the sweep runs the analytic and raises what it finds.');
+    expect(legend.textContent).toContain('shadow: the sweep runs the analytic and records what it finds.');
+    expect(legend.textContent).toContain('draft: the sweep has never run the analytic.');
     expect(legend.textContent).toContain('retired: the analytic keeps its ledger and its reason.');
     // C6: the paused status was nowhere on the screen.
     expect(legend.textContent).toContain(
-      'paused by soc-ai: soc-ai moved a live analytic to shadow. It fired too often or was ' +
-        'often wrong. You decide.',
+      'Paused by soc-ai: soc-ai moved a live analytic to shadow. The analytic fired too often ' +
+        'or was often wrong. Approve it or reject it.',
     );
   });
 
@@ -490,7 +490,7 @@ describe('AnalyticsPanel sweep', () => {
     );
     mount();
     const row = await screen.findByTestId(`analytic-${SHIPPED_LIVE.id}`);
-    expect(within(row).getByText('6 measured · 38 blind · baseline 26 h old, stale')).toBeTruthy();
+    expect(within(row).getByText('6 measured · 38 blind · profiles built 26 h ago, stale')).toBeTruthy();
   });
 
   // N2 of the 2026-10-05 verification. The sweep now opens every reason with
@@ -587,10 +587,10 @@ describe('AnalyticsPanel sweep', () => {
     mount();
     const modelRow = await screen.findByTestId(`analytic-${model.id}`);
     await waitFor(() => expect(within(modelRow).getByText('6 measured · 38 blind')).toBeTruthy());
-    expect(modelRow.textContent).not.toContain('baseline 13 h old');
+    expect(modelRow.textContent).not.toContain('profiles built 13 h ago');
     // Negative control: the profile analytic reads the same coverage with its age.
     const profileRow = screen.getByTestId(`analytic-${profile.id}`);
-    expect(within(profileRow).getByText('6 measured · 38 blind · baseline 13 h old')).toBeTruthy();
+    expect(within(profileRow).getByText('6 measured · 38 blind · profiles built 13 h ago')).toBeTruthy();
   });
 
   it('reads an older backend without baseline fields unchanged', async () => {
@@ -603,7 +603,12 @@ describe('AnalyticsPanel sweep', () => {
   it('names a rejection in the legend', async () => {
     mount();
     const legend = await screen.findByTestId('analytics-legend');
-    expect(legend.textContent).toContain('Rejected = retired with a reason.');
+    expect(legend.textContent).toContain(
+      'Rejected: the analytic is retired, and the reason is on record.',
+    );
+    // R3 STE 5: the legend names the controls and says no "You decide".
+    expect(legend.textContent).toContain('Approve it or reject it.');
+    expect(legend.textContent).not.toContain('You decide');
   });
 });
 
@@ -670,5 +675,171 @@ describe('AnalyticsPanel filters', () => {
     await screen.findByTestId(`analytic-${SHIPPED_LIVE.id}`);
     fireEvent.click(screen.getByRole('checkbox', { name: /active in 7 days/ }));
     await waitFor(() => expect(rowIds()).toEqual([SHIPPED_LIVE.id]));
+  });
+});
+
+
+// Dogfood 2026-10-19 R3-D1. Nine live query analytics read a green "live",
+// "0 observations" and "last sweep 13m ago" while every sweep failed. The
+// catalog held the error and the tab never read it.
+describe('AnalyticsPanel, a failed sweep', () => {
+  const ago = (ms: number) => new Date(Date.now() - ms).toISOString();
+  const failedSpec = {
+    id: SHIPPED_LIVE.id,
+    title: SHIPPED_LIVE.title,
+    level: 'high',
+    scope_kind: 'host',
+    attack: [],
+    evaluator: 'match',
+    coverage: null,
+    last_swept_at: ago(13 * 60_000),
+    last_fired_at: null,
+    blind: false,
+    last_error: 'precondition: ConnectionError(Cannot connect to host 192.0.2.10:9200)',
+    last_error_text: 'soc-ai could not connect to the grid.',
+    sweeps_24h: 25,
+    fired_24h: 0,
+    fresh_24h: 0,
+    already_handled_24h: 0,
+    shadow_24h: 0,
+    undecided_docs: 0,
+    unattributed_docs: 0,
+    truncated_docs: 0,
+    failed_24h: 25,
+    failing_since: ago(4 * 86_400_000),
+  };
+  const FAILED = {
+    ...RAN,
+    last_sweep_at: ago(13 * 60_000),
+    specs: [failedSpec],
+    sweep_health: {
+      last_run_at: ago(13 * 60_000),
+      last_outcome: 'failed',
+      last_error_text: 'soc-ai could not connect to the grid.',
+      runs_24h: 25,
+      failed_24h: 25,
+      failing_since: ago(4 * 86_400_000),
+      counted_since: null,
+    },
+  };
+
+  it('reads the row as failed, with the reason in words', async () => {
+    vi.mocked(getHuntCatalog).mockResolvedValue(FAILED);
+    mount();
+    const row = await screen.findByTestId(`analytic-${SHIPPED_LIVE.id}`);
+    await waitFor(() => expect(within(row).getByText('live, last run failed')).toBeTruthy());
+    const dot = within(row).getByTestId('status-dot');
+    expect(dot.getAttribute('data-run')).toBe('failed');
+    const why = within(row).getByTestId(`analytic-failed-${SHIPPED_LIVE.id}`);
+    expect(why.textContent).toBe('The last run failed 13m ago. soc-ai could not connect to the grid.');
+    expect(row.textContent).not.toContain('ConnectionError');
+  });
+
+  it('states the loop result over the table', async () => {
+    vi.mocked(getHuntCatalog).mockResolvedValue(FAILED);
+    mount();
+    const line = await screen.findByTestId('analytics-sweep-result-match');
+    expect(line.textContent).toBe(
+      'Analytic sweep: Last sweep failed 13m ago. soc-ai could not connect to the grid. ' +
+        '25 of 25 runs failed in 24 h. First failure 4d ago.',
+    );
+    expect(screen.getByTestId('analytics-sweep').textContent).toContain('last sweep failed 13m ago');
+  });
+
+  it('shows no result line for a healthy loop', async () => {
+    vi.mocked(getHuntCatalog).mockResolvedValue({
+      ...RAN,
+      sweep_health: {
+        last_run_at: ago(10 * 60_000),
+        last_outcome: 'ok',
+        runs_24h: 24,
+        failed_24h: 0,
+      },
+    });
+    mount();
+    await screen.findByTestId('analytics-sweep');
+    expect(screen.queryByTestId('analytics-sweep-results')).toBeNull();
+  });
+
+  it('reads a profile analytic that measured no host as such', async () => {
+    const PROFILE: AnalyticRow = {
+      ...base,
+      id: 'prior-hypervisor-novel-served-port',
+      title: 'A hypervisor serves a new port',
+      evaluator: 'profile',
+      tier: 'shipped',
+      status: 'live',
+    };
+    vi.mocked(getAnalytics).mockResolvedValue({ analytics: [PROFILE], counts: { live: 1 } });
+    vi.mocked(getHuntCatalog).mockResolvedValue({
+      ...RAN,
+      specs: [
+        {
+          ...failedSpec,
+          id: PROFILE.id,
+          evaluator: 'profile',
+          last_error: null,
+          last_error_text: null,
+          coverage: {
+            last_run_at: ago(5 * 60_000),
+            measured: 0,
+            learning: 0,
+            blind: 0,
+            not_applicable: 0,
+            fired: 0,
+            shadow: false,
+          },
+        },
+      ],
+    });
+    mount();
+    const row = await screen.findByTestId(`analytic-${PROFILE.id}`);
+    await waitFor(() => expect(within(row).getByText('live, measured no host')).toBeTruthy());
+  });
+});
+
+// Dogfood 2026-10-19 R3 STE 6. "1 shadow hits · 1 unread".
+describe('AnalyticsPanel, the shadow hit count', () => {
+  it('says one shadow hit in the singular', async () => {
+    vi.mocked(getAnalytics).mockResolvedValue({
+      analytics: [{ ...LOCAL_SHADOW, shadow_hits_7d: 1, unread_shadow_hits: 1 }],
+      counts: { shadow: 1 },
+    });
+    mount();
+    const row = await screen.findByTestId(`analytic-${LOCAL_SHADOW.id}`);
+    expect(within(row).getByText(/1 shadow hit · 1 unread/)).toBeTruthy();
+    expect(row.textContent).not.toContain('1 shadow hits');
+  });
+});
+
+// Dogfood 2026-10-19 R3-D14. Escape did not close the New analytic box.
+describe('AnalyticsPanel, the New analytic box', () => {
+  it('closes on Escape', async () => {
+    mount();
+    fireEvent.click(await screen.findByText('New analytic'));
+    const box = await screen.findByTestId('new-analytic-box');
+    fireEvent.keyDown(within(box).getByRole('textbox'), { key: 'Escape' });
+    await waitFor(() => expect(screen.queryByTestId('new-analytic-box')).toBeNull());
+    expect(screen.getByText('New analytic')).toBeTruthy();
+  });
+
+  // V1-H9: the box opened as a 200 px textarea in the right slot of the
+  // panel header.
+  it('opens as a full-width row under the header', async () => {
+    mount();
+    const open = await screen.findByRole('button', { name: 'New analytic' });
+    const slot = open.parentElement as HTMLElement;
+    fireEvent.click(open);
+    const box = await screen.findByTestId('new-analytic-box');
+    expect(slot.contains(box)).toBe(false);
+    expect(box.className).toContain('w-full');
+    const area = within(box).getByRole('textbox') as HTMLTextAreaElement;
+    expect(Number(area.getAttribute('rows'))).toBeGreaterThanOrEqual(14);
+    expect(area.className).toContain('w-full');
+    expect(document.activeElement).toBe(area);
+    // The button says the box is open, and a second press closes it.
+    expect(open.getAttribute('aria-expanded')).toBe('true');
+    fireEvent.click(open);
+    await waitFor(() => expect(screen.queryByTestId('new-analytic-box')).toBeNull());
   });
 });

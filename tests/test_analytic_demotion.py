@@ -393,3 +393,38 @@ def test_a_person_with_a_system_name_is_refused_through_the_route(client: TestCl
     assert "system_actor_refused" in res.text
     detail = client.get(f"/api/v1/analytics/{_SHIPPED}").json()
     assert detail["status"] == "shadow"
+
+
+def test_a_live_hit_of_a_held_analytic_names_the_hold(client: TestClient) -> None:
+    """R3-D11. The hits of a held analytic sat under Live with a "shadow" chip
+    and Approve and Reject, and no card said soc-ai held the analytic."""
+    born = datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=2)
+
+    async def seed() -> None:
+        async with client.app.state.db_sessionmaker() as db:
+            db.add(
+                EntityObservation(
+                    entity_kind="host",
+                    entity_key="192.0.2.21",
+                    kind="catalog_match",
+                    spec_id=_SHIPPED,
+                    fingerprint="fp-held-live",
+                    birth_weight=0.7,
+                    born_at=born,
+                    first_seen_at=born,
+                    occurrences=1,
+                    source="catalog",
+                    shadow=False,
+                )
+            )
+            await db.commit()
+
+    asyncio.run(seed())
+    hit = client.get("/api/v1/hunts/hits").json()["hits"][0]
+    # Control: the analytic is live and holds nothing.
+    assert hit["analytic_held_by_system"] is None
+    _demote(client, _SHIPPED)
+    hit = client.get("/api/v1/hunts/hits").json()["hits"][0]
+    assert hit["recorded_in_shadow"] is False
+    assert hit["analytic_status"] == "shadow"
+    assert hit["analytic_held_by_system"] == _REASON

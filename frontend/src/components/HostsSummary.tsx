@@ -71,7 +71,7 @@ export function roleSlices(summary: MachineSummary): RoleSlice[] {
 
 const BUCKET_TITLES: Record<string, string> = {
   low_confidence:
-    'The sweep guessed a role for these machines. The evidence is too thin to assert it. Role-scoped analytics leave these machines unscored.',
+    'The sweep guessed a role for these machines. The evidence is too weak to assert it. Role-scoped analytics leave these machines unscored.',
   stale:
     'The sweep inferred a role for these machines. The evidence is older than the staleness window. Run a sweep to confirm it.',
   unknown: 'The sweep has no role for these machines.',
@@ -125,7 +125,7 @@ function RoleBar({
         <span
           data-testid="role-bar-scope"
           className="text-[11px] text-faint"
-          title="The role of each machine. An operator declaration wins over the sweep."
+          title="The role of each machine. An operator declaration replaces the sweep value."
         >
           across all {plural(summary.machines, 'machine')}, quiet ones too
         </span>
@@ -201,7 +201,17 @@ export interface HostsSummaryProps {
   searchActive?: boolean;
 }
 
-/** The two parts of Needs attention. An older server sends no `out_of_date`;
+/** One part of Needs attention: a count, its words and the filter it lists. */
+export interface AttentionPart {
+  key: 'stale' | 'failed' | 'never-built' | 'no-clean-build';
+  count: number;
+  text: string;
+  /** The `health` filter that lists the machines of this part. */
+  health: 'stale' | 'broken';
+  title: string;
+}
+
+/** The parts of Needs attention. An older server sends no `out_of_date`;
  *  the part is then the remainder. */
 export function attentionParts(summary: MachineSummary): { outOfDate: number; neverBuilt: number } {
   const neverBuilt = summary.never_built;
@@ -209,11 +219,66 @@ export function attentionParts(summary: MachineSummary): { outOfDate: number; ne
   return { outOfDate, neverBuilt };
 }
 
-/** "37 need attention: 34 out of date, 3 never built". */
-export function attentionSentence(summary: MachineSummary): string {
+/**
+ * The parts to show, each above zero. `never_built` counts every machine with
+ * no clean build, and the card read "3 never built" over 3 failed builds
+ * (dogfood 2026-10-19, R4-D16). `build_failed` splits the failed builds off.
+ * An older server sends no `build_failed`, and one part names the total.
+ */
+export function attentionList(summary: MachineSummary): AttentionPart[] {
   const { outOfDate, neverBuilt } = attentionParts(summary);
+  const out: AttentionPart[] = [];
+  if (outOfDate > 0) {
+    out.push({
+      key: 'stale',
+      count: outOfDate,
+      text: `${outOfDate.toLocaleString()} out of date`,
+      health: 'stale',
+      title: 'A clean build older than the staleness window. A sweep confirms it again.',
+    });
+  }
+  const BROKEN_LIST = 'The link lists every machine with no clean build.';
+  if (summary.build_failed == null) {
+    if (neverBuilt > 0) {
+      out.push({
+        key: 'no-clean-build',
+        count: neverBuilt,
+        text: `${neverBuilt.toLocaleString()} ${neverBuilt === 1 ? 'has' : 'have'} no clean build`,
+        health: 'broken',
+        title: 'The sweep never built these machines, or the last build failed.',
+      });
+    }
+    return out;
+  }
+  const failed = Math.min(Math.max(0, summary.build_failed), neverBuilt);
+  const never = neverBuilt - failed;
+  if (failed > 0) {
+    out.push({
+      key: 'failed',
+      count: failed,
+      text: `${failed.toLocaleString()} failed to build`,
+      health: 'broken',
+      title: `The last build of these machines failed. ${BROKEN_LIST}`,
+    });
+  }
+  if (never > 0) {
+    out.push({
+      key: 'never-built',
+      count: never,
+      text: `${never.toLocaleString()} never built`,
+      health: 'broken',
+      title: `The sweep has not built these machines yet. ${BROKEN_LIST}`,
+    });
+  }
+  return out;
+}
+
+/** "37 need attention: 34 out of date, 3 failed to build". */
+export function attentionSentence(summary: MachineSummary): string {
   if (summary.needs_attention === 0) return 'No machine needs attention.';
-  return `${summary.needs_attention.toLocaleString()} need attention: ${outOfDate.toLocaleString()} out of date, ${neverBuilt.toLocaleString()} never built`;
+  const parts = attentionList(summary).map((p) => p.text);
+  const head = `${summary.needs_attention.toLocaleString()} need attention`;
+  return parts.length ? `${head}: ${parts.join(', ')}` : head;
 }
 
 export function HostsSummary({
@@ -225,7 +290,7 @@ export function HostsSummary({
 }: HostsSummaryProps) {
   const n = (v: number | undefined) => (summary == null || v == null ? UNKNOWN : v.toLocaleString());
   const tone = (good: string) => (summary == null ? UNKNOWN_TONE : good);
-  const parts = summary ? attentionParts(summary) : null;
+  const parts = summary ? attentionList(summary) : null;
   return (
     <div data-testid="hosts-summary" className="mb-3.5">
       {searchActive && (
@@ -334,25 +399,19 @@ export function HostsSummary({
               ) : summary.needs_attention === 0 ? (
                 'every build is clean and current'
               ) : (
-                <>
-                  <Link
-                    to={linkFor({ health: 'stale', activity: 'all' })}
-                    data-testid="attention-stale"
-                    className="underline decoration-dim/50 underline-offset-2 hover:text-text"
-                    title="A clean build older than the staleness window. A sweep confirms it again."
-                  >
-                    {parts.outOfDate.toLocaleString()} out of date
-                  </Link>
-                  {', '}
-                  <Link
-                    to={linkFor({ health: 'broken', activity: 'all' })}
-                    data-testid="attention-broken"
-                    className="underline decoration-dim/50 underline-offset-2 hover:text-text"
-                    title="No clean build: the sweep never built the machine, or the last build failed."
-                  >
-                    {parts.neverBuilt.toLocaleString()} never built
-                  </Link>
-                </>
+                parts.map((p, i) => (
+                  <span key={p.key}>
+                    {i > 0 && ', '}
+                    <Link
+                      to={linkFor({ health: p.health, activity: 'all' })}
+                      data-testid={`attention-${p.key}`}
+                      className="underline decoration-dim/50 underline-offset-2 hover:text-text"
+                      title={p.title}
+                    >
+                      {p.text}
+                    </Link>
+                  </span>
+                ))
               )
             }
             icon={<AlertTriangle size={16} />}

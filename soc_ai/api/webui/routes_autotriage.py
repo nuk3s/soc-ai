@@ -119,8 +119,8 @@ def _planning_budget_spent(status: Any, budget: int) -> HTTPException:
         detail={
             "reason": "grid_unavailable",
             "hint": (
-                f"Security Onion did not finish answering within {budget}s, so no sweep "
-                "was started. Retry, or narrow the range or severities."
+                f"Security Onion did not answer in {budget} s. soc-ai started no sweep. "
+                "Retry, or narrow the range or the severities."
             ),
         },
     )
@@ -132,10 +132,13 @@ def _finished_empty(
     """Land a run that planned successfully and found nothing to do."""
     status.reset(active=False, total=0, skipped=skipped, severities=severities)
     status.finished_at = datetime.now(UTC).isoformat()
+    # The console prefixes a sweep note with its window: "Last 24 hours: no
+    # alert to investigate". It read "nothing to hunt" for a run of
+    # investigations (dogfood 2026-10-19, R1 STE 12).
     if selected:
-        note = f"all {skipped} selected already triaged" if skipped else "nothing to triage"
+        note = f"all {skipped} selected already triaged" if skipped else "no alert to investigate"
     else:
-        note = "nothing to hunt"
+        note = "no alert to investigate"
     return _at_status(status, note=note)
 
 

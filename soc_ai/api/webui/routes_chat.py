@@ -179,7 +179,7 @@ def _require_general_chat(request: Request) -> None:
             status_code=403,
             detail={
                 "reason": "general_chat_disabled",
-                "hint": "enable general_chat_enabled to use the dashboard assistant",
+                "hint": "Turn on general_chat_enabled to use the general chat.",
             },
         )
 

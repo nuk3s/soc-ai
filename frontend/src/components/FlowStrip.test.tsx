@@ -207,7 +207,7 @@ describe('leadFlow', () => {
       }),
     );
     expect(step(steps, 'hunt').state).toBe('done');
-    expect(step(steps, 'investigations')).toMatchObject({ state: 'next', note: '2 of 3 done' });
+    expect(step(steps, 'investigations')).toMatchObject({ state: 'next', note: '2 of 3 findings' });
     // The hunt investigates its findings, so the step names no control.
     expect(step(steps, 'investigations').control).toBeUndefined();
     expect(step(steps, 'verdicts').state).toBe('not_yet');
@@ -233,7 +233,7 @@ describe('leadFlow', () => {
       'verdicts:done',
       'actions:next',
     ]);
-    expect(step(steps, 'investigations').note).toBe('2 of 2 done');
+    expect(step(steps, 'investigations').note).toBe('2 of 2 findings');
     expect(step(steps, 'verdicts').note).toBe('1 of 2 threats');
     expect(step(steps, 'actions')).toMatchObject({
       note: '1 wait for you',
@@ -254,7 +254,7 @@ describe('leadFlow', () => {
     );
     expect(step(steps, 'investigations')).toMatchObject({
       state: 'done',
-      note: '1 of 1 done',
+      note: '1 of 1 finding',
       to: '/investigation/I-9',
     });
     expect(step(steps, 'verdicts').note).toBe('no threat confirmed');
@@ -303,7 +303,7 @@ describe('leadFlow', () => {
       hunt({ findings: [threat(inv), threat(inv)], findingsTotal: 2, findingsInvestigated: 2 }),
     );
     expect(step(steps, 'lead').note).toBe('closed');
-    expect(step(steps, 'investigations')).toMatchObject({ state: 'done', note: '2 of 2 done' });
+    expect(step(steps, 'investigations')).toMatchObject({ state: 'done', note: '2 of 2 findings' });
     expect(step(steps, 'verdicts').state).toBe('done');
     expect(step(steps, 'actions').state).toBe('next');
     // Control: the same lead with a hunt that investigated nothing keeps the
@@ -359,7 +359,57 @@ describe('huntFlow', () => {
       12,
     );
     expect(step(steps, 'hunt').note).toBe('investigating');
-    expect(step(steps, 'investigations').note).toBe('1 of 3 done');
+    expect(step(steps, 'investigations').note).toBe('1 of 3 findings');
+  });
+
+  // R3-D8: the server sends findingsTotal 0 on every hunt it did not plan.
+  it('a running hunt with a zero plan count does not read "no findings"', () => {
+    const steps = huntFlow(hunt({ status: 'running', findings: [], findingsTotal: 0, findingsInvestigated: 0 }), 12);
+    const s = step(steps, 'investigations');
+    expect(s.state).toBe('next');
+    expect(s.note).toBeUndefined();
+    expect(s.title).toBe('soc-ai investigates the findings when the hunt ends.');
+  });
+
+  it('a hunt with threat findings and no plan offers the manual control, not "no threat finding"', () => {
+    const steps = huntFlow(
+      hunt({ findings: [threat(), threat({ category: 'observation' })], findingsTotal: 0, findingsInvestigated: 0 }),
+      9,
+    );
+    expect(step(steps, 'investigations')).toMatchObject({
+      state: 'next',
+      note: '0 of 1 finding',
+      control: 'Open an investigation',
+    });
+  });
+
+  it('a hunt whose every query failed reads could not run and names Re-hunt', () => {
+    const failed = threat({ category: 'visibility_gap', title: 'DCSync by a non-machine: could not run' });
+    const steps = huntFlow(
+      hunt({ kind: 'triggered', starter: 'catalog', outcome: 'could_not_run', findings: [failed], findingsTotal: 0 }),
+    );
+    expect(step(steps, 'hunt').note).toBe('could not run');
+    expect(step(steps, 'investigations')).toMatchObject({ state: 'next', control: 'Re-hunt' });
+    expect(step(steps, 'investigations').note).toBeUndefined();
+    // An older server sends no outcome. The findings answer.
+    const legacy = huntFlow(hunt({ kind: 'triggered', starter: 'catalog', findings: [failed] }));
+    expect(step(legacy, 'investigations')).toMatchObject({ state: 'next', control: 'Re-hunt' });
+  });
+
+  it('two findings that share one investigation count its actions once', () => {
+    const shared = {
+      investigationId: 'I-9',
+      investigationStatus: 'complete' as const,
+      verdict: 'true_positive',
+      pendingActions: 1,
+    };
+    const steps = huntFlow(
+      hunt({ findings: [threat(shared), threat(shared)], findingsTotal: 2, findingsInvestigated: 2 }),
+      5,
+    );
+    expect(step(steps, 'actions').note).toBe('1 wait for you');
+    // One investigation: the step links it.
+    expect(step(steps, 'investigations').to).toBe('/investigation/I-9');
   });
 
   // Negative control: a stopped hunt is never a hunt with findings.
@@ -431,6 +481,38 @@ describe('investigationFlow', () => {
     }
   });
 
+  // R2-D4 (dogfood 2026-10-19): the failure panel said a re-run cannot change
+  // the recorded cause, and the strip still named Re-run as the next control.
+  it('a permanent failure names no Re-run', () => {
+    const steps = investigationFlow(
+      inv({
+        status: 'error',
+        verdict: 'untriaged',
+        failure: { cause: 'alert_not_found', hint: null, permanent: true },
+      }),
+    );
+    expect(step(steps, 'verdict').control).toBeUndefined();
+    expect(step(steps, 'verdict').title).toBe('A re-run cannot change the recorded cause.');
+  });
+
+  // R2-D22: after an override to true positive the strip read the old
+  // auto-ack as the action, while the escalate waited.
+  it('an escalate that waits keeps the action open on an acknowledged alert', () => {
+    const steps = investigationFlow(
+      inv({
+        verdict: 'true_positive',
+        alertAcked: true,
+        actions: [action({ tag: 'escalate', title: 'Escalate to case' })],
+      }),
+    );
+    expect(step(steps, 'action')).toMatchObject({ state: 'next', control: 'Escalate to case' });
+  });
+
+  it('control: a waiting ack on an acknowledged alert reads as done', () => {
+    const steps = investigationFlow(inv({ alertAcked: true, actions: [action()] }));
+    expect(step(steps, 'action').state).toBe('done');
+  });
+
   it('a stuck run the page gave up on reads as failed', () => {
     const steps = investigationFlow(inv({ status: 'investigating', verdict: 'untriaged' }), {
       failed: true,
@@ -452,6 +534,20 @@ describe('investigationFlow', () => {
       note: 'needs more info',
       control: 'Request more info',
     });
+  });
+
+  it('a replaced record that needs more info names no control (V1-A7)', () => {
+    // A locked replay offered "Request more info" next to "Its actions are off".
+    const steps = investigationFlow(
+      inv({ verdict: 'needs_more_info', supersededBy: 'INV-NEW' }),
+      { noWrites: true },
+    );
+    const verdict = step(steps, 'verdict');
+    expect(verdict.control).toBeUndefined();
+    expect(verdict.note).toBe('needs more info');
+    expect(verdict.title).toBe('A newer run replaced this one. Its actions are off.');
+    mount(steps);
+    expect(screen.queryByTestId('flow-control-verdict')).toBeNull();
   });
 
   it('an investigation of a hunt finding starts at its lead and its hunt', () => {
@@ -499,5 +595,84 @@ describe('findingInvestigation', () => {
       findingInvestigation(threat({ investigation: { id: 'I-2', status: 'error', verdict: null } })),
     ).toMatchObject({ id: 'I-2', status: 'error' });
     expect(findingInvestigation(threat())).toBeNull();
+  });
+});
+
+// ── the round 2 verify of 2026-10-19 ────────────────────────────────────────
+
+describe('the hunt tail after the round 2 verify', () => {
+  // V1-H1: the hunt of lead 9 offered "Open an investigation" while the card
+  // of F1 turned that control off. F1 cites no event.
+  it('offers no Open an investigation when no open threat finding cites an event', () => {
+    const steps = huntFlow(
+      hunt({
+        findings: [threat({ citations: [] }), threat({ category: 'observation', citations: ['doc-2'] })],
+        findingsTotal: 0,
+        findingsInvestigated: 0,
+      }),
+      9,
+    );
+    const s = step(steps, 'investigations');
+    expect(s.control).toBeUndefined();
+    expect(s).toMatchObject({ state: 'not_yet', note: '0 of 1 finding' });
+    expect(s.title).toBe(
+      'No threat finding without an investigation cites an event. An investigation needs at least one event.',
+    );
+    expect(steps.some((x) => x.control === 'Open an investigation')).toBe(false);
+  });
+
+  it('keeps the control when one open threat finding cites an event', () => {
+    const steps = huntFlow(
+      hunt({
+        findings: [
+          threat({ citations: [] }),
+          threat({ citations: ['doc-3'] }),
+          // A threat finding with its own investigation needs no control.
+          threat({ citations: [], investigationId: 'I-1', investigationStatus: 'complete', verdict: 'false_positive' }),
+        ],
+        findingsTotal: 0,
+        findingsInvestigated: 0,
+      }),
+      9,
+    );
+    expect(step(steps, 'investigations')).toMatchObject({
+      state: 'next',
+      note: '1 of 3 findings',
+      control: 'Open an investigation',
+    });
+  });
+
+  // R3-D4 residual: the hunt of lead 5 read "Investigations 2 of 2 done" over
+  // one investigation that F1 and F2 share.
+  it('counts findings and names an investigation that two findings share', () => {
+    const shared = {
+      investigationId: 'I-5',
+      investigationStatus: 'complete' as const,
+      verdict: 'true_positive',
+      pendingActions: 1,
+    };
+    const steps = huntFlow(
+      hunt({
+        findings: [threat(shared), threat(shared), threat({ category: 'observation' })],
+        findingsTotal: 2,
+        findingsInvestigated: 2,
+      }),
+      5,
+    );
+    expect(step(steps, 'investigations')).toMatchObject({
+      state: 'done',
+      note: '2 of 2 findings',
+      title: '2 findings share 1 investigation.',
+    });
+    // Control: two findings with their own investigations share nothing.
+    const own = huntFlow(
+      hunt({
+        findings: [threat({ ...shared, investigationId: 'I-6' }), threat({ ...shared, investigationId: 'I-7' })],
+        findingsTotal: 2,
+        findingsInvestigated: 2,
+      }),
+      5,
+    );
+    expect(step(own, 'investigations').title).toBeUndefined();
   });
 });

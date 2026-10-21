@@ -300,6 +300,7 @@ export function Notifications() {
           line up on the same left edge and the same top edge. */}
       <ListToolbar
         presets={presets}
+        presetsLabel="Types"
         onPreset={(id) => setKind(id as NotificationKind | 'all')}
       >
         <MultiSelect

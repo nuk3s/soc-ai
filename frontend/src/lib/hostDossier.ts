@@ -13,6 +13,7 @@
 // what lets the identity sentence's composition RULES be tested as rules.
 // ---------------------------------------------------------------------------
 
+import { ago } from './timeRange';
 import type {
   DossierFieldBrief,
   DossierFieldName,
@@ -111,8 +112,8 @@ export const isJsonField = (name: DossierFieldName): boolean => JSON_FIELDS.inde
  *  ladder can weigh. The rung names themselves stay available inside the
  *  evidence drawer for whoever asks "says who, exactly?". */
 const SOURCE_PHRASES: Record<string, string> = {
-  hostlog: 'reported by the agent on the box',
-  osquery: 'reported by the agent on the box',
+  hostlog: 'reported by the agent on the machine',
+  osquery: 'reported by the agent on the machine',
   telemetry: 'seen in DNS/DHCP traffic',
   banner: 'read from a service banner',
   behaviour: 'inferred from its traffic',
@@ -146,13 +147,13 @@ export function unresolvedPhrase(f: {
 }): string {
   if (f.reason === 'stale') {
     return f.last_run_at
-      ? `stale. The sweep last checked it ${relativeAge(f.last_run_at)}, too old to trust`
-      : 'stale. Last seen too long ago, too old to trust';
+      ? `stale. The sweep last checked it ${relativeAge(f.last_run_at)}. The value is too old to use`
+      : 'stale. The value is too old to use';
   }
   if (f.reason === 'low_confidence') {
     return f.inferred_value && f.inferred_value.trim().toLowerCase() !== 'unknown'
-      ? `low confidence: "${f.inferred_value}". The evidence is too thin to say`
-      : 'a faint signal, too thin to say';
+      ? `low confidence: "${f.inferred_value}". The evidence is too weak to confirm it`
+      : 'a weak signal. The evidence does not confirm a value';
   }
   if (f.retracted_at) return 'the evidence behind it has gone';
   if (!f.last_run_at) return 'not checked yet';
@@ -412,24 +413,13 @@ export function activityProfileView(payload: unknown, scalar?: string | null): A
 
 // ---- freshness --------------------------------------------------------------
 
-/** Relative age with a range wide enough for a dossier: `ago()` in
- *  lib/timeRange tops out at days, which renders "first seen 395d ago" for a
- *  host the operator thinks of as "a year old". Absolute stamps belong in
- *  tooltips and the evidence drawer, not headers. */
+/** Relative age on the host surfaces. It is `ago()` from lib/timeRange: the
+ *  hero, the facts and the entity page had a second rule, with hours up to
+ *  47 and months from 60 days, and one instant read "30h ago" and "1d ago"
+ *  (dogfood round 2, R4-D15). Absolute stamps belong in tooltips and the
+ *  evidence drawer, not headers. */
 export function relativeAge(iso: string | null | undefined, now = Date.now()): string {
-  if (!iso) return 'never';
-  const ms = now - new Date(iso).getTime();
-  if (!Number.isFinite(ms)) return '—';
-  if (ms < 60_000) return 'now';
-  const minutes = ms / 60_000;
-  if (minutes < 60) return `${Math.round(minutes)}m ago`;
-  const hours = minutes / 60;
-  if (hours < 48) return `${Math.round(hours)}h ago`;
-  const days = hours / 24;
-  if (days < 60) return `${Math.round(days)}d ago`;
-  const months = days / 30.44;
-  if (months < 24) return `${Math.round(months)}mo ago`;
-  return `${Math.round(days / 365.25)}y ago`;
+  return ago(iso, now);
 }
 
 // ---- plain words for the analyst --------------------------------------------
@@ -665,7 +655,7 @@ export function identitySentence(
     parts.push({
       text: opts.othersKnown
         ? ' has no known role or system yet.'
-        : ' has appeared on the network. Nothing else is known about it yet.',
+        : ' is on the network. soc-ai knows no other fact about this host.',
     });
     return parts;
   }
@@ -680,7 +670,7 @@ export function identitySentence(
     parts.push(...clause);
   });
   parts.push({ text: '.' });
-  if (guessed) parts.push({ text: ' Part of this rests on old or weak evidence.' });
+  if (guessed) parts.push({ text: ' Some of these facts come from old or weak evidence.' });
   return parts;
 }
 
@@ -831,8 +821,8 @@ export function machineRoleView(role: MachineRole | null | undefined): MachineRo
       guess: guess ?? null,
       qualifier: 'low confidence',
       title: guess
-        ? `The sweep guessed ${guess}. The evidence is too thin to assert it. Declare the role to settle it.`
-        : 'The sweep has a faint signal. The evidence is too thin to name a role.',
+        ? `The sweep guessed ${guess}. The evidence is too weak to assert it. Declare the role to settle it.`
+        : 'The sweep has a weak signal. The evidence is too weak to name a role.',
     };
   }
   if (state === 'stale') {
@@ -857,12 +847,29 @@ export function machineRoleView(role: MachineRole | null | undefined): MachineRo
   };
 }
 
+/** A sweep older than this names its age: its count describes the days
+ *  before it ran, and "last 14 days" read as the 14 days before now. */
+const SWEEP_FRESH_MS = 2 * 86_400_000;
+
 /** The days a sweep count covers, in words: "last 14 days". A sweep counts
  *  the events of the `dossier_lookback_days` window, and the 24h and 7d
  *  buttons of the host page do not change the count. An older server sends
- *  no number, and the words then name the sweep window. */
-export function sweepWindowWords(days: number | null | undefined): string {
-  return typeof days === 'number' && days > 0
-    ? `last ${days} ${days === 1 ? 'day' : 'days'}`
-    : 'sweep window';
+ *  no number, and the words then name the sweep window.
+ *
+ *  `builtAt` is the time of the sweep. A sweep older than 2 days names its
+ *  age: "14 days before the sweep 17d ago". The page labelled a count
+ *  from a 17-day-old sweep "events in the last 14 days" (dogfood 2026-10-19,
+ *  R4-D10). */
+export function sweepWindowWords(
+  days: number | null | undefined,
+  builtAt?: string | null,
+  now = Date.now(),
+): string {
+  const span = typeof days === 'number' && days > 0 ? `${days} ${days === 1 ? 'day' : 'days'}` : null;
+  const built = builtAt ? new Date(builtAt).getTime() : Number.NaN;
+  if (Number.isFinite(built) && now - built > SWEEP_FRESH_MS) {
+    const when = relativeAge(builtAt, now);
+    return span ? `${span} before the sweep ${when}` : `window of the sweep ${when}`;
+  }
+  return span ? `last ${span}` : 'sweep window';
 }

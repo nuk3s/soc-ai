@@ -224,7 +224,7 @@ function AnalystPath() {
         )}
       </div>
 
-      {invId && preview.loading && <LoadingState label="Rebuilding analyst prompt" />}
+      {invId && preview.loading && <LoadingState label="Building the prompt again" />}
       {invId && preview.error && <ErrorState error={preview.error} />}
 
       {/* Non-fatal outcomes (events_missing / context_unparseable): the run
@@ -242,9 +242,9 @@ function AnalystPath() {
             <div className="mb-3 flex items-start gap-2 rounded-control border border-[rgba(245,166,35,.3)] bg-[rgba(245,166,35,.06)] px-3 py-2 text-[12.5px] leading-[1.55] text-[#f5a623]">
               <span className="mt-0.5 flex-none"><ShieldAlert size={15} /></span>
               <span>
-                Analyst-path redaction is off. This preview shows the redaction that soc-ai
-                applies if you turn the setting on. An analyst call today sends the original
-                text without redaction.
+                Redaction for the analyst model is off. This preview shows the redaction that
+                soc-ai applies when you turn the setting on. Today a call to the analyst model
+                sends the original text without redaction.
               </span>
             </div>
           )}

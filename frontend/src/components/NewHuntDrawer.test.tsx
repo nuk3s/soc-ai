@@ -238,3 +238,15 @@ describe('NewHuntDrawer', () => {
     expect((box() as HTMLTextAreaElement).value).toBe('');
   });
 });
+
+// Dogfood 2026-10-19 H1-D19. The drawer moved the focus to a header button
+// first, and the analyst had to Tab to the objective box.
+describe('NewHuntDrawer first focus', () => {
+  it('puts the focus in the objective box', async () => {
+    mount();
+    await screen.findByTestId('new-hunt-run-time');
+    // Past the modal surface's own focus move, which runs after one task.
+    await new Promise((r) => setTimeout(r, 20));
+    expect(document.activeElement).toBe(box());
+  });
+});

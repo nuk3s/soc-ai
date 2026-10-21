@@ -17,7 +17,7 @@ from soc_ai.webui.timeline_labels import label_event, title_for
 
 def test_session_and_context() -> None:
     assert title_for("session_start", {}) == "Investigation started"
-    assert "alert context" in title_for("enriched_alert_context", {})
+    assert "loaded the alert" in title_for("enriched_alert_context", {})
 
 
 def test_tool_call_and_result_humanized() -> None:
@@ -83,8 +83,8 @@ def test_a_hunt_subject_reads_as_a_hunt_subject() -> None:
 
 def test_an_alert_run_keeps_the_alert_words() -> None:
     """NEGATIVE CONTROL. An alert run reads exactly as it did."""
-    assert title_for("enriched_alert_context", {}) == "Loaded alert context + enrichments"
-    assert title_for("alert_context", {}) == "Loaded alert context + enrichments"
+    assert title_for("enriched_alert_context", {}) == "soc-ai loaded the alert and its enrichments"
+    assert title_for("alert_context", {}) == "soc-ai loaded the alert and its enrichments"
     assert (
         title_for("decision_template_match", {"matched": False, "skipped": None})
         == "No decision-template match"

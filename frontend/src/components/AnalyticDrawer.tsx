@@ -3,16 +3,22 @@ import { Link, useNavigate } from 'react-router-dom';
 
 import {
   getAnalytic,
+  getHuntCatalog,
   setAnalyticStatus,
   startHuntConsole,
   type AnalyticBreach,
   type AnalyticDetail,
   type AnalyticRow,
+  type HuntCatalog,
+  type HuntCatalogSpec,
 } from '../lib/api';
 import {
+  BLIND_RUN_TITLE,
+  FAILED_TITLE,
   NO_HUNT_LINE,
   NOT_RUNNING_TITLE,
   type RunState,
+  UNMEASURED_TITLE,
   WAITING_TITLE,
   appliesWord,
   huntCanRun,
@@ -20,6 +26,7 @@ import {
   methodWord,
   runsInProfileSweep,
   sourceWord,
+  specRunState,
   statusLabel,
   statusWord,
 } from '../lib/analyticRuns';
@@ -49,6 +56,7 @@ import {
 import { useAsync } from '../lib/useAsync';
 import { Definition } from './Definition';
 import { Drawer } from './Drawer';
+import { GapHoldNote } from './GridGapReview';
 import { LoadingInline } from './States';
 
 // ---------------------------------------------------------------------------
@@ -69,8 +77,11 @@ import { LoadingInline } from './States';
  *  "telemetry", for the same two numbers. */
 export const COVERAGE_TITLE =
   'The newest profile run, in entity evaluations. measured means soc-ai scored the entity ' +
-  'against a real baseline. blind means no baseline, no confident role, or no telemetry on ' +
+  'against its baseline. blind means no baseline, no confident role, or no telemetry on ' +
   'the grid that can answer.';
+
+/** The dot of an analytic whose newest run failed. */
+const FAILED_COLOR = '#f04438';
 
 export const STATUS_COLOR: Record<string, string> = {
   live: '#3fb950',
@@ -88,6 +99,24 @@ export const STATUS_TITLE: Record<string, string> = {
   retired: CHIP_RETIRED,
 };
 
+/** The failed runs of the last 24 h of one analytic. */
+export interface FailedRuns {
+  failed: number;
+  runs: number;
+}
+
+/** "22 of 25 runs failed in 24 h." */
+function failedRunsSentence(f: FailedRuns): string {
+  return `${f.failed} of ${plural(f.runs, 'run')} failed in 24 h.`;
+}
+
+/** The failed runs of the day from the catalog, or null when none failed. */
+export function failedRunsOf(sweep: SweepFacts | null): FailedRuns | null {
+  const failed = sweep?.spec.failed_24h ?? 0;
+  if (!sweep || failed <= 0) return null;
+  return { failed, runs: Math.max(failed, sweep.spec.sweeps_24h) };
+}
+
 /** The status dot. `running` false means the loop that runs the analytic is
  *  off or has not run: the dot goes grey and the word says so. A green "live"
  *  over an analytic no sweep has run is a false all-clear. */
@@ -95,31 +124,60 @@ export function StatusDot({
   status,
   running,
   every,
+  failedRuns = null,
 }: {
   status: string;
   running?: RunState;
   /** How often the loop runs, as words: "every hour". */
   every?: string;
+  /** The failed runs of the day. A newest run that completed after 22
+   *  failed runs read as a green "live" (dogfood 2026-10-19, V1-H6). */
+  failedRuns?: FailedRuns | null;
 }) {
   const live = status === 'live' || status === 'shadow';
   const idle = (running === false || running === 'waiting') && live;
+  // A failed, blind or unmeasured newest run. The dot keeps no green: a
+  // failed run reads red, and a run that saw nothing reads as an amber ring.
+  const failed = live && running === 'failed';
+  const unseen = live && (running === 'blind' || running === 'unmeasured');
+  // The newest run completed, and earlier runs of the day failed.
+  const dayFailed = live && running === true && failedRuns !== null && failedRuns.failed > 0;
+  const title = failed
+    ? FAILED_TITLE
+    : dayFailed && failedRuns
+      ? `The newest run of this analytic completed. ${failedRunsSentence(failedRuns)} ` +
+        'A failed run reads no document. A zero here does not show a clean grid.'
+    : running === 'blind' && live
+      ? BLIND_RUN_TITLE
+      : running === 'unmeasured' && live
+        ? UNMEASURED_TITLE
+        : !idle
+          ? STATUS_TITLE[status]
+          : running === 'waiting'
+            ? WAITING_TITLE
+            : NOT_RUNNING_TITLE;
   return (
     <span
       className="inline-flex items-center gap-1.5 whitespace-nowrap"
-      title={
-        !idle ? STATUS_TITLE[status] : running === 'waiting' ? WAITING_TITLE : NOT_RUNNING_TITLE
-      }
+      title={title}
       data-testid="status-dot"
+      data-run={typeof running === 'string' ? running : dayFailed ? 'failed_runs' : undefined}
     >
       <span
         className="h-[7px] w-[7px] flex-none rounded-full"
         style={
-          idle
-            ? { border: `1.5px solid ${STATUS_COLOR[status]}` }
-            : { background: STATUS_COLOR[status] ?? '#8b949e' }
+          failed
+            ? { background: FAILED_COLOR }
+            : unseen || dayFailed
+              ? { border: `1.5px solid ${STATUS_COLOR.shadow}` }
+              : idle
+                ? { border: `1.5px solid ${STATUS_COLOR[status]}` }
+                : { background: STATUS_COLOR[status] ?? '#8b949e' }
         }
       />
-      {statusLabel(status, running, every)}
+      {dayFailed && failedRuns
+        ? `${statusWord(status)}, ${failedRuns.failed} of ${plural(failedRuns.runs, 'run')} failed`
+        : statusLabel(status, running, every)}
     </span>
   );
 }
@@ -443,16 +501,61 @@ function coverageLine(coverage: Record<string, number>): string {
   return `${coverage.measured ?? 0} measured · ${coverage.blind ?? 0} blind`;
 }
 
+/** The newest run of the drawer's analytic, from GET /hunt-catalog: the
+ *  catalog row of the analytic, and when the loop last tried to run it. */
+export interface SweepFacts {
+  spec: HuntCatalogSpec;
+  /** The newest attempt of the loop. A failed profile sweep wrote no trail
+   *  row, so the loop's own record dates it. */
+  at: string | null;
+  catalog: HuntCatalog;
+}
+
+/** The newest run of one analytic, from the catalog. Null when the catalog
+ *  does not list it. */
+export function sweepFactsOf(catalog: HuntCatalog | null | undefined, id: string): SweepFacts | null {
+  const spec = catalog?.specs.find((s) => s.id === id);
+  if (!catalog || !spec) return null;
+  const at = runsInProfileSweep(spec.evaluator)
+    ? (catalog.prior_sweep_health?.last_run_at ?? spec.last_swept_at)
+    : spec.last_swept_at;
+  return { spec, at, catalog };
+}
+
 /** What the drawer says when the analytic observed nothing. Whether it ran
  *  is a fact the backend knows, so the drawer never says "it has not run, or
- *  it found nothing". */
-export function nothingObserved(detail: AnalyticDetail): string {
+ *  it found nothing".
+ *
+ *  A run that failed, ran blind or measured no host is no quiet run. The
+ *  drawer said "ran 19m ago and observed nothing" over nine analytics whose
+ *  every sweep failed (dogfood 2026-10-19 R3-D1). */
+export function nothingObserved(detail: AnalyticDetail, sweep: SweepFacts | null = null): string {
   const off = detail.runner_enabled === false ? ' Its sweep is off.' : '';
+  const state = sweep ? specRunState(sweep.catalog, sweep.spec) : true;
+  const tail = 'The analytic observed nothing in the last 30 days.';
+  if (sweep && state === 'failed') {
+    const why = sweep.spec.last_error_text ?? 'The application log holds the reason.';
+    return `The last run of this analytic failed ${ago(sweep.at)}. ${why} ${tail}`;
+  }
+  if (sweep && state === 'blind') {
+    return (
+      `The last run ${ago(sweep.at)} matched nothing that this analytic reads. ` +
+      `The telemetry is absent. ${tail}`
+    );
+  }
+  if (sweep && state === 'unmeasured') {
+    return `The last profile sweep ${ago(sweep.at)} measured no host. ${tail}`;
+  }
   if (detail.last_run_at === null) return `This analytic has not run.${off}`;
   if (detail.last_run_at === undefined) {
     return 'This analytic has observed nothing. soc-ai cannot tell if it ran.';
   }
-  return `This analytic ran ${ago(detail.last_run_at)} and observed nothing in the last 30 days.${off}`;
+  // The newest run completed, and earlier runs of the day failed. A failed
+  // run reads no document, so the quiet sentence alone was a false
+  // all-clear (dogfood 2026-10-19, V1-H6).
+  const day = failedRunsOf(sweep);
+  const failedTail = day ? ` ${failedRunsSentence(day)} A failed run reads no document.` : '';
+  return `This analytic ran ${ago(detail.last_run_at)} and observed nothing in the last 30 days.${off}${failedTail}`;
 }
 
 /** The cost cell. A profile analytic reads stored baselines: the prior sweep
@@ -484,7 +587,7 @@ function costCell(detail: AnalyticDetail): { value: string; sub: string; title: 
   return {
     value: ledger.docs_scanned.toLocaleString(),
     sub: `documents · ${runtimeLine(ledger.runtime_ms)} · ${plural(ledger.sweeps, 'sweep')}`,
-    title: 'Documents scanned and time spent over the window. The sweep trail is the source.',
+    title: 'Documents scanned and time spent over the window. The sweep record is the source.',
   };
 }
 
@@ -506,7 +609,22 @@ function numberedVersions(
     .reverse();
 }
 
-function Body({ detail, onChanged }: { detail: AnalyticDetail; onChanged?: () => void }) {
+/** The actor of a version row as the console says it. soc-ai writes its own
+ *  rows as "system:self-heal" and "system:catalog", and the drawer printed
+ *  those words (dogfood 2026-10-19). */
+export function actorWord(who: string): string {
+  return who.startsWith('system:') || who === 'hunt-catalog' ? 'soc-ai' : who;
+}
+
+function Body({
+  detail,
+  onChanged,
+  sweep,
+}: {
+  detail: AnalyticDetail;
+  onChanged?: () => void;
+  sweep: SweepFacts | null;
+}) {
   const [specOpen, setSpecOpen] = useState(false);
   const ledger = detail.ledger;
   const cost = costCell(detail);
@@ -549,6 +667,9 @@ function Body({ detail, onChanged }: { detail: AnalyticDetail; onChanged?: () =>
             {/* The box said "approve it to live or retire it" over the two
                 controls "Approve" and "Reject". It names the controls now. */}
             <div className="mt-0.5 text-dim">{HELD_NEXT_STEP}</div>
+            {/* The hold came from a grid gap on the range, and nothing here
+                said so (dogfood 2026-10-19, R1-I5, R3-I1). */}
+            {detail.gap_hold && <GapHoldNote hold={detail.gap_hold} onChanged={onChanged} />}
           </div>
         ) : (
           detail.reason && (
@@ -629,7 +750,7 @@ function Body({ detail, onChanged }: { detail: AnalyticDetail; onChanged?: () =>
         <div className="mb-1.5 text-[13px] font-semibold">Recent observations · by entity</div>
         {detail.recent.length === 0 ? (
           <div data-testid="analytic-nothing-observed" className="text-[12px] text-dim">
-            {nothingObserved(detail)}
+            {nothingObserved(detail, sweep)}
           </div>
         ) : (
           <ul className="divide-y divide-border-faint">
@@ -708,12 +829,17 @@ function Body({ detail, onChanged }: { detail: AnalyticDetail; onChanged?: () =>
                     </span>
                   )
                 )}
-                <span className="text-[11.5px] text-dim">{v.who}</span>
+                {/* The chip already says soc-ai on a system row. */}
+                {!(v.system && v.who !== CATALOG_ACTOR) && (
+                  <span data-testid="version-actor" className="text-[11.5px] text-dim">
+                    {actorWord(v.who)}
+                  </span>
+                )}
                 {v.why && <span className="text-[11.5px] text-dim">"{v.why}"</span>}
                 {v.has_receipts && (
                   <span
                     className="rounded-chip border border-border-strong px-1.5 py-px text-[10.5px] text-dim"
-                    title="The evidence this decision was taken on is stored on this row."
+                    title="This row stores the evidence for this decision."
                   >
                     evidence
                   </span>
@@ -735,11 +861,15 @@ function Body({ detail, onChanged }: { detail: AnalyticDetail; onChanged?: () =>
 }
 
 /** The run state of the drawer's analytic, from its own trail. The loop is on
- *  and has not run this analytic yet: it waits for the next sweep. */
-export function drawerRunState(d: AnalyticDetail): RunState {
+ *  and has not run this analytic yet: it waits for the next sweep. A newest
+ *  run that failed, ran blind or measured no host says so, from the catalog. */
+export function drawerRunState(d: AnalyticDetail, sweep: SweepFacts | null = null): RunState {
   if (d.last_run_at === undefined) return undefined;
   if (d.runner_enabled === false) return false;
-  return d.last_run_at === null ? 'waiting' : true;
+  const state = sweep ? specRunState(sweep.catalog, sweep.spec) : true;
+  if (state === 'failed') return state;
+  if (d.last_run_at === null) return 'waiting';
+  return state === 'blind' || state === 'unmeasured' ? state : true;
 }
 
 export function AnalyticDrawer({
@@ -757,6 +887,13 @@ export function AnalyticDrawer({
     [analyticId, reload],
   );
   const data = detail.data;
+  // The newest run of this analytic. The catalog holds the error of a failed
+  // run, and the drawer's own record does not.
+  const catalog = useAsync(
+    () => (analyticId ? getHuntCatalog() : Promise.resolve(null)),
+    [analyticId, reload],
+  );
+  const sweep = analyticId ? sweepFactsOf(catalog.data, analyticId) : null;
   const changed = () => {
     setReload((n) => n + 1);
     onChanged?.();
@@ -781,8 +918,9 @@ export function AnalyticDrawer({
           {data && (
             <StatusDot
               status={data.status}
-              running={drawerRunState(data)}
+              running={drawerRunState(data, sweep)}
               every={intervalWords(data.sweep_interval_minutes)}
+              failedRuns={failedRunsOf(sweep)}
             />
           )}
         </div>
@@ -796,7 +934,7 @@ export function AnalyticDrawer({
           {detail.error ? 'Could not read the analytic.' : <LoadingInline>Reading the analytic</LoadingInline>}
         </div>
       ) : (
-        <Body detail={data} onChanged={changed} />
+        <Body detail={data} onChanged={changed} sweep={sweep} />
       )}
     </Drawer>
   );

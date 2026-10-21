@@ -125,12 +125,14 @@ def test_totals_count_the_whole_window_past_the_list_cap(client: TestClient) -> 
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["hunts"] == 140
-    assert body["findings"] == 90 + 80
+    # A catalog run whose one finding is a gap answered nothing. Its list cell
+    # states no count, so the header counts none of its findings (R3-D6).
+    assert body["findings"] == 80
     assert body["threat_findings"] == 40
     assert body["running"] == 10
     assert body["by_kind"]["triggered"] == {
         "hunts": 90,
-        "findings": 90,
+        "findings": 0,
         "threat_findings": 0,
         "running": 0,
     }
@@ -178,6 +180,62 @@ def test_totals_read_the_report_of_a_row_without_the_count_columns(client: TestC
     assert body["hunts"] == 2
     assert body["findings"] == sum(r["findingCount"] for r in listed) == 4
     assert body["threat_findings"] == sum(r["threatFindingCount"] for r in listed) == 3
+
+
+def _failed_query(title: str) -> dict[str, Any]:
+    return {**_gap(f"{title}: could not run"), "detail": "The grid did not answer in time."}
+
+
+def test_totals_count_no_failure_marker_and_every_hunt_in_progress(client: TestClient) -> None:
+    """R3-D6 and R3-D7. The header read "24 findings" over 24 rows that each
+    read "Could not run", and "0 in progress" while a hunt investigated its
+    findings."""
+    now = utcnow()
+    rows: list[dict[str, Any]] = [
+        {
+            "kind": "triggered",
+            "status": "complete",
+            "created_at": now - timedelta(minutes=n + 1),
+            "report": {"findings": [_failed_query(f"spec-{n}")], "narrative": ""},
+            "findings_count": 1,
+            "threat_findings_count": 0,
+        }
+        for n in range(24)
+    ]
+    rows.append(
+        {
+            "kind": "lead",
+            "status": "investigating",
+            "created_at": now - timedelta(minutes=30),
+            "report": {"findings": [_threat("T1"), _threat("T2")], "narrative": "x"},
+            "findings_count": 2,
+            "threat_findings_count": 2,
+        }
+    )
+    # Control: a clean hunt with an observation states its count.
+    rows.append(
+        {
+            "kind": "chat",
+            "status": "complete",
+            "created_at": now - timedelta(minutes=40),
+            "report": {
+                "findings": [{**_threat("Backup job"), "category": "observation"}],
+                "narrative": "The hunt found no threat.",
+            },
+            "findings_count": 1,
+            "threat_findings_count": 0,
+        }
+    )
+    _insert(client, rows)
+    body = client.get(
+        "/api/v1/hunts/totals", params={"since": _iso(now - timedelta(hours=1))}
+    ).json()
+    assert body["hunts"] == 26
+    assert body["by_kind"]["triggered"]["findings"] == 0
+    assert body["findings"] == 3
+    assert body["threat_findings"] == 2
+    assert body["running"] == 1
+    assert body["by_kind"]["lead"]["running"] == 1
 
 
 def test_totals_honour_until_and_an_empty_window(client: TestClient) -> None:

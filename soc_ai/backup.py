@@ -313,7 +313,7 @@ def read_manifest(archive: Path) -> Manifest:
     except (tarfile.TarError, OSError, json.JSONDecodeError) as exc:
         raise BackupError(f"cannot read backup archive {archive}: {exc}") from exc
     if not isinstance(raw, dict):
-        raise BackupError(f"malformed manifest.json in {archive} (not an object)")
+        raise BackupError(f"malformed manifest.json in {archive}: it is not a JSON object")
     return Manifest.from_dict(raw)
 
 
@@ -389,8 +389,8 @@ def _restore_caches(
             restored.append(label)
         except OSError as exc:
             warnings.append(
-                f"could not restore the {label!r} cache to {target_dir}: {exc} "
-                "(re-seed with `soc-ai blocklists refresh`)"
+                f"could not restore the {label!r} cache to {target_dir}: {exc}. "
+                "Seed it again with `soc-ai blocklists refresh`."
             )
     return restored
 
@@ -432,8 +432,8 @@ def restore_backup(
         live_msg = (
             f"the store at {db_path} has a write-ahead log touched {wal_age:.0f}s ago. "
             "The app looks RUNNING. A restore under a live app loses writes and can "
-            "corrupt the restored store. Stop the app first (docker compose stop "
-            "soc-ai / systemctl stop soc-ai)"
+            "corrupt the restored store. Stop the app first with `docker compose stop "
+            "soc-ai` or `systemctl stop soc-ai`"
         )
     if not assume_yes:
         reasons: list[str] = []

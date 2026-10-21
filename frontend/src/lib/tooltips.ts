@@ -22,24 +22,27 @@
 // The sentences match the chart the "How this flows" link opens, so the words
 // on the page and the words on the chart are the same words.
 
+import { CLOSE_RULE_CLAUSE } from './leadDecisions';
+
 export const DEFINE_HIT =
-  'A hit is one thing one analytic found on one entity. A live hit counts. A shadow hit ' +
-  'waits for you to read it and to approve or reject the analytic that wrote it.';
+  'A hit is one match of one analytic on one entity. A live hit adds weight to a lead. A ' +
+  'shadow hit adds no weight. It waits for you to read it and to approve or reject the ' +
+  'analytic that wrote it.';
 
 export const DEFINE_LEAD =
   'A lead is a set of observations on one entity that are worth one decision: hunt it or ' +
   'dismiss it.';
 
 export const DEFINE_HUNT =
-  'A hunt is one agent run with an objective. It returns findings. A hunt is not finished ' +
-  'until its findings are investigated. You, a schedule or a lead can start one.';
+  'A hunt is one run against one objective. The model or a catalog query runs it. soc-ai ' +
+  'investigates each threat finding when the hunt ends. You, a schedule or a lead can start one.';
 
 export const DEFINE_SCHEDULE =
   'A schedule starts a hunt on an interval and writes a hunt row on every run.';
 
 export const DEFINE_ANALYTIC =
-  'An analytic is one detection logic. It runs on every sweep. Live analytics raise what ' +
-  'they find. Shadow analytics record it for you to judge.';
+  'An analytic is one written detection. The sweep runs each analytic. A live analytic ' +
+  'records hits that can form a lead. A shadow analytic records hits for you to read.';
 
 // ── The fold of a section ───────────────────────────────────────────────────
 //
@@ -67,8 +70,16 @@ export const PILL_HUNTED =
 
 export const PILL_DISMISSED =
   'Dismissed: an analyst closed this lead with a reason. Reopen puts it back in the queue.';
+/** The rule soc-ai closes a lead by when its hunt investigated its findings,
+ *  as a sentence. The clause lives in lib/leadDecisions.ts. */
+export const CLOSE_RULE = `${CLOSE_RULE_CLAUSE.charAt(0).toUpperCase()}${CLOSE_RULE_CLAUSE.slice(1)}.`;
+
 export const PILL_CLOSED_BY_HUNT =
   'Closed: soc-ai closed this lead. Its hunt found no threat. Reopen puts it back in the queue.';
+
+/** The pill of a lead soc-ai closed because every finding of its hunt has a
+ *  verdict. The pill read "Promoted", the word of an analyst's act. */
+export const PILL_CLOSED_ON_VERDICTS = `Closed: soc-ai closed this lead. ${CLOSE_RULE} Open the hunt to read each verdict.`;
 
 export const PILL_PROMOTED =
   'Promoted: an analyst opened an investigation from this lead. The lead is closed.';
@@ -97,8 +108,8 @@ export const TAB_NEEDS_DECISION =
 export const TAB_IN_PROGRESS = 'Leads with a hunt running. Nothing waits on you here.';
 
 export const TAB_CLOSED =
-  'Leads an analyst dismissed or opened an investigation on, and leads a clean hunt closed. ' +
-  'Reopen puts one back.';
+  'Leads an analyst dismissed or opened an investigation on, and leads a hunt closed when it found no threat. ' +
+  `soc-ai also closes a lead when ${CLOSE_RULE_CLAUSE}. Reopen puts one back.`;
 
 export const TAB_ALL = 'Every lead, in every state.';
 
@@ -122,6 +133,10 @@ export const CHIP_SHADOW =
 export const CHIP_RECORDED_IN_SHADOW =
   'This hit was recorded while the analytic was in shadow. The analytic is live now.';
 
+export const CHIP_RECORDED_LIVE =
+  'This hit was recorded while the analytic was live. It counts toward a lead. The analytic ' +
+  'is in shadow now.';
+
 export const CHIP_LOCAL = 'Local: a row in this deployment, written or drafted here.';
 
 export const CHIP_SHIPPED = 'Shipped: a file in the soc-ai release.';
@@ -143,6 +158,8 @@ export const CHIP_CATALOG_RUN = 'A row the analytic sweep wrote for an analytic 
 export const CHIP_DISMISS_REASON = 'The dismissal reason the analyst chose.';
 export const CHIP_CLOSED_BY_HUNT = 'soc-ai closed this lead after its hunt. No analyst chose a reason.';
 
+export const CHIP_CLOSED_ON_VERDICTS = `soc-ai closed this lead after its hunt. ${CLOSE_RULE}`;
+
 export const CHIP_WINDOW = 'The window the hunt searched.';
 
 /** The read chip of a shadow hit. The time is the API's, so a payload without
@@ -160,9 +177,11 @@ export function chipNotApplicable(n: number): string {
 
 // ── The hit filters ─────────────────────────────────────────────────────────
 
-export const HIT_FILTER_ALL = 'Every hit from the last 7 days.';
+export const HIT_FILTER_ALL =
+  'Every hit from the last 7 days, and every unread shadow hit of any age.';
 
-export const HIT_FILTER_UNREAD = 'Shadow hits nobody has opened or acted on.';
+export const HIT_FILTER_UNREAD =
+  'Every shadow hit that nobody has opened or acted on, at any age.';
 
 export const HIT_FILTER_LIVE = 'Hits from live analytics. They count and can form leads.';
 
@@ -193,7 +212,7 @@ export const TYPE_CATALOG =
 export const STATUS_RUNNING = 'The hunt is running now.';
 
 export const STATUS_INVESTIGATING =
-  'The hunt landed its report. The investigations of its findings run now.';
+  'The hunt wrote its report. The investigations of its findings run now.';
 
 export const STATUS_COMPLETE = 'The hunt finished. The findings column counts its threat findings.';
 
@@ -214,10 +233,10 @@ export const UNREAD_DOT = 'Unread. Open the evidence or act on the hit to mark i
 /** The line under the lead tabs and the lead actions. The tab is a filter and
  *  the pill is the state, so the four words are said once, in one place. */
 export const LEAD_LEGEND =
-  'New: nobody has acted. In progress: a hunt is running. ' +
-  'Hunted: the hunt finished, and the lead waits on a decision. ' +
-  'Closed: an analyst dismissed the lead or opened an investigation on it, or a clean hunt ' +
-  'closed it.';
+  'Needs decision: the lead is New or Hunted, and it waits on you. ' +
+  'In progress: a hunt is running. ' +
+  'Closed: an analyst dismissed the lead or opened an investigation on it. soc-ai also closes ' +
+  `a lead when its hunt finds no threat, or when ${CLOSE_RULE_CLAUSE}.`;
 
 /** The chip on an analytic in the stored status `candidate`. The screen word
  *  is "draft": the analytic is written and has never run. */
@@ -270,7 +289,7 @@ export const CHIP_SHADOW_LEAD =
 
 /** How a sighting ages. One sentence for every surface that shows a weight.
  *  The words "48 h half-life" named the scoring machinery in analyst text. */
-export const SIGHTING_HALF_WEIGHT = 'A sighting counts half as much after 48 hours.';
+export const SIGHTING_HALF_WEIGHT = 'An observation counts half as much after 48 hours.';
 
 /** The lead rule of soc_ai/hunting/leads.py: two or more types reach 0.85
  *  together, or one type repeats to 1.50 alone (SINGLE_SIGNAL_THRESHOLD). */
@@ -286,7 +305,7 @@ export const CHIP_SEEN = 'The analytic matched this entity again. The repeat add
 export const CHIP_SWEEPS =
   'The number of sweeps that saw a new document for this observation. Each one adds weight. A signal seen on many sweeps repeats. It is not more severe.';
 
-export const WEIGHT_NOW = `${SIGHTING_HALF_WEIGHT} A new sighting adds weight.`;
+export const WEIGHT_NOW = `${SIGHTING_HALF_WEIGHT} A sweep that sees it again adds weight.`;
 
 /** The weight the lead reached at formation. It is a record of one moment and
  *  it never moves, so it cannot wear the sentence of the decaying weight. */
@@ -456,8 +475,8 @@ export const COUNT_ALERT_EVENTS =
  *  2026-10-07: "What is the user flow?"). The "How this flows" link follows
  *  it. */
 export const OVERVIEW_FLOW =
-  'Alerts and sweeps come in. soc-ai triages, hunts, and investigates what the hunts find. ' +
-  'You decide in Needs you. Your actions go to Security Onion.';
+  'soc-ai investigates alerts and runs hunts. You make each decision in Needs you. ' +
+  'soc-ai sends your actions to Security Onion.';
 
 export const COUNT_NEEDS_YOU =
   'The work that waits on you: leads to decide, unread shadow hits, alert groups with no verdict, verdicts that need more info and recommended actions. The sidebar badges and the bell state the same count.';
@@ -506,7 +525,7 @@ export const LEGEND_AUTO_HUNT = 'A new lead starts its own hunt.';
  *  came. */
 export const LEADS_NOTE_AUTO_HUNT =
   'soc-ai starts a hunt on every new lead, except a shadow lead, a reopened lead and a ' +
-  'lead with no documents. A shadow lead comes from an analytic in trial mode. ' +
+  'lead with no documents. A shadow lead comes from a shadow analytic. ' +
   'You decide what the hunt found.';
 
 /** The chip beside the pill on a New lead the loop leaves to the analyst. The
@@ -514,7 +533,7 @@ export const LEADS_NOTE_AUTO_HUNT =
  *  The screen word for the loop is "auto-hunt", the name of its setting. */
 export const CHIP_LEFT_TO_YOU =
   'Auto-hunt starts no hunt here: a shadow lead, a reopened lead, or a lead with no ' +
-  'documents. A shadow lead comes from an analytic in trial mode. Hunt it by hand.';
+  'documents. A shadow lead comes from a shadow analytic. Hunt it by hand.';
 
 /** The secondary act on a lead whose hunt is queued. The loop starts it within
  *  a minute, and this button does not wait for the loop. */
@@ -526,18 +545,18 @@ export const ACTION_HUNT_NOW = 'Start the hunt now. The lead does not wait for a
  *  do. The owner could not tell a hunt from an investigation (2026-10-07). */
 export const ACTION_HUNT =
   'Start a hunt on this lead. The hunt returns findings and a narrative. soc-ai investigates ' +
-  'the findings and brings back the verdicts. The hunt takes no action in Security Onion.';
+  'each threat finding and shows the verdicts. The hunt takes no action in Security Onion.';
 
 /** The line under the actions of a lead. The two verbs of the flow, once. */
 export const LEAD_ACTIONS_LINE =
-  'Hunt this lead. The hunt investigates what it finds and brings back the verdicts.';
+  'Hunt this lead. soc-ai investigates each threat finding of the hunt and shows the verdicts.';
 
 /** The hover of "Open an investigation" on a finding that has no
  *  investigation. The hunt investigates its findings, and this is the manual
  *  control for a finding it left. */
 export const ACTION_OPEN_INVESTIGATION =
-  'Open an investigation on this finding. soc-ai investigates the evidence that the finding ' +
-  'cites. The investigation ends in a verdict and recommended actions.';
+  'Open an investigation on this finding. The control starts one run of the model on the ' +
+  'evidence that the finding cites. The run ends in a verdict and recommended actions.';
 
 /** The depth chip on an investigation: how far the run was allowed to go.
  *
@@ -550,7 +569,7 @@ export const CHIP_RUN_CLASS: Record<string, { label: string; title: string }> = 
     label: 'Depth: quick',
     title:
       'Quick. The model wrote the verdict from the context soc-ai gathered, in one request. ' +
-      'No tool loop ran. The Oracle did not review it. A decision template cleared the alert first.',
+      'The model called no tool. The Oracle did not review it. A decision template cleared the alert first.',
   },
   standard: {
     label: 'Depth: standard',
@@ -588,7 +607,7 @@ export const CHIP_RUN_CLASS_PENDING = {
  * classic rule write. The sentences name a verdict in the words the console
  * shows, never as a stored key. */
 export const ORACLE_REASON: Record<string, string> = {
-  confidence_in_band: 'The confidence sits in the gate band, from 0.4 to below 0.7.',
+  confidence_in_band: 'The confidence is in the gate band, from 0.4 to below 0.7.',
   template_split: 'The decision template and the model disagree on the verdict.',
   deep_needs_more_info: 'A deep re-run ended with the verdict Needs more info.',
   needs_more_info: 'The local verdict is Needs more info.',

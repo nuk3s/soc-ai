@@ -27,7 +27,6 @@ from soc_ai.api.deps import get_elastic, get_settings_dep
 from soc_ai.api.security import identify_caller
 from soc_ai.api.webui._errors import api_error
 from soc_ai.api.webui._shared import (
-    LEGACY_OBSERVATION_SOURCE,
     observation_source,
     router,
 )
@@ -35,7 +34,7 @@ from soc_ai.api.webui.kind_labels import kind_label
 from soc_ai.config import Settings
 from soc_ai.hunting.catalog_tiers import Catalog, effective_catalog
 from soc_ai.hunting.leads import decays_from, no_lead_reasons
-from soc_ai.hunting.ledger import Ledger, analytic_ledger
+from soc_ai.hunting.ledger import HIT_SOURCES, Ledger, analytic_ledger
 from soc_ai.hunting.spec import CATALOG_DIR, PRIOR_SWEEP_EVALUATORS, HuntSpec
 from soc_ai.hunting.weight import live_weight
 from soc_ai.hunting.wording import reword_legacy_summary
@@ -77,7 +76,9 @@ _MAX_OBSERVATION_DAYS = 90
 # profile analytics. A shadow departure carries receipts, as a catalog hit
 # does. An ``alert`` or a ``hunt`` observation is written under an adapter
 # id and no analytic wrote it, so it stays out.
-_HIT_SOURCES = ("catalog", LEGACY_OBSERVATION_SOURCE, "profile", "model")
+# The ledger owns the tuple, so the Analytics row and the hits list read one
+# set of sources.
+_HIT_SOURCES = HIT_SOURCES
 
 
 def _not_found(analytic_id: str) -> HTTPException:
@@ -134,6 +135,44 @@ class AnalyticVersionOut(BaseModel):
     evidence: dict[str, Any] | None = None
 
 
+class GridGapHoldOut(BaseModel):
+    """A hold of the daily hit limit, and the hits in its window that a grid gap wrote.
+
+    ``hits`` counts the live hits of the analytic in the window of the hold.
+    ``gap_hits`` counts the ones a grid gap wrote. ``spike_hits`` counts the
+    gap hits that are spikes; a gap does not explain a spike, so they still
+    count against the limit. ``return_offered`` is true when the other hits
+    stay inside the limit and the hold names no other
+    breach: the console then offers Return to live. The approval stays the
+    operator's click. See :mod:`soc_ai.hunting.gap_recovery`.
+    """
+
+    analytic_id: str
+    title: str
+    hits: int
+    gap_hits: int
+    spike_hits: int = 0
+    budget: int
+    return_offered: bool
+    gap_ids: list[int]
+    held_at: str
+
+
+def gap_hold_out(hold: Any) -> GridGapHoldOut:
+    """One :class:`soc_ai.hunting.gap_recovery.GapHold` as the API states it."""
+    return GridGapHoldOut(
+        analytic_id=hold.analytic_id,
+        title=hold.title,
+        hits=hold.hits,
+        gap_hits=hold.gap_hits,
+        spike_hits=hold.spike_hits,
+        budget=hold.budget,
+        return_offered=hold.return_offered,
+        gap_ids=list(hold.gap_ids),
+        held_at=_iso(hold.held_at) or "",
+    )
+
+
 class AnalyticDetailOut(AnalyticRowOut):
     description: str
     spec_text: str
@@ -161,6 +200,10 @@ class AnalyticDetailOut(AnalyticRowOut):
     shadow_ends_at: str | None = None
     shadow_sweeps: int | None = None
     shadow_hits: int | None = None
+    # A hold of the daily hit limit that hits of a grid gap are part of. None
+    # on every other analytic. The hold card states the counts and offers
+    # Return to live when the gap hits alone broke the limit.
+    gap_hold: GridGapHoldOut | None = None
 
 
 class AnalyticCreateIn(BaseModel):
@@ -290,6 +333,13 @@ class AnalyticHitOut(BaseModel):
     dismissed_reason: str | None = None
     dismissed_by: str | None = None
     dismissed_at: str | None = None
+    # The note of the mark. The grid-gap review writes the gap and its hours
+    # here, beside the reason ``grid_gap``.
+    dismissed_note: str | None = None
+    # The reason soc-ai moved the analytic from live to shadow, while that
+    # hold lasts. A hit recorded live stays under Live and counts toward a
+    # lead, and the card says why its analytic now reads shadow (R3-D11).
+    analytic_held_by_system: str | None = None
 
 
 class AnalyticHitCountsOut(BaseModel):
@@ -456,6 +506,7 @@ async def get_analytic(request: Request, analytic_id: str) -> AnalyticDetailOut:
             if shadow_since is not None
             else None
         )
+        gap_hold = await _gap_hold(request, db, analytic_id, versions=versions, now=now)
     state = states.get(analytic_id)
     by_entity: dict[str, dict[str, Any]] = {}
     for observation in recent_rows:
@@ -525,7 +576,27 @@ async def get_analytic(request: Request, analytic_id: str) -> AnalyticDetailOut:
         else None,
         shadow_sweeps=shadow_record[0] if shadow_record is not None else None,
         shadow_hits=shadow_record[1] if shadow_record is not None else None,
+        gap_hold=gap_hold,
     )
+
+
+async def _gap_hold(
+    request: Request, db: AsyncSession, analytic_id: str, *, versions: Any, now: datetime
+) -> GridGapHoldOut | None:
+    """The grid-gap line of a hold, when soc-ai holds the analytic and a gap wrote some hits."""
+    from soc_ai.hunting import gap_recovery  # noqa: PLC0415 - lazy
+    from soc_ai.store import grid_gaps as gap_store  # noqa: PLC0415 - lazy
+
+    newest = versions[-1] if versions else None
+    if newest is None or not analytics_store.is_system_demotion(newest):
+        return None
+    holds = await gap_recovery.gap_holds(
+        db,
+        settle=gap_store.settle_of(request.app.state.settings),
+        now=now,
+        analytic_id=analytic_id,
+    )
+    return gap_hold_out(holds[0]) if holds else None
 
 
 # The shadow week: an analyst approves a shadow analytic to live after it.
@@ -671,6 +742,14 @@ async def set_analytic_status(
             "reason_required",
             "A retirement needs a reason. Type why you retire this analytic.",
         )
+    if not reason_is_readable(body.why):
+        unreadable = api_error(
+            422,
+            "reason_unreadable",
+            "Type the reason in words. The reason needs a word of 3 or more letters.",
+        )
+    else:
+        unreadable = None
     async with request.app.state.db_sessionmaker() as db:
         # ``seed``: a shipped analytic that ships in shadow reads shadow before
         # its row exists, and an approval moves a row. The sweeps write it, and
@@ -679,6 +758,10 @@ async def set_analytic_status(
         if analytic_id not in cat.listed:
             raise _not_found(analytic_id)
         tier, status = cat.status_of(analytic_id)
+        # A move the table refuses names its own reason first. A reason
+        # matters on a move that happens.
+        if unreadable is not None and body.to in analytics_store.allowed_transitions(tier, status):
+            raise unreadable
         try:
             if tier == "shipped" and status == "live":
                 if body.to != "retired":
@@ -1069,6 +1152,21 @@ _MAX_HITS = 200
 _MAX_HIT_OFFSET = 100_000
 
 
+# A word of three letters or more, in any script. "';l" and "ok" hold none.
+_READABLE_WORD_RE = re.compile(r"[^\W\d_]{3,}")
+
+
+def reason_is_readable(text: str | None) -> bool:
+    """True when a typed reason holds a word, or when no reason was typed.
+
+    The range stored the approval reason "';l" on a live analytic (R3-D15).
+    The version history is the record of why an analytic runs, so a reason
+    with no word in it is refused.
+    """
+    stripped = (text or "").strip()
+    return not stripped or bool(_READABLE_WORD_RE.search(stripped))
+
+
 def _hit_bounds(
     days: int, hit_filter: str, limit: int, offset: int = 0
 ) -> tuple[int, str, int, int]:
@@ -1106,6 +1204,7 @@ def _hit_row(
     cat: Catalog,
     lead_status: str | None,
     no_lead_reason: str | None = None,
+    held_by_system: str | None = None,
 ) -> AnalyticHitOut:
     """One hit as the card renders it."""
     receipts = _receipts_of(observation)
@@ -1151,6 +1250,8 @@ def _hit_row(
         dismissed_reason=observation.dismissed_reason,
         dismissed_by=observation.dismissed_by,
         dismissed_at=_iso(observation.dismissed_at),
+        dismissed_note=observation.dismissed_note,
+        analytic_held_by_system=held_by_system if now_status == "shadow" else None,
     )
 
 
@@ -1162,7 +1263,8 @@ async def list_analytic_hits(
     limit: int = Query(default=50),
     offset: int = Query(default=0, description="How many hits of the order to skip."),
 ) -> AnalyticHitsOut:
-    """Every analytic hit from the last ``days`` days, live and shadow.
+    """Every analytic hit from the last ``days`` days, live and shadow, and
+    every unread shadow hit at any age.
 
     Order under ``all``: the unread shadow hits first, newest first. Then the
     live hits, newest first. Then the read shadow hits, newest first. Needs-you
@@ -1182,9 +1284,19 @@ async def list_analytic_hits(
     since = (datetime.now(UTC) - timedelta(days=days)).replace(tzinfo=None)
     async with request.app.state.db_sessionmaker() as db:
         cat = await effective_catalog(db)
+        # The window bounds the live hits and the read shadow hits. An unread
+        # shadow hit is listed at any age: the Needs-you count, the bell and
+        # the sidebar count every one (unread_shadow_hits_where), and a hit
+        # they count must be on the list they send the analyst to (R3-D9).
         in_window = (
             EntityObservation.source.in_(_HIT_SOURCES),
-            EntityObservation.born_at >= since,
+            or_(
+                EntityObservation.born_at >= since,
+                and_(
+                    EntityObservation.shadow.is_(True),
+                    EntityObservation.read_at.is_(None),
+                ),
+            ),
         )
         # The flag on the row picks the half. The two halves therefore hold
         # every hit in the window except the retired ones, and no hit can fall
@@ -1244,6 +1356,9 @@ async def list_analytic_hits(
                 int(lead.id): str(lead.status)
                 for lead in (await db.scalars(select(Lead).where(Lead.id.in_(lead_ids)))).all()
             }
+        # The analytics a system demotion holds in shadow, for the card of a
+        # hit recorded while the analytic was live.
+        holds = await analytics_store.system_holds(db)
         # Why each hit with no lead formed none. One weighing per entity, for
         # the page on screen only.
         reasons = await no_lead_reasons(
@@ -1261,6 +1376,7 @@ async def list_analytic_hits(
                 cat,
                 lead_status.get(int(r.lead_id or 0)),
                 reasons.get((r.entity_kind, r.entity_key)),
+                holds[r.spec_id].why if r.spec_id in holds else None,
             )
             for r in rows
         ],

@@ -83,13 +83,16 @@ describe('last seen reads the live activity', () => {
     ]);
     expect(lastActivity).toBe(recent);
     render(<HostHero dossier={dossier()} adminBlocked={false} lastActivity={lastActivity} />);
-    expect(screen.getByTestId('hero-last-seen').textContent).toBe('last seen 2h ago');
+    // Dogfood round 2 (V2-7): the host page and the entity page each said
+    // "last seen" for two sources. The host page names the grid.
+    expect(screen.getByTestId('hero-last-seen').textContent).toBe('last grid event 2h ago');
+
   });
 
   it('keeps the sweep stamp when the live read has nothing', () => {
     // Negative control: no activity, no claim of recent life.
     render(<HostHero dossier={dossier()} adminBlocked={false} lastActivity={newestActivity([])} />);
-    expect(screen.getByTestId('hero-last-seen').textContent).toBe('last seen 8d ago');
+    expect(screen.getByTestId('hero-last-seen').textContent).toBe('last grid event 8d ago');
   });
 });
 
@@ -121,7 +124,9 @@ describe('the connections card names its unit', () => {
   it('states the in-and-out rate per hour beside the count', () => {
     const activity: HostActivity = {
       peers: [{ ip: '192.0.2.20', hostname: null, direction: 'out', ports: [443], events: 10, alerted: false }],
-      volume: [{ ts: new Date().toISOString(), events: 5676 }],
+      // The newest full hour, and the window ends at its close.
+      volume: [{ ts: new Date(Math.floor(Date.now() / 3_600_000) * 3_600_000 - 3_600_000).toISOString(), events: 5676 }],
+      window_end: new Date(Math.floor(Date.now() / 3_600_000) * 3_600_000).toISOString(),
       users: null,
       alerts_7d: 0,
       latest_investigation: null,
@@ -133,19 +138,23 @@ describe('the connections card names its unit', () => {
         <HostKpis ip={IP} services={[]} activity={activity} state="ok" range="24h" />
       </MemoryRouter>,
     );
-    expect(screen.getByTestId('kpi-events-rate').textContent).toBe('237 per hour in and out');
+    // One hour of the window holds data, and the rate says so (dogfood
+    // 2026-10-19, R4-D8).
+    expect(screen.getByTestId('kpi-events-rate').textContent).toBe(
+      '5,676 per hour in and out over the 1 hour with data',
+    );
   });
 });
 
-describe('no observations links to Operate', () => {
-  it('makes the Operate sentence a link to the catalog', async () => {
+describe('no observations links to Status', () => {
+  it('makes the Status sentence a link to the catalog', async () => {
     vi.mocked(getObservations).mockResolvedValue({ entity: IP, days: 7, observations: [] });
     render(
       <MemoryRouter>
         <HostObservations entityKey={IP} />
       </MemoryRouter>,
     );
-    const link = await screen.findByRole('link', { name: /operate shows the analytics/i });
+    const link = await screen.findByRole('link', { name: /the status page shows the analytics/i });
     expect(link.getAttribute('href')).toBe('/operate#catalog');
   });
 });

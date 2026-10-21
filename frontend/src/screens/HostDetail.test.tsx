@@ -89,6 +89,7 @@ import { roleAccent, roleRail } from '../lib/hostColors';
 import type { HostActivity } from '../lib/types';
 import { peerGraphView } from '../lib/peerGraph';
 import { alertsHref } from '../components/HostKpis';
+import { OTHER_ROLE } from '../components/RoleChoice';
 import { HostDetail } from './HostDetail';
 
 // TEST-NET-1 (RFC 5737). Never a lab address: this repo publishes to GitHub and
@@ -939,7 +940,7 @@ describe('HostDetail — the identity sentence', () => {
     vi.mocked(getDossier).mockResolvedValue(dossier());
     mount();
     expect((await screen.findByTestId('host-sentence')).textContent).toMatch(
-      /nothing else is known about it yet/i,
+      /soc-ai knows no other fact about this host/i,
     );
   });
 });
@@ -982,7 +983,7 @@ describe('HostDetail — the hero banner', () => {
     // Four second-precision timestamps was the old header. Now: relative ages
     // a reader can feel, absolute times one hover away.
     expect(facts.textContent).toMatch(/first seen .*ago/i);
-    expect(facts.textContent).toMatch(/last seen .*ago/i);
+    expect(facts.textContent).toMatch(/last grid event .*ago/i);
     expect(facts.textContent).toMatch(/swept .*ago/i);
     expect(facts.textContent).not.toMatch(/2026/);
     expect(facts.textContent).toContain('48,213 events');
@@ -999,7 +1000,7 @@ describe('HostDetail — the hero banner', () => {
     vi.mocked(getDossier).mockResolvedValue(rich());
     mount();
     const chip = await screen.findByTestId('hero-agent');
-    expect(chip.textContent).toMatch(/agent on box/i);
+    expect(chip.textContent).toMatch(/agent on machine/i);
     // The claim names its evidence rather than asking for faith.
     expect(chip.getAttribute('title')).toContain('Hostname');
   });
@@ -1029,7 +1030,7 @@ describe('HostDetail — the hero banner', () => {
       ),
     );
     mount();
-    expect((await screen.findByTestId('hero-agent')).textContent).toMatch(/agent on box/i);
+    expect((await screen.findByTestId('hero-agent')).textContent).toMatch(/agent on machine/i);
   });
 
   it('trusts the wire over the field guess when the agent has gone quiet', async () => {
@@ -1222,7 +1223,7 @@ describe('HostDetail — the fact rows', () => {
     expect(role.textContent).toMatch(/inferred from its traffic/i);
 
     const name = await row('hostname');
-    expect(name.textContent).toMatch(/reported by the agent on the box/i);
+    expect(name.textContent).toMatch(/reported by the agent on the machine/i);
   });
 
   it('does not give criticality or the operator note a second row under the strip', async () => {
@@ -1436,8 +1437,14 @@ describe('HostDetail — the unknown line tells the truth about why', () => {
     fireEvent.click(within(unknowns).getByText(/unknown/i));
     expect(unknowns.textContent).toMatch(/checked, nothing found/i);
     expect(unknowns.textContent).toMatch(/not checked yet/i);
-    expect(unknowns.textContent).toMatch(/too old to trust/i);
-    expect(unknowns.textContent).toMatch(/low confidence: "CORP"/i);
+    expect(unknowns.textContent).toMatch(/too old to use/i);
+    // A guess with a value is a fact from weak evidence. The facts panel
+    // states it, marked, and the unknown line leaves it out (dogfood
+    // 2026-10-19, R4-D11).
+    expect(unknowns.textContent).not.toMatch(/CORP/);
+    expect(within(screen.getByTestId('host-facts')).getByTestId('withheld-domain_membership').textContent).toBe(
+      'CORP · low confidence',
+    );
     expect(unknowns.textContent).not.toMatch(/possibly/i);
   });
 
@@ -1540,16 +1547,14 @@ describe('HostDetail — the unknown line tells the truth about why', () => {
     fireEvent.click(within(unknowns).getByText(/unknown/i));
     const roleEntry = within(unknowns).getByTestId('field-role');
     fireEvent.click(within(roleEntry).getByRole('button', { name: /declare a value/i }));
-    const input = within(roleEntry).getByLabelText(/value/i);
-    // A datalist: the canonical vocabulary offered, free text still possible.
-    const listId = input.getAttribute('list');
-    expect(listId).toBeTruthy();
-    const options = Array.from(
-      roleEntry.querySelectorAll(`datalist#${listId} option`),
-    ).map((o) => o.getAttribute('value'));
+    const select = within(roleEntry).getByLabelText(/value/i) as HTMLSelectElement;
+    // The role list of the bulk bar. Other opens a text box for a novel role.
+    expect(select.tagName).toBe('SELECT');
+    const options = Array.from(select.options).map((o) => o.value);
     expect(options).toContain('hypervisor');
     expect(options).toContain('workstation');
     expect(options).toContain('domain_controller');
+    expect(options).toContain(OTHER_ROLE);
   });
 
   it('refuses a blank declaration client-side, the way the server does', async () => {
@@ -2100,8 +2105,8 @@ describe('HostDetail — the activity row', () => {
     vi.mocked(getHostActivity).mockResolvedValue(activity({ users: null }));
     mount();
     const users = await screen.findByTestId('host-users');
-    expect(within(users).getByText(/no host-log users in this window/i)).toBeTruthy();
-    expect(within(users).getByText(/cannot tell the two apart/i)).toBeTruthy();
+    expect(within(users).getByText(/no logon in this window/i)).toBeTruthy();
+    expect(within(users).getByText(/a host that ships no host logs both show this line/i)).toBeTruthy();
   });
 
   it('degrades only the live half when the grid is unreachable', async () => {
@@ -2310,7 +2315,7 @@ describe('HostDetail — the Services card', () => {
     mount();
     const card = await screen.findByTestId('kpi-services');
     expect(within(card).getByText('0')).toBeTruthy();
-    expect(card.textContent).toContain('nothing answers inbound');
+    expect(card.textContent).toContain('this host serves no ports');
   });
 });
 

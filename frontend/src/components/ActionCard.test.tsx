@@ -106,6 +106,41 @@ describe('ActionCard', () => {
     expect(screen.getByRole('button', { name: /Dismiss/ })).toBeDisabled();
   });
 
+  // Dogfood 2026-10-19, R1-I1 follow-up. The card and the row of the
+  // pending-action list read one server rule (analyst_verdict_block), and
+  // the card shows the reason the server states.
+  it('turns the write off and states the reason when it acts against an analyst verdict', () => {
+    const reason =
+      'ana set the verdict of this alert to false positive. This run reached true positive. Override the verdict of this run to act.';
+    const p = mount({ ...esc, blockedReason: reason });
+    const write = screen.getByRole('button', { name: /Escalate to case/ });
+    expect(write).toBeDisabled();
+    expect(write.getAttribute('title')).toBe(reason);
+    expect(screen.getByTestId('action-blocked').textContent).toBe(reason);
+    fireEvent.click(write);
+    expect(screen.queryByTestId('action-confirm')).toBeNull();
+    expect(p.onExecute).not.toHaveBeenCalled();
+    // Dismiss writes nothing to Security Onion. It stays on.
+    expect(screen.getByRole('button', { name: /Dismiss/ })).toBeEnabled();
+  });
+
+  it('does not count the alerts of an ack that the rule turns off', () => {
+    getActionScope.mockClear();
+    mount({
+      ...ack,
+      blockedReason:
+        'ana set the verdict of this alert to true positive. soc-ai does not acknowledge an alert with that verdict.',
+    });
+    expect(screen.getByRole('button', { name: /^Acknowledge$/ })).toBeDisabled();
+    expect(getActionScope).not.toHaveBeenCalled();
+  });
+
+  it('NEGATIVE CONTROL: no reason from the server keeps the write on', () => {
+    mount({ ...esc, blockedReason: null });
+    expect(screen.getByRole('button', { name: /Escalate to case/ })).toBeEnabled();
+    expect(screen.queryByTestId('action-blocked')).toBeNull();
+  });
+
   it('falls back to a plain sentence when the count does not arrive', async () => {
     getActionScope.mockRejectedValueOnce(new Error('down'));
     await act(async () => {
@@ -115,6 +150,71 @@ describe('ActionCard', () => {
       expect(screen.getByTestId('action-scope').textContent).toContain(
         'soc-ai could not count the alerts.',
       ),
+    );
+  });
+
+  // Verify 2026-10-20, V3-N2. The alert of the range was on two cases, and
+  // the card said "Open one Security Onion case for this alert.". The execute
+  // route then opened no case. The card names and links each case, like the
+  // Alerts escalate confirm.
+  const CASES = [
+    { id: 'case-a', url: 'https://so.example/#/case/case-a' },
+    { id: 'case-b', url: 'https://so.example/#/case/case-b' },
+  ];
+
+  it('names and links each case the alert is already on', () => {
+    const p = mount(esc, { cases: CASES, casesComplete: true });
+    const line = screen.getByTestId('action-cases');
+    expect(line.textContent).toBe('The alert is already on cases case-a, case-b.');
+    expect(screen.getByRole('link', { name: 'case-a' })).toHaveAttribute(
+      'href',
+      'https://so.example/#/case/case-a',
+    );
+    expect(screen.getByRole('link', { name: 'case-b' })).toHaveAttribute(
+      'href',
+      'https://so.example/#/case/case-b',
+    );
+    expect(screen.getByTestId('action-scope').textContent).toBe(
+      'soc-ai opens no second case. The press records this action as done.',
+    );
+    fireEvent.click(screen.getByRole('button', { name: /Escalate to case/ }));
+    const confirm = screen.getByTestId('action-confirm');
+    // The press writes nothing to Security Onion, so the confirm says no write.
+    expect(confirm.textContent).not.toContain('This writes to Security Onion.');
+    expect(confirm.textContent).toContain('The alert is already on cases case-a, case-b.');
+    fireEvent.click(screen.getByRole('button', { name: 'Record as done' }));
+    expect(p.onExecute).toHaveBeenCalledWith('group');
+  });
+
+  it('says found for a case list the grid did not confirm', () => {
+    mount(esc, { cases: CASES.slice(0, 1), casesComplete: false });
+    expect(screen.getByTestId('action-cases').textContent).toBe(
+      'soc-ai found the alert on case case-a.',
+    );
+  });
+
+  it('names the cases beside the reason when the write is off', () => {
+    const reason =
+      'A promoted lead uses this document as its anchor. The document is not a Security Onion alert.';
+    mount({ ...esc, blockedReason: reason }, { cases: CASES, casesComplete: true });
+    expect(screen.getByRole('button', { name: /Escalate to case/ })).toBeDisabled();
+    expect(screen.getByTestId('action-blocked').textContent).toBe(reason);
+    expect(screen.getByTestId('action-cases').textContent).toBe(
+      'The alert is already on cases case-a, case-b.',
+    );
+  });
+
+  it('NEGATIVE CONTROL: an ack names no case', () => {
+    getActionScope.mockResolvedValueOnce(GROUP_SCOPE);
+    mount(ack, { cases: CASES, casesComplete: true });
+    expect(screen.queryByTestId('action-cases')).toBeNull();
+  });
+
+  it('asks to dismiss a recommended action', () => {
+    mount(esc);
+    fireEvent.click(screen.getByRole('button', { name: /Dismiss/ }));
+    expect(screen.getByTestId('dismiss-confirm').textContent).toContain(
+      'Dismiss this recommended action. soc-ai records your name and the time. You can undo it.',
     );
   });
 

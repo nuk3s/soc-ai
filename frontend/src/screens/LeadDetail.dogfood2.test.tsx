@@ -17,6 +17,7 @@ vi.mock('../lib/api', async () => {
     getEvent: vi.fn(),
     resolveMachine: vi.fn(),
     getMachine: vi.fn(),
+    listMachines: vi.fn(),
   };
 });
 import {
@@ -25,6 +26,7 @@ import {
   getMachine,
   getNeedsYou,
   keepLeadOpen,
+  listMachines,
   resolveMachine,
 } from '../lib/api';
 import { ShellProvider } from '../shell/ShellContext';
@@ -107,6 +109,7 @@ beforeEach(() => {
   vi.mocked(closeLeadAsPromoted).mockReset().mockResolvedValue(LEAD as never);
   vi.mocked(keepLeadOpen).mockReset().mockResolvedValue(LEAD as never);
   vi.mocked(resolveMachine).mockReset().mockRejectedValue(new Error('no machine'));
+  vi.mocked(listMachines).mockReset().mockResolvedValue({ rows: [], total: 0 } as never);
   vi.mocked(getMachine).mockReset();
 });
 
@@ -126,7 +129,7 @@ describe('C8: the reasons sit in plain view', () => {
     vi.mocked(getLead).mockResolvedValue(NEW as never);
     mount();
     expect((await screen.findByTestId('lead-actions-line')).textContent).toBe(
-      'Hunt this lead. The hunt investigates what it finds and brings back the verdicts.',
+      'Hunt this lead. soc-ai investigates each threat finding of the hunt and shows the verdicts.',
     );
     expect(screen.getByTestId('lead-left-to-you-reason').textContent).toMatch(
       /^Auto-hunt starts no hunt here/,
@@ -165,33 +168,46 @@ describe('W7: the lead title names the machine', () => {
     role: { value: 'server', label: 'server, DNS', confidence: 0.9, state: 'inferred', guess: null, stale_hours: null },
   };
 
+  const row = (over: object = {}) =>
+    ({ rows: [{ ...MACHINE, addresses: ['10.99.0.40'], ...over }], total: 1 }) as never;
+
   it('reads "Lead 16 · <name> · <address> · <role>"', async () => {
-    vi.mocked(resolveMachine).mockResolvedValue({ key: 'mac:aa', primary_ip: '10.99.0.40', matched: 'address' });
-    vi.mocked(getMachine).mockResolvedValue(MACHINE as never);
+    vi.mocked(listMachines).mockResolvedValue(row());
     mount();
     await screen.findByTestId('lead-machine-name');
     const title = screen.getByRole('heading', { level: 1 });
     expect(title.textContent).toBe('Lead 16 · sr-router · 10.99.0.40 · server, DNS');
-    expect(resolveMachine).toHaveBeenCalledWith('10.99.0.40');
-    expect(getMachine).toHaveBeenCalledWith('mac:aa');
+    expect(listMachines).toHaveBeenCalledWith(expect.objectContaining({ q: '10.99.0.40' }));
+    // R3-D15: the resolve route answers 404 for an address no machine holds,
+    // and the browser logged each one. The page reads the list instead.
+    expect(resolveMachine).not.toHaveBeenCalled();
+    expect(getMachine).not.toHaveBeenCalled();
+    // R3-D15: the tab named no lead.
+    expect(document.title).toBe('Lead 16 · soc·ai');
   });
 
-  // Negative controls: a role held back as a guess, and an address no
-  // machine holds.
+  // Negative controls: a role held back as a guess, an address no machine
+  // holds, and a machine whose address only starts with the lead's address.
   it('states no role the server holds back, and keeps the address alone when no machine holds it', async () => {
-    vi.mocked(resolveMachine).mockResolvedValue({ key: 'mac:aa', primary_ip: '10.99.0.40', matched: 'address' });
-    vi.mocked(getMachine).mockResolvedValue({
-      ...MACHINE,
-      role: { ...MACHINE.role, state: 'low_confidence', label: null, guess: 'server' },
-    } as never);
+    vi.mocked(listMachines).mockResolvedValue(
+      row({ role: { ...MACHINE.role, state: 'low_confidence', label: null, guess: 'server' } }),
+    );
     const first = mount();
     await screen.findByTestId('lead-machine-name');
     expect(screen.queryByTestId('lead-machine-role')).toBeNull();
     first.unmount();
-    vi.mocked(resolveMachine).mockRejectedValue(new Error('no_host'));
-    mount();
+    vi.mocked(listMachines).mockResolvedValue({ rows: [], total: 0 } as never);
+    const second = mount();
     await screen.findByTestId('lead-status');
     expect(screen.getByRole('heading', { level: 1 }).textContent).toBe('Lead 16 · 10.99.0.40');
+    second.unmount();
+    vi.mocked(listMachines).mockResolvedValue(
+      row({ primary_ip: '10.99.0.41', addresses: ['10.99.0.41', '10.99.0.400'] }),
+    );
+    mount();
+    await screen.findByTestId('lead-status');
+    await waitFor(() => expect(listMachines).toHaveBeenCalled());
+    expect(screen.queryByTestId('lead-machine-name')).toBeNull();
   });
 
   it('names the count a departure measures', async () => {

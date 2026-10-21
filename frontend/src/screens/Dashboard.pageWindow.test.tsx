@@ -120,6 +120,16 @@ describe('Needs-you tile scope words', () => {
     );
   });
 
+  it('opens the runs with a pending action from the actions line (R1-I1)', async () => {
+    // The line opened every true positive of 30 days, a list that did not
+    // match its number.
+    mount();
+    const line = await screen.findByTestId('needs-you-line-actions');
+    expect(within(line).getByRole('link').getAttribute('href')).toBe(
+      '/investigations?range=30d&actions=pending',
+    );
+  });
+
   it('labels the total as the sum of the lines, each with its own scope', async () => {
     mount();
     const total = await screen.findByTestId('needs-you-total');
@@ -176,8 +186,8 @@ describe('Shadow-hit tile scope words', () => {
     mount();
     const tile = await screen.findByTestId('kpi-shadow-hits');
     expect(within(tile).getByText('Shadow hits · all unread')).toBeTruthy();
-    const link = within(tile).getByRole('link', { name: 'Read the last 7 days on Hunts' });
-    expect(link.getAttribute('href')).toBe('/hunts?hits=unread');
+    const link = within(tile).getByRole('link', { name: 'Read them on Hunts' });
+    expect(link.getAttribute('href')).toBe('/hunts?hits=unread#analytic-hits');
   });
 });
 
@@ -231,7 +241,7 @@ describe('Running tile scope', () => {
     vi.mocked(getAutoTriageStatus).mockResolvedValue({ active: true, hunted: 0, total: 3 } as never);
     mount();
     expect(await screen.findByText('Auto-Investigate active')).toBeTruthy();
-    expect(screen.getByText('of all 1')).toBeTruthy();
+    expect(screen.getByText('now, of 1 investigation on record')).toBeTruthy();
   });
 });
 

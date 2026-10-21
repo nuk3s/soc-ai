@@ -548,6 +548,8 @@ async def test_the_lead_closes_as_promoted_when_every_finding_has_a_verdict(
         (0, "false_positive"),
         (1, "true_positive"),
     ]
+    # R3-D5: the strip names this close. It read "Promoted" alone.
+    assert leads_store.closed_on_verdicts(lead) is True
     await engine.dispose()
 
 

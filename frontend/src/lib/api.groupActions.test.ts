@@ -58,8 +58,9 @@ describe('ackGroup', () => {
     expect(body()).toEqual({
       rule_name: 'ET SCAN Nmap',
       kind: 'suricata',
-      from_: '2026-08-01T00:00',
-      to: '2026-08-02T00:00',
+      // The bounds name their zone, the form every window read sends (R1-D8).
+      from_: new Date('2026-08-01T00:00').toISOString(),
+      to: new Date('2026-08-02T00:00').toISOString(),
       q: 'host.name:web-01',
     });
   });

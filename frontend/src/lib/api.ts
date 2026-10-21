@@ -7,14 +7,19 @@
 // asynchronously (loading / empty / error states) and never import ./mock.
 // ---------------------------------------------------------------------------
 
+import { hadSession, markSignedOut } from './loginReason';
+import { wireBound } from './timeRange';
 import type {
   AboutInfo,
   AdminUser,
   AlertEvent,
   AlertGroup,
+  AlertSibling,
   AlertsEmptyReason,
   AuditChainVerifyResult,
   Backtest,
+  BacktestRunSummary,
+  CaseLink,
   ChatMessage,
   Config,
   ConnTestResult,
@@ -31,6 +36,10 @@ import type {
   DossierSummary,
   EntityDetail,
   EntitySearchHit,
+  GridGapBenignResult,
+  GridGapHits,
+  GridGapHold,
+  GridGaps,
   HostActivity,
   HostActivityRange,
   HuntBulkDeleteResult,
@@ -211,7 +220,11 @@ function redirectToLogin(): void {
   } catch {
     /* storage blocked — the ?next= param still carries the destination */
   }
-  window.location.href = '/app/login?next=' + encodeURIComponent(next);
+  // The login page states why it shows. "expired" only when this browser
+  // signed in before: a first visit to a deep link gets the same 401
+  // (dogfood 2026-10-19, H1-D18).
+  window.location.href =
+    '/app/login?next=' + encodeURIComponent(next) + (hadSession() ? '&reason=expired' : '');
 }
 
 // Client-side budget for every JSON request. Without it, fetch inherits the
@@ -240,8 +253,8 @@ export const MODEL_FITNESS_TIMEOUT_MS = 90_000;
 /** What a write's client-side abort says. The write may still land, so the
  *  copy must not call it failed. */
 export const WRITE_TIMEOUT_NOTE =
-  'The grid is slow. The change may still land. Check the row in a minute.';
-const READ_TIMEOUT_NOTE = 'The soc-ai API is slow or down, or Security Onion behind it is.';
+  'The grid is slow. The change can still complete. Check the row in a minute.';
+const READ_TIMEOUT_NOTE = 'The soc-ai API or Security Onion is slow or down.';
 const INVESTIGATION_START_NOTE =
   'The server is slow. The investigation may still start. Check the investigations list in a minute.';
 const HUNT_START_NOTE = 'The server is slow. The hunt may still start. Check the hunts list in a minute.';
@@ -360,6 +373,10 @@ export interface AlertQuery {
    *  one host with it. Part of AlertQuery so the event pages and group actions
    *  fetched under an active filter stay scoped to the same set. */
   q?: string;
+  /** Ask GET /alerts for the links of each row: the groups that share its
+   *  flow and the cases its alerts are on. One more grid search per page.
+   *  Only the Alerts screen asks. The event and write routes ignore it. */
+  links?: boolean;
 }
 
 function alertQueryParams(query: AlertQuery, base: Record<string, string> = {}): string {
@@ -367,15 +384,19 @@ function alertQueryParams(query: AlertQuery, base: Record<string, string> = {}):
   if (query.range === 'custom' && query.from && query.to) {
     // The bounds travel with range=custom. Sent alone, they left the alerts
     // route on its default 24 hours for the verdict counts of each group.
+    // Each bound carries its zone (wireBound). A bare wall time was read in
+    // so_timezone, while the investigation reads read it in the browser zone,
+    // so one custom window counted two different spans (R1-D8).
     p.set('range', 'custom');
-    p.set('from', query.from);
-    p.set('to', query.to);
+    p.set('from', wireBound(query.from));
+    p.set('to', wireBound(query.to));
   } else if (query.range) {
     p.set('range', query.range);
   }
   if (query.severity) p.set('severity', query.severity);
   if (query.hideAcked) p.set('hide_acked', 'true');
   if (query.q) p.set('q', query.q);
+  if (query.links) p.set('links', 'true');
   return p.toString();
 }
 
@@ -405,6 +426,27 @@ export function getAlerts(query: AlertQuery = {}): Promise<AlertQueue> {
   return request<AlertQueue>('/alerts' + (qs ? `?${qs}` : ''));
 }
 
+/** GET /alerts/siblings: the groups that share the flow of the alert of one
+ *  investigation (R2-D9). `siblings` is null when there is no sibling data,
+ *  and `reason` says why: the run investigated no alert, or the grid did not
+ *  answer. */
+export interface InvestigationSiblings {
+  siblings: AlertSibling[] | null;
+  siblingCount: number | null;
+  reason: 'no_alert' | 'grid' | null;
+  /** True when the read listed fewer groups than the flow holds, so
+   *  `siblingCount` is a floor. Absent on an older server. */
+  partial?: boolean | null;
+  /** The window the read covered, as ISO UTC. The Show action opens the
+   *  Alerts list on it. Absent on an older server. */
+  windowFrom?: string | null;
+  windowTo?: string | null;
+}
+
+export function getInvestigationSiblings(invId: string): Promise<InvestigationSiblings> {
+  return request<InvestigationSiblings>(`/alerts/siblings?${new URLSearchParams({ inv_id: invId })}`);
+}
+
 /**
  * Why the queue is empty. Call this ONLY when getAlerts came back with
  * nothing. It costs four counts against the grid, and the answer is only
@@ -419,6 +461,42 @@ export function getAlerts(query: AlertQuery = {}): Promise<AlertQueue> {
 export function getAlertsEmptyReason(query: AlertQuery = {}): Promise<AlertsEmptyReason> {
   const qs = alertQueryParams({ range: query.range, from: query.from, to: query.to });
   return request<AlertsEmptyReason>('/alerts/empty-reason' + (qs ? `?${qs}` : ''));
+}
+
+/**
+ * The recorded grid gaps that overlap the page window, oldest first. A gap is
+ * a time when soc-ai could not read the grid, or when the documents stopped
+ * on most hosts of one plane. A count over that time is incomplete.
+ *
+ * A preset window sends `since` alone, and the server closes it at now.
+ */
+export function getGridGaps(window: { since: string; until?: string }): Promise<GridGaps> {
+  const qs = new URLSearchParams({ since: window.since });
+  if (window.until) qs.set('until', window.until);
+  return request<GridGaps>(`/grid/gaps?${qs}`);
+}
+
+/** The hits one grid gap wrote, the leads that hold them, and the holds of
+ *  the daily hit limit they caused. The store is the only source. */
+export function getGridGapHits(gapId: number): Promise<GridGapHits> {
+  return request<GridGapHits>(`/grid/gaps/${gapId}/hits`);
+}
+
+/** Mark the selected hits of a closed gap benign, with the gap as the note.
+ *  `expected` is the count the confirm showed. A selected id that left the gap
+ *  list answers 409, and the server writes nothing. No analytic moves, and no
+ *  hit leaves its lead. */
+export function markGridGapHitsBenign(
+  gapId: number,
+  ids: number[],
+  expected: number = ids.length,
+): Promise<GridGapBenignResult> {
+  return post<GridGapBenignResult>(`/grid/gaps/${gapId}/hits/benign`, { ids, expected }).then(
+    (answer) => {
+      emitNeedsYouChanged();
+      return answer;
+    },
+  );
 }
 
 /**
@@ -474,6 +552,12 @@ export interface InvestigationListQuery {
    *  leaves them out by default: a replay measures the model on an alert an
    *  analyst already closed, and the list counts live work. */
   includeBacktest?: boolean;
+  /** Only the runs with a recommended action that waits for the analyst, by
+   *  the rule of the needs-you count. The Needs-you line opens this list. */
+  pendingAction?: boolean;
+  /** One machine: the runs that name any of its addresses or names. Any
+   *  key of the machine works. */
+  entity?: string;
   limit?: number;
   offset?: number;
 }
@@ -488,6 +572,8 @@ export function listInvestigations(q: InvestigationListQuery = {}): Promise<Inve
   if (q.q?.trim()) p.set('q', q.q.trim());
   if (q.errorState) p.set('error_state', q.errorState);
   if (q.includeBacktest) p.set('include_backtest', 'true');
+  if (q.pendingAction) p.set('pending_action', 'true');
+  if (q.entity?.trim()) p.set('entity', q.entity.trim());
   if (q.limit != null) p.set('limit', String(q.limit));
   if (q.offset != null) p.set('offset', String(q.offset));
   const qs = p.toString();
@@ -1553,6 +1639,30 @@ export interface HuntCatalogSpec {
   /** The reason of a system demotion that holds the analytic in shadow now.
    *  Null for a shadow an analyst chose. Absent from an older backend. */
   held_by_system?: string | null;
+  /** The newest failed run of this analytic as one console sentence. Null
+   *  when the newest run did not fail. `last_error` keeps the raw text.
+   *  Absent from an older backend. */
+  last_error_text?: string | null;
+  /** The failed runs of the last 24 h. The counters read zero over a failed
+   *  run, so this is the number that says the day was not quiet. */
+  failed_24h?: number;
+  /** The first failed run of the current streak, or null when the newest run
+   *  did not fail. */
+  failing_since?: string | null;
+}
+
+/** What one sweep loop did on its recent runs. `skipped` is a due profile
+ *  sweep that the loop did not run because the grid was down. The counts
+ *  cover the time since `counted_since`, at most 24 h. The profile sweep
+ *  keeps its record in memory, so a restart starts it again. */
+export interface LoopHealth {
+  last_run_at: string | null;
+  last_outcome: string;
+  last_error_text?: string | null;
+  runs_24h: number;
+  failed_24h: number;
+  failing_since?: string | null;
+  counted_since?: string | null;
 }
 
 /** GET /hunt-catalog — every spec in catalog order plus the sweep loop's
@@ -1573,6 +1683,13 @@ export interface HuntCatalog {
    *  `profile` analytics. Absent from an older backend. */
   prior_sweeps_enabled?: boolean;
   last_prior_run_at?: string | null;
+  /** How often the profile sweep runs, after its floor. Absent from an older
+   *  backend. */
+  prior_sweep_interval_minutes?: number;
+  /** The result of each loop. Null for a loop with no run on record. Absent
+   *  from an older backend. */
+  sweep_health?: LoopHealth | null;
+  prior_sweep_health?: LoopHealth | null;
 }
 
 /** The hunt catalog with each spec's sweep status (analyst-readable). */
@@ -1587,6 +1704,11 @@ export interface ApiKeyField {
   help: string;
   isSet: boolean;
   source: string; // "db" | "env" | "unset"
+  /** False when the server holds no CONFIG_SECRET_KEY: a save cannot store a
+   *  key. Absent on an older server. */
+  can_store?: boolean;
+  /** Why a save cannot store a key, in one or two sentences. */
+  store_hint?: string | null;
 }
 
 export function getApiKeys(): Promise<ApiKeyField[]> {
@@ -1937,7 +2059,10 @@ export interface ExecuteActionResult {
 }
 
 /** Execute one advisory (report-recommended) write action against Security Onion.
- *  `scope: 'alert'` is "Acknowledge this alert only". Only an ack reads it. */
+ *  `scope: 'alert'` is "Acknowledge this alert only". Only an ack reads it.
+ *  A Security Onion write, so it waits SO_WRITE_TIMEOUT_MS like the group
+ *  writes. The 20 s read budget called a slow write failed (R2-D14).
+ *  SO_WRITE_OPTS is declared further down; the call reads it at run time. */
 export function executeAction(
   invId: string,
   index: number,
@@ -1946,6 +2071,7 @@ export function executeAction(
   return post<ExecuteActionResult>(
     `/investigations/${encodeURIComponent(invId)}/actions/${index}/execute`,
     scope ? { scope } : undefined,
+    SO_WRITE_OPTS,
   ).then((answer) => {
     // An executed action leaves the pending-action part of the needs-you count.
     emitNeedsYouChanged();
@@ -1963,6 +2089,11 @@ export interface ActionScope {
   held: number;
   rangeLabel: string;
   sentence: string;
+  /** An escalate only: the cases the alert is already on. The press then
+   *  opens no second case. Absent from an older server. */
+  cases?: CaseLink[];
+  /** False when the grid did not confirm the case list. */
+  casesComplete?: boolean;
 }
 
 export function getActionScope(invId: string, index: number): Promise<ActionScope> {
@@ -2010,6 +2141,20 @@ export function setSetting(
       return r;
     },
   );
+}
+
+/** Return one setting to its .env value or its code default ("Use the
+ *  default"). `restart_required` is true when the running value waits for a
+ *  restart. */
+export function clearSetting(
+  key: string,
+): Promise<{ ok: boolean; restart_required: boolean; removed: boolean }> {
+  return del<{ ok: boolean; restart_required: boolean; removed: boolean }>(
+    `/config/setting/${encodeURIComponent(key)}`,
+  ).then((r) => {
+    invalidateSessionProbes(); // same config-apply rule as setSetting
+    return r;
+  });
 }
 
 /** Mint an API token — the raw value is returned once. */
@@ -2066,6 +2211,11 @@ export function setMyStatus(status: string): Promise<{ ok: boolean; status: stri
   });
 }
 
+/** The window event a successful password change sends. The shell reads
+ *  /me again on it, so the generated-password banner hides wherever the
+ *  change came from: the account menu, Settings > Users or the banner. */
+export const PASSWORD_CHANGED_EVENT = 'soc-ai:password-changed';
+
 /**
  * Change your own password. Rejections (wrong current password, below the
  * server's minimum length) arrive as a thrown Error carrying the backend's
@@ -2079,6 +2229,10 @@ export function changePassword(
   return post<{ ok: boolean }>('/me/password', {
     current_password: currentPassword,
     new_password: newPassword,
+  }).then((r) => {
+    invalidateSessionProbes(); // the cached /me carries password_is_generated
+    if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent(PASSWORD_CHANGED_EVENT));
+    return r;
   });
 }
 
@@ -2103,8 +2257,25 @@ export function saveDangerSetting(
   });
 }
 
-export function testConnection(target: 'es' | 'llm'): Promise<ConnTestResult> {
-  return post<ConnTestResult>(`/config/danger/test/${target}`);
+/** Probe the grid or the model gateway. With `edit`, the probe uses the edited
+ *  value of one connection setting and saves nothing. */
+export function testConnection(
+  target: 'es' | 'llm',
+  edit?: { key: string; value: string },
+): Promise<ConnTestResult> {
+  return post<ConnTestResult>(`/config/danger/test/${target}`, edit);
+}
+
+/** Whether this server asks for a sign-in. Open, so the sign-in page can read
+ *  it before any session exists. Plain fetch: a 401 here must not redirect. */
+export async function getAuthStatus(): Promise<{ auth_required: boolean }> {
+  const res = await fetch(API_BASE + '/auth-status', {
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    headers: { Accept: 'application/json' },
+    credentials: 'include',
+  });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return (await res.json()) as { auth_required: boolean };
 }
 
 /** Re-run the tamper-evident audit hash chain check against the live ES audit
@@ -2113,8 +2284,13 @@ export function testConnection(target: 'es' | 'llm'): Promise<ConnTestResult> {
  * unreachable or partially-read index rejects this promise rather than
  * resolving with a result (see AuditChainVerifyResult's doc) — a caller must
  * not fold that rejection into "tampered". */
+/** The days of audit records the console's Verify audit chain reads. */
+export const AUDIT_VERIFY_DAYS = 7;
+
 export function verifyAuditChain(): Promise<AuditChainVerifyResult> {
-  return request<AuditChainVerifyResult>('/config/audit/verify-chain', {
+  // The window is pinned here so the result line can name it (R5-D27). The
+  // server default is the same 7 days.
+  return request<AuditChainVerifyResult>(`/config/audit/verify-chain?days=${AUDIT_VERIFY_DAYS}`, {
     timeoutMs: AUDIT_VERIFY_TIMEOUT_MS,
   });
 }
@@ -2216,6 +2392,18 @@ export function getBacktestById(id: string): Promise<Backtest> {
   return request<Backtest>(`/backtest/${encodeURIComponent(id)}`);
 }
 
+/** Stop a running backtest after the alert in flight (admin). The run keeps
+ *  the results of the alerts it finished. A refusal (409 not_running or
+ *  cancel_requested) arrives as an ApiError with the server's hint. */
+export function cancelBacktest(id: string): Promise<Backtest> {
+  return post<Backtest>(`/backtest/${encodeURIComponent(id)}/cancel`);
+}
+
+/** The stored backtest runs, newest first, one summary each. */
+export function getBacktestRuns(limit = 20): Promise<{ runs: BacktestRunSummary[] }> {
+  return request<{ runs: BacktestRunSummary[] }>(`/backtests?limit=${limit}`);
+}
+
 export interface AckGroupResult {
   acked: number;
   failed: number;
@@ -2256,6 +2444,9 @@ export interface EscalateGroupResult {
   /** The cases this press opened, one per distinct case id. `url` is the case
    *  in Security Onion's console, null when the settings name no host. */
   cases?: Array<{ id: string; url: string | null }>;
+  /** The cases the already-escalated alerts are on, from soc-ai's own ledger.
+   *  A case opened outside soc-ai has no entry. Absent from an older server. */
+  existing_cases?: Array<{ id: string; url: string | null }>;
 }
 
 /** One escalate the ledger claimed and never got an answer for. The claim is
@@ -2295,6 +2486,26 @@ export interface StrandedClaims {
 /** Escalate claims that never came back with a case id (analyst-readable). */
 export function getStrandedEscalations(): Promise<StrandedClaims> {
   return request<StrandedClaims>('/escalations/stranded');
+}
+
+/** The outcome of one claim check. `case_found` and `no_case` settled the
+ *  claim. `waiting` left it open. `message` is the one sentence to show. */
+export interface EscalationCheck {
+  alert_id: string;
+  result: 'case_found' | 'no_case' | 'waiting' | 'already_settled';
+  settled: boolean;
+  case_id: string | null;
+  /** The case in the Security Onion console. Null with no case, and when the
+   *  server names no Security Onion host. */
+  case_url?: string | null;
+  message: string;
+}
+
+/** POST /escalations/check: compare one stranded claim with Security Onion
+ *  now, and settle it on evidence (R5-I5). A 503 means Security Onion did not
+ *  answer; the claim then stays open. */
+export function checkEscalationClaim(alertId: string): Promise<EscalationCheck> {
+  return post<EscalationCheck>('/escalations/check', { alert_id: alertId });
 }
 
 export interface AssignResult {
@@ -2349,8 +2560,8 @@ function groupActionBody(
 ): Record<string, string | undefined> {
   const body: Record<string, string | undefined> = { rule_name: group.name, kind: group.kind };
   if (query.range === 'custom' && query.from && query.to) {
-    body.from_ = query.from;
-    body.to = query.to;
+    body.from_ = wireBound(query.from);
+    body.to = wireBound(query.to);
   } else if (query.range) {
     body.range = query.range;
   }
@@ -2815,8 +3026,17 @@ export async function login(username: string, password: string): Promise<LoginRe
     throw new Error('Network error. Check that the soc-ai API is reachable.');
   }
   if (res.status === 401) {
-    // Keep generic — don't leak whether the username exists.
-    throw new Error('Invalid username or password');
+    // Keep generic: the message never says whether the username exists. The
+    // server hint is generic too, and it adds the lock warning near the limit.
+    let message = 'The username or the password is wrong.';
+    try {
+      const body = await res.json();
+      const hint = body?.detail?.hint;
+      if (typeof hint === 'string' && hint) message = hint;
+    } catch {
+      /* non-JSON body: keep the generic sentence */
+    }
+    throw new Error(message);
   }
   if (!res.ok) {
     // Surface the server's helpful detail/hint (e.g. a 429 rate-limit message)
@@ -2862,7 +3082,11 @@ export async function logout(): Promise<void> {
  * client-side navigate would leave the session cookie alive (security bug).
  */
 export function signOut(navigate: (to: string) => void): Promise<void> {
-  return logout().finally(() => navigate('/login'));
+  return logout().finally(() => {
+    markSignedOut();
+    // The login page says "You signed out." (dogfood 2026-10-19, H1-D18).
+    navigate('/login?reason=signed-out');
+  });
 }
 
 // ── Saved list views (per user, server-held) ────────────────────────────────
@@ -2998,6 +3222,9 @@ export interface Lead {
   /** True when the lead formed from backtest replays only. A replay is a
    *  measurement on an alert an analyst already closed, not live evidence. */
   formed_from_backtest?: boolean;
+  /** True when soc-ai closed the lead because every finding of its hunt has a
+   *  verdict. Absent from an older server. */
+  closed_by_hunt_verdicts?: boolean;
 }
 
 /** One hunt on a lead, with its answer. The page labelled a hunt by its id
@@ -3064,6 +3291,12 @@ export interface LeadObservationDetail extends LeadObservation {
   /** When an analyst retired the analytic that wrote the row. The row kept
    *  its shadow chip after a reject, and nothing said the analytic was gone. */
   analytic_retired_at?: string | null;
+  /** Somebody marked the observation benign. It counts toward no lead, so
+   *  `weight_now` is 0. Absent from an older server. */
+  dismissed_reason?: string | null;
+  dismissed_note?: string | null;
+  dismissed_by?: string | null;
+  dismissed_at?: string | null;
 }
 
 /** The live weight of one type on a lead. One type saturates at `cap`, so a
@@ -3117,6 +3350,9 @@ export interface LeadPromotedFinding {
   status: string;
   verdict: string | null;
   confidence: number | null;
+  /** The other findings of the same hunt that read this investigation, by
+   *  0-based ordinal. Absent from an older server. */
+  shared_with?: number[];
 }
 
 /** Open leads, newest first, each with the observations that formed it. */
@@ -3230,6 +3466,93 @@ export function keepLeadOpen(id: number, investigationId: string): Promise<LeadD
   return post<LeadDetail>(`/hunts/leads/${id}/keep-open`, {
     investigation_id: investigationId,
   }).then(leadChanged);
+}
+
+// ── Bulk decisions on leads ──────────────────────────────────────────────────
+
+/** One lead a bulk press wrote. */
+export interface LeadBulkDone {
+  id: number;
+  /** The lead's change token after the write. Undo sends it back as `seen`. */
+  updated_at?: string | null;
+  /** The hunt the press started on the lead. */
+  hunt_id?: string | null;
+  /** The dismissal reason the write cleared or restored. */
+  previous_reason?: string | null;
+}
+
+/** One lead a bulk press skipped or could not write, with the code and the
+ *  sentence for the analyst. */
+export interface LeadBulkSkip {
+  id: number;
+  reason: string;
+  hint: string;
+}
+
+/** What one bulk press did, lead by lead. */
+export interface LeadBulkResult {
+  action: 'dismiss' | 'reopen' | 'hunt' | 'dismiss_again';
+  done: LeadBulkDone[];
+  skipped: LeadBulkSkip[];
+  failed: LeadBulkSkip[];
+  /** The hunt cap of a Hunt press. */
+  cap?: number | null;
+}
+
+/** The leads of one press. `expected` is the count the confirm named: the
+ *  server answers 409 and writes nothing when the ids name another count.
+ *  `seen` holds each lead's `updated_at` as the page read it, and the server
+ *  skips a lead that changed after that. */
+export interface LeadBulkPress {
+  ids: number[];
+  expected: number;
+  seen?: Record<string, string | null>;
+}
+
+/** Dismiss every lead of the press with one reason and one optional note. */
+export function bulkDismissLeads(
+  press: LeadBulkPress,
+  reason: string,
+  note?: string,
+): Promise<LeadBulkResult> {
+  return post<LeadBulkResult>('/hunts/leads/bulk-dismiss', {
+    ...press,
+    reason,
+    note: note ?? null,
+  }).then(leadChanged);
+}
+
+/** Reopen every dismissed lead of the press. The Undo of a bulk dismiss. */
+export function bulkReopenLeads(press: LeadBulkPress): Promise<LeadBulkResult> {
+  return post<LeadBulkResult>('/hunts/leads/bulk-reopen', press).then(leadChanged);
+}
+
+/** Dismiss each lead again with the reason its last reopen cleared. The Undo
+ *  of a bulk reopen. */
+export function bulkDismissLeadsAgain(press: LeadBulkPress): Promise<LeadBulkResult> {
+  return post<LeadBulkResult>('/hunts/leads/bulk-dismiss-again', press).then(leadChanged);
+}
+
+/** Start one hunt per lead, at most the cap per press. */
+export function bulkHuntLeads(press: LeadBulkPress): Promise<LeadBulkResult> {
+  // One press starts its hunts one after another, so its budget is one
+  // start budget for each hunt of the cap.
+  return post<LeadBulkResult>('/hunts/leads/bulk-hunt', press, {
+    timeoutMs: RUN_START_TIMEOUT_MS * 3,
+    timeoutNote: HUNT_START_NOTE,
+  }).then(leadChanged);
+}
+
+/** What the bulk Hunt confirm states: the cap of one press, and how long
+ *  hunts on this grid take. `typical_run` is null while the store holds too
+ *  few finished hunts. */
+export interface LeadBulkHuntPlan {
+  cap: number;
+  typical_run: { lowMin: number; highMin: number; medianMin: number; samples: number } | null;
+}
+
+export function getLeadBulkHuntPlan(): Promise<LeadBulkHuntPlan> {
+  return request<LeadBulkHuntPlan>('/leads/bulk-hunt-plan');
 }
 
 // ── Lead quality (the rule is instrumented, not moved) ───────────────────────
@@ -3469,6 +3792,12 @@ export interface AnalyticHit {
   dismissed_reason?: string | null;
   dismissed_by?: string | null;
   dismissed_at?: string | null;
+  /** The note of the mark. The grid-gap review writes the gap and its hours
+   *  here, beside the reason `grid_gap`. Absent from an older server. */
+  dismissed_note?: string | null;
+  /** The reason soc-ai moved the analytic from live to shadow, while that hold
+   *  lasts. Null on any other analytic. Absent from an older server. */
+  analytic_held_by_system?: string | null;
 }
 
 /** Mark one observation benign with a reason from the dismissal list. The
@@ -3635,6 +3964,9 @@ export interface AnalyticDetail extends AnalyticRow {
   /** Sweeps and hits since the shadow began. */
   shadow_sweeps?: number | null;
   shadow_hits?: number | null;
+  /** A hold of the daily hit limit that hits of a grid gap are part of.
+   *  null on every other analytic. Absent from an older server. */
+  gap_hold?: GridGapHold | null;
 }
 
 /** One observation on one entity, from any source. `weight_now` decays with a
@@ -3848,4 +4180,52 @@ export function onNeedsYouChanged(listener: ShadowHitsListener): () => void {
   return () => {
     needsYouListeners.delete(listener);
   };
+}
+
+// ── Status page: the unattended jobs ────────────────────────────────────────
+//
+// The Status page lists each job that runs with no operator. Most of them read
+// a route that already existed. The two helpers below fill the gaps: the
+// dossier sweep's closed health projection had no helper here (Hosts.tsx reads
+// it with its own fetch), and the scheduled audit-chain check had no route.
+
+/** The dossier sweep's health, projected for any signed-in caller. The full
+ *  sweep record (`getDossierRefreshStatus`) is admin-only. */
+export interface DossierSweepHealth {
+  running: boolean;
+  /** The last finished sweep recorded at least one error. */
+  degraded: boolean;
+  /** When the last sweep finished. Null when no sweep is on record in this
+   *  process. */
+  last_run: string | null;
+  error_count: number;
+}
+
+export function getDossierSweepHealth(): Promise<DossierSweepHealth> {
+  return request<DossierSweepHealth>('/dossiers/sweep-health');
+}
+
+/** The scheduled audit-chain check, as its loop last left it. */
+export interface AuditVerifySchedule {
+  enabled: boolean;
+  interval_hours: number;
+  window_days: number;
+  /** When the loop last ran the check. The loop stamps a clean check and a
+   *  check that could not read the index alike. Null until the first
+   *  scheduled check of the process. */
+  last_run: string | null;
+  /** A break is on record. A clean check clears it. A check that could not
+   *  read the index leaves it as it was. So `false` means "no break on
+   *  record", never "the last check came back clean". */
+  broken: boolean;
+  broken_since: string | null;
+  /** The census sentence the bell shows for the break. */
+  detail: string | null;
+  /** What the last run found. 'not_checked' = it could not read the audit
+   *  index. Null before the first run. Absent on an older server. */
+  last_outcome?: 'intact' | 'broken' | 'not_checked' | null;
+}
+
+export function getAuditVerifySchedule(): Promise<AuditVerifySchedule> {
+  return request<AuditVerifySchedule>('/audit/verify-schedule');
 }

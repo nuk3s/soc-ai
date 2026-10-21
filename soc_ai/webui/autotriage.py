@@ -729,6 +729,32 @@ async def _grounded_inheritance_sources(state: Any, source_ids: list[str]) -> se
     return {sid for sid in source_ids if recorded_run_retrieved_evidence(by_source.get(sid, []))}
 
 
+async def _analyst_held_alerts(state: Any, alert_ids: list[str]) -> set[str] | None:
+    """Which of *alert_ids* carry an analyst verdict other than false positive.
+
+    An inherited false positive fans out over every event of the cluster, and
+    one of those events can carry its own analyst verdict. The planner checks
+    only the cluster's representative event, so the fan-out is the path that
+    acknowledges an alert the analyst called a true positive (dogfood
+    2026-10-19, R2-D1).
+
+    FAILS CLOSED. None means the store did not answer, and the caller refuses
+    every candidate.
+    """
+    if not alert_ids:
+        return set()
+    try:
+        async with state.db_sessionmaker() as db:
+            found = await inv_svc.analyst_verdicts_for_alerts(db, alert_ids)
+    except Exception:
+        _LOGGER.exception(
+            "auto-triage: could not read the analyst verdicts. Refusing %d inherited acks",
+            len(alert_ids),
+        )
+        return None
+    return {aid for aid, v in found.items() if v.verdict != "false_positive"}
+
+
 async def _ack_inherited_fps(
     state: Any,
     ctx: Any,
@@ -771,6 +797,7 @@ async def _ack_inherited_fps(
     grounded = await _grounded_inheritance_sources(
         state, list(dict.fromkeys(a.inherited_from for a in acks))
     )
+    analyst_held = await _analyst_held_alerts(state, [a.alert_es_id for a in acks])
     try:
         lookup = await state.elastic.search(
             state.settings.events_index_pattern,
@@ -791,6 +818,11 @@ async def _ack_inherited_fps(
             continue
         if get_dotted(hit.get("_source", {}), "event.acknowledged"):
             continue  # already acked (a human, or a previous sweep)
+        if analyst_held is None or cand.alert_es_id in analyst_held:
+            # An analyst set this alert's verdict, and not to false positive.
+            # A sibling's inherited verdict never overrules a person.
+            _bump(status.inherited_refused, "analyst_verdict")
+            continue
         if cand.inherited_from not in grounded:
             # The verdict is not being overturned — it still reads as a
             # confident false positive on the console. It just stops

@@ -954,3 +954,208 @@ def test_the_peer_table_excludes_multicast_and_link_local() -> None:
     }
     peers, _truncated = _fold_peers(aggs, "10.1.10.11")
     assert [p.ip for p in peers] == ["10.1.10.21"]
+
+
+# ---------------------------------------------------------------------------
+# Dogfood 2026-10-19: the Users lane on a Windows host, and the chart bounds
+# ---------------------------------------------------------------------------
+
+_WIN_IP = "192.0.2.21"
+
+# The Windows logon plane of one domain controller. The machine accounts are
+# the busiest buckets, as they are on a real controller: every member computer
+# authenticates to it.
+_WINDOWS_AUTH_AGG: dict[str, Any] = {
+    "agents": {"buckets": [{"key": "dc01.example.test", "doc_count": 3008}]},
+    "users": {
+        "buckets": [
+            {
+                "key": "DC01$",
+                "doc_count": 2100,
+                "last": {"value_as_string": "2026-10-19T10:20:00.000Z"},
+            },
+            {
+                "key": "WS01$ ",
+                "doc_count": 600,
+                "last": {"value_as_string": "2026-10-19T10:19:00.000Z"},
+            },
+            {
+                "key": "alice",
+                "doc_count": 200,
+                "last": {"value_as_string": "2026-10-19T10:18:00.000Z"},
+            },
+            {
+                "key": "svc-sql",
+                "doc_count": 108,
+                "last": {"value_as_string": "2026-10-19T10:17:00.000Z"},
+            },
+        ]
+    },
+}
+
+
+class _WindowsAuthElastic(_FakeConnElastic):
+    """A grid whose auth documents for this host are all in ``system.security``.
+
+    The users search finds them only when its query selects that dataset. A
+    lane that reads ``system.auth`` alone gets no documents, which is the
+    Windows host the dogfood saw with ``users: null``.
+    """
+
+    async def search(  # type: ignore[override]
+        self, index: str, query: dict[str, Any], **kwargs: Any
+    ) -> EsSearchResult:
+        aggs = kwargs.get("aggs") or {}
+        if "users" in aggs and "system.security" not in json.dumps(query):
+            self.searches.append({"index": index, "query": query, "aggs": aggs, "size": 0})
+            return EsSearchResult(total=0, took_ms=1)
+        return await super().search(index, query, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_the_users_lane_reads_the_windows_logon_dataset(
+    settings_kratos: Settings,
+) -> None:
+    """R4-D5: a Windows host showed ``users: null`` beside 9 profile logon users.
+
+    The profile reads ``system.security`` and ``system.auth``. The Users lane
+    read ``system.auth`` alone, so every Windows host read as one that ships
+    no auth logs.
+    """
+    es = _WindowsAuthElastic(_CONN_AGG, auth=_WINDOWS_AUTH_AGG, auth_total=3008)
+    act = await fetch_host_activity(es, settings_kratos, _WIN_IP, range="24h")  # type: ignore[arg-type]
+
+    assert act.users is not None
+    assert [u.name for u in act.users] == ["alice", "svc-sql"]
+    assert act.users_truncated is False
+
+
+@pytest.mark.asyncio
+async def test_the_users_lane_reads_the_profile_logon_datasets(
+    settings_kratos: Settings,
+) -> None:
+    """One list of logon datasets, read by the profile and the Users lane alike."""
+    from soc_ai.dossier.profile import LOGON_CANDIDATES
+
+    es = _FakeConnElastic(_CONN_AGG, auth=_AUTH_AGG, auth_total=59)
+    act = await fetch_host_activity(es, settings_kratos, _IP, range="24h")  # type: ignore[arg-type]
+
+    users_search = next(s for s in es.searches if "users" in (s["aggs"] or {}))
+    rendered = json.dumps(users_search["query"])
+    for dataset in LOGON_CANDIDATES:
+        assert dataset in rendered, dataset
+    # Both spellings of the dataset field, as the connection pass reads them.
+    assert "data_stream.dataset" in rendered
+    # The field names what the card read, so the page can say it.
+    assert act.auth_datasets == list(LOGON_CANDIDATES)
+
+
+@pytest.mark.asyncio
+async def test_machine_accounts_do_not_spend_the_user_buckets(
+    settings_kratos: Settings,
+) -> None:
+    """A controller's machine accounts would fill every one of the 11 buckets.
+
+    The terms aggregation excludes them on the grid, so the buckets go to
+    accounts that the card can list.
+    """
+    import re
+
+    es = _FakeConnElastic(_CONN_AGG, auth=_AUTH_AGG, auth_total=59)
+    await fetch_host_activity(es, settings_kratos, _IP, range="24h")  # type: ignore[arg-type]
+
+    terms = next(s for s in es.searches if "users" in (s["aggs"] or {}))["aggs"]["users"]["terms"]
+    pattern = terms["exclude"]
+    # Lucene regular expressions match the whole term, as fullmatch does.
+    assert re.fullmatch(pattern, "DC01$")
+    assert re.fullmatch(pattern, "ws-0042$")
+    assert not re.fullmatch(pattern, "alice")
+    assert not re.fullmatch(pattern, "a$b")
+
+
+@pytest.mark.asyncio
+async def test_a_host_with_only_machine_accounts_is_empty_not_null(
+    settings_kratos: Settings,
+) -> None:
+    """Auth documents that name only machine accounts are ``[]``.
+
+    The host ships auth logs, so the card must not read as a coverage gap.
+    """
+    machines_only = {
+        "agents": {"buckets": [{"key": "ws01.example.test", "doc_count": 40}]},
+        "users": {
+            "buckets": [
+                {
+                    "key": "WS01$",
+                    "doc_count": 40,
+                    "last": {"value_as_string": "2026-10-19T10:00:00Z"},
+                }
+            ]
+        },
+    }
+    es = _FakeConnElastic(_CONN_AGG, auth=machines_only, auth_total=40)
+    act = await fetch_host_activity(es, settings_kratos, _WIN_IP, range="24h")  # type: ignore[arg-type]
+
+    assert act.users == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("range_", "anchor"), [("24h", "now-24h"), ("7d", "now-7d")])
+async def test_the_volume_series_spans_the_whole_window(
+    settings_kratos: Settings, range_: str, anchor: str
+) -> None:
+    """R4-D8: a 24 h window with data in one hour returned one bucket.
+
+    The chart then drew one bar with equal start and end labels. The bounds
+    pin the series to the window the query reads, so empty hours render as
+    zero bars.
+    """
+    es = _FakeConnElastic(_CONN_AGG)
+    await fetch_host_activity(es, settings_kratos, _IP, range=range_)  # type: ignore[arg-type]
+
+    conn = next(s for s in es.searches if "volume" in (s["aggs"] or {}))
+    histogram = conn["aggs"]["volume"]["date_histogram"]
+    assert histogram["min_doc_count"] == 0
+    assert histogram["extended_bounds"] == {"min": anchor, "max": "now"}
+    # The lower bound is the same instant the range filter reads from.
+    window = next(
+        clause["range"]["@timestamp"]["gte"]
+        for clause in conn["query"]["bool"]["filter"]
+        if "range" in clause
+    )
+    assert window == anchor
+
+
+@pytest.mark.asyncio
+async def test_newest_event_is_the_newest_connection_record(
+    settings_kratos: Settings,
+) -> None:
+    """R4-D9: "last seen" was the start of the newest chart bucket.
+
+    The newest record time rides the same search as the volume series.
+    """
+    newest = "2026-10-19T10:47:12.000Z"
+    es = _FakeConnElastic({**_CONN_AGG, "newest": {"value": 1.0, "value_as_string": newest}})
+    act = await fetch_host_activity(es, settings_kratos, _IP, range="24h")  # type: ignore[arg-type]
+
+    assert act.newest_event == newest
+    conn = [s for s in es.searches if "volume" in (s["aggs"] or {})]
+    assert len(conn) == 1
+    assert conn[0]["aggs"]["newest"] == {"max": {"field": "@timestamp"}}
+    # Still three searches: the field costs no extra round trip.
+    assert len(es.searches) == 3
+
+
+@pytest.mark.asyncio
+async def test_a_quiet_host_has_no_newest_event(settings_kratos: Settings) -> None:
+    """ES answers a max over no documents with a null value and no string."""
+    es = _FakeConnElastic(
+        {
+            "out": {"peers": {"buckets": []}},
+            "in": {"peers": {"buckets": []}},
+            "newest": {"value": None},
+        }
+    )
+    act = await fetch_host_activity(es, settings_kratos, _IP, range="24h")  # type: ignore[arg-type]
+
+    assert act.newest_event is None

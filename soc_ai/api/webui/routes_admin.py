@@ -42,9 +42,11 @@ async def create_token(request: Request, body: TokenCreateIn) -> dict[str, str]:
             status_code=403,
             detail={
                 "reason": "no_session_user",
+                # The console showed this to an operator with authentication
+                # off as a refusal of a bearer-token caller (R5-D11).
                 "hint": (
-                    "Minting an API token requires a signed-in admin session. "
-                    "Log in at /app/login. A bearer-token caller cannot mint a token."
+                    "A token needs a signed-in user to own it. This request has none. "
+                    "Sign in as an admin at /app/login, then create the token."
                 ),
             },
         )
@@ -172,7 +174,7 @@ async def create_user_endpoint(request: Request, body: CreateUserIn) -> dict[str
                 status_code=400,
                 detail={
                     "reason": "password_too_long",
-                    "hint": "The password must be at most 72 bytes. That is the bcrypt limit.",
+                    "hint": "The password is too long. Use 72 bytes or fewer.",
                 },
             ) from exc
     return {"ok": True}
@@ -234,7 +236,8 @@ async def reset_user_password_endpoint(request: Request, user_id: int) -> dict[s
     and tokens and retires the bootstrap sidecar). A logged-in admin session
     keeps working whether auth is on or off.
     """
-    if await current_user(request) is None:
+    caller = await current_user(request)
+    if caller is None:
         raise HTTPException(
             status_code=403,
             detail={
@@ -243,6 +246,20 @@ async def reset_user_password_endpoint(request: Request, user_id: int) -> dict[s
                     "Resetting a password requires a signed-in admin session. "
                     "Log in at /app/login. An anonymous or bearer-token caller "
                     "cannot reset a password."
+                ),
+            },
+        )
+    # A self-reset revokes the caller's own session, so the page that holds
+    # the new password is signed out before it can show it. On a fresh install
+    # that locked out the only admin (dogfood 2026-10-19, H1-D1).
+    if caller.id == user_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "reason": "cannot_reset_self",
+                "hint": (
+                    "You cannot reset your own password here. Open the account menu "
+                    "and select Change password."
                 ),
             },
         )

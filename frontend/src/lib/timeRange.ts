@@ -28,6 +28,56 @@ export function inRange(ts: string | undefined, range: string, custom?: CustomRa
   return t >= from && t <= to;
 }
 
+// An ISO time that names its zone: "Z" or an offset such as "+02:00".
+const ZONED = /(?:Z|[+-]\d\d:?\d\d)$/i;
+
+/**
+ * A custom-window bound as the server reads it: an ISO time with its zone.
+ *
+ * The picker gives a wall time in the browser zone ("2026-10-08T00:00"). The
+ * investigation reads sent it as UTC, and the alert reads sent it bare, which
+ * the server read in `so_timezone`. With the browser and the grid in two
+ * zones, one custom window counted alerts and investigations over two spans
+ * six hours apart (dogfood 2026-10-19, R1-D8). Every read now sends the UTC
+ * form of the browser's wall time. A bound that already names its zone, or
+ * one that does not parse, goes as it is: the server refuses a bad one.
+ */
+export function wireBound(value: string): string {
+  if (ZONED.test(value.trim())) return value;
+  const t = new Date(value).getTime();
+  return Number.isNaN(t) ? value : new Date(t).toISOString();
+}
+
+const PRESET = /^\d+[mhd]$/;
+
+/**
+ * The page window a URL names: `?range=7d`, or `?range=custom&from=…&to=…`.
+ * Anything else is `fallback`. A page that keeps its window in the URL opens
+ * on the same window after Back and from a link (R1-D22).
+ */
+export function windowFromSearch(
+  search: URLSearchParams | string,
+  fallback = '24h',
+): { range: string; custom: CustomRange | null } {
+  const p = typeof search === 'string' ? new URLSearchParams(search) : search;
+  const range = p.get('range') ?? '';
+  if (range === 'custom') {
+    const from = p.get('from') ?? '';
+    const to = p.get('to') ?? '';
+    if (from && to && !Number.isNaN(new Date(from).getTime()) && !Number.isNaN(new Date(to).getTime())) {
+      return { range, custom: { from, to } };
+    }
+    return { range: fallback, custom: null };
+  }
+  return { range: PRESET.test(range) ? range : fallback, custom: null };
+}
+
+/** The URL params of a page window: the inverse of `windowFromSearch`. */
+export function windowParams(range: string, custom: CustomRange | null): Record<string, string> {
+  if (range === 'custom' && custom) return { range, from: custom.from, to: custom.to };
+  return { range };
+}
+
 /** Convert the selected range to the hunts API's `since`/`until` ISO params.
  * Presets ("last 24h") send only `since` — the upper edge is implicitly "now",
  * and sending a client-clock `until` could exclude a row the server creates a
@@ -39,10 +89,7 @@ export function rangeToSinceUntil(
   now = Date.now(),
 ): { since: string; until?: string } {
   if (range === 'custom' && custom?.from && custom?.to) {
-    return {
-      since: new Date(custom.from).toISOString(),
-      until: new Date(custom.to).toISOString(),
-    };
+    return { since: wireBound(custom.from), until: wireBound(custom.to) };
   }
   const { from } = rangeBounds(range, custom, now);
   return { since: new Date(from).toISOString() };
@@ -64,10 +111,15 @@ export function rangeToSinceUntil(
 // A line that dates a record states the absolute time with its zone.
 // ---------------------------------------------------------------------------
 
-/** Relative age for a wire timestamp ("now", "8m ago", "4h ago", "3d ago").
+/** Relative age for a wire timestamp ("now", "8m ago", "4h ago", "3d ago",
+ * "2mo ago", "2y ago").
  *
  * Hours stop at 24: a day and more reads in days. "27h ago" sat beside "3d
- * ago" on one page and the reader had to convert one of them.
+ * ago" on one page and the reader had to convert one of them. Days stop at 60
+ * and months at 24, so a host header does not read "first seen 395d ago". The
+ * host header, the facts and the entity page read this rule too: they had a
+ * second one, and one instant read "30h ago" and "1d ago" (dogfood round 2,
+ * R4-D15). Every unit floors.
  *
  * A list or a KPI strip is scanned for "is this recent?", which a wall-clock
  * time answers only after the reader does the subtraction; the absolute time
@@ -83,7 +135,11 @@ export function ago(iso: string | number | null | undefined, now = Date.now()): 
   if (minutes < 60) return `${minutes}m ago`;
   const hours = Math.floor(minutes / 60);
   if (hours < 24) return `${hours}h ago`;
-  return `${Math.floor(hours / 24)}d ago`;
+  const days = ms / 86_400_000;
+  if (days < 60) return `${Math.floor(days)}d ago`;
+  const months = days / 30.44;
+  if (months < 24) return `${Math.floor(months)}mo ago`;
+  return `${Math.floor(days / 365.25)}y ago`;
 }
 
 /** An absolute time in the browser zone, with the zone named:

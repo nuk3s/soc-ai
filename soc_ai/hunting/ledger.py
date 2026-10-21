@@ -22,7 +22,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from soc_ai.store.models import EntityObservation, HuntSpecSweep, Lead, PriorSpecRun
 
-__all__ = ["Ledger", "analytic_ledger", "analytic_ledgers"]
+__all__ = ["HIT_SOURCES", "Ledger", "analytic_ledger", "analytic_ledgers"]
+
+# The observation sources an analytic writes a hit from. "candidate" is the
+# source the catalog sweep wrote before 1.5.0.
+HIT_SOURCES: tuple[str, ...] = ("catalog", "candidate", "profile", "model")
 
 
 @dataclass(frozen=True)
@@ -159,6 +163,24 @@ async def analytic_ledgers(
     ).all()
     by_prior_runs = {str(spec): int(n) for spec, n in prior_runs}
 
+    # The unread shadow hits at any age. One rule for every surface that
+    # counts them: the Needs-you strip, the bell, the hits list and this row
+    # (R3-D9). A window by first_seen_at read "1 unread" beside a strip that
+    # read 4.
+    unread = (
+        await db.execute(
+            select(EntityObservation.spec_id, func.count(EntityObservation.id))
+            .where(
+                EntityObservation.spec_id.in_(wanted),
+                EntityObservation.source.in_(HIT_SOURCES),
+                EntityObservation.shadow.is_(True),
+                EntityObservation.read_at.is_(None),
+            )
+            .group_by(EntityObservation.spec_id)
+        )
+    ).all()
+    by_unread = {str(spec): int(n) for spec, n in unread}
+
     # Coverage is the NEWEST prior run, not a sum over the window. The question
     # is how much of the estate this analytic can score now; a sum would keep
     # the number of a fortnight ago on a spec that has since gone blind.
@@ -209,7 +231,7 @@ async def analytic_ledgers(
             observations=len(observations),
             entities=len({(o.entity_kind, o.entity_key) for o in observations}),
             shadow_hits=sum(1 for o in observations if o.shadow),
-            unread_shadow_hits=sum(1 for o in observations if o.shadow and o.read_at is None),
+            unread_shadow_hits=by_unread.get(spec, 0),
             leads=len([i for i in attached if i in leads]),
             hunted=hunted,
             promoted=promoted,

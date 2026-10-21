@@ -83,6 +83,22 @@ describe('HuntDetail running line', () => {
     expect(screen.queryByText(/maps them to MITRE/)).toBeNull();
   });
 
+  // R3-D15: a running hunt wore two chips, "RUNNING" and "Running".
+  it('wears one status chip while it runs', async () => {
+    vi.mocked(getHunt).mockResolvedValue(running());
+    render(
+      <MemoryRouter initialEntries={['/hunts/H-9']}>
+        <Routes>
+          <Route path="/hunts/:id" element={<HuntDetail />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    await screen.findByTestId('hunt-running-line');
+    expect(screen.queryByTestId('hunt-disposition')).toBeNull();
+    // The status chip states it once. The flow strip names the step too.
+    expect(screen.getAllByTitle('The hunt is running now.')).toHaveLength(1);
+  });
+
   it('leaves out a part the server did not send', () => {
     // Negative control: an older server sends no estimate and no step word.
     expect(runningLine(running({ typicalRun: null, currentStep: null }))).toBe('Step 8');

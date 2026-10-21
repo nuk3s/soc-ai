@@ -53,6 +53,7 @@ from soc_ai.dossier.prompt import host_dossier_prompt_block, internal_ips_in_tex
 from soc_ai.hunting.outcome import FindingVerdicts
 from soc_ai.run_meter import start_search_meter
 from soc_ai.so_client.inventory import inventory_prompt_block
+from soc_ai.store import grid_gaps
 from soc_ai.store import hunts as hunt_svc
 from soc_ai.webui import hunt_findings
 
@@ -85,10 +86,15 @@ async def _build_hunt_run(
     # addresses to a cloud model in the clear.
     inventory = await inventory_prompt_block(ctx.elastic, ctx.settings)
     dossier = await _objective_dossier_block(ctx, objective, prior)
+    # The grid gaps of the last 30 days, one fact line each. A hunt over the
+    # range outage reported zero counts as facts (dogfood 2026-10-19, R3-D3).
+    gap_lines = await grid_gaps.recent_fact_lines(ctx.db_sessionmaker)
+    gaps = "\n" + "\n".join(gap_lines) + "\n" if gap_lines else ""
     system_prompt = (
         HUNT_SYSTEM_PROMPT.format(objective=objective)
         + oql_primer_block(flavor="hunt")
         + inventory
+        + gaps
         + dossier
     )
     user_msg = build_hunt_prompt(objective, prior=prior)
@@ -502,15 +508,15 @@ async def run_hunt(  # noqa: PLR0915 - one linear streaming flow, like the triag
 
 
 _PARTIAL_HUMILITY_NOTE = (
-    "budget/timeout-partial: the hunt stopped early and did not corroborate this "
-    "finding. Corroborate it before you act."
+    "partial report: the hunt stopped at its budget or its time limit. It did not "
+    "corroborate this finding. Corroborate it before you act."
 )
 
 _GRID_OUTAGE_NOTE = (
-    "grid unavailable: every grid query in this hunt failed, so the hunt checked "
-    "nothing and ruled out nothing"
+    "grid unavailable: every grid query in this hunt failed. The hunt checked "
+    "nothing and ruled out nothing."
 )
-_GRID_OUTAGE_TITLE = "Grid unavailable. This hunt could not look"
+_GRID_OUTAGE_TITLE = "Grid unavailable. The hunt read nothing"
 
 # The two evidence-count reasons beside the transport outage. Persisted on the
 # ``done`` event's ``degraded_reason``, so they are vocabulary, not prose: the
@@ -522,16 +528,16 @@ QUERIES_REJECTED_REASON = "grid_queries_rejected"
 NO_GRID_READS_REASON = "no_grid_reads"
 
 _QUERIES_REJECTED_NOTE = (
-    "every grid query rejected: the grid answered and rejected each query this "
-    "hunt wrote as invalid, so the hunt checked nothing and ruled out nothing"
+    "every grid query rejected: the grid answered and rejected each query of this "
+    "hunt as invalid. The hunt checked nothing and ruled out nothing."
 )
-_QUERIES_REJECTED_TITLE = "Every query rejected. This hunt could not look"
+_QUERIES_REJECTED_TITLE = "The grid rejected every query. The hunt read nothing"
 
 _NO_GRID_READS_NOTE = (
-    "no grid reads: this hunt never ran a successful grid query, so it checked "
-    "nothing and ruled out nothing"
+    "no grid reads: this hunt ran no successful grid query. It checked nothing "
+    "and ruled out nothing."
 )
-_NO_GRID_READS_TITLE = "No grid reads. This hunt never looked"
+_NO_GRID_READS_TITLE = "No grid reads. The hunt read nothing"
 
 
 def _grid_tool_outcomes(tool_results: list[Any]) -> tuple[int, int, int]:
@@ -647,17 +653,16 @@ def _mark_grid_outage(report: Any, failures: int) -> Any:
         report,
         title=_GRID_OUTAGE_TITLE,
         detail=(
-            f"All {failures} Security Onion queries this hunt ran failed and none "
-            "succeeded, so the objective was neither confirmed nor ruled out. This "
-            "report is no evidence that the network is quiet. It shows that the hunt "
-            "could not read the grid. Run the hunt again when the grid is reachable."
+            f"All {failures} Security Onion queries of this hunt failed. The hunt did "
+            "not confirm the objective and did not rule it out. Do not read this "
+            "report as proof of a quiet network. Run the hunt again when the grid is "
+            "reachable."
         ),
         note=_GRID_OUTAGE_NOTE,
         banner=(
-            "**Grid unavailable. This hunt could not read the network.** "
-            f"All {failures} grid queries failed and none succeeded, so nothing below "
-            "rules anything out. The write-up that follows was produced without grid "
-            "data."
+            "**Grid unavailable. The hunt could not read the network.** "
+            f"All {failures} grid queries failed. Nothing below rules anything out. "
+            "The model wrote the text below without grid data."
         ),
     )
 
@@ -673,20 +678,18 @@ def _mark_queries_rejected(report: Any, rejections: int) -> Any:
         report,
         title=_QUERIES_REJECTED_TITLE,
         detail=(
-            f"The grid rejected all {rejections} Security Onion queries this hunt ran "
-            "as invalid, and none succeeded. The query or its arguments were bad. The "
-            "grid was reachable, but every question this hunt asked it was malformed, "
-            "so the objective was neither confirmed nor ruled out. This report is no "
-            "evidence that the network is quiet. It shows that the hunt read nothing. "
-            "Run the hunt again. When the grid rejects every query again, the queries "
-            "the model writes no longer match this grid."
+            f"The grid rejected all {rejections} Security Onion queries of this hunt "
+            "as invalid. The grid was reachable. The queries or their arguments were "
+            "bad. The hunt did not confirm the objective and did not rule it out. Do "
+            "not read this report as proof of a quiet network. Run the hunt again. If "
+            "the grid rejects every query again, the queries that the model writes do "
+            "not match this grid."
         ),
         note=_QUERIES_REJECTED_NOTE,
         banner=(
-            "**The grid rejected every query. This hunt read nothing.** "
-            f"All {rejections} queries were rejected as invalid and none succeeded, so "
-            "nothing below rules anything out. The write-up that follows was produced "
-            "without grid data."
+            "**The grid rejected every query. The hunt read nothing.** "
+            f"The grid rejected all {rejections} queries as invalid. Nothing below "
+            "rules anything out. The model wrote the text below without grid data."
         ),
     )
 
@@ -702,16 +705,16 @@ def _mark_no_grid_reads(report: Any) -> Any:
         report,
         title=_NO_GRID_READS_TITLE,
         detail=(
-            "This hunt produced its report without running a single Security Onion "
-            "query, so the objective was neither confirmed nor ruled out against the "
-            "network's actual telemetry. This report is no evidence that the network "
-            "is quiet. It shows that the hunt looked at nothing. Run the hunt again."
+            "The hunt wrote its report without a Security Onion query. It did not "
+            "confirm the objective against the network telemetry and did not rule it "
+            "out. Do not read this report as proof of a quiet network. Run the hunt "
+            "again."
         ),
         note=_NO_GRID_READS_NOTE,
         banner=(
-            "**No grid reads. This hunt never queried the network.** "
-            "Not one grid query ran, so nothing below rules anything out. The "
-            "write-up that follows was produced without grid data."
+            "**No grid reads. The hunt did not query the network.** "
+            "No grid query ran. Nothing below rules anything out. The model wrote "
+            "the text below without grid data."
         ),
     )
 

@@ -10,7 +10,9 @@ Two budgets, both declared on the spec and both off by default:
 
 - ``fire_budget_per_day``: the hits the analytic may write in 24 hours. A hit
   is an observation the analytic wrote or refreshed live in the window, the
-  unit the Analytic hits section counts.
+  unit the Analytic hits section counts. A hit whose event window lies inside
+  a grid gap does not count: the grid held no data then, and the hit says
+  more about the grid than about the analytic.
 - ``precision_floor``: the share of its hunted leads over 30 days that reached
   a promoted finding or an investigation. The other side of the share is the
   leads a hunt closed clean. A lead an analyst dismissed counts on neither
@@ -33,6 +35,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -44,6 +47,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from soc_ai.hunting.catalog_tiers import Catalog, effective_catalog
 from soc_ai.hunting.spec import HuntSpec
 from soc_ai.store import analytics as analytics_store
+from soc_ai.store import grid_gaps as gap_store
 from soc_ai.store.leads import HUNT_CLEAN_REASON
 from soc_ai.store.models import EntityObservation, Hunt, Investigation, Lead
 
@@ -58,6 +62,7 @@ __all__ = [
     "LeadOutcomes",
     "SelfHealResult",
     "count_hits",
+    "event_window",
     "find_breaches",
     "lead_outcomes",
     "run_self_heal",
@@ -148,18 +153,92 @@ def _window_start(now: datetime, width: timedelta, live_since: datetime | None) 
 
 
 async def count_hits(
-    db: AsyncSession, analytic_id: str, *, since: datetime, until: datetime
+    db: AsyncSession,
+    analytic_id: str,
+    *,
+    since: datetime,
+    until: datetime,
+    gaps: Sequence[gap_store.GapWindow] = (),
 ) -> int:
-    """The live observations one analytic wrote or refreshed in the window."""
-    found = await db.scalar(
-        select(func.count(EntityObservation.id)).where(
-            EntityObservation.spec_id == analytic_id,
-            EntityObservation.shadow.is_(False),
-            EntityObservation.born_at >= _naive(since),
-            EntityObservation.born_at <= _naive(until),
-        )
+    """The live observations one analytic wrote or refreshed in the window.
+
+    A hit whose event window lies inside one of the ``gaps`` does not count.
+    """
+    where = (
+        EntityObservation.spec_id == analytic_id,
+        EntityObservation.shadow.is_(False),
+        EntityObservation.born_at >= _naive(since),
+        EntityObservation.born_at <= _naive(until),
     )
-    return int(found or 0)
+    if not gaps:
+        found = await db.scalar(select(func.count(EntityObservation.id)).where(*where))
+        return int(found or 0)
+    rows = (
+        await db.execute(
+            select(EntityObservation.observed_at, EntityObservation.evidence_json).where(*where)
+        )
+    ).all()
+    return sum(1 for observed_at, evidence in rows if not _in_gap(observed_at, evidence, gaps))
+
+
+def _moment(raw: Any) -> datetime | None:
+    if isinstance(raw, datetime):
+        return raw if raw.tzinfo is not None else raw.replace(tzinfo=UTC)
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        at = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return at if at.tzinfo is not None else at.replace(tzinfo=UTC)
+
+
+# The window of the query a departure wrote: @timestamp:["<start>" TO "<end>"].
+_QUERY_WINDOW = re.compile(r'@timestamp:\["([^"]+)" TO "([^"]+)"\]')
+
+# The dimensions whose query names the hours that departed. The query of any
+# other dimension names the whole read window, which is no event time.
+_QUERY_NAMES_THE_RUN = frozenset({"connection_rate"})
+
+
+def event_window(
+    observed_at: Any, evidence: Any, rerun_query: str | None = None
+) -> tuple[datetime, datetime] | None:
+    """The hours the documents of one hit cover, as far as the row says.
+
+    A rate departure stores its run in ``evidence.window``. A learned
+    detector stores its silence in the features of its baseline block. A rate
+    departure written before ``evidence.window`` existed names its run in the
+    query that shows it again, when the caller passes ``rerun_query``. Any
+    other hit is the moment of its newest document. None when the row names
+    no time at all.
+    """
+    if isinstance(evidence, dict):
+        window = evidence.get("window")
+        if isinstance(window, dict):
+            start, end = _moment(window.get("start")), _moment(window.get("end"))
+            if start is not None and end is not None:
+                return start, end
+        baseline = evidence.get("baseline")
+        features = baseline.get("features") if isinstance(baseline, dict) else None
+        if isinstance(features, dict):
+            start = _moment(features.get("silent_from"))
+            end = _moment(features.get("silent_until"))
+            if start is not None and end is not None:
+                return start, end
+        dimension = baseline.get("dimension") if isinstance(baseline, dict) else None
+        found = _QUERY_WINDOW.search(rerun_query or "")
+        if dimension in _QUERY_NAMES_THE_RUN and found is not None:
+            start, end = _moment(found.group(1)), _moment(found.group(2))
+            if start is not None and end is not None:
+                return start, end
+    at = _moment(observed_at)
+    return (at, at) if at is not None else None
+
+
+def _in_gap(observed_at: Any, evidence: Any, gaps: Sequence[gap_store.GapWindow]) -> bool:
+    span = event_window(observed_at, evidence)
+    return span is not None and any(w.holds_span(*span) for w in gaps)
 
 
 async def lead_outcomes(
@@ -300,19 +379,30 @@ def _live_with_a_budget(catalog: Catalog) -> list[tuple[str, HuntSpec]]:
 
 
 async def find_breaches(
-    db: AsyncSession, catalog: Catalog, *, now: datetime
+    db: AsyncSession,
+    catalog: Catalog,
+    *,
+    now: datetime,
+    settle: timedelta = timedelta(minutes=gap_store.DEFAULT_SETTLE_MINUTES),
 ) -> tuple[list[Demotion], list[str], dict[str, str]]:
     """The demotions the store calls for now. Reads only.
 
     Returns the demotions, the ids it checked, and the breaches it does not act
     on with the reason. A breach whose window already holds a system demotion
     of the same analytic is one of those: the hold was written once.
+
+    ``settle`` is the margin after a grid gap. A hit inside a gap or its
+    margin does not count toward the daily hit limit.
     """
     now = _naive(now)
     candidates = _live_with_a_budget(catalog)
     ids: Sequence[str] = [analytic_id for analytic_id, _spec in candidates]
     if not ids:
         return [], [], {}
+    # The hits of the window describe events up to a day or so older than the
+    # write, so the gaps are read three days back.
+    gap_rows = await gap_store.overlapping(db, since=now - timedelta(days=3), until=now)
+    gaps = gap_store.windows_of(gap_rows, settle=settle, now=now)
     live_since = await analytics_store.latest_live_at(db, ids)
     demoted_at = {
         analytic_id: row.at
@@ -327,7 +417,7 @@ async def find_breaches(
         starts: list[datetime] = []
         if spec.fire_budget_per_day is not None:
             start = _window_start(now, FIRE_WINDOW, since)
-            hits = await count_hits(db, analytic_id, since=start, until=now)
+            hits = await count_hits(db, analytic_id, since=start, until=now, gaps=gaps)
             found = _fire_breach(hits, spec.fire_budget_per_day, start=start, now=now)
             if found is not None:
                 breaches.append(found)
@@ -354,7 +444,11 @@ async def find_breaches(
 
 
 async def run_self_heal(
-    db: AsyncSession, *, now: datetime | None = None, catalog: Catalog | None = None
+    db: AsyncSession,
+    *,
+    now: datetime | None = None,
+    catalog: Catalog | None = None,
+    settle: timedelta = timedelta(minutes=gap_store.DEFAULT_SETTLE_MINUTES),
 ) -> SelfHealResult:
     """Check every live analytic that declares a budget, and demote each one in breach.
 
@@ -363,7 +457,7 @@ async def run_self_heal(
     """
     at = _naive(now or datetime.now(UTC))
     cat = catalog if catalog is not None else await effective_catalog(db)
-    demotions, checked, skipped = await find_breaches(db, cat, now=at)
+    demotions, checked, skipped = await find_breaches(db, cat, now=at, settle=settle)
     result = SelfHealResult(checked=checked, skipped=skipped)
     for demotion in demotions:
         try:

@@ -1760,13 +1760,14 @@ def test_row_status_is_honest() -> None:
 
 def test_config_surfaces_events_index_pattern(client: TestClient) -> None:
     """GET /config exposes the newly-surfaced events_index_pattern (inc 1) with
-    source=env (no override yet), hot apply, and its env value."""
+    source=default (no override, and the fixture does not set it), hot apply,
+    and its value."""
     resp = client.get("/api/v1/config")
     assert resp.status_code == 200
     items = {item["key"]: item for group in resp.json()["groups"] for item in group["items"]}
     assert "events_index_pattern" in items, "events_index_pattern not surfaced in /config"
     spec = items["events_index_pattern"]
-    assert spec["source"] == "env"
+    assert spec["source"] == "default"
     assert spec["apply"] == "hot-apply"
     assert spec["type"] == "text"
     assert spec["value"]  # the env/default value is rendered, not blank
@@ -1960,13 +1961,36 @@ def test_egress_policy_analyst_redaction_posture_is_honest(settings_kratos: Sett
     for client in _egress_client(best_effort):
         d = _egress_dest(client, "analyst_cloud")
         assert d["enabled"] is True
-        assert "best-effort" in d["redaction"]
+        assert d["redaction"] == (
+            "pseudonymized. An identifier that the redaction misses still goes out."
+        )
 
     fail_closed = settings_kratos.model_copy(
         update={"analyst_cloud_redaction": True, "analyst_redaction_fail_closed": True}
     )
     for client in _egress_client(fail_closed):
-        assert _egress_dest(client, "analyst_cloud")["redaction"] == "sanitized + fail-closed"
+        assert _egress_dest(client, "analyst_cloud")["redaction"] == (
+            "pseudonymized. soc-ai blocks a payload that still holds an internal identifier."
+        )
+
+
+def test_egress_policy_rows_name_settings_by_label(settings_kratos: Settings) -> None:
+    """R5 STE items 34 and 35 (dogfood 2026-10-19): the rows read as sentences,
+    and a row names a setting by its console label in its section."""
+    for client in _egress_client(settings_kratos):
+        body = client.get("/api/v1/config/egress-policy").json()
+        by_id = {d["id"]: d for d in body["destinations"]}
+        analyst = by_id["analyst_cloud"]
+        assert analyst["label"] == "Investigation model"
+        assert "analyst_cloud_redaction" not in analyst["redaction"]
+        assert "Redact internal identifiers for a cloud model" in analyst["redaction"]
+        assert "Settings > Agent" in analyst["redaction"]
+        assert "+" not in by_id["oracle"]["redaction"]
+        rag = by_id["rag_gateway"]["detail"]
+        assert "unset and unset" not in rag
+        assert "FTS5" not in rag
+        assert "The embeddings model is not set." in rag
+        assert "Settings > About" in by_id["update_check"]["detail"]
 
 
 def test_egress_policy_counts_null_when_audit_errors(settings_kratos: Settings) -> None:
@@ -2214,7 +2238,9 @@ def test_auto_triage_nothing_to_hunt(client: TestClient) -> None:
     with patch("soc_ai.api.webui_api.at.plan_targets", AsyncMock(return_value=([], 0, []))):
         s = client.post("/api/v1/auto-triage", json={}).json()
     assert s["active"] is False
-    assert s["note"] == "nothing to hunt"
+    # The console prefixes the window: "Last 24 hours: no alert to investigate".
+    # "nothing to hunt" named a hunt for an investigation run (R1 STE 12).
+    assert s["note"] == "no alert to investigate"
 
 
 def test_auto_triage_selected_routes_to_ids(client: TestClient) -> None:
@@ -2630,7 +2656,7 @@ def test_build_actions_explains_pending_ack_after_auto_ack_skip() -> None:
     high_stakes = SimpleNamespace(kind="auto_ack_skipped", payload={"reason": "high_stakes"})
     a = _build_actions([high_stakes], report)[0]
     assert a.applied is False
-    assert a.pendingNote is not None and "require a human" in a.pendingNote
+    assert a.pendingNote is not None and "acknowledges a high or critical alert" in a.pendingNote
 
     below = SimpleNamespace(
         kind="auto_ack_skipped",
@@ -3879,10 +3905,14 @@ def test_ack_group_passes_hide_acked_true(client: TestClient) -> None:
             json={"rule_name": "ET MALWARE X", "range": "24h"},
         )
     assert resp.status_code == 200
-    _, kwargs = mock_fetch.call_args
+    # The write scan reads with hide_acked=True. An empty first scan then reads
+    # the group once more with hide_acked=False, to count what the grid hid as
+    # already handled (R2-D15).
+    _, kwargs = mock_fetch.call_args_list[0]
     assert kwargs.get("hide_acked") is True, (
         "ack_group must pass hide_acked=True to fetch_group_events"
     )
+    assert mock_fetch.call_args_list[-1].kwargs.get("hide_acked") is False
 
 
 def test_escalate_group_calls_write_tool_per_event(client: TestClient) -> None:
@@ -4982,8 +5012,9 @@ def test_reset_password_returns_password(admin_session_client: TestClient) -> No
     assert resp.status_code == 403
     assert resp.json()["detail"]["reason"] == "no_session_user"
 
-    # A real session user resets and receives the fresh password once.
-    login = client.post("/api/v1/login", json={"username": "eve", "password": "longpassword1"})
+    # A real session user resets another account and receives the fresh
+    # password once. The admin resets eve: a self-reset is refused.
+    login = client.post("/api/v1/login", json={"username": "admin", "password": ADMIN_PW_USERS})
     assert login.status_code == 200, login.text
     resp = client.post(
         f"/api/v1/config/users/{uid}/reset-password",
@@ -5088,7 +5119,8 @@ class TestDangerZoneGet:
             assert "password123" not in r.text, "Raw secret value leaked into response body"
             for row in r.json():
                 if row.get("type") == "secret":
-                    # Structural guarantee: DangerSettingOut has no value field.
+                    # Structural guarantee: a secret row has no value field. A
+                    # non-secret row carries its value (dogfood 2026-10-19, H1-D15).
                     assert "value" not in row, f"Secret value leaked for {row['key']}"
 
     def test_get_danger_row_shape(self, settings_kratos: Settings) -> None:
@@ -5474,7 +5506,18 @@ class TestApiKeys:
             # enrichment-provider siblings, not a Danger-Zone typed-confirm field.
             assert {"shodan_api_key", "greynoise_api_key", "misp_api_key", "crawl4ai_token"} <= keys
             for row in rows:
-                assert set(row) == {"key", "label", "help", "isSet", "source"}
+                assert set(row) == {
+                    "key",
+                    "label",
+                    "help",
+                    "isSet",
+                    "source",
+                    "can_store",
+                    "store_hint",
+                }
+                # The server holds CONFIG_SECRET_KEY here: Set can store a key.
+                assert row["can_store"] is True
+                assert row["store_hint"] is None
 
     def test_save_hot_applies_and_encrypts(self, settings: Settings) -> None:
         import asyncio
@@ -5564,6 +5607,16 @@ class TestApiKeys:
             assert r.status_code == 400
             assert r.json()["detail"]["reason"] == "no_config_secret_key"
             assert "supersecret" not in r.text
+            # Dogfood round 2 (V2-4): the panel offered Set and a Save that
+            # could not work. GET now says so before the operator types a key.
+            hint = (
+                "Set CONFIG_SECRET_KEY on the server and restart soc-ai. "
+                "soc-ai then stores the API keys encrypted."
+            )
+            assert r.json()["detail"]["hint"] == hint
+            rows = c.get("/api/v1/config/api-keys").json()
+            assert rows and all(row["can_store"] is False for row in rows)
+            assert all(row["store_hint"] == hint for row in rows)
 
     def test_whitespace_only_env_key_reported_unset(self, settings: Settings) -> None:
         """F63: a whitespace-only env-sourced key (shodan_api_key has no
@@ -6932,7 +6985,7 @@ def test_timeline_reads_a_hunt_subject_as_a_hunt_subject() -> None:
         ),
     ]
     alert_steps = {s.id: s for s in _build_timeline(alert_events)[0]}
-    assert alert_steps["e1"].title == "Loaded alert context + enrichments"
+    assert alert_steps["e1"].title == "soc-ai loaded the alert and its enrichments"
     assert alert_steps["e2"].title == "No pattern matched: a full investigation ran"
 
 
@@ -7541,7 +7594,7 @@ def test_the_bell_says_a_stopped_hunt_could_not_run(client: TestClient) -> None:
     assert errored["tone"] == "warn"
     running = by_id[f"hunt:{running_id}"]
     assert running["outcome"] == "running"
-    assert running["title"] == "Hunt running: find tunnels"
+    assert running["title"] == "Hunt: find tunnels"
     assert running["tone"] == "accent"
 
 
@@ -7620,7 +7673,7 @@ def test_the_bell_carries_unread_shadow_hits_and_new_leads(client: TestClient) -
     assert lead["href"].startswith("/leads/")
     # The bell names the kinds in the analyst's words. "prior no baseline" is
     # a column name with the underscores removed, and it is not English.
-    assert "finding with no benign baseline" in lead["title"]
+    assert "no benign baseline" in lead["title"]
     assert "prior" not in lead["title"]
     # Both belong to the same section of the Notifications screen.
     assert hit["group"] == "hunting" and lead["group"] == "hunting"

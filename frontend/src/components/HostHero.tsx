@@ -254,11 +254,13 @@ function MachineHero({
 
         <div data-testid="hero-facts" className="mt-2.5 flex flex-wrap gap-x-5 gap-y-1 font-mono text-[11px] text-faint">
           <span data-testid="hero-events" title="Events on every address of this machine. The sweep counts them. The 24h and 7d buttons do not change this count.">
-            {machine.events.toLocaleString()} events in the {sweepWindowWords(dossier.lookback_days)}
+            {machine.events.toLocaleString()} events in the {sweepWindowWords(dossier.lookback_days, dossier.last_built_at)}
           </span>
           <span title={absTime(machine.first_seen)}>first seen {relativeAge(machine.first_seen)}</span>
+          {/* The label names its source. The host page and the entity page
+              each said "last seen" for two sources (dogfood round 2, V2-7). */}
           <span data-testid="hero-last-seen" title={absTime(lastSeen)}>
-            last seen {relativeAge(lastSeen)}
+            last grid event {relativeAge(lastSeen)}
           </span>
           {dossier.last_built_at ? (
             <span title={absTime(dossier.last_built_at)}>swept {relativeAge(dossier.last_built_at)}</span>
@@ -383,7 +385,7 @@ function AddressHero({ dossier, adminBlocked, lastActivity, situation = [] }: Ho
                   provenanceChip('hostlog'),
                 )}
               >
-                agent on box
+                agent on machine
               </span>
             ) : (
               <span
@@ -421,11 +423,11 @@ function AddressHero({ dossier, adminBlocked, lastActivity, situation = [] }: Ho
             data-testid="hero-events"
             title="Events the sweep has aggregated for this host. The 24h and 7d buttons do not change this count."
           >
-            {dossier.event_count.toLocaleString()} events in the {sweepWindowWords(dossier.lookback_days)}
+            {dossier.event_count.toLocaleString()} events in the {sweepWindowWords(dossier.lookback_days, dossier.last_built_at)}
           </span>
           <span title={absTime(dossier.first_seen)}>first seen {relativeAge(dossier.first_seen)}</span>
           <span data-testid="hero-last-seen" title={absTime(lastSeen)}>
-            last seen {relativeAge(lastSeen)}
+            last grid event {relativeAge(lastSeen)}
           </span>
           {dossier.last_built_at ? (
             <span title={absTime(dossier.last_built_at)}>

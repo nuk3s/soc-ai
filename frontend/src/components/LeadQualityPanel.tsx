@@ -167,9 +167,18 @@ export function LeadQualityPanel() {
                 </table>
               )}
               {data.by_types.length > 0 && (
+                <>
+                {/* The table counts the whole window and has no week column,
+                    so it states the window in words (R3-D15). */}
+                <div
+                  data-testid="lead-quality-types-window"
+                  className="border-t border-border px-[15px] pt-2 text-[11.5px] text-dim"
+                >
+                  {`By type: the leads that formed in the ${WEEKS} weeks above.`}
+                </div>
                 <table
                   data-testid="lead-quality-types"
-                  className="w-full table-auto border-t border-border text-left"
+                  className="w-full table-auto text-left"
                 >
                   <thead>
                     <tr>
@@ -206,6 +215,7 @@ export function LeadQualityPanel() {
                     ))}
                   </tbody>
                 </table>
+                </>
               )}
             </>
           )}

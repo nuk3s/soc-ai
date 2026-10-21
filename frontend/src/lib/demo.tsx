@@ -51,7 +51,7 @@ export function useDemo(): boolean {
  *  of firing a doomed write and surfacing a raw error. Reused verbatim by every
  *  guarded handler (ack/escalate/assign, config save, action/override). */
 export const DEMO_ACTION_NOTE =
-  'Not available in the read-only demo. In a live deployment this action runs for real.';
+  'The read-only demo blocks this action. A live deployment runs it.';
 
 /** The single demo-guard decision, shared so a handler can't drift: returns the
  *  note to show (and the caller must return WITHOUT its network write) when this

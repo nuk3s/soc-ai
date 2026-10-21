@@ -2,7 +2,7 @@ import { AtSign, Bell, BookOpen, ChevronsLeft, Crosshair, Globe, History, Info, 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { getAlerts, getConfig, getInvestigations, listMachines, searchEntityIndex, signOut } from '../lib/api';
+import { getAlerts, getConfig, getHealth, getInvestigations, listMachines, searchEntityIndex, signOut } from '../lib/api';
 import { buildConfigLayout, keyToSectionId } from '../lib/configLayout';
 import type { ConfigParent } from '../lib/configLayout';
 import { machineHref } from '../lib/hostsList';
@@ -18,6 +18,8 @@ import type { AlertGroup, EntitySearchHit, InvestigationRow, MachineRow } from '
 import { isSignedOut, useSession } from './Session';
 import { useShell } from './ShellContext';
 import { GUIDE_URL } from './pages';
+import { returnFocusTarget } from './platform';
+import { upstreamState } from './upstream';
 
 interface Command {
   group:
@@ -108,6 +110,35 @@ function searchSettings(q: string, layout: ConfigParent[] | null): SettingHit[] 
   return tiers.flat().slice(0, SETTINGS_CAP);
 }
 
+/** The sweep the palette starts. Alerts runs it with the header sweep window
+ *  and its default floor, "High and up", which also takes the alerts that
+ *  carry no severity (lib/api.ts severitiesAtOrAbove). */
+const SWEEP_RANGE = '24h';
+const SWEEP_SEVERITIES = new Set(['critical', 'high', 'unknown']);
+
+/** What the confirm step knows before the analyst starts the sweep. */
+interface BulkCheck {
+  /** Untriaged alert groups in the sweep band, or null while unknown. */
+  groups: number | null;
+  /** The count read failed. */
+  countFailed: boolean;
+  /** Why the sweep cannot run now, one sentence each. */
+  blocked: string[];
+  checking: boolean;
+}
+
+/** Why the confirm offers no Investigate when the count is zero. */
+const BULK_NOTHING = 'No alert group of these severities waits for a verdict.';
+
+/** The count line of the confirm step. */
+function bulkCountLine(check: BulkCheck): string {
+  if (check.groups !== null) {
+    const n = check.groups;
+    return `${n.toLocaleString()} alert group${n === 1 ? '' : 's'} of these severities ${n === 1 ? 'has' : 'have'} no verdict.`;
+  }
+  return check.countFailed ? 'soc-ai could not count the alert groups.' : 'Counting the alert groups.';
+}
+
 // Focusable descendants for the Tab focus-trap while the palette is open.
 const FOCUSABLE =
   'a[href],button:not([disabled]),textarea:not([disabled]),input:not([disabled]),select:not([disabled]),[tabindex]:not([tabindex="-1"])';
@@ -132,6 +163,12 @@ export function CommandPalette() {
   const [idx, setIdx] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
+  // The confirm step of the bulk sweep. The entry started a sweep at once,
+  // with no word on the window, the severities or the model cost (dogfood
+  // 2026-10-19, R1-D14).
+  const [bulk, setBulk] = useState<BulkCheck | null>(null);
+  const confirmRef = useRef<HTMLButtonElement>(null);
+  const cancelRef = useRef<HTMLButtonElement>(null);
 
   const commands = useMemo<Command[]>(() => {
     const go = (to: string) => () => {
@@ -155,17 +192,11 @@ export function CommandPalette() {
       { group: 'Go to', label: 'About soc-ai', icon: <Info size={15} />, run: go('/config#about') },
       {
         group: 'Action',
-        label: 'Bulk investigate all untriaged',
+        label: 'Investigate untriaged alerts of the last 24 hours',
+        detail: 'The Bulk Investigate sweep of the Alerts page',
         icon: <Zap size={15} />,
-        // Carry the intent in the navigation STATE, not a shell nonce: Alerts is
-        // code-split, so from another screen it mounts AFTER this click commits —
-        // a nonce bumped pre-mount is seeded away and never seen, and the batch
-        // silently never starts. Alerts consumes-and-clears location.state on the
-        // arriving navigation (and on a repeat while already there).
-        run: () => {
-          closePalette();
-          navigate('/alerts', { state: { autoTriage: true } });
-        },
+        // The entry opens a confirm step. The sweep starts from its button.
+        run: () => setBulk({ groups: null, countFailed: false, blocked: [], checking: true }),
       },
       {
         group: 'Help',
@@ -279,7 +310,12 @@ export function CommandPalette() {
   const filtered = useMemo(() => {
     const query = q.toLowerCase();
     const base = query
-      ? commands.filter((c) => c.label.toLowerCase().includes(query) || c.group.toLowerCase().includes(query))
+      ? commands.filter(
+          (c) =>
+            c.label.toLowerCase().includes(query) ||
+            c.group.toLowerCase().includes(query) ||
+            (c.detail ?? '').toLowerCase().includes(query),
+        )
       : commands;
     // IP → host page is the analyst's primary pivot, so host hits sit ahead of
     // investigation/alert entity hits.
@@ -337,6 +373,7 @@ export function CommandPalette() {
     if (!paletteOpen) return;
     setQ('');
     setIdx(0);
+    setBulk(null);
     getInvestigations().then(setInvs).catch(() => {});
     getAlerts({ range: '7d' }).then((q) => setGroups(q.groups)).catch(() => {});
     if (!configRequested.current) {
@@ -352,9 +389,65 @@ export function CommandPalette() {
     return () => {
       clearTimeout(t);
       popModal();
-      opener?.focus?.();
+      // A palette opened from the keyboard with nothing focused gave the
+      // focus back to BODY (dogfood 2026-10-19, H1-D19). The trigger takes it.
+      returnFocusTarget(opener)?.focus?.();
     };
   }, [paletteOpen, pushModal, popModal]);
+
+  // The confirm step reads what it states: the untriaged groups in the sweep
+  // band, and whether the grid and the model gateway answer.
+  const bulkOpen = bulk !== null;
+  useEffect(() => {
+    if (!bulkOpen) return;
+    let alive = true;
+    Promise.allSettled([getAlerts({ range: SWEEP_RANGE }), getHealth()]).then(([alerts, health]) => {
+      if (!alive) return;
+      const rows = alerts.status === 'fulfilled' ? alerts.value?.groups : undefined;
+      const groups = Array.isArray(rows)
+        ? rows.filter((g) => SWEEP_SEVERITIES.has(g.sev) && g.verdict === 'untriaged' && !g.triaging).length
+        : null;
+      // An unread health answer blocks nothing. The sweep reports its own
+      // failure on Alerts.
+      const h = health.status === 'fulfilled' ? health.value : null;
+      const blocked: string[] = [];
+      if (h?.es && upstreamState(h.es) === 'down') {
+        blocked.push('The grid does not answer. The sweep cannot read the alerts.');
+      }
+      if (h?.llm && upstreamState(h.llm) === 'down') {
+        blocked.push('The model gateway does not answer. The investigations cannot run.');
+      }
+      setBulk({ groups, countFailed: groups === null, blocked, checking: false });
+    });
+    return () => {
+      alive = false;
+    };
+  }, [bulkOpen]);
+  // The focus goes to the button that acts, or to Cancel when the sweep
+  // cannot run. A sweep with no group to investigate starts nothing, so its
+  // button is off too. At 0 groups the button stayed on and took the focus
+  // (dogfood 2026-10-19, V1-S3).
+  const bulkBlocked = (bulk?.blocked.length ?? 0) > 0;
+  const bulkChecking = bulk?.checking ?? false;
+  const bulkEmpty = bulk?.groups === 0;
+  useEffect(() => {
+    if (!bulkOpen) return;
+    (bulkBlocked || bulkChecking || bulkEmpty ? cancelRef : confirmRef).current?.focus();
+  }, [bulkOpen, bulkBlocked, bulkChecking, bulkEmpty]);
+  const startBulk = () => {
+    setBulk(null);
+    closePalette();
+    // Carry the intent in the navigation STATE, not a shell nonce: Alerts is
+    // code-split, so from another screen it mounts AFTER this click commits —
+    // a nonce bumped pre-mount is seeded away and never seen, and the batch
+    // silently never starts. Alerts consumes-and-clears location.state on the
+    // arriving navigation (and on a repeat while already there).
+    navigate('/alerts', { state: { autoTriage: true } });
+  };
+  const cancelBulk = () => {
+    setBulk(null);
+    window.setTimeout(() => inputRef.current?.focus(), 0);
+  };
 
   // global keyboard: ⌘K/Ctrl-K toggle, `/` open, arrows + enter when open
   useEffect(() => {
@@ -382,6 +475,9 @@ export function CommandPalette() {
             e.preventDefault();
             first.focus();
           }
+        } else if (bulkOpen) {
+          // The confirm step has its own buttons. The list keys do nothing.
+          return;
         } else if (e.key === 'ArrowDown') {
           e.preventDefault();
           setIdx((i) => {
@@ -409,7 +505,7 @@ export function CommandPalette() {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [paletteOpen, filtered, idx, togglePalette, openPalette, closePalette]);
+  }, [paletteOpen, filtered, idx, togglePalette, openPalette, closePalette, bulkOpen]);
 
   if (!paletteOpen) return null;
 
@@ -421,9 +517,55 @@ export function CommandPalette() {
         role="dialog"
         aria-modal="true"
         aria-label="Command palette"
-        className="fixed left-1/2 top-[84px] z-[61] -translate-x-1/2 animate-fadeUp overflow-hidden rounded-panel-lg border border-border-input bg-surface-card shadow-palette"
+        className="fixed left-1/2 top-[84px] z-[61] flex max-h-[calc(100vh-100px)] -translate-x-1/2 animate-fadeUp flex-col overflow-hidden rounded-panel-lg border border-border-input bg-surface-card shadow-palette"
         style={{ width: 'min(560px,92vw)' }}
       >
+        {bulk ? (
+          <div data-testid="palette-bulk-confirm" className="flex min-h-0 flex-col overflow-y-auto">
+            <div className="flex items-center gap-2.5 border-b border-border-2 px-4 py-[13px]">
+              <span className="flex text-faint">
+                <Zap size={15} />
+              </span>
+              <span className="text-[14px] font-semibold text-text">Investigate untriaged alerts</span>
+            </div>
+            <div className="flex flex-col gap-2 px-4 py-3.5 text-[13px] leading-[1.5] text-dim">
+              <p>
+                soc-ai sweeps the alerts of the last 24 hours. The sweep covers the critical and high
+                alerts and the alerts with no severity.
+              </p>
+              <p data-testid="palette-bulk-count" className="text-text-2">
+                {bulkCountLine(bulk)}
+              </p>
+              <p>soc-ai investigates each untriaged alert. Each investigation uses the model.</p>
+              {bulk.blocked.map((line) => (
+                <p key={line} className="font-semibold text-danger">
+                  {line}
+                </p>
+              ))}
+            </div>
+            <div className="flex items-center justify-end gap-2 border-t border-border-2 px-3.5 py-2.5">
+              <button
+                ref={cancelRef}
+                type="button"
+                onClick={cancelBulk}
+                className="rounded-control border border-border-2 px-3 py-1.5 text-[12.5px] font-semibold text-dim hover:border-border-strong hover:text-text"
+              >
+                Cancel
+              </button>
+              <button
+                ref={confirmRef}
+                type="button"
+                onClick={startBulk}
+                disabled={bulk.checking || bulk.blocked.length > 0 || bulk.groups === 0}
+                title={bulk.groups === 0 ? BULK_NOTHING : undefined}
+                className="rounded-control border border-accent bg-accent px-3 py-1.5 text-[12.5px] font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                Investigate
+              </button>
+            </div>
+          </div>
+        ) : (
+        <>
         <div className="flex items-center gap-2.5 border-b border-border-2 px-4 py-[13px]">
           <span className="flex text-faint">
             <Search size={15} />
@@ -445,7 +587,7 @@ export function CommandPalette() {
           />
           <kbd className="rounded-[4px] border border-border-input px-1.5 py-px font-mono text-[10px] text-faint">esc</kbd>
         </div>
-        <div className="max-h-[344px] overflow-y-auto p-1.5" role="listbox" id="palette-listbox" aria-label="Results">
+        <div className="max-h-[344px] min-h-0 flex-1 overflow-y-auto p-1.5" role="listbox" id="palette-listbox" aria-label="Results">
           {filtered.map((c, i) => (
             <button
               key={`${c.group}:${c.label}:${c.detail ?? ''}:${i}`}
@@ -481,6 +623,8 @@ export function CommandPalette() {
           <span>↵ select</span>
           <span>esc close</span>
         </div>
+        </>
+        )}
       </div>
     </>
   );

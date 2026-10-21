@@ -2,8 +2,26 @@ import { useState } from 'react';
 
 import { ApiError } from '../lib/api';
 import type { NeedsYouState } from '../lib/needsYou';
-import { decisionsThatStay, dismissAll, dismissAllPrompt } from '../lib/notifications';
+import {
+  decisionsThatStay,
+  dismissAll,
+  dismissAllPrompt,
+  dismissAllUndoNote,
+  restoreDismissals,
+  snapshotDismissals,
+} from '../lib/notifications';
+import { useToast } from '../lib/toast';
 import type { Notification } from '../lib/types';
+
+/** The toast after a Dismiss all: what it hid and what the server read. */
+function dismissAllDone(events: number, read: number | null): string {
+  const parts: string[] = [];
+  if (events > 0) parts.push(`Dismiss all hid ${events} notification${events === 1 ? '' : 's'}.`);
+  if (read !== null && read > 0) {
+    parts.push(`${read} shadow hit${read === 1 ? ' is' : 's are'} read.`);
+  }
+  return parts.length > 0 ? parts.join(' ') : 'Dismiss all hid every older notification.';
+}
 
 /**
  * "Dismiss all" and its confirm step, for the bell panel and the Notifications
@@ -11,8 +29,10 @@ import type { Notification } from '../lib/types';
  * cannot do two different things under one name.
  *
  * The confirm step states what happens: how many events it hides, how many
- * shadow hits it marks read on the server, and which decisions stay. A
- * dismissal has no undo, so one stray click must not empty the list (D8).
+ * shadow hits it marks read on the server, and which decisions stay. One
+ * stray click must not empty the list (D8). A toast then offers Undo for the
+ * local hide. The shadow hits stay read, and the confirm says so (dogfood
+ * 2026-10-19, R1-I6).
  *
  * `rows` are the event rows on screen. `loadedAt` is when they loaded, in
  * epoch ms. The moment of the Dismiss all is the earlier of that and the load
@@ -36,6 +56,7 @@ export function DismissAllControl({
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const { toast } = useToast();
 
   const data = needsYou.data;
   const shadowHits = data ? data.unread_shadow_hits : null;
@@ -52,16 +73,23 @@ export function DismissAllControl({
   const confirm = async () => {
     setBusy(true);
     setError(null);
+    const before = snapshotDismissals();
     try {
-      await dismissAll({ rows: dismissible, loadedAt: moment(), shadowHits });
+      const read = await dismissAll({ rows: dismissible, loadedAt: moment(), shadowHits });
       setConfirming(false);
       onDone?.();
+      toast({
+        message: dismissAllDone(dismissible.length, read),
+        tone: 'success',
+        duration: 10_000,
+        action: { label: 'Undo', onClick: () => restoreDismissals(before) },
+      });
     } catch (e) {
       setConfirming(false);
       setError(
         e instanceof ApiError && e.reason === 'shadow_hits_changed'
-          ? 'New shadow hits arrived after the count. Dismiss all hid the events and marked no hit read. Check the new count and try again.'
-          : 'Dismiss all hid the events. It could not mark the shadow hits read. Try again.',
+          ? 'New shadow hits arrived after the count. Dismiss all hid the notifications and marked no hit read. Check the new count and try again.'
+          : 'Dismiss all hid the notifications. It could not mark the shadow hits read. Try again.',
       );
     } finally {
       setBusy(false);
@@ -84,7 +112,8 @@ export function DismissAllControl({
             shadowHits,
             stay: decisionsThatStay(data),
             fixed,
-          })}
+          })}{' '}
+          {dismissAllUndoNote({ events: dismissible.length, shadowHits })}
         </span>
         <button
           onClick={() => void confirm()}

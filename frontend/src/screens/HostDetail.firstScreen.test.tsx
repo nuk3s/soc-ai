@@ -3,7 +3,7 @@
 // appeared on the network. Nothing else is known about it yet." and "ALERTS
 // 7D 0 · nothing fired", while lower on the page sat six alert verdicts and a
 // hunted lead. These tests pin what the page says before the first scroll.
-import { render, screen, waitFor, within } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
@@ -30,6 +30,9 @@ vi.mock('../lib/api', async (importOriginal) => ({
   getLeads: vi.fn(),
   getLeadCount: vi.fn(),
   getNeedsYou: vi.fn(),
+  listInvestigations: vi.fn(),
+  setDossierOverride: vi.fn(),
+  clearDossierOverride: vi.fn(),
 }));
 
 import {
@@ -44,7 +47,10 @@ import {
   getMe,
   getNeedsYou,
   getObservations,
+  clearDossierOverride,
+  listInvestigations,
   resolveMachine,
+  setDossierOverride,
 } from '../lib/api';
 import { absTime } from '../lib/timeRange';
 import { HostDetail } from './HostDetail';
@@ -178,6 +184,16 @@ beforeEach(() => {
     .mockReset()
     .mockImplementation(async (status = 'open', query) => ({ status, entity: query?.entity ?? null, total: 0 }));
   vi.mocked(getNeedsYou).mockReset().mockRejectedValue(new Error('offline'));
+  vi.mocked(listInvestigations).mockReset().mockResolvedValue({
+    rows: [],
+    total: 0,
+    running: 0,
+    truePositives: 0,
+    totalAll: 0,
+    active: false,
+    limit: 3,
+    offset: 0,
+  });
 });
 
 function Here() {
@@ -320,7 +336,8 @@ describe('HostDetail: the first screen leads with leads and verdicts', () => {
 
   it('states the sweep window on the event counts', async () => {
     vi.mocked(getMachine).mockResolvedValue(
-      machine({ dossier: dossier(PRIMARY, {}, { lookback_days: 14 }) }),
+      // A sweep of the last hour. An older sweep names its date.
+      machine({ dossier: dossier(PRIMARY, {}, { lookback_days: 14, last_built_at: ago(HOUR) }) }),
     );
     mount('/hosts/agent%3Aea2d');
     expect((await screen.findByTestId('hero-events')).textContent).toBe('3,662 events in the last 14 days');
@@ -336,7 +353,7 @@ describe('HostDetail: the first screen leads with leads and verdicts', () => {
       '6 alert verdicts on this host',
     );
     // The card says it does not follow the window buttons.
-    expect(within(card).getByTestId('kpi-alerts-fixed').textContent).toBe('always 7 days');
+    expect(within(card).getByTestId('kpi-alerts-fixed').textContent).toBe('This card counts the last 7 days.');
     expect(card.getAttribute('title')).toMatch(/always counts 7 days/);
   });
 
@@ -366,7 +383,7 @@ describe('HostDetail: nothing known is said only when nothing is known', () => {
     await waitFor(() => expect(getObservations).toHaveBeenCalled());
     await waitFor(() =>
       expect(screen.getByTestId('host-sentence').textContent).toBe(
-        'files01 has appeared on the network. Nothing else is known about it yet.',
+        'files01 is on the network. soc-ai knows no other fact about this host.',
       ),
     );
     expect(screen.queryByTestId('host-situation')).toBeNull();
@@ -530,5 +547,154 @@ describe('HostDetail: the role chip shows that it has a tooltip', () => {
     expect(within(chip).getByTestId('hero-role-more')).toBeTruthy();
     expect(chip.className).toContain('cursor-help');
     expect(chip.getAttribute('title')).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Dogfood 2026-10-19, R4-D3 and R4-I1: the investigations of the machine
+// ---------------------------------------------------------------------------
+
+describe('HostDetail: the investigations of the machine', () => {
+  const runs = (total: number, truePositives: number) => ({
+    rows: [
+      {
+        id: '01INV',
+        name: 'DCSync from a workstation',
+        kind: 'suricata' as const,
+        verdict: 'true_positive' as const,
+        conf: 0.9,
+        host: PRIMARY,
+        status: 'complete' as const,
+        when: '20d ago',
+        ts: ago(20 * DAY),
+      },
+    ],
+    total,
+    running: 0,
+    truePositives,
+    totalAll: 40,
+    active: false,
+    limit: 3,
+    offset: 0,
+  });
+
+  it('reads the machine key over all time and says the true positives in the hero', async () => {
+    vi.mocked(listInvestigations).mockResolvedValue(runs(7, 6));
+    mount('/hosts/agent%3Aea2d');
+    expect((await screen.findByTestId('host-investigations-count')).textContent).toBe(
+      '7 investigations name this host. 6 reached a true-positive verdict.',
+    );
+    expect(listInvestigations).toHaveBeenCalledWith({ entity: 'agent:ea2d', limit: 3 });
+    const hero = await screen.findByTestId('host-hero');
+    await waitFor(() =>
+      expect(hero.textContent).toContain('6 investigations of this host reached a true-positive verdict.'),
+    );
+    expect(screen.getByTestId('host-investigations-all').getAttribute('href')).toBe(
+      '/investigations?entity=agent%3Aea2d&entity_label=files01&range=all',
+    );
+  });
+
+  it('adds no hero line when no investigation reached a true positive', async () => {
+    // NEGATIVE CONTROL: the block keeps the count, the hero stays quiet.
+    vi.mocked(listInvestigations).mockResolvedValue(runs(2, 0));
+    mount('/hosts/agent%3Aea2d');
+    await screen.findByTestId('host-investigations-count');
+    expect(screen.getByTestId('host-hero').textContent).not.toContain('true-positive verdict');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Dogfood 2026-10-19, R4-D12, R4-D17 and R4-I4: a declaration and the window
+// ---------------------------------------------------------------------------
+
+describe('HostDetail: a declaration on one host', () => {
+  const staleRole = dossier(PRIMARY, {
+    role: { reason: 'stale', inferred_value: 'server', inferred_confidence: 0.9, last_run_at: ago(17 * DAY) },
+  });
+  const declared = dossier(PRIMARY, {
+    role: {
+      value: 'domain_controller',
+      source: 'operator',
+      reason: null,
+      overridden: true,
+      inferred_value: 'server',
+      last_run_at: ago(17 * DAY),
+    },
+  });
+  const staleMachine = machine({
+    dossier: staleRole,
+    role: { value: null, label: null, confidence: 0.9, state: 'stale', guess: 'server', stale_hours: 17 * 24 },
+  });
+  const declaredMachine = machine({
+    dossier: declared,
+    role: {
+      value: 'domain_controller',
+      label: 'domain controller',
+      confidence: 1,
+      state: 'declared',
+      guess: null,
+      stale_hours: null,
+    },
+  });
+
+  beforeEach(() => {
+    vi.mocked(getMe).mockResolvedValue({ username: 'root', role: 'admin', status: '' });
+    vi.mocked(getMachine).mockReset().mockResolvedValueOnce(staleMachine).mockResolvedValue(declaredMachine);
+    vi.mocked(setDossierOverride).mockReset().mockResolvedValue(declared);
+    vi.mocked(clearDossierOverride).mockReset().mockResolvedValue(staleRole);
+  });
+
+  const declare = async () => {
+    mount('/hosts/agent%3Aea2d');
+    const facts = await screen.findByTestId('host-facts');
+    const row = within(facts).getByTestId('field-role');
+    fireEvent.click(await within(row).findByRole('button', { name: 'Edit Role' }));
+    fireEvent.change(within(row).getByRole('combobox'), { target: { value: 'domain_controller' } });
+    fireEvent.click(within(row).getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(setDossierOverride).toHaveBeenCalled());
+  };
+
+  it('re-reads the machine, so the hero badge shows the declared role', async () => {
+    await declare();
+    await waitFor(() => expect(getMachine).toHaveBeenCalledTimes(2));
+    expect((await screen.findByTestId('hero-role')).textContent).toContain('domain controller');
+  });
+
+  it('offers Undo, and Undo removes a new declaration', async () => {
+    await declare();
+    const note = await screen.findByTestId('declaration-undo');
+    expect(note.textContent).toContain('Role declared: domain controller.');
+    fireEvent.click(within(note).getByRole('button', { name: 'Undo' }));
+    await waitFor(() => expect(clearDossierOverride).toHaveBeenCalledWith(PRIMARY, 'role'));
+  });
+
+  it('closes the Undo note on request', async () => {
+    // NEGATIVE CONTROL: a closed note runs no write.
+    await declare();
+    const note = await screen.findByTestId('declaration-undo');
+    fireEvent.click(within(note).getByRole('button', { name: 'Close the Undo note' }));
+    expect(screen.queryByTestId('declaration-undo')).toBeNull();
+    expect(clearDossierOverride).not.toHaveBeenCalled();
+  });
+});
+
+describe('HostDetail: the activity window lives in the URL', () => {
+  it('opens on the window the URL names', async () => {
+    mount('/hosts/agent%3Aea2d?range=7d');
+    await waitFor(() => expect(getHostActivity).toHaveBeenCalledWith(PRIMARY, '7d'));
+  });
+
+  it('writes the chosen window to the URL', async () => {
+    mount('/hosts/agent%3Aea2d');
+    await waitFor(() => expect(getHostActivity).toHaveBeenCalledWith(PRIMARY, '24h'));
+    fireEvent.click(await screen.findByRole('button', { name: '7d' }));
+    await waitFor(() => expect(screen.getByTestId('url').textContent).toContain('range=7d'));
+    await waitFor(() => expect(getHostActivity).toHaveBeenCalledWith(PRIMARY, '7d'));
+  });
+
+  it('opens on 24h for a window it does not know', async () => {
+    // NEGATIVE CONTROL: an odd value is no window.
+    mount('/hosts/agent%3Aea2d?range=90d');
+    await waitFor(() => expect(getHostActivity).toHaveBeenCalledWith(PRIMARY, '24h'));
   });
 });

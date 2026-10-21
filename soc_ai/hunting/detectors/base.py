@@ -148,6 +148,14 @@ class DetectorContext:
     census: frozenset[str] = frozenset()
     cidrs: tuple[Any, ...] = ()
     windows: Mapping[str, list[tuple[datetime, datetime]]] = field(default_factory=dict)
+    # The grid gaps with their settle margin, as aware UTC spans. The grid held
+    # no data then, so a detector neither scores nor learns from those hours.
+    gaps: tuple[tuple[datetime, datetime], ...] = ()
+
+    def in_gap(self, at: datetime) -> bool:
+        """Whether one hour start falls inside a grid gap."""
+        moment = at if at.tzinfo is not None else at.replace(tzinfo=UTC)
+        return any(start <= moment < end for start, end in self.gaps)
 
     @property
     def index(self) -> str:

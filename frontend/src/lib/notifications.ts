@@ -221,8 +221,8 @@ export function dismissAllPrompt(p: {
 }): string {
   const acts: string[] = [];
   if (p.events > 0) {
-    const noun = p.events === 1 ? 'event' : 'events';
-    acts.push(p.more ? `hide ${p.events} ${noun} and every older event` : `hide ${p.events} ${noun}`);
+    const noun = p.events === 1 ? 'notification' : 'notifications';
+    acts.push(p.more ? `hide ${p.events} ${noun} and every older notification` : `hide ${p.events} ${noun}`);
   }
   if (p.shadowHits === null) acts.push('mark every unread shadow hit read');
   else if (p.shadowHits > 0) {
@@ -241,6 +241,42 @@ export function dismissAllPrompt(p: {
     );
   }
   return sentences.join(' ');
+}
+
+/** The sentence the confirm adds after the prompt: what an Undo restores and
+ *  what it cannot. The server marks the shadow hits read, and no local undo
+ *  can take that back (dogfood 2026-10-19, R1-I6). */
+export function dismissAllUndoNote(p: { events: number; shadowHits: number | null }): string {
+  const parts: string[] = [];
+  if (p.events > 0) parts.push('Undo shows the notifications again.');
+  if (p.shadowHits === null || p.shadowHits > 0) parts.push('The shadow hits stay read.');
+  return parts.join(' ');
+}
+
+/** The local hide before a Dismiss all, for its Undo. */
+export interface DismissalSnapshot {
+  dismissed: string[];
+  clearedAt: string | null;
+}
+
+/** Read the local hide: the dismissed ids and the stored moment. */
+export function snapshotDismissals(): DismissalSnapshot {
+  return { dismissed: Array.from(getDismissed()), clearedAt: getClearedAt() };
+}
+
+/** Put the local hide back the way a snapshot read it, and tell every
+ *  surface to read the list again. The shadow hits the server marked read
+ *  stay read. */
+export function restoreDismissals(snapshot: DismissalSnapshot): void {
+  try {
+    localStorage.setItem(KEY, JSON.stringify(snapshot.dismissed));
+    if (snapshot.clearedAt) localStorage.setItem(CLEARED_AT_KEY, snapshot.clearedAt);
+    else localStorage.removeItem(CLEARED_AT_KEY);
+  } catch {
+    // Writes can be blocked. The rows then stay hidden.
+  }
+  if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent(NOTIFICATIONS_DISMISSED_EVENT));
+  emitNeedsYouChanged();
 }
 
 /**
@@ -322,6 +358,7 @@ export function notificationKind(n: { id: string; group?: unknown }): Notificati
     case 'lead':
     case 'lead-more':
     case 'shadow-hit':
+    case 'analytic-held':
       return 'hunting';
     case 'dossier-conflict':
       return 'host';
@@ -333,6 +370,9 @@ export function notificationKind(n: { id: string; group?: unknown }): Notificati
 /** The noun for each row source, singular and plural. */
 const ROW_NOUN: Record<string, [string, string]> = {
   'shadow-hit': ['shadow hit', 'shadow hits'],
+  // The budget moved an analytic to shadow. The row is a hunting row, and
+  // the header called it a system notice (dogfood 2026-10-19, R1-D15).
+  'analytic-held': ['analytic notice', 'analytic notices'],
   lead: ['lead', 'leads'],
   inv: ['running investigation', 'running investigations'],
   'inv-failed': ['failed triage', 'failed triages'],
@@ -363,7 +403,7 @@ const SYSTEM_NOUN: [string, string] = ['system notice', 'system notices'];
  * and only when the list holds a finished run.
  */
 export function describeNotifications(rows: ReadonlyArray<{ id: string }>, more: boolean): string {
-  if (rows.length === 0) return '0 items.';
+  if (rows.length === 0) return '0 notifications.';
   const order: string[] = [];
   const counts = new Map<string, number>();
   for (const r of rows) {
@@ -380,9 +420,11 @@ export function describeNotifications(rows: ReadonlyArray<{ id: string }>, more:
   const list = joinWords(parts);
   const finished = rows.some((r) => FINISHED_RUNS.has(r.id.split(':', 1)[0]));
   const window = finished ? ' Finished runs cover the last 24 h.' : '';
-  const count = `${rows.length} item${rows.length === 1 ? '' : 's'}`;
+  // One row has one name on every surface: a notification. The header said
+  // "items" and the bell said "events" (dogfood 2026-10-19, V1-S7).
+  const count = `${rows.length} notification${rows.length === 1 ? '' : 's'}`;
   if (!more) return `${count}: ${list}.${window}`;
-  return `${count} loaded: ${list}. More items exist. Select Show more to load them.${window}`;
+  return `${count} loaded: ${list}. More notifications exist. Select Show more to load them.${window}`;
 }
 
 /** The rows that report a finished run. Only these have a 24 h window. */

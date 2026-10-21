@@ -238,8 +238,9 @@ describe('the Investigations list', () => {
   it('draws the chips in the tags column in the one order', async () => {
     await mount();
     const tags = screen.getByTestId('inv-tags-INV-FULL');
+    // One hunt chip: the type chip of a hunt run already names the subject
+    // (dogfood 2026-10-19, STE item 30).
     expect(chipTexts(tags)).toEqual([
-      'hunt',
       'hunt',
       'Depth: deep',
       'Synthetic evaluation data',
@@ -248,12 +249,9 @@ describe('the Investigations list', () => {
       'Superseded',
       '2',
     ]);
-    // Negative control: the bare row has only its type and the depth
-    // placeholder, because a list shows the depth on every row or on none.
-    expect(chipTexts(screen.getByTestId('inv-tags-INV-BARE'))).toEqual([
-      'suricata',
-      'Depth: not recorded',
-    ]);
+    // Negative control: the bare row has only its type. A row with no
+    // recorded depth shows no depth chip (dogfood 2026-10-19, STE item 29).
+    expect(chipTexts(screen.getByTestId('inv-tags-INV-BARE'))).toEqual(['suricata']);
     // The tags column sits after When and before the delete gutter.
     const header = screen.getByTestId('tags-header');
     expect(header.textContent).toBe('Tags');

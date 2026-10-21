@@ -98,13 +98,14 @@ WHITELIST: tuple[SettingSpec, ...] = (
         section="Oracle",
         hot=True,
         help=(
-            "Classic sends a needs_more_info verdict, a verdict other than "
-            "true_positive on a malware or attack rule, or a confidence below 0.6. "
-            "Uncertainty sends a confidence from 0.4 to below 0.7, a verdict the "
-            "decision template disagrees with, or a needs_more_info verdict from a "
-            "deep re-run. Shadow lets the classic rule decide. It records what the "
-            "uncertainty rule would do. Detection tuning shows the tally. This "
-            "setting applies live."
+            "Classic sends a Needs more info verdict to the Oracle. It also sends a "
+            "verdict other than True positive on a malware or attack rule. It also "
+            "sends a verdict with a confidence below 0.6. Uncertainty sends a verdict "
+            "with a confidence from 0.4 to below 0.7. It also sends a verdict that the "
+            "decision template disputes, and a Needs more info verdict from a deep "
+            "re-run. Shadow lets the classic rule decide. It records what the "
+            "uncertainty rule would do. The tally is in Settings > Detection tuning. "
+            "This setting applies live."
         ),
     ),
     SettingSpec(
@@ -114,17 +115,21 @@ WHITELIST: tuple[SettingSpec, ...] = (
         label="Oracle model alias",
         section="Oracle",
         hot=True,
+        help=(
+            "This setting is the model name of the Oracle on the model gateway. "
+            "soc-ai sends each Oracle review to this model."
+        ),
     ),
     SettingSpec(
         key="oracle_escalate_needs_more_info",
         attr="oracle_escalate_needs_more_info",
         type="bool",
-        label="Allow the Oracle to review a needs_more_info verdict",
+        label="Allow the Oracle to review a Needs more info verdict",
         section="Oracle",
         hot=True,
         help=(
-            "Off, no needs_more_info verdict goes to the Oracle. On, an uncertain "
-            "needs_more_info verdict can go."
+            "On, the Oracle can review an uncertain Needs more info verdict. Off, it "
+            "reviews no Needs more info verdict."
         ),
     ),
     SettingSpec(
@@ -187,10 +192,14 @@ WHITELIST: tuple[SettingSpec, ...] = (
         key="investigate_when_unsure",
         attr="investigate_when_unsure",
         type="bool",
-        label="Investigate if the round-1 verdict has no evidence",
+        label="Investigate a first-pass verdict that has no evidence",
         section="Agent",
         hot=True,
-        help="soc-ai runs the full tool-driven loop for that alert.",
+        help=(
+            "On, soc-ai runs the full investigation on that alert. Off, the "
+            "first-pass verdict stands. A deep re-run and the Fast verdict setting "
+            "can still start the full investigation."
+        ),
     ),
     SettingSpec(
         key="investigator_emits_report",
@@ -213,11 +222,11 @@ WHITELIST: tuple[SettingSpec, ...] = (
         section="Agent",
         hot=True,
         help=(
-            "soc-ai runs the first-pass verdict even when that pass cannot close "
-            "the alert. By default it runs the pass only when the pass can close "
-            "the alert. The investigation loop replaces the first-pass verdict on "
-            "every other alert, so the pass costs time and tokens for nothing. "
-            "Turn this on to get the first-pass verdict back in the timeline."
+            "On, soc-ai runs the first-pass synthesis on every alert. Off, it runs "
+            "the pass only when the pass can close the alert. On every other alert "
+            "the investigation replaces the first-pass verdict. The pass then costs "
+            "time and tokens with no result. Turn this on to keep the first-pass "
+            "verdict in the timeline."
         ),
     ),
     SettingSpec(
@@ -236,12 +245,12 @@ WHITELIST: tuple[SettingSpec, ...] = (
         key="analyst_model",
         attr="analyst_model",
         type="str",
-        label="Analyst model",
+        label="Investigation model",
         section="Agent",
         hot=True,
         day1=True,
         help=(
-            "The analyst agent uses this LiteLLM model for every investigation. "
+            "The model runs every investigation. Set the gateway model name here. "
             "A bad value fails every investigation."
         ),
     ),
@@ -249,7 +258,7 @@ WHITELIST: tuple[SettingSpec, ...] = (
         key="analyst_cloud_redaction",
         attr="analyst_cloud_redaction",
         type="bool",
-        label="Redact internal identifiers before a cloud analyst model",
+        label="Redact internal identifiers for a cloud model",
         section="Agent",
         hot=True,
         help=(
@@ -264,15 +273,15 @@ WHITELIST: tuple[SettingSpec, ...] = (
         key="analyst_redaction_fail_closed",
         attr="analyst_redaction_fail_closed",
         type="bool",
-        label="Fail closed on a residual identifier in analyst egress",
+        label="Block a payload that still holds an internal identifier",
         section="Agent",
         hot=True,
         help=(
-            "This setting applies only if the redaction above is on. If it is on, "
-            "soc-ai blocks an outbound payload that still holds an internal "
-            "identifier. soc-ai does not call the model. The run lands a pipeline "
-            "error that names the leaked count. If it is off, a sanitize miss "
-            "still leaves the network."
+            "This setting applies only if the redaction above is on. On, soc-ai "
+            "blocks a payload that still holds an internal identifier. soc-ai then "
+            "does not call the model. The run records a pipeline error with the "
+            "count of leaked identifiers. Off, soc-ai sends the payload even if an "
+            "internal identifier remains."
         ),
     ),
     SettingSpec(
@@ -320,7 +329,8 @@ WHITELIST: tuple[SettingSpec, ...] = (
         section="Agent",
         hot=True,
         help=(
-            "This setting caps the Pydantic-AI output-schema retries for the investigation loop."
+            "This setting caps the retries when the model returns a report in the "
+            "wrong format during the investigation."
         ),
         min_value=1,
         max_value=20,
@@ -329,12 +339,13 @@ WHITELIST: tuple[SettingSpec, ...] = (
         key="phase_d_max_rounds",
         attr="phase_d_max_rounds",
         type="int",
-        label="Maximum targeted-dispatch rounds",
+        label="Maximum follow-up rounds",
         section="Agent",
         hot=True,
         help=(
-            "This setting caps the gap, tool and re-synthesis rounds the "
-            "synthesizer runs in one investigation."
+            "This setting caps the follow-up rounds in one investigation. In a "
+            "round the synthesizer names a gap, runs one tool for it and writes the "
+            "verdict again."
         ),
         min_value=1,
         max_value=3,
@@ -392,11 +403,11 @@ WHITELIST: tuple[SettingSpec, ...] = (
         section="Agent",
         hot=True,
         help=(
-            "This setting sets how the no-tools synthesizers obtain the "
-            "TriageReport. native uses server-side guided decoding. Guided decoding "
-            "is the strongest fix for schema wobble on a weaker model. prompted "
-            "returns JSON inside the text. Validate a candidate with "
-            "`soc-ai model-probe --output-mode` first."
+            "This setting selects how the model returns the report in a synthesis "
+            "call. The tool mode returns the report as a tool call. The native mode "
+            "uses guided decoding on the server. Use native for a weaker model that "
+            "returns a bad format. The prompted mode reads the report from the text. "
+            "Test a mode with `soc-ai model-probe --output-mode` first."
         ),
         options=("tool", "native", "prompted"),
     ),
@@ -404,14 +415,14 @@ WHITELIST: tuple[SettingSpec, ...] = (
         key="analyst_tool_choice_required",
         attr="analyst_tool_choice_required",
         type="bool",
-        label="Force tool_choice=required",
+        label="Require a tool call",
         section="Agent",
         hot=True,
         help=(
-            "This setting allows tool_choice='required' for structured output. "
-            "The default forces tool_choice='auto' as a vLLM parser workaround. "
-            "The result changes per backend. Measure it with "
-            "`soc-ai model-probe --tool-choice required` first."
+            "On, soc-ai requires the model to return the report as a tool call. "
+            "Off, the model can answer in text. A weaker model can then use up its "
+            "format retries. Some servers fail when soc-ai requires a tool "
+            "call. Test it with `soc-ai model-probe --tool-choice required` first."
         ),
     ),
     SettingSpec(
@@ -437,9 +448,9 @@ WHITELIST: tuple[SettingSpec, ...] = (
         hot=True,
         help=(
             "This setting sets how many times soc-ai runs the final verdict "
-            "synthesis. soc-ai takes the majority verdict. A split lands "
-            "`inconclusive`. 1 is the default and turns the vote off. Each extra "
-            "sample is one more synthesizer call."
+            "synthesis. soc-ai takes the majority verdict. A split vote gives an "
+            "Inconclusive verdict. 1 turns the vote off. Each extra sample is one "
+            "more synthesizer call."
         ),
         min_value=1,
         max_value=5,
@@ -448,7 +459,7 @@ WHITELIST: tuple[SettingSpec, ...] = (
         key="auto_triage_max_targets",
         attr="auto_triage_max_targets",
         type="int",
-        label="Maximum alerts per Investigate sweep",
+        label="Maximum alerts per Auto-Investigate run",
         section="Triage automation",
         hot=True,
         day1=True,
@@ -481,7 +492,7 @@ WHITELIST: tuple[SettingSpec, ...] = (
             "This setting caps the synthesizer reasoning and report per call. "
             "soc-ai sends it as max_completion_tokens. A reasoning model can spend "
             "the whole budget and truncate before it states a verdict. The run then "
-            "falls back to needs-more-info. Raise the cap for a verbose reasoning "
+            "falls back to Needs more info. Raise the cap for a verbose reasoning "
             "model."
         ),
         min_value=1000,
@@ -513,7 +524,7 @@ WHITELIST: tuple[SettingSpec, ...] = (
         hot=True,
         help=(
             "soc-ai acknowledges a completed investigation in Security Onion if "
-            "its verdict is false_positive at or above the threshold below. An "
+            "its verdict is False positive at or above the threshold below. An "
             "Auto-Investigate run also acknowledges an alert that inherits such a "
             "verdict inside the inherit window. The alert must share the rule, the "
             "source and the destination. The default is on, and soc-ai audits every "
@@ -542,18 +553,18 @@ WHITELIST: tuple[SettingSpec, ...] = (
     SettingSpec(
         key="auto_triage_min_severity",
         attr="auto_triage_min_severity",
-        type="str",
+        type="select",
+        options=("critical", "high", "medium", "low"),
         label="Auto-Investigate minimum severity",
         section="Triage automation",
         hot=True,
         day1=True,
         help=(
-            "A sweep triages this severity and above. The values are critical, "
-            "high, medium and low. The default is high, so a sweep triages critical "
-            "and high detections. Set it to medium to add the medium-severity "
-            "detections. A sweep also covers an alert whose document carries no "
-            "severity, because a floor needs a value to compare. Turn on the "
-            "schedule below to run sweeps automatically."
+            "An Auto-Investigate run investigates the alerts at this severity and "
+            "above. High covers the critical alerts and the high alerts. Medium adds "
+            "the medium alerts. A run also covers an alert with no severity, "
+            "because the floor needs a value to compare. Turn on the schedule below "
+            "to start the runs automatically."
         ),
     ),
     SettingSpec(
@@ -629,7 +640,7 @@ WHITELIST: tuple[SettingSpec, ...] = (
         day1=True,
         help=(
             "soc-ai runs Auto-Investigate on a schedule and drains the untriaged "
-            "backlog. Each sweep covers every detection at or above the minimum "
+            "backlog. Each run covers every alert at or above the minimum "
             "severity above. The default is off, because the schedule makes "
             "continuous model calls. This setting applies live."
         ),
@@ -644,8 +655,8 @@ WHITELIST: tuple[SettingSpec, ...] = (
         day1=True,
         help=(
             "This setting is the minimum number of minutes between scheduled "
-            "sweeps. A lower value drains the backlog faster. A lower value also "
-            "makes more model calls."
+            "Auto-Investigate runs. A lower value drains the backlog faster. A lower "
+            "value also makes more model calls."
         ),
         min_value=1,
         max_value=1440,
@@ -659,7 +670,7 @@ WHITELIST: tuple[SettingSpec, ...] = (
         hot=True,
         help=(
             "soc-ai runs a saved hunt automatically on its own interval. Set that "
-            "interval in the Hunt Console. This setting is the master switch, so "
+            "interval on the Hunts page. This setting is the master switch, so "
             "off stops every scheduled hunt. The default is off, because a schedule "
             "makes recurring model calls. This setting applies live."
         ),
@@ -672,16 +683,11 @@ WHITELIST: tuple[SettingSpec, ...] = (
         section="Triage automation",
         hot=True,
         help=(
-            "On, soc-ai runs every live analytic as a grid query on a schedule. "
-            "Each run reads the lookback window. A document that matches an analytic "
-            "becomes an observation on the host or the user it names. The Hunts page "
-            "lists it under Analytic hits, and the host page shows it. Observations "
-            "that stack past the lead threshold form a lead, and a lead starts a hunt "
-            "when auto-hunt is on. A sweep makes no model call. It runs two grid "
-            "queries per analytic. Off, no analytic runs and the Analytics tab says so. "
-            "The default is off, because a sweep writes observations without an "
-            "analyst. Set an analytic to shadow to read what it would raise first. "
-            "You can also run `soc-ai spec-sweep --shadow` for a week and read the counts."
+            "On, soc-ai runs every live analytic as a grid query on a schedule. A "
+            "document that matches becomes an observation on the host or the user it "
+            "names. Observations that stack past the lead threshold form a lead. A "
+            "sweep makes no model call and writes observations with no analyst "
+            "present. Set an analytic to shadow first to read what it would raise."
         ),
     ),
     SettingSpec(
@@ -725,9 +731,8 @@ WHITELIST: tuple[SettingSpec, ...] = (
         section="Hunting",
         hot=True,
         help=(
-            "When this setting is on, the analytic sweep writes a hunt row for each "
-            "hit, as it did before 1.5.0. When it is off, the analytic sweep writes "
-            "the observation and no hunt row."
+            "On, the analytic sweep writes a hunt row for each hit. Off, it writes "
+            "only the observation."
         ),
     ),
     SettingSpec(
@@ -738,9 +743,9 @@ WHITELIST: tuple[SettingSpec, ...] = (
         section="Hunting",
         hot=True,
         help=(
-            "soc-ai compares each host with its own baseline every hour and "
-            "records what departs. An analytic in shadow writes observations and "
-            "raises nothing."
+            "soc-ai compares each host with its own baseline on the interval below. "
+            "It records each departure as an observation. An analytic in shadow "
+            "writes observations and raises nothing."
         ),
     ),
     SettingSpec(
@@ -760,6 +765,22 @@ WHITELIST: tuple[SettingSpec, ...] = (
             "with no daily hit limit and no minimum precision in its spec never "
             "moves. This setting applies live."
         ),
+    ),
+    SettingSpec(
+        key="grid_gap_settle_minutes",
+        attr="grid_gap_settle_minutes",
+        type="int",
+        label="Minutes to wait after a grid gap",
+        section="Hunting",
+        hot=True,
+        help=(
+            "A grid gap is a span of hours the grid held no readable data for "
+            "soc-ai. The profile sweep does not score the hours of a gap. It also "
+            "waits this many minutes after the gap ends. The agents send the "
+            "events they kept in this time. This setting applies live."
+        ),
+        min_value=0,
+        max_value=1440,
     ),
     SettingSpec(
         key="hunting_prior_sweep_interval_minutes",
@@ -915,9 +936,9 @@ WHITELIST: tuple[SettingSpec, ...] = (
         section="Agent",
         hot=True,
         help=(
-            "This setting is the confidence floor for a true-positive or "
-            "false-positive verdict. soc-ai rewrites a verdict below the floor to "
-            "needs_more_info if it also lacks semantic citation coverage. The tuned "
+            "This setting is the confidence floor for a True positive or a False "
+            "positive verdict. soc-ai rewrites a verdict below the floor to "
+            "Needs more info if it also lacks semantic citation coverage. The tuned "
             "default is 0.6."
         ),
         min_value=0.0,
@@ -1046,7 +1067,12 @@ WHITELIST: tuple[SettingSpec, ...] = (
         label="PCAP retrieval enabled",
         section="PCAP",
         hot=True,
-        help="soc-ai fetches the PCAP over SSH with suripcap.",
+        help=(
+            "On, the model can call the get_pcap tool. The tool reads the packets of "
+            "a flow from the Suricata PCAP on the sensor over SSH. Set the sensor "
+            "SSH host, user and key in Settings > Connections. soc-ai refuses this "
+            "setting while the sensor SSH host is empty."
+        ),
     ),
     SettingSpec(
         key="web_search_enabled",
@@ -1068,8 +1094,8 @@ WHITELIST: tuple[SettingSpec, ...] = (
             "The default is off, because the rest of soc-ai reads local feeds "
             "only. On lets the agent reach a third-party reputation or asset API "
             "over the internet. GreyNoise and Shodan are two such providers. Set "
-            "the provider keys in the API keys panel below. Shodan InternetDB "
-            "needs no key."
+            "the provider keys in Settings > API keys. Shodan InternetDB needs no "
+            "key."
         ),
     ),
     SettingSpec(
@@ -1081,7 +1107,7 @@ WHITELIST: tuple[SettingSpec, ...] = (
         hot=True,
         help=(
             "The default is off, so soc-ai makes no outbound call to check for an "
-            "update. On, the 'Check for updates' button on the About page compares "
+            "update. On, the Check for updates button in Settings > About compares "
             "the running version against the latest GitHub release. The check is "
             "manual and soc-ai never polls. soc-ai sends nothing about your "
             "environment or your alerts. soc-ai compares the version locally."
@@ -1104,8 +1130,7 @@ WHITELIST: tuple[SettingSpec, ...] = (
         help=(
             "This setting is the base URL of your MISP instance, for example "
             "https://misp.example.com. soc-ai builds the MISP client at startup, so "
-            "a change needs a restart. Also set the MISP API key in the API keys "
-            "panel below."
+            "a change needs a restart. Set the MISP API key in Settings > API keys."
         ),
     ),
     SettingSpec(
@@ -1178,11 +1203,10 @@ WHITELIST: tuple[SettingSpec, ...] = (
         section="Retrieval (RAG)",
         hot=True,
         help=(
-            "This setting is the rerank model id on your gateway. It reranks the "
-            "merged keyword candidates and semantic candidates. The gateway must "
-            "answer the Cohere-shape /rerank route. Empty is the default and keeps "
-            "the weighted merge order. A rerank failure is fail-soft, so search "
-            "still answers if the gateway is down."
+            "This setting is the rerank model name on the model gateway. The model "
+            "orders the keyword matches and the semantic matches together. The "
+            "gateway must serve a /rerank route. Empty keeps the merged order. If "
+            "the rerank fails, search still answers."
         ),
     ),
     # ---- MEMORY: deterministic prior-outcome context for synthesis (hot) -----
@@ -1197,11 +1221,10 @@ WHITELIST: tuple[SettingSpec, ...] = (
         section="Memory",
         hot=True,
         help=(
-            "soc-ai shows the verdict synthesis a small block of prior verdicts for "
-            "similar alerts. A similar alert shares the rule or an endpoint. The "
-            "match is deterministic SQL and uses no embeddings. The block is "
-            "context and never evidence, so the citation gate rejects it as "
-            "grounding. The default is off until an anchoring-bias A/B test runs."
+            "soc-ai shows the first pass a short list of past verdicts on similar "
+            "alerts. A similar alert shares the rule or an endpoint. The list is "
+            "context and never evidence. The citation gate refuses it as grounding. "
+            "A past verdict can bias the model."
         ),
     ),
     SettingSpec(
@@ -1227,9 +1250,8 @@ WHITELIST: tuple[SettingSpec, ...] = (
         section="Memory",
         hot=True,
         help=(
-            "This setting caps the prior-outcome digests in the round-1 prompt. "
-            "Keep the value between 1 and 5. Each item adds anchoring risk and "
-            "spends context budget."
+            "This setting caps the past verdicts that the first pass reads. Each "
+            "item can bias the model and uses context."
         ),
         min_value=1,
         max_value=5,
@@ -1307,10 +1329,10 @@ WHITELIST: tuple[SettingSpec, ...] = (
         section="Quality",
         hot=True,
         help=(
-            "This setting is the agreement-rate drop below the trailing 7-run "
-            "median that fires the quality_regression alarm. It applies to an "
-            "oracle-graded nightly run. A local-mode run alarms on its error rate "
-            "and its fallback rate."
+            "A nightly run compares its agreement rate with the median of the last 7 "
+            "runs. A drop larger than this value raises a quality alarm. This rule "
+            "applies when the Oracle grades the run. Without the Oracle, soc-ai "
+            "alarms on errors and fallbacks."
         ),
         min_value=0.05,
         max_value=0.5,
@@ -1370,9 +1392,9 @@ WHITELIST: tuple[SettingSpec, ...] = (
         hot=True,
         help=(
             "soc-ai runs the internal-identifier scan in the background on the "
-            "interval below. Off runs the scan only on demand, from 'Scan now' or "
-            "the CLI. The master switch above still applies. This setting applies "
-            "live."
+            "interval below. Off, the scan runs only on demand. Start it with Scan "
+            "now in Settings > Internal identifiers, or from the CLI. The master "
+            "switch above still applies. This setting applies live."
         ),
     ),
     SettingSpec(
@@ -1417,8 +1439,8 @@ WHITELIST: tuple[SettingSpec, ...] = (
         hot=True,
         help=(
             "soc-ai sweeps the network in the background on the interval below. "
-            "Off runs the sweep only on demand, from 'Rebuild now'. The master "
-            "switch above still applies. This setting applies live."
+            "Off, the sweep runs only on demand, from Rebuild now on the Hosts page. "
+            "The master switch above still applies. This setting applies live."
         ),
     ),
     SettingSpec(
@@ -1446,8 +1468,8 @@ WHITELIST: tuple[SettingSpec, ...] = (
             "This setting is how many days of events soc-ai infers each host's "
             "identity and role from. The default is 14 days. 14 days covers two "
             "weekends and two patch cycles, so routine fortnightly activity does "
-            "not read as a first-ever event. The hunting layer has its own baseline "
-            "window under Behavioural profiles."
+            "not read as a first-ever event. Set the baseline window of the profiles "
+            "in Settings > Behavioural profiles."
         ),
         min_value=1,
         max_value=90,
@@ -1464,10 +1486,10 @@ WHITELIST: tuple[SettingSpec, ...] = (
         section="Behavioural profiles",
         hot=True,
         help=(
-            "The dossier sweep builds a model of normal activity for each host. The "
-            "model holds the served ports, the peers, the processes, the active "
+            "The dossier sweep builds a profile of normal activity for each host. The "
+            "profile holds the served ports, the peers, the processes, the active "
             "hours and the connection rate. soc-ai compares new activity with the "
-            "model. A departure from it becomes an observation. The default is off. "
+            "profile. A departure from it becomes an observation. The default is off. "
             "Read a week of shadow observations before you rely on it."
         ),
     ),
@@ -1526,8 +1548,8 @@ WHITELIST: tuple[SettingSpec, ...] = (
         section="Behavioural profiles",
         hot=True,
         help=(
-            "A new member that fewer hosts hold is estate-rare. Its observation is "
-            "born heavier. The default is 3 hosts. A member must also reach this "
+            "A new member that fewer hosts hold is estate-rare. Its observation has a "
+            "higher weight. The default is 3 hosts. A member must also reach this "
             "number of hosts to be estate-common."
         ),
         min_value=1,
@@ -1556,12 +1578,12 @@ WHITELIST: tuple[SettingSpec, ...] = (
         section="Behavioural profiles",
         hot=True,
         help=(
-            "soc-ai fits a model of the estate once a day. The model groups the "
-            "hosts that act alike. It scores each host against the estate. Its "
-            "observations stay in shadow. A host with no confident role reads its "
-            "learned group as its peer group. The model needs an extra package "
-            "your deployment may not have installed. Diagnostics shows whether it "
-            "is present. The container image includes it. The default is off."
+            "soc-ai groups the hosts that act alike once a day. It scores each host "
+            "against the estate. Its observations stay in shadow. A host with no "
+            "confident role uses its learned group as its peer group. This feature "
+            "needs an extra package that your deployment may not have. Settings > "
+            "Diagnostics shows whether it is present. The container image includes "
+            "it. The default is off."
         ),
     ),
     SettingSpec(
@@ -1699,6 +1721,27 @@ WHITELIST: tuple[SettingSpec, ...] = (
         min_value=0,
         max_value=8760,
     ),
+    # ---- EXPERIMENTS: arm switches for the eval harness ------------------
+    # Section "Experiments" is intentionally NOT in SECTION_ORDER, the same rule
+    # the API keys below follow: GET /config does not render it, so the console
+    # never shows an experiment knob as a product setting. POST /config/setting
+    # still accepts the key, so the backtest replay can switch an arm on
+    # production through this store and restore ``single`` after the arm
+    # (docs/dev/specs/2026-10-08-swarm-triage-experiment-design.md).
+    SettingSpec(
+        key="investigator_strategy",
+        attr="investigator_strategy",
+        type="select",
+        options=("single", "spend", "ensemble", "advocates", "planes"),
+        label="Investigator strategy",
+        section="Experiments",
+        hot=True,
+        help=(
+            "This setting selects the strategy of the investigation loop. Single is "
+            "the default. The other values are arms of the swarm triage experiment. "
+            "This setting applies live."
+        ),
+    ),
     # ---- API KEYS: enrichment provider secrets (write-only) ------------------
     # Distinct from the Danger-Zone secrets: MOST of these feed per-call
     # enrichment clients (read fresh from settings on each tool call / refresh),
@@ -1751,7 +1794,7 @@ WHITELIST: tuple[SettingSpec, ...] = (
         label="MISP API key",
         help=(
             "soc-ai builds the MISP client at startup, so a new key needs a "
-            "restart. Also set the MISP URL above under Online enrichment."
+            "restart. Set the MISP URL in Settings > Online enrichment."
         ),
     ),
     SettingSpec(
@@ -1763,8 +1806,9 @@ WHITELIST: tuple[SettingSpec, ...] = (
         secret=True,
         label="MaxMind license key",
         help=(
-            "This key refreshes the local GeoLite2 GeoIP and ASN databases. The "
-            "next `blocklists refresh` uses it."
+            "No soc-ai command uses this key to download the GeoLite2 files. Copy "
+            "GeoLite2-City.mmdb and GeoLite2-ASN.mmdb into MAXMIND_DATA_DIR by hand. "
+            "Then restart soc-ai."
         ),
     ),
     SettingSpec(
@@ -1776,8 +1820,8 @@ WHITELIST: tuple[SettingSpec, ...] = (
         secret=True,
         label="abuse.ch auth key",
         help=(
-            "This key refreshes the URLhaus and Feodo blocklists. The next "
-            "`blocklists refresh` uses it."
+            "`soc-ai blocklists refresh` uses this key to download the URLhaus, "
+            "ThreatFox and Feodo feeds. Without the key the command skips them."
         ),
     ),
     SettingSpec(
@@ -1789,9 +1833,9 @@ WHITELIST: tuple[SettingSpec, ...] = (
         secret=True,
         label="crawl4ai API token",
         help=(
-            "This is the bearer token for the crawl4ai instance under Web research "
-            "above. Set it if that instance needs authentication. soc-ai stores it "
-            "Fernet-encrypted."
+            "This is the bearer token for the crawl4ai instance in Settings > Web "
+            "research. Set it if that instance needs authentication. soc-ai stores "
+            "it encrypted."
         ),
     ),
     # ---- NOTIFICATIONS: opt-in outbound webhook (the only new egress path) ----
@@ -1866,7 +1910,7 @@ WHITELIST: tuple[SettingSpec, ...] = (
         section="Notifications",
         hot=True,
         help=(
-            "soc-ai notifies on a true-positive verdict at or above the confidence threshold above."
+            "soc-ai notifies on a True positive verdict at or above the confidence threshold above."
         ),
     ),
     SettingSpec(
@@ -1885,7 +1929,7 @@ WHITELIST: tuple[SettingSpec, ...] = (
         label="Notify on model-fitness FAIL",
         section="Notifications",
         hot=True,
-        help=("soc-ai notifies if the analyst-model fitness probe grades the model unfit."),
+        help=("soc-ai notifies if the model fitness probe grades the model unfit."),
     ),
     SettingSpec(
         key="notify_on_quality_regression",
@@ -2244,7 +2288,6 @@ _BOOL_FALSE = ("", "off", "false", "0", "no")
 # The spec stays type "str" so the console keeps its own control, but the save
 # refuses a value outside the set with the set in the hint.
 _STR_CHOICES: dict[str, tuple[str, ...]] = {
-    "auto_triage_min_severity": ("critical", "high", "medium", "low"),
     "notify_format": ("json", "slack", "matrix"),
 }
 
@@ -2281,13 +2324,15 @@ def _check_bounds(spec: SettingSpec, value: float) -> None:
     low, high = spec.min_value, spec.max_value
     if (low is not None and value < low) or (high is not None and value > high):
         if low is not None and high is not None:
-            span = f"between {_fmt_bound(spec, low)} and {_fmt_bound(spec, high)}"
+            span = f"from {_fmt_bound(spec, low)} to {_fmt_bound(spec, high)}"
         elif low is not None:
             span = f"{_fmt_bound(spec, low)} or more"
         else:
             span = f"{_fmt_bound(spec, high or 0)} or less"
+        # The label the operator sees beside the field, not the raw key
+        # (dogfood 2026-10-19, H1-D23).
         raise SettingValueError(
-            f"{spec.key} must be {span}. soc-ai did not save {value}.",
+            f"{spec.label or spec.key} must be {span}. soc-ai did not save {value}.",
             reason="out_of_range",
         )
 
@@ -2328,14 +2373,14 @@ def coerce(key: str, raw_str: str) -> Any:
         try:
             v = float(raw_str)
         except ValueError as exc:
-            raise SettingValueError(f"{key} must be a number.") from exc
+            raise SettingValueError(f"{spec.label or key} must be a number.") from exc
         _check_bounds(spec, v)
         return v
     if spec.type == "int":
         try:
             v_int = int(raw_str)  # "1.5" is refused: the field takes whole numbers
         except ValueError as exc:
-            raise SettingValueError(f"{key} must be a whole number.") from exc
+            raise SettingValueError(f"{spec.label or key} must be a whole number.") from exc
         _check_bounds(spec, v_int)
         return v_int
     # URL-scheme guard for BOTH csv (es_hosts) and plain-str URL settings. Runs

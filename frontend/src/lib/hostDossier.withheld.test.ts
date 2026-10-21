@@ -105,7 +105,7 @@ describe('the reading forms', () => {
 
   it('says low confidence and stale in the unknown line, never "possibly"', () => {
     expect(unresolvedPhrase({ reason: 'low_confidence', last_run_at: null, retracted_at: null, inferred_value: 'CORP' })).toBe(
-      'low confidence: "CORP". The evidence is too thin to say',
+      'low confidence: "CORP". The evidence is too weak to confirm it',
     );
     const stale = unresolvedPhrase({
       reason: 'stale',

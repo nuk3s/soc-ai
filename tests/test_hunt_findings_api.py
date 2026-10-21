@@ -183,7 +183,10 @@ def test_a_complete_hunt_reads_the_verdicts(client: TestClient) -> None:
     assert detail["outcome"] == "threats_confirmed"
     assert detail["outcome_label"] == "2 of 4 findings are threats"
     f0, _f1, f2, f3 = detail["findings"]
-    assert f0["pendingActions"] == 2
+    # No person can execute an action of a promoted finding: the finding has
+    # no Security Onion alert. The action waits for nobody, as on the
+    # needs-you count (dogfood 2026-10-20).
+    assert f0["pendingActions"] == 0
     # A false positive's actions are housekeeping, as on the needs-you count.
     assert f2["pendingActions"] == 0
     assert (f3["investigationId"], f3["investigationStatus"]) == (None, "over_cap")
@@ -192,6 +195,137 @@ def test_a_complete_hunt_reads_the_verdicts(client: TestClient) -> None:
     # The bell titles the hunt by the verdicts.
     titles = [n["title"] for n in client.get("/api/v1/notifications").json()]
     assert any(t.startswith("Hunt finished: 2 of 4 findings are threats") for t in titles)
+
+
+def _shared_hunt_findings() -> list[dict[str, Any]]:
+    """The lead 5 hunt of 2026-10-19: two threats and an observation on one
+    host pair, a gap and a second observation. No finding cites a document,
+    so the first three share one subject fingerprint."""
+    pair = ["192.0.2.11", "192.0.2.5"]
+    return [
+        _finding(1, hosts=pair, citations=[], title="RC4 service ticket for svc_sql"),
+        _finding(2, hosts=pair, citations=[], title="Password guessing then success"),
+        _finding(
+            3, hosts=pair, citations=[], category="observation", title="All abuse is historical"
+        ),
+        _finding(4, hosts=["192.0.2.5"], citations=[], category="visibility_gap"),
+        _finding(5, hosts=["192.0.2.11"], citations=[], category="observation"),
+    ]
+
+
+def test_a_stored_observation_link_does_not_count_as_a_threat(client: TestClient) -> None:
+    """A row the older rule wrote: the observation reused the investigation of
+    the first threat. The label counts the threat findings over every finding,
+    and the observation card borrows no verdict. No migration rewrites the row."""
+    maker = client.app.state.db_sessionmaker
+
+    async def seed() -> tuple[str, str]:
+        hunt_id = await _seed(maker, _shared_hunt_findings(), status="complete", plan={})
+        tp = await _run_row(maker, hunt_id, 0, verdict="true_positive")
+        async with maker() as db:
+            row = await db.get(Hunt, hunt_id)
+            assert row is not None
+            row.finding_investigations = {
+                "0": _entry("ended", tp),
+                "1": _entry("ended", tp, origin="reused"),
+                "2": _entry("ended", tp, origin="reused"),
+            }
+            row.findings_total = 3
+            row.findings_investigated = 3
+            await db.commit()
+        return hunt_id, tp
+
+    hunt_id, tp = _run(seed())
+    detail = client.get(f"/api/v1/hunts/{hunt_id}").json()
+    assert detail["outcome"] == "threats_confirmed"
+    assert detail["outcome_label"] == "2 of 5 findings are threats"
+    assert (detail["findingsInvestigated"], detail["findingsTotal"]) == (2, 2)
+    f0, f1, f2, f3, f4 = detail["findings"]
+    assert (f0["investigationId"], f1["investigationId"]) == (tp, tp)
+    # The observation borrows no verdict.
+    assert (f2["investigationId"], f2["verdict"], f2["investigationStatus"]) == (None, None, None)
+    # Each card names the other finding that shares its investigation.
+    assert (f0["sharedWith"], f0["investigationSubject"]) == ([1], 0)
+    assert (f1["sharedWith"], f1["investigationSubject"]) == ([0], 0)
+    assert f1["investigationOrigin"] == "reused"
+    assert (f3["sharedWith"], f4["sharedWith"]) == ([], [])
+
+    row = next(h for h in client.get("/api/v1/hunts").json() if h["id"] == hunt_id)
+    assert row["outcome_label"] == "2 of 5 findings are threats"
+    assert (row["findingCount"], row["threatFindingCount"]) == (5, 2)
+
+
+def test_two_threats_that_share_one_run_count_as_two_of_all(client: TestClient) -> None:
+    """The lead 18 hunt: the run was opened for F2 and F1 reused it. A gap is
+    the third finding. The label read "2 of 2" on a three-finding hunt."""
+    maker = client.app.state.db_sessionmaker
+    pair = ["192.0.2.40", "192.0.2.10"]
+    findings = [
+        _finding(1, hosts=pair, citations=[]),
+        _finding(2, hosts=pair, citations=[]),
+        _finding(3, hosts=["192.0.2.10"], category="visibility_gap"),
+    ]
+
+    async def seed() -> tuple[str, str]:
+        hunt_id = await _seed(maker, findings, status="complete", plan={})
+        tp = await _run_row(maker, hunt_id, 1, verdict="true_positive")
+        async with maker() as db:
+            row = await db.get(Hunt, hunt_id)
+            assert row is not None
+            row.finding_investigations = {
+                "0": _entry("ended", tp, origin="reused"),
+                "1": _entry("ended", tp),
+            }
+            row.findings_total = 2
+            row.findings_investigated = 2
+            await db.commit()
+        return hunt_id, tp
+
+    hunt_id, _tp = _run(seed())
+    detail = client.get(f"/api/v1/hunts/{hunt_id}").json()
+    assert detail["outcome_label"] == "2 of 3 findings are threats"
+    f0, f1, _f2 = detail["findings"]
+    assert (f0["sharedWith"], f0["investigationSubject"]) == ([1], 1)
+    assert (f1["sharedWith"], f1["investigationSubject"]) == ([0], 1)
+
+
+def test_a_lead_soc_ai_closed_on_verdicts_says_so(client: TestClient) -> None:
+    """R3-D5: a lead the hunt closed on its finding verdicts read "Promoted",
+    the word of an analyst's act. The list and the page send the close."""
+    from soc_ai.store import leads as leads_store
+    from soc_ai.store.models import Lead
+
+    maker = client.app.state.db_sessionmaker
+
+    async def seed() -> tuple[int, int]:
+        ids: list[int] = []
+        async with maker() as db:
+            for by, reason in (
+                (leads_store.SYSTEM_HUNT_ACTOR, leads_store.PROMOTED_FINDING_REASON),
+                ("alice", None),
+            ):
+                lead = Lead(
+                    status="open",
+                    entities_json=[["host", "192.0.2.11"]],
+                    kinds_json=["catalog_match"],
+                    weight_at_formation=1.5,
+                    shadow=False,
+                )
+                db.add(lead)
+                await db.commit()
+                await db.refresh(lead)
+                await leads_store.mark_promoted(
+                    db, lead.id, investigation_id="INV-1", by=by, reason=reason
+                )
+                ids.append(int(lead.id))
+        return ids[0], ids[1]
+
+    by_soc_ai, by_analyst = _run(seed())
+    rows = {r["id"]: r for r in client.get("/api/v1/leads?status=promoted").json()}
+    assert rows[by_soc_ai]["closed_by_hunt_verdicts"] is True
+    assert rows[by_analyst]["closed_by_hunt_verdicts"] is False
+    detail = client.get(f"/api/v1/hunts/leads/{by_soc_ai}").json()
+    assert detail["closed_by_hunt_verdicts"] is True
 
 
 def test_a_failed_investigation_reads_failed_and_offers_the_manual_control(
@@ -316,6 +450,10 @@ def test_the_outcome_labels_count_the_findings() -> None:
     assert hunt_outcome.outcome_label("no_threat_confirmed", one) == "No threat confirmed"
     assert hunt_outcome.outcome_label("threats_confirmed") == "Threats confirmed"
     assert hunt_outcome.outcome_label("no_answer") == "No answer"
+    # The threats are counted over every finding of the report when the
+    # summary knows that count.
+    five = FindingVerdicts(total=2, investigated=2, decided=2, threats=2, findings=5)
+    assert hunt_outcome.outcome_label("threats_confirmed", five) == "2 of 5 findings are threats"
     for key in hunt_outcome.OUTCOMES:
         assert hunt_outcome.OUTCOME_LABEL[key]
 
@@ -368,10 +506,38 @@ def test_the_bell_line_of_an_investigating_hunt() -> None:
         findings_investigated=1,
     )
     notice = _hunt_in_flight(row)
-    assert notice.title == "Investigating 1 of 3 findings: hunt for beacons"
+    assert notice.title == "Hunt: hunt for beacons. Investigating 1 of 3 findings."
     assert notice.outcome == "investigating"
+    # The chip says "Running", so the line names the hunt only.
     running = _hunt_in_flight(row._replace(status="running"))
-    assert running.title == "Hunt running: hunt for beacons"
+    assert running.title == "Hunt: hunt for beacons"
+    assert running.outcome == "running"
+
+
+def test_the_bell_line_of_a_lead_hunt_names_the_hunt_once() -> None:
+    """The bell read "Hunt running: Lead 19 hunt: 192.0.2.20" beside a Running chip.
+
+    A lead hunt title already names the hunt (dogfood 2026-10-19, R1 STE 17).
+    """
+    from soc_ai.api.webui.routes_meta import _hunt_in_flight
+
+    row = hunt_svc.HuntNotifRow(
+        id="H2",
+        objective="[lead 19] Investigate 192.0.2.20. The lead formed.\nObservations:\n- a",
+        status="running",
+        created_at=datetime(2026, 10, 7, 9, 0),
+        finished_at=None,
+        findings_count=0,
+        threat_findings_count=0,
+        is_synth_eval=False,
+        findings_total=0,
+        findings_investigated=0,
+    )
+    assert _hunt_in_flight(row).title == "Lead 19 hunt: 192.0.2.20"
+    counted = row._replace(status="investigating", findings_total=2, findings_investigated=1)
+    assert _hunt_in_flight(counted).title == (
+        "Lead 19 hunt: 192.0.2.20. Investigating 1 of 2 findings."
+    )
 
 
 # ── the recorded hunt ────────────────────────────────────────────────────────

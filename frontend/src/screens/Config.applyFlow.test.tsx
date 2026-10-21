@@ -247,7 +247,7 @@ describe('the battery match line (RC5, C12)', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Apply' }));
 
     const line = await screen.findByTestId('battery-match');
-    expect(line.textContent).toMatch(/staged, not applied/);
+    expect(line.textContent).toMatch(/is staged\. It is not saved yet\./);
     expect(screen.queryByText(/The current settings match/)).toBeNull();
   });
 

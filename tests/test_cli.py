@@ -1186,7 +1186,7 @@ def test_audit_verify_tamper_names_what_broke(capsys: pytest.CaptureFixture[str]
     assert rc == 3
     err = _strip_ansi(capsys.readouterr().err)
     assert "DUPLICATE SEQUENCE NUMBERS" in err
-    assert "duplicate sequence numbers; no record was altered" in err
+    assert "Duplicate sequence numbers. No record was altered." in err
     assert "CHAIN BROKEN" not in err
     assert "TAMPER DETECTED" not in err
     assert "two writers continued the chain from the same point" in err
@@ -1511,7 +1511,7 @@ def test_audit_verify_duplicates_only_exits_3_and_says_no_record_was_altered(
     err = _strip_ansi(capsys.readouterr().err)
     assert rc == 3, err
     assert "DUPLICATE SEQUENCE NUMBERS" in err
-    assert "duplicate sequence numbers; no record was altered" in err
+    assert "Duplicate sequence numbers. No record was altered." in err
     assert "6 sequence numbers" in err
     assert "CHAIN BROKEN" not in err
 

@@ -96,7 +96,10 @@ def test_ack_group_accepts_normal_q(client: TestClient) -> None:
             json={"rule_name": "R", "range": "24h", "q": "source.ip:10.0.0.5"},
         )
     assert resp.status_code == 200
-    fetch.assert_called_once()
+    # A press that finds nothing reads the group once more with the
+    # acknowledged alerts, to say what is already done (dogfood 2026-10-19,
+    # R2-D15). The cap test needs only the first read.
+    fetch.assert_called()
 
 
 # ── es-badrequest-escapes-handler ───────────────────────────────────────────

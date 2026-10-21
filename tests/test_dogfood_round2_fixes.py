@@ -5,6 +5,7 @@ Each of these was a screen reading wrong while the data behind it was right.
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 from soc_ai.api.webui.routes_hunts import _hunt_outcome
@@ -223,3 +224,51 @@ def test_a_silent_host_says_it_was_not_seen() -> None:
         "That is 0.0 times the median. The sweep did not see the host in the window"
     )
     assert _phrase(Kind.BELOW_BASELINE, measured).endswith("That is 0.0 times the median")
+
+
+# --- R3-D13 and the STE list: the partial-results error in plain words -------
+
+_PARTIAL = (
+    "precondition: partial search results from .ds-logs-*-so-*,logs-synth-*: 244 of 289 "
+    "shards failed (no_shard_available_action_exception). The returned hits are incomplete. "
+    "An empty or short answer here means unknown."
+)
+
+
+def test_a_partial_read_names_the_shards_that_answered() -> None:
+    assert plain_error(_PARTIAL) == (
+        "The grid answered from 45 of 289 shards during the precondition query. The answer "
+        "is incomplete. An empty answer means that the result is unknown."
+    )
+    # A partial read that timed out with no shard count is a timeout.
+    timed = "detection: partial search results from logs-*: the search timed out"
+    assert plain_error(timed) == (
+        "The data source did not answer in time during the detection query."
+    )
+
+
+def test_a_failed_run_names_the_analytic_and_the_grid() -> None:
+    from soc_ai.hunting.execute import SpecRun
+    from soc_ai.hunting.findings import candidate_findings
+    from soc_ai.hunting.outcome import grid_reason
+    from soc_ai.hunting.spec import load_catalog
+
+    catalog = load_catalog(Path(__file__).resolve().parents[1] / "soc_ai/hunting/catalog")
+    spec = catalog["identity-4662-dcsync-nonmachine"]
+    run = SpecRun(
+        spec_id=spec.id,
+        since="now-1440m",
+        until="now",
+        blind=False,
+        precondition_docs=0,
+        matched_docs=0,
+        candidates=[],
+        error=_PARTIAL,
+    )
+    (finding,) = candidate_findings(spec, run)
+    assert finding["detail"].startswith(
+        "The analytic identity-4662-dcsync-nonmachine could not run on the grid. The result "
+        "is unknown. The grid answered from 45 of 289 shards"
+    )
+    assert "*" not in finding["detail"]
+    assert grid_reason(finding["detail"]) == "The grid answered from part of its shards."

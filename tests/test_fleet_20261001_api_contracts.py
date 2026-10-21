@@ -104,8 +104,20 @@ def test_enumerated_setting_refusal_names_the_choices(
 
 
 def test_enumerated_setting_accepts_any_case() -> None:
-    assert cfg.coerce("auto_triage_min_severity", " Medium ") == "medium"
     assert cfg.coerce("notify_format", "SLACK") == "slack"
+
+
+def test_the_severity_floor_select_takes_its_exact_values() -> None:
+    """auto_triage_min_severity is a select since the 2026-10-19 dogfood (R5-D19).
+
+    The console offers the four values in a list and sends one of them as it
+    is. A select takes its exact values, like every other select setting. A
+    value in another case is refused with the four values in the hint, and
+    nothing is stored.
+    """
+    assert cfg.coerce("auto_triage_min_severity", " medium ") == "medium"
+    with pytest.raises(cfg.SettingValueError, match="critical, high, medium, low"):
+        cfg.coerce("auto_triage_min_severity", "Medium")
 
 
 def test_bounded_float_refuses_out_of_range(client: TestClient) -> None:
@@ -115,7 +127,12 @@ def test_bounded_float_refuses_out_of_range(client: TestClient) -> None:
     assert r.status_code == 400, r.text
     d = _detail(r)
     assert d["reason"] == "out_of_range"
-    assert "between 0.0 and 1.0" in d["hint"]
+    assert "from 0.0 to 1.0" in d["hint"]
+    # The hint names the setting by the label the operator sees beside the
+    # field, not by the raw key (dogfood 2026-10-19, H1-D23).
+    label = cfg.WHITELIST_BY_KEY["dossier_min_confidence"].label
+    assert d["hint"].startswith(f"{label} must be from 0.0 to 1.0.")
+    assert "dossier_min_confidence" not in d["hint"]
     assert "dossier_min_confidence" not in _load_overrides(client)
 
 
@@ -124,7 +141,7 @@ def test_bounded_int_refuses_out_of_range_and_junk(client: TestClient) -> None:
     assert r.status_code == 400
     d = _detail(r)
     assert d["reason"] == "out_of_range"
-    assert "between 1 and 100000" in d["hint"]
+    assert "from 1 to 100000" in d["hint"]
     r = client.post("/api/v1/config/setting", json={"key": "dossier_min_events", "value": "1.5"})
     assert r.status_code == 400
     d = _detail(r)

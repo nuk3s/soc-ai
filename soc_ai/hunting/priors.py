@@ -40,7 +40,7 @@ from soc_ai.dossier.profile_math import (
     Seasonal,
     cell_for,
     hour_of_week,
-    seasonal_baseline,
+    seasonal_from_samples,
     served_port_counts,
 )
 from soc_ai.hunting.spec import HuntSpec
@@ -69,6 +69,7 @@ __all__ = [
     "STATISTIC_ROBUST_Z",
     "Departure",
     "PriorResult",
+    "collapse_hours",
     "evaluate_prior",
     "known_members",
     "member_days",
@@ -368,10 +369,19 @@ def _seasonal_of(
     start = _stamp(block.get("start"))
     if start is None or not isinstance(counts, list) or not counts:
         return None
-    values = [
-        float(c) if isinstance(c, (int, float)) and not isinstance(c, bool) else 0.0 for c in counts
+    first = start.astimezone(UTC).replace(minute=0, second=0, microsecond=0)
+    # A null hour is a missing hour: the profile build writes null for an
+    # hour inside a grid gap. It is no measurement, never a zero. Any other
+    # value that is not a number reads as zero, as before.
+    samples = [
+        (
+            first + timedelta(hours=n),
+            float(c) if isinstance(c, (int, float)) and not isinstance(c, bool) else 0.0,
+        )
+        for n, c in enumerate(counts)
+        if c is not None
     ]
-    return seasonal_baseline(start, values, tz=tz, exclude=exclude)
+    return seasonal_from_samples(samples, tz=tz, exclude=exclude)
 
 
 def _stamp(raw: Any) -> datetime | None:
@@ -412,6 +422,61 @@ def _zone_of(tz: str) -> Any:
         return ZoneInfo("UTC")
 
 
+def _crossing(
+    count: float, expected: float, sigma: float, *, above: bool, bar: float
+) -> float | None:
+    """The residual of one hour when it crosses the bar, else None.
+
+    An hour crosses when it sits ``bar`` dispersions from the expected count,
+    and the count is ``bar`` times the expectation or a ``bar``-th of it.
+    """
+    z = (count - expected) / sigma
+    far = count >= bar * max(expected, 1.0) if above else count <= expected / bar
+    crossed = z >= bar if above else z <= -bar
+    return z if far and crossed else None
+
+
+def collapse_hours(
+    test: Any,
+    profile: ProfileRow | None,
+    observed: Mapping[Any, Any],
+    *,
+    tz: str,
+    exclude: Sequence[tuple[datetime, datetime]] = (),
+) -> dict[datetime, bool]:
+    """For each recent hour where a collapse is measurable, whether the count collapsed.
+
+    An hour is measurable when its expected count is high enough that a zero
+    would cross the bar. A host that expects two connections at 03:00 cannot
+    collapse at 03:00, and counting it would make a quiet night look like a
+    dark grid. The bar is the one :func:`_rate_departures` reads, so this and
+    the departure agree on every hour. Empty when the baseline is not
+    scorable or holds no hourly series.
+
+    The sweep reads this across hosts to tell a grid that went dark from a
+    host that did.
+    """
+    if profile is None or not profile.is_scorable or not isinstance(profile.vector, Mapping):
+        return {}
+    seasonal = _seasonal_of(profile.vector, tz=tz, exclude=exclude)
+    if seasonal is None:
+        return {}
+    bar = float(test.threshold)
+    out: dict[datetime, bool] = {}
+    for key, entry in observed.items():
+        at = _stamp(key)
+        if at is None:
+            continue
+        how = hour_of_week(at, tz=tz)
+        expected = seasonal.expected[how]
+        sigma = seasonal.sigma(how)
+        if expected is None or sigma is None or expected < bar * sigma:
+            continue
+        count = float(_observed_count(entry))
+        out[at] = _crossing(count, expected, sigma, above=False, bar=bar) is not None
+    return out
+
+
 def _runs(
     hours: list[tuple[datetime, Any]], *, seasonal: Seasonal, above: bool, bar: float, tz: str
 ) -> list[list[_Hour]]:
@@ -426,10 +491,8 @@ def _runs(
         hit: _Hour | None = None
         if expected is not None and sigma is not None:
             count = float(_observed_count(entry))
-            z = (count - expected) / sigma
-            far = count >= bar * max(expected, 1.0) if above else count <= expected / bar
-            crossed = z >= bar if above else z <= -bar
-            if far and crossed:
+            z = _crossing(count, expected, sigma, above=above, bar=bar)
+            if z is not None:
                 hit = _Hour(at=at, count=count, expected=expected, z=z, entry=entry)
         follows = previous is not None and at - previous == timedelta(hours=1)
         if current and (hit is None or not follows):
@@ -549,6 +612,7 @@ def evaluate_prior(  # noqa: PLR0912, PLR0915 - one function reads as one proced
     tz: str = "UTC",
     exclude: Sequence[tuple[datetime, datetime]] = (),
     peers: PeerView | None = None,
+    gaps: Sequence[tuple[datetime, datetime]] = (),
 ) -> PriorResult:
     """Compare what was just seen against what this entity's baseline holds.
 
@@ -568,6 +632,11 @@ def evaluate_prior(  # noqa: PLR0912, PLR0915 - one function reads as one proced
     ``peers`` is the entity's peer group in its confident role. A new member
     most peers hold is a role trait and forms no departure. ``rare_for_peers``
     reads it to find a new member the peers do not hold either.
+
+    ``gaps`` names the grid gaps. A rate baseline does not learn from their
+    hours: the grid held no data then, and the stored series reads zero for a
+    build that ran before the gap was known. A set baseline keeps them, since
+    a member first seen in a gap is still a member the host holds.
     """
     # The notes below reach the console as the blind reason of the analytic.
     # The operator reads them, so they name the dimension in words and the
@@ -682,7 +751,7 @@ def evaluate_prior(  # noqa: PLR0912, PLR0915 - one function reads as one proced
                 )
 
     elif test.test in {"above", "below"}:
-        seasonal = _seasonal_of(baseline, tz=tz, exclude=exclude)
+        seasonal = _seasonal_of(baseline, tz=tz, exclude=[*exclude, *gaps])
         if seasonal is None:
             # A rate baseline built before the hourly series existed holds the
             # three cells only. The next build writes the series. Until then

@@ -529,7 +529,9 @@ def test_a_hold_raises_a_bell_entry_until_the_analyst_acts(client: TestClient) -
     entry = entries[0]
     assert entry["group"] == "hunting"
     assert entry["tone"] == "warn"
-    assert entry["title"].startswith("soc-ai moved A Kerberos ticket request names a service")
+    # The title names the analytic as one, in quotes (dogfood 2026-10-19, R1 STE 1).
+    assert entry["title"].startswith('soc-ai moved the analytic "A Kerberos ticket request')
+    assert '" to shadow. ' in entry["title"]
     assert "Its daily hit limit is 2." in entry["title"]
     assert entry["href"] == f"/hunts?tab=analytics&open={_ID}"
 

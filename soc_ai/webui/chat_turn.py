@@ -31,9 +31,11 @@ from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from pydantic_ai import Agent
+from pydantic_ai import Agent, capture_run_messages
 from pydantic_ai.models import Model
+from pydantic_ai.usage import UsageLimits
 
+from soc_ai.agent._partial_replay import repair_dangling_tool_calls, replay_reasoning_context
 from soc_ai.agent.chat_agent import CHAT_SYSTEM_PROMPT, build_chat_agent
 from soc_ai.agent.context import InvestigationContext
 from soc_ai.agent.egress_guard import EgressGuard
@@ -91,6 +93,30 @@ MAX_HISTORY = 12  # prior turns embedded into the prompt
 # the agent run it follows, so it does not need — and should not get — that
 # budget too.
 _TAIL_TIMEOUT_S = 20
+
+# Wall clock for the partial answer. When the agent run hits ``spec.timeout_s``
+# after its tools already returned results, a no-tools pass writes an answer
+# from those results. The range chat of 2026-10-19 ran 12 event queries,
+# timed out at 300 s and showed only "ran out of time": every result was
+# discarded. The reaper adds this budget to the chat age, so it does not
+# reap a turn while the partial answer is written.
+PARTIAL_ANSWER_TIMEOUT_S = 60
+
+# The progress entry the partial pass writes, so the panel names the step.
+PARTIAL_ANSWER_STEP = "partial_answer"
+
+# What a tool call that the deadline cut off returns in the replayed
+# transcript. The partial pass reads it as "no result".
+_PARTIAL_CLOSURE_CONTENT = "Not run. The time for the question ran out."
+
+# The instructions of the partial pass. ``instructions=`` reaches the model on
+# every request, also with a replayed history (see build_hunt_synthesizer).
+PARTIAL_ANSWER_INSTRUCTIONS = (
+    "The time for this question is over. You cannot call a tool now. "
+    "Answer the analyst's question from the tool results above and the context only. "
+    "Say which part of the question those results do not answer. "
+    "Do not state a fact that no tool result and no context line states."
+)
 
 
 class FinishRow(Protocol):
@@ -199,10 +225,10 @@ def split_history(
     return "", history
 
 
-def _extract_tools(result: Any) -> list[str]:
-    """Tool names called during the turn (for the live trace + stored meta)."""
+def _tool_names(messages: list[Any]) -> list[str]:
+    """Tool names called in a message log, oldest first."""
     names: list[str] = []
-    for msg in result.all_messages():
+    for msg in messages:
         for part in getattr(msg, "parts", []) or []:
             if type(part).__name__ == "ToolCallPart":
                 name = getattr(part, "tool_name", "")
@@ -211,10 +237,10 @@ def _extract_tools(result: Any) -> list[str]:
     return names
 
 
-def _extract_tool_evidence(result: Any) -> list[dict[str, Any]]:
-    """[{tool, result}] from the run, for grounding a verdict proposal."""
+def _tool_returns(messages: list[Any]) -> list[dict[str, Any]]:
+    """[{tool, result}] from a message log. A proposal is not evidence."""
     out: list[dict[str, Any]] = []
-    for msg in result.all_messages():
+    for msg in messages:
         for part in getattr(msg, "parts", []) or []:
             if type(part).__name__ == "ToolReturnPart":
                 tool_for = getattr(part, "tool_name", None)
@@ -224,14 +250,10 @@ def _extract_tool_evidence(result: Any) -> list[dict[str, Any]]:
     return out
 
 
-def _extract_tool_calls(result: Any) -> list[dict[str, Any]]:
-    """[{tool, args}] from the run: the names a call used ground a claim too.
-
-    A dataset that a zero-hit query asked for grounds the claim that the
-    dataset holds nothing (``narrative_grounding.argument_names``).
-    """
+def _tool_call_args(messages: list[Any]) -> list[dict[str, Any]]:
+    """[{tool, args}] from a message log."""
     out: list[dict[str, Any]] = []
-    for msg in result.all_messages():
+    for msg in messages:
         for part in getattr(msg, "parts", []) or []:
             if type(part).__name__ != "ToolCallPart":
                 continue
@@ -243,6 +265,25 @@ def _extract_tool_calls(result: Any) -> list[dict[str, Any]]:
             if tool_for and tool_for != "propose_verdict" and isinstance(args, dict):
                 out.append({"tool": tool_for, "args": args})
     return out
+
+
+def _extract_tools(result: Any) -> list[str]:
+    """Tool names called during the turn (for the live trace + stored meta)."""
+    return _tool_names(result.all_messages())
+
+
+def _extract_tool_evidence(result: Any) -> list[dict[str, Any]]:
+    """[{tool, result}] from the run, for grounding a verdict proposal."""
+    return _tool_returns(result.all_messages())
+
+
+def _extract_tool_calls(result: Any) -> list[dict[str, Any]]:
+    """[{tool, args}] from the run: the names a call used ground a claim too.
+
+    A dataset that a zero-hit query asked for grounds the claim that the
+    dataset holds nothing (``narrative_grounding.argument_names``).
+    """
+    return _tool_call_args(result.all_messages())
 
 
 def _finish_run(result: Any, guard: Any) -> tuple[str, dict[str, Any], Any, Any]:
@@ -314,13 +355,13 @@ async def run_chat_turn(state: Any, spec: ChatTurnSpec) -> None:  # noqa: PLR091
     written is a thread the analyst can never use again (the POST handler 409s
     while one is in flight).
     """
-    # Which wall-clock phase raised, for the `except TimeoutError` handler below
-    # to report accurately: "run" covers spec.prepare() and the agent-run block
-    # (an over-budget question — the historical case), "finalize" covers the
-    # post-answer tail bounded by `_TAIL_TIMEOUT_S` (an answer that was produced
-    # but could not be saved promptly — a different failure with a different
-    # analyst-facing message).
-    stage = "run"
+    # Which phase raised, for the handlers below to report accurately:
+    # "prepare" covers spec.prepare() and the prompt build (store and grid
+    # reads), "run" covers the agent-run block (model calls only, because every
+    # tool catches its own grid failure), and "finalize" covers the post-answer
+    # tail bounded by `_TAIL_TIMEOUT_S` (an answer that was produced but could
+    # not be saved promptly, a different failure with a different message).
+    stage = "prepare"
     try:
         settings = state.settings
         inputs = await spec.prepare()
@@ -403,38 +444,67 @@ async def run_chat_turn(state: Any, spec: ChatTurnSpec) -> None:  # noqa: PLR091
         # error row — instead of `wait_for`'s CancelledError, which is a
         # BaseException that the except never catches and which leaves the row
         # stuck pending forever.
-        async with asyncio.timeout(spec.timeout_s):
-            result = await agent.run(prompt_for_run)
-            answer, meta, tool_evidence, tool_calls = _finish_run(result, guard)
-            for _ in range(attempts):
-                probe = check_narrative_grounding(
-                    answer,
-                    seed_context=inputs.seed_context,
-                    tool_evidence=tool_evidence,
-                    tool_calls=tool_calls,
-                )
-                if probe.grounded or not probe.ungrounded:
-                    break
-                correction = regrounding_instruction(probe.ungrounded)
-                if not correction:
-                    break
-                if guard is not None:
-                    correction = guard.sanitize_text(correction)
-                    # The correction quotes the answer's ungrounded artifacts —
-                    # dynamic text; sweep it before the re-run egresses it.
-                    guard.check_or_raise(
-                        correction, fail_closed=settings.analyst_redaction_fail_closed is True
-                    )
-                _LOGGER.info(
-                    "chat: regrounding attempt %d for %s — %s",
-                    reground_used + 1,
-                    spec.label,
-                    probe.ungrounded[:5],
-                )
-                prompt_for_run = prompt_for_run + correction
-                result = await agent.run(prompt_for_run)
+        stage = "run"
+        # ``gathered`` is the first run's message log, kept by
+        # ``capture_run_messages`` as the run goes. When the deadline cuts the
+        # run off, the tool results in it are what the partial answer reads.
+        gathered: list[Any] = []
+        answered = False
+        try:
+            async with asyncio.timeout(spec.timeout_s):
+                with capture_run_messages() as gathered:
+                    result = await agent.run(prompt_for_run)
                 answer, meta, tool_evidence, tool_calls = _finish_run(result, guard)
-                reground_used += 1
+                answered = True
+                for _ in range(attempts):
+                    probe = check_narrative_grounding(
+                        answer,
+                        seed_context=inputs.seed_context,
+                        tool_evidence=tool_evidence,
+                        tool_calls=tool_calls,
+                    )
+                    if probe.grounded or not probe.ungrounded:
+                        break
+                    correction = regrounding_instruction(probe.ungrounded)
+                    if not correction:
+                        break
+                    if guard is not None:
+                        correction = guard.sanitize_text(correction)
+                        # The correction quotes the answer's ungrounded
+                        # artifacts. It is dynamic text, so sweep it before the
+                        # re-run egresses it.
+                        guard.check_or_raise(
+                            correction, fail_closed=settings.analyst_redaction_fail_closed is True
+                        )
+                    _LOGGER.info(
+                        "chat: regrounding attempt %d for %s — %s",
+                        reground_used + 1,
+                        spec.label,
+                        probe.ungrounded[:5],
+                    )
+                    prompt_for_run = prompt_for_run + correction
+                    result = await agent.run(prompt_for_run)
+                    answer, meta, tool_evidence, tool_calls = _finish_run(result, guard)
+                    reground_used += 1
+        except TimeoutError:
+            if not answered:
+                partial = await _write_partial_answer(
+                    settings, spec, guard=guard, gathered=list(gathered)
+                )
+                if partial is None:
+                    # No tool result to answer from, or the partial pass
+                    # failed. The handler below writes the timeout row, with
+                    # the tools that ran.
+                    raise _TurnTimedOut(_tool_names(list(gathered))) from None
+                answer, meta, tool_evidence, tool_calls = partial
+            else:
+                # A regrounding re-run hit the deadline. The last answer
+                # stands, and the tail below grounds or strips it.
+                _LOGGER.warning(
+                    "chat: regrounding for %s hit the %ss deadline; keeping the last answer",
+                    spec.label,
+                    spec.timeout_s,
+                )
         if reground_used:
             meta["regrounding_attempts"] = reground_used
             # The analyst never saw the correction. A sentence about it is the
@@ -528,11 +598,18 @@ async def run_chat_turn(state: Any, spec: ChatTurnSpec) -> None:  # noqa: PLR091
             if inputs.finalize_meta is not None:
                 inputs.finalize_meta(meta, tool_evidence, guard)
             await spec.finish(content=answer, status="done", meta=meta)
+    except _TurnTimedOut as e:
+        _LOGGER.warning("chat turn timed out for %s after %ss", spec.label, spec.timeout_s)
+        await _persist_terminal_error(
+            spec,
+            timeout_text(spec.timeout_s),
+            meta={"tools": e.tools, "timed_out": True} if e.tools else None,
+        )
     except TimeoutError:
         if stage == "finalize":
             # The answer existed; only saving it ran over _TAIL_TIMEOUT_S (e.g.
             # DB contention). Distinct log + message from the agent-run timeout
-            # below — "narrower follow-up" would be actively wrong advice here.
+            # below — "narrower question" would be actively wrong advice here.
             _LOGGER.warning(
                 "chat turn tail timed out for %s after %ss (post-answer finalize/persist)",
                 spec.label,
@@ -540,27 +617,165 @@ async def run_chat_turn(state: Any, spec: ChatTurnSpec) -> None:  # noqa: PLR091
             )
             await _persist_terminal_error(
                 spec,
-                "The assistant finished analyzing but ran out of time saving the reply "
-                "(storage was slow). Try again.",
+                "The assistant wrote the reply and ran out of time saving the reply. "
+                "The store was slow. Try again.",
             )
         else:
-            # The turn hit spec.timeout_s (the asyncio.timeout block above). Write a
-            # user-facing, actionable terminal row so the pending status never gets stuck.
+            # A timeout outside the agent-run block. Write a user-facing,
+            # actionable terminal row so the pending status never gets stuck.
             _LOGGER.warning("chat turn timed out for %s after %ss", spec.label, spec.timeout_s)
-            await _persist_terminal_error(
-                spec,
-                f"The assistant ran out of time on this question (hit the {spec.timeout_s}s "
-                "limit). Try a narrower follow-up.",
-            )
+            await _persist_terminal_error(spec, timeout_text(spec.timeout_s))
     except Exception as e:
         _LOGGER.exception("chat turn failed for %s", spec.label)
-        # Scrub the exception text before it becomes user-facing content — a
-        # verbose provider/gateway error body could otherwise echo a credential
-        # (same defensive scrub probes.py applies to its error surfaces).
-        await _persist_terminal_error(spec, f"The chat turn failed: {_scrub(str(e))}. Try again.")
+        await _persist_terminal_error(spec, failure_text(e, stage=stage))
 
 
-async def _persist_terminal_error(spec: ChatTurnSpec, content: str) -> None:
+class _TurnTimedOut(Exception):
+    """The agent run hit its deadline and no partial answer was written."""
+
+    def __init__(self, tools: list[str]) -> None:
+        super().__init__("chat turn timed out")
+        self.tools = tools
+
+
+def _seconds(value: float) -> str:
+    """300.0 as "300", 0.01 as "0.01"."""
+    return f"{value:g}"
+
+
+def timeout_text(timeout_s: float) -> str:
+    """The terminal row of a turn that hit its deadline with no answer."""
+    return (
+        f"soc-ai stopped after {_seconds(timeout_s)} seconds with no answer. "
+        "Ask a narrower question."
+    )
+
+
+def partial_note(timeout_s: float, results: int) -> str:
+    """The first line of a partial answer. It says what the answer rests on."""
+    calls = "tool call" if results == 1 else "tool calls"
+    return (
+        f"soc-ai stopped the question after {_seconds(timeout_s)} seconds. "
+        f"This answer uses only the results of the {results} {calls} that finished."
+    )
+
+
+# Exception class names that mean "the gateway did not take the call". The
+# OpenAI client raises APIConnectionError ("Connection error.") and httpx and
+# aiohttp raise their own connect errors. A chat read "The chat turn failed:
+# Connection error.. Try again." while the gateway was down (dogfood
+# 2026-10-19, H1).
+_UNREACHABLE_NAMES = frozenset(
+    {
+        "APIConnectionError",
+        "APITimeoutError",
+        "ConnectError",
+        "ConnectTimeout",
+        "ClientConnectorError",
+        "ServerDisconnectedError",
+    }
+)
+
+
+def _is_unreachable(exc: BaseException) -> bool:
+    """True when the exception, or one it came from, is a connect failure."""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, ConnectionError) or any(
+            cls.__name__ in _UNREACHABLE_NAMES for cls in type(cur).__mro__
+        ):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+def failure_text(exc: BaseException, *, stage: str) -> str:
+    """The terminal row of a turn that failed.
+
+    The agent run calls only the model gateway: every tool catches its own
+    grid failure and hands the model a result. A connect failure in that stage
+    is the gateway. The detail of any other failure is scrubbed first, because
+    a verbose provider error body can echo a credential.
+    """
+    if stage == "run" and _is_unreachable(exc):
+        return "The model did not answer. soc-ai cannot reach the model gateway. Try again later."
+    detail = _scrub(str(exc)).strip().rstrip(".").strip()
+    if not detail:
+        return "The chat turn failed. Try again."
+    return f"The chat turn failed. {detail}. Try again."
+
+
+async def _write_partial_answer(
+    settings: Any,
+    spec: ChatTurnSpec,
+    *,
+    guard: Any,
+    gathered: list[Any],
+) -> tuple[str, dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]] | None:
+    """Answer from the tool results of a run that hit its deadline.
+
+    Returns (answer, meta, tool_evidence, tool_calls) for the tail, which
+    grounds or strips the answer like any other. None when no tool returned a
+    result, or when the partial pass fails or runs over
+    :data:`PARTIAL_ANSWER_TIMEOUT_S`.
+
+    The pass is a no-tools agent over the replayed message log, the pattern
+    of the hunt's partial report (``hunt_runner._synthesize_partial_hunt``).
+    The log is in label space when a guard is on, because the model only ever
+    saw labels. The answer is desanitized after the run.
+    """
+    results = _tool_returns(gathered)
+    if not results:
+        return None
+    names = _tool_names(gathered)
+    if spec.set_progress is not None:
+        # Name the step on the panel. The progress write is cosmetic.
+        with contextlib.suppress(Exception):
+            await spec.set_progress([*names, PARTIAL_ANSWER_STEP])
+    user_msg = (
+        replay_reasoning_context(gathered) + "Answer the question now from the tool results above."
+    )
+    try:
+        if guard is not None:
+            user_msg = guard.sanitize_text(user_msg)
+            guard.check_or_raise(
+                user_msg, fail_closed=settings.analyst_redaction_fail_closed is True
+            )
+        synth: Agent[None, str] = Agent(
+            build_investigator_model(settings),
+            output_type=str,
+            instructions=PARTIAL_ANSWER_INSTRUCTIONS,
+        )
+        async with asyncio.timeout(PARTIAL_ANSWER_TIMEOUT_S):
+            result = await synth.run(
+                user_msg,
+                message_history=repair_dangling_tool_calls(
+                    gathered, closure_content=_PARTIAL_CLOSURE_CONTENT
+                ),
+                usage_limits=UsageLimits(request_limit=2, tool_calls_limit=0),
+            )
+    except Exception:
+        _LOGGER.warning("chat: the partial answer failed for %s", spec.label, exc_info=True)
+        return None
+    answer = str(result.output or "").strip()
+    if not answer:
+        return None
+    tool_evidence: Any = results
+    tool_calls: Any = _tool_call_args(gathered)
+    if guard is not None:
+        answer = str(guard.desanitize_obj(answer))
+        tool_evidence = guard.desanitize_obj(tool_evidence)
+        tool_calls = guard.desanitize_obj(tool_calls)
+    answer = f"{partial_note(spec.timeout_s, len(results))}\n\n{answer}"
+    meta: dict[str, Any] = {"tools": names, "partial": True}
+    return answer, meta, tool_evidence, tool_calls
+
+
+async def _persist_terminal_error(
+    spec: ChatTurnSpec, content: str, *, meta: dict[str, Any] | None = None
+) -> None:
     """Write a terminal ``error`` row, swallowing+logging any secondary error.
 
     The last line of defense in run_chat_turn's handlers: a failure here can't be
@@ -568,7 +783,7 @@ async def _persist_terminal_error(spec: ChatTurnSpec, content: str) -> None:
     reaper resolves it on the next sweep / restart).
     """
     try:
-        await spec.finish(content=content, status="error", meta=None)
+        await spec.finish(content=content, status="error", meta=meta)
     except Exception:
         _LOGGER.exception(
             "chat: FAILED to persist error row for msg=%s — pending stuck", spec.row_id

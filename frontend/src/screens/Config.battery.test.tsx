@@ -213,6 +213,12 @@ describe('Run the model battery keeps polling until the server reports the resul
     return run;
   }
 
+  /** Run asks first: the battery costs minutes and has no cancel (R5-I9). */
+  function start(run: HTMLButtonElement) {
+    fireEvent.click(run);
+    fireEvent.click(screen.getByRole('button', { name: 'Start the battery' }));
+  }
+
   it('re-arms the poll after a start and renders the finished table', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     try {
@@ -223,7 +229,7 @@ describe('Run the model battery keeps polling until the server reports the resul
       vi.mocked(startModelBattery).mockResolvedValue({ started: true, model: MODEL });
 
       const run = await mountIdle();
-      fireEvent.click(run);
+      start(run);
       await waitFor(() => expect(vi.mocked(startModelBattery)).toHaveBeenCalledWith(MODEL));
 
       // Two poll periods: the first answer says running, the second is the result.
@@ -247,7 +253,7 @@ describe('Run the model battery keeps polling until the server reports the resul
     );
 
     const run = await mountIdle();
-    fireEvent.click(run);
+    start(run);
 
     // The refusal is shown, not swallowed…
     const err = await screen.findByText(/The model battery could not start/);
@@ -264,10 +270,55 @@ describe('Run the model battery keeps polling until the server reports the resul
     vi.mocked(startModelBattery).mockRejectedValue(new ApiError('A battery is already running.', 409));
 
     const run = await mountIdle();
-    fireEvent.click(run);
+    start(run);
 
     expect(await screen.findByText(/Model battery:/)).toBeTruthy();
     expect(screen.queryByText(/could not start/)).toBeNull();
     expect(run.disabled).toBe(true);
+  });
+});
+
+// The battery ran against a dead gateway and showed "tool 0/2 13.1s" with no
+// reason, though the API held the failure text (dogfood 2026-10-19, H1-D7).
+// A start now states its cost first, and Escape cancels (R5-I9).
+describe('the model battery states its cost and each failure reason', () => {
+  it('asks before a start, and Cancel starts nothing', async () => {
+    vi.mocked(getModelBattery).mockResolvedValue(battery({}));
+    renderConfig();
+    fireEvent.click(await screen.findByText('Run the model battery'));
+    const confirm = screen.getByTestId('battery-confirm');
+    expect(confirm).toHaveTextContent('The model battery makes 8 calls to the model');
+    expect(confirm).toHaveTextContent('A battery has no cancel.');
+    fireEvent.keyDown(confirm, { key: 'Escape' });
+    expect(screen.queryByTestId('battery-confirm')).toBeNull();
+    expect(vi.mocked(startModelBattery)).not.toHaveBeenCalled();
+  });
+
+  it('shows the failure reason beside a configuration that failed', async () => {
+    vi.mocked(getModelBattery).mockResolvedValue(
+      battery({
+        stored_at: '2026-10-19T06:00:00',
+        result: {
+          model: MODEL,
+          n_per_config: 2,
+          configs: [
+            {
+              output_mode: 'tool',
+              tool_choice_required: false,
+              ok: 0,
+              n: 2,
+              usable_rate: 0,
+              tally: {},
+              failures: ['Connection error.', 'Connection error.'],
+              elapsed_s: 13.1,
+            },
+          ],
+          recommendation: null,
+          elapsed_s: 13.1,
+        },
+      }),
+    );
+    renderConfig();
+    expect(await screen.findByTestId('battery-failure-tool')).toHaveTextContent('Connection error.');
   });
 });

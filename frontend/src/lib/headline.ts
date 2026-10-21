@@ -52,9 +52,11 @@ const TOOL_WORDS: Record<string, string> = {
   t_search_events: 'the event search',
   t_origin_chain: 'the origin chain',
   t_suggest_rule_tuning: 'the rule tuning check',
+  t_query_zeek_logs: 'the Zeek logs',
+  t_query_events_oql: 'the event search',
 };
 
-function toolWords(id: string): string {
+export function toolWords(id: string): string {
   return TOOL_WORDS[id] ?? `the ${id.replace(/^t_/, '').replace(/_/g, ' ')} check`;
 }
 

@@ -10,6 +10,7 @@ import { NeedsYouProvider } from '../lib/needsYou';
 import { ToastProvider } from '../lib/toast';
 import { useUpdateCheck } from '../lib/useUpdateCheck';
 import { CommandPalette } from './CommandPalette';
+import { GeneratedPasswordBanner } from './GeneratedPasswordBanner';
 import { PreviousPageTracker } from './PreviousPageTracker';
 import { ShortcutSheet } from './ShortcutSheet';
 import { SessionProvider, useSession } from './Session';
@@ -59,6 +60,9 @@ export function AppShell() {
         <Sidebar />
         <div className="flex min-w-0 flex-1 flex-col">
           <Topbar />
+          {/* The generated admin password is still in use (H1-D5). Shown on
+              every page until the password changes. */}
+          <GeneratedPasswordBanner />
           {/* Bottom padding keeps the last row of a screen clear of the
               update notice, which floats at the bottom right. */}
           <div className="relative flex-1 overflow-y-auto pb-20">

@@ -247,7 +247,7 @@ def test_banner_on_backtest(page: Page, demo_mode_stack: dict) -> None:
     expect(page.get_by_text("Missed true positives", exact=False).first).to_be_visible(
         timeout=_WAIT_MS
     )
-    expect(page.get_by_text("False-positive toil cleared", exact=False).first).to_be_visible(
+    expect(page.get_by_text("False-positive agreement", exact=False).first).to_be_visible(
         timeout=_WAIT_MS
     )
     # The agreement number itself (recorded metrics: agreement_rate=1.0 → 100%).
@@ -329,7 +329,7 @@ def test_mutation_is_refused(demo_mode_stack: dict) -> None:
     assert status_code == 403, f"expected 403 demo refusal, got HTTP {status_code}: {body}"
     detail = body.get("detail") or {}
     assert detail.get("reason") == "demo_mode", f"missing demo_mode reason: {body}"
-    assert "disabled" in (detail.get("hint") or "").lower(), f"missing refusal hint: {body}"
+    assert "read-only" in (detail.get("hint") or "").lower(), f"missing refusal hint: {body}"
 
 
 @pytest.mark.browser

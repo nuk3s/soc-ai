@@ -209,7 +209,7 @@ describe('folding a section of the Hunts tab', () => {
   it('unfolds the block a Needs-you link jumps to', async () => {
     localStorage.setItem('soc-ai.hunts.collapsed.hits', '1');
     renderHunts();
-    const link = await screen.findByRole('link', { name: 'Read the last 7 days' });
+    const link = await screen.findByRole('link', { name: 'Show the unread hits' });
     expect(screen.queryByTestId(`analytic-hit-${HIT.id}`)).toBeNull();
 
     fireEvent.click(link);

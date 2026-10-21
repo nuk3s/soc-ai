@@ -150,7 +150,7 @@ def _abs_ts_range(q: dict[str, Any]) -> dict[str, Any]:
 
 
 def test_build_filter_abs_range_within_window_passes_through(settings_kratos: Settings) -> None:
-    """An in-window absolute range is passed through verbatim (with time_zone)."""
+    """An in-window absolute range with zone-explicit bounds reaches the grid in UTC."""
     q = aq.build_filter(
         settings_kratos,
         time_range="24h",
@@ -163,7 +163,50 @@ def test_build_filter_abs_range_within_window_passes_through(settings_kratos: Se
     assert _abs_ts_range(q) == {
         "gte": "2026-08-01T00:00:00Z",
         "lte": "2026-08-05T00:00:00Z",
-        "time_zone": "UTC",
+    }
+
+
+def test_build_filter_reads_zone_explicit_bounds_as_the_instant_they_name(
+    settings_kratos: Settings,
+) -> None:
+    """A bound with an offset is one instant. ``so_timezone`` does not move it.
+
+    The console sent the custom window of the alert tiles as naive wall times,
+    read in ``so_timezone``, and the window of the investigation tiles in UTC.
+    With the browser in another zone the two tiles counted hours 6 h apart
+    (dogfood 2026-10-19, R1-D8). The console now sends zone-explicit bounds,
+    and the grid gets them in UTC with no zone to apply on top.
+    """
+    q = aq.build_filter(
+        settings_kratos,
+        time_range="24h",
+        severity=None,
+        oql=None,
+        abs_from="2026-10-08T00:00:00-02:00",
+        abs_to="2026-10-08T06:30:00.000+02:00",
+        time_zone="America/New_York",
+    )
+    assert _abs_ts_range(q) == {
+        "gte": "2026-10-08T02:00:00Z",
+        "lte": "2026-10-08T04:30:00Z",
+    }
+
+
+def test_build_filter_keeps_naive_bounds_in_the_so_zone(settings_kratos: Settings) -> None:
+    """NEGATIVE CONTROL. An older console sends naive wall times. They keep the SO zone."""
+    q = aq.build_filter(
+        settings_kratos,
+        time_range="24h",
+        severity=None,
+        oql=None,
+        abs_from="2026-10-08T00:00",
+        abs_to="2026-10-09T00:00",
+        time_zone="America/New_York",
+    )
+    assert _abs_ts_range(q) == {
+        "gte": "2026-10-08T00:00",
+        "lte": "2026-10-09T00:00",
+        "time_zone": "America/New_York",
     }
 
 

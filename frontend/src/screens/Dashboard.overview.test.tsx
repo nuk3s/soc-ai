@@ -1,4 +1,4 @@
-// The landing page is the Overview, and it states the flow (owner, 2026-10-07:
+// The landing page is the Dashboard, and it states the flow (owner, 2026-10-07:
 // "What is the user flow?"). Under the Needs you tile one sentence names the
 // flow in the analyst's words, and the link opens the chart on the Hunts page.
 import { render, screen, within } from '@testing-library/react';
@@ -50,12 +50,14 @@ beforeEach(() => {
   });
 });
 
-describe('the Overview', () => {
-  it('names the page "Overview"', async () => {
+describe('the Dashboard', () => {
+  // The header read "Overview" under a nav item and a top bar that both read
+  // "Dashboard": two names for one page (dogfood 2026-10-19, R1 STE 3).
+  it('names the page "Dashboard", as the nav does', async () => {
     mount();
-    expect(await screen.findByText('Overview')).toBeTruthy();
-    // Negative control: the old title is gone from the page header.
-    expect(screen.queryByText('Dashboard')).toBeNull();
+    expect(await screen.findByRole('heading', { name: 'Dashboard' })).toBeTruthy();
+    // Negative control: the second name is gone from the page header.
+    expect(screen.queryByText('Overview')).toBeNull();
   });
 
   it('states the flow under the Needs you tile and links to the chart', async () => {
@@ -63,8 +65,8 @@ describe('the Overview', () => {
     const tile = await screen.findByTestId('kpi-needs-you');
     const line = within(tile).getByTestId('needs-you-flow');
     expect(line.textContent).toBe(
-      'Alerts and sweeps come in. soc-ai triages, hunts, and investigates what the hunts find. ' +
-        'You decide in Needs you. Your actions go to Security Onion. How this flows',
+      'soc-ai investigates alerts and runs hunts. You make each decision in Needs you. ' +
+        'soc-ai sends your actions to Security Onion. How this flows',
     );
     expect(line.textContent).toContain(OVERVIEW_FLOW);
     expect(within(line).getByRole('link', { name: 'How this flows' }).getAttribute('href')).toBe(

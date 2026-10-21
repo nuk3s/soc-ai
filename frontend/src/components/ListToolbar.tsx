@@ -438,45 +438,66 @@ export function ListToolbar({
       {/* The selection strip, APPENDED under the facets rather than replacing
           them. Compact and accented so it reads as a mode without costing the
           filters their place. */}
-      {selecting && (
-        <div
-          data-testid="list-toolbar-selection"
-          className="mb-3.5 flex flex-wrap items-center gap-2 rounded-card border border-accent-deep bg-[#0d1726] px-[11px] py-[7px]"
-        >
-          <span className="text-[12.5px] text-dim">
-            {selection?.summary ?? (
-              <>
-                <span className="font-mono text-accent">{selection?.count}</span>{' '}
-                {selection?.noun ?? 'selected'}
-              </>
-            )}
-          </span>
-          {/* Selection outlives a filter change on purpose — but silently, it is
-              a trap: the operator submits ids nothing on screen shows. Say so,
-              and offer the narrower exit than "Clear". */}
-          {!!selection?.offPageCount && (
-            <button
-              type="button"
-              onClick={selection.onClearOffPage}
-              disabled={!selection.onClearOffPage}
-              title="These were selected under a different filter or on another page. They are still included in a bulk action."
-              className="flex items-center gap-1.5 rounded-badge border border-warn/40 bg-warn/10 px-[7px] py-[2px] text-[11.5px] font-semibold text-warn enabled:hover:border-warn"
-            >
-              <EyeOff size={11} className="flex-none" />
-              {selection.offPageCount} not on this page
-              {selection.onClearOffPage && <X size={11} className="flex-none" />}
-            </button>
-          )}
-          {selection?.actions}
-          <button
-            type="button"
-            onClick={selection?.onClear}
-            className="rounded-[7px] border border-border-strong bg-transparent px-[11px] py-1.5 text-[12.5px] font-semibold text-dim hover:border-danger hover:text-danger"
-          >
-            Clear
-          </button>
-        </div>
+      {selecting && selection && <SelectionStrip selection={selection} />}
+    </div>
+  );
+}
+
+/**
+ * The selection strip of a list: the count, the off-page marker, the bulk
+ * actions and Clear.
+ *
+ * ListToolbar renders it under its facet row. The leads list on the Hunts
+ * page has its own header with tabs, and renders this strip on its own, so
+ * the two selections read and act the same.
+ */
+export function SelectionStrip({
+  selection,
+  className,
+}: {
+  selection: ListToolbarSelection;
+  className?: string;
+}) {
+  return (
+    <div
+      data-testid="list-toolbar-selection"
+      className={cn(
+        'mb-3.5 flex flex-wrap items-center gap-2 rounded-card border border-accent-deep bg-[#0d1726] px-[11px] py-[7px]',
+        className,
       )}
+    >
+      <span className="text-[12.5px] text-dim">
+        {selection.summary ?? (
+          <>
+            <span className="font-mono text-accent">{selection.count}</span>{' '}
+            {selection.noun ?? 'selected'}
+          </>
+        )}
+      </span>
+      {/* Selection outlives a filter change on purpose — but silently, it is
+          a trap: the operator submits ids nothing on screen shows. Say so,
+          and offer the narrower exit than "Clear". */}
+      {!!selection.offPageCount && (
+        <button
+          type="button"
+          onClick={selection.onClearOffPage}
+          disabled={!selection.onClearOffPage}
+          title="These were selected under a different filter or on another page. They are still included in a bulk action."
+          className="flex items-center gap-1.5 rounded-badge border border-warn/40 bg-warn/10 px-[7px] py-[2px] text-[11.5px] font-semibold text-warn enabled:hover:border-warn"
+        >
+          <EyeOff size={11} className="flex-none" />
+          {selection.offPageCount} not on this page
+          {selection.onClearOffPage && <X size={11} className="flex-none" />}
+        </button>
+      )}
+      {selection.actions}
+      <button
+        type="button"
+        onClick={selection.onClear}
+        className="rounded-[7px] border border-border-strong bg-transparent px-[11px] py-1.5 text-[12.5px] font-semibold text-dim hover:border-danger hover:text-danger"
+      >
+        Clear
+      </button>
     </div>
   );
 }

@@ -52,7 +52,7 @@ describe('hunt-kind settled bar', () => {
         <Investigation inv={baseInv({ kind: 'hunt', huntId: '01HUNT0000000000000000000000' })} layout="page" />
       </MemoryRouter>,
     );
-    expect(screen.queryByText(/Verdict settled\. Take action\./i)).toBeNull();
+    expect(screen.queryByText('No automatic action')).toBeNull();
   });
 
   it('keeps the settled bar for a suricata-kind run', () => {
@@ -61,7 +61,7 @@ describe('hunt-kind settled bar', () => {
         <Investigation inv={baseInv({ kind: 'suricata' })} layout="page" />
       </MemoryRouter>,
     );
-    expect(screen.getByText(/Verdict settled\. Take action\./i)).toBeTruthy();
+    expect(screen.getByText('No automatic action')).toBeTruthy();
   });
 });
 
@@ -193,7 +193,7 @@ describe('hunt-kind error-state re-run', () => {
     // two different meanings ("click a button" vs "go re-promote from the
     // hunt") stacked at the same spot is the bug under test here.
     expect(container.textContent).toContain(
-      'soc·ai recorded no cause. Open an investigation on it again from its hunt.',
+      'soc-ai recorded no cause. Open an investigation on it again from its hunt.',
     );
     expect(container.textContent).not.toContain('Re-run it to try again.');
     const link = screen.getByRole('link', { name: 'Sweep for beaconing to rare external IPs' });
@@ -212,7 +212,7 @@ describe('hunt-kind error-state re-run', () => {
     expect(container.textContent).not.toContain('Open an investigation on this finding again');
     // The suricata copy names the missing cause and keeps the re-run advice.
     expect(container.textContent).toContain(
-      'soc·ai recorded no cause. Re-run it to try again.',
+      'soc-ai recorded no cause. Re-run it to try again.',
     );
   });
 });
@@ -240,7 +240,7 @@ describe('hunt-kind pipeline-fallback re-run', () => {
     // Same copy-tension fix as failedEl: the sentence above the pointer must
     // agree with it instead of also saying "re-run it".
     expect(container.textContent).toContain(
-      'soc·ai recorded it as needs_more_info as a placeholder. Open an investigation on it again from its hunt.',
+      'soc-ai recorded the verdict Needs more info as a placeholder. Open an investigation on it again from its hunt.',
     );
     expect(container.textContent).not.toContain('placeholder. Re-run it to get a real verdict.');
     // Two identical links here by design: the fallback panel's own pointer AND
@@ -271,7 +271,7 @@ describe('hunt-kind pipeline-fallback re-run', () => {
     expect(screen.getAllByRole('button', { name: /Re-run investigation/i }).length).toBeGreaterThan(0);
     // Suricata prose is byte-identical to before this polish pass.
     expect(container.textContent).toContain(
-      'soc·ai recorded it as needs_more_info as a placeholder. Re-run it to get a real verdict.',
+      'soc-ai recorded the verdict Needs more info as a placeholder. Re-run it to get a real verdict.',
     );
   });
 });
@@ -317,7 +317,7 @@ describe('hunt-kind inconclusive/needs_more_info wayfinding', () => {
         />
       </MemoryRouter>,
     );
-    expect(container.textContent).toContain('The model could not converge on a verdict.');
+    expect(container.textContent).toContain('The model could not reach a verdict.');
     expect(container.textContent).toContain(
       'Start a focused re-investigation. You can also resolve it in chat.',
     );
@@ -347,12 +347,20 @@ describe('hunt-kind inconclusive/needs_more_info wayfinding', () => {
   });
 });
 
+// The server states why a write is off, from the one action rule
+// (V3-N2). The card shows that reason. The fixture carries it as the
+// server sends it.
+const promotedAck: RecommendedAction = {
+  ...ackAction,
+  blockedReason: 'A promoted finding has no Security Onion alert to act on.',
+};
+
 describe('hunt-kind recommended actions', () => {
   it('disables the Approve/Execute button with the explanatory title, but leaves Dismiss clickable (no SO write)', () => {
     render(
       <MemoryRouter>
         <Investigation
-          inv={baseInv({ kind: 'hunt', huntId: '01HUNT0000000000000000000000', actions: [ackAction] })}
+          inv={baseInv({ kind: 'hunt', huntId: '01HUNT0000000000000000000000', actions: [promotedAck] })}
           layout="page"
         />
       </MemoryRouter>,
@@ -378,7 +386,7 @@ describe('hunt-kind recommended actions', () => {
     render(
       <MemoryRouter>
         <Investigation
-          inv={baseInv({ kind: 'hunt', huntId: '01HUNT0000000000000000000000', actions: [ackAction] })}
+          inv={baseInv({ kind: 'hunt', huntId: '01HUNT0000000000000000000000', actions: [promotedAck] })}
           layout="page"
         />
       </MemoryRouter>,

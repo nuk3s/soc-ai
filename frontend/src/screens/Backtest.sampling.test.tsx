@@ -17,6 +17,8 @@ const state = vi.hoisted(() => ({ current: null as BacktestData | null }));
 vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
   getBacktest: vi.fn(async () => state.current),
+  getBacktestRuns: vi.fn(async () => ({ runs: [] })),
+  getHealth: vi.fn(async () => null),
   startBacktest: vi.fn(),
 }));
 

@@ -311,7 +311,7 @@ async def create_detection_override(
     if body.action != "mute":
         raise HTTPException(
             status_code=400,
-            detail={"reason": "invalid_action", "hint": "only 'mute' is supported"},
+            detail={"reason": "invalid_action", "hint": "The only supported action is mute."},
         )
     created_by = await identify_caller(request)
     async with request.app.state.db_sessionmaker() as db:
@@ -336,6 +336,6 @@ async def remove_detection_override(request: Request, override_id: int) -> dict[
     if not ok:
         raise HTTPException(
             status_code=404,
-            detail={"reason": "not_found", "hint": "no active override with that id"},
+            detail={"reason": "not_found", "hint": "soc-ai has no active override with this id."},
         )
     return {"removed": True}

@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 
 from soc_ai.api.deps import get_elastic, get_settings_dep
 from soc_ai.api.security import identify_caller
-from soc_ai.api.webui import _timeline
+from soc_ai.api.webui import _timeline, action_rules
 from soc_ai.api.webui._shared import (
     _iso_utc,
     router,
@@ -32,8 +32,18 @@ from soc_ai.store.auth import utcnow
 from soc_ai.store.models import Investigation
 from soc_ai.tools.write_exec import WRITE_TOOLS, execute_write_tool
 from soc_ai.webui import alerts_query as aq
+from soc_ai.webui import anchor_check, case_links
 
 _LOGGER = logging.getLogger(__name__)
+
+# The status of a refusal of the execute route, by the code of the rule. A
+# write against the analyst verdict is a conflict. An anchor the grid did not
+# answer for is a grid outage: the press can work later. Every other rule is
+# a bad request.
+_BLOCK_STATUS = {
+    action_rules.CODE_ANALYST: 409,
+    action_rules.CODE_ANCHOR_UNREAD: 503,
+}
 
 # Window for the group-scoped ack below. The drawer doesn't know which time
 # window the Alerts screen is showing, so use a generous fixed one — wide
@@ -505,6 +515,8 @@ class _LoadedAction:
     events: list[Any]
     next_seq: int
     anchors_a_hunt: bool
+    # What the action rule reads about the run (:mod:`action_rules`).
+    facts: action_rules.ActionFacts
     rec: dict[str, Any]
     action_key: str
     tool_name: str
@@ -527,15 +539,46 @@ async def _load_action(request: Request, inv_id: str, index: int) -> _LoadedActi
         alert_es_id = inv.alert_es_id
         # Anchor-keyed hunt check: a fresh non-hunt row over a promoted
         # finding's or lead's anchor (a POST /investigate re-run) must not
-        # launder the document past the kind-keyed guard below — the anchor is
-        # still cited telemetry with no SO alert behind it, whatever THIS
-        # row's kind says.
-        anchors_a_hunt = inv_svc.is_promoted(inv) or (
-            alert_es_id is not None and bool(await inv_svc.hunt_anchor_ids(db, [alert_es_id]))
+        # launder the document past the kind-keyed guard below — the anchor
+        # can be cited telemetry with no SO alert behind it, whatever THIS
+        # row's kind says. The grid says below whether it is an alert.
+        promoted = action_rules.promoted_kind(inv)
+        anchor = (
+            (await inv_svc.hunt_anchor_kinds(db, [alert_es_id])).get(alert_es_id)
+            if alert_es_id and not promoted
+            else None
         )
         # Every action route refuses a replay: the execute, the scope and the
         # dismissal. A replay's actions are closed on the page.
         _refuse_a_replay(inv)
+        await _refuse_a_superseded_run(db, inv)
+        analyst = (
+            (await inv_svc.analyst_verdicts_for_alerts(db, [alert_es_id])).get(alert_es_id)
+            if alert_es_id and not inv_svc.is_hunt_subject(inv)
+            else None
+        )
+    # The grid read waits until the store session is closed. A real alert
+    # that a promotion anchors takes the write (dogfood 2026-10-21).
+    anchor_status = (
+        (await anchor_check.alert_status(request.app.state, [alert_es_id])).get(
+            alert_es_id, anchor_check.UNKNOWN
+        )
+        if anchor is not None and alert_es_id
+        else anchor_check.NOT_ALERT
+    )
+    anchors_a_hunt = promoted is not None or (
+        anchor is not None and anchor_status != anchor_check.ALERT
+    )
+    facts = action_rules.ActionFacts(
+        promoted=promoted,
+        anchor=anchor,
+        anchor_status=anchor_status,
+        alert_id=alert_es_id,
+        run_verdict=inv.verdict,
+        analyst_verdict=analyst.verdict if analyst is not None else None,
+        analyst_by=analyst.resolved_by if analyst is not None else None,
+        case_id=_observed_case_id(list(events)),
+    )
     recs = report.get("recommended_actions") or []
     if index < 0 or index >= len(recs):
         raise HTTPException(status_code=404, detail={"reason": "no_such_action"})
@@ -548,6 +591,7 @@ async def _load_action(request: Request, inv_id: str, index: int) -> _LoadedActi
         events=list(events),
         next_seq=max((e.sequence for e in events), default=0) + 1,
         anchors_a_hunt=anchors_a_hunt,
+        facts=facts,
         rec=rec,
         # Idempotency identity is the action's CONTENT, not its list position: a
         # chat-resolve can replace recommended_actions and shift indexes (F04).
@@ -622,6 +666,31 @@ def _refuse_a_replay(inv: Investigation) -> None:
         )
 
 
+async def _refuse_a_superseded_run(db: Any, inv: Investigation) -> None:
+    """Refuse every action route on a run that a newer run replaced.
+
+    The page of a replaced run locks every action. The Investigations list
+    offers Execute and Dismiss on the row, and a row read before a newer run
+    started still offers them (dogfood 2026-10-19, R1-I1). This refusal holds
+    for a stale row and for a client that skips the page. The rule is the
+    detail page's, the one the override route reads.
+    """
+    from soc_ai.api.webui.routes_investigations import (  # noqa: PLC0415 - route cycle
+        superseding_run_id,
+    )
+
+    newer = await superseding_run_id(db, inv)
+    if newer:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": "superseded",
+                "invId": newer,
+                "hint": f"Investigation {newer} replaced this run. Act on that run.",
+            },
+        )
+
+
 async def _execute_action_locked(  # noqa: PLR0915 — linear single-analyst write path
     request: Request,
     *,
@@ -646,21 +715,18 @@ async def _execute_action_locked(  # noqa: PLR0915 — linear single-analyst wri
             detail={"reason": "not_executable", "tool": tool_name},
         )
 
-    if act.anchors_a_hunt:
-        # A promoted finding's anchor is cited telemetry, not an SO alert —
-        # there is nothing to ack/escalate, and the rule-keyed group ack below
-        # must never see a finding title as a rule_name. Keyed off the ANCHOR
-        # document (any hunt-kind investigation over this alert_es_id), not
-        # just this row's own kind — see anchors_a_hunt above. No `and
-        # tool_name in WRITE_TOOLS` conjunct here: the check above already
-        # 400s any non-write tool, so by this point tool_name is proven to be
-        # a write tool — restating the condition would just be dead weight.
+    # The one action rule, the one the card, the list row and the needs-you
+    # count read (V3-N2). A promoted finding's anchor is cited telemetry, not
+    # an SO alert: there is nothing to ack/escalate, and the rule-keyed group
+    # ack below must never see a finding title as a rule_name. The anchor rule
+    # keys off the ANCHOR document (any promoted investigation over this
+    # alert_es_id), not just this row's own kind. A write never acts against
+    # an analyst verdict. The demo guard refuses every write before this.
+    block = action_rules.action_block(act.facts, tool_name)
+    if block is not None:
         raise HTTPException(
-            status_code=400,
-            detail={
-                "reason": "hunt_kind_no_so_target",
-                "hint": "A promoted finding has no Security Onion alert to act on.",
-            },
+            status_code=_BLOCK_STATUS.get(block.code, 400),
+            detail={"reason": block.code, "hint": block.reason, "tool": tool_name},
         )
 
     # "Acknowledge this alert only" acts on the grid state, not on the record:
@@ -864,11 +930,30 @@ class ActionScopeOut(BaseModel):
     held: int = 0
     rangeLabel: str = ""
     sentence: str
+    # An escalate only: the cases the alert is already on. The press then
+    # opens no second case (V3-N2). ``casesComplete`` is False when the grid
+    # did not confirm the list.
+    cases: list[_timeline.CaseRefOut] = []
+    casesComplete: bool = False
 
 
 _ALERT_ONLY_ACK = "Acknowledge this alert in Security Onion."
 _ESCALATE_SENTENCE = "Open one Security Onion case for this alert."
 _COMMENT_SENTENCE = "Add a comment to the Security Onion case this investigation opened."
+_NO_SECOND_CASE = "soc-ai opens no second case."
+
+
+def cases_sentence(case_ids: list[str], *, complete: bool) -> str:
+    """Where the alert already is: "The alert is already on cases A, B."
+
+    A list the grid did not confirm names its cases as a finding, like the
+    Alerts escalate confirm: "soc-ai found the alert on case A."
+    """
+    noun = "case" if len(case_ids) == 1 else "cases"
+    joined = ", ".join(case_ids)
+    if complete:
+        return f"The alert is already on {noun} {joined}."
+    return f"soc-ai found the alert on {noun} {joined}."
 
 
 @router.get(
@@ -890,6 +975,28 @@ async def action_scope(
     """
     act = await _load_action(request, inv_id, index)
     if act.tool_name == "escalate_to_case":
+        # The cases the alert is already on, from the sources the execute
+        # route asks before it opens a case. A promotion names cited
+        # telemetry, and no case read applies to it.
+        case_ids, complete = (
+            await case_links.cases_of_alert(
+                request.app.state.db_sessionmaker, elastic, settings, act.alert_es_id
+            )
+            if act.alert_es_id and act.facts.promoted is None
+            else ([], False)
+        )
+        if case_ids:
+            return ActionScopeOut(
+                tool=act.tool_name,
+                scope="alert",
+                count=0,
+                sentence=f"{cases_sentence(case_ids, complete=complete)} {_NO_SECOND_CASE}",
+                cases=[
+                    _timeline.CaseRefOut(id=c, url=case_links.case_url(settings, c))
+                    for c in case_ids
+                ],
+                casesComplete=complete,
+            )
         return ActionScopeOut(
             tool=act.tool_name, scope="alert", count=1, sentence=_ESCALATE_SENTENCE
         )
@@ -1123,6 +1230,23 @@ async def override_verdict(
                 detail={
                     "reason": "investigation_running",
                     "hint": "Wait for the investigation to complete before you override.",
+                },
+            )
+        from soc_ai.api.webui.routes_investigations import (  # noqa: PLC0415 - route cycle
+            superseding_run_id,
+        )
+
+        newer = await superseding_run_id(db, inv)
+        if newer:
+            # A record keeps the verdict it reached. An override on it changed
+            # the verdict of a run the alert no longer stands on, and the
+            # alert row never showed it (dogfood 2026-10-19, R2-D4).
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "reason": "superseded",
+                    "invId": newer,
+                    "hint": f"Investigation {newer} replaced this run. Override that run.",
                 },
             )
         headline = _override_headline(resolved_by, body.rationale)

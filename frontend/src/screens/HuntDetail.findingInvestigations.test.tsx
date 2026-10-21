@@ -30,6 +30,7 @@ import {
   findingInvestigationStatus,
   findingsProgressLine,
   pendingActionsText,
+  sharedInvestigationText,
 } from './HuntDetail';
 
 const about: AboutInfo = {
@@ -202,6 +203,53 @@ describe('HuntDetail findings, investigated by the hunt', () => {
     await screen.findAllByText(confirmed.title);
     expect(screen.queryByTestId('findings-progress')).toBeNull();
     expect(within(card(gap.title)).queryByTestId('finding-investigation')).toBeNull();
+  });
+});
+
+// R3-D4: the range hunt of lead 18 linked one investigation to F1 and F2,
+// and each card read the verdict as its own.
+describe('a shared investigation', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getAbout).mockResolvedValue(about);
+  });
+
+  it('names the finding whose investigation a card shares', async () => {
+    const run = {
+      investigationId: 'inv-tp',
+      investigationStatus: 'complete' as const,
+      verdict: 'true_positive',
+      confidence: 0.72,
+      pendingActions: 1,
+    };
+    const first = finding(1, { ...run, sharedWith: [1], investigationSubject: 1 });
+    const second = finding(2, { ...run, sharedWith: [0], investigationSubject: 1 });
+    vi.mocked(getHunt).mockResolvedValue(hunt({ findings: [first, second, gap] }));
+    mount();
+    await screen.findAllByText(first.title);
+    expect(within(card(first.title)).getByTestId('finding-shared-investigation').textContent).toBe(
+      'Shares the investigation of F2.',
+    );
+    expect(within(card(second.title)).getByTestId('finding-shared-investigation').textContent).toBe(
+      'F1 shares this investigation.',
+    );
+    // Control: the gap card has no investigation and no note.
+    expect(within(card(gap.title)).queryByTestId('finding-shared-investigation')).toBeNull();
+  });
+
+  it('writes the note from the server fields', () => {
+    const f = finding(1);
+    expect(sharedInvestigationText(f, 0)).toBeNull();
+    expect(sharedInvestigationText({ ...f, sharedWith: [], investigationSubject: 0 }, 0)).toBeNull();
+    expect(sharedInvestigationText({ ...f, sharedWith: [1, 4], investigationSubject: 0 }, 0)).toBe(
+      'F2 and F5 share this investigation.',
+    );
+    expect(sharedInvestigationText({ ...f, sharedWith: [0], investigationSubject: 0 }, 2)).toBe(
+      'Shares the investigation of F1.',
+    );
+    expect(
+      sharedInvestigationText({ ...f, investigationOrigin: 'reused', investigationSubject: null }, 0),
+    ).toBe('Shares the investigation of an earlier hunt on the same subject.');
   });
 });
 

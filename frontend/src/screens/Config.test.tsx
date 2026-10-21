@@ -66,6 +66,7 @@ describe('Config admin write paths surface a failure instead of failing silently
     );
     const resetBtn = await screen.findByText('Reset password');
     fireEvent.click(resetBtn);
+    fireEvent.click(await screen.findByRole('button', { name: 'Reset the password' }));
     await screen.findByText('reset failed');
   });
 
@@ -76,8 +77,8 @@ describe('Config admin write paths surface a failure instead of failing silently
         <Config />
       </MemoryRouter>,
     );
-    const mintBtn = await screen.findByText('+ Mint token');
-    fireEvent.click(mintBtn);
+    fireEvent.change(await screen.findByLabelText('Token name'), { target: { value: 'siem-export' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Create token' }));
     await screen.findByText('mint failed');
   });
 
@@ -90,6 +91,7 @@ describe('Config admin write paths surface a failure instead of failing silently
     );
     const revokeBtn = await screen.findByText('Revoke');
     fireEvent.click(revokeBtn);
+    fireEvent.click(await screen.findByRole('button', { name: 'Revoke the token' }));
     await screen.findByText('revoke failed');
   });
 });
@@ -109,6 +111,7 @@ describe('reset-password banner auto-dismiss (F69)', () => {
     );
       const resetBtn = await screen.findByText('Reset password');
       fireEvent.click(resetBtn);
+      fireEvent.click(await screen.findByRole('button', { name: 'Reset the password' }));
       await screen.findByText('temp-pw');
 
       await vi.advanceTimersByTimeAsync(30000);

@@ -1,13 +1,13 @@
 # Security Onion account requirements
 
-soc-ai connects to a Security Onion 3.0 grid in 3 ways. Each way needs a different
+soc-ai connects to a Security Onion 3.0 grid on 3 paths. Each path needs a different
 privilege. SO means Security Onion in this document. A wrong privilege is the most common
 install problem. This document states what the account behind each path needs.
 
 | Path | What it does | How it authenticates | Privilege needed |
 |------|--------------|----------------------|------------------|
 | **Read / triage** | Pulls alerts, events, cases, detections and playbooks | Elasticsearch basic auth with `ES_USERNAME` and `ES_PASSWORD` | `read` and `view_index_metadata` on the events indices and the SO indices. The stock `analyst` role covers this. |
-| **Write-back** | ack / escalate-to-case / add-comment | SO web API with the SO login. The login uses a Kratos session cookie. | A real SO analyst login. It needs no ES write privilege. |
+| **Write-back** | ack / escalate-to-case / add-comment | SO web API with the SO login. The login uses a Kratos session cookie. | A valid SO analyst login. It needs no ES write privilege. |
 | **Audit log** | Tamper-evident forensic record of every action | Elasticsearch basic auth. This is the same identity as Read. | `write` and index-create on `soc-ai-audit-*`. This is NOT in the stock `analyst` role. |
 | **PCAP (optional)** | Pulls full packet captures from a sensor | SSH to the sensor with a de-privileged key | A sensor SSH key. It is not an SO role and not an ES role. |
 
@@ -32,7 +32,7 @@ Add soc-ai's source IP to SO's firewall so it can reach:
 
 **Allow-list the host IP under Docker.** The default Docker bridge network NATs the
 traffic of the container out of the address of the Docker host. SO then sees the IP of the
-Docker host. Pinhole that address. An internal `172.x` container address does not work. A
+Docker host. Allow-list that address. An internal `172.x` container address does not work. A
 host-networked deployment uses the host IP anyway. This rule holds for both methods
 below.
 
@@ -80,7 +80,7 @@ analyst login. The account needs:
   deployment the pattern is `*:logs-*` for cross-cluster search. Set the pattern in
   `.env`. `setup.sh` detects the cluster prefix and writes the concrete value. The old
   `*:so-*` form is wrong. It matches the old-style `so-*` admin indices. It misses the
-  `logs-*` data streams, so the alert queue in the console comes up empty.
+  `logs-*` data streams, so the alert queue in the console is empty.
 
   **Leave it as `logs-*`.** The grant must cover every data stream that soc-ai reads, and
   the pattern must cover them too. Some of those data streams do not belong to Security
@@ -106,7 +106,7 @@ Two consequences:
 - You need no Elasticsearch *write* privilege for ack, escalate or comment. A
   read-capable analyst login is enough. SO enforces the write authorization on its own
   side.
-- You do need a real, working SO analyst login. You also need the correct Kratos auth
+- You need a valid SO analyst login. You also need the correct Kratos auth
   prefix. SO 3.0 mounts Kratos under `/auth/...`, so leave the default:
 
   ```ini
@@ -220,25 +220,25 @@ through the root-only `curl.config`. Run the script on the manager as root or un
 sudo. After the script runs, test an ack or an escalate again. The 403 disappears
 immediately, and the action goes through.
 
-**The trap: the Superuser toggle.** SO does not expose Elasticsearch role editing in its
-web UI. People then use the only control that is exposed. They set the SO user to
+**Not recommended: the Superuser toggle.** SO does not expose Elasticsearch role editing in its
+web UI. Operators then use the only control that SO exposes. They set the SO user to
 Superuser in SOC → Administration → Users. This works, because superuser implies the
 `all` index privilege. It is also a large over-grant on a shared cluster, because
 that account can then read and write *everything* in Elasticsearch. Prefer the
 least-privilege script.
 
 If you use the toggle, allow for the ~15-minute Salt propagation lag. Salt pushes the
-role change. The change therefore does not apply at the moment you set the switch. Set the
-switch, then wait ~15 minutes before you test again. An immediate retry looks like a
-toggle that did nothing. That is the most common false "it's still broken" report.
+role change. The change therefore does not apply at the moment you set the toggle. Set the
+toggle, then wait ~15 minutes before you test again. An immediate retry looks like a
+toggle that did nothing. This retry is the most common cause of a false "still broken" report.
 
 ---
 
 ## 4. SSH access for PCAP fetch
 
-PCAP fetch is optional, and it uses no ES role and no SO role. If you enable full
-packet-capture retrieval with `PCAP_ENABLED=true`, soc-ai connects to a sensor over SSH
-and pulls Suricata's ring-buffer PCAP. It uses a separate, de-privileged sensor SSH key in
+PCAP fetch is optional, and it uses no ES role and no SO role. `PCAP_ENABLED=true` turns on
+full packet-capture retrieval. soc-ai then connects to a sensor over SSH and pulls
+Suricata's ring-buffer PCAP. It uses a separate, de-privileged sensor SSH key in
 `SO_SSH_KEY`, pointed at `SO_SSH_HOST`. That key is not an SO web login and not an
 Elasticsearch role. PCAP is off by default. See [DOCKER.md](DOCKER.md) for the key
 mount.
@@ -255,15 +255,15 @@ This deploy triages only. It has no ack, no escalate and no audit log. The stock
 - `ES_USERNAME` and `ES_PASSWORD` hold your SO analyst login.
 - Nothing else is required. You get full investigations and recommendations. The console
   shows the recommended write actions, and you apply them by hand in SO.
-- `AUDIT_FAIL_CLOSED=false` removes the audit 403 noise from the logs, and it grants
-  nothing. Under that setting a failed audit write no longer blocks a write. Use it only
+- `AUDIT_FAIL_CLOSED=false` removes the audit 403 noise from the logs. It grants no
+  privilege. Under that setting a failed audit write no longer blocks a write. Use it only
   on a read-only deploy.
 
 ### Full deploy with write-back and audit
 
 To let soc-ai ack, escalate and comment, and to keep a forensic trail:
 
-1. Put a real SO analyst login in `.env` under `SO_USERNAME` and `SO_PASSWORD`. Set
+1. Put a valid SO analyst login in `.env` under `SO_USERNAME` and `SO_PASSWORD`. Set
    `SO_KRATOS_PATH_PREFIX=/auth`.
 2. Put the same account in `ES_USERNAME` and `ES_PASSWORD` for the reads and the audit
    writes.
@@ -288,7 +288,7 @@ To let soc-ai ack, escalate and comment, and to keep a forensic trail:
 > every backing index under that stream.
 >
 > The leading dot matters. A dot-prefixed index is hidden, so a plain `logs-*` never
-> matches a `.ds-…` name directly. It does not need to.
+> matches a `.ds-…` name directly. The data-stream match is enough.
 >
 > If you write the pattern against the backing indices, you must name the Elastic Agent
 > namespace segment yourself:
@@ -299,10 +299,11 @@ To let soc-ai ack, escalate and comment, and to keep a forensic trail:
 > | `.ds-logs-*-default-*` | Elastic's stock integrations: system.auth, system.syslog, endpoint, winlog |
 > | `logs-synth-*` | soc-ai's synthetic and eval data |
 >
-> Any fragment you leave off is invisible, and nothing tells you. On 2026-08-05 a
+> soc-ai cannot see the data of a fragment that you leave off. No error reports the gap.
+> On 2026-08-05 a
 > production install ran `.ds-logs-*-so-*,logs-synth-*`. It had no access to ~117K
 > `system.auth` records and ~48M `system.syslog` records. Every query succeeded. The
-> pattern still matched 139M documents, so `soc-ai doctor` stayed green at the time. An
+> pattern still matched 139M documents, so `soc-ai doctor` passed at the time. An
 > investigation reached the wrong conclusion, because the login evidence was absent.
 >
 > The doctor's index pattern coverage check now catches this exact shape by name. It
@@ -311,7 +312,7 @@ To let soc-ai ack, escalate and comment, and to keep a forensic trail:
 >
 > If you are upgrading and you narrowed this value before, widen it now. Set
 > `EVENTS_INDEX_PATTERN=logs-*` in `.env` and restart. You can also set it live in
-> Config → Queries → Events index pattern. The live change applies to the next query.
+> Settings → Queries → Events index pattern. The live change applies to the next query.
 > Confirm the result with a count that includes the `default` namespace:
 >
 > ```bash
@@ -340,7 +341,7 @@ To let soc-ai ack, escalate and comment, and to keep a forensic trail:
 > This works, and it grants far more than soc-ai needs. It also has a ~15-minute Salt
 > propagation lag. Wait ~15 min before you test again, or the change looks ineffective.
 >
-> In both fixes the privilege must land on the `ES_USERNAME` account. The audit write
+> In both fixes, grant the privilege to the `ES_USERNAME` account. The audit write
 > uses the Elasticsearch basic-auth identity. It does not use the Kratos web login.
 
 > **Every write fails after an SO upgrade, and the doctor says `GET /api/info` answered
@@ -367,7 +368,7 @@ To let soc-ai ack, escalate and comment, and to keep a forensic trail:
 >
 > A refused session now backs off. The hold starts at 30 seconds and doubles up to ten
 > minutes. The next accepted call clears it. Fix the login flow above. Then wait one hold
-> period, and the log stops.
+> period. The log lines then stop.
 
 > **ack/escalate "succeeds" in the console, and the alert is unchanged in SO**
 >
@@ -379,6 +380,6 @@ To let soc-ai ack, escalate and comment, and to keep a forensic trail:
 >
 > Security Onion's firewall does not allow soc-ai's host through. A *timeout* or a
 > "connection refused" means that the socket never opened. A fast 401 means something
-> else. Pinhole soc-ai's IP in SO's firewall. Section 0 covers this step. Under Docker
+> else. Allow-list soc-ai's IP in SO's firewall. Section 0 covers this step. Under Docker
 > bridge networking, allow-list the Docker host's IP. The container's `172.x` address
 > does not work.

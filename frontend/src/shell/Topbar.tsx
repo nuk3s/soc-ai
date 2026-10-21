@@ -30,6 +30,8 @@ import {
 import type { Notification, Workspace } from '../lib/types';
 import { needsYouLines, useNeedsYouCount } from '../lib/needsYou';
 import { type Crumb, GUIDE_URL, crumbFor } from './pages';
+import { PALETTE_TRIGGER_ATTR, paletteKeyLabel } from './platform';
+import { UPSTREAM_COLOR, type UpstreamState, upstreamState } from './upstream';
 import { useSession } from './Session';
 import { useShell } from './ShellContext';
 import { isMachineKey } from '../lib/hostDossier';
@@ -58,14 +60,15 @@ export function WorkspaceGlyph({ name, size = 11 }: { name: string; size?: numbe
   return <>{name[0].toUpperCase()}</>;
 }
 
-/** The panel header line for the bell: "11 need you · 8 events".
+/** The panel header line for the bell: "11 need you · 8 notifications".
  *
  *  The first number is the needs-you count, the one the Dashboard tile and the
  *  sidebar badges state. The bell counted its own rows and said "None need
  *  attention" while 10 leads waited. `need` is null when the count could not
  *  be read, and `floor` marks a count that misses a part the server could not
  *  read. `undefined` is a count still being read. The second number counts
- *  the other rows on the list. */
+ *  the other rows on the list. One row has one name: a notification. The
+ *  bell said "events", the screen said "items" (dogfood 2026-10-19, V1-S7). */
 export function notificationSummary(need: number | null | undefined, events: number, floor = false): string {
   const head =
     need === undefined
@@ -73,9 +76,14 @@ export function notificationSummary(need: number | null | undefined, events: num
       : need === null
         ? 'Could not read what needs you'
         : need === 0
-          ? 'Nothing needs you'
+          ? // A zero over a part the server could not read is no answer. The
+            // header said "Nothing needs you" beside a Dashboard tile reading
+            // "0+" (dogfood 2026-10-19, H1-D10).
+            floor
+            ? 'Could not count what needs you'
+            : 'Nothing needs you'
           : `${need}${floor ? '+' : ''} need${need === 1 && !floor ? 's' : ''} you`;
-  return events > 0 ? `${head} · ${events} event${events === 1 ? '' : 's'}` : head;
+  return events > 0 ? `${head} · ${events} notification${events === 1 ? '' : 's'}` : head;
 }
 
 function isInside(target: EventTarget | null, refs: RefObject<HTMLElement | null>[]): boolean {
@@ -84,7 +92,8 @@ function isInside(target: EventTarget | null, refs: RefObject<HTMLElement | null
 }
 
 function useBreadcrumb(): Crumb {
-  return crumbFor(useLocation().pathname);
+  const { pathname, search } = useLocation();
+  return crumbFor(pathname, search);
 }
 
 export function Topbar() {
@@ -239,10 +248,28 @@ export function Topbar() {
   const healthList = health
     ? [health.es, health.llm, ...(health.so ? [health.so] : []), ...(health.pcap ? [health.pcap] : [])]
     : [];
-  const healthDown = healthList.filter((c) => !c.ok).length;
-  const healthOk = health !== null && !healthFailed && healthDown === 0;
-  // grey = initial load; amber = fetch failed or components down; green = all ok
-  const healthColor = healthFailed ? '#f5a623' : health === null ? '#6b7484' : healthOk ? '#3fb950' : '#f5a623';
+  const healthDown = healthList.filter((c) => upstreamState(c) === 'down').length;
+  const healthDegraded = healthList.filter((c) => upstreamState(c) === 'degraded').length;
+  const healthOk = health !== null && !healthFailed && healthDown === 0 && healthDegraded === 0;
+  const healthState: UpstreamState | null = healthOk
+    ? 'ok'
+    : health === null || healthFailed
+      ? null
+      : healthDown > 0
+        ? 'down'
+        : 'degraded';
+  const healthLabel = healthFailed
+    ? 'unreachable'
+    : health === null
+      ? 'checking'
+      : healthOk
+        ? 'connected'
+        : [healthDown > 0 ? `${healthDown} down` : '', healthDegraded > 0 ? `${healthDegraded} degraded` : '']
+            .filter(Boolean)
+            .join(', ');
+  // grey = initial load; amber = fetch failed or a dependency degraded;
+  // red = a dependency down; green = all ok
+  const healthColor = healthFailed ? '#f5a623' : healthState === null ? '#6b7484' : UPSTREAM_COLOR[healthState];
 
   const menusOpen = wsOpen || notifOpen || healthOpen;
 
@@ -308,10 +335,16 @@ export function Topbar() {
         : faults > 0
           ? '!'
           : null;
+  // The name states the floor the badge marks with "+". It read "34 need you"
+  // under a badge of "34+" (dogfood 2026-10-19, R1-D18).
   const bellName =
     need !== null && need > 0
-      ? `Notifications, ${need} need${need === 1 ? 's' : ''} you`
-      : badge === '!'
+      ? floor
+        ? `Notifications, ${need} or more need you`
+        : `Notifications, ${need} need${need === 1 ? 's' : ''} you`
+      : need === 0 && floor
+        ? 'Notifications, could not count what needs you'
+        : badge === '!'
         ? `Notifications, ${faults} urgent`
         : need === null && fallback > 0
           ? `Notifications, ${fallback} need${fallback === 1 ? 's' : ''} attention`
@@ -424,7 +457,8 @@ export function Topbar() {
       {/* command palette trigger */}
       <button
         onClick={openPalette}
-        title="Search or jump to. The shortcut is ⌘K."
+        {...{ [PALETTE_TRIGGER_ATTR]: '' }}
+        title={`Search or jump to. The shortcut is ${paletteKeyLabel()}.`}
         className="flex flex-none cursor-text items-center gap-2 rounded-control border border-border-2 bg-surface-1 px-2.5 py-1.5 text-faint hover:border-border-strong"
         style={{ width: 'clamp(170px,22vw,300px)' }}
       >
@@ -432,7 +466,7 @@ export function Topbar() {
           <Search size={14} />
         </span>
         <span className="flex-1 break-words text-left text-[12.5px]">Search or jump to</span>
-        <kbd className="rounded-[4px] border border-border-input px-[5px] py-px font-mono text-[10px] text-dim">⌘K</kbd>
+        <kbd className="rounded-[4px] border border-border-input px-[5px] py-px font-mono text-[10px] text-dim">{paletteKeyLabel()}</kbd>
       </button>
 
       {/* upstream health (ES / LLM / PCAP) */}
@@ -446,13 +480,14 @@ export function Topbar() {
           setNotifOpen(false);
         }}
         title="Upstream health"
+        data-state={healthState ?? undefined}
         className="flex flex-none items-center gap-1.5 rounded-control border border-border-2 px-[9px] py-1.5 font-mono text-[11.5px] text-dim hover:border-border-strong hover:text-text"
       >
         <span
           className="h-1.5 w-1.5 rounded-full"
           style={{ background: healthColor, boxShadow: `0 0 8px ${healthColor}` }}
         />
-        {healthFailed ? 'unreachable' : health === null ? 'checking' : healthOk ? 'connected' : `${healthDown} degraded`}
+        {healthLabel}
       </button>
       {/* health dropdown: ES / LLM / Security Onion / PCAP, with the PCAP hint */}
       {healthOpen && (
@@ -470,29 +505,34 @@ export function Topbar() {
           {!healthFailed && health === null && (
             <div className="px-3.5 py-6 text-center text-[12px] text-faint"><LoadingInline>Checking</LoadingInline></div>
           )}
+          {/* One term per thing: "the grid" is Security Onion and its
+              Elasticsearch, and "the model gateway" serves the model. */}
           {([
-            ['Elasticsearch', health?.es],
-            ['LLM gateway', health?.llm],
-            ['Security Onion API', health?.so],
-            ['PCAP (sensor)', health?.pcap],
-          ] as const).map(([label, c]) =>
-            c == null ? null : (
+            ['Grid: Elasticsearch', health?.es],
+            ['Model gateway', health?.llm],
+            ['Grid: Security Onion API', health?.so],
+            ['Sensor PCAP', health?.pcap],
+          ] as const).map(([label, c]) => {
+            if (c == null) return null;
+            const st = upstreamState(c);
+            const color = UPSTREAM_COLOR[st];
+            return (
               <div key={label} className="flex gap-2.5 border-b border-border-faint px-3.5 py-[11px] last:border-0">
                 <span
                   className="mt-[5px] h-[7px] w-[7px] flex-none rounded-full"
-                  style={{ background: c.ok ? '#3fb950' : '#f5a623', boxShadow: `0 0 7px ${c.ok ? '#3fb950' : '#f5a623'}` }}
+                  style={{ background: color, boxShadow: `0 0 7px ${color}` }}
                 />
                 <div className="min-w-0 flex-1">
                   <div className="text-[12.5px] font-semibold">
-                    {label} <span className={c.ok ? 'text-success' : 'text-warn'}>{c.ok ? 'ok' : 'down'}</span>
+                    {label} <span style={{ color }}>{st}</span>
                   </div>
                   <div className="mt-0.5 break-words font-mono text-[10.5px] leading-[1.5] text-faint">
                     {c.detail}
                   </div>
                 </div>
               </div>
-            )
-          )}
+            );
+          })}
           {health?.pcap == null && health !== null && (
             <div className="px-3.5 py-2.5 font-mono text-[10.5px] text-faint">
               PCAP fetch is off. The setting pcap_enabled is false.
@@ -566,7 +606,7 @@ export function Topbar() {
           <div className="max-h-[min(60vh,560px)] overflow-y-auto">
           {events.length === 0 && (
             <div className="px-3.5 py-6 text-center text-[12px] text-faint">
-              {needsYouParts.length > 0 ? 'No events.' : NO_NOTIFICATIONS}
+              {needsYouParts.length > 0 ? 'No other notifications.' : NO_NOTIFICATIONS}
             </div>
           )}
           {events.map((nt) => {

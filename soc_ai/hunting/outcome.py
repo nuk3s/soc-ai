@@ -42,7 +42,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from soc_ai.hunting.findings import finding_category, hunt_outcome
+from soc_ai.hunting.findings import finding_category, hunt_outcome, restate_failure
 
 __all__ = [
     "OUTCOMES",
@@ -64,12 +64,15 @@ class FindingVerdicts:
     ``total`` counts the subject findings. ``investigated`` counts those whose
     investigation ended, a failed one included. ``decided`` counts those whose
     investigation reached a verdict. ``threats`` counts the true positives.
+    ``findings`` counts every finding of the report, a failed-query record
+    excluded. It is 0 when the caller did not read the report.
     """
 
     total: int = 0
     investigated: int = 0
     decided: int = 0
     threats: int = 0
+    findings: int = 0
 
 
 OUTCOMES: tuple[str, ...] = (
@@ -106,17 +109,20 @@ def _findings(n: int) -> str:
 def outcome_label(outcome: str, verdicts: FindingVerdicts | None = None) -> str:
     """The words for one outcome, with the counts when the outcome has them.
 
-    ``investigating`` reads "Investigating 2 of 3 findings" and
-    ``threats_confirmed`` reads "2 of 3 findings are threats". Without a
-    summary each reads its plain label.
+    ``investigating`` reads "Investigating 2 of 3 findings": the subject
+    findings. ``threats_confirmed`` reads "2 of 5 findings are threats": the
+    confirmed threat findings over every finding of the report, so the label
+    and the list row count one set of findings. Without a summary each reads
+    its plain label.
     """
     if verdicts is not None and verdicts.total > 0:
         total = verdicts.total
         if outcome == "investigating":
             return f"Investigating {verdicts.investigated} of {_findings(total)}"
         if outcome == "threats_confirmed":
+            every = max(verdicts.findings, total)
             verb = "is a threat" if verdicts.threats == 1 else "are threats"
-            return f"{verdicts.threats} of {_findings(total)} {verb}"
+            return f"{verdicts.threats} of {_findings(every)} {verb}"
     return OUTCOME_LABEL.get(outcome, "")
 
 
@@ -154,6 +160,7 @@ GRID_WINDOW_SENTENCE = "The grid answers 30 days back."
 # catalog composer already turned the exception into a phrase
 # (soc_ai.hunting.findings.plain_error); this maps that phrase to the grid.
 _GRID_REASONS: tuple[tuple[str, str], ...] = (
+    ("the answer is incomplete", "The grid answered from part of its shards."),
     ("did not accept a connection", "The grid did not accept a connection."),
     ("did not answer in time", "The grid did not answer in time."),
     ("rejected the credentials", "The grid refused the credentials."),
@@ -237,7 +244,9 @@ def could_not_run_reason(status: str, findings: Any, narrative: str | None) -> s
         text = (narrative or "").strip()
         return text or "The hunt ended in an error. The server recorded no reason."
     failures = [f for f in _rows(findings) if is_run_failure(f)]
-    source = " ".join(str(f.get("detail") or "") for f in failures) or (narrative or "")
+    # A hunt stored before the plain words keeps the grid client's raw text,
+    # and the raw text read as a refused query (V1-H7).
+    source = " ".join(restate_failure(f.get("detail")) for f in failures) or (narrative or "")
     return f"{grid_reason(source)} {_HUNT_AGAIN}"
 
 

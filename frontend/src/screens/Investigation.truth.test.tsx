@@ -69,14 +69,14 @@ describe('a needs_more_info verdict (P2)', () => {
     mount({ verdict: 'needs_more_info', openQuestions: [] });
     expect(screen.getByRole('button', { name: /request more info/i })).toBeTruthy();
     expect(screen.getByRole('button', { name: /resolve in chat/i })).toBeTruthy();
-    expect(screen.queryByText(/Verdict settled\. Take action\./i)).toBeNull();
+    expect(screen.queryByText('No automatic action')).toBeNull();
     expect(screen.queryByRole('button', { name: /^acknowledge$/i })).toBeNull();
   });
 
   it('still offers the settled bar on a committed verdict', () => {
     // Negative control: the fix must not take the bar off a real verdict.
     mount({ verdict: 'false_positive' });
-    expect(screen.getByText(/Verdict settled\. Take action\./i)).toBeTruthy();
+    expect(screen.getByText('No automatic action')).toBeTruthy();
     expect(screen.queryByRole('button', { name: /request more info/i })).toBeNull();
   });
 });

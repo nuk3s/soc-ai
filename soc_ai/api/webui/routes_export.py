@@ -209,13 +209,13 @@ def _analyst_preview_note(
     caveat that doesn't apply to THIS investigation's stored events.
     """
     parts = [
-        "soc-ai rebuilt this preview from the investigation's stored events. It "
-        "redacted them with the CURRENT identifier configuration. This is a "
-        "simulation of the analyst-path egress. It is not a byte-replay of the "
+        "soc-ai rebuilt this preview from the stored events of the investigation. "
+        "It redacted them with the CURRENT identifier configuration. The preview "
+        "simulates the analyst egress. It does not replay the bytes of the "
         "original run.",
-        "soc-ai writes the stored enriched context before any redaction. Local "
-        "storage never egresses. The original side is the true raw prompt "
-        "material. This holds even for runs that executed with redaction on.",
+        "soc-ai stores the enriched context before any redaction. The local store "
+        "sends nothing out. The original side shows the raw prompt material. This "
+        "is also true for a run with redaction on.",
     ]
     if not redaction_enabled:
         parts.append(

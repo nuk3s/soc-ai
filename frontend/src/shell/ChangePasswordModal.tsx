@@ -28,6 +28,7 @@ const REASON_FIELD: Record<string, ErrField> = {
   bad_credentials: 'current',
   password_too_short: 'new',
   password_too_long: 'new',
+  password_unchanged: 'new',
 };
 
 interface Props {
@@ -92,6 +93,12 @@ export function ChangePasswordModal({ open, onClose, returnFocusRef }: Props) {
   function submit(e: React.FormEvent) {
     e.preventDefault();
     if (saving) return;
+    // An empty Current field reached the server, and its 422 text landed
+    // under Confirm (dogfood 2026-10-19, H1-D16).
+    if (!current) {
+      setErr({ field: 'current', message: 'Enter your current password.' });
+      return;
+    }
     if (next.length < MIN_PASSWORD_LENGTH) {
       setErr({
         field: 'new',
@@ -101,6 +108,15 @@ export function ChangePasswordModal({ open, onClose, returnFocusRef }: Props) {
     }
     if (next !== confirm) {
       setErr({ field: 'confirm', message: 'The new passwords do not match.' });
+      return;
+    }
+    // The server refuses it too. A change to the same password left the
+    // generated password live (dogfood 2026-10-19, H1-D4).
+    if (next === current) {
+      setErr({
+        field: 'new',
+        message: 'The new password is the same as the current password. Enter a different password.',
+      });
       return;
     }
     setErr(null);
@@ -138,7 +154,7 @@ export function ChangePasswordModal({ open, onClose, returnFocusRef }: Props) {
         aria-modal="true"
         aria-label="Change password"
         tabIndex={-1}
-        className="fixed left-1/2 top-1/2 z-[61] -translate-x-1/2 -translate-y-1/2 animate-fadeUp overflow-hidden rounded-panel-lg border border-border-input bg-surface-card shadow-palette outline-none"
+        className="fixed left-1/2 top-1/2 z-[61] max-h-[calc(100vh-32px)] -translate-x-1/2 -translate-y-1/2 animate-fadeUp overflow-y-auto rounded-panel-lg border border-border-input bg-surface-card shadow-palette outline-none"
         style={{ width: 'min(400px,92vw)' }}
       >
         <div className="flex items-center justify-between border-b border-border-2 px-4 py-[13px]">

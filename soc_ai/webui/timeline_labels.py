@@ -69,6 +69,8 @@ _ICON: dict[str, str] = {
     "alert_context": "📎",
     "classification": "🏷",
     "investigation_loop_entered": "🔎",
+    "swarm_agent_started": "🔎",
+    "swarm_agent_finished": "📝",
     "tool_call": "🔧",
     "tool_result": "📥",
     "targeted_dispatch": "🎯",
@@ -78,6 +80,7 @@ _ICON: dict[str, str] = {
     "prior_outcomes": "📚",
     "chat_memory": "💬",
     "session_prior": "🔗",
+    "analyst_verdict": "👤",
     "session_verdict_conflict": "⚖️",
     "template_grounds_adopted": "🧩",
     "investigator_evidence_carried": "📝",
@@ -373,7 +376,7 @@ def _t_alert_context(p: dict[str, Any]) -> str:
     "Subject: hunt" said "Loaded alert context + enrichments" one row below.
     """
     if p.get("subject") != "hunt":
-        return "Loaded alert context + enrichments"
+        return "soc-ai loaded the alert and its enrichments"
     findings = p.get("subject_findings")
     documents = p.get("subject_documents")
     return (
@@ -424,8 +427,14 @@ def _t_session_prior(p: dict[str, Any]) -> str:
         else []
     )
     if not ids:
-        return "Same network session already investigated"
-    return f"Same network session already investigated: {', '.join(ids)}"
+        return "Another alert on this network session has a verdict"
+    return f"Another alert on this network session has a verdict: {', '.join(ids)}"
+
+
+def _t_analyst_verdict(p: dict[str, Any]) -> str:
+    """An analyst set this alert's verdict on an earlier run (R2-D1)."""
+    verdict = _humanize(p.get("verdict")) or "a verdict"
+    return f"Read the analyst verdict on this alert: {verdict.lower()}"
 
 
 def _t_session_verdict_conflict(p: dict[str, Any]) -> str:
@@ -641,6 +650,31 @@ def _t_error(p: dict[str, Any]) -> str:
     return "Error: " + (_phrase(p.get("message") or p.get("error")) or "see details")
 
 
+def _swarm_agent_label(p: dict[str, Any]) -> str:
+    label = str(p.get("label") or "").strip() or _humanize(str(p.get("role") or "agent"))
+    return label[0].upper() + label[1:] if label else "Agent"
+
+
+def _t_swarm_agent_started(p: dict[str, Any]) -> str:
+    limit = p.get("tool_calls_limit")
+    calls = f" with {_count(limit, 'tool call')}" if isinstance(limit, int) and limit > 0 else ""
+    return f"{_swarm_agent_label(p)} started{calls}"
+
+
+_SWARM_STATUS_PHRASE = {
+    "complete": "finished",
+    "limit": "stopped at its limit",
+    "error": "failed",
+}
+
+
+def _t_swarm_agent_finished(p: dict[str, Any]) -> str:
+    phrase = _SWARM_STATUS_PHRASE.get(str(p.get("status") or ""), "finished")
+    calls = p.get("tool_calls")
+    tail = f": {_count(calls, 'tool call')}" if isinstance(calls, int) else ""
+    return f"{_swarm_agent_label(p)} {phrase}{tail}"
+
+
 def _t_usage(p: dict[str, Any]) -> str:
     return (
         f"Model call · {p.get('phase', '?')} round {p.get('round', '?')} "
@@ -696,6 +730,7 @@ _DYNAMIC_TITLES: dict[str, Callable[[dict[str, Any]], str]] = {
     "prior_outcomes": _t_prior_outcomes,
     "chat_memory": _t_chat_memory,
     "session_prior": _t_session_prior,
+    "analyst_verdict": _t_analyst_verdict,
     "session_verdict_conflict": _t_session_verdict_conflict,
     "template_grounds_adopted": _t_template_grounds_adopted,
     "investigator_evidence_carried": _t_investigator_evidence_carried,
@@ -721,6 +756,8 @@ _DYNAMIC_TITLES: dict[str, Callable[[dict[str, Any]], str]] = {
     "done": _t_done,
     "error": _t_error,
     "usage": _t_usage,
+    "swarm_agent_started": _t_swarm_agent_started,
+    "swarm_agent_finished": _t_swarm_agent_finished,
 }
 
 

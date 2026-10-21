@@ -79,8 +79,8 @@ export function NeedsYouStrip() {
           </span>
           {/* The strip does not read the page window, so each line states
               its scope in visible words. The hit count holds every unread
-              hit, and the hits block lists the last 7 days, so the link
-              names the 7 days it opens. */}
+              hit, and the Unread filter of the hits block lists every one at
+              any age (R3-D9), so the link reaches each hit it counts. */}
           {data.unread_shadow_hits > 0 && (
             <span data-testid="needs-you-hits" className="text-[12.5px]">
               <span className="text-text-2">
@@ -89,7 +89,7 @@ export function NeedsYouStrip() {
               </span>
               <span className="text-faint"> · all unread · </span>
               <Link to={to('hits', 'unread', HITS_ANCHOR)} className="text-accent hover:underline">
-                Read the last 7 days
+                Show the unread hits
               </Link>
             </span>
           )}

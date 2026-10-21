@@ -13,7 +13,7 @@ import {
   type AnalyticHits as AnalyticHitsPage,
   type HuntCatalog,
 } from '../lib/api';
-import { loopRuns } from '../lib/analyticRuns';
+import { evaluations, loopRuns, runsInProfileSweep } from '../lib/analyticRuns';
 import { entityPath as pathOfEntity } from '../lib/entityPath';
 import { plural } from '../lib/plural';
 import { absTime, ago } from '../lib/timeRange';
@@ -23,6 +23,7 @@ import {
   CHIP_LOCAL,
   CHIP_NO_LEAD,
   CHIP_RECORDED_IN_SHADOW,
+  CHIP_RECORDED_LIVE,
   CHIP_SHADOW,
   CHIP_SHIPPED,
   HIT_FILTER_ALL,
@@ -34,7 +35,7 @@ import {
 } from '../lib/tooltips';
 import { useAsync } from '../lib/useAsync';
 import { AnalyticDrawer } from './AnalyticDrawer';
-import { DISMISS_REASONS, REASON_LABEL } from './LeadsStrip';
+import { DISMISS_REASONS, REASON_LABEL, benignLine } from './LeadsStrip';
 import { Definition } from './Definition';
 import { DocumentChip } from './DocumentDrawer';
 import { CollapseChevron, Panel } from './Panel';
@@ -114,13 +115,32 @@ const FILTERS: { id: AnalyticHitFilter; label: string; title: string }[] = [
 ];
 
 /** What an empty hit list means. "No analytic matched a document the sweeps
- *  read" was a false all-clear on a grid where no sweep had run. */
+ *  read" was a false all-clear on a grid where no sweep had run.
+ *
+ *  A loop whose last run failed, and a profile sweep that measured no host,
+ *  found nothing because it read nothing. "The profile analytics found
+ *  nothing." over a dead grid was the same false all-clear (dogfood
+ *  2026-10-19 H1-D2). */
 export function emptyHitsText(catalog: HuntCatalog | null | undefined): string {
   const head = 'No analytic hit in the last 7 days.';
   if (!catalog) return `${head} soc-ai cannot tell if the sweeps ran.`;
   const match = loopRuns(catalog, 'match');
   const profile = loopRuns(catalog, 'profile');
-  if (match && profile !== false) return `${head} No analytic matched a document the sweeps read.`;
+  const matchFailed = match !== false && catalog.sweep_health?.last_outcome === 'failed';
+  const priorHealth = catalog.prior_sweep_health;
+  const profileFailed =
+    catalog.prior_sweeps_enabled !== false && !!priorHealth && priorHealth.last_outcome !== 'ok';
+  const profiled = catalog.specs.filter(
+    (s) => runsInProfileSweep(s.evaluator) && s.status !== 'retired' && s.coverage,
+  );
+  const profileUnmeasured =
+    !!profile &&
+    !profileFailed &&
+    profiled.length > 0 &&
+    profiled.every((s) => s.coverage && evaluations(s.coverage) === 0);
+  if (match && profile !== false && !matchFailed && !profileFailed && !profileUnmeasured) {
+    return `${head} No analytic matched a document the sweeps read.`;
+  }
   const parts = [head];
   if (!match) {
     parts.push(
@@ -129,15 +149,18 @@ export function emptyHitsText(catalog: HuntCatalog | null | undefined): string {
         : 'Sweeps are off. The match analytics do not run.',
     );
   }
-  if (profile === false) {
+  if (profile === false && !profileFailed) {
     parts.push(
       catalog.prior_sweeps_enabled === false
         ? 'The profile sweep is off. The profile analytics do not run.'
         : 'The profile sweep has not run yet.',
     );
   }
-  if (match) parts.push('The match analytics found nothing.');
-  if (profile) parts.push('The profile analytics found nothing.');
+  if (matchFailed) parts.push('The last analytic sweep could not read the grid.');
+  else if (match) parts.push('The match analytics found nothing.');
+  if (profileFailed) parts.push('The last profile sweep could not read the grid.');
+  else if (profileUnmeasured) parts.push('The profile analytics measured no host.');
+  else if (profile) parts.push('The profile analytics found nothing.');
   return parts.join(' ');
 }
 
@@ -598,6 +621,12 @@ function HitCard({
           {!recordedLive && liveAnalytic && (
             <Chip label="recorded in shadow" title={CHIP_RECORDED_IN_SHADOW} tone="faint" />
           )}
+          {/* The other way round: the hit lists under Live and its analytic
+              reads shadow, because soc-ai or an analyst moved it after the hit
+              (R3-D11). */}
+          {recordedLive && shadowAnalytic && (
+            <Chip label="recorded live" title={CHIP_RECORDED_LIVE} tone="faint" />
+          )}
           <Chip
             label={hit.tier === 'shipped' ? 'shipped' : 'local'}
             title={hit.tier === 'shipped' ? CHIP_SHIPPED : CHIP_LOCAL}
@@ -660,11 +689,15 @@ function HitCard({
             {summary}
           </div>
         )}
+        {recordedLive && shadowAnalytic && hit.analytic_held_by_system && (
+          <div data-testid="analytic-hit-held" className="mt-1.5 text-[11.5px] text-warn">
+            {`soc-ai held this analytic in shadow after this hit. ${hit.analytic_held_by_system} ` +
+              'The hit counts toward a lead. Approve or reject the analytic.'}
+          </div>
+        )}
         {benign && (
           <div data-testid="analytic-hit-benign" className="mt-1.5 text-[11.5px] text-dim">
-            {`Marked benign${hit.dismissed_by ? ` by ${hit.dismissed_by}` : ''}: ${
-              REASON_LABEL[hit.dismissed_reason ?? ''] ?? hit.dismissed_reason
-            }. It counts toward no lead.`}
+            {benignLine(hit)}
           </div>
         )}
         {!provable && (

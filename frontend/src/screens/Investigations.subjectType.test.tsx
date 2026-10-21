@@ -63,11 +63,23 @@ beforeEach(() => {
 
 describe('the subject type chip', () => {
   it('names a hunt subject beside the detection type, with its sentence', async () => {
-    listInvestigations.mockResolvedValue(list([row({ subjectType: 'hunt' })]));
+    listInvestigations.mockResolvedValue(
+      list([row({ kind: 'lead' as never, subjectType: 'hunt' })]),
+    );
     mount();
     const chip = await screen.findByTestId('subject-type-INV-X');
     expect(chip.textContent).toBe('hunt');
     expect(chip.getAttribute('title')).toBe(CHIP_SUBJECT_HUNT);
+  });
+
+  // The type chip of a hunt run says that the subject is the hunt. The row
+  // showed "HUNT" and "hunt" side by side (dogfood 2026-10-19, STE item 30).
+  it('carries no second chip on a hunt run', async () => {
+    listInvestigations.mockResolvedValue(list([row({ kind: 'hunt', subjectType: 'hunt' })]));
+    mount();
+    await screen.findByText(/directory replication/);
+    expect(screen.queryByTestId('subject-type-INV-X')).toBeNull();
+    expect(screen.getByTitle(detectionKindTitle('hunt')).textContent).toBe('hunt');
   });
 
   it('carries no chip on a run whose subject is one alert', async () => {
@@ -106,7 +118,9 @@ describe('the subject type chip', () => {
   // The two chips answer two questions: what raised it, and what it read. The
   // subject chip stands beside the detection chip, it does not replace it.
   it('keeps the detection type chip beside it', async () => {
-    listInvestigations.mockResolvedValue(list([row({ subjectType: 'hunt' })]));
+    listInvestigations.mockResolvedValue(
+      list([row({ kind: 'lead' as never, subjectType: 'hunt' })]),
+    );
     mount();
     const chip = await screen.findByTestId('subject-type-INV-X');
     const rowEl = chip.parentElement as HTMLElement;

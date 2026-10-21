@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -296,7 +297,17 @@ def test_catalog_includes_dataset_discovery_tools() -> None:
     assert "describe_dataset" in names
     assert "field_values" in names
 
-    settings = SimpleNamespace(es_hosts=["https://es:9200"])
+    # The enrichment rows also read the local feed directories.
+    no_feeds = Path("/nonexistent/soc-ai-test-feeds")
+    settings = SimpleNamespace(
+        es_hosts=["https://es:9200"],
+        blocklist_data_dir=no_feeds,
+        maxmind_data_dir=no_feeds,
+        cloud_prefix_data_dir=no_feeds,
+        blocklist_sources=["tor"],
+        blocklist_stale_threshold_days=7,
+        cloud_prefix_stale_threshold_days=45,
+    )
     tools = {t.name: t for t in collect_agent_tools(settings)}
     for n in ("describe_dataset", "field_values"):
         assert tools[n].read_only is True

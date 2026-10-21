@@ -242,6 +242,9 @@ async def test_a_withheld_dissent_on_a_local_false_positive_blocks_the_auto_ack(
     settings_kratos.auto_ack_fp_threshold = 0.5
     ctx = MagicMock()
     ctx.settings = settings_kratos
+    # No store, so no analyst verdict to read. A MagicMock store would answer
+    # nothing usable and the analyst-verdict guard would fail closed first.
+    ctx.db_sessionmaker = None
     report = TriageReport(
         verdict="false_positive",
         confidence=0.95,

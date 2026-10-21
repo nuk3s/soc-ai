@@ -59,6 +59,17 @@ describe('ago', () => {
     expect(ago(before(59 * 60_000), now)).toBe('59m ago');
   });
 
+  it('reads in months from 60 days and in years from 24 months', () => {
+    // The host header read "first seen 395d ago" for a host the operator
+    // thinks of as a year old. The list and the header share this rule.
+    const now = Date.UTC(2026, 9, 6, 12, 0, 0);
+    const days = (n: number) => new Date(now - n * 86_400_000).toISOString();
+    expect(ago(days(59), now)).toBe('59d ago');
+    expect(ago(days(61), now)).toBe('2mo ago');
+    expect(ago(days(400), now)).toBe('13mo ago');
+    expect(ago(days(900), now)).toBe('2y ago');
+  });
+
   it('takes an epoch number too', () => {
     const now = Date.UTC(2026, 9, 6, 12, 0, 0);
     expect(ago(now - 2 * 86_400_000, now)).toBe('2d ago');

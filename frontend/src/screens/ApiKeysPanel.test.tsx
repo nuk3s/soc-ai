@@ -5,6 +5,7 @@
 // the provider. Every other destructive action in the app arms an inline
 // two-step confirm; this panel does the same, keyed per row.
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ApiKeyField } from '../lib/api';
 
@@ -121,5 +122,111 @@ describe('ApiKeysPanel clear confirm', () => {
     expect(screen.queryByRole('button', { name: 'Confirm clear' })).toBeNull();
     expect(screen.getByRole('button', { name: 'Clear' })).toBeInTheDocument();
     expect(clearApiKeyMock).not.toHaveBeenCalled();
+  });
+});
+
+// Dogfood 2026-10-19 (R5-D17, R5-D21): the intro said every key was for "the
+// opt-in online enrichment tools" and applied live, while the MISP key help
+// said it needs a restart, and MaxMind, abuse.ch and crawl4ai are no online
+// enrichment. The help strings rendered raw backticks.
+const MISP: ApiKeyField = {
+  key: 'misp_api_key',
+  label: 'MISP API key',
+  help: 'soc-ai builds the MISP client at startup, so a new key needs a restart.',
+  isSet: false,
+  source: 'unset',
+};
+
+const ABUSE: ApiKeyField = {
+  key: 'abuse_ch_auth_key',
+  label: 'abuse.ch auth key',
+  help: '`soc-ai blocklists refresh` uses this key to download the URLhaus feed.',
+  isSet: false,
+  source: 'unset',
+};
+
+function renderInRouter() {
+  return render(
+    <MemoryRouter>
+      <ApiKeysPanel />
+    </MemoryRouter>,
+  );
+}
+
+describe('ApiKeysPanel text', () => {
+  it('says which keys apply live and which key needs a restart', async () => {
+    getApiKeysMock.mockResolvedValue([MAXMIND]);
+    renderInRouter();
+    await screen.findByText('MaxMind');
+    const intro = screen.getByTestId('api-keys-intro').textContent ?? '';
+    expect(intro).toContain('The MISP key applies after a restart.');
+    expect(intro).not.toContain('A new key applies live without a restart.');
+    expect(intro).not.toContain('for the opt-in online enrichment tools');
+    expect(
+      within(screen.getByTestId('api-keys-intro'))
+        .getByRole('link', { name: 'Settings > Online enrichment' })
+        .getAttribute('href'),
+    ).toBe('/config#online-enrichment');
+  });
+
+  it('renders a code span in a key help as code', async () => {
+    getApiKeysMock.mockResolvedValue([ABUSE]);
+    renderInRouter();
+    await screen.findByText('abuse.ch auth key');
+    const help = row('abuse.ch auth key');
+    expect(help.querySelector('code')?.textContent).toBe('soc-ai blocklists refresh');
+    expect(help.textContent).not.toContain('`');
+  });
+
+  it('tells the operator to restart after a new MISP key', async () => {
+    getApiKeysMock.mockResolvedValue([MISP]);
+    saveApiKeyMock.mockResolvedValue({ ok: true, isSet: true });
+    renderInRouter();
+    fireEvent.click(await screen.findByRole('button', { name: 'Set' }));
+    fireEvent.change(screen.getByPlaceholderText('Paste the key here'), { target: { value: 'k' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    expect(await screen.findByText('soc-ai saved the key. Restart soc-ai to apply it.')).toBeTruthy();
+    expect(screen.queryByText(/applies live/)).toBeNull();
+  });
+
+  it('says a hot key applies live', async () => {
+    getApiKeysMock.mockResolvedValue([{ ...SHODAN, isSet: false, source: 'unset' }]);
+    saveApiKeyMock.mockResolvedValue({ ok: true, isSet: true });
+    renderInRouter();
+    fireEvent.click(await screen.findByRole('button', { name: 'Set' }));
+    fireEvent.change(screen.getByPlaceholderText('Paste the key here'), { target: { value: 'k' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    expect(await screen.findByText('soc-ai saved the key. The key applies live.')).toBeTruthy();
+  });
+});
+
+// Dogfood round 2 (V2-4): with CONFIG_SECRET_KEY unset, Set opened a field
+// and Save answered "Set CONFIG_SECRET_KEY to store API keys via the UI." GET
+// now carries can_store, as the webhook panel reads it.
+describe('ApiKeysPanel store hint', () => {
+  const HINT =
+    'Set CONFIG_SECRET_KEY on the server and restart soc-ai. soc-ai then stores the API keys encrypted.';
+
+  it('turns off Set and Replace and states the reason when the server cannot store a key', async () => {
+    getApiKeysMock.mockResolvedValue([
+      { ...SHODAN, isSet: false, source: 'unset', can_store: false, store_hint: HINT },
+      { ...MAXMIND, source: 'env', can_store: false, store_hint: HINT },
+    ]);
+    renderInRouter();
+    expect((await screen.findByTestId('api-keys-store-hint')).textContent).toBe(HINT);
+    const set = screen.getByRole('button', { name: 'Set' });
+    const replace = screen.getByRole('button', { name: 'Replace' });
+    expect(set).toBeDisabled();
+    expect(replace).toBeDisabled();
+    expect(set.getAttribute('title')).toBe(HINT);
+    fireEvent.click(set);
+    expect(screen.queryByPlaceholderText('Paste the key here')).toBeNull();
+  });
+
+  it('keeps Set on for a server that can store, or one older than the field', async () => {
+    getApiKeysMock.mockResolvedValue([{ ...SHODAN, isSet: false, source: 'unset' }]);
+    renderInRouter();
+    expect(await screen.findByRole('button', { name: 'Set' })).toBeEnabled();
+    expect(screen.queryByTestId('api-keys-store-hint')).toBeNull();
   });
 });

@@ -492,6 +492,7 @@ def build_general_context_block(
     verdict_counts: Mapping[str, int] | None = None,
     top_rules: Sequence[tuple[str, int]] | None = None,
     window_hours: int = 24,
+    gap_lines: Sequence[str] = (),
 ) -> str:
     """Render the general chat's seed block: THE GRID, in place of one alert.
 
@@ -512,6 +513,11 @@ def build_general_context_block(
     whole: it is already bounded by the discovery aggregation, and "what data
     do I have?" is the canonical question this chat exists to answer — an
     inventory clipped here would answer it wrongly, with confidence.
+
+    ``gap_lines`` are the grid gaps of the last 30 days, one fact line each
+    (:func:`soc_ai.store.grid_gaps.fact_lines`). The chat called a host
+    "simply inactive" over four days the grid held no data (dogfood
+    2026-10-19, R1-D5).
     """
     lines = ["### This grid"]
     lines.extend(_identifier_lines(identifiers))
@@ -525,6 +531,7 @@ def build_general_context_block(
         "before you conclude that a data type is absent. Neither field names every "
         "plane. A document may carry only one of them."
     )
+    lines.extend(gap_lines)
     lines.append("")
     lines.extend(_posture_lines(verdict_counts, top_rules, window_hours))
     return "\n".join(lines)

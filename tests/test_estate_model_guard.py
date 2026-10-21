@@ -356,8 +356,8 @@ def test_the_setting_is_off_by_default_and_in_the_console() -> None:
     assert spec.hot
     assert spec.section == "Behavioural profiles"
     assert (
-        "The model needs an extra package your deployment may not have installed. "
-        "Diagnostics shows whether it is present." in spec.help
+        "This feature needs an extra package that your deployment may not have. "
+        "Settings > Diagnostics shows whether it is present." in spec.help
     )
     assert "ml extra" not in spec.help
     assert "—" not in spec.help and "–" not in spec.help

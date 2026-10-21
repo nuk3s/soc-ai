@@ -11,14 +11,14 @@ The demo takes 5 minutes. It needs no Security Onion grid and no model.
 ```bash
 git clone https://github.com/nuk3s/soc-ai.git && cd soc-ai
 docker compose -f docker-compose.demo.yml up --build
-# → http://127.0.0.1:8080/app/alerts
+# → http://127.0.0.1:8080/app/
 ```
 
 The demo replays recorded investigations, hunts and a backtest on canned data.
 It runs the same console that you connect to your grid later. The demo also
 carries a week of hunt catalog sweeps. The catalog panel on the Status page and
 the Catalog preset on the Hunts screen show the declarative catalog at work.
-No data leaves the box. The hosted copy is
+No data leaves the host. The hosted copy is
 [the live demo](https://soc-ai-demo.onrender.com/). It needs no install and no
 login.
 
@@ -110,9 +110,9 @@ Run the doctor again at any time with
 4. Pick a detection and press **Investigate**.
 
 The agent then works in front of you. It pulls the alert with its Zeek and PCAP
-context, enriches the indicators, and lands a verdict that cites its evidence.
-Each write-back waits for your click. If you turned on auto-triage, the backlog
-drains on its own. Look again after 5 minutes.
+context, enriches the indicators, and writes a verdict that cites its evidence.
+Each write-back waits for your click. If you turned on auto-triage, auto-triage
+works through the backlog. Look again after 5 minutes.
 
 ![The soc-ai console: an investigation showing the verdict, confidence, reasoning, recommended actions, and the agent's evidence timeline](img/screenshot-investigation.png)
 

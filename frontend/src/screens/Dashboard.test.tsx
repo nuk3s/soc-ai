@@ -205,7 +205,7 @@ describe('Dashboard quality eval — demo guard', () => {
       </MemoryRouter>,
     );
     fireEvent.click(await screen.findByText('Run now'));
-    await screen.findByText(/Not available in the read-only demo/);
+    await screen.findByText(/The read-only demo blocks this action/);
     expect(startQualityEvalMock).not.toHaveBeenCalled();
   });
 });
@@ -257,15 +257,15 @@ describe('Dashboard recent-investigations row layout', () => {
 
 
 // The running tile read "of the 16 most recent, any time" when 16 was every
-// investigation there is. With the whole set on the page it says "all".
+// investigation there is. With the whole set on the page it names the count.
 describe('Dashboard running tile scope', () => {
-  it('says "all" when the page holds every investigation', async () => {
+  it('names the count when the page holds every investigation', async () => {
     render(
       <MemoryRouter>
         <Dashboard />
       </MemoryRouter>,
     );
-    await screen.findByText(`of all ${ROWS.length}`);
+    await screen.findByText(`now, of ${ROWS.length} investigations on record`);
     expect(screen.queryByText(/most recent, any time/)).toBeNull();
   });
 });
@@ -295,7 +295,7 @@ describe('Dashboard shadow-hit KPI', () => {
     const tile = await screen.findByTestId('kpi-shadow-hits');
     expect(within(tile).getByText('Shadow hits · all unread')).toBeTruthy();
     expect(within(tile).getByText('2')).toBeTruthy();
-    expect(within(tile).getByText(/Read the last 7 days on Hunts/)).toBeTruthy();
+    expect(within(tile).getByText(/Read them on Hunts/)).toBeTruthy();
   });
 
   // The whole card was a button that navigated. The click is on the words that
@@ -309,8 +309,10 @@ describe('Dashboard shadow-hit KPI', () => {
     );
     const tile = await screen.findByTestId('kpi-shadow-hits');
     expect(tile.tagName).toBe('DIV');
-    expect(within(tile).getByRole('link', { name: /Read the last 7 days on Hunts/ }).getAttribute('href')).toBe(
-      '/hunts?hits=unread',
+    // R1-D12 residual: the link lands on the hits block, the anchor of the
+    // Needs-you line. The block sits below the fold of the Hunts page.
+    expect(within(tile).getByRole('link', { name: /Read them on Hunts/ }).getAttribute('href')).toBe(
+      '/hunts?hits=unread#analytic-hits',
     );
     expect(within(tile).getByText('2').getAttribute('title')).toBe(COUNT_UNREAD_SHADOW_HITS);
   });

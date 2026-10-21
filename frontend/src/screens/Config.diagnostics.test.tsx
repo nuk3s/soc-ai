@@ -72,6 +72,8 @@ vi.mock('../lib/api', async (importOriginal) => ({
       { name: 'prompt assets', status: 'PASS', detail: '2 assets are present', hint: '' },
       { name: 'blocklists', status: 'WARN', detail: 'no feed is loaded', hint: '' },
       { name: 'auth', status: 'WARN', detail: 'sign-in is off', hint: '' },
+      // Last in the list, first in the header: the chips sort by grade.
+      { name: 'elasticsearch', status: 'FAIL', detail: 'the grid does not answer', hint: '' },
     ],
   }),
   refreshPreflight: vi.fn(),
@@ -511,12 +513,29 @@ describe('Diagnostics, the doctor list', () => {
   });
 });
 
-// The 2 WARN rows sat among 31 with no filter (dogfood 2026-10-06, 5.6).
-describe('Diagnostics, the warnings chip', () => {
+// The 2 WARN rows sat among 31 with no filter (dogfood 2026-10-06, 5.6). The
+// one chip counted WARN only and read "4 warnings" while 6 checks failed
+// (dogfood 2026-10-19, H1-D9): one chip per grade now, FAIL first.
+describe('Diagnostics, the grade chips', () => {
+  it('shows a chip per grade with rows, FAIL first', async () => {
+    renderDiagnostics();
+    const warn = await screen.findByTestId('doctor-warn-chip');
+    const chips = warn.parentElement!.querySelectorAll('button');
+    const grades = [...chips].map((c) => c.textContent?.split(' ')[1]);
+    const order = ['FAIL', 'WARN', 'INFO'].filter((g) => grades.includes(g));
+    expect(grades).toEqual(order);
+    expect(screen.queryByTestId('doctor-pass-chip')).toBeNull();
+    expect(screen.getByTestId('doctor-fail-chip').textContent).toBe('1 FAIL');
+    expect(screen.getByTestId('doctor-info-chip').textContent).toBe('1 INFO');
+    fireEvent.click(screen.getByTestId('doctor-fail-chip'));
+    expect(screen.getByTestId('doctor-row-elasticsearch')).toBeTruthy();
+    expect(screen.queryByTestId('doctor-row-auth')).toBeNull();
+  });
+
   it('counts the WARN rows and filters the list to them', async () => {
     renderDiagnostics();
     const chip = await screen.findByTestId('doctor-warn-chip');
-    expect(chip.textContent).toBe('2 warnings');
+    expect(chip.textContent).toBe('2 WARN');
     expect(chip).toHaveAttribute('aria-pressed', 'false');
     fireEvent.click(chip);
     expect(chip).toHaveAttribute('aria-pressed', 'true');

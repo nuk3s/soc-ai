@@ -9,11 +9,28 @@ import {
   X,
 } from "lucide-react";
 import { Fragment, useEffect, useRef, useState } from "react";
-import { Link, useLocation, useNavigate } from "react-router-dom";
+import {
+  Link,
+  useLocation,
+  useNavigate,
+  useNavigationType,
+  useSearchParams,
+} from "react-router-dom";
 import { PipelineErrorChip, VerdictPill } from "../components/Badges";
 import { isBacktestReplay } from "../components/BacktestReplayChip";
 import { FlowBadge } from "../components/FlowBadge";
 import { RowTags, TAGS_COLUMN, TagsHeader } from "../components/RowTags";
+import { WaitingActions, waitingKey } from "../components/WaitingActions";
+import {
+  BulkDismissConfirm,
+  BulkDismissResultLine,
+  actionCount,
+  bulkDismissTargets,
+  dismissEach,
+  restoreEach,
+  type BulkDismissEntry,
+  type BulkDismissTarget,
+} from "../components/WaitingActionsBulk";
 import { ListToolbar } from "../components/ListToolbar";
 import { MultiSelect } from "../components/MultiSelect";
 import {
@@ -69,8 +86,14 @@ const REHUNT_SKIP_REASONS: Record<string, string> = {
   // this code should be unreachable from the UI, but a server refusal still
   // deserves a readable reason if it ever fires (e.g. a stale selection).
   hunt_kind: "promoted finding. Re-promote it from the hunt page",
+  // A new run can replace the analyst verdict. The page of the run asks
+  // first and names the verdict. This list has no confirm.
+  analyst_verdict: "an analyst verdict stands on the alert. Re-run it from its page",
+  // A promotion uses the alert as its anchor, and the grid did not say
+  // whether the alert feed holds it. A new run could write to Security Onion.
+  anchor_unread: "soc-ai could not read the anchor document. Try again when the grid answers",
 };
-const rehuntSkipReason = (code: string): string =>
+export const rehuntSkipReason = (code: string): string =>
   REHUNT_SKIP_REASONS[code] ?? code;
 
 /**
@@ -233,6 +256,122 @@ export function landingWindow(
 /** The window with no lower edge. The query sends no `since`. */
 export const ALL_TIME = "all";
 
+/** The machine filter a link names: `?entity=` and its `?entity_label=`. */
+export function entityFilterFromSearch(
+  search: string,
+): { value: string; label: string } | null {
+  const p = new URLSearchParams(search);
+  const value = (p.get("entity") ?? "").trim();
+  if (!value) return null;
+  return { value, label: (p.get("entity_label") ?? "").trim() || value };
+}
+
+// ---------------------------------------------------------------------------
+// The filters in the URL
+// ---------------------------------------------------------------------------
+
+/** The Status filter values a URL may carry. */
+const STATUS_FILTER_VALUES: readonly string[] = [
+  "complete",
+  "running",
+  "error",
+  "interrupted",
+  "cancelled",
+];
+
+/** The URL parameters that hold a filter of this screen. */
+const FILTER_PARAMS: readonly string[] = [
+  "range",
+  "from",
+  "to",
+  "verdict",
+  "status",
+  "errors",
+  "q",
+  "group",
+  "backtest",
+  "actions",
+  "entity",
+];
+
+/** The window the list opens on when the URL names none. A verdict link
+ *  counted over 30 days, and the demo's seeded runs span more than 24 hours. */
+function impliedRange(verdicts: readonly string[], demo: boolean): string {
+  return verdicts.length || demo ? "30d" : "24h";
+}
+
+/** The filters of the list, as the URL holds them. */
+export interface ListFilters {
+  /** The window the URL names, or null when it names none. */
+  range: string | null;
+  custom: CustomRange | null;
+  verdicts: string[];
+  statuses: string[];
+  errorState: string | null;
+  q: string;
+  groupBy: "none" | "detection";
+  showReplays: boolean;
+}
+
+/**
+ * The filters a URL names.
+ *
+ * The filters stayed in component state, so a reload returned the list to
+ * 24 hours with every filter off (dogfood 2026-10-19, R2-D13). An unknown
+ * value is dropped: a mangled link degrades to the broader list. A custom
+ * window needs both bounds, because a bare `range=custom` has no window.
+ */
+export function filtersFromSearch(search: string): ListFilters {
+  const p = new URLSearchParams(search);
+  const wanted = p.get("range");
+  const from = p.get("from");
+  const to = p.get("to");
+  const custom = wanted === "custom" && from && to ? { from, to } : null;
+  const range = custom
+    ? "custom"
+    : wanted && (wanted === ALL_TIME || /^\d+[mhd]$/.test(wanted))
+      ? wanted
+      : null;
+  const statuses = (p.get("status") ?? "")
+    .split(",")
+    .map((v) => v.trim())
+    .filter((v) => STATUS_FILTER_VALUES.includes(v));
+  return {
+    range,
+    custom,
+    verdicts: verdictFilterFromSearch(search),
+    statuses,
+    errorState: errorStateFromSearch(search),
+    q: p.get("q") ?? "",
+    groupBy: p.get("group") === "detection" ? "detection" : "none",
+    showReplays: p.get("backtest") === "1",
+  };
+}
+
+/** The history state on the entry the screen writes for its own filters.
+ *  The link effect reads it to tell the screen's own write from a link. */
+const FILTER_WRITE = { investigationsFilterWrite: true } as const;
+
+/** The URL parameters for the filters on screen. A parameter of another
+ *  screen part stays. A filter at its default leaves its parameter out, so
+ *  the plain list keeps the plain address. */
+function writeFilters(params: URLSearchParams, f: ListFilters): URLSearchParams {
+  const next = new URLSearchParams(params);
+  const put = (k: string, v: string | null) =>
+    v ? next.set(k, v) : next.delete(k);
+  const custom = f.range === "custom" && f.custom ? f.custom : null;
+  put("range", f.range === "custom" && !custom ? null : f.range);
+  put("from", custom ? custom.from : null);
+  put("to", custom ? custom.to : null);
+  put("verdict", f.verdicts.length ? f.verdicts.join(",") : null);
+  put("status", f.statuses.length ? f.statuses.join(",") : null);
+  put("errors", f.errorState);
+  put("q", f.q.trim() || null);
+  put("group", f.groupBy === "detection" ? "detection" : null);
+  put("backtest", f.showReplays ? "1" : null);
+  return next;
+}
+
 /** The presets this list offers: the shared ones and all time. */
 const PRESETS = ["15m", "1h", "4h", "24h", "3d", "7d", "30d", ALL_TIME];
 
@@ -391,6 +530,11 @@ function WhenCell({
   );
 }
 
+/** `?actions=pending`: the runs with a recommended action that waits. */
+function pendingActionsFromSearch(search: string): boolean {
+  return new URLSearchParams(search).get("actions") === "pending";
+}
+
 export function Investigations() {
   const navigate = useNavigate();
   const location = useLocation();
@@ -400,68 +544,97 @@ export function Investigations() {
   // effect below once `demo` flips (the useState initializer runs before it does).
   const demo = useDemo();
 
-  // Seed the Verdict filter from the URL (?verdict=pipeline_error — the
-  // Dashboard's pipeline-error KPI deep-links here). Initializer-only: once
-  // mounted the MultiSelect owns the state, so clearing the filter works
-  // normally and doesn't fight the URL.
-  const [filterVerdicts, setFilterVerdicts] = useState<string[]>(() =>
-    verdictFilterFromSearch(location.search),
+  // Every filter starts from the URL and goes back into it on change (see
+  // the write effect below). A link from the Dashboard KPI
+  // (?verdict=pipeline_error) seeds the Verdict filter, and a reload keeps
+  // the list the analyst built (dogfood 2026-10-19, R2-D13).
+  const [, setSearchParams] = useSearchParams();
+  const [seed] = useState(() => filtersFromSearch(location.search));
+  const [filterVerdicts, setFilterVerdicts] = useState<string[]>(
+    seed.verdicts,
   );
-  const [filterStatuses, setFilterStatuses] = useState<string[]>([]);
+  const [filterStatuses, setFilterStatuses] = useState<string[]>(
+    seed.statuses,
+  );
   // Which half of a pipeline-error set is on screen. The Dashboard tile counts
   // the runs that still need a retry and links here saying so, so the list can
   // reproduce its number instead of sitting at twenty beside a tile reading
   // seven, with a run dismissed seconds earlier rendered identically to a
   // counted one (dogfood 2026-09-07, D2). null means the whole set.
-  const [errorState, setErrorState] = useState<string | null>(() =>
-    errorStateFromSearch(location.search),
+  const [errorState, setErrorState] = useState<string | null>(
+    seed.errorState,
   );
   // Backtest replays are off by default: a replay measures the model on an
   // alert an analyst already closed, and this list is the live work. The
   // server leaves them out of the rows and the header figures unless asked.
-  const [showReplays, setShowReplays] = useState(false);
+  const [showReplays, setShowReplays] = useState(seed.showReplays);
+  // Only the runs with a recommended action that waits for the analyst
+  // (`?actions=pending`). The Needs-you line "N recommended actions wait for
+  // you" opens the list this way (R1-I1). It opened every true positive.
+  const [pendingOnly, setPendingOnly] = useState(() =>
+    pendingActionsFromSearch(location.search),
+  );
   // Free text, matched SERVER-side against rule name, source and destination.
   // Alerts had a search box and this screen did not, which is half of why the
   // two never read as the same product (dogfood A3). Client-side filtering was
   // never an option here: it is the exact defect the server-side query
   // replaced.
-  const [q, setQ] = useState(
-    () => new URLSearchParams(location.search).get("q") ?? "",
-  );
-  const [debouncedQ, setDebouncedQ] = useState(
-    () => new URLSearchParams(location.search).get("q") ?? "",
-  );
+  const [q, setQ] = useState(seed.q);
+  const [debouncedQ, setDebouncedQ] = useState(seed.q.trim());
   // A deep link widens the window to the widest preset: the Dashboard KPI counts
   // its 100 most recent runs with NO time filter, so landing on the default 24h
-  // could show an empty list for the very rows the link promised.
-  const [range, setRange] = useState(() => {
-    // A link may name the window it counted over (`?range=30d`), so the page
-    // opens on the rows the link promised instead of an empty 24h.
-    const wanted = new URLSearchParams(location.search).get("range");
-    if (wanted && (wanted === ALL_TIME || /^\d+[mhd]$/.test(wanted)))
-      return wanted;
-    return verdictFilterFromSearch(location.search).length ? "30d" : "24h";
-  });
+  // could show an empty list for the very rows the link promised. A link may
+  // also name the window it counted over (`?range=30d`), so the page opens on
+  // the rows the link promised instead of an empty 24h.
+  const [range, setRange] = useState(
+    () => seed.range ?? impliedRange(seed.verdicts, false),
+  );
   // True while the landing window is still the screen's own guess. A link that
   // named a window, and every later pick, owns it instead.
-  const [autoWindow] = useState(() => {
-    const wanted = new URLSearchParams(location.search).get("range");
-    if (wanted && (wanted === ALL_TIME || /^\d+[mhd]$/.test(wanted)))
-      return false;
-    return verdictFilterFromSearch(location.search).length === 0;
-  });
+  const [autoWindow] = useState(
+    () => seed.range == null && seed.verdicts.length === 0,
+  );
+  // One machine, from the host page link: every run that names any address
+  // or name of the machine. A search for the host name found 1 of the 7
+  // runs of a domain controller (dogfood 2026-10-19, R4-D3).
+  const [entityFilter, setEntityFilter] = useState(() =>
+    entityFilterFromSearch(location.search),
+  );
+  useEffect(() => {
+    const fromUrl = entityFilterFromSearch(location.search);
+    if (fromUrl) {
+      setEntityFilter(fromUrl);
+      setOffset(0);
+    }
+  }, [location.search]);
+  const clearEntityFilter = () => {
+    setEntityFilter(null);
+    setOffset(0);
+    const next = new URLSearchParams(location.search);
+    next.delete("entity");
+    next.delete("entity_label");
+    const qs = next.toString();
+    navigate(`${location.pathname}${qs ? `?${qs}` : ""}`, {
+      replace: true,
+      state: FILTER_WRITE,
+    });
+  };
   // The start time of the newest run when the screen widened its own window
   // to hold it. The header says why the window is not 24 hours. Cleared when
   // the analyst picks a window.
   const [widenedFor, setWidenedFor] = useState<string | null>(null);
-  const windowChosen = useRef(false);
+  // True once a link, a saved view, the demo or the analyst picked the
+  // window. The URL then names the window, also when it is the default.
+  const windowChosen = useRef(seed.range != null);
   useEffect(() => {
-    if (demo) {
+    // A window the URL names is the analyst's own. The demo leaves it alone.
+    if (demo && seed.range == null) {
       windowChosen.current = true;
       setRange("30d");
     }
-  }, [demo]);
-  const [custom, setCustom] = useState<CustomRange | null>(null);
+  }, [demo, seed.range]);
+  const [custom, setCustom] = useState<CustomRange | null>(seed.custom);
+  const [groupBy, setGroupBy] = useState<"none" | "detection">(seed.groupBy);
   // SQL paging offset. Every filter change resets it: page 3 of the old query
   // is a meaningless position in the new one.
   const [offset, setOffset] = useState(0);
@@ -475,19 +648,49 @@ export function Investigations() {
   useEffect(() => {
     setOffset(0);
   }, [debouncedQ]);
-  // Re-apply on a LATER navigation to this screen with a ?verdict= param (the
-  // mount initializers above won't re-run). Param absent → no-op, so the
-  // operator's manual filter/range changes are never clobbered.
+
+  // The filters go back into the URL on every change, with a replace: a
+  // filter change, or a key typed in the search box, is not a Back step.
+  // The window the screen widened on its own stays out of the URL, so a
+  // reload makes the same landing guess and the note says why. The entry
+  // carries FILTER_WRITE, so the link effect below can tell the screen's own
+  // write from a link.
+  // Bumped when the bare nav entry opens the screen. The effect then puts
+  // the filters on screen back into the URL.
+  const [rewrite, setRewrite] = useState(0);
   useEffect(() => {
-    const fromUrl = verdictFilterFromSearch(location.search);
-    if (fromUrl.length) {
-      setFilterVerdicts(fromUrl);
-      setErrorState(errorStateFromSearch(location.search));
-      windowChosen.current = true;
-      setRange("30d");
-      setOffset(0);
-    }
-  }, [location.search]);
+    const implied = impliedRange(filterVerdicts, demo);
+    const nameWindow = widenedFor
+      ? filterVerdicts.length > 0 && range !== implied
+      : range !== implied || windowChosen.current;
+    const next = writeFilters(new URLSearchParams(location.search), {
+      range: nameWindow ? range : null,
+      custom,
+      verdicts: filterVerdicts,
+      statuses: filterStatuses,
+      errorState,
+      q,
+      groupBy,
+      showReplays,
+    });
+    const search = next.toString() ? `?${next.toString()}` : "";
+    if (search !== location.search)
+      setSearchParams(next, { replace: true, state: FILTER_WRITE });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    range,
+    custom?.from,
+    custom?.to,
+    filterVerdicts.join(","),
+    filterStatuses.join(","),
+    errorState,
+    q,
+    groupBy,
+    showReplays,
+    widenedFor,
+    demo,
+    rewrite,
+  ]);
 
   // useAsync captures pauseWhen at setup and can't see `data` there, so track
   // whether any run is still live in a ref and let pauseWhen consult it: stop
@@ -509,10 +712,13 @@ export function Investigations() {
         q: debouncedQ || undefined,
         errorState: errorState ?? undefined,
         includeBacktest: showReplays || undefined,
+        pendingAction: pendingOnly || undefined,
+        entity: entityFilter?.value,
         limit: PAGE_SIZE,
         offset,
       }),
     [
+      entityFilter?.value ?? "",
       range,
       custom,
       filterVerdicts.join(","),
@@ -520,6 +726,7 @@ export function Investigations() {
       debouncedQ,
       errorState ?? "",
       showReplays,
+      pendingOnly,
       offset,
     ],
     {
@@ -579,7 +786,6 @@ export function Investigations() {
     { key: "when", dir: "desc" },
     "asc",
   );
-  const [groupBy, setGroupBy] = useState<"none" | "detection">("none");
   // Alert ids whose earlier (non-primary) runs are expanded inline.
   const [expandedAlerts, setExpandedAlerts] = useState<Record<string, boolean>>(
     {},
@@ -611,7 +817,45 @@ export function Investigations() {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
 
-  const rows = data?.rows ?? [];
+  // The waiting actions this tab executed or dismissed from the pending-action
+  // list, as `run:index`. The row leaves the list at once, and the list asks
+  // the server again. A key stays only while the server still lists its
+  // action, so the server decides in the end (dogfood 2026-10-19, R1-I1).
+  const [doneActions, setDoneActions] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const actionDone = (key: string) => {
+    setDoneActions((cur) => new Set(cur).add(key));
+    refetch();
+  };
+  const actionRestored = (key: string) => {
+    setDoneActions((cur) => {
+      const next = new Set(cur);
+      next.delete(key);
+      return next;
+    });
+    refetch();
+  };
+  useEffect(() => {
+    if (!data) return;
+    const listed = new Set(
+      data.rows.flatMap((r) =>
+        (r.waitingActions ?? []).map((a) => waitingKey(r.id, a.index)),
+      ),
+    );
+    setDoneActions((cur) => {
+      const kept = [...cur].filter((k) => listed.has(k));
+      return kept.length === cur.size ? cur : new Set(kept);
+    });
+  }, [data]);
+
+  // A row whose every waiting action this tab carried out. Hidden until the
+  // server stops listing it.
+  const actedOn = (r: InvestigationRow): boolean =>
+    !!r.waitingActions?.length &&
+    r.waitingActions.every((a) => doneActions.has(waitingKey(r.id, a.index)));
+  const rows = (data?.rows ?? []).filter((r) => !actedOn(r));
+  const actedRows = (data?.rows ?? []).filter(actedOn);
   // Server truth, whole store: keep polling while ANY run is live, even one the
   // current filter (or page) excludes — it can complete into the filter set.
   activeRef.current = data?.active ?? false;
@@ -632,10 +876,17 @@ export function Investigations() {
   // Header figures come from the server's counts over the SAME filter set as
   // the rows. Tallying the page instead would describe up to PAGE_SIZE rows
   // while reading as the query's — the phantom-untriaged defect, again.
-  const total = data?.total ?? 0;
+  // A row this tab acted on is off the list and off the figures, until the
+  // server's next answer leaves it out on its own.
+  const total = Math.max(0, (data?.total ?? 0) - actedRows.length);
   const totalAll = data?.totalAll ?? 0;
   const running = data?.running ?? 0;
-  const tps = data?.truePositives ?? 0;
+  const tps = Math.max(
+    0,
+    (data?.truePositives ?? 0) -
+      actedRows.filter((r) => r.verdict === "true_positive" && !r.fallback)
+        .length,
+  );
   const replays = data?.backtestReplays ?? 0;
 
   // Cluster retries of the SAME alert: surface the canonical (primary) run and
@@ -665,6 +916,11 @@ export function Investigations() {
 
   // When grouping, cluster rows by detection name (keeping the user's sort within
   // each group) and precompute per-group counts for the headers.
+  //
+  // The count is the runs of the group, with the earlier runs tucked under
+  // each row. It counted the rows only, so a group of one alert with three
+  // runs read "1" (dogfood 2026-10-19, R2-D21). The count covers the page the
+  // screen holds, and the header says so when the list has more pages.
   const displayRows =
     groupBy === "detection"
       ? [...primaries].sort(
@@ -677,9 +933,11 @@ export function Investigations() {
   if (groupBy === "detection") {
     for (const r of displayRows) {
       const k = r.name || "(unnamed detection)";
-      groupCounts.set(k, (groupCounts.get(k) ?? 0) + 1);
+      const earlier = retriesByAlert.get(r.alertId ?? "")?.length ?? 0;
+      groupCounts.set(k, (groupCounts.get(k) ?? 0) + 1 + earlier);
     }
   }
+  const groupScope = total > PAGE_SIZE ? "on this page" : "in the list";
 
   // Selection: the shared hook, which IS this screen's logic — the other lists
   // now borrow it from here rather than each keeping their own copy. A
@@ -690,13 +948,100 @@ export function Investigations() {
   // stays a defense in depth, not the only guard).
   const bulkEligible = visible.filter((r) => r.kind !== "hunt");
 
-  // The depth chip shows on every row or on none. A chip on some rows only
-  // read as a property the other rows lack (dogfood 2026-10-06).
+  // The depth chip shows on a row with a recorded depth. A run from before
+  // depths existed shows no chip: "Depth: not recorded" stood on most rows
+  // and told the analyst nothing (dogfood 2026-10-19, STE item 29). A run in
+  // progress shows "Depth: pending" when another row has a depth.
   const showDepth = visible.some(
     (r) => !!r.runClass && r.runClass in CHIP_RUN_CLASS,
   );
   const sel = useListSelection(bulkEligible.map((r) => r.id));
   const selCount = sel.count;
+
+  // Dismiss for the selection, on the pending-action list only (dogfood
+  // 2026-10-20). One confirm dismisses the waiting actions of the selected
+  // rows, through the route of each row. The result line names each row and
+  // offers the Undo of the press.
+  const [dismissAsk, setDismissAsk] = useState<{
+    targets: BulkDismissTarget[];
+    offList: number;
+  } | null>(null);
+  const [bulkDismiss, setBulkDismiss] = useState<BulkDismissEntry | null>(
+    null,
+  );
+  const [bulkDismissBusy, setBulkDismissBusy] = useState(false);
+  const dismissOpener = useRef<HTMLButtonElement>(null);
+  const dismissTargets = pendingOnly
+    ? bulkDismissTargets(data?.rows ?? [], sel.ids, doneActions)
+    : [];
+  const dismissTotal = actionCount(dismissTargets);
+  const closeDismissAsk = () => {
+    setDismissAsk(null);
+    dismissOpener.current?.focus();
+  };
+  const markDone = (keys: string[], done: boolean) => {
+    setDoneActions((cur) => {
+      const next = new Set(cur);
+      for (const k of keys) {
+        if (done) next.add(k);
+        else next.delete(k);
+      }
+      return next;
+    });
+    refetch();
+  };
+  const runBulkDismiss = async () => {
+    const ask = dismissAsk;
+    if (!ask) return;
+    const blocked = demoBlocked(demo);
+    if (blocked) {
+      setBulkDismiss({ rows: [], undo: null, error: blocked });
+      setDismissAsk(null);
+      return;
+    }
+    setBulkDismissBusy(true);
+    try {
+      const results = await dismissEach(ask.targets);
+      const done = results.flatMap((r) =>
+        r.done.map((index) => ({ runId: r.runId, name: r.name, index })),
+      );
+      // The rows that did not land stay selected: "try them again" is one
+      // press.
+      const failedRuns = results
+        .filter((r) => r.failed.length > 0)
+        .map((r) => r.runId);
+      if (failedRuns.length) sel.select(failedRuns);
+      else sel.clear();
+      setBulkDismiss({ rows: results, undo: done.length ? done : null });
+      markDone(
+        done.map((d) => waitingKey(d.runId, d.index)),
+        true,
+      );
+    } finally {
+      setBulkDismissBusy(false);
+      setDismissAsk(null);
+    }
+  };
+  const runBulkUndo = async () => {
+    const entry = bulkDismiss;
+    if (!entry?.undo) return;
+    const blocked = demoBlocked(demo);
+    if (blocked) {
+      setBulkDismiss({ ...entry, error: blocked });
+      return;
+    }
+    setBulkDismissBusy(true);
+    try {
+      const results = await restoreEach(entry.undo);
+      setBulkDismiss({ rows: results, undo: null, undoOf: true });
+      markDone(
+        results.flatMap((r) => r.done.map((i) => waitingKey(r.runId, i))),
+        false,
+      );
+    } finally {
+      setBulkDismissBusy(false);
+    }
+  };
 
   // Saved views. The filter state travels as one object, so a chip restores the
   // whole set at once — half-applying a view is how a "saved" view stops being
@@ -734,6 +1079,46 @@ export function Investigations() {
     setShowReplays(false);
     setOffset(0);
   });
+
+  // A link to this screen while it is open: the bell, a Dashboard tile or the
+  // nav entry. The mount initializers above do not run again. A link that
+  // names a filter applies its whole filter set, so the list is the list the
+  // link counted. The bare nav entry names none: the filters on screen stay,
+  // and the write effect puts them back into the URL. The screen's own write
+  // is a replace that carries FILTER_WRITE, and it is not a link. Back and
+  // Forward are links: the entry they open holds the filters it showed.
+  const navigationType = useNavigationType();
+  const seenSearch = useRef(location.search);
+  useEffect(() => {
+    if (location.search === seenSearch.current) return;
+    seenSearch.current = location.search;
+    const own =
+      navigationType === "REPLACE" &&
+      (location.state as Partial<typeof FILTER_WRITE> | null)
+        ?.investigationsFilterWrite === true;
+    if (own) return;
+    const params = new URLSearchParams(location.search);
+    if (!FILTER_PARAMS.some((k) => params.has(k))) {
+      setRewrite((n) => n + 1);
+      return;
+    }
+    const f = filtersFromSearch(location.search);
+    setPendingOnly(pendingActionsFromSearch(location.search));
+    windowChosen.current = true;
+    setWidenedFor(null);
+    setRange(f.range ?? impliedRange(f.verdicts, demo));
+    setCustom(f.custom);
+    setFilterVerdicts(f.verdicts);
+    setFilterStatuses(f.statuses);
+    setErrorState(f.errorState);
+    setQ(f.q);
+    setDebouncedQ(f.q.trim());
+    setGroupBy(f.groupBy);
+    setShowReplays(f.showReplays);
+    setOffset(0);
+    views.clearActive();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [location.search]);
 
   const handleRehunt = async () => {
     const ids = sel.ids;
@@ -882,6 +1267,30 @@ export function Investigations() {
           onClear: sel.clear,
           actions: (
             <>
+              {pendingOnly && (
+                <button
+                  ref={dismissOpener}
+                  type="button"
+                  disabled={dismissTotal === 0 || bulkDismissBusy}
+                  title={
+                    dismissTotal === 0
+                      ? "The selected rows hold no waiting action."
+                      : "Dismiss the waiting actions of the selected rows."
+                  }
+                  aria-expanded={!!dismissAsk}
+                  onClick={() =>
+                    dismissAsk
+                      ? closeDismissAsk()
+                      : setDismissAsk({
+                          targets: dismissTargets,
+                          offList: sel.ids.length - dismissTargets.length,
+                        })
+                  }
+                  className="flex items-center gap-1.5 rounded-[7px] border border-border-strong bg-transparent px-[11px] py-1.5 text-[12.5px] font-semibold text-dim hover:border-danger hover:text-danger disabled:opacity-50"
+                >
+                  <X size={12} /> Dismiss actions ({dismissTotal})
+                </button>
+              )}
               <button
                 disabled={rehunting}
                 onClick={() => {
@@ -931,6 +1340,27 @@ export function Investigations() {
           ),
         }}
       >
+        {entityFilter && (
+          <span
+            data-testid="inv-entity-filter"
+            title={
+              data?.entityKeys?.length
+                ? `The filter reads every key of the machine: ${data.entityKeys.join(", ")}.`
+                : "The filter reads every address and name of the machine."
+            }
+            className="flex items-center gap-1.5 rounded-chip border border-accent/40 bg-accent/10 px-2 py-1 text-[12px] font-semibold text-accent"
+          >
+            Host: {entityFilter.label}
+            <button
+              type="button"
+              aria-label="Clear the host filter"
+              onClick={clearEntityFilter}
+              className="rounded px-0.5 text-accent hover:bg-accent/20"
+            >
+              ×
+            </button>
+          </span>
+        )}
         <TimeRangeFilter
           value={range}
           custom={custom}
@@ -1060,12 +1490,50 @@ export function Investigations() {
         >
           Show backtest replays{showReplays ? " ✓" : ""}
         </button>
+        {pendingOnly && (
+          <button
+            data-testid="pending-actions-filter"
+            aria-pressed
+            onClick={() => {
+              setPendingOnly(false);
+              setOffset(0);
+              const next = new URLSearchParams(location.search);
+              next.delete("actions");
+              setSearchParams(next, { replace: true, state: FILTER_WRITE });
+            }}
+            title="The list shows only the investigations with a recommended action that waits for you. Select to show every investigation."
+            className="rounded-[7px] border border-accent px-[11px] py-1.5 text-[12.5px] font-semibold text-accent"
+          >
+            Action waits for you ✓
+          </button>
+        )}
       </ListToolbar>
 
       {/* Bulk re-investigate result (E2.2): a collapsed "Started N · M skipped"
           header expands to the per-id detail the API already returns — WHICH
           detections re-ran and WHY each skip happened — so a mixed batch is
           never an opaque count. */}
+      {dismissAsk && (
+        <BulkDismissConfirm
+          targets={dismissAsk.targets}
+          offList={dismissAsk.offList}
+          busy={bulkDismissBusy}
+          onCancel={closeDismissAsk}
+          onConfirm={() => {
+            void runBulkDismiss();
+          }}
+        />
+      )}
+      {bulkDismiss && (
+        <BulkDismissResultLine
+          entry={bulkDismiss}
+          busy={bulkDismissBusy}
+          onUndo={() => {
+            void runBulkUndo();
+          }}
+          onClose={() => setBulkDismiss(null)}
+        />
+      )}
       {rehuntResult &&
         (() => {
           const started = rehuntResult.started;
@@ -1257,10 +1725,9 @@ export function Investigations() {
               </Link>
             }
           >
-            soc-ai runs an investigation on a detection. The investigation pulls
-            the evidence, reasons over the evidence and reaches a verdict. Pick
-            a detection on the Alerts screen. Auto-Investigate can also work the
-            backlog.
+            soc-ai runs an investigation on a detection. The investigation reads
+            the evidence and reaches a verdict. Select a detection on the Alerts
+            screen. Auto-Investigate can also investigate the backlog.
           </EmptyState>
         )}
         {!loading && !error && displayRows.length === 0 && totalAll > 0 && (
@@ -1287,7 +1754,11 @@ export function Investigations() {
                 the cure also when the cause was the search text (RL13). The
                 search names its window too: a search for a run older than the
                 window read as a run that does not exist (dogfood 2026-10-06). */}
-            {!showReplays && replays > 0
+            {pendingOnly
+              ? range === ALL_TIME
+                ? "No recommended action waits for you."
+                : `No recommended action waits for you in ${windowPhrase(range)}.`
+              : !showReplays && replays > 0
               ? `Only ${plural(replays, "backtest replay")} ${replays === 1 ? "matches" : "match"}. Turn on "Show backtest replays" to see ${replays === 1 ? "it" : "them"}.`
               : debouncedQ
                 ? range === ALL_TIME
@@ -1320,8 +1791,13 @@ export function Investigations() {
                   <span title={groupName} className="min-w-0 break-words">
                     {groupName}
                   </span>
-                  <span className="font-mono text-[11px] text-faint">
-                    {groupCounts.get(groupName)}
+                  <span
+                    data-testid={`group-count-${groupName}`}
+                    title={`This detection has ${plural(groupCounts.get(groupName) ?? 0, "investigation")} ${groupScope}. The count includes the earlier runs under each row.`}
+                    className="font-mono text-[11px] text-faint"
+                  >
+                    {plural(groupCounts.get(groupName) ?? 0, "investigation")}
+                    {groupScope === "on this page" ? " on this page" : ""}
                   </span>
                 </div>
               )}
@@ -1396,7 +1872,7 @@ export function Investigations() {
                   the hunt subject say what raised the run and what it read.
                   The synthetic mark keeps a planted attack from reading as
                   real activity. A backtest replay is a measurement. The
-                  depth is on every row or on none. Dismissed and Superseded
+                  depth shows when the run recorded one. Dismissed and Superseded
                   say why the Dashboard tile does not count the row
                   (dogfood 2026-09-07, D2). The newer-run chip says the row is
                   representative but not current, and opens the run that
@@ -1404,12 +1880,15 @@ export function Investigations() {
                 <RowTags
                   testId={`inv-tags-${r.id}`}
                   kind={r.kind}
-                  subjectHunt={r.subjectType === "hunt"}
+                  // A hunt run's type chip already says that its subject is
+                  // the hunt. A second "hunt" chip beside it said it twice
+                  // (dogfood 2026-10-19, STE item 30).
+                  subjectHunt={r.subjectType === "hunt" && r.kind !== "hunt"}
                   subjectTestId={`subject-type-${r.id}`}
                   depth={{
                     runClass: r.runClass,
                     testId: `run-class-${r.id}`,
-                    placeholder: showDepth,
+                    placeholder: showDepth && r.status === "running",
                     running: r.status === "running",
                   }}
                   synthetic={r.isSynthEval}
@@ -1508,6 +1987,25 @@ export function Investigations() {
                   )}
                 </div>
               </div>
+              {/* The waiting actions of the row, on the pending-action list
+                  only. The server fills them under that filter alone. */}
+              {r.waitingActions && r.waitingActions.length > 0 && (
+                <div
+                  className="border-b border-border-faint bg-surface-2/30 py-2 pl-[46px] pr-3.5"
+                  style={{ minWidth: GRID_MIN_WIDTH }}
+                >
+                  <WaitingActions
+                    row={{
+                      ...r,
+                      waitingActions: r.waitingActions.filter(
+                        (a) => !doneActions.has(waitingKey(r.id, a.index)),
+                      ),
+                    }}
+                    onDone={actionDone}
+                    onRestored={actionRestored}
+                  />
+                </div>
+              )}
               {expanded &&
                 retries.map((rt) => {
                   return (
@@ -1555,7 +2053,7 @@ export function Investigations() {
                         depth={{
                           runClass: rt.runClass,
                           testId: `run-class-${rt.id}`,
-                          placeholder: showDepth,
+                          placeholder: showDepth && rt.status === "running",
                           running: rt.status === "running",
                         }}
                         synthetic={rt.isSynthEval}

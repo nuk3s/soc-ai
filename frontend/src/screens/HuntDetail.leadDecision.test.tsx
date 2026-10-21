@@ -130,6 +130,40 @@ describe('HuntDetail lead decision', () => {
     );
   });
 
+  // R3-I4: the analyst dismissed a lead whose hunt had a confirmed threat,
+  // and nothing on the form said so.
+  it('names the open threat finding on the Dismiss form', async () => {
+    const finding = (title: string, verdict: string) => ({
+      title,
+      detail: 'd',
+      severity: 'high',
+      category: 'threat',
+      hosts: ['192.0.2.11'],
+      citations: [],
+      investigationId: `inv-${verdict}`,
+      investigationStatus: 'complete' as const,
+      verdict,
+    });
+    vi.mocked(getHunt).mockResolvedValue(
+      hunt({
+        findings: [
+          finding('RC4 service ticket for svc_sql', 'true_positive'),
+          finding('A cleared scan', 'false_positive'),
+        ],
+      }),
+    );
+    vi.mocked(getLead).mockResolvedValue(lead('hunting'));
+    mount();
+    fireEvent.click(await screen.findByTestId('hunt-lead-dismiss'));
+    expect(screen.getByTestId('dismiss-threat-warning').textContent).toBe(
+      'The hunt of this lead found a threat: RC4 service ticket for svc_sql. Dismiss closes the ' +
+        'lead. The threat finding stays open on the hunt. ',
+    );
+    // Escape closes the form (R3-D14).
+    fireEvent.keyDown(screen.getByLabelText('Reason'), { key: 'Escape' });
+    await waitFor(() => expect(screen.queryByLabelText('Reason')).toBeNull());
+  });
+
   it('shows no bar on a closed lead or a running hunt', async () => {
     // Negative controls: a dismissed lead waits on no one, and a running hunt
     // has nothing to decide yet.

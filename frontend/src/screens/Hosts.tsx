@@ -24,6 +24,7 @@ import {
 } from '../components/HostsSummary';
 import { ListToolbar } from '../components/ListToolbar';
 import { Panel, PanelHeader } from '../components/Panel';
+import { RoleChoice } from '../components/RoleChoice';
 import { EmptyState, ErrorState, Freshness, LoadingInline, LoadingState, StaleNotice } from '../components/States';
 import {
   bulkSetDossierOverride,
@@ -47,7 +48,6 @@ import {
   nameSourceLabel,
   nameSourceTitle,
   roleLabel,
-  roleVocabulary,
 } from '../lib/hostDossier';
 import {
   FIRST_DIR,
@@ -766,22 +766,44 @@ function Pager({
 
 // ---- filter vocabulary ------------------------------------------------------
 
-/** The chip of each health filter. Each one is a part of Needs attention. */
+/** The chip of each health filter. Each one is a part of Needs attention.
+ *  `broken` lists a failed build and a machine never built, so its chip
+ *  names both (dogfood 2026-10-19, R4-D16). */
 const HEALTH_CHIPS: Record<'attention' | 'stale' | 'broken', string> = {
   attention: 'Needs attention',
   stale: 'Out of date',
-  broken: 'Never built',
+  broken: 'No clean build',
 };
 
 /**
  * The panel title: the population the list shows. "37 machines" sat beside
  * "Machines · 18" with nothing to say that the 18 were the active ones
  * (dogfood 2026-10-06).
+ *
+ * A filter on the default list counts against the machines with events, the
+ * base the Role menu counts. "Showing 12 of 37 machines" put 12 active rows
+ * over a census that counts quiet machines too (dogfood 2026-10-19, R4-D19).
  */
-export function listScope(total: number | null, machines: number | null, activeOnly: boolean): string {
+export function listScope(
+  total: number | null,
+  machines: number | null,
+  scope: {
+    /** The list hides quiet machines: the default, with no search. */
+    activeOnly: boolean;
+    /** A filter other than the activity narrows the list. */
+    narrowed: boolean;
+    /** The machines with events, or null while unknown. */
+    activeMachines: number | null;
+  },
+): string {
   if (total == null) return 'Machines';
+  if (scope.activeOnly && scope.narrowed) {
+    const base = scope.activeMachines;
+    if (base == null) return `Showing ${plural(total, 'active machine')}.`;
+    return `Showing ${total.toLocaleString()} of ${base.toLocaleString()} active ${base === 1 ? 'machine' : 'machines'}.`;
+  }
   if (machines == null || total === machines) return `Machines · ${total.toLocaleString()}`;
-  if (activeOnly) {
+  if (scope.activeOnly) {
     return `Showing ${total.toLocaleString()} active ${total === 1 ? 'machine' : 'machines'} of ${machines.toLocaleString()}.`;
   }
   return `Showing ${total.toLocaleString()} of ${plural(machines, 'machine')}.`;
@@ -789,22 +811,54 @@ export function listScope(total: number | null, machines: number | null, activeO
 
 const BUCKET_LABELS: Record<string, string> = ROLE_BUCKET_LABELS;
 
-function roleFilterLabel(role: string): string {
+/** The filter value of a guessed role: `guess:<slug>`. */
+const GUESS_PREFIX = 'guess:';
+
+export function roleFilterLabel(role: string): string {
+  if (role.startsWith(GUESS_PREFIX)) return `${roleLabel(role.slice(GUESS_PREFIX.length))} · guess`;
   return BUCKET_LABELS[role] ?? roleLabel(role);
 }
 
-/** The role menu: every role a machine holds, with its count, then the three
- *  buckets. A role with no machine is not offered. A filter that lists
- *  nothing reads as a broken filter. The three buckets are always offered
- *  with their count, 0 included: the count says the bucket is empty. */
-function roleOptions(summary: MachineSummary | null, current: string): FilterOption[] {
+/** The line under the Role heading: the population the counts cover, and the
+ *  overlap of the guess counts. A guessed role also counts in "weak guess"
+ *  or "old guess", and the menu did not say so (dogfood round 2, V2-5). */
+export function roleMenuNote(counts: MachineSummary | null, activity: string): string | undefined {
+  if (counts == null) return undefined;
+  const base =
+    activity === 'active'
+      ? `Counts in this list of ${plural(counts.machines, 'machine')} with events.`
+      : `Counts across all ${plural(counts.machines, 'machine')}.`;
+  const guesses = Object.values(counts.role_guesses ?? {}).some((n) => n > 0);
+  return guesses ? `${base} A guessed role also counts in "weak guess" or "old guess".` : base;
+}
+
+/** A declared value in reading form: a role by its label, a criticality as
+ *  is. The bulk note read 'Declared role "domain_controller"' (dogfood round
+ *  2, V2-6). */
+export function bulkValueLabel(field: string, value: string): string {
+  return field === 'role' ? roleLabel(value) : value;
+}
+
+/** The role menu: every role a machine holds, with its count, then each
+ *  guessed role marked as a guess, then the three buckets. A role with no
+ *  machine is not offered. A filter that lists nothing reads as a broken
+ *  filter. The three buckets are always offered with their count, 0
+ *  included: the count says the bucket is empty.
+ *
+ *  The guesses sit in the low-confidence and old-guess buckets too. The menu
+ *  named the buckets and no guessed role (dogfood 2026-10-19, R4-I6). */
+export function roleOptions(summary: MachineSummary | null, current: string): FilterOption[] {
   const roles = summary?.roles ?? {};
   const buckets = new Set<string>(ROLE_BUCKETS);
   const known = Object.entries(roles)
     .filter(([role, count]) => !buckets.has(role) && count > 0)
     .sort(([a], [b]) => roleLabel(a).localeCompare(roleLabel(b)))
     .map(([role, count]) => ({ value: role, label: roleLabel(role), count }));
-  const options: FilterOption[] = [{ value: '', label: 'any role' }, ...known];
+  const guessed = Object.entries(summary?.role_guesses ?? {})
+    .filter(([, count]) => count > 0)
+    .sort(([a], [b]) => roleLabel(a).localeCompare(roleLabel(b)))
+    .map(([role, count]) => ({ value: `${GUESS_PREFIX}${role}`, label: roleFilterLabel(`${GUESS_PREFIX}${role}`), count }));
+  const options: FilterOption[] = [{ value: '', label: 'any role' }, ...known, ...guessed];
   for (const bucket of ROLE_BUCKETS) {
     options.push({ value: bucket, label: BUCKET_LABELS[bucket], count: summary ? roles[bucket] ?? 0 : undefined });
   }
@@ -1061,12 +1115,9 @@ export function Hosts() {
   const [bulkField, setBulkField] = useState<'role' | 'criticality'>('criticality');
   const [bulkValue, setBulkValue] = useState('');
   const [bulkBusy, setBulkBusy] = useState(false);
+  // The result of the last bulk action. No timer clears it: the operator
+  // closes it, or the next bulk action replaces it.
   const [bulkNote, setBulkNote] = useState<string | null>(null);
-  useEffect(() => {
-    if (!bulkNote) return;
-    const t = setTimeout(() => setBulkNote(null), 6000);
-    return () => clearTimeout(t);
-  }, [bulkNote]);
 
   // The last bulk declaration, for Undo. Each address carries the operator
   // value it held BEFORE the declaration: Undo restores that value, or removes
@@ -1079,6 +1130,11 @@ export function Hosts() {
     unknown: string[];
   } | null>(null);
   const [undoBusy, setUndoBusy] = useState(false);
+  const bulkShown = bulkNote != null || lastBulk != null;
+  const dismissBulk = () => {
+    setBulkNote(null);
+    setLastBulk(null);
+  };
 
   const undoBulk = async () => {
     if (!lastBulk) return;
@@ -1098,7 +1154,9 @@ export function Hosts() {
       }
     }
     const undone = lastBulk.prior.length - failed.length;
-    const parts = [`Undid ${lastBulk.field} "${lastBulk.value}" on ${plural(undone, 'machine')}.`];
+    const parts = [
+      `Undid ${lastBulk.field} "${bulkValueLabel(lastBulk.field, lastBulk.value)}" on ${plural(undone, 'machine')}.`,
+    ];
     if (lastBulk.unknown.length) {
       parts.push(
         `${plural(lastBulk.unknown.length, 'machine')} kept the declaration. This page could not read their earlier value.`,
@@ -1151,7 +1209,7 @@ export function Hosts() {
         `${items.slice(0, 3).join(', ')}${items.length > 3 ? `, +${items.length - 3} more` : ''}`;
       const failedIps = (out.failed ?? []).map((f) => f.ip);
       const parts = [
-        `Declared ${bulkField} "${value}" on ${out.updated.length} of ${plural(ips.length, 'machine')}.`,
+        `Declared ${bulkField} "${bulkValueLabel(bulkField, value)}" on ${out.updated.length} of ${plural(ips.length, 'machine')}.`,
       ];
       if (out.not_found.length) {
         parts.push(`${out.not_found.length} not swept yet: ${names(out.not_found)}.`);
@@ -1192,15 +1250,9 @@ export function Hosts() {
 
   // What a BULK declare may set a role to: the classifier's closed vocabulary,
   // and nothing else. One typo here would become a role for every machine
-  // selected. The server enforces the same list.
+  // selected. The server enforces the same list. The control is the one the
+  // host page declare uses, without Other (dogfood 2026-10-19, R4-D20).
   const wireRoles = census.data?.role_vocabulary;
-  const bulkRoleOptions = useMemo(
-    () => [
-      { value: '', label: 'choose' },
-      ...[...roleVocabulary(wireRoles)].sort().map((r) => ({ value: r, label: roleLabel(r) })),
-    ],
-    [wireRoles],
-  );
 
   // ---- filters, sort, saved views ------------------------------------------
   const currentQuery: SavedViewQuery = {
@@ -1334,7 +1386,9 @@ export function Hosts() {
       {!firstRun && (
         <div
           data-testid="hosts-toolbar"
-          className={cn(selecting && 'sticky top-0 z-20 bg-bg pb-1 shadow-[0_1px_0_rgba(0,0,0,.4)]')}
+          className={cn(
+            (selecting || bulkShown) && 'sticky top-0 z-20 bg-bg pb-1 shadow-[0_1px_0_rgba(0,0,0,.4)]',
+          )}
         >
           <ListToolbar
             views={views.views}
@@ -1354,7 +1408,6 @@ export function Hosts() {
               label: 'Search hosts',
               fitPlaceholder: true,
             }}
-            note={bulkNote}
             selection={
               selecting
                 ? {
@@ -1385,11 +1438,13 @@ export function Hosts() {
                             label="Criticality to declare"
                           />
                         ) : (
-                          <Select
+                          <RoleChoice
                             value={bulkValue}
-                            options={bulkRoleOptions}
                             onChange={setBulkValue}
+                            vocabulary={wireRoles}
+                            allowOther={false}
                             label="Role to declare"
+                            title="A bulk declaration takes a role from this list. Declare a new role on the host page."
                           />
                         )}
                         <button
@@ -1397,7 +1452,7 @@ export function Hosts() {
                           onClick={() => {
                             void declare();
                           }}
-                          title="Declare this value on the primary address of every selected machine. Your answer wins over the sweep answer and survives the next rebuild."
+                          title="Declare this value on the primary address of every selected machine. Your value replaces the sweep value. The next rebuild keeps it."
                           className="flex items-center gap-1.5 rounded-[7px] border px-[11px] py-1.5 text-[12.5px] font-semibold text-[#cfe0ff] disabled:opacity-50"
                           style={{ background: 'rgba(75,139,245,.14)', borderColor: 'rgba(75,139,245,.4)' }}
                         >
@@ -1411,37 +1466,64 @@ export function Hosts() {
             }
             trailing={
               isAdmin ? (
-                <>
-                  {lastBulk && (
-                    <button
-                      data-testid="bulk-undo"
-                      onClick={() => {
-                        void undoBulk();
-                      }}
-                      disabled={undoBusy}
-                      title="Undo the last bulk declaration. Each address gets back the value it held before. Nothing else changes."
-                      className="flex items-center gap-1.5 rounded-[7px] border border-warn/40 px-[11px] py-1.5 text-[12.5px] font-semibold text-warn hover:bg-warn/10 disabled:opacity-60"
-                    >
-                      {undoBusy
-                        ? 'Undoing'
-                        : `Undo ${lastBulk.field} "${lastBulk.value}" (${lastBulk.prior.length})`}
-                    </button>
-                  )}
-                  <button
-                    onClick={() => {
-                      void rebuild();
-                    }}
-                    disabled={starting || running}
-                    title="Start a network sweep now. The sweep runs in the background because it queries hundreds of hosts."
-                    className="flex items-center gap-1.5 rounded-[7px] border border-border-strong px-[11px] py-1.5 text-[12.5px] font-semibold text-dim hover:text-text disabled:opacity-60"
-                  >
-                    <RefreshCw size={12} className={running || starting ? 'animate-spin' : ''} />
-                    {running ? 'Rebuilding' : 'Rebuild now'}
-                  </button>
-                </>
+                <button
+                  onClick={() => {
+                    void rebuild();
+                  }}
+                  disabled={starting || running}
+                  title="Start a network sweep now. The sweep runs in the background because it queries hundreds of hosts."
+                  className="flex items-center gap-1.5 rounded-[7px] border border-border-strong px-[11px] py-1.5 text-[12.5px] font-semibold text-dim hover:text-text disabled:opacity-60"
+                >
+                  <RefreshCw size={12} className={running || starting ? 'animate-spin' : ''} />
+                  {running ? 'Rebuilding' : 'Rebuild now'}
+                </button>
               ) : undefined
             }
           />
+          {/* The bulk result and its Undo, in the sticky bar under the
+              selection. The line sat at the top of the screen, out of view
+              for an operator who scrolled down to select, and a 6 s timer
+              took it away (dogfood 2026-10-19, R4-D14). It stays until the
+              operator closes it or a new bulk action replaces it. Undo
+              does not need the selection. */}
+          {bulkShown && (
+            <div
+              data-testid="bulk-result"
+              role="status"
+              className="mb-3.5 flex flex-wrap items-center gap-2 rounded-card border border-accent-deep bg-[#0d1726] px-[11px] py-[7px]"
+            >
+              <span className="min-w-0 flex-1 break-words text-[12.5px] text-text-2">{bulkNote}</span>
+              {lastBulk && (
+                <button
+                  data-testid="bulk-undo"
+                  onClick={() => {
+                    void undoBulk();
+                  }}
+                  disabled={undoBusy}
+                  title="Undo the last bulk declaration. Each address gets back the value it held before. Nothing else changes."
+                  className="flex items-center gap-1.5 rounded-[7px] border border-warn/40 px-[11px] py-1.5 text-[12.5px] font-semibold text-warn hover:bg-warn/10 disabled:opacity-60"
+                >
+                  {undoBusy
+                    ? 'Undoing'
+                    : `Undo ${lastBulk.field} "${bulkValueLabel(lastBulk.field, lastBulk.value)}" (${lastBulk.prior.length})`}
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={dismissBulk}
+                disabled={undoBusy}
+                aria-label="Close the bulk result"
+                title={
+                  lastBulk
+                    ? 'Close this result. After you close it, you cannot undo the declaration from this page.'
+                    : 'Close this result.'
+                }
+                className="flex flex-none items-center rounded-control p-1 text-faint hover:text-text disabled:opacity-60"
+              >
+                <X size={13} />
+              </button>
+            </div>
+          )}
           {/* The search reads the whole census. The activity filter does not
               apply to it, and the screen says so while a query is set. */}
           {state.q && (
@@ -1482,7 +1564,7 @@ export function Hosts() {
             <>
               The host dossier is off. The sweep did not run. Turn the host dossier on in{' '}
               <Link to={DOSSIER_CONFIG_HREF} className="font-semibold text-accent hover:underline">
-                Config → Host dossier
+                Settings → Host dossier
               </Link>
               .
             </>
@@ -1507,7 +1589,7 @@ export function Hosts() {
                 the whole network. This list is incomplete. A host that is missing below, or that
                 shows old answers, may be a host the sweep could not reach.{' '}
                 {sweepErrors.length > 0
-                  ? 'A rebuild runs the same queries. Start with what failed:'
+                  ? 'A new sweep runs the same queries. Fix these errors first:'
                   : 'An admin can read what failed on this screen. An admin can start another sweep.'}
               </div>
               {sweepErrors.length > 0 && (
@@ -1609,7 +1691,7 @@ export function Hosts() {
                 className="text-[13px] leading-[1.6] text-dim"
               >
                 {sweepInFlight ? (
-                  'The network sweep is running now. This list fills in after the sweep finishes. The sweep reads telemetry Security Onion already holds. Nothing new touches your network.'
+                  'The network sweep is running now. This list fills in after the sweep finishes. The sweep reads telemetry that Security Onion already holds. The sweep sends no traffic to your network.'
                 ) : sweepDegraded ? (
                   'The last sweep could not read the network. The sweep built nothing. This list is empty because the sweep failed. The network may still hold hosts.'
                 ) : sweepUnreadable ? (
@@ -1622,7 +1704,7 @@ export function Hosts() {
                     </span>
                   </>
                 ) : (
-                  "The network sweep hasn't run yet. The sweep builds this list from telemetry Security Onion already holds. Nothing new touches your network."
+                  'The network sweep has not run yet. The sweep builds this list from telemetry that Security Onion already holds. The sweep sends no traffic to your network.'
                 )}
               </div>
               {isAdmin ? (
@@ -1652,7 +1734,7 @@ export function Hosts() {
                   to={DOSSIER_CONFIG_HREF}
                   className="text-[12.5px] font-semibold text-accent hover:underline"
                 >
-                  turn on scheduled sweeps
+                  Turn on scheduled sweeps
                 </Link>
               </div>
             </div>
@@ -1664,7 +1746,11 @@ export function Hosts() {
             icon={<Server size={15} />}
             title={
               <span data-testid="hosts-list-scope">
-                {listScope(listData ? total : null, machines ?? null, state.activity === 'active' && !narrowed)}
+                {listScope(listData ? total : null, machines ?? null, {
+                  activeOnly: state.activity === 'active' && !state.q,
+                  narrowed,
+                  activeMachines: activeCounts.data?.machines ?? null,
+                })}
                 {listData &&
                   machines != null &&
                   total < machines &&
@@ -1695,7 +1781,7 @@ export function Hosts() {
                         indeterminate={!sel.allVisibleSelected && sel.someVisibleSelected}
                         onChange={sel.toggleAll}
                         title="Select every machine on this page."
-                        aria-label="Select all hosts on this page"
+                        aria-label="Select every machine on this page"
                       />
                     </th>
                   )}
@@ -1712,12 +1798,7 @@ export function Hosts() {
                             groups={[
                               {
                                 label: 'Role',
-                                note:
-                                  menuCounts == null
-                                    ? undefined
-                                    : menuActivity === 'active'
-                                      ? `Counts in this list of ${plural(menuCounts.machines, 'machine')} with events.`
-                                      : `Counts across all ${plural(menuCounts.machines, 'machine')}.`,
+                                note: roleMenuNote(menuCounts, menuActivity),
                                 value: state.role,
                                 options: roleOptions(menuCounts, state.role),
                                 onChange: (v) => setFilter({ role: v || null }),

@@ -145,7 +145,7 @@ describe('master-detail: only the selected section renders', () => {
     expect(await screen.findByText('Fast verdict')).toBeTruthy();
     expect(screen.queryByText('Verdict inheritance window')).toBeNull();
     // System-parent management surfaces are not in the DOM either.
-    expect(screen.queryByText('+ Mint token')).toBeNull();
+    expect(screen.queryByText('+ Create token')).toBeNull();
   });
 
   it('deep-link hash selects that section', async () => {
@@ -179,7 +179,7 @@ describe('master-detail: only the selected section renders', () => {
     fireEvent.click(navLink);
     await screen.findByText('Fast verdict');
 
-    fireEvent.click(screen.getByRole('switch', { name: 'fast_triage_enabled' }));
+    fireEvent.click(screen.getByRole('switch', { name: 'Fast verdict' }));
     fireEvent.click(await screen.findByRole('button', { name: /apply change/i }));
 
     await waitFor(() => expect(vi.mocked(setSetting)).toHaveBeenCalled());
@@ -194,7 +194,7 @@ describe('master-detail: only the selected section renders', () => {
     expect((await screen.findAllByText('Refetched marker')).length).toBeGreaterThan(0);
 
     expect(screen.queryByText('Verdict inheritance window')).toBeNull();
-    expect(screen.getByRole('switch', { name: 'fast_triage_enabled' })).toBeTruthy();
+    expect(screen.getByRole('switch', { name: 'Fast verdict' })).toBeTruthy();
   });
 
   it('a nav click moves the hash and keeps the query string', async () => {
@@ -275,7 +275,7 @@ describe('the Apply bar names its staged edits', () => {
   it('shows a chip per dirty setting; the chip discards individually', async () => {
     renderAt('/config');
     await screen.findByText('Fast verdict');
-    fireEvent.click(screen.getByRole('switch', { name: 'fast_triage_enabled' }));
+    fireEvent.click(screen.getByRole('switch', { name: 'Fast verdict' }));
     const chip = await screen.findByTestId('chip-fast_triage_enabled');
     expect(chip.textContent).toContain('Fast verdict');
     fireEvent.click(screen.getByRole('button', { name: /discard fast verdict/i }));
@@ -285,7 +285,7 @@ describe('the Apply bar names its staged edits', () => {
   it('a chip click returns to the owning section and highlights the row', async () => {
     renderAt('/config');
     await screen.findByText('Fast verdict');
-    fireEvent.click(screen.getByRole('switch', { name: 'fast_triage_enabled' }));
+    fireEvent.click(screen.getByRole('switch', { name: 'Fast verdict' }));
     await screen.findByTestId('chip-fast_triage_enabled');
     // Wander to another section — the staged edit and its chip survive.
     const navLink = screen

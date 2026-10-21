@@ -95,7 +95,7 @@ export function peerGraphView(ip: string, peers: HostPeer[]): GraphView {
         peer.hostname ? `${peer.hostname} · ${peer.ip}` : peer.ip,
         internal ? 'Internal address.' : 'External address.',
         ...facts,
-        'Click to open its page.',
+        'Select it to open its page.',
       ],
     });
 

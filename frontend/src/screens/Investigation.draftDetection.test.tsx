@@ -107,9 +107,9 @@ describe('draft-detection affordance — visibility gates', () => {
   it('shows a quiet enable-it pointer for a confirmed-TP hunt investigation when the flag is off', async () => {
     vi.mocked(getAbout).mockResolvedValue(about(false));
     mount(baseInv({}));
-    const link = await screen.findByRole('link', { name: /enable it in config/i });
+    const link = await screen.findByRole('link', { name: /turn it on in settings/i });
     expect(link).toHaveAttribute('href', '/config#triage-automation');
-    expect(screen.getByText(/detection authoring is off/i)).toBeTruthy();
+    expect(screen.getByText(/sigma export is off/i)).toBeTruthy();
   });
 
   it('does not show the enable-it pointer for a non-hunt investigation with the flag off', async () => {
@@ -117,7 +117,7 @@ describe('draft-detection affordance — visibility gates', () => {
     const inv = baseInv({ kind: 'suricata', rationale: 'flag-off suricata case', huntId: null, huntObjective: null });
     mount(inv);
     await screen.findByText('flag-off suricata case');
-    expect(screen.queryByText(/detection authoring is off/i)).toBeNull();
+    expect(screen.queryByText(/sigma export is off/i)).toBeNull();
   });
 
   it('does not show the enable-it pointer for a non-TP hunt investigation with the flag off', async () => {
@@ -125,7 +125,7 @@ describe('draft-detection affordance — visibility gates', () => {
     const inv = baseInv({ verdict: 'false_positive', rationale: 'flag-off non-tp case' });
     mount(inv);
     await screen.findByText('flag-off non-tp case');
-    expect(screen.queryByText(/detection authoring is off/i)).toBeNull();
+    expect(screen.queryByText(/sigma export is off/i)).toBeNull();
   });
 
   it('is hidden for a non-hunt-kind investigation even with the flag on', async () => {

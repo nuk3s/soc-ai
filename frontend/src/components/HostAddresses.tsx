@@ -211,6 +211,9 @@ export interface HostAddressesProps {
   /** The days of events each sweep counts. The Events columns say it in
    *  their header, because the 24h and 7d buttons do not change them. */
   windowDays?: number | null;
+  /** The time of the sweep of the primary address. An old sweep names its
+   *  date in the Events header. */
+  builtAt?: string | null;
 }
 
 export function HostAddresses({
@@ -219,8 +222,9 @@ export function HostAddresses({
   focusField,
   lastActivity,
   windowDays,
+  builtAt,
 }: HostAddressesProps) {
-  const eventsHeader = `Events, ${sweepWindowWords(windowDays)}`;
+  const eventsHeader = `Events, ${sweepWindowWords(windowDays, builtAt)}`;
   // Primary first, then the newest. The primary row takes the live stamp the
   // header reads (dogfood 2026-10-06, S4: "last seen 2m" over a row of "4d").
   const addresses = machine.addresses
@@ -311,7 +315,7 @@ export function HostAddresses({
               {plural(containers.length, 'container')} on this machine
             </summary>
             <div className="px-[15px] pb-1 text-[11.5px] text-faint">
-              A container address sits inside a bridge network that this machine owns. Only the
+              A container address is in a bridge network that this machine owns. Only the
               endpoint sensor of this machine sees it.
             </div>
             <table className="w-full text-[12.5px]">

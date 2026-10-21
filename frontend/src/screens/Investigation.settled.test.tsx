@@ -50,7 +50,7 @@ describe('settled-action bar vs pipeline fallback', () => {
         />
       </MemoryRouter>,
     );
-    expect(screen.queryByText(/Verdict settled\. Take action\./i)).toBeNull();
+    expect(screen.queryByText('No automatic action')).toBeNull();
     expect(screen.getByText(/failed before it reached a verdict/i)).toBeTruthy();
   });
 
@@ -60,7 +60,7 @@ describe('settled-action bar vs pipeline fallback', () => {
         <Investigation inv={baseInv({ fallback: null, verdict: 'false_positive' })} layout="page" />
       </MemoryRouter>,
     );
-    expect(screen.getByText(/Verdict settled\. Take action\./i)).toBeTruthy();
+    expect(screen.getByText('No automatic action')).toBeTruthy();
   });
 });
 
@@ -164,6 +164,34 @@ describe('what the settled-action bar reports', () => {
     await waitFor(() => expect(escalateGroup).toHaveBeenCalledTimes(1));
     const msg = await screen.findByText(/Opened 2 cases/i);
     expect(msg.textContent).toBe('Opened 2 cases for GPL ICMP Large ICMP Packet');
+  });
+});
+
+// Dogfood 2026-10-19, R2-D15: a press that wrote nothing read like a write.
+describe('a settled-bar press that wrote nothing', () => {
+  it('reads in the info tone and counts as no action', async () => {
+    vi.mocked(ackGroup).mockResolvedValue({
+      acked: 0,
+      failed: 0,
+      total: 0,
+      capped: false,
+      already_acked: 2,
+    });
+    mountDrawer();
+    fireEvent.click(screen.getByRole('button', { name: /^acknowledge$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /confirm acknowledge/i }));
+    const msg = await screen.findByTestId('settled-msg');
+    expect(msg.dataset.tone).toBe('info');
+    expect(screen.getByTestId('flow-step-action').dataset.state).not.toBe('done');
+  });
+
+  it('control: a press that wrote reads in the ok tone', async () => {
+    vi.mocked(ackGroup).mockResolvedValue({ acked: 2, failed: 0, total: 2, capped: false });
+    mountDrawer();
+    fireEvent.click(screen.getByRole('button', { name: /^acknowledge$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /confirm acknowledge/i }));
+    const msg = await screen.findByTestId('settled-msg');
+    expect(msg.dataset.tone).toBe('ok');
   });
 });
 

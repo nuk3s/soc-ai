@@ -5,7 +5,7 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { QualityFreshness, QualityPoint } from '../lib/api';
-import { absTime } from '../lib/timeRange';
+import { absoluteTime } from '../lib/timeRange';
 import {
   QualityCard,
   alarmBanner,
@@ -225,7 +225,7 @@ describe('alarmBanner', () => {
     // guess one — and with no identity there is nothing to key a dismissal on.
     const b = alarmBanner([point({ ts: T1 }), alarmed({ id: 2, ts: T2 })]);
     expect(b?.kind).toBe('quality');
-    expect(b?.headline).toBe('The last run tripped the regression alarm.');
+    expect(b?.headline).toBe('The last run raised the regression alarm.');
     expect(b?.pipelineNote).toBeNull();
     expect(b?.dismissId).toBeNull();
   });
@@ -253,7 +253,7 @@ describe('alarmBanner', () => {
     for (const code of ['agreement_drop', 'fallback_jump']) {
       const b = alarmBanner([point({ ts: T1 }), condition([code], T2, { id: 2, ts: T2 })]);
       expect(b?.kind).toBe('quality');
-      expect(b?.headline).toBe('The last run tripped the regression alarm.');
+      expect(b?.headline).toBe('The last run raised the regression alarm.');
       expect(b?.pipelineNote).toBeNull();
     }
   });
@@ -272,7 +272,7 @@ describe('alarmBanner', () => {
       }),
     ]);
     expect(b?.kind).toBe('quality');
-    expect(b?.headline).toBe('The last run tripped the regression alarm.');
+    expect(b?.headline).toBe('The last run raised the regression alarm.');
     expect(b?.pipelineNote).toBe('The eval pipeline is also failing. 2 of 5 eval runs errored.');
   });
 
@@ -284,14 +284,14 @@ describe('alarmBanner', () => {
     ]);
     expect(b?.ongoing).toBe(true);
     expect(b?.runs).toBe(2);
-    expect(b?.headline).toBe(`Regression alarm, ongoing since ${absTime(T2)}, 2 runs`);
+    expect(b?.headline).toBe(`Regression alarm, ongoing since ${absoluteTime(T2)}, 2 runs`);
   });
 
   it('reads NEW on the run that raised the alarm (alarm_since === ts)', () => {
     const b = alarmBanner([point({ ts: T1 }), condition(['agreement_drop'], T2, { id: 2, ts: T2 })]);
     expect(b?.ongoing).toBe(false);
     expect(b?.runs).toBe(1);
-    expect(b?.headline).toBe('The last run tripped the regression alarm.');
+    expect(b?.headline).toBe('The last run raised the regression alarm.');
   });
 
   it('restarts the count after a clean night — a re-raise is not the old condition', () => {
@@ -332,7 +332,7 @@ describe('alarmBanner', () => {
 describe('QualityCard', () => {
   it('renders the schedule-it empty state when no snapshot exists', () => {
     render(<QualityCard points={[]} error={null} loading={false} />);
-    expect(screen.getByText(/No quality history yet/)).toBeInTheDocument();
+    expect(screen.getByText(/No quality history\./)).toBeInTheDocument();
     expect(screen.getByText('soc-ai eval-nightly')).toBeInTheDocument();
     expect(screen.getByText(/docs\/DOCKER\.md/)).toBeInTheDocument();
   });
@@ -391,7 +391,7 @@ describe('QualityCard', () => {
       />,
     );
     expect(screen.getByRole('alert')).toBeInTheDocument();
-    expect(screen.getByText('The last run tripped the regression alarm.')).toBeInTheDocument();
+    expect(screen.getByText('The last run raised the regression alarm.')).toBeInTheDocument();
     expect(screen.getByText(reason)).toBeInTheDocument();
   });
 
@@ -520,7 +520,7 @@ describe('QualityCard', () => {
       />,
     );
     expect(screen.getByText('The eval pipeline is failing. 5 of 5 eval runs errored.')).toBeInTheDocument();
-    expect(screen.queryByText('The last run tripped the regression alarm.')).toBeNull();
+    expect(screen.queryByText('The last run raised the regression alarm.')).toBeNull();
     // The detector's own words still show — this replaces the headline, not the evidence.
     expect(screen.getByText('error_rate 1.00 exceeds the 0.30 ceiling')).toBeInTheDocument();
   });
@@ -538,9 +538,9 @@ describe('QualityCard', () => {
       />,
     );
     expect(
-      screen.getByText(`Regression alarm, ongoing since ${absTime(T2)}, 2 runs`),
+      screen.getByText(`Regression alarm, ongoing since ${absoluteTime(T2)}, 2 runs`),
     ).toBeInTheDocument();
-    expect(screen.queryByText('The last run tripped the regression alarm.')).toBeNull();
+    expect(screen.queryByText('The last run raised the regression alarm.')).toBeNull();
   });
 
   it('shows the pipeline line under the quality banner on mixed codes', () => {
@@ -560,7 +560,7 @@ describe('QualityCard', () => {
         loading={false}
       />,
     );
-    expect(screen.getByText('The last run tripped the regression alarm.')).toBeInTheDocument();
+    expect(screen.getByText('The last run raised the regression alarm.')).toBeInTheDocument();
     expect(screen.getByTestId('quality-pipeline-note')).toHaveTextContent(
       'The eval pipeline is also failing. 2 of 5 eval runs errored.',
     );
@@ -811,7 +811,7 @@ describe('QualityCard freshness (issue #56)', () => {
         })}
       />,
     );
-    expect(screen.getByText(/No quality history yet/)).toBeInTheDocument();
+    expect(screen.getByText(/No quality history\./)).toBeInTheDocument();
     expect(screen.getByTestId('quality-freshness')).toHaveTextContent(
       `Last attempt 6h ago: ${DETAIL}`,
     );
@@ -822,7 +822,7 @@ describe('QualityCard freshness (issue #56)', () => {
 
   it('keeps the schedule-it copy when nothing has tried yet', () => {
     render(<QualityCard points={[]} error={null} loading={false} freshness={freshness()} />);
-    expect(screen.getByText(/turn the nightly eval on/)).toBeInTheDocument();
+    expect(screen.getByText(/turn on the nightly eval/)).toBeInTheDocument();
   });
 
   // An empty trend is the normal shape of two different situations, and the
@@ -834,7 +834,7 @@ describe('QualityCard freshness (issue #56)', () => {
   it('says an empty trend has never been attempted, rather than saying nothing', () => {
     render(<QualityCard points={[]} error={null} loading={false} freshness={freshness()} />);
     expect(screen.getByTestId('quality-freshness')).toHaveTextContent(
-      /No eval has run on this deployment yet/i,
+      /No eval has run on this deployment\./i,
     );
   });
 

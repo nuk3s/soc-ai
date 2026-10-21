@@ -27,7 +27,7 @@ const NO_ID = 'No document id was given.';
 const READ_FAILED = 'Could not read the document.';
 
 export const DOCUMENT_TITLE =
-  'This is an Elasticsearch document id. Open it to read the document the analytic matched.';
+  'This is an Elasticsearch document id. Open it to read the document.';
 
 /** One value, as one line. An array is joined, because one key with four rows
  *  under it reads as four separate facts. */

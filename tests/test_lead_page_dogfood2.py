@@ -399,6 +399,7 @@ def test_the_lead_names_the_investigation_of_a_promoted_finding(client: TestClie
             "status": "complete",
             "verdict": "true_positive",
             "confidence": 0.75,
+            "shared_with": [],
         }
     ]
 

@@ -94,7 +94,7 @@ describe('the abort message', () => {
     expect(isRequestTimeout(err)).toBe(true);
     expect((err as RequestTimeoutError).timeoutMs).toBe(90_000);
     expect((err as Error).message).toBe(
-      'The request did not return in 90 s. The grid is slow. The change may still land. Check the row in a minute.',
+      'The request did not return in 90 s. The grid is slow. The change can still complete. Check the row in a minute.',
     );
   });
 

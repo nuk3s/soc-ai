@@ -115,7 +115,9 @@ export function needsYouLinks(data: NeedsYouCount | null) {
     shadowHits: '/hunts?hits=unread#analytic-hits',
     untriaged: `/alerts?range=${alertWindow}&verdict=untriaged`,
     needsMoreInfo: `/investigations?range=${verdictWindow}&verdict=needs_more_info`,
-    pendingActions: `/investigations?range=${verdictWindow}&verdict=true_positive`,
+    // The runs with a pending action, by the rule of the count. The line
+    // opened every true positive, and the list did not match the number.
+    pendingActions: `/investigations?range=${verdictWindow}&actions=pending`,
   };
 }
 

@@ -14,8 +14,8 @@ reasoning behind them. Onion AI needs a Security Onion Pro license. soc-ai is
 an open alternative to it.
 
 The model runs on your own hardware behind a [LiteLLM](https://docs.litellm.ai/) gateway.
-No data about your network leaves it. The write-backs stay yours, because the
-agent recommends and you execute. One exception exists. soc-ai can
+No data about your network leaves it. The agent recommends each write-back, and
+you execute it. One exception exists. soc-ai can
 auto-acknowledge a high-confidence, low-stakes, investigated false positive, and
 it audits that write. The exception is off until you turn it on.
 
@@ -115,7 +115,7 @@ You stay in control of every action that changes state.
 - **Writes wait for a human.** A write acknowledges an alert, opens a case or
   adds a comment. The agent recommends the write and you execute it with a
   click. One exception is off until you turn it on. Set
-  `auto_ack_fp_enabled=true` under Config → Triage automation. The exception
+  `auto_ack_fp_enabled=true` under Settings → Triage automation. The exception
   auto-acknowledges a confident false positive. The write needs high
   confidence, and the investigation must have retrieved something first. It
   never fires on a critical or high-severity alert, or on a malware-class or
@@ -134,11 +134,12 @@ You stay in control of every action that changes state.
 
 Alert triage is the task a security operations centre most wants to give to an
 LLM. It is also the task where you least want to send your hostnames, usernames
-and IP addresses to another company's cloud. soc-ai removes that trade:
+and IP addresses to another company's cloud. soc-ai does the triage on your own
+hardware:
 
-- **Free and yours:** soc-ai has no per-seat meter, no per-alert meter and no
-  per-investigation meter. No license needs a call home. You run it and you own
-  it.
+- **No cost meter:** soc-ai has no per-seat meter, no per-alert meter and no
+  per-investigation meter. No license needs a call home. You run it on your own
+  host.
 - **Local or air-gapped:** the reasoning runs on a model that you host. The
   Oracle is off by default, so the whole pipeline works with no internet
   connection.
@@ -148,7 +149,7 @@ and IP addresses to another company's cloud. soc-ai removes that trade:
   concrete indicator-of-compromise hit and a cited correlated-pivot record.
   soc-ai rewrites any weaker verdict to `needs_more_info`. The logic is open, so you
   can read how soc-ai reached a verdict and then change the logic.
-- **You own every change.** The agent recommends a write and you execute it. The
+- **You approve every change.** The agent recommends a write and you execute it. The
   false-positive auto-acknowledge is the one unattended write. It is off by
   default, bounded and audited. It never fires if the run retrieved nothing.
 
@@ -186,7 +187,7 @@ only.
 
     ---
 
-    The Security Onion account, role and firewall prerequisites. These setup steps reliably cause trouble.
+    The Security Onion account, role and firewall prerequisites. These steps cause the most install problems.
 
     [:octicons-arrow-right-24: SO setup](SECURITY-ONION-SETUP.md)
 
@@ -203,6 +204,6 @@ only.
 ---
 
 soc-ai is open source under the [Apache-2.0 license](https://github.com/nuk3s/soc-ai/blob/main/LICENSE).
-If you already run Security Onion, soc-ai puts a local model to work on your
-alert queue. The [roadmap](ROADMAP.md) records what shipped, what comes next, and
+If you already run Security Onion, soc-ai runs a local model over your alert
+queue. The [roadmap](ROADMAP.md) records what shipped, what comes next, and
 what ships off by default. Each release has its notes under Project.

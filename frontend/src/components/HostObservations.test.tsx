@@ -88,7 +88,7 @@ describe('HostObservations', () => {
 
     const catalog = screen.getByTestId('observation-1');
     expect(within(catalog).getByText('catalog')).toBeTruthy();
-    expect(within(catalog).getByText('finding with no benign baseline')).toBeTruthy();
+    expect(within(catalog).getByText('no benign baseline')).toBeTruthy();
     expect(within(catalog).getByText('weight 0.94')).toBeTruthy();
     expect(within(catalog).getByText('in lead 12').getAttribute('href')).toBe('/leads/12');
 
@@ -110,7 +110,7 @@ describe('HostObservations', () => {
   it('states what every chip on a row means', async () => {
     mount();
     const catalog = await screen.findByTestId('observation-1');
-    expect(within(catalog).getByText('finding with no benign baseline').getAttribute('title')).toBe(
+    expect(within(catalog).getByText('no benign baseline').getAttribute('title')).toBe(
       CHIP_TYPE,
     );
     expect(within(catalog).getByText('in lead 12').getAttribute('title')).toBe(CHIP_IN_LEAD);
@@ -185,5 +185,67 @@ describe('HostObservations', () => {
     );
     // Negative control: a row with no statistic states none.
     expect(screen.queryByTestId('observation-statistic-7')).toBeNull();
+  });
+});
+
+// Dogfood 2026-10-19, R4-D18: an old observation kept "in the last 24 h".
+describe('an old observation', () => {
+  it('anchors its window to the sweep that wrote it', async () => {
+    const born = iso(20 * 24 * HOUR);
+    vi.mocked(getObservations).mockResolvedValue({
+      entity: '192.0.2.10',
+      days: 30,
+      observations: [{ ...ROWS[0], id: 9, summary: 'new port for this host: 4444. 3 documents in the last 24 h', born_at: born }],
+    });
+    render(
+      <MemoryRouter>
+        <HostObservations entityKey="192.0.2.10" />
+      </MemoryRouter>,
+    );
+    const row = await screen.findByTestId('observation-9');
+    expect(row.textContent).toContain('3 documents in the 24 h before');
+    expect(row.textContent).not.toContain('in the last 24 h');
+  });
+});
+
+// Dogfood 2026-10-19, R4 STE: "A residual z of -52.0 against an expected 2759
+// per hour" on the host page. The summary states the count and the expected
+// count, so the z score stays off the row.
+describe('a rate departure', () => {
+  it('states no z score on the row', async () => {
+    vi.mocked(getObservations).mockResolvedValue({
+      entity: '192.0.2.10',
+      days: 7,
+      observations: [
+        {
+          ...ROWS[0],
+          id: 21,
+          kind: 'below_baseline',
+          summary: 'The connection rate on Sunday 16:00 is 0 per hour. The baseline expects 2759 per hour',
+          statistic: 'residual_z',
+          statistic_value: -52,
+          baseline_value: 2759,
+        },
+        {
+          // NEGATIVE CONTROL: a statistic that is no z score keeps its line.
+          ...ROWS[0],
+          id: 22,
+          statistic: 'plane_documents',
+          statistic_value: 0,
+          baseline_value: 412,
+        },
+      ],
+    });
+    render(
+      <MemoryRouter>
+        <HostObservations entityKey="192.0.2.10" />
+      </MemoryRouter>,
+    );
+    const row = await screen.findByTestId('observation-21');
+    expect(row.textContent).not.toMatch(/residual z/);
+    expect(screen.queryByTestId('observation-statistic-21')).toBeNull();
+    expect(screen.getByTestId('observation-statistic-22').textContent).toBe(
+      '0 documents from the log source in the hours it stopped. The baseline expects 412 in those hours.',
+    );
   });
 });

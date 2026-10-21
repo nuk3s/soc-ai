@@ -62,7 +62,7 @@ import {
   listSavedViews,
 } from '../lib/api';
 import { queueOf } from '../test/alertQueue';
-import { Alerts, escalateAlertCount, escalateConfirmText } from './Alerts';
+import { Alerts, ESCALATE_CAP, escalateConfirmText, pressPlan } from './Alerts';
 import { ShellProvider } from '../shell/ShellContext';
 
 const GROUP: AlertGroup = {
@@ -149,6 +149,8 @@ describe('the escalate strip', () => {
 
   it('says which alerts a second case was withheld from', async () => {
     // The second press: nothing to do, and the reason is a case that exists.
+    // It read "Opened no cases for X" and named no case (dogfood 2026-10-19,
+    // R2-D15). It now names what is already done and that it opened nothing.
     vi.mocked(escalateGroup).mockResolvedValue({
       escalated: 0,
       failed: 0,
@@ -162,10 +164,10 @@ describe('the escalate strip', () => {
 
     await pressEscalate();
 
-    const strip = await screen.findByText(/Opened no cases/);
-    expect(strip.textContent).toMatch(/1 alert already on a case, no second case opened/);
-    expect(strip.textContent).toMatch(/17 alerts already acknowledged in Security Onion/);
-    expect(strip.textContent).not.toMatch(/press again/);
+    const strip = await screen.findByText(/soc-ai opened no case/);
+    expect(strip.textContent).toMatch(/1 alert of .* is already on a case\./);
+    expect(strip.textContent).toMatch(/17 alerts of .* are already acknowledged\./);
+    expect(strip.textContent).not.toMatch(/press again/i);
   });
 
   it('names alerts whose earlier escalate never came back', async () => {
@@ -286,10 +288,10 @@ describe('the escalate confirm', () => {
   });
 
   it('says "each alert" when a group is not on the page', () => {
-    expect(escalateAlertCount([{ name: 'X', kind: 'suricata' }], [GROUP])).toBeNull();
-    expect(escalateAlertCount([{ name: GROUP.name, kind: GROUP.kind }], [GROUP])).toBe(18);
+    expect(pressPlan([{ name: 'X', kind: 'suricata' }], [GROUP], ESCALATE_CAP)).toBeNull();
+    expect(pressPlan([{ name: GROUP.name, kind: GROUP.kind }], [GROUP], ESCALATE_CAP)?.press).toBe(18);
     expect(escalateConfirmText([{ name: 'X', kind: 'suricata' }], null)).toBe(
-      'Open one Security Onion case for each alert of X.',
+      'Open one Security Onion case for each alert of X. One press opens at most 25 cases.',
     );
   });
 });

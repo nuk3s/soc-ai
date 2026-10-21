@@ -109,7 +109,7 @@ describe('the handled-count chips', () => {
   it('shows the number when the grid can count', async () => {
     await showGroup({ ...GROUP, ackedCount: 3, escalatedCount: 1 });
     expect(screen.getByTitle('3 acknowledged')).toBeTruthy();
-    expect(screen.getByTitle('1 escalated')).toBeTruthy();
+    expect(screen.getByTitle('1 alert is on a case')).toBeTruthy();
   });
 
   it('shows nothing when the grid counted zero', async () => {

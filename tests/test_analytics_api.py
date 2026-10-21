@@ -63,6 +63,28 @@ def test_a_candidate_goes_to_shadow_then_live_with_a_reason(client: TestClient) 
     assert detail["spec_text"].startswith("id: local-svc-ticket-from-workstation")
 
 
+@pytest.mark.parametrize("why", ["';l", "ok", "...", "1234", "a b"])
+def test_an_approval_refuses_a_reason_with_no_words(client: TestClient, why: str) -> None:
+    """R3-D15: the range stored the approval reason "';l" on a live analytic."""
+    client.post("/api/v1/analytics", json={"spec_text": SPEC_TEXT})
+    client.post(f"/api/v1/analytics/{_LOCAL}/status", json={"to": "shadow", "why": "try it"})
+    res = client.post(f"/api/v1/analytics/{_LOCAL}/status", json={"to": "live", "why": why})
+    assert res.status_code == 422
+    assert res.json()["detail"]["reason"] == "reason_unreadable"
+    assert client.get(f"/api/v1/analytics/{_LOCAL}").json()["status"] == "shadow"
+    # Control: a reason in words passes, and so does no reason.
+    ok = client.post(f"/api/v1/analytics/{_LOCAL}/status", json={"to": "live", "why": "two hits"})
+    assert ok.status_code == 200
+
+
+def test_a_retirement_refuses_a_reason_with_no_words(client: TestClient) -> None:
+    res = client.post(
+        f"/api/v1/analytics/{_RETIRABLE}/status", json={"to": "retired", "why": "';l"}
+    )
+    assert res.status_code == 422
+    assert res.json()["detail"]["reason"] == "reason_unreadable"
+
+
 def test_a_bad_spec_is_refused_with_the_reason(client: TestClient) -> None:
     res = client.post("/api/v1/analytics", json={"spec_text": "- nope, not a mapping\n"})
     assert res.status_code == 422
@@ -910,8 +932,14 @@ def test_a_hit_outside_the_window_is_not_listed(client: TestClient) -> None:
     fresh = _insert_observation(
         client, fingerprint="fp-fresh", source="catalog", shadow=True, born_at=_ago(24)
     )
+    # A read shadow hit. An unread one is listed at any age (R3-D9).
     _insert_observation(
-        client, fingerprint="fp-old", source="catalog", shadow=True, born_at=_ago(24 * 9)
+        client,
+        fingerprint="fp-old",
+        source="catalog",
+        shadow=True,
+        born_at=_ago(24 * 9),
+        read_at=_ago(24 * 8),
     )
     body = client.get("/api/v1/hunts/hits").json()
     assert [h["id"] for h in body["hits"]] == [fresh]
@@ -1061,6 +1089,55 @@ def test_needs_you_and_the_hits_list_count_the_same_unread_shadow_hits(
     assert len(unread_list["hits"]) == needs["unread_shadow_hits"]
     assert band["unread"] == needs["unread_shadow_hits"]
     assert {h["analytic_id"] for h in band["hits"]} == {_PROFILE, "model-logon-chain"}
+
+
+def test_an_old_unread_shadow_hit_counts_and_lists_on_every_surface(client: TestClient) -> None:
+    """R3-D9: one rule for an unread shadow hit, with no window.
+
+    The range read "4 shadow hits are unread" on the Needs-you strip, "Unread
+    3" on the hits chip (7 days by born_at) and "1 unread" on the Analytics row
+    (7 days by first_seen_at). A hit born 12 days back sat in the count and in
+    no list.
+    """
+    old = _insert_observation(
+        client,
+        spec_id=_PROFILE,
+        fingerprint="fp-old-unread",
+        source="profile",
+        shadow=True,
+        born_at=_ago(12 * 24),
+        first_seen_at=_ago(12 * 24),
+    )
+    recent = _insert_observation(
+        client,
+        spec_id=_PROFILE,
+        fingerprint="fp-recent-unread",
+        source="profile",
+        shadow=True,
+        born_at=_ago(2),
+        first_seen_at=_ago(30 * 24),
+    )
+    # Control: an old read shadow hit stays out of the 7 day list.
+    read = _insert_observation(
+        client,
+        spec_id=_PROFILE,
+        fingerprint="fp-old-read",
+        source="profile",
+        shadow=True,
+        born_at=_ago(12 * 24),
+        read_at=_ago(11 * 24),
+    )
+    needs = client.get("/api/v1/hunts/needs-you").json()
+    assert needs["unread_shadow_hits"] == 2
+    body = client.get("/api/v1/hunts/hits").json()
+    assert body["counts"]["unread"] == 2
+    listed = {h["id"] for h in body["hits"]}
+    assert {old, recent} <= listed
+    assert read not in listed
+    unread = client.get("/api/v1/hunts/hits?filter=unread").json()
+    assert {h["id"] for h in unread["hits"]} == {old, recent}
+    rows = {a["id"]: a for a in client.get("/api/v1/analytics").json()["analytics"]}
+    assert rows[_PROFILE]["unread_shadow_hits"] == 2
 
 
 def test_a_read_profile_hit_leaves_the_unread_count(client: TestClient) -> None:

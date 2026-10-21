@@ -1,6 +1,13 @@
 import { Suspense } from 'react';
+import { Link } from 'react-router-dom';
 
 import { lazyWithReload } from '../lib/lazyWithReload';
+
+/** A same-app path: one leading "/" and no scheme. `safeUrl` has already
+ *  dropped every other kind of target. */
+export function isAppPath(href: string | undefined): href is string {
+  return typeof href === 'string' && href.startsWith('/') && !href.startsWith('//');
+}
 
 /**
  * Explicit URL allow-list for links in agent output. Agent markdown is derived
@@ -54,7 +61,7 @@ const LazyMarkdown = lazyWithReload(async () => {
     import('react-markdown'),
     import('remark-gfm'),
   ]);
-  function RenderedMarkdown({ children }: { children: string }) {
+  function RenderedMarkdown({ children, appLinks }: { children: string; appLinks?: boolean }) {
     return (
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
@@ -89,11 +96,19 @@ const LazyMarkdown = lazyWithReload(async () => {
           h3: ({ children }) => (
             <div className="mb-1 mt-2 text-[12.5px] font-semibold text-text-2 first:mt-0">{children}</div>
           ),
-          a: ({ children, href }) => (
-            <a href={href} target="_blank" rel="noopener noreferrer" className="text-accent underline">
-              {children}
-            </a>
-          ),
+          // With `appLinks`, a same-app path opens in the console. The chat
+          // answer's addresses, leads and investigations are such links
+          // (lib/chatLinks.ts). Every other link opens a new tab.
+          a: ({ children, href }) =>
+            appLinks && isAppPath(href) ? (
+              <Link to={href} className="text-accent underline">
+                {children}
+              </Link>
+            ) : (
+              <a href={href} target="_blank" rel="noopener noreferrer" className="text-accent underline">
+                {children}
+              </a>
+            ),
           // Tables always get an overflow-x-auto wrapper: at narrow widths (the
           // 400px chat dock) a multi-column table scrolls horizontally instead of
           // crushing; on wide surfaces the wrapper is inert (no scrollbar when it
@@ -119,13 +134,15 @@ const LazyMarkdown = lazyWithReload(async () => {
   return { default: RenderedMarkdown };
 });
 
-/** Renders assistant Markdown into the dark theme — tight spacing for chat. */
-export function Markdown({ children }: { children: string }) {
+/** Renders assistant Markdown into the dark theme — tight spacing for chat.
+ *  `appLinks` opens a same-app path in the console. The renderer needs a
+ *  router above it then. */
+export function Markdown({ children, appLinks = false }: { children: string; appLinks?: boolean }) {
   return (
     // Fallback = the raw text: a bubble shows plaintext for the instant before
     // the react-markdown chunk loads, never a blank or a spinner.
     <Suspense fallback={<span className="whitespace-pre-wrap">{children}</span>}>
-      <LazyMarkdown>{children}</LazyMarkdown>
+      <LazyMarkdown appLinks={appLinks}>{children}</LazyMarkdown>
     </Suspense>
   );
 }

@@ -22,9 +22,10 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from soc_ai.config import Settings
@@ -37,6 +38,7 @@ from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.store import hunts as hunts_store
 from soc_ai.store.hunt_spec_state import GAP_SCOPE, apply_gate, link_handled, link_hunt
 from soc_ai.store.hunt_spec_sweeps import record as record_sweep
+from soc_ai.store.models import HuntSpecSweep
 from soc_ai.tools._synth_scope import SynthScope
 
 _LOGGER = logging.getLogger(__name__)
@@ -54,6 +56,16 @@ SWEEP_ACTOR = "hunt-catalog"
 # permanently blind on that spec by construction, so this is the normal case
 # rather than an edge. It is defined in the gate rather than here because the
 # gate is what treats it specially; see `soc_ai.store.hunt_spec_state`.
+
+# How long a failed analytic waits before it reports again while its gap is
+# open. The gate holds a gap until the analytic sees again, which is right
+# for a blind analytic: a deployment with no decoy is blind on that analytic
+# forever. A failed run is different. The analytic did not run at all, and a
+# grid that was down for four days left no row in the 3 day hunt list, the
+# words of a quiet grid (dogfood 2026-10-19). One row a day per failed
+# analytic puts the failure in every window of the list. The bell folds the
+# rows of one sweep into one line.
+FAILURE_REREPORT = timedelta(hours=24)
 
 
 @dataclass
@@ -175,7 +187,26 @@ async def sweep_spec(
         # nothing. The early return used to skip this check entirely, so
         # `--backfill` on a blind spec recorded a hunt and contradicted its own
         # documented behaviour.
-        if not decision.fresh or not record or backfill or shadow_spec:
+        live = record and not backfill and not shadow_spec
+        if (
+            not decision.fresh
+            and live
+            and run.error is not None
+            and await _failure_report_due(session, spec.id, now)
+        ):
+            # The gap is open, and the analytic failed for a day or stopped
+            # being blind and failed. One row says so. The open gap row keeps
+            # its first hunt, so the gate holds the next sweeps as before.
+            failed_hunt_id = await _record(
+                spec,
+                run,
+                session=session,
+                since=since,
+                until=until,
+                is_synth_eval=bool(include_synth),
+            )
+            return run, failed_hunt_id
+        if not decision.fresh or not live:
             return run, None
         # Named apart from the catalog hunt row below. The two are different
         # rows on different paths, and one name for both hid which row a reader
@@ -414,6 +445,34 @@ async def _shadow_receipts(
 
 def _is_gap(candidate: Candidate) -> bool:
     return candidate.scope_key == GAP_SCOPE
+
+
+async def _failure_report_due(session: AsyncSession, spec_id: str, now: datetime) -> bool:
+    """Whether a failed run of an analytic with an open gap reports again.
+
+    The trail answers it. The newest live row of the analytic that names a
+    hunt is its last report. A failed run reports again when that report is
+    a day old, and when that report was not a failure: the analytic was
+    blind or unclean then, and now it does not run. No report on the trail
+    reports too. The trail is pruned, and a report it does not hold is
+    older than any row it holds.
+    """
+    last = (
+        await session.execute(
+            select(HuntSpecSweep.created_at, HuntSpecSweep.error)
+            .where(
+                HuntSpecSweep.spec_id == spec_id,
+                HuntSpecSweep.hunt_id.is_not(None),
+                HuntSpecSweep.shadow.is_(False),
+            )
+            .order_by(HuntSpecSweep.id.desc())
+            .limit(1)
+        )
+    ).first()
+    if last is None:
+        return True
+    reported_at, error = last
+    return error is None or now - reported_at >= FAILURE_REREPORT
 
 
 def _gap_candidate(spec_id: str, reason: str) -> Candidate:

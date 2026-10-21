@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from pydantic import BaseModel
@@ -66,6 +67,8 @@ _TL_GROUP = {
     # The same-session lookup runs during prompt assembly too, before any
     # synthesis, so it belongs with the rest of the prefetch story.
     "session_prior": "Prefetch & pivots",
+    # The analyst verdict on this alert, read while the prompt is assembled.
+    "analyst_verdict": "Prefetch & pivots",
     # Holding a verdict is a decision, not a lookup.
     "session_verdict_conflict": "Decision",
     # The "Tool calls" group holds tool calls and nothing else, because the
@@ -127,6 +130,9 @@ _ACTION_TITLE = {
     "add_case_comment": "Add case comment",
 }
 _ACTION_TAG = {"ack_alert": "ack", "escalate_to_case": "escalate", "add_case_comment": "comment"}
+# The type of an action in the operator's words: the word on the button of the
+# action card (ACTION_VERB in the console).
+ACTION_LABEL = {"ack": "Acknowledge", "escalate": "Escalate to case", "comment": "Add comment"}
 
 
 def _tl_group(kind: str) -> str:
@@ -275,6 +281,49 @@ def _flag_sources(enr: dict[str, Any]) -> list[str]:
     return srcs[:3]
 
 
+def _endpoint_internal(ip: Any, enrichments: dict[str, Any]) -> bool | None:
+    """Whether an endpoint is inside the estate. None when nothing says.
+
+    Enrichment's ``internal`` flag answers first: it knows the configured
+    internal ranges. An address enrichment did not describe falls back to
+    "not globally routable", which is internal on every network.
+    """
+    if not ip:
+        return None
+    enr = enrichments.get(str(ip))
+    if isinstance(enr, dict) and isinstance(enr.get("internal"), bool):
+        return bool(enr["internal"])
+    try:
+        return not ipaddress.ip_address(str(ip).strip()).is_global
+    except ValueError:
+        return None
+
+
+def _graph_scope(
+    alert: dict[str, Any], enrichments: dict[str, Any], inv: Investigation
+) -> str | None:
+    """The direction of the alert's flow: lateral, inbound, outbound or external.
+
+    The page called every true positive "lateral movement" and its source
+    "compromised", an external SQL injection source too (dogfood 2026-10-19,
+    R2-D10). Lateral movement is internal to internal. None when an end is
+    missing or unknown.
+    """
+    src = alert.get("source_ip") or inv.src_ip
+    dst = alert.get("destination_ip") or inv.dest_ip
+    src_in = _endpoint_internal(src, enrichments)
+    dst_in = _endpoint_internal(dst, enrichments)
+    if src_in is None or dst_in is None or not dst or str(dst) == str(src):
+        return None
+    if src_in and dst_in:
+        return "lateral"
+    if dst_in:
+        return "inbound"
+    if src_in:
+        return "outbound"
+    return "external"
+
+
 def _entity_graph(
     alert: dict[str, Any], enrichments: dict[str, Any], inv: Investigation
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None]:
@@ -289,13 +338,20 @@ def _entity_graph(
     if not src:
         return [], [], None
     src_enr = enrichments.get(str(src)) or {}
+    src_internal = _endpoint_internal(src, enrichments)
+    # A true positive marks an INTERNAL source compromised. An external source
+    # is the far end of an attack, and nothing here shows it was compromised.
     src_node: dict[str, Any] = {
         "id": str(src),
         "x": 20,
         "y": 50,
-        "kind": "compromised" if inv.verdict == "true_positive" else "host",
+        "kind": "compromised" if inv.verdict == "true_positive" and src_internal else "host",
         "label": str(label or src),
-        "sub": "source · internal" if src_enr.get("internal") else "source",
+        "sub": "source · internal"
+        if src_internal
+        else "source · external"
+        if src_internal is False
+        else "source",
     }
     src_flags = _flag_sources(src_enr)
     if src_flags:
@@ -380,6 +436,7 @@ _TOOL_NOUN = {
     "t_describe_dataset": "Dataset shape",
     "t_field_values": "Field values",
     "t_get_event_raw": "Raw event",
+    "t_get_rule_content": "Rule content",
     "t_host_dossier": "Host dossier",
     "t_ack_alert": "Acknowledge",
     "t_escalate_to_case": "Escalate to case",
@@ -516,6 +573,147 @@ def _dossier_outcome(result: Any) -> str | None:
     return f"{who}, " + ", ".join(parts)
 
 
+def _n(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _times(n: int, one: str, many: str) -> str:
+    return f"{n} {one if n == 1 else many}"
+
+
+def _day(iso: Any) -> str | None:
+    m = _ISO_TS_RE.search(str(iso or ""))
+    return m.group(1) if m else None
+
+
+def _prevalence_ste(args: dict[str, Any], r: dict[str, Any]) -> str | None:
+    total, days = _n(r.get("total_events")), _n(r.get("distinct_days"))
+    if total is None or days is None:
+        return None
+    ends = [str(args[k]) for k in ("ip", "peer_ip", "domain") if args.get(k)]
+    who = f"{' and '.join(ends)}: " if ends else ""
+    if not r.get("observed") or total == 0:
+        return f"{who}soc-ai found no event in the window. The pair is first-seen."
+    out = f"{who}{_times(total, 'event', 'events')} on {_times(days, 'day', 'days')}."
+    first, last = _day(r.get("first_seen")), _day(r.get("last_seen"))
+    if first and last:
+        out += f" The first event is on {first}. The last event is on {last}."
+    if r.get("rarity"):
+        out += f" Rarity: {r['rarity']}."
+    return out
+
+
+def _rule_prevalence_ste(r: dict[str, Any]) -> str | None:
+    total, window = _n(r.get("total_fires")), _n(r.get("lookback_days"))
+    if total is None or window is None:
+        return None
+    if total == 0:
+        return f"The rule did not fire in the {window}-day window. The rule is first-seen."
+    days = _n(r.get("active_days"))
+    on_days = f" on {_times(days, 'day', 'days')}" if days else ""
+    out = f"The rule fired {_times(total, 'time', 'times')}{on_days} in the {window}-day window."
+    src, dst = _n(r.get("distinct_src_hosts")), _n(r.get("distinct_dest_hosts"))
+    if src is not None:
+        out += f" Source hosts: {src}."
+    if dst is not None:
+        out += f" Destination hosts: {dst}."
+    rate = r.get("fires_per_day")
+    if r.get("is_burst"):
+        # A burst has no rate. The stored text gave one and then said so
+        # (R2 STE item 10).
+        out += " The fires form one burst."
+    elif isinstance(rate, int | float) and not isinstance(rate, bool):
+        out += f" The rate is {rate:.1f} fires a day."
+    if r.get("noisiness"):
+        out += f" Type: {r['noisiness']}."
+    return out
+
+
+def _origin_chain_ste(r: dict[str, Any]) -> str | None:
+    minutes, ip = _n(r.get("lookback_minutes")), r.get("ip")
+    if minutes is None or not ip:
+        return None
+    if not r.get("observations"):
+        return (
+            f"soc-ai found no inbound remote-access session to {ip} in the {minutes} "
+            "minutes before the activity."
+        )
+    sessions = r.get("inbound_sessions")
+    n = len(sessions) if isinstance(sessions, list) else 0
+    out = (
+        f"{_times(n, 'inbound remote-access session', 'inbound remote-access sessions')} "
+        f"reached {ip} in the {minutes} minutes before the activity."
+    )
+    closest = r.get("closest_preceding")
+    if isinstance(closest, dict) and closest.get("source_ip"):
+        secs = closest.get("seconds_before")
+        when = f", {secs:.0f} seconds before" if isinstance(secs, int | float) else ""
+        out += f" The closest came from {closest['source_ip']}{when}. Look at that source next."
+    return out
+
+
+def _rule_tuning_ste(r: dict[str, Any]) -> str | None:
+    count, window = _n(r.get("alert_count")), _n(r.get("lookback_days"))
+    if count is None or not r.get("recommendation"):
+        return None
+    span = f" in the {window}-day window" if window is not None else ""
+    return (
+        f"The rule raised {_times(count, 'alert', 'alerts')}{span}. "
+        f"The recommendation is {r['recommendation']}."
+    )
+
+
+def _rule_content_ste(r: dict[str, Any]) -> str | None:
+    """The rule-content answer. Its note and its miss hint are written for the
+    model: "2 detections matched; returning the best-ranked one" (V1-A5)."""
+    found = r.get("found")
+    if found is False:
+        return "no detection matches this rule id or title."
+    if found is not True:
+        return None
+    matches = _n(r.get("matches"))
+    if matches is not None and matches > 1:
+        return f"{matches} detections match. soc-ai read the best-ranked one."
+    return "soc-ai read the rule text."
+
+
+# The tools whose STE summary also replaces the model-facing ``hint``. The
+# hint of a rule-content miss names t_query_detections and carries a dash.
+_STE_REPLACES_HINT = frozenset({"t_get_rule_content"})
+
+
+def _ste_tool_summary(tool_name: str, args: dict[str, Any], result: Any) -> str | None:
+    """An operator sentence for a tool whose summary is written for the model.
+
+    These tools write their ``summary`` for the model, and the timeline
+    printed it verbatim (dogfood 2026-10-19, R2 STE items 9 to 13). The tool
+    output does not change. The timeline restates the result from its fields,
+    and stored runs read the same way. None leaves the summary as it is.
+    """
+    if not isinstance(result, dict) or result.get("error"):
+        return None
+    # A stored run can carry its arguments as a string, and older runs carry
+    # other result shapes. The demo fixtures do both. A summary that cannot
+    # read its fields returns None, so the step keeps the stored text. It
+    # must never fail the whole detail page (dogfood 2026-10-19 merge gate).
+    call_args = args if isinstance(args, dict) else {}
+    builders = {
+        "t_prevalence": lambda: _prevalence_ste(call_args, result),
+        "t_rule_prevalence": lambda: _rule_prevalence_ste(result),
+        "t_origin_chain": lambda: _origin_chain_ste(result),
+        "t_suggest_rule_tuning": lambda: _rule_tuning_ste(result),
+        "t_get_rule_content": lambda: _rule_content_ste(result),
+    }
+    build = builders.get(tool_name)
+    if build is None:
+        return None
+    try:
+        return build()
+    except (AttributeError, KeyError, TypeError, ValueError):
+        _LOGGER.warning("timeline: no STE summary for %s. The stored text stays.", tool_name)
+        return None
+
+
 def _tool_step(tool_name: str, args: dict[str, Any], result: Any) -> tuple[str, str]:
     """Title carries the point (tool + a short outcome); detail (shown on expand)
     carries the FULL headline result first, then the query and any enrichment chips.
@@ -525,7 +723,8 @@ def _tool_step(tool_name: str, args: dict[str, Any], result: Any) -> tuple[str, 
     """
     noun = _TOOL_NOUN.get(tool_name, _humanize_id(tool_name).capitalize())
     outcome = _dossier_outcome(result) if tool_name == "t_host_dossier" else None
-    title = f"{noun}: {outcome or _tool_outcome(result)}"
+    ste = _ste_tool_summary(tool_name, args, result)
+    title = f"{noun}: {outcome or (_compact(ste) if ste else None) or _tool_outcome(result)}"
 
     lines: list[str] = []
     headline_key: str | None = None
@@ -542,6 +741,14 @@ def _tool_step(tool_name: str, args: dict[str, Any], result: Any) -> tuple[str, 
                 headline_key = k
                 lines.append(f"reason: {_compact(reason)}")
                 break
+    elif ste is not None:
+        headline_key = "hint" if tool_name in _STE_REPLACES_HINT else "summary"
+        lines.append(f"result: {ste}")
+    elif isinstance(result, dict) and result.get("prefetch_already_has_this"):
+        # The hint is an instruction to the model (R2 STE 7). The analyst
+        # reads what happened.
+        headline_key = "hint"
+        lines.append("result: soc-ai already loaded the Zeek events of this flow.")
     elif isinstance(result, dict):
         # The full answer first. The title holds only the short outcome.
         for k in ("summary", "verdict", "status", "note", "hint"):
@@ -568,6 +775,59 @@ def _tool_step(tool_name: str, args: dict[str, Any], result: Any) -> tuple[str, 
     return title, "\n".join(lines)
 
 
+_VERDICT_WORDS = {
+    "true_positive": "a true positive",
+    "false_positive": "a false positive",
+    "needs_more_info": "needs more info",
+    "inconclusive": "no verdict",
+}
+
+
+def _verdict_words(verdict: Any) -> str:
+    """A verdict code as words in a sentence: "a false positive"."""
+    return _VERDICT_WORDS.get(str(verdict or ""), str(verdict or "no verdict").replace("_", " "))
+
+
+# Why the investigation loop ran, as a sentence (R2 STE 5). The codes come from
+# the orchestrator's loop_reason and soc_ai.agent.budget.ClassPlan.reason.
+_LOOP_REASONS = {
+    "deep_rerun": "An analyst asked for a deep run.",
+    "analyst_run": "An analyst asked for this run.",
+    "hunt_subject": "The run investigates a hunt.",
+    "fast_triage_disabled": "Fast triage is off. Every alert gets the full investigation.",
+    "session_true_positive_stands": "A true positive stands on the same network session.",
+    "round1_cannot_settle": "The first pass cannot settle this alert.",
+    "gate_would_change": "An evidence gate can change the first-pass verdict.",
+    "verdict_not_evidence_backed": "The first-pass verdict has no evidence behind it.",
+    "no_dispositive_template": "No pattern settles this alert.",
+    "dispositive_template": "A pattern settles this alert.",
+}
+
+
+# The trigger behind ``definitely_investigate``, from the loop event (V1-A1).
+# The code had one sentence, "an exploit or malware signal", for three
+# triggers. An NTLMv1 alert sent to the loop by a provisional template read
+# as malware. A stored run without the field gets the neutral sentence.
+_DI_TRIGGERS = {
+    "malware_rule": "The alert has an exploit or malware signal.",
+    "host_concurrent_threat": "Another alert on the same host signals a threat.",
+    "provisional_template": (
+        "A pattern proposed a false positive. The pattern cannot close the alert without evidence."
+    ),
+}
+_DI_NO_TRIGGER = "A soc-ai rule sends this alert to the full investigation."
+
+
+def _loop_reason(code: Any, trigger: Any = None) -> str:
+    text = str(code or "").strip()
+    if not text:
+        return ""
+    if text == "definitely_investigate":
+        known = _DI_TRIGGERS.get(trigger) if isinstance(trigger, str) else None
+        return known or _DI_NO_TRIGGER
+    return _LOOP_REASONS.get(text, text.replace("_", " ").capitalize() + ".")
+
+
 def _percent(ratio: Any) -> str:
     """A 0..1 ratio as a whole percent: "83%", never 0.8333333333333334."""
     if isinstance(ratio, bool) or not isinstance(ratio, int | float):
@@ -582,12 +842,87 @@ _AUTO_ACK_SKIP_REASON = {
     "uncited": "no citation resolves",
     "promoted_finding": "a promoted finding has no alert",
     "oracle_dissent": "the Oracle disagreed without evidence",
+    "analyst_verdict": "an analyst set a different verdict",
+    "analyst_verdict_unknown": "soc-ai could not read the analyst verdict",
 }
 
 
 def _auto_ack_skip_reason(p: dict[str, Any]) -> str:
     reason = str(p.get("reason") or "")
     return _AUTO_ACK_SKIP_REASON.get(reason, reason.replace("_", " ") or "no reason recorded")
+
+
+def _report_detail(p: dict[str, Any]) -> str:
+    """The verdict step: the summary. The title states the verdict.
+
+    The detail opened with the code, "false_positive (0.8)" (V1-A4).
+    """
+    summary = p.get("summary")
+    if isinstance(summary, str) and summary.strip():
+        return summary.strip()
+    conf = p.get("confidence")
+    at = f" at {conf:.2f}" if _is_number(conf) else ""
+    return f"soc-ai reached {_verdict_words(p.get('verdict'))}{at}. The report has no summary."
+
+
+def _downgrade_detail(p: dict[str, Any]) -> str | None:
+    """A gate that changed the verdict, in words. The step showed its JSON.
+
+    None on a payload without both verdicts, so the stored text stays.
+    """
+    before, after = p.get("original_verdict"), p.get("downgraded_verdict")
+    if not (isinstance(before, str) and isinstance(after, str)):
+        return None
+    lines = [
+        f"soc-ai changed the verdict from {_verdict_words(before)} to {_verdict_words(after)}."
+    ]
+    reason = p.get("reason")
+    if isinstance(reason, str) and reason.strip():
+        lines.append(f"Reason: {reason.strip()}")
+    summary = p.get("original_summary")
+    if isinstance(summary, str) and summary.strip():
+        lines.append(f"The summary before the change: {summary.strip()}")
+    return "\n".join(lines)
+
+
+def _template_rationale(template_id: Any, rationale: Any) -> str:
+    """The rationale of the template, as the timeline shows it.
+
+    The model reads the internal-traffic rationale as the grounds of the
+    candidate, so the template keeps its text. Its "likely benign east-west
+    traffic" is a conclusion with no fact behind it, and the timeline states
+    the facts only (V1-A5). Four stored wordings exist. Each states whether
+    the blocklist answered.
+    """
+    text = rationale if isinstance(rationale, str) else ""
+    if template_id != "clean_internal_traffic" or "east-west" not in text:
+        return text
+    if "not loaded" in text:
+        return (
+            "Both hosts are internal. The blocklist was not loaded. "
+            "No indicator reached threat intel."
+        )
+    return "Both hosts are internal. The blocklist answered with no hit."
+
+
+_EM_DASH = chr(0x2014)
+# "- <ip> (<label>) <em dash> no dossier: ..." and "... <em dash> role: ...",
+# the two head lines of the dossier block (soc_ai/dossier/prompt.py). The
+# model reads the block, so the timeline maps the lines it shows (V1-A5).
+_DOSSIER_NONE_RE = re.compile(rf"^- (?P<head>.+?) {_EM_DASH} no dossier:.*$")
+_DOSSIER_ROLE_RE = re.compile(rf"^- (?P<head>.+?) {_EM_DASH} role: (?P<rest>.*)$")
+
+
+def _dossier_line_words(line: str) -> str:
+    """One host head line without the dash and the "not evidence" contrast."""
+    if m := _DOSSIER_NONE_RE.match(line):
+        return (
+            f"- {m.group('head')}: soc-ai has no dossier for this address. "
+            "The network sweep has no record of it."
+        )
+    if m := _DOSSIER_ROLE_RE.match(line):
+        return f"- {m.group('head')}: role {m.group('rest')}"
+    return line
 
 
 def _dossier_event_detail(p: dict[str, Any]) -> str:
@@ -607,11 +942,34 @@ def _dossier_event_detail(p: dict[str, Any]) -> str:
         lines.append(f"{omitted} more host(s) not described.")
     block = p.get("block")
     if isinstance(block, str) and block.strip():
-        body = [ln for ln in block.strip().splitlines() if not ln.lstrip().startswith("#")]
-        text = "\n".join(body).strip()
+        text = "\n".join(_dossier_line_words(ln) for ln in _dossier_host_lines(block)).strip()
         if text:
             lines.append(_compact(text))
     return "\n".join(lines) or "The dossier block was empty."
+
+
+def _dossier_host_lines(block: str) -> list[str]:
+    """The host lines of the dossier block, without the model instructions.
+
+    The block opens with a heading, an intro and the writing-style rule, all
+    addressed to the model ("Do not cite these lines", "call
+    `t_host_dossier`", "Write for the analyst"). The timeline showed them to
+    the analyst (dogfood 2026-10-19, R2-D6). A host line starts with "- " at
+    the margin, and its detail lines are indented under it. The trailing
+    "omitted" line is an instruction too, and ``hosts_omitted`` states it.
+    """
+    out: list[str] = []
+    in_host = False
+    for ln in block.splitlines():
+        if ln.startswith("- "):
+            in_host = not ln.startswith("- (+")
+            if in_host:
+                out.append(ln)
+        elif in_host and ln.startswith("  ") and ln.strip():
+            out.append(ln)
+        else:
+            in_host = False
+    return out
 
 
 def _citation_detail(p: dict[str, Any]) -> str:
@@ -631,12 +989,60 @@ def _citation_detail(p: dict[str, Any]) -> str:
     for item in per if isinstance(per, list) else []:
         if isinstance(item, dict) and item.get("citation"):
             mark = "valid" if item.get("resolved") else "not resolved"
-            lines.append(f"{mark}: {_compact(str(item['citation']))}")
+            lines.append(f"{mark}: {_citation_words(str(item['citation']))}")
     return "\n".join(lines)
+
+
+# A tool citation as the model writes it: "tool t_prevalence:result.rarity",
+# "(tool t_enrich_ip)" or a bare "t_x:result.y". The step listed the tool id
+# and the result key, "prefetch_already_has_this" among them (V1-A4).
+_TOOL_CITATION_RE = re.compile(
+    r"^\(?\s*(?:tool\s+)?(?P<tool>t_[A-Za-z0-9_]+)\s*(?::\s*(?P<path>[^)]*?))?\s*\)?$"
+)
+# Result keys that are an instruction to the model, as what they mean.
+_CITED_RESULT_WORDS = {"prefetch_already_has_this": "the events soc-ai already loaded"}
+
+
+def _citation_words(citation: str) -> str:
+    """A tool citation in words: "Indicator prevalence: rarity".
+
+    A field path and a document id stay as they are: the analyst opens them.
+    """
+    m = _TOOL_CITATION_RE.match(citation.strip())
+    if m is None:
+        return _compact(citation)
+    tool = m.group("tool")
+    noun = _TOOL_NOUN.get(tool, _humanize_id(tool).capitalize())
+    path = (m.group("path") or "").strip()
+    path = "" if path == "result" else path.removeprefix("result.")
+    if not path:
+        return noun
+    return f"{noun}: {_CITED_RESULT_WORDS.get(path, path.replace('_', ' '))}"
+
+
+def _auto_ack_detail(p: dict[str, Any]) -> str:
+    """The auto-acknowledge write, in words. The step showed its raw JSON (V1-A4)."""
+    es_id = p.get("es_id")
+    alert = f"alert {es_id}" if isinstance(es_id, str) and es_id else "the alert"
+    if p.get("success") is False:
+        return f"soc-ai tried to acknowledge {alert} in Security Onion. The write failed."
+    out = f"soc-ai acknowledged {alert} in Security Onion."
+    conf, threshold = p.get("confidence"), p.get("threshold")
+    if _is_number(conf) and _is_number(threshold):
+        out += f" The confidence {conf:.2f} is at or above the threshold {threshold:.2f}."
+    return out
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool)
 
 
 def _special_step(kind: str, p: dict[str, Any]) -> tuple[str, str] | None:
     """Title and detail for the kinds whose payload is machine data (P11)."""
+    if kind == "auto_ack":
+        return timeline_labels.title_for(kind, p), _auto_ack_detail(p)
+    if kind.endswith("_downgrade") and (down := _downgrade_detail(p)) is not None:
+        return timeline_labels.title_for(kind, p), down
     if kind == "auto_ack_skipped":
         reason = _auto_ack_skip_reason(p)
         return (
@@ -659,6 +1065,7 @@ def _detail_for(kind: str, p: dict[str, Any] | None, result: Any = None) -> str:
     if kind in ("enriched_alert_context", "alert_context"):
         enr = p.get("enrichments") or {}
         prof = p.get("host_alert_profile") or {}
+        n_enr = len(enr) if isinstance(enr, dict) else 0
         if p.get("subject") == "hunt":
             # D2. The step loaded the hunt and the documents its findings
             # cite. The alert profile of the one anchor document says nothing
@@ -667,38 +1074,49 @@ def _detail_for(kind: str, p: dict[str, Any] | None, result: Any = None) -> str:
             return (
                 "soc-ai loaded the hunt's findings and the "
                 f"{len(docs) if isinstance(docs, list) else 0} documents they cite. "
-                f"It enriched {len(enr)} indicator(s)."
+                f"soc-ai enriched {_times(n_enr, 'indicator', 'indicators')}."
             )
         # "Enriched N indicators" reads as N reputation checks. Say when it was not.
         gap = (
             " soc-ai loaded no blocklist feed. It checked no indicator against threat intel."
-            if _blocklist_unchecked(enr)
+            if isinstance(enr, dict) and _blocklist_unchecked(enr)
+            else ""
+        )
+        # One fact per sentence, and a count with its own plural (V1-A5).
+        types = (
+            f" The host shows {_times(len(prof), 'alert type', 'alert types')} in the window."
+            if isinstance(prof, dict) and prof
             else ""
         )
         return (
-            f"soc-ai loaded the alert and enriched {len(enr)} indicator(s). The host shows "
-            f"{len(prof)} distinct alert type(s) in the window.{gap}"
+            f"soc-ai loaded the alert. soc-ai enriched "
+            f"{_times(n_enr, 'indicator', 'indicators')}.{types}{gap}"
         )
     if kind == "decision_template_match":
         if p.get("skipped") == "hunt_subject":
             return "A decision template matches an alert rule class. A hunt has none."
         if p.get("matched"):
+            conf = p.get("confidence")
+            at = f" at {conf:.2f}" if isinstance(conf, int | float) else ""
             return (
-                f"Matched the '{_template_label(p.get('template_id'))}' pattern → "
-                f"{p.get('verdict')} ({p.get('confidence')}). {p.get('rationale', '')}".strip()
-            )
+                f"The run matched the {_template_label(p.get('template_id'))} pattern. "
+                f"The pattern gives {_verdict_words(p.get('verdict'))}{at}. "
+                f"{_template_rationale(p.get('template_id'), p.get('rationale'))}"
+            ).strip()
         return "No pattern matched. soc-ai ran a full tool-using investigation."
     if kind == "investigation_loop_entered":
         # The first pass is skipped on most alerts, so there is often no
         # round-1 verdict. Say nothing rather than "Round 1 was None at None".
+        why = _loop_reason(p.get("reason"), p.get("trigger"))
         if p.get("round1_verdict") is None:
-            return f"{p.get('reason', '')} The first pass did not run.".strip()
+            return f"{why} soc-ai skipped the first pass.".strip()
+        conf = p.get("round1_confidence")
+        at = f" at {conf:.2f}" if isinstance(conf, int | float) else ""
         return (
-            f"{p.get('reason', '')} Round 1 was {p.get('round1_verdict')} at "
-            f"{p.get('round1_confidence')}."
+            f"{why} The first pass reached {_verdict_words(p.get('round1_verdict'))}{at}."
         ).strip()
     if kind == "triage_report":
-        return f"{p.get('verdict')} ({p.get('confidence')})\n{_compact(p.get('summary', ''))}"
+        return _report_detail(p)
     if kind == "template_grounds_adopted":
         cites = p.get("citations") or []
         return f"{p.get('template_id')} grounds recorded as the citations: {', '.join(cites)}"
@@ -715,7 +1133,9 @@ def _detail_for(kind: str, p: dict[str, Any] | None, result: Any = None) -> str:
     if kind == "error":
         return _compact(p.get("message") or p.get("error") or "")
     if kind == "session_start":
-        return f"pipeline: {p.get('pipeline', '?')}"
+        # The pipeline name is an internal label (R2 STE 6). The row says
+        # enough without it.
+        return ""
     if kind == "context_trimmed":
         return _compact(p.get("detail") or "")
     if kind == "prior_outcomes":
@@ -735,11 +1155,24 @@ def _detail_for(kind: str, p: dict[str, Any] | None, result: Any = None) -> str:
         # whole point of telling them the two are related.
         items = p.get("items") or []
         chips = ", ".join(
-            f"{it.get('verdict')} ({it.get('id')})" for it in items if isinstance(it, dict)
+            f"{_verdict_words(it.get('verdict'))} ({it.get('id')})"
+            for it in items
+            if isinstance(it, dict)
         )
+        minutes = p.get("window_minutes")
+        window = (
+            f" in the last {minutes // 60} hours"
+            if isinstance(minutes, int) and minutes >= 120 and minutes % 60 == 0
+            else f" in the last {minutes} minutes"
+            if isinstance(minutes, int) and minutes > 0
+            else ""
+        )
+        return f"An earlier run on another alert of this network session reached {chips}{window}."
+    if kind == "analyst_verdict":
+        who = p.get("analyst") or "An analyst"
         return (
-            f"Same network session, already investigated: {chips}. "
-            f"The window is {p.get('window_minutes')} min."
+            f"{who} set the verdict of this alert to {_verdict_words(p.get('verdict'))} "
+            f"on investigation {p.get('id')}. The run read this verdict as context."
         )
     if kind == "session_verdict_conflict":
         return (
@@ -801,6 +1234,97 @@ class RecommendedActionOut(BaseModel):
     dismissed: bool = False
     dismissedBy: str | None = None
     dismissedAt: str | None = None
+    # Why the card offers no write for this action. The rule is
+    # :func:`soc_ai.api.webui.action_rules.action_block`, the one the row of
+    # the pending-action list, the needs-you count and the execute route read.
+    # Dismiss stays on. None when the console may execute the action.
+    blockedReason: str | None = None
+
+
+# A verdict code as the words of a sentence: "set the verdict to false positive".
+_VERDICT_NAMES = {
+    "true_positive": "true positive",
+    "false_positive": "false positive",
+    "needs_more_info": "needs more info",
+    "inconclusive": "no verdict",
+    "untriaged": "no verdict",
+}
+
+
+def _verdict_name(verdict: str | None) -> str:
+    return _VERDICT_NAMES.get(verdict or "", (verdict or "no verdict").replace("_", " "))
+
+
+def analyst_verdict_block(
+    tag: str,
+    run_verdict: str | None,
+    analyst_verdict: str | None,
+    analyst_by: str | None,
+) -> str | None:
+    """Why the console offers no write for an action, under the analyst verdict rule.
+
+    The one rule for the action card of the run page and for the row of the
+    pending-action list, so the two surfaces cannot drift. A write never acts
+    against an analyst verdict. The analyst verdict stands on the alert over
+    every run of it (dogfood 2026-10-19, R2-D1). The rule fires in two cases:
+
+    * The analyst verdict differs from the verdict of this run. An override
+      of this run makes the actions follow the analyst.
+    * The action is an ack, and the analyst verdict is not false positive.
+      soc-ai does not acknowledge an alert that an analyst set to true positive.
+
+    ``tag`` is the tag of the action: "ack", "escalate" or "comment". None
+    when no analyst verdict stands, or when the action agrees with it.
+    """
+    if not analyst_verdict:
+        return None
+    who = analyst_by or "An analyst"
+    head = f"{who} set the verdict of this alert to {_verdict_name(analyst_verdict)}."
+    if analyst_verdict != run_verdict:
+        return (
+            f"{head} This run reached {_verdict_name(run_verdict)}. "
+            "Override the verdict of this run to act."
+        )
+    if tag == "ack" and analyst_verdict != "false_positive":
+        return f"{head} soc-ai does not acknowledge an alert with that verdict."
+    return None
+
+
+class CaseRefOut(BaseModel):
+    """One Security Onion case, and where its console shows it.
+
+    The wire shape of ``routes_alerts.CaseLinkOut``. ``url`` is None when the
+    settings name no Security Onion host.
+    """
+
+    id: str
+    url: str | None = None
+
+
+class WaitingActionOut(BaseModel):
+    """One recommended action that waits for a person, as a list row carries it.
+
+    The Investigations list filtered to the waiting actions offers Execute and
+    Dismiss on the row (dogfood 2026-10-19, R1-I1). The analyst opened each run
+    to act, and came back: two page changes per run. ``index`` is the position
+    in the report, the key of the action routes. ``executable`` is False when
+    the row must not offer Execute, and ``reason`` then says why. Dismiss
+    writes nothing to Security Onion, and the row offers it for every action.
+    """
+
+    id: str
+    index: int
+    # "ack", "escalate" or "comment": the tag of the action card.
+    type: str
+    label: str
+    # The rule of the alert for an ack or an escalate. The case id for a comment.
+    target: str | None = None
+    # "alert", "case", "finding" or "lead": what the action acts on. A run
+    # that a promotion landed names a finding or a lead (V3-N4).
+    targetType: str | None = None
+    rationale: str = ""
+    executable: bool = True
+    reason: str | None = None
 
 
 class TimelineStepOut(BaseModel):
@@ -1012,6 +1536,16 @@ _FAILURE_HINTS: dict[str, str] = {
 }
 
 
+# A hint an older run stored, as the page states it now (V1-A5). The run
+# keeps its text. Both wordings name Elasticsearch, and the console calls it
+# the grid.
+_ALERT_ID_HINT = "The alert id can be wrong. Check that the alert is in the grid."
+_STORED_HINTS: dict[str, str] = {
+    "alert id may be wrong; verify it exists in ES.": _ALERT_ID_HINT,
+    "The alert id can be wrong. Check that the alert exists in Elasticsearch.": _ALERT_ID_HINT,
+}
+
+
 def _failure_out(status: str | None, events: list[Any]) -> FailureOut | None:
     """The recorded cause of an errored run, from its last ``error`` event."""
     if status != "error":
@@ -1028,6 +1562,8 @@ def _failure_out(status: str | None, events: list[Any]) -> FailureOut | None:
             _PERMANENT_ERROR_PREFIXES
         )
         hint = _FAILURE_HINTS.get(str(p.get("phase") or ""), p.get("hint"))
+        if isinstance(hint, str):
+            hint = _STORED_HINTS.get(hint.strip(), hint)
         return FailureOut(
             cause=_compact(message),
             hint=hint if isinstance(hint, str) and hint.strip() else None,
@@ -1045,6 +1581,19 @@ class SupersededRunOut(BaseModel):
     # The verdict and confidence of a complete run. None while it runs.
     verdict: str | None = None
     conf: float | None = None
+
+
+class StandingAnalystVerdictOut(BaseModel):
+    """The verdict an analyst set on an alert, and the run it is on."""
+
+    investigationId: str
+    verdict: str
+    # The person, when the resolution names one.
+    by: str | None = None
+    # "manual" for an override, "chat" for a chat proposal the analyst applied.
+    via: str
+    # ISO UTC time of the resolution, when it was stored.
+    at: str | None = None
 
 
 class EntityRefOut(BaseModel):
@@ -1100,6 +1649,13 @@ class InvestigationOut(BaseModel):
     alert: dict[str, Any] | None = None
     hostContext: list[dict[str, Any]] = []
     graphNote: str | None = None
+    # The direction of the alert's flow: "lateral" (internal to internal),
+    # "inbound", "outbound" or "external". None when an end is unknown. The page
+    # names lateral movement only on "lateral" (R2-D10).
+    graphScope: str | None = None
+    # The host context counts alerts within this many hours each side of the
+    # alert (``host_risk_window_hours``). The panel states it (R2-D21).
+    hostContextWindowHours: int | None = None
     openQuestions: list[str] = []
     # The report's citations, each with what it names. The page links an `id`
     # citation to its event (P3). Built by `_citations_out`.
@@ -1165,6 +1721,30 @@ class InvestigationOut(BaseModel):
     # this alert reached true positive (0.65)." None when no run replaced
     # this one.
     supersededRun: SupersededRunOut | None = None
+    # The verdict an analyst set on the alert, on ANY run of it, by the rule
+    # the store uses (``analyst_verdicts_for_alerts``). The page read only its
+    # own run, so a newer model run hid the analyst verdict that stands, and
+    # Re-run asked nothing (dogfood 2026-10-19, V1-A3). None when no person
+    # set a verdict on the alert, and on a hunt subject.
+    standingAnalystVerdict: StandingAnalystVerdictOut | None = None
+    # Why no write from this page can reach Security Onion: a promotion landed
+    # the run, or a promotion uses the alert of the run as its anchor. The
+    # rule is :func:`soc_ai.api.webui.action_rules.action_block`. The page
+    # offers no settled bar and no escalate from the chat on such a run
+    # (V3-N2). None when the run has an alert to act on.
+    writeBlockedReason: str | None = None
+    # The Security Onion cases the alert of this run is on, read when an
+    # escalate of the run waits: the escalation ledger first, then the case
+    # links of the grid. The escalate card names and links each case, like
+    # the Alerts escalate confirm (V3-N2). ``alertCasesComplete`` is False
+    # when the grid did not confirm the list.
+    alertCases: list[CaseRefOut] = []
+    alertCasesComplete: bool = False
+    # On a backtest replay only: the live run of the alert, the newest
+    # complete run outside the backtest. A new run started from a replay is a
+    # live run and replaces that verdict (V1-A2). None on a live run, and on a
+    # replay whose alert has no live verdict.
+    alertLiveRun: SupersededRunOut | None = None
     # A run in flight: what it does now, and how long runs on this grid take
     # (dogfood 2026-10-06, first hour W11). The display stayed on "Working"
     # for minutes with no estimate. Both None once the run ends.
@@ -1355,8 +1935,18 @@ def _ack_pending_note(events: list[Any]) -> str | None:
         p = e.payload or {}
         if p.get("reason") == "high_stakes":
             ack_pending_note = (
-                "High/critical-severity and malware/exploit-class alerts "
-                "always require a human acknowledgement."
+                "An analyst acknowledges a high or critical alert. An analyst "
+                "acknowledges a malware or exploit alert."
+            )
+        elif p.get("reason") == "analyst_verdict":
+            ack_pending_note = (
+                f"An analyst set this alert to {_verdict_words(p.get('analyst_verdict'))}. "
+                "soc-ai does not acknowledge it."
+            )
+        elif p.get("reason") == "analyst_verdict_unknown":
+            ack_pending_note = (
+                "soc-ai could not read the analyst verdict of this alert. "
+                "A person must acknowledge it."
             )
         elif p.get("reason") == "below_threshold":
             conf, thr = p.get("confidence"), p.get("threshold")
@@ -1428,6 +2018,19 @@ def _dismissals(events: list[Any]) -> dict[str, dict[str, Any]]:
         else:
             out.pop(key, None)
     return out
+
+
+def action_tool_names(events: Sequence[Any], report: dict[str, Any]) -> list[str]:
+    """The tool name of each action :func:`_build_actions` returns, in its order.
+
+    The action rule reads the tool, and the action card carries only its tag.
+    A run from the old approval gate names its tools on the approval events.
+    """
+    approvals = [e for e in events if e.kind in ("approval_request", "approval_required")]
+    if approvals:
+        return [str((e.payload or {}).get("tool_name") or "") for e in approvals]
+    recs = report.get("recommended_actions") or []
+    return [str(r.get("tool_name") or "") if isinstance(r, dict) else "" for r in recs]
 
 
 def _build_actions(

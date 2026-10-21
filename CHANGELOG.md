@@ -6,6 +6,233 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-10-21
+
+### Dependencies
+
+- `aiohttp` 3.14.5 and `certifi` 2026.10.19. pip-audit found four CVEs in aiohttp 3.14.3 and
+  one advisory in certifi 2026.4.22.
+- GitHub Actions: `docker/build-push-action` 7.4.0, `docker/login-action` 4.6.0,
+  `docker/setup-qemu-action` 4.4.0, `docker/metadata-action` 6.2.0,
+  `docker/setup-buildx-action` 4.4.1 and `astral-sh/setup-uv` 10.3.0. The docker actions move
+  to the Node 24 runtime. The workflows use no input that these versions removed.
+
+### Operator workflow (2026-10-20)
+
+- **Act on a waiting action from the list.** The Investigations list of runs with a waiting
+  action shows each action on its row, with the write named on its button and Dismiss. Both use
+  the routes of the action card. A write on a run that a newer run replaced answers 409. Select
+  rows and press Dismiss actions to dismiss their waiting actions with one confirm. The result
+  line names each row and offers Undo for the press.
+- **One action rule.** The action card, the list row, the needs-you count and the execute route
+  read one rule. A write is off on a replay and on a superseded run. A write is off on a
+  promoted finding or lead, and on a document that a promotion uses as its anchor when the
+  document is not a Security Onion alert. A write is off on a run with no alert, on a comment
+  with no case, and in the demo. A write is also off when it disagrees with the analyst verdict
+  on the alert. Each case states its own reason. The execute route refuses a write against the
+  analyst verdict with 409 `analyst_verdict`. New fields on `GET /api/v1/investigations/{id}`:
+  `blockedReason` on each action, `writeBlockedReason`, `alertCases` and `alertCasesComplete`.
+- **The anchor of a real alert.** The anchor rule refused every Security Onion write on a
+  document that a promotion uses as its anchor. On the range, lead 17 cites a real Suricata
+  alert, and the execute route refused "Escalate to case" on the investigation of that alert.
+  soc-ai now asks the grid whether the alert feed holds the anchor document, with the alert
+  filter of the Alerts page and no time window. A real alert takes the write, the ack and a new
+  run with writes on. Telemetry keeps the refusal, and its reason now reads "A promoted lead
+  uses this document as its anchor. The document is not a Security Onion alert." One search
+  answers a page of rows, and the answers stay in memory for 6 hours. When the grid does not
+  answer, the write is off with the new code `anchor_unread`. The execute route,
+  `POST /api/v1/alerts/ack-events`, `POST /api/v1/hunt` and request-more-info then answer 503.
+  Bulk re-hunt skips the run with the same reason. `POST /api/v1/hunt` over a telemetry anchor
+  of a lead now runs with Security Onion writes off, like `POST /investigate`.
+- **The needs-you count holds actions that can run.** The count, the badges, the bell and the
+  pending filter leave out an action that no person can execute. The run page keeps it with its
+  reason. On the range, 8 of the 9 counted actions were on promoted findings.
+- **The cases of an escalate.** The escalate card and the row confirm name and link each case
+  that the alert is already on. A press then opens no second case and records the action as
+  done. The scope of an escalate adds `cases` and `casesComplete`.
+- **Same flow.** An Alerts group names the other groups on its network flow: an alert of each
+  group with the same community id within 1 hour of the other, or an alert of each group between
+  the same two hosts within 5 minutes of the other. A community id repeats across days for
+  fixed-port traffic such as NTP, so the community id link has a time bound too. The chip warns
+  when the verdicts are opposite. A report shows the same block, and Show in Alerts opens the
+  row of each sibling. The Alerts screen asks for it with
+  `GET /api/v1/alerts?links=true`. The read costs at most two searches and stays one minute for
+  each window. When a size limit cuts the read, the count reads "at least" and the list says
+  that it can be partial. New fields: `siblingsPartial` on each row, and `partial`,
+  `windowFrom` and `windowTo` on the new route `GET /api/v1/alerts/siblings`.
+- **The case of an escalated alert.** The escalate confirm and the escalated marker on a row
+  link the Security Onion case that the alert is on.
+- **Bulk decisions on leads.** The Hunts page selects leads. One press dismisses, reopens or
+  hunts the selection. The confirm states the count and the skips. A bulk hunt starts at most 3
+  hunts. Undo stays for 2 minutes. New routes: `POST /api/v1/hunts/leads/bulk-dismiss`,
+  `bulk-reopen`, `bulk-dismiss-again` and `bulk-hunt`, and `GET /api/v1/leads/bulk-hunt-plan`.
+- **Cancel a backtest.** `POST /api/v1/backtest/{id}/cancel` stops the run after the alert in
+  flight. The run keeps the results it finished and reads "Cancelled after N of M alerts."
+- **Check one stranded escalation.** "Check Security Onion now" on the Status page re-reads one
+  escalation claim and settles it when Security Onion confirms the case. It writes nothing to
+  Security Onion. The result links the case it found. New route:
+  `POST /api/v1/escalations/check`, with the field `case_url`.
+- **Generated password banner.** Every page shows a banner while the account still uses the
+  generated password. The banner opens Change password.
+
+### Dogfood fixes (2026-10-19)
+
+A dogfood on the attack range and on a fresh install with authentication on found 141
+defects. The range sensor was down from 2026-10-15 to 2026-10-19, and many defects came from
+that real outage. Migration 0064 adds the `grid_gaps` table.
+
+**Grid gaps**
+
+- soc-ai records a grid gap when the grid stays unreadable for 3 minutes. It closes the gap
+  when the grid answers again. The ledger survives a restart.
+- The sweep also records a gap when most hosts of a plane go dark in the same hours. One quiet
+  host among busy hosts still gets its departure.
+- The sweep does not score the hours of a gap or the settle margin after it. The new setting
+  `grid_gap_settle_minutes` sets the margin. The default is 60.
+- A profile stores a gap hour as missing. The baseline no longer learns the outage as zero.
+- A hit inside a gap does not count toward the daily hit limit of its analytic.
+- A closed gap stays in the bell for 24 hours. The Dashboard, Alerts, Hunts and the host page
+  show a strip for each gap in the window. The Alerts empty state no longer says "The grid is
+  quiet" over a gap.
+- The general chat and a hunt get one fact line for each gap in their window.
+- New route: `GET /api/v1/grid/gaps`.
+- An operator can record a gap that soc-ai did not see: `soc-ai grid-gaps add --start --end`,
+  or `POST /api/v1/grid/gaps` as an admin. `soc-ai grid-gaps list` prints the ledger.
+- "Review N hits in this gap" lists the hits that a gap wrote. soc-ai selects a hit when its
+  event window lies inside the gap and it is not a spike. The drawer states the reason under each
+  hit it does not select. The operator can change each selection. One confirm marks the selected
+  hits benign with the reason `grid_gap`. The marks have no undo.
+- `POST /api/v1/grid/gaps/{id}/hits/benign` requires `ids`. A body without `ids` answers 422.
+  A selected id that left the gap list answers 409.
+- The hold card of an analytic says how many of the hits that broke its limit fall inside a
+  gap. It offers **Return to live** when the gap hits alone broke the limit. A spike inside a
+  gap does not count toward the offer. The card still
+  finds the hold after the next sweep marks those hits shadow.
+- The lead page leaves benign observations out of its weight.
+
+**Verdicts and writes to Security Onion**
+
+- Auto-acknowledge never acts on an alert that carries an analyst verdict other than false
+  positive. The guard covers a re-run and the cluster fan-out.
+- A re-run reads the analyst verdict. Re-run, Deep re-run and Request more info ask first when
+  an analyst verdict stands on any run of the alert. The confirm names that verdict.
+- The investigation page and the Alerts row name an analyst verdict that stands on another run.
+- A new run from a backtest replay asks first. The confirm says that the new run becomes the
+  live verdict of the alert.
+- Bulk Re-investigate skips an alert that carries an analyst verdict.
+- An override on a superseded run gets 409. The console turns off Re-run and Override on a
+  locked record and says why.
+- An Alerts row opens the newest complete run of its alert.
+- The Acknowledge button and the escalate confirm state what one press writes, with the caps. A
+  second press names what is already done.
+- The rule prevalence window ends at the alert time.
+
+**Hunts, leads and analytics**
+
+- The Analytics tab and the Status page show a failed or blind sweep. They no longer show a
+  green "live" over failed runs.
+- An observation finding is no longer an investigation subject. The outcome counts threat
+  findings over all findings. A card names an investigation that it shares.
+- A lead that soc-ai closed on the verdicts of its hunt says so.
+- Every unread shadow hit counts and lists on every surface.
+
+**Hosts and entities**
+
+- The entity page reads every key of a machine. An address and a name of one machine show the
+  same counts.
+- The host page lists the investigations of the machine. `GET /investigations` takes `entity`.
+- The Users card reads Windows logons.
+- The Connections rate divides by the window hours that hold records. It counts the part of
+  each edge bucket inside the window, and it leaves out the hours of a grid gap. The 7d rate
+  divided by 192 hours on a 168-hour window. `GET /dossiers/{ip}/activity` adds `window_end`.
+- Every relative age reads one rule. The host header, the facts and the entity page read
+  "30h ago" where the lists read "1d ago". An age from 60 days reads in months.
+- The host header reads "last grid event". The entity page reads "last soc-ai record".
+- A stale traffic pattern shows its stored sentence. It read "a traffic pattern".
+- The Role filter says that a guessed role also counts in "weak guess" or "old guess".
+- The bulk note and its Undo show the role label. They showed the role identifier.
+
+**Sign-in, Settings and Status**
+
+- An admin cannot reset their own password in Settings. The new command
+  `soc-ai users reset-password <name>` recovers a locked-out admin. `soc-ai users list` prints
+  the accounts.
+- The sign-in page states the real transport. With authentication off, it says so.
+- Number fields no longer clip their values. A field now has room for its spinner.
+- Data sources shows the grid in its first row, with the state of the health probe and the
+  event index pattern. The blocklist row names the feeds that the config loads.
+- The Notification webhook section links to Settings > Notifications. It said "above".
+- API keys turns off Set and states the reason when CONFIG_SECRET_KEY is not set.
+  `GET /config/api-keys` adds `can_store` and `store_hint` to each row.
+- The blocklist remedy in Diagnostics names the feeds and shows its command as code.
+- Each setting shows DEFAULT, ENV or DB. "Use the default" removes a database override.
+- A model check that meets only transport errors reads "could not measure" and raises no alarm.
+- The Status page shows the dependencies and each scheduled job.
+- "Danger Zone" is now "Connections". It shows the current values and tests an edited value.
+- An API token has a name. Revoke asks first.
+- New doctor rows: `admin password` and `backups`. An empty alerts feed is WARN.
+
+**Dashboard, shell and chat**
+
+- The needs-you count leaves out actions on backtest replays.
+- The Dashboard, Hunts, Investigations and host page keep their window and filters in the URL.
+- A custom window means the same hours on every page.
+- A chat turn that times out after its tools returned writes a partial answer.
+- Chat answers link addresses, leads and investigations.
+- Dialogs stay centred and fit the screen.
+- `/` opens the Dashboard. An unknown page address opens the console not-found page.
+
+**Text**
+
+- The console, the backend operator strings, the docs and the in-app guide follow ASD-STE100.
+- The timeline no longer shows prompt text or internal labels. It names the trigger of a
+  deeper investigation. Stored text that the timeline cannot read stays as it is.
+- Toasts show at the bottom centre of every page.
+
+### Swarm triage experiment (2026-10-08)
+
+The experiment tests whether a team of agents triages an alert better than the one
+investigator, at a cost the owner accepts. The design record is
+`docs/dev/specs/2026-10-08-swarm-triage-experiment-design.md`. Production keeps the default.
+
+- **One setting selects the investigator strategy.** `investigator_strategy` takes `single`,
+  `spend`, `ensemble`, `advocates` or `planes`. The default is `single`, and the loop runs as
+  before. The environment variable is `INVESTIGATOR_STRATEGY`. The override store accepts the
+  setting live. The Settings page does not show it, because it is an experiment setting.
+- **The loop fills one result object.** The investigation loop hands the pipeline one
+  `LoopResult`. Each strategy fills the same object. The steps before and after the loop do not
+  change, and the gates do not change.
+- **Two advocates and a judge.** The `advocates` strategy runs a threat advocate and a benign
+  advocate in parallel. Each advocate is the investigator of the loop, with a mandate and its own
+  limits. Each advocate writes a brief: a claim, the records that support it, the strongest
+  counterpoint, a confidence word and the gaps. A judge with no tools writes the report from the
+  alert context and the two briefs.
+- **One worker for each plane.** The `planes` strategy runs one worker for each evidence plane of
+  the alert. A worker can use the tools of its plane only. A lead with no tools writes the report
+  from the briefs.
+- **The judge cites only the briefs.** The pipeline removes from the report each document id that
+  no brief carries. The report counts the removed ids. The gates then check each citation that
+  is left.
+- **Hard budgets.** Each agent has its own limits. The agents of one strategy share
+  `agent_tool_calls_limit`. An agent that reaches its limit writes its brief from the evidence it
+  has. An agent that fails returns an empty brief with the error, and the judge reads it.
+- **Every agent is counted.** Each agent emits the tool, model and usage events of the loop. Two
+  new events, `swarm_agent_started` and `swarm_agent_finished`, record the role, the calls and the
+  tokens of each agent. The audit trail accepts them, and the timeline gives them a title. The
+  report names the strategy when it is not `single`.
+- **The vote counts each sample.** The self-consistency vote emitted no usage event for its extra
+  samples, so a run with three samples read at the cost of one. Each sample now emits a usage
+  event.
+- **A run cut at the budget votes.** When the vote re-runs the loop, a run that reaches its tool
+  budget votes with the partial verdict that one more call with no tools writes. The first run
+  votes the same way. Only a run that raises or ends with no verdict is dropped. Before, the vote
+  dropped each run cut at the budget, so an ensemble at 8 tool calls often ran as a single run.
+  The `self_consistency_vote` event states `requested`, `voted`, `partial` and `dropped`.
+- **A backtest replays a fixed list.** `POST /api/v1/backtest` takes `alert_ids`, a list of 1 to
+  200 alert ids. The run replays those alerts in that order and reads the analyst label of each
+  from the grid. Each backtest status lists the ids it replays, so the next strategy can replay
+  the same alerts.
+
 ## [1.5.3] - 2026-10-15
 
 1.5.3 is the detection ladder release. It holds the work from 2026-10-01 to 2026-10-14. The
@@ -5666,7 +5893,8 @@ The first public release. Highlights:
     positives is **capped** to low-stakes alerts (a prompt-injected verdict can
     no longer auto-acknowledge a malware/exploit/high-severity alert).
 
-[Unreleased]: https://github.com/nuk3s/soc-ai/compare/v1.5.3...HEAD
+[Unreleased]: https://github.com/nuk3s/soc-ai/compare/v1.6.0...HEAD
+[1.6.0]: https://github.com/nuk3s/soc-ai/compare/v1.5.3...v1.6.0
 [1.5.3]: https://github.com/nuk3s/soc-ai/compare/v1.5.2...v1.5.3
 [1.5.2]: https://github.com/nuk3s/soc-ai/compare/v1.5.1...v1.5.2
 [1.5.1]: https://github.com/nuk3s/soc-ai/compare/v1.5.0...v1.5.1

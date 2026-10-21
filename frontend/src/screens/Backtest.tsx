@@ -1,8 +1,18 @@
-import { AlertTriangle, CheckCircle2, History, Loader2, Play, ShieldCheck } from 'lucide-react';
-import { useRef, useState } from 'react';
+import { AlertTriangle, CheckCircle2, History, Loader2, Play, ShieldCheck, Square } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { Panel } from '../components/Panel';
 import { ErrorState } from '../components/States';
-import { getBacktest, startBacktest } from '../lib/api';
+import {
+  type Health,
+  type HealthComponent,
+  cancelBacktest,
+  getBacktest,
+  getBacktestById,
+  getBacktestRuns,
+  getHealth,
+  startBacktest,
+} from '../lib/api';
 import { verdictLabel, verdictMeta } from '../lib/labels';
 import { absoluteTime, ago } from '../lib/timeRange';
 import { useAsync } from '../lib/useAsync';
@@ -10,6 +20,7 @@ import type {
   Backtest as BacktestData,
   BacktestConfusion,
   BacktestRow,
+  BacktestRunSummary,
   HumanDisposition,
   SocVerdict,
 } from '../lib/types';
@@ -68,6 +79,61 @@ function pct(x: number): string {
   return `${Math.round(x * 100)}%`;
 }
 
+/** The share of acknowledged alerts soc-ai called a false positive. An older
+ *  server sends it under its old name only. */
+function fpAgreement(m: { fp_agreement_rate?: number; fp_reduction: number }): number {
+  return m.fp_agreement_rate ?? m.fp_reduction;
+}
+
+// The probe's own state. The type in lib/api.ts predates the field.
+type ProbedComponent = HealthComponent & { state?: string };
+
+/** True when the probe says the dependency cannot serve a backtest. A slow
+ *  answer still serves one. A probe that ran out of its budget is treated as
+ *  down, as the probe itself says. An older server sends no state. */
+function isDown(c: ProbedComponent | null | undefined): boolean {
+  if (!c) return false;
+  if (c.state) return c.state === 'down' || c.kind === 'timeout';
+  return !c.ok;
+}
+
+/** Why a backtest cannot run now, or null. Each replay reads the grid and
+ *  asks the model, so a run against a dead dependency only records failures
+ *  (dogfood 2026-10-19, H1-D13). An unknown state does not block. */
+function backtestBlockedReason(h: Health | null): string | null {
+  if (!h) return null;
+  const grid = isDown(h.es as ProbedComponent);
+  const model = isDown(h.llm as ProbedComponent);
+  if (!grid && !model) return null;
+  const which =
+    grid && model
+      ? 'The grid and the model gateway are down.'
+      : grid
+        ? 'The grid is down.'
+        : 'The model gateway is down.';
+  return `${which} A backtest needs the grid and the model gateway.`;
+}
+
+/** The cost of the next run, in the words of the confirm (R5-I9). The server
+ *  caps the sample, and a window can hold fewer alerts, so the count is a
+ *  ceiling. The time is the count times the median replay time. A running
+ *  backtest has a Cancel control, so the confirm no longer warns of none. */
+function backtestCostText(
+  sampleSize: number,
+  maxSample: number | null | undefined,
+  secondsPerAlert: number | null | undefined,
+): string {
+  const n = maxSample ? Math.min(sampleSize, maxSample) : sampleSize;
+  const parts = [
+    `This backtest runs up to ${n} investigation${n === 1 ? '' : 's'} by the model.`,
+  ];
+  if (secondsPerAlert && secondsPerAlert > 0) {
+    const minutes = Math.max(1, Math.round((n * secondsPerAlert) / 60));
+    parts.push(`It takes about ${minutes} minute${minutes === 1 ? '' : 's'}.`);
+  }
+  return parts.join(' ');
+}
+
 // ---------------------------------------------------------------------------
 
 export function Backtest() {
@@ -90,6 +156,67 @@ export function Backtest() {
   const running = !!data?.active;
   activeRef.current = running;
 
+  // The grid and the model gateway, as the header pill reads them. A run
+  // against a dead dependency records one failure per alert, so the page
+  // refuses to start one (H1-D13).
+  const health = useAsync<Health>(getHealth, [], { refetchInterval: 30_000 });
+  const blocked = backtestBlockedReason(health.data);
+  // The cost confirm is open (R5-I9).
+  const [confirming, setConfirming] = useState(false);
+  // The focus opens on Cancel: Enter on "Start backtest" started a run of
+  // about 42 minutes (verify 2026-10-20, V3-N6). Cancel and Escape return
+  // the focus to "Run backtest". The page body held it.
+  const runButton = useRef<HTMLButtonElement>(null);
+  const confirmCancel = useRef<HTMLButtonElement>(null);
+  const focusRun = useRef(false);
+  const closeConfirm = () => {
+    focusRun.current = true;
+    setConfirming(false);
+  };
+  useEffect(() => {
+    if (confirming) {
+      confirmCancel.current?.focus();
+    } else if (focusRun.current) {
+      focusRun.current = false;
+      runButton.current?.focus();
+    }
+  }, [confirming]);
+  // The stored runs. Read again when a run starts or ends (R5-I10).
+  const runs = useAsync(() => getBacktestRuns(), [reloadKey, running]);
+  // An older run the operator opened from the list. Null shows the latest.
+  const [viewId, setViewId] = useState<string | null>(null);
+  const viewed = useAsync<BacktestData | null>(
+    () => (viewId ? getBacktestById(viewId) : Promise.resolve(null)),
+    [viewId],
+  );
+  const viewing = viewId !== null && viewId !== data?.backtest_id;
+  // The cancel of the running backtest (R5-I9). The server holds the request,
+  // so `data.cancel_requested` is what says a stop is pending.
+  const [cancelOpen, setCancelOpen] = useState(false);
+  const [cancelSending, setCancelSending] = useState(false);
+  const [cancelError, setCancelError] = useState<string | null>(null);
+  useEffect(() => {
+    // A new run replaces whatever older run was open.
+    if (running) setViewId(null);
+    // A cancel confirm or refusal belongs to the run it was about.
+    setCancelOpen(false);
+    setCancelError(null);
+  }, [running]);
+  const finishedSoFar = (data?.replayed ?? 0) + (data?.failed ?? 0);
+  const sendCancel = () => {
+    const id = data?.backtest_id;
+    if (!id || cancelSending) return;
+    setCancelOpen(false);
+    setCancelSending(true);
+    setCancelError(null);
+    cancelBacktest(id)
+      .then(() => setReloadKey((k) => k + 1))
+      .catch((e: unknown) =>
+        setCancelError(e instanceof Error ? e.message : 'The request to cancel the backtest failed.'),
+      )
+      .finally(() => setCancelSending(false));
+  };
+
   // A run is `active` from the moment the sampling query goes out — before a
   // backtest row exists and before there is anything to replay. Rendering that
   // as "Replaying 0 dispositioned alerts… / 0 / 0 replayed" states a finished
@@ -108,10 +235,16 @@ export function Backtest() {
   // backtest. A run that failed in its sampling read has no results of its own,
   // so without this its note landed under a completed run's score and was never
   // drawn: the failure was invisible behind last week's number.
-  const storedRun = !!data && ((!!data.results && data.status === 'complete') || data.status === 'error');
+  const storedRun =
+    !!data &&
+    ((!!data.results && data.status === 'complete') ||
+      data.status === 'error' ||
+      data.status === 'cancelled');
 
   const launch = () => {
-    if (starting || running) return;
+    if (starting || running || blocked) return;
+    setConfirming(false);
+    setViewId(null);
     setStarting(true);
     setStartError(null);
     startBacktest({ windowDays, sampleSize, minSeverity: minSeverity || undefined })
@@ -138,11 +271,11 @@ export function Backtest() {
           <div className="text-[20px] font-semibold tracking-[-.015em]">Backtest</div>
         </div>
         <div className="mt-0.5 max-w-[720px] text-[13px] text-dim">
-          Prove soc-ai on your own alerts. soc-ai replays its triage over a sample of alerts your
-          analysts already closed in Security Onion. soc-ai then reports how its verdicts
-          compare to your analysts' verdicts. An escalated alert is a true positive. An
-          acknowledged alert is a false positive. soc-ai reads Security Onion and writes nothing
-          back.
+          Measure soc-ai on your own alerts. soc-ai replays its triage over a sample of alerts that
+          your analysts already closed in Security Onion. soc-ai then compares its verdicts with
+          the verdicts of your analysts. An escalated alert counts as a true positive. An
+          acknowledged alert counts as a false positive. soc-ai reads Security Onion and writes
+          nothing back.
         </div>
       </div>
 
@@ -193,8 +326,10 @@ export function Backtest() {
             </select>
           </Field>
           <button
-            onClick={launch}
-            disabled={starting || running}
+            ref={runButton}
+            onClick={() => setConfirming(true)}
+            disabled={starting || running || !!blocked || confirming}
+            title={blocked ?? undefined}
             className="flex items-center gap-1.5 rounded-control bg-accent px-[15px] py-2 text-[13px] font-semibold text-white hover:bg-accent-deep disabled:cursor-not-allowed disabled:opacity-50"
           >
             {starting || running ? (
@@ -205,9 +340,51 @@ export function Backtest() {
             {running ? 'Running' : starting ? 'Starting' : 'Run backtest'}
           </button>
         </div>
+        {blocked && !running && (
+          <div role="status" className="mt-2.5 text-[12px] text-warn">
+            {blocked}
+          </div>
+        )}
+        {confirming && !running && (
+          <div
+            data-testid="backtest-confirm"
+            role="group"
+            aria-label="Confirm the backtest"
+            onKeyDown={(e) => {
+              if (e.key === 'Escape') {
+                e.stopPropagation();
+                closeConfirm();
+              }
+            }}
+            className="mt-3 flex flex-wrap items-center gap-2.5 rounded-control border border-border-strong bg-surface-2 px-3 py-2.5"
+          >
+            <span className="min-w-[240px] flex-1 text-[12.5px] text-text-2">
+              {backtestCostText(sampleSize, data?.max_sample, data?.estimate?.seconds_per_alert)}
+            </span>
+            <button
+              onClick={launch}
+              disabled={starting || !!blocked}
+              className="rounded-control bg-accent px-[13px] py-1.5 text-[12px] font-semibold text-white hover:bg-accent-deep disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              Start backtest
+            </button>
+            <button
+              ref={confirmCancel}
+              onClick={closeConfirm}
+              className="rounded-control border border-border-strong px-[13px] py-1.5 text-[12px] font-semibold text-dim hover:text-text"
+            >
+              Cancel
+            </button>
+          </div>
+        )}
         <div className="mt-2.5 text-[11.5px] text-faint">
-          Each sampled alert is a full LLM investigation. The server caps the sample size. soc-ai
-          samples only the alerts your analysts closed.
+          {[
+            'Each sampled alert is one investigation by the model.',
+            data?.max_sample
+              ? `The server caps the sample at ${data.max_sample} alerts.`
+              : 'The server caps the sample size.',
+            'soc-ai samples only the alerts that your analysts closed.',
+          ].join(' ')}
         </div>
         {startError && <div className="mt-2 text-[12px] text-danger">{startError}</div>}
       </Panel>
@@ -244,6 +421,19 @@ export function Backtest() {
                   <span className="text-warn"> · {data.failed} failed</span>
                 )}
               </div>
+              <CancelControl
+                pending={!!data.cancel_requested}
+                open={cancelOpen}
+                sending={cancelSending}
+                finished={finishedSoFar}
+                error={cancelError}
+                onOpen={() => {
+                  setCancelError(null);
+                  setCancelOpen(true);
+                }}
+                onConfirm={sendCancel}
+                onKeep={() => setCancelOpen(false)}
+              />
             </>
           )}
         </Panel>
@@ -277,13 +467,54 @@ export function Backtest() {
         </div>
       )}
 
+      {/* the stored runs, when there is more than the one on screen */}
+      {runs.data && runs.data.runs.length > 1 && (
+        <PastRuns
+          runs={runs.data.runs}
+          shownId={viewing ? viewId : (data?.backtest_id ?? null)}
+          onOpen={(id) => setViewId(id === data?.backtest_id ? null : id)}
+        />
+      )}
+
       {/* results / errors / empty */}
-      {error && !data ? (
+      {viewing ? (
+        <div data-testid="backtest-viewed">
+          <div className="mb-3 flex flex-wrap items-center gap-2.5 rounded-card border border-border bg-surface-2 px-4 py-2.5 text-[12px] text-text-2">
+            <span className="flex-1">
+              This is an earlier run.{' '}
+              {viewed.data?.finished_at
+                ? `It finished at ${absoluteTime(viewed.data.finished_at)}.`
+                : ''}
+            </span>
+            <button
+              onClick={() => setViewId(null)}
+              className="rounded-control border border-border-strong px-[11px] py-1 text-[11.5px] font-semibold text-dim hover:text-text"
+            >
+              Show the latest run
+            </button>
+          </div>
+          {viewed.error ? (
+            <ErrorState error={viewed.error} onRetry={viewed.refetch} />
+          ) : viewed.data?.results && viewed.data.status === 'complete' ? (
+            <Results data={viewed.data} />
+          ) : viewed.data?.status === 'error' ? (
+            <InterruptedRun data={viewed.data} />
+          ) : viewed.data?.status === 'cancelled' ? (
+            <CancelledRun data={viewed.data} />
+          ) : viewed.data ? (
+            <Panel className="p-6 text-center text-[13px] text-faint">
+              This run has no result yet.
+            </Panel>
+          ) : null}
+        </div>
+      ) : error && !data ? (
         <ErrorState error={error} onRetry={() => setReloadKey((k) => k + 1)} />
       ) : data?.results && data.status === 'complete' ? (
         <Results data={data} />
       ) : data?.status === 'error' ? (
         <InterruptedRun data={data} />
+      ) : data?.status === 'cancelled' && !running ? (
+        <CancelledRun data={data} />
       ) : !running && !loading ? (
         <div data-testid="backtest-empty">
           <Panel className="p-8 text-center text-[13px] text-faint">
@@ -291,7 +522,7 @@ export function Backtest() {
               ? 'soc-ai has no earlier backtest result.'
               : data?.note
               ? data.note
-              : 'No backtest yet. Select a window above and run a backtest. The report compares soc-ai’s verdicts to the real dispositions your analysts made.'}
+              : 'No backtest yet. Select a window above and run a backtest. The report compares the verdicts of soc-ai with the dispositions of your analysts.'}
           </Panel>
         </div>
       ) : null}
@@ -318,6 +549,170 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
  * disagreement — "soc-ai disagrees with human analysts 90% of the time" when the
  * truth was the sensor was blind for 18 of 20 replays. Those runs now land as
  * `error` and stop here: the coverage is stated, the score is not. */
+/** The stored runs, newest first (R5-I10). Each row opens its report. */
+function PastRuns({
+  runs,
+  shownId,
+  onOpen,
+}: {
+  runs: BacktestRunSummary[];
+  shownId: string | null;
+  onOpen: (id: string) => void;
+}) {
+  return (
+    <Panel className="mb-5">
+      <div className="border-b border-border px-4 py-3 text-[13px] font-semibold">Past runs</div>
+      <ul data-testid="backtest-runs" className="max-h-[260px] overflow-y-auto">
+        {runs.map((r) => {
+          const shown = r.backtest_id === shownId;
+          const when = r.finished_at ?? r.started_at;
+          return (
+            <li
+              key={r.backtest_id}
+              className={`flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-border px-4 py-2 text-[12px] last:border-0 ${shown ? 'bg-surface-2' : ''}`}
+            >
+              <span className="min-w-[150px] text-text-2">{when ? absoluteTime(when) : 'No date'}</span>
+              <span className="text-dim">
+                {r.listed ? 'Listed alerts' : r.window_days ? `${r.window_days}-day window` : ''}
+              </span>
+              <span className="text-dim">
+                {r.sampled ?? 0} alert{r.sampled === 1 ? '' : 's'}
+              </span>
+              <span className="flex-1 font-semibold text-text-2">{runScore(r)}</span>
+              <button
+                onClick={() => onOpen(r.backtest_id)}
+                disabled={shown}
+                className="rounded-control border border-border-strong px-[11px] py-1 text-[11.5px] font-semibold text-dim hover:text-text disabled:cursor-default disabled:opacity-60"
+              >
+                {shown ? 'Shown' : 'Open'}
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+    </Panel>
+  );
+}
+
+/** The headline of one stored run. A run that did not complete has no score,
+ *  and a run with no escalated alert has no agreement to measure. */
+function runScore(r: BacktestRunSummary): string {
+  if (r.status === 'running') return 'Running';
+  if (r.status === 'cancelled') return 'Cancelled';
+  if (r.status !== 'complete' || r.agreement_rate === null) return 'No score';
+  if (r.human_tp === 0) return 'Agreement not measurable';
+  return `${pct(r.agreement_rate)} agreement`;
+}
+
+/** The Cancel control of a running backtest (R5-I9). The stop is
+ *  cooperative: the alert in flight finishes, and no new alert starts. */
+function CancelControl({
+  pending,
+  open,
+  sending,
+  finished,
+  error,
+  onOpen,
+  onConfirm,
+  onKeep,
+}: {
+  pending: boolean;
+  open: boolean;
+  sending: boolean;
+  finished: number;
+  error: string | null;
+  onOpen: () => void;
+  onConfirm: () => void;
+  onKeep: () => void;
+}) {
+  if (pending) {
+    return (
+      <div role="status" className="mt-2.5 flex items-center gap-1.5 text-[12px] text-warn">
+        <Loader2 size={13} className="animate-spin" />
+        soc-ai stops the backtest after the current alert.
+      </div>
+    );
+  }
+  return (
+    <div className="mt-2.5">
+      {open ? (
+        <div
+          data-testid="backtest-cancel-confirm"
+          role="group"
+          aria-label="Confirm the cancel"
+          onKeyDown={(e) => {
+            if (e.key === 'Escape') {
+              e.stopPropagation();
+              onKeep();
+            }
+          }}
+          className="flex flex-wrap items-center gap-2.5 rounded-control border border-border-strong bg-surface-2 px-3 py-2.5"
+        >
+          <span className="min-w-[240px] flex-1 text-[12.5px] text-text-2">
+            Stop the backtest after the current alert. soc-ai keeps the {finished} result
+            {finished === 1 ? '' : 's'} so far.
+          </span>
+          <button
+            autoFocus
+            onClick={onConfirm}
+            disabled={sending}
+            className="rounded-control border border-warn px-[13px] py-1.5 text-[12px] font-semibold text-warn hover:bg-[rgba(245,166,35,.1)] disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            Stop the backtest
+          </button>
+          <button
+            onClick={onKeep}
+            className="rounded-control border border-border-strong px-[13px] py-1.5 text-[12px] font-semibold text-dim hover:text-text"
+          >
+            Keep running
+          </button>
+        </div>
+      ) : (
+        <button
+          onClick={onOpen}
+          disabled={sending}
+          className="flex items-center gap-1.5 rounded-control border border-border-strong px-[11px] py-1 text-[11.5px] font-semibold text-dim hover:text-text disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          <Square size={11} />
+          Cancel backtest
+        </button>
+      )}
+      {error && (
+        <div role="alert" className="mt-1.5 text-[12px] text-danger">
+          {error}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** A run an operator cancelled (R5-I9). It keeps the results of the alerts
+ *  it finished, and states where it stopped before the score. */
+function CancelledRun({ data }: { data: BacktestData }) {
+  const r = data.results;
+  const after = r?.cancel?.after ?? data.sampled ?? 0;
+  const of = r?.cancel?.of ?? data.total;
+  const decided = r?.completion?.decided ?? r?.metrics.counts.decided ?? r?.rows.length ?? 0;
+  const scored = !!r && r.rows.length > 0 && decided > 0 && !r.completion?.degraded;
+  return (
+    <div data-testid="backtest-cancelled">
+      <div className="mb-3 flex items-center gap-1.5 rounded-card border border-border bg-surface-2 px-4 py-2.5 text-[12px] font-semibold text-warn">
+        <Square size={12} />
+        Cancelled after {after} of {of} alerts.
+      </div>
+      {scored ? (
+        <Results data={data} />
+      ) : (
+        <Panel className="p-6 text-center text-[13px] text-faint">
+          {after === 0
+            ? 'There is no score to report. No alert finished before the cancel.'
+            : `There is no score to report. Only ${decided} of ${after} finished replays produced a verdict.`}
+        </Panel>
+      )}
+    </div>
+  );
+}
+
 function InterruptedRun({ data }: { data: BacktestData }) {
   const c = data.results?.completion;
   return (
@@ -394,14 +789,18 @@ function Results({ data }: { data: BacktestData }) {
           <MetricCard
             label="Agreement with analysts"
             value={pct(m.agreement_rate)}
-            sub={`${m.counts.agreements} of ${m.counts.decided ?? m.counts.total} replayed verdicts matched the human call`}
+            sub={`${m.counts.agreements} of ${m.counts.decided ?? m.counts.total} replayed verdicts matched the analyst verdict`}
             color="#4b8bf5"
           />
         )}
+        {/* An agreement figure. Auto-acknowledge also needs the confidence
+            threshold, a retrieval, a resolved citation and a low-stakes
+            alert, and a replay records none of those, so this is not what
+            auto-acknowledge would clear (R5-D13). */}
         <MetricCard
-          label="False-positive toil cleared"
-          value={pct(m.fp_reduction)}
-          sub={`soc-ai would auto-clear ${m.counts.fp_cleared} of ${m.counts.human_fp_decided ?? m.counts.human_fp} acknowledged alerts`}
+          label="False-positive agreement"
+          value={pct(fpAgreement(m))}
+          sub={`soc-ai called ${m.counts.fp_cleared} of ${m.counts.human_fp_decided ?? m.counts.human_fp} acknowledged alerts a false positive.`}
           color="#3fb950"
         />
         <MissedTpCard missed={missed} humanTp={m.counts.human_tp} rows={r.missed_tp_rows} />
@@ -522,9 +921,9 @@ function MissedTpCard({
       <div className="mt-1 text-[11.5px]" style={{ color: safe ? '#7ea88a' : '#e88' }}>
         {safe
           ? humanTp === 1
-            ? 'soc-ai did not call the one escalated incident a false positive.'
-            : `soc-ai called none of the ${humanTp} escalated incidents a false positive.`
-          : `soc-ai called ${missed} real incident${missed === 1 ? '' : 's'} a false positive. This is the critical safety miss.`}
+            ? 'soc-ai did not call the one escalated alert a false positive.'
+            : `soc-ai called none of the ${humanTp} escalated alerts a false positive.`
+          : `soc-ai called ${missed} escalated alert${missed === 1 ? '' : 's'} a false positive. A missed true positive is the most serious error.`}
       </div>
       {!safe && rows.length > 0 && (
         <ul className="mt-2 space-y-0.5 text-[11.5px]" style={{ color: '#e88' }}>
@@ -605,7 +1004,17 @@ function RowsTable({ rows }: { rows: BacktestRow[] }) {
             return (
               <tr key={row.alert_id} className="border-b border-border last:border-0">
                 <td className="max-w-[280px] break-words px-4 py-2 text-text" title={row.rule_name}>
-                  {row.rule_name || row.alert_id}
+                  {/* The replay behind the verdict (R5-I10). */}
+                  {row.investigation_id ? (
+                    <Link
+                      to={`/investigation/${encodeURIComponent(row.investigation_id)}`}
+                      className="text-text underline decoration-border-strong underline-offset-2 hover:text-accent hover:decoration-accent"
+                    >
+                      {row.rule_name || row.alert_id}
+                    </Link>
+                  ) : (
+                    row.rule_name || row.alert_id
+                  )}
                 </td>
                 <td className="px-4 py-2" style={{ color: VERDICT_COLOR[row.human_disposition] }}>
                   {DISPOSITION_LABEL[row.human_disposition]}

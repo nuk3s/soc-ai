@@ -46,9 +46,7 @@ DETECTOR_DATASETS = frozenset({"suricata.alert", "sigma.alert", "zeek.notice"})
 # The hint of a promotion whose citations resolve to nothing on the grid.
 NO_EVIDENCE_HINT = "None of the citations resolve to an event on the grid."
 # The hint of a promotion the investigation manager did not start.
-COULD_NOT_START_HINT = (
-    "The console did not start the run. Check the model gateway on the Config screen."
-)
+COULD_NOT_START_HINT = "The console did not start the run. Check the model gateway in Settings."
 
 
 class PromotionRefused(Exception):

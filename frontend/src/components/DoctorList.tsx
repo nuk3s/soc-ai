@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 import { ApiError, getPreflightDetail, refreshPreflight } from '../lib/api';
 import type { PreflightDetail, PreflightRow } from '../lib/types';
 import { absTime, ago } from '../lib/timeRange';
+import { HelpText } from './HelpText';
 import { LoadingInline } from './States';
 
 // ---------------------------------------------------------------------------
@@ -67,18 +68,35 @@ function readFailure(e: unknown): string {
   return 'The doctor read failed. The result is unknown. Select Refresh to try again.';
 }
 
-/** The WARN rows of a doctor read. The Diagnostics header counts these. */
+/** The WARN rows of a doctor read. */
 export function warnRows(rows: PreflightRow[]): PreflightRow[] {
   return rows.filter((r) => r.status.toUpperCase() === 'WARN');
 }
 
+/** A grade the Diagnostics header can filter on. null = every row. */
+export type DoctorFilter = 'FAIL' | 'WARN' | 'INFO' | null;
+
+/** How many rows each grade has. The Diagnostics header shows a chip for
+ *  FAIL, WARN and INFO, FAIL first. Its one chip counted WARN only, and read
+ *  "4 warnings" while 6 checks failed (dogfood 2026-10-19, H1-D9). */
+export function statusCounts(rows: PreflightRow[]): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const r of rows) {
+    const key = r.status.toUpperCase();
+    out[key] = (out[key] ?? 0) + 1;
+  }
+  return out;
+}
+
 export function DoctorList({
   warnOnly = false,
+  filter = null,
   onRows,
 }: {
-  /** Show the WARN rows only. The "2 warnings" chip in the Diagnostics header
-   *  sets it, because 2 WARN rows sat among 31 (dogfood 2026-10-06). */
+  /** Show the WARN rows only. Kept for older callers; `filter` replaces it. */
   warnOnly?: boolean;
+  /** Show the rows of one grade only. */
+  filter?: DoctorFilter;
   /** Called with the rows of each read, so the header can count them. */
   onRows?: (rows: PreflightRow[]) => void;
 } = {}) {
@@ -122,7 +140,8 @@ export function DoctorList({
     // onRows is a setter from the caller. A new closure must not read again.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [detail]);
-  const shown = warnOnly ? warnRows(rows) : rows;
+  const only: DoctorFilter = filter ?? (warnOnly ? 'WARN' : null);
+  const shown = only ? rows.filter((r) => r.status.toUpperCase() === only) : rows;
   return (
     <div data-testid="doctor-list" className="border-t border-border-faint">
       <div className="flex flex-wrap items-center gap-2 px-4 py-2.5">
@@ -155,8 +174,8 @@ export function DoctorList({
       {detail && rows.length === 0 && (
         <div className="px-4 pb-3 text-[12px] text-dim">The doctor returned no row.</div>
       )}
-      {warnOnly && detail && shown.length === 0 && (
-        <div className="px-4 pb-3 text-[12px] text-dim">No row is WARN.</div>
+      {only && detail && shown.length === 0 && (
+        <div className="px-4 pb-3 text-[12px] text-dim">No row is {only}.</div>
       )}
       {shown.length > 0 && (
         <ul className="divide-y divide-border-faint border-t border-border-faint">
@@ -180,8 +199,10 @@ export function DoctorList({
                   <span className="font-semibold text-text-2">{r.name}</span>
                   <span className="text-dim">: {r.detail}</span>
                   {r.hint && (
+                    // A remedy names a command in backticks. HelpText renders
+                    // it as code (dogfood round 2, V2-3).
                     <div data-testid="doctor-fix" className="mt-0.5 text-faint">
-                      {r.hint}
+                      <HelpText text={r.hint} />
                     </div>
                   )}
                 </div>

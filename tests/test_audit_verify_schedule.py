@@ -504,6 +504,17 @@ async def test_an_unreadable_index_is_not_reported_as_tamper(
     assert audit.records == []
     assert fired == []
     assert _get_audit_verify_status(app.state).alarm is None
+    # The run is on record as a check that could not read the index. The
+    # Status page read it as a clean check (dogfood 2026-10-19, FIX-D1-ST).
+    assert _get_audit_verify_status(app.state).last_outcome == "not_checked"
+
+
+@pytest.mark.asyncio
+async def test_each_run_records_its_outcome(monkeypatch: pytest.MonkeyPatch) -> None:
+    app = _app(_RecordingAudit())
+    _patch_verify(monkeypatch, [_result()])
+    await _run_iterations(monkeypatch, app, _settings())
+    assert _get_audit_verify_status(app.state).last_outcome == "intact"
 
 
 @pytest.mark.asyncio

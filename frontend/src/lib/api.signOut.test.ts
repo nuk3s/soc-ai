@@ -48,6 +48,7 @@ describe('signOut', () => {
   it('still lands on /login when the backend never answers', async () => {
     const navigate = vi.fn();
     expect(await within(signOut(navigate))).not.toBe('hung');
-    expect(navigate).toHaveBeenCalledWith('/login');
+    // The login page says why it shows (dogfood 2026-10-19, H1-D18).
+    expect(navigate).toHaveBeenCalledWith('/login?reason=signed-out');
   });
 });

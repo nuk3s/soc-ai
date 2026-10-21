@@ -1,7 +1,7 @@
 import { AlertTriangle, Check, Loader2, MessageSquare, RotateCcw, Triangle, X, type LucideIcon } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { getActionScope, type ActionScope } from '../lib/api';
-import type { ActionTag, RecommendedAction } from '../lib/types';
+import type { ActionTag, CaseLink, RecommendedAction } from '../lib/types';
 
 // ---------------------------------------------------------------------------
 // One recommended action, from the recommendation to the record.
@@ -50,12 +50,81 @@ const DEFAULT_SCOPE: Record<ActionTag, string> = {
   comment: 'Add a comment to the Security Onion case this investigation opened.',
 };
 
-/** "03:12": the local clock time of an ISO instant, or null when it does not parse. */
+/** The dismiss confirm. The row of the pending-action list asks the same. */
+export const DISMISS_CONFIRM_TEXT =
+  'Dismiss this recommended action. soc-ai records your name and the time. You can undo it.';
+/** What an escalate does when the alert is already on a case. The execute
+ *  route opens no second case and records the action as done. */
+export const NO_SECOND_CASE =
+  'soc-ai opens no second case. The press records this action as done.';
+
+/** "The alert is already on cases A, B." A list the grid did not confirm
+ *  names its cases as a finding, like the Alerts escalate confirm. */
+export function casesHead(count: number, complete: boolean): string {
+  const noun = count === 1 ? 'case' : 'cases';
+  return complete ? `The alert is already on ${noun}` : `soc-ai found the alert on ${noun}`;
+}
+
+/** The case sentence as plain text, for a confirm. */
+export function casesSentence(cases: readonly CaseLink[], complete: boolean): string {
+  return `${casesHead(cases.length, complete)} ${cases.map((c) => c.id).join(', ')}.`;
+}
+
+/** The case sentence with each case a link to its page in the Security Onion
+ *  console. A case with no page reads as its id. */
+export function CasesLine({
+  cases,
+  complete,
+  className,
+}: {
+  cases: readonly CaseLink[];
+  complete: boolean;
+  className?: string;
+}) {
+  return (
+    <div data-testid="action-cases" className={className}>
+      {casesHead(cases.length, complete)}{' '}
+      {cases.map((c, i) => (
+        <span key={c.id}>
+          {i > 0 && ', '}
+          {c.url ? (
+            <a
+              href={c.url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="font-mono text-accent hover:underline"
+            >
+              {c.id}
+            </a>
+          ) : (
+            <span className="font-mono">{c.id}</span>
+          )}
+        </span>
+      ))}
+      .
+    </div>
+  );
+}
+/** The ack scope while the server counts, and when it could not count. */
+export const ACK_COUNTING = 'soc-ai is counting the alerts this ack covers.';
+export const ACK_COUNT_FAILED =
+  'soc-ai could not count the alerts. The ack covers the unacknowledged alerts of this rule from the last 7 days.';
+
+/** "Oct 19, 03:12 UTC": the local date, clock time and zone of an ISO
+ *  instant, or null when it does not parse. A bare "03:12" named no day and
+ *  no zone (dogfood 2026-10-19, R2-D17). */
 export function clockTime(iso: string | null | undefined): string | null {
   if (!iso) return null;
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return null;
-  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+  return d.toLocaleString([], {
+    month: 'short',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+    timeZoneName: 'short',
+  });
 }
 
 /** "Executed by auto-ack at 03:12": who or what wrote, and when. A record
@@ -71,15 +140,17 @@ export function dismissedLine(by: string, at?: string | null): string {
   return when ? `Dismissed by ${by} at ${when}` : `Dismissed by ${by}`;
 }
 
-/** The label of the confirm button: the write, with its count. */
-export function confirmLabel(tag: ActionTag, scope: ActionScope | null): string {
+/** The label of the confirm button: the write, with its count. An escalate
+ *  of an alert already on a case writes nothing, and the press records the
+ *  action as done. */
+export function confirmLabel(tag: ActionTag, scope: ActionScope | null, onCase = false): string {
   if (tag === 'ack') {
     if (scope?.scope === 'group' && scope.count != null) {
       return scope.count === 1 ? 'Acknowledge 1 alert' : `Acknowledge ${scope.count} alerts`;
     }
     return 'Acknowledge this alert';
   }
-  if (tag === 'escalate') return 'Open the case';
+  if (tag === 'escalate') return onCase ? 'Record as done' : 'Open the case';
   return 'Add the comment';
 }
 
@@ -105,6 +176,8 @@ export function ActionCard({
   disabledReason,
   lockedReason,
   confirmRequest,
+  cases,
+  casesComplete = false,
 }: {
   action: RecommendedAction;
   /** The position of the action in the report. The server keys on it. */
@@ -128,6 +201,11 @@ export function ActionCard({
   lockedReason?: string;
   /** A new value opens the write confirm: the chat asked for this action. */
   confirmRequest?: number;
+  /** The cases the alert is already on. An escalate names and links each
+   *  one, and a press then opens no second case (V3-N2). */
+  cases?: readonly CaseLink[];
+  /** False when the grid did not confirm the case list. */
+  casesComplete?: boolean;
 }) {
   const Icon = ACTION_ICON[action.tag];
   const tagStyle = ACTION_TAG_COLOR[action.tag];
@@ -151,7 +229,11 @@ export function ActionCard({
     !applied &&
     !dismissed &&
     (!decision || decision === 'failed' || decision === 'dismissing');
-  const canWrite = pending && !disabledReason && !lockedReason;
+  // The server states why a write can act against an analyst verdict. The
+  // row of the pending-action list reads the same rule (R1-I1 follow-up).
+  const blockedReason = action.blockedReason || undefined;
+  const writeOffReason = lockedReason ?? disabledReason ?? blockedReason;
+  const canWrite = pending && !writeOffReason;
 
   useEffect(() => {
     if (confirmRequest != null && canWrite) setConfirm('write');
@@ -177,13 +259,17 @@ export function ActionCard({
     };
   }, [canWrite, action.tag, invId, index]);
 
-  const scopeSentence =
-    action.tag === 'ack'
+  // The alert is already on a case. The escalate states it and links each
+  // case. The execute route opens no second case.
+  const onCases = action.tag === 'escalate' && cases && cases.length > 0 ? cases : null;
+  const scopeSentence = onCases
+    ? NO_SECOND_CASE
+    : action.tag === 'ack'
       ? scope?.sentence ??
         (scopeState === 'loading'
-          ? 'soc-ai is counting the alerts this ack covers.'
+          ? ACK_COUNTING
           : scopeState === 'error'
-            ? 'soc-ai could not count the alerts. The ack covers the unacknowledged alerts of this rule from the last 7 days.'
+            ? ACK_COUNT_FAILED
             : DEFAULT_SCOPE.ack)
       : DEFAULT_SCOPE[action.tag];
   const groupAck = action.tag === 'ack' && scope?.scope === 'group';
@@ -251,7 +337,17 @@ export function ActionCard({
         </div>
       ) : pending ? (
         <>
-          <div data-testid="action-scope" className="mt-[10px] pl-[31px] text-[12px] leading-[1.5] text-text-2">
+          {onCases && (
+            <CasesLine
+              cases={onCases}
+              complete={casesComplete}
+              className="mt-[10px] pl-[31px] text-[12px] leading-[1.5] text-text-2"
+            />
+          )}
+          <div
+            data-testid="action-scope"
+            className={`${onCases ? 'mt-1' : 'mt-[10px]'} pl-[31px] text-[12px] leading-[1.5] text-text-2`}
+          >
             {scopeSentence}
           </div>
           {action.pendingNote && (
@@ -269,11 +365,20 @@ export function ActionCard({
           {lockedReason && (
             <div className="mt-1 pl-[31px] text-[12px] leading-[1.5] text-warn">{lockedReason}</div>
           )}
+          {!lockedReason && blockedReason && (
+            <div data-testid="action-blocked" className="mt-1 pl-[31px] text-[12px] leading-[1.5] text-warn">
+              {blockedReason}
+            </div>
+          )}
           {confirm === 'write' ? (
             <div data-testid="action-confirm" className="ml-[31px] mt-[11px] rounded-[7px] border px-3 py-2.5" style={{ borderColor: 'rgba(245,166,35,.35)', background: 'rgba(245,166,35,.07)' }}>
               <div className="mb-2.5 flex items-start gap-2 text-[12.5px] leading-[1.5] text-warn">
                 <AlertTriangle size={13} className="mt-px flex-none" />
-                <span>This writes to Security Onion. {scopeSentence}</span>
+                <span>
+                  {onCases
+                    ? `${casesSentence(onCases, casesComplete)} ${scopeSentence}`
+                    : `This writes to Security Onion. ${scopeSentence}`}
+                </span>
               </div>
               <div className="flex flex-wrap gap-2">
                 <button
@@ -283,7 +388,7 @@ export function ActionCard({
                   }}
                   className={`${btn} border-success-btn-border bg-success-btn text-[#eafff2] hover:bg-[#22824c]`}
                 >
-                  <Check size={15} /> {confirmLabel(action.tag, scope)}
+                  <Check size={15} /> {confirmLabel(action.tag, scope, !!onCases)}
                 </button>
                 {groupAck && (
                   <button
@@ -308,7 +413,7 @@ export function ActionCard({
             <div data-testid="dismiss-confirm" className="ml-[31px] mt-[11px] rounded-[7px] border px-3 py-2.5" style={{ borderColor: 'rgba(245,166,35,.35)', background: 'rgba(245,166,35,.07)' }}>
               <div className="mb-2.5 flex items-start gap-2 text-[12.5px] leading-[1.5] text-warn">
                 <AlertTriangle size={13} className="mt-px flex-none" />
-                <span>Dismiss this recommendation. soc-ai records your name and the time. You can undo it.</span>
+                <span>{DISMISS_CONFIRM_TEXT}</span>
               </div>
               <div className="flex flex-wrap gap-2">
                 <button
@@ -333,7 +438,7 @@ export function ActionCard({
               <button
                 onClick={() => setConfirm('write')}
                 disabled={!canWrite}
-                title={lockedReason ?? disabledReason}
+                title={writeOffReason}
                 className={`${btn} border-success-btn-border bg-success-btn text-[#eafff2] hover:bg-[#22824c] disabled:hover:bg-success-btn`}
               >
                 <Check size={15} /> {decision === 'failed' ? 'Retry' : ACTION_VERB[action.tag]}

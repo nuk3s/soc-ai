@@ -100,14 +100,14 @@ describe('the page of a backtest replay', () => {
 
   it('offers no settled bar on a replay', () => {
     mount(inv('backtest', []));
-    expect(screen.queryByText('Verdict settled. Take action.')).toBeNull();
+    expect(screen.queryByText('No automatic action')).toBeNull();
     expect(screen.queryByRole('button', { name: /^Acknowledge$/ })).toBeNull();
     expect(screen.queryByRole('button', { name: /Escalate to case/ })).toBeNull();
   });
 
   it('control: a live run with no actions keeps the settled bar', () => {
     mount(inv('analyst', []));
-    expect(screen.getByText('Verdict settled. Take action.')).toBeTruthy();
+    expect(screen.getByText('No automatic action')).toBeTruthy();
     expect(screen.getByRole('button', { name: /^Acknowledge$/ })).toBeTruthy();
   });
 });

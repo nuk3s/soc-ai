@@ -1019,13 +1019,23 @@ def _active_hours_vector(bucket: dict[str, Any], *, tz: str) -> dict[str, Any]:
     return out
 
 
-def _rate_vector(bucket: dict[str, Any], *, tz: str) -> dict[str, Any]:
+def _rate_vector(
+    bucket: dict[str, Any],
+    *,
+    tz: str,
+    gaps: Sequence[tuple[datetime, datetime]] = (),
+) -> dict[str, Any]:
     """The three local-time cells for a numeric dimension, and the hourly series.
 
     The aggregation drops hours with no document. Those hours are filled with
     zero from the entity's first active hour to its last, so the cells and
     the hourly expectation both measure the rate in every hour, and not the
     rate in active hours.
+
+    An hour inside one of the ``gaps`` is missing. The grid held no data for
+    it, so it is no measurement: the cells leave it out and the series holds
+    null for it. Read as zero, a 90-hour outage taught the baseline 90 quiet
+    hours (dogfood 2026-10-19, R4-D4).
 
     ``hourly`` holds the series itself: the UTC start of its first hour and
     one count per hour. The prior sweep reads the expected count per hour of
@@ -1040,9 +1050,22 @@ def _rate_vector(bucket: dict[str, Any], *, tz: str) -> dict[str, Any]:
             continue
         counts[stamp] = counts.get(stamp, 0.0) + float(hour_bucket.get("doc_count") or 0)
 
-    start, series = zero_filled(counts)
+    start, filled = zero_filled(counts)
+    windows = [
+        (
+            a if a.tzinfo is not None else a.replace(tzinfo=UTC),
+            b if b.tzinfo else b.replace(tzinfo=UTC),
+        )
+        for a, b in gaps
+    ]
+    series: list[float | None] = list(filled)
+    if start is not None and windows:
+        for n in range(len(series)):
+            at = start + timedelta(hours=n)
+            if any(a <= at < b for a, b in windows):
+                series[n] = None
     samples = (
-        [(start + timedelta(hours=n), value) for n, value in enumerate(series)]
+        [(start + timedelta(hours=n), value) for n, value in enumerate(series) if value is not None]
         if start is not None
         else []
     )
@@ -1059,7 +1082,9 @@ def _rate_vector(bucket: dict[str, Any], *, tz: str) -> dict[str, Any]:
     if start is not None:
         vector[HOURLY_KEY] = {
             "start": start.isoformat(),
-            "counts": [int(v) if float(v).is_integer() else v for v in series],
+            "counts": [
+                None if v is None else int(v) if float(v).is_integer() else v for v in series
+            ],
         }
     return vector
 
@@ -1103,8 +1128,12 @@ async def collect_entity_profiles(  # noqa: PLR0915 - one function reads as one 
     time_anchor: datetime | None = None,
     lag_hours: int = 0,
     cidrs: Sequence[Any] = (),
+    gaps: Sequence[tuple[datetime, datetime]] = (),
 ) -> ProfileSweep:
     """Build every entity's profile over ``window_hours``.
+
+    ``gaps`` are the grid gaps, with their settle margin. A rate leaves their
+    hours out as missing. See :func:`_rate_vector`.
 
     ``cidrs`` scopes HOST entities to the estate's own address space. Without
     it the lane profiles every address it sees as a source, which on the range
@@ -1300,7 +1329,7 @@ async def collect_entity_profiles(  # noqa: PLR0915 - one function reads as one 
                 vector = (
                     _active_hours_vector(bucket, tz=tz)
                     if shape == "active_hours"
-                    else _rate_vector(bucket, tz=tz)
+                    else _rate_vector(bucket, tz=tz, gaps=gaps)
                 )
                 profiles.append(
                     BuiltProfile(

@@ -26,13 +26,16 @@ import asyncio
 import ipaddress
 import logging
 from dataclasses import asdict
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from elastic_transport import TransportError
 from elasticsearch import ApiError
 from fastapi import Depends, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from soc_ai.api.deps import get_elastic, get_settings_dep
 from soc_ai.api.security import identify_caller
@@ -58,6 +61,7 @@ from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.store import entity_profiles, host_machines
 from soc_ai.store import host_dossier as dossier_store
 from soc_ai.store import investigations as inv_svc
+from soc_ai.store.models import DossierRun
 from soc_ai.webui import host_activity as activity_query
 from soc_ai.webui.deps import current_user
 
@@ -289,31 +293,35 @@ class DossierSummaryOut(BaseModel):
     named: int = Field(
         default=0,
         description=(
-            "Hosts whose 'hostname' field the resolver would assert — the operator "
-            "lane, or an inferred name that clears both the confidence floor and "
-            "the staleness window. A stored name the resolver withholds is not "
-            "counted, so this agrees with the hostname column in the list."
+            "Hosts whose 'hostname' field the resolver asserts. The name comes from "
+            "the operator lane, or it is an inferred name that clears the confidence "
+            "floor and the staleness window. A stored name that the resolver withholds "
+            "does not count, so this count agrees with the hostname column of the list."
         ),
     )
     reporting: int = Field(
         default=0,
         description=(
-            "Hosts whose inference lane currently holds a value at the 'hostlog' "
-            "rung — an agent on the machine reporting about itself. Counts the "
-            "OBSERVATION, so an operator override on the field does not hide it."
+            "Hosts whose inference lane holds a value at the 'hostlog' rung. That "
+            "value comes from an agent on the machine that reports about itself. The "
+            "count reads the OBSERVATION, so an operator override on the field does "
+            "not hide it."
         ),
     )
     conflicts: int = Field(
         default=0,
-        description="Open disagreements past the observation gate — the /dossiers/conflicts count.",
+        description=(
+            "Open disagreements past the observation gate. This is the count of "
+            "/dossiers/conflicts."
+        ),
     )
     roles: dict[str, int] = Field(
         default_factory=dict,
         description=(
-            "Hosts per effective role — the operator's declaration where one "
-            "exists, otherwise an inferred role the resolver would assert "
-            "(confidence floor + staleness window). Hosts with no resolved role "
-            "are in no bucket, so the values need not sum to `hosts`; the "
+            "Hosts per effective role. The role is the operator declaration if one "
+            "exists. Otherwise it is an inferred role that the resolver asserts under "
+            "the confidence floor and the staleness window. A host with no resolved "
+            "role is in no bucket, so the values can sum to less than `hosts`. The "
             "difference is the unresolved remainder."
         ),
     )
@@ -478,10 +486,10 @@ class HostPeerOut(BaseModel):
 class VolumePointOut(BaseModel):
     """One bar of the connection-volume chart.
 
-    The series is NOT a fixed-length window: it starts at the host's first
-    activity in the range, not at the range's edge, so a quiet host returns
-    fewer bars than there are hours or days. Render off ``ts``; never index by
-    position or assume a bar count.
+    The series spans the whole range, and an empty hour or day is a zero bar.
+    The bar count is not fixed: the first bar starts at the hour or day that
+    holds the range start, so a 24 h series holds 25 bars. Render off ``ts``;
+    never index by position.
     """
 
     model_config = _WIRE_STRICT
@@ -539,13 +547,13 @@ class HostActivityOut(BaseModel):
     # as truncated and went quietly false whenever the cap moved).
     peers_truncated: bool = Field(
         default=False,
-        description="The ranked peer list was cut to the server cap; rows fell off the end.",
+        description="The server cap cut the ranked peer list. Rows fell off the end.",
     )
     users_truncated: bool = Field(
         default=False,
         description=(
-            "The account list was cut to the server cap. Always false when "
-            "`users` is null — an absent list is not a cut one."
+            "The server cap cut the account list. This is always false when "
+            "`users` is null, because an absent list is not a cut list."
         ),
     )
     conn_datasets: list[str] = Field(
@@ -553,10 +561,31 @@ class HostActivityOut(BaseModel):
         description=(
             "Flow datasets that produced at least one conversation record for "
             "this host, busiest first. Empty means the host had no conversation "
-            "records in the window — which is the only way a client can tell a "
-            "genuinely quiet host from a grid whose sensor this build does not "
-            "read. More than one entry means the same conversation may be "
-            "counted by two sensors, so the totals are an upper bound."
+            "records in the window. Only this list lets a client tell a quiet host "
+            "from a grid whose sensor this build does not read. More than one entry "
+            "means two sensors can count the same conversation, so the totals are "
+            "an upper bound."
+        ),
+    )
+    auth_datasets: list[str] = Field(
+        default_factory=list,
+        description=(
+            "The host-log datasets that the users list reads. The list is the "
+            "same for every host. It names what was read, also when `users` is null."
+        ),
+    )
+    newest_event: str | None = Field(
+        default=None,
+        description=(
+            "The time of the newest connection record for this host in the window. "
+            "Null when the window holds no connection record."
+        ),
+    )
+    window_end: str | None = Field(
+        default=None,
+        description=(
+            "The end of the window: the server time of the read, in UTC. "
+            "The window starts 24 hours or 7 days before it."
         ),
     )
 
@@ -650,6 +679,9 @@ def _row_out(resolved: ResolvedDossier) -> DossierRowOut:
 from soc_ai.dossier.profile import (  # noqa: E402 - imported after the router is built
     _MAX_MEMBERS as _PROFILE_MEMBER_CAP,
 )
+from soc_ai.dossier.profile import (  # noqa: E402 - imported after the router is built
+    LOGON_CANDIDATES,
+)
 
 # "197 members" is the data model's word. The row names what it counted.
 _PROFILE_NOUN: dict[str, tuple[str, str]] = {
@@ -715,9 +747,16 @@ _AGENT_EVENT_NOUN: dict[str, str] = {
     "logon_users": "logon events",
 }
 # The coverage plane an agent dimension reads, where the coverage module names one.
+# "logon" is the profile's logon plane. The coverage module files its datasets
+# under host logs and Windows security, so the read marks it apart: a Linux
+# host that ships system.auth ships its logons in its host logs, and the reason
+# said "this host ships no logon events. It ships host logs." (dogfood
+# 2026-10-19).
+_LOGON_PLANE = "logon"
 _AGENT_DIMENSION_PLANE: dict[str, str] = {
     "process_names": "process",
     "process_parents": "process",
+    "logon_users": _LOGON_PLANE,
 }
 # The agent's own logs are its bookkeeping. They say nothing about the host.
 _UNNAMED_PLANES = frozenset({"agent_self"})
@@ -737,7 +776,12 @@ def _join_words(items: list[str]) -> str:
 
 
 def _blind_reason(
-    dimension: str, *, reporting: bool, shipped: tuple[frozenset[str], list[str]] | None = None
+    dimension: str,
+    *,
+    reporting: bool,
+    shipped: tuple[frozenset[str], list[str]] | None = None,
+    reporting_unknown: bool = False,
+    swept_on: str | None = None,
 ) -> str:
     """The reason a blind row states when the store recorded none.
 
@@ -745,29 +789,72 @@ def _blind_reason(
     render order. Without it, the dossier knows one plane: an agent that
     reports about itself ships host logs, because its self-report is read from
     the host-log datasets.
+
+    ``reporting_unknown`` says the dossier build behind ``reporting`` is
+    missing, failed or older than the staleness window. A false flag then
+    says nothing about now: a Linux host 17 days past its build read "no host
+    log in the window" beside 6 accounts from its own auth log (dogfood
+    2026-10-19). With no coverage answer, the reason states the one fact a
+    blind row always holds: the profile sweep, on ``swept_on``, found none.
     """
     noun = _AGENT_EVENT_NOUN.get(dimension)
     if noun is None:
         return _FLOW_BLIND_REASON.get(dimension, _FLOW_BLIND_DEFAULT)
-    if not reporting:
-        return "no host log in the window"
     present, labels = shipped if shipped is not None else (frozenset(), [])
     if _AGENT_DIMENSION_PLANE.get(dimension) in present:
         return (
             f"the last profile sweep found no {noun} for this host. "
             "The host ships them now. The next profile sweep reads them."
         )
-    return f"this host ships no {noun}. It ships {_join_words(labels or ['host logs'])}."
+    if reporting or labels:
+        return f"this host ships no {noun}. It ships {_join_words(labels or ['host logs'])}."
+    if shipped is None and reporting_unknown:
+        when = f" on {swept_on}" if swept_on else ""
+        return f"the last profile sweep{when} found no {noun} for this host"
+    return "no host log in the window"
 
 
-def _needs_plane_read(rows: dict[str, Any], *, reporting: bool) -> bool:
-    """True when a blind agent row on a reporting host has no stored reason."""
-    return reporting and any(
+def _needs_plane_read(
+    rows: dict[str, Any], *, reporting: bool, reporting_unknown: bool = False
+) -> bool:
+    """True when a blind agent row has no stored reason, and the dossier
+    cannot state the reason alone: the host reports, or the flag is unknown.
+
+    A host whose fresh build found no agent skips the read. The flag is a
+    fact then, and the read would cost a search on every agentless host.
+    """
+    return (reporting or reporting_unknown) and any(
         dim in _AGENT_EVENT_NOUN
         and row.coverage == "blind"
         and getattr(row, "coverage_reason", None) is None
         for dim, row in rows.items()
     )
+
+
+def _reporting_unknown(resolved: ResolvedDossier, *, now: datetime, settings: Settings) -> bool:
+    """True when the build behind ``resolved.reporting`` cannot vouch for now.
+
+    No build, a failed build, or a build older than the staleness window. The
+    resolver marks every agent fact of such a build stale, so ``reporting``
+    reads false whatever the host ships today.
+    """
+    built = resolved.last_built_at
+    if built is None or resolved.build_error is not None:
+        return True
+    if built.tzinfo is None:
+        built = built.replace(tzinfo=UTC)
+    hours = int(getattr(settings, "dossier_staleness_hours", DEFAULT_STALENESS_HOURS))
+    return now - built > timedelta(hours=hours)
+
+
+def _swept_on(row: Any) -> str | None:
+    """The UTC date of the profile sweep that wrote ``row``, or None."""
+    built = getattr(row, "built_at", None)
+    if not isinstance(built, datetime):
+        return None
+    if built.tzinfo is not None:
+        built = built.astimezone(UTC)
+    return built.date().isoformat()
 
 
 async def _shipped_planes(
@@ -804,6 +891,10 @@ async def _shipped_planes(
     if not coverage.read_ok:
         return None
     present = frozenset(p.plane for p in coverage.planes if p.present)
+    datasets = {d.dataset for p in coverage.planes for d in p.datasets if d.count > 0}
+    datasets |= {d.dataset for d in coverage.other if d.count > 0}
+    if datasets & set(LOGON_CANDIDATES):
+        present |= {_LOGON_PLANE}
     labels = [
         plane_label(p.plane)
         for p in coverage.planes
@@ -842,6 +933,7 @@ def _profile_out(
     *,
     reporting: bool = False,
     shipped: tuple[frozenset[str], list[str]] | None = None,
+    reporting_unknown: bool = False,
 ) -> list[ProfileDimensionOut]:
     out: list[ProfileDimensionOut] = []
     for dim in (
@@ -861,7 +953,13 @@ def _profile_out(
         summary, top = _profile_summary(row)
         reason = getattr(row, "coverage_reason", None)
         if reason is None and row.coverage == "blind":
-            reason = _blind_reason(dim, reporting=reporting, shipped=shipped)
+            reason = _blind_reason(
+                dim,
+                reporting=reporting,
+                shipped=shipped,
+                reporting_unknown=reporting_unknown,
+                swept_on=_swept_on(row),
+            )
         out.append(
             ProfileDimensionOut(
                 dimension=dim,
@@ -882,11 +980,17 @@ def _dossier_out(
     profile: dict[str, Any] | None = None,
     aliases: list[str] | None = None,
     shipped: tuple[frozenset[str], list[str]] | None = None,
+    reporting_unknown: bool = False,
 ) -> DossierOut:
     return DossierOut(
         **_header(resolved),
         fields=[_field_out(f) for f in resolved.fields.values()],
-        profile=_profile_out(profile or {}, reporting=resolved.reporting, shipped=shipped),
+        profile=_profile_out(
+            profile or {},
+            reporting=resolved.reporting,
+            shipped=shipped,
+            reporting_unknown=reporting_unknown,
+        ),
         aliases=list(aliases or []),
     )
 
@@ -922,7 +1026,7 @@ def _require_field(field: str) -> str:
             status_code=400,
             detail={
                 "reason": "unknown_field",
-                "hint": f"expected one of: {', '.join(DOSSIER_FIELDS)}",
+                "hint": f"field accepts one of these values: {', '.join(DOSSIER_FIELDS)}.",
             },
         )
     return field
@@ -997,6 +1101,43 @@ def _refresh_out(status: _DossierStatus, note: str | None = None) -> DossierRefr
     )
 
 
+async def last_finished_sweep(db: AsyncSession) -> DossierRun | None:
+    """The newest sweep that finished, from the durable ``dossier_run`` table.
+
+    ``GET /hosts/summary`` dates the store with it (``last_sweep_at``). The
+    sweep status routes read it when the in-memory status holds no run. That
+    status is empty after every restart, and sweep-health said ``last_run:
+    null`` beside a summary that named the sweep (dogfood 2026-10-19). One
+    query, so the two routes name the same run.
+    """
+    run: DossierRun | None = await db.scalar(
+        select(DossierRun)
+        .where(DossierRun.finished_at.is_not(None))
+        .order_by(DossierRun.finished_at.desc())
+        .limit(1)
+    )
+    return run
+
+
+async def _stored_run(request: Request) -> tuple[str | None, list[str]]:
+    """``(finish time, error strings)`` of the newest stored sweep.
+
+    ``(None, [])`` when no sweep finished or the read failed. A failed read
+    leaves the status as the process knows it. The stored errors are the same
+    list the in-memory summary holds, because ``_close_run`` writes it.
+    """
+    try:
+        async with request.app.state.db_sessionmaker() as db:
+            run = await last_finished_sweep(db)
+    except SQLAlchemyError as exc:
+        _LOGGER.warning("dossier: could not read the last sweep row: %s", exc)
+        return None, []
+    if run is None:
+        return None, []
+    errors = run.errors if isinstance(run.errors, list) else []
+    return _iso_utc(run.finished_at) or None, [e for e in errors if isinstance(e, str)]
+
+
 async def _run_dossier_task(state: Any, *, trigger: str = "manual") -> None:
     """Background worker: one network sweep, summary stashed, never raises.
 
@@ -1062,7 +1203,16 @@ async def start_dossier_refresh(request: Request) -> DossierRefreshOut:
     dependencies=[Depends(require_admin_api)],
 )
 async def dossier_refresh_status(request: Request) -> DossierRefreshOut:
-    return _refresh_out(_get_dossier_status(request.app.state))
+    """The status the Rebuild button polls.
+
+    ``last_run`` falls back to the newest stored sweep when this process has
+    run none. ``last_summary`` stays null then: the stored row holds counters,
+    and the summary shape is the one the sweep returns.
+    """
+    out = _refresh_out(_get_dossier_status(request.app.state))
+    if out.last_run is None:
+        out.last_run, _errors = await _stored_run(request)
+    return out
 
 
 def _summary_error_count(last_summary: dict[str, Any] | None) -> int:
@@ -1117,11 +1267,17 @@ async def dossier_sweep_health(request: Request) -> DossierSweepHealthOut:
     routes exist so that trade never has to be made.
     """
     status = _get_dossier_status(request.app.state)
+    last_run = status.last_run
     error_count = _summary_error_count(status.last_summary)
+    if last_run is None and status.last_summary is None:
+        # This process has run no sweep. The stored row names the last one,
+        # and its error count keeps a failed sweep degraded after a restart.
+        last_run, errors = await _stored_run(request)
+        error_count = len(errors)
     return DossierSweepHealthOut(
         running=status.running,
         degraded=error_count > 0,
-        last_run=status.last_run,
+        last_run=last_run,
         error_count=error_count,
     )
 
@@ -1259,15 +1415,16 @@ async def list_dossiers(
     health: Literal["broken"] | None = Query(
         None,
         description=(
-            "'broken' selects hosts with no clean build on record — never built, "
-            "or the last build errored: exactly the set the summary's never_built "
-            "counts, so that KPI can click through to the rows behind its number."
+            "'broken' selects hosts with no clean build on record. A host is never "
+            "built, or its last build errored. This is the set that never_built in "
+            "the summary counts, so that KPI can open the rows behind its number."
         ),
     ),
     activity: Literal["active"] | None = Query(
         None,
-        description="'active' keeps only hosts with observed events (event_count > 0) — "
-        "the screen's default; omit for the full census including DNS-only entries.",
+        description="'active' keeps only hosts with observed events, where event_count "
+        "is above 0. The screen uses it by default. Leave it out for the full census, "
+        "with the DNS-only entries.",
     ),
     limit: int = Query(dossier_store.DEFAULT_LIST_LIMIT, ge=1, le=dossier_store.MAX_LIST_LIMIT),
     offset: int = Query(0, ge=0),
@@ -1493,6 +1650,9 @@ async def get_dossier_activity(
         peers_truncated=activity.peers_truncated,
         users_truncated=activity.users_truncated,
         conn_datasets=list(activity.conn_datasets),
+        auth_datasets=list(activity.auth_datasets),
+        newest_event=activity.newest_event,
+        window_end=activity.window_end,
     )
 
 
@@ -1532,13 +1692,14 @@ async def _current_dossier(request: Request, key: str, settings: Settings) -> Do
             if variant != key
         ]
     merged = _merge_profiles(profile, *alias_rows)
+    unknown = _reporting_unknown(resolved, now=now, settings=settings)
     # Outside the database session: the read waits on the grid, not on SQLite.
     shipped = (
         await _shipped_planes(request, settings, address=key, names=aliases)
-        if _needs_plane_read(merged, reporting=resolved.reporting)
+        if _needs_plane_read(merged, reporting=resolved.reporting, reporting_unknown=unknown)
         else None
     )
-    out = _dossier_out(resolved, merged, aliases, shipped)
+    out = _dossier_out(resolved, merged, aliases, shipped, reporting_unknown=unknown)
     out.profiles_enabled = bool(getattr(settings, "entity_profiles_enabled", False))
     out.lookback_days = max(1, int(getattr(settings, "dossier_lookback_days", 14)))
     return out
@@ -1638,7 +1799,7 @@ async def set_dossier_override(
     if row is None:
         raise HTTPException(
             status_code=404,
-            detail={"reason": "not_found", "hint": "no dossier for that host yet"},
+            detail={"reason": "not_found", "hint": "soc-ai has no dossier for this host yet."},
         )
     await _audit(
         request,
@@ -1855,7 +2016,10 @@ async def clear_dossier_override(
         if existing is None:
             raise HTTPException(
                 status_code=404,
-                detail={"reason": "not_found", "hint": "no dossier field for that host"},
+                detail={
+                    "reason": "not_found",
+                    "hint": "The dossier of this host has no such field.",
+                },
             )
         if existing.operator_value is None and existing.operator_value_json is None:
             raise HTTPException(
@@ -1900,14 +2064,17 @@ async def snooze_dossier_conflict(
         if existing is None:
             raise HTTPException(
                 status_code=404,
-                detail={"reason": "not_found", "hint": "no dossier field for that host"},
+                detail={
+                    "reason": "not_found",
+                    "hint": "The dossier of this host has no such field.",
+                },
             )
         if existing.conflict_first_seen_at is None:
             raise HTTPException(
                 status_code=409,
                 detail={
                     "reason": "no_open_conflict",
-                    "hint": f"nothing currently disagrees with the '{field}' override",
+                    "hint": f"Nothing disagrees with the '{field}' override now.",
                 },
             )
         row = await dossier_store.snooze_conflict(

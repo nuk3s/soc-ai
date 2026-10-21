@@ -91,7 +91,7 @@ class TestTheConsoleSaysWhichEmptyItIs:
         assert body["reason"] == "quiet"
         assert "filter" not in body["hint"].lower()
         # No count proves a configuration sound (dogfood 2026-10-06).
-        assert body["hint"] == "No alert label matches anything in this window. The grid is quiet."
+        assert body["hint"] == "No alert in this window matches an alert label. The grid is quiet."
 
     def test_a_filter_that_matched_nothing_while_another_label_did_says_so(
         self, client: TestClient

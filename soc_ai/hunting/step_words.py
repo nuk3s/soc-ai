@@ -37,6 +37,32 @@ _CAP_RE = re.compile(
     r"(?P<cap>\d+),\s*got\s+(?P<got>-?\d+)"
 )
 _LENGTH_RE = re.compile(r"query must be <= (?P<cap>\d+) chars")
+# The OQL validator's refusal of a pattern that starts with a wildcard
+# (soc_ai.so_client.oql). The model reads the validator's text. The page reads
+# these sentences (R3 STE 27).
+_LEADING_WILDCARD_RE = re.compile(r"leading-wildcard patterns are too expensive", re.I)
+_LEADING_WILDCARD_WORDS = (
+    "The query starts a pattern with a wildcard. The grid refuses that form. "
+    "Write the pattern as foo*, or use field:~value."
+)
+
+# Tool sentences the model reads, and the words the page shows for them. The
+# tools keep their text, because a change of tool text changes what the model
+# does (R3 STE 26).
+_PAGE_SENTENCES: tuple[tuple[str, str], ...] = (
+    (
+        "That is a single episode, not a background rate, so no per-day rate is reported.",
+        "That is one episode. soc-ai states no rate for each day.",
+    ),
+)
+
+# The text soc-ai writes for the model when the grid fails a tool call
+# (soc_ai.agent.toolset._GRID_UNAVAILABLE_MESSAGE). It tells the model what to
+# do next: "Do not re-send this exact call". The model keeps the text. The
+# page states what happened (dogfood 2026-10-19, V1-H8). The stored text of
+# an older build carried em dashes, so the match reads the first words only.
+_GRID_UNAVAILABLE_RE = re.compile(r"^\s*The Security Onion grid did not answer this query\b", re.I)
+_GRID_UNAVAILABLE_WORDS = "The grid did not answer this query. The result is unknown."
 
 _UNIT_MINUTES = {"time_range_minutes": 1, "lookback_hours": 60, "lookback_days": 1440}
 
@@ -85,6 +111,17 @@ def translate_tool_error(message: str | None, *, retried: bool = False) -> str |
         length = _LENGTH_RE.search(text)
         if length is not None:
             sentence = f"The query was too long. A query holds {length.group('cap')} characters."
+        elif _LEADING_WILDCARD_RE.search(text):
+            sentence = _LEADING_WILDCARD_WORDS
+        elif _GRID_UNAVAILABLE_RE.search(text):
+            sentence = _GRID_UNAVAILABLE_WORDS
+        elif "partial search results" in text.lower():
+            # The grid client's text is the model's (R3 STE 14). The catalog
+            # composer already words it for the page, so the two agree.
+            from soc_ai.hunting.findings import plain_error  # noqa: PLC0415 - lazy
+
+            worded = plain_error(text)
+            sentence = worded if worded != text.strip() else None
     if sentence is None:
         return None
     return f"{sentence} The agent tried again." if retried else sentence
@@ -178,6 +215,41 @@ def search_title(
         return f"Search {what}{span} failed. {plain}" if plain else None
     count = _count(result)
     return f"Searched {what}{span}: {count}" if count else None
+
+
+def page_sentences(text: str) -> str:
+    """A tool sentence the model reads, in the words the page shows."""
+    for model_text, page_text in _PAGE_SENTENCES:
+        text = text.replace(model_text, page_text)
+    return text
+
+
+def prevalence_title(tool_name: str, result: Any) -> str | None:
+    """The title of an indicator prevalence step, or None for another step.
+
+    The step read "Indicator prevalence: 10.1.99.5: common - 99976 event(s)
+    across 13 distinct day(s)". It now reads "Indicator prevalence: 10.1.99.5
+    is common. 99,976 events on 13 days." (R3 STE 28). The tool's own summary
+    is the model's text and stays as it is.
+    """
+    if tool_name != "t_prevalence" or not isinstance(result, Mapping):
+        return None
+    if result.get("error") or not result.get("observed"):
+        return None
+    total, days = result.get("total_events"), result.get("distinct_days")
+    if not isinstance(total, int) or isinstance(total, bool) or not isinstance(days, int):
+        return None
+    summary = str(result.get("summary") or "")
+    subject = summary.split(":", 1)[0].strip() if ":" in summary else ""
+    if not subject:
+        return None
+    if result.get("is_novel"):
+        state = "is new, with no baseline"
+    else:
+        state = f"is {str(result.get('rarity') or 'seen').strip()}"
+    events = f"{total:,} event" + ("" if total == 1 else "s")
+    on = "1 day" if days == 1 else f"{days} days"
+    return f"Indicator prevalence: {subject} {state}. {events} on {on}."
 
 
 def current_activity(events: Sequence[Any]) -> str | None:

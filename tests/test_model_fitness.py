@@ -1156,3 +1156,108 @@ async def test_the_doctor_still_fails_a_real_capability_failure() -> None:
 
     assert row.status == "FAIL"
     assert "ANALYST_MODEL" in row.hint
+
+
+# ── Dogfood 2026-10-19, H1-D6 / R5-D29: the console graded a dead gateway UNFIT ──
+#
+# The doctor read a leg that could not reach the model as "could not measure".
+# The console route did not: the same data graded "unfit", measured, alarm
+# true, and the unfit-model webhook could fire. A client timeout did the same.
+
+
+def _unreachable_probe(cause: str = "transport") -> Any:
+    calls: list[int] = []
+
+    async def _fake(settings: Any) -> dict[str, Any]:
+        calls.append(1)
+        legs = [
+            {
+                "name": name,
+                "ok": False,
+                "grade": "fail",
+                "detail": "Connection error. It is not a model capability failure.",
+                "cause": cause,
+            }
+            for name in ("structured_output", "tool_loop", "reasoning_budget")
+        ]
+        return {
+            "grade": "fail",
+            "model": settings.analyst_model,
+            "legs": legs,
+            "detail": "structured_output=fail, tool_loop=fail, reasoning_budget=fail",
+            "served_backend": None,
+        }
+
+    _fake.calls = calls  # type: ignore[attr-defined]
+    return _fake
+
+
+@pytest.mark.parametrize("cause", ["transport", "timeout"])
+def test_console_reads_an_unreachable_model_as_could_not_measure(
+    client: TestClient, cause: str
+) -> None:
+    app = client.app
+    model = app.state.settings.analyst_model
+    # One stored fail: a real second fail would raise the alarm.
+    app.state.elastic = _StubElastic([_audit_hit("fail", "2026-10-18T18:00:00+00:00", model)])
+    fit = {"grade": "pass", "model": model, "legs": [], "detail": "fit"}
+    _seed_fitness(app, model, fit, age_h=2)
+    probe = _unreachable_probe(cause)
+
+    with (
+        patch("soc_ai.webui.probes.probe_model_fitness", probe),
+        patch("soc_ai.notify.event_for_model_fitness") as event_for,
+    ):
+        body = client.get("/api/v1/config/model-fitness?force=true").json()
+
+    assert probe.calls == [1]
+    assert body["measured"] is False
+    assert body["alarm"] is False
+    assert "could not measure" in (body["note"] or "")
+    assert "Connection error" in (body["note"] or "")
+    # The previous verdict stays on screen, labelled as the old one.
+    assert body["grade"] == "pass"
+    assert body["cached"] is True
+    event_for.assert_not_called()
+
+    # The cache still holds the pass: a dead gateway did not overwrite it.
+    again = client.get("/api/v1/config/model-fitness").json()
+    assert again["grade"] == "pass"
+
+
+def test_console_reads_a_cached_unreachable_fail_as_not_measured(client: TestClient) -> None:
+    """A fail verdict cached before this fix showed "last unfit verdict, 14d
+    ago" for a check that measured nothing (R5-D29)."""
+    app = client.app
+    model = app.state.settings.analyst_model
+    old = asyncio_run_probe(_unreachable_probe("timeout"), app.state.settings)
+    _seed_fitness(app, model, old, age_h=1)
+    body = client.get("/api/v1/config/model-fitness").json()
+    assert body["grade"] != "fail"
+    assert body["measured"] is False
+    assert body["alarm"] is False
+    assert "could not measure" in (body["note"] or "")
+
+
+def test_history_skips_a_check_that_could_not_measure(client: TestClient) -> None:
+    """An unmeasured check in the audit trail is no fail. It must not feed the
+    two-in-a-row alarm."""
+    app = client.app
+    model = app.state.settings.analyst_model
+    unmeasured = _audit_hit("fail", "2026-10-18T18:00:00+00:00", model)
+    unmeasured["_source"]["payload"]["legs"] = [
+        {"name": "structured_output", "grade": "fail", "cause": "transport"}
+    ]
+    app.state.elastic = _StubElastic([unmeasured])
+    probe = _probe_returning("fail")
+    with patch("soc_ai.webui.probes.probe_model_fitness", probe):
+        body = client.get("/api/v1/config/model-fitness?force=true").json()
+    assert body["grade"] == "fail"
+    assert body["alarm"] is False
+    assert body["recent_checks"] == 1
+
+
+def asyncio_run_probe(probe: Any, settings: Any) -> dict[str, Any]:
+    import asyncio as _asyncio
+
+    return dict(_asyncio.run(probe(settings)))

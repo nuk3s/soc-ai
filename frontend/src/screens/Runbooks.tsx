@@ -1,5 +1,6 @@
 import { BookOpen, Eye, FileUp, History, Pencil, PackagePlus, Plus } from 'lucide-react';
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
 import {
   type PromotableRule,
   type Runbook,
@@ -150,7 +151,7 @@ const toolbarBtnCls =
 function DraftChip() {
   return (
     <span
-      title="The draft comes from investigation history. The agent does not cite this runbook until you approve it."
+      title="The draft comes from investigation history. The model does not cite this runbook until you approve it."
       className="rounded px-1.5 py-0.5 text-[10px] font-bold"
       style={{ background: '#f5a62322', color: '#f5a623' }}
     >
@@ -167,13 +168,13 @@ function EmbedChip({ rb }: { rb: Runbook }) {
       ? [
           'not embedded',
           '#f5a623',
-          'This runbook has no embedding vector. The gateway was down during the save. Run “Re-embed runbooks” in Config → Retrieval.',
+          'This runbook has no embedding vector. The gateway was down during the save. Run “Re-embed runbooks” in Settings → Retrieval.',
         ]
       : rb.stale
         ? [
             'stale embedding',
             '#f5a623',
-            'The embedding model is not the configured model. Run “Re-embed runbooks” in Config → Retrieval.',
+            'The embedding model is not the configured model. Run “Re-embed runbooks” in Settings → Retrieval.',
           ]
         : ['embedded', '#12b76a', 'The semantic-search vector is current.'];
   return (
@@ -185,6 +186,19 @@ function EmbedChip({ rb }: { rb: Runbook }) {
       {label}
     </span>
   );
+}
+
+// A Suricata SID or a Sigma UUID. Anything else is a rule name.
+const RULE_ID_RE = /^(?:\d+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
+
+/** The Alerts screen, filtered to the alerts of one linked rule over 30 days
+ *  (dogfood 2026-10-19, R5-D16). The chip looked like a link and did nothing.
+ *  An empty list there says that the rule matched no alert in the window. The
+ *  filter is an exact match on the rule name or the rule id. */
+function ruleAlertsHref(rule: string): string {
+  const field = RULE_ID_RE.test(rule.trim()) ? 'rule.uuid' : 'rule.name';
+  const clause = `${field}:"${rule.trim().replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  return `/alerts?range=30d&hide_acked=false&q=${encodeURIComponent(clause)}`;
 }
 
 /**
@@ -217,6 +231,15 @@ export function Runbooks() {
   const [pendingDelete, setPendingDelete] = useState<number | null>(null);
   // One-line outcome summaries for the two bulk actions (import / pack).
   const [bulkSummary, setBulkSummary] = useState('');
+  // The outcome of the last save while the editor stays open (R5-I11).
+  const [savedNote, setSavedNote] = useState('');
+  // Each label names its control (R5-D23).
+  const fieldId = useId();
+  const titleId = `${fieldId}-title`;
+  const contentId = `${fieldId}-content`;
+  const contentLabelId = `${fieldId}-content-label`;
+  const tagsId = `${fieldId}-tags`;
+  const rulesId = `${fieldId}-rules`;
   const fileInputRef = useRef<HTMLInputElement>(null);
   // ── Draft-from-history (promotion) panel state ────────────────────────────
   // promotable: null = loading (panel open, fetch in flight); [] = none left.
@@ -247,8 +270,19 @@ export function Runbooks() {
     });
   }, [runbooks, query]);
 
+  // Escape cancels an armed delete wherever the focus is (R5-D24).
+  useEffect(() => {
+    if (pendingDelete === null) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setPendingDelete(null);
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [pendingDelete]);
+
   const openNew = () => {
     setActionError('');
+    setSavedNote('');
     setDraft(EMPTY_DRAFT);
     setPreview(false);
     setEditingDraft(false);
@@ -256,6 +290,7 @@ export function Runbooks() {
   };
   const openEdit = (rb: Runbook) => {
     setActionError('');
+    setSavedNote('');
     setDraft(toDraft(rb));
     // An existing runbook opens RENDERED (it's markdown — reading comes before
     // editing); the Write toggle is one click away. A new runbook starts in
@@ -269,6 +304,7 @@ export function Runbooks() {
     setDraft(EMPTY_DRAFT);
     setEditingDraft(false);
     setActionError('');
+    setSavedNote('');
   };
 
   const save = async () => {
@@ -277,11 +313,17 @@ export function Runbooks() {
     setActionError('');
     try {
       if (editing === 'new') {
-        await createRunbook(toInput(draft));
+        // The new runbook stays open, so the author can keep writing it
+        // (R5-I11). The editor now edits the stored runbook.
+        const rb = await createRunbook(toInput(draft));
+        setEditing(rb.id);
+        setDraft(toDraft(rb));
+        setEditingDraft(rb.draft);
+        setSavedNote('soc-ai created the runbook.');
       } else if (typeof editing === 'number') {
         await updateRunbook(editing, toInput(draft));
+        cancel();
       }
-      cancel();
       setNonce((n) => n + 1);
     } catch (e) {
       setActionError(e instanceof Error ? e.message : 'The save failed.');
@@ -417,7 +459,7 @@ export function Runbooks() {
           <DraftChip />
           <span className="min-w-[200px] flex-1 text-[12px] leading-[1.45] text-dim">
             The draft comes from this rule's investigation history. Review the draft and edit
-            it. The agent does not cite the draft until you approve it.
+            it. The model does not cite the draft until you approve it.
           </span>
           <button
             onClick={() => void approve()}
@@ -430,17 +472,25 @@ export function Runbooks() {
         </div>
       )}
       <div className="mb-3">
-        <label className={labelCls}>Title</label>
+        <label htmlFor={titleId} className={labelCls}>
+          Title
+        </label>
         <input
+          id={titleId}
           value={draft.title}
           onChange={(e) => setDraft({ ...draft, title: e.target.value })}
-          placeholder="e.g. Triage an ET SCAN Nmap alert"
+          placeholder="Example: Triage an ET SCAN Nmap alert"
           className={inputCls}
         />
       </div>
       <div className="mb-3 flex min-h-0 flex-1 flex-col">
         <div className="mb-1 flex flex-none items-center justify-between">
-          <label className="block text-[11px] font-semibold uppercase tracking-[.06em] text-faint">
+          {/* In the preview the label names the rendered region. */}
+          <label
+            id={contentLabelId}
+            htmlFor={preview ? undefined : contentId}
+            className="block text-[11px] font-semibold uppercase tracking-[.06em] text-faint"
+          >
             Markdown content
           </label>
           <button
@@ -453,7 +503,11 @@ export function Runbooks() {
           </button>
         </div>
         {preview ? (
-          <div className="min-h-[55vh] flex-1 overflow-y-auto rounded-control border border-border-input bg-bg px-3 py-2 text-[12.5px] leading-[1.55] text-text lg:min-h-[240px]">
+          <div
+            role="region"
+            aria-labelledby={contentLabelId}
+            className="min-h-[55vh] flex-1 overflow-y-auto rounded-control border border-border-input bg-bg px-3 py-2 text-[12.5px] leading-[1.55] text-text lg:min-h-[240px]"
+          >
             {draft.content.trim() ? (
               <Markdown>{draft.content}</Markdown>
             ) : (
@@ -462,9 +516,10 @@ export function Runbooks() {
           </div>
         ) : (
           <textarea
+            id={contentId}
             value={draft.content}
             onChange={(e) => setDraft({ ...draft, content: e.target.value })}
-            placeholder="The procedure the agent cites. Describe what is normal on this network. Give the confirm steps and the dismiss steps. Name the known-benign hosts and the pivot queries."
+            placeholder="The procedure the model cites. Describe what is normal on this network. Give the confirm steps and the dismiss steps. Name the known-benign hosts and the pivot queries."
             rows={12}
             className={`${inputCls} min-h-[55vh] flex-1 resize-y font-mono leading-[1.55] lg:min-h-[240px] lg:resize-none`}
           />
@@ -472,8 +527,11 @@ export function Runbooks() {
       </div>
       <div className="mb-3 grid flex-none grid-cols-2 gap-3">
         <div>
-          <label className={labelCls}>Tags</label>
+          <label htmlFor={tagsId} className={labelCls}>
+            Tags
+          </label>
           <input
+            id={tagsId}
             value={draft.tags}
             onChange={(e) => setDraft({ ...draft, tags: e.target.value })}
             placeholder="Separate tags with a comma. Example: scan, recon"
@@ -481,16 +539,24 @@ export function Runbooks() {
           />
         </div>
         <div>
-          <label className={labelCls}>Linked rules</label>
+          <label htmlFor={rulesId} className={labelCls}>
+            Linked rules
+          </label>
           <input
+            id={rulesId}
             value={draft.linked_rules}
             onChange={(e) => setDraft({ ...draft, linked_rules: e.target.value })}
-            placeholder="Rule names or UUIDs. This is the strongest match signal."
+            placeholder="Rule names or UUIDs. A linked rule ranks the runbook first."
             className={inputCls}
           />
         </div>
       </div>
       {actionError && <div className="mb-2 text-[12px] text-danger">{actionError}</div>}
+      {savedNote && !actionError && (
+        <div role="status" className="mb-2 text-[12px] text-success">
+          {savedNote}
+        </div>
+      )}
       <div className="flex items-center gap-2">
         <button
           onClick={() => void save()}
@@ -565,7 +631,7 @@ export function Runbooks() {
         <button
           onClick={() => void togglePromo()}
           disabled={busy}
-          title="Draft a runbook from the investigations this deployment already ran. The model writes an org-specific draft for you to review and approve."
+          title="Draft a runbook from the investigations this deployment already ran. The model writes a draft for this network. You review and approve it."
           className={toolbarBtnCls}
         >
           <History size={13} />
@@ -588,8 +654,8 @@ export function Runbooks() {
           </div>
           <div className="mb-2 max-w-[720px] text-[11.5px] leading-[1.5] text-faint">
             The list holds each rule with 3 or more completed investigations and no runbook. The
-            model distills the observed verdicts, the rationales and the analyst chat into an
-            org-specific draft. The agent uses no draft until you approve it.
+            model summarizes the verdicts, the rationales and the analyst chat into a draft for
+            this network. The model uses no draft until you approve it.
           </div>
           {promoError && <div className="mb-2 text-[12px] text-danger">{promoError}</div>}
           {promotable === null && <LoadingState />}
@@ -624,7 +690,7 @@ export function Runbooks() {
                 title={
                   editing !== null
                     ? 'Close the open editor first. The new draft opens there.'
-                    : 'Run one analyst-model call to distill this rule’s history into a draft. The call can take up to a minute.'
+                    : 'Make one call to the model. It summarizes the history of this rule into a draft. The call can take up to a minute.'
                 }
                 className={toolbarBtnCls}
               >
@@ -684,7 +750,7 @@ export function Runbooks() {
             {!loading && !error && runbooks.length === 0 && editing !== 'new' && (
               <div className="px-3.5 py-5 text-[12.5px] text-faint">
                 No runbooks yet. Write one, import your .md procedures, or load the starter pack.
-                The agent then has a runbook to cite.
+                The model then has a runbook to cite.
               </div>
             )}
             {!loading && !error && runbooks.length > 0 && visible.length === 0 && (
@@ -702,62 +768,71 @@ export function Runbooks() {
                   className={`border-b border-border-faint px-3.5 py-3 last:border-b-0 ${editing === rb.id ? 'bg-[#11161e]' : ''}`}
                 >
                   <div className="flex items-start gap-3">
-                    {/* The whole title/body area opens the runbook — the Edit
-                        button is no longer the only way in (dogfood). */}
-                    <button
-                      type="button"
-                      onClick={() => openEdit(rb)}
-                      disabled={busy || editing !== null}
-                      className="min-w-0 flex-1 text-left disabled:cursor-default"
-                    >
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="break-words text-[13px] font-medium" title={rb.title}>
-                          {rb.title}
-                        </span>
-                        {rb.draft && <DraftChip />}
-                        <EmbedChip rb={rb} />
-                        <span
-                          className="text-[10.5px] text-faint"
-                          title={absoluteTime(rb.updated_at)}
-                          data-testid={`runbook-updated-${rb.id}`}
-                        >
-                          updated {ago(rb.updated_at)}
-                        </span>
-                      </div>
-                      {preview && (
-                        // The body of a runbook runs to pages, so the row
-                        // shows its first three lines and the hover holds the
-                        // whole text. The box stops at the line edge and draws
-                        // no ellipsis (owner, 2026-10-07). The row opens the
-                        // runbook.
-                        <div
-                          data-testid={`runbook-preview-${rb.id}`}
-                          title={preview}
-                          className="mt-0.5 max-h-[4.2em] overflow-hidden break-words text-[11.5px] leading-[1.4] text-faint"
-                        >
-                          {preview}
+                    <div className="min-w-0 flex-1">
+                      {/* The whole title/body area opens the runbook — the Edit
+                          button is no longer the only way in (dogfood). */}
+                      <button
+                        type="button"
+                        onClick={() => openEdit(rb)}
+                        disabled={busy || editing !== null}
+                        className="w-full min-w-0 text-left disabled:cursor-default"
+                      >
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="break-words text-[13px] font-medium" title={rb.title}>
+                            {rb.title}
+                          </span>
+                          {rb.draft && <DraftChip />}
+                          <EmbedChip rb={rb} />
+                          <span
+                            className="text-[10.5px] text-faint"
+                            title={absoluteTime(rb.updated_at)}
+                            data-testid={`runbook-updated-${rb.id}`}
+                          >
+                            updated {ago(rb.updated_at)}
+                          </span>
+                        </div>
+                        {preview && (
+                          // The body of a runbook runs to pages, so the row
+                          // shows its first three lines and the hover holds the
+                          // whole text. The box stops at the line edge and draws
+                          // no ellipsis (owner, 2026-10-07). The row opens the
+                          // runbook.
+                          <div
+                            data-testid={`runbook-preview-${rb.id}`}
+                            title={preview}
+                            className="mt-0.5 max-h-[4.2em] overflow-hidden break-words text-[11.5px] leading-[1.4] text-faint"
+                          >
+                            {preview}
+                          </div>
+                        )}
+                      </button>
+                      {/* The chips sit outside the row button: a link inside a
+                          button is invalid markup, and its click opened the
+                          editor. A linked rule opens its alerts (R5-D16). */}
+                      {(rb.linked_rules.length > 0 || rb.tags.length > 0) && (
+                        <div className="mt-1.5 flex flex-wrap gap-1.5">
+                          {rb.linked_rules.map((r) => (
+                            <Link
+                              key={`r-${r}`}
+                              to={ruleAlertsHref(r)}
+                              title="Show the alerts of this rule in the last 30 days. An empty list means that the rule matched no alert."
+                              aria-label={`Alerts of the linked rule ${r}`}
+                              className="rounded border border-accent/40 px-1.5 py-0.5 text-[10.5px] text-accent underline-offset-2 hover:border-accent hover:underline"
+                            >
+                              {r}
+                            </Link>
+                          ))}
+                          {rb.tags.map((t) => (
+                            <span
+                              key={`t-${t}`}
+                              className="rounded border border-border-strong bg-surface-3 px-1.5 py-0.5 text-[10.5px] text-dim"
+                            >
+                              {t}
+                            </span>
+                          ))}
                         </div>
                       )}
-                      <div className="mt-1.5 flex flex-wrap gap-1.5">
-                        {rb.linked_rules.map((r) => (
-                          <span
-                            key={`r-${r}`}
-                            className="rounded border border-accent/40 px-1.5 py-0.5 text-[10.5px] text-accent"
-                            title="linked rule"
-                          >
-                            {r}
-                          </span>
-                        ))}
-                        {rb.tags.map((t) => (
-                          <span
-                            key={`t-${t}`}
-                            className="rounded border border-border-strong bg-surface-3 px-1.5 py-0.5 text-[10.5px] text-dim"
-                          >
-                            {t}
-                          </span>
-                        ))}
-                      </div>
-                    </button>
+                    </div>
                     <div className="flex flex-none items-center gap-1.5">
                       <button
                         onClick={() => openEdit(rb)}
@@ -775,7 +850,9 @@ export function Runbooks() {
                           >
                             Confirm delete
                           </button>
+                          {/* The safe choice holds the focus. */}
                           <button
+                            autoFocus
                             onClick={() => setPendingDelete(null)}
                             disabled={busy}
                             className="rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-[5px] text-[11.5px] font-semibold text-dim hover:text-text disabled:cursor-not-allowed disabled:opacity-40"
@@ -795,6 +872,17 @@ export function Runbooks() {
                       )}
                     </div>
                   </div>
+                  {/* What a delete does, beside the armed confirm (R5-D24). */}
+                  {pendingDelete === rb.id && (
+                    <div
+                      data-testid={`runbook-delete-confirm-${rb.id}`}
+                      role="alert"
+                      className="mt-2 text-[11.5px] leading-[1.45] text-danger"
+                    >
+                      Select Confirm delete to remove the runbook “{rb.title}”. The model then stops
+                      citing it. You cannot undo this.
+                    </div>
+                  )}
                 </div>
                 );
               })}

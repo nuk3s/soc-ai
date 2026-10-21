@@ -15,6 +15,7 @@ import { dismissLead, getLeads, huntLead, promoteLead, reopenLead, type Lead } f
 import {
   ACTION_REOPEN,
   PILL_CLOSED_BY_HUNT,
+  PILL_CLOSED_ON_VERDICTS,
   PILL_DISMISSED,
   PILL_HUNTED,
   PILL_IN_PROGRESS,
@@ -273,10 +274,11 @@ describe('LeadsStrip tabs', () => {
     // F9: the legend said the analyst decides every close, and every lead on
     // prod read "closed by soc-ai". The words are true for both closers.
     expect(legend.textContent).toBe(
-      'New: nobody has acted. In progress: a hunt is running. ' +
-        'Hunted: the hunt finished, and the lead waits on a decision. ' +
-        'Closed: an analyst dismissed the lead or opened an investigation on it, or a clean ' +
-        'hunt closed it.',
+      'Needs decision: the lead is New or Hunted, and it waits on you. ' +
+        'In progress: a hunt is running. ' +
+        'Closed: an analyst dismissed the lead or opened an investigation on it. soc-ai also closes ' +
+        'a lead when its hunt finds no threat, or when every threat finding of the hunt that names an ' +
+        'entity has a verdict.',
     );
   });
 
@@ -284,10 +286,10 @@ describe('LeadsStrip tabs', () => {
     vi.mocked(getLeads).mockResolvedValue([]);
     mount();
     const tab = await screen.findByRole('button', { name: 'Closed' });
-    expect(tab.getAttribute('title')).toMatch(/a clean hunt closed/);
+    expect(tab.getAttribute('title')).toMatch(/a hunt closed when it found no threat/);
     fireEvent.click(tab);
     await waitFor(() =>
-      expect(screen.getByText(/no clean hunt closed one/)).toBeTruthy(),
+      expect(screen.getByText(/soc-ai closed none/)).toBeTruthy(),
     );
   });
 
@@ -305,8 +307,9 @@ describe('LeadsStrip tabs', () => {
     mount();
     const header = await screen.findByTestId('leads-heading');
     const title = header.getAttribute('title') ?? '';
-    expect(title).toContain('A lead forms at a live weight of 0.85 across two or more types.');
-    expect(title).toContain('A finding with no benign baseline forms alone.');
+    expect(title).toContain('A lead forms in three cases.');
+    expect(title).toContain('Two or more types reach a live weight of 0.85.');
+    expect(title).toContain('One finding has no benign baseline.');
     expect(title).toContain('marked one signal, repeated');
   });
 });
@@ -507,10 +510,29 @@ describe('LeadsStrip state pills', () => {
     mount();
     const row = await screen.findByTestId('lead-14');
     fireEvent.click(within(row).getByRole('button', { name: LEAD_ACTION.huntAgain }));
-    expect(within(row).getByText(/A hunt on this lead already finished/)).toBeTruthy();
+    // R3-I5: the confirm links the hunt on record and names the close.
+    expect(within(row).getByTestId('lead-hunt-again-confirm-14').textContent).toBe(
+      'This lead has a hunt. Read that hunt first. soc-ai closes the lead when the new hunt ' +
+        'finds no threat, or when every threat finding of the hunt that names an entity has a verdict.',
+    );
     expect(huntLead).not.toHaveBeenCalled();
     fireEvent.click(within(row).getByRole('button', { name: 'Start another hunt' }));
     await waitFor(() => expect(huntLead).toHaveBeenCalledWith(14));
+  });
+
+  // V1-H4: Escape closed the Dismiss form and left the Hunt again confirm open.
+  it('closes the Hunt again confirm on Escape', async () => {
+    vi.mocked(getLeads).mockResolvedValue([HUNTED]);
+    mount();
+    const row = await screen.findByTestId('lead-14');
+    const again = within(row).getByRole('button', { name: LEAD_ACTION.huntAgain });
+    fireEvent.click(again);
+    // The keyboard lands in the confirm, on the control that starts nothing.
+    expect(document.activeElement).toBe(within(row).getByRole('button', { name: 'Cancel' }));
+    fireEvent.keyDown(document.activeElement as Element, { key: 'Escape' });
+    expect(within(row).queryByTestId('lead-hunt-again-confirm-14')).toBeNull();
+    expect(document.activeElement).toBe(again);
+    expect(huntLead).not.toHaveBeenCalled();
   });
 
   // C9: the form chose "A benign repeat" after a clean hunt, and one click
@@ -781,5 +803,88 @@ describe('a lead the hunt closed', () => {
     expect(leadState({ status: 'hunting', hunt_status: 'cancelled' })).toBe('hunted');
     expect(leadState({ status: 'hunting', hunt_status: 'interrupted' })).toBe('hunted');
     expect(leadState({ status: 'open', hunt_status: 'error', hunt_id: 'H-1' })).toBe('hunted');
+  });
+});
+
+// R3-D5: a lead soc-ai closed on its hunt's verdicts read "Promoted", the
+// word of an analyst's act, and the row named no closer.
+describe('a lead soc-ai closed on the verdicts of its hunt', () => {
+  const closed: Lead = {
+    ...LEAD,
+    status: 'promoted',
+    shadow: false,
+    hunt_id: 'H-5',
+    hunt_status: 'complete',
+    hunt_outcome: 'threats',
+    hunt_outcome_label: '2 of 5 findings are threats',
+    investigation_id: 'INV-1',
+    closed_by_hunt_verdicts: true,
+  } as Lead;
+
+  it('names the reason on the pill and soc-ai on the row', async () => {
+    vi.mocked(getLeads).mockResolvedValue([closed]);
+    mount();
+    const pill = await screen.findByTestId('lead-status');
+    expect(pill.textContent).toBe('Closed. 2 of 5 findings are threats.');
+    expect(pill.getAttribute('title')).toBe(PILL_CLOSED_ON_VERDICTS);
+    expect(screen.getByText('closed by soc-ai')).toBeTruthy();
+  });
+
+  // Control: an analyst's promotion keeps its word.
+  it('keeps Promoted on a lead an analyst closed', async () => {
+    vi.mocked(getLeads).mockResolvedValue([{ ...closed, closed_by_hunt_verdicts: false }]);
+    mount();
+    expect((await screen.findByTestId('lead-status')).textContent).toBe('Promoted');
+    expect(screen.queryByText('closed by soc-ai')).toBeNull();
+  });
+});
+
+// R3-D14 and R3-I4: the Dismiss form did not close on Escape, and its confirm
+// row did not say that the lead's hunt found a threat.
+describe('the Dismiss form of a lead row', () => {
+  const hunted: Lead = {
+    ...LEAD,
+    shadow: false,
+    status: 'hunting',
+    hunt_id: 'H-9',
+    hunt_status: 'complete',
+    hunt_outcome: 'threats',
+    hunt_outcome_label: 'Threat found',
+    hunt_threat_count: 1,
+  } as Lead;
+
+  it('closes on Escape', async () => {
+    vi.mocked(getLeads).mockResolvedValue([hunted]);
+    mount();
+    fireEvent.click(await screen.findByRole('button', { name: LEAD_ACTION.dismiss }));
+    const select = await screen.findByLabelText('Reason');
+    expect(document.activeElement).toBe(select);
+    fireEvent.keyDown(select, { key: 'Escape' });
+    await waitFor(() => expect(screen.queryByLabelText('Reason')).toBeNull());
+  });
+
+  it('names the threat the hunt found before the analyst dismisses', async () => {
+    vi.mocked(getLeads).mockResolvedValue([hunted]);
+    mount();
+    fireEvent.click(await screen.findByRole('button', { name: LEAD_ACTION.dismiss }));
+    const warning = await screen.findByTestId('dismiss-threat-warning');
+    expect(warning.textContent).toBe(
+      'The hunt of this lead found a threat. Dismiss closes the lead. The threat finding stays ' +
+        'open on the hunt. Open the hunt',
+    );
+    expect(within(warning).getByRole('link', { name: 'Open the hunt' }).getAttribute('href')).toBe(
+      '/hunts/H-9',
+    );
+  });
+
+  // Control: a clean hunt carries no warning.
+  it('carries no warning after a clean hunt', async () => {
+    vi.mocked(getLeads).mockResolvedValue([
+      { ...hunted, hunt_outcome: 'clean', hunt_outcome_label: 'No threat found', hunt_threat_count: 0 },
+    ]);
+    mount();
+    fireEvent.click(await screen.findByRole('button', { name: LEAD_ACTION.dismiss }));
+    await screen.findByLabelText('Reason');
+    expect(screen.queryByTestId('dismiss-threat-warning')).toBeNull();
   });
 });

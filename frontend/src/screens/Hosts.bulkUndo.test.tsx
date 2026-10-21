@@ -6,9 +6,9 @@
 // The list is one row per machine now, and a row carries no per-field lanes.
 // The declare writes the primary address of each selected machine, and the
 // value each address held before is read off its own dossier.
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Dossier, DossierSummary, MachineRow, MachineSummary } from '../lib/types';
 
 vi.mock('../lib/api', async (importOriginal) => ({
@@ -137,6 +137,10 @@ beforeEach(() => {
   vi.mocked(listSavedViews).mockReset().mockResolvedValue([]);
 });
 
+afterEach(() => {
+  vi.useRealTimers();
+});
+
 const mount = () =>
   render(
     <MemoryRouter initialEntries={['/hosts']}>
@@ -146,7 +150,7 @@ const mount = () =>
 
 async function declareLowOnBoth() {
   mount();
-  fireEvent.click(await screen.findByLabelText(/select all hosts/i));
+  fireEvent.click(await screen.findByLabelText(/select every machine on this page/i));
   fireEvent.change(await screen.findByDisplayValue('choose'), { target: { value: 'low' } });
   fireEvent.click(screen.getByRole('button', { name: /declare \(2\)/i }));
 }
@@ -156,7 +160,7 @@ describe('Hosts — bulk declare', () => {
     mount();
     const toolbar = await screen.findByTestId('hosts-toolbar');
     expect(toolbar.className).not.toContain('sticky');
-    fireEvent.click(await screen.findByLabelText(/select all hosts/i));
+    fireEvent.click(await screen.findByLabelText(/select every machine on this page/i));
     await waitFor(() => expect(screen.getByTestId('hosts-toolbar').className).toContain('sticky'));
   });
 
@@ -193,5 +197,58 @@ describe('Hosts — bulk declare', () => {
     expect(clearDossierOverride).not.toHaveBeenCalledWith('198.51.100.33', 'criticality');
     expect(setDossierOverride).not.toHaveBeenCalled();
     expect(await screen.findByText(/1 machine kept the declaration/)).toBeTruthy();
+  });
+});
+
+// Dogfood 2026-10-19 (R4-D14, R4-I5): the result line and its Undo sat at the
+// top of the screen, out of view for an operator who scrolled down to select,
+// and a 6 s timer took the line away. The result now sits in the sticky bar
+// and stays there until the operator closes it.
+describe('Hosts — the bulk result stays in the sticky bar', () => {
+  it('shows the result and its Undo in the sticky bar after the selection clears', async () => {
+    await declareLowOnBoth();
+    const result = await screen.findByTestId('bulk-result');
+    // Every address took the value, so the selection is empty now.
+    await waitFor(() => expect(screen.queryByTestId('list-toolbar-selection')).toBeNull());
+    const toolbar = screen.getByTestId('hosts-toolbar');
+    expect(toolbar.contains(result)).toBe(true);
+    expect(toolbar.className).toContain('sticky');
+    expect(result.textContent).toMatch(/Declared criticality "low" on 2 of 2 machines\./);
+    expect(within(result).getByTestId('bulk-undo')).toBeTruthy();
+  });
+
+  it('keeps the result past any timer', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    await declareLowOnBoth();
+    await screen.findByTestId('bulk-result');
+    // Two steps: the first act lets the effects of the result commit, so a
+    // timer they start exists before the clock moves.
+    await act(async () => {});
+    await act(async () => {
+      vi.advanceTimersByTime(60_000);
+    });
+    expect(screen.getByTestId('bulk-result').textContent).toMatch(/Declared criticality "low"/);
+    expect(screen.getByTestId('bulk-undo')).toBeTruthy();
+  });
+
+  it('runs Undo after the selection cleared', async () => {
+    await declareLowOnBoth();
+    await waitFor(() => expect(screen.queryByTestId('list-toolbar-selection')).toBeNull());
+    fireEvent.click(await screen.findByTestId('bulk-undo'));
+    await waitFor(() => expect(clearDossierOverride).toHaveBeenCalledWith('198.51.100.29', 'criticality'));
+    // The undo result replaces the declare result in the same place.
+    await waitFor(() =>
+      expect(screen.getByTestId('bulk-result').textContent).toMatch(/Undid criticality "low" on 2 machines\./),
+    );
+  });
+
+  it('goes away when the operator closes it, and the bar stops sticking', async () => {
+    await declareLowOnBoth();
+    const result = await screen.findByTestId('bulk-result');
+    await waitFor(() => expect(screen.queryByTestId('list-toolbar-selection')).toBeNull());
+    fireEvent.click(within(result).getByRole('button', { name: 'Close the bulk result' }));
+    expect(screen.queryByTestId('bulk-result')).toBeNull();
+    expect(screen.queryByTestId('bulk-undo')).toBeNull();
+    expect(screen.getByTestId('hosts-toolbar').className).not.toContain('sticky');
   });
 });

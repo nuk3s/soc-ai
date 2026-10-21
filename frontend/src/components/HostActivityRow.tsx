@@ -28,10 +28,20 @@ import { LoadingInline } from './States';
  * the line: an auto-scaled chart with no scale on it makes a quiet hour look
  * exactly like a busy one.
  *
- * The server sets no `extended_bounds`, so the series does not necessarily span
- * the window. Nothing here assumes a bucket count.
+ * The server pads the series to the whole window. An older server sends a
+ * series that starts at the first active bucket. Nothing here assumes a
+ * bucket count. The right label is the END of the newest bucket: a one-bucket
+ * series read the same instant at both ends (dogfood 2026-10-19, R4-D8).
  */
-function VolumeChart({ volume, range }: { volume: VolumePoint[]; range: HostActivityRange }) {
+function VolumeChart({
+  volume,
+  range,
+  datasets,
+}: {
+  volume: VolumePoint[];
+  range: HostActivityRange;
+  datasets?: string[];
+}) {
   const W = 260;
   const H = 54;
   const peak = volume.reduce((max, point) => Math.max(max, point.events), 0);
@@ -53,6 +63,9 @@ function VolumeChart({ volume, range }: { volume: VolumePoint[]; range: HostActi
   const last = coords[coords.length - 1].split(',');
   const first = volume[0];
   const newest = volume[volume.length - 1];
+  const bucketMs = range === '7d' ? 86_400_000 : 3_600_000;
+  // The newest bucket may still be open. Its end is then now.
+  const end = new Date(Math.min(new Date(newest.ts).getTime() + bucketMs, Date.now())).toISOString();
 
   return (
     <div className="px-[15px] py-3.5">
@@ -85,14 +98,27 @@ function VolumeChart({ volume, range }: { volume: VolumePoint[]; range: HostActi
         />
       </svg>
       <div className="mt-2 flex items-baseline justify-between gap-2 font-mono text-[11px] text-faint">
-        <span>{absTime(first.ts)}</span>
-        <span title="The chart is scaled to its own busiest bucket">
+        <span data-testid="volume-start">{absTime(first.ts)}</span>
+        <span title="The bottom of the chart is zero. The top is the busiest interval.">
           peak {peak.toLocaleString()}
         </span>
-        <span>{absTime(newest.ts)}</span>
+        <span data-testid="volume-end">{absTime(end)}</span>
       </div>
+      {/* The flow datasets behind the counts. The page never named them
+          (dogfood 2026-10-19, R4-D21). */}
+      {datasets && datasets.length > 0 && (
+        <div data-testid="volume-datasets" className="mt-1 text-[11px] text-faint">
+          The counts come from {joinWords(datasets)}.
+        </div>
+      )}
     </div>
   );
+}
+
+/** "a", "a and b", "a, b and c". */
+function joinWords(items: readonly string[]): string {
+  if (items.length <= 1) return items.join('');
+  return `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`;
 }
 
 // ---- the users card ---------------------------------------------------------
@@ -110,19 +136,27 @@ function UsersCard({
   users,
   truncated,
   range,
+  datasets,
 }: {
   users: HostActivity['users'];
   /** The server cut the ranked list — the wire's own flag, never re-inferred. */
   truncated: boolean;
   range: HostActivityRange;
+  /** The host-log datasets the list reads. Absent on an older server. */
+  datasets?: string[];
 }) {
+  // The card names the datasets it reads. It read Linux logons only and said
+  // "no host logs" on a Windows domain controller (dogfood 2026-10-19, R4-D5).
+  const named = datasets && datasets.length > 0 ? joinWords(datasets) : null;
   if (users === null) {
     return (
       <div className="px-[15px] py-3.5">
-        <div className="text-[12.5px] text-dim">No host-log users in this window.</div>
+        <div className="text-[12.5px] text-dim">No logon in this window.</div>
         <div className="mt-1 text-[11.5px] leading-[1.5] text-faint">
-          Nobody authenticated in the last {range}, or the grid holds no host logs for this address.
-          This view cannot tell the two apart.
+          {named
+            ? `This card reads ${named}. ${datasets!.length === 1 ? 'This dataset holds' : 'These datasets hold'} no logon for this address in the last ${range}.`
+            : `The host logs hold no logon for this address in the last ${range}.`}{' '}
+          A host with no logon and a host that ships no host logs both show this line.
         </div>
       </div>
     );
@@ -156,6 +190,11 @@ function UsersCard({
       {truncated && (
         <div className="px-[15px] py-2 text-[11px] text-faint">
           The {users.length} busiest accounts in this window.
+        </div>
+      )}
+      {named && (
+        <div data-testid="users-datasets" className="px-[15px] py-2 text-[11px] text-faint">
+          From {named}.
         </div>
       )}
     </div>
@@ -296,13 +335,18 @@ export function HostActivityRow({
           <Panel className={cn(loading && 'opacity-60')}>
             <PanelHeader icon={<ActivityIcon size={15} />} title={`Volume · ${range}`} />
             <div data-testid="host-volume">
-              <VolumeChart volume={activity.volume} range={range} />
+              <VolumeChart volume={activity.volume} range={range} datasets={activity.conn_datasets} />
             </div>
           </Panel>
           <Panel className={cn(loading && 'opacity-60')}>
             <PanelHeader icon={<Users size={15} />} title={`Users · ${range}`} />
             <div data-testid="host-users">
-              <UsersCard users={activity.users} truncated={activity.users_truncated} range={range} />
+              <UsersCard
+                users={activity.users}
+                truncated={activity.users_truncated}
+                range={range}
+                datasets={activity.auth_datasets}
+              />
             </div>
           </Panel>
         </div>

@@ -188,7 +188,7 @@ async def recorded_run(
             alert_id,
         )
         timeout_payload = {
-            "message": f"investigation exceeded {run_timeout}s wall-clock limit",
+            "message": f"The investigation passed its wall-clock limit of {run_timeout} s.",
             "type": "TimeoutError",
             "phase": "whole_run_backstop",
             "hint": (
@@ -225,15 +225,15 @@ async def recorded_run(
                 _record_terminal_error(
                     {
                         "message": (
-                            "investigation cancelled before reaching a verdict "
-                            "(client disconnect, shutdown, or an outer wall-clock cap)"
+                            "The investigation stopped before it reached a verdict. A "
+                            "client disconnect, a shutdown or an outer time limit stopped it."
                         ),
                         "type": "CancelledError",
                         "phase": "run_cancelled",
                         "hint": (
-                            "if this was an auto-triage sweep, the per-target cap "
-                            "fired; it is floored above investigation_run_timeout_s "
-                            "so the whole-run backstop reports the real cause first."
+                            "In an auto-triage sweep, the per-target cap stopped the "
+                            "run. That cap is above investigation_run_timeout_s. The "
+                            "whole-run limit therefore fires first and names the cause."
                         ),
                     }
                 )

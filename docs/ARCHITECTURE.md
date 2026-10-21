@@ -21,8 +21,9 @@ diagram. It describes `main` as of the 1.5 line.
   investigations, hunts, backtests, chat threads, config overrides, discovered
   internal identifiers, detection overrides, and operator runbooks.
 - The local database does not hold the audit trail. soc-ai writes the
-  tamper-evident audit trail to Elasticsearch. The application cannot edit that
-  index in place. Read *Audit pipeline* below.
+  tamper-evident audit trail to Elasticsearch. A hash chain makes an edit visible.
+  With the least-privilege credential that SAFETY_MODEL.md recommends, the
+  application also cannot edit that index in place. Read *Audit pipeline* below.
 
 ## Request surface (`soc_ai/api/routes.py`)
 
@@ -45,7 +46,7 @@ the report. The analyst executes them through the actions API at
 > `soc_ai/api/security.py` enforces this. An admin-only route sits behind a
 > separate admin gate.
 >
-> CORS is scoped to `CORS_ALLOW_ORIGINS`, and it falls back to the configured
+> soc-ai scopes CORS to `CORS_ALLOW_ORIGINS`, and it falls back to the configured
 > `SO_HOST`. `"*"` is a last-resort fallback only, and `soc_ai/main.py` logs a
 > warning for it. Deploy soc-ai behind TLS on a trusted interface. Read
 > `docs/SAFETY_MODEL.md` and `SECURITY.md`.
@@ -81,9 +82,9 @@ The name in the code, and the real role:
 | Code name | Actual role |
 |---|---|
 | `build_synth_first_agent` ("synthesizer") | The primary verdict writer on the settle path. It has no tools by design. The loop path uses the sibling `build_synthesizer` over the transcript. A failure path emits a deterministic fallback. |
-| `targeted_investigator` / Phase D | A deterministic dispatcher. It is no agent and no LLM. It runs the one tool that the synth named. The code is `soc_ai/agent/targeted_investigator.py`. |
-| `build_investigator` | The investigation loop. It is a full tool-equipped agent. It is entered on a definitely-investigate decision, on an `investigate_when_unsure` trigger, or on `fast_triage_enabled=false`. That setting forces the loop for every alert. |
-| Chat / Hunt agents | They share the read-tool surface from `soc_ai/agent/toolset.py`. Chat adds `propose_verdict` and rule tuning. Hunt uses wider windows and writes a `HuntReport`. |
+| `targeted_investigator` / Phase D | A deterministic dispatcher. It is no agent and no LLM. It runs the one tool that the synthesizer named. The code is `soc_ai/agent/targeted_investigator.py`. |
+| `build_investigator` | The investigation loop. It is a full tool-equipped agent. The pipeline enters it on a definitely-investigate decision, on an `investigate_when_unsure` trigger, or on `fast_triage_enabled=false`. That setting forces the loop for every alert. |
+| Chat / Hunt agents | They share the read-tool surface from `soc_ai/agent/toolset.py`. Every chat agent also has the rule tuning tool. The investigation chat adds `propose_verdict`. The general chat, the host chat and the lead chat add `propose_hunt`. Hunt uses wider windows and writes a `HuntReport`. |
 | Oracle | An opt-in second opinion over a raw HTTP completion. It is not a pydantic-ai agent. |
 
 ### Synth-first stage detail
@@ -93,8 +94,8 @@ The name in the code, and the real role:
   produces an `EnrichedAlertContext`.
 - **Phase B, decision template:** `match_decision_template()` in
   `soc_ai/agent/decision_templates.py` runs ordered pure-function templates over
-  the enriched context. It can hand the synth a *candidate verdict*. That
-  candidate is an anchor, and the synth can keep it, refine it or override it.
+  the enriched context. It can hand the synthesizer a *candidate verdict*. That
+  candidate is an anchor, and the synthesizer can keep it, refine it or override it.
 - **The definitely-investigate check, before Phase C:** `_definitely_investigate()`
   tests 3 triggers: a malware or exploit signal on the rule, a concurrent host
   threat-context flag, or a provisional benign decision-template match. This
@@ -109,7 +110,7 @@ The name in the code, and the real role:
   It emits `synth_round1_skipped` with reason `cannot_settle`, and it enters the
   loop with `loop_reason="round1_cannot_settle"`. The same function decides
   whether `_should_investigate()` accepts a round-1 verdict, so the two cannot
-  disagree. The check yields if nothing else would produce a verdict.
+  disagree. The check does not skip round 1 if nothing else would produce a verdict.
   That is the `investigate_when_unsure=false` case with no forced loop. The
   `synth_round1_always` setting restores the call on every alert.
 - **Template authority:** a candidate verdict is `dispositive` or `provisional`.
@@ -129,11 +130,11 @@ The name in the code, and the real role:
   then dispatches that single tool deterministically, with no model call.
   Synthesis round 2 then reads the combined evidence. Phase D runs at most
   `phase_d_max_rounds` rounds of gap, dispatch and re-synthesize. The default is
-  1. On a round that is not the last one, the synth can chain one more gap, for
+  1. On a round that is not the last one, the synthesizer can chain one more gap, for
   example `t_get_event_raw` and then `t_decode_payload`.
 - **The investigation loop, optional:** it is a full tool-equipped agent. Any of
-  4 conditions enters it. `_definitely_investigate` returned true, and the loop
-  then skipped round 1. `_round1_can_settle` returned false, and the loop again
+  4 conditions enters it. `_definitely_investigate` returned true, and the pipeline
+  skipped round 1. `_round1_can_settle` returned false, and the pipeline again
   skipped round 1. `_should_investigate` triggers on an evidence gap with the
   `investigate_when_unsure` setting on. `fast_triage_enabled=false` forces
   the loop for every alert, whatever the round-1 confidence, with loop_reason
@@ -153,12 +154,12 @@ none. The run row stores the class in `run_class`.
 | Class | What the run does | Who gets it |
 |---|---|---|
 | `rule_prior` | No model call. The alert takes the verdict of its rule's latest model run. | The scheduler, when the rule prior covers the alert in live mode. |
-| `cheap` | One synthesis request on the prefetch. No tool loop. No Oracle. | The scheduler, when a dispositive template cleared the alert. |
+| `cheap` | One synthesis request over the enriched alert context. No tool loop. No Oracle. | The scheduler, when a dispositive template cleared the alert. |
 | `standard` | The tool loop at the standard budget. The prompt and the tool schemas fit the alert. | An analyst's Investigate, a re-run, a bulk selection, a promotion, a hunt. The scheduler for every other alert. |
 | `deep` | The tool loop with the whole prompt and every tool schema. | The analyst's Deep re-run. |
 
 The rungs of the ladder run in order. Each rung is cheaper than the next. A
-step runs only if a cheaper step did not decide the alert.
+rung runs only if a cheaper rung did not decide the alert.
 
 1. **Inheritance:** a model verdict on the same rule, source, destination and
    host in the last 7 days covers the alert. A pipeline fallback and a
@@ -178,7 +179,7 @@ entered the loop is standard. The report carries the reason in
 ### The rule prior
 
 The rule prior covers a scheduled alert with the verdict of its rule's latest
-model run. It is the one rung that can hide a new case, so six safeguards hold
+model run. It is the one rung that can hide a new case, so six safeguards limit
 it. The code is `soc_ai/agent/rule_prior.py`.
 
 1. Both endpoints are inside the estate. An alert with an external endpoint or
@@ -209,10 +210,10 @@ alerts, the agreements, the disagreements and the suspension per rule.
 The pipeline runs the web search that the loop used to spend a turn on. If an
 external indicator has no enrichment answer, the pipeline searches it before
 the loop. It puts the result in the loop's message. The loop does not repeat
-the search. A failed search leaves the condition, and the loop can still search.
+the search. A failed search leaves the condition in place, and the loop can still search.
 
 The standard class sends the prompt sections and the tool schemas that the
-alert's planes make useful. A plane is a fact about the prefetch. The planes are
+alert's planes make useful. A plane is a fact about the enriched alert context. The planes are
 a flow, an external endpoint, an internal pair, host logs or an attack-class rule,
 a payload, a file hash, ICMP and a decoy. A flow to the internet gets no Kerberos
 rule and no PsExec example. The other investigator tools stay registered with
@@ -239,13 +240,13 @@ Oracle. The default is `shadow`.
 Three reasons send a verdict under the uncertainty rule:
 
 - `confidence_in_band`: the confidence is in the gate band, from 0.4 to below
-  0.7. A coercing gate parks a verdict it could not ground at 0.4. The gates let
+  0.7. A coercing gate sets a verdict that it could not ground to a confidence of 0.4. The gates let
   a verdict at 0.7 stand as confident.
 - `template_split`: the decision template and the model disagree.
 - `deep_needs_more_info`: a deep run ended with needs_more_info.
 
 A verdict that the template and the model agree on at 0.7 or above never goes
-to the Oracle. A cheap run and a rule-prior run never go under either rule. The opt-ins
+to the Oracle. A cheap run and a rule-prior run never go to the Oracle under either rule. The opt-ins
 `oracle_escalate_needs_more_info`, `oracle_escalate_malware_non_tp`,
 `oracle_skip_after_confident_loop` and `oracle_escalate_below_confidence` narrow
 both rules. They never add an escalation. The `oracle_escalation` audit row names
@@ -253,8 +254,8 @@ the reason and the rule mode.
 
 An Oracle verdict that changes the local verdict needs evidence. The Oracle
 must cite an id that resolves to evidence that the local run retrieved beyond
-the alert. That evidence is a prefetched event or a document in the tool results
-of the loop. With the
+the alert. That evidence is an event in the enriched alert context or a document in the
+tool results of the loop. With the
 tool loop on, a successful tool call of its own also counts. Without evidence,
 the `oracle_adjudication` row records the answer as an opinion with
 `override_withheld`. The local verdict stands, and the auto-acknowledge never
@@ -388,10 +389,17 @@ shows a trace.
 ## Audit pipeline (`soc_ai/audit/`)
 
 `AuditLogger` mirrors every `StepEvent` to a date-stamped Elasticsearch index,
-`{AUDIT_INDEX_ALIAS}-YYYY.MM.dd`. An audit write fails open. soc-ai logs a
-write error locally and drops the event, and the in-flight investigation
-continues. A local fallback queue is a noted follow-up. Optional regex redaction
-in `audit/redact.py` runs in place if `AUDIT_REDACT=true`.
+`{AUDIT_INDEX_ALIAS}-YYYY.MM.dd`. A failed audit write for a read, a triage or
+an enrichment fails open. soc-ai logs the write error locally and drops the
+event, and the in-flight investigation continues. A local fallback queue is a
+noted follow-up.
+
+A failed audit write for an action that changes SO state fails closed by
+default. Those actions are ack, escalate, comment and auto-ack. `AuditLogger`
+raises `AuditWriteError`, and the action aborts. Set `AUDIT_FAIL_CLOSED=false`
+to make these writes fail open too.
+
+Optional regex redaction in `audit/redact.py` runs in place if `AUDIT_REDACT=true`.
 [SAFETY_MODEL.md](SAFETY_MODEL.md) holds the schema and the redaction policy.
 
 ## MCP server (`soc_ai/mcp_server/`)
@@ -411,7 +419,8 @@ The operator downloads those two files by hand.
 The `soc-ai blocklists refresh` CLI subcommand refreshes the blocklists and the
 cloud prefixes.
 
-Every enrichment source is wrapped, so a missing or stale source degrades triage
+soc-ai wraps every enrichment source, so a missing or stale source degrades triage
+
 and never blocks it. MISP is the one optional network lookup, if you configure
 it.
 
@@ -420,9 +429,13 @@ it.
 The harness sits outside the request path. It samples real alerts, and it can
 inject synthetic true-positive scenarios into a lab index. It runs the triage
 pipeline, sanitizes the output, and grades it against the Oracle. It reaches
-the Oracle through the same LiteLLM gateway. This harness is the only
-component that calls a third-party model. That call is opt-in, and soc-ai
+the Oracle through the same LiteLLM gateway. That call is opt-in, and soc-ai
 sanitizes and refuse-gates the data before it leaves.
+
+The request path can also call a third-party model, in 2 cases. The first case is the opt-in Oracle second
+opinion, which has its own sanitizer and refuse gate. The second case is an
+analyst model that you point at a cloud provider. `ANALYST_CLOUD_REDACTION`
+covers that second case. [SAFETY_MODEL.md](SAFETY_MODEL.md) describes both.
 
 [`soc_ai/eval/synth_scenarios/README.md`](https://github.com/nuk3s/soc-ai/blob/main/soc_ai/eval/synth_scenarios/README.md)
 documents the synthetic-scenario catalogue that the harness can inject.

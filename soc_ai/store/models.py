@@ -1758,3 +1758,25 @@ class RulePriorDecision(Base):
     agree: Mapped[bool | None] = mapped_column(Boolean, default=None)
     cleared_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
     cleared_by: Mapped[str | None] = mapped_column(String(80), default=None)
+
+
+class GridGap(Base):
+    """One span of hours the grid held no readable data for soc-ai.
+
+    ``source`` is ``probe`` when the health probe found Elasticsearch
+    unreadable, and ``sweep`` when the grid answered and the profile sweep
+    found one plane dark on most hosts at once. ``plane`` names the dimension
+    of a sweep gap and is NULL for a probe gap. ``ended_at`` is NULL while the
+    gap is open. The store module is :mod:`soc_ai.store.grid_gaps`.
+    """
+
+    __tablename__ = "grid_gaps"
+    __table_args__ = (Index("ix_grid_gaps_window", "started_at", "ended_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source: Mapped[str] = mapped_column(String(16))
+    plane: Mapped[str | None] = mapped_column(String(64), default=None)
+    started_at: Mapped[datetime] = mapped_column(DateTime())
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+    detail: Mapped[str | None] = mapped_column(Text, default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())

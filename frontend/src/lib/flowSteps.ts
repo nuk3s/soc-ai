@@ -156,6 +156,7 @@ export function investigationFlow(
     | 'supersededBy'
     | 'fallback'
     | 'id'
+    | 'failure'
   >,
   opts: InvestigationFlowOptions = {},
 ): FlowStep[] {
@@ -208,15 +209,35 @@ export function investigationFlow(
   } else if (failed) {
     verdict = inv.supersededBy
       ? { key: 'verdict', label: 'Verdict', state: 'next', title: 'A newer run replaced this one.' }
-      : { key: 'verdict', label: 'Verdict', state: 'next', control: again };
+      : inv.status === 'error' && inv.failure?.permanent
+        ? // The failure panel says no re-run can help, so the strip names no
+          // Re-run either (R2-D4).
+          {
+            key: 'verdict',
+            label: 'Verdict',
+            state: 'next',
+            title: 'A re-run cannot change the recorded cause.',
+          }
+        : { key: 'verdict', label: 'Verdict', state: 'next', control: again };
   } else if (!SETTLED.has(inv.verdict)) {
-    verdict = {
-      key: 'verdict',
-      label: 'Verdict',
-      state: 'next',
-      note: verdictNote(inv.verdict),
-      control: fromHunt ? again : 'Request more info',
-    };
+    verdict = inv.supersededBy
+      ? // A newer run answered or replaced this one, and every action here is
+        // off. The strip offered Request more info next to "Its actions are
+        // off" (V1-A7).
+        {
+          key: 'verdict',
+          label: 'Verdict',
+          state: 'next',
+          note: verdictNote(inv.verdict),
+          title: 'A newer run replaced this one. Its actions are off.',
+        }
+      : {
+          key: 'verdict',
+          label: 'Verdict',
+          state: 'next',
+          note: verdictNote(inv.verdict),
+          control: fromHunt ? again : 'Request more info',
+        };
   } else {
     verdict = { key: 'verdict', label: 'Verdict', state: 'done', note: verdictNote(inv.verdict) };
   }
@@ -227,7 +248,14 @@ export function investigationFlow(
     const pending = inv.actions.filter((a) => a.applied !== true && a.dismissed !== true);
     const applied =
       opts.actedHere || inv.actions.some((a) => a.applied === true) || inv.alertAcked === true;
-    if (applied) {
+    // A write other than the ack still waits. An acknowledged alert does not
+    // settle an escalate: after an override to true positive the strip read
+    // the old auto-ack as the action (R2-D22).
+    const waiting = pending.filter((a) => a.tag !== 'ack');
+    if (!opts.actedHere && !inv.supersededBy && waiting.length > 0) {
+      action.state = 'next';
+      action.control = controlWords(waiting.map((a) => a.tag));
+    } else if (applied) {
       action.state = 'done';
     } else if (inv.supersededBy) {
       action.title = 'A newer run replaced this one. Its actions are off.';
@@ -260,30 +288,80 @@ function subjectFindings(findings: FlowFinding[]): FlowFinding[] {
 
 const HUNT_STOPPED = new Set(['error', 'cancelled', 'interrupted']);
 
+/** The finding the catalog composer writes for a query that failed. */
+function isRunFailureFinding(f: FlowFinding): boolean {
+  return f.category === 'visibility_gap' && (f.title ?? '').endsWith(': could not run');
+}
+
+/** A hunt that ended with no result: the server says could_not_run, or every
+ *  finding records a failed query. Its stepper must not read as a clean hunt. */
+function couldNotRun(hunt: FlowHunt): boolean {
+  if (hunt.outcome === 'could_not_run') return true;
+  const findings = hunt.findings ?? [];
+  return findings.length > 0 && findings.every(isRunFailureFinding);
+}
+
+/** "1 of 2 findings": the subject findings whose investigation ended. The
+ *  step counts findings, the way the hunt label does. Two findings can share
+ *  one investigation, so the count of runs can be lower (R3-D4). */
+function findingsNote(investigated: number, total: number): string {
+  return `${investigated} of ${total === 1 ? '1 finding' : `${total} findings`}`;
+}
+
+/** The hover sentence when findings share an investigation, or undefined.
+ *  "2 findings share 1 investigation." */
+function sharedRunsTitle(findings: number, runs: number): string | undefined {
+  if (runs <= 0 || runs >= findings) return undefined;
+  return `${findings} findings share ${runs === 1 ? '1 investigation' : `${runs} investigations`}.`;
+}
+
+/** The step sentence when no open threat finding can start an investigation:
+ *  each one cites no event. The card turns its control off for that reason,
+ *  and the step offered the control the card refused (V1-H1). */
+const NO_EVENT_TO_INVESTIGATE =
+  'No threat finding without an investigation cites an event. An investigation needs at least one event.';
+
+/** The investigations of a list of findings, once each. Two findings can
+ *  share one investigation, and its actions wait once. */
+function distinctRuns(invs: FindingInvestigation[]): FindingInvestigation[] {
+  const seen = new Set<string>();
+  return invs.filter((i) => {
+    if (seen.has(i.id)) return false;
+    seen.add(i.id);
+    return true;
+  });
+}
+
 /** The three steps after a finished hunt, from its findings. */
 function huntTail(hunt: FlowHunt | null, retry: string): FlowStep[] {
   const investigations: FlowStep = { key: 'investigations', label: 'Investigations', state: 'not_yet' };
   const verdicts: FlowStep = { key: 'verdicts', label: 'Verdicts', state: 'not_yet' };
   const actions: FlowStep = { key: 'actions', label: 'Actions', state: 'not_yet' };
   if (!hunt) return [investigations, verdicts, actions];
-  if (HUNT_STOPPED.has(hunt.status)) {
+  if (HUNT_STOPPED.has(hunt.status) || (hunt.status === 'complete' && couldNotRun(hunt))) {
     investigations.state = 'next';
     investigations.control = retry;
     return [investigations, verdicts, actions];
   }
-  const subject = subjectFindings(hunt.findings);
-  const invs = subject.map(findingInvestigation);
-  const phase = typeof hunt.findingsTotal === 'number';
-  const total = phase ? (hunt.findingsTotal as number) : subject.length;
-  const investigated =
-    typeof hunt.findingsInvestigated === 'number'
-      ? hunt.findingsInvestigated
-      : invs.filter((i) => i?.status === 'complete').length;
-  if (hunt.status === 'running' && !phase) {
+  if (hunt.status === 'running') {
+    // The server sends a plan count of 0 on a hunt that has not ended. The
+    // findings arrive with the report.
     investigations.state = 'next';
     investigations.title = 'soc-ai investigates the findings when the hunt ends.';
     return [investigations, verdicts, actions];
   }
+  const subject = subjectFindings(hunt.findings);
+  const invs = subject.map(findingInvestigation);
+  // A plan count of 0 beside threat findings is a hunt the server did not
+  // plan: a hunt from before the phase, or one with the switch off. The
+  // analyst opens each investigation by hand.
+  const phase =
+    typeof hunt.findingsTotal === 'number' && (hunt.findingsTotal > 0 || subject.length === 0);
+  const total = phase ? (hunt.findingsTotal as number) : subject.length;
+  const investigated =
+    phase && typeof hunt.findingsInvestigated === 'number'
+      ? hunt.findingsInvestigated
+      : invs.filter((i) => i?.status === 'complete').length;
   if (total === 0) {
     // A finding that names no threat, an observation or a visibility gap,
     // gives the hunt nothing to investigate. The note says which case it is.
@@ -295,27 +373,37 @@ function huntTail(hunt: FlowHunt | null, retry: string): FlowStep[] {
     return [investigations, verdicts, actions];
   }
   const done = invs.filter((i): i is FindingInvestigation => i?.status === 'complete');
-  investigations.note = `${Math.min(investigated, total)} of ${total} done`;
+  investigations.note = findingsNote(Math.min(investigated, total), total);
   if (investigated < total) {
-    investigations.state = 'next';
     // The hunt investigates its findings. An older server does not, and the
     // analyst opens each investigation by hand.
-    if (!phase) investigations.control = 'Open an investigation';
-    else investigations.title = 'soc-ai investigates each finding.';
+    if (phase) {
+      investigations.state = 'next';
+      investigations.title = 'soc-ai investigates each threat finding.';
+    } else if (subject.some((f) => !findingInvestigation(f) && (f.citations ?? []).length > 0)) {
+      investigations.state = 'next';
+      investigations.control = 'Open an investigation';
+    } else {
+      // Every open threat finding cites no event, and its card turns the
+      // control off. The step names the reason and offers no control.
+      investigations.title = NO_EVENT_TO_INVESTIGATE;
+    }
     return [investigations, verdicts, actions];
   }
   investigations.state = 'done';
-  if (done.length === 1) investigations.to = `/investigation/${encodeURIComponent(done[0].id)}`;
+  const runs = distinctRuns(done);
+  investigations.title = sharedRunsTitle(done.length, runs.length);
+  if (runs.length === 1) investigations.to = `/investigation/${encodeURIComponent(runs[0].id)}`;
   verdicts.state = 'done';
   const threats = done.filter((i) => i.verdict === 'true_positive').length;
   verdicts.note = threats > 0 ? `${threats} of ${total} threats` : 'no threat confirmed';
-  const known = done.filter((i) => i.pendingActions !== null);
+  const known = runs.filter((i) => i.pendingActions !== null);
   const waiting = known.reduce((n, i) => n + (i.pendingActions ?? 0), 0);
   if (waiting > 0) {
     actions.state = 'next';
     actions.note = `${waiting} wait for you`;
     actions.control = SETTLED_BAR_CONTROL;
-  } else if (known.length > 0 && known.length === done.length) {
+  } else if (known.length > 0 && known.length === runs.length) {
     actions.state = 'done';
     actions.note = 'none waiting';
   } else {
@@ -455,10 +543,12 @@ function huntOrigin(hunt: Pick<FlowHunt, 'kind' | 'starter'>, leadId: number | n
 /** The flow of one hunt, for the hunt page. */
 export function huntFlow(hunt: FlowHunt, leadId: number | null = null): FlowStep[] {
   const stopped = HUNT_STOPPED.has(hunt.status);
+  const noRun = !stopped && hunt.status === 'complete' && couldNotRun(hunt);
   const phase = typeof hunt.findingsTotal === 'number';
   const investigating =
-    phase && hunt.status !== 'running' && !stopped &&
-    (hunt.findingsInvestigated ?? 0) < (hunt.findingsTotal as number);
+    hunt.status === 'investigating' ||
+    (phase && hunt.status !== 'running' && !stopped &&
+      (hunt.findingsInvestigated ?? 0) < (hunt.findingsTotal as number));
   const huntStep: FlowStep = {
     key: 'hunt',
     label: 'Hunt',
@@ -468,11 +558,12 @@ export function huntFlow(hunt: FlowHunt, leadId: number | null = null): FlowStep
         ? 'running'
         : stopped
           ? 'stopped'
-          : investigating
-            ? 'investigating'
-            : undefined,
-    title:
-      'This hunt. It returns findings. A hunt is not finished until its findings are investigated.',
+          : noRun
+            ? 'could not run'
+            : investigating
+              ? 'investigating'
+              : undefined,
+    title: 'This hunt. It returns findings. soc-ai investigates each threat finding when the hunt ends.',
   };
   return settle([...huntOrigin(hunt, leadId), huntStep, ...huntTail(hunt, 'Re-hunt')]);
 }

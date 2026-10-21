@@ -43,6 +43,7 @@ import { absTime } from '../lib/timeRange';
 import type { Dossier, DossierField, DossierFieldName } from '../lib/types';
 import { useDossierWrite } from '../lib/useDossierWrite';
 import { Panel, PanelHeader } from './Panel';
+import { RoleChoice } from './RoleChoice';
 import { Spinner } from './States';
 
 /** The two why-care fields the briefing strip carries. They lead the page up
@@ -78,25 +79,23 @@ export interface DeclareEditorProps {
    *  Edit form had no way out of a declaration; the button states the real
    *  outcome (lib/hostDossier `removeOutcome`). */
   onRemove?: () => void;
-  /** The role datalist suggestions, from the summary wire (see
-   *  lib/hostDossier `roleVocabulary`). Omitted, it falls back to the frontend's
-   *  ROLE_VOCABULARY — so the declare form and the host filter offer the same
-   *  vocabulary instead of drifting apart (the F10 finding). */
+  /** The role list, from the summary wire (see lib/hostDossier
+   *  `roleVocabulary`). Omitted, it falls back to the frontend's
+   *  ROLE_VOCABULARY, so the declare form and the host filter offer the same
+   *  vocabulary (the F10 finding). */
   roleVocabulary?: readonly string[];
 }
 
 /**
  * The one form that writes a declaration, shared by fact rows, the why-care
- * strip and the unknown line so the three cannot drift. Role declarations get
- * the classifier's own vocabulary as suggestions (still free text — an
- * operator may know a role the classifier does not), because a typed
+ * strip and the unknown line so the three cannot drift. A role declaration
+ * uses the RoleChoice list of the Hosts bulk bar, because a typed
  * "Hypervisor" would be disputed against the canonical `hypervisor` forever.
  *
- * Free text HERE and a closed `<select>` in the Hosts BULK strip is the
- * deliberate asymmetry: this declares one host the operator has looked at, and
- * a novel role costs exactly one row. Bulk writes the same keystroke to every
- * selected host, where a typo becomes a first-class bucket in the ROLES
- * distribution and an entry in the role facet for every user.
+ * Here the list adds Other with a text box: this declares one host the
+ * operator has looked at, and a novel role costs one row. The bulk bar has no
+ * Other. Bulk writes the same value to every selected host, where a typo
+ * becomes a bucket in the ROLES distribution, and the server refuses it.
  */
 export function DeclareEditor({
   f,
@@ -139,8 +138,6 @@ export function DeclareEditor({
     }
   };
 
-  const roleList = f.field === 'role' ? `role-options-${f.field}` : undefined;
-
   return (
     <div className="mt-2 flex flex-col gap-2 rounded-card border border-border-input bg-surface-2 px-3 py-2.5">
       <label className="text-[11.5px] font-semibold text-dim" htmlFor={`declare-${f.field}`}>
@@ -155,24 +152,25 @@ export function DeclareEditor({
           onChange={(e) => setDraft(e.target.value)}
           className="w-full rounded-control border border-border-input bg-bg px-3 py-2 font-mono text-[12px] text-text outline-none focus:border-accent"
         />
+      ) : f.field === 'role' ? (
+        // The role list the Hosts bulk bar uses, plus Other for a role the
+        // classifier does not know (dogfood 2026-10-19, R4-D20).
+        <RoleChoice
+          id={`declare-${f.field}`}
+          label={`Value for ${label}`}
+          value={draft}
+          onChange={setDraft}
+          vocabulary={roleVocabulary ?? ROLE_VOCABULARY}
+          variant="form"
+        />
       ) : (
-        <>
-          <input
-            id={`declare-${f.field}`}
-            aria-label={`Value for ${label}`}
-            value={draft}
-            list={roleList}
-            onChange={(e) => setDraft(e.target.value)}
-            className="w-full rounded-control border border-border-input bg-bg px-3 py-2 text-[13px] text-text outline-none focus:border-accent"
-          />
-          {roleList && (
-            <datalist id={roleList}>
-              {(roleVocabulary ?? ROLE_VOCABULARY).map((r) => (
-                <option key={r} value={r} />
-              ))}
-            </datalist>
-          )}
-        </>
+        <input
+          id={`declare-${f.field}`}
+          aria-label={`Value for ${label}`}
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          className="w-full rounded-control border border-border-input bg-bg px-3 py-2 text-[13px] text-text outline-none focus:border-accent"
+        />
       )}
       {/* The Operator note fact is a note. A second Note box under its value
           read as a duplicate (dogfood 2026-10-06), so that form has one box. */}
@@ -490,7 +488,7 @@ function WhyDrawer({
                   </span>
                 </>
               ) : (
-                <span className="text-faint">nothing. The sweep does not work this field out</span>
+                <span className="text-faint">nothing. The sweep does not infer this field</span>
               )}
             </div>
           </div>
@@ -713,9 +711,30 @@ export function withheldRole(fields: DossierField[]): DossierField | null {
   return f;
 }
 
-/** The withheld guess as a fact row: the role, the number that withheld it,
+/**
+ * Every guess the resolver withheld, in field order: old evidence or weak
+ * evidence. The facts header counted 8 such facts and the panel showed the
+ * role alone, with the other 7 under "Unknown" (dogfood 2026-10-19, R4-D11).
+ * The panel now states each one, marked stale or low confidence.
+ */
+export function withheldFields(fields: DossierField[]): DossierField[] {
+  return fields.filter((f) => !BRIEFING_FIELDS.has(f.field) && isWithheldGuess(f));
+}
+
+/** A withheld guess in reading form: a role label, a port list or the stored text. */
+function guessText(f: DossierField, value: string): string {
+  if (f.field === 'role') return roleLabel(value);
+  // A port list reads from the JSON, which holds every port. Any other guess
+  // reads its stored sentence. The traffic pattern read "a traffic pattern"
+  // over "Busiest hours 11:00, 20:00, 02:00 UTC" (dogfood round 2, V2-2).
+  const ports = portsView(f.inferred_value_json);
+  if (ports && ports.ports.length > 0) return ports.ports.join(', ');
+  return valueText(f.field, value, f.inferred_value_json) ?? value;
+}
+
+/** The withheld guess as a fact row: the value, the state that withheld it,
  *  and the same declare control every other row carries. */
-function WithheldRoleRow({
+function WithheldRow({
   ip,
   f,
   canDeclare,
@@ -754,13 +773,15 @@ function WithheldRoleRow({
             className="inline-flex items-baseline gap-1.5"
             title={
               guess?.state === 'stale'
-                ? `The sweep last checked this role ${guess.age ?? 'long ago'}. The value is too old to trust. Declare the role to settle it.`
-                : 'The sweep inferred this role below the confidence gate. Declare the role to settle it.'
+                ? `The sweep last checked this fact ${guess.age ?? 'long ago'}. The value is too old to use. Declare the value to settle it.`
+                : 'The sweep inferred this value below the confidence gate. Declare the value to settle it.'
             }
           >
             <span className="relative top-[-2px] h-2 w-2 flex-none rounded-full bg-warn" />
-            <span data-testid="withheld-role" className="break-words text-[13px] text-dim">
-              {guess ? withheldPhrase(guess) : roleLabel(f.inferred_value ?? '')}
+            <span data-testid={`withheld-${f.field}`} className="break-words text-[13px] text-dim">
+              {guess
+                ? withheldPhrase(guess, (v) => guessText(f, v))
+                : guessText(f, f.inferred_value ?? '')}
             </span>
           </span>
         </div>
@@ -840,16 +861,16 @@ export function HostFacts({
 }: HostFactsProps) {
   const { known } = partitionFields(dossier.fields);
   const rows = known.filter((f) => !BRIEFING_FIELDS.has(f.field));
-  // The withheld role guess rides with the facts rather than in the collapsed
-  // unknown line. It is not counted as a fact: the header counts what the
-  // resolver will assert, and this row is the one the resolver refused.
-  const guess = withheldRole(dossier.fields);
+  // The withheld guesses ride with the facts rather than in the collapsed
+  // unknown line, each marked stale or low confidence. The header counts
+  // them as facts from old or weak evidence.
+  const guesses = withheldFields(dossier.fields);
   return (
     <div data-testid="host-facts" className="mb-3">
       <Panel>
         <PanelHeader
           icon={<ListChecks size={15} />}
-          title="What we know"
+          title="Facts"
           right={
             <span className="font-mono text-[11px] text-faint">
               {address && (
@@ -861,14 +882,15 @@ export function HostFacts({
             </span>
           }
         />
-        {rows.length === 0 && guess == null ? (
+        {rows.length === 0 && guesses.length === 0 ? (
           <div className="px-4 py-4 text-[12.5px] text-faint">
             Nothing confirmed about this machine yet.
           </div>
         ) : (
           <>
-            {guess && (
-              <WithheldRoleRow
+            {guesses.map((guess) => (
+              <WithheldRow
+                key={guess.field}
                 ip={dossier.ip}
                 f={guess}
                 canDeclare={canDeclare}
@@ -876,7 +898,7 @@ export function HostFacts({
                 onApplied={onApplied}
                 roleVocabulary={roleVocabulary}
               />
-            )}
+            ))}
             {rows.map((f) => (
               <FactRow
                 key={f.field}
@@ -975,10 +997,11 @@ export function HostUnknowns({
   focusField,
   roleVocabulary,
 }: HostFactsProps) {
-  // A withheld role guess is stated in the facts panel above, so it does not
-  // also appear here. One answer, one place on the page.
-  const guess = withheldRole(dossier.fields);
-  const unknown = partitionFields(dossier.fields).unknown.filter((f) => f !== guess);
+  // A withheld guess is stated in the facts panel above, so it does not also
+  // appear here. One answer, one place on the page. The briefing strip owns
+  // its two fields.
+  const guesses = new Set(withheldFields(dossier.fields));
+  const unknown = partitionFields(dossier.fields).unknown.filter((f) => !guesses.has(f));
   const names = unknown.map((f) => f.field).join(',');
 
   // Collapsed by default: these are the gaps, not the content. A deep link

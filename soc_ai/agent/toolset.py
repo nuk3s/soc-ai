@@ -1119,6 +1119,12 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
         name = getattr(fn, "__name__", "")
         if not _in_role(name, role):
             return fn
+        # A swarm plane worker's hard surface (soc_ai.agent.swarm.planes): a
+        # tool outside its plane is not registered at all. Only a real set
+        # trims; None and a test double's attribute register as before.
+        allowlist = getattr(ctx, "tool_allowlist", None) if role == "investigator" else None
+        if isinstance(allowlist, (set, frozenset)) and name not in allowlist:
+            return fn
         # The standard class (soc_ai.agent.budget): an investigator tool outside
         # the run's visible set registers with deferred loading. It stays
         # registered and callable, its schema stays off the wire, and one
@@ -1667,6 +1673,10 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
                 elastic=ctx.elastic,
                 settings=ctx.settings,
                 lookback_days=lookback_days,
+                # The base rate the rule had when the alert fired. A re-triage
+                # of an alert older than the window read "first-seen" from a
+                # window that ended now (R2-D11).
+                time_anchor=ctx.default_time_anchor,
                 include_synth=ctx.include_synth,
             )
         except Exception as e:

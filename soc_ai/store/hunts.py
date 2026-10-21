@@ -14,14 +14,18 @@ from collections.abc import Sequence
 from datetime import datetime, timedelta
 from typing import Any, NamedTuple
 
-from sqlalchemy import and_, case, func, not_, select
+from sqlalchemy import and_, case, func, not_, or_, select
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 from ulid import ULID
 
-from soc_ai.hunting.findings import threat_finding_count
-from soc_ai.hunting.outcome import FindingVerdicts
+from soc_ai.hunting.findings import (
+    finding_is_subject,
+    is_run_failure_finding,
+    threat_finding_count,
+)
+from soc_ai.hunting.outcome import FindingVerdicts, public_outcome
 from soc_ai.run_meter import RunCounters, apply_counters
 from soc_ai.secret_scrub import (
     MODEL_TEXT_EVENT_KINDS,
@@ -368,12 +372,42 @@ async def reap_investigating(db: AsyncSession) -> int:
     return len(rows)
 
 
+def subject_links(links: dict[int, FindingLink], findings: Any) -> dict[int, FindingLink]:
+    """The entries of the findings that are subjects by the current rule.
+
+    An older row can hold an entry on a finding the rule no longer
+    investigates: the observation that reused the investigation of a threat
+    on the same hosts. That entry borrows a verdict the finding never had, so
+    it is dropped. With no readable report every entry stays.
+    """
+    if not isinstance(findings, list):
+        return links
+    return {
+        ordinal: link
+        for ordinal, link in links.items()
+        if ordinal < len(findings) and finding_is_subject(findings[ordinal])
+    }
+
+
+def counted_findings(findings: Any) -> int:
+    """The findings of a report that count as findings. A failed-query record
+    is the trace of a run that did not happen, so it is not one."""
+    if not isinstance(findings, list):
+        return 0
+    return sum(1 for f in findings if isinstance(f, dict) and not is_run_failure_finding(f))
+
+
 async def finding_verdicts(db: AsyncSession, hunt_ids: Sequence[str]) -> dict[str, FindingVerdicts]:
     """The verdict summary of each hunt's subject findings. One query per table.
 
     A hunt with no subject finding is left out. The verdicts are read live from
     the investigations, so an analyst's override of a verdict moves the
     hunt's outcome with it.
+
+    The report is read too. An entry on a finding that is not a subject by the
+    current rule is dropped (:func:`subject_links`), and ``findings`` counts
+    every finding of the report. So a row an older rule wrote reads correctly
+    with no migration.
     """
     wanted = [i for i in hunt_ids if i]
     if not wanted:
@@ -385,17 +419,24 @@ async def finding_verdicts(db: AsyncSession, hunt_ids: Sequence[str]) -> dict[st
                 Hunt.findings_total,
                 Hunt.findings_investigated,
                 Hunt.finding_investigations,
+                Hunt.report,
             ).where(Hunt.id.in_(wanted), Hunt.findings_total > 0)
         )
     ).all()
-    links_by_hunt = {
-        str(hunt_id): (int(total or 0), int(done or 0), finding_links_from(raw))
-        for hunt_id, total, done, raw in rows
-    }
+    links_by_hunt: dict[str, tuple[int, int, dict[int, FindingLink], int]] = {}
+    for hunt_id, stored_total, stored_done, raw, report in rows:
+        findings = report.get("findings") if isinstance(report, dict) else None
+        links = finding_links_from(raw)
+        kept = subject_links(links, findings)
+        total, done = int(stored_total or 0), int(stored_done or 0)
+        if len(kept) != len(links):
+            total = len(kept)
+            done = sum(1 for link in kept.values() if link.state in LINK_ENDED_STATES)
+        links_by_hunt[str(hunt_id)] = (total, done, kept, counted_findings(findings))
     inv_ids = sorted(
         {
             link.investigation_id
-            for _total, _done, links in links_by_hunt.values()
+            for _total, _done, links, _every in links_by_hunt.values()
             for link in links.values()
             if link.investigation_id
         }
@@ -414,7 +455,9 @@ async def finding_verdicts(db: AsyncSession, hunt_ids: Sequence[str]) -> dict[st
         for inv_id, status, verdict, fallback in found.all():
             runs[str(inv_id)] = (str(status or ""), verdict, bool(fallback))
     out: dict[str, FindingVerdicts] = {}
-    for hunt_id, (total, done, links) in links_by_hunt.items():
+    for hunt_id, (total, done, links, every) in links_by_hunt.items():
+        if total <= 0:
+            continue
         decided = threats = 0
         for link in links.values():
             run = runs.get(link.investigation_id or "")
@@ -425,7 +468,7 @@ async def finding_verdicts(db: AsyncSession, hunt_ids: Sequence[str]) -> dict[st
                 decided += 1
                 threats += verdict == "true_positive"
         out[hunt_id] = FindingVerdicts(
-            total=total, investigated=done, decided=decided, threats=threats
+            total=total, investigated=done, decided=decided, threats=threats, findings=every
         )
     return out
 
@@ -505,9 +548,18 @@ async def window_totals(
     that counted the page read "100 hunts" over a window of 140.
 
     The finding counts come from the denormalized columns, so no report blob is
-    read for a stamped row. A row that holds a report and no stamped counts (a
-    demo fixture, or a row written outside :func:`finalize`) is counted from
-    its report, the way the list row counts it.
+    read for a stamped row with a threat finding. A row that holds a report and
+    no stamped counts (a demo fixture, or a row written outside
+    :func:`finalize`) is counted from its report, the way the list row counts
+    it.
+
+    ``findings`` counts what the list cells state. A hunt that could not run
+    or found no answer states no count in its cell, because its findings are
+    gaps and failed-query records. The header read "24 findings" over 24 rows
+    that each read "Could not run" (R3-D6). So a complete row with no threat
+    finding is read from its report, and its outcome decides. A hunt that
+    stopped states no count either. ``running`` counts every hunt that has not
+    ended, an investigating hunt included (R3-D7).
     """
     window: list[Any] = []
     if since is not None:
@@ -515,13 +567,19 @@ async def window_totals(
     if until is not None:
         window.append(Hunt.created_at <= until)
     stamped = and_(Hunt.findings_count.is_not(None), Hunt.threat_findings_count.is_not(None))
+    # A stamped row whose cell states its count without a report read.
+    shown = and_(
+        stamped,
+        Hunt.threat_findings_count > 0,
+        Hunt.status.in_((STATUS_COMPLETE, STATUS_INVESTIGATING)),
+    )
     rows = await db.execute(
         select(
             Hunt.kind,
             func.count(Hunt.id),
-            func.sum(case((stamped, Hunt.findings_count), else_=0)),
+            func.sum(case((shown, Hunt.findings_count), else_=0)),
             func.sum(case((stamped, Hunt.threat_findings_count), else_=0)),
-            func.sum(case((Hunt.status == STATUS_RUNNING, 1), else_=0)),
+            func.sum(case((Hunt.status.in_(OPEN_STATUSES), 1), else_=0)),
         )
         .where(*window)
         .group_by(Hunt.kind)
@@ -530,18 +588,35 @@ async def window_totals(
         str(kind): WindowTotals(int(n or 0), int(f or 0), int(t or 0), int(r or 0))
         for kind, n, f, t, r in rows.all()
     }
-    unstamped = await db.execute(
-        select(Hunt.kind, Hunt.report).where(*window, Hunt.report.is_not(None), not_(stamped))
+    quiet = and_(
+        stamped,
+        Hunt.threat_findings_count == 0,
+        Hunt.findings_count > 0,
+        Hunt.status == STATUS_COMPLETE,
     )
-    for kind, report in unstamped.all():
+    to_read = await db.execute(
+        select(Hunt.kind, Hunt.status, Hunt.report, Hunt.narrative, stamped).where(
+            *window, Hunt.report.is_not(None), or_(not_(stamped), quiet)
+        )
+    )
+    for kind, status, report, narrative, is_stamped in to_read.all():
         findings = report.get("findings") if isinstance(report, dict) else None
-        counted = len(findings) if isinstance(findings, list) else 0
+        rows_in = findings if isinstance(findings, list) else []
+        text = narrative or (report.get("narrative") if isinstance(report, dict) else None)
+        outcome = public_outcome(str(status or ""), rows_in, str(text or ""))
+        counted = 0 if outcome in _NO_COUNT_OUTCOMES else len(rows_in)
         base = out.get(str(kind), WindowTotals())
         out[str(kind)] = base._replace(
             findings=base.findings + counted,
-            threat_findings=base.threat_findings + threat_finding_count(findings),
+            threat_findings=base.threat_findings
+            + (0 if is_stamped else threat_finding_count(findings)),
         )
     return out
+
+
+# The outcomes whose list cell states no finding count (Hunts.tsx
+# NO_COUNT_OUTCOMES). Their findings are gaps and failed-query records.
+_NO_COUNT_OUTCOMES = frozenset({"could_not_run", "no_answer"})
 
 
 class HuntNotifRow(NamedTuple):
@@ -668,8 +743,25 @@ async def outcome_inputs(db: AsyncSession, ids: Sequence[str]) -> dict[str, tupl
     return out
 
 
+def _names_account(text: str, account: str) -> bool:
+    """True when *text* holds *account* as a whole token, in any case.
+
+    A letter, a digit, an underscore or a hyphen on either side makes a
+    longer account: "admin" is not in "netadmin".
+    """
+    if not account:
+        return False
+    pattern = rf"(?<![\w-]){re.escape(account)}(?![\w-])"
+    return re.search(pattern, text, flags=re.IGNORECASE) is not None
+
+
 async def findings_for_entity(
-    db: AsyncSession, value: str, *, scan_limit: int = 100
+    db: AsyncSession,
+    value: str,
+    *,
+    scan_limit: int = 100,
+    aliases: Sequence[str] = (),
+    named_in_title: bool = False,
 ) -> list[dict[str, Any]]:
     """Hunt findings that name an entity in their ``hosts[]`` — for the entity page.
 
@@ -685,6 +777,13 @@ async def findings_for_entity(
     hunt's ``created_at`` (findings have no own timestamp). Only COMPLETE hunts
     carry a report worth scanning; running/errored rows are skipped.
 
+    A finding matches when its ``hosts[]`` holds *value* or one of
+    *aliases*, in any case. The entity page passes every key of the
+    machine, so one machine reads one set of findings from any of its keys.
+    With ``named_in_title`` a finding also matches when its title names
+    *value* as a whole token. A user account is in no ``hosts[]``: the model
+    names the account in the title (dogfood 2026-10-19, R4-D13).
+
     Synth-eval hunts (migration 0032) are skipped too — same decision as
     ``investigations.for_entity``, the query that feeds the other half of the
     entity timeline: the page narrates a host's REAL history, and a planted
@@ -693,6 +792,7 @@ async def findings_for_entity(
     """
     if not value:
         return []
+    wanted = {k.strip().casefold() for k in (value, *aliases) if k and k.strip()}
     recent = await list_recent(db, status=STATUS_COMPLETE, limit=scan_limit)
     out: list[dict[str, Any]] = []
     for hunt in recent:
@@ -706,7 +806,12 @@ async def findings_for_entity(
             if not isinstance(f, dict):
                 continue
             hosts = f.get("hosts") or []
-            if not isinstance(hosts, list) or value not in [str(h) for h in hosts]:
+            held = isinstance(hosts, list) and any(
+                str(h).strip().casefold() in wanted for h in hosts
+            )
+            if not held and not (
+                named_in_title and _names_account(str(f.get("title") or ""), value.strip())
+            ):
                 continue
             out.append(
                 {

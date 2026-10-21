@@ -42,6 +42,7 @@ from soc_ai.dossier.prompt import host_dossier_prompt_block, internal_ips_in_tex
 from soc_ai.oracle.identifiers import EffectiveIdentifiers, effective_internal_identifiers
 from soc_ai.so_client.inventory import inventory_prompt_block
 from soc_ai.store import general_chat as gc_svc
+from soc_ai.store import grid_gaps
 from soc_ai.store import investigations as inv_svc
 from soc_ai.store.auth import utcnow
 from soc_ai.webui import alerts_query as aq
@@ -174,6 +175,7 @@ def _general_spec(state: Any, thread_key: str, assistant_msg_id: int) -> ChatTur
             history = await gc_svc.history_for_agent(db, thread_key)
             identifiers = await _identifiers(db, settings)
             verdict_counts = await _verdict_counts(db)
+        gap_lines = await grid_gaps.recent_fact_lines(state.db_sessionmaker)
         question, prior = split_history(history)
         # NOTE — this seed now stacks four ambient blocks: internal identifiers,
         # the dataset inventory, recent posture, and the host dossier. NONE of
@@ -192,6 +194,7 @@ def _general_spec(state: Any, thread_key: str, assistant_msg_id: int) -> ChatTur
             verdict_counts=verdict_counts,
             top_rules=await _top_rules(ctx.elastic, settings),
             window_hours=POSTURE_WINDOW_HOURS,
+            gap_lines=gap_lines,
         ) + await _thread_dossier_block(ctx, question, prior)
 
         hunt_sink: list[dict[str, Any]] = []

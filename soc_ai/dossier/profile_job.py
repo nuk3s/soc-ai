@@ -63,7 +63,7 @@ from soc_ai.dossier.stages import StageClock, counting
 from soc_ai.enrichment.discovery import _is_ip_literal
 from soc_ai.so_client.elastic import DEFAULT_MAX_BUCKETS, EsSearchResult
 from soc_ai.so_client.paging import read_pages
-from soc_ai.store import entity_profiles
+from soc_ai.store import entity_profiles, grid_gaps
 from soc_ai.store.host_machines import address_sort_key
 from soc_ai.store.models import EntityProfile, HostDossier, HostMachine
 
@@ -998,6 +998,19 @@ async def _build(  # noqa: PLR0915 - one procedure, read top to bottom
                     fresh_for=timedelta(hours=interval_hours),
                     lag=timedelta(hours=lag_hours),
                 )
+                # The hours the grid held no data. A rate baseline reads them
+                # as missing, never as zero.
+                gap_rows = await grid_gaps.overlapping(
+                    db,
+                    since=started - timedelta(days=window_days) - timedelta(hours=lag_hours),
+                    until=started,
+                )
+                gaps = [
+                    (w.start, w.end)
+                    for w in grid_gaps.windows_of(
+                        gap_rows, settle=grid_gaps.settle_of(settings), now=started
+                    )
+                ]
         except Exception as exc:
             build.errors.append(f"entity profiles: could not read the census: {exc}")
             return
@@ -1037,6 +1050,7 @@ async def _build(  # noqa: PLR0915 - one procedure, read top to bottom
                     # Host entities are scoped to the estate's own address
                     # space, or the lane profiles the internet.
                     cidrs=cidrs,
+                    gaps=gaps,
                 )
             except Exception as exc:
                 outcome.errors[f"entity profiles: {exc}"] = None

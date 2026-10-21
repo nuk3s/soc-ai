@@ -20,6 +20,9 @@ import {
   NOTIFICATIONS_MAX,
   dismissAll,
   dismissAllPrompt,
+  dismissAllUndoNote,
+  restoreDismissals,
+  snapshotDismissals,
   dismissNotification,
   getClearedAt,
   hasMoreNotifications,
@@ -138,12 +141,12 @@ describe('dismissAllPrompt', () => {
   it('states what happens and what stays', () => {
     expect(
       dismissAllPrompt({ events: 14, more: false, shadowHits: 300, stay: ['leads_needing_decision', 'needs_more_info'], fixed: 0 }),
-    ).toBe('Hide 14 events and mark 300 shadow hits read? Leads and verdicts that need more info stay.');
+    ).toBe('Hide 14 notifications and mark 300 shadow hits read? Leads and verdicts that need more info stay.');
   });
 
   it('says when more events exist than the list loaded', () => {
     expect(dismissAllPrompt({ events: 12, more: true, shadowHits: 0, stay: [], fixed: 0 })).toBe(
-      'Hide 12 events and every older event?',
+      'Hide 12 notifications and every older notification?',
     );
   });
 
@@ -157,7 +160,7 @@ describe('dismissAllPrompt', () => {
         fixed: 1,
       }),
     ).toBe(
-      'Hide 1 event and mark 1 shadow hit read? Leads, alert groups with no verdict, verdicts that need more info and recommended actions stay. 1 notice you cannot dismiss stays.',
+      'Hide 1 notification and mark 1 shadow hit read? Leads, alert groups with no verdict, verdicts that need more info and recommended actions stay. 1 notice you cannot dismiss stays.',
     );
   });
 
@@ -165,5 +168,33 @@ describe('dismissAllPrompt', () => {
     expect(dismissAllPrompt({ events: 0, more: false, shadowHits: null, stay: [], fixed: 0 })).toBe(
       'Mark every unread shadow hit read?',
     );
+  });
+});
+
+// Dogfood 2026-10-19 R1-I6. Dismiss all had no undo, and the confirm did not
+// say that the shadow hits stay read.
+describe('Dismiss all undo', () => {
+  it('names what an Undo restores and what it cannot', () => {
+    expect(dismissAllUndoNote({ events: 3, shadowHits: 5 })).toBe(
+      'Undo shows the notifications again. The shadow hits stay read.',
+    );
+    expect(dismissAllUndoNote({ events: 3, shadowHits: null })).toBe(
+      'Undo shows the notifications again. The shadow hits stay read.',
+    );
+    expect(dismissAllUndoNote({ events: 3, shadowHits: 0 })).toBe('Undo shows the notifications again.');
+    expect(dismissAllUndoNote({ events: 0, shadowHits: 2 })).toBe('The shadow hits stay read.');
+  });
+
+  it('restores the local hide that a Dismiss all wrote', async () => {
+    const rows = [row('inv-done:1', '2026-10-14T08:00:00+00:00'), row('inv-done:2', '2026-10-14T08:30:00+00:00')];
+    localStorage.setItem('soc-ai:dismissed-notifications', JSON.stringify(['inv-done:0']));
+    const snapshot = snapshotDismissals();
+    await dismissAll({ rows, loadedAt: LOADED, shadowHits: 0 });
+    expect(visibleNotifications(rows)).toEqual([]);
+    restoreDismissals(snapshot);
+    expect(visibleNotifications(rows).map((r) => r.id)).toEqual(['inv-done:1', 'inv-done:2']);
+    expect(getClearedAt()).toBeNull();
+    // The earlier per-row dismissal stays.
+    expect(visibleNotifications([row('inv-done:0', null)])).toEqual([]);
   });
 });

@@ -24,10 +24,10 @@ export const KIND_LABEL: Record<string, string> = {
   scope_count: 'across many hosts',
   estate_outlier: 'unusual across all hosts',
   alert: 'alert',
-  prior_no_baseline: 'finding with no benign baseline',
+  prior_no_baseline: 'no benign baseline',
   catalog_match: 'analytic match',
   hunt_finding: 'hunt finding',
-  telemetry_silence: 'log source went silent',
+  telemetry_silence: 'events stopped',
   logon_chain: 'logon chain',
 };
 
@@ -48,7 +48,7 @@ const SOURCE_LABEL: Record<string, string> = {
   candidate: 'catalog',
   alert: 'alert',
   hunt: 'hunt',
-  model: 'model',
+  model: 'statistics',
 };
 
 /** The one word the source chip carries. A shadow observation reads "shadow",
@@ -63,9 +63,9 @@ const SOURCE_TITLE: Record<string, string> = {
     'A behavioural profile of this entity produced this observation. The profile sweep wrote it.',
   catalog: 'A query analytic matched this entity. The analytic sweep wrote it.',
   alert:
-    'A triage verdict on an alert produced this observation. A false positive is not recorded.',
+    'A triage verdict on an alert produced this observation. A false positive verdict writes no observation.',
   hunt: 'An analyst promoted a hunt finding on this entity.',
-  model:
+  statistics:
     'A learned detector produced this observation. The profile sweep ran it. The detector calls no model.',
 };
 

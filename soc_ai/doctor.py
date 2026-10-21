@@ -74,11 +74,11 @@ from soc_ai.store.db import (
 from soc_ai.webui import alerts_query as aq
 from soc_ai.webui.probes import (
     PROBE_BUDGET_S,
-    UNMEASURED_CAUSES,
     _safe_reason,
     _scrub,
     list_gateway_models,
     probe_model_fitness,
+    unmeasured_failed_legs,
 )
 
 CheckStatus = Literal["PASS", "WARN", "FAIL", "INFO"]
@@ -274,9 +274,19 @@ _REACH_DNS_HINT = (
     "This container cannot resolve the hostname. Use an IP address in .env. You can "
     "also add an extra_hosts entry for it in docker-compose.yml."
 )
-_REACH_SO_ES_FIREWALL_HINT = (
-    "There is no route, or the upstream refused the connection. Pinhole this host's "
-    "IP through the SO firewall. Elasticsearch uses TCP 9200. See "
+# A refusal means nothing listens on the port: the SO firewall drops a packet,
+# it does not refuse it. So a refusal names the setting that holds the
+# address, and only a timeout or a missing route gets the firewall advice
+# (dogfood 2026-10-19, H1-D20: "Connection refused" got the pinhole hint, and
+# the SO row named the Elasticsearch port).
+_REACH_REFUSED_HINT = "Nothing listens on the address. Check {setting} and that {service} runs."
+_REACH_SO_FIREWALL_HINT = (
+    "The connection timed out or has no route. Allow this host through the SO firewall "
+    "to the SO API port. See docs/SECURITY-ONION-SETUP.md, section 0."
+)
+_REACH_ES_FIREWALL_HINT = (
+    "The connection timed out or has no route. Allow this host through the SO firewall "
+    "to the Elasticsearch port. That port is TCP 9200 by default. See "
     "docs/SECURITY-ONION-SETUP.md, section 0."
 )
 _REACH_TLS_FALLBACK_NOTE = "If the endpoint does not serve TLS on this port, use http://."
@@ -286,22 +296,29 @@ _REACH_HINTS: dict[tuple[str, str], str] = {
         "Private CA or self-signed certificate. Point SO_CA_BUNDLE at the CA, "
         "or set SO_VERIFY_SSL=false if you accept unverified TLS. " + _REACH_TLS_FALLBACK_NOTE
     ),
-    ("so", "reach"): _REACH_SO_ES_FIREWALL_HINT,
+    ("so", "reach"): _REACH_SO_FIREWALL_HINT,
+    ("so", "refused"): _REACH_REFUSED_HINT.format(
+        setting="SO_HOST", service="the Security Onion API"
+    ),
     ("es", "dns"): _REACH_DNS_HINT,
     ("es", "tls"): (
         "Private CA or self-signed certificate. Point ES_CA_BUNDLE at the CA, "
         "or set ES_VERIFY_SSL=false if you accept unverified TLS. " + _REACH_TLS_FALLBACK_NOTE
     ),
-    ("es", "reach"): _REACH_SO_ES_FIREWALL_HINT,
+    ("es", "reach"): _REACH_ES_FIREWALL_HINT,
+    ("es", "refused"): _REACH_REFUSED_HINT.format(setting="ES_HOSTS", service="Elasticsearch"),
     ("gateway", "dns"): _REACH_DNS_HINT,
     ("gateway", "tls"): (
         "Self-signed or private-CA gateway cert. Set LITELLM_VERIFY_SSL=false if you "
         "accept unverified TLS to the gateway. " + _REACH_TLS_FALLBACK_NOTE
     ),
     ("gateway", "reach"): (
-        "There is no route, or the gateway refused the connection. Check the gateway "
-        "URL and port. Check that the gateway container is up. It must answer from "
-        "inside this container on the Docker network."
+        "The connection timed out or has no route. Check LITELLM_BASE_URL and the "
+        "network path to the model gateway. On a Docker install, the address must "
+        "answer from inside the soc-ai container."
+    ),
+    ("gateway", "refused"): _REACH_REFUSED_HINT.format(
+        setting="LITELLM_BASE_URL", service="the model gateway"
     ),
 }
 
@@ -360,6 +377,8 @@ def _classify_endpoint(url: str, *, verify_tls: bool, timeout_s: float = 5.0) ->
         return "tls", f"{host}:{port}: TLS handshake failed: {exc}"
     except TimeoutError:  # socket.timeout is TimeoutError as of Python 3.10
         return "reach", f"{host}:{port}: connection timed out"
+    except ConnectionRefusedError as exc:
+        return "refused", f"{host}:{port}: {exc.strerror or exc}"
     except OSError as exc:
         return "reach", f"{host}:{port}: {exc.strerror or exc}"
     return "", f"{host}:{port} resolves and connects"
@@ -753,7 +772,7 @@ async def check_elasticsearch(settings: Settings) -> list[CheckResult]:
             CheckResult(
                 name,
                 "FAIL",
-                f"the grid answered and read only part of itself: {_safe_reason(exc)}",
+                f"the grid answered with a partial read: {_safe_reason(exc)}",
                 hint="Shards failed, or the search stopped part-way. Check Elasticsearch "
                 "shard health. The index pattern is not the problem.",
             )
@@ -866,9 +885,9 @@ async def check_audit_write_privileges(settings: Settings) -> CheckResult:
             "WARN",
             f"soc-ai could not query _has_privileges: {_safe_reason(exc)}",
             hint=(
-                "Fix Elasticsearch connectivity first. Then run the doctor again. "
-                "If ack, escalate or comment fail without an error once ES answers, "
-                f"the grant can be missing. {fix}"
+                "Fix the grid connection first. Then run the doctor again. "
+                "An ack, an escalation or a comment can still fail with no error after "
+                f"the grid answers. Then the audit grant is missing. {fix}"
             ),
         )
     finally:
@@ -891,9 +910,9 @@ async def check_audit_write_privileges(settings: Settings) -> CheckResult:
             "WARN",
             "the _has_privileges response has an unexpected shape. soc-ai cannot tell "
             "whether the audit grant is present.",
-            hint="This is not a confirmed problem. If ack, escalate or comment ever fail "
-            "without an error, check the grant by hand. See docs/SECURITY-ONION-SETUP.md, "
-            "section 3.",
+            hint="This is not a confirmed problem. An ack, an escalation or a comment can "
+            "fail with no error. Then check the grant by hand. See "
+            "docs/SECURITY-ONION-SETUP.md, section 3.",
         )
     if bool(body["has_all_requested"]):
         return CheckResult(
@@ -980,7 +999,7 @@ async def check_index_pattern_coverage(settings: Settings) -> CheckResult:
     """
     name = "index pattern coverage"
     pattern = settings.events_index_pattern
-    hint_connectivity = "Fix Elasticsearch connectivity first. Then run the doctor again."
+    hint_connectivity = "Fix the grid connection first. Then run the doctor again."
     elastic = _probe_client(settings)
     try:
         results = await asyncio.gather(
@@ -1017,7 +1036,7 @@ async def check_index_pattern_coverage(settings: Settings) -> CheckResult:
             "WARN",
             f"the count under {pattern!r} took longer than the probe budget of "
             f"{probe_budget_s(settings):g} s. The grid answered the reachability rows "
-            "of this run. This is grid latency, not a connectivity fault.",
+            "of this run. This is grid latency. The connection to the grid works.",
             hint="Run the doctor again. If the warning repeats, read the Elasticsearch "
             "node load: CPU, heap and the search thread pool queue.",
         )
@@ -1185,12 +1204,14 @@ async def check_alerts_feed_filter(settings: Settings) -> CheckResult:
     about volume rather than a class nobody can see, and one label is the whole
     of the recommendation.
 
-    A grid where no label finds anything is quiet, not misconfigured, and PASSes
-    with that said out loud. Reporting a problem on every idle grid is how a
-    real mismatch gets scrolled past.
+    A grid where no label finds anything WARNs, and the row says the filter is
+    not the cause. It used to PASS as a quiet grid. On the range a sensor sent
+    no data for four days and this row stayed green over an empty queue
+    (dogfood 2026-10-19, R5-D6). A quiet grid and a blind sensor read the same
+    from here, so the hint names both.
     """
     name = "alerts feed filter"
-    hint_connectivity = "Fix Elasticsearch connectivity first, then re-run the doctor."
+    hint_connectivity = "Fix the grid connection first. Then run the doctor again."
     elastic = _probe_client(settings)
     try:
         counts = await aq.count_alert_labels(elastic, settings)
@@ -1243,8 +1264,11 @@ async def check_alerts_feed_filter(settings: Settings) -> CheckResult:
     if configured_count == 0 and better_count == 0:
         return CheckResult(
             name,
-            "PASS",
-            f"{detail_counts}. No label found an alert {window}. The triage queue will be empty.",
+            "WARN",
+            f"{detail_counts}. No label found an alert {window}. The triage queue is empty. "
+            "The filter is not the cause.",
+            hint="A quiet grid gives this result. A sensor that sends no data gives it too. "
+            "Check the sensor status in Security Onion.",
         )
     if configured_count == 0:
         return CheckResult(
@@ -1525,21 +1549,8 @@ async def check_oracle_route(
 # ── Check 5: model fitness (the E1.1 probe) ──────────────────────────────────
 
 
-def _unmeasured_legs(fitness: dict[str, Any]) -> list[dict[str, Any]] | None:
-    """The failed legs when every one of them failed to measure, else None.
-
-    A leg that timed out or could not reach the model holds no capability
-    result. When those are the only failed legs, the probe measured nothing
-    that says the model is unfit. A probe result with no leg list (an older
-    cache, a test double) gives None, and the grade stands.
-    """
-    legs = [leg for leg in fitness.get("legs") or [] if isinstance(leg, dict)]
-    failed = [leg for leg in legs if leg.get("grade") == "fail"]
-    if not failed:
-        return None
-    if all(leg.get("cause") in UNMEASURED_CAUSES for leg in failed):
-        return failed
-    return None
+# One rule for the doctor and the console route: see probes.unmeasured_failed_legs.
+_unmeasured_legs = unmeasured_failed_legs
 
 
 async def check_model_fitness(settings: Settings) -> list[CheckResult]:
@@ -1562,7 +1573,7 @@ async def check_model_fitness(settings: Settings) -> list[CheckResult]:
         return [CheckResult("model fitness", "PASS", detail)]
     unmeasured = _unmeasured_legs(fitness) if grade == "fail" else None
     if unmeasured:
-        model = str(fitness.get("model") or "") or "the analyst model"
+        model = str(fitness.get("model") or "") or "the investigation model"
         causes = " ".join(str(leg.get("detail") or leg.get("name") or "") for leg in unmeasured)
         return [
             CheckResult(
@@ -1588,8 +1599,8 @@ async def check_model_fitness(settings: Settings) -> list[CheckResult]:
             "model fitness",
             "FAIL",
             detail,
-            hint="An unfit analyst model lands all-fallback needs_more_info verdicts. "
-            "Point ANALYST_MODEL at a model that passes structured output.",
+            hint="An unfit investigation model returns only fallback Needs more info "
+            "verdicts. Set ANALYST_MODEL to a model that passes structured output.",
         )
     ]
 
@@ -1648,7 +1659,14 @@ async def check_audit_chain(
 
     if result.ok:
         if result.records_verified == 0:
-            return CheckResult(name, "PASS", "intact. The last 24 h hold no audit records.")
+            # A PASS over zero records verified nothing (dogfood 2026-10-19, R5-D27).
+            return CheckResult(
+                name,
+                "INFO",
+                "the last 24 h hold no audit record. Nothing to verify.",
+                hint="soc-ai writes an audit record for each verdict and each write. "
+                "A quiet day has none.",
+            )
         detail = (
             f"intact: {result.records_verified} records in the last 24 h, "
             f"seq {result.first_seq}..{result.last_seq}."
@@ -1673,6 +1691,113 @@ async def check_audit_chain(
         hint="Run soc-ai audit verify --days 1 for the detail. Treat an altered record as "
         "an incident.",
     )
+
+
+# ── Check 5d: the admin password (dogfood 2026-10-19, H1-D5) ─────────────────
+
+
+async def check_admin_password(settings: Settings) -> list[CheckResult]:
+    """WARN while the bootstrap admin still signs in with a generated password.
+
+    The first start writes the generated password to a sidecar file, and
+    ``setup.sh`` writes one into ``.env``. A reader of either file can sign in
+    as admin until the password changes. Only a service-log line said so. No
+    row when the store holds no ``admin`` account. INFO with authentication
+    off: every visitor has admin access then, and the row is a fact.
+    """
+    from soc_ai.bootstrap_credential import (  # noqa: PLC0415 - lazy
+        BOOTSTRAP_ADMIN_USERNAME,
+        SOURCE_SIDECAR,
+        bootstrap_credential_path,
+        generated_password_source,
+    )
+    from soc_ai.store.auth import list_users  # noqa: PLC0415 - lazy
+
+    name = "admin password"
+    engine = make_engine(settings)
+    try:
+        async with make_sessionmaker(engine)() as db:
+            users = await list_users(db)
+    finally:
+        await engine.dispose()
+    admin = next((u for u in users if u.username == BOOTSTRAP_ADMIN_USERNAME), None)
+    if admin is None:
+        return []
+    source = await generated_password_source(settings, admin.username, admin.password_hash)
+    if source is None:
+        return [CheckResult(name, "PASS", "the admin account does not use a generated password.")]
+    where = (
+        str(bootstrap_credential_path(settings))
+        if source == SOURCE_SIDECAR
+        else "BOOTSTRAP_ADMIN_PASSWORD in .env"
+    )
+    detail = (
+        f"the admin account still uses the generated password. The password is in {where}. "
+        "A reader of that file can sign in as admin."
+    )
+    hint = "Sign in as admin. Open the account menu and select Change password."
+    if not settings.api_auth_required:
+        return [CheckResult(name, "INFO", detail, hint=hint)]
+    return [CheckResult(name, "WARN", detail, hint=hint)]
+
+
+# ── Check 5e: backups (dogfood 2026-10-19, R5-D14) ────────────────────────────
+
+# The nightly job runs once a day. Two days leaves room for one late run.
+_BACKUP_STALE_AFTER = timedelta(hours=48)
+
+
+def check_backups(settings: Settings, *, now: datetime | None = None) -> list[CheckResult]:
+    """The newest ``soc-ai backup`` archive in ``<data dir>/backups``.
+
+    Settings > Scheduled maintenance read this directory and said the backup
+    job did not run, while every doctor row stayed green. Same directory, same
+    rule, one answer. A PostgreSQL store is INFO: ``soc-ai backup`` does not
+    cover it.
+    """
+    name = "backups"
+    if is_postgres_url(store_url(settings)):
+        return [
+            CheckResult(
+                name,
+                "INFO",
+                "the store is PostgreSQL. soc-ai backup does not cover it. Back it up "
+                "with pg_dump.",
+            )
+        ]
+    backups_dir = Path(settings.soc_ai_data_dir) / "backups"
+    hint = (
+        "Schedule a nightly soc-ai backup. See docs/DOCKER.md, Backup schedule and "
+        "retention. soc-ai reads this directory only. A job that writes to another "
+        "directory does not show here."
+    )
+    try:
+        archives = [p for p in backups_dir.glob("soc-ai-backup-*.tar.gz") if p.is_file()]
+        newest = max((p.stat().st_mtime for p in archives), default=None)
+    except OSError:
+        newest = None
+    if newest is None:
+        return [CheckResult(name, "WARN", f"no backup archive in {backups_dir}.", hint=hint)]
+    now = now or datetime.now(UTC)
+    age = now - datetime.fromtimestamp(newest, tz=UTC)
+    if age > _BACKUP_STALE_AFTER:
+        days = int(age.total_seconds() // 86400)
+        return [
+            CheckResult(
+                name,
+                "WARN",
+                f"the newest backup archive in {backups_dir} is {days} days old.",
+                hint=hint,
+            )
+        ]
+    hours = max(1, int(age.total_seconds() // 3600))
+    return [
+        CheckResult(
+            name,
+            "PASS",
+            f"the newest backup archive in {backups_dir} is {hours} h old.",
+        )
+    ]
 
 
 # ── Check 6: egress posture (INFO only) ──────────────────────────────────────
@@ -1992,6 +2117,28 @@ def _tls_mode_row(settings: Settings, proxies: list[str], *, now: datetime | Non
     return CheckResult("tls", "PASS", f"{detail} Names: {sans}. Chain of {status.chain_length}.")
 
 
+# The name of each refreshable feed in operator prose.
+_BLOCKLIST_FEED_NAMES: dict[str, str] = {
+    "urlhaus": "URLhaus",
+    "threatfox": "ThreatFox",
+    "feodo": "Feodo",
+    "tor": "Tor",
+    "spamhaus_drop": "Spamhaus DROP",
+}
+
+
+def _and_join(items: list[str]) -> str:
+    if len(items) <= 1:
+        return "".join(items)
+    return f"{', '.join(items[:-1])} and {items[-1]}"
+
+
+def _feeds_phrase(sources: list[str]) -> str:
+    """The phrase for the feeds: "the Tor feed", "the Feodo, ThreatFox and URLhaus feeds"."""
+    names = _and_join([_BLOCKLIST_FEED_NAMES.get(s, s) for s in sources])
+    return f"the {names} feed" if len(sources) == 1 else f"the {names} feeds"
+
+
 def _blocklist_hint(settings: Settings, missing: list[str], stale: list[str]) -> str:
     """What would actually clear this warning, in THIS configuration.
 
@@ -2003,26 +2150,33 @@ def _blocklist_hint(settings: Settings, missing: list[str], stale: list[str]) ->
     teaches its reader to stop reading the doctor, which costs more than the
     feeds do.
     """
-    unrefreshable = sorted(
-        _ABUSE_CH_FEEDS.intersection(
-            # `stale` entries carry an age suffix; the source is the first token.
-            set(missing) | {s.split(" ", 1)[0] for s in stale}
-        )
-    )
-    if unrefreshable and settings.abuse_ch_auth_key is None:
-        joined = ", ".join(unrefreshable)
-        return (
-            f"{joined} need a free abuse.ch Auth-Key. ABUSE_CH_AUTH_KEY is not set, so "
-            f"`soc-ai blocklists refresh` skips them. The warning stays until you do one "
-            f"of two things. Register at https://auth.abuse.ch/ and set the key. Or remove "
-            f"{joined} from blocklist_sources. Triage continues in both cases. See "
-            f"docs/BLOCKLISTS.md."
-        )
-    return (
-        "run `soc-ai blocklists refresh`. The abuse.ch feeds need ABUSE_CH_AUTH_KEY. "
-        "See docs/BLOCKLISTS.md. Triage keeps working with stale feeds and with "
-        "absent feeds."
-    )
+    # `stale` entries carry an age suffix; the source is the first token.
+    sources = set(missing) | {s.split(" ", 1)[0] for s in stale}
+    keyless = settings.abuse_ch_auth_key is None
+    unrefreshable = sorted(_ABUSE_CH_FEEDS & sources) if keyless else []
+    refreshable = sorted(sources - set(unrefreshable))
+    sentences: list[str] = []
+    # The feeds read by their names: "the Tor feed", "the Feodo, ThreatFox and
+    # URLhaus feeds". The hint read "to fetch tor. feodo, threatfox, urlhaus
+    # need ...", a sentence that started lowercase (dogfood round 2, V2-3).
+    if refreshable:
+        # Tor needs no key. The range doctor listed it as never refreshed, and
+        # the hint gave no step for it (dogfood 2026-10-19, R1-D21).
+        sentences.append(f"Run `soc-ai blocklists refresh` to fetch {_feeds_phrase(refreshable)}.")
+    if unrefreshable:
+        one = len(unrefreshable) == 1
+        ids = _and_join([f"`{s}`" for s in unrefreshable])
+        phrase = _feeds_phrase(unrefreshable)
+        sentences += [
+            f"{phrase[0].upper()}{phrase[1:]} {'needs' if one else 'need'} an abuse.ch Auth-Key. "
+            "The key is free.",
+            "ABUSE_CH_AUTH_KEY is not set, so `soc-ai blocklists refresh` skips "
+            f"{'this feed' if one else 'these feeds'}.",
+            "To clear the warning, register at https://auth.abuse.ch/ and set ABUSE_CH_AUTH_KEY.",
+            f"Or remove {ids} from `blocklist_sources`.",
+        ]
+    sentences.append("Triage continues with stale or absent feeds. See docs/BLOCKLISTS.md.")
+    return " ".join(sentences)
 
 
 def check_blocklists(settings: Settings) -> list[CheckResult]:
@@ -2368,8 +2522,8 @@ async def run_doctor(
                 CheckResult(
                     "checks",
                     "INFO",
-                    "the settings did not load. soc-ai skipped the store, security "
-                    "onion, elasticsearch, gateway and model checks.",
+                    "the settings did not load. soc-ai skipped the store, Security "
+                    "Onion, Elasticsearch, gateway and model checks.",
                 )
             )
             return results
@@ -2417,6 +2571,7 @@ async def run_doctor(
         _isolated("gateway", check_gateway(settings), _GATEWAY_TIMEOUT_S),
         _isolated("oracle route", check_oracle_route(settings), _ORACLE_ROUTE_TIMEOUT_S),
         _isolated("estate model", check_estate_model(settings), _STORE_TIMEOUT_S),
+        _isolated("admin password", check_admin_password(settings), _STORE_TIMEOUT_S),
     ]
     if include_fitness:
         checks.append(_isolated("model fitness", check_model_fitness(settings), _FITNESS_TIMEOUT_S))
@@ -2428,5 +2583,6 @@ async def run_doctor(
     results.extend(check_authentication(settings))
     results.extend(check_tls(settings))
     results.extend(check_blocklists(settings))
+    results.extend(check_backups(settings))
     results.extend(check_prompt_assets())
     return results

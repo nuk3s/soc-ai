@@ -201,7 +201,7 @@ describe('the lead page offers one verb', () => {
     const hunt = await screen.findByRole('button', { name: 'Hunt this lead' });
     expect(hunt.getAttribute('title')).toBe(ACTION_HUNT);
     expect(screen.getByTestId('lead-actions-line').textContent).toBe(
-      'Hunt this lead. The hunt investigates what it finds and brings back the verdicts.',
+      'Hunt this lead. soc-ai investigates each threat finding of the hunt and shows the verdicts.',
     );
     expect(LEAD_ACTIONS_LINE).toBe(screen.getByTestId('lead-actions-line').textContent);
   });
@@ -309,7 +309,7 @@ describe('the flow strip on the lead page', () => {
     );
     await waitFor(() =>
       expect(within(strip).getByTestId('flow-step-investigations').textContent).toContain(
-        '1 of 3 done',
+        '1 of 3 findings',
       ),
     );
     expect(getHunt).toHaveBeenCalledWith('H-LEAD-1');

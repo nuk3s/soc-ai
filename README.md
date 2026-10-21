@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/license-Apache%202.0-4b8bf5" alt="Apache 2.0">
   <img src="https://img.shields.io/badge/python-3.12-4b8bf5" alt="Python 3.12">
   <img src="https://img.shields.io/badge/Security%20Onion-3.0-3fb950" alt="Security Onion 3.0">
-  <img src="https://img.shields.io/badge/status-1.5.3-3fb950" alt="1.5.3">
+  <img src="https://img.shields.io/badge/status-1.6.0-3fb950" alt="1.6.0">
   <a href="https://soc-ai-demo.onrender.com/"><img src="https://img.shields.io/badge/live%20demo-online-3fb950" alt="Live demo"></a>
 </p>
 
@@ -30,7 +30,7 @@ Try the [live demo](https://soc-ai-demo.onrender.com/) first. It needs no instal
 docker compose -f docker-compose.demo.yml up --build   # then open http://127.0.0.1:8080
 ```
 
-A real install needs a Linux host with `git` and `curl`, network reach to your grid, and a model. The model is a local OpenAI-compatible endpoint or a cloud API key with redacted egress.
+A full install needs a Linux host with `git` and `curl`, network reach to your grid, and a model. The model is a local OpenAI-compatible endpoint or a cloud API key with redacted egress.
 
 ```bash
 git clone https://github.com/nuk3s/soc-ai.git && cd soc-ai
@@ -59,16 +59,16 @@ The [docs site](https://nuk3s.github.io/soc-ai/) holds the same pages, with sear
 - Installation: [Quickstart](docs/quickstart.md) · [Security Onion setup](docs/SECURITY-ONION-SETUP.md) · [Docker deployment](docs/DOCKER.md) · [Bare-metal deployment](docs/DEPLOYMENT.md) · [Blocklists](docs/BLOCKLISTS.md) · [Sensor PCAP setup](docs/SENSOR_PCAP_SETUP.md)
 - Operation: [Console guide](docs/WEBUI_GUIDE.md) · [Hunting](docs/HUNTING.md) · [Agent tools](docs/AGENT_TOOLS.md) · [OQL primer](docs/OQL_PRIMER.md) · [OQL hunting examples](docs/OQL_HUNT_EXAMPLES.md) · [Test PCAPs](docs/TEST_PCAPS.md)
 - Design: [Architecture](docs/ARCHITECTURE.md) · [Safety model](docs/SAFETY_MODEL.md) · [Audit chain breaks](docs/AUDIT-CHAIN.md) · [Lesser models](docs/LESSER_MODELS.md)
-- Project: [Roadmap](docs/ROADMAP.md) · Release notes [1.5.3](docs/releases/1.5.3.md), [1.5.2](docs/releases/1.5.2.md), [1.5.1](docs/releases/1.5.1.md) and [1.5.0](docs/releases/1.5.0.md) · [Changelog](CHANGELOG.md) · [Security policy](.github/SECURITY.md)
+- Project: [Roadmap](docs/ROADMAP.md) · Release notes [1.6.0](docs/releases/1.6.0.md), [1.5.3](docs/releases/1.5.3.md), [1.5.2](docs/releases/1.5.2.md), [1.5.1](docs/releases/1.5.1.md) and [1.5.0](docs/releases/1.5.0.md) · [Changelog](CHANGELOG.md) · [Security policy](.github/SECURITY.md)
 - Blog: [soc-ai hunts on its own now](docs/blog/2026-10-soc-ai-hunts-on-its-own-now.md) · [Getting an LLM to show its work](docs/blog/2026-07-getting-an-llm-to-show-its-work.md)
 
 ## Roadmap
 
 <div align="center">
-  <img src="docs/img/roadmap.svg" alt="The soc-ai roadmap. Releases 1.0 to 1.5 shipped: triage engine, measurement, operations, hunting, trust and proactive hunting. 1.5 is the current release. 1.6 joins leads into campaigns and measures the lead thresholds." width="900">
+  <img src="docs/img/roadmap.svg" alt="The soc-ai roadmap. Releases 1.0 to 1.6 shipped: triage engine, measurement, operations, hunting, trust, proactive hunting and operator workflow. 1.6 is the current release. 1.7 joins leads into campaigns and measures the lead thresholds." width="900">
 </div>
 
-Release 1.5 is the current release. soc-ai now hunts on its own: analytics run over the grid, and a lead starts its own hunt. Release 1.6 joins related leads into a campaign and validates the lead thresholds. [docs/ROADMAP.md](docs/ROADMAP.md) has the full story, and [CHANGELOG.md](CHANGELOG.md) has every version.
+Release 1.6 is the current release. soc-ai records each span of time when grid data is missing, and it shows that grid gap to the operator. The sweeps do not score the hours of a gap. The operator can act on waiting actions from one list and on many leads with one press. Release 1.7 joins related leads into a campaign and validates the lead thresholds. [docs/ROADMAP.md](docs/ROADMAP.md) has the full plan, and [CHANGELOG.md](CHANGELOG.md) has every version.
 
 ## Contributing
 

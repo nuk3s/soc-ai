@@ -98,11 +98,13 @@ class Settings(BaseSettings):
     def _validate_so_login_flow(cls, v: Any) -> Any:
         """Lowercase + validate so_login_flow in {auto, browser, api}."""
         if not isinstance(v, str):
-            raise ValueError(f"so_login_flow must be a string, got {type(v).__name__}")
+            raise ValueError(
+                f"so_login_flow must be a string. The value has type {type(v).__name__}."
+            )
         lowered = v.strip().lower()
         if lowered not in SO_LOGIN_FLOWS:
             raise ValueError(
-                f"so_login_flow must be one of: {', '.join(SO_LOGIN_FLOWS)}; got {v!r}"
+                f"so_login_flow must be one of: {', '.join(SO_LOGIN_FLOWS)}. The value is {v!r}."
             )
         return lowered
 
@@ -933,6 +935,14 @@ class Settings(BaseSettings):
     is already written stays until an analyst approves or retires the
     analytic."""
 
+    grid_gap_settle_minutes: int = 60
+    """Minutes the sweeps wait after a grid gap ends before they score its hours.
+
+    A grid gap is a span of hours the grid held no readable data for soc-ai.
+    The agents send the events they kept after the grid comes back. The hours
+    right after the recovery are not final until they do. The profile sweep
+    and the baseline treat the gap hours and this margin as unknown."""
+
     hunting_prior_sweep_interval_minutes: int = 60
     """Minutes between profile sweeps. Floor of 15.
 
@@ -967,8 +977,8 @@ class Settings(BaseSettings):
     """A hunt opens one investigation for each subject finding.
 
     ON by default. The owner's rule: a hunt that finds a sign of an attack
-    also checks it. A subject finding names an entity and cites a document
-    (soc_ai.hunting.findings.finding_is_subject). The hunt reads
+    also checks it. A subject finding is a threat finding that names an
+    entity (soc_ai.hunting.findings.finding_is_subject). The hunt reads
     ``investigating`` while the investigations run and ``complete`` when the
     last one ends. OFF restores the older behaviour: the hunt completes when
     its report lands, and the analyst opens each investigation by hand."""
@@ -1065,8 +1075,45 @@ class Settings(BaseSettings):
         except (TypeError, ValueError) as exc:
             raise ValueError("verdict_consistency_samples must be an integer in [1, 5]") from exc
         if i < 1 or i > 5:
-            raise ValueError(f"verdict_consistency_samples must be in [1, 5], got {i}")
+            raise ValueError(f"verdict_consistency_samples must be in [1, 5]. The value is {i}.")
         return i
+
+    # --- Swarm triage experiment (2026-10-08) ----------------------------
+    # docs/dev/specs/2026-10-08-swarm-triage-experiment-design.md. An
+    # experiment knob, off the Config console groups on purpose: the arms
+    # harness sets it per arm, and production keeps ``single``.
+    investigator_strategy: Literal["single", "spend", "ensemble", "advocates", "planes"] = "single"
+    """Which strategy runs the investigation loop. Env: ``INVESTIGATOR_STRATEGY``.
+
+    ``single`` is the loop as it is. ``spend`` and ``ensemble`` run the same
+    loop. They name an arm whose limits come from its environment. The
+    ``spend`` arm raises ``agent_tool_calls_limit`` and ``agent_request_limit``.
+    The ``ensemble`` arm sets ``verdict_consistency_samples``. ``advocates`` runs a
+    threat advocate and a benign advocate in parallel, and a judge with no
+    tools writes the report from their briefs. ``planes`` runs one worker per
+    evidence plane of the alert, and a lead with no tools writes the report.
+    The setting swaps the loop only. Every step before and after it is the
+    same for each strategy (soc_ai.agent.swarm)."""
+
+    advocate_tool_calls: int = Field(default=10, ge=0, le=200)
+    """Tool calls for each advocate of the ``advocates`` strategy. The two
+    advocates share ``agent_tool_calls_limit``: each one gets the smaller of
+    this value and half of that limit."""
+
+    advocate_request_limit: int = Field(default=8, ge=1, le=100)
+    """Model requests for each advocate of the ``advocates`` strategy."""
+
+    plane_worker_tool_calls: int = Field(default=6, ge=0, le=200)
+    """Tool calls for each plane worker of the ``planes`` strategy. The workers
+    share ``agent_tool_calls_limit``: each one gets the smaller of this value
+    and that limit divided by the worker count."""
+
+    plane_worker_request_limit: int = Field(default=5, ge=1, le=100)
+    """Model requests for each plane worker of the ``planes`` strategy."""
+
+    judge_request_limit: int = Field(default=3, ge=1, le=20)
+    """Model requests for the judge of ``advocates`` and the lead of ``planes``.
+    The judge has no tools, so the requests cover the schema retries."""
 
     # --- Synthesis confidence floor -------------------------------------
     # A synthesized verdict whose confidence comes back below this floor is
@@ -1467,10 +1514,14 @@ class Settings(BaseSettings):
     def _validate_notify_format(cls, v: Any) -> Any:
         """Lowercase + validate notify_format ∈ {json, slack, matrix}."""
         if not isinstance(v, str):
-            raise ValueError(f"notify_format must be a string, got {type(v).__name__}")
+            raise ValueError(
+                f"notify_format must be a string. The value has type {type(v).__name__}."
+            )
         lowered = v.strip().lower()
         if lowered not in ("json", "slack", "matrix"):
-            raise ValueError(f"notify_format must be one of: json, slack, matrix; got {v!r}")
+            raise ValueError(
+                f"notify_format must be one of: json, slack, matrix. The value is {v!r}."
+            )
         return lowered
 
     notify_verify_ssl: bool = True
@@ -1494,7 +1545,9 @@ class Settings(BaseSettings):
                 "notify_tp_confidence_threshold must be a number in [0.0, 1.0]"
             ) from exc
         if f < 0.0 or f > 1.0:
-            raise ValueError(f"notify_tp_confidence_threshold must be in [0.0, 1.0], got {f}")
+            raise ValueError(
+                f"notify_tp_confidence_threshold must be in [0.0, 1.0]. The value is {f}."
+            )
         return f
 
     notify_on_tp: bool = True
@@ -1667,7 +1720,7 @@ class Settings(BaseSettings):
         except (TypeError, ValueError) as exc:
             raise ValueError("memory_window_days must be an integer in [1, 365]") from exc
         if i < 1 or i > 365:
-            raise ValueError(f"memory_window_days must be in [1, 365], got {i}")
+            raise ValueError(f"memory_window_days must be in [1, 365]. The value is {i}.")
         return i
 
     @field_validator("memory_max_items", mode="before")
@@ -1679,7 +1732,7 @@ class Settings(BaseSettings):
         except (TypeError, ValueError) as exc:
             raise ValueError("memory_max_items must be an integer in [1, 5]") from exc
         if i < 1 or i > 5:
-            raise ValueError(f"memory_max_items must be in [1, 5], got {i}")
+            raise ValueError(f"memory_max_items must be in [1, 5]. The value is {i}.")
         return i
 
     # --- Oracle frontier adjudication ---------------------------------
@@ -1892,7 +1945,7 @@ class Settings(BaseSettings):
         except (TypeError, ValueError) as exc:
             raise ValueError("auto_ack_fp_threshold must be a number in [0.0, 1.0]") from exc
         if f < 0.0 or f > 1.0:
-            raise ValueError(f"auto_ack_fp_threshold must be in [0.0, 1.0], got {f}")
+            raise ValueError(f"auto_ack_fp_threshold must be in [0.0, 1.0]. The value is {f}.")
         return f
 
     auto_triage_min_severity: str = "high"
@@ -1914,11 +1967,14 @@ class Settings(BaseSettings):
     def _validate_auto_triage_min_severity(cls, v: Any) -> Any:
         """Lowercase and validate auto_triage_min_severity."""
         if not isinstance(v, str):
-            raise ValueError(f"auto_triage_min_severity must be a string, got {type(v).__name__}")
+            raise ValueError(
+                f"auto_triage_min_severity must be a string. The value has type {type(v).__name__}."
+            )
         lowered = v.strip().lower()
         if lowered not in {"critical", "high", "medium", "low"}:
             raise ValueError(
-                f"auto_triage_min_severity must be one of: critical, high, medium, low; got {v!r}"
+                "auto_triage_min_severity must be one of: critical, high, medium, low. "
+                f"The value is {v!r}."
             )
         return lowered
 
@@ -2038,8 +2094,8 @@ class Settings(BaseSettings):
         """
         if self.pcap_enabled and not self.so_ssh_host.strip():
             raise ValueError(
-                "PCAP_ENABLED is true but SO_SSH_HOST is empty — set SO_SSH_HOST to "
-                "the Security Onion sensor host (or set PCAP_ENABLED=false)."
+                "PCAP_ENABLED is true and SO_SSH_HOST is empty. Set SO_SSH_HOST to "
+                "the Security Onion sensor host, or set PCAP_ENABLED=false."
             )
         return self
 

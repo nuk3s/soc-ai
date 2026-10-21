@@ -104,6 +104,35 @@ class SpecStatus:
     fresh_24h: int
     already_handled_24h: int
     shadow_24h: int
+    # The failed runs of the window: rows that carry an error. The counters
+    # above read zero over a failed run, so a day of outage read as a quiet
+    # day, and one good sweep later the outage left no trace on the row.
+    failed_24h: int = 0
+    # The first failed run of the current streak of failures, or None when
+    # the newest run is clean. The streak starts after the newest clean run.
+    failing_since: datetime | None = None
+
+
+@dataclass(frozen=True)
+class LoopStatus:
+    """What the trail says about the catalog sweep loop as a whole.
+
+    One sweep is one run of the loop: the rows of one ``created_at``, because
+    every analytic in a sweep shares the sweep's ``now``. A run failed when
+    every analytic in it failed. A run with one good analytic did not fail:
+    the loop reached the grid, and the row of the failed analytic says why
+    that analytic did not.
+    """
+
+    last_run_at: datetime
+    last_failed: bool
+    # The error of the newest failed row of the newest run, or None.
+    last_error: str | None
+    runs_24h: int
+    failed_24h: int
+    # The first failed run of the current streak, or None when the newest
+    # run did not fail.
+    failing_since: datetime | None
 
 
 def _fired() -> ColumnElement[bool]:
@@ -277,6 +306,18 @@ async def catalog_status(session: AsyncSession, *, now: datetime) -> dict[str, S
         ).all()
     }
 
+    failed = {
+        spec_id: int(n or 0)
+        for spec_id, n in (
+            await session.execute(
+                select(HuntSpecSweep.spec_id, func.count())
+                .where(HuntSpecSweep.created_at >= cutoff, HuntSpecSweep.error.is_not(None))
+                .group_by(HuntSpecSweep.spec_id)
+            )
+        ).all()
+    }
+    streaks = await _failure_streaks(session, [s for s, r in newest.items() if r.error])
+
     status: dict[str, SpecStatus] = {}
     for spec_id, row in newest.items():
         sweeps, fired, fresh, handled, shadow = windowed.get(spec_id, (0, 0, 0, 0, 0))
@@ -293,15 +334,111 @@ async def catalog_status(session: AsyncSession, *, now: datetime) -> dict[str, S
             fresh_24h=int(fresh or 0),
             already_handled_24h=int(handled or 0),
             shadow_24h=int(shadow or 0),
+            failed_24h=failed.get(spec_id, 0),
+            failing_since=streaks.get(spec_id),
         )
     return status
+
+
+async def _failure_streaks(session: AsyncSession, spec_ids: list[str]) -> dict[str, datetime]:
+    """The first failed row after the newest clean row, per spec.
+
+    Only for the specs whose newest row failed. A spec with no clean row at
+    all failed from its first row on.
+    """
+    if not spec_ids:
+        return {}
+    clean = {
+        spec_id: last_id
+        for spec_id, last_id in (
+            await session.execute(
+                select(HuntSpecSweep.spec_id, func.max(HuntSpecSweep.id))
+                .where(HuntSpecSweep.spec_id.in_(spec_ids), HuntSpecSweep.error.is_(None))
+                .group_by(HuntSpecSweep.spec_id)
+            )
+        ).all()
+    }
+    out: dict[str, datetime] = {}
+    for spec_id in spec_ids:
+        stmt = select(func.min(HuntSpecSweep.created_at)).where(
+            HuntSpecSweep.spec_id == spec_id, HuntSpecSweep.error.is_not(None)
+        )
+        if spec_id in clean:
+            stmt = stmt.where(HuntSpecSweep.id > clean[spec_id])
+        first = await session.scalar(stmt)
+        if first is not None:
+            out[spec_id] = first
+    return out
+
+
+async def loop_status(
+    session: AsyncSession, *, now: datetime, spec_ids: set[str]
+) -> LoopStatus | None:
+    """The catalog sweep loop's own result, from the rows of ``spec_ids``.
+
+    None when the trail holds no row of these analytics. The caller passes the
+    analytics the catalog sweep runs, so the rows of a profile analytic from
+    before the split of the two loops do not speak for this loop.
+    """
+    if not spec_ids:
+        return None
+    runs = (
+        await session.execute(
+            select(
+                HuntSpecSweep.created_at,
+                func.count(),
+                func.sum(case((HuntSpecSweep.error.is_not(None), 1), else_=0)),
+            )
+            .where(HuntSpecSweep.spec_id.in_(sorted(spec_ids)))
+            .group_by(HuntSpecSweep.created_at)
+            .order_by(HuntSpecSweep.created_at.desc())
+        )
+    ).all()
+    if not runs:
+        return None
+    cutoff = now - STATUS_WINDOW
+
+    def _failed(rows: int, errors: int | None) -> bool:
+        return int(errors or 0) >= int(rows or 0) > 0
+
+    last_at, last_rows, last_errors = runs[0]
+    last_failed = _failed(last_rows, last_errors)
+    failing_since: datetime | None = None
+    if last_failed:
+        for at, rows, errors in runs:
+            if not _failed(rows, errors):
+                break
+            failing_since = at
+    last_error = None
+    if last_errors:
+        last_error = await session.scalar(
+            select(HuntSpecSweep.error)
+            .where(
+                HuntSpecSweep.spec_id.in_(sorted(spec_ids)),
+                HuntSpecSweep.created_at == last_at,
+                HuntSpecSweep.error.is_not(None),
+            )
+            .order_by(HuntSpecSweep.id.desc())
+            .limit(1)
+        )
+    window = [(rows, errors) for at, rows, errors in runs if at >= cutoff]
+    return LoopStatus(
+        last_run_at=last_at,
+        last_failed=last_failed,
+        last_error=last_error,
+        runs_24h=len(window),
+        failed_24h=sum(1 for rows, errors in window if _failed(rows, errors)),
+        failing_since=failing_since,
+    )
 
 
 __all__ = [
     "KEEP_LAST_PER_SPEC",
     "STATUS_WINDOW",
+    "LoopStatus",
     "SpecStatus",
     "catalog_status",
+    "loop_status",
     "recent",
     "record",
     "sweep_row",

@@ -4984,6 +4984,11 @@ async def test_investigation_loop_runs_and_flips_verdict(
     assert "synth_round1_skipped" in kinds
     assert loop_ev.payload["round1_verdict"] is None
     assert loop_ev.payload["reason"] == "definitely_investigate"
+    # The event names which trigger fired, so the timeline can say it
+    # (dogfood 2026-10-19, V1-A1). The skip event carries it too.
+    assert loop_ev.payload["trigger"] == "malware_rule"
+    skip_ev = next(e for e in events if e.kind == "synth_round1_skipped")
+    assert skip_ev.payload["trigger"] == "malware_rule"
     # The investigator was actually invoked (streamed via iter()).
     fake_investigator.iter.assert_called_once()
     fake_loop_synth.run.assert_awaited_once()

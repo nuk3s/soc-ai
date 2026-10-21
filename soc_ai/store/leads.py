@@ -28,6 +28,7 @@ __all__ = [
     "BACKTEST_DECISION_NOTE",
     "CLOSED_STATUSES",
     "DISMISS_REASONS",
+    "GRID_GAP_REASON",
     "HOLD_EARLIER_THREAT",
     "HOLD_PARTIAL_READ",
     "HOLD_SENTENCES",
@@ -35,6 +36,7 @@ __all__ = [
     "HUNT_FAILED_STATUSES",
     "HUNT_RUNNING_STATUSES",
     "KEPT_OPEN",
+    "OBSERVATION_DISMISS_REASONS",
     "PROMOTED_FINDING_REASON",
     "RELATED_WINDOW_DAYS",
     "RelatedLead",
@@ -97,6 +99,16 @@ AUTO_HUNT_ACTOR = "auto-hunt"
 # The reason the settle rule writes. It is not in DISMISS_REASONS: the form
 # offers the analyst five reasons, and this one is the rule's own word.
 HUNT_CLEAN_REASON = "hunt_clean"
+
+# The reason the grid-gap review writes on each hit it marks benign
+# (soc_ai.hunting.gap_recovery). The note names the gap and its hours. It is
+# not in DISMISS_REASONS: no form offers it, and no lead takes it. A hit of a
+# gap says something about the grid, and the sharpening loop must not read it
+# as a fault of the analytic.
+GRID_GAP_REASON = "grid_gap"
+
+# The reasons one observation can carry: the analyst's list and the gap review's.
+OBSERVATION_DISMISS_REASONS: tuple[str, ...] = (*DISMISS_REASONS, GRID_GAP_REASON)
 
 # A hunt that ended without an answer. The lead behind one goes back to open,
 # and the loop tries once more, then leaves it to the analyst.
@@ -350,6 +362,25 @@ def _clear_dismissal(lead: Lead) -> None:
     lead.dismissed_at = None
 
 
+def closed_on_verdicts(lead: Lead) -> bool:
+    """Whether soc-ai closed the lead on the verdicts of its hunt's findings.
+
+    The newest close of a promoted lead decides. :func:`settle_after_hunt`
+    signs that close with :data:`SYSTEM_HUNT_ACTOR` and the reason
+    :data:`PROMOTED_FINDING_REASON`. An analyst's close on a finding verdict
+    carries the reason and the analyst's name.
+    """
+    if lead.status != "promoted":
+        return False
+    for decision in reversed(decisions_of(lead)):
+        if decision.get("action") == "promoted":
+            return (
+                decision.get("by") == SYSTEM_HUNT_ACTOR
+                and decision.get("reason") == PROMOTED_FINDING_REASON
+            )
+    return False
+
+
 def hold_reason_of(lead: Lead) -> str | None:
     """Why the settle rule left the lead's current hunt to the analyst, or None.
 
@@ -479,7 +510,8 @@ async def dismiss_observation(
     """Mark one observation benign, in the shape a lead dismissal takes.
 
     The reason comes from :data:`DISMISS_REASONS`, so the sharpening loop
-    reads one list. The observation then counts toward no lead (see
+    reads one list. The grid-gap review writes :data:`GRID_GAP_REASON` through
+    this same path. The observation then counts toward no lead (see
     ``soc_ai.hunting.leads.weigh_entity``), and a repeat of the same content
     refreshes the same row, so the mark holds for the repeats.
 
@@ -487,7 +519,7 @@ async def dismiss_observation(
     first hand stay. ``LookupError`` for an id no row holds and ``ValueError``
     for a reason the list does not name.
     """
-    if reason not in DISMISS_REASONS:
+    if reason not in OBSERVATION_DISMISS_REASONS:
         raise ValueError(f"unknown dismissal reason: {reason}")
     row = await db.get(EntityObservation, int(observation_id))
     if row is None:
@@ -786,7 +818,11 @@ async def settle_after_hunt(db: AsyncSession, hunt: Hunt, *, now: datetime | Non
             verdicts=decided,
             hunt_id=hunt.id,
         )
-        _LOGGER.info("lead %s closed: every finding of hunt %s has a verdict", lead.id, hunt.id)
+        _LOGGER.info(
+            "lead %s closed: every threat finding of hunt %s that names an entity has a verdict",
+            lead.id,
+            hunt.id,
+        )
         return "closed"
     outcome = hunt_outcome_of(hunt)
     if outcome in ("threats", "gap"):

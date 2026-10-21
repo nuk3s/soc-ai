@@ -162,6 +162,22 @@ class LoginThrottle:
             return True
         return False
 
+    def retry_after(self, ip: str, username: str) -> float:
+        """Seconds until this key unlocks; 0.0 when it is not locked."""
+        until = self._locked.get(self._key(ip, username))
+        if until is None:
+            return 0.0
+        return max(0.0, until - time.monotonic())
+
+    def failures_left(self, ip: str, username: str) -> int:
+        """Failed attempts this key may still make before the lock engages."""
+        key = self._key(ip, username)
+        if self._locked.get(key, 0.0) > time.monotonic():
+            return 0
+        window_start = time.monotonic() - self.window_s
+        hits = [t for t in self._fails.get(key, ()) if t >= window_start]
+        return max(0, self.max_failures - len(hits))
+
     def clear(self, ip: str, username: str) -> None:
         """Clear all failure state for a key (call on a successful login)."""
         key = self._key(ip, username)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 from collections.abc import Sequence
 from datetime import UTC, datetime
@@ -16,7 +17,7 @@ from sqlalchemy import select
 
 from soc_ai.api.deps import get_elastic, get_settings_dep
 from soc_ai.api.security import identify_caller
-from soc_ai.api.webui import _timeline, routes_entity, routes_hunts
+from soc_ai.api.webui import _timeline, action_rules, routes_entity, routes_hunts
 from soc_ai.api.webui._errors import api_error
 from soc_ai.api.webui._shared import (
     _ago,
@@ -27,8 +28,10 @@ from soc_ai.api.webui._shared import (
     router,
 )
 from soc_ai.api.webui._timeline import (
+    CaseRefOut,
     InvestigationOut,
     InvMetaOut,
+    StandingAnalystVerdictOut,
     SupersededRunOut,
     _alert_meta,
     _build_actions,
@@ -37,18 +40,24 @@ from soc_ai.api.webui._timeline import (
     _chat_msg_out,
     _collect_reasoning,
     _entity_graph,
+    _graph_scope,
     _host_signals,
+    action_tool_names,
 )
 from soc_ai.api.webui.routes_alerts import _es_api_error_http, _grid_unavailable
 from soc_ai.config import Settings
+from soc_ai.demo.guard import is_demo
 from soc_ai.hunting.step_words import current_activity
 from soc_ai.secret_scrub import scrub_secrets, scrub_value
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.store import chat as chat_svc
+from soc_ai.store import host_machines
 from soc_ai.store import investigations as inv_svc
 from soc_ai.store.models import Hunt, Investigation
 from soc_ai.triage_models import is_pipeline_fallback
 from soc_ai.webui import (
+    anchor_check,
+    case_links,
     hunt_manager,
 )
 
@@ -212,6 +221,14 @@ class InvestigationRowOut(BaseModel):
     # "backtest" for a backtest replay. The console marks a replay with a chip,
     # because a replay is a measurement and the list is the live work.
     ranBy: str = ""
+    # The recommended actions of this run that wait for a person, under the
+    # needs-you rule. Filled only when the list is asked for
+    # ``pending_action=true``. None means the list did not count them.
+    pendingActions: int | None = None
+    # The waiting actions themselves, under the same filter only. The console
+    # offers Execute and Dismiss on the row (dogfood 2026-10-19, R1-I1). None
+    # means the list did not read them.
+    waitingActions: list[_timeline.WaitingActionOut] | None = None
 
 
 def _elapsed_sec(inv: Investigation) -> int:
@@ -454,6 +471,10 @@ class InvestigationListOut(BaseModel):
     backtestReplays: int = 0
     # Echo of the request: whether the rows and the figures include replays.
     includesBacktest: bool = False
+    # Echo of the ``entity`` filter: every key the filter matched on. The
+    # machine of the entity is stored under each of its addresses and names.
+    # Null when the request named no entity.
+    entityKeys: list[str] | None = None
 
 
 @router.get("/investigations", response_model=InvestigationListOut)
@@ -468,6 +489,8 @@ async def list_investigations(
     limit: int = 100,
     offset: int = 0,
     include_backtest: bool = False,
+    pending_action: bool = False,
+    entity: str | None = None,
 ) -> InvestigationListOut:
     """Investigation rows, newest first — filtered, counted and paged in SQL.
 
@@ -494,10 +517,28 @@ async def list_investigations(
     over one capped read and the response says when the set outgrew that cap.
     An unknown value is refused with 422, like an unknown ``verdict`` member.
 
+    ``entity`` keeps the real runs that name one machine: either end of the
+    flow is one of its addresses, or the reporting host is one of its names.
+    The value may be any key of the machine. A value that names no machine
+    filters on itself. Synth-eval runs and backtest replays never match it,
+    so the host page count and this list agree. ``q`` matched one key, and
+    the host page of a domain controller found 1 of its 7 runs that way
+    (dogfood 2026-10-19, R4-D3).
+
     ``include_backtest`` puts the backtest replays into the rows and the
     figures. Off by default: a replay is a measurement on an alert an analyst
     already closed, and the list and the Dashboard count live work. Each row
     carries ``ranBy``, so the console can mark a replay when it shows one.
+
+    ``pending_action`` keeps only the runs with a recommended action that waits
+    for a person, the runs the needs-you count counts
+    (:func:`routes_meta.pending_action_runs`), inside ``since``/``until``. Each
+    row then carries ``pendingActions`` and ``waitingActions``, the actions the
+    console offers on the row (:func:`routes_meta.waiting_actions_by_run`). The
+    needs-you line linked to the whole list, and the analyst paged through
+    every run to find the actions (dogfood 2026-10-19, R1-I1). A replay never
+    has a pending action, so the filter leaves replays out even with
+    ``include_backtest``.
     """
     statuses = _csv_filter("status", status, inv_svc.DISPLAY_STATUSES)
     verdicts = _csv_filter("verdict", verdict, _VERDICT_FILTERS)
@@ -523,7 +564,29 @@ async def list_investigations(
     # the split is decided per row and the count has to describe the partition.
     read_limit = inv_svc.MAX_PAGE_LIMIT if wanted_state else limit
     read_offset = 0 if wanted_state else offset
+    wanted_entity = (entity or "").strip()
+    if len(wanted_entity) > _SEARCH_MAX:
+        raise api_error(
+            422,
+            "bad_filter",
+            f"An entity may be at most {_SEARCH_MAX} characters.",
+        )
     async with request.app.state.db_sessionmaker() as db:
+        pending: dict[str, int] | None = None
+        if pending_action:
+            from soc_ai.api.webui.routes_meta import (  # noqa: PLC0415 - cycle
+                pending_action_runs,
+            )
+
+            pending = await pending_action_runs(
+                db,
+                since=routes_hunts._naive_utc(since),
+                until=routes_hunts._naive_utc(until),
+                state=request.app.state,
+            )
+        entity_keys = (
+            await host_machines.entity_expansion(db, wanted_entity) if wanted_entity else None
+        )
         page = await inv_svc.query_page(
             db,
             since=routes_hunts._naive_utc(since),
@@ -534,6 +597,8 @@ async def list_investigations(
             limit=read_limit,
             offset=read_offset,
             include_backtest=include_backtest,
+            ids=None if pending is None else sorted(pending),
+            entity_keys=entity_keys,
         )
         # A row stored with the old "suricata" default shows the type its alert
         # document names (RL5). Corrected once, in place.
@@ -541,6 +606,18 @@ async def list_investigations(
         chat_counts = await chat_svc.counts_for(db, [inv.id for inv in page.rows])
         alert_ids = sorted({g for inv in page.rows if (g := inv_svc.alert_group_id(inv))})
         group_rows = await inv_svc.runs_for_alerts(db, alert_ids)
+        waiting: dict[str, list[_timeline.WaitingActionOut]] | None = None
+        if pending is not None:
+            from soc_ai.api.webui.routes_meta import (  # noqa: PLC0415 - cycle
+                waiting_actions_by_run,
+            )
+
+            waiting = await waiting_actions_by_run(
+                db,
+                [inv for inv in page.rows if inv.id in pending],
+                demo=is_demo(request.app.state.settings),
+                state=request.app.state,
+            )
     # Primacy over the FULL groups. A page row that names no group — a blank
     # alert_es_id, or a hunt-subject run, whose anchor document is a time
     # anchor and not its subject — contributes no group to fan out on, so it
@@ -566,6 +643,10 @@ async def list_investigations(
         )
         for inv in page.rows
     ]
+    if pending is not None:
+        for row in rows:
+            row.pendingActions = pending.get(row.id, 0)
+            row.waitingActions = (waiting or {}).get(row.id, [])
     if wanted_state is None:
         return InvestigationListOut(
             rows=rows,
@@ -578,6 +659,7 @@ async def list_investigations(
             offset=offset,
             backtestReplays=page.backtest_replays,
             includesBacktest=include_backtest,
+            entityKeys=entity_keys,
         )
     kept = [r for r in rows if _needs_retry(r) == (wanted_state == "live")]
     return InvestigationListOut(
@@ -597,6 +679,7 @@ async def list_investigations(
         # left out, the partition holds none.
         backtestReplays=sum(1 for r in kept if inv_svc.is_backtest_actor(r.ranBy)),
         includesBacktest=include_backtest,
+        entityKeys=entity_keys,
     )
 
 
@@ -625,8 +708,17 @@ async def get_investigation(
         # The newer run that replaced this one, read whole: the page names its
         # verdict in a banner, so a bookmarked older run never reads as the
         # current answer (dogfood 2026-10-06, investigation S1).
-        superseded_by = _superseded_by(inv, group_runs)
+        superseded_by = _superseded_by(inv, group_runs) or await _answered_by(db, inv)
         newer = await db.get(Investigation, superseded_by) if superseded_by else None
+        standing_analyst, live_run = await _alert_verdicts(db, inv)
+        # A promoted run that uses the alert of this run as its anchor. The
+        # action rule refuses every write for that alert when the anchor is
+        # not a Security Onion alert (V3-N2). The grid answers below.
+        anchor = (
+            (await inv_svc.hunt_anchor_kinds(db, [inv.alert_es_id])).get(inv.alert_es_id)
+            if inv.alert_es_id and not inv_svc.is_promoted(inv)
+            else None
+        )
         typical = (
             routes_hunts._typical_run(await _recent_run_seconds(db))
             if inv.status == "running"
@@ -657,6 +749,26 @@ async def get_investigation(
         alert_unacked=ack_state is False,
         ran_at=_iso_utc(inv.finished_at or inv.created_at) or None,
         replay=inv_svc.is_backtest(inv),
+    )
+    anchor_status = (
+        (await anchor_check.alert_status(request.app.state, [inv.alert_es_id])).get(
+            inv.alert_es_id, anchor_check.UNKNOWN
+        )
+        if anchor is not None and inv.alert_es_id
+        else anchor_check.NOT_ALERT
+    )
+    write_blocked, alert_cases, cases_complete = await _apply_action_rule(
+        request,
+        elastic,
+        settings,
+        inv,
+        events,
+        report,
+        actions,
+        superseded_by=superseded_by,
+        analyst=standing_analyst,
+        anchor=anchor,
+        anchor_status=anchor_status,
     )
 
     # The enriched-alert-context event carries the alert, the host's alert
@@ -754,6 +866,8 @@ async def get_investigation(
         hostContext=_host_signals(host_profile),
         hostContexts=_timeline._host_contexts(enr_p.get("host_alert_profiles")),
         graphNote=graph_note,
+        graphScope=_graph_scope(alert_obj, enrichments, inv),
+        hostContextWindowHours=settings.host_risk_window_hours,
         openQuestions=_timeline._open_questions_out(report, events),
         citations=_timeline._citations_out(report, events),
         failure=_timeline._failure_out(inv.status, events),
@@ -772,12 +886,82 @@ async def get_investigation(
         isSynthEval=bool(inv.is_synth_eval),
         supersededBy=superseded_by,
         supersededRun=_superseded_run_out(newer),
+        standingAnalystVerdict=standing_analyst,
+        writeBlockedReason=write_blocked,
+        alertCases=alert_cases,
+        alertCasesComplete=cases_complete,
+        alertLiveRun=_superseded_run_out(live_run),
         currentStep=current_activity(events) if inv.status == "running" else None,
         typicalRun=typical.model_dump() if typical is not None else None,
         runClass=_run_class_of(inv),
         runClassReason=_str_or_none(report.get("run_class_reason")),
         entities=entities,
     )
+
+
+async def _apply_action_rule(
+    request: Request,
+    elastic: ElasticClient,
+    settings: Settings,
+    inv: Investigation,
+    events: Sequence[Any],
+    report: dict[str, Any],
+    actions: Sequence[Any],
+    *,
+    superseded_by: str | None,
+    analyst: StandingAnalystVerdictOut | None,
+    anchor: str | None,
+    anchor_status: str = anchor_check.NOT_ALERT,
+) -> tuple[str | None, list[CaseRefOut], bool]:
+    """Set the ``blockedReason`` of each action card, under the one action rule.
+
+    The rule is :func:`action_rules.action_block`, the one the row of the
+    pending-action list, the needs-you count and the execute route read, so
+    the card and the row cannot disagree (V3-N2). Returns the run-level
+    reason, the cases the alert is already on, and whether the grid
+    confirmed that list.
+
+    The run-level reason holds the rules with no page state of their own: a
+    promotion, and the anchor of a promotion. The settled bar and the
+    escalate of the chat read it. The page shows the replay and the
+    superseded run on its own, and the demo note at the press.
+
+    The cases are read only when an escalate waits. The card names each case:
+    the execute route opens no second case.
+    """
+    from soc_ai.api.webui.routes_actions import _observed_case_id  # noqa: PLC0415 - cycle
+
+    facts = action_rules.ActionFacts(
+        replay=inv_svc.is_backtest(inv),
+        superseded_by=superseded_by,
+        promoted=action_rules.promoted_kind(inv),
+        anchor=anchor,
+        anchor_status=anchor_status,
+        alert_id=inv.alert_es_id,
+        run_verdict=inv.verdict,
+        analyst_verdict=analyst.verdict if analyst is not None else None,
+        analyst_by=analyst.by if analyst is not None else None,
+        case_id=_observed_case_id(list(events)),
+        demo=is_demo(settings),
+    )
+    for action, tool_name in zip(actions, action_tool_names(events, report), strict=False):
+        action.blockedReason = action_rules.block_reason(facts, tool_name)
+    write_blocked = action_rules.block_reason(
+        dataclasses.replace(facts, replay=False, superseded_by=None, demo=False), None
+    )
+    if not (
+        inv.alert_es_id
+        and facts.promoted is None
+        and not facts.replay
+        and not facts.superseded_by
+        and any(a.tag == "escalate" and not a.applied for a in actions)
+    ):
+        return write_blocked, [], False
+    case_ids, complete = await case_links.cases_of_alert(
+        request.app.state.db_sessionmaker, elastic, settings, inv.alert_es_id
+    )
+    cases = [CaseRefOut(id=c, url=case_links.case_url(settings, c)) for c in case_ids]
+    return write_blocked, cases, complete
 
 
 def _str_or_none(value: Any) -> str | None:
@@ -862,6 +1046,38 @@ def _oracle_line(settings: Settings, inv: Investigation, has_oracle: bool) -> st
     return f"Oracle review: not run. Confidence {conf:.2f} is under {band:.2f}."
 
 
+async def _alert_verdicts(
+    db: Any, inv: Investigation
+) -> tuple[StandingAnalystVerdictOut | None, Investigation | None]:
+    """The analyst verdict that stands on the alert, and a replay's live run.
+
+    A new run from this page can replace the verdict of the alert. The page
+    asks first when an analyst verdict stands on ANY run of the alert, and it
+    names it (dogfood 2026-10-19, V1-A3). On a backtest replay it also names
+    the live verdict the new run replaces (V1-A2). A hunt subject names a
+    cited document, and the store reads no verdict of it as the alert's.
+    """
+    alert_id = inv.alert_es_id
+    if not alert_id or inv_svc.is_hunt_subject(inv):
+        return None, None
+    found = (await inv_svc.analyst_verdicts_for_alerts(db, [alert_id])).get(alert_id)
+    analyst = (
+        StandingAnalystVerdictOut(
+            investigationId=found.investigation_id,
+            verdict=_verdict(found.verdict),
+            by=found.resolved_by or None,
+            via=found.resolved_via,
+            at=found.resolved_at,
+        )
+        if found is not None
+        else None
+    )
+    live = None
+    if inv_svc.is_backtest(inv):
+        live = (await inv_svc.standing_for_alerts(db, [alert_id])).get(alert_id)
+    return analyst, live
+
+
 def _superseded_run_out(newer: Investigation | None) -> SupersededRunOut | None:
     """What the newer run reached: its status, and its verdict once it has one."""
     if newer is None:
@@ -874,6 +1090,50 @@ def _superseded_run_out(newer: Investigation | None) -> SupersededRunOut | None:
         verdict=_verdict(newer.verdict) if complete else None,
         conf=newer.confidence if complete else None,
     )
+
+
+async def _answered_by(db: Any, inv: Investigation) -> str | None:
+    """The run that answered this run's Request more info, when one exists.
+
+    The alert group links a live run to its answer. A backtest replay stands
+    alone, so its answer is read off the report (R2-D12). An answer that
+    failed answers nothing, and the page keeps its actions.
+    """
+    fid = inv_svc.follow_up_id(inv)
+    if not fid or fid == inv.id:
+        return None
+    answer = await db.get(Investigation, fid)
+    if answer is None or answer.status not in ("running", "complete"):
+        return None
+    return fid
+
+
+async def superseding_run_id(db: Any, inv: Investigation) -> str | None:
+    """The newer run that replaced *inv*, by the rule the detail page uses."""
+    group_id = inv_svc.alert_group_id(inv)
+    group_runs = await inv_svc.runs_for_alerts(db, [group_id]) if group_id else []
+    return _superseded_by(inv, group_runs) or await _answered_by(db, inv)
+
+
+async def superseding_run_ids(db: Any, runs: Sequence[Investigation]) -> dict[str, str]:
+    """:func:`superseding_run_id` for many runs: run id to the run that replaced it.
+
+    One read of the alert groups for every run, so a list row pays no query of
+    its own. A run that stands is not in the answer.
+    """
+    group_ids = sorted({g for inv in runs if (g := inv_svc.alert_group_id(inv))})
+    by_group: dict[str, list[inv_svc.RunRef]] = {}
+    for ref in await inv_svc.runs_for_alerts(db, group_ids):  # newest first
+        by_group.setdefault(ref.alert_es_id or "", []).append(ref)
+    out: dict[str, str] = {}
+    for inv in runs:
+        group_id = inv_svc.alert_group_id(inv)
+        newer = _superseded_by(inv, by_group.get(group_id, []) if group_id else [])
+        if newer is None:
+            newer = await _answered_by(db, inv)
+        if newer:
+            out[inv.id] = newer
+    return out
 
 
 def _superseded_by(inv: Investigation, group_runs: Sequence[inv_svc.RunRef]) -> str | None:
@@ -1068,6 +1328,7 @@ async def bulk_rehunt(  # noqa: PLR0915 — linear per-id skip/start loop, each 
 
     inv_by_id: dict[str, Investigation] = {}
     promoted_anchors: set[str] = set()
+    analyst_alerts: set[str] = set()
     if eligible:
         async with request.app.state.db_sessionmaker() as db:
             rows = (
@@ -1080,10 +1341,30 @@ async def bulk_rehunt(  # noqa: PLR0915 — linear per-id skip/start loop, each 
             # re-investigation of a promoted finding lands an ordinary
             # kind="suricata" row over the same anchor, and relaunching THAT
             # row through the manager's default kind would run with SO writes
-            # on over cited telemetry that has no SO alert behind it.
+            # on over cited telemetry that has no SO alert behind it. An
+            # anchor that is a real alert reruns (dogfood 2026-10-21).
             promoted_anchors = await inv_svc.hunt_anchor_ids(
                 db, [inv.alert_es_id for inv in rows if inv.alert_es_id]
             )
+            # A new run can replace an analyst verdict on any run of the
+            # alert. The page asks first and names the verdict (dogfood
+            # 2026-10-19, R2-D1 and V1-A3). This list has no confirm, so it
+            # skips the alert and names the reason.
+            analyst_alerts = set(
+                await inv_svc.analyst_verdicts_for_alerts(
+                    db, [inv.alert_es_id for inv in rows if inv.alert_es_id]
+                )
+            )
+
+    # One grid search for the anchors of the batch, after the store session.
+    anchor_states = await anchor_check.alert_status(
+        request.app.state,
+        [
+            inv.alert_es_id
+            for inv in inv_by_id.values()
+            if inv.alert_es_id in promoted_anchors and not inv_svc.is_promoted(inv)
+        ],
+    )
 
     for inv_id in eligible:
         inv = inv_by_id.get(inv_id)
@@ -1091,7 +1372,12 @@ async def bulk_rehunt(  # noqa: PLR0915 — linear per-id skip/start loop, each 
             skipped.append({"invId": inv_id, "reason": "not_found"})
             continue
 
-        if inv_svc.is_promoted(inv) or inv.alert_es_id in promoted_anchors:
+        anchor_state = (
+            anchor_states.get(inv.alert_es_id or "", anchor_check.UNKNOWN)
+            if inv.alert_es_id in promoted_anchors
+            else anchor_check.ALERT
+        )
+        if inv_svc.is_promoted(inv) or anchor_state == anchor_check.NOT_ALERT:
             # A promoted finding's anchor is cited telemetry, not an SO alert —
             # relaunching it here would mint an unlabeled kind="suricata"
             # duplicate carrying the finding title as rule_name (the exact
@@ -1100,8 +1386,18 @@ async def bulk_rehunt(  # noqa: PLR0915 — linear per-id skip/start loop, each 
             skipped.append({"invId": inv_id, "reason": "hunt_kind"})
             continue
 
+        if anchor_state == anchor_check.UNKNOWN:
+            # The grid did not say whether the anchor is an alert. The new
+            # run could write to Security Onion, so the batch skips it.
+            skipped.append({"invId": inv_id, "reason": "anchor_unread"})
+            continue
+
         if not inv.alert_es_id:
             skipped.append({"invId": inv_id, "reason": "no_alert"})
+            continue
+
+        if inv.alert_es_id in analyst_alerts:
+            skipped.append({"invId": inv_id, "reason": "analyst_verdict"})
             continue
 
         # Concurrency guard: start at most _REHUNT_START_CAP runs this call — the
@@ -1205,16 +1501,30 @@ async def request_more_info(
         # Anchor-keyed, like bulk re-hunt: an ordinary row over a promoted
         # anchor (a re-investigation) is as much off-limits as the promoted
         # row itself — the manager's default kind would relaunch it with SO
-        # writes on over cited telemetry that has no SO alert behind it.
+        # writes on over cited telemetry that has no SO alert behind it. An
+        # anchor that is a real alert reruns (dogfood 2026-10-21).
         over_promoted_anchor = (
             inv is not None
             and bool(inv.alert_es_id)
+            and not inv_svc.is_promoted(inv)
             and bool(await inv_svc.hunt_anchor_ids(db, [inv.alert_es_id]))
         )
 
     if inv is None:
         raise HTTPException(status_code=404, detail={"reason": "not_found"})
-    if inv_svc.is_promoted(inv) or over_promoted_anchor:
+    anchor_state = (
+        (await anchor_check.alert_status(request.app.state, [inv.alert_es_id or ""])).get(
+            inv.alert_es_id or "", anchor_check.UNKNOWN
+        )
+        if over_promoted_anchor
+        else anchor_check.ALERT
+    )
+    if anchor_state == anchor_check.UNKNOWN:
+        raise HTTPException(
+            status_code=503,
+            detail={"reason": "anchor_unread", "hint": action_rules.ANCHOR_UNREAD},
+        )
+    if inv_svc.is_promoted(inv) or anchor_state != anchor_check.ALERT:
         # Re-promotion from the hunt page is the sanctioned re-run for a
         # promoted finding — relaunching here would mint an unlabeled
         # kind="suricata" duplicate against the same anchor telemetry doc.
@@ -1251,6 +1561,20 @@ async def request_more_info(
             },
         )
 
+    async with request.app.state.db_sessionmaker() as db:
+        answered = await superseding_run_id(db, inv)
+    if answered:
+        # One question, one answer. A second press started a second run on a
+        # run the page already called answered (R2-D12).
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": "already_answered",
+                "invId": answered,
+                "hint": f"Investigation {answered} answers this run. Open it.",
+            },
+        )
+
     questions = _open_questions_of(inv, inv_events)
     focus_hint = _focus_hint_from_questions(questions) if questions else None
 
@@ -1278,6 +1602,8 @@ async def request_more_info(
         raise api_error(
             503,
             "could_not_start",
-            "The console did not start the run. Check the model gateway on the Config screen.",
+            "The console did not start the run. Check the model gateway in Settings.",
         )
+    async with request.app.state.db_sessionmaker() as db:
+        await inv_svc.record_follow_up(db, inv_id, follow_up_id=new_inv_id, requested_by=started_by)
     return {"investigation_id": new_inv_id}

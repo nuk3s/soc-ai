@@ -5,6 +5,11 @@ Two small batch directories are written under tmp_path, in the shape
 bundle per run with an ``events.jsonl``. The tests read the printed numbers.
 The negative controls: a directory with no ``index.jsonl`` prints one clear
 line and exits 2, and an event that is not a ``usage`` event adds nothing.
+
+A second group of tests covers the swarm experiment additions: the
+strategy label and the agents-per-run count a bundle's ``triage_report``
+and ``swarm_agent_finished`` events carry, and the cost-matched flag that
+reads arm B's tokens as a multiple of arm A's.
 """
 
 from __future__ import annotations
@@ -52,6 +57,25 @@ def _usage(input_tokens: int, output_tokens: int, requests: int, tool_calls: int
 
 # Not a usage event. Its token count must not reach the sums.
 _NOT_USAGE = {"kind": "tool_call", "payload": {"input_tokens": 999_999, "tool_name": "t"}}
+
+
+def _swarm_finished(n: int) -> dict[str, Any]:
+    return {
+        "kind": "swarm_agent_finished",
+        "session_id": "s",
+        "sequence": n,
+        "payload": {"agent": f"worker{n}"},
+    }
+
+
+def _triage_report(strategy: str | None = None, *, in_counters: bool = False) -> dict[str, Any]:
+    payload: dict[str, Any] = {"verdict": "true_positive"}
+    if strategy is not None:
+        if in_counters:
+            payload["counters"] = {"strategy": strategy}
+        else:
+            payload["strategy"] = strategy
+    return {"kind": "triage_report", "session_id": "s", "sequence": 9, "payload": payload}
 
 
 def _bundle(batch: Path, name: str, events: list[dict[str, Any]]) -> Path:
@@ -170,6 +194,9 @@ def test_each_arm_prints_its_counts_quality_and_cost(
     assert code == 0, err
     assert lines[0] == f"== arm A: {a}"
     assert lines[1] == "runs 3  ok 2  errors 1  fallbacks 1"
+    # Neither bundle carries a triage_report or a swarm_agent_finished event:
+    # the strategy is unknown and each run counts as one agent.
+    assert lines[2] == f"strategy                        {compare_arms.NA}"
     assert "strict recall (macro)           0.600  ci [0.400, 0.700]" in lines
     assert "verdict-only recall (macro)     0.800  ci [0.600, 0.900]" in lines
     assert "benign strict (macro)           0.900  ci [0.750, 1.000]" in lines
@@ -183,6 +210,8 @@ def test_each_arm_prints_its_counts_quality_and_cost(
         "per run (2 bundles): input tokens 2250  output tokens 225  requests 2.00  tool calls 3.00"
         in lines
     )
+    # Neither bundle emits a swarm_agent_finished event, so each run is one agent.
+    assert "agents per run (2 bundles): 1.00" in lines
     assert "median investigation wall time 20.0 s" in lines
 
     b_start = lines.index(f"== arm B: {b}")
@@ -208,7 +237,9 @@ def test_the_scenario_table_and_the_token_change(
         "h1            0/5      1/5   +0.20",
         "m1            n/a      2/5     n/a",
     ]
-    assert lines[-1] == "input tokens per run: A 2250  B 2700  change +20.0%"
+    assert lines[-2] == "input tokens per run: A 2250  B 2700  change +20.0%"
+    # A's mean total tokens 2250 + 225 = 2475. B's: 2700 + 250 = 2950. 2950 / 2475 = 1.19x.
+    assert lines[-1] == "cost-matched: B spends 1.19x the tokens of A (within the 2x budget)"
 
 
 def test_an_arm_directory_reads_its_newest_batch(
@@ -236,7 +267,8 @@ def test_a_batch_with_no_aggregates_says_how_to_build_them(
     assert code == 0
     assert f"no aggregates.json. Run: soc-ai eval-report --no-meta {b}" in lines
     # The usage still reads from the bundles.
-    assert lines[-1] == "input tokens per run: A 2250  B 2700  change +20.0%"
+    assert lines[-2] == "input tokens per run: A 2250  B 2700  change +20.0%"
+    assert lines[-1] == "cost-matched: B spends 1.19x the tokens of A (within the 2x budget)"
 
 
 def test_a_directory_with_no_index_prints_one_line_and_exits_2(
@@ -255,6 +287,73 @@ def test_a_directory_with_no_index_prints_one_line_and_exits_2(
         f"compare-arms: {empty}: no index.jsonl here and no batch-* directory with one. "
         "Pass the batch directory that validate-batch wrote."
     ]
+
+
+def test_strategy_and_agents_read_from_swarm_events(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The strategy label and the agent count both come from the bundle's own events."""
+    empty_stratum = _stratum(strict=0.5, precision=0.5, flip=0.0, stability={})
+    a = _batch(
+        tmp_path / "A",
+        usages=[
+            [
+                _usage(1000, 100, 1, 2),
+                _triage_report("ensemble"),
+                _swarm_finished(1),
+                _swarm_finished(2),
+                _swarm_finished(3),
+            ],
+            [_usage(1000, 100, 1, 2), _triage_report("ensemble", in_counters=True)],
+        ],
+        walls=[10_000, 10_000],
+        stratum=empty_stratum,
+    )
+    b = _batch(
+        tmp_path / "B",
+        usages=[[_usage(1000, 100, 1, 2), _triage_report("single")]],
+        walls=[10_000],
+        stratum=empty_stratum,
+    )
+    code, lines, err = _run(capsys, a, b)
+
+    assert code == 0, err
+    assert "strategy                        ensemble" in lines
+    # bundle 0 carries 3 swarm_agent_finished events; bundle 1 carries none, so it
+    # counts as 1 agent. Mean (3 + 1) / 2 = 2.00.
+    assert "agents per run (2 bundles): 2.00" in lines
+    assert "strategy                        single" in lines
+    assert "agents per run (1 bundles): 1.00" in lines
+
+
+def test_cost_matched_flag_over_the_budget(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A B that spends more than twice A's tokens is flagged OVER the budget."""
+    empty_stratum = _stratum(strict=0.0, precision=0.0, flip=0.0, stability={})
+    a = _batch(
+        tmp_path / "A", usages=[[_usage(100, 0, 1, 1)]], walls=[1_000], stratum=empty_stratum
+    )
+    b = _batch(
+        tmp_path / "B", usages=[[_usage(300, 0, 1, 1)]], walls=[1_000], stratum=empty_stratum
+    )
+    _code, lines, _err = _run(capsys, a, b)
+
+    assert lines[-1] == "cost-matched: B spends 3.00x the tokens of A (OVER the 2x budget)"
+
+
+def test_cost_matched_flag_is_na_with_no_usage(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An arm with no resolvable bundle has no tokens to total, so the flag reads n/a."""
+    empty_stratum = _stratum(strict=0.0, precision=0.0, flip=0.0, stability={})
+    a = _batch(tmp_path / "A", usages=[], walls=[], stratum=empty_stratum)
+    b = _batch(
+        tmp_path / "B", usages=[[_usage(100, 0, 1, 1)]], walls=[1_000], stratum=empty_stratum
+    )
+    _code, lines, _err = _run(capsys, a, b)
+
+    assert lines[-1] == "cost-matched: n/a"
 
 
 def test_the_script_runs_with_the_standard_library_alone(arms: tuple[Path, Path]) -> None:

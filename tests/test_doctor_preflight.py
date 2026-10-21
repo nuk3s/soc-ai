@@ -280,7 +280,7 @@ async def test_coverage_count_error_warns(
     _patch_elastic(monkeypatch, fake)
     result = await doctor.check_index_pattern_coverage(settings_kratos)
     assert result.status == "WARN"
-    assert result.hint.startswith("Fix Elasticsearch connectivity first")
+    assert result.hint.startswith("Fix the grid connection first")
     assert fake.closed  # cleanup still runs on the exception path
 
 
@@ -387,7 +387,7 @@ async def test_reachability_dns_label_too_long_is_dns_kind(
         assert "resolve" in r.hint.lower() or "DNS" in r.detail
 
 
-async def test_reachability_connection_refused_names_firewall(
+async def test_reachability_connection_refused_names_the_setting(
     monkeypatch: pytest.MonkeyPatch, settings_kratos: Settings
 ) -> None:
     def _raise_refused(*args: Any, **kwargs: Any) -> Any:
@@ -400,13 +400,40 @@ async def test_reachability_connection_refused_names_firewall(
     assert all(r.status == "FAIL" for r in results)
 
     by_name = {r.name: r for r in results}
-    # SO/ES sit behind the SO firewall — keep the pinhole wording naming ES's
-    # port specifically.
-    assert "firewall" in by_name["SO reachability"].hint.lower()
-    assert "firewall" in by_name["ES reachability"].hint.lower()
-    # The gateway is a different service entirely — sending an operator to
-    # pinhole the SO firewall for a dead LiteLLM box would point nowhere.
-    assert "firewall" not in by_name["gateway reachability"].hint.lower()
+    # A refused connection means nothing listens on the port. The SO firewall
+    # drops a packet, it does not refuse it, so pinhole advice sent the
+    # operator to the wrong fix (dogfood 2026-10-19, H1-D20). Each row names
+    # the setting that holds its own address, and the SO row no longer
+    # talks about the Elasticsearch port.
+    so_hint = by_name["SO reachability"].hint
+    es_hint = by_name["ES reachability"].hint
+    gw_hint = by_name["gateway reachability"].hint
+    for hint in (so_hint, es_hint, gw_hint):
+        assert hint.startswith("Nothing listens on the address.")
+        assert "firewall" not in hint.lower()
+    assert "SO_HOST" in so_hint and "9200" not in so_hint
+    assert "ES_HOSTS" in es_hint
+    assert "LITELLM_BASE_URL" in gw_hint
+
+
+async def test_reachability_gateway_hint_does_not_assume_docker(
+    monkeypatch: pytest.MonkeyPatch, settings_kratos: Settings
+) -> None:
+    """The gateway hint told a host-venv install to check the Docker network
+    (dogfood 2026-10-19, H1-D20). Docker is one case, and the hint says so."""
+
+    def _raise_timeout(*args: Any, **kwargs: Any) -> Any:
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr("socket.getaddrinfo", _fake_getaddrinfo)
+    monkeypatch.setattr("socket.create_connection", _raise_timeout)
+    results = await doctor.check_upstream_reachability(settings_kratos)
+    gw = {r.name: r for r in results}["gateway reachability"].hint
+    assert "LITELLM_BASE_URL" in gw
+    assert "On a Docker install" in gw
+    assert "inside this container on the Docker network" not in gw
+    so = {r.name: r for r in results}["SO reachability"].hint
+    assert "9200" not in so
 
 
 async def test_reachability_all_good(
@@ -636,7 +663,9 @@ def test_reach_hints_cover_every_target_and_failure_kind() -> None:
     since check_upstream_reachability has no per-target isolation of its
     own, the other two rows alongside it)."""
     expected = {
-        (slug, kind) for slug in ("so", "es", "gateway") for kind in ("dns", "tls", "reach")
+        (slug, kind)
+        for slug in ("so", "es", "gateway")
+        for kind in ("dns", "tls", "reach", "refused")
     }
     assert set(doctor._REACH_HINTS) == expected
 
@@ -794,22 +823,26 @@ async def test_alerts_filter_ahead_of_every_alternative_passes_and_pins_call_sha
         assert {"exists": {"field": "synth.scenario_id"}} in call["query"]["bool"]["must_not"]
 
 
-async def test_alerts_filter_on_a_quiet_grid_passes_with_a_note(
+async def test_alerts_filter_on_an_empty_grid_warns_and_clears_the_filter(
     monkeypatch: pytest.MonkeyPatch, settings_kratos: Settings
 ) -> None:
-    """No label finds anything, so nothing is misconfigured. The grid is quiet.
+    """No label finds anything. The filter is not the cause, and the row says so.
 
-    The over-correction guard. Reporting a problem here would train operators
-    to ignore the row on every idle grid, which is how a real mismatch gets
-    scrolled past.
+    This row used to PASS. On the range a sensor sent no data for four days,
+    and this row stayed green over an empty queue (dogfood 2026-10-19, R5-D6).
+    A quiet grid and a blind sensor read the same here, so the row WARNs and
+    the hint names both causes. It still points away from the filter, so the
+    operator does not edit a filter that is fine.
     """
     search = _FakeAlertFilterSearch({})
     fake = _FakeElastic(search=search)
     _patch_elastic(monkeypatch, fake)
     result = await doctor.check_alerts_feed_filter(_alerts_settings(settings_kratos, "tags:alert"))
-    assert result.status == "PASS"
+    assert result.status == "WARN"
     assert "No label found an alert" in result.detail
-    assert "triage queue will be empty" in result.detail
+    assert "The triage queue is empty." in result.detail
+    assert "The filter is not the cause." in result.detail
+    assert "sensor" in result.hint
 
 
 async def test_alerts_filter_that_is_not_valid_oql_warns(
@@ -835,7 +868,7 @@ async def test_alerts_filter_count_error_warns(
     _patch_elastic(monkeypatch, fake)
     result = await doctor.check_alerts_feed_filter(_alerts_settings(settings_kratos, "tags:alert"))
     assert result.status == "WARN"
-    assert result.hint.startswith("Fix Elasticsearch connectivity first")
+    assert result.hint.startswith("Fix the grid connection first")
     assert fake.closed
 
 
@@ -856,7 +889,7 @@ async def test_alerts_filter_partial_grid_read_warns(
     assert result.status == "WARN"
     assert "counts are unreliable" in result.detail
     assert "WEBUI_ALERTS_QUERY" not in result.hint
-    assert result.hint.startswith("Fix Elasticsearch connectivity first")
+    assert result.hint.startswith("Fix the grid connection first")
     assert fake.closed
 
 

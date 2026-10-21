@@ -295,7 +295,7 @@ describe('LeadDetail', () => {
   it('reads every kind from the one table', async () => {
     mount();
     await waitFor(() =>
-      expect(screen.getAllByText('finding with no benign baseline').length).toBeGreaterThan(0),
+      expect(screen.getAllByText('no benign baseline').length).toBeGreaterThan(0),
     );
     expect(screen.getAllByText('off hours').length).toBeGreaterThan(0);
   });
@@ -534,10 +534,39 @@ describe('LeadDetail hunts on the lead', () => {
     } as never);
     mount();
     fireEvent.click(await screen.findByRole('button', { name: 'Hunt again' }));
-    expect(screen.getByText(/A hunt on this lead already exists/)).toBeTruthy();
+    // R3-I5: the confirm names the hunt on record and the close that follows.
+    const confirm = screen.getByTestId('lead-hunt-again-confirm');
+    expect(confirm.textContent).toMatch(/^This lead has a hunt( from .+ ago)?\. Read that hunt first\./);
+    expect(confirm.textContent).toContain(
+      'soc-ai closes the lead when the new hunt finds no threat, or when every threat finding of the hunt that names an entity has a verdict.',
+    );
+    expect(within(confirm).getByRole('link', { name: 'that hunt' }).getAttribute('href')).toBe(
+      '/hunts/H-LEAD-1',
+    );
     expect(huntLead).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole('button', { name: 'Start another hunt' }));
     await waitFor(() => expect(huntLead).toHaveBeenCalledWith(12));
+  });
+
+  // V1-H4: Escape did not close the Hunt again confirm.
+  it('closes the Hunt again confirm on Escape', async () => {
+    vi.mocked(getHunts).mockResolvedValue([HUNT_ON_LEAD as never]);
+    vi.mocked(getLead).mockResolvedValue({
+      ...LEAD,
+      status: 'hunting',
+      hunt_id: 'H-LEAD-1',
+      hunt_status: 'complete',
+    } as never);
+    mount();
+    const again = await screen.findByRole('button', { name: 'Hunt again' });
+    fireEvent.click(again);
+    const confirm = screen.getByTestId('lead-hunt-again-confirm');
+    expect(confirm).toBeTruthy();
+    expect(document.activeElement?.textContent).toBe('Cancel');
+    fireEvent.keyDown(document.activeElement as Element, { key: 'Escape' });
+    expect(screen.queryByTestId('lead-hunt-again-confirm')).toBeNull();
+    expect(document.activeElement).toBe(again);
+    expect(huntLead).not.toHaveBeenCalled();
   });
 });
 
@@ -1012,7 +1041,7 @@ describe('LeadDetail weight', () => {
     await openScoring();
     await screen.findByTestId('lead-meta');
     expect(screen.getByText(/weight now 1\.28/).getAttribute('title')).toBe(
-      'A sighting counts half as much after 48 hours. A new sighting adds weight.',
+      'An observation counts half as much after 48 hours. A sweep that sees it again adds weight.',
     );
   });
 });

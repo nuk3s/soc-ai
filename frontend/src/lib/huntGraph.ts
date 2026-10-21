@@ -191,16 +191,16 @@ export function huntGraphView(findings: HuntFinding[], affectedHosts: string[] =
             `Named in ${plural(s.count, 'finding')}.`,
             ...(s.threats ? [`Named in ${plural(s.threats, 'threat finding')}.`] : []),
             `Worst severity: ${s.worst}.`,
-            'Click to open its page.',
+            'Select it to open its page.',
           ]
-        : [s.host, 'The hunt marked this host affected. No finding names it.', 'Click to open its page.'],
+        : [s.host, 'The hunt marked this host affected. No finding names it.', 'Select it to open its page.'],
     });
   }
 
   const legend: LegendItem[] = [];
   const cats = new Set(findings.map(category));
   if (cats.has('threat')) {
-    legend.push({ kind: 'node', label: 'threat finding · severity colour', color: SEVERITY.high.color, shape: 'square' });
+    legend.push({ kind: 'node', label: 'threat finding · severity color', color: SEVERITY.high.color, shape: 'square' });
   }
   if (cats.has('visibility_gap')) {
     legend.push({ kind: 'node', label: 'visibility gap', color: HUNT_COLOR.gap, shape: 'square' });

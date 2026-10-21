@@ -2,6 +2,7 @@ import { Send, Wrench } from 'lucide-react';
 import { type ReactNode, useEffect, useRef } from 'react';
 import { DocumentChip } from './DocumentDrawer';
 import { Markdown } from './Markdown';
+import { linkifyChatAnswer } from '../lib/chatLinks';
 import { findEventIds } from '../lib/eventIds';
 
 // ---------------------------------------------------------------------------
@@ -48,20 +49,42 @@ interface ChatThreadViewProps<M extends ChatDockMessage> {
   linkIds?: string[];
   /** Move the focus into the input on mount. The panel opens with it. */
   autoFocus?: boolean;
+  /** Render addresses, leads and investigation ids in answers as links. */
+  linkEntities?: boolean;
+  /** Why a send cannot work now. The send control is off while it is set. */
+  blockedReason?: string | null;
+  /** A state the answer depends on, said above the input. */
+  stateNote?: string | null;
 }
 
-// Tool name -> what the analyst would call it. Unknown tools fall back to a
-// de-prefixed, de-underscored form so a new tool still reads sensibly.
+// Tool name -> what the analyst would call it, as a step in progress. Unknown
+// tools fall back to "Running <name>" so a new tool still reads as a step.
+// The panel showed "Host dossier" and "Field values" for two tools this map
+// did not hold (dogfood 2026-10-19, R1-D23).
 const TOOL_LABELS: Record<string, string> = {
   t_query_events_oql: 'Querying events',
   t_query_zeek_logs: 'Reading Zeek logs',
+  t_describe_dataset: 'Reading the dataset fields',
+  t_field_values: 'Reading field values',
+  t_get_event_raw: 'Reading the raw event',
+  t_run_analytic: 'Running an analytic',
   t_enrich_ip: 'Enriching IP',
   t_enrich_domain: 'Enriching domain',
   t_enrich_hash: 'Enriching hash',
   t_host_summary: 'Profiling host',
+  t_host_dossier: 'Reading the dossier',
   t_origin_chain: 'Checking who used the host',
   t_prevalence: 'Checking prevalence',
   t_rule_prevalence: 'Checking rule prevalence',
+  t_beacon_profile: 'Measuring the beacon cadence',
+  t_dns_entropy_scan: 'Scanning DNS names',
+  t_dcerpc_histogram: 'Counting DCE/RPC calls',
+  t_first_seen: 'Checking the first sighting',
+  t_suggest_rule_tuning: 'Checking the rule tuning',
+  t_shodan_internetdb: 'Looking up the address on Shodan',
+  t_shodan_host: 'Looking up the address on Shodan',
+  t_greynoise: 'Looking up the address on GreyNoise',
+  t_cve_lookup: 'Looking up the CVE',
   t_get_pcap: 'Fetching PCAP',
   t_decode_payload: 'Decoding payload',
   t_get_rule_content: 'Reading the rule',
@@ -72,6 +95,10 @@ const TOOL_LABELS: Record<string, string> = {
   t_web_search: 'Searching the web',
   t_crawl_page: 'Reading a page',
   propose_verdict: 'Drafting a verdict',
+  propose_hunt: 'Drafting a hunt',
+  // The server's step when the time ran out and the model writes an answer
+  // from the results so far (chat_turn.PARTIAL_ANSWER_STEP).
+  partial_answer: 'Writing an answer from the results so far',
 };
 
 // Tool name -> the noun for one call and for several. The footer counts
@@ -80,6 +107,19 @@ const TOOL_LABELS: Record<string, string> = {
 const TOOL_NOUNS: Record<string, [string, string]> = {
   t_query_events_oql: ['event query', 'event queries'],
   t_query_zeek_logs: ['Zeek log query', 'Zeek log queries'],
+  t_describe_dataset: ['dataset read', 'dataset reads'],
+  t_field_values: ['field value read', 'field value reads'],
+  t_run_analytic: ['analytic run', 'analytic runs'],
+  t_beacon_profile: ['beacon check', 'beacon checks'],
+  t_dns_entropy_scan: ['DNS scan', 'DNS scans'],
+  t_dcerpc_histogram: ['DCE/RPC count', 'DCE/RPC counts'],
+  t_first_seen: ['first-sighting check', 'first-sighting checks'],
+  t_suggest_rule_tuning: ['rule tuning check', 'rule tuning checks'],
+  t_shodan_internetdb: ['Shodan lookup', 'Shodan lookups'],
+  t_shodan_host: ['Shodan lookup', 'Shodan lookups'],
+  t_greynoise: ['GreyNoise lookup', 'GreyNoise lookups'],
+  t_cve_lookup: ['CVE lookup', 'CVE lookups'],
+  propose_hunt: ['hunt draft', 'hunt drafts'],
   t_enrich_ip: ['IP lookup', 'IP lookups'],
   t_enrich_domain: ['domain lookup', 'domain lookups'],
   t_enrich_hash: ['hash lookup', 'hash lookups'],
@@ -120,10 +160,7 @@ export function toolsSummary(tools: string | null | undefined): string | null {
 }
 
 export function toolLabel(name: string): string {
-  return (
-    TOOL_LABELS[name] ??
-    name.replace(/^t_/, '').replace(/_/g, ' ').replace(/^./, (c) => c.toUpperCase())
-  );
+  return TOOL_LABELS[name] ?? `Running ${name.replace(/^t_/, '').replace(/_/g, ' ')}`;
 }
 
 /**
@@ -142,10 +179,13 @@ export function AssistantBubble({
   text,
   tools,
   linkIds,
+  linkEntities = false,
 }: {
   text?: string | null;
   tools?: string | null;
   linkIds?: string[];
+  /** Render addresses, leads and investigation ids as links to their pages. */
+  linkEntities?: boolean;
 }) {
   const summary = toolsSummary(tools);
   // Ids only when the caller asked for them: the Dashboard chat has no scope
@@ -158,7 +198,7 @@ export function AssistantBubble({
           className="overflow-hidden break-words rounded-[12px_12px_12px_3px] border border-border-2 bg-surface-3 px-[13px] py-2.5 text-[13px] leading-[1.55] text-text-2 [&_pre]:max-w-full [&_pre]:overflow-x-auto"
           style={{ textWrap: 'pretty' }}
         >
-          <Markdown>{text}</Markdown>
+          {linkEntities ? <Markdown appLinks>{linkifyChatAnswer(text)}</Markdown> : <Markdown>{text}</Markdown>}
         </div>
       ) : null}
       {ids.length > 0 ? (
@@ -199,7 +239,11 @@ export function ChatThreadView<M extends ChatDockMessage>({
   renderSpecial,
   linkIds,
   autoFocus,
+  linkEntities = false,
+  blockedReason = null,
+  stateNote = null,
 }: ChatThreadViewProps<M>) {
+  const blocked = !!blockedReason;
   const listRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const didMountRef = useRef(false);
@@ -263,7 +307,7 @@ export function ChatThreadView<M extends ChatDockMessage>({
               key={i}
               className={`flex min-w-0 max-w-[88%] flex-col gap-1.5 self-start${isNew ? ' animate-fadeUp' : ''}`}
             >
-              <AssistantBubble text={m.text} tools={m.tools} linkIds={linkIds} />
+              <AssistantBubble text={m.text} tools={m.tools} linkIds={linkIds} linkEntities={linkEntities} />
             </div>
           );
         })}
@@ -285,7 +329,19 @@ export function ChatThreadView<M extends ChatDockMessage>({
           </div>
         )}
       </div>
-      <div className="flex items-end gap-[9px] border-t border-border px-[13px] py-[11px]">
+      {(blockedReason || stateNote) && (
+        <div
+          data-testid="chat-state"
+          role="status"
+          className={`flex-none border-t border-border px-[13px] pt-2 text-[11.5px] leading-[1.45] ${blocked ? 'text-warn' : 'text-faint'}`}
+        >
+          {blockedReason ?? stateNote}
+          {blockedReason && stateNote ? ` ${stateNote}` : ''}
+        </div>
+      )}
+      <div
+        className={`flex items-end gap-[9px] px-[13px] py-[11px]${blockedReason || stateNote ? '' : ' border-t border-border'}`}
+      >
         <textarea
           ref={inputRef}
           rows={1}
@@ -295,7 +351,7 @@ export function ChatThreadView<M extends ChatDockMessage>({
           onKeyDown={(e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
               e.preventDefault();
-              onSend();
+              if (!blocked) onSend();
             }
           }}
           placeholder={placeholder}
@@ -304,7 +360,9 @@ export function ChatThreadView<M extends ChatDockMessage>({
         <button
           onClick={onSend}
           aria-label="Send"
-          className="flex h-9 w-[38px] flex-none items-center justify-center rounded-control bg-accent text-white hover:bg-accent-deep"
+          disabled={blocked}
+          title={blockedReason ?? undefined}
+          className="flex h-9 w-[38px] flex-none items-center justify-center rounded-control bg-accent text-white hover:bg-accent-deep disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-accent"
         >
           <Send size={16} />
         </button>

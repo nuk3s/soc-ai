@@ -313,7 +313,7 @@ def test_startup_refuses_when_a_prompt_asset_is_missing(
         _require_prompt_assets()
 
     message = str(excinfo.value)
-    assert "refusing to start" in message
+    assert "does not start" in message
     assert "oql primer" in message
     assert "query language is unavailable" in message
     assert "OQL_PRIMER.md" in message

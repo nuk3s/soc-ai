@@ -306,9 +306,9 @@ describe('HuntDetail — Draft detection per finding (confirm-first)', () => {
     // instead of rendering nothing (the flag is hot-editable). findByRole
     // would throw on >1 match — so this also pins that the non-TP cards
     // (f0/f2/f3/f4) do NOT get the pointer.
-    const link = await screen.findByRole('link', { name: /enable it in config/i });
+    const link = await screen.findByRole('link', { name: /turn it on in settings/i });
     expect(link).toHaveAttribute('href', '/config#triage-automation');
-    expect(screen.getByText(/detection authoring is off/i)).toBeInTheDocument();
+    expect(screen.getByText(/Sigma export is off/i)).toBeInTheDocument();
   });
 
   it('shows the badge ONLY on the finding whose promoted investigation is complete + true_positive', async () => {
@@ -320,7 +320,7 @@ describe('HuntDetail — Draft detection per finding (confirm-first)', () => {
     const badges = await screen.findAllByRole('button', { name: /draft detection/i });
     expect(badges).toHaveLength(1);
     // No Config pointer when the flag is on.
-    expect(screen.queryByText(/detection authoring is off/i)).toBeNull();
+    expect(screen.queryByText(/Sigma export is off/i)).toBeNull();
   });
 
   it('drafts a detection for the confirmed finding and renders the review pane', async () => {
@@ -597,7 +597,7 @@ describe('HuntDetail — the labels on a finding', () => {
     // Five threat findings, one investigation complete. The next control is
     // the one the finding cards show.
     expect(within(strip).getByTestId('flow-step-investigations').textContent).toContain(
-      '1 of 5 done',
+      '1 of 5 findings',
     );
     expect(within(strip).getByTestId('flow-control-investigations').textContent).toBe(
       '· Open an investigation',

@@ -88,6 +88,30 @@ export interface AlertEvent {
   conf?: number | null;
 }
 
+/** Another group of the window that shares a flow with a row (R2-I9).
+ *
+ * `flow`: an alert of each group carries the same network.community_id, within
+ * 1 hour of the other.
+ * `hosts`: an alert of each group runs between the same two hosts within 5
+ * minutes of the other. */
+export interface AlertSibling {
+  name: string;
+  kind: DetectionKind;
+  /** The verdict the row of the sibling shows. null for a pipeline error. */
+  verdict: string | null;
+  conf: number | null;
+  /** The run behind that verdict. null for an untriaged sibling. */
+  invId: string | null;
+  signals: Array<'flow' | 'hosts'>;
+}
+
+/** One Security Onion case, and its page in the Security Onion console. */
+export interface CaseLink {
+  id: string;
+  /** null when the server names no Security Onion host. */
+  url: string | null;
+}
+
 /** A grouped-by-detection row in the Alerts console. */
 export interface AlertGroup {
   id: string;
@@ -149,6 +173,11 @@ export interface AlertGroup {
   worstVerdict?: string | null;
   worstConf?: number | null;
   worstInvId?: string | null;
+  /** The verdict an analyst set on the alert behind the badge, on any run of
+   *  it, the analyst, and that run. Absent from an older server. */
+  analystVerdict?: string | null;
+  analystBy?: string | null;
+  analystInvId?: string | null;
   /** The window verdict: the worst verdict among the runs made inside the
    *  page window, and the run that holds it. null when the group has no run
    *  in the window. Absent on an older server. */
@@ -158,6 +187,21 @@ export interface AlertGroup {
   /** The ISO time of the run behind the standing verdict `verdict`. The row
    *  states the age of an inherited verdict from it. */
   verdictAt?: string | null;
+  /** The other groups of the window that share a flow with this one, worst
+   *  verdict first, and how many there are. null or absent: no sibling data
+   *  (the query asked for no links, or the grid did not answer). */
+  siblings?: AlertSibling[] | null;
+  siblingCount?: number | null;
+  /** True when a size limit of the sibling read cut data that can hold a
+   *  sibling of this group, so `siblingCount` is a floor (V3-N1). null or
+   *  absent: no sibling data, or an older server. */
+  siblingsPartial?: boolean | null;
+  /** The Security Onion cases the escalated alerts of the group are on.
+   *  Absent unless the query asked for links. */
+  cases?: CaseLink[];
+  /** True when `cases` covers every escalated alert of the group. The server
+   *  reads the newest escalated alerts only, so a long list can be partial. */
+  casesComplete?: boolean;
 }
 
 /** Returned by GET /api/v1/alerts/empty-reason: why the queue is showing nothing.
@@ -168,8 +212,108 @@ export interface AlertGroup {
  * answer and it is never folded into `quiet`, because a read that failed is not a
  * calm network. */
 export interface AlertsEmptyReason {
-  reason: 'not_empty' | 'quiet' | 'filter_mismatch' | 'bad_filter' | 'unknown';
+  reason: 'not_empty' | 'quiet' | 'filter_mismatch' | 'bad_filter' | 'unknown' | 'gap';
   hint: string;
+}
+
+// ---- Grid gaps -------------------------------------------------------------
+
+/** One recorded hole in the grid data, from GET /api/v1/grid/gaps.
+ *
+ * `probe`: soc-ai saw the grid unreadable. `sweep`: the grid answered, but
+ * documents stopped on most hosts of one plane, and `plane` names it.
+ * `operator`: an operator recorded a gap that soc-ai did not see. */
+export interface GridGap {
+  id: number;
+  source: 'probe' | 'sweep' | 'operator';
+  plane: string | null;
+  started_at: string;
+  /** null while the gap is open. */
+  ended_at: string | null;
+  open: boolean;
+  /** Whole seconds. For an open gap, the server counts up to now. */
+  duration_s: number;
+  detail: string;
+  /** The hits this gap wrote that nobody marked benign yet. 0 for an open
+   *  gap. Absent on an older server. */
+  hits_to_review?: number;
+}
+
+/** One hit a grid gap wrote, from GET /api/v1/grid/gaps/{id}/hits. The event
+ *  window is the one the server rule read. */
+export interface GridGapHit {
+  id: number;
+  analytic_id: string;
+  analytic_title: string;
+  entity_kind: string;
+  entity_key: string;
+  kind: string;
+  kind_label: string;
+  summary: string | null;
+  recorded_in_shadow: boolean;
+  lead_id: number | null;
+  event_start: string;
+  event_end: string;
+  born_at: string | null;
+  /** The event window lies inside the gap plus the settle margin. Absent on
+   *  an older server. */
+  inside_gap?: boolean;
+  /** The review selects the hit for the mark. A spike and a hit that only
+   *  overlaps the gap stay unselected. Absent on an older server. */
+  selected_by_default?: boolean;
+  /** Why the review leaves the hit unselected, one sentence each. */
+  reasons?: string[];
+}
+
+/** A hold of the daily hit limit, and the hits in its window that a grid gap
+ *  wrote. `return_offered`: the other hits stay inside the limit and the hold
+ *  names no other breach. */
+export interface GridGapHold {
+  analytic_id: string;
+  title: string;
+  hits: number;
+  gap_hits: number;
+  /** The gap hits that are spikes. A gap does not explain a spike. */
+  spike_hits?: number;
+  budget: number;
+  return_offered: boolean;
+  gap_ids: number[];
+  held_at: string;
+}
+
+/** GET /api/v1/grid/gaps/{id}/hits: the hits one gap wrote, the leads that
+ *  hold them, and the holds they caused. `hits` stops at 500 rows; `count`
+ *  is exact. */
+export interface GridGapHits {
+  gap: GridGap;
+  review_start: string;
+  review_end: string;
+  settle_minutes: number;
+  /** The note each mark carries: "Grid gap from ... to ...". */
+  note: string;
+  count: number;
+  hits: GridGapHit[];
+  /** The hits of `count` that the review selects by default. */
+  selected_count?: number;
+  leads: number[];
+  held: GridGapHold[];
+}
+
+/** POST /api/v1/grid/gaps/{id}/hits/benign. */
+export interface GridGapBenignResult {
+  marked: number;
+  ids: number[];
+  leads: number[];
+  note: string;
+  held: GridGapHold[];
+}
+
+/** Returned by GET /api/v1/grid/gaps: the gaps that overlap [since, until],
+ *  oldest first. */
+export interface GridGaps {
+  since: string;
+  until: string;
+  gaps: GridGap[];
 }
 
 // ---- Representative-event picker -------------------------------------------
@@ -233,6 +377,12 @@ export interface RecommendedAction {
   dismissed?: boolean;
   dismissedBy?: string | null;
   dismissedAt?: string | null;
+  /** Why the card offers no write. The server decides with one rule for the
+   *  card, the row of the pending-action list, the needs-you count and the
+   *  execute route: replay, superseded run, promoted finding or lead, anchor
+   *  of a promotion, no alert, analyst verdict, comment with no case, demo.
+   *  Dismiss stays on. Absent on an older server. */
+  blockedReason?: string | null;
 }
 
 export interface ResolutionProvenance {
@@ -448,6 +598,13 @@ export interface Investigation {
   oracle?: OracleAdjudication | null;
   /** One-line blast-radius summary shown in the collapsed entity-graph bar. */
   graphNote?: string;
+  /** The direction of the alert's flow: `lateral` (internal to internal),
+   *  `inbound`, `outbound` or `external`. Null when an end is unknown. Only
+   *  `lateral` is lateral movement. Absent from an older server. */
+  graphScope?: 'lateral' | 'inbound' | 'outbound' | 'external' | null;
+  /** The host context counts alerts within this many hours each side of the
+   *  alert. Absent from an older server. */
+  hostContextWindowHours?: number | null;
   /** Unresolved gaps from a needs_more_info verdict — seeds the resolve-in-chat flow. */
   openQuestions?: string[];
   /** The report's citations with their type. An `id` citation names a document
@@ -459,6 +616,23 @@ export interface Investigation {
   supersededBy?: string | null;
   /** What that later run reached: its status, and its verdict once it has one. */
   supersededRun?: SupersededRun | null;
+  /** The verdict an analyst set on the alert, on any run of it. A newer
+   *  model run can carry another verdict while this one stands. Absent from
+   *  an older server. */
+  standingAnalystVerdict?: StandingAnalystVerdict | null;
+  /** Why no write from this page can reach Security Onion: a promotion
+   *  landed the run, or a promotion uses its alert as the anchor. The page
+   *  then offers no settled bar and no escalate from the chat. Absent from an
+   *  older server. */
+  writeBlockedReason?: string | null;
+  /** The Security Onion cases the alert of this run is already on, read
+   *  when an escalate waits. The escalate card names and links each one. */
+  alertCases?: CaseLink[];
+  /** False when the grid did not confirm the case list. */
+  alertCasesComplete?: boolean;
+  /** On a backtest replay only: the live run of the alert. A new run started
+   *  from the replay replaces its verdict. Absent from an older server. */
+  alertLiveRun?: SupersededRun | null;
   /** A run in flight: what it does now, in words. */
   currentStep?: string | null;
   /** A run in flight: how long runs on this grid take, from the newest
@@ -511,6 +685,18 @@ export interface InvestigationCitation {
 }
 
 /** The newer run of the same alert that replaced a run. */
+/** The verdict an analyst set on an alert, and the run it is on. */
+export interface StandingAnalystVerdict {
+  investigationId: string;
+  verdict: string;
+  /** The person, when the resolution names one. */
+  by?: string | null;
+  /** 'manual' for an override, 'chat' for a chat proposal the analyst applied. */
+  via: string;
+  /** ISO UTC time of the resolution. */
+  at?: string | null;
+}
+
 export interface SupersededRun {
   id: string;
   status: string;
@@ -622,6 +808,31 @@ export interface InvestigationRow {
   /** Who started the run: an analyst, the scheduler, a sweep, or "backtest"
    *  for a backtest replay. The list marks a replay with a chip. */
   ranBy?: string;
+  /** The recommended actions of the run that wait for a person. Filled only
+   *  when the list is asked for `pending_action=true`. Null otherwise. */
+  pendingActions?: number | null;
+  /** Those actions, for Execute and Dismiss on the row (dogfood 2026-10-19,
+   *  R1-I1). Filled under the same filter only. Absent on an older server. */
+  waitingActions?: WaitingAction[] | null;
+}
+
+/** One recommended action that waits for a person, as a list row carries it.
+ *  `index` is the position in the report, the key of the action routes. The
+ *  row offers Execute only when `executable` is true. `reason` says why not. */
+export interface WaitingAction {
+  id: string;
+  index: number;
+  type: ActionTag;
+  /** The type in the operator's words: "Escalate to case", "Acknowledge". */
+  label: string;
+  /** The rule of the alert, the case id of a comment, or the title of a
+   *  finding or a lead. */
+  target: string | null;
+  /** What the action acts on. */
+  targetType: 'alert' | 'case' | 'finding' | 'lead' | null;
+  rationale: string;
+  executable: boolean;
+  reason: string | null;
 }
 
 /** One SQL page of GET /api/v1/investigations — the /dossiers list shape.
@@ -649,6 +860,9 @@ export interface InvestigationList {
    *  `includesBacktest` they do. An older server sends neither field. */
   backtestReplays?: number;
   includesBacktest?: boolean;
+  /** Echo of the `entity` filter: every key of the machine the filter read.
+   *  Null or absent when the request named no entity. */
+  entityKeys?: string[] | null;
 }
 
 // ---- Hunts -----------------------------------------------------------------
@@ -780,6 +994,15 @@ export interface HuntFinding {
   investigationStatus?: FindingInvestigationStatus | null;
   /** Recommended actions of the investigation that wait for a person. */
   pendingActions?: number;
+  /** Who put the investigation on the finding: the hunt opened it, the hunt
+   *  reused a run of the same subject, or an analyst opened it. */
+  investigationOrigin?: 'opened' | 'reused' | 'manual' | null;
+  /** The other findings of this hunt, by 0-based ordinal, that read the same
+   *  investigation. Absent from an older backend. */
+  sharedWith?: number[];
+  /** The finding of this hunt, by 0-based ordinal, that the investigation was
+   *  opened for. Null when another hunt opened it. */
+  investigationSubject?: number | null;
 }
 
 // ---- Detection bridge (1.3 slice 3): draft-detection review pane ----------
@@ -989,6 +1212,11 @@ export interface EntityDetail {
   last_seen?: string | null;
   /** For a domain: the addresses joined to it. */
   domain_machines?: number | null;
+  /** The first name of the machine that holds the value. */
+  host_name?: string | null;
+  /** Every key the counts read: the value first, then the other addresses,
+   *  names and the agent of its machine. Absent from an older server. */
+  machine_keys?: string[];
 }
 
 /** One host, address, user or domain a record names, with the page that
@@ -1015,7 +1243,8 @@ export interface EntitySearchHit {
 
 // ---- Config ----------------------------------------------------------------
 
-export type SettingSource = 'db' | 'env';
+/** db = saved in the console. env = the environment or .env. default = the code default. */
+export type SettingSource = 'db' | 'env' | 'default';
 export type SettingApply = 'hot-apply' | 'restart';
 export type SettingType = 'toggle' | 'number' | 'select' | 'text';
 
@@ -1034,6 +1263,14 @@ export interface Setting {
    * behind the section's "Advanced" reveal. Never hardcode which keys are
    * day1 on the frontend — this flag is the only source of truth. */
   day1: boolean;
+  /** The origin and value under a DB override ('env' or 'default'). Absent on
+   *  an older server. */
+  base_source?: 'env' | 'default' | null;
+  base_value?: boolean | number | string | null;
+  /** The code default of the setting. */
+  default?: boolean | number | string | null;
+  /** A restart setting whose saved value is not the running value yet. */
+  pending_restart?: boolean;
 }
 
 export interface SettingGroup {
@@ -1069,6 +1306,8 @@ export interface Me {
    *  states where per-user features cannot mean what they say. Optional so a
    *  page served by an older build reads as "unknown" rather than "no". */
   signed_in?: boolean;
+  /** True while the bootstrap admin signs in with the generated password. */
+  password_is_generated?: boolean;
 }
 
 export interface Config {
@@ -1090,6 +1329,12 @@ export interface DangerSetting {
   isSet: boolean;
   source: DangerSettingSource;
   hot: boolean;
+  /** The current value of a non-secret setting. A secret row never has one. */
+  value?: string | null;
+  /** soc-ai cannot run without it. An unset optional secret is no fault. */
+  required?: boolean;
+  /** The saved value waits for a restart. */
+  pending_restart?: boolean;
 }
 
 export interface ConnTestResult {
@@ -1208,7 +1453,9 @@ export interface Notification {
 // Replay soc-ai's triage over a sample of already-dispositioned alerts and
 // compare its verdicts to the analyst's REAL Security Onion disposition.
 
-export type BacktestRunStatus = 'running' | 'complete' | 'error';
+/** 'cancelled': an operator stopped the run after the alert in flight. The
+ *  run keeps the results of the alerts it finished (R5-I9). */
+export type BacktestRunStatus = 'running' | 'complete' | 'error' | 'cancelled';
 
 /** The two ground-truth disposition labels + the two settled soc-ai verdicts,
  * plus the hedge and the "no verdict produced" bucket. */
@@ -1227,6 +1474,9 @@ export interface BacktestRow {
   human_disposition: HumanDisposition;
   soc_ai_verdict: SocVerdict | null;
   match: boolean;
+  /** The replay investigation behind the verdict. Null when the server found
+   *  no replay for the row. An older server sends no field. */
+  investigation_id?: string | null;
 }
 
 /** human_disposition → { soc verdict → count }. */
@@ -1238,6 +1488,10 @@ export interface BacktestMetrics {
   agreement_rate: number;
   /** Decided rows / sampled rows: how much of the backtest actually ran. */
   completion_rate?: number;
+  /** Of the acknowledged alerts soc-ai decided, the share it called a false
+   *  positive. An agreement figure: auto-acknowledge applies more tests. An
+   *  older server sends `fp_reduction` only, with the same value. */
+  fp_agreement_rate?: number;
   fp_reduction: number;
   missed_tp: number;
   n_needs_more_info: number;
@@ -1267,6 +1521,13 @@ export interface BacktestCompletion {
   reason: string | null;
 }
 
+/** Where a cancelled run stopped: `after` alerts of the `of` planned. */
+export interface BacktestCancel {
+  after: number;
+  of: number;
+  by?: string | null;
+}
+
 export interface BacktestResults {
   metrics: BacktestMetrics;
   completion?: BacktestCompletion;
@@ -1274,6 +1535,8 @@ export interface BacktestResults {
   missed_tp_rows: BacktestRow[];
   rows: BacktestRow[];
   caveat: string;
+  /** Present on a run an operator cancelled (R5-I9). */
+  cancel?: BacktestCancel;
 }
 
 export interface BacktestParams {
@@ -1305,6 +1568,43 @@ export interface Backtest {
   /** How many alerts the operator asked for, and why fewer were replayed. */
   requested?: number | null;
   skipped_reason?: string | null;
+  /** The server cap on a sample. GET /backtest sends it while no run is
+   *  active. */
+  max_sample?: number | null;
+  /** The median time of one replay, for the cost of the next run. Null when
+   *  the store holds no completed run. */
+  estimate?: BacktestEstimate | null;
+  /** An operator asked the live run to stop after the alert in flight. The
+   *  server holds it, so a reload reads it back (R5-I9). */
+  cancel_requested?: boolean;
+}
+
+export interface BacktestEstimate {
+  seconds_per_alert: number;
+  /** How many completed runs the median covers. */
+  runs: number;
+  /** 'backtest': the recent replays. 'investigations': the store holds no
+   *  replay, so the median reads the recent investigations. */
+  basis: string;
+}
+
+/** One stored run in the list of past runs (GET /backtests). A run that did
+ *  not complete carries no rates. */
+export interface BacktestRunSummary {
+  backtest_id: string;
+  status: BacktestRunStatus;
+  started_at: string | null;
+  finished_at: string | null;
+  sampled: number | null;
+  requested: number | null;
+  window_days: number | null;
+  min_severity: string | null;
+  listed: boolean;
+  agreement_rate: number | null;
+  fp_agreement_rate: number | null;
+  missed_tp: number | null;
+  human_tp: number | null;
+  human_fp: number | null;
 }
 
 export interface StartBacktestOpts {
@@ -1724,12 +2024,19 @@ export interface MachineSummary {
   /** Machines per role slug, plus the `unknown`, `low_confidence` and `stale`
    *  buckets. */
   roles: Record<string, number>;
+  /** Each role the resolver withheld as a guess, with its machine count. The
+   *  list filter `role=guess:<slug>` lists them. Absent on an older server. */
+  role_guesses?: Record<string, number>;
   needs_attention: number;
   /** The clean builds older than the staleness window. With `never_built` it
    *  sums to `needs_attention`. Absent from an older server. */
   out_of_date?: number;
   conflicts: number;
+  /** The machines with no clean build: never built, or the last build failed. */
   never_built: number;
+  /** The part of `never_built` whose last build failed. Absent from an older
+   *  server. */
+  build_failed?: number;
   last_sweep_at: string | null;
   stale_hours: number | null;
 }
@@ -1836,6 +2143,17 @@ export interface HostActivity {
   /** Same contract for the account list. Always false when `users` is null:
    *  an absent list is not a cut one. */
   users_truncated: boolean;
+  /** The flow datasets that held a connection record for this host, busiest
+   *  first. Absent on an older server. */
+  conn_datasets?: string[];
+  /** The host-log datasets the users list reads. Absent on an older server. */
+  auth_datasets?: string[];
+  /** The time of the newest connection record in the window. Null when the
+   *  window holds none. Absent on an older server. */
+  newest_event?: string | null;
+  /** The end of the window the server read: the server time of the read. The
+   *  window starts 24 hours or 7 days before it. Absent on an older server. */
+  window_end?: string | null;
 }
 
 // ── Saved list views ────────────────────────────────────────────────────────

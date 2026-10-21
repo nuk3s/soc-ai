@@ -93,6 +93,7 @@ from soc_ai.hunting.priors import (
     COVERAGE_NOT_APPLICABLE,
     PriorResult,
     _blank,
+    collapse_hours,
     evaluate_prior,
     known_members,
 )
@@ -105,12 +106,14 @@ from soc_ai.hunting.wording import (
     baseline_sentence,
     noun,
     phrase,
+    plural,
     scope_sentence,
     times,
     when,
 )
 from soc_ai.so_client.paging import CompositeRead
 from soc_ai.store import entity_profiles as ep
+from soc_ai.store import grid_gaps as gap_store
 from soc_ai.store.models import EntityProfile, HostDossier
 
 if TYPE_CHECKING:
@@ -134,6 +137,20 @@ from soc_ai.hunting.window import DEFAULT_RECENT_HOURS  # noqa: E402 - re-export
 # How many documents the recent read keeps per member. Three is enough for an
 # analyst to read the condition and cheap enough to ask for on every bucket.
 SAMPLE_IDS_PER_MEMBER = 3
+
+# The grid-dark rule. In one hour of one sweep, the rate collapsed on at least
+# GRID_DARK_MIN_HOSTS hosts, and on at least GRID_DARK_SHARE of the hosts whose
+# baseline makes a collapse measurable in that hour. That hour is the grid's
+# condition: a sensor or a pipeline stopped. The sweep records a sweep gap and
+# writes no departure for the hour. One host that goes quiet while the others
+# keep talking is 1 of N and stays a departure.
+GRID_DARK_MIN_HOSTS = 3
+GRID_DARK_SHARE = 0.6
+
+# How far back the sweep reads the gap ledger. It covers the 30-day baseline,
+# its lag and the recent window, so a baseline built before a gap was known
+# does not learn the gap hours.
+_GAP_LOOKBACK = timedelta(days=62)
 
 
 def _samples_agg() -> dict[str, Any]:
@@ -1042,6 +1059,9 @@ class _Context:
     # The windows an investigation confirmed as an attack, per host key. The
     # baseline does not learn from them.
     windows: dict[str, list[tuple[datetime, datetime]]] = dc_field(default_factory=dict)
+    # The grid gaps, with the settle margin. A rate does not score their
+    # hours, and a rate baseline does not learn from them.
+    gaps: list[gap_store.GapWindow] = dc_field(default_factory=list)
     # Each peer group read once per sweep: per (role, dimension), every peer's
     # key with the members its baseline knows, and how many peers hold each.
     groups: dict[tuple[str, str], tuple[list[tuple[str, set[str]]], Counter[str]]] = dc_field(
@@ -1222,11 +1242,178 @@ async def _evaluate_entities(
                 tz=context.tz if context is not None else "UTC",
                 exclude=exclude,
                 peers=peers,
+                gaps=_gap_pairs(context),
             )
         )
 
 
-async def run_prior_sweep(  # noqa: PLR0915 - one function reads as one procedure
+def _gap_pairs(context: _Context | None) -> list[tuple[datetime, datetime]]:
+    return [(w.start, w.end) for w in context.gaps] if context is not None else []
+
+
+def _mask_hours(
+    observations: dict[str, dict[str, Any]], windows: Sequence[gap_store.GapWindow]
+) -> int:
+    """Drop every hour inside a window from each entity's rate. Returns the hours dropped.
+
+    A rate keys each complete hour of the window by its UTC start, so every
+    entity loses the same hours. A dropped hour is unknown. It breaks a run,
+    and it is never a collapse.
+    """
+    if not windows:
+        return 0
+    dropped: set[str] = set()
+    for entity_key, hours in observations.items():
+        gone = {
+            key
+            for key in hours
+            if (at := _stamp_of(key)) is not None and gap_store.covered(at, windows)
+        }
+        if gone:
+            # A new mapping: the recent read is cached for the next spec on
+            # the same dimension, and its hours stay as the grid gave them.
+            observations[entity_key] = {k: v for k, v in hours.items() if k not in gone}
+            dropped |= gone
+    return len(dropped)
+
+
+async def _grid_dark_hours(
+    db: AsyncSession,
+    spec: HuntSpec,
+    observations: dict[str, dict[str, Any]],
+    *,
+    context: _Context,
+) -> tuple[list[datetime], int]:
+    """The hours the rate collapsed on most hosts at once, and the most hosts measured.
+
+    See :data:`GRID_DARK_MIN_HOSTS`. The baselines are read in slices, as the
+    scoring loop reads them.
+    """
+    assert spec.profile is not None
+    keys = list(observations)
+    measurable: Counter[datetime] = Counter()
+    dark: Counter[datetime] = Counter()
+    gaps = _gap_pairs(context)
+    for n in range(0, len(keys), _PROFILE_SLICE):
+        batch = keys[n : n + _PROFILE_SLICE]
+        baselines = await ep.load_dimension(
+            db, entity_kind="host", dimension=spec.profile.dimension, entity_keys=batch
+        )
+        for key in batch:
+            states = collapse_hours(
+                spec.profile,
+                baselines.get(key),
+                observations[key],
+                tz=context.tz,
+                exclude=[*windows_for(context.windows, key), *gaps],
+            )
+            for at, collapsed in states.items():
+                measurable[at] += 1
+                if collapsed:
+                    dark[at] += 1
+    hours = sorted(
+        at
+        for at, count in dark.items()
+        if count >= GRID_DARK_MIN_HOSTS and count >= GRID_DARK_SHARE * measurable[at]
+    )
+    return hours, max((measurable[at] for at in hours), default=0)
+
+
+def _hour_runs(hours: Sequence[datetime]) -> list[tuple[datetime, datetime]]:
+    """Consecutive hours as ``(start, end)`` spans."""
+    spans: list[tuple[datetime, datetime]] = []
+    for at in sorted(hours):
+        if spans and spans[-1][1] == at:
+            spans[-1] = (spans[-1][0], at + timedelta(hours=1))
+        else:
+            spans.append((at, at + timedelta(hours=1)))
+    return spans
+
+
+async def _gap_windows(
+    db: AsyncSession, settings: Any, *, now: datetime | None
+) -> list[gap_store.GapWindow]:
+    """The recorded grid gaps near the sweep, with the settle margin."""
+    end = now or datetime.now(UTC)
+    end = end if end.tzinfo is not None else end.replace(tzinfo=UTC)
+    rows = await gap_store.overlapping(db, since=end - _GAP_LOOKBACK, until=end)
+    return gap_store.windows_of(rows, settle=gap_store.settle_of(settings), now=end)
+
+
+async def _mask_gaps(
+    db: AsyncSession,
+    spec: HuntSpec,
+    observations: dict[str, dict[str, Any]],
+    *,
+    context: _Context,
+    notes: list[str],
+    errors: list[str],
+    dark_found: list[tuple[str, str, list[tuple[datetime, datetime]], int, int]],
+) -> PriorResult | None:
+    """Leave the gap hours and the grid-dark hours out of one rate read.
+
+    Returns the one blind result when no hour of the window is left to score.
+    """
+    assert spec.profile is not None
+    total = max((len(hours) for hours in observations.values()), default=0)
+    masked = _mask_hours(observations, context.gaps)
+    if masked:
+        notes.append(
+            f"{spec.id}: {masked} of {plural(total, 'hour')} of the window lie in a grid gap "
+            "or its settle margin. The sweep did not score them."
+        )
+    if spec.profile.test == "below" and any(observations.values()):
+        try:
+            hours, measured = await _grid_dark_hours(db, spec, observations, context=context)
+        except Exception as exc:
+            await db.rollback()
+            errors.append(f"{spec.id}: the grid-dark check could not read the baselines: {exc}")
+            hours, measured = [], 0
+        if hours:
+            spans = _hour_runs(hours)
+            dark_found.append((spec.id, spec.profile.dimension, spans, len(hours), measured))
+            _mask_hours(observations, [gap_store.GapWindow(start=a, end=b) for a, b in spans])
+            notes.append(
+                f"{spec.id}: the rate collapsed on most hosts at once in "
+                f"{plural(len(hours), 'hour')}. The condition is the grid's. The sweep "
+                "wrote no departure for those hours."
+            )
+    if any(observations.values()):
+        return None
+    return PriorResult(
+        spec_id=spec.id,
+        entity_kind="host",
+        entity_key="*",
+        coverage=COVERAGE_BLIND,
+        note=(
+            "the recent window lies in a grid gap. The grid held no data for these hours, "
+            "so the sweep scored no host."
+        ),
+        kind=_blank(spec, None, COVERAGE_BLIND, "").kind,
+    )
+
+
+async def _record_dark(
+    db: AsyncSession,
+    dark_found: Sequence[tuple[str, str, list[tuple[datetime, datetime]], int, int]],
+) -> None:
+    """Write each grid-dark span the sweep found as a sweep gap."""
+    for spec_id, dimension, spans, hours, measured in dark_found:
+        for start, end in spans:
+            await gap_store.record_sweep_gap(
+                db,
+                plane=dimension,
+                started_at=start,
+                ended_at=end,
+                detail=(
+                    f"{spec_id}: the rate collapsed on most of the {measured} hosts with a "
+                    f"measurable baseline at once, in {plural(hours, 'hour')}."
+                ),
+                join_within=timedelta(hours=2),
+            )
+
+
+async def run_prior_sweep(  # noqa: PLR0912, PLR0915 - one function reads as one procedure
     *,
     elastic: Any,
     settings: Any,
@@ -1296,6 +1483,15 @@ async def run_prior_sweep(  # noqa: PLR0915 - one function reads as one procedur
     except Exception as exc:
         await db.rollback()
         notes.append(f"confirmed attack windows could not be read: {exc}")
+    # The hours the grid held no data. A rate does not score them.
+    try:
+        context.gaps = await _gap_windows(db, settings, now=now)
+    except Exception as exc:
+        await db.rollback()
+        notes.append(f"the grid gaps could not be read, the rates score every hour: {exc}")
+    # The grid-dark hours this sweep found, per spec. Recorded only on a
+    # recording sweep, so reading the sweep stays free of side effects.
+    dark_found: list[tuple[str, str, list[tuple[datetime, datetime]], int, int]] = []
 
     # One recent read per DIMENSION, not per spec: several priors share a
     # dimension, and re-reading the plane for each is the difference between
@@ -1375,6 +1571,22 @@ async def run_prior_sweep(  # noqa: PLR0915 - one function reads as one procedur
             except Exception as exc:
                 errors.append(f"{spec.id}: profile read failed: {exc}")
 
+        if shaped is not None and shaped[1] == "numeric" and observations:
+            blind = await _mask_gaps(
+                db,
+                spec,
+                observations,
+                context=context,
+                notes=notes,
+                errors=errors,
+                dark_found=dark_found,
+            )
+            if blind is not None:
+                results.append(blind)
+                if last_use.get(dimension) == n:
+                    recent_cache[dimension] = {}
+                continue
+
         await _evaluate_entities(
             db,
             spec,
@@ -1403,6 +1615,7 @@ async def run_prior_sweep(  # noqa: PLR0915 - one function reads as one procedur
                 census=estate.census,
                 cidrs=estate.cidrs,
                 windows=context.windows,
+                gaps=tuple(_gap_pairs(context)),
             ),
         )
         results.extend(outcome.results)
@@ -1426,6 +1639,12 @@ async def run_prior_sweep(  # noqa: PLR0915 - one function reads as one procedur
         recent_hours=recent_hours,
     )
     trail_shadow = shadow_ids
+    if record and dark_found:
+        try:
+            await _record_dark(db, dark_found)
+        except Exception as exc:
+            await db.rollback()
+            errors.append(f"could not record the grid gap: {exc}")
     if record:
         try:
             lead_outcome = await _record_and_form(
@@ -1514,6 +1733,9 @@ async def _record_and_form(
                     "anchor_id": departure.sample_ids[0] if departure.sample_ids else None,
                     "baseline": _baseline_block(departure),
                     **({"receipts": _profile_receipts(departure)} if shadow_spec else {}),
+                    # The hours a rate departure covers. The self-healing hold
+                    # reads them: a hit inside a grid gap does not count.
+                    **_run_window(departure),
                 },
                 # The adapter, not the status. ``shadow`` carries the status.
                 source="profile",
@@ -1641,6 +1863,14 @@ def _departure_query(
         end=end,
         count_only=count_only,
     )
+
+
+def _run_window(departure: Any) -> dict[str, Any]:
+    """The run of a rate departure as ``{"window": {"start", "end"}}``, else nothing."""
+    start, end = getattr(departure, "run_start", None), getattr(departure, "run_end", None)
+    if start is None or end is None:
+        return {}
+    return {"window": {"start": start.isoformat(), "end": end.isoformat()}}
 
 
 def _baseline_block(departure: Any) -> dict[str, Any]:

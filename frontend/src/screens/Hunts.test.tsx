@@ -158,7 +158,7 @@ describe('ScheduledHunts demo guard', () => {
     });
     fireEvent.click(screen.getByText('Add'));
 
-    await screen.findByText(/Not available in the read-only demo/);
+    await screen.findByText(/The read-only demo blocks this action/);
     expect(createHuntScheduleMock).not.toHaveBeenCalled();
   });
 
@@ -170,7 +170,7 @@ describe('ScheduledHunts demo guard', () => {
       .parentElement!;
     fireEvent.click(within(row).getByText('on'));
 
-    await screen.findByText(/Not available in the read-only demo/);
+    await screen.findByText(/The read-only demo blocks this action/);
     expect(updateHuntScheduleMock).not.toHaveBeenCalled();
   });
 
@@ -183,7 +183,7 @@ describe('ScheduledHunts demo guard', () => {
     fireEvent.click(within(row).getByTitle('Delete schedule'));
     fireEvent.click(within(row).getByTitle('Confirm delete'));
 
-    await screen.findByText(/Not available in the read-only demo/);
+    await screen.findByText(/The read-only demo blocks this action/);
     expect(deleteHuntScheduleMock).not.toHaveBeenCalled();
   });
 });
@@ -635,7 +635,8 @@ describe('Hunts kind chip lives in the URL', () => {
     await screen.findByText('recorded by a spec');
 
     fireEvent.click(await screen.findByTitle('Apply the saved view "Mine"'));
-    await waitFor(() => expect(loc()).toBe('/hunts?kind=chat'));
+    // The view names a window too, and the address holds both (R3-D12).
+    await waitFor(() => expect(loc()).toBe('/hunts?kind=chat&range=24h'));
     await waitFor(() => expect(lastQuery()).toMatchObject({ kind: 'chat' }));
     expect(await screen.findByText('typed by an analyst')).toBeTruthy();
     expect(screen.queryByText('recorded by a spec')).toBeNull();
@@ -1275,6 +1276,20 @@ describe('Hunts block window', () => {
     await waitFor(() => expect(getHunts).toHaveBeenCalled());
     const since = vi.mocked(getHunts).mock.calls[0][0]!.since!;
     expect(Math.round((Date.now() - new Date(since).getTime()) / 3_600_000)).toBe(24);
+  });
+
+  // R3-D12: the page read ?range= and never wrote it, so a reload or a
+  // shared link lost the window.
+  it('writes the window chip into the address', async () => {
+    getHuntSchedulesMock.mockResolvedValue({ schedules: [], masterSwitchEnabled: true });
+    vi.mocked(getHunts).mockClear().mockResolvedValue([]);
+    renderHunts();
+    await waitFor(() => expect(getHunts).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole('button', { name: '30d' }));
+    await waitFor(() => expect(screen.getByTestId('loc').textContent).toContain('range=30d'));
+    // The default window is the plain address.
+    fireEvent.click(screen.getByRole('button', { name: '7d' }));
+    await waitFor(() => expect(screen.getByTestId('loc').textContent).not.toContain('range='));
   });
 
   it('names the leads when the window holds no hunt and a lead has one', async () => {

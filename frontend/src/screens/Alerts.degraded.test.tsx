@@ -65,7 +65,7 @@ const mount = () =>
 /** The header's count line and the footer's, by their own prose. */
 const headerLine = () => screen.getByText(/untriaged ·/).textContent ?? '';
 const footerLine = () =>
-  screen.getByText(/grouped · click a row to expand events/).textContent ?? '';
+  screen.getByText(/grouped · select a row to expand its events/).textContent ?? '';
 
 /**
  * The view chips, read off the toolbar. They are the only text-bearing
@@ -318,7 +318,7 @@ describe('Alerts on a healthy grid with nothing in the window (D2 control)', () 
     await screen.findByText('No open detection in this window. The list hides acknowledged and escalated groups. Widen the time range.');
 
     expect(headerLine()).toBe('0 untriaged · 0 detections · 0 events in window');
-    expect(footerLine()).toBe('0 detections · grouped · click a row to expand events');
+    expect(footerLine()).toBe('0 detections · grouped · select a row to expand its events');
     expect(chipTexts()).toEqual(['Mine0', 'In review0', 'Critical0', 'Needs decision0', 'All0']);
     expect(screen.queryByText("Could not load this view")).toBeNull();
   });
@@ -365,7 +365,7 @@ describe('Alerts telling a quiet grid apart from a filter that matched nothing',
     // the night it means something.
     vi.mocked(getAlertsEmptyReason).mockResolvedValue({
       reason: 'quiet',
-      hint: 'No alert label matches anything in this window. The grid is quiet.',
+      hint: 'No alert in this window matches an alert label. The grid is quiet.',
     });
     mount();
     await screen.findByText('No open detection in this window. The list hides acknowledged and escalated groups. Widen the time range.');

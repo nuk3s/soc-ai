@@ -182,7 +182,7 @@ describe('the apply-bar chip re-opens a folded item on click', () => {
 
     // Reveal the advanced row and stage an edit on it.
     fireEvent.click(screen.getByRole('button', { name: /advanced \(1\)/i }));
-    fireEvent.click(await screen.findByRole('switch', { name: 'auto_triage_inheritance_enabled' }));
+    fireEvent.click(await screen.findByRole('switch', { name: 'Verdict inheritance' }));
     await screen.findByTestId('chip-auto_triage_inheritance_enabled');
 
     // Fold it back up — the staged edit (and its chip) survive independently
@@ -234,7 +234,7 @@ describe('tier-aware fold unfolding (final-review I1/I2)', () => {
     renderAt({ pathname: '/config', hash: '#triage-automation' });
     await screen.findByText(/auto_triage_schedule_enabled/);
 
-    fireEvent.click(screen.getByRole('switch', { name: 'auto_triage_schedule_enabled' }));
+    fireEvent.click(screen.getByRole('switch', { name: 'Continuous auto-investigate' }));
     fireEvent.click(await screen.findByTestId('chip-auto_triage_schedule_enabled'));
 
     await waitFor(() => {

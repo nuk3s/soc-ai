@@ -1,7 +1,7 @@
 """The subject rule: which hunt findings the hunt investigates.
 
-A finding is a subject when it names an entity and is not a visibility gap,
-a failed run or a clean "nothing here" result. A citation is not required:
+A finding is a subject when it is a threat and names an entity. A visibility
+gap, a failed run and an observation are never subjects. A citation is not required:
 the anchor rule of the promotion finds a document, or says that it cannot.
 Each case below pairs the positive shape with the one field that turns it
 off.
@@ -98,10 +98,20 @@ def test_a_clean_observation_is_not_a_subject() -> None:
     assert finding_is_subject(_threat(category="observation", title="Nothing unusual")) is False
 
 
-def test_an_observation_with_activity_is_a_subject() -> None:
-    """Control for the clean rule: an observation that reports activity is checked."""
+def test_an_observation_is_never_a_subject() -> None:
+    """An observation claims no threat, so the hunt opens no investigation on it.
+
+    The range hunt of lead 5 (2026-10-19) linked the observation "All abuse is
+    historical, no 30-day recurrence" to the investigation of a threat on the
+    same hosts. The card then read "True positive 0.72" and the label counted
+    it as a threat.
+    """
     seen = _threat(category="observation", title="Nightly backup job writes to a share")
-    assert finding_is_subject(seen) is True
+    assert finding_is_subject(seen) is False
+    historical = _threat(category="observation", title="All abuse is historical")
+    assert finding_is_subject(historical) is False
+    # Control: the same finding as a threat is a subject.
+    assert finding_is_subject({**seen, "category": "threat"}) is True
 
 
 def test_a_threat_title_that_starts_with_no_is_still_a_subject() -> None:

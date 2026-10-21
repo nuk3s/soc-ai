@@ -3,8 +3,9 @@ import { Link } from 'react-router-dom';
 import { getObservations, type EntityObservation } from '../lib/api';
 import { plainEvidence } from '../lib/hostDossier';
 import { kindLabel, sourceLabel, sourceTitle } from '../lib/kinds';
+import { anchoredSummary } from '../lib/observationWords';
 import { plural } from '../lib/plural';
-import { statisticSentence } from '../lib/statistics';
+import { isZScore, statisticSentence } from '../lib/statistics';
 import { absTime, ago } from '../lib/timeRange';
 import {
   CHIP_IN_LEAD,
@@ -76,10 +77,14 @@ function Row({ observation }: { observation: EntityObservation }) {
         {kindLabel(observation.kind, observation.kind_label)}
       </span>
       <span className="min-w-0 flex-1 text-text-2">
-        {plainEvidence(observation.summary ?? '')}
+        {plainEvidence(anchoredSummary(observation.summary ?? '', observation.born_at))}
         {/* The statistic the row carries. A row written before it existed
             states none. */}
-        {statisticSentence(
+        {/* A z score stays out of the line: the summary states the count and
+            the expected count. "A residual z of -52.0" asked the analyst to
+            know what a residual z is (dogfood 2026-10-19, R4 STE). */}
+        {!isZScore(observation.statistic) &&
+          statisticSentence(
           observation.statistic,
           observation.statistic_value,
           observation.baseline_value,
@@ -169,7 +174,7 @@ export function HostObservations({
         <div className="px-[15px] py-3 text-[12.5px] text-dim">
           No observations on this {noun} in the last {DAYS} days.{' '}
           <Link to="/operate#catalog" className="text-accent hover:underline">
-            Operate shows the analytics that could not score it.
+            The Status page shows the analytics that could not score it.
           </Link>
         </div>
       ) : (

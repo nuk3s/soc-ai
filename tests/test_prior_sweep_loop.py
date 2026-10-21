@@ -670,3 +670,59 @@ async def test_profiles_off_means_no_freshness_read(settings_kratos: Settings) -
     await _tick_with_profiles(_app(settings_kratos), sweeper, freshness=reader, builder=AsyncMock())
     reader.assert_not_awaited()
     assert sweeper.await_args.kwargs["profiles"] is None
+
+
+# ── The loop's own record (dogfood 2026-10-19 R5-D5, H1-D2) ────────────────
+#
+# While the grid was down for four days the loop skipped every wake and wrote
+# nothing, so the Status page read the profile analytics as live and quiet.
+
+
+async def test_a_skip_while_the_grid_is_down_is_recorded_once(settings_kratos: Settings) -> None:
+    from soc_ai.hunting.loop_health import OUTCOME_SKIPPED, SKIP_GRID_DOWN
+
+    app = _app(settings_kratos, down=("es",))
+    await _tick(app, AsyncMock(), wakes=5)
+    snap = app.state.prior_sweep_health.snapshot(datetime.now(UTC).replace(tzinfo=None))
+    assert snap is not None
+    assert snap.last_outcome == OUTCOME_SKIPPED
+    assert snap.last_error_text == SKIP_GRID_DOWN
+    assert snap.runs_24h == 1, "five wakes inside one interval are one skipped run"
+
+
+async def test_a_sweep_that_scored_nothing_on_a_dead_grid_is_recorded_as_failed(
+    settings_kratos: Settings,
+) -> None:
+    from soc_ai.hunting.loop_health import OUTCOME_FAILED
+
+    sweep = _sweep(
+        errors=("p1: recent read for conn failed: ConnectionError(Cannot connect to host)",),
+        evaluated_specs=("p1",),
+    )
+    app = _app(settings_kratos)
+    await _tick(app, AsyncMock(return_value=sweep), wakes=1)
+    snap = app.state.prior_sweep_health.snapshot(datetime.now(UTC).replace(tzinfo=None))
+    assert snap is not None
+    assert snap.last_outcome == OUTCOME_FAILED
+    assert snap.last_error_text == "soc-ai could not connect to the grid."
+    assert "p1" in snap.spec_errors
+
+
+async def test_a_sweep_that_raised_is_recorded_as_failed(settings_kratos: Settings) -> None:
+    from soc_ai.hunting.loop_health import OUTCOME_FAILED
+
+    app = _app(settings_kratos)
+    await _tick(app, AsyncMock(side_effect=RuntimeError("boom")), wakes=1)
+    snap = app.state.prior_sweep_health.snapshot(datetime.now(UTC).replace(tzinfo=None))
+    assert snap is not None
+    assert snap.last_outcome == OUTCOME_FAILED
+
+
+async def test_a_good_sweep_is_recorded_as_complete(settings_kratos: Settings) -> None:
+    from soc_ai.hunting.loop_health import OUTCOME_OK
+
+    app = _app(settings_kratos)
+    await _tick(app, AsyncMock(return_value=_sweep(results=(_result(),))), wakes=1)
+    snap = app.state.prior_sweep_health.snapshot(datetime.now(UTC).replace(tzinfo=None))
+    assert snap is not None
+    assert snap.last_outcome == OUTCOME_OK

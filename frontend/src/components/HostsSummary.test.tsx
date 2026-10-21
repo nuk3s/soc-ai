@@ -81,16 +81,55 @@ describe('HostsSummary — the cards', () => {
 // built", and its click listed the 3. The number now lists the machines it
 // counts, and each part lists its own.
 describe('HostsSummary: Needs attention lists what it counts', () => {
-  it('splits the number into its two linked parts', () => {
-    mount({ ...SUMMARY, needs_attention: 37, out_of_date: 34, never_built: 3 });
+  it('splits the number into its linked parts', () => {
+    mount({ ...SUMMARY, needs_attention: 37, out_of_date: 34, never_built: 3, build_failed: 3 });
     const card = screen.getByTestId('sum-attention');
-    expect(card.textContent).toMatch(/34 out of date, 3 never built/);
+    expect(card.textContent).toMatch(/34 out of date, 3 failed to build/);
     expect(card.getAttribute('title')).toBe(
-      '37 need attention: 34 out of date, 3 never built. Each number lists its machines.',
+      '37 need attention: 34 out of date, 3 failed to build. Each number lists its machines.',
     );
     expect(screen.getByTestId('attention-all').textContent).toBe('37');
     expect(screen.getByTestId('attention-stale').getAttribute('href')).toBe('/hosts?health=stale&activity=all');
-    expect(screen.getByTestId('attention-broken').getAttribute('href')).toBe('/hosts?health=broken&activity=all');
+    expect(screen.getByTestId('attention-failed').getAttribute('href')).toBe('/hosts?health=broken&activity=all');
+  });
+
+  // Dogfood 2026-10-19 (R4-D16): "3 never built" counted 3 machines whose
+  // last build FAILED. never_built is every machine with no clean build, and
+  // build_failed is the part whose last build failed.
+  it('does not call a failed build "never built"', () => {
+    mount({ ...SUMMARY, needs_attention: 37, out_of_date: 34, never_built: 3, build_failed: 3 });
+    const card = screen.getByTestId('sum-attention');
+    expect(card.textContent).not.toMatch(/never built/);
+    expect(screen.queryByTestId('attention-never-built')).toBeNull();
+  });
+
+  it('names the failed builds and the machines never built apart', () => {
+    mount({ ...SUMMARY, needs_attention: 9, out_of_date: 4, never_built: 5, build_failed: 2 });
+    expect(screen.getByTestId('attention-failed').textContent).toBe('2 failed to build');
+    expect(screen.getByTestId('attention-never-built').textContent).toBe('3 never built');
+    expect(screen.getByTestId('attention-never-built').getAttribute('href')).toBe(
+      '/hosts?health=broken&activity=all',
+    );
+    expect(screen.getByTestId('sum-attention').getAttribute('title')).toBe(
+      '9 need attention: 4 out of date, 2 failed to build, 3 never built. Each number lists its machines.',
+    );
+  });
+
+  it('shows a part only when it counts a machine', () => {
+    mount({ ...SUMMARY, needs_attention: 5, out_of_date: 5, never_built: 0, build_failed: 0 });
+    expect(screen.getByTestId('sum-attention').textContent).toMatch(/5 out of date/);
+    expect(screen.queryByTestId('attention-failed')).toBeNull();
+    expect(screen.queryByTestId('attention-never-built')).toBeNull();
+    expect(screen.queryByTestId('attention-no-clean-build')).toBeNull();
+  });
+
+  it('keeps one part for an older server that sends no build_failed', () => {
+    // An older server cannot tell a failed build from no build.
+    mount({ ...SUMMARY, needs_attention: 37, out_of_date: 34, never_built: 3 });
+    const part = screen.getByTestId('attention-no-clean-build');
+    expect(part.textContent).toBe('3 have no clean build');
+    expect(part.getAttribute('href')).toBe('/hosts?health=broken&activity=all');
+    expect(screen.getByTestId('sum-attention').textContent).not.toMatch(/never built|failed to build/);
   });
 
   it('derives the out-of-date part from an older server', () => {
@@ -101,7 +140,7 @@ describe('HostsSummary: Needs attention lists what it counts', () => {
 
   it('nests no link in a link', () => {
     // NEGATIVE CONTROL: three links in one card, so the card is not a link.
-    mount({ ...SUMMARY, needs_attention: 37, out_of_date: 34, never_built: 3 });
+    mount({ ...SUMMARY, needs_attention: 37, out_of_date: 34, never_built: 3, build_failed: 1 });
     expect(screen.getByTestId('card-attention').tagName).toBe('DIV');
     expect(screen.getByTestId('card-attention').querySelectorAll('a a')).toHaveLength(0);
   });

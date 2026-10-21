@@ -226,3 +226,28 @@ describe('W1: no unread hit folds the block to one line', () => {
     expect(screen.queryByTestId('analytic-hits-quiet')).toBeNull();
   });
 });
+
+// R3-D11: a hit recorded live sat under Live with a "shadow" chip and Approve
+// and Reject after soc-ai held its analytic, and no card said so.
+describe('a live hit of a held analytic', () => {
+  it('says where the hit was recorded and why the analytic reads shadow', async () => {
+    const reason = 'It went over its daily hit limit.';
+    vi.mocked(getAnalyticHits).mockResolvedValue({
+      hits: [{ ...LIVE, analytic_status: 'shadow', analytic_held_by_system: reason }],
+      counts: { all: 1, unread: 0, live: 1, shadow: 0 },
+    });
+    mount('/hunts?hits=live');
+    const card = await screen.findByTestId('analytic-hit-41');
+    expect(within(card).getByText('recorded live')).toBeTruthy();
+    expect(within(card).getByTestId('analytic-hit-held').textContent).toBe(
+      `soc-ai held this analytic in shadow after this hit. ${reason} The hit counts toward a lead. Approve or reject the analytic.`,
+    );
+  });
+
+  it('carries no held line on a live analytic', async () => {
+    mount('/hunts?hits=live');
+    const card = await screen.findByTestId('analytic-hit-41');
+    expect(within(card).queryByText('recorded live')).toBeNull();
+    expect(within(card).queryByTestId('analytic-hit-held')).toBeNull();
+  });
+});

@@ -8,8 +8,8 @@ rsync + systemd path in [DEPLOYMENT.md](DEPLOYMENT.md), and it can replace that 
 ## Quick start
 
 > **The fast path is `./setup.sh`** in the repo root. That guided installer does
-> everything below. It installs Docker if the host needs it, writes `.env`,
-> generates the certificate and the secrets, starts the stack, and seeds the
+> everything below. It installs Docker if the host needs it, and it writes `.env`.
+> It generates the certificate and the secrets, starts the stack and seeds the
 > enrichment data. The steps here are the manual equivalent, for reference.
 
 ### 1. The `.env` file
@@ -54,7 +54,7 @@ Docker bind-mounts the `.env` file read-only into the container at runtime.
 
 #### CONFIG_SECRET_KEY
 
-The Danger Zone on the Config screen needs `CONFIG_SECRET_KEY`. The key encrypts a
+Settings > Connections needs `CONFIG_SECRET_KEY`. The key encrypts a
 secret override before soc-ai stores it in the database. Generate a key once and keep it
 in `.env`:
 
@@ -62,7 +62,7 @@ in `.env`:
 python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
 
-Without the key, the Config screen still works for a non-secret setting. You cannot edit a
+Without the key, the Settings page still works for a non-secret setting. You cannot edit a
 password, an API key or another secret field in the console.
 
 ---
@@ -72,14 +72,14 @@ password, an API key or another secret field in the console.
 soc-ai has two TLS paths.
 
 The proxy path is the production path. Caddy terminates TLS in front of soc-ai and renews
-the certificate on its own. soc-ai serves plain HTTP inside the compose network. Use this
+the certificate automatically. soc-ai serves plain HTTP inside the compose network. Use this
 path for a public name or for Caddy's own CA in a lab. It also suits an ACME CA of your own
 or a certificate from your own CA. One command, `scripts/tls-proxy.sh enable <domain>`, sets
 it up.
 
 The direct path is the default after `setup.sh`. uvicorn terminates TLS with a certificate
 file and a key file. Use it for a lab, or if a proxy is not an option. soc-ai validates
-the files at start. The TLS panel on the Config screen and `soc-ai doctor` report them.
+the files at start. The TLS panel on the Settings page and `soc-ai doctor` report them.
 soc-ai warns 30, 14 and 7 days before expiry.
 
 #### The proxy path: Caddy in front of soc-ai
@@ -120,17 +120,17 @@ The script backs up `.env` to `.env.bak-<stamp>` and then changes these settings
 - `SOC_AI_BIND=127.0.0.1`. Port 8443 stays on the host loopback.
 - `SOC_AI_DOMAIN=<domain>` and `SOC_AI_CADDY_TLS=<the tls directive>`. The Caddy container
   receives these two variables and no soc-ai secret.
-- `COMPOSE_PROFILES=proxy`. The `caddy` service in `docker-compose.yml` sits under the
+- `COMPOSE_PROFILES=proxy`. The `caddy` service in `docker-compose.yml` is in the
   `proxy` profile. This line keeps Caddy in every later `docker compose up -d`.
 - `PROXY_TRUSTED_IPS=<the subnet of the compose network>`. The script reads the subnet with
   `docker network inspect`. soc-ai trusts the forwarded headers from that subnet. It skips
   every trusted hop when it reads the client address, so the block must not cover the
-  addresses your analysts connect from.
+  addresses that your analysts connect from.
 
 Then it runs `docker compose up -d`, waits up to 120 s for the certificate, and prints the
 URL and a health check. The health check does not verify the certificate. For `acme`, a
 second check verifies the chain against the root file. `--dry-run` before the verb prints
-the changes and the commands and changes nothing.
+the changes and the commands. It changes nothing.
 
 The self-signed pair in `./certs/` stays. The main stack still mounts the two files, and the
 direct path needs them again after `disable`.
@@ -156,7 +156,7 @@ Certificates.
 removes the five proxy settings, stops and removes Caddy, and starts soc-ai with TLS on 8443.
 Caddy's data volume stays, with its CA.
 
-`setup.sh` asks the same question. `HTTPS_DOMAIN` in `setup.conf`, with `HTTPS_CA=auto` or
+`setup.sh` also offers the proxy path. `HTTPS_DOMAIN` in `setup.conf`, with `HTTPS_CA=auto` or
 `HTTPS_CA=internal`, makes the installer run the command for you.
 
 Caddy reloads a changed certificate without downtime. To reload a changed `Caddyfile`:
@@ -195,7 +195,7 @@ The compose file bind-mounts `./certs/cert.pem` to `/etc/soc-ai/cert.pem` and
 default. Override them in `.env` if you mount the files elsewhere.
 
 > **SELinux hosts: Fedora, RHEL, Rocky and podman.** The certificate and key bind
-> mounts already ship with the `,Z` relabel suffix, as `:ro,Z`. They work at once.
+> mounts already ship with the `,Z` relabel suffix, as `:ro,Z`. They need no change.
 > Without that suffix the container gets `Permission denied`, even at mode 644. Append
 > `,Z` to your own bind mounts on an SELinux host too. On a host without SELinux the
 > suffix does nothing.
@@ -220,7 +220,7 @@ Keep the filenames `cert.pem` and `key.pem`, because the compose mounts and the
 to match new names. On an SELinux host the `,Z` relabel applies automatically at the next
 start.
 
-After the swap, open Config and check the TLS panel, or run `soc-ai doctor`. Both inspect
+After the replacement, open Settings and check the TLS panel, or run `soc-ai doctor`. Both inspect
 the files on disk. They do not read the files that soc-ai loaded at start. The panel says
 "Restart soc-ai to load them" until you restart.
 `GET /api/v1/config/tls` returns the same record.
@@ -247,10 +247,10 @@ curl -k https://localhost:8443/healthz
 #    "version":"1.5.0","so_auth":"kratos",...}
 ```
 
-This check probes nothing. It stays green with an unreachable grid, a dead model
-gateway and no analyst model configured. The container healthcheck polls it. A
-`healthy` state in `docker ps` means only that the process is up. It says nothing
-about the install. For that, run the doctor:
+This check probes nothing. It passes when the grid is unreachable, the model gateway
+is down and no analyst model is set. The container healthcheck polls it. A
+`healthy` state in `docker ps` means only that the process is up. It does not check
+the install. For that, run the doctor:
 
 ```bash
 docker compose exec soc-ai python -m soc_ai doctor
@@ -272,7 +272,8 @@ docker exec soc-ai cat /var/lib/soc-ai/data/bootstrap-admin-password.txt
 The container log names that file and holds no password. If the data directory
 is not writable at startup, the password goes to the log.
 `docker compose logs soc-ai` shows it then. Change the password after the first
-login. Then delete the file if it is still there.
+login. Use the account menu, then **Change password**. soc-ai then deletes the file.
+If the log says that soc-ai could not delete the file, delete it by hand.
 
 The first visit prompts you to accept the self-signed certificate.
 
@@ -299,12 +300,17 @@ The image serves two surfaces on the same port. Bare `/` redirects to `/app`.
 | `soc_ai_evals` (vol)     | `/var/lib/soc-ai/evals`             | rw   | Nightly quality-eval bundles + critiques   |
 
 `soc_ai_evals` holds the per-alert bundles and the Oracle critiques behind every point on
-the Quality card of the dashboard. They are the only evidence for or against a regression
+the Verdict quality card of the dashboard. They are the only evidence for or against a regression
 alarm, and nothing regenerates them. Without the volume they live in the container
 filesystem, and every recreate deletes them.
 
-`docker compose up` creates the 5 named volumes automatically. They survive
-`docker compose down`. Only `docker compose down -v` deletes the data.
+The soc-ai service uses these 5 named volumes. `docker compose up` creates them
+automatically. They survive `docker compose down`. Only `docker compose down -v`
+deletes the data.
+
+The compose file declares 3 more volumes, and each belongs to a profile.
+`soc_ai_postgres` belongs to the `postgres` profile. `caddy_data` and `caddy_config`
+belong to the `proxy` profile. Compose creates one of them only when you turn on its profile.
 
 ---
 
@@ -344,9 +350,10 @@ ASN enrichment report nothing. Everything else still works. `MAXMIND_LICENSE_KEY
 ## Update
 
 **Back up first.** Migrations run automatically at startup, and soc-ai does not
-support a schema downgrade. An old image cannot roll back a bad upgrade against a
-migrated database. To undo a bad upgrade, restore from a snapshot. Take a snapshot before
-every upgrade. See [Backup and restore](#backup-and-restore) for the full command:
+support a schema downgrade. An old image refuses to start against a migrated database.
+To undo a bad upgrade, restore a snapshot. Take a snapshot before every upgrade.
+See [Backup and restore](#backup-and-restore) for the full command. See
+[Rollback](#rollback) for the steps to undo an upgrade:
 
 ```bash
 docker exec soc-ai python -m soc_ai backup --out /var/lib/soc-ai/data/backup.tar.gz
@@ -370,13 +377,13 @@ needed:
 - **Your data stays in place.** The SQLite DB, the sessions and the enrichment caches
   live in named Docker volumes. A volume survives a container replacement. Only
   `docker compose down -v` deletes one.
-- **Your `.env` keeps working.** soc-ai ignores an unknown key, so a setting that
-  a new version removed or renamed does not stop the container from booting.
+- **Your `.env` keeps working.** soc-ai ignores an unknown key. A setting that
+  a new version removed or renamed therefore does not stop the container from booting.
 - **A new release can add a volume.** `docker compose up -d` reads the mounts
-  from `docker-compose.yml` in the repo, so a `git pull` picks a new one up on
-  its own. If you maintain your own compose file, diff it against the repo file
-  after every upgrade. A mount that you did not copy across raises no error. It
-  writes into the container filesystem and loses the data on the next recreate.
+  from `docker-compose.yml` in the repo. A `git pull` therefore adds a new mount
+  automatically. If you maintain your own compose file, diff it against the repo file
+  after every upgrade. A mount that you did not copy across raises no error. soc-ai
+  then writes into the container filesystem, and the next recreate deletes the data.
 
 !!! warning "One new volume for an upgrade from 1.2.7 or earlier"
 
@@ -391,7 +398,7 @@ needed:
     two consequences:
 
     - **The bundles written before the upgrade are gone.** They lived on the
-      container filesystem that the upgrade recreate replaces. The trend rows
+      container filesystem that the upgrade replaces. The trend rows
       survive, because they live in the DB. Only the artifacts that they point at
       are lost. Nothing regenerates them, so you can no longer check an alarm
       from before the upgrade against its critiques.
@@ -399,7 +406,7 @@ needed:
       `soc_ai_evals:/var/lib/soc-ai/evals` under the service, and
       `soc_ai_evals:` in the top-level `volumes:` block. Mount it at that exact
       path. The image creates `/var/lib/soc-ai/evals` as uid 1000. A volume at a
-      path that the image never created comes up root-owned. The nightly
+      path that the image never created is root-owned. The nightly
       run detects that, keeps running against `./evals`, and logs
       `cannot use … for eval bundles (not writable by this user)`.
 
@@ -411,7 +418,7 @@ curl -k https://localhost:8443/healthz      # → {"status":"alive","version":"�
 docker compose exec soc-ai python -m soc_ai doctor   # the actual verdict
 ```
 
-The first two commands say the process came back. Only the doctor says the
+The first two commands say that the process is up again. Only the doctor says the
 install still works. The doctor is the check that touches Elasticsearch, the
 Security Onion API, the model gateway and the audit-write grant.
 
@@ -421,8 +428,8 @@ With the store in PostgreSQL, `soc-ai backup` refuses. See [PostgreSQL](#postgre
 
 `soc-ai backup` snapshots the store through the SQLite backup API, so it is safe
 while the app is running. Do not `docker cp` the bare `.db` file out of a live
-container. The store runs WAL journaling, and a raw copy of a hot database
-can tear pages. The archive carries the DB snapshot, the app-owned sidecar files
+container. The store runs WAL journaling, and a raw copy of a live database
+can hold torn pages. The archive carries the DB snapshot, the app-owned sidecar files
 next to it, and a manifest that records the schema migration head. The sidecar
 files are the decision-record signing key and the pinned sensor `known_hosts`.
 
@@ -440,14 +447,14 @@ the DB. Add `--full` to include them. Do that on an air-gapped host, where nothi
 can fetch them again.
 
 `soc-ai blocklists refresh` downloads the blocklists and the cloud prefixes again.
-The `.mmdb` files come back by hand, the same way they arrived. See
+Copy the `.mmdb` files back by hand, the same way as at the first install. See
 [Enrichment data](#enrichment-data).
 
 #### Backup schedule and retention
 
 The Docker stack ships no in-app scheduler for backups, the same as for the
 blocklist refresh. Add a host cron job or a systemd timer. The script below
-snapshots the store into a dated file on the host. It then deletes anything older
+snapshots the store into a dated file on the host. It then deletes every backup older
 than 14 days:
 
 ```bash
@@ -473,10 +480,10 @@ find "$DEST" -name 'soc-ai-backup-*.tar.gz' -type f -mtime "+$RETAIN_DAYS" -dele
 47 2 * * *  root  /usr/local/bin/soc-ai-backup.sh >/var/log/soc-ai-backup.log 2>&1
 ```
 
-Store the backups off the box. They hold the decision-record signing key, the pinned
+Store the backups on another host. They hold the decision-record signing key, the pinned
 sensor `known_hosts` and the full store. The store holds the password hashes and the
 encrypted secrets. soc-ai writes the archive with mode `0600`, whatever the umask.
-Keep that mode wherever you copy it. The archive never packs the one-shot
+Keep that mode wherever you copy it. The archive never includes the one-shot
 `bootstrap-admin-password.txt`. Test a restore at regular intervals.
 
 Restore refuses every dangerous step without `--yes`. It does not overwrite an
@@ -498,20 +505,31 @@ docker exec soc-ai rm /var/lib/soc-ai/data/restore.tar.gz
 
 ### Rollback
 
-Check out the previous tag and rebuild. The volumes stay untouched, and the
-schema only ever moves forward. Older code therefore reads a newer DB correctly
-for the additive changes that a patch release makes:
+The schema only ever moves forward. An older image refuses to start against a database
+that a newer image migrated. The older code cannot find the newer revision. The start fails
+with `Can't locate revision identified by`. This holds for an additive migration too.
+
+[CHANGELOG.md](https://github.com/nuk3s/soc-ai/blob/main/CHANGELOG.md) names each
+migration. If the upgrade added no migration, the older image starts against the same
+database. Check out the previous tag and rebuild. The volumes stay untouched:
 
 ```bash
 git checkout v1.2.0 && docker compose up -d --build
 ```
 
-### The "no breaking updates" promise
+If the upgrade added a migration, restore the snapshot that you took before the upgrade:
+
+1. Check out the previous tag. Rebuild the image with `docker compose build soc-ai`.
+2. Run the restore steps from [Backup and restore](#backup-and-restore). The restore
+   replaces the store with the snapshot, so it loses every write since the snapshot.
+3. Start the container with `docker compose up -d soc-ai`.
+
+### Update compatibility
 
 Inside one major version, an update needs no manual migration and no change to
 your `.env`. A new setting ships with a safe default. A renamed setting keeps its
 old name as an alias, so `HEAVY_MODEL` still works after the rename to
-`ANALYST_MODEL`. A migration is additive. A change that cannot keep that promise
+`ANALYST_MODEL`. A migration is additive. A change that cannot keep these rules
 waits for the next major version.
 [CHANGELOG.md](https://github.com/nuk3s/soc-ai/blob/main/CHANGELOG.md) names it.
 
@@ -524,7 +542,7 @@ scheduler, the sweeps and the console contend for that writer. The compose file 
 optional `postgres` service for that case. [DEPLOYMENT.md, "PostgreSQL"](DEPLOYMENT.md#13-postgresql)
 lists what changes and the limits.
 
-The service sits under the `postgres` profile, so a plain `docker compose up -d` does not start
+The service is in the `postgres` profile, so a plain `docker compose up -d` does not start
 it. It publishes no port. soc-ai reaches it on the compose network as `postgres:5432`. Its data
 lives in the `soc_ai_postgres` volume. At start, soc-ai waits up to 60 s for the server to accept
 connections.
@@ -614,8 +632,8 @@ The Docker path and the rsync + systemd path have the same production capability
 | Enrichment data  | `/var/lib/soc-ai/...` on host    | Named volumes (same CLI command to seed)  |
 | Port binding     | Direct (uvicorn on :8443)        | Direct (port-mapped to :8443)             |
 
-The Docker path is easier to reason about for an upgrade, because the image is
-immutable and the state lives in volumes. It also avoids the SELinux caveats on a
+An upgrade is easier to follow on the Docker path, because the image is
+immutable and the state is in volumes. It also avoids the SELinux caveats on a
 Fedora host. soc-ai supports both paths.
 
 ---
@@ -628,13 +646,13 @@ appears as a failed first hunt. The boot succeeds.
 
 ### Upstream TLS trust
 
-This trap applies to Security Onion, Elasticsearch, LiteLLM and MISP.
+This problem applies to Security Onion, Elasticsearch, LiteLLM and MISP.
 
 The container image ships the public CA bundle only. A lab Security Onion,
 Elasticsearch, LiteLLM or MISP often uses a self-signed certificate or an
 internal-CA certificate. The first hunt then fails with
-`CERTIFICATE_VERIFY_FAILED` in `docker compose logs soc-ai`, and `/healthz` stays
-green. Fix it in `.env`:
+`CERTIFICATE_VERIFY_FAILED` in `docker compose logs soc-ai`, and `/healthz` still
+passes. Fix it in `.env`:
 
 ```ini
 SO_VERIFY_SSL=false        # Security Onion web API (Kratos)
@@ -657,8 +675,8 @@ certificate that the container's public bundle already trusts.
 
 ### Port 8443 conflict with the Security Onion nginx
 
-A stock Security Onion manager already runs nginx on 8443. An earlier soc-ai can
-also sit there. If soc-ai runs on the SO box or near it, remap the host port with
+A stock Security Onion manager already runs nginx on 8443. An earlier soc-ai install can
+also use that port. If soc-ai runs on the SO host or near it, remap the host port with
 `SOC_AI_PORT` in `.env`:
 
 ```ini
@@ -676,7 +694,7 @@ sudo firewall-cmd --add-port=9443/tcp --permanent && sudo firewall-cmd --reload
 Docker inserts its own iptables and nftables rules ahead of firewalld. The
 `"${SOC_AI_BIND:-0.0.0.0}:${SOC_AI_PORT:-8443}:8443"` mapping binds `0.0.0.0` by
 default. A published port is therefore reachable from any host that can route to
-this box. That holds even if firewalld shows the port closed.
+this host. That holds even if firewalld shows the port closed.
 `firewall-cmd --list-ports` does not list it. A firewalld rule that you add or
 remove does not change its reachability. To restrict who can reach the console,
 work at the Docker layer:
@@ -711,7 +729,7 @@ connection error. There are 3 fixes:
       extra_hosts:
         - "litellm.example.com:203.0.113.5"
   ```
-- Point the names at real DNS that the container can reach.
+- Point the names at a DNS server that the container can reach.
 
 ### PCAP key mount
 
@@ -749,13 +767,13 @@ Add a host cron job or another scheduler that runs the refresh at an interval:
 ### Profile sweep schedule
 
 soc-ai runs the profile sweep inside the app. The sweep compares each host with
-its own baseline, records what departs as an observation, and forms a lead from
-what accumulates. It runs every 60 minutes by default, and the floor is 15
-minutes. Set the interval in Config → Hunting → *Minutes between profile
+its own baseline, records each departure as an observation, and forms a lead from
+the observations that accumulate. It runs every 60 minutes by default, and the floor is 15
+minutes. Set the interval in Settings → Hunting → *Minutes between profile
 sweeps*. Turn the sweep off with *Run the profile sweep* in the same section.
 Both settings apply live, with no restart.
 
-The sweep skips a demo deployment, and it skips a sweep while Elasticsearch is
+soc-ai does not run the sweep on a demo deployment or while Elasticsearch is
 down. It makes no model call.
 
 Do not add a host cron job for it. Two schedulers run the same sweep twice and
@@ -764,17 +782,18 @@ available for a run by hand.
 
 ### Nightly quality micro-eval schedule
 
-`soc-ai eval-nightly` investigates a handful of real alerts. It lands one row in
+`soc-ai eval-nightly` investigates a handful of real alerts. It writes one row to
 the local quality trend, on the dashboard's Verdict quality card. It alarms
 through the notification webhook if the new point regresses against its own
 history. The verdicts then get a measurement every night. A drop in quality after
 a change of the inference engine or of the model shows on the next point.
 
-The simplest schedule is in-app. Open Config → Quality → *Nightly quality eval*.
+The simplest schedule is in-app. Open Settings → Quality → *Nightly quality eval*.
 It runs daily at the configured UTC hour. The dashboard card also has a Run now
-button, and it shares the same single-flight run. The in-app scheduler skips its
-slot if a snapshot already landed today, for example from a host cron. A host cron
-does not skip its slot, so pick ONE scheduler: the toggle, or this host cron:
+button. Only one run happens at a time, from the button or from the schedule. The
+in-app scheduler skips its slot if a snapshot from today already exists, for
+example from a host cron. A host cron does not skip its slot, so pick ONE
+scheduler: the toggle, or this host cron:
 
 ```cron
 # /etc/cron.d/soc-ai-quality: nightly micro-eval, 02:17
@@ -783,13 +802,13 @@ does not skip its slot, so pick ONE scheduler: the toggle, or this host cron:
 
 soc-ai picks the mode. With `oracle_enabled` on, the Oracle grades each run. That
 mode makes one cloud call per alert, and the agreement rate joins the trend.
-Otherwise the run uses zero-egress local mode, with no Oracle call at all. The trend
+Otherwise the run uses zero-egress local mode, with no Oracle call. The trend
 then carries the fallback and error rates, the verdict distribution and the latency.
 The dashboard card labels which mode measured each point.
 
 Force either mode with `--graded` or `--local`. Tune the sample size
 `quality_nightly_n` and the alarm threshold `quality_alarm_drop` live, in the
-Quality section of the Config screen.
+Quality section of the Settings page.
 
 Each run also writes a `batch-<timestamp>/` bundle to `/var/lib/soc-ai/evals`, on
 the `soc_ai_evals` volume. The bundle holds the per-alert artifacts, the Oracle
@@ -802,13 +821,13 @@ docker exec soc-ai ls /var/lib/soc-ai/evals
 docker exec soc-ai cat /var/lib/soc-ai/evals/batch-<timestamp>/report.md
 ```
 
-`--out-dir` overrides the location. Without it the bundles follow the data dir.
-That is what keeps them on a volume and out of the container.
+`--out-dir` overrides the location. Without it, the bundles go under the data directory.
+That location keeps them on a volume and out of the container filesystem.
 
 ### Memory cap of 1 GB
 
 `docker-compose.yml` sets a `1G` memory limit. Under cgroup v2 that limit is a
-hard cap. A pathological hunt that accumulates a lot of tool output can
+hard cap. A hunt that accumulates a large tool output can
 reach the cap, and the kernel then OOM-kills the container. The container
 restarts through `restart: unless-stopped`. If the container restarts in the
 middle of a hunt, raise `deploy.resources.limits.memory` in
@@ -818,8 +837,8 @@ middle of a hunt, raise `deploy.resources.limits.memory` in
 
 ## Troubleshooting
 
-**Run the doctor first.** `docker exec soc-ai python -m soc_ai doctor` checks the whole
-dependency surface. It covers the config, the store and its migration head, Security Onion,
+**Run the doctor first.** `docker exec soc-ai python -m soc_ai doctor` checks every
+dependency. It covers the config, the store and its migration head, Security Onion,
 Elasticsearch, the audit grant, the gateway and the model fitness. It prints a pass and
 fail table with a fix hint on every failing line. Start there, before the per-symptom
 entries below.

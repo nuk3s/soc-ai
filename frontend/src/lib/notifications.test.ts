@@ -123,7 +123,7 @@ describe('describeNotifications', () => {
   it('names only the row types present, with a count each', () => {
     expect(
       describeNotifications([{ id: 'lead:1' }, { id: 'inv-done:a' }, { id: 'inv-done:b' }], false),
-    ).toBe('3 items: 1 lead and 2 completed investigations. Finished runs cover the last 24 h.');
+    ).toBe('3 notifications: 1 lead and 2 completed investigations. Finished runs cover the last 24 h.');
   });
 
   // The header said "the 10 newest" over a list the API cut at 12 rows, and
@@ -136,13 +136,24 @@ describe('describeNotifications', () => {
       ...Array.from({ length: 10 }, (_, i) => ({ id: `inv-done:${i}` })),
     ];
     expect(describeNotifications(rows, true)).toBe(
-      '12 items loaded: 2 running investigations and 10 completed investigations. More items exist. Select Show more to load them. Finished runs cover the last 24 h.',
+      '12 notifications loaded: 2 running investigations and 10 completed investigations. More notifications exist. Select Show more to load them. Finished runs cover the last 24 h.',
+    );
+  });
+
+  // Dogfood 2026-10-19 R1-D15. A held analytic is a hunting row: its chip
+  // says Hunting. The header called two of them "2 system notices."
+  it('names a held analytic row as an analytic notice', () => {
+    expect(
+      describeNotifications([{ id: 'analytic-held:38' }, { id: 'analytic-held:39' }], false),
+    ).toBe('2 notifications: 2 analytic notices.');
+    expect(describeNotifications([{ id: 'analytic-held:38' }], false)).toBe(
+      '1 notification: 1 analytic notice.',
     );
   });
 
   it('counts an unknown source as a system notice', () => {
     expect(describeNotifications([{ id: 'dep-down:es:1' }], false)).toBe(
-      '1 item: 1 system notice.',
+      '1 notification: 1 system notice.',
     );
   });
 });
@@ -176,9 +187,9 @@ describe('the hunt rows of the bell', () => {
   it('names a folded sweep and a running hunt in the header', () => {
     expect(
       describeNotifications([{ id: 'hunt-sweep:could_not_run:01A' }, { id: 'hunt:01B' }], false),
-    ).toBe('2 items: 1 catalog sweep and 1 running hunt. Finished runs cover the last 24 h.');
+    ).toBe('2 notifications: 1 catalog sweep and 1 running hunt. Finished runs cover the last 24 h.');
     // A running hunt alone has no window.
-    expect(describeNotifications([{ id: 'hunt:01B' }], false)).toBe('1 item: 1 running hunt.');
+    expect(describeNotifications([{ id: 'hunt:01B' }], false)).toBe('1 notification: 1 running hunt.');
   });
 });
 

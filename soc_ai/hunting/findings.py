@@ -72,19 +72,68 @@ _ERROR_PHRASES: tuple[tuple[str, str], ...] = (
 )
 _STAGES = ("precondition", "undecided", "detection")
 
+# The grid client's partial-read error (soc_ai.so_client.elastic). The model
+# reads that text as a tool error, so it stays as it is there. The console
+# reads this sentence. It carried the index patterns, and the narrative
+# renderer read their asterisks as emphasis (R3-D13).
+_PARTIAL_SHARDS_RE = re.compile(r"partial search results\b.*?(\d+) of (\d+) shards failed", re.I)
+
 
 def plain_error(text: str | None) -> str:
-    """Say what went wrong in one plain sentence, or return the text unchanged."""
+    """Say what went wrong in plain sentences, or return the text unchanged."""
     raw = (text or "").strip()
     if not raw:
         return ""
     stage = next((s for s in _STAGES if raw.lower().startswith(s + ":")), None)
+    where = f" during the {stage} query" if stage else ""
+    partial = _PARTIAL_SHARDS_RE.search(raw)
+    if partial:
+        failed, total = int(partial.group(1)), int(partial.group(2))
+        return (
+            f"The grid answered from {max(0, total - failed)} of {total} shards{where}. "
+            "The answer is incomplete. An empty answer means that the result is unknown."
+        )
     lowered = raw.lower()
     for needle, phrase in _ERROR_PHRASES:
         if needle in lowered:
-            where = f" during the {stage} query" if stage else ""
             return f"{phrase[0].upper()}{phrase[1:]}{where}."
     return raw
+
+
+# The head of a failed-run finding before 2026-10-19 (R3 STE). The composer
+# writes "The analytic <id> could not run on the grid." now.
+_OLD_FAILURE_HEAD_RE = re.compile(r"^The (?P<id>\S+) hunt spec failed against the grid\.")
+# The sentence that ends the composer's own words in a failed-run text. The
+# raw error of the run follows it.
+_UNKNOWN_MARK = "The result is unknown. "
+
+
+def restate_failure(text: str | None) -> str:
+    """A stored failed-run sentence of a catalog hunt, in today's words.
+
+    The composer words a failed run in plain sentences since 2026-10-19
+    (:func:`plain_error`). A hunt stored before that keeps the grid client's
+    raw text: the index patterns, an em dash and "not 'nothing happened'".
+    The hunt page maps that text when it reads it (dogfood 2026-10-19, V1-H7).
+
+    Only the two shapes the composer wrote are mapped: the old head of the
+    finding detail, and a raw error after "The result is unknown.". Any other
+    text comes back as it was stored. The function never raises, so a stored
+    value of a shape this build does not know never fails a page.
+    """
+    try:
+        raw = "" if text is None else str(text)
+        out = _OLD_FAILURE_HEAD_RE.sub(
+            lambda m: f"The analytic {m.group('id')} could not run on the grid.", raw, count=1
+        )
+        head, mark, tail = out.partition(_UNKNOWN_MARK)
+        if mark and tail.strip():
+            worded = plain_error(tail)
+            if worded != tail.strip():
+                out = f"{head}{mark}{worded}"
+        return out
+    except Exception:  # a read of stored text never fails a page
+        return "" if text is None else str(text)
 
 
 def _title(spec: HuntSpec, scope_key: str) -> str:
@@ -199,7 +248,7 @@ def candidate_findings(spec: HuntSpec, run: SpecRun) -> list[dict[str, Any]]:
             {
                 "title": f"{spec.title}: could not run",
                 "detail": (
-                    f"The {spec.id} hunt spec failed against the grid. The result is "
+                    f"The analytic {spec.id} could not run on the grid. The result is "
                     f"unknown. {plain_error(run.error)}"
                 ),
                 "severity": "medium",
@@ -619,10 +668,12 @@ def is_run_failure_finding(finding: Mapping[str, Any]) -> bool:
 def finding_is_subject(finding: Any) -> bool:
     """Whether the hunt investigates this finding.
 
-    A subject names at least one entity (a host, an address, a user or a
-    domain). A visibility gap, a failed run and a clean observation are never
-    subjects: a gap and a failure name no activity, and a clean result names
-    nothing to check.
+    A subject is a threat finding that names at least one entity (a host, an
+    address, a user or a domain). A visibility gap, a failed run and an
+    observation are never subjects: a gap and a failure name no activity, and
+    an observation claims no threat. The range hunt of lead 5 (2026-10-19)
+    linked the observation "All abuse is historical" to the investigation of
+    a threat on the same hosts, and the card read that verdict as its own.
 
     A citation is not required. The investigation runs on the document the
     finding cites, else on the evidence of the lead the hunt was started on.
@@ -633,9 +684,7 @@ def finding_is_subject(finding: Any) -> bool:
     """
     if not isinstance(finding, Mapping):
         return False
-    if finding_category(finding) == "visibility_gap" or is_run_failure_finding(finding):
-        return False
-    if is_clean_finding(finding):
+    if finding_category(finding) != "threat" or is_run_failure_finding(finding):
         return False
     return bool(finding_entities(finding))
 

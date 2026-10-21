@@ -133,6 +133,10 @@ describe('the lead quality block', () => {
   it('counts the leads each set of types formed', async () => {
     mount();
     const table = await screen.findByTestId('lead-quality-types');
+    // R3-D15: the table counts the whole window and named none.
+    expect(screen.getByTestId('lead-quality-types-window').textContent).toBe(
+      'By type: the leads that formed in the 4 weeks above.',
+    );
     const heads = within(table).getAllByRole('columnheader');
     expect(heads.map((th) => th.textContent)).toEqual([
       'Types',

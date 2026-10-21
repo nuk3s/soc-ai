@@ -19,10 +19,15 @@ that claims the alert and therefore cannot lag at all. This module answers
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from typing import Any
+from urllib.parse import quote
 
 from soc_ai.config import Settings
 from soc_ai.so_client.elastic import ElasticClient
+
+_LOGGER = logging.getLogger(__name__)
 
 # Security Onion's case index holds several document shapes under ``so_kind``;
 # ``related`` is the alert-to-case link. ``artifact`` and ``comment`` live
@@ -100,3 +105,103 @@ async def case_ids_for_alerts(
         if case_id:
             links[alert_id] = case_id
     return links
+
+
+# The most cases one alert lists. An alert on more cases than this is a case
+# queue problem, and the card names the first ones.
+MAX_CASES_PER_ALERT = 20
+
+
+async def all_case_ids_for_alert(
+    elastic: ElasticClient,
+    settings: Settings,
+    alert_id: str,
+    *,
+    limit: int = MAX_CASES_PER_ALERT,
+) -> list[str]:
+    """Every case Security Onion has ``alert_id`` on, earliest first.
+
+    :func:`case_ids_for_alerts` answers with the earliest case of each alert,
+    because a press decides on the first link. The action card names every
+    case of one alert: the alert of the range was on two cases, and the card
+    must link both (dogfood 2026-10-20, V3-N2). A second attach to the same
+    case is one case.
+
+    ``require_complete`` as above: a partial read raises, and the caller
+    treats the failure as unknown.
+    """
+    if not alert_id:
+        return []
+    query: dict[str, Any] = {
+        "bool": {
+            "filter": [
+                {"term": {"so_kind": _RELATED_KIND}},
+                {"term": {_SOC_ID_FIELD: alert_id}},
+            ]
+        }
+    }
+    result = await elastic.search(
+        settings.cases_index_pattern,
+        query,
+        size=limit,
+        sort=[{_CREATE_TIME_FIELD: {"order": "asc"}}],
+        source=[_CASE_ID_FIELD],
+        require_complete=True,
+    )
+    out: list[str] = []
+    for hit in result.hits:
+        related = (hit.get("_source") or {}).get("so_related") or {}
+        case_id = str(related.get("caseId") or "")
+        if case_id and case_id not in out:
+            out.append(case_id)
+    return out
+
+
+async def cases_of_alert(
+    db_sessionmaker: Any,
+    elastic: ElasticClient,
+    settings: Settings,
+    alert_id: str,
+) -> tuple[list[str], bool]:
+    """The cases ``alert_id`` is on, and whether Security Onion confirmed the list.
+
+    The two sources of the duplicate-case guard of the execute route, in its
+    order: soc-ai's escalation ledger, then the case links of Security Onion.
+    The ledger is a store read and cannot lag. The grid read is bounded by
+    ``webui_grid_timeout_s``. A failed grid read leaves the ledger case alone,
+    and the list is then not confirmed. Best-effort: a failure of both reads
+    answers an empty list, and the console then names no case.
+    """
+    from soc_ai.store import escalations as esc_svc  # noqa: PLC0415 - light import
+
+    if not alert_id:
+        return [], False
+    ledger: str | None = None
+    try:
+        async with db_sessionmaker() as db:
+            ledger = (await esc_svc.cases_for_alerts(db, [alert_id])).get(alert_id)
+    except Exception:
+        _LOGGER.warning("case links: the escalation ledger could not be read", exc_info=True)
+    ids: list[str] = []
+    complete = False
+    try:
+        async with asyncio.timeout(settings.webui_grid_timeout_s):
+            ids = await all_case_ids_for_alert(elastic, settings, alert_id)
+        complete = len(ids) < MAX_CASES_PER_ALERT
+    except Exception as exc:
+        _LOGGER.info("case links: the grid was not read (%s)", type(exc).__name__)
+    if ledger and ledger not in ids:
+        ids = [ledger, *ids]
+    return ids, complete
+
+
+def case_url(settings: Settings, case_id: str) -> str | None:
+    """The case in Security Onion's console, built from ``so_host``.
+
+    ``None`` when the settings name no host to build it from. The same form
+    the escalate answer carries.
+    """
+    host = str(settings.so_host or "").rstrip("/")
+    if not host or not case_id:
+        return None
+    return f"{host}/#/case/{quote(case_id, safe='')}"

@@ -25,10 +25,10 @@ KIND_LABEL: dict[str, str] = {
     "scope_count": "across many hosts",
     "estate_outlier": "estate outlier",
     "alert": "alert",
-    "prior_no_baseline": "finding with no benign baseline",
+    "prior_no_baseline": "no benign baseline",
     "catalog_match": "analytic match",
     "hunt_finding": "hunt finding",
-    "telemetry_silence": "telemetry plane silent",
+    "telemetry_silence": "events stopped",
     "logon_chain": "logon chain",
 }
 

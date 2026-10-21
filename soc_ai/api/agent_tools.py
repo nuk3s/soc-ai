@@ -21,6 +21,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from soc_ai.api.data_sources import LocalFeedHealth, local_feed_health
 from soc_ai.config import Settings
 
 
@@ -56,12 +57,25 @@ class _Req:
 
 
 @dataclass(frozen=True)
+class _Feed:
+    """A local feed a tool looks in. ``source_id`` keys local_feed_health."""
+
+    label: str
+    source_id: str
+
+
+@dataclass(frozen=True)
 class _ToolDef:
     name: str
     category: str
     read_only: bool
     description: str
     reqs: tuple[_Req, ...] = field(default_factory=tuple)
+    # The local feeds the tool looks in. With none of them usable and no MISP,
+    # an empty answer reads as "no hit" while the tool had nothing to search,
+    # so the row is unavailable. With some of them stale or absent it is
+    # degraded (dogfood 2026-10-19, R5-D9).
+    feeds: tuple[_Feed, ...] = field(default_factory=tuple)
 
 
 class AgentToolOut(BaseModel):
@@ -75,11 +89,21 @@ class AgentToolOut(BaseModel):
     # Requirements that are configured but down right now, per the live
     # health probe. They are in ``missing`` too, so the row reads unavailable.
     unreachable: list[str] = []
+    # Local feeds the tool reads that are stale or absent while the tool still
+    # has data to look in. The row stays available and reads degraded.
+    degraded: list[str] = []
+    # Why the row is degraded, or unavailable for want of a local feed. STE
+    # prose for the operator. None when every feed the tool reads is fresh.
+    state_reason: str | None = None
 
 
 _ES = _Req("Elasticsearch", _es)
 _ONLINE = _Req("Online enrichment", _online)
 _SO = _Req("Security Onion", _str_set("so_host"))
+
+_BLOCKLISTS = _Feed("Local blocklists", "blocklists")
+_GEOIP = _Feed("MaxMind GeoLite2", "maxmind")
+_CLOUD = _Feed("Cloud prefixes", "cloud_prefixes")
 
 # Curated catalogue. Order = display order within a category.
 _CATALOG: tuple[_ToolDef, ...] = (
@@ -88,7 +112,7 @@ _CATALOG: tuple[_ToolDef, ...] = (
         "get_alert_context",
         "Query",
         True,
-        "Prefetch the full enriched context of an alert. This is the starting evidence.",
+        "Load the full enriched context of an alert. This is the first evidence.",
         (_ES,),
     ),
     _ToolDef(
@@ -98,7 +122,7 @@ _CATALOG: tuple[_ToolDef, ...] = (
         "query_zeek_logs",
         "Query",
         True,
-        "Query raw Zeek logs (conn, dns, http, ssl/ja3, files) for a host or flow.",
+        "Query the raw Zeek logs for a host or a flow: conn, dns, http, ssl, ja3 and files.",
         (_ES,),
     ),
     _ToolDef(
@@ -112,57 +136,68 @@ _CATALOG: tuple[_ToolDef, ...] = (
         "get_rule_content",
         "Query",
         True,
-        "Fetch a detection rule's full text (what the signature matches) by SID or title.",
+        "Fetch the full text of a detection rule by SID or title. The text shows what the "
+        "signature matches.",
         (_ES,),
     ),
     _ToolDef(
         "decode_payload",
         "Query",
         True,
-        "Decode alert payload bytes (base64/hex) into strings, indicators, and "
-        "protocol facts. Runs locally with no egress.",
+        "Decode the base64 or hex payload bytes of an alert into strings, indicators "
+        "and protocol facts. The decode runs locally with no egress.",
         (),
     ),
     _ToolDef(
-        "query_cases", "Query", True, "Search existing SO cases for related or prior work.", (_ES,)
+        "query_cases",
+        "Query",
+        True,
+        "Search the Security Onion cases for related or earlier work.",
+        (_ES,),
     ),
     _ToolDef(
         "prevalence",
         "Query",
         True,
-        "Measure how common an indicator (IP, domain or hash) is across the grid.",
+        "Measure how common an IP, a domain or a hash is across the grid.",
         (_ES,),
     ),
     _ToolDef(
         "rule_prevalence",
         "Query",
         True,
-        "Measure how noisy a detection rule is: fires per day and distinct hosts.",
+        "Measure how noisy a detection rule is: the fires per day and the distinct hosts.",
         (_ES,),
     ),
     _ToolDef(
         "suggest_rule_tuning",
         "Query",
         True,
-        "Detection tuning: is a rule a noisy FP nuisance to mute? Volume + ack/escalate trend.",
+        "Find out if a rule fires mostly false positives and is a candidate to mute. The "
+        "tool reads the volume and the acknowledge and escalate trend.",
         (_ES,),
     ),
     _ToolDef(
         "host_summary",
         "Query",
         True,
-        "Profile a host by IP: identity, OS/UA fingerprint, recent alert history.",
+        "Describe a host by IP: the identity, the OS and user-agent fingerprint, and the "
+        "recent alert history.",
         (_ES,),
     ),
     _ToolDef(
         "get_event_raw",
         "Query",
         True,
-        "Fetch one event's raw document by id (chat deep-dive).",
+        "Fetch the raw document of one event by id. The chat uses it.",
         (_ES,),
     ),
     _ToolDef(
-        "get_playbooks", "Query", True, "Fetch the SO playbooks relevant to a detection.", (_ES,)
+        "get_playbooks",
+        "Query",
+        True,
+        "Fetch the Security Onion playbooks for a detection.",
+        (_ES,),
     ),
     _ToolDef(
         "lookup_runbook",
@@ -175,53 +210,53 @@ _CATALOG: tuple[_ToolDef, ...] = (
         "describe_dataset",
         "Query",
         True,
-        "Discover which fields populate a dataset. Samples its recent documents "
-        "to learn a schema before a query.",
+        "Find the fields that a dataset fills. The tool samples recent documents "
+        "to learn the schema before a query.",
         (_ES,),
     ),
     _ToolDef(
         "field_values",
         "Query",
         True,
-        "List the top values of a field with a terms aggregation. Shows what populates the field.",
+        "List the top values of a field with a terms aggregation.",
         (_ES,),
     ),
     _ToolDef(
         "beacon_profile",
         "Query",
         True,
-        "Beacon-cadence sweep over zeek.conn: measures inter-arrival coefficient "
-        "of variation per source and destination pair. A hunt reports a measured "
-        "cadence from it. Hunts only. Triage has no equivalent.",
+        "Sweep zeek.conn for beacon cadence. The tool measures the inter-arrival "
+        "coefficient of variation for each source and destination pair. Only a "
+        "hunt uses it. Triage has no equivalent.",
         (_ES,),
     ),
     _ToolDef(
         "dns_entropy_scan",
         "Query",
         True,
-        "DNS-entropy sweep over zeek.dns: groups qnames by parent domain and "
-        "flags DGA/tunnel candidates by mean subdomain-label Shannon entropy "
-        "plus query volume (hunt-only).",
+        "Sweep zeek.dns for DNS entropy. The tool groups the query names by parent "
+        "domain. It flags DGA and tunnel candidates by the mean Shannon entropy of "
+        "the subdomain labels and by the query volume. Only a hunt uses it.",
         (_ES,),
     ),
     _ToolDef(
         "dcerpc_histogram",
         "Query",
         True,
-        "Operation histogram over zeek.dce_rpc: flags individually-dangerous "
-        "operations (Zerologon-style NetrServerAuthenticate*, DCSync's "
-        "DRSGetNCChanges/DsGetNCChanges, remote service creation) and "
-        "operations rare against a busy baseline (hunt-only).",
+        "Count the operations in zeek.dce_rpc. The tool flags the dangerous "
+        "operations: Zerologon-style NetrServerAuthenticate*, the DCSync "
+        "DRSGetNCChanges and DsGetNCChanges, and remote service creation. It also "
+        "flags an operation that is rare against a busy baseline. Only a hunt uses it.",
         (_ES,),
     ),
     _ToolDef(
         "first_seen",
         "Query",
         True,
-        "Novelty sweep: diffs external destinations seen in a recent window "
-        "against a trailing baseline window that ends exactly where the "
-        "recent window begins, surfacing destinations with no prior baseline "
-        "sighting (hunt-only).",
+        "Sweep for new external destinations. The tool compares a recent window "
+        "with a baseline window that ends where the recent window begins. It "
+        "reports each destination with no sighting in the baseline. Only a hunt "
+        "uses it.",
         (_ES,),
     ),
     # ── Enrichment (local-mirror feeds; online opt-in) ───────────────────────
@@ -231,47 +266,52 @@ _CATALOG: tuple[_ToolDef, ...] = (
         True,
         "Enrich an IP against local feeds: blocklists, GeoIP/ASN and cloud prefixes.",
         (),
+        (_BLOCKLISTS, _GEOIP, _CLOUD),
     ),
     _ToolDef(
         "enrich_domain",
         "Enrichment",
         True,
-        "Enrich a domain against local feeds (blocklists, MISP if configured).",
+        "Enrich a domain against the local blocklists, and against MISP if MISP is configured.",
         (),
+        (_BLOCKLISTS,),
     ),
     _ToolDef(
         "enrich_hash",
         "Enrichment",
         True,
-        "Enrich a file hash against local feeds (blocklists, MISP if configured).",
+        "Enrich a file hash against the local blocklists, and against MISP if MISP is configured.",
         (),
+        (_BLOCKLISTS,),
     ),
     _ToolDef(
         "shodan_internetdb",
         "Enrichment",
         True,
-        "Free Shodan InternetDB view of a public IP (ports, CPEs, CVEs).",
+        "Read the free Shodan InternetDB record of a public IP: the ports, CPEs and CVEs.",
         (_ONLINE,),
     ),
     _ToolDef(
         "cve_lookup",
         "Enrichment",
         True,
-        "Score a CVE with Shodan CVEDB: CVSS, EPSS and CISA-KEV. Free, needs no key.",
+        "Score a CVE with Shodan CVEDB: CVSS, EPSS and CISA-KEV. The lookup is free "
+        "and needs no key.",
         (_ONLINE,),
     ),
     _ToolDef(
         "greynoise",
         "Enrichment",
         True,
-        "GreyNoise: is an external IP indiscriminate internet scanner-noise?",
+        "Ask GreyNoise if an external IP is a mass internet scanner.",
         (_ONLINE, _Req("GreyNoise API key", _key_set("greynoise_api_key"))),
     ),
     _ToolDef(
         "shodan_host",
         "Enrichment",
         True,
-        "Full Shodan host lookup: owner, banners, services and vulns. Needs a paid key.",
+        "Look up a host in the full Shodan record: the owner, banners, services and "
+        "vulnerabilities. The lookup needs a paid key.",
         (_ONLINE, _Req("Shodan API key", _key_set("shodan_api_key"))),
     ),
     # ── Web research ─────────────────────────────────────────────────────────
@@ -279,7 +319,7 @@ _CATALOG: tuple[_ToolDef, ...] = (
         "web_search",
         "Web research",
         True,
-        "Search the web via SearXNG for threat-intel / context.",
+        "Search the web through SearXNG for threat intelligence and context.",
         (
             _Req("Web search enabled", _flag("web_search_enabled")),
             _Req("SearXNG URL", _str_set("searxng_url")),
@@ -289,7 +329,7 @@ _CATALOG: tuple[_ToolDef, ...] = (
         "crawl_page",
         "Web research",
         True,
-        "Read a web page's content via crawl4ai (deep read of a search hit).",
+        "Read the content of a web page through crawl4ai. The tool reads a search hit in full.",
         (
             _Req("Page read enabled", _flag("crawl4ai_enabled")),
             _Req("crawl4ai URL", _str_set("crawl4ai_url")),
@@ -300,7 +340,8 @@ _CATALOG: tuple[_ToolDef, ...] = (
         "get_pcap",
         "PCAP",
         True,
-        "Pull packet-level facts for a flow from the SO sensor (full PCAP via SSH).",
+        "Get the packet facts for a flow from the Security Onion sensor. The tool reads the "
+        "full PCAP over SSH.",
         (
             _Req("PCAP enabled", _flag("pcap_enabled")),
             _Req("SSH sensor host", _str_set("so_ssh_host")),
@@ -311,21 +352,21 @@ _CATALOG: tuple[_ToolDef, ...] = (
         "ack_alert",
         "Action",
         False,
-        "Acknowledge an alert in Security Onion (analyst-executed).",
+        "Acknowledge an alert in Security Onion. The analyst runs this action.",
         (_SO,),
     ),
     _ToolDef(
         "escalate_to_case",
         "Action",
         False,
-        "Escalate an alert to a new SO case (analyst-executed).",
+        "Escalate an alert to a new Security Onion case. The analyst runs this action.",
         (_SO,),
     ),
     _ToolDef(
         "add_case_comment",
         "Action",
         False,
-        "Add a comment to an SO case (analyst-executed).",
+        "Add a comment to a Security Onion case. The analyst runs this action.",
         (_SO,),
     ),
 )
@@ -346,25 +387,53 @@ def collect_agent_tools(
     judged on config alone.
     """
     live = live or {}
+    health = local_feed_health(settings)
+    misp_on = bool(str(getattr(settings, "misp_url", None) or "").strip())
     out: list[AgentToolOut] = []
     for t in _CATALOG:
         missing = [r.label for r in t.reqs if not r.ok(settings)]
         unreachable = [
             r.label for r in t.reqs if r.label not in missing and live.get(r.label) is False
         ]
+        feed_missing, degraded, reason = _feed_state(t.feeds, health, misp_on=misp_on)
         out.append(
             AgentToolOut(
                 name=t.name,
                 category=t.category,
                 read_only=t.read_only,
                 description=t.description,
-                requires=[r.label for r in t.reqs],
-                missing=missing + unreachable,
-                available=not missing and not unreachable,
+                requires=[r.label for r in t.reqs] + [f.label for f in t.feeds],
+                missing=missing + unreachable + feed_missing,
+                available=not missing and not unreachable and not feed_missing,
                 unreachable=unreachable,
+                degraded=degraded,
+                state_reason=reason,
             )
         )
     return out
+
+
+def _feed_state(
+    feeds: tuple[_Feed, ...], health: dict[str, LocalFeedHealth], *, misp_on: bool
+) -> tuple[list[str], list[str], str | None]:
+    """(missing feed labels, degraded feed labels, reason) for one tool.
+
+    The rule for each feed is local_feed_health, the rule the Data sources
+    panel shows. A feed in state "missing" or "off" has no data to look in.
+    """
+    if not feeds:
+        return [], [], None
+    states = [(f, health[f.source_id]) for f in feeds]
+    not_active = [(f, h) for f, h in states if h.state != "active"]
+    if not not_active:
+        return [], [], None
+    facts = " ".join(h.reason for _f, h in not_active if h.reason)
+    usable = [f for f, h in states if h.state not in ("missing", "off")]
+    if not usable and not misp_on:
+        reason = f"{facts} The tool has no data to look in.".strip()
+        return [f.label for f in feeds], [], reason
+    reason = f"{facts} An empty answer can come from a gap in a feed.".strip()
+    return [], [f.label for f, _h in not_active], reason
 
 
 def catalog_tool_names() -> set[str]:

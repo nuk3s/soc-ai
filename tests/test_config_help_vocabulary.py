@@ -42,8 +42,11 @@ def test_a_drafted_analytic_is_a_draft() -> None:
 
 
 def test_profiles_help_reads_in_plain_words() -> None:
+    """The profile of a host is no model. "The model" is the language model
+    (dogfood 2026-10-19, R5 STE item 22)."""
     text = _help("entity_profiles_enabled")
-    assert "compares new activity with the model" in text
+    assert "compares new activity with the profile" in text
+    assert "model" not in text
     assert "A departure from it becomes an observation." in text
 
 

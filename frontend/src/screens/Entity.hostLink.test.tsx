@@ -124,3 +124,68 @@ describe('Entity: a value a machine holds', () => {
     expect(screen.queryByTestId('here')).toBeNull();
   });
 });
+
+// Dogfood 2026-10-19, R4-D2 and R4-D23. The address view said "No machine in
+// the census holds it" beside the chip of the machine, and its counts read
+// the address alone. A user page wore the host icon.
+describe('Entity: the counts of a machine', () => {
+  const ADDRESS = {
+    ...NAMED,
+    value: '192.0.2.130',
+    kind: 'ip' as const,
+    type: 'address' as const,
+    host_key: 'agent:ea2d',
+    host_name: 'files01',
+    machine_keys: ['192.0.2.130', '192.0.2.129', 'files01', 'a-ea2d', 'agent:ea2d'],
+    summary: {
+      investigationCount: 7,
+      huntFindingCount: 2,
+      latestVerdict: 'true_positive',
+      truePositiveCount: 6,
+    },
+  };
+
+  it('names the machine of an address and the keys the counts read', async () => {
+    vi.mocked(resolveMachine).mockResolvedValue({
+      key: 'agent:ea2d',
+      primary_ip: '192.0.2.129',
+      matched: 'address',
+    });
+    vi.mocked(getEntity).mockResolvedValue(ADDRESS as never);
+    mount('/entity/192.0.2.130?view=entity');
+    const line = await screen.findByTestId('entity-identity');
+    expect(line.textContent).toBe('192.0.2.130 is an internal address of the machine files01.');
+    expect((await screen.findByTestId('entity-keys')).textContent).toBe(
+      'The counts cover every key of the machine: 192.0.2.130, 192.0.2.129, files01 and a-ea2d.',
+    );
+  });
+
+  it('says that no machine holds an address only when none does', async () => {
+    // NEGATIVE CONTROL: an address no machine holds reads itself only.
+    vi.mocked(getEntity).mockResolvedValue({
+      ...ADDRESS,
+      value: '198.51.100.7',
+      host_key: null,
+      host_name: null,
+      machine_keys: ['198.51.100.7'],
+    } as never);
+    mount('/entity/198.51.100.7');
+    expect((await screen.findByTestId('entity-identity')).textContent).toBe(
+      '198.51.100.7 is an internal address. No machine holds it.',
+    );
+    expect(screen.queryByTestId('entity-keys')).toBeNull();
+  });
+
+  it('wears the user icon on a user page', async () => {
+    vi.mocked(getEntity).mockResolvedValue({ ...NAMED, value: 'backup', type: 'user' } as never);
+    mount('/entity/backup?type=user');
+    expect((await screen.findByTestId('entity-icon')).getAttribute('data-type')).toBe('user');
+  });
+
+  it('wears the host icon on an address page', async () => {
+    // NEGATIVE CONTROL: the icon follows the type.
+    vi.mocked(getEntity).mockResolvedValue({ ...ADDRESS, host_key: null, machine_keys: [] } as never);
+    mount('/entity/192.0.2.130');
+    expect((await screen.findByTestId('entity-icon')).getAttribute('data-type')).toBe('host');
+  });
+});

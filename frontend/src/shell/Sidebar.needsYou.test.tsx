@@ -144,3 +144,30 @@ describe('Sidebar needs-you badges', () => {
     await waitFor(() => expect(screen.getByTestId('sidebar-needs-you').textContent).toBe('3'));
   });
 });
+
+// Dogfood 2026-10-19 R1-D17. The collapsed rail hid every badge, so a rail
+// with 34 things waiting read like a quiet day.
+describe('Sidebar needs-you badges on the collapsed rail', () => {
+  it('keeps a compact count on the icon and names it on the link', async () => {
+    localStorage.setItem('soc-ai:navCollapsed', '1');
+    vi.mocked(getNeedsYouCount).mockResolvedValue(count({ untriaged_groups: 5, leads_needing_decision: 140 }));
+    mount();
+    const alerts = await screen.findByTestId('sidebar-needs-you-alerts');
+    expect(alerts.textContent).toBe('5');
+    expect(screen.getByRole('link', { name: 'Alerts, 5 need you' }).contains(alerts)).toBe(true);
+    const hunts = screen.getByTestId('sidebar-needs-you');
+    expect(hunts.textContent).toBe('99+');
+    expect(screen.getByRole('link', { name: 'Hunts, 140 need you' })).toBeTruthy();
+    // A zero part shows nothing on the rail either.
+    expect(screen.queryByTestId('sidebar-needs-you-investigations')).toBeNull();
+  });
+
+  it('marks an unknown part on the collapsed rail', async () => {
+    localStorage.setItem('soc-ai:navCollapsed', '1');
+    vi.mocked(getNeedsYouCount).mockResolvedValue(count({ untriaged_groups: null, unknown: ['untriaged_groups'] }));
+    mount();
+    const alerts = await screen.findByTestId('sidebar-needs-you-alerts');
+    expect(alerts.textContent).toBe('?');
+    expect(screen.getByRole('link', { name: 'Alerts, could not count what needs you' })).toBeTruthy();
+  });
+});

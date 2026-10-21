@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
+import math
 import time
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
@@ -16,7 +18,7 @@ from sqlalchemy import func, not_, select
 from soc_ai import __commit__, __version__
 from soc_ai.api.data_sources import DataSourceOut, collect_data_sources
 from soc_ai.api.deps import get_settings_dep
-from soc_ai.api.webui import routes_hunts
+from soc_ai.api.webui import action_rules, routes_hunts
 from soc_ai.api.webui._errors import api_error
 from soc_ai.api.webui._shared import (
     _ago,
@@ -27,7 +29,7 @@ from soc_ai.api.webui._shared import (
     router,
 )
 from soc_ai.api.webui.kind_labels import kind_label
-from soc_ai.bootstrap_credential import clear_bootstrap_credential
+from soc_ai.bootstrap_credential import clear_bootstrap_credential, uses_generated_password
 from soc_ai.config import Settings
 from soc_ai.demo.guard import is_demo
 from soc_ai.doctor import CheckResult, run_doctor
@@ -35,12 +37,15 @@ from soc_ai.hunting.outcome import FindingVerdicts
 from soc_ai.notify import hunt_outcome_tone
 from soc_ai.store import auth as auth_svc
 from soc_ai.store import dashboard_layout as layout_svc
+from soc_ai.store import grid_gaps as gaps_svc
 from soc_ai.store import host_dossier as dossier_svc
 from soc_ai.store import hunts as hunts_svc
 from soc_ai.store import investigations as inv_svc
 from soc_ai.store import quality as quality_svc
 from soc_ai.store import saved_views as views_svc
 from soc_ai.webui import (
+    anchor_check,
+    grid_gap_probe,
     probes,
 )
 from soc_ai.webui import (
@@ -61,11 +66,24 @@ class DataSourcesOut(BaseModel):
     dependencies=[Depends(require_admin_api)],
 )
 async def get_data_sources(
+    request: Request,
     settings: Settings = Depends(get_settings_dep),
 ) -> DataSourcesOut:
-    """Every enrichment data source — local feeds + opt-in online lookups — with
-    freshness and key/enable status, for the config console's Data Sources panel."""
-    return DataSourcesOut(sources=collect_data_sources(settings))
+    """Every data source with its freshness and its key and enable status.
+
+    The sources are the grid, the local feeds and the opt-in online lookups.
+    The config console's Data Sources panel reads them.
+
+    The grid row reads the cached health probe, the one the status pill reads.
+    A failed probe read leaves the grid row "unknown"."""
+    try:
+        probed: dict[str, dict[str, Any]] | None = await _cached_health_probes(
+            request.app.state, settings
+        )
+    except Exception:
+        _LOGGER.warning("data sources: the health probe read failed", exc_info=True)
+        probed = None
+    return DataSourcesOut(sources=collect_data_sources(settings, grid=probed))
 
 
 # ── Demo flag (open) ────────────────────────────────────────────────────────
@@ -202,15 +220,45 @@ _FAILED_NOTIF_CAP = 3
 # in the same second (dogfood 2026-08-14, D9). An unclassified failure keeps
 # "unreachable" — it is the honest fallback when nothing more is known.
 _DEP_TROUBLE = {
-    "partial": "reading only part of the grid",
-    "overloaded": "overloaded and shedding load",
-    "timeout": "not answering",
-    "slow": "slow to answer",
+    "partial": "returns partial results",
+    "overloaded": "is overloaded and refuses some requests",
+    "timeout": "does not answer",
+    "slow": "is slow to answer",
     # Reachable but with no events index pattern configured: the connection is
     # fine and nothing can be read through it, which "unreachable" would
     # misdescribe and send the reader at the network.
-    "unreadable": "reachable but not readable, with no events index pattern",
+    "unreadable": "is reachable. No events index pattern is configured",
 }
+
+# The one term for each dependency in operator text (dogfood 2026-10-19, H1
+# STE 19 and 20). "The grid" is Security Onion and its Elasticsearch. The
+# Security Onion API carries the writes, so it keeps its own name.
+_DEP_LABEL = {
+    "es": "The grid",
+    "llm": "The model gateway",
+    "so": "The Security Onion API",
+}
+
+
+def _dep_consequence(dep: str, kind: str) -> str:
+    """What a down dependency stops, in one sentence.
+
+    Every row ended "Investigations are degraded." That named no effect, and
+    for the Security Onion API it was wrong: investigations run, and the writes
+    fail (dogfood 2026-10-19, H1 STE 21).
+    """
+    if kind == "slow":
+        if dep == "so":
+            return "Writes to Security Onion can be late."
+        return "Counts and investigations can be late."
+    if kind == "partial":
+        return "Counts and investigations can miss events."
+    if kind == "unreadable":
+        return "soc-ai cannot read an event until an index pattern is set."
+    until = "until it recovers" if kind == "overloaded" else "until it answers"
+    if dep == "so":
+        return f"soc-ai cannot acknowledge, escalate or comment {until}."
+    return f"soc-ai cannot run an investigation {until}."
 
 
 def _conflict_line(host: Any, field: Any) -> str:
@@ -630,7 +678,10 @@ async def _analytic_hold_notifications(
             NotificationOut(
                 id=f"analytic-held:{version.id}",
                 tone="warn",
-                title=f"soc-ai moved {title} to shadow. {version.why or ''}".strip(),
+                # The analytic is named as one, in quotes. "soc-ai moved A
+                # host's connection rate falls far below ... to shadow" read
+                # as one long sentence (dogfood 2026-10-19, R1 STE 1).
+                title=f'soc-ai moved the analytic "{title}" to shadow. {version.why or ""}'.strip(),
                 when=_ago(version.at.replace(tzinfo=UTC).isoformat()),
                 href=f"/hunts?tab=analytics&open={analytic_id}",
                 group="hunting",
@@ -738,10 +789,11 @@ async def list_notifications(
 ) -> list[NotificationOut]:
     """The standing conditions, the runs in flight and the runs of the last 24 h.
 
-    The standing conditions come first: a dependency that is down, a broken
-    audit chain, an expiring certificate, a paused Oracle, a quality alarm, a
-    dossier conflict, the unread shadow hits, the analytics soc-ai held, the
-    open leads and the failed triages. The runs follow, newest first.
+    The standing conditions come first: a dependency that is down, a grid
+    gap that closed in the last 24 h, a broken audit chain, an expiring
+    certificate, a paused Oracle, a quality alarm, a dossier conflict, the
+    unread shadow hits, the analytics soc-ai held, the open leads and the
+    failed triages. The runs follow, newest first.
 
     The bell badge does not count this list. It states the needs-you count
     (``GET /needs-you``), and the bell panel shows each part of that count
@@ -768,25 +820,22 @@ async def list_notifications(
     # DB-fast and never probe ES itself (it is polled every 15s and must keep
     # working precisely when ES is down). Id is stable per outage (keyed on the
     # flip time) so a client-side dismissal holds for the outage's duration.
-    _DEP_LABEL = {
-        "es": "Security Onion / Elasticsearch",
-        "llm": "LLM gateway",
-        "so": "Security Onion API",
-    }
     down_since = getattr(request.app.state, "_dep_down_since", None) or {}
     down_kind = getattr(request.app.state, "_dep_down_kind", None) or {}
     for dep, since in down_since.items():
-        trouble = _DEP_TROUBLE.get(str(down_kind.get(dep) or ""), "unreachable")
+        kind = str(down_kind.get(dep) or "")
+        trouble = _DEP_TROUBLE.get(kind, "is unreachable")
         out.append(
             NotificationOut(
                 id=f"dep-down:{dep}:{since.strftime('%Y%m%d%H%M%S')}",
                 tone="danger",
-                title=f"{_DEP_LABEL.get(dep, dep)} {trouble}. Investigations are degraded.",
+                title=f"{_DEP_LABEL.get(dep, dep)} {trouble}. {_dep_consequence(dep, kind)}",
                 when=_ago(since.isoformat()),
                 href=None,
                 at=_at(since),
             )
         )
+    out.extend(await _grid_gap_notifications(request, since=cutoff))
     out.extend(_audit_chain_notifications(request))
     out.extend(_tls_notifications(request))
     out.extend(_oracle_pause_notifications(request))
@@ -902,6 +951,43 @@ async def list_notifications(
     return rows[:limit]
 
 
+async def _grid_gap_notifications(request: Request, *, since: datetime) -> list[NotificationOut]:
+    """One informational row per grid gap that closed in the bell window.
+
+    The dependency-down row leaves the bell at the recovery, and it left no
+    record (dogfood 2026-10-19, R1-D4). A closed gap stays for 24 hours after
+    it closes. An open gap has the dependency-down row already.
+    """
+    try:
+        async with request.app.state.db_sessionmaker() as db:
+            gaps = await gaps_svc.closed_since(db, since=since)
+    except Exception:
+        _LOGGER.warning("notifications: the grid gaps could not be read", exc_info=True)
+        return []
+    out: list[NotificationOut] = []
+    for gap in gaps[:_GRID_GAP_NOTIF_CAP]:
+        ended = gap.ended_at
+        if ended is None:
+            continue
+        out.append(
+            NotificationOut(
+                # The end is in the id: a sweep gap that grows reads as new.
+                id=f"grid-gap:{gap.id}:{ended.strftime('%Y%m%d%H%M%S')}",
+                tone="accent",
+                title=f"{gaps_svc.describe(gap)} Counts over these hours are incomplete.",
+                when=_ago(ended.isoformat()),
+                href=None,
+                at=_at(ended),
+            )
+        )
+    return out
+
+
+# Closed grid gaps shown at once. A flapping grid can close many short gaps in
+# a day, and the default list holds 12 rows.
+_GRID_GAP_NOTIF_CAP = 3
+
+
 def _after_mark(raw: str | None) -> datetime | None:
     """The ``after`` moment as an aware UTC datetime, or None when not sent."""
     if raw is None or not raw.strip():
@@ -928,18 +1014,24 @@ def _cleared(row: NotificationOut, mark: datetime) -> bool:
 def _hunt_in_flight(h: hunts_svc.HuntNotifRow) -> NotificationOut:
     """The bell line of a hunt that has not ended.
 
-    "Hunt running: <title>" while the model hunts, and "Investigating 2 of 3
-    findings: <title>" while the investigations of its findings run.
+    The line names the hunt: "Lead 19 hunt: 192.0.2.20", or "Hunt: <title>"
+    for a hunt whose title does not say hunt. The chip beside it says
+    "Running", so the line does not say it again. While the investigations of
+    its findings run, a second sentence counts them: "Investigating 2 of 3
+    findings." The bell read "Hunt running: Lead 19 hunt: 10.99.0.20" beside a
+    Running chip (dogfood 2026-10-19, R1 STE 17).
     """
+    from soc_ai.hunting.hunt_words import lead_entities  # noqa: PLC0415 - lazy
     from soc_ai.hunting.outcome import outcome_label  # noqa: PLC0415 - lazy
 
     title = routes_hunts.objective_headline(h.objective)
+    subject = title if lead_entities(h.objective) is not None else f"Hunt: {title}"
     if h.status == hunts_svc.STATUS_INVESTIGATING:
         counts = FindingVerdicts(total=h.findings_total, investigated=h.findings_investigated)
-        line = f"{outcome_label('investigating', counts)}: {title}"
+        line = f"{subject.rstrip('.')}. {outcome_label('investigating', counts)}."
         outcome = "investigating"
     else:
-        line = f"Hunt running: {title}"
+        line = subject
         outcome = "running"
     return NotificationOut(
         id=f"hunt:{h.id}",
@@ -1197,6 +1289,22 @@ async def _cached_untriaged_groups(request: Request) -> tuple[int, bool]:
 async def _pending_action_count(request: Request, *, since: datetime) -> int:
     """Recommended actions that wait for a person, on the standing true positives.
 
+    The rule is :func:`pending_action_runs`. This sums its counts.
+    """
+    async with request.app.state.db_sessionmaker() as db:
+        by_run = await pending_action_runs(db, since=since, state=request.app.state)
+    return sum(by_run.values())
+
+
+async def pending_action_runs(
+    db: Any,
+    *,
+    since: datetime | None,
+    until: datetime | None = None,
+    state: Any = None,
+) -> dict[str, int]:
+    """The runs with a pending recommended action, and the count of each one.
+
     The rule is the action card's own (:func:`_timeline._build_actions`): an
     action is pending when no execution receipt and no auto-ack carried it out,
     and no analyst dismissed it.
@@ -1204,43 +1312,124 @@ async def _pending_action_count(request: Request, *, since: datetime) -> int:
     others. Only a true positive counts. A false positive recommends an
     acknowledgement, and that housekeeping would drown the count. A
     needs-more-info verdict recommends nothing. A run from the old approval gate
-    offers nothing to execute, so it counts nothing.
+    offers nothing to execute, so it counts nothing. A backtest replay counts
+    nothing. The console offers no Execute button on a replay, and the range
+    count read 28 for 16 actions that could run (dogfood 2026-10-19, R1-D1).
+
+    An action that the console cannot execute counts nothing. The rule is
+    :func:`~soc_ai.api.webui.action_rules.action_block`, the rule of the action
+    card and of the execute route. On the range, 8 of the 9 counted actions
+    were on promoted findings, and no person could execute one of them
+    (dogfood 2026-10-20). A blocked action stays on the run page, with its
+    reason and its next step.
+
+    ``since`` and ``until`` bound ``created_at`` (naive UTC, inclusive). The
+    needs-you count and the Investigations list filter both read this, so the
+    list holds the runs the count counts.
 
     The card also reads the live acknowledged flag of the alert from the grid.
-    This count does not, because one grid read per run is too much for a poll.
+    This rule does not, because one grid read per run is too much for a poll.
     An alert that Security Onion acknowledged outside soc-ai can still count.
+
+    ``state`` is the app state. The anchor rule asks the grid through it
+    whether the anchor of a promotion is a Security Onion alert, with one
+    search for every anchor of the scan, and the answers stay in a cache
+    (:mod:`soc_ai.webui.anchor_check`). Without ``state`` an anchored alert
+    counts nothing.
     """
     from soc_ai.store.models import Investigation  # noqa: PLC0415 - lazy
 
-    async with request.app.state.db_sessionmaker() as db:
-        runs = (
-            await db.scalars(
-                select(Investigation)
-                .where(
-                    Investigation.status == "complete",
-                    Investigation.verdict == "true_positive",
-                    Investigation.is_fallback.isnot(True),
-                    Investigation.created_at >= since,
-                    not_(inv_svc.superseded_sql()),
-                )
-                .order_by(Investigation.created_at.desc())
-                .limit(_PENDING_ACTION_SCAN)
-            )
-        ).all()
-        by_run = await pending_actions_by_run(db, runs)
-    return sum(by_run.values())
+    conds: list[Any] = [
+        Investigation.status == "complete",
+        Investigation.verdict == "true_positive",
+        Investigation.is_fallback.isnot(True),
+        inv_svc.not_backtest(),
+        not_(inv_svc.superseded_sql()),
+    ]
+    if since is not None:
+        conds.append(Investigation.created_at >= since)
+    if until is not None:
+        conds.append(Investigation.created_at <= until)
+    runs = (
+        await db.scalars(
+            select(Investigation)
+            .where(*conds)
+            .order_by(Investigation.created_at.desc())
+            .limit(_PENDING_ACTION_SCAN)
+        )
+    ).all()
+    by_run = await pending_actions_by_run(db, runs, state=state)
+    return {run_id: count for run_id, count in by_run.items() if count > 0}
 
 
-async def pending_actions_by_run(db: Any, runs: Sequence[Any]) -> dict[str, int]:
+async def pending_actions_by_run(
+    db: Any, runs: Sequence[Any], *, state: Any = None
+) -> dict[str, int]:
     """The pending recommended actions of each run, keyed by run id.
 
     The caller picks the runs. This applies the rest of the needs-you rule
-    (:func:`_pending_action_count`): an action is pending when no receipt and
-    no auto-ack carried it out and no analyst dismissed it, and a run from
-    the old approval gate counts nothing. A run with no recommended action is
-    left out. The hunt page reads it for the investigation of each finding.
+    (:func:`pending_action_runs`) through :func:`waiting_actions_by_run`, so
+    the count and the list rows cannot disagree. The hunt page reads it for
+    the investigation of each finding.
     """
-    from soc_ai.api.webui._timeline import _build_actions  # noqa: PLC0415 - lazy
+    by_run = await _waiting_actions(db, runs, demo=False, state=state)
+    return {run_id: len(actions) for run_id, actions in by_run.items()}
+
+
+async def waiting_actions_by_run(
+    db: Any, runs: Sequence[Any], *, demo: bool = False, state: Any = None
+) -> dict[str, list[Any]]:
+    """The recommended actions of each run that wait for a person, for a list row.
+
+    The caller picks the runs. The rule is the action card's own: an action
+    waits when no receipt and no auto-ack carried it out, no analyst
+    dismissed it, and the console can execute it
+    (:func:`~soc_ai.api.webui.action_rules.action_block`). A run that offers
+    nothing is left out: a run with no recommended action, a run from the old
+    approval gate, a backtest replay, and a run a newer run replaced. The
+    supersede rule is the detail page's
+    (:func:`routes_investigations.superseding_run_ids`). The list filter also
+    drops a superseded run in SQL, but a caller that picks its own runs has no
+    such filter.
+
+    ``demo`` is the one rule that does not decide the count. The read-only
+    demo plays back a deployment, and its count is the count of that
+    deployment. In the demo each row action carries ``executable`` False and
+    the demo note as ``reason``. Dismiss writes nothing to Security Onion, and
+    the row offers it for every waiting action, like the card.
+    """
+    return await _waiting_actions(db, runs, demo=demo, state=state)
+
+
+def _target_type(run: Any, tool_name: str) -> str:
+    """What the action acts on: "case", "lead", "finding" or "alert"."""
+    if tool_name == "add_case_comment":
+        return "case"
+    return action_rules.promoted_kind(run) or "alert"
+
+
+async def _waiting_actions(
+    db: Any, runs: Sequence[Any], *, demo: bool, state: Any = None
+) -> dict[str, list[Any]]:
+    """The waiting actions of each run, under the one action rule.
+
+    The first pass keeps the actions no receipt, auto-ack or dismissal
+    closed. The rule then needs the analyst verdicts and the promoted
+    anchors, two store reads, only for the runs with such an action. The
+    anchors then cost one grid search through ``state``, and none when the
+    cache holds them. Without ``state`` an anchor reads as unknown.
+    """
+    from soc_ai.api.webui._timeline import (  # noqa: PLC0415 - lazy
+        _ACTION_TAG,
+        ACTION_LABEL,
+        WaitingActionOut,
+        _build_actions,
+    )
+    from soc_ai.api.webui.routes_actions import _observed_case_id  # noqa: PLC0415 - cycle
+    from soc_ai.api.webui.routes_investigations import (  # noqa: PLC0415 - cycle
+        superseding_run_ids,
+    )
+    from soc_ai.secret_scrub import scrub_secrets  # noqa: PLC0415 - lazy
     from soc_ai.store.models import InvestigationEvent  # noqa: PLC0415 - lazy
 
     with_actions = [
@@ -1263,18 +1452,85 @@ async def pending_actions_by_run(db: Any, runs: Sequence[Any]) -> dict[str, int]
     by_run: dict[str, list[Any]] = {}
     for event in events:
         by_run.setdefault(event.investigation_id, []).append(event)
-    pending: dict[str, int] = {}
+    # A newer run replaced the run: its page locks every action, so the row
+    # offers none.
+    replaced = await superseding_run_ids(db, with_actions)
+    open_actions: dict[str, list[tuple[int, Any, dict[str, Any]]]] = {}
     for run in with_actions:
         run_events = by_run.get(run.id, [])
+        if run.id in replaced:
+            continue
         if any(e.kind in ("approval_request", "approval_required") for e in run_events):
             continue
         report = run.report if isinstance(run.report, dict) else {}
-        pending[run.id] = sum(
-            1
-            for action in _build_actions(run_events, report)
+        recs = report.get("recommended_actions") or []
+        actions = _build_actions(run_events, report, replay=inv_svc.is_backtest(run))
+        still = [
+            (index, action, rec if isinstance(rec, dict) else {})
+            for index, (action, rec) in enumerate(zip(actions, recs, strict=False))
             if not action.applied and not action.dismissed
+        ]
+        if still:
+            open_actions[run.id] = still
+    if not open_actions:
+        return {}
+    candidates = [run for run in with_actions if run.id in open_actions]
+    analyst = await inv_svc.analyst_verdicts_for_alerts(
+        db,
+        [r.alert_es_id for r in candidates if r.alert_es_id and not inv_svc.is_hunt_subject(r)],
+    )
+    anchors = await inv_svc.hunt_anchor_kinds(
+        db, [r.alert_es_id for r in candidates if not inv_svc.is_promoted(r)]
+    )
+    anchor_states = (
+        await anchor_check.alert_status(state, list(anchors)) if anchors and state else {}
+    )
+    out: dict[str, list[Any]] = {}
+    for run in candidates:
+        run_events = by_run.get(run.id, [])
+        standing = None if inv_svc.is_hunt_subject(run) else analyst.get(run.alert_es_id)
+        case_id = _observed_case_id(run_events)
+        promoted = action_rules.promoted_kind(run)
+        facts = action_rules.ActionFacts(
+            replay=inv_svc.is_backtest(run),
+            promoted=promoted,
+            anchor=None if promoted else anchors.get(run.alert_es_id or ""),
+            anchor_status=anchor_states.get(run.alert_es_id or "", anchor_check.UNKNOWN),
+            alert_id=run.alert_es_id,
+            run_verdict=run.verdict,
+            analyst_verdict=standing.verdict if standing is not None else None,
+            analyst_by=standing.resolved_by if standing is not None else None,
+            case_id=case_id,
         )
-    return pending
+        waiting: list[Any] = []
+        for index, action, rec in open_actions[run.id]:
+            tool_name = str(rec.get("tool_name") or "")
+            # An action the console cannot execute does not wait for anyone.
+            if action_rules.action_block(facts, tool_name) is not None:
+                continue
+            reason = action_rules.block_reason(dataclasses.replace(facts, demo=demo), tool_name)
+            tag = _ACTION_TAG.get(tool_name, "comment")
+            on_case = tool_name == "add_case_comment"
+            waiting.append(
+                WaitingActionOut(
+                    id=action.id,
+                    index=index,
+                    type=tag,
+                    label=ACTION_LABEL[tag] if tool_name in _ACTION_TAG else action.title,
+                    target=(
+                        case_id
+                        if on_case
+                        else run.rule_name or f"Alert {run.alert_es_id or run.id}"
+                    ),
+                    targetType=_target_type(run, tool_name),
+                    rationale=scrub_secrets(action.rationale or ""),
+                    executable=reason is None,
+                    reason=reason,
+                )
+            )
+        if waiting:
+            out[run.id] = waiting
+    return out
 
 
 @router.get("/needs-you", response_model=NeedsYouCountOut)
@@ -1460,6 +1716,11 @@ class MeOut(BaseModel):
     # 401s, or none at all, with nothing to tell an analyst which
     # (dogfood 2026-09-07, D3).
     signed_in: bool = False
+    # True while the bootstrap admin still signs in with the password soc-ai
+    # generated: the sidecar value or the setup.sh BOOTSTRAP_ADMIN_PASSWORD.
+    # Both sit in a plaintext file. The console showed nothing about it, only a
+    # service-log line (dogfood 2026-10-19, H1-D5).
+    password_is_generated: bool = False
 
 
 class SetStatusIn(BaseModel):
@@ -1496,7 +1757,15 @@ async def get_me(request: Request) -> MeOut:
     """
     user = await current_user(request)
     if user is not None:
-        return MeOut(username=user.username, role=user.role, status=user.status, signed_in=True)
+        return MeOut(
+            username=user.username,
+            role=user.role,
+            status=user.status,
+            signed_in=True,
+            password_is_generated=await uses_generated_password(
+                request.app.state.settings, user.username, user.password_hash
+            ),
+        )
     settings = request.app.state.settings
     if not settings.api_auth_required:
         return _DEV_ME
@@ -1588,11 +1857,15 @@ async def change_my_password(request: Request, body: ChangePasswordIn) -> dict[s
             user.username,
             caller_ip,
         )
+        wait = max(1, math.ceil(throttle.retry_after(caller_ip, user.username) / 60))
         raise HTTPException(
             status_code=429,
             detail={
                 "reason": "too_many_attempts",
-                "hint": "Too many incorrect attempts. Try again later.",
+                "hint": (
+                    "Too many wrong current passwords. Try again in "
+                    f"{wait} minute{'' if wait == 1 else 's'}."
+                ),
             },
         )
     if not await auth_svc.verify_password(body.current_password, user.password_hash):
@@ -1607,6 +1880,18 @@ async def change_my_password(request: Request, body: ChangePasswordIn) -> dict[s
             detail={"reason": "bad_credentials", "hint": "Current password is incorrect."},
         )
     throttle.clear(caller_ip, user.username)
+    # A "change" to the same value used to succeed and retire the bootstrap
+    # sidecar while the generated password stayed live (dogfood 2026-10-19,
+    # H1-D4). The current password is proven above, so this reveals nothing.
+    if body.new_password == body.current_password:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "reason": "password_unchanged",
+                "hint": "The new password is the same as the current password. "
+                "Enter a different password.",
+            },
+        )
     if len(body.new_password) < auth_svc.MIN_PASSWORD_LENGTH:
         raise HTTPException(
             status_code=400,
@@ -1631,7 +1916,7 @@ async def change_my_password(request: Request, body: ChangePasswordIn) -> dict[s
                 status_code=400,
                 detail={
                     "reason": "password_too_long",
-                    "hint": "The password must be at most 72 bytes. That is the bcrypt limit.",
+                    "hint": "The password is too long. Use 72 bytes or fewer.",
                 },
             ) from exc
     # Only after the change actually landed: the startup log tells the operator
@@ -1712,7 +1997,10 @@ async def save_my_view(request: Request, body: SaveViewIn) -> SavedViewOut:
             status_code=400,
             detail={
                 "reason": "unknown_screen",
-                "hint": f"expected one of: {', '.join(views_svc.SAVED_VIEW_SCREENS)}",
+                "hint": (
+                    "screen accepts one of these values: "
+                    f"{', '.join(views_svc.SAVED_VIEW_SCREENS)}."
+                ),
             },
         )
     name = body.name.strip()
@@ -2023,6 +2311,9 @@ async def _cached_health_probes(state: Any, settings: Settings) -> dict[str, dic
             # the next poll runs the doctor against the state the pill shows.
             state._preflight_cache = None
         _note_dep_transitions(state, result)
+        # The same results, kept past the recovery: a grid that stays
+        # unreadable opens a stored gap, and the first good probe closes it.
+        await grid_gap_probe.note_probe(state, result)
         return result
 
 
@@ -2097,6 +2388,123 @@ async def health(
     if settings.pcap_enabled:
         out.pcap = HealthComponentOut(**await _cached_pcap_probe(request.app.state, settings))
     return out
+
+
+# ── Grid gaps: the hours soc-ai could not read the grid ─────────────────────
+
+
+class GridGapOut(BaseModel):
+    """One gap in the grid-gap ledger (``soc_ai.store.grid_gaps``)."""
+
+    id: int
+    # probe: the health probe found the grid unreadable. sweep: the grid
+    # answered, and the profile sweep found one plane dark on most hosts.
+    # operator: an operator recorded a gap soc-ai did not see.
+    source: str
+    # The dimension of a sweep gap. None for a probe gap.
+    plane: str | None = None
+    started_at: str
+    # None while the gap is open.
+    ended_at: str | None = None
+    open: bool
+    # The length in seconds. An open gap counts up to now.
+    duration_s: int
+    detail: str = ""
+    # The hits this gap wrote that nobody marked benign yet. The strip offers
+    # "Review N hits in this gap" when it is above zero. 0 for an open gap,
+    # whose hours are not known yet. See soc_ai.hunting.gap_recovery.
+    hits_to_review: int = 0
+
+
+class GridGapsOut(BaseModel):
+    since: str
+    until: str
+    gaps: list[GridGapOut]
+
+
+# The window GET /grid/gaps reads when the caller names none, and the widest
+# it reads.
+_GAPS_DEFAULT_WINDOW = timedelta(days=7)
+_GAPS_MAX_WINDOW = timedelta(days=366)
+
+
+def _gap_moment(raw: str | None, *, name: str) -> datetime | None:
+    """An ISO-8601 bound as aware UTC. A naive value is UTC. A bad value is a 400."""
+    if raw is None or not raw.strip():
+        return None
+    try:
+        value = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise api_error(
+            400,
+            "bad_time",
+            f"{name} must be an ISO 8601 timestamp, for example 2026-10-19T00:00:00Z.",
+        ) from exc
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+def _z(value: datetime) -> str:
+    aware = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    return aware.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _gap_out(row: Any, *, now: datetime, hits_to_review: int = 0) -> GridGapOut:
+    """One ledger row as the API states it."""
+    return GridGapOut(
+        id=int(row.id),
+        source=str(row.source),
+        plane=row.plane,
+        started_at=_z(row.started_at),
+        ended_at=_z(row.ended_at) if row.ended_at is not None else None,
+        open=row.ended_at is None,
+        duration_s=int(gaps_svc.gap_hours(row, now=now) * 3600),
+        detail=str(row.detail or ""),
+        hits_to_review=hits_to_review,
+    )
+
+
+@router.get("/grid/gaps", response_model=GridGapsOut)
+async def list_grid_gaps(
+    request: Request,
+    since: Annotated[
+        str | None,
+        Query(description="The start of the window, as ISO-8601. The default is 7 days ago."),
+    ] = None,
+    until: Annotated[
+        str | None,
+        Query(description="The end of the window, as ISO-8601. The default is now."),
+    ] = None,
+) -> GridGapsOut:
+    """The grid gaps that overlap the window, oldest first.
+
+    A gap is a span of hours the grid held no readable data for soc-ai. Each
+    page that counts over a window shows these gaps, so a blind window does
+    not read as a quiet one. The read uses the store only. It works while the
+    grid is down.
+    """
+    now = datetime.now(UTC)
+    hi = _gap_moment(until, name="until") or now
+    lo = _gap_moment(since, name="since") or hi - _GAPS_DEFAULT_WINDOW
+    if lo >= hi:
+        raise api_error(400, "bad_time", "since must be before until.")
+    lo = max(lo, hi - _GAPS_MAX_WINDOW)
+    from soc_ai.hunting import gap_recovery  # noqa: PLC0415 - lazy
+
+    settle = gaps_svc.settle_of(request.app.state.settings)
+    async with request.app.state.db_sessionmaker() as db:
+        rows = await gaps_svc.overlapping(db, since=lo, until=hi)
+        # A closed gap counts the hits it wrote. An open gap has no end, and
+        # its settle margin has not started.
+        to_review = {
+            int(row.id): len(await gap_recovery.hits_in_gap(db, row, settle=settle, now=now))
+            for row in rows
+            if row.ended_at is not None
+        }
+    return GridGapsOut(
+        since=_z(lo),
+        until=_z(hi),
+        gaps=[_gap_out(row, now=now, hits_to_review=to_review.get(int(row.id), 0)) for row in rows],
+    )
 
 
 # ── Preflight (cached doctor checks minus fitness) — Dashboard setup-health ─

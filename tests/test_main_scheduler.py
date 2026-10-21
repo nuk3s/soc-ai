@@ -1334,6 +1334,36 @@ async def test_reaper_loop_sweeps_stale_general_chat_turns(
 
 
 @pytest.mark.asyncio
+async def test_reaper_loop_spares_a_turn_that_writes_its_partial_answer(
+    settings_kratos: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A turn past its timeout can still write a partial answer from its tool
+    results (chat_turn.PARTIAL_ANSWER_TIMEOUT_S). The sweep must not reap it
+    in that time, or the answer lands after the bubble already reads
+    "interrupted"."""
+    from soc_ai.webui.chat_turn import PARTIAL_ANSWER_TIMEOUT_S
+
+    engine = make_engine(settings_kratos)
+    await run_migrations(engine)
+    maker = make_sessionmaker(engine)
+
+    timeout_s = int(settings_kratos.chat_turn_timeout_s)
+    writing = auth_svc.utcnow() - timedelta(seconds=timeout_s + PARTIAL_ANSWER_TIMEOUT_S // 2)
+    async with maker() as db:
+        row = await gc_svc.create_pending_assistant(db, "analyst:alice")
+        row.created_at = writing
+        await db.commit()
+        row_id = row.id
+
+    await _run_reaper_once(monkeypatch, maker, settings_kratos)
+
+    async with maker() as db:
+        spared = await db.get(GeneralChatMessage, row_id)
+        assert spared is not None and spared.status == "pending"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_init_store_reaps_pending_general_chat_turns(settings_kratos: Settings) -> None:
     """A 'pending' general-chat row that survives a restart is resolved at
     startup regardless of age — its background task died with the previous

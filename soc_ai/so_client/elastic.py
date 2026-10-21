@@ -286,9 +286,9 @@ class ElasticClient:
             parts.append("the search timed out before all shards answered")
         detail = f" ({reason})" if reason else ""
         message = (
-            f"partial search results from {index}: {' and '.join(parts)}{detail} — "
-            f"the returned hits are incomplete, so an empty or short answer here "
-            f"means 'unknown', not 'nothing happened'"
+            f"partial search results from {index}: {' and '.join(parts)}{detail}. "
+            "The returned hits are incomplete. An empty or short answer here means "
+            "unknown."
         )
 
         if not require_complete and not self._settings.es_fail_on_partial_results:

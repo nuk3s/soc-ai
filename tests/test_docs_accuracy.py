@@ -298,7 +298,15 @@ METRICS_ONLY_KINDS = {
 _AUDIT_EMISSION_PATTERNS = (
     # \w*_ev( matches both the `_ev(` helpers and `emit_ev(`; \s* spans the
     # newline in multi-line calls like `_ev(\n    "targeted_dispatch", ...`.
-    (r'\w*_ev\(\s*"([a-z0-9_]+)"', (REPO_ROOT / "soc_ai" / "agent" / "orchestrator.py",)),
+    (
+        r'\w*_ev\(\s*"([a-z0-9_]+)"',
+        (
+            REPO_ROOT / "soc_ai" / "agent" / "orchestrator.py",
+            # The swarm strategies build their events with the pipeline's
+            # factory (``make_ev``), and the pipeline audits every one.
+            *sorted((REPO_ROOT / "soc_ai" / "agent" / "swarm").glob("*.py")),
+        ),
+    ),
     (r'\.log_kind\(\s*[\w.\[\]]+,\s*"([a-z0-9_]+)"', None),  # None => all of soc_ai/
     (r'StepEvent\(\s*kind="([a-z0-9_]+)"', None),
 )
@@ -779,6 +787,9 @@ def test_docs_do_not_claim_cli_downloads_maxmind(tmp_path: Path) -> None:
         allow_online_enrichment=False,
         greynoise_api_key=None,
         shodan_api_key=None,
+        blocklist_sources=["urlhaus", "threatfox", "feodo", "tor"],
+        blocklist_stale_threshold_days=7,
+        cloud_prefix_stale_threshold_days=45,
     )
     rows = {row.id: row for row in collect_data_sources(stub)}
     assert "refresh" not in rows["maxmind"].note.lower(), rows["maxmind"].note

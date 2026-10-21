@@ -150,8 +150,8 @@ async def require_csrf_safe(request: Request) -> None:
         detail={
             "reason": "bad_origin",
             "hint": (
-                "Cross-origin cookie-authenticated write rejected. Send the request "
-                "from the app's own origin, or use 'Authorization: Bearer scai_<token>'."
+                "soc-ai rejected a cross-origin write that used a session cookie. Send "
+                "the request from the app origin, or use 'Authorization: Bearer scai_<token>'."
             ),
         },
     )
@@ -187,8 +187,8 @@ async def require_api_auth(request: Request) -> None:
             detail={
                 "reason": "invalid_token",
                 "hint": (
-                    "API token unknown or revoked; create one in the Config screen "
-                    "(Settings → API Tokens)."
+                    "soc-ai does not know this API token, or the token is revoked. "
+                    "Create a token in Settings > API tokens."
                 ),
             },
         )

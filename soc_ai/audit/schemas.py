@@ -32,6 +32,12 @@ AuditKind = Literal[
     # Theme-1 investigation loop (synth-first pipeline)
     "investigation_loop_entered",
     "synth_round1_skipped",
+    # The swarm triage experiment (soc_ai.agent.swarm): one agent of the
+    # advocates or planes strategy started, and finished with its role, its
+    # calls, its tokens and its brief. Must be valid audit kinds or _audit
+    # drops them, the trap the downgrade kinds below hit.
+    "swarm_agent_started",
+    "swarm_agent_finished",
     # proactive context budgeting: oldest pivot events dropped to fit the
     # analyst model's input window (soc_ai.agent.context_budget)
     "context_trimmed",
@@ -217,6 +223,10 @@ AuditKind = Literal[
     # separately from session_prior because a contradiction is a different fact
     # from a resemblance: this one changed the verdict.
     "session_verdict_conflict",
+    # an analyst set the verdict of this alert on an earlier run (a manual
+    # override or an applied chat proposal), and this run was told so. The
+    # payload carries the run id, the verdict and the analyst, never the note.
+    "analyst_verdict",
     # analyst-egress fail-closed residue sweep (soc_ai/agent/orchestrator.py::
     # _guard_egress). Emitted best-effort when analyst_redaction_fail_closed is on
     # and the INDEPENDENT unsafe_residue detector finds an internal identifier that
@@ -256,6 +266,31 @@ AuditKind = Literal[
     # how many rows it read belongs on the record. Must be a valid audit kind
     # or _audit drops it, the trap the downgrade kinds above document.
     "shadow_hits_read",
+    # The grid-gap recovery (soc_ai/api/webui/routes_grid_gaps.py). An
+    # operator gap makes every reader treat its hours as unknown, and one
+    # review marks every hit of a gap benign in one click. Who did it, when,
+    # on which gap and on how many rows belongs on the record. Must be valid
+    # audit kinds or _audit drops them, the trap the downgrade kinds above
+    # document.
+    "grid_gap_recorded",
+    "grid_gap_hits_benign",
+    # An operator cancelled a running backtest (POST /backtest/{id}/cancel,
+    # R5-I9). The run stops after the alert in flight, so who stopped it, when,
+    # and how many alerts had run belongs on the record. Must be a valid audit
+    # kind or _audit drops it, the trap the downgrade kinds above document.
+    "backtest_cancelled",
+    # The per-claim "Check Security Onion now" on the Status page settled an
+    # escalation claim (POST /escalations/check, R5-I5): it wrote the case id
+    # from a grid link onto the claim, or released a claim with no case. A
+    # release lets the alert be escalated again, so who did it, when and on
+    # which alert belongs on the record. Must be a valid audit kind or _audit
+    # drops it, the trap the downgrade kinds above document.
+    "escalation_claim_settled",
+    # A bulk decision on leads (soc_ai/api/webui/routes_lead_bulk.py). One
+    # press dismisses, reopens or hunts up to 200 leads. Each lead's history
+    # holds its own row, and this record holds the press: who, which leads,
+    # and what each lead got. Must be a valid audit kind or _audit drops it.
+    "leads_bulk_decision",
     "done",
     "error",
 ]

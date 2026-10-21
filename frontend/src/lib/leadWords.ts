@@ -7,6 +7,7 @@
 // ---------------------------------------------------------------------------
 
 import { huntOutcome } from './labels';
+import { CLOSE_RULE_CLAUSE, isSystemActor } from './leadDecisions';
 import { VERDICT } from './tokens';
 import type { Verdict } from './types';
 
@@ -28,6 +29,20 @@ export interface PromotedFindingFacts {
   status: string;
   verdict: string | null;
   confidence: number | null;
+  /** The other findings of the hunt that read the same investigation. */
+  shared_with?: number[];
+}
+
+/** "F2", "F2 and F4", "F2, F3 and F5": finding numbers from 0-based ordinals. */
+function findingNumbers(ordinals: readonly number[]): string {
+  const names = ordinals.map((o) => `F${o + 1}`);
+  if (names.length <= 1) return names.join('');
+  return `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+}
+
+/** The findings one promoted row covers: its own and those that share it. */
+export function findingsCovered(p: { finding_ordinal: number; shared_with?: number[] }): number {
+  return 1 + (p.shared_with ?? []).filter((o) => o !== p.finding_ordinal).length;
 }
 
 
@@ -44,9 +59,17 @@ function investigationState(p: PromotedFindingFacts): string {
  *  the act by its control, "Open an investigation". The sentence carries the
  *  whole id. An eight-character cut hid the rest of it (owner, 2026-10-07). */
 export function promotedFindingSentence(p: PromotedFindingFacts): string {
-  const who = p.promoted_by || 'An analyst';
+  // The hunt's own investigation is signed system:hunt. The page says soc-ai.
+  const who = isSystemActor(p.promoted_by) ? 'soc-ai' : p.promoted_by || 'An analyst';
+  // R3-D4: the hunt reuses one investigation for two findings on one subject.
+  // The row named only the first, and the header counted one finding.
+  const others = (p.shared_with ?? []).filter((o) => o !== p.finding_ordinal);
+  const shared =
+    others.length > 0
+      ? `${findingNumbers(others)} ${others.length === 1 ? 'shares' : 'share'} this investigation. `
+      : '';
   return (
-    `${who} opened an investigation on finding F${p.finding_ordinal + 1}. ` +
+    `${who} opened an investigation on finding F${p.finding_ordinal + 1}. ${shared}` +
     `Investigation ${p.investigation_id}: ${investigationState(p)}.`
   );
 }
@@ -216,6 +239,16 @@ export function entityCountWords(entities: readonly (readonly string[])[]): stri
   return parts.join(' and ');
 }
 
+/** The entities after the first, for "and 1 more host". The strip read "and
+ *  1 host more" (R3 STE 7). A mix reads "3 more: 2 hosts and 1 account". */
+export function moreEntityWords(entities: readonly (readonly string[])[]): string {
+  const accounts = entities.filter((e) => e[0] === 'user').length;
+  const hosts = entities.length - accounts;
+  if (accounts === 0) return `${hosts} more ${hosts === 1 ? 'host' : 'hosts'}`;
+  if (hosts === 0) return `${accounts} more ${accounts === 1 ? 'account' : 'accounts'}`;
+  return `${entities.length} more: ${entityCountWords(entities)}`;
+}
+
 /** The span of the observations, as "in 18 days" or "in 5 hours". */
 function spanWords(observations: readonly DatedObservation[]): string {
   const times: number[] = [];
@@ -266,16 +299,41 @@ export function runTime(seconds: number): string {
 }
 
 /** A past time in words a sentence can carry: "5 minutes ago", "6 hours ago",
- *  "17 days ago". `ago()` writes "17d ago", which is a chip and not prose. */
+ *  "17 days ago". `ago()` writes "17d ago", which is a chip and not prose.
+ *
+ *  The count is the one `ago()` states: whole units, and days from 24 hours.
+ *  These words rounded, and one hunt read "27 days ago" in the Hunt again
+ *  confirm and "26d ago" in its row (dogfood 2026-10-19, V1-H5). */
 export function agoWords(iso: string, now = Date.now()): string {
   const ms = now - new Date(iso).getTime();
   if (!Number.isFinite(ms) || ms < 60_000) return 'less than a minute ago';
-  const minutes = Math.round(ms / 60_000);
-  if (minutes < 60) return `${minutes} ${minutes === 1 ? 'minute' : 'minutes'} ago`;
-  const hours = Math.round(minutes / 60);
-  if (hours < 48) return `${hours} ${hours === 1 ? 'hour' : 'hours'} ago`;
-  const days = Math.round(hours / 24);
-  return `${days} days ago`;
+  const unit = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'} ago`;
+  const minutes = Math.floor(ms / 60_000);
+  if (minutes < 60) return unit(minutes, 'minute');
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return unit(hours, 'hour');
+  return unit(Math.floor(hours / 24), 'day');
+}
+
+/** What the Hunt again confirm states about the next hunt (R3-I5). The
+ *  confirm said nothing of the close, and the range lead closed on its own
+ *  after a second hunt. */
+export const HUNT_AGAIN_CLOSE = `soc-ai closes the lead when the new hunt finds no threat, or when ${CLOSE_RULE_CLAUSE}.`;
+
+/** The two sentences of the Hunt again confirm about the hunt on record:
+ *  when it ran and how long it took. The confirm said "A hunt on this lead
+ *  already exists" and named no time. `run` is null when the record holds no
+ *  run time. */
+export function huntAgainWords(
+  hunt: { started_at: string | null; elapsed_sec: number } | null | undefined,
+  now = Date.now(),
+): { head: string; run: string | null } {
+  return {
+    head: hunt?.started_at
+      ? `This lead has a hunt from ${agoWords(hunt.started_at, now)}.`
+      : 'This lead has a hunt.',
+    run: hunt && hunt.elapsed_sec > 0 ? `That hunt ran ${runTime(hunt.elapsed_sec)}.` : null,
+  };
 }
 
 /** The warning for a hunt older than the evidence, or null.

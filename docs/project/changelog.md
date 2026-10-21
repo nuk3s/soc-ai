@@ -9,6 +9,11 @@ follows [Semantic Versioning](https://semver.org/) from 1.0 onward.
 
 ## Highlights
 
+- **1.6.0**: The operator workflow release. soc-ai records each grid gap and shows it on the
+  Dashboard, Alerts, Hunts and host pages. The sweeps do not score the hours of a gap. The operator
+  acts on waiting actions from the Investigations list and on many leads with one press. One rule
+  decides whether a write to Security Onion can run, and each refusal states its reason. See the
+  [1.6.0 release notes](../releases/1.6.0.md).
 - **1.5.3**: The detection ladder release. Cheaper detection steps run before the model
   investigation, and each run records its cost. The Hosts list shows one row per machine. A hunt
   investigates its own findings. The runs inside the page window decide the verdict of an alert
@@ -28,7 +33,7 @@ follows [Semantic Versioning](https://semver.org/) from 1.0 onward.
   on you. The profile sweep runs in the app. An investigation is more accurate. Every write to
   a Security Onion 3.3 grid works again.
 - **1.4.0**: The trust release. An analyst can check soc-ai's judgement. The eval scores the
-  whole hunt journey and says which step broke. The journey is: plant an attack, hunt, promote,
+  whole hunt path and names the step that broke. The path is: plant an attack, hunt, promote,
   verdict. Synthetic runs are marked everywhere they appear. A verdict must rest on evidence the
   run retrieved. The release closes the deterministic half of the most serious finding of the
   1.3.2 audit.
@@ -36,37 +41,37 @@ follows [Semantic Versioning](https://semver.org/) from 1.0 onward.
   audit took four attacker positions: hostile telemetry, a rogue analyst, a stranger on the
   network, and a channel that carries data out. Every finding had a working reproduction before
   its fix.
-- **1.3.1**: A critical dogfood of the 1.3 journey before the public release. It walked hunt,
-  promote, investigate and draft on a live grid. It added correctness and performance passes.
+- **1.3.1**: A critical test of the 1.3 hunt flow before the public release. The test walked
+  hunt, promote, investigate and draft on a live grid. It added correctness and performance passes.
 - **1.3.0**: Three hunting capabilities that build on each other. A confirmed hunt finding becomes
-  a full investigation. Behavioral-analytics tools show the findings worth confirming. A
+  a full investigation. Behavioral-analytics tools show the findings to confirm. A
   confirmed finding becomes a drafted detection that you review and export.
-- **1.2.9**: The front-door release. The installer asks how you will reach a model. It redacts
-  the cloud route by default. The doctor names each hidden trap and its fix. Config opens on a
+- **1.2.9**: The first-run release. The installer asks how you will reach a model. It redacts
+  the cloud route by default. The doctor names each known install problem and its fix. Config opens on a
   few day-one decisions. The full set is 109. An Operate hub gives the trust instruments one
   page that says what each proves.
 - **1.2.8**: The degraded-grid release. It defines what soc-ai says when Security Onion is down,
   saturated, stalled or answering with half its shards. A blind sensor never reads as a calm
   network. The upgrade applies seven migrations.
 - **1.2.7**: The lesser-model release. soc-ai adapts to the analyst backend behind the gateway
-  by configuration and measurement, with no code change. Failed pipeline runs explain
-  themselves.
+  by configuration and measurement, with no code change. A failed pipeline run states its
+  cause.
 - **1.2.6**: An About page shows the running version, the repo and license links, and a
-  sidebar version line. Its GitHub update check is opt-in and off by default, so nothing
-  leaves the box. The Config page is now a master-detail screen. It went from about 36
+  sidebar version line. Its GitHub update check is opt-in and off by default, so no data
+  leaves the host. The Config page is now a master-detail screen. It went from about 36
   screens to about 2. Settings search works on the page and in the command palette. An Apply
   bar names each staged change as a clickable chip. The identifier lists filter, page and
   bulk-edit.
 - **1.2.5**: A visual refresh of the alert workspace. It added design-token theming and a
   filter bar that turns into bulk actions without shifting the table. It added toast
   notifications with a one-click clear, and freshness markers that flag a stalled poll. The
-  release also holds a code-review remediation across the 1.2.x line and a batch of dogfood
-  fixes. DNS-SD and SRV service records no longer pollute the auto-detected internal-domain
+  release also holds a code-review remediation across the 1.2.x line and a batch of fixes from
+  a test on the live deployment. DNS-SD and SRV service records no longer pollute the auto-detected internal-domain
   inventory.
-- **1.2.4**: A dogfood patch. The Hunt Console says when scheduled hunts are paused. The
-  triage pipeline retries a transient grid error. Before, it dropped the investigation. The
-  nightly regression alarm no longer pages on one flipped verdict at a small sample size. The
-  config console groups the switch of each integration with its key.
+- **1.2.4**: A patch from a test on the live deployment. The Hunt Console says when scheduled
+  hunts are paused. The triage pipeline retries a transient grid error. Before, it dropped the
+  investigation. The nightly regression alarm no longer pages on one flipped verdict at a small
+  sample size. The config console groups the switch of each integration with its key.
 - **1.2.3**: Per-alert verdict inheritance now respects the inherit window,
   `webui_inherit_window_days`. The alerts feed no longer puts the stale standing verdict of a
   rule on fresh alerts.
@@ -78,7 +83,7 @@ follows [Semantic Versioning](https://semver.org/) from 1.0 onward.
   telemetry-first scope. The corroboration gate credits Zeek evidence from broad queries, and a
   generic sweep no longer re-triages the alert stream. The release also refreshed the docs and
   published the roadmap.
-- **1.2.0**: The dogfood release. A full analyst shift on the live deployment produced
+- **1.2.0**: A full analyst shift on the live deployment produced
   fourteen findings, and this release fixed all of them. It added notifications, entity
   search, a maintenance panel, and pipeline-error visibility with a one-click dismiss. It added
   group acknowledge and a deep re-run. The dashboard can schedule the verdict-quality eval.
@@ -102,7 +107,7 @@ follows [Semantic Versioning](https://semver.org/) from 1.0 onward.
   malware-label payload gate and a fast-path domain reputation. It added inventory-first hunts
   with correlation and lateral-movement recipes. It added a first-run "not connected" banner
   and an Acknowledge and Escalate bar on a settled verdict.
-- **1.0.3**: Dogfood, detection and resilience. It added dataset-agnostic grid discovery, and
+- **1.0.3**: In-house use, detection and resilience. It added dataset-agnostic grid discovery, and
   behavioral-summary detections for beaconing and DNS tunneling. It added a docs site,
   operator runbooks, and a one-click "request more info" on any verdict. A sweep hardened
   resilience, performance and flow.

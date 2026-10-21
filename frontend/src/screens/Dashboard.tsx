@@ -1,9 +1,10 @@
 import { Activity, ArrowUpRight, Crosshair, Database, Gauge, Ghost, Inbox, RotateCw, Server, ShieldCheck, Stethoscope, WifiOff, X } from 'lucide-react';
 import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { PipelineErrorChip, StatusTag, VerdictPill } from '../components/Badges';
 import { DashboardGrid, LAYOUT_HELP_ID, LayoutControls } from '../components/DashboardGrid';
 import { FlowBadge } from '../components/FlowBadge';
+import { GridGapStrip } from '../components/GridGapStrip';
 import { AskSocAiCard } from '../components/AskPanel';
 import { FlowLink } from '../components/HowThisFlows';
 import { RowTags, TAGS_COLUMN } from '../components/RowTags';
@@ -41,7 +42,7 @@ import { PIPELINE_ERRORS_URL, livePipelineErrors } from '../lib/investigationFil
 import { statusDetail, statusMeta } from '../lib/labels';
 import { formatSkipReasons } from '../lib/skipReasons';
 import { COUNTING } from '../lib/text';
-import { rangeToSinceUntil } from '../lib/timeRange';
+import { absoluteTime, agoWords, rangeToSinceUntil, windowFromSearch, windowParams } from '../lib/timeRange';
 import { VERDICT } from '../lib/tokens';
 import {
   COUNT_AGE,
@@ -147,11 +148,18 @@ function tuningNudgeLine(summary: { pending: number; nominated?: number }): stri
 }
 
 /** The scope under "Investigations running". The tile counts the newest page
- *  of investigations. When that page holds every investigation, say "all". */
+ *  of investigations. When that page holds every investigation, it names the
+ *  count: "of 30 investigations". "of all 0" read as a fragment (H1-D24).
+ *
+ *  The count does not obey the page window: a run is running now, whenever it
+ *  started. The words name that window. "0 of 36 investigations" under a 24h
+ *  page read as 36 runs in 24 hours (dogfood 2026-10-19, V1-S8). */
 function recentScope(shown: number, total: number | undefined): string {
   const n = shown.toLocaleString();
-  if (typeof total === 'number' && total <= shown) return `of all ${n}`;
-  return `of the ${n} newest`;
+  if (typeof total === 'number' && total <= shown) {
+    return `now, of ${n} investigation${shown === 1 ? '' : 's'} on record`;
+  }
+  return `now, of the ${n} newest investigations on record`;
 }
 
 /** How many rows the recent list reads. It shows seven, after it drops the
@@ -159,17 +167,16 @@ function recentScope(shown: number, total: number | undefined): string {
 const RECENT_READ_LIMIT = 50;
 
 /** The Investigations list on the window of the recent list. A custom window
- *  has no preset to name, so the list opens on its own window. */
-function recentDestination(range: string): string {
-  return range === 'custom' ? '/investigations' : `/investigations?range=${range}`;
+ *  travels with its bounds: the list dropped it and opened its own window
+ *  (R1-D7). */
+function recentDestination(range: string, custom: CustomRange | null): string {
+  return `/investigations?${new URLSearchParams(windowParams(range, custom))}`;
 }
 
 /** The Investigations list the true-positive tile counts: the same window and
- *  the verdict filter. A custom window has no preset to name, so the list
- *  opens on its own window with the filter. */
-function truePositiveDestination(range: string): string {
-  const p = new URLSearchParams();
-  if (range !== 'custom') p.set('range', range);
+ *  the verdict filter. */
+function truePositiveDestination(range: string, custom: CustomRange | null): string {
+  const p = new URLSearchParams(windowParams(range, custom));
   p.set('verdict', 'true_positive');
   return `/investigations?${p}`;
 }
@@ -594,11 +601,24 @@ function SeverityBreakdown({
  * "found nothing" and "could not look" are the same numbers. */
 function AutoTriageDegradedNote({ s }: { s: AutoTriageStatus }) {
   const n = s.grid_errors?.length ?? 0;
+  // The note dates the sweep it describes. It stood with no time from 10:18
+  // until a manual run at 10:41, and read as a state of now (R1-D11).
+  const when = !s.active && s.finished_at ? s.finished_at : null;
   return (
     <div data-testid="autotriage-degraded" className="mb-2">
       <StatusTag color="#d29922" label="Sweep degraded" />
       <div className="mt-1 text-[12.5px] leading-[1.5] text-dim">
-        The sweep could not read the Security Onion grid
+        {when ? (
+          <>
+            The sweep of{' '}
+            <time dateTime={when} title={agoWords(when)} data-testid="autotriage-degraded-time">
+              {absoluteTime(when)}
+            </time>{' '}
+            could not read the grid
+          </>
+        ) : (
+          'This sweep cannot read the grid'
+        )}
         {n ? ` for ${n} of its queries` : ''}. The backlog is unknown.
       </div>
     </div>
@@ -643,8 +663,11 @@ function AutoTriagePanel({ s, loading }: { s: AutoTriageStatus | null; loading: 
       {s.degraded && <AutoTriageDegradedNote s={s} />}
       {s.finished_at ? (
         <>
-          Last batch ·{' '}
-          <span className="font-semibold text-text">{s.hunted}</span> investigated
+          Last batch at{' '}
+          <time dateTime={s.finished_at} title={agoWords(s.finished_at)} data-testid="autotriage-last-batch-time">
+            {absoluteTime(s.finished_at)}
+          </time>{' '}
+          · <span className="font-semibold text-text">{s.hunted}</span> investigated
           {s.skipped ? `, ${s.skipped} skipped` : ''}
           {s.failed ? `, ${s.failed} failed` : ''}.
           {/* WHY were they skipped — the bare count told the analyst nothing. */}
@@ -655,7 +678,7 @@ function AutoTriagePanel({ s, loading }: { s: AutoTriageStatus | null; loading: 
           )}
         </>
       ) : (
-        'Auto-Investigate is idle. No Auto-Investigate run has happened yet.'
+        'No Auto-Investigate batch has run since soc-ai started.'
       )}
     </div>
   );
@@ -711,7 +734,7 @@ function EnrichmentPanel({
       />
       <Row
         label="Online enrichment"
-        value={onlineOn > 0 ? `${onlineOn} enabled` : 'off · zero-egress'}
+        value={onlineOn > 0 ? `${onlineOn} enabled` : 'Off. No lookup leaves the network.'}
         color={onlineOn > 0 ? '#4b8bf5' : '#8b94a3'}
       />
       <button
@@ -827,8 +850,8 @@ function SetupHealthCard({
             failingRows.map((r) => (
               <div key={r.name} className="mt-2.5 text-[12.5px] leading-[1.5]">
                 <span className="font-semibold text-text-2">{r.name}</span>
-                <span className="text-dim">: {r.detail}</span>
-                {r.hint && <div className="mt-0.5 text-faint">{r.hint}</div>}
+                <span className="text-dim">: {withCode(r.detail)}</span>
+                {r.hint && <div className="mt-0.5 text-faint">{withCode(r.hint)}</div>}
               </div>
             ))
           )}
@@ -861,6 +884,22 @@ function SetupHealthCard({
         </div>
       )}
     </Panel>
+  );
+}
+
+/** Text with each `backtick` span as code. The doctor writes a command in
+ *  backticks, and the card showed the raw backticks (R1-D21). */
+function withCode(text: string): ReactNode {
+  const parts = text.split(/`([^`]+)`/);
+  if (parts.length === 1) return text;
+  return parts.map((part, i) =>
+    i % 2 === 1 ? (
+      <code key={i} className="rounded-[4px] bg-bg px-1 py-px font-mono text-[11.5px] text-mono-amber">
+        {part}
+      </code>
+    ) : (
+      part
+    ),
   );
 }
 
@@ -910,7 +949,7 @@ function depHeadline(label: string, kind: string, key: DownDep['key']): string {
   // headline is amber and says the counts can be late. It read "not
   // reachable" in red over "answered in 4.3 s, budget 5 s" (dogfood
   // 2026-10-06).
-  if (kind === 'slow') return key === 'es' ? 'Elasticsearch is slow. Counts can be late.' : `${label} is slow.`;
+  if (kind === 'slow') return key === 'es' ? 'The grid is slow. Counts can be late.' : `${label} is slow.`;
   if (kind === 'overloaded') return `${label} is overloaded. Retry later.`;
   if (kind === 'partial') return `${label} reads are incomplete.`;
   return `${label} is not reachable.`;
@@ -932,11 +971,14 @@ function downDeps(h: Health | null): DownDep[] {
     headline: depHeadline(label, depKind(c), key),
     tone: depKind(c) === 'slow' ? 'warn' : 'danger',
   });
-  if (!h.es.ok) out.push(dep('es', 'Security Onion (Elasticsearch)', h.es));
-  if (!h.llm.ok) out.push(dep('llm', 'AI gateway (LLM)', h.llm));
+  // One term for each dependency (R1 STE 14, H1 STE 19 and 20): "the grid"
+  // for Security Onion and its Elasticsearch, "the model gateway" for the
+  // LLM gateway.
+  if (!h.es.ok) out.push(dep('es', 'The grid', h.es));
+  if (!h.llm.ok) out.push(dep('llm', 'The model gateway', h.llm));
   // Read defensively: a page served by an older build has no `so` field, and
   // "not reported" must not read as "down".
-  if (h.so && !h.so.ok) out.push(dep('so', 'Security Onion API', h.so));
+  if (h.so && !h.so.ok) out.push(dep('so', 'The Security Onion API', h.so));
   return out;
 }
 
@@ -954,8 +996,21 @@ export function Dashboard() {
   const wide = useMediaQuery(WIDE_QUERY);
   const [editingRequested, setEditingRequested] = useState(false);
   const editingLayout = editingRequested && wide && dashLayout.editable;
-  const [range, setRange] = useState('24h');
-  const [custom, setCustom] = useState<CustomRange | null>(null);
+  // The window lives in the URL, so Back and a shared link open the same
+  // window. It was component state, and Back reset it to 24 hours (R1-D22).
+  const [searchParams, setSearchParams] = useSearchParams();
+  const { range, custom } = windowFromSearch(searchParams);
+  const setWindow = (next: string, nextCustom: CustomRange | null) => {
+    setSearchParams(
+      (prev) => {
+        const p = new URLSearchParams(prev);
+        for (const k of ['range', 'from', 'to']) p.delete(k);
+        for (const [k, v] of Object.entries(windowParams(next, nextCustom))) p.set(k, v);
+        return p;
+      },
+      { replace: true },
+    );
+  };
   const rangeLabel = range === 'custom' ? 'custom range' : `last ${range}`;
   const alertQuery: AlertQuery =
     range === 'custom' && custom ? { range: 'custom', from: custom.from, to: custom.to } : { range };
@@ -1317,6 +1372,10 @@ export function Dashboard() {
   // over-correction — the screen would go permanently uncertain on a grid with
   // one chronically red shard nowhere near these queries.
   const alertsStale = alerts.failCount >= 2;
+  // "live" while the alert counts read; "not updating" once the reads fail.
+  // Nothing while the first read is in flight.
+  const liveState: 'live' | 'stopped' | 'pending' =
+    alerts.error || alertsStale ? 'stopped' : alerts.data ? 'live' : 'pending';
 
   return (
     <div className="px-[22px] pb-[60px] pt-5">
@@ -1355,15 +1414,30 @@ export function Dashboard() {
       <div className="flex flex-wrap items-end justify-between gap-2">
         <div>
           <div className="flex items-baseline gap-3">
-            <div className="text-[20px] font-semibold tracking-[-.015em]">Overview</div>
+            <h1 className="text-[20px] font-semibold tracking-[-.015em]">Dashboard</h1>
             <Freshness at={alerts.lastUpdated} />
           </div>
-          <div className="mt-0.5 text-[13px] text-dim">Live investigation counts · {rangeLabel}</div>
+          <div className="mt-0.5 text-[13px] text-dim">
+            Counts for the {range === 'custom' ? 'custom window' : lastWords(range)}
+          </div>
         </div>
-        <span className="mb-1 flex items-center gap-1.5 text-[11.5px] text-faint">
-          <span className="h-1.5 w-1.5 animate-pulseDot rounded-full bg-success" />
-          live
-        </span>
+        {/* The mark follows the alert read. It pulsed green beside "Could not
+            load the alert counts" (R1-D10). */}
+        {liveState === 'live' ? (
+          <span data-testid="live-mark" className="mb-1 flex items-center gap-1.5 text-[11.5px] text-faint">
+            <span className="h-1.5 w-1.5 animate-pulseDot rounded-full bg-success" />
+            live
+          </span>
+        ) : liveState === 'stopped' ? (
+          <span
+            data-testid="live-mark"
+            title="The last reads of the alert counts failed. The counts on screen are older."
+            className="mb-1 flex items-center gap-1.5 text-[11.5px] text-warn"
+          >
+            <span className="h-1.5 w-1.5 rounded-full bg-warn" />
+            not updating
+          </span>
+        ) : null}
       </div>
 
       {/* filter bar — TimeRangeFilter sits first, matching Alerts & Investigations */}
@@ -1371,10 +1445,7 @@ export function Dashboard() {
         <TimeRangeFilter
           value={range}
           custom={custom}
-          onChange={(v, r) => {
-            setRange(v);
-            if (r) setCustom(r);
-          }}
+          onChange={(v, r) => setWindow(v, v === 'custom' ? (r ?? custom) : null)}
         />
         {/* Under 1024 px the panels stack in one column and cannot move. The
             control went away with no word on why (dogfood 2026-10-06). */}
@@ -1403,6 +1474,7 @@ export function Dashboard() {
           size. {dashLayout.storeNote}
         </div>
       )}
+      <GridGapStrip range={range} custom={custom} className="mb-3" />
 
       {/* The counts below are the last ones the grid answered, and both ways of
           losing the next read leave them frozen with nothing on the screen
@@ -1479,8 +1551,9 @@ export function Dashboard() {
                 {tpRead.data ? (
                   <>
                     of {tpRead.data.total.toLocaleString()} investigation
-                    {tpRead.data.total === 1 ? '' : 's'} ·{' '}
-                    <Link to={truePositiveDestination(range)} className="text-accent hover:underline">
+                    {tpRead.data.total === 1 ? '' : 's'}{' '}
+                    <span data-testid="tp-clock">started in this window</span> ·{' '}
+                    <Link to={truePositiveDestination(range, custom)} className="text-accent hover:underline">
                       Open them
                     </Link>
                   </>
@@ -1514,7 +1587,8 @@ export function Dashboard() {
           color={(tpRead.data?.truePositives ?? 0) > 0 ? '#f04438' : '#8b949e'}
           icon={<ShieldCheck size={16} />}
           title={COUNT_TRUE_POSITIVES}
-          incomplete={esDegraded}
+          // The count reads the store. A grid outage does not change it, so
+          // it carries no "May be incomplete" mark (R1-D26).
         />
         <StatCard
           key="kpi-running"
@@ -1553,12 +1627,14 @@ export function Dashboard() {
                 shadowHitsFailed ? (
                   'Could not read the shadow hits.'
                 ) : (
-                  // The count holds every unread hit. The hits block on Hunts
-                  // lists the last 7 days, so the link says what it opens.
+                  // The count holds every unread hit, and the Unread filter on
+                  // Hunts lists every one of them (dogfood 2026-10-19, R3-D9).
+                  // The link carries the anchor of the Needs-you line, so it
+                  // lands on the hits block below the fold (R1-D12).
                   <>
                     from analytics in shadow.{' '}
-                    <Link to="/hunts?hits=unread" className="text-accent hover:underline">
-                      Read the last 7 days on Hunts
+                    <Link to={needsYouLinks(null).shadowHits} className="text-accent hover:underline">
+                      Read them on Hunts
                     </Link>
                     .
                   </>
@@ -1578,6 +1654,13 @@ export function Dashboard() {
               title="Investigation outcomes"
               right={<span className="text-[11.5px] text-faint">{a(m.groups)} detection {m.groups === 1 ? 'group' : 'groups'}</span>}
             />
+            {/* The panel and the True positives tile count by two clocks. The
+                panel did not say which, and the two read different numbers
+                for one window (R1-D9). */}
+            <div data-testid="outcomes-clock" className="px-[15px] pt-2.5 text-[11.5px] leading-[1.45] text-faint">
+              The chart counts the alert groups with an alert in this window. The True positives
+              tile counts the investigations that started in this window.
+            </div>
             {(alerts.loading && !alerts.data) || switchingWindow ? (
               <LoadingState label={switchingWindow ? `Loading the ${rangeLabel} window` : undefined} />
             ) : alerts.error ? (
@@ -1609,7 +1692,7 @@ export function Dashboard() {
               title="Recent investigations"
               right={
                 <Link
-                  to={recentDestination(range)}
+                  to={recentDestination(range, custom)}
                   className="flex items-center gap-1 text-[12px] font-semibold text-accent hover:underline"
                 >
                   View all
@@ -1768,7 +1851,7 @@ export function Dashboard() {
                   <button
                     onClick={runEvalNow}
                     disabled={evalRunning}
-                    title="Run the quality micro-eval now. The run uses real investigations and takes minutes."
+                    title="Run the quality eval now. The eval runs real investigations. It takes several minutes."
                     className="flex items-center gap-1 text-[12px] font-semibold text-accent hover:underline disabled:opacity-60"
                   >
                     {evalRunning ? 'Evaluating' : 'Run now'}

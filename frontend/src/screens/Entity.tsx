@@ -1,4 +1,4 @@
-import { ChevronLeft, Crosshair, Server, ShieldAlert } from 'lucide-react';
+import { ChevronLeft, Crosshair, Globe, Server, ShieldAlert, User } from 'lucide-react';
 import { Link, Navigate, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { SeverityTag, VerdictPill } from '../components/Badges';
 import { HostObservations } from '../components/HostObservations';
@@ -9,6 +9,8 @@ import {
   ENTITY_TYPE_LABEL,
   entityType,
   identityLine,
+  machineKeysLine,
+  machineKeysShown,
   nothingKnown,
   nothingKnownLine,
   worryLines,
@@ -19,7 +21,7 @@ import { isIpKey } from '../lib/ip';
 import { plural } from '../lib/plural';
 import { absTime } from '../lib/timeRange';
 import { ENTITY_ADDRESS, ENTITY_NAME } from '../lib/tooltips';
-import type { EntityDetail, EntityTimelineItem, Severity, Verdict } from '../lib/types';
+import type { EntityDetail, EntityTimelineItem, EntityType, Severity, Verdict } from '../lib/types';
 import { useAsync } from '../lib/useAsync';
 
 // The narrow frontend severity union the pill understands; a hunt finding can
@@ -73,6 +75,17 @@ function TimelineCard({ item }: { item: EntityTimelineItem }) {
   );
 }
 
+/** The icon of each type. A user page wore the server icon of a host
+ *  (dogfood 2026-10-19, R4-D23). */
+function TypeIcon({ type }: { type: EntityType }) {
+  const chrome = type === 'user' ? 'user' : type === 'domain' || type === 'external_address' ? 'globe' : 'host';
+  return (
+    <span data-testid="entity-icon" data-type={chrome} className="text-dim">
+      {chrome === 'user' ? <User size={18} /> : chrome === 'globe' ? <Globe size={18} /> : <Server size={18} />}
+    </span>
+  );
+}
+
 /** The machine read: a key, "no machine", or a read that failed. Each answer
  *  carries the value it answers for, because useAsync keeps the last answer
  *  while the next one loads. */
@@ -93,6 +106,7 @@ interface MachineRead {
  * `?type=user` or `?type=domain` says what the value is, so an account that
  * shares a name with a machine never opens the machine.
  */
+
 export function Entity() {
   const { value = '' } = useParams();
   const [params] = useSearchParams();
@@ -174,6 +188,7 @@ function EntityBody({
   const type = entityType(data);
   const empty = nothingKnown(data);
   const worry = worryLines(data);
+  const keys = machineKeysShown(data);
   const s = data.summary;
   return (
     <>
@@ -183,9 +198,7 @@ function EntityBody({
         className="mb-4 rounded-panel-lg border border-border bg-surface-2 px-5 py-4"
       >
         <div className="flex flex-wrap items-center gap-3">
-          <span className="text-dim">
-            <Server size={18} />
-          </span>
+          <TypeIcon type={type} />
           <span className="font-mono text-[17px] font-semibold text-white">{data.value}</span>
           <span
             data-testid="entity-type"
@@ -223,12 +236,21 @@ function EntityBody({
           data-testid="entity-seen"
           className="mt-2.5 flex flex-wrap items-center gap-x-4 gap-y-1 font-mono text-[11px] text-faint"
         >
-          <span title={data.first_seen ? absTime(data.first_seen) : undefined}>
-            first seen {data.first_seen ? relativeAge(data.first_seen) : 'never'}
-          </span>
-          <span title={data.last_seen ? absTime(data.last_seen) : undefined}>
-            last seen {data.last_seen ? relativeAge(data.last_seen) : 'never'}
-          </span>
+          {/* The source of each time is named: soc-ai records here, grid
+              events on the host page. Both said "last seen" (dogfood round 2,
+              V2-7). */}
+          {data.first_seen || data.last_seen ? (
+            <>
+              <span title={data.first_seen ? absTime(data.first_seen) : undefined}>
+                first soc-ai record {data.first_seen ? relativeAge(data.first_seen) : 'never'}
+              </span>
+              <span title={data.last_seen ? absTime(data.last_seen) : undefined}>
+                last soc-ai record {data.last_seen ? relativeAge(data.last_seen) : 'never'}
+              </span>
+            </>
+          ) : (
+            <span>no soc-ai record</span>
+          )}
           <span>{plural(s.investigationCount, 'investigation')}</span>
           <span>{plural(s.huntFindingCount, 'hunt finding')}</span>
           <span>{plural(s.leadCount ?? 0, 'lead')}</span>
@@ -242,6 +264,14 @@ function EntityBody({
             </span>
           )}
         </div>
+        {/* The counts read every key of the machine. The address and the
+            name of one machine gave two sets of counts (dogfood
+            2026-10-19, R4-D2). */}
+        {keys.length > 0 && (
+          <p data-testid="entity-keys" className="mt-1 break-words text-[11.5px] leading-[1.5] text-faint">
+            {machineKeysLine(keys)}
+          </p>
+        )}
       </div>
 
       {/* The leads and the observations that name the entity come first:

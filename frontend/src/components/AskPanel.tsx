@@ -34,6 +34,7 @@ import {
   scopeKey,
   useChat,
 } from '../lib/chatScope';
+import { useChatReadiness } from '../lib/chatReadiness';
 import type { ChatMessage, Investigation } from '../lib/types';
 import { useChatThread } from '../lib/useChatThread';
 import { useOptionalShell } from '../shell/ShellContext';
@@ -174,7 +175,7 @@ function adapterFor(scope: ChatScope, verdict: Investigation['verdict'] | undefi
         fetch: () => getGeneralChat(),
         send: (text) => postGeneralChat(text),
         clear: () => clearGeneralChat(),
-        placeholder: 'Ask about your environment. Example: what datasets do I have?',
+        placeholder: 'Ask about your grid. Example: what datasets do I have?',
         hint:
           'Ask about your grid. soc-ai answers here. ' +
           'A question that needs a sweep comes back as a hunt for you to confirm.',
@@ -318,6 +319,10 @@ function ScopedChat({
   });
   const launch = useHuntLaunch();
   const [clearError, setClearError] = useState<string | null>(null);
+  // A dead model gateway blocks the send, and the panel says why. A dead or
+  // slow grid gets a note (H1-D13).
+  const readiness = useChatReadiness();
+  const blocked = readiness.blocked;
 
   // A question asked from outside the panel: "Resolve in chat", a Dashboard
   // starter. It waits for the thread read, so a turn already running gets the
@@ -326,12 +331,12 @@ function ScopedChat({
   useEffect(() => {
     if (!pendingAsk || pendingAsk.key !== key || !chat.synced) return;
     consumeAsk(pendingAsk.n);
-    if (chat.pending) chat.setDraft(pendingAsk.text);
+    if (chat.pending || blocked) chat.setDraft(pendingAsk.text);
     else chat.send(pendingAsk.text);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pendingAsk, key, chat.synced]);
 
-  const ask = (q: string) => (chat.pending ? chat.setDraft(q) : chat.send(q));
+  const ask = (q: string) => (chat.pending || blocked ? chat.setDraft(q) : chat.send(q));
 
   const clear = adapter.clear;
   const clearThread = () => {
@@ -415,7 +420,7 @@ function ScopedChat({
         {scope.kind !== 'general' && scope.name && (
           <span
             data-testid="ask-scope-name"
-            className="min-w-0 break-all font-mono text-[11.5px] text-dim"
+            className="min-w-0 break-words font-mono text-[11.5px] text-dim"
             title={scope.name}
           >
             {scope.name}
@@ -453,7 +458,7 @@ function ScopedChat({
               </span>
               <span>{adapter.hint}</span>
             </div>
-            <StarterChips questions={adapter.starters} onAsk={ask} />
+            <StarterChips questions={adapter.starters} onAsk={ask} disabledReason={blocked} />
           </div>
         }
         messages={chat.messages}
@@ -463,6 +468,9 @@ function ScopedChat({
         onDraft={chat.setDraft}
         onSend={chat.send}
         linkIds={scope.kind === 'investigation' ? (reg?.linkIds ?? []) : undefined}
+        linkEntities
+        blockedReason={blocked}
+        stateNote={readiness.note}
         renderSpecial={renderSpecial}
       />
       {clearError && (
@@ -472,8 +480,17 @@ function ScopedChat({
   );
 }
 
-/** The question chips. A click asks the question outright. */
-function StarterChips({ questions, onAsk }: { questions: string[]; onAsk: (q: string) => void }) {
+/** The question chips. A click asks the question outright. With a
+ *  `disabledReason` the chips are off, and the reason is their title. */
+function StarterChips({
+  questions,
+  onAsk,
+  disabledReason = null,
+}: {
+  questions: string[];
+  onAsk: (q: string) => void;
+  disabledReason?: string | null;
+}) {
   return (
     <div className="flex flex-wrap gap-1.5">
       {questions.map((q) => (
@@ -481,7 +498,9 @@ function StarterChips({ questions, onAsk }: { questions: string[]; onAsk: (q: st
           key={q}
           type="button"
           onClick={() => onAsk(q)}
-          className="rounded-pill border border-border-input bg-surface-3 px-2.5 py-1 text-left text-[12px] text-text-2 hover:border-accent hover:text-text"
+          disabled={!!disabledReason}
+          title={disabledReason ?? undefined}
+          className="rounded-pill border border-border-input bg-surface-3 px-2.5 py-1 text-left text-[12px] text-text-2 hover:border-accent hover:text-text disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:border-border-input disabled:hover:text-text-2"
         >
           {q}
         </button>
@@ -528,7 +547,7 @@ function VerdictProposalRow({
     resolveInvestigation(invId, m.messageId, m.token)
       .then(onResolved)
       .catch((err: unknown) =>
-        setError(err instanceof Error ? err.message : 'soc·ai could not apply the verdict. Try again.'),
+        setError(err instanceof Error ? err.message : 'soc-ai could not apply the verdict. Try again.'),
       )
       .finally(() => setApplying(false));
   };
@@ -595,6 +614,7 @@ function VerdictProposalRow({
  */
 export function AskSocAiCard() {
   const chat = useChat();
+  const readiness = useChatReadiness();
   if (!chat || !chat.generalEnabled) return null;
   return (
     <div data-testid="ask-card">
@@ -617,9 +637,19 @@ export function AskSocAiCard() {
           <div className="text-faint">
             Ask about your grid. The answer opens in the Ask soc-ai panel.
           </div>
+          {(readiness.blocked || readiness.note) && (
+            <div
+              data-testid="ask-card-state"
+              role="status"
+              className={`leading-[1.45] ${readiness.blocked ? 'text-warn' : 'text-faint'}`}
+            >
+              {[readiness.blocked, readiness.note].filter(Boolean).join(' ')}
+            </div>
+          )}
           <StarterChips
             questions={GENERAL_STARTERS}
             onAsk={(q) => chat.openChat({ general: true, ask: q })}
+            disabledReason={readiness.blocked}
           />
         </div>
       </Panel>

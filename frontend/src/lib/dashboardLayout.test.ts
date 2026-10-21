@@ -85,6 +85,18 @@ describe('the shipped layout', () => {
   });
 });
 
+describe('the shadow-hit tile', () => {
+  it('fills the left column and leaves no hole beside it (R1-D25)', () => {
+    const grid = effectiveLayout(defaultLayout(), ALL, NATURAL);
+    const tile = find(grid, 'kpi-shadow-hits');
+    const chart = find(grid, 'outcomes');
+    expect(tile.x).toBe(chart.x);
+    expect(tile.w).toBe(chart.w);
+    // The chart starts right under the tile.
+    expect(chart.y).toBe(tile.y + tile.h);
+  });
+});
+
 describe('effectiveLayout', () => {
   it('makes each panel as tall as its content and evens the tile row', () => {
     const grid = effectiveLayout(defaultLayout(), ALL, NATURAL);

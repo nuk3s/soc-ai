@@ -11,11 +11,16 @@ An arm directory also works: the newest ``batch-<ts>`` in it with an
 ``index.jsonl`` is read.
 
 Per arm the script prints the run counts, the synth stratum metrics from
-``aggregates.json``, the mean model usage per run and the median
-investigation wall time. The usage is the sum of the ``usage`` events in each
-bundle's ``events.jsonl``. The wall time is ``investigation_ms`` from
-``index.jsonl``. Then it prints the strict passes k/N of each scenario for A
-and B with the change in pass rate, and the change in input tokens per run.
+``aggregates.json``, the strategy label, the mean agents per run, the mean
+model usage per run and the median investigation wall time. The usage is the
+sum of the ``usage`` events in each bundle's ``events.jsonl``. The strategy
+label and the agent count come from the same bundle: the strategy from a
+``triage_report`` event's payload (or its ``counters``), the agent count
+from the number of ``swarm_agent_finished`` events, or 1 when a bundle has
+none. The wall time is ``investigation_ms`` from ``index.jsonl``. Then it
+prints the strict passes k/N of each scenario for A and B with the change in
+pass rate, the change in input tokens per run, and arm B's mean tokens per
+run as a multiple of arm A's, against the swarm experiment's 2x budget.
 
 Standard library only, so any Python 3.12 runs it without the install's
 environment. See ``docs/dev/eval-arms.md`` for the runbook.
@@ -38,6 +43,11 @@ from typing import Any
 USAGE_KEYS: tuple[str, ...] = ("input_tokens", "output_tokens", "requests", "tool_calls")
 NA = "n/a"
 
+# The swarm experiment's decision rule caps a win at this multiple of arm
+# A's tokens. docs/dev/specs/2026-10-08-swarm-triage-experiment-design.md,
+# "Decision rule".
+COST_MATCH_BUDGET = 2.0
+
 
 class BatchDirError(Exception):
     """An argument names no readable batch directory."""
@@ -53,6 +63,13 @@ class Arm:
     aggregates: dict[str, Any] | None
     # One entry per run whose bundle has an events.jsonl: the summed usage.
     usage: tuple[dict[str, int], ...]
+    # One entry per run whose bundle has an events.jsonl: its swarm agent
+    # count (swarm_agent_finished events, or 1 when a run spawned none).
+    agents: tuple[int, ...]
+    # The investigator_strategy label the arm's bundles carry, or None when
+    # no bundle names one (an older bundle, or a run that predates the
+    # swarm strategies).
+    strategy: str | None
 
     @property
     def ok_rows(self) -> list[dict[str, Any]]:
@@ -66,6 +83,20 @@ class Arm:
         if not self.usage:
             return None
         return statistics.fmean(u[key] for u in self.usage)
+
+    def mean_agents(self) -> float | None:
+        if not self.agents:
+            return None
+        return statistics.fmean(self.agents)
+
+    def mean_total_tokens(self) -> float | None:
+        input_tokens, output_tokens = (
+            self.mean_usage("input_tokens"),
+            self.mean_usage("output_tokens"),
+        )
+        if input_tokens is None or output_tokens is None:
+            return None
+        return input_tokens + output_tokens
 
     def median_wall_s(self) -> float | None:
         walls = [
@@ -147,6 +178,36 @@ def read_usage(bundle: Path) -> dict[str, int]:
     return totals
 
 
+def read_agents(bundle: Path) -> int:
+    """The swarm agents one run spent: ``swarm_agent_finished`` events, or 1 for a run with none.
+
+    A single-agent strategy spawns no swarm agent and emits none of these
+    events, so a bundle with none is one agent, not zero.
+    """
+    events = read_jsonl(bundle / "events.jsonl")
+    count = sum(1 for event in events if event.get("kind") == "swarm_agent_finished")
+    return count or 1
+
+
+def read_strategy(bundle: Path) -> str | None:
+    """The ``investigator_strategy`` label a ``triage_report`` event's payload carries.
+
+    The label rides the payload directly, or inside its ``counters``. A
+    bundle with neither, or with no ``triage_report`` event, carries None.
+    """
+    for event in read_jsonl(bundle / "events.jsonl"):
+        if event.get("kind") != "triage_report":
+            continue
+        payload = _as_dict(event.get("payload"))
+        strategy = payload.get("strategy")
+        if isinstance(strategy, str) and strategy:
+            return strategy
+        strategy = _as_dict(payload.get("counters")).get("strategy")
+        if isinstance(strategy, str) and strategy:
+            return strategy
+    return None
+
+
 def load_arm(label: str, path: Path) -> Arm:
     """Read one batch directory. Raises :class:`BatchDirError` when there is none."""
     batch = resolve_batch_dir(path)
@@ -159,11 +220,25 @@ def load_arm(label: str, path: Path) -> Arm:
         except json.JSONDecodeError:
             aggregates = None
     usage: list[dict[str, int]] = []
+    agents: list[int] = []
+    strategy: str | None = None
     for row in rows:
         bundle = bundle_dir(row, batch)
-        if bundle is not None:
-            usage.append(read_usage(bundle))
-    return Arm(label=label, batch_dir=batch, rows=rows, aggregates=aggregates, usage=tuple(usage))
+        if bundle is None:
+            continue
+        usage.append(read_usage(bundle))
+        agents.append(read_agents(bundle))
+        if strategy is None:
+            strategy = read_strategy(bundle)
+    return Arm(
+        label=label,
+        batch_dir=batch,
+        rows=rows,
+        aggregates=aggregates,
+        usage=tuple(usage),
+        agents=tuple(agents),
+        strategy=strategy,
+    )
 
 
 def fmt_rate(value: object) -> str:
@@ -190,6 +265,7 @@ def summary_lines(arm: Arm) -> list[str]:
         f"== arm {arm.label}: {arm.batch_dir}",
         f"runs {len(arm.rows)}  ok {len(ok)}  errors {len(arm.rows) - len(ok)}  "
         f"fallbacks {fallbacks}",
+        f"strategy                        {arm.strategy or NA}",
     ]
     if arm.aggregates is None:
         lines.append(f"no aggregates.json. Run: soc-ai eval-report --no-meta {arm.batch_dir}")
@@ -220,6 +296,7 @@ def summary_lines(arm: Arm) -> list[str]:
         f"requests {fmt_mean(arm.mean_usage('requests'), 2)}  "
         f"tool calls {fmt_mean(arm.mean_usage('tool_calls'), 2)}"
     )
+    lines.append(f"agents per run ({len(arm.agents)} bundles): {fmt_mean(arm.mean_agents(), 2)}")
     lines.append(f"median investigation wall time {fmt_mean(arm.median_wall_s(), 1)} s")
     return lines
 
@@ -270,6 +347,24 @@ def token_change_line(a: Arm, b: Arm) -> str:
     return f"input tokens per run: A {fmt_mean(ia, 0)}  B {fmt_mean(ib, 0)}  change {change}"
 
 
+def cost_matched_line(a: Arm, b: Arm) -> str:
+    """Arm B's mean total tokens per run, as a multiple of arm A's, against the 2x budget.
+
+    The swarm experiment's decision rule allows a win at no more than
+    :data:`COST_MATCH_BUDGET` times arm A's tokens. ``n/a`` prints when
+    either arm has no usage to total.
+    """
+    ta, tb = a.mean_total_tokens(), b.mean_total_tokens()
+    if not ta or tb is None:
+        return "cost-matched: n/a"
+    ratio = tb / ta
+    flag = "within" if ratio <= COST_MATCH_BUDGET else "OVER"
+    return (
+        f"cost-matched: B spends {ratio:.2f}x the tokens of A "
+        f"({flag} the {COST_MATCH_BUDGET:g}x budget)"
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Compare two validate-batch directories: quality and cost per run."
@@ -287,7 +382,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     table = scenario_lines(a, b)
     if table:
         out += ["", *table]
-    out += ["", token_change_line(a, b)]
+    out += ["", token_change_line(a, b), cost_matched_line(a, b)]
     print("\n".join(out))
     return 0
 

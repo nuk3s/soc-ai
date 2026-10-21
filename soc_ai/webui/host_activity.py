@@ -21,19 +21,21 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 from soc_ai.config import Settings
+from soc_ai.dossier.principal import PrincipalKind, principal_kind
+from soc_ai.dossier.profile import LOGON_CANDIDATES
 from soc_ai.so_client.elastic import ElasticClient
-from soc_ai.so_client.fields import EPHEMERAL_PORT_FLOOR, is_peer_address
+from soc_ai.so_client.fields import DATASET_NAME_FIELDS, EPHEMERAL_PORT_FLOOR, is_peer_address
 from soc_ai.webui.alerts_query import (
     # The ONE spelling of where Security Onion nests an endpoint detection's own
     # address; a second copy here would drift the moment that path changes.
     NESTED_HOST_IP_FIELD,
-    NOTICE_SOURCE_OQL,
-    SIGMA_SOURCE_OQL,
     TIME_RANGES,
     build_filter,
+    feed_sources,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -90,10 +92,18 @@ _ALERT_PEER_AGG_SIZE = 500
 MAX_USERS = 10
 _USER_AGG_SIZE = MAX_USERS + 1
 
-# The host-log datasets the user lane reads. Linux only today: Windows logon
-# events land in `system.security`/`winlog.*` under different field names, and
-# aggregating those as-is would list machine accounts (`HOST$`) as users.
-_AUTH_DATASETS: tuple[str, ...] = ("system.auth",)
+# The host-log datasets the user lane reads: the profile's logon plane, one
+# list for both. The lane read `system.auth` alone, and every Windows host
+# showed "no host-log users" beside a profile that listed its logon users
+# (dogfood 2026-10-19). `system.security` carries machine accounts (`HOST$`),
+# which the users aggregation excludes; see _MACHINE_ACCOUNT_TERMS.
+_AUTH_DATASETS: tuple[str, ...] = LOGON_CANDIDATES
+
+# A machine account is a name that ends in `$`. Lucene regular expressions
+# match the whole term, so this excludes exactly those names. On a domain
+# controller every member computer authenticates, and without the exclusion
+# the machine accounts fill every user bucket before a person gets one.
+_MACHINE_ACCOUNT_TERMS = r".*\$"
 
 # Agent-name buckets on the auth pass. TWO is the whole requirement: the gate
 # asks "did more than one machine write these documents", and one bucket of
@@ -130,10 +140,11 @@ class HostPeer:
 class VolumePoint:
     """One histogram bucket: connections in the interval starting at ``ts``.
 
-    The list length is NOT fixed and does not necessarily span the whole range.
-    Elasticsearch fills interior gaps but not the edges, so a host that was
-    silent until this morning returns buckets starting this morning. Render from
-    the timestamps; do not index by position or assume 24 of them.
+    The series spans the whole range. The histogram's extended bounds are the
+    window, so an empty hour or day is a zero bucket. The bucket COUNT is still
+    not fixed: the first bucket starts at the hour or day that holds the window
+    start, so a 24 h series holds 25 buckets. Render from the timestamps; do
+    not index by position.
     """
 
     ts: str
@@ -211,6 +222,19 @@ class HostActivity:
     # more. Answering the other question needs a grid-wide dataset probe that
     # this pass deliberately does not make.
     conn_datasets: list[str] = field(default_factory=list)
+    # The host-log datasets the Users lane read, whatever they held. The page
+    # names them, because "no host-log users" means nothing until the reader
+    # knows which logs were read.
+    auth_datasets: list[str] = field(default_factory=lambda: list(_AUTH_DATASETS))
+    # The newest connection record of the window, or None when it holds none.
+    # The page's "last seen" reads this. The newest volume bucket only says
+    # which hour or day held the record.
+    newest_event: str | None = None
+    # The end of the window: the server time of the read, as UTC ISO-8601.
+    # The window starts 24 hours or 7 days before it. The page needs it to
+    # count the part of the two edge buckets that lies inside the window
+    # (dogfood round 2, V2-1).
+    window_end: str | None = None
 
 
 # Both lookups are INJECTED rather than imported. This module sits in the query
@@ -374,7 +398,7 @@ def _fold_conn_datasets(aggregations: dict[str, Any]) -> list[str]:
     return [name for name, _ in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
 
 
-def _conn_aggs(ip: str, interval: str) -> dict[str, Any]:
+def _conn_aggs(ip: str, interval: str, window: str) -> dict[str, Any]:
     return {
         # Which sensor(s) the count came from. Two reasons it is not optional:
         # a count is only meaningful next to what it counted, and on a grid
@@ -405,18 +429,24 @@ def _conn_aggs(ip: str, interval: str) -> dict[str, Any]:
             "aggs": _peer_aggs("source.ip"),
         },
         # min_doc_count 0 so an idle hour renders as a zero in the chart rather
-        # than closing up and making a quiet host look continuously busy. No
-        # extended_bounds: ES fills interior gaps but not the edges, so the
-        # series starts at the host's first activity and the bucket COUNT is not
-        # fixed. Padding it would mean anchoring "now" here, and this module
-        # deliberately leaves the clock to Elasticsearch.
+        # than closing up and making a quiet host look continuously busy.
+        # extended_bounds so the edges fill too: ES fills interior gaps only,
+        # and a 24 h window with data in one hour returned one bucket, which the
+        # chart drew with equal start and end labels (dogfood 2026-10-19). The
+        # bounds are the same date math the range filter reads, so the clock
+        # stays with Elasticsearch. The first bucket starts at the hour or day
+        # that holds the window start, so a 24 h series holds 25 buckets.
         "volume": {
             "date_histogram": {
                 "field": "@timestamp",
                 "calendar_interval": interval,
                 "min_doc_count": 0,
+                "extended_bounds": {"min": window, "max": "now"},
             }
         },
+        # The newest record of the window, for the page's "last seen". One
+        # metric on the search that already runs.
+        "newest": {"max": {"field": "@timestamp"}},
     }
 
 
@@ -499,6 +529,18 @@ def _fold_peers(aggregations: dict[str, Any], host_ip: str) -> tuple[list[HostPe
     return ordered[:MAX_PEERS], len(ordered) > MAX_PEERS
 
 
+def _fold_newest(aggregations: dict[str, Any]) -> str | None:
+    """The newest connection record time, or None for a window with none.
+
+    ES answers a max over no documents with ``value: null`` and no string.
+    """
+    newest = (aggregations or {}).get("newest")
+    if not isinstance(newest, dict) or newest.get("value") is None:
+        return None
+    stamp = newest.get("value_as_string")
+    return str(stamp) if stamp else None
+
+
 def _fold_volume(aggregations: dict[str, Any]) -> list[VolumePoint]:
     points: list[VolumePoint] = []
     for bucket in _buckets(aggregations, "volume"):
@@ -545,11 +587,12 @@ async def _fetch_alert_edges(
     switch is on) — a host page and the console disagreeing about how many alerts
     a machine has is a bug report waiting to happen.
     """
-    sources = [settings.webui_alerts_query]
-    if settings.webui_extra_detections:
-        sources += [SIGMA_SOURCE_OQL, NOTICE_SOURCE_OQL]
     query = build_filter(
-        settings, time_range=ALERT_WINDOW, severity=None, oql=None, dataset_oqls=sources
+        settings,
+        time_range=ALERT_WINDOW,
+        severity=None,
+        oql=None,
+        dataset_oqls=feed_sources(settings),
     )
     query["bool"]["filter"].append(_detection_scope(ip))
     result = await elastic.search(
@@ -644,7 +687,16 @@ async def _fetch_users(
     query = {
         "bool": {
             "filter": [
-                {"terms": {"event.dataset": list(_AUTH_DATASETS)}},
+                # Both spellings of the dataset field, as the connection pass
+                # and the profile read them.
+                {
+                    "bool": {
+                        "should": [
+                            {"terms": {name: list(_AUTH_DATASETS)}} for name in DATASET_NAME_FIELDS
+                        ],
+                        "minimum_should_match": 1,
+                    }
+                },
                 {"term": {"host.ip": ip}},
                 {"range": {"@timestamp": {"gte": window}}},
             ],
@@ -661,7 +713,11 @@ async def _fetch_users(
             # `_uniquely_claimed` for why the answer gates the whole list.
             "agents": {"terms": {"field": "host.name", "size": _AGENT_AGG_SIZE}},
             "users": {
-                "terms": {"field": "user.name", "size": _USER_AGG_SIZE},
+                "terms": {
+                    "field": "user.name",
+                    "size": _USER_AGG_SIZE,
+                    "exclude": _MACHINE_ACCOUNT_TERMS,
+                },
                 "aggs": {"last": {"max": {"field": "@timestamp"}}},
             },
         },
@@ -677,7 +733,10 @@ async def _fetch_users(
     folded: dict[str, UserSeen] = {}
     for bucket in _buckets(result.aggregations or {}, "users"):
         name = str(bucket.get("key") or "").strip()
-        if not name:
+        # A machine account the exclusion missed (a padded `HOST$ `) and a
+        # placeholder such as `-` name no person. The profile's principal
+        # rules decide both.
+        if principal_kind(name) in (None, PrincipalKind.MACHINE):
             continue
         last = str((bucket.get("last") or {}).get("value_as_string") or "")
         seen = folded.get(name)
@@ -734,6 +793,9 @@ async def fetch_host_activity(
     """
     window = _window(range)
     interval = _VOLUME_INTERVAL[_supported(range)]
+    # The ``now`` of the range filter is the grid clock. The server clock is the
+    # closest value soc-ai can state, and the two agree within the request.
+    read_at = datetime.now(UTC)
 
     # Three searches, fanned out. THREE and not one because the alert pass takes
     # its scoping from ``alerts_query.build_filter`` — the same call the alerts
@@ -755,7 +817,7 @@ async def fetch_host_activity(
             settings.events_index_pattern,
             _conn_query(ip, window),
             size=0,
-            aggs=_conn_aggs(ip, interval),
+            aggs=_conn_aggs(ip, interval, window),
         ),
         _fetch_alert_edges(elastic, settings, ip=ip, window=window),
         _fetch_users(elastic, settings, ip=ip, window=window),
@@ -798,4 +860,7 @@ async def fetch_host_activity(
         peers_truncated=peers_truncated,
         users_truncated=users_truncated,
         conn_datasets=_fold_conn_datasets(aggregations),
+        auth_datasets=list(_AUTH_DATASETS),
+        newest_event=_fold_newest(aggregations),
+        window_end=read_at.isoformat(timespec="seconds").replace("+00:00", "Z"),
     )

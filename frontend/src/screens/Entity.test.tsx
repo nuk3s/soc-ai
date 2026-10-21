@@ -175,8 +175,11 @@ describe('Entity identity and worry lines', () => {
     expect(worry).toContain('2 investigations reached a true-positive verdict.');
     expect(screen.getByTestId('entity-type').textContent).toBe('external address');
     const seen = screen.getByTestId('entity-seen').textContent ?? '';
-    expect(seen).toContain('first seen 2d ago');
-    expect(seen).toContain('last seen 2h ago');
+    // Dogfood round 2 (V2-7): the entity page names soc-ai records as the
+    // source. The host page names the grid.
+    expect(seen).toContain('first soc-ai record 2d ago');
+    expect(seen).toContain('last soc-ai record 2h ago');
+    expect(seen).not.toContain('last seen');
     expect(screen.queryByTestId('entity-nothing-known')).toBeNull();
   });
 
@@ -194,7 +197,7 @@ describe('Entity identity and worry lines', () => {
       'soc-ai knows nothing about ghost yet. No investigation, hunt finding, lead or observation names it.',
     );
     expect(screen.queryByTestId('entity-worry')).toBeNull();
-    expect(screen.getByTestId('entity-seen').textContent).toContain('first seen never');
+    expect(screen.getByTestId('entity-seen').textContent).toContain('no soc-ai record');
   });
 
   it('does not say nothing is known when a lead names the value', async () => {

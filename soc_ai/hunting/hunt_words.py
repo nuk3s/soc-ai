@@ -134,12 +134,30 @@ _LEGACY_ALERT_ONLY = re.compile(
 )
 
 
+# The citation gate's notes (soc_ai.agent.hunt_gates). The gate writes the
+# stored text. The page reads one fact per sentence (R3 STE 25), and every
+# stored row reads the new words with no rewrite of the store.
+_UNRESOLVED_CITES = re.compile(
+    r"citations did not resolve to gathered evidence.*?severity (?:capped )?to (?P<sev>[a-z]+)",
+    re.IGNORECASE,
+)
+_HIGH_NO_CITES = re.compile(r"high-severity finding has no citations", re.IGNORECASE)
+
+
 def validator_note(text: str | None) -> str | None:
     """A stored validator note, reworded when an older build wrote it."""
     if not text:
         return None
     if _LEGACY_ALERT_ONLY.search(text):
         return ALERT_ONLY_NOTE
+    unresolved = _UNRESOLVED_CITES.search(text)
+    if unresolved is not None:
+        severity = unresolved.group("sev").lower()
+        return (
+            f"The citations name no gathered evidence. soc-ai lowered the severity to {severity}."
+        )
+    if _HIGH_NO_CITES.search(text):
+        return "This finding cites no evidence. soc-ai lowered the severity from high to medium."
     return text
 
 

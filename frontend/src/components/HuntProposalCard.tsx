@@ -79,7 +79,7 @@ export function huntProposalRow(m: ChatMessage, i: number, launch: HuntLaunch): 
           already found, then propose the sweep"), so the row renders the
           shared bubble AND the card — dropping the prose would throw away the
           half of the reply the analyst judges the proposal by. */}
-      <AssistantBubble text={m.text} tools={m.tools} />
+      <AssistantBubble text={m.text} tools={m.tools} linkEntities />
       <div
         className="rounded-card border px-3 py-2.5"
         style={{ borderColor: 'rgba(75,139,245,.35)', background: 'rgba(75,139,245,.06)' }}

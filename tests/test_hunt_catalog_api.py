@@ -133,8 +133,13 @@ def test_every_catalog_spec_appears_even_when_never_swept(client: TestClient) ->
         "undecided_docs": 0,
         "unattributed_docs": 0,
         "truncated_docs": 0,
+        "last_error_text": None,
+        "failed_24h": 0,
+        "failing_since": None,
     }
     assert body["last_sweep_at"] is None
+    assert body["sweep_health"] is None
+    assert body["prior_sweep_health"] is None
 
 
 def test_the_trail_lands_on_the_right_spec(client: TestClient) -> None:
@@ -710,3 +715,87 @@ def test_a_coverage_at_the_recent_cap_says_it_is_capped(client: TestClient) -> N
     capped = by_id["prior-hypervisor-novel-served-port"]["coverage"]
     assert capped["capped"] is True and capped["recent_cap"] == RECENT_MAX_ENTITIES
     assert by_id["prior-server-internet-nonweb-novel-port"]["coverage"]["capped"] is False
+
+
+# ── Failed runs (dogfood 2026-10-19 R3-D1, R5-D3, R5-D4, R5-D5, R5-I3) ─────
+
+
+def test_a_failed_run_reads_as_one_sentence_and_counts(client: TestClient) -> None:
+    now = _now()
+    _seed(client, spec_id=DCSYNC, now=now - timedelta(hours=30))
+    raw = (
+        "precondition: Connection error caused by: ConnectionError(Connection error caused by: "
+        "ClientConnectorError(Cannot connect to host 192.0.2.10:9200 ssl:default))"
+    )
+    for hours in (3, 2, 1):
+        _seed(client, spec_id=DCSYNC, now=now - timedelta(hours=hours), error=raw)
+    body = client.get("/api/v1/hunt-catalog").json()
+    row = next(s for s in body["specs"] if s["id"] == DCSYNC)
+    assert row["last_error"] == raw, "the raw text stays for whoever fixes it"
+    assert row["last_error_text"] == "soc-ai could not connect to the grid."
+    assert row["failed_24h"] == 3
+    assert row["sweeps_24h"] == 3
+    assert row["failing_since"] == (now - timedelta(hours=3)).isoformat() + "Z"
+
+
+def test_the_catalog_loop_result_rides_along(client: TestClient) -> None:
+    now = _now()
+    _seed(client, spec_id=DCSYNC, now=now - timedelta(hours=2), error="ConnectionError: x")
+    _seed(client, spec_id=DECOY, now=now - timedelta(hours=2), error="ConnectionError: x")
+    _seed(client, spec_id=DCSYNC, now=now - timedelta(hours=1), error="ConnectionError: x")
+    _seed(client, spec_id=DECOY, now=now - timedelta(hours=1), error="ConnectionError: x")
+    loop = client.get("/api/v1/hunt-catalog").json()["sweep_health"]
+    assert loop == {
+        "last_run_at": (now - timedelta(hours=1)).isoformat() + "Z",
+        "last_outcome": "failed",
+        "last_error_text": "soc-ai could not connect to the grid.",
+        "runs_24h": 2,
+        "failed_24h": 2,
+        "failing_since": (now - timedelta(hours=2)).isoformat() + "Z",
+        "counted_since": None,
+    }
+
+
+def test_a_profile_sweep_skipped_on_a_down_grid_shows_on_its_rows(client: TestClient) -> None:
+    """The profile trail holds completed runs. The loop's record holds the rest."""
+    from soc_ai.hunting.loop_health import SKIP_GRID_DOWN, prior_health
+
+    spec_id = "prior-hypervisor-novel-served-port"
+    now = _now()
+    _prior_run(client, spec_id, at=now - timedelta(hours=3))
+    health = prior_health(client.app.state)
+    health.note(now - timedelta(hours=3), "ok")
+    health.note_skip(now - timedelta(hours=2), SKIP_GRID_DOWN, timedelta(hours=1))
+    health.note_skip(now - timedelta(hours=1), SKIP_GRID_DOWN, timedelta(hours=1))
+    body = client.get("/api/v1/hunt-catalog").json()
+    row = next(s for s in body["specs"] if s["id"] == spec_id)
+    assert row["last_error_text"] == SKIP_GRID_DOWN
+    assert row["failed_24h"] == 2
+    assert row["failing_since"] == (now - timedelta(hours=2)).isoformat() + "Z"
+    loop = body["prior_sweep_health"]
+    assert loop["last_outcome"] == "skipped"
+    assert (loop["runs_24h"], loop["failed_24h"]) == (3, 2)
+    assert body["prior_sweep_interval_minutes"] == 60
+    # Control: a match analytic is not touched by the profile loop's record.
+    dcsync = next(s for s in body["specs"] if s["id"] == DCSYNC)
+    assert dcsync["last_error_text"] is None
+
+
+def test_a_completed_profile_sweep_names_only_its_failed_analytics(client: TestClient) -> None:
+    from soc_ai.hunting.loop_health import prior_health
+
+    failed = "prior-hypervisor-novel-served-port"
+    now = _now()
+    _prior_run(client, failed, at=now - timedelta(minutes=5))
+    health = prior_health(client.app.state)
+    health.note(now - timedelta(minutes=5), "ok", spec_errors={failed: f"{failed}: timed out"})
+    body = client.get("/api/v1/hunt-catalog").json()
+    row = next(s for s in body["specs"] if s["id"] == failed)
+    assert row["last_error_text"] == "The grid did not answer in time."
+    assert row["failing_since"] is None, "the loop completed, so no streak is open"
+    others = [
+        s
+        for s in body["specs"]
+        if s["evaluator"] != "match" and s["id"] != failed and s["last_error_text"]
+    ]
+    assert others == []

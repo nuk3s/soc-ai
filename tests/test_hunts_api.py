@@ -2028,7 +2028,10 @@ def test_hunt_detail_serializes_validator_note(client: TestClient) -> None:
     body = client.get(f"/api/v1/hunts/{hunt_id}").json()
     assert body["findings"][0]["severity"] == "low"
     assert body["findings"][0]["validatorNote"]
-    assert "did not resolve" in body["findings"][0]["validatorNote"].lower()
+    # The page reads the note in one fact per sentence (R3 STE 25).
+    assert body["findings"][0]["validatorNote"] == (
+        "The citations name no gathered evidence. soc-ai lowered the severity to low."
+    )
 
 
 def test_hunt_detail_serializes_a_catalog_findings_two_halves(client: TestClient) -> None:
@@ -2566,6 +2569,48 @@ def test_get_hunt_diff_new_persisting_resolved(
     # the baseline run is referenced (for the "vs run from {ago}" label)
     assert diff["previousHuntId"]
     assert diff["previousTs"]
+
+
+def test_get_hunt_diff_counts_no_failed_query_record(
+    client: TestClient, settings_kratos: Settings
+) -> None:
+    """R3-D15: "VS LAST RUN · 1 persisting" counted the could-not-run record
+    of two failed catalog runs. A run that did not run persists nothing."""
+    from datetime import timedelta
+
+    failed = HuntFinding(
+        title="DCSync by a non-machine: could not run",
+        detail="The grid did not accept a connection.",
+        severity="medium",
+        category="visibility_gap",
+        hosts=[],
+        citations=[],
+    )
+    now = datetime.now(UTC).replace(tzinfo=None)
+    _seed_hunt_at(
+        client,
+        objective="[catalog] dcsync",
+        status="complete",
+        findings=[failed],
+        created_at=now - timedelta(hours=2),
+    )
+    current = _seed_hunt_at(
+        client,
+        objective="[catalog] dcsync",
+        status="complete",
+        findings=[failed],
+        created_at=now - timedelta(hours=1),
+    )
+    assert client.get(f"/api/v1/hunts/{current}").json()["diff"] is None
+    # Control: a run that ran after a failed one has no run to compare with.
+    ran = _seed_hunt_at(
+        client,
+        objective="[catalog] dcsync",
+        status="complete",
+        findings=[_finding("Finding A", "10.0.0.1")],
+        created_at=now - timedelta(minutes=30),
+    )
+    assert client.get(f"/api/v1/hunts/{ran}").json()["diff"] is None
 
 
 def test_get_hunt_diff_absent_on_first_run(client: TestClient, settings_kratos: Settings) -> None:
@@ -3171,7 +3216,7 @@ def test_apply_partial_humility_clamps_confidence_and_threat_severity() -> None:
     threat = clamped.findings[0]
     assert threat.severity == "medium"  # high threat capped
     assert threat.validator_note is not None
-    assert "budget/timeout-partial" in threat.validator_note.lower()
+    assert "partial report" in threat.validator_note.lower()
     # the visibility_gap finding keeps its severity (only threats are capped)
     assert clamped.findings[1].severity == "high"
     assert clamped.findings[1].validator_note is None
@@ -3284,7 +3329,7 @@ def test_run_hunt_partial_path_applies_humility(settings_kratos: Settings) -> No
     assert report_ev.payload["confidence"] <= 0.5  # humility clamp applied
     f = report_ev.payload["findings"][0]
     assert f["severity"] == "medium"  # high threat capped on the partial path
-    assert "budget/timeout-partial" in (f["validator_note"] or "").lower()
+    assert "partial report" in (f["validator_note"] or "").lower()
 
 
 def test_run_hunt_full_run_report_not_clamped(settings_kratos: Settings) -> None:
@@ -6408,9 +6453,10 @@ def test_the_lead_quality_block_counts_two_weeks_and_two_type_pairs(
             "threat": 0,
         },
     ]
+    # R3 STE 24: one case per sentence.
     assert body["rule"] == (
-        "A lead forms at 0.85 over two or more types, on a finding with no benign "
-        "baseline, or on one type repeated to 1.5."
+        "A lead forms in three cases. Two or more types reach a weight of 0.85. One "
+        "finding has no benign baseline. One type repeats to a weight of 1.5."
     )
     assert body["note"] == "A threshold moves only on a week of data."
 

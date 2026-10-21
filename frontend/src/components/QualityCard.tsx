@@ -26,7 +26,7 @@ import { Activity, Copy, X } from 'lucide-react';
 import { useState } from 'react';
 import type { QualityFreshness, QualityPoint } from '../lib/api';
 import { dismissNotification, getDismissed } from '../lib/notifications';
-import { absTime, ago } from '../lib/timeRange';
+import { absoluteTime, ago } from '../lib/timeRange';
 import { tint } from '../lib/tokens';
 import { LoadingState } from './States';
 
@@ -270,7 +270,9 @@ export function alarmBanner(points: QualityPoint[]): AlarmBanner | null {
 
   const errored = latest.n_error;
   const total = latest.n_ok + latest.n_error;
-  const ongoingClause = `ongoing since ${absTime(since)}, ${runs} run${runs === 1 ? '' : 's'}`;
+  // The console's one absolute format, with its zone, as on the rest of the
+  // Dashboard (dogfood 2026-10-19, V1-S5).
+  const ongoingClause = `ongoing since ${absoluteTime(since)}, ${runs} run${runs === 1 ? '' : 's'}`;
 
   if (pipelineOnly) {
     return {
@@ -289,7 +291,7 @@ export function alarmBanner(points: QualityPoint[]): AlarmBanner | null {
     kind: 'quality',
     headline: ongoing
       ? `Regression alarm, ${ongoingClause}`
-      : 'The last run tripped the regression alarm.',
+      : 'The last run raised the regression alarm.',
     pipelineNote: hasPipeline
       ? `The eval pipeline is also failing. ${errored} of ${total} eval runs errored.`
       : null,
@@ -326,7 +328,7 @@ export function gapLabel(iso: string | null): string {
 const AMBER = '#f5a623';
 
 const STALE_TITLE =
-  'The nightly eval is on and has not written a point in two scheduled runs. The last attempt line says what it did instead.';
+  'The nightly eval is on and has not written a point in two scheduled runs. The last attempt line says what the eval did.';
 
 /** The clause after the point's age: absent until an attempt has been recorded.
  *
@@ -514,21 +516,21 @@ export function QualityCard({
             switch that is set; the line below says what the runs did instead. */}
         {freshness?.scheduled ? (
           <>
-            No quality history yet. The nightly eval is on and has written no point. Use{' '}
+            No quality history. The nightly eval is on and has written no point. Select{' '}
             <span className="font-semibold text-text-2">Run now</span> above to try one.{' '}
           </>
         ) : (
           <>
-            No quality history yet. Use <span className="font-semibold text-text-2">Run now</span>{' '}
-            above, or turn the nightly eval on in Config → Quality.{' '}
+            No quality history. Select <span className="font-semibold text-text-2">Run now</span>{' '}
+            above, or turn on the nightly eval in Settings &gt; Quality.{' '}
           </>
         )}
         <span className="text-faint">
-          Host cron with{' '}
+          A host cron job can also run{' '}
           <code className="rounded bg-surface-3 px-1 font-mono text-[11px]">
             soc-ai eval-nightly
-          </code>{' '}
-          still works. See docs/DOCKER.md.
+          </code>
+          . See docs/DOCKER.md.
         </span>
         {/* The one fact an empty trend cannot carry: whether anything has
             tried. A run that finds no eligible alerts exits 2 and a run that
@@ -548,7 +550,7 @@ export function QualityCard({
               {freshness.last_detail ? `: ${freshness.last_detail}` : ''}
             </>
           ) : (
-            'No eval has run on this deployment yet.'
+            'No eval has run on this deployment.'
           )}
         </div>
       </div>
@@ -607,7 +609,7 @@ export function QualityCard({
         <div
           data-testid="quality-grade-counts"
           className="mt-1 text-[11.5px] text-dim"
-          title="A partial critique means a right verdict with thin reasoning. It counts against the rate as hard as a disagreement."
+          title="A partial critique means a correct verdict with weak reasoning. It counts against the rate the same as a disagreement."
         >
           {breakdown}
         </div>
@@ -623,7 +625,7 @@ export function QualityCard({
         <div
           data-testid="quality-measured-on"
           className="mt-1 break-words text-[11px] text-faint"
-          title={`Measured on: ${[latest.app_version && `soc-ai ${latest.app_version}`, latest.code_commit && `commit ${latest.code_commit}`, latest.analyst_model && `analyst model ${latest.analyst_model}`].filter(Boolean).join(', ')}`}
+          title={`Measured on: ${[latest.app_version && `soc-ai ${latest.app_version}`, latest.code_commit && `commit ${latest.code_commit}`, latest.analyst_model && `model ${latest.analyst_model}`].filter(Boolean).join(', ')}`}
         >
           {measured}
         </div>

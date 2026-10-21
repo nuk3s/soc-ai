@@ -28,7 +28,7 @@ interface Toast {
 }
 
 interface ToastApi {
-  /** Push a toast. Global, bottom-right, newest on top, max 3 stacked.
+  /** Push a toast. Global, bottom center, newest on top, max 3 stacked.
    *  Returns the toast's id, for a later `dismiss`. */
   toast: (opts: ToastOptions) => number;
   /** Remove one toast, e.g. a stale "did not return" notice once the write
@@ -97,9 +97,13 @@ function Toaster({ toasts, onDismiss }: { toasts: Toast[]; onDismiss: (id: numbe
     <div
       role="region"
       aria-label="Notifications"
-      // Sits just above the deploy-update notice; pointer-events-none so it never
-      // blocks the content beneath, re-enabled per toast.
-      className="pointer-events-none fixed bottom-4 right-4 z-[60] flex w-[360px] max-w-[calc(100vw-2rem)] flex-col gap-2"
+      // Bottom center. At the bottom right a toast covered the row actions of
+      // the lowest Alerts row, and the Send button of the Ask soc-ai panel
+      // (dogfood 2026-10-19, V1-A8). The row actions of every list sit at the
+      // right edge. pointer-events-none so the region never blocks the content
+      // beneath, re-enabled per toast.
+      data-placement="bottom-center"
+      className="pointer-events-none fixed bottom-4 left-1/2 z-[60] flex w-[360px] max-w-[calc(100vw-2rem)] -translate-x-1/2 flex-col gap-2"
     >
       {toasts.map((t) => {
         const meta = TONE[t.tone];

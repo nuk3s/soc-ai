@@ -183,3 +183,17 @@ async def stranded(
         await db.scalar(select(func.count()).select_from(AlertEscalation).where(where)) or 0
     )
     return rows, total
+
+
+async def get_claim(db: AsyncSession, alert_id: str) -> AlertEscalation | None:
+    """The ledger row of one alert, or None when nothing claimed it.
+
+    The one-claim check on the Status page reads the age and the case id of a
+    single claim before it asks Security Onion (R5-I5).
+    """
+    if not alert_id:
+        return None
+    row: AlertEscalation | None = await db.scalar(
+        select(AlertEscalation).where(AlertEscalation.alert_id == alert_id)
+    )
+    return row

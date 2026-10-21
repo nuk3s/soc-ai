@@ -123,7 +123,10 @@ describe('Notifications — the shared list toolbar', () => {
     // Same testid Alerts/Investigations/Hunts/Hosts get from ListToolbar — this
     // is the shared component, not a lookalike.
     const chips = screen.getByTestId('list-toolbar-views');
-    expect(within(chips).getByText('Views')).toBeTruthy();
+    // The chips are notification types. "Views" over them read as saved
+    // views (dogfood 2026-10-19, R1 STE 16).
+    expect(within(chips).getByText('Types')).toBeTruthy();
+    expect(within(chips).queryByText('Views')).toBeNull();
     expect(within(chips).getByRole('button', { name: /^All/ })).toBeTruthy();
     // …and the screen's own facet, rendered as the toolbar's children.
     expect(screen.getByRole('button', { name: /Urgency/ })).toBeTruthy();
@@ -335,7 +338,7 @@ describe('Notifications — what the header says the list holds', () => {
     await screen.findByText(/ET SCAN Suspicious inbound/);
     // Only the types on the list, each with its count (D3).
     expect(container.textContent).toContain(
-      '5 items: 1 system notice, 1 host disagreement, 1 running investigation, 1 completed investigation and 1 finished hunt. Finished runs cover the last 24 h.',
+      '5 notifications: 1 system notice, 1 host disagreement, 1 running investigation, 1 completed investigation and 1 finished hunt. Finished runs cover the last 24 h.',
     );
     expect(container.textContent).not.toMatch(/shadow hit|lead/);
   });

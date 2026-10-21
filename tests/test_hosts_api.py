@@ -507,6 +507,42 @@ def test_a_failed_build_rides_on_the_machine_row(estate: TestClient) -> None:
     assert rows["agent:a-proxy"]["build_error"] is None
 
 
+def test_the_summary_counts_failed_builds_apart_from_never_built(estate: TestClient) -> None:
+    """R4-D16: "3 never built" counted 3 machines whose last build failed.
+
+    ``build_failed`` counts the machines whose primary address holds a build
+    error. ``never_built`` keeps its meaning: every machine with no clean build,
+    the ``health=broken`` total. The difference is the machines never built.
+    """
+
+    async def _run() -> None:
+        maker = estate.app.state.db_sessionmaker  # type: ignore[attr-defined]
+        async with maker() as db:
+            # The quiet machine had a clean build nine days ago. Its next build failed.
+            await db.execute(
+                update(HostDossier)
+                .where(HostDossier.ip == "10.60.0.9")
+                .values(build_error="10.60.0.9: TimeoutError:")
+            )
+            await db.commit()
+
+    asyncio.run(_run())
+    summary = estate.get("/api/v1/hosts/summary").json()
+
+    assert (
+        summary["never_built"] == 2 == int(_list(estate, activity="all", health="broken")["total"])
+    )
+    assert summary["build_failed"] == 1
+    # NEGATIVE CONTROL: the address with no build at all is not a failed build.
+    assert summary["never_built"] - summary["build_failed"] == 1
+
+
+def test_a_clean_estate_has_no_failed_build(estate: TestClient) -> None:
+    summary = estate.get("/api/v1/hosts/summary").json()
+    assert summary["build_failed"] == 0
+    assert summary["never_built"] == 1
+
+
 def test_the_summary_counts_under_the_list_activity(estate: TestClient) -> None:
     """The header menus said "unknown 117" over a list of 81.
 
@@ -629,3 +665,25 @@ def test_the_per_address_dossier_routes_still_answer(estate: TestClient) -> None
     one = estate.get("/api/v1/dossiers/10.41.99.1").json()
     assert one["ip"] == "10.41.99.1"
     assert estate.get("/api/v1/dossiers/summary").status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Guessed roles (dogfood 2026-10-19, R4-I6)
+# ---------------------------------------------------------------------------
+
+
+def test_the_summary_counts_each_guessed_role(estate: TestClient) -> None:
+    """The role menu listed "low confidence 1" and "old guess 1". It now
+    lists each guessed role with its count, and the count is the list total
+    of its ``guess:<slug>`` filter."""
+    summary = estate.get("/api/v1/hosts/summary").json()
+    assert summary["role_guesses"] == {"iot": 1, "server": 1}
+    for slug, count in summary["role_guesses"].items():
+        assert int(_list(estate, activity="all", role=f"guess:{slug}")["total"]) == count, slug
+    assert _keys(_list(estate, activity="all", role="guess:server")) == ["ip:10.60.0.9"]
+
+
+def test_a_guess_filter_never_matches_a_firm_role(estate: TestClient) -> None:
+    """NEGATIVE CONTROL: the declared workstation is no guessed workstation."""
+    assert _list(estate, activity="all", role="guess:workstation")["total"] == 0
+    assert "agent:a-nexus" in _keys(_list(estate, activity="all", role="workstation"))

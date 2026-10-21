@@ -15,6 +15,12 @@
 #
 #   SOC_AI_CLI="PYTHONPATH=<checkout> <install>/.venv/bin/python -m soc_ai.cli"
 #
+# An arm can also carry its own settings on one checkout. When
+# scripts/eval/arms/<arm-name>.env exists beside this script, its NAME=VALUE
+# lines are exported before the run, so SOC_AI_CLI picks them up through the
+# normal .env precedence. A missing file changes nothing. See
+# docs/dev/eval-arms.md.
+#
 # Run one arm at a time. synth-clean deletes every synthetic document, the
 # plants of a running arm too.
 #
@@ -39,6 +45,19 @@ fi
 if [[ ! "$repeats" =~ ^[1-9][0-9]*$ || ! "$concurrency" =~ ^[1-9][0-9]*$ ]]; then
   echo "run-arm: repeats and concurrency are positive integers." >&2
   usage
+fi
+
+# scripts/eval/arms/<arm-name>.env holds this arm's own settings, for
+# example INVESTIGATOR_STRATEGY. It is optional: an arm with no file runs
+# on whatever SOC_AI_CLI and the working directory's .env already give it.
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+arm_env_file="$script_dir/arms/$arm.env"
+if [[ -f "$arm_env_file" ]]; then
+  echo "run-arm: arm env file: $arm_env_file"
+  set -a
+  # shellcheck disable=SC1090
+  source "$arm_env_file"
+  set +a
 fi
 
 read -r -a cli <<<"${SOC_AI_CLI:-soc-ai}"

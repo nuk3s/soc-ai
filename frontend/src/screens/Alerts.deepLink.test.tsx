@@ -91,10 +91,12 @@ describe('Alerts deep-link seeding', () => {
   it('carries a custom range through with its from/to', async () => {
     mount('/alerts?range=custom&from=2026-08-01T00:00&to=2026-08-02T00:00');
     await screen.findByText(GROUP.name);
+    // As ISO UTC: the link holds a wall time in the browser zone, and the
+    // server reads a bound without an offset in the zone of Security Onion.
     expect(lastQuery()).toMatchObject({
       range: 'custom',
-      from: '2026-08-01T00:00',
-      to: '2026-08-02T00:00',
+      from: new Date('2026-08-01T00:00').toISOString(),
+      to: new Date('2026-08-02T00:00').toISOString(),
     });
   });
 

@@ -247,3 +247,30 @@ describe('withStop', () => {
     expect(withStop('Done.  ')).toBe('Done.');
   });
 });
+
+// R3-D5: the timeline printed the raw actor "system:hunt".
+describe('decisionSentence: soc-ai closes a lead on the verdicts of its hunt', () => {
+  it('names soc-ai and the reason', () => {
+    expect(
+      decisionSentence({
+        ...BASE,
+        action: 'promoted',
+        by: 'system:hunt',
+        reason: 'finding_verdict',
+      }),
+    ).toBe('soc-ai closed the lead. Every threat finding of the hunt that names an entity has a verdict.');
+  });
+
+  // Control: an analyst's close on a finding verdict keeps the analyst.
+  it("keeps an analyst's close in the analyst's name", () => {
+    expect(
+      decisionSentence({ ...BASE, action: 'promoted', by: 'alice', reason: 'finding_verdict' }),
+    ).toBe('alice closed the lead on the investigation of a hunt finding.');
+  });
+
+  it('never prints a system actor', () => {
+    expect(decisionSentence({ ...BASE, action: 'dismissed', by: 'system:self-heal' })).toBe(
+      'Dismissed by soc-ai: Expected for this role.',
+    );
+  });
+});

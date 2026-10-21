@@ -109,3 +109,37 @@ async def test_a_bucket_with_no_case_id_is_not_a_link(settings: Settings) -> Non
     whether a case exists, so it must not be reported as one."""
     es = _elastic([_bucket("ev-1", ""), {"key": "ev-2", "first_case": {"hits": {"hits": []}}}])
     assert await case_ids_for_alerts(es, settings, ["ev-1", "ev-2"]) == {}
+
+
+# ── Every case of one alert (dogfood 2026-10-20, V3-N2) ─────────────────────
+
+
+def _hits(*case_ids: str) -> AsyncMock:
+    es = AsyncMock()
+    es.search.return_value = EsSearchResult(
+        total=len(case_ids),
+        took_ms=1,
+        hits=[{"_source": {"so_related": {"caseId": c}}} for c in case_ids],
+    )
+    return es
+
+
+async def test_every_case_of_one_alert_comes_back_earliest_first(settings: Settings) -> None:
+    """The action card names each case the alert is on. The alert of the
+    range was on two cases, and the earliest-only lookup named one."""
+    from soc_ai.webui.case_links import all_case_ids_for_alert
+
+    es = _hits("case-a", "case-b", "case-a", "")
+    assert await all_case_ids_for_alert(es, settings, "ev-1") == ["case-a", "case-b"]
+    call = es.search.call_args
+    assert {"term": {"so_related.fields.soc_id": "ev-1"}} in call.args[1]["bool"]["filter"]
+    assert call.kwargs["sort"] == [{"so_related.createTime": {"order": "asc"}}]
+    assert call.kwargs["require_complete"] is True
+
+
+async def test_no_alert_id_asks_the_grid_nothing(settings: Settings) -> None:
+    from soc_ai.webui.case_links import all_case_ids_for_alert
+
+    es = _hits()
+    assert await all_case_ids_for_alert(es, settings, "") == []
+    es.search.assert_not_awaited()

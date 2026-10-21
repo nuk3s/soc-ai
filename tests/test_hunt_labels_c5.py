@@ -37,7 +37,7 @@ def test_the_alert_only_note_reads_in_three_sentences() -> None:
     assert validator_note(_LEGACY_DASH) == ALERT_ONLY_NOTE
     assert validator_note(_LEGACY_GATE) == ALERT_ONLY_NOTE
     # Negative controls: another note stays as stored, and no note is no note.
-    other = "The citations did not resolve to gathered evidence, so soc-ai lowered the severity."
+    other = "A note that a later build writes stays as stored."
     assert validator_note(other) == other
     assert validator_note(None) is None
     assert "—" not in ALERT_ONLY_NOTE
@@ -123,3 +123,29 @@ def test_a_threat_keeps_the_techniques_its_findings_name(client: TestClient) -> 
     assert body["outcome"] == "threat_found"
     assert body["mitreTechniques"] == ["T1003.006"]
     assert body["findings"][0]["validatorNote"] == ALERT_ONLY_NOTE
+
+
+# R3 STE 25: the citation gate's notes, in one fact per sentence. The gate
+# writes the stored text, and the page rewords it, so every stored row reads
+# the new words.
+@pytest.mark.parametrize(
+    ("stored", "shown"),
+    [
+        (
+            "The citations did not resolve to gathered evidence, so soc-ai lowered the "
+            "severity to low.",
+            "The citations name no gathered evidence. soc-ai lowered the severity to low.",
+        ),
+        (
+            "Citations did not resolve to gathered evidence; severity capped to low.",
+            "The citations name no gathered evidence. soc-ai lowered the severity to low.",
+        ),
+        (
+            "This high-severity finding has no citations, so soc-ai lowered the severity "
+            "to medium.",
+            "This finding cites no evidence. soc-ai lowered the severity from high to medium.",
+        ),
+    ],
+)
+def test_the_citation_notes_read_one_fact_per_sentence(stored: str, shown: str) -> None:
+    assert validator_note(stored) == shown

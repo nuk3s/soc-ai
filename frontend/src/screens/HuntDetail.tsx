@@ -50,8 +50,9 @@ import {
   promoteFinding,
   startHuntConsole,
 } from '../lib/api';
-import { DISMISS_REASONS, DismissLeadForm } from '../components/LeadsStrip';
+import { DISMISS_REASONS, DismissLeadForm, openThreatTitles } from '../components/LeadsStrip';
 import { FlowStrip } from '../components/FlowStrip';
+import { useTabTitle } from '../lib/useTabTitle';
 import { type FlowFinding, type FlowHunt, findingInvestigation, huntFlow } from '../lib/flowSteps';
 import { useDemo } from '../lib/demo';
 import { entityPath } from '../lib/entityPath';
@@ -186,6 +187,14 @@ const LONG_TITLE_CHARS = 140;
 // so a model that genuinely scored zero keeps its 0.00 and a hunt nothing
 // scored shows no number at all, whoever started it.
 const CATALOG_ACTOR = 'hunt-catalog';
+
+/** The hand that started a hunt, in screen words. The meta strip printed the
+ *  raw actor "hunt-catalog". A system actor reads as soc-ai. */
+export function starterWords(startedBy: string): string {
+  if (startedBy === CATALOG_ACTOR) return 'the catalog sweep';
+  if (startedBy.startsWith('system:')) return 'soc-ai';
+  return startedBy;
+}
 
 // A catalog finding's detail arrives as ONE string: the spec's own prose,
 // written and reviewed when the detection was authored, and then this run's
@@ -519,6 +528,34 @@ export function findingsProgressLine(
   });
 }
 
+/** "F2", "F2 and F3", "F2, F3 and F5": finding numbers from 0-based ordinals. */
+function findingNumbers(ordinals: number[]): string {
+  const names = ordinals.map((o) => `F${o + 1}`);
+  if (names.length <= 1) return names.join('');
+  return `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+}
+
+/** The note on a card whose investigation another finding reads too.
+ *
+ *  The range hunt of lead 18 (2026-10-19) linked one investigation to F1 and
+ *  F2, and no card said so: each card read the verdict as its own. Null when
+ *  the investigation is the finding's own. */
+export function sharedInvestigationText(f: HuntFinding, ordinal: number): string | null {
+  const others = (f.sharedWith ?? []).filter((o) => o !== ordinal);
+  const subject = f.investigationSubject ?? null;
+  if (subject != null && subject !== ordinal) {
+    return `Shares the investigation of ${findingNumbers([subject])}.`;
+  }
+  if (others.length > 0) {
+    const verb = others.length === 1 ? 'shares' : 'share';
+    return `${findingNumbers(others)} ${verb} this investigation.`;
+  }
+  if (f.investigationOrigin === 'reused' && subject == null) {
+    return 'Shares the investigation of an earlier hunt on the same subject.';
+  }
+  return null;
+}
+
 // The sentence for a finding with no verdict. The manual control on the card
 // opens an investigation by hand.
 const NO_VERDICT_LINE: Partial<Record<FindingInvestigationStatus, string>> = {
@@ -529,7 +566,29 @@ const NO_VERDICT_LINE: Partial<Record<FindingInvestigationStatus, string>> = {
   over_cap: 'Over the cap, open by hand.',
 };
 
-function FindingInvestigationLine({ f, huntId }: { f: HuntFinding; huntId: string }) {
+function SharedInvestigationNote({ f, ordinal }: { f: HuntFinding; ordinal: number }) {
+  const text = sharedInvestigationText(f, ordinal);
+  if (!text) return null;
+  return (
+    <span
+      data-testid="finding-shared-investigation"
+      className="font-semibold"
+      title="One investigation answers these findings. The findings name the same hosts and cite the same evidence."
+    >
+      {text}
+    </span>
+  );
+}
+
+function FindingInvestigationLine({
+  f,
+  huntId,
+  ordinal,
+}: {
+  f: HuntFinding;
+  huntId: string;
+  ordinal: number;
+}) {
   const status = findingInvestigationStatus(f);
   if (!status) return null;
   const invId = f.investigationId ?? f.investigation?.id ?? null;
@@ -569,6 +628,7 @@ function FindingInvestigationLine({ f, huntId }: { f: HuntFinding; huntId: strin
         >
           {pendingActionsText(pending)}
         </span>
+        <SharedInvestigationNote f={f} ordinal={ordinal} />
         {link}
       </div>
     );
@@ -582,6 +642,7 @@ function FindingInvestigationLine({ f, huntId }: { f: HuntFinding; huntId: strin
       className="mb-1.5 flex flex-wrap items-center gap-2 font-sans text-[11.5px] text-dim"
     >
       <span className={failed ? 'font-semibold text-warn' : undefined}>{line}</span>
+      {status === 'running' && <SharedInvestigationNote f={f} ordinal={ordinal} />}
       {status === 'running' && link}
     </div>
   );
@@ -828,13 +889,13 @@ function FindingCard({
           // point at the switch instead of rendering nothing — the flag is
           // hot-editable, so this is a live path, not a dead end.
           <span className="flex-none font-sans text-[10.5px] text-faint">
-            Detection authoring is off.{' '}
+            Sigma export is off.{' '}
             <Link
               to="/config#triage-automation"
               state={{ highlightKey: 'sigma_authoring_enabled' }}
               className="underline hover:text-dim"
             >
-              Enable it in Config
+              Turn it on in Settings
             </Link>
           </span>
         )}
@@ -851,7 +912,7 @@ function FindingCard({
       </div>
       {/* The investigation the hunt opened for this finding: its verdict, the
           confidence word, the actions that wait and the link. */}
-      {!runFailure && <FindingInvestigationLine f={f} huntId={huntId} />}
+      {!runFailure && <FindingInvestigationLine f={f} huntId={huntId} ordinal={ordinal} />}
       {promoteErr && (
         <div className="mb-1.5 font-mono text-[11px] text-danger">{promoteErr}</div>
       )}
@@ -1133,9 +1194,12 @@ export function runningLine(
 export function LeadDecisionBar({
   lead,
   onChanged,
+  threatTitles = [],
 }: {
   lead: Pick<LeadDetail, 'id' | 'status' | 'dismiss_reasons'>;
   onChanged: () => void;
+  /** The open threat findings of this hunt. The Dismiss form names them. */
+  threatTitles?: string[];
 }) {
   const [dismissing, setDismissing] = useState(false);
   if (lead.status !== 'open' && lead.status !== 'hunting') return null;
@@ -1169,6 +1233,9 @@ export function LeadDecisionBar({
         <DismissLeadForm
           leadId={lead.id}
           reasons={lead.dismiss_reasons?.length ? lead.dismiss_reasons : DISMISS_REASONS}
+          // The page is the hunt, so the form links no hunt.
+          threat={threatTitles.length ? { huntId: null, titles: threatTitles } : null}
+          onCancel={() => setDismissing(false)}
           onDone={() => {
             setDismissing(false);
             onChanged();
@@ -1489,6 +1556,8 @@ export function HuntDetail() {
   useChatScope(
     data && terminal ? { scope: { kind: 'hunt', id: data.id, name: title || data.objective } } : null,
   );
+  // The tab names the hunt. Every tab read "soc·ai: SOC alert triage".
+  useTabTitle(data ? `Hunt: ${title || data.objective}` : 'Hunt');
 
   return (
     <div className="px-[22px] pb-[60px] pt-[18px] font-sans text-text">
@@ -1578,10 +1647,19 @@ export function HuntDetail() {
               <div className="min-w-0 flex-1">
                 {/* verdict-style disposition badge + status — up top, like alerts */}
                 <div className="mb-2.5 flex flex-wrap items-center gap-2.5">
-                  {disp && <DispositionBadge label={disp.label} color={disp.color} />}
+                  {/* A running hunt has no outcome yet. The badge read
+                      "RUNNING" beside the status chip "Running" (R3-D15), so
+                      the status chip alone states it. An investigating hunt
+                      states its counts on the badge, and the chip would
+                      repeat the word. */}
+                  {disp && outcome !== 'running' && (
+                    <DispositionBadge label={disp.label} color={disp.color} />
+                  )}
                   {/* A run whose every query failed is not "Complete". The
                       green chip beside it was the false all-clear. */}
-                  {!(complete && outcome === 'could_not_run') && <StatusPill status={data.status} />}
+                  {!(complete && outcome === 'could_not_run') && outcome !== 'investigating' && (
+                    <StatusPill status={data.status} />
+                  )}
                   <HuntKindBadge kind={data.kind} />
                   {/* The lead that asked for this hunt. The page named the
                       kind and not the lead, so the hunt and the lead were two
@@ -1651,7 +1729,7 @@ export function HuntDetail() {
                 {/* meta strip */}
                 <div className="mt-3 flex flex-wrap items-center gap-x-2 gap-y-1 font-mono text-[12px] text-dim">
                   <span className="text-faint">started by</span>
-                  <span className="text-text-2">{data.startedBy}</span>
+                  <span className="text-text-2">{starterWords(data.startedBy)}</span>
                   <span className="text-ghost">·</span>
                   <span className="text-faint">elapsed</span>
                   <span className="text-text-2">{data.elapsedLabel}</span>
@@ -1773,7 +1851,11 @@ export function HuntDetail() {
 
           {/* The lead decision, on the page that holds the hunt's answer. */}
           {terminal && lead.data && (
-            <LeadDecisionBar lead={lead.data} onChanged={lead.refetch} />
+            <LeadDecisionBar
+              lead={lead.data}
+              onChanged={lead.refetch}
+              threatTitles={openThreatTitles(data.findings)}
+            />
           )}
 
           {/* running banner */}
@@ -1840,7 +1922,16 @@ export function HuntDetail() {
                       className="p-4 text-[13.5px] leading-[1.6] text-text-2"
                       style={{ textWrap: 'pretty' }}
                     >
-                      <Markdown>{data.narrative}</Markdown>
+                      {/* The catalog composer writes plain text, and an index
+                          pattern such as .ds-logs-*-so-* read as emphasis
+                          (R3-D13). A model's narrative is Markdown. */}
+                      {catalog ? (
+                        <p data-testid="hunt-narrative-plain" className="whitespace-pre-line">
+                          {data.narrative}
+                        </p>
+                      ) : (
+                        <Markdown>{data.narrative}</Markdown>
+                      )}
                     </div>
                   </Panel>
                 </CollapsibleSection>
@@ -1942,7 +2033,7 @@ export function HuntDetail() {
                   {data.timeline.length === 0 ? (
                     <div className="px-[15px] py-3.5 text-[12.5px] text-dim">
                       {catalog
-                        ? 'This hunt has no steps. A catalog hunt runs its spec as a single Elasticsearch query.'
+                        ? 'This hunt has no steps. A catalog hunt runs its analytic as one grid query.'
                         : 'No steps yet.'}
                     </div>
                   ) : (

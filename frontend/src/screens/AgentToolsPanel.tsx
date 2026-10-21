@@ -1,9 +1,24 @@
+import { HelpText } from '../components/HelpText';
 import { CollapseChevron } from '../components/Panel';
 import { ErrorState, LoadingState } from '../components/States';
 import { type AgentTool, getAgentTools } from '../lib/api';
 import { useAsync } from '../lib/useAsync';
 
 const CATEGORY_ORDER = ['Query', 'Enrichment', 'Web research', 'PCAP', 'Action'];
+
+/** A tool row. `degraded` names the local feeds a tool reads that are stale
+ * or absent while the tool still has data. `state_reason` says why the row is
+ * degraded, or unavailable for want of a feed (dogfood 2026-10-19, R5-D9). */
+type ToolRow = AgentTool & { degraded?: string[]; state_reason?: string | null };
+
+const GREEN = { color: '#3fb950', borderColor: 'rgba(63,185,80,.3)', background: 'rgba(63,185,80,.07)' };
+const AMBER = { color: '#f5a623', borderColor: 'rgba(245,166,35,.3)', background: 'rgba(245,166,35,.07)' };
+
+function toolStatus(t: ToolRow): { label: string; color: string } {
+  if (!t.available) return { label: 'Unavailable', color: '#8b94a3' };
+  if ((t.degraded ?? []).length > 0) return { label: 'Degraded', color: '#f5a623' };
+  return { label: 'Available', color: '#3fb950' };
+}
 
 /**
  * Agent tools — every capability the triage & chat agent can call, with a short
@@ -19,7 +34,7 @@ export function AgentToolsPanel({
   onToggleCollapse?: () => void;
 } = {}) {
   const { data, loading, error } = useAsync(getAgentTools, []);
-  const tools: AgentTool[] = data?.tools ?? [];
+  const tools: ToolRow[] = data?.tools ?? [];
   const groups = CATEGORY_ORDER.map((cat) => ({
     cat,
     items: tools.filter((t) => t.category === cat),
@@ -38,7 +53,7 @@ export function AgentToolsPanel({
       <div className="mb-3 text-[12.5px] leading-[1.5] text-dim">
         The list holds every tool the triage agent and the chat agent can call. Each row names what
         the tool needs. A grey row is unavailable. The ○ mark names a requirement this deployment
-        does not meet.
+        does not meet. The ! mark names a local feed that is stale or absent.
       </div>
       <div className="overflow-hidden rounded-card border border-border bg-surface-1">
         {loading && !data && <LoadingState />}
@@ -52,9 +67,13 @@ export function AgentToolsPanel({
             <div className="border-b border-border-faint bg-surface-2 px-[15px] py-1.5 text-[10.5px] font-semibold uppercase tracking-[.06em] text-faint">
               {g.cat}
             </div>
-            {g.items.map((t) => (
+            {g.items.map((t) => {
+              const st = toolStatus(t);
+              const degraded = t.degraded ?? [];
+              return (
               <div
                 key={t.name}
+                data-setting-key={`tool:${t.name}`}
                 className="flex items-start gap-3 border-b border-border-faint px-[15px] py-2.5 last:border-0"
                 style={{ opacity: t.available ? 1 : 0.55 }}
               >
@@ -74,32 +93,33 @@ export function AgentToolsPanel({
                   {t.requires.length > 0 && (
                     <div className="mt-1.5 flex flex-wrap gap-1.5">
                       {t.requires.map((r) => {
-                        const ok = !t.missing.includes(r);
+                        const unmet = t.missing.includes(r);
+                        const weak = !unmet && degraded.includes(r);
+                        const mark = unmet ? '○' : weak ? '!' : '✓';
                         return (
                           <span
                             key={r}
                             className="rounded-chip border px-1.5 py-px text-[10px] font-medium"
-                            style={
-                              ok
-                                ? { color: '#3fb950', borderColor: 'rgba(63,185,80,.3)', background: 'rgba(63,185,80,.07)' }
-                                : { color: '#f5a623', borderColor: 'rgba(245,166,35,.3)', background: 'rgba(245,166,35,.07)' }
-                            }
+                            style={unmet || weak ? AMBER : GREEN}
                           >
-                            {ok ? '✓' : '○'} {r}
+                            {mark} {r}
                           </span>
                         );
                       })}
                     </div>
                   )}
+                  {t.state_reason && (
+                    <div data-testid="tool-state-reason" className="mt-1.5 text-[11px] leading-[1.4] text-warn">
+                      <HelpText text={t.state_reason} />
+                    </div>
+                  )}
                 </div>
-                <span
-                  className="flex-none text-[11px] font-semibold"
-                  style={{ color: t.available ? '#3fb950' : '#8b94a3' }}
-                >
-                  {t.available ? 'Available' : 'Unavailable'}
+                <span className="flex-none text-[11px] font-semibold" style={{ color: st.color }}>
+                  {st.label}
                 </span>
               </div>
-            ))}
+              );
+            })}
           </div>
         ))}
       </div>

@@ -17,7 +17,7 @@ describe('a lead starts its own hunt', () => {
     expect(TIP.LEGEND_AUTO_HUNT).toBe('A new lead starts its own hunt.');
     expect(TIP.LEADS_NOTE_AUTO_HUNT).toBe(
       'soc-ai starts a hunt on every new lead, except a shadow lead, a reopened lead and a ' +
-        'lead with no documents. A shadow lead comes from an analytic in trial mode. ' +
+        'lead with no documents. A shadow lead comes from a shadow analytic. ' +
         'You decide what the hunt found.',
     );
     expect(TIP.ACTION_HUNT_NOW).toBe('Start the hunt now. The lead does not wait for auto-hunt.');
@@ -29,7 +29,7 @@ describe('a lead starts its own hunt', () => {
   it('states why auto-hunt leaves one lead alone', () => {
     expect(TIP.CHIP_LEFT_TO_YOU).toBe(
       'Auto-hunt starts no hunt here: a shadow lead, a reopened lead, or a lead with no ' +
-        'documents. A shadow lead comes from an analytic in trial mode. Hunt it by hand.',
+        'documents. A shadow lead comes from a shadow analytic. Hunt it by hand.',
     );
   });
 });
@@ -40,16 +40,16 @@ describe('a hunt is the subject of an investigation', () => {
   it('states what a hunt returns, and that it takes no action', () => {
     expect(TIP.ACTION_HUNT).toBe(
       'Start a hunt on this lead. The hunt returns findings and a narrative. soc-ai investigates ' +
-        'the findings and brings back the verdicts. The hunt takes no action in Security Onion.',
+        'each threat finding and shows the verdicts. The hunt takes no action in Security Onion.',
     );
     expect(TIP.LEAD_ACTIONS_LINE).toBe(
-      'Hunt this lead. The hunt investigates what it finds and brings back the verdicts.',
+      'Hunt this lead. soc-ai investigates each threat finding of the hunt and shows the verdicts.',
     );
     expect(TIP.ACTION_OPEN_INVESTIGATION).toBe(
-      'Open an investigation on this finding. soc-ai investigates the evidence that the finding ' +
-        'cites. The investigation ends in a verdict and recommended actions.',
+      'Open an investigation on this finding. The control starts one run of the model on the ' +
+        'evidence that the finding cites. The run ends in a verdict and recommended actions.',
     );
-    expect(TIP.DEFINE_HUNT).toContain('A hunt is not finished until its findings are investigated.');
+    expect(TIP.DEFINE_HUNT).toContain('soc-ai investigates each threat finding when the hunt ends.');
     // Negative control: no sentence offers "promote" as an act.
     for (const s of [TIP.ACTION_HUNT, TIP.LEAD_ACTIONS_LINE, TIP.DEFINE_LEAD, TIP.DEFINE_HUNT]) {
       expect(s).not.toMatch(/promot/i);

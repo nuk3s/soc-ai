@@ -275,9 +275,11 @@ async def test_timeout_uses_the_specs_clock_not_a_settings_key() -> None:
         await run_chat_turn(state, _spec(prepare=_prepare, finish=finish, timeout_s=0.01))
 
     assert finish.last["status"] == "error"
-    assert "ran out of time" in finish.last["content"]
-    assert "0.01" in finish.last["content"]
-    assert "narrower" in finish.last["content"]
+    assert finish.last["content"] == (
+        "soc-ai stopped after 0.01 seconds with no answer. Ask a narrower question."
+    )
+    # No tool ran, so the row carries no tools footer.
+    assert finish.last["meta"] is None
 
 
 async def test_a_stuck_finish_after_the_answer_is_produced_still_resolves() -> None:
@@ -323,7 +325,7 @@ async def test_a_stuck_finish_after_the_answer_is_produced_still_resolves() -> N
     assert calls[0]["status"] == "done"  # the answer was produced and an attempt made to save it
     assert calls[-1]["status"] == "error"  # the tail's own timeout unstuck the row
     assert "ran out of time saving the reply" in calls[-1]["content"]
-    assert "narrower follow-up" not in calls[-1]["content"]  # not the agent-run's message
+    assert "narrower" not in calls[-1]["content"]  # not the agent-run's message
 
 
 async def test_progress_rides_the_specs_writer() -> None:
@@ -868,3 +870,190 @@ async def test_backstop_fires_when_the_task_is_cancelled() -> None:
     # Wait for the cancellation to drive the backstop, not a fixed sleep.
     await _wait_until(lambda: fired == [1])
     assert fired == [1]
+
+
+# ── a deadline after the tools answered (dogfood 2026-10-19, R1-D6) ─────────
+#
+# The range chat ran 12 event queries for "Did the network sensor stop sending
+# data?", hit the 300 s limit and wrote only "ran out of time". Every result
+# was discarded and the reply had no tools footer. A run that the deadline
+# cuts off after its tools answered now gets a partial answer from those
+# results, from a no-tools pass, with the tools in the meta.
+
+
+def _cut_off_agent(tool_result: str) -> Any:
+    """A real agent whose model calls one tool, then hangs past any deadline."""
+    from pydantic_ai import Agent
+    from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
+    from pydantic_ai.models.function import AgentInfo, FunctionModel
+
+    async def _explore(messages: list[Any], _info: AgentInfo) -> ModelResponse:
+        if len(messages) == 1:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="t_query_events_oql",
+                        args={"query": "event.dataset:zeek.conn"},
+                        tool_call_id="call-1",
+                    )
+                ]
+            )
+        await asyncio.sleep(5)
+        return ModelResponse(parts=[TextPart("too late")])
+
+    agent: Any = Agent(FunctionModel(_explore), output_type=str)
+
+    @agent.tool_plain
+    async def t_query_events_oql(query: str) -> str:
+        return tool_result
+
+    return agent
+
+
+def _synth_model(reply: str | Exception, seen: list[Any]) -> Any:
+    from pydantic_ai.messages import ModelResponse, TextPart
+    from pydantic_ai.models.function import AgentInfo, FunctionModel
+
+    def _synth(messages: list[Any], info: AgentInfo) -> ModelResponse:
+        seen.append((messages, info))
+        if isinstance(reply, Exception):
+            raise reply
+        return ModelResponse(parts=[TextPart(reply)])
+
+    return FunctionModel(_synth)
+
+
+async def test_a_deadline_after_tool_results_writes_a_partial_answer() -> None:
+    from soc_ai.webui import chat_turn
+
+    state = _state()
+    ctx = _ctx(state)
+    finish = _Finish()
+    seen: list[Any] = []
+    progress: list[list[str]] = []
+
+    async def _write(tools: list[str]) -> None:
+        progress.append(tools)
+
+    async def _prepare() -> TurnInputs:
+        return TurnInputs(
+            ctx=ctx,
+            seed_context="Grid: lab",
+            question="Did the sensor stop sending data?",
+            system_prompt=_TEMPLATE,
+            build_agent=lambda _m, _c, _p: _cut_off_agent("zeek.conn: 0 documents on day 3"),
+        )
+
+    with patch.multiple(
+        "soc_ai.webui.chat_turn",
+        build_investigator_model=MagicMock(
+            return_value=_synth_model("The sensor sent no data on day 3.", seen)
+        ),
+        inventory_prompt_block=AsyncMock(return_value=""),
+    ):
+        await run_chat_turn(
+            state,
+            _spec(prepare=_prepare, finish=finish, timeout_s=0.3, set_progress=_write),
+        )
+
+    assert finish.last["status"] == "done"
+    content = finish.last["content"]
+    assert content.startswith(chat_turn.partial_note(0.3, 1))
+    assert "This answer uses only the results of the 1 tool call that finished." in content
+    assert content.endswith("The sensor sent no data on day 3.")
+    meta = finish.last["meta"]
+    assert meta["tools"] == ["t_query_events_oql"]
+    assert meta["partial"] is True
+    # The no-tools pass read the tool result the cut-off run produced, under
+    # the partial instructions.
+    messages, info = seen[0]
+    returns = [
+        p.content
+        for m in messages
+        for p in getattr(m, "parts", [])
+        if type(p).__name__ == "ToolReturnPart"
+    ]
+    assert "zeek.conn: 0 documents on day 3" in returns
+    assert chat_turn.PARTIAL_ANSWER_INSTRUCTIONS in (info.instructions or "")
+    # The panel names the step while the partial answer is written.
+    assert progress[-1][-1] == chat_turn.PARTIAL_ANSWER_STEP
+
+
+async def test_a_failed_partial_pass_keeps_the_tools_on_the_timeout_row() -> None:
+    state = _state()
+    ctx = _ctx(state)
+    finish = _Finish()
+    seen: list[Any] = []
+
+    async def _prepare() -> TurnInputs:
+        return TurnInputs(
+            ctx=ctx,
+            seed_context="Grid: lab",
+            question="q",
+            system_prompt=_TEMPLATE,
+            build_agent=lambda _m, _c, _p: _cut_off_agent("1 document"),
+        )
+
+    with patch.multiple(
+        "soc_ai.webui.chat_turn",
+        build_investigator_model=MagicMock(
+            return_value=_synth_model(RuntimeError("gateway gone"), seen)
+        ),
+        inventory_prompt_block=AsyncMock(return_value=""),
+    ):
+        await run_chat_turn(state, _spec(prepare=_prepare, finish=finish, timeout_s=0.3))
+
+    assert finish.last["status"] == "error"
+    assert finish.last["content"] == (
+        "soc-ai stopped after 0.3 seconds with no answer. Ask a narrower question."
+    )
+    assert finish.last["meta"]["tools"] == ["t_query_events_oql"]
+
+
+async def test_an_unreachable_gateway_reads_as_the_gateway() -> None:
+    """H1 STE 4: the row read "The chat turn failed: Connection error.. Try
+    again." with a doubled period and no word about which part failed."""
+    import httpx
+    import openai
+
+    state = _state()
+    ctx = _ctx(state)
+    finish = _Finish()
+
+    class _Down:
+        async def run(self, _prompt: str) -> _Result:
+            raise openai.APIConnectionError(request=httpx.Request("POST", "http://gateway.test/v1"))
+
+    async def _prepare() -> TurnInputs:
+        return TurnInputs(
+            ctx=ctx,
+            seed_context="Grid: lab",
+            question="q",
+            system_prompt=_TEMPLATE,
+            build_agent=lambda _m, _c, _p: _Down(),
+        )
+
+    with _patched():
+        await run_chat_turn(state, _spec(prepare=_prepare, finish=finish))
+
+    assert finish.last["status"] == "error"
+    assert finish.last["content"] == (
+        "The model did not answer. soc-ai cannot reach the model gateway. Try again later."
+    )
+
+
+async def test_a_failure_while_preparing_is_not_blamed_on_the_gateway() -> None:
+    """A connect failure before the agent runs is a store or grid read. The
+    gateway sentence would send the operator to the wrong dependency."""
+    state = _state()
+    finish = _Finish()
+
+    async def _prepare() -> TurnInputs:
+        raise ConnectionError("Cannot connect to host 192.0.2.53:9200.")
+
+    with _patched():
+        await run_chat_turn(state, _spec(prepare=_prepare, finish=finish))
+
+    assert finish.last["content"] == (
+        "The chat turn failed. Cannot connect to host 192.0.2.53:9200. Try again."
+    )

@@ -131,9 +131,9 @@ describe('Investigations list: run class chip', () => {
     expect(screen.queryByTestId('run-class-INV-1')).toBeNull();
   });
 
-  // Every row or none (dogfood 2026-10-06). A chip on some rows only read as a
-  // property the other rows lack.
-  it('shows a depth chip on every row once one row has a depth', async () => {
+  // A row with no recorded depth shows no chip (dogfood 2026-10-19, STE item
+  // 29). A run in progress shows the pending chip once one row has a depth.
+  it('shows the depth chip only where a depth is recorded or pending', async () => {
     vi.mocked(listInvestigations).mockResolvedValue(
       invList([
         invRow({ id: 'A', alertId: 'ev-a', runClass: 'standard' }),
@@ -147,7 +147,7 @@ describe('Investigations list: run class chip', () => {
       </MemoryRouter>,
     );
     expect(await screen.findByTestId('run-class-A')).toHaveTextContent('Depth: standard');
-    expect(screen.getByTestId('run-class-B')).toHaveTextContent('Depth: not recorded');
+    expect(screen.queryByTestId('run-class-B')).toBeNull();
     expect(screen.getByTestId('run-class-C')).toHaveTextContent('Depth: pending');
   });
 

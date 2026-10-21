@@ -17,8 +17,11 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Link, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { Checkbox } from '../components/Controls';
 import { Definition } from '../components/Definition';
+import { GridGapStrip } from '../components/GridGapStrip';
 import { FLOW_PARAM, FlowLink, HowThisFlowsDrawer } from '../components/HowThisFlows';
 import { ListToolbar } from '../components/ListToolbar';
+import { scrollIntoViewSettled } from '../lib/scrollSettled';
+import { useTabTitle } from '../lib/useTabTitle';
 import { useListSelection } from '../lib/useListSelection';
 import { useSavedViews } from '../lib/useSavedViews';
 import { CollapseChevron, Panel } from '../components/Panel';
@@ -238,9 +241,15 @@ const NO_COUNT_OUTCOMES = new Set(['could_not_run', 'no_answer', 'no_threat_gap'
 /** F4: the cell and the header counted threat findings under the word
  *  Findings, so a hunt with one finding read 0 and one with six read 1. The
  *  cell states both counts. The outcome comes from lib/labels.ts. */
-function findingsCellText(h: HuntRow): string {
+/** Whether the findings cell of a row states a count. The header counts the
+ *  findings of these rows only, so the two agree. */
+function findingsCellCounts(h: HuntRow): boolean {
   const outcome = huntOutcome(h);
-  if (outcome && NO_COUNT_OUTCOMES.has(outcome)) return '—';
+  return !(outcome && NO_COUNT_OUTCOMES.has(outcome));
+}
+
+function findingsCellText(h: HuntRow): string {
+  if (!findingsCellCounts(h)) return '—';
   const total = h.findingCount ?? 0;
   // A row recorded before the threat count existed states the total only.
   const threats = h.threatFindingCount;
@@ -464,7 +473,7 @@ function ScheduledHunts() {
               onClick={() => navigate('/config#triage-automation')}
               className="font-semibold underline decoration-warn/50 underline-offset-2 hover:decoration-warn"
             >
-              Enable them in Config
+              Turn them on in Settings
             </button>
             . Each row below shows its own state. No schedule fires until the global
             switch is on.
@@ -495,10 +504,10 @@ function ScheduledHunts() {
                   onClick={() => { void toggleEnabled(s); }}
                   title={
                     !s.enabled
-                      ? 'The schedule is paused. Click to enable it.'
+                      ? 'The schedule is paused. Select to turn it on.'
                       : masterSwitchOn
-                        ? 'The schedule is enabled. Click to pause it.'
-                        : 'The schedule is enabled. The global switch in Config is off. This schedule does not fire.'
+                        ? 'The schedule is on. Select to pause it.'
+                        : 'The schedule is on. The global switch in Settings is off. This schedule does not fire.'
                   }
                   className={`flex-none rounded-badge border px-[8px] py-[2px] text-[10.5px] font-semibold uppercase tracking-[.04em] ${
                     s.enabled && masterSwitchOn
@@ -653,6 +662,8 @@ export function Hunts() {
   const [rehuntExpanded, setRehuntExpanded] = useState(false);
 
   const [searchParams, setSearchParams] = useSearchParams();
+  // The tab names the page. Every tab read "soc·ai: SOC alert triage".
+  useTabTitle('Hunts');
 
   // Time filter, the same pattern as Alerts and Investigations: a preset
   // (default 7d) or a custom from/to, held in plain component state. Unlike
@@ -666,6 +677,24 @@ export function Hunts() {
     return wanted && /^\d+[mhd]$/.test(wanted) ? wanted : DEFAULT_RANGE;
   });
   const [custom, setCustom] = useState<CustomRange | null>(null);
+  // The chip writes the window back, so a reload and a shared link keep it
+  // (R3-D12). The default window and a custom range are the plain address.
+  // The functional form reads the newest address, so a saved view that sets
+  // the window and the type in one handler keeps both.
+  useEffect(() => {
+    const want = range === DEFAULT_RANGE || range === 'custom' ? null : range;
+    if ((searchParams.get('range') ?? null) === want) return;
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        if (want) next.set('range', want);
+        else next.delete('range');
+        return next;
+      },
+      { replace: true },
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [range]);
   // Kind filter — the list's second facet, and like the window it is applied
   // SERVER-SIDE. It used to slice the page the window fetched, but the backend
   // caps that page at 100 rows, so any kind the newest hundred crowded out
@@ -705,7 +734,9 @@ export function Hunts() {
     // composer. A parameter that describes a block the analyst cannot see is a
     // filter waiting to surprise them on the way back. The flow drawer goes
     // with them: a tab change is a move, and a drawer does not follow a move.
-    for (const key of ['hits', 'leads', 'new', 'objective', FLOW_PARAM]) params.delete(key);
+    for (const key of ['hits', 'leads', 'lead_entity', 'lead_entity_label', 'new', 'objective', FLOW_PARAM]) {
+      params.delete(key);
+    }
     setSearchParams(params, { replace: true });
   };
 
@@ -771,11 +802,12 @@ export function Hunts() {
           ? 'leads'
           : null;
     if (!target) return;
-    // Open it, then scroll to it.
+    // Open it, then scroll to it. The leads above the hits render later and
+    // push the block down, so the scroll follows the block while the page
+    // settles (R1-D12).
     if (target === 'analytic-hits') expandHits();
     else expandLeads();
-    const timer = window.setTimeout(() => document.getElementById(target)?.scrollIntoView(), 0);
-    return () => window.clearTimeout(timer);
+    return scrollIntoViewSettled(target);
   }, [tab, hash, expandHits, expandLeads]);
 
   // `#shadow-hits` is the bell's anchor, and a shadow-hit notice is about one
@@ -891,15 +923,18 @@ export function Hunts() {
             .map((c) => `${mark(c.n)} ${c.label}`)
             .join(', ')
         : '';
+    // The header counts what the cells state. A row that could not run or
+    // found no answer states no count, so its findings are not counted.
     const findings = scopedTotals
       ? scopedTotals.findings
-      : rows.reduce((n, h) => n + (h.findingCount ?? 0), 0);
+      : rows.reduce((n, h) => n + (findingsCellCounts(h) ? (h.findingCount ?? 0) : 0), 0);
     const threats = scopedTotals
       ? scopedTotals.threat_findings
       : rows.reduce((n, h) => n + (h.threatFindingCount ?? h.findingCount ?? 0), 0);
+    // A hunt that investigates its findings has not ended either.
     const running = scopedTotals
       ? scopedTotals.running
-      : rows.filter((h) => h.status === 'running').length;
+      : rows.filter((h) => h.status === 'running' || h.status === 'investigating').length;
     return [
       {
         label: 'Hunts',
@@ -908,7 +943,7 @@ export function Hunts() {
         detail: byKind ? `(${byKind})` : '',
       },
       { label: 'Findings', value: mark(findings), sub: `${mark(threats)} threat`, detail: '' },
-      { label: 'In progress', value: mark(running), sub: 'running now', detail: '' },
+      { label: 'In progress', value: mark(running), sub: 'running or investigating', detail: '' },
     ];
   }, [visible, kind, windowTotals, scopedTotals, pageFloor]);
 
@@ -1076,7 +1111,7 @@ export function Hunts() {
             type="button"
             onClick={() => setTab('analytics')}
             className={tabClass(tab === 'analytics')}
-            title="One analytic is one detection logic. Open this tab to read what each analytic found and to change what it does."
+            title="An analytic is one written detection. Open this tab to read what each analytic found and to change it."
           >
             Analytics
             {analyticsCount && (
@@ -1305,6 +1340,7 @@ export function Hunts() {
           className="mb-3"
         />
       )}
+      <GridGapStrip range={range} custom={custom} className="mb-3" />
       <Panel>
         <div className="overflow-x-auto">
         <div
@@ -1370,7 +1406,7 @@ export function Hunts() {
                 </button>
               }
             >
-              A hunt is a question you ask of the whole network. Select New hunt and describe it.
+              A hunt answers a question about the whole network. Select New hunt and describe it.
               Example: &ldquo;look for hosts beaconing to rare external IPs&rdquo;.
             </EmptyState>
           )

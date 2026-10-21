@@ -82,7 +82,8 @@ export function MaintenancePanel({
               <div className="overflow-hidden rounded-card border border-border bg-surface-1">
                 {backups.length === 0 && (
                   <div className="px-3.5 py-4 text-[12.5px] text-faint">
-                    No backup archive is present. The backup cron job did not run.
+                    soc-ai finds no backup archive in this directory. A backup job that writes to
+                    another directory does not show here.
                   </div>
                 )}
                 {backups.map((b) => (
@@ -97,7 +98,7 @@ export function MaintenancePanel({
                 ))}
               </div>
               <div className="mt-1.5 font-mono text-[10.5px] text-faint">
-                the archives are in {data.backups_dir}
+                The archives are in {data.backups_dir}.
               </div>
             </>
           )}

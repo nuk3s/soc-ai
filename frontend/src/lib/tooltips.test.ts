@@ -110,8 +110,12 @@ describe('the analytic and hit chips', () => {
 
 describe('the filters and the statuses', () => {
   it('states each hit filter on its own chip and all of them together', () => {
-    expect(HIT_FILTER_ALL).toBe('Every hit from the last 7 days.');
-    expect(HIT_FILTER_UNREAD).toBe('Shadow hits nobody has opened or acted on.');
+    expect(HIT_FILTER_ALL).toBe(
+      'Every hit from the last 7 days, and every unread shadow hit of any age.',
+    );
+    expect(HIT_FILTER_UNREAD).toBe(
+      'Every shadow hit that nobody has opened or acted on, at any age.',
+    );
     expect(HIT_FILTER_LIVE).toBe('Hits from live analytics. They count and can form leads.');
     expect(HIT_FILTER_SHADOW).toBe(
       'Hits from analytics in shadow. Recorded and shown. They raise nothing.',
@@ -232,8 +236,10 @@ describe('the lead rule and the weight', () => {
   });
 
   it('says how a sighting ages in plain words on every weight', () => {
-    expect(TIP.SIGHTING_HALF_WEIGHT).toBe('A sighting counts half as much after 48 hours.');
-    expect(TIP.WEIGHT_NOW).toBe('A sighting counts half as much after 48 hours. A new sighting adds weight.');
+    expect(TIP.SIGHTING_HALF_WEIGHT).toBe('An observation counts half as much after 48 hours.');
+    expect(TIP.WEIGHT_NOW).toBe(
+      'An observation counts half as much after 48 hours. A sweep that sees it again adds weight.',
+    );
     expect(TIP.WEIGHT_NOW).not.toMatch(/half-life/);
   });
 });

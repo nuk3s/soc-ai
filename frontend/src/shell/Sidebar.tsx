@@ -21,6 +21,7 @@ import { needsYouPart, useNeedsYouCount } from '../lib/needsYou';
 import type { AboutInfo, Me } from '../lib/types';
 import { ScopeMark, Wordmark } from '../components/Logo';
 import { AccountMenu } from './AccountMenu';
+import { entityNavSection } from './pages';
 import { useSession } from './Session';
 import { useShell } from './ShellContext';
 
@@ -50,7 +51,7 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { to: '/dashboard', label: 'Dashboard', icon: <LayoutDashboard size={16} /> },
       { to: '/alerts', label: 'Alerts', icon: <Triangle size={16} /> },
-      { to: '/investigations', label: 'Investigations', icon: <Search size={16} />, match: ['/investigations', '/investigation', '/entity'] },
+      { to: '/investigations', label: 'Investigations', icon: <Search size={16} />, match: ['/investigations', '/investigation'] },
       // Sits beside Investigations rather than under Config: the dossier is a
       // network view an analyst pivots INTO from an alert, not a settings panel.
       { to: '/hosts', label: 'Hosts', icon: <Server size={16} />, match: ['/hosts'] },
@@ -80,7 +81,11 @@ const NAV_GROUPS: NavGroup[] = [
 
 /** Per-item active check, shared by row styling and the group-level
  * force-expand test below (same rule: exact path or a `match` prefix). */
-function isItemActive(item: NavItem, pathname: string): boolean {
+function isItemActive(item: NavItem, pathname: string, search = ''): boolean {
+  // An entity page lights Hosts for an address or a host name, and no entry
+  // for a user or a domain (dogfood 2026-10-19, R4-D23).
+  const entity = entityNavSection(pathname, search);
+  if (entity !== undefined) return entity === item.to;
   return pathname === item.to || (item.match ?? []).some((m) => pathname.startsWith(m));
 }
 
@@ -114,16 +119,51 @@ function windowWords(range: string): string {
   return `${n} ${unit}${n === 1 ? '' : 's'}`;
 }
 
-function NeedsYouBadge({ badge, failed, loaded }: { badge: NavBadge; failed: boolean; loaded: boolean }) {
-  // Unknown reads as "?", grey. Zero reads as nothing, because a standing "0"
-  // teaches the eye to skip the badge. Nothing shows before the first read.
-  if (!loaded && !failed) return null;
-  const unknown = failed || badge.value === null;
-  if (!unknown && !badge.value) return null;
+/** What a badge shows: null for nothing, "?" for an unknown part, else the
+ *  count. Unknown reads as "?", grey. Zero reads as nothing, because a
+ *  standing "0" teaches the eye to skip the badge. Nothing shows before the
+ *  first read. */
+function badgeState(badge: NavBadge, failed: boolean, loaded: boolean): 'none' | 'unknown' | 'count' {
+  if (!loaded && !failed) return 'none';
+  if (failed || badge.value === null) return 'unknown';
+  return badge.value ? 'count' : 'none';
+}
+
+/** The name of a nav link on the collapsed rail, where the label is not on
+ *  screen. It carries the badge in words. */
+function railLinkName(label: string, badge: NavBadge | undefined, failed: boolean, loaded: boolean): string {
+  if (!badge) return label;
+  const st = badgeState(badge, failed, loaded);
+  if (st === 'unknown') return `${label}, could not count what needs you`;
+  if (st === 'count') return `${label}, ${badge.value} need${badge.value === 1 ? 's' : ''} you`;
+  return label;
+}
+
+function NeedsYouBadge({
+  badge,
+  failed,
+  loaded,
+  compact = false,
+}: {
+  badge: NavBadge;
+  failed: boolean;
+  loaded: boolean;
+  /** The collapsed rail: a small count on the corner of the icon. The rail
+   *  hid every badge (dogfood 2026-10-19, R1-D17). */
+  compact?: boolean;
+}) {
+  const st = badgeState(badge, failed, loaded);
+  if (st === 'none') return null;
+  const unknown = st === 'unknown';
+  const value = badge.value ?? 0;
   return (
     <span
       data-testid={badge.testId}
-      className="rounded-chip border px-1.5 py-px text-[10px] font-semibold tabular-nums"
+      className={
+        compact
+          ? 'absolute right-0.5 top-0 rounded-chip border px-1 text-[9px] font-semibold leading-[14px] tabular-nums'
+          : 'rounded-chip border px-1.5 py-px text-[10px] font-semibold tabular-nums'
+      }
       style={
         unknown
           ? { color: '#8b949e', borderColor: 'rgba(139,148,158,.45)', background: 'rgba(139,148,158,.1)' }
@@ -131,7 +171,7 @@ function NeedsYouBadge({ badge, failed, loaded }: { badge: NavBadge; failed: boo
       }
       title={unknown ? 'Could not read what needs you. Open the page to try again.' : badge.title}
     >
-      {unknown ? '?' : badge.value}
+      {unknown ? '?' : compact && value > 99 ? '99+' : badge.value}
     </span>
   );
 }
@@ -191,7 +231,7 @@ export function Sidebar() {
   // second persisted state.
   const operateGroup = NAV_GROUPS.find((g) => g.collapsible);
   const operateForceExpanded =
-    !!operateGroup && operateGroup.items.some((item) => isItemActive(item, location.pathname));
+    !!operateGroup && operateGroup.items.some((item) => isItemActive(item, location.pathname, location.search));
 
   const toggleOperateCollapsed = () => {
     setOperateStoredCollapsed((c) => {
@@ -249,13 +289,19 @@ export function Sidebar() {
                 ))}
               {(collapsed || !groupCollapsed) &&
                 group.items.map((n) => {
-                  const active = isItemActive(n, location.pathname);
+                  const active = isItemActive(n, location.pathname, location.search);
+                  const badgeFailed = needsYou.failed && !needsYou.data;
+                  const badgeLoaded = needsYou.data !== null;
+                  const railName = collapsed
+                    ? railLinkName(n.label, badges[n.to], badgeFailed, badgeLoaded)
+                    : undefined;
                   return (
                     <NavLink
                       key={n.to}
                       to={n.to}
-                      title={n.label}
-                      className="mb-0.5 flex items-center gap-2.5 rounded-control px-[9px] py-2 text-[13.5px] font-medium hover:bg-surface-3"
+                      title={railName ?? n.label}
+                      aria-label={railName}
+                      className="relative mb-0.5 flex items-center gap-2.5 rounded-control px-[9px] py-2 text-[13.5px] font-medium hover:bg-surface-3"
                       style={{
                         justifyContent: collapsed ? 'center' : 'flex-start',
                         background: active ? '#11161e' : 'transparent',
@@ -269,11 +315,12 @@ export function Sidebar() {
                           {n.label}
                         </span>
                       )}
-                      {!collapsed && badges[n.to] && (
+                      {badges[n.to] && (
                         <NeedsYouBadge
                           badge={badges[n.to]}
-                          failed={needsYou.failed && !needsYou.data}
-                          loaded={needsYou.data !== null}
+                          failed={badgeFailed}
+                          loaded={badgeLoaded}
+                          compact={collapsed}
                         />
                       )}
                       {!collapsed && n.dev && (

@@ -27,6 +27,8 @@ from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
 from soc_ai.store.models import Investigation
 from sqlalchemy.exc import InvalidRequestError
 
+from tests.anchor_grid import install as install_anchor_grid
+
 
 async def _db(settings: Settings):  # type: ignore[no-untyped-def]
     engine = make_engine(settings)
@@ -1049,6 +1051,8 @@ def test_bulk_rehunt_skips_a_non_hunt_row_over_a_promoted_anchor(
     _, laundered_id = _seed_row_over_promoted_anchor(
         kind_client, promoted_kind=promoted_kind, verdict="false_positive"
     )
+    # The anchor is telemetry: the alert feed does not hold it.
+    install_anchor_grid(kind_client, telemetry={"tel-doc-000001"})
 
     async def _seed_plain() -> str:
         maker = kind_client.app.state.db_sessionmaker
@@ -1091,6 +1095,7 @@ def test_request_more_info_refuses_a_non_hunt_row_over_a_promoted_anchor(
     _, laundered_id = _seed_row_over_promoted_anchor(
         kind_client, promoted_kind=promoted_kind, verdict="needs_more_info"
     )
+    install_anchor_grid(kind_client, telemetry={"tel-doc-000001"})
 
     fake_mgr = AsyncMock()
     fake_mgr.start = AsyncMock(return_value="SHOULD-NOT-START")
@@ -1240,6 +1245,7 @@ def test_start_hunt_refuses_when_latest_investigation_for_alert_is_hunt_kind(
             return promoted.id
 
     asyncio.run(_seed())
+    install_anchor_grid(kind_client, telemetry={"tel-doc-000001"})
 
     fake_mgr = AsyncMock()
     fake_mgr.start = AsyncMock(return_value="SHOULD-NOT-START")
@@ -1286,6 +1292,7 @@ def test_start_hunt_hunt_kind_409_includes_running_inv_id_when_running(
             return promoted.id
 
     promoted_id = asyncio.run(_seed())
+    install_anchor_grid(kind_client, telemetry={"tel-doc-000002"})
 
     fake_mgr = AsyncMock()
     fake_mgr.start = AsyncMock(return_value="SHOULD-NOT-START")

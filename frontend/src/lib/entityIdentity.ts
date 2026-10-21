@@ -32,8 +32,11 @@ export function identityLine(data: EntityDetail): string {
   switch (entityType(data)) {
     case 'external_address':
       return `${v} is an external address. It is outside the internal ranges.`;
-    case 'address':
-      return `${v} is an internal address. No machine in the census holds it.`;
+    case 'address': {
+      if (!data.host_key) return `${v} is an internal address. No machine holds it.`;
+      const name = (data.host_name ?? '').trim();
+      return name ? `${v} is an internal address of the machine ${name}.` : `${v} is an internal address of a machine.`;
+    }
     case 'host':
       return `${v} is a host name.`;
     case 'user':
@@ -47,6 +50,21 @@ export function identityLine(data: EntityDetail): string {
     default:
       return `${v} is a name. soc-ai does not know what it names.`;
   }
+}
+
+/** The keys of the machine the counts read, for the line under the counts.
+ *  Empty when no machine holds the value: the counts then read the value
+ *  alone. The machine key is an internal id and stays off the line. */
+export function machineKeysShown(data: EntityDetail): string[] {
+  if (!data.host_key) return [];
+  const keys = (data.machine_keys ?? []).filter((k) => k && k !== data.host_key);
+  return keys.length > 1 ? keys : [];
+}
+
+/** "The counts cover every key of the machine: a, b and c." */
+export function machineKeysLine(keys: readonly string[]): string {
+  const list = keys.length > 1 ? `${keys.slice(0, -1).join(', ')} and ${keys[keys.length - 1]}` : keys.join('');
+  return `The counts cover every key of the machine: ${list}.`;
 }
 
 /** True when nothing soc-ai holds names the value. */

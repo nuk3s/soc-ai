@@ -64,9 +64,9 @@ describe('the Oracle row and the scratch work', () => {
         <Investigation inv={inv} layout="page" />
       </MemoryRouter>,
     );
-    expect(screen.getByText('Model scratch work')).toBeTruthy();
+    expect(screen.getByText('Model notes')).toBeTruthy();
     expect(screen.queryByText('I think the scan is routine.')).toBeNull();
-    fireEvent.click(screen.getByText('Model scratch work'));
+    fireEvent.click(screen.getByText('Model notes'));
     expect(screen.getByTestId('scratch-note').textContent).toContain('not evidence');
     expect(screen.getByText('I think the scan is routine.')).toBeTruthy();
   });

@@ -35,7 +35,7 @@ const COVERAGE: Record<string, { label: string; color: string; title: string }> 
   measured: {
     label: 'measured',
     color: '#3fb950',
-    title: 'A real baseline. A member that is absent from it is a real departure. An empty baseline means this host does none of this.',
+    title: 'The row has a baseline. A member that is absent from it is a departure. An empty baseline means that this host never shows this activity.',
   },
   learning: {
     label: 'learning',
@@ -45,7 +45,7 @@ const COVERAGE: Record<string, { label: string; color: string; title: string }> 
   blind: {
     label: 'blind',
     color: '#d29922',
-    title: 'No plane on this grid can answer this dimension for this host. soc-ai can score no departure here.',
+    title: 'No log source on this grid can measure this dimension for this host. soc-ai can score no departure here.',
   },
   behind_proxy: {
     label: 'behind proxy',
@@ -78,7 +78,7 @@ function CoverageChip({ coverage, days }: { coverage: string; days: number }) {
  *  words sat on the rows with no definition, and "blind" read as an alarm
  *  (dogfood 2026-10-06). */
 export const PROFILE_LEGEND =
-  'measured: a real baseline, and a departure from it counts. ' +
+  'measured: the row has a baseline, and a departure from it counts. ' +
   'learning: under 7 days of history, so nothing scores yet. ' +
   'blind: no log source on the grid can measure this row for this host. It marks a gap in coverage and raises no alarm. ' +
   'stale: the evidence is older than the staleness window.';
@@ -192,9 +192,9 @@ export function noProfileText(profilesEnabled: boolean | null | undefined): stri
     return 'This host has too few events for a profile. The profile sweep builds one from up to 30 days of history. soc-ai scores nothing here until then.';
   }
   if (profilesEnabled === false) {
-    return 'No profile exists for this host. Profiles are off. Turn them on in Config › Behavioural profiles. soc-ai scores nothing here until then.';
+    return 'No profile exists for this host. Profiles are off. Turn them on in Settings → Behavioural profiles. soc-ai scores nothing here until then.';
   }
-  return 'No profile exists for this host yet. The host has too few events, or profiles are off in Config › Behavioural profiles. soc-ai scores nothing here until then.';
+  return 'No profile exists for this host yet. The host has too few events, or profiles are off in Settings → Behavioural profiles. soc-ai scores nothing here until then.';
 }
 
 export function BehaviouralProfile({

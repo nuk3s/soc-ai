@@ -49,7 +49,7 @@ async def check_for_update(settings: Any) -> dict[str, Any]:
             "enabled": False,
             "current_version": current,
             "update_available": False,
-            "detail": "update check is off (no outbound calls)",
+            "detail": "The update check is off. soc-ai makes no outbound call.",
         }
     # Enabled but replaying fixtures: report a clean, no-egress answer rather than
     # letting the demo guard turn a working demo into a "could not reach GitHub".
@@ -89,7 +89,7 @@ async def check_for_update(settings: Any) -> dict[str, Any]:
                 "current_version": current,
                 "latest_version": latest,
                 "update_available": False,
-                "detail": f"unrecognized release tag '{latest}'",
+                "detail": f"soc-ai does not recognize the release tag '{latest}'.",
             }
         return {
             "enabled": True,
@@ -106,5 +106,5 @@ async def check_for_update(settings: Any) -> dict[str, Any]:
             "ok": False,
             "current_version": current,
             "update_available": False,
-            "detail": f"could not reach GitHub ({type(exc).__name__})",
+            "detail": f"soc-ai could not reach GitHub: {type(exc).__name__}.",
         }

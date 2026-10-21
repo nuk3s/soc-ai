@@ -404,9 +404,9 @@ async def test_probe_es_with_the_opt_out_off_is_unchanged(settings_kratos: Setti
         "ok": False,
         "kind": "partial",
         "detail": (
-            "demo-grid, ES 8.14.3. Reading logs-*: the grid read only 2 of 4 shards. "
-            "These results are incomplete. A retry does not help. To find the cause, "
-            "check Elasticsearch shard health."
+            "demo-grid, ES 8.14.3. Reading logs-*: Elasticsearch did not answer for "
+            "2 of 4 shards. The results are incomplete. Check the shard health in "
+            "Elasticsearch."
         ),
     }
 
@@ -474,7 +474,7 @@ async def test_probe_es_a_search_timeout_is_not_blamed_on_shard_health(
     assert "4 of 4 shards" not in detail
     assert "shard health" not in detail
     assert "timed out" in detail
-    assert "retry" in detail
+    assert "retry" in detail.lower()
     assert "narrow" in detail
 
 
@@ -482,8 +482,8 @@ async def test_probe_es_failed_shards_still_send_the_admin_to_shard_health() -> 
     """The control: when shards really did fail, retrying is exactly what will
     not help, and the shard count is the fact the admin needs."""
     detail = (await probes.probe_es(_GridStub(search_error=_partial_read())))["detail"]
-    assert "read only 2 of 4 shards" in detail
-    assert "check Elasticsearch shard health" in detail
+    assert "did not answer for 2 of 4 shards" in detail
+    assert "Check the shard health in Elasticsearch" in detail
 
 
 async def test_probe_es_a_read_that_lost_shards_and_timed_out_keeps_both_facts() -> None:
@@ -495,9 +495,9 @@ async def test_probe_es_a_read_that_lost_shards_and_timed_out_keeps_both_facts()
         timed_out=True,
     )
     detail = (await probes.probe_es(_GridStub(search_error=exc)))["detail"]
-    assert "read only 3 of 4 shards" in detail
+    assert "did not answer for 1 of 4 shards" in detail
     assert "timed out" in detail
-    assert "check Elasticsearch shard health" in detail
+    assert "Check the shard health in Elasticsearch" in detail
 
 
 async def test_probe_es_classifies_a_refused_connection() -> None:

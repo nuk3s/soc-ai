@@ -161,6 +161,29 @@ async def test_a_silent_plane_beside_a_live_one_fires_and_cites_both() -> None:
     assert "The network flows of app-01 held" in hit.reason
 
 
+async def test_a_silence_inside_a_grid_gap_is_unknown_and_writes_no_hit() -> None:
+    """The plant lies in a recorded grid gap. The hours are unknown, so nothing fires.
+
+    After the range outage of 2026-10-15 the agents back-filled their host
+    planes and the sensor did not. Every machine read as a silent flow plane
+    beside a live host plane (dogfood 2026-10-19, R1-D3).
+    """
+    grid = PlaneGrid(hosts=_estate(), clock=ANCHOR)
+    ctx = DetectorContext(
+        elastic=grid,
+        settings=_Settings(),
+        db=None,
+        now=ANCHOR,
+        tz="UTC",
+        cidrs=CIDRS,
+        gaps=(PLANT,),
+    )
+    run = await detect(CrossPlaneSilenceParams(), ctx)
+    a = _state(run, "app-01")
+    assert a.state == "measured"
+    assert a.hits == ()
+
+
 async def test_a_machine_whose_every_plane_fell_is_quiet() -> None:
     """The twin: the machine is off. No plane is live, so nothing fires."""
     run, _grid = await _detect(_estate())

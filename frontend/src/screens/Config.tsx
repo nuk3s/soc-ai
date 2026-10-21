@@ -1,13 +1,15 @@
-import { ChevronRight, Key, ShieldAlert, Users } from 'lucide-react';
+import { ChevronRight, Copy, Key, ShieldAlert, Users } from 'lucide-react';
 import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
-import { useLocation, useNavigate } from 'react-router-dom';
+import { Link, useLocation, useNavigate } from 'react-router-dom';
 import type { ReactNode } from 'react';
 import { ApplyBadge, RoleChip, SourceBadge, StatusTag } from '../components/Badges';
 import { NumberField, Select, Toggle } from '../components/Controls';
 import { ManagedList } from '../components/ManagedList';
 import { SectionTitle } from '../components/Panel';
 import { DemoDisabledState, ErrorState, LoadingInline, LoadingState, Spinner } from '../components/States';
-import { DoctorList, warnRows } from '../components/DoctorList';
+import { DoctorList, type DoctorFilter, statusCounts } from '../components/DoctorList';
+import { HelpText, sectionIdsFromLayout } from '../components/HelpText';
+import { ChangePasswordModal } from '../shell/ChangePasswordModal';
 import { AgentToolsPanel } from './AgentToolsPanel';
 import { ApiKeysPanel } from './ApiKeysPanel';
 import { DataSourcesPanel } from './DataSourcesPanel';
@@ -19,18 +21,21 @@ import { DetectionTuningPanel } from './DetectionTuningPanel';
 import { AboutPanel } from './AboutPanel';
 import { MaintenancePanel } from './MaintenancePanel';
 import { RunbooksPanel } from './RunbooksPanel';
-import { addInternalIdentifier, createUser, dismissIdentifier, getConfig, getDiscoveryScan, getGatewayModels, getInternalIdentifiers, getModelBattery, getModelFitness, listDangerSettings, listUsers, mintToken, reembedRunbooks, removeIdentifier, resetUserPassword, revokeToken, saveDangerSetting, setIdentifierActive, setSetting, setUserRole, startModelBattery, startDiscoveryScan, testConnection, toggleUserDisabled, verifyAuditChain } from '../lib/api';
-import { ApiError, isRequestTimeout } from '../lib/api';
+import { addInternalIdentifier, clearSetting, createUser, dismissIdentifier, getAgentTools, getApiKeys, getConfig, getDataSources, getDiscoveryScan, getGatewayModels, getInternalIdentifiers, getMe, getModelBattery, getModelFitness, listDangerSettings, listUsers, mintToken, reembedRunbooks, removeIdentifier, resetUserPassword, revokeToken, saveDangerSetting, setIdentifierActive, setSetting, setUserRole, startModelBattery, startDiscoveryScan, testConnection, toggleUserDisabled, verifyAuditChain } from '../lib/api';
+import { AUDIT_VERIFY_DAYS, ApiError, isRequestTimeout } from '../lib/api';
 import type { BatteryRecommendation, ModelBatteryStatus } from '../lib/api';
 import type { IdentifierKind, InternalIdentifiers, ModelFitness, RagReembedResult } from '../lib/api';
 import { demoBlocked, useDemo } from '../lib/demo';
 import { plural } from '../lib/plural';
 import { SHOWN_ERRORS, sweepErrorList } from '../lib/sweepErrors';
 import { useAsync } from '../lib/useAsync';
-import type { AdminUser, AuditChainVerifyResult, ConnTestResult, DangerSetting, Setting, SettingGroup } from '../lib/types';
+import { absTime } from '../lib/timeRange';
+import { useToast } from '../lib/toast';
+import type { AdminUser, AuditChainVerifyResult, ConnTestResult, DangerSetting, Me, Setting, SettingGroup } from '../lib/types';
 import { ConfigNav, ConfigNavSelect } from './ConfigNav';
 import {
   type ConfigParent,
+  PANELS,
   SUB_ANCHOR_HOSTS,
   buildConfigLayout,
   keyToDay1,
@@ -84,7 +89,7 @@ function CollapsibleConfigSection({
   // (a Scan-now / Mint-token button) sits OUTSIDE the toggle button so we never
   // nest a <button> inside a <button> (invalid HTML).
   return (
-    <div id={id} className={className ?? 'mb-[22px] scroll-mt-6'}>
+    <div id={id} className={className ?? 'mb-[22px] scroll-mt-16'}>
       <SectionTitle
         right={
           <>
@@ -254,7 +259,7 @@ function ModelFitnessChip({
         <span
           data-testid="fitness-staged"
           className="text-[11px] text-faint"
-          title="The fitness check grades the analyst model that is running. Apply the model change first. Then check fitness."
+          title="The fitness check grades the investigation model that is running. Apply the model change first. Then check fitness."
         >
           Apply the change to check fitness
         </span>
@@ -317,6 +322,38 @@ function ModelFitnessChip({
   );
 }
 
+/** The connection settings each Test can try before a save (H1-I2). The
+ *  server holds the same map and refuses a key of another target. */
+const CONN_TEST_TARGET: Record<string, 'es' | 'llm'> = {
+  litellm_base_url: 'llm',
+  litellm_api_key: 'llm',
+  litellm_verify_ssl: 'llm',
+  es_hosts: 'es',
+  es_username: 'es',
+  es_password: 'es',
+  es_verify_ssl: 'es',
+};
+
+/** Search words for a setting whose help does not name a control in its row.
+ *  The model battery and the fitness check sit in the Investigation model row. */
+const SETTING_KEYWORDS: Record<string, string> = {
+  analyst_model: 'model battery fitness check investigation analyst',
+};
+
+/** A setting value in a sentence: on/off for a switch, "empty" for "". */
+function showValue(v: boolean | number | string | null | undefined): string {
+  if (typeof v === 'boolean') return v ? 'on' : 'off';
+  if (v === null || v === undefined || v === '') return 'empty';
+  return String(v);
+}
+
+/** The Diagnostics header chips, FAIL first. */
+const DOCTOR_CHIPS: { grade: 'FAIL' | 'WARN' | 'INFO'; color: string; border: string; wash: string }[] = [
+  { grade: 'FAIL', color: '#f04438', border: 'rgba(240,68,56,.45)', wash: 'rgba(240,68,56,.14)' },
+  { grade: 'WARN', color: '#f5a623', border: 'rgba(245,166,35,.45)', wash: 'rgba(245,166,35,.16)' },
+  { grade: 'INFO', color: '#8b949e', border: 'rgba(139,148,158,.45)', wash: 'rgba(139,148,158,.14)' },
+];
+
 /** How long an "Applied N changes." notice stays on the sticky bar. */
 const APPLY_NOTICE_MS = 8000;
 
@@ -327,6 +364,9 @@ function _batteryAgeDays(iso: string | null): number | null {
   if (!Number.isFinite(ms) || ms < 0) return null;
   return ms / 86_400_000;
 }
+
+/** Calls per configuration in a battery run (model_probe.run_battery n=2). */
+const BATTERY_CALLS_PER_CONFIG = 2;
 
 /** A battery result older than this reads amber: the model behind the
  *  gateway may have changed since it was measured. */
@@ -377,8 +417,47 @@ function ModelBatteryPanel({
   const ageDays = _batteryAgeDays(battery?.stored_at ?? null);
   const age = battery?.stored_at ? _batteryAge(battery.stored_at) : '';
   const oldResult = ageDays != null && ageDays > BATTERY_STALE_DAYS;
+  // A battery costs minutes of model calls and has no cancel, so a start asks
+  // first (dogfood 2026-10-19, R5-I9).
+  const [confirm, setConfirm] = useState<'battery' | 'all' | null>(null);
+  const configs = battery?.total ?? 4;
+  const calls = configs * BATTERY_CALLS_PER_CONFIG;
   return (
     <div className="flex flex-col items-end gap-1">
+      {confirm && (
+        <div
+          role="group"
+          aria-label="Confirm the model battery"
+          data-testid="battery-confirm"
+          onKeyDown={(e) => { if (e.key === 'Escape') setConfirm(null); }}
+          className="flex max-w-[420px] flex-wrap items-center justify-end gap-2 rounded border border-border bg-surface-2 px-2 py-1.5"
+        >
+          <span className="text-[11px] leading-[1.45] text-text-2">
+            The model battery makes {calls} calls to the model: {configs} configurations, {BATTERY_CALLS_PER_CONFIG}{' '}
+            calls each. It takes minutes on a slow backend. A battery has no cancel.
+          </span>
+          <button
+            type="button"
+            autoFocus
+            onClick={() => {
+              const which = confirm;
+              setConfirm(null);
+              if (which === 'all') onRunAll();
+              else onRun();
+            }}
+            className="rounded border border-accent px-2 py-0.5 text-[11px] font-semibold text-accent hover:bg-accent/10"
+          >
+            Start the battery
+          </button>
+          <button
+            type="button"
+            onClick={() => setConfirm(null)}
+            className="rounded border border-border px-2 py-0.5 text-[11px] font-medium text-dim hover:text-text"
+          >
+            Cancel
+          </button>
+        </div>
+      )}
       <div className="flex items-center gap-2">
         {running && (
           <span className="text-[11px] text-faint">
@@ -392,8 +471,8 @@ function ModelBatteryPanel({
         <button
           type="button"
           className="rounded border border-border bg-surface-2 px-2 py-0.5 text-[11px] font-medium hover:bg-surface-3 transition-colors disabled:opacity-50"
-          onClick={onRun}
-          disabled={running || demo || staged}
+          onClick={() => setConfirm('battery')}
+          disabled={running || demo || staged || confirm !== null}
           title={
             demo
               ? 'The demo blocks this action. The demo has no model egress.'
@@ -407,8 +486,8 @@ function ModelBatteryPanel({
         <button
           type="button"
           className="rounded border border-border bg-surface-2 px-2 py-0.5 text-[11px] font-medium hover:bg-surface-3 transition-colors disabled:opacity-50"
-          onClick={onRunAll}
-          disabled={running || demo || staged}
+          onClick={() => setConfirm('all')}
+          disabled={running || demo || staged || confirm !== null}
           title={
             demo
               ? 'The demo blocks this action. The demo has no model egress.'
@@ -425,13 +504,23 @@ function ModelBatteryPanel({
           <tbody>
             {result.configs.map((c) => {
               const label = c.tool_choice_required ? `${c.output_mode}+required` : c.output_mode;
+              // Why a call failed. "tool 0/2 13.1s" said nothing while the
+              // API held "Connection error." (dogfood 2026-10-19, H1-D7).
+              const reasons = [...new Set((c.failures ?? []).filter(Boolean))];
               return (
                 <tr key={label}>
-                  <td className="pr-3 font-mono">{label}</td>
-                  <td className="pr-3 text-right">
+                  <td className="pr-3 align-top font-mono">{label}</td>
+                  <td className="pr-3 text-right align-top">
                     {c.ok}/{c.n}
                   </td>
-                  <td className="text-right">{c.elapsed_s.toFixed(1)}s</td>
+                  <td className="pr-3 text-right align-top">{c.elapsed_s.toFixed(1)}s</td>
+                  <td
+                    data-testid={`battery-failure-${label}`}
+                    className="max-w-[220px] break-words align-top text-danger"
+                    title={reasons.join('\n')}
+                  >
+                    {c.ok < c.n && reasons.length > 0 ? reasons[0] : ''}
+                  </td>
                 </tr>
               );
             })}
@@ -452,7 +541,7 @@ function ModelBatteryPanel({
       )}
       {!running && result?.recommendation && recApplied === 'staged' && (
         <span data-testid="battery-match" className="text-[11px] text-faint" title={result.recommendation.reason}>
-          The {result.recommendation.config} recommendation is staged, not applied. Select Apply changes below to save it.
+          The {result.recommendation.config} recommendation is staged. It is not saved yet. Select Apply changes below to save it.
         </span>
       )}
       {!running && result?.recommendation && recApplied === 'none' && (
@@ -511,9 +600,9 @@ export function Config() {
   }, [collapsed]);
   const toggleSection = (title: string) =>
     setCollapsed((c) => ({ ...c, [title]: !c[title] }));
-  // The WARN rows of the doctor list, and whether the list shows only them.
-  const [doctorWarnings, setDoctorWarnings] = useState(0);
-  const [doctorWarnOnly, setDoctorWarnOnly] = useState(false);
+  // The doctor rows per grade, and the grade the list shows (null = all).
+  const [doctorCounts, setDoctorCounts] = useState<Record<string, number>>({});
+  const [doctorFilter, setDoctorFilter] = useState<DoctorFilter>(null);
   // Advanced folds (day1 tier, Wave 2) don't have ONE fixed default: a mixed
   // section (some day1 items, some not) starts collapsed, but an all-advanced
   // section starts OPEN (see advCollapsed in renderGroup below — the single
@@ -540,7 +629,7 @@ export function Config() {
     setDangerError('');
     listDangerSettings()
       .then((r) => { if (active) setDangerSettings(r); })
-      .catch(() => { if (active) setDangerError('The Danger Zone is not available. Only an admin can read it.'); })
+      .catch(() => { if (active) setDangerError('The connection settings are not available. Only an admin can read them.'); })
       .finally(() => { if (active) setDangerLoading(false); });
     return () => { active = false; };
   }, []);
@@ -578,6 +667,8 @@ export function Config() {
     setFormNonce((n) => n + 1);
   }, [data]);
   const [applying, setApplying] = useState(false);
+  // The key whose "Use the default" request is in flight.
+  const [clearing, setClearing] = useState<string | null>(null);
   // Per-key apply errors, surfaced inline beside the offending control.
   const [applyErrors, setApplyErrors] = useState<Record<string, string>>({});
   // Sticky-bar result after an Apply: how many saved, and whether any need a restart.
@@ -776,6 +867,31 @@ export function Config() {
   const dirtyKeys = Object.keys(staged);
   const isDirty = dirtyKeys.length > 0;
 
+  const { toast } = useToast();
+  // The signed-in user: which Users row is "you", whether the console has a
+  // user at all (a token needs one), and whether the generated admin password
+  // is still in use. null = not known; nothing is hidden on null.
+  const [me, setMe] = useState<Me | null>(null);
+  useEffect(() => {
+    let live = true;
+    getMe()
+      .then((m) => { if (live) setMe(m); })
+      .catch(() => { if (live) setMe(null); });
+    return () => { live = false; };
+  }, [nonce]);
+  const [pwModalOpen, setPwModalOpen] = useState(false);
+  const [confirmResetId, setConfirmResetId] = useState<number | null>(null);
+  const [tokenName, setTokenName] = useState('');
+  const [tokenNameError, setTokenNameError] = useState('');
+  const [confirmRevokeId, setConfirmRevokeId] = useState<number | null>(null);
+  const [mintedName, setMintedName] = useState('');
+  const copyText = (text: string, what: string) => {
+    void navigator.clipboard
+      ?.writeText(text)
+      .then(() => toast({ tone: 'success', message: `soc-ai copied the ${what}.` }))
+      .catch(() => toast({ tone: 'danger', message: `The browser did not copy the ${what}. Select the text and copy it.` }));
+  };
+
   const [minted, setMinted] = useState('');
   // The API-tokens section has no error strip of its own; this carries the demo
   // note (mint/revoke are blocked in the read-only demo) via the section's own
@@ -813,6 +929,8 @@ export function Config() {
   const [dangerSaving, setDangerSaving] = useState(false);
   const [dangerSaveMsg, setDangerSaveMsg] = useState<{ key: string; msg: string; ok: boolean } | null>(null);
   const [connTestResults, setConnTestResults] = useState<Record<string, ConnTestResult & { loading?: boolean }>>({});
+  // The Test result of an edited connection value, before a save (H1-I2).
+  const [editTest, setEditTest] = useState<(ConnTestResult & { loading?: boolean; key: string }) | null>(null);
   // Audit chain verify — its own state, not folded into connTestResults: the
   // endpoint is NOT fail-soft (raises rather than answering on an unreachable
   // or partial read), so a request failure and an `ok:false` (tampered)
@@ -899,6 +1017,9 @@ export function Config() {
   // have a Setting/SearchHit in hand to read `.day1` off directly; the
   // palette hand-off effect only has the bare key, so it needs this map.
   const keyIsDay1 = useMemo(() => keyToDay1(layout), [layout]);
+  // Section title -> id, so a "Settings > <Section>" reference in a help text
+  // links the live layout, a new server section included.
+  const sectionIds = useMemo(() => sectionIdsFromLayout(layout), [layout]);
 
   // Selection: nav click > the URL's hash > last-visited (localStorage) > the
   // first section. Stored so "come back to where I was tuning" survives.
@@ -944,10 +1065,32 @@ export function Config() {
   const [highlightKey, setHighlightKey] = useState<string | null>(null);
   useEffect(() => {
     if (!highlightKey) return;
-    const el = document.querySelector(`[data-setting-key="${highlightKey}"]`);
-    (el as HTMLElement | null)?.scrollIntoView?.({ behavior: 'auto', block: 'center' });
+    // A panel row (an agent tool, a data source, an API key) renders after
+    // its own fetch, so the first look can miss it. Look again a few times.
+    let marked: HTMLElement | null = null;
+    const timers: ReturnType<typeof setTimeout>[] = [];
+    const find = () => {
+      const el = document.querySelector<HTMLElement>(`[data-setting-key="${CSS.escape(highlightKey)}"]`);
+      if (!el || marked) return;
+      el.scrollIntoView?.({ behavior: 'auto', block: 'center' });
+      // A settings row draws its own ring. A panel row gets an outline here.
+      if (!el.hasAttribute('data-highlighted')) {
+        marked = el;
+        el.style.outline = '2px solid rgb(var(--accent) / 0.7)';
+        el.style.outlineOffset = '-2px';
+      }
+    };
+    find();
+    for (const ms of [250, 800]) timers.push(setTimeout(find, ms));
     const t = setTimeout(() => setHighlightKey(null), 2500);
-    return () => clearTimeout(t);
+    return () => {
+      clearTimeout(t);
+      timers.forEach(clearTimeout);
+      if (marked) {
+        marked.style.outline = '';
+        marked.style.outlineOffset = '';
+      }
+    };
   }, [highlightKey, effectiveId]);
 
   // ── Settings search (spans every section) ──────────────────────────────────
@@ -1043,7 +1186,8 @@ export function Config() {
   // section name, and the Danger Zone settings. All already client-side — the
   // page had 275 controls and no way to find one (dogfood 2026-08-01).
   interface SearchHit {
-    kind: 'setting' | 'section';
+    /** 'row' = a row of a panel: an agent tool, a data source, an API key. */
+    kind: 'setting' | 'section' | 'row';
     settingKey?: string;
     label: string;
     haystack: string;
@@ -1056,14 +1200,16 @@ export function Config() {
      * section's Advanced fold (see resultsPane's onClick below). */
     day1?: boolean;
   }
+  const [panelHits, setPanelHits] = useState<SearchHit[] | null>(null);
   const searchIndex = useMemo<SearchHit[]>(() => {
     const out: SearchHit[] = [];
     for (const p of layout) {
       for (const c of p.children) {
+        const keywords = c.kind === 'panel' ? (PANELS.find((d) => d.id === c.id)?.keywords ?? '') : '';
         out.push({
           kind: 'section',
           label: c.label,
-          haystack: `${c.label} ${p.label}`.toLowerCase(),
+          haystack: `${c.label} ${p.label} ${keywords}`.toLowerCase(),
           sectionId: c.id,
           sectionLabel: c.label,
           parent: p.label,
@@ -1074,7 +1220,7 @@ export function Config() {
               kind: 'setting',
               settingKey: it.key,
               label: it.label || it.key,
-              haystack: `${it.label} ${it.key} ${it.help}`.toLowerCase(),
+              haystack: `${it.label} ${it.key} ${it.help} ${SETTING_KEYWORDS[it.key] ?? ''}`.toLowerCase(),
               sectionId: c.id,
               sectionLabel: c.label,
               parent: p.label,
@@ -1091,12 +1237,67 @@ export function Config() {
         label: ds.label,
         haystack: `${ds.label} ${ds.key}`.toLowerCase(),
         sectionId: 'danger-zone',
-        sectionLabel: 'Danger Zone',
+        sectionLabel: 'Connections',
         parent: 'System',
       });
     }
-    return out;
-  }, [layout, dangerSettings]);
+    return out.concat(panelHits ?? []);
+  }, [layout, dangerSettings, panelHits]);
+
+  // The rows of the panels that fetch their own data, for the search. Read on
+  // the first search only, so a page view costs no extra request.
+  useEffect(() => {
+    if (!searching || panelHits !== null) return;
+    let live = true;
+    const parentOf = (id: string) => PANELS.find((d) => d.id === id)?.parent ?? 'Settings';
+    void Promise.allSettled([getAgentTools(), getDataSources(), getApiKeys()]).then(
+      ([tools, sources, keys]) => {
+        if (!live) return;
+        const rows: SearchHit[] = [];
+        if (tools.status === 'fulfilled') {
+          for (const t of tools.value.tools ?? []) {
+            rows.push({
+              kind: 'row',
+              settingKey: `tool:${t.name}`,
+              label: t.name,
+              haystack: `${t.name} ${t.category} ${t.description}`.toLowerCase(),
+              sectionId: 'agent-tools',
+              sectionLabel: 'Agent tools',
+              parent: parentOf('agent-tools'),
+            });
+          }
+        }
+        if (sources.status === 'fulfilled') {
+          for (const d of sources.value.sources ?? []) {
+            rows.push({
+              kind: 'row',
+              settingKey: `source:${d.id}`,
+              label: d.name,
+              haystack: `${d.name} ${d.id} ${d.category} ${d.note}`.toLowerCase(),
+              sectionId: 'data-sources',
+              sectionLabel: 'Data sources',
+              parent: parentOf('data-sources'),
+            });
+          }
+        }
+        if (keys.status === 'fulfilled') {
+          for (const k of keys.value ?? []) {
+            rows.push({
+              kind: 'row',
+              settingKey: `apikey:${k.key}`,
+              label: k.label,
+              haystack: `${k.label} ${k.key} ${k.help}`.toLowerCase(),
+              sectionId: 'api-keys',
+              sectionLabel: 'API keys',
+              parent: parentOf('api-keys'),
+            });
+          }
+        }
+        setPanelHits(rows);
+      },
+    );
+    return () => { live = false; };
+  }, [searching, panelHits]);
 
   // Every whitespace-separated term must match; ranked label-match, then
   // key/help match, sections after settings within a tier.
@@ -1151,7 +1352,7 @@ export function Config() {
     try {
       const start = await startDiscoveryScan();
       if (start.note === 'discovery disabled') {
-        setIdentError('Discovery is disabled. Enable discovery in settings to run a scan.');
+        setIdentError('Discovery is off. Turn on discovery in Settings to run a scan.');
         setScanning(false);
         return;
       }
@@ -1305,6 +1506,38 @@ export function Config() {
     setApplying(false);
   };
 
+  // "Use the default": drop the console value of one setting. The console
+  // had no way back to the .env value or the default (dogfood 2026-10-19,
+  // R5-D8, R5-I1).
+  const returnToBase = (s: Setting) => {
+    const blocked = demoBlocked(demo);
+    if (blocked) { setApplyResult({ ok: false, msg: blocked }); return; } // demo: no doomed write
+    setClearing(s.key);
+    const what = s.base_source === 'env' ? 'the .env value' : 'the default';
+    const label = s.label || s.key;
+    clearSetting(s.key)
+      .then((r) => {
+        setApplyResult({
+          ok: true,
+          msg: r.restart_required
+            ? `${label} returns to ${what} at the next restart of soc-ai.`
+            : `${label} now uses ${what}.`,
+        });
+        setStaged((st) => {
+          if (!(s.key in st)) return st;
+          const next = { ...st };
+          delete next[s.key];
+          return next;
+        });
+        remountOnData.current = true;
+        setNonce((n) => n + 1);
+      })
+      .catch((e: unknown) =>
+        setApplyErrors((er) => ({ ...er, [s.key]: e instanceof Error ? e.message : 'soc-ai could not remove the value.' })),
+      )
+      .finally(() => setClearing(null));
+  };
+
   const renderControl = (s: Setting) => {
     const serverStr = String(s.value);
     const err = applyErrors[s.key];
@@ -1314,7 +1547,7 @@ export function Config() {
         <Toggle
           on={toggleValue(s)}
           onChange={(next) => stage(s.key, String(next), serverStr)}
-          label={s.key}
+          label={s.label || s.key}
         />
       );
     } else if (s.type === 'number') {
@@ -1331,6 +1564,7 @@ export function Config() {
             key={`${s.key}-${formNonce}`}
             value={current}
             bounds={s.bounds}
+            label={s.label || s.key}
             onChange={(v) => stage(s.key, String(v), serverStr)}
           />
           {isAutoAckThreshold && !thresholdEnabled && (
@@ -1343,6 +1577,7 @@ export function Config() {
         <Select
           value={stagedStr(s.key, serverStr)}
           options={s.options}
+          label={s.label || s.key}
           onChange={(v) => stage(s.key, v, serverStr)}
         />
       );
@@ -1469,6 +1704,7 @@ export function Config() {
         <input
           key={`${s.key}-${formNonce}`}
           defaultValue={stagedStr(s.key, serverStr)}
+          aria-label={s.label || s.key}
           onChange={(e) => stage(s.key, e.target.value, serverStr)}
           className="w-[200px] rounded-control border border-border-input bg-bg px-3 py-1.5 font-mono text-[12.5px] text-text outline-none focus:border-accent"
         />
@@ -1512,7 +1748,7 @@ export function Config() {
       const res = await saveDangerSetting(key, dangerEditValue, dangerConfirm);
       setDangerSaveMsg({
         key,
-        msg: res.restart_required ? 'Saved. Restart the service to apply the change.' : 'Saved and applied',
+        msg: res.restart_required ? 'soc-ai saved the value. Restart soc-ai to apply it.' : 'soc-ai saved and applied the value.',
         ok: true,
       });
       setDangerEditKey(null);
@@ -1672,16 +1908,17 @@ export function Config() {
       // un-composed "intact from the start of the chain" overstates it when
       // that prefix itself already spans more than one restart: say so.
       const epochNote = result.epochs > 1 ? ` within ${result.epochs} epochs` : '';
-      return `Partial verification. ${verified} intact${epochNote} from the start of the chain. The scan was capped. It did not check the full chain.`;
+      return `Partial verification. ${verified} intact${epochNote} from the start of the chain. The scan was capped. It did not check the full chain. The window is the last ${AUDIT_VERIFY_DAYS} days.`;
     }
     if (result.epochs > 1) {
       return (
-        `Chain intact within ${result.epochs} epochs. ${verified} verified. An epoch boundary ` +
+        `Chain intact within ${result.epochs} epochs. ${verified} verified in the last ` +
+        `${AUDIT_VERIFY_DAYS} days. An epoch boundary ` +
         `is a process restart. soc-ai fixed a chain-head recovery bug on 2026-08-17. soc-ai ` +
         `cannot prove the linkage between two epochs.`
       );
     }
-    return `Chain intact. ${verified} verified.`;
+    return `Chain intact. ${verified} verified in the last ${AUDIT_VERIFY_DAYS} days.`;
   };
 
   // What the last scan could not read. The lists below are the scan's OUTPUT,
@@ -1715,7 +1952,7 @@ export function Config() {
           )}
           {idents?.last_scan?.last_scan && !scanInFlight && (
             <span className="text-[11px] text-faint">
-              last scan: {new Date(idents.last_scan.last_scan).toLocaleString()}
+              last scan: {absTime(idents.last_scan.last_scan)}
             </span>
           )}
           <button
@@ -1737,7 +1974,7 @@ export function Config() {
       </div>
       <div className="mb-2.5 text-[12px] text-dim">
         <strong>Dismiss</strong> a suggestion you do not want. soc-ai removes a dismissed suggestion
-        from the list for good. An identifier that is off stays in the list and stays unused. Add a
+        from the list permanently. An identifier that is off stays in the list and stays unused. Add a
         dismissed identifier again by hand to restore it.
       </div>
 
@@ -1792,7 +2029,7 @@ export function Config() {
               // triage/enrichment), so detected subnets land off and never
               // auto-activate — the operator turns one on to apply it. Manual
               // adds are active immediately.
-              hint: 'A detected subnet is a suggestion. Turn a subnet on to treat it as internal. A subnet moves hosts between internal and external. soc-ai never turns a detected subnet on automatically. A subnet that you add by hand applies at once.',
+              hint: 'A detected subnet is a suggestion. Turn a subnet on to treat it as internal. A subnet change can move hosts between internal and external. soc-ai never turns a detected subnet on automatically. A subnet that you add by hand applies at once.',
             },
           };
           return (
@@ -1837,8 +2074,8 @@ export function Config() {
             <div className="mt-1 text-[12px] text-dim">
               This action embeds every runbook with a missing vector or a stale vector. A vector is
               missing if the gateway was down during a save. A vector is stale if the embeddings
-              model changed. A runbook embeds automatically on save. This action is the catch-up
-              pass. It needs an applied embeddings model above.
+              model changed. A runbook embeds automatically on save. Use this action to embed the
+              runbooks that a save missed. It needs an applied embeddings model above.
             </div>
           </div>
           <div className="flex-none">
@@ -1868,6 +2105,37 @@ export function Config() {
     </div>
   );
 
+  // What the origin badge stands on. A DB row names the value under it and
+  // offers to return to it; an ENV row names the default (R5-D7, R5-D19).
+  const renderOrigin = (s: Setting) => {
+    if (s.source === 'db' && s.base_source) {
+      const what = s.base_source === 'env' ? 'The .env value' : 'The default';
+      return (
+        <div data-testid={`origin-${s.key}`} className="mt-1 flex flex-wrap items-center gap-2 text-[11.5px] text-faint">
+          <span>
+            Saved in the console. {what} is {showValue(s.base_value)}.
+          </span>
+          <button
+            type="button"
+            onClick={() => returnToBase(s)}
+            disabled={clearing === s.key}
+            className="rounded-[6px] border border-border-strong bg-surface-3 px-2 py-[2px] text-[11px] font-semibold text-text hover:border-accent disabled:opacity-50"
+          >
+            {s.base_source === 'env' ? 'Use the .env value' : 'Use the default'}
+          </button>
+        </div>
+      );
+    }
+    if (s.source === 'env' && s.default !== undefined && s.default !== null) {
+      return (
+        <div data-testid={`origin-${s.key}`} className="mt-1 text-[11.5px] text-faint">
+          Set in the environment. The default is {showValue(s.default)}.
+        </div>
+      );
+    }
+    return null;
+  };
+
   // One row of a settings group: label/key/badges, its control, and the
   // (setting-specific) auto-ack coupling note. Factored out of renderGroup so
   // day1 rows and folded Advanced rows share identical markup —
@@ -1895,13 +2163,26 @@ export function Config() {
             <span className="font-mono text-[11px] text-faint">{s.key}</span>
             <SourceBadge source={s.source} />
             <ApplyBadge apply={s.apply} />
+            {s.pending_restart && (
+              <span
+                data-testid={`pending-restart-${s.key}`}
+                className="rounded px-1.5 py-0.5 text-[10px] font-semibold"
+                style={{ background: 'rgba(245,166,35,.14)', color: '#f5a623' }}
+                title="The saved value applies at the next restart of soc-ai."
+              >
+                waits for restart
+              </span>
+            )}
             {staged[s.key] !== undefined && (
               <span className="rounded px-1.5 py-0.5 text-[10px] font-semibold" style={{ background: 'rgba(245,166,35,.14)', color: '#f5a623' }}>
                 unsaved
               </span>
             )}
           </div>
-          <div className="mt-1 text-[12px] text-dim">{s.help}</div>
+          <div className="mt-1 text-[12px] text-dim">
+            <HelpText text={s.help} sections={sectionIds} />
+          </div>
+          {renderOrigin(s)}
         </div>
         <div className="flex-none">{renderControl(s)}</div>
       </div>
@@ -1917,9 +2198,9 @@ export function Config() {
         >
           <span className="flex-none pt-px">{autoAckInert ? '⚠' : 'ℹ'}</span>
           <span>
-            Auto-ack acks only a false positive that soc-ai investigates.
+            Auto-acknowledge acts only on a false positive that soc-ai investigates.
             {autoAckInert && scheduleOn === false && ' Continuous Auto-Investigate is off. soc-ai investigates nothing automatically.'}
-            {autoAckInert && floorTooHigh && ` The Auto-Investigate severity floor is “${minSev}”. Auto-ack never acks a high or critical alert.`}
+            {autoAckInert && floorTooHigh && ` The Auto-Investigate severity floor is “${minSev}”. Auto-acknowledge never acts on a high or critical alert.`}
             {' '}Run Auto-Investigate to clear a backlog.
             {scheduleOn !== true && ' You can also turn on Continuous Auto-Investigate in this group.'}
             {' '}Set its severity floor to medium or low.
@@ -1952,7 +2233,7 @@ export function Config() {
     const advCollapsed = collapsed[advKey] ?? day1Items.length > 0;
     return (
     <>
-      <div id={id} className="mb-[22px] scroll-mt-6">
+      <div id={id} className="mb-[22px] scroll-mt-16">
         <button
           type="button"
           onClick={() => toggleSection(g.title)}
@@ -2004,6 +2285,19 @@ export function Config() {
 
   // Standalone System-parent sections, lifted out of the return so the
   // two-level layout loop can place them by id (see PANELS).
+  const resetTarget = users.find((u) => u.id === confirmResetId) ?? null;
+  const doReset = (u: AdminUser) => {
+    const blocked = demoBlocked(demo);
+    if (blocked) { setUserError(blocked); return; } // demo: no doomed write
+    setUserError('');
+    setConfirmResetId(null);
+    resetUserPassword(u.id)
+      // No refetch: a reset changes no field of the list. The old refetch of a
+      // self-reset met a 401 and left the page before the password showed
+      // (dogfood 2026-10-19, H1-D1).
+      .then((r) => setResetPw({ id: u.id, password: r.password }))
+      .catch((e: unknown) => setUserError(e instanceof Error ? e.message : 'soc-ai could not reset the password.'));
+  };
   const usersSection = (
       <CollapsibleConfigSection
         id="users"
@@ -2012,17 +2306,50 @@ export function Config() {
         collapsed={!!collapsed['Users']}
         onToggle={() => toggleSection('Users')}
       >
+        {me?.password_is_generated && (
+          <div
+            data-testid="generated-password-banner"
+            className="mb-2.5 flex items-center gap-2.5 rounded-card border px-3.5 py-3"
+            style={{ borderColor: 'rgba(245,166,35,.3)', background: 'rgba(245,166,35,.06)' }}
+          >
+            <span className="text-warn"><Key size={15} /></span>
+            <div className="flex-1 text-[12px] text-text-2">
+              <div className="font-semibold text-warn">You still use the generated admin password.</div>
+              <div className="mt-0.5">
+                The password is in a plaintext file on the server. A reader of that file can sign in as
+                admin. Change the password now.
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => setPwModalOpen(true)}
+              className="flex-none rounded-[7px] border border-warn px-[11px] py-[5px] text-[11.5px] font-semibold text-warn hover:bg-[rgba(245,166,35,.1)]"
+            >
+              Change password
+            </button>
+          </div>
+        )}
         {resetPw && (
           <div className="mb-2.5 flex items-center gap-2.5 rounded-card border px-3.5 py-3" style={{ borderColor: 'rgba(245,166,35,.3)', background: 'rgba(245,166,35,.06)' }}>
             <span className="text-warn"><Key size={15} /></span>
             <div className="flex-1">
               <div className="text-[12px] font-semibold text-warn">
-                New password for <span className="font-mono">{users.find((u) => u.id === resetPw.id)?.username ?? `user #${resetPw.id}`}</span>. Save it now. soc-ai does not show it again.
+                New password for <span className="font-mono">{users.find((u) => u.id === resetPw.id)?.username ?? `user #${resetPw.id}`}</span>. Copy it now. soc-ai does not show it again.
               </div>
               <div className="mt-0.5 font-mono text-[12px] text-text">{resetPw.password}</div>
+              <div className="mt-0.5 text-[11px] text-faint">This banner closes in 30 seconds.</div>
             </div>
             <button
+              type="button"
+              onClick={() => copyText(resetPw.password, 'password')}
+              className="inline-flex flex-none items-center gap-1 rounded-[7px] border border-border-strong bg-surface-3 px-[9px] py-[4px] text-[11.5px] font-semibold text-text hover:border-accent"
+            >
+              <Copy size={12} /> Copy
+            </button>
+            <button
+              type="button"
               onClick={() => setResetPw(null)}
+              aria-label="Close"
               className="text-[11.5px] text-faint hover:text-text"
             >
               ✕
@@ -2034,10 +2361,18 @@ export function Config() {
           {users.map((u) => {
             const enabledAdminCount = users.filter((x) => x.role === 'admin' && !x.disabled).length;
             const isLastEnabledAdmin = u.role === 'admin' && !u.disabled && enabledAdminCount === 1;
+            // Your own row has Change password, not Reset. The server refuses
+            // a self-reset: it ended your session before the new password
+            // showed, and locked out the only admin (H1-D1).
+            const isMe = !!me?.signed_in && me.username === u.username;
             return (
-              <div key={u.id} className="flex items-center gap-3 border-b border-border-faint px-[15px] py-3">
+              <div key={u.id} className="border-b border-border-faint px-[15px] py-3">
+              <div className="flex items-center gap-3">
                 <div className="flex-1 min-w-0">
-                  <div className="text-[13px] font-semibold">{u.username}</div>
+                  <div className="text-[13px] font-semibold">
+                    {u.username}
+                    {isMe && <span className="ml-1.5 text-[11px] font-normal text-faint">(you)</span>}
+                  </div>
                   <div className="mt-0.5 flex items-center gap-2 text-[11.5px] text-faint">
                     <RoleChip role={u.role} />
                     <span
@@ -2049,7 +2384,7 @@ export function Config() {
                       {u.disabled ? 'disabled' : 'enabled'}
                     </span>
                     {u.lastLoginAt && (
-                      <span>last login {new Date(u.lastLoginAt).toLocaleDateString()}</span>
+                      <span title={absTime(u.lastLoginAt, { zone: true })}>last sign-in {absTime(u.lastLoginAt)}</span>
                     )}
                   </div>
                   {u.status && (
@@ -2059,13 +2394,14 @@ export function Config() {
                 <div className="flex items-center gap-2 flex-none">
                   <select
                     value={u.role}
+                    aria-label={`Role of ${u.username}`}
                     onChange={(e) => {
                       const blocked = demoBlocked(demo);
                       if (blocked) { setUserError(blocked); return; } // demo: no doomed write
                       setUserError('');
                       setUserRole(u.id, e.target.value)
                         .then(() => setNonce((n) => n + 1))
-                        .catch((e: unknown) => setUserError(e instanceof Error ? e.message : 'Could not set the role.'));
+                        .catch((e: unknown) => setUserError(e instanceof Error ? e.message : 'soc-ai could not set the role.'));
                     }}
                     className="rounded-control border border-border-input bg-bg px-2 py-1 text-[11.5px] text-text outline-none focus:border-accent"
                   >
@@ -2080,31 +2416,65 @@ export function Config() {
                       setUserError('');
                       toggleUserDisabled(u.id)
                         .then(() => setNonce((n) => n + 1))
-                        .catch((e: unknown) => setUserError(e instanceof Error ? e.message : 'Could not enable or disable the user.'));
+                        .catch((e: unknown) => setUserError(e instanceof Error ? e.message : 'soc-ai could not enable or disable the user.'));
                     }}
                     disabled={isLastEnabledAdmin}
+                    title={isLastEnabledAdmin ? 'soc-ai keeps one enabled admin. Add another admin first.' : undefined}
                     className="rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-[5px] text-[11.5px] font-semibold text-text hover:border-accent disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     {u.disabled ? 'Enable' : 'Disable'}
                   </button>
+                  {isMe ? (
+                    <button
+                      type="button"
+                      onClick={() => setPwModalOpen(true)}
+                      className="rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-[5px] text-[11.5px] font-semibold text-text hover:border-accent"
+                    >
+                      Change password
+                    </button>
+                  ) : (
+                    <button
+                      onClick={() => { setUserError(''); setConfirmResetId(u.id); }}
+                      disabled={resetPw?.id === u.id || confirmResetId === u.id}
+                      className="rounded-[7px] border px-[11px] py-[5px] text-[11.5px] font-semibold text-danger hover:bg-[rgba(240,68,56,.12)] disabled:opacity-40 disabled:cursor-not-allowed"
+                      style={{ borderColor: 'rgba(240,68,56,.3)' }}
+                    >
+                      Reset password
+                    </button>
+                  )}
+                </div>
+              </div>
+              {resetTarget?.id === u.id && (
+                <div
+                  role="group"
+                  aria-label={`Confirm the password reset of ${u.username}`}
+                  data-testid="reset-confirm"
+                  onKeyDown={(e) => { if (e.key === 'Escape') setConfirmResetId(null); }}
+                  className="mt-2.5 flex flex-wrap items-center gap-2 rounded-control border px-3 py-2"
+                  style={{ borderColor: 'rgba(240,68,56,.3)', background: 'rgba(240,68,56,.05)' }}
+                >
+                  <span className="min-w-0 flex-1 text-[12px] leading-[1.45] text-text-2">
+                    Reset the password of <span className="font-mono">{u.username}</span>? soc-ai ends every
+                    session of this user and revokes the API tokens that this user created. soc-ai shows the
+                    new password once.
+                  </span>
                   <button
-                    onClick={() => {
-                      const blocked = demoBlocked(demo);
-                      if (blocked) { setUserError(blocked); return; } // demo: no doomed write
-                      resetUserPassword(u.id)
-                        .then((r) => {
-                          setResetPw({ id: u.id, password: r.password });
-                          setNonce((n) => n + 1);
-                        })
-                        .catch((e: unknown) => setUserError(e instanceof Error ? e.message : 'Could not reset the password.'));
-                    }}
-                    disabled={resetPw?.id === u.id}
-                    className="rounded-[7px] border px-[11px] py-[5px] text-[11.5px] font-semibold text-danger hover:bg-[rgba(240,68,56,.12)] disabled:opacity-40 disabled:cursor-not-allowed"
-                    style={{ borderColor: 'rgba(240,68,56,.3)' }}
+                    type="button"
+                    autoFocus
+                    onClick={() => doReset(u)}
+                    className="rounded-[7px] border border-danger px-[11px] py-[5px] text-[11.5px] font-semibold text-danger hover:bg-[rgba(240,68,56,.12)]"
                   >
-                    Reset password
+                    Reset the password
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setConfirmResetId(null)}
+                    className="rounded-[7px] border border-border-strong px-[11px] py-[5px] text-[11.5px] font-semibold text-dim hover:border-accent hover:text-text"
+                  >
+                    Cancel
                   </button>
                 </div>
+              )}
               </div>
             );
           })}
@@ -2114,6 +2484,7 @@ export function Config() {
         <div className="mt-3 flex flex-wrap items-center gap-2">
           <input
             placeholder="username"
+            aria-label="New username"
             value={newUser.username}
             onChange={(e) => setNewUser((u) => ({ ...u, username: e.target.value }))}
             className="w-[160px] rounded-control border border-border-input bg-bg px-3 py-1.5 font-mono text-[12.5px] text-text outline-none focus:border-accent"
@@ -2121,12 +2492,14 @@ export function Config() {
           <input
             type="password"
             placeholder="password"
+            aria-label="New password"
             value={newUser.password}
             onChange={(e) => setNewUser((u) => ({ ...u, password: e.target.value }))}
             className="w-[160px] rounded-control border border-border-input bg-bg px-3 py-1.5 font-mono text-[12.5px] text-text outline-none focus:border-accent"
           />
           <select
             value={newUser.role}
+            aria-label="Role of the new user"
             onChange={(e) => setNewUser((u) => ({ ...u, role: e.target.value }))}
             className="rounded-control border border-border-input bg-bg px-2 py-1.5 text-[12.5px] text-text outline-none focus:border-accent"
           >
@@ -2144,7 +2517,7 @@ export function Config() {
                   setNewUser({ username: '', password: '', role: 'analyst' });
                 })
                 .catch((e: unknown) => {
-                  setUserError(e instanceof Error ? e.message : 'Could not create the user.');
+                  setUserError(e instanceof Error ? e.message : 'soc-ai could not create the user.');
                 });
             }}
             className="rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-[5px] text-[11.5px] font-semibold text-text hover:border-accent"
@@ -2155,36 +2528,106 @@ export function Config() {
         {userError && (
           <div className="mt-1.5 text-[12px] text-danger">{userError}</div>
         )}
+        {/* Mounted only while open: the dialog reads the shell context,
+            and the Settings page renders in tests without the shell. */}
+        {pwModalOpen && (
+          <ChangePasswordModal
+            open
+            onClose={() => {
+              setPwModalOpen(false);
+              // The cached /me is dropped on success, so a fresh read says if
+              // the generated password is still in use.
+              getMe().then(setMe).catch(() => {});
+            }}
+          />
+        )}
       </CollapsibleConfigSection>
   );
 
+  // With authentication off and no signed-in user, the server refuses a new
+  // token: a token needs a user to own it. The button was enabled and the
+  // refusal blamed a bearer-token caller (dogfood 2026-10-19, R5-D11).
+  const tokenBlocked = me !== null && me.signed_in === false;
+  const TOKEN_NAME_RE = /^[\w .-]+$/;
+  const createToken = () => {
+    const blocked = demoBlocked(demo);
+    if (blocked) { setTokenMsg(blocked); return; } // demo: no doomed write
+    const name = tokenName.trim();
+    if (!name) { setTokenNameError('Enter a name for the token.'); return; }
+    if (!TOKEN_NAME_RE.test(name)) {
+      setTokenNameError('Use letters, digits, spaces, dots, dashes and underscores only.');
+      return;
+    }
+    setTokenNameError('');
+    setTokenMsg('');
+    mintToken(name)
+      .then((t) => { setMinted(t); setMintedName(name); setTokenName(''); setNonce((n) => n + 1); })
+      .catch((e: unknown) => setTokenMsg(e instanceof Error ? e.message : 'soc-ai could not create the token.'));
+  };
+  const doRevoke = (id: number, name: string) => {
+    const blocked = demoBlocked(demo);
+    if (blocked) { setTokenMsg(blocked); return; } // demo: no doomed write
+    setConfirmRevokeId(null);
+    revokeToken(id)
+      .then(() => {
+        toast({ tone: 'success', message: `soc-ai revoked the token ${name}.` });
+        setNonce((n) => n + 1);
+      })
+      .catch((e: unknown) => setTokenMsg(e instanceof Error ? e.message : 'soc-ai could not revoke the token.'));
+  };
   const apiTokensSection = (
       <CollapsibleConfigSection
         id="api-tokens"
         title="API tokens"
         collapsed={!!collapsed['API tokens']}
         onToggle={() => toggleSection('API tokens')}
-        right={
-          <span onClick={(e) => e.stopPropagation()}>
-            <button
-              onClick={() => {
-                const blocked = demoBlocked(demo);
-                if (blocked) { setTokenMsg(blocked); return; } // demo: no doomed write
-                mintToken()
-                  .then((t) => { setMinted(t); setNonce((n) => n + 1); })
-                  .catch((e: unknown) => setTokenMsg(e instanceof Error ? e.message : 'Could not mint the token.'));
-              }}
-              className="rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-[5px] text-[11.5px] font-semibold text-text hover:border-accent"
-            >
-              + Mint token
-            </button>
-          </span>
-        }
       >
+        <div className="mb-2.5 text-[12px] text-dim">
+          An integration sends a token in the Authorization header. Give each integration its own token,
+          so that you can revoke one without the others.
+        </div>
+        {tokenBlocked ? (
+          <div
+            data-testid="token-blocked"
+            className="mb-2.5 rounded-card border border-border bg-surface-2 px-3.5 py-2.5 text-[12.5px] text-text-2"
+          >
+            Sign in as an admin to create a token. Authentication is off, so this console has no
+            signed-in user to own the token.{' '}
+            <Link to="/login" className="font-semibold text-accent hover:underline">
+              Sign in
+            </Link>
+          </div>
+        ) : (
+          <div className="mb-2.5 flex flex-wrap items-start gap-2">
+            <div className="flex flex-col gap-1">
+              <input
+                value={tokenName}
+                onChange={(e) => { setTokenName(e.target.value); setTokenNameError(''); }}
+                onKeyDown={(e) => { if (e.key === 'Enter') createToken(); }}
+                placeholder="token name, for example siem-export"
+                aria-label="Token name"
+                maxLength={64}
+                aria-invalid={tokenNameError ? true : undefined}
+                className="w-[260px] rounded-control border border-border-input bg-bg px-3 py-1.5 font-mono text-[12.5px] text-text outline-none focus:border-accent"
+              />
+              {tokenNameError && (
+                <span role="alert" className="text-[11px] text-danger">{tokenNameError}</span>
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={createToken}
+              className="rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-[6px] text-[11.5px] font-semibold text-text hover:border-accent"
+            >
+              Create token
+            </button>
+          </div>
+        )}
         {tokenMsg && (
           <div
+            role="alert"
             className="mb-2.5 flex items-center gap-2.5 rounded-card border px-3.5 py-2.5 text-[12.5px] text-text-2"
-            style={{ borderColor: 'rgba(75,139,245,.30)', background: 'rgba(75,139,245,.06)' }}
+            style={{ borderColor: 'rgba(240,68,56,.30)', background: 'rgba(240,68,56,.06)' }}
           >
             <span className="flex-1">{tokenMsg}</span>
             <button onClick={() => setTokenMsg('')} className="text-[11.5px] text-faint hover:text-text" aria-label="Dismiss">
@@ -2195,12 +2638,23 @@ export function Config() {
         {minted && (
           <div className="mb-2.5 flex items-center gap-2.5 rounded-card border px-3.5 py-3" style={{ borderColor: 'rgba(245,166,35,.3)', background: 'rgba(245,166,35,.06)' }}>
             <span className="text-warn"><Key size={15} /></span>
-            <div className="flex-1">
-              <div className="text-[12px] font-semibold text-warn">Copy this token now. soc-ai does not show it again.</div>
-              <div className="mt-0.5 font-mono text-[12px] text-text">{minted}</div>
+            <div className="min-w-0 flex-1">
+              <div className="text-[12px] font-semibold text-warn">
+                Copy the token {mintedName} now. soc-ai does not show it again.
+              </div>
+              <div className="mt-0.5 break-all font-mono text-[12px] text-text">{minted}</div>
             </div>
             <button
+              type="button"
+              onClick={() => copyText(minted, 'token')}
+              className="inline-flex flex-none items-center gap-1 rounded-[7px] border border-border-strong bg-surface-3 px-[9px] py-[4px] text-[11.5px] font-semibold text-text hover:border-accent"
+            >
+              <Copy size={12} /> Copy
+            </button>
+            <button
+              type="button"
               onClick={() => setMinted('')}
+              aria-label="Close"
               className="text-[11.5px] text-faint hover:text-text"
             >
               ✕
@@ -2209,28 +2663,61 @@ export function Config() {
         )}
 
         <div className="overflow-hidden rounded-card border border-border bg-surface-1">
+          {data.tokens.length === 0 && (
+            <div data-testid="tokens-empty" className="px-[15px] py-4 text-[12.5px] text-faint">
+              No API token exists. Create a token for each integration.
+            </div>
+          )}
           {data.tokens.map((tk) => (
-            <div key={tk.id} className="flex items-center gap-3 border-b border-border-faint px-[15px] py-3">
-              <span className="text-faint"><Key size={15} /></span>
-              <div className="flex-1">
-                <div className="text-[13px] font-semibold">{tk.name}</div>
-                <div className="mt-0.5 font-mono text-[11.5px] text-faint">
-                  {tk.prefix} · created {tk.created} · last used {tk.used}
+            <div key={tk.id} className="border-b border-border-faint px-[15px] py-3">
+              <div className="flex items-center gap-3">
+                <span className="text-faint"><Key size={15} /></span>
+                <div className="flex-1">
+                  <div className="text-[13px] font-semibold">{tk.name}</div>
+                  <div className="mt-0.5 text-[11.5px] text-faint">
+                    created {tk.created} · last used {tk.used}
+                  </div>
                 </div>
+                <button
+                  type="button"
+                  onClick={() => setConfirmRevokeId(tk.id)}
+                  disabled={confirmRevokeId === tk.id}
+                  className="rounded-[7px] border px-[11px] py-[5px] text-[11.5px] font-semibold text-danger hover:bg-[rgba(240,68,56,.12)] disabled:opacity-40"
+                  style={{ borderColor: 'rgba(240,68,56,.3)' }}
+                >
+                  Revoke
+                </button>
               </div>
-              <button
-                onClick={() => {
-                  const blocked = demoBlocked(demo);
-                  if (blocked) { setTokenMsg(blocked); return; } // demo: no doomed write
-                  revokeToken(tk.id)
-                    .then(() => setNonce((n) => n + 1))
-                    .catch((e: unknown) => setTokenMsg(e instanceof Error ? e.message : 'Could not revoke the token.'));
-                }}
-                className="rounded-[7px] border px-[11px] py-[5px] text-[11.5px] font-semibold text-danger hover:bg-[rgba(240,68,56,.12)]"
-                style={{ borderColor: 'rgba(240,68,56,.3)' }}
-              >
-                Revoke
-              </button>
+              {confirmRevokeId === tk.id && (
+                <div
+                  role="group"
+                  aria-label={`Confirm the revoke of ${tk.name}`}
+                  data-testid="revoke-confirm"
+                  onKeyDown={(e) => { if (e.key === 'Escape') setConfirmRevokeId(null); }}
+                  className="mt-2.5 flex flex-wrap items-center gap-2 rounded-control border px-3 py-2"
+                  style={{ borderColor: 'rgba(240,68,56,.3)', background: 'rgba(240,68,56,.05)' }}
+                >
+                  <span className="min-w-0 flex-1 text-[12px] leading-[1.45] text-text-2">
+                    Revoke the token <span className="font-mono">{tk.name}</span>? Every client that sends it
+                    stops at once. You cannot undo this.
+                  </span>
+                  <button
+                    type="button"
+                    autoFocus
+                    onClick={() => doRevoke(tk.id, tk.name)}
+                    className="rounded-[7px] border border-danger px-[11px] py-[5px] text-[11.5px] font-semibold text-danger hover:bg-[rgba(240,68,56,.12)]"
+                  >
+                    Revoke the token
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setConfirmRevokeId(null)}
+                    className="rounded-[7px] border border-border-strong px-[11px] py-[5px] text-[11.5px] font-semibold text-dim hover:border-accent hover:text-text"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              )}
             </div>
           ))}
         </div>
@@ -2244,24 +2731,33 @@ export function Config() {
         collapsed={!!collapsed['Diagnostics']}
         onToggle={() => toggleSection('Diagnostics')}
         right={
-          // The WARN rows sat among 31 doctor rows with no filter (dogfood
-          // 2026-10-06). The chip shows the WARN rows only, and again all of
-          // them on a second press.
-          doctorWarnings > 0 && !collapsed['Diagnostics'] ? (
-            <button
-              type="button"
-              data-testid="doctor-warn-chip"
-              aria-pressed={doctorWarnOnly}
-              onClick={() => setDoctorWarnOnly((on) => !on)}
-              title={doctorWarnOnly ? 'Show every doctor row.' : 'Show the WARN rows only.'}
-              className={`rounded-chip border px-2 py-px text-[11px] font-semibold ${
-                doctorWarnOnly
-                  ? 'border-warn bg-[rgba(245,166,35,.16)] text-warn'
-                  : 'border-[rgba(245,166,35,.45)] text-warn hover:bg-[rgba(245,166,35,.1)]'
-              }`}
-            >
-              {doctorWarnings} warning{doctorWarnings === 1 ? '' : 's'}
-            </button>
+          // One chip per grade with rows, FAIL first. The single WARN chip
+          // read "4 warnings" while 6 checks failed (dogfood 2026-10-19,
+          // H1-D9). A chip shows that grade only; a second press shows all.
+          !collapsed['Diagnostics'] ? (
+            <span className="flex items-center gap-1.5">
+              {DOCTOR_CHIPS.filter((c) => (doctorCounts[c.grade] ?? 0) > 0).map((c) => {
+                const on = doctorFilter === c.grade;
+                return (
+                  <button
+                    key={c.grade}
+                    type="button"
+                    data-testid={`doctor-${c.grade.toLowerCase()}-chip`}
+                    aria-pressed={on}
+                    onClick={() => setDoctorFilter((f) => (f === c.grade ? null : c.grade))}
+                    title={on ? 'Show every doctor row.' : `Show the ${c.grade} rows only.`}
+                    className="rounded-chip border px-2 py-px text-[11px] font-semibold"
+                    style={{
+                      color: c.color,
+                      borderColor: on ? c.color : c.border,
+                      background: on ? c.wash : 'transparent',
+                    }}
+                  >
+                    {doctorCounts[c.grade]} {c.grade}
+                  </button>
+                );
+              })}
+            </span>
           ) : undefined
         }
       >
@@ -2325,15 +2821,31 @@ export function Config() {
           </div>
           {/* Every doctor row. The Setup health card shows FAIL and WARN
               only, and the INFO and PASS rows had no other surface. */}
-          <DoctorList warnOnly={doctorWarnOnly} onRows={(rows) => setDoctorWarnings(warnRows(rows).length)} />
+          <DoctorList filter={doctorFilter} onRows={(rows) => setDoctorCounts(statusCounts(rows))} />
         </div>
       </CollapsibleConfigSection>
   );
 
+  const testEdited = (key: string) => {
+    const target = CONN_TEST_TARGET[key];
+    if (!target) return;
+    const blocked = demoBlocked(demo);
+    if (blocked) { setEditTest({ key, ok: false, detail: blocked }); return; } // demo: no doomed probe
+    setEditTest({ key, ok: false, detail: '', loading: true });
+    testConnection(target, { key, value: dangerEditValue })
+      .then((r) => setEditTest({ key, ...r }))
+      .catch((e: unknown) =>
+        setEditTest({ key, ok: false, detail: e instanceof Error ? e.message : 'The test did not finish.' }),
+      );
+  };
+
+  // "Danger Zone" is now "Connections". The rows showed only "env" and an
+  // empty Edit field, so a fix needed the old value from memory; an optional
+  // secret read red "Unset" (dogfood 2026-10-19, H1-D15, H1-I2).
   const dangerZoneSection = (
       <div
         id="danger-zone"
-        className="overflow-hidden rounded-card border scroll-mt-6"
+        className="overflow-hidden rounded-card border scroll-mt-16"
         style={{
           borderColor: 'rgba(240,68,56,.35)',
           background: 'linear-gradient(180deg,rgba(240,68,56,.05),rgba(11,14,19,0) 60%),#0b0e13',
@@ -2343,22 +2855,25 @@ export function Config() {
             header, not a SectionTitle, so the toggle lives inline here). */}
         <button
           type="button"
-          onClick={() => toggleSection('Danger Zone')}
+          onClick={() => toggleSection('Connections')}
+          aria-expanded={!collapsed['Connections']}
           className="group flex w-full items-center gap-[9px] border-b border-[rgba(240,68,56,.2)] px-4 py-[13px] text-left"
           style={{ background: 'rgba(240,68,56,.06)' }}
         >
           <ShieldAlert size={15} className="text-[#f04438]" />
-          <span className="text-[13px] font-semibold text-[#f04438]">Danger Zone</span>
-          <span className="ml-auto text-[11px] text-text-muted">A connection change may need a restart</span>
+          <span className="text-[13px] font-semibold text-[#f04438]">Connections</span>
+          <span className="ml-auto text-[11px] text-text-muted">
+            A change to the grid or the model gateway needs a restart
+          </span>
           <ChevronRight
             size={15}
             className="text-[#f04438] transition-transform"
-            style={{ transform: collapsed['Danger Zone'] ? 'none' : 'rotate(90deg)' }}
+            style={{ transform: collapsed['Connections'] ? 'none' : 'rotate(90deg)' }}
           />
         </button>
 
         {/* Settings rows */}
-        {collapsed['Danger Zone'] ? null : dangerLoading ? (
+        {collapsed['Connections'] ? null : dangerLoading ? (
           <div className="px-4 py-6 text-[12px] text-text-muted"><LoadingInline>Loading</LoadingInline></div>
         ) : dangerError ? (
           <div className="px-4 py-4 text-[12px] text-faint">{dangerError}</div>
@@ -2368,22 +2883,39 @@ export function Config() {
               const isEditing = dangerEditKey === s.key;
               const confirmOk = dangerConfirm === s.key;
               const saveMsg = dangerSaveMsg?.key === s.key ? dangerSaveMsg : null;
+              const unsetTone = s.required
+                ? { background: 'rgba(240,68,56,.12)', color: '#f04438' }
+                : { background: 'rgba(139,148,158,.12)', color: '#8b949e' };
+              const testTarget = CONN_TEST_TARGET[s.key];
+              const testResult = editTest?.key === s.key ? editTest : null;
               return (
-                <div key={s.key} className="border-b border-border-faint px-4 py-3 last:border-0">
+                <div key={s.key} data-setting-key={s.key} className="border-b border-border-faint px-4 py-3 last:border-0">
                   <div className="flex items-center gap-3">
                     <div className="min-w-0 flex-1">
                       <div className="text-[12.5px] font-medium text-text-primary">{s.label}</div>
                       <div className="text-[10.5px] text-text-muted font-mono">{s.key}</div>
+                      {s.type !== 'secret' && (
+                        <div data-testid={`conn-value-${s.key}`} className="mt-0.5 break-all font-mono text-[11.5px] text-text-2">
+                          {s.value ? s.value : <span className="text-faint">empty</span>}
+                        </div>
+                      )}
                     </div>
+                    {s.pending_restart && (
+                      <span
+                        className="rounded px-1.5 py-0.5 text-[10px] font-semibold"
+                        style={{ background: 'rgba(245,166,35,.14)', color: '#f5a623' }}
+                        title="The saved value applies at the next restart of soc-ai."
+                      >
+                        waits for restart
+                      </span>
+                    )}
                     {s.type === 'secret' && (
                       <span
                         className="rounded px-1.5 py-0.5 text-[10px] font-semibold"
-                        style={{
-                          background: s.isSet ? 'rgba(18,183,106,.15)' : 'rgba(240,68,56,.12)',
-                          color: s.isSet ? '#12b76a' : '#f04438',
-                        }}
+                        style={s.isSet ? { background: 'rgba(18,183,106,.15)', color: '#12b76a' } : unsetTone}
+                        title={!s.isSet && !s.required ? 'This secret is optional.' : undefined}
                       >
-                        {s.isSet ? 'Set' : 'Unset'}
+                        {s.isSet ? 'Set' : 'Not set'}
                       </span>
                     )}
                     {s.source !== 'unset' && (
@@ -2396,9 +2928,12 @@ export function Config() {
                         className="rounded px-2 py-0.5 text-[11px] border border-border bg-surface-2 hover:bg-surface-3 transition-colors"
                         onClick={() => {
                           setDangerEditKey(s.key);
-                          setDangerEditValue('');
+                          // The edit starts from the current value. A secret
+                          // has none to show, so it starts empty.
+                          setDangerEditValue(s.type === 'secret' ? '' : (s.value ?? ''));
                           setDangerConfirm('');
                           setDangerSaveMsg(null);
+                          setEditTest(null);
                         }}
                       >
                         Edit
@@ -2409,23 +2944,47 @@ export function Config() {
                   {isEditing && (
                     <div className="mt-2.5 space-y-2">
                       <div>
-                        <label className="block text-[11px] text-text-muted mb-1">
-                          {s.type === 'secret' ? 'New write-only value' : 'Value'}
+                        <label htmlFor={`conn-edit-${s.key}`} className="block text-[11px] text-text-muted mb-1">
+                          {s.type === 'secret' ? 'New value. soc-ai never shows it again.' : 'Value'}
                         </label>
-                        <input
-                          type={s.type === 'secret' ? 'password' : 'text'}
-                          className="w-full rounded border border-border bg-surface-2 px-2.5 py-1.5 text-[12px] font-mono text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-1 focus:ring-[rgba(240,68,56,.5)]"
-                          placeholder={s.type === 'secret' ? '••••••••' : s.label}
-                          value={dangerEditValue}
-                          onChange={e => setDangerEditValue(e.target.value)}
-                          autoComplete="new-password"
-                        />
+                        <div className="flex gap-2">
+                          <input
+                            id={`conn-edit-${s.key}`}
+                            type={s.type === 'secret' ? 'password' : 'text'}
+                            className="w-full rounded border border-border bg-surface-2 px-2.5 py-1.5 text-[12px] font-mono text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-1 focus:ring-[rgba(240,68,56,.5)]"
+                            placeholder={s.type === 'secret' ? 'Enter a new value' : s.label}
+                            value={dangerEditValue}
+                            onChange={e => { setDangerEditValue(e.target.value); setEditTest(null); }}
+                            autoComplete="new-password"
+                          />
+                          {testTarget && (
+                            <button
+                              type="button"
+                              onClick={() => testEdited(s.key)}
+                              disabled={!dangerEditValue || !!testResult?.loading}
+                              title="Test this value before you save it. The test saves nothing."
+                              className="flex-none rounded px-2.5 py-1 text-[11.5px] font-medium border border-border bg-surface-2 hover:bg-surface-3 disabled:opacity-50"
+                            >
+                              {testResult?.loading ? 'Testing' : 'Test'}
+                            </button>
+                          )}
+                        </div>
+                        {testResult && !testResult.loading && (
+                          <div
+                            data-testid="conn-edit-test"
+                            className="mt-1 text-[11.5px]"
+                            style={{ color: testResult.ok ? '#12b76a' : '#f04438' }}
+                          >
+                            {testResult.ok ? '✓' : '✗'} {testResult.detail}
+                          </div>
+                        )}
                       </div>
                       <div>
-                        <label className="block text-[11px] text-text-muted mb-1">
+                        <label htmlFor={`conn-confirm-${s.key}`} className="block text-[11px] text-text-muted mb-1">
                           Type <span className="font-mono text-[#f04438]">{s.key}</span> to confirm
                         </label>
                         <input
+                          id={`conn-confirm-${s.key}`}
                           type="text"
                           className="w-full rounded border border-border bg-surface-2 px-2.5 py-1.5 text-[12px] font-mono text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-1 focus:ring-[rgba(240,68,56,.5)]"
                           placeholder={s.key}
@@ -2437,7 +2996,7 @@ export function Config() {
                       {!s.hot && (
                         <div className="flex items-center gap-1.5 text-[11px] text-[#f79009]">
                           <span>⚠</span>
-                          <span>Restart the service to apply this change</span>
+                          <span>Restart soc-ai to apply this change.</span>
                         </div>
                       )}
                       {saveMsg && (
@@ -2465,11 +3024,17 @@ export function Config() {
                             setDangerEditValue('');
                             setDangerConfirm('');
                             setDangerSaveMsg(null);
+                            setEditTest(null);
                           }}
                         >
                           Cancel
                         </button>
                       </div>
+                    </div>
+                  )}
+                  {!isEditing && saveMsg && (
+                    <div className="mt-1.5 text-[11.5px]" style={{ color: saveMsg.ok ? '#12b76a' : '#f04438' }}>
+                      {saveMsg.msg}
                     </div>
                   )}
                 </div>
@@ -2556,6 +3121,8 @@ export function Config() {
     <input
       value={query}
       onChange={(e) => setQuery(e.target.value)}
+      // Escape clears the search (R5-D23).
+      onKeyDown={(e) => { if (e.key === 'Escape') setQuery(''); }}
       placeholder="Search settings"
       aria-label="Search settings"
       className={`rounded-control border border-border-input bg-bg px-3 py-1.5 text-[12.5px] text-text outline-none placeholder:text-faint focus:border-accent ${className}`}
@@ -2588,16 +3155,17 @@ export function Config() {
     <div className="overflow-hidden rounded-card border border-border bg-surface-1">
       {searchHits.length === 0 ? (
         <div className="px-4 py-6 text-[12.5px] text-faint">
-          No settings match “{query.trim()}”. Check the spelling, or search for the setting key.
+          No setting matches “{query.trim()}”. Check the spelling, or search for the setting key.
         </div>
       ) : (
         searchHits.map((h) => (
           <button
-            key={h.kind === 'setting' ? h.settingKey : `section-${h.sectionId}`}
+            key={h.kind === 'section' ? `section-${h.sectionId}` : h.settingKey}
             type="button"
-            data-testid={`search-result-${h.kind === 'setting' ? h.settingKey : `section-${h.sectionId}`}`}
+            data-testid={`search-result-${h.kind === 'section' ? `section-${h.sectionId}` : h.settingKey}`}
             onClick={() => {
               navigateToSection(h.sectionId);
+              if (h.kind === 'row') setHighlightKey(h.settingKey ?? null);
               if (h.kind === 'setting') {
                 setHighlightKey(h.settingKey ?? null);
                 // The hit may be a non-day1 item sitting behind its section's
@@ -2643,8 +3211,8 @@ export function Config() {
           over a page the guide called "Settings" (dogfood 2026-10-06). */}
       <div className="text-[20px] font-semibold tracking-[-.015em]">Settings</div>
       <div className="mb-[14px] mt-0.5 text-[13px] text-dim">
-        Runtime settings · users · API tokens. A source badge names the origin of a value. The
-        origin is the database or an environment variable.
+        Each value has an origin badge. DEFAULT is the code default. ENV is a value from the
+        environment or .env. DB is a value that you saved here. A DB value wins over the other two.
       </div>
       {searchInput('mb-[14px] w-full lg:hidden')}
 
@@ -2691,19 +3259,19 @@ export function Config() {
                     }
                   };
                   return (
+                    // Two sibling buttons in a plain span: the chip was a
+                    // role=button with a button inside it (R5-D23). A click on
+                    // the label button bubbles to the span, which jumps.
                     <span
                       key={key}
                       data-testid={`chip-${key}`}
-                      role="button"
-                      tabIndex={0}
                       title={`${String(s?.value ?? '')} → ${staged[key]}`}
                       onClick={jumpToChip}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') jumpToChip();
-                      }}
                       className="inline-flex cursor-pointer items-center gap-1.5 rounded-chip border border-border-strong bg-surface-3 px-2 py-0.5 text-[11.5px] font-medium text-text hover:border-accent"
                     >
-                      {label}
+                      <button type="button" aria-label={`Open ${label}`} className="outline-none focus-visible:underline">
+                        {label}
+                      </button>
                       <button
                         type="button"
                         aria-label={`Discard ${label}`}

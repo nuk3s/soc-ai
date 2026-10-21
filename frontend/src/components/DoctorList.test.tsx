@@ -53,6 +53,32 @@ describe('DoctorList', () => {
     expect(within(screen.getByTestId('doctor-row-estate model')).queryByTestId('doctor-fix')).toBeNull();
   });
 
+  // Round 2 (V2-3): a remedy showed its backticks raw: "Run `soc-ai
+  // blocklists refresh` to fetch ...". The fix line renders a code span.
+  it('renders the code spans of a fix line without the backticks', async () => {
+    vi.mocked(getPreflightDetail).mockResolvedValue({
+      checked_at: new Date().toISOString(),
+      rows: [
+        {
+          name: 'blocklists',
+          status: 'WARN',
+          detail: 'never refreshed: tor',
+          hint: 'Run `soc-ai blocklists refresh` to fetch the Tor feed. Or remove `tor` from `blocklist_sources`.',
+        },
+      ],
+    });
+    render(<DoctorList />);
+    const fix = within(await screen.findByTestId('doctor-row-blocklists')).getByTestId('doctor-fix');
+    expect(fix.textContent).toBe(
+      'Run soc-ai blocklists refresh to fetch the Tor feed. Or remove tor from blocklist_sources.',
+    );
+    expect([...fix.querySelectorAll('code')].map((c) => c.textContent)).toEqual([
+      'soc-ai blocklists refresh',
+      'tor',
+      'blocklist_sources',
+    ]);
+  });
+
   it('runs the checks again on Refresh and shows the new rows', async () => {
     vi.mocked(refreshPreflight).mockResolvedValue({
       checked_at: new Date().toISOString(),

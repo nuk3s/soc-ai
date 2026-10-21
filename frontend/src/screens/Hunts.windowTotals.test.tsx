@@ -167,6 +167,28 @@ describe('Hunts window totals', () => {
     expect(screen.queryByTestId('hunts-page-note')).toBeNull();
   });
 
+  // R3-D6 and R3-D7, on the page path: the header counts what the cells state.
+  it('counts no failure marker and every hunt in progress from the page', async () => {
+    vi.mocked(getHuntTotals).mockRejectedValue(new Error('404'));
+    const failed = (n: number): HuntRow => ({
+      ...row(n, 'triggered'),
+      outcome: 'could_not_run',
+      outcome_label: 'Could not run',
+    });
+    vi.mocked(getHunts).mockResolvedValue([
+      failed(1),
+      failed(2),
+      failed(3),
+      { ...row(4, 'lead'), status: 'investigating', findingCount: 2, threatFindingCount: 2 },
+      { ...row(5, 'chat'), findingCount: 2, threatFindingCount: 1 },
+    ]);
+    renderHunts();
+    const line = await screen.findByTestId('hunt-stats-line');
+    await waitFor(() => expect(line.textContent).toContain('5 hunts'));
+    expect(line.textContent).toContain('4 findings');
+    expect(line.textContent).toContain('1 in progress');
+  });
+
   it('keeps the page counts when the totals fail and the page is not full', async () => {
     vi.mocked(getHuntTotals).mockRejectedValue(new Error('404'));
     vi.mocked(getHunts).mockResolvedValue(PAGE.slice(0, 3));

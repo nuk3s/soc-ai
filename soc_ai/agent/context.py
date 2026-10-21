@@ -165,6 +165,12 @@ class InvestigationContext:
     loop_visible_tools: frozenset[str] | None = None
     # The tools the registration deferred, for the prompt's "more tools" line.
     deferred_tool_names: list[str] = field(default_factory=list)
+    # The read tools an investigator-role agent may register at all. A plane
+    # worker of the swarm triage experiment (soc_ai.agent.swarm.planes) gets
+    # the tools of its plane only: a tool outside this set is not registered,
+    # not even with deferred loading. None, the default, registers every tool
+    # of the role. The swarm sets it on the worker's own copy of the context.
+    tool_allowlist: frozenset[str] | None = None
 
 
 class StepEvent(BaseModel):

@@ -7,7 +7,7 @@ an arbitrary command.
 
 > **⚠ The grid can delete this user.** An operator creates `socpcap` by hand on the
 > sensor. A Salt highstate, an SO upgrade or a re-image can remove the user, its sudoers
-> file or its `authorized_keys` file. PCAP fetch then fails, and no screen reports it. A
+> file or its `authorized_keys` file. PCAP fetch then fails. No screen reports the failure. A
 > planned change detects this state and asks you to create the user again. Until that
 > change ships, run the setup below again if PCAP stops working.
 >
@@ -22,7 +22,7 @@ an arbitrary command.
 | User | `socpcap`. It is a normal system user. SSH needs a shell and a home directory for it. |
 | Group | `socore`. It grants read and traverse on `so_suripcap_dir`. That directory is `/nsm/suripcap`, mode 775, owner `suricata:socore`. The `find` step can then list the pcap files. |
 | Sudo | `/etc/sudoers.d/socpcap` holds `socpcap ALL=(root) NOPASSWD: /usr/sbin/tcpdump` only. The file allows no other sudo command. |
-| Key | The soc-ai `so_pcap` public key sits in `~socpcap/.ssh/authorized_keys`. A `from="<soc-ai host IP>"` restriction limits it. |
+| Key | The soc-ai `so_pcap` public key is in `~socpcap/.ssh/authorized_keys`. A `from="<soc-ai host IP>"` restriction limits it. |
 
 On the soc-ai side, set these values in `.env` on the soc-ai host: `SO_SSH_USER=socpcap`,
 `SO_SSH_KEY=/opt/soc-ai/.ssh/so_pcap`, `SO_SSH_SUDO=sudo` and `PCAP_ENABLED=true`.

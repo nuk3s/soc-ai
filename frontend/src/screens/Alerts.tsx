@@ -5,7 +5,9 @@ import { type Dispatch, type RefObject, type SetStateAction, useCallback, useEff
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { KindBadge, PipelineErrorChip, SeverityTag, VerdictPill } from '../components/Badges';
 import { FlowBadge } from '../components/FlowBadge';
+import { GridGapStrip } from '../components/GridGapStrip';
 import { RowTags, TAGS_COLUMN, TagsHeader } from '../components/RowTags';
+import { SameFlowChip } from '../components/SameFlowChip';
 import { Checkbox } from '../components/Controls';
 import { ListToolbar } from '../components/ListToolbar';
 import { useListSelection } from '../lib/useListSelection';
@@ -18,6 +20,7 @@ import { groupOutcome, hideOptimisticallyAcked, outcomeOf } from '../lib/alertFi
 import { ago } from '../lib/timeRange';
 import { MIN_BUCKET, bucketEvents } from '../lib/alertEventBuckets';
 import {
+  type AckGroupResult,
   type AlertQuery,
   type AutoTriageStatus,
   ApiError,
@@ -39,7 +42,15 @@ import {
   stopAutoTriage,
 } from '../lib/api';
 import { DEMO_ACTION_NOTE, demoBlocked, useDemo } from '../lib/demo';
-import { ackMessage, ackTail, escalateLinks, escalateMessage } from '../lib/groupWriteMessages';
+import {
+  ackMessage,
+  ackTail,
+  ackWroteNothing,
+  escalateLinks,
+  escalateMessage,
+  escalateNamesCase,
+  escalateWroteNothing,
+} from '../lib/groupWriteMessages';
 import { plural } from '../lib/plural';
 import { COUNTING } from '../lib/text';
 import { type ToastTone, useToast } from '../lib/toast';
@@ -49,7 +60,9 @@ import { type SortDir, useSort } from '../lib/useSort';
 import type {
   AlertEvent,
   AlertGroup,
+  AlertSibling,
   AlertsEmptyReason,
+  CaseLink,
   Investigation as Inv,
   SavedViewQuery,
   Severity,
@@ -89,7 +102,9 @@ const GRID_MIN_WIDTH = 998;
 // column stacks its second line (the endpoint agent's IP, host detections only)
 // rather than taking a column of its own: it is absent on every flow alert, so a
 // column would be empty on the common case.
-const EVENT_GRID = '16px 132px 76px minmax(150px,1fr) 116px 196px 92px';
+// The time column fits "Oct 19, 14:23:05 EDT" (R2-D17). The last column fits
+// the row's own Acknowledge beside Investigate (R2-I1).
+const EVENT_GRID = '16px 150px 76px minmax(150px,1fr) 116px 196px 206px';
 
 // Page size for an expanded group's events ("Load more" pulls one page at a time).
 const EVENTS_PAGE_SIZE = 50;
@@ -207,6 +222,16 @@ const asViewId = (raw: unknown): ViewId =>
 const DEFAULT_RANGE = '24h';
 const DEFAULT_HIDE_ACKED = true;
 
+/** A custom bound as ISO UTC for the API, when it parses. The picker writes a
+ *  wall time in the browser zone ("2026-08-25T00:00"), and the chip states it
+ *  in that zone. The server reads a bound without an offset in the zone of
+ *  Security Onion, so the chip and the query disagreed where the two zones
+ *  differ. The URL keeps the value the picker wrote. */
+export function utcBound(value: string): string {
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? value : d.toISOString();
+}
+
 function seedFromLink(params: URLSearchParams): {
   sevs: string[];
   verdicts: string[];
@@ -303,7 +328,7 @@ const groupKey = (g: Pick<AlertGroup, 'kind' | 'name'>): string => `${g.kind}:${
 /** What a group write needs to know about its target. The drawer has only the
  *  investigation's name and type, so the counts and owner are optional. */
 type GroupRef = Pick<AlertGroup, 'name' | 'kind'> &
-  Partial<Pick<AlertGroup, 'owner' | 'ackedCount' | 'escalatedCount'>>;
+  Partial<Pick<AlertGroup, 'owner' | 'ackedCount' | 'escalatedCount' | 'cases' | 'casesComplete'>>;
 
 /** The count chip for a group's already-handled events — or the absence of one.
  *
@@ -324,11 +349,15 @@ function HandledChip({
   icon,
   colour,
   known,
+  cases,
 }: {
   count: number | null | undefined;
   icon: React.ReactNode;
   colour: { borderColor: string; background: string; color: string };
   known: (n: number) => string;
+  /** The cases the counted alerts are on. The chip links to the first case
+   *  with a page in the Security Onion console (R2-I2). */
+  cases?: CaseLink[];
 }) {
   const cls =
     'inline-flex flex-shrink-0 items-center gap-[3px] rounded-chip border px-[5px] py-[2px] font-mono text-[10px] font-semibold';
@@ -337,6 +366,28 @@ function HandledChip({
   // row shows one "uncounted" chip in their place, with the reason.
   if (count === null) return null;
   if (!count || count <= 0) return null;
+  const linked = (cases ?? []).find((c) => !!c.url);
+  if (linked?.url) {
+    const others = (cases ?? []).filter((c) => c.id !== linked.id).map((c) => c.id);
+    const label =
+      `${known(count)}. Open case ${linked.id} in Security Onion.` +
+      (others.length ? ` soc-ai found ${others.length === 1 ? 'case' : 'cases'} ${others.join(', ')} too.` : '');
+    return (
+      <a
+        href={linked.url}
+        target="_blank"
+        rel="noopener noreferrer"
+        aria-label={label}
+        title={label}
+        onClick={(e) => e.stopPropagation()}
+        className={`${cls} hover:brightness-125 hover:underline`}
+        style={colour}
+      >
+        {icon}
+        {count}
+      </a>
+    );
+  }
   return (
     <span title={known(count)} className={cls} style={colour}>
       {icon}
@@ -345,10 +396,10 @@ function HandledChip({
   );
 }
 
-/** Why a row shows no handled counts: the index of the detector cannot search
- *  the flags. */
+/** Why a row shows no handled counts: the index of the detection cannot
+ *  search the flags. */
 export const COUNTS_UNKNOWN =
-  "Security Onion cannot count the acknowledged and escalated alerts of this detection. This detector's index cannot search the flags. Expand the group to see what each event says.";
+  'Security Onion cannot count the acknowledged and escalated alerts of this detection. The index of this detection cannot search the flags. Expand the group to see what each event says.';
 
 /** Derive 1-2 char avatar initials from a username or token:<name> string. */
 function toInitials(owner: string): string {
@@ -393,13 +444,24 @@ function StateChip({ state }: { state?: TriageState | null }) {
   );
 }
 
-/** A compact, glanceable clock time for an event row ("14:23:05"). The full
- * date-time is exposed via the cell's title. */
-function clockTime(iso?: string): string {
+/** The time of an event row: the date, the 24 h clock time and, unless
+ *  `zone` is false, the zone of the browser ("Oct 19, 14:23:05 EDT"). A clock
+ *  time alone was ambiguous in a 30 day window, and a run of events read
+ *  "08:27:23 PM to 06:20:57 AM" across two days (dogfood 2026-10-19, R2-D17).
+ *  The year is in the title. */
+function eventStamp(iso?: string, zone = true): string {
   if (!iso) return '';
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return '';
-  return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  return d.toLocaleString(undefined, {
+    month: 'short',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+    ...(zone ? { timeZoneName: 'short' as const } : {}),
+  });
 }
 
 /** The entity an event-table cell may pivot to, or null when there is nothing
@@ -605,6 +667,22 @@ function VerdictMix({
  * the last RE-RUN of this rule crashed (error/cancelled/interrupted) or fell
  * back, while the real verdict still stands. Answers the "stayed at Needs Info"
  * mystery — the verdict chip stays primary; this is a quiet warning. */
+/** The analyst verdict on the alert behind the row, when the pill shows
+ *  another run. A newer model run hid it: the row read "False positive"
+ *  while the analyst true positive stood (V1-A3). */
+export function analystHint(
+  g: Pick<AlertGroup, 'analystVerdict' | 'analystBy' | 'analystInvId'>,
+  shownInvId: string | null,
+): { text: string; title: string; invId: string } | null {
+  if (!g.analystVerdict || !g.analystInvId || g.analystInvId === shownInvId) return null;
+  const word = verdictLabel(g.analystVerdict).toLowerCase();
+  return {
+    text: `· analyst: ${word}`,
+    title: `${g.analystBy || 'An analyst'} set the verdict of this alert to ${word} on another run. Open that run.`,
+    invId: g.analystInvId,
+  };
+}
+
 function LastRetryHint({ attempt }: { attempt: NonNullable<AlertGroup['lastAttempt']> }) {
   // "fallback" reads as "failed" for the operator; the other statuses name the
   // terminal state directly ("error"/"cancelled"/"interrupted").
@@ -620,8 +698,9 @@ function LastRetryHint({ attempt }: { attempt: NonNullable<AlertGroup['lastAttem
   );
 }
 
-/** Format an ISO timestamp as a human-readable absolute time for a tooltip.
- * Falls back to the raw string if it isn't parseable. */
+/** Format an ISO timestamp as a human-readable absolute time for a tooltip,
+ * with the zone of the browser (R2-D17). Falls back to the raw string if it
+ * isn't parseable. */
 function absTime(iso?: string): string | undefined {
   if (!iso) return undefined;
   const d = new Date(iso);
@@ -629,6 +708,7 @@ function absTime(iso?: string): string | undefined {
   return d.toLocaleString(undefined, {
     year: 'numeric', month: 'short', day: '2-digit',
     hour: '2-digit', minute: '2-digit', second: '2-digit',
+    timeZoneName: 'short',
   });
 }
 
@@ -702,7 +782,7 @@ function matchView(g: AlertGroup, view: ViewId, me: string): boolean {
   }
 }
 
-function EventRow({ ev, g, selEvents, setSelEvents, navigate, openDrawer, huntEvent }: {
+function EventRow({ ev, g, selEvents, setSelEvents, navigate, openDrawer, huntEvent, ackState, onAck }: {
   ev: AlertEvent;
   g: AlertGroup;
   selEvents: Record<string, boolean>;
@@ -710,6 +790,9 @@ function EventRow({ ev, g, selEvents, setSelEvents, navigate, openDrawer, huntEv
   navigate: ReturnType<typeof useNavigate>;
   openDrawer: (id: string) => void;
   huntEvent: (g: AlertGroup, ev: AlertEvent) => void;
+  /** This session's acknowledge of the event: in flight, or written. */
+  ackState?: 'pending' | 'done';
+  onAck: (ev: AlertEvent) => void;
 }) {
   // Resolved once per row: which of these are real values and
   // which are the backend's "—" placeholder (see pivotTarget).
@@ -717,12 +800,16 @@ function EventRow({ ev, g, selEvents, setSelEvents, navigate, openDrawer, huntEv
   const dstPivot = pivotTarget(ev.dst);
   const hostPivot = pivotTarget(ev.host);
   const hostIpPivot = pivotTarget(ev.hostIp);
+  // The name of the row in its controls: the time of the alert, else its id.
+  // The visible label of the Acknowledge button is the same for every row.
+  const stamp = eventStamp(ev.ts);
+  const which = stamp ? `at ${stamp}` : (ev.id ?? '');
   return (
     <div
       className="grid items-center gap-2.5 py-[7px] pl-[36px] pr-3.5 font-mono text-[11.5px] hover:bg-surface-2"
       style={{ gridTemplateColumns: EVENT_GRID }}
     >
-      {/* per-event checkbox */}
+      {/* per-event checkbox. It had no accessible name (R2-D18). */}
       <div onClick={(e) => e.stopPropagation()}>
         <Checkbox
           checked={!!(ev.id && selEvents[ev.id])}
@@ -731,11 +818,12 @@ function EventRow({ ev, g, selEvents, setSelEvents, navigate, openDrawer, huntEv
             setSelEvents((prev) => ({ ...prev, [ev.id!]: checked }));
           }}
           onClick={(e) => e.stopPropagation()}
+          aria-label={`Select the event ${which}`.trim()}
         />
       </div>
-      {/* this alert's OWN timestamp: clock time + relative age */}
+      {/* this alert's OWN timestamp: date, clock time, zone + relative age */}
       <div className="flex min-w-0 flex-col leading-tight" title={absTime(ev.ts) ?? ev.ts ?? ''}>
-        <span className="break-words text-text-2">{clockTime(ev.ts) || '—'}</span>
+        <span data-testid="event-time" className="break-words text-text-2">{eventStamp(ev.ts) || '—'}</span>
         {ev.ago && <span className="text-[10px] text-faint">{ev.ago} ago</span>}
       </div>
       {/* severity */}
@@ -809,8 +897,33 @@ function EventRow({ ev, g, selEvents, setSelEvents, navigate, openDrawer, huntEv
       <div className="flex min-w-0 items-center">
         <ProvenanceBadge ev={ev} onOpen={openDrawer} />
       </div>
-      {/* investigate this exact event */}
-      <div className="flex justify-end">
+      {/* acknowledge or investigate this exact event. The Ack took four
+          steps through the selection and the bulk bar (R2-I1). */}
+      <div className="flex items-center justify-end gap-1.5">
+        {ev.id && (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onAck(ev);
+            }}
+            disabled={!!ackState}
+            aria-label={`${ackState === 'done' ? 'Acknowledged' : 'Acknowledge'} the event ${which}`.trim()}
+            title={
+              ackState === 'done'
+                ? 'Security Onion acknowledged this event.'
+                : 'Acknowledge this event in Security Onion.'
+            }
+            aria-busy={ackState === 'pending' || undefined}
+            className={`inline-flex items-center whitespace-nowrap rounded-badge border px-[7px] py-[3px] font-sans text-[11px] font-semibold ${
+              ackState === 'done'
+                ? 'border-success-btn-border text-success'
+                : 'border-border-strong text-dim enabled:hover:border-success-btn-border enabled:hover:text-success disabled:opacity-60'
+            }`}
+          >
+            {ackState === 'done' ? 'Acknowledged' : 'Acknowledge'}
+          </button>
+        )}
         <button
           onClick={() => huntEvent(g, ev)}
           className="inline-flex items-center gap-1.5 rounded-badge border px-[9px] py-[3px] font-sans text-[11px] font-semibold text-accent"
@@ -829,11 +942,13 @@ const WIDEST_RANGE = '30d';
 /** The windows the screen may widen to on landing, narrowest first. */
 const LANDING_WINDOWS = ['7d', '30d'] as const;
 
-/** The next wider window an empty list offers, or null at the widest. */
-export function widerWindow(range: string): '7d' | '30d' | null {
-  if (range === '7d') return '30d';
-  if (range === WIDEST_RANGE) return null;
-  return '7d';
+/** True when the landing window `wider` is wider than `range`. Every preset
+ *  under 7 days is narrower than both. An empty custom range is offered both
+ *  too, and the probe picks the narrowest that holds a detection. */
+function widerThan(wider: (typeof LANDING_WINDOWS)[number], range: string): boolean {
+  if (range === WIDEST_RANGE) return false;
+  if (range === '7d') return wider === '30d';
+  return true;
 }
 
 /** "7d" as "7 days", "24h" as "24 hours", for a sentence. */
@@ -845,9 +960,17 @@ function windowWords(range: string): string {
   return `${n} ${unit}${n === 1 ? '' : 's'}`;
 }
 
-/** "14:05", the local clock time of a read. */
-function hhmm(ms: number): string {
-  return new Date(ms).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', hour12: false });
+/** "Oct 19, 14:05 EDT", the local date and time of a read, with the zone
+ *  (R2-D17). */
+function readTime(ms: number): string {
+  return new Date(ms).toLocaleString(undefined, {
+    month: 'short',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+    timeZoneName: 'short',
+  });
 }
 
 /**
@@ -900,9 +1023,9 @@ interface PendingWrite {
 }
 
 const WRITE_NOUN: Record<PendingWrite['kind'], string> = {
-  ack: 'acknowledge',
-  escalate: 'escalate',
-  assign: 'assign',
+  ack: 'acknowledgement',
+  escalate: 'escalation',
+  assign: 'assignment',
   release: 'release',
 };
 
@@ -926,6 +1049,55 @@ function writeLanded(
     case 'release':
       return !!g && !g.owner;
   }
+}
+
+/** The tone of an ack answer. A press that wrote nothing is not a success,
+ *  and the green check said it was (R2-D15). */
+function ackTone(r: AckGroupResult): ToastTone {
+  if (r.failed > 0) return 'danger';
+  return ackWroteNothing(r) ? 'info' : 'success';
+}
+
+/** The message and the tone after a bulk ack of more than one group.
+ *
+ *  Groups that wrote nothing are said apart from the groups that wrote. The
+ *  already-acknowledged tail counts only the groups that wrote: a group that
+ *  wrote nothing read its handled alerts again without the hide filter, so
+ *  the "cannot hide them" sentence of the tail is not true of it. */
+export function bulkAckMessage(
+  answered: Array<{ g: AlertGroup; r: AckGroupResult }>,
+  failedGroups: number,
+  timedOut: number,
+): [string, ToastTone] {
+  const wrote = answered.filter(({ r }) => !ackWroteNothing(r));
+  const idle = answered.filter(({ r }) => ackWroteNothing(r));
+  const acked = wrote.reduce((n, { r }) => n + r.acked, 0);
+  const failed = wrote.reduce((n, { r }) => n + r.failed, 0);
+  const idleAlready = idle.reduce((n, { r }) => n + (r.already_acked ?? 0), 0);
+  const tail = ackTail({
+    capped: answered.some(({ r }) => r.capped),
+    remaining: answered.reduce((n, { r }) => n + (r.remaining ?? 0), 0),
+    already_acked: wrote.reduce((n, { r }) => n + (r.already_acked ?? 0), 0),
+  });
+  if (!wrote.length && !failedGroups && !timedOut) {
+    const remaining = idle.reduce((n, { r }) => n + (r.remaining ?? 0), 0);
+    const sentences = [
+      idleAlready > 0
+        ? `${plural(idleAlready, 'alert')} of the ${plural(idle.length, 'group')} ${idleAlready === 1 ? 'is' : 'are'} already acknowledged.`
+        : `No alert of the ${plural(idle.length, 'group')} waits for an acknowledgement.`,
+      'soc-ai wrote nothing.',
+    ];
+    if (remaining > 0) sentences.push(`${plural(remaining, 'alert')} left. Press again to continue.`);
+    return [sentences.join(' '), 'info'];
+  }
+  const parts: string[] = [];
+  if (wrote.length) parts.push(`Acknowledged ${plural(acked, 'alert')} across ${plural(wrote.length, 'group')}`);
+  if (failed) parts.push(`${plural(failed, 'event')} failed`);
+  if (idle.length) parts.push(`${plural(idle.length, 'group')} already acknowledged`);
+  if (failedGroups) parts.push(`${plural(failedGroups, 'group')} failed. The failed groups stay selected. Select Acknowledge to try again.`);
+  if (timedOut) parts.push(`${plural(timedOut, 'group')} did not answer yet`);
+  const tone: ToastTone = failed || failedGroups ? 'danger' : wrote.length ? 'success' : 'info';
+  return [parts.join(' · ') + tail, tone];
 }
 
 export function Alerts() {
@@ -988,7 +1160,7 @@ export function Alerts() {
 
   const alertQuery: AlertQuery = {
     ...(filterTime === 'custom' && customRange
-      ? { range: 'custom', from: customRange.from, to: customRange.to }
+      ? { range: 'custom', from: utcBound(customRange.from), to: utcBound(customRange.to) }
       : { range: filterTime }),
     hideAcked: hideAcked || undefined,
     // In alertQuery (not a one-off param) so the lazy event pages and the
@@ -1007,7 +1179,9 @@ export function Alerts() {
   // seconds (P7), so the poll stops until the filter changes.
   const badFilterRef = useRef(false);
   const { data: queue, loading, error, lastUpdated, failCount, refetch } = useAsync(
-    () => getAlerts(alertQuery),
+    // links: the same-flow siblings and the case ids of each row (R2-I9,
+    // R2-I2). Only this screen asks for them.
+    () => getAlerts({ ...alertQuery, links: true }),
     [filterTime, customRange?.from, customRange?.to, hideAcked, filterQ, reloadKey],
     {
       refetchInterval: 10000, // keep the grid + verdict/status badges live without a reload
@@ -1050,26 +1224,12 @@ export function Alerts() {
       mounted.current = false;
     };
   }, []);
+  // The first read of the default window decides the landing once. A list
+  // that has rows on landing is not widened later, when it empties.
   useEffect(() => {
     if (!plainLanding.current || windowChosen.current || probed.current) return;
     if (loading || error || !queue || filterTime !== DEFAULT_RANGE) return;
-    probed.current = true;
-    if (queue.groups.length > 0) return;
-    void (async () => {
-      for (const wider of LANDING_WINDOWS) {
-        const found = await getAlerts({ ...alertQuery, range: wider }).catch(() => null);
-        // A failed probe leaves the default window. The list reports its
-        // own read, and a second error line about a probe adds nothing.
-        if (!mounted.current || windowChosen.current || !found) return;
-        if (found.groups.length > 0) {
-          setWidenedFrom(DEFAULT_RANGE);
-          setFilterTime(wider);
-          return;
-        }
-      }
-    })();
-    // alertQuery is rebuilt every render; the probe reads it once.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    if (queue.groups.length > 0) probed.current = true;
   }, [queue, loading, error, filterTime]);
 
   // The rows, and separately whether they are all the rows. The grid caps every
@@ -1536,10 +1696,84 @@ export function Alerts() {
       if (!writeLanded(p, byKey.get(gk), queryKey, me)) continue;
       dismissToast(p.toastId);
       delete pendingWrites.current[gk];
-      toast({ message: `The ${WRITE_NOUN[p.kind]} of ${p.name} landed.`, tone: 'success' });
+      toast({ message: `The ${WRITE_NOUN[p.kind]} of ${p.name} is complete.`, tone: 'success' });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [groups]);
+
+  // This session's acknowledges of single events, keyed by event id. An
+  // expanded group does not read its events again after a write, so the row
+  // reads its Ack state from here.
+  const [eventAck, setEventAck] = useState<Record<string, 'pending' | 'done'>>({});
+
+  /** Acknowledge events by id: the Ack of one row, or the loose events of the
+   *  bulk bar. The answer is always said. The client dropped it, so a 200
+   *  with failures said nothing (R2-D7). The server takes at most ACK_CAP ids,
+   *  so a larger selection goes in more than one press. */
+  const ackSomeEvents = async (ids: string[]): Promise<void> => {
+    const blocked = demoBlocked(demo);
+    if (blocked) { showAckMsg(blocked); return; } // demo: no doomed write
+    const batch = ids.slice(0, ACK_CAP);
+    const left = ids.length - batch.length;
+    const selected = batch.some((id) => selEvents[id]);
+    const mark = (state: 'pending' | 'done' | null) =>
+      setEventAck((m) => {
+        const next = { ...m };
+        batch.forEach((id) => {
+          if (state) next[id] = state;
+          else delete next[id];
+        });
+        return next;
+      });
+    const unselect = () =>
+      setSelEvents((prev) => {
+        const next = { ...prev };
+        batch.forEach((id) => delete next[id]);
+        return next;
+      });
+    mark('pending');
+    try {
+      const r = await ackEvents(batch);
+      if (r.failed > 0) {
+        // The answer does not say which events failed, so the selection stays
+        // whole and the same press tries again.
+        mark(null);
+        showAckMsg(
+          `Acknowledged ${r.acked.toLocaleString()} of ${plural(r.acked + r.failed, 'event')}. ${plural(r.failed, 'event')} failed.` +
+            (selected ? ' The events stay selected. Select Acknowledge to try again.' : ''),
+          'danger',
+        );
+      } else {
+        mark('done');
+        unselect();
+        const parts = [r.acked > 0 ? `Acknowledged ${plural(r.acked, 'event')}.` : 'soc-ai wrote nothing.'];
+        if (left > 0) parts.push(`${plural(left, 'event')} left. Press again to continue.`);
+        showAckMsg(parts.join(' '), r.acked > 0 ? 'success' : 'info');
+      }
+      setReloadKey((k) => k + 1);
+    } catch (err: unknown) {
+      mark(null);
+      if (isRequestTimeout(err)) {
+        // Not a failure: the write can still land. The notice says so, the
+        // list reads again, and the selection goes. A red toast over a
+        // standing selection invited a second write of the same events.
+        toast({
+          message: `No answer yet for the acknowledgement of ${plural(batch.length, 'event')}. ${err.message}`,
+          tone: 'info',
+          duration: 0,
+        });
+        unselect();
+        setReloadKey((k) => k + 1);
+        return;
+      }
+      // The selection is deliberately left standing so the same click
+      // retries it, as the group path does.
+      showAckMsg(
+        err instanceof Error ? err.message : 'Could not acknowledge the selected events',
+        'danger',
+      );
+    }
+  };
 
   // Groups with an escalate in flight. The ack has its strip in the activity
   // slot; an escalate had nothing, so a slow one read as a dead key press.
@@ -1554,11 +1788,11 @@ export function Alerts() {
     const blocked = demoBlocked(demo);
     if (blocked) { showAckMsg(blocked); return; } // demo: no doomed write
     setAckingCount(1);
-    setAckingAlertTotal(g.count || 0);
+    setAckingAlertTotal(pressPlan([g], [g], ACK_CAP)?.press ?? g.count ?? 0);
     setAcking(true);
     ackGroup(g, alertQuery)
       .then((r) => {
-        showAckMsg(ackMessage(r, g.name));
+        showAckMsg(ackMessage(r, g.name, { unhidable: g.ackedCount === null }), ackTone(r));
         setReloadKey((k) => k + 1);
       })
       .catch((err: unknown) => {
@@ -1586,10 +1820,11 @@ export function Alerts() {
         .then((r) => {
           toast({
             message: escalateMessage(r, g.name),
-            tone: r.failed > 0 ? 'danger' : 'success',
+            // A press that opened no case wears no success check (R2-D15).
+            tone: r.failed > 0 ? 'danger' : escalateWroteNothing(r) ? 'info' : 'success',
             links: escalateLinks(r),
             // A case id is something to copy; do not take it away at 6 s.
-            duration: (r.cases?.length ?? 0) > 0 ? 0 : undefined,
+            duration: escalateNamesCase(r) ? 0 : undefined,
           });
           setReloadKey((k) => k + 1);
         })
@@ -1624,7 +1859,12 @@ export function Alerts() {
     if (!fresh.length) return;
     setEscalateAsk({ targets: fresh, query, onConfirm });
   };
-  const escalateAskCount = escalateAsk ? escalateAlertCount(escalateAsk.targets, groups ?? []) : null;
+  // The plan of the press on confirm. A write under another window than the
+  // list (the drawer's) cannot be planned from these rows, so it has none.
+  const escalateAskPlan =
+    escalateAsk && JSON.stringify(escalateAsk.query) === queryKey
+      ? pressPlan(escalateAsk.targets, groups ?? [], ESCALATE_CAP)
+      : null;
   const escalateOneGroup = (g: AlertGroup) => askEscalate([g]);
   const escalatingNames = Object.values(escalating);
 
@@ -1775,11 +2015,12 @@ export function Alerts() {
   // the same facets the list is already under. Counted off the raw fetch, the
   // chips described a list nobody was looking at, and the All chip disagreed
   // with the footer directly below it.
+  const facet = (rows: AlertGroup[]): AlertGroup[] =>
+    hideOptimisticallyAcked(rows, optimisticAcked, hideAcked)
+      .filter((g) => !filterSevs.length || filterSevs.includes(g.sev))
+      .filter(matchesVerdict);
   const faceted = useMemo(
-    () =>
-      hideOptimisticallyAcked(groups ?? [], optimisticAcked, hideAcked)
-        .filter((g) => !filterSevs.length || filterSevs.includes(g.sev))
-        .filter(matchesVerdict),
+    () => facet(groups ?? []),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [groups, filterSevs, filterVerdicts, optimisticAcked, hideAcked],
   );
@@ -1790,6 +2031,74 @@ export function Alerts() {
         .sort((a, b) => cmpGroups(a, b, sort.key, sort.dir)),
     [faceted, view, me, sort],
   );
+
+  // A sibling the analyst asked to see from the same-flow list (R2-I9). The
+  // row expands and takes the keyboard focus. The server read the whole
+  // window, so a sibling the list hides is in the window: Hide acknowledged
+  // and the facets are the usual cause, and the press clears them. `after`
+  // is the read the filter change waits past. null when no filter changed.
+  const [pendingShow, setPendingShow] = useState<{ key: string; name: string; after: number | null } | null>(null);
+  const showSibling = (s: AlertSibling) => {
+    const key = groupKey({ kind: s.kind, name: s.name });
+    let changed = false;
+    if (!visible.some((g) => groupKey(g) === key)) {
+      if (hideAcked && !(groups ?? []).some((g) => groupKey(g) === key)) {
+        setHideAcked(false);
+        changed = true;
+      }
+      if (filterSevs.length) {
+        setFilterSevs([]);
+        changed = true;
+      }
+      if (filterVerdicts.length) {
+        setFilterVerdicts([]);
+        changed = true;
+      }
+      if (view !== 'all') {
+        setView('all');
+        changed = true;
+      }
+    }
+    setPendingShow({ key, name: s.name, after: changed ? lastUpdated ?? 0 : null });
+  };
+  // A Show link from a report names the row with ?show=<type>:<name> (V3).
+  // The link also names the window, and the screen seeds the window and the
+  // filters from the URL at mount. The row opens after the first read. The
+  // parameter then leaves the URL, so a reload does not open the row again.
+  const showParam = searchParams.get('show');
+  useEffect(() => {
+    if (!showParam) return;
+    const at = showParam.indexOf(':');
+    setPendingShow({ key: showParam, name: at >= 0 ? showParam.slice(at + 1) : showParam, after: lastUpdated ?? 0 });
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        next.delete('show');
+        return next;
+      },
+      { replace: true },
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showParam]);
+  useEffect(() => {
+    if (!pendingShow) return;
+    const g = visible.find((x) => groupKey(x) === pendingShow.key);
+    if (g) {
+      setPendingShow(null);
+      setFocusedKey(pendingShow.key);
+      if (!expanded[pendingShow.key]) toggleExpand(g);
+      return;
+    }
+    // Wait for the read after a filter change. Then say why the row is not
+    // there: the filter of the list or the row limit hides it.
+    if (pendingShow.after !== null && (lastUpdated ?? 0) <= pendingShow.after) return;
+    setPendingShow(null);
+    showAckMsg(
+      `The list does not show ${pendingShow.name}. The alert filter or the row limit hides it.`,
+      'info',
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingShow, visible, lastUpdated]);
 
   // The next alert with a report, after the one the drawer shows (dogfood
   // 2026-10-06, first hour W1). Each alert took two clicks: close the
@@ -1843,6 +2152,65 @@ export function Alerts() {
     // alertQuery is rebuilt every render; depend on the window it is built from.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isEmpty, filterTime, customRange?.from, customRange?.to, reloadKey]);
+
+  // The wider window an empty list offers, found by a read (R2-D20, R2-I8).
+  // The list offered "Show the last 7 days" where the last 7 days were empty
+  // too. The probe reads the wider windows narrowest first, under the same
+  // filters, and the button names the window and its count of detections.
+  // On a plain landing the same probe widens the list instead.
+  const [widerOffer, setWiderOffer] = useState<{
+    key: string;
+    range: (typeof LANDING_WINDOWS)[number] | null;
+    count: number | null;
+  } | null>(null);
+  const offerKey = JSON.stringify([
+    queryKey,
+    view,
+    view === 'mine' ? me : '',
+    filterSevs,
+    filterVerdicts,
+    reloadKey,
+  ]);
+  useEffect(() => {
+    if (!isEmpty) return;
+    const landing =
+      plainLanding.current && !windowChosen.current && !probed.current && filterTime === DEFAULT_RANGE;
+    if (landing) probed.current = true;
+    const candidates = LANDING_WINDOWS.filter((w) => widerThan(w, filterTime));
+    if (!candidates.length) return;
+    const key = offerKey;
+    let cancelled = false;
+    void (async () => {
+      for (const wider of candidates) {
+        const found = await getAlerts({ ...alertQuery, range: wider }).catch(() => null);
+        if (cancelled || !mounted.current) return;
+        if (!found) {
+          // A failed read says nothing about the wider window. The list
+          // reports its own read, so the button offers the next window and
+          // claims no count.
+          if (!landing) setWiderOffer({ key, range: candidates[0], count: null });
+          return;
+        }
+        const count = facet(found.groups).filter((g) => matchView(g, view, me)).length;
+        if (count > 0) {
+          if (landing && !windowChosen.current) {
+            setWidenedFrom(DEFAULT_RANGE);
+            setFilterTime(wider);
+          } else {
+            setWiderOffer({ key, range: wider, count });
+          }
+          return;
+        }
+      }
+      setWiderOffer({ key, range: null, count: 0 });
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // alertQuery and facet are rebuilt every render; offerKey names what they read.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isEmpty, offerKey]);
+  const offer = widerOffer && widerOffer.key === offerKey ? widerOffer : null;
 
   const visIds = visible.map(groupKey);
   // The shared selection hook. Keyed by the STABLE group key, not the list
@@ -1982,6 +2350,9 @@ export function Alerts() {
   };
   selectedRef.current = selCount + selectedEventIds.length;
   const alertsInWindow = selectedGroups.reduce((n, g) => n + (g.count || 0), 0);
+  // What one press of the bulk Acknowledge writes (R2-D8).
+  const ackPlan = pressPlan(selectedGroups, selectedGroups, ACK_CAP);
+  const ackOff = ackButtonOffReason(ackPlan);
 
   const toggleSelectAll = () => sel.toggleAll();
 
@@ -2052,9 +2423,9 @@ export function Alerts() {
   const floorOf = (n: number, one: string, many = `${one}s`): string =>
     counted && truncated ? `${n.toLocaleString()}+ ${many}` : countOf(n, one, many);
   const FLOOR_TITLE =
-    'The grid returned the biggest detections. The grid stopped at its group ceiling. These ' +
-    'numbers are floors. This window holds more detections than the queue can show. Narrow ' +
-    'the window, the severity, or the query until the queue fits.';
+    'The grid returned the largest detections and stopped at its group limit. These numbers ' +
+    'are minimums. This window holds more detections than the queue can show. Narrow the ' +
+    'window, the severity or the query until the queue shows every detection.';
 
   const TABS: Array<{ id: ViewId; label: string; count: number | undefined }> = [
     { id: 'mine', label: 'Mine', count: chipCount(counts.mine) },
@@ -2219,7 +2590,9 @@ export function Alerts() {
           {acking && (
             <div className="flex items-center gap-2.5 text-[13px]">
               <Spinner size={14} />
-              <span className="font-semibold text-text-2">Security Onion acknowledges {ackingCount} group{ackingCount !== 1 ? 's' : ''}. The groups hold {ackingAlertTotal} alert{ackingAlertTotal !== 1 ? 's' : ''}.</span>
+              <span className="font-semibold text-text-2">
+                Security Onion acknowledges up to {plural(ackingAlertTotal, 'alert')} in {plural(ackingCount, 'group')}.
+              </span>
             </div>
           )}
           {escalatingNames.length > 0 && (
@@ -2237,7 +2610,12 @@ export function Alerts() {
           so they read as the same mechanism as a saved view — one is a view
           this screen ships with, the other one the analyst named. The selection
           strip takes the facet row's slot, which is where that behaviour came
-          from in the first place. */}
+          from in the first place.
+          The selection strip sticks to the top of the page, so the bulk
+          actions stay in view for a selection low on the page (R2-D16). The
+          holder and the toolbar box take no box of their own, so the strip
+          sticks for the height of the page and the toolbar keeps its layout. */}
+      <div data-testid="alerts-toolbar" className={STICKY_SELECTION}>
       <ListToolbar
         presets={TABS.map((t) => ({ id: t.id, label: t.label, count: t.count, active: view === t.id }))}
         onPreset={(id) => {
@@ -2365,7 +2743,7 @@ export function Alerts() {
                           sel.select(failedIds);
                           dropEventsOutside(targets, failedIds);
                           if (failedIds.length) {
-                            showAckMsg(`Assigned ${ok} of ${n} group${n !== 1 ? 's' : ''} · ${failedIds.length} failed. The failed groups stay selected. Click Assign to me to retry.`, 'danger');
+                            showAckMsg(`Assigned ${ok} of ${n} group${n !== 1 ? 's' : ''} · ${failedIds.length} failed. The failed groups stay selected. Select Assign to me to try again.`, 'danger');
                           } else if (ok > 0) {
                             showAckMsg(`Assigned ${ok} group${ok !== 1 ? 's' : ''} to you`);
                           }
@@ -2385,30 +2763,19 @@ export function Alerts() {
                       if (blocked) { showAckMsg(blocked); return; } // demo: no doomed write (before setAcking so the strip shows)
                       const targets = selectedGroups;
                       const n = targets.length;
-                      const alertTotal = alertsInWindow;
                       setAckingCount(n);
-                      setAckingAlertTotal(alertTotal);
+                      setAckingAlertTotal(ackPlan?.press ?? alertsInWindow);
                       setAcking(true);
                       // allSettled: one group failing must not wipe the whole batch. Keep
                       // failed groups selected so the analyst can retry them.
                       Promise.allSettled(targets.map((g) => ackGroup(g, alertQuery)))
                         .then((outcomes) => {
                           const failedIds: string[] = [];
-                          let totalAcked = 0;
-                          let totalFailed = 0;
-                          let okGroups = 0;
-                          let anyCapped = false;
-                          let totalRemaining = 0;
-                          let totalAlready = 0;
+                          const answered: Array<{ g: AlertGroup; r: AckGroupResult }> = [];
                           let timedOut = 0;
                           outcomes.forEach((o, i) => {
                             if (o.status === 'fulfilled') {
-                              okGroups += 1;
-                              totalAcked += o.value.acked;
-                              totalFailed += o.value.failed;
-                              totalRemaining += o.value.remaining ?? 0;
-                              totalAlready += o.value.already_acked ?? 0;
-                              if (o.value.capped) anyCapped = true;
+                              answered.push({ g: targets[i], r: o.value });
                             } else if (isRequestTimeout(o.reason)) {
                               // Not a failure: the write may still land. Its own
                               // notice says so, and the poll clears it.
@@ -2422,23 +2789,23 @@ export function Alerts() {
                           // Clear only the groups that succeeded; retain failed ones for retry.
                           sel.select(failedIds);
                           dropEventsOutside(targets, failedIds);
-                          if (okGroups > 0 || failedGroups > 0) {
-                            const parts = [`Acknowledged ${plural(totalAcked, 'alert')} across ${plural(okGroups, 'group')}`];
-                            if (totalFailed) parts.push(`${plural(totalFailed, 'event')} failed`);
-                            if (failedGroups) parts.push(`${plural(failedGroups, 'group')} failed. The failed groups stay selected. Click Acknowledge to retry.`);
-                            if (timedOut) parts.push(`${plural(timedOut, 'group')} did not answer yet`);
-                            showAckMsg(
-                              parts.join(' · ') + ackTail({ capped: anyCapped, remaining: totalRemaining, already_acked: totalAlready }),
-                              totalFailed || failedGroups ? 'danger' : 'success',
-                            );
+                          if (answered.length === 1 && !failedGroups && !timedOut) {
+                            // One group: the sentence of the `a` key, so a
+                            // second press names what is already done (R2-D15).
+                            const { g, r } = answered[0];
+                            showAckMsg(ackMessage(r, g.name, { unhidable: g.ackedCount === null }), ackTone(r));
+                          } else if (answered.length > 0 || failedGroups > 0) {
+                            showAckMsg(...bulkAckMessage(answered, failedGroups, timedOut));
                           }
                           setReloadKey((k) => k + 1);
                         })
                         .finally(() => setAcking(false));
                     }}
-                    className="rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-1.5 text-[12.5px] font-semibold text-text hover:border-success-btn-border hover:text-success"
+                    disabled={ackOff != null}
+                    title={ackOff ?? ackButtonTitle(ackPlan)}
+                    className="rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-1.5 text-[12.5px] font-semibold text-text enabled:hover:border-success-btn-border enabled:hover:text-success disabled:opacity-50"
                   >
-                    {`Acknowledge ${selectedGroups.length} group${selectedGroups.length !== 1 ? 's' : ''} · ${alertsInWindow.toLocaleString()} alert${alertsInWindow !== 1 ? 's' : ''}`}
+                    {ackButtonLabel(selectedGroups.length, ackPlan)}
                   </button>
                   )}
                   {selectedGroups.length > 0 && (
@@ -2462,27 +2829,25 @@ export function Alerts() {
                     <button
                       disabled={ackingEvents}
                       onClick={async () => {
-                        const blocked = demoBlocked(demo);
-                        if (blocked) { showAckMsg(blocked); return; } // demo: no doomed write
                         setAckingEvents(true);
                         try {
-                          await ackEvents(looseEventIds);
-                          setSelEvents({});
-                          setReloadKey((k) => k + 1);
-                        } catch (err: unknown) {
-                          // The selection is deliberately left standing so the
-                          // same click retries it, as the group path does.
-                          showAckMsg(
-                            err instanceof Error ? err.message : 'Could not acknowledge the selected events',
-                            'danger',
-                          );
+                          await ackSomeEvents(looseEventIds);
                         } finally {
                           setAckingEvents(false);
                         }
                       }}
+                      title={
+                        looseEventIds.length > ACK_CAP
+                          ? `One press acknowledges at most ${ACK_CAP} events. Press again for the other ${plural(looseEventIds.length - ACK_CAP, 'event')}.`
+                          : undefined
+                      }
                       className="rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-1.5 text-[12.5px] font-semibold text-text hover:border-success-btn-border hover:text-success disabled:opacity-50"
                     >
-                      {ackingEvents ? 'Acknowledging' : `Acknowledge ${looseEventIds.length} event${looseEventIds.length !== 1 ? 's' : ''}`}
+                      {ackingEvents
+                        ? 'Acknowledging'
+                        : looseEventIds.length > ACK_CAP
+                          ? `Acknowledge ${ACK_CAP} of ${plural(looseEventIds.length, 'event')}`
+                          : `Acknowledge ${plural(looseEventIds.length, 'event')}`}
                     </button>
                   )}
                   </>
@@ -2580,6 +2945,7 @@ export function Alerts() {
           </span>
         )}
       </ListToolbar>
+      </div>
 
       {/* Group-hunt (pivot) representative reason — a subtle 12px annotation
           attached beneath the context row, not a standalone strip (DESIGN Q4). */}
@@ -2613,7 +2979,7 @@ export function Alerts() {
             Severity{caret('sev')}
           </div>
           <div className={hdrCls('verdict')} onClick={() => toggleSort('verdict')}>
-            soc·ai verdict{caret('verdict')}
+            soc-ai verdict{caret('verdict')}
           </div>
           <div className={`text-right ${hdrCls('conf')}`} onClick={() => toggleSort('conf')}>
             Conf{caret('conf')}
@@ -2653,7 +3019,7 @@ export function Alerts() {
             role="status"
             className="mx-3 mt-2 rounded-card border border-[rgba(245,166,35,.35)] bg-[rgba(245,166,35,.06)] px-3 py-1.5 text-[12px] text-text-2"
           >
-            Showing the last good read from {hhmm(lastUpdated)}. The grid did not answer.
+            Showing the last good read from {readTime(lastUpdated)}. The grid did not answer.
           </div>
         )}
         {widenedFrom && groups && groups.length > 0 && (
@@ -2666,6 +3032,7 @@ export function Alerts() {
             {windowWords(filterTime)}.
           </div>
         )}
+        <GridGapStrip range={filterTime} custom={customRange} className="mx-3 mt-2" />
         {isEmpty && (
           <div
             className="px-4 py-10 text-center text-[13px] text-faint"
@@ -2689,14 +3056,15 @@ export function Alerts() {
             ) : null}
             {/* The way out, as a control. "Widen the time range" pointed at a
                 filter bar and offered nothing to press (dogfood 2026-10-06). */}
-            {widerWindow(filterTime) && (
+            {offer?.range && (
               <button
                 type="button"
                 data-testid="alerts-widen"
-                onClick={() => chooseWindow(widerWindow(filterTime)!)}
+                onClick={() => chooseWindow(offer.range!)}
                 className="mt-3 rounded-control border border-border-strong bg-surface-3 px-3 py-1.5 text-[12px] font-semibold text-text-2 hover:border-accent hover:text-text"
               >
-                Show the last {windowWords(widerWindow(filterTime)!)}
+                Show the last {windowWords(offer.range)}
+                {offer.count != null ? ` · ${plural(offer.count, 'detection')}` : ''}
               </button>
             )}
           </div>
@@ -2781,8 +3149,8 @@ export function Alerts() {
                         other sources the group holds, and the machine. The row
                         showed none of it until it was expanded (dogfood
                         2026-10-06, W3). A host log has no flow, and says so. */}
-                    {(g.src || g.dst || g.host) && (
-                      <div data-testid="group-who" className="flex min-w-0 flex-wrap items-center gap-x-1.5 font-mono text-[10.5px] text-faint">
+                    {(g.src || g.dst || g.host || (g.siblingCount ?? 0) > 0) && (
+                      <div data-testid="group-who" className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 font-mono text-[10.5px] text-faint">
                         {g.src || g.dst ? (
                           <FlowBadge src={g.src} dst={g.dst} className="text-[10.5px]" />
                         ) : null}
@@ -2798,6 +3166,17 @@ export function Alerts() {
                           <span className="min-w-0 break-all">
                             {g.src || g.dst ? `· on ${g.host}` : `on ${g.host} · host log`}
                           </span>
+                        )}
+                        {/* The other detections on this flow (R2-I9, R2-D9). */}
+                        {g.siblings && (g.siblingCount ?? 0) > 0 && (
+                          <SameFlowChip
+                            verdict={g.fallback ? null : pill.verdict}
+                            siblings={g.siblings}
+                            count={g.siblingCount ?? g.siblings.length}
+                            partial={!!g.siblingsPartial}
+                            onShow={showSibling}
+                            onOpen={openDrawer}
+                          />
                         )}
                       </div>
                     )}
@@ -2886,6 +3265,24 @@ export function Alerts() {
                       else. The row said "False positive" over a group that held
                       a true positive (dogfood 2026-10-06, S5). */}
                   {!g.triaging && <VerdictMix g={g} shown={g.fallback ? null : pill.verdict} onOpen={openDrawer} />}
+                  {!g.triaging &&
+                    (() => {
+                      const hint = analystHint(g, g.fallback ? g.invId ?? null : pill.invId);
+                      return hint ? (
+                        <button
+                          type="button"
+                          data-testid={`analyst-verdict-${g.id}`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            openDrawer(hint.invId);
+                          }}
+                          title={hint.title}
+                          className="font-mono text-[10.5px] font-semibold text-warn hover:underline"
+                        >
+                          {hint.text}
+                        </button>
+                      ) : null;
+                    })()}
                   {/* E2.1: a later re-run failed on top of the standing verdict —
                       a secondary red hint; the verdict chip above stays primary.
                       Backend nulls this for triaging + fallback-standing rows. */}
@@ -2916,7 +3313,7 @@ export function Alerts() {
                         e.stopPropagation();
                         release(g);
                       }}
-                      title={`Assigned to ${owner}. Click to release it.`}
+                      title={`Assigned to ${owner}. Select to release it.`}
                       aria-label={`Release ${g.name}`}
                       className="flex h-[25px] w-[25px] items-center justify-center rounded-full border border-border-strong bg-[#1a2330] text-[9.5px] font-bold text-[#b9c2cf] hover:border-danger hover:text-danger"
                     >
@@ -2960,7 +3357,9 @@ export function Alerts() {
                         count={g.escalatedCount}
                         icon={<ArrowUpRight size={9} strokeWidth={2.5} />}
                         colour={{ borderColor: 'rgba(251,146,60,.35)', background: 'rgba(251,146,60,.08)', color: '#fb923c' }}
-                        known={(n) => `${n} escalated`}
+                        // "1 escalated." read as a sentence with no noun (V3).
+                        known={(n) => `${alertsAre(n)} on a case`}
+                        cases={g.cases}
                       />
                       {(g.ackedCount === null || g.escalatedCount === null) && (
                         <span
@@ -3123,6 +3522,10 @@ export function Alerts() {
                           navigate={navigate}
                           openDrawer={openDrawer}
                           huntEvent={huntEvent}
+                          ackState={ev.id ? eventAck[ev.id] : undefined}
+                          onAck={(e) => {
+                            if (e.id) void ackSomeEvents([e.id]);
+                          }}
                         />
                       ));
                     }
@@ -3148,9 +3551,11 @@ export function Alerts() {
                             aria-label={`Select ${b.events.length} identical events`}
                           />
                         </div>
-                        {/* span of the collapsed run: oldest–newest clock time */}
+                        {/* span of the collapsed run: both ends dated, one zone.
+                            A clock time alone hid a run that crossed midnight
+                            (R2-D17). */}
                         <div className="flex min-w-0 flex-col leading-tight" title={`${absTime(b.first) ?? ''} to ${absTime(b.last) ?? ''}`}>
-                          <span className="break-words text-text-2">{clockTime(b.first) || '—'} to {clockTime(b.last) || '—'}</span>
+                          <span data-testid="event-time" className="break-words text-text-2">{eventStamp(b.first, false) || '—'} to {eventStamp(b.last) || '—'}</span>
                           {b.head.ago && <span className="text-[10px] text-faint">newest {b.head.ago} ago</span>}
                         </div>
                         {/* severity */}
@@ -3213,11 +3618,11 @@ export function Alerts() {
       </div>
 
       <div className="mt-2.5 font-mono text-[12px] text-faint">
-        {countOf(shown, 'detection')} · grouped · click a row to expand events
+        {countOf(shown, 'detection')} · grouped · select a row to expand its events
       </div>
 
       {/* keyboard cheatsheet (E2.5) — `?` opens; Esc / backdrop closes */}
-      {keyHelpOpen && <KeyHelpOverlay onClose={() => setKeyHelpOpen(false)} />}
+      {keyHelpOpen && <KeyHelpOverlay onClose={() => setKeyHelpOpen(false)} rowKeys />}
 
       {/* investigation drawer */}
       <AlertDrawer
@@ -3238,12 +3643,18 @@ export function Alerts() {
         escalatingNames={escalatingNames}
         nextName={nextReport?.name ?? null}
         onNext={openNextReport}
+        onShowSibling={(s) => {
+          // The drawer closes and hands the focus to the row of the sibling.
+          drawerRowKeyRef.current = groupKey({ kind: s.kind, name: s.name });
+          closeDrawer();
+          showSibling(s);
+        }}
       />
 
       {escalateAsk && (
         <EscalateConfirm
           targets={escalateAsk.targets}
-          alerts={escalateAskCount}
+          plan={escalateAskPlan}
           onCancel={() => setEscalateAsk(null)}
           onConfirm={() => {
             const ask = escalateAsk;
@@ -3269,37 +3680,202 @@ export function nextReportAfter(
   return list.slice(i + 1).find((g) => !!g.invId) ?? null;
 }
 
-/** The alerts an escalate of these groups covers: one case for each. Null
- *  when a group is not on the page and its count is unknown. */
-export function escalateAlertCount(targets: GroupRef[], groups: AlertGroup[]): number | null {
-  let total = 0;
+/** The per-press caps of the group writes, as the server enforces them
+ *  (routes_alert_actions.py: _ACK_CAP, _ESCALATE_CAP). ack-events takes at
+ *  most ACK_CAP ids too. */
+export const ACK_CAP = 199;
+export const ESCALATE_CAP = 25;
+
+/** The classes that hold the selection strip of the list toolbar sticky to
+ *  the top of the scroll area (R2-D16). A sticky box stays inside its parent,
+ *  and the parent of the strip is the toolbar box, which ends under the strip.
+ *  So the holder and the toolbar box take `display: contents`, and the strip
+ *  sticks inside the page. */
+const STICKY_SELECTION =
+  'contents [&>div]:contents [&_[data-testid=list-toolbar-selection]]:sticky [&_[data-testid=list-toolbar-selection]]:top-2 [&_[data-testid=list-toolbar-selection]]:z-30 [&_[data-testid=list-toolbar-selection]]:shadow-dropdown';
+
+/** What one press of a group write does, from the rows on screen. */
+export interface PressPlan {
+  /** The alerts of the targets in the window. */
+  total: number;
+  /** The alerts this press writes: the open alerts, at most the cap for each
+   *  group. */
+  press: number;
+  /** The open alerts past the cap. A further press writes them. */
+  rest: number;
+  /** True when the grid cannot count the handled alerts of a target. The
+   *  press then writes at most `press` alerts. */
+  upTo: boolean;
+  /** The alerts already on a case, and the alerts only acknowledged. */
+  escalated: number;
+  acked: number;
+  /** The cases the targets are on, one entry per case, from the rows
+   *  (R2-I2). Empty when the rows name no case. */
+  cases: CaseLink[];
+  /** True when `cases` covers every alert already on a case. */
+  casesComplete: boolean;
+}
+
+/** The plan of one press over the targets, each capped at `cap`, or null when
+ *  a target is not on the page and its count is unknown.
+ *
+ *  The confirm said "Open 1 Security Onion case" for a group already on a
+ *  case, "Open 51 cases" where one press opens 25, and "1,531 alerts" on an
+ *  ack that writes 199 (dogfood 2026-10-19, R2-D8). Both writes skip an alert
+ *  Security Onion already acknowledged or escalated, and an escalate also
+ *  acknowledges, so the handled alerts are the larger of the two counts. A
+ *  null count is a grid that cannot answer: the press writes at most the
+ *  count, and the plan says "at most". */
+export function pressPlan(targets: GroupRef[], groups: AlertGroup[], cap: number): PressPlan | null {
+  const plan: PressPlan = {
+    total: 0,
+    press: 0,
+    rest: 0,
+    upTo: false,
+    escalated: 0,
+    acked: 0,
+    cases: [],
+    casesComplete: true,
+  };
   for (const t of targets) {
     const g = groups.find((x) => groupKey(x) === groupKey(t));
     if (!g || g.count == null) return null;
-    total += g.count;
+    const known = g.ackedCount !== null && g.escalatedCount !== null;
+    const onCase = known ? Math.min(g.count, g.escalatedCount ?? 0) : 0;
+    const handled = known ? Math.min(g.count, Math.max(onCase, g.ackedCount ?? 0)) : 0;
+    const open = g.count - handled;
+    plan.total += g.count;
+    plan.press += Math.min(open, cap);
+    plan.rest += Math.max(0, open - cap);
+    plan.upTo = plan.upTo || !known;
+    plan.escalated += onCase;
+    plan.acked += handled - onCase;
+    for (const c of g.cases ?? []) {
+      if (!plan.cases.some((x) => x.id === c.id)) plan.cases.push(c);
+    }
+    if (onCase > 0 && !g.casesComplete) plan.casesComplete = false;
   }
-  return total;
+  return plan;
 }
 
-/** The sentence an escalate confirm shows. */
-export function escalateConfirmText(targets: GroupRef[], alerts: number | null): string {
-  const what = targets.length === 1 ? targets[0].name : `${targets.length} detections`;
-  if (alerts == null) {
-    return `Open one Security Onion case for each alert of ${what}.`;
+/** "on a case", "on case X", "on cases X, Y": where the handled alerts are.
+ *  A case list that does not cover every alert names no case here. */
+function onCaseWords(plan: PressPlan): string {
+  const ids = plan.cases.map((c) => c.id);
+  if (!ids.length || !plan.casesComplete) return 'on a case';
+  return `on ${ids.length === 1 ? 'case' : 'cases'} ${ids.join(', ')}`;
+}
+
+/** The cases a partial list names, as a finding: "soc-ai found case X." */
+function foundCases(plan: PressPlan): string | null {
+  const ids = plan.cases.map((c) => c.id);
+  if (!ids.length || plan.casesComplete) return null;
+  return `soc-ai found ${ids.length === 1 ? 'case' : 'cases'} ${ids.join(', ')}.`;
+}
+
+/** "1 alert is", "3 alerts are". */
+function alertsAre(n: number): string {
+  return `${plural(n, 'alert')} ${n === 1 ? 'is' : 'are'}`;
+}
+
+/** The label of the bulk Acknowledge button: what one press writes. */
+export function ackButtonLabel(groupCount: number, plan: PressPlan | null): string {
+  const head = `Acknowledge ${plural(groupCount, 'group')}`;
+  if (!plan) return head;
+  const upTo = plan.upTo ? 'up to ' : '';
+  if (plan.rest > 0) {
+    return `${head} · ${upTo}${plan.press.toLocaleString()} of ${plural(plan.press + plan.rest, 'alert')}`;
   }
-  return alerts === 1
-    ? `Open 1 Security Onion case, for the one alert of ${what}.`
-    : `Open ${alerts} Security Onion cases, one for each alert of ${what}.`;
+  return `${head} · ${upTo}${plural(plan.press, 'alert')}`;
+}
+
+/** Why the bulk Acknowledge button is off: Security Onion already handled
+ *  every alert of the selection, so a press writes nothing (V1-A6). Null
+ *  when a press writes, and when the grid cannot count the handled alerts. */
+export function ackButtonOffReason(plan: PressPlan | null): string | null {
+  if (!plan || plan.upTo || plan.press > 0) return null;
+  return 'Every alert of the selected groups is already acknowledged or on a case. A press writes nothing.';
+}
+
+/** The title of the bulk Acknowledge button, when one press is not enough. */
+export function ackButtonTitle(plan: PressPlan | null): string | undefined {
+  if (!plan || plan.rest === 0) return undefined;
+  const others = plan.upTo ? 'the other alerts' : `the other ${plural(plan.rest, 'alert')}`;
+  return `One press acknowledges at most ${ACK_CAP} alerts of each group. Press Acknowledge again for ${others}.`;
+}
+
+/** The sentences an escalate confirm shows: what one press opens. */
+export function escalateConfirmText(targets: GroupRef[], plan: PressPlan | null): string {
+  const many = targets.length > 1;
+  const what = many ? `${targets.length} detections` : targets[0].name;
+  const capSentence = `One press opens at most ${ESCALATE_CAP} cases${many ? ' for each detection' : ''}.`;
+  if (plan == null) {
+    return `Open one Security Onion case for each alert of ${what}. ${capSentence}`;
+  }
+  const s: string[] = [];
+  const handled = plan.escalated + plan.acked;
+  if (plan.press === 0) {
+    // Every alert is already handled (R2-I2). The press opens nothing, and
+    // the confirm must not promise a case.
+    if (plan.escalated === plan.total) {
+      s.push(
+        plan.total === 1
+          ? `The alert of ${what} is already ${onCaseWords(plan)}.`
+          : `The ${plan.total.toLocaleString()} alerts of ${what} are already ${onCaseWords(plan)}.`,
+      );
+      const found = foundCases(plan);
+      if (found) s.push(found);
+    } else if (plan.acked === plan.total) {
+      s.push(
+        plan.total === 1
+          ? `The alert of ${what} is already acknowledged.`
+          : `The ${plan.total.toLocaleString()} alerts of ${what} are already acknowledged.`,
+      );
+    } else {
+      if (plan.escalated > 0) s.push(`${alertsAre(plan.escalated)} already ${onCaseWords(plan)}.`);
+      const found = foundCases(plan);
+      if (found) s.push(found);
+      if (plan.acked > 0) s.push(`${alertsAre(plan.acked)} already acknowledged.`);
+    }
+    s.push('soc-ai opens no case.');
+    return s.join(' ');
+  }
+  const cases = plan.press === 1 ? 'case' : 'cases';
+  if (plan.upTo) {
+    s.push(
+      `Open at most ${plan.press.toLocaleString()} Security Onion ${cases} for the ${plural(plan.total, 'alert')} of ${what}.`,
+      'soc-ai skips an alert that is already acknowledged or on a case.',
+    );
+  } else if (handled === 0 && plan.rest === 0) {
+    s.push(
+      plan.press === 1
+        ? `Open 1 Security Onion case for the alert of ${what}.`
+        : `Open ${plan.press.toLocaleString()} Security Onion cases, one for each alert of ${what}.`,
+    );
+  } else {
+    s.push(
+      `Open ${plan.press.toLocaleString()} Security Onion ${cases} for ${plan.press.toLocaleString()} of the ${plural(plan.total, 'alert')} of ${what}.`,
+    );
+    if (plan.escalated > 0) s.push(`${alertsAre(plan.escalated)} already ${onCaseWords(plan)}.`);
+    const found = foundCases(plan);
+    if (found) s.push(found);
+    if (plan.acked > 0) s.push(`${alertsAre(plan.acked)} already acknowledged.`);
+  }
+  if (plan.rest > 0) {
+    const others = plan.upTo ? 'the other alerts' : `the other ${plural(plan.rest, 'alert')}`;
+    s.push(capSentence, `Press Escalate again for ${others}.`);
+  }
+  return s.join(' ');
 }
 
 function EscalateConfirm({
   targets,
-  alerts,
+  plan,
   onCancel,
   onConfirm,
 }: {
   targets: GroupRef[];
-  alerts: number | null;
+  plan: PressPlan | null;
   onCancel: () => void;
   onConfirm: () => void;
 }) {
@@ -3313,6 +3889,9 @@ function EscalateConfirm({
     window.addEventListener('keydown', onKey, true);
     return () => window.removeEventListener('keydown', onKey, true);
   }, [onCancel]);
+  // A plan that opens no case offers no write. Its one button closes.
+  const writes = plan == null || plan.press > 0;
+  const cases = plan?.press === 1 ? 'case' : 'cases';
   return (
     <div
       className="fixed inset-0 z-[70] flex items-center justify-center"
@@ -3332,24 +3911,56 @@ function EscalateConfirm({
         <div className="mb-4 text-[14px] font-semibold">Escalate to Security Onion</div>
         <div
           className="mb-5 flex items-start gap-2 rounded-[7px] border px-3 py-2.5 text-[12.5px] leading-[1.5]"
-          style={{ borderColor: 'rgba(240,68,56,.35)', background: 'rgba(240,68,56,.07)', color: '#fca5a5' }}
+          style={
+            writes
+              ? { borderColor: 'rgba(240,68,56,.35)', background: 'rgba(240,68,56,.07)', color: '#fca5a5' }
+              : { borderColor: 'rgba(148,163,184,.32)', background: 'rgba(148,163,184,.08)', color: '#cbd5e1' }
+          }
         >
           <AlertTriangle size={13} className="mt-px flex-none" />
-          <span>This writes to Security Onion. {escalateConfirmText(targets, alerts)}</span>
+          <span>
+            {writes ? 'This writes to Security Onion. ' : ''}
+            {escalateConfirmText(targets, plan)}
+          </span>
         </div>
+        {/* The cases the alerts are already on, each a link to its page in
+            the Security Onion console (R2-I2). */}
+        {(plan?.cases ?? []).some((c) => !!c.url) && (
+          <div data-testid="escalate-confirm-cases" className="-mt-2 mb-5 flex flex-wrap gap-x-3 gap-y-1 text-[12.5px]">
+            {(plan?.cases ?? [])
+              .filter((c): c is { id: string; url: string } => !!c.url)
+              .map((c) => (
+                <a
+                  key={c.id}
+                  href={c.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  aria-label={`Open case ${c.id} in Security Onion`}
+                  className="inline-flex items-center gap-1 font-semibold text-accent hover:underline"
+                >
+                  Open case {c.id}
+                  <ArrowUpRight size={12} />
+                </a>
+              ))}
+          </div>
+        )}
         <div className="flex justify-end gap-2.5">
           <button
             onClick={onCancel}
             className="rounded-control border border-border-strong bg-surface-3 px-4 py-2 text-[13px] font-semibold text-text-2 hover:text-text"
           >
-            Cancel
+            {writes ? 'Cancel' : 'Close'}
           </button>
-          <button
-            onClick={onConfirm}
-            className="rounded-control border border-danger bg-[rgba(240,68,56,.1)] px-4 py-2 text-[13px] font-semibold text-[#fca5a5] hover:bg-[rgba(240,68,56,.18)]"
-          >
-            {alerts == null ? 'Open the cases' : alerts === 1 ? 'Open 1 case' : `Open ${alerts} cases`}
-          </button>
+          {writes && (
+            <button
+              onClick={onConfirm}
+              className="rounded-control border border-danger bg-[rgba(240,68,56,.1)] px-4 py-2 text-[13px] font-semibold text-[#fca5a5] hover:bg-[rgba(240,68,56,.18)]"
+            >
+              {plan == null
+                ? 'Open the cases'
+                : `Open ${plan.upTo ? 'at most ' : ''}${plan.press.toLocaleString()} ${cases}`}
+            </button>
+          )}
         </div>
       </div>
     </div>
@@ -3383,6 +3994,7 @@ function AlertDrawer({
   escalatingNames = [],
   nextName = null,
   onNext,
+  onShowSibling,
 }: {
   drawerId: string | null;
   starting: AlertGroup | null;
@@ -3397,6 +4009,8 @@ function AlertDrawer({
   /** The rule of the next alert with a report, or null at the end of the list. */
   nextName?: string | null;
   onNext?: () => void;
+  /** Show a same-flow sibling of the report on the list. */
+  onShowSibling?: (sibling: AlertSibling) => void;
 }) {
   const [tick, setTick] = useState(0);
   const [cancelling, setCancelling] = useState(false);
@@ -3502,7 +4116,16 @@ function AlertDrawer({
       {isStarting && <LoadingState label={`Starting the investigation of ${starting?.name}`} />}
       {drawerId && loading && !inv && <LoadingState label="Loading investigation" />}
       {error && <div className="p-4"><ErrorState error={error} onRetry={refetch} /></div>}
-      {inv && <Investigation inv={inv} layout="drawer" onReHunt={onReHunt} onVerdictApplied={() => setTick((x) => x + 1)} onAcked={onAcked} />}
+      {inv && (
+        <Investigation
+          inv={inv}
+          layout="drawer"
+          onReHunt={onReHunt}
+          onVerdictApplied={() => setTick((x) => x + 1)}
+          onAcked={onAcked}
+          onShowSibling={onShowSibling}
+        />
+      )}
     </Drawer>
   );
 }
