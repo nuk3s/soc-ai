@@ -131,7 +131,7 @@ export function Operate() {
   return (
     <div className="px-[22px] pb-[60px] pt-5">
       {/* page header — same register as Backtest.tsx's */}
-      <div className="mb-5">
+      <div data-tour="status-header" className="mb-5">
         <div className="flex items-center gap-2">
           <Wrench size={19} className="text-accent" />
           {/* "Status": the group and its first page both read "Operate". */}
@@ -147,8 +147,15 @@ export function Operate() {
       <div className="grid gap-4 md:grid-cols-2">
         {/* First, because every job below needs them: is the grid up, and
             does the model gateway answer? Then the jobs themselves. */}
-        <StatusDependenciesPanel />
-        <StatusJobsPanel />
+        {/* Each wrapper is the full-width grid item and holds the anchor of
+            the page tour. A Panel takes no attribute. The panel inside keeps
+            its own md:col-span-2, which does nothing outside a grid. */}
+        <div data-tour="status-dependencies" className="md:col-span-2">
+          <StatusDependenciesPanel />
+        </div>
+        <div data-tour="status-jobs" className="md:col-span-2">
+          <StatusJobsPanel />
+        </div>
         {/* Full-width, in the same grid as the link cards rather than a
             block of its own: the reason an operator comes here ("is it
             running?") is answered before the orientation links, while the
@@ -157,7 +164,9 @@ export function Operate() {
         {/* Second, and full-width for the same reason: a stranded claim is an
             alert that cannot be escalated, which is a live operational fact
             and not an orientation link. */}
-        <EscalationLedgerPanel />
+        <div data-tour="status-escalations" className="md:col-span-2">
+          <EscalationLedgerPanel />
+        </div>
         {CARD_DEFS.map(({ title, purpose, to, icon }) => (
           <Panel key={title}>
             <PanelHeader icon={icon} title={title} />

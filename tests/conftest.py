@@ -247,6 +247,8 @@ POSTGRES_MODULES = frozenset(
         "test_store_copy.py",
         # The saved-view cap leaned on SQLite's writer lock under concurrent saves.
         "test_saved_views.py",
+        # Migration 0065 and the tour state on the user row.
+        "test_me_tours.py",
     }
 )
 

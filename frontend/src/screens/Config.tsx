@@ -2141,10 +2141,11 @@ export function Config() {
   // day1 rows and folded Advanced rows share identical markup —
   // `data-setting-key` must land on every row either way (search flash and
   // the apply-bar chip jump both depend on it).
-  const renderSettingRow = (s: Setting) => (
+  const renderSettingRow = (s: Setting, tour?: string) => (
     <div
       key={s.key}
       data-setting-key={s.key}
+      data-tour={tour}
       data-highlighted={highlightKey === s.key ? 'true' : undefined}
       className="border-b border-border-faint px-[15px] py-[13px] transition-shadow"
       style={
@@ -2231,9 +2232,12 @@ export function Config() {
     // default. See toggleAdvanced above for why the toggle takes this exact
     // computed value as an argument rather than re-deriving its own default.
     const advCollapsed = collapsed[advKey] ?? day1Items.length > 0;
+    // The first row on screen carries the tour anchor of a setting row.
+    const firstRow = day1Items[0] ?? (advCollapsed ? undefined : advItems[0]);
+    const row = (s: Setting) => renderSettingRow(s, s === firstRow ? 'settings-row' : undefined);
     return (
     <>
-      <div id={id} className="mb-[22px] scroll-mt-16">
+      <div id={id} data-tour="settings-section" className="mb-[22px] scroll-mt-16">
         <button
           type="button"
           onClick={() => toggleSection(g.title)}
@@ -2256,7 +2260,7 @@ export function Config() {
         </button>
         {!collapsed[g.title] && (
         <div className="overflow-hidden rounded-card border border-border bg-surface-1">
-          {day1Items.map(renderSettingRow)}
+          {day1Items.map(row)}
           {advItems.length > 0 && (
             <>
               <button
@@ -2272,7 +2276,7 @@ export function Config() {
                 />
                 Advanced ({advItems.length})
               </button>
-              {!advCollapsed && advItems.map(renderSettingRow)}
+              {!advCollapsed && advItems.map(row)}
             </>
           )}
         </div>
@@ -3117,8 +3121,9 @@ export function Config() {
     'danger-zone': dangerZoneSection,
   };
 
-  const searchInput = (className: string) => (
+  const searchInput = (className: string, tour?: string) => (
     <input
+      data-tour={tour}
       value={query}
       onChange={(e) => setQuery(e.target.value)}
       // Escape clears the search (R5-D23).
@@ -3202,14 +3207,14 @@ export function Config() {
   return (
     <div className="mx-auto flex max-w-workstation gap-6 px-[22px] pb-[60px] pt-5">
       <aside className="hidden w-[190px] flex-none lg:block">
-        {searchInput('mb-3 w-full')}
+        {searchInput('mb-3 w-full', 'settings-search')}
         <ConfigNav groups={layout} activeId={effectiveId} onNavigate={navigateToSection} />
       </aside>
       <div className="min-w-0 max-w-permalink flex-1">
       <ConfigNavSelect groups={layout} activeId={effectiveId} onNavigate={navigateToSection} />
       {/* The nav entry and the page share one name. The nav said "Config"
           over a page the guide called "Settings" (dogfood 2026-10-06). */}
-      <div className="text-[20px] font-semibold tracking-[-.015em]">Settings</div>
+      <div data-tour="settings-header" className="text-[20px] font-semibold tracking-[-.015em]">Settings</div>
       <div className="mb-[14px] mt-0.5 text-[13px] text-dim">
         Each value has an origin badge. DEFAULT is the code default. ENV is a value from the
         environment or .env. DB is a value that you saved here. A DB value wins over the other two.

@@ -19,7 +19,7 @@ import { Login } from './Login';
 
 // Pinned literally (not imported) so a copy edit can't silently self-approve.
 const BANNER_COPY =
-  'Demo. soc-ai ran these investigations and recorded them. Nothing here is live.';
+  'Demo. Some runs are recordings from a test grid. A script generated the rest. Nothing here is live.';
 
 let fetchMock: ReturnType<typeof vi.fn>;
 

@@ -334,7 +334,7 @@ export function LeadDetail() {
           className="mb-3"
         />
       )}
-      <div className="flex flex-wrap items-center gap-3">
+      <div className="flex flex-wrap items-center gap-3" data-tour="lead-header">
         <h1 className="text-[19px] font-semibold">
           Lead {d.id} ·{' '}
           {/* W7: the machine name first, then the address, then the role. */}
@@ -433,7 +433,7 @@ export function LeadDetail() {
         {/* One set of actions per state, in the words of the strip. A closed
             lead offers one act: every other act answers 409 from the server. A
             lead under a running hunt offers one act: follow the hunt. */}
-        <span className="ml-auto flex flex-wrap items-center gap-2.5">
+        <span className="ml-auto flex flex-wrap items-center gap-2.5" data-tour="lead-actions">
           {state === 'new' && (
             <>
               {/* A queued lead already has a hunt coming, so the word on the
@@ -557,6 +557,7 @@ export function LeadDetail() {
       {ask && (
         <div
           data-testid="lead-verdict-strip"
+          data-tour="lead-verdict"
           className="mt-2 flex flex-wrap items-center gap-2.5 rounded-panel border px-3 py-2 text-[12.5px]"
           style={{ borderColor: 'rgba(163,113,247,.45)', background: 'rgba(163,113,247,.08)' }}
         >
@@ -614,7 +615,10 @@ export function LeadDetail() {
       <div data-testid="lead-why" className="mt-1.5 text-[13px] text-text-2">
         {leadWhySentence(d)}
       </div>
-      <div className="mt-0.5 flex flex-wrap items-center gap-2 text-[12px] text-dim">
+      <div
+        className="mt-0.5 flex flex-wrap items-center gap-2 text-[12px] text-dim"
+        data-tour="lead-weight"
+      >
         <span title={absTime(d.formed_at)}>formed {ago(d.formed_at)}</span>
         <span className="text-faint">·</span>
         <button
@@ -772,67 +776,73 @@ export function LeadDetail() {
       {error && <div className="mt-2 text-[12px] text-danger">{error}</div>}
 
       {/* Every hunt this lead started. The page named one, from `hunt_id`, so a
-          lead hunted twice showed the first hunt forever. */}
+          lead hunted twice showed the first hunt forever.
+
+          The tour anchor wraps the panel. A plain block with no border or
+          padding lets the top margin of the panel pass through, so the page
+          lays out the same. The timeline below is wrapped the same way. */}
       {hunts.length > 0 && (
-        <Panel className="mt-4">
-          <PanelHeader title={`Hunts on this lead · ${hunts.length}`} />
-          <ul data-testid="lead-hunts" className="divide-y divide-border-faint">
-            {hunts.map((h) => (
-              <li
-                key={h.id}
-                data-testid={`lead-hunt-${h.id}`}
-                className="px-[15px] py-2.5 text-[12.5px]"
-              >
-                <div className="flex flex-wrap items-center gap-2.5">
-                  {/* K5: the label states the type, the steps, the run time
-                      and the threat findings. The id alone said nothing an
-                      analyst can use, so it moves to the hover. */}
-                  <Link
-                    to={`/hunts/${h.id}`}
-                    className="text-accent hover:underline"
-                    title={`Open hunt ${h.id}.`}
-                  >
-                    {huntName(h)}
-                  </Link>
-                  {/* The screen word, with the sentence that states it. The
-                      row printed the raw API word and explained nothing. */}
-                  <span className="text-dim" title={huntStatusTitle(h.status, 'row')}>
-                    {statusLabel(h.status)}
-                  </span>
-                  {/* The outcome, in the words and the colour of the one
-                      label map. A threat is never green. */}
-                  {rowOutcome(h, d) && (
-                    <span
-                      data-testid={`lead-hunt-outcome-${h.id}`}
-                      {...chipProps(outcomeMeta(rowOutcome(h, d)))}
+        <div data-tour="lead-hunts">
+          <Panel className="mt-4">
+            <PanelHeader title={`Hunts on this lead · ${hunts.length}`} />
+            <ul data-testid="lead-hunts" className="divide-y divide-border-faint">
+              {hunts.map((h) => (
+                <li
+                  key={h.id}
+                  data-testid={`lead-hunt-${h.id}`}
+                  className="px-[15px] py-2.5 text-[12.5px]"
+                >
+                  <div className="flex flex-wrap items-center gap-2.5">
+                    {/* K5: the label states the type, the steps, the run time
+                        and the threat findings. The id alone said nothing an
+                        analyst can use, so it moves to the hover. */}
+                    <Link
+                      to={`/hunts/${h.id}`}
+                      className="text-accent hover:underline"
+                      title={`Open hunt ${h.id}.`}
                     >
-                      {rowOutcomeLabel(h, d)}
+                      {huntName(h)}
+                    </Link>
+                    {/* The screen word, with the sentence that states it. The
+                        row printed the raw API word and explained nothing. */}
+                    <span className="text-dim" title={huntStatusTitle(h.status, 'row')}>
+                      {statusLabel(h.status)}
                     </span>
-                  )}
-                  {h.started_at && (
-                    <span className="text-[11.5px] text-faint" title={absTime(h.started_at)}>
-                      started {ago(h.started_at)}
-                    </span>
-                  )}
-                </div>
-                {/* W3: the hunt's answer, and what it could not check. The
-                    analyst read a long narrative on the hunt page to decide. */}
-                {h.answer && (
-                  <div data-testid={`lead-hunt-answer-${h.id}`} className="mt-1 text-text-2">
-                    <span className="font-semibold">Answer: </span>
-                    {h.answer}
+                    {/* The outcome, in the words and the colour of the one
+                        label map. A threat is never green. */}
+                    {rowOutcome(h, d) && (
+                      <span
+                        data-testid={`lead-hunt-outcome-${h.id}`}
+                        {...chipProps(outcomeMeta(rowOutcome(h, d)))}
+                      >
+                        {rowOutcomeLabel(h, d)}
+                      </span>
+                    )}
+                    {h.started_at && (
+                      <span className="text-[11.5px] text-faint" title={absTime(h.started_at)}>
+                        started {ago(h.started_at)}
+                      </span>
+                    )}
                   </div>
-                )}
-                {h.not_checked.length > 0 && (
-                  <div data-testid={`lead-hunt-gaps-${h.id}`} className="mt-0.5 text-dim">
-                    <span className="font-semibold">Not checked: </span>
-                    {h.not_checked.join(' ')}
-                  </div>
-                )}
-              </li>
-            ))}
-          </ul>
-        </Panel>
+                  {/* W3: the hunt's answer, and what it could not check. The
+                      analyst read a long narrative on the hunt page to decide. */}
+                  {h.answer && (
+                    <div data-testid={`lead-hunt-answer-${h.id}`} className="mt-1 text-text-2">
+                      <span className="font-semibold">Answer: </span>
+                      {h.answer}
+                    </div>
+                  )}
+                  {h.not_checked.length > 0 && (
+                    <div data-testid={`lead-hunt-gaps-${h.id}`} className="mt-0.5 text-dim">
+                      <span className="font-semibold">Not checked: </span>
+                      {h.not_checked.join(' ')}
+                    </div>
+                  )}
+                </li>
+              ))}
+            </ul>
+          </Panel>
+        </div>
       )}
 
       {/* One entity is one lead. A coordinated attack across entities is
@@ -844,7 +854,9 @@ export function LeadDetail() {
       {/* The dismissal stays on the record, and the timeline names the
           reopen. The hunt page renders the same component, so the entry
           reads one way on both. */}
-      <LeadTimeline lead={d} scoring={scoring} />
+      <div data-tour="lead-timeline">
+        <LeadTimeline lead={d} scoring={scoring} />
+      </div>
     </div>
   );
 }

@@ -26,7 +26,7 @@ from soc_ai.demo.catalog_trail import (
     ROWS_PER_SPEC,
     seed_catalog_trail,
 )
-from soc_ai.demo.fixtures import load_fixtures, seed_fixtures
+from soc_ai.demo.fixtures import load_fixtures, rebase_document, seed_fixtures, shift_iso
 from soc_ai.hunting.spec import CATALOG_DIR, load_catalog
 from soc_ai.hunting.sweep import SWEEP_ACTOR
 from soc_ai.store.auth import utcnow
@@ -34,12 +34,15 @@ from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
 from soc_ai.store.hunt_spec_sweeps import catalog_status
 from soc_ai.store.models import (
     Backtest,
+    EntityObservation,
+    GridGap,
     Hunt,
     HuntEvent,
     HuntSchedule,
     HuntSpecSweep,
     Investigation,
     InvestigationEvent,
+    Lead,
     QualitySnapshot,
 )
 from soc_ai.triage_models import is_pipeline_fallback
@@ -49,7 +52,8 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from tests.conftest import _base_settings_kwargs
 
 FIXTURE = {
-    "version": 1,
+    "version": 2,
+    "anchor": "2026-07-01T02:30:00Z",
     "investigations": [
         {
             "id": "01DEMO0000000000000000TEST",
@@ -89,7 +93,8 @@ FIXTURE = {
 }
 
 HUNT_FIXTURE = {
-    "version": 1,
+    "version": 2,
+    "anchor": "2026-07-01T01:10:00Z",
     "investigations": [],
     "hunts": [
         {
@@ -158,15 +163,15 @@ async def test_seed_inserts_investigation_and_events(settings_kratos: Settings) 
 
 
 async def test_seed_rebases_timestamps_to_now(settings_kratos: Settings) -> None:
-    """Seeding rebases EACH section independently so its own newest row lands at
-    'now' — every surface (investigations, hunts, backtests) reads as current,
-    with each row's internal gaps preserved. This is why the backtest being ~2
-    days newer in the committed fixtures no longer drags investigations away."""
-    # Merge a hunt into FIXTURE so all three sections are exercised at once.
+    """Seeding moves every timestamp by one delta, now minus the anchor. The
+    anchor lands at now, and the gaps between rows of different sections stay
+    as written, so a lead and the observations under it keep their order."""
     fx = copy.deepcopy(FIXTURE)
     fx["hunts"] = copy.deepcopy(HUNT_FIXTURE["hunts"])
     engine, maker = await _db(settings_kratos)
-    await seed_fixtures(maker, fx)
+    # Whole seconds: a timestamp keeps the format it was written in.
+    now = utcnow().replace(microsecond=0)
+    await seed_fixtures(maker, fx, now=now)
     async with maker() as db:
         inv = await db.get(Investigation, "01DEMO0000000000000000TEST")
         hunt = await db.get(Hunt, "01DEMO000000000000000HUNT1")
@@ -174,12 +179,11 @@ async def test_seed_rebases_timestamps_to_now(settings_kratos: Settings) -> None
     assert inv is not None
     assert hunt is not None
     assert bt is not None
-    # The newest row of EACH section now sits within the last few minutes — not
-    # just the single global-newest row. (Each is its section's only/newest row.)
-    assert utcnow() - inv.finished_at < timedelta(minutes=5)
-    assert utcnow() - hunt.finished_at < timedelta(minutes=5)
-    assert utcnow() - bt.finished_at < timedelta(minutes=5)
-    # Each row's own gaps survive the shift.
+    # The anchor (the backtest's finished_at) lands at the seed instant.
+    assert bt.finished_at == now
+    # Every other row keeps its distance from the anchor, across sections.
+    assert now - inv.finished_at == timedelta(hours=2, minutes=25)
+    assert now - hunt.finished_at == timedelta(hours=1, minutes=20)
     assert inv.finished_at - inv.created_at == timedelta(minutes=5)
     assert hunt.finished_at - hunt.created_at == timedelta(minutes=10)
     assert bt.finished_at - bt.created_at == timedelta(minutes=30)
@@ -221,7 +225,8 @@ async def test_seed_hunts_with_events(settings_kratos: Settings) -> None:
 
 
 HUNT_SCHEDULE_FIXTURE = {
-    "version": 1,
+    "version": 2,
+    "anchor": "2026-07-01T03:00:00Z",
     "investigations": [],
     "hunts": [],
     "backtests": [],
@@ -280,7 +285,8 @@ async def test_seed_without_hunt_schedules_key_is_a_noop(settings_kratos: Settin
 
 
 QUALITY_SNAPSHOT_FIXTURE = {
-    "version": 1,
+    "version": 2,
+    "anchor": "2026-07-01T03:00:00Z",
     "investigations": [],
     "hunts": [],
     "backtests": [],
@@ -379,10 +385,31 @@ def test_load_fixtures_parses_and_preserves_passthrough(tmp_path: Path) -> None:
     assert len(data["investigations"]) == 1
 
 
-def test_load_fixtures_rejects_unknown_version(tmp_path: Path) -> None:
+@pytest.mark.parametrize("version", [1, 3, None])
+def test_load_fixtures_rejects_unknown_version(tmp_path: Path, version: int | None) -> None:
+    """Version 1 was the per-section rebase shape. The runtime reads only the
+    shape scripts/demo/build_story.py writes."""
     path = tmp_path / "fixtures.json"
-    path.write_text(json.dumps({"version": 2, "investigations": []}))
+    path.write_text(json.dumps({"version": version, "anchor": FIXTURE["anchor"]}))
     with pytest.raises(ValueError, match="unsupported fixtures version"):
+        load_fixtures(path)
+
+
+@pytest.mark.parametrize("anchor", [None, "", "2026-07-01", "yesterday"])
+def test_load_fixtures_rejects_a_bad_anchor(tmp_path: Path, anchor: str | None) -> None:
+    path = tmp_path / "fixtures.json"
+    path.write_text(json.dumps({"version": 2, "anchor": anchor}))
+    with pytest.raises(ValueError, match="anchor"):
+        load_fixtures(path)
+
+
+def test_load_fixtures_refuses_a_table_outside_the_allowlist(tmp_path: Path) -> None:
+    """A fixture file can never write a user, a session, a token or a config row."""
+    fx = copy.deepcopy(FIXTURE)
+    fx["tables"] = {"users": [{"id": 1, "username": "x"}]}
+    path = tmp_path / "f.json"
+    path.write_text(json.dumps(fx))
+    with pytest.raises(ValueError, match="users"):
         load_fixtures(path)
 
 
@@ -417,6 +444,151 @@ def test_load_fixtures_rejects_malformed_chat_entry(tmp_path: Path) -> None:
         load_fixtures(path)
 
 
+def test_rebase_document_moves_every_datetime_and_keeps_its_format() -> None:
+    """Nested timestamps move with the rows: an event payload, a decision list
+    and an evidence window read as current, each in the format it was written."""
+    doc = {
+        "version": 2,
+        "anchor": "2026-07-01T12:00:00Z",
+        "tables": {
+            "leads": [
+                {
+                    "id": 1,
+                    "formed_at": "2026-07-01T10:00:00",
+                    "decisions_json": [{"action": "dismissed", "at": "2026-07-01T11:30:00+00:00"}],
+                }
+            ]
+        },
+        "alerts": [{"_source": {"@timestamp": "2026-07-01T11:59:00.123Z", "id": "2026-07-01"}}],
+        "chats": [
+            {"target": "hunt", "id": "h", "messages": [{"content": "at 2026-07-01T11:00:00Z"}]}
+        ],
+    }
+    before = copy.deepcopy(doc)
+    now = datetime(2026, 10, 22, 18, 0, 0)
+    out = rebase_document(doc, now)
+    assert doc == before  # the input never changes
+    lead = out["tables"]["leads"][0]
+    assert lead["formed_at"] == "2026-10-22T16:00:00"
+    assert lead["decisions_json"][0]["at"] == "2026-10-22T17:30:00+00:00"
+    src = out["alerts"][0]["_source"]
+    assert src["@timestamp"] == "2026-10-22T17:59:00.123Z"
+    assert src["id"] == "2026-07-01"  # a date alone is not a timestamp
+    # A datetime inside prose is text, and text stays as written.
+    assert out["chats"][0]["messages"][0]["content"] == "at 2026-07-01T11:00:00Z"
+    assert out["anchor"].startswith("2026-10-22T18:00:00")
+
+
+def test_shift_iso_keeps_the_fraction_digits() -> None:
+    delta = timedelta(hours=1)
+    assert shift_iso("2026-07-01T00:00:00.5Z", delta) == "2026-07-01T01:00:00.5Z"
+    assert shift_iso("2026-07-01T00:00:00.123456", delta) == "2026-07-01T01:00:00.123456"
+    assert shift_iso("not a time", delta) == "not a time"
+
+
+_TABLES_FIXTURE = {
+    "version": 2,
+    "anchor": "2026-07-01T12:00:00Z",
+    "tables": {
+        "leads": [
+            {
+                "id": 7,
+                "status": "dismissed",
+                "formed_at": "2026-07-01T09:00:00Z",
+                "updated_at": "2026-07-01T10:00:00Z",
+                "entities_json": [["host", "10.20.0.20"]],
+                "kinds_json": ["novel_destination", "off_hours"],
+                "weight_at_formation": 1.4,
+                "scope_count": 1,
+                "shadow": False,
+                "dismissed_reason": "known_change",
+                "dismissed_by": "analyst",
+                "dismissed_at": "2026-07-01T10:00:00Z",
+                "decisions_json": [
+                    {"action": "dismissed", "at": "2026-07-01T10:00:00Z", "by": "analyst"}
+                ],
+            }
+        ],
+        "entity_observations": [
+            {
+                "id": 70,
+                "entity_kind": "host",
+                "entity_key": "10.20.0.20",
+                "kind": "off_hours",
+                "spec_id": "profile-active-hours-off",
+                "fingerprint": "f1",
+                "birth_weight": 0.7,
+                "born_at": "2026-07-01T08:00:00Z",
+                "first_seen_at": "2026-07-01T08:00:00Z",
+                "occurrences": 1,
+                "source": "profile",
+                "lead_id": 7,
+            }
+        ],
+        "grid_gaps": [
+            {
+                "id": 3,
+                "source": "probe",
+                "started_at": "2026-07-01T02:00:00Z",
+                "ended_at": "2026-07-01T05:00:00Z",
+                "detail": "Elasticsearch did not answer.",
+            }
+        ],
+    },
+}
+
+
+async def test_seed_tables_section_lands_rows_with_store_datetimes(
+    settings_kratos: Settings,
+) -> None:
+    engine, maker = await _db(settings_kratos)
+    now = utcnow().replace(microsecond=0)
+    assert await seed_fixtures(maker, copy.deepcopy(_TABLES_FIXTURE), now=now) == 3
+    assert await seed_fixtures(maker, copy.deepcopy(_TABLES_FIXTURE), now=now) == 0
+    async with maker() as db:
+        lead = await db.get(Lead, 7)
+        obs = await db.get(EntityObservation, 70)
+        gap = await db.get(GridGap, 3)
+    assert lead is not None and obs is not None and gap is not None
+    assert lead.formed_at == now - timedelta(hours=3)
+    assert lead.formed_at.tzinfo is None
+    assert lead.decisions_json[0]["at"].startswith(
+        (now - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M")
+    )
+    assert obs.lead_id == 7
+    assert gap.ended_at == now - timedelta(hours=7)
+    await engine.dispose()
+
+
+async def test_seed_tables_rows_may_leave_out_a_defaulted_column(
+    settings_kratos: Settings,
+) -> None:
+    """Rows of one table need not name the same columns. A row that leaves a
+    column out takes the column default; the store does not reject the batch."""
+    fx = copy.deepcopy(_TABLES_FIXTURE)
+    second = dict(fx["tables"]["entity_observations"][0], id=71, fingerprint="f2")
+    del second["occurrences"]
+    del second["source"]
+    fx["tables"]["entity_observations"].append(second)
+    engine, maker = await _db(settings_kratos)
+    assert await seed_fixtures(maker, fx) == 4
+    async with maker() as db:
+        obs = await db.get(EntityObservation, 71)
+    assert obs is not None
+    assert (obs.occurrences, obs.source) == (1, "profile")
+    await engine.dispose()
+
+
+async def test_seed_tables_fails_loud_on_an_unknown_column(settings_kratos: Settings) -> None:
+    """A builder typo must stop the seed, not land a row with a missing value."""
+    fx = copy.deepcopy(_TABLES_FIXTURE)
+    fx["tables"]["grid_gaps"][0]["endd_at"] = "2026-07-01T05:00:00Z"
+    engine, maker = await _db(settings_kratos)
+    with pytest.raises(ValueError, match="endd_at"):
+        await seed_fixtures(maker, fx)
+    await engine.dispose()
+
+
 # --- startup hook (main._init_store) ---------------------------------------
 
 
@@ -447,6 +619,69 @@ def test_startup_seeds_fixtures_in_demo_mode(
     with _app_client(_demo_app_settings()) as client:
         rows = client.get("/api/v1/investigations").json()["rows"]
     assert [r["id"] for r in rows] == ["01DEMO0000000000000000TEST"]
+
+
+def test_startup_keeps_a_seeded_running_hunt_running(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The demo shows a lead whose hunt is in progress. The startup reaper ends
+    every running row, so the seed runs after it and the hunt stays running."""
+    from tests.test_demo_mode import _app_client, _demo_app_settings
+
+    fx = copy.deepcopy(HUNT_FIXTURE)
+    fx["hunts"][0]["status"] = "running"
+    fx["hunts"][0]["finished_at"] = None
+    path = tmp_path / "fixtures.json"
+    path.write_text(json.dumps(fx))
+    monkeypatch.setattr("soc_ai.demo.fixtures.DEFAULT_FIXTURES", path)
+    with _app_client(_demo_app_settings()) as client:
+        hunt = client.get("/api/v1/hunts/01DEMO000000000000000HUNT1").json()
+    assert hunt["status"] == "running"
+
+
+def test_startup_sets_the_auto_investigate_panel_from_fixtures(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The panel reads process memory. The demo sets its last batch at startup,
+    with the finish time moved to read as current."""
+    from tests.test_demo_mode import _app_client, _demo_app_settings
+
+    fx = copy.deepcopy(FIXTURE)
+    fx["autotriage"] = {
+        "total": 12,
+        "hunted": 9,
+        "skipped": 3,
+        "failed": 0,
+        "finished_at": "2026-07-01T02:00:00+00:00",
+        "skipped_reasons": {"inherited": 3},
+        "active": True,  # ignored: the demo never shows a batch in flight
+    }
+    path = tmp_path / "fixtures.json"
+    path.write_text(json.dumps(fx))
+    monkeypatch.setattr("soc_ai.demo.fixtures.DEFAULT_FIXTURES", path)
+    with _app_client(_demo_app_settings()) as client:
+        status = client.get("/api/v1/auto-triage").json()
+    assert status["active"] is False
+    assert (status["total"], status["hunted"], status["skipped"]) == (12, 9, 3)
+    finished = datetime.fromisoformat(status["finished_at"])
+    assert timedelta(minutes=25) < datetime.now(finished.tzinfo) - finished < timedelta(minutes=35)
+
+
+async def test_the_demo_runs_neither_the_reaper_nor_the_lead_auto_hunt_loop() -> None:
+    """Both loops return at once on a demo. A lead hunt could only fail against
+    the mock gateway, and the reaper would end the seeded hunt in flight."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from soc_ai.main import _lead_auto_hunt_loop, _reaper_loop
+
+    from tests.test_demo_mode import _demo_app_settings
+
+    settings = _demo_app_settings()
+    assert settings.investigation_reaper_interval_minutes > 0
+    app = SimpleNamespace(state=SimpleNamespace(settings=settings))
+    await asyncio.wait_for(_reaper_loop(None, settings), timeout=2)
+    await asyncio.wait_for(_lead_auto_hunt_loop(app), timeout=2)  # type: ignore[arg-type]
 
 
 def test_startup_does_not_seed_outside_demo(

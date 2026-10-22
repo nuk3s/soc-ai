@@ -1053,7 +1053,10 @@ function FindingCard({
         </div>
       )}
       {(f.hosts.length > 0 || f.citations.length > 0) && (
-        <div className="mt-2 flex flex-wrap gap-1.5 font-mono text-[10.5px]">
+        <div
+          data-tour="hunt-evidence"
+          className="mt-2 flex flex-wrap gap-1.5 font-mono text-[10.5px]"
+        >
           {f.hosts.map((h) => (
             // Host chip → the page that holds what this grid knows about the
             // entity. `entityPath` picks it: an address has a host page, a name
@@ -1208,6 +1211,7 @@ export function LeadDecisionBar({
   return (
     <div
       data-testid="hunt-lead-decision"
+      data-tour="hunt-lead-decision"
       role="region"
       aria-label={`Lead ${lead.id} decision`}
       className="mt-[18px] flex flex-col gap-2 rounded-panel-lg border px-[18px] py-3"
@@ -1386,16 +1390,19 @@ function CollapsibleSection({
   title,
   meta,
   defaultOpen = true,
+  tour,
   children,
 }: {
   title: string;
   meta?: ReactNode;
   defaultOpen?: boolean;
+  /** The `data-tour` anchor of the section, for the page tour. */
+  tour?: string;
   children: ReactNode;
 }) {
   const [open, setOpen] = useState(defaultOpen);
   return (
-    <div>
+    <div data-tour={tour}>
       <button
         onClick={() => setOpen((o) => !o)}
         aria-expanded={open}
@@ -1628,6 +1635,7 @@ export function HuntDetail() {
           <FlowStrip steps={huntFlow(data as FlowHunt, leadId)} className="mb-3" />
           {/* ── hero: objective headline, meta strip, confidence ring ────── */}
           <div
+            data-tour="hunt-hero"
             className="relative overflow-hidden rounded-panel-lg border p-5"
             style={{
               borderColor: tint(statusColor, 0.32),
@@ -1789,6 +1797,7 @@ export function HuntDetail() {
                   a quiet secondary action on a completed one. Never while running. */}
               {terminal && (
                 <button
+                  data-tour="hunt-rehunt"
                   onClick={doRehunt}
                   disabled={rehunting}
                   title="Re-run this objective as a fresh hunt"
@@ -1958,6 +1967,7 @@ export function HuntDetail() {
 
               <CollapsibleSection
                 title="Findings"
+                tour="hunt-findings"
                 meta={
                   <span title={COUNT_FINDINGS}>
                     {`${data.findings.length} finding${data.findings.length === 1 ? '' : 's'}`}
@@ -2020,6 +2030,7 @@ export function HuntDetail() {
                   already marked Complete. Say what it actually did instead. */}
               <CollapsibleSection
                 title="Hunt timeline"
+                tour="hunt-timeline"
                 meta={
                   <span title={COUNT_STEPS}>
                     {catalog && data.timeline.length === 0

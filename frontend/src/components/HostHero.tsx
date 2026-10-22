@@ -130,6 +130,7 @@ function MachineHero({
   return (
     <section
       data-testid="host-hero"
+      data-tour="host-hero"
       className="mb-3 flex overflow-hidden rounded-panel-lg border border-border bg-surface-2"
     >
       <div className={cn('w-1.5 flex-none', roleRail(role.accent))} aria-hidden="true" />
@@ -316,6 +317,7 @@ function AddressHero({ dossier, adminBlocked, lastActivity, situation = [] }: Ho
   return (
     <section
       data-testid="host-hero"
+      data-tour="host-hero"
       className="mb-3 flex overflow-hidden rounded-panel-lg border border-border bg-surface-2"
     >
       {/* The role accent, and the largest piece of colour on the page. A host

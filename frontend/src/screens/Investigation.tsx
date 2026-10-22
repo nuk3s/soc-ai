@@ -883,7 +883,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   // The toolbar wraps. In the drawer at 1280 px the buttons wrapped their
   // words and the Ask soc-ai button ran off the edge (R2-D19).
   const toolbarEl = (
-    <div data-testid="verdict-toolbar" className="mb-3.5 flex flex-wrap items-center gap-x-2.5 gap-y-2 [&>button]:whitespace-nowrap">
+    <div data-testid="verdict-toolbar" data-tour="investigation-toolbar" className="mb-3.5 flex flex-wrap items-center gap-x-2.5 gap-y-2 [&>button]:whitespace-nowrap">
       {/* Whose verdict the card shows (R2-D22). */}
       <div data-testid="verdict-source" className="whitespace-nowrap text-[11px] font-semibold uppercase tracking-[.06em] text-faint">
         {analystVerdict ? 'Analyst verdict' : 'soc-ai verdict'}
@@ -1227,6 +1227,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   const verdictEl = (
     <>
     <div
+      data-tour="investigation-verdict"
       className="relative overflow-hidden rounded-panel-lg border p-5"
       style={{
         borderColor: v.border,
@@ -1371,7 +1372,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
       )}
       {/* Every document the report cites, each one opens the event (P3). */}
       {!isFallback && (citedIds.length > 0 || citedPaths.length > 0 || citedTools.length > 0) && (
-        <div data-testid="cited-evidence" className="mt-3 flex flex-wrap items-center gap-1.5 text-[12px] text-faint">
+        <div data-testid="cited-evidence" data-tour="investigation-evidence" className="mt-3 flex flex-wrap items-center gap-1.5 text-[12px] text-faint">
           <span>Cited evidence:</span>
           {citedIds.map((id) =>
             unresolvedIds.has(id) ? (
@@ -1729,6 +1730,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   const actionsEl = (
     <CollapsibleSection
       title="Recommended actions"
+      tour="investigation-actions"
       meta={pendingCount === 1 ? '1 action waits for you' : `${pendingCount} actions wait for you`}
     >
       <div className="flex flex-col gap-2.5">
@@ -1813,6 +1815,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     // closed. Its page offers no write, so no group ack and no escalate.
     !isBacktestReplay(inv.meta?.ranBy) ? (
       <div
+        data-tour="investigation-actions"
         className="rounded-card border px-3.5 py-3"
         style={{ borderColor: 'rgba(245,166,35,.35)', background: 'rgba(245,166,35,.06)' }}
       >
@@ -1945,6 +1948,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   const timelineEl = (
     <CollapsibleSection
       title="Investigation timeline"
+      tour="investigation-timeline"
       meta={`${plural(inv.timeline.length, 'step')} · ${running ? durationLabel(elapsed) : inv.elapsedLabel}`}
       open={timelineOpen}
       onToggle={() => setTimelineOpen((o) => !o)}
@@ -2267,7 +2271,12 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
                 {timelineEl}
                 {reasoningEl}
               </div>
-              <div className="flex flex-col gap-[18px]">
+              {/* The tour step names the alert panels, so a hunt run, whose
+                  column holds the hunt subject, has no anchor here. */}
+              <div
+                data-tour={huntSubject ? undefined : 'investigation-context'}
+                className="flex flex-col gap-[18px]"
+              >
                 {alertEl}
                 {sameFlow && <SameFlowPanel invId={inv.id} verdict={inv.verdict} onShow={onShowSibling} />}
                 {hostEl}
@@ -2866,6 +2875,7 @@ function CollapsibleSection({
   defaultOpen = true,
   open: openProp,
   onToggle,
+  tour,
   children,
 }: {
   title: string;
@@ -2873,13 +2883,15 @@ function CollapsibleSection({
   defaultOpen?: boolean;
   open?: boolean;
   onToggle?: () => void;
+  /** The `data-tour` anchor of the section, for the page tour. */
+  tour?: string;
   children: ReactNode;
 }) {
   const [openState, setOpenState] = useState(defaultOpen);
   const open = openProp ?? openState;
   const toggle = onToggle ?? (() => setOpenState((o) => !o));
   return (
-    <div>
+    <div data-tour={tour}>
       <button onClick={toggle} aria-expanded={open} className="mb-[11px] flex w-full items-center gap-2 text-left">
         <div className="text-[13px] font-semibold uppercase tracking-[.05em] text-text-2">{title}</div>
         {meta != null && <div className="font-mono text-[11.5px] text-faint">{meta}</div>}

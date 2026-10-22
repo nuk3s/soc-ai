@@ -196,6 +196,7 @@ export function AskSocAiButton() {
   return (
     <button
       type="button"
+      data-tour="ask"
       {...{ [ASK_BUTTON_ATTR]: '' }}
       aria-expanded={chat.open && onPage}
       aria-keyshortcuts={ASK_SHORTCUT}

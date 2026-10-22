@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, Literal
 
 from fastapi import Depends, HTTPException, Query, Request
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_serializer
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, model_serializer
 from sqlalchemy import func, not_, select
 
 from soc_ai import __commit__, __version__
@@ -43,6 +43,7 @@ from soc_ai.store import hunts as hunts_svc
 from soc_ai.store import investigations as inv_svc
 from soc_ai.store import quality as quality_svc
 from soc_ai.store import saved_views as views_svc
+from soc_ai.store import user_tours as tours_svc
 from soc_ai.webui import (
     anchor_check,
     grid_gap_probe,
@@ -2132,6 +2133,75 @@ async def delete_my_dashboard_layout(request: Request) -> dict[str, bool]:
     async with request.app.state.db_sessionmaker() as db:
         removed = await layout_svc.delete_layout(db, user.id)
     return {"ok": True, "removed": removed}
+
+
+# ── Tour state (per user) ─────────────────────────────────────────────────────
+
+
+class ToursStateIO(BaseModel):
+    """The console's tour state: the global opt-out and the version of each
+    tour the user saw. Strict types: ``"1"`` and ``true`` are no version."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    off: StrictBool
+    seen: dict[str, StrictInt]
+
+
+_TOURS_HINT = (
+    "Tour state belongs to a signed-in user. "
+    "With authentication off, the browser keeps the tour state."
+)
+
+
+async def _tours_user_id(request: Request) -> int:
+    """The user whose tour state this request reads and writes.
+
+    A session user reads their own. A bearer token reads the state of the user
+    who created it, so an automated check can open or skip a tour on purpose.
+    With no user behind the request, the answer is the house 401, and the
+    console keeps the state in the browser.
+    """
+    user = await current_user(request)
+    if user is not None:
+        return int(user.id)
+    authz = request.headers.get("authorization", "")
+    if authz.lower().startswith("bearer "):
+        async with request.app.state.db_sessionmaker() as db:
+            token = await auth_svc.check_api_token(db, authz[7:].strip())
+        if token is not None:
+            return int(token.created_by)
+    raise HTTPException(status_code=401, detail={"reason": "no_session", "hint": _TOURS_HINT})
+
+
+@router.get("/me/tours", response_model=ToursStateIO)
+async def get_my_tours(request: Request) -> ToursStateIO:
+    """This user's tour state. A user who saw no tour reads
+    ``{"off": false, "seen": {}}``."""
+    user_id = await _tours_user_id(request)
+    async with request.app.state.db_sessionmaker() as db:
+        state = await tours_svc.get_state(db, user_id)
+    return ToursStateIO(**state)
+
+
+@router.put("/me/tours", response_model=ToursStateIO)
+async def put_my_tours(request: Request, body: ToursStateIO) -> ToursStateIO:
+    """Replace this user's tour state whole.
+
+    The body is capped at ``user_tours.MAX_BYTES`` (main._ROUTE_BODY_CAPS). A
+    tour id or a version out of range, or more than ``user_tours.MAX_TOURS``
+    tours, answers 400 ``invalid_tours_state`` and stores nothing.
+    """
+    user_id = await _tours_user_id(request)
+    try:
+        state = tours_svc.validate_state(body.model_dump())
+    except tours_svc.ToursStateInvalidError as exc:
+        raise HTTPException(
+            status_code=400, detail={"reason": exc.reason, "hint": exc.hint}
+        ) from exc
+    async with request.app.state.db_sessionmaker() as db:
+        stored = await tours_svc.put_state(db, user_id, state)
+    return ToursStateIO(**stored)
 
 
 # ── Upstream health (ES / LLM / PCAP) — drives the live status indicator ───────

@@ -263,7 +263,7 @@ export function Sidebar() {
           spacer just preserves the original vertical rhythm above the icons. */}
       {collapsed && <div className="h-3.5" />}
 
-      <nav>
+      <nav data-tour="nav">
         {NAV_GROUPS.map((group) => {
           // Only a collapsible group (Operate) ever folds its items; a plain
           // group (Investigate) always shows everything, matching pre-groups

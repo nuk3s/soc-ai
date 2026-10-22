@@ -938,6 +938,10 @@ export function Investigations() {
     }
   }
   const groupScope = total > PAGE_SIZE ? "on this page" : "in the list";
+  // The first row with a waiting action carries the tour anchor. One anchor
+  // per page, so the tour points at one row.
+  const firstWaitingId =
+    displayRows.find((r) => (r.waitingActions?.length ?? 0) > 0)?.id ?? null;
 
   // Selection: the shared hook, which IS this screen's logic — the other lists
   // now borrow it from here rather than each keeping their own copy. A
@@ -1204,7 +1208,7 @@ export function Investigations() {
 
   return (
     <div className="px-[22px] pb-[60px] pt-5">
-      <div className="flex items-baseline gap-3">
+      <div data-tour="investigations-header" className="flex items-baseline gap-3">
         <div className="text-title">Investigations</div>
         <Freshness at={lastUpdated} />
       </div>
@@ -1474,6 +1478,7 @@ export function Investigations() {
         </button>
         <button
           data-testid="show-backtest-replays"
+          data-tour="investigations-replays"
           aria-pressed={showReplays}
           onClick={() => {
             setShowReplays((v) => !v);
@@ -1615,13 +1620,17 @@ export function Investigations() {
           );
         })()}
 
-      <div className="overflow-x-auto overflow-y-hidden rounded-card border border-border bg-surface-1">
+      <div
+        data-tour="investigations-list"
+        className="overflow-x-auto overflow-y-hidden rounded-card border border-border bg-surface-1"
+      >
         <div
           role="row"
           className="grid gap-2.5 border-b border-border bg-surface-2 px-3.5 py-[9px] text-[10.5px] font-semibold uppercase tracking-[.06em] text-faint"
           style={{ gridTemplateColumns: GRID, minWidth: GRID_MIN_WIDTH }}
         >
           <div
+            data-tour="investigations-select"
             className="flex items-center"
             onClick={(e) => e.stopPropagation()}
           >
@@ -1991,6 +2000,11 @@ export function Investigations() {
                   only. The server fills them under that filter alone. */}
               {r.waitingActions && r.waitingActions.length > 0 && (
                 <div
+                  data-tour={
+                    r.id === firstWaitingId
+                      ? "investigations-waiting-actions"
+                      : undefined
+                  }
                   className="border-b border-border-faint bg-surface-2/30 py-2 pl-[46px] pr-3.5"
                   style={{ minWidth: GRID_MIN_WIDTH }}
                 >

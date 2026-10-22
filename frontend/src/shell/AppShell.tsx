@@ -9,6 +9,7 @@ import { DEMO_BANNER_H, DemoBanner, DemoProvider, useDemoStatus } from '../lib/d
 import { NeedsYouProvider } from '../lib/needsYou';
 import { ToastProvider } from '../lib/toast';
 import { useUpdateCheck } from '../lib/useUpdateCheck';
+import { TourProvider } from '../tours/TourProvider';
 import { CommandPalette } from './CommandPalette';
 import { GeneratedPasswordBanner } from './GeneratedPasswordBanner';
 import { PreviousPageTracker } from './PreviousPageTracker';
@@ -50,6 +51,9 @@ export function AppShell() {
       <SessionProvider>
       <SessionNeedsYou>
       <SessionChat>
+      {/* The tours: the welcome tour, the page tours and the "?" menu that
+          opens them. Inside the session, so the state read waits for /me. */}
+      <TourProvider>
       {/* Demo honesty banner: pinned above the shell on EVERY screen, never
           dismissible. Absent (and the DOM untouched) outside demo mode. */}
       {demo && <DemoBanner />}
@@ -119,6 +123,7 @@ export function AppShell() {
           </div>
         )}
       </div>
+      </TourProvider>
       </SessionChat>
       </SessionNeedsYou>
       </SessionProvider>

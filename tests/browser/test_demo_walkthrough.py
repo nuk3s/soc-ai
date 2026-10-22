@@ -36,7 +36,7 @@ _WAIT_MS = 15000
 # substring of the current sentence, so the test proves the real banner rendered
 # without pinning its punctuation. Keep it in step with the copy: this assertion
 # runs only in the browser-smoke CI job, not in the local pytest gate.
-_BANNER = "soc-ai ran these investigations and recorded them"
+_BANNER = "Some runs are recordings from a test grid"
 
 # A recorded replay alert (committed fixtures.json). Its recorded verdict is read
 # from the fixture rather than hardcoded, so a data refresh can't silently pass.
@@ -341,13 +341,16 @@ def test_hunt_console_lists_hunts_and_detail_renders(page: Page, demo_mode_stack
     assert len(hunts) >= 2, f"expected >=2 seeded hunts, got {len(hunts)}"
 
     # The Hunt Console lists every seeded hunt by its objective (the row renders
-    # the full objective under CSS truncation, so the text stays in the DOM).
+    # the full objective under CSS truncation, so the text stays in the DOM). A
+    # lead hunt's objective is the long brief the lead writes, so its row names
+    # the lead instead: "Lead 4 hunt: ...".
     page.goto(f"{base}/app/hunts", wait_until="networkidle")
     expect(page.get_by_text(_BANNER, exact=False).first).to_be_visible(timeout=_WAIT_MS)
     for hunt in hunts:
         objective = (hunt.get("objective") or "").strip()
         assert objective, f"seeded hunt {hunt.get('id')} has no objective"
-        expect(page.get_by_text(objective, exact=False).first).to_be_visible(timeout=_WAIT_MS)
+        label = f"Lead {hunt['lead_id']} hunt" if hunt.get("kind") == "lead" else objective
+        expect(page.get_by_text(label, exact=False).first).to_be_visible(timeout=_WAIT_MS)
 
     # Opening a hunt shows its recorded narrative and the execution timeline.
     hunt = _seeded_hunt(fixtures)

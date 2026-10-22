@@ -131,6 +131,7 @@ export function GridGapStrip({ range, custom, className }: Props) {
         <div
           role="status"
           data-testid="grid-gap-strip"
+          data-tour="grid-gap"
           className={cn(
             'flex items-start gap-2 rounded-card border border-warn/30 bg-warn/[0.06] px-3.5 py-2.5 text-[12.5px] leading-[1.5] text-text-2',
             className,

@@ -588,7 +588,7 @@ export function Runbooks() {
         <BookOpen size={19} className="text-accent" />
         <div className="text-[20px] font-semibold tracking-[-.015em]">Runbooks</div>
       </div>
-      <div className="mb-4 mt-0.5 max-w-[880px] flex-none text-[13px] leading-[1.55] text-dim">
+      <div data-tour="runbooks-header" className="mb-4 mt-0.5 max-w-[880px] flex-none text-[13px] leading-[1.55] text-dim">
         A runbook holds your team's own triage guidance. During an investigation, the model
         searches the runbooks and cites the best match. The verdict then cites <strong>your</strong> procedure. A runbook that names a
         detection rule under <em>Linked rules</em> ranks first if that rule fires. Every runbook
@@ -596,7 +596,7 @@ export function Runbooks() {
       </div>
 
       {/* toolbar: bulk actions + new (search lives in the list pane) */}
-      <div className="mb-3 flex flex-none flex-wrap items-center gap-2">
+      <div data-tour="runbooks-toolbar" className="mb-3 flex flex-none flex-wrap items-center gap-2">
         <div className="flex-1" />
         {/* Import: hidden file input driven by the button (browser File API). */}
         <input
@@ -629,6 +629,7 @@ export function Runbooks() {
           Load starter pack
         </button>
         <button
+          data-tour="runbooks-draft"
           onClick={() => void togglePromo()}
           disabled={busy}
           title="Draft a runbook from the investigations this deployment already ran. The model writes a draft for this network. You review and approve it."
@@ -714,7 +715,10 @@ export function Runbooks() {
       <div className="flex min-h-0 flex-col gap-4 lg:flex-1 lg:flex-row-reverse">
         {/* editor pane — the form when open, else a hint card (lg+ only; on
             narrow screens the pane vanishes entirely when nothing is open). */}
-        <div className={`${editing === null ? 'hidden lg:flex' : 'flex'} min-w-0 flex-1 flex-col lg:min-h-0`}>
+        <div
+          data-tour="runbooks-editor"
+          className={`${editing === null ? 'hidden lg:flex' : 'flex'} min-w-0 flex-1 flex-col lg:min-h-0`}
+        >
           {editing !== null ? (
             form
           ) : (
@@ -735,12 +739,16 @@ export function Runbooks() {
         {/* list pane: search + rows; scrolls internally on lg+ */}
         <div className="flex min-h-0 flex-none flex-col lg:w-1/3 lg:min-w-[300px] lg:max-w-[440px]">
           <input
+            data-tour="runbooks-search"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder={`Search ${runbooks.length} runbook${runbooks.length === 1 ? '' : 's'}`}
             className="mb-2 w-full flex-none rounded-control border border-border-input bg-bg px-3 py-1.5 text-[12.5px] text-text outline-none focus:border-accent"
           />
-          <div className="overflow-hidden rounded-card border border-border bg-surface-1 lg:flex-1 lg:overflow-y-auto">
+          <div
+            data-tour="runbooks-list"
+            className="overflow-hidden rounded-card border border-border bg-surface-1 lg:flex-1 lg:overflow-y-auto"
+          >
             {loading && <LoadingState />}
             {error && (
               <div className="p-3">

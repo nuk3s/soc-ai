@@ -292,7 +292,7 @@ export function HostsSummary({
   const tone = (good: string) => (summary == null ? UNKNOWN_TONE : good);
   const parts = summary ? attentionList(summary) : null;
   return (
-    <div data-testid="hosts-summary" className="mb-3.5">
+    <div data-testid="hosts-summary" data-tour="hosts-summary" className="mb-3.5">
       {searchActive && (
         <div data-testid="hosts-summary-scope" className="mb-1.5 text-[11.5px] text-faint">
           The cards and the role bar count every machine. The search does not filter them.

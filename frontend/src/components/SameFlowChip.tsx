@@ -96,6 +96,9 @@ export function SameFlowChip({ verdict, siblings, count, partial = false, onShow
       <button
         type="button"
         data-testid="same-flow-chip"
+        // The anchor of the same-flow step of the Alerts tour. Only the
+        // Alerts screen renders this chip. The tour points at the first one.
+        data-tour="alerts-same-flow"
         data-tone={opposite ? 'warning' : 'neutral'}
         aria-label={`${opposite ? `${opposite} ` : ''}${share} Show them.`}
         aria-expanded={open}

@@ -105,6 +105,10 @@ export async function readJobs(): Promise<JobsRead> {
 // ---- helpers ---------------------------------------------------------------
 
 function readFailure(error: unknown): string {
+  // The public demo refuses every admin read, and no visitor can sign in there.
+  if (error instanceof ApiError && error.reason === 'demo_mode') {
+    return 'The demo does not show this job.';
+  }
   return error instanceof ApiError && error.status === 403
     ? 'Only an admin can read this job.'
     : 'soc-ai could not read this job.';

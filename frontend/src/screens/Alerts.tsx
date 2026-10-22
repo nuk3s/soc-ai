@@ -2467,7 +2467,7 @@ export function Alerts() {
   return (
     <div className="px-[22px] pb-[60px] pt-5">
       {/* header */}
-      <div className="mb-4 flex items-end gap-3.5">
+      <div data-tour="alerts-header" className="mb-4 flex items-end gap-3.5">
         <div>
           <div className="flex items-baseline gap-3">
             <div className="text-title">Alerts</div>
@@ -3087,6 +3087,8 @@ export function Alerts() {
             >
               <div
                 onClick={() => toggleExpand(g)}
+                // The tour anchors of a row sit on the first row only.
+                data-tour={rowIdx === 0 ? 'alerts-row' : undefined}
                 className={`relative grid cursor-pointer items-center gap-2 border-b border-border-faint hover:bg-surface-hover${
                   kbFocused ? ' bg-surface-hover ring-1 ring-inset ring-accent' : ''
                 }`}
@@ -3102,7 +3104,7 @@ export function Alerts() {
                   const evSelCount = loadedIds.filter((id) => selEvents[id]).length;
                   const evIndeterminate = evSelCount > 0 && evSelCount < loadedIds.length;
                   return (
-                    <div className="flex items-center">
+                    <div data-tour={rowIdx === 0 ? 'alerts-select' : undefined} className="flex items-center">
                       <Checkbox
                         checked={seld}
                         indeterminate={evIndeterminate}
@@ -3379,7 +3381,10 @@ export function Alerts() {
                     overflow wraps to a second line below, never left into the
                     "Last seen" column; each button is nowrap so its own label
                     can't break mid-word. */}
-                <div className="flex flex-wrap items-center justify-end gap-1.5">
+                <div
+                  data-tour={rowIdx === 0 ? 'alerts-row-actions' : undefined}
+                  className="flex flex-wrap items-center justify-end gap-1.5"
+                >
                   {/* Wave 2 Task 7: Detection tuning now lives in the Operate
                       hub, but noise NOMINATIONS still start here — an analyst
                       staring at a noisy group needs a way there without

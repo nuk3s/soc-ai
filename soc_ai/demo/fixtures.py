@@ -1,37 +1,52 @@
-"""Load the sanitized demo fixture set and seed it into the store.
+"""Load the demo fixture set and seed it into the store.
 
-Schema (version 1): ``{version, investigations[], hunts[], backtests[],
-hunt_schedules[] (OPTIONAL — see :class:`~soc_ai.store.models.HuntSchedule`),
-quality_snapshots[] (OPTIONAL — the nightly quality-trend series, see
-:class:`~soc_ai.store.models.QualitySnapshot`), alerts[] (mock-ES documents,
-consumed by scripts/demo/mock_es.py), replays[] ({alert_es_id,
-investigation{...}, events[]} — replayed live by soc_ai/demo/replay.py, NOT
-seeded at startup), chats[] ({target ("investigation"|"hunt"), id,
-messages[]} — canned assistant replies looked up by soc_ai/demo/chat.py at
-request time, NOT seeded at startup)}``. Each investigation/hunt carries its
-ordered ``events[]`` (``{kind, sequence, payload}``) — the same rows
-:class:`~soc_ai.store.models.InvestigationEvent` /
-:class:`~soc_ai.store.models.HuntEvent` store. ``hunt_schedules[]`` rows carry
-no events.
+Schema (version 2), built by ``scripts/demo/build_story.py``:
 
-Seeding is idempotent PER ROW (skip any primary key already present), so a
-restart — or a store that was only partially seeded — completes without
-duplicating anything. The fixture file itself ships separately (built +
-owner-reviewed by the demo pipeline); a missing/invalid file is the caller's
-fail-soft concern (see the demo hook in :func:`soc_ai.main._init_store`).
+* ``anchor``: the instant the file's timestamps are written against. Every
+  ISO-8601 datetime string in the file, at any depth, moves by
+  ``now - anchor`` when the demo starts (:func:`rebase_document`). The anchor
+  lands at the seed instant, so "the last 24 hours" holds data on every boot,
+  and the gaps between rows in different sections stay as written. The mock
+  grid (``scripts/demo/mock_es.py``) moves its documents the same way.
+* ``investigations[]`` and ``hunts[]``: store rows, each with its ordered
+  ``events[]`` (``{kind, sequence, payload}``), the rows that
+  :class:`~soc_ai.store.models.InvestigationEvent` and
+  :class:`~soc_ai.store.models.HuntEvent` hold.
+* ``backtests[]``, ``hunt_schedules[]``, ``quality_snapshots[]``: store rows.
+* ``tables``: ``{table name: [row, ...]}`` for every other store table the
+  demo fills (hosts, profiles, observations, leads, grid gaps, analytic
+  history, escalations, runbooks and more). Only the tables in
+  :data:`SEEDED_TABLES` are accepted, in that order. A row names every
+  primary key, so a restart skips the rows it already holds.
+* ``autotriage``: the last Auto-Investigate batch, set on ``app.state`` at
+  startup (the panel reads process memory, not the store).
+* ``alerts[]``, ``documents[]``, ``traffic``: the mock grid's documents and
+  host traffic. The seeder ignores them.
+* ``replays[]`` and ``chats[]``: request-time content for
+  :mod:`soc_ai.demo.replay` and :mod:`soc_ai.demo.chat`. The seeder ignores
+  them.
+
+Seeding is idempotent per row: a row whose primary key is already present is
+skipped. A missing or invalid file is the caller's fail-soft concern (see the
+demo hook in :func:`soc_ai.main._init_store`).
 """
 
 from __future__ import annotations
 
+import copy
 import json
-from datetime import UTC, datetime
+import re
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from sqlalchemy import DateTime, Table, insert, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.types import TypeDecorator
 
 from soc_ai.store.models import (
     Backtest,
+    Base,
     Hunt,
     HuntEvent,
     HuntSchedule,
@@ -42,28 +57,59 @@ from soc_ai.store.models import (
 
 DEFAULT_FIXTURES = Path(__file__).parent / "fixtures.json"
 
-# Row keys holding ISO-8601 strings in the fixture file; the store's DateTime
-# columns want naive-UTC datetime objects (see soc_ai/store/models.py docstring).
-_TIME_KEYS = ("created_at", "finished_at")
+FIXTURES_VERSION = 2
 
-# Same idea for a hunt_schedules[] row (HuntSchedule has no finished_at, but
-# does have last_run_at — NULL until the schedule has fired once).
-_SCHEDULE_TIME_KEYS = ("created_at", "last_run_at")
+# The store tables a fixture file may fill through ``tables``, in insert order:
+# a parent table comes before the table that holds a key to it. The list is
+# also the allowlist. A fixture can never write users, sessions, tokens or
+# config overrides.
+SEEDED_TABLES: tuple[str, ...] = (
+    "host_machine",
+    "host_dossier",
+    "host_dossier_field",
+    "dossier_run",
+    "entity_profiles",
+    "member_prevalence",
+    "leads",
+    "entity_observations",
+    "grid_gaps",
+    "analytic_state",
+    "analytic_versions",
+    "hunt_spec_sweeps",
+    "prior_spec_runs",
+    "alert_assignments",
+    "alert_escalations",
+    "detection_override",
+    "runbook",
+    "internal_identifier",
+    "rule_prior_decisions",
+)
+
+# A full ISO-8601 datetime, the only string shape the rebase moves. A date
+# alone, a version string or an id never matches.
+_ISO_DATETIME = re.compile(
+    r"^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})(\.\d{1,6})?(Z|[+-]\d{2}:\d{2})?$"
+)
 
 
 def load_fixtures(path: Path = DEFAULT_FIXTURES) -> dict[str, Any]:
-    """Parse + version-check the fixture file.
+    """Parse and check the fixture file.
 
-    Returns the whole document — including the ``alerts[]``/``replays[]``/
-    ``chats[]`` pass-through sections consumed by the mock ES, the replay
-    runner, and the demo chat lookup, all of which :func:`seed_fixtures`
-    deliberately ignores. ``chats[]`` entries are shape-checked (see
-    :func:`_validate_chats`) so a malformed canned-chat entry fails loud here
-    rather than silently producing no reply at request time.
+    Returns the whole document as written, timestamps still against the
+    anchor. Call :func:`rebase_document` for the copy that reads as current.
+    ``chats[]`` entries are shape-checked (see :func:`_validate_chats`), so a
+    malformed canned-chat entry fails here and not at chat time.
     """
     data: dict[str, Any] = json.loads(path.read_text())
-    if data.get("version") != 1:
+    if data.get("version") != FIXTURES_VERSION:
         raise ValueError(f"unsupported fixtures version: {data.get('version')!r}")
+    anchor = data.get("anchor")
+    if not isinstance(anchor, str) or _ISO_DATETIME.match(anchor) is None:
+        raise ValueError(f"fixtures anchor must be an ISO-8601 datetime, got {anchor!r}")
+    tables = data.get("tables") or {}
+    unknown = sorted(set(tables) - set(SEEDED_TABLES))
+    if unknown:
+        raise ValueError(f"fixtures name tables the demo does not seed: {unknown}")
     _validate_chats(data.get("chats", []))
     return data
 
@@ -94,127 +140,178 @@ def _validate_chats(chats: list[Any]) -> None:
 
 
 def _parse_naive_utc(value: str) -> datetime:
-    """Parse an ISO-8601 string to a naive-UTC datetime (same normalization as
-    :func:`_coerce_times`), so mixed tz-aware/naive fixture rows stay comparable.
-    """
+    """Parse an ISO-8601 string to a naive-UTC datetime, the store's form."""
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is not None:
         parsed = parsed.astimezone(UTC).replace(tzinfo=None)
     return parsed
 
 
-def _rebase_rows_to_now(rows: list[dict[str, Any]], keys: tuple[str, ...] = _TIME_KEYS) -> None:
-    """Shift one section's timestamp fields (*keys*) forward so its newest row
-    lands at 'now', preserving ordering and gaps within the section. Mutates in
-    place; a no-op when the section carries no parseable timestamp.
+def shift_iso(value: str, delta: timedelta) -> str:
+    """Move one ISO-8601 datetime string by ``delta`` and keep its format.
+
+    The suffix stays as written (``Z``, an offset, or none for a naive UTC
+    value), and so does the number of fraction digits. A string that is not a
+    full datetime comes back unchanged.
     """
-    times: list[datetime] = []
-    for row in rows:
-        for key in keys:
-            value = row.get(key)
-            if isinstance(value, str):
-                times.append(_parse_naive_utc(value))
-    if not times:
-        return
-    delta = datetime.now(UTC).replace(tzinfo=None) - max(times)
-    for row in rows:
-        for key in keys:
-            value = row.get(key)
-            if isinstance(value, str):
-                row[key] = (_parse_naive_utc(value) + delta).isoformat()
+    match = _ISO_DATETIME.match(value)
+    if match is None:
+        return value
+    _date, _time, fraction, suffix = match.groups()
+    moved = _parse_naive_utc(value) + delta
+    out = moved.strftime("%Y-%m-%dT%H:%M:%S")
+    if fraction:
+        digits = len(fraction) - 1
+        out += "." + f"{moved.microsecond:06d}"[:digits]
+    if suffix == "Z":
+        out += "Z"
+    elif suffix:
+        out += "+00:00"
+    return out
 
 
-def _rebase_to_now(data: dict[str, Any]) -> None:
-    """Rebase each section (investigations/hunts/backtests/hunt_schedules)
-    independently so its OWN newest row lands at 'now', preserving ordering and
-    gaps within the section.
+def shift_tree(node: Any, delta: timedelta) -> Any:
+    """A copy of ``node`` with every datetime string value moved by ``delta``.
 
-    Per-section, not one global delta: in the committed fixtures the backtest is
-    ~2 days newer than the newest investigation, so a single global anchor would
-    drag every investigation ~46h into the past and out of the default window.
-    Cross-section time relationships don't matter for the demo — only that each
-    surface reads as current. Mutates ``data`` in place (the ISO-string timestamp
-    fields only); the committed fixtures mix tz-aware and naive rows, so
-    everything is normalized to naive-UTC first.
+    Dict keys never move. Only a whole string value that is a full datetime
+    moves; a datetime inside prose stays as written.
     """
-    for section in ("investigations", "hunts", "backtests", "quality_snapshots"):
-        _rebase_rows_to_now(data.get(section, []))
-    _rebase_rows_to_now(data.get("hunt_schedules", []), keys=_SCHEDULE_TIME_KEYS)
+    if isinstance(node, str):
+        return shift_iso(node, delta)
+    if isinstance(node, dict):
+        return {key: shift_tree(value, delta) for key, value in node.items()}
+    if isinstance(node, list):
+        return [shift_tree(item, delta) for item in node]
+    return node
 
 
-def _coerce_times(row: dict[str, Any], keys: tuple[str, ...] = _TIME_KEYS) -> dict[str, Any]:
-    """Convert ISO-8601 timestamp strings to the store's naive-UTC datetimes.
+def rebase_document(data: dict[str, Any], now: datetime | None = None) -> dict[str, Any]:
+    """A copy of the fixture document with every timestamp moved to read as current.
 
-    *keys* defaults to the investigation/hunt/backtest pair
-    (``created_at``/``finished_at``); a hunt_schedules[] row passes
-    :data:`_SCHEDULE_TIME_KEYS` instead (``created_at``/``last_run_at``).
+    The anchor lands at ``now`` (the seed instant, naive or aware UTC), and
+    every other datetime string keeps its distance from the anchor. The
+    input is never changed, so one loaded document can be rebased again.
     """
-    for key in keys:
-        value = row.get(key)
-        if isinstance(value, str):
-            parsed = datetime.fromisoformat(value)
-            if parsed.tzinfo is not None:
-                parsed = parsed.astimezone(UTC).replace(tzinfo=None)
-            row[key] = parsed
+    anchor = _parse_naive_utc(str(data["anchor"]))
+    current = now or datetime.now(UTC)
+    if current.tzinfo is not None:
+        current = current.astimezone(UTC).replace(tzinfo=None)
+    rebased: dict[str, Any] = shift_tree(data, current - anchor)
+    rebased["anchor"] = current.isoformat() + "+00:00"
+    return rebased
+
+
+def _table(name: str) -> Table:
+    table = Base.metadata.tables.get(name)
+    if table is None:
+        raise ValueError(f"no store table {name!r}")
+    return table
+
+
+def _store_row(table: Table, raw: dict[str, Any]) -> dict[str, Any]:
+    """One fixture row as the column values the store takes.
+
+    A DateTime column gets a naive-UTC datetime. An unknown key fails loud:
+    a builder mistake must not seed a row with a silently missing value.
+    """
+    columns = table.columns
+    unknown = sorted(set(raw) - set(columns.keys()))
+    if unknown:
+        raise ValueError(f"{table.name}: unknown column(s) {unknown}")
+    row = dict(raw)
+    for name, value in raw.items():
+        if isinstance(value, str) and _is_datetime(columns[name].type):
+            row[name] = _parse_naive_utc(value)
     return row
 
 
-async def seed_fixtures(
-    sessionmaker: async_sessionmaker[AsyncSession], data: dict[str, Any]
-) -> int:
-    """Insert fixture rows; skip any id that already exists (idempotent).
+def _is_datetime(column_type: Any) -> bool:
+    """Whether a column holds a datetime. The store's type wraps ``DateTime``."""
+    if isinstance(column_type, TypeDecorator):
+        column_type = column_type.impl
+    return isinstance(column_type, DateTime)
 
-    Rebases every row's timestamps to 'now' first (in place, see
-    :func:`_rebase_to_now`) so seeded content always reads as recent. Each row
-    is then copied before the ``events`` pop / time coercion, so seeding never
-    drops events and one loaded document can be seeded repeatedly.
-    Returns the number of parent rows (investigations + hunts + backtests +
-    hunt_schedules + quality_snapshots) added; their child events ride along
-    uncounted.
+
+async def _seed_table(db: AsyncSession, table_name: str, rows: list[dict[str, Any]]) -> int:
+    """Insert the rows of one table whose primary key the store does not hold."""
+    if not rows:
+        return 0
+    table = _table(table_name)
+    pk_cols = list(table.primary_key.columns)
+    names = [col.name for col in pk_cols]
+    for i, row in enumerate(rows):
+        missing = [name for name in names if row.get(name) is None]
+        if missing:
+            raise ValueError(f"{table_name}[{i}]: the primary key {missing} is missing")
+    keys = [tuple(row[name] for name in names) for row in rows]
+    have: set[tuple[Any, ...]] = set()
+    if len(names) == 1:
+        found = await db.scalars(select(pk_cols[0]).where(pk_cols[0].in_([k[0] for k in keys])))
+        have = {(value,) for value in found}
+    else:
+        result = await db.execute(select(*pk_cols).where(tuple_(*pk_cols).in_(keys)))
+        have = {tuple(r) for r in result}
+    fresh = [_store_row(table, row) for row, key in zip(rows, keys, strict=True) if key not in have]
+    # One executemany per set of keys: a row that leaves a column out takes the
+    # column default, and a row that names it None stores NULL.
+    groups: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+    for row in fresh:
+        groups.setdefault(tuple(sorted(row)), []).append(row)
+    for group in groups.values():
+        await db.execute(insert(table), group)
+    return len(fresh)
+
+
+async def seed_fixtures(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    data: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> int:
+    """Insert the fixture rows; skip any primary key that already exists.
+
+    Rebases a copy of ``data`` to ``now`` first (:func:`rebase_document`), so
+    the caller's document is never changed and can be seeded again. Returns
+    the number of rows added: the parent rows of the named sections plus the
+    rows of ``tables``. Child events ride along uncounted.
     """
-    _rebase_to_now(data)
+    doc = rebase_document(data, now)
     added = 0
     async with sessionmaker() as db:
-        for raw in data.get("investigations", []):
-            inv = _coerce_times(dict(raw))
+        for raw in doc.get("investigations", []):
+            inv = copy.deepcopy(raw)
             events = inv.pop("events", [])
             if await db.get(Investigation, inv["id"]) is not None:
                 continue
-            db.add(Investigation(**inv))
-            # Parent before children: no ORM relationships are declared (same
-            # constraint scripts/demo/seed_demo.py works around), so flush the
-            # parent row before its FK event rows.
+            db.add(Investigation(**_store_row(_table("investigations"), inv)))
+            # Parent before children: no ORM relationships are declared, so
+            # flush the parent row before its FK event rows.
             await db.flush()
             for ev in events:
                 db.add(InvestigationEvent(investigation_id=inv["id"], **ev))
             added += 1
-        for raw in data.get("hunts", []):
-            hunt = _coerce_times(dict(raw))
+        for raw in doc.get("hunts", []):
+            hunt = copy.deepcopy(raw)
             events = hunt.pop("events", [])
             if await db.get(Hunt, hunt["id"]) is not None:
                 continue
-            db.add(Hunt(**hunt))
+            db.add(Hunt(**_store_row(_table("hunts"), hunt)))
             await db.flush()
             for ev in events:
                 db.add(HuntEvent(hunt_id=hunt["id"], **ev))
             added += 1
-        for raw in data.get("backtests", []):
-            bt = _coerce_times(dict(raw))
-            if await db.get(Backtest, bt["id"]) is None:
-                db.add(Backtest(**bt))
-                added += 1
-        # OPTIONAL section — ``.get(..., [])`` makes this a no-op when absent.
-        for raw in data.get("hunt_schedules", []):
-            sched = _coerce_times(dict(raw), keys=_SCHEDULE_TIME_KEYS)
-            if await db.get(HuntSchedule, sched["id"]) is None:
-                db.add(HuntSchedule(**sched))
-                added += 1
-        # OPTIONAL section — the nightly quality-trend series (created_at is the
-        # only time key). ``.get(..., [])`` makes this a no-op when absent.
-        for raw in data.get("quality_snapshots", []):
-            snap = _coerce_times(dict(raw))
-            if await db.get(QualitySnapshot, snap["id"]) is None:
-                db.add(QualitySnapshot(**snap))
-                added += 1
+        for section, model in (
+            ("backtests", Backtest),
+            ("hunt_schedules", HuntSchedule),
+            ("quality_snapshots", QualitySnapshot),
+        ):
+            for raw in doc.get(section, []):
+                if await db.get(model, raw["id"]) is None:
+                    db.add(model(**_store_row(_table(model.__tablename__), raw)))
+                    added += 1
+        await db.flush()
+        tables = doc.get("tables") or {}
+        for table_name in SEEDED_TABLES:
+            added += await _seed_table(db, table_name, tables.get(table_name) or [])
         await db.commit()
     return added

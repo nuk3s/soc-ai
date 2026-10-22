@@ -265,7 +265,7 @@ export function Backtest() {
   return (
     <div className="px-[22px] pb-[60px] pt-5">
       {/* page header */}
-      <div className="mb-5">
+      <div data-tour="backtest-header" className="mb-5">
         <div className="flex items-center gap-2">
           <History size={19} className="text-accent" />
           <div className="text-[20px] font-semibold tracking-[-.015em]">Backtest</div>
@@ -282,7 +282,7 @@ export function Backtest() {
       {/* run form */}
       <Panel className="mb-5 p-4">
         <div className="mb-3 text-[13px] font-semibold">New backtest</div>
-        <div className="flex flex-wrap items-end gap-4">
+        <div data-tour="backtest-form" className="flex flex-wrap items-end gap-4">
           <Field label="Window">
             <select
               value={windowDays}
@@ -562,7 +562,7 @@ function PastRuns({
   return (
     <Panel className="mb-5">
       <div className="border-b border-border px-4 py-3 text-[13px] font-semibold">Past runs</div>
-      <ul data-testid="backtest-runs" className="max-h-[260px] overflow-y-auto">
+      <ul data-testid="backtest-runs" data-tour="backtest-runs" className="max-h-[260px] overflow-y-auto">
         {runs.map((r) => {
           const shown = r.backtest_id === shownId;
           const when = r.finished_at ?? r.started_at;
@@ -634,7 +634,7 @@ function CancelControl({
     );
   }
   return (
-    <div className="mt-2.5">
+    <div data-tour="backtest-cancel" className="mt-2.5">
       {open ? (
         <div
           data-testid="backtest-cancel-confirm"
@@ -776,7 +776,7 @@ function Results({ data }: { data: BacktestData }) {
       )}
 
       {/* headline metric cards */}
-      <div className="mb-5 grid grid-cols-1 gap-3 md:grid-cols-3">
+      <div data-tour="backtest-figures" className="mb-5 grid grid-cols-1 gap-3 md:grid-cols-3">
         {noEscalated ? (
           <MetricCard
             label="Agreement with analysts"
@@ -988,7 +988,7 @@ function RowsTable({ rows }: { rows: BacktestRow[] }) {
     return <div className="px-4 py-8 text-center text-[13px] text-faint">The table has no rows.</div>;
   }
   return (
-    <div className="overflow-x-auto">
+    <div data-tour="backtest-table" className="overflow-x-auto">
       <table className="w-full min-w-[640px] border-collapse text-[12.5px]">
         <thead>
           <tr className="border-b border-border text-[11px] uppercase tracking-[.04em] text-dim">

@@ -451,6 +451,26 @@ describe('StatusJobsPanel', () => {
   });
 });
 
+describe('StatusJobsPanel on the public demo', () => {
+  it('names the demo as the reason a job is hidden, and never asks for an admin', async () => {
+    // The demo refuses every admin read with reason demo_mode. No visitor can
+    // sign in there, so "Only an admin can read this job" sent them nowhere.
+    const demo = () => Promise.reject(new ApiError('demo', 403, 'demo_mode'));
+    vi.mocked(getConfig).mockImplementation(demo);
+    vi.mocked(getDiscoveryScan).mockImplementation(demo);
+    vi.mocked(getQualityTrend).mockImplementation(demo);
+    vi.mocked(getQualityEvalStatus).mockImplementation(demo);
+    vi.mocked(getMaintenance).mockImplementation(demo);
+    mount();
+    await loaded();
+    for (const name of ['Discovery scan', 'Nightly quality eval', 'Nightly backup']) {
+      expect(state(name)).toBe('unknown');
+      expect(result(name)).toHaveTextContent('The demo does not show this job.');
+    }
+    expect(screen.queryByText('Only an admin can read this job.')).toBeNull();
+  });
+});
+
 describe('StatusJobsPanel poll', () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());

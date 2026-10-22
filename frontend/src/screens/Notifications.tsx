@@ -180,6 +180,13 @@ export function Notifications() {
     setDismissTick((t) => t + 1);
   };
 
+  // Whether Dismiss all shows its button: the condition of DismissAllControl.
+  // The page tour points at the button only when it shows, so the step never
+  // lights an empty box.
+  const unreadHits = needsYou.data ? needsYou.data.unread_shadow_hits : null;
+  const canDismissAll =
+    lastUpdated !== null && (items.some((n) => n.dismissible !== false) || more || unreadHits !== 0);
+
   const resetFilters = () => {
     setKind('all');
     setUrgency([]);
@@ -257,7 +264,7 @@ export function Notifications() {
   return (
     <div className="px-[22px] pb-[60px] pt-5">
       <div className="mb-4 flex items-start justify-between gap-3">
-        <div>
+        <div data-tour="notifications-header">
           <div className="flex items-baseline gap-3">
             <div className="text-title">Notifications</div>
             <Freshness at={lastUpdated} />
@@ -277,7 +284,10 @@ export function Notifications() {
             the unread shadow hits. It steps over a row the server marks
             undismissible: one click that sweeps away a tamper finding is not
             a tamper alarm. */}
-        <div className="flex max-w-[460px] flex-none flex-col items-end">
+        <div
+          data-tour={canDismissAll ? 'notifications-dismiss-all' : undefined}
+          className="flex max-w-[460px] flex-none flex-col items-end"
+        >
           <DismissAllControl
             rows={items}
             more={more}
@@ -289,29 +299,35 @@ export function Notifications() {
       </div>
       {failCount >= 2 && <StaleNotice since={lastUpdated} onRefresh={refetch} className="mb-3" />}
 
-      {/* Every part of the count the bell badge shows, with its scope. */}
-      <NeedsYouBlock
-        state={needsYou}
-        className="mb-4 rounded-card border border-border bg-surface-1 px-4 py-3"
-      />
+      {/* Every part of the count the bell badge shows, with its scope. The
+          wrapper holds the anchor of the page tour: the block is shared with
+          the bell and takes no attribute. */}
+      <div data-tour="notifications-needs-you">
+        <NeedsYouBlock
+          state={needsYou}
+          className="mb-4 rounded-card border border-border bg-surface-1 px-4 py-3"
+        />
+      </div>
 
       {/* The shared list toolbar, in its sibling placement: directly above the
           list, chip row over facet row, so the four screens in this nav group
           line up on the same left edge and the same top edge. */}
-      <ListToolbar
-        presets={presets}
-        presetsLabel="Types"
-        onPreset={(id) => setKind(id as NotificationKind | 'all')}
-      >
-        <MultiSelect
-          label="Urgency"
-          options={URGENCY.map((u) => ({ value: u.value, label: u.label }))}
-          value={urgency}
-          onChange={setUrgency}
-        />
-      </ListToolbar>
+      <div data-tour="notifications-filters">
+        <ListToolbar
+          presets={presets}
+          presetsLabel="Types"
+          onPreset={(id) => setKind(id as NotificationKind | 'all')}
+        >
+          <MultiSelect
+            label="Urgency"
+            options={URGENCY.map((u) => ({ value: u.value, label: u.label }))}
+            value={urgency}
+            onChange={setUrgency}
+          />
+        </ListToolbar>
+      </div>
 
-      <div className="overflow-hidden rounded-card border border-border bg-surface-1">
+      <div data-tour="notifications-list" className="overflow-hidden rounded-card border border-border bg-surface-1">
         {loading && <LoadingState />}
         {error && (
           <div className="p-3">

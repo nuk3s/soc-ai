@@ -65,6 +65,7 @@ import type {
   Verdict,
 } from '../lib/types';
 import { useAsync } from '../lib/useAsync';
+import type { PanelId } from '../lib/dashboardLayout';
 import { useDashboardLayout } from '../lib/useDashboardLayout';
 import { type NeedsYouState, needsYouLinks, useNeedsYouCount } from '../lib/needsYou';
 import { WIDE_QUERY, useMediaQuery } from '../lib/useMediaQuery';
@@ -984,6 +985,15 @@ function downDeps(h: Health | null): DownDep[] {
 
 // ---- screen ----------------------------------------------------------------
 
+/** The anchors of the page tour on the panels (tours/content.ts,
+ *  DASHBOARD_TOUR). DashboardGrid puts each one on the tile of its panel. */
+const TOUR_ANCHORS: Partial<Record<PanelId, string>> = {
+  'kpi-awaiting': 'dashboard-needs-you',
+  outcomes: 'dashboard-outcomes',
+  recent: 'dashboard-recent',
+  'setup-health': 'dashboard-setup-health',
+};
+
 export function Dashboard() {
   const navigate = useNavigate();
   const demo = useDemo(); // read-only demo: eval-run shows a note, never POST
@@ -1411,7 +1421,7 @@ export function Dashboard() {
         </div>
       ))}
 
-      <div className="flex flex-wrap items-end justify-between gap-2">
+      <div data-tour="dashboard-header" className="flex flex-wrap items-end justify-between gap-2">
         <div>
           <div className="flex items-baseline gap-3">
             <h1 className="text-[20px] font-semibold tracking-[-.015em]">Dashboard</h1>
@@ -1514,6 +1524,7 @@ export function Dashboard() {
         editing={editingLayout}
         wide={wide}
         onCommit={dashLayout.commit}
+        tourAnchors={TOUR_ANCHORS}
       >
         {/* The panel id predates the tile: a saved layout keeps the slot it
             gave "Awaiting investigation", and the Needs-you tile holds it. */}

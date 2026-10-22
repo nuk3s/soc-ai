@@ -113,7 +113,7 @@ export function TimeRangeFilter({ value, custom, onChange, presets = DEFAULT_PRE
   };
 
   return (
-    <div className="relative flex items-center">
+    <div data-tour="time-filter" className="relative flex items-center">
       <div className="flex items-center overflow-hidden rounded-control border border-border-2 bg-surface-1">
         {presets.map((t) => (
           <button

@@ -866,7 +866,7 @@ export function HostFacts({
   // them as facts from old or weak evidence.
   const guesses = withheldFields(dossier.fields);
   return (
-    <div data-testid="host-facts" className="mb-3">
+    <div data-testid="host-facts" data-tour="host-facts" className="mb-3">
       <Panel>
         <PanelHeader
           icon={<ListChecks size={15} />}

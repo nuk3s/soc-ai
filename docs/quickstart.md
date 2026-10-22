@@ -14,11 +14,11 @@ docker compose -f docker-compose.demo.yml up --build
 # → http://127.0.0.1:8080/app/
 ```
 
-The demo replays recorded investigations, hunts and a backtest on canned data.
-It runs the same console that you connect to your grid later. The demo also
-carries a week of hunt catalog sweeps. The catalog panel on the Status page and
-the Catalog preset on the Hunts screen show the declarative catalog at work.
-No data leaves the host. The hosted copy is
+The demo holds one story on a small estate of 24 machines. Some runs are
+recordings of soc-ai on a test grid. A script generated the hosts, the leads,
+the analytics and the rest. Every page of the console shows data. The demo
+runs the same console that you connect to your grid later. No data leaves the
+host. The hosted copy is
 [the live demo](https://soc-ai-demo.onrender.com/). It needs no install and no
 login.
 

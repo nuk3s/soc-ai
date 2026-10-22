@@ -823,7 +823,7 @@ export function HuntCatalogPanel() {
           ) : catalog.failCount >= 2 ? (
             <StaleNotice since={catalog.lastUpdated} onRefresh={catalog.refetch} className="mx-[15px] mt-3" />
           ) : null}
-          <div className="border-b border-border px-[15px] py-3 text-[13px] text-text-2">
+          <div data-tour="status-sweep" className="border-b border-border px-[15px] py-3 text-[13px] text-text-2">
             <SweepsLine data={data} demo={demo} />
             <LoopResult health={data.sweep_health} testId="catalog-sweep-result" />
           </div>

@@ -184,7 +184,7 @@ export function HostBriefing({ dossier, canDeclare, onApplied, focusField, agent
   if (conflicts.length === 0 && !criticality && !policy && !noAgent && !lateAgent) return null;
 
   return (
-    <section data-testid="host-briefing" className="mb-3 flex flex-col gap-2">
+    <section data-testid="host-briefing" data-tour="host-briefing" className="mb-3 flex flex-col gap-2">
       {(criticality || policy) && (
         <div
           className={cn(

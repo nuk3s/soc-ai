@@ -9,6 +9,7 @@
 
 import { hadSession, markSignedOut } from './loginReason';
 import { wireBound } from './timeRange';
+import type { ToursState } from '../tours/types';
 import type {
   AboutInfo,
   AdminUser,
@@ -3143,6 +3144,23 @@ export function deleteDashboardLayout(): Promise<{ ok: boolean; removed: boolean
   return del<{ ok: boolean; removed: boolean }>('/me/dashboard-layout', {
     skipLoginRedirect: true,
   });
+}
+
+// ── Tour state (per user, server-held) ──────────────────────────────────────
+//
+// The same 401 contract as the Dashboard layout: the state belongs to a user
+// row, so a deployment with authentication off answers 401, and the console
+// keeps the state in the browser (tours/TourProvider.tsx). The opt-out keeps
+// that answer from sending the page to a login form.
+
+/** This user's tour state: the opt-out and the version of each tour seen. */
+export function getMyTours(): Promise<ToursState> {
+  return request<ToursState>('/me/tours', { skipLoginRedirect: true });
+}
+
+/** Replace this user's tour state whole. */
+export function putMyTours(state: ToursState): Promise<ToursState> {
+  return put<ToursState>('/me/tours', state, { skipLoginRedirect: true });
 }
 
 // ── Leads (hunting release, phase 2) ─────────────────────────────────────────

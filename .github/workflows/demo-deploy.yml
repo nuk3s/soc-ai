@@ -16,6 +16,8 @@ name: demo deploy
 # Gate: the demo fixture leak tests run before any deploy — a committed
 # soc_ai/demo/fixtures.json carrying a lab identifier fails the run; an
 # absent fixtures.json passes clean (the image boots fail-soft without it).
+# tests/test_demo_story.py also fails when the file is stale: rebuild it with
+# scripts/demo/build_story.py.
 # NOTE: on the public GitHub mirror the gate module self-skips (its pattern
 # source, scripts/build-public-mirror.sh, never ships publicly) — there the
 # effective gate is the mirror build itself, which refuses to publish a
@@ -56,7 +58,7 @@ jobs:
         run: uv sync --all-extras --dev
 
       - name: Demo fixture leak gate
-        run: uv run pytest tests/test_demo_leak_gate.py -v --no-cov
+        run: uv run pytest tests/test_demo_leak_gate.py tests/test_demo_story.py -v --no-cov
 
   deploy:
     name: deploy to Render

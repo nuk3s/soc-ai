@@ -51,6 +51,7 @@ from soc_ai.store import hunt_templates as hunt_templates_svc
 from soc_ai.store import hunts as hunt_svc
 from soc_ai.store import investigations as inv_svc
 from soc_ai.store import leads as leads_store
+from soc_ai.store import user_tours
 from soc_ai.store.auth import bootstrap_admin, purge_expired_sessions
 from soc_ai.store.config_overrides import apply_to_settings, load_overrides
 from soc_ai.store.db import describe_store, make_engine, make_sessionmaker, run_migrations
@@ -141,6 +142,11 @@ async def _reaper_loop(db_sessionmaker: Any, settings: Any) -> None:
     interval_min = settings.investigation_reaper_interval_minutes
     age_min = settings.investigation_reaper_minutes
     if interval_min <= 0 or age_min <= 0:
+        return
+    # The demo runs no work that can go stale: a replay ends its own row, and a
+    # demo chat stores nothing. The one row that stays in flight is the seeded
+    # hunt under the in-progress lead, and the reaper would end it.
+    if getattr(settings, "soc_ai_demo", False) is True:
         return
     # A turn that hits its timeout can still write a partial answer from its
     # tool results, in at most PARTIAL_ANSWER_TIMEOUT_S more. The sweep waits
@@ -1510,6 +1516,12 @@ async def _lead_auto_hunt_loop(app: FastAPI) -> None:
     """
     from soc_ai.hunting import lead_hunt  # noqa: PLC0415
 
+    # The demo starts no hunt. Its model gateway is a mock, so a lead hunt
+    # could only fail, and each failed hunt would grow the store of a public
+    # site. The seeded leads already show every state.
+    if getattr(app.state.settings, "soc_ai_demo", False) is True:
+        return
+
     # Per-process, per-lead: when the skip was last said. Rebuilt each wake
     # from the leads still being skipped, so it cannot grow without bound.
     said_no_documents: dict[int, datetime] = {}
@@ -1760,6 +1772,38 @@ async def _mark_backtest_leads(db_sessionmaker: Any) -> None:
         _LOGGER.warning("backtest lead repair failed; continuing", exc_info=True)
 
 
+def _apply_demo_autotriage(state: Any, batch: Any) -> None:
+    """Set the last Auto-Investigate batch the demo shows.
+
+    The panel reads process memory, and a demo never runs a batch, so the
+    fixture file carries one. Unknown keys are ignored: the fixture cannot
+    reach the private fields of the status object.
+    """
+    if not isinstance(batch, dict):
+        return
+    from soc_ai.webui import autotriage  # noqa: PLC0415
+
+    status = autotriage.get_status(state)
+    for key in (
+        "total",
+        "hunted",
+        "skipped",
+        "failed",
+        "finished_at",
+        "tool_calls",
+        "inherited_acked",
+        "inherited_acked_total",
+        "prior_covered",
+    ):
+        if key in batch:
+            setattr(status, key, batch[key])
+    if isinstance(batch.get("skipped_reasons"), dict):
+        status.skipped_reasons = {str(k): int(v) for k, v in batch["skipped_reasons"].items()}
+    if isinstance(batch.get("severities"), list):
+        status.severities = tuple(str(v) for v in batch["severities"])
+    status.active = False
+
+
 async def _init_store(db_engine: Any, settings: Any, secret_box: Any = None) -> Any:
     """Migrate the store, bootstrap the admin, apply config overrides, reap orphans.
 
@@ -1817,10 +1861,13 @@ async def _init_store(db_engine: Any, settings: Any, secret_box: Any = None) -> 
 
     await _mark_backtest_leads(db_sessionmaker)
 
-    # Demo mode: seed the sanitized recorded-run fixtures so the UI has
-    # investigations/hunts/backtests to browse. Idempotent per row (restart-safe)
-    # and fail-soft — a missing or invalid fixtures.json must never block
-    # serving; the demo just starts with whatever the store already holds.
+    await _reap_orphans_at_startup(db_sessionmaker)
+
+    # Demo mode: seed the fixture set so every console page has content. The
+    # seed runs AFTER the reaper on purpose: the demo shows a hunt in flight
+    # and a lead that waits on it, and the reaper would end both. Idempotent
+    # per row (restart-safe) and fail-soft: a missing or invalid fixtures.json
+    # must never block serving; the demo starts with whatever the store holds.
     if settings.soc_ai_demo:
         try:
             from soc_ai.demo.fixtures import (  # noqa: PLC0415
@@ -1837,7 +1884,7 @@ async def _init_store(db_engine: Any, settings: Any, secret_box: Any = None) -> 
         # The hunt catalog's sweep trail is generated from the shipped catalog,
         # not read from the fixture file (see soc_ai/demo/catalog_trail.py), so
         # it has its own fail-soft step: a fixture problem must not cost the
-        # Operate hub its one live panel, and the reverse holds too.
+        # Status page its analytic sweep panel, and the reverse holds too.
         try:
             from soc_ai.demo.catalog_trail import seed_catalog_trail  # noqa: PLC0415
 
@@ -1845,8 +1892,6 @@ async def _init_store(db_engine: Any, settings: Any, secret_box: Any = None) -> 
                 _LOGGER.info("demo mode: seeded a week of hunt catalog sweeps")
         except Exception:
             _LOGGER.warning("demo catalog trail seed failed; continuing without it", exc_info=True)
-
-    await _reap_orphans_at_startup(db_sessionmaker)
 
     return db_sessionmaker
 
@@ -1948,9 +1993,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: PLR0915 — li
     app.state.demo_fixtures = None
     if settings.soc_ai_demo:
         try:
-            from soc_ai.demo.fixtures import DEFAULT_FIXTURES, load_fixtures  # noqa: PLC0415
+            from soc_ai.demo.fixtures import (  # noqa: PLC0415
+                DEFAULT_FIXTURES,
+                load_fixtures,
+                rebase_document,
+            )
 
-            app.state.demo_fixtures = load_fixtures(DEFAULT_FIXTURES)
+            app.state.demo_fixtures = rebase_document(load_fixtures(DEFAULT_FIXTURES))
+            _apply_demo_autotriage(app.state, app.state.demo_fixtures.get("autotriage"))
         except Exception:
             _LOGGER.warning(
                 "demo replay fixtures unavailable; replay lookups will find nothing",
@@ -2270,7 +2320,11 @@ def _validation_hint(err: dict[str, Any]) -> str:
 _MAX_BODY_BYTES = 1024 * 1024
 # Tighter caps for named routes. Login is unauthenticated and sits in front of
 # the throttle, so it gets the smallest one.
-_ROUTE_BODY_CAPS: dict[str, int] = {"/api/v1/login": 8 * 1024}
+_ROUTE_BODY_CAPS: dict[str, int] = {
+    "/api/v1/login": 8 * 1024,
+    # The tour state is a small object (soc_ai.store.user_tours).
+    "/api/v1/me/tours": user_tours.MAX_BYTES,
+}
 
 
 def _too_large(limit: int) -> JSONResponse:

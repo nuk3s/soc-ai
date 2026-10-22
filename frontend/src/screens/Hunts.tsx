@@ -1076,7 +1076,7 @@ export function Hunts() {
           title + freshness, then ONE line of counts. Those counts used to be a
           three-card KPI band; the figures (and their sub-labels, now hover
           context) are unchanged, the 112px of chrome around them is not. */}
-      <div className="mb-4">
+      <div className="mb-4" data-tour="hunts-header">
         <div className="flex items-baseline gap-3">
           <div className="text-title">Hunt Console</div>
           <Freshness at={lastUpdated} />
@@ -1099,7 +1099,7 @@ export function Hunts() {
             header and the composer, because the pixels this screen was fixed
             for were spent by a third band. A tab strip is part of the header,
             so it rides there. */}
-        <div className="mt-3 flex gap-1 border-b border-border">
+        <div className="mt-3 flex gap-1 border-b border-border" data-tour="hunts-tabs">
           <button
             type="button"
             onClick={() => setTab('hunts')}
@@ -1132,17 +1132,24 @@ export function Hunts() {
           was pursued. Each item appears once. W1: the leads started 1,977 px
           down a 900 px screen, under 12 hits that waited on nobody. */}
       <NeedsYouStrip />
-      <LeadsStrip
-        paramBound
-        onRows={setLeadRows}
-        collapsed={leadsFold.collapsed}
-        onToggleCollapsed={leadsFold.toggle}
-      />
-      <AnalyticHits
-        onAnalyticChanged={analyticsChanged}
-        collapsed={hitsFold.collapsed}
-        onToggleCollapsed={hitsFold.toggle}
-      />
+      {/* The two tour anchors wrap shared blocks. A plain block with no
+          border or padding lets the bottom margin of the block pass through,
+          so the page lays out the same. */}
+      <div data-tour="hunts-leads">
+        <LeadsStrip
+          paramBound
+          onRows={setLeadRows}
+          collapsed={leadsFold.collapsed}
+          onToggleCollapsed={leadsFold.toggle}
+        />
+      </div>
+      <div data-tour="hunts-hits">
+        <AnalyticHits
+          onAnalyticChanged={analyticsChanged}
+          collapsed={hitsFold.collapsed}
+          onToggleCollapsed={hitsFold.toggle}
+        />
+      </div>
 
       {/* The hunt section: agent runs only. The catalog sweep writes an
           observation now, and its hit is a card in the block above. */}
@@ -1342,7 +1349,7 @@ export function Hunts() {
       )}
       <GridGapStrip range={range} custom={custom} className="mb-3" />
       <Panel>
-        <div className="overflow-x-auto">
+        <div className="overflow-x-auto" data-tour="hunts-list">
         <div
           className="grid items-center gap-2.5 border-b border-border px-4 py-2.5 text-[11px] font-semibold uppercase tracking-[.04em] text-dim"
           style={{ gridTemplateColumns: GRID, minWidth: GRID_MIN_WIDTH }}

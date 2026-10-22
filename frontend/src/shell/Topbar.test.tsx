@@ -446,7 +446,7 @@ describe('Topbar dropdowns close like the account menu', () => {
     await flush();
     act(() => bell().click());
     const panel = screen.getByRole('dialog', { name: 'Notifications' });
-    const help = screen.getByRole('link', { name: 'Open the guide' });
+    const help = screen.getByRole('button', { name: 'Help' });
     // DOCUMENT_POSITION_FOLLOWING: the argument comes after the reference.
     expect(bell().compareDocumentPosition(panel) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(panel.compareDocumentPosition(help) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
@@ -511,14 +511,24 @@ describe('Workspace avatar', () => {
 });
 
 // The help button opened the command palette, and the guide had no link in
-// the console (dogfood 2026-10-06).
+// the console (dogfood 2026-10-06). The guide is now an item of the "?" menu,
+// beside the tours and the keyboard shortcuts.
 describe('Topbar help', () => {
-  it('opens the guide in a new tab', async () => {
+  it('opens the guide in a new tab from the help menu', async () => {
     mount();
     await flush();
-    const help = screen.getByRole('link', { name: 'Open the guide' });
+    act(() => screen.getByRole('button', { name: 'Help' }).click());
+    const help = screen.getByRole('menuitem', { name: 'Open the guide' });
     expect(help.getAttribute('href')).toBe('/app/guide/');
     expect(help.getAttribute('target')).toBe('_blank');
+  });
+
+  it('carries the anchors of the welcome tour', async () => {
+    mount();
+    await flush();
+    for (const anchor of ['search', 'bell', 'help']) {
+      expect(document.querySelector(`[data-tour="${anchor}"]`), anchor).not.toBeNull();
+    }
   });
 });
 

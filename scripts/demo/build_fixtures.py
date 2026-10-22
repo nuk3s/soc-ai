@@ -1,4 +1,8 @@
-"""Build ``soc_ai/demo/fixtures.json`` from recorded runs.
+"""Build ``scripts/demo/recorded_runs.json`` from recorded runs.
+
+The file is the recorded half of the demo. ``scripts/demo/build_story.py``
+reads it and writes the fixture file the demo serves,
+``soc_ai/demo/fixtures.json`` (version 2).
 
 Inputs:
 
@@ -599,7 +603,9 @@ def main(argv: list[str] | None = None) -> None:
         help="canned chat threads (JSON list) for the chats[] section "
         "(scripts/demo/demo_chats.json)",
     )
-    parser.add_argument("--out", type=Path, default=REPO / "soc_ai" / "demo" / "fixtures.json")
+    parser.add_argument(
+        "--out", type=Path, default=REPO / "scripts" / "demo" / "recorded_runs.json"
+    )
     args = parser.parse_args(argv)
     if (
         not args.bundles

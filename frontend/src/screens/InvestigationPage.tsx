@@ -70,7 +70,7 @@ export function InvestigationPage() {
 
   return (
     <div className="px-[22px] pb-[60px] pt-[18px]">
-      <div className="mx-auto mb-4 flex max-w-workstation items-center gap-3">
+      <div data-tour="investigation-header" className="mx-auto mb-4 flex max-w-workstation items-center gap-3">
         <Link to={backTo} className="flex items-center gap-1.5 text-[12.5px] text-dim hover:text-text">
           <ChevronLeft size={13} /> Back to {backLabel}
         </Link>

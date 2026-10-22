@@ -195,6 +195,7 @@ function EntityBody({
       {/* Header: the value, what it is, and the answer to "should I worry". */}
       <div
         data-testid="entity-header"
+        data-tour="entity-header"
         className="mb-4 rounded-panel-lg border border-border bg-surface-2 px-5 py-4"
       >
         <div className="flex flex-wrap items-center gap-3">
@@ -234,6 +235,7 @@ function EntityBody({
         )}
         <div
           data-testid="entity-seen"
+          data-tour="entity-seen"
           className="mt-2.5 flex flex-wrap items-center gap-x-4 gap-y-1 font-mono text-[11px] text-faint"
         >
           {/* The source of each time is named: soc-ai records here, grid
@@ -276,12 +278,12 @@ function EntityBody({
 
       {/* The leads and the observations that name the entity come first:
           they are the open work. The timeline is the history. */}
-      <div data-testid="entity-hunting">
+      <div data-testid="entity-hunting" data-tour="entity-hunting">
         <LeadsStrip entityKey={data.value} status="all" noun="entity" className="mb-4" />
         <HostObservations entityKey={data.value} noun="entity" />
       </div>
 
-      <div className="mt-4">
+      <div data-tour="entity-timeline" className="mt-4">
         {data.timeline.length === 0 ? (
           <EmptyState>
             No investigation or hunt finding names{' '}

@@ -299,7 +299,7 @@ export function HostActivityRow({
         </div>
       )}
 
-      <div className="mb-3 grid grid-cols-1 gap-3 lg:grid-cols-3">
+      <div data-tour="host-activity" className="mb-3 grid grid-cols-1 gap-3 lg:grid-cols-3">
         <Panel className={cn('lg:col-span-2', loading && 'opacity-60')}>
           {/* No verdict chip here. A "latest False positive" chip on the
               peer graph read as the verdict on the host, beside an Alerts

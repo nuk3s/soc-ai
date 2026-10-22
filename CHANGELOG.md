@@ -6,6 +6,56 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Tutorial mode
+
+- **Tours.** The console has a welcome tour and one tour for each page. The welcome tour
+  starts after the first sign-in, or on the first visit with authentication off. It shows the
+  sidebar, the page time filter, the search, the bell, the Ask soc-ai button and the help menu.
+  The tour of a page starts on the first visit to the page, after the welcome tour when both
+  apply. Two tours never run at the same time. A step dims the page and draws an outline around
+  one control, with a card beside it. A step whose control is not on the page is skipped. A tour
+  with no control on the page does not start.
+- **The help menu.** The "?" button in the top bar opens a menu: Tour this page, Tour soc-ai from
+  the start, Keyboard shortcuts and Open the guide. The menu also turns the tours on again.
+- **Turn off tours.** The last step of a tour and the Skip panel offer "Turn off tours". No tour
+  then starts by itself. The help menu still starts one.
+- **Automated browsers.** No tour starts by itself when `navigator.webdriver` is true, when the
+  URL has `?tour=off`, or when localStorage `soc-ai.tours.off` is `1`. The help menu still starts
+  a tour, so an automated check can open one on purpose.
+- **The tour state.** Migration 0065 adds the column `users.tours_state`. It holds the opt-out and
+  the version of each tour that the user saw, so the first sign-in holds across browsers. New
+  routes: `GET /api/v1/me/tours` and `PUT /api/v1/me/tours`. A bearer token reads and writes the
+  state of the user who created it. With no user behind the request, both routes answer 401
+  `no_session`, and the console keeps the state in the browser. A write with a bad tour id, a bad
+  version or more than 64 tours answers 400 `invalid_tours_state`. The body is capped at 8 KiB.
+- All tour text is in `frontend/src/tours/content.ts`, for review in one place.
+
+### Demo
+
+- **Every page shows content.** The hosted demo and `docker-compose.demo.yml` hold one story on
+  an estate of 24 machines. An attack chain runs from a downloaded executable to lateral
+  movement and an upload to cloud storage, with benign noise around it. The Hosts page, the
+  host and entity pages, leads in every state, the analytic hits, a held analytic, a closed grid
+  gap with its review hits, the Status panels, the runbooks and a cancelled backtest now show
+  data.
+- **One anchor for every timestamp.** The demo fixture file moves to version 2. Every timestamp
+  in it is written against one anchor, and the demo moves the anchor to the start instant. The
+  last day and the last week hold data on any day the demo starts.
+- **The build.** `scripts/demo/build_story.py` writes `soc_ai/demo/fixtures.json` from
+  `scripts/demo/recorded_runs.json` and `scripts/demo/story.py`. Two leak gates run before the
+  write. `tests/test_demo_story.py` fails when the committed file is stale.
+- **The mock grid.** `scripts/demo/mock_es.py` answers the host page, the same-flow reads, the
+  citation drawer and the alert pass. A time range now limits the alerts it lists.
+- **The banner** reads "Demo. Some runs are recordings from a test grid. A script generated the
+  rest. Nothing here is live."
+- **No background work on the demo.** The demo runs no lead hunt and no reaper loop. The seed
+  runs after the startup reaper, so the hunt in progress stays in progress.
+
+### Dependencies
+
+- `opentelemetry-api` 1.45.1. pip-audit found CVE-2026-114603 in 1.39.1. The lock drops
+  `importlib-metadata` and `zipp`, which the new version no longer needs.
+
 ## [1.6.0] - 2026-10-21
 
 ### Dependencies

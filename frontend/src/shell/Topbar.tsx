@@ -1,4 +1,4 @@
-import { Bell, Check, ChevronDown, HelpCircle, Network, Search, Settings, X } from 'lucide-react';
+import { Bell, Check, ChevronDown, Network, Search, Settings, X } from 'lucide-react';
 import { type RefObject, useEffect, useRef, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { AskSocAiButton } from '../components/AskPanel';
@@ -29,12 +29,13 @@ import {
 } from '../lib/notifications';
 import type { Notification, Workspace } from '../lib/types';
 import { needsYouLines, useNeedsYouCount } from '../lib/needsYou';
-import { type Crumb, GUIDE_URL, crumbFor } from './pages';
+import { type Crumb, crumbFor } from './pages';
 import { PALETTE_TRIGGER_ATTR, paletteKeyLabel } from './platform';
 import { UPSTREAM_COLOR, type UpstreamState, upstreamState } from './upstream';
 import { useSession } from './Session';
 import { useShell } from './ShellContext';
 import { isMachineKey } from '../lib/hostDossier';
+import { HelpMenu } from '../tours/HelpMenu';
 
 const TONE: Record<Notification['tone'], string> = {
   danger: '#f04438',
@@ -457,6 +458,7 @@ export function Topbar() {
       {/* command palette trigger */}
       <button
         onClick={openPalette}
+        data-tour="search"
         {...{ [PALETTE_TRIGGER_ATTR]: '' }}
         title={`Search or jump to. The shortcut is ${paletteKeyLabel()}.`}
         className="flex flex-none cursor-text items-center gap-2 rounded-control border border-border-2 bg-surface-1 px-2.5 py-1.5 text-faint hover:border-border-strong"
@@ -553,6 +555,7 @@ export function Topbar() {
         }}
         title={bellName}
         aria-label={bellName}
+        data-tour="bell"
         className="relative flex h-[34px] w-[34px] flex-none items-center justify-center rounded-control border border-border-2 text-dim hover:border-border-strong hover:text-text"
       >
         <Bell size={16} />
@@ -712,19 +715,10 @@ export function Topbar() {
         </div>
       )}
 
-      {/* The guide. The button opened the command palette, and the guide had
-          no link in the console (dogfood 2026-10-06). The palette holds the
-          keyboard shortcuts. */}
-      <a
-        href={GUIDE_URL}
-        target="_blank"
-        rel="noopener noreferrer"
-        title="Open the guide in a new tab"
-        aria-label="Open the guide"
-        className="flex h-[34px] w-[34px] flex-none items-center justify-center rounded-control border border-border-2 text-dim hover:border-border-strong hover:text-text"
-      >
-        <HelpCircle size={16} />
-      </a>
+      {/* Help: the tours, the keyboard shortcuts and the guide. The button
+          was a plain link to the guide (dogfood 2026-10-06). The tours need a
+          way to start on demand, so it is a menu now. */}
+      <HelpMenu />
 
       {/* The one chat, at the right end on every page. The label names the
           object the page shows. */}

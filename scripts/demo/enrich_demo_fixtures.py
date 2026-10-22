@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Idempotently enrich ``soc_ai/demo/fixtures.json`` with 1.2.x showcase content.
+"""Idempotently enrich ``scripts/demo/recorded_runs.json`` with 1.2.x showcase content.
+
+The file is the recorded half of the demo. Run ``scripts/demo/build_story.py``
+after this script: it writes ``soc_ai/demo/fixtures.json``, the file the demo
+serves.
 
 WHY THIS SCRIPT EXISTS
 ----------------------
@@ -54,7 +58,7 @@ if str(REPO) not in sys.path:  # allow ``python scripts/demo/enrich_demo_fixture
 
 from scripts.demo.build_fixtures import residue_scan, scan_for_leaks  # noqa: E402
 
-FIXTURES = REPO / "soc_ai" / "demo" / "fixtures.json"
+FIXTURES = REPO / "scripts" / "demo" / "recorded_runs.json"
 
 
 # ---------------------------------------------------------------------------

@@ -320,7 +320,8 @@ def test_demo_status_open_without_auth():
 # ---------------------------------------------------------------------------
 
 REPLAY_FIXTURE: dict[str, Any] = {
-    "version": 1,
+    "version": 2,
+    "anchor": "2026-07-01T00:00:00Z",
     "investigations": [],
     "hunts": [],
     "backtests": [],
@@ -523,7 +524,8 @@ def test_demo_investigate_reuses_complete_row_past_a_newer_error_row(monkeypatch
     abort's residue) for the same recorded alert; a clean /investigate must reuse
     the complete row's id."""
     fixture: dict[str, Any] = {
-        "version": 1,
+        "version": 2,
+        "anchor": "2026-07-01T00:00:00Z",
         "investigations": [
             {  # what a clean run left behind
                 "id": _ABORT_COMPLETE_ID,
@@ -807,7 +809,8 @@ _CANNED_ANSWER = (
 _CHAT_INV_ID = "01DEMOCHAT0000000000000INV"
 
 CHAT_FIXTURE: dict[str, Any] = {
-    "version": 1,
+    "version": 2,
+    "anchor": "2026-07-01T00:00:00Z",
     "investigations": [
         {
             "id": _CHAT_INV_ID,
@@ -904,7 +907,8 @@ _HUNT_CANNED_ANSWER = (
 _CHAT_HUNT_ID = "01DEMOCHAT000000000000HUNT"
 
 HUNT_CHAT_FIXTURE: dict[str, Any] = {
-    "version": 1,
+    "version": 2,
+    "anchor": "2026-07-01T00:00:00Z",
     "investigations": [],
     "hunts": [
         {
@@ -1016,7 +1020,8 @@ _HUNT_REPLAY_REPORT: dict[str, Any] = {
 }
 
 HUNT_START_FIXTURE: dict[str, Any] = {
-    "version": 1,
+    "version": 2,
+    "anchor": "2026-07-01T00:00:00Z",
     "investigations": [],
     "hunts": [
         {

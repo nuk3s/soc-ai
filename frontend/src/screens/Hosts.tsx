@@ -582,6 +582,7 @@ function MachineTableRow({
   onOpen,
   linkState,
   sweep,
+  tourAnchor,
 }: {
   row: MachineRow;
   selectable: boolean;
@@ -591,6 +592,8 @@ function MachineTableRow({
   linkState: HostsLocationState;
   /** The sweep the row comes from, for the stale marker. */
   sweep: ListSweep;
+  /** The page tour's anchor. The first row carries it. */
+  tourAnchor?: string;
 }) {
   const navigate = useNavigate();
   const href = machineHref(row.key);
@@ -604,6 +607,7 @@ function MachineTableRow({
   return (
     <tr
       data-testid={`machine-row-${row.key}`}
+      data-tour={tourAnchor}
       onClick={() => {
         onOpen();
         navigate(href, { state: linkState });
@@ -1359,7 +1363,7 @@ export function Hosts() {
   return (
     <div ref={rootRef} className="px-[22px] pb-[60px] pt-5">
       {/* page header */}
-      <div className="mb-4">
+      <div data-tour="hosts-header" className="mb-4">
         <div className="flex items-baseline gap-3">
           <div className="text-title">Hosts</div>
           <Freshness at={list.lastUpdated} />
@@ -1386,6 +1390,7 @@ export function Hosts() {
       {!firstRun && (
         <div
           data-testid="hosts-toolbar"
+          data-tour="hosts-toolbar"
           className={cn(
             (selecting || bulkShown) && 'sticky top-0 z-20 bg-bg pb-1 shadow-[0_1px_0_rgba(0,0,0,.4)]',
           )}
@@ -1633,7 +1638,10 @@ export function Hosts() {
 
       {/* The disagreement queue: the single conflict surface on this screen. */}
       {!firstRun && pending > 0 && (
-        <div className="mb-3.5 overflow-hidden rounded-card border border-warn/30 bg-warn/[0.06]">
+        <div
+          data-tour="hosts-conflicts"
+          className="mb-3.5 overflow-hidden rounded-card border border-warn/30 bg-warn/[0.06]"
+        >
           <div className="flex items-center gap-2.5 px-3.5 py-2.5 text-[13px]">
             <AlertTriangle size={13} className="flex-none text-warn" />
             <button
@@ -1773,9 +1781,9 @@ export function Hosts() {
           <div className="overflow-x-auto">
             <table data-testid="hosts-table" className="w-full table-fixed border-collapse text-[12.5px]">
               <thead className="border-b border-border bg-surface-2 text-[10.5px] text-faint">
-                <tr>
+                <tr data-tour="hosts-columns">
                   {isAdmin && (
-                    <th scope="col" className="w-[38px] px-2.5 py-[9px] text-left">
+                    <th scope="col" data-tour="hosts-select" className="w-[38px] px-2.5 py-[9px] text-left">
                       <Checkbox
                         checked={sel.allVisibleSelected}
                         indeterminate={!sel.allVisibleSelected && sel.someVisibleSelected}
@@ -1890,9 +1898,10 @@ export function Hosts() {
                     </td>
                   </tr>
                 ) : (
-                  rows.map((row) => (
+                  rows.map((row, i) => (
                     <MachineTableRow
                       key={row.key}
+                      tourAnchor={i === 0 ? 'hosts-row' : undefined}
                       row={row}
                       selectable={isAdmin}
                       selected={sel.isSelected(row.primary_ip)}

@@ -123,9 +123,13 @@ export interface DashboardGridProps {
   /** At the `lg` width and wider. A narrow window stacks the panels. */
   wide: boolean;
   onCommit: (next: PanelSlot[]) => void;
+  /** The `data-tour` anchor of a panel, by panel id. The page tour points at
+   *  the tile, which is the panel's own box: a Panel takes no attribute, and a
+   *  wrapper around it would stop the tile from stretching. */
+  tourAnchors?: Partial<Record<PanelId, string>>;
 }
 
-export function DashboardGrid({ children, layout, editing, wide, onCommit }: DashboardGridProps) {
+export function DashboardGrid({ children, layout, editing, wide, onCommit, tourAnchors }: DashboardGridProps) {
   const panels = collectPanels(children);
   const presentKey = [...panels.keys()].sort().join(',');
   const present = useMemo(() => new Set(presentKey.split(',')), [presentKey]);
@@ -405,7 +409,7 @@ export function DashboardGrid({ children, layout, editing, wide, onCommit }: Das
                 </button>
               </>
             )}
-            <div ref={tileRef(id)} className="dash-tile" style={tileStyle(id)}>
+            <div ref={tileRef(id)} className="dash-tile" style={tileStyle(id)} data-tour={tourAnchors?.[id]}>
               {panels.get(id)}
             </div>
           </div>

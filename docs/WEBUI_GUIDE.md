@@ -149,8 +149,9 @@ The Alerts, Investigations and Hunts entries carry a badge for the work that
 waits on you there. The badges are parts of the Needs-you count. The
 Needs-you tile on the Dashboard and the bell state the same total.
 
-The help button in the top bar opens this guide in a new tab. The command
-palette holds the keyboard shortcuts. Press ⌘K and type "shortcuts".
+The help button "?" in the top bar opens the help menu. The menu starts a tour,
+opens the keyboard shortcuts and opens this guide in a new tab. See [Tours](#tours).
+The command palette also holds the keyboard shortcuts. Press ⌘K and type "shortcuts".
 
 The Ask soc-ai button at the right end of the top bar opens the chat. See
 [Ask soc-ai](#ask-soc-ai).
@@ -158,6 +159,74 @@ The Ask soc-ai button at the right end of the top bar opens the chat. See
 The top bar shows the workspace switcher only when more than one workspace
 exists. On a lead page, the breadcrumb reads "Hunts / Lead 18", and the Hunts
 entry stays highlighted.
+
+## Tours
+
+A tour points at the main controls of a page, one step at a time. A step dims the page
+and draws an outline around one control. A card beside the control explains it.
+
+### How a tour starts
+
+- The welcome tour starts after the first sign-in. With authentication off, it starts on
+  the first visit. It shows the sidebar, the page time filter, the search, the bell, the
+  Ask soc-ai button and the help menu.
+- Each page has its own tour. The tour of a page starts on the first visit to that page.
+  When the welcome tour also applies, the page tour starts after it. Two tours never run
+  at the same time.
+- A tour that you close or skip does not start again. The next page tour waits until you
+  open another page.
+- A tour starts again on a first visit only when its content changes in a way that a
+  returning operator needs to see.
+
+A step whose control is not on the page is skipped. A control can be absent because the
+page has no data, the grid is degraded or your role cannot see it. When no step of a tour
+can show, the tour does not start.
+
+### Keys
+
+Right arrow and Left arrow move between the steps. Escape closes the tour. Tab stays
+inside the card. The page under a step takes no click and no page key.
+
+### The help menu
+
+The "?" button in the top bar opens the help menu:
+
+| Item | What it does |
+|---|---|
+| Tour this page | Starts the tour of the current page. |
+| Tour soc-ai from the start | Starts the welcome tour again. The page tours keep their state. Use Tour this page for the tour of a page. |
+| Keyboard shortcuts | Opens the keyboard shortcut sheet. |
+| Open the guide | Opens this guide in a new tab. |
+| Turn on tours | Shows when the tours are off. It turns them on again. |
+
+### Turn off tours
+
+Press "Turn off tours" on the last step of a tour, or press Skip and then "Turn off tours".
+No tour then starts by itself. The help menu still starts a tour on demand.
+
+### Where the tour state lives
+
+soc-ai keeps the tour state of a signed-in user on the user account, so the first sign-in
+holds across browsers. The state is the opt-out and the version of each tour seen.
+`GET /api/v1/me/tours` reads it and `PUT /api/v1/me/tours` replaces it. A bearer token
+reads and writes the state of the user who created it.
+
+With authentication off, and in the demo, the browser keeps the same state in
+localStorage under `soc-ai.tours`. Another browser then shows the tours again.
+
+### Automated browsers
+
+A tour never starts by itself in an automated browser, so a script sees the page with no
+card over it. The rule holds in each of these cases:
+
+- `navigator.webdriver` is true. Playwright and Selenium set it. The browser tests in
+  `tests/browser` and the dogfood scripts are not affected.
+- The URL has `?tour=off`. The browser tab keeps the switch for the rest of its session.
+- localStorage `soc-ai.tours.off` is `1`.
+
+The help menu still starts a tour in each case. Thus an automated check can open a tour
+on purpose. A vitest test calls `allowTourAutoStartInTests()` from
+`frontend/src/tours/testing.ts` to see a tour start by itself.
 
 ## Ask soc-ai
 

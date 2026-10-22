@@ -1164,15 +1164,19 @@ export function HostDetail() {
                 New. A lead under a hunt and a lead already closed both
                 belong to this host. A repeated single signal is visible in
                 the observations before it forms a lead. */}
-            {investigationKey && (
-              <HostInvestigations
-                entityKey={investigationKey}
-                label={hostname ?? ip}
-                read={investigations}
-              />
-            )}
-            <LeadsStrip entityKey={ip} entityLabel={hostname ?? ip} status="all" className="mb-3" />
-            <HostObservations entityKey={ip} className="mb-3" />
+            {/* One block for the page tour. A plain block in block flow: the
+                panels keep their margins and the layout does not change. */}
+            <div data-tour="host-work">
+              {investigationKey && (
+                <HostInvestigations
+                  entityKey={investigationKey}
+                  label={hostname ?? ip}
+                  read={investigations}
+                />
+              )}
+              <LeadsStrip entityKey={ip} entityLabel={hostname ?? ip} status="all" className="mb-3" />
+              <HostObservations entityKey={ip} className="mb-3" />
+            </div>
 
             {/* Every address of the machine, and its containers. */}
             {machine && (
@@ -1209,10 +1213,12 @@ export function HostDetail() {
                 it is the same shape of claim with better provenance -- and
                 because the two are currently computed separately and an
                 analyst needs to see both to notice when they disagree. */}
-            <BehaviouralProfile
-              profile={dossier.profile ?? []}
-              profilesEnabled={dossier.profiles_enabled}
-            />
+            <div data-tour="host-profile">
+              <BehaviouralProfile
+                profile={dossier.profile ?? []}
+                profilesEnabled={dossier.profiles_enabled}
+              />
+            </div>
 
             <HostUnknowns
               dossier={dossier}

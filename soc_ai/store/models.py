@@ -77,6 +77,10 @@ class User(Base):
     status: Mapped[str] = mapped_column(String(64), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+    # Migration 0065. The console's tour state as JSON text:
+    # {"off": bool, "seen": {"<tour-id>": <version>}}. soc_ai.store.user_tours
+    # checks the shape on write and reads a damaged value as the default.
+    tours_state: Mapped[str] = mapped_column(Text, default="{}", server_default="{}")
 
 
 class UserSession(Base):
