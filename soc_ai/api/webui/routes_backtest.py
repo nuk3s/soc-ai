@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from typing import Annotated, Any
 
@@ -327,7 +328,12 @@ async def backtest_status(request: Request) -> BacktestStatusOut:
     that is the state this screen most needs to report.
     """
     state = request.app.state
-    live = backtest_svc.get_status(state)
+    # A snapshot of the live status, taken BEFORE the store read. The run writes
+    # its final row and only then clears ``active``. Read in this order, an idle
+    # snapshot means the row below is final. The route read the live object
+    # after the store read, so a run that ended in between answered "running"
+    # with active false. That failed the v1.6.0 release run on a loaded runner.
+    live = dataclasses.replace(backtest_svc.get_status(state))
     estimate: dict[str, Any] | None = None
     results: dict[str, Any] | None = None
     async with state.db_sessionmaker() as db:

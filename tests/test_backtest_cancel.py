@@ -363,3 +363,37 @@ def test_the_audit_kind_is_declared() -> None:
     from soc_ai.audit.schemas import AuditKind
 
     assert "backtest_cancelled" in typing.get_args(AuditKind)
+
+
+class TestTheStatusReadHasNoTornState:
+    def test_a_run_that_ends_during_the_status_read_never_reads_running_and_idle(
+        self, gated: tuple[TestClient, _Gate]
+    ) -> None:
+        """The status route read the stored row, then checked ``live.active``.
+
+        A run that ended between the two reads answered status "running" with
+        active false. That failed the release run of v1.6.0 on a loaded runner.
+        The route now reads the live status first. This test forces the
+        interleaving: the run ends while the route reads the store.
+        """
+        client, gate = gated
+        started = client.post("/api/v1/backtest", json={"window_days": 30, "sample_size": 20})
+        assert started.status_code == 200
+        _wait(lambda: len(gate.started) == 1)
+
+        live = backtest_svc.get_status(client.app.state)
+        real_latest = bt_svc.latest
+
+        async def _latest_then_the_run_ends(db: Any) -> Any:
+            row = await real_latest(db)
+            live.active = False  # the run ends right after the store read
+            return row
+
+        with patch.object(bt_svc, "latest", _latest_then_the_run_ends):
+            body = client.get("/api/v1/backtest").json()
+        live.active = True  # give the run back its own state
+        gate.open.set()
+        _settled(client)
+
+        torn = body["active"] is False and body["status"] == "running"
+        assert not torn, f"the route read a running row as idle: {body}"

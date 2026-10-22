@@ -12,6 +12,8 @@ All notable changes to this project are documented here. The format is based on
 
 - `aiohttp` 3.14.5 and `certifi` 2026.10.19. pip-audit found four CVEs in aiohttp 3.14.3 and
   one advisory in certifi 2026.4.22.
+- `virtualenv` 21.14.12, `packaging` 26.3 and `distlib` 0.4.4. pip-audit found five CVEs in
+  virtualenv 21.14.1. The newer virtualenv needs packaging 26.
 - GitHub Actions: `docker/build-push-action` 7.4.0, `docker/login-action` 4.6.0,
   `docker/setup-qemu-action` 4.4.0, `docker/metadata-action` 6.2.0,
   `docker/setup-buildx-action` 4.4.1 and `astral-sh/setup-uv` 10.3.0. The docker actions move
