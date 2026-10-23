@@ -8,7 +8,7 @@
 // Unknown is not zero. The count says so, and a genuinely empty list on a
 // healthy grid keeps its 0 and its caption — the over-correction guard is the
 // last test here.
-import { fireEvent, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { DetectionTuning } from '../lib/api';
 
@@ -41,6 +41,9 @@ const ONE_MUTE: DetectionTuning = {
 };
 
 afterEach(() => {
+  // Unmount first. The unmount runs the effects React still owes, and those
+  // call the mocks. A reset mock returns undefined and breaks the next tests.
+  cleanup();
   getDetectionTuningMock.mockReset();
   unmuteRuleMock.mockReset();
 });

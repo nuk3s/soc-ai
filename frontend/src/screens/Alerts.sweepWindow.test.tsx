@@ -88,8 +88,11 @@ describe('Bulk Investigate names its window', () => {
     await mount();
     fireEvent.click(sweepButton());
     const line = await screen.findByTestId('bulk-investigate-progress');
-    await waitFor(() =>
-      expect(line.textContent).toBe('Bulk Investigate runs on critical, high · last 24 hours'),
+    // The severities come with the first status poll, a real 2 s interval. The
+    // default 5 s wait leaves a loaded runner 3 s for it, so allow 10 s.
+    await waitFor(
+      () => expect(line.textContent).toBe('Bulk Investigate runs on critical, high · last 24 hours'),
+      { timeout: 10_000 },
     );
   });
 

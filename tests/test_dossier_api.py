@@ -886,7 +886,7 @@ def test_refresh_starts_and_status_settles(client: TestClient) -> None:
         assert resp.status_code == 200
         assert resp.json()["note"] in ("started", "already running")
 
-        deadline = time.time() + 5.0
+        deadline = time.time() + 30.0
         data: dict[str, Any] = {}
         while time.time() < deadline:
             data = client.get("/api/v1/dossiers/refresh").json()
@@ -1002,6 +1002,38 @@ def test_sweep_health_prefers_the_run_this_process_saw(client: TestClient) -> No
 
     assert health["last_run"] == status.last_run
     assert health["degraded"] is False
+
+
+def test_sweep_health_reads_a_first_sweep_that_ends_mid_read_as_running(
+    client: TestClient,
+) -> None:
+    """The route read ``running`` after the await of the stored run.
+
+    A first sweep of the process that ended during that read answered running
+    false beside the stored row of the sweep before it. This test ends the
+    sweep while the route reads the stored row.
+    """
+    from unittest.mock import patch
+
+    from soc_ai.api.webui import routes_dossier
+
+    _seed_finished_run(client, finished_ago=timedelta(days=2))
+    status = routes_dossier._get_dossier_status(client.app.state)  # type: ignore[attr-defined]
+    real_stored_run = routes_dossier._stored_run
+
+    async def _stored_run_then_the_sweep_ends(request: Any) -> Any:
+        row = await real_stored_run(request)
+        status.running = False  # the first sweep ends right after this read
+        return row
+
+    status.running = True
+    try:
+        with patch.object(routes_dossier, "_stored_run", _stored_run_then_the_sweep_ends):
+            health = client.get("/api/v1/dossiers/sweep-health").json()
+    finally:
+        status.running = False
+
+    assert health["running"] is True, f"an old row was served as the end of the sweep: {health}"
 
 
 def test_refresh_worker_never_raises() -> None:

@@ -541,7 +541,7 @@ async def test_reachability_probes_run_concurrently(
     a latency-insensitive, non-flaky way to pin "all three began before any
     returned" without asserting on wall-clock durations.
     """
-    barrier = threading.Barrier(3, timeout=2.0)
+    barrier = threading.Barrier(3, timeout=10.0)
 
     def _fake_create_connection(address: Any, timeout: float | None = None) -> _FakeConnectedSocket:
         barrier.wait()

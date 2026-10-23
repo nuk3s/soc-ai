@@ -477,8 +477,9 @@ describe('HuntDetail — a hunt started from a lead', () => {
     vi.mocked(getHunt).mockResolvedValue({ ...LEAD_HUNT, leadId: 12, starter: 'lead' });
     mount();
     await screen.findByTestId('hunt-lead-chip');
+    // The lead read starts in an effect of the hunt render.
+    await waitFor(() => expect(getLead).toHaveBeenCalledWith(12));
     expect(getHunts).not.toHaveBeenCalled();
-    expect(getLead).toHaveBeenCalledWith(12);
   });
 
   it('shows the observations the lead is made of', async () => {

@@ -108,6 +108,11 @@ async def list_internal_identifiers(
         effective_internal_identifiers,
     )
 
+    # The discovery status, read BEFORE the rows. A scan commits its rows and
+    # only then clears ``running``, so an idle status here means the rows below
+    # are final. Read after the rows, a scan that ended in between answered
+    # the old rows as the result, and the Settings page stopped its poll.
+    last_scan = _discovery_status_out(_get_discovery_status(request.app.state))
     async with request.app.state.db_sessionmaker() as db:
         effective = await effective_internal_identifiers(db, settings)
         effective_by_kind: dict[str, list[str]] = {
@@ -148,7 +153,6 @@ async def list_internal_identifiers(
                 )
             groups.append(InternalIdentifierGroupOut(kind=kind, rows=rows))
 
-    last_scan = _discovery_status_out(_get_discovery_status(request.app.state))
     return InternalIdentifiersOut(groups=groups, last_scan=last_scan)
 
 

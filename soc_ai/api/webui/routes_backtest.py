@@ -390,12 +390,18 @@ async def cancel_backtest(request: Request, backtest_id: str) -> BacktestStatusO
             "The backtest stops after the current alert.",
         )
     if refusal is not None:
+        # The run can end while the caller is identified, after the first read.
+        # Read the row again, so the answer names the status it ended with.
+        async with state.db_sessionmaker() as db:
+            bt = await bt_svc.get(db, backtest_id) or bt
         raise api_error(
             409,
             "not_running",
             f"This backtest is not running. Its status is {bt.status}. There is nothing to cancel.",
         )
-    live = backtest_svc.get_status(state)
+    # A snapshot, taken before the audit write. The run can end during that
+    # write, and the live object then says idle beside a row that says running.
+    live = dataclasses.replace(backtest_svc.get_status(state))
     await _audit_cancel(
         request,
         {
@@ -438,7 +444,10 @@ async def backtest_runs(request: Request, limit: int = 20) -> BacktestRunsOut:
 async def backtest_by_id(request: Request, backtest_id: str) -> BacktestStatusOut:
     """A specific backtest run by id."""
     state = request.app.state
-    live = backtest_svc.get_status(state)
+    # A snapshot, taken BEFORE the store read, as in ``backtest_status``. The
+    # route held the live object and read it after the store read, so a run
+    # that ended in between answered "running" with active false.
+    live = dataclasses.replace(backtest_svc.get_status(state))
     async with state.db_sessionmaker() as db:
         bt = await bt_svc.get(db, backtest_id)
         results = await _served_results(db, bt) if bt is not None else None

@@ -40,7 +40,9 @@ export default defineConfig({
         settings: { handleDisabledFileLoadingAsSuccess: true },
       },
     },
-    setupFiles: ['./src/test/setup.ts'],
+    // loadedScheduler.ts does nothing outside `npm run test:loaded` (vitest
+    // mode "loaded"). It must load before setup.ts loads React.
+    setupFiles: ['./src/test/loadedScheduler.ts', './src/test/setup.ts'],
     include: ['src/**/*.test.{ts,tsx}'],
     // MUST stay above setup.ts's asyncUtilTimeout (5000). Both were 5000, so
     // RTL's findBy wait and vitest's own deadline expired on the same tick:

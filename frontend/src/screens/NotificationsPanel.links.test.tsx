@@ -3,7 +3,7 @@
 // "above" pointed at a section the operator could not see (dogfood
 // 2026-10-19, R5-D18). The text now names the section, and the name is a
 // link to it.
-import { render, screen, within } from '@testing-library/react';
+import { cleanup, render, screen, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -19,7 +19,12 @@ vi.mock('../lib/api', async (importOriginal) => ({
 
 import { NotificationsPanel } from './NotificationsPanel';
 
-afterEach(() => getNotifyWebhookMock.mockReset());
+afterEach(() => {
+  // Unmount first. The unmount runs the effects React still owes, and those
+  // call the mocks. A reset mock returns undefined and breaks the next tests.
+  cleanup();
+  getNotifyWebhookMock.mockReset();
+});
 
 describe('NotificationsPanel section links', () => {
   it('links the sections it names and says no "above"', async () => {

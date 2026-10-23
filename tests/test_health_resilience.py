@@ -245,9 +245,15 @@ def test_the_opt_out_still_leaves_a_whole_read_grid_green(tmp_path):
 
 def test_the_opt_out_is_invisible_to_health(tmp_path):
     """Same grid, same /health answer, whichever way the operator set it."""
-    assert _health_es(tmp_path, shards_failed=2, fail_on_partial=True) == _health_es(
-        tmp_path, shards_failed=2, fail_on_partial=False
-    )
+
+    def _answer(fail_on_partial: bool) -> dict:
+        es = _health_es(tmp_path, shards_failed=2, fail_on_partial=fail_on_partial)
+        # The time the probe took is a measurement. A loaded run read 1 ms for
+        # one setting and 0 ms for the other, and the test failed on it.
+        es.pop("elapsed_ms", None)
+        return es
+
+    assert _answer(True) == _answer(False)
 
 
 def test_a_half_read_grid_under_the_opt_out_still_reaches_the_bell(tmp_path):

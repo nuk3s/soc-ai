@@ -1131,7 +1131,7 @@ def test_start_hunt_chat_persists_via_manager(
         hunt_id = resp.json()["hunt_id"]
 
         out: dict[str, Any] | None = None
-        for _ in range(50):  # up to ~5s
+        for _ in range(300):  # up to ~30s on a loaded runner
             out = _read_hunt(settings_kratos, hunt_id)
             if out is not None and out["status"] in ("complete", "error"):
                 break
@@ -1473,7 +1473,7 @@ def test_hunt_chat_message_runs_a_turn_and_round_trips(
 
         # poll the persisted thread until the assistant row flips to done
         done: dict[str, Any] | None = None
-        for _ in range(50):  # up to ~5s
+        for _ in range(300):  # up to ~30s on a loaded runner
             rows = _read_hunt_chat(settings_kratos, hunt_id)
             assistant = [r for r in rows if r["kind"] == "chat_assistant"]
             if assistant and assistant[-1]["payload"].get("status") == "done":
@@ -1566,7 +1566,7 @@ def test_hunt_chat_ungrounded_answer_now_gets_redacted(
         assert resp.status_code == 200
 
         done: dict[str, Any] | None = None
-        for _ in range(50):  # up to ~5s
+        for _ in range(300):  # up to ~30s on a loaded runner
             rows = _read_hunt_chat(settings_kratos, hunt_id)
             assistant = [r for r in rows if r["kind"] == "chat_assistant"]
             if assistant and assistant[-1]["payload"].get("status") == "done":
@@ -4438,7 +4438,7 @@ def test_hunting_a_lead_starts_a_lead_hunt_and_marks_the_lead(
         assert res.status_code == 200
         hunt_id = res.json()["hunt_id"]
         out = None
-        for _ in range(50):
+        for _ in range(300):  # up to ~30s on a loaded runner
             out = _read_hunt(settings_kratos, hunt_id)
             if out is not None and out["status"] in ("complete", "error"):
                 break
@@ -4512,7 +4512,7 @@ def test_hunt_again_on_a_hunted_lead_starts_a_second_hunt(
         body = res.json()
         assert body["hunt_id"] != "01HUNTDONE" and "existing" not in body
         out = None
-        for _ in range(50):
+        for _ in range(300):  # up to ~30s on a loaded runner
             out = _read_hunt(settings_kratos, body["hunt_id"])
             if out is not None and out["status"] in ("complete", "error"):
                 break
@@ -4550,7 +4550,7 @@ def test_a_lead_hunt_that_finds_no_threat_closes_the_lead(
         assert res.status_code == 200
         hunt_id = res.json()["hunt_id"]
         detail = None
-        for _ in range(50):
+        for _ in range(300):  # up to ~30s on a loaded runner
             detail = client.get(f"/api/v1/hunts/leads/{lead_id}").json()
             if detail["status"] == "dismissed":
                 break
@@ -4859,7 +4859,7 @@ def test_hunting_a_lead_whose_hunt_finished_starts_a_new_one(
         new_hunt_id = res.json()["hunt_id"]
         assert new_hunt_id != old_hunt_id
         out = None
-        for _ in range(50):
+        for _ in range(300):  # up to ~30s on a loaded runner
             out = _read_hunt(settings_kratos, new_hunt_id)
             if out is not None and out["status"] in ("complete", "error"):
                 break

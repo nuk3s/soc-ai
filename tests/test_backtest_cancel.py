@@ -229,7 +229,7 @@ def gated(bt_settings: Settings) -> Iterator[tuple[TestClient, _Gate]]:  # noqa:
             gate.open.set()
 
 
-def _wait(predicate: Any, *, deadline_s: float = 6.0) -> None:
+def _wait(predicate: Any, *, deadline_s: float = 30.0) -> None:
     deadline = time.time() + deadline_s
     while time.time() < deadline:
         if predicate():
@@ -397,3 +397,95 @@ class TestTheStatusReadHasNoTornState:
 
         torn = body["active"] is False and body["status"] == "running"
         assert not torn, f"the route read a running row as idle: {body}"
+
+    def test_a_run_that_ends_during_the_read_by_id_never_reads_running_and_idle(
+        self, gated: tuple[TestClient, _Gate]
+    ) -> None:
+        """``GET /backtest/{id}`` had the race that ``GET /backtest`` had.
+
+        It held the live object and read it after the store read. This test
+        ends the run while the route reads the store.
+        """
+        client, gate = gated
+        started = client.post("/api/v1/backtest", json={"window_days": 30, "sample_size": 20})
+        assert started.status_code == 200
+        bid = started.json()["backtest_id"]
+        _wait(lambda: len(gate.started) == 1)
+
+        live = backtest_svc.get_status(client.app.state)
+        real_get = bt_svc.get
+
+        async def _get_then_the_run_ends(db: Any, backtest_id: str) -> Any:
+            row = await real_get(db, backtest_id)
+            live.active = False  # the run ends right after the store read
+            return row
+
+        with patch.object(bt_svc, "get", _get_then_the_run_ends):
+            body = client.get(f"/api/v1/backtest/{bid}").json()
+        live.active = True  # give the run back its own state
+        gate.open.set()
+        _settled(client)
+
+        torn = body["active"] is False and body["status"] == "running"
+        assert not torn, f"the route read a running row as idle: {body}"
+
+    def test_a_run_that_ends_during_the_cancel_audit_never_reads_running_and_idle(
+        self, gated: tuple[TestClient, _Gate]
+    ) -> None:
+        """The cancel route read the live object after its audit write."""
+        from soc_ai.api.webui import routes_backtest
+
+        client, gate = gated
+        started = client.post("/api/v1/backtest", json={"window_days": 30, "sample_size": 20})
+        bid = started.json()["backtest_id"]
+        _wait(lambda: len(gate.started) == 1)
+
+        live = backtest_svc.get_status(client.app.state)
+
+        async def _audit_then_the_run_ends(*_args: Any, **_kwargs: Any) -> None:
+            live.active = False  # the run ends during the audit write
+
+        with patch.object(routes_backtest, "_audit_cancel", _audit_then_the_run_ends):
+            resp = client.post(f"/api/v1/backtest/{bid}/cancel")
+        live.active = True
+        gate.open.set()
+        _settled(client)
+
+        assert resp.status_code == 200
+        body = resp.json()
+        torn = body["active"] is False and body["status"] == "running"
+        assert not torn, f"the cancel answered a running row as idle: {body}"
+
+    def test_a_cancel_refused_after_the_run_ended_names_the_status_it_ended_with(
+        self, gated: tuple[TestClient, _Gate]
+    ) -> None:
+        """The run can end while the route identifies the caller.
+
+        The route then refused the cancel with the status of its first read,
+        "running", for a run that was not running. It reads the row again.
+        """
+        from soc_ai.api.webui import routes_backtest
+
+        client, gate = gated
+        started = client.post("/api/v1/backtest", json={"window_days": 30, "sample_size": 20})
+        bid = started.json()["backtest_id"]
+        _wait(lambda: len(gate.started) == 1)
+
+        live = backtest_svc.get_status(client.app.state)
+        real_identify = routes_backtest.identify_caller
+
+        async def _identify_while_the_run_ends(request: Any) -> str:
+            gate.open.set()
+            for _ in range(3000):  # up to ~30 s
+                if not live.active:
+                    break
+                await asyncio.sleep(0.01)
+            return await real_identify(request)
+
+        with patch.object(routes_backtest, "identify_caller", _identify_while_the_run_ends):
+            resp = client.post(f"/api/v1/backtest/{bid}/cancel")
+
+        assert live.active is False, "the run did not end during the caller check"
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["reason"] == "not_running"
+        assert "complete" in resp.json()["detail"]["hint"]

@@ -826,7 +826,8 @@ describe('LeadDetail evidence ids', () => {
     fireEvent.click(await screen.findByRole('button', { name: '7Kq2c1' }));
     await waitFor(() => expect(getEvent).toHaveBeenCalledWith('7Kq2c1'));
     const dialog = await screen.findByRole('dialog');
-    expect(within(dialog).getByText('winlog.event_id')).toBeTruthy();
+    // The dialog opens before the read lands. Wait for the fields.
+    expect(await within(dialog).findByText('winlog.event_id')).toBeTruthy();
   });
 
   it('says the grid holds no document with an id that aged out', async () => {

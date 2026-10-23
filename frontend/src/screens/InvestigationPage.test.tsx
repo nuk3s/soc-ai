@@ -3,7 +3,7 @@
 // hunt (Investigate button, HuntDetail.tsx) also sends the hunt path in the
 // router state, and that state outlives a reload. With neither, the link goes
 // to the list of investigations.
-import { act, fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Investigation as Inv, InvestigationSubject } from '../lib/types';
@@ -148,8 +148,9 @@ describe('InvestigationPage back-link reads the page the analyst left', () => {
 describe('InvestigationPage title and Delete', () => {
   it('reads the rule name as the title, with the id beside it', async () => {
     at('/investigation/INV-1');
-    expect((await screen.findByTestId('investigation-page-title')).textContent).toBe(
-      'Beaconing to rare external IP',
+    // The title reads "Investigation" until the read lands.
+    await waitFor(() =>
+      expect(screen.getByTestId('investigation-page-title').textContent).toBe('Beaconing to rare external IP'),
     );
     expect(screen.getByTestId('investigation-page-id').textContent).toBe('INV-1');
   });

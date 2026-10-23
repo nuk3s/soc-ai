@@ -619,9 +619,10 @@ def test_demo_hunt_second_click_reuses_completed_row(monkeypatch, tmp_path):
     row (same id, no new row) instead of replaying into a fresh one — so an
     anonymous visitor looping this can't grow the table. Bounds demo investigate
     rows to the recorded-alert set."""
-    # 0.4s/step × 3 between-step pauses = a ≥1.2s running window for the 409
-    # probe — wide enough not to flake on a loaded CI box.
-    with _replay_app(monkeypatch, tmp_path, max_step_s=0.4) as client:
+    # 1 s per step × 3 between-step pauses = a running window of at least 3 s
+    # for the 409 probe. Nothing holds the replay, so the second POST has to
+    # land inside it. The old 1.2 s window left a loaded runner little room.
+    with _replay_app(monkeypatch, tmp_path, max_step_s=1.0) as client:
         r1 = client.post("/api/v1/hunt", json={"alert_id": "demo-alert-1"})
         assert r1.status_code == 200
         inv1 = r1.json()["investigation_id"]
@@ -776,7 +777,7 @@ async def test_replay_client_disconnect_lands_terminal_state(monkeypatch, tmp_pa
     # to win locally, not under CI load. A genuine orphan (the row never leaving
     # 'running') still fails, at the timeout.
     inv = None
-    for _ in range(300):  # up to ~3s
+    for _ in range(3000):  # up to ~30s on a loaded runner
         async with maker() as db:
             got = await inv_svc.get_with_events(db, inv_id)
         assert got is not None

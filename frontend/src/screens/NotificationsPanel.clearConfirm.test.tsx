@@ -3,7 +3,7 @@
 // mis-click deleted the URL on the spot with nothing to undo — notifications
 // silently stopped until the operator re-entered it. Every other destructive
 // action in the app arms an inline two-step confirm; this panel does the same.
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 const getNotifyWebhookMock = vi.hoisted(() => vi.fn());
@@ -22,6 +22,9 @@ vi.mock('../lib/api', async (importOriginal) => ({
 import { NotificationsPanel } from './NotificationsPanel';
 
 afterEach(() => {
+  // Unmount first. The unmount runs the effects React still owes, and those
+  // call the mocks. A reset mock returns undefined and breaks the next tests.
+  cleanup();
   getNotifyWebhookMock.mockReset();
   clearNotifyWebhookMock.mockReset();
   saveNotifyWebhookMock.mockReset();

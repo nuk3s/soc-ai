@@ -660,8 +660,9 @@ describe('HostDetail — a sweep that came back blind does not report an address
     expect(screen.getByTestId('host-sweep-blind')).toBeTruthy();
     expect(screen.queryByText(NEXT_SWEEP)).toBeNull();
     // The kickoff receipt has been superseded by the outcome, not left sitting
-    // over it telling the analyst to give it a minute.
-    expect(screen.queryByText(/sweep runs in the background/i)).toBeNull();
+    // over it telling the analyst to give it a minute. An effect of the
+    // outcome render clears it, so wait for that render.
+    await waitFor(() => expect(screen.queryByText(/sweep runs in the background/i)).toBeNull());
   });
 
   it('discloses a dead sweep to a role that may not read the full record', async () => {
@@ -1536,8 +1537,9 @@ describe('HostDetail — the unknown line tells the truth about why', () => {
     await waitFor(() =>
       expect(setDossierOverride).toHaveBeenCalledWith(IP, { field: 'hostname', value: 'ws-lab-3' }),
     );
-    // The response is the new page: hostname now leads the hero.
-    expect((await screen.findByTestId('hero-name')).textContent).toBe('ws-lab-3');
+    // The response is the new page: hostname now leads the hero. The hero
+    // shows the old name until the response renders.
+    await waitFor(() => expect(screen.getByTestId('hero-name').textContent).toBe('ws-lab-3'));
   });
 
   it('offers the role vocabulary instead of a free-text trap', async () => {
@@ -2055,8 +2057,10 @@ describe('HostDetail — the activity row', () => {
     vi.mocked(getHostActivity).mockResolvedValue(seeded());
     mount();
     const graph = await screen.findByTestId('host-peer-graph');
-    expect(within(graph).getByText('gw')).toBeTruthy();
-    expect(within(graph).getByText('198.51.100.7')).toBeTruthy();
+    // The layout settles after the panel mounts, so wait for the labels. A
+    // synchronous read failed on a loaded GitHub runner (2026-10-22).
+    expect(await within(graph).findByText('gw')).toBeTruthy();
+    expect(await within(graph).findByText('198.51.100.7')).toBeTruthy();
   });
 
   it('draws an alerted peer differently from a quiet one', async () => {
@@ -2064,8 +2068,8 @@ describe('HostDetail — the activity row', () => {
     vi.mocked(getHostActivity).mockResolvedValue(seeded());
     mount();
     const graph = await screen.findByTestId('host-peer-graph');
-    // One edge per peer. The alerted one is the red one.
-    const edges = Array.from(graph.querySelectorAll('[data-testid="graph-edge"]'));
+    // One edge per peer. The alerted one is the red one. Wait for the layout.
+    const edges = await within(graph).findAllByTestId('graph-edge');
     expect(edges.length).toBe(2);
     const strokes = new Set(
       edges.map((e) => e.querySelector('path:not([stroke="transparent"])')?.getAttribute('stroke')),
@@ -2130,14 +2134,15 @@ describe('HostDetail — the activity row', () => {
     vi.mocked(getDossier).mockResolvedValue(dossier());
     vi.mocked(getHostActivity).mockResolvedValueOnce(seeded());
     mount();
-    expect(within(await screen.findByTestId('host-peer-graph')).getByText('gw')).toBeTruthy();
+    // The graph draws its labels after its layout settles. Wait for them.
+    expect(await within(await screen.findByTestId('host-peer-graph')).findByText('gw')).toBeTruthy();
 
     vi.mocked(getHostActivity).mockRejectedValue(new Error('grid down'));
     fireEvent.click(screen.getByRole('button', { name: /refresh host/i }));
 
     const stale = await screen.findByTestId('activity-stale');
     expect(stale).toHaveTextContent(/grid down/i);
-    expect(within(screen.getByTestId('host-peer-graph')).getByText('gw')).toBeTruthy();
+    expect(await within(screen.getByTestId('host-peer-graph')).findByText('gw')).toBeTruthy();
     expect(within(screen.getByTestId('kpi-alerts')).getByText('1')).toBeTruthy();
     expect(screen.queryByTestId('activity-degraded')).toBeNull();
   });
@@ -2229,7 +2234,8 @@ describe('HostDetail — the activity window', () => {
     mount();
     await waitFor(() => expect(getHostActivity).toHaveBeenCalledWith(IP, '24h'));
 
-    fireEvent.click(screen.getByRole('button', { name: '7d' }));
+    // The call is on record before the row renders its window buttons.
+    fireEvent.click(await screen.findByRole('button', { name: '7d' }));
     await waitFor(() => expect(getHostActivity).toHaveBeenCalledWith(IP, '7d'));
     expect(await within(await screen.findByTestId('kpi-events')).findByText(/7d/i)).toBeTruthy();
   });

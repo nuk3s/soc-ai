@@ -71,6 +71,7 @@ import {
   startAutoTriage,
 } from '../lib/api';
 import { queueOf } from '../test/alertQueue';
+import { flushEffects } from '../test/flushEffects';
 import { Alerts } from './Alerts';
 import { CommandPalette } from '../shell/CommandPalette';
 import { Sidebar } from '../shell/Sidebar';
@@ -151,8 +152,12 @@ describe('F11 — selection survives the ES-id churn of a background poll', () =
       // Bulk bar is up.
       expect(screen.getAllByRole('button', { name: /^Bulk Investigate/ }).length).toBe(2);
 
-      // A poll lands with the fresh id.
-      capturePoll(intervalSpy)();
+      // A poll lands with the fresh id. `act` flushes the poll's resolved fetch
+      // and its render, as in F12. A bare waitFor on the call passed before the
+      // new id rendered, and the click then sent the old one.
+      await act(async () => {
+        capturePoll(intervalSpy)();
+      });
       await waitFor(() => expect(getAlerts).toHaveBeenCalledTimes(2));
 
       // Fire the bulk-bar Bulk Investigate.
@@ -181,6 +186,9 @@ describe('F12 — keyboard focus follows the group, not the row index', () => {
     try {
       renderAlerts();
       await screen.findByText('AAA');
+      // The key listener of the row render attaches in an effect. Run it,
+      // or `j` reaches the listener of the empty list and does nothing.
+      flushEffects();
 
       // Highlight the first row (AAA) with `j`.
       fireEvent.keyDown(window, { key: 'j' });
@@ -269,13 +277,20 @@ describe('selection counts are a true partition, not a double count', () => {
       mkEvent({ id: 'ev-3', dst: '10.0.0.13', ts: '2026-07-30T00:02:00Z' }),
     ]);
   };
+  // Expand the group and wait for its events to RENDER. The call is on record
+  // before its rows paint, and a click in that gap ticks the group's box.
+  const expandGroup = async () => {
+    const before = screen.getAllByRole('checkbox').length;
+    fireEvent.click(screen.getByText('ET SCAN Noisy'));
+    await waitFor(() => expect(getAlertGroupEvents).toHaveBeenCalled());
+    await waitFor(() => expect(screen.getAllByRole('checkbox').length).toBeGreaterThan(before));
+  };
 
   it('does not count a selected group\'s own events a second time', async () => {
     groupWithEvents();
     renderAlerts();
     await screen.findByText('ET SCAN Noisy');
-    fireEvent.click(screen.getByText('ET SCAN Noisy')); // expand → events load
-    await waitFor(() => expect(getAlertGroupEvents).toHaveBeenCalled());
+    await expandGroup();
 
     // Tick the GROUP box, which also ticks its three loaded events.
     fireEvent.click(screen.getAllByRole('checkbox')[1]);
@@ -292,8 +307,7 @@ describe('selection counts are a true partition, not a double count', () => {
     groupWithEvents();
     renderAlerts();
     await screen.findByText('ET SCAN Noisy');
-    fireEvent.click(screen.getByText('ET SCAN Noisy'));
-    await waitFor(() => expect(getAlertGroupEvents).toHaveBeenCalled());
+    await expandGroup();
     fireEvent.click(screen.getAllByRole('checkbox')[1]);
 
     const strip = await screen.findByTestId('list-toolbar-selection');
@@ -307,8 +321,7 @@ describe('selection counts are a true partition, not a double count', () => {
     groupWithEvents();
     renderAlerts();
     await screen.findByText('ET SCAN Noisy');
-    fireEvent.click(screen.getByText('ET SCAN Noisy'));
-    await waitFor(() => expect(getAlertGroupEvents).toHaveBeenCalled());
+    await expandGroup();
 
     // Only one event, no group.
     const boxes = screen.getAllByRole('checkbox');

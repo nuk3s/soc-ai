@@ -884,7 +884,7 @@ def test_hunts_chat_request_body_cannot_set_the_synth_eval_marker(
 
         # Wait for the background drainer to finish INSIDE the patch (the fake
         # loop is resolved lazily when the drain task first iterates it).
-        for _ in range(50):  # up to ~5s
+        for _ in range(300):  # up to ~30s on a loaded runner
             status = spine_client.get(f"/api/v1/hunts/{hunt_id}").json()["status"]
             if status != "running":
                 break

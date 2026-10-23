@@ -77,6 +77,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
 import { Config } from './Config';
 import { getGatewayModels, getModelFitness } from '../lib/api';
 import type { ModelFitness } from '../lib/api';
+import { flushEffects } from '../test/flushEffects';
 
 /** A fitness response with only the field(s) a test cares about spelled out. */
 const fit = (over: Partial<ModelFitness> = {}): ModelFitness => ({
@@ -348,6 +349,8 @@ describe('a staged, unapplied model pick is not graded', () => {
       vi.mocked(getModelFitness).mockResolvedValue(fit());
       renderPage();
       const sel = await screen.findByDisplayValue(MODEL);
+      // The 600 ms probe timer starts in an effect of this render. Run it first.
+      flushEffects();
       await act(() => vi.advanceTimersByTimeAsync(700));
       // The applied model is graded on mount, as before.
       expect((await screen.findByTestId('fitness-chip')).textContent).toBe('fit');
@@ -385,6 +388,8 @@ describe('a staged, unapplied model pick is not graded', () => {
     try {
       renderPage();
       const sel = await screen.findByDisplayValue(MODEL);
+      // The 600 ms probe timer starts in an effect of this render. Run it first.
+      flushEffects();
       await act(() => vi.advanceTimersByTimeAsync(700));
       // The mount probe for the applied model is in flight…
       expect(vi.mocked(getModelFitness)).toHaveBeenCalledTimes(1);

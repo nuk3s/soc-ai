@@ -733,8 +733,8 @@ describe('the fold', () => {
 
   it('keeps the heading, the count and the definition while it is folded', async () => {
     mountFolded(true);
-    const heading = await screen.findByTestId('leads-heading');
-    expect(heading.textContent).toContain('1 needs a decision');
+    // The heading renders while the leads load. The count comes with them.
+    await waitFor(() => expect(screen.getByTestId('leads-heading').textContent).toContain('1 needs a decision'));
     expect(screen.getByTestId('define-lead')).toBeTruthy();
     expect(screen.queryByTestId('lead-7')).toBeNull();
     // The tabs filter a list nobody can see.

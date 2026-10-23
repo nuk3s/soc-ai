@@ -446,7 +446,7 @@ async def test_dns_guard_runs_off_event_loop() -> None:
     ran_concurrently = {"v": False}
 
     def blocking_resolve(host: str, *a: Any, **k: Any) -> list[Any]:
-        if not unblock.wait(timeout=1.0):
+        if not unblock.wait(timeout=10.0):
             raise OSError("resolver never unblocked — event loop was stalled")
         return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
 

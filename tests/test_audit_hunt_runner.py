@@ -65,7 +65,7 @@ async def test_hunt_stream_client_disconnect_lands_terminal_state(
     # unwinds; poll for it rather than race it. A genuine orphan still fails at
     # the timeout.
     hunt = None
-    for _ in range(300):  # up to ~3s
+    for _ in range(3000):  # up to ~30s on a loaded runner
         async with maker() as db:
             got = await hunt_svc.get_with_events(db, hunt_id)
         assert got is not None

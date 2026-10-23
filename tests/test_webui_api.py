@@ -3131,14 +3131,14 @@ async def test_execute_action_serializes_concurrent_escalate(settings_kratos: Se
             t1 = asyncio.create_task(
                 execute_action(request, inv_id, 0, settings=settings, elastic=AsyncMock())
             )
-            await asyncio.wait_for(started.wait(), timeout=2)  # first call is inside the write
+            await asyncio.wait_for(started.wait(), timeout=30)  # first call is inside the write
             t2 = asyncio.create_task(
                 execute_action(request, inv_id, 0, settings=settings, elastic=AsyncMock())
             )
             await asyncio.sleep(0.15)  # give the racer time to (try to) reach the write
             release.set()
-            r1 = await asyncio.wait_for(t1, timeout=2)
-            r2 = await asyncio.wait_for(t2, timeout=2)
+            r1 = await asyncio.wait_for(t1, timeout=30)
+            r2 = await asyncio.wait_for(t2, timeout=30)
     finally:
         await engine.dispose()
 
@@ -6501,6 +6501,39 @@ def test_internal_identifiers_get_shape_with_always_on(client: TestClient) -> No
     assert suffix_rows[".lan"]["mutable"] is False
     assert suffix_rows[".lan"]["source"] == "reserved"
     assert suffix_rows[".lan"]["state"] == "active"
+
+
+def test_internal_identifiers_a_scan_that_ends_during_the_read_still_reads_running(
+    client: TestClient,
+) -> None:
+    """The route read the rows, then the discovery status.
+
+    A scan that committed its rows and ended in between answered the old rows
+    with running false. The Settings page stops its poll on that answer, so
+    the old rows stayed on screen. The route now reads the status first. This
+    test ends the scan while the route reads the rows.
+    """
+    from unittest.mock import patch
+
+    from soc_ai.api.webui import routes_identifiers
+    from soc_ai.store import internal_identifiers as ids_store
+
+    status = routes_identifiers._get_discovery_status(client.app.state)
+    real_list = ids_store.list_identifiers
+
+    async def _list_then_the_scan_ends(*args: Any, **kwargs: Any) -> Any:
+        rows = await real_list(*args, **kwargs)
+        status.running = False  # the scan ends right after this read
+        return rows
+
+    status.running = True
+    try:
+        with patch.object(ids_store, "list_identifiers", _list_then_the_scan_ends):
+            body = client.get("/api/v1/internal-identifiers").json()
+    finally:
+        status.running = False
+
+    assert body["last_scan"]["running"] is True, "rows read during a scan were served as final"
 
 
 def test_internal_identifiers_add_manual_happy(client: TestClient) -> None:

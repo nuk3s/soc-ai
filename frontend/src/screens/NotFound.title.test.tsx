@@ -44,8 +44,9 @@ describe('the investigation not-found page', () => {
         <CrumbProbe />
       </ShellProvider>,
     );
-    expect((await screen.findByTestId('investigation-page-title')).textContent).toBe(
-      'No such investigation',
+    // The title reads "Investigation" until the failed read renders.
+    await waitFor(() =>
+      expect(screen.getByTestId('investigation-page-title').textContent).toBe('No such investigation'),
     );
     const backs = screen.getAllByRole('link', { name: /Investigations/ });
     expect(backs.length).toBe(2);

@@ -161,7 +161,8 @@ describe('AnalyticDrawer', () => {
   it('states the status in the words of the hit card', async () => {
     mount();
     await screen.findByTestId('analytic-id');
-    expect(screen.getAllByTitle(CHIP_LIVE).length).toBeGreaterThan(0);
+    // The id renders from the prop. The status chip waits for the read.
+    expect((await screen.findAllByTitle(CHIP_LIVE)).length).toBeGreaterThan(0);
   });
 
   // The header carried the title alone. Two analytics on one subject read the

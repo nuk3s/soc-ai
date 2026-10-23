@@ -65,6 +65,7 @@ import {
   startHunt,
 } from '../lib/api';
 import { queueOf } from '../test/alertQueue';
+import { flushEffects } from '../test/flushEffects';
 import { Alerts } from './Alerts';
 import { ShellProvider } from '../shell/ShellContext';
 
@@ -119,6 +120,10 @@ function renderAlerts() {
 async function pressAcknowledge() {
   renderAlerts();
   await screen.findByText(GROUP.name);
+  // The key listener of the row render attaches in an effect. Run it, or `j`
+  // reaches the listener of the empty list and does nothing. A loaded runner
+  // failed here.
+  flushEffects();
   await act(async () => {
     fireEvent.keyDown(window, { key: 'j' });
   });

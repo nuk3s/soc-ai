@@ -385,7 +385,7 @@ def test_battery_api_start_poll_persist(tmp_path):
             r = client.post("/api/v1/config/model-battery", json={"model": "probe-me"})
             assert r.status_code == 202
 
-            deadline = _time.monotonic() + 10
+            deadline = _time.monotonic() + 30
             data = None
             while _time.monotonic() < deadline:
                 data = client.get("/api/v1/config/model-battery?model=probe-me").json()

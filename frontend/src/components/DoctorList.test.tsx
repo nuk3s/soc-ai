@@ -122,8 +122,9 @@ describe('DoctorList, the WARN filter', () => {
     render(<DoctorList warnOnly onRows={(rows) => seen.push(rows.length)} />);
     expect(await screen.findByTestId('doctor-row-blocklists')).toBeTruthy();
     expect(screen.queryByTestId('doctor-row-estate model')).toBeNull();
-    // The header counts every row of the read, not the filtered list.
-    expect(seen).toEqual([4]);
+    // The header counts every row of the read, not the filtered list. The
+    // count goes up in an effect after the rows render.
+    await waitFor(() => expect(seen).toEqual([4]));
   });
 
   // NEGATIVE CONTROL. With no WARN row the filter says so. It is not an empty doctor.

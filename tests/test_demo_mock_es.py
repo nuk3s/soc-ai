@@ -416,7 +416,7 @@ def test_set_degrade_state_round_trips_and_releases_the_tarpit():
         time.sleep(0.1)
         assert mock_es.degrade_state() == "stalled"
         mock_es.set_degrade_state("healthy")
-        assert released.wait(2), "a state change did not release the stalled waiter"
+        assert released.wait(10), "a state change did not release the stalled waiter"
         assert mock_es.degrade_state() == "healthy"
     finally:
         mock_es.set_degrade_state("healthy")
@@ -803,7 +803,12 @@ def test_date_histogram_fills_the_bounds_at_the_interval():
     daily = {"field": "@timestamp", "interval": "1d", "extended_bounds": {"min": "now-7d"}}
     body = {"size": 0, "aggs": {"v": {"date_histogram": daily}}}
     buckets = mock_es.search_docs(body, docs)["aggregations"]["v"]["buckets"]
-    assert len(buckets) == 8
+    # No upper bound, so the last bucket is the day of the newest record, one
+    # hour ago. From 00:00 to 01:00 UTC that day is yesterday, and the test
+    # failed in that hour with 7 buckets. Count the days the bounds hold.
+    newest = datetime.fromisoformat(docs[0]["_source"]["@timestamp"].replace("Z", "+00:00"))
+    first_day = (datetime.now(UTC) - timedelta(days=7)).date()
+    assert len(buckets) == (newest.date() - first_day).days + 1
     assert all(b["key"] % 86_400_000 == 0 for b in buckets)
 
 
@@ -1017,7 +1022,12 @@ def test_conn_pass_counts_agree_and_a_silent_span_reads_zero():
 
 def test_conn_pass_newest_steps_back_out_of_a_silent_span():
     now = datetime.now(UTC)
-    gap = {"start": _iso_at(now - timedelta(hours=2)), "end": _iso_at(now + timedelta(hours=1))}
+    # The mock gives each hour slot whole records. A gap that opens in the
+    # first three minutes of an hour leaves that slot no record, so the newest
+    # record is the end of the hour before. The test failed in those minutes,
+    # about one run in twenty. The gap now opens at half past the hour.
+    start = (now - timedelta(hours=2)).replace(minute=30, second=0, microsecond=0)
+    gap = {"start": _iso_at(start), "end": _iso_at(now + timedelta(hours=1))}
     resp = mock_es.search_docs(_conn_body(), [], traffic=_traffic(silent=[gap]))
     _conn_total_agrees(resp)
     assert resp["aggregations"]["newest"]["value_as_string"] == gap["start"]

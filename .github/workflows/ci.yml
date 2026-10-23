@@ -140,6 +140,13 @@ jobs:
       - name: test
         run: npm test
 
+      # The same suite with the loaded-runner order made the usual order
+      # (src/test/loadedScheduler.ts). A test that reads the page before it
+      # finishes rendering fails here on every run, instead of now and then on
+      # a busy runner. Four such tests failed GitHub runs in October 2026.
+      - name: test under the loaded order
+        run: npm run test:loaded
+
       - name: build
         run: npm run build
 

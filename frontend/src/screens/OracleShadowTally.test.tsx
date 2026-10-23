@@ -1,7 +1,7 @@
 // The Oracle rule shadow tally (oracle_rule_mode=shadow). One small table:
 // what the uncertainty rule would send, what the classic rule sent, and the
 // overlap, by reason. A failed load must never read as "the rules agree".
-import { render, screen, within } from '@testing-library/react';
+import { cleanup, render, screen, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { OracleShadowTally as Tally } from '../lib/api';
 
@@ -31,6 +31,9 @@ const WEEK: Tally = {
 
 describe('OracleShadowTally', () => {
   afterEach(() => {
+    // Unmount first. The unmount runs the effects React still owes, and those
+    // call the mock. A reset mock returns undefined and breaks the next tests.
+    cleanup();
     getOracleShadowTallyMock.mockReset();
   });
 

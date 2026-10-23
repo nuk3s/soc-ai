@@ -84,8 +84,9 @@ describe('Entity hunting panels', () => {
   it('reads the observations on the entity and names the entity in the heading', async () => {
     mount();
     await waitFor(() => expect(getObservations).toHaveBeenCalledWith('svc_sql', 7));
-    expect(screen.getByText(/Observations on this entity/)).toBeTruthy();
-    expect(screen.getByText('4769 for svc_sql from a workstation')).toBeTruthy();
+    // The call is on record before its answer renders. Wait for the rows.
+    expect(await screen.findByText(/Observations on this entity/)).toBeTruthy();
+    expect(await screen.findByText('4769 for svc_sql from a workstation')).toBeTruthy();
   });
 
   it('asks the server for the leads that name this entity', async () => {
@@ -98,7 +99,8 @@ describe('Entity hunting panels', () => {
     await waitFor(() => expect(getLeads).toHaveBeenCalledWith('all', { entity: 'svc_sql' }));
     const strip = await screen.findByTestId('leads-strip');
     expect(within(strip).getByText(/Leads on this entity/)).toBeTruthy();
-    expect(within(strip).getByTestId('lead-12')).toBeTruthy();
+    // The strip renders while the leads load. Wait for the row.
+    expect(await within(strip).findByTestId('lead-12')).toBeTruthy();
   });
 
   it('links each lead row to the lead', async () => {

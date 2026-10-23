@@ -157,8 +157,9 @@ describe('Dashboard true-positives tile — every number answers one question', 
     await mount([fallback('fb1'), fallback('fb2')]);
     const tile = await tpTile();
     // It counts investigation runs over thirty days, which is neither the unit
-    // nor the window in the tile's heading, so it says so.
-    expect(tile.textContent).toMatch(/runs, last 30 days/i);
+    // nor the window in the tile's heading, so it says so. The clause waits for
+    // its own read.
+    await waitFor(() => expect(tile.textContent).toMatch(/runs, last 30 days/i));
     expect(await screen.findByRole('button', { name: '2 pipeline errors' })).toBeTruthy();
   });
 

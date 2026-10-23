@@ -136,8 +136,29 @@ def clean_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]
     _auth.login_throttle.reset()
     _auth.login_ip_throttle.reset()
     _auth.password_change_throttle.reset()
+    _clear_process_caches()
     yield
     get_settings.cache_clear()
+
+
+def _clear_process_caches() -> None:
+    """Empty the module caches that outlive a test.
+
+    A test that fills one steers the next test on the same worker. Several
+    files cleared some of them on setup. The xdist split of files differs
+    between this box and a 4-vCPU runner, so a leak shows on one and not on
+    the other.
+    """
+    from soc_ai import notify
+    from soc_ai.agent import context_budget
+    from soc_ai.so_client import fields, inventory
+    from soc_ai.store import host_dossier
+
+    inventory._clear_cache()
+    fields._clear_agg_field_cache()
+    context_budget._window_cache.clear()
+    host_dossier._env_profile_cache.clear()
+    notify._dedup_seen.clear()
 
 
 @pytest.fixture(scope="session")

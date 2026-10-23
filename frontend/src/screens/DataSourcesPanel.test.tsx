@@ -4,7 +4,7 @@
 // doctor's freshness rule and sends the result as `state`. The panel shows that
 // state. The notes and the intro render through HelpText, so a backtick span is
 // code and "Settings > <Section>" is a link (R5-D17, R5-D18, R5-D21).
-import { render, screen, within } from '@testing-library/react';
+import { cleanup, render, screen, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { DataSource } from '../lib/api';
@@ -51,7 +51,12 @@ async function statusOf(name: string): Promise<string> {
   return row.lastElementChild?.textContent ?? '';
 }
 
-afterEach(() => getDataSourcesMock.mockReset());
+afterEach(() => {
+  // Unmount first. The unmount runs the effects React still owes, and those
+  // call the mocks. A reset mock returns undefined and breaks the next tests.
+  cleanup();
+  getDataSourcesMock.mockReset();
+});
 
 describe('DataSourcesPanel status', () => {
   it('shows a stale local feed as Stale, never Active', async () => {

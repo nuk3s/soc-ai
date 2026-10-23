@@ -4,7 +4,7 @@
 // quietly dropped to "Needs key" until the operator fetched a fresh one from
 // the provider. Every other destructive action in the app arms an inline
 // two-step confirm; this panel does the same, keyed per row.
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ApiKeyField } from '../lib/api';
@@ -46,6 +46,9 @@ function row(label: string): HTMLElement {
 }
 
 afterEach(() => {
+  // Unmount first. The unmount runs the effects React still owes, and those
+  // call the mocks. A reset mock returns undefined and breaks the next tests.
+  cleanup();
   getApiKeysMock.mockReset();
   clearApiKeyMock.mockReset();
   saveApiKeyMock.mockReset();

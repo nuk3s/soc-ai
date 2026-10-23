@@ -230,7 +230,8 @@ describe('HostDetail: an address or a name resolves to the machine', () => {
     mount([`/hosts/${BRIDGE}?field=role`]);
     await waitFor(() => expect(url()).toBe(`/hosts/agent%3Aea2d?field=role&address=${BRIDGE}`));
     expect(resolveMachine).toHaveBeenCalledWith(BRIDGE);
-    expect(getMachine).toHaveBeenCalledWith('agent:ea2d');
+    // The machine read starts in an effect after the new URL renders.
+    await waitFor(() => expect(getMachine).toHaveBeenCalledWith('agent:ea2d'));
     // The address in focus opens in the Addresses section, marked.
     const row = await screen.findByTestId(`address-row-${BRIDGE}`);
     expect(row.getAttribute('data-focus')).toBe('true');
@@ -358,7 +359,8 @@ describe('HostDetail: the machine header', () => {
     await waitFor(() => expect(getObservations).toHaveBeenCalledWith(PRIMARY, expect.anything()));
     // A closed panel reads no thread.
     expect(getHostChat).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole('button', { name: 'Ask soc-ai about this host' }));
+    // The page registers its chat scope in an effect. Wait for the button.
+    fireEvent.click(await screen.findByRole('button', { name: 'Ask soc-ai about this host' }));
     await waitFor(() => expect(getHostChat).toHaveBeenCalledWith(PRIMARY));
     expect(screen.getByTestId('host-facts-address').textContent).toMatch(/primary address 192\.0\.2\.10/);
   });

@@ -255,12 +255,16 @@ def windows_for(
     return found
 
 
-async def refresh_estate(db: AsyncSession) -> EstateRefresh:
+async def refresh_estate(db: AsyncSession, *, now: datetime | None = None) -> EstateRefresh:
     """Count, per dimension and member, the hosts whose stored set holds it.
 
     Replaces the whole table in one transaction. A partial table would read
     a member as held by fewer hosts than hold it, which is the false rarity
     this table exists to prevent.
+
+    ``now`` anchors the confirmed attack windows the count leaves out, as in
+    :func:`confirmed_windows`. None is the present. A sweep passes its own
+    anchor, so the table and the sweep leave out the same windows.
     """
     rows = (
         await db.execute(
@@ -277,7 +281,7 @@ async def refresh_estate(db: AsyncSession) -> EstateRefresh:
     # role priors read. The build writes each row with no role.
     role_map = await roles(db)
     stamped = await stamp_roles(db, lambda key: role_for(role_map, key))
-    windows = await confirmed_windows(db)
+    windows = await confirmed_windows(db, now=now)
     holders: dict[tuple[str, str], set[str]] = {}
     hosts: set[str] = set()
     for entity_key, dimension, vector in rows:
@@ -321,11 +325,14 @@ async def estate_is_stale(db: AsyncSession) -> bool:
     return newest is not None and newest > stamp
 
 
-async def ensure_estate(db: AsyncSession) -> str | None:
-    """Refresh the table when a build is newer than it. A note when it ran."""
+async def ensure_estate(db: AsyncSession, *, now: datetime | None = None) -> str | None:
+    """Refresh the table when a build is newer than it. A note when it ran.
+
+    ``now`` anchors the confirmed attack windows. See :func:`refresh_estate`.
+    """
     if not await estate_is_stale(db):
         return None
-    done = await refresh_estate(db)
+    done = await refresh_estate(db, now=now)
     return (
         f"estate prevalence: read {done.hosts} host(s), counted "
         f"{done.members} member(s) across the set dimensions and wrote "

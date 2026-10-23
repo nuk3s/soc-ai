@@ -313,7 +313,7 @@ def at_client(at_settings: Settings, fake_es: AsyncMock) -> Iterator[TestClient]
             yield client
 
 
-def _poll_done(client: TestClient, *, deadline_s: float = 5.0) -> dict[str, Any]:
+def _poll_done(client: TestClient, *, deadline_s: float = 30.0) -> dict[str, Any]:
     """Poll GET /api/v1/auto-triage until the batch finishes; return final JSON."""
     deadline = time.time() + deadline_s
     data: dict[str, Any] = {}
@@ -324,14 +324,16 @@ def _poll_done(client: TestClient, *, deadline_s: float = 5.0) -> dict[str, Any]
         if not data["active"] and data.get("finished_at"):
             return data
         time.sleep(0.1)
-    return data
+    # Fail at the deadline. A stuck run must not fall through to asserts
+    # that a run in flight also passes.
+    raise AssertionError(f"the auto-triage batch did not finish before the deadline: {data}")
 
 
 def _poll_until(
     client: TestClient,
     predicate: Callable[[dict[str, Any]], bool],
     *,
-    deadline_s: float = 5.0,
+    deadline_s: float = 30.0,
 ) -> dict[str, Any]:
     """Poll GET /api/v1/auto-triage until *predicate* holds; return the JSON.
 

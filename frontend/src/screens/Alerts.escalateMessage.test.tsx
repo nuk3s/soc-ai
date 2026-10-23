@@ -62,6 +62,7 @@ import {
   listSavedViews,
 } from '../lib/api';
 import { queueOf } from '../test/alertQueue';
+import { flushEffects } from '../test/flushEffects';
 import { Alerts, ESCALATE_CAP, escalateConfirmText, pressPlan } from './Alerts';
 import { ShellProvider } from '../shell/ShellContext';
 
@@ -112,6 +113,10 @@ async function pressEscalate() {
     </ToastProvider>,
   );
   await screen.findByText(GROUP.name);
+  // The key listener of the row render attaches in an effect. Run it, or `j`
+  // reaches the listener of the empty list and does nothing. A loaded runner
+  // failed here.
+  flushEffects();
   await act(async () => {
     fireEvent.keyDown(window, { key: 'j' });
   });
@@ -270,6 +275,7 @@ describe('the escalate confirm', () => {
       </ToastProvider>,
     );
     await screen.findByText(GROUP.name);
+    flushEffects();
     await act(async () => {
       fireEvent.keyDown(window, { key: 'j' });
     });

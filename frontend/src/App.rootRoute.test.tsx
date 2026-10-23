@@ -3,7 +3,7 @@
  * login screen when one is. Pinned because the range tester's first screen was
  * a password prompt on an instance with no passwords.
  */
-import { render, screen, waitFor } from '@testing-library/react';
+import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from './App';
@@ -33,6 +33,10 @@ describe('the bare root', () => {
     vi.mocked(getMe).mockReset();
   });
   afterEach(() => {
+    // Unmount first. The unmount runs the effects React still owes, and the
+    // sidebar's effect calls getMe. A restored mock returns undefined, and the
+    // error breaks React for the next test.
+    cleanup();
     vi.restoreAllMocks();
   });
 

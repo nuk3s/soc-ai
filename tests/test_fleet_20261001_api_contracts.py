@@ -436,10 +436,14 @@ def test_a_leg_that_answers_late_is_slow_not_ok(
 ) -> None:
     from soc_ai.api.webui import routes_meta
 
-    monkeypatch.setattr(routes_meta, "_HEALTH_PROBE_LEG_TIMEOUT_S", 0.5)
+    # A leg is slow past 60 percent of its budget. The late leg answers at
+    # 1.3 s of a 2 s budget: it can never answer under 1.2 s, and a loaded
+    # runner has 0.7 s before the leg reads as a timeout. The old 0.4 s of a
+    # 0.5 s budget left 0.1 s.
+    monkeypatch.setattr(routes_meta, "_HEALTH_PROBE_LEG_TIMEOUT_S", 2.0)
 
     async def late() -> dict[str, Any]:
-        await asyncio.sleep(0.4)
+        await asyncio.sleep(1.3)
         return {"ok": True, "detail": "up"}
 
     async def fast() -> dict[str, Any]:

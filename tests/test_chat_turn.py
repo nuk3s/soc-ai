@@ -32,7 +32,7 @@ _TEMPLATE = "You are a test assistant.\n\n## Context\n{context}"
 
 
 async def _wait_until(
-    predicate: Callable[[], bool], *, deadline_s: float = 2.0, interval_s: float = 0.005
+    predicate: Callable[[], bool], *, deadline_s: float = 30.0, interval_s: float = 0.005
 ) -> None:
     """Poll *predicate* until true or the deadline elapses.
 
@@ -881,6 +881,12 @@ async def test_backstop_fires_when_the_task_is_cancelled() -> None:
 # results, from a no-tools pass, with the tools in the meta.
 
 
+# The deadline of the cut-off turns. The tool call must finish before it. That
+# takes under 50 ms on an idle box, and the old 0.3 s left a loaded runner little
+# room. The hang after the tool call is 30 s, so the deadline always fires.
+_CUT_OFF_S = 1.5
+
+
 def _cut_off_agent(tool_result: str) -> Any:
     """A real agent whose model calls one tool, then hangs past any deadline."""
     from pydantic_ai import Agent
@@ -898,7 +904,7 @@ def _cut_off_agent(tool_result: str) -> Any:
                     )
                 ]
             )
-        await asyncio.sleep(5)
+        await asyncio.sleep(30)
         return ModelResponse(parts=[TextPart("too late")])
 
     agent: Any = Agent(FunctionModel(_explore), output_type=str)
@@ -953,12 +959,12 @@ async def test_a_deadline_after_tool_results_writes_a_partial_answer() -> None:
     ):
         await run_chat_turn(
             state,
-            _spec(prepare=_prepare, finish=finish, timeout_s=0.3, set_progress=_write),
+            _spec(prepare=_prepare, finish=finish, timeout_s=_CUT_OFF_S, set_progress=_write),
         )
 
     assert finish.last["status"] == "done"
     content = finish.last["content"]
-    assert content.startswith(chat_turn.partial_note(0.3, 1))
+    assert content.startswith(chat_turn.partial_note(_CUT_OFF_S, 1))
     assert "This answer uses only the results of the 1 tool call that finished." in content
     assert content.endswith("The sensor sent no data on day 3.")
     meta = finish.last["meta"]
@@ -1001,11 +1007,11 @@ async def test_a_failed_partial_pass_keeps_the_tools_on_the_timeout_row() -> Non
         ),
         inventory_prompt_block=AsyncMock(return_value=""),
     ):
-        await run_chat_turn(state, _spec(prepare=_prepare, finish=finish, timeout_s=0.3))
+        await run_chat_turn(state, _spec(prepare=_prepare, finish=finish, timeout_s=_CUT_OFF_S))
 
     assert finish.last["status"] == "error"
     assert finish.last["content"] == (
-        "soc-ai stopped after 0.3 seconds with no answer. Ask a narrower question."
+        "soc-ai stopped after 1.5 seconds with no answer. Ask a narrower question."
     )
     assert finish.last["meta"]["tools"] == ["t_query_events_oql"]
 

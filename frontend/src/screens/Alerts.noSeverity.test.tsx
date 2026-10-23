@@ -121,8 +121,9 @@ describe('a labelled alert is unchanged', () => {
   it('still seeds and applies the four ladder filters', async () => {
     mount('/alerts?sev=critical,high,medium,low');
     expect(await screen.findByText('Severity · 4')).toBeTruthy();
-    // The labelled row is in the band, the unlabelled one is not.
-    expect(screen.getByText(LABELLED.name)).toBeTruthy();
+    // The labelled row is in the band, the unlabelled one is not. The chip
+    // renders from the URL before the rows load.
+    expect(await screen.findByText(LABELLED.name)).toBeTruthy();
     expect(screen.queryByText(UNLABELLED.name)).toBeNull();
   });
 });

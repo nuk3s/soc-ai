@@ -270,7 +270,7 @@ async def test_recorded_run_client_disconnect_lands_terminal_state(monkeypatch, 
     # locally, not under CI load). A real regression — the row never leaving
     # 'running' — still fails, at the timeout.
     inv = None
-    for _ in range(300):  # up to ~3s
+    for _ in range(3000):  # up to ~30s on a loaded runner
         async with maker() as db:
             got = await inv_svc.get_with_events(db, inv_id)
         assert got is not None

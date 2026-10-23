@@ -657,7 +657,8 @@ describe('HostDetail: a declaration on one host', () => {
   it('re-reads the machine, so the hero badge shows the declared role', async () => {
     await declare();
     await waitFor(() => expect(getMachine).toHaveBeenCalledTimes(2));
-    expect((await screen.findByTestId('hero-role')).textContent).toContain('domain controller');
+    // The badge shows the old role until the second read renders.
+    await waitFor(() => expect(screen.getByTestId('hero-role').textContent).toContain('domain controller'));
   });
 
   it('offers Undo, and Undo removes a new declaration', async () => {

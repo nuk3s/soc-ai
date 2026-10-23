@@ -1,7 +1,7 @@
 // Fleet dogfood 2026-10-01 (RC8): the webhook Save answered 400
 // no_config_secret_key after the operator typed the URL. GET now says whether a
 // save can store the URL, and the panel disables Set with the hint first.
-import { fireEvent, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 const getNotifyWebhookMock = vi.hoisted(() => vi.fn());
@@ -18,6 +18,9 @@ vi.mock('../lib/api', async (importOriginal) => ({
 import { NotificationsPanel } from './NotificationsPanel';
 
 afterEach(() => {
+  // Unmount first. The unmount runs the effects React still owes, and those
+  // call the mocks. A reset mock returns undefined and breaks the next tests.
+  cleanup();
   getNotifyWebhookMock.mockReset();
   saveNotifyWebhookMock.mockReset();
 });

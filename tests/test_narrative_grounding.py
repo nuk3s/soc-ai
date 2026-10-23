@@ -21,6 +21,8 @@ from soc_ai.agent.narrative_grounding import (
     strip_correction_talk,
 )
 
+from tests.scaling import LINEAR_BOUND, SCALE_STEP, scaling
+
 
 def test_zero_tool_fabricated_host_and_dns_is_flagged() -> None:
     """(1) Answer asserts a hostname + internal DNS with meta.tools == [] and a seed
@@ -287,36 +289,8 @@ def test_domain_regex_ignores_prose_and_filenames() -> None:
     assert a.domains == []
 
 
-def _scaling(pattern: re.Pattern[str], small: str, large: str, *, rounds: int = 7) -> float:
-    """How much longer ``pattern`` takes on ``large`` than on ``small``.
-
-    The best of several interleaved runs: each round times the small input and
-    then the large one, so both see the same load on a shared CI runner. One
-    run measures the scheduler as much as the pattern.
-    """
-    import time
-
-    best_small = best_large = float("inf")
-    for _ in range(rounds):
-        start = time.perf_counter()
-        list(pattern.finditer(small))
-        best_small = min(best_small, time.perf_counter() - start)
-        start = time.perf_counter()
-        list(pattern.finditer(large))
-        best_large = min(best_large, time.perf_counter() - start)
-    return best_large / max(best_small, 1e-6)
-
-
 def _dot_dense(n: int) -> str:
     return "a." * n + "a" * 100  # dot-dense label run with no valid TLD tail
-
-
-# Four times the input: a linear pattern takes about 4x, a quadratic one about
-# 16x. The bound sits between them with room for runner noise on both sides.
-# The old test doubled the input and allowed 3.0 against a linear 2.0, and a
-# loaded GitHub runner read 3.07 and 3.16 for the linear pattern.
-_SCALE_STEP = 4
-_LINEAR_BOUND = 8.0
 
 
 def test_domain_regex_scales_linearly_on_dot_dense_text() -> None:
@@ -333,9 +307,13 @@ def test_domain_regex_scales_linearly_on_dot_dense_text() -> None:
     from soc_ai.agent.narrative_grounding import _DOMAIN
 
     list(_DOMAIN.finditer("ab" * 100))  # warm the compiled pattern before timing
-    scaling = _scaling(_DOMAIN, _dot_dense(5_000), _dot_dense(5_000 * _SCALE_STEP))
-    assert scaling < _LINEAR_BOUND, (
-        f"ReDoS: _DOMAIN scaled {scaling:.2f}x on {_SCALE_STEP}x input (linear is {_SCALE_STEP})"
+    ratio = scaling(
+        lambda text: list(_DOMAIN.finditer(text)),
+        _dot_dense(5_000),
+        _dot_dense(5_000 * SCALE_STEP),
+    )
+    assert ratio < LINEAR_BOUND, (
+        f"ReDoS: _DOMAIN scaled {ratio:.2f}x on {SCALE_STEP}x input (linear is {SCALE_STEP})"
     )
 
 
@@ -344,13 +322,17 @@ def test_the_scaling_check_catches_a_quadratic_pattern() -> None:
 
     ``(?:a\\.)+b`` scans the whole run from every start and never matches, so it
     costs n squared. Without this control a broken measurement could pass every
-    pattern.
+    pattern. The ReDoS checks in test_eval_sanitize.py and
+    test_oracle_credential_redaction.py use the same measurement.
     """
-    import re
-
     quadratic = re.compile(r"(?:a\.)+b")
-    scaling = _scaling(quadratic, _dot_dense(1_000), _dot_dense(1_000 * _SCALE_STEP), rounds=3)
-    assert scaling > _LINEAR_BOUND, f"the check read a quadratic pattern as {scaling:.2f}x"
+    ratio = scaling(
+        lambda text: list(quadratic.finditer(text)),
+        _dot_dense(1_000),
+        _dot_dense(1_000 * SCALE_STEP),
+        rounds=3,
+    )
+    assert ratio > LINEAR_BOUND, f"the check read a quadratic pattern as {ratio:.2f}x"
 
 
 def test_domain_regex_matching_semantics_preserved() -> None:

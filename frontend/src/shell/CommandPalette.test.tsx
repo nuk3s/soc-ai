@@ -12,6 +12,7 @@ import { listMachines } from '../lib/api';
 import type { Config, Setting } from '../lib/types';
 import { CommandPalette } from './CommandPalette';
 import { ShellProvider } from './ShellContext';
+import { flushEffects } from '../test/flushEffects';
 
 // Stub useNavigate so the Settings entries' navigate(to, { state }) contract —
 // the exact shape the Config page reads to flash the matched row — is assertable.
@@ -144,6 +145,8 @@ describe('CommandPalette', () => {
     await screen.findByRole('option', { name: /Verdict inheritance window · Triage/ });
 
     // Label matches rank first, so the matched setting is the highlighted row.
+    // The Enter listener of the new results attaches in an effect. Run it.
+    flushEffects();
     fireEvent.keyDown(window, { key: 'Enter' });
     expect(navigateMock).toHaveBeenCalledWith('/config#triage', {
       state: { highlightKey: 'webui_inherit_window_days' },
@@ -232,6 +235,8 @@ describe('CommandPalette', () => {
     // The row reads "<name> · <primary address> · <role>". No dash.
     expect(hit.textContent).not.toMatch(/[–—]/);
 
+    // The Enter listener of the new results attaches in an effect. Run it.
+    flushEffects();
     fireEvent.keyDown(window, { key: 'Enter' });
     expect(navigateMock).toHaveBeenCalledWith('/hosts/agent%3A7f3a');
   });

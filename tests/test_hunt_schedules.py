@@ -358,7 +358,7 @@ async def test_loop_cancels_cleanly_on_shutdown(
 
     monkeypatch.setattr(main_mod.asyncio, "sleep", _sleep)
     task = asyncio.create_task(_hunt_schedule_loop(app))
-    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await asyncio.wait_for(started.wait(), timeout=30)
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await task

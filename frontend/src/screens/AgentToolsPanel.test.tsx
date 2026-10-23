@@ -3,7 +3,7 @@
 // "no hit" (dogfood 2026-10-19, R5-D9). The backend now sends `degraded` and
 // `state_reason`. A degraded tool reads "Degraded" with its reason. A tool
 // with no feed to look in reads "Unavailable" with its reason.
-import { render, screen } from '@testing-library/react';
+import { cleanup, render, screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AgentTool } from '../lib/api';
@@ -47,7 +47,12 @@ function rowOf(name: string): HTMLElement {
   return screen.getByText(name).closest('div.flex.items-start') as HTMLElement;
 }
 
-afterEach(() => getAgentToolsMock.mockReset());
+afterEach(() => {
+  // Unmount first. The unmount runs the effects React still owes, and those
+  // call the mocks. A reset mock returns undefined and breaks the next tests.
+  cleanup();
+  getAgentToolsMock.mockReset();
+});
 
 describe('AgentToolsPanel feed state', () => {
   it('shows a tool with a stale feed as Degraded with the reason', async () => {

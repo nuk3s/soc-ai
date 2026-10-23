@@ -71,6 +71,7 @@ import {
   setSetting,
 } from '../lib/api';
 import type { ModelBatteryStatus } from '../lib/api';
+import { flushEffects } from '../test/flushEffects';
 
 const PASS = { grade: 'pass', model: MODEL, legs: [], detail: 'ok' } as never;
 
@@ -164,6 +165,9 @@ describe('the "Applied" notice leaves (RC13)', () => {
     fireEvent.change(input('sweep_interval_minutes'), { target: { value: '60' } });
     fireEvent.click(screen.getByRole('button', { name: /Apply changes/ }));
     await screen.findByText(/Applied 1 change\./);
+    // The 8 s timer starts in an effect of the notice render. Run that effect
+    // before the clock moves. A loaded runner failed here (2026-10-22).
+    flushEffects();
 
     await act(async () => {
       vi.advanceTimersByTime(8000);
@@ -202,7 +206,7 @@ describe('the "Applied" notice leaves (RC13)', () => {
 describe('Check fitness keeps the previous grade and names an abort (RC3)', () => {
   it('shows the old chip with "checking" during the run, and one error line on abort', async () => {
     renderConfig('#agent');
-    const chip = await screen.findByTestId('fitness-chip', {}, { timeout: 3000 });
+    const chip = await screen.findByTestId('fitness-chip');
     expect(chip.textContent).toBeTruthy();
 
     let fail: (e: unknown) => void = () => {};

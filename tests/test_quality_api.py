@@ -250,7 +250,7 @@ def test_quality_eval_run_now_single_flight(client: TestClient) -> None:
 
         release.set()
         # bounded wait for the worker to land
-        for _ in range(40):
+        for _ in range(600):  # up to ~30s on a loaded runner
             status = client.get("/api/v1/quality/eval/status").json()
             if not status["running"]:
                 break
@@ -272,7 +272,7 @@ def test_quality_eval_run_now_records_failure_detail(client: TestClient) -> None
         assert client.post("/api/v1/quality/eval/run").json()["running"] is True
         import time
 
-        for _ in range(40):
+        for _ in range(600):  # up to ~30s on a loaded runner
             status = client.get("/api/v1/quality/eval/status").json()
             if not status["running"]:
                 break
@@ -292,7 +292,7 @@ def _wait_for_eval_to_land(client: TestClient) -> dict[str, Any]:
     import time
 
     status: dict[str, Any] = {}
-    for _ in range(40):
+    for _ in range(600):  # up to ~30s on a loaded runner
         status = client.get("/api/v1/quality/eval/status").json()
         if not status["running"]:
             break

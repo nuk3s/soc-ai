@@ -7,7 +7,7 @@
 // this test only cares about the Users / API tokens sections Config.tsx itself
 // owns, and each stub keeps the test hermetic (no api mocking needed for panels
 // this bug doesn't touch).
-import { fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { describe, expect, it, vi } from 'vitest';
 
@@ -55,6 +55,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
 
 import { Config } from './Config';
 import { getConfig, mintToken, resetUserPassword, revokeToken } from '../lib/api';
+import { flushEffects } from '../test/flushEffects';
 
 describe('Config admin write paths surface a failure instead of failing silently (F39)', () => {
   it('shows an error on the users strip when resetUserPassword rejects', async () => {
@@ -113,8 +114,10 @@ describe('reset-password banner auto-dismiss (F69)', () => {
       fireEvent.click(resetBtn);
       fireEvent.click(await screen.findByRole('button', { name: 'Reset the password' }));
       await screen.findByText('temp-pw');
-
-      await vi.advanceTimersByTimeAsync(30000);
+      // The 30 s timer starts in an effect of the banner render. Run that
+      // effect before the clock moves, and let act render what the timer does.
+      flushEffects();
+      await act(() => vi.advanceTimersByTimeAsync(30000));
 
       expect(screen.queryByText('temp-pw')).toBeNull();
     } finally {

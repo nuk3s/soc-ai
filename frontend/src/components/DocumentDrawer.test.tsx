@@ -56,7 +56,8 @@ describe('DocumentChip', () => {
     fireEvent.click(screen.getByRole('button', { name: '7Kq2c1' }));
     await waitFor(() => expect(getEvent).toHaveBeenCalledWith('7Kq2c1'));
     const dialog = await screen.findByRole('dialog');
-    expect(within(dialog).getByText('winlog.event_id')).toBeTruthy();
+    // The dialog opens before the read lands. Wait for the fields.
+    expect(await within(dialog).findByText('winlog.event_id')).toBeTruthy();
     expect(within(dialog).getByText('4769')).toBeTruthy();
     expect(within(dialog).getByText('windows.security')).toBeTruthy();
   });
@@ -83,9 +84,8 @@ describe('DocumentDrawer', () => {
   it('sorts the keys and joins an array into one value', async () => {
     mount();
     const dialog = await screen.findByRole('dialog');
-    const keys = within(dialog)
-      .getAllByTestId('document-key')
-      .map((k) => k.textContent);
+    // The dialog opens before the read lands. Wait for the fields.
+    const keys = (await within(dialog).findAllByTestId('document-key')).map((k) => k.textContent);
     expect(keys).toEqual([
       'message',
       'tags',
@@ -119,7 +119,7 @@ describe('DocumentDrawer', () => {
     Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
     mount();
     const dialog = await screen.findByRole('dialog');
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Copy JSON' }));
+    fireEvent.click(await within(dialog).findByRole('button', { name: 'Copy JSON' }));
     await waitFor(() => expect(writeText).toHaveBeenCalled());
     expect(JSON.parse(writeText.mock.calls[0][0])).toEqual(DOC.source);
   });

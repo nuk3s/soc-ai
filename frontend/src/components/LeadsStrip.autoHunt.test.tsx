@@ -136,8 +136,8 @@ describe('a queued hunt on a new lead', () => {
   // hunted".
   it('adds one sentence to the legend while a lead is queued', async () => {
     mount();
-    const legend = await screen.findByTestId('leads-legend');
-    expect(legend.textContent).toContain(LEGEND_AUTO_HUNT);
+    // The legend renders while the leads load. The sentence comes with them.
+    await waitFor(() => expect(screen.getByTestId('leads-legend').textContent).toContain(LEGEND_AUTO_HUNT));
   });
 
   it('leaves the legend alone when no lead is queued', async () => {
@@ -151,8 +151,8 @@ describe('a queued hunt on a new lead', () => {
   // the loop running that is the opposite of the truth.
   it('replaces the note that says soc-ai starts no hunt', async () => {
     mount();
-    const note = await screen.findByTestId('leads-note');
-    expect(note.textContent).toBe(LEADS_NOTE_AUTO_HUNT);
+    // The note renders while the leads load. The auto-hunt note comes with them.
+    await waitFor(() => expect(screen.getByTestId('leads-note').textContent).toBe(LEADS_NOTE_AUTO_HUNT));
   });
 
   it('keeps the standing note when no lead is queued', async () => {

@@ -47,6 +47,7 @@ import {
   listSavedViews,
 } from '../lib/api';
 import { queueOf } from '../test/alertQueue';
+import { flushEffects } from '../test/flushEffects';
 import { Alerts, nextReportAfter } from './Alerts';
 import { ShellProvider } from '../shell/ShellContext';
 
@@ -126,6 +127,8 @@ describe('the next-alert control', () => {
     mount('inv-1');
     await screen.findByText('Rule 3');
     await screen.findByTestId('drawer-next');
+    // The drawer's key listener attaches in an effect of the report render.
+    flushEffects();
     await act(async () => {
       fireEvent.keyDown(window, { key: 'ArrowDown' });
     });

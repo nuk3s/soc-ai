@@ -21,6 +21,9 @@ describe('Freshness', () => {
   });
 
   it('counts seconds under a minute and uses the shared scale after', () => {
+    // The label rounds to the second. Hold the clock, so a slow render on a
+    // loaded runner cannot read "31s ago".
+    vi.useFakeTimers({ toFake: ['Date'] });
     const { rerender } = render(<Freshness at={Date.now() - 30_000} />);
     expect(screen.getByText('updated 30s ago')).toBeTruthy();
     rerender(<Freshness at={Date.now() - 26 * 3_600_000} />);

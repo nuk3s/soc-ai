@@ -162,9 +162,8 @@ describe('HostObservations', () => {
     });
     mount();
     await waitFor(() => expect(getObservations).toHaveBeenCalledWith('10.1.2.3', 7));
-    expect(
-      screen.getByText(/No observations on this host in the last 7 days/),
-    ).toBeTruthy();
+    // The call is on record before its answer renders.
+    expect(await screen.findByText(/No observations on this host in the last 7 days/)).toBeTruthy();
   });
 
   // The row states the statistic it carries. The numbers lived only in the

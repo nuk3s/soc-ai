@@ -369,7 +369,7 @@ def bt_client(bt_settings: Settings) -> Iterator[TestClient]:
             yield client
 
 
-def _poll_backtest(client: TestClient, *, deadline_s: float = 6.0) -> dict[str, Any]:
+def _poll_backtest(client: TestClient, *, deadline_s: float = 30.0) -> dict[str, Any]:
     """Poll GET /api/v1/backtest until the run finishes; return final JSON."""
     deadline = time.time() + deadline_s
     data: dict[str, Any] = {}
@@ -380,7 +380,9 @@ def _poll_backtest(client: TestClient, *, deadline_s: float = 6.0) -> dict[str, 
         if not data["active"] and data.get("status") in ("complete", "error"):
             return data
         time.sleep(0.1)
-    return data
+    # Fail at the deadline. A stuck run must not fall through to asserts
+    # that a run in flight also passes.
+    raise AssertionError(f"the backtest did not finish before the deadline: {data}")
 
 
 class TestBacktestEndpoints:

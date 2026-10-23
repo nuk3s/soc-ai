@@ -569,7 +569,10 @@ async def test_a_member_a_host_learnt_during_an_attack_counts_toward_no_trait(
         maker, verdict="true_positive", at=datetime(2026, 8, 10, 3, tzinfo=UTC), host_name=_DC
     )
     async with maker() as db:
-        await refresh_estate(db)
+        # Anchored where the seeds live. The windows reach back 100 days, so
+        # with the present as the anchor the attack fell out of them on
+        # 2026-11-18 and the test failed from that day.
+        await refresh_estate(db, now=datetime(2026, 9, 1, tzinfo=UTC))
         assert await prevalence_for(db, "logon_users", ["administrator", "domainadmin"]) == {
             "administrator": 1
         }

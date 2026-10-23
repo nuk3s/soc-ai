@@ -3,7 +3,7 @@
 // (amber, a fixable gap), and not-applicable (demoted into a collapsed cluster,
 // grayed, never hidden, still runnable). The demotion must never become
 // blindness: a demoted chip launches exactly like any other.
-import { act, fireEvent, render, screen } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DemoProvider } from '../lib/demo';
@@ -76,6 +76,9 @@ function renderHunts() {
 }
 
 afterEach(() => {
+  // Unmount first. The unmount runs the effects React still owes, and those
+  // call the mocks. A reset mock returns undefined and breaks the next tests.
+  cleanup();
   getHuntTemplatesMock.mockReset();
   startHuntConsoleMock.mockReset();
 });

@@ -39,6 +39,7 @@ import {
   huntConfirmText,
   reopenConfirmText,
 } from './LeadsStrip';
+import { flushEffects } from '../test/flushEffects';
 
 const HOUR = 3_600_000;
 const iso = (msAgo: number) => new Date(Date.now() - msAgo).toISOString();
@@ -357,6 +358,9 @@ describe('the bulk Dismiss', () => {
     fireEvent.click(within(confirmBox()).getByRole('button', { name: 'Dismiss 1 lead' }));
     const line = await screen.findByTestId('leads-bulk-result');
     expect(within(line).getByRole('button', { name: 'Undo (1)' })).toBeTruthy();
+    // The window timer starts in an effect of the result render. Run that
+    // effect before the clock moves. A loaded runner failed here (2026-10-22).
+    flushEffects();
     act(() => {
       vi.advanceTimersByTime(LEAD_UNDO_WINDOW_MS + 1_000);
     });

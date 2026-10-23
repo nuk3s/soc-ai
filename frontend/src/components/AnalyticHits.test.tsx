@@ -590,7 +590,8 @@ describe('reading a shadow hit', () => {
     const shadow = await card(42);
     fireEvent.click(within(shadow).getByRole('button', { name: 'Show evidence' }));
     await waitFor(() => expect(markShadowHitRead).toHaveBeenCalledWith(42));
-    expect(within(shadow).queryByTitle(UNREAD_DOT)).toBeNull();
+    // The call is on record before its answer clears the dot.
+    await waitFor(() => expect(within(shadow).queryByTitle(UNREAD_DOT)).toBeNull());
     // One load. The list does not reorder under the hand that is working it.
     expect(getAnalyticHits).toHaveBeenCalledTimes(1);
     expect(await screen.findByTestId('analytic-hit-42')).toBeTruthy();

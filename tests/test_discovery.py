@@ -1572,7 +1572,7 @@ def test_discovery_scan_post_starts_and_get_reports(client: TestClient) -> None:
         # Poll GET until the background task settles.
         import time
 
-        deadline = time.time() + 5.0
+        deadline = time.time() + 30.0
         data: dict[str, Any] = {}
         while time.time() < deadline:
             data = client.get("/api/v1/discovery/scan").json()

@@ -149,9 +149,12 @@ describe('Hunts window totals', () => {
     expect(line.textContent).not.toContain('(');
     expect(chip('Manual').textContent).toBe('Manual40');
     expect(screen.getByTitle(BADGE_TITLE).textContent).toBe('40');
-    // The page holds 10 manual hunts of the 40.
-    expect(screen.getByTestId('hunts-page-note').textContent).toBe(
-      'The table shows the 10 newest of 40 hunts in this window.',
+    // The page holds 10 manual hunts of the 40. The note comes from the page
+    // read of the new type, which can land after the totals.
+    await waitFor(() =>
+      expect(screen.getByTestId('hunts-page-note').textContent).toBe(
+        'The table shows the 10 newest of 40 hunts in this window.',
+      ),
     );
   });
 

@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:loaded": "vitest run --mode loaded --fileParallelism",
     "typecheck": "tsc -b"
   },
   "dependencies": {

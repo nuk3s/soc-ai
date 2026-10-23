@@ -315,7 +315,7 @@ async def test_f10_shutdown_drain_resolves_pending_hunt_chat(
         return _hunt_chat_resolve_if_pending(state, event_id)
 
     task.add_done_callback(lambda t: mgr._on_task_done(event_id, _backstop, t))
-    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await asyncio.wait_for(started.wait(), timeout=30)
 
     # The lifespan shutdown drain: collect the manager's tasks, cancel, await.
     tasks = list(mgr._tasks.values())

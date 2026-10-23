@@ -339,7 +339,8 @@ describe('HuntDetail — a catalog finding’s citation chips', () => {
     fireEvent.click(screen.getByRole('button', { name: CITATIONS[0] }));
     await waitFor(() => expect(getEvent).toHaveBeenCalledWith(CITATIONS[0]));
     const dialog = await screen.findByRole('dialog');
-    expect(within(dialog).getByText('source.ip')).toBeTruthy();
+    // The dialog opens before the read lands. Wait for the fields.
+    expect(await within(dialog).findByText('source.ip')).toBeTruthy();
   });
 
   it('says how many of the matching documents these ids are', async () => {
@@ -438,7 +439,7 @@ describe('HuntDetail: the starter of a catalog hunt', () => {
     const label = await screen.findByText('started by');
     expect(label.nextElementSibling?.textContent).toBe('the catalog sweep');
     expect(screen.queryByText('hunt-catalog')).toBeNull();
-    // R3-D15: the tab named no hunt.
-    expect(document.title).toMatch(/^Hunt: .+ · soc·ai$/);
+    // R3-D15: the tab named no hunt. The title is set in an effect.
+    await waitFor(() => expect(document.title).toMatch(/^Hunt: .+ · soc·ai$/));
   });
 });

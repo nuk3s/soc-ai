@@ -1267,6 +1267,10 @@ async def dossier_sweep_health(request: Request) -> DossierSweepHealthOut:
     routes exist so that trade never has to be made.
     """
     status = _get_dossier_status(request.app.state)
+    # Read ``running`` with the other fields, before the await below. A first
+    # sweep that ended during the stored read answered running false beside
+    # the stored row of the sweep before it.
+    running = status.running
     last_run = status.last_run
     error_count = _summary_error_count(status.last_summary)
     if last_run is None and status.last_summary is None:
@@ -1275,7 +1279,7 @@ async def dossier_sweep_health(request: Request) -> DossierSweepHealthOut:
         last_run, errors = await _stored_run(request)
         error_count = len(errors)
     return DossierSweepHealthOut(
-        running=status.running,
+        running=running,
         degraded=error_count > 0,
         last_run=last_run,
         error_count=error_count,

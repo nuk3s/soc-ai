@@ -268,7 +268,7 @@ async def test_loop_cancels_cleanly_on_shutdown(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(main_mod.asyncio, "sleep", _sleep)
 
     task = asyncio.create_task(_discovery_scheduler_loop(app, settings))
-    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await asyncio.wait_for(started.wait(), timeout=30)
 
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
@@ -355,7 +355,7 @@ async def test_inflight_worker_cancelled_on_shutdown() -> None:
     # The scheduler / scan-now path spawns the worker and tracks it on _task.
     status.running = True
     status._task = asyncio.create_task(_slow_worker(app.state))
-    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await asyncio.wait_for(started.wait(), timeout=30)
 
     # Exactly the lifespan-shutdown sequence (post scheduler-loop cancellation).
     _st = _get_discovery_status(app.state)
@@ -723,7 +723,7 @@ async def test_at_loop_cancels_cleanly_on_shutdown(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(main_mod.asyncio, "sleep", _sleep)
 
     task = asyncio.create_task(_auto_triage_scheduler_loop(app, settings))
-    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await asyncio.wait_for(started.wait(), timeout=30)
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await task
@@ -1214,7 +1214,7 @@ async def test_dossier_loop_cancels_cleanly_on_shutdown(monkeypatch: pytest.Monk
     monkeypatch.setattr(main_mod.asyncio, "sleep", _sleep)
 
     task = asyncio.create_task(_dossier_scheduler_loop(app, _dossier_settings()))
-    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await asyncio.wait_for(started.wait(), timeout=30)
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await task

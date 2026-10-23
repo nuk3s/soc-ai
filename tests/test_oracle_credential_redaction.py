@@ -30,6 +30,8 @@ from soc_ai.oracle import client as oracle_client
 from soc_ai.oracle.redact import Mapping, sanitize_case
 from soc_ai.oracle.sanitize import desanitize, unsafe_residue
 
+from tests.scaling import LINEAR_BOUND, SCALE_STEP, scaling
+
 
 def _redact(case: dict[str, Any]) -> tuple[dict[str, Any], Mapping]:
     mapping = Mapping()
@@ -371,12 +373,11 @@ class TestRedosBounds:
         first written with an absolute deadline, and chased it twice: it timed
         regex COMPILATION and so failed cold while passing warm (fixed by
         warming outside the timed section), then failed at 2.34s against a 2.0s
-        bound on 2026-08-07 purely from CPU contention. Doubling the input is
-        load-invariant — catastrophic backtracking is superlinear (quadratic
-        gives 4x, exponential far worse) while a bounded quantifier is linear,
-        and both measurements slow down together under load.
+        bound on 2026-08-07 purely from CPU contention. The growth over a 4x
+        input is load-invariant (tests/scaling.py). A doubled input with a bound
+        of 3.0 has only a 1.5x margin over a linear 2.0, and the same check
+        elsewhere read 3.16 on a loaded GitHub runner.
         """
-        import time
 
         def build(n: int) -> dict[str, str]:
             return {
@@ -385,18 +386,16 @@ class TestRedosBounds:
                 "rule_name": ("w." * n) + "x",
             }
 
-        def elapsed(case: dict[str, str]) -> float:
-            start = time.perf_counter()
+        def run(case: dict[str, str]) -> None:
             mapping = Mapping()
             out = sanitize_case(case, mapping)
             unsafe_residue(json.dumps(out), known_values=tuple(mapping.reverse.values()))
-            return time.perf_counter() - start
 
-        elapsed(build(50))  # warm every pattern's compile before anything is timed
-        single = elapsed(build(10000))
-        double = elapsed(build(20000))
-        scaling = double / max(single, 1e-6)
-        assert scaling < 3.0, f"redaction scaled {scaling:.2f}x on 2x input (linear is 2.0)"
+        run(build(50))  # warm every pattern's compile before anything is timed
+        ratio = scaling(run, build(5_000), build(5_000 * SCALE_STEP), rounds=5)
+        assert ratio < LINEAR_BOUND, (
+            f"redaction scaled {ratio:.2f}x on {SCALE_STEP}x input (linear is {SCALE_STEP})"
+        )
 
     def test_real_suffix_fqdn_still_redacted(self) -> None:
         # The bound must not break matching of a normal internal FQDN.

@@ -3,7 +3,7 @@
 // suspension a disagreement leaves, with a Clear button an analyst presses
 // after reading the disagreeing run. A rule the prior never covered says why
 // it held back on the newest alert, so "not covered" is never a bare blank.
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { DetectionNomination, DetectionTuning } from '../lib/api';
 import { RULE_PRIOR_REASON, RULE_PRIOR_SUSPENDED } from '../lib/tooltips';
@@ -40,6 +40,9 @@ const nomination = (over: Partial<DetectionNomination>): DetectionNomination => 
 const tuning = (n: DetectionNomination): DetectionTuning => ({ nominations: [n], overrides: [] });
 
 afterEach(() => {
+  // Unmount first. The unmount runs the effects React still owes, and those
+  // call the mocks. A reset mock returns undefined and breaks the next tests.
+  cleanup();
   getDetectionTuningMock.mockReset();
   clearRulePriorMock.mockReset();
 });

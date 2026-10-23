@@ -1469,7 +1469,7 @@ async def run_prior_sweep(  # noqa: PLR0912, PLR0915 - one function reads as one
     # newer than the table. A failure here costs the prevalence, not the sweep.
     context = _context_for(settings)
     try:
-        refreshed = await ensure_estate(db)
+        refreshed = await ensure_estate(db, now=now)
         context.prevalence_ready = True
         if refreshed:
             notes.append(refreshed)
