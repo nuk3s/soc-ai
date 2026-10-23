@@ -118,7 +118,7 @@ jobs:
   frontend:
     name: frontend typecheck + test + build
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: frontend
