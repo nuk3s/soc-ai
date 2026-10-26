@@ -125,7 +125,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -201,7 +201,7 @@ jobs:
       - name: Set up Python
         run: uv python install 3.12
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -294,7 +294,7 @@ jobs:
             --no-dev --extra postgres --extra ml -o "${RUNNER_TEMP}/requirements.txt"
           uvx pip-audit==2.10.1 -r "${RUNNER_TEMP}/requirements.txt" --no-deps --strict
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
 
