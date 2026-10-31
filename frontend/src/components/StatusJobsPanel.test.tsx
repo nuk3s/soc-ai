@@ -451,6 +451,133 @@ describe('StatusJobsPanel', () => {
   });
 });
 
+// A failed alert waits before its next automatic run, five failures with one
+// error open an alarm, and five in a row pause the scheduled runs
+// (soc_ai/webui/autotriage_health.py). The row says so, and the title names
+// the error.
+describe('StatusJobsPanel Auto-Investigate health', () => {
+  const ERROR = 'ModelHTTPError in synth_first_round1';
+
+  it('a paused job reads failed and names the pause', async () => {
+    vi.mocked(getAutoTriageStatus).mockResolvedValue({
+      ...TRIAGE,
+      hunted: 0,
+      failed: 5,
+      finished_at: iso(30 * MIN),
+      paused_until: new Date(Date.now() + 10 * MIN).toISOString(),
+      failed_in_a_row: 5,
+      alarm_error: ERROR,
+      alarm_failures: 5,
+    });
+    mount();
+    await loaded();
+    expect(state('Continuous Auto-Investigate')).toBe('failed');
+    const text = result('Continuous Auto-Investigate');
+    expect(text.textContent).toMatch(/^Paused until /);
+    expect(text).toHaveTextContent('The last 5 investigations failed.');
+    expect(text.getAttribute('title')).toBe(ERROR);
+    // The finished_at is two intervals old, and the pause is the reason.
+    expect(text.textContent).not.toContain('overdue');
+  });
+
+  it('measures an overdue run from the end of a pause that ran out', async () => {
+    // The pause ended 2 minutes ago, and the next scheduled run comes within
+    // one interval. The last run is 20 minutes old, and that is no missed run.
+    const ranOut = {
+      ...TRIAGE,
+      hunted: 0,
+      failed: 5,
+      finished_at: iso(20 * MIN),
+      paused_until: null,
+      failed_in_a_row: 0,
+      alarm_error: ERROR,
+      alarm_failures: 5,
+    };
+    vi.mocked(getAutoTriageStatus).mockResolvedValue({ ...ranOut, pause_ends: iso(2 * MIN) });
+    const first = mount();
+    await loaded();
+    expect(result('Continuous Auto-Investigate').textContent).not.toContain('overdue');
+    expect(result('Continuous Auto-Investigate')).toHaveTextContent('5 investigations failed with the same error.');
+    first.unmount();
+
+    // Two intervals after the end of the pause with no run: that is overdue.
+    vi.mocked(getAutoTriageStatus).mockResolvedValue({ ...ranOut, pause_ends: iso(11 * MIN) });
+    mount();
+    await loaded();
+    expect(state('Continuous Auto-Investigate')).toBe('failed');
+    expect(result('Continuous Auto-Investigate')).toHaveTextContent(
+      'The job is overdue. It runs every 5 minutes.',
+    );
+  });
+
+  it('an open alarm and the retry limit read failed', async () => {
+    vi.mocked(getAutoTriageStatus).mockResolvedValue({ ...TRIAGE, alarm_error: ERROR, alarm_failures: 7 });
+    const first = mount();
+    await loaded();
+    expect(state('Continuous Auto-Investigate')).toBe('failed');
+    expect(result('Continuous Auto-Investigate')).toHaveTextContent('7 investigations failed with the same error.');
+    expect(result('Continuous Auto-Investigate').getAttribute('title')).toBe(ERROR);
+    first.unmount();
+
+    vi.mocked(getAutoTriageStatus).mockResolvedValue({
+      ...TRIAGE,
+      total: 0,
+      hunted: 0,
+      skipped: 2,
+      skipped_reasons: { retry_limit: 2 },
+    });
+    const second = mount();
+    await loaded();
+    expect(state('Continuous Auto-Investigate')).toBe('failed');
+    expect(result('Continuous Auto-Investigate')).toHaveTextContent(
+      'The last run started no investigation. 2 alerts reached the retry limit.',
+    );
+    second.unmount();
+
+    vi.mocked(getAutoTriageStatus).mockResolvedValue({ ...TRIAGE, skipped_reasons: { retry_limit: 1 } });
+    mount();
+    await loaded();
+    expect(state('Continuous Auto-Investigate')).toBe('failed');
+    expect(result('Continuous Auto-Investigate')).toHaveTextContent(
+      'The last run investigated 4 alerts. 1 alert reached the retry limit.',
+    );
+  });
+
+  it('a run that held every alert back names the alerts that wait to retry', async () => {
+    // "found no alert to investigate" over two failed alerts is a false
+    // all-clear. The alerts wait inside their retry limit, so the row stays ok.
+    vi.mocked(getAutoTriageStatus).mockResolvedValue({
+      ...TRIAGE,
+      total: 0,
+      hunted: 0,
+      skipped: 2,
+      skipped_reasons: { retry_wait: 2 },
+    });
+    const first = mount();
+    await loaded();
+    expect(state('Continuous Auto-Investigate')).toBe('on');
+    expect(result('Continuous Auto-Investigate')).toHaveTextContent(
+      'The last run started no investigation. 2 failed alerts wait to retry.',
+    );
+    expect(result('Continuous Auto-Investigate').textContent).not.toContain('found no alert');
+    first.unmount();
+
+    vi.mocked(getAutoTriageStatus).mockResolvedValue({
+      ...TRIAGE,
+      total: 0,
+      hunted: 0,
+      skipped: 2,
+      skipped_reasons: { retry_wait: 1, retry_limit: 1 },
+    });
+    mount();
+    await loaded();
+    expect(state('Continuous Auto-Investigate')).toBe('failed');
+    expect(result('Continuous Auto-Investigate')).toHaveTextContent(
+      'The last run started no investigation. 1 failed alert waits to retry. 1 alert reached the retry limit.',
+    );
+  });
+});
+
 describe('StatusJobsPanel on the public demo', () => {
   it('names the demo as the reason a job is hidden, and never asks for an admin', async () => {
     // The demo refuses every admin read with reason demo_mode. No visitor can

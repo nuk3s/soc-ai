@@ -410,6 +410,212 @@ def test_host_ip_outranks_a_wire_dataset() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Endpoint-authored flows: an endpoint agent writes one document for each
+# connection and each DNS lookup. It stamps its own host.name and no host.ip,
+# so the name belongs to one end of the flow only: the local end.
+# ---------------------------------------------------------------------------
+
+_AGENT = "192.0.2.202"
+_TARGET = "192.0.2.164"
+_RESOLVER = "192.0.2.22"
+
+
+def _defend_flow(**extra: Any) -> dict[str, Any]:
+    """An endpoint network document with no host.ip and no observer."""
+    return {
+        "event.dataset": "endpoint.events.network",
+        "event.module": "endpoint",
+        "host.name": "ws-a",
+        "agent.type": "endpoint",
+        **extra,
+    }
+
+
+def test_an_endpoint_flow_document_names_its_local_end_only() -> None:
+    egress = _defend_flow(
+        **{
+            "network.direction": "egress",
+            "event.action": ["connection_attempted", "disconnect_received"],
+            "source.ip": _AGENT,
+            "source.port": 51544,
+            "destination.ip": _TARGET,
+            "destination.port": 8443,
+        }
+    )
+    assert fields.names_the_shipper(egress, "ws-a", _TARGET) is True
+    assert fields.names_the_shipper(egress, "ws-a", _AGENT) is False
+
+    ingress = _defend_flow(
+        **{
+            "network.direction": "ingress",
+            "event.action": ["connection_accepted"],
+            "source.ip": _TARGET,
+            "source.port": 40112,
+            "destination.ip": _AGENT,
+            "destination.port": 22,
+        }
+    )
+    assert fields.names_the_shipper(ingress, "ws-a", _TARGET) is True
+    assert fields.names_the_shipper(ingress, "ws-a", _AGENT) is False
+
+
+def test_a_perimeter_direction_places_neither_end() -> None:
+    """``outbound`` is a perimeter value. It does not say which end is the host."""
+    doc = _defend_flow(
+        **{"network.direction": "outbound", "source.ip": _AGENT, "destination.ip": _TARGET}
+    )
+    assert fields.names_the_shipper(doc, "ws-a", _AGENT) is True
+    assert fields.names_the_shipper(doc, "ws-a", _TARGET) is True
+
+
+def test_an_endpoint_flow_that_names_no_local_end_names_neither_end() -> None:
+    doc = _defend_flow(**{"source.ip": _AGENT, "destination.ip": _TARGET})
+    assert fields.names_the_shipper(doc, "ws-a", _AGENT) is True
+    assert fields.names_the_shipper(doc, "ws-a", _TARGET) is True
+
+
+def test_a_dns_lookup_names_the_end_off_port_53() -> None:
+    """In a lookup document the resolver on port 53 can sit in source.ip."""
+    requested = _defend_flow(
+        **{
+            "event.action": "lookup_requested",
+            "source.ip": _RESOLVER,
+            "source.port": 53,
+            "destination.ip": _AGENT,
+            "destination.port": 38319,
+        }
+    )
+    assert fields.names_the_shipper(requested, "ws-a", _RESOLVER) is True
+    assert fields.names_the_shipper(requested, "ws-a", _AGENT) is False
+
+    result = _defend_flow(
+        **{
+            "event.action": ["lookup_result"],
+            "source.ip": _AGENT,
+            "source.port": 41000,
+            "destination.ip": _RESOLVER,
+            "destination.port": 53,
+        }
+    )
+    assert fields.names_the_shipper(result, "ws-a", _RESOLVER) is True
+    assert fields.names_the_shipper(result, "ws-a", _AGENT) is False
+
+
+def test_a_lookup_with_no_port_53_end_places_nothing() -> None:
+    doc = _defend_flow(
+        **{
+            "event.action": "lookup_requested",
+            "source.ip": _AGENT,
+            "source.port": 41000,
+            "destination.ip": _RESOLVER,
+            "destination.port": 5353,
+        }
+    )
+    assert fields.names_the_shipper(doc, "ws-a", _AGENT) is True
+    assert fields.names_the_shipper(doc, "ws-a", _RESOLVER) is True
+
+
+def test_a_lookup_whose_direction_picks_the_port_53_end_places_nothing() -> None:
+    doc = _defend_flow(
+        **{
+            "network.direction": "egress",
+            "event.action": "lookup_requested",
+            "source.ip": _RESOLVER,
+            "source.port": 53,
+            "destination.ip": _AGENT,
+            "destination.port": 38319,
+        }
+    )
+    assert fields.local_end(doc) is None
+    assert fields.names_the_shipper(doc, "ws-a", _AGENT) is True
+    assert fields.names_the_shipper(doc, "ws-a", _RESOLVER) is True
+
+
+def test_local_end_reads_direction_and_refuses_a_contradiction() -> None:
+    assert fields.local_end({"network.direction": "egress"}) == "source.ip"
+    assert fields.local_end({"network.direction": "ingress"}) == "destination.ip"
+    assert fields.local_end({"network": {"direction": "Egress"}}) == "source.ip"
+    assert fields.local_end({"network.direction": ["egress", "ingress"]}) is None
+    assert fields.local_end({"network.direction": "outbound"}) is None
+    assert fields.local_end({}) is None
+
+
+def test_it_still_fails_open_when_the_ip_is_at_no_flow_end() -> None:
+    doc = _defend_flow(**{"source.ip": _AGENT, "destination.ip": _RESOLVER})
+    assert fields.names_the_shipper(doc, "ws-a", _TARGET) is False
+
+
+def test_the_flow_end_test_compares_addresses_not_spellings() -> None:
+    doc = _defend_flow(
+        **{
+            "network.direction": "egress",
+            "source.ip": "2001:db8::1",
+            "destination.ip": "2001:db8::a",
+        }
+    )
+    assert fields.names_the_shipper(doc, "ws-a", "2001:DB8::A") is True
+    assert fields.names_the_shipper(doc, "ws-a", "2001:DB8:0:0:0:0:0:1") is False
+
+
+def test_the_flow_end_test_reads_the_document_ends_in_any_spelling() -> None:
+    """The document spells its ends in a non-canonical form.
+
+    A raw compare finds the target at no end and fails open, so the target
+    gets the peer agent's name.
+    """
+    doc = _defend_flow(
+        **{
+            "network.direction": "egress",
+            "source.ip": "2001:DB8:0::1",
+            "destination.ip": "2001:DB8::A",
+        }
+    )
+    assert fields.names_the_shipper(doc, "ws-a", "2001:db8::a") is True
+
+
+def test_host_ip_compares_addresses_not_spellings() -> None:
+    doc = {"event.dataset": "system.syslog", "host.ip": ["2001:DB8::1"]}
+    assert fields.names_the_shipper(doc, "ws-a", "2001:db8::1") is False
+    assert fields.names_the_shipper(doc, "ws-a", "2001:db8::2") is True
+
+
+def test_an_ipv4_mapped_address_is_the_ipv4_address() -> None:
+    """Elasticsearch stores ``::ffff:a.b.c.d`` and ``a.b.c.d`` as one ip value.
+
+    A term query for the target therefore selects a document that spells an
+    end in the mapped form.
+    """
+    mapped_ends = _defend_flow(
+        **{
+            "network.direction": "ingress",
+            "source.ip": f"::ffff:{_TARGET}",
+            "destination.ip": f"::ffff:{_AGENT}",
+        }
+    )
+    assert fields.names_the_shipper(mapped_ends, "ws-a", _TARGET) is True
+    assert fields.names_the_shipper(mapped_ends, "ws-a", _AGENT) is False
+
+    plain_ends = _defend_flow(
+        **{"network.direction": "egress", "source.ip": _AGENT, "destination.ip": _TARGET}
+    )
+    assert fields.names_the_shipper(plain_ends, "ws-a", f"::ffff:{_TARGET}") is True
+    assert fields.names_the_shipper(plain_ends, "ws-a", f"::FFFF:{_AGENT}") is False
+
+    own = {"event.dataset": "system.syslog", "host.ip": [f"::ffff:{_AGENT}"]}
+    assert fields.names_the_shipper(own, "ws-a", _AGENT) is False
+    assert fields.names_the_shipper(own, "ws-a", _TARGET) is True
+
+
+def test_canonical_ip_gives_one_spelling_for_one_address() -> None:
+    assert fields.canonical_ip("2001:DB8:0:0::A") == "2001:db8::a"
+    assert fields.canonical_ip("::ffff:192.0.2.164") == "192.0.2.164"
+    assert fields.canonical_ip("::FFFF:C000:02A4") == "192.0.2.164"
+    assert fields.canonical_ip("192.0.2.164") == "192.0.2.164"
+    with pytest.raises(ValueError):
+        fields.canonical_ip("ws-a")
+
+
+# ---------------------------------------------------------------------------
 # dataset_of — a plane that lives only in data_stream.dataset is still a plane
 # ---------------------------------------------------------------------------
 

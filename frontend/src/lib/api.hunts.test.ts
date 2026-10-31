@@ -38,6 +38,23 @@ describe('promoteFinding', () => {
     await promoteFinding('a/b', 0);
     expect(url()).toBe('/api/v1/hunts/a%2Fb/findings/0/investigate');
   });
+
+  it('sends no body without the rerun option', async () => {
+    await promoteFinding('01HUNTX', 2);
+    expect(init().body).toBeUndefined();
+  });
+
+  it('sends rerun true in the JSON body for a Re-run of a finding run', async () => {
+    fetchMock = vi.fn(() => ok({ investigation_id: 'inv-2' }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await promoteFinding('01HUNTX', 2, { rerun: true });
+
+    expect(url()).toBe('/api/v1/hunts/01HUNTX/findings/2/investigate');
+    expect(init().method).toBe('POST');
+    expect(JSON.parse(String(init().body))).toEqual({ rerun: true });
+    expect(result).toEqual({ investigation_id: 'inv-2' });
+  });
 });
 
 // The Hunts screen sends `kind` when a chip other than All is active, so the

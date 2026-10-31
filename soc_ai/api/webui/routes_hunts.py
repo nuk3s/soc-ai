@@ -24,6 +24,7 @@ from soc_ai.api.hunt_runner import sse_encode as hunt_sse_encode
 from soc_ai.api.security import identify_caller
 from soc_ai.api.webui import action_rules
 from soc_ai.api.webui._errors import api_error
+from soc_ai.api.webui._event_timeline import EventTimelineOut, hunt_event_timeline
 from soc_ai.api.webui._shared import (
     _ago,
     _iso_utc,
@@ -258,6 +259,7 @@ from soc_ai.hunting.findings import (  # noqa: E402
 )
 from soc_ai.hunting.findings import finding_category as _finding_category  # noqa: E402
 from soc_ai.hunting.findings import hunt_outcome as _hunt_outcome  # noqa: E402
+from soc_ai.hunting.hunt_words import first_sentence as _first_sentence  # noqa: E402
 from soc_ai.hunting.hunt_words import hunt_title, is_operator_step, validator_note  # noqa: E402
 from soc_ai.hunting.step_words import (  # noqa: E402
     current_activity,
@@ -354,13 +356,26 @@ def _finding_run_status(link: Any, inv: Investigation | None) -> str | None:
     return _LINK_STATUS.get(str(link.state))
 
 
+def _run_answers(inv: Investigation) -> bool:
+    """Whether a run answers for its finding: it runs, or it holds a verdict.
+
+    The finding-card columns only. A pipeline fallback is a failed run.
+    """
+    if inv.status == "running":
+        return True
+    return inv.status == "complete" and inv.is_fallback is not True
+
+
 async def _finding_runs(db: Any, hunt: Hunt, *, state: Any = None) -> dict[int, _FindingRun]:
     """The investigation of each finding of one hunt, keyed by ordinal.
 
     Two sources. The hunt row names the run it opened or reused for each
     subject finding (``finding_investigations``). A run an analyst promoted
     names the hunt and the ordinal itself (:func:`inv_svc.latest_per_finding`).
-    The newer run wins, so a re-run of a failed finding replaces it on the page.
+    A run that answers, one that runs or holds a verdict, wins over a failed
+    run, so the page shows the run that the lead settle rule reads. Between
+    two runs that both answer or both failed, the newer run wins, so a re-run
+    of a failed finding replaces it on the page.
     ``state`` is the app state. The pending-action count reads the anchor
     check of :func:`routes_meta.pending_actions_by_run` through it.
     """
@@ -378,7 +393,9 @@ async def _finding_runs(db: Any, hunt: Hunt, *, state: Any = None) -> dict[int, 
         inv = newest.get(ordinal)
         other = linked.get(link.investigation_id or "") if link is not None else None
         if other is not None and (
-            inv is None or (other.created_at, other.id) > (inv.created_at, inv.id)
+            inv is None
+            or (_run_answers(other), other.created_at, other.id)
+            > (_run_answers(inv), inv.created_at, inv.id)
         ):
             inv = other
         chosen[ordinal] = (link, inv)
@@ -573,6 +590,12 @@ class HuntOut(BaseModel):
     # The investigations of the subject findings. See HuntRowOut.
     findingsInvestigated: int = 0
     findingsTotal: int = 0
+    # The documents the findings cite, in event-time order, with the waves
+    # (change D). Built by ``_event_timeline.hunt_event_timeline`` from the
+    # stored tool results. The step timeline above keeps tool-call order. None
+    # while the hunt runs, and when fewer than two cited documents have a
+    # stored time.
+    eventTimeline: EventTimelineOut | None = None
 
 
 _HUNT_STATUS = {
@@ -800,6 +823,29 @@ def _event_time(payload: dict[str, Any]) -> str:
     return at.strftime("%H:%M:%S")
 
 
+def _objective_detail(p: dict[str, Any]) -> str:
+    """The Objective step: the objective, then the earlier conclusions the hunt read.
+
+    The source records of the earlier conclusions follow, by type and id, for
+    the analyst. The model never reads the ids. A block the redaction dropped
+    is named, so the step never shows text the model did not read.
+    """
+    from soc_ai.hunting import earlier  # noqa: PLC0415 - lazy, like the other hunt reads
+
+    parts = [str(p.get("objective") or "")]
+    block = p.get("earlier")
+    if isinstance(block, str) and block:
+        parts.append(block)
+    refs = p.get("earlier_refs")
+    if isinstance(refs, dict) and refs:
+        sentence = earlier.refs_sentence(refs)
+        if sentence:
+            parts.append(sentence)
+    if p.get("earlier_dropped"):
+        parts.append(earlier.DROPPED_SENTENCE)
+    return "\n\n".join(parts)
+
+
 def _build_hunt_timeline(
     events: list[HuntEvent], hunt_status: str = "running"
 ) -> list[TimelineStepOut]:
@@ -870,7 +916,7 @@ def _build_hunt_timeline(
             # The whole objective. The step opens on a click, and a lead
             # objective past 400 characters was cut here with an ellipsis.
             title = "Objective"
-            detail = str(p.get("objective") or "")
+            detail = _objective_detail(p)
         elif e.kind == "hunt_report":
             findings = p.get("findings") or []
             n = len(findings) if isinstance(findings, list) else 0
@@ -1322,6 +1368,10 @@ async def get_hunt(request: Request, hunt_id: str) -> HuntOut:
         typicalRun=typical,
         findingsInvestigated=counts.investigated,
         findingsTotal=counts.total,
+        # The same dict-only list HuntOut.findings numbers, so the ordinals match.
+        eventTimeline=hunt_event_timeline(
+            events, [f for f in findings if isinstance(f, dict)], hunt.status
+        ),
     )
 
 
@@ -1982,8 +2032,9 @@ async def start_hunt(
         # Promotion already owns this doc as a finding's anchor — an ad-hoc
         # POST /hunt against the same alert_id would mint an unlabeled
         # kind='suricata' duplicate and re-enable SO writes on an event a
-        # promoted finding already claims. Re-promotion from the hunt page is
-        # the sanctioned re-run (mirrors bulk_rehunt/request_more_info, 4fbe8132).
+        # promoted finding already claims. Re-run on the finding's
+        # investigation (the promote route with rerun) is the sanctioned
+        # re-run (mirrors bulk_rehunt/request_more_info, 4fbe8132).
         # An alert_id promotion never touched (existing is None, or its latest
         # row isn't kind='hunt') is unaffected — this only fires once
         # promotion owns the latest row for the doc. A real alert reruns.
@@ -1995,7 +2046,7 @@ async def start_hunt(
                 "reason": "hunt_kind_no_rerun",
                 "hint": (
                     "This event is a promoted finding's anchor. "
-                    "Re-promote the finding from its hunt."
+                    f"{finding_promotion.FINDING_RERUN_HINT}"
                 ),
             }
         )
@@ -2069,7 +2120,10 @@ async def _hunt_subject_for(
     lead_id: int | None = None,
     related_leads: Sequence[dict[str, Any]] | None = None,
 ) -> HuntSubject:
-    """Build the subject of a promoted investigation: the hunt as a whole.
+    """Build the subject of a promoted investigation.
+
+    A finding promotion judges the claim of that finding, and the rest of the
+    hunt is context. A lead promotion judges the hunt.
 
     One grid read, under the same timeout and with the same grid-failure
     answers as the anchor resolution, so a promotion has one refusal shape.
@@ -2120,15 +2174,47 @@ async def _start_promotion(
 
     ``subject`` (D2) carries the hunt. The run reads the hunt's objective, its
     findings and every document they cite. The anchor is still one document,
-    because the pipeline anchors its time windows on one timestamp, but the
-    subject of the verdict is the hunt.
+    because the pipeline anchors its time windows on one timestamp. A finding
+    promotion judges the claim of that finding, and a lead promotion judges
+    the hunt.
 
     The work is the promotion service's (:mod:`soc_ai.webui.finding_promotion`),
     which the hunt runner shares. This wrapper gives its refusals and the grid
     failures their HTTP answers.
     """
+    anchor_id = await _promotion_anchor(
+        settings=settings, elastic=elastic, citations=citations, subject=subject
+    )
+    return await _start_on_anchor(
+        request,
+        anchor_id=anchor_id,
+        started_by=started_by,
+        title=title,
+        detail=detail,
+        hosts=hosts,
+        kind=kind,
+        hunt_id=hunt_id,
+        finding_ordinal=finding_ordinal,
+        focus_origin=focus_origin,
+        is_synth_eval=is_synth_eval,
+        subject=subject,
+    )
+
+
+async def _promotion_anchor(
+    *,
+    settings: Settings,
+    elastic: ElasticClient,
+    citations: list[str],
+    subject: HuntSubject | None,
+) -> str:
+    """The anchor of a promotion, with the HTTP answers of :func:`_start_promotion`.
+
+    The first half of :func:`_start_promotion`. It reads the grid, so the
+    finding route runs it before it takes the start lock.
+    """
     try:
-        anchor_id = await finding_promotion.promotion_anchor(
+        return await finding_promotion.promotion_anchor(
             settings=settings, elastic=elastic, citations=citations, subject=subject
         )
     except (TimeoutError, TransportError) as exc:
@@ -2137,6 +2223,24 @@ async def _start_promotion(
         raise _es_api_error_http(exc) from exc
     except finding_promotion.PromotionRefused as exc:
         raise api_error(exc.status, exc.reason, exc.hint) from exc
+
+
+async def _start_on_anchor(
+    request: Request,
+    *,
+    anchor_id: str,
+    started_by: str,
+    title: str,
+    detail: str,
+    hosts: list[str],
+    kind: str,
+    hunt_id: str | None,
+    finding_ordinal: int | None,
+    focus_origin: FocusOrigin,
+    is_synth_eval: bool,
+    subject: HuntSubject | None,
+) -> str:
+    """Start the promotion on its anchor. The second half of :func:`_start_promotion`."""
     try:
         return await finding_promotion.start_promotion(
             request.app.state,
@@ -2165,11 +2269,13 @@ def promoted_finding_out(inv: Investigation, hunt: Hunt | None) -> dict[str, Any
     investigations list read "10.99.0.30 → 10.99.0.40" with the victim first,
     because the anchor alert was the server's response. A finding that names
     no end of the flow leaves the attacker out. None when no finding promoted
-    the run or the hunt is gone.
+    the run. When the hunt is gone, the stored subject names the finding.
     """
     ordinal = getattr(inv, "finding_ordinal", None)
-    if hunt is None or ordinal is None:
+    if ordinal is None:
         return None
+    if hunt is None:
+        return _promoted_finding_from_subject(inv, int(ordinal))
     findings = _hunt_report(hunt).get("findings") or []
     if not (0 <= int(ordinal) < len(findings)) or not isinstance(findings[ordinal], dict):
         return None
@@ -2199,21 +2305,161 @@ def promoted_finding_out(inv: Investigation, hunt: Hunt | None) -> dict[str, Any
     }
 
 
+def _promoted_finding_from_subject(inv: Investigation, ordinal: int) -> dict[str, Any] | None:
+    """The finding of a run whose hunt an admin deleted, from the stored subject.
+
+    The subject record keeps the ordinal and the title of each finding, so the
+    page still names the finding that the run judged. The record keeps no
+    hosts, so the page shows no direction. None when the record does not name
+    the ordinal.
+    """
+    subject = getattr(inv, "subject_json", None)
+    if not isinstance(subject, dict) or subject.get("type") != "hunt":
+        return None
+    ordinals = subject.get("finding_ordinals")
+    titles = subject.get("finding_titles")
+    if not isinstance(ordinals, list) or not isinstance(titles, list):
+        return None
+    try:
+        index = ordinals.index(ordinal)
+    except ValueError:
+        return None
+    if index >= len(titles):
+        return None
+    objective = str(subject.get("objective") or "")
+    return {
+        "ordinal": ordinal,
+        "label": f"F{ordinal + 1}",
+        "title": str(titles[index] or ""),
+        "hosts": [],
+        "attacker": None,
+        "victim": None,
+        "huntId": str(subject.get("hunt_id") or getattr(inv, "hunt_id", None) or ""),
+        "huntTitle": objective_headline(objective) if objective else "",
+    }
+
+
+class _FindingAnswer(NamedTuple):
+    """The run that answers a press on a finding, and the finding's entry."""
+
+    run: Investigation | None
+    link: hunt_svc.FindingLink | None
+
+
+async def _finding_answer(
+    db: Any,
+    *,
+    hunt: Hunt,
+    ordinal: int,
+    finding: dict[str, Any],
+    rerun: bool,
+    is_synth_eval: bool,
+) -> _FindingAnswer:
+    """The run that answers a press on the finding, or no run.
+
+    Without ``rerun``: a running or complete run of this exact finding, else
+    the running or complete run the hunt links to the finding, else a running
+    or complete run of another hunt with the same subject fingerprint from
+    the last seven days. An errored or cancelled run frees the slot (the
+    re-hunt guard of POST /hunt).
+
+    With ``rerun``: only a run of this finding that still runs, or a running
+    run the hunt links to the finding. A second run beside it is a duplicate.
+    A run that ended, and a run of another hunt, stay as records.
+    """
+    existing = await inv_svc.latest_for_finding(db, hunt.id, ordinal)
+    link = hunt_svc.finding_links(hunt).get(ordinal)
+    linked = (
+        await db.get(Investigation, link.investigation_id)
+        if link is not None and link.investigation_id
+        else None
+    )
+    if rerun:
+        if existing is None or existing.status != "running":
+            existing = linked if linked is not None and linked.status == "running" else None
+    elif existing is None or not inv_svc.blocks_rehunt(existing):
+        if linked is not None and inv_svc.blocks_rehunt(linked):
+            existing = linked
+        else:
+            same = await inv_svc.reusable_for_subject(
+                db,
+                alert_id=None,
+                fingerprint=subject_fingerprint(finding),
+                is_synth_eval=is_synth_eval,
+                # Change E. A sibling finding of this hunt makes another
+                # claim, so its run never answers for this finding.
+                exclude_hunt_id=hunt.id,
+            )
+            if same is not None:
+                existing = same
+    if existing is not None and inv_svc.blocks_rehunt(existing):
+        return _FindingAnswer(existing, link)
+    return _FindingAnswer(None, link)
+
+
+async def _answer_press(
+    request: Request,
+    hunt_id: str,
+    ordinal: int,
+    run: Investigation,
+    link: hunt_svc.FindingLink | None,
+    *,
+    has_plan: bool,
+) -> dict[str, Any]:
+    """Return the run that answers a press, and name it on the hunt row.
+
+    The run answers for the finding, so a finding the hunt planned for names
+    it on the hunt row, the way the hunt phase records a reuse. The hunt page
+    and the lead settle rule read that entry. Without it, a held lead stayed
+    held on each press of the documented remedy.
+    """
+    if has_plan and (link is None or link.investigation_id != run.id):
+        own = run.hunt_id == hunt_id and run.finding_ordinal == ordinal
+        await hunt_findings.record_link(
+            request.app.state,
+            hunt_id,
+            ordinal,
+            hunt_svc.LINK_INVESTIGATING if run.status == "running" else hunt_svc.LINK_ENDED,
+            investigation_id=run.id,
+            origin=hunt_svc.ORIGIN_MANUAL if own else hunt_svc.ORIGIN_REUSED,
+        )
+    return {"investigation_id": run.id, "existing": True}
+
+
+class PromoteFindingIn(BaseModel):
+    """The options of a finding promotion.
+
+    ``rerun`` asks for a new run of the finding. The route then starts a new
+    run over a run that ended. A run of the finding that still runs answers.
+    """
+
+    rerun: bool = False
+
+
 @router.post("/hunts/{hunt_id}/findings/{ordinal}/investigate")
 async def promote_finding(
     request: Request,
     hunt_id: str,
     ordinal: int,
+    body: PromoteFindingIn | None = None,
     settings: Settings = Depends(get_settings_dep),
     elastic: ElasticClient = Depends(get_elastic),
 ) -> dict[str, Any]:
-    """Promote one hunt finding into a full investigation of the hunt.
+    """Promote one hunt finding into an investigation of that finding.
 
-    The finding is the reason the analyst pressed the button and its documents
-    are read first, but the subject is the hunt: its objective, all of its
-    findings and every document they cite. Idempotent: while a promotion for
-    this exact finding is running or landed a verdict, re-posting returns it;
-    only an errored/cancelled one frees the slot.
+    The investigation judges the claim of the finding. The rest of the hunt
+    is context: its objective, the other findings and every document they
+    cite. Idempotent: while a promotion for this exact finding is running or
+    landed a verdict, re-posting returns it; only an errored/cancelled one
+    frees the slot. A run of another hunt with the same subject fingerprint
+    answers too. A run of a sibling finding of this hunt does not.
+
+    ``{"rerun": true}`` is the Re-run of the investigation page. A run of
+    this finding that still runs answers, and so does a running run the hunt
+    links to the finding: a second run beside it is a duplicate. Every other
+    run stays as a record, and a new run starts through the same promotion
+    path. A finished needs_more_info run blocked each new run of its finding
+    before this flag, and Request more info refuses a finding run.
 
     ``ordinal`` is the finding's index into ``hunt.report["findings"]`` — the
     FastAPI ``int`` path convertor already refuses a negative segment with a
@@ -2221,6 +2467,7 @@ async def promote_finding(
     has to catch a positive ordinal past the end of the list.
     """
     started_by = await identify_caller(request)
+    rerun = body is not None and body.rerun
     async with request.app.state.db_sessionmaker() as db:
         hunt = await db.get(Hunt, hunt_id)
         if hunt is None:
@@ -2259,33 +2506,18 @@ async def promote_finding(
             await db.execute(select(Lead).where(Lead.hunt_id == hunt_id).limit(1))
         ).scalar_one_or_none()
         lead_id: int | None = int(lead_row.id) if lead_row is not None else None
-        # Idempotency probe: a running or already-complete promotion of this
-        # exact finding is returned as-is; only an error/cancelled one frees
-        # the slot for a fresh promotion (mirrors POST /hunt's re-hunt guard).
-        existing = await inv_svc.latest_for_finding(db, hunt_id, ordinal)
-        # One investigation per subject. The finding's entry on the hunt names
-        # the run the hunt opened or reused for it, and a run of the same
-        # subject from the last seven days answers for it too.
-        if existing is None or not inv_svc.blocks_rehunt(existing):
-            link = hunt_svc.finding_links(hunt).get(ordinal)
-            linked = (
-                await db.get(Investigation, link.investigation_id)
-                if link is not None and link.investigation_id
-                else None
-            )
-            if linked is not None and inv_svc.blocks_rehunt(linked):
-                existing = linked
-            else:
-                same = await inv_svc.reusable_for_subject(
-                    db,
-                    alert_id=None,
-                    fingerprint=subject_fingerprint(finding),
-                    is_synth_eval=hunt_is_synth_eval,
-                )
-                if same is not None:
-                    existing = same
-    if existing is not None and inv_svc.blocks_rehunt(existing):
-        return {"investigation_id": existing.id, "existing": True}
+        answer = await _finding_answer(
+            db,
+            hunt=hunt,
+            ordinal=ordinal,
+            finding=finding,
+            rerun=rerun,
+            is_synth_eval=hunt_is_synth_eval,
+        )
+    if answer.run is not None:
+        return await _answer_press(
+            request, hunt_id, ordinal, answer.run, answer.link, has_plan=hunt_has_plan
+        )
 
     citations = finding.get("citations")
     if not isinstance(citations, list):
@@ -2307,27 +2539,51 @@ async def promote_finding(
     # The row keeps the subject's fingerprint, so a later hunt that finds the
     # same subject reuses this run.
     subject = subject.model_copy(update={"subject_fingerprint": subject_fingerprint(finding)})
-    inv_id = await _start_promotion(
-        request,
-        settings=settings,
-        elastic=elastic,
-        started_by=started_by,
-        title=str(finding.get("title") or "Hunt finding"),
-        detail=str(finding.get("detail") or ""),
-        hosts=[str(h) for h in (finding.get("hosts") or [])],
-        citations=citations,
-        kind="hunt",
-        hunt_id=hunt_id,
-        finding_ordinal=ordinal,
-        focus_origin="hunt_finding",
-        subject=subject,
-        # Inherit the source hunt's synth-eval marker (migration 0032): a
-        # finding a synth-eval hunt surfaced is planted evidence, and its
-        # promoted investigation must stay marked as such forever.
-        is_synth_eval=hunt_is_synth_eval,
+    anchor_id = await _promotion_anchor(
+        settings=settings, elastic=elastic, citations=citations, subject=subject
     )
-    # A finding the hunt planned for, past the cap or after a failed run,
-    # now names the analyst's run on the hunt row.
+    # The grid reads above take seconds, and a second press on the finding can
+    # start in that time: two tabs, an API client, a press after the client
+    # timeout. The second check and the start run under the lock of the hunt
+    # phase, so the second press reads the run of the first one. The entry
+    # write below takes the same lock, so it runs after the lock is free.
+    async with hunt_findings.start_lock(request.app.state):
+        async with request.app.state.db_sessionmaker() as db:
+            current = await db.get(Hunt, hunt_id)
+            if current is None:
+                raise HTTPException(status_code=404, detail={"reason": "not_found"})
+            answer = await _finding_answer(
+                db,
+                hunt=current,
+                ordinal=ordinal,
+                finding=finding,
+                rerun=rerun,
+                is_synth_eval=hunt_is_synth_eval,
+            )
+        if answer.run is None:
+            inv_id = await _start_on_anchor(
+                request,
+                anchor_id=anchor_id,
+                started_by=started_by,
+                title=str(finding.get("title") or "Hunt finding"),
+                detail=str(finding.get("detail") or ""),
+                hosts=[str(h) for h in (finding.get("hosts") or [])],
+                kind="hunt",
+                hunt_id=hunt_id,
+                finding_ordinal=ordinal,
+                focus_origin="hunt_finding",
+                subject=subject,
+                # Inherit the source hunt's synth-eval marker (migration 0032): a
+                # finding a synth-eval hunt surfaced is planted evidence, and its
+                # promoted investigation must stay marked as such forever.
+                is_synth_eval=hunt_is_synth_eval,
+            )
+    if answer.run is not None:
+        return await _answer_press(
+            request, hunt_id, ordinal, answer.run, answer.link, has_plan=hunt_has_plan
+        )
+    # A finding the hunt planned for, past the cap, after a failed run or on
+    # a re-run, now names the analyst's run on the hunt row.
     if hunt_has_plan:
         await hunt_findings.record_link(
             request.app.state,
@@ -3149,8 +3405,8 @@ class LeadDetailOut(LeadOut):
     # promotion, the close by a clean hunt, and a hold.
     decisions: list[LeadDecisionOut] = []
     # Why a finished hunt did not close the lead, when the settle rule held
-    # it: ``partial_read`` or ``earlier_threat``. ``hold_sentence`` is the
-    # line the page prints.
+    # it: ``partial_read``, ``earlier_threat``, ``lead_link`` or ``no_verdict``.
+    # ``hold_sentence`` is the line the page prints.
     hold_reason: str | None = None
     hold_sentence: str | None = None
     # The open leads this one shares an analytic, an external network or a
@@ -3519,26 +3775,6 @@ def _hunt_finds_a_threat(hunt: Hunt) -> bool:
 def _hunt_tally(hunts: Sequence[Hunt]) -> tuple[int, int]:
     """How many hunts a lead has on record, and how many of them found a threat."""
     return len(hunts), sum(1 for h in hunts if _hunt_finds_a_threat(h))
-
-
-# The end of a sentence: a stop, then space, then a capital, a digit or a quote.
-# "e.g. the host" and an address such as 10.1.2.3 do not end one.
-_SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(\[])")
-
-
-def _first_sentence(text: str) -> str:
-    """The first sentence of a narrative as plain text, whole.
-
-    A heading line goes, and so do the emphasis marks and a list bullet. The
-    sentence is never cut. The console wraps a long one.
-    """
-    lines = [ln for ln in (text or "").splitlines() if not ln.lstrip().startswith("#")]
-    plain = re.sub(r"[*`]+", "", "\n".join(lines))
-    plain = re.sub(r"^\s*[-+]\s+", "", plain, flags=re.MULTILINE)
-    plain = " ".join(plain.split())
-    if not plain:
-        return ""
-    return _SENTENCE_END.split(plain, maxsplit=1)[0]
 
 
 def _gap_sentences(hunt: Hunt, limit: int = 3) -> list[str]:

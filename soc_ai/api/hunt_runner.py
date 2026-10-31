@@ -19,7 +19,7 @@ import json
 import logging
 import uuid
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import UsageLimitExceeded
@@ -42,6 +42,7 @@ from soc_ai.agent.hunt_gates import (
     _validate_hunt_charts,
     _validate_hunt_findings,
     gate_host_gaps,
+    gate_lead_links,
 )
 from soc_ai.agent.models import build_investigator_model
 from soc_ai.agent.orchestrator import InvestigationContext, StepEvent, _walk_message
@@ -57,11 +58,18 @@ from soc_ai.store import grid_gaps
 from soc_ai.store import hunts as hunt_svc
 from soc_ai.webui import hunt_findings
 
+if TYPE_CHECKING:
+    from soc_ai.hunting.earlier import EarlierConclusions
+
 _LOGGER = logging.getLogger(__name__)
 
 
 async def _build_hunt_run(
-    ctx: InvestigationContext, *, objective: str, prior: str | None
+    ctx: InvestigationContext,
+    *,
+    objective: str,
+    prior: str | None,
+    earlier: str | None = None,
 ) -> tuple[EgressGuard | None, Agent[None, HuntReport], str]:
     """Compose the (guard, agent, user message) triple for one hunt run.
 
@@ -71,6 +79,11 @@ async def _build_hunt_run(
     inventory + host dossier) and the user message (objective + prior-hunt
     summary) are sanitized here — they are the hunt's prompt-side egress
     boundary.
+
+    ``earlier`` is the earlier-conclusions block that :func:`_vetted_earlier`
+    kept. It follows the objective in the user message, so the sanitize pass
+    and the residue sweep over the user message cover it. The hosts it names
+    go to the dossier with their own label.
     """
     guard = await _egress_guard_for(ctx)
     # The hunt agent runs OQL — append the primer so it writes VALID queries
@@ -85,7 +98,7 @@ async def _build_hunt_run(
     # below — appending it after the sweep would send the network's hostnames and
     # addresses to a cloud model in the clear.
     inventory = await inventory_prompt_block(ctx.elastic, ctx.settings)
-    dossier = await _objective_dossier_block(ctx, objective, prior)
+    dossier = await _objective_dossier_block(ctx, objective, prior, earlier)
     # The grid gaps of the last 30 days, one fact line each. A hunt over the
     # range outage reported zero counts as facts (dogfood 2026-10-19, R3-D3).
     gap_lines = await grid_gaps.recent_fact_lines(ctx.db_sessionmaker)
@@ -97,7 +110,7 @@ async def _build_hunt_run(
         + gaps
         + dossier
     )
-    user_msg = build_hunt_prompt(objective, prior=prior)
+    user_msg = build_hunt_prompt(objective, prior=prior, earlier=earlier)
     if guard is not None:
         # The objective is analyst-typed free text that may name internal
         # hosts, and the inventory block carries grid dataset detail.
@@ -122,7 +135,7 @@ async def _build_hunt_run(
 
 
 async def _objective_dossier_block(
-    ctx: InvestigationContext, objective: str, prior: str | None
+    ctx: InvestigationContext, objective: str, prior: str | None, earlier: str | None = None
 ) -> str:
     """The host-dossier block for the addresses the hunt's own brief names.
 
@@ -140,13 +153,45 @@ async def _objective_dossier_block(
     type an address that was never observed, and a rendered "no dossier" line
     would put it into the hunt's own prompt as though it were an asset. Only
     hosts the sweep knows are described.
+
+    The hosts that only the ``earlier`` block names follow, with their own
+    label. An earlier conclusion is a claim, and the label keeps the hunt
+    from reading such a host as part of its objective.
     """
     named = internal_ips_in_text(f"{objective}\n{prior or ''}", ctx.settings)
-    if not named:
+    seen = set(named)
+    extra = [ip for ip in internal_ips_in_text(earlier or "", ctx.settings) if ip not in seen]
+    if not named and not extra:
         return ""
-    return await host_dossier_prompt_block(
-        {ip: "named in the objective" for ip in named}, ctx=ctx, known_only=True
-    )
+    hosts = {ip: "named in the objective" for ip in named}
+    hosts.update(dict.fromkeys(extra, "named in an earlier conclusion"))
+    return await host_dossier_prompt_block(hosts, ctx=ctx, known_only=True)
+
+
+async def _vetted_earlier(
+    ctx: InvestigationContext, earlier: EarlierConclusions | None
+) -> tuple[str | None, bool]:
+    """The earlier-conclusions text the hunt may read, and whether it was dropped.
+
+    The block carries stored model text, desanitized at rest. With redaction
+    on and fail-closed, a block that holds a name the redaction cannot remove
+    is dropped, and the hunt runs without it. A residue error here would fail
+    every later run of the same subject closed, because the same stored text
+    comes back each time. The log line gives the count only, never the names.
+    """
+    if earlier is None:
+        return None, False
+    guard = await _egress_guard_for(ctx)
+    if guard is not None and ctx.settings.analyst_redaction_fail_closed is True:
+        leaked = guard.residue(guard.sanitize_text(earlier.text))
+        if leaked:
+            _LOGGER.warning(
+                "hunt: the earlier conclusions held %d internal names that the redaction "
+                "could not remove. The hunt starts without them.",
+                len(leaked),
+            )
+            return None, True
+    return earlier.text, False
 
 
 async def _egress_guard_for(ctx: InvestigationContext) -> EgressGuard | None:
@@ -326,6 +371,7 @@ async def run_hunt(  # noqa: PLR0915 - one linear streaming flow, like the triag
     objective: str,
     prior: str | None = None,
     session_id: str | None = None,
+    earlier: EarlierConclusions | None = None,
 ) -> AsyncIterator[StepEvent]:
     """Stream a chat-driven hunt as StepEvents.
 
@@ -336,6 +382,11 @@ async def run_hunt(  # noqa: PLR0915 - one linear streaming flow, like the triag
     - ``tool_call`` / ``tool_result`` / ``model_response`` — the live trace;
     - ``hunt_report`` — the final HuntReport (or an ``error`` event on failure);
     - ``done`` — a small terminal marker with the finding count.
+
+    ``earlier`` is the earlier-conclusions block (:mod:`soc_ai.hunting.earlier`).
+    ``hunt_started`` records its source records, the text the model reads, or
+    the drop (:func:`_vetted_earlier`), so the event never shows text the model
+    did not read.
     """
     sid = session_id or uuid.uuid4().hex[:12]
     sequence = 0
@@ -345,12 +396,22 @@ async def run_hunt(  # noqa: PLR0915 - one linear streaming flow, like the triag
         sequence += 1
         return StepEvent(kind=kind, session_id=sid, sequence=sequence, payload=payload)
 
-    yield _ev("hunt_started", {"objective": objective})
+    earlier_text, earlier_dropped = await _vetted_earlier(ctx, earlier)
+    started: dict[str, Any] = {"objective": objective}
+    if earlier is not None:
+        started["earlier_refs"] = {k: list(v) for k, v in earlier.refs.items()}
+    if earlier_text is not None:
+        started["earlier"] = earlier_text
+    if earlier_dropped:
+        started["earlier_dropped"] = "residue"
+    yield _ev("hunt_started", started)
 
     # Guard (opt-in cloud-egress redaction) + agent + sanitized prompts. The
     # guard is attached to ctx BEFORE the agent is built so the toolset wraps
     # the tool closures at registration time.
-    guard, agent, user_msg = await _build_hunt_run(ctx, objective=objective, prior=prior)
+    guard, agent, user_msg = await _build_hunt_run(
+        ctx, objective=objective, prior=prior, earlier=earlier_text
+    )
     # Hunts get a bigger budget than a single-alert investigation — they explore
     # broadly (many hosts/queries) before synthesizing, and the investigation-sized
     # request_limit ran out mid-hunt, erroring before the findings report.
@@ -828,12 +889,21 @@ def _gate_hunt_citations(
     ``citation_validation`` emission. Fail-soft: a validator surprise must never
     cost the hunt its report — on error the unvalidated report is returned with a
     ``None`` event.
+
+    The lead-link gate runs last, over the validated findings (change E): a
+    threat whose title links leads becomes an observation, and its note says
+    why. The event carries ``lead_links``, the count the lead store reads to
+    keep such a lead from a clean close.
     """
     try:
         validated_findings, counts = _validate_hunt_findings(report.findings, tool_results)
+        validated_findings, lead_links = gate_lead_links(validated_findings)
         kept_charts, chart_counts = _validate_hunt_charts(report.charts, tool_results)
         report = report.model_copy(update={"findings": validated_findings, "charts": kept_charts})
-        return report, ev_factory("citation_validation", {"round": 1, **counts, **chart_counts})
+        return report, ev_factory(
+            "citation_validation",
+            {"round": 1, **counts, **chart_counts, "lead_links": lead_links},
+        )
     except Exception:
         _LOGGER.warning("hunt citation gate failed; persisting unvalidated report", exc_info=True)
         return report, None
@@ -884,12 +954,16 @@ async def hunt_recorded_run(
     starter: str = "analyst",
     lead_id: int | None = None,
     cancel_token: CancelToken | None = None,
+    earlier: EarlierConclusions | None = None,
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
     """Wrap :func:`run_hunt` with the hunt recorder tee.
 
     Yields ``(event_name, data_dict)`` pairs. The leading ``hunt_created`` event
     (carrying the new row id) is always first. Mirrors
     :func:`soc_ai.api.runner.recorded_run`.
+
+    ``earlier`` is the earlier-conclusions block, passed to :func:`run_hunt`.
+    The stored objective does not change.
     """
     recorder = HuntRecorder(
         state.db_sessionmaker,
@@ -922,7 +996,7 @@ async def hunt_recorded_run(
     # hunt covered nothing.
     grid_blind = False
     try:
-        async for ev in run_hunt(ctx, objective=objective, prior=prior):
+        async for ev in run_hunt(ctx, objective=objective, prior=prior, earlier=earlier):
             if ev.kind == "done" and ev.payload.get("degraded"):
                 grid_blind = True
             await recorder.record(ev.kind, ev.sequence, ev.payload)

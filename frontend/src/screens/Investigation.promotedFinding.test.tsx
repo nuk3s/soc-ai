@@ -2,9 +2,21 @@
 // hunting C4). The page read as a hunt of the whole lead, marked no finding,
 // and showed the raw model prompt as the objective. The control: a hunt
 // subject with no promoted finding keeps its objective open.
+//
+// Change E (2026-10-30): a new finding run judges the claim of its finding,
+// and the record says so with `judges: 'finding'`. Its page names the finding
+// as the subject and the hunt as context. A row stored before the change
+// judged the whole hunt and keeps the old labels.
 import { fireEvent, render, screen, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { describe, expect, it, vi } from 'vitest';
+import {
+  CHIP_SUBJECT_HUNT,
+  SUBJECT_FINDING,
+  SUBJECT_HUNT_CONTEXT,
+  SUBJECT_OBJECTIVE,
+  SUBJECT_OBJECTIVE_CONTEXT,
+} from '../lib/tooltips';
 import type { Investigation as Inv } from '../lib/types';
 
 vi.mock('../lib/api', async (importOriginal) => ({
@@ -70,11 +82,64 @@ const mount = (i: Inv) =>
     </MemoryRouter>,
   );
 
+const judged = (): Inv => inv({ subject: { ...inv().subject!, judges: 'finding' } });
+
+describe('an investigation that judges one finding', () => {
+  it('names the finding as the subject when the run judges it', () => {
+    mount(judged());
+    expect(screen.getByTestId('promoted-finding').textContent).toContain(
+      'Subject: F2, HTTP service executes id command as root',
+    );
+    expect(screen.getByText('Context: hunt').getAttribute('title')).toBe(SUBJECT_HUNT_CONTEXT);
+    expect(screen.queryByText('Subject: hunt')).toBeNull();
+    expect(screen.getByTestId('subject-promoted').textContent).toBe('subject');
+    expect(screen.getByTestId('verdict-subject').getAttribute('title')).toBe(SUBJECT_FINDING);
+    fireEvent.click(screen.getByTestId('show-objective'));
+    expect(screen.getByText(PROMPT).getAttribute('title')).toBe(SUBJECT_OBJECTIVE_CONTEXT);
+  });
+
+  it('names the finding after an admin deleted the hunt', () => {
+    // The API reads the finding from the stored subject: the ordinal and the
+    // title, with no hosts, no detail and no evidence (routes_hunts
+    // _promoted_finding_from_subject). The page named no finding before.
+    mount(
+      inv({
+        subject: { ...inv().subject!, judges: 'finding' },
+        promotedFinding: {
+          ordinal: 1,
+          label: 'F2',
+          title: 'HTTP service executes id command as root',
+          hosts: [],
+          attacker: null,
+          victim: null,
+          huntId: 'H1',
+          huntTitle: 'Command execution on the web server',
+        },
+      }),
+    );
+    expect(screen.getByTestId('promoted-finding').textContent).toBe(
+      'Subject: F2, HTTP service executes id command as root',
+    );
+    expect(screen.getByTestId('verdict-subject').textContent).toBe(
+      'F2, HTTP service executes id command as root',
+    );
+    expect(screen.getByTestId('verdict-subject').getAttribute('title')).toBe(SUBJECT_FINDING);
+    expect(screen.getByTestId('subject-promoted').textContent).toBe('subject');
+    expect(screen.queryByTestId('promoted-direction')).toBeNull();
+    expect(screen.queryByTestId('promoted-hosts')).toBeNull();
+    expect(screen.queryByTestId('promoted-evidence')).toBeNull();
+  });
+});
+
 describe('a promoted investigation', () => {
   it('names the finding first, with its evidence and its direction', () => {
+    // A legacy row: no `judges` key. The run judged the whole hunt.
     mount(inv());
     const panel = screen.getByTestId('promoted-finding');
     expect(panel.textContent).toContain('Promoted finding: F2, HTTP service executes id command as root');
+    expect(screen.getByText('Subject: hunt').getAttribute('title')).toBe(CHIP_SUBJECT_HUNT);
+    expect(screen.getByTestId('subject-promoted').textContent).toBe('promoted');
+    expect(screen.getByTestId('verdict-subject').getAttribute('title')).toBe(SUBJECT_OBJECTIVE);
     expect(within(screen.getByTestId('promoted-direction')).getAllByTestId('entity-link').map((a) => a.textContent)).toEqual([
       '198.51.100.30',
       '192.0.2.40',
@@ -104,5 +169,6 @@ describe('a promoted investigation', () => {
     expect(screen.queryByTestId('promoted-finding')).toBeNull();
     expect(screen.queryByTestId('show-objective')).toBeNull();
     expect(screen.getAllByText(PROMPT).length).toBeGreaterThan(0);
+    expect(screen.getByText('Subject: hunt')).toBeTruthy();
   });
 });

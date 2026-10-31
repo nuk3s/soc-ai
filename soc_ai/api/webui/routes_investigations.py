@@ -17,7 +17,13 @@ from sqlalchemy import select
 
 from soc_ai.api.deps import get_elastic, get_settings_dep
 from soc_ai.api.security import identify_caller
-from soc_ai.api.webui import _timeline, action_rules, routes_entity, routes_hunts
+from soc_ai.api.webui import (
+    _event_timeline,
+    _timeline,
+    action_rules,
+    routes_entity,
+    routes_hunts,
+)
 from soc_ai.api.webui._errors import api_error
 from soc_ai.api.webui._shared import (
     _ago,
@@ -58,6 +64,7 @@ from soc_ai.triage_models import is_pipeline_fallback
 from soc_ai.webui import (
     anchor_check,
     case_links,
+    finding_promotion,
     hunt_manager,
 )
 
@@ -135,6 +142,28 @@ def _subject_type(inv: Investigation) -> str:
     """
     subject = getattr(inv, "subject_json", None)
     return "hunt" if isinstance(subject, dict) and subject.get("type") == "hunt" else "alert"
+
+
+def _finding_focus_ids(inv: Investigation, hunt: Hunt | None) -> list[str] | None:
+    """The document ids of the finding that a finding run judges, or None.
+
+    None for an alert run, a lead run, an older run that judged the whole
+    hunt, and a run whose hunt is gone. The Event timeline of such a run keeps
+    every subject document. A finding run lists only the documents of its own
+    finding and the documents that its verdict cites.
+    """
+    from soc_ai.hunting.findings import finding_document_ids  # noqa: PLC0415 - lazy
+
+    subject = getattr(inv, "subject_json", None)
+    ordinal = getattr(inv, "finding_ordinal", None)
+    if not isinstance(subject, dict) or subject.get("judges") != "finding":
+        return None
+    if hunt is None or ordinal is None:
+        return None
+    findings = routes_hunts._hunt_report(hunt).get("findings") or []
+    if not (0 <= int(ordinal) < len(findings)) or not isinstance(findings[int(ordinal)], dict):
+        return None
+    return finding_document_ids(findings[int(ordinal)])
 
 
 def _subject_out(inv: Investigation, hunt: Hunt | None) -> dict[str, Any] | None:
@@ -703,11 +732,11 @@ async def get_investigation(
         inv, events = got
         await inv_svc.heal_detection_kinds(db, [inv])
         chat = await chat_svc.list_messages(db, inv.id)
-        group_id = inv_svc.alert_group_id(inv)
-        group_runs = await inv_svc.runs_for_alerts(db, [group_id]) if group_id else []
+        group_runs = await _group_runs(db, inv)
         # The newer run that replaced this one, read whole: the page names its
         # verdict in a banner, so a bookmarked older run never reads as the
-        # current answer (dogfood 2026-10-06, investigation S1).
+        # current answer (dogfood 2026-10-06, investigation S1). A Re-run of a
+        # hunt finding replaces the older run of the finding the same way.
         superseded_by = _superseded_by(inv, group_runs) or await _answered_by(db, inv)
         newer = await db.get(Investigation, superseded_by) if superseded_by else None
         standing_analyst, live_run = await _alert_verdicts(db, inv)
@@ -821,6 +850,9 @@ async def get_investigation(
         toolCalls=tool_calls,
         pivots=pivots,
     )
+    # One read of the citations: the page links them, and the Event timeline
+    # lists the documents they name (change D).
+    citations = _timeline._citations_out(report, events)
     return InvestigationOut(
         id=inv.id,
         groupId=inv.alert_es_id or inv.id,
@@ -869,7 +901,7 @@ async def get_investigation(
         graphScope=_graph_scope(alert_obj, enrichments, inv),
         hostContextWindowHours=settings.host_risk_window_hours,
         openQuestions=_timeline._open_questions_out(report, events),
-        citations=_timeline._citations_out(report, events),
+        citations=citations,
         failure=_timeline._failure_out(inv.status, events),
         resolution=report.get("resolution") or None,
         validatorNote=_note_or_none(report.get("validator_note")),
@@ -896,6 +928,9 @@ async def get_investigation(
         runClass=_run_class_of(inv),
         runClassReason=_str_or_none(report.get("run_class_reason")),
         entities=entities,
+        eventTimeline=_event_timeline.investigation_event_timeline(
+            events, citations, inv.status, focus_ids=_finding_focus_ids(inv, hunt)
+        ),
     )
 
 
@@ -1108,27 +1143,50 @@ async def _answered_by(db: Any, inv: Investigation) -> str | None:
     return fid
 
 
+async def _group_runs(db: Any, inv: Investigation) -> list[inv_svc.RunRef]:
+    """Every run of the group of *inv*, newest first: its alert, or its hunt finding.
+
+    Empty for a run that stands alone.
+    """
+    group_id = inv_svc.alert_group_id(inv)
+    if group_id:
+        return await inv_svc.runs_for_alerts(db, [group_id])
+    finding = inv_svc.finding_group_id(inv)
+    if finding is not None:
+        return (await inv_svc.runs_for_findings(db, [finding])).get(finding, [])
+    return []
+
+
 async def superseding_run_id(db: Any, inv: Investigation) -> str | None:
     """The newer run that replaced *inv*, by the rule the detail page uses."""
-    group_id = inv_svc.alert_group_id(inv)
-    group_runs = await inv_svc.runs_for_alerts(db, [group_id]) if group_id else []
-    return _superseded_by(inv, group_runs) or await _answered_by(db, inv)
+    return _superseded_by(inv, await _group_runs(db, inv)) or await _answered_by(db, inv)
 
 
 async def superseding_run_ids(db: Any, runs: Sequence[Investigation]) -> dict[str, str]:
     """:func:`superseding_run_id` for many runs: run id to the run that replaced it.
 
-    One read of the alert groups for every run, so a list row pays no query of
-    its own. A run that stands is not in the answer.
+    One read of the alert groups and one of the finding groups for every run,
+    so a list row pays no query of its own. A run that stands is not in the
+    answer.
     """
     group_ids = sorted({g for inv in runs if (g := inv_svc.alert_group_id(inv))})
     by_group: dict[str, list[inv_svc.RunRef]] = {}
     for ref in await inv_svc.runs_for_alerts(db, group_ids):  # newest first
         by_group.setdefault(ref.alert_es_id or "", []).append(ref)
+    by_finding = await inv_svc.runs_for_findings(
+        db, [f for inv in runs if (f := inv_svc.finding_group_id(inv)) is not None]
+    )
     out: dict[str, str] = {}
     for inv in runs:
         group_id = inv_svc.alert_group_id(inv)
-        newer = _superseded_by(inv, by_group.get(group_id, []) if group_id else [])
+        finding = inv_svc.finding_group_id(inv)
+        if group_id:
+            group_runs = by_group.get(group_id, [])
+        elif finding is not None:
+            group_runs = by_finding.get(finding, [])
+        else:
+            group_runs = []
+        newer = _superseded_by(inv, group_runs)
         if newer is None:
             newer = await _answered_by(db, inv)
         if newer:
@@ -1279,6 +1337,20 @@ def _grid_skip_reason(exc: BaseException) -> str:
     return "grid_unavailable"
 
 
+def _lead_promotion(inv: Investigation, anchor_kind: str | None) -> bool:
+    """Whether a refused new run concerns a promoted lead, not a finding.
+
+    A promoted row is a lead run when it is no finding run. Another row over
+    a promoted anchor follows the promotion that anchors the document
+    (``anchor_kind`` from :func:`inv_svc.hunt_anchor_kinds`). The console has
+    a Re-run for a finding run and none for a lead run, so the refusal names
+    the remedy that exists.
+    """
+    if inv_svc.is_promoted(inv):
+        return inv.kind != "hunt" and inv.finding_ordinal is None
+    return anchor_kind == "lead"
+
+
 @router.post("/investigations/rehunt", response_model=RehuntResultOut)
 async def bulk_rehunt(  # noqa: PLR0915 — linear per-id skip/start loop, each guard is a short early continue
     request: Request,
@@ -1327,7 +1399,7 @@ async def bulk_rehunt(  # noqa: PLR0915 — linear per-id skip/start loop, each 
     eligible = unique_ids
 
     inv_by_id: dict[str, Investigation] = {}
-    promoted_anchors: set[str] = set()
+    promoted_anchors: dict[str, str] = {}
     analyst_alerts: set[str] = set()
     if eligible:
         async with request.app.state.db_sessionmaker() as db:
@@ -1343,7 +1415,8 @@ async def bulk_rehunt(  # noqa: PLR0915 — linear per-id skip/start loop, each 
             # row through the manager's default kind would run with SO writes
             # on over cited telemetry that has no SO alert behind it. An
             # anchor that is a real alert reruns (dogfood 2026-10-21).
-            promoted_anchors = await inv_svc.hunt_anchor_ids(
+            # The kind of the promotion picks the reason a skip names.
+            promoted_anchors = await inv_svc.hunt_anchor_kinds(
                 db, [inv.alert_es_id for inv in rows if inv.alert_es_id]
             )
             # A new run can replace an analyst verdict on any run of the
@@ -1381,9 +1454,12 @@ async def bulk_rehunt(  # noqa: PLR0915 — linear per-id skip/start loop, each 
             # A promoted finding's anchor is cited telemetry, not an SO alert —
             # relaunching it here would mint an unlabeled kind="suricata"
             # duplicate carrying the finding title as rule_name (the exact
-            # string the group-ack guard exists to keep out). Re-promotion
-            # from the hunt page is the sanctioned re-run.
-            skipped.append({"invId": inv_id, "reason": "hunt_kind"})
+            # string the group-ack guard exists to keep out). Re-run on the
+            # finding's investigation (the promote route with rerun) is the
+            # sanctioned re-run. A lead run has no such Re-run, so its skip
+            # names the lead.
+            lead = _lead_promotion(inv, promoted_anchors.get(inv.alert_es_id or ""))
+            skipped.append({"invId": inv_id, "reason": "lead_kind" if lead else "hunt_kind"})
             continue
 
         if anchor_state == anchor_check.UNKNOWN:
@@ -1502,13 +1578,14 @@ async def request_more_info(
         # anchor (a re-investigation) is as much off-limits as the promoted
         # row itself — the manager's default kind would relaunch it with SO
         # writes on over cited telemetry that has no SO alert behind it. An
-        # anchor that is a real alert reruns (dogfood 2026-10-21).
-        over_promoted_anchor = (
-            inv is not None
-            and bool(inv.alert_es_id)
-            and not inv_svc.is_promoted(inv)
-            and bool(await inv_svc.hunt_anchor_ids(db, [inv.alert_es_id]))
+        # anchor that is a real alert reruns (dogfood 2026-10-21). The kind
+        # of the promotion picks the remedy the refusal names.
+        anchor_kind = (
+            (await inv_svc.hunt_anchor_kinds(db, [inv.alert_es_id])).get(inv.alert_es_id)
+            if inv is not None and inv.alert_es_id and not inv_svc.is_promoted(inv)
+            else None
         )
+        over_promoted_anchor = anchor_kind is not None
 
     if inv is None:
         raise HTTPException(status_code=404, detail={"reason": "not_found"})
@@ -1525,14 +1602,21 @@ async def request_more_info(
             detail={"reason": "anchor_unread", "hint": action_rules.ANCHOR_UNREAD},
         )
     if inv_svc.is_promoted(inv) or anchor_state != anchor_check.ALERT:
-        # Re-promotion from the hunt page is the sanctioned re-run for a
-        # promoted finding — relaunching here would mint an unlabeled
-        # kind="suricata" duplicate against the same anchor telemetry doc.
+        # Re-run on the finding's investigation (the promote route with
+        # rerun) is the sanctioned re-run for a promoted finding —
+        # relaunching here would mint an unlabeled kind="suricata" duplicate
+        # against the same anchor telemetry doc. A lead run has no re-run in
+        # the console, so its refusal names Resolve in chat.
+        lead = _lead_promotion(inv, anchor_kind)
         raise HTTPException(
             status_code=409,
             detail={
                 "reason": "hunt_kind_no_rerun",
-                "hint": "Re-promote the finding from its hunt instead.",
+                "hint": (
+                    finding_promotion.LEAD_NO_RERUN_HINT
+                    if lead
+                    else finding_promotion.FINDING_RERUN_HINT
+                ),
             },
         )
     if not inv.alert_es_id:

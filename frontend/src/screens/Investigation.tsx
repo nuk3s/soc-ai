@@ -27,6 +27,7 @@ import { AskSocAiButton, investigationStarters } from '../components/AskPanel';
 import { ConfidenceRing } from '../components/ConfidenceRing';
 import { DocumentChip } from '../components/DocumentDrawer';
 import { DraftDetectionPane } from '../components/DraftDetectionPane';
+import { EventTimelinePanel, eventTimelineMeta } from '../components/EventTimeline';
 import { Markdown } from '../components/Markdown';
 import { EntityGraph } from '../components/EntityGraph';
 import { Panel } from '../components/Panel';
@@ -51,6 +52,7 @@ import {
   downloadInvestigationExport,
   overrideVerdict as submitOverride,
   getMe,
+  promoteFinding,
   requestMoreInfo,
   restoreAction,
   startHunt,
@@ -71,10 +73,13 @@ import {
   CHIP_SUBJECT_HUNT,
   ORACLE_REASON,
   SUBJECT_DOCUMENTS,
+  SUBJECT_FINDING,
   SUBJECT_FINDINGS,
+  SUBJECT_HUNT_CONTEXT,
   SUBJECT_HUNT_LINK,
   SUBJECT_LEAD,
   SUBJECT_OBJECTIVE,
+  SUBJECT_OBJECTIVE_CONTEXT,
 } from '../lib/tooltips';
 import { useAsync } from '../lib/useAsync';
 import { useChat, useChatScope } from '../lib/chatScope';
@@ -155,14 +160,19 @@ function durationLabel(s: number) {
 
 /** The banner on a run a newer run replaced (dogfood 2026-10-06,
  *  investigation S1). "Request more info" and "Re-run" start a new run, and
- *  the older page kept its verdict and its live buttons at a bookmarked URL. */
-export function supersededSentence(run: Pick<Inv, 'supersededRun'>['supersededRun']): string {
+ *  the older page kept its verdict and its live buttons at a bookmarked URL.
+ *  A Re-run of a hunt finding replaces the older run of the finding the same
+ *  way, and the banner then names the finding (2026-10-30). */
+export function supersededSentence(
+  run: Pick<Inv, 'supersededRun'>['supersededRun'],
+  subject: NewRunSubject = 'alert',
+): string {
   if (run?.status === 'complete' && run.verdict) {
     const conf = run.conf != null ? ` (${run.conf.toFixed(2)})` : '';
-    return `A newer run on this alert reached ${verdictLabel(run.verdict).toLowerCase()}${conf}.`;
+    return `A newer run on this ${subject} reached ${verdictLabel(run.verdict).toLowerCase()}${conf}.`;
   }
-  if (run?.status === 'running') return 'A newer run on this alert is in progress.';
-  return 'A newer run on this alert replaced this run.';
+  if (run?.status === 'running') return `A newer run on this ${subject} is in progress.`;
+  return `A newer run on this ${subject} replaced this run.`;
 }
 
 /** Why every action on a replaced run is off. */
@@ -204,6 +214,9 @@ export function standingAnalystSentence(a: { verdict: string; by: string }): str
 /** The two actions that start a new run of the alert from this page. */
 export type NewRunAction = 'rerun' | 'request_info';
 
+/** What the run judged: an alert, or the claim of a hunt finding. */
+export type NewRunSubject = 'alert' | 'finding';
+
 /** What a new run can replace: the analyst verdict on any run of the alert,
  *  and, on a backtest replay, the live verdict of the alert. */
 export interface NewRunStakes {
@@ -214,17 +227,34 @@ export interface NewRunStakes {
 
 /** What a new run does to the verdict of the alert, said before the run
  *  starts. One rule for Re-run and Request more info, on a live run and on a
- *  replay (R2-D1, R2-I5, V1-A2, V1-A3). Null when nothing needs a question. */
-export function newRunConfirmText(action: NewRunAction, stakes: NewRunStakes): string[] | null {
+ *  replay (R2-D1, R2-I5, V1-A2, V1-A3). Null when nothing needs a question.
+ *
+ *  A finding run judged the claim of a hunt finding. Its Re-run starts a new
+ *  run of the finding, the hunt page then reads the new verdict, and the run
+ *  makes no Security Onion write, so the alert words do not apply. */
+export function newRunConfirmText(
+  action: NewRunAction,
+  stakes: NewRunStakes,
+  subject: NewRunSubject = 'alert',
+): string[] | null {
   if (!stakes.analyst && !stakes.replay) return null;
   const lines: string[] = [];
   if (stakes.analyst) {
     lines.push(
-      `${stakes.analyst.by} set the verdict of this alert to ${verdictLabel(stakes.analyst.verdict).toLowerCase()}.`,
+      `${stakes.analyst.by} set the verdict of this ${subject} to ${verdictLabel(stakes.analyst.verdict).toLowerCase()}.`,
     );
-    if (stakes.analyst.otherRun) lines.push('That verdict is on another run of the alert.');
+    if (stakes.analyst.otherRun) lines.push(`That verdict is on another run of the ${subject}.`);
   }
   const name = action === 'rerun' ? 'A re-run' : 'Request more info';
+  if (subject === 'finding' && !stakes.replay) {
+    // The hunt page reads the newest run of the finding, so the new verdict
+    // replaces the analyst verdict there. The buttons say the same.
+    lines.push(
+      `${name} starts a new run of the finding. The verdict of the new run then replaces the analyst verdict on the hunt page.`,
+    );
+    lines.push('The run with the analyst verdict stays as a record.');
+    return lines;
+  }
   if (stakes.replay) {
     lines.push('This run is a backtest replay.');
     const live = stakes.live;
@@ -306,6 +336,15 @@ const SETTLED_SCOPE: Record<'ack' | 'escalate', string> = {
 /** Why Re-run is off while a run is in flight (fleet P4, 2026-10-01). */
 export const RERUN_BUSY_REASON =
   'A run is in progress. Wait for it to finish before you start another run.';
+
+/** What Re-run does on the run of a hunt finding (2026-10-30). */
+export const FINDING_RERUN_TIP =
+  'This button starts a new investigation of the finding. This run stays as a record.';
+
+/** Re-run on a finding run the page calls stuck. The server row still reads
+ *  running, so the promote route returns this same run. */
+export const FINDING_RUN_STILL_RUNS =
+  'The server still runs this investigation. Wait for it to end, or cancel it.';
 
 /** The headline of a pipeline fallback. The stored summary names the failed
  *  phase and the exception class, which is internal detail (fleet P11). */
@@ -543,6 +582,18 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     : inv.status === 'error' && inv.failure?.permanent
       ? PERMANENT_FAILURE_LOCK
       : null;
+  // The finding a Re-run of this run starts a new run of (2026-10-30). A
+  // finding run re-runs through the promote route with rerun true. POST /hunt
+  // and Request more info refuse it (409 hunt_kind_no_rerun). Null on an
+  // alert run, and on a finding run whose hunt is gone: the page then names
+  // the finding from the stored subject, and the promote route answers 404.
+  const findingRun =
+    inv.kind === 'hunt' && inv.promotedFinding && inv.huntObjective != null
+      ? inv.promotedFinding
+      : null;
+  // A run of a hunt finding with no finding to re-run. Its panels point at
+  // the hunt page, the way every finding run did before Re-run.
+  const huntPointer = inv.kind === 'hunt' && !findingRun;
   // The verdict an analyst set on this run. The label over the card reads it.
   const analystVerdict = analystVerdictOf(inv);
   // The analyst verdict on ANY run of the alert, and what a new run from
@@ -559,6 +610,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     replay: isBacktestReplay(inv.meta?.ranBy),
     live: inv.alertLiveRun ?? null,
   };
+  const newRunSubject: NewRunSubject = findingRun ? 'finding' : 'alert';
   // A verdict the model did not commit to. It never reads as settled, and it
   // always offers the two ways forward (fleet P2).
   const unsettledVerdict = inv.verdict === 'needs_more_info' || inv.verdict === 'inconclusive';
@@ -755,7 +807,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     }
     return (
       `The API gave no answer to ${action}. The run may have started anyway. ` +
-      `Check the Investigations list for a newer run of this alert before you start another. ${endSentence(
+      `Check the Investigations list for a newer run of this ${newRunSubject} before you start another. ${endSentence(
         detail || 'The request did not complete',
       )}`
     );
@@ -768,25 +820,36 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   // same fast path just repeats the heuristic (dogfood 2026-07-15).
   const startReRun = (deep: boolean, confirmed = false) => {
     if (reHunting) return;
+    // Defense in depth: every visible Re-run affordance is already hidden for
+    // a finding run with no finding to re-run (toolbar, failedEl, the
+    // fallback panel), and POST /hunt refuses a finding run (409
+    // hunt_kind_no_rerun). A stray caller reaching this function directly
+    // should still no-op rather than mint an unlabeled kind='suricata'
+    // duplicate.
+    if (huntPointer) return;
     // A re-run replaces the verdict on the alert. Over an analyst verdict on
     // any run of the alert, and on a replay, it asks first and names the
-    // verdict (R2-D1, R2-I5, V1-A2, V1-A3).
-    if (!confirmed && newRunConfirmText('rerun', newRunStakes)) {
+    // verdict (R2-D1, R2-I5, V1-A2, V1-A3). A finding run asks the same.
+    if (!confirmed && newRunConfirmText('rerun', newRunStakes, newRunSubject)) {
       setNewRunAsk({ action: 'rerun', deep });
       return;
     }
-    // Defense in depth: every visible Re-run affordance is already hidden for
-    // a promoted finding (toolbar, failedEl, the fallback panel), and the API
-    // refuses it too (409 hunt_kind_no_rerun) — but a stray caller reaching
-    // this function directly should still no-op rather than mint an
-    // unlabeled kind='suricata' duplicate.
-    if (inv.kind === 'hunt') return;
     // A second start while this run is in flight makes a duplicate run (P4).
     if (running) return;
     setReRunError(null);
     setReHunting(true);
-    startHunt(inv.groupId, deep ? { deep: true } : undefined)
-      .then((newId) => onReHunt?.(newId))
+    // A finding run starts a new run of its finding. The promote route has
+    // no deep variant, and a run of the finding that still runs answers.
+    // A stuck finding run still reads running on the server, so the route
+    // returns this same run. A hand-off to the same id changes nothing on
+    // the page, so the page says why no new run started.
+    const start: Promise<string | null> = findingRun
+      ? promoteFinding(findingRun.huntId, findingRun.ordinal, { rerun: true }).then((r) =>
+          r.existing && r.investigation_id === inv.id ? null : r.investigation_id,
+        )
+      : startHunt(inv.groupId, deep ? { deep: true } : undefined);
+    start
+      .then((newId) => (newId === null ? setReRunError(FINDING_RUN_STILL_RUNS) : onReHunt?.(newId)))
       .catch((err: unknown) => setReRunError(startFailure(err, 'Re-run investigation')))
       .finally(() => setReHunting(false));
   };
@@ -862,6 +925,10 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   // objective and a set of findings where an alert run has a rule and an
   // event. Two panels there would give one run two subjects.
   const huntSubject = inv.subject?.type === 'hunt' ? inv.subject : null;
+  // Change E. A new finding run judged the claim of its finding, and the
+  // record says so. A row without the key judged the whole hunt, and its page
+  // keeps the old labels.
+  const judgesFinding = huntSubject?.judges === 'finding';
   const ends = alertEnds(inv);
 
   // ── composable section blocks (arranged differently per layout) ──────────
@@ -900,15 +967,17 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
           Override verdict
         </button>
       )}
-      {/* Re-run / Deep re-run: hidden for a promoted hunt finding. Re-promoting
-          from the hunt page is the sanctioned re-run in this slice — startHunt
-          would mint an unlabeled kind='suricata' duplicate on the anchor
-          telemetry doc, and the API refuses these paths anyway (Task 6b). */}
-      {inv.kind !== 'hunt' && (
+      {/* Re-run on a finding run starts a new run of the finding through
+          the promote route with rerun true, and hides while the run runs.
+          startHunt would mint an unlabeled kind='suricata' duplicate on the
+          anchor telemetry doc, and the API refuses that path (Task 6b). A
+          finding run with no finding to re-run shows no Re-run. Deep re-run
+          stays an alert-run control: the promote route has no deep variant. */}
+      {(inv.kind !== 'hunt' || (findingRun && !running)) && (
         <button
           onClick={reRun}
           disabled={reHunting || running || !!rerunLock}
-          title={running ? RERUN_BUSY_REASON : rerunLock ?? undefined}
+          title={running ? RERUN_BUSY_REASON : rerunLock ?? (findingRun ? FINDING_RERUN_TIP : undefined)}
           className="flex items-center gap-1.5 rounded-control border border-border-strong bg-surface-3 px-[11px] py-1.5 text-[12px] font-semibold text-dim hover:border-accent hover:text-text disabled:opacity-60"
         >
           {reHunting ? <Spinner size={13} /> : <RotateCw size={13} />}
@@ -987,7 +1056,8 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
       style={{ borderColor: 'rgba(244,114,182,.35)', background: 'rgba(244,114,182,.06)' }}
     >
       <div className="text-[13.5px] font-semibold text-text">
-        <span style={{ color: '#f472b6' }}>Promoted finding:</span> {pf.label}, {pf.title}
+        <span style={{ color: '#f472b6' }}>{judgesFinding ? 'Subject:' : 'Promoted finding:'}</span>{' '}
+        {pf.label}, {pf.title}
       </div>
       {pf.detail && (
         <div className="mt-1 text-[12.5px] leading-[1.5] text-text-2">
@@ -1027,7 +1097,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
         className="mb-3.5 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-card border px-3.5 py-2.5 text-[13px]"
         style={{ borderColor: 'rgba(75,139,245,.4)', background: 'rgba(75,139,245,.08)' }}
       >
-        <span className="text-text-2">{supersededSentence(inv.supersededRun)}</span>
+        <span className="text-text-2">{supersededSentence(inv.supersededRun, newRunSubject)}</span>
         <Link
           to={`/investigation/${inv.supersededBy}`}
           className="font-semibold text-accent underline hover:opacity-80"
@@ -1098,11 +1168,11 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     </div>
   );
 
-  // Substitute for a Re-run button on a promoted finding: the API refuses a
-  // re-run of the anchor event once promotion owns its latest investigation
-  // (409 hunt_kind_no_rerun), so offering the button is a click that
-  // dead-ends. Points at the sanctioned path instead — re-promoting from the
-  // hunt page — with the same link idiom as the provenance strip.
+  // Substitute for a Re-run button on a finding run with no finding to
+  // re-run (huntPointer): POST /hunt refuses a re-run of the anchor event
+  // once promotion owns its latest investigation (409 hunt_kind_no_rerun),
+  // and the promote route needs the finding. Points at the hunt page with
+  // the same link idiom as the provenance strip.
   const reRunOrPromoteLine = (className: string) => (
     <div className={className}>
       Open an investigation on this finding again from its hunt.
@@ -1122,10 +1192,9 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   // needs no re-run either (D1).
   const failure = inv.status === 'error' ? inv.failure ?? null : null;
   const noRerunAdvice = !!inv.supersededBy || !!failure?.permanent;
-  const tryAgain =
-    inv.kind === 'hunt'
-      ? 'Open an investigation on it again from its hunt.'
-      : 'Re-run it to try again.';
+  const tryAgain = huntPointer
+    ? 'Open an investigation on it again from its hunt.'
+    : 'Re-run it to try again.';
   const failureSentence = failure?.permanent
       ? 'The run reached no verdict. A re-run cannot change the recorded cause.'
       : failure
@@ -1160,19 +1229,21 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
         <div className="font-mono text-[12.5px] text-faint">elapsed {fmt(elapsed)}</div>
       </div>
       <div className="mt-2 text-[13px] leading-[1.55] text-dim" style={{ textWrap: 'pretty' }}>
-        {/* A hunt-kind row points at the "Re-promote this finding from its
-            hunt" line right below instead of telling the analyst to
-            "re-run it" here too — the API refuses a direct re-run of a
-            promoted finding's anchor (409 hunt_kind_no_rerun), so the two
-            instructions would mean different things at the same spot. */}
+        {/* A finding run with no finding to re-run points at the "Open an
+            investigation on this finding again from its hunt" line right
+            below instead of telling the analyst to "re-run it" here too, so
+            the two instructions never mean different things at the same
+            spot. A finding run with Re-run reads the alert words. */}
         {inv.supersededBy
           ? 'The run reached no verdict.'
           : interrupted
-          ? inv.kind === 'hunt'
+          ? huntPointer
             ? 'There is no verdict. The service restarted during the run. soc-ai re-investigates this finding if Auto-Investigate is on. Open an investigation on it again from its hunt.'
-            : 'There is no verdict. The service restarted during the run. soc-ai re-investigates this alert if Auto-Investigate is on. Re-run it now to get a verdict.'
+            : findingRun
+              ? 'There is no verdict. The service restarted during the run. Re-run it now to get a verdict.'
+              : 'There is no verdict. The service restarted during the run. soc-ai re-investigates this alert if Auto-Investigate is on. Re-run it now to get a verdict.'
           : cancelled
-            ? inv.kind === 'hunt'
+            ? huntPointer
               ? 'The run reached no verdict. An operator cancel or a service restart stopped the run before it finished. Open an investigation on it again from its hunt.'
               : 'The run reached no verdict. An operator cancel or a service restart stopped the run before it finished. Re-run it to get a verdict.'
             : stuck && inv.status === 'investigating'
@@ -1198,7 +1269,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
         </div>
       )}
       <div className="mt-[14px] flex flex-wrap items-center gap-2">
-        {inv.kind === 'hunt' ? (
+        {huntPointer ? (
           !inv.supersededBy && reRunOrPromoteLine('text-[13px] leading-[1.5] text-dim')
         ) : noRerunAdvice ? null : (
           <button
@@ -1253,7 +1324,13 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
             <span
               data-testid="verdict-subject"
               className="min-w-0 max-w-full text-[12.5px] text-dim"
-              title={SUBJECT_OBJECTIVE}
+              title={
+                judgesFinding
+                  ? inv.promotedFinding
+                    ? SUBJECT_FINDING
+                    : SUBJECT_OBJECTIVE_CONTEXT
+                  : SUBJECT_OBJECTIVE
+              }
             >
               {inv.promotedFinding
                 ? `${inv.promotedFinding.label}, ${inv.promotedFinding.title}`
@@ -1457,16 +1534,16 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
           This run failed before it reached a verdict
           {inv.fallback.hint ? <>: {inv.fallback.hint}</> : '.'}
           {' '}soc-ai recorded the verdict Needs more info as a placeholder.
-          {/* Same re-run/re-promote split as failedEl above: the button (or
-              the re-promote pointer) right below already says how to get a
-              real verdict, so this sentence must agree with it instead of
-              also instructing "re-run" for a row the API refuses to re-run. */}
-          {inv.kind === 'hunt'
+          {/* Same Re-run/hunt-pointer split as failedEl above: the button (or
+              the hunt pointer) right below already says how to get a real
+              verdict, so this sentence must agree with it instead of also
+              instructing "re-run" for a row with no Re-run. */}
+          {huntPointer
             ? ' Open an investigation on it again from its hunt.'
             : ' Re-run it to get a real verdict.'}
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          {inv.kind === 'hunt' ? (
+          {huntPointer ? (
             reRunOrPromoteLine('text-[12.5px] leading-[1.5] text-dim')
           ) : (
             <button
@@ -1528,22 +1605,39 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
             </div>
           </div>
         ) : null}
-        {/* Honest wayfinding for a promoted finding: every re-run affordance
-            (Re-run, Deep re-run, Request more info) is hidden for kind='hunt'
-            because the API refuses them — so "dig deeper with a focused
-            re-investigation" would name a path that does not exist on this
-            screen. Say what actually refines a promoted finding instead. */}
-        {inv.kind === 'hunt' && (
+        {/* Wayfinding for a finding run: Request more info and Deep re-run
+            are hidden for kind='hunt' because the API refuses them, so "dig
+            deeper with a focused re-investigation" would name a path that
+            does not exist on this screen. A finding run has Re-run here
+            (the promote route with rerun). A finding run with no finding to
+            re-run points at its hunt. */}
+        {findingRun ? (
+          <div className="mb-2.5 text-[13px] text-text-2">
+            Re-run the investigation of this finding to refine it. You can also ask a follow-up
+            in Ask soc-ai.
+          </div>
+        ) : huntPointer ? (
           <div className="mb-2.5 text-[13px] text-text-2">
             Open an investigation on this finding again from its hunt to refine it. You can
             also ask a follow-up in Ask soc-ai. This screen cannot re-run the investigation of
             a finding.
           </div>
-        )}
+        ) : null}
         <div className="flex flex-wrap items-center gap-2">
-          {/* A promoted finding has no re-run affordance in this slice — the
-              server refuses it (409 hunt_kind_no_rerun); re-promote from the
-              hunt page instead. */}
+          {/* A finding run has no Request more info: the server refuses it
+              (409 hunt_kind_no_rerun). Its Re-run takes the place. */}
+          {findingRun && (
+            <button
+              onClick={reRun}
+              disabled={reHunting || !!rerunLock}
+              title={rerunLock ?? FINDING_RERUN_TIP}
+              className="flex items-center gap-1.5 rounded-[7px] border px-[11px] py-1.5 text-[12.5px] font-semibold text-[#0b0f16] disabled:opacity-60"
+              style={{ background: '#f5a623', borderColor: '#f5a623' }}
+            >
+              {reHunting ? <Spinner size={13} /> : <RotateCw size={13} />}
+              {reHunting ? 'Re-running' : 'Re-run investigation'}
+            </button>
+          )}
           {inv.kind !== 'hunt' && (
             <button
               onClick={requestInfo}
@@ -1968,6 +2062,16 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     </CollapsibleSection>
   );
 
+  // The documents of the run in event time, in UTC, with the waves (change D).
+  // It sits above the step timeline. The server sends none while the run
+  // runs, and none when fewer than two documents have a stored time.
+  const eventTimeline = inv.eventTimeline;
+  const eventTimelineEl = eventTimeline?.entries.length ? (
+    <CollapsibleSection title="Event timeline" meta={eventTimelineMeta(eventTimeline)}>
+      <EventTimelinePanel timeline={eventTimeline} />
+    </CollapsibleSection>
+  ) : null;
+
   const reasoning = inv.reasoning ?? [];
   const reasoningEl =
     reasoning.length > 0 ? (
@@ -2042,7 +2146,9 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   });
 
   // ── New-run confirm (R2-D1, R2-I5, V1-A2, V1-A3) ────────────────────────
-  const newRunLines = newRunAsk ? newRunConfirmText(newRunAsk.action, newRunStakes) : null;
+  const newRunLines = newRunAsk
+    ? newRunConfirmText(newRunAsk.action, newRunStakes, newRunSubject)
+    : null;
   const newRunTitle = newRunAsk?.action === 'request_info' ? 'Request more info' : 'Re-run investigation';
   const confirmNewRun = () => {
     const ask = newRunAsk;
@@ -2197,7 +2303,11 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
 
   // analyst-context rail panels (only render when the data is present).
   const alertEl = huntSubject ? (
-    <HuntSubjectPanel subject={huntSubject} promotedOrdinal={inv.promotedFinding?.ordinal} />
+    <HuntSubjectPanel
+      subject={huntSubject}
+      promotedOrdinal={inv.promotedFinding?.ordinal}
+      judgesFinding={judgesFinding}
+    />
   ) : inv.alert ? (
     <AlertDetailsPanel alert={inv.alert} sev={inv.sev} kind={inv.kind} entities={inv.entities} windowHours={inv.hostContextWindowHours} />
   ) : null;
@@ -2268,6 +2378,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
                 {inv.nodes.length > 0 && entityEl}
                 {inv.actions.length > 0 ? actionsEl : settledActionEl}
                 {draftDetectionEl}
+                {eventTimelineEl}
                 {timelineEl}
                 {reasoningEl}
               </div>
@@ -2319,6 +2430,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
           {inv.nodes.length > 0 && <div className="mt-[18px]">{entityEl}</div>}
           <div className="mt-[18px]">{inv.actions.length > 0 ? actionsEl : settledActionEl}</div>
           {draftDetectionEl && <div className="mt-[18px]">{draftDetectionEl}</div>}
+          {eventTimelineEl && <div className="mt-5">{eventTimelineEl}</div>}
           <div className="mt-5">{timelineEl}</div>
           {reasoningEl && <div className="mt-5">{reasoningEl}</div>}
         </>
@@ -2346,11 +2458,15 @@ export const starterQuestions = investigationStarters;
 function HuntSubjectPanel({
   subject,
   promotedOrdinal,
+  judgesFinding = false,
 }: {
   subject: InvestigationSubject;
   /** The finding the analyst promoted. Its objective is the raw prompt of the
    *  hunt, so it folds behind "Show objective". */
   promotedOrdinal?: number;
+  /** The run judged that one finding (change E). The panel then shows the
+   *  hunt as context. A legacy row judged the whole hunt. */
+  judgesFinding?: boolean;
 }) {
   const [objectiveOpen, setObjectiveOpen] = useState(promotedOrdinal == null);
   const findings = subject.finding_ordinals.map((ordinal, i) => {
@@ -2368,7 +2484,13 @@ function HuntSubjectPanel({
   return (
     <CollapsiblePanel
       icon={<GitBranch size={15} />}
-      title={<span title={CHIP_SUBJECT_HUNT}>Subject: hunt</span>}
+      title={
+        judgesFinding ? (
+          <span title={SUBJECT_HUNT_CONTEXT}>Context: hunt</span>
+        ) : (
+          <span title={CHIP_SUBJECT_HUNT}>Subject: hunt</span>
+        )
+      }
       summary={subject.objective}
     >
       <div data-testid="investigation-subject" className="flex flex-col">
@@ -2389,7 +2511,7 @@ function HuntSubjectPanel({
           {objectiveOpen && (
             <div
               className="mt-1 text-[12.5px] leading-[1.5] text-text-2"
-              title={SUBJECT_OBJECTIVE}
+              title={judgesFinding ? SUBJECT_OBJECTIVE_CONTEXT : SUBJECT_OBJECTIVE}
             >
               {subject.objective}
             </div>
@@ -2412,7 +2534,7 @@ function HuntSubjectPanel({
                     data-testid="subject-promoted"
                     className="ml-1.5 rounded-badge border border-border-input px-1.5 py-px text-[10.5px] font-semibold text-accent"
                   >
-                    promoted
+                    {judgesFinding ? 'subject' : 'promoted'}
                   </span>
                 )}
               </li>

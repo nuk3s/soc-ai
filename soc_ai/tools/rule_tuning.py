@@ -60,6 +60,7 @@ import logging
 from typing import Any
 
 from soc_ai.config import Settings
+from soc_ai.event_time import WAVE_GAP_SECONDS
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.tools import _burstiness as burst
 from soc_ai.tools._provenance import (
@@ -140,7 +141,7 @@ def _agg_count(agg: dict[str, Any] | None) -> int:
         "rule's alert volume, its acknowledged-vs-escalated disposition trend "
         "(the ES proxy for false-positive vs true-positive), and a "
         "mute/monitor/none recommendation with a one-line reason. Also reports "
-        "whether the alerts arrived as a recurring rate or as one burst "
+        "whether the alerts arrived as a recurring rate or as a burst "
         "(is_burst) — a burst is never a tuning problem, and may be the event "
         "worth investigating. READ-ONLY: it nominates, it does not change "
         "Security Onion."
@@ -269,7 +270,15 @@ async def suggest_rule_tuning(
         alert_count, fp, tp, nmi, triaged=triaged, is_burst=shape.is_burst
     )
 
-    if shape.is_burst and span_seconds is not None:
+    if shape.is_burst and span_seconds is not None and span_seconds > WAVE_GAP_SECONDS:
+        # A span longer than one wave gap can hold several waves, and this tool
+        # reads no fire times, so it claims no one burst (change D).
+        shape_clause = (
+            f", inside {burst.span_phrase(span_seconds)} on "
+            f"{burst.plural(active_days or 1, 'active day')}, with no recurring rate and an"
+            " unknown number of waves"
+        )
+    elif shape.is_burst and span_seconds is not None:
         shape_clause = (
             f" — all of it inside {burst.span_phrase(span_seconds)} on "
             f"{burst.plural(active_days or 1, 'active day')}, one burst rather than a"

@@ -547,6 +547,53 @@ export interface InvestigationSubject {
   document_ids: string[];
   /** The lead's observations, by id. */
   observation_ids: number[];
+  /** Present on a run that judged one finding of the hunt. A row stored
+   *  before change E has no key and judged the whole hunt. */
+  judges?: 'finding';
+}
+
+/** One document on the Event timeline. `at` and `end` are ISO UTC times.
+ *  `end` is set when the document lasts, a Zeek conn with a duration.
+ *  `source` and `destination` are "address" or "address:port". `findings`
+ *  holds the 0-based ordinals of the hunt findings that cite the document. */
+export interface EventTimelineEntry {
+  id: string;
+  at: string;
+  end?: string | null;
+  dataset?: string | null;
+  source?: string | null;
+  destination?: string | null;
+  host?: string | null;
+  label: string;
+  cited: boolean;
+  findings: number[];
+  wave: number;
+}
+
+/** One wave of the Event timeline: its number from 1, its start and end in
+ *  ISO UTC, its document count, and the addresses of its two ends. */
+export interface EventTimelineWave {
+  n: number;
+  start: string;
+  end: string;
+  documents: number;
+  sources: string[];
+  destinations: string[];
+}
+
+/** The documents of a run in event-time order, with the waves (change D).
+ *  Every time is UTC. `basis` picks the intro: an alert run, an
+ *  investigation of a hunt finding, or a hunt. */
+export interface EventTimeline {
+  basis: 'alert' | 'finding' | 'hunt_subject' | 'hunt';
+  entries: EventTimelineEntry[];
+  waves: EventTimelineWave[];
+  /** A new wave starts after a gap of more than this many minutes. */
+  gapMinutes: number;
+  /** Cited documents with no stored event time. They are not on the list. */
+  untimed: number;
+  /** Later documents past the list cap. */
+  omitted: number;
 }
 
 export interface Investigation {
@@ -641,6 +688,10 @@ export interface Investigation {
   /** Every host, address, user and domain the run names, each with its
    *  page. Render each with `EntityLink`. Absent from an older server. */
   entities?: EntityRef[];
+  /** The documents of the run in event-time order, in UTC. null while the
+   *  run runs and when fewer than two documents have a stored time. An older
+   *  server omits the field. */
+  eventTimeline?: EventTimeline | null;
   /** Manual or chat provenance — present when the AI verdict was overridden. */
   resolution?: ResolutionProvenance;
   /** Post-validator override note — present when a validator auto-corrected the verdict. */
@@ -1134,6 +1185,10 @@ export interface HuntDetailData {
   /** The investigations of the subject findings. See HuntRow. */
   findingsInvestigated?: number;
   findingsTotal?: number;
+  /** The documents the findings cite, in event-time order, in UTC. null
+   *  while the hunt runs and when fewer than two cited documents have a
+   *  stored time. An older server omits the field. */
+  eventTimeline?: EventTimeline | null;
 }
 
 export interface HostContextEnd {

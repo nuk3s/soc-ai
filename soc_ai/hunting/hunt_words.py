@@ -20,6 +20,7 @@ from collections.abc import Mapping
 __all__ = [
     "ALERT_ONLY_NOTE",
     "catalog_parts",
+    "first_sentence",
     "hunt_title",
     "is_operator_step",
     "lead_entities",
@@ -40,6 +41,26 @@ _RELATIVE_RE = re.compile(r"^now-(?P<n>\d+)(?P<unit>[mhd])$")
 # carries dots, so the sentence ends at the first full stop that a space or the
 # end of the line follows.
 _LEAD_RE = re.compile(r"^\[lead (?P<id>\d+)\] Investigate (?P<entities>.+?)\.(?:\s|$)")
+
+
+# The end of a sentence: a stop, then space, then a capital, a digit or a quote.
+# "e.g. the host" and an address such as 10.1.2.3 do not end one.
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(\[])")
+
+
+def first_sentence(text: str) -> str:
+    """The first sentence of a narrative as plain text, whole.
+
+    A heading line goes, and so do the emphasis marks and a list bullet. The
+    sentence is never cut. The console wraps a long one.
+    """
+    lines = [ln for ln in (text or "").splitlines() if not ln.lstrip().startswith("#")]
+    plain = re.sub(r"[*`]+", "", "\n".join(lines))
+    plain = re.sub(r"^\s*[-+]\s+", "", plain, flags=re.MULTILINE)
+    plain = " ".join(plain.split())
+    if not plain:
+        return ""
+    return _SENTENCE_END.split(plain, maxsplit=1)[0]
 
 
 def objective_headline(objective: str) -> str:

@@ -11,7 +11,7 @@ module exposes a plain ``async def`` so step 5 can wrap it without restructuring
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, get_args
 
 from soc_ai.config import Settings
@@ -176,11 +176,19 @@ def _build_time_filter(
         )
     before: int | float
     after: int | float
+    bounds: dict[str, str] = {}
     if time_anchor is None:
         gte, lte = f"now-{time_range_minutes}m", "now"
         before, after = time_range_minutes, 0
         note = _NOW_NOTE.format(minutes=time_range_minutes)
         mode = "now_relative"
+        # The two UTC bounds at query time, so a count from this window can
+        # name its window (change D). The filter stays relative.
+        end = datetime.now(UTC).replace(microsecond=0)
+        bounds = {
+            "start_utc": _utc_z(end - timedelta(minutes=time_range_minutes)),
+            "end_utc": _utc_z(end),
+        }
     elif window_mode == "before":
         gte = (time_anchor - timedelta(minutes=time_range_minutes)).isoformat()
         lte = time_anchor.isoformat()
@@ -205,8 +213,14 @@ def _build_time_filter(
         "minutes_before_anchor": before,
         "minutes_after_anchor": after,
         "note": note,
+        **bounds,
     }
     return {"range": {"@timestamp": {"gte": gte, "lte": lte}}}, descriptor
+
+
+def _utc_z(at: datetime) -> str:
+    """An aware time as ISO UTC with a ``Z`` suffix."""
+    return at.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
 @tool(

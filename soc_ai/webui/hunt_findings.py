@@ -13,10 +13,13 @@ reads ``investigating`` while they run and ``complete`` when the last one
 ends. A failed investigation counts as ended.
 
 One investigation per subject. Before it opens one, the phase looks for a
-running or complete investigation of the same subject from the last seven
-days: the same alert, or the same subject fingerprint
-(:func:`soc_ai.store.investigations.reusable_for_subject`). A match is reused.
-The finding names it, and no new run starts.
+running or complete investigation from the last seven days with the same
+subject fingerprint (:func:`soc_ai.store.investigations.reusable_for_subject`).
+A match from another hunt is reused. The finding names it, and no new run
+starts. An alert run never answers for a finding: the alert run judges the
+alert, and the finding makes its own claim. Two findings of one hunt never
+share a run, and a finding that cites no document has no fingerprint
+(change E, 2026-10-30).
 
 The system path records no observation. An analyst's promotion records one,
 because it is the analyst's judgement of the finding. A hunt's own
@@ -116,6 +119,16 @@ def _lock(state: Any) -> asyncio.Lock:
     return lock
 
 
+def start_lock(state: Any) -> asyncio.Lock:
+    """The lock of :func:`open_for_finding`, for the promote route.
+
+    The promote route holds it across its second check and its start, so two
+    presses on one finding at the same time start one run. It is the same
+    lock as the entry writes use: do not call :func:`record_link` under it.
+    """
+    return _lock(state)
+
+
 async def record_link(
     state: Any,
     hunt_id: str,
@@ -158,11 +171,20 @@ class _NotOpened(Exception):
 
 
 async def _reusable(
-    state: Any, *, alert_id: str | None, fingerprint: str | None, is_synth_eval: bool
+    state: Any, *, fingerprint: str | None, hunt_id: str, is_synth_eval: bool
 ) -> Investigation | None:
+    """A run of another hunt with the same subject fingerprint, or None.
+
+    No alert test: an alert run judges the alert, and the finding makes its own
+    claim. No run of this hunt: a sibling finding makes another claim.
+    """
     async with state.db_sessionmaker() as db:
         return await inv_svc.reusable_for_subject(
-            db, alert_id=alert_id, fingerprint=fingerprint, is_synth_eval=is_synth_eval
+            db,
+            alert_id=None,
+            fingerprint=fingerprint,
+            is_synth_eval=is_synth_eval,
+            exclude_hunt_id=hunt_id,
         )
 
 
@@ -180,12 +202,13 @@ async def open_for_finding(
     """Reuse or start the investigation of one subject finding.
 
     The fingerprint test runs first, because it needs no grid read. The
-    subject build and the anchor need one. The second test, with the anchor,
-    and the start run under one lock.
+    subject build and the anchor need one. The second fingerprint test and the
+    start run under one lock, so two findings of one subject in two hunts that
+    run at the same time never both start a run.
     """
     fingerprint = subject_fingerprint(finding)
     existing = await _reusable(
-        state, alert_id=None, fingerprint=fingerprint, is_synth_eval=is_synth_eval
+        state, fingerprint=fingerprint, hunt_id=hunt_id, is_synth_eval=is_synth_eval
     )
     if existing is not None:
         return _Opened(existing.id, reused=True, running=existing.status == "running")
@@ -219,7 +242,7 @@ async def open_for_finding(
         raise _NotOpened(REASON_GRID) from exc
     async with _lock(state):
         existing = await _reusable(
-            state, alert_id=anchor_id, fingerprint=fingerprint, is_synth_eval=is_synth_eval
+            state, fingerprint=fingerprint, hunt_id=hunt_id, is_synth_eval=is_synth_eval
         )
         if existing is not None:
             return _Opened(existing.id, reused=True, running=existing.status == "running")
@@ -512,5 +535,6 @@ __all__ = [
     "open_for_finding",
     "plan_findings",
     "record_link",
+    "start_lock",
     "wait_for_end",
 ]

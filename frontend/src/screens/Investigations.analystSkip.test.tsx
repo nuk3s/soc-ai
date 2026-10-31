@@ -19,6 +19,17 @@ describe('the bulk re-investigate names the analyst skip', () => {
     );
   });
 
+  it('names the remedy of a promoted finding and of a promoted lead', () => {
+    // A finding run has Re-run on its page. A lead run has none, and Resolve
+    // in chat on its page settles the verdict (2026-10-30).
+    expect(rehuntSkipReason('hunt_kind')).toBe(
+      'promoted finding. Use Re-run on the investigation of the finding',
+    );
+    expect(rehuntSkipReason('lead_kind')).toBe(
+      'promoted lead. Use Resolve in chat on the investigation of the lead',
+    );
+  });
+
   it('NEGATIVE CONTROL: an unknown code reads as the code', () => {
     expect(rehuntSkipReason('a_new_code')).toBe('a_new_code');
   });

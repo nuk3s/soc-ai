@@ -1588,3 +1588,76 @@ async def test_the_subject_column_holds_a_hunt_subject(settings_kratos: Settings
         assert read_back is not None
         assert read_back.subject_json == subject
     await engine.dispose()
+
+
+async def test_failed_runs_for_alerts_counts_the_failures_after_the_last_verdict(
+    settings_kratos: Settings,
+) -> None:
+    """The retry budget of Auto-Investigate reads this count.
+
+    A failure is an error run or a pipeline fallback. A cancel, an interrupt
+    and a run in flight cost no retry. A hunt-subject run and a backtest replay
+    are not the alert's own runs. A real verdict resets the count, and
+    ``failed_since`` resets it for an alert whose error class healed.
+    """
+    from soc_ai.triage_models import PIPELINE_FALLBACK_PROVENANCE
+
+    engine, maker = await _db(settings_kratos)
+    now = utcnow()
+    seq = iter(range(100))
+
+    def _run(alert: str, status: str, minutes_ago: int, **extra: object) -> Investigation:
+        at = now - timedelta(minutes=minutes_ago)
+        return Investigation(
+            id=f"01FAILEDRUNS{next(seq):014d}",
+            alert_es_id=alert,
+            started_by=str(extra.pop("started_by", "auto-triage:scheduler")),
+            kind="suricata",
+            status=status,
+            created_at=at - timedelta(seconds=30),
+            finished_at=None if status == "running" else at,
+            **extra,
+        )
+
+    fallback = {
+        "verdict": "needs_more_info",
+        "is_fallback": True,
+        "report": {"resolution": {"provenance": PIPELINE_FALLBACK_PROVENANCE}},
+    }
+    hunt = {"subject_json": {"type": "hunt", "hunt_id": "h1", "document_ids": ["ev-a"]}}
+    async with maker() as db:
+        db.add_all(
+            [
+                _run("ev-a", "error", 50),
+                _run("ev-a", "complete", 20, **fallback),
+                _run("ev-a", "cancelled", 15),
+                _run("ev-a", "interrupted", 12),
+                _run("ev-a", "running", 1),
+                _run("ev-a", "error", 5, **hunt),
+                _run("ev-a", "error", 4, started_by=inv_svc.BACKTEST_ACTOR),
+                _run("ev-b", "complete", 30, verdict="false_positive"),
+                _run("ev-c", "complete", 90, **fallback),
+                _run("ev-c", "complete", 80, **fallback),
+                _run("ev-c", "complete", 70, **fallback),
+                _run("ev-c", "complete", 60, verdict="false_positive"),
+                _run("ev-c", "error", 10),
+            ]
+        )
+        await db.commit()
+
+        got = await inv_svc.failed_runs_for_alerts(db, ["ev-a", "ev-b", "ev-c", "ev-none"])
+        assert set(got) == {"ev-a", "ev-c"}
+        assert got["ev-a"] == inv_svc.FailedRuns(
+            count=2, last_at=(now - timedelta(minutes=20)).replace(tzinfo=None)
+        )
+        assert got["ev-c"].count == 1
+        assert got["ev-c"].last_at == (now - timedelta(minutes=10)).replace(tzinfo=None)
+
+        healed = await inv_svc.failed_runs_for_alerts(
+            db, ["ev-a", "ev-c"], failed_since={"ev-a": now - timedelta(minutes=35)}
+        )
+        assert healed["ev-a"].count == 1
+        assert healed["ev-c"].count == 1
+
+        assert await inv_svc.failed_runs_for_alerts(db, []) == {}
+    await engine.dispose()

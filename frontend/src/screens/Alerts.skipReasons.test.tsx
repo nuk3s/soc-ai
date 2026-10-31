@@ -102,6 +102,22 @@ describe('auto-triage skip-reason labels', () => {
     await screen.findByText('Last 24 hours: 2 investigated · 3 skipped (3 not found)');
   });
 
+  it('names the retry reasons in the Bulk Investigate summary', async () => {
+    vi.mocked(startAutoTriage).mockResolvedValue(finished({ retry_wait: 1 }));
+    await sweep();
+
+    await screen.findByText('Last 24 hours: 2 investigated · 1 skipped (1 waiting to retry)');
+    expect(screen.queryByText(/retry wait/)).toBeNull();
+  });
+
+  it('reads the retry limit as a count of alerts at the limit', async () => {
+    vi.mocked(startAutoTriage).mockResolvedValue(finished({ retry_limit: 2 }));
+    await sweep();
+
+    await screen.findByText('Last 24 hours: 2 investigated · 2 skipped (2 at the retry limit)');
+    expect(screen.queryByText(/retry limit reached/)).toBeNull();
+  });
+
   it('still spells out the reasons the planner does emit', async () => {
     vi.mocked(startAutoTriage).mockResolvedValue(
       finished({ already_triaged: 2, running: 1, inherited: 1 }),

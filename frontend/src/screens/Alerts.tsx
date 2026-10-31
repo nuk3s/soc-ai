@@ -121,6 +121,10 @@ const TRIAGE_SKIP_REASONS: Record<string, string> = {
   already_triaged: 'already triaged',
   running: 'in progress',
   inherited: 'covered by a prior verdict',
+  // A failed alert waits before its next automatic run. Same words as
+  // lib/skipReasons.ts.
+  retry_wait: 'waiting to retry',
+  retry_limit: 'at the retry limit',
 };
 
 // " (8 already triaged, 3 in-flight)" — the per-reason breakdown of a batch's

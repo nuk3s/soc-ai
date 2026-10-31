@@ -1335,7 +1335,12 @@ async def _hunt_schedule_loop(app: FastAPI) -> None:
     Note (workers>1): a second uvicorn worker would run its own copy of this loop
     and double-fire every schedule — soc-ai runs a SINGLE worker today; distributed
     scheduler coordination is Epoch 6.2, deliberately not built here.
+
+    Each hunt also reads the findings of the last complete runs of its objective
+    (:func:`soc_ai.hunting.earlier.earlier_for_objective`). The objective does not
+    change, so the run keeps its link to the earlier runs and its diff.
     """
+    from soc_ai.hunting import earlier as earlier_mod  # noqa: PLC0415
     from soc_ai.store import hunt_schedules as hs_svc  # noqa: PLC0415
     from soc_ai.webui import hunt_console_manager as hcm  # noqa: PLC0415
 
@@ -1354,12 +1359,18 @@ async def _hunt_schedule_loop(app: FastAPI) -> None:
             launched = 0
             for sched in due:
                 try:
+                    # Opens its own session and never raises, so a failed read
+                    # cannot reach the except branch below that stamps mark_ran.
+                    earlier = await earlier_mod.earlier_for_objective(
+                        app.state.db_sessionmaker, sched.objective, now=now
+                    )
                     hunt_id = await manager.start(
                         app.state,
                         objective=sched.objective,
                         started_by="scheduler",
                         kind="scheduled",
                         starter="schedule",
+                        earlier=earlier,
                     )
                     if hunt_id is None:
                         # Rejected: the shared concurrency ceiling is full (or the

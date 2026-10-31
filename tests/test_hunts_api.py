@@ -5052,7 +5052,7 @@ def test_promoting_a_reopened_lead_starts_a_new_investigation(client: TestClient
 
 
 def test_promoting_a_finding_investigates_the_whole_hunt(client: TestClient) -> None:
-    """The finding is the reason. The hunt is the subject.
+    """The finding is the subject. The hunt is context.
 
     The promoted finding's documents come first, the other findings' documents
     follow, and the record the row stores names all of them.
@@ -5124,6 +5124,8 @@ def test_promoting_a_finding_investigates_the_whole_hunt(client: TestClient) -> 
     record = subject.as_record()
     assert record["finding_titles"] == [f["title"] for f in findings]
     assert record["document_ids"] == ["tel-doc-000002", "tel-doc-000001"]
+    # Change E. The record states that the run judged one finding.
+    assert record["judges"] == "finding"
 
 
 def test_promoting_the_same_finding_twice_returns_the_first_investigation(
@@ -6539,3 +6541,162 @@ def test_a_lead_whose_hunt_did_not_run_reads_could_not_run(client: TestClient) -
     assert {errored, interrupted} <= _lead_set(client, "needs_decision")
     detail = client.get(f"/api/v1/hunts/leads/{errored}").json()
     assert detail["hunt_outcome_label"] == "Could not run"
+
+
+# ── Earlier conclusions (soc_ai.hunting.earlier) ─────────────────────────────
+
+
+def test_build_hunt_prompt_puts_the_earlier_conclusions_after_the_objective() -> None:
+    assert build_hunt_prompt("go", earlier="E") == "go\n\nE"
+    assert build_hunt_prompt("go") == "go"
+    assert build_hunt_prompt("go", earlier=None) == "go"
+
+
+def _hunt_started_payload(settings: Settings, **kwargs: Any) -> dict[str, Any]:
+    from soc_ai.so_client.elastic import EsSearchResult
+
+    async def _go() -> dict[str, Any]:
+        with (
+            patch(
+                "soc_ai.api.hunt_runner.build_investigator_model",
+                return_value=TestModel(
+                    call_tools=["t_query_events_oql"], custom_output_args=FAKE_REPORT
+                ),
+            ),
+            patch(
+                "soc_ai.agent.toolset.query_events_oql",
+                AsyncMock(return_value=EsSearchResult(total=0, took_ms=1)),
+            ),
+        ):
+            async for ev in run_hunt(_ctx(settings), objective="hunt for beaconing", **kwargs):
+                assert ev.kind == "hunt_started"
+                return dict(ev.payload)
+        raise AssertionError("no event")
+
+    return asyncio.run(_go())
+
+
+def test_run_hunt_records_the_earlier_conclusions_on_hunt_started(
+    settings_kratos: Settings,
+) -> None:
+    from soc_ai.hunting.earlier import EarlierConclusions
+
+    block = EarlierConclusions(text="E", refs={"hunts": ["H1"]})
+    assert _hunt_started_payload(settings_kratos, earlier=block) == {
+        "objective": "hunt for beaconing",
+        "earlier": "E",
+        "earlier_refs": {"hunts": ["H1"]},
+    }
+    assert _hunt_started_payload(settings_kratos) == {"objective": "hunt for beaconing"}
+
+
+def test_build_hunt_run_sends_the_block_and_labels_its_hosts(settings_kratos: Settings) -> None:
+    """The block reaches the user message. The hosts it names reach the dossier
+    with their own label, after the hosts the objective names."""
+    import re as _re
+
+    from soc_ai.api import hunt_runner
+
+    block = (
+        "Earlier conclusions about this objective. They come from the last complete runs "
+        "of the same objective:\n"
+        "- The run of 2026-10-27 01:00 UTC listed these findings:\n"
+        '  - observation: "Connect-back listener harness on host harness-01". Hosts: 192.0.2.70. '
+        "Documents: docDDDDDDDDDDDDDDDDD."
+    )
+    seen: dict[str, Any] = {}
+
+    async def _dossier(mapping: dict[str, str], **_kw: Any) -> str:
+        seen["mapping"] = dict(mapping)
+        return ""
+
+    def _ips(text: str, _settings: Any) -> list[str]:
+        return list(dict.fromkeys(_re.findall(r"192\.0\.2\.\d+", text)))
+
+    async def _go() -> str:
+        with (
+            patch.object(hunt_runner, "build_investigator_model", MagicMock()),
+            patch.object(hunt_runner, "build_hunt_agent", MagicMock()),
+            patch.object(hunt_runner, "internal_ips_in_text", _ips),
+            patch.object(hunt_runner, "host_dossier_prompt_block", _dossier),
+            patch.object(hunt_runner, "inventory_prompt_block", AsyncMock(return_value="")),
+            patch.object(hunt_runner.grid_gaps, "recent_fact_lines", AsyncMock(return_value=[])),
+        ):
+            _guard, _agent, user_msg = await hunt_runner._build_hunt_run(
+                _ctx(settings_kratos), objective="check 192.0.2.60", prior=None, earlier=block
+            )
+        return user_msg
+
+    user_msg = asyncio.run(_go())
+    assert user_msg == f"check 192.0.2.60\n\n{block}"
+    mapping = seen["mapping"]
+    assert next(iter(mapping)) == "192.0.2.60"
+    assert mapping["192.0.2.60"] == "named in the objective"
+    assert mapping["192.0.2.70"] == "named in an earlier conclusion"
+
+
+def test_the_objective_step_shows_the_earlier_conclusions_and_their_records() -> None:
+    from soc_ai.api.webui.routes_hunts import _build_hunt_timeline
+    from soc_ai.hunting import earlier
+    from soc_ai.store.models import HuntEvent
+
+    step = _build_hunt_timeline(
+        [
+            HuntEvent(
+                hunt_id="h",
+                sequence=1,
+                kind="hunt_started",
+                payload={"objective": "o", "earlier": "E", "earlier_refs": {"leads": ["46"]}},
+            )
+        ],
+        "complete",
+    )[0]
+    assert step.title == "Objective"
+    assert step.detail.startswith("o\n\nE\n\n")
+    assert "lead 46" in step.detail
+
+    dropped = _build_hunt_timeline(
+        [
+            HuntEvent(
+                hunt_id="h",
+                sequence=1,
+                kind="hunt_started",
+                payload={
+                    "objective": "o",
+                    "earlier_refs": {"hunts": ["H1"]},
+                    "earlier_dropped": "residue",
+                },
+            )
+        ],
+        "complete",
+    )[0]
+    assert earlier.DROPPED_SENTENCE in dropped.detail
+    assert "\n\nE" not in dropped.detail
+    # A row recorded before the change shows the objective alone.
+    plain = _build_hunt_timeline(
+        [HuntEvent(hunt_id="h", sequence=1, kind="hunt_started", payload={"objective": "o"})],
+        "complete",
+    )[0]
+    assert plain.detail == "o"
+
+
+def test_hunting_a_lead_by_hand_passes_the_earlier_conclusions(client: TestClient) -> None:
+    """The analyst's Hunt again runs the same body as the loop, so it carries the block."""
+    from tests.test_hunt_earlier import _investigation, _lead, _now, _promote
+
+    maker = client.app.state.db_sessionmaker
+
+    async def seed() -> tuple[int, int]:
+        old = await _lead(maker, "192.0.2.10")
+        await _promote(maker, old, [await _investigation(maker)], at=_now() - timedelta(hours=3))
+        return old, await _lead(maker, "192.0.2.10")
+
+    old, new = asyncio.run(seed())
+    start = AsyncMock(return_value="fake-hunt")
+    with patch.object(hcm.HuntConsoleManager, "start", start):
+        res = client.post(f"/api/v1/hunts/leads/{new}/hunt")
+    assert res.status_code == 200
+    block = start.await_args.kwargs["earlier"]
+    assert block is not None
+    assert block.refs["leads"] == [str(old)]
+    assert "closed as promoted at " in block.text

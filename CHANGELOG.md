@@ -51,6 +51,213 @@ All notable changes to this project are documented here. The format is based on
 - **No background work on the demo.** The demo runs no lead hunt and no reaper loop. The seed
   runs after the startup reaper, so the hunt in progress stays in progress.
 
+### Event time
+
+- **Event timeline.** The investigation page and the hunt page have a new section, Event timeline.
+  The section shows when the run is finished and two or more of its documents have an event time.
+  It lists the documents of the run in the order of their event time, in UTC. A new wave starts
+  after a gap of more than 30 minutes. The section states the gap between two waves. Each row gives
+  the time, the dataset, the two ends, the rule or the request, and a link to the document. soc-ai
+  reads the times from the documents that the run already holds. The page makes no new grid query.
+  The section counts the cited documents that have no stored time. A file hash, a CVE id or a rule
+  UUID is not a document, so the section does not count it.
+- **The list of a finding investigation.** An investigation of one hunt finding lists the documents
+  of that finding and the documents that its verdict cites. Before this fix, the list held the
+  documents of every finding of the hunt. A prod run about web exploitation showed an SSH session of
+  another finding as a wave of its own. An older investigation that judged the whole hunt keeps its
+  full list.
+- **Stories in time order.** The verdict summary, the hunt narrative and the Oracle summary keep
+  the bottom line first. Then they tell the events in time order, with UTC times. They name each
+  wave. They give each count its unit, and a window when the record states one. They never call an
+  earlier event a consequence of a later event. The investigation of a hunt finding reads the
+  documents of that finding in time order, with the waves named. When the finding cites no
+  document with an event time, the list gives the other documents of the hunt in time order with
+  no waves.
+- **A time does not resolve a citation.** The writers give the time of each record that they
+  cite. The citation check ignores a date in a citation, because every alert holds its own date.
+  An id with a time after it is still checked against the documents that the run read.
+- **The Oracle wire check.** On the tool path, the check of each Oracle request looks for a
+  learned host or user name outside the fixed system prompt and the tool definitions. The new time
+  rule put common words such as "exploit" and "hunt" in the prompt. A host with such a name
+  stopped each adjudication on the tool path.
+- **Rule prevalence waves.** The rule prevalence tool reads the fire times of a burst that is
+  longer than 30 minutes. It names each wave with its start, its end and its fire count. A rule
+  that fired in three waves on one day no longer reads as one burst. The step on the page names the
+  waves too.
+
+### Hunt findings
+
+- **Each investigation judges its own finding.** An investigation of a hunt finding decides on the
+  claim of that finding. The rest of the hunt is context. On 2026-10-24 the investigation of an SSH
+  finding gave its verdict on the exploit. It named the SSH login only as context. A lead promotion
+  still judges the hunt as a whole.
+- **A true positive needs an attack.** A login, a probe or a transfer that happened is not a true
+  positive by itself. When the evidence does not show if the activity is an attack or
+  administration, the verdict is needs more info.
+- **The anchor is a document of the finding.** The run anchors on a document that the finding
+  cites. The documents of the other findings and of the lead anchor it only when the grid holds no
+  document that the finding cites.
+- **Reuse needs the same subject.** An investigation of an alert no longer answers for a finding.
+  Two findings of one hunt never share an investigation. A finding that cites no document has no
+  subject fingerprint. A tool call is not a document. Such a finding gets its own investigation. On
+  2026-10-24 one hunt linked four different findings to one alert investigation.
+- **A link between leads goes in the narrative.** The hunt prompt and the objective of a lead hunt
+  ask for it there. A threat finding whose title names leads becomes an observation. No
+  investigation opens for it. A lead whose hunt found only such a link does not close as clean. The
+  lead page states the reason "The hunt linked this lead to other leads."
+- **The time pattern goes in the narrative.** The hunt prompt asks for the waves, their times and
+  the gaps in the narrative. It rules out a finding whose only claim is a wave, a time span or a
+  count. A scheduled hunt wrote "Exploit campaign held one wave on one host pair" as a threat
+  finding, and the finding got an investigation of its own. A finding about an attack in one wave
+  is still a finding.
+- **The investigation page names the finding.** A new finding investigation reads "Subject: F2"
+  with the title of the finding. The hunt panel reads "Context: hunt". An older finding
+  investigation keeps its old labels, because it judged the whole hunt. The tip of the hunt chip on
+  the Investigations list now says that the subject is one finding of the hunt or the whole hunt.
+  The page still names the finding after an admin deletes the hunt.
+- **The Oracle reads the claim.** The Oracle case of a finding investigation names the title and
+  the hosts of the finding. The Oracle judges that claim. The redaction learns each host of the
+  claim, so a host name reaches the Oracle as a label in the claim and in the other fields.
+
+### Re-run of a finding investigation
+
+- **Re-run.** The investigation page of a hunt finding shows Re-run investigation when the run is
+  not running. Re-run starts a new investigation of the same finding. Before this change, a
+  finished needs_more_info run of a finding could not run again. Request more info refused it,
+  and the hunt page linked only to the finished run.
+- **The route.** `POST /api/v1/hunts/{hunt_id}/findings/{ordinal}/investigate` takes the optional
+  JSON body `{"rerun": true}`. The route then starts a new run over a run that ended. A running
+  run of the finding still answers with `existing: true`. Two presses at the same time start one
+  run. Without the body, the route keeps its idempotent answer.
+- **The new run.** The new run judges the claim of the finding. It keeps the subject and the
+  synthetic-evaluation marker of the hunt. The hunt page links the finding to the new run. The
+  run writes nothing to Security Onion.
+- **The old run.** The old run stays as a record. Its page names the new run. Its Re-run, Override
+  verdict and actions are off. The needs-you count and the bell leave it out. The hunt counts the
+  finding as investigated again when the new run ends.
+- **Analyst verdict.** Re-run asks first when an analyst verdict is on the run. The verdict of the
+  new run then replaces the analyst verdict on the hunt page. The investigation of a finding has
+  no Deep re-run and no Request more info. On a run that the page calls stuck, Re-run states that
+  the server still runs the investigation.
+- **Hints.** The 409 `hunt_kind_no_rerun` hint names Re-run on the investigation of the finding.
+  For a lead run, the hint names Resolve in chat. The bulk Re-investigate skips a lead run with
+  the new reason `lead_kind`, and the list names Resolve in chat.
+
+### Host history gate
+
+- **Hunt findings.** The host history gate reads every document that a finding cites. A malware
+  alert or an attack alert among them keeps the true positive. The documents of other findings and
+  of the lead do not count. Before this change, the gate read only one document of the hunt. That
+  document was often a Zeek record. When the grid holds no document that the finding cites, the
+  gate still reads only the anchor document. That anchor is a document of another finding or of the
+  lead.
+- **Web attack evidence.** A true positive also stays when the summary or the citations name web
+  attack evidence. Examples are a web shell, a path traversal, `/etc/passwd`, a file inclusion, a
+  command injection, an SQL injection and remote code execution. Evidence of a type does not count
+  when a rule name in the alert history of the host names the same type. The word "exploit" and a
+  CVE number do not keep a true positive. The alert history of a host contains them too.
+- **The summary.** When the gate changes a true positive to needs more info, the summary keeps the
+  text of the model. The summary starts with three sentences that state the change. The
+  investigation page shows the reason under Post-validator override. Before this change, the gate
+  replaced the summary with a fixed text.
+- **The Oracle.** The gate does not run on an Oracle verdict. An Oracle true positive that changes
+  the local verdict must still cite evidence beyond the alert. The Oracle reads the change of the
+  gate at the start of the local summary. On 2026-10-29 the gate changed two Oracle true positives
+  on hunt findings back to needs more info.
+
+### Host names
+
+- **A connection document names one end.** An endpoint agent writes one document for each
+  connection and for each DNS lookup. Such a document has two ends. `t_host_summary` now reads the
+  `host.name` value of the document as the name of the agent's own end only. The
+  `network.direction` value tells that end: `egress` is the source and `ingress` is the
+  destination. On a DNS lookup document, the agent's end is the end that is not on port 53. When
+  the document does not tell the end, no end gets the name. Before this fix, a host got the name of
+  an agent that had a connection or a DNS lookup with it. This happened to hosts with an agent and
+  to hosts without one. The tool also reads an address in the form `::ffff:192.0.2.1` as the IPv4
+  address `192.0.2.1`.
+- **The tool checks the name against the machines in the store.** `t_host_summary` now checks each
+  `host.name` value against the machines in the store. The tool does not use a name when the store
+  puts the address on one machine and the name on a different machine. The field
+  `evidence.hostname_withheld` then gives the address of the other machine. An address that the
+  store does not know keeps the name. A container address that two agents report is a machine of
+  its own in the store. Such an address now gets no agent name.
+- **The host logs come from the right machine.** The `host_logs` block reads the documents of the
+  host by its address and by its resolved name. A wrong name gave the block the agent, the planes
+  and the counts of a different machine. On a live grid, the target of a test attack showed the
+  process events of the operator's own host. A hunt then read those events as the target's events.
+
+### Earlier conclusions
+
+- **Lead hunts.** A lead hunt reads the leads that closed as promoted in the last 7 days when the
+  new lead names their subject. It reads at most 3 leads. Each lead line names up to 3 entities.
+  The entities that the new lead also names come first. For each lead the hunt reads the title, the
+  verdict and the first summary sentence of up to 3 investigations. On a lab grid, four leads
+  formed on one host in 21 hours. Each hunt started with no knowledge of the conclusion before it.
+- **Scheduled hunts.** A scheduled hunt reads the findings of the last complete run of its
+  objective. It also reads up to 2 older runs from the last 7 days. Each finding line gives the
+  type, the title, the hosts, up to 3 document ids and the verdict of its investigation. soc-ai
+  skips partial runs, runs that read nothing and runs of the synthetic evaluation. On a lab grid,
+  one run named the test workspace behind an exploit. A run two days later could not name the
+  driver.
+- **Claims to check.** The hunt reads each earlier conclusion as a claim to check. The block names
+  no lead, hunt or investigation id, so the hunt cannot cite one. The citation check removes any
+  citation that the hunt did not read. The Objective step on the hunt page shows the block and its
+  source records. The objective does not
+  change, so a scheduled hunt keeps its comparison with the last run.
+- **Redaction.** With redaction in fail-closed mode, soc-ai drops a block that holds a name the
+  redaction cannot remove. The hunt then starts without the block, and the Objective step states
+  this.
+- **Investigations of the findings.** The investigation of a hunt finding reads the hunt
+  narrative, and the narrative can repeat an earlier claim. The prompt states that such a claim is
+  not evidence.
+
+### Lead hunts
+
+- **The tool name in the evidence block.** The evidence block of a lead hunt now names the tool
+  `t_get_event_raw`. Before this fix, it named `get_event_raw`. The hunt agent has no tool with
+  that name.
+
+### Held leads
+
+- **The lead page states the reason.** When a threat finding of a lead hunt has no verdict, the
+  lead waits for the analyst. The lead page now states "A threat finding of the hunt has no
+  verdict." The lead history records the hold once for each hunt. On a lab grid, one investigation
+  of a hunt finding stopped at its 900 s limit. Its lead then waited with no reason on its page.
+  Re-run the investigation of that finding on the hunt page, or decide on the lead.
+- **Subject findings only.** The settle rule reads only the investigations of findings that are
+  subjects by the current rule. The hunt page already counted only these. Before this change, a
+  failed run on an older observation entry held the lead.
+- **A reused investigation settles the lead.** An investigation of another hunt with the same
+  subject can answer for a finding. The hunt page now names that investigation on the finding, and
+  the lead settles on its verdict. Before this fix, the finding kept its failed run, so the lead
+  stayed held on each re-run.
+
+### Auto-Investigate retries
+
+- **Retry limit.** Auto-Investigate retries a failed alert two times after a short wait. After the
+  last short retry, the alert runs again once each 6 hours. A run fails when it ends in an error or
+  a pipeline fallback. The first retry waits 15 minutes, and the second waits 30 minutes. A verdict
+  on the alert resets its count. The setting `auto_triage_retry_limit` sets the number of short
+  retries, from 0 to 10. The skip reasons count the alerts that wait and the alerts at the limit.
+  The Status page counts the failed alerts that wait to retry. Bulk Investigate of selected alerts
+  and Re-run ignore the limit.
+- **Alarm.** Five failed runs with the same error in two hours open one alarm in the bell. The
+  alarm names the error. Each hour, one of the failed alerts runs again as a test. A verdict on one
+  of the failed alerts closes the alarm. The other alerts with that error then get their retries
+  back.
+- **Pause.** Five failed runs in a row with no verdict pause continuous Auto-Investigate for 15
+  minutes. Each failed run after that doubles the pause, up to one hour. A run that reaches a
+  verdict ends the pause. Bulk Investigate still runs during a pause. The Status page names the
+  pause and the error. After the pause ends, the Status page measures a missed run from the end of
+  the pause.
+- **Fallbacks in the bell.** The bell shows a pipeline fallback as a failed triage. A dismissed
+  fallback leaves the bell. The bell then shows the older verdicts in its place.
+- **Unexpected cancels.** A run that stops with an unexpected cancel fails only its own alert. The
+  batch goes on to the next alert.
+- **The reason.** On 2026-10-27 the model gateway refused the triage schema for 11 hours. The
+  scheduler ran two alerts 109 times each. The bell showed each failed run as a needs_more_info
+  verdict, and no alarm named the fault.
 ### Dependencies
 
 - `opentelemetry-api` 1.45.1. pip-audit found CVE-2026-114603 in 1.39.1. The lock drops

@@ -2634,12 +2634,42 @@ def test_format_focus_hint_block_hunt_finding_origin_is_honest() -> None:
     block = format_focus_hint_block(
         "Promoted hunt finding: Beaconing to rare external IP.", origin="hunt_finding"
     )
-    assert "## Focus: promoted hunt finding" in block
-    assert "promoted a hunt finding" in block
+    # A hunt opens these runs on its own (system:hunt), so the block names no
+    # analyst (change E, 2026-10-30).
+    assert "## Focus: hunt finding" in block
+    assert "This investigation judges one finding of a hunt." in block
+    assert "An analyst promoted" not in block
     assert "Do not assume it is correct" in block
     assert "Promoted hunt finding: Beaconing to rare external IP." in block
     assert "needs_more_info" not in block
     assert "open questions" not in block
+
+
+def test_the_hunt_prompt_keeps_lead_links_in_the_narrative() -> None:
+    """Change E. A lead hunt wrote "Leads 47 and 48 are one campaign" as a
+    threat finding, and its investigation ran 900 s and ended in error."""
+    from soc_ai.agent.hunt import HUNT_SYSTEM_PROMPT
+
+    assert "A link between leads is not activity." in HUNT_SYSTEM_PROMPT
+    assert "State a link between leads in the `narrative`." in HUNT_SYSTEM_PROMPT
+    assert "A campaign across leads is such a link." in HUNT_SYSTEM_PROMPT
+    assert "Never write it as a finding." in HUNT_SYSTEM_PROMPT
+    # The runner formats the prompt with the objective, so a brace would raise.
+    assert "Never write it as a finding." in HUNT_SYSTEM_PROMPT.format(objective="x")
+
+
+def test_the_hunt_prompt_keeps_the_time_pattern_in_the_narrative() -> None:
+    """A scheduled hunt of 2026-10-30 wrote "Exploit campaign held one wave on
+    one host pair" as a high threat finding. The claim was only the time
+    pattern of the other findings, and it got an investigation of its own. A
+    finding about an attack in one wave stays allowed: only a finding whose
+    whole claim is the time pattern is ruled out."""
+    from soc_ai.agent.hunt import HUNT_SYSTEM_PROMPT
+
+    prompt = HUNT_SYSTEM_PROMPT.format(objective="x")
+    assert "The time pattern of the activity is not activity." in prompt
+    assert "State the waves, their times and the gaps in the `narrative`." in prompt
+    assert "Never write a finding whose only claim is a wave, a time span or a count." in prompt
 
 
 def test_build_synth_first_user_message_candidate_before_evidence() -> None:
@@ -5980,7 +6010,10 @@ def test_downgrade_ungrounded_host_anchored_tp_fires_on_no_evidence() -> None:
     (separate unconfirmed alert), enrichments have no blocklist/MISP hits, focus
     alert is misc-activity (not malware class), no beacon/payload tokens in summary.
     Expected: verdict=needs_more_info, recommended_actions=[], audit entry written.
+    The text of the model stays behind a lead that states the change (change A,
+    2026-10-30).
     """
+    from soc_ai.agent.gates import _HOST_ANCHORED_TP_LEAD, _host_anchored_tp_note
     from soc_ai.agent.orchestrator import _downgrade_ungrounded_host_anchored_tp
 
     report = TriageReport(
@@ -6009,13 +6042,11 @@ def test_downgrade_ungrounded_host_anchored_tp_fires_on_no_evidence() -> None:
     assert "ungrounded_host_anchored_tp_downgrade" in audit, "audit entry must be written"
     assert audit["ungrounded_host_anchored_tp_downgrade"]["original_verdict"] == "true_positive"
     assert audit["ungrounded_host_anchored_tp_downgrade"]["downgraded_verdict"] == "needs_more_info"
-    # Summary must lead with the correct conclusion — no inline bracket.
-    assert not result.summary.startswith("[Auto-downgraded")
-    assert "insufficient" in result.summary.lower() or "re-investigate" in result.summary.lower()
-    # Override explanation in validator_note; original summary preserved there.
-    assert result.validator_note is not None
-    assert "true_positive" in result.validator_note
-    assert "BPFDoor" in result.validator_note  # original summary text
+    # The summary leads with the change, then keeps the text of the model.
+    assert result.summary == (
+        f"{_HOST_ANCHORED_TP_LEAD} BPFDoor C2 confirmed by host profile and absence of reputation."
+    )
+    assert result.validator_note == _host_anchored_tp_note(False)
 
 
 def test_downgrade_ungrounded_host_anchored_tp_skipped_with_blocklist_hit() -> None:

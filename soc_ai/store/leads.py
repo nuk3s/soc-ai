@@ -30,6 +30,8 @@ __all__ = [
     "DISMISS_REASONS",
     "GRID_GAP_REASON",
     "HOLD_EARLIER_THREAT",
+    "HOLD_LEAD_LINK",
+    "HOLD_NO_VERDICT",
     "HOLD_PARTIAL_READ",
     "HOLD_SENTENCES",
     "HUNT_CLEAN_REASON",
@@ -119,9 +121,20 @@ AUTO_HUNT_RETRY_LIMIT = 2
 # lead waits on the analyst, and the lead page states the reason.
 HOLD_PARTIAL_READ = "partial_read"
 HOLD_EARLIER_THREAT = "earlier_threat"
+# The hunt claimed a link between this lead and other leads, and the gate
+# lowered that finding to an observation (change E, 2026-10-30). The claim
+# says the activity is part of a campaign, so the lead is no clean answer.
+HOLD_LEAD_LINK = "lead_link"
+# Why the settle rule did not close a lead whose hunt investigated its subject
+# findings: one of them has no verdict. The run failed, fell back, was
+# cancelled or never started. The documented rule leaves the lead to the
+# analyst. Prod lead 47 (2026-10-24) waited with no reason on its page.
+HOLD_NO_VERDICT = "no_verdict"
 HOLD_SENTENCES: dict[str, str] = {
     HOLD_PARTIAL_READ: "The hunt could not read all evidence.",
     HOLD_EARLIER_THREAT: "An earlier hunt found a threat.",
+    HOLD_LEAD_LINK: "The hunt linked this lead to other leads.",
+    HOLD_NO_VERDICT: "A threat finding of the hunt has no verdict.",
 }
 
 # The decision an analyst records when an investigation of one of the lead's
@@ -650,13 +663,17 @@ async def _clean_close_blocker(db: AsyncSession, hunt: Hunt) -> str | None:
     - ``partial_read``: the report holds a visibility gap, a tool call failed
       in the trace, the run was degraded, or the report came from the
       budget synthesizer.
+    - ``lead_link``: the citation gate lowered a threat finding that linked
+      this lead to other leads (``lead_links`` on the ``citation_validation``
+      event). A partial read wins over it, so the reason does not depend on
+      the order of the events.
 
     Every test reads a structured signal: the finding category, the tool
-    result's error, the ``error`` event, and the ``degraded`` and ``partial``
-    flags on the ``done`` event. A console string decides nothing, because a
-    wording edit in the runner then made a partial hunt close its lead as
-    clean. The one exception is a row recorded before the ``partial`` flag
-    existed (see :data:`_LEGACY_PARTIAL_TEXT`).
+    result's error, the ``error`` event, the ``degraded`` and ``partial``
+    flags on the ``done`` event, and the ``lead_links`` count. A console
+    string decides nothing, because a wording edit in the runner then made a
+    partial hunt close its lead as clean. The one exception is a row recorded
+    before the ``partial`` flag existed (see :data:`_LEGACY_PARTIAL_TEXT`).
     """
     if hunt.lead_id is not None:
         earlier = await db.scalars(
@@ -679,14 +696,20 @@ async def _clean_close_blocker(db: AsyncSession, hunt: Hunt) -> str | None:
     events = await db.scalars(
         select(HuntEvent).where(
             HuntEvent.hunt_id == hunt.id,
-            HuntEvent.kind.in_(("tool_result", "done", "model_response", "error")),
+            HuntEvent.kind.in_(
+                ("tool_result", "done", "model_response", "error", "citation_validation")
+            ),
         )
     )
     rows = [(e.kind, e.payload if isinstance(e.payload, dict) else {}) for e in events.all()]
     # A ``done`` event that carries the partial key states the fact. Only a row
     # recorded before the key existed falls back to its frozen stored text.
     flagged = any(kind == "done" and _DONE_PARTIAL_KEY in payload for kind, payload in rows)
+    linked = False
     for kind, payload in rows:
+        if kind == "citation_validation":
+            linked = linked or _int_count(payload.get("lead_links")) > 0
+            continue
         if kind == "error":
             return HOLD_PARTIAL_READ
         if kind == "tool_result" and _tool_failed(payload.get("result")):
@@ -699,7 +722,14 @@ async def _clean_close_blocker(db: AsyncSession, hunt: Hunt) -> str | None:
             and str(payload.get("text") or "").startswith(_LEGACY_PARTIAL_TEXT)
         ):
             return HOLD_PARTIAL_READ
-    return None
+    return HOLD_LEAD_LINK if linked else None
+
+
+def _int_count(value: Any) -> int:
+    """A stored count as an int. A value that is no count reads as 0."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    return int(value)
 
 
 async def derived_hold_reason(db: AsyncSession, lead: Lead) -> str | None:
@@ -709,8 +739,13 @@ async def derived_hold_reason(db: AsyncSession, lead: Lead) -> str | None:
     reopened has no ``held`` entry in its history. The page still has to say
     why the clean answer did not settle it. Read the hunt it names and apply
     :func:`_clean_close_blocker` on read. A recorded hold wins.
+
+    A ``hunting`` lead whose hunt investigated its subject findings, and
+    settled before :data:`HOLD_NO_VERDICT` existed, has no ``held`` entry
+    either. When a subject finding still has no verdict, the hold is read
+    on read too.
     """
-    if lead.status != "open" or lead.hunt_id is None:
+    if lead.hunt_id is None or lead.status not in ("open", "hunting"):
         return None
     recorded = hold_reason_of(lead)
     if recorded is not None:
@@ -718,22 +753,49 @@ async def derived_hold_reason(db: AsyncSession, lead: Lead) -> str | None:
     hunt = await db.get(Hunt, lead.hunt_id)
     if hunt is None or hunt.status in HUNT_RUNNING_STATUSES:
         return None
+    if lead.status == "hunting":
+        if not _verdicts_decide(hunt) or analyst_dismissed(lead):
+            return None
+        links = _subject_links(hunt)
+        if links and await _subject_verdicts(db, hunt, links) is None:
+            return HOLD_NO_VERDICT
+        return None
     if hunt_outcome_of(hunt) != "clean":
         return None
     return await _clean_close_blocker(db, hunt)
 
 
-async def _subject_verdicts(db: AsyncSession, hunt: Hunt) -> list[dict[str, Any]] | None:
+def _verdicts_decide(hunt: Hunt) -> bool:
+    """Whether the verdicts of the hunt's subject findings answer its lead."""
+    return hunt.status == "complete" and int(getattr(hunt, "findings_total", 0) or 0) > 0
+
+
+def _subject_links(hunt: Hunt) -> dict[int, Any]:
+    """The hunt's finding entries on findings that are subjects by the current rule.
+
+    The hunt page and the verdict counts drop an entry on a finding that is
+    no subject now (:func:`soc_ai.store.hunts.subject_links`). The settle
+    rule read every entry, so a lead waited on the failed run of an
+    observation that the page did not count.
+    """
+    from soc_ai.store.hunts import finding_links, subject_links  # noqa: PLC0415 - import cycle
+
+    report = hunt.report if isinstance(hunt.report, dict) else {}
+    return subject_links(finding_links(hunt), report.get("findings"))
+
+
+async def _subject_verdicts(
+    db: AsyncSession, hunt: Hunt, links: dict[int, Any]
+) -> list[dict[str, Any]] | None:
     """The verdict of every subject finding of the hunt, or None when one has none.
 
+    ``links`` holds the entries of the subject findings (:func:`_subject_links`).
     One entry per subject finding, in ordinal order: the ordinal, the
     investigation, its verdict and its confidence. Only a complete run that is
     not a pipeline fallback carries a verdict.
     """
-    from soc_ai.store.hunts import finding_links  # noqa: PLC0415 - avoids an import cycle
     from soc_ai.store.models import Investigation  # noqa: PLC0415 - local, like the hunt reads
 
-    links = finding_links(hunt)
     if not links:
         return None
     ids = [link.investigation_id for link in links.values() if link.investigation_id]
@@ -800,12 +862,32 @@ async def settle_after_hunt(db: AsyncSession, hunt: Hunt, *, now: datetime | Non
     # of them has a verdict, the verdicts answer the lead: it closes as
     # promoted, in the hunt's hand, with each verdict recorded. A subject with
     # no verdict, a failed run or one past the cap, leaves the lead to the
-    # analyst. A hunt with no subject settles by the rules below, as before.
-    if hunt.status == "complete" and int(getattr(hunt, "findings_total", 0) or 0) > 0:
+    # analyst, and the history records why (HOLD_NO_VERDICT). A hunt with no
+    # subject settles by the rules below, as before. An entry on a finding
+    # that is no subject by the current rule counts for neither.
+    links = _subject_links(hunt) if _verdicts_decide(hunt) else {}
+    if links:
         if analyst_dismissed(lead):
             return "waits"
-        decided = await _subject_verdicts(db, hunt)
+        decided = await _subject_verdicts(db, hunt, links)
         if decided is None:
+            # Recorded once per hunt, like the hold of a clean hunt. Prod lead
+            # 47 (2026-10-24) waited on one failed run with no reason on its
+            # page, while its sibling lead with every verdict closed.
+            if hold_reason_of(lead) != HOLD_NO_VERDICT:
+                record_decision(
+                    lead,
+                    "held",
+                    at,
+                    by=SYSTEM_HUNT_ACTOR,
+                    reason=HOLD_NO_VERDICT,
+                    hunt_id=hunt.id,
+                )
+                lead.updated_at = at
+                await db.commit()
+                _LOGGER.info(
+                    "lead %s waits: a subject finding of hunt %s has no verdict", lead.id, hunt.id
+                )
             return "waits"
         first = next((v for v in decided if v["verdict"] == "true_positive"), decided[0])
         await mark_promoted(
@@ -1010,7 +1092,10 @@ def objective_for(
         for other in list(related)[:8]:
             names = ", ".join(_entity_names(other.entities)) or "the entity"
             lines.append(f"- lead {other.lead_id} on {names}: {other.reason}")
-        lines.append("State whether these leads and this one are one campaign, with the evidence.")
+        lines.append(
+            "State in the narrative whether these leads and this one are one campaign. "
+            "Name the evidence. Never write the link as a finding."
+        )
     lines.append(
         "Decide whether these observations together describe malicious activity on this "
         "entity. Name what you could not check."
@@ -1097,7 +1182,7 @@ def evidence_block_for(
             )
     if any_ids:
         lines.append(
-            "Read each document id with get_event_raw before you run any query. "
+            "Read each document id with t_get_event_raw before you run any query. "
             "Judge the observations from these documents first. Then widen the search."
         )
     if any_query:

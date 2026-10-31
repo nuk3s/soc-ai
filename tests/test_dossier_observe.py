@@ -795,6 +795,16 @@ async def test_targeted_searches_sort_newest_first() -> None:
         assert call["size"] == 20
 
 
+async def test_the_identity_envelope_projects_the_local_end_fields() -> None:
+    """The host.name read goes through names_the_shipper, which places the local end."""
+    es = _FakeES(main_aggs=_MAIN_AGGS, main_total=3412, targeted_hits=_TARGETED_HITS)
+
+    await _collect(es)
+
+    projected = _one(es, "zeek.http|zeek.ssl")["source"]
+    assert {"network.direction", "event.action"} <= set(projected)
+
+
 async def test_dhcp_lease_is_collected() -> None:
     es = _FakeES(main_aggs=_MAIN_AGGS, main_total=3412, targeted_hits=_TARGETED_HITS)
 

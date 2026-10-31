@@ -106,6 +106,9 @@ export function rangeToSinceUntil(
 //   absoluteTime(iso)     "2026-10-01 08:18 EDT", in the browser zone
 //   formatDuration(199)   "3m 19s"
 //   timeLabel(iso)        { text: ago, title: absoluteTime } for a cell
+//   utcStamp(iso)         "2026-10-05 04:12 UTC", or with { seconds: true }
+//                         "2026-10-05 04:12:09 UTC"
+//   utcWindow(a, b)       "2026-10-05 04:00 to 05:00 UTC"
 //
 // A list states the relative time and puts the absolute time in the title.
 // A line that dates a record states the absolute time with its zone.
@@ -227,4 +230,41 @@ export function agoWords(iso: string | null | undefined): string {
   const hours = Math.floor(minutes / 60);
   if (hours < 24) return unit(hours, 'hour');
   return unit(Math.floor(hours / 24), 'day');
+}
+
+/** UTC with seconds, for a list of event times where two documents can share
+ *  a minute. */
+export interface UtcOptions {
+  seconds?: boolean;
+}
+
+function utcParts(at: Date, opts: UtcOptions): [string, string] {
+  const [day, time] = at.toISOString().slice(0, opts.seconds ? 19 : 16).split('T');
+  return [day, time];
+}
+
+/** A time in UTC with the zone named: "2026-10-05 04:12 UTC", or
+ *  "2026-10-05 04:12:09 UTC" with `{ seconds: true }`. The lead timeline and
+ *  the Event timeline state their times in UTC, because the summaries and the
+ *  queries the server writes are in UTC. */
+export function utcStamp(iso: string | null | undefined, opts: UtcOptions = {}): string {
+  if (!iso) return 'no time on record';
+  const at = new Date(iso);
+  if (Number.isNaN(at.getTime())) return iso;
+  const [day, time] = utcParts(at, opts);
+  return `${day} ${time} UTC`;
+}
+
+/** A window in UTC: "2026-10-05 04:00 to 05:00 UTC", or with both dates when
+ *  the window crosses midnight. One instant reads as one time. */
+export function utcWindow(start: string, end: string, opts: UtcOptions = {}): string {
+  const a = new Date(start);
+  const b = new Date(end);
+  if (Number.isNaN(a.getTime()) || Number.isNaN(b.getTime())) return `${start} to ${end}`;
+  const [aDay, aTime] = utcParts(a, opts);
+  const [bDay, bTime] = utcParts(b, opts);
+  if (aDay === bDay && aTime === bTime) return `${aDay} ${aTime} UTC`;
+  return aDay === bDay
+    ? `${aDay} ${aTime} to ${bTime} UTC`
+    : `${aDay} ${aTime} to ${bDay} ${bTime} UTC`;
 }

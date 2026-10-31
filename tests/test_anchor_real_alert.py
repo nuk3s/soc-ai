@@ -233,6 +233,30 @@ def test_ack_events_refuses_when_the_grid_does_not_answer(client: TestClient) ->
     write_spy.assert_not_awaited()
 
 
+def test_a_real_alert_a_finding_anchors_keeps_its_writes(client: TestClient) -> None:  # noqa: F811
+    """Change E. A finding run anchors on a document of its own finding, and
+    that is often a suricata alert. The alert keeps its writes: ack-events
+    acks it and a new run on it keeps SO writes on."""
+    install(client, alerts={"es-wmi"})
+    _finding_on(client, "INV-FINDING", "es-wmi")
+    res, write_spy = _ack_events(client, ["es-wmi"])
+    assert res.status_code == 200, res.text
+    assert res.json()["acked"] == 1
+    write_spy.assert_awaited_once()
+    assert _investigate(client, "es-wmi").get("allow_so_writes") is True
+
+
+def test_a_real_alert_a_finding_anchors_fails_closed_when_the_grid_does_not_answer(
+    client: TestClient,  # noqa: F811
+) -> None:
+    install(client, alerts={"es-wmi"}, down=True)
+    _finding_on(client, "INV-FINDING", "es-wmi")
+    res, write_spy = _ack_events(client, ["es-wmi"])
+    assert res.status_code == 503, res.text
+    assert res.json()["detail"]["reason"] == "anchor_unread"
+    write_spy.assert_not_awaited()
+
+
 # ── A new run over an anchor ────────────────────────────────────────────────
 
 
@@ -285,7 +309,8 @@ def _manager() -> AsyncMock:
     ("grid", "reason"),
     [
         ({"alerts": {"es-wmi"}}, None),
-        ({"telemetry": {"es-wmi"}}, "hunt_kind"),
+        # A promoted lead anchors the document, so the reason names the lead.
+        ({"telemetry": {"es-wmi"}}, "lead_kind"),
         ({"alerts": {"es-wmi"}, "down": True}, "anchor_unread"),
     ],
 )
@@ -309,6 +334,22 @@ def test_rehunt_reruns_the_alert_run_of_a_real_alert(
         assert body["started"] == []
         assert body["skipped"] == [{"invId": "INV-WMI", "reason": reason}]
         mgr.start.assert_not_awaited()
+
+
+def test_rehunt_names_the_finding_for_a_row_over_a_finding_anchor(
+    client: TestClient,  # noqa: F811
+) -> None:
+    """NEGATIVE CONTROL of the lead reason. A promoted finding anchors the
+    document, so the reason names the finding and its Re-run."""
+    install(client, telemetry={"es-wmi"})
+    _seed(client, "INV-WMI", alert_id="es-wmi", verdict="needs_more_info", hours_ago=2)
+    _finding_on(client, "INV-F2", "es-wmi")
+    mgr = _manager()
+    with patch("soc_ai.webui.hunt_manager.get_manager", return_value=mgr):
+        res = client.post("/api/v1/investigations/rehunt", json={"inv_ids": ["INV-WMI"]})
+    assert res.status_code == 200, res.text
+    assert res.json()["skipped"] == [{"invId": "INV-WMI", "reason": "hunt_kind"}]
+    mgr.start.assert_not_awaited()
 
 
 @pytest.mark.parametrize(

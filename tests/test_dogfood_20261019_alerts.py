@@ -598,8 +598,75 @@ def test_a_rule_prevalence_burst_states_no_rate() -> None:
     )
     _assert_operator_text(step)
     assert "The rule fired 12 times on 1 day in the 30-day window." in step.detail
-    assert "The fires form one burst." in step.detail
+    # No span and no waves: the step claims no one burst (change D). Fires
+    # form waves. The rule has a rate, or it has none.
+    assert "The rule has no daily rate." in step.detail
+    assert "form no daily rate" not in step.detail
+    assert "one burst" not in step.detail
     assert "/day" not in step.detail.split("\nquery:")[0]
+
+
+def _burst_result(**over: Any) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "observed": True,
+        "lookback_days": 30,
+        "total_fires": 10,
+        "active_days": 1,
+        "distinct_src_hosts": 3,
+        "distinct_dest_hosts": 1,
+        "is_burst": True,
+        "fires_per_day": None,
+        "noisiness": "burst",
+        "summary": "'ET X' fired 10x in 3 waves.",
+    }
+    result.update(over)
+    return result
+
+
+def test_a_rule_prevalence_burst_states_its_waves() -> None:
+    """A prod rule fired in three waves on one day. The step read "The fires
+    form one burst." and the hunt wrote "one 19.7-hour burst" (change D)."""
+    day = (datetime.now(UTC) - timedelta(days=3)).strftime("%Y-%m-%d")
+    waves = [
+        {"start": f"{day}T01:11:56Z", "end": f"{day}T01:18:09Z", "fires": 4},
+        {"start": f"{day}T14:56:33Z", "end": f"{day}T15:01:48Z", "fires": 4},
+        {"start": f"{day}T20:56:47Z", "end": f"{day}T20:56:47Z", "fires": 2},
+    ]
+    step = _tool_detail(
+        "t_rule_prevalence",
+        {"rule_name": "ET X"},
+        _burst_result(observed_span_seconds=71091.0, waves=waves, wave_count=3),
+    )
+    _assert_operator_text(step)
+    assert "The fires form 3 waves." in step.detail
+    assert f"Wave 1: 4 fires from {day} 01:11:56 to 01:18:09 UTC." in step.detail
+    assert f"Wave 3: 2 fires at {day} 20:56:47 UTC." in step.detail
+    assert step.detail.index("Wave 3:") < step.detail.index("Type: burst.")
+
+    one = _tool_detail(
+        "t_rule_prevalence",
+        {"rule_name": "ET X"},
+        _burst_result(observed_span_seconds=71091.0, waves=waves[:1], wave_count=1),
+    )
+    assert f"The fires form one wave, from {day} 01:11:56 to 01:18:09 UTC." in one.detail
+
+    unknown = _tool_detail(
+        "t_rule_prevalence",
+        {"rule_name": "ET X"},
+        _burst_result(observed_span_seconds=71091.0, waves=None, wave_count=None),
+    )
+    _assert_operator_text(unknown)
+    assert "The rule has no daily rate." in unknown.detail
+    assert "form no daily rate" not in unknown.detail
+    assert "The first and the last fire are 19 h 44 min apart." in unknown.detail
+    assert "That span can hold one wave or several waves." in unknown.detail
+
+    short = _tool_detail(
+        "t_rule_prevalence",
+        {"rule_name": "ET X"},
+        _burst_result(observed_span_seconds=59.0),
+    )
+    assert "The fires form one wave." in short.detail
 
 
 def test_an_origin_chain_answer_reads_in_ste() -> None:

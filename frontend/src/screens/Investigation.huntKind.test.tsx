@@ -3,6 +3,11 @@
 // every SO write for it (Task 6). These tests pin the honest-UI half: every
 // affordance that would end in a refused write is hidden or disabled, and
 // the finding's provenance (which hunt, which objective) is always visible.
+//
+// The fixtures below carry no promotedFinding: the run names no finding of a
+// hunt the store still holds, so the page has no finding to re-run and points
+// at the hunt. A finding run with its finding has Re-run (the promote route
+// with rerun true). Investigation.findingRerun.test.tsx pins that half.
 import { fireEvent, render, screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { describe, expect, it, vi } from 'vitest';
@@ -108,7 +113,7 @@ describe('hunt-kind provenance strip', () => {
 });
 
 describe('hunt-kind toolbar gates', () => {
-  it('hides Re-run and Deep re-run for a promoted finding', () => {
+  it('hides Re-run and Deep re-run for a finding run with no finding to re-run', () => {
     render(
       <MemoryRouter>
         <Investigation
@@ -170,9 +175,10 @@ describe('hunt-kind toolbar gates', () => {
 
 describe('hunt-kind error-state re-run', () => {
   // An errored/interrupted/cancelled run is exactly when an analyst reaches
-  // for Re-run — but the API refuses it (409 hunt_kind_no_rerun) once
-  // promotion owns the anchor. failedEl points to the sanctioned path
-  // instead of offering a dead-end button.
+  // for Re-run. POST /hunt refuses it (409 hunt_kind_no_rerun) once
+  // promotion owns the anchor, and a run with no finding on record cannot
+  // use the promote route. failedEl points to the hunt instead of offering
+  // a dead-end button.
   it('replaces Re-run with a re-promote pointer to the hunt on a failed run', () => {
     const { container } = render(
       <MemoryRouter>
@@ -278,11 +284,10 @@ describe('hunt-kind pipeline-fallback re-run', () => {
 
 describe('hunt-kind inconclusive/needs_more_info wayfinding', () => {
   // F13 (1.3 dogfood): a complete hunt-kind run that lands inconclusive (or
-  // needs_more_info) has every re-run affordance hidden — Re-run, Deep
-  // re-run, Request more info all gate on kind!=='hunt' — yet the
-  // inconclusive copy said "dig deeper with a focused re-investigation".
-  // That names a path that does not exist on this screen. The hunt-kind copy
-  // now says what actually refines a promoted finding.
+  // needs_more_info) with no finding to re-run has every re-run affordance
+  // hidden, yet the inconclusive copy said "dig deeper with a focused
+  // re-investigation". That names a path that does not exist on this
+  // screen. The hunt-kind copy now says what refines the finding.
   it('replaces the focused-re-investigation copy with re-promote wayfinding on an inconclusive promoted finding', () => {
     const { container } = render(
       <MemoryRouter>

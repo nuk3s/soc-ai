@@ -43,7 +43,8 @@ Two controls start the next step:
   investigates its findings.
 - **Open an investigation:** an investigation ends in a verdict, recommended actions and an audit
   record. Its actions go to Security Onion. The hunt page offers this control on a finding with no
-  investigation.
+  investigation. To run the investigation of a finding again, use **Re-run investigation** on its
+  investigation page.
 
 The alert drawer, the investigation page, the lead page and the hunt page each show a flow strip
 under the header. The strip names each step and its state: done, current, next or
@@ -533,7 +534,16 @@ by rule and shows the newest first.
   The default is critical and high. `auto_triage_max_targets` caps a single
   run at 25 targets, so one click cannot start dozens of investigations. The
   next run takes the remaining uncovered alerts. The status chip shows the hunted, total and
-  skipped counts with the chosen severities.
+  skipped counts with the chosen severities. Bulk Investigate skips an alert that waits to
+  retry after a failed run.
+- **Failed runs:** Auto-Investigate retries a failed alert two times after a short wait. The
+  first retry waits 15 minutes, and the second waits 30 minutes. After the last short retry, the
+  alert runs again once each 6 hours. A run fails when it ends in an error or a pipeline
+  fallback. `auto_triage_retry_limit` sets the number of short retries. Five failed runs with the same
+  error in two hours open an alarm in the bell. Each hour, one failed alert runs again as a
+  test. A verdict on one of the failed alerts closes the alarm. Five failed runs in a row with
+  no verdict pause continuous Auto-Investigate for 15 to 60 minutes. Bulk Investigate runs
+  during a pause. Bulk Investigate of selected alerts and Re-run ignore the retry limit.
 
 ## Investigations
 
@@ -561,11 +571,34 @@ A recommended action that disagrees with the analyst verdict has its write butto
 off on the action card. The card states the reason. The action does not count as
 waiting.
 
+**Re-run of a finding:** the investigation page of a hunt finding shows **Re-run
+investigation** when the run is not running. Re-run starts a new investigation of the same
+finding. The old run stays as a record, and the hunt page links the finding to the new run. The
+page of the old run names the new run, and its actions are off. While a run of the finding runs,
+Re-run opens that run. Re-run asks first when an analyst verdict is on the run. A finding
+investigation has no **Deep re-run** and no **Request more info**. The bulk **Re-investigate** of
+this list skips a finding investigation. Use Re-run on its page. The bulk **Re-investigate** also
+skips a lead investigation. Use **Resolve in chat** on its page. [Hunting](HUNTING.md#re-run)
+gives the rules.
+
 **Backtest replays:** the list hides the investigations that a backtest ran. The
 header figures do not count them. The header line names how many replays it left
 out. Turn on **Show backtest replays** to add them to the list and to the figures.
 A grey **Backtest replay** chip marks each replay. The Dashboard counts never
 include a replay. The [Backtest](#backtest) section gives the reason.
+
+**Event timeline:** the investigation page and the hunt page show an Event timeline
+section. The section shows when the run is finished and two or more of its
+documents have an event time. It lists the documents of the run in the order of
+their event time, in UTC. Each row gives the time, the dataset, the two ends, the rule or the request,
+and a link to the document. A new wave starts after a gap of more than 30 minutes
+between two documents on the list. A wave groups documents by time only. The
+section states the gap between two waves. On the hunt page, a chip such as F2 names
+the finding that cites the document. An investigation of one hunt finding lists the
+documents of that finding and the documents that its verdict cites. The documents of
+the other findings of the hunt are not on its list. soc-ai builds the section from the documents
+that the run already holds. It makes no new grid query. The section counts the
+cited documents that have no stored time.
 
 ## Hunts
 
@@ -582,7 +615,8 @@ A lead settles when its hunt finishes. A hunt that found no threat closes the
 lead. The lead then shows under Closed as "Closed. The hunt found no threat." with
 the chip "closed by soc-ai". A hunt closes the lead only when it read its
 evidence. A lead stays under Needs decision if its hunt could not read all
-evidence, or if an earlier hunt found a threat. The lead page states the reason. A
+evidence, or if an earlier hunt found a threat. A finding that linked the lead to
+other leads also keeps it there. The lead page states the reason. A
 hunt that found a threat or a visibility gap leaves the lead under Needs decision. If its hunt could not run on two attempts, the lead stays there as
 "Hunted · Could not run", with Hunt again.
 
@@ -813,8 +847,12 @@ Connections. A row that soc-ai could not read says unknown. It never says up.
 continuous Auto-Investigate, the dossier sweep, the discovery scan, the audit
 chain check, the nightly quality eval and the backup. Each row shows the state,
 the last run, the last result and a link to its setting. The audit chain row
-tells a clean check from a check that could not read the audit index. soc-ai
-keeps some of these times in memory, so a restart clears them.
+tells a clean check from a check that could not read the audit index. The
+continuous Auto-Investigate row shows failed when investigations fail with the
+same error. It also shows failed during a pause and when an alert reaches the
+retry limit. The row title names the error. When a run starts no investigation
+and failed alerts wait to retry, the row gives their count. soc-ai keeps some of
+these times in memory, so a restart clears them.
 
 **Escalations awaiting an answer** lists each escalation claim that has no answer
 from Security Onion yet. Each row links to its alert.

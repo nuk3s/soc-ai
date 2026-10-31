@@ -47,6 +47,16 @@ DETECTOR_DATASETS = frozenset({"suricata.alert", "sigma.alert", "zeek.notice"})
 NO_EVIDENCE_HINT = "None of the citations resolve to an event on the grid."
 # The hint of a promotion the investigation manager did not start.
 COULD_NOT_START_HINT = "The console did not start the run. Check the model gateway in Settings."
+# The remedy that a refused re-run of a finding run names. Re-run on the
+# investigation page posts the promote route with ``rerun`` (the 409
+# hunt_kind_no_rerun of Request more info and of POST /hunt).
+FINDING_RERUN_HINT = "Use Re-run on the investigation of the finding."
+# The same refusal for the run of a promoted lead. The console has no re-run
+# of a lead run, and Resolve in chat is on the investigation page.
+LEAD_NO_RERUN_HINT = (
+    "Request more info does not apply to a promoted lead. "
+    "Use Resolve in chat to settle the verdict."
+)
 
 
 class PromotionRefused(Exception):
@@ -95,14 +105,24 @@ async def resolve_finding_anchor(
 def anchor_from_subject(subject: HuntSubject) -> str | None:
     """The anchor document of a hunt-subject run, from the documents it holds.
 
-    Same rule as :func:`resolve_finding_anchor`: the promoted finding's
-    documents come first and telemetry wins over a detector's claim. No second
-    grid read, because the subject builder fetched these documents already.
+    Same rule as :func:`resolve_finding_anchor`: telemetry wins over a
+    detector's claim. No second grid read, because the subject builder fetched
+    these documents already.
+
+    Change E (2026-10-30): on a finding run the pool is the documents that the
+    promoted finding cites, in subject order. Telemetry wins inside the pool,
+    else the first document of the pool wins. Before, telemetry from ANY
+    finding won: run 01M5WRBJZRB348GX4MZTY1GS59 judged a finding that cites two
+    suricata alerts and anchored on a Zeek record that another finding cites.
+    A lead subject, or a finding with no resolved document, keeps the rule over
+    every document of the subject.
     """
-    for doc in subject.documents:
+    focus = set(subject.promoted_document_ids())
+    pool = [d for d in subject.documents if d.id in focus] or subject.documents
+    for doc in pool:
         if str(doc.event_dataset or "").lower() not in DETECTOR_DATASETS:
             return doc.id
-    return subject.documents[0].id if subject.documents else None
+    return pool[0].id if pool else None
 
 
 def promotion_focus(
@@ -112,10 +132,21 @@ def promotion_focus(
     detail: str,
     hosts: Sequence[str],
     hunt_subject: bool,
+    finding_subject: bool = False,
 ) -> str:
-    """The focus block the investigator reads first."""
+    """The focus block the investigator reads first.
+
+    ``finding_subject`` (change E): the subject has a promoted finding, and
+    the run judges the claim of that finding. A lead promotion judges the hunt.
+    """
     host_text = ", ".join(hosts) or "none named"
     lead_in = f"Promoted {focus_origin.replace('_', ' ')}: {title}. {detail} Hosts involved: "
+    if hunt_subject and finding_subject:
+        return (
+            f"{lead_in}{host_text}. The subject of this investigation is this finding. "
+            "Judge its claim. Read the rest of the hunt as context. Do not assume the "
+            "framing is correct."
+        )
     if hunt_subject:
         return (
             f"{lead_in}{host_text}. The subject of this investigation is the hunt, not one "
@@ -168,8 +199,9 @@ async def start_promotion(
 
     ``subject`` (D2) carries the hunt. The run reads the hunt's objective, its
     findings and every document they cite. The anchor is one document, because
-    the pipeline anchors its time windows on one timestamp, but the subject of
-    the verdict is the hunt.
+    the pipeline anchors its time windows on one timestamp. A finding promotion
+    judges the claim of that finding, and the rest of the hunt is context. A
+    lead promotion judges the hunt (change E).
 
     ``ctx`` is the context the run uses. None builds a fresh one from
     ``state``, which is the route's case. The hunt runner passes a copy of its
@@ -184,6 +216,7 @@ async def start_promotion(
         detail=detail,
         hosts=hosts,
         hunt_subject=subject is not None,
+        finding_subject=subject is not None and subject.promoted_finding is not None,
     )
     kwargs: dict[str, Any] = {
         "alert_id": anchor_id,
@@ -233,6 +266,8 @@ def fresh_context(ctx: InvestigationContext) -> InvestigationContext:
 __all__ = [
     "COULD_NOT_START_HINT",
     "DETECTOR_DATASETS",
+    "FINDING_RERUN_HINT",
+    "LEAD_NO_RERUN_HINT",
     "NO_EVIDENCE_HINT",
     "PromotionRefused",
     "anchor_from_subject",

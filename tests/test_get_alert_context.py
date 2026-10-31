@@ -1292,6 +1292,41 @@ async def test_get_enriched_alert_context_returns_enriched_shape(
 
 
 @pytest.mark.asyncio
+async def test_the_host_alert_profile_states_its_window(
+    settings_kratos: Settings, sample_alert: dict[str, Any]
+) -> None:
+    """The profile counts the alerts within host_risk_window_hours each side of
+    the alert. The context states that window, so the model can give the count
+    its window (change D). A dump stored before the field reads None."""
+    from soc_ai.enrichment.blocklists import BlocklistDB
+    from soc_ai.enrichment.cloud_tags import CloudPrefixDB
+    from soc_ai.enrichment.maxmind import MaxmindReader
+    from soc_ai.tools.enrichment import EnrichmentContext
+    from soc_ai.tools.get_alert_context import (
+        EnrichedAlertContext,
+        get_enriched_alert_context,
+    )
+
+    elastic, _fake_es = _make_elastic(
+        settings_kratos,
+        [_alert_lookup_response(sample_alert), *([_EMPTY_HITS] * 6)],
+    )
+    ctx = await get_enriched_alert_context(
+        "alert-001",
+        elastic=elastic,
+        settings=settings_kratos,
+        enrichment=EnrichmentContext(
+            blocklist=BlocklistDB(), maxmind=MaxmindReader(), cloud=CloudPrefixDB()
+        ),
+    )
+    assert ctx.host_alert_window_hours == settings_kratos.host_risk_window_hours
+    stored = ctx.model_dump(mode="json")
+    assert stored["host_alert_window_hours"] == settings_kratos.host_risk_window_hours
+    stored.pop("host_alert_window_hours")
+    assert EnrichedAlertContext.model_validate(stored).host_alert_window_hours is None
+
+
+@pytest.mark.asyncio
 async def test_get_enriched_alert_context_enriches_external_indicators(
     settings_kratos: Settings, sample_alert: dict[str, Any]
 ) -> None:

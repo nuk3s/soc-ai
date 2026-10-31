@@ -416,6 +416,40 @@ def _oracle_pause_notifications(request: Request) -> list[NotificationOut]:
     ]
 
 
+# Where the Auto-Investigate alarm row links: the live failed triages.
+_AUTO_INVESTIGATE_FAILING_HREF = "/investigations?verdict=pipeline_error&errors=live"
+
+
+def _auto_investigate_health_notifications(request: Request) -> list[NotificationOut]:
+    """One bell row while Auto-Investigate runs keep failing or the scheduler is paused.
+
+    Read from the process state (soc_ai.webui.autotriage_health), so a
+    15-second poll never reads the store. The id carries the start of the
+    outage: one id holds for one outage, and a new error class gets a new id.
+    No setting turns the row off. On 2026-10-27 the gateway refused the
+    triage schema for 11 hours and no surface named the fault.
+    """
+    from soc_ai.oracle import breaker  # noqa: PLC0415 - lazy
+    from soc_ai.webui import autotriage as at  # noqa: PLC0415 - lazy
+
+    health = getattr(at.get_status(request.app.state), "health", None)
+    row = health.bell_row() if health is not None else None
+    if row is None:
+        return []
+    row_id, title, since = row
+    since_iso = breaker.iso(since) or ""
+    return [
+        NotificationOut(
+            id=row_id,
+            tone="danger",
+            title=title,
+            when=_ago(since_iso),
+            href=_AUTO_INVESTIGATE_FAILING_HREF,
+            at=_at(since_iso),
+        )
+    ]
+
+
 async def _dossier_conflict_notifications(
     request: Request, limit: int = NOTIF_DEFAULT_LIMIT
 ) -> list[NotificationOut]:
@@ -792,7 +826,8 @@ async def list_notifications(
 
     The standing conditions come first: a dependency that is down, a grid
     gap that closed in the last 24 h, a broken audit chain, an expiring
-    certificate, a paused Oracle, a quality alarm, a dossier conflict, the
+    certificate, a paused Oracle, a failing or paused Auto-Investigate, a
+    quality alarm, a dossier conflict, the
     unread shadow hits, the analytics soc-ai held, the open leads and the
     failed triages. The runs follow, newest first.
 
@@ -840,6 +875,7 @@ async def list_notifications(
     out.extend(_audit_chain_notifications(request))
     out.extend(_tls_notifications(request))
     out.extend(_oracle_pause_notifications(request))
+    out.extend(_auto_investigate_health_notifications(request))
     out.extend(await _quality_alarm_notifications(request))
     out.extend(await _dossier_conflict_notifications(request, limit))
     if not events_only:
@@ -858,7 +894,13 @@ async def list_notifications(
             db, status="running", limit=_notif_cap(20, limit)
         )
         completed = await inv_svc.list_recent_notifications(
-            db, status="complete", limit=_notif_cap(20, limit), finished_since=cutoff
+            db,
+            status="complete",
+            limit=_notif_cap(20, limit),
+            finished_since=cutoff,
+            # A dismissed fallback leaves the bell. The filter is in SQL, so
+            # the dismissed rows cannot fill the cap ahead of real verdicts.
+            exclude_dismissed_fallbacks=True,
         )
         failed = await inv_svc.list_recent_notifications(
             db,
@@ -923,6 +965,23 @@ async def list_notifications(
     for inv in completed:
         fin = inv.finished_at
         if fin is None or fin < cutoff:
+            continue
+        if inv.is_fallback:
+            # A pipeline fallback is a failed triage with a placeholder
+            # verdict. It read as "Verdict needs_more_info" for each of the
+            # 226 failed runs of 2026-10-27. The query above already left out
+            # the dismissed ones.
+            done.append(
+                NotificationOut(
+                    id=f"inv-failed:{inv.id}",
+                    tone="danger",
+                    title=f"Triage failed, pipeline error: {inv.rule_name or inv.id}",
+                    when=_ago(fin.isoformat()),
+                    href=f"/investigation/{inv.id}",
+                    isSynthEval=bool(inv.is_synth_eval),
+                    at=_at(fin),
+                )
+            )
             continue
         verdict = inv.verdict or "untriaged"
         tone = (

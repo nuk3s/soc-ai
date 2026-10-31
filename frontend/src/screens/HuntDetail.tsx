@@ -21,6 +21,7 @@ import { ConfidenceRing } from '../components/ConfidenceRing';
 import { Definition } from '../components/Definition';
 import { DocumentChip } from '../components/DocumentDrawer';
 import { DraftDetectionPane } from '../components/DraftDetectionPane';
+import { EventTimelinePanel, eventTimelineMeta } from '../components/EventTimeline';
 import { LeadTimeline } from '../components/LeadTimeline';
 import { Markdown } from '../components/Markdown';
 import { Panel, PanelHeader } from '../components/Panel';
@@ -2024,10 +2025,25 @@ export function HuntDetail() {
                 )}
               </CollapsibleSection>
 
+              {/* The documents the findings cite, in event time, in UTC, with
+                  the waves (change D). The step timeline below keeps the
+                  order of the tool calls. */}
+              {data.eventTimeline?.entries.length ? (
+                <CollapsibleSection
+                  title="Event timeline"
+                  tour="hunt-event-timeline"
+                  meta={eventTimelineMeta(data.eventTimeline)}
+                >
+                  <EventTimelinePanel timeline={data.eventTimeline} />
+                </CollapsibleSection>
+              ) : null}
+
               {/* A catalog hunt has no steps BY CONSTRUCTION — it is one query
                   from a spec, not an agent loop — so "0 steps" and "No steps
                   yet." promised a second act that never arrives on a hunt
-                  already marked Complete. Say what it actually did instead. */}
+                  already marked Complete. Say what it actually did instead.
+                  The step clock is the recorder's UTC wall clock, and the
+                  meta names its zone. */}
               <CollapsibleSection
                 title="Hunt timeline"
                 tour="hunt-timeline"
@@ -2035,7 +2051,9 @@ export function HuntDetail() {
                   <span title={COUNT_STEPS}>
                     {catalog && data.timeline.length === 0
                       ? `single query · ${data.elapsedLabel}`
-                      : `${data.timeline.length} step${data.timeline.length === 1 ? '' : 's'} · ${data.elapsedLabel}`}
+                      : `${data.timeline.length} step${data.timeline.length === 1 ? '' : 's'} · ${data.elapsedLabel}${
+                          data.timeline.length > 0 ? ' · step times in UTC' : ''
+                        }`}
                   </span>
                 }
                 defaultOpen

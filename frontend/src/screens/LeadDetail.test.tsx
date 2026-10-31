@@ -815,6 +815,32 @@ describe('LeadDetail decisions', () => {
     const row = screen.getByTestId('lead-decision');
     expect(row.textContent).toContain('Left open by soc-ai. An earlier hunt found a threat.');
   });
+
+  // Prod lead 47 (2026-10-24): one investigation of a hunt finding ended in
+  // error, and the lead waited with no reason on its page.
+  it('states that a threat finding of the hunt has no verdict', async () => {
+    vi.mocked(getLead).mockResolvedValue({
+      ...LEAD,
+      status: 'hunting',
+      hunt_id: 'H-3',
+      hunt_status: 'complete',
+      hunt_outcome_label: '2 of 3 findings are threats',
+      hold_reason: 'no_verdict',
+      hold_sentence: null,
+      decisions: [
+        { action: 'held', at: '2026-10-24T21:41:23Z', by: 'system:hunt', reason: 'no_verdict', note: null, hunt_id: 'H-3', investigation_id: null },
+      ],
+    } as never);
+    mount();
+    const hold = await screen.findByTestId('lead-hold-reason');
+    expect(hold.textContent).toBe(
+      'The hunt did not close this lead. A threat finding of the hunt has no verdict. Decide on the lead.',
+    );
+    const row = screen.getByTestId('lead-decision');
+    expect(row.textContent).toContain(
+      'Left open by soc-ai. A threat finding of the hunt has no verdict.',
+    );
+  });
 });
 
 // An evidence id was a dashed chip that did nothing, then a link into the

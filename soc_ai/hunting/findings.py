@@ -558,6 +558,10 @@ def hunt_outcome(status: str, findings: Any) -> tuple[int, str]:
 # An Elasticsearch document id, the shape the promotion anchor accepts. A
 # finding also cites prose and tool calls, and those are not documents.
 DOCUMENT_ID_RE = re.compile(r"^[A-Za-z0-9_\-:.]{12,128}$")
+# A tool call that a finding cites, such as 't_host_summary:<address>'. It
+# passes DOCUMENT_ID_RE and it is not a document (change E, 2026-10-30). An ES
+# auto-id, a Zeek uid and a community id never carry this prefix with a colon.
+TOOL_CITATION_RE = re.compile(r"^t_[a-z][a-z0-9_]*:")
 
 # The entity types a subject can name, keyed by the word a finding or a scope
 # uses for them. A rule, a dataset and a decoy name no entity to investigate.
@@ -640,14 +644,17 @@ def finding_entities(finding: Mapping[str, Any]) -> list[tuple[str, str]]:
 
 
 def finding_document_ids(finding: Mapping[str, Any]) -> list[str]:
-    """The document ids a finding cites, in order, without repeats."""
+    """The document ids a finding cites, in order, without repeats.
+
+    A tool-call citation (:data:`TOOL_CITATION_RE`) is not a document.
+    """
     citations = finding.get("citations")
     out: list[str] = []
     for c in citations if isinstance(citations, list) else []:
         if isinstance(c, bool) or not isinstance(c, (str, int)):
             continue
         text = str(c).strip()
-        if DOCUMENT_ID_RE.match(text) and text not in out:
+        if DOCUMENT_ID_RE.match(text) and not TOOL_CITATION_RE.match(text) and text not in out:
             out.append(text)
     return out
 
@@ -694,12 +701,16 @@ def subject_fingerprint(finding: Mapping[str, Any]) -> str | None:
 
     The entity set and the cited document ids, sorted, hashed. Two hunts of
     one lead that find the same activity on the same documents share it, so
-    the second hunt reuses the first one's investigation. None when the
-    finding names no entity and cites no document.
+    the second hunt reuses the first one's investigation.
+
+    None when the finding cites no document (change E, 2026-10-30). Such a
+    finding has only its claim as identity, and the entity set alone is not a
+    claim: lead 49 linked findings with different claims on one host pair to
+    one investigation. A tool call in the citations is not a document.
     """
     entities = sorted({f"{kind}:{value}" for kind, value in finding_entities(finding)})
     documents = sorted(set(finding_document_ids(finding)))
-    if not entities and not documents:
+    if not documents:
         return None
     body = json.dumps({"entities": entities, "documents": documents}, sort_keys=True)
     return hashlib.sha256(body.encode("utf-8")).hexdigest()[:32]
@@ -726,6 +737,7 @@ def subject_ordinals(findings: Any) -> list[int]:
 
 __all__ = [
     "DOCUMENT_ID_RE",
+    "TOOL_CITATION_RE",
     "candidate_findings",
     "detail_sentence",
     "finding_category",

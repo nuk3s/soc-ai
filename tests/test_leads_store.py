@@ -659,7 +659,11 @@ async def test_the_objective_names_the_related_leads_and_asks_for_a_campaign(
     # it, and the two can disagree by then, so the line says when it was read.
     assert "Related leads at the start of this hunt:" in text
     assert f"- lead {other.id} on 10.1.1.6: same analytic within 24 h" in text
-    assert "State whether these leads and this one are one campaign, with the evidence." in text
+    # Change E. The link between leads goes in the narrative, never in a finding.
+    assert (
+        "State in the narrative whether these leads and this one are one campaign. "
+        "Name the evidence. Never write the link as a finding."
+    ) in text
     # The argument is optional, so the caller that has none reads what it read
     # before.
     assert "Related leads" not in plain

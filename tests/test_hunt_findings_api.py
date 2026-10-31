@@ -199,8 +199,8 @@ def test_a_complete_hunt_reads_the_verdicts(client: TestClient) -> None:
 
 def _shared_hunt_findings() -> list[dict[str, Any]]:
     """The lead 5 hunt of 2026-10-19: two threats and an observation on one
-    host pair, a gap and a second observation. No finding cites a document,
-    so the first three share one subject fingerprint."""
+    host pair, a gap and a second observation. No finding cites a document.
+    An older rule linked the first three to one investigation."""
     pair = ["192.0.2.11", "192.0.2.5"]
     return [
         _finding(1, hosts=pair, citations=[], title="RC4 service ticket for svc_sql"),
@@ -328,6 +328,211 @@ def test_a_lead_soc_ai_closed_on_verdicts_says_so(client: TestClient) -> None:
     assert detail["closed_by_hunt_verdicts"] is True
 
 
+def test_a_lead_held_on_a_finding_with_no_verdict_states_the_reason(client: TestClient) -> None:
+    """Prod lead 47 (2026-10-24): the hunt investigated three subject
+    findings, one run ended in error, and the lead waited in 'hunting' with
+    no reason on its page. The page now names the hold."""
+    from soc_ai.store import leads as leads_store
+    from soc_ai.store.models import Lead
+
+    maker = client.app.state.db_sessionmaker
+    findings = [_finding(n, hosts=[f"192.0.2.{n}"], detail=f"Host 192.0.2.{n}.") for n in (1, 2, 3)]
+
+    async def seed() -> int:
+        async with maker() as db:
+            lead = Lead(
+                status="open",
+                entities_json=[["host", "192.0.2.1"]],
+                kinds_json=["alert"],
+                weight_at_formation=1.5,
+                shadow=False,
+            )
+            db.add(lead)
+            await db.commit()
+            await db.refresh(lead)
+            hunt = await hunt_svc.create(
+                db, objective="hunt", started_by="auto-hunt", kind="lead", lead_id=lead.id
+            )
+            hunt_id = hunt.id
+            lead_id = int(lead.id)
+        runs = [
+            await _run_row(maker, hunt_id, 0, verdict="true_positive"),
+            await _run_row(maker, hunt_id, 1, status="error"),
+            await _run_row(maker, hunt_id, 2, verdict="true_positive"),
+        ]
+        async with maker() as db:
+            await hunt_svc.finalize(
+                db,
+                hunt_id,
+                status="complete",
+                report={"findings": findings},
+                finding_plan={str(i): _entry("ended", r) for i, r in enumerate(runs)},
+            )
+            await leads_store.mark_hunting(db, lead_id, hunt_id=hunt_id)
+            row = await db.get(Hunt, hunt_id)
+            assert row is not None
+            assert await leads_store.settle_after_hunt(db, row) == "waits"
+        return lead_id
+
+    lead_id = _run(seed())
+    detail = client.get(f"/api/v1/hunts/leads/{lead_id}").json()
+    assert detail["status"] == "hunting"
+    assert detail["hunt_status"] == "complete"
+    assert detail["hold_reason"] == "no_verdict"
+    assert detail["hold_sentence"] == "A threat finding of the hunt has no verdict."
+    held = detail["decisions"][-1]
+    assert (held["action"], held["reason"]) == ("held", "no_verdict")
+
+
+def test_a_reused_run_of_another_hunt_answers_on_the_hunt_page_and_settles_the_lead(
+    client: TestClient,
+) -> None:
+    """The held lead's remedy is "re-run the investigation of that finding".
+    When a run of another hunt with the same subject answers (change E), the
+    route returned it and left the finding's entry on the failed run. The
+    lead stayed held on each press, and the hunt page still read failed. The
+    route now names the reused run on the finding's entry, the same way the
+    hunt phase records a reuse."""
+    from soc_ai.hunting.findings import subject_fingerprint
+    from soc_ai.store import leads as leads_store
+    from soc_ai.store.models import Lead
+
+    maker = client.app.state.db_sessionmaker
+    findings = [
+        _finding(n, hosts=[f"192.0.2.{n}"], citations=[f"tel-doc-{n:08d}"]) for n in (1, 2, 3)
+    ]
+    fingerprint = subject_fingerprint(findings[1])
+
+    async def seed() -> tuple[int, str, str, str]:
+        async with maker() as db:
+            lead = Lead(
+                status="open",
+                entities_json=[["host", "192.0.2.1"]],
+                kinds_json=["alert"],
+                weight_at_formation=1.5,
+                shadow=False,
+            )
+            db.add(lead)
+            await db.commit()
+            await db.refresh(lead)
+            hunt = await hunt_svc.create(
+                db, objective="hunt", started_by="auto-hunt", kind="lead", lead_id=lead.id
+            )
+            other = await hunt_svc.create(
+                db, objective="other hunt", started_by="auto-hunt", kind="lead"
+            )
+            hunt_id, lead_id = hunt.id, int(lead.id)
+            reused = await inv_svc.create(
+                db,
+                alert_es_id="tel-doc-00000002",
+                started_by="system:hunt",
+                kind="hunt",
+                hunt_id=other.id,
+                finding_ordinal=0,
+                subject={
+                    "type": "hunt",
+                    "hunt_id": other.id,
+                    "subject_fingerprint": fingerprint,
+                    "judges": "finding",
+                },
+            )
+            await inv_svc.finalize(
+                db, reused.id, status="complete", verdict="true_positive", confidence=0.8
+            )
+        runs = [
+            await _run_row(maker, hunt_id, 0, verdict="true_positive"),
+            await _run_row(maker, hunt_id, 1, status="error"),
+            await _run_row(maker, hunt_id, 2, verdict="true_positive"),
+        ]
+        async with maker() as db:
+            await hunt_svc.finalize(
+                db,
+                hunt_id,
+                status="complete",
+                report={"findings": findings},
+                finding_plan={str(i): _entry("ended", r) for i, r in enumerate(runs)},
+            )
+            await leads_store.mark_hunting(db, lead_id, hunt_id=hunt_id)
+            row = await db.get(Hunt, hunt_id)
+            assert row is not None
+            assert await leads_store.settle_after_hunt(db, row) == "waits"
+        return lead_id, hunt_id, reused.id, runs[1]
+
+    lead_id, hunt_id, reused, failed = _run(seed())
+    body = client.post(f"/api/v1/hunts/{hunt_id}/findings/1/investigate").json()
+    assert body == {"investigation_id": reused, "existing": True}
+
+    async def settle() -> tuple[str, str, Any]:
+        async with maker() as db:
+            row = await db.get(Hunt, hunt_id)
+            assert row is not None
+            link = hunt_svc.finding_links(row)[1]
+            out = await leads_store.settle_after_hunt(db, row)
+            lead = await db.get(Lead, lead_id)
+            assert lead is not None
+            return out, str(lead.status), link
+
+    out, status, link = _run(settle())
+    assert (link.investigation_id, link.state, link.origin) == (
+        reused,
+        hunt_svc.LINK_ENDED,
+        hunt_svc.ORIGIN_REUSED,
+    )
+    assert link.investigation_id != failed
+    assert (out, status) == ("closed", "promoted")
+    f2 = client.get(f"/api/v1/hunts/{hunt_id}").json()["findings"][1]
+    assert (f2["investigationId"], f2["investigationStatus"], f2["verdict"]) == (
+        reused,
+        "complete",
+        "true_positive",
+    )
+
+
+def test_a_reused_running_run_reads_investigating_on_the_finding(client: TestClient) -> None:
+    """The reused run still runs, so the finding's entry reads investigating."""
+    from soc_ai.hunting.findings import subject_fingerprint
+
+    maker = client.app.state.db_sessionmaker
+    findings = [_finding(1, hosts=["192.0.2.1"], citations=["tel-doc-00000001"])]
+
+    async def seed() -> tuple[str, str]:
+        hunt_id = await _seed(maker, findings, status="complete", plan={})
+        failed = await _run_row(maker, hunt_id, 0, status="error")
+        async with maker() as db:
+            other = await hunt_svc.create(db, objective="other hunt", started_by="admin")
+            running = await inv_svc.create(
+                db,
+                alert_es_id="tel-doc-00000001",
+                started_by="system:hunt",
+                kind="hunt",
+                hunt_id=other.id,
+                finding_ordinal=0,
+                subject={
+                    "type": "hunt",
+                    "hunt_id": other.id,
+                    "subject_fingerprint": subject_fingerprint(findings[0]),
+                },
+            )
+            await hunt_svc.set_finding_link(db, hunt_id, 0, "ended", investigation_id=failed)
+        return hunt_id, running.id
+
+    hunt_id, running = _run(seed())
+    body = client.post(f"/api/v1/hunts/{hunt_id}/findings/0/investigate").json()
+    assert body == {"investigation_id": running, "existing": True}
+
+    async def link() -> Any:
+        async with maker() as db:
+            row = await db.get(Hunt, hunt_id)
+            return hunt_svc.finding_links(row)[0]
+
+    entry = _run(link())
+    assert (entry.investigation_id, entry.state, entry.origin) == (
+        running,
+        hunt_svc.LINK_INVESTIGATING,
+        hunt_svc.ORIGIN_REUSED,
+    )
+
+
 def test_a_failed_investigation_reads_failed_and_offers_the_manual_control(
     client: TestClient,
 ) -> None:
@@ -429,6 +634,65 @@ def test_the_manual_control_on_an_over_cap_finding_names_the_run(client: TestCli
 
     entry = _run(link())
     assert (entry.investigation_id, entry.origin) == (inv_id, hunt_svc.ORIGIN_MANUAL)
+
+
+def test_the_promote_route_never_returns_the_run_of_another_finding_of_the_hunt(
+    client: TestClient,
+) -> None:
+    """Change E. F0 and F1 of one hunt name the same hosts and cite the same
+    document, so they share a subject fingerprint. The run of F1 judged the
+    claim of F1, and the button on F0 starts a run of its own."""
+    from soc_ai.hunting.findings import subject_fingerprint
+    from soc_ai.so_client.elastic import ElasticClient
+
+    maker = client.app.state.db_sessionmaker
+    pair = ["192.0.2.10", "192.0.2.20"]
+    doc = ["tel-doc-00000050"]
+    findings = [
+        _finding(1, hosts=pair, citations=doc, title="Web shell upload to the web server"),
+        _finding(2, hosts=pair, citations=doc, title="Repeated exploit variants"),
+    ]
+    assert subject_fingerprint(findings[0]) == subject_fingerprint(findings[1])
+
+    async def seed() -> tuple[str, str]:
+        hunt_id = await _seed(maker, findings, status="complete", plan={})
+        async with maker() as db:
+            inv = await inv_svc.create(
+                db,
+                alert_es_id=doc[0],
+                started_by="system:hunt",
+                kind="hunt",
+                hunt_id=hunt_id,
+                finding_ordinal=1,
+                subject={
+                    "type": "hunt",
+                    "hunt_id": hunt_id,
+                    "subject_fingerprint": subject_fingerprint(findings[1]),
+                    "judges": "finding",
+                },
+            )
+            await inv_svc.finalize(
+                db, inv.id, status="complete", verdict="true_positive", confidence=0.8
+            )
+        return hunt_id, inv.id
+
+    hunt_id, sibling = _run(seed())
+    mgr = FakeManager(maker)
+    hits = [{"_id": doc[0], "_source": {"event": {"dataset": "suricata.alert"}}}]
+    with (
+        patch(_MGR, return_value=mgr),
+        patch.object(
+            ElasticClient,
+            "search",
+            AsyncMock(return_value=EsSearchResult(total=1, took_ms=1, hits=hits)),
+        ),
+    ):
+        resp = client.post(f"/api/v1/hunts/{hunt_id}/findings/0/investigate")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "existing" not in body
+    assert body["investigation_id"] != sibling
+    assert len(mgr.started) == 1
 
 
 def test_delete_refuses_an_investigating_hunt(client: TestClient) -> None:

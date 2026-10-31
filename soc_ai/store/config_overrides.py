@@ -662,6 +662,26 @@ WHITELIST: tuple[SettingSpec, ...] = (
         max_value=1440,
     ),
     SettingSpec(
+        key="auto_triage_retry_limit",
+        attr="auto_triage_retry_limit",
+        type="int",
+        label="Retries of a failed alert",
+        section="Triage automation",
+        hot=True,
+        day1=False,
+        help=(
+            "Auto-Investigate retries a failed alert this many times after a short wait. "
+            "After the last short retry, the alert runs again once each 6 hours. A run "
+            "fails when it ends in an error or a pipeline fallback. The first retry waits "
+            "15 minutes, and each next retry waits twice as long. With 0, the alert waits "
+            "6 hours after its first failed run. A verdict on the alert resets the count. "
+            "An analyst can start a run on the alert at any time. This setting applies "
+            "live."
+        ),
+        min_value=0,
+        max_value=10,
+    ),
+    SettingSpec(
         key="hunt_schedules_enabled",
         attr="hunt_schedules_enabled",
         type="bool",

@@ -82,6 +82,7 @@ def test_hunt_validator_notes_say_what_happened() -> None:
         hunt_gates._UNRESOLVED_NOTE,
         hunt_gates._HIGH_NO_CITE_NOTE,
         hunt_gates._ALERT_ONLY_NOTE,
+        hunt_gates._LEAD_LINK_NOTE,
     )
     for note in notes:
         assert not DASH.search(note), note

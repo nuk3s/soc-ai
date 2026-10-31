@@ -133,7 +133,6 @@ from soc_ai.agent.models import (
 from soc_ai.agent.narrative_grounding import coverage_subject, ground_host_coverage_claims
 from soc_ai.agent.prompts import (
     BUDGET_PARTIAL_SYNTH_PROMPT,
-    HUNT_SUBJECT_RULES,
     INVESTIGATOR_PROMPT,
     SYNTHESIZER_PROMPT,
     FocusOrigin,
@@ -145,6 +144,7 @@ from soc_ai.agent.prompts import (
     format_host_coverage_block,
     format_more_tools_block,
     format_prefetched_web_search_block,
+    hunt_subject_rules,
     rule_body_in_alert,
     unresolved_external_indicator,
 )
@@ -1410,12 +1410,14 @@ async def investigate(
 
     Async-yields :class:`StepEvent` items throughout the run.
 
-    ``subject`` (optional, D2): a HUNT subject. The run then investigates the
-    hunt as a whole: its objective, its findings and every document they cite.
-    ``alert_id`` stays the anchor document the prefetch reads, so the tools
-    keep their time anchor, but the subject block replaces the alert block in
-    the investigator prompt and the verdict answers the hunt's objective.
-    ``None`` is the ordinary alert subject and nothing changes.
+    ``subject`` (optional, D2): a HUNT subject. The run reads the hunt: its
+    objective, its findings and every document they cite. ``alert_id`` stays
+    the anchor document the prefetch reads, so the tools keep their time
+    anchor, but the subject block replaces the alert block in the investigator
+    prompt. For a finding subject the verdict judges the claim of the promoted
+    finding, and the rest of the hunt is context. For a lead subject the
+    verdict answers the hunt's objective (change E, 2026-10-30). ``None`` is
+    the ordinary alert subject and nothing changes.
 
     ``deep`` (optional): force the full tool-driven investigation loop for THIS
     run regardless of ``fast_triage_enabled`` — the analyst's "deep re-run" of
@@ -2655,12 +2657,13 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
 
     ``allow_so_writes`` / ``focus_origin`` / ``subject``: see :func:`investigate`.
 
-    A HUNT subject changes four things and nothing else. The cited documents
+    A HUNT subject changes five things and nothing else. The cited documents
     join the prefetch bundle, so every id resolver reads them. The decision
     templates do not run: they match alert rule classes and a hunt has none.
     The same-session prior does not run: a hunt has no community id of its own.
     Round 1 does not run: it is a tool-less synthesis over one alert, and the
-    hunt has to be read with the tools. Every gate still runs.
+    hunt has to be read with the tools. The host history gate also reads the
+    documents that the promoted finding cites. Every gate still runs.
     """
     from soc_ai.agent._prefetch_retry import retry_prefetch  # noqa: PLC0415
     from soc_ai.agent.decision_templates import match_decision_template  # noqa: PLC0415
@@ -2872,8 +2875,14 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
     # (gates._retrieved_evidence_tokens, _pivot_event_ids) reads them beside
     # the pivots. Empty on every alert run.
     subject_block = ""
+    # Change E. A subject with a promoted finding judges the claim of that
+    # finding, and the prompt says so. A lead promotion judges the hunt.
+    subject_finding = subject is not None and subject.promoted_finding is not None
     if subject is not None:
         enriched.subject_documents = list(subject.documents)
+        # Change A. The documents that the promoted finding cites. Only the
+        # host history gate reads them, and the field stays out of every dump.
+        enriched.subject_focus_document_ids = subject.promoted_document_ids()
         subject_block = subject.render_block()
     enriched_payload = enriched.model_dump(mode="json")
     if subject is not None:
@@ -3676,6 +3685,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 # alert block: the hunt, its findings and its cited documents
                 # are the subject, so the enriched alert JSON is not rendered.
                 subject_block=subject_block or None,
+                subject_finding=subject_finding,
             )
             + web_search_block
             + more_tools_block
@@ -3957,6 +3967,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                         conditions=conditions,
                         emits_report=False,
                         subject_block=subject_block or None,
+                        subject_finding=subject_finding,
                     )
                     + web_search_block
                     + more_tools
@@ -4119,10 +4130,13 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             loop_synth_msg = _inject_session_constraint(loop_synth_msg, session_block)
             # D2. The verdict writer has to know the subject is a hunt, or it
             # scores the transcript as an alert and the summary answers the
-            # wrong question. Empty on every alert run.
+            # wrong question. Empty on every alert run. Change E: on a finding
+            # run it reads the rules for one finding.
             loop_synth_msg = _inject_subject_block(
                 loop_synth_msg,
-                f"{subject_block}\n\n{HUNT_SUBJECT_RULES}" if subject_block else "",
+                f"{subject_block}\n\n{hunt_subject_rules(finding=subject_finding)}"
+                if subject_block
+                else "",
             )
             if guard is not None:
                 # The transcript is already in label space (the loop ran over
@@ -4837,6 +4851,9 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             extra_hosts=oracle_hosts,
             extra_suffixes=oracle_suffixes,
             failure_out=oracle_failure,
+            # Change E. A finding run names the claim it judged, so the Oracle
+            # judges the same claim. None on an alert run and a lead run.
+            subject_claim=subject.claim() if subject is not None else None,
         )
 
         if (
@@ -4892,13 +4909,17 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             oracle_report = _refuse_benign_verdict_without_baseline(
                 oracle_report, enriched, oracle_audit
             )
-            # I2: ungrounded host-anchored TP guard — Oracle path parity.
-            # Prevents the Oracle from re-escalating to TP solely on host_alert_profile
-            # context that the local path already downgraded. enriched is an
-            # EnrichedAlertContext: carries .alert, .enrichments, .host_alert_profile.
-            oracle_report = _downgrade_ungrounded_host_anchored_tp(
-                oracle_report, enriched, oracle_audit
-            )
+            # The host history gate (_downgrade_ungrounded_host_anchored_tp)
+            # does not run on the Oracle report. Owner rule of 2026-10-30: the
+            # gate must not override an Oracle true positive. On 2026-10-29 the
+            # call reset two backed Oracle true positives on hunt findings to
+            # needs_more_info. A class-changing Oracle true positive still needs
+            # a resolved citation beyond the alert, or a tool call of its own
+            # (the override gate above and oracle/client.py). That rule accepts
+            # any prefetched pivot id, so on an alert run the removal is a
+            # policy choice and not a proof. When the local gate fired,
+            # local_summary opens with _HOST_ANCHORED_TP_LEAD, so the Oracle
+            # reads the change. The ICMP (Fix M2) and no-baseline guards stay.
             if guard is not None:
                 # The Oracle desanitizes its OWN labels (its independent
                 # pipeline/mapping), but the loop-transcript text it was shown

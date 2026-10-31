@@ -636,6 +636,65 @@ def _apply_corroboration_cap(
     )
 
 
+# ── The lead-link gate ────────────────────────────────────────────────────────
+#
+# A link between leads is not activity on a host, and it is not a finding
+# (change E, 2026-10-30). Hunt 01M5QVP4DZ46HNF7WM3J8FTHZK wrote "Leads 47 and
+# 48 are one campaign" as a high threat finding: the hunt opened an
+# investigation for it, and the run ended in error at the 900 s limit. The hunt
+# of lead 49 wrote "Lead 47 and 49 are one campaign" as its F2. The prompt asks
+# for the link in the narrative. This gate catches the model that writes it as
+# a threat anyway: the finding becomes an observation with severity info, so
+# no investigation opens for it. The text stays.
+#
+# The title decides, and the detail does not: a real threat may name a lead in
+# its detail. A read-only scan of 980 prod findings matched only the 10
+# lead-link titles. The gate only lowers a finding and writes a note, and the
+# lead_link hold (soc_ai.store.leads) keeps such a lead from a clean close.
+_LEAD_LINK_TITLE_RE = re.compile(
+    r"\bleads?\s+#?\d+\b|\brelated\s+leads?\b|\b(?:two|both|these|all)\s+leads\b",
+    re.IGNORECASE,
+)
+
+_LEAD_LINK_NOTE = (
+    "This finding links leads. soc-ai changed its type to observation and its "
+    "severity to info. The hunt opens no investigation for a link between leads."
+)
+
+
+def is_lead_link(finding: Any) -> bool:
+    """True when the title of the finding states a link between leads."""
+    title = finding.get("title") if isinstance(finding, dict) else getattr(finding, "title", None)
+    return bool(_LEAD_LINK_TITLE_RE.search(str(title or "")))
+
+
+def gate_lead_links(findings: list[Any]) -> tuple[list[Any], int]:
+    """Lower each threat finding whose title links leads. PURE.
+
+    Returns the findings and how many the gate lowered. The note is set
+    outright: the type change replaces any earlier severity cap, and
+    ``hunt_words.validator_note`` rewrites a note that combines two.
+    """
+    out: list[Any] = []
+    lowered = 0
+    for finding in findings:
+        category = str(getattr(finding, "category", None) or "threat").strip().lower()
+        if category in _NON_THREAT_CATEGORIES or not is_lead_link(finding):
+            out.append(finding)
+            continue
+        lowered += 1
+        out.append(
+            finding.model_copy(
+                update={
+                    "category": "observation",
+                    "severity": "info",
+                    "validator_note": _LEAD_LINK_NOTE,
+                }
+            )
+        )
+    return out, lowered
+
+
 def _validate_hunt_charts(
     charts: list[Any],
     tool_results: list[Any],

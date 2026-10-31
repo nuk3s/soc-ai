@@ -563,6 +563,82 @@ def test_promote_finding_focus_hint_names_the_finding(kind_client: TestClient) -
     # not a prior run's open questions.
     assert fake_mgr.start.call_args.kwargs["allow_so_writes"] is False
     assert fake_mgr.start.call_args.kwargs["focus_origin"] == "hunt_finding"
+    # Change E. The run judges the claim of this finding.
+    assert "Judge its claim." in focus_hint
+    assert "Answer the hunt's objective." not in focus_hint
+
+
+# ── Change E: a finding run anchors on, and judges, its own finding ──────────
+
+_DET_A = "det-doc-0000a"
+_DET_B = "det-doc-0000b"
+_TEL_SSH = "tel-ssh-00001"
+_TEL_X = "tel-http-0001"
+
+
+def _anchor_subject(promoted: list[str] | None, other: list[str]) -> Any:
+    """A subject whose finding F0 cites ``promoted`` and F1 cites ``other``.
+
+    ``promoted=None`` builds a lead subject: no finding is promoted.
+    """
+    from soc_ai.agent.context import HuntSubject, SubjectFinding
+    from soc_ai.so_client.models import SoAlert
+
+    datasets = {
+        _DET_A: "suricata.alert",
+        _DET_B: "suricata.alert",
+        _TEL_SSH: "zeek.ssh",
+        _TEL_X: "zeek.http",
+    }
+    cited = list(promoted or []) + other
+    return HuntSubject(
+        hunt_id="01HUNT0000000000000000000",
+        objective="read the web server",
+        findings=[
+            SubjectFinding(
+                ordinal=0,
+                title="Exploit alerts on the web server",
+                citations=list(promoted or []),
+                promoted=promoted is not None,
+            ),
+            SubjectFinding(ordinal=1, title="SSH login to the web server", citations=other),
+        ],
+        documents=[
+            SoAlert(id=i, event_dataset=datasets[i]) for i in dict.fromkeys(cited) if i in datasets
+        ],
+    )
+
+
+def test_the_anchor_of_a_finding_run_is_a_document_of_that_finding() -> None:
+    """Before change E, telemetry from ANY finding won. Run
+    01M5WRBJZRB348GX4MZTY1GS59 judged a finding that cites two suricata alerts
+    and anchored on a Zeek record that another finding cites."""
+    from soc_ai.webui.finding_promotion import anchor_from_subject
+
+    assert anchor_from_subject(_anchor_subject([_DET_A, _DET_B], [_TEL_SSH])) == _DET_A
+    # Telemetry still wins inside the documents of the finding.
+    assert anchor_from_subject(_anchor_subject([_DET_A, _TEL_X], [_TEL_SSH])) == _TEL_X
+    # Controls: a finding with no resolved document, and a lead subject, keep
+    # the rule over every document of the subject.
+    assert anchor_from_subject(_anchor_subject(["prose only"], [_DET_A, _TEL_SSH])) == _TEL_SSH
+    assert anchor_from_subject(_anchor_subject(None, [_DET_A, _TEL_SSH])) == _TEL_SSH
+
+
+def test_the_focus_of_a_finding_run_asks_for_the_claim() -> None:
+    from soc_ai.webui.finding_promotion import promotion_focus
+
+    kwargs: dict[str, Any] = {
+        "focus_origin": "hunt_finding",
+        "title": "Successful SSH to victim by host-a",
+        "detail": "host-a logged in over SSH.",
+        "hosts": ["192.0.2.10"],
+        "hunt_subject": True,
+    }
+    finding = promotion_focus(**kwargs, finding_subject=True)
+    assert "The subject of this investigation is this finding. Judge its claim." in finding
+    assert "Read the rest of the hunt as context." in finding
+    assert "Answer the hunt's objective." not in finding
+    assert "Answer the hunt's objective." in promotion_focus(**kwargs, finding_subject=False)
 
 
 def test_promote_finding_detector_only_still_promotable(kind_client: TestClient) -> None:
@@ -907,6 +983,19 @@ _REHUNT_MGR_TARGET = "soc_ai.api.webui.routes_investigations.hunt_manager.get_ma
 # refuses a hunt-kind row must refuse a lead-kind row too.
 _PROMOTED_KINDS = ("hunt", "lead")
 
+# The skip reason of a bulk re-investigation, per promoted kind. A lead run
+# has no Re-run of a finding, so its reason names the lead.
+_BULK_SKIP_REASON = {"hunt": "hunt_kind", "lead": "lead_kind"}
+
+# The hint of the 409 hunt_kind_no_rerun, per promoted kind.
+_NO_RERUN_HINT = {
+    "hunt": "Use Re-run on the investigation of the finding.",
+    "lead": (
+        "Request more info does not apply to a promoted lead. "
+        "Use Resolve in chat to settle the verdict."
+    ),
+}
+
 
 def _lead_subject(hunt_id: str) -> dict[str, Any]:
     return {"type": "hunt", "hunt_id": hunt_id, "lead_id": 10}
@@ -955,7 +1044,7 @@ def test_bulk_rehunt_skips_hunt_kind_but_proceeds_for_suricata_kind(
     assert resp.status_code == 200
     body = resp.json()
     skipped = {s["invId"]: s["reason"] for s in body["skipped"]}
-    assert skipped[hunt_kind_id] == "hunt_kind"
+    assert skipped[hunt_kind_id] == _BULK_SKIP_REASON[promoted_kind]
     started = {s["invId"]: s for s in body["started"]}
     assert started[plain_id]["newInvId"] == "NEW-PLAIN"
     assert started[plain_id]["alertEsId"] == "ev-rh-plain"
@@ -995,7 +1084,10 @@ def test_request_more_info_refuses_hunt_kind_row(
     assert resp.status_code == 409
     body = resp.json()["detail"]
     assert body["reason"] == "hunt_kind_no_rerun"
-    assert body["hint"] == "Re-promote the finding from its hunt instead."
+    # The hint names a remedy that exists. A finding run has Re-run on its
+    # page (the promote route with rerun). A lead run has no re-run, and the
+    # old hint sent it to a finding it does not have.
+    assert body["hint"] == _NO_RERUN_HINT[promoted_kind]
     fake_mgr.start.assert_not_called()
 
 
@@ -1082,7 +1174,7 @@ def test_bulk_rehunt_skips_a_non_hunt_row_over_a_promoted_anchor(
     assert resp.status_code == 200
     body = resp.json()
     skipped = {s["invId"]: s["reason"] for s in body["skipped"]}
-    assert skipped.get(laundered_id) == "hunt_kind", body
+    assert skipped.get(laundered_id) == _BULK_SKIP_REASON[promoted_kind], body
     started = {s["invId"]: s for s in body["started"]}
     assert started[plain_id]["newInvId"] == "NEW-PLAIN"
     assert [s["alert_id"] for s in starts] == ["ev-rh-plain"]
@@ -1105,6 +1197,7 @@ def test_request_more_info_refuses_a_non_hunt_row_over_a_promoted_anchor(
 
     assert resp.status_code == 409, resp.text
     assert resp.json()["detail"]["reason"] == "hunt_kind_no_rerun"
+    assert resp.json()["detail"]["hint"] == _NO_RERUN_HINT[promoted_kind]
     fake_mgr.start.assert_not_called()
 
 
@@ -1260,7 +1353,7 @@ def test_start_hunt_refuses_when_latest_investigation_for_alert_is_hunt_kind(
     body = resp.json()["detail"]
     assert body["reason"] == "hunt_kind_no_rerun"
     assert body["hint"] == (
-        "This event is a promoted finding's anchor. Re-promote the finding from its hunt."
+        "This event is a promoted finding's anchor. Use Re-run on the investigation of the finding."
     )
     # The blocked row is already settled (complete) — no running deep-link to carry.
     assert "running_inv_id" not in body

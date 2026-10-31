@@ -332,7 +332,8 @@ export const INVESTIGATION_TOUR: Tour = {
       title: 'Investigation timeline',
       body:
         'The timeline lists each step of the investigation, such as the context gathered, the follow-up queries and the checks. ' +
-        'Click a step to show its detail.',
+        'Click a step to show its detail. ' +
+        'When the run holds event times, the Event timeline above the steps lists the documents in time order.',
     },
     {
       anchor: 'investigation-context',
@@ -459,6 +460,14 @@ export const HUNT_TOUR: Tour = {
         'The chips under a finding are its evidence. ' +
         'A host chip opens the host page or the entity page. ' +
         'A document chip opens the cited document in a drawer.',
+    },
+    {
+      anchor: 'hunt-event-timeline',
+      title: 'Event timeline',
+      body:
+        'The Event timeline lists the documents that the findings cite, in the order of their event time, in UTC. ' +
+        'A new wave starts after a gap of more than 30 minutes between two documents. ' +
+        'A chip such as F2 names the finding that cites the document.',
     },
     {
       anchor: 'hunt-timeline',

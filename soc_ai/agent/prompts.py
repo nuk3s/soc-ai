@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from soc_ai import event_time
 from soc_ai.dossier.coverage import describe as describe_coverage
 from soc_ai.tools.get_alert_context import (
     ENDPOINT_COVERAGE_DATASET_ABSENT,
@@ -116,6 +117,14 @@ for one thing.
 State the fact first. State the reason in the next sentence. Cite the evidence
 ids this prompt already requires.
 """
+
+
+# Shared text, like HOST_NAMING_RULE: the time-order rule (change D). It lives
+# in the pure soc_ai.event_time module, so the Oracle client and the tools read
+# the same wave gap. It is named here beside the other writer rules, and it is
+# composed directly after WRITING_STYLE_RULE in every summary and narrative
+# writer.
+EVENT_TIME_RULE = event_time.EVENT_TIME_RULE
 
 
 # One doctrine for every writer of a verdict: the investigator, the round-2
@@ -356,7 +365,9 @@ _INVESTIGATOR_STEPS = """
    consult the local MISP instance if one is configured.
 4. **Reconstruct the host and temporal context.** Check `host_alert_profile`. It
    is a NEUTRAL histogram of the rule names that recently fired on EITHER end of
-   this alert. `host_alert_profiles` splits the same window per end. Each entry
+   this alert. `host_alert_window_hours` gives its window. The window runs that
+   many hours before and after this alert. `host_alert_profiles` splits the same
+   window per end. Each entry
    names the IP, the end of this alert it is, and its alerts as source and as
    destination. Read it to say WHICH host an alert belongs to. It is
    CONTEXT. It is not proof. A malware, RAT or C2 rule in the histogram means a
@@ -720,6 +731,7 @@ _SYNTHESIZER_RUBRIC = (
     _SYNTHESIZER_ROLE
     # Style first, rubric after: the model copies the register of what it reads.
     + WRITING_STYLE_RULE
+    + EVENT_TIME_RULE
     + _SYNTHESIZER_INPUTS
     + DISCONFIRMING_RECORD_RULE
     + VERDICT_EVIDENCE_RULES
@@ -734,6 +746,7 @@ _SYNTHESIZER_RUBRIC = (
 _INVESTIGATOR_REPORT_RUBRIC = (
     _INVESTIGATOR_REPORT_ROLE
     + WRITING_STYLE_RULE
+    + EVENT_TIME_RULE
     + _stop_rule("TriageReport")
     + DISCONFIRMING_RECORD_RULE
     + VERDICT_EVIDENCE_RULES
@@ -962,6 +975,7 @@ def build_investigator_prompt(
         rubric = (
             _INVESTIGATOR_REPORT_ROLE
             + WRITING_STYLE_RULE
+            + EVENT_TIME_RULE
             + _stop_rule("TriageReport")
             + DISCONFIRMING_RECORD_RULE
             + evidence
@@ -1133,7 +1147,8 @@ def format_focus_hint_block(focus_hint: str | None, origin: FocusOrigin = "rerun
     - ``"hunt_finding"``: a hunt-finding promotion (Task 6) — ``focus_hint``
       carries the promoted finding's title/detail/hosts, NOT a prior
       investigation's open questions. Using the "rerun" header here would
-      falsely claim a prior investigation exists.
+      falsely claim a prior investigation exists. The hunt opens most of these
+      runs itself, so the block names no analyst.
     - ``"lead"``: a lead promotion — ``focus_hint`` carries the lead's
       entities and observation summaries, again not a prior run's questions.
 
@@ -1143,9 +1158,11 @@ def format_focus_hint_block(focus_hint: str | None, origin: FocusOrigin = "rerun
     if not focus_hint or not focus_hint.strip():
         return ""
     if origin == "hunt_finding":
+        # The hunt opens most of these runs on its own (system:hunt), so the
+        # block names no analyst (change E, 2026-10-30).
         return (
-            "## Focus: promoted hunt finding\n\n"
-            "An analyst promoted a hunt finding into this investigation. Assess "
+            "## Focus: hunt finding\n\n"
+            "This investigation judges one finding of a hunt. Assess "
             "the framing below against the evidence. Do not assume it is "
             "correct.\n\n"
             f"{focus_hint.strip()}\n\n"
@@ -1432,6 +1449,7 @@ Their results are there too.
 """
     # Style first, rubric after: the model copies the register of what it reads.
     + WRITING_STYLE_RULE
+    + EVENT_TIME_RULE
     + """
 Write the final `TriageReport` NOW from ONLY the evidence already gathered above. \
 You have NO remaining tool budget. Do not ask for more tools. HARD RULE: state a \
@@ -1759,6 +1777,47 @@ HUNT_SUBJECT_RULES = (
     "above do not answer.\n"
 )
 
+# Change E (2026-10-30). What the three verdicts mean when the subject is ONE
+# finding of a hunt. HUNT_SUBJECT_RULES stays for a lead promotion, which has
+# no finding to judge. A threat finding claims that the activity it names is an
+# attack, so the rules define the true positive by the attack and not by the
+# activity: the investigation of the SSH finding of one lead hunt (2026-10-24)
+# opened with "The hunt's hypothesis holds" and judged the exploit, and a run
+# on an SSH administration claim ended true_positive because the login was
+# "consistent with post-exploitation access". A rule worded "the claim holds"
+# invites that error again.
+FINDING_SUBJECT_RULES = (
+    "## What your verdict means for this finding\n\n"
+    'The subject is the finding under "The finding to judge" above. It is not '
+    "one alert. It is not the whole hunt. The rest of the hunt is context.\n\n"
+    "A threat finding claims that the activity it names is an attack or a "
+    "compromise. Decide on that claim.\n\n"
+    "- `true_positive`: the activity is an attack or a compromise, and the "
+    "evidence shows it. A login, a probe or a transfer that happened is not a "
+    "true positive by itself.\n"
+    "- `false_positive`: the activity has a benign explanation, and the "
+    "evidence supports that explanation. Name the evidence.\n"
+    "- `needs_more_info`: you cannot decide on the claim yet. Use it when the "
+    "activity happened and the evidence does not show if it is an attack or "
+    "administration. Name the gap and name the tool call that closes it.\n\n"
+    "A host name in the title can be wrong. Check it against the addresses on "
+    "the Hosts line.\n\n"
+    "Write the summary as one paragraph about the claim of this finding. Do not "
+    "retell the hunt. Name another finding only when it changes the verdict on "
+    "this claim.\n\n"
+    "Cite the documents of this finding first. Query the grid for anything the "
+    "documents above do not answer.\n"
+)
+
+
+def hunt_subject_rules(*, finding: bool) -> str:
+    """The verdict rules of a hunt-subject run.
+
+    ``finding`` is True when the subject has a promoted finding: the run judges
+    the claim of that finding. False for a lead promotion, which judges the hunt.
+    """
+    return FINDING_SUBJECT_RULES if finding else HUNT_SUBJECT_RULES
+
 
 def _format_investigator_prompt(
     alert_id: str,
@@ -1769,16 +1828,22 @@ def _format_investigator_prompt(
     conditions: CaseConditions | None = None,
     emits_report: bool = False,
     subject_block: str | None = None,
+    subject_finding: bool = False,
 ) -> str:
     """Investigator user message including pre-fetched alert context.
 
     ``subject_block`` (D2): the rendered hunt subject
     (:meth:`soc_ai.agent.context.HuntSubject.render_block`). When it is given,
     it REPLACES the alert block and the typed-field reading order: the subject
-    is a whole hunt, so there is no rule, no single event and no Suricata
-    field to read first. :data:`HUNT_SUBJECT_RULES` follows it and states what
-    the three verdicts mean for a hunt. Everything else is unchanged, including
-    the conditional-tool block and the report block.
+    is a hunt, so there is no rule, no single event and no Suricata field to
+    read first. :func:`hunt_subject_rules` follows it and states what the three
+    verdicts mean. Everything else is unchanged, including the conditional-tool
+    block and the report block.
+
+    ``subject_finding`` (change E): the subject has a promoted finding. The
+    opener, the rules and the last sentence of "Your job" then name one
+    finding of the hunt. False keeps the text of a lead promotion, which
+    judges the hunt.
 
     ``conditions`` appends the per-alert conditional-tool block, which names
     only the tools whose condition this alert meets (see :func:`case_conditions`).
@@ -1797,18 +1862,28 @@ def _format_investigator_prompt(
     be evaluated almost entirely from these fields.
     """
     if subject_block:
+        opener = (
+            "Investigate one finding of the hunt below."
+            if subject_finding
+            else "Investigate the hunt below."
+        )
+        subject_line = (
+            "The subject is one finding of the hunt. It is not one alert."
+            if subject_finding
+            else "The subject is the hunt, not one alert."
+        )
         return (
-            "Investigate the hunt below.\n\n"
+            f"{opener}\n\n"
             f"{format_focus_hint_block(focus_hint, origin=focus_origin)}"
             f"{subject_block.strip()}\n\n"
-            f"{HUNT_SUBJECT_RULES}\n"
+            f"{hunt_subject_rules(finding=subject_finding)}\n"
             "## Your job\n\n"
             "The hunt's findings and the documents they cite are already "
             "gathered above. Read them. Use the read tools when a result can "
             "change the verdict. Enrich indicators with `t_enrich_ip`, "
             "`t_enrich_domain` and `t_enrich_hash`. Query Zeek logs by "
             "community_id with `t_query_zeek_logs`. Do NOT call "
-            "`t_get_alert_context`. The subject is the hunt, not one alert.\n"
+            f"`t_get_alert_context`. {subject_line}\n"
             + (format_case_conditions_block(conditions) if conditions is not None else "")
             + (INVESTIGATOR_EMITS_REPORT_BLOCK if emits_report else "")
         )

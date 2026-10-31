@@ -173,6 +173,12 @@ _SAFE_ORACLE_ENVELOPE_FIELDS: frozenset[str] = frozenset(
         "loop_evidence",
         "loop_evidence_bullets",
         "loop_tool_results.tool",
+        # Change E. The title of the finding a hunt-finding run judges. It is
+        # model prose like local_summary. The harvest learns each element of
+        # subject_claim.hosts, so a host name in the title is a label by then.
+        # subject_claim.hosts stays under the backstop: an element the harvest
+        # learned is a label, and the backstop masks any other value.
+        "subject_claim.title",
     }
 )
 

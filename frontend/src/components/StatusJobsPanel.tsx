@@ -19,7 +19,7 @@ import {
   type QualityEvalStatus,
   type QualityTrend,
 } from '../lib/api';
-import { agoWords, timeLabel } from '../lib/timeRange';
+import { absTime, agoWords, timeLabel } from '../lib/timeRange';
 import { tint } from '../lib/tokens';
 import type { Config } from '../lib/types';
 import { useAsync } from '../lib/useAsync';
@@ -180,6 +180,18 @@ interface Facts {
   result: string;
   resultTitle?: string | null;
   schedule?: string | null;
+  /** The scheduled runs are paused. An old last run is then no missed run. */
+  paused?: boolean;
+  /** The moment to measure a missed run from, when it is later than the last run. */
+  dueFrom?: string | null;
+}
+
+/** The later of two ISO moments. A missing or bad moment loses. */
+function later(a: string | null | undefined, b: string | null | undefined): string | null | undefined {
+  const tb = b ? Date.parse(b) : NaN;
+  if (!Number.isFinite(tb)) return a;
+  const ta = a ? Date.parse(a) : NaN;
+  return Number.isFinite(ta) && ta >= tb ? a : b;
 }
 
 function finish(
@@ -190,7 +202,7 @@ function finish(
   let { outcome, result } = f;
   let resultTitle = f.resultTitle ?? null;
   const every = f.intervalMinutes !== null ? everyWords(f.intervalMinutes) : null;
-  if (f.enabled === true && !f.running && overdue(f.lastRun, f.intervalMinutes, now)) {
+  if (f.enabled === true && !f.running && !f.paused && overdue(later(f.lastRun, f.dueFrom), f.intervalMinutes, now)) {
     outcome = 'failed';
     resultTitle = result;
     result = `The job is overdue. It runs ${every}.`;
@@ -216,9 +228,27 @@ function autoInvestigate(read: JobsRead, now: number): JobRow {
     return finish(base, { enabled, intervalMinutes, running: false, lastRun: undefined, outcome: 'unknown', result: readFailure(r.error) }, now);
   }
   const s = r.data;
-  const facts = { enabled, intervalMinutes, running: s.active, lastRun: s.finished_at };
+  // A pause that ran out holds until a verdict. The next scheduled run comes
+  // up to one interval after its end, so a missed run counts from there.
+  const facts = { enabled, intervalMinutes, running: s.active, lastRun: s.finished_at, dueFrom: s.pause_ends };
   if (s.active) {
     return finish(base, { ...facts, outcome: 'ok', result: `A run is in progress. It investigated ${s.hunted} of ${s.total} alerts.` }, now);
+  }
+  // Five failed investigations in a row pause the scheduled runs
+  // (autotriage_health.py). On this row "run" is one scheduled run, so the
+  // count of failed alerts says "investigation".
+  if (s.paused_until) {
+    return finish(
+      base,
+      {
+        ...facts,
+        paused: true,
+        outcome: 'failed',
+        result: `Paused until ${absTime(s.paused_until, { zone: true })}. The last ${plural(s.failed_in_a_row ?? 0, 'investigation')} failed.`,
+        resultTitle: s.alarm_error ?? null,
+      },
+      now,
+    );
   }
   if (!s.finished_at) {
     return finish(base, { ...facts, outcome: 'never', result: 'No run since soc-ai started.' }, now);
@@ -235,21 +265,45 @@ function autoInvestigate(read: JobsRead, now: number): JobRow {
       now,
     );
   }
+  // Five failed investigations with one error in two hours open an alarm.
+  if (s.alarm_error) {
+    return finish(
+      base,
+      {
+        ...facts,
+        outcome: 'failed',
+        result: `${plural(s.alarm_failures ?? 0, 'investigation')} failed with the same error.`,
+        resultTitle: s.alarm_error,
+      },
+      now,
+    );
+  }
+  // Alerts past auto_triage_retry_limit run again once each 6 hours.
+  const atLimit = s.skipped_reasons?.retry_limit ?? 0;
+  const limitNote = atLimit > 0 ? ` ${plural(atLimit, 'alert')} reached the retry limit.` : '';
+  const limitOutcome: Outcome = atLimit > 0 ? 'failed' : 'ok';
   if (s.failed > 0) {
     return finish(
       base,
       {
         ...facts,
         outcome: 'failed',
-        result: `The last run investigated ${plural(s.hunted, 'alert')}. ${plural(s.failed, 'investigation')} failed.`,
+        result: `The last run investigated ${plural(s.hunted, 'alert')}. ${plural(s.failed, 'investigation')} failed.${limitNote}`,
       },
       now,
     );
   }
   if (s.total === 0 && s.hunted === 0) {
-    return finish(base, { ...facts, outcome: 'ok', result: 'The last run found no alert to investigate.' }, now);
+    // A failed alert inside its retry limit waits, so the run found work it
+    // held back. "found no alert" would be a false all-clear.
+    const waiting = s.skipped_reasons?.retry_wait ?? 0;
+    const waitNote = waiting > 0 ? ` ${plural(waiting, 'failed alert')} ${waiting === 1 ? 'waits' : 'wait'} to retry.` : '';
+    const result = atLimit > 0 || waiting > 0
+      ? `The last run started no investigation.${waitNote}${limitNote}`
+      : 'The last run found no alert to investigate.';
+    return finish(base, { ...facts, outcome: limitOutcome, result }, now);
   }
-  return finish(base, { ...facts, outcome: 'ok', result: `The last run investigated ${plural(s.hunted, 'alert')}.` }, now);
+  return finish(base, { ...facts, outcome: limitOutcome, result: `The last run investigated ${plural(s.hunted, 'alert')}.${limitNote}` }, now);
 }
 
 function dossier(read: JobsRead, now: number): JobRow {

@@ -94,6 +94,7 @@ __all__ = [
     "entity_expansion",
     "load_address_facts",
     "load_prior",
+    "names_held_elsewhere",
     "normalize_mac",
     "persist_clustering",
     "resolve_membership",
@@ -1152,6 +1153,39 @@ async def _live_names(db: AsyncSession) -> dict[int, tuple[HostMachine, set[str]
     return out
 
 
+def _match_named(live: Mapping[int, tuple[HostMachine, set[str]]], value: str) -> list[HostMachine]:
+    """The machines in *live* that answer to *value*. See :func:`_machines_named`."""
+    folded = _fold(value)
+    if not folded:
+        return []
+    label = short_name(folded)
+    exact = [row for row, names in live.values() if folded in names]
+    if exact:
+        return exact
+    if "." in folded:
+        return [row for row, names in live.values() if label in names]
+    return [row for row, names in live.values() if label in {short_name(n) for n in names}]
+
+
+def _answers_to(names: Iterable[str], value: str) -> bool:
+    """True when one machine with *names* answers to *value*.
+
+    The fold and label rules of :func:`_machines_named` apply to the one
+    machine: an exact folded match, the first label of a full *value* among the
+    names, or a bare *value* equal to the first label of a name.
+    """
+    folded = _fold(value)
+    if not folded:
+        return False
+    own = {_fold(name) for name in names if isinstance(name, str) and _fold(name)}
+    if folded in own:
+        return True
+    label = short_name(folded)
+    if "." in folded:
+        return label in own
+    return label in {short_name(name) for name in own}
+
+
 async def _machines_named(db: AsyncSession, value: str) -> list[HostMachine]:
     """The live machines that answer to *value*.
 
@@ -1161,17 +1195,9 @@ async def _machines_named(db: AsyncSession, value: str) -> list[HostMachine]:
     "depot.example.test". A full name never matches another full name by its
     first label alone: "db.alpha" and "db.beta" are two machines.
     """
-    folded = _fold(value)
-    if not folded:
+    if not _fold(value):
         return []
-    label = short_name(folded)
-    live = await _live_names(db)
-    exact = [row for row, names in live.values() if folded in names]
-    if exact:
-        return exact
-    if "." in folded:
-        return [row for row, names in live.values() if label in names]
-    return [row for row, names in live.values() if label in {short_name(n) for n in names}]
+    return _match_named(await _live_names(db), value)
 
 
 async def resolve_membership(db: AsyncSession, value: str) -> Membership | None:
@@ -1215,6 +1241,49 @@ async def resolve_membership(db: AsyncSession, value: str) -> Membership | None:
     if len(named) == 1:
         return await _membership(db, named[0], "name")
     return None
+
+
+async def names_held_elsewhere(
+    db: AsyncSession, names: Iterable[str], ip: str
+) -> dict[str, tuple[str, ...]]:
+    """The *names* that a different machine holds, each with that machine's addresses.
+
+    A host name read off a document can belong to a machine other than the one
+    at *ip*. The function withholds a name only on positive evidence. The store
+    must put *ip* on a machine that does not answer to the name, and a
+    different live machine must answer to it. An unknown name or an unknown
+    address gives no entry. A container address resolves to its host machine,
+    so it keeps the host's name.
+
+    The value of each entry lists one address for each holder: its primary
+    address, or its first address when it has no primary. The addresses are in
+    numeric order.
+    """
+    address = _is_address(ip)
+    if address is None:
+        return {}
+    own = await resolve_membership(db, address)
+    if own is None:
+        return {}
+    pending = [name for name in dict.fromkeys(names) if not _answers_to(own.names, name)]
+    if not pending:
+        return {}
+    live = await _live_names(db)
+    out: dict[str, tuple[str, ...]] = {}
+    for name in pending:
+        held: set[str] = set()
+        for row in _match_named(live, name):
+            if row.machine_key == own.key:
+                continue
+            holder_ip = row.primary_ip
+            if not holder_ip:
+                holder = await _membership(db, row, "name")
+                holder_ip = holder.addresses[0] if holder.addresses else None
+            if holder_ip:
+                held.add(holder_ip)
+        if held:
+            out[name] = tuple(sorted(held, key=address_sort_key))
+    return out
 
 
 async def label_owners(db: AsyncSession) -> dict[str, set[str]]:

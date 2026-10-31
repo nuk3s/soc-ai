@@ -3,6 +3,9 @@ const LABEL: Record<string, string> = {
   already_triaged: 'already triaged',
   inherited: 'verdict inherited',
   running: 'already running',
+  // A failed alert waits before its next automatic run (autotriage_health.py).
+  retry_wait: 'waiting to retry',
+  retry_limit: 'at the retry limit',
 };
 
 /**

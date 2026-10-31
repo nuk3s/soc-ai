@@ -454,7 +454,9 @@ export const DETECTION_KIND_TITLE: Record<string, string> = {
   suricata: 'Suricata raised this alert. It reads network traffic.',
   sigma: 'A Sigma rule raised this alert. It reads host and application logs.',
   notice: 'Zeek raised this notice. It reads network traffic.',
-  hunt: "An investigation that started from a hunt. Its subject is the hunt's findings.",
+  hunt:
+    'An investigation that started from a hunt. Its subject is one finding of the hunt or the ' +
+    'whole hunt.',
   lead: "An investigation that started from a lead. Its subject is the lead's hunt.",
   unnamed: 'The alert carries no rule name. The list groups these by dataset.',
   alert: 'The alert comes from a dataset this deployment maps to no detector.',
@@ -650,14 +652,27 @@ export const RULE_PRIOR_REASON: Record<string, string> = {
   evaluation_failed: 'The prior could not read its inputs.',
 };
 
-/** The type chip on an investigation whose subject is a hunt. */
+/** The type chip on an investigation whose subject is a hunt. A finding run
+ *  judges one finding (change E). A lead run and an older finding run judge
+ *  the whole hunt. The list row does not read which, so the tip covers both. */
 export const CHIP_SUBJECT_HUNT =
-  'An investigation of a hunt. Its subject is every finding of the hunt.';
+  'An investigation of a hunt. Its subject is one finding of the hunt or the whole hunt.';
 
 export const SUBJECT_OBJECTIVE =
   'The objective the hunt ran with. This investigation answers it.';
 
 export const SUBJECT_FINDINGS = 'The findings of the hunt this investigation read.';
+
+/** A run that judged one finding (change E). The two tips above stay true for
+ *  a lead run and for a finding run stored before the change. */
+export const SUBJECT_FINDING =
+  'The finding this investigation judges. The rest of the hunt is context.';
+
+export const SUBJECT_HUNT_CONTEXT =
+  'The hunt this finding came from. The investigation read it as context.';
+
+export const SUBJECT_OBJECTIVE_CONTEXT =
+  'The objective the hunt ran with. It is context for the finding.';
 
 export const SUBJECT_DOCUMENTS =
   'The documents the findings cite. The investigation read every one of them.';
@@ -709,3 +724,13 @@ export const QUALITY_TYPES_CLOSED_BY_HUNT =
 
 export const QUALITY_TYPES_THREAT =
   'Leads these types formed whose hunt reported a threat finding.';
+
+// ── The Event timeline ──────────────────────────────────────────────────────
+
+/** The chip on a row of the Event timeline that the verdict cites. */
+export const EVENT_CITED = 'The verdict cites this document.';
+
+/** The chip on a row of the hunt Event timeline: "F2". `n` counts from 1. */
+export function eventFindingTitle(n: number): string {
+  return `Finding ${n} cites this document.`;
+}

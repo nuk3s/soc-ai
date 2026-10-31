@@ -10,7 +10,10 @@ can see what the call was made from instead of inferring it.
 What it derives for one IP over a lookback window:
 
 - ``hostname`` — from Zeek DHCP (``host_name``), DCE-RPC/SMB host announcements,
-  or a reverse-DNS (PTR) answer, with the source noted in ``evidence``.
+  the ``host.name`` of a document that the host wrote, or a reverse-DNS (PTR)
+  answer, with the source noted in ``evidence``. The tool does not use a
+  ``host.name`` that the store gives to a different machine. The
+  ``evidence.hostname_withheld`` sentence then gives the address of that machine.
 - ``device_os_guess`` — PARSED from HTTP ``user_agent`` strings (and Zeek
   ``software.log`` when present). The parser is **ordered most-specific-first**
   so ``iPhone`` / ``iPad`` / ``Android`` win over the generic ``Macintosh`` /
@@ -68,8 +71,9 @@ import ipaddress
 import logging
 import re
 from collections import Counter
+from collections.abc import Mapping
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any, TypeGuard
 
 from soc_ai.config import Settings
 from soc_ai.dossier.coverage import HostCoverage, coverage_window, describe, host_coverage
@@ -96,6 +100,9 @@ from soc_ai.tools._registry import tool
 from soc_ai.tools._synth_scope import SynthScope, synth_scope_must_not
 from soc_ai.tools.os_hint import OsHint, os_hint_from_domains
 from soc_ai.tools.query_events import _build_time_filter
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -177,6 +184,9 @@ _DHCP_HOSTNAME: tuple[str, ...] = ("zeek.dhcp.host_name", "dhcp.host_name")
 # on a sensor's document it names the sensor (see fields.names_the_shipper).
 # ``host.hostname`` used to sit in the DHCP table above, which both skipped that
 # check and stamped the answer "(from dhcp)" — provenance for evidence never read.
+# A value that passes that check is also checked against the machines in the
+# store. The tool does not use a value that the store gives to a different
+# machine (see _names_held_elsewhere).
 _ECS_HOST_IDENTITY: tuple[str, ...] = ("host.name", "host.hostname")
 _SMB_HOSTNAME: tuple[str, ...] = (
     "zeek.dce_rpc.named_pipe",  # weak; real announcement is below
@@ -335,8 +345,13 @@ def _guess_role(ip: str, hits: list[dict[str, Any]]) -> tuple[str, list[str]]:
     return "unknown", []
 
 
-def _resolve_hostname(hits: list[dict[str, Any]], ip: str) -> tuple[str | None, str | None]:
-    """Best hostname for ``ip`` + the evidence string, or ``(None, None)``.
+def _resolve_hostname(
+    hits: list[dict[str, Any]],
+    ip: str,
+    *,
+    held_elsewhere: Mapping[str, tuple[str, ...]] | None = None,
+) -> tuple[str | None, str | None, dict[str, tuple[str, ...]]]:
+    """Best hostname for ``ip``, the evidence string, and the names it withheld.
 
     Preference order: Zeek DHCP ``host_name`` > SMB/DCE-RPC host announcement >
     ECS ``host.name``/``host.hostname`` > a reverse-DNS (PTR) answer. A field
@@ -348,7 +363,16 @@ def _resolve_hostname(hits: list[dict[str, Any]], ip: str) -> tuple[str | None, 
     actually being about ``ip`` (:func:`~soc_ai.so_client.fields.names_the_shipper`).
     Without that gate an agentless host inherits the name of whatever sensor
     watched it, which is how two range targets were both reported as the router.
+
+    The ECS lane also skips a value that is a key of ``held_elsewhere``: the
+    store gives that name to a different machine. The walk then continues to
+    later lanes, later documents and the PTR answer. The third value holds the
+    skipped names with the addresses of their machines. It holds only the names
+    that the walk skipped before the winner, or before it ran out, because only
+    those names changed the answer.
     """
+    held = held_elsewhere or {}
+    skipped: dict[str, tuple[str, ...]] = {}
     for hit in hits:
         for source_label, candidates in (
             ("dhcp", _DHCP_HOSTNAME),
@@ -356,11 +380,15 @@ def _resolve_hostname(hits: list[dict[str, Any]], ip: str) -> tuple[str | None, 
             ("host.name", _ECS_HOST_IDENTITY),
         ):
             value = first_present(hit, candidates)
-            if not (isinstance(value, str) and value and not _looks_like_ip(value)):
+            if not _usable_name(value):
                 continue
-            if candidates is _ECS_HOST_IDENTITY and fields.names_the_shipper(hit, value, ip):
-                continue
-            return value, f"{value} (from {source_label})"
+            if candidates is _ECS_HOST_IDENTITY:
+                if fields.names_the_shipper(hit, value, ip):
+                    continue
+                if value in held:
+                    skipped.setdefault(value, held[value])
+                    continue
+            return value, f"{value} (from {source_label})", skipped
     # PTR fallback: a reverse-DNS answer naming this IP (only if nothing better).
     for hit in hits:
         qname = first_present(hit, fields.DNS_QUERY)
@@ -368,9 +396,89 @@ def _resolve_hostname(hits: list[dict[str, Any]], ip: str) -> tuple[str | None, 
             (".in-addr.arpa", ".ip6.arpa")
         ):
             ans_str = _first_str(first_present(hit, _PTR_ANSWER))
-            if ans_str and not _looks_like_ip(ans_str):
-                return ans_str, f"{ans_str} (from DNS PTR)"
-    return None, None
+            if _usable_name(ans_str):
+                return ans_str, f"{ans_str} (from DNS PTR)", skipped
+    return None, None, skipped
+
+
+# evidence.hostname_withheld: the store gives a host.name on the documents to a
+# different machine. One form for one address, one form for more.
+_WITHHELD_ONE = (
+    "A host.name value on these documents names the machine at {addresses}. "
+    "The tool does not use that name for {ip}. "
+    "The store puts {ip} on a different machine."
+)
+_WITHHELD_MANY = (
+    "The host.name values on these documents name the machines at {addresses}. "
+    "The tool does not use those names for {ip}. "
+    "The store puts {ip} on a different machine."
+)
+_WITHHELD_TAIL = "{shown} and {n} more"
+_WITHHELD_SHOWN = 3
+
+
+async def _names_held_elsewhere(
+    db_sessionmaker: async_sessionmaker[AsyncSession] | None,
+    hits: list[dict[str, Any]],
+    ip: str,
+) -> dict[str, tuple[str, ...]]:
+    """The ``host.name`` values that the store gives to a different machine.
+
+    Only a value that passes the grid rule
+    (:func:`~soc_ai.so_client.fields.names_the_shipper`) is asked about. When no
+    value passes, the function reads nothing, so an agentless host costs no
+    store read. A failed read logs a warning and gives ``{}``: the grid answer
+    stands. Never raises.
+    """
+    if db_sessionmaker is None:
+        return {}
+    names: dict[str, None] = {}
+    for hit in hits:
+        value = first_present(hit, _ECS_HOST_IDENTITY)
+        if _usable_name(value) and not fields.names_the_shipper(hit, value, ip):
+            names.setdefault(value, None)
+    if not names:
+        return {}
+    from soc_ai.store import host_machines  # noqa: PLC0415 - keep the store out of import time
+
+    try:
+        async with db_sessionmaker() as db:
+            return await host_machines.names_held_elsewhere(db, list(names), ip)
+    except Exception as e:
+        _LOGGER.warning("host_summary cannot read the machines in the store for %s: %s", ip, e)
+        return {}
+
+
+async def _checked_hostname(
+    db_sessionmaker: async_sessionmaker[AsyncSession] | None,
+    hits: list[dict[str, Any]],
+    ip: str,
+) -> tuple[str | None, dict[str, str]]:
+    """The hostname after the grid rule and the store check, and its evidence entries.
+
+    The entries are ``hostname`` for the winner and ``hostname_withheld`` when
+    the walk skipped a name that the store gives to a different machine.
+    """
+    held = await _names_held_elsewhere(db_sessionmaker, hits, ip)
+    hostname, hostname_evidence, skipped = _resolve_hostname(hits, ip, held_elsewhere=held)
+    notes: dict[str, str] = {}
+    if hostname_evidence:
+        notes["hostname"] = hostname_evidence
+    if skipped:
+        notes["hostname_withheld"] = _withheld_note(skipped, ip)
+    return hostname, notes
+
+
+def _withheld_note(skipped: Mapping[str, tuple[str, ...]], ip: str) -> str:
+    """The ``evidence.hostname_withheld`` sentence for the names the walk skipped."""
+    from soc_ai.store.host_machines import address_sort_key  # noqa: PLC0415
+
+    addresses = sorted({a for held in skipped.values() for a in held}, key=address_sort_key)
+    shown = ", ".join(addresses[:_WITHHELD_SHOWN])
+    if len(addresses) > _WITHHELD_SHOWN:
+        shown = _WITHHELD_TAIL.format(shown=shown, n=len(addresses) - _WITHHELD_SHOWN)
+    template = _WITHHELD_ONE if len(addresses) == 1 else _WITHHELD_MANY
+    return template.format(addresses=shown, ip=ip)
 
 
 def _resolve_device_os(hits: list[dict[str, Any]]) -> tuple[str | None, list[str]]:
@@ -433,6 +541,7 @@ async def host_summary(
     time_anchor: datetime | None = None,
     include_synth: SynthScope = False,
     provenance: Provenance = LIVE,
+    db_sessionmaker: async_sessionmaker[AsyncSession] | None = None,
 ) -> dict[str, Any]:
     """Summarise what host an IP is, from Zeek/ECS observations in the window.
 
@@ -454,6 +563,11 @@ async def host_summary(
             every field below would be read off it. ``"any"`` includes
             backfill, for reading an import deliberately — which is what the
             empty result points a caller at when the address is import-only.
+        db_sessionmaker: the store. When it is set, the tool checks each
+            ``host.name`` answer against the machines in the store. It does
+            not use a name that the store gives to a different machine, and
+            ``evidence.hostname_withheld`` then says so. ``None`` skips the
+            check.
 
     Returns:
         A dict with ``hostname`` / ``device_os_guess`` / ``os_hint`` /
@@ -475,7 +589,9 @@ async def host_summary(
         the caller is an LLM tool boundary.
     """
     try:
-        ipaddress.ip_address(ip)
+        # One spelling for every compare, query and the returned "ip". An
+        # IPv4-mapped address gives the IPv4 address.
+        ip = fields.canonical_ip(ip)
     except ValueError:
         return {"error": True, "type": "ValueError", "message": f"invalid IP: {ip}"}
 
@@ -536,6 +652,7 @@ async def host_summary(
         "host.ip",
         "observer.name",
         "agent.name",
+        *fields.LOCAL_END_FIELDS,
     ):
         source_fields.setdefault(f, None)
     for candidates in (
@@ -604,9 +721,10 @@ async def host_summary(
     evidence: dict[str, Any] = {"population": denominator_note(provenance)}
 
     # --- hostname (DHCP host_name > SMB/DCE-RPC announcement > host.name > PTR) ---
-    hostname, hostname_evidence = _resolve_hostname(hits, ip)
-    if hostname_evidence:
-        evidence["hostname"] = hostname_evidence
+    # Resolved before the host-log read, so that read keys on a name that
+    # passed both the grid rule and the store.
+    hostname, hostname_notes = await _checked_hostname(db_sessionmaker, hits, ip)
+    evidence.update(hostname_notes)
 
     # --- host logs: the documents the host's own agent ships ---
     # Read by host.ip and by host.name (the resolved name, its short form and
@@ -744,6 +862,11 @@ def _looks_like_ip(value: str) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _usable_name(value: object) -> TypeGuard[str]:
+    """True for a non-empty str that is not an address. Only such a value names a host."""
+    return isinstance(value, str) and bool(value) and not _looks_like_ip(value)
 
 
 def _first_str(value: Any) -> str | None:

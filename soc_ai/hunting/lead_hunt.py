@@ -8,6 +8,10 @@ started carry the same objective, the same evidence block and the same tags.
 Two copies of that body would drift, and the drift would only show on the
 range, where a lead hunt reads a different prompt depending on who began it.
 
+Every lead hunt also reads the earlier conclusions about its entities
+(:mod:`soc_ai.hunting.earlier`). That covers the loop, the analyst's Hunt
+again and the bulk hunt, because all three run :func:`start_lead_hunt`.
+
 The loop's own rules live here too, because they are queries and not schedule
 discipline: :func:`leads_awaiting_a_hunt` names the leads the loop may take,
 and :func:`running_auto_hunts` counts the hunts it already has in flight.
@@ -116,6 +120,10 @@ async def start_lead_hunt(state: Any, *, lead_id: int, started_by: str) -> LeadH
     The read, the console start and the mark run under one lock per lead, so
     a start that lands while another is between the read and the mark waits
     for it and then reads the hunt it left, rather than starting its own.
+
+    The hunt also reads the earlier conclusions about the lead's entities
+    (:func:`soc_ai.hunting.earlier.earlier_for_lead`). They travel beside the
+    objective, so the objective stays the lead's own record.
     """
     lead_id = int(lead_id)
     async with _start_lock(lead_id):
@@ -124,6 +132,7 @@ async def start_lead_hunt(state: Any, *, lead_id: int, started_by: str) -> LeadH
 
 async def _start_lead_hunt(state: Any, *, lead_id: int, started_by: str) -> LeadHuntStart:
     """The body of :func:`start_lead_hunt`, run with the lead's lock held."""
+    from soc_ai.hunting import earlier as earlier_mod  # noqa: PLC0415 - lazy
     from soc_ai.store import leads as leads_store  # noqa: PLC0415 - lazy
     from soc_ai.webui import hunt_console_manager as hcm  # noqa: PLC0415 - lazy
 
@@ -148,6 +157,9 @@ async def _start_lead_hunt(state: Any, *, lead_id: int, started_by: str) -> Lead
             + leads_store.evidence_block_for(rows)
         )
 
+    # Read on its own session, and never raises: a failed read starts the hunt
+    # without the block.
+    earlier = await earlier_mod.earlier_for_lead(state.db_sessionmaker, lead_id)
     hunt_id = await hcm.get_manager(state).start(
         state,
         objective=objective,
@@ -155,6 +167,7 @@ async def _start_lead_hunt(state: Any, *, lead_id: int, started_by: str) -> Lead
         kind="lead",
         starter="lead",
         lead_id=lead_id,
+        earlier=earlier,
     )
     if hunt_id is None:
         raise LeadHuntRefused("could_not_start", lead_id)

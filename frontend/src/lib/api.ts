@@ -679,15 +679,25 @@ export function getHunt(id: string): Promise<HuntDetailData> {
 }
 
 /** Promote one hunt finding into a full investigation of its cited evidence.
- * Idempotent server-side: a running/complete promotion returns its id. */
+ * Idempotent server-side: a running/complete promotion returns its id.
+ *
+ * `rerun: true` is the Re-run of a finding run (2026-10-30). The server starts
+ * a new run of the finding over a run that ended, and returns a run of the
+ * finding that still runs with `existing: true`. Without the option the
+ * request carries no body, so the default request keeps its shape. */
 export function promoteFinding(
   huntId: string,
   ordinal: number,
+  opts?: { rerun?: boolean },
 ): Promise<{ investigation_id: string; existing?: boolean }> {
-  return post(`/hunts/${encodeURIComponent(huntId)}/findings/${ordinal}/investigate`, undefined, {
-    timeoutMs: RUN_START_TIMEOUT_MS,
-    timeoutNote: INVESTIGATION_START_NOTE,
-  });
+  return post(
+    `/hunts/${encodeURIComponent(huntId)}/findings/${ordinal}/investigate`,
+    opts?.rerun ? { rerun: true } : undefined,
+    {
+      timeoutMs: RUN_START_TIMEOUT_MS,
+      timeoutNote: INVESTIGATION_START_NOTE,
+    },
+  );
 }
 
 /**
@@ -2319,6 +2329,16 @@ export interface AutoTriageStatus {
   degraded?: boolean;
   /** Which queries failed ("severity critical", "rule ET SCAN thing"). */
   grid_errors?: string[];
+  /** The end of the pause of continuous Auto-Investigate (ISO). Null when not paused. */
+  paused_until?: string | null;
+  /** The end of the last pause (ISO). It stays after the end passes, until a verdict closes the pause. */
+  pause_ends?: string | null;
+  /** The failed runs in a row while paused. 0 when not paused. */
+  failed_in_a_row?: number;
+  /** The error of the open alarm, or the last error while paused. Null when all is well. */
+  alarm_error?: string | null;
+  /** The failed runs of the open alarm. 0 when no alarm is open. */
+  alarm_failures?: number;
 }
 
 const _SEV_LADDER = ['critical', 'high', 'medium', 'low'] as const;

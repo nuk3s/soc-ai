@@ -10,6 +10,14 @@ describe('formatSkipReasons', () => {
     ).toBe('80 already triaged · 10 verdict inherited · 1 already running');
   });
 
+  // A failed alert waits before its next automatic run (2026-10-27: the
+  // scheduler ran two failed alerts 109 times each).
+  it('formats the retry reasons', () => {
+    expect(formatSkipReasons({ retry_limit: 2, retry_wait: 1 })).toBe(
+      '2 at the retry limit · 1 waiting to retry',
+    );
+  });
+
   it('passes through unknown codes readably', () => {
     expect(formatSkipReasons({ some_new_code: 3 })).toBe('3 some new code');
   });

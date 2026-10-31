@@ -208,8 +208,11 @@ async def test_loop_fires_due_schedule_once(
         started_by: str,
         kind: str = "chat",
         starter: str = "analyst",
+        earlier: Any = None,
     ) -> str:
-        calls.append({"objective": objective, "started_by": started_by, "kind": kind})
+        calls.append(
+            {"objective": objective, "started_by": started_by, "kind": kind, "earlier": earlier}
+        )
         return "HUNT123"
 
     fake_manager = SimpleNamespace(start=_start)
@@ -222,7 +225,80 @@ async def test_loop_fires_due_schedule_once(
     assert calls[0]["objective"] == "nightly beacon sweep"
     assert calls[0]["kind"] == "scheduled"
     assert calls[0]["started_by"] == "scheduler"
+    # No earlier run of the objective, so no earlier conclusion.
+    assert calls[0]["earlier"] is None
     # last_run_at stamped → the interval clock reset
+    async with maker() as db:
+        got = await hs_svc.get(db, sched.id)
+        assert got is not None and got.last_run_at is not None
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_loop_hands_the_earlier_runs_to_the_scheduled_hunt(
+    monkeypatch: pytest.MonkeyPatch, settings_kratos: Settings
+) -> None:
+    """Prod: the 10-27 run of a schedule named the test workspace behind an
+    exploit, and the 10-29 run could not name the driver. The loop now hands
+    the hunt the findings of the last complete runs. The objective does not
+    change, so the run keeps its link to the earlier runs."""
+    from soc_ai.store import hunts as hunt_svc
+    from soc_ai.store.models import Hunt
+
+    engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        sched = await hs_svc.create(db, objective="nightly beacon sweep", interval_minutes=60)
+        earlier_run = await hunt_svc.create(
+            db, objective="Nightly  beacon sweep", started_by="scheduler", kind="scheduled"
+        )
+        await hunt_svc.finalize(
+            db,
+            earlier_run.id,
+            status="complete",
+            report={
+                "findings": [
+                    {
+                        "title": "Host logs tie the beacon to a lab",
+                        "detail": "The lab runs the beacon.",
+                        "severity": "low",
+                        "category": "observation",
+                        "hosts": ["192.0.2.26"],
+                        "citations": ["docAAAAAAAAAAAAAAAAA"],
+                    }
+                ]
+            },
+        )
+        row = await db.get(Hunt, earlier_run.id)
+        assert row is not None
+        row.created_at = utcnow() - timedelta(days=2)
+        await db.commit()
+    app = _loop_app(maker, enabled=True)
+
+    calls: list[dict[str, Any]] = []
+
+    async def _start(
+        _state: Any,
+        *,
+        objective: str,
+        started_by: str,
+        kind: str = "chat",
+        starter: str = "analyst",
+        earlier: Any = None,
+    ) -> str:
+        calls.append({"objective": objective, "earlier": earlier})
+        return "HUNT-E"
+
+    monkeypatch.setattr(
+        "soc_ai.webui.hunt_console_manager.get_manager",
+        lambda _s: SimpleNamespace(start=_start),
+    )
+
+    await _run_loop(monkeypatch, app)
+
+    assert len(calls) == 1
+    assert calls[0]["objective"] == "nightly beacon sweep"
+    assert calls[0]["earlier"] is not None
+    assert '- observation: "Host logs tie the beacon to a lab"' in calls[0]["earlier"].text
     async with maker() as db:
         got = await hs_svc.get(db, sched.id)
         assert got is not None and got.last_run_at is not None
@@ -249,6 +325,7 @@ async def test_loop_single_flights_just_ran_schedule(
         started_by: str,
         kind: str = "chat",
         starter: str = "analyst",
+        earlier: Any = None,
     ) -> str:
         calls.append(objective)
         return "HUNT-X"
@@ -284,6 +361,7 @@ async def test_loop_skips_when_master_switch_off(
         started_by: str,
         kind: str = "chat",
         starter: str = "analyst",
+        earlier: Any = None,
     ) -> str:
         calls.append(objective)
         return "HUNT-Y"
@@ -319,6 +397,7 @@ async def test_loop_survives_a_bad_schedule(
         started_by: str,
         kind: str = "chat",
         starter: str = "analyst",
+        earlier: Any = None,
     ) -> str:
         if objective == "BAD":
             raise RuntimeError("spawn boom")

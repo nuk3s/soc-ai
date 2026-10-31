@@ -984,3 +984,435 @@ async def test_a_failed_host_log_read_is_unknown(settings_kratos: Settings) -> N
     assert out["host_logs"]["read_ok"] is False
     assert out["host_logs"]["datasets"] == {}
     assert "could not read the coverage of 192.0.2.41" in out["summary"]
+
+
+# ---------------------------------------------------------------------------
+# Endpoint-authored flows: an endpoint agent writes one document for each
+# connection and each DNS lookup, with its own host.name and no host.ip. The
+# name belongs to the local end of the flow only. Before the fix, an agentless
+# target took the name of the agent that connected to it, and the host-log
+# block then read that agent's process events as the target's.
+# ---------------------------------------------------------------------------
+
+_AGENT_IP = "192.0.2.202"
+_TARGET_IP = "192.0.2.164"
+_RESOLVER_IP = "192.0.2.22"
+
+
+def _endpoint_doc(**extra: Any) -> dict[str, Any]:
+    return {
+        "@timestamp": "2026-10-24T22:20:43Z",
+        "event.dataset": "endpoint.events.network",
+        "event.module": "endpoint",
+        "agent.type": "endpoint",
+        "process.name": "curl",
+        **extra,
+    }
+
+
+DEFEND_HITS = [
+    _endpoint_doc(
+        **{
+            "host.name": "ws-a",
+            "network.direction": "egress",
+            "event.action": ["connection_attempted", "disconnect_received"],
+            "source.ip": _AGENT_IP,
+            "source.port": 51544,
+            "destination.ip": _TARGET_IP,
+            "destination.port": 8443,
+        }
+    ),
+    _endpoint_doc(
+        **{
+            "host.name": "ws-a",
+            "network.direction": "ingress",
+            "event.action": ["connection_accepted"],
+            "source.ip": _TARGET_IP,
+            "source.port": 40112,
+            "destination.ip": _AGENT_IP,
+            "destination.port": 4444,
+        }
+    ),
+]
+
+LOOKUP_HITS = [
+    _endpoint_doc(
+        **{
+            "host.name": "ws-a",
+            "event.action": "lookup_requested",
+            "source.ip": _RESOLVER_IP,
+            "source.port": 53,
+            "destination.ip": _AGENT_IP,
+            "destination.port": 38319,
+        }
+    ),
+]
+
+
+def _host_log_terms(calls: list[dict[str, Any]]) -> dict[str, Any]:
+    """The terms of the host-log read, keyed by field."""
+    reads = [c for c in calls if "host_datasets" in (c.get("aggs") or {})]
+    assert len(reads) == 1, calls
+    should = reads[0]["query"]["bool"]["should"]
+    return {next(iter(c["terms"])): next(iter(c["terms"].values())) for c in should}
+
+
+def _routed(
+    settings: Settings, hits: list[dict[str, Any]]
+) -> tuple[ElasticClient, list[dict[str, Any]]]:
+    calls: list[dict[str, Any]] = []
+    elastic, _ = _make_elastic(settings, _result(hits))
+    elastic.search = _routing_search(  # type: ignore[method-assign]
+        _result(hits), EsSearchResult(total=0, took_ms=1, aggregations={}), calls
+    )
+    return elastic, calls
+
+
+@pytest.mark.asyncio
+async def test_host_summary_does_not_borrow_the_name_of_an_endpoint_peer(
+    settings_kratos: Settings,
+) -> None:
+    elastic, calls = _routed(settings_kratos, DEFEND_HITS)
+
+    out = await host_summary(_TARGET_IP, elastic=elastic, settings=settings_kratos)
+
+    assert out["hostname"] is None
+    assert "hostname" not in out["evidence"]
+    terms = _host_log_terms(calls)
+    assert terms["host.ip"] == [_TARGET_IP]
+    assert "host.name" not in terms
+
+
+@pytest.mark.asyncio
+async def test_host_summary_keeps_the_agents_own_name_from_its_flow_documents(
+    settings_kratos: Settings,
+) -> None:
+    """NEGATIVE CONTROL: the agent's own documents still name the agent."""
+    elastic, _calls = _routed(settings_kratos, DEFEND_HITS)
+
+    out = await host_summary(_AGENT_IP, elastic=elastic, settings=settings_kratos)
+
+    assert out["hostname"] == "ws-a"
+    assert out["evidence"]["hostname"] == "ws-a (from host.name)"
+
+
+@pytest.mark.asyncio
+async def test_host_summary_names_an_agent_host_by_its_own_agent_after_a_peers_document(
+    settings_kratos: Settings,
+) -> None:
+    """A peer's document comes first in the sample. The host's own document names it."""
+    hits = [
+        _endpoint_doc(
+            **{
+                "host.name": "ws-a",
+                "network.direction": "ingress",
+                "event.action": ["connection_accepted"],
+                "source.ip": "192.0.2.226",
+                "source.port": 50110,
+                "destination.ip": _AGENT_IP,
+                "destination.port": 22,
+            }
+        ),
+        _endpoint_doc(
+            **{
+                "@timestamp": "2026-10-24T22:21:00Z",
+                "host.name": "ws-b",
+                "network.direction": "egress",
+                "event.action": ["connection_attempted"],
+                "source.ip": "192.0.2.226",
+                "source.port": 50110,
+                "destination.ip": _AGENT_IP,
+                "destination.port": 22,
+            }
+        ),
+    ]
+    elastic, calls = _routed(settings_kratos, hits)
+
+    out = await host_summary("192.0.2.226", elastic=elastic, settings=settings_kratos)
+
+    assert out["hostname"] == "ws-b"
+    assert "ws-a" not in _host_log_terms(calls).get("host.name", [])
+
+
+@pytest.mark.asyncio
+async def test_host_summary_does_not_name_a_resolver_after_its_clients(
+    settings_kratos: Settings,
+) -> None:
+    elastic, _calls = _routed(settings_kratos, LOOKUP_HITS)
+    resolver = await host_summary(_RESOLVER_IP, elastic=elastic, settings=settings_kratos)
+
+    elastic, _calls = _routed(settings_kratos, LOOKUP_HITS)
+    agent = await host_summary(_AGENT_IP, elastic=elastic, settings=settings_kratos)
+
+    assert resolver["hostname"] is None
+    assert agent["hostname"] == "ws-a"
+
+
+@pytest.mark.asyncio
+async def test_host_summary_projects_the_fields_that_place_the_local_end(
+    settings_kratos: Settings,
+) -> None:
+    search = AsyncMock(return_value=_result(DEFEND_HITS))
+    elastic, _ = _make_elastic(settings_kratos, _result(DEFEND_HITS))
+    elastic.search = search  # type: ignore[method-assign]
+
+    await host_summary(_TARGET_IP, elastic=elastic, settings=settings_kratos)
+
+    projected = search.await_args_list[0].kwargs["source"]
+    assert {"network.direction", "event.action", "source.port", "destination.port"} <= set(
+        projected
+    )
+
+
+@pytest.mark.asyncio
+async def test_host_summary_reads_an_address_in_any_spelling(settings_kratos: Settings) -> None:
+    hits = [
+        _endpoint_doc(
+            **{
+                "host.name": "ws-a",
+                "network.direction": "egress",
+                "source.ip": "2001:db8::1",
+                "destination.ip": "2001:db8::a",
+            }
+        )
+    ]
+    elastic, _calls = _routed(settings_kratos, hits)
+
+    out = await host_summary("2001:DB8::A", elastic=elastic, settings=settings_kratos)
+
+    assert out["hostname"] is None
+    assert out["ip"] == "2001:db8::a"
+
+
+@pytest.mark.asyncio
+async def test_host_summary_reads_an_ipv4_mapped_address_as_the_ipv4_address(
+    settings_kratos: Settings,
+) -> None:
+    """Elasticsearch stores ``::ffff:a.b.c.d`` and ``a.b.c.d`` as one ip value."""
+    elastic, calls = _routed(settings_kratos, DEFEND_HITS)
+
+    out = await host_summary(f"::ffff:{_TARGET_IP}", elastic=elastic, settings=settings_kratos)
+
+    assert out["ip"] == _TARGET_IP
+    assert out["hostname"] is None
+    assert _host_log_terms(calls)["host.ip"] == [_TARGET_IP]
+
+
+# ---------------------------------------------------------------------------
+# The machine store: a host.name that passes the grid rule is checked against
+# the machines in the store. The tool withholds a name that the store gives to
+# a different machine.
+# ---------------------------------------------------------------------------
+
+# A shared-bridge document: the agent on the depot lists the bridge address in
+# its own host.ip, so the grid rule accepts the name for that address.
+_BRIDGE_IP = "172.17.0.1"
+BRIDGE_HITS = [
+    {
+        "@timestamp": "2026-10-24T10:00:00Z",
+        "event.dataset": "system.syslog",
+        "host.name": "depot",
+        "host.ip": [_BRIDGE_IP, "192.0.2.75"],
+        "source.ip": _BRIDGE_IP,
+        "destination.ip": "192.0.2.80",
+    }
+]
+_ONE_MACHINE_NOTE = (
+    "A host.name value on these documents names the machine at 192.0.2.75. "
+    "The tool does not use that name for 172.17.0.1. "
+    "The store puts 172.17.0.1 on a different machine."
+)
+
+
+class _FakeSession:
+    async def __aenter__(self) -> _FakeSession:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+
+class _FakeMaker:
+    """Stands in for an async_sessionmaker. It counts the sessions it opens."""
+
+    def __init__(self) -> None:
+        self.opened = 0
+
+    def __call__(self) -> _FakeSession:
+        self.opened += 1
+        return _FakeSession()
+
+
+@pytest.mark.asyncio
+async def test_host_summary_withholds_a_name_another_machine_holds(
+    settings_kratos: Settings,
+) -> None:
+    elastic, calls = _routed(settings_kratos, BRIDGE_HITS)
+    held = AsyncMock(return_value={"depot": ("192.0.2.75",)})
+    maker = _FakeMaker()
+
+    with patch("soc_ai.store.host_machines.names_held_elsewhere", held):
+        out = await host_summary(
+            _BRIDGE_IP,
+            elastic=elastic,
+            settings=settings_kratos,
+            db_sessionmaker=maker,  # type: ignore[arg-type]
+        )
+
+    assert out["hostname"] is None
+    assert "hostname" not in out["evidence"]
+    assert out["evidence"]["hostname_withheld"] == _ONE_MACHINE_NOTE
+    assert "host.name" not in _host_log_terms(calls)
+    held.assert_awaited_once()
+    _db, names, ip = held.await_args.args
+    assert list(names) == ["depot"]
+    assert ip == _BRIDGE_IP
+    assert maker.opened == 1
+
+
+@pytest.mark.asyncio
+async def test_host_summary_keeps_a_name_its_own_machine_holds(
+    settings_kratos: Settings,
+) -> None:
+    """NEGATIVE CONTROL: the store gives the name to no other machine."""
+    elastic, _calls = _routed(settings_kratos, BRIDGE_HITS)
+
+    with patch("soc_ai.store.host_machines.names_held_elsewhere", AsyncMock(return_value={})):
+        out = await host_summary(
+            _BRIDGE_IP,
+            elastic=elastic,
+            settings=settings_kratos,
+            db_sessionmaker=_FakeMaker(),  # type: ignore[arg-type]
+        )
+
+    assert out["hostname"] == "depot"
+    assert "hostname_withheld" not in out["evidence"]
+
+
+@pytest.mark.asyncio
+async def test_host_summary_notes_only_a_withheld_name_that_would_have_won(
+    settings_kratos: Settings,
+) -> None:
+    """A DHCP lease names the host first, so the withheld name changed nothing."""
+    lease = {
+        "@timestamp": "2026-10-24T09:00:00Z",
+        "event.dataset": "zeek.dhcp",
+        "source.ip": _BRIDGE_IP,
+        "destination.ip": "192.0.2.254",
+        "zeek": {"dhcp": {"host_name": "ws-lease"}},
+    }
+    elastic, _calls = _routed(settings_kratos, [lease, *BRIDGE_HITS])
+    held = AsyncMock(return_value={"depot": ("192.0.2.75",)})
+
+    with patch("soc_ai.store.host_machines.names_held_elsewhere", held):
+        out = await host_summary(
+            _BRIDGE_IP,
+            elastic=elastic,
+            settings=settings_kratos,
+            db_sessionmaker=_FakeMaker(),  # type: ignore[arg-type]
+        )
+
+    assert out["hostname"] == "ws-lease"
+    assert out["evidence"]["hostname"] == "ws-lease (from dhcp)"
+    assert "hostname_withheld" not in out["evidence"]
+    held.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_host_summary_notes_a_withheld_name_when_a_later_lane_wins(
+    settings_kratos: Settings,
+) -> None:
+    """The walk skips the held name first. A later DHCP lease then wins.
+
+    The skipped name changed the answer, so the note stays.
+    """
+    lease = {
+        "@timestamp": "2026-10-24T11:00:00Z",
+        "event.dataset": "zeek.dhcp",
+        "source.ip": _BRIDGE_IP,
+        "destination.ip": "192.0.2.254",
+        "zeek": {"dhcp": {"host_name": "ws-lease"}},
+    }
+    elastic, _calls = _routed(settings_kratos, [*BRIDGE_HITS, lease])
+    held = AsyncMock(return_value={"depot": ("192.0.2.75",)})
+
+    with patch("soc_ai.store.host_machines.names_held_elsewhere", held):
+        out = await host_summary(
+            _BRIDGE_IP,
+            elastic=elastic,
+            settings=settings_kratos,
+            db_sessionmaker=_FakeMaker(),  # type: ignore[arg-type]
+        )
+
+    assert out["hostname"] == "ws-lease"
+    assert out["evidence"]["hostname"] == "ws-lease (from dhcp)"
+    assert out["evidence"]["hostname_withheld"] == _ONE_MACHINE_NOTE
+    held.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_host_summary_skips_the_machine_store_for_an_agentless_host(
+    settings_kratos: Settings,
+) -> None:
+    """No host.name passes the grid rule for the target, so the store is not read."""
+    elastic, _calls = _routed(settings_kratos, DEFEND_HITS)
+    held = AsyncMock(return_value={})
+    maker = _FakeMaker()
+
+    with patch("soc_ai.store.host_machines.names_held_elsewhere", held):
+        out = await host_summary(
+            _TARGET_IP,
+            elastic=elastic,
+            settings=settings_kratos,
+            db_sessionmaker=maker,  # type: ignore[arg-type]
+        )
+
+    assert out["hostname"] is None
+    held.assert_not_awaited()
+    assert maker.opened == 0
+
+
+@pytest.mark.asyncio
+async def test_host_summary_keeps_the_grid_answer_when_the_machine_store_fails(
+    settings_kratos: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    elastic, _calls = _routed(settings_kratos, DEFEND_HITS)
+    held = AsyncMock(side_effect=RuntimeError("database is locked"))
+
+    with (
+        caplog.at_level("WARNING", logger="soc_ai.tools.host_summary"),
+        patch("soc_ai.store.host_machines.names_held_elsewhere", held),
+    ):
+        out = await host_summary(
+            _AGENT_IP,
+            elastic=elastic,
+            settings=settings_kratos,
+            db_sessionmaker=_FakeMaker(),  # type: ignore[arg-type]
+        )
+
+    assert out["hostname"] == "ws-a"
+    assert "hostname_withheld" not in out["evidence"]
+    warnings = [
+        r.getMessage()
+        for r in caplog.records
+        if r.getMessage().startswith("host_summary cannot read the machines in the store")
+    ]
+    assert warnings == [
+        f"host_summary cannot read the machines in the store for {_AGENT_IP}: database is locked"
+    ]
+
+
+def test_the_withheld_note_names_at_most_three_machines() -> None:
+    from soc_ai.tools.host_summary import _withheld_note
+
+    two = _withheld_note({"ws-a": ("192.0.2.9",), "ws-b": ("192.0.2.10", "192.0.2.9")}, _BRIDGE_IP)
+    assert two == (
+        "The host.name values on these documents name the machines at 192.0.2.9, 192.0.2.10. "
+        "The tool does not use those names for 172.17.0.1. "
+        "The store puts 172.17.0.1 on a different machine."
+    )
+    five = _withheld_note(
+        {"ws-a": ("192.0.2.5", "192.0.2.4", "192.0.2.3"), "ws-b": ("192.0.2.2", "192.0.2.1")},
+        _BRIDGE_IP,
+    )
+    assert "at 192.0.2.1, 192.0.2.2, 192.0.2.3 and 2 more." in five

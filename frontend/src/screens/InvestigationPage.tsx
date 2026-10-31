@@ -13,8 +13,8 @@ export function InvestigationPage() {
   const navigate = useNavigate();
   const location = useLocation();
   const from = (location.state as { from?: string } | null)?.from;
-  // A promoted finding's back-link returns to the hunt it came from — the
-  // hunt page is where re-promotion (this slice's sanctioned re-run) lives.
+  // A promoted finding's back-link returns to the hunt it came from. The
+  // hunt page holds the finding and the other findings of the hunt.
   const fromHunt = from?.startsWith('/hunts/') ? from : null;
   const [reloadKey, setReloadKey] = useState(0);
   // useAsync captures pauseWhen at setup and can't see `inv` there, so track the

@@ -37,6 +37,11 @@ _LOGGER = logging.getLogger(__name__)
 # forms like ``community_id:1:abc=`` to yield separate tokens that each
 # can be checked independently against the bundle JSON.
 _FUZZY_TOKEN_RE = re.compile(r"[A-Za-z0-9][\w./\-]{2,}")
+# GATE C: a date, a date with its hour, or a token of digits and dashes only.
+# Every bundle holds the alert's own @timestamp, so such a token matches any
+# bundle, and the writer rules ask for the time of each cited record (change
+# D). An address is digits and dots, and it stays distinctive.
+_DATE_TOKEN_RE = re.compile(r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}(?:t\d{1,2})?|[\d-]+")
 
 # GATE C: generic tokens that must never, on their own, resolve a citation
 # semantically. A citation that "matches" the bundle only on one of these (or on
@@ -106,7 +111,7 @@ def _semantic_token_resolves(source: str, bundle_text: str) -> bool:
     """
     for tok in _FUZZY_TOKEN_RE.findall(source):
         low = tok.lower()
-        if low in _CITATION_STOP_WORDS:
+        if low in _CITATION_STOP_WORDS or _DATE_TOKEN_RE.fullmatch(low):
             continue
         if len(tok) >= 8 and low in bundle_text:
             return True
@@ -852,6 +857,7 @@ def _synth_first_post_validate(
     # Catches the defect where the LLM escalates to TP solely because the
     # host_alert_profile lists malware/C2 rules (which may themselves be FPs)
     # and the external IP has no reputation — with zero per-alert evidence.
+    # On a hunt finding it also reads the documents the promoted finding cites.
     report = _downgrade_ungrounded_host_anchored_tp(report, enriched_ctx, audit)
 
     # ----- Decisive-value support gate (H1's deferred half) -----
@@ -918,6 +924,70 @@ _GROUNDED_EVIDENCE_TOKENS: frozenset[str] = frozenset(
         "timed",
     }
 )
+
+# Web attack evidence (owner fix, 2026-10-30). One compiled pattern per type of
+# evidence. The PHP2Shell finding runs of 2026-10-24..29 named this evidence,
+# with 'webshell', '<?php', 'RCE', 'path-traversal' and '/etc/passwd', and none
+# of it matched the C2 words above, so the gate wiped four hunt-finding stories.
+#
+# Bare 'exploit', 'cve' and 'traversal' stay out: prod host histories carry
+# them ('ET EXPLOIT ... CVE-2020-11910', the STUN 'Session Traversal' rules).
+# 'rfi' stays out: SOC text uses it for 'request for information'.
+#
+# A pattern counts only when no rule name of the host_alert_profile matches it.
+# Prod histories carry 'log4j RCE', 'Command Injection' and 'Code Injection'
+# rule names, and a model quotes rule names in its citations. The C2 words
+# above get no such exclusion, so no keep path of an alert run gets smaller.
+#
+# A negated phrase ('no web shell was written') still matches. That weakness is
+# accepted, as it was for 'beacon' in the 2026-07-21 review: the scan only
+# ever keeps a true positive, and the hard evidence gate runs after it.
+_WEB_ATTACK_EVIDENCE_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p)
+    for p in (
+        r"web[\s-]?shell",
+        r"(?:path|directory)[\s-]traversal",
+        r"/etc/passwd",
+        r"file[\s-]inclusion|\blfi\b",
+        r"command[\s-]injection",
+        r"code[\s-]injection",
+        r"sql[\s-]injection|\bsqli\b",
+        r"remote[\s-]code[\s-]execution|\brce\b",
+        r"<\?php",
+    )
+)
+
+# The text of the host history gate. The lead opens the summary when the gate
+# fires: its first sentence becomes the row headline and the session-prior
+# digest (recorder._first_rationale), and the Oracle reads it in local_summary.
+_HOST_ANCHORED_TP_LEAD = (
+    "soc-ai changed the verdict from a true positive to needs more info. "
+    "soc-ai found no direct evidence for the true positive. "
+    "The rest of this summary is the text that the model wrote."
+)
+_HOST_ANCHORED_TP_IOC = "No blocklist or MISP entry matches an indicator."
+_HOST_ANCHORED_TP_ALERT = "The alert is not a malware or attack detection."
+_HOST_ANCHORED_TP_FINDING = "No document that this finding cites is a malware or attack detection."
+_HOST_ANCHORED_TP_WORDS = (
+    "The summary and the citations name no attack evidence beyond the alert history "
+    "of the host. Examples of attack evidence are a beacon, a payload, a web shell "
+    "and a path traversal."
+)
+
+
+def _host_anchored_tp_reason(on_finding: bool) -> str:
+    """The reason of the host history gate, as the audit event records it."""
+    check = _HOST_ANCHORED_TP_FINDING if on_finding else _HOST_ANCHORED_TP_ALERT
+    return f"{_HOST_ANCHORED_TP_IOC} {check} {_HOST_ANCHORED_TP_WORDS}"
+
+
+def _host_anchored_tp_note(on_finding: bool) -> str:
+    """The validator note of the host history gate."""
+    return (
+        "soc-ai changed the verdict from a true positive to needs more info. "
+        f"{_host_anchored_tp_reason(on_finding)} "
+        "Run the investigation again to find direct evidence."
+    )
 
 
 _DECOY_REFUSAL_NOTE = (
@@ -1098,16 +1168,23 @@ def _downgrade_ungrounded_host_anchored_tp(
       2. host_alert_profile is non-empty (the anchor exists)
       3. No per-alert malicious evidence:
          a. No blocklist_hits or misp_hits on ANY indicator in enrichments
-         b. The focus alert's own signature is NOT a malware/exploit/attack class
-            (checked via _alert_signals_malware + _ATTACK_CLASSTYPES) — if THIS
-            alert is itself a confirmed-malware-class signature we leave the TP
+         b. The focus alert, and on a hunt finding every document that the
+            promoted finding cites, is not a malware/exploit/attack class
+            (checked via _alert_signals_malware + _ATTACK_CLASSTYPES). If one
+            of them is a confirmed-malware-class signature we leave the TP
          c. No concrete beacon/payload/lateral evidence cited in summary or
-            citations (conservative keyword scan; false negative preferred over
-            false positive here)
+            citations, and no web attack evidence of a type that no
+            host_alert_profile rule name names (conservative keyword scan;
+            false negative preferred over false positive here)
 
-    When ALL conditions hold the verdict is downgraded to needs_more_info at
-    confidence 0.5 with recommended_actions cleared and a corrective prefix on
-    the summary.
+    When all conditions hold, the verdict goes to needs_more_info at confidence
+    <= 0.5 and recommended_actions is cleared. The summary keeps the text of the
+    model behind _HOST_ANCHORED_TP_LEAD, and the reason is appended to
+    validator_note.
+
+    Owner fix of 2026-10-30: the gate replaced the summary with a fixed text
+    and wiped the stories of four hunt-finding investigations on prod. The gate
+    now only adds ways to keep a true positive, and it keeps the story.
     """
     if report.verdict != "true_positive":
         return report
@@ -1140,16 +1217,39 @@ def _downgrade_ungrounded_host_anchored_tp(
         )
 
         alert_obj = getattr(enriched_ctx, "alert", None)
-        if alert_obj is not None:
-            if _alert_signals_malware(alert_obj):
-                return report  # this alert IS malware-class — leave the TP
+        # D2 'every gate still runs' still holds. On a hunt finding the gate
+        # also reads the documents that the promoted finding cites (change A,
+        # 2026-10-30): the focus alert of a hunt run is one anchor document,
+        # often a Zeek record, while the finding cites the exploit alerts.
+        # Documents of other findings and of the lead's observations do not
+        # count. Prod replay showed 45 of 65 hunt runs exempt through noise
+        # documents, for example 'ET MALWARE Potential DNS Command and Control
+        # via TXT queries', and through the NMI history this gate writes, which
+        # comes back as a lead observation.
+        # One case keeps the old rule. When the grid holds no document that
+        # the finding cites, focus_ids is empty and the gate reads only the
+        # anchor, as before change A. anchor_from_subject then picks the anchor
+        # from the documents of the other findings and the lead, so such a
+        # document can still keep the TP. Change A adds no downgrade, so this
+        # case is not narrowed. The reason reads the alert text, because the
+        # gate checked the anchor.
+        focus_ids = set(getattr(enriched_ctx, "subject_focus_document_ids", None) or [])
+        on_finding = bool(focus_ids)
+        evidence = ([alert_obj] if alert_obj is not None else []) + [
+            d
+            for d in (getattr(enriched_ctx, "subject_documents", None) or [])
+            if getattr(d, "id", None) in focus_ids
+        ]
+        for doc in evidence:
+            if _alert_signals_malware(doc):
+                return report  # this document IS malware-class: leave the TP
             # Through the normalizer, not a bare .lower(): the field carries
             # Suricata EVE's classification DESCRIPTION and the set holds
             # shortnames, so the raw comparison this call site used could never
             # match anything a sensor writes. It failed in the direction that
             # costs recall: the exemption never fired, so attack-class true
             # positives were downgraded to needs-more-info.
-            if normalize_classtype(getattr(alert_obj, "classtype", None)) in _ATTACK_CLASSTYPES:
+            if normalize_classtype(getattr(doc, "classtype", None)) in _ATTACK_CLASSTYPES:
                 return report  # attack-class classtype — leave the TP
     except Exception:
         return report  # import or attribute failure → conservatively leave TP
@@ -1163,42 +1263,36 @@ def _downgrade_ungrounded_host_anchored_tp(
     for token in _GROUNDED_EVIDENCE_TOKENS:
         if token in combined:
             return report  # concrete evidence cited — leave the TP
+    # Web attack evidence counts one type at a time, and only when no rule name
+    # of the host's alert history names the same type (see the patterns).
+    history = " ".join(str(k) for k in host_profile).lower()
+    for pattern in _WEB_ATTACK_EVIDENCE_PATTERNS:
+        if pattern.search(combined) and not pattern.search(history):
+            return report  # web attack evidence cited: leave the TP
 
     # All gates passed: downgrade to needs_more_info.
-    original_summary = report.summary or ""
-    downgrade_reason = (
-        "TP rested solely on host_alert_profile context and/or absence of "
-        "reputation (no per-alert IOC hit, focus alert is not malware-class, "
-        "no beacon/payload/lateral evidence cited)"
-    )
+    # No original_summary in the event: the summary keeps the text, and the
+    # timeline (_timeline._downgrade_detail) would print it twice.
+    note = _host_anchored_tp_note(on_finding)
     audit["ungrounded_host_anchored_tp_downgrade"] = {
         "original_verdict": "true_positive",
         "downgraded_verdict": "needs_more_info",
-        "reason": downgrade_reason,
-        "original_summary": original_summary,
+        "reason": _host_anchored_tp_reason(on_finding),
     }
-    # Lead with the correct conclusion; the agent's original text and the
-    # override reason move to validator_note. No confusing inline bracket.
-    corrected_summary = (
-        "Insufficient per-alert evidence to confirm this as a true positive. "
-        "The verdict rested on the host's alert history and absence of "
-        "reputation, not on direct evidence in this alert. "
-        "Re-investigate to ground a verdict in per-alert evidence."
-    )
-    validator_note = (
-        "Verdict auto-corrected true_positive→needs_more_info by the "
-        "ungrounded-host-anchored-TP validator. "
-        + downgrade_reason
-        + " Original agent summary: "
-        + original_summary
-    )
+    # The summary still leads with the correct conclusion: its first sentence
+    # becomes the row headline and the session-prior digest
+    # (recorder._first_rationale). The summary keeps the story of the model
+    # after the lead (owner fix, 2026-10-30). The lead travels in
+    # local_summary, so the Oracle, the session prior and the chat seed read
+    # the change without reading validator_note. The note is appended, so the
+    # note of an earlier gate stays.
     return report.model_copy(
         update={
             "verdict": "needs_more_info",
             "confidence": min(report.confidence, 0.5),
             "recommended_actions": [],
-            "summary": corrected_summary,
-            "validator_note": validator_note,
+            "summary": f"{_HOST_ANCHORED_TP_LEAD} {report.summary or ''}".strip(),
+            "validator_note": f"{report.validator_note}\n{note}" if report.validator_note else note,
         }
     )
 

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from soc_ai.agent.chat_agent import CHAT_SYSTEM_PROMPT
 from soc_ai.api.deps import ctx_from_state
@@ -35,6 +35,9 @@ from soc_ai.webui.chat_turn import (
     run_chat_turn,
     split_history,
 )
+
+if TYPE_CHECKING:
+    from soc_ai.hunting.earlier import EarlierConclusions
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -78,6 +81,7 @@ class HuntConsoleManager:
         kind: str = "chat",
         starter: str = "analyst",
         lead_id: int | None = None,
+        earlier: EarlierConclusions | None = None,
     ) -> str | None:
         """Create the hunt row and spawn a background drainer task.
 
@@ -93,6 +97,10 @@ class HuntConsoleManager:
 
         ``starter`` names the class that started the hunt: analyst, schedule or
         lead. ``lead_id`` links a lead-started hunt to its lead.
+
+        ``earlier`` is the earlier-conclusions block (:mod:`soc_ai.hunting.earlier`)
+        that a lead hunt and a scheduled hunt read. :meth:`start_streaming`
+        passes none, so an analyst's chat hunt reads none.
         """
         return await self._launch(
             state,
@@ -103,6 +111,7 @@ class HuntConsoleManager:
             starter=starter,
             lead_id=lead_id,
             sink=None,
+            earlier=earlier,
         )
 
     async def start_streaming(
@@ -142,6 +151,7 @@ class HuntConsoleManager:
         starter: str = "analyst",
         lead_id: int | None = None,
         sink: HuntEventQueue | None,
+        earlier: EarlierConclusions | None = None,
     ) -> str | None:
         # Concurrency guard: this manager is fire-and-forget (one unbounded
         # background asyncio.Task per call), so without a cap a scripted/rapid-fire
@@ -170,6 +180,7 @@ class HuntConsoleManager:
                 starter=starter,
                 lead_id=lead_id,
                 cancel_token=token,
+                earlier=earlier,
             )
 
             hunt_id: str | None = None

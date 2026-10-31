@@ -128,9 +128,9 @@ async def existing_investigation(
 
     The rule the hunt runner applies, one investigation per subject: the run
     the hunt names for the finding, then a run promoted from this finding,
-    then a run of the same alert or the same subject fingerprint from the
-    last seven days. A run that cannot answer, failed or a fallback, is not
-    one.
+    then a run of the same subject fingerprint from the last seven days. A run
+    that cannot answer, failed or a fallback, is not one. An alert run never
+    answers for a finding.
 
     The journey takes a run of THIS finding only. The scorer refuses a run
     whose join keys name another hunt (:func:`soc_ai.eval.journey.score_journey`),
@@ -157,7 +157,7 @@ async def existing_investigation(
     finding = findings[ordinal] if 0 <= ordinal < len(findings) else None
     same = await inv_svc.reusable_for_subject(
         db,
-        alert_id=anchor_id,
+        alert_id=None,
         fingerprint=subject_fingerprint(finding) if isinstance(finding, dict) else None,
         is_synth_eval=bool(hunt.is_synth_eval),
     )

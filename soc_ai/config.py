@@ -803,6 +803,18 @@ class Settings(BaseSettings):
     hunts. Overflow targets are simply not queued this run (they have no verdict
     yet, so the next run picks them up). Set 0 to disable the cap."""
 
+    auto_triage_retry_limit: int = Field(default=2, ge=0, le=10)
+    """The quick automatic retries of one alert after a failed run.
+
+    A run fails when it ends in an error or a pipeline fallback. The first
+    retry waits 15 minutes, and each next retry waits twice as long. After
+    the limit, the alert runs again once each 6 hours. A real verdict on the
+    alert resets the count. An explicit selection and Re-run are not limited.
+
+    On 2026-10-27 the model gateway refused the triage schema for 11 hours.
+    The scheduler ran two alerts 109 times each, one run about every 5
+    minutes. Environment variable: ``AUTO_TRIAGE_RETRY_LIMIT``."""
+
     auto_triage_inheritance_enabled: bool = True
     """Inherit verdicts across similar alerts. When ON (default), an auto-investigate
     sweep skips any (rule, source, destination) cluster that already has a verdict

@@ -156,6 +156,30 @@ def test_the_fingerprint_changes_with_the_subject() -> None:
     assert subject_fingerprint(_threat(hosts=[], citations=[])) is None
 
 
+@pytest.mark.parametrize(
+    "citations",
+    [
+        [],
+        ["the conn log shows the login", "t_origin_chain(192.0.2.10)"],
+        ["1:YDPTyOYjiAM6SPNKuaVlT1H+k7A="],
+        ["t_origin_chain:192.0.2.10"],
+        ["t_host_summary:192.0.2.11"],
+    ],
+)
+def test_a_finding_that_cites_no_document_has_no_fingerprint(citations: list[str]) -> None:
+    """Change E. A finding with no document has only its claim as identity.
+    The entity set alone made two different claims on one host pair share an
+    investigation (lead 49, 2026-10-24). A tool call is not a document."""
+    finding = _threat(hosts=["192.0.2.10", "192.0.2.11"], citations=citations)
+    assert subject_fingerprint(finding) is None
+    # The owner rule holds: the finding is still a subject.
+    assert finding_is_subject(finding) is True
+
+
+def test_a_tool_call_citation_is_not_a_document() -> None:
+    assert finding_document_ids(_threat(citations=["t_host_summary:192.0.2.11", _DOC])) == [_DOC]
+
+
 def test_subjects_come_in_severity_then_report_order() -> None:
     findings = [
         _threat(severity="low"),

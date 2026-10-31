@@ -385,8 +385,8 @@ describe('Investigations selection does not cost the filters', () => {
 });
 
 describe('Investigations bulk re-investigate excludes promoted findings', () => {
-  // A promoted finding (kind='hunt') has no re-run affordance — re-promoting
-  // from its hunt is the sanctioned re-run in this slice (Task 6b). The
+  // A promoted finding (kind='hunt') has no bulk re-run. Re-run on the
+  // investigation of the finding is the sanctioned re-run (Task 6b). The
   // checkbox is disabled at the selection layer so a hunt-kind row can never
   // enter the bulk selection: select-all skips it and the strip's count can
   // never disagree with what the bulk action actually submits.
@@ -404,7 +404,7 @@ describe('Investigations bulk re-investigate excludes promoted findings', () => 
     expect(boxes[2]).toBeDisabled();
     expect(boxes[2]).toHaveAttribute(
       'title',
-      'A bulk re-investigation skips a promoted finding. Re-promote it from the hunt page.',
+      'A bulk re-investigation skips a promoted finding. Use Re-run on the investigation of the finding.',
     );
 
     fireEvent.click(boxes[2]);
@@ -436,7 +436,7 @@ describe('Investigations bulk re-investigate excludes promoted findings', () => 
     expect(headerBox).toBeDisabled();
     expect(headerBox).toHaveAttribute(
       'title',
-      'A bulk re-investigation skips a promoted finding. Re-promote it from the hunt page.',
+      'A bulk re-investigation skips a promoted finding. Use Re-run on the investigation of the finding.',
     );
 
     fireEvent.click(headerBox);

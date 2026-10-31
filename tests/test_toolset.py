@@ -647,3 +647,19 @@ def test_clamp_tool_result_clips_long_string_leaves_of_plain_dicts() -> None:
     assert {"payload", "event.original", "message"} <= set(out["__clipped_fields__"])
     # The caller's dict is never mutated.
     assert len(big["payload"]) == 200_000
+
+
+@pytest.mark.asyncio
+async def test_t_host_summary_passes_the_store_to_the_tool(
+    settings_kratos: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The tool checks a host.name answer against the store, so it needs the store."""
+    sentinel = object()
+    tool = AsyncMock(return_value={"ip": "192.0.2.164", "hostname": None})
+    monkeypatch.setattr("soc_ai.agent.toolset.host_summary", tool)
+    agent = _agent_with("hunt", settings_kratos, db_sessionmaker=sentinel)
+
+    await agent._function_toolset.tools["t_host_summary"].function("192.0.2.164")
+
+    assert tool.await_args is not None
+    assert tool.await_args.kwargs["db_sessionmaker"] is sentinel

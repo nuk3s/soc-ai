@@ -327,3 +327,83 @@ async def test_the_old_alias_read_answers_machine_membership(settings_kratos: Se
     assert "10.40.0.30" not in aliases
     assert nobody == []
     await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# A name another machine holds
+#
+# t_host_summary reads host.name off documents. The store says which machine
+# answers to that name. The read withholds a name only on positive evidence:
+# the store puts the address on a machine that does not answer to the name,
+# and a different live machine does.
+# ---------------------------------------------------------------------------
+
+
+async def test_a_name_another_machine_holds_is_withheld_from_an_address_on_a_different_machine(
+    settings_kratos: Settings,
+) -> None:
+    engine, maker = await _db(settings_kratos)
+    await _two_machines(maker)
+
+    async with maker() as db:
+        held = await host_machines.names_held_elsewhere(
+            db, ["ws-7", "ws-7.example.test"], "10.40.0.21"
+        )
+        own = await host_machines.names_held_elsewhere(db, ["ws-7"], "10.40.0.30")
+        # NEGATIVE CONTROL: this address joins "db" through its DNS name.
+        by_dns = await host_machines.names_held_elsewhere(db, ["db"], "10.40.3.21")
+        unknown_name = await host_machines.names_held_elsewhere(db, ["printer-9"], "10.40.0.21")
+
+    assert held == {"ws-7": ("10.40.0.30",), "ws-7.example.test": ("10.40.0.30",)}
+    assert own == {}
+    assert by_dns == {}
+    assert unknown_name == {}
+    await engine.dispose()
+
+
+async def test_an_address_the_store_does_not_know_keeps_the_name(
+    settings_kratos: Settings,
+) -> None:
+    engine, maker = await _db(settings_kratos)
+    await _two_machines(maker)
+
+    async with maker() as db:
+        unknown = await host_machines.names_held_elsewhere(db, ["ws-7"], "10.40.9.9")
+        not_an_address = await host_machines.names_held_elsewhere(db, ["ws-7"], "not-an-address")
+
+    assert unknown == {}
+    assert not_an_address == {}
+    await engine.dispose()
+
+
+async def test_a_name_is_withheld_from_an_address_the_store_files_with_no_name(
+    settings_kratos: Settings,
+) -> None:
+    """The agentless target: its own machine has no name, the agent's machine has one."""
+    engine, maker = await _db(settings_kratos)
+    await _seed(maker, "10.40.0.75", "172.18.0.1", "10.60.0.9")
+    await _sweep(maker, agents=[_DEPOT])
+    rows = await _rows(maker)
+    assert rows["ip:10.60.0.9"].name is None
+
+    async with maker() as db:
+        held = await host_machines.names_held_elsewhere(db, ["depot"], "10.60.0.9")
+
+    assert held == {"depot": (rows["agent:a-depot"].primary_ip,)}
+    await engine.dispose()
+
+
+async def test_a_container_address_keeps_its_hosts_name(settings_kratos: Settings) -> None:
+    engine, maker = await _db(settings_kratos)
+    await _seed(maker, "10.40.0.75", "172.18.0.1", "172.18.0.7")
+    await _sweep(
+        maker,
+        agents=[_DEPOT],
+        sightings=[ContainerSighting(ip="172.18.0.7", agent_id="a-depot")],
+    )
+
+    async with maker() as db:
+        held = await host_machines.names_held_elsewhere(db, ["depot"], "172.18.0.7")
+
+    assert held == {}
+    await engine.dispose()

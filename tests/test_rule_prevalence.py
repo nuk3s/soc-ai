@@ -937,3 +937,328 @@ async def test_an_unmeasured_import_volume_stays_unmeasured(settings_kratos: Set
     assert out["imported_fires"] is None
     assert "could not be measured" in out["summary"]
     assert "error" not in out
+
+
+# ---------------------------------------------------------------------------
+# Waves (change D). The rule of a prod hunt fired 10 times on one day, in three
+# waves hours apart. The tool read the first and the last fire only, called the
+# 19.7 hours between them "one burst" and "a single episode", and the hunt
+# wrote "one 19.7-hour burst". A burst longer than a wave now reads its fire
+# minutes and names each wave.
+# ---------------------------------------------------------------------------
+
+
+def _wave_day() -> datetime:
+    return (datetime.now(UTC) - timedelta(days=3)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+
+
+def _iso(at: datetime) -> str:
+    return at.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def _long_burst_first_call() -> EsSearchResult:
+    """10 fires on one day, 71091 s from the first to the last."""
+    day = _wave_day()
+    first = day + timedelta(hours=1, minutes=11, seconds=56)
+    last = first + timedelta(seconds=71091)
+    return _result(
+        total=10,
+        aggregations=_aggs(
+            src=3, dest=1, ports=10, first=_iso(first), last=_iso(last), active_days=1
+        ),
+    )
+
+
+def _fire_minutes() -> EsSearchResult:
+    """The prod shape: 5 fire minutes of 2 fires each, in 3 waves."""
+    day = _wave_day()
+    fires = [
+        day + timedelta(hours=1, minutes=11, seconds=56),
+        day + timedelta(hours=1, minutes=18, seconds=9),
+        day + timedelta(hours=14, minutes=56, seconds=33),
+        day + timedelta(hours=15, minutes=1, seconds=48),
+        day + timedelta(hours=20, minutes=56, seconds=47),
+    ]
+    buckets = []
+    for at in fires:
+        minute = at.replace(second=0)
+        ms = int(at.timestamp() * 1000)
+        buckets.append(
+            {
+                "key_as_string": _iso(minute),
+                "key": int(minute.timestamp() * 1000),
+                "doc_count": 2,
+                "first": {"value": ms, "value_as_string": _iso(at)},
+                "last": {"value": ms, "value_as_string": _iso(at)},
+            }
+        )
+    return _result(total=10, aggregations={"fire_minutes": {"buckets": buckets}})
+
+
+@pytest.mark.asyncio
+async def test_a_one_day_burst_longer_than_a_wave_names_its_waves(
+    settings_kratos: Settings,
+) -> None:
+    elastic, _ = _make_elastic(settings_kratos, _result(total=0))
+    elastic.search = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[_long_burst_first_call(), _fire_minutes()]
+    )
+
+    out = await rule_prevalence(RULE, elastic=elastic, settings=settings_kratos, lookback_days=30)
+
+    assert out["is_burst"] is True
+    assert out["wave_count"] == 3
+    assert [w["fires"] for w in out["waves"]] == [4, 4, 2]
+    assert out["waves"][0]["start"].endswith("01:11:56Z")
+    assert out["waves"][0]["end"].endswith("01:18:09Z")
+    summary = out["summary"]
+    assert "3 waves" in summary
+    assert "Wave 1:" in summary
+    assert "no per-day rate" in summary
+    assert "single episode" not in summary
+    assert "one burst" not in summary
+    assert out["burst_fires_per_minute"] is None
+    assert elastic.search.await_count == 2
+    second = elastic.search.await_args_list[1]
+    histogram = second.kwargs["aggs"]["fire_minutes"]["date_histogram"]
+    assert histogram["fixed_interval"] == "1m"
+    assert histogram["min_doc_count"] == 1
+    assert second.kwargs["size"] == 0
+    # The same query as the first call.
+    assert second.args[1] == elastic.search.await_args_list[0].args[1]
+
+
+@pytest.mark.asyncio
+async def test_a_long_burst_with_no_fire_times_says_it_cannot_tell_the_waves(
+    settings_kratos: Settings,
+) -> None:
+    elastic, _ = _make_elastic(settings_kratos, _result(total=0))
+    elastic.search = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[_long_burst_first_call(), RuntimeError("grid timeout")]
+    )
+
+    out = await rule_prevalence(RULE, elastic=elastic, settings=settings_kratos, lookback_days=30)
+
+    assert out.get("error") is None
+    assert out["waves"] is None
+    assert out["wave_count"] is None
+    assert "cannot tell one wave from several waves" in out["summary"]
+    assert "single episode" not in out["summary"]
+    assert out["burst_fires_per_minute"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_short_burst_sends_one_search(settings_kratos: Settings) -> None:
+    elastic, _ = _make_elastic(
+        settings_kratos,
+        _result(
+            total=_BURST_FIRES,
+            aggregations=_aggs(
+                src=1, dest=1, ports=1, first=_BURST_FIRST, last=_BURST_LAST, active_days=1
+            ),
+        ),
+    )
+
+    out = await rule_prevalence(RULE, elastic=elastic, settings=settings_kratos, lookback_days=30)
+
+    assert elastic.search.await_count == 1
+    assert "single episode" in out["summary"]
+    assert out["burst_fires_per_minute"] == pytest.approx(1560.2, abs=0.1)
+    assert out["waves"] is None
+    assert out["wave_count"] is None
+
+
+def test_the_descriptions_do_not_call_a_burst_one_episode(settings_kratos: Settings) -> None:
+    from pydantic_ai import Agent
+    from pydantic_ai.models.test import TestModel
+    from soc_ai.agent.context import InvestigationContext
+    from soc_ai.agent.toolset import register_read_tools
+    from soc_ai.tools._registry import get_tool
+
+    description = get_tool("rule_prevalence").description
+    agent: Agent = Agent(TestModel(call_tools=[]), output_type=str, system_prompt="x")
+    ctx = InvestigationContext(settings=settings_kratos, auth=AsyncMock(), elastic=AsyncMock())
+    register_read_tools(agent, ctx, role="investigator")  # type: ignore[arg-type]
+    docstring = agent._function_toolset.tools["t_rule_prevalence"].description or ""
+    for text in (description, docstring):
+        assert "one short episode" not in text
+        assert "waves" in text
+
+
+def _fire_buckets(fires: list[tuple[datetime, int]]) -> EsSearchResult:
+    """One fire-minute bucket per (time, count), the shape of the wave query."""
+    buckets = []
+    for at, count in fires:
+        minute = at.replace(second=0)
+        ms = int(at.timestamp() * 1000)
+        buckets.append(
+            {
+                "key_as_string": _iso(minute),
+                "key": int(minute.timestamp() * 1000),
+                "doc_count": count,
+                "first": {"value": ms, "value_as_string": _iso(at)},
+                "last": {"value": ms, "value_as_string": _iso(at)},
+            }
+        )
+    return _result(
+        total=sum(c for _, c in fires), aggregations={"fire_minutes": {"buckets": buckets}}
+    )
+
+
+def _base_call(first: datetime, last: datetime, *, total: int, active_days: int) -> EsSearchResult:
+    return _result(
+        total=total,
+        aggregations=_aggs(
+            src=2, dest=1, ports=4, first=_iso(first), last=_iso(last), active_days=active_days
+        ),
+    )
+
+
+def test_the_wave_list_counts_only_the_waves_the_field_holds() -> None:
+    """The summary names 6 waves. The sentence about the later waves counts
+    only the waves that the waves field holds, with a verb that agrees."""
+    from soc_ai.event_time import WaveSpan
+    from soc_ai.tools.rule_prevalence import MAX_WAVES_RETURNED, _wave_list
+
+    day = _wave_day()
+
+    def spans(n: int) -> list[WaveSpan]:
+        return [
+            WaveSpan(
+                i + 1,
+                day + timedelta(minutes=40 * i),
+                day + timedelta(minutes=40 * i + 5),
+                2,
+                (f"{i:06d}",),
+            )
+            for i in range(n)
+        ]
+
+    seven = _wave_list(spans(7), dated=False)
+    assert seven.endswith(" 1 later wave is in the waves field.")
+    assert "are in the waves field" not in seven
+
+    eight = _wave_list(spans(8), dated=False)
+    assert eight.endswith(" 2 later waves are in the waves field.")
+
+    thirty = _wave_list(spans(30), dated=False)
+    listed = MAX_WAVES_RETURNED - 6
+    assert f" {listed} later waves are in the waves field." in thirty
+    assert f"The waves field lists the first {MAX_WAVES_RETURNED} of 30 waves." in thirty
+    assert "24 later waves" not in thirty
+
+    assert "later wave" not in _wave_list(spans(6), dated=False)
+
+
+@pytest.mark.asyncio
+async def test_a_burst_of_more_waves_than_the_field_holds_says_so(
+    settings_kratos: Settings,
+) -> None:
+    day = _wave_day()
+    fires = [(day + timedelta(hours=1, minutes=40 * i), 2) for i in range(30)]
+    elastic, _ = _make_elastic(settings_kratos, _result(total=0))
+    elastic.search = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[
+            _base_call(fires[0][0], fires[-1][0], total=60, active_days=1),
+            _fire_buckets(fires),
+        ]
+    )
+
+    out = await rule_prevalence(RULE, elastic=elastic, settings=settings_kratos, lookback_days=30)
+
+    assert out["wave_count"] == 30
+    assert len(out["waves"]) == 20
+    assert "30 waves" in out["summary"]
+    assert "14 later waves are in the waves field." in out["summary"]
+    assert "The waves field lists the first 20 of 30 waves." in out["summary"]
+
+
+@pytest.mark.asyncio
+async def test_a_two_day_burst_names_its_waves_with_their_dates(
+    settings_kratos: Settings,
+) -> None:
+    """A burst on two days takes the multi-day sentence. Each wave carries its
+    date, and the sentence counts the later waves."""
+    start = _wave_day() - timedelta(days=1) + timedelta(hours=18)
+    fires: list[tuple[datetime, int]] = []
+    for w in range(8):
+        at = start + timedelta(hours=3 * w)
+        fires += [(at, 2), (at + timedelta(minutes=5), 2)]
+    elastic, _ = _make_elastic(settings_kratos, _result(total=0))
+    elastic.search = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[
+            _base_call(fires[0][0], fires[-1][0], total=32, active_days=2),
+            _fire_buckets(fires),
+        ]
+    )
+
+    out = await rule_prevalence(RULE, elastic=elastic, settings=settings_kratos, lookback_days=30)
+
+    assert out["is_burst"] is True
+    assert out["active_days"] == 2
+    assert out["wave_count"] == 8
+    assert [w["fires"] for w in out["waves"]] == [4] * 8
+    summary = out["summary"]
+    assert "The fires form 8 waves." in summary
+    first_day = f"{start:%Y-%m-%d}"
+    next_day = f"{start + timedelta(days=1):%Y-%m-%d}"
+    assert f"Wave 1: {first_day} 18:00:00 to 18:05:00 UTC, 4 fires." in summary
+    assert f"Wave 3: {next_day} 00:00:00 to 00:05:00 UTC, 4 fires." in summary
+    assert "2 later waves are in the waves field." in summary
+    assert out["burst_fires_per_minute"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_one_day_burst_in_one_long_wave_keeps_its_rate(
+    settings_kratos: Settings,
+) -> None:
+    """Fires every 10 minutes for 2 hours form one wave. The span is the
+    duration of the fires, so the per-minute rate stays."""
+    start = _wave_day() + timedelta(hours=2)
+    fires = [(start + timedelta(minutes=10 * i), 2) for i in range(13)]
+    elastic, _ = _make_elastic(settings_kratos, _result(total=0))
+    elastic.search = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[
+            _base_call(fires[0][0], fires[-1][0], total=26, active_days=1),
+            _fire_buckets(fires),
+        ]
+    )
+
+    out = await rule_prevalence(RULE, elastic=elastic, settings=settings_kratos, lookback_days=30)
+
+    assert out["wave_count"] == 1
+    assert "fired 26x in one wave from 02:00:00 to 04:00:00 UTC" in out["summary"]
+    assert "single episode" not in out["summary"]
+    assert out["burst_fires_per_minute"] == pytest.approx(26 / 120, abs=0.01)
+
+
+@pytest.mark.asyncio
+async def test_a_burst_with_too_many_fire_minutes_sends_one_search(
+    settings_kratos: Settings,
+) -> None:
+    """The wave query runs only when min(fires, active days x 1440) is at or
+    under MAX_WAVE_BUCKETS. 9000 fires on 4 days is 5760 buckets: no query.
+    4000 fires on the same days is 4000 buckets: the query runs."""
+    from soc_ai.tools.rule_prevalence import MAX_WAVE_BUCKETS
+
+    first = (datetime.now(UTC) - timedelta(days=20)).replace(microsecond=0)
+    last = (datetime.now(UTC) - timedelta(days=2)).replace(microsecond=0)
+    assert min(9000, 4 * 1440) > MAX_WAVE_BUCKETS >= 4000
+
+    elastic, _ = _make_elastic(settings_kratos, _base_call(first, last, total=9000, active_days=4))
+    out = await rule_prevalence(RULE, elastic=elastic, settings=settings_kratos, lookback_days=30)
+    assert out["is_burst"] is True
+    assert elastic.search.await_count == 1
+    assert out["waves"] is None
+    assert out["wave_count"] is None
+
+    elastic, _ = _make_elastic(settings_kratos, _result(total=0))
+    elastic.search = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[_base_call(first, last, total=4000, active_days=4), _fire_minutes()]
+    )
+    out = await rule_prevalence(RULE, elastic=elastic, settings=settings_kratos, lookback_days=30)
+    assert out["is_burst"] is True
+    assert elastic.search.await_count == 2
+    assert out["wave_count"] == 3

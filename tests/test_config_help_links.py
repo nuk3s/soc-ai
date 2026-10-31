@@ -139,11 +139,26 @@ def test_the_severity_floor_is_a_select_of_the_four_values() -> None:
         cfg.coerce("auto_triage_min_severity", "med")
 
 
-@pytest.mark.parametrize("key", ["auto_triage_max_targets", "auto_triage_min_severity"])
+@pytest.mark.parametrize(
+    "key", ["auto_triage_max_targets", "auto_triage_min_severity", "auto_triage_retry_limit"]
+)
 def test_an_auto_investigate_setting_does_not_call_a_run_a_sweep(key: str) -> None:
     spec = cfg.WHITELIST_BY_KEY[key]
     assert "sweep" not in spec.label.lower()
     assert "sweep" not in spec.help.lower()
+
+
+def test_the_retry_limit_help_states_the_runs_past_the_limit() -> None:
+    """The help said "at most this many times", and its next sentence said the
+    alert runs again each 6 hours with no end (autotriage_health.retry_wait)."""
+    spec = cfg.WHITELIST_BY_KEY["auto_triage_retry_limit"]
+    assert "at most" not in spec.help
+    assert spec.help.startswith(
+        "Auto-Investigate retries a failed alert this many times after a short wait. "
+        "After the last short retry, the alert runs again once each 6 hours."
+    )
+    assert "pipeline fallback" in spec.help
+    assert "pipeline error" not in spec.help
 
 
 @pytest.mark.parametrize(

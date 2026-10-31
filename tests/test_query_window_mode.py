@@ -228,3 +228,32 @@ async def test_an_unanchored_result_names_the_clock_it_used(settings_kratos: Set
     assert result.window["mode"] == "now_relative"
     assert result.window["gte"] == "now-120m"
     assert result.window["lte"] == "now"
+
+
+@pytest.mark.asyncio
+async def test_a_now_relative_window_states_its_absolute_bounds(settings_kratos: Settings) -> None:
+    """A count from a now-relative query read 'in the last 120 minutes' with no
+    clock. The descriptor now states the two UTC bounds the query ran over, so
+    the model can give the count its window (change D). The filter itself stays
+    relative."""
+    elastic, fake_es = _make_elastic(settings_kratos, {"took": 0, "hits": {"total": 3, "hits": []}})
+
+    result = await query_events_oql(
+        "host.name:foo",
+        elastic=elastic,
+        settings=settings_kratos,
+        time_range_minutes=120,
+    )
+
+    assert result.window is not None
+    start, end = result.window["start_utc"], result.window["end_utc"]
+    assert isinstance(start, str) and start.endswith("Z")
+    assert isinstance(end, str) and end.endswith("Z")
+    end_at = datetime.fromisoformat(end)
+    start_at = datetime.fromisoformat(start)
+    assert abs((datetime.now(UTC) - end_at).total_seconds()) < 5
+    assert (end_at - start_at).total_seconds() == 120 * 60
+    assert result.window["gte"] == "now-120m"
+    assert result.window["lte"] == "now"
+    rng = _range_filter(fake_es)
+    assert rng == {"gte": "now-120m", "lte": "now"}

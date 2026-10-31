@@ -135,6 +135,13 @@ class AlertContext(BaseModel):
     # behalf. Every id-citation resolver reads this list with the pivots, so a
     # verdict that cites one of these documents resolves.
     subject_documents: list[SoAlert] = Field(default_factory=list)
+    # The ids of the subject documents that the promoted finding cites (D2,
+    # change A). Empty on every alert run and on a lead promotion. exclude=True
+    # keeps the list out of model_dump, so the stored enriched_alert_context
+    # event, the budget trim and the Oracle case payload do not change. Only
+    # the host history gate reads it. The budget trim returns JSON and does not
+    # rebuild the model, so the object the gates receive keeps the field.
+    subject_focus_document_ids: list[str] = Field(default_factory=list, exclude=True)
     pivot_summary: dict[str, int] = Field(default_factory=dict)
     # Histogram of rule_name → count of alerts that fired on this IP recently
     # (wide ±host_risk_window_hours window). DATA ONLY, not a verdict — each
@@ -145,6 +152,11 @@ class AlertContext(BaseModel):
     # activity hours away is visible. Empty when the host has no other alerts
     # in-window or the lookup failed.
     host_alert_profile: dict[str, int] = Field(default_factory=dict)
+    # The window of ``host_alert_profile``, in hours. It runs that many hours
+    # before and after the alert (``host_risk_window_hours``), so the model can
+    # give the count its window (change D). None on a dump stored before the
+    # field existed.
+    host_alert_window_hours: int | None = None
     # The same window, per end of the alert: one entry per endpoint IP, each
     # named and split by side. Read this one to say WHICH host an alert in the
     # histogram belongs to; ``host_alert_profile`` pools both ends.
@@ -427,6 +439,7 @@ async def get_alert_context(
             if k != "host" or host_pivot_ran
         },
         host_alert_profile=host_alert_profile,
+        host_alert_window_hours=settings.host_risk_window_hours,
         host_alert_profiles=host_alert_profiles,
         prefetch_gaps=gaps,
         host_coverage=endpoint_coverages,
@@ -546,6 +559,7 @@ async def get_enriched_alert_context(
         file_events=base.file_events,
         pivot_summary=base.pivot_summary,
         host_alert_profile=base.host_alert_profile,
+        host_alert_window_hours=base.host_alert_window_hours,
         host_alert_profiles=base.host_alert_profiles,
         prefetch_gaps=base.prefetch_gaps,
         host_coverage=base.host_coverage,

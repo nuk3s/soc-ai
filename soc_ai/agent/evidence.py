@@ -38,6 +38,19 @@ _CITE_ID_RE = re.compile(r"\(?\s*id\s+([A-Za-z0-9_-]{6,})\s*\)?")
 
 _PLAIN_PATH_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+$")
 _PLAIN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{12,}$")
+# A trailing event time after a citation: "(2026-10-24 22:20:43 UTC)",
+# "at 2026-10-24 22:20:43 UTC", "@ 2026-10-24T22:20:43Z", ", 2026-10-24 22:20".
+# The writer rules ask for the @timestamp of each cited record (change D). The
+# time is no part of the id or the path, so it is removed before the citation
+# is classified. Without that, "id (time)" left the strict id path.
+_CITE_TIME = (
+    r"\d{4}-\d{2}-\d{2}(?:[T\s]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)?"
+    r"\s*(?:Z|UTC|[+-]00:?00)?(?:\s*UTC)?"
+)
+_TRAILING_TIME_RE = re.compile(
+    rf"\s*(?:\(\s*(?:at\s+|@\s*)?{_CITE_TIME}\s*\)|(?:,|@|\bat\b)\s*{_CITE_TIME})\s*$",
+    re.IGNORECASE,
+)
 # Bare tool name, prefix dropped (`t_enrich_ip`), with the same optional
 # `:key` qualifier the prefixed form already accepts. All-lowercase with
 # the `t_` prefix, so it can't collide with a mixed-case Elasticsearch _id.
@@ -87,6 +100,7 @@ def _classify_citation(citation: str) -> tuple[str, str | None]:
     grammar enforcement, so accept the natural shape.
     """
     s = citation.strip()
+    s = _TRAILING_TIME_RE.sub("", s).strip() or s
     # Explicit-prefix forms first (most specific).
     if m := _CITE_PATH_RE.search(s):
         return "path", m.group(1)

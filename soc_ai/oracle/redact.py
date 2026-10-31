@@ -82,6 +82,7 @@ dict is fully covered.
 
 from __future__ import annotations
 
+import ipaddress
 import re
 from collections.abc import Iterable
 from typing import Any
@@ -251,6 +252,16 @@ _HOST_LIST_FIELDS: frozenset[str] = frozenset({"related.hosts"})
 
 # List-valued IP fields: every element of the list is tokenised (if private).
 _IP_LIST_FIELDS: frozenset[str] = frozenset({"related.ip", "host.ip"})
+
+# The hosts of the finding a hunt-finding run judges (change E). The hunt
+# writes each element as an address, a bare name, or ``name (role, ip)`` as
+# HOST_NAMING_RULE asks. The default single-shot path runs no backstop, so an
+# element the harvest did not learn reached the Oracle raw, in the list and in
+# the title beside it. See :func:`_harvest_claim_host`.
+_CLAIM_HOST_LIST_FIELDS: frozenset[str] = frozenset({"subject_claim.hosts"})
+
+# ``name (role, ip)``: the leading token, then an optional parenthesised tail.
+_CLAIM_HOST_RE = re.compile(r"^\s*([^\s(),]+)\s*(?:\(([^()]*)\))?\s*$")
 
 # DOMAIN_LIKE fields — Zeek protocol-identity fields (SNI / HTTP Host / DNS query).
 # Gated per value: single-label → tokenise; internal suffix → tokenise; public FQDN → PASS.
@@ -644,6 +655,10 @@ def _harvest_pass(
             for item in obj:
                 if isinstance(item, str) and item and _is_internal_ip(item):
                     mapping.label_for(item, "IP")
+        elif _path in _CLAIM_HOST_LIST_FIELDS:
+            for item in obj:
+                if isinstance(item, str) and item:
+                    _harvest_claim_host(item, mapping, no_propagate)
         elif _path in _DOMAIN_LIKE_LIST_FIELDS or _path.endswith(
             tuple(f".{f}" for f in _DOMAIN_LIKE_LIST_FIELDS)
         ):
@@ -671,6 +686,50 @@ def _harvest_pass(
             _path, _parent_key, obj, mapping, suffixes=suffixes, no_propagate=no_propagate
         )
     # Non-string scalars (int, float, bool, None): skip.
+
+
+def _is_ip_literal(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _harvest_claim_host(value: str, mapping: Mapping, no_propagate: set[str]) -> None:
+    """Learn one element of ``subject_claim.hosts``.
+
+    An address takes the IP rule: a private one gets a label and a public one
+    passes. In ``name (role, ip)`` the leading name is a HOST and each address
+    inside the parentheses takes the IP rule. The role stays. Any other element
+    is a HOST whole. A learned value is replaced in every string of the case,
+    so the title and the prose that name the host get the same label. A value
+    with no letter or digit is no name, so it is left as it is. A name of 3
+    characters or fewer gets its label in the list only, the DOMAIN_LIKE rule:
+    a global replace of ``dc`` would turn ``dc.evil.com`` into an internal name.
+    """
+    match = _CLAIM_HOST_RE.match(value)
+    if match is None:
+        if any(c.isalnum() for c in value):
+            _learn_claim_name(value.strip(), mapping, no_propagate)
+        return
+    name, tail = match.group(1), match.group(2)
+    if _is_ip_literal(name):
+        if _is_internal_ip(name):
+            mapping.label_for(name, "IP")
+    elif any(c.isalnum() for c in name):
+        _learn_claim_name(name, mapping, no_propagate)
+    for raw in (tail or "").split(","):
+        part = raw.strip()
+        if part and _is_ip_literal(part) and _is_internal_ip(part):
+            mapping.label_for(part, "IP")
+
+
+def _learn_claim_name(name: str, mapping: Mapping, no_propagate: set[str]) -> None:
+    mapping.label_for(name, "HOST")
+    if len(name) <= 3:
+        no_propagate.add(name)
+        no_propagate.add(name.lower())
 
 
 def _path_suffixes(path: str) -> list[str]:

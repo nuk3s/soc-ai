@@ -58,6 +58,7 @@ from pydantic import BaseModel, Field, field_validator
 from soc_ai import metrics
 from soc_ai.config import Settings
 from soc_ai.demo.guard import assert_egress_allowed
+from soc_ai.event_time import EVENT_TIME_RULE
 from soc_ai.oracle import breaker as route_breaker
 from soc_ai.oracle import failures
 from soc_ai.oracle.backstop import mask_unclassified_scalars
@@ -144,7 +145,10 @@ def _warn_if_privacy_gate_unconfigured(
     )
 
 
-ORACLE_SYSTEM_PROMPT = (
+# The base of both Oracle prompts. ORACLE_SYSTEM_PROMPT and
+# ORACLE_TOOL_SYSTEM_PROMPT (below, beside the tool loop) each add the event
+# time rule as their last section (change D).
+_ORACLE_BASE_PROMPT = (
     "You are a senior SOC analyst adjudicating an alert the local triage was "
     "uncertain or possibly wrong about. The evidence is sanitized: internal IP "
     "addresses appear as IP_01, IP_02 etc.; internal hostnames appear as HOST_01 "
@@ -165,7 +169,9 @@ ORACLE_SYSTEM_PROMPT = (
     "loop_tool_results; copy each id exactly as it appears). "
     "A verdict that CHANGES the local verdict counts only when at least one of its "
     "citations names evidence in the case beyond the alert itself. Without one, it is "
-    "kept as an opinion and the local verdict stands."
+    "kept as an opinion and the local verdict stands. "
+    "When the case has a `subject_claim` field, the case is one finding of a hunt. "
+    "Judge that claim. The other evidence is context."
 )
 
 
@@ -750,6 +756,7 @@ def _assemble_case_dict(
     transcript_text: str,
     tool_results: list[dict[str, Any]] | None = None,
     evidence_bullets: list[str] | None = None,
+    subject_claim: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble the case payload from enriched context + local verdict + transcript.
 
@@ -761,6 +768,12 @@ def _assemble_case_dict(
     verdict rests on, and the investigator's claim→id bullets that index them.
     They MUST stay structured (dicts, not flattened strings) so
     ``sanitize_case``'s field-aware harvest sees their key paths.
+
+    ``subject_claim`` (change E): the title and the hosts of the finding that a
+    hunt-finding investigation judges. The key is added only when it is given,
+    so the payload of an alert case does not change. ``sanitize_case`` learns
+    each element of ``hosts`` (``redact._harvest_claim_host``), so a host name
+    gets its label in the list, in the title and in the prose fields.
     """
     # Serialize enriched context compactly.  model_dump(mode="json") gives a plain
     # Python dict; mode="json" coerces non-JSON-native types (datetime, etc.) to
@@ -771,7 +784,7 @@ def _assemble_case_dict(
     else:
         enriched_compact = dict(enriched)
 
-    return {
+    case: dict[str, Any] = {
         "alert_summary": enriched_compact,
         "loop_evidence": _bound_transcript(transcript_text or ""),
         "loop_tool_results": tool_results or [],
@@ -781,6 +794,9 @@ def _assemble_case_dict(
         "local_summary": local_report.summary,
         "local_citations": local_report.citations,
     }
+    if subject_claim is not None:
+        case["subject_claim"] = subject_claim
+    return case
 
 
 # ===========================================================================
@@ -794,8 +810,15 @@ def _assemble_case_dict(
 # and there is deliberately no second, weaker sweep anywhere else.
 # ===========================================================================
 
-ORACLE_TOOL_SYSTEM_PROMPT = ORACLE_SYSTEM_PROMPT + (
-    " You ALSO have a set of READ-ONLY investigation tools: query the grid "
+# The Oracle writes a summary too, so it tells the events in time order by the
+# same rule as every local writer (change D). The rule text holds no lab data,
+# so the egress payload does not change. The rule is the last section of both
+# prompts: the tool rules and the output rule of the tool prompt must not sit
+# under its heading.
+ORACLE_SYSTEM_PROMPT = _ORACLE_BASE_PROMPT + "\n" + EVENT_TIME_RULE
+
+ORACLE_TOOL_SYSTEM_PROMPT = (
+    _ORACLE_BASE_PROMPT + " You ALSO have a set of READ-ONLY investigation tools: query the grid "
     "(OQL / Zeek), pull an event's raw document, decode payload bytes locally, "
     "and check host context, prevalence, rule noisiness and IOC enrichment. "
     "Use them to CHECK a claim you doubt rather than distrusting it in the "
@@ -806,7 +829,7 @@ ORACLE_TOOL_SYSTEM_PROMPT = ORACLE_SYSTEM_PROMPT + (
     "opaque labels already present in the evidence (IP_01, HOST_02, USER_03, …); "
     "never invent a label that is not there. When you have gathered enough, stop "
     "calling tools and emit the final JSON verdict object described above as your "
-    "last message, with no prose around it."
+    "last message, with no prose around it." + "\n" + EVENT_TIME_RULE
 )
 
 
@@ -872,24 +895,79 @@ def _make_residue_hook(
             text = body.decode("utf-8", "replace")
         else:
             text = str(body)
+        # The shape sweep reads the whole body. Wire form: json.dumps doubles
+        # every real backslash, so a lone one is a JSON escape, not a NetBIOS
+        # separator.
         leaks = unsafe_residue(
             text,
             allowlist=allowlist,
             extra_hosts=extra_hosts,
             extra_suffixes=extra_suffixes,
-            # Exclude the short DOMAIN_LIKE values the sanitizer intentionally
-            # left un-propagated (they would corrupt public FQDNs) and the host
-            # names a text rule labelled in place only — same exclusion the
-            # single-shot gate applies.
-            known_values=tuple(v for v in mapping.learned_values() if v not in no_propagate),
-            # Wire form: json.dumps doubles every real backslash, so a lone one is
-            # a JSON escape, not a NetBIOS separator.
             wire_escaped=True,
         )
+        # Exclude the short DOMAIN_LIKE values the sanitizer intentionally
+        # left un-propagated (they would corrupt public FQDNs) and the host
+        # names a text rule labelled in place only — same exclusion the
+        # single-shot gate applies.
+        learned = tuple(v for v in mapping.learned_values() if v not in no_propagate)
+        if learned:
+            # The learned-value sweep skips the static repo text: the system
+            # prompt and the tool definitions. A learned name that is a common
+            # word ("exploit", "hunt") matched the prompt and refused every
+            # adjudication. The single-shot gate and the hunt sweep leave the
+            # static text out the same way.
+            for leak in unsafe_residue(
+                _without_static_text(text),
+                allowlist=allowlist,
+                known_values=learned,
+                wire_escaped=True,
+            ):
+                if leak not in leaks:
+                    leaks.append(leak)
         if leaks:
             raise OracleResidueError(refusal_reasons(leaks, mapping))
 
     return _hook
+
+
+# The system prompts the tool loop and the single-shot call send. Static repo
+# text: it carries no deployment data.
+_STATIC_SYSTEM_PROMPTS: frozenset[str] = frozenset(
+    {ORACLE_SYSTEM_PROMPT, ORACLE_TOOL_SYSTEM_PROMPT}
+)
+
+
+def _without_static_text(text: str) -> str:
+    """The outbound body with the static repo text taken out.
+
+    A chat-completion body holds the system prompt as one message and the tool
+    definitions in ``tools``. Both are version-controlled text. A system message
+    that differs from the static prompt stays, and so does every user, tool and
+    assistant message. A body that is not a JSON object is returned whole, so
+    the sweep fails closed.
+    """
+    try:
+        body = json.loads(text)
+    except ValueError:
+        return text
+    if not isinstance(body, dict):
+        return text
+    dynamic = {k: v for k, v in body.items() if k != "tools"}
+    messages = body.get("messages")
+    if isinstance(messages, list):
+        dynamic["messages"] = [
+            m
+            for m in messages
+            if not (
+                isinstance(m, dict)
+                and m.get("role") in ("system", "developer")
+                and isinstance(m.get("content"), str)
+                and m["content"] in _STATIC_SYSTEM_PROMPTS
+            )
+        ]
+    # ensure_ascii=False keeps a non-ASCII learned value in its raw form, so
+    # the word-boundary match sees it.
+    return json.dumps(dynamic, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
@@ -1299,6 +1377,7 @@ async def _adjudicate_with_tools(  # noqa: PLR0915 - one linear egress-gated pip
     extra_suffixes: tuple[str, ...] | None,
     failure_out: dict[str, Any] | None,
     http_transport: Any,
+    subject_claim: dict[str, Any] | None = None,
 ) -> OracleResult | None:
     """The tool-running Oracle: sanitize → bounded read-only loop → verdict.
 
@@ -1323,6 +1402,7 @@ async def _adjudicate_with_tools(  # noqa: PLR0915 - one linear egress-gated pip
         transcript_text=transcript_text,
         tool_results=_extract_tool_results(loop_messages),
         evidence_bullets=evidence_bullets,
+        subject_claim=subject_claim,
     )
     mapping = Mapping()
     allowlist: tuple[str, ...] = ()
@@ -1722,6 +1802,7 @@ async def adjudicate(  # noqa: PLR0915 - one linear pipeline; splitting hides th
     extra_suffixes: tuple[str, ...] | None = None,
     failure_out: dict[str, Any] | None = None,
     _http_transport: Any = None,
+    subject_claim: dict[str, Any] | None = None,
 ) -> OracleResult | None:
     """Send a sanitized case to the frontier Oracle for adjudication.
 
@@ -1772,6 +1853,9 @@ async def adjudicate(  # noqa: PLR0915 - one linear pipeline; splitting hides th
             ``no_parseable_verdict`` means the last attempt got a 200 whose
             body held no verdict. A gateway answer that failed every attempt
             is ``gateway_error`` with its status and its message.
+        subject_claim: The claim of a hunt-finding investigation: the title
+            and the hosts of the finding (change E). ``None`` on an alert run
+            and on a lead promotion, and the case then has no such key.
 
     Returns:
         An :class:`OracleResult` on success; ``None`` on refusal (residue
@@ -1814,6 +1898,7 @@ async def adjudicate(  # noqa: PLR0915 - one linear pipeline; splitting hides th
             extra_suffixes=extra_suffixes,
             failure_out=failure_out,
             http_transport=_http_transport,
+            subject_claim=subject_claim,
         )
 
     def _fail(
@@ -1832,6 +1917,7 @@ async def adjudicate(  # noqa: PLR0915 - one linear pipeline; splitting hides th
         transcript_text=transcript_text,
         tool_results=_extract_tool_results(loop_messages),
         evidence_bullets=evidence_bullets,
+        subject_claim=subject_claim,
     )
 
     # 2. Sanitize — replace internal identifiers with opaque labels.

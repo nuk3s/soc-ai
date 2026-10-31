@@ -112,7 +112,7 @@ def assess(
                 True,
                 "monitor",
                 (
-                    f"fired {alert_count}× in a single burst with no recurring rate, "
+                    f"fired {alert_count}× in a burst with no recurring rate, "
                     f"so volume says nothing about noise; {override_fp} analyst "
                     "FP-overrides on this rule, so watch it"
                 ),
@@ -121,8 +121,8 @@ def assess(
             False,
             "none",
             (
-                f"fired {alert_count}× in a single burst with no recurring rate; "
-                "one episode is no tuning problem, and the burst itself can be "
+                f"fired {alert_count}× in a burst with no recurring rate; "
+                "a burst is no tuning problem, and the burst itself can be "
                 "the event to investigate"
             ),
         )

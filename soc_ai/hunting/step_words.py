@@ -52,7 +52,7 @@ _LEADING_WILDCARD_WORDS = (
 _PAGE_SENTENCES: tuple[tuple[str, str], ...] = (
     (
         "That is a single episode, not a background rate, so no per-day rate is reported.",
-        "That is one episode. soc-ai states no rate for each day.",
+        "That is one wave. soc-ai states no rate for each day.",
     ),
 )
 

@@ -85,7 +85,10 @@ const REHUNT_SKIP_REASONS: Record<string, string> = {
   // Defense in depth — the checkbox for a promoted finding is disabled, so
   // this code should be unreachable from the UI, but a server refusal still
   // deserves a readable reason if it ever fires (e.g. a stale selection).
-  hunt_kind: "promoted finding. Re-promote it from the hunt page",
+  hunt_kind: "promoted finding. Use Re-run on the investigation of the finding",
+  // A lead run, or a row over the anchor of a promoted lead. A lead run has
+  // no Re-run. Resolve in chat on its page settles the verdict.
+  lead_kind: "promoted lead. Use Resolve in chat on the investigation of the lead",
   // A new run can replace the analyst verdict. The page of the run asks
   // first and names the verdict. This list has no confirm.
   analyst_verdict: "an analyst verdict stands on the alert. Re-run it from its page",
@@ -1641,7 +1644,7 @@ export function Investigations() {
               disabled={bulkEligible.length === 0}
               title={
                 bulkEligible.length === 0
-                  ? "A bulk re-investigation skips a promoted finding. Re-promote it from the hunt page."
+                  ? "A bulk re-investigation skips a promoted finding. Use Re-run on the investigation of the finding."
                   : "Select all visible"
               }
             />
@@ -1832,7 +1835,7 @@ export function Investigations() {
                     disabled={r.kind === "hunt"}
                     title={
                       r.kind === "hunt"
-                        ? "A bulk re-investigation skips a promoted finding. Re-promote it from the hunt page."
+                        ? "A bulk re-investigation skips a promoted finding. Use Re-run on the investigation of the finding."
                         : "Select"
                     }
                   />

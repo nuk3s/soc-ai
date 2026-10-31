@@ -7,8 +7,10 @@ evidence survives and a pivot-grounded escalation is not downgraded.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from soc_ai.agent.evidence import _bundle_dump_text, _classify_citation
 from soc_ai.agent.orchestrator import (
     _downgrade_unevidenced_verdict,
     _materialize_prefetch_evidence,
@@ -663,6 +665,64 @@ def test_gate_c_short_dotted_domain_resolves_on_word_boundary() -> None:
     # not resolve (word-boundary guard holds).
     res_frag = _resolve_citations(["saw abc2xyzq somewhere"], ctx, [])
     assert res_frag["coverage_ratio"] == 0.0
+
+
+# A date is in every bundle: the alert carries its own @timestamp. The writer
+# rules ask for the @timestamp of each cited record (change D), so a citation
+# often carries a time. The date must not resolve a citation, and a time after
+# an id must not move the id off the strict membership path.
+
+
+def _timed_cite_ctx() -> tuple[EnrichedAlertContext, datetime]:
+    at = (datetime.now(UTC) - timedelta(hours=2)).replace(microsecond=0)
+    ctx = EnrichedAlertContext(
+        alert=_alert().model_copy(update={"timestamp": at}),
+        community_id_events=[
+            _zeek("pivotSslDoc00001", "zeek.ssl", {"zeek.ssl.ja3s": "b742b4c0ffee1234"})
+        ],
+    )
+    return ctx, at
+
+
+def _time_forms(at: datetime) -> list[str]:
+    return [
+        f"({at:%Y-%m-%d %H:%M:%S} UTC)",
+        f"at {at:%Y-%m-%d %H:%M:%S} UTC",
+        f"@ {at:%Y-%m-%dT%H:%M:%SZ}",
+        f"({at:%Y-%m-%dT%H:%M:%S}Z)",
+        f", {at:%Y-%m-%d %H:%M} UTC",
+    ]
+
+
+def test_gate_c_the_alert_date_alone_does_not_resolve_a_citation() -> None:
+    ctx, at = _timed_cite_ctx()
+    bundle = _bundle_dump_text(ctx)
+    # The control: the bundle holds the date, so a substring rule matched it.
+    assert f"{at:%Y-%m-%d}" in bundle
+    for form in _time_forms(at):
+        cite = f"the host beaconed every 60 s to the C2 server {form}"
+        res = _resolve_citations([cite], ctx, [])
+        assert res["coverage_ratio"] == 0.0, cite
+    assert _resolve_citations([f"seen on {at:%Y-%m-%d}"], ctx, [])["coverage_ratio"] == 0.0
+    # A distinctive value with its time still resolves.
+    res = _resolve_citations([f"JA3S b742b4c0ffee1234 at {at:%Y-%m-%d %H:%M:%S} UTC"], ctx, [])
+    assert res["coverage_ratio"] == 1.0
+    # An address is digits and dots. It is no date, and it still resolves.
+    assert _resolve_citations(["destination 104.18.42.69"], ctx, [])["coverage_ratio"] == 1.0
+
+
+def test_an_id_with_its_time_keeps_the_strict_id_path() -> None:
+    ctx, at = _timed_cite_ctx()
+    for form in _time_forms(at):
+        fabricated = f"FakeId9999XYZabc {form}"
+        assert _classify_citation(fabricated) == ("id", "FakeId9999XYZabc"), fabricated
+        res = _resolve_citations([fabricated], ctx, [])
+        assert res["coverage_ratio"] == 0.0, fabricated
+        # The id this run retrieved resolves strictly with its time.
+        real = f"pivotSslDoc00001 {form}"
+        res = _resolve_citations([real], ctx, [])
+        assert res["coverage_ratio"] == 1.0, real
+        assert res["per_citation"][0]["resolution_kind"] == "strict_id", real
 
 
 def test_loop_evidence_marker_requires_successful_tool_call() -> None:

@@ -164,7 +164,7 @@
   "frontend/src/screens/HostDetail.tsx": 5,
   "frontend/src/screens/HuntDetail.tsx": 5,
   "frontend/src/screens/Hunts.tsx": 6,
-  "frontend/src/screens/Investigation.tsx": 13,
+  "frontend/src/screens/Investigation.tsx": 10,
   "frontend/src/screens/InvestigationPage.tsx": 1,
   "frontend/src/screens/Investigations.tsx": 6,
   "frontend/src/screens/Notifications.tsx": 2,

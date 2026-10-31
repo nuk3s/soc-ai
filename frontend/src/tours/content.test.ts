@@ -100,6 +100,22 @@ function tourProblems(tour: Tour): string[] {
 }
 
 describe('tour content', () => {
+  it('defines a wave by the gap that the Event timeline uses', () => {
+    // "A wave is a run of documents" gave "run" a second meaning, and "no
+    // long gap" did not state the 30-minute rule of the section intro.
+    const bodies = ALL_TOURS.flatMap((t) => t.steps.map((s) => s.body));
+    const step = ALL_TOURS.flatMap((t) => t.steps).find((s) => s.anchor === 'hunt-event-timeline');
+    expect(step?.body.startsWith('The Event timeline lists')).toBe(true);
+    expect(step?.body).toContain(
+      'A new wave starts after a gap of more than 30 minutes between two documents.',
+    );
+    for (const body of bodies) {
+      expect(body).not.toMatch(/\brun of documents\b/);
+      // The section title is "Event timeline", so the step names it that way.
+      expect(body).not.toMatch(/\b[Tt]he event timeline\b/);
+    }
+  });
+
   it('gives every tour a unique id and a positive version', () => {
     const ids = ALL_TOURS.map((t) => t.id);
     expect(new Set(ids).size).toBe(ids.length);

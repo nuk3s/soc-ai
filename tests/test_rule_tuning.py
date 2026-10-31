@@ -74,6 +74,45 @@ async def test_a_burst_is_not_a_tuning_problem(settings_kratos: Settings) -> Non
 
 
 @pytest.mark.asyncio
+async def test_a_long_burst_is_not_called_one_burst(settings_kratos: Settings) -> None:
+    """A burst can hold several waves. A prod rule fired in three waves on one
+    day, 71091 s from the first fire to the last, and the text called it one
+    burst and one episode. The tool has no fire times, so it says the number of
+    waves is unknown (change D)."""
+    first = "2026-09-01T01:11:56.000Z"
+    last = "2026-09-01T20:56:47.000Z"
+    elastic = _make_elastic(
+        settings_kratos,
+        EsSearchResult(
+            total=40,
+            took_ms=3,
+            aggregations=_aggs(acked=12, escalated=0, first=first, last=last, active_days=1),
+        ),
+    )
+
+    out = await suggest_rule_tuning(
+        RULE, elastic=elastic, settings=settings_kratos, lookback_days=30
+    )
+
+    assert out["is_burst"] is True
+    assert out["observed_span_seconds"] == pytest.approx(71091.0, abs=0.001)
+    assert "an unknown number of waves" in out["summary"]
+    assert "one burst" not in out["summary"]
+    assert "single burst" not in out["reason"]
+    assert "one episode" not in out["reason"]
+
+
+def test_the_description_does_not_call_every_burst_one_burst() -> None:
+    """The registry description reaches a model through the tool list. A burst
+    can hold several waves, so it says 'a burst' (change D)."""
+    from soc_ai.tools._registry import get_tool
+
+    description = get_tool("suggest_rule_tuning").description
+    assert "one burst" not in description
+    assert "as a recurring rate or as a burst (is_burst)" in description
+
+
+@pytest.mark.asyncio
 async def test_negative_control_a_steady_nuisance_is_still_muted(
     settings_kratos: Settings,
 ) -> None:

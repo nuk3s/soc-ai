@@ -179,7 +179,8 @@ class InvestigationTranscript(BaseModel):
         default_factory=list,
         description=(
             "Bullet-point findings backed by tool results. Each item should be "
-            "a single fact + the ES `_id` or SOC API id that supports it."
+            "a single fact + the ES `_id` or SOC API id that supports it. "
+            "Add the @timestamp of that document when the result shows one."
         ),
     )
     tentative_summary: str = Field(

@@ -223,7 +223,7 @@ def test_the_timeline_states_a_prevalence_in_plain_words() -> None:
     ]
     titles = [s.title for s in _build_hunt_timeline(trace, "complete")]
     assert titles[1] == "Indicator prevalence: 192.0.2.5 is common. 99,976 events on 13 days."
-    assert "That is one episode. soc-ai states no rate for each day." in titles[2]
+    assert "That is one wave. soc-ai states no rate for each day." in titles[2]
     assert "background rate" not in titles[2]
 
 

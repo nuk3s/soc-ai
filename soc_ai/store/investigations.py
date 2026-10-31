@@ -8,7 +8,7 @@ most recent investigation per rule / per alert.
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, NamedTuple
@@ -83,6 +83,41 @@ def alert_group_id(inv: Any) -> str | None:
     if is_hunt_subject(inv) or is_backtest(inv):
         return None
     return getattr(inv, "alert_es_id", None)
+
+
+def finding_group_id(inv: Any) -> tuple[str, int] | None:
+    """The hunt finding this run groups under, or None.
+
+    The twin of :func:`alert_group_id` for the run of a hunt finding. A run
+    with a hunt subject stands outside every alert group, so a Re-run of the
+    finding had nothing to replace its older run: the old page read as the
+    current answer, and its actions stayed live. The runs of one finding of
+    one hunt now form a group, and the primacy rule of an alert group applies
+    to it. A sibling finding of the hunt makes another claim, and a run of
+    another hunt belongs to that hunt, so neither joins the group. A run that
+    groups under an alert stays there. :func:`finding_group_sql` is the same
+    rule in SQL.
+    """
+    if alert_group_id(inv) is not None:
+        return None
+    hunt_id = getattr(inv, "hunt_id", None)
+    ordinal = getattr(inv, "finding_ordinal", None)
+    if not hunt_id or ordinal is None:
+        return None
+    return str(hunt_id), int(ordinal)
+
+
+def finding_group_sql(model: Any = Investigation) -> Any:
+    """The SQL for a run that groups under its hunt finding (:func:`finding_group_id`).
+
+    ``model`` takes an alias of :class:`Investigation` for a correlated
+    subquery.
+    """
+    return and_(
+        model.hunt_id.is_not(None),
+        model.finding_ordinal.is_not(None),
+        or_(~not_hunt_subject(model), func.coalesce(model.alert_es_id, "") == ""),
+    )
 
 
 def not_hunt_subject(model: Any = Investigation) -> Any:
@@ -169,19 +204,17 @@ def superseded_sql() -> Any:
     any status. So a run is superseded when another run of the same alert is
     live and (this run is not live, or that run is newer), or when this run is
     not live and another run is newer. A run with no alert group (a blank
-    ``alert_es_id``, a hunt-subject run) stands alone and is never superseded.
+    ``alert_es_id``, a hunt-subject run) is never superseded by an alert run.
+
+    The runs of one hunt finding form a group too (:func:`finding_group_sql`),
+    and the same rule applies in it. A Re-run of the finding then replaces
+    the older run in the needs-you count, as it does on the run's page.
 
     The bell's failed-triage half filters on it (dogfood 2026-10-01 D1): two
     red "Triage failed" rows stood for alerts that a later run had settled.
     """
     other = aliased(Investigation)
-    other_newer = or_(
-        other.created_at > Investigation.created_at,
-        and_(other.created_at == Investigation.created_at, other.id > Investigation.id),
-    )
-    this_live = Investigation.status.in_(_LIVE_STATUSES)
-    other_live = other.status.in_(_LIVE_STATUSES)
-    return and_(
+    alert_clause = and_(
         Investigation.alert_es_id != "",
         not_hunt_subject(),
         # A backtest replay stands alone (:func:`alert_group_id`): it neither
@@ -193,12 +226,37 @@ def superseded_sql() -> Any:
             other.id != Investigation.id,
             not_hunt_subject(other),
             not_backtest(other),
-            or_(
-                and_(other_live, or_(~this_live, other_newer)),
-                and_(~this_live, other_newer),
-            ),
+            _replaces(other),
         )
         .exists(),
+    )
+    sibling = aliased(Investigation)
+    finding_clause = and_(
+        finding_group_sql(),
+        select(sibling.id)
+        .where(
+            sibling.hunt_id == Investigation.hunt_id,
+            sibling.finding_ordinal == Investigation.finding_ordinal,
+            sibling.id != Investigation.id,
+            finding_group_sql(sibling),
+            _replaces(sibling),
+        )
+        .exists(),
+    )
+    return or_(alert_clause, finding_clause)
+
+
+def _replaces(other: Any) -> Any:
+    """The SQL for a run ``other`` of the same group that replaces this run."""
+    other_newer = or_(
+        other.created_at > Investigation.created_at,
+        and_(other.created_at == Investigation.created_at, other.id > Investigation.id),
+    )
+    this_live = Investigation.status.in_(_LIVE_STATUSES)
+    other_live = other.status.in_(_LIVE_STATUSES)
+    return or_(
+        and_(other_live, or_(~this_live, other_newer)),
+        and_(~this_live, other_newer),
     )
 
 
@@ -930,6 +988,81 @@ async def latest_for_alerts(db: AsyncSession, alert_ids: list[str]) -> dict[str,
     )
 
 
+@dataclass(frozen=True)
+class FailedRuns:
+    """The failed runs of one alert after its newest real verdict.
+
+    ``last_at`` is naive UTC, the clock of the store.
+    """
+
+    count: int
+    last_at: datetime
+
+
+async def failed_runs_for_alerts(
+    db: AsyncSession,
+    alert_ids: list[str],
+    *,
+    failed_since: Mapping[str, datetime] | None = None,
+) -> dict[str, FailedRuns]:
+    """How often each alert failed since its newest real verdict.
+
+    The retry budget of Auto-Investigate reads this count. A failure is an
+    ``error`` run or a pipeline fallback. A cancelled, interrupted or running
+    run costs no retry. A real verdict is a complete run that is not a fallback
+    and has a verdict that is not blank. It resets the count. A time in
+    ``failed_since`` (naive UTC) also resets the count of its alert: the error
+    class of that alert healed in this process. Every starter counts: the
+    scheduler, Bulk Investigate and Re-run. Hunt-subject runs and backtest
+    replays are not the alert's own runs. An alert with no failure is absent.
+
+    blocks_rehunt does not read this. A failed run stays re-huntable, and this
+    count only sets how long the sweep waits before it runs the alert again.
+    """
+    ids = list(dict.fromkeys(a for a in alert_ids if a))
+    if not ids:
+        return {}
+    when = func.coalesce(Investigation.finished_at, Investigation.created_at)
+    own_runs = and_(Investigation.alert_es_id.in_(ids), not_hunt_subject(), not_backtest())
+    verdict_rows = await db.execute(
+        select(Investigation.alert_es_id, func.max(when))
+        .where(
+            own_runs,
+            Investigation.status == "complete",
+            Investigation.is_fallback.isnot(True),
+            ~_blank_verdict_sql(),
+        )
+        .group_by(Investigation.alert_es_id)
+    )
+    newest_verdict: dict[str, datetime] = {aid: at for aid, at in verdict_rows.all() if at}
+    failure_rows = await db.execute(
+        select(Investigation.alert_es_id, when).where(
+            own_runs,
+            or_(
+                Investigation.status == "error",
+                and_(Investigation.status == "complete", Investigation.is_fallback.is_(True)),
+            ),
+        )
+    )
+    out: dict[str, FailedRuns] = {}
+    for aid, at in failure_rows.all():
+        if at is None:
+            continue
+        floor = newest_verdict.get(aid)
+        if floor is not None and at <= floor:
+            continue
+        healed = (failed_since or {}).get(aid)
+        if healed is not None and at <= healed:
+            continue
+        prior = out.get(aid)
+        out[aid] = (
+            FailedRuns(count=1, last_at=at)
+            if prior is None
+            else FailedRuns(count=prior.count + 1, last_at=max(prior.last_at, at))
+        )
+    return out
+
+
 async def standing_for_alerts(db: AsyncSession, alert_ids: list[str]) -> dict[str, Investigation]:
     """The newest COMPLETE, verdict-bearing run per alert: its standing verdict.
 
@@ -1261,6 +1394,7 @@ async def reusable_for_subject(
     is_synth_eval: bool = False,
     now: datetime | None = None,
     window_days: int = SUBJECT_REUSE_DAYS,
+    exclude_hunt_id: str | None = None,
 ) -> Investigation | None:
     """A running or complete investigation of the same subject, or None.
 
@@ -1269,6 +1403,11 @@ async def reusable_for_subject(
     same subject fingerprint. The alert test reads an alert run only: a
     hunt-subject run holds a cited document as its time anchor, and that
     document is not its subject (:func:`is_hunt_subject`).
+
+    ``exclude_hunt_id`` keeps the runs of that hunt out of the fingerprint
+    match. Two findings of one hunt make two claims, so a sibling's run never
+    answers for another finding of the same hunt (change E). A run of another
+    hunt still matches. The default keeps the match for every other caller.
 
     A run that cannot answer is never reused: a failed run, a pipeline
     fallback (:func:`blocks_rehunt`) and a backtest replay
@@ -1279,9 +1418,15 @@ async def reusable_for_subject(
     if alert_id:
         clauses.append(and_(Investigation.alert_es_id == alert_id, not_hunt_subject()))
     if fingerprint:
-        clauses.append(
+        same_fingerprint = (
             Investigation.subject_json[SUBJECT_FINGERPRINT_KEY].as_string() == fingerprint
         )
+        if exclude_hunt_id:
+            same_fingerprint = and_(
+                same_fingerprint,
+                or_(Investigation.hunt_id.is_(None), Investigation.hunt_id != exclude_hunt_id),
+            )
+        clauses.append(same_fingerprint)
     if not clauses:
         return None
     cutoff = (now or utcnow()) - timedelta(days=window_days)
@@ -1359,6 +1504,9 @@ class NotifRow(NamedTuple):
     finished_at: datetime | None
     is_synth_eval: bool
     error_dismissed_at: datetime | None
+    # A pipeline fallback completes with a placeholder verdict. The bell shows
+    # it as a failed triage. LAST: NotifRow(*row) is positional.
+    is_fallback: bool | None
 
 
 async def list_recent_notifications(
@@ -1369,6 +1517,7 @@ async def list_recent_notifications(
     finished_since: datetime | None = None,
     no_verdict: bool = False,
     exclude_dismissed: bool = False,
+    exclude_dismissed_fallbacks: bool = False,
     primary_only: bool = False,
 ) -> list[NotifRow]:
     """Lightweight investigation rows for the notifications bell — scalar columns only.
@@ -1394,9 +1543,11 @@ async def list_recent_notifications(
     ``exclude_dismissed`` drops the ones an operator has already acknowledged
     (``POST /investigations/{id}/dismiss-error``), and ``primary_only`` drops
     the runs a later run of the same alert superseded. Together they are the bell's
-    failed-triage half. Both are SQL conditions rather than a Python filter over
-    the page, because dropping rows after a LIMIT is how a bounded query comes
-    back empty while matching rows sit just past the cut.
+    failed-triage half. ``exclude_dismissed_fallbacks`` drops only the pipeline
+    fallbacks an operator dismissed, and keeps every other row. The bell's
+    completed half uses it. All are SQL conditions rather than a Python filter
+    over the page, because dropping rows after a LIMIT is how a bounded query
+    comes back empty while matching rows sit just past the cut.
     """
     q = select(
         Investigation.id,
@@ -1407,6 +1558,7 @@ async def list_recent_notifications(
         Investigation.finished_at,
         Investigation.is_synth_eval,
         Investigation.error_dismissed_at,
+        Investigation.is_fallback,
     ).where(
         # A backtest replay sends no notification. One backtest is up to 50
         # replays, and each one landed in the bell as a verdict to read.
@@ -1426,6 +1578,13 @@ async def list_recent_notifications(
         q = q.where(_blank_verdict_sql())
     if exclude_dismissed:
         q = q.where(Investigation.error_dismissed_at.is_(None))
+    if exclude_dismissed_fallbacks:
+        q = q.where(
+            or_(
+                Investigation.is_fallback.isnot(True),
+                Investigation.error_dismissed_at.is_(None),
+            )
+        )
     if primary_only:
         # A failed run that a later run of the same alert replaced is history,
         # not a standing fault. See :func:`superseded_sql`.
@@ -1768,6 +1927,51 @@ async def runs_for_alerts(db: AsyncSession, alert_ids: Sequence[str]) -> list[Ru
         .order_by(Investigation.created_at.desc(), Investigation.id.desc())
     )
     return [RunRef(*row) for row in rows.all()]
+
+
+def finding_group_key(group: tuple[str, int]) -> str:
+    """The group key of a finding group in :class:`RunRef.alert_es_id`.
+
+    The primacy rule keys on that field. A finding group keys on this
+    string, so its runs form one group.
+    """
+    return f"finding:{group[0]}:{group[1]}"
+
+
+async def runs_for_findings(
+    db: AsyncSession, groups: Sequence[tuple[str, int]]
+) -> dict[tuple[str, int], list[RunRef]]:
+    """EVERY run of each hunt finding, newest first. The primacy input of a finding group.
+
+    ``groups`` holds the pairs of :func:`finding_group_id`. The
+    ``alert_es_id`` of each :class:`RunRef` holds :func:`finding_group_key`,
+    so the primacy rule reads one group per finding. One query.
+    """
+    wanted = set(groups)
+    if not wanted:
+        return {}
+    rows = await db.execute(
+        select(
+            Investigation.id,
+            Investigation.hunt_id,
+            Investigation.finding_ordinal,
+            Investigation.status,
+            Investigation.created_at,
+        )
+        .where(
+            Investigation.hunt_id.in_(sorted({hunt_id for hunt_id, _ in wanted})),
+            finding_group_sql(),
+        )
+        .order_by(Investigation.created_at.desc(), Investigation.id.desc())
+    )
+    out: dict[tuple[str, int], list[RunRef]] = {}
+    for inv_id, hunt_id, ordinal, status, created_at in rows.all():
+        group = (str(hunt_id), int(ordinal))
+        if group in wanted:
+            out.setdefault(group, []).append(
+                RunRef(inv_id, finding_group_key(group), status, created_at)
+            )
+    return out
 
 
 async def for_entity(db: AsyncSession, value: str, *, limit: int = 50) -> list[Investigation]:

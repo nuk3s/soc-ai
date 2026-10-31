@@ -2,7 +2,8 @@
 //
 // The hunt is a complete lead hunt whose lead is still open, so the lead
 // decision bar shows. One finding cites a host and a document, so the
-// evidence row shows. The timeline holds one step.
+// evidence row shows. The timeline holds one step. Two timed documents put
+// the Event timeline on the page.
 import { render, screen } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { describe, expect, it, vi } from 'vitest';
@@ -57,6 +58,59 @@ const HUNT: HuntDetailData = {
   leadId: 7,
   outcome: 'threat_found',
   outcome_label: 'Threat found',
+  // Two timed documents, so the Event timeline section is on the page.
+  eventTimeline: {
+    basis: 'hunt',
+    gapMinutes: 30,
+    untimed: 0,
+    omitted: 0,
+    entries: [
+      {
+        id: 'doc-0001',
+        at: iso(4 * HOUR),
+        end: null,
+        dataset: 'zeek.conn',
+        source: '192.0.2.10',
+        destination: '203.0.113.5',
+        host: null,
+        label: 'Connection, state SF',
+        cited: true,
+        findings: [0],
+        wave: 1,
+      },
+      {
+        id: 'doc-0002',
+        at: iso(3 * HOUR),
+        end: null,
+        dataset: 'zeek.conn',
+        source: '192.0.2.10',
+        destination: '203.0.113.5',
+        host: null,
+        label: 'Connection, state SF',
+        cited: true,
+        findings: [0],
+        wave: 2,
+      },
+    ],
+    waves: [
+      {
+        n: 1,
+        start: iso(4 * HOUR),
+        end: iso(4 * HOUR),
+        documents: 1,
+        sources: ['192.0.2.10'],
+        destinations: ['203.0.113.5'],
+      },
+      {
+        n: 2,
+        start: iso(3 * HOUR),
+        end: iso(3 * HOUR),
+        documents: 1,
+        sources: ['192.0.2.10'],
+        destinations: ['203.0.113.5'],
+      },
+    ],
+  },
 };
 
 const LEAD = {

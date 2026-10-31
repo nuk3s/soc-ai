@@ -25,7 +25,7 @@ from soc_ai.store import investigations as inv_svc
 from soc_ai.store import leads as leads_store
 from soc_ai.store.auth import utcnow
 from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
-from soc_ai.store.models import Hunt, Investigation, Lead
+from soc_ai.store.models import EntityObservation, Hunt, Investigation, Lead
 from soc_ai.webui import hunt_findings
 from sqlalchemy import select
 
@@ -438,7 +438,9 @@ async def test_a_rehunt_of_the_same_lead_reuses_the_investigation_of_the_same_su
     await engine.dispose()
 
 
-async def test_an_alert_run_on_the_anchor_is_reused(settings_kratos: Settings) -> None:
+async def test_an_alert_run_never_answers_for_a_finding(settings_kratos: Settings) -> None:
+    """Change E. The alert run judges the alert. The finding makes its own claim,
+    so it gets its own run even when it cites the alert of that run."""
     engine, maker = await _store(settings_kratos)
     finding = _finding(1)
     async with maker() as db:
@@ -449,9 +451,83 @@ async def test_an_alert_run_on_the_anchor_is_reused(settings_kratos: Settings) -
     hunt_id, plan = await _investigating_hunt(maker, settings_kratos, [finding])
     mgr = FakeManager(maker)
     await _run_phase(settings_kratos, maker, mgr, hunt_id, plan)
-    assert mgr.started == []
+    assert len(mgr.started) == 1
     link = hunt_svc.finding_links(await _hunt(maker, hunt_id))[0]
-    assert link.investigation_id == alert_run.id
+    assert link.investigation_id == mgr.started[0]["inv_id"]
+    assert link.investigation_id != alert_run.id
+    assert link.origin == hunt_svc.ORIGIN_OPENED
+    await engine.dispose()
+
+
+async def _lead_with_alert_observation(maker: Any, alert_id: str) -> int:
+    """A lead formed from one alert observation, the lead 49 shape."""
+    lead_id = await _lead(maker)
+    async with maker() as db:
+        db.add(
+            EntityObservation(
+                entity_kind="host",
+                entity_key="192.0.2.10",
+                kind="alert_burst",
+                spec_id="alerts",
+                fingerprint="fp-alert-000049",
+                summary="exploit alerts on the web server",
+                evidence_json={"alert_id": alert_id},
+                lead_id=lead_id,
+            )
+        )
+        await db.commit()
+    return lead_id
+
+
+async def test_findings_that_cite_no_document_never_reuse_the_alert_run_of_the_lead(
+    settings_kratos: Settings,
+) -> None:
+    """Change E. Lead 49 (2026-10-24) mapped four different findings to one
+    alert run. Its findings cited prose only, so each run anchored on the alert
+    of the lead, and the alert run answered for all of them."""
+    engine, maker = await _store(settings_kratos)
+    lead_alert = "alert-doc-000049"
+    lead_id = await _lead_with_alert_observation(maker, lead_alert)
+    async with maker() as db:
+        alert_run = await inv_svc.create(db, alert_es_id=lead_alert, started_by="analyst")
+        await inv_svc.finalize(db, alert_run.id, status="complete", verdict="true_positive")
+    pair = ["192.0.2.10", "192.0.2.20"]
+    findings = [
+        _finding(1, hosts=pair, citations=["the web log"], title="Exploit of the web server"),
+        _finding(
+            2, hosts=pair, citations=["t_origin_chain(192.0.2.10)"], title="Upload of a shell"
+        ),
+        _finding(3, hosts=["192.0.2.30"], citations=[], title="Probe of the web server"),
+    ]
+    hunt_id, plan = await _investigating_hunt(maker, settings_kratos, findings, lead_id=lead_id)
+    mgr = FakeManager(maker)
+    await _run_phase(settings_kratos, maker, mgr, hunt_id, plan)
+    assert len(mgr.started) == 3
+    links = hunt_svc.finding_links(await _hunt(maker, hunt_id))
+    assert {links[o].investigation_id for o in (0, 1, 2)} == {s["inv_id"] for s in mgr.started}
+    assert all(links[o].origin == hunt_svc.ORIGIN_OPENED for o in (0, 1, 2))
+    assert alert_run.id not in {links[o].investigation_id for o in (0, 1, 2)}
+    await engine.dispose()
+
+
+async def test_two_findings_of_one_hunt_never_share_a_run(settings_kratos: Settings) -> None:
+    """Change E. Lead 50 (2026-10-24): two findings of one hunt named the same
+    hosts and cited the same document, and the first reused the run of the
+    second. Each finding makes its own claim."""
+    engine, maker = await _store(settings_kratos)
+    pair = ["192.0.2.10", "192.0.2.20"]
+    doc = ["tel-doc-00000050"]
+    findings = [
+        _finding(1, hosts=pair, citations=doc, title="Web shell upload to the web server"),
+        _finding(2, hosts=pair, citations=doc, title="Repeated exploit variants"),
+    ]
+    hunt_id, plan = await _investigating_hunt(maker, settings_kratos, findings)
+    mgr = FakeManager(maker)
+    await _run_phase(settings_kratos, maker, mgr, hunt_id, plan)
+    assert len(mgr.started) == 2
+    links = hunt_svc.finding_links(await _hunt(maker, hunt_id))
+    assert links[0].origin == links[1].origin == hunt_svc.ORIGIN_OPENED
+    assert links[0].investigation_id != links[1].investigation_id
     await engine.dispose()
 
 
@@ -459,15 +535,26 @@ async def test_an_alert_run_on_the_anchor_is_reused(settings_kratos: Settings) -
 async def test_a_run_that_cannot_answer_is_not_reused(
     settings_kratos: Settings, shape: str
 ) -> None:
-    """Negative controls. Each run names the same alert, and each one fails one test."""
+    """Negative controls. Each run is a finding run of another hunt with the
+    same subject fingerprint, and each one fails one test. An alert run never
+    answers for a finding, so the controls use the one path that can reuse."""
     engine, maker = await _store(settings_kratos)
     finding = _finding(1)
     async with maker() as db:
         run = await inv_svc.create(
             db,
             alert_es_id=finding["citations"][0],
-            started_by=inv_svc.BACKTEST_ACTOR if shape == "backtest" else "analyst",
+            started_by=inv_svc.BACKTEST_ACTOR if shape == "backtest" else "system:hunt",
+            kind="hunt",
+            hunt_id="01OTHERHUNT000000000000000",
+            finding_ordinal=0,
             is_synth_eval=shape == "synth",
+            subject={
+                "type": "hunt",
+                "hunt_id": "01OTHERHUNT000000000000000",
+                "subject_fingerprint": subject_fingerprint(finding),
+                "judges": "finding",
+            },
         )
         await inv_svc.finalize(
             db,
@@ -567,6 +654,213 @@ async def test_the_lead_waits_when_a_finding_has_no_verdict(settings_kratos: Set
         lead = await db.get(Lead, lead_id)
         assert lead is not None
         assert lead.status == "hunting"
+    await engine.dispose()
+
+
+def _net_finding(n: int, **over: Any) -> dict[str, Any]:
+    """A subject finding on a TEST-NET host."""
+    base: dict[str, Any] = {"hosts": [f"192.0.2.{n}"], "detail": f"Host 192.0.2.{n} sent it."}
+    base.update(over)
+    return _finding(n, **base)
+
+
+async def _net_lead(maker: Any) -> int:
+    async with maker() as db:
+        lead = Lead(
+            status="open",
+            entities_json=[["host", "192.0.2.1"]],
+            kinds_json=["alert"],
+            weight_at_formation=1.5,
+            shadow=False,
+        )
+        db.add(lead)
+        await db.commit()
+        await db.refresh(lead)
+        return int(lead.id)
+
+
+async def test_a_failed_finding_investigation_holds_the_lead_with_a_reason(
+    settings_kratos: Settings,
+) -> None:
+    """Replay of prod lead 47 (2026-10-24): three subject findings, the middle
+    investigation ended in error at its wall clock, the other two reached
+    true positive. The documented rule leaves the lead to the analyst. The
+    lead stayed 'hunting' with no reason on its page, while a sibling lead
+    with every verdict closed. The hold now names the reason, once."""
+    engine, maker = await _store(settings_kratos)
+    lead_id = await _net_lead(maker)
+    hunt_id, plan = await _investigating_hunt(
+        maker,
+        settings_kratos,
+        [_net_finding(1), _net_finding(2), _net_finding(3, severity="medium")],
+        lead_id=lead_id,
+    )
+    await _hunting(maker, lead_id, hunt_id)
+    mgr = FakeManager(maker, verdicts={0: "true_positive", 1: "error", 2: "true_positive"})
+    await _run_phase(settings_kratos, maker, mgr, hunt_id, plan)
+
+    async with maker() as db:
+        lead = await db.get(Lead, lead_id)
+        assert lead is not None
+        assert lead.status == "hunting"
+        assert leads_store.hold_reason_of(lead) == leads_store.HOLD_NO_VERDICT
+        held = leads_store.decisions_of(lead)[-1]
+        assert (held["action"], held["hunt_id"]) == ("held", hunt_id)
+        assert held["by"] == leads_store.SYSTEM_HUNT_ACTOR
+        assert await leads_store.derived_hold_reason(db, lead) == leads_store.HOLD_NO_VERDICT
+        assert leads_store.HOLD_SENTENCES[leads_store.HOLD_NO_VERDICT] == (
+            "A threat finding of the hunt has no verdict."
+        )
+        # The reconciliation pass calls the rule on every wake. It records
+        # the hold once per hunt.
+        hunt = await db.get(Hunt, hunt_id)
+        assert hunt is not None
+        assert await leads_store.settle_after_hunt(db, hunt) == "waits"
+        assert await leads_store.settle_finished_hunts(db) == 0
+        lead = await db.get(Lead, lead_id)
+        assert lead is not None
+        assert [d["action"] for d in leads_store.decisions_of(lead)].count("held") == 1
+    await engine.dispose()
+
+
+async def test_a_re_run_of_the_failed_finding_settles_the_held_lead(
+    settings_kratos: Settings,
+) -> None:
+    """Control: the hold does not strand the lead. The analyst re-runs the
+    failed finding on the hunt page, and the next settle pass closes it."""
+    engine, maker = await _store(settings_kratos)
+    lead_id = await _net_lead(maker)
+    hunt_id, plan = await _investigating_hunt(
+        maker, settings_kratos, [_net_finding(1), _net_finding(2)], lead_id=lead_id
+    )
+    await _hunting(maker, lead_id, hunt_id)
+    mgr = FakeManager(maker, verdicts={0: "true_positive", 1: "error"})
+    await _run_phase(settings_kratos, maker, mgr, hunt_id, plan)
+    async with maker() as db:
+        rerun = await inv_svc.create(
+            db,
+            alert_es_id="tel-doc-00000002",
+            started_by="alice",
+            kind="hunt",
+            hunt_id=hunt_id,
+            finding_ordinal=1,
+        )
+        await inv_svc.finalize(
+            db, rerun.id, status="complete", verdict="false_positive", confidence=0.7
+        )
+        await hunt_svc.set_finding_link(
+            db,
+            hunt_id,
+            1,
+            hunt_svc.LINK_INVESTIGATING,
+            investigation_id=rerun.id,
+            origin=hunt_svc.ORIGIN_MANUAL,
+        )
+        assert await leads_store.settle_finished_hunts(db) == 1
+        lead = await db.get(Lead, lead_id)
+        assert lead is not None
+        assert lead.status == "promoted"
+        assert leads_store.hold_reason_of(lead) is None
+        decision = leads_store.decisions_of(lead)[-1]
+        assert [(v["ordinal"], v["verdict"]) for v in decision["verdicts"]] == [
+            (0, "true_positive"),
+            (1, "false_positive"),
+        ]
+    await engine.dispose()
+
+
+async def test_a_lead_held_before_the_rule_recorded_it_reads_the_reason(
+    settings_kratos: Settings,
+) -> None:
+    """A lead that an older release left 'hunting' over a finding with no
+    verdict has no 'held' entry. The page reads the reason on read."""
+    engine, maker = await _store(settings_kratos)
+    lead_id = await _net_lead(maker)
+    async with maker() as db:
+        hunt = await hunt_svc.create(
+            db, objective="hunt", started_by="auto-hunt", kind="lead", lead_id=lead_id
+        )
+        tp = await inv_svc.create(
+            db, alert_es_id="tel-doc-00000001", started_by="system:hunt", kind="hunt"
+        )
+        await inv_svc.finalize(db, tp.id, status="complete", verdict="true_positive")
+        await hunt_svc.finalize(
+            db,
+            hunt.id,
+            status="complete",
+            report={"findings": [_net_finding(1), _net_finding(2)]},
+            finding_plan={
+                "0": hunt_svc.plan_entry(
+                    hunt_svc.LINK_ENDED, investigation_id=tp.id, origin="opened"
+                ),
+                "1": hunt_svc.plan_entry(hunt_svc.LINK_FAILED, reason="restart"),
+            },
+        )
+        hunt_id = hunt.id
+    await _hunting(maker, lead_id, hunt_id)
+    async with maker() as db:
+        lead = await db.get(Lead, lead_id)
+        assert lead is not None
+        assert leads_store.hold_reason_of(lead) is None
+        assert await leads_store.derived_hold_reason(db, lead) == leads_store.HOLD_NO_VERDICT
+        # Control: a lead whose verdicts are all in reads no hold.
+        row = await db.get(Hunt, hunt_id)
+        assert row is not None
+        row.finding_investigations = {
+            "0": hunt_svc.plan_entry(hunt_svc.LINK_ENDED, investigation_id=tp.id, origin="opened")
+        }
+        await db.commit()
+        assert await leads_store.derived_hold_reason(db, lead) is None
+    await engine.dispose()
+
+
+async def test_an_entry_on_a_finding_that_is_no_subject_does_not_hold_the_lead(
+    settings_kratos: Settings,
+) -> None:
+    """An older row holds an entry on an observation, which is no subject by
+    the current rule. The hunt page drops that entry, and the settle rule
+    waited on it. The lead now settles on the verdicts of its subjects."""
+    engine, maker = await _store(settings_kratos)
+    lead_id = await _net_lead(maker)
+    async with maker() as db:
+        hunt = await hunt_svc.create(
+            db, objective="hunt", started_by="auto-hunt", kind="lead", lead_id=lead_id
+        )
+        tp = await inv_svc.create(
+            db, alert_es_id="tel-doc-00000001", started_by="system:hunt", kind="hunt"
+        )
+        await inv_svc.finalize(db, tp.id, status="complete", verdict="true_positive")
+        failed = await inv_svc.create(
+            db, alert_es_id="tel-doc-00000002", started_by="system:hunt", kind="hunt"
+        )
+        await inv_svc.finalize(db, failed.id, status="error")
+        await hunt_svc.finalize(
+            db,
+            hunt.id,
+            status="complete",
+            report={"findings": [_net_finding(1), _net_finding(2, category="observation")]},
+            finding_plan={
+                "0": hunt_svc.plan_entry(
+                    hunt_svc.LINK_ENDED, investigation_id=tp.id, origin="opened"
+                ),
+                "1": hunt_svc.plan_entry(
+                    hunt_svc.LINK_ENDED, investigation_id=failed.id, origin="reused"
+                ),
+            },
+        )
+        hunt_id = hunt.id
+    await _hunting(maker, lead_id, hunt_id)
+    async with maker() as db:
+        row = await db.get(Hunt, hunt_id)
+        assert row is not None
+        assert await leads_store.settle_after_hunt(db, row) == "closed"
+        lead = await db.get(Lead, lead_id)
+        assert lead is not None
+        assert lead.status == "promoted"
+        decision = leads_store.decisions_of(lead)[-1]
+        assert [(v["ordinal"], v["verdict"]) for v in decision["verdicts"]] == [
+            (0, "true_positive")
+        ]
     await engine.dispose()
 
 

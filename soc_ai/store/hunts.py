@@ -165,6 +165,83 @@ async def previous_completed_run(
     return (await db.scalars(q)).first()
 
 
+async def earlier_runs(
+    db: AsyncSession,
+    *,
+    objective: str,
+    before: datetime,
+    window_days: int = 7,
+    limit: int = 3,
+) -> list[Hunt]:
+    """The earlier runs of an objective that a new run reads, newest first.
+
+    A scheduled hunt reads what its last runs concluded
+    (:mod:`soc_ai.hunting.earlier`). The objective matches by its normalized
+    hash. The answer is the newest eligible run of any age, so a weekly
+    schedule still reads its last run, then up to ``limit - 1`` older
+    eligible runs from the ``window_days`` before ``before``. ``before`` is
+    strict, so a run never reads itself.
+
+    A run is eligible when it is ``complete`` or ``investigating``. Four runs
+    are not eligible, each for its reason:
+
+    - A synth-eval run. Its tools could see planted scenarios, so it
+      describes nothing real.
+    - A partial or degraded run, by the ``partial`` and ``degraded`` keys of
+      its ``done`` event. The owner's re-hunt rule says a partial run poisons
+      a later run (``routes_hunts``, the re-hunt route).
+    - A run whose findings are all failed queries. It read nothing, so it
+      concluded nothing (the rule of ``routes_hunts._did_not_run``).
+    - An error, cancelled or interrupted run, by the status.
+
+    A row older than 2026-10-01 has no ``partial`` key on its ``done`` event
+    and reads as a full run. :func:`previous_completed_run` and the "vs last
+    run" diff do not change.
+    """
+    candidates = list(
+        (
+            await db.scalars(
+                select(Hunt)
+                .where(
+                    Hunt.objective_hash == _objective_hash(objective),
+                    Hunt.status.in_((STATUS_COMPLETE, STATUS_INVESTIGATING)),
+                    Hunt.is_synth_eval.is_(False),
+                    Hunt.created_at < before,
+                )
+                .order_by(Hunt.created_at.desc(), Hunt.id.desc())
+                .limit(12)
+            )
+        ).all()
+    )
+    if not candidates:
+        return []
+    done = await db.execute(
+        select(HuntEvent.hunt_id, HuntEvent.payload).where(
+            HuntEvent.kind == "done", HuntEvent.hunt_id.in_([h.id for h in candidates])
+        )
+    )
+    held_back = {
+        str(hunt_id)
+        for hunt_id, payload in done.all()
+        if isinstance(payload, dict) and (payload.get("partial") or payload.get("degraded"))
+    }
+    eligible: list[Hunt] = []
+    for hunt in candidates:
+        if hunt.id in held_back:
+            continue
+        report = hunt.report if isinstance(hunt.report, dict) else {}
+        raw = report.get("findings")
+        findings = [f for f in raw if isinstance(f, dict)] if isinstance(raw, list) else []
+        if findings and all(is_run_failure_finding(f) for f in findings):
+            continue
+        eligible.append(hunt)
+    if not eligible or limit < 1:
+        return []
+    floor = before - timedelta(days=window_days)
+    older = [h for h in eligible[1:] if h.created_at is not None and h.created_at >= floor]
+    return [eligible[0], *older[: limit - 1]]
+
+
 async def append_events(db: AsyncSession, hunt_id: str, events: list[dict[str, Any]]) -> None:
     for ev in events:
         db.add(
@@ -243,6 +320,20 @@ def _ended_count(plan: dict[str, Any]) -> int:
         for entry in plan.values()
         if isinstance(entry, dict) and entry.get("state") in LINK_ENDED_STATES
     )
+
+
+def _link_ended(link: FindingLink, run_status: str | None) -> bool:
+    """Whether the investigation of one finding has ended.
+
+    The entry state says so, or the run the entry names says so. The analyst's
+    run of a finding (the promote route) is linked as investigating, and no
+    task moves that entry to ended. The run's own status is the fact, so a
+    re-run that ended counts as investigated. ``run_status`` is None when the
+    entry names no run, or a run the store no longer holds.
+    """
+    if link.state in LINK_ENDED_STATES:
+        return True
+    return link.state == LINK_INVESTIGATING and run_status not in (None, "running")
 
 
 def finding_links(hunt: Any) -> dict[int, FindingLink]:
@@ -408,6 +499,11 @@ async def finding_verdicts(db: AsyncSession, hunt_ids: Sequence[str]) -> dict[st
     current rule is dropped (:func:`subject_links`), and ``findings`` counts
     every finding of the report. So a row an older rule wrote reads correctly
     with no migration.
+
+    ``investigated`` is counted here too, from the entries and the runs they
+    name (:func:`_link_ended`). The stored ``findings_investigated`` counts
+    the entry states only, and the entry of a re-run stays investigating
+    after its run ends.
     """
     wanted = [i for i in hunt_ids if i]
     if not wanted:
@@ -417,26 +513,24 @@ async def finding_verdicts(db: AsyncSession, hunt_ids: Sequence[str]) -> dict[st
             select(
                 Hunt.id,
                 Hunt.findings_total,
-                Hunt.findings_investigated,
                 Hunt.finding_investigations,
                 Hunt.report,
             ).where(Hunt.id.in_(wanted), Hunt.findings_total > 0)
         )
     ).all()
-    links_by_hunt: dict[str, tuple[int, int, dict[int, FindingLink], int]] = {}
-    for hunt_id, stored_total, stored_done, raw, report in rows:
+    links_by_hunt: dict[str, tuple[int, dict[int, FindingLink], int]] = {}
+    for hunt_id, stored_total, raw, report in rows:
         findings = report.get("findings") if isinstance(report, dict) else None
         links = finding_links_from(raw)
         kept = subject_links(links, findings)
-        total, done = int(stored_total or 0), int(stored_done or 0)
+        total = int(stored_total or 0)
         if len(kept) != len(links):
             total = len(kept)
-            done = sum(1 for link in kept.values() if link.state in LINK_ENDED_STATES)
-        links_by_hunt[str(hunt_id)] = (total, done, kept, counted_findings(findings))
+        links_by_hunt[str(hunt_id)] = (total, kept, counted_findings(findings))
     inv_ids = sorted(
         {
             link.investigation_id
-            for _total, _done, links, _every in links_by_hunt.values()
+            for _total, links, _every in links_by_hunt.values()
             for link in links.values()
             if link.investigation_id
         }
@@ -455,12 +549,13 @@ async def finding_verdicts(db: AsyncSession, hunt_ids: Sequence[str]) -> dict[st
         for inv_id, status, verdict, fallback in found.all():
             runs[str(inv_id)] = (str(status or ""), verdict, bool(fallback))
     out: dict[str, FindingVerdicts] = {}
-    for hunt_id, (total, done, links, every) in links_by_hunt.items():
+    for hunt_id, (total, links, every) in links_by_hunt.items():
         if total <= 0:
             continue
-        decided = threats = 0
+        decided = threats = done = 0
         for link in links.values():
             run = runs.get(link.investigation_id or "")
+            done += _link_ended(link, run[0] if run is not None else None)
             if run is None:
                 continue
             status, verdict, fallback = run

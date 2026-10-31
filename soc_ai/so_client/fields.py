@@ -504,34 +504,147 @@ NETWORK_SENSOR_MODULES: frozenset[str] = frozenset({"suricata", "zeek", "network
 HOST_OWN_ADDRESSES: tuple[str, ...] = ("host.ip",)
 
 
+# ---------------------------------------------------------------------------
+# Endpoint-authored flows
+#
+# An endpoint agent writes one document for each connection and for each DNS
+# lookup. It stamps its own host.name on the document and writes no host.ip. The
+# document has two ends, and the name belongs to one of them: the local end. On
+# a production grid, an agentless server took the name of an agent that
+# connected to it, and a resolver took the name of its clients.
+#
+# ECS ingress and egress are host-based: egress puts the host at the source,
+# ingress puts it at the destination. The perimeter values (inbound, outbound,
+# internal, external) say nothing about the host, so they place no end. In a
+# lookup document the resolver on port 53 can be in source.ip, so the end that
+# is not on port 53 is the local end there.
+# ---------------------------------------------------------------------------
+
+# The fields that place the local end. A projection that feeds
+# names_the_shipper must carry them.
+LOCAL_END_FIELDS: tuple[str, ...] = (
+    "network.direction",
+    "event.action",
+    "source.port",
+    "destination.port",
+)
+_FLOW_ENDS: tuple[tuple[str, str], ...] = (
+    ("source.ip", "source.port"),
+    ("destination.ip", "destination.port"),
+)
+_LOCAL_END_BY_DIRECTION: dict[str, str] = {"egress": "source.ip", "ingress": "destination.ip"}
+_DNS_LOOKUP_ACTIONS: frozenset[str] = frozenset({"lookup_requested", "lookup_result"})
+_DNS_PORT = 53
+
+
+def _strings(value: Any) -> list[str]:
+    """The str members of a scalar or a list."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return [item for item in value if isinstance(item, str)]
+    return []
+
+
+def _port(source: Mapping[str, Any], path: str) -> int | None:
+    """The port at ``path`` as an int. A list gives its first member."""
+    value = get_dotted(source, path)
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else None
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def canonical_ip(value: str) -> str:
+    """One spelling for one address. Raises ValueError for a value that is not an address.
+
+    An IPv4-mapped IPv6 address (``::ffff:a.b.c.d``) gives the IPv4 address.
+    Elasticsearch stores the two forms as one ip value, so a term query for
+    one form also selects a document that spells the other.
+    """
+    address = ipaddress.ip_address(value)
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        return address.ipv4_mapped.compressed
+    return address.compressed
+
+
+def _canonical(value: str) -> str:
+    """:func:`canonical_ip` of the value. A value that is not an address is unchanged."""
+    try:
+        return canonical_ip(value.strip())
+    except ValueError:
+        return value
+
+
+def _addresses_at(source: Mapping[str, Any], path: str) -> set[str]:
+    """The canonical addresses at ``path``."""
+    return {_canonical(value) for value in _strings(get_dotted(source, path))}
+
+
+def local_end(source: Mapping[str, Any]) -> str | None:
+    """The ECS field of the end that wrote the document: ``source.ip`` or ``destination.ip``.
+
+    ``network.direction`` gives one pick: egress is the source and ingress is
+    the destination. A value outside those two is ignored. Values that pick
+    both ends give None. A DNS lookup action with exactly one end on port 53
+    gives a second pick: the other end. Two picks that differ give None. None
+    also means that no rule applies.
+    """
+    by_direction = {
+        end
+        for value in _strings(get_dotted(source, "network.direction"))
+        if (end := _LOCAL_END_BY_DIRECTION.get(value.casefold())) is not None
+    }
+    if len(by_direction) > 1:
+        return None
+    direction_pick = next(iter(by_direction), None)
+    port_pick: str | None = None
+    actions = {value.casefold() for value in _strings(get_dotted(source, "event.action"))}
+    if actions & _DNS_LOOKUP_ACTIONS:
+        on_53 = [end for end, port in _FLOW_ENDS if _port(source, port) == _DNS_PORT]
+        if len(on_53) == 1:
+            port_pick = next(end for end, _port_path in _FLOW_ENDS if end != on_53[0])
+    if direction_pick is not None and port_pick is not None and direction_pick != port_pick:
+        return None
+    return direction_pick or port_pick
+
+
 def names_the_shipper(source: Mapping[str, Any], name: str, ip: str) -> bool:
     """True when ``name`` identifies the box that shipped ``source``, not ``ip``.
 
-    Three tests in strict precedence:
+    Four tests in strict precedence:
 
-    1. ``host.ip`` — the shipping host's own address list. When present it is
-       authoritative and decides on its own: the identity belongs to whoever
-       owns those addresses, so the answer is simply whether ``ip`` is one.
-    2. A network-sensor dataset or module, where a surviving top-level host
-       identity is always the sensor rather than either flow endpoint.
-    3. ``observer.name`` equal to the name — an observer, by the word's ECS
-       meaning, watches something other than itself.
+    1. ``host.ip``: the shipping host's own address list. When it is present,
+       it decides alone. The name belongs to the owner of those addresses, so
+       the answer is whether ``ip`` is one of them. Addresses compare in
+       canonical form.
+    2. A network-sensor dataset or module. A top-level host name on such a
+       document names the sensor and neither flow end.
+    3. ``observer.name`` equal to the name. An observer watches something
+       other than itself.
+    4. ``ip`` at a flow end. An endpoint agent writes one document for each
+       connection and each lookup, with its own name and no ``host.ip``. The
+       name belongs to the local end only (:func:`local_end`). When the
+       document does not tell the local end, the name belongs to no end.
 
     ``agent.name`` is deliberately NOT a test. On an endpoint's own EDR document
     the agent runs on the host, so ``agent.name == host.name`` is the *normal*
     shape; treating that as sensor evidence rejects exactly the documents this
     lane exists to read.
 
-    Fails OPEN. A document with no ``host.ip``, an unenumerated dataset and no
-    ``observer.name`` is read as endpoint-authored. That leaves a real hole — a
+    The function fails open only for a document that does not put ``ip`` at a
+    flow end. Such a document with no ``host.ip``, an unenumerated dataset and
+    no ``observer.name`` is read as endpoint-authored. That leaves a real hole — a
     sensor shipping under a dataset nobody listed — which is why ``host.ip``
     leads: it is the one test that needs no list kept current.
     """
-    own = first_present(source, HOST_OWN_ADDRESSES)
-    if isinstance(own, str):
-        own = [own]
-    if isinstance(own, (list, tuple)) and own:
-        return ip not in own
+    owned = {_canonical(value) for value in _strings(first_present(source, HOST_OWN_ADDRESSES))}
+    if owned:
+        return _canonical(ip) not in owned
     dataset = get_dotted(source, "event.dataset")
     if isinstance(dataset, str) and dataset.startswith(NETWORK_SENSOR_DATASET_PREFIXES):
         return True
@@ -539,7 +652,13 @@ def names_the_shipper(source: Mapping[str, Any], name: str, ip: str) -> bool:
     if isinstance(module, str) and module in NETWORK_SENSOR_MODULES:
         return True
     observer = get_dotted(source, "observer.name")
-    return isinstance(observer, str) and observer == name
+    if isinstance(observer, str) and observer == name:
+        return True
+    want = _canonical(ip)
+    if not any(want in _addresses_at(source, end) for end, _port_path in _FLOW_ENDS):
+        return False
+    end = local_end(source)
+    return end is None or want not in _addresses_at(source, end)
 
 
 # Per-(index, candidates) cache of the resolved aggregation field. Once a

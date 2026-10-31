@@ -53,6 +53,8 @@ class AutoTriageStatusOut(BaseModel):
     # ``no_investigation`` | ``high_stakes``.
     inherited_refused: dict[str, int] = {}
     # Per-reason breakdown of ``skipped`` (reason code -> count); sums to skipped.
+    # ``retry_wait`` and ``retry_limit`` count the failed alerts that wait
+    # before their next automatic run (soc_ai.webui.autotriage_health).
     skipped_reasons: dict[str, int] = {}
     # True when this run could not read part (or all) of the grid. Without it a
     # blind sweep is indistinguishable on the wire from a drained queue: both are
@@ -63,6 +65,28 @@ class AutoTriageStatusOut(BaseModel):
     # Targets the rule prior covered with no model run this sweep (live mode).
     # They are not in ``hunted``: no model investigated them.
     prior_covered: int = 0
+    # The pause of continuous Auto-Investigate, as ISO-8601 UTC. None when the
+    # scheduled runs are not paused.
+    paused_until: str | None = None
+    # The end of the last pause, as ISO-8601 UTC, until a verdict closes the
+    # pause. It stays after the end passes. The next scheduled run comes up to
+    # one interval after it. None when no pause is open.
+    pause_ends: str | None = None
+    # Failed runs in a row while paused, else 0.
+    failed_in_a_row: int = 0
+    # The error of the newest open alarm, or the last error while paused:
+    # "ModelHTTPError in synth_first_round1". None when all is well.
+    alarm_error: str | None = None
+    # Failed runs of the newest open alarm, else 0.
+    alarm_failures: int = 0
+
+
+def _health_fields(status: Any) -> dict[str, Any]:
+    """The pause and the alarm of soc_ai.webui.autotriage_health, for the wire."""
+    health = getattr(status, "health", None)
+    if health is None:
+        return {}
+    return dict(health.status_fields())
 
 
 def _at_status(status: Any, note: str | None = None) -> AutoTriageStatusOut:
@@ -84,6 +108,7 @@ def _at_status(status: Any, note: str | None = None) -> AutoTriageStatusOut:
         degraded=bool(getattr(status, "degraded", False)),
         grid_errors=list(getattr(status, "grid_errors", []) or []),
         prior_covered=int(getattr(status, "prior_covered", 0) or 0),
+        **_health_fields(status),
     )
 
 
@@ -138,7 +163,14 @@ def _finished_empty(
     if selected:
         note = f"all {skipped} selected already triaged" if skipped else "no alert to investigate"
     else:
-        note = "no alert to investigate"
+        reasons = getattr(status, "skipped_reasons", {}) or {}
+        held = reasons.get("retry_wait", 0) + reasons.get("retry_limit", 0)
+        if held == 1:
+            note = "1 failed alert waits to retry"
+        elif held > 1:
+            note = f"{held} failed alerts wait to retry"
+        else:
+            note = "no alert to investigate"
     return _at_status(status, note=note)
 
 

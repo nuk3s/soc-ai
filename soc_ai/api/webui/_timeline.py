@@ -12,7 +12,9 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from soc_ai.api.webui._event_timeline import EventTimelineOut
 from soc_ai.config import Settings
+from soc_ai.event_time import WAVE_GAP_SECONDS, as_utc, gap_words
 from soc_ai.secret_scrub import scrub_secrets
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.so_client.fields import get_dotted
@@ -620,13 +622,69 @@ def _rule_prevalence_ste(r: dict[str, Any]) -> str | None:
     rate = r.get("fires_per_day")
     if r.get("is_burst"):
         # A burst has no rate. The stored text gave one and then said so
-        # (R2 STE item 10).
-        out += " The fires form one burst."
+        # (R2 STE item 10). It also called every burst "one burst", and a prod
+        # rule fired in three waves on one day (change D).
+        out += _burst_waves_ste(r)
     elif isinstance(rate, int | float) and not isinstance(rate, bool):
         out += f" The rate is {rate:.1f} fires a day."
     if r.get("noisiness"):
         out += f" Type: {r['noisiness']}."
     return out
+
+
+# The most waves the page step names.
+_STEP_WAVES = 6
+
+
+def _wave_window(start: Any, end: Any) -> tuple[str, str] | None:
+    """The start and the end of one wave as page words, or None."""
+    first, last = as_utc(start), as_utc(end)
+    if first is None:
+        return None
+    if last is None or last < first:
+        last = first
+    head = first.strftime("%Y-%m-%d %H:%M:%S")
+    if last.replace(microsecond=0) == first.replace(microsecond=0):
+        return head, ""
+    return head, last.strftime("%H:%M:%S" if last.date() == first.date() else "%Y-%m-%d %H:%M:%S")
+
+
+def _burst_waves_ste(r: dict[str, Any]) -> str:
+    """The wave sentences of a burst step. A ``waves`` field from a newer tool
+    names each wave. Without it, a span of one wave gap or less is one wave,
+    and a longer span claims no wave count."""
+    waves = [
+        (w, window)
+        for w in (r.get("waves") or [])
+        if isinstance(w, dict) and (window := _wave_window(w.get("start"), w.get("end")))
+    ]
+    count = _n(r.get("wave_count")) or len(waves)
+    if waves and count == 1:
+        head, tail = waves[0][1]
+        if not tail:
+            return f" The fires form one wave, at {head} UTC."
+        return f" The fires form one wave, from {head} to {tail} UTC."
+    if waves:
+        out = f" The fires form {count} waves."
+        for i, (w, (head, tail)) in enumerate(waves[:_STEP_WAVES], 1):
+            fires = _times(_n(w.get("fires")) or 0, "fire", "fires")
+            out += (
+                f" Wave {i}: {fires} from {head} to {tail} UTC."
+                if tail
+                else f" Wave {i}: {fires} at {head} UTC."
+            )
+        if count > _STEP_WAVES:
+            out += f" The page shows the first {_STEP_WAVES} waves."
+        return out
+    span = r.get("observed_span_seconds")
+    if isinstance(span, int | float) and not isinstance(span, bool):
+        if span <= WAVE_GAP_SECONDS:
+            return " The fires form one wave."
+        return (
+            " The rule has no daily rate. The first and the last fire are "
+            f"{gap_words(span)} apart. That span can hold one wave or several waves."
+        )
+    return " The rule has no daily rate."
 
 
 def _origin_chain_ste(r: dict[str, Any]) -> str | None:
@@ -1701,8 +1759,9 @@ class InvestigationOut(BaseModel):
     # The finding the analyst promoted, for the page to name first: "Promoted
     # finding: F2, <title>", and attacker to victim from the finding. The
     # page read "Subject: hunt" with six findings and the raw model prompt
-    # (dogfood 2026-10-06 C4). None on a run that no finding promoted, and
-    # when the hunt is gone. Built by routes_hunts.promoted_finding_out.
+    # (dogfood 2026-10-06 C4). None on a run that no finding promoted. When
+    # the hunt is gone, the stored subject names the finding. Built by
+    # routes_hunts.promoted_finding_out.
     promotedFinding: dict[str, Any] | None = None
     # Migration 0032's synthetic-evaluation marker: this run investigated
     # PLANTED synthetic attack scenarios (directly, or promoted from a marked
@@ -1763,6 +1822,11 @@ class InvestigationOut(BaseModel):
     # that answers for it. The console makes each one a link. Empty from an
     # older server.
     entities: list[EntityRefOut] = []
+    # The documents of the run in event-time order, with the waves (change
+    # D). Built by ``_event_timeline.investigation_event_timeline`` from the
+    # stored documents. None while the run runs, and when fewer than two
+    # documents have a stored time.
+    eventTimeline: EventTimelineOut | None = None
 
 
 def _host_contexts(profiles: Any) -> list[dict[str, Any]]:

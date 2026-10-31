@@ -523,6 +523,9 @@ lead's observations and the related leads. It asks the hunt to state, with the e
 the leads are one campaign. soc-ai writes the objective once, at the start of the hunt. The
 objective therefore reads "Related leads at the start of this hunt".
 
+Every lead hunt also reads the earlier conclusions about its entities. This includes Hunt again
+and the bulk hunt. See [Earlier conclusions](#earlier-conclusions).
+
 ## Hunt outcomes
 
 A lead settles when its hunt finishes. What the hunt found decides where the lead goes.
@@ -532,9 +535,10 @@ A lead settles when its hunt finishes. What the hunt found decides where the lea
   No analyst chose a reason, so the lead quality report counts it separately from your dismissals.
   soc-ai closes the lead only if the hunt read its evidence. A visibility gap finding, a failed
   tool call, a degraded run or a report from the budget synthesizer keeps the lead open. An earlier
-  hunt on the same lead with a threat finding keeps it open too. The lead then waits under Needs
-  decision. The lead page states the reason: "The hunt could not read all evidence." or "An
-  earlier hunt found a threat."
+  hunt on the same lead with a threat finding keeps it open too. A finding that linked this lead to
+  other leads also keeps it open. The lead then waits under Needs decision. The lead page states the
+  reason: "The hunt could not read all evidence.", "An earlier hunt found a threat." or "The hunt
+  linked this lead to other leads."
 - The hunt found a **threat**, or it reported a **visibility gap**. The lead waits on you under
   Needs decision as "Hunted · Threat findings" or "Hunted · No threat observed · visibility gap".
   Read the verdicts that the hunt brought back, or dismiss the lead.
@@ -570,9 +574,16 @@ one investigation for each subject finding. The investigation runs the same way 
 hand. Its actor is `system:hunt`.
 
 A finding is a subject when it is a threat and names a host, an address, a user or a domain. A
-visibility gap, a failed query and an observation are not subjects. The investigation runs on the document the
-finding cites. When the finding cites none, it runs on the evidence of the lead. When there is no
-document at all, the finding reads "Investigation failed" with that reason, and you decide.
+visibility gap, a failed query and an observation are not subjects. The investigation runs on a
+document that the finding cites. When the grid holds no document that the finding cites, it runs on
+a document of the other findings or the lead. When there is no document at all, the finding reads
+"Investigation failed" with that reason, and you decide.
+
+A link between leads is not a finding. The hunt states it in the narrative. When the title of a
+threat finding names leads, soc-ai changes the finding to an observation with severity info. The
+note on the finding says why. No investigation opens for it. When that finding was the only threat
+of a lead hunt, the lead does not close as clean. It waits for the analyst with the reason "The
+hunt linked this lead to other leads."
 
 - Two investigations of one hunt run at a time. The finding with the highest severity goes first.
   Findings of equal severity go in report order.
@@ -581,7 +592,8 @@ document at all, the finding reads "Investigation failed" with that reason, and 
 - The hunt reads **Investigating** while the investigations run. The findings section reads
   "Investigating 2 of 3 findings". The hunt is complete when the last investigation ends.
 - A failed investigation counts as ended. Its finding reads "Investigation failed, re-run." Use
-  Open an investigation on that finding.
+  Open an investigation on that finding. Re-run on the page of the failed investigation also starts
+  a new run.
 - A cancel of the hunt stops its investigations. A queued one never starts, and a running one stops.
 - A restart completes an investigating hunt. A finding whose investigation never started reads failed.
 - The hunt's own investigations record no observation. An observation for each finding would form a
@@ -592,11 +604,19 @@ investigation.
 
 ### One investigation per subject
 
-Before soc-ai opens an investigation, it looks for a running or complete one from the last 7 days.
-A match investigated the same alert, or it has the same subject fingerprint. The fingerprint is the
-entity set and the cited document ids of the finding. It does not depend on the hunt. soc-ai
-reuses a match. The finding links to it, and no new run starts. A re-hunt of a lead therefore reuses the
-investigations of the first hunt for the findings that did not change.
+Before soc-ai opens an investigation, it looks for a running or complete one from the last 7 days
+with the same subject fingerprint. The fingerprint is the entity set and the cited document ids of
+the finding. It does not depend on the hunt. soc-ai reuses a match from another hunt. The finding
+links to it, and no new run starts. A re-hunt of a lead therefore reuses the investigations of the
+first hunt for the findings that did not change.
+
+Two findings of one hunt never share an investigation. Each finding makes its own claim.
+
+A finding that cites no document has no fingerprint. A tool call in the citations is not a
+document. soc-ai opens a new investigation for such a finding.
+
+An investigation of one alert never answers for a finding. The alert investigation judges the
+alert. The finding makes its own claim.
 
 soc-ai never reuses a failed run, a pipeline fallback or a backtest replay.
 
@@ -617,8 +637,13 @@ no subject finding. The bell reads "Hunt finished: 2 of 3 findings are threats".
 
 When every subject finding of a lead hunt has a verdict, soc-ai closes the lead as promoted. The
 decision names `system:hunt` and records the verdict of each finding. A finding with no verdict
-leaves the lead to you. A lead hunt with no subject finding settles by the rules in
-[Hunt outcomes](#hunt-outcomes).
+leaves the lead to you. A failed investigation, a pipeline fallback, a cancelled investigation and a
+finding past the cap have no verdict. The lead then waits under Needs decision. The lead page
+states the reason: "A threat finding of the hunt has no verdict." Use Re-run on the investigation
+page of that finding, or decide on the lead. A finding past the cap has no investigation. Use Open
+an investigation on the hunt page for it. With `lead_auto_hunt` on, the loop closes the
+lead at its next wake after the last verdict lands. A lead hunt with no subject finding settles by
+the rules in [Hunt outcomes](#hunt-outcomes).
 
 `soc-ai usage` counts the hunt's own investigations under the entry "Hunt finding investigation". It
 prints the line `hunt findings investigated: N` for the window.
@@ -627,8 +652,16 @@ prints the line `hunt findings investigated: N` for the window.
 
 A hunt finishes only after soc-ai investigates its findings. The hunt investigates what it finds and
 brings back the verdicts. A finding with no investigation offers **Open an investigation** on the
-hunt page. That control starts the investigation by hand. The subject of the investigation is the
-hunt.
+hunt page. That control starts the investigation by hand. The subject of the investigation is that
+finding.
+
+An investigation of a finding judges the claim of that finding. The rest of the hunt is context.
+The run anchors on a document that the finding cites. When the grid holds no document that the
+finding cites, the run anchors on a document of the other findings or the lead. The investigation
+page names the finding under Subject. The hunt shows under Context: hunt.
+
+An older investigation of a finding judged the whole hunt. Its page keeps the old labels. Its
+subject in the API has no `judges` key.
 
 The run reads the hunt's objective, its narrative, every finding, and every document those findings
 cite, up to 40. The documents of the chosen finding come first and the rest follow newest first. A lead
@@ -637,11 +670,22 @@ evidence before the investigation starts. A verdict that cites one of them then 
 document the run holds.
 
 The verdict is `true_positive`, `false_positive` or `needs_more_info`, with a confidence, a
-rationale, citations and recommended actions. For a hunt subject the three words mean this:
+rationale, citations and recommended actions. For a finding, the three words mean this:
+
+- **true positive**: the activity that the finding names is an attack or a compromise, and the
+  evidence shows it. A login or a probe that happened is not a true positive by itself.
+- **false positive**: the activity has a benign explanation that the evidence supports.
+- **needs more info**: the report names the gap that a tool call can close.
+
+A lead promotion has no finding. It judges the hunt as a whole. For a lead promotion, the three
+words mean this:
 
 - **true positive**: the hunt's hypothesis holds as an attack or a compromise.
 - **false positive**: the findings have a benign explanation that the evidence supports.
 - **needs more info**: the report names the gap that a tool call can close.
+
+When the Oracle reviews an investigation of a finding, the case names the title and the hosts of
+the finding. The Oracle judges that claim.
 
 Every gate runs: the evidence gate, the citation validation and cap, the confidence floor, the
 egress guard, the Oracle escalation and the session gate. Two things do not run. The decision
@@ -650,6 +694,33 @@ acknowledge does not either. Security Onion holds no hunt to acknowledge.
 
 The route `POST /hunts/leads/{id}/promote` stays for API clients. The console offers no control
 for it. The server refuses it on a lead with no finished hunt, with HTTP 409 `lead_not_hunted`.
+
+### Re-run
+
+An investigation of a finding that ended keeps its verdict. The hunt page links the finding to that
+run with **View investigation**. To run the investigation of the finding again, use **Re-run
+investigation** on the investigation page. The button shows when the run is not running.
+
+- Re-run starts a new investigation of the same finding. The new run judges the claim of the
+  finding again.
+- The old run stays as a record. The finding on the hunt page links to the new run.
+- The page of the old run names the new run. Its Re-run, Override verdict and actions are off.
+- The hunt counts the finding as investigated again when the new run ends.
+- While a run of the finding runs, Re-run opens that run. No second run starts. When two presses
+  arrive at the same time, one run starts.
+- A run that the page calls stuck can still run on the server. Re-run then states that the server
+  still runs it. No run starts.
+- Re-run starts a run of its own when a run of another hunt has the same subject.
+- The new run keeps the synthetic-evaluation marker of the hunt. It writes nothing to Security
+  Onion.
+- Re-run asks first when an analyst verdict is on the run. The verdict of the new run then replaces
+  the analyst verdict on the hunt page.
+- A finding investigation has no **Deep re-run** and no **Request more info**. The API refuses
+  Request more info with HTTP 409 `hunt_kind_no_rerun`. The hint names Re-run.
+- A finding investigation whose hunt an admin deleted has no Re-run.
+
+The console sends the route of the finding with the JSON body `{"rerun": true}`. The
+[API](#the-api) table describes the route.
 
 ## Related leads
 
@@ -672,6 +743,45 @@ lead row on the strip carries a "+N related" chip.
 soc-ai computes the list on read and stores nothing. A stored relation goes stale as soon as you
 answer either lead. A deployment whose API returns no related leads shows no panel. An empty panel
 there would claim a result that the API did not return.
+
+## Earlier conclusions
+
+Two types of hunt read the earlier conclusions about their subject before they start.
+
+A **lead hunt** reads the leads that closed as promoted in the last 7 days. An earlier lead counts
+when its subject is an entity that the new lead names. Two leads that only mention the same host do
+not count. The hunt reads at most 3 leads, newest first. Each lead line names up to 3 entities of
+the earlier lead. The entities that the new lead also names come first. For each lead the hunt
+reads up to 3 investigations: the title, the verdict and the first sentence of the summary.
+
+A **scheduled hunt** reads the last complete run of its objective. It also reads up to 2 older runs
+from the last 7 days. It reads at most 5 findings from each run and 10 in total. Each finding line
+gives the type, the title, the hosts, up to 3 document ids and the verdict of its investigation.
+
+soc-ai skips a run of the synthetic evaluation, a partial run and a run that read nothing. A
+partial run is a run that stopped at its budget. soc-ai carries only the findings that cite a
+document. It does not carry the narrative, because no gate checks the narrative.
+
+The hunt reads each conclusion as a claim to check. A conclusion is not evidence. The block names no
+lead, hunt or investigation id, so the hunt cannot cite one. The Objective step on the hunt page
+shows the block and its source records. The hosts that only the block names reach the host dossier
+with the label "named in an earlier conclusion".
+
+With redaction in fail-closed mode, soc-ai checks the block before the hunt starts. When the block
+holds a name that the redaction cannot remove, the hunt starts without the block. The Objective step
+states this.
+
+soc-ai reads the conclusions once, at the start of the hunt. The objective does not change. A
+scheduled hunt therefore keeps its link to its earlier runs and its "vs last run" comparison.
+
+The investigations of the hunt findings do not read this block. They read the hunt narrative, and
+the narrative can name an earlier claim. The prompt of each investigation therefore states that a
+claim of an earlier hunt in the narrative is not evidence.
+
+The read writes nothing. A closed lead keeps its status, its history and its observations. soc-ai
+reads promoted leads only. A dismissed lead, a reopened lead and a lead whose hunt did not settle
+are not earlier conclusions. An analyst chat hunt and a re-hunt of a hunt read no earlier
+conclusions.
 
 ## The Hunts page
 
@@ -1136,7 +1246,7 @@ Every route sits under `/api/v1`. The console uses these, and an integrator can 
 | `POST /hunts/leads/bulk-dismiss-again` | Dismiss each lead again with the reason and the note that its last reopen cleared. The console sends it as the Undo of a bulk reopen. |
 | `POST /hunts/leads/bulk-hunt` | Start one hunt for each lead, at most 3 for each call. A lead past the cap is skipped as `over_cap`, and a lead with a hunt in flight as `hunt_running`. |
 | `GET /leads/bulk-hunt-plan` | The hunt cap of one bulk call, and how long hunts on this grid take. `typical_run` is null while the store holds fewer than 3 finished hunts. |
-| `POST /hunts/{hunt_id}/findings/{ordinal}/investigate` | Open an investigation on one finding of a hunt. The subject is the hunt. The console control is **Open an investigation**. When a running or complete investigation of the same subject exists, the route returns it. |
+| `POST /hunts/{hunt_id}/findings/{ordinal}/investigate` | Open an investigation on one finding of a hunt. The investigation judges the claim of that finding. The rest of the hunt is context. The console control is **Open an investigation**. The route returns a running or complete investigation of this finding with `existing: true`. It also returns one with the same subject fingerprint from another hunt. The optional JSON body `{"rerun": true}` starts a new run over a run that ended. A running run of the finding, or a running run that the hunt links to the finding, still answers. **Re-run investigation** on the investigation page sends it. |
 | `GET /hunts` and `GET /hunts/{id}` | A hunt row carries `findingsInvestigated` and `findingsTotal`. Each finding of the detail carries `investigationId`, `verdict`, `confidence`, `investigationStatus` and `pendingActions`. `investigationStatus` is `queued`, `running`, `complete`, `failed`, `cancelled` or `over_cap`. |
 | `GET /hunts/totals` | The counts of every hunt in a window: hunts, findings, threat findings and running hunts. It gives each count in total and per type. `since` and `until` set the window, as on `GET /hunts`. It has no row cap. The Hunts page header reads it. |
 | `GET /hunts/observations` | The observations on one entity, from every source, for the host page. |
@@ -1159,6 +1269,10 @@ carries `subjectType`, which reads `alert` or `hunt`.
   them into one record.
 - soc-ai computes related leads on read. A hunt objective holds the list as it stood when the hunt
   started, and it says so.
+- The "vs last run" comparison matches findings by title and hosts. A scheduled hunt reads the
+  titles of its last run, so a finding that it repeats reads as persisting.
+- With `lead_auto_hunt` off, a lead held on a finding with no verdict settles at the next start of
+  soc-ai. A re-run of the investigation alone does not settle it.
 - Nobody has validated the lead thresholds against a miss yet. The lead threshold (0.85) and the
   single-type threshold (1.5) come from arithmetic. The hub limit (8) comes from an attack range,
   and no derivation is on record. Read the lead quality report for a week before you move any of

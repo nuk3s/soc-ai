@@ -1472,6 +1472,7 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
                 lookback_hours=lookback_hours,
                 time_anchor=ctx.default_time_anchor,
                 include_synth=ctx.include_synth,
+                db_sessionmaker=ctx.db_sessionmaker,
             )
         except Exception as e:
             _LOGGER.warning("t_host_summary failed: %s", e)
@@ -1648,18 +1649,19 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
         which ones it looked in, so a `first-seen` answer can be read for what it
         is. Answers whether this rule is NOISY (fires constantly across many
         hosts — so its next firing is likely benign HERE and is weak evidence),
-        RARE / FIRST-SEEN (a firing is notable), or a BURST (every fire packed
-        into one short episode — that is not a background rate, and if the alert
-        you are triaging sits inside the burst, the burst may BE the incident).
+        RARE / FIRST-SEEN (a firing is notable), or a BURST: the fires clump into
+        a small part of the window and form no background rate. A burst can hold
+        one wave or several waves. `waves` lists them with their start, end and
+        fire count. A new wave starts after a gap of more than 30 minutes. If the
+        alert you are triaging sits inside a wave, that wave may BE the incident.
         Call this whenever the verdict leans on a rule label: before trusting the
         signature name, check whether that signature is a constant-firing
         nuisance on this grid. Read `summary` as the headline, not any single
         number. Returns
         total_fires, distinct src/dest hosts and source ports, first/last seen,
-        the observed span, active_days, is_burst, a noisiness bucket,
-        fires_per_day measured over the span actually observed — which is null
-        for a burst, because a per-day rate is meaningless for one episode. It
-        also returns fires_per_active_day, measured over the days the rule fired
+        the observed span, active_days, is_burst, a noisiness bucket, waves,
+        fires_per_day measured over the span actually observed, which is null
+        for a burst. It also returns fires_per_active_day, measured over the days the rule fired
         on, which is the larger number when the rule was quiet inside its span.
         READ-ONLY and zero-egress.
         """

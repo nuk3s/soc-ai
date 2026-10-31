@@ -164,6 +164,71 @@ def test_hunt_prompt_residue_fails_closed_before_the_model(
         )
 
 
+def test_hunt_earlier_block_residue_is_dropped_and_the_hunt_still_runs(
+    settings_kratos: Settings,
+) -> None:
+    """Negative control on the earlier-conclusions path (soc_ai.hunting.earlier).
+
+    The block carries stored, desanitized model text. Residue in it must not
+    reach the model, and it must not fail every later run closed either: the
+    runner drops the block before ``hunt_started`` and the hunt runs without it.
+    """
+    from pydantic_ai.models.test import TestModel
+    from soc_ai.agent.hunt import HuntReport
+    from soc_ai.api import hunt_runner
+    from soc_ai.hunting.earlier import EarlierConclusions
+    from soc_ai.so_client.elastic import EsSearchResult
+
+    settings_kratos.analyst_cloud_redaction = True
+    settings_kratos.analyst_redaction_fail_closed = True
+    block = EarlierConclusions(text=f'It wrote: "{_RESIDUE_ONLY}"', refs={})
+
+    assert asyncio.run(hunt_runner._vetted_earlier(_hunt_ctx(settings_kratos), block)) == (
+        None,
+        True,
+    )
+
+    captured: list[dict[str, Any]] = []
+    real_build = hunt_runner._build_hunt_run
+
+    async def _capture(ctx: Any, **kwargs: Any) -> Any:
+        captured.append(kwargs)
+        return await real_build(ctx, **kwargs)
+
+    async def _go() -> list[Any]:
+        events = []
+        with (
+            patch.object(hunt_runner, "_build_hunt_run", _capture),
+            patch.object(
+                hunt_runner,
+                "build_investigator_model",
+                return_value=TestModel(
+                    call_tools=["t_query_events_oql"],
+                    custom_output_args=HuntReport(narrative="Nothing found.", confidence=0.4),
+                ),
+            ),
+            patch(
+                "soc_ai.agent.toolset.query_events_oql",
+                AsyncMock(return_value=EsSearchResult(total=0, took_ms=1)),
+            ),
+        ):
+            async for ev in hunt_runner.run_hunt(
+                _hunt_ctx(settings_kratos), objective="hunt for new external beacons", earlier=block
+            ):
+                events.append(ev)
+        return events
+
+    events = asyncio.run(_go())
+    assert captured[0]["earlier"] is None
+    started = events[0]
+    assert started.kind == "hunt_started"
+    assert started.payload.get("earlier_dropped") == "residue"
+    assert "earlier" not in started.payload
+    kinds = [e.kind for e in events]
+    assert "hunt_report" in kinds
+    assert "error" not in kinds
+
+
 def test_hunt_prompt_sweep_does_not_block_the_oql_primer(
     settings_kratos: Settings,
 ) -> None:

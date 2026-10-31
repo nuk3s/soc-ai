@@ -14,6 +14,7 @@ keyword to decide which payload to return.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
 from typing import Any
@@ -658,8 +659,11 @@ class TestFallbackIsNotAnInheritedVerdict:
 
     def test_the_scheduler_reruns_its_own_fallback(self, at_settings: Settings) -> None:
         """The fallback sits on the SAME alert the sweep sees again. The direct
-        check already lets it through (blocks_rehunt); the pair check must too."""
-        _seed_investigation(
+        check already lets it through (blocks_rehunt); the pair check must too.
+
+        The fallback is 20 minutes old: the first retry of a failed alert waits
+        15 minutes (TestRetryBudget)."""
+        fallback = _seed_investigation(
             at_settings,
             rule_name="ET SCAN thing",
             alert_es_id="ev1",
@@ -667,6 +671,7 @@ class TestFallbackIsNotAnInheritedVerdict:
             dest_ip="10.0.0.1",
             fallback=True,
         )
+        _age_run(at_settings, fallback, minutes_ago=20)
         targets, skipped, acks = self._plan(at_settings)
         assert [t.alert_es_id for t in targets] == ["ev1"]
         assert skipped == 0
@@ -2920,10 +2925,12 @@ class TestStartConfigSweep:
             started_by: str,
             inherited_acks: Any = None,
             apply_rule_prior: bool = False,
+            stop_on_pause: bool = False,
         ) -> None:
             ran["targets"] = targets
             ran["started_by"] = started_by
             ran["apply_rule_prior"] = apply_rule_prior
+            ran["stop_on_pause"] = stop_on_pause
 
         with (
             patch("soc_ai.webui.autotriage.plan_targets", _plan),
@@ -2942,6 +2949,8 @@ class TestStartConfigSweep:
         assert ran["started_by"] == "auto-triage:scheduler"
         # The scheduler's sweep is the one path the rule prior serves.
         assert ran["apply_rule_prior"] is True
+        # The scheduler stops when the pause opens. A press does not.
+        assert ran["stop_on_pause"] is True
 
 
 class TestResolveRuleNames:
@@ -3932,3 +3941,773 @@ class TestASelectionDoesNotEraseWhatTheSweepLearned:
         targets, skipped = asyncio.run(at.plan_targets_for_ids(state, alert_ids=["", ""]))
         assert (targets, skipped) == ([], 0)
         assert at.get_status(state).grid_errors == ["severity critical"]
+
+
+def _seed_failed_run(
+    settings: Settings,
+    alert_es_id: str,
+    *,
+    minutes_ago: float,
+    kind: str = "error",
+    rule_name: str = "ET SCAN thing",
+) -> str:
+    """Seed one finished run of ``alert_es_id``, backdated relative to now.
+
+    ``kind`` is ``error``, ``fallback``, ``cancelled``, ``interrupted`` or
+    ``verdict`` (a real false positive). The endpoints are TEST-NET, so the run
+    never covers the 10.0.0.x pair of the fake events by inheritance.
+    """
+
+    async def _go() -> str:
+        engine = make_engine(settings)
+        await run_migrations(engine)
+        maker = make_sessionmaker(engine)
+        async with maker() as db:
+            inv = await inv_svc.create(
+                db,
+                alert_es_id=alert_es_id,
+                started_by="auto-triage:scheduler",
+                rule_name=rule_name,
+                src_ip="192.0.2.41",
+                dest_ip="192.0.2.1",
+            )
+            if kind == "fallback":
+                await inv_svc.finalize(
+                    db,
+                    inv.id,
+                    status="complete",
+                    verdict="needs_more_info",
+                    confidence=0.3,
+                    rationale="Synthesis failed.",
+                    report={
+                        "verdict": "needs_more_info",
+                        "confidence": 0.3,
+                        "resolution": {"provenance": PIPELINE_FALLBACK_PROVENANCE},
+                    },
+                )
+            elif kind == "verdict":
+                await inv_svc.finalize(
+                    db, inv.id, status="complete", verdict="false_positive", confidence=0.9
+                )
+            else:
+                await inv_svc.finalize(db, inv.id, status=kind)
+        await engine.dispose()
+        return inv.id
+
+    inv_id = asyncio.run(_go())
+    _age_run(settings, inv_id, minutes_ago=minutes_ago)
+    return inv_id
+
+
+def _age_run(settings: Settings, inv_id: str, *, minutes_ago: float) -> None:
+    """Move a run's created_at and finished_at to ``minutes_ago`` before now."""
+    from datetime import timedelta
+
+    from soc_ai.store.auth import utcnow
+    from soc_ai.store.models import Investigation
+
+    async def _go() -> None:
+        engine = make_engine(settings)
+        maker = make_sessionmaker(engine)
+        async with maker() as db:
+            row = await db.get(Investigation, inv_id)
+            assert row is not None
+            at = utcnow() - timedelta(minutes=minutes_ago)
+            row.created_at = at - timedelta(seconds=30)
+            row.finished_at = at
+            await db.commit()
+        await engine.dispose()
+
+    asyncio.run(_go())
+
+
+def _test_net_hit(es_id: str, src: str) -> dict[str, Any]:
+    """One ET SCAN thing event on a TEST-NET pair of its own."""
+    return {
+        "_id": es_id,
+        "_source": {
+            "@timestamp": "2026-06-12T06:41:00.000Z",
+            "source": {"ip": src, "port": 51515},
+            "destination": {"ip": "192.0.2.1", "port": 443},
+            "event": {"severity_label": "high"},
+            "host": {"name": "sensor1"},
+        },
+    }
+
+
+class TestRetryBudget:
+    """A failed alert waits before its next automatic run.
+
+    A failed run stays re-huntable (blocks_rehunt). On 2026-10-27 that let the
+    scheduler run two alerts 109 times each in 11 hours. The planner now reads
+    the failed runs of each alert and holds a failed alert back: 15 minutes,
+    then 30 minutes, then 6 hours past auto_triage_retry_limit.
+    """
+
+    @staticmethod
+    def _plan(
+        settings: Settings,
+        events_resp: dict[str, Any] = EVENTS_ES_RESPONSE,
+        state: Any = None,
+    ) -> tuple[Any, list[Any], int]:
+        from soc_ai.webui import autotriage as at
+
+        if state is None:
+            es = AsyncMock()
+            es.search.side_effect = _make_es_side_effect(events_resp=events_resp)
+            state = _FakeState(settings, es)
+        targets, skipped, _acks = asyncio.run(at.plan_targets(state, time_range="24h", oql=None))
+        return state, targets, skipped
+
+    @staticmethod
+    def _reasons(state: Any) -> dict[str, int]:
+        from soc_ai.webui import autotriage as at
+
+        return at.get_status(state).skipped_reasons
+
+    def test_a_fresh_fallback_waits_before_its_retry(self, at_settings: Settings) -> None:
+        _seed_failed_run(at_settings, "ev1", minutes_ago=0, kind="fallback")
+        state, targets, skipped = self._plan(at_settings)
+        assert targets == []
+        assert skipped == 1
+        assert self._reasons(state) == {"retry_wait": 1}
+
+    def test_an_alert_out_of_retries_is_skipped(self, at_settings: Settings) -> None:
+        for minutes in (240, 180, 120):
+            _seed_failed_run(at_settings, "ev1", minutes_ago=minutes, kind="fallback")
+        state, targets, skipped = self._plan(at_settings)
+        assert targets == []
+        assert skipped == 1
+        assert self._reasons(state) == {"retry_limit": 1}
+
+    def test_an_alert_at_the_limit_runs_again_after_six_hours(self, at_settings: Settings) -> None:
+        for minutes in (500, 420, 365):
+            _seed_failed_run(at_settings, "ev1", minutes_ago=minutes, kind="error")
+        state, targets, skipped = self._plan(at_settings)
+        assert [t.alert_es_id for t in targets] == ["ev1"]
+        assert skipped == 0
+        assert self._reasons(state) == {}
+
+    def test_a_real_verdict_resets_the_retry_count(self, at_settings: Settings) -> None:
+        for minutes in (190, 185, 180):
+            _seed_failed_run(at_settings, "ev1", minutes_ago=minutes, kind="fallback")
+        _seed_failed_run(at_settings, "ev1", minutes_ago=120, kind="verdict")
+        error = _seed_failed_run(at_settings, "ev1", minutes_ago=10, kind="error")
+        state, targets, _skipped = self._plan(at_settings)
+        assert targets == []
+        assert self._reasons(state) == {"retry_wait": 1}
+
+        _age_run(at_settings, error, minutes_ago=16)
+        state, targets, _skipped = self._plan(at_settings, state=state)
+        assert [t.alert_es_id for t in targets] == ["ev1"]
+        assert self._reasons(state) == {}
+
+    def test_cancelled_and_interrupted_runs_cost_no_retry(self, at_settings: Settings) -> None:
+        for _ in range(4):
+            _seed_failed_run(at_settings, "ev1", minutes_ago=60, kind="cancelled")
+        _seed_failed_run(at_settings, "ev1", minutes_ago=60, kind="interrupted")
+        state, targets, _skipped = self._plan(at_settings)
+        assert [t.alert_es_id for t in targets] == ["ev1"]
+        assert self._reasons(state) == {}
+
+    def test_a_pair_verdict_still_covers_a_failed_alert(self, at_settings: Settings) -> None:
+        _seed_investigation(
+            at_settings,
+            rule_name="ET SCAN thing",
+            alert_es_id="other-ev",
+            src_ip="10.0.0.41",
+            dest_ip="10.0.0.1",
+        )
+        for minutes in (30, 20, 10):
+            _seed_failed_run(at_settings, "ev1", minutes_ago=minutes, kind="fallback")
+        state, targets, skipped = self._plan(at_settings)
+        assert targets == []
+        assert skipped == 1
+        assert self._reasons(state) == {"inherited": 1}
+
+    def test_an_explicit_selection_runs_an_alert_out_of_retries(
+        self, at_settings: Settings
+    ) -> None:
+        from soc_ai.webui import autotriage as at
+
+        for minutes in (30, 20, 10):
+            _seed_failed_run(at_settings, "ev1", minutes_ago=minutes, kind="fallback")
+        es = AsyncMock()
+        es.search.side_effect = _make_es_side_effect()
+        state = _FakeState(at_settings, es)
+        targets, skipped = asyncio.run(at.plan_targets_for_ids(state, alert_ids=["ev1"]))
+        assert [t.alert_es_id for t in targets] == ["ev1"]
+        assert skipped == 0
+
+    def test_a_heal_gives_the_retries_back(self, at_settings: Settings) -> None:
+        from datetime import UTC, datetime, timedelta
+
+        from soc_ai.webui import autotriage as at
+
+        for minutes in (130, 125, 120):
+            _seed_failed_run(at_settings, "ev1", minutes_ago=minutes, kind="error")
+        es = AsyncMock()
+        es.search.side_effect = _make_es_side_effect()
+        state = _FakeState(at_settings, es)
+        _state, targets, _skipped = self._plan(at_settings, state=state)
+        assert targets == []
+
+        at.get_status(state).health.forgiven["ev1"] = datetime.now(UTC) - timedelta(minutes=1)
+        _state, targets, _skipped = self._plan(at_settings, state=state)
+        assert [t.alert_es_id for t in targets] == ["ev1"]
+        assert self._reasons(state) == {}
+
+    def test_the_probe_is_planned_first(self, at_settings: Settings) -> None:
+        from datetime import UTC, datetime, timedelta
+
+        from soc_ai.webui import autotriage as at
+
+        for minutes in (150, 140, 120):
+            _seed_failed_run(at_settings, "ev1", minutes_ago=minutes, kind="fallback")
+        events = _events_response(
+            [_test_net_hit("ev-new", "192.0.2.50"), EVENTS_ES_RESPONSE["hits"]["hits"][0]]
+        )
+        es = AsyncMock()
+        es.search.side_effect = _make_es_side_effect(events_resp=events)
+        state = _FakeState(at_settings, es)
+        health = at.get_status(state).health
+        t0 = datetime.now(UTC) - timedelta(minutes=120)
+        for i, alert in enumerate(["ev1", "o1", "o2", "o3", "o4"]):
+            health.record_failure(alert, "synth_first_round1", "ModelHTTPError", at=t0)
+            health.record_verdict(f"between{i}", at=t0)
+        assert health.newest_alarm() is not None
+
+        _state, targets, _skipped = self._plan(at_settings, state=state)
+        assert [t.alert_es_id for t in targets] == ["ev1", "ev-new"]
+        assert "retry_limit" not in self._reasons(state)
+
+        _state, targets, _skipped = self._plan(at_settings, state=state)
+        assert [t.alert_es_id for t in targets] == ["ev-new"]
+        assert self._reasons(state) == {"retry_limit": 1}
+
+    def test_a_fresh_alert_runs_before_a_retry(self, at_settings: Settings) -> None:
+        _seed_failed_run(at_settings, "ev-retry", minutes_ago=20, kind="error")
+        events = _events_response(
+            [_test_net_hit("ev-retry", "192.0.2.60"), _test_net_hit("ev-fresh", "192.0.2.61")]
+        )
+        _state, targets, skipped = self._plan(at_settings, events_resp=events)
+        assert [t.alert_es_id for t in targets] == ["ev-fresh", "ev-retry"]
+        assert skipped == 0
+
+
+# The 2026-10-27 failure: the gateway refused the schema, and the orchestrator
+# landed a pipeline fallback behind a typed error event.
+SYNTH_ERROR: dict[str, Any] = {
+    "phase": "synth_first_round1",
+    "round": 1,
+    "type": "ModelHTTPError",
+    "message": "The gateway refused the response schema.",
+}
+SYNTH_ERROR_SHAPE = ("synth_first_round1", "ModelHTTPError")
+FALLBACK_REPORT: dict[str, Any] = {
+    "verdict": "needs_more_info",
+    "confidence": 0.3,
+    "summary": "Synthesis failed.",
+    "resolution": {"provenance": PIPELINE_FALLBACK_PROVENANCE},
+}
+
+
+async def _fallback_investigate(
+    alert_id: str,
+    *,
+    ctx: Any,
+    focus_hint: str | None = None,
+    deep: bool = False,
+    allow_so_writes: bool = True,
+    focus_origin: str = "rerun",
+    subject: Any = None,
+) -> AsyncIterator[StepEvent]:
+    sid = "fallback-sid"
+    yield StepEvent(
+        kind="session_start", session_id=sid, sequence=1, payload={"alert_id": alert_id}
+    )
+    yield StepEvent(kind="error", session_id=sid, sequence=2, payload=dict(SYNTH_ERROR))
+    yield StepEvent(kind="triage_report", session_id=sid, sequence=3, payload=dict(FALLBACK_REPORT))
+    yield StepEvent(kind="done", session_id=sid, sequence=4, payload={})
+
+
+def _health_targets(n: int, prefix: str = "fail") -> list[Any]:
+    from soc_ai.webui.autotriage import Target
+
+    return [
+        Target(
+            alert_es_id=f"{prefix}{i}",
+            rule_name="ET HEALTH rule",
+            src_ip=f"192.0.2.{10 + i}",
+            dst_ip="192.0.2.1",
+        )
+        for i in range(n)
+    ]
+
+
+@contextlib.contextmanager
+def _worker_app(settings: Settings, fake_es: AsyncMock, investigate: Any) -> Iterator[Any]:
+    """A started app whose runs drain ``investigate``. Yields (app, client)."""
+    fake_auth = AsyncMock()
+    with (
+        patch("soc_ai.so_client.elastic.AsyncElasticsearch", return_value=fake_es),
+        patch("soc_ai.main.make_auth", return_value=fake_auth),
+        patch("soc_ai.main.get_settings", return_value=settings),
+        patch("soc_ai.api.runner.investigate", investigate),
+    ):
+        app = create_app()
+        with TestClient(app) as client:
+            yield app, client
+
+
+def _runs_of(settings: Settings, alert_es_id: str) -> list[tuple[Any, list[Any]]]:
+    """Every run of one alert with its events, oldest first."""
+    from soc_ai.store.models import Investigation
+    from sqlalchemy import select
+
+    async def _go() -> list[tuple[Any, list[Any]]]:
+        engine = make_engine(settings)
+        maker = make_sessionmaker(engine)
+        async with maker() as db:
+            ids = (
+                await db.scalars(
+                    select(Investigation.id)
+                    .where(Investigation.alert_es_id == alert_es_id)
+                    .order_by(Investigation.created_at, Investigation.id)
+                )
+            ).all()
+            out = []
+            for inv_id in ids:
+                found = await inv_svc.get_with_events(db, inv_id)
+                assert found is not None
+                out.append(found)
+        await engine.dispose()
+        return out
+
+    return asyncio.run(_go())
+
+
+class TestAutoInvestigateHealth:
+    """The worker, the scheduler, the status and the bell of the retry budget.
+
+    On 2026-10-27 the gateway refused the triage schema for 11 hours. The
+    scheduler ran two alerts 109 times each, and no surface named the fault.
+    """
+
+    def test_the_retry_limit_is_a_live_bounded_setting(self) -> None:
+        from soc_ai.store import config_overrides as cfg
+
+        spec = cfg.WHITELIST_BY_KEY["auto_triage_retry_limit"]
+        assert spec.hot is True
+        assert spec.type == "int"
+        assert spec.min_value == 0
+        assert spec.max_value == 10
+        assert spec.section == "Triage automation"
+        assert spec.day1 is False
+        assert Settings.model_fields["auto_triage_retry_limit"].default == 2
+        with pytest.raises(ValueError):
+            cfg.coerce("auto_triage_retry_limit", "11")
+        assert cfg.coerce("auto_triage_retry_limit", "0") == 0
+
+    def test_the_scheduler_stops_when_the_pause_opens(
+        self, at_settings: Settings, fake_es: AsyncMock
+    ) -> None:
+        from soc_ai.webui import autotriage as at
+
+        with _worker_app(at_settings, fake_es, _fallback_investigate) as (app, _client):
+            status = at.get_status(app.state)
+            status.reset(active=True, total=8, skipped=0)
+            asyncio.run(
+                asyncio.wait_for(
+                    at.run_auto_triage(
+                        app.state,
+                        targets=_health_targets(8),
+                        started_by="auto-triage:scheduler",
+                        stop_on_pause=True,
+                    ),
+                    timeout=30,
+                )
+            )
+            assert status.failed == 5
+            assert status.hunted == 0
+            assert status.active is False
+            assert status.health.is_paused()
+            assert status.health.status_fields()["alarm_error"] == (
+                "ModelHTTPError in synth_first_round1"
+            )
+        assert _count_investigations(at_settings) == 5
+
+    def test_a_press_runs_every_alert_during_a_pause(
+        self, at_settings: Settings, fake_es: AsyncMock
+    ) -> None:
+        from soc_ai.webui import autotriage as at
+
+        with _worker_app(at_settings, fake_es, _fallback_investigate) as (app, _client):
+            status = at.get_status(app.state)
+            status.reset(active=True, total=8, skipped=0)
+            asyncio.run(
+                asyncio.wait_for(
+                    at.run_auto_triage(
+                        app.state,
+                        targets=_health_targets(8),
+                        started_by="auto-triage:admin",
+                        requested_class="standard",
+                    ),
+                    timeout=30,
+                )
+            )
+            assert status.failed == 8
+            assert status.health.is_paused()
+            assert status.health.streak == 8
+        assert _count_investigations(at_settings) == 8
+
+    async def test_a_paused_scheduler_plans_nothing(self) -> None:
+        import types
+        from datetime import UTC, datetime, timedelta
+
+        from soc_ai.webui import autotriage as at
+
+        state = types.SimpleNamespace(
+            settings=types.SimpleNamespace(auto_triage_min_severity="high")
+        )
+        status = at.get_status(state)
+        now = datetime.now(UTC)
+        status.health.pause_since = now - timedelta(minutes=5)
+        status.health.paused_until = now + timedelta(minutes=10)
+        before = (now - timedelta(minutes=6)).isoformat()
+        status.finished_at = before
+
+        planned: list[bool] = []
+
+        async def _boom(*a: Any, **k: Any) -> Any:
+            # start_config_sweep swallows a planning error, so the flag is
+            # what proves the planner never ran.
+            planned.append(True)
+            raise AssertionError("plan_targets ran during the pause")
+
+        with patch("soc_ai.webui.autotriage.plan_targets", _boom):
+            assert await at.start_config_sweep(state, started_by="auto-triage:scheduler") == 0
+        assert planned == []
+        assert status.active is False
+        assert status.finished_at == before
+
+    def test_a_stray_cancel_fails_one_target_and_the_run_goes_on(
+        self, at_settings: Settings, fake_es: AsyncMock
+    ) -> None:
+        from soc_ai.webui import autotriage as at
+
+        async def _cancel_then_succeed(
+            alert_id: str,
+            *,
+            ctx: Any,
+            focus_hint: str | None = None,
+            deep: bool = False,
+            allow_so_writes: bool = True,
+            focus_origin: str = "rerun",
+            subject: Any = None,
+        ) -> AsyncIterator[StepEvent]:
+            if alert_id == "stray0":
+                yield StepEvent(
+                    kind="session_start", session_id="s", sequence=1, payload={"alert_id": alert_id}
+                )
+                raise asyncio.CancelledError
+            async for ev in _fake_investigate_success(alert_id, ctx=ctx):
+                yield ev
+
+        with _worker_app(at_settings, fake_es, _cancel_then_succeed) as (app, _client):
+            status = at.get_status(app.state)
+            status.reset(active=True, total=2, skipped=0)
+            asyncio.run(
+                asyncio.wait_for(
+                    at.run_auto_triage(
+                        app.state,
+                        targets=_health_targets(2, prefix="stray"),
+                        started_by="auto-triage:scheduler",
+                        stop_on_pause=True,
+                    ),
+                    timeout=30,
+                )
+            )
+            assert status.failed == 1
+            assert status.hunted == 1
+            assert status.active is False
+            assert status.health.failed_class["stray0"][0] == "timeout"
+            assert "stray1" not in status.health.failed_class
+            assert status.health.streak == 0
+        [(row, events)] = _runs_of(at_settings, "stray0")
+        assert row.status == "error"
+        phases = [e.payload.get("phase") for e in events if e.kind == "error"]
+        assert phases == ["run_cancelled"]
+
+    def test_a_shutdown_cancel_still_stops_the_worker(
+        self, at_settings: Settings, fake_es: AsyncMock
+    ) -> None:
+        from soc_ai.webui import autotriage as at
+
+        started = asyncio.Event()
+        ran: list[str] = []
+
+        async def _hang(
+            alert_id: str,
+            *,
+            ctx: Any,
+            focus_hint: str | None = None,
+            deep: bool = False,
+            allow_so_writes: bool = True,
+            focus_origin: str = "rerun",
+            subject: Any = None,
+        ) -> AsyncIterator[StepEvent]:
+            ran.append(alert_id)
+            yield StepEvent(
+                kind="session_start", session_id="s", sequence=1, payload={"alert_id": alert_id}
+            )
+            started.set()
+            await asyncio.sleep(3600)
+            yield StepEvent(kind="done", session_id="s", sequence=2, payload={})
+
+        with _worker_app(at_settings, fake_es, _hang) as (app, _client):
+            status = at.get_status(app.state)
+            status.reset(active=True, total=2, skipped=0)
+
+            async def _drive() -> asyncio.Task[None]:
+                task = asyncio.create_task(
+                    at.run_auto_triage(
+                        app.state,
+                        targets=_health_targets(2, prefix="shut"),
+                        started_by="auto-triage:scheduler",
+                        stop_on_pause=True,
+                    )
+                )
+                await asyncio.wait_for(started.wait(), timeout=10)
+                task.cancel()
+                # Bounded: a worker that swallows the cancel goes on to shut1
+                # and sleeps for an hour. The timeout cancels shut1, the last
+                # target, so the worker returns and the raises check fails at
+                # once. soc-ai has no pytest-timeout to stop a hang.
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, timeout=10)
+                return task
+
+            task = asyncio.run(_drive())
+            assert task.cancelled()
+            assert ran == ["shut0"]
+            assert status.active is False
+            assert status.health.streak == 0
+            assert status.failed == 0
+        assert len(_runs_of(at_settings, "shut1")) == 0
+
+    def test_a_rerun_verdict_ends_the_pause(
+        self, at_settings: Settings, fake_es: AsyncMock
+    ) -> None:
+        from datetime import UTC, datetime, timedelta
+
+        from soc_ai.agent.context import HuntSubject
+        from soc_ai.api.deps import ctx_from_state
+        from soc_ai.api.runner import run_recorded
+        from soc_ai.webui import autotriage as at
+
+        def _open_pause(health: Any) -> None:
+            now = datetime.now(UTC)
+            health.pause_since = now - timedelta(minutes=5)
+            health.paused_until = now + timedelta(minutes=10)
+            health.streak = 5
+
+        async def _drain(
+            state: Any, alert_id: str, started_by: str, subject: HuntSubject | None = None
+        ) -> None:
+            ctx = ctx_from_state(state)
+            async for _name, _data in run_recorded(
+                state, ctx=ctx, alert_id=alert_id, started_by=started_by, subject=subject
+            ):
+                pass
+
+        with _worker_app(at_settings, fake_es, _fallback_investigate) as (app, _client):
+            health = at.get_status(app.state).health
+            _open_pause(health)
+            asyncio.run(_drain(app.state, "rr-fallback", "admin"))
+            assert health.is_paused()
+
+        with _worker_app(at_settings, fake_es, _fake_investigate_success) as (app, _client):
+            health = at.get_status(app.state).health
+            _open_pause(health)
+            asyncio.run(_drain(app.state, "rr-backtest", inv_svc.BACKTEST_ACTOR))
+            assert health.is_paused()
+            # A hunt-subject run anchors on a document id of the hunt. Its
+            # verdict is about the hunt, so it ends no pause and heals no
+            # alert. The anchor id failed here, so a missing guard shows twice.
+            health.record_failure("rr-subject", *SYNTH_ERROR_SHAPE)
+            subject = HuntSubject(
+                hunt_id="01HUNTSUBJECT0000000000000", objective="read the example hosts"
+            )
+            asyncio.run(_drain(app.state, "rr-subject", "admin", subject))
+            assert health.is_paused()
+            assert "rr-subject" in health.failed_class
+            asyncio.run(_drain(app.state, "rr-verdict", "admin"))
+            assert not health.is_paused()
+            assert health.pause_since is None
+            assert health.streak == 0
+
+    def test_a_stream_crash_names_its_phase(
+        self, at_settings: Settings, fake_es: AsyncMock
+    ) -> None:
+        from soc_ai.webui import autotriage as at
+
+        async def _crash(
+            alert_id: str,
+            *,
+            ctx: Any,
+            focus_hint: str | None = None,
+            deep: bool = False,
+            allow_so_writes: bool = True,
+            focus_origin: str = "rerun",
+            subject: Any = None,
+        ) -> AsyncIterator[StepEvent]:
+            yield StepEvent(
+                kind="session_start", session_id="s", sequence=1, payload={"alert_id": alert_id}
+            )
+            raise RuntimeError("the stream broke")
+
+        with _worker_app(at_settings, fake_es, _crash) as (app, _client):
+            status = at.get_status(app.state)
+            status.reset(active=True, total=1, skipped=0)
+            asyncio.run(
+                at.run_auto_triage(
+                    app.state, targets=_health_targets(1, prefix="crash"), started_by="t"
+                )
+            )
+            assert status.failed == 1
+            assert status.health.failed_class["crash0"][0] == "RuntimeError in stream_crashed"
+
+    def test_the_status_names_the_pause_and_the_alarm(self, at_client: TestClient) -> None:
+        from datetime import UTC, datetime, timedelta
+
+        from soc_ai.webui import autotriage as at
+
+        data = at_client.get("/api/v1/auto-triage").json()
+        assert data["paused_until"] is None
+        assert data["pause_ends"] is None
+        assert data["failed_in_a_row"] == 0
+        assert data["alarm_error"] is None
+        assert data["alarm_failures"] == 0
+
+        health = at.get_status(at_client.app.state).health  # type: ignore[attr-defined]
+        at_time = datetime.now(UTC) - timedelta(minutes=1)
+        for i in range(5):
+            health.record_failure(f"st{i}", "synth_first_round1", "ModelHTTPError", at=at_time)
+        data = at_client.get("/api/v1/auto-triage").json()
+        assert data["paused_until"] == (at_time + timedelta(minutes=15)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        assert data["pause_ends"] == data["paused_until"]
+        assert data["failed_in_a_row"] == 5
+        assert data["alarm_error"] == "ModelHTTPError in synth_first_round1"
+        assert data["alarm_failures"] == 5
+
+    def test_a_band_press_names_the_alerts_that_wait(
+        self, at_client: TestClient, at_settings: Settings
+    ) -> None:
+        _seed_failed_run(at_settings, "ev1", minutes_ago=0, kind="fallback")
+        resp = at_client.post("/api/v1/auto-triage", json={})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["note"] == "1 failed alert waits to retry"
+        assert data["skipped_reasons"] == {"retry_wait": 1}
+
+    def test_the_bell_shows_one_row_for_the_alarm(self, at_client: TestClient) -> None:
+        from datetime import UTC, datetime, timedelta
+
+        from soc_ai.webui import autotriage as at
+        from soc_ai.webui import autotriage_health as ah
+
+        def _rows() -> list[dict[str, Any]]:
+            resp = at_client.get("/api/v1/notifications", params={"limit": 50})
+            assert resp.status_code == 200
+            return [r for r in resp.json() if r["id"].startswith("auto-triage-failing")]
+
+        error = "ModelHTTPError in synth_first_round1"
+        assert _rows() == []
+        health = at.get_status(at_client.app.state).health  # type: ignore[attr-defined]
+        t0 = datetime.now(UTC) - timedelta(minutes=30)
+        for i in range(5):
+            at_time = t0 + timedelta(minutes=i)
+            health.record_failure(f"b{i}", *SYNTH_ERROR_SHAPE, at=at_time)
+            health.record_verdict(f"ok{i}", at=at_time + timedelta(seconds=30))
+        [row] = _rows()
+        assert row["tone"] == "danger"
+        assert row["title"] == ah.alarm_text(5, error)
+        assert row["href"] == "/investigations?verdict=pipeline_error&errors=live"
+        first_id = row["id"]
+
+        health.record_failure("b5", *SYNTH_ERROR_SHAPE, at=t0 + timedelta(minutes=10))
+        [row] = _rows()
+        assert row["id"] == first_id
+        assert row["title"] == ah.alarm_text(6, error)
+
+        for i in range(5):
+            health.record_failure(f"b{i}", *SYNTH_ERROR_SHAPE, at=t0 + timedelta(minutes=11 + i))
+        # b5 and these five failed with no verdict between them: six in a row.
+        assert health.paused_until is not None
+        assert health.streak == 6
+        [row] = _rows()
+        assert row["id"] == first_id
+        assert row["title"] == ah.pause_text(health.paused_until, 6, error)
+
+        health.record_verdict("b2")
+        assert _rows() == []
+
+    def test_the_bell_shows_a_fallback_as_a_failed_triage(
+        self, at_client: TestClient, at_settings: Settings
+    ) -> None:
+        def _rows() -> dict[str, dict[str, Any]]:
+            resp = at_client.get("/api/v1/notifications", params={"limit": 50})
+            assert resp.status_code == 200
+            return {r["id"]: r for r in resp.json()}
+
+        fallback = _seed_failed_run(
+            at_settings, "ev-fb", minutes_ago=5, kind="fallback", rule_name="ET FALLBACK rule"
+        )
+        verdict = _seed_failed_run(
+            at_settings, "ev-fp", minutes_ago=4, kind="verdict", rule_name="ET VERDICT rule"
+        )
+        rows = _rows()
+        row = rows[f"inv-failed:{fallback}"]
+        assert row["tone"] == "danger"
+        assert row["title"] == "Triage failed, pipeline error: ET FALLBACK rule"
+        assert row["href"] == f"/investigation/{fallback}"
+        assert f"inv-done:{fallback}" not in rows
+        assert rows[f"inv-done:{verdict}"]["title"] == "Verdict false_positive: ET VERDICT rule"
+
+        resp = at_client.post(f"/api/v1/investigations/{fallback}/dismiss-error")
+        assert resp.status_code == 200
+        rows = _rows()
+        assert f"inv-failed:{fallback}" not in rows
+        assert f"inv-done:{fallback}" not in rows
+        assert f"inv-done:{verdict}" in rows
+
+    def test_dismissed_fallbacks_leave_room_for_an_older_verdict(
+        self, at_client: TestClient, at_settings: Settings
+    ) -> None:
+        # The completed-runs query has a cap of 20 at the default limit. The
+        # dismissed fallbacks are newer than the verdict, so a Python filter
+        # after the LIMIT gives back a page with no row at all.
+        verdict = _seed_failed_run(
+            at_settings, "ev-fp", minutes_ago=30, kind="verdict", rule_name="ET VERDICT rule"
+        )
+        fallbacks = [
+            _seed_failed_run(
+                at_settings,
+                f"ev-fb{i}",
+                minutes_ago=1 + i,
+                kind="fallback",
+                rule_name="ET FALLBACK rule",
+            )
+            for i in range(21)
+        ]
+        for fb in fallbacks:
+            resp = at_client.post(f"/api/v1/investigations/{fb}/dismiss-error")
+            assert resp.status_code == 200
+        resp = at_client.get("/api/v1/notifications")
+        assert resp.status_code == 200
+        rows = {r["id"]: r for r in resp.json()}
+        assert rows[f"inv-done:{verdict}"]["title"] == "Verdict false_positive: ET VERDICT rule"
+        assert not [fb for fb in fallbacks if f"inv-failed:{fb}" in rows]

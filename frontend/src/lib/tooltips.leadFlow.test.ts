@@ -62,8 +62,12 @@ describe('a hunt is the subject of an investigation', () => {
     expect(TIP.detectionKindTitle('lead')).toBe(
       "An investigation that started from a lead. Its subject is the lead's hunt.",
     );
+    // Change E. A finding run judges one finding, and a lead run or an older
+    // finding run judges the whole hunt. The list row cannot tell them apart,
+    // so the sentence is true for both.
     expect(TIP.detectionKindTitle('hunt')).toBe(
-      "An investigation that started from a hunt. Its subject is the hunt's findings.",
+      'An investigation that started from a hunt. Its subject is one finding of the hunt or ' +
+        'the whole hunt.',
     );
   });
 
@@ -83,7 +87,7 @@ describe('a hunt is the subject of an investigation', () => {
 
   it('states what the subject of a hunt investigation is', () => {
     expect(TIP.CHIP_SUBJECT_HUNT).toBe(
-      'An investigation of a hunt. Its subject is every finding of the hunt.',
+      'An investigation of a hunt. Its subject is one finding of the hunt or the whole hunt.',
     );
     expect(TIP.SUBJECT_OBJECTIVE).toBe(
       'The objective the hunt ran with. This investigation answers it.',
@@ -95,6 +99,16 @@ describe('a hunt is the subject of an investigation', () => {
     expect(TIP.SUBJECT_HUNT_LINK).toBe('Open the hunt this investigation read.');
     expect(TIP.SUBJECT_LEAD).toBe(
       'The lead this hunt started from. Open it to read its observations.',
+    );
+    // Change E. A new finding run judges one finding, and the hunt is context.
+    expect(TIP.SUBJECT_FINDING).toBe(
+      'The finding this investigation judges. The rest of the hunt is context.',
+    );
+    expect(TIP.SUBJECT_HUNT_CONTEXT).toBe(
+      'The hunt this finding came from. The investigation read it as context.',
+    );
+    expect(TIP.SUBJECT_OBJECTIVE_CONTEXT).toBe(
+      'The objective the hunt ran with. It is context for the finding.',
     );
   });
 });

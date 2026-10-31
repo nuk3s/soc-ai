@@ -445,3 +445,57 @@ async def test_create_records_the_starter_and_the_lead(settings_kratos: Settings
         default = await hunts_store.create(db, objective="p", started_by="analyst")
     assert hunt.starter == "lead" and hunt.lead_id == 12
     assert default.starter == "analyst" and default.lead_id is None
+
+
+async def test_earlier_runs_takes_the_newest_eligible_runs_of_the_objective(
+    settings_kratos: Settings,
+) -> None:
+    """The scheduled-hunt carry reads the last complete runs of one objective.
+
+    It skips an error run, a partial run and a synth-eval run, and it matches
+    the objective by its normalized hash. The bound is strictly earlier.
+    """
+    from datetime import UTC
+
+    engine, maker = await _db(settings_kratos)
+    now = datetime.now(UTC).replace(tzinfo=None)
+
+    async def run(
+        at: datetime,
+        *,
+        status: str = "complete",
+        objective: str = "Nightly beacon sweep",
+        partial: bool = False,
+        synth: bool = False,
+    ) -> Hunt:
+        async with maker() as db:
+            hunt = await hunt_svc.create(
+                db, objective=objective, started_by="scheduler", is_synth_eval=synth
+            )
+            await hunt_svc.finalize(db, hunt.id, status=status, report=REPORT)
+            await hunt_svc.append_events(
+                db,
+                hunt.id,
+                [{"sequence": 3, "kind": "done", "payload": {"partial": partial}}],
+            )
+            row = await db.get(Hunt, hunt.id)
+            assert row is not None
+            row.created_at = at
+            await db.commit()
+            return row
+
+    a = await run(now - timedelta(days=3))
+    await run(now - timedelta(days=2), status="error")
+    await run(now - timedelta(hours=30), partial=True)
+    b = await run(now - timedelta(days=1))
+    await run(now - timedelta(hours=1), synth=True)
+    await run(now - timedelta(hours=2), objective="Another sweep")
+
+    async with maker() as db:
+        got = await hunt_svc.earlier_runs(db, objective="  Nightly  Beacon Sweep ", before=now)
+        assert [h.id for h in got] == [b.id, a.id]
+        assert (
+            await hunt_svc.earlier_runs(db, objective="nightly beacon sweep", before=a.created_at)
+            == []
+        )
+    await engine.dispose()

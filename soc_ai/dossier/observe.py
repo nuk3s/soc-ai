@@ -166,6 +166,8 @@ _ENVELOPE: tuple[str, ...] = (
     "observer.name",
     *fields.HOST_OWN_ADDRESSES,
     *fields.HOST_MAC,
+    # The shipper test places the local end of an endpoint flow from these.
+    *fields.LOCAL_END_FIELDS,
 )
 
 # (record key, ECS-first candidate list) per targeted search. The record keys

@@ -96,10 +96,18 @@ Robustness contract (mirrors ``host_summary`` and the other read tools):
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from soc_ai.config import Settings
+from soc_ai.event_time import (
+    WAVE_GAP_MINUTES,
+    WAVE_GAP_SECONDS,
+    Point,
+    WaveSpan,
+    as_utc,
+    group_waves,
+)
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.tools import _burstiness as burst
 from soc_ai.tools._provenance import (
@@ -174,6 +182,17 @@ _NOISY_MIN_HOSTS = 5
 # aggs) against the same live SO grid production hunting depends on. 365d is
 # ample for a base-rate signal and mirrors the sibling read tools' ceilings.
 _MAX_LOOKBACK_DAYS = 365
+
+# Waves (change D). A burst whose first and last fire are more than one wave
+# gap apart can hold several waves, and the day histogram cannot see them. The
+# tool then reads the fire minutes in one more size-0 query and groups them by
+# the shared wave gap. The query is sent only when its minute buckets stay at
+# or under this bound: min(fires, active days x 1440).
+MAX_WAVE_BUCKETS = 5000
+# The most waves the result lists. ``wave_count`` keeps the full count.
+MAX_WAVES_RETURNED = 20
+# The most waves the summary sentence names.
+MAX_WAVES_IN_SUMMARY = 6
 
 
 def _window_filter(lookback_days: int, anchor: datetime | None) -> dict[str, Any]:
@@ -424,8 +443,11 @@ def _empty_result(
         " every dataset that carries detections (Suricata, Sigma, Zeek notices,"
         " endpoint alerts):"
         " is it noisy (fires constantly -> a firing is weak evidence here),"
-        " rare/first-seen (a firing is notable), or a burst (all its fires sit in"
-        " one short episode, so it has no per-day rate)? Returns total_fires,"
+        " rare/first-seen (a firing is notable), or a burst? A burst clumps into a"
+        " small part of the window and has no per-day rate. It can hold one wave or"
+        " several waves. When the span is longer than"
+        f" {WAVE_GAP_MINUTES} minutes, waves lists each wave with its start, its end"
+        " and its fire count. Returns total_fires,"
         " distinct src/dest hosts and source ports, first/last seen, the observed"
         " span, active_days, is_burst, fires_per_day over the observed span (null"
         " for a burst), and fires_per_active_day over the days it actually fired."
@@ -445,8 +467,8 @@ async def rule_prevalence(
 
     Answers: is this rule *noisy* (fires constantly across many hosts → its next
     firing is likely benign HERE and weak evidence), *rare / first-seen* (a firing
-    is notable), or a *burst* (every fire inside one short episode, which is not a
-    rate at all and often IS the incident)? This is the base-rate context the
+    is notable), or a *burst* (the fires clump into a small part of the window, in
+    one wave or several, and often ARE the incident)? This is the base-rate context the
     alert itself never carries — weigh it BEFORE trusting a rule label as a
     verdict driver, and read ``summary``, not a single number, as the headline.
 
@@ -495,7 +517,9 @@ async def rule_prevalence(
         / ``provenance`` (the population every count above was drawn from)
         / ``noisiness``
         (``noisy`` | ``occasional`` | ``rare`` | ``burst`` | ``first-seen``) /
-        ``summary``. On no data: a clean ``observed: False``,
+        ``summary`` / ``waves`` (up to 20 ``{start, end, fires}``, None when
+        the fire minutes were not read) / ``wave_count``. On no data: a clean
+        ``observed: False``,
         ``noisiness: 'first-seen'`` result (absence is a real answer) carrying
         ``imported_fires`` — how many firings the live scope held back, so a
         first-seen earned by hiding an import cannot pass for a quiet rule.
@@ -607,6 +631,15 @@ async def rule_prevalence(
     )
     is_burst = shape.is_burst
 
+    # The waves of a burst longer than one wave gap (change D). The first and
+    # the last fire do not show the gaps between them: a prod rule fired 10
+    # times in three waves on one day and read as "one 19.7-hour burst".
+    spans: list[WaveSpan] | None = None
+    if is_burst and span_seconds is not None and span_seconds > WAVE_GAP_SECONDS:
+        buckets = total_fires if not active_days else min(total_fires, active_days * 1440)
+        if buckets <= MAX_WAVE_BUCKETS:
+            spans = await _fire_waves(elastic, index, query, rule_name)
+
     # The lookback-normalised average. Kept as a FLOOR on the noisy/occasional
     # buckets and never reported: this is precisely the number that fabricated
     # "51.033/day" out of a 59-second burst.
@@ -632,8 +665,14 @@ async def rule_prevalence(
     # rate was carrying: 335 fires on 4 days of 25.4 came out as 0.01 a minute.
     # The day histogram cannot see how long each episode lasted, so nothing is
     # offered in its place and fires_per_active_day carries the magnitude.
+    # A span longer than one wave gap is the burst only when one wave covers it.
     burst_fires_per_minute: float | None = None
-    if is_burst and span_seconds and shape.fires_fill_span:
+    if (
+        is_burst
+        and span_seconds
+        and shape.fires_fill_span
+        and (span_seconds <= WAVE_GAP_SECONDS or (spans is not None and len(spans) == 1))
+    ):
         burst_fires_per_minute = round(total_fires / (span_seconds / 60.0), 2)
 
     noisiness = _classify_noisiness(
@@ -665,6 +704,7 @@ async def rule_prevalence(
         fires_by_dataset=fires_by_dataset,
         noisiness=noisiness,
         provenance=provenance,
+        spans=spans,
     )
 
     return {
@@ -695,7 +735,124 @@ async def rule_prevalence(
         "provenance": provenance,
         "noisiness": noisiness,
         "summary": summary,
+        # The waves of a burst longer than one wave gap: up to 20 entries of
+        # {start, end, fires}. None when the fire minutes were not read.
+        "waves": (
+            None
+            if spans is None
+            else [
+                {"start": _iso_z(w.start), "end": _iso_z(w.end), "fires": w.count}
+                for w in spans[:MAX_WAVES_RETURNED]
+            ]
+        ),
+        "wave_count": None if spans is None else len(spans),
     }
+
+
+def _iso_z(at: datetime) -> str:
+    return at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _bucket_time(agg: Any) -> datetime | None:
+    """A min/max sub-aggregation of one fire-minute bucket, as UTC."""
+    if not isinstance(agg, dict):
+        return None
+    at = as_utc(agg.get("value_as_string"))
+    if at is not None:
+        return at
+    value = agg.get("value")
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        try:
+            return datetime.fromtimestamp(float(value) / 1000.0, tz=UTC)
+        except (OverflowError, OSError, ValueError):
+            return None
+    return None
+
+
+async def _fire_waves(
+    elastic: ElasticClient, index: str, query: dict[str, Any], rule_name: str
+) -> list[WaveSpan] | None:
+    """Read the fire minutes of a burst and group them into waves.
+
+    One size-0 query over the same match as the base-rate query: a 1-minute
+    date histogram with the first and the last fire of each minute. None when
+    the query fails or returns no usable bucket. Never raises.
+    """
+    aggs: dict[str, Any] = {
+        "fire_minutes": {
+            "date_histogram": {
+                "field": "@timestamp",
+                "fixed_interval": "1m",
+                "min_doc_count": 1,
+            },
+            "aggs": {
+                "first": {"min": {"field": "@timestamp"}},
+                "last": {"max": {"field": "@timestamp"}},
+            },
+        }
+    }
+    try:
+        result = await elastic.search(index, query, size=0, aggs=aggs)
+        buckets = ((result.aggregations or {}).get("fire_minutes") or {}).get("buckets")
+    except Exception as e:
+        _LOGGER.warning("rule_prevalence could not read the fire minutes of %r: %s", rule_name, e)
+        return None
+    if not isinstance(buckets, list):
+        return None
+    points: list[Point] = []
+    for i, bucket in enumerate(buckets):
+        if not isinstance(bucket, dict):
+            continue
+        count = bucket.get("doc_count")
+        if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+            continue
+        start = _bucket_time(bucket.get("first")) or as_utc(bucket.get("key_as_string"))
+        if start is None:
+            continue
+        end = _bucket_time(bucket.get("last")) or start
+        points.append(Point(key=f"{i:06d}", start=start, end=end, count=count))
+    return group_waves(points) or None
+
+
+def _clock(at: datetime) -> str:
+    return at.astimezone(UTC).strftime("%H:%M:%S")
+
+
+def _one_day_wave(n: int, w: WaveSpan) -> str:
+    """'Wave 1: 01:11:56 to 01:18:09 UTC, 4 fires.' The day is in the sentence."""
+    fires = burst.plural(w.count, "fire")
+    if _clock(w.start) == _clock(w.end):
+        return f"Wave {n}: {_clock(w.start)} UTC, {fires}."
+    return f"Wave {n}: {_clock(w.start)} to {_clock(w.end)} UTC, {fires}."
+
+
+def _dated_wave(n: int, w: WaveSpan) -> str:
+    """'Wave 1: 2026-10-24 01:11:56 to 01:18:09 UTC, 4 fires.'"""
+    fires = burst.plural(w.count, "fire")
+    start = w.start.astimezone(UTC)
+    end = w.end.astimezone(UTC)
+    head = f"{start:%Y-%m-%d} {_clock(start)}"
+    if _clock(start) == _clock(end) and start.date() == end.date():
+        return f"Wave {n}: {head} UTC, {fires}."
+    tail = _clock(end) if start.date() == end.date() else f"{end:%Y-%m-%d} {_clock(end)}"
+    return f"Wave {n}: {head} to {tail} UTC, {fires}."
+
+
+def _wave_list(spans: list[WaveSpan], *, dated: bool) -> str:
+    """The first waves, one sentence each, and the count of the rest.
+
+    The later-waves sentence counts only the waves that the waves field holds,
+    and says when the field stops before the last wave.
+    """
+    shown = spans[:MAX_WAVES_IN_SUMMARY]
+    words = [(_dated_wave if dated else _one_day_wave)(i, w) for i, w in enumerate(shown, 1)]
+    listed = min(len(spans), MAX_WAVES_RETURNED) - len(shown)
+    if listed > 0:
+        verb = "is" if listed == 1 else "are"
+        words.append(f"{burst.plural(listed, 'later wave')} {verb} in the waves field.")
+    if len(spans) > MAX_WAVES_RETURNED:
+        words.append(f"The waves field lists the first {MAX_WAVES_RETURNED} of {len(spans)} waves.")
+    return " ".join(words)
 
 
 def _summarize(
@@ -716,6 +873,7 @@ def _summarize(
     fires_by_dataset: dict[str, int],
     noisiness: str,
     provenance: Provenance,
+    spans: list[WaveSpan] | None = None,
 ) -> str:
     """The one line the model reads. It says what was actually seen.
 
@@ -757,11 +915,23 @@ def _summarize(
         if active_days is not None and active_days <= 1:
             day = (first_seen or "")[:10]
             on_day = f" on {day}" if day else ""
-            return (
-                f"'{rule_name}' fired {total_fires}x in {span}{on_day} - one burst, "
-                f"{active} of the {lookback_days}d window, from {spread}{source}, and nothing "
-                f"before or after it. That is a single episode, not a background rate, "
-                f"so no per-day rate is reported."
+            if span_seconds <= WAVE_GAP_SECONDS:
+                return (
+                    f"'{rule_name}' fired {total_fires}x in {span}{on_day} - one burst, "
+                    f"{active} of the {lookback_days}d window, from {spread}{source}, and "
+                    f"nothing before or after it. That is a single episode, not a background "
+                    f"rate, so no per-day rate is reported."
+                )
+            return _one_day_waves_sentence(
+                rule_name=rule_name,
+                total_fires=total_fires,
+                span=span,
+                on_day=on_day,
+                active=active,
+                lookback_days=lookback_days,
+                spread=spread,
+                source=source,
+                spans=spans,
             )
         clumped = f" clumped into {active}" if active else ""
         # The span here is mostly the silence between episodes, so it is the
@@ -772,11 +942,16 @@ def _summarize(
             if fires_per_active_day is None
             else f", about {fires_per_active_day}/day on the days it fired"
         )
+        waves = ""
+        if spans:
+            count = "one wave" if len(spans) == 1 else f"{len(spans)} waves"
+            waves = f" The fires form {count}. {_wave_list(spans, dated=True)}"
         return (
             f"'{rule_name}' fired {total_fires}x in the last {lookback_days}d,{clumped} "
             f"spanning {span} ({first_seen} to {last_seen}), from {spread}{source}{on_days}. "
             f"bursty, not a background rate: no per-day rate is reported, and most of that "
             f"span is silence rather than firing, so no per-minute burst rate either."
+            f"{waves}"
         )
 
     if total_fires == 1:
@@ -809,4 +984,43 @@ def _summarize(
         f"'{rule_name}' fired {total_fires}x{span_clause}{active_clause} in the last "
         f"{lookback_days}d - {rate_clause} - from {spread}{source} - {noisiness}"
         f"{spread_note}"
+    )
+
+
+def _one_day_waves_sentence(
+    *,
+    rule_name: str,
+    total_fires: int,
+    span: str,
+    on_day: str,
+    active: str | None,
+    lookback_days: int,
+    spread: str,
+    source: str,
+    spans: list[WaveSpan] | None,
+) -> str:
+    """A one-day burst longer than one wave gap, in its waves (change D).
+
+    The first and the last fire alone cannot tell one wave from several, so
+    with no fire times the sentence says so and claims no single episode.
+    """
+    on_active = f", on {active} of the {lookback_days}d window" if active else ""
+    no_rate = "The fires form no background rate, so no per-day rate is reported."
+    if not spans:
+        return (
+            f"'{rule_name}' fired {total_fires}x within {span}{on_day}{on_active}, from "
+            f"{spread}{source}. Nothing fired before or after that span. {no_rate} This tool "
+            f"has no fire times for this span, so it cannot tell one wave from several waves."
+        )
+    if len(spans) == 1:
+        w = spans[0]
+        return (
+            f"'{rule_name}' fired {total_fires}x in one wave from {_clock(w.start)} to "
+            f"{_clock(w.end)} UTC{on_day}{on_active}, from {spread}{source}. Nothing fired "
+            f"before or after it. {no_rate}"
+        )
+    return (
+        f"'{rule_name}' fired {total_fires}x in {len(spans)} waves{on_day}{on_active}, from "
+        f"{spread}{source}. {_wave_list(spans, dated=False)} Nothing fired before the first "
+        f"wave or after the last wave. {no_rate}"
     )

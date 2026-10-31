@@ -8,6 +8,7 @@
 
 import { huntOutcome } from './labels';
 import { CLOSE_RULE_CLAUSE, isSystemActor } from './leadDecisions';
+import { utcStamp, utcWindow } from './timeRange';
 import { VERDICT } from './tokens';
 import type { Verdict } from './types';
 
@@ -115,27 +116,9 @@ export function withStop(text: string): string {
 // timeline states every time in UTC and says so.
 // ---------------------------------------------------------------------------
 
-/** A time on the timeline: "2026-10-05 04:12 UTC". */
-export function utcStamp(iso: string | null | undefined): string {
-  if (!iso) return 'no time on record';
-  const at = new Date(iso);
-  if (Number.isNaN(at.getTime())) return iso;
-  return `${at.toISOString().slice(0, 16).replace('T', ' ')} UTC`;
-}
-
-/** An event window: "2026-10-05 04:00 to 05:00 UTC", or with both dates when
- *  the window crosses midnight. */
-export function utcWindow(start: string, end: string): string {
-  const a = new Date(start);
-  const b = new Date(end);
-  if (Number.isNaN(a.getTime()) || Number.isNaN(b.getTime())) return `${start} to ${end}`;
-  const [aDay, aTime] = a.toISOString().slice(0, 16).split('T');
-  const [bDay, bTime] = b.toISOString().slice(0, 16).split('T');
-  if (a.getTime() === b.getTime()) return `${aDay} ${aTime} UTC`;
-  return aDay === bDay
-    ? `${aDay} ${aTime} to ${bTime} UTC`
-    : `${aDay} ${aTime} to ${bDay} ${bTime} UTC`;
-}
+// The two UTC helpers live in the one time formatter (timeRange.ts). They are
+// re-exported here, so the lead surfaces keep their imports.
+export { utcStamp, utcWindow } from './timeRange';
 
 /** The facts of an observation that date it. */
 export interface DatedObservation {

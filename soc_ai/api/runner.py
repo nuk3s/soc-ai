@@ -29,6 +29,7 @@ from soc_ai.agent.prompts import FocusOrigin
 from soc_ai.api.recorder import InvestigationRecorder
 from soc_ai.run_meter import start_search_meter
 from soc_ai.store import investigations as inv_svc
+from soc_ai.triage_models import is_pipeline_fallback
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -163,6 +164,13 @@ async def recorded_run(
                     },
                 )
         await recorder.finish("complete")
+        _note_verdict(
+            state,
+            alert_id=alert_id,
+            report=recorder._report,
+            started_by=started_by,
+            subject=subject,
+        )
         # E2.4 notification trigger — a completed investigation with a
         # high-confidence true-positive verdict pings on-call. THIN + fail-soft:
         # build a NotifyEvent from the recorder's captured report and fire it
@@ -250,7 +258,10 @@ async def recorded_run(
             }
         )
         await recorder.finish("error")
-        yield "error", {"message": str(exc), "type": type(exc).__name__}
+        yield (
+            "error",
+            {"message": str(exc), "type": type(exc).__name__, "phase": "stream_crashed"},
+        )
     finally:
         # no-op if already finished; lands rows abandoned by client disconnect.
         # Shielded for the same reason as the cancel branch above: the finally runs
@@ -336,6 +347,36 @@ async def run_recorded(
         subject=subject.as_record() if subject is not None else None,
     ):
         yield name, data
+
+
+def _note_verdict(
+    state: Any,
+    *,
+    alert_id: str,
+    report: Any,
+    started_by: str,
+    subject: dict[str, Any] | None,
+) -> None:
+    """Tell the Auto-Investigate health state that a run reached a verdict.
+
+    A Re-run or a chat-started run of an alert also ends the pause, and it can
+    close the alarm of the error the alert failed with
+    (soc_ai.webui.autotriage_health). A hunt subject, a backtest replay and a
+    pipeline fallback say nothing about the alert's own triage. Fail-soft: a
+    health update must never break the finalized investigation.
+    """
+    try:
+        if subject is not None or inv_svc.is_backtest_actor(started_by):
+            return
+        if not isinstance(report, dict) or is_pipeline_fallback(report):
+            return
+        if not report.get("verdict"):
+            return
+        from soc_ai.webui import autotriage  # noqa: PLC0415 - the worker imports this module
+
+        autotriage.get_status(state).health.record_verdict(alert_id)
+    except Exception:
+        _LOGGER.debug("auto-triage health: the verdict note failed", exc_info=True)
 
 
 async def _maybe_notify_investigation(state: Any, recorder: InvestigationRecorder) -> None:

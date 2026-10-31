@@ -262,6 +262,12 @@ the `oracle_adjudication` row records the answer as an opinion with
 fires on that run. A citation resolves only by membership in the retrieved ids.
 A substring of the payload text does not count.
 
+The host history gate does not run on an Oracle verdict. That gate changes a
+local true positive that rests only on the alert history of the host. An Oracle
+true positive that changes the local verdict must cite evidence beyond the
+alert, as the rule above says. When the gate changed the local verdict, the
+local summary that the Oracle reads starts with that change.
+
 A failed adjudication writes an `oracle_adjudication_failed` row with the HTTP
 status, the error class and the gateway's message. The message is
 secret-scrubbed. The classes are `quota`, `5xx`, `4xx`, `timeout`, `transport`,

@@ -3,7 +3,18 @@
 // skew can never exclude a just-created hunt), while a custom range sends both
 // edges. Bounds are inclusive [from, to], matching inRange.
 import { describe, expect, it } from 'vitest';
-import { absTime, absoluteTime, ago, agoFromLabel, formatDuration, rangeToSinceUntil, timeLabel } from './timeRange';
+import * as leadWords from './leadWords';
+import {
+  absTime,
+  absoluteTime,
+  ago,
+  agoFromLabel,
+  formatDuration,
+  rangeToSinceUntil,
+  timeLabel,
+  utcStamp,
+  utcWindow,
+} from './timeRange';
 
 describe('absTime', () => {
   const at = '2026-10-02T12:10:28Z';
@@ -177,5 +188,35 @@ describe('rangeToSinceUntil', () => {
     expect(rangeToSinceUntil('custom', { from: '2026-07-01T09:30', to: '' }, now)).toEqual({
       since: '2026-07-06T12:00:00.000Z',
     });
+  });
+});
+
+describe('utcStamp and utcWindow', () => {
+  it('prints seconds in UTC when it is asked to', () => {
+    expect(utcStamp('2026-10-24T01:11:56.000Z', { seconds: true })).toBe('2026-10-24 01:11:56 UTC');
+    // The same instant written with an offset reads the same UTC time.
+    expect(utcStamp('2026-10-24T03:11:56+02:00', { seconds: true })).toBe('2026-10-24 01:11:56 UTC');
+  });
+
+  it('keeps minutes by default', () => {
+    expect(utcStamp('2026-10-24T01:11:56.000Z')).toBe('2026-10-24 01:11 UTC');
+    expect(utcStamp(null)).toBe('no time on record');
+  });
+
+  it('prints a window with seconds, and both dates across midnight', () => {
+    expect(utcWindow('2026-10-24T01:11:56Z', '2026-10-24T01:18:09Z', { seconds: true })).toBe(
+      '2026-10-24 01:11:56 to 01:18:09 UTC',
+    );
+    expect(utcWindow('2026-10-24T23:50:00Z', '2026-10-25T00:10:00Z')).toBe(
+      '2026-10-24 23:50 to 2026-10-25 00:10 UTC',
+    );
+    expect(utcWindow('2026-10-24T20:56:47Z', '2026-10-24T20:56:47Z', { seconds: true })).toBe(
+      '2026-10-24 20:56:47 UTC',
+    );
+  });
+
+  it('is the same function the lead words export', () => {
+    expect(leadWords.utcStamp).toBe(utcStamp);
+    expect(leadWords.utcWindow).toBe(utcWindow);
   });
 });

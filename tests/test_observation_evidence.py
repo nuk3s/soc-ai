@@ -227,3 +227,42 @@ def test_a_row_with_no_statistic_states_none() -> None:
     assert "Query:" not in block
     assert "Run the query" not in block
     assert "document ids doc-1" in block
+
+
+def test_the_hunt_reads_each_tool_by_its_registered_name(settings_kratos: Settings) -> None:
+    """The evidence block and the earlier-conclusion block tell the hunt which
+    tool to call. The hunt agent registers ``t_get_event_raw``. A block that
+    names ``get_event_raw`` names a tool the model cannot call."""
+    import re
+    from unittest.mock import AsyncMock
+
+    from pydantic_ai.models.test import TestModel
+    from soc_ai.agent.context import InvestigationContext
+    from soc_ai.agent.hunt import build_hunt_agent
+    from soc_ai.hunting.earlier import CLAIMS_RULE
+
+    agent = build_hunt_agent(
+        TestModel(call_tools=[]),
+        InvestigationContext(settings=settings_kratos, auth=AsyncMock(), elastic=AsyncMock()),
+        system_prompt="hunt",
+    )
+    registered = set(agent._function_toolset.tools.keys())  # type: ignore[attr-defined]
+    now = datetime.now(UTC)
+    query = rerun_query("served_ports", _HOST, "4444", start=now - timedelta(hours=4), end=now)
+    block = evidence_block_for(
+        [
+            _row(
+                document_ids=["doc-1", "doc-2"],
+                rerun_query=query,
+                born_at=(now - timedelta(hours=1)).replace(tzinfo=None),
+            )
+        ],
+        now=now,
+    )
+    assert "t_get_event_raw" in registered
+    for name, text in (("evidence block", block), ("earlier claims", "\n".join(CLAIMS_RULE))):
+        words = set(re.findall(r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b", text))
+        tools = {w for w in words if w in registered or f"t_{w}" in registered}
+        assert tools, name
+        assert tools <= registered, (name, sorted(tools - registered))
+    assert "Read each document id with t_get_event_raw" in block

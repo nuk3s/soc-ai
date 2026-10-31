@@ -31,11 +31,15 @@ export interface LeadDecisionFields {
 /** The hand the settle rule and the loop sign with on the server. */
 export const AUTO_HUNT_ACTOR = 'auto-hunt';
 
-/** Why the settle rule left a clean hunt's lead open. The server sends the
- *  sentence too. These are the words for a server that sends the code only. */
+/** Why the settle rule left a hunt's lead open. The server sends the
+ *  sentence too. These are the words for a server that sends the code only.
+ *  `no_verdict`: a threat finding of the hunt has no verdict, so the
+ *  verdicts did not close the lead (soc_ai.store.leads.HOLD_NO_VERDICT). */
 export const HOLD_SENTENCE: Record<string, string> = {
   partial_read: 'The hunt could not read all evidence.',
   earlier_threat: 'An earlier hunt found a threat.',
+  lead_link: 'The hunt linked this lead to other leads.',
+  no_verdict: 'A threat finding of the hunt has no verdict.',
 };
 
 /** The chip word for each decision. The store keeps the word `promoted`.

@@ -1502,9 +1502,48 @@ async def test_the_lifted_start_tags_the_hunt_as_a_lead_hunt(
     assert calls[0]["lead_id"] == lead_id and calls[0]["started_by"] == "tester"
     assert calls[0]["objective"].startswith(f"[lead {lead_id}] ")
     assert "document ids d1" in calls[0]["objective"]
+    # No lead closed as promoted on this host, so there is no earlier conclusion.
+    assert calls[0]["earlier"] is None
     async with maker() as db:
         lead = await db.get(Lead, lead_id)
         assert lead.status == "hunting" and lead.hunt_id == "01HUNTFROMLEAD"
+    await engine.dispose()
+
+
+async def test_a_lead_hunt_hands_the_earlier_conclusions_to_the_console(
+    settings_kratos: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Prod, 2026-10-24: four leads formed on one host in 21 h, and each hunt
+    started blind to the promoted conclusion before it. The block travels on
+    its own keyword. The objective stays the lead's own record."""
+    from soc_ai.hunting import lead_hunt
+
+    from tests.test_hunt_earlier import _investigation, _lead, _promote
+
+    engine, maker = await _db(settings_kratos)
+    now = datetime.now(UTC).replace(tzinfo=None)
+    old = await _lead(maker, "192.0.2.40")
+    await _promote(
+        maker,
+        old,
+        [await _investigation(maker, summary="Host 192.0.2.30 sent the exploit. More.")],
+        at=now - timedelta(hours=5),
+    )
+    new = await _lead(maker, "192.0.2.40")
+    calls, manager = _recorder()
+    monkeypatch.setattr("soc_ai.webui.hunt_console_manager.get_manager", lambda _s: manager)
+
+    await lead_hunt.start_lead_hunt(_state(maker), lead_id=new, started_by="tester")
+
+    assert len(calls) == 1
+    block = calls[0]["earlier"]
+    assert block is not None
+    assert "closed as promoted at " in block.text
+    assert 'It wrote: "Host 192.0.2.30 sent the exploit."' in block.text
+    assert "Earlier conclusions" not in calls[0]["objective"]
+    async with maker() as db:
+        promoted = await db.get(Lead, old)
+        assert promoted is not None and promoted.status == "promoted"
     await engine.dispose()
 
 

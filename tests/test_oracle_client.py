@@ -8,6 +8,8 @@ Agent, matching the new robust httpx-based implementation.
 from __future__ import annotations
 
 import json
+import re
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1870,3 +1872,219 @@ async def test_oracle_tools_decode_only_flip_is_withheld() -> None:
     assert result.oracle_tool_calls == 0  # the decode did not count as evidence
     assert result.override_withheld is True
     assert result.report.verdict == "false_positive"  # the local verdict stands
+
+
+# ===========================================================================
+# Change E (2026-10-30): the case of a finding investigation names its claim.
+# The Oracle framed every case as an alert and the case carried no claim, so a
+# local verdict on one finding could come back as a verdict on the whole hunt.
+# ===========================================================================
+
+
+def test_a_finding_case_carries_its_claim() -> None:
+    from soc_ai.oracle.backstop import MASK_PLACEHOLDER, mask_unclassified_scalars
+    from soc_ai.oracle.client import ORACLE_SYSTEM_PROMPT, _assemble_case_dict
+    from soc_ai.oracle.redact import Mapping, sanitize_case
+
+    title = "Successful SSH to victim by host-a"
+    claim = {"title": title, "hosts": ["10.1.2.3", "host-a"]}
+    case = _assemble_case_dict(
+        enriched=_stub_enriched(),
+        local_report=_stub_report(),
+        transcript_text="",
+        subject_claim=claim,
+    )
+    assert case["subject_claim"] == claim
+    # An alert case keeps the payload it had: no claim key at all.
+    alert_case = _assemble_case_dict(
+        enriched=_stub_enriched(), local_report=_stub_report(), transcript_text=""
+    )
+    assert "subject_claim" not in alert_case
+
+    sanitized = sanitize_case(case, Mapping())
+    hosts = sanitized["subject_claim"]["hosts"]
+    assert hosts[0].startswith("IP_")
+    assert "10.1.2.3" not in json.dumps(sanitized)
+    # The harvest reads subject_claim.hosts as a host list. A bare name is a
+    # HOST label, and the label replaces the name in the title too.
+    assert hosts[1].startswith("HOST_")
+    assert "host-a" not in json.dumps(sanitized)
+    assert sanitized["subject_claim"]["title"] == f"Successful SSH to victim by {hosts[1]}"
+    # The tool path masks a free-form value it cannot prove safe. The title is
+    # model prose like local_summary and passes. A label passes too.
+    masked, _n = mask_unclassified_scalars(sanitized, suffixes=(".lan", ".local"))
+    assert masked["subject_claim"]["title"] == sanitized["subject_claim"]["title"]
+    assert masked["subject_claim"]["hosts"] == hosts
+    assert MASK_PLACEHOLDER not in json.dumps(masked["subject_claim"])
+
+    assert "When the case has a `subject_claim` field" in ORACLE_SYSTEM_PROMPT
+
+
+def test_the_claim_hosts_learn_a_name_role_ip_element() -> None:
+    """HOST_NAMING_RULE tells the hunt to write a host as `name (role, ip)`.
+    The name is a HOST label, a private address is an IP label, a public
+    address passes, and the role stays."""
+    from soc_ai.oracle.redact import Mapping, sanitize_case
+
+    case = {
+        "local_summary": "jumpbox logged in to webprod01.",
+        "subject_claim": {
+            "title": "Successful SSH to victim by jumpbox",
+            "hosts": ["jumpbox (workstation, 10.0.0.9)", "webprod01", "8.8.8.8", "-"],
+        },
+    }
+    sanitized = sanitize_case(case, Mapping())
+    text = json.dumps(sanitized)
+    for raw in ("jumpbox", "webprod01", "10.0.0.9"):
+        assert raw not in text, raw
+    hosts = sanitized["subject_claim"]["hosts"]
+    assert re.fullmatch(r"HOST_\d+ \(workstation, IP_\d+\)", hosts[0]), hosts[0]
+    assert re.fullmatch(r"HOST_\d+", hosts[1]), hosts[1]
+    # A public address is evidence for the Oracle, and a value with no letter
+    # or digit is no name.
+    assert hosts[2:] == ["8.8.8.8", "-"]
+    assert sanitized["local_summary"].startswith(hosts[0].split(" ")[0])
+
+
+@pytest.mark.asyncio
+async def test_a_bare_claim_host_never_reaches_the_single_shot_oracle() -> None:
+    """The default path runs no backstop (oracle_tools_enabled=False). A bare
+    host name in the claim reached the gateway body before the harvest read
+    subject_claim.hosts."""
+    sent: list[str] = []
+
+    async def raw_call(payload_text: str, **_kw: Any) -> str:
+        sent.append(payload_text)
+        return _valid_verdict_json(verdict="false_positive")
+
+    with patch("soc_ai.oracle.client._call_oracle_raw", raw_call):
+        await adjudicate(
+            _real_ctx(_make_settings()),
+            enriched=_enriched_min(),
+            local_report=_stub_report(),
+            transcript_text="",
+            loop_messages=None,
+            subject_claim={
+                "title": "Successful SSH to victim by host-a",
+                "hosts": ["host-a", "jumpbox (workstation, 10.0.0.9)"],
+            },
+        )
+    assert sent, "the gateway was called"
+    body = sent[0]
+    for raw in ("host-a", "jumpbox", "10.0.0.9"):
+        assert raw not in body, raw
+    assert "HOST_" in body
+
+
+# ===========================================================================
+# The static prompt is not a leak (2026-10-30). EVENT_TIME_RULE added about 60
+# common words to the Oracle prompts. The wire hook swept the whole body for
+# learned values, system prompt included, so a host or user that the harvest
+# learned as "exploit" or "hunt" refused every tool-path adjudication.
+# ===========================================================================
+
+
+def _chat_body(*messages: dict[str, Any], tools: list[Any] | None = None) -> bytes:
+    body: dict[str, Any] = {"model": "oracle", "messages": list(messages)}
+    if tools is not None:
+        body["tools"] = tools
+    return json.dumps(body).encode("utf-8")
+
+
+def _hook_for(*learned: str) -> Any:
+    from soc_ai.oracle.client import _make_residue_hook
+    from soc_ai.oracle.redact import Mapping
+
+    mapping = Mapping()
+    for value in learned:
+        mapping.label_for(value, "HOST")
+    return _make_residue_hook(
+        mapping, allowlist=(), extra_hosts=(), extra_suffixes=(), no_propagate=set()
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_learned_word_in_the_static_oracle_prompt_does_not_refuse() -> None:
+    import httpx
+    from soc_ai.oracle.client import ORACLE_TOOL_SYSTEM_PROMPT
+
+    for word in ("exploit", "hunt", "wave", "unit"):
+        assert re.search(rf"\b{word}\b", ORACLE_TOOL_SYSTEM_PROMPT, re.IGNORECASE), word
+        bodies: list[str] = []
+
+        def _handler(request: httpx.Request, sink: list[str] = bodies) -> httpx.Response:
+            sink.append(request.content.decode("utf-8", "replace"))
+            return httpx.Response(200, json=_openai_text_response(_valid_verdict_json()))
+
+        failure: dict[str, Any] = {}
+        result = await adjudicate(
+            _real_ctx(_tools_settings()),
+            enriched=_enriched_with_host(word),
+            local_report=_stub_report(),
+            transcript_text="",
+            failure_out=failure,
+            _http_transport=httpx.MockTransport(_handler),
+        )
+        assert result is not None, (word, failure)
+        assert len(bodies) == 1, word
+        # The harvest learned the name, so the case carries its label.
+        user = next(m for m in json.loads(bodies[0])["messages"] if m["role"] == "user")
+        assert "HOST_" in user["content"], word
+        assert not re.search(rf"\b{word}\b", user["content"], re.IGNORECASE), word
+
+
+@pytest.mark.asyncio
+async def test_a_learned_word_outside_the_static_prompt_still_refuses() -> None:
+    """The negative controls. The learned-value sweep skips only the static
+    system prompt and the static tool definitions. The same word in a tool
+    result, in a tool call of the model, in the case or in a system message
+    that is not the static prompt still refuses."""
+    from soc_ai.oracle.client import ORACLE_TOOL_SYSTEM_PROMPT, OracleResidueError
+
+    hook = _hook_for("exploit")
+    system = {"role": "system", "content": ORACLE_TOOL_SYSTEM_PROMPT}
+    tools = [{"type": "function", "function": {"name": "t_x", "description": "An exploit."}}]
+    clean = _chat_body(system, {"role": "user", "content": '{"host": "HOST_01"}'}, tools=tools)
+    await hook(SimpleNamespace(content=clean))
+
+    leaks = [
+        _chat_body(system, {"role": "user", "content": "The host exploit sent it."}),
+        _chat_body(system, {"role": "tool", "tool_call_id": "c0", "content": "host exploit"}),
+        _chat_body(
+            system,
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "c0",
+                        "type": "function",
+                        "function": {"name": "t_x", "arguments": '{"host": "exploit"}'},
+                    }
+                ],
+            },
+        ),
+        _chat_body({"role": "system", "content": ORACLE_TOOL_SYSTEM_PROMPT + " Host exploit."}),
+    ]
+    for body in leaks:
+        with pytest.raises(OracleResidueError):
+            await hook(SimpleNamespace(content=body))
+
+    # The shape sweep still reads the whole body, static parts included.
+    shaped = [{"type": "function", "function": {"name": "t_x", "description": "10.0.0.9"}}]
+    with pytest.raises(OracleResidueError):
+        await hook(SimpleNamespace(content=_chat_body(system, tools=shaped)))
+
+
+def test_a_short_claim_host_is_labelled_in_the_list_only() -> None:
+    """The DOMAIN_LIKE rule. A global replace of a short name would turn the
+    attacker's dc.example.com into an internal name for the Oracle."""
+    from soc_ai.oracle.redact import Mapping, sanitize_case
+
+    case = {
+        "local_summary": "The host beaconed to dc.example.com.",
+        "subject_claim": {"title": "Beacon from dc", "hosts": ["dc"]},
+    }
+    sanitized = sanitize_case(case, Mapping())
+    assert re.fullmatch(r"HOST_\d+", sanitized["subject_claim"]["hosts"][0])
+    assert sanitized["local_summary"] == "The host beaconed to dc.example.com."

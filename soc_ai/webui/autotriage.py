@@ -31,6 +31,8 @@ from soc_ai.store import investigations as inv_svc
 from soc_ai.store import rule_prior as rule_prior_store
 from soc_ai.triage_models import is_pipeline_fallback
 from soc_ai.webui import alerts_query as aq
+from soc_ai.webui import autotriage_health
+from soc_ai.webui.autotriage_health import TriageHealth
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -121,6 +123,9 @@ class AutoTriageStatus:
     prior_covered: int = 0
     # set by the stop endpoint; the worker checks it between targets and aborts.
     cancelled: bool = False
+    # The retry alarm, the pause and the heals (soc_ai.webui.autotriage_health).
+    # They span runs, so reset() does not touch them.
+    health: TriageHealth = field(default_factory=TriageHealth, repr=False, compare=False)
     # internal: keep a reference to the running task to prevent GC
     _task: asyncio.Task[None] | None = field(default=None, repr=False, compare=False)
 
@@ -418,10 +423,18 @@ async def plan_targets(
       :class:`InheritedAck` candidates for the worker to acknowledge in SO
       (inheritance used to leave them unacked forever).
 
+    A failed alert then waits before its next automatic run. The first retry
+    waits 15 minutes and each next retry twice as long (``retry_wait``). Past
+    ``auto_triage_retry_limit`` the alert runs once each 6 hours
+    (``retry_limit``). A held alert takes no slot under the cap. While an
+    alarm is open, one held alert of its error runs each hour as the probe,
+    first in the list. A fresh alert runs before a retry.
+
     Returns (targets, skipped_count, inherited_acks). A per-reason breakdown of
-    the skip count (``{"already_triaged"|"running"|"inherited": n}``) is
-    additionally stashed on the run's :class:`AutoTriageStatus` so the polling
-    status can explain the skips without widening this tuple's signature.
+    the skip count (``already_triaged``, ``running``, ``inherited``,
+    ``retry_wait``, ``retry_limit``) is additionally stashed on the run's
+    :class:`AutoTriageStatus` so the polling status can explain the skips
+    without widening this tuple's signature.
 
     RAISES when NOTHING could be read — every severity's group query failed, or
     every group's event query did. A sweep that could not look must not return
@@ -458,9 +471,9 @@ async def plan_targets(
         _stash_grid_errors(state, grid_errors)
         return [], 0, []
 
-    direct_hits, running_pairs, pair_hits = await _coverage_maps(state, clusters)
+    direct_hits, running_pairs, pair_hits, failed_runs = await _coverage_maps(state, clusters)
 
-    targets: list[Target] = []
+    budget = _RetryBudget(state, failed_runs, skipped_reasons)
     inherited_acks: list[InheritedAck] = []
     for key, ev in clusters.items():
         rule_name, src_ip, dst_ip = key[0], key[1], key[2]
@@ -487,16 +500,18 @@ async def plan_targets(
                 _inherited_ack_candidates(settings, inherited, rule_events.get(rule_name, []), key)
             )
             continue
-        targets.append(
-            Target(
-                alert_es_id=ev.es_id,
-                rule_name=rule_name,
-                src_ip=src_ip,
-                dst_ip=dst_ip,
-                severity=ev.severity or "",
-                host_name=ev.subject_host or "",
-            )
+        target = Target(
+            alert_es_id=ev.es_id,
+            rule_name=rule_name,
+            src_ip=src_ip,
+            dst_ip=dst_ip,
+            severity=ev.severity or "",
+            host_name=ev.subject_host or "",
         )
+        # The retry budget comes after the coverage checks, so a sibling's
+        # verdict still covers a failed alert and queues its acks.
+        budget.admit(target)
+    targets = budget.ordered()
 
     # Safety cap: bound a single run so one click can't spawn dozens of hunts.
     # Overflow targets have no verdict yet, so the next run picks them up.
@@ -514,11 +529,57 @@ async def plan_targets(
     return targets, sum(skipped_reasons.values()), inherited_acks
 
 
+class _RetryBudget:
+    """The retry budget of one planning pass (soc_ai.webui.autotriage_health).
+
+    A held alert is tallied as ``retry_wait`` or ``retry_limit`` and takes no
+    slot. While an alarm is open, the first held alert of its error that
+    take_probe admits runs as the probe.
+    """
+
+    def __init__(
+        self,
+        state: Any,
+        failed_runs: dict[str, inv_svc.FailedRuns],
+        skipped_reasons: dict[str, int],
+    ) -> None:
+        self._health = get_status(state).health
+        self._limit = int(getattr(state.settings, "auto_triage_retry_limit", 2))
+        self._now = autotriage_health._now()
+        self._failed_runs = failed_runs
+        self._skipped_reasons = skipped_reasons
+        self._probe: list[Target] = []
+        self._fresh: list[Target] = []
+        self._retries: list[Target] = []
+
+    def admit(self, target: Target) -> None:
+        failed = self._failed_runs.get(target.alert_es_id)
+        hold = autotriage_health.retry_hold(self._limit, failed, now=self._now.replace(tzinfo=None))
+        if hold and not self._probe and self._health.take_probe(target.alert_es_id, at=self._now):
+            self._probe.append(target)
+        elif hold:
+            _bump(self._skipped_reasons, hold)
+        elif failed is not None:
+            self._retries.append(target)
+        else:
+            self._fresh.append(target)
+
+    def ordered(self) -> list[Target]:
+        """The probe first, so the cap never drops it. Then the alerts with no
+        failure, so a retry never takes the slot of a new alert."""
+        return self._probe + self._fresh + self._retries
+
+
 async def _coverage_maps(
     state: Any,
     clusters: dict[inv_svc.PairKey, aq.AlertEvent],
-) -> tuple[dict[str, Any], set[inv_svc.PairKey], dict[inv_svc.PairKey, Any]]:
-    """The three existing-coverage lookups for the planned clusters.
+) -> tuple[
+    dict[str, Any],
+    set[inv_svc.PairKey],
+    dict[inv_svc.PairKey, Any],
+    dict[str, inv_svc.FailedRuns],
+]:
+    """The existing-coverage lookups for the planned clusters.
 
     - direct verdicts on the clustered event ids (status-agnostic);
     - pairs with an IN-FLIGHT run (unconditional — duplicate concurrent work
@@ -526,12 +587,21 @@ async def _coverage_maps(
     - pair verdicts within the inherit-window. Inheritance keeps a continuous
       sweep tenable: a covered cluster inherits its sibling's verdict instead
       of being re-triaged. Toggleable — with inheritance off the map is empty
-      and every cluster is investigated.
+      and every cluster is investigated;
+    - the failed runs of each event id since its last verdict, for the retry
+      budget. An alert whose error class healed in this process counts only
+      its failures after the heal.
     """
     settings = state.settings
     all_event_ids = [ev.es_id for ev in clusters.values()]
     all_pairs = list(clusters.keys())
     inherit_on = getattr(settings, "auto_triage_inheritance_enabled", True)
+    health = get_status(state).health
+    healed: dict[str, datetime] = {}
+    for aid in all_event_ids:
+        at = health.heal_since(aid)
+        if at is not None:
+            healed[aid] = at.astimezone(UTC).replace(tzinfo=None)
     async with state.db_sessionmaker() as db:
         direct_hits = await inv_svc.latest_for_alerts(db, all_event_ids)
         running_pairs = await inv_svc.running_for_pairs(db, all_pairs)
@@ -542,7 +612,8 @@ async def _coverage_maps(
             if inherit_on
             else {}
         )
-    return direct_hits, running_pairs, pair_hits
+        failed_runs = await inv_svc.failed_runs_for_alerts(db, all_event_ids, failed_since=healed)
+    return direct_hits, running_pairs, pair_hits, failed_runs
 
 
 def _qualifies_for_inherited_ack(settings: Any, inv: Any) -> bool:
@@ -1087,9 +1158,19 @@ class _TargetRun:
     errored: bool = False
     run_id: str | None = None
     report: dict[str, Any] | None = None
+    # The phase and the type of the FIRST error event, for the retry alarm.
+    error_phase: str | None = None
+    error_type: str | None = None
 
     def observe(self, name: str, data: Any, status: AutoTriageStatus) -> None:
         if name == "error":
+            if not self.errored and isinstance(data, dict):
+                # A stream event carries the error in its payload. A terminal
+                # error of recorded_run is the flat dict itself.
+                payload = data.get("payload")
+                body = payload if isinstance(payload, dict) else data
+                self.error_phase = str(body.get("phase") or "") or None
+                self.error_type = str(body.get("type") or "") or None
             self.errored = True
         elif name == "tool_call":
             status.tool_calls += 1
@@ -1154,12 +1235,19 @@ async def run_auto_triage(  # noqa: PLR0915 - one linear per-target flow, guards
     inherited_acks: list[InheritedAck] | None = None,
     requested_class: str | None = None,
     apply_rule_prior: bool = False,
+    stop_on_pause: bool = False,
 ) -> None:
     """Sequential worker: hunt each target, update status, never raise.
 
     Drains ``run_recorded`` per target.  Failures are logged and counted;
-    they never abort the remaining targets.  Sets ``active=False`` and
-    ``finished_at`` when done. Inherited-FP ack candidates (see
+    they never abort the remaining targets. The one exception is
+    ``stop_on_pause``: the scheduler's run stops when the pause of
+    :mod:`soc_ai.webui.autotriage_health` opens. A press runs every target.
+    Each target that the model ran records a verdict or a failure on
+    ``status.health``. A stray ``CancelledError`` fails its own target only.
+    A cancel of this task (a shutdown) still stops the worker.
+
+    Sets ``active=False`` and ``finished_at`` when done. Inherited-FP ack candidates (see
     :class:`InheritedAck`) are processed first — they need no LLM.
 
     ``requested_class`` is the budget class every target asks for
@@ -1207,6 +1295,8 @@ async def run_auto_triage(  # noqa: PLR0915 - one linear per-target flow, guards
             ctx = ctx_from_state(state)
             ctx.requested_run_class = requested_class
             run = _TargetRun()
+            # (phase, type) of this target's failure, for the retry alarm.
+            failure: tuple[str, str] | None = None
             try:
                 # Hold the generator so we can guarantee it is closed if the
                 # wall-clock backstop fires mid-stream — a hung LLM read would
@@ -1235,6 +1325,7 @@ async def run_auto_triage(  # noqa: PLR0915 - one linear per-target flow, guards
                 if run.errored:
                     _LOGGER.warning("auto-triage: stream error for alert_id=%s", target.alert_es_id)
                     status.failed += 1
+                    failure = (run.error_phase or "run", run.error_type or "error")
                 else:
                     status.hunted += 1
             except TimeoutError:
@@ -1244,11 +1335,29 @@ async def run_auto_triage(  # noqa: PLR0915 - one linear per-target flow, guards
                     target.alert_es_id,
                 )
                 status.failed += 1
-            except Exception:
+                failure = ("per_target_cap", "TimeoutError")
+            except asyncio.CancelledError:
+                # A cancel of THIS task (a shutdown, or the task cancelled)
+                # stops the worker. A stray cancel from inside one run, with
+                # no cancel request on the task, fails that target only. On
+                # 2026-10-27 one such cancel ended a batch of 6 targets after
+                # the first.
+                task = asyncio.current_task()
+                if task is None or task.cancelling() > 0:
+                    raise
+                _LOGGER.warning(
+                    "auto-triage: the run of alert_id=%s stopped with an unexpected cancel. "
+                    "The next target runs.",
+                    target.alert_es_id,
+                )
+                status.failed += 1
+                failure = ("run_cancelled", "CancelledError")
+            except Exception as exc:
                 _LOGGER.exception(
                     "auto-triage: investigation failed for alert_id=%s", target.alert_es_id
                 )
                 status.failed += 1
+                failure = ("worker", type(exc).__name__)
             finally:
                 status.current = None
             if prior is not None:
@@ -1257,6 +1366,18 @@ async def run_auto_triage(  # noqa: PLR0915 - one linear per-target flow, guards
                 await prior.settle(
                     decision_id, investigation_id=run.run_id, real_verdict=_real_verdict(run.report)
                 )
+            # The retry alarm and the pause read every model run, a press too.
+            if _real_verdict(run.report):
+                status.health.record_verdict(target.alert_es_id)
+            else:
+                status.health.record_failure(target.alert_es_id, *(failure or ("run", "NoVerdict")))
+            if stop_on_pause and status.health.is_paused():
+                _LOGGER.warning(
+                    "auto-triage: the pause is open. The run stops after %d of %d targets.",
+                    i + 1,
+                    len(targets),
+                )
+                break
     finally:
         status.active = False
         status.finished_at = datetime.now(UTC).isoformat()
@@ -1293,11 +1414,21 @@ async def start_config_sweep(state: Any, *, started_by: str) -> int:
     Sweeps every untriaged detection at/above ``auto_triage_min_severity`` and
     launches a background :func:`run_auto_triage`. Returns the number of targets
     launched, or 0 if a sweep is already running / there is nothing to triage.
+    While the pause of :mod:`soc_ai.webui.autotriage_health` is open it plans
+    nothing and returns 0.
     Used by the continuous scheduler loop; mirrors the ⚡ endpoint's config-band
     path.
     """
     status = get_status(state)
     if status.active:
+        return 0
+    if status.health.is_paused():
+        # The pause stops the scheduled runs only. The last real batch stands
+        # on the status, so nothing here resets it.
+        _LOGGER.debug(
+            "auto-triage: Continuous Auto-Investigate is paused until %s. No run starts.",
+            status.health.status_fields()["paused_until"],
+        )
         return 0
     band = config_severity_band(state.settings)
     status.active = True  # claim the single-flight slot before any await
@@ -1343,6 +1474,8 @@ async def start_config_sweep(state: Any, *, started_by: str) -> int:
             inherited_acks=inherited_acks,
             # The scheduler's sweep is the one path the rule prior serves.
             apply_rule_prior=True,
+            # Only the scheduler stops when the pause opens.
+            stop_on_pause=True,
         )
     )
     return len(targets)
