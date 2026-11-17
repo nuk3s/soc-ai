@@ -56,7 +56,7 @@ describe('a run a newer run replaced', () => {
       }),
     );
     const banner = screen.getByTestId('superseded-banner');
-    expect(banner.textContent).toContain('A newer run on this alert reached true positive (0.65).');
+    expect(banner.textContent).toContain('A newer investigation on this alert reached true positive (0.65).');
     expect(screen.getByRole('link', { name: 'Open it.' }).getAttribute('href')).toBe(
       '/investigation/INV-NEW',
     );
@@ -74,8 +74,8 @@ describe('a run a newer run replaced', () => {
 
   it('says a newer run is in progress while it runs', () => {
     expect(supersededSentence({ id: 'x', status: 'running' })).toBe(
-      'A newer run on this alert is in progress.',
+      'A newer investigation on this alert is in progress.',
     );
-    expect(supersededSentence(null)).toBe('A newer run on this alert replaced this run.');
+    expect(supersededSentence(null)).toBe('A newer investigation on this alert replaced this one.');
   });
 });

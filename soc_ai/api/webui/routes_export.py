@@ -215,7 +215,7 @@ def _analyst_preview_note(
         "original run.",
         "soc-ai stores the enriched context before any redaction. The local store "
         "sends nothing out. The original side shows the raw prompt material. This "
-        "is also true for a run with redaction on.",
+        "is also true for an investigation with redaction on.",
     ]
     if not redaction_enabled:
         parts.append(
@@ -225,7 +225,7 @@ def _analyst_preview_note(
         )
     if "synth_round1_skipped" in event_kinds:
         parts.append(
-            "This run skipped the round-1 synthesis. It went straight to the "
+            "This investigation skipped the round-1 synthesis. It went straight to the "
             "investigation loop. The preview shows the message round 1 WOULD have "
             "received."
         )
@@ -243,7 +243,7 @@ def _analyst_preview_note(
     if cited_dropped:
         parts.append(
             "soc-ai could not reproduce the candidate's cited-evidence lines. The "
-            "template logic changed after this run. The preview omits those lines."
+            "template logic changed after this investigation. The preview omits those lines."
         )
     return " ".join(parts)
 
@@ -325,7 +325,7 @@ async def analyst_redaction_preview(
             missing=missing,
             detail=(
                 "This investigation predates the stored events needed to rebuild the "
-                "analyst prompt. Only newer runs can be previewed."
+                "analyst prompt. Only newer investigations can be previewed."
             ),
         )
 

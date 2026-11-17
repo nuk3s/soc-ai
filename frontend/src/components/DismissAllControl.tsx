@@ -1,7 +1,7 @@
 import { useState } from 'react';
 
 import { ApiError } from '../lib/api';
-import type { NeedsYouState } from '../lib/needsYou';
+import { type NeedsYouState, reviewCount } from '../lib/needsYou';
 import {
   decisionsThatStay,
   dismissAll,
@@ -59,7 +59,10 @@ export function DismissAllControl({
   const { toast } = useToast();
 
   const data = needsYou.data;
-  const shadowHits = data ? data.unread_shadow_hits : null;
+  // The review count the bell and the tile state, so the confirm names the
+  // hits the analyst saw. The server reads them with this number as
+  // `expected` and refuses a write that would read more.
+  const shadowHits = data ? reviewCount(data) : null;
   const dismissible = rows.filter((n) => n.dismissible !== false);
   const fixed = rows.length - dismissible.length;
   const canAct = loadedAt !== null && (dismissible.length > 0 || more || shadowHits !== 0);

@@ -365,7 +365,7 @@ def test_nulls_sort_last_in_both_directions(estate: TestClient, direction: str) 
 
 
 @pytest.mark.parametrize(
-    "sort", ["name", "address", "role", "agent", "events", "first_seen", "last_seen"]
+    "sort", ["name", "address", "role", "agent", "events", "first_seen", "last_seen", "findings"]
 )
 def test_every_column_sorts_in_both_directions(estate: TestClient, sort: str) -> None:
     asc = _list(estate, activity="all", sort=sort, dir="asc")
@@ -687,3 +687,113 @@ def test_a_guess_filter_never_matches_a_firm_role(estate: TestClient) -> None:
     """NEGATIVE CONTROL: the declared workstation is no guessed workstation."""
     assert _list(estate, activity="all", role="guess:workstation")["total"] == 0
     assert "agent:a-nexus" in _keys(_list(estate, activity="all", role="workstation"))
+
+
+# ---------------------------------------------------------------------------
+# The Findings column and the last grid event (review 2026-11-12, L2)
+# ---------------------------------------------------------------------------
+
+
+def _seed_findings(client: TestClient) -> None:
+    """True positive runs and leads on the estate, relative to now."""
+    from soc_ai.store import investigations as inv_svc
+    from soc_ai.store.models import Investigation, Lead
+
+    async def _run() -> None:
+        maker = client.app.state.db_sessionmaker  # type: ignore[attr-defined]
+        async with maker() as db:
+
+            async def run(
+                src: str, dst: str, verdict: str, age: timedelta, *, synth: bool = False
+            ) -> None:
+                inv = await inv_svc.create(
+                    db, alert_es_id=f"doc-{src}-{dst}-{verdict}-{age}", started_by="system"
+                )
+                await inv_svc.finalize(
+                    db, inv.id, status="complete", verdict=verdict, confidence=0.9
+                )
+                row = await db.get(Investigation, inv.id)
+                assert row is not None
+                row.src_ip, row.dest_ip = src, dst
+                row.created_at = _NOW - age
+                row.is_synth_eval = synth
+                await db.commit()
+
+            # Two true positives on the proxy: one names two of its addresses
+            # and counts once.
+            await run("203.0.113.9", "10.40.0.119", "true_positive", timedelta(hours=2))
+            await run("10.41.99.1", "10.42.1.5", "true_positive", timedelta(days=1))
+            # Negative controls: a false positive, a run older than 7 days and
+            # a synthetic run do not count.
+            await run("203.0.113.9", "10.40.0.129", "false_positive", timedelta(hours=2))
+            await run("203.0.113.9", "10.40.0.129", "true_positive", timedelta(days=9))
+            await run("203.0.113.9", "10.40.0.129", "true_positive", timedelta(hours=1), synth=True)
+            db.add(Lead(status="open", entities_json=[["host", "10.40.0.129"]]))
+            db.add(Lead(status="hunting", entities_json=[["host", "nexus"]]))
+            # A closed lead is no open work.
+            db.add(Lead(status="dismissed", entities_json=[["host", "10.40.0.129"]]))
+            await db.commit()
+
+    asyncio.run(_run())
+
+
+def test_the_findings_column_counts_confirmed_threats_and_open_leads(
+    estate: TestClient,
+) -> None:
+    _seed_findings(estate)
+    rows = {row["key"]: row for row in _list(estate, activity="all")["rows"]}
+
+    assert rows["agent:a-proxy"]["findings"] == {"confirmed": 2, "open_leads": 0, "days": 7}
+    assert rows["agent:a-nexus"]["findings"] == {"confirmed": 0, "open_leads": 2, "days": 7}
+    assert rows["ip:10.60.0.9"]["findings"] == {"confirmed": 0, "open_leads": 0, "days": 7}
+
+
+def test_the_findings_sort_puts_the_confirmed_threats_first(estate: TestClient) -> None:
+    _seed_findings(estate)
+    body = _list(estate, activity="all", sort="findings")
+
+    assert (body["sort"], body["dir"]) == ("findings", "desc")
+    assert _keys(body)[:2] == ["agent:a-proxy", "agent:a-nexus"]
+
+
+def test_last_events_reads_the_grid_once_for_a_page(estate: TestClient) -> None:
+    from soc_ai.so_client.elastic import EsSearchResult
+
+    stamp = (_NOW - timedelta(minutes=3)).isoformat() + "Z"
+    result = EsSearchResult(
+        total=0,
+        took_ms=1,
+        aggregations={
+            "by_ip": {
+                "buckets": {
+                    "10.40.0.119": {"newest": {"value": 1.0, "value_as_string": stamp}},
+                    "10.40.0.129": {"newest": {"value": None}},
+                }
+            }
+        },
+    )
+    with patch(
+        "soc_ai.so_client.elastic.ElasticClient.search", AsyncMock(return_value=result)
+    ) as search:
+        response = estate.get(
+            "/api/v1/hosts/last-events", params=[("ip", "10.40.0.119"), ("ip", "10.40.0.129")]
+        )
+    assert response.status_code == 200, response.text
+    assert response.json() == {"events": {"10.40.0.119": stamp}, "window": "24h"}
+    assert search.await_count == 1
+
+
+def test_last_events_answers_503_when_the_grid_is_down(estate: TestClient) -> None:
+    from elastic_transport import ConnectionError as TransportConnectionError
+
+    with patch(
+        "soc_ai.so_client.elastic.ElasticClient.search",
+        AsyncMock(side_effect=TransportConnectionError("down")),
+    ):
+        response = estate.get("/api/v1/hosts/last-events", params={"ip": "10.40.0.119"})
+    assert response.status_code == 503
+
+
+def test_last_events_refuses_a_value_that_is_no_address(estate: TestClient) -> None:
+    response = estate.get("/api/v1/hosts/last-events", params={"ip": "proxy"})
+    assert response.status_code == 422

@@ -15,9 +15,12 @@ synthetic document is sitting in a production index.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from elasticsearch import NotFoundError
@@ -59,6 +62,11 @@ class IngestResult:
     plant_id: str = ""
     # 0-based repeat index of this plant within its batch.
     repeat: int = 0
+    # The address of every document this plant wrote, as ``(index, id)`` in
+    # write order. ``index`` is the concrete index the grid stored the document
+    # in, taken from the write response. For a data stream that is the backing
+    # index, and a delete by id accepts no other address.
+    documents: tuple[tuple[str, str], ...] = ()
 
 
 def _check_synth_prefix(docs: list[RenderedDoc], scenario_id: str) -> None:
@@ -121,11 +129,17 @@ async def assert_no_synth_in_production(elastic: ElasticClient, settings: Settin
         )
 
 
-async def _index_one(elastic: ElasticClient, doc: RenderedDoc) -> str:
-    """Index one doc and return its OpenSearch ``_id``."""
+async def _index_one(elastic: ElasticClient, doc: RenderedDoc) -> tuple[str, str]:
+    """Index one doc and return ``(_id, index)`` as the grid stored it.
+
+    The second value is the ``_index`` of the write response: the concrete
+    index that holds the document. A caller that must take the document back
+    needs exactly this pair, because a delete by id goes to that index.
+    """
     # `index()` returns an `ObjectApiResponse[Any]`, which is dict-subscriptable.
     response = await elastic._client.index(index=doc.index, body=doc.body)
-    return str(response["_id"])
+    stored_in = response.get("_index", doc.index)
+    return str(response["_id"]), str(stored_in)
 
 
 async def _refresh(elastic: ElasticClient, indices: set[str]) -> None:
@@ -175,7 +189,7 @@ def _no_triage_target(scenario_id: str) -> RuntimeError:
     )
 
 
-def plant_id_for(scenario_id: str, repeat: int) -> str:
+def plant_id_for(scenario_id: str, repeat: int, tag: str | None = None) -> str:
     """The ``synth.scenario_id`` scope key for one planted copy of a scenario.
 
     Repeat 0 keeps the bare scenario id, so a single plant (``--repeats 1``,
@@ -183,19 +197,38 @@ def plant_id_for(scenario_id: str, repeat: int) -> str:
     appends ``::r<k>``. The per-run ``SynthScope`` filter term-matches this
     exact value, so N plants of one scenario can never retrieve each other's
     documents — the same isolation that already keeps sibling scenarios apart.
+
+    ``tag`` puts a batch of its own between the two: ``<id>::<tag>``, then the
+    repeat suffix. The nightly plants the same few scenarios again and again on
+    one grid, and without a tag the plant of five nights ago carries the very
+    key tonight's run is scoped to. If its cleanup failed, that old plant would
+    come back as corroborating evidence. None (the default) leaves every key
+    exactly as it was.
     """
-    return scenario_id if repeat == 0 else f"{scenario_id}::r{repeat}"
+    base = f"{scenario_id}::{tag}" if tag else scenario_id
+    return base if repeat == 0 else f"{base}::r{repeat}"
 
 
 async def ingest_scenario(
-    scenario: Scenario, *, elastic: ElasticClient, run_time: datetime, repeat: int = 0
+    scenario: Scenario,
+    *,
+    elastic: ElasticClient,
+    run_time: datetime,
+    repeat: int = 0,
+    plant_tag: str | None = None,
+    written: list[tuple[str, str]] | None = None,
 ) -> IngestResult:
     """Render and ingest one scenario; return the triage-target locator.
 
     ``repeat`` selects this plant's :func:`plant_id_for` scope key; 0 (the
-    default) reproduces the single-plant stamp exactly.
+    default) reproduces the single-plant stamp exactly. ``plant_tag`` is the
+    batch's own key suffix (see :func:`plant_id_for`).
+
+    ``written`` receives the ``(index, id)`` of each document as soon as the
+    grid accepts it. A plant that fails part way raises and returns nothing, and
+    this list is then the only record of what is on the grid.
     """
-    plant_id = plant_id_for(scenario.id, repeat)
+    plant_id = plant_id_for(scenario.id, repeat, plant_tag)
     docs = render_scenario(scenario, run_time=run_time, plant_id=plant_id)
     _check_synth_prefix(docs, scenario.id)
     # Decided from the rendered docs, before the first write: the check is
@@ -207,9 +240,13 @@ async def ingest_scenario(
 
     touched: set[str] = set()
     doc_ids: list[str] = []
+    documents: list[tuple[str, str]] = []
     doc_ids_by_event: dict[str, list[str]] = {}
     for doc in docs:
-        doc_id = await _index_one(elastic, doc)
+        doc_id, stored_in = await _index_one(elastic, doc)
+        documents.append((stored_in, doc_id))
+        if written is not None:
+            written.append((stored_in, doc_id))
         doc_ids.append(doc_id)
         touched.add(doc.index)
         doc_ids_by_event.setdefault(doc.index, []).append(doc_id)
@@ -223,6 +260,7 @@ async def ingest_scenario(
         doc_ids_by_event=doc_ids_by_event,
         plant_id=plant_id,
         repeat=repeat,
+        documents=tuple(documents),
     )
 
 
@@ -266,8 +304,95 @@ async def cleanup_synth_docs(
     return int(resp.get("deleted", 0))
 
 
+# The marker every synthetic index carries in its name: ``logs-synth-<x>`` for
+# the data stream and ``.ds-logs-synth-<x>-<date>-<n>`` for its backing index.
+_SYNTH_INDEX_MARKER = "logs-synth-"
+
+# The record a ride-along batch keeps of what it wrote, beside its bundles.
+LEDGER_NAME = "synth_documents.json"
+
+
+async def delete_synth_documents(
+    elastic: ElasticClient, documents: Sequence[tuple[str, str]]
+) -> tuple[int, list[tuple[str, str, str]]]:
+    """Delete the named documents, one request per document, by ``(index, id)``.
+
+    The only way the nightly removes anything from the grid. There is no query
+    in it: each request names one document by the id the grid gave it when it
+    was written, in the index the grid stored it in. A delete by query selects
+    its victims at delete time, and a filter that was assembled wrong, or a
+    real document that came to carry a matching field, is then deleted with
+    them. A delete by id cannot reach a document this code did not write.
+
+    An address outside a synthetic index is refused and reported, never sent.
+    A document that is already gone counts as removed.
+
+    Returns ``(removed, failures)`` where each failure is
+    ``(index, id, reason)``. Never raises for a document: one refused delete
+    must not stop the rest.
+    """
+    removed = 0
+    failures: list[tuple[str, str, str]] = []
+    for index, doc_id in documents:
+        if _SYNTH_INDEX_MARKER not in index:
+            failures.append((index, doc_id, "refused: the index is not a synthetic index"))
+            continue
+        try:
+            await elastic._client.delete(index=index, id=doc_id)
+        except NotFoundError:
+            pass
+        except Exception as e:
+            failures.append((index, doc_id, f"{type(e).__name__}: {e}"[:200]))
+            continue
+        removed += 1
+    return removed, failures
+
+
+def write_ledger(
+    batch_dir: Path, documents: Sequence[tuple[str, str]], *, planted_at: datetime | None
+) -> None:
+    """Record the documents a batch still has on the grid, in its own directory.
+
+    Written as soon as the plant ends, before the first run, so a batch that is
+    killed leaves the addresses behind for the next one. Rewritten after each
+    removal with what is left. An empty list is a batch that took everything
+    back.
+    """
+    payload = {
+        "planted_at": planted_at.isoformat() if planted_at is not None else None,
+        "documents": [[index, doc_id] for index, doc_id in documents],
+    }
+    (batch_dir / LEDGER_NAME).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def read_ledger(batch_dir: Path) -> tuple[datetime | None, list[tuple[str, str]]]:
+    """``(planted_at, documents)`` from a batch's ledger. Empty when it has none.
+
+    A ledger that cannot be read gives no documents: nothing is deleted on the
+    strength of a file this code cannot parse.
+    """
+    try:
+        payload = json.loads((batch_dir / LEDGER_NAME).read_text(encoding="utf-8"))
+        raw_time = payload.get("planted_at")
+        planted_at = datetime.fromisoformat(raw_time) if isinstance(raw_time, str) else None
+        documents = [
+            (str(entry[0]), str(entry[1]))
+            for entry in payload.get("documents") or []
+            if isinstance(entry, list | tuple) and len(entry) == len(("index", "id"))
+        ]
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None, []
+    return planted_at, documents
+
+
 async def ingest_scenarios(
-    scenarios: list[Scenario], *, elastic: ElasticClient, run_time: datetime, repeats: int = 1
+    scenarios: list[Scenario],
+    *,
+    elastic: ElasticClient,
+    run_time: datetime,
+    repeats: int = 1,
+    plant_tag: str | None = None,
+    written: list[tuple[str, str]] | None = None,
 ) -> list[IngestResult]:
     """Render + ingest each scenario sequentially, ``repeats`` copies apiece.
 
@@ -296,7 +421,9 @@ async def ingest_scenarios(
             raise _no_triage_target(scenario.id)
     await assert_no_synth_in_production(elastic, elastic._settings)
     return [
-        await ingest_scenario(s, elastic=elastic, run_time=run_time, repeat=k)
+        await ingest_scenario(
+            s, elastic=elastic, run_time=run_time, repeat=k, plant_tag=plant_tag, written=written
+        )
         for s in scenarios
         for k in range(repeats)
     ]

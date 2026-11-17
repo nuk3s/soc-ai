@@ -1,4 +1,5 @@
 import { Bell, X } from 'lucide-react';
+import { CampaignNoticeMark } from '../components/campaign/shared';
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { SyntheticEvalBadge } from '../components/Badges';
@@ -9,7 +10,7 @@ import { MultiSelect } from '../components/MultiSelect';
 import { NeedsYouBlock } from '../components/NeedsYouBlock';
 import { ErrorState, Freshness, LoadingState, StaleNotice } from '../components/States';
 import { getNotifications } from '../lib/api';
-import { useNeedsYouCount } from '../lib/needsYou';
+import { reviewCount, useNeedsYouCount } from '../lib/needsYou';
 import {
   NOTIFICATIONS_CAP,
   NOTIFICATIONS_DISMISSED_EVENT,
@@ -21,6 +22,7 @@ import {
   formatNotificationWhen,
   getClearedAt,
   hasMoreNotifications,
+  isCampaignRow,
   isNeedsYouRow,
   nextNotificationLimit,
   notificationKind,
@@ -65,7 +67,10 @@ const TONE_TITLE: Record<Notification['tone'], string> = {
 };
 
 /** What a group holds, in one sentence. */
-const GROUP_TITLE: Partial<Record<NotificationKind, string>> = { hunting: GROUP_HUNTING };
+const GROUP_TITLE: Partial<Record<NotificationKind, string>> = {
+  hunting: GROUP_HUNTING,
+  campaign: 'Each change of a campaign: it formed, reached a new stage, gained a machine or opened again.',
+};
 
 /**
  * Notifications: the Needs-you block, then the events under the same list
@@ -169,10 +174,21 @@ export function Notifications() {
   // Headings and chips read the one notificationKind, so a row sits under the
   // heading its chip names. A lead sat under HUNTING and counted on "System"
   // when the two read different fields (D7, RD7).
+  //
+  // The server orders the rows by urgency, so a group comes in the place of
+  // its most urgent row. A true positive put its group first, and a fixed
+  // group order put it under the system notices (production review
+  // 2026-11-12, ui-core 5).
+  const firstAt = (id: NotificationKind) => {
+    const at = visible.findIndex((n) => notificationKind(n) === id);
+    return at === -1 ? Number.MAX_SAFE_INTEGER : at;
+  };
   const groups = NOTIFICATION_KINDS.map((k) => ({
     ...k,
     rows: visible.filter((n) => notificationKind(n) === k.id),
-  })).filter((g) => g.rows.length > 0);
+  }))
+    .filter((g) => g.rows.length > 0)
+    .sort((a, b) => firstAt(a.id) - firstAt(b.id));
   const grouped = groups.length > 1;
 
   const dismiss = (id: string) => {
@@ -183,7 +199,7 @@ export function Notifications() {
   // Whether Dismiss all shows its button: the condition of DismissAllControl.
   // The page tour points at the button only when it shows, so the step never
   // lights an empty box.
-  const unreadHits = needsYou.data ? needsYou.data.unread_shadow_hits : null;
+  const unreadHits = needsYou.data ? reviewCount(needsYou.data) : null;
   const canDismissAll =
     lastUpdated !== null && (items.some((n) => n.dismissible !== false) || more || unreadHits !== 0);
 
@@ -229,6 +245,7 @@ export function Notifications() {
       />
       <div className="min-w-0 flex-1">
         <div data-testid="notification-title" className="flex flex-wrap items-center gap-1.5 text-[13px]">
+          {isCampaignRow(nt) && <CampaignNoticeMark stage={nt.stage} />}
           {nt.href ? (
             <Link to={nt.href} className="text-accent hover:underline">
               {formatNotificationTitle(nt.title)}

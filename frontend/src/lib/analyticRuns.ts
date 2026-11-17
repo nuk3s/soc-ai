@@ -279,3 +279,51 @@ export const BLIND_RUN_TITLE =
 
 export const UNMEASURED_TITLE =
   'The newest profile sweep scored this analytic against no host. A zero here does not show a clean network.';
+
+/** How the live analytics ran on their newest run. `measuring`: the run read
+ *  documents, or the profile sweep scored a host. `blind`: the run matched
+ *  nothing the analytic reads, or the profile sweep scored no host. `failed`:
+ *  the newest run failed. `notRunning`: the loop is off, waits for its first
+ *  run, or the console has not read the catalog. The four add up to `live`. */
+export interface LiveCoverage {
+  live: number;
+  measuring: number;
+  blind: number;
+  failed: number;
+  notRunning: number;
+}
+
+/** The live coverage of a list of analytics, from the run state each row of
+ *  the Analytics tab shows (specRunState). */
+export function liveCoverage(
+  analytics: { id: string; status: string; evaluator?: string }[],
+  catalog: HuntCatalog | null | undefined,
+): LiveCoverage {
+  const specOf = new Map((catalog?.specs ?? []).map((s) => [s.id, s] as const));
+  const out: LiveCoverage = { live: 0, measuring: 0, blind: 0, failed: 0, notRunning: 0 };
+  for (const a of analytics) {
+    if (a.status !== 'live') continue;
+    out.live += 1;
+    const state = specRunState(catalog, specOf.get(a.id), a.evaluator);
+    if (state === true) out.measuring += 1;
+    else if (state === 'blind' || state === 'unmeasured') out.blind += 1;
+    else if (state === 'failed') out.failed += 1;
+    else out.notRunning += 1;
+  }
+  return out;
+}
+
+/** "15 live (4 measuring, 11 blind)". A failed or a waiting live analytic
+ *  joins the brackets when there is one, so the parts add up to the live
+ *  count. The tab read "15 live" while 7 analytics were blind on their last
+ *  run and 4 scored no host (review 2026-11-12). The parts then sat beside
+ *  the live count with the same dot as the shadow and the retired counts,
+ *  so the line read as seven parts (polish review 2026-11-13). Without the
+ *  catalog the line states the live count. */
+export function liveCoverageWords(c: LiveCoverage, catalogRead: boolean): string {
+  if (!catalogRead || c.live === 0) return `${c.live} live`;
+  const parts = [`${c.measuring} measuring`, `${c.blind} blind`];
+  if (c.failed > 0) parts.push(`${c.failed} failed`);
+  if (c.notRunning > 0) parts.push(`${c.notRunning} not running`);
+  return `${c.live} live (${parts.join(', ')})`;
+}

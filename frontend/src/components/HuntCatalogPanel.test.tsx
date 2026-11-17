@@ -176,7 +176,7 @@ describe('HuntCatalogPanel run state', () => {
     const model: HuntCatalogSpec = {
       ...PROFILE,
       id: 'model-logon-chain',
-      title: 'A logon chain the estate model has not seen',
+      title: 'A logon chain the network model has not seen',
       evaluator: 'model',
       status: 'shadow',
     };
@@ -359,7 +359,7 @@ describe('HuntCatalogPanel, failed sweeps', () => {
     vi.mocked(getHuntCatalog).mockResolvedValue(DOWN);
     mount();
     const row = (await screen.findByText(SPEC.title)).closest('li')!;
-    expect(within(row).getByText(/fired 0 · fresh 0 · handled 0 · failed 24 of 25 runs/)).toBeTruthy();
+    expect(within(row).getByText(/fired 0 · fresh 0 · handled 0 in 24 h · failed 24 of 25 runs/)).toBeTruthy();
     const chip = within(row).getByTestId('last-run-failed');
     expect(chip.getAttribute('title')).toBe('soc-ai could not connect to the grid.');
     expect(row.textContent).not.toContain('ConnectionError');

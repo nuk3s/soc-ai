@@ -34,7 +34,7 @@ export const ERROR_STATE_VALUES: readonly string[] = ['live', 'handled'];
  * retry and the plain verdict filter does not: the tile went nine, eight, seven
  * while the list it opened sat at twenty, with a run dismissed seconds earlier
  * rendered exactly like a counted one (dogfood 2026-09-07, D2). */
-export const PIPELINE_ERRORS_URL = '/investigations?verdict=pipeline_error&errors=live';
+export const PIPELINE_ERRORS_URL = '/investigations?verdict=pipeline_error&errors=live&clock=investigated';
 
 /**
  * Initial Verdict filter from a location.search — lets the Dashboard KPI link

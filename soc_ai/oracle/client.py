@@ -53,7 +53,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, cast
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from soc_ai import metrics
 from soc_ai.config import Settings
@@ -77,7 +77,7 @@ from soc_ai.oracle.sanitize import (
     redaction_summary,
     unsafe_residue,
 )
-from soc_ai.triage_models import TriageReport
+from soc_ai.triage_models import TriageReport, _normalize_impact, settled_impact
 
 if TYPE_CHECKING:
     from soc_ai.agent.egress_guard import EgressGuard
@@ -148,6 +148,14 @@ def _warn_if_privacy_gate_unconfigured(
 # The base of both Oracle prompts. ORACLE_SYSTEM_PROMPT and
 # ORACLE_TOOL_SYSTEM_PROMPT (below, beside the tool loop) each add the event
 # time rule as their last section (change D).
+#
+# H3 (2026-11-13). The answer has two text fields. ``analyst_summary`` is the
+# text of the run for the analyst, and ``reasoning`` is the argument of the
+# Oracle. Until then one ``summary`` field held both, and the client appended
+# the reasoning to it: 27 runs on production showed up to 2,502 characters of
+# tool names and "The local needs_more_info verdict is wrong" as their
+# summary. The two fields replace the old one in the prompt, so the request
+# does not grow, and no second model call writes the text.
 _ORACLE_BASE_PROMPT = (
     "You are a senior SOC analyst adjudicating an alert the local triage was "
     "uncertain or possibly wrong about. The evidence is sanitized: internal IP "
@@ -156,14 +164,19 @@ _ORACLE_BASE_PROMPT = (
     "EMAIL_01. Treat these opaque labels as real identifiers — cross-references "
     "between them are preserved and meaningful. "
     "Your task: review the alert summary, enriched context, local triage verdict, "
-    "and any loop evidence provided, then produce a definitive verdict, confidence, "
-    "and a concise summary citing specific evidence. "
-    "Be direct. If the local verdict is wrong, say so and explain why. "
+    "and any loop evidence provided, then produce a definitive verdict and a confidence. "
     "Respond with a single JSON object (no prose before or after) with keys: "
     '"verdict" (one of "true_positive", "false_positive", "needs_more_info"), '
     '"confidence" (float 0.0-1.0), '
-    '"summary" (3-6 sentence plain-English narrative for the on-call analyst), '
-    '"reasoning" (brief internal reasoning justifying the verdict), '
+    '"analyst_summary" (at most three plain sentences for the on-call analyst: what '
+    "happened, on which hosts, and what to do; name no tool and do not refer to the "
+    "local verdict), "
+    '"reasoning" (your reasoning with the specific evidence; be direct, and if the '
+    "local verdict is wrong, say so here and explain why), "
+    '"impact" (for a true_positive only, else null: "none" when the activity had no '
+    'hostile effect, "attempted" when a hostile action was sent and no evidence '
+    'shows that it worked, "succeeded" when a cited record shows that it worked, '
+    '"unknown" when the evidence does not show the effect), '
     '"citations" (a list of the evidence ids in the case that support the verdict: '
     "the id of a prefetched event, or a document id or a hash inside "
     "loop_tool_results; copy each id exactly as it appears). "
@@ -194,12 +207,44 @@ class OracleVerdict(BaseModel):
     # being clamped downstream into a fabricated 1.0 that could clear the
     # auto-ack threshold.
     confidence: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
-    summary: str
-    reasoning: str
+    # H3. The text for the analyst, in at most three plain sentences. None on
+    # an answer of the earlier prompt, which wrote ``summary``.
+    analyst_summary: str | None = None
+    # The text field of the earlier prompt. An answer needs this field or
+    # ``analyst_summary``: the reasoning alone is no text for the analyst.
+    summary: str = ""
+    reasoning: str = ""
+    # H2. What the hostile action of a true positive did: one of the four
+    # values of soc_ai.triage_models.Impact, else None. Optional: an answer
+    # without the key still parses, and a true positive then reads "unknown".
+    impact: str | None = None
     # The evidence ids the Oracle names (design 2026-10-04, "No override
     # without evidence"). Optional: an answer without the key still parses, and
     # its verdict can then only agree with the local one or be an opinion.
     citations: list[str] = Field(default_factory=list)
+
+    @field_validator("analyst_summary", mode="before")
+    @classmethod
+    def _coerce_analyst_summary(cls, value: Any) -> str | None:
+        text = value.strip() if isinstance(value, str) else ""
+        return text or None
+
+    @model_validator(mode="after")
+    def _needs_a_text_for_the_analyst(self) -> OracleVerdict:
+        if not self.analyst_summary and not self.summary.strip():
+            raise ValueError("the answer has no analyst_summary and no summary")
+        return self
+
+    @property
+    def text(self) -> str:
+        """The text of the answer for the analyst: the analyst summary, else the summary."""
+        return self.analyst_summary or self.summary
+
+    @field_validator("impact", mode="before")
+    @classmethod
+    def _coerce_impact(cls, value: Any) -> str | None:
+        folded = _normalize_impact(value)
+        return folded if isinstance(folded, str) else None
 
     @field_validator("citations", mode="before")
     @classmethod
@@ -263,7 +308,16 @@ class OracleResult:
 
     raw_oracle_summary: str = ""
     """The Oracle's own summary, desanitized. Kept for the opinion record when
-    the override is withheld."""
+    the override is withheld. The analyst summary when the answer has one."""
+
+    analyst_summary: str = ""
+    """The analyst summary of the answer, desanitized (H3). Empty on an answer
+    of the earlier prompt: the report then holds the earlier text, the summary
+    with the reasoning appended."""
+
+    oracle_reasoning: str = ""
+    """The reasoning of the answer, desanitized (H3). The run stores it in its
+    own field when the answer has an analyst summary."""
 
 
 # ---------------------------------------------------------------------------
@@ -351,6 +405,25 @@ def _parse_oracle_verdict(raw_text: str) -> OracleVerdict | None:
         return None
 
 
+def _desanitized_verdict(raw: OracleVerdict, mapping: Mapping) -> OracleVerdict:
+    """The answer with the real identifiers back in each of its text fields.
+
+    ``desanitize`` walks str, dict, list and tuple. The analyst summary, the
+    summary of the earlier prompt and the reasoning each get their labels
+    restored, for local display.
+    """
+    return OracleVerdict(
+        verdict=raw.verdict,
+        confidence=raw.confidence,
+        analyst_summary=(
+            str(desanitize(raw.analyst_summary, mapping)) if raw.analyst_summary else None
+        ),
+        summary=str(desanitize(raw.summary, mapping)),
+        reasoning=str(desanitize(raw.reasoning, mapping)),
+        impact=raw.impact,
+    )
+
+
 def _verdict_to_report(
     verdict: OracleVerdict,
     *,
@@ -375,8 +448,10 @@ def _verdict_to_report(
     - ``gap_for_investigator`` — always ``None`` (adjudication is terminal;
       never recurse into Phase D off an Oracle verdict).
 
-    The reasoning text is appended to the summary so it is visible in the
-    analyst-facing output.
+    The summary is the analyst summary of the answer (H3). The reasoning then
+    travels on :class:`OracleResult`, and the run stores it in its own field.
+    An answer of the earlier prompt has no analyst summary: its summary gets
+    the reasoning appended, as before, so that text stays visible.
 
     **The override gate (design §6, DECIDED 2026-08-27; both paths since
     2026-10-04).** A verdict that CHANGES the local class must be ``backed``:
@@ -393,9 +468,12 @@ def _verdict_to_report(
     production 6 of 23 answers changed the class, NMI to FP, with no tool call
     and no citation, and 2 of them were then auto-acknowledged.
     """
-    combined_summary = verdict.summary
-    if verdict.reasoning and verdict.reasoning.strip():
+    if verdict.analyst_summary:
+        combined_summary = verdict.analyst_summary
+    elif verdict.reasoning and verdict.reasoning.strip():
         combined_summary = f"{verdict.summary}\n\nOracle reasoning: {verdict.reasoning}"
+    else:
+        combined_summary = verdict.summary
     same_verdict = verdict.verdict == local_report.verdict
 
     if not same_verdict and not backed:
@@ -411,6 +489,9 @@ def _verdict_to_report(
         verdict=verdict.verdict,
         confidence=verdict.confidence,
         summary=combined_summary,
+        # H2. The impact the Oracle states. The orchestrator runs the impact
+        # guard on this report, as it does on a local one.
+        impact=settled_impact(verdict.verdict, verdict.impact),
         citations=list(local_report.citations),
         recommended_actions=list(local_report.recommended_actions) if same_verdict else [],
         field_reconciliation=local_report.field_reconciliation,
@@ -1576,14 +1657,7 @@ async def _adjudicate_with_tools(  # noqa: PLR0915 - one linear egress-gated pip
     # 4. Count the loop's successful (evidence-bearing) tool calls — the override
     # gate's input — and desanitize the verdict text for local display.
     successful_tool_calls = count_successful_tool_calls(result_messages)
-    rehydrated_summary = str(desanitize(raw_verdict.summary, mapping))
-    rehydrated_reasoning = str(desanitize(raw_verdict.reasoning, mapping))
-    desanitized_verdict = OracleVerdict(
-        verdict=raw_verdict.verdict,
-        confidence=raw_verdict.confidence,
-        summary=rehydrated_summary,
-        reasoning=rehydrated_reasoning,
-    )
+    desanitized_verdict = _desanitized_verdict(raw_verdict, mapping)
     # Citations resolve against the local run's retrieved evidence and the
     # Oracle's own tool results.
     resolved_citations = _resolve_oracle_citations(
@@ -1622,7 +1696,9 @@ async def _adjudicate_with_tools(  # noqa: PLR0915 - one linear egress-gated pip
         oracle_citations=resolved_citations,
         oracle_citations_cited=len(raw_verdict.citations),
         raw_oracle_confidence=desanitized_verdict.confidence,
-        raw_oracle_summary=rehydrated_summary,
+        raw_oracle_summary=desanitized_verdict.text,
+        analyst_summary=desanitized_verdict.analyst_summary or "",
+        oracle_reasoning=desanitized_verdict.reasoning,
     )
 
 
@@ -2170,15 +2246,7 @@ async def adjudicate(  # noqa: PLR0915 - one linear pipeline; splitting hides th
 
     # 6. Desanitize the verdict's text fields back to real identifiers.
     # desanitize() walks str / dict / list / tuple recursively.
-    rehydrated_summary = str(desanitize(raw_verdict.summary, mapping))
-    rehydrated_reasoning = str(desanitize(raw_verdict.reasoning, mapping))
-
-    desanitized_verdict = OracleVerdict(
-        verdict=raw_verdict.verdict,
-        confidence=raw_verdict.confidence,
-        summary=rehydrated_summary,
-        reasoning=rehydrated_reasoning,
-    )
+    desanitized_verdict = _desanitized_verdict(raw_verdict, mapping)
 
     # 7. Map OracleVerdict → TriageReport for the orchestrator, carrying the
     # local report's earned evidence fields forward (see _verdict_to_report).
@@ -2203,7 +2271,9 @@ async def adjudicate(  # noqa: PLR0915 - one linear pipeline; splitting hides th
         oracle_citations=resolved_citations,
         oracle_citations_cited=len(raw_verdict.citations),
         raw_oracle_confidence=desanitized_verdict.confidence,
-        raw_oracle_summary=rehydrated_summary,
+        raw_oracle_summary=desanitized_verdict.text,
+        analyst_summary=desanitized_verdict.analyst_summary or "",
+        oracle_reasoning=desanitized_verdict.reasoning,
     )
 
 

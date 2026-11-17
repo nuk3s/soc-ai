@@ -182,8 +182,14 @@ The rule prior covers a scheduled alert with the verdict of its rule's latest
 model run. It is the one rung that can hide a new case, so six safeguards limit
 it. The code is `soc_ai/agent/rule_prior.py`.
 
-1. Both endpoints are inside the estate. An alert with an external endpoint or
-   with no flow always runs.
+1. Both addresses are internal, or the external address is known. Two or more
+   model false positives of the rule in the last 7 days must have the same
+   internal address. Their external address must match the external address of
+   the alert. A match is the same address, the same IPv4 /24 or IPv6 /64
+   network, or the same name of the external end. The reason of such a cover
+   is `covered_known_external`. A new external address holds the alert with
+   `external_endpoint_new`. An alert with two external addresses or with no
+   flow always gets the model.
 2. The rule has `rule_prior_min_runs` model false positives in the last 7 days.
    The minimum is 5. No other model verdict of the rule falls in that window.
    One run is less than 24 hours old, so every rule gets one real run a day.
@@ -197,13 +203,19 @@ it. The code is `soc_ai/agent/rule_prior.py`.
    prior suspends it for the rule. An analyst clears the suspension on the
    Detection tuning panel.
 
+An alert with an address of a party of an open campaign always gets the model.
+The reason is `campaign_machine`. A campaign that an analyst closed holds no machine. The check
+reads the stored campaign rows.
+
 `rule_prior_mode` is `off`, `shadow` or `live`. A change applies with no restart.
 `shadow` is the default. In `shadow`, the model runs as before. The `rule_prior_decisions` table records
 what the prior would decide, why it did or did not apply, and the real verdict.
 In shadow every covered alert gets a real run, so every disagreement suspends
 the rule. In `live` a covered alert that the sample did not pick gets a
 rule-prior run and no model call. The Detection tuning panel shows the covered
-alerts, the agreements, the disagreements and the suspension per rule.
+alerts, the agreements, the disagreements and the suspension per rule. It splits
+the covered alerts and the disagreements into two internal addresses and a known
+external address.
 
 ### The standard loop
 
@@ -252,6 +264,19 @@ to the Oracle. A cheap run and a rule-prior run never go to the Oracle under eit
 both rules. They never add an escalation. The `oracle_escalation` audit row names
 the reason and the rule mode.
 
+One reason holds in each rule mode: `fallback_route`. Each run records what
+served it, in the `served_model` field of its report: the gateway model groups,
+the models that its calls asked for and a fallback mark. Only the gateway says
+what a fallback is. A call is a fallback when the fallback count of the gateway
+is above zero, or when the model group that served the call is not the model
+that the call asked for. The setting `analyst_model` is no test, because two
+configured names can share one backend. A run with a fallback call carries the
+mark, and the report page shows it. A run with no attribution reads "not
+recorded" and has no mark. A true positive from a marked run goes to the
+Oracle. A verdict from a marked run that changes an earlier verdict of the same
+alert or network session also goes to the Oracle. A cheap run and a rule-prior
+run stay local.
+
 An Oracle verdict that changes the local verdict needs evidence. The Oracle
 must cite an id that resolves to evidence that the local run retrieved beyond
 the alert. That evidence is an event in the enriched alert context or a document in the
@@ -268,6 +293,21 @@ true positive that changes the local verdict must cite evidence beyond the
 alert, as the rule above says. When the gate changed the local verdict, the
 local summary that the Oracle reads starts with that change.
 
+A gate that changes a verdict keeps the text of the model. The report
+carries the change in its `verdict_change` field: the gate, the verdict before
+and after, the reason and the missing evidence. The report page prints the
+change as one labeled line under the headline. Open questions lists the
+missing evidence.
+
+The headline never contradicts the final verdict. A gate that lowers a claim
+to needs more info leaves the summary of the model in place, so the sentence
+of the model stays the headline. A gate that refutes a claim sets a settled
+verdict, for example a false positive. The stored summary then leads with the
+reason of the gate, and the text of the model moves to the `model_summary`
+field of the report. Each list reads the stored summary and the stored
+headline. The report page prints the text of the model under the label "The
+model wrote".
+
 A failed adjudication writes an `oracle_adjudication_failed` row with the HTTP
 status, the error class and the gateway's message. The message is
 secret-scrubbed. The classes are `quota`, `5xx`, `4xx`, `timeout`, `transport`,
@@ -277,10 +317,22 @@ the body.
 
 The Oracle route pauses if the gateway answers with a usage limit, or with
 three server errors in a row. A route is the gateway URL and the Oracle model.
-The pause lasts until the reset time that the message or the `Retry-After`
-header names. With no reset time, the pause lasts one hour. During the pause soc-ai makes no Oracle call. It
+The pause lasts until the reset time that the message, the `retry_after` field
+of its JSON body or the `Retry-After` header names. The field holds seconds or
+an ISO time. A safety bound cuts its wait to 7 days. With no reset time, the
+pause lasts one hour. During the pause soc-ai makes no Oracle call. It
 writes an `oracle_skipped` row for each escalation, with the reset time, and
-the local verdict stands. The doctor and the preflight show an "oracle route"
+the local verdict stands. A run whose Oracle call failed, or whose escalation
+the pause skipped, is in the Oracle retry queue. When the pause is over, the
+auto-triage sweep starts a new run of the same alert or finding, and that run
+escalates again. The cap is a count for all time: one alert or finding gets two
+new runs after a quota, server, timeout or transport failure, and one new run
+after a refusal. A skipped escalation is no failed call and does not use the
+cap. A subject that cannot run leaves the queue, and the run records the
+reason in an `oracle_retry_dropped` row: the hunt of a finding is gone, the
+grid no longer holds the alert, or the alert is acknowledged or escalated. The
+queue also skips a subject with an analyst verdict or an analyst action. The
+doctor and the preflight show an "oracle route"
 row. The bell gets one row for each pause, and the webhook gets one message.
 `notify_on_oracle_failure` turns both off.
 
@@ -356,7 +408,9 @@ them on `synth.scenario_id`, so no fixture leaks into a real response.
    severity, and whether the run retrieved anything. Set
    `auto_ack_fp_enabled=true` to enable it.
 3. Every execution runs through `execute_write_tool`. It accepts the 3 write
-   tools only. It audits fail-closed, so soc-ai writes the audit *intent* record
+   tools, `open_finding_case` for the escalate of a promoted finding, and
+   `open_campaign_case` for the one case of a campaign. No report can name
+   either of the last two. The route builds their arguments from the store. It audits fail-closed, so soc-ai writes the audit *intent* record
    before it touches Security Onion. It is idempotent for an action that already
    ran. A persisted `action_executed` event, or an already-acked alert, returns
    ok-with-note, and soc-ai does not write twice.

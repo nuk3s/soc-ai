@@ -1,7 +1,7 @@
 id: prior-hypervisor-novel-served-port
 title: A hypervisor serves a port it has never served before
 description: >
-  A hypervisor is the highest-value machine in most estates. A hypervisor is
+  A hypervisor is the highest-value machine in most networks. A hypervisor is
   also among the most predictable. It serves a management interface, an API and
   a console proxy. A new listening port on a hypervisor is always worth a look.
 

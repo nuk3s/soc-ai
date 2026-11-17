@@ -38,5 +38,5 @@ export function useSort<K extends string>(initial: SortState<K>, newKeyDir: Sort
   const ariaSort = (key: K): 'ascending' | 'descending' | 'none' =>
     sort.key !== key ? 'none' : sort.dir === 'asc' ? 'ascending' : 'descending';
 
-  return { sort, toggleSort, caret, headerCls, ariaSort };
+  return { sort, setSort, toggleSort, caret, headerCls, ariaSort };
 }

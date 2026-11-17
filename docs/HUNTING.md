@@ -1,10 +1,11 @@
 # Hunting
 
 soc-ai triages the alerts your grid raises. It also looks for the attacks that raise no alert.
-This guide covers that second half. The analytics run over the grid and write hits. Leads form
-from the hits. Hunts answer the leads, and investigations end in a verdict.
+This guide covers that second half. The analytics read the grid and write hits. Leads form
+from the hits. Hunts answer the leads, and investigations end in a verdict. A confirmed attack
+starts or joins a campaign, and you decide on the campaign in Needs you.
 
-![How this flows: the alert path and the sweep path, from an analytic hit and an alert to an action in Security Onion](img/hunting-flow.svg)
+![How this flows: from the grid to your decision, with the sweep path, the alert path, the campaign and Needs you](img/hunting-flow.svg)
 
 ## The five nouns
 
@@ -14,11 +15,10 @@ soc-ai uses one word for one thing. The whole pipeline uses these five nouns.
   analytic is one that you write in the console. Both use one schema.
 - **Hit:** one match of one analytic on one entity, with the documents behind it. A hit is
   stored as an observation. The lead page and the host page call it an observation.
-- **Lead:** the observations on one entity that are worth one decision.
-- **Hunt:** one run against one objective. The model or a catalog query runs it. An analyst, a schedule or a lead starts it. A hunt
-  ends in findings and a narrative. It states no verdict. soc-ai investigates its findings.
-- **Investigation:** one run of the model that ends in a verdict. Its subject is one alert, or one hunt
-  with all of its findings.
+- **Lead:** the observations on one entity that are worth one look.
+- **Hunt:** one search of the grid for one objective. The model or a catalog query does the search. An analyst, a schedule, a lead or a campaign starts it. A hunt
+  reads the open campaigns. It ends in findings and a narrative. It states no verdict. soc-ai investigates each threat finding that names an entity, unless a campaign holds the finding.
+- **Investigation:** the work of the model on one alert or one hunt finding. It ends in a verdict.
 
 Two more words appear on screen. An **entity** is a host, a user or an address. A **type** is the
 class of an observation or a hunt. The database column is still named `kind`.
@@ -37,7 +37,7 @@ and keeps the record time in the hover text.
 | A profile novelty that fewer than 3 hosts know | the novelty type | 0.6 |
 | One new member on 3 or more hosts in one sweep | `scope_count` | 0.4 |
 | A new member that the peers in the role do not know | `rare_for_peers` | 0.45 |
-| A host far from its learned peer group, from the estate model, always in shadow | `estate_outlier` | 0.3 |
+| A host far from its learned peer group, from the network model, always in shadow | `estate_outlier` | 0.3 |
 | A catalog hit | `catalog_match` | 0.7 |
 | A catalog hit from an analytic with no benign baseline | `prior_no_baseline` | 1.0 |
 | A triaged alert, true positive | `alert` | 1.0 |
@@ -72,6 +72,29 @@ lead. It never merges two leads.
 
 A lead that holds one or more shadow observations is a shadow lead. A shadow lead starts nothing by
 itself.
+
+A live finding lands in a live lead. A live finding is a true-positive alert, or a hit of a live
+analytic that declares no benign baseline. It joins a lead on its entity that is open or under a
+hunt and is not a shadow lead. If the entity has no such lead, the finding forms one. That lead is
+never a shadow lead and never a fleet condition, so the loop hunts it. A shadow observation never
+joins that lead. The entity can then hold two leads: the fleet condition or the shadow lead, and the
+live lead.
+
+A second true-positive alert on the same entity joins the live lead. The lead keeps the hunt it has,
+and no second hunt starts. A true-positive alert that arrives after a clean hunt closed a lead does
+not join that closed lead as history. It forms a new lead.
+
+One bound applies after a close. A true-positive alert joins a closed lead on its entity when the
+lead held the same alert rule at its close, and the close is less than 207 hours old. No new lead
+forms, and no hunt starts. The row of the closed lead states the count of these repeats and the
+time of the newest one. The bound applies to each type of close. An alert of another rule forms a
+new lead, and so does the same rule on another host or after 207 hours. If you reopen the lead, the
+alert joins the open lead.
+
+The verdict of an alert can change to true positive after the alert joined a lead. The alert then
+leaves a shadow lead, a fleet condition, and a lead that a hunt closed before the alert arrived. It
+goes to a live lead by the same rule. A lead that holds a live finding is never marked shadow, also
+when soc-ai moves one of its analytics back to shadow.
 
 ## The baseline behind a profile departure
 
@@ -110,7 +133,13 @@ served port also needs two different peers or two different days before it count
 and at novelty alike. A port at 32768 or above needs both. One client that tries one high port once
 is not a service.
 
-### Estate prevalence
+A probed port is not a served port. A TCP flow record is a probe when the responder sent no packet,
+or when the responder refused the connection. A probe does not count in the baseline, at novelty,
+in the host dossier or in the host summary. One SYN-ACK from the host is enough for the port to
+count. A UDP record and a record with no responder counter count as before, because a UDP log sink
+sends no answer. The host dossier corrects a stored port of this type on its next build.
+
+### Prevalence on the network
 
 After each build, soc-ai counts the hosts whose set knows each member. The count reads the stored
 profiles, so it costs no search. The prior sweep refreshes it if a build is newer than the count.
@@ -118,8 +147,8 @@ A new member on a host is then one of three things:
 
 | Hosts that know the member | Name | Effect |
 |---|---|---|
-| Fewer than 3 | estate-rare | The observation is born at 0.6, where a plain novelty is born at 0.5 |
-| More than 20 % of the profiled hosts, and at least 3 | estate-common | A trait of the estate. No observation. The note counts it |
+| Fewer than 3 | rare on the network | The observation is born at 0.6, where a plain novelty is born at 0.5 |
+| More than 20 % of the profiled hosts, and at least 3 | common on the network | A trait of the network. No observation. The note counts it |
 | Any other count | novelty | The observation is born at 0.5 |
 
 The observation states the count as its statistic, as in "1 of 40 profiled hosts holds this
@@ -133,9 +162,9 @@ The peer group of a host is the other hosts in its role. The role must be declar
 0.9 or more. The refresh after each build writes the role and its confidence on every profile row.
 With 5 peers or more, a new member that most peers know is a trait of the role. It forms no
 observation, and the note counts it. A host whose role is a guess has no peer group, unless the
-estate model is on. With `estate_model_enabled` on, a host with no confident role reads its
+network model is on. With `estate_model_enabled` on, a host with no confident role reads its
 learned group as its peer group. The note then names the group, as in "learned group 3". The
-learned group applies only if it comes from a measured fit that is under 48 hours old. See "The estate model"
+learned group applies only if it comes from a measured fit that is under 48 hours old. See "The network model"
 below.
 
 The test `rare_for_peers` finds a member that is new to the host and new to its peers. At most
@@ -208,7 +237,7 @@ of the host all resolve to a proxy, and the proxy carries the dimension. **unmea
 plane carries the field, but the grid refused the query that measures it. soc-ai scores a departure
 against a measured dimension only.
 
-The builder reads the active hours and the connection rate with one query over the whole estate,
+The builder reads the active hours and the connection rate with one query over the whole network,
 split into partitions. If Elasticsearch refuses the query for too many buckets, the builder doubles
 the partitions and tries again, up to 32 partitions. If the grid still refuses, the builder records
 both dimensions as unmeasurable, with the reason that the grid gave. The host page shows the reason on the row,
@@ -261,7 +290,7 @@ runs it. A `profile` analytic compares a host with its stored baseline. A `model
 learned detector. The profile sweep runs the `profile` and the `model` analytics every hour, with
 the same time anchor.
 
-A learned detector learns what is normal from the estate's own history. It calls no model and it
+A learned detector learns what is normal from the history of the network. It calls no model and it
 needs no label. It is pure Python. A `model` analytic names its detector and the parameters of the
 detector:
 
@@ -316,7 +345,7 @@ running.
 The detector reads each plane of each machine, hour by hour. The planes are host logs, process
 events, endpoint network events, Windows security events, osquery, agent self-logs and the network
 flows of the sensor. The host planes are keyed by `host.name`. The flows join the machine through the
-`host.ip` values its agent reports, inside the estate. An address that two machines report joins
+`host.ip` values its agent reports, inside the network. An address that two machines report joins
 neither.
 
 Each plane is compared with its own expected count for the same hour of the week. The expected
@@ -347,7 +376,7 @@ more planes. Both run until a shadow week measures them.
 `model-logon-chain` finds a session that lands on host B, followed by the first attempt from B to a
 third host C. This is how an intruder moves from one host to the next.
 
-The detector learns the edge set of the estate over 30 days: which address opened an accepted
+The detector learns the edge set of the network over 30 days: which address opened an accepted
 session on which host. A session is a Windows 4624 of logon type 3 or 10 with a source address, or
 an sshd Accepted line in `system.auth`. The outbound edges of a host are the edges whose source is
 one of its own addresses.
@@ -355,24 +384,24 @@ one of its own addresses.
 A hit needs a session on B from another host, then within 15 minutes an attempt from an address of
 B to a host C. The attempt is an accepted or a failed logon on C. C is not in the edge set of B.
 B did not try C earlier in the read. C is not the host that the session came from. The edge set of
-the estate and the history of B must each hold 14 days or more. Until then B is learning. A host
+the network and the history of B must each hold 14 days or more. Until then B is learning. A host
 whose address soc-ai does not know is unmeasurable.
 
 A hit cites the session document on B and the attempt document on C. Its statistic is
 `chain_minutes`: the minutes between the two documents, against the number of outbound edges B
 had. Its query shows the documents of B and the attempts from the addresses of B over that time.
 
-## The estate model
+## The network model
 
-The estate model is tier 3 of the detection design. It fits a model of the whole estate once a
-day. The model groups the hosts that act alike, and it scores each host against the estate. It
+The network model is tier 3 of the detection design. It fits a model of the whole network once a
+day. The model groups the hosts that act alike, and it scores each host against the network. It
 writes observations in shadow only. It is off by default. Turn on `estate_model_enabled` to run it.
 
 ### Dependencies
 
 The model needs scikit-learn and numpy. They come in the optional extra `ml`. The container image
 installs the extra. On the systemd path, run `uv sync --extra ml`. With the setting on and the
-extra absent, the daily run logs one line, "estate model: unavailable", and does nothing. soc-ai
+extra absent, the daily run logs one line, "network model: unavailable", and does nothing. soc-ai
 imports the extra only when the run starts.
 
 | Package | Version on 2026-10-04 |
@@ -447,7 +476,7 @@ carries an OQL query that groups the documents of the host by dataset. The summa
 three features with the value of the host and the median of its peers:
 
 ```
-198.51.100.2 departs from learned group 2 of 102 hosts. Its estate outlier score is 0.62. The
+198.51.100.2 departs from learned group 2 of 102 hosts. Its network outlier score is 0.62. The
 group median is 0.48. Logon users: 30. The peer median is 1. Logons a day: 400.0. The peer
 median is 9.7. Outbound ports: 6. The peer median is 5.
 ```
@@ -488,7 +517,7 @@ A loop wakes every 5 minutes. It fits if the newest fit is 24 hours old. The fit
 single-flight slot of the dossier sweep, so it never runs beside a dossier sweep or a profile
 rebuild. The fit runs in a worker thread.
 
-The doctor row "estate model" reads "unavailable", "off", "learning", "measured", "drifted" or
+The doctor row "network model" reads "unavailable", "off", "learning", "measured", "drifted" or
 "held", with the date of the last fit. A fit older than 48 hours reads "stale". With the setting
 off, the row still states the date and the state of the last fit.
 
@@ -526,6 +555,73 @@ objective therefore reads "Related leads at the start of this hunt".
 Every lead hunt also reads the earlier conclusions about its entities. This includes Hunt again
 and the bulk hunt. See [Earlier conclusions](#earlier-conclusions).
 
+A lead of a campaign follows its campaign. See
+[Leads and hunts of a campaign](#leads-and-hunts-of-a-campaign).
+
+## Leads and hunts of a campaign
+
+A lead of a campaign is a lead whose observations are all alert observations of investigations
+that one campaign holds. The step after each rebuild finds these leads from the stored rows. It
+writes the campaign id on the lead. The refresh loop runs the step again on each wake. A write of
+another process then reaches the leads too.
+
+A lead of a campaign waits on its campaign. It is no item of Needs you, it is not on the Needs
+decision tab, and it raises no bell row. It never reads "hunt queued". `GET /leads/count` counts
+it in `in_campaign`, and the In progress tab leaves it out. The lead page names its campaign.
+
+A lead keeps normal handling when one of its observations is of another type. It also keeps normal
+handling when one of its observations is of an investigation that the campaign does not hold.
+soc-ai reads this rule again on each read. A lead also returns to normal handling when its
+campaign is withdrawn, and when its investigation is beyond an authorization. The campaign page
+lists such a lead under "Related, not proven" when two facts hold. The lead names a machine of the
+campaign, and one of its observations is in the period of the campaign.
+
+**One hunt a day.** soc-ai starts at most one hunt for one campaign in 24 hours. The limit reads
+the hunt rows of any status and of any starter, so it holds after a restart. A hunt of a merged
+campaign counts for the campaign that took it. An analyst can always start a hunt by hand. Such a
+hunt counts for the limit.
+
+The first hunt of a campaign is the lead hunt of its seed. The seed forms its lead before the
+campaign exists, and the lead loop hunts it. The rebuild then gives that lead and that hunt the
+campaign id. The seed forms a lead on each internal end, and only the first lead takes a hunt.
+
+The lead loop skips a lead of a campaign when the campaign had a hunt in the last 24 hours. It also
+skips the lead when the campaign holds a close or an authorization in force.
+
+**The campaign hunt.** With `lead_auto_hunt` on, a second loop wakes every 60 s. It starts a hunt
+for a campaign after four changes: a higher stage, a new machine, an open again by new activity,
+and activity beyond an authorization. A hunt answers each change from 24 hours before the change
+on. Two changes in one hour therefore start one hunt. A change older than 24 hours starts no hunt.
+
+A close and an authorization in force stop a hunt for a higher stage and for a new machine. The
+analyst decided on that activity. An open again by an analyst and a revoke start no hunt. The loop
+holds at most `lead_auto_hunt_concurrency` of its own hunts at a time, inside the shared limit of
+the console. The demo starts no campaign hunt.
+
+The hunt has the type "Campaign" on the Hunts page, and its title reads "Campaign 12 hunt". Code
+writes its objective from stored facts: the title, the machines with role and address, each
+reached stage with its times, and the period. The title and the addresses go in quotes inside the
+untrusted markers, as in the other hunt blocks. No rule name and no text of the model goes in. The
+objective asks four questions:
+
+1. Did the action on the target work?
+2. What ran on the target after it?
+3. Did the target reach a third machine?
+4. Is there activity after the last event?
+
+**A decision closes the leads.** A close of a campaign dismisses each open lead of the campaign
+with the reason `campaign_closed`. An authorization dismisses them with the reason
+`campaign_authorized`. Each lead gets the hand `system:campaign` and one decision record. A lead
+with an investigation beyond the authorization stays open. A lead that joins a closed campaign
+later closes with it. An open again and a revoke change no lead, because new activity forms its
+own observation. The dismiss form does not offer the two reasons.
+
+**The payloads.** `LeadOut.campaign`, `HuntOut.campaign` and the `campaign` of a hunt list row hold
+the campaign link. `CampaignOut.leads` lists the leads of the campaign and the related leads. Each
+row holds `id`, `title`, `state`, `hunted` and `related`. `CampaignOut.hunts` lists the 20 newest
+hunts for the campaign. Each row holds `id`, `starter`, `status`, `startedAt`, `findings` and
+`threatFindings`.
+
 ## Hunt outcomes
 
 A lead settles when its hunt finishes. What the hunt found decides where the lead goes.
@@ -533,12 +629,17 @@ A lead settles when its hunt finishes. What the hunt found decides where the lea
 - The hunt found **no threat**. soc-ai closes the lead with the reason `hunt_clean`. The lead moves
   to the Closed tab and reads "Closed. The hunt found no threat.", with the chip "closed by soc-ai".
   No analyst chose a reason, so the lead quality report counts it separately from your dismissals.
-  soc-ai closes the lead only if the hunt read its evidence. A visibility gap finding, a failed
-  tool call, a degraded run or a report from the budget synthesizer keeps the lead open. An earlier
-  hunt on the same lead with a threat finding keeps it open too. A finding that linked this lead to
-  other leads also keeps it open. The lead then waits under Needs decision. The lead page states the
-  reason: "The hunt could not read all evidence.", "An earlier hunt found a threat." or "The hunt
-  linked this lead to other leads."
+  soc-ai closes the lead only if the hunt read its evidence. A grid failure keeps the lead open:
+  the grid did not answer a tool call, and no later call of that tool got an answer. A grid failure
+  beside a visibility gap finding keeps it open too. A degraded run, a run error and a report from
+  the budget synthesizer keep it open. A query error does not: the model wrote a wrong query, and
+  the grid lost nothing. A visibility gap finding with no grid failure does not: it states a
+  standing fact, such as a host with no agent. An earlier hunt on the same lead with a threat
+  finding keeps the lead open. A finding that linked this lead to other leads keeps it open. A
+  true-positive alert that joined the lead after the hunt started keeps it open. The lead then waits
+  under Needs decision. The lead page and the lead row state the cause in one sentence, such as
+  "The grid did not answer a query of the hunt. The hunt did not get that answer later.", "An
+  earlier hunt found a threat." or "The hunt linked this lead to other leads."
 - The hunt found a **threat**, or it reported a **visibility gap**. The lead waits on you under
   Needs decision as "Hunted · Threat findings" or "Hunted · No threat observed · visibility gap".
   Read the verdicts that the hunt brought back, or dismiss the lead.
@@ -561,6 +662,12 @@ for an investigation opened on the lead. The lead page shows it as "opened an in
 A closed lead keeps its history. A type that the hunt already cleared can show up again while the
 lead's observations are still live. The new observation then joins the closed lead as history. No new
 lead forms, and no new hunt starts. A new type reopens the lead in place, and the loop hunts it again.
+
+A repeat of an observation stays on its closed lead for 207 hours after the close. That time is the
+decay horizon of the default half-life and floor. A new sighting after it leaves the closed lead. The
+observation then starts a new count, and it can form a lead or join an open lead. This rule applies
+to a lead that a hunt closed and to a lead with an investigation. A lead that you dismissed keeps its
+observations and their repeats until you reopen it.
 
 A lead that an earlier release left in hunting settles at the next start. With `lead_auto_hunt` on,
 the loop also settles finished hunts at each wake, before it picks the next leads.
@@ -620,6 +727,62 @@ alert. The finding makes its own claim.
 
 soc-ai never reuses a failed run, a pipeline fallback or a backtest replay.
 
+### A finding that restates an earlier finding
+
+A scheduled hunt can report the same activity on each run, in new words. soc-ai then looks for a
+finding of another hunt from the last 7 days that the new finding restates. All of these must be
+true:
+
+- The latest run of the earlier finding is finished, and its verdict is true positive. soc-ai
+  follows every Re-run and reads the verdict after an analyst override. A false positive, needs
+  more info, an inconclusive verdict, a running run and a failed run never answer.
+- The new finding cites one document or more, and each one is a document that the earlier
+  finding cites. A citation is a document only when the hunt stored it. A tool name, an address
+  and a rule are not documents.
+- The two findings name the same machines. A host name and its address are one machine where the
+  Hosts data joins them.
+- The new finding names no ATT&CK technique and no `rule:<id>` that the earlier finding lacks.
+
+The new finding links to the investigation of the earlier finding, and no new run starts. One
+earlier investigation answers for one finding of a hunt: the finding that shares the most
+documents with it. Each other finding of that hunt gets its own investigation.
+
+The finding card reads "Restates <earlier finding>, verdict <x>" and links to the hunt of the
+earlier finding. The verdict is the verdict of the latest run, read when the page loads. When that
+run stops being a true positive, the card shows no verdict for the new finding. It reads "That
+verdict does not answer for this finding", and **Open an investigation** starts a run of the new
+finding. The API returns the earlier finding in `restates`, with `verdict` and `answers`.
+
+A lead hunt does not use this rule. Each threat finding of a lead hunt gets its own
+investigation, or reuses a run with the same subject fingerprint as before. The lead settles on
+those verdicts. A restated link never closes a lead.
+
+### A finding that restates a campaign
+
+A hunt reads the campaigns that soc-ai holds (see [Campaign blocks](#campaign-blocks)). A finding
+that only restates such a campaign gets no investigation of its own. soc-ai checks this before
+the restated-finding rule above. The rule is strict, and each doubt goes to an investigation. All
+of these must be true:
+
+- The finding is a threat. Each host that it names is a machine of one active campaign, and the
+  hunt read the block of that campaign. An address in the citations counts as a named host. A
+  user or a domain fails the rule.
+- The finding names two machines or more, or the campaign has one target.
+- The finding cites one document or more. Each one is a document that the hunt stored, and its
+  time is not after the last event of the campaign.
+- The finding states its stage, and the stage is not above the stage that the campaign reached.
+
+The entry of the finding then reads the state `campaign`. It names the campaign and gives the
+reason in words. The finding card reads "Held by the campaign <title>" and links to the campaign.
+The API returns `investigationStatus: "campaign"` and the campaign link in `campaign`. A merged
+campaign answers with the campaign that it merged into. A withdrawn campaign holds nothing. The
+finding then reads no investigation, and **Open an investigation** starts its own investigation.
+
+A held finding is settled. It is no new threat finding of the hunt, so the threat counts of the
+hunt leave it out and it reads neither as confirmed nor as not judged. A hunt whose only threat
+findings are held keeps the outcome of the rest of its report, and it sends no notice. A lead
+hunt and an evaluation hunt never use this rule. Every other finding is investigated as before.
+
 ### Outcomes after the investigations
 
 The outcome of the hunt then reads the verdicts.
@@ -639,7 +802,8 @@ When every subject finding of a lead hunt has a verdict, soc-ai closes the lead 
 decision names `system:hunt` and records the verdict of each finding. A finding with no verdict
 leaves the lead to you. A failed investigation, a pipeline fallback, a cancelled investigation and a
 finding past the cap have no verdict. The lead then waits under Needs decision. The lead page
-states the reason: "A threat finding of the hunt has no verdict." Use Re-run on the investigation
+and the lead row state the count and each confirmed threat, as in "1 of 3 threat findings has no
+verdict. 1 finding is a true positive." Use Re-run on the investigation
 page of that finding, or decide on the lead. A finding past the cap has no investigation. Use Open
 an investigation on the hunt page for it. With `lead_auto_hunt` on, the loop closes the
 lead at its next wake after the last verdict lands. A lead hunt with no subject finding settles by
@@ -647,6 +811,33 @@ the rules in [Hunt outcomes](#hunt-outcomes).
 
 `soc-ai usage` counts the hunt's own investigations under the entry "Hunt finding investigation". It
 prints the line `hunt findings investigated: N` for the window.
+
+### A hunt that reaches its budget
+
+A hunt that reaches its budget or its time limit still writes a report. A second model call writes
+it from the evidence that the hunt gathered. That call replays the tool calls of the hunt. When the
+model answers the replay with one more tool call, soc-ai runs the call again on a text copy of the
+evidence. The report is a partial report in both cases. soc-ai records the model usage of an
+attempt that fails, so the run counters hold its cost.
+
+### A degraded hunt
+
+A hunt takes the mark **Degraded** when its model returns no reasoning trace and one of the last 10
+agent hunts carried one. The hunt still completes, and soc-ai still investigates its findings. The
+Hunts list and the hunt page show the mark. Each finding states it, behind the note of a gate
+when the finding has one. The API returns the reason in
+`degraded` and the sentence in `degradedNote`. A later scheduled hunt does not read the findings of
+a degraded hunt as earlier conclusions.
+
+A deployment whose model never returns a reasoning trace takes no mark.
+
+### A lost hunt
+
+A hunt that ends in an error states the cause in plain words: which limit the hunt reached, and
+what stopped the report. Each cause has its own sentence: the redaction stopped the prompt, the
+model gateway failed, the model answered with a tool call, the model used every request of the
+report writer, or a request did not answer in time. The hunt page shows the error text of the
+server behind **Show the technical detail**. The API returns it in `errorDetail`.
 
 ## Investigations of hunt findings
 
@@ -728,7 +919,8 @@ One entity is one lead. A coordinated attack across several machines is several 
 single one of them reads as a campaign. The lead page carries a **Related leads** panel for that
 case.
 
-A related lead is open, and it formed in the last 7 days. It also shares one of four things with
+A related lead is open, and it formed in the last 7 days. A fleet condition lead is never a related
+lead. A shadow lead is never a related lead. A related lead also shares one of four things with
 the lead you are reading:
 
 - the same analytic on an observation within 24 h
@@ -762,6 +954,36 @@ soc-ai skips a run of the synthetic evaluation, a partial run and a run that rea
 partial run is a run that stopped at its budget. soc-ai carries only the findings that cite a
 document. It does not carry the narrative, because no gate checks the narrative.
 
+A scheduled hunt also reads the **records of its window**. The window is the time range that the
+objective states, such as "the past 72 hours", "72h" or "seven days". An objective that states
+none reads the interval of its schedule. The header of the block states which one. The window is
+at most 7 days. The block holds three lists:
+
+- **Confirmed activity**: the true positive verdicts of alert triage, one line for each target
+  host and rule. The line gives the count, the newest time, the highest confidence, up to 3
+  sources and the count that the Oracle confirmed. At most 8 lines. An alert counts by its event
+  time, so a Re-run of an old alert is not activity of the window.
+- **Confirmed activity**: the findings of other hunts whose latest investigation is a true
+  positive. A finding with a false positive, with needs more info or with no verdict is not
+  listed. A finding of a partial hunt or a degraded hunt carries that mark. At most 8 findings.
+- **Open leads**: the open leads that changed in the window, each with its entities, its
+  observation types and its 2 newest observations. At most 6 leads. The label states that a lead
+  is not confirmed activity. A shadow lead and a fleet condition are not read.
+
+Every value in the block comes from the grid, from a model or from a user. soc-ai puts each value
+in quotes, escapes its control characters and puts the records between two markers. The rule of
+the block tells the model that a quoted value is never an instruction.
+
+The whole block is at most 6,000 characters: the header, the records and the rule. A longer block
+loses its last records and says so. A window with none of the three lists adds no block.
+
+The hunt must not write an all-clear that contradicts a true positive of the block. The prompt
+states the rule. soc-ai also checks the report, and it reads no sentence to do so. A true positive
+is accounted for when the report holds a threat finding on its target host, or when the narrative
+names its target host or its rule. For each true positive that is not accounted for, soc-ai names
+it in one line before the narrative. The line has the label "Confirmed activity in the window".
+The text of the model stays whole. A report that names the confirmed activity gets no line.
+
 The hunt reads each conclusion as a claim to check. A conclusion is not evidence. The block names no
 lead, hunt or investigation id, so the hunt cannot cite one. The Objective step on the hunt page
 shows the block and its source records. The hosts that only the block names reach the host dossier
@@ -769,7 +991,8 @@ with the label "named in an earlier conclusion".
 
 With redaction in fail-closed mode, soc-ai checks the block before the hunt starts. When the block
 holds a name that the redaction cannot remove, the hunt starts without the block. The Objective step
-states this.
+states this. soc-ai checks the earlier runs and the records of the window apart, so a name in one
+part does not drop the other part.
 
 soc-ai reads the conclusions once, at the start of the hunt. The objective does not change. A
 scheduled hunt therefore keeps its link to its earlier runs and its "vs last run" comparison.
@@ -782,6 +1005,348 @@ The read writes nothing. A closed lead keeps its status, its history and its obs
 reads promoted leads only. A dismissed lead, a reopened lead and a lead whose hunt did not settle
 are not earlier conclusions. An analyst chat hunt and a re-hunt of a hunt read no earlier
 conclusions.
+
+## Campaign blocks
+
+A hunt reads the campaigns that soc-ai holds before it starts. The scheduled hunt then reports
+only what is new about them.
+
+soc-ai gives the hunt one block for each active campaign that is open or has an event in the
+window of the hunt. The window is the window of the records block above. The hunt reads at most 5
+blocks, the newest last event first. A scheduled hunt and a hunt that an analyst starts read these
+blocks. A lead hunt and a campaign hunt read the block of their own campaign only. An evaluation
+hunt reads no block.
+
+Each block states stored facts of one campaign:
+
+- the title;
+- the machines, each with its role, its name and its address, at most 6;
+- each reached stage with its time, and the highest stage;
+- the period, from the first event to the last event;
+- the decision: none, closed with its date, or authorized with its expiry.
+
+A block never carries a rule name, a summary or other text that a model wrote. The title and the
+machine names come from DHCP, DNS and the agents. soc-ai puts each such value in quotes, escapes
+its control characters and puts the facts between two markers, as in the records block. One block
+is at most 1,600 characters. A rule follows the last block. It tells the hunt that the activity of
+a campaign is known, and that a finding on its machines is due only for new activity. New activity
+is a later stage, a machine that the block does not name, or an event after the last event. The
+hunt states the stage of each finding on such a machine. The narrative states in one sentence that
+each campaign continues or shows no new event.
+
+The records block and the campaign blocks state each record one time. A true positive, a finding
+or a lead that a campaign block states leaves the three lists of the records block. A lead of a
+campaign is a lead whose every live observation is the alert observation of an investigation of
+that campaign. The all-clear check above still reads every true positive of the window. A hunt
+with no records block reads the true positives of its campaign blocks in its window. The
+authorized activity block lists a campaign record only when no campaign block states that
+campaign.
+
+With redaction in fail-closed mode, soc-ai checks each block alone. A block that holds a name that
+the redaction cannot remove is dropped, and the hunt starts without it. A dropped block states
+nothing, so its records stay in the records block. The Objective step shows the blocks that the
+hunt read, or states that a block was dropped. The started event of the hunt stores the text of
+the blocks in `campaigns` and the ids of their campaigns in `campaign_ids`.
+
+## Campaigns
+
+A campaign is one activity. It is a set of investigations that proven links join. The console
+shows one page for each campaign: who acted, on what, when, and how far the activity went.
+
+Code decides which investigations belong to a campaign. The model writes no campaign. A hunt
+reads the stored facts of a campaign in its campaign block (see [Campaign blocks](#campaign-blocks)).
+
+**The terms.** An event is one record of the grid. An alert is an event of a detection rule. A
+finding is a hunt finding. An investigation is the work of soc-ai on one alert or one finding. A
+party is a machine of the campaign, and its role is actor or target. A link is the proven reason
+that an investigation belongs. The attack classes are the alert classes `recon`, `exploit_attempt`
+and `post_compromise`, a true positive finding, and a true positive with the impact `attempted` or
+`succeeded`.
+
+**The seed.** A campaign starts from one true positive investigation of an attack class. The Hosts
+data must join its source address to one machine and its target address to one machine. A true
+positive with the impact `none` starts no campaign. Such an investigation can join one.
+
+**The links.** An investigation joins a campaign when one link holds between it and an
+investigation of the campaign. The horizon is the decay horizon of a lead, 207 hours. The gap is
+the wave gap, 30 minutes.
+
+The table names each link by its engine name. The console shows the label of the last column.
+
+| Link | Condition | Console label |
+|---|---|---|
+| `seed` | The investigation starts the campaign. See the seed above. | First confirmed attack |
+| `session` | The two investigations hold the same community id, and the two times are within one gap. The new investigation has any verdict, and the other is a true positive. | Same connection |
+| `actor` | Both investigations are true positives of an attack class with the same source machine, within one horizon. | Same attacking machine |
+| `artifact` | The new investigation is a true positive with a source machine, on the target machine of the other. Both hold the same rule, the same CVE id, or the same HTTP method and URI path. The same source machine has no time limit. A new source machine needs one horizon. | Same rule, CVE or request |
+| `documents` | The new investigation is a true positive finding. The store holds each document that it cites, and both machines of each document are parties. Within one horizon. | Same records |
+| `target_source` | The source machine of the new investigation is the target machine of the other, within one horizon after the other. The impact of the other reads `succeeded`. | The target then acted |
+| `named_pair` | The new investigation is a true positive finding with a target machine and no source machine. Its finding names one other machine, and the campaign holds an attack of that machine on that target, within one horizon. | Named by the finding |
+| `included` | An analyst includes the investigation. See "Exclude and include" below. | Included by an analyst |
+
+A true positive investigation that links to two campaigns merges them. The older campaign keeps
+its id. An investigation with another verdict joins one campaign by its session and passes no link
+on. An investigation that joins by the `named_pair` link starts no campaign, adds no machine and
+passes no link on: the names of a finding prove no direction. The result does not depend on the order in which the investigations arrive.
+
+The sessions and the artifacts of an investigation come from the documents between its own source
+and target. A finding investigation reads the documents that its own finding cites.
+
+A machine is a party only when the Hosts data joins its address by an agent report, a DHCP lease
+or a network record. A container address and a bridge address are never party addresses. More than
+one machine can hold such an address.
+
+**The stages.** Each true positive investigation of the campaign proves at most one stage. The
+stage of the campaign is the highest stage that an investigation proves.
+
+| Stage | Source |
+|---|---|
+| Reconnaissance | An alert of the class `recon`. |
+| Attempt | An alert of the class `exploit_attempt` or `post_compromise`, or the impact `attempted`. |
+| Access | The impact `succeeded`. The impact guard keeps that value only with a cited content record. |
+| Action on the target | A finding investigation states the stage `action`, and its impact is `succeeded`. |
+| Movement beyond the target | A machine is the source of a true positive investigation after an attack on that machine worked. |
+
+A finding investigation states its stage in the report field `stage`. A stage above `attempt`
+stands only with the impact `succeeded`. An alert investigation stores no stage.
+
+**The events.** The page counts events, because one investigation can stand for many alerts. The
+detail route reads the grid for the alert events between each pair of machines of the campaign.
+A record is between two machines when its `source.ip` and `destination.ip` hold their addresses. A
+Sigma alert of Security Onion holds its matched record under `event_data`. The read also matches
+the addresses `event_data.source.ip` and `event_data.destination.ip`. The read starts 30 minutes before the first event and ends 30 minutes after the last event. A
+confirmed rule of a pair is a rule that a true positive investigation of the campaign holds between
+the two machines. The alert count of a pair counts the alerts of its confirmed rules. The page
+lists each other rule with its own count. Such a rule takes the verdict of its standing
+investigations between the two machines: false positive, needs more info, or not judged. The
+timeline counts the alerts of the confirmed rules. The route reads the grid again for a new pair,
+a new confirmed rule or a new window. It also reads again every 15 minutes while the campaign is
+open. An ended campaign does not read the grid again, because the grid forgets old records. When no
+grid read stored events, the page counts the alert documents that the investigations hold. The
+field `events.source` then reads `stored`.
+
+**The page.** The page opens with the bottom line, which code writes from the parties, the period
+and the stage. The authorizations that the investigations match are lines under the bottom line.
+Three graphics follow, and they use one color for each stage:
+
+- The stage ladder shows the five stages in one row. A reached stage states its first time, what
+  happened, and the record that proves it.
+- The attack graph shows the actors on the left and the targets to the right of them. A third
+  column holds the targets that a target acted on. An arrow states the alert events from one
+  machine to another, and its color states the highest stage. A dashed line is a session between
+  two parties that the engine did not include.
+- The timeline has one lane for each actor, on one time axis in UTC. It counts the alerts of the
+  confirmed rules. A drag across the timeline zooms in.
+
+A click on a machine or an arrow opens the Alerts table for that selection. A click on a mark of
+the timeline opens the Investigations table for that time. Seven folds under the graphics hold the
+tables, and each fold starts closed:
+
+- Alerts lists each rule between two machines with its alert events, its first and last time, and
+  the verdict of soc-ai.
+- Findings lists the true positive hunt findings of the campaign.
+- Machines lists the actors and the targets.
+- "Related, not proven" lists what the engine did not include: investigations between two machines
+  that need more info, and documents between two machines on a port that no alert of the campaign
+  is on.
+- "Verdicts that differ" lists each investigation with another verdict on a session of the
+  campaign. Its verdict does not change.
+- "Detection record" states the tier that saw each stage first.
+- Investigations lists the investigations of soc-ai, each with the link that joined it and the
+  evidence of that link.
+
+**The engine.** The engine reads the store only. soc-ai rebuilds the campaigns in the
+background, with no page read. A rebuild starts about 2 seconds after an investigation ends with a
+verdict. An override, a chat verdict and a dismissed action also start a rebuild. With no such
+change, soc-ai checks the store every 5 minutes. A campaign route also checks the store before it
+answers. A rebuild changes the campaigns only when a true positive investigation changed, or an
+investigation on a session of a campaign. `soc-ai campaigns rebuild` runs the engine from the
+command line, and `--dry-run` writes nothing. The engine never reads the grid. Only the detail
+route reads the events.
+
+**The Re-run.** An investigation stays in its campaign while its Re-run is in progress. The Re-run
+takes its place when the Re-run is complete. A Re-run that ends in an error keeps the earlier
+investigation in the campaign.
+
+**The other pages.** Each page that shows an investigation names its campaign:
+
+- The Investigations list marks each investigation of a campaign.
+- The page of an investigation opens with its campaign.
+- The Alerts view marks a group when the investigation of its verdict is in a campaign.
+- The page of a hunt marks a finding when its investigation is in a campaign.
+- The host page lists the campaigns of the machine, with its role: actor, target, or both.
+- The Confirmed threats panel lists the campaigns of its window first. Each campaign states its
+  true positive investigations and the investigations that an authorization holds. The other rows
+  of the panel hold no investigation of a listed campaign. The total of the panel still counts
+  them.
+
+An investigation with another verdict on a session of a campaign has the same mark. The mark then
+states that the verdict differs.
+
+**The decision.** The analyst decides once on a campaign. A campaign has no decision, the
+decision `closed`, the decision `authorized` or the decision `case`. "Close with a reason" closes the campaign. The reasons are "Handled outside
+soc-ai", "Accepted risk" and "Test that is over". A note is optional. Any signed-in analyst can
+close a campaign and open it again. The read-only demo refuses both.
+
+- A close writes the audit record `campaign_closed` first. When soc-ai cannot write the record,
+  the close changes nothing and the console states the failure.
+- When the store cannot save the close after that record, soc-ai writes the audit record
+  `campaign_close_failed`. The campaign stays open, and the console states the failure. The
+  create and the revoke of an authorization, an exclusion, an inclusion and an undo each write
+  their own `_failed` record in the same case.
+- A close changes no verdict.
+- A close can acknowledge the alerts of the campaign in Security Onion. The dialog states the count
+  first: the alert events of the confirmed rules between the machines of the campaign, in its
+  period, that Security Onion has not acknowledged. A close acknowledges at most 2,000 alerts. Each
+  acknowledgement goes through the write path of the Alerts page, with its own audit records. A
+  failed acknowledgement does not open the campaign again.
+- The acknowledgement runs after the close. A restart in that minute loses the rest. A closed
+  campaign then shows the button "Acknowledge the remaining alerts" with the count of the close
+  scope. The button shows when the close asked for the acknowledgement and none followed, when
+  some alerts failed, or when the close scope still counts alerts. The route is
+  `POST /api/v1/campaigns/{id}/acknowledge`. It records one change `acknowledged`. The read-only
+  demo refuses it.
+- A close covers only the past. soc-ai stores the last event, the stage and the machines that the
+  close covered. A rebuild opens the campaign again when the campaign has a later event, a higher
+  stage or a new machine. A Re-run of an old investigation with the same event time does not.
+- "Open again" clears the decision. The audit record is `campaign_reopened`. An authorized
+  campaign does not open again this way. Revoke its authorization.
+- A merged campaign passes no decision to the campaign that takes its investigations.
+
+**The authorization.** An admin records the activity of a campaign as authorized. The record lists
+the machines of the campaign, each an actor or a target. It has a label, a note and an expiry. It
+lists no rule. The expiry is 7 days by default and at most 30 days from now. The period starts at
+the first event of the campaign. Each party is listed by default, and the admin can unlist a
+machine. The dialog states the cover before the press. The draft is
+`GET /api/v1/campaigns/{id}/authorize-draft`, and the record is `POST /api/v1/campaigns/{id}/authorize`.
+
+An investigation is inside the authorization when three things hold:
+
+- Its source is a listed actor.
+- Its target is a listed target.
+- Its event time is between the start and the expiry.
+
+The answer of a listed target to a listed actor is inside too: it is between the same two machines.
+The rule holds for an alert investigation and for a finding investigation, at each stage. A finding
+investigation with a target and no source is inside when its target is a listed target. Each
+machine that a finding names must be listed too. soc-ai matches a machine by its machine key in the
+Hosts data, the same key as a party. A name never matches.
+
+Each other investigation that touches a listed machine is outside, and it stays loud:
+
+| Reason | Case |
+|---|---|
+| `source` | The source is no listed actor. A listed target as the source against any machine that is no listed actor is outside too. |
+| `target` | The target is no listed target, or the alert is a hit of a deception sensor. |
+| `machine` | An address of a listed machine belongs to another machine now, or the finding names a machine that is not listed. A host that a finding names by its name is outside. The text of the report names a third machine: an address that no listed machine carries, or the name of a machine that is not listed. |
+| `expired` | The event time is after the expiry or before the start. |
+
+An inside investigation keeps its verdict and gets the mark. No action of it waits, it raises no
+bell row and no webhook, and it forms no lead. soc-ai sets the mark at the end of the investigation,
+before the webhook and the lead. soc-ai also marks the stored investigations of the campaign at the
+create and after each rebuild. The model never reads an authorization. Any failure of the check
+gives normal handling.
+
+An outside investigation gets normal handling. Its actions wait, it is a Needs you item of its own,
+it raises its bell row and its webhook, and it forms its lead. The campaign page states "Activity
+beyond the authorization" and lists each such investigation with its reason. Each one is one change
+`beyond` of the campaign.
+
+- The create writes the audit record `authorized_activity_created` before the commit. When soc-ai
+  cannot write the record, nothing changes.
+- New activity between the listed machines does not open the campaign again. A higher stage
+  between them is a neutral bell row while the authorization is in force.
+- At the expiry, the decision stays and covers the past. A later event is outside.
+- A revoke needs a reason, and any signed-in analyst can revoke. The audit record
+  `authorized_activity_revoked` comes before the commit. The revoke ends each mark, clears the
+  decision and records one change `reopened` with the cause `revoked`. The campaign then holds its
+  investigations again and waits as one item. No investigation goes to the lead path.
+- A record of the earlier form lists rule names. It keeps its behavior, and no migration changes
+  it. When such a record covers part of a campaign, the dialog takes its label and its expiry as
+  the defaults.
+
+**The case.** "Open one case" opens one Security Onion case for the campaign. Any signed-in
+analyst can open it. The read-only demo refuses it. The dialog reads
+`GET /api/v1/campaigns/{id}/case-scope` and states what the press writes before the press. The
+press is `POST /api/v1/campaigns/{id}/case`.
+
+- The title is "soc-ai campaign:" and the title of the campaign. The description holds the bottom
+  line, each reached stage with its time and what happened, the machines with role and address,
+  the period, the counts of alerts and findings, the note of the analyst and the link to the
+  campaign page. Code writes each word from stored facts.
+- The case takes at most 25 alerts, the newest first: the alerts of the true positive alert
+  investigations that the campaign holds. soc-ai skips an alert that Security Onion acknowledged
+  or escalated, an alert that the escalation ledger has on a case, and an investigation with no
+  Security Onion alert. Each alert goes through the ledger before the call, so one alert is on one
+  case. Security Onion marks each attached alert escalated and acknowledged.
+- soc-ai records the intent, one change `case_intent`, before the first call to Security Onion.
+  When soc-ai cannot record the intent, it makes no call. Each write goes through the write path
+  of the actions, with its own audit records.
+- The result is one change `case` with the case id, or one change `case_failed` with the reason.
+  The decision `case` follows the audit record `campaign_case_opened`. A refusal of Security Onion
+  leaves no decision and frees the alerts in the ledger.
+- When soc-ai cannot read the answer of Security Onion, the intent stays open, and a case can
+  exist. A second press then makes no call. The page states "soc-ai could not read the answer of
+  Security Onion." and offers "Try again". Look in the Cases page of Security Onion first. "Try
+  again" writes the audit record `campaign_case_retry` and clears the intent. The route is
+  `POST /api/v1/campaigns/{id}/case/retry`.
+- A second press opens no second case. "Open again" clears the decision. The case stays in
+  Security Onion, and the campaign keeps the case id. The next press records the decision on the
+  same case and makes no call.
+- A closed campaign and a campaign with an authorization take no case. Open the campaign again,
+  or revoke the authorization, first.
+- After the case exists, a higher stage and a new machine each add one comment to the case. The
+  comment names the stage or the machine, the time and the link. A new investigation adds no
+  comment. soc-ai comments only on a case that it opened. The step after each rebuild writes the
+  comment, and the refresh loop tries again on each wake. A change with a recorded comment gets no
+  second one. Each comment records one change `case_comment` and the audit record
+  `campaign_case_commented`.
+- A campaign with a case does not open again on new activity. It is no item of Needs you. A
+  higher stage and a new machine of such a campaign are danger rows in the bell.
+- The Escalate of an investigation that a campaign holds is blocked. The card reads "Open the case
+  on the campaign." and links to the campaign. An investigation beyond an authorization and an
+  investigation in no campaign keep their Escalate.
+- `CampaignOut.case` states the case: `open`, `pending` or `failed`, with the case id, the link,
+  the time, the analyst, the alerts and the comments of soc-ai. A row of the campaign list and of
+  the Confirmed threats panel carries `case.openedAt`. `soc-ai campaigns list` prints the decision
+  `case` and the case id.
+
+**Exclude and include.** An analyst can take an investigation out of a campaign with a reason. The
+investigation then joins no campaign and gets normal handling again. The mark of a campaign record
+on it ends. An analyst can also join an investigation of "Related, not proven" to the campaign. The
+anchor is the seed of the campaign at that time. Each one records one change, `excluded` or
+`included`, and one audit record before the commit. "Undo" removes either. The routes are
+`POST /api/v1/campaigns/{id}/exclude`, `/include` and `/overrides/{runId}/undo`. None of them forms
+a lead.
+
+**The changes.** A rebuild compares each campaign with the stored campaign. It records a change for
+a new campaign, a higher stage and a new machine. It also records each new investigation beyond an
+authorization. The decision routes record the decision, the acknowledgement, the open again, the
+revoke, the exclusion, the inclusion and the record of the case. The campaign page lists the 50 newest changes. The first
+rebuild after the upgrade records no change for a campaign that exists.
+
+**Needs you.** Each active campaign with no decision is one item of Needs you, at any age. An
+investigation that a campaign holds is no item of its own, and no action of it waits. Its actions
+stay executable, except its Escalate, and the card names the campaign. An investigation in no campaign keeps its own
+item. An investigation whose verdict differs keeps its own item too. An authorized campaign holds
+only its inside investigations. An investigation beyond the authorization keeps its own item, and
+its item states "Beyond the authorization of the campaign" first. A verdict that needs more info
+and a waiting action stay in Needs you until a person decides. `GET /api/v1/needs-you/items` lists
+every item, the oldest first. One item holds the alert groups with no verdict. The `total` of the
+list counts each alert group, so it equals `decisions` of `GET /needs-you`.
+
+**The bell.** Each change of the last 24 hours is one bell row in the tier of the true positives: a
+new campaign, a higher stage, a new machine, an open again after new activity, and each
+investigation beyond an authorization. A higher stage of a campaign with an authorization in force
+is a neutral row. A decision, an acknowledgement, an open again by an analyst, a revoke, an
+exclusion and an inclusion raise no row. The true positive row of an
+investigation that a campaign holds does not show. The row of the campaign speaks for it.
+
+**The limits.** A true positive with an external source forms no campaign: such a source has no
+machine key. The waves come from the event times
+of the investigations. The grid read covers the 20 pairs of machines with the most investigations.
+It finds an alert by its top-level `source.ip` and `destination.ip`. A Sigma alert that holds its
+addresses only under `event_data` does not count in the grid read.
 
 ## The Hunts page
 
@@ -798,36 +1363,83 @@ the Hunts item shows the same count, and the bell lists the items.
 
 ### 2. Analytic hits
 
-Every hit from the last 7 days, live and shadow, in one list. Under All, the unread shadow hits
-come first, newest first. Needs-you counts these hits, so they open the list. The live hits follow,
-newest first, and the read shadow hits come last. The filter chips are All, Unread, Live and
-Shadow, and the counts behind them are read over the whole window.
+Every hit from the last 7 days, live and shadow, in one list. The list also holds every unread
+shadow hit at any age. The label of the block states the two counts apart, as in "39 in the last
+7 days · 210 older unread". A hit is in the window if an analytic saw it in the last 7 days.
+`GET /hunts/hits` sends the two counts as `window.in_window` and `window.older_unread`.
+
+The list has one order under All. The unread shadow hits come first, newest first. Needs-you
+counts these hits, so they open the list. The live hits follow, newest first, and the read shadow
+hits come last. The filter chips are All, Unread, Live and Shadow, and the counts behind them are
+read over the whole window.
 
 The list reads 50 hits at a time. The line under the list states the share, for example "50 of
 148 hits". "Show more" reads the next 50 hits.
 
-A live hit carries a solid accent border and a bold title. A shadow hit carries a dashed amber
-border and the `shadow` chip. A read shadow hit is dimmer still. A live hit is never lighter than a
-shadow hit.
+A live hit carries a solid accent border. A shadow hit carries a dashed amber border. A read
+shadow hit is dimmer still. A live hit is never lighter than a shadow hit. The header of a live
+analytic has a bold title, and the header of a shadow analytic has the `shadow` chip.
 
-Each card names the analytic, the entity, the document count, when the hit was first seen and how
-many times it was seen. Evidence sits under that, and each document opens the document drawer. If
-a lead holds the hit, the action is **Open lead**, because you decide on the lead.
-A hit that formed no lead offers **Hunt this entity**. A shadow hit adds **Approve analytic**,
-**Reject analytic** and **Mark read**.
+The hits are grouped by analytic. Each analytic has one header. The header names the analytic,
+its status and its tier. It counts the hits, the unread hits and the machines over the whole list,
+as in "116 hits · 116 unread · 44 machines". Two addresses of one machine are one machine. The
+analytics with unread hits come first.
+
+The header of a shadow analytic carries the decisions on the analytic, one time:
+
+- **Approve analytic** makes the analytic live. Its hits then count toward a lead. The approval
+  marks the unread hits of the analytic read.
+- **Reject analytic** retires the analytic. It stops, and its hits leave the list.
+- **Mark N read** marks the unread hits of the analytic read in one write. The analytic keeps its
+  status.
+
+One line under the counts states the effect of each button. Approve and Reject ask for a reason.
+
+The rows fold under the header. Three hits of each analytic are in view. "Show N more hits" opens
+the other hits that the list has read.
+
+Each card names the entity, the document count, when the hit was first seen and how many times
+it was seen. Evidence sits under that, and each document opens the document drawer. If a lead
+holds the hit, the action is **Open lead**, because you decide on the lead. A hit that formed no
+lead offers **Hunt this entity**. An unread shadow hit adds **Mark read** for that one hit.
 
 A shadow hit stays unread until you open its evidence or act on it. A live hit has no read flag.
 
+A read shadow hit stays read when it fires again, unless the new sighting is materially new. A
+sighting is materially new when its weight is higher than the weight you read, or when its score is
+further from the baseline than the largest score you read. The score is the statistic of the hit,
+such as the residual z of a rate departure or the document count of a match. A hit with no score is
+new when it cites a new document.
+
+The read mark is keyed on the machine. A hit is one analytic and one value on one machine. The
+same hit on another address of that machine is a repeat, so it starts read unless it is materially
+new. When you read a hit, soc-ai also marks the same hit on the other addresses of the machine,
+unless that row is larger than the one you read. Each address keeps its own row, because each
+address has its own baseline. The row states the machine in `machine_key` and `machine_name`.
+
 ### 3. Leads
 
-Four tabs, named by what you must do: **Needs decision**, **In progress**, **Closed**, **All**. The
-block opens on Needs decision. Closed holds the leads you dismissed or opened an investigation on,
-and the leads a hunt closed.
+Five tabs, named by what you must do: **Needs decision**, **In progress**, **Closed**,
+**Fleet condition**, **All**. The block opens on Needs decision. Closed holds the leads you
+dismissed or opened an investigation on, and the leads a hunt closed.
+
+A fleet condition is one departure that more than 8 hosts hold at one time. A change to the network
+causes it more often than an attack does. A fleet condition lead waits on no decision, and soc-ai
+starts no hunt on it. The Fleet condition tab lists these leads and prints that line.
+
+Each tab states its count. The counts of the first four tabs sum to the count of All. With
+`lead_auto_hunt` on, a new lead that waits on the loop is on the All tab only. The block then
+prints one more count, as in "2 new leads wait on auto-hunt. The All tab lists them."
 
 Every row carries a state pill: `New`, `In progress`, `Hunted · <outcome>`, `Dismissed`,
-`Closed. The hunt found no threat.`, `Promoted`. A new lead whose hunt the loop has taken reads
-`New · hunt queued`. A lead whose loop hunt could not run twice reads `Hunted · Could not run`. The
-pill is the state. The tab is a filter.
+`Closed. The hunt found no threat.`, `Promoted`, `Fleet condition`. A new lead whose hunt the loop
+has taken reads `New · hunt queued`. A lead whose loop hunt could not run twice reads
+`Hunted · Could not run`. The pill is the state. The tab is a filter.
+
+Every row prints the hunt result on its own line: "found a threat", "found no threat", "hunt
+failed" or "not hunted". A finished hunt adds its answer and what it could not check. The lead page
+states the same two sentences for each hunt. `GET /leads` sends them as `hunt_answer` and
+`hunt_not_checked`.
 
 | State | Actions |
 |---|---|
@@ -835,11 +1447,22 @@ pill is the state. The tab is a filter.
 | In progress | View hunt |
 | Hunted | Read hunt, Dismiss, Hunt again |
 | Dismissed, Closed by the hunt, Promoted | Reopen. A promoted lead also offers View investigation. |
+| Fleet condition | Hunt this lead, Dismiss. A hunt or a dismissal moves the lead to the state of that act. |
 
 A dismissal needs a reason: `expected_for_role`, `known_change`, `benign_repeat`, `bad_baseline`,
 `authorized_test`, `duplicate`, `bad_analytic_logic`, `lab_host` or `other`. The form opens with no
 reason chosen. Free text is optional. The lead quality report counts the reasons, so pick the
 reason that is true.
+
+Each reason closes the lead in the same way. The history of the lead keeps the reason, and the
+lead quality report counts it. No reason changes a baseline, an analytic or a host. The form
+prints what the chosen reason records, as in "Records that the baseline is wrong. The baseline
+does not change."
+
+The lead page opens with one state line. The line states what soc-ai saw and on which host, what
+the newest hunt concluded, and what the lead waits on. Under it, one line states the effect of
+each button that the page shows. A lead whose live weight is under 0.85 carries a mark, as in
+"weight decayed to 0.32 · a lead forms at 0.85".
 
 A dismissal closes the lead. The observations on the lead and their repeats form no new lead. A
 new observation on the same host can form a new lead at once. No time window applies. Select
@@ -857,10 +1480,13 @@ scroll.
 | Needs decision | Dismiss, Hunt |
 | In progress | None. A lead under a running hunt takes no bulk decision. |
 | Closed | Reopen |
+| Fleet condition | Dismiss |
 | All | Dismiss, Hunt, Reopen |
 
-Each button shows how many selected leads it acts on. A confirm states the count, the leads the
-press skips and the consequence. Escape closes the confirm.
+Each button shows how many selected leads it acts on. The strip prints the selected leads that an
+action skips, with the reason, as in "6 shadow leads take no bulk action. Decide on a shadow lead
+from its own row." A confirm states the count, the leads the press skips and the consequence.
+Escape closes the confirm.
 
 - **Dismiss** takes one reason and one optional note for all leads. The history of each lead
   records one dismissal, with your name, the reason and the note.
@@ -901,6 +1527,12 @@ The analytic catalog. Each row carries the title, the tier, the status and the a
 The tier is shipped or local. The status is live, shadow, candidate or retired. An analytic opens a drawer with its
 description, its evaluator, its version history, its outcome ledger and its recent observations by
 entity.
+
+The tab label counts the analytics by status. The live count states how the live analytics ran
+on their newest run, for example "15 live (4 measuring, 11 blind)". A measuring analytic read
+documents or scored a host. A blind analytic matched nothing that it reads, or scored no host. A
+failed run and a loop that does not run add their own counts. The Last 7 days column counts the
+shadow hits of 7 days and the unread shadow hits at any age.
 
 soc-ai computes the outcome ledger on read, over one window. The ledger holds these numbers:
 
@@ -1131,7 +1763,7 @@ A hit belongs to the gap when all three are true:
 
 1. An analytic wrote it.
 2. Its type measures a count or a silence: below baseline, above baseline, telemetry silence or
-   estate outlier.
+   network outlier.
 3. Its event window overlaps the gap or the settle margin after it.
 
 soc-ai reads the event window in this order: the run in `evidence.window`, the silence in the
@@ -1192,9 +1824,9 @@ hold. The hold count reads every hit that existed at the hold, whatever its flag
 | `hunt_findings_investigate` | on | A hunt opens one investigation for each subject finding. The hunt is complete when the last one ends. When the setting is off, the hunt completes when it writes its report. | live |
 | `hunt_findings_investigate_max` | 20 | The most findings one hunt investigates by itself. A finding past the cap waits for you to open its investigation. | live |
 | `entity_profiles_enabled` | off | Build a behavioural baseline for each host. The profile sweep rebuilds it when it is older than the dossier refresh interval, and a dossier refresh rebuilds it too. The profile sweep reads every host as blind until this is on. Turn it on for the shadow week. | live |
-| `profile_estate_rare_hosts` | 3 | Below this many hosts that know a member, a new member is estate-rare. Its observation is born at 0.6. A member must also reach this many hosts to be estate-common. | live |
-| `profile_estate_common_share` | 0.2 | Above this share of the profiled hosts, a new member is estate-common. It forms no observation. | live |
-| `estate_model_enabled` | off | Fit the estate model once a day. Its observations stay in shadow. A host with no confident role reads its learned group as its peer group. Needs the `ml` extra. | live |
+| `profile_estate_rare_hosts` | 3 | Below this many hosts that know a member, a new member is rare on the network. Its observation is born at 0.6. A member must also reach this many hosts to be common on the network. | live |
+| `profile_estate_common_share` | 0.2 | Above this share of the profiled hosts, a new member is common on the network. It forms no observation. | live |
+| `estate_model_enabled` | off | Fit the network model once a day. Its observations stay in shadow. A host with no confident role reads its learned group as its peer group. Needs the `ml` extra. | live |
 | `hunt_spec_sweeps_enabled` | off | Run every live analytic as a grid query on a schedule. A matching document becomes an observation on the host it names. Observations can form a lead. No model call. Turn this on last, after the shadow week. | live |
 | `hunt_spec_sweep_interval_minutes` | 60 | Minutes between analytic sweeps. The floor is 5. | live |
 | `hunt_spec_sweep_window_minutes` | 1440 | How far back each analytic sweep reads. Keep it wider than the interval. | live |
@@ -1219,8 +1851,10 @@ Each command reads the local store or the grid. None of them calls a model.
 | `soc-ai priors --record` | Write each departure as an observation, and form leads from what accumulates. Off by default, because a read of the coverage must have no side effect. |
 | `soc-ai spec-run [<id>] --since <start>` | Run one analytic, or the whole catalog, and print the candidates as JSON. `--since` is required. It takes ES date math or ISO-8601. Example: `now-7d`. `--until` and `--include-synth` shape the run. |
 | `soc-ai spec-sweep` | Sweep the catalog and record what is not already handled. `--since`, `--until`, `--shadow` and `--backfill` shape the run. |
-| `soc-ai estate-model show` | Print the newest estate model fit: the time, the state, the hosts, the groups, the outliers, the model file, the hash and the drift index. `--json` prints the fit as JSON. |
-| `soc-ai estate-model run` | Fit the estate model once, now. It runs when `estate_model_enabled` is off, and it says so. It refuses in a demo. It cannot take the dossier slot of the server, so run it when no dossier sweep runs. |
+| `soc-ai estate-model show` | Print the newest network model fit: the time, the state, the hosts, the groups, the outliers, the model file, the hash and the drift index. `--json` prints the fit as JSON. |
+| `soc-ai estate-model run` | Fit the network model once, now. It runs when `estate_model_enabled` is off, and it says so. It refuses in a demo. It cannot take the dossier slot of the server, so run it when no dossier sweep runs. |
+| `soc-ai campaigns rebuild` | Build the campaigns from the stored runs, and print the count of campaigns and members. A campaign keeps its id. The line also counts the true positive runs with an end that soc-ai cannot resolve to one machine. `--dry-run` writes no row. `--refresh-facts` reads the facts of every run again, for a change of the Hosts data. `--json` prints each campaign with its parties and its members. |
+| `soc-ai campaigns list` | Print the id, the status, the stage, the decision, the period and the title of each campaign. An active campaign with no decision reads `waits`. |
 
 `soc-ai leads --report` and the Lead quality block print the same numbers from the same function,
 so a terminal and a browser cannot disagree.
@@ -1231,9 +1865,10 @@ Every route sits under `/api/v1`. The console uses these, and an integrator can 
 
 | Route | What it answers |
 |---|---|
-| `GET /hunts/hits` | Every analytic hit from the last `days` days. Under `all`: unread shadow hits, then live hits, then read shadow hits. `filter` takes `all`, `unread`, `live` or `shadow`. `limit` and `offset` page through the order. |
-| `GET /hunts/needs-you` | The one number the sidebar badge and the Needs-you strip show: unread shadow hits plus leads that wait on a decision. |
-| `GET /leads` | The lead list, newest first. `status` takes a stored value, `all`, or one of the aliases `new`, `closed`, `needs_decision`, `in_progress` and `open_or_hunting`. `entity` keeps the leads that name one entity, under every key of its machine. The filter runs before `limit`. |
+| `GET /hunts/hits` | Every analytic hit from the last `days` days. Under `all`: unread shadow hits, then live hits, then read shadow hits. `filter` takes `all`, `unread`, `live` or `shadow`. `limit` and `offset` page through the order. Each hit states its machine in `machine_key` and `machine_name`. `window` holds the hits in the window and the older unread hits. `groups` holds one row for each analytic, counted over the whole list: `hits`, `unread`, `machines` and `accounts`. |
+| `GET /hunts/needs-you` | The counts of the sidebar badges and the Needs-you strip. `decisions` counts the leads that wait on a decision. `review` counts the unread shadow hits. `total` is the sum of the two. It is kept for an older console and is deprecated. |
+| `GET /needs-you` | The Needs-you count of the Dashboard tile, the bell and the sidebar. Each part has its own field. `decisions` sums `campaigns`, `investigations_waiting`, `leads_needing_decision` and `untriaged_groups`: each decision once. `needs_more_info` and `pending_actions` stay as detail and are no part of the sum. `pending_actions` counts actions, and one investigation can hold two. `review` counts the unread shadow hits. `total` is the sum of the two. It is kept for an older console and is deprecated. `investigations_waiting` counts the investigations that need more info or hold a waiting action. It is the total of `GET /investigations?needs_you=true` over `verdict_window`. |
+| `GET /leads` | The lead list, newest first. `status` takes a stored value, `all`, or one of the aliases `new`, `closed`, `needs_decision`, `in_progress` and `open_or_hunting`. `entity` keeps the leads that name one entity, under every key of its machine. The filter runs before `limit`. Each row states the result of its hunt: `hunt_answer` is the first sentence of the narrative, and `hunt_not_checked` lists the visibility gaps. `hold_reason` and `hold_sentence` state why a finished hunt did not settle the lead. `repeats_after_close` and `last_repeat_at` state the observations that joined a closed lead after its close. |
 | `GET /leads/count` | The total for the same `status` and `entity` filter. The list stops at `limit`. The count does not. |
 | `GET /leads/quality` | The lead rule, the noise floor rule, and what the rule produced per ISO week and per observation-type pair, with `closed_by_hunt` counted separately from `dismissed`. `weeks` sets the window. |
 | `GET /hunts/leads/{id}` | One lead: its observations, its entities, its related leads and whether its investigation still exists. |
@@ -1251,12 +1886,15 @@ Every route sits under `/api/v1`. The console uses these, and an integrator can 
 | `GET /hunts/totals` | The counts of every hunt in a window: hunts, findings, threat findings and running hunts. It gives each count in total and per type. `since` and `until` set the window, as on `GET /hunts`. It has no row cap. The Hunts page header reads it. |
 | `GET /hunts/observations` | The observations on one entity, from every source, for the host page. |
 | `GET /hunts/shadow-hits` | The shadow hits only, for the bell and the Dashboard card. |
-| `POST /hunts/shadow-hits/{obs_id}/read` | Mark one shadow hit read. |
+| `POST /hunts/shadow-hits/{obs_id}/read` | Mark one shadow hit read. The same hit on the other addresses of its machine is marked too, unless that row is larger. |
+| `POST /hunts/shadow-hits/read-analytic` | Mark the unread shadow hits of one analytic read, in one write. The body names `analytic_id`, `before` and the optional `expected` count. |
 | `POST /hunts/shadow-hits/read-all` | Mark every unread shadow hit born at or before `before` as read, in one write. `before` takes ISO-8601. "Dismiss all" in the bell sends the time it loaded the count. Writes a `shadow_hits_read` audit record and answers `{"read": <count>}`. A hit of a retired analytic is not touched. |
 | `GET /analytics` | The catalog, both tiers, with status and tier on each row. `held_by_system` holds the reason of a system demotion while it holds the analytic in shadow. |
 | `GET /analytics/{id}` | One analytic with its version history, its outcome ledger and its recent observations. A version row carries `system` for a change soc-ai made, and `evidence` for a system demotion. |
 | `POST /analytics/{id}/status` | Move an analytic between candidate, shadow, live and retired, with a reason. |
 | `GET /hunt-catalog` | The health of the catalog: the last sweep, the last firing and the 24-hour counts for each analytic. |
+| `GET /campaigns` | The active campaigns, newest last event first. Each row states the title, the status, the stage, the actors, at most three targets, the count of investigations and `alerts`. `alerts` is the alert count of the last grid read, or null before the first read. `stale` is true when the engine failed on this read and the rows are older. |
+| `GET /campaigns/{id}` | One campaign: the bottom line, the stage ladder, the parties, the waves, the investigations with link and evidence, the related investigations and documents, and the detection record. Each step of `ladder` states `headline`, what happened, and `evidence`, the record that proves the stage, or null. `graph.edges` holds the arrows of the attack graph. Each arrow states `source`, `target`, `runs`, `alerts`, `stage`, `firstAt`, `lastAt`, `beyond` and `fromDocuments`. `runs` counts the investigations of the arrow, and `alerts` counts its alert events, or is null. Each entry of `members` states `sourceKey` and `targetKey`, the machine keys of its two ends, or null. `events` states `source`, `readAt`, `alerts`, `rules`, `findings`, `records`, `pairs` and `timeline`. `source` is `grid`, `stored` or `none`. Each pair states its alerts by rule, the alerts of other rules, the records and the datasets. A campaign of an earlier release has an empty `graph.edges` until the next rebuild. A campaign that merged into another answers with `status` `merged`, `mergedInto`, empty lists and `events.source` `none`. |
 
 `GET /investigations/{id}` carries a `subject` block for a hunt run. The block holds the hunt id,
 the objective, the finding ordinals and titles, the lead id, the document ids and the observation
@@ -1265,12 +1903,16 @@ carries `subjectType`, which reads `alert` or `hunt`.
 
 ## Known limits
 
-- There is no campaign object. Related leads name the leads that may be one campaign. Nothing joins
-  them into one record.
+- A campaign joins runs. It does not join leads. Related leads name the leads that may be one
+  activity.
 - soc-ai computes related leads on read. A hunt objective holds the list as it stood when the hunt
   started, and it says so.
-- The "vs last run" comparison matches findings by title and hosts. A scheduled hunt reads the
-  titles of its last run, so a finding that it repeats reads as persisting.
+- The "vs last run" comparison matches a finding on a shared machine and on a shared rule,
+  technique or document. A citation is a document only when the run stored it. A tool name and an
+  address are not documents. A host name and its address are one machine where the Hosts data
+  joins them. One finding can match many. A finding that cites none of the three matches on its
+  title and hosts. The third count reads "not reported this run". The comparison does not know
+  that the activity stopped. The API keeps `resolved` as a deprecated copy of `notReported`.
 - With `lead_auto_hunt` off, a lead held on a finding with no verdict settles at the next start of
   soc-ai. A re-run of the investigation alone does not settle it.
 - Nobody has validated the lead thresholds against a miss yet. The lead threshold (0.85) and the
@@ -1282,7 +1924,7 @@ carries `subjectType`, which reads `alert` or `hunt`.
   it reads with `member_patterns`, a list of case-insensitive globs on the base name.
   `prior-workstation-remote-execution-tooling` reads only the PsExec, WMIC, WinRM and PowerShell
   remoting names, so an updater name does not fire it. It does not see a renamed copy of a tool.
-- Estate prevalence reads the stored sets, and a set keeps 200 members. A member past the cap of
+- Prevalence on the network reads the stored sets, and a set keeps 200 members. A member past the cap of
   a host does not count toward its prevalence on that host.
 - The active hours set holds counts per hour of the day, with no dates. A confirmed attack window
   stays out of the sets and the rate. It does not stay out of the active hours.
@@ -1290,21 +1932,21 @@ carries `subjectType`, which reads `alert` or `hunt`.
 - No shipped analytic uses `rare_for_peers` yet. Each tier 2 change starts in shadow for a week,
   and a shipped analytic starts live.
 - A `model` observation is a shadow observation while its analytic is in shadow. An approval to live
-  lifts the shadow status of new observations. The automatic demotion restores it. The estate model
+  lifts the shadow status of new observations. The automatic demotion restores it. The network model
   has no live mode, so its observations always stay in shadow.
 - A learned detector stores no parameter set. It reads what it learns from the grid on every sweep.
   The `stale` and `drifted` states have no writer yet.
 - The logon chain detector reads an attempt from the logon plane of the target host. An attempt to
   a host that ships no logon plane is not read. The edge set learns accepted sessions only. A
   failed attempt from B to C before the recent read does not count as an earlier attempt.
-- The estate model fits the address key space and the name key space separately. The address and the
+- The network model fits the address key space and the name key space separately. The address and the
   name of one machine are two vectors. soc-ai does not join the two vectors to the machine row yet.
-- The estate model does not call a change on 5 or more hosts at once an outlier. Each such host
+- The network model does not call a change on 5 or more hosts at once an outlier. Each such host
   counts as shared. The scope count of tier 2 records a spread across hosts.
-- The thresholds of the estate model come from the design and the synthetic estates. They are the
+- The thresholds of the network model come from the design and the synthetic networks. They are the
   score bar 0.55, the reason bar 3, the twin radius 1 and the fire budget. None has a shadow week
   yet.
-- The estate model has no live mode. Its observations stay in shadow, and a lead that holds one is
+- The network model has no live mode. Its observations stay in shadow, and a lead that holds one is
   a shadow lead.
 - A hunt-subject investigation still stores its anchor document as `alert_es_id`, and
   `GET /investigations/{id}` returns that id as `groupId`. soc-ai keeps the run out of the alert's

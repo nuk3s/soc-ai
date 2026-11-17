@@ -1,6 +1,9 @@
-import { AlertTriangle, Check, Loader2, MessageSquare, RotateCcw, Triangle, X, type LucideIcon } from 'lucide-react';
+import { AlertTriangle, ArrowUpRight, Check, Loader2, MessageSquare, Network, RotateCcw, Triangle, X, type LucideIcon } from 'lucide-react';
 import { useEffect, useState } from 'react';
-import { getActionScope, type ActionScope } from '../lib/api';
+import { Link } from 'react-router-dom';
+import { getActionScope, type ActionScope, type InvestigationCampaign } from '../lib/api';
+import { campaignHolds } from '../lib/campaignDecision';
+import { ACTION_CAMPAIGN_NOTE, OPEN_CAMPAIGN } from '../lib/campaignWords';
 import type { ActionTag, CaseLink, RecommendedAction } from '../lib/types';
 
 // ---------------------------------------------------------------------------
@@ -49,6 +52,14 @@ const DEFAULT_SCOPE: Record<ActionTag, string> = {
   escalate: 'Open one Security Onion case for this alert.',
   comment: 'Add a comment to the Security Onion case this investigation opened.',
 };
+
+/** What the escalate of a promoted finding does, while the server counts the
+ *  alerts that the case attaches. The server then states the whole effect. */
+export const FINDING_CASE_SCOPE = 'Open one Security Onion case for this finding.';
+export const FINDING_CASE_COUNTING =
+  'Open one Security Onion case for this finding. soc-ai is counting the alerts that the case attaches.';
+export const FINDING_CASE_COUNT_FAILED =
+  'Open one Security Onion case for this finding. soc-ai could not count the alerts that the case attaches.';
 
 /** The dismiss confirm. The row of the pending-action list asks the same. */
 export const DISMISS_CONFIRM_TEXT =
@@ -150,7 +161,16 @@ export function confirmLabel(tag: ActionTag, scope: ActionScope | null, onCase =
     }
     return 'Acknowledge this alert';
   }
-  if (tag === 'escalate') return onCase ? 'Record as done' : 'Open the case';
+  if (tag === 'escalate') {
+    if (onCase) return 'Record as done';
+    // The case of a finding also attaches and marks the alerts it cites.
+    if (scope?.scope === 'finding' && scope.count) {
+      return scope.count === 1
+        ? 'Open the case and attach 1 alert'
+        : `Open the case and attach ${scope.count} alerts`;
+    }
+    return 'Open the case';
+  }
   return 'Add the comment';
 }
 
@@ -178,6 +198,8 @@ export function ActionCard({
   confirmRequest,
   cases,
   casesComplete = false,
+  findingCase = false,
+  campaign = null,
 }: {
   action: RecommendedAction;
   /** The position of the action in the report. The server keys on it. */
@@ -191,7 +213,7 @@ export function ActionCard({
   dismissal?: ActionDismissalState | null;
   /** Why the last dismissal or undo did not land. */
   dismissError?: string | null;
-  onExecute: (scope: 'group' | 'alert') => void;
+  onExecute: (scope: 'group' | 'alert', opts?: { retry?: boolean }) => void;
   onDismiss: () => void;
   onUndoDismiss: () => void;
   /** Set when the action has no Security Onion target (a promoted finding).
@@ -206,6 +228,12 @@ export function ActionCard({
   cases?: readonly CaseLink[];
   /** False when the grid did not confirm the case list. */
   casesComplete?: boolean;
+  /** The run is a promoted finding. Its escalate opens a case from the
+   *  finding, and the card says so. */
+  findingCase?: boolean;
+  /** The campaign of the investigation. When the campaign holds it, the card
+   *  names the campaign and sends the analyst there. The write stays. */
+  campaign?: InvestigationCampaign | null;
 }) {
   const Icon = ACTION_ICON[action.tag];
   const tagStyle = ACTION_TAG_COLOR[action.tag];
@@ -229,9 +257,23 @@ export function ActionCard({
     !applied &&
     !dismissed &&
     (!decision || decision === 'failed' || decision === 'dismissing');
+  // The card builds the campaign sentence, with its link, from the campaign
+  // of the investigation. The server sends the same sentence as `note` with
+  // the code `campaign`, so the card states it once.
+  const ownCampaignNote = !!campaign && campaignHolds(campaign);
   // The server states why a write can act against an analyst verdict. The
   // row of the pending-action list reads the same rule (R1-I1 follow-up).
   const blockedReason = action.blockedReason || undefined;
+  // The Escalate of an investigation that a campaign holds: the one case of
+  // the activity opens on the campaign. The server blocks the write, and the
+  // card states the block with the link of the campaign. It is no button.
+  const campaignCase =
+    action.tag === 'escalate' && !!blockedReason && (action.noteCode === 'campaign' || ownCampaignNote);
+  const campaignHref = action.noteHref?.trim() || (campaign ? `/campaigns/${campaign.id}` : null);
+  const serverNote =
+    action.note && action.note.trim() && !(action.noteCode === 'campaign' && (ownCampaignNote || campaignCase))
+      ? action.note.trim()
+      : null;
   const writeOffReason = lockedReason ?? disabledReason ?? blockedReason;
   const canWrite = pending && !writeOffReason;
 
@@ -244,7 +286,10 @@ export function ActionCard({
   // State the scope before the click. Only an ack needs the server: its plan
   // depends on the grid. The other two have one target each.
   useEffect(() => {
-    if (!canWrite || action.tag !== 'ack') return;
+    // An ack and the case of a finding write to more than one alert. The
+    // server states how many before the click.
+    const counted = action.tag === 'ack' || (action.tag === 'escalate' && findingCase);
+    if (!canWrite || !counted) return;
     let live = true;
     setScopeState('loading');
     getActionScope(invId, index)
@@ -257,7 +302,9 @@ export function ActionCard({
     return () => {
       live = false;
     };
-  }, [canWrite, action.tag, invId, index]);
+    // A failed press can leave the finding with no recorded result. The
+    // server then answers the blocked state, so the read runs again.
+  }, [canWrite, action.tag, findingCase, invId, index, decision]);
 
   // The alert is already on a case. The escalate states it and links each
   // case. The execute route opens no second case.
@@ -271,8 +318,18 @@ export function ActionCard({
           : scopeState === 'error'
             ? ACK_COUNT_FAILED
             : DEFAULT_SCOPE.ack)
-      : DEFAULT_SCOPE[action.tag];
+      : action.tag === 'escalate' && findingCase
+        ? scope?.sentence ??
+          (scopeState === 'loading'
+            ? FINDING_CASE_COUNTING
+            : scopeState === 'error'
+              ? FINDING_CASE_COUNT_FAILED
+              : FINDING_CASE_SCOPE)
+        : DEFAULT_SCOPE[action.tag];
   const groupAck = action.tag === 'ack' && scope?.scope === 'group';
+  // An earlier press on this finding recorded no result. A press opens no
+  // case, so the one control is "Try again", behind its own confirm.
+  const retryCase = action.tag === 'escalate' && findingCase && scope?.retry === true;
 
   const base = dismissed || closedNote
     ? { border: '#2a3645', bg: '#0c0f15' }
@@ -344,12 +401,16 @@ export function ActionCard({
               className="mt-[10px] pl-[31px] text-[12px] leading-[1.5] text-text-2"
             />
           )}
-          <div
-            data-testid="action-scope"
-            className={`${onCases ? 'mt-1' : 'mt-[10px]'} pl-[31px] text-[12px] leading-[1.5] text-text-2`}
-          >
-            {scopeSentence}
-          </div>
+          {/* The scope of a write the card offers. The case of a held
+              investigation opens on the campaign, so the card states no scope. */}
+          {!campaignCase && (
+            <div
+              data-testid="action-scope"
+              className={`${onCases ? 'mt-1' : 'mt-[10px]'} pl-[31px] text-[12px] leading-[1.5] text-text-2`}
+            >
+              {scopeSentence}
+            </div>
+          )}
           {action.pendingNote && (
             <div className="mt-1 pl-[31px] text-[12px] leading-[1.5] text-faint">
               {action.pendingNote}
@@ -365,7 +426,62 @@ export function ActionCard({
           {lockedReason && (
             <div className="mt-1 pl-[31px] text-[12px] leading-[1.5] text-warn">{lockedReason}</div>
           )}
-          {!lockedReason && blockedReason && (
+          {campaignCase && (
+            <div
+              data-testid="action-campaign-case"
+              className="mt-1 flex flex-wrap items-baseline gap-x-2 gap-y-0.5 pl-[31px] text-[12px] leading-[1.5] text-text-2"
+            >
+              <span className="min-w-0 break-words">
+                <Network size={11} aria-hidden className="mr-1 inline-block align-[-1px] text-dim" />
+                {ownCampaignNote && campaign && (
+                  <>
+                    {ACTION_CAMPAIGN_NOTE.before}
+                    <span className="font-semibold">{campaign.title.trim()}</span>
+                    {'. '}
+                  </>
+                )}
+                {blockedReason}
+              </span>
+              {campaignHref && (
+                <Link
+                  to={campaignHref}
+                  className="inline-flex flex-none items-center gap-0.5 font-semibold text-accent hover:underline"
+                >
+                  {OPEN_CAMPAIGN}
+                  <ArrowUpRight size={12} aria-hidden />
+                </Link>
+              )}
+            </div>
+          )}
+          {ownCampaignNote && campaign && !campaignCase && (
+            <div
+              data-testid="action-campaign"
+              className="mt-1 flex flex-wrap items-baseline gap-x-2 gap-y-0.5 pl-[31px] text-[12px] leading-[1.5] text-text-2"
+            >
+              <span className="min-w-0 break-words">
+                <Network size={11} aria-hidden className="mr-1 inline-block align-[-1px] text-dim" />
+                {ACTION_CAMPAIGN_NOTE.before}
+                <span className="font-semibold">{campaign.title.trim()}</span>
+                {ACTION_CAMPAIGN_NOTE.after}
+              </span>
+              <Link
+                to={`/campaigns/${campaign.id}`}
+                className="inline-flex flex-none items-center gap-0.5 font-semibold text-accent hover:underline"
+              >
+                {OPEN_CAMPAIGN}
+                <ArrowUpRight size={12} aria-hidden />
+              </Link>
+            </div>
+          )}
+          {/* A note of the server that the card builds no sentence for: a
+              code the console does not know, or a campaign note with no
+              campaign link. The card states it as plain text. */}
+          {serverNote && (
+            <div data-testid="action-note" className="mt-1 break-words pl-[31px] text-[12px] leading-[1.5] text-text-2">
+              {serverNote}
+            </div>
+          )}
+          {!lockedReason && blockedReason && !campaignCase && (
             <div data-testid="action-blocked" className="mt-1 pl-[31px] text-[12px] leading-[1.5] text-warn">
               {blockedReason}
             </div>
@@ -375,20 +491,23 @@ export function ActionCard({
               <div className="mb-2.5 flex items-start gap-2 text-[12.5px] leading-[1.5] text-warn">
                 <AlertTriangle size={13} className="mt-px flex-none" />
                 <span>
-                  {onCases
-                    ? `${casesSentence(onCases, casesComplete)} ${scopeSentence}`
-                    : `This writes to Security Onion. ${scopeSentence}`}
+                  {retryCase
+                    ? scope?.retrySentence ?? scopeSentence
+                    : onCases
+                      ? `${casesSentence(onCases, casesComplete)} ${scopeSentence}`
+                      : `This writes to Security Onion. ${scopeSentence}`}
                 </span>
               </div>
               <div className="flex flex-wrap gap-2">
                 <button
                   onClick={() => {
                     setConfirm(null);
-                    onExecute('group');
+                    if (retryCase) onExecute('group', { retry: true });
+                    else onExecute('group');
                   }}
                   className={`${btn} border-success-btn-border bg-success-btn text-[#eafff2] hover:bg-[#22824c]`}
                 >
-                  <Check size={15} /> {confirmLabel(action.tag, scope, !!onCases)}
+                  <Check size={15} /> {retryCase ? 'Try again' : confirmLabel(action.tag, scope, !!onCases)}
                 </button>
                 {groupAck && (
                   <button
@@ -435,14 +554,17 @@ export function ActionCard({
             </div>
           ) : (
             <div className="mt-[13px] flex gap-[9px] pl-[31px]">
-              <button
-                onClick={() => setConfirm('write')}
-                disabled={!canWrite}
-                title={writeOffReason}
-                className={`${btn} border-success-btn-border bg-success-btn text-[#eafff2] hover:bg-[#22824c] disabled:hover:bg-success-btn`}
-              >
-                <Check size={15} /> {decision === 'failed' ? 'Retry' : ACTION_VERB[action.tag]}
-              </button>
+              {!campaignCase && (
+                <button
+                  onClick={() => setConfirm('write')}
+                  disabled={!canWrite}
+                  title={writeOffReason}
+                  className={`${btn} border-success-btn-border bg-success-btn text-[#eafff2] hover:bg-[#22824c] disabled:hover:bg-success-btn`}
+                >
+                  <Check size={15} />{' '}
+                  {retryCase ? 'Try again' : decision === 'failed' ? 'Retry' : ACTION_VERB[action.tag]}
+                </button>
+              )}
               <button
                 onClick={() => setConfirm('dismiss')}
                 disabled={!!lockedReason || decision === 'dismissing'}

@@ -298,6 +298,9 @@ def test_the_escalate_scope_is_one_case_for_this_alert(client: TestClient) -> No
         # confirmed (2026-10-20, V3-N2).
         "cases": [],
         "casesComplete": False,
+        # Only the case of a finding with a press that has no result sets these.
+        "retry": False,
+        "retrySentence": None,
     }
 
 
@@ -530,7 +533,7 @@ def test_the_failed_run_hint_names_no_setting() -> None:
     out = _failure_out("error", [stored])
     assert out is not None and out.hint is not None
     assert "investigation_run_timeout_s" not in out.hint
-    assert out.hint.startswith("This run stopped before a verdict.")
+    assert out.hint.startswith("This investigation stopped before a verdict.")
     # Negative control: a phase with no analyst sentence keeps its stored hint.
     other = SimpleNamespace(
         kind="error", payload={"message": "boom", "phase": "synth", "hint": "Check the gateway."}

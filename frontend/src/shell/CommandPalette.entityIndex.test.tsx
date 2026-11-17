@@ -17,6 +17,7 @@ vi.mock('react-router-dom', async (importOriginal) => {
 });
 
 vi.mock('../lib/api', () => ({
+  getAbout: vi.fn(() => Promise.resolve({ version: '1.6.0' })),
   getAlerts: vi.fn(() => Promise.resolve({ groups: [], truncated: false, other_docs: 0 })),
   getInvestigations: vi.fn(() => Promise.resolve([])),
   getConfig: vi.fn(() => Promise.resolve({ groups: [], tokens: [], users: [], dangerHost: '' })),
@@ -178,5 +179,36 @@ describe('CommandPalette: users, domains, addresses and hunts', () => {
     expect(await screen.findByRole('option', { name: /ws-15/ })).toBeInTheDocument();
     type('192.0.2.15 ');
     expect(screen.getByRole('option', { name: /ws-15/ })).toBeInTheDocument();
+  });
+});
+
+// L4 (review 2026-11-12): Ctrl K "php2shell" put a hunt first, and its label
+// was a 13-line prompt. Investigations and hosts rank before hunts.
+describe('CommandPalette: the order of the results', () => {
+  it('ranks the hosts and the investigations before a hunt', async () => {
+    vi.mocked(listMachines).mockResolvedValue({ ...EMPTY_PAGE, rows: [{ ...MACHINE, name: 'php2shell-web' }], total: 1 });
+    vi.mocked(getInvestigations).mockResolvedValue([
+      { ...inv('INV-1', '192.0.2.15', '198.51.100.7'), name: 'ET EXPLOIT php2shell upload' } as InvestigationRow,
+    ]);
+    vi.mocked(searchEntityIndex).mockResolvedValue({
+      q: 'php2shell',
+      hits: [
+        {
+          type: 'hunt',
+          value: 'H-49',
+          label: 'Lead 49 hunt: 192.0.2.15',
+          detail: 'Hunt H-49 · 1 confirmed · 0 not judged · of 1 threat finding',
+          href: '/hunts/H-49',
+        },
+      ],
+    });
+    await openPalette();
+    type('php2shell');
+    await screen.findByText('Lead 49 hunt: 192.0.2.15');
+    const groups = screen.getAllByRole('option').map((o) => o.textContent ?? '');
+    const at = (word: string) => groups.findIndex((g) => g.endsWith(word));
+    expect(at('Hosts')).toBeGreaterThanOrEqual(0);
+    expect(at('Investigations')).toBeGreaterThan(at('Hosts'));
+    expect(at('Hunts')).toBeGreaterThan(at('Investigations'));
   });
 });

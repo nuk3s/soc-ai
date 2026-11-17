@@ -27,6 +27,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
   listMachines: vi.fn(),
   getMachineSummary: vi.fn(),
+  getHostLastEvents: vi.fn(),
   listDossiers: vi.fn(),
   getDossier: vi.fn(),
   getDossierConflicts: vi.fn(),
@@ -40,6 +41,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
 
 import {
   bulkSetDossierOverride,
+  getHostLastEvents,
   getDossier,
   getDossierConflicts,
   getDossierRefreshStatus,
@@ -210,6 +212,7 @@ beforeEach(() => {
   sessionStorage.clear();
   vi.mocked(listMachines).mockReset().mockResolvedValue(page([PROXY, UNNAMED, PRINTER]));
   vi.mocked(getMachineSummary).mockReset().mockResolvedValue(SUMMARY);
+  vi.mocked(getHostLastEvents).mockReset().mockResolvedValue({ events: {}, window: '24h' });
   vi.mocked(listDossiers).mockReset();
   vi.mocked(getDossier).mockReset();
   vi.mocked(getDossierConflicts).mockReset().mockResolvedValue({ pending: 0, rows: [] });
@@ -290,7 +293,7 @@ describe('Hosts table: one row per machine', () => {
     const headers = within(table)
       .getAllByRole('columnheader')
       .map((h) => (h.textContent ?? '').trim());
-    expect(headers).toEqual(['Host', 'Address', 'Agent', 'Role', 'Events', 'First seen', 'Last seen']);
+    expect(headers).toEqual(['Host', 'Address', 'Agent', 'Role', 'Findings', 'Events', 'First seen', 'Last seen']);
     // One row per machine: three machines, three body rows.
     expect(within(table).getAllByRole('row')).toHaveLength(4);
   });
@@ -1186,5 +1189,54 @@ describe('Hosts bulk declare', () => {
     await waitFor(() =>
       expect(Array.from(control.options).map((o) => o.value)).toEqual(['', 'jump_host', 'workstation']),
     );
+  });
+});
+
+
+// L2 (review 2026-11-12): the list had no security column, and LAST SEEN read
+// "5h ago" on every row: the age of the sweep. The host page read "last grid
+// event now".
+describe('Hosts list: findings and the last grid event', () => {
+  it('states the confirmed threats and the open leads of each machine', async () => {
+    vi.mocked(listMachines).mockResolvedValue(
+      page([
+        { ...PROXY, findings: { confirmed: 27, open_leads: 2, days: 7 } },
+        { ...UNNAMED, findings: { confirmed: 0, open_leads: 1, days: 7 } },
+        { ...PRINTER, findings: { confirmed: 0, open_leads: 0, days: 7 } },
+      ]),
+    );
+    mount();
+    const cell = await screen.findByTestId(`machine-findings-${PROXY.key}`);
+    expect(cell.textContent).toBe('27 confirmed in 7 days2 open leads');
+    expect(screen.getByTestId(`machine-findings-${UNNAMED.key}`).textContent).toBe('1 open lead');
+    expect(screen.queryByTestId(`machine-findings-${PRINTER.key}`)).toBeNull();
+    // The header states the window of each count.
+    const header = screen.getByRole('columnheader', { name: /Findings/ });
+    expect(header.getAttribute('title')).toMatch(/last 7 days/);
+  });
+
+  it('reads the newest grid event of the page in one request', async () => {
+    const recent = new Date(Date.now() - 2 * 60_000).toISOString();
+    vi.mocked(getHostLastEvents).mockResolvedValue({ events: { '198.51.100.5': recent }, window: '24h' });
+    mount();
+    await waitFor(() =>
+      expect(screen.getByTestId(`machine-last-seen-${PROXY.key}`).textContent).toBe('2m ago'),
+    );
+    expect(getHostLastEvents).toHaveBeenCalledTimes(1);
+    const sent = vi.mocked(getHostLastEvents).mock.calls[0][0];
+    expect(sent).toEqual(expect.arrayContaining(['192.0.2.10', '198.51.100.5', '192.0.2.20', '192.0.2.30']));
+    expect(screen.getByTestId(`machine-last-seen-${PROXY.key}`).getAttribute('title')).toMatch(
+      /read it from the grid/,
+    );
+  });
+
+  it('keeps the time the sweep saw when the grid read fails', async () => {
+    // NEGATIVE CONTROL: a grid outage never blanks the column.
+    vi.mocked(getHostLastEvents).mockRejectedValue(new Error('grid down'));
+    mount();
+    const cell = await screen.findByTestId(`machine-last-seen-${PROXY.key}`);
+    await waitFor(() => expect(getHostLastEvents).toHaveBeenCalled());
+    expect(cell.textContent).not.toBe('');
+    expect(cell.getAttribute('title')).toMatch(/the last sweep saw/);
   });
 });

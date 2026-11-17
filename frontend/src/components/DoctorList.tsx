@@ -1,14 +1,18 @@
-import { RotateCw } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { Copy, ExternalLink, KeyRound, RotateCw, Settings2 } from 'lucide-react';
+import { type ReactNode, useEffect, useRef, useState } from 'react';
+import { Link, useInRouterContext } from 'react-router-dom';
 
-import { ApiError, getPreflightDetail, refreshPreflight } from '../lib/api';
+import { ApiError, getApiKeys, getPreflightDetail, refreshPreflight } from '../lib/api';
+import { type DoctorFix, doctorFix, rowsByGrade } from '../lib/doctorFix';
 import type { PreflightDetail, PreflightRow } from '../lib/types';
 import { absTime, ago } from '../lib/timeRange';
+import { ChangePasswordModal } from '../shell/ChangePasswordModal';
 import { HelpText } from './HelpText';
 import { LoadingInline } from './States';
 
 // ---------------------------------------------------------------------------
-// Every doctor row, in the order the doctor writes them.
+// Every doctor row. FAIL and WARN rows come first, each with a control to the
+// place that fixes it (lib/doctorFix.ts). The rest keep the doctor order.
 //
 // The Setup health card on the Dashboard shows the FAIL and WARN rows only.
 // The INFO and PASS rows ("estate model", "prompt assets", "oracle route")
@@ -88,10 +92,137 @@ export function statusCounts(rows: PreflightRow[]): Record<string, number> {
   return out;
 }
 
+/** Where a setting lives in Settings: the section and the row to flash. */
+export interface SettingTarget {
+  sectionId: string;
+  highlightKey: string;
+  label: string;
+}
+
+const CONTROL =
+  'inline-flex items-center gap-1 rounded-control border border-border bg-surface-2 px-2 py-0.5 text-[11px] font-semibold text-text-2 hover:bg-surface-3 hover:text-text';
+
+/** A link inside the console. A list rendered outside a router (a test, a
+ *  story) gets a plain anchor. */
+function ConsoleLink({
+  to,
+  state,
+  children,
+  testId,
+}: {
+  to: { pathname: string; hash: string };
+  state?: unknown;
+  children: ReactNode;
+  testId: string;
+}) {
+  const routed = useInRouterContext();
+  if (!routed) {
+    return (
+      <a data-testid={testId} href={`/app${to.pathname}#${to.hash}`} className={CONTROL}>
+        {children}
+      </a>
+    );
+  }
+  return (
+    <Link data-testid={testId} to={to} state={state} className={CONTROL}>
+      {children}
+    </Link>
+  );
+}
+
+function CopyCommand({ command }: { command: string }) {
+  const [copied, setCopied] = useState(false);
+  const canCopy = typeof navigator !== 'undefined' && !!navigator.clipboard;
+  return (
+    <span className="inline-flex min-w-0 flex-wrap items-center gap-1.5">
+      <code
+        data-testid="doctor-fix-command"
+        className="break-all rounded-chip bg-surface-2 px-1.5 py-px font-mono text-[11px] text-text-2"
+      >
+        {command}
+      </code>
+      {canCopy && (
+        <button
+          type="button"
+          data-testid="doctor-fix-copy"
+          className={CONTROL}
+          onClick={() => {
+            navigator.clipboard
+              .writeText(command)
+              .then(() => setCopied(true))
+              .catch(() => setCopied(false));
+          }}
+        >
+          <Copy size={11} />
+          {copied ? 'Copied' : 'Copy the command'}
+        </button>
+      )}
+    </span>
+  );
+}
+
+/** The controls of one FAIL or WARN row. */
+function FixControls({
+  fix,
+  settingTarget,
+  onChangePassword,
+}: {
+  fix: DoctorFix;
+  settingTarget: (key: string) => SettingTarget | null;
+  onChangePassword: () => void;
+}) {
+  const settings = fix.settings
+    .map((key) => settingTarget(key))
+    .filter((t): t is SettingTarget => t != null);
+  const any = fix.changePassword || settings.length > 0 || fix.command || fix.doc || fix.panel;
+  if (!any) return null;
+  return (
+    <div data-testid="doctor-fix-controls" className="mt-1.5 flex flex-wrap items-center gap-1.5">
+      {fix.changePassword && (
+        <button type="button" data-testid="doctor-fix-password" className={CONTROL} onClick={onChangePassword}>
+          <KeyRound size={11} />
+          Change password
+        </button>
+      )}
+      {settings.map((t) => (
+        <ConsoleLink
+          key={t.highlightKey}
+          testId="doctor-fix-setting"
+          to={{ pathname: '/config', hash: t.sectionId }}
+          state={{ highlightKey: t.highlightKey }}
+        >
+          <Settings2 size={11} />
+          {`Open the setting ${t.label}`}
+        </ConsoleLink>
+      ))}
+      {fix.panel && (
+        <ConsoleLink testId="doctor-fix-panel" to={{ pathname: '/config', hash: fix.panel.id }}>
+          <Settings2 size={11} />
+          {`Open ${fix.panel.label}`}
+        </ConsoleLink>
+      )}
+      {fix.command && <CopyCommand command={fix.command} />}
+      {fix.doc && (
+        <a
+          data-testid="doctor-fix-doc"
+          href={fix.doc.href}
+          target="_blank"
+          rel="noopener noreferrer"
+          className={CONTROL}
+        >
+          <ExternalLink size={11} />
+          {`Read ${fix.doc.label}`}
+        </a>
+      )}
+    </div>
+  );
+}
+
 export function DoctorList({
   warnOnly = false,
   filter = null,
   onRows,
+  settingTarget,
 }: {
   /** Show the WARN rows only. Kept for older callers; `filter` replaces it. */
   warnOnly?: boolean;
@@ -99,6 +230,9 @@ export function DoctorList({
   filter?: DoctorFilter;
   /** Called with the rows of each read, so the header can count them. */
   onRows?: (rows: PreflightRow[]) => void;
+  /** Where a setting key lives in Settings. The Settings page knows its
+   *  sections. An API key that it does not know resolves to API keys. */
+  settingTarget?: (key: string) => SettingTarget | null;
 } = {}) {
   const [detail, setDetail] = useState<PreflightDetail | null>(null);
   const [failed, setFailed] = useState<string | null>(null);
@@ -140,8 +274,35 @@ export function DoctorList({
     // onRows is a setter from the caller. A new closure must not read again.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [detail]);
+  // The API keys of the API keys panel. A hint that names one ("set
+  // ABUSE_CH_AUTH_KEY") links to its row there. Read once, when a FAIL or WARN
+  // row names a setting that the caller does not resolve.
+  const [apiKeys, setApiKeys] = useState<Record<string, string> | null>(null);
+  const askedKeys = useRef(false);
+  useEffect(() => {
+    if (!detail || askedKeys.current) return;
+    const unresolved = detail.rows.some((r) =>
+      (doctorFix(r)?.settings ?? []).some((key) => !settingTarget?.(key)),
+    );
+    if (!unresolved) return;
+    askedKeys.current = true;
+    getApiKeys()
+      .then((keys) => setApiKeys(Object.fromEntries(keys.map((k) => [k.key, k.label]))))
+      .catch(() => setApiKeys({}));
+  }, [detail, settingTarget]);
+  const resolveSetting = (key: string): SettingTarget | null => {
+    const found = settingTarget?.(key);
+    if (found) return found;
+    const label = apiKeys?.[key];
+    return label ? { sectionId: 'api-keys', highlightKey: `apikey:${key}`, label } : null;
+  };
+  const [passwordOpen, setPasswordOpen] = useState(false);
+  const passwordReturn = useRef<HTMLElement | null>(null);
   const only: DoctorFilter = filter ?? (warnOnly ? 'WARN' : null);
-  const shown = only ? rows.filter((r) => r.status.toUpperCase() === only) : rows;
+  // FAIL and WARN first. Three warnings sat at rows 21, 34 and 35 of 36
+  // (review 2026-11-12).
+  const ordered = rowsByGrade(rows);
+  const shown = only ? ordered.filter((r) => r.status.toUpperCase() === only) : ordered;
   return (
     <div data-testid="doctor-list" className="border-t border-border-faint">
       <div className="flex flex-wrap items-center gap-2 px-4 py-2.5">
@@ -205,11 +366,31 @@ export function DoctorList({
                       <HelpText text={r.hint} />
                     </div>
                   )}
+                  {(() => {
+                    const fix = doctorFix(r);
+                    return fix ? (
+                      <FixControls
+                        fix={fix}
+                        settingTarget={resolveSetting}
+                        onChangePassword={() => {
+                          passwordReturn.current = document.activeElement as HTMLElement | null;
+                          setPasswordOpen(true);
+                        }}
+                      />
+                    ) : null;
+                  })()}
                 </div>
               </li>
             );
           })}
         </ul>
+      )}
+      {passwordOpen && (
+        <ChangePasswordModal
+          open
+          onClose={() => setPasswordOpen(false)}
+          returnFocusRef={passwordReturn}
+        />
       )}
     </div>
   );

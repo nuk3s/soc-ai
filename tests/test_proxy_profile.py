@@ -65,14 +65,22 @@ def test_caddyfile_proxies_to_soc_ai_over_plain_http_and_reads_the_two_variables
     assert "https://soc-ai" not in text
 
 
-def test_container_healthchecks_try_https_then_http() -> None:
+def test_container_healthchecks_hold_both_schemes_and_the_switch() -> None:
+    """Both health checks can ask in HTTPS and in HTTP, and SOC_AI_TLS_CERT picks the first.
+
+    The checks asked HTTPS first on every path. Behind the proxy that made the
+    server log a warning each 30 s. tests/test_doctor_disk.py runs the compose
+    command and reads the order of the requests.
+    """
     test = " ".join(_compose()["services"]["soc-ai"]["healthcheck"]["test"])
     assert "https://127.0.0.1:8443/healthz" in test and "http://127.0.0.1:8443/healthz" in test
+    assert "SOC_AI_TLS_CERT" in test
     dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
-    m = re.search(r"HEALTHCHECK[^\n]*\n[^\n]*CMD ([^\n]+)", dockerfile)
+    m = re.search(r"^HEALTHCHECK.*?(?=\n\n)", dockerfile, re.M | re.S)
     assert m is not None
-    assert "https://127.0.0.1:8443/healthz" in m.group(1)
-    assert "http://127.0.0.1:8443/healthz" in m.group(1)
+    assert "https://127.0.0.1:8443/healthz" in m.group(0)
+    assert "http://127.0.0.1:8443/healthz" in m.group(0)
+    assert "SOC_AI_TLS_CERT" in m.group(0)
 
 
 def test_env_example_documents_the_proxy_path() -> None:

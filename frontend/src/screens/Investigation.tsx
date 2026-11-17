@@ -24,12 +24,14 @@ import {
 import { type ReactNode, useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { AskSocAiButton, investigationStarters } from '../components/AskPanel';
+import { AuthorizedActivityDialog } from '../components/AuthorizedActivityDialog';
 import { ConfidenceRing } from '../components/ConfidenceRing';
-import { DocumentChip } from '../components/DocumentDrawer';
+import { DocumentChip, DocumentDrawer, type CitedField } from '../components/DocumentDrawer';
 import { DraftDetectionPane } from '../components/DraftDetectionPane';
 import { EventTimelinePanel, eventTimelineMeta } from '../components/EventTimeline';
 import { Markdown } from '../components/Markdown';
 import { EntityGraph } from '../components/EntityGraph';
+import { HostLabel } from '../components/FlowBadge';
 import { Panel } from '../components/Panel';
 import { SameFlowPanel } from '../components/SameFlowPanel';
 import { KindBadge, RecordedRunChip, RunClassChip, SeverityTag, SyntheticEvalBadge, VerdictPill } from '../components/Badges';
@@ -57,18 +59,22 @@ import {
   restoreAction,
   startHunt,
 } from '../lib/api';
+import { campaignHolds } from '../lib/campaignDecision';
 import {
   ackMessage,
   ackWroteNothing,
   escalateMessage,
   escalateWroteNothing,
 } from '../lib/groupWriteMessages';
+import { AUTHORIZED_MARK, authorizedSentence, markHolds } from '../lib/authorizedActivity';
 import { plural } from '../lib/plural';
 import { firstSentence, objectiveHeadline } from '../lib/text';
 import { VERDICT_OPTIONS, confidenceWord, verdictLabel } from '../lib/labels';
 import { useToast } from '../lib/toast';
 import { gapSentence } from '../lib/openQuestions';
-import { plainHeadline, toolWords } from '../lib/headline';
+import { plainHeadline, plainText, splitHeadline, toolWords } from '../lib/headline';
+import { fieldChipLabel, fieldChipTitle, fieldWords, findingCitation } from '../lib/citations';
+import { asSentence, failureAction, failureCause, failureKind } from '../lib/runFailure';
 import {
   CHIP_SUBJECT_HUNT,
   ORACLE_REASON,
@@ -86,7 +92,7 @@ import { useChat, useChatScope } from '../lib/chatScope';
 import { citedEventIds, splitEventIds } from '../lib/eventIds';
 import { demoBlocked, useDemo } from '../lib/demo';
 import { absTime } from '../lib/timeRange';
-import { SEVERITY, TIMELINE_GROUP_COLOR, VERDICT, tint } from '../lib/tokens';
+import { TIMELINE_GROUP_COLOR, VERDICT, tint } from '../lib/tokens';
 import type {
   AlertMeta,
   AlertSibling,
@@ -102,11 +108,6 @@ import type {
   SummarySegment,
   TimelineStep,
 } from '../lib/types';
-
-// Derived from the single app-wide severity ramp (lib/tokens) — no duplicate hexes.
-const SEV_COLOR: Record<string, string> = Object.fromEntries(
-  (Object.keys(SEVERITY) as Severity[]).map((k) => [k, SEVERITY[k].color]),
-);
 
 
 interface InvestigationProps {
@@ -169,21 +170,21 @@ export function supersededSentence(
 ): string {
   if (run?.status === 'complete' && run.verdict) {
     const conf = run.conf != null ? ` (${run.conf.toFixed(2)})` : '';
-    return `A newer run on this ${subject} reached ${verdictLabel(run.verdict).toLowerCase()}${conf}.`;
+    return `A newer investigation on this ${subject} reached ${verdictLabel(run.verdict).toLowerCase()}${conf}.`;
   }
-  if (run?.status === 'running') return `A newer run on this ${subject} is in progress.`;
-  return `A newer run on this ${subject} replaced this run.`;
+  if (run?.status === 'running') return `A newer investigation on this ${subject} is in progress.`;
+  return `A newer investigation on this ${subject} replaced this one.`;
 }
 
 /** Why every action on a replaced run is off. */
-export const SUPERSEDED_LOCK = 'A newer run replaced this run. Act on the newer run.';
+export const SUPERSEDED_LOCK = 'A newer investigation replaced this one. Act on the newer investigation.';
 
 /** Why Re-run is off on a run whose recorded cause a re-run cannot change. */
-export const PERMANENT_FAILURE_LOCK = 'A re-run cannot change the recorded cause.';
+export const PERMANENT_FAILURE_LOCK = 'A new investigation cannot change the recorded cause.';
 
 /** The tooltip of a citation the validator could not resolve (R2-D5). */
 export const UNRESOLVED_CITATION =
-  'The validator did not resolve this citation. The run retrieved nothing that it names.';
+  'The validator did not resolve this citation. The investigation retrieved nothing that it names.';
 
 /** The verdict an analyst set on this run, or null when the model set it. */
 export function analystVerdictOf(
@@ -208,7 +209,7 @@ export function standingAnalystOf(
 
 /** The note on a run whose alert carries an analyst verdict on another run. */
 export function standingAnalystSentence(a: { verdict: string; by: string }): string {
-  return `${a.by} set the verdict of this alert to ${verdictLabel(a.verdict).toLowerCase()} on another run. That verdict stands.`;
+  return `${a.by} set the verdict of this alert to ${verdictLabel(a.verdict).toLowerCase()} on another investigation. That verdict stands.`;
 }
 
 /** The two actions that start a new run of the alert from this page. */
@@ -243,20 +244,20 @@ export function newRunConfirmText(
     lines.push(
       `${stakes.analyst.by} set the verdict of this ${subject} to ${verdictLabel(stakes.analyst.verdict).toLowerCase()}.`,
     );
-    if (stakes.analyst.otherRun) lines.push(`That verdict is on another run of the ${subject}.`);
+    if (stakes.analyst.otherRun) lines.push(`That verdict is on another investigation of the ${subject}.`);
   }
-  const name = action === 'rerun' ? 'A re-run' : 'Request more info';
+  const name = action === 'rerun' ? 'Re-run investigation' : 'Request more info';
   if (subject === 'finding' && !stakes.replay) {
     // The hunt page reads the newest run of the finding, so the new verdict
     // replaces the analyst verdict there. The buttons say the same.
     lines.push(
-      `${name} starts a new run of the finding. The verdict of the new run then replaces the analyst verdict on the hunt page.`,
+      `${name} starts a new investigation of the finding. The verdict of the new investigation then replaces the analyst verdict on the hunt page.`,
     );
-    lines.push('The run with the analyst verdict stays as a record.');
+    lines.push('The investigation with the analyst verdict stays as a record.');
     return lines;
   }
   if (stakes.replay) {
-    lines.push('This run is a backtest replay.');
+    lines.push('This investigation is a backtest replay.');
     const live = stakes.live;
     if (live?.verdict) {
       const at = live.conf != null ? ` at ${live.conf.toFixed(2)}` : '';
@@ -264,10 +265,10 @@ export function newRunConfirmText(
     } else {
       lines.push('The alert has no live verdict.');
     }
-    lines.push(`${name} starts a live run. The verdict of the new run becomes the live verdict of the alert.`);
+    lines.push(`${name} starts a live investigation. The verdict of the new investigation becomes the live verdict of the alert.`);
   } else {
     lines.push(
-      `${name} starts a new run. The new run can reach another verdict, and the alert then shows that verdict.`,
+      `${name} starts a new investigation. The new investigation can reach another verdict, and the alert then shows that verdict.`,
     );
   }
   if (stakes.analyst) {
@@ -312,12 +313,12 @@ const BRIEF_ROWS = new Set(['rule', 'source', 'dest', 'user']);
 
 /** How long a run takes on this grid, in one or two sentences. */
 export function runEstimate(t: Inv['typicalRun']): string {
-  if (!t) return 'A run takes 1 to 5 minutes.';
+  if (!t) return 'An investigation takes 1 to 5 minutes.';
   const span =
     t.lowMin === t.highMin
       ? `about ${t.medianMin} minute${t.medianMin === 1 ? '' : 's'}`
       : `${t.lowMin} to ${t.highMin} minutes`;
-  return `A run on this grid takes ${span}. The median of the last ${t.samples} runs is ${t.medianMin} minute${t.medianMin === 1 ? '' : 's'}.`;
+  return `An investigation on this grid takes ${span}. The median of the last ${t.samples} investigations is ${t.medianMin} minute${t.medianMin === 1 ? '' : 's'}.`;
 }
 
 /** What the Oracle is, on hover of the word. */
@@ -335,11 +336,11 @@ const SETTLED_SCOPE: Record<'ack' | 'escalate', string> = {
 
 /** Why Re-run is off while a run is in flight (fleet P4, 2026-10-01). */
 export const RERUN_BUSY_REASON =
-  'A run is in progress. Wait for it to finish before you start another run.';
+  'An investigation is in progress. Wait for it to finish before you start another one.';
 
 /** What Re-run does on the run of a hunt finding (2026-10-30). */
 export const FINDING_RERUN_TIP =
-  'This button starts a new investigation of the finding. This run stays as a record.';
+  'This button starts a new investigation of the finding. This investigation stays as a record.';
 
 /** Re-run on a finding run the page calls stuck. The server row still reads
  *  running, so the promote route returns this same run. */
@@ -348,7 +349,7 @@ export const FINDING_RUN_STILL_RUNS =
 
 /** The headline of a pipeline fallback. The stored summary names the failed
  *  phase and the exception class, which is internal detail (fleet P11). */
-export const FALLBACK_HEADLINE = 'The pipeline stopped. This run has no verdict.';
+export const FALLBACK_HEADLINE = 'The pipeline stopped. This investigation has no verdict.';
 
 // The fallback report's summary, for a row that lacks the fallback marker.
 const FALLBACK_SUMMARY_RE = /^Synth-first pipeline fallback:/;
@@ -617,20 +618,60 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   const isFallback =
     !!inv.fallback || FALLBACK_SUMMARY_RE.test(inv.rationale ?? '');
   const citedIds = citedEventIds(inv.citations);
+  // The headline is one sentence, and the body never repeats it (review
+  // 2026-11-13). A run whose stored headline held the whole summary printed
+  // the paragraph twice, once in the headline type. An analyst verdict keeps
+  // its whole note as the headline, and the text of the model folds below.
+  const summaryIsText = inv.summary.every((seg) => seg.t === 'text');
+  const keepWholeHeadline = inv.resolution?.resolved_via === 'manual' || !summaryIsText;
+  const split = keepWholeHeadline
+    ? null
+    : splitHeadline(inv.rationale, inv.summary.map((seg) => ('v' in seg ? seg.v : '')).join(''));
+  const bodySegments: SummarySegment[] = split
+    ? split.body
+      ? [{ t: 'text', v: split.body }]
+      : []
+    : inv.summary;
+  // A quiet line above the headline, when the detail carries one and the
+  // run states an impact. The verdict chip and the flow badge above already
+  // state the rest of the line, so a line with "Impact: not stated" said
+  // nothing new (polish review 2026-11-13). An unknown impact states nothing
+  // either. An older server sends no such field, so the page reads it with
+  // care.
+  const rawFirstLine = (inv as { firstLine?: unknown }).firstLine;
+  const rawImpact = (inv as { impact?: unknown }).impact;
+  const statesImpact = rawImpact === 'succeeded' || rawImpact === 'attempted' || rawImpact === 'none';
+  const firstLine =
+    statesImpact && typeof rawFirstLine === 'string' && rawFirstLine.trim() ? rawFirstLine.trim() : null;
   // The headline in plain words: field paths out, tool ids named in words.
-  const headline = plainHeadline(inv.rationale ?? '');
+  const headline = plainHeadline(split ? split.headline : inv.rationale ?? '');
   // Each cited field with the validator's answer (R2-D5). An unresolved
   // citation read like a resolved one. A path the headline names and the
   // report does not cite has no answer: null.
-  const citedPathItems: Array<{ path: string; resolved: boolean | null }> = [];
+  // A cited field carries the document that holds it and its value (K1).
+  const citedPathItems: Array<{
+    path: string;
+    resolved: boolean | null;
+    documentId: string | null;
+    value: string | null;
+    valueTruncated: boolean;
+  }> = [];
   for (const c of inv.citations ?? []) {
     const path = c.kind === 'path' ? c.target || c.text : '';
     if (path && !citedPathItems.some((i) => i.path === path)) {
-      citedPathItems.push({ path, resolved: c.resolved ?? null });
+      citedPathItems.push({
+        path,
+        resolved: c.resolved ?? null,
+        documentId: c.documentId ?? null,
+        value: c.value ?? null,
+        valueTruncated: c.valueTruncated === true,
+      });
     }
   }
   for (const path of headline.paths) {
-    if (path && !citedPathItems.some((i) => i.path === path)) citedPathItems.push({ path, resolved: null });
+    if (path && !citedPathItems.some((i) => i.path === path)) {
+      citedPathItems.push({ path, resolved: null, documentId: null, value: null, valueTruncated: false });
+    }
   }
   const citedPaths = citedPathItems.map((i) => i.path);
   // A tool the report cites. A resolved tool citation did not render (R2-D5).
@@ -696,6 +737,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     setStuck(false);
     setErrDismiss('idle');
     setErrDismissMsg(null);
+    setFailureDetailOpen(false);
     // Seed from the REAL elapsed (backend) so opening the same run in the drawer
     // then the permalink doesn't reset the timer to 0:00.
     setElapsed(inv.elapsedSec ?? 0);
@@ -712,6 +754,8 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
 
   const [reHunting, setReHunting] = useState(false);
   const [overrideOpen, setOverrideOpen] = useState(false);
+  // The dialog that records the activity of this run as authorized.
+  const [authorizeOpen, setAuthorizeOpen] = useState(false);
   // Nothing preselected: a confirm on the current verdict changed nothing
   // and still read as an override (dogfood 2026-10-06, first hour C5).
   const [overrideVerdictVal, setOverrideVerdictVal] = useState<string>('');
@@ -721,12 +765,27 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   const { toast } = useToast();
   // An analyst set the verdict. The model's paragraph folds under a label.
   const overridden = inv.resolution?.resolved_via === 'manual';
+  // The one line of a gate that changed the verdict. An analyst verdict and a
+  // pipeline error replace the verdict of the gate, so they show no line.
+  const gateChange = !isFallback && !overridden ? inv.verdictChange ?? null : null;
+  // The text of the model, when a gate refuted its claim. The headline and
+  // the summary are then the reason of the gate, so the headline never
+  // contradicts the verdict. The line states the change, and the reason is
+  // not printed a third time.
+  const modelWrote = gateChange ? inv.modelText ?? null : null;
+  const gateLine = gateChange
+    ? `soc-ai changed the verdict from ${verdictLabel(gateChange.fromVerdict).toLowerCase()} to ${verdictLabel(gateChange.toVerdict).toLowerCase()}. ${modelWrote ? '' : gateChange.reason}`.trim()
+    : null;
   const [priorOpen, setPriorOpen] = useState(false);
+  // The document a cited field opens, with the field to show first (K1).
+  const [citedDoc, setCitedDoc] = useState<{ id: string; cited: CitedField } | null>(null);
 
   // Dismiss (acknowledge) a pipeline-error run: the Dashboard KPI stops counting
   // it, while the run itself stays a fallback under the Pipeline-error filter.
   // `done` locally bridges the gap until a poll returns inv.errorDismissed.
   const [errDismiss, setErrDismiss] = useState<'idle' | 'busy' | 'done'>('idle');
+  // The raw error of a failed run, behind a toggle (K2).
+  const [failureDetailOpen, setFailureDetailOpen] = useState(false);
   const [errDismissMsg, setErrDismissMsg] = useState<string | null>(null);
   const errorDismissed = inv.errorDismissed || errDismiss === 'done';
   const dismissError = () => {
@@ -752,13 +811,13 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   // not have counted them down even if it had counted them.
   const dismissControl = errorDismissed ? (
     <span className="flex items-center gap-1.5 text-[12.5px] text-dim">
-      <Check size={13} /> Dismissed. The Dashboard does not count this run.
+      <Check size={13} /> Dismissed. The Dashboard does not count this investigation.
     </span>
   ) : (
     <button
       onClick={dismissError}
       disabled={errDismiss === 'busy'}
-      title="This button acknowledges the failed run. The Dashboard stops counting the run. The run stays under the Investigations 'Pipeline error' filter, and you can still re-run it."
+      title="This button acknowledges the failed investigation. The Dashboard stops counting it. The investigation stays under the Investigations 'Pipeline error' filter, and you can still re-run it."
       className="flex items-center gap-1.5 rounded-control border border-border-strong bg-surface-3 px-4 py-2 text-[12.5px] font-semibold text-dim hover:border-accent hover:text-text disabled:opacity-60"
     >
       {errDismiss === 'busy' ? <Spinner size={13} /> : <X size={13} />}
@@ -806,8 +865,8 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
       return `The API refused ${action}. ${endSentence(detail || `The API answered ${err.status}`)}`;
     }
     return (
-      `The API gave no answer to ${action}. The run may have started anyway. ` +
-      `Check the Investigations list for a newer run of this ${newRunSubject} before you start another. ${endSentence(
+      `The API gave no answer to ${action}. The investigation may have started anyway. ` +
+      `Check the Investigations list for a newer investigation of this ${newRunSubject} before you start another. ${endSentence(
         detail || 'The request did not complete',
       )}`
     );
@@ -906,12 +965,18 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   // Genuinely-pending = no local decision AND not already carried out by the
   // system (auto-ack). An applied action renders as a terminal "✓ done" card, so
   // counting it as pending contradicted the card (dogfood FP-run finding).
-  const pendingCount = inv.actions.filter(
-    (a) =>
-      actions[a.id] !== 'approved' &&
-      a.applied !== true &&
-      !(a.id in dismissals ? dismissals[a.id] : a.dismissed),
-  ).length;
+  // A run inside an authorized activity scope requests nothing, so none of
+  // its actions waits. The server counts the same way (action_waits).
+  // A run that a campaign holds requests nothing either: the analyst decides
+  // once, on the campaign (owner, 2026-11-14). The server counts the same way.
+  const pendingCount = markHolds(inv.authorization) || campaignHolds(inv.campaign)
+    ? 0
+    : inv.actions.filter(
+        (a) =>
+          actions[a.id] !== 'approved' &&
+          a.applied !== true &&
+          !(a.id in dismissals ? dismissals[a.id] : a.dismissed),
+      ).length;
   const graphInteresting =
     inv.edges.some((e) => e.kind === 'lateral') || inv.nodes.some((n) => n.kind === 'compromised');
   // The direction of the flow, from the server (R2-D10). Every true positive
@@ -943,6 +1008,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
         actedHere:
           Object.values(actions).some((d) => d === 'approved') || settledMsg?.tone === 'ok',
         noWrites: isBacktestReplay(inv.meta?.ranBy),
+        authorized: markHolds(inv.authorization),
       })}
       className="mb-3"
     />
@@ -967,6 +1033,25 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
           Override verdict
         </button>
       )}
+      {/* A true positive alert run can start an authorized activity record.
+          The dialog reads what the run allows, and it says why when the run
+          allows nothing. A run that holds the mark shows no button. */}
+      {!running &&
+        inv.verdict === 'true_positive' &&
+        !huntSubject &&
+        !isBacktestReplay(inv.meta?.ranBy) &&
+        !markHolds(inv.authorization) && (
+          <button
+            data-testid="record-authorized"
+            onClick={() => setAuthorizeOpen(true)}
+            disabled={!!supersededLock}
+            title={supersededLock ?? undefined}
+            className="flex items-center gap-1.5 rounded-control border border-border-strong bg-surface-3 px-[11px] py-1.5 text-[12px] font-semibold text-dim hover:border-accent hover:text-text disabled:opacity-60"
+          >
+            <Shield size={13} />
+            Record authorized activity
+          </button>
+        )}
       {/* Re-run on a finding run starts a new run of the finding through
           the promote route with rerun true, and hides while the run runs.
           startHunt would mint an unlabeled kind='suricata' duplicate on the
@@ -985,7 +1070,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
         </button>
       )}
       {inv.kind !== 'hunt' && running && (
-        <span className="text-[11.5px] text-faint">A run is in progress.</span>
+        <span className="text-[11.5px] text-faint">An investigation is in progress.</span>
       )}
       {inv.kind !== 'hunt' && wasHeuristic && (
         <button
@@ -1052,16 +1137,19 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   const promotedFindingEl = pf ? (
     <div
       data-testid="promoted-finding"
-      className="mb-3.5 rounded-card border px-3.5 py-3"
-      style={{ borderColor: 'rgba(244,114,182,.35)', background: 'rgba(244,114,182,.06)' }}
+      className="mb-3.5 rounded-card border border-border-strong bg-surface-2 px-3.5 py-3"
     >
       <div className="text-[13.5px] font-semibold text-text">
-        <span style={{ color: '#f472b6' }}>{judgesFinding ? 'Subject:' : 'Promoted finding:'}</span>{' '}
-        {pf.label}, {pf.title}
+        {/* The finding by its number and title. "Subject: F1" was a code
+            word and a code label (K3). */}
+        <span title={judgesFinding ? SUBJECT_FINDING : undefined} className="text-dim">
+          {findingName(pf.ordinal, judgesFinding)}:
+        </span>{' '}
+        {pf.title}
       </div>
       {pf.detail && (
         <div className="mt-1 text-[12.5px] leading-[1.5] text-text-2">
-          <EntityText text={pf.detail} entities={inv.entities} />
+          <EntityText text={plainText(pf.detail)} entities={inv.entities} />
         </div>
       )}
       {pf.attacker && pf.victim ? (
@@ -1081,9 +1169,23 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
       {(pf.citations?.length ?? 0) > 0 && (
         <div data-testid="promoted-evidence" className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[12px] text-faint">
           <span>Evidence:</span>
-          {pf.citations!.map((id) => (
-            <DocumentChip key={id} id={id} />
-          ))}
+          {pf.citations!.map((raw) => {
+            // A document id opens the document. A tool result or a query
+            // reads in words and opens nothing (K1, K3).
+            const c = findingCitation(raw);
+            return c.kind === 'document' ? (
+              <DocumentChip key={raw} id={c.id} />
+            ) : (
+              <span
+                key={raw}
+                data-testid="finding-citation-text"
+                title={c.title}
+                className="rounded-chip border border-border-strong bg-surface-2 px-1.5 py-px text-text-2"
+              >
+                {c.label}
+              </span>
+            );
+          })}
         </div>
       )}
     </div>
@@ -1123,10 +1225,73 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
           to={`/investigation/${standingAnalyst.investigationId}`}
           className="font-semibold text-accent underline hover:opacity-80"
         >
-          Open that run.
+          Open that investigation.
         </Link>
       </div>
     ) : null;
+
+  // The authorized activity of the run. A run inside a scope carries the
+  // mark, the label, the analyst and the expiry. A run outside a scope
+  // carries the one line that names the part that failed.
+  const authorizedEl = inv.authorization ? (
+    <div
+      role="note"
+      data-testid="authorized-activity"
+      className="mb-3.5 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-card border px-3.5 py-2.5 text-[13px]"
+      style={{ borderColor: 'rgba(75,139,245,.4)', background: 'rgba(75,139,245,.08)' }}
+    >
+      {markHolds(inv.authorization) && (
+        <span className="rounded-badge border border-accent px-[6px] py-[1px] text-[11px] font-semibold text-accent">
+          {AUTHORIZED_MARK}
+        </span>
+      )}
+      <span className="text-text-2">{authorizedSentence(inv.authorization)}</span>
+      <Link
+        to={`/investigations?authorization=${inv.authorization.id}&range=all`}
+        className="font-semibold text-accent underline hover:opacity-80"
+      >
+        Open its investigations.
+      </Link>
+    </div>
+  ) : inv.outsideAuthorizedScope ? (
+    <div
+      role="note"
+      data-testid="outside-authorized-scope"
+      className="mb-3.5 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-card border px-3.5 py-2.5 text-[13px]"
+      style={{ borderColor: 'rgba(245,166,35,.35)', background: 'rgba(245,166,35,.06)' }}
+    >
+      <span className="text-text-2">{inv.outsideAuthorizedScope}</span>
+      <span className="text-dim">This investigation gets normal handling.</span>
+    </div>
+  ) : null;
+
+  // The operator cleared this investigation from Needs you. The server
+  // writes the line, and the verdict stays the verdict of the run.
+  const clearedEl = inv.needsYouCleared ? (
+    <div
+      role="note"
+      data-testid="needs-you-cleared"
+      className="mb-3.5 rounded-card border border-border px-3.5 py-2.5 text-[13px] text-text-2"
+    >
+      {inv.needsYouCleared}
+    </div>
+  ) : null;
+
+  const authorizeDialogEl = (
+    <AuthorizedActivityDialog
+      invId={inv.id}
+      campaign={inv.campaign}
+      open={authorizeOpen}
+      onClose={() => setAuthorizeOpen(false)}
+      onSaved={(record) => {
+        toast({
+          tone: 'success',
+          message: `soc-ai recorded the authorized activity "${record.label}".`,
+        });
+        onVerdictApplied?.();
+      }}
+    />
+  );
 
   const runningEl = (
     <div
@@ -1163,7 +1328,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
       {/* How long a run takes here, from the store (dogfood 2026-10-06,
           first hour W11). The display sat on "Working" for minutes. */}
       <div data-testid="running-estimate" className="mt-3 text-[12px] leading-[1.5] text-dim">
-        {runEstimate(inv.typicalRun)} You can close this page. Notifications tells you when the run ends.
+        {runEstimate(inv.typicalRun)} You can close this page. Notifications tells you when the investigation ends.
       </div>
     </div>
   );
@@ -1195,22 +1360,27 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   const tryAgain = huntPointer
     ? 'Open an investigation on it again from its hunt.'
     : 'Re-run it to try again.';
+  // The plain cause leads, then the step the analyst can take (K2). The raw
+  // error is behind a toggle: it opened the card with an SSL context dump.
+  const failKind = failureKind(failure);
   const failureSentence = failure?.permanent
-      ? 'The run reached no verdict. A re-run cannot change the recorded cause.'
+      ? 'The investigation reached no verdict. The grid no longer holds its alert or its hunt. A new investigation cannot change the recorded cause.'
       : failure
-        ? `The run reached no verdict. ${tryAgain}`
-        : `The run reached no verdict. soc-ai recorded no cause. ${tryAgain}`;
+        ? `${failureCause(failKind)} ${huntPointer ? tryAgain : failureAction(failKind)}`
+        : `The investigation reached no verdict. soc-ai recorded no cause. ${tryAgain}`;
 
   // Terminal failure: a reaped/interrupted run (status 'error') OR one the
   // client-side stuck-guard gave up on. Replaces both the spinner and the
   // (empty) verdict so the analyst never stares at "Investigating…" forever.
+  // Grey with an amber icon (K4). Red is for a confirmed threat and a
+  // failed write, and this card had the border of a true positive card.
   const failedEl = (
     <div
-      className="relative mb-[18px] overflow-hidden rounded-panel-lg border p-[18px]"
-      style={{ borderColor: 'rgba(240,68,56,.32)', background: 'linear-gradient(180deg,rgba(240,68,56,.07),rgba(240,68,56,.02))' }}
+      data-testid="failed-run-card"
+      className="relative mb-[18px] overflow-hidden rounded-panel-lg border border-border-strong bg-surface-2 p-[18px]"
     >
       <div className="flex items-center gap-[11px]">
-        <span className="flex text-danger"><AlertTriangle size={18} /></span>
+        <span className="flex text-warn"><AlertTriangle size={18} /></span>
         <div className="text-[15px] font-semibold">
           {stuck && inv.status === 'investigating'
             ? 'This investigation seems stuck'
@@ -1235,36 +1405,51 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
             the two instructions never mean different things at the same
             spot. A finding run with Re-run reads the alert words. */}
         {inv.supersededBy
-          ? 'The run reached no verdict.'
+          ? 'The investigation reached no verdict.'
           : interrupted
           ? huntPointer
-            ? 'There is no verdict. The service restarted during the run. soc-ai re-investigates this finding if Auto-Investigate is on. Open an investigation on it again from its hunt.'
+            ? 'There is no verdict. The service restarted during the investigation. soc-ai re-investigates this finding if Auto-Investigate is on. Open an investigation on it again from its hunt.'
             : findingRun
-              ? 'There is no verdict. The service restarted during the run. Re-run it now to get a verdict.'
-              : 'There is no verdict. The service restarted during the run. soc-ai re-investigates this alert if Auto-Investigate is on. Re-run it now to get a verdict.'
+              ? 'There is no verdict. The service restarted during the investigation. Re-run it now to get a verdict.'
+              : 'There is no verdict. The service restarted during the investigation. soc-ai re-investigates this alert if Auto-Investigate is on. Re-run it now to get a verdict.'
           : cancelled
             ? huntPointer
-              ? 'The run reached no verdict. An operator cancel or a service restart stopped the run before it finished. Open an investigation on it again from its hunt.'
-              : 'The run reached no verdict. An operator cancel or a service restart stopped the run before it finished. Re-run it to get a verdict.'
+              ? 'The investigation reached no verdict. An operator cancel or a service restart stopped it before it finished. Open an investigation on it again from its hunt.'
+              : 'The investigation reached no verdict. An operator cancel or a service restart stopped it before it finished. Re-run it to get a verdict.'
             : stuck && inv.status === 'investigating'
-              ? `The run made no progress for 5 minutes. It may have stalled. ${tryAgain}`
+              ? `The investigation made no progress for 5 minutes. It may have stalled. ${tryAgain}`
               : failureSentence}
       </div>
       {failure && (
-        <div data-testid="failure-cause" className="mt-2 text-[12.5px] leading-[1.5] text-dim">
-          Recorded cause:{' '}
-          <span className="break-words font-mono text-[12px] text-text-2">{failure.cause}</span>
-          {failure.hint && <div className="mt-1">{failure.hint}</div>}
+        <div data-testid="failure-detail" className="mt-2 text-[12.5px] leading-[1.5] text-dim">
+          <button
+            type="button"
+            onClick={() => setFailureDetailOpen((o) => !o)}
+            aria-expanded={failureDetailOpen}
+            className="flex items-center gap-1.5 font-semibold hover:text-text"
+          >
+            <ChevronDown size={13} style={{ transform: failureDetailOpen ? 'rotate(180deg)' : 'none' }} />
+            {failureDetailOpen ? 'Hide the technical detail' : 'Show the technical detail'}
+          </button>
+          {failureDetailOpen && (
+            <div className="mt-1.5">
+              <div data-testid="failure-cause">
+                Recorded error:{' '}
+                <span className="break-words font-mono text-[12px] text-text-2">{failure.cause}</span>
+              </div>
+              {failure.hint && <div className="mt-1">{asSentence(failure.hint)}</div>}
+            </div>
+          )}
         </div>
       )}
       {inv.supersededBy && (
         <div data-testid="superseded-by" className="mt-2 text-[13px] leading-[1.5] text-text-2">
-          A later run replaced this one.{' '}
+          A later investigation replaced this one.{' '}
           <Link
             to={`/investigation/${inv.supersededBy}`}
             className="font-semibold text-accent underline hover:opacity-80"
           >
-            Open the later run
+            Open the later investigation
           </Link>
         </div>
       )}
@@ -1275,9 +1460,9 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
           <button
             onClick={reRun}
             disabled={reHunting}
-            className="flex items-center gap-1.5 rounded-control border border-danger bg-[rgba(240,68,56,.1)] px-4 py-2 text-[13px] font-semibold text-[#fca5a5] hover:bg-[rgba(240,68,56,.18)] disabled:opacity-60"
+            className="flex items-center gap-1.5 rounded-control border border-accent/50 bg-accent/10 px-4 py-2 text-[13px] font-semibold text-[#cfe0ff] hover:bg-accent/20 disabled:opacity-60"
           >
-            {reHunting ? <Spinner size={13} color="#fca5a5" /> : <RotateCw size={13} />}
+            {reHunting ? <Spinner size={13} color="#cfe0ff" /> : <RotateCw size={13} />}
             {reHunting ? 'Re-running' : 'Re-run investigation'}
           </button>
         )}
@@ -1333,7 +1518,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
               }
             >
               {inv.promotedFinding
-                ? `${inv.promotedFinding.label}, ${inv.promotedFinding.title}`
+                ? `${findingName(inv.promotedFinding.ordinal, judgesFinding)}: ${inv.promotedFinding.title}`
                 : firstSentence(huntSubject.objective)}
             </span>
             {huntSubject.lead_id != null && (
@@ -1389,18 +1574,22 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
               >
                 {ends.src && ends.dst ? (
                   <>
+                    <HostLabel value={ends.src} />
                     <span data-testid="endpoint-src" className="break-all text-mono-amber"><EndLink inv={inv} value={ends.src} /></span>
                     <span className="text-faint"> → </span>
+                    <HostLabel value={ends.dst} />
                     <span data-testid="endpoint-dst" className="break-all text-mono-green"><EndLink inv={inv} value={ends.dst} /></span>
                   </>
                 ) : ends.src ? (
                   <>
                     <span className="text-faint">from </span>
+                    <HostLabel value={ends.src} />
                     <span data-testid="endpoint-src" className="break-all text-mono-amber"><EndLink inv={inv} value={ends.src} /></span>
                   </>
                 ) : ends.dst ? (
                   <>
                     <span className="text-faint">to </span>
+                    <HostLabel value={ends.dst} />
                     <span data-testid="endpoint-dst" className="break-all text-mono-green"><EndLink inv={inv} value={ends.dst} /></span>
                   </>
                 ) : null}
@@ -1415,16 +1604,41 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
         </div>
       )}
 
+      {firstLine && !isFallback && (
+        <div data-testid="first-line" className="mb-1.5 text-[12.5px] leading-[1.5] text-dim" style={{ textWrap: 'pretty' }}>
+          {firstLine}
+        </div>
+      )}
       {/* rationale as headline */}
-      <div className="text-[21px] font-semibold leading-[1.32] tracking-[-.015em]" style={{ textWrap: 'pretty' }}>
+      <div data-testid="verdict-headline" className="text-[21px] font-semibold leading-[1.32] tracking-[-.015em]" style={{ textWrap: 'pretty' }}>
         {isFallback ? FALLBACK_HEADLINE : <CitedText text={headline.text} ids={citedIds} entities={inv.entities} />}
       </div>
+      {/* A gate changed the verdict. The headline above is the sentence of
+          the model, and this one line states the change and its reason
+          (review 2026-11-12). Open questions lists the missing evidence. */}
+      {gateLine && (
+        <div data-testid="gate-line" className="mt-2.5 text-[12.5px] leading-[1.55] text-dim" style={{ textWrap: 'pretty' }}>
+          <span className="font-semibold" style={{ color: '#f5a623' }}>Verdict change</span>
+          {': '}
+          {gateLine}
+        </div>
+      )}
 
       {/* summary with citations. A fallback's stored summary is the exception
           text; the pipeline-error panel below says what an analyst needs. */}
-      {!isFallback && !overridden && (
-        <p className="mt-3.5 text-[13.5px] leading-[1.6] text-[#aeb6c2]" style={{ textWrap: 'pretty' }}>
-          <Summary segments={inv.summary} onCite={goToCite} ids={citedIds} entities={inv.entities} />
+      {!isFallback && !overridden && bodySegments.length > 0 && (
+        <p data-testid="verdict-body" className="mt-3.5 text-[13.5px] leading-[1.6] text-[#aeb6c2]" style={{ textWrap: 'pretty' }}>
+          <Summary segments={bodySegments} onCite={goToCite} ids={citedIds} entities={inv.entities} />
+        </p>
+      )}
+      {/* A gate refuted the claim of the model. The text above is the reason
+          of the gate. The text of the model stays readable, under a label
+          that says whose text it is. */}
+      {modelWrote && (
+        <p data-testid="model-wrote" className="mt-3 text-[12.5px] leading-[1.6] text-dim" style={{ textWrap: 'pretty' }}>
+          <span className="font-semibold text-[#8b94a3]">The model wrote</span>
+          {': '}
+          {plainText(modelWrote)}
         </p>
       )}
       {/* After an analyst override the model's paragraph no longer explains
@@ -1460,38 +1674,71 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
               <DocumentChip key={id} id={id} />
             ),
           )}
-          {/* A field of the alert the verdict cites. The headline names the
-              evidence in words, and the path stays here (dogfood
-              2026-10-06, C1). An unresolved one is struck through. */}
-          {citedPathItems.map(({ path, resolved }) => (
-            <span
-              key={path}
-              data-testid="cited-path"
-              data-resolved={resolved === null ? undefined : String(resolved)}
-              title={
-                resolved === false
-                  ? UNRESOLVED_CITATION
-                  : 'A field of the alert that the verdict cites.'
-              }
-              className={`rounded-chip border bg-surface-2 px-1.5 py-px font-mono text-[11px] ${
-                resolved === false
-                  ? 'border-dashed border-border-strong text-faint line-through'
-                  : 'border-border-strong text-text-2'
-              }`}
-            >
-              {path}
-            </span>
-          ))}
-          {citedTools.map((tool) => (
-            <span
-              key={tool}
-              data-testid="cited-tool"
-              title="A tool result that the verdict cites."
-              className="rounded-chip border border-border-strong bg-surface-2 px-1.5 py-px text-[11px] text-text-2"
-            >
-              {toolWords(tool).replace(/^the /, '')}
-            </span>
-          ))}
+          {/* A field the verdict cites, in words with its value when the
+              value is short. The chip opens the document that holds the
+              field, at the field (K1). The raw path stays in the tooltip.
+              A field no stored document holds is a plain chip, and an
+              unresolved one is struck through. */}
+          {citedPathItems.map(({ path, resolved, documentId, value, valueTruncated }) => {
+            const label = fieldChipLabel(path, value);
+            const title = fieldChipTitle(path, { documentId, value, resolved });
+            return resolved !== false && documentId ? (
+              <button
+                key={path}
+                type="button"
+                data-testid="cited-path"
+                data-resolved={resolved === null ? undefined : String(resolved)}
+                title={title}
+                onClick={() =>
+                  setCitedDoc({ id: documentId, cited: { label: fieldWords(path), path, value, valueTruncated } })
+                }
+                className="rounded-chip border border-border-strong bg-surface-2 px-1.5 py-px text-[11px] text-accent hover:bg-surface-3"
+              >
+                {label}
+              </button>
+            ) : (
+              <span
+                key={path}
+                data-testid="cited-path"
+                data-resolved={resolved === null ? undefined : String(resolved)}
+                title={title}
+                className={`rounded-chip border bg-surface-2 px-1.5 py-px text-[11px] ${
+                  resolved === false
+                    ? 'border-dashed border-border-strong text-faint line-through'
+                    : 'border-border-strong text-text-2'
+                }`}
+              >
+                {label}
+              </span>
+            );
+          })}
+          {/* A tool the verdict cites. The chip shows its step in the
+              timeline when the page has one. */}
+          {citedTools.map((tool) => {
+            const at = inv.timeline.findIndex((step) => step.tool === tool);
+            const words = toolWords(tool).replace(/^the /, '');
+            return at >= 0 ? (
+              <button
+                key={tool}
+                type="button"
+                data-testid="cited-tool"
+                title={`Tool ${tool}. Show this tool call in the investigation timeline.`}
+                onClick={() => goToCite(at + 1)}
+                className="rounded-chip border border-border-strong bg-surface-2 px-1.5 py-px text-[11px] text-accent hover:bg-surface-3"
+              >
+                {words}
+              </button>
+            ) : (
+              <span
+                key={tool}
+                data-testid="cited-tool"
+                title={`Tool ${tool}. The investigation timeline has no step for this tool call.`}
+                className="rounded-chip border border-border-strong bg-surface-2 px-1.5 py-px text-[11px] text-text-2"
+              >
+                {words}
+              </span>
+            );
+          })}
           {unresolvedCount > 0 && (
             <span className="text-faint">
               {unresolvedCount === 1
@@ -1514,6 +1761,9 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
         </button>
       )}
     </div>
+    {citedDoc && (
+      <DocumentDrawer documentId={citedDoc.id} cited={citedDoc.cited} onClose={() => setCitedDoc(null)} />
+    )}
     {inv.oracle?.escalated && (
       <OracleCard oracle={inv.oracle} />
     )}
@@ -1524,14 +1774,14 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
         open-questions block below — re-running is the fix, not "dig deeper". */}
     {inv.fallback && (
       <div
-        className="mb-3 rounded-card border px-3.5 py-3"
-        style={{ borderColor: 'rgba(240,68,56,.32)', background: 'rgba(240,68,56,.06)' }}
+        data-testid="pipeline-error-panel"
+        className="mb-3 rounded-card border border-border-strong bg-surface-2 px-3.5 py-3"
       >
-        <div className="mb-1.5 flex items-center gap-2 text-[12px] font-semibold uppercase tracking-[.05em]" style={{ color: '#fca5a5' }}>
+        <div className="mb-1.5 flex items-center gap-2 text-[12px] font-semibold uppercase tracking-[.05em] text-warn">
           <Wrench size={13} /> Pipeline error
         </div>
         <div className="mb-2.5 text-[13px] leading-[1.55] text-text-2" style={{ textWrap: 'pretty' }}>
-          This run failed before it reached a verdict
+          This investigation failed before it reached a verdict
           {inv.fallback.hint ? <>: {inv.fallback.hint}</> : '.'}
           {' '}soc-ai recorded the verdict Needs more info as a placeholder.
           {/* Same Re-run/hunt-pointer split as failedEl above: the button (or
@@ -1550,9 +1800,9 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
               onClick={reRun}
               disabled={reHunting || !!rerunLock}
               title={rerunLock ?? undefined}
-              className="flex items-center gap-1.5 rounded-control border border-danger bg-[rgba(240,68,56,.1)] px-4 py-2 text-[12.5px] font-semibold text-[#fca5a5] hover:bg-[rgba(240,68,56,.18)] disabled:opacity-60"
+              className="flex items-center gap-1.5 rounded-control border border-accent/50 bg-accent/10 px-4 py-2 text-[12.5px] font-semibold text-[#cfe0ff] hover:bg-accent/20 disabled:opacity-60"
             >
-              {reHunting ? <Spinner size={13} color="#fca5a5" /> : <RotateCw size={13} />}
+              {reHunting ? <Spinner size={13} color="#cfe0ff" /> : <RotateCw size={13} />}
               {reHunting ? 'Re-running' : 'Re-run investigation'}
             </button>
           )}
@@ -1667,10 +1917,10 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     )}
     {inv.kind === 'hunt' && inv.huntId && (
       <div
-        className="rounded-card border px-3.5 py-2.5 text-[12px] text-dim"
-        style={{ borderColor: 'rgba(244,114,182,.35)', background: 'rgba(244,114,182,.06)' }}
+        data-testid="promoted-from-hunt"
+        className="rounded-card border border-border-strong bg-surface-2 px-3.5 py-2.5 text-[12px] text-dim"
       >
-        <span style={{ color: '#f472b6' }}>Promoted from hunt</span>
+        <span className="text-text-2">Promoted from hunt</span>
         {': '}
         <SourceHuntLink huntId={inv.huntId} objective={inv.huntObjective} />
       </div>
@@ -1688,14 +1938,16 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
         {'.'}
       </div>
     )}
-    {inv.validatorNote && (
+    {/* The gate line under the headline states the change. This block
+        would state it a second time. */}
+    {inv.validatorNote && !gateLine && (
       <div
         className="rounded-card border px-3.5 py-2.5 text-[12px] text-dim"
         style={{ borderColor: 'rgba(107,135,168,.3)', background: 'rgba(107,135,168,.05)' }}
       >
-        <span className="font-semibold" style={{ color: '#8fa3bf' }}>Post-validator override</span>
+        <span className="font-semibold" style={{ color: '#8fa3bf' }}>Verdict check</span>
         {': '}
-        {inv.validatorNote}
+        {plainText(inv.validatorNote)}
       </div>
     )}
     </>
@@ -1763,12 +2015,17 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   // Advisory actions (a completed run's recommendations) execute on demand.
   // The card states the write and asks for a confirm first. The confirm IS
   // the human consent. These write to the live Security Onion grid.
-  const runAdvisory = (a: RecommendedAction, index: number, scope: 'group' | 'alert') => {
+  const runAdvisory = (
+    a: RecommendedAction,
+    index: number,
+    scope: 'group' | 'alert',
+    retry = false,
+  ) => {
     const blocked = demoBlocked(demo);
     if (blocked) { setActionMsg((m) => ({ ...m, [a.id]: blocked })); return; } // demo: no doomed grid write
     setActions((s) => ({ ...s, [a.id]: 'executing' }));
     setActionMsg((m) => ({ ...m, [a.id]: '' }));
-    executeAction(inv.id, index, a.tag === 'ack' ? scope : undefined)
+    executeAction(inv.id, index, a.tag === 'ack' ? scope : undefined, retry)
       .then((res) => {
         if (res.status === 'executed') {
           setActions((s) => ({ ...s, [a.id]: 'approved' }));
@@ -1839,12 +2096,14 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
             executedBy={me ?? 'you'}
             dismissal={dismissalOf(a)}
             dismissError={dismissMsg[a.id]}
-            onExecute={(scope) => runAdvisory(a, i, scope)}
+            onExecute={(scope, opts) => runAdvisory(a, i, scope, opts?.retry)}
             onDismiss={() => setDismissal(a, i, true)}
             onUndoDismiss={() => setDismissal(a, i, false)}
             lockedReason={supersededLock ?? undefined}
             cases={inv.alertCases}
             casesComplete={inv.alertCasesComplete ?? false}
+            findingCase={inv.promotedKind === 'finding'}
+            campaign={inv.campaign}
             confirmRequest={confirmRequest?.id === a.id ? confirmRequest.n : undefined}
           />
         ))}
@@ -2192,7 +2451,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
               className="flex items-center gap-1.5 rounded-control border border-warn bg-[rgba(245,166,35,.12)] px-4 py-2 text-[13px] font-semibold text-warn hover:bg-[rgba(245,166,35,.2)]"
             >
               {newRunAsk.action === 'rerun' ? <RotateCw size={13} /> : <Crosshair size={13} />}
-              {newRunStakes.analyst ? 'Replace the analyst verdict' : 'Start a live run'}
+              {newRunStakes.analyst ? 'Replace the analyst verdict' : 'Start a live investigation'}
             </button>
           </div>
         </div>
@@ -2362,6 +2621,8 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
         {reRunErrorEl}
         {supersededEl}
         {standingAnalystEl}
+        {authorizedEl}
+        {clearedEl}
         {promotedFindingEl}
         {failed ? (
           <>
@@ -2397,6 +2658,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
           </>
         )}
         {overrideModalEl}
+        {authorizeDialogEl}
         {newRunConfirmEl}
       </div>
     );
@@ -2410,6 +2672,8 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
       {reRunErrorEl}
       {supersededEl}
       {standingAnalystEl}
+      {authorizedEl}
+      {clearedEl}
       {promotedFindingEl}
       {failed ? (
         <>
@@ -2436,6 +2700,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
         </>
       )}
       {overrideModalEl}
+      {authorizeDialogEl}
       {newRunConfirmEl}
     </div>
   );
@@ -2733,13 +2998,16 @@ function HostContextPanel({
             {sec.label ? <div className="text-[11px] font-semibold text-faint">{sec.label}</div> : null}
             {sec.signals.map((s, i) => (
               <div key={i}>
+                {/* One neutral color (K4). The bar shows the volume of the
+                    rule on the host, and the most frequent rule was red,
+                    so a benign rule was the reddest line of the page. */}
                 <div className="flex items-center gap-2 text-[12px]">
                   <span className="font-mono text-faint">{s.time}</span>
                   <span className="min-w-0 flex-1 break-words text-text-2" title={s.label}>{s.label}</span>
-                  <span className="flex-none font-mono text-[10.5px]" style={{ color: SEV_COLOR[s.tone] }}>{s.sev}</span>
+                  <span className="flex-none font-mono text-[10.5px] text-dim">{s.sev}</span>
                 </div>
                 <div className="mt-1 h-1 overflow-hidden rounded-full bg-surface-3">
-                  <div className="h-full origin-left animate-barGrow rounded-full" style={{ width: `${s.w}%`, background: SEV_COLOR[s.tone] }} />
+                  <div data-testid="host-context-bar" className="h-full origin-left animate-barGrow rounded-full bg-sev-low" style={{ width: `${s.w}%` }} />
                 </div>
               </div>
             ))}
@@ -2767,17 +3035,32 @@ function HeuristicBadge() {
   );
 }
 
+/** A stored verdict key as the console words it, in lower case. */
+function verdictWord(v: string | null | undefined): string {
+  return v ? verdictLabel(v).toLowerCase() : 'no verdict';
+}
+
+/** A finding by the number the hunt page prints. A person counts from one,
+ *  and the stored ordinal counts from zero. */
+export function findingName(ordinal: number, judgesFinding: boolean): string {
+  return `${judgesFinding ? 'Finding' : 'Promoted finding'} ${ordinal + 1}`;
+}
+
 function OracleBadge({ oracle }: { oracle: OracleAdjudication }) {
   // A withheld disagreement changed nothing: the local verdict stands.
   const overrode = oracle.changed && !oracle.withheld;
   const hasVerdict = !!oracle.oracleVerdict;
+  // Verdict words, never the stored keys, and a badge that says what the
+  // Oracle answered (K3). "Oracle consulted" sat beside "Oracle did not
+  // return a verdict".
+  const said = verdictWord(oracle.oracleVerdict);
   const label = oracle.withheld
-    ? `Oracle opinion: ${oracle.oracleVerdict}. The local verdict stands`
+    ? `Oracle opinion: ${said}. The soc-ai verdict stands`
     : overrode
-      ? `Oracle overrode: ${oracle.localVerdict} → ${oracle.oracleVerdict}`
+      ? `Oracle changed the verdict: ${verdictWord(oracle.localVerdict)} → ${said}`
       : hasVerdict
-        ? `Oracle upheld ${oracle.oracleVerdict}`
-        : 'Oracle consulted';
+        ? `Oracle upheld ${said}`
+        : 'Oracle gave no answer';
   const borderColor = overrode ? 'rgba(139,92,246,.55)' : 'rgba(139,92,246,.3)';
   const bg = overrode ? 'rgba(139,92,246,.18)' : 'rgba(139,92,246,.07)';
   const textColor = overrode ? '#c4b5fd' : '#a78bfa';
@@ -2828,9 +3111,9 @@ function OracleCard({ oracle }: { oracle: OracleAdjudication }) {
         <div className="mb-2 flex flex-wrap items-center gap-2 text-[12.5px]">
           {oracle.localVerdict && (
             <span className="flex items-center gap-1.5">
-              <span className="text-faint">Local:</span>
-              <span className="rounded-badge bg-surface-3 px-2 py-[2px] font-mono text-[11.5px] text-text-2">
-                {oracle.localVerdict}
+              <span className="text-faint">soc-ai verdict:</span>
+              <span className="rounded-badge bg-surface-3 px-2 py-[2px] text-[11.5px] text-text-2">
+                {verdictLabel(oracle.localVerdict)}
               </span>
               {oracle.localConfidence != null && (
                 <span className="font-mono text-[11px] text-faint">
@@ -2844,15 +3127,15 @@ function OracleCard({ oracle }: { oracle: OracleAdjudication }) {
           )}
           {oracle.oracleVerdict && (
             <span className="flex items-center gap-1.5">
-              <span className="text-faint">Oracle:</span>
+              <span className="text-faint">Oracle verdict:</span>
               <span
-                className="rounded-badge px-2 py-[2px] font-mono text-[11.5px] font-semibold"
+                className="rounded-badge px-2 py-[2px] text-[11.5px] font-semibold"
                 style={{
                   background: overrode ? 'rgba(139,92,246,.18)' : 'rgba(139,92,246,.08)',
                   color: overrode ? '#c4b5fd' : '#a78bfa',
                 }}
               >
-                {oracle.oracleVerdict}
+                {verdictLabel(oracle.oracleVerdict)}
               </span>
               {oracle.oracleConfidence != null && (
                 <span className="font-mono text-[11px] text-faint">
@@ -2872,7 +3155,10 @@ function OracleCard({ oracle }: { oracle: OracleAdjudication }) {
             </span>
           )}
           {!oracle.oracleVerdict && (
-            <span className="text-[12px] text-faint italic">Oracle did not return a verdict</span>
+            <span data-testid="oracle-no-answer" className="text-[12px] text-dim">
+              The Oracle gave no answer. {oracle.noAnswer ?? 'soc-ai recorded no reason.'} The soc-ai
+              verdict stands.
+            </span>
           )}
         </div>
       )}
@@ -2880,7 +3166,7 @@ function OracleCard({ oracle }: { oracle: OracleAdjudication }) {
       {/* a disagreement with no evidence that resolves: an opinion, never an override */}
       {oracle.withheld && (
         <div data-testid="oracle-opinion-note" className="mb-1 text-[12px] text-dim">
-          The Oracle cited no evidence that resolves. Its answer is an opinion. The local
+          The Oracle cited no evidence that resolves. Its answer is an opinion. The soc-ai
           verdict stands, and soc-ai does not acknowledge the alert on it.
         </div>
       )}
@@ -2896,20 +3182,54 @@ function OracleCard({ oracle }: { oracle: OracleAdjudication }) {
 }
 
 function InvMetaPanel({ meta, id, toolCalls }: { meta: InvMeta; id: string; toolCalls: number }) {
-  const rows: [string, string][] = [
+  // The model that served the run, and the model that the run asked for. A
+  // gateway can serve a run from a fallback route, and the page named the
+  // configured model only (review 2026-11-12). Only the gateway says what a
+  // fallback is, so a run with no attribution reads "not recorded".
+  const served = meta.servedModel ?? null;
+  const asked = meta.requestedModel ?? null;
+  const fallback = !!served && !!meta.servedFallback;
+  const rows: [string, ReactNode][] = [
     ['id', id],
-    ['model', meta.model],
+    [
+      'model',
+      // A call that hits the output token limit runs one more time with low
+      // reasoning. The verdict of such a run had no mark (review 2026-11-13).
+      <span key="model" data-testid="model-line">
+        {meta.model}
+        {meta.lowReasoning && (
+          <span data-testid="low-reasoning-mark" className="font-sans" style={{ color: '#f5a623' }}>
+            . A model call ran again with low reasoning
+          </span>
+        )}
+      </span>,
+    ],
+    [
+      'served by',
+      <span key="served" data-testid="served-model-line">
+        {served ?? 'not recorded'}
+        {fallback && (
+          <span data-testid="served-fallback-mark" className="font-sans" style={{ color: '#f5a623' }}>
+            . A fallback route served this investigation
+          </span>
+        )}
+        {served && asked && <span className="font-sans">{`. The investigation asked for ${asked}.`}</span>}
+        {served && !asked && fallback && <span className="font-sans">.</span>}
+      </span>,
+    ],
     ['oracle', meta.oracle ?? '—'],
     ['tool calls', `${toolCalls}`],
     ['pivots', `${meta.pivots}`],
     ['run by', meta.ranBy],
+    // The time of the event first, then the time of the investigation.
+    ['event time', absTime(meta.eventAt || meta.ranAt, { zone: true })],
     ['ran at', absTime(meta.ranAt, { zone: true })],
   ];
   return (
     <CollapsiblePanel
       icon={<Cpu size={15} />}
       title="Investigation"
-      summary={`${meta.model} · ${plural(toolCalls, 'tool call')}`}
+      summary={`${meta.model}${meta.lowReasoning ? ' · low reasoning' : ''}${fallback ? ' · fallback route' : ''} · ${plural(toolCalls, 'tool call')}`}
     >
       <div className="flex flex-col">
         {rows.map(([k, val]) => (
@@ -3044,7 +3364,7 @@ function Summary({
         if (seg.t === 'text')
           return (
             <span key={i}>
-              <CitedText text={seg.v} ids={ids} entities={entities} />
+              <CitedText text={plainText(seg.v)} ids={ids} entities={entities} />
             </span>
           );
         if (seg.t === 'mono')

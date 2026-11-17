@@ -8,12 +8,12 @@ most recent investigation per rule / per alert.
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, NamedTuple
 
-from sqlalchemy import and_, case, func, literal, or_, select
+from sqlalchemy import and_, case, func, literal, not_, or_, select
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,13 +21,15 @@ from sqlalchemy.orm import aliased, load_only
 from sqlalchemy.orm.attributes import set_committed_value
 from ulid import ULID
 
+from soc_ai.campaigns import refresh as campaign_refresh
 from soc_ai.run_meter import RunCounters, apply_counters
 from soc_ai.secret_scrub import MODEL_TEXT_EVENT_KINDS, scrub_optional, scrub_value
 from soc_ai.so_client.fields import DETECTION_KINDS, detection_kind_of_alert_payload
-from soc_ai.store import chat_memory
+from soc_ai.store import authorized_activity, chat_memory
+from soc_ai.store import event_at as event_at_rule
 from soc_ai.store.auth import utcnow
 from soc_ai.store.models import ChatMessage, Investigation, InvestigationEvent
-from soc_ai.triage_models import is_pipeline_fallback
+from soc_ai.triage_models import IMPACT_ORDER, is_pipeline_fallback
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -167,6 +169,24 @@ def not_backtest(model: Any = Investigation) -> Any:
     return func.coalesce(model.started_by, "") != BACKTEST_ACTOR
 
 
+# The report key of a clear from Needs you (``soc-ai needs-you clear``). The
+# operator cleared an old item that waited with no decision. The record holds
+# the id of the clear, the time, the user, the reason, the verdict and the
+# actions that the clear dismissed. It is no resolution: the verdict, the
+# confidence and every count that reads an analyst verdict stay as they were.
+NEEDS_YOU_CLEARED_KEY = "needs_you_cleared"
+
+
+def needs_you_cleared_sql(model: Any = Investigation) -> Any:
+    """The SQL for a run that a clear took out of Needs you.
+
+    A verdict that needs more info waits until a person decides. The clear
+    record stops that wait and changes no verdict. A NULL report holds no
+    record.
+    """
+    return model.report[NEEDS_YOU_CLEARED_KEY]["at"].as_string().is_not(None)
+
+
 def entity_match_sql(keys: Sequence[str]) -> Any:
     """The SQL for a real run that names one of *keys*.
 
@@ -196,7 +216,7 @@ def entity_match_sql(keys: Sequence[str]) -> Any:
 _LIVE_STATUSES = ("running", "complete")
 
 
-def superseded_sql() -> Any:
+def superseded_sql(*, by_complete: bool = False) -> Any:
     """True for a run that is NOT its alert's primary run, as a SQL expression.
 
     The SQL twin of the route's ``_primary_run_ids`` rule: per alert, the
@@ -212,6 +232,12 @@ def superseded_sql() -> Any:
 
     The bell's failed-triage half filters on it (dogfood 2026-10-01 D1): two
     red "Triage failed" rows stood for alerts that a later run had settled.
+
+    ``by_complete`` is the rule of the campaign service only. A run is then
+    superseded only by a newer run of its group that is complete and is no
+    pipeline error. A Re-run in progress, or one that ends in an error,
+    keeps the older run, so an investigation stays in its campaign while its
+    Re-run runs. Every other caller keeps the default rule.
     """
     other = aliased(Investigation)
     alert_clause = and_(
@@ -226,7 +252,7 @@ def superseded_sql() -> Any:
             other.id != Investigation.id,
             not_hunt_subject(other),
             not_backtest(other),
-            _replaces(other),
+            _replaces(other, by_complete=by_complete),
         )
         .exists(),
     )
@@ -239,19 +265,21 @@ def superseded_sql() -> Any:
             sibling.finding_ordinal == Investigation.finding_ordinal,
             sibling.id != Investigation.id,
             finding_group_sql(sibling),
-            _replaces(sibling),
+            _replaces(sibling, by_complete=by_complete),
         )
         .exists(),
     )
     return or_(alert_clause, finding_clause)
 
 
-def _replaces(other: Any) -> Any:
+def _replaces(other: Any, *, by_complete: bool = False) -> Any:
     """The SQL for a run ``other`` of the same group that replaces this run."""
     other_newer = or_(
         other.created_at > Investigation.created_at,
         and_(other.created_at == Investigation.created_at, other.id > Investigation.id),
     )
+    if by_complete:
+        return and_(other.status == "complete", other.is_fallback.isnot(True), other_newer)
     this_live = Investigation.status.in_(_LIVE_STATUSES)
     other_live = other.status.in_(_LIVE_STATUSES)
     return or_(
@@ -286,6 +314,10 @@ async def _observe_verdict(db: AsyncSession, inv: Investigation) -> None:
         # run. Its rule_name is the promotion title, so the range wrote "Lead
         # 12 on <ip>: true positive at 0.70" as an alert on every internal end
         # of the anchor document, and one landed on another host's lead.
+        return
+    if await authorized_activity.holds_run(db, inv):
+        # The run is inside an authorized scope. It forms no lead and starts
+        # no lead hunt. Its link to the authorization is on the row.
         return
     from soc_ai.hunting.sources import observe_alert_verdict  # noqa: PLC0415 - cycle
 
@@ -423,6 +455,23 @@ async def append_events(db: AsyncSession, inv_id: str, events: list[dict[str, An
 _CONTEXT_EVENT_KINDS = ("alert_context", "enriched_alert_context")
 
 
+async def settle_event_at(db: AsyncSession, invs: Sequence[Investigation]) -> None:
+    """Set ``event_at`` of each run by the one rule (:func:`event_at.decide`).
+
+    The settled event time of the report, else the time of the stored alert,
+    else ``created_at``. One read of the alert times for the runs whose
+    report holds none. The caller commits.
+    """
+    need = [inv.id for inv in invs if event_at_rule.stored_event_time(inv.report) is None]
+    alert_at = await alert_event_times(db, need) if need else {}
+    for inv in invs:
+        inv.event_at = event_at_rule.decide(
+            report=inv.report,
+            alert_at=alert_at.get(inv.id),
+            created_at=inv.created_at or utcnow(),
+        )
+
+
 async def heal_detection_kinds(db: AsyncSession, invs: Sequence[Investigation]) -> None:
     """Correct a stored detector type that disagrees with the alert document.
 
@@ -531,10 +580,21 @@ async def finalize(
         # (migration 0028). Recomputed from the report just written, so it always
         # agrees with is_pipeline_fallback(report).
         inv.is_fallback = is_pipeline_fallback(report)
+        # The authorized activity this run matched, as the report states it.
+        inv.authorization_id = authorized_activity.authorization_id_of(report)
     inv.finished_at = utcnow()
+    # The run ends: its event time settles, from the report or the alert.
+    # Never at the cost of the verdict: on a failed read the row keeps the
+    # time that it has.
+    try:
+        await settle_event_at(db, [inv])
+    except Exception:
+        _LOGGER.warning("event time: not settled for this run", exc_info=True)
     await db.commit()
     if verdict is not None and inv.status == "complete":
         await _observe_verdict(db, inv)
+        # A verdict can change a campaign. The refresh loop rebuilds them.
+        campaign_refresh.request_refresh()
 
 
 async def resolve(
@@ -601,6 +661,7 @@ async def resolve(
     await db.commit()
     await db.refresh(inv)
     await _observe_verdict(db, inv)
+    campaign_refresh.request_refresh()
     return inv
 
 
@@ -687,6 +748,8 @@ async def reap_stale_running(
                 else "The investigation did not finish. A restart or a timeout stopped it."
             )
     if rows:
+        # A reaped run ends too: its event time settles from its alert.
+        await settle_event_at(db, rows)
         await db.commit()
     return len(rows)
 
@@ -1174,6 +1237,94 @@ async def analyst_verdicts_for_alerts(
     return out
 
 
+_TRUE_POSITIVE = "true_positive"
+
+
+def _change_from_true_positive(change: Any) -> bool:
+    """Whether a stored ``verdict_change`` starts any of its steps at true positive."""
+    if not isinstance(change, dict):
+        return False
+    entries: list[Any] = [change]
+    steps = change.get("steps")
+    if isinstance(steps, list):
+        entries.extend(steps)
+    return any(
+        isinstance(e, dict) and _TRUE_POSITIVE in (e.get("from_verdict"), e.get("fromVerdict"))
+        for e in entries
+    )
+
+
+async def earlier_true_positive_runs(
+    db: AsyncSession, alert_ids: Sequence[str], *, exclude_ids: Sequence[str] = ()
+) -> dict[str, str]:
+    """Per alert, the id of the newest run of it that leaned true positive.
+
+    A run leans true positive when its final verdict is true positive, when
+    its report keeps a ``local_verdict`` of true positive, when a step of its
+    ``verdict_change`` starts at true positive, or when an Oracle adjudication
+    of it answered true positive. The production run of 2026-11-13 is the
+    shape: the model said true positive, an evidence gate lowered it to needs
+    more info, and a later run of the alert reached false positive and was
+    acknowledged in Security Onion with no person.
+
+    Only a run with a verdict counts. A run that failed with no verdict leans
+    neither way. The run that asks is still running and holds no verdict until
+    its recorder finalizes it, so it never answers for itself. A hunt-subject
+    run, a backtest replay and a synthetic-evaluation run are left out: none
+    of them is a verdict about the live alert. ``exclude_ids`` leaves out more
+    runs by id.
+
+    ONE statement for the whole batch: the inheritance fan-out asks for
+    hundreds of alerts at once.
+    """
+    keys = sorted({a for a in alert_ids if a})
+    if not keys:
+        return {}
+    oracle_true_positive = (
+        select(InvestigationEvent.id)
+        .where(
+            InvestigationEvent.investigation_id == Investigation.id,
+            InvestigationEvent.kind == "oracle_adjudication",
+            InvestigationEvent.payload["oracle_verdict"].as_string() == _TRUE_POSITIVE,
+        )
+        .exists()
+        .label("oracle_true_positive")
+    )
+    conds: list[Any] = [
+        Investigation.alert_es_id.in_(keys),
+        Investigation.verdict.is_not(None),
+        not_hunt_subject(),
+        not_backtest(),
+        Investigation.is_synth_eval.isnot(True),
+    ]
+    excluded = sorted({i for i in exclude_ids if i})
+    if excluded:
+        conds.append(Investigation.id.not_in(excluded))
+    rows = await db.execute(
+        select(
+            Investigation.id,
+            Investigation.alert_es_id,
+            Investigation.verdict,
+            Investigation.report["local_verdict"].as_string(),
+            Investigation.report["verdict_change"],
+            oracle_true_positive,
+        )
+        .where(*conds)
+        .order_by(Investigation.created_at.desc(), Investigation.id.desc())
+    )
+    out: dict[str, str] = {}
+    for inv_id, alert_id, verdict, local_verdict, change, oracle in rows.all():
+        if alert_id in out:
+            continue
+        if (
+            _TRUE_POSITIVE in (verdict, local_verdict)
+            or bool(oracle)
+            or _change_from_true_positive(change)
+        ):
+            out[str(alert_id)] = str(inv_id)
+    return out
+
+
 async def latest_replays_for_alerts(
     db: AsyncSession, alert_ids: list[str]
 ) -> dict[str, Investigation]:
@@ -1448,6 +1599,143 @@ async def reusable_for_subject(
     return None
 
 
+# How many runs of hunt findings the restatement rule reads, newest first.
+RESTATE_CANDIDATES_MAX = 200
+
+
+class FindingRunRef(NamedTuple):
+    """One run of a hunt finding, by the finding it was opened for."""
+
+    id: str
+    hunt_id: str
+    ordinal: int
+    status: str
+
+
+def is_settled_true_positive(status: Any, verdict: Any, is_fallback: Any) -> bool:
+    """Whether a run finished with the verdict true positive.
+
+    The one test of the restatement rule. A run that still runs, a failed run,
+    a pipeline fallback and every other verdict fail it.
+    """
+    return status == "complete" and is_fallback is not True and verdict == "true_positive"
+
+
+async def confirmed_finding_runs(
+    db: AsyncSession,
+    *,
+    is_synth_eval: bool = False,
+    exclude_hunt_id: str | None = None,
+    now: datetime | None = None,
+    window_days: int = SUBJECT_REUSE_DAYS,
+    limit: int = RESTATE_CANDIDATES_MAX,
+) -> list[FindingRunRef]:
+    """The hunt findings whose latest run is a true positive, newest first.
+
+    The promotion of a finding reads them to find the finding it restates
+    (:func:`soc_ai.hunting.finding_match.restates`). The runs of one finding
+    of one hunt form a group, and a Re-run adds a run to it. Only the latest
+    run of a group answers, and only when it finished with the verdict true
+    positive, read live from the row, so an analyst override counts. A group
+    whose latest run is a false positive, needs more info, inconclusive,
+    running or failed gives no entry. A link to such a run would bury the
+    claim of the later finding for the whole look-back.
+
+    The look-back is ``window_days`` on the start of the latest run. A
+    backtest replay is no run of a finding. A synthetic-evaluation run matches
+    only a synthetic-evaluation caller. ``exclude_hunt_id`` keeps the findings
+    of that hunt out: two findings of one hunt make two claims.
+    """
+    clauses: list[Any] = [
+        Investigation.hunt_id.is_not(None),
+        Investigation.finding_ordinal.is_not(None),
+        Investigation.created_at >= (now or utcnow()) - timedelta(days=window_days),
+        not_backtest(),
+        Investigation.is_synth_eval == bool(is_synth_eval),
+    ]
+    if exclude_hunt_id:
+        clauses.append(Investigation.hunt_id != exclude_hunt_id)
+    rows = await db.execute(
+        select(
+            Investigation.id,
+            Investigation.hunt_id,
+            Investigation.finding_ordinal,
+            Investigation.status,
+            Investigation.verdict,
+            Investigation.is_fallback,
+        )
+        .where(*clauses)
+        .order_by(Investigation.created_at.desc(), Investigation.id.desc())
+        .limit(max(1, limit))
+    )
+    seen: set[tuple[str, int]] = set()
+    out: list[FindingRunRef] = []
+    for r in rows.all():
+        group = (str(r.hunt_id), int(r.finding_ordinal))
+        if group in seen:
+            continue
+        # The first row of a group is its latest run. An older run never answers.
+        seen.add(group)
+        if is_settled_true_positive(r.status, r.verdict, r.is_fallback):
+            out.append(FindingRunRef(str(r.id), group[0], group[1], str(r.status)))
+    return out
+
+
+class LiveRun(NamedTuple):
+    """The latest run of one hunt finding, as a link to that finding reads it."""
+
+    id: str
+    status: str
+    verdict: str | None
+    confidence: float | None
+    is_fallback: bool
+
+    @property
+    def answers(self) -> bool:
+        return is_settled_true_positive(self.status, self.verdict, self.is_fallback)
+
+
+async def latest_finding_runs(
+    db: AsyncSession, groups: Iterable[tuple[str, int]]
+) -> dict[tuple[str, int], LiveRun]:
+    """The latest run of each ``(hunt id, finding ordinal)``, read live.
+
+    A finding that restates an earlier finding stores the run that answered
+    when the hunt ran. A Re-run of the earlier finding, or an analyst
+    override, changes the answer after that. Every reader of such a link asks
+    here, so the link follows the earlier finding and never a replaced run.
+    A backtest replay is no run of a finding.
+    """
+    wanted = {(str(h), int(o)) for h, o in groups if h}
+    if not wanted:
+        return {}
+    rows = await db.execute(
+        select(
+            Investigation.id,
+            Investigation.hunt_id,
+            Investigation.finding_ordinal,
+            Investigation.status,
+            Investigation.verdict,
+            Investigation.confidence,
+            Investigation.is_fallback,
+        )
+        .where(
+            Investigation.hunt_id.in_({h for h, _o in wanted}),
+            Investigation.finding_ordinal.is_not(None),
+            not_backtest(),
+        )
+        .order_by(Investigation.created_at.desc(), Investigation.id.desc())
+    )
+    out: dict[tuple[str, int], LiveRun] = {}
+    for r in rows.all():
+        group = (str(r.hunt_id), int(r.finding_ordinal))
+        if group in wanted and group not in out:
+            out[group] = LiveRun(
+                str(r.id), str(r.status or ""), r.verdict, r.confidence, bool(r.is_fallback)
+            )
+    return out
+
+
 async def delete(db: AsyncSession, inv_id: str) -> bool:
     """Delete an investigation and its events + chat messages in one transaction.
 
@@ -1505,8 +1793,81 @@ class NotifRow(NamedTuple):
     is_synth_eval: bool
     error_dismissed_at: datetime | None
     # A pipeline fallback completes with a placeholder verdict. The bell shows
-    # it as a failed triage. LAST: NotifRow(*row) is positional.
+    # it as a failed triage.
     is_fallback: bool | None
+    # The time of the event of the run (migration 0072). A verdict row about
+    # an older event states its date. LAST: NotifRow(*row) is positional.
+    event_at: datetime | None = None
+
+
+_NOTIF_COLUMNS = (
+    Investigation.id,
+    Investigation.rule_name,
+    Investigation.verdict,
+    Investigation.status,
+    Investigation.created_at,
+    Investigation.finished_at,
+    Investigation.is_synth_eval,
+    Investigation.error_dismissed_at,
+    Investigation.is_fallback,
+    Investigation.event_at,
+)
+
+
+def _notification_conds(
+    *,
+    status: str | None,
+    finished_since: datetime | None,
+    no_verdict: bool,
+    exclude_dismissed: bool,
+    exclude_dismissed_fallbacks: bool,
+    primary_only: bool,
+    exclude_authorized: bool,
+    false_positives: bool | None,
+    finished_after: datetime | None,
+) -> list[Any]:
+    """The WHERE terms of :func:`list_recent_notifications` and its count."""
+    # A backtest replay sends no notification. One backtest is up to 50
+    # replays, and each one landed in the bell as a verdict to read.
+    conds: list[Any] = [not_backtest()]
+    if status is not None:
+        conds.append(_display_status_sql() == status)
+        if status != "error":
+            # Redundant, and kept on purpose. 'error' is the only display status
+            # a row can reach from a DIFFERENT stored value, so for every other
+            # one the raw column is an exact restatement of the CASE, and a plain
+            # equality is what the (status, created_at) index can serve.
+            # Without it the bell's two hot queries, polled every 15s by every
+            # open tab, would fall back to scanning the table.
+            conds.append(Investigation.status == status)
+    if no_verdict:
+        conds.append(_blank_verdict_sql())
+    if exclude_dismissed:
+        conds.append(Investigation.error_dismissed_at.is_(None))
+    if exclude_dismissed_fallbacks:
+        conds.append(
+            or_(
+                Investigation.is_fallback.isnot(True),
+                Investigation.error_dismissed_at.is_(None),
+            )
+        )
+    if primary_only:
+        # A failed run that a later run of the same alert replaced is history,
+        # not a standing fault. See :func:`superseded_sql`.
+        conds.append(~superseded_sql())
+    if exclude_authorized:
+        conds.append(~authorized_activity.holds_sql())
+    if false_positives is not None:
+        real_fp = and_(
+            Investigation.verdict == "false_positive",
+            Investigation.is_fallback.isnot(True),
+        )
+        conds.append(real_fp if false_positives else or_(~real_fp, Investigation.verdict.is_(None)))
+    if finished_since is not None:
+        conds.append(Investigation.finished_at >= finished_since)
+    if finished_after is not None:
+        conds.append(Investigation.finished_at > finished_after)
+    return conds
 
 
 async def list_recent_notifications(
@@ -1519,6 +1880,9 @@ async def list_recent_notifications(
     exclude_dismissed: bool = False,
     exclude_dismissed_fallbacks: bool = False,
     primary_only: bool = False,
+    exclude_authorized: bool = False,
+    false_positives: bool | None = None,
+    finished_after: datetime | None = None,
 ) -> list[NotifRow]:
     """Lightweight investigation rows for the notifications bell — scalar columns only.
 
@@ -1548,55 +1912,70 @@ async def list_recent_notifications(
     completed half uses it. All are SQL conditions rather than a Python filter
     over the page, because dropping rows after a LIMIT is how a bounded query
     comes back empty while matching rows sit just past the cut.
+
+    ``exclude_authorized`` drops the runs inside an authorized scope
+    (:func:`authorized_activity.holds_sql`). Such a run raises no notification
+    of its own, and the card of its authorization counts it. A run whose
+    authorization an analyst revoked stays.
+
+    ``false_positives`` True keeps only the real false positive verdicts, a
+    run that is not a pipeline fallback. False leaves them out. None applies no
+    such filter. The bell folds the false positive closures into one row with a
+    count (:func:`count_recent_notifications`), so the completed half leaves
+    them out, and the closures cannot fill its cap ahead of a true positive.
+    ``finished_after`` keeps the runs that finished after a moment: the last
+    Dismiss all of the console.
     """
-    q = select(
-        Investigation.id,
-        Investigation.rule_name,
-        Investigation.verdict,
-        Investigation.status,
-        Investigation.created_at,
-        Investigation.finished_at,
-        Investigation.is_synth_eval,
-        Investigation.error_dismissed_at,
-        Investigation.is_fallback,
-    ).where(
-        # A backtest replay sends no notification. One backtest is up to 50
-        # replays, and each one landed in the bell as a verdict to read.
-        not_backtest()
+    conds = _notification_conds(
+        status=status,
+        finished_since=finished_since,
+        no_verdict=no_verdict,
+        exclude_dismissed=exclude_dismissed,
+        exclude_dismissed_fallbacks=exclude_dismissed_fallbacks,
+        primary_only=primary_only,
+        exclude_authorized=exclude_authorized,
+        false_positives=false_positives,
+        finished_after=finished_after,
     )
-    if status is not None:
-        q = q.where(_display_status_sql() == status)
-        if status != "error":
-            # Redundant, and kept on purpose. 'error' is the only display status
-            # a row can reach from a DIFFERENT stored value, so for every other
-            # one the raw column is an exact restatement of the CASE, and a plain
-            # equality is what the (status, created_at) index can serve.
-            # Without it the bell's two hot queries, polled every 15s by every
-            # open tab, would fall back to scanning the table.
-            q = q.where(Investigation.status == status)
-    if no_verdict:
-        q = q.where(_blank_verdict_sql())
-    if exclude_dismissed:
-        q = q.where(Investigation.error_dismissed_at.is_(None))
-    if exclude_dismissed_fallbacks:
-        q = q.where(
-            or_(
-                Investigation.is_fallback.isnot(True),
-                Investigation.error_dismissed_at.is_(None),
-            )
-        )
-    if primary_only:
-        # A failed run that a later run of the same alert replaced is history,
-        # not a standing fault. See :func:`superseded_sql`.
-        q = q.where(~superseded_sql())
+    q = select(*_NOTIF_COLUMNS).where(*conds)
     if finished_since is not None:
-        q = q.where(Investigation.finished_at >= finished_since).order_by(
-            Investigation.finished_at.desc(), Investigation.id.desc()
-        )
+        q = q.order_by(Investigation.finished_at.desc(), Investigation.id.desc())
     else:
         q = q.order_by(Investigation.created_at.desc(), Investigation.id.desc())
     q = q.limit(limit)
     return [NotifRow(*row) for row in (await db.execute(q)).all()]
+
+
+async def count_recent_notifications(
+    db: AsyncSession,
+    *,
+    status: str | None = None,
+    finished_since: datetime | None = None,
+    no_verdict: bool = False,
+    exclude_dismissed: bool = False,
+    exclude_dismissed_fallbacks: bool = False,
+    primary_only: bool = False,
+    exclude_authorized: bool = False,
+    false_positives: bool | None = None,
+    finished_after: datetime | None = None,
+) -> int:
+    """The count of the rows :func:`list_recent_notifications` matches, uncut.
+
+    The same terms, so a folded bell row states the count of the rows it
+    stands for, and the cap of the list read cannot cut that count.
+    """
+    conds = _notification_conds(
+        status=status,
+        finished_since=finished_since,
+        no_verdict=no_verdict,
+        exclude_dismissed=exclude_dismissed,
+        exclude_dismissed_fallbacks=exclude_dismissed_fallbacks,
+        primary_only=primary_only,
+        exclude_authorized=exclude_authorized,
+        false_positives=false_positives,
+        finished_after=finished_after,
+    )
+    return int(await db.scalar(select(func.count(Investigation.id)).where(*conds)) or 0)
 
 
 # The stored statuses the backend actually writes (anything else renders as
@@ -1618,6 +1997,81 @@ PIPELINE_ERROR_VERDICT = "pipeline_error"
 
 # Cap shared with the route (mirrors list_recent's historical clamp).
 MAX_PAGE_LIMIT = 500
+
+# The orders the list offers. ``newest`` is the default. ``verdict`` puts the
+# worst verdict first, and the true positives in the order of their impact.
+SORT_NEWEST = "newest"
+SORT_VERDICT = "verdict"
+PAGE_SORTS: tuple[str, ...] = (SORT_NEWEST, SORT_VERDICT)
+
+# The time that the window of the list bounds and the order of the list reads.
+# ``event`` (the default) is the time of the event that a run judges
+# (``event_at``): a list of what happened. ``investigated`` is the time when
+# soc-ai started the run (``created_at``): a list of what soc-ai did, for
+# example the pipeline errors of 30 days.
+CLOCK_EVENT = "event"
+CLOCK_INVESTIGATED = "investigated"
+PAGE_CLOCKS: tuple[str, ...] = (CLOCK_EVENT, CLOCK_INVESTIGATED)
+
+
+def impact_sql(model: Any = Investigation) -> Any:
+    """The impact a run stores in its report, as a SQL expression (H2).
+
+    NULL for a run that states none: every verdict that is no true positive,
+    and a true positive that an older release stored. No column holds the
+    impact, because the report already does. The JSON index renders
+    ``json_extract`` on SQLite and ``->>`` on PostgreSQL.
+    """
+    return model.report["impact"].as_string()
+
+
+def _impact_filter_sql(impacts: Sequence[str]) -> Any:
+    """The SQL for a true positive whose impact is one of *impacts*.
+
+    ``unknown`` also matches a true positive that states no impact, so the
+    four values cover every true positive. The merged threat rows read a
+    missing impact the same way.
+    """
+    stated = impact_sql()
+    named = [i for i in impacts if i in IMPACT_ORDER and i != "unknown"]
+    terms: list[Any] = []
+    if named:
+        terms.append(stated.in_(named))
+    if "unknown" in impacts:
+        known = [i for i in IMPACT_ORDER if i != "unknown"]
+        terms.append(or_(stated.is_(None), stated.not_in(known)))
+    if not terms:
+        return literal(False)
+    return and_(
+        Investigation.is_fallback.isnot(True),
+        Investigation.verdict == "true_positive",
+        or_(*terms),
+    )
+
+
+def _verdict_order_sql() -> list[Any]:
+    """ORDER BY for ``sort=verdict``: the worst verdict first, then the impact.
+
+    A true positive, then needs more info, inconclusive and a false positive.
+    A pipeline error and a run with no verdict come last. Inside the true
+    positives the impact decides: succeeded, attempted, unknown, none. A true
+    positive that states no impact sorts as unknown.
+    """
+    verdict_rank = case(
+        (Investigation.is_fallback.is_(True), 4),
+        (Investigation.verdict == "true_positive", 0),
+        (Investigation.verdict == "needs_more_info", 1),
+        (Investigation.verdict == "inconclusive", 2),
+        (Investigation.verdict == "false_positive", 3),
+        else_=4,
+    )
+    stated = impact_sql()
+    unknown = IMPACT_ORDER.index("unknown")
+    impact_rank = case(
+        *[(stated == value, rank) for rank, value in enumerate(IMPACT_ORDER) if rank != unknown],
+        else_=unknown,
+    )
+    return [verdict_rank, impact_rank]
 
 
 def _blank_verdict_sql() -> Any:
@@ -1712,17 +2166,39 @@ async def query_page(
     include_backtest: bool = False,
     ids: Sequence[str] | None = None,
     entity_keys: Sequence[str] | None = None,
+    needs_you_ids: Sequence[str] | None = None,
+    impacts: Sequence[str] | None = None,
+    sort: str = SORT_NEWEST,
+    primary_only: bool = False,
+    clock: str = CLOCK_EVENT,
 ) -> InvestigationPage:
     """The investigations list as a real query: filters, counts and paging in SQL.
+
+    ``primary_only`` leaves out a run that a later run of the same alert or of
+    the same hunt finding superseded (:func:`superseded_sql`). The needs-you
+    count asks for it: a verdict that a later run replaced waits on nobody.
 
     ``ids`` limits the rows and the counts to those run ids. The route builds
     the set from a rule that SQL cannot state alone, for example the runs with
     a pending recommended action. An empty set matches no row. None applies no
     id filter.
 
+    ``needs_you_ids`` keeps the runs that wait on the analyst: a real
+    needs_more_info verdict (the member the verdict filter matches) that no
+    clear took out of Needs you (:func:`needs_you_cleared_sql`), or a run id
+    of the set. The route passes the runs with a waiting action. None applies
+    no such filter. An empty set keeps the needs-more-info runs alone.
+
     ``entity_keys`` keeps the real runs that name one of the keys (see
     :func:`entity_match_sql`). The route expands one entity to every key of
     its machine, so the host page and the filtered list count the same runs.
+
+    ``impacts`` keeps the true positives whose impact is one of the values
+    (H2). ``unknown`` also matches a true positive that states no impact.
+
+    ``sort`` is ``newest`` (the default) or ``verdict``: the worst verdict
+    first, the true positives in the order of their impact, then the newest
+    first (:func:`_verdict_order_sql`).
 
     ``include_backtest`` puts the backtest replays (:func:`is_backtest`) into
     the rows and the counts. Off by default: a replay is a measurement, and
@@ -1735,8 +2211,12 @@ async def query_page(
     ANY filter the operator could set. :func:`list_recent` is left untouched for
     its other callers (the bell's bounded running/completed lists).
 
-    ``since``/``until`` bound ``created_at`` inclusively (naive UTC, matching
-    the column). ``statuses`` filters on the DISPLAY status
+    ``since``/``until`` bound the time of ``clock`` inclusively (naive UTC,
+    matching the column), and the newest-first order reads the same time.
+    ``clock`` is ``event`` by default: ``event_at``, the time of the event
+    that the run judges. An investigation made today of an event of 10 days
+    ago is no row of the last 24 hours. ``investigated`` reads ``created_at``,
+    the time when soc-ai started the run. ``statuses`` filters on the DISPLAY status
     (:func:`_display_status_sql`) so the filter agrees with what the table
     renders. ``verdicts`` matches stored verdict strings, plus the synthetic
     :data:`PIPELINE_ERROR_VERDICT`: a fallback-marked row matches ONLY that
@@ -1760,8 +2240,9 @@ async def query_page(
 
     Four queries: the page, one aggregate over the filter set (total / running
     / true-positive), one count of the backtest replays the other filters
-    match, one over the whole table (total_all / active). The
-    ``(status, created_at)`` index (migration 0028) serves the ORDER BY.
+    match, one over the whole table (total_all / active). The ``event_at``
+    index (migration 0072) serves the ORDER BY of the event clock, and the
+    ``(status, created_at)`` index (migration 0028) the other clock.
     Fallback membership reads the persisted ``is_fallback`` column — stamped at
     finalize/resolve — rather than ``json_extract``'ing every row's report blob
     on each poll (the growth defect this query used to carry). Reordering the
@@ -1775,11 +2256,12 @@ async def query_page(
     is_fallback = Investigation.is_fallback.is_(True)
     not_fallback = Investigation.is_fallback.isnot(True)
 
+    window = Investigation.created_at if clock == CLOCK_INVESTIGATED else Investigation.event_at
     conds: list[Any] = []
     if since is not None:
-        conds.append(Investigation.created_at >= since)
+        conds.append(window >= since)
     if until is not None:
-        conds.append(Investigation.created_at <= until)
+        conds.append(window <= until)
     if statuses:
         conds.append(_display_status_sql().in_(list(statuses)))
     if verdicts:
@@ -1793,8 +2275,28 @@ async def query_page(
     if ids is not None:
         # An empty IN list matches nothing, which is the meaning: no run waits.
         conds.append(Investigation.id.in_(list(ids)))
+    if needs_you_ids is not None:
+        # A needs-more-info verdict that a later run replaced waits on nobody.
+        # Eight of the ten such rows on production had a later run with a
+        # settled verdict, and each one read as a decision (2026-11-13). A
+        # verdict that a clear took out of Needs you waits on nobody too.
+        conds.append(
+            or_(
+                and_(
+                    not_fallback,
+                    Investigation.verdict == "needs_more_info",
+                    ~superseded_sql(),
+                    ~needs_you_cleared_sql(),
+                ),
+                Investigation.id.in_(list(needs_you_ids)),
+            )
+        )
+    if primary_only:
+        conds.append(~superseded_sql())
     if entity_keys is not None:
         conds.append(entity_match_sql(entity_keys))
+    if impacts:
+        conds.append(_impact_filter_sql(impacts))
     needle = (q or "").strip()
     if needle:
         conds.append(
@@ -1816,12 +2318,13 @@ async def query_page(
     limit = max(1, min(limit, MAX_PAGE_LIMIT))
     offset = max(0, offset)
 
+    order: list[Any] = _verdict_order_sql() if sort == SORT_VERDICT else []
     rows = list(
         (
             await db.scalars(
                 select(Investigation)
                 .where(*conds)
-                .order_by(Investigation.created_at.desc(), Investigation.id.desc())
+                .order_by(*order, window.desc(), Investigation.id.desc())
                 .limit(limit)
                 .offset(offset)
             )
@@ -1870,6 +2373,113 @@ async def query_page(
         active=int(running_all) > 0,
         backtest_replays=backtest_replays,
     )
+
+
+# The most true positive runs that one read of the confirmed threats takes.
+THREAT_SCAN_MAX = 1000
+
+
+async def standing_true_positives(
+    db: AsyncSession,
+    *,
+    since: datetime,
+    until: datetime,
+    limit: int = THREAT_SCAN_MAX,
+) -> tuple[list[Investigation], int]:
+    """The true positive verdicts that stand in a window, newest first, and their count.
+
+    H1. The read of the confirmed threats: one run for each alert and each
+    hunt finding, the run that stands. ``since`` and ``until`` bound
+    ``event_at``, the time of the event that the run judges (naive UTC,
+    inclusive), and the order reads the same time. A verdict of today on an
+    event of 10 days ago is no threat of the last 24 hours. Needs you and
+    the campaign changes still state it: they have no window.
+
+    A run stands when it is complete, its verdict is a true positive, and it
+    is the latest run of its alert or of its finding
+    (:func:`superseded_sql`). Four types of run are left out, each for the
+    reason its predicate states: a pipeline error that holds a verdict, a
+    backtest replay (:func:`is_backtest`), a synthetic run, and a run that a
+    follow-up run answered (:func:`follow_up_id`). The needs-you count reads
+    the same set (``routes_meta.pending_action_runs``), minus the synthetic
+    runs.
+
+    The count is exact also when the window holds more runs than ``limit``:
+    it is counted in SQL, less the answered runs of the page. Two queries,
+    and a third only when a run of the page has a follow-up.
+    """
+    conds = [
+        Investigation.status == "complete",
+        Investigation.verdict == "true_positive",
+        Investigation.is_fallback.isnot(True),
+        Investigation.is_synth_eval.isnot(True),
+        not_backtest(),
+        not_(superseded_sql()),
+        Investigation.event_at >= since,
+        Investigation.event_at <= until,
+    ]
+    rows = list(
+        (
+            await db.scalars(
+                select(Investigation)
+                .where(*conds)
+                .order_by(Investigation.event_at.desc(), Investigation.id.desc())
+                .limit(max(1, limit))
+            )
+        ).all()
+    )
+    total = len(rows)
+    if total >= limit:
+        total = int(await db.scalar(select(func.count(Investigation.id)).where(*conds)) or 0)
+    answers = {inv.id: fid for inv in rows if (fid := follow_up_id(inv)) and fid != inv.id}
+    if answers:
+        live = set(
+            (
+                await db.scalars(
+                    select(Investigation.id).where(
+                        Investigation.id.in_(sorted(set(answers.values()))),
+                        Investigation.status.in_(_LIVE_STATUSES),
+                    )
+                )
+            ).all()
+        )
+        answered = {inv_id for inv_id, fid in answers.items() if fid in live}
+        rows = [inv for inv in rows if inv.id not in answered]
+        total -= len(answered)
+    return rows, max(total, 0)
+
+
+async def alert_event_times(db: AsyncSession, run_ids: Sequence[str]) -> dict[str, datetime]:
+    """The time of the alert of each run, as naive UTC, from its context event.
+
+    For a run that stores no event time in its report: a run of an older
+    release. One query. Only the one field is read from each payload
+    (``json_extract`` on SQLite, ``#>>`` on PostgreSQL), never the payload.
+    A run with no context event, or with no time in it, has no entry.
+    """
+    wanted = sorted({str(i) for i in run_ids if i})
+    if not wanted:
+        return {}
+    rows = await db.execute(
+        select(
+            InvestigationEvent.investigation_id,
+            InvestigationEvent.payload[("alert", "timestamp")].as_string(),
+        )
+        .where(
+            InvestigationEvent.investigation_id.in_(wanted),
+            InvestigationEvent.kind.in_(_CONTEXT_EVENT_KINDS),
+        )
+        .order_by(InvestigationEvent.sequence, InvestigationEvent.id)
+    )
+    raws: dict[str, list[Any]] = {}
+    for run_id, raw in rows.all():
+        raws.setdefault(str(run_id), []).append(raw)
+    out: dict[str, datetime] = {}
+    for run_id, values in raws.items():
+        at = event_at_rule.first_time(values)
+        if at is not None:
+            out[run_id] = at
+    return out
 
 
 class RunRef(NamedTuple):

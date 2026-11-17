@@ -176,7 +176,7 @@ def test_a_recorded_file_of_another_format_is_refused(tmp_path: Path) -> None:
     directory.mkdir(parents=True)
     path = directory / "estate-other.json"
     path.write_text(json.dumps({"format": "something-else"}))
-    with pytest.raises(art.ModelRefused, match="not an estate model"):
+    with pytest.raises(art.ModelRefused, match="not a network model"):
         art.read_verified(tmp_path, path.name, {path.name: art.sha256_of(path.read_bytes())})
 
 
@@ -233,7 +233,7 @@ async def test_a_learned_group_serves_only_from_a_fresh_measured_fit(
         )
         stale = await store.learned_group(db, "192.0.2.1", now=now)
         fresh = await store.learned_group(db, "192.0.2.1", now=now - timedelta(hours=60))
-        with pytest.raises(ValueError, match="unknown estate model state"):
+        with pytest.raises(ValueError, match="unknown network model state"):
             await store.record_fit(db, fitted_at=now, state="failed")
     await engine.dispose()
     assert stale is None
@@ -273,7 +273,7 @@ async def test_the_doctor_says_off_learning_measured_and_drifted_with_the_date(
     [off] = await doctor.check_estate_model(settings_kratos)
     assert (off.status, off.detail) == (
         "INFO",
-        "off. The extra package that the estate model needs is installed.",
+        "off. The extra package that the network model needs is installed.",
     )
 
     settings = _with(settings_kratos, estate_model_enabled=True)
@@ -320,7 +320,7 @@ async def test_the_doctor_off_row_keeps_the_last_fit(
     [bare] = await doctor.check_estate_model(settings)
     assert (bare.status, bare.detail) == (
         "INFO",
-        "off. The extra package that the estate model needs is installed.",
+        "off. The extra package that the network model needs is installed.",
     )
     assert not (tmp_path / "data" / "soc-ai.db").exists()
 
@@ -338,7 +338,7 @@ async def test_the_doctor_off_row_keeps_the_last_fit(
     [off] = await doctor.check_estate_model(settings)
     assert off.status == "INFO"
     assert off.detail == (
-        "off. The extra package that the estate model needs is installed. "
+        "off. The extra package that the network model needs is installed. "
         "The last fit ran on 2026-10-05 01:50 UTC, "
         "in state learning."
     )

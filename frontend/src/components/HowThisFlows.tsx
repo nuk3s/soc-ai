@@ -3,11 +3,17 @@ import { Link, useLocation, useSearchParams } from 'react-router-dom';
 import flowUrl from '../assets/hunting-flow.svg';
 import { cn } from '../lib/cn';
 import {
+  DEFINE_ALERT,
   DEFINE_ANALYTIC,
+  DEFINE_CAMPAIGN,
+  DEFINE_CAMPAIGN_DECISION,
   DEFINE_HIT,
   DEFINE_HUNT,
+  DEFINE_INVESTIGATION,
   DEFINE_LEAD,
-  DEFINE_SCHEDULE,
+  DEFINE_NEEDS_YOU,
+  DEFINE_TWO_VERBS,
+  DEFINE_VERDICT,
   OVERVIEW_FLOW,
 } from '../lib/tooltips';
 import { Drawer } from './Drawer';
@@ -16,12 +22,13 @@ import { Drawer } from './Drawer';
 // How this flows: the chart behind every definition line.
 //
 // The Hunts page reads as the pipeline and never drew it: an analytic finds a
-// hit, hits on one entity form a lead, a lead starts a hunt, and the hunt
-// investigates what it finds. The chart draws the alert path beside the sweep
-// path, because both end in an investigation, a verdict and an action in
-// Security Onion (owner, 2026-10-07). The chart states each step and names
-// the screen that holds it. Its words are the words of the controls: "Hunt
-// this lead", "Open an investigation", "hit".
+// hit, hits on one entity form a lead, soc-ai hunts the lead, and the hunt
+// investigates its threat findings. The chart draws the alert path under the
+// sweep path, because both end in an investigation and a verdict (owner,
+// 2026-10-07). A confirmed attack starts or joins a campaign, and the analyst
+// decides once on the campaign in Needs you (owner, 2026-11-16: "Update the
+// flow chart with our new update."). Each box states one thing and names the
+// screen that holds it. The longer sentences live under the chart.
 //
 // The drawer carries the address parameter `?flow=1`, the way the composer
 // carries `?new=1`: a reload keeps it open, closing takes the parameter out,
@@ -39,22 +46,30 @@ export const FLOW_LINK_LABEL = 'How this flows';
 /** The chart for a reader who cannot see it. A chart of boxes and their
  *  arrows says nothing as "hunting-flow.svg". */
 export const FLOW_ALT =
-  'The flow, left to right and then down. Two inputs enter on the left. On the sweep path an ' +
-  'analytic runs on every hourly sweep and finds a hit. Hits on one entity form a lead. The ' +
-  'lead starts its own hunt, or you press Hunt this lead. A hunt returns findings. soc-ai ' +
-  'investigates each threat finding. On the alert path soc-ai triages an alert. Both paths end in an ' +
-  'investigation, which ends in a verdict. In Needs you, you agree with the verdict or ' +
-  'override it. Your action goes to Security Onion. The chart also defines the two verbs.';
+  'The flow from the grid to your decision, in three rows. On the sweep path an analytic ' +
+  'finds a hit, and hits on one entity form a lead. soc-ai hunts the lead, and the hunt ' +
+  'returns findings. soc-ai investigates each threat finding that names an entity. On the ' +
+  'alert path soc-ai investigates one alert of each group. The investigation ends in a ' +
+  'verdict. A confirmed attack starts or joins a campaign. A true positive or needs more info ' +
+  'verdict of an alert writes an observation that can form a lead. Needs you lists the work ' +
+  'that waits on you. You decide once on a campaign, and soc-ai writes the action to ' +
+  'Security Onion.';
 
-/** The sentences under the chart: the flow in one line, then the five
- *  definitions in the order the chart reads. */
-const SENTENCES = [
+/** The sentences under the chart: the flow in one line, then one definition
+ *  for each box in the order the chart reads, then the two verbs. */
+export const FLOW_SENTENCES = [
   OVERVIEW_FLOW,
   DEFINE_ANALYTIC,
   DEFINE_HIT,
   DEFINE_LEAD,
   DEFINE_HUNT,
-  DEFINE_SCHEDULE,
+  DEFINE_ALERT,
+  DEFINE_INVESTIGATION,
+  DEFINE_VERDICT,
+  DEFINE_CAMPAIGN,
+  DEFINE_CAMPAIGN_DECISION,
+  DEFINE_NEEDS_YOU,
+  DEFINE_TWO_VERBS,
 ] as const;
 
 /** The address of the Hunt Console. The chart lives on that page, so a link
@@ -109,14 +124,14 @@ export function HowThisFlowsDrawer({ open, onClose }: { open: boolean; onClose: 
           className="w-full rounded-panel border border-border"
           style={{ maxWidth: '100%' }}
         />
-        {/* The flow line and the five sentences the page carries. A reader
+        {/* The flow line and the definition of each box. A reader
             who cannot see the chart still gets the words, and a reader who can
             gets them twice, which is how a definition is learned. */}
         <ul
           data-testid="flow-definitions"
           className="mt-4 flex flex-col gap-2 text-[12.5px] leading-[1.6] text-text-2"
         >
-          {SENTENCES.map((sentence) => (
+          {FLOW_SENTENCES.map((sentence) => (
             <li key={sentence}>{sentence}</li>
           ))}
         </ul>

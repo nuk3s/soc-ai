@@ -60,18 +60,27 @@ describe('the Dashboard', () => {
     expect(screen.queryByText('Overview')).toBeNull();
   });
 
-  it('states the flow under the Needs you tile and links to the chart', async () => {
+  it('links the total of the Needs you tile to the Needs you page', async () => {
     mount();
     const tile = await screen.findByTestId('kpi-needs-you');
-    const line = within(tile).getByTestId('needs-you-flow');
-    expect(line.textContent).toBe(
-      'soc-ai investigates alerts and runs hunts. You make each decision in Needs you. ' +
-        'soc-ai sends your actions to Security Onion. How this flows',
+    const total = within(tile).getByTestId('needs-you-total');
+    expect(total.closest('a')?.getAttribute('href')).toBe('/needs-you');
+  });
+
+  it('puts the flow in the tooltip of the Needs you label and the chart link in its header', async () => {
+    mount();
+    const tile = await screen.findByTestId('kpi-needs-you');
+    const header = within(tile).getByTestId('needs-you-flow');
+    expect(within(header).getByText('Needs you').getAttribute('title')).toBe(
+      'soc-ai investigates alerts, hunts leads and joins confirmed attacks into campaigns. You ' +
+        'decide in Needs you, and soc-ai writes your actions to Security Onion.',
     );
-    expect(line.textContent).toContain(OVERVIEW_FLOW);
-    expect(within(line).getByRole('link', { name: 'How this flows' }).getAttribute('href')).toBe(
+    expect(within(header).getByRole('link', { name: 'How this flows' }).getAttribute('href')).toBe(
       '/hunts?flow=1',
     );
+    // The sentence no longer fills the tile body (polish review 2026-11-13):
+    // the three tiles beside it stretched to its height.
+    expect(tile.textContent).not.toContain(OVERVIEW_FLOW);
   });
 
   // The tile read "…" and "Reading what needs you…" while the count loaded.

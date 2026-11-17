@@ -2,6 +2,7 @@ import { useEffect } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 
 import { getNeedsYou, onNeedsYouChanged } from '../lib/api';
+import { reviewText } from '../lib/needsYou';
 import { plural } from '../lib/plural';
 import { useAsync } from '../lib/useAsync';
 import { LoadingInline, StaleNotice } from './States';
@@ -39,6 +40,10 @@ export function NeedsYouStrip() {
   };
 
   const data = needs.data;
+  // The server splits the count (decisions, review). An older server sends
+  // only the two parts, and they are the same numbers.
+  const decisions = data ? (data.decisions ?? data.leads_needing_decision) : 0;
+  const review = data ? (data.review ?? data.unread_shadow_hits) : 0;
   // A failed first read states the failure. A poll failing after a good read
   // kept the last number with nothing to date it, so a dead API read as a fresh
   // count. Two consecutive failures is the house threshold: one missed poll is
@@ -58,57 +63,59 @@ export function NeedsYouStrip() {
         <span className="text-[12.5px] text-dim">
           {needs.error ? 'Could not read what needs you.' : <LoadingInline>Reading what needs you</LoadingInline>}
         </span>
-      ) : data.total === 0 ? (
-        <>
-          <span className="text-[13px] font-semibold text-text">Nothing needs you.</span>
-          <span className="text-[11.5px] text-dim">
-            No unread shadow hit. No lead waits on a decision.
-          </span>
-          <span data-testid="needs-you-scope" className="text-[11.5px] text-faint">
-            The count covers all unread shadow hits and all open leads.
-          </span>
-        </>
       ) : (
         <>
-          <span
-            data-testid="needs-you-count"
-            className="rounded-chip border border-accent/40 bg-accent/10 px-1.5 py-px text-[11px] font-semibold tabular-nums text-accent"
-            title="Unread shadow hits, plus leads that wait on a decision."
-          >
-            {data.total}
-          </span>
-          {/* The strip does not read the page window, so each line states
-              its scope in visible words. The hit count holds every unread
+          {decisions === 0 ? (
+            <>
+              <span className="text-[13px] font-semibold text-text">Nothing needs you.</span>
+              <span className="text-[11.5px] text-dim">No lead waits on a decision.</span>
+            </>
+          ) : (
+            <>
+              <span
+                data-testid="needs-you-count"
+                className="rounded-chip border border-accent/40 bg-accent/10 px-1.5 py-px text-[11px] font-semibold tabular-nums text-accent"
+                title="Leads that wait on a decision."
+              >
+                {decisions}
+              </span>
+              <span data-testid="needs-you-leads" className="text-[12.5px]">
+                <Link
+                  to={to('leads', 'needs_decision', LEADS_ANCHOR)}
+                  className="text-accent hover:underline"
+                >
+                  {plural(data.leads_needing_decision, 'lead')}{' '}
+                  {data.leads_needing_decision === 1 ? 'waits' : 'wait'} on a decision
+                </Link>
+                <span className="text-faint"> · all open</span>
+              </span>
+            </>
+          )}
+          {/* The unread shadow hits are review work. They take a neutral
+              color and their own link, apart from the decision count. The
+              strip read "NEEDS YOU 241" for 233 hits and 8 leads (production
+              review 2026-11-12, ui-hunt 1). The hit count holds every unread
               hit, and the Unread filter of the hits block lists every one at
               any age (R3-D9), so the link reaches each hit it counts. */}
-          {data.unread_shadow_hits > 0 && (
-            <span data-testid="needs-you-hits" className="text-[12.5px]">
-              <span className="text-text-2">
-                {plural(data.unread_shadow_hits, 'shadow hit')}{' '}
-                {data.unread_shadow_hits === 1 ? 'is' : 'are'} unread
+          {review > 0 && (
+            <>
+              <span className="text-faint">·</span>
+              <span data-testid="needs-you-hits" className="text-[12.5px]">
+                <span className="text-text-2">{reviewText(review)}</span>
+                <span className="text-faint"> · all unread · </span>
+                <Link to={to('hits', 'unread', HITS_ANCHOR)} className="text-text-2 hover:underline">
+                  Show the unread hits
+                </Link>
               </span>
-              <span className="text-faint"> · all unread · </span>
-              <Link to={to('hits', 'unread', HITS_ANCHOR)} className="text-accent hover:underline">
-                Show the unread hits
-              </Link>
+            </>
+          )}
+          {decisions === 0 && review === 0 ? (
+            <span data-testid="needs-you-scope" className="text-[11.5px] text-faint">
+              The count covers all open leads and all unread shadow hits.
             </span>
+          ) : (
+            <span className="text-[11.5px] text-faint">Each link jumps to the block below.</span>
           )}
-          {data.unread_shadow_hits > 0 && data.leads_needing_decision > 0 && (
-            <span className="text-faint">·</span>
-          )}
-          {data.leads_needing_decision > 0 && (
-            <span data-testid="needs-you-leads" className="text-[12.5px]">
-              <Link
-                to={to('leads', 'needs_decision', LEADS_ANCHOR)}
-                className="text-accent hover:underline"
-              >
-                {plural(data.leads_needing_decision, 'lead')}{' '}
-                {data.leads_needing_decision === 1 ? 'waits' : 'wait'} on a decision
-              </Link>
-              <span className="text-faint"> · all open</span>
-            </span>
-          )}
-          <span className="text-[11.5px] text-faint">Each link jumps to the block below.</span>
         </>
       )}
     </div>

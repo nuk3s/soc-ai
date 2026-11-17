@@ -181,7 +181,12 @@ def test_a_complete_hunt_reads_the_verdicts(client: TestClient) -> None:
     hunt_id, (tp1, _tp2, _fp) = _run(seed())
     detail = client.get(f"/api/v1/hunts/{hunt_id}").json()
     assert detail["outcome"] == "threats_confirmed"
-    assert detail["outcome_label"] == "2 of 4 findings are threats"
+    # One count sentence: the parts add up to the threat findings.
+    assert detail["outcome_label"] == (
+        "2 confirmed · 1 false positive · 1 not judged · of 4 threat findings"
+    )
+    assert (detail["findingsConfirmed"], detail["findingsFalsePositive"]) == (2, 1)
+    assert detail["threatFindingCount"] == 4
     f0, _f1, f2, f3 = detail["findings"]
     # No person can execute an action of a promoted finding: the finding has
     # no Security Onion alert. The action waits for nobody, as on the
@@ -194,7 +199,12 @@ def test_a_complete_hunt_reads_the_verdicts(client: TestClient) -> None:
 
     # The bell titles the hunt by the verdicts.
     titles = [n["title"] for n in client.get("/api/v1/notifications").json()]
-    assert any(t.startswith("Hunt finished: 2 of 4 findings are threats") for t in titles)
+    assert any(
+        t.startswith(
+            "Hunt finished: 2 confirmed · 1 false positive · 1 not judged · of 4 threat findings"
+        )
+        for t in titles
+    )
 
 
 def _shared_hunt_findings() -> list[dict[str, Any]]:
@@ -238,7 +248,7 @@ def test_a_stored_observation_link_does_not_count_as_a_threat(client: TestClient
     hunt_id, tp = _run(seed())
     detail = client.get(f"/api/v1/hunts/{hunt_id}").json()
     assert detail["outcome"] == "threats_confirmed"
-    assert detail["outcome_label"] == "2 of 5 findings are threats"
+    assert detail["outcome_label"] == "2 confirmed · 0 not judged · of 2 threat findings"
     assert (detail["findingsInvestigated"], detail["findingsTotal"]) == (2, 2)
     f0, f1, f2, f3, f4 = detail["findings"]
     assert (f0["investigationId"], f1["investigationId"]) == (tp, tp)
@@ -251,8 +261,9 @@ def test_a_stored_observation_link_does_not_count_as_a_threat(client: TestClient
     assert (f3["sharedWith"], f4["sharedWith"]) == ([], [])
 
     row = next(h for h in client.get("/api/v1/hunts").json() if h["id"] == hunt_id)
-    assert row["outcome_label"] == "2 of 5 findings are threats"
+    assert row["outcome_label"] == "2 confirmed · 0 not judged · of 2 threat findings"
     assert (row["findingCount"], row["threatFindingCount"]) == (5, 2)
+    assert (row["findingsConfirmed"], row["findingsFalsePositive"]) == (2, 0)
 
 
 def test_two_threats_that_share_one_run_count_as_two_of_all(client: TestClient) -> None:
@@ -283,7 +294,7 @@ def test_two_threats_that_share_one_run_count_as_two_of_all(client: TestClient) 
 
     hunt_id, _tp = _run(seed())
     detail = client.get(f"/api/v1/hunts/{hunt_id}").json()
-    assert detail["outcome_label"] == "2 of 3 findings are threats"
+    assert detail["outcome_label"] == "2 confirmed · 0 not judged · of 2 threat findings"
     f0, f1, _f2 = detail["findings"]
     assert (f0["sharedWith"], f0["investigationSubject"]) == ([1], 1)
     assert (f1["sharedWith"], f1["investigationSubject"]) == ([0], 1)
@@ -379,7 +390,11 @@ def test_a_lead_held_on_a_finding_with_no_verdict_states_the_reason(client: Test
     assert detail["status"] == "hunting"
     assert detail["hunt_status"] == "complete"
     assert detail["hold_reason"] == "no_verdict"
-    assert detail["hold_sentence"] == "A threat finding of the hunt has no verdict."
+    # The sentence names the count and the confirmed threat (review of
+    # 2026-11-12, C5). Production lead 66 read the same as seven benign leads.
+    assert detail["hold_sentence"] == (
+        "1 of 3 threat findings has no verdict. 2 findings are true positives."
+    )
     held = detail["decisions"][-1]
     assert (held["action"], held["reason"]) == ("held", "no_verdict")
 
@@ -708,16 +723,33 @@ def test_delete_refuses_an_investigating_hunt(client: TestClient) -> None:
 def test_the_outcome_labels_count_the_findings() -> None:
     three = FindingVerdicts(total=3, investigated=2, decided=2, threats=2)
     assert hunt_outcome.outcome_label("investigating", three) == "Investigating 2 of 3 findings"
-    assert hunt_outcome.outcome_label("threats_confirmed", three) == "2 of 3 findings are threats"
+    assert hunt_outcome.outcome_label("threats_confirmed", three) == (
+        "2 confirmed · 1 not judged · of 3 threat findings"
+    )
     one = FindingVerdicts(total=1, investigated=1, decided=1, threats=1)
-    assert hunt_outcome.outcome_label("threats_confirmed", one) == "1 of 1 finding is a threat"
-    assert hunt_outcome.outcome_label("no_threat_confirmed", one) == "No threat confirmed"
+    assert hunt_outcome.outcome_label("threats_confirmed", one) == (
+        "1 confirmed · 0 not judged · of 1 threat finding"
+    )
+    cleared = FindingVerdicts(total=1, investigated=1, decided=1, false_positives=1)
+    assert hunt_outcome.outcome_label("no_threat_confirmed", cleared) == "No threat confirmed"
     assert hunt_outcome.outcome_label("threats_confirmed") == "Threats confirmed"
     assert hunt_outcome.outcome_label("no_answer") == "No answer"
-    # The threats are counted over every finding of the report when the
-    # summary knows that count.
-    five = FindingVerdicts(total=2, investigated=2, decided=2, threats=2, findings=5)
-    assert hunt_outcome.outcome_label("threats_confirmed", five) == "2 of 5 findings are threats"
+    # The sentence counts the threat findings of the report, a subject or not.
+    # Every other finding stays out of it.
+    five = FindingVerdicts(
+        total=2, investigated=2, decided=2, threats=2, findings=5, threat_findings=3
+    )
+    assert hunt_outcome.outcome_label("threats_confirmed", five) == (
+        "2 confirmed · 1 not judged · of 3 threat findings"
+    )
+    # A failed run under "No threat confirmed" is not a clean answer: the
+    # label states the count sentence.
+    failed = FindingVerdicts(
+        total=3, investigated=3, decided=1, false_positives=1, threat_findings=3
+    )
+    assert hunt_outcome.outcome_label("no_threat_confirmed", failed) == (
+        "0 confirmed · 1 false positive · 2 not judged · of 3 threat findings"
+    )
     for key in hunt_outcome.OUTCOMES:
         assert hunt_outcome.OUTCOME_LABEL[key]
 
@@ -745,7 +777,7 @@ def test_the_webhook_names_the_confirmed_threats(settings_kratos: Settings) -> N
     tp = FindingVerdicts(total=3, investigated=3, decided=3, threats=2)
     event = event_for_hunt(hunt_id="H1", report=report, settings=settings, verdicts=tp)
     assert event is not None
-    assert event.title == "Hunt finished: 2 of 3 findings are threats"
+    assert event.title == "Hunt finished: 2 confirmed · 1 not judged · of 3 threat findings"
     clean = FindingVerdicts(total=3, investigated=3, decided=3, threats=0)
     assert event_for_hunt(hunt_id="H1", report=report, settings=settings, verdicts=clean) is None
     # Control: with no verdict the report's threat finding still pages.
@@ -939,7 +971,8 @@ def test_the_lead_pages_label_a_hunt_by_its_finding_verdicts() -> None:
         created_at=datetime.now(UTC),
     )
     verdicts = FindingVerdicts(total=2, investigated=2, decided=2, threats=2)
-    assert _lead_hunt_state(hunt, verdicts) == ("complete", "2 of 2 findings are threats")
-    assert _lead_hunt_out(hunt, 3, verdicts).outcome_label == "2 of 2 findings are threats"
+    words = "2 confirmed · 0 not judged · of 2 threat findings"
+    assert _lead_hunt_state(hunt, verdicts) == ("complete", words)
+    assert _lead_hunt_out(hunt, 3, verdicts).outcome_label == words
     # Control: with no summary the report's own outcome stands.
     assert _lead_hunt_state(hunt, None)[1] == "Threat found"

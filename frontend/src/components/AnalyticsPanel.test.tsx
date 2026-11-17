@@ -235,7 +235,7 @@ describe('AnalyticsPanel when the sweeps do not run', () => {
 describe('AnalyticsPanel', () => {
   it('states the counts and the legend', async () => {
     mount();
-    await screen.findByText(/3 analytics · 1 live · 1 shadow · 1 draft · 0 retired/);
+    await screen.findByText(/3 analytics · 1 live \(1 measuring, 0 blind\) · 1 shadow · 1 draft · 0 retired/);
     // Each status says what the sweep does and what happens to what it finds.
     // "runs, recorded, not raised" named neither actor.
     const legend = screen.getByTestId('analytics-legend');
@@ -314,7 +314,7 @@ describe('AnalyticsPanel', () => {
     const shadow = screen.getByTestId(`analytic-${LOCAL_SHADOW.id}`);
     expect(within(shadow).getByText('shadow')).toBeTruthy();
     expect(within(shadow).getByText(/written here/)).toBeTruthy();
-    expect(within(shadow).getByText(/3 shadow hits · 2 unread/)).toBeTruthy();
+    expect(within(shadow).getByText(/3 shadow hits · 2 unread at any age/)).toBeTruthy();
   });
 
   it('offers the actions the status allows and no others', async () => {
@@ -349,7 +349,7 @@ describe('AnalyticsPanel', () => {
     const model: AnalyticRow = {
       ...base,
       id: 'model-logon-chain',
-      title: 'A logon chain the estate model has not seen',
+      title: 'A logon chain the network model has not seen',
       evaluator: 'model',
       tier: 'shipped',
       status: 'live',
@@ -560,7 +560,7 @@ describe('AnalyticsPanel sweep', () => {
     const model: AnalyticRow = {
       ...base,
       id: 'model-logon-chain',
-      title: 'A logon chain the estate model has not seen',
+      title: 'A logon chain the network model has not seen',
       evaluator: 'model',
       tier: 'shipped',
       status: 'shadow',

@@ -1141,6 +1141,31 @@ async def _tls_expiry_check(app: Any, settings: Any) -> None:
         _tls_remember_notified(settings, fingerprint, band)
 
 
+# The campaign refresh loop (soc_ai.campaigns.refresh) starts with the app.
+# tests/conftest.py turns it off for the suite: a rebuild in the background
+# of an unrelated test would write to its store. A test that needs the loop
+# turns it on.
+CAMPAIGN_REFRESH_LOOP = True
+
+
+async def _authorized_expiry_loop(app: Any) -> None:
+    """Write the audit record of each authorized activity that expired.
+
+    An expiry has no event of its own: the record ends when the clock passes
+    ``expires_at``. This loop wakes once a minute and writes one audit record
+    for each such row (:func:`soc_ai.agent.authorized_activity.record_expiries`).
+    A failed wake is logged, and the next wake tries again.
+    """
+    from soc_ai.agent import authorized_activity  # noqa: PLC0415
+
+    while True:
+        await asyncio.sleep(60)
+        try:
+            await authorized_activity.record_expiries(app.state)
+        except Exception:
+            _LOGGER.exception("authorized activity: the expiry record failed")
+
+
 async def _tls_expiry_loop(app: Any, settings: Any) -> None:
     """Check once at start, then once a day."""
     wake_seconds = 3600
@@ -1362,7 +1387,11 @@ async def _hunt_schedule_loop(app: FastAPI) -> None:
                     # Opens its own session and never raises, so a failed read
                     # cannot reach the except branch below that stamps mark_ran.
                     earlier = await earlier_mod.earlier_for_objective(
-                        app.state.db_sessionmaker, sched.objective, now=now
+                        app.state.db_sessionmaker,
+                        sched.objective,
+                        now=now,
+                        # The window of an objective that states none.
+                        interval_minutes=getattr(sched, "interval_minutes", None),
                     )
                     hunt_id = await manager.start(
                         app.state,
@@ -1596,6 +1625,47 @@ async def _lead_auto_hunt_loop(app: FastAPI) -> None:
             _LOGGER.exception("lead auto-hunt iteration failed; continuing")
 
 
+# The campaign hunt loop (soc_ai.hunting.campaign_hunt) starts with the app.
+# tests/conftest.py turns it off for the suite, like the refresh loop. A test
+# that needs the loop calls it directly.
+CAMPAIGN_HUNT_LOOP = True
+
+
+async def _campaign_hunt_loop(app: FastAPI) -> None:
+    """Start one hunt for a campaign that changed, at most one in 24 hours (D1, D3).
+
+    The pattern of :func:`_lead_auto_hunt_loop`: a fixed 60 s wake, live
+    settings read each wake, and a no-op unless ``lead_auto_hunt``. The cap of
+    the hunts in flight is ``lead_auto_hunt_concurrency``, counted on the
+    hunts of this loop only. The shared limit of the console holds as well.
+
+    Each wake reads the changes of the campaigns that no hunt answered: a
+    higher stage, a new machine, a reopen by new activity and activity beyond
+    an authorization. The rule is
+    :func:`soc_ai.hunting.campaign_hunt.due_changes`, and the limit reads the
+    hunt rows, so it holds after a restart.
+
+    Off in the demo: its model gateway is a mock, and each failed hunt would
+    grow the store of a public site. One worker only, as for the other loops.
+    """
+    from soc_ai.hunting import campaign_hunt  # noqa: PLC0415
+
+    if getattr(app.state.settings, "soc_ai_demo", False) is True:
+        return
+    while True:
+        await asyncio.sleep(60)
+        try:
+            settings = app.state.settings
+            if not getattr(settings, "lead_auto_hunt", False):
+                continue
+            cap = max(1, int(getattr(settings, "lead_auto_hunt_concurrency", 2) or 1))
+            await campaign_hunt.start_due(app.state, cap=cap)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOGGER.exception("campaign hunt iteration failed; continuing")
+
+
 def _persist_bootstrap_credential(settings: Any, created_pw: str) -> None:
     """Write the one-shot bootstrap admin password to a locked-down sidecar
     file instead of the shared log stream, and log only a pointer to it.
@@ -1815,6 +1885,28 @@ def _apply_demo_autotriage(state: Any, batch: Any) -> None:
     status.active = False
 
 
+async def _build_demo_campaigns(db_sessionmaker: Any) -> None:
+    """Build the campaigns of the seeded demo runs once, after the fixture seed.
+
+    The Campaigns page then has its campaign on the first visit. The campaign
+    routes run ensure_fresh, which holds no basis yet and rebuilds once on the
+    first read; that rebuild keeps the campaign ids, and later reads skip it.
+    Fail-soft: a failed build costs the demo its campaigns, never its start.
+    """
+    try:
+        from soc_ai.campaigns.service import rebuild  # noqa: PLC0415
+
+        async with db_sessionmaker() as db:
+            built = await rebuild(db)
+        _LOGGER.info("demo mode: built %d campaign(s)", built.campaigns)
+    except Exception:
+        _LOGGER.warning(
+            "demo mode: soc-ai could not build the campaigns at startup. "
+            "The campaign pages try again on the first read.",
+            exc_info=True,
+        )
+
+
 async def _init_store(db_engine: Any, settings: Any, secret_box: Any = None) -> Any:
     """Migrate the store, bootstrap the admin, apply config overrides, reap orphans.
 
@@ -1903,6 +1995,7 @@ async def _init_store(db_engine: Any, settings: Any, secret_box: Any = None) -> 
                 _LOGGER.info("demo mode: seeded a week of hunt catalog sweeps")
         except Exception:
             _LOGGER.warning("demo catalog trail seed failed; continuing without it", exc_info=True)
+        await _build_demo_campaigns(db_sessionmaker)
 
     return db_sessionmaker
 
@@ -2024,6 +2117,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: PLR0915 — li
     autotriage_task = asyncio.create_task(_auto_triage_scheduler_loop(app, settings))
     hunt_schedule_task = asyncio.create_task(_hunt_schedule_loop(app))
     lead_auto_hunt_task = asyncio.create_task(_lead_auto_hunt_loop(app))
+    campaign_hunt_task = (
+        asyncio.create_task(_campaign_hunt_loop(app)) if CAMPAIGN_HUNT_LOOP else None
+    )
     eval_nightly_task = asyncio.create_task(_eval_nightly_loop(app, settings))
     spec_sweep_task = asyncio.create_task(_hunt_spec_sweep_loop(app))
     prior_sweep_task = asyncio.create_task(_prior_sweep_loop(app))
@@ -2034,11 +2130,32 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: PLR0915 — li
     audit_verify_task = asyncio.create_task(_audit_verify_loop(app, settings))
     tls_expiry_task = asyncio.create_task(_tls_expiry_loop(app, settings))
     health_probe_task = asyncio.create_task(_health_probe_loop(app, settings))
+    authorized_expiry_task = asyncio.create_task(_authorized_expiry_loop(app))
+    # The campaigns are rebuilt after a change of the store, with no page read.
+    # The demo runs it too: a replayed verdict then shows its campaign.
+    from soc_ai.campaigns import refresh as campaign_refresh  # noqa: PLC0415
+
+    campaign_refresh_task = (
+        asyncio.create_task(campaign_refresh.refresh_loop(app)) if CAMPAIGN_REFRESH_LOOP else None
+    )
+    # The comments of soc-ai on the case of a campaign. The demo has no
+    # Security Onion to comment on.
+    from soc_ai.campaigns import case_comments  # noqa: PLC0415
+
+    case_comments.bind_state(None if settings.soc_ai_demo else app.state)
 
     try:
         yield
     finally:
         _LOGGER.info("soc-ai shutting down; releasing clients")
+        case_comments.release_state(app.state)
+        if campaign_refresh_task is not None:
+            campaign_refresh_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await campaign_refresh_task
+        authorized_expiry_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await authorized_expiry_task
         reaper_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await reaper_task
@@ -2057,6 +2174,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: PLR0915 — li
         lead_auto_hunt_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await lead_auto_hunt_task
+        if campaign_hunt_task is not None:
+            campaign_hunt_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await campaign_hunt_task
         eval_nightly_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await eval_nightly_task

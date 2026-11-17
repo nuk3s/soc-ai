@@ -86,6 +86,7 @@ from soc_ai.so_client.fields import (
     flow_dataset_filter,
     get_dotted,
     is_peer_address,
+    probe_record_clause,
 )
 from soc_ai.tools._provenance import (
     ANY,
@@ -194,12 +195,9 @@ _SMB_HOSTNAME: tuple[str, ...] = (
     "smb.host_name",
 )
 _PTR_ANSWER: tuple[str, ...] = fields.DNS_RESOLVED_IP
-_SOFTWARE: tuple[str, ...] = (
-    "zeek.software.unparsed_version",
-    "software.unparsed_version",
-    "zeek.software.name",
-    "software.name",
-)
+# The banner first, then the parsed name. Security Onion 3.x writes the banner
+# in ``software.version.unparsed``, which the field table leads with.
+_SOFTWARE: tuple[str, ...] = (*fields.SOFTWARE_VERSION, *fields.SOFTWARE_NAME)
 
 
 def _to_int_port(value: Any) -> int | None:
@@ -624,12 +622,17 @@ async def host_summary(
             # and would inflate "ports this host serves" with IDS-targeted
             # ports. Every flow sensor, not just Zeek: see FLOW_DATASETS for
             # what scoping this to one plane cost.
+            #
+            # A flow record is also written for a connection ATTEMPT. A SYN
+            # that nothing answered and a SYN that a closed port refused are
+            # left out, so a port scan does not read as ports this host serves.
             "filter": {
                 "bool": {
                     "must": [
                         {"term": {"destination.ip": ip}},
                         flow_dataset_filter(),
-                    ]
+                    ],
+                    "must_not": [probe_record_clause()],
                 }
             },
             "aggs": {"ports": _terms_agg("destination.port")},

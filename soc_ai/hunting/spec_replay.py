@@ -536,7 +536,7 @@ def describe_plan(
     full = catalog if catalog is not None else load_catalog(CATALOG_DIR)
     if not plan.hosts_from_census:
         seeded = (
-            "Census: not seeded. The build reads the estate in one search per dimension. "
+            "Census: not seeded. The build reads the network in one search per dimension. "
             "Each search holds at most 500 hosts."
         )
     elif census is None:
@@ -1404,7 +1404,7 @@ def render_markdown(report: ReplayReport) -> str:
         f"| Analytic host-days | {report.host_days} |",
         f"| Hits per 100 analytic host-days | {_num(report.per_100_host_days)} |",
         f"| Wilson 95 percent upper bound per 100 | {_num(report.wilson_upper_95_per_100)} |",
-        f"| Estate host-days | {report.estate_host_days} |",
+        f"| Host-days of the network | {report.estate_host_days} |",
         f"| Observations in the store | {report.observations} |",
         f"| Sightings | {report.sightings} |",
         f"| Leads formed | {report.leads} |",
@@ -1479,8 +1479,8 @@ def render_markdown(report: ReplayReport) -> str:
         "- A model analytic has seven states. The report folds them into four, as the ledger "
         "does. Held counts as measured. Unmeasurable, stale and drifted count as blind. "
         "Folded states gives the host-hours of each folded state.",
-        "- Estate host-days count each host key that an analytic measured on a day. An address "
-        "and a machine name are two keys.",
+        "- Host-days of the network count each host key that an analytic measured on a day. "
+        "An address and a machine name are two keys.",
         "",
     ]
     return "\n".join(lines)

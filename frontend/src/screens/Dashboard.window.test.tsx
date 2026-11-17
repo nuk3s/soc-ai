@@ -36,6 +36,12 @@ vi.mock('../lib/api', async (importOriginal) => ({
   getPreflight: vi.fn().mockResolvedValue({ status: 'green', failing: 0, warned: 0, checked_at: '2026-08-19T00:00:00+00:00' }),
   getPreflightDetail: vi.fn().mockResolvedValue({ rows: [], checked_at: '2026-08-19T00:00:00+00:00' }),
   getShadowHits: vi.fn().mockResolvedValue({ hits: [], unread: 0 }),
+  getThreats: vi.fn().mockResolvedValue({
+    window: { since: '2026-10-08T00:00:00Z', until: '2026-10-09T00:00:00Z' },
+    rows: [],
+    authorized: [],
+    total: 0,
+  }),
   getNeedsYouCount: vi.fn().mockResolvedValue({
     leads_needing_decision: 0,
     unread_shadow_hits: 0,
@@ -155,12 +161,16 @@ describe('the store-read tiles in a grid outage (D26)', () => {
 });
 
 describe('the clocks (D9)', () => {
-  it('names the clock of the chart and of the tile', async () => {
+  // The chart counts alert groups, and says so in one sentence. The True
+  // positives tile reads the Confirmed threats panel, which states its own
+  // window (review 2026-11-12, ui-core 3).
+  it('names the unit of the chart and the window of the tile', async () => {
     mount();
-    expect((await screen.findByTestId('outcomes-clock')).textContent).toMatch(
-      /alert groups with an alert in this window.*investigations that started in this window/,
+    expect((await screen.findByTestId('outcomes-clock')).textContent).toBe(
+      'The chart counts the alert groups with an alert in this window.',
     );
-    expect((await screen.findByTestId('tp-clock')).textContent).toBe('started in this window');
+    expect((await screen.findByTestId('tp-hosts')).textContent).toBe('on 0 hosts in this window');
+    expect(screen.getByTestId('confirmed-threats-title').textContent).toBe('Confirmed threats · last 24 hours');
   });
 });
 

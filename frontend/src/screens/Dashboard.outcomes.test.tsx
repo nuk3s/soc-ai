@@ -152,7 +152,7 @@ describe('Dashboard outcome breakdown: the window verdict', () => {
     expect(await count('True positive')).toBe('1');
     expect(await count('Untriaged')).toBe('1');
     expect(screen.getByTestId('outcome-inherited').textContent).toBe(
-      '1 of 3 groups: verdict inherited from a run before this window.',
+      '1 of 3 groups: verdict inherited from an investigation before this window.',
     );
   });
 

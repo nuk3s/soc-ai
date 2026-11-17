@@ -1,5 +1,5 @@
 import { ChevronRight, Copy, Key, ShieldAlert, Users } from 'lucide-react';
-import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import type { ReactNode } from 'react';
 import { ApplyBadge, RoleChip, SourceBadge, StatusTag } from '../components/Badges';
@@ -7,7 +7,8 @@ import { NumberField, Select, Toggle } from '../components/Controls';
 import { ManagedList } from '../components/ManagedList';
 import { SectionTitle } from '../components/Panel';
 import { DemoDisabledState, ErrorState, LoadingInline, LoadingState, Spinner } from '../components/States';
-import { DoctorList, type DoctorFilter, statusCounts } from '../components/DoctorList';
+import { DoctorList, type DoctorFilter, type SettingTarget, statusCounts } from '../components/DoctorList';
+import { QualityLastRun } from '../components/QualityLastRun';
 import { HelpText, sectionIdsFromLayout } from '../components/HelpText';
 import { ChangePasswordModal } from '../shell/ChangePasswordModal';
 import { AgentToolsPanel } from './AgentToolsPanel';
@@ -1243,6 +1244,20 @@ export function Config() {
     }
     return out.concat(panelHits ?? []);
   }, [layout, dangerSettings, panelHits]);
+  // Where a doctor hint's setting lives: "set ABUSE_CH_AUTH_KEY" links to its
+  // row in Settings. The doctor names the environment name, and the setting
+  // key is that name in lowercase.
+  const doctorSettingTarget = useCallback(
+    (key: string): SettingTarget | null => {
+      const hit = searchIndex.find(
+        (h) => (h.kind === 'setting' || h.kind === 'row') && (h.settingKey === key || h.settingKey === `apikey:${key}`),
+      );
+      return hit && hit.settingKey
+        ? { sectionId: hit.sectionId, highlightKey: hit.settingKey, label: hit.label }
+        : null;
+    },
+    [searchIndex],
+  );
 
   // The rows of the panels that fetch their own data, for the search. Read on
   // the first search only, so a page view costs no extra request.
@@ -2201,7 +2216,7 @@ export function Config() {
           <span>
             Auto-acknowledge acts only on a false positive that soc-ai investigates.
             {autoAckInert && scheduleOn === false && ' Continuous Auto-Investigate is off. soc-ai investigates nothing automatically.'}
-            {autoAckInert && floorTooHigh && ` The Auto-Investigate severity floor is “${minSev}”. Auto-acknowledge never acts on a high or critical alert.`}
+            {autoAckInert && floorTooHigh && ` The Auto-Investigate severity floor is “${minSev}”. Auto-acknowledge never acts on a critical alert. It acts on a high alert only if the alert is a Suricata alert, the classification is policy violation or inappropriate content, and each signature severity is Informational.`}
             {' '}Run Auto-Investigate to clear a backlog.
             {scheduleOn !== true && ' You can also turn on Continuous Auto-Investigate in this group.'}
             {' '}Set its severity floor to medium or low.
@@ -2258,6 +2273,9 @@ export function Config() {
             {g.title}
           </SectionTitle>
         </button>
+        {/* L3: the Quality section opens with the last evaluation result. It
+            held four settings and no result (review 2026-11-12). */}
+        {id === 'quality' && !collapsed[g.title] && <QualityLastRun />}
         {!collapsed[g.title] && (
         <div className="overflow-hidden rounded-card border border-border bg-surface-1">
           {day1Items.map(row)}
@@ -2825,7 +2843,11 @@ export function Config() {
           </div>
           {/* Every doctor row. The Setup health card shows FAIL and WARN
               only, and the INFO and PASS rows had no other surface. */}
-          <DoctorList filter={doctorFilter} onRows={(rows) => setDoctorCounts(statusCounts(rows))} />
+          <DoctorList
+            filter={doctorFilter}
+            onRows={(rows) => setDoctorCounts(statusCounts(rows))}
+            settingTarget={doctorSettingTarget}
+          />
         </div>
       </CollapsibleConfigSection>
   );

@@ -64,8 +64,8 @@ export const WELCOME_TOUR: Tour = {
       anchor: 'bell',
       title: 'Notifications',
       body:
-        'The badge counts the items that need you. ' +
-        'These are alert groups with no verdict, verdicts that need more information, waiting actions, open leads and unread shadow hits. ' +
+        'The badge counts the decisions that wait on you, each decision once. ' +
+        'These are campaigns, investigations, open leads and alert groups with no verdict. ' +
         'The panel also lists events, such as a finished hunt.',
     },
     {
@@ -301,7 +301,7 @@ export const INVESTIGATION_TOUR: Tour = {
       body:
         'Press Override verdict to set your own verdict and an optional reason. ' +
         'Press Re-run investigation to start a new investigation of the alert. ' +
-        'A re-run asks first when an analyst verdict stands on the alert.',
+        'Re-run investigation asks first when an analyst verdict stands on the alert.',
     },
     {
       anchor: 'investigation-verdict',
@@ -333,7 +333,7 @@ export const INVESTIGATION_TOUR: Tour = {
       body:
         'The timeline lists each step of the investigation, such as the context gathered, the follow-up queries and the checks. ' +
         'Click a step to show its detail. ' +
-        'When the run holds event times, the Event timeline above the steps lists the documents in time order.',
+        'When the investigation holds event times, the Event timeline above the steps lists the documents in time order.',
     },
     {
       anchor: 'investigation-context',
@@ -361,21 +361,21 @@ export const HUNTS_TOUR: Tour = {
       body:
         'This page holds the hunting path, from an analytic hit to a lead to a hunt. ' +
         'The line under the title counts the hunts, the findings and the hunts in progress in the page window. ' +
-        'The link How this flows opens a chart of the path.',
+        'The link How this flows opens a chart of the flow from the grid to your decision.',
     },
     {
       anchor: 'hunts-tabs',
       title: 'Page tabs',
       body:
         'The Hunts tab holds the leads, the analytic hits and the hunts. ' +
-        'An analytic is one written detection that the sweep runs. ' +
+        'An analytic is one written detection, and the sweep reads the grid with it. ' +
         'Open the Analytics tab to read what each analytic found and to change it.',
     },
     {
       anchor: 'hunts-leads',
       title: 'Leads',
       body:
-        'A lead is a set of observations on one entity that waits on one decision. ' +
+        'A lead is a set of observations on one entity that are worth one look. ' +
         'Select leads with the check boxes, then press Dismiss, Hunt or Reopen for the selection. ' +
         'Each press opens a confirm that states the count and the leads it skips.',
     },

@@ -40,7 +40,7 @@ What it seeds
       group (E1.2 "Pipeline error" chip, excluded from the Needs-info KPI).
     - (untriaged)          stream-retransmission run interrupted by a restart.
 * 2 completed hunts with the SAME objective (E3.4 "vs last run" diff strip:
-  1 new / 3 persisting / 1 resolved finding) + a daily hunt schedule row.
+  1 new / 3 persisting / 1 not reported this run) + a daily hunt schedule row.
 * a week of hunt catalog sweeps (soc_ai/demo/catalog_trail.py, the same
   generator the product demo seeds at startup): one row per spec every six
   hours, the decoy spec blind throughout, one DCSync firing two days back
@@ -203,6 +203,9 @@ def build_emotet(inv_id: str, prior_ids: tuple[str, str]) -> tuple[Investigation
             "verdict": "true_positive",
             "confidence": 0.92,
             "summary": summary,
+            # The beacon sessions completed: the Confirmed threats panel shows
+            # this run first, with the impact "succeeded".
+            "impact": "succeeded",
             "recommended_actions": [
                 {
                     "tool_name": "escalate_to_case",
@@ -1169,9 +1172,10 @@ def build_hunt_prev(hunt_id: str) -> tuple[Hunt, list]:
     """The OLDER completed run of the same objective (E3.4 hunt-diff baseline).
 
     Its findings overlap the newer run's: three persist (same fuzzy identity —
-    normalized title + hosts set), one resolves (present here, absent in the
-    newer run), and the newer run adds one ("Only new external peer…"), so the
-    diff strip shows 1 new · 3 persisting · 1 resolved.
+    normalized title + hosts set), one is not reported again (present here,
+    absent in the newer run), and the newer run adds one ("Only new external
+    peer…"), so the diff strip shows 1 new · 3 persisting · 1 not reported
+    this run.
     """
     src = "198.51.100.23"
     created = utcnow() - timedelta(hours=26, minutes=40)

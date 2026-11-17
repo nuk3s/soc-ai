@@ -19,6 +19,7 @@ from collections.abc import Mapping
 
 __all__ = [
     "ALERT_ONLY_NOTE",
+    "campaign_of",
     "catalog_parts",
     "first_sentence",
     "hunt_title",
@@ -41,6 +42,11 @@ _RELATIVE_RE = re.compile(r"^now-(?P<n>\d+)(?P<unit>[mhd])$")
 # carries dots, so the sentence ends at the first full stop that a space or the
 # end of the line follows.
 _LEAD_RE = re.compile(r"^\[lead (?P<id>\d+)\] Investigate (?P<entities>.+?)\.(?:\s|$)")
+
+# soc_ai.hunting.campaign_hunt.objective_for writes the head sentence of a
+# campaign hunt. It names the campaign by its id only: the title holds party
+# names, and a headline is printed on every surface.
+_CAMPAIGN_RE = re.compile(r"^\[campaign (?P<id>\d+)\]\s")
 
 
 # The end of a sentence: a stop, then space, then a capital, a digit or a quote.
@@ -105,6 +111,12 @@ def lead_entities(objective: str) -> tuple[int, list[str]] | None:
     return int(m.group("id")), entities
 
 
+def campaign_of(objective: str) -> int | None:
+    """The campaign id of a campaign hunt objective, or None."""
+    m = _CAMPAIGN_RE.match(objective_headline(objective))
+    return int(m.group("id")) if m is not None else None
+
+
 def _is_address(value: str) -> bool:
     try:
         ipaddress.ip_address(value)
@@ -141,6 +153,9 @@ def hunt_title(objective: str, *, names: Mapping[str, str] | None = None) -> str
     lead = lead_entities(objective)
     if lead is not None:
         return _lead_title(lead[0], lead[1], names or {})
+    campaign = campaign_of(objective)
+    if campaign is not None:
+        return f"Campaign {campaign} hunt"
     return objective_headline(objective)
 
 
@@ -165,10 +180,16 @@ _UNRESOLVED_CITES = re.compile(
 _HIGH_NO_CITES = re.compile(r"high-severity finding has no citations", re.IGNORECASE)
 
 
-def validator_note(text: str | None) -> str | None:
-    """A stored validator note, reworded when an older build wrote it."""
-    if not text:
-        return None
+# The mark on each finding of a hunt whose model returned no reasoning trace
+# (soc_ai.api.hunt_runner). The runner joins it to a note that a gate wrote.
+DEGRADED_FINDING_NOTE = (
+    "degraded run: the model returned no reasoning trace in this hunt. "
+    "Check this finding against its evidence before you act."
+)
+
+
+def _reworded(text: str) -> str:
+    """One stored gate note in the words of the page."""
     if _LEGACY_ALERT_ONLY.search(text):
         return ALERT_ONLY_NOTE
     unresolved = _UNRESOLVED_CITES.search(text)
@@ -180,6 +201,23 @@ def validator_note(text: str | None) -> str | None:
     if _HIGH_NO_CITES.search(text):
         return "This finding cites no evidence. soc-ai lowered the severity from high to medium."
     return text
+
+
+def validator_note(text: str | None) -> str | None:
+    """A stored validator note, reworded when an older build wrote it.
+
+    A finding of a degraded hunt holds two notes in one field: the note of a
+    gate, then :data:`DEGRADED_FINDING_NOTE`. The gate note is reworded alone,
+    and the degraded note stays behind it. A rewording of the whole field
+    dropped the mark, and the finding then did not state it on the page.
+    """
+    if not text:
+        return None
+    head, mark, _tail = text.partition(DEGRADED_FINDING_NOTE)
+    if not mark:
+        return _reworded(text)
+    head = head.strip()
+    return f"{_reworded(head)} {DEGRADED_FINDING_NOTE}" if head else DEGRADED_FINDING_NOTE
 
 
 # A step that needs the grid, the sensors or the data pipeline. The analyst

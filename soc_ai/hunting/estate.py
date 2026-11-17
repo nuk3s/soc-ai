@@ -334,7 +334,7 @@ async def ensure_estate(db: AsyncSession, *, now: datetime | None = None) -> str
         return None
     done = await refresh_estate(db, now=now)
     return (
-        f"estate prevalence: read {done.hosts} host(s), counted "
+        f"network prevalence: read {done.hosts} host(s), counted "
         f"{done.members} member(s) across the set dimensions and wrote "
         f"{done.roles_stamped} role(s)"
     )

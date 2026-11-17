@@ -28,6 +28,40 @@ from soc_ai.store.models import QualityEvalAttempt
 _LOGGER = logging.getLogger(__name__)
 
 
+class QualityServedModelOut(BaseModel):
+    """One model that served runs of a batch.
+
+    ``recorded`` false marks the fallback: the run recorded no served model, so
+    ``model`` is the CONFIGURED route and must not be read as the served one.
+    """
+
+    model: str | None
+    backend: str | None  # host:port of the engine, when the gateway named it
+    runs: int
+    recorded: bool
+
+
+class QualitySynthOut(BaseModel):
+    """What became of one planted true positive.
+
+    ``outcome`` is ``caught``, ``missed`` or ``not_measured``. Only ``missed``
+    raises an alarm. ``cause`` states why a plant was not measured.
+    """
+
+    scenario_id: str
+    outcome: str
+    verdict: str | None = None
+    confidence: float | None = None
+    cause: str | None = None
+
+
+class QualityIneligibleOut(BaseModel):
+    """One scenario the nightly did not plant, and the input that is missing."""
+
+    scenario_id: str
+    reason: str
+
+
 class QualityPointOut(BaseModel):
     """One nightly snapshot, in the light shape the sparkline plots.
 
@@ -84,6 +118,146 @@ class QualityPointOut(BaseModel):
     app_version: str | None
     code_commit: str | None
     analyst_model: str | None
+    # The detail of the point (migration 0066). Every field below reads as an
+    # absence on a row from before that revision: an empty list, or null where
+    # null and zero are different facts.
+    #
+    # ``analyst_model`` above is the CONFIGURED route. ``served_models`` is what
+    # served the runs, and ``served_model_recorded`` is true only when every
+    # completed run recorded it. Null means the row recorded nothing.
+    served_models: list[QualityServedModelOut]
+    served_model_recorded: bool | None
+    # The planted true positives of the batch, and the reason a plant failed.
+    synth: list[QualitySynthOut]
+    synth_note: str | None
+    # Scenarios the deployment could not detect on that night, so the run did
+    # not plant them. One line that names each with its reason, and the same as
+    # a list. A feed that is not loaded is the usual reason.
+    synth_ineligible: list[QualityIneligibleOut]
+    synth_ineligible_note: str | None
+    # Null when every synthetic document of the run is off the grid. Otherwise
+    # one sentence: how many are still there and why the delete failed.
+    synth_cleanup_error: str | None
+    # Runs whose investigation completed and whose grade request failed, with
+    # the count of each cause (``quota``, ``gateway``, ``refusal``). These runs
+    # are in ``n_ok`` and are not in ``n_error``.
+    n_not_graded: int | None
+    not_graded_kinds: dict[str, int]
+    # One sentence when the grader lost grades. It opens with "Agreement is not
+    # measured." when no run was graded. Null when nothing was lost.
+    not_measured: str | None
+    # VERDICT agreement on the real alerts: the runs where the model and the
+    # Oracle each stated a verdict, and how many of those are the same class.
+    # This is what the ``agreement_low`` alarm reads. ``agreement_rate`` above
+    # is a different measure: it also grades the confidence and the reasoning.
+    # ``verdict_disagreements`` counts each disagreement under
+    # ``<local verdict>><Oracle verdict>``. ``n_no_oracle_verdict`` counts the
+    # completed runs left out because the Oracle named no verdict.
+    verdict_agree: int | None
+    verdict_compared: int | None
+    verdict_disagreements: dict[str, int]
+    n_no_oracle_verdict: int | None
+    # ``n_error`` by cause: ``gateway``, ``token_limit``, ``time_limit``,
+    # ``other``. A run with no report, a run with no verdict and a pipeline
+    # fallback are errors. ``n_ok`` is the completed runs. ``n_unfinished`` is
+    # the runs that never ended, which are in neither count.
+    error_classes: dict[str, int]
+    n_unfinished: int | None
+
+
+def _detail_fields(detail: dict[str, Any] | None) -> dict[str, Any]:
+    """Project the stored ``detail`` object onto the point's typed fields.
+
+    Defensive on every key: the column is free JSON, and a row written by an
+    older or a newer build must degrade to an absence and never to a 500 on
+    the dashboard's own card.
+    """
+    detail = detail if isinstance(detail, dict) else {}
+    not_graded = detail.get("not_graded")
+    not_graded = not_graded if isinstance(not_graded, dict) else {}
+    kinds = not_graded.get("kinds")
+    n_lost = not_graded.get("n")
+    recorded = detail.get("served_recorded")
+    note = detail.get("synth_note")
+    sentence = detail.get("not_measured")
+    verdicts = detail.get("verdict_agreement")
+    verdicts = verdicts if isinstance(verdicts, dict) else {}
+    pairs = verdicts.get("pairs")
+
+    def _count(value: Any) -> int | None:
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    return {
+        "verdict_agree": _count(verdicts.get("agree")),
+        "verdict_compared": _count(verdicts.get("compared")),
+        "verdict_disagreements": (
+            {str(k): int(v) for k, v in pairs.items() if isinstance(v, int)}
+            if isinstance(pairs, dict)
+            else {}
+        ),
+        "n_no_oracle_verdict": _count(verdicts.get("no_oracle_verdict")),
+        "error_classes": (
+            {str(k): int(v) for k, v in detail["error_classes"].items() if isinstance(v, int)}
+            if isinstance(detail.get("error_classes"), dict)
+            else {}
+        ),
+        "n_unfinished": _count(
+            detail["runs"].get("unfinished") if isinstance(detail.get("runs"), dict) else None
+        ),
+        "served_models": [
+            QualityServedModelOut(
+                model=entry.get("model") if isinstance(entry.get("model"), str) else None,
+                backend=entry.get("backend") if isinstance(entry.get("backend"), str) else None,
+                runs=int(entry.get("runs") or 0),
+                recorded=bool(entry.get("recorded", True)),
+            )
+            for entry in detail.get("served") or []
+            if isinstance(entry, dict)
+        ],
+        "served_model_recorded": recorded if isinstance(recorded, bool) else None,
+        "synth": [
+            QualitySynthOut(
+                scenario_id=str(entry.get("scenario_id") or ""),
+                outcome=str(entry.get("outcome") or ""),
+                verdict=entry.get("verdict") if isinstance(entry.get("verdict"), str) else None,
+                confidence=(
+                    float(entry["confidence"])
+                    if isinstance(entry.get("confidence"), int | float)
+                    and not isinstance(entry.get("confidence"), bool)
+                    else None
+                ),
+                cause=entry.get("cause") if isinstance(entry.get("cause"), str) else None,
+            )
+            for entry in detail.get("synth") or []
+            if isinstance(entry, dict)
+        ],
+        "synth_note": note if isinstance(note, str) else None,
+        "synth_ineligible": [
+            QualityIneligibleOut(
+                scenario_id=str(entry.get("scenario_id") or ""),
+                reason=str(entry.get("reason") or ""),
+            )
+            for entry in detail.get("synth_ineligible") or []
+            if isinstance(entry, dict)
+        ],
+        "synth_ineligible_note": (
+            detail["synth_ineligible_note"]
+            if isinstance(detail.get("synth_ineligible_note"), str)
+            else None
+        ),
+        "synth_cleanup_error": (
+            detail["synth_cleanup_error"]
+            if isinstance(detail.get("synth_cleanup_error"), str)
+            else None
+        ),
+        "n_not_graded": int(n_lost) if isinstance(n_lost, int) else None,
+        "not_graded_kinds": (
+            {str(k): int(v) for k, v in kinds.items() if isinstance(v, int)}
+            if isinstance(kinds, dict)
+            else {}
+        ),
+        "not_measured": sentence if isinstance(sentence, str) else None,
+    }
 
 
 STALE_AFTER = timedelta(hours=48)
@@ -123,7 +297,10 @@ class QualityFreshnessOut(BaseModel):
     stale: bool  # scheduled, and the newest row is older than STALE_AFTER
     last_attempt_at: str | None
     last_exit_code: int | None
-    last_detail: str | None  # the run's own one-line reason; null on a clean run
+    # The run's own note, or null when it had nothing to say. A run that wrote
+    # no point states why. A run that wrote one states what became of the
+    # synthetic true positive, and any grade the Oracle did not give.
+    last_detail: str | None
 
 
 class QualityTrendOut(BaseModel):
@@ -192,6 +369,7 @@ async def get_quality_trend(request: Request) -> QualityTrendOut:
                 app_version=r.app_version,
                 code_commit=r.code_commit,
                 analyst_model=r.analyst_model,
+                **_detail_fields(r.detail),
             )
             for r in reversed(rows)
         ],
@@ -284,12 +462,28 @@ async def _quality_eval_worker(state: Any, *, trigger: str = "manual") -> None:
         )
         status.last_exit_code = result.exit_code
         status.last_detail = result.detail
+        if result.exit_code == 0 and result.detail:
+            # A run that worked and has something to say: what became of the
+            # planted true positive, or the grades the grader did not give.
+            _LOGGER.info("quality eval: %s", result.detail)
         if result.exit_code != 0:
             # A run that wrote nothing (exit 2: no eligible alerts; exit 5:
             # failed) raises nothing, and the status slot above is process
             # memory. This line is the only record of the attempt that
             # survives a restart, once per attempt, with the run's own reason.
             _LOGGER.warning("quality eval: exit %d: %s", result.exit_code, result.detail)
+    except asyncio.CancelledError:
+        # A restart or a deploy inside the nightly hour cancels this task, and
+        # ``except Exception`` does not see a cancel. The finally below records
+        # the attempt from the status slot, which then still held the outcome
+        # of the PREVIOUS run. Production recorded exit 0 on 2026-10-27 for a
+        # run that left one row and no snapshot. A clean run now carries a note
+        # ("The model caught the synthetic true positive ..."), so a stale slot
+        # would also repeat last night's catch for a night that measured
+        # nothing. The slot gets this run's own outcome before the finally.
+        status.last_exit_code = 5
+        status.last_detail = "The run stopped before the end. It wrote no snapshot."
+        raise
     except Exception as e:  # the eval must never take the app down
         _LOGGER.exception("quality eval run failed")
         status.last_exit_code = 5

@@ -46,14 +46,30 @@ describe('a hunt is the subject of an investigation', () => {
       'Hunt this lead. soc-ai investigates each threat finding of the hunt and shows the verdicts.',
     );
     expect(TIP.ACTION_OPEN_INVESTIGATION).toBe(
-      'Open an investigation on this finding. The control starts one run of the model on the ' +
-        'evidence that the finding cites. The run ends in a verdict and recommended actions.',
+      'Open an investigation on this finding. The control starts the model on the evidence ' +
+        'that the finding cites. The investigation ends in a verdict and recommended actions.',
     );
-    expect(TIP.DEFINE_HUNT).toContain('soc-ai investigates each threat finding when the hunt ends.');
+    expect(TIP.DEFINE_HUNT).toContain(
+      'When the hunt ends, soc-ai investigates each threat finding that names an entity',
+    );
     // Negative control: no sentence offers "promote" as an act.
     for (const s of [TIP.ACTION_HUNT, TIP.LEAD_ACTIONS_LINE, TIP.DEFINE_LEAD, TIP.DEFINE_HUNT]) {
       expect(s).not.toMatch(/promot/i);
     }
+  });
+
+  // Leads and hunts of a campaign (2026-11-16). The lines under the chart say
+  // where a lead of a campaign waits, which hunts a campaign starts, and that a
+  // finding a campaign holds gets no investigation of its own.
+  it('states the leads and the hunts of a campaign', () => {
+    expect(TIP.DEFINE_LEAD).toContain('It waits on that campaign');
+    expect(TIP.DEFINE_LEAD).toContain('Any other lead waits on you.');
+    expect(TIP.DEFINE_HUNT).toContain('It reads the open campaigns');
+    expect(TIP.DEFINE_HUNT).toContain('unless a campaign holds the finding.');
+    expect(TIP.DEFINE_CAMPAIGN).toContain('at most one hunt for a campaign in 24 hours');
+    // Negative control: a lead of a campaign is no item of Needs you, so the
+    // lead line must not send every lead to the analyst.
+    expect(TIP.DEFINE_LEAD).not.toContain('and any other lead waits on you');
   });
 
   // The chip on the Investigations list read "The detector that raised this

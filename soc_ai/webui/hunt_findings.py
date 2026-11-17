@@ -21,6 +21,29 @@ alert, and the finding makes its own claim. Two findings of one hunt never
 share a run, and a finding that cites no document has no fingerprint
 (change E, 2026-10-30).
 
+A finding that restates a confirmed finding starts no run either. Prod,
+2026-11-08 to 2026-11-12: one exploit campaign became 12 threat findings and
+12 investigations in 5 scheduled hunts. Each day cited one more document, so
+the exact fingerprint never matched. A finding now links to the investigation
+of an earlier finding when it adds nothing to it
+(:func:`soc_ai.hunting.finding_match.restates`) and the latest run of that
+finding is a true positive (:func:`plan_restatements`).
+
+A finding that restates a campaign that the hunt read starts no run either
+(recommendation 7, 2026-11-16). The phase links it to the campaign first
+(:func:`plan_campaign_holds`, :mod:`soc_ai.hunting.campaign_hold`). The rule
+is strict, and every doubt goes to "investigate". A lead hunt and an
+evaluation hunt never use it.
+
+A document match cannot tell two claims apart, so a link must never bury a
+claim. Four limits hold that. Only a true positive answers: a link to a false
+positive or to a run with no verdict would leave the later claim with no
+investigation for the whole look-back. One earlier run answers for one
+finding of a hunt, and each other finding gets its own run. The link is read
+live, so a Re-run or an override of the earlier finding shows at once, and a
+finding whose answer is gone offers its own run. A lead hunt never uses the
+rule: its findings get their own runs, and its lead settles on those.
+
 The system path records no observation. An analyst's promotion records one,
 because it is the analyst's judgement of the finding. A hunt's own
 investigation is not, and an observation per finding would form a new lead on
@@ -36,7 +59,10 @@ from dataclasses import dataclass, field
 from time import monotonic
 from typing import Any
 
+from sqlalchemy import select
+
 from soc_ai.agent.context import InvestigationContext, build_hunt_subject
+from soc_ai.hunting import campaign_hold, finding_match
 from soc_ai.hunting.findings import (
     finding_document_ids,
     subject_fingerprint,
@@ -46,7 +72,7 @@ from soc_ai.hunting.outcome import FindingVerdicts
 from soc_ai.store import hunts as hunt_svc
 from soc_ai.store import investigations as inv_svc
 from soc_ai.store import leads as leads_store
-from soc_ai.store.models import Hunt, Investigation
+from soc_ai.store.models import Hunt, HuntEvent, Investigation
 from soc_ai.webui import finding_promotion
 
 _LOGGER = logging.getLogger(__name__)
@@ -138,6 +164,8 @@ async def record_link(
     investigation_id: str | None = None,
     origin: str | None = None,
     reason: str | None = None,
+    restates: dict[str, Any] | None = None,
+    campaign_id: int | None = None,
 ) -> None:
     """Write one finding's entry on the hunt row. Never raises."""
     try:
@@ -150,6 +178,8 @@ async def record_link(
                 investigation_id=investigation_id,
                 origin=origin,
                 reason=reason,
+                restates=restates,
+                campaign_id=campaign_id,
             )
     except Exception:
         _LOGGER.exception("hunt %s: finding %s entry was not written", hunt_id, ordinal)
@@ -157,9 +187,16 @@ async def record_link(
 
 @dataclass(frozen=True)
 class _Opened:
+    """The investigation of one finding, and how the finding came by it.
+
+    ``restates`` names the earlier finding whose investigation answers:
+    ``{"hunt_id", "ordinal", "title"}``. It is set only with ``reused``.
+    """
+
     investigation_id: str
     reused: bool
     running: bool
+    restates: dict[str, Any] | None = None
 
 
 class _NotOpened(Exception):
@@ -188,6 +225,189 @@ async def _reusable(
         )
 
 
+async def _hunt_tool_events(db: Any, hunt_ids: set[str]) -> dict[str, list[Any]]:
+    """The stored tool calls and tool results of each hunt, in order."""
+    if not hunt_ids:
+        return {}
+    rows = await db.scalars(
+        select(HuntEvent)
+        .where(HuntEvent.hunt_id.in_(hunt_ids), HuntEvent.kind.in_(("tool_call", "tool_result")))
+        .order_by(HuntEvent.hunt_id, HuntEvent.sequence, HuntEvent.id)
+    )
+    out: dict[str, list[Any]] = {}
+    for event in rows.all():
+        out.setdefault(str(event.hunt_id), []).append(event)
+    return out
+
+
+async def plan_restatements(
+    state: Any,
+    *,
+    hunt_id: str,
+    findings: list[Any],
+    ordinals: list[int],
+    is_synth_eval: bool,
+) -> dict[int, _Opened]:
+    """The findings of one hunt that restate a confirmed finding, by ordinal.
+
+    Reads the hunt findings of the last seven days whose LATEST run is a true
+    positive (:func:`soc_ai.store.investigations.confirmed_finding_runs`),
+    newest first. A finding of this hunt restates one of them when it adds
+    nothing to it (:func:`soc_ai.hunting.finding_match.restates`): one
+    resolved document or more, no document, technique or rule the earlier
+    finding lacks, and the same machines. A document is an id that the hunt
+    stored, read from the stored tool results of each hunt. A host name and
+    its address are one machine where the Hosts data joins them.
+
+    One earlier run answers for one finding of this hunt: the one that shares
+    the most documents with it, then the first in plan order. Every other
+    finding gets its own run. Two findings that cite two halves of the earlier
+    evidence make two claims, and one verdict cannot answer both.
+
+    Never raises. A read that fails logs one line, and every finding gets its
+    own investigation.
+    """
+    subjects = {
+        o: findings[o] for o in ordinals if 0 <= o < len(findings) and isinstance(findings[o], dict)
+    }
+    if not subjects:
+        return {}
+    try:
+        async with state.db_sessionmaker() as db:
+            runs = await inv_svc.confirmed_finding_runs(
+                db, is_synth_eval=is_synth_eval, exclude_hunt_id=hunt_id
+            )
+            if not runs:
+                return {}
+            rows = await db.execute(
+                select(Hunt.id, Hunt.report).where(Hunt.id.in_({r.hunt_id for r in runs}))
+            )
+            reports = {str(row.id): row.report for row in rows.all()}
+            earlier: list[tuple[inv_svc.FindingRunRef, dict[str, Any]]] = []
+            for run in runs:
+                report = reports.get(run.hunt_id)
+                listed = report.get("findings") if isinstance(report, dict) else None
+                if isinstance(listed, list) and 0 <= run.ordinal < len(listed):
+                    found = listed[run.ordinal]
+                    if isinstance(found, dict):
+                        earlier.append((run, found))
+            if not earlier:
+                return {}
+            machines = await finding_match.machine_keys(
+                db, [*subjects.values(), *(f for _run, f in earlier)]
+            )
+            events = await _hunt_tool_events(db, {hunt_id, *(r.hunt_id for r, _f in earlier)})
+    except Exception:
+        _LOGGER.warning(
+            "hunt %s: soc-ai could not read the earlier findings. "
+            "Each finding gets its own investigation.",
+            hunt_id,
+            exc_info=True,
+        )
+        return {}
+
+    def keys_of(owner: str, finding: dict[str, Any]) -> finding_match.FindingKeys:
+        stored = finding_match.stored_documents(
+            events.get(owner, []), finding_match.cited_ids(finding)
+        )
+        return finding_match.finding_keys(finding, documents=stored, machines=machines)
+
+    earlier_keys = [(run, found, keys_of(run.hunt_id, found)) for run, found in earlier]
+    # The best finding of this hunt for each earlier run: (overlap, ordinal).
+    winners: dict[str, tuple[int, int, inv_svc.FindingRunRef, dict[str, Any]]] = {}
+    for ordinal in ordinals:
+        if ordinal not in subjects:
+            continue
+        keys = keys_of(hunt_id, subjects[ordinal])
+        for run, found, other in earlier_keys:
+            if not finding_match.restates(keys, other):
+                continue
+            overlap = len(keys.documents & other.documents)
+            held = winners.get(run.id)
+            if held is None or overlap > held[0]:
+                winners[run.id] = (overlap, ordinal, run, found)
+            # The newest earlier finding that this finding restates is its
+            # one candidate. A finding that loses it gets its own run.
+            break
+    return {
+        ordinal: _Opened(
+            run.id,
+            reused=True,
+            running=False,
+            restates={
+                "hunt_id": run.hunt_id,
+                "ordinal": run.ordinal,
+                "title": str(found.get("title") or "Hunt finding"),
+            },
+        )
+        for _overlap, ordinal, run, found in winners.values()
+    }
+
+
+async def _read_campaign_ids(db: Any, hunt_id: str) -> set[int]:
+    """The campaigns whose block the hunt read: ``campaign_ids`` of its started event."""
+    rows = await db.scalars(
+        select(HuntEvent.payload).where(
+            HuntEvent.hunt_id == hunt_id, HuntEvent.kind == "hunt_started"
+        )
+    )
+    out: set[int] = set()
+    for payload in rows.all():
+        ids = payload.get("campaign_ids") if isinstance(payload, dict) else None
+        for value in ids if isinstance(ids, list) else []:
+            if isinstance(value, int) and not isinstance(value, bool):
+                out.add(value)
+    return out
+
+
+async def plan_campaign_holds(
+    state: Any, *, hunt_id: str, findings: list[Any], ordinals: list[int]
+) -> dict[int, campaign_hold.HoldCampaign]:
+    """The findings of one hunt that a campaign holds, by ordinal.
+
+    Recommendation 7 (2026-11-16): a finding that restates a campaign gets no
+    investigation of its own. Only a campaign whose block the hunt read can
+    hold a finding, and the rule of
+    :func:`soc_ai.hunting.campaign_hold.held_by` decides. Every doubt goes to
+    "investigate".
+
+    Never raises. A read that fails logs one line, and every finding gets its
+    own investigation.
+    """
+    subjects = {
+        o: findings[o] for o in ordinals if 0 <= o < len(findings) and isinstance(findings[o], dict)
+    }
+    if not subjects:
+        return {}
+    try:
+        async with state.db_sessionmaker() as db:
+            read = await _read_campaign_ids(db, hunt_id)
+            if not read:
+                return {}
+            campaigns = await campaign_hold.active_campaigns(db)
+            if not campaigns:
+                return {}
+            machines = await campaign_hold.machine_keys(db, subjects.values())
+            events = (await _hunt_tool_events(db, {hunt_id})).get(hunt_id, [])
+    except Exception:
+        _LOGGER.warning(
+            "hunt %s: soc-ai could not read the campaigns. Each finding gets its own "
+            "investigation.",
+            hunt_id,
+            exc_info=True,
+        )
+        return {}
+    out: dict[int, campaign_hold.HoldCampaign] = {}
+    for ordinal, finding in subjects.items():
+        documents = finding_match.stored_documents(events, finding_match.cited_ids(finding))
+        campaign = campaign_hold.held_by(
+            finding, campaigns=campaigns, read=read, documents=documents, machines=machines
+        )
+        if campaign is not None:
+            out[ordinal] = campaign
+    return out
+
+
 async def open_for_finding(
     state: Any,
     *,
@@ -205,6 +425,9 @@ async def open_for_finding(
     subject build and the anchor need one. The second fingerprint test and the
     start run under one lock, so two findings of one subject in two hunts that
     run at the same time never both start a run.
+
+    A finding that restates a confirmed finding never reaches this function:
+    the phase links it first (:func:`plan_restatements`).
     """
     fingerprint = subject_fingerprint(finding)
     existing = await _reusable(
@@ -329,17 +552,56 @@ async def investigate_findings(
         report = dict(hunt.report or {}) if hunt is not None else {}
         lead_id = hunt.lead_id if hunt is not None else None
         is_synth_eval = bool(hunt.is_synth_eval) if hunt is not None else False
+        is_lead_hunt = lead_id is not None or (
+            hunt is not None and str(hunt.starter or "") == "lead"
+        )
     raw = report.get("findings")
+    findings = raw if isinstance(raw, list) else []
+    # A finding that restates a campaign of the hunt gets no investigation of
+    # its own. Its entry names the campaign. A lead hunt never uses the rule:
+    # its lead settles on the verdicts of its findings. An evaluation hunt
+    # never uses it: a real campaign says nothing about a planted scenario.
+    held = (
+        await plan_campaign_holds(state, hunt_id=hunt_id, findings=findings, ordinals=plan.queued)
+        if not is_lead_hunt and not is_synth_eval
+        else {}
+    )
+    for ordinal, campaign in held.items():
+        _LOGGER.info("hunt %s finding %s is held by campaign %s", hunt_id, ordinal, campaign.id)
+        await record_link(
+            state,
+            hunt_id,
+            ordinal,
+            hunt_svc.LINK_CAMPAIGN,
+            reason=campaign_hold.HELD_REASON,
+            campaign_id=campaign.id,
+        )
+    queued = [o for o in plan.queued if o not in held]
+    # A lead hunt never links a finding to an earlier investigation. Its lead
+    # closes as promoted on the verdicts of its findings, and a verdict that
+    # an earlier hunt reached on an earlier claim must not close a lead.
+    restated = (
+        await plan_restatements(
+            state,
+            hunt_id=hunt_id,
+            findings=findings,
+            ordinals=queued,
+            is_synth_eval=is_synth_eval,
+        )
+        if lead_id is None
+        else {}
+    )
     phase = _Phase(
         state,
         ctx=ctx,
         hunt_id=hunt_id,
-        findings=raw if isinstance(raw, list) else [],
+        findings=findings,
         lead_id=lead_id,
         is_synth_eval=is_synth_eval,
-        queued=plan.queued,
+        queued=queued,
+        restated=restated,
     )
-    count = min(CONCURRENCY, len(plan.queued))
+    count = min(CONCURRENCY, len(queued))
     workers = [asyncio.create_task(phase.worker()) for _ in range(count)]
     try:
         # asyncio.wait and not gather: a cancel of the hunt must not cancel
@@ -369,7 +631,11 @@ class _Phase:
         lead_id: int | None,
         is_synth_eval: bool,
         queued: list[int],
+        restated: dict[int, _Opened] | None = None,
     ) -> None:
+        # The findings that restate a confirmed finding, by ordinal
+        # (:func:`plan_restatements`). Each one links to that finding's run.
+        self.restated = restated or {}
         self.state = state
         self.ctx = ctx
         self.hunt_id = hunt_id
@@ -383,9 +649,10 @@ class _Phase:
         # the investigation it opened, for the cancel path. A finding leaves
         # the map when its entry reaches a final state.
         self.unfinished: dict[int, str | None] = dict.fromkeys(queued)
-        # Reused runs of another hunt that still run. The hunt waits for them
-        # at the end and never cancels them.
-        self.reused_running: list[tuple[int, str]] = []
+        # Reused runs of another hunt that still run, each with the entry
+        # fields of its finding. The hunt waits for them at the end and never
+        # cancels them.
+        self.reused_running: list[tuple[int, dict[str, Any]]] = []
         # Set by a cancel of the hunt. A worker reads it after every wait, and
         # it starts no new investigation and records no end once it is set.
         # The workers are never cancelled. They stop on this flag.
@@ -432,6 +699,8 @@ class _Phase:
         """Open or reuse the investigation of one finding. None when none started."""
         finding = self.findings[ordinal] if 0 <= ordinal < len(self.findings) else None
         reason = REASON_NOT_STARTED
+        if ordinal in self.restated:
+            return self.restated[ordinal]
         if isinstance(finding, dict):
             try:
                 return await open_for_finding(
@@ -462,16 +731,23 @@ class _Phase:
             self.unfinished[ordinal] = inv_id
             finding_promotion.investigation_manager(self.state).cancel(inv_id)
             return
+        fields: dict[str, Any]
         if opened.reused:
             _LOGGER.info(
-                "hunt %s finding %s reuses investigation %s", self.hunt_id, ordinal, inv_id
+                "hunt %s finding %s %s investigation %s",
+                self.hunt_id,
+                ordinal,
+                "restates a finding of" if opened.restates else "reuses",
+                inv_id,
             )
             fields = {"investigation_id": inv_id, "origin": hunt_svc.ORIGIN_REUSED}
+            if opened.restates:
+                fields["restates"] = opened.restates
             if not opened.running:
                 await self.settle(ordinal, hunt_svc.LINK_ENDED, **fields)
                 return
             self.unfinished.pop(ordinal, None)
-            self.reused_running.append((ordinal, inv_id))
+            self.reused_running.append((ordinal, fields))
             await self.link(ordinal, hunt_svc.LINK_INVESTIGATING, **fields)
             return
         self.unfinished[ordinal] = inv_id
@@ -484,16 +760,11 @@ class _Phase:
         await self.settle(ordinal, hunt_svc.LINK_ENDED, **fields)
 
     async def wait_for_reused(self) -> None:
-        for ordinal, inv_id in self.reused_running:
-            await wait_for_end(self.state, inv_id, stopped=self.is_stopped)
+        for ordinal, fields in self.reused_running:
+            await wait_for_end(self.state, fields["investigation_id"], stopped=self.is_stopped)
             if self.stopped:
                 return
-            await self.link(
-                ordinal,
-                hunt_svc.LINK_ENDED,
-                investigation_id=inv_id,
-                origin=hunt_svc.ORIGIN_REUSED,
-            )
+            await self.link(ordinal, hunt_svc.LINK_ENDED, **fields)
 
     async def cancel_rest(self) -> None:
         """Record what the hunt still owed as cancelled: the queued findings and its runs.
@@ -533,6 +804,7 @@ __all__ = [
     "FindingPlan",
     "investigate_findings",
     "open_for_finding",
+    "plan_campaign_holds",
     "plan_findings",
     "record_link",
     "start_lock",

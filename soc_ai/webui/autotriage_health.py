@@ -28,11 +28,27 @@ the Oracle route breaker holds its state (:mod:`soc_ai.oracle.breaker`).
 - The pause. Five failed runs in a row with no verdict between them stop the
   scheduled runs for 15 minutes. Each failure after that doubles the pause, up
   to one hour. A verdict ends the pause.
+
+From 2026-11-01 to 2026-11-12 the gateway could not reach the model engine in
+eight windows. 62 runs failed in 5 to 12 seconds each, and the sweep started
+the next alert at once. The pause above opened six times, after five alerts
+each time. 33 alerts kept an error and no verdict. So a fourth guard exists:
+
+- The gateway pause. Two gateway connection errors in sequence stop the
+  scheduled runs. The pause has no end time. The scheduler tests the gateway
+  before each scheduled run (:func:`soc_ai.webui.autotriage.probe_gateway`).
+  The pause closes when the gateway is reachable: a test that gets an answer
+  that is no connection failure, or a verdict from any run. A gateway that
+  answers 401 or 404 is reachable, and the alarm and the pause above handle
+  that error. The alerts that failed on the gateway then run again at once:
+  their failed runs before the recovery no longer count toward the retry
+  wait.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -74,6 +90,31 @@ _TIMEOUT_TYPES = frozenset({"TimeoutError", "CancelledError"})
 RETRY_WAIT = "retry_wait"
 RETRY_LIMIT = "retry_limit"
 
+GATEWAY_PAUSE_AFTER = 2
+"""Gateway connection errors in sequence that open the gateway pause."""
+
+# The words of a connection that did not open, in the text of a model error.
+# The production body: "litellm.InternalServerError: Hosted_vllmException -
+# Cannot connect to host <engine>:8888".
+_CONNECT_WORDS = (
+    "cannot connect",
+    "connection error",
+    "connection refused",
+    "connect call failed",
+    "all connection attempts failed",
+    "no route to host",
+    "network is unreachable",
+    "name or service not known",
+)
+# HTTP 502 and 503: the gateway names an engine that it cannot reach.
+_UNREACHABLE_STATUS_RE = re.compile(r"status_code:\s*50[23]\b")
+_SERVER_ERROR_RE = re.compile(r"status_code:\s*500\b")
+# The model error of a gateway answer, and the errors of a connection to the
+# gateway that did not open.
+_HTTP_ERROR_TYPES = frozenset({"ModelHTTPError"})
+_CONNECT_ERROR_TYPES = frozenset({"APIConnectionError", "ConnectError", "ConnectTimeout"})
+_API_ERROR_TYPES = frozenset({"ModelAPIError"})
+
 
 def _now() -> datetime:
     """The clock, aware UTC. Tests patch this."""
@@ -85,6 +126,27 @@ def error_key(phase: str, error_type: str) -> str:
     if phase in _TIMEOUT_PHASES or error_type in _TIMEOUT_TYPES:
         return TIMEOUT_KEY
     return f"{error_type} in {phase}"
+
+
+def is_gateway_connection_error(error_type: str, message: str) -> bool:
+    """True when a run failed because the model engine could not be reached.
+
+    Three shapes count: a gateway answer of HTTP 502 or 503, a gateway answer
+    of HTTP 500 whose body names a connection that did not open, and a
+    connection to the gateway itself that did not open. A timeout does not
+    count, and an answer that refuses the request does not count: the engine
+    answered. Those keep the rule of five failed runs in a row.
+    """
+    text = (message or "").lower()
+    if error_type in _HTTP_ERROR_TYPES:
+        if _UNREACHABLE_STATUS_RE.search(text):
+            return True
+        return bool(_SERVER_ERROR_RE.search(text)) and any(w in text for w in _CONNECT_WORDS)
+    if error_type in _CONNECT_ERROR_TYPES:
+        return True
+    if error_type in _API_ERROR_TYPES:
+        return any(w in text for w in _CONNECT_WORDS)
+    return False
 
 
 def describe(phase: str, error_type: str) -> str:
@@ -133,6 +195,15 @@ def pause_text(until: datetime, streak: int, error: str) -> str:
     )
 
 
+def gateway_pause_text(streak: int, error: str) -> str:
+    """The bell title while the gateway pause is open."""
+    return (
+        f"Continuous Auto-Investigate is paused. The model gateway failed {streak} runs "
+        f"in a row with a connection error. The last error is {error}. soc-ai tests the "
+        "gateway before each scheduled run. A test that passes ends the pause."
+    )
+
+
 def alarm_text(failures: int, error: str) -> str:
     """The bell title while an alarm is open."""
     return (
@@ -178,6 +249,16 @@ class TriageHealth:
     paused_until: datetime | None = None
     pause_since: datetime | None = None
     pause_count: int = 0
+    # Gateway connection errors in sequence, and the gateway pause that two of
+    # them open. The pause has no end time: a gateway test that passes ends it.
+    gateway_streak: int = 0
+    gateway_pause_since: datetime | None = None
+    # The gateway connection errors of the open pause: the two that opened it
+    # and each one after. The bell prints this count. Another failure resets
+    # the streak, and the count of the open pause stays.
+    gateway_pause_failures: int = 0
+    # alert id -> the time of its last gateway connection error.
+    gateway_failed: dict[str, datetime] = field(default_factory=dict)
 
     def _prune(self, at: datetime) -> None:
         for key in list(self.recent):
@@ -190,16 +271,78 @@ class TriageHealth:
             a: (k, t) for a, (k, t) in self.failed_class.items() if at - t < MEMORY
         }
         self.forgiven = {a: t for a, t in self.forgiven.items() if at - t < MEMORY}
+        self.gateway_failed = {a: t for a, t in self.gateway_failed.items() if at - t < MEMORY}
+
+    @property
+    def gateway_paused(self) -> bool:
+        """True while the gateway pause is open."""
+        return self.gateway_pause_since is not None
+
+    def blocks_sweep(self, at: datetime | None = None) -> bool:
+        """True while a scheduled run must not start: either pause is open."""
+        return self.gateway_paused or self.is_paused(at)
+
+    def _record_gateway(self, alert_id: str, is_gateway: bool, at: datetime) -> None:
+        """Count the gateway connection errors in sequence. Two open the pause."""
+        if not is_gateway:
+            self.gateway_streak = 0
+            return
+        self.gateway_streak += 1
+        self.gateway_failed[alert_id] = at
+        if self.gateway_pause_since is not None:
+            self.gateway_pause_failures += 1
+        elif self.gateway_streak >= GATEWAY_PAUSE_AFTER:
+            self.gateway_pause_since = at
+            self.gateway_pause_failures = self.gateway_streak
+            _LOGGER.warning(
+                "auto-triage: the model gateway failed %d runs in a row with a connection "
+                "error. Continuous Auto-Investigate is paused. A gateway test that passes "
+                "ends the pause.",
+                self.gateway_streak,
+            )
+
+    def record_gateway_recovered(
+        self, stored_alerts: list[str] | None = None, *, at: datetime | None = None
+    ) -> list[str]:
+        """The gateway is reachable: close the gateway pause. Returns the healed alerts.
+
+        A gateway test that gets an answer calls this, and so does a verdict
+        of any run.
+
+        Each alert that failed on the gateway gets its runs back: its failed
+        runs before this moment no longer count toward the retry wait, so the
+        next sweep runs it at once. ``stored_alerts`` are the alerts that the
+        store names with a gateway connection error and no verdict, which
+        covers the failures of an earlier process.
+        """
+        at = at or _now()
+        healed = sorted({*self.gateway_failed, *(stored_alerts or [])})
+        for alert_id in healed:
+            self.forgiven[alert_id] = at
+        self.gateway_failed = {}
+        self.gateway_streak = 0
+        self.gateway_pause_since = None
+        self.gateway_pause_failures = 0
+        return healed
 
     def record_failure(
-        self, alert_id: str, phase: str, error_type: str, *, at: datetime | None = None
+        self,
+        alert_id: str,
+        phase: str,
+        error_type: str,
+        *,
+        message: str = "",
+        at: datetime | None = None,
     ) -> tuple[bool, bool]:
         """Record one failed run. Returns (the alarm opened, the pause opened).
 
         Only a transition returns True, so a caller can log once per outage.
+        ``message`` is the error text of the run. It tells a gateway
+        connection error from another failure, for the gateway pause.
         """
         at = at or _now()
         self._prune(at)
+        self._record_gateway(alert_id, is_gateway_connection_error(error_type, message), at)
         key = error_key(phase, error_type)
         self.recent.setdefault(key, []).append(at)
         self.failed_class[alert_id] = (key, at)
@@ -256,6 +399,12 @@ class TriageHealth:
         """
         at = at or _now()
         self.streak = 0
+        self.gateway_streak = 0
+        if self.gateway_pause_since is not None:
+            # A run reached a verdict, so the gateway answers. The pause held
+            # the scheduled runs after a press had reached a verdict.
+            self.record_gateway_recovered(at=at)
+            _LOGGER.info("auto-triage: a run reached a verdict. The gateway pause is closed.")
         if self.pause_since is not None:
             self.paused_until = None
             self.pause_since = None
@@ -329,6 +478,15 @@ class TriageHealth:
         at = at or _now()
         alarm = self.newest_alarm()
         paused = self.is_paused(at)
+        if self.gateway_pause_since is not None:
+            # The gateway pause is the cause that the operator can act on, so
+            # it has the bell row while it is open.
+            error = describe(*self.last_error) if self.last_error else "an unknown error"
+            return (
+                f"auto-triage-gateway:{breaker.iso(self.gateway_pause_since)}",
+                gateway_pause_text(self.gateway_pause_failures, error),
+                self.gateway_pause_since,
+            )
         if alarm is None and not paused:
             return None
         since = alarm.since if alarm is not None else (self.pause_since or at)
@@ -349,9 +507,10 @@ class TriageHealth:
         at = at or _now()
         paused = self.is_paused(at)
         alarm = self.newest_alarm()
+        gateway_paused = self.gateway_paused
         if alarm is not None:
             alarm_error: str | None = alarm.describe()
-        elif paused and self.last_error is not None:
+        elif (paused or gateway_paused) and self.last_error is not None:
             alarm_error = describe(*self.last_error)
         else:
             alarm_error = None
@@ -362,7 +521,11 @@ class TriageHealth:
         return {
             "paused_until": breaker.iso(self.paused_until) if paused else None,
             "pause_ends": breaker.iso(self.paused_until) if open_pause else None,
-            "failed_in_a_row": self.streak if paused else 0,
+            "failed_in_a_row": (
+                self.gateway_pause_failures if gateway_paused else self.streak if paused else 0
+            ),
+            # The gateway pause has no end time, so paused_until stays None.
+            "gateway_paused": gateway_paused,
             "alarm_error": alarm_error,
             "alarm_failures": alarm.failures if alarm is not None else 0,
         }
@@ -372,6 +535,7 @@ __all__ = [
     "ALARM_AFTER",
     "ALARM_STALE",
     "ALARM_WINDOW",
+    "GATEWAY_PAUSE_AFTER",
     "MEMORY",
     "PAUSE_AFTER",
     "PAUSE_FIRST",
@@ -386,6 +550,8 @@ __all__ = [
     "alarm_text",
     "describe",
     "error_key",
+    "gateway_pause_text",
+    "is_gateway_connection_error",
     "pause_text",
     "retry_hold",
     "retry_wait",

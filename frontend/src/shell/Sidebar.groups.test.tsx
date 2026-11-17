@@ -118,6 +118,38 @@ describe('Sidebar entries', () => {
     expect(alerts.querySelector('span')?.getAttribute('style')).not.toContain('#4b8bf5');
   });
 
+  // The campaign is the unit of work (owner, 2026-11-14). Campaigns has its
+  // own item, directly after Dashboard, and the campaign pages light it.
+  it('has a Campaigns item directly after Dashboard, lit on the campaign pages', async () => {
+    for (const at of ['/campaigns', '/campaigns/7']) {
+      const { unmount } = renderAt(at);
+      const campaigns = await screen.findByRole('link', { name: /^Campaigns/ });
+      expect(campaigns).toHaveAttribute('href', '/campaigns');
+      expect(campaigns.querySelector('span')?.getAttribute('style')).toContain('#4b8bf5');
+      const names = screen
+        .getAllByRole('link')
+        .map((l) => l.textContent?.trim() ?? '')
+        .filter((t) => /^(Dashboard|Campaigns|Alerts)/.test(t));
+      expect(names.slice(0, 3).map((t) => t.match(/^(Dashboard|Campaigns|Alerts)/)?.[1])).toEqual([
+        'Dashboard',
+        'Campaigns',
+        'Alerts',
+      ]);
+      // NEGATIVE CONTROL. Hunts and Hosts are not lit on a campaign page.
+      const hunts = screen.getByRole('link', { name: /^Hunts/ });
+      expect(hunts.querySelector('span')?.getAttribute('style')).not.toContain('#4b8bf5');
+      const hosts = screen.getByRole('link', { name: /^Hosts/ });
+      expect(hosts.querySelector('span')?.getAttribute('style')).not.toContain('#4b8bf5');
+      unmount();
+    }
+  });
+
+  it('does not light Campaigns on the Hunts page', async () => {
+    renderAt('/hunts');
+    const campaigns = await screen.findByRole('link', { name: /^Campaigns/ });
+    expect(campaigns.querySelector('span')?.getAttribute('style')).not.toContain('#4b8bf5');
+  });
+
   it('reads the wordmark as soc-ai', async () => {
     renderAt('/dashboard');
     await screen.findByRole('link', { name: 'Dashboard' });

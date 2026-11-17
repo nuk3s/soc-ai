@@ -62,7 +62,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
   }),
 }));
 
-import { ApiError, getAnalytic, getAnalytics, getHunts, getHuntStats, getLeads } from '../lib/api';
+import { ApiError, getAnalytic, getAnalytics, getHuntCatalog, getHunts, getHuntStats, getLeads } from '../lib/api';
 import { ShellProvider } from '../shell/ShellContext';
 import { CHIP_CATALOG_RUN, TYPE_LEAD } from '../lib/tooltips';
 import type { HuntsQuery } from '../lib/api';
@@ -349,7 +349,11 @@ describe('Hunts findings counts', () => {
     ]);
     renderHunts();
     await screen.findByText('six findings, one threat');
-    expect(screen.getByText('6 · 1 threat')).toBeTruthy();
+    // The cell states every finding. The threat count has one format, and
+    // the status cell states it. The split is the hover.
+    const cell = screen.getByTitle('1 threat finding · 5 other findings: visibility gaps and observations');
+    expect(cell.textContent).toBe('6');
+    expect(screen.queryByText('6 · 1 threat')).toBeNull();
     const line = screen.getByTestId('hunt-stats-line');
     expect(line.textContent).toContain('7 findings');
     expect(within(line).getByTitle('1 threat')).toBeTruthy();
@@ -1086,7 +1090,41 @@ describe('Hunts list status word', () => {
     const status = await screen.findByTestId('hunt-status');
     expect(status.textContent).toBe('Threat found');
     expect(status.getAttribute('data-tone')).toBe('danger');
-    expect(within(status.closest('.grid') as HTMLElement).getByText('2 · 1 threat')).toBeTruthy();
+    const cell = within(status.closest('.grid') as HTMLElement).getByTitle(/^1 threat finding · 1 other finding/);
+    expect(cell.textContent).toBe('2');
+  });
+
+  // L1: the row read "7 · 4 threat" beside "3 of 7 findings are threats".
+  it('states one threat count sentence on a confirmed row', async () => {
+    await show({
+      ...base,
+      findingCount: 7,
+      threatFindingCount: 4,
+      outcome: 'threats_confirmed',
+      outcome_label: '3 confirmed · 1 not judged · of 4 threat findings',
+      findingsInvestigated: 4,
+      findingsTotal: 4,
+      findingsConfirmed: 3,
+    });
+    const status = await screen.findByTestId('hunt-status');
+    expect(status.textContent).toBe('3 confirmed · 1 not judged · of 4 threat findings');
+    const row = status.closest('.grid') as HTMLElement;
+    expect(row.textContent).not.toMatch(/\d+ · \d+ threat\b/);
+    cleanup();
+    // An older server sends no label: the row writes the same sentence from
+    // its counts.
+    await show({
+      ...base,
+      findingCount: 7,
+      threatFindingCount: 4,
+      outcome: 'threats_confirmed',
+      findingsInvestigated: 4,
+      findingsTotal: 4,
+      findingsConfirmed: 3,
+    });
+    expect((await screen.findByTestId('hunt-status')).textContent).toBe(
+      '3 confirmed · 1 not judged · of 4 threat findings',
+    );
   });
 
   it('paints a clean row green and a stopped row grey', async () => {
@@ -1097,7 +1135,7 @@ describe('Hunts list status word', () => {
     const stopped = await screen.findByTestId('hunt-status');
     expect(stopped.textContent).toBe('Could not run');
     expect(stopped.getAttribute('data-tone')).toBe('muted');
-    expect(stopped.getAttribute('title')).toBe('An error stopped the run before it finished.');
+    expect(stopped.getAttribute('title')).toBe('An error stopped the hunt before it finished.');
   });
 });
 
@@ -1126,21 +1164,51 @@ describe('Hunts analytics tab count', () => {
     counts: { live: 16, shadow: 1, candidate: 1 },
   };
 
-  it('names every status the catalog holds', async () => {
+  // L5: the tab read "15 live" while 7 analytics were blind on their last
+  // run and 4 scored no host (review 2026-11-12). The live count states how
+  // the live analytics ran, from the run state each row shows.
+  const CATALOG = {
+    specs: Array.from({ length: 16 }, (_, i) => ({
+      id: `a${i}`,
+      evaluator: 'match',
+      blind: i >= 4 && i < 15,
+      last_error: i === 15 ? 'TransportError' : null,
+      last_error_text: i === 15 ? 'The grid did not answer.' : null,
+    })),
+    sweeps_enabled: true,
+    sweep_interval_minutes: 60,
+    sweep_window_minutes: 61,
+    last_sweep_at: new Date(Date.now() - 600_000).toISOString(),
+  };
+
+  it('names every status the catalog holds, and how the live analytics ran', async () => {
     getHuntSchedulesMock.mockResolvedValue({ schedules: [], masterSwitchEnabled: true });
     vi.mocked(getHunts).mockResolvedValue([]);
     vi.mocked(getAnalytics).mockResolvedValue(LIST as never);
+    vi.mocked(getHuntCatalog).mockResolvedValue(CATALOG as never);
     renderHunts();
-    await screen.findByText('18 · 16 live · 1 shadow · 1 candidate');
+    await screen.findByText('18 · 16 live (4 measuring, 11 blind, 1 failed) · 1 shadow · 1 candidate');
   });
 
-  it('reads the list once for the tab and the panel together', async () => {
+  it('reads the list and the catalog once for the tab and the panel together', async () => {
     getHuntSchedulesMock.mockResolvedValue({ schedules: [], masterSwitchEnabled: true });
     vi.mocked(getHunts).mockResolvedValue([]);
     vi.mocked(getAnalytics).mockClear().mockResolvedValue(LIST as never);
+    vi.mocked(getHuntCatalog).mockClear().mockResolvedValue(CATALOG as never);
     renderHunts(false, '/hunts?tab=analytics');
-    await screen.findByText('18 · 16 live · 1 shadow · 1 candidate');
+    await screen.findByText('18 · 16 live (4 measuring, 11 blind, 1 failed) · 1 shadow · 1 candidate');
     expect(vi.mocked(getAnalytics).mock.calls.length).toBe(1);
+    expect(vi.mocked(getHuntCatalog).mock.calls.length).toBe(1);
+  });
+
+  it('states the live count alone until the catalog is read', async () => {
+    // NEGATIVE CONTROL: an unread catalog is no claim that an analytic measures.
+    getHuntSchedulesMock.mockResolvedValue({ schedules: [], masterSwitchEnabled: true });
+    vi.mocked(getHunts).mockResolvedValue([]);
+    vi.mocked(getAnalytics).mockResolvedValue(LIST as never);
+    vi.mocked(getHuntCatalog).mockReturnValue(new Promise(() => {}) as never);
+    renderHunts();
+    await screen.findByText('18 · 16 live · 1 shadow · 1 candidate');
   });
 });
 

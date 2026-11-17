@@ -650,21 +650,20 @@ class TestSolicitedIcmpEchoDowngrade:
         assert v.verdict == "false_positive"
         assert v.recommended_actions == []
 
-    def test_downgrade_reconciles_summary(self) -> None:
-        """When the verdict is downgraded, the summary must lead
-        with the correct FP/benign conclusion — no confusing inline bracket.
-        The agent's original text is preserved in validator_note, not prepended
-        to the summary."""
+    def test_downgrade_keeps_the_model_summary(self) -> None:
+        """B2 (2026-11-13): a gate that changes the verdict keeps the text of
+        the model. Until then this gate replaced the summary with a fixed text
+        and moved the model text into validator_note. The change is stated in
+        validator_note and in the verdict change record of the report."""
         original = self._make_tp()
         v = self._validate(original, _icmp_bundle())
-        # Summary must NOT start with the old bracket — leads with the correct conclusion.
         assert not v.summary.lower().startswith("[auto-corrected")
-        assert "solicited" in v.summary.lower()
-        # Original synth narrative relocated to validator_note.
-        assert "symmetric byte counts" not in v.summary
+        assert v.summary == original.summary
         assert v.validator_note is not None
-        assert "symmetric byte counts" in v.validator_note
-        assert "true_positive" in v.validator_note  # records what was overridden
+        assert "solicited" in v.validator_note.lower()
+        # The note states the change in words, and holds no copy of the summary.
+        assert "from a true positive to a false positive" in v.validator_note
+        assert original.summary not in v.validator_note
 
     def test_external_dest_icmp_echo_not_downgraded(self) -> None:
         """Solicited echo reply to an EXTERNAL dest could be ICMP exfil — keep TP."""

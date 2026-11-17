@@ -21,6 +21,9 @@ describe('crumbFor', () => {
     ['/entity/198.51.100.7', 'Hosts', '198.51.100.7'],
     ['/hunts/01HUNT', 'Hunts', '01HUNT'],
     ['/investigation/01INV', 'Investigation', '01INV'],
+    ['/campaigns', 'Campaigns', undefined],
+    ['/campaigns/7', 'Campaigns', '7'],
+    ['/needs-you', 'Needs you', undefined],
     ['/dashboard', 'Dashboard', undefined],
   ])('names %s', (path, crumb, crumb2) => {
     expect(crumbFor(path)).toEqual(crumb2 ? { crumb, crumb2 } : { crumb });
@@ -62,6 +65,8 @@ describe('pageLabel', () => {
     expect(pageLabel('/hunts/01HUNT')).toBe('Hunt');
     expect(pageLabel('/leads/18')).toBe('Lead 18');
     expect(pageLabel('/hosts/10.0.0.4')).toBe('Host');
+    expect(pageLabel('/campaigns')).toBe('Campaigns');
+    expect(pageLabel('/campaigns/7')).toBe('Campaign');
   });
 });
 

@@ -3,7 +3,7 @@
 //     used to read "1 pending" while the only card said "✓ Auto-acknowledged".
 // (2) Opening chat on a message-less investigation shows a starter hint with
 //     suggested questions instead of a blank void.
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { describe, expect, it, vi } from 'vitest';
 import type { Investigation as Inv, RecommendedAction } from '../lib/types';
@@ -86,5 +86,61 @@ describe('empty investigation chat', () => {
     fireEvent.click(screen.getAllByRole('button', { name: 'Ask soc-ai about this investigation' })[0]);
     expect(screen.getByText('Why not a true positive?')).toBeTruthy();
     expect(screen.getByText(/Ask a follow-up about this investigation/i)).toBeTruthy();
+  });
+});
+
+describe('recommended actions of an investigation that a campaign holds', () => {
+  const campaign = {
+    id: 7,
+    title: 'actor-a against web-1',
+    status: 'open' as const,
+    stage: 'action' as const,
+    differs: false,
+    decision: null,
+    waitsSince: '2026-10-24T00:40:00Z',
+  };
+  const waiting: RecommendedAction = { id: 'a2', title: 'Escalate to case', tag: 'escalate', rationale: 'Bad.' };
+
+  it('counts no action that waits, and each card names the campaign', () => {
+    render(
+      <MemoryRouter>
+        <Investigation inv={baseInv({ verdict: 'true_positive', actions: [waiting], campaign })} layout="page" />
+      </MemoryRouter>,
+    );
+    expect(screen.getByText(/0 actions wait for you/)).toBeTruthy();
+    expect(screen.getByTestId('action-campaign')).toHaveTextContent('Decide on the campaign.');
+  });
+
+  it('offers no Escalate button and sends the analyst to the case on the campaign', () => {
+    const blocked: RecommendedAction = {
+      ...waiting,
+      blockedReason: 'Open the case on the campaign.',
+      noteCode: 'campaign',
+      note: 'Part of the campaign actor-a against web-1. Decide on the campaign.',
+      noteHref: '/campaigns/7',
+    };
+    render(
+      <MemoryRouter>
+        <Investigation inv={baseInv({ verdict: 'true_positive', actions: [blocked], campaign })} layout="page" />
+      </MemoryRouter>,
+    );
+    const line = screen.getByTestId('action-campaign-case');
+    expect(line).toHaveTextContent('Part of the campaign actor-a against web-1. Open the case on the campaign.');
+    expect(within(line).getByRole('link', { name: 'Open the campaign' }).getAttribute('href')).toBe('/campaigns/7');
+    expect(screen.queryByRole('button', { name: /Escalate to case/ })).toBeNull();
+  });
+
+  it('still counts the action of a verdict that differs', () => {
+    // NEGATIVE CONTROL. A verdict that differs waits under its own rules.
+    render(
+      <MemoryRouter>
+        <Investigation
+          inv={baseInv({ verdict: 'true_positive', actions: [waiting], campaign: { ...campaign, differs: true } })}
+          layout="page"
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByText(/1 action waits for you/)).toBeTruthy();
+    expect(screen.queryByTestId('action-campaign')).toBeNull();
   });
 });

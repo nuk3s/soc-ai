@@ -84,7 +84,7 @@ export function formatNotificationWhen(when: string | null | undefined): string 
 // ── What produced this notification ────────────────────────────────────────
 
 /** Which part of the app raised the item. */
-export type NotificationKind = 'system' | 'host' | 'investigation' | 'hunting';
+export type NotificationKind = 'system' | 'host' | 'campaign' | 'investigation' | 'hunting';
 
 /**
  * The kinds in the order /notifications itself emits them: standing conditions
@@ -99,6 +99,13 @@ export type NotificationKind = 'system' | 'host' | 'investigation' | 'hunting';
 export const NOTIFICATION_KINDS: ReadonlyArray<{ id: NotificationKind; label: string }> = [
   { id: 'system', label: 'System' },
   { id: 'host', label: 'Hosts' },
+  // One row for each change of a campaign: formed, a new stage, a new
+  // machine, a reopen, an investigation beyond the authorization. The
+  // campaign is the unit of work, so its rows sit before the investigations.
+  // The server sets the tone: a row beyond the authorization is danger, and
+  // a new stage between listed machines of an authorization in force is
+  // informational.
+  { id: 'campaign', label: 'Campaigns' },
   { id: 'investigation', label: 'Investigations' },
   { id: 'hunting', label: 'Hunting' },
 ];
@@ -116,6 +123,12 @@ const NEEDS_YOU_ROWS = new Set(['lead', 'lead-more', 'shadow-hit']);
 
 export function isNeedsYouRow(n: { id: string }): boolean {
   return NEEDS_YOU_ROWS.has(n.id.split(':', 1)[0]);
+}
+
+/** A row for one change of a campaign: `campaign:{change id}`. The id is
+ *  stable, so it is the dismissal key. The row opens the campaign page. */
+export function isCampaignRow(n: { id: string }): boolean {
+  return n.id.split(':', 1)[0] === 'campaign';
 }
 
 /** The rows GET /notifications returns when the console names no limit
@@ -180,9 +193,15 @@ export function visibleNotifications<T extends Hideable>(rows: ReadonlyArray<T>)
 }
 
 /** The parts of the needs-you count that are decisions. Dismiss all leaves them. */
-export type DecisionPart = 'leads_needing_decision' | 'untriaged_groups' | 'needs_more_info' | 'pending_actions';
+export type DecisionPart =
+  | 'campaigns'
+  | 'leads_needing_decision'
+  | 'untriaged_groups'
+  | 'needs_more_info'
+  | 'pending_actions';
 
 const DECISION_PARTS: ReadonlyArray<[DecisionPart, string]> = [
+  ['campaigns', 'campaigns that wait on your decision'],
   ['leads_needing_decision', 'leads'],
   ['untriaged_groups', 'alert groups with no verdict'],
   ['needs_more_info', 'verdicts that need more info'],
@@ -193,9 +212,10 @@ const DECISION_PARTS: ReadonlyArray<[DecisionPart, string]> = [
  *  part when the count could not be read. */
 export function decisionsThatStay(data: NeedsYouCount | null): DecisionPart[] {
   return DECISION_PARTS.map(([key]) => key).filter((key) => {
-    if (!data) return true;
+    // An older server sends no campaign part: nothing of it stays.
+    if (!data) return key !== 'campaigns';
     const value = data[key];
-    return value === null || value > 0;
+    return value === null || (value !== undefined && value > 0);
   });
 }
 
@@ -350,6 +370,8 @@ export function notificationKind(n: { id: string; group?: unknown }): Notificati
     // A failed triage is an investigation that ended with no verdict. It sat
     // under "System" while the Investigations chip held verdicts only (D7).
     case 'inv-failed':
+    // One row for the false positive closures of the window.
+    case 'inv-fp':
       return 'investigation';
     case 'hunt':
     case 'hunt-done':
@@ -362,6 +384,8 @@ export function notificationKind(n: { id: string; group?: unknown }): Notificati
       return 'hunting';
     case 'dossier-conflict':
       return 'host';
+    case 'campaign':
+      return 'campaign';
     default:
       return 'system';
   }
@@ -374,9 +398,12 @@ const ROW_NOUN: Record<string, [string, string]> = {
   // the header called it a system notice (dogfood 2026-10-19, R1-D15).
   'analytic-held': ['analytic notice', 'analytic notices'],
   lead: ['lead', 'leads'],
+  campaign: ['campaign change', 'campaign changes'],
   inv: ['running investigation', 'running investigations'],
   'inv-failed': ['failed triage', 'failed triages'],
   'inv-done': ['completed investigation', 'completed investigations'],
+  // One row counts the false positive closures of the window.
+  'inv-fp': ['false positive summary', 'false positive summaries'],
   'hunt-done': ['finished hunt', 'finished hunts'],
   'hunt-sweep': ['catalog sweep', 'catalog sweeps'],
   hunt: ['running hunt', 'running hunts'],
@@ -419,7 +446,7 @@ export function describeNotifications(rows: ReadonlyArray<{ id: string }>, more:
   });
   const list = joinWords(parts);
   const finished = rows.some((r) => FINISHED_RUNS.has(r.id.split(':', 1)[0]));
-  const window = finished ? ' Finished runs cover the last 24 h.' : '';
+  const window = finished ? ' Finished investigations and hunts cover the last 24 h.' : '';
   // One row has one name on every surface: a notification. The header said
   // "items" and the bell said "events" (dogfood 2026-10-19, V1-S7).
   const count = `${rows.length} notification${rows.length === 1 ? '' : 's'}`;
@@ -428,7 +455,7 @@ export function describeNotifications(rows: ReadonlyArray<{ id: string }>, more:
 }
 
 /** The rows that report a finished run. Only these have a 24 h window. */
-const FINISHED_RUNS = new Set(['inv-done', 'inv-failed', 'hunt-done', 'hunt-sweep']);
+const FINISHED_RUNS = new Set(['inv-done', 'inv-failed', 'inv-fp', 'hunt-done', 'hunt-sweep']);
 
 /** The label and colour of a hunt outcome, from lib/labels.ts, or null for
  *  a row with none. An outcome this build does not know keeps its own words

@@ -17,6 +17,9 @@ import { AppShell } from './shell/AppShell';
 // ErrorBoundary card.
 const Alerts = lazyWithReload(() => import('./screens/Alerts').then((m) => ({ default: m.Alerts })));
 const Backtest = lazyWithReload(() => import('./screens/Backtest').then((m) => ({ default: m.Backtest })));
+const CampaignDetail = lazyWithReload(() => import('./screens/CampaignDetail').then((m) => ({ default: m.CampaignDetail })));
+const Campaigns = lazyWithReload(() => import('./screens/Campaigns').then((m) => ({ default: m.Campaigns })));
+const NeedsYou = lazyWithReload(() => import('./screens/NeedsYou').then((m) => ({ default: m.NeedsYou })));
 const Config = lazyWithReload(() => import('./screens/Config').then((m) => ({ default: m.Config })));
 const Dashboard = lazyWithReload(() => import('./screens/Dashboard').then((m) => ({ default: m.Dashboard })));
 const Entity = lazyWithReload(() => import('./screens/Entity').then((m) => ({ default: m.Entity })));
@@ -119,9 +122,12 @@ export function App() {
             <Route path="/investigations" element={<Investigations />} />
             <Route path="/investigation/:id" element={<InvestigationPage />} />
             <Route path="/notifications" element={<Notifications />} />
+            <Route path="/needs-you" element={<NeedsYou />} />
             <Route path="/hunts" element={<Hunts />} />
             <Route path="/hunts/:id" element={<HuntDetail />} />
             <Route path="/leads/:id" element={<LeadDetail />} />
+            <Route path="/campaigns" element={<Campaigns />} />
+            <Route path="/campaigns/:id" element={<CampaignDetail />} />
             <Route path="/entity/:value" element={<EntityRoute />} />
             <Route path="/hosts" element={<Hosts />} />
             <Route path="/hosts/:key" element={<HostDetail />} />

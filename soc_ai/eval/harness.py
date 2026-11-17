@@ -13,11 +13,12 @@ import contextlib
 import json
 import logging
 import time
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 
 from soc_ai.agent.orchestrator import (
     InvestigationContext,
@@ -40,6 +41,149 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 
+# Why a grade request failed. The three want different responses from an
+# operator: a used-up quota clears by itself, a gateway fault is an outage, and
+# a sanitizer refusal is a gap in the redactor.
+GRADER_QUOTA = "quota"
+GRADER_GATEWAY = "gateway"
+GRADER_REFUSAL = "refusal"
+
+# The gateway status for a rate limit. The provider names its quota in the body
+# of the same answer ("Claude Max rate limit reached").
+_HTTP_TOO_MANY_REQUESTS = 429
+
+
+class GraderError(RuntimeError):
+    """The GRADING half of a run failed. The investigation itself completed.
+
+    A ``RuntimeError`` on purpose: ``soc-ai validate`` and ``validate-batch``
+    asked for a grade and map a ``RuntimeError`` to their failure exit, and
+    that must not change. The subclass is what lets the nightly tell a lost
+    grade from a failed investigation. On production the two were one error
+    string, so three nights that lost every grade to the Oracle quota were
+    recorded as ``error_rate 1.00``: a triage failure that never happened.
+    """
+
+    def __init__(self, message: str, *, kind: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
+def _grader_kind(error: BaseException) -> str:
+    """Quota or gateway, read from the status first and the text second.
+
+    The text check exists for an ``oracle_caller`` that raises a plain
+    ``OracleError`` with no status, which every older double does.
+    """
+    text = str(error).lower()
+    if getattr(error, "status_code", None) == _HTTP_TOO_MANY_REQUESTS or any(
+        marker in text for marker in ("rate limit", "rate_limit", "ratelimit")
+    ):
+        return GRADER_QUOTA
+    return GRADER_GATEWAY
+
+
+def _backend_of(api_base: Any) -> str | None:
+    """``host:port`` of a gateway ``api_base``, or None.
+
+    Only the host and the port. A backend address can carry credentials in its
+    userinfo, and those have no business in a quality record.
+    """
+    if not isinstance(api_base, str) or not api_base.strip():
+        return None
+    raw = api_base.strip()
+    try:
+        parts = urlsplit(raw if "://" in raw else f"//{raw}")
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return None
+    if not host:
+        return None
+    return f"{host}:{port}" if port else host
+
+
+def _names(value: Any) -> list[str]:
+    """The non-empty strings in ``value``: one string, or a list of them."""
+    values = value if isinstance(value, list) else [value]
+    return [v.strip() for v in values if isinstance(v, str) and v.strip()]
+
+
+def _served_models_of(payload: dict[str, Any]) -> list[str]:
+    """The models one event names as served. Empty when it names none.
+
+    A ``served_model`` field on the event wins, read by name and by shape: a
+    string, or a mapping that holds the names. The mapping form is the per-run
+    record (``{"configured": ..., "model_groups": [...], "fallback": ...}``);
+    its ``configured`` key is NOT read, because a configured name is not a
+    served one. Otherwise the route the gateway attributed the call to
+    (``served_backend.model_group``), which is what every run records today.
+    """
+    own = payload.get("served_model")
+    if isinstance(own, dict):
+        for key in ("model_groups", "model_group", "model", "name"):
+            if names := _names(own.get(key)):
+                return names
+    elif names := _names(own):
+        return names
+    backend = payload.get("served_backend")
+    if isinstance(backend, dict):
+        return _names(backend.get("model_group"))
+    return []
+
+
+def served_models_from_events(payloads: Iterable[Any]) -> list[dict[str, str]]:
+    """The distinct (model, backend) pairs that served one run, in first-seen order.
+
+    Empty when the run recorded nothing. This function never falls back to the
+    configured model: the caller marks that case, because a configured name
+    presented as a served name is the defect this record exists to end. On
+    production the route ``deepseek-v4-flash`` moved from one engine to another
+    on 2026-11-02 and a fallback route served 54 runs, and every snapshot of
+    those days carried the one configured name.
+
+    Each entry is ``{"model": ...}`` with a ``"backend"`` key when the gateway
+    named the engine address. The route name alone could not show the move
+    above: the name stayed and the address changed. A model that one event
+    names with its address and another event names without it is listed once,
+    with the address.
+    """
+    seen: list[dict[str, str]] = []
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        backend = payload.get("served_backend")
+        address = _backend_of(backend.get("api_base")) if isinstance(backend, dict) else None
+        for model in _served_models_of(payload):
+            entry = {"model": model}
+            if address is not None:
+                entry["backend"] = address
+            if entry not in seen:
+                seen.append(entry)
+    with_address = {entry["model"] for entry in seen if "backend" in entry}
+    return [entry for entry in seen if "backend" in entry or entry["model"] not in with_address]
+
+
+def run_error_from_events(events: Iterable[Any]) -> tuple[str | None, str | None]:
+    """``(type, text)`` of the last ``error`` event of a run, or ``(None, None)``.
+
+    Takes ``(kind, payload)`` pairs. The orchestrator writes the exception class
+    under ``type`` and its text under ``message``. This is what the run itself
+    recorded about its end, and the nightly reads it to state why a run that
+    left no report died: a gateway fault, a token limit or a time limit.
+    """
+    found: tuple[str | None, str | None] = (None, None)
+    for kind, payload in events:
+        if kind != "error" or not isinstance(payload, dict):
+            continue
+        error_type = payload.get("type")
+        message = payload.get("message")
+        found = (
+            str(error_type) if isinstance(error_type, str) and error_type else None,
+            str(message)[:300] if isinstance(message, str) and message else None,
+        )
+    return found
+
+
 @dataclass
 class EvalResult:
     """Returned to the CLI after a successful run.
@@ -55,6 +199,20 @@ class EvalResult:
     mapping: san.Mapping
     oracle_response: OracleResponse
     investigation_elapsed_ms: int
+    # Set only under ``tolerate_grader_failure``: the investigation completed
+    # and the grade request failed. ``grader_error_kind`` is one of the
+    # GRADER_* constants. Both stay None on a graded or an ungraded run.
+    grader_error: str | None = None
+    grader_error_kind: str | None = None
+    # Which model served this run, from the RAW events. See
+    # :func:`served_models_from_events`.
+    served: list[dict[str, str]] = field(default_factory=list)
+    # The run's own failure, from its last ``error`` event: the exception class
+    # and its message. None on a run that raised no error. A run can record an
+    # error and still end with a report, so this says why a run died only when
+    # the run has no verdict. See :func:`run_error_from_events`.
+    run_error_type: str | None = None
+    run_error: str | None = None
 
 
 # Type alias for an oracle-call function so tests can substitute a
@@ -72,6 +230,7 @@ async def run(
     include_synth: bool | str = False,
     expected_verdict: str | None = None,
     grade: bool = True,
+    tolerate_grader_failure: bool = False,
 ) -> EvalResult:
     """Run the eval pipeline end-to-end.
 
@@ -98,6 +257,13 @@ async def run(
             refusal gate is skipped (it exists to protect an egress that
             isn't happening). The local trend signals (verdict, fallback,
             latency) are all still real.
+        tolerate_grader_failure: when True (the nightly), a failed grade
+            request does not raise. The bundle is saved with an empty
+            critique and the result carries ``grader_error`` and
+            ``grader_error_kind``, so the caller keeps the verdict, the
+            latency and the served model of an investigation that completed.
+            False (the default) keeps the raise: ``validate`` and
+            ``validate-batch`` asked for the grade.
     """
     settings = settings or get_settings()
     out_dir = out_dir or Path("evals")
@@ -142,6 +308,12 @@ async def run(
             with contextlib.suppress(Exception):
                 await engine.dispose()
     investigation_elapsed_ms = int((time.monotonic() - started) * 1000)
+    # Read from the RAW events, before the sanitizer runs: it rewrites host
+    # names, and this record never leaves the install.
+    served, (run_error_type, run_error) = (
+        served_models_from_events(ev.payload for ev in events),
+        run_error_from_events((ev.kind, ev.payload) for ev in events),
+    )
 
     # ----- Sanitize -----
     # Thread the operator's ORACLE_EXTRA_HOSTS / ORACLE_INTERNAL_SUFFIXES into
@@ -174,17 +346,30 @@ async def run(
         else None
     )
 
+    grader_error: GraderError | None = None
     if grade:
-        response, response_md, user_message, arch = await _grade_with_oracle(
-            alert_id=alert_id,
-            settings=settings,
-            out_dir=out_dir,
-            oracle_caller=oracle_caller,
-            expected_verdict=expected_verdict,
-            sanitized_events=sanitized_events,
-            sanitized_report=sanitized_report,
-            mapping=mapping,
-        )
+        try:
+            response, response_md, user_message, arch = await _grade_with_oracle(
+                alert_id=alert_id,
+                settings=settings,
+                out_dir=out_dir,
+                oracle_caller=oracle_caller,
+                expected_verdict=expected_verdict,
+                sanitized_events=sanitized_events,
+                sanitized_report=sanitized_report,
+                mapping=mapping,
+            )
+        except GraderError as e:
+            if not tolerate_grader_failure:
+                raise
+            # The investigation is complete and is worth keeping: its verdict,
+            # its latency and its served model are all real. Only the critique
+            # is missing, so the bundle takes the ungraded shape below.
+            grader_error = e
+            user_message = ""
+            arch = ""
+            response = OracleResponse(text="", model="(not graded)", usage={}, elapsed_ms=0)
+            response_md = ""
     else:
         # Ungraded (local) mode: NO oracle, NO egress of any kind. The bundle
         # keeps its normal shape (an empty response.md, a zero-usage stub
@@ -212,6 +397,8 @@ async def run(
         response=response,
         response_md=response_md,
         investigation_elapsed_ms=investigation_elapsed_ms,
+        grader_error=str(grader_error) if grader_error is not None else None,
+        grader_error_kind=grader_error.kind if grader_error is not None else None,
     )
 
     return EvalResult(
@@ -222,6 +409,11 @@ async def run(
         mapping=mapping,
         oracle_response=response,
         investigation_elapsed_ms=investigation_elapsed_ms,
+        grader_error=str(grader_error) if grader_error is not None else None,
+        grader_error_kind=grader_error.kind if grader_error is not None else None,
+        served=served,
+        run_error_type=run_error_type,
+        run_error=run_error,
     )
 
 
@@ -289,9 +481,10 @@ async def _grade_with_oracle(
             encoding="utf-8",
         )
         (debug_dir / "issues.txt").write_text("\n".join(issues), encoding="utf-8")
-        raise RuntimeError(
+        raise GraderError(
             f"sanitization residue check refused to send "
-            f"({len(issues)} issues). See {debug_dir} for the offending tokens."
+            f"({len(issues)} issues). See {debug_dir} for the offending tokens.",
+            kind=GRADER_REFUSAL,
         )
 
     # ----- Build the user message + ask the oracle (via LiteLLM) -----
@@ -323,7 +516,7 @@ async def _grade_with_oracle(
             user_message=user_message,
         )
     except OracleError as e:
-        raise RuntimeError(f"LiteLLM/oracle call failed: {e}") from e
+        raise GraderError(f"LiteLLM/oracle call failed: {e}", kind=_grader_kind(e)) from e
 
     # ----- De-sanitize the response for local display -----
     response_md = san.desanitize(response.text, mapping)
@@ -479,6 +672,8 @@ def _save_bundle(
     response: OracleResponse,
     response_md: str,
     investigation_elapsed_ms: int,
+    grader_error: str | None = None,
+    grader_error_kind: str | None = None,
 ) -> None:
     """Persist the full artifact bundle.
 
@@ -539,6 +734,10 @@ def _save_bundle(
                 "confidence": (report or {}).get("confidence"),
                 "redaction_summary": mapping.summary(),
                 "events_count": len(events),
+                # None on a graded and on an ungraded run. Set when the grade
+                # request failed and the caller chose to keep the investigation.
+                "grader_error": grader_error,
+                "grader_error_kind": grader_error_kind,
             },
             indent=2,
             default=str,

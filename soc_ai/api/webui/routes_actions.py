@@ -6,10 +6,12 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any, Literal
+from uuid import uuid4
 from weakref import WeakValueDictionary
 
 from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 
 from soc_ai.api.deps import get_elastic, get_settings_dep
 from soc_ai.api.security import identify_caller
@@ -23,14 +25,19 @@ from soc_ai.api.webui._timeline import (
     _action_identity,
     _executed_actions,
 )
+from soc_ai.campaigns import refresh as campaign_refresh
+from soc_ai.campaigns import service as campaign_svc
 from soc_ai.config import Settings
 from soc_ai.so_client.elastic import ElasticClient
+from soc_ai.store import authorized_activity as authorized_svc
 from soc_ai.store import chat as chat_svc
 from soc_ai.store import escalations as esc_svc
 from soc_ai.store import investigations as inv_svc
 from soc_ai.store.auth import utcnow
-from soc_ai.store.models import Investigation
-from soc_ai.tools.write_exec import WRITE_TOOLS, execute_write_tool
+from soc_ai.store.models import Hunt, Investigation, InvestigationEvent
+from soc_ai.tools.escalate_to_case import _EVENT_ID_RE, fit_case_description, fit_case_title
+from soc_ai.tools.write_exec import FINDING_CASE_TOOL, WRITE_TOOLS, execute_write_tool
+from soc_ai.triage_models import drop_case_comments_without_a_case
 from soc_ai.webui import alerts_query as aq
 from soc_ai.webui import anchor_check, case_links
 
@@ -42,6 +49,8 @@ _LOGGER = logging.getLogger(__name__)
 # a bad request.
 _BLOCK_STATUS = {
     action_rules.CODE_ANALYST: 409,
+    action_rules.CODE_AUTHORIZED: 409,
+    action_rules.CODE_CAMPAIGN: 409,
     action_rules.CODE_ANCHOR_UNREAD: 503,
 }
 
@@ -79,11 +88,13 @@ def _case_id_from_result(result: Any) -> str:
 
 
 def _observed_case_id(events: list[Any]) -> str | None:
-    """The SO case id THIS investigation itself opened, if any.
+    """The SO case id of THIS investigation's escalate, if any.
 
     Scans persisted successful ``action_executed`` events for an
-    ``escalate_to_case`` execution and returns the case id the system observed
-    from SO's response (persisted as ``case_id``). This is the ONLY case id an
+    ``escalate_to_case`` execution and returns the case id the system observed:
+    from SO's response when the press opened the case, or from the ledger or
+    the case links when the alert of the run was already on one (persisted as
+    ``case_id`` in both cases). This is the ONLY case id an
     ``add_case_comment`` action may target: ``RecommendedAction.tool_args`` is
     fully model-authored and attacker-influenceable, so the model's free-form
     ``case_id`` is never trusted as a write target (F07). Returns the most
@@ -399,14 +410,28 @@ async def _reserve_escalate(
     # A case already exists. Same shape as the already-acknowledged arm in the
     # caller: ok-with-note, and persist the marker so the card reads applied
     # from now on rather than re-offering a duplicate.
-    await _persist_action_executed(
-        request, inv_real_id, sequence, {**receipt, "success": True, "by": user}
-    )
-    return ExecuteActionResult(
-        status="executed",
-        title=title,
-        detail="This alert is already on a Security Onion case. soc-ai opened no second case.",
-    )
+    #
+    # The marker names the case when the ledger or the case links name it. A
+    # comment beside this escalate binds to the case of the run, and a marker
+    # with no case left that comment off for good, with the advice "Escalate
+    # the alert first" (review of the lane, defect 8). The id is read by the
+    # server for the alert of this run. It is never the model's.
+    case_id: str | None = None
+    try:
+        case_ids, _complete = await case_links.cases_of_alert(
+            request.app.state.db_sessionmaker, elastic, settings, alert_id
+        )
+        case_id = case_ids[0] if case_ids else None
+    except Exception:
+        _LOGGER.warning("case lookup failed for an alert already on a case", exc_info=True)
+    marker: dict[str, Any] = {**receipt, "success": True, "by": user}
+    named = "a Security Onion case"
+    if case_id:
+        marker["case_id"] = case_id
+        named = f"Security Onion case {case_id}"
+    detail = f"This alert is already on {named}. soc-ai opened no second case."
+    await _persist_action_executed(request, inv_real_id, sequence, {**marker, "detail": detail})
+    return ExecuteActionResult(status="executed", title=title, detail=detail)
 
 
 async def _record_escalation(
@@ -476,6 +501,760 @@ def _now_iso() -> str:
     return _iso_utc(utcnow())
 
 
+# The title of a case when the run names no rule. The override path and the
+# execute route bind the same words.
+_DEFAULT_CASE_TITLE = "soc-ai investigation"
+
+
+def _text(value: Any) -> str:
+    """A stored value as text: the stripped string, or empty for any other type."""
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _bind_case_text(
+    tool_args: dict[str, Any],
+    *,
+    inv_id: str,
+    rule_name: str | None,
+    headline: str | None,
+    rationale: Any,
+) -> None:
+    """Give an escalate the title and the description it needs.
+
+    ``escalate_to_case`` refuses a call with no title or no description, and
+    the model does not always send them. Five true positive runs on production
+    held ``"tool_args": {}`` (review 2026-11-13), so Execute failed on the one
+    action a true positive offers. The same holds for a value that is not
+    text: a ``null`` title reached ``.strip()`` inside the tool.
+
+    A field with text is kept. An empty field is bound from the run, the way
+    :func:`_override_actions` binds it: the title is the rule name, and the
+    description is the headline of the run, else the reason of this action.
+    Every source is a stored field of this investigation. No id is read from
+    ``tool_args``, so the binding gives the model no new way to choose what
+    the write reaches (F07).
+    """
+    title = _text(tool_args.get("case_title")) or _text(rule_name) or _DEFAULT_CASE_TITLE
+    description = (
+        _text(tool_args.get("case_description"))
+        or _text(headline)
+        or _text(rationale)
+        or f"soc-ai investigation {inv_id} recommends this case."
+    )
+    # Security Onion refuses a title over 100 bytes. The cut is made here too,
+    # for a bound title and for the title of the model, so the audit record
+    # holds the text that is sent.
+    tool_args["case_title"] = fit_case_title(title)
+    tool_args["case_description"] = fit_case_description(description)
+
+
+# ── The case of a promoted finding ─────────────────────────────────────────
+# A finding is no alert, and Security Onion creates a case from a title and a
+# description alone. "Escalate to case" on a finding run opens a case from the
+# stored finding. Every part of the case is a stored field of the hunt or of
+# the run. ``tool_args`` is never read: the model's alert id is the anchor
+# document, which is cited telemetry, and a model-authored list of alerts to
+# attach would be a write target the analyst did not see (F07).
+
+# The description lists at most this many cited documents.
+_CASE_DOCUMENTS_MAX = 50
+_DEFAULT_FINDING_TITLE = "Hunt finding"
+
+
+@dataclass(frozen=True)
+class _FindingCase:
+    """What the escalate of a promoted finding opens."""
+
+    title: str
+    description: str
+    # The documents the finding cites. The alerts among them can go on the case.
+    document_ids: list[str]
+    # The hosts the finding names, lowercased. An alert goes on the case only
+    # when it is on one of them.
+    hosts: frozenset[str]
+    # What the one-case guard keys on: the hunt and the finding. Not the run
+    # and not the action, so an override, a second action and a later run all
+    # meet the same record. A row that names no hunt finding keys on itself.
+    identity: str
+    hunt_id: str | None
+    ordinal: int | None
+
+
+async def _stored_finding(db: Any, inv: Investigation) -> dict[str, Any] | None:
+    """The finding this run was promoted from, or None when the hunt is gone.
+
+    The link carries no foreign key, so it can dangle, and a stored report is
+    not schema-checked.
+    """
+    if not inv.hunt_id or inv.finding_ordinal is None:
+        return None
+    hunt = await db.get(Hunt, inv.hunt_id)
+    report = hunt.report if hunt is not None and isinstance(hunt.report, dict) else {}
+    findings = report.get("findings")
+    ordinal = int(inv.finding_ordinal)
+    if not isinstance(findings, list) or not 0 <= ordinal < len(findings):
+        return None
+    finding = findings[ordinal]
+    return finding if isinstance(finding, dict) else None
+
+
+async def _finding_case(db: Any, inv: Investigation) -> _FindingCase:
+    """The case of the finding run ``inv``, built from stored fields only.
+
+    The title is the title of the finding. The description is the headline of
+    the run, then the hosts and the documents the finding cites, then the run
+    that judged it. The detail text of the finding stays out: the headline is
+    the verdict of the investigation, and the detail is the earlier claim of
+    the hunt.
+
+    With the hunt gone, the run still names its title and the documents it
+    read (``subject_json``), and the case is built from those.
+    """
+    from soc_ai.hunting.findings import (  # noqa: PLC0415 - lazy
+        DOCUMENT_ID_RE,
+        finding_document_ids,
+    )
+
+    finding = await _stored_finding(db, inv)
+    ordinal = int(inv.finding_ordinal) if inv.hunt_id and inv.finding_ordinal is not None else None
+    hosts: list[str] = []
+    if finding is not None:
+        title = _text(finding.get("title"))
+        raw_hosts = finding.get("hosts")
+        hosts = [
+            str(h).strip()
+            for h in (raw_hosts if isinstance(raw_hosts, list) else [])
+            if isinstance(h, (str, int)) and not isinstance(h, bool) and str(h).strip()
+        ]
+        documents = finding_document_ids(finding)
+    else:
+        title = ""
+        subject = inv.subject_json if isinstance(inv.subject_json, dict) else {}
+        stored = subject.get("document_ids")
+        documents = list(
+            dict.fromkeys(
+                d
+                for d in (stored if isinstance(stored, list) else [])
+                if isinstance(d, str) and DOCUMENT_ID_RE.match(d)
+            )
+        )
+    lines = [
+        _text(inv.rationale) or f"soc-ai investigation {inv.id} recommends this case.",
+        "",
+    ]
+    if hosts:
+        lines.append(f"Hosts: {', '.join(dict.fromkeys(hosts))}")
+    if documents:
+        lines.append(f"Cited documents: {', '.join(documents[:_CASE_DOCUMENTS_MAX])}")
+        if len(documents) > _CASE_DOCUMENTS_MAX:
+            lines.append(
+                f"The list holds {_CASE_DOCUMENTS_MAX} of {len(documents)} cited documents."
+            )
+    lines.append(f"Source: soc-ai investigation {inv.id} of a hunt finding.")
+    return _FindingCase(
+        title=fit_case_title(title or _text(inv.rule_name) or _DEFAULT_FINDING_TITLE),
+        description=fit_case_description("\n".join(lines)),
+        document_ids=documents,
+        hosts=frozenset(h.lower() for h in hosts),
+        identity=f"hunt:{inv.hunt_id}:{ordinal}" if ordinal is not None else f"run:{inv.id}",
+        hunt_id=inv.hunt_id if ordinal is not None else None,
+        ordinal=ordinal,
+    )
+
+
+# The most alerts one finding case attaches: the cap of the group escalate
+# (routes_alert_actions._ESCALATE_CAP). Each attach also acknowledges the
+# alert in Security Onion, so the number is a blast radius, and the hunt model
+# chose the list.
+_FINDING_ATTACH_CAP = 25
+# The fields of a cited alert that the attach plan reads.
+_PLAN_FIELDS = [
+    "event.acknowledged",
+    "event.escalated",
+    "source.ip",
+    "destination.ip",
+    "host.name",
+    "host.ip",
+]
+
+
+@dataclass(frozen=True)
+class _FindingState:
+    """What the receipts of one finding say: its case, or a press with no result."""
+
+    case_id: str | None
+    # The intent of a press that recorded no result. A case can exist.
+    open_intent: dict[str, Any] | None
+
+
+async def _finding_state(request: Request, act: _LoadedAction, case: _FindingCase) -> _FindingState:
+    """Read the one-case record of the finding, across runs and actions.
+
+    The record is the ``action_executed`` receipts that carry ``finding_case``,
+    on every run of the hunt finding and on this run. The first version read
+    the other runs only and matched the receipt to one action, so one finding
+    got a second case three ways: an override gave the action a new identity,
+    a report held two escalate actions, and a receipt write failed after the
+    case existed (review of the lane, defect 2).
+
+    A press writes an intent before it calls Security Onion and a result
+    after. An intent with no result is a press whose outcome soc-ai does not
+    know: the case can exist.
+    """
+    async with request.app.state.db_sessionmaker() as db:
+        return await _finding_receipt_state(db, act.inv_real_id, case.hunt_id, case.ordinal)
+
+
+async def _finding_receipt_state(
+    db: Any, run_id: str, hunt_id: str | None, ordinal: int | None
+) -> _FindingState:
+    """The one-case record of the finding of run ``run_id``, read on ``db``.
+
+    ``_finding_state`` reads it for a press and for the confirm. The list of
+    waiting actions reads it for a row (``finding_case_blocked``).
+    """
+    run_ids = {run_id}
+    if hunt_id is not None and ordinal is not None:
+        run_ids.update(
+            (
+                await db.scalars(
+                    select(Investigation.id).where(
+                        Investigation.hunt_id == hunt_id,
+                        Investigation.finding_ordinal == ordinal,
+                    )
+                )
+            ).all()
+        )
+    receipts = (
+        await db.scalars(
+            select(InvestigationEvent)
+            .where(
+                InvestigationEvent.investigation_id.in_(sorted(run_ids)),
+                InvestigationEvent.kind == "action_executed",
+            )
+            .order_by(InvestigationEvent.id)
+        )
+    ).all()
+    payloads = [e.payload or {} for e in receipts if (e.payload or {}).get("finding_case")]
+    case_id: str | None = None
+    settled: set[str] = set()
+    for payload in payloads:
+        if payload.get("phase") != "intent" and isinstance(payload.get("intent_id"), str):
+            settled.add(payload["intent_id"])
+        found = payload.get("case_id")
+        if payload.get("success") and isinstance(found, str) and found:
+            case_id = found
+    open_intent = next(
+        (
+            payload
+            for payload in reversed(payloads)
+            if payload.get("phase") == "intent" and payload.get("intent_id") not in settled
+        ),
+        None,
+    )
+    return _FindingState(case_id=case_id, open_intent=open_intent)
+
+
+async def finding_case_blocked(db: Any, run: Any) -> bool:
+    """True when the escalate of the finding run ``run`` waits on "Try again".
+
+    An earlier press recorded an intent and no result, and the finding is on
+    no case. The scope route then answers ``retry`` and the card offers "Try
+    again" and no Escalate. The row of the pending list reads the same record,
+    so it offers no Escalate that only returns the blocked sentence. The keys
+    are the ones ``_finding_case`` builds.
+    """
+    ordinal = int(run.finding_ordinal) if run.hunt_id and run.finding_ordinal is not None else None
+    state = await _finding_receipt_state(
+        db, run.id, run.hunt_id if ordinal is not None else None, ordinal
+    )
+    return state.case_id is None and state.open_intent is not None
+
+
+def _already_on_case_sentence(case_id: str) -> str:
+    return f"This finding is already on Security Onion case {case_id}. soc-ai opens no second case."
+
+
+def _open_intent_sentence(case: _FindingCase) -> str:
+    """A press started a case and recorded no result. Plain, with where to look."""
+    return (
+        "An earlier press started a Security Onion case for this finding, and soc-ai has "
+        "no record of the result. A case can exist. soc-ai opens no case. Look in the "
+        f'Cases page of Security Onion for the title "{case.title}".'
+    )
+
+
+@dataclass(frozen=True)
+class _AttachPlan:
+    """The cited alerts a finding case attaches, and the ones it leaves out."""
+
+    attach: list[str]
+    # Security Onion already holds a decision on the alert: acknowledged or escalated.
+    decided: int = 0
+    # The alert names none of the hosts of the finding.
+    off_host: int = 0
+    # soc-ai's ledger already has the alert on a case.
+    on_case: int = 0
+    # Past the cap.
+    over_cap: int = 0
+
+    @property
+    def skipped(self) -> int:
+        return self.decided + self.off_host + self.on_case + self.over_cap
+
+
+def _alert_hosts(source: dict[str, Any]) -> set[str]:
+    """Every host an alert document names: its endpoints and its machine."""
+    out: set[str] = set()
+    for path in ("source.ip", "destination.ip", "host.name", "host.ip"):
+        value = aq._dig(source, path)
+        for item in value if isinstance(value, list) else [value]:
+            if isinstance(item, str) and item.strip():
+                out.add(item.strip().lower())
+    return out
+
+
+async def _finding_attach_plan(request: Request, case: _FindingCase) -> _AttachPlan | None:
+    """Which cited alerts the case of a finding attaches. None: the grid did not answer.
+
+    The hunt model chose the cited documents from everything the hunt read,
+    and an attach also acknowledges the alert in Security Onion. So the plan
+    is narrow, and the card states it before the press:
+
+    * Only a document the alert feed holds. A Zeek record is cited evidence,
+      and it is named in the description.
+    * Not an alert that already carries a decision in Security Onion
+      (acknowledged or escalated), and not one soc-ai's ledger has on a case.
+    * Only an alert on a host the finding names.
+    * At most :data:`_FINDING_ATTACH_CAP`, in the order the finding cites them.
+    """
+    state = request.app.state
+    settings = state.settings
+    ids = [d for d in case.document_ids if _EVENT_ID_RE.match(d)]
+    if not ids:
+        return _AttachPlan(attach=[])
+    try:
+        async with asyncio.timeout(settings.webui_grid_timeout_s):
+            result = await state.elastic.search(
+                settings.events_index_pattern,
+                aq.feed_ids_query(settings, ids),
+                size=len(ids),
+                source=_PLAN_FIELDS,
+                # A shard that failed can hold the alert, and its decision.
+                require_complete=True,
+            )
+    except Exception:
+        _LOGGER.warning("finding case: the grid did not answer for the cited alerts", exc_info=True)
+        return None
+    sources = {str(hit.get("_id")): hit.get("_source") or {} for hit in result.hits}
+    alerts = [doc_id for doc_id in ids if doc_id in sources]
+    async with state.db_sessionmaker() as db:
+        ledger = await esc_svc.cases_for_alerts(db, alerts)
+    attach: list[str] = []
+    decided = off_host = on_case = over_cap = 0
+    for alert_id in alerts:
+        source = sources[alert_id]
+        if aq._source_acknowledged(source) or aq._source_escalated(source):
+            decided += 1
+        elif ledger.get(alert_id):
+            on_case += 1
+        elif not (_alert_hosts(source) & case.hosts):
+            off_host += 1
+        elif len(attach) >= _FINDING_ATTACH_CAP:
+            over_cap += 1
+        else:
+            attach.append(alert_id)
+    return _AttachPlan(
+        attach=attach, decided=decided, off_host=off_host, on_case=on_case, over_cap=over_cap
+    )
+
+
+def _cited_alerts(n: int) -> str:
+    """ "1 alert that the finding cites" / "2 alerts that the finding cites"."""
+    return f"{_alerts(n)} that the finding cites"
+
+
+def _finding_scope_sentence(plan: _AttachPlan) -> str:
+    """What the escalate of a finding will do, said before the press."""
+    parts = [_FINDING_CASE_SENTENCE]
+    n = len(plan.attach)
+    if n:
+        parts.append(
+            f"soc-ai attaches {_cited_alerts(n)}. Security Onion marks each attached "
+            "alert escalated and acknowledged."
+        )
+    else:
+        parts.append("soc-ai attaches no alert.")
+    if plan.skipped:
+        parts.append(f"soc-ai skips {_cited_alerts(plan.skipped)}.")
+        reasons = (
+            (plan.decided, "already has a decision", "already have a decision"),
+            (plan.on_case, "is already on a case", "are already on a case"),
+            (plan.off_host, "is not on a host of the finding", "are not on a host of the finding"),
+            (plan.over_cap, "is over the limit", "are over the limit"),
+        )
+        limit = f" of {_FINDING_ATTACH_CAP}"
+        for count, one, many in reasons:
+            if count:
+                tail = limit if "limit" in one else ""
+                parts.append(f"{_alerts(count)} {one if count == 1 else many}{tail}.")
+    return " ".join(parts)
+
+
+def _finding_case_sentence(
+    case_id: str, *, cited: int, attached: int, skipped: int, failed: int
+) -> str:
+    """What the escalate of a finding did, said after the write."""
+    parts = [f"soc-ai created case {case_id} from the finding."]
+    if cited == 0:
+        parts.append("The finding cites no Security Onion alert, so the case holds no alert.")
+    elif attached:
+        parts.append(
+            f"{_cited_alerts(attached)} {'is' if attached == 1 else 'are'} attached to it."
+        )
+    else:
+        parts.append("soc-ai attached no alert.")
+    if skipped:
+        parts.append(f"soc-ai skipped {_cited_alerts(skipped)}.")
+    if failed:
+        parts.append(f"Security Onion did not attach {_cited_alerts(failed)}.")
+    return " ".join(parts)
+
+
+# One lock for each finding, across its runs and its actions. The per-action
+# lock of the execute route cannot see a press on another action of the run.
+_FINDING_LOCKS: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+
+
+def _finding_lock(identity: str) -> asyncio.Lock:
+    lock = _FINDING_LOCKS.get(identity)
+    if lock is None:
+        lock = asyncio.Lock()
+        _FINDING_LOCKS[identity] = lock
+    return lock
+
+
+async def _record_intent(
+    request: Request, inv_real_id: str, sequence: int, payload: dict[str, Any]
+) -> bool:
+    """Record that a press is about to open a case. False when the store refused.
+
+    Not best-effort, unlike a receipt: the intent is what stops a second case
+    when the result is lost, so a press with no intent on record must not
+    reach Security Onion.
+    """
+    try:
+        async with request.app.state.db_sessionmaker() as db:
+            await inv_svc.append_events(
+                db,
+                inv_real_id,
+                [{"sequence": sequence, "kind": "action_executed", "payload": payload}],
+            )
+    except Exception:
+        _LOGGER.warning("finding case: the intent of the press was not stored", exc_info=True)
+        return False
+    return True
+
+
+async def _open_finding_case(
+    request: Request,
+    act: _LoadedAction,
+    *,
+    inv_id: str,
+    index: int,
+    retry: bool = False,
+    settings: Settings,
+    elastic: ElasticClient,
+) -> ExecuteActionResult:
+    """Open one Security Onion case from the finding of a promoted run.
+
+    MUST run under ``_action_lock(inv_id, index)``, after the action rule and
+    after the check of this action's own receipt. It takes the lock of the
+    finding itself for the whole press.
+
+    One finding gets one case. The guard reads the record of the finding
+    (:func:`_finding_state`), and the press writes to that record twice: an
+    intent before the call to Security Onion and a result after. A press that
+    finds a case opens none. A press that finds an intent with no result
+    opens none either, and says that a case can exist and where to look: the
+    result of that earlier press is unknown, and a second case is the one
+    outcome nobody can take back.
+
+    That state has one way out, ``retry``: the analyst looked at the Cases
+    page, found no case with the title, and pressed "Try again". The press
+    writes an audit record, settles the open intent as cleared and runs the
+    open once more. Without it the finding stayed blocked for good after one
+    5xx from Security Onion. A finding with a recorded case is not in that
+    state, and ``retry`` changes nothing for it.
+
+    The alerts the case attaches are the plan the card stated
+    (:func:`_finding_attach_plan`). Each is reserved in the escalation ledger
+    first, so a group escalate of the same alert opens no second case.
+    """
+    case = act.finding_case
+    if case is None:  # the action rule passed, so the run is a promoted finding
+        raise HTTPException(
+            status_code=400, detail={"reason": "not_executable", "tool": act.tool_name}
+        )
+    async with _finding_lock(case.identity):
+        return await _open_finding_case_locked(
+            request,
+            act,
+            case,
+            inv_id=inv_id,
+            index=index,
+            retry=retry,
+            settings=settings,
+            elastic=elastic,
+        )
+
+
+async def _open_finding_case_locked(
+    request: Request,
+    act: _LoadedAction,
+    case: _FindingCase,
+    *,
+    inv_id: str,
+    index: int,
+    retry: bool,
+    settings: Settings,
+    elastic: ElasticClient,
+) -> ExecuteActionResult:
+    from soc_ai.api.webui.routes_alert_actions import _reserve  # noqa: PLC0415 - circular
+
+    title = act.title
+    seq = act.next_seq
+    user = await identify_caller(request)
+    receipt: dict[str, Any] = {
+        "index": index,
+        "action_key": act.action_key,
+        "tool_name": act.tool_name,
+        "title": title,
+        "finding_case": True,
+        "finding": case.identity,
+    }
+
+    state = await _finding_state(request, act, case)
+    if state.case_id:
+        detail = _already_on_case_sentence(state.case_id)
+        await _persist_action_executed(
+            request,
+            act.inv_real_id,
+            act.next_seq,
+            {
+                **receipt,
+                "success": True,
+                "by": user,
+                "note": "already_escalated",
+                "case_id": state.case_id,
+                "detail": detail,
+            },
+        )
+        # The press wrote nothing, so the row reads it in the info tone.
+        return ExecuteActionResult(status="executed", title=title, detail=detail, count=0)
+    if state.open_intent is not None:
+        if not retry:
+            return ExecuteActionResult(
+                status="error", title=title, error=_open_intent_sentence(case)
+            )
+        cleared = await _clear_open_intent(
+            request,
+            act,
+            case,
+            state.open_intent,
+            session_id=f"action:{inv_id}",
+            sequence=seq,
+            user=user,
+            receipt=receipt,
+        )
+        if not cleared:
+            return ExecuteActionResult(
+                status="error",
+                title=title,
+                error="soc-ai could not record the retry, so it opened no case. Try again.",
+            )
+        seq += 1
+
+    plan = await _finding_attach_plan(request, case)
+    if plan is None:
+        raise HTTPException(
+            status_code=_BLOCK_STATUS[action_rules.CODE_ANCHOR_UNREAD],
+            detail={
+                "reason": action_rules.CODE_ANCHOR_UNREAD,
+                "hint": action_rules.FINDING_UNREAD,
+                "tool": act.tool_name,
+            },
+        )
+    skipped = plan.skipped
+    claimed: list[str] = []
+    if plan.attach:
+        reserved = await _reserve(request, elastic, settings, plan.attach, caller=user)
+        claimed = [a for a in plan.attach if a in set(reserved.claimed)]
+        skipped += len(plan.attach) - len(claimed)
+
+    intent_id = uuid4().hex
+    intent = {
+        **receipt,
+        "phase": "intent",
+        "intent_id": intent_id,
+        "success": False,
+        "by": user,
+        "at": _now_iso(),
+        "case_title": case.title,
+    }
+    if not await _record_intent(request, act.inv_real_id, seq, intent):
+        return ExecuteActionResult(
+            status="error",
+            title=title,
+            error="soc-ai could not record the press, so it opened no case. Try again.",
+        )
+
+    result, error = await execute_write_tool(
+        FINDING_CASE_TOOL,
+        {"case_title": case.title, "case_description": case.description, "alert_ids": claimed},
+        auth=request.app.state.auth,
+        settings=request.app.state.settings,
+        audit=request.app.state.audit,
+        session_id=f"action:{inv_id}",
+        user=user,
+    )
+    result_seq = seq + 1
+    settle = {**receipt, "intent_id": intent_id, "by": user}
+    if error is not None:
+        if _no_case_was_opened(error):
+            # Security Onion refused the create, or the call never left. The
+            # intent is settled as failed, and the next press can run.
+            await _persist_action_executed(
+                request,
+                act.inv_real_id,
+                result_seq,
+                {**settle, "phase": "failed", "success": False, "detail": error},
+            )
+            return ExecuteActionResult(status="error", title=title, error=error)
+        # The call may have reached Security Onion. The intent stays open.
+        return ExecuteActionResult(
+            status="error", title=title, error=f"{error} {_open_intent_sentence(case)}"
+        )
+    body = result if isinstance(result, dict) else {}
+    case_id = _case_id_from_result(body)
+    if not case_id:
+        # Security Onion took the create and named no case. The intent stays
+        # open: a case exists, and soc-ai cannot name it.
+        return ExecuteActionResult(
+            status="error",
+            title=title,
+            error=(
+                "Security Onion accepted the case and returned no case id. "
+                f"{_open_intent_sentence(case)}"
+            ),
+        )
+    attached = [a for a in (body.get("alerts_attached") or []) if isinstance(a, str)]
+    for alert_id in attached:
+        await _record_escalation(request, alert_id=alert_id, case_id=case_id, linked=True)
+    cited = len(plan.attach) + plan.skipped
+    detail = _finding_case_sentence(
+        case_id,
+        cited=cited,
+        attached=len(attached),
+        skipped=skipped,
+        failed=len(claimed) - len(attached),
+    )
+    await _persist_action_executed(
+        request,
+        act.inv_real_id,
+        result_seq,
+        {
+            **settle,
+            "phase": "done",
+            "success": True,
+            "detail": detail,
+            "case_id": case_id,
+            "alerts_attached": len(attached),
+            "alerts_skipped": skipped,
+        },
+    )
+    # One case was opened. The count is the write, like the escalate of an
+    # alert: a case that holds no alert is still a case.
+    return ExecuteActionResult(status="executed", title=title, detail=detail, count=1)
+
+
+async def _clear_open_intent(
+    request: Request,
+    act: _LoadedAction,
+    case: _FindingCase,
+    open_intent: dict[str, Any],
+    *,
+    session_id: str,
+    sequence: int,
+    user: str,
+    receipt: dict[str, Any],
+) -> bool:
+    """Settle an intent with no result as cleared, on the analyst's word. False: not done.
+
+    Two records, in this order, and the press goes on only when both are
+    written. The audit record says who cleared the intent of which finding,
+    so a second case is never anonymous. The store record settles the intent
+    by its id, on whichever run of the finding holds it.
+    """
+    from soc_ai.audit.logger import AuditWriteError  # noqa: PLC0415 - lazy
+
+    intent_id = open_intent.get("intent_id")
+    audit = request.app.state.audit
+    if audit is not None:
+        try:
+            await audit.log_kind(
+                session_id,
+                "tool_call",
+                {
+                    "tool": FINDING_CASE_TOOL,
+                    "phase": "retry",
+                    "finding": case.identity,
+                    "cleared_intent": intent_id,
+                    "case_title": case.title,
+                },
+                user=user,
+                approved_by=user,
+                mutating=True,
+            )
+        except AuditWriteError:
+            _LOGGER.warning("finding case: the retry was not audited", exc_info=True)
+            return False
+    return await _record_intent(
+        request,
+        act.inv_real_id,
+        sequence,
+        {
+            **receipt,
+            "phase": "cleared",
+            "intent_id": intent_id,
+            "success": False,
+            "by": user,
+            "at": _now_iso(),
+        },
+    )
+
+
+def _retry_confirm_sentence(case: _FindingCase) -> str:
+    """The confirm of "Try again": look first, then press."""
+    return (
+        "Look at the Cases page of Security Onion first. Press Try again only if no case "
+        f'has the title "{case.title}". soc-ai then opens one case and records your name.'
+    )
+
+
+def _no_case_was_opened(error: str) -> bool:
+    """Whether a failed write is KNOWN to have opened no case.
+
+    True for an audit abort, where the call never left, for an argument the
+    tool refused before any request, and for a create that Security Onion
+    answered with a 4xx. A 5xx or a transport fault can follow a create that
+    took effect, so those are not known.
+    """
+    from soc_ai.tools.escalate_to_case import refused_before_a_case  # noqa: PLC0415 - lazy
+
+    return error.startswith("aborted:") or refused_before_a_case(error)
+
+
 # Per-(inv_id, index) execution locks serialize concurrent execute-action calls
 # for the SAME advisory action (double-click, client retry, flaky-network
 # auto-retry). Without this, two concurrent escalates both pass the "already
@@ -512,11 +1291,16 @@ class _LoadedAction:
     inv_real_id: str
     alert_es_id: str | None
     rule_name: str | None
+    # The headline of the run: the one sentence the list row shows.
+    headline: str | None
     events: list[Any]
     next_seq: int
     anchors_a_hunt: bool
     # What the action rule reads about the run (:mod:`action_rules`).
     facts: action_rules.ActionFacts
+    # The case a promoted finding opens, from the stored finding. None on
+    # every other run.
+    finding_case: _FindingCase | None
     rec: dict[str, Any]
     action_key: str
     tool_name: str
@@ -557,6 +1341,13 @@ async def _load_action(request: Request, inv_id: str, index: int) -> _LoadedActi
             if alert_es_id and not inv_svc.is_hunt_subject(inv)
             else None
         )
+        finding_case = (
+            await _finding_case(db, inv) if promoted == action_rules.ANCHOR_FINDING else None
+        )
+        mark = (await authorized_svc.marks_for(db, [inv.authorization_id])).get(
+            inv.authorization_id or 0
+        )
+        campaign = (await campaign_svc.links_of(db, [inv.id])).get(inv.id)
     # The grid read waits until the store session is closed. A real alert
     # that a promotion anchors takes the write (dogfood 2026-10-21).
     anchor_status = (
@@ -578,7 +1369,10 @@ async def _load_action(request: Request, inv_id: str, index: int) -> _LoadedActi
         analyst_verdict=analyst.verdict if analyst is not None else None,
         analyst_by=analyst.resolved_by if analyst is not None else None,
         case_id=_observed_case_id(list(events)),
+        authorized=mark.label if mark is not None and mark.holds else None,
     )
+    # The campaign that holds the run. The action stays executable.
+    facts = action_rules.with_campaign(facts, campaign)
     recs = report.get("recommended_actions") or []
     if index < 0 or index >= len(recs):
         raise HTTPException(status_code=404, detail={"reason": "no_such_action"})
@@ -588,10 +1382,12 @@ async def _load_action(request: Request, inv_id: str, index: int) -> _LoadedActi
         inv_real_id=inv.id,
         alert_es_id=alert_es_id,
         rule_name=inv.rule_name,
+        headline=inv.rationale,
         events=list(events),
         next_seq=max((e.sequence for e in events), default=0) + 1,
         anchors_a_hunt=anchors_a_hunt,
         facts=facts,
+        finding_case=finding_case,
         rec=rec,
         # Idempotency identity is the action's CONTENT, not its list position: a
         # chat-resolve can replace recommended_actions and shift indexes (F04).
@@ -606,6 +1402,10 @@ class ExecuteActionIn(BaseModel):
     ``alert`` is "Acknowledge this alert only". Only an ack reads it."""
 
     scope: Literal["group", "alert"] = "group"
+    # "Try again" on the case of a finding whose earlier press recorded no
+    # result. The analyst confirmed that Security Onion holds no case with the
+    # title. Only that state reads it.
+    retry: bool = False
 
 
 @router.post(
@@ -640,9 +1440,55 @@ async def execute_action(
             inv_id=inv_id,
             index=index,
             scope=(body or ExecuteActionIn()).scope,
+            retry=(body or ExecuteActionIn()).retry,
             settings=settings,
             elastic=elastic,
         )
+
+
+def _bound_tool_args(act: _LoadedAction) -> dict[str, Any]:
+    """The arguments of the write, with its target bound on the server.
+
+    SECURITY (F07): the write TARGET is bound server-side, never taken from the
+    model. ``RecommendedAction.tool_args`` is fully model-authored (no
+    validator) and assembled from attacker-influenceable enriched-alert context,
+    so a present-but-wrong alert_id/case_id would ack/escalate/comment on a
+    DIFFERENT SO object than the one the analyst approved in this investigation.
+    """
+    tool_name = act.tool_name
+    # A stored report is not schema-checked on read. Arguments that are not an
+    # object count as no arguments.
+    stored_args = act.rec.get("tool_args")
+    tool_args = dict(stored_args) if isinstance(stored_args, dict) else {}
+    if tool_name in ("ack_alert", "escalate_to_case"):
+        # Always OVERWRITE (not default-when-missing): the target is this
+        # investigation's own alert, even when the model supplied an alert_id.
+        if not act.alert_es_id:
+            raise HTTPException(
+                status_code=400,
+                detail={"reason": "missing_alert_id", "tool": tool_name},
+            )
+        tool_args["alert_id"] = act.alert_es_id
+        if tool_name == "escalate_to_case":
+            _bind_case_text(
+                tool_args,
+                inv_id=act.inv_real_id,
+                rule_name=act.rule_name,
+                headline=act.headline,
+                rationale=act.rec.get("rationale"),
+            )
+    elif tool_name == "add_case_comment":
+        # Bind to a case THIS investigation itself opened (a prior escalate the
+        # system executed and observed), never the model's free-form case_id. No
+        # such case → refuse rather than comment on an arbitrary/hostile case id.
+        bound_case_id = _observed_case_id(act.events)
+        if not bound_case_id:
+            raise HTTPException(
+                status_code=400,
+                detail={"reason": "no_case_for_comment", "tool": tool_name},
+            )
+        tool_args["case_id"] = bound_case_id
+    return tool_args
 
 
 def _refuse_a_replay(inv: Investigation) -> None:
@@ -659,7 +1505,7 @@ def _refuse_a_replay(inv: Investigation) -> None:
             detail={
                 "reason": "backtest_replay",
                 "hint": (
-                    "This run is a backtest replay. soc-ai executes no action for a "
+                    "This investigation is a backtest replay. soc-ai executes no action for a "
                     "replay. Open the live investigation of the alert to act on it."
                 ),
             },
@@ -686,17 +1532,18 @@ async def _refuse_a_superseded_run(db: Any, inv: Investigation) -> None:
             detail={
                 "reason": "superseded",
                 "invId": newer,
-                "hint": f"Investigation {newer} replaced this run. Act on that run.",
+                "hint": f"Investigation {newer} replaced this one. Act on that investigation.",
             },
         )
 
 
-async def _execute_action_locked(  # noqa: PLR0915 — linear single-analyst write path
+async def _execute_action_locked(
     request: Request,
     *,
     inv_id: str,
     index: int,
     scope: str = "group",
+    retry: bool = False,
     settings: Settings,
     elastic: ElasticClient,
 ) -> ExecuteActionResult:
@@ -724,10 +1571,10 @@ async def _execute_action_locked(  # noqa: PLR0915 — linear single-analyst wri
     # an analyst verdict. The demo guard refuses every write before this.
     block = action_rules.action_block(act.facts, tool_name)
     if block is not None:
-        raise HTTPException(
-            status_code=_BLOCK_STATUS.get(block.code, 400),
-            detail={"reason": block.code, "hint": block.reason, "tool": tool_name},
-        )
+        refusal: dict[str, Any] = {"reason": block.code, "hint": block.reason, "tool": tool_name}
+        if block.code == action_rules.CODE_CAMPAIGN:
+            refusal["href"] = f"/campaigns/{act.facts.campaign_id}"
+        raise HTTPException(status_code=_BLOCK_STATUS.get(block.code, 400), detail=refusal)
 
     # "Acknowledge this alert only" acts on the grid state, not on the record:
     # an earlier group ack can leave this alert open (dogfood 2026-10-06, S3),
@@ -744,32 +1591,20 @@ async def _execute_action_locked(  # noqa: PLR0915 — linear single-analyst wri
             detail="Already executed. soc-ai did not repeat it.",
         )
 
-    tool_args = dict(act.rec.get("tool_args") or {})
-    # SECURITY (F07): the write TARGET is bound server-side, never taken from the
-    # model. ``RecommendedAction.tool_args`` is fully model-authored (no
-    # validator) and assembled from attacker-influenceable enriched-alert context,
-    # so a present-but-wrong alert_id/case_id would ack/escalate/comment on a
-    # DIFFERENT SO object than the one the analyst approved in this investigation.
-    if tool_name in ("ack_alert", "escalate_to_case"):
-        # Always OVERWRITE (not default-when-missing): the target is this
-        # investigation's own alert, even when the model supplied an alert_id.
-        if not alert_es_id:
-            raise HTTPException(
-                status_code=400,
-                detail={"reason": "missing_alert_id", "tool": tool_name},
-            )
-        tool_args["alert_id"] = alert_es_id
-    elif tool_name == "add_case_comment":
-        # Bind to a case THIS investigation itself opened (a prior escalate the
-        # system executed and observed), never the model's free-form case_id. No
-        # such case → refuse rather than comment on an arbitrary/hostile case id.
-        bound_case_id = _observed_case_id(events)
-        if not bound_case_id:
-            raise HTTPException(
-                status_code=400,
-                detail={"reason": "no_case_for_comment", "tool": tool_name},
-            )
-        tool_args["case_id"] = bound_case_id
+    if action_rules.opens_finding_case(act.facts, tool_name):
+        # A promoted finding: the case comes from the stored finding, and no
+        # argument of the model is read.
+        return await _open_finding_case(
+            request,
+            act,
+            inv_id=inv_id,
+            index=index,
+            retry=retry,
+            settings=settings,
+            elastic=elastic,
+        )
+
+    tool_args = _bound_tool_args(act)
 
     user = await identify_caller(request)
     receipt: dict[str, Any] = {
@@ -919,7 +1754,8 @@ class ActionScopeOut(BaseModel):
     """What one recommended action will write, stated before the analyst confirms.
 
     ``scope`` is "group" for a rule-wide ack, "alert" for a write to the one
-    alert of this run, and "case" for a comment on the case this run opened.
+    alert of this run, "finding" for the case of a promoted finding, and
+    "case" for a comment on the case this run opened.
     ``count`` and ``hosts`` are None when the grid did not answer.
     """
 
@@ -935,12 +1771,61 @@ class ActionScopeOut(BaseModel):
     # did not confirm the list.
     cases: list[_timeline.CaseRefOut] = []
     casesComplete: bool = False
+    # The case of a finding only: an earlier press recorded no result, so a
+    # press opens no case. The card then offers "Try again" behind a confirm
+    # that reads ``retrySentence``.
+    retry: bool = False
+    retrySentence: str | None = None
 
 
 _ALERT_ONLY_ACK = "Acknowledge this alert in Security Onion."
 _ESCALATE_SENTENCE = "Open one Security Onion case for this alert."
+_FINDING_CASE_SENTENCE = "Open one Security Onion case for this finding."
 _COMMENT_SENTENCE = "Add a comment to the Security Onion case this investigation opened."
 _NO_SECOND_CASE = "soc-ai opens no second case."
+
+
+async def _finding_scope(
+    request: Request, act: _LoadedAction, case: _FindingCase
+) -> ActionScopeOut:
+    """What the escalate of a finding will write: one case, and the alerts it attaches.
+
+    ``count`` is the alerts the press attaches and marks, and ``held`` is the
+    cited alerts it skips. The press reads the same record and the same plan.
+    The grid can move between the two reads, and the receipt then states the
+    real counts.
+    """
+    state = await _finding_state(request, act, case)
+    if state.case_id:
+        return ActionScopeOut(
+            tool=act.tool_name,
+            scope="finding",
+            count=0,
+            sentence=_already_on_case_sentence(state.case_id),
+        )
+    if state.open_intent is not None:
+        return ActionScopeOut(
+            tool=act.tool_name,
+            scope="finding",
+            count=0,
+            sentence=_open_intent_sentence(case),
+            retry=True,
+            retrySentence=_retry_confirm_sentence(case),
+        )
+    plan = await _finding_attach_plan(request, case)
+    if plan is None:
+        return ActionScopeOut(
+            tool=act.tool_name,
+            scope="finding",
+            sentence=f"{_FINDING_CASE_SENTENCE} {action_rules.FINDING_UNREAD}",
+        )
+    return ActionScopeOut(
+        tool=act.tool_name,
+        scope="finding",
+        count=len(plan.attach),
+        held=plan.skipped,
+        sentence=_finding_scope_sentence(plan),
+    )
 
 
 def cases_sentence(case_ids: list[str], *, complete: bool) -> str:
@@ -974,6 +1859,8 @@ async def action_scope(
     move between the two reads. The receipt then states the real count.
     """
     act = await _load_action(request, inv_id, index)
+    if action_rules.opens_finding_case(act.facts, act.tool_name) and act.finding_case is not None:
+        return await _finding_scope(request, act, act.finding_case)
     if act.tool_name == "escalate_to_case":
         # The cases the alert is already on, from the sources the execute
         # route asks before it opens a case. A promotion names cited
@@ -1069,20 +1956,49 @@ async def _record_dismissal(
                 db,
                 act.inv_real_id,
                 [
-                    {
-                        "sequence": act.next_seq,
-                        "kind": kind,
-                        "payload": {
-                            "index": index,
-                            "action_key": act.action_key,
-                            "tool_name": act.tool_name,
-                            "by": user,
-                            "at": at,
-                        },
-                    }
+                    dismissal_event(
+                        sequence=act.next_seq,
+                        kind=kind,
+                        index=index,
+                        action_key=act.action_key,
+                        tool_name=act.tool_name,
+                        by=user,
+                        at=at,
+                    )
                 ],
             )
+    # A dismissed action changes what waits in a campaign.
+    campaign_refresh.request_refresh()
     return ActionDismissOut(dismissed=kind == "action_dismissed", by=user, at=at)
+
+
+def dismissal_event(
+    *,
+    sequence: int,
+    kind: str,
+    index: int,
+    action_key: str,
+    tool_name: str,
+    by: str,
+    at: str,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The event of a dismissal, ``action_dismissed``, or of its undo, ``action_restored``.
+
+    The dismiss route and the clear of Needs you
+    (:mod:`soc_ai.webui.needs_you_clear`) write this one shape, so the action
+    card reads both the same. ``extra`` adds keys to the payload: the clear
+    adds its reason and its id.
+    """
+    payload: dict[str, Any] = {
+        "index": index,
+        "action_key": action_key,
+        "tool_name": tool_name,
+        "by": by,
+        "at": at,
+    }
+    payload.update(extra or {})
+    return {"sequence": sequence, "kind": kind, "payload": payload}
 
 
 @router.post(
@@ -1132,13 +2048,20 @@ async def resolve_investigation(request: Request, inv_id: str, body: ResolveIn) 
         verdict = proposal.get("verdict")
         if not verdict:
             raise HTTPException(status_code=400, detail={"reason": "malformed_proposal"})
+        # A proposal is model text too. A comment it recommends needs a case
+        # that this investigation opened, like a comment in a report.
+        actions = proposal.get("recommended_actions")
+        if isinstance(actions, list):
+            got = await inv_svc.get_with_events(db, inv_id)
+            opened = _observed_case_id(list(got[1])) if got is not None else None
+            actions, _dropped = drop_case_comments_without_a_case(actions, case_open=bool(opened))
         updated = await inv_svc.resolve(
             db,
             inv_id,
             verdict=verdict,
             confidence=proposal.get("confidence"),
             rationale=proposal.get("rationale"),
-            recommended_actions=proposal.get("recommended_actions"),
+            recommended_actions=actions,
             resolved_by=resolved_by,
             source_message_id=body.message_id,
         )
@@ -1178,8 +2101,8 @@ def _override_actions(
             {
                 "tool_name": "escalate_to_case",
                 "tool_args": {
-                    "case_title": rule_name or "soc-ai investigation",
-                    "case_description": headline,
+                    "case_title": fit_case_title(rule_name or _DEFAULT_CASE_TITLE),
+                    "case_description": fit_case_description(headline),
                 },
                 "rationale": (
                     f"{user} set the verdict to true positive. "
@@ -1246,7 +2169,7 @@ async def override_verdict(
                 detail={
                     "reason": "superseded",
                     "invId": newer,
-                    "hint": f"Investigation {newer} replaced this run. Override that run.",
+                    "hint": f"Investigation {newer} replaced this one. Override that one.",
                 },
             )
         headline = _override_headline(resolved_by, body.rationale)

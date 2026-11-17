@@ -1,4 +1,4 @@
-import { AlertTriangle, ArrowUpRight, Check, ChevronRight, Filter, Sparkles, X, Zap } from 'lucide-react';
+import { AlertTriangle, ArrowUpRight, Check, ChevronRight, Filter, ShieldAlert, Sparkles, X, Zap } from 'lucide-react';
 import { KeyHelpOverlay } from '../components/KeyHelpOverlay';
 import { chipProps, confidenceText, verdictLabel, verdictMeta } from '../lib/labels';
 import { type Dispatch, type RefObject, type SetStateAction, useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -6,7 +6,7 @@ import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { KindBadge, PipelineErrorChip, SeverityTag, VerdictPill } from '../components/Badges';
 import { FlowBadge } from '../components/FlowBadge';
 import { GridGapStrip } from '../components/GridGapStrip';
-import { RowTags, TAGS_COLUMN, TagsHeader } from '../components/RowTags';
+import { RowTags, TagsHeader } from '../components/RowTags';
 import { SameFlowChip } from '../components/SameFlowChip';
 import { Checkbox } from '../components/Controls';
 import { ListToolbar } from '../components/ListToolbar';
@@ -57,6 +57,7 @@ import { type ToastTone, useToast } from '../lib/toast';
 import { useAsync } from '../lib/useAsync';
 import { isEditableTarget, nextFocusIndex, resolveTriageKey } from '../lib/triageKeys';
 import { type SortDir, useSort } from '../lib/useSort';
+import { WIDE_TABLE_QUERY, useMediaQuery } from '../lib/useMediaQuery';
 import type {
   AlertEvent,
   AlertGroup,
@@ -76,6 +77,12 @@ type ViewId = 'mine' | 'inreview' | 'critical' | 'decision' | 'all';
 type Density = 'comfortable' | 'compact';
 type SortKey = 'count' | 'detection' | 'sev' | 'verdict' | 'conf' | 'latest';
 
+/** The tags column of an alert group. A group row holds the type chip and the
+ *  handled counts, never the synthetic mark of the shared column, so the
+ *  column is narrower. The widest type chip is 65 px. A second chip wraps
+ *  under it in the cell. */
+const ALERT_TAGS_COLUMN = '100px';
+
 // checkbox  DETECTION (name + flow, subtle count)  sev  verdict  conf  owner  last-seen  actions
 // The GROUP row is intentionally LEAN — the per-alert detail (each event's own
 // timestamp + the time of the investigation it ran/inherited from) lives on the
@@ -90,9 +97,22 @@ type SortKey = 'count' | 'detection' | 'sev' | 'verdict' | 'conf' | 'latest';
 // 2026-10-07). The name wraps whole, so its floor is lower than when it held
 // the chips. The table fits a 1280px window and scrolls sideways under the sum
 // of the floors.
-const GRID = `28px minmax(160px,1fr) 96px 128px 44px 40px 84px ${TAGS_COLUMN} 166px`;
+// The detection column is the one track that takes the free width. At a 1440
+// px window it was 344 px, a 60-character rule name wrapped to two lines, the
+// flow wrapped to three, and the Tags and actions columns held a blank band
+// (polish review 2026-11-13). Each fixed column now fits its content, measured
+// in Chromium: Severity 76, Last seen 72 with its sort caret, Tags 100 for the
+// type chip (the handled counts wrap under it) and 150 for "Tune rule" with
+// "Open report". The detection column is 452 px at 1440 px.
+const GRID = `28px minmax(160px,1fr) 76px 128px 44px 40px 72px ${ALERT_TAGS_COLUMN} 150px`;
 /** The sum of the column floors, the gaps and the row padding. */
-const GRID_MIN_WIDTH = 998;
+const GRID_MIN_WIDTH = 890;
+// Under 1280 px the row folds the Owner and the Tags columns into the
+// detection cell. At 1100 px the row was 998 px wide in an 866 px card, the
+// actions sat off the right edge and a rule name wrapped to six lines (prod
+// review 2026-11-12, ui-core 12). The narrow row needs 756 px.
+const GRID_NARROW = '28px minmax(160px,1fr) 88px 128px 44px 72px 160px';
+const GRID_NARROW_MIN_WIDTH = 756;
 
 // Per-alert (expanded) event row: checkbox | alert time (abs+rel) | sev |
 // src→dst:port | host (+ its address) | verdict provenance (+ when) |
@@ -157,18 +177,30 @@ const SEV_RANK: Record<string, number> = { critical: 4, high: 3, medium: 2, low:
 // already uses for a null. Ranking them 0 would have sunk them below Low on a
 // descending sort, which is where they were hiding in the first place.
 const isRanked = (sev: string): boolean => sev in SEV_RANK;
-// inconclusive sorts with needs_more_info: both are terminal non-committed
-// verdicts that still need an analyst decision.
-const VERDICT_RANK: Record<string, number> = { true_positive: 6, false_positive: 5, needs_more_info: 4, inconclusive: 3, untriaged: 1 };
+// The verdict order of the list, most urgent first: a true positive, then the
+// verdicts that wait on the analyst (needs more info, then untriaged), then
+// inconclusive, then a false positive. The list sorted by rule severity, and a
+// High false positive sat above a Medium true positive of 306 events (prod
+// review 2026-11-12, ui-core 8).
+const VERDICT_RANK: Record<string, number> = { true_positive: 6, needs_more_info: 5, untriaged: 3, inconclusive: 2, false_positive: 1 };
 // A row that is actively being investigated has no verdict yet (still "untriaged"
 // in the DB) but should not interleave with genuinely-untriaged rows when sorting
 // by verdict — rank it just above untriaged so triaging rows cluster together.
-const TRIAGING_RANK = 2;
+const TRIAGING_RANK = 4;
 // The verdict sort reads the verdict the group counts under, so a true
 // positive that later false positives followed sorts with the true positives.
 // Runs inside the page window decide that verdict (owner rule, 2026-10-14).
 const verdictRank = (g: AlertGroup): number =>
   g.triaging ? TRIAGING_RANK : VERDICT_RANK[groupOutcome(g) ?? g.verdict] ?? 0;
+
+/** Inside one verdict: the most severe first, then the newest. The order
+ *  holds in both directions of the verdict sort. */
+function verdictTieBreak(a: AlertGroup, b: AlertGroup): number {
+  const sa = isRanked(a.sev) ? SEV_RANK[a.sev] : 0;
+  const sb = isRanked(b.sev) ? SEV_RANK[b.sev] : 0;
+  if (sa !== sb) return sb - sa;
+  return (b.latestTs ?? '').localeCompare(a.latestTs ?? '');
+}
 
 // ---- deep-link seeding ------------------------------------------------------
 // Allow-lists for the URL-seeded filters. A value outside its set is DROPPED,
@@ -279,7 +311,17 @@ function seedFromLink(params: URLSearchParams): {
 }
 
 const SORT_KEYS = new Set<SortKey>(['count', 'detection', 'sev', 'verdict', 'conf', 'latest']);
-const DEFAULT_SORT: { key: SortKey; dir: SortDir } = { key: 'sev', dir: 'desc' };
+/** Verdict first, then severity, then the newest (see verdictTieBreak). */
+const DEFAULT_SORT: { key: SortKey; dir: SortDir } = { key: 'verdict', dir: 'desc' };
+/** The words of the sort menu. The control showed the internal key, "sev". */
+const SORT_LABELS: Record<SortKey, string> = {
+  verdict: 'Verdict',
+  sev: 'Severity',
+  latest: 'Last seen',
+  count: 'Count',
+  conf: 'Confidence',
+  detection: 'Detection',
+};
 
 /** `?sort=latest:asc`. Anything else is ignored and the default applies. */
 function sortFromLink(raw: string | null): { key: SortKey; dir: SortDir } | null {
@@ -599,7 +641,7 @@ function rowPill(g: AlertGroup): RowPill {
       when,
       title:
         'No investigation of this detection ran in this window. The verdict comes from the newest ' +
-        `earlier run${when ? `, ${when}` : ''}. Open the investigation.`,
+        `earlier investigation${when ? `, ${when}` : ''}. Open the investigation.`,
     };
   }
   return {
@@ -608,13 +650,33 @@ function rowPill(g: AlertGroup): RowPill {
     invId: o.invId,
     inherited: false,
     when: null,
-    title: 'The worst verdict among the runs in this window. Open the investigation.',
+    title: 'The worst verdict among the investigations in this window. Open the investigation.',
   };
 }
 
 /** The confidence column of a row: the confidence of the verdict on the pill. */
 function rowConf(g: AlertGroup): number | null {
   return g.fallback ? g.conf : rowPill(g).conf;
+}
+
+/** The reason line of a row: the headline of the run behind the verdict the
+ *  group counts under. The row showed a verdict chip and no reason, and the
+ *  analyst opened each report to learn why (prod review 2026-11-12, ui-core
+ *  8). null for a running, untriaged or pipeline-error row, and on an older
+ *  server that sends no headline. */
+export function rowReason(g: AlertGroup): string | null {
+  if (g.triaging) return null;
+  const o = outcomeOf(g);
+  if (!o.verdict || o.verdict === 'untriaged' || !o.invId) return null;
+  const text =
+    o.invId === g.windowInvId ? g.windowHeadline : o.invId === g.invId ? g.headline : null;
+  return text?.trim() || null;
+}
+
+/** True when the group counts under a true positive. The row then carries a
+ *  shape mark, so the row does not depend on the red of the pill alone. */
+export function isThreatRow(g: AlertGroup): boolean {
+  return !g.triaging && groupOutcome(g) === 'true_positive';
 }
 
 /** The window verdict of a group as a chip that opens its run, when the pill
@@ -657,8 +719,9 @@ function VerdictMix({
       )}
       {line && (
         <span
-          className="break-all font-mono text-[10.5px] text-faint"
-          title="The verdict of each alert of this group with a run in this window."
+          data-testid="verdict-mix-line"
+          className="min-w-0 break-words font-mono text-[10.5px] text-faint"
+          title="The verdict of each alert of this group with an investigation in this window."
         >
           {line}
         </span>
@@ -682,7 +745,7 @@ export function analystHint(
   const word = verdictLabel(g.analystVerdict).toLowerCase();
   return {
     text: `· analyst: ${word}`,
-    title: `${g.analystBy || 'An analyst'} set the verdict of this alert to ${word} on another run. Open that run.`,
+    title: `${g.analystBy || 'An analyst'} set the verdict of this alert to ${word} on another investigation. Open that investigation.`,
     invId: g.analystInvId,
   };
 }
@@ -694,7 +757,7 @@ function LastRetryHint({ attempt }: { attempt: NonNullable<AlertGroup['lastAttem
   const outcome = attempt.status === 'fallback' ? 'failed with a pipeline fallback' : `ended in ${attempt.status}`;
   return (
     <span
-      title={`The last re-run of this detection ${outcome} ${attempt.ago} ago. The standing verdict comes from an earlier run.`}
+      title={`The newest investigation of this detection ${outcome} ${attempt.ago} ago. The standing verdict comes from an earlier investigation.`}
       className="flex min-w-0 items-center flex-wrap font-mono text-[10.5px] font-semibold text-danger"
     >
       <span className="break-words">· last retry {label} {attempt.ago} ago</span>
@@ -744,6 +807,7 @@ function cmpGroups(a: AlertGroup, b: AlertGroup, key: SortKey, dir: SortDir): nu
       break;
     case 'verdict':
       result = verdictRank(a) - verdictRank(b);
+      if (result === 0) return verdictTieBreak(a, b);
       break;
     case 'conf': {
       // The confidence on screen, the one of the verdict on the pill. null
@@ -777,7 +841,11 @@ function matchView(g: AlertGroup, view: ViewId, me: string): boolean {
     case 'decision': {
       // Non-committed verdicts: NMI + inconclusive (terminal hedges) + untriaged,
       // by the verdict the group counts under in this window. A pipeline error
-      // counts under no verdict, and it still waits on the analyst.
+      // counts under no verdict, and it still waits on the analyst. A group
+      // with a recommended action that waits for a person is a decision too:
+      // the view left out nine true positives with a waiting Escalate (prod
+      // review 2026-11-12, ui-core 8).
+      if ((g.waitingActions ?? 0) > 0) return true;
       const v = groupOutcome(g);
       return v === null || v === 'needs_more_info' || v === 'inconclusive' || v === 'untriaged';
     }
@@ -836,35 +904,17 @@ function EventRow({ ev, g, selEvents, setSelEvents, navigate, openDrawer, huntEv
           The backend sends BARE endpoints (the pivot value); the
           destination port renders exactly once here, hugging the
           dst (inside the same span group, outside the flex gap). */}
-      <div className="flex min-w-0 items-center gap-1.5 flex-wrap">
-        {srcPivot ? (
-          <span
-            className="cursor-pointer text-mono-green hover:underline"
-            onClick={() => navigate(`/entity/${encodeURIComponent(srcPivot)}`)}
-            title={`Pivot to ${srcPivot}`}
-          >
-            {ev.src}
-          </span>
-        ) : (
-          <span className="text-mono-green">{ev.src}</span>
-        )}
-        <span className="text-ghost">→</span>
-        <span className="flex min-w-0 items-center flex-wrap">
-          {dstPivot ? (
-            <span
-              className="cursor-pointer break-words text-mono-amber hover:underline"
-              onClick={() => navigate(`/entity/${encodeURIComponent(dstPivot)}`)}
-              title={`Pivot to ${dstPivot}`}
-            >
-              {ev.dst}
-            </span>
-          ) : (
-            <span className="text-mono-amber">{ev.dst}</span>
-          )}
-          {ev.port != null && (
-            <span className="text-faint">:{ev.port}</span>
-          )}
-        </span>
+      {/* The same component as the group row, so the two rows give the
+          source and the destination the same colour (ui-core 11). */}
+      <div className="flex min-w-0 items-center">
+        <FlowBadge
+          src={ev.src}
+          dst={ev.dst}
+          port={ev.port}
+          className="text-[11.5px]"
+          onPivotSrc={srcPivot ? () => navigate(`/entity/${encodeURIComponent(srcPivot)}`) : undefined}
+          onPivotDst={dstPivot ? () => navigate(`/entity/${encodeURIComponent(dstPivot)}`) : undefined}
+        />
       </div>
       {/* The machine the detection fired ON: name, and beneath it
           the endpoint agent's own address when the backend could
@@ -1268,6 +1318,10 @@ export function Alerts() {
   const selectedRef = useRef(0);
   const [ackingEvents, setAckingEvents] = useState(false);
   const [density, setDensity] = useState<Density>('comfortable');
+  // Under 1280 px the row folds Owner and Tags into the detection cell.
+  const wideTable = useMediaQuery(WIDE_TABLE_QUERY);
+  const grid = wideTable ? GRID : GRID_NARROW;
+  const gridMinWidth = wideTable ? GRID_MIN_WIDTH : GRID_NARROW_MIN_WIDTH;
 
   // ---- keyboard-first triage (E2.5) --------------------------------------
   // Index of the keyboard-focused group row within the visible list; -1 = none.
@@ -1295,7 +1349,7 @@ export function Alerts() {
     [],
   );
   // Shared sort mechanics; clicking a new column here starts it descending.
-  const { sort, toggleSort, caret, headerCls: hdrCls } = useSort<SortKey>(
+  const { sort, setSort, toggleSort, caret, headerCls: hdrCls } = useSort<SortKey>(
     seed.sort ?? DEFAULT_SORT,
     'desc',
   );
@@ -2658,8 +2712,33 @@ export function Alerts() {
                 <svg width={15} height={15} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round"><path d="M4 5h16M4 9h16M4 13h16M4 17h16M4 21h16" /></svg>
               </button>
             </div>
+            {/* A real control. The line read "Sort sev ↓", the internal key
+                with no way to change it (prod review 2026-11-12, ui-core 11). */}
             <div className="flex items-center gap-1.5 text-[12.5px] text-dim">
-              Sort <span className="font-mono font-semibold text-text">{sort.key} {sort.dir === 'asc' ? '↑' : '↓'}</span>
+              <label htmlFor="alerts-sort" className="flex-none">Sort</label>
+              <select
+                id="alerts-sort"
+                data-testid="alerts-sort"
+                value={sort.key}
+                onChange={(e) => setSort({ key: e.target.value as SortKey, dir: 'desc' })}
+                className="rounded-control border border-border-2 bg-surface-1 px-1.5 py-1 text-[12.5px] font-semibold text-text"
+              >
+                {(Object.keys(SORT_LABELS) as SortKey[]).map((k) => (
+                  <option key={k} value={k}>
+                    {SORT_LABELS[k]}
+                  </option>
+                ))}
+              </select>
+              <button
+                type="button"
+                data-testid="alerts-sort-dir"
+                onClick={() => setSort({ key: sort.key, dir: sort.dir === 'asc' ? 'desc' : 'asc' })}
+                aria-label={sort.dir === 'asc' ? 'Sort ascending. Select to sort descending.' : 'Sort descending. Select to sort ascending.'}
+                title={sort.dir === 'asc' ? 'Ascending' : 'Descending'}
+                className="flex h-[26px] w-[26px] items-center justify-center rounded-control border border-border-2 font-mono text-text hover:border-accent"
+              >
+                {sort.dir === 'asc' ? '↑' : '↓'}
+              </button>
             </div>
           </>
         }
@@ -2971,7 +3050,7 @@ export function Alerts() {
         {/* header */}
         <div
           className="grid items-center gap-2 border-b border-border bg-surface-2 px-3.5 py-[9px] text-[10.5px] font-semibold uppercase tracking-[.06em] text-faint"
-          style={{ gridTemplateColumns: GRID, minWidth: GRID_MIN_WIDTH }}
+          style={{ gridTemplateColumns: grid, minWidth: gridMinWidth }}
         >
           <div className="flex items-center">
             <Checkbox checked={allSelected} onClick={toggleSelectAll} title="Select all" aria-label="Select all detections" />
@@ -2988,11 +3067,11 @@ export function Alerts() {
           <div className={`text-right ${hdrCls('conf')}`} onClick={() => toggleSort('conf')}>
             Conf{caret('conf')}
           </div>
-          <div>Owner</div>
+          {wideTable && <div>Owner</div>}
           <div className={`text-right ${hdrCls('latest')}`} onClick={() => toggleSort('latest')}>
             Last seen{caret('latest')}
           </div>
-          <TagsHeader />
+          {wideTable && <TagsHeader />}
           <div />
         </div>
 
@@ -3081,6 +3160,94 @@ export function Alerts() {
           const owner = ownerOf(g);
           const seld = sel.isSelected(gk);
           const kbFocused = rowIdx === focusedIndex;
+          const threat = isThreatRow(g);
+          const reason = rowReason(g);
+          const countChip =
+            g.count > 1 ? (
+              <span
+                className="ml-0.5 whitespace-nowrap font-mono text-[10.5px] font-normal text-faint"
+                title={`This detection fired ${g.count.toLocaleString()} times in the window. Expand the row to see each event.`}
+              >
+                ×{g.count.toLocaleString()}
+              </span>
+            ) : null;
+          const ownerCell = (
+            <div className="flex items-center">
+              {ownerPending[gk] ? (
+                <span
+                  role="status"
+                  aria-label={owner ? `Releasing ${g.name}` : `Assigning ${g.name}`}
+                  className="flex h-[25px] w-[25px] items-center justify-center"
+                >
+                  <Spinner size={13} />
+                </span>
+              ) : owner ? (
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    release(g);
+                  }}
+                  title={`Assigned to ${owner}. Select to release it.`}
+                  aria-label={`Release ${g.name}`}
+                  className="flex h-[25px] w-[25px] items-center justify-center rounded-full border border-border-strong bg-[#1a2330] text-[9.5px] font-bold text-[#b9c2cf] hover:border-danger hover:text-danger"
+                >
+                  {toInitials(owner)}
+                </button>
+              ) : (
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    assignToMe(g);
+                  }}
+                  title="Assign to me"
+                  aria-label={`Assign ${g.name} to me`}
+                  className="flex h-[25px] w-[25px] items-center justify-center rounded-full border-[1.5px] border-dashed border-border-strong text-[14px] leading-none text-faint hover:border-accent hover:text-accent"
+                >
+                  +
+                </button>
+              )}
+            </div>
+          );
+          // The tags, in the one order of every list: the type, then the
+          // handled counts. An unknown count draws one "uncounted" chip with
+          // the reason in its tooltip. A narrow row folds the owner and the
+          // tags into the detection cell (ui-core 12).
+          const tagsCell = (
+            <RowTags
+              testId={`alert-tags-${g.id}`}
+              kind={g.kind}
+              campaign={g.campaign}
+              campaignTestId={`alert-campaign-${g.id}`}
+              counts={
+                <>
+                  <HandledChip
+                    count={g.ackedCount}
+                    icon={<Check size={9} strokeWidth={2.5} />}
+                    colour={{ borderColor: 'rgba(34,197,94,.35)', background: 'rgba(34,197,94,.08)', color: '#4ade80' }}
+                    known={(n) => `${n} acknowledged`}
+                  />
+                  <HandledChip
+                    count={g.escalatedCount}
+                    icon={<ArrowUpRight size={9} strokeWidth={2.5} />}
+                    colour={{ borderColor: 'rgba(251,146,60,.35)', background: 'rgba(251,146,60,.08)', color: '#fb923c' }}
+                    // "1 escalated." read as a sentence with no noun (V3).
+                    known={(n) => `${alertsAre(n)} on a case`}
+                    cases={g.cases}
+                  />
+                  {(g.ackedCount === null || g.escalatedCount === null) && (
+                    <span
+                      data-testid="counts-unknown"
+                      title={COUNTS_UNKNOWN}
+                      className="inline-flex flex-shrink-0 cursor-help items-center rounded-chip border px-[5px] py-[2px] text-[10px] font-semibold"
+                      style={{ borderColor: 'rgba(148,163,184,.32)', background: 'rgba(148,163,184,.08)', color: '#94a3b8' }}
+                    >
+                      uncounted
+                    </span>
+                  )}
+                </>
+              }
+            />
+          );
           return (
             <div
               key={gk}
@@ -3093,11 +3260,18 @@ export function Alerts() {
                 onClick={() => toggleExpand(g)}
                 // The tour anchors of a row sit on the first row only.
                 data-tour={rowIdx === 0 ? 'alerts-row' : undefined}
+                data-testid={`alert-row-${g.id}`}
+                data-threat={threat ? 'true' : undefined}
                 className={`relative grid cursor-pointer items-center gap-2 border-b border-border-faint hover:bg-surface-hover${
                   kbFocused ? ' bg-surface-hover ring-1 ring-inset ring-accent' : ''
                 }`}
-                style={{ gridTemplateColumns: GRID, minWidth: GRID_MIN_WIDTH, padding: rowPad }}
+                style={{ gridTemplateColumns: grid, minWidth: gridMinWidth, padding: rowPad }}
               >
+                {/* A true positive row: a bar at the left edge. The shield mark
+                    beside the name carries the same fact in a shape. */}
+                {threat && !kbFocused && (
+                  <span className="pointer-events-none absolute inset-y-0 left-0 w-[3px] bg-danger" aria-hidden="true" />
+                )}
                 {/* keyboard-focus accent bar (E2.5) */}
                 {kbFocused && (
                   <span className="pointer-events-none absolute inset-y-0 left-0 w-[3px] bg-accent" aria-hidden="true" />
@@ -3140,17 +3314,45 @@ export function Alerts() {
                     <ChevronRight size={13} />
                   </span>
                   <div className="flex min-w-0 flex-1 flex-col gap-px">
-                    <div className="min-w-0 whitespace-normal break-words text-[13.5px] font-medium leading-[1.4]">
-                      <span data-testid="alert-name">{g.name}</span>
-                      {g.count > 1 && (
-                        <span
-                          className="ml-1.5 whitespace-nowrap font-mono text-[10.5px] font-normal text-faint"
-                          title={`This detection fired ${g.count.toLocaleString()} times in the window. Expand the row to see each event.`}
-                        >
-                          ×{g.count.toLocaleString()}
-                        </span>
+                    {/* The whole name shows and wraps. A two-line clip cut a
+                        name mid-word at 1100 px (owner, 2026-10-07: a cut
+                        text shows whole and wraps). A narrow row moves the
+                        count to the folded line. */}
+                    <div
+                      data-testid="alert-name-box"
+                      className={`min-w-0 whitespace-normal break-words text-[13.5px] leading-[1.4] ${
+                        threat ? 'font-semibold' : 'font-medium'
+                      }`}
+                    >
+                      {threat && (
+                        <ShieldAlert
+                          size={13}
+                          strokeWidth={2.4}
+                          data-testid="threat-mark"
+                          role="img"
+                          aria-label="True positive"
+                          className="mr-1 inline-block align-[-2px] text-danger"
+                        />
                       )}
+                      <span data-testid="alert-name">{g.name}</span>
+                      {/* A space before the count: the line may break there.
+                          With no space the count held on to the last word,
+                          and a name that fit its line wrapped one word. */}
+                      {wideTable && countChip && <> {countChip}</>}
                     </div>
+                    {/* The reason: the headline of the run behind the verdict.
+                        The whole sentence shows and wraps. A two-line clip
+                        ended it mid-sentence on production. */}
+                    {reason && (
+                      <div
+                        data-testid="alert-reason"
+                        className={`min-w-0 break-words text-[12px] leading-[1.45] ${
+                          threat ? 'text-text-2' : 'text-faint'
+                        }`}
+                      >
+                        {reason}
+                      </div>
+                    )}
                     {/* Who is involved: the flow of the latest alert, how many
                         other sources the group holds, and the machine. The row
                         showed none of it until it was expanded (dogfood
@@ -3184,6 +3386,14 @@ export function Alerts() {
                             onOpen={openDrawer}
                           />
                         )}
+                      </div>
+                    )}
+                    {/* A narrow row: the count, the owner and the tags. */}
+                    {!wideTable && (
+                      <div data-testid="alert-folded" className="mt-1 flex min-w-0 flex-wrap items-center gap-1.5">
+                        {countChip}
+                        {ownerCell}
+                        {tagsCell}
                       </div>
                     )}
                   </div>
@@ -3239,11 +3449,14 @@ export function Alerts() {
                         if (pill.invId) openDrawer(pill.invId);
                       }}
                       title={pill.title}
-                      className="group/inh flex min-w-0 items-center gap-1.5 rounded-pill text-left enabled:hover:opacity-90 disabled:cursor-default"
+                      // The text stacks under the chip. Beside the chip it
+                      // printed over the confidence (ui-core 11).
+                      data-testid="inherited-pill"
+                      className="group/inh flex min-w-0 max-w-full flex-col items-start gap-0.5 rounded-pill text-left enabled:hover:opacity-90 disabled:cursor-default"
                     >
                       <VerdictPill verdict={pill.verdict} conf={pill.conf} inherited showConf={false} showInherited={false} />
-                      <span className="flex min-w-0 items-center gap-0.5 flex-wrap font-mono text-[10.5px] text-faint group-enabled/inh:group-hover/inh:text-accent">
-                        <span className="break-words">
+                      <span className="flex min-w-0 max-w-full items-center gap-0.5 flex-wrap font-mono text-[10.5px] text-faint group-enabled/inh:group-hover/inh:text-accent">
+                        <span className="min-w-0 break-words">
                           · inherited{pill.when ? ` ${pill.when}` : ''}
                         </span>
                         {pill.invId && <ArrowUpRight size={10} className="flex-shrink-0" />}
@@ -3304,82 +3517,14 @@ export function Alerts() {
                     return conf != null ? conf.toFixed(2) : '—';
                   })()}
                 </div>
-                <div className="flex items-center">
-                  {ownerPending[gk] ? (
-                    <span
-                      role="status"
-                      aria-label={owner ? `Releasing ${g.name}` : `Assigning ${g.name}`}
-                      className="flex h-[25px] w-[25px] items-center justify-center"
-                    >
-                      <Spinner size={13} />
-                    </span>
-                  ) : owner ? (
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        release(g);
-                      }}
-                      title={`Assigned to ${owner}. Select to release it.`}
-                      aria-label={`Release ${g.name}`}
-                      className="flex h-[25px] w-[25px] items-center justify-center rounded-full border border-border-strong bg-[#1a2330] text-[9.5px] font-bold text-[#b9c2cf] hover:border-danger hover:text-danger"
-                    >
-                      {toInitials(owner)}
-                    </button>
-                  ) : (
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        assignToMe(g);
-                      }}
-                      title="Assign to me"
-                      aria-label={`Assign ${g.name} to me`}
-                      className="flex h-[25px] w-[25px] items-center justify-center rounded-full border-[1.5px] border-dashed border-border-strong text-[14px] leading-none text-faint hover:border-accent hover:text-accent"
-                    >
-                      +
-                    </button>
-                  )}
-                </div>
+                {wideTable && ownerCell}
                 <div
                   className="text-right font-mono text-[12.5px] font-medium text-text-2"
                   title={absTime(g.latestTs) ?? g.latest}
                 >
                   {g.latest || '—'}
                 </div>
-                {/* The tags, in the one order of every list: the type, then
-                    the handled counts. An unknown count draws one
-                    "uncounted" chip with the reason in its tooltip. */}
-                <RowTags
-                  testId={`alert-tags-${g.id}`}
-                  kind={g.kind}
-                  counts={
-                    <>
-                      <HandledChip
-                        count={g.ackedCount}
-                        icon={<Check size={9} strokeWidth={2.5} />}
-                        colour={{ borderColor: 'rgba(34,197,94,.35)', background: 'rgba(34,197,94,.08)', color: '#4ade80' }}
-                        known={(n) => `${n} acknowledged`}
-                      />
-                      <HandledChip
-                        count={g.escalatedCount}
-                        icon={<ArrowUpRight size={9} strokeWidth={2.5} />}
-                        colour={{ borderColor: 'rgba(251,146,60,.35)', background: 'rgba(251,146,60,.08)', color: '#fb923c' }}
-                        // "1 escalated." read as a sentence with no noun (V3).
-                        known={(n) => `${alertsAre(n)} on a case`}
-                        cases={g.cases}
-                      />
-                      {(g.ackedCount === null || g.escalatedCount === null) && (
-                        <span
-                          data-testid="counts-unknown"
-                          title={COUNTS_UNKNOWN}
-                          className="inline-flex flex-shrink-0 cursor-help items-center rounded-chip border px-[5px] py-[2px] text-[10px] font-semibold"
-                          style={{ borderColor: 'rgba(148,163,184,.32)', background: 'rgba(148,163,184,.08)', color: '#94a3b8' }}
-                        >
-                          uncounted
-                        </span>
-                      )}
-                    </>
-                  }
-                />
+                {wideTable && tagsCell}
                 {/* flex-wrap keeps the action pills INSIDE this cell: when an
                     owned row shows all three (Review/Done/Open report) the
                     overflow wraps to a second line below, never left into the
@@ -3450,7 +3595,7 @@ export function Alerts() {
                       }}
                       disabled={!!huntGroupPending[gk]}
                       aria-label="Retry investigation"
-                      title="The last re-run failed. Investigate the representative event again."
+                      title="The newest investigation failed. Investigate the representative event again."
                       className="inline-flex items-center gap-1 whitespace-nowrap rounded-badge border px-[9px] py-[3px] font-sans text-[11px] font-semibold disabled:opacity-50"
                       style={{ borderColor: 'rgba(239,68,68,.4)', background: 'rgba(239,68,68,.08)', color: '#f87171' }}
                     >
@@ -3571,10 +3716,7 @@ export function Alerts() {
                         <div><SeverityTag sev={(b.head.sev ?? 'unknown') as Severity} /></div>
                         {/* src → dst:port, plus the collapsed count */}
                         <div className="flex min-w-0 items-center gap-1.5 flex-wrap">
-                          <span className="text-mono-green">{b.head.src}</span>
-                          <span className="text-ghost">→</span>
-                          <span className="break-words text-mono-amber">{b.head.dst}</span>
-                          {b.head.port != null && <span className="text-faint">:{b.head.port}</span>}
+                          <FlowBadge src={b.head.src} dst={b.head.dst} port={b.head.port} className="text-[11.5px]" />
                           <span className="flex-shrink-0 text-faint" title={`This row holds ${b.events.length} identical events.`}>
                             ×{b.events.length}
                           </span>

@@ -15,6 +15,7 @@ import json
 from datetime import datetime, timedelta
 from itertools import pairwise
 from pathlib import Path
+from typing import Any
 
 import pytest
 from soc_ai.config import Settings
@@ -619,6 +620,96 @@ def test_startup_seeds_fixtures_in_demo_mode(
     with _app_client(_demo_app_settings()) as client:
         rows = client.get("/api/v1/investigations").json()["rows"]
     assert [r["id"] for r in rows] == ["01DEMO0000000000000000TEST"]
+
+
+def test_startup_builds_the_campaign_of_the_shipped_story(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Demo startup builds the campaigns once after the seed. The route's own
+    rebuild is a no-op here, so the row can only come from the startup build.
+    The story holds one campaign: the PsExec run from jump01 to fs01."""
+    from tests.test_demo_mode import _app_client, _demo_app_settings
+
+    async def held(db: AsyncSession, **_kwargs: Any) -> bool:
+        return True
+
+    monkeypatch.setattr("soc_ai.campaigns.service.ensure_fresh", held)
+    with _app_client(_demo_app_settings()) as client:
+        listing = client.get("/api/v1/campaigns").json()
+    assert [row["title"] for row in listing["rows"]] == ["jump01 against fs01"]
+
+
+def test_the_demo_campaign_shows_events_when_the_grid_gives_none_and_when_it_answers() -> None:
+    """The demo campaign holds a stored alert event, so the page counts events with no grid.
+
+    The demo grid of the container evaluates the read over its fixture
+    documents: the confirmed rule and one policy rule between jump01 and fs01.
+    """
+    from scripts.demo import mock_es
+    from soc_ai.demo.fixtures import DEFAULT_FIXTURES
+    from soc_ai.so_client.elastic import EsSearchResult
+
+    from tests.test_demo_mode import _app_client, _demo_app_settings
+
+    grid = mock_es.load_fixture(DEFAULT_FIXTURES)
+
+    class NoGrid:
+        async def search(self, index: str, query: dict[str, Any], **kw: Any) -> EsSearchResult:
+            raise ConnectionError("no grid")
+
+    class DemoGrid:
+        async def search(self, index: str, query: dict[str, Any], **kw: Any) -> EsSearchResult:
+            body = {"query": query, "size": kw["size"], "aggs": kw["aggs"]}
+            answer = mock_es.search_docs(body, grid.docs, traffic=grid.traffic)
+            return EsSearchResult(
+                total=answer["hits"]["total"]["value"],
+                took_ms=1,
+                aggregations=answer.get("aggregations"),
+            )
+
+    with _app_client(_demo_app_settings()) as client:
+        (row,) = client.get("/api/v1/campaigns").json()["rows"]
+        # The grid answers no read: the page counts the stored events.
+        client.app.state.elastic = NoGrid()
+        stored = client.get(f"/api/v1/campaigns/{row['id']}").json()["events"]
+        client.app.state.elastic = DemoGrid()
+        read = client.get(f"/api/v1/campaigns/{row['id']}").json()
+        listed = client.get("/api/v1/campaigns").json()["rows"][0]
+    assert stored["source"] == "stored"
+    assert stored["alerts"] >= 1
+    events = read["events"]
+    (pair,) = events["pairs"]
+    assert (events["source"], pair["alerts"], pair["otherAlerts"]) == ("grid", 1, 1)
+    assert pair["records"] > 2
+    assert listed["alerts"] == events["alerts"]
+    (edge,) = read["graph"]["edges"]
+    assert edge["alerts"] == 1
+
+
+def test_startup_serves_when_the_campaign_build_fails(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failed build logs one warning and the app starts. The campaign route
+    then answers with no row and a stale flag, never an error."""
+    from tests.test_demo_mode import _app_client, _demo_app_settings
+
+    async def broken(db: AsyncSession, **kwargs: Any) -> Any:
+        raise RuntimeError("campaign build failed")
+
+    monkeypatch.setattr("soc_ai.campaigns.service.rebuild", broken)
+    with (
+        caplog.at_level("WARNING", logger="soc_ai.main"),
+        _app_client(_demo_app_settings()) as client,
+    ):
+        assert client.get("/healthz").status_code == 200
+        resp = client.get("/api/v1/campaigns")
+    assert resp.status_code == 200
+    assert resp.json() == {"rows": [], "total": 0, "stale": True}
+    lines = [r.getMessage() for r in caplog.records if r.name == "soc_ai.main"]
+    assert [m for m in lines if "could not build the campaigns" in m] == [
+        "demo mode: soc-ai could not build the campaigns at startup. "
+        "The campaign pages try again on the first read."
+    ]
 
 
 def test_startup_keeps_a_seeded_running_hunt_running(

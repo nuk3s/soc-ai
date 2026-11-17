@@ -78,6 +78,8 @@ The analyst executes a write tool from the report in the console.
 | `ack_alert` | Acknowledge a SOC alert. The comment is optional. |
 | `escalate_to_case` | Create a SOC case from an alert. The title and the description are required. |
 | `add_case_comment` | Add a comment to an existing SOC case. |
+| `open_finding_case` | Create a SOC case from a hunt finding. The console runs it for **Escalate to case** on a promoted finding. soc-ai builds the title, the description and the alert list from the stored finding. No report can recommend it. |
+| `open_campaign_case` | Create one SOC case for a campaign. The console runs it for **Open one case** on the campaign page. soc-ai builds the title, the description and the alert list from the stored campaign. No report can recommend it. |
 
 ## Enrichments on every alert
 
@@ -110,7 +112,7 @@ The agent cannot do these things today. The list follows the roadmap order.
   I/O. If the tool is enabled, the agent fetches and decodes the Suricata pcap-log ring
   buffer for a bidirectional flow. The result gives the SNI, the DNS names, the HTTP
   hosts, the inter-arrival timing and the five-tuple statistics.
-- **No active host or network actions.** The three SO write tools are the limit. The
+- **No active host or network actions.** The SO write tools above are the limit. The
   agent cannot isolate a host, block traffic or change a firewall.
 - A read tool runs against the indices that the deployment's index-pattern settings name.
   The agent cannot see data outside that pattern.

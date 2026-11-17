@@ -99,7 +99,7 @@ hit. Hits on one entity form a lead. The lead starts its own hunt, and you
 promote the hunt to an investigation that ends in a verdict.
 
 <p align="center">
-  <img src="img/hunting-flow.svg" alt="The hunting pipeline: an analytic finds a hit, hits on one entity form a lead, the lead starts a hunt, and a promoted hunt becomes an investigation with a verdict" width="900">
+  <img src="img/hunting-flow.svg" alt="How this flows: an analytic finds a hit, hits on one entity form a lead, soc-ai hunts the lead and investigates the alerts and the threat findings, and a confirmed attack starts or joins a campaign that waits in Needs you" width="900">
 </p>
 
 [:octicons-arrow-right-24: The hunting guide](HUNTING.md)
@@ -118,8 +118,11 @@ You stay in control of every action that changes state.
   `auto_ack_fp_enabled=true` under Settings → Triage automation. The exception
   auto-acknowledges a confident false positive. The write needs high
   confidence, and the investigation must have retrieved something first. It
-  never fires on a critical or high-severity alert, or on a malware-class or
-  exploit-class alert. soc-ai audits every unattended write.
+  never fires on a critical alert, or on a malware-class or exploit-class
+  alert. It fires on a high-severity alert only if each of these conditions is
+  true. The alert is a Suricata alert. The classification is policy violation
+  or inappropriate content. Each signature severity of the rule is
+  Informational. soc-ai audits every unattended write.
 - **No data leaves your network without your consent.** The reasoning runs on
   your own model and your own hardware. The Oracle is an optional cloud second
   opinion, and it is off by default. If you turn it on, soc-ai redacts

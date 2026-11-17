@@ -11,19 +11,32 @@ module exposes a plain ``async def`` so step 5 can wrap it without restructuring
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, get_args
 
 from soc_ai.config import Settings
+from soc_ai.so_client import fields
 from soc_ai.so_client.elastic import ElasticClient, EsSearchResult
 from soc_ai.so_client.oql import (
+    And,
+    BareValue,
     Count,
+    FilterNode,
     GroupBy,
     Head,
+    OqlAst,
+    Or,
+    QuotedValue,
+    Term,
+    _safe_agg_name,
     ast_to_es_dsl,
+    filter_to_dsl,
     parse_oql,
     validate_oql,
 )
+from soc_ai.so_client.widen import Widening, widen_filter
+from soc_ai.tools._field_check import CheckedField, absent_field_note
 from soc_ai.tools._registry import tool
 from soc_ai.tools._synth_scope import SynthScope, synth_scope_must_not
 
@@ -119,6 +132,105 @@ def _counted_descriptor(
         "by_dataset": chosen,
         "note": _COUNTED_NOTE,
     }
+
+
+# The fields that say WHICH documents a query reads. A term on one of them is
+# the dataset of the query, so the field check counts inside it.
+_SCOPE_FIELDS: frozenset[str] = frozenset({*fields.DATASET_NAME_FIELDS, "event.module"})
+# Fields that every document holds. A zero on one of them is a zero on the value.
+_NEVER_CHECKED: frozenset[str] = frozenset({"@timestamp", "_id", "_score"})
+
+
+def _is_scope_term(node: FilterNode) -> bool:
+    return isinstance(node, Term) and node.field in _SCOPE_FIELDS
+
+
+def _scope_nodes(node: FilterNode) -> list[FilterNode]:
+    """The dataset terms that every match of the filter must satisfy.
+
+    A term on a dataset field at the top level of the filter, or under a
+    top-level AND. An OR counts only when each of its branches is a dataset
+    term. A dataset term under a NOT or beside a different branch of an OR
+    does not bound the query, so it is not part of the scope.
+    """
+    if _is_scope_term(node):
+        return [node]
+    if isinstance(node, And):
+        return [found for child in node.children for found in _scope_nodes(child)]
+    if isinstance(node, Or) and node.children and all(_is_scope_term(c) for c in node.children):
+        return [node]
+    return []
+
+
+def _scope_labels(nodes: list[FilterNode]) -> list[str]:
+    """The dataset values of the scope, for the text of the note."""
+    labels: dict[str, None] = {}
+    stack: list[FilterNode] = list(nodes)
+    while stack:
+        node = stack.pop(0)
+        if isinstance(node, Or):
+            stack.extend(node.children)
+        elif isinstance(node, Term) and isinstance(node.value, BareValue | QuotedValue):
+            labels.setdefault(node.value.text, None)
+    return list(labels)
+
+
+def _positive_fields(node: FilterNode) -> set[str]:
+    """The fields that the filter requires a value of.
+
+    A field under a NOT is absent from the answer. A NOT on a field that no
+    document holds matches every document, so that field cannot cause a zero.
+    """
+    if isinstance(node, Term):
+        return {node.field}
+    if isinstance(node, And | Or):
+        return {name for child in node.children for name in _positive_fields(child)}
+    return set()
+
+
+def _empty_groupby_fields(aggregations: dict[str, Any] | None, groupby: GroupBy) -> tuple[str, ...]:
+    """The groupby fields from the first level that returned no bucket."""
+    level: list[dict[str, Any]] = [aggregations or {}]
+    for depth, name in enumerate(groupby.fields):
+        key = "by_" + _safe_agg_name(name)
+        buckets = [
+            bucket
+            for holder in level
+            for bucket in ((holder.get(key) or {}).get("buckets") or [])
+            if isinstance(bucket, dict)
+        ]
+        if not buckets:
+            return groupby.fields[depth:]
+        level = buckets
+    return ()
+
+
+def _fields_to_check(ast: OqlAst, result: EsSearchResult, widening: Widening) -> list[CheckedField]:
+    """The named fields of a zero-hit result, or an empty list.
+
+    A filter field is checked when the query matched no document. A groupby
+    field is checked when its level returned no bucket, which also occurs when
+    the filter matched documents.
+
+    A filter field is checked under the names that the query tested
+    (``widening.names``). ``event.kind:alert`` runs as both alert labels, so a
+    dataset that holds ``tags`` and no ``event.kind`` did get a real test, and
+    its zero is a zero on the value.
+    """
+    checked: dict[CheckedField, None] = {}
+    if result.total == 0:
+        for name in sorted(_positive_fields(ast.filter_) - _SCOPE_FIELDS - _NEVER_CHECKED):
+            tested = widening.names.get(name, (name,))
+            checked.setdefault(CheckedField(name=name, names=tested, widened=True), None)
+    groupby = next((stage for stage in ast.pipes if isinstance(stage, GroupBy)), None)
+    if groupby is not None:
+        for name in _empty_groupby_fields(result.aggregations, groupby):
+            if name not in _SCOPE_FIELDS and name not in _NEVER_CHECKED:
+                checked.setdefault(
+                    CheckedField(name=name, names=fields.same_value_names(name), widened=False),
+                    None,
+                )
+    return list(checked)
 
 
 WindowMode = Literal["around", "before"]
@@ -237,6 +349,7 @@ async def query_events_oql(
     time_anchor: datetime | None = None,
     window_mode: WindowMode = "around",
     include_synth: SynthScope = False,
+    widen_names: bool = True,
 ) -> EsSearchResult:
     """Run a validated OQL query against ``settings.events_index_pattern``.
 
@@ -260,13 +373,19 @@ async def query_events_oql(
             span behind the anchor, ``[anchor - rng, anchor]``, which is what
             "how often in the last N" means. Ignored with no anchor, where the
             window is ``[now - rng, now]`` either way.
+        widen_names: When true, a filter term reads every name of its field,
+            both dataset name fields and both alert labels
+            (:func:`soc_ai.so_client.widen.widen_filter`). The Sigma dry run
+            passes false, because it must test the rule as written.
 
     Returns:
         An :class:`EsSearchResult`. For ``groupby`` queries the response holds
         the bucketed aggregation under :attr:`EsSearchResult.aggregations` and
         :attr:`hits` is empty; for plain queries, ``hits`` carries the
         documents and ``aggregations`` is ``None``. :attr:`window` always names
-        the span the totals were counted over.
+        the span the totals were counted over. :attr:`field_note` is set on
+        a zero-hit result when no document in the dataset and the window holds
+        a field that the query names.
     """
     # Before the cheap-to-fail range checks so a bad mode is reported as a bad
     # mode rather than being masked by whichever other argument is also wrong.
@@ -285,7 +404,11 @@ async def query_events_oql(
         raise ValueError(f"query must be <= {_MAX_OQL_LEN} chars, got {len(query)}")
     ast = parse_oql(query)
     validate_oql(ast, max_results=max_results)
-    body = ast_to_es_dsl(ast, default_size=max_results)
+    # One value has several field names, so a filter on one name reads each
+    # name (soc_ai.so_client.widen). The Sigma dry run turns this off: Security
+    # Onion matches the name that a rule holds.
+    widening = widen_filter(ast.filter_) if widen_names else Widening(filter_=ast.filter_)
+    body = ast_to_es_dsl(replace(ast, filter_=widening.filter_), default_size=max_results)
 
     time_filter, window = _build_time_filter(time_range_minutes, time_anchor, window_mode)
     wrapped_bool: dict[str, Any] = {
@@ -297,7 +420,8 @@ async def query_events_oql(
     # into prod responses or the eval sampler's view of "real" alerts.
     # A batch-eval caller passes its scenario id so only that scenario's
     # own plants join the results; the hunt-journey eval passes True.
-    if synth_must_not := synth_scope_must_not(include_synth):
+    synth_must_not = synth_scope_must_not(include_synth)
+    if synth_must_not:
         wrapped_bool["must_not"] = synth_must_not
     wrapped_query = {"bool": wrapped_bool}
 
@@ -327,4 +451,22 @@ async def query_events_oql(
     # reserved keys must not be what makes it a dict.
     if not result.aggregations:
         result.aggregations = None
+    # A zero from a field that no document holds is not a zero from a value
+    # that no document has. One count, only after a zero, tells them apart.
+    if checked := _fields_to_check(ast, result, widening):
+        scope = _scope_nodes(ast.filter_)
+        result.field_note = await absent_field_note(
+            elastic,
+            settings.events_index_pattern,
+            scope_filters=[
+                time_filter,
+                *(
+                    filter_to_dsl(widen_filter(node).filter_ if widen_names else node)
+                    for node in scope
+                ),
+            ],
+            must_not=synth_must_not,
+            checked=checked,
+            datasets=_scope_labels(scope),
+        )
     return result

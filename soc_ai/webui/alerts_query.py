@@ -16,9 +16,11 @@ from typing import Any
 
 from soc_ai.config import Settings
 from soc_ai.errors import OqlValidationError, TimeBoundError
+from soc_ai.so_client import fields as so_fields
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.so_client.fields import ENVELOPE_FIELD, detection_kind, envelope
 from soc_ai.so_client.oql import filter_to_dsl, parse_oql, validate_oql
+from soc_ai.so_client.widen import widen_filter
 from soc_ai.tools._synth_scope import synth_scope_must_not
 
 TIME_RANGES: dict[str, str] = {
@@ -288,6 +290,10 @@ class AlertEvent:
     # all, so a false here means "the grid has nothing to say", not "untouched".
     acknowledged: bool = False
     escalated: bool = False
+    # The names of the external end that the document itself carries: the TLS
+    # server name, the HTTP host and the DNS query, in that order. The rule
+    # prior reads them (soc_ai.agent.rule_prior, safeguard 1).
+    external_names: tuple[str, ...] = ()
 
     @property
     def subject_host(self) -> str | None:
@@ -313,10 +319,16 @@ def _dig(source: Mapping[str, Any], path: str) -> Any:
     return cur
 
 
-def _oql_filter_dsl(oql: str) -> dict[str, Any]:
+def _oql_filter_dsl(oql: str, *, widen: bool = False) -> dict[str, Any]:
+    """Compile one OQL filter. ``widen`` gives each term every name of its field.
+
+    The filter bar passes true, so the console gives the answer that the query
+    tool of the model gives for the same text. A configured source runs as the
+    operator wrote it.
+    """
     ast = parse_oql(oql)
     validate_oql(ast)
-    return filter_to_dsl(ast.filter_)
+    return filter_to_dsl(widen_filter(ast.filter_).filter_ if widen else ast.filter_)
 
 
 # Absolute @timestamp ranges arrive as raw query-param strings and go straight
@@ -422,7 +434,7 @@ def build_filter(
             raise OqlValidationError(
                 "This filter does not accept pipe stages. The page groups the alerts itself."
             )
-        must.append(_oql_filter_dsl(oql))
+        must.append(_oql_filter_dsl(oql, widen=True))
     if abs_from and abs_to:
         lo = _parse_abs_ts(abs_from, bound="from")
         hi = _parse_abs_ts(abs_to, bound="to")
@@ -1197,9 +1209,22 @@ async def fetch_group_events(
                 host_ip=_host_ip(source, env),
                 acknowledged=_source_acknowledged(source),
                 escalated=_source_escalated(source),
+                external_names=_external_names(source, env),
             )
         )
     return events
+
+
+def _external_names(source: Mapping[str, Any], env: Mapping[str, Any]) -> tuple[str, ...]:
+    """The TLS server name, the HTTP host and the DNS query the document holds."""
+    out: list[str] = []
+    for candidates in (so_fields.SSL_SNI, so_fields.HTTP_HOST, so_fields.DNS_QUERY):
+        value = so_fields.unwrapped_first_present(source, env, candidates)
+        if isinstance(value, list):
+            value = value[0] if value else None
+        if isinstance(value, str) and value.strip() and value not in out:
+            out.append(value)
+    return tuple(out)
 
 
 async def count_group_events(

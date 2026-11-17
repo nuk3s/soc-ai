@@ -17,11 +17,13 @@ import {
 import { type ReactNode, Suspense, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { HuntKindBadge, RecordedRunChip, SyntheticEvalBadge } from '../components/Badges';
+import { CampaignChip } from '../components/campaign/CampaignChip';
 import { ConfidenceRing } from '../components/ConfidenceRing';
 import { Definition } from '../components/Definition';
 import { DocumentChip } from '../components/DocumentDrawer';
 import { DraftDetectionPane } from '../components/DraftDetectionPane';
 import { EventTimelinePanel, eventTimelineMeta } from '../components/EventTimeline';
+import { DEGRADED_FALLBACK_NOTE, HuntDegradedChip } from '../components/HuntDegradedChip';
 import { LeadTimeline } from '../components/LeadTimeline';
 import { Markdown } from '../components/Markdown';
 import { Panel, PanelHeader } from '../components/Panel';
@@ -38,6 +40,7 @@ import {
   ApiError,
   type AnalyticDraftResult,
   type AnalyticDraftReview,
+  type InvestigationCampaign,
   type LeadDetail,
   cancelHuntConsole,
   deleteHunt,
@@ -51,7 +54,14 @@ import {
   promoteFinding,
   startHuntConsole,
 } from '../lib/api';
-import { DISMISS_REASONS, DismissLeadForm, openThreatTitles } from '../components/LeadsStrip';
+import { DISMISS_REASONS, DismissLeadForm, heldByCampaign, openThreatTitles } from '../components/LeadsStrip';
+import { campaignLeadSentence } from '../lib/leadWords';
+import {
+  HELD_FINDING_OPEN_TITLE,
+  HUNT_IN_CAMPAIGN,
+  HUNT_ON_CHANGE,
+  heldFindingSentence,
+} from '../lib/campaignWords';
 import { FlowStrip } from '../components/FlowStrip';
 import { useTabTitle } from '../lib/useTabTitle';
 import { type FlowFinding, type FlowHunt, findingInvestigation, huntFlow } from '../lib/flowSteps';
@@ -66,10 +76,11 @@ import {
   huntOutcome,
   outcomeLabel,
   outcomeMeta,
+  threatCountSentence,
   verdictLabel,
   verdictMeta,
 } from '../lib/labels';
-import { objectiveHeadline } from '../lib/text';
+import { firstSentence, objectiveHeadline } from '../lib/text';
 import { HUNT_KIND, SEVERITY, TIMELINE_GROUP_COLOR, tint } from '../lib/tokens';
 import {
   ACTION_OPEN_INVESTIGATION,
@@ -82,7 +93,7 @@ import {
   COUNT_STEPS,
   DIFF_NEW,
   DIFF_PERSISTING,
-  DIFF_RESOLVED,
+  DIFF_NOT_REPORTED,
   DIFF_STRIP,
   DISPOSITION,
   STEP_DETAIL,
@@ -188,11 +199,14 @@ const LONG_TITLE_CHARS = 140;
 // so a model that genuinely scored zero keeps its 0.00 and a hunt nothing
 // scored shows no number at all, whoever started it.
 const CATALOG_ACTOR = 'hunt-catalog';
+/** The actor of a hunt that soc-ai started on a change of a campaign. */
+const CAMPAIGN_ACTOR = 'campaign-hunt';
 
 /** The hand that started a hunt, in screen words. The meta strip printed the
  *  raw actor "hunt-catalog". A system actor reads as soc-ai. */
 export function starterWords(startedBy: string): string {
   if (startedBy === CATALOG_ACTOR) return 'the catalog sweep';
+  if (startedBy === CAMPAIGN_ACTOR) return 'soc-ai';
   if (startedBy.startsWith('system:')) return 'soc-ai';
   return startedBy;
 }
@@ -284,8 +298,58 @@ function huntDisposition(
   serverLabel?: string | null,
 ): { label: string; color: string } {
   const meta = outcomeMeta(outcome);
-  // The server's label carries the counts, "2 of 3 findings are threats".
+  // The server label carries the count sentence, "3 confirmed · 1 not judged · of 4 threat findings".
   return { label: serverLabel || outcomeLabel(outcome), color: meta.color };
+}
+
+/** The outcomes whose bottom line counts the threat findings. */
+const COUNTED: ReadonlySet<HuntOutcomeKey> = new Set<HuntOutcomeKey>([
+  'threat_found',
+  'threats_confirmed',
+  'no_threat_confirmed',
+]);
+
+/** The count sentence of the bottom line: "3 confirmed · 1 not judged · of 4
+ *  threat findings", the words of every surface (lib/labels.ts). A hunt with
+ *  no threat finding reads its outcome label. */
+export function bottomLineCount(
+  data: Pick<
+    HuntDetailData,
+    | 'status'
+    | 'findings'
+    | 'outcome'
+    | 'outcome_label'
+    | 'findingsTotal'
+    | 'findingsConfirmed'
+    | 'findingsFalsePositive'
+    | 'threatFindingCount'
+  >,
+): string {
+  const outcome = pageOutcome(data);
+  const threats =
+    data.threatFindingCount ??
+    data.findings.filter((f) => (f.category ?? 'threat') === 'threat' && !isRunFailure(f)).length;
+  const total = Math.max(threats, data.findingsTotal ?? 0);
+  if (total > 0 && COUNTED.has(outcome)) {
+    return threatCountSentence({
+      confirmed: data.findingsConfirmed ?? 0,
+      falsePositives: data.findingsFalsePositive ?? 0,
+      threatFindings: total,
+    });
+  }
+  return huntDisposition(outcome, data.outcome_label).label;
+}
+
+/** The first sentence of the narrative, as plain text. The narrative of a
+ *  model hunt is Markdown, and a mark such as "**" or "#" is no word. */
+export function narrativeLead(narrative: string | null | undefined): string {
+  const plain = (narrative ?? '')
+    .replace(/^\s*#{1,6}\s+.*$/gm, '')
+    .replace(/^\s*(?:[-*+]|\d+\.|>)\s+/gm, '')
+    .replace(/\*\*|__|`/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return firstSentence(plain);
 }
 
 /** The outcomes where the hunt tested its objective. Only these carry a
@@ -333,10 +397,16 @@ const STEP_ICON: Record<string, ReactNode> = {
 
 // "vs last run" diff strip — a compact summary above the findings that answers
 // "what changed" since the previous COMPLETE run of the SAME objective:
-// N new · M persisting · K resolved, with the baseline run's age. Expandable to
-// list the new/resolved finding titles (persisting is the boring bucket — it's
-// the count that matters, so it stays collapsed). Only rendered when a previous
-// run exists (data.diff present).
+// N new · M persisting · K not reported this run, with the baseline run's age.
+// Expandable to list the new and the not-reported finding titles (persisting is
+// the boring bucket — it's the count that matters, so it stays collapsed). Only
+// rendered when a previous run exists (data.diff present).
+//
+// The third count read "resolved" in green. The comparison knows that this run
+// did not report the finding. It does not know that the activity stopped, and
+// prod showed an exploit that still ran as "5 resolved" (2026-11-12). The count
+// wears the neutral gray of "persisting".
+const DIFF_NEUTRAL = '#8b949e';
 function DiffCount({
   n,
   label,
@@ -389,9 +459,9 @@ function DiffList({ title, entries, color }: { title: string; entries: HuntDiff[
 
 function HuntDiffStrip({ diff }: { diff: HuntDiff }) {
   const [open, setOpen] = useState(false);
-  const expandable = diff.new.length > 0 || diff.resolved.length > 0;
+  const expandable = diff.new.length > 0 || diff.notReported.length > 0;
   return (
-    <div className="rounded-card border border-border-2 bg-surface-2">
+    <div data-testid="hunt-diff-strip" className="rounded-card border border-border-2 bg-surface-2">
       <button
         onClick={() => expandable && setOpen((o) => !o)}
         className="flex w-full items-center gap-2.5 px-[15px] py-2.5 text-left"
@@ -410,15 +480,15 @@ function HuntDiffStrip({ diff }: { diff: HuntDiff }) {
           <DiffCount
             n={diff.persisting.length}
             label="persisting"
-            color="#8b949e"
+            color={DIFF_NEUTRAL}
             title={DIFF_PERSISTING}
           />
           <span className="text-ghost">·</span>
           <DiffCount
-            n={diff.resolved.length}
-            label="resolved"
-            color="#3fb950"
-            title={DIFF_RESOLVED}
+            n={diff.notReported.length}
+            label="not reported this run"
+            color={DIFF_NEUTRAL}
+            title={DIFF_NOT_REPORTED}
           />
         </div>
         <div className="flex-1" />
@@ -437,7 +507,7 @@ function HuntDiffStrip({ diff }: { diff: HuntDiff }) {
       {open && expandable && (
         <div className="grid grid-cols-1 gap-4 border-t border-border-faint px-[15px] py-3 sm:grid-cols-2">
           <DiffList title="New this run" entries={diff.new} color="#f0883e" />
-          <DiffList title="Resolved since last run" entries={diff.resolved} color="#3fb950" />
+          <DiffList title="Not reported this run" entries={diff.notReported} color={DIFF_NEUTRAL} />
         </div>
       )}
     </div>
@@ -542,6 +612,8 @@ function findingNumbers(ordinals: number[]): string {
  *  F2, and no card said so: each card read the verdict as its own. Null when
  *  the investigation is the finding's own. */
 export function sharedInvestigationText(f: HuntFinding, ordinal: number): string | null {
+  // A finding that restates an earlier finding says so in its own note.
+  if (f.restates) return null;
   const others = (f.sharedWith ?? []).filter((o) => o !== ordinal);
   const subject = f.investigationSubject ?? null;
   if (subject != null && subject !== ordinal) {
@@ -555,6 +627,44 @@ export function sharedInvestigationText(f: HuntFinding, ordinal: number): string
     return 'Shares the investigation of an earlier hunt on the same subject.';
   }
   return null;
+}
+
+/** The note on a finding that restates an earlier finding.
+ *
+ *  Prod, 2026-11-08 to 2026-11-12: one exploit became 12 threat findings and
+ *  12 investigations in 5 hunts. A finding that names no new entity and cites
+ *  nothing new now reads the investigation of the earlier finding, and the
+ *  card says whose verdict it shows. Null on a finding with its own run. */
+export function restatesText(f: HuntFinding): string | null {
+  if (!f.restates) return null;
+  const title = f.restates.title || 'an earlier finding';
+  // The verdict of the latest run of the earlier finding. The server reads it
+  // live, after each Re-run and each override. An older server sends none.
+  const verdict = f.restates.verdict ?? f.verdict ?? f.investigation?.verdict ?? null;
+  if (!verdict) return `Restates "${title}".`;
+  return `Restates "${title}", verdict ${verdictLabel(verdict).toLowerCase()}.`;
+}
+
+/** True when the earlier finding no longer answers for this finding. Only a
+ *  true positive answers. The finding then has no investigation, and the card
+ *  offers "Open an investigation" for this finding. */
+export function restatesIsStale(f: HuntFinding): boolean {
+  return f.restates != null && f.restates.answers === false;
+}
+
+function RestatesNote({ f }: { f: HuntFinding }) {
+  const text = restatesText(f);
+  if (!text || !f.restates) return null;
+  return (
+    <Link
+      to={`/hunts/${f.restates.huntId}`}
+      data-testid="finding-restates"
+      className="font-semibold text-text-2 hover:underline"
+      title="This finding names no new host and cites no new evidence. The investigation of the earlier finding answers for it. The link opens the hunt of the earlier finding."
+    >
+      {text}
+    </Link>
+  );
 }
 
 // The sentence for a finding with no verdict. The manual control on the card
@@ -581,6 +691,17 @@ function SharedInvestigationNote({ f, ordinal }: { f: HuntFinding; ordinal: numb
   );
 }
 
+/** The campaign that holds a finding, or null. The link state `campaign`
+ *  says so, and the finding names the campaign. A server that names the
+ *  campaign and states no link state holds the finding when no investigation
+ *  is on it. The campaign of an investigation of the finding is no hold. */
+export function findingHeldByCampaign(f: HuntFinding): InvestigationCampaign | null {
+  if (!f.campaign) return null;
+  if (f.investigationStatus === 'campaign') return f.campaign;
+  const hasInvestigation = Boolean(f.investigationId ?? f.investigation?.id);
+  return !f.investigationStatus && !hasInvestigation ? f.campaign : null;
+}
+
 function FindingInvestigationLine({
   f,
   huntId,
@@ -590,7 +711,40 @@ function FindingInvestigationLine({
   huntId: string;
   ordinal: number;
 }) {
+  // A campaign holds the finding: the campaign already states the activity,
+  // so soc-ai opened no investigation. The line is calm, and the chip is the
+  // one link to the campaign.
+  const held = findingHeldByCampaign(f);
+  if (held) {
+    return (
+      <div
+        data-testid="finding-held"
+        data-status="campaign"
+        className="mb-1.5 flex flex-wrap items-center gap-2 font-sans text-[11.5px] text-dim"
+      >
+        <CampaignChip campaign={held} testId="finding-campaign" />
+        <span className="min-w-0 break-words text-text-2">{heldFindingSentence(held.title)}</span>
+      </div>
+    );
+  }
   const status = findingInvestigationStatus(f);
+  if (restatesIsStale(f)) {
+    // The earlier finding held a true positive when the hunt ran. Its latest
+    // run does not, after a Re-run or an override. The verdict of another
+    // claim must not stand for this one, so the card says it and the control
+    // above starts an investigation of this finding.
+    return (
+      <div
+        data-testid="finding-restates-stale"
+        className="mb-1.5 flex flex-wrap items-center gap-2 font-sans text-[11.5px] text-dim"
+      >
+        <RestatesNote f={f} />
+        <span className="font-semibold text-warn">
+          That verdict does not answer for this finding. Open an investigation on this finding.
+        </span>
+      </div>
+    );
+  }
   if (!status) return null;
   const invId = f.investigationId ?? f.investigation?.id ?? null;
   const verdict = f.verdict ?? f.investigation?.verdict ?? null;
@@ -605,6 +759,9 @@ function FindingInvestigationLine({
       Open the investigation
     </Link>
   ) : null;
+  // The campaign of the investigation leads the line of a finding with a
+  // verdict: the campaign is the unit of work, and the finding is one part.
+  const campaign = <CampaignChip campaign={f.investigation?.campaign} testId="finding-campaign" />;
   if (status === 'complete' && verdict) {
     const pending = f.pendingActions ?? 0;
     return (
@@ -613,6 +770,7 @@ function FindingInvestigationLine({
         data-status={status}
         className="mb-1.5 flex flex-wrap items-center gap-2 font-sans text-[11.5px] text-dim"
       >
+        {campaign}
         <span
           data-testid="finding-verdict"
           {...chipProps(verdictMeta(verdict), { title: 'The verdict of the investigation.' })}
@@ -629,6 +787,7 @@ function FindingInvestigationLine({
         >
           {pendingActionsText(pending)}
         </span>
+        <RestatesNote f={f} />
         <SharedInvestigationNote f={f} ordinal={ordinal} />
         {link}
       </div>
@@ -642,7 +801,9 @@ function FindingInvestigationLine({
       data-status={status}
       className="mb-1.5 flex flex-wrap items-center gap-2 font-sans text-[11.5px] text-dim"
     >
+      {status === 'running' && campaign}
       <span className={failed ? 'font-semibold text-warn' : undefined}>{line}</span>
+      {status === 'running' && <RestatesNote f={f} />}
       {status === 'running' && <SharedInvestigationNote f={f} ordinal={ordinal} />}
       {status === 'running' && link}
     </div>
@@ -738,6 +899,7 @@ function FindingCard({
   // unpromoted, running, or non-TP finding gets no draft affordance — the
   // Investigate/Open flow is how the analyst confirms first.
   const confirmedTP = invComplete && inv?.verdict === 'true_positive';
+  const heldBy = findingHeldByCampaign(f);
 
   return (
     <div
@@ -828,10 +990,17 @@ function FindingCard({
             title={
               f.citations.length === 0
                 ? 'This finding has no linked evidence events. An investigation needs at least one event.'
-                : ACTION_OPEN_INVESTIGATION
+                : heldBy
+                  ? HELD_FINDING_OPEN_TITLE
+                  : ACTION_OPEN_INVESTIGATION
             }
-            className="ml-auto inline-flex items-center gap-1.5 rounded-badge border px-[9px] py-[3px] font-sans text-[11px] font-semibold text-accent disabled:opacity-50"
-            style={{ borderColor: 'rgba(75,139,245,.3)', background: 'rgba(75,139,245,.07)' }}
+            // A finding that a campaign holds asks for no act. The control
+            // stays for a check by hand, in the neutral tone.
+            data-quiet={heldBy ? 'true' : undefined}
+            className={`ml-auto inline-flex items-center gap-1.5 rounded-badge border px-[9px] py-[3px] font-sans text-[11px] font-semibold disabled:opacity-50 ${
+              heldBy ? 'border-border-strong text-dim hover:text-text' : 'text-accent'
+            }`}
+            style={heldBy ? undefined : { borderColor: 'rgba(75,139,245,.3)', background: 'rgba(75,139,245,.07)' }}
           >
             <Sparkles size={12} />
             {busy ? 'Starting the investigation' : 'Open an investigation'}
@@ -1200,13 +1369,16 @@ export function LeadDecisionBar({
   onChanged,
   threatTitles = [],
 }: {
-  lead: Pick<LeadDetail, 'id' | 'status' | 'dismiss_reasons'>;
+  lead: Pick<LeadDetail, 'id' | 'status' | 'dismiss_reasons' | 'campaign'>;
   onChanged: () => void;
   /** The open threat findings of this hunt. The Dismiss form names them. */
   threatTitles?: string[];
 }) {
   const [dismissing, setDismissing] = useState(false);
   if (lead.status !== 'open' && lead.status !== 'hunting') return null;
+  // A campaign holds the lead: the analyst decides on the campaign, so the bar
+  // is calm and names the campaign. It does not say that the lead waits.
+  const campaign = heldByCampaign(lead) ? (lead.campaign ?? null) : null;
   const btn =
     'flex items-center gap-1.5 rounded-control border px-[11px] py-1.5 text-[12px] font-semibold disabled:opacity-60';
   return (
@@ -1215,14 +1387,27 @@ export function LeadDecisionBar({
       data-tour="hunt-lead-decision"
       role="region"
       aria-label={`Lead ${lead.id} decision`}
-      className="mt-[18px] flex flex-col gap-2 rounded-panel-lg border px-[18px] py-3"
-      style={{ borderColor: 'rgba(75,139,245,.35)', background: 'rgba(75,139,245,.06)' }}
+      data-held={campaign ? 'true' : undefined}
+      className={`mt-[18px] flex flex-col gap-2 rounded-panel-lg border px-[18px] py-3 ${
+        campaign ? 'border-border-strong bg-surface-2' : ''
+      }`}
+      style={campaign ? undefined : { borderColor: 'rgba(75,139,245,.35)', background: 'rgba(75,139,245,.06)' }}
     >
       <div className="flex flex-wrap items-center gap-2.5">
-        <span className="text-[13px] font-semibold text-text">Lead {lead.id} waits on you.</span>
-        <span className="text-[12px] text-dim">
-          Read each finding and the verdict of its investigation. Dismiss the lead if it is noise.
-        </span>
+        {campaign ? (
+          <>
+            <span className="text-[13px] font-semibold text-text">Lead {lead.id}</span>
+            <CampaignChip campaign={campaign} testId="hunt-lead-campaign" />
+            <span className="min-w-0 break-words text-[12px] text-text-2">{campaignLeadSentence(campaign.title)}</span>
+          </>
+        ) : (
+          <>
+            <span className="text-[13px] font-semibold text-text">Lead {lead.id} waits on you.</span>
+            <span className="text-[12px] text-dim">
+              Read each finding and the verdict of its investigation. Dismiss the lead if it is noise.
+            </span>
+          </>
+        )}
         <div className="flex-1" />
         <button
           type="button"
@@ -1438,6 +1623,8 @@ export function HuntDetail() {
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [rehunting, setRehunting] = useState(false);
   const [rehuntError, setRehuntError] = useState<string | null>(null);
+  // The raw error of a failed hunt opens on a click.
+  const [errorDetailOpen, setErrorDetailOpen] = useState(false);
 
   // Draft-detection's kill switch — same one-mount-GET pattern the
   // Investigation screen reads it with (Investigation.tsx `about`). Defaults
@@ -1581,6 +1768,30 @@ export function HuntDetail() {
         <div className="text-[15px] font-semibold">Hunt detail</div>
       </div>
 
+      {/* The bottom line, first on the page: the count sentence and the first
+          sentence of the narrative. The findings started about 2,000 px down
+          under the narrative and the charts (review 2026-11-12). */}
+      {data && data.status !== 'running' && (
+        <div
+          data-testid="hunt-bottom-line"
+          className="mx-auto mb-3.5 max-w-workstation text-[14px] leading-[1.55]"
+          style={{ textWrap: 'pretty' }}
+        >
+          <span
+            data-testid="hunt-bottom-line-count"
+            className="font-semibold"
+            style={{ color: statusColor }}
+          >
+            {bottomLineCount(data)}
+          </span>
+          {!failed && narrativeLead(data.narrative) && (
+            <span data-testid="hunt-bottom-line-narrative" className="text-text-2">
+              {` ${narrativeLead(data.narrative)}`}
+            </span>
+          )}
+        </div>
+      )}
+
       {/* What a hunt is, under the title. An analyst who lands here from a link
           never saw the line the Hunt Console carries. */}
       <Definition of="hunt" className="mb-3.5" />
@@ -1683,9 +1894,16 @@ export function HuntDetail() {
                       Lead {leadId}
                     </Link>
                   )}
+                  {/* The campaign of the hunt: the one a campaign hunt answers,
+                      or the one that holds the lead of the hunt. */}
+                  <CampaignChip campaign={data.campaign} testId="hunt-campaign-chip" />
                   {/* A hunt run against planted synthetic scenarios must never
                       read as a real one — badged right beside the disposition. */}
                   {data.isSynthEval && <SyntheticEvalBadge />}
+                  {/* A hunt that completed in a degraded state. The run of
+                      2026-11-03 returned no reasoning trace and wrote three
+                      false threat findings under a plain "Complete". */}
+                  {data.degraded && <HuntDegradedChip note={data.degradedNote} />}
                   {demo && <RecordedRunChip />}
                   <Freshness at={lastUpdated} className="ml-auto" />
                 </div>
@@ -1702,6 +1920,17 @@ export function HuntDetail() {
                     {outcomeHeadline}
                   </div>
                 )}
+                {/* What the degraded mark means, in the sentence the server
+                    writes. The chip alone is one word. */}
+                {data.degraded && (
+                  <div
+                    data-testid="hunt-degraded-note"
+                    className="mb-2.5 text-[13px] leading-[1.55] text-warn"
+                    style={{ textWrap: 'pretty' }}
+                  >
+                    {data.degradedNote || DEGRADED_FALLBACK_NOTE}
+                  </div>
+                )}
                 {/* generated title (from the objective) as the hero headline.
                     It wraps and never cuts. */}
                 <div
@@ -1716,6 +1945,17 @@ export function HuntDetail() {
                 >
                   {title}
                 </div>
+                {/* The campaign by name. A campaign hunt answers a change of
+                    the campaign, and the chip alone names no campaign. */}
+                {data.campaign && (
+                  <div data-testid="hunt-campaign" className="mt-1.5 break-words text-[12.5px] text-text-2">
+                    {(data.starter === 'campaign' ? HUNT_ON_CHANGE : HUNT_IN_CAMPAIGN).before}
+                    <Link to={`/campaigns/${data.campaign.id}`} className="font-semibold text-accent hover:underline">
+                      {data.campaign.title.trim()}
+                    </Link>
+                    {(data.starter === 'campaign' ? HUNT_ON_CHANGE : HUNT_IN_CAMPAIGN).after}
+                  </div>
+                )}
                 {/* The objective a lead hunt carries is a paragraph of
                     generated prose. It pushed the findings below the fold on
                     every lead hunt, so it opens on a click. */}
@@ -1896,10 +2136,35 @@ export function HuntDetail() {
               <span className="mt-px flex text-danger">
                 <AlertTriangle size={16} />
               </span>
-              <div className="text-[13px] leading-[1.55] text-dim" style={{ textWrap: 'pretty' }}>
+              <div className="min-w-0 text-[13px] leading-[1.55] text-dim" style={{ textWrap: 'pretty' }}>
                 {data.findings.length > 0
                   ? 'The findings and the trace below are partial.'
                   : 'The trace below shows how far the hunt got.'}
+                {/* The plain cause sits under the status pill. The raw error
+                    of the server is for the operator, so it opens on a click.
+                    The page of a lost hunt read "UsageLimitExceeded ...
+                    tool_calls_limit of 0" in its first line (2026-10-31). */}
+                {data.errorDetail && (
+                  <div className="mt-1.5">
+                    <button
+                      type="button"
+                      data-testid="hunt-error-detail-toggle"
+                      aria-expanded={errorDetailOpen}
+                      onClick={() => setErrorDetailOpen((v) => !v)}
+                      className="text-[12px] font-semibold text-dim hover:text-text"
+                    >
+                      {errorDetailOpen ? 'Hide the technical detail' : 'Show the technical detail'}
+                    </button>
+                    {errorDetailOpen && (
+                      <pre
+                        data-testid="hunt-error-detail"
+                        className="mt-1.5 whitespace-pre-wrap break-words rounded-chip border border-border-faint bg-surface-2 p-2 font-mono text-[11.5px] leading-[1.5] text-text-2"
+                      >
+                        {data.errorDetail}
+                      </pre>
+                    )}
+                  </div>
+                )}
               </div>
             </div>
           )}
@@ -1908,20 +2173,6 @@ export function HuntDetail() {
           <div className="mt-[18px] grid grid-cols-1 items-start gap-[18px] lg:grid-cols-[minmax(0,1fr)_360px]">
             {/* main column: narrative, findings, timeline */}
             <div className="flex min-w-0 flex-col gap-[18px]">
-              {/* What the lead is made of. The hunt page named the lead and
-                  showed nothing of it, so an analyst reading the hunt had to
-                  leave it to learn what the hunt was about. */}
-              {lead.data && (
-                <div data-testid="hunt-lead-timeline">
-                  <LeadTimeline
-                    lead={lead.data}
-                    title={`Lead timeline · ${lead.data.observations.length} observation${
-                      lead.data.observations.length === 1 ? '' : 's'
-                    }`}
-                    className=""
-                  />
-                </div>
-              )}
               {/* An errored hunt's narrative IS the failure sentence, and it
                   already sits under the verdict. One sentence twice on one
                   page reads as two facts. */}
@@ -1946,25 +2197,6 @@ export function HuntDetail() {
                   </Panel>
                 </CollapsibleSection>
               )}
-
-              {/* Deterministic charts from the findings — only once the hunt has
-                  concluded WITH findings (a running or empty hunt has nothing
-                  to plot, and a chart must never render from nothing). */}
-              {complete && charted.length > 0 && (
-                <CollapsibleSection title="Visual summary">
-                  <Suspense fallback={<VisualsSkeleton />}>
-                    <HuntVisuals
-                      findings={charted}
-                      affectedHosts={data.affectedHosts}
-                      charts={data.charts}
-                    />
-                  </Suspense>
-                </CollapsibleSection>
-              )}
-
-              {/* "vs last run" diff — only when a prior COMPLETE run of this
-                  same objective exists (server omits diff otherwise). */}
-              {complete && data.diff && <HuntDiffStrip diff={data.diff} />}
 
               <CollapsibleSection
                 title="Findings"
@@ -2037,6 +2269,43 @@ export function HuntDetail() {
                   <EventTimelinePanel timeline={data.eventTimeline} />
                 </CollapsibleSection>
               ) : null}
+
+              {/* L1: the order is narrative, findings, event timeline, then the
+                  lead, the charts, the diff and the steps. The findings sat
+                  under the lead timeline, two charts, a node map and the diff
+                  (review 2026-11-12). */}
+              {/* What the lead is made of. The hunt page named the lead and
+                  showed nothing of it, so an analyst reading the hunt had to
+                  leave it to learn what the hunt was about. */}
+              {lead.data && (
+                <div data-testid="hunt-lead-timeline">
+                  <LeadTimeline
+                    lead={lead.data}
+                    title={`Lead timeline · ${lead.data.observations.length} observation${
+                      lead.data.observations.length === 1 ? '' : 's'
+                    }`}
+                    className=""
+                  />
+                </div>
+              )}
+              {/* Deterministic charts from the findings — only once the hunt has
+                  concluded WITH findings (a running or empty hunt has nothing
+                  to plot, and a chart must never render from nothing). */}
+              {complete && charted.length > 0 && (
+                <CollapsibleSection title="Visual summary">
+                  <Suspense fallback={<VisualsSkeleton />}>
+                    <HuntVisuals
+                      findings={charted}
+                      affectedHosts={data.affectedHosts}
+                      charts={data.charts}
+                    />
+                  </Suspense>
+                </CollapsibleSection>
+              )}
+
+              {/* "vs last run" diff — only when a prior COMPLETE run of this
+                  same objective exists (server omits diff otherwise). */}
+              {complete && data.diff && <HuntDiffStrip diff={data.diff} />}
 
               {/* A catalog hunt has no steps BY CONSTRUCTION — it is one query
                   from a spec, not an agent loop — so "0 steps" and "No steps

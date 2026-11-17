@@ -66,6 +66,10 @@ def get_dotted(d: Mapping[str, Any], path: str) -> Any:
 # --- DNS ---
 DNS_QUERY: tuple[str, ...] = ("dns.query.name", "dns.question.name", "zeek.dns.query")
 DNS_RESOLVED_IP: tuple[str, ...] = ("dns.resolved_ip", "zeek.dns.answers")
+# The names with an ip mapping. Elasticsearch refuses a host name or a wildcard
+# on such a field, and it fails the whole search on each shard. A filter is
+# widened to one of these names only for an address value.
+IP_TYPED_NAMES: frozenset[str] = frozenset({"dns.resolved_ip"})
 # SO-computed registrable domain; PREFER this for suffix derivation when present.
 DNS_REGISTERED_DOMAIN: tuple[str, ...] = ("dns.highest_registered_domain",)
 DNS_TOP_LEVEL_DOMAIN: tuple[str, ...] = ("dns.top_level_domain",)
@@ -76,6 +80,13 @@ DNS_QTYPE: tuple[str, ...] = ("dns.query.type_name", "zeek.dns.qtype_name")
 CONN_ORIG_BYTES: tuple[str, ...] = ("client.bytes", "source.bytes", "zeek.conn.orig_bytes")
 CONN_RESP_BYTES: tuple[str, ...] = ("server.bytes", "destination.bytes", "zeek.conn.resp_bytes")
 CONN_TOTAL_BYTES: tuple[str, ...] = ("network.bytes",)
+# Packets that the RESPONDER sent. A flow record with zero here and zero in
+# CONN_RESP_BYTES is a connection attempt that nothing answered.
+CONN_RESP_PACKETS: tuple[str, ...] = (
+    "server.packets",
+    "destination.packets",
+    "zeek.conn.resp_pkts",
+)
 # NOTE: on Security Onion, event.duration carries Zeek's native SECONDS (verified
 # against a live grid: avg ~40, max ~1.12e6 = ~13d). Do NOT add a nanosecond
 # normalization — raw Elastic Zeek integrations may write ns, but SO does not.
@@ -103,24 +114,41 @@ HTTP_STATUS: tuple[str, ...] = (
     "http.response.status_code",
     "zeek.http.status_code",
 )
+# Security Onion 3.x writes the User-Agent of a zeek.http document in
+# ``http.useragent``. No stored document of a production grid holds one of the
+# other three names (census of 2026-11-13).
 HTTP_USER_AGENT: tuple[str, ...] = (
     "user_agent.original",
+    "http.useragent",
     "http.user_agent",
     "zeek.http.user_agent",
 )
 
 # --- files ---
+# Security Onion 3.x names the dataset ``zeek.file``, and older grids and the
+# synth fixtures name it ``zeek.files``. Its documents hold the hash in
+# ``hash.md5`` and ``hash.sha1`` and the size in ``file.bytes.total``. The
+# stored documents hold no SHA-256, so FILE_SHA256 has no grid name to add:
+# ``hash.sha256`` on a zeek.ssl document is a certificate hash.
+ZEEK_FILE_DATASETS: tuple[str, ...] = ("zeek.file", "zeek.files")
 FILE_MIME: tuple[str, ...] = ("file.mime_type", "zeek.files.mime_type")
-FILE_MD5: tuple[str, ...] = ("file.hash.md5", "zeek.files.md5")
+FILE_MD5: tuple[str, ...] = ("file.hash.md5", "hash.md5", "zeek.files.md5")
 FILE_SHA256: tuple[str, ...] = ("file.hash.sha256", "zeek.files.sha256")
-FILE_SIZE: tuple[str, ...] = ("file.size", "zeek.files.total_bytes")
+FILE_SIZE: tuple[str, ...] = ("file.size", "file.bytes.total", "zeek.files.total_bytes")
+FILE_NAME: tuple[str, ...] = ("file.name", "zeek.files.filename")
 
 # --- kerberos (credential-access: Kerberoasting / AS-REP roasting) ---
 # The DECISIVE Kerberoasting signal is the ticket cipher — RC4-HMAC (etype 23,
 # often rendered "rc4-hmac" / "0x17") requested for a service principal. No stable
 # ECS mapping on SO, so read zeek.kerberos.* directly (ECS `kerberos.*` first in
 # case a future integration populates it).
-KERBEROS_CIPHER: tuple[str, ...] = ("kerberos.cipher", "zeek.kerberos.cipher")
+# Security Onion 3.x writes the cipher in ``kerberos.ticket.cipher``. The other
+# kerberos fields below hold their first name on the grid.
+KERBEROS_CIPHER: tuple[str, ...] = (
+    "kerberos.ticket.cipher",
+    "kerberos.cipher",
+    "zeek.kerberos.cipher",
+)
 KERBEROS_SERVICE: tuple[str, ...] = ("kerberos.service", "zeek.kerberos.service")
 KERBEROS_CLIENT: tuple[str, ...] = ("kerberos.client", "zeek.kerberos.client")
 KERBEROS_REQUEST_TYPE: tuple[str, ...] = ("kerberos.request_type", "zeek.kerberos.request_type")
@@ -141,7 +169,13 @@ SMB_FILE_ACTION: tuple[str, ...] = ("smb.file.action", "zeek.smb_files.action")
 SMB_FILE_NAME: tuple[str, ...] = ("smb.file.name", "zeek.smb_files.name")
 SMB_FILE_PATH: tuple[str, ...] = ("smb.file.path", "zeek.smb_files.path")
 SMB_MAPPING_SERVICE: tuple[str, ...] = ("smb.mapping.service", "zeek.smb_mapping.service")
-SMB_MAPPING_SHARE_TYPE: tuple[str, ...] = ("smb.mapping.share_type", "zeek.smb_mapping.share_type")
+# A stored zeek.smb_mapping document holds ``smb.path`` and ``smb.share_type``.
+SMB_MAPPING_SHARE_TYPE: tuple[str, ...] = (
+    "smb.share_type",
+    "smb.mapping.share_type",
+    "zeek.smb_mapping.share_type",
+)
+SMB_MAPPING_PATH: tuple[str, ...] = ("smb.path", "zeek.smb_mapping.path")
 DCE_RPC_ENDPOINT: tuple[str, ...] = ("dce_rpc.endpoint", "zeek.dce_rpc.endpoint")
 DCE_RPC_OPERATION: tuple[str, ...] = ("dce_rpc.operation", "zeek.dce_rpc.operation")
 # The NetBIOS name a host announces over SMB — an identity signal, not a
@@ -153,8 +187,21 @@ SMB_HOST_NAME: tuple[str, ...] = ("smb.host_name", "zeek.smb.host_name")
 
 # --- ssh (interactive lateral movement; a completed auth from a bad-reputation
 # source is a confirmed intrusion) ---
-SSH_AUTH_SUCCESS: tuple[str, ...] = ("ssh.auth_success", "zeek.ssh.auth_success")
-SSH_AUTH_ATTEMPTS: tuple[str, ...] = ("ssh.auth_attempts", "zeek.ssh.auth_attempts")
+# Security Onion 3.x writes the login result in ``ssh.authentication.success``
+# and the count in ``ssh.authentication.attempts``. The two older names were the
+# only names here until 2026-11-13, and no stored document of a production grid
+# holds them: 10 of 12 scheduled hunts filtered on ``zeek.ssh.auth_success`` and
+# reported "no successful SSH login" while the grid held successful logins.
+SSH_AUTH_SUCCESS: tuple[str, ...] = (
+    "ssh.authentication.success",
+    "ssh.auth_success",
+    "zeek.ssh.auth_success",
+)
+SSH_AUTH_ATTEMPTS: tuple[str, ...] = (
+    "ssh.authentication.attempts",
+    "ssh.auth_attempts",
+    "zeek.ssh.auth_attempts",
+)
 SSH_CLIENT: tuple[str, ...] = ("ssh.client", "zeek.ssh.client")
 SSH_SERVER: tuple[str, ...] = ("ssh.server", "zeek.ssh.server")
 # The SSH banner is the strongest OS signal a headless Linux box emits:
@@ -187,7 +234,7 @@ DHCP_HOSTNAME: tuple[str, ...] = (
     "host.hostname",
 )
 DHCP_CLIENT_FQDN: tuple[str, ...] = ("dhcp.client_fqdn", "zeek.dhcp.client_fqdn")
-DHCP_DOMAIN: tuple[str, ...] = ("dhcp.domain", "zeek.dhcp.domain")
+DHCP_DOMAIN: tuple[str, ...] = ("dhcp.domain", "zeek.dhcp.domain", "host.domain")
 DHCP_MAC: tuple[str, ...] = ("dhcp.client.mac", "zeek.dhcp.mac", "host.mac")
 # The address the server gave, and the address the client sent from. Either one
 # names the lease holder on an SO 3.x grid. The older shape names it by
@@ -215,8 +262,18 @@ NTLM_SERVER_NB: tuple[str, ...] = (
 # and ``software_type`` are Zeek's parse of it. All three are read because the
 # banner often names the OS the parsed fields drop.
 SOFTWARE_NAME: tuple[str, ...] = ("software.name", "zeek.software.name")
-SOFTWARE_VERSION: tuple[str, ...] = ("software.unparsed_version", "zeek.software.unparsed_version")
-SOFTWARE_TYPE: tuple[str, ...] = ("software.software_type", "zeek.software.software_type")
+# Security Onion 3.x writes the banner in ``software.version.unparsed`` and the
+# type in ``software.type``.
+SOFTWARE_VERSION: tuple[str, ...] = (
+    "software.version.unparsed",
+    "software.unparsed_version",
+    "zeek.software.unparsed_version",
+)
+SOFTWARE_TYPE: tuple[str, ...] = (
+    "software.type",
+    "software.software_type",
+    "zeek.software.software_type",
+)
 
 # --- behavioral-summary pivots (derived/aggregated docs) ---
 # Some deployments surface a per-(host,dest) BEHAVIORAL SUMMARY document rather
@@ -239,6 +296,182 @@ DNS_TUNNEL_PROFILE: tuple[str, ...] = (
     "network.dns_profile",
     "synth.dns_profile",
 )
+
+
+# ---------------------------------------------------------------------------
+# Responder evidence
+#
+# A flow record is written for a connection ATTEMPT. A SYN to an address with
+# no machine, and a SYN to a closed port, each leave a record that names the
+# address as the responder. Two rules read the same evidence, and they must
+# agree on what it is, so the clauses live here:
+#
+# * the census asks whether a MACHINE is at an address. Any packet from the
+#   address answers yes, a refusal included: one RST proves a machine.
+# * the served-port reads ask whether the machine SERVES a port. A refusal
+#   answers no: a closed port sends one RST to a SYN.
+#
+# The counters are the packets and the payload bytes that the responder sent.
+# Security Onion 3.x writes ``server.packets`` on each Zeek conn record, and it
+# leaves ``server.bytes`` off a record with no payload. So the packet counter is
+# the one that measures an unanswered SYN.
+# ---------------------------------------------------------------------------
+
+RESPONDER_COUNTERS: tuple[str, ...] = (*CONN_RESP_PACKETS, *CONN_RESP_BYTES)
+# Zeek's state for "connection attempt rejected": a SYN, then a RST from the
+# responder. The responder sent a packet, and the port is closed.
+CONN_REFUSED_STATES: tuple[str, ...] = ("REJ",)
+_TCP = "tcp"
+
+
+def _any_of(clauses: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    return {"bool": {"should": list(clauses), "minimum_should_match": 1}}
+
+
+def responder_measured_clause() -> dict[str, Any]:
+    """The record carries a responder counter, so its answer can be measured."""
+    return _any_of([{"exists": {"field": name}} for name in RESPONDER_COUNTERS])
+
+
+def responder_answered_clause() -> dict[str, Any]:
+    """A responder counter is above zero: the responder sent a packet or a byte."""
+    return _any_of([{"range": {name: {"gt": 0}}} for name in RESPONDER_COUNTERS])
+
+
+def served_evidence_clause() -> dict[str, Any]:
+    """The responder answered, and the answer was not a refusal.
+
+    One SYN-ACK is evidence: it is a responder packet with no payload, and its
+    connection state is not a refusal.
+    """
+    refused = _any_of(
+        [{"terms": {name: list(CONN_REFUSED_STATES)}} for name in CONN_STATE],
+    )
+    return {"bool": {"filter": [responder_answered_clause()], "must_not": [refused]}}
+
+
+def tcp_record_clause() -> dict[str, Any]:
+    """The record names TCP as its transport, under any name of the field."""
+    return _any_of([{"term": {name: _TCP}} for name in CONN_TRANSPORT])
+
+
+def judged_record_clause() -> dict[str, Any]:
+    """A record that the probe rule can judge: TCP, with a responder counter.
+
+    The rule is exact for TCP only. A TCP service cannot serve a connection
+    with no packet of its own. A UDP service can: a log sink answers nothing
+    and is a real service. A record with no transport field, or with no
+    responder counter, is not judged, and it counts as it did before.
+    """
+    return {"bool": {"filter": [tcp_record_clause(), responder_measured_clause()]}}
+
+
+def probe_record_clause() -> dict[str, Any]:
+    """A flow record that only shows a probe: judged, and with no served evidence.
+
+    A SYN that nothing answered, and a SYN that a closed port refused. A read
+    of served ports leaves these records out.
+    """
+    return {
+        "bool": {
+            "filter": [judged_record_clause()],
+            "must_not": [served_evidence_clause()],
+        }
+    }
+
+
+# ---------------------------------------------------------------------------
+# One logical field, every name
+#
+# The tables above let a READER find a value under each name a grid can give
+# it. A FILTER had no such help: the model wrote one name, and a grid that
+# holds the value under a different name answered zero. The tables below are
+# the ones whose names all carry the same value, so a filter on one name can
+# match a document that holds a different name of the same table.
+#
+# The DHCP tables, HOST_MAC and the profile tables are absent on purpose. They
+# hold ``host.hostname``, ``host.mac`` and ``client.address``, and those names
+# mean a different thing on a document of a different dataset.
+# ---------------------------------------------------------------------------
+
+LOGICAL_FIELDS: tuple[tuple[str, ...], ...] = (
+    DNS_QUERY,
+    DNS_RESOLVED_IP,
+    DNS_RCODE,
+    DNS_QTYPE,
+    CONN_ORIG_BYTES,
+    CONN_RESP_BYTES,
+    CONN_DURATION,
+    CONN_STATE,
+    CONN_HISTORY,
+    CONN_SERVICE,
+    CONN_TRANSPORT,
+    CONN_LOCAL_ORIG,
+    CONN_LOCAL_RESP,
+    SSL_JA3,
+    SSL_JA3S,
+    SSL_SNI,
+    SSL_VERSION,
+    SSL_ESTABLISHED,
+    HTTP_HOST,
+    HTTP_METHOD,
+    HTTP_URI,
+    HTTP_STATUS,
+    HTTP_USER_AGENT,
+    FILE_MIME,
+    FILE_MD5,
+    FILE_SHA256,
+    FILE_SIZE,
+    FILE_NAME,
+    KERBEROS_CIPHER,
+    KERBEROS_SERVICE,
+    KERBEROS_CLIENT,
+    KERBEROS_REQUEST_TYPE,
+    KERBEROS_SUCCESS,
+    SMB_FILE_ACTION,
+    SMB_FILE_NAME,
+    SMB_FILE_PATH,
+    SMB_MAPPING_SERVICE,
+    SMB_MAPPING_SHARE_TYPE,
+    SMB_MAPPING_PATH,
+    DCE_RPC_ENDPOINT,
+    DCE_RPC_OPERATION,
+    SSH_AUTH_SUCCESS,
+    SSH_AUTH_ATTEMPTS,
+    SSH_CLIENT,
+    SSH_SERVER,
+    SSH_VERSION,
+    SSH_DIRECTION,
+    NTLM_HOSTNAME,
+    NTLM_DOMAIN,
+    NTLM_SERVER_NB,
+    SOFTWARE_NAME,
+    SOFTWARE_VERSION,
+    SOFTWARE_TYPE,
+)
+
+_SAME_VALUE_NAMES: dict[str, tuple[str, ...]] = {
+    name: table for table in LOGICAL_FIELDS for name in table
+}
+
+# The dataset names that mean the same dataset. A dataset filter on one name
+# also selects the other.
+_SAME_DATASET_NAMES: dict[str, tuple[str, ...]] = {
+    name: ZEEK_FILE_DATASETS for name in ZEEK_FILE_DATASETS
+}
+
+
+def same_value_names(field: str) -> tuple[str, ...]:
+    """Every name that carries the value of ``field``, the grid name first.
+
+    A field outside :data:`LOGICAL_FIELDS` gives only itself.
+    """
+    return _SAME_VALUE_NAMES.get(field, (field,))
+
+
+def same_dataset_names(dataset: str) -> tuple[str, ...]:
+    """Every name of ``dataset``. A dataset with one name gives only itself."""
+    return _SAME_DATASET_NAMES.get(dataset, (dataset,))
 
 
 def _is_absent(value: Any) -> bool:
@@ -388,10 +621,17 @@ def dataset_name_filter(dataset: str) -> dict[str, Any]:
     both fields. Scoping such a tool to ``event.dataset`` alone answers "no
     documents" for a plane that is only ever named by ``data_stream.dataset``,
     which is indistinguishable from the plane not existing.
+
+    A dataset with two names is matched under both. Security Onion 3.x names
+    the file log ``zeek.file`` and an older grid names it ``zeek.files``.
     """
     return {
         "bool": {
-            "should": [{"term": {f: dataset}} for f in DATASET_NAME_FIELDS],
+            "should": [
+                {"term": {f: name}}
+                for name in same_dataset_names(dataset)
+                for f in DATASET_NAME_FIELDS
+            ],
             "minimum_should_match": 1,
         }
     }

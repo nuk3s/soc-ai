@@ -141,16 +141,23 @@ async def test_a_rule_with_five_fresh_false_positives_is_covered(settings_kratos
 
 
 async def test_a_new_pair_on_an_external_endpoint_runs(settings_kratos: Settings) -> None:
-    """Negative control: the history covers the rule, but this pair leaves the estate."""
+    """Negative control: the history covers the rule, but this external address is new.
+
+    tests/test_rule_prior_external.py holds the known external address.
+    """
     settings = _settings(settings_kratos)
     engine, maker = await _store(settings)
     await _seed_history(maker)
     out = await _decide(maker, settings, _target(dst_ip=OUTSIDE, alert_es_id="ev-out"))
     back = await _decide(maker, settings, _target(src_ip=OUTSIDE, alert_es_id="ev-in"))
+    both = await _decide(
+        maker, settings, _target(src_ip="198.18.0.9", dst_ip=OUTSIDE, alert_es_id="ev-x")
+    )
     no_flow = await _decide(maker, settings, _target(dst_ip="", alert_es_id="ev-host"))
     await engine.dispose()
-    assert (out.applies, out.reason) == (False, "external_endpoint")
-    assert (back.applies, back.reason) == (False, "external_endpoint")
+    assert (out.applies, out.reason) == (False, "external_endpoint_new")
+    assert (back.applies, back.reason) == (False, "external_endpoint_new")
+    assert (both.applies, both.reason) == (False, "external_endpoint")
     assert (no_flow.applies, no_flow.reason) == (False, "no_flow_endpoints")
 
 
@@ -343,11 +350,13 @@ async def _sweep(
     verdict: str,
     draw: float,
     alert_id: str = "ev-new",
+    src_ip: str = SRC,
+    dst_ip: str = DST,
 ) -> list[str]:
     state = SimpleNamespace(settings=settings, db_sessionmaker=maker)
     calls: list[str] = []
     target = at.Target(
-        alert_es_id=alert_id, rule_name=RULE, src_ip=SRC, dst_ip=DST, severity="medium"
+        alert_es_id=alert_id, rule_name=RULE, src_ip=src_ip, dst_ip=dst_ip, severity="medium"
     )
 
     async def nominate(_state: Any) -> list[dict[str, Any]]:
@@ -524,7 +533,13 @@ def test_the_panel_route_shows_the_record_and_clears_a_suspension(
                 )
 
         asyncio.run(seed())
-        with patch("soc_ai.webui.detection_tuning.nominate", nominate):
+
+        async def nominate_page(state: Any) -> Any:
+            from soc_ai.webui.detection_tuning import NominationPage
+
+            return NominationPage(nominations=await nominate(state), alert_total=400)
+
+        with patch("soc_ai.webui.detection_tuning.nominate_page", nominate_page):
             body = client.get("/api/v1/detection-tuning").json()
             row = body["nominations"][0]
             assert (row["prior_covered"], row["prior_disagreements"]) == (1, 1)

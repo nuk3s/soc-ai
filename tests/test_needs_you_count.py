@@ -168,7 +168,7 @@ def test_one_item_of_each_part_reads_a_total_of_five(client: TestClient) -> None
     assert body["total"] == 5
     assert body["unknown"] == []
     assert body["alert_window"] == "7d"
-    assert body["verdict_window"] == "30d"
+    assert body["verdict_window"] == "all"
     # The hunting half is the Hunts page count, read through its own route.
     hunting = client.get("/api/v1/hunts/needs-you").json()
     assert hunting["leads_needing_decision"] == body["leads_needing_decision"]
@@ -180,6 +180,45 @@ def test_one_item_of_each_part_reads_a_total_of_five(client: TestClient) -> None
         "/api/v1/investigations", params={"verdict": "needs_more_info", "since": since}
     ).json()
     assert listed["total"] == body["needs_more_info"]
+
+
+def test_one_request_runs_the_pending_action_scan_once(client: TestClient) -> None:
+    """``pending_actions`` and ``investigations_waiting`` read one scan.
+
+    Each GET /needs-you ran the scan twice: once for the pending-action part
+    and once in the Needs you query of the Investigations list.
+    """
+    from soc_ai.api.webui import routes_meta
+
+    _seed_run(client, "INV-NMI", alert_id="es-nmi", verdict="needs_more_info")
+    _seed_run(client, "INV-TP", alert_id="es-tp", verdict="true_positive", actions=[_ESCALATE])
+    real = routes_meta.pending_action_runs
+    calls: list[tuple[Any, Any]] = []
+
+    async def counted(db: Any, **kwargs: Any) -> dict[str, int]:
+        calls.append((kwargs.get("since"), kwargs.get("until")))
+        return await real(db, **kwargs)
+
+    # The alert part reads the Alerts list, which scans its own 7 day window
+    # for the waiting actions of each rule. It stands in here, so the count
+    # holds only the scans of the verdict window.
+    with (
+        patch(
+            "soc_ai.api.webui.routes_alerts.untriaged_group_count",
+            AsyncMock(return_value=(1, False)),
+        ),
+        patch.object(routes_meta, "pending_action_runs", counted),
+    ):
+        body = _needs_you(client)
+        assert len(calls) == 1
+        assert body["pending_actions"] == 1
+        # The Needs you view holds the run with the action and the run that
+        # needs more info. Both readers saw the one scan.
+        assert body["investigations_waiting"] == 2
+        # Negative control: the result does not outlive its request. A second
+        # request runs the scan again.
+        _needs_you(client)
+        assert len(calls) == 2
 
 
 def test_an_empty_store_needs_nothing(client: TestClient) -> None:
@@ -342,7 +381,7 @@ def test_pending_actions_by_run_counts_nothing_on_a_replay(client: TestClient) -
     assert by_run["INV-LIVE"] == 1
 
 
-def test_a_run_outside_the_window_is_not_counted(client: TestClient) -> None:
+def test_a_run_older_than_30_days_waits_until_a_person_decides(client: TestClient) -> None:
     _seed_run(
         client,
         "INV-TP",
@@ -354,8 +393,9 @@ def test_a_run_outside_the_window_is_not_counted(client: TestClient) -> None:
     _seed_run(client, "INV-NMI", alert_id="es-nmi", verdict="needs_more_info", hours_ago=31 * 24)
     with patch("soc_ai.webui.alerts_query.fetch_groups", AsyncMock(return_value=GroupPage([], 0))):
         body = _needs_you(client)
-    assert body["pending_actions"] == 0
-    assert body["needs_more_info"] == 0
+    assert body["pending_actions"] == 1
+    assert body["needs_more_info"] == 1
+    assert body["investigations_waiting"] == 2
 
 
 # ── The bell ────────────────────────────────────────────────────────────────

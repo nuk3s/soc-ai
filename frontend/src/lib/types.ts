@@ -3,6 +3,8 @@
 // Screens consume these via src/lib/api.ts; never import mock data directly.
 // ---------------------------------------------------------------------------
 
+import type { CampaignStage, HostCampaign, InvestigationCampaign } from './api';
+
 export type Verdict =
   | 'true_positive'
   | 'false_positive'
@@ -202,6 +204,18 @@ export interface AlertGroup {
   /** True when `cases` covers every escalated alert of the group. The server
    *  reads the newest escalated alerts only, so a long list can be partial. */
   casesComplete?: boolean;
+  /** The recommended actions that wait for a person on the true positive
+   *  runs of the group, under the needs-you rule. A group with one is in the
+   *  "Needs decision" view. Absent on an older server. */
+  waitingActions?: number;
+  /** The headline of the run behind `invId` and of the run behind
+   *  `windowInvId`. The row states the one of the run its verdict shows as
+   *  its reason line. Absent on an older server. */
+  headline?: string | null;
+  windowHeadline?: string | null;
+  /** The campaign of the investigation that the group names as its verdict.
+   *  Null when it is in no campaign. Absent on an older server. */
+  campaign?: InvestigationCampaign | null;
 }
 
 /** Returned by GET /api/v1/alerts/empty-reason: why the queue is showing nothing.
@@ -346,6 +360,9 @@ export interface TimelineStep {
   title: string;
   time: string;
   detail: string;
+  /** The tool of a tool call step, such as `t_prevalence`. Absent on other
+   *  steps and from an older server. */
+  tool?: string | null;
 }
 
 export type ActionTag = 'ack' | 'escalate' | 'comment';
@@ -383,6 +400,15 @@ export interface RecommendedAction {
    *  of a promotion, no alert, analyst verdict, comment with no case, demo.
    *  Dismiss stays on. Absent on an older server. */
   blockedReason?: string | null;
+  /** A note on an action that stays executable and waits on no one.
+   *  `campaign` for an investigation that a campaign holds. The card builds
+   *  that sentence from the campaign link. It states the `note` of any other
+   *  code as plain text. Absent on an older server. */
+  noteCode?: string | null;
+  /** The note in words: "Part of the campaign {title}. Decide on the campaign." */
+  note?: string | null;
+  /** The page of the note: the campaign page for the code `campaign`. */
+  noteHref?: string | null;
 }
 
 export interface ResolutionProvenance {
@@ -596,10 +622,53 @@ export interface EventTimeline {
   omitted: number;
 }
 
+
+/** A gate changed the verdict of a run. The summary keeps the text of the
+ *  model, and this record states the change. */
+export interface VerdictChange {
+  /** The gate, as the event trail names it. */
+  gate: string;
+  fromVerdict: string;
+  toVerdict: string;
+  /** The reason, in one or two sentences. */
+  reason: string;
+  /** The evidence the gate looked for and did not find. */
+  missing: string[];
+  /** Each step that changed the verdict, in order: the vote and the gates.
+   *  `fromVerdict` above is the verdict of the model. */
+  steps?: { gate: string; fromVerdict: string; toVerdict: string }[];
+}
+
+/** The authorized activity a run matched, as the list and the run page read
+ *  it. `state` is active, expired or revoked. An expired authorization keeps
+ *  the mark of its runs. After a revoke the run gets normal handling again. */
+export interface AuthorizationRef {
+  id: number;
+  label: string;
+  state: 'active' | 'expired' | 'revoked';
+  /** ISO UTC. */
+  expiresAt: string;
+  /** The analyst who recorded it. */
+  by: string;
+}
+
 export interface Investigation {
   id: string;
   /** alert-group id this investigation was opened from (drawer routing). */
   groupId: string;
+  /** The campaign of the investigation. Null when it is in no campaign.
+   *  Absent on an older server. */
+  campaign?: InvestigationCampaign | null;
+  /** The authorized activity this run matched. The id stays after a revoke.
+   *  Both are null on a run that matched none. Absent from an older server. */
+  authorizationId?: number | null;
+  authorization?: AuthorizationRef | null;
+  /** The one line of a run that is outside an authorized scope. It names the
+   *  part that failed. Null when no scope has anything to say. */
+  outsideAuthorizedScope?: string | null;
+  /** The one line of a clear from Needs you (`soc-ai needs-you clear`).
+   *  Null when no clear stands. Absent from an older server. */
+  needsYouCleared?: string | null;
   name: string;
   kind: DetectionKind;
   /** The source address of the alert as a display string. */
@@ -672,6 +741,10 @@ export interface Investigation {
    *  then offers no settled bar and no escalate from the chat. Absent from an
    *  older server. */
   writeBlockedReason?: string | null;
+  /** 'finding' or 'lead' when a promotion landed this run. The server
+   *  decides, with the rule that its action rule reads. Absent from an older
+   *  server. */
+  promotedKind?: 'finding' | 'lead' | null;
   /** The Security Onion cases the alert of this run is already on, read
    *  when an escalate waits. The escalate card names and links each one. */
   alertCases?: CaseLink[];
@@ -696,6 +769,14 @@ export interface Investigation {
   resolution?: ResolutionProvenance;
   /** Post-validator override note — present when a validator auto-corrected the verdict. */
   validatorNote?: string | null;
+  /** The text of the model, when a gate refuted its claim. The headline and
+   *  the summary are then the reason of the gate, and the page prints this
+   *  text under the label "The model wrote". null on every other run. */
+  modelText?: string | null;
+  /** The verdict change of a gate. The page prints it as one labeled line
+   *  under the headline, and `openQuestions` lists its missing evidence.
+   *  null when no gate changed the verdict. Absent from an older server. */
+  verdictChange?: VerdictChange | null;
   /** Pipeline-failure provenance (E1.2) — present ONLY when this run failed before
    * reaching a verdict (model truncation / gateway 5xx). Drives the drawer's
    * "failed before reaching a verdict" panel + Re-run, not the amber NMI block. */
@@ -733,6 +814,13 @@ export interface InvestigationCitation {
   target?: string | null;
   /** The validator's answer. Null when the run recorded no validation. */
   resolved?: boolean | null;
+  /** A `path` citation: the grid document that holds the field. Null when
+   *  no document holds it, or the stored context lacks the field. */
+  documentId?: string | null;
+  /** A `path` citation: the value of the field in the stored context. */
+  value?: string | null;
+  /** True when the server cut `value` at 2,000 characters. */
+  valueTruncated?: boolean;
 }
 
 /** The newer run of the same alert that replaced a run. */
@@ -760,6 +848,9 @@ export interface InvestigationFailure {
   cause: string;
   hint?: string | null;
   permanent: boolean;
+  /** The class of the cause: gateway, token_limit, time_limit, grid or
+   *  other. Absent from an older server. */
+  kind?: string | null;
 }
 
 /** The triggering detection's raw facts — the "what fired" reference panel. */
@@ -784,10 +875,26 @@ export interface AlertMeta {
 
 /** How the verdict was produced — the investigation provenance panel. */
 export interface InvMeta {
+  /** The model that the run asked for, or the configured model when the run
+   *  recorded none. */
   model: string;
+  /** A model call of the run hit the output token limit and ran again with
+   *  low reasoning. The page marks the model line. */
+  lowReasoning?: boolean;
+  /** The gateway model groups that served the run. null when the run
+   *  recorded none. Absent from an older server. */
+  servedModel?: string | null;
+  /** The models that the calls of the run asked for. null when the run
+   *  recorded none. */
+  requestedModel?: string | null;
+  /** The gateway served the run from a fallback route: its fallback count is
+   *  above zero, or a model group is not the model that the call asked for. */
+  servedFallback?: boolean;
   oracle?: string;
   ranBy: string;
   ranAt: string;
+  /** The time of the event that the investigation judges (ISO UTC). */
+  eventAt?: string;
   toolCalls: number;
   pivots: number;
 }
@@ -807,6 +914,9 @@ export interface OracleAdjudication {
   /** The Oracle answered another verdict and cited no evidence that resolves.
    * Its answer is an opinion on the run. The local verdict stands. */
   withheld?: boolean;
+  /** Why the Oracle gave no verdict, as one sentence. Null when it answered
+   *  or the run recorded no reason. Absent from an older server. */
+  noAnswer?: string | null;
 }
 
 export type SummarySegment =
@@ -828,8 +938,13 @@ export interface InvestigationRow {
    *  backend and null on a row whose alert named no machine. */
   hostName?: string | null;
   status: 'complete' | 'running' | 'error' | 'cancelled' | 'interrupted';
+  /** When soc-ai started the investigation: relative words and ISO time. */
   when: string;
   ts?: string;
+  /** The time of the event that the investigation judges (ISO UTC), and its
+   *  relative words. The When column, the window and the order read it. */
+  eventAt?: string;
+  eventWhen?: string;
   chatCount?: number;
   /** the alert this run investigated — retries of the same alert share it. */
   alertId?: string;
@@ -865,6 +980,23 @@ export interface InvestigationRow {
   /** Those actions, for Execute and Dismiss on the row (dogfood 2026-10-19,
    *  R1-I1). Filled under the same filter only. Absent on an older server. */
   waitingActions?: WaitingAction[] | null;
+  /** The authorized activity the run matched. Both are null on a run that
+   *  matched none. Absent on an older server. */
+  authorizationId?: number | null;
+  authorization?: AuthorizationRef | null;
+  /** The first line of the run: the verdict, the impact, and the host names
+   *  and roles. Null on a run that states none. Absent on an older server. */
+  firstLine?: string | null;
+  /** The headline of the run: the sentence the Alerts row and the
+   *  investigation page state. Null on a run with no verdict and on a
+   *  pipeline error. Absent on an older server. */
+  headline?: string | null;
+  /** The impact of a true positive: succeeded, attempted, unknown or none.
+   *  Null on every other verdict. Absent on an older server. */
+  impact?: string | null;
+  /** The campaign of the investigation. Null when it is in no campaign.
+   *  Absent on an older server. */
+  campaign?: InvestigationCampaign | null;
 }
 
 /** One recommended action that waits for a person, as a list row carries it.
@@ -884,6 +1016,10 @@ export interface WaitingAction {
   rationale: string;
   executable: boolean;
   reason: string | null;
+  /** The escalate of a finding only: an earlier press recorded no result and
+   *  the finding is on no case. The card of the investigation offers "Try
+   *  again", and the row offers no Escalate. Absent on an older server. */
+  retry?: boolean;
 }
 
 /** One SQL page of GET /api/v1/investigations — the /dossiers list shape.
@@ -950,10 +1086,16 @@ export type FindingInvestigationStatus =
   | 'complete'
   | 'failed'
   | 'cancelled'
-  | 'over_cap';
+  | 'over_cap'
+  /** A campaign holds the finding: no new stage, no new machine, no later
+   *  event. soc-ai opened no investigation, and the link names the campaign. */
+  | 'campaign';
 /** The four codes a backend before 2026-10-06 sends. */
 export type LegacyHuntOutcome = 'threats' | 'clean' | 'gap' | 'failed' | '';
 export type HuntKind = 'chat' | 'scheduled' | 'triggered' | 'lead';
+/** The class that started a hunt. `campaign`: soc-ai hunted on a change of a
+ *  campaign. */
+export type HuntStarter = 'analyst' | 'schedule' | 'lead' | 'catalog' | 'campaign';
 
 /** One row in the Hunts list. */
 export interface HuntRow {
@@ -981,9 +1123,13 @@ export interface HuntRow {
   confidence: number | null;
   startedBy: string;
   /** The class that started the hunt. startedBy keeps the actor name. */
-  starter?: 'analyst' | 'schedule' | 'lead' | 'catalog';
+  starter?: HuntStarter;
   /** The lead a lead-started hunt came from. */
   leadId?: number | null;
+  /** The campaign of the hunt: the campaign a campaign hunt answers, or the
+   *  campaign that holds the lead or the findings of the hunt. Null for none.
+   *  Absent on an older server. */
+  campaign?: InvestigationCampaign | null;
   when: string;
   ts: string;
   /** Follow-up chat messages on this hunt (0 = no chat log). */
@@ -996,6 +1142,17 @@ export interface HuntRow {
    *  and how many subject findings there are. 0 and 0 on a hunt with none. */
   findingsInvestigated?: number;
   findingsTotal?: number;
+  /** The threat findings whose verdict is true positive, and those whose
+   *  verdict is false positive. A finding that restates an earlier finding
+   *  counts the verdict that answers for it. An older server omits both. */
+  findingsConfirmed?: number;
+  findingsFalsePositive?: number;
+  /** The degraded mark of a hunt that completed: the reason code and the
+   *  sentence the console prints. null on a hunt with no mark. The one code
+   *  today is "no_reasoning_trace": the model returned no reasoning trace,
+   *  and earlier hunts carried one. An older server omits both. */
+  degraded?: string | null;
+  degradedNote?: string | null;
 }
 
 export interface HuntStat {
@@ -1035,7 +1192,15 @@ export interface HuntFinding {
    *  re-promote slot server-side, so the card falls back to Investigate even
    *  though this is non-null — status is what decides the card's state, not
    *  presence alone. */
-  investigation?: { id: string; status: string; verdict?: string | null; conf?: number | null } | null;
+  investigation?: {
+    id: string;
+    status: string;
+    verdict?: string | null;
+    conf?: number | null;
+    /** The campaign of the investigation. Null when it is in no campaign.
+     *  Absent on an older server. */
+    campaign?: InvestigationCampaign | null;
+  } | null;
   /** The investigation of this finding, flat (2026-10-07). The hunt opens one
    *  for each subject finding, or reuses the run of the same subject. Null on
    *  a finding with none. Absent from an older backend. */
@@ -1054,6 +1219,24 @@ export interface HuntFinding {
   /** The finding of this hunt, by 0-based ordinal, that the investigation was
    *  opened for. Null when another hunt opened it. */
   investigationSubject?: number | null;
+  /** The earlier finding this one restates: the hunt that reported it, its
+   *  0-based ordinal there and its title. The finding names no new entity and
+   *  cites nothing new, so the investigation of the earlier finding answers
+   *  and the hunt started no new one. Null on a finding with its own run.
+   *  Absent from an older backend. */
+  /** The campaign that holds the finding, on the link state `campaign`.
+   *  Absent on an older server. */
+  campaign?: InvestigationCampaign | null;
+  restates?: {
+    huntId: string;
+    ordinal: number;
+    title: string;
+    /** The verdict of the latest run of the earlier finding, read live. */
+    verdict?: string | null;
+    /** Whether that run answers for this finding. Only a true positive does.
+     *  false leaves this finding with no investigation of its own. */
+    answers?: boolean;
+  } | null;
 }
 
 // ---- Detection bridge (1.3 slice 3): draft-detection review pane ----------
@@ -1122,12 +1305,14 @@ export interface HuntDiffEntry {
 }
 
 /** The finding-level diff of a hunt vs the previous COMPLETE run of the SAME
- *  objective (new / persisting / resolved), with the baseline run's timestamp.
- *  Present only when a previous completed run exists. */
+ *  objective (new / persisting / not reported this run), with the baseline
+ *  run's timestamp. Present only when a previous completed run exists.
+ *  `notReported` was `resolved`: the comparison knows that this run did not
+ *  report the finding, and it does not know that the activity stopped. */
 export interface HuntDiff {
   new: HuntDiffEntry[];
   persisting: HuntDiffEntry[];
-  resolved: HuntDiffEntry[];
+  notReported: HuntDiffEntry[];
   previousHuntId: string;
   previousTs: string;
   previousWhen: string;
@@ -1160,7 +1345,9 @@ export interface HuntDetailData {
   timeline: TimelineStep[];
   /** The class that started the hunt. startedBy keeps the actor name. Absent
    *  on a route that sends none, and `kind` answers instead. */
-  starter?: 'analyst' | 'schedule' | 'lead' | 'catalog';
+  starter?: HuntStarter;
+  /** The campaign of the hunt. See HuntRow. */
+  campaign?: InvestigationCampaign | null;
   /** The lead a lead-started hunt came from. Absent on a route that sends
    *  none, and the hunts list answers instead. */
   leadId?: number | null;
@@ -1182,13 +1369,25 @@ export interface HuntDetailData {
   /** How long agent hunts on this grid take: the middle half of the recent
    *  finished runs, in whole minutes. null while the store holds too few. */
   typicalRun?: { lowMin: number; highMin: number; medianMin: number; samples: number } | null;
-  /** The investigations of the subject findings. See HuntRow. */
+  /** The investigations of the subject findings and their verdicts. See
+   *  HuntRow. */
   findingsInvestigated?: number;
   findingsTotal?: number;
+  findingsConfirmed?: number;
+  findingsFalsePositive?: number;
+  /** The threat findings of the report, a subject or not. */
+  threatFindingCount?: number;
   /** The documents the findings cite, in event-time order, in UTC. null
    *  while the hunt runs and when fewer than two cited documents have a
    *  stored time. An older server omits the field. */
   eventTimeline?: EventTimeline | null;
+  /** The degraded mark of a hunt that completed. See HuntRow. */
+  degraded?: string | null;
+  degradedNote?: string | null;
+  /** The raw error of a hunt that ended in an error: the exception name and
+   *  its message. `outcome_headline` states the plain cause, and the page
+   *  shows this text behind a toggle. null on a hunt with no stored error. */
+  errorDetail?: string | null;
 }
 
 export interface HostContextEnd {
@@ -1502,6 +1701,10 @@ export interface Notification {
    *  moment. Dismiss all hides every dismissible row at or before its own
    *  moment, the rows it never loaded too. */
   at?: string | null;
+  /** The stage of the campaign on a campaign row (`campaign:{change id}`).
+   *  Null when no stage is proven. Absent on every other row and on an older
+   *  server. */
+  stage?: CampaignStage | null;
 }
 
 // ── Backtest ("prove it on my last N days") ─────────────────────────────────
@@ -1989,7 +2192,8 @@ export type MachineSortKey =
   | 'agent'
   | 'events'
   | 'first_seen'
-  | 'last_seen';
+  | 'last_seen'
+  | 'findings';
 
 export type SortDir = 'asc' | 'desc';
 
@@ -2054,6 +2258,23 @@ export interface MachineRow extends MachineBase {
   /** The sweep error on the primary address of a machine with no clean
    *  build. Absent from an older server. */
   build_error?: string | null;
+  /** The Findings column: true positive verdicts on the machine in the last
+   *  `days` days, and the open leads that name it. Absent from an older
+   *  server. */
+  findings?: MachineFindings;
+}
+
+export interface MachineFindings {
+  confirmed: number;
+  open_leads: number;
+  days: number;
+}
+
+/** The newest grid event of each address, read live in one search. An
+ *  address with no record in the window is absent. */
+export interface MachineLastEvents {
+  events: Record<string, string>;
+  window: string;
 }
 
 export interface MachineList {
@@ -2129,6 +2350,9 @@ export interface MachineDetail extends MachineBase {
   macs: string[];
   merged_from: string[];
   dossier: Dossier;
+  /** The active campaigns where the machine is a party, newest last event
+   *  first. Absent on an older server. */
+  campaigns?: HostCampaign[];
 }
 
 // ---- Host activity (live half of the host page) -----------------------------

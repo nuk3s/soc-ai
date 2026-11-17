@@ -27,8 +27,16 @@ FLUSH_EVERY = 1
 
 
 def _first_rationale(report: dict[str, Any]) -> str | None:
+    """The row headline: the rationale of the first action, else the first
+    sentence of the summary.
+
+    A report whose claim a gate refuted carries ``model_summary``, and its
+    summary is the reason of the gate (soc_ai.agent.gates.report_text). Its
+    headline is the first sentence of that summary. The rationale of an
+    action is a sentence of the model, and it contradicts the final verdict.
+    """
     actions = report.get("recommended_actions") or []
-    if actions and actions[0].get("rationale"):
+    if actions and actions[0].get("rationale") and not report.get("model_summary"):
         return str(actions[0]["rationale"])
     summary = str(report.get("summary") or "")
     if summary:

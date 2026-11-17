@@ -18,7 +18,8 @@ import asyncio
 import json
 import logging
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 from pydantic_ai import Agent
@@ -47,10 +48,15 @@ from soc_ai.agent.hunt_gates import (
 from soc_ai.agent.models import build_investigator_model
 from soc_ai.agent.orchestrator import InvestigationContext, StepEvent, _walk_message
 from soc_ai.agent.prompts import oql_primer_block
+from soc_ai.agent.reasoning import extract_reasoning_trace
 from soc_ai.agent.toolset import GRID_BACKED_TOOLS, GRID_UNAVAILABLE_REASON
 from soc_ai.api.hunt_recorder import HuntRecorder
 from soc_ai.api.runner import CancelToken
 from soc_ai.dossier.prompt import host_dossier_prompt_block, internal_ips_in_text
+from soc_ai.hunting import authorized as authorized_block
+from soc_ai.hunting import campaign_block
+from soc_ai.hunting import outcome as hunt_outcome
+from soc_ai.hunting.hunt_words import DEGRADED_FINDING_NOTE
 from soc_ai.hunting.outcome import FindingVerdicts
 from soc_ai.run_meter import start_search_meter
 from soc_ai.so_client.inventory import inventory_prompt_block
@@ -70,6 +76,8 @@ async def _build_hunt_run(
     objective: str,
     prior: str | None,
     earlier: str | None = None,
+    authorized: str | None = None,
+    campaigns: str | None = None,
 ) -> tuple[EgressGuard | None, Agent[None, HuntReport], str]:
     """Compose the (guard, agent, user message) triple for one hunt run.
 
@@ -84,6 +92,14 @@ async def _build_hunt_run(
     kept. It follows the objective in the user message, so the sanitize pass
     and the residue sweep over the user message cover it. The hosts it names
     go to the dossier with their own label.
+
+    ``authorized`` is the authorized activity block that
+    :func:`_vetted_authorized` kept. It follows the earlier conclusions in the
+    user message, under the same sanitize pass and residue sweep.
+
+    ``campaigns`` is the text of the campaign blocks that
+    :func:`_vetted_campaigns` kept. It sits between the earlier conclusions
+    and the authorized activity, under the same pass and sweep.
     """
     guard = await _egress_guard_for(ctx)
     # The hunt agent runs OQL — append the primer so it writes VALID queries
@@ -110,7 +126,9 @@ async def _build_hunt_run(
         + gaps
         + dossier
     )
-    user_msg = build_hunt_prompt(objective, prior=prior, earlier=earlier)
+    user_msg = build_hunt_prompt(
+        objective, prior=prior, earlier=earlier, campaigns=campaigns, authorized=authorized
+    )
     if guard is not None:
         # The objective is analyst-typed free text that may name internal
         # hosts, and the inventory block carries grid dataset detail.
@@ -170,28 +188,159 @@ async def _objective_dossier_block(
 
 async def _vetted_earlier(
     ctx: InvestigationContext, earlier: EarlierConclusions | None
-) -> tuple[str | None, bool]:
-    """The earlier-conclusions text the hunt may read, and whether it was dropped.
+) -> tuple[str | None, list[str]]:
+    """The earlier-conclusions text the hunt may read, and the parts that were dropped.
 
     The block carries stored model text, desanitized at rest. With redaction
-    on and fail-closed, a block that holds a name the redaction cannot remove
+    on and fail-closed, a part that holds a name the redaction cannot remove
     is dropped, and the hunt runs without it. A residue error here would fail
     every later run of the same subject closed, because the same stored text
     comes back each time. The log line gives the count only, never the names.
+
+    A scheduled hunt reads two parts: the earlier runs of its objective and
+    the records of its window. Each part is vetted alone, so a name in one
+    part does not cost the hunt the other part.
     """
     if earlier is None:
+        return None, []
+    # A window whose every record a campaign block states has no text.
+    parts = list(earlier.parts) or ([("block", earlier.text)] if earlier.text else [])
+    guard = await _egress_guard_for(ctx)
+    kept: list[str] = []
+    dropped: list[str] = []
+    for name, text in parts:
+        if guard is not None and ctx.settings.analyst_redaction_fail_closed is True:
+            leaked = guard.residue(guard.sanitize_text(text))
+            if leaked:
+                _LOGGER.warning(
+                    "hunt: the %s part of the earlier conclusions held %d internal names "
+                    "that the redaction could not remove. The hunt starts without that part.",
+                    name,
+                    len(leaked),
+                )
+                dropped.append(name)
+                continue
+        kept.append(text)
+    return ("\n\n".join(kept) if kept else None), dropped
+
+
+async def _vetted_campaigns(
+    ctx: InvestigationContext, scope: campaign_block.Scope, *, hours: int
+) -> campaign_block.CampaignBlocks:
+    """The campaign blocks the hunt may read, and the campaigns whose block was dropped.
+
+    The blocks hold machine names from DHCP, DNS and the agents. With
+    redaction on and fail-closed, a block that holds a name the redaction
+    cannot remove is dropped, and the hunt runs without it. Each block is
+    vetted alone, so one name does not cost the hunt the other campaigns. A
+    dropped block covers nothing, so its records stay in the window block.
+    An evaluation hunt reads no block: its grid holds planted scenarios, and
+    a real campaign says nothing about them.
+    """
+    if ctx.include_synth:
+        return campaign_block.CampaignBlocks()
+    blocks = await campaign_block.blocks_for_hunt(ctx.db_sessionmaker, scope=scope, hours=hours)
+    if not blocks:
+        return campaign_block.CampaignBlocks()
+    guard = await _egress_guard_for(ctx)
+    kept: list[campaign_block.CampaignBlock] = []
+    dropped: list[int] = []
+    for block in blocks:
+        if guard is not None and ctx.settings.analyst_redaction_fail_closed is True:
+            leaked = guard.residue(guard.sanitize_text(block.text))
+            if leaked:
+                _LOGGER.warning(
+                    "hunt: the block of campaign %s held %d internal names that the redaction "
+                    "could not remove. The hunt starts without that block.",
+                    block.campaign_id,
+                    len(leaked),
+                )
+                dropped.append(block.campaign_id)
+                continue
+        kept.append(block)
+    return campaign_block.CampaignBlocks(kept=tuple(kept), dropped=tuple(dropped))
+
+
+async def _without_campaign_records(
+    ctx: InvestigationContext,
+    earlier: EarlierConclusions | None,
+    campaigns: campaign_block.CampaignBlocks,
+) -> EarlierConclusions | None:
+    """The earlier conclusions of a scheduled hunt, read again without the campaign records.
+
+    A kept campaign block states its investigations and its leads. The
+    window block then leaves them out (``covered`` of
+    :func:`~soc_ai.hunting.earlier.earlier_for_objective`). A dropped block covers nothing, so
+    its records stay in the window block. A read that gives nothing keeps the
+    first conclusions: the hunt reads a record two times, never zero times.
+    """
+    covered = campaigns.covered
+    if earlier is None or earlier.basis is None or not covered or ctx.db_sessionmaker is None:
+        return earlier
+    from soc_ai.hunting import earlier as earlier_mod  # noqa: PLC0415 - lazy, like the gate
+
+    objective, at, interval = earlier.basis
+    again = await earlier_mod.earlier_for_objective(
+        ctx.db_sessionmaker, objective, now=at, interval_minutes=interval, covered=covered
+    )
+    return again if again is not None else earlier
+
+
+def _gate_basis(
+    earlier: EarlierConclusions | None, campaigns: campaign_block.CampaignBlocks
+) -> EarlierConclusions | None:
+    """What the window gate reads: the true positives that the hunt was told about.
+
+    A scheduled hunt reads its window, and the window still names each true
+    positive that a campaign block states. Any other hunt reads no window:
+    the true positives of its campaign blocks in the window of the hunt feed
+    the gate (:attr:`soc_ai.hunting.campaign_block.CampaignBlock.confirmed`).
+    """
+    if earlier is not None and earlier.basis is not None:
+        return earlier
+    extra = campaigns.confirmed
+    if not extra:
+        return earlier
+    from soc_ai.hunting import earlier as earlier_mod  # noqa: PLC0415 - lazy, like the gate
+
+    held = tuple(earlier.confirmed) if earlier is not None else ()
+    return earlier_mod.EarlierConclusions(text="", confirmed=held + extra)
+
+
+async def _vetted_authorized(
+    ctx: InvestigationContext, stated_campaigns: Sequence[int] = ()
+) -> tuple[str | None, bool]:
+    """The authorized activity block the hunt may read, and whether it was dropped.
+
+    The block lists the authorizations in force
+    (:func:`soc_ai.hunting.authorized.block_for_hunt`). It holds machine
+    names. With redaction on and fail-closed, a block that holds a name the
+    redaction cannot remove is dropped, like the earlier conclusions. The
+    hunt then reports the authorized activity as a threat, which is the safe
+    side. An evaluation hunt reads no block: its grid holds planted
+    scenarios, and a real authorization says nothing about them.
+
+    ``stated_campaigns`` are the campaigns whose block the hunt reads. Their
+    campaign records are not listed again.
+    """
+    if ctx.include_synth:
+        return None, False
+    block = await authorized_block.block_for_hunt(
+        ctx.db_sessionmaker, skip_campaigns=stated_campaigns
+    )
+    if block is None:
         return None, False
     guard = await _egress_guard_for(ctx)
     if guard is not None and ctx.settings.analyst_redaction_fail_closed is True:
-        leaked = guard.residue(guard.sanitize_text(earlier.text))
+        leaked = guard.residue(guard.sanitize_text(block.text))
         if leaked:
             _LOGGER.warning(
-                "hunt: the earlier conclusions held %d internal names that the redaction "
-                "could not remove. The hunt starts without them.",
+                "hunt: the authorized activity held %d internal names that the redaction "
+                "could not remove. The hunt starts without it.",
                 len(leaked),
             )
             return None, True
-    return earlier.text, False
+    return block.text, False
 
 
 async def _egress_guard_for(ctx: InvestigationContext) -> EgressGuard | None:
@@ -235,8 +384,73 @@ _repair_dangling_tool_calls = repair_dangling_tool_calls
 _replay_reasoning_context = replay_reasoning_context
 
 
+_TEXT_TRANSCRIPT_HEADER = (
+    "## The evidence of the hunt, as text\n"
+    "Each line below is a tool call that the hunt made or the result that it "
+    "returned, in order. Call no tool. Write the HuntReport from these results "
+    "only.\n\n"
+)
+
+
+def _part_text(value: Any) -> str:
+    """One tool argument or tool result as text. Never raises."""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, default=str, ensure_ascii=False)
+    except Exception:
+        return str(value)
+
+
+def _parts_of(msg: Any) -> list[Any]:
+    """The parts of one transcript message, or none for a shape that has none."""
+    try:
+        return list(getattr(msg, "parts", None) or [])
+    except Exception:
+        return []
+
+
+def _text_transcript(gathered: list[Any]) -> str:
+    """The gathered transcript as plain text, with no tool-call part in it.
+
+    The synthesizer replays the transcript as message history. A model that
+    reads a history of tool calls can answer with one more tool call, and the
+    synthesizer has no tool. Prod hunt 01M69M3FVK9D6KECGCAXJK9F6Z lost its
+    report that way (2026-10-31): 42 tool calls, then "the next tool call(s)
+    would exceed the tool_calls_limit of 0".
+
+    This copy holds the same evidence as lines of text: each tool call, each
+    tool result and each note of the model, in order. The system prompt, the
+    user prompt and the retry prompts are left out, because the synthesizer
+    has its own instructions. The reasoning is left out too, because
+    :func:`_replay_reasoning_context` carries it. A part of a shape this
+    build does not know is skipped.
+    """
+    lines: list[str] = []
+    for msg in gathered:
+        for part in _parts_of(msg):
+            name = type(part).__name__
+            tool = str(getattr(part, "tool_name", "") or "tool")
+            if name in ("ToolCallPart", "ToolSearchCallPart"):
+                lines.append(f"Tool call {tool}: {_part_text(getattr(part, 'args', None))}")
+            elif name in ("ToolReturnPart", "ToolSearchReturnPart"):
+                lines.append(f"Tool result {tool}: {_part_text(getattr(part, 'content', None))}")
+            elif name == "TextPart":
+                note = str(getattr(part, "content", "") or "").strip()
+                if note:
+                    lines.append(f"Model note: {note}")
+    if not lines:
+        return ""
+    return _TEXT_TRANSCRIPT_HEADER + "\n".join(lines) + "\n\n---\n\n"
+
+
 async def _synthesize_partial_hunt(
-    ctx: InvestigationContext, *, objective: str, gathered: list[Any]
+    ctx: InvestigationContext,
+    *,
+    objective: str,
+    gathered: list[Any],
+    text_only: bool = False,
+    usage: RunUsage | None = None,
 ) -> Any:
     """Force a :class:`HuntReport` from an already-gathered transcript (no tools).
 
@@ -261,12 +475,25 @@ async def _synthesize_partial_hunt(
     transcript is already label-space (``_stream_node`` gathers the sanitized
     node messages). The caller desanitizes the labeled report via
     :func:`_desanitize_hunt_report`, exactly as on the full-run path.
+
+    ``text_only`` is the second attempt, after the replay stopped on a usage
+    limit. The transcript goes into the user message as text
+    (:func:`_text_transcript`), and no message history is replayed, so the
+    model reads no tool-call part that it could answer with a tool call. The
+    tool-call limit of 0 does not apply to this attempt. The synthesizer
+    registers no tool, so no call can run. Without the limit, a call to a tool
+    that does not exist gets a retry prompt, where the limit ended the run.
+    The request limit still bounds the attempt.
+
+    ``usage`` receives the model usage of the attempt as it runs. An attempt
+    that raises returns no result, so the caller reads its cost from here.
     """
     guard = ctx.egress_guard
     reasoning_block = _replay_reasoning_context(gathered)
     user_msg = (
         reasoning_block + "Write the HuntReport now from the evidence already gathered above."
     )
+    transcript = _text_transcript(gathered) if text_only else ""
     synth_objective = objective
     if guard is not None:
         fail_closed = ctx.settings.analyst_redaction_fail_closed
@@ -278,13 +505,22 @@ async def _synthesize_partial_hunt(
         # ``_build_hunt_run``).
         guard.check_or_raise(synth_objective, fail_closed=fail_closed)
         guard.check_or_raise(user_msg, fail_closed=fail_closed)
+        # The transcript is label-space already, like the history it replaces:
+        # the tool boundary sanitized each result. It gets the same pass again
+        # and no residue sweep, which is the boundary of the replayed history.
+        transcript = guard.sanitize_text(transcript)
     synth = build_hunt_synthesizer(
         build_investigator_model(ctx.settings), objective=synth_objective
     )
+    if text_only:
+        return await synth.run(
+            transcript + user_msg, usage_limits=UsageLimits(request_limit=3), usage=usage
+        )
     return await synth.run(
         user_msg,
         message_history=_repair_dangling_tool_calls(gathered),
         usage_limits=UsageLimits(request_limit=3, tool_calls_limit=0),
+        usage=usage,
     )
 
 
@@ -365,6 +601,128 @@ async def _stream_node(
         yield disp
 
 
+async def _partial_report(
+    ctx: InvestigationContext,
+    *,
+    objective: str,
+    gathered: list[Any],
+    stopped_by: str,
+    ev_factory: Any,
+    landed: list[Any],
+) -> AsyncIterator[StepEvent]:
+    """Write the partial report of a hunt that reached a limit, as trace events.
+
+    The first attempt replays the transcript as message history. When it
+    stops on a usage limit, the model answered the transcript with a tool
+    call, and the synthesizer has no tool. Prod lost a 55-minute hunt there
+    (2026-10-31). The evidence is still in hand, so a second attempt runs on a
+    text copy of it (:func:`_text_transcript`). Any other failure of the first
+    attempt gets no second attempt: a gateway error is not a transcript
+    problem.
+
+    ``landed`` receives the synthesis result when one attempt succeeds. When
+    it stays empty, the last event of the stream is the ``error`` event.
+    """
+    yield ev_factory(
+        "model_response",
+        {
+            "text": (
+                "Reached the hunt's exploration budget. Writing a partial "
+                "report from the evidence gathered so far."
+            )
+        },
+    )
+    # The usage of each attempt, filled as it runs. An attempt that raises
+    # returns no result, and the model calls it made still cost tokens. The
+    # failed first attempt of a lost prod hunt ran 25 minutes with no record.
+    first_usage = RunUsage()
+    try:
+        landed.append(
+            await _synthesize_partial_hunt(
+                ctx, objective=objective, gathered=gathered, usage=first_usage
+            )
+        )
+        return
+    except asyncio.CancelledError:
+        raise
+    except UsageLimitExceeded as e:
+        _LOGGER.warning(
+            "hunt: the report writer stopped on a usage limit (%s). "
+            "It runs once more on a text copy of the evidence.",
+            e,
+        )
+        if (spent := _failed_attempt_usage(ev_factory, first_usage)) is not None:
+            yield spent
+    except BaseException as e:
+        _LOGGER.exception("hunt partial synthesis failed")
+        if (spent := _failed_attempt_usage(ev_factory, first_usage)) is not None:
+            yield spent
+        yield _synthesis_failed_event(ev_factory, e, stopped_by)
+        return
+    yield ev_factory("model_response", {"text": _TEXT_RETRY_NOTE})
+    second_usage = RunUsage()
+    try:
+        landed.append(
+            await _synthesize_partial_hunt(
+                ctx, objective=objective, gathered=gathered, text_only=True, usage=second_usage
+            )
+        )
+    except asyncio.CancelledError:
+        raise
+    except BaseException as e:
+        _LOGGER.exception("hunt partial synthesis failed on the text copy too")
+        if (spent := _failed_attempt_usage(ev_factory, second_usage)) is not None:
+            yield spent
+        yield _synthesis_failed_event(ev_factory, e, stopped_by)
+
+
+def _failed_attempt_usage(ev_factory: Any, usage: RunUsage) -> StepEvent | None:
+    """The ``usage`` event of a report attempt that raised, or None when it made no request."""
+    if not usage.requests:
+        return None
+    return _hunt_usage_event(
+        ev_factory, SimpleNamespace(usage=usage), phase="hunt_partial_synth_failed"
+    )
+
+
+def _started_payload(
+    objective: str,
+    earlier: Any,
+    *,
+    earlier_text: str | None,
+    earlier_dropped: Any,
+    authorized_text: str | None,
+    authorized_dropped: Any,
+    campaigns: campaign_block.CampaignBlocks | None = None,
+) -> dict[str, Any]:
+    """The payload of the ``hunt_started`` event: what the hunt was given to read.
+
+    ``campaign_ids`` names the campaigns whose block the hunt read. The
+    investigation phase reads it: only such a campaign can hold a finding
+    (:func:`soc_ai.webui.hunt_findings.plan_campaign_holds`).
+    """
+    started: dict[str, Any] = {"objective": objective}
+    if campaigns is not None and campaigns.text is not None:
+        started["campaigns"] = campaigns.text
+        started["campaign_ids"] = campaigns.ids
+    if campaigns is not None and campaigns.dropped:
+        started["campaigns_dropped"] = "residue"
+        started["campaigns_dropped_ids"] = list(campaigns.dropped)
+    if earlier is not None:
+        started["earlier_refs"] = {k: list(v) for k, v in earlier.refs.items()}
+    if earlier_text is not None:
+        started["earlier"] = earlier_text
+    if earlier_dropped:
+        started["earlier_dropped"] = "residue"
+        # Which parts the hunt did not read: "runs", "window" or "block".
+        started["earlier_dropped_parts"] = earlier_dropped
+    if authorized_text is not None:
+        started["authorized"] = authorized_text
+    if authorized_dropped:
+        started["authorized_dropped"] = "residue"
+    return started
+
+
 async def run_hunt(  # noqa: PLR0915 - one linear streaming flow, like the triage pipeline
     ctx: InvestigationContext,
     *,
@@ -372,6 +730,7 @@ async def run_hunt(  # noqa: PLR0915 - one linear streaming flow, like the triag
     prior: str | None = None,
     session_id: str | None = None,
     earlier: EarlierConclusions | None = None,
+    campaign_scope: campaign_block.Scope | None = None,
 ) -> AsyncIterator[StepEvent]:
     """Stream a chat-driven hunt as StepEvents.
 
@@ -387,6 +746,10 @@ async def run_hunt(  # noqa: PLR0915 - one linear streaming flow, like the triag
     ``hunt_started`` records its source records, the text the model reads, or
     the drop (:func:`_vetted_earlier`), so the event never shows text the model
     did not read.
+
+    ``campaign_scope`` says which campaign blocks the hunt reads
+    (:func:`soc_ai.hunting.campaign_block.scope_of`). None reads the blocks of
+    every campaign of the window. An evaluation hunt reads none.
     """
     sid = session_id or uuid.uuid4().hex[:12]
     sequence = 0
@@ -396,21 +759,41 @@ async def run_hunt(  # noqa: PLR0915 - one linear streaming flow, like the triag
         sequence += 1
         return StepEvent(kind=kind, session_id=sid, sequence=sequence, payload=payload)
 
+    from soc_ai.hunting import earlier as earlier_mod  # noqa: PLC0415 - lazy, like the gate
+
+    basis = earlier.basis if earlier is not None else None
+    campaigns = await _vetted_campaigns(
+        ctx,
+        campaign_scope or campaign_block.EVERY_CAMPAIGN,
+        hours=earlier_mod.window_hours(objective, basis[2] if basis is not None else None),
+    )
+    # The window block leaves out what a kept campaign block states, so the
+    # hunt reads each record one time. The gate reads all of them.
+    earlier = await _without_campaign_records(ctx, earlier, campaigns)
+    gate_basis = _gate_basis(earlier, campaigns)
     earlier_text, earlier_dropped = await _vetted_earlier(ctx, earlier)
-    started: dict[str, Any] = {"objective": objective}
-    if earlier is not None:
-        started["earlier_refs"] = {k: list(v) for k, v in earlier.refs.items()}
-    if earlier_text is not None:
-        started["earlier"] = earlier_text
-    if earlier_dropped:
-        started["earlier_dropped"] = "residue"
+    authorized_text, authorized_dropped = await _vetted_authorized(ctx, campaigns.ids)
+    started = _started_payload(
+        objective,
+        earlier,
+        earlier_text=earlier_text,
+        earlier_dropped=earlier_dropped,
+        authorized_text=authorized_text,
+        authorized_dropped=authorized_dropped,
+        campaigns=campaigns,
+    )
     yield _ev("hunt_started", started)
 
     # Guard (opt-in cloud-egress redaction) + agent + sanitized prompts. The
     # guard is attached to ctx BEFORE the agent is built so the toolset wraps
     # the tool closures at registration time.
     guard, agent, user_msg = await _build_hunt_run(
-        ctx, objective=objective, prior=prior, earlier=earlier_text
+        ctx,
+        objective=objective,
+        prior=prior,
+        earlier=earlier_text,
+        authorized=authorized_text,
+        campaigns=campaigns.text,
     )
     # Hunts get a bigger budget than a single-alert investigation — they explore
     # broadly (many hosts/queries) before synthesizing, and the investigation-sized
@@ -421,6 +804,10 @@ async def run_hunt(  # noqa: PLR0915 - one linear streaming flow, like the triag
     )
 
     result: Any = None
+    # Which limit stopped the exploration: "time" for the wall clock, "budget"
+    # for the request or tool-call budget. The error event of a lost hunt
+    # carries it, so the page can name the limit.
+    stopped_by = "budget"
     # Accumulate the streamed node messages so that, if the hunt exhausts its budget
     # before emitting a report, we can synthesize a partial report from what it
     # actually gathered instead of erroring with nothing.
@@ -460,6 +847,7 @@ async def run_hunt(  # noqa: PLR0915 - one linear streaming flow, like the triag
             "hunt hit its exploration budget/time limit; synthesizing partial report: %s", e
         )
         budget_exhausted = True
+        stopped_by = "time" if isinstance(e, TimeoutError) else "budget"
     except BaseException as e:
         _LOGGER.exception("hunt agent run failed")
         if (usage_ev := _hunt_usage_event(_ev, agent_run, phase="hunt")) is not None:
@@ -475,30 +863,21 @@ async def run_hunt(  # noqa: PLR0915 - one linear streaming flow, like the triag
     if result is None and budget_exhausted and gathered:
         # Replay the accumulated transcript through a no-tools synthesizer to land a
         # grounded partial HuntReport rather than an empty error.
-        yield _ev(
-            "model_response",
-            {
-                "text": (
-                    "Reached the hunt's exploration budget. Writing a partial "
-                    "report from the evidence gathered so far."
-                )
-            },
-        )
-        try:
-            result = await _synthesize_partial_hunt(ctx, objective=objective, gathered=gathered)
-            partial_synthesis = True
-        except asyncio.CancelledError:
-            raise
-        except BaseException as e:
-            _LOGGER.exception("hunt partial synthesis failed")
-            yield _ev(
-                "error",
-                {
-                    "message": f"hunt hit its budget and partial synthesis failed: {e}",
-                    "type": type(e).__name__,
-                },
-            )
+        landed: list[Any] = []
+        async for synth_ev in _partial_report(
+            ctx,
+            objective=objective,
+            gathered=gathered,
+            stopped_by=stopped_by,
+            ev_factory=_ev,
+            landed=landed,
+        ):
+            yield synth_ev
+        if not landed:
+            # The report writer failed, and its error event is in the stream.
             return
+        result = landed[0]
+        partial_synthesis = True
         if (
             synth_usage_ev := _hunt_usage_event(_ev, result, phase="hunt_partial_synth")
         ) is not None:
@@ -534,6 +913,14 @@ async def run_hunt(  # noqa: PLR0915 - one linear streaming flow, like the triag
     for gate_ev in gate_events:
         yield gate_ev
 
+    # ── Window gate (deterministic, C2) ──────────────────────────────────────
+    # A scheduled hunt reads the true positives that soc-ai holds for its
+    # window. A report that names none of them, by host or by rule, gets one
+    # labeled line before the text of the model. Runs before the
+    # evidence-count gate, so it reads the model's own narrative and not the
+    # banner of a blind hunt.
+    report = _gate_window_all_clear(report, gate_basis)
+
     # ── Evidence-count gate (deterministic, G6) ──────────────────────────────
     # Count what the tools ACTUALLY returned rather than trusting the write-up to
     # mention the failures. A hunt may only stand as a clean sweep if at least ONE
@@ -545,12 +932,43 @@ async def run_hunt(  # noqa: PLR0915 - one linear streaming flow, like the triag
     # citation gate for citing nothing — a blind hunt has nothing to cite.
     report, degraded_reason = _gate_hunt_evidence(report, gathered_tool_results)
 
+    # ── Reasoning trace check (C4) ───────────────────────────────────────────
+    # A hunt whose model responses carry no reasoning trace, on a deployment
+    # whose earlier hunts carried one, ran on a weaker path. Prod hunt
+    # 01M6HB9Y7JDA71ZEYME4N2MSF2 (2026-11-03) ran 36 responses with no trace
+    # and wrote 3 false threat findings, and no surface said so. The hunt
+    # still completes, and its findings are still investigated. The report and
+    # each finding carry the mark.
+    responses, traced = _reasoning_counts(gathered)
+    no_reasoning = responses > 0 and traced == 0 and await _reasoning_expected(ctx)
+    if no_reasoning:
+        _LOGGER.warning(
+            "hunt: %d model responses carry no reasoning trace. Earlier hunts carried one. "
+            "The report takes the degraded mark.",
+            responses,
+        )
+        report = _mark_no_reasoning(report)
+
     report_payload = report.model_dump(mode="json")
+    if no_reasoning:
+        # A key beside the HuntReport fields, on the stored report. The hunt
+        # row and the hunt page read it with no event query and no migration.
+        report_payload[hunt_outcome.DEGRADED_KEY] = {
+            "reason": hunt_outcome.NO_REASONING_REASON,
+            "model_responses": responses,
+        }
     yield _ev("hunt_report", report_payload)
     yield _ev(
         "done",
         {
             "finding_count": len(report.findings),
+            # How many model responses the exploration made, and how many of
+            # them carried a reasoning trace. ``no_reasoning_trace`` is the
+            # mark above. It is apart from ``degraded``: a hunt with the mark
+            # read the grid, so it does not finalize as a blind run.
+            "model_responses": responses,
+            "reasoning_traces": traced,
+            "no_reasoning_trace": no_reasoning,
             # Read by hunt_recorded_run to finalize the row as a degraded run
             # rather than a completed hunt. On the done event (not a new event
             # kind) so the persisted trace carries it without a UI that must
@@ -572,6 +990,154 @@ _PARTIAL_HUMILITY_NOTE = (
     "partial report: the hunt stopped at its budget or its time limit. It did not "
     "corroborate this finding. Corroborate it before you act."
 )
+
+# The trace line of the second synthesis attempt (:func:`_text_transcript`).
+_TEXT_RETRY_NOTE = (
+    "The report writer answered with a tool call and wrote no report. "
+    "It writes the report again from a text copy of the evidence."
+)
+
+# The mark on each finding of a hunt whose model returned no reasoning trace.
+# The page keeps it when it rewords the note of a gate before it
+# (soc_ai.hunting.hunt_words.validator_note).
+_NO_REASONING_NOTE = DEGRADED_FINDING_NOTE
+
+
+def _gate_window_all_clear(report: Any, earlier: EarlierConclusions | None) -> Any:
+    """Add one labeled line to a report that names none of the true positives of its window.
+
+    Prod hunt 01M6VMYHA1TTSBJRHRNGJZT6AD wrote "No malicious cyber activity"
+    while the store held two true positives from its window (2026-11-07). The
+    prompt rule asks the model to name them
+    (:data:`soc_ai.hunting.earlier.WINDOW_RULE`). This gate is the part that
+    does not depend on the model.
+
+    It parses no sentence. A true positive of the block
+    (:attr:`EarlierConclusions.confirmed`) is accounted for when the report
+    holds a threat finding on its target, or when the narrative names its
+    target host or its rule (:func:`soc_ai.hunting.earlier.unnamed_activity`).
+    The line names the ones that are not. A report that names the confirmed
+    activity gets no line, whatever else it says. The text of the model stays
+    whole, after the line. No finding, severity or confidence changes.
+    Fail-soft and pure.
+    """
+    confirmed = tuple(getattr(earlier, "confirmed", None) or ())
+    if not confirmed:
+        return report
+    try:
+        from soc_ai.hunting import earlier as earlier_mod  # noqa: PLC0415 - lazy, like the caller
+
+        narrative = str(getattr(report, "narrative", "") or "")
+        if narrative.startswith(f"**{earlier_mod.ALL_CLEAR_LABEL}.**"):
+            # The line is there. A second pass adds no second line.
+            return report
+        threat_hosts = [
+            host
+            for finding in report.findings
+            if str(getattr(finding, "category", "") or "").strip().lower() == "threat"
+            for host in (getattr(finding, "hosts", None) or [])
+        ]
+        unnamed = earlier_mod.unnamed_activity(confirmed, narrative, threat_hosts)
+        if not unnamed:
+            return report
+        _LOGGER.warning(
+            "hunt: the report names none of %d true positive verdicts of its window. "
+            "The report takes one labeled line.",
+            len(unnamed),
+        )
+        line = earlier_mod.all_clear_line(unnamed)
+        return report.model_copy(update={"narrative": f"{line}\n\n{narrative}".strip()})
+    except Exception:
+        _LOGGER.warning("hunt window gate failed; persisting report as-is", exc_info=True)
+        return report
+
+
+def _synthesis_failed_event(ev_factory: Any, exc: BaseException, stopped_by: str) -> StepEvent:
+    """The ``error`` event of a hunt that reached a limit and then got no report.
+
+    ``message`` keeps the raw error for the technical detail of the page.
+    ``stage`` and ``limit`` say where the hunt stopped, so the plain cause
+    (:func:`soc_ai.hunting.outcome.failure_cause`) does not read it out of
+    the text.
+    """
+    limit_words = "its time limit" if stopped_by == "time" else "its budget"
+    event: StepEvent = ev_factory(
+        "error",
+        {
+            "message": f"hunt hit {limit_words} and partial synthesis failed: {exc}",
+            "type": type(exc).__name__,
+            "stage": "partial_synthesis",
+            "limit": stopped_by,
+        },
+    )
+    return event
+
+
+def _reasoning_counts(gathered: list[Any]) -> tuple[int, int]:
+    """``(model responses, responses with a reasoning trace)`` of the exploration.
+
+    A trace is a ``ThinkingPart`` with text, or an inline ``<think>`` block in
+    a text part: the two shapes :func:`soc_ai.agent.orchestrator._walk_message`
+    records as ``reasoning_trace``. Never raises.
+    """
+    responses = traced = 0
+    for msg in gathered:
+        if type(msg).__name__ != "ModelResponse":
+            continue
+        responses += 1
+        for part in _parts_of(msg):
+            name = type(part).__name__
+            content = str(getattr(part, "content", "") or "")
+            if name == "ThinkingPart" and content.strip():
+                traced += 1
+                break
+            if name == "TextPart" and extract_reasoning_trace(content)[0]:
+                traced += 1
+                break
+    return responses, traced
+
+
+async def _reasoning_expected(ctx: InvestigationContext) -> bool:
+    """Whether this deployment's recent hunts carried a reasoning trace.
+
+    A deployment on a model that does not reason has no trace on any hunt,
+    and a mark on every hunt would say nothing. The store answers: one of the
+    newest agent hunts must hold a model response with a trace. Never raises.
+    With no store, or on a read that fails, the answer is no and the hunt
+    takes no mark.
+    """
+    if ctx.db_sessionmaker is None:
+        return False
+    try:
+        async with ctx.db_sessionmaker() as db:
+            return await hunt_svc.recent_reasoning_seen(db)
+    except Exception:
+        _LOGGER.warning(
+            "hunt: soc-ai could not read the reasoning traces of earlier hunts. "
+            "The hunt takes no degraded mark.",
+            exc_info=True,
+        )
+        return False
+
+
+def _mark_no_reasoning(report: Any) -> Any:
+    """State the degraded mark on every finding of the report.
+
+    The note joins a note that a gate already wrote. No severity and no
+    confidence changes: the investigations of the findings still run, and
+    they judge each claim. Fail-soft and pure, like the humility clamp.
+    """
+    try:
+        marked: list[Any] = []
+        for finding in report.findings:
+            earlier_note = str(getattr(finding, "validator_note", None) or "").strip()
+            note = f"{earlier_note} {_NO_REASONING_NOTE}" if earlier_note else _NO_REASONING_NOTE
+            marked.append(finding.model_copy(update={"validator_note": note}))
+        return report.model_copy(update={"findings": marked})
+    except Exception:
+        _LOGGER.warning("hunt degraded mark failed; persisting report as-is", exc_info=True)
+        return report
+
 
 _GRID_OUTAGE_NOTE = (
     "grid unavailable: every grid query in this hunt failed. The hunt checked "
@@ -955,6 +1521,7 @@ async def hunt_recorded_run(
     lead_id: int | None = None,
     cancel_token: CancelToken | None = None,
     earlier: EarlierConclusions | None = None,
+    campaign_id: int | None = None,
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
     """Wrap :func:`run_hunt` with the hunt recorder tee.
 
@@ -964,7 +1531,13 @@ async def hunt_recorded_run(
 
     ``earlier`` is the earlier-conclusions block, passed to :func:`run_hunt`.
     The stored objective does not change.
+
+    ``campaign_id`` is the campaign of the hunt: the campaign of the lead of
+    a lead hunt, or the campaign of a campaign hunt. A lead hunt and a
+    campaign hunt read the block of that campaign only
+    (:func:`soc_ai.hunting.campaign_block.scope_of`).
     """
+    scope = campaign_block.scope_of(starter=starter, lead_id=lead_id, campaign_id=campaign_id)
     recorder = HuntRecorder(
         state.db_sessionmaker,
         objective=objective,
@@ -996,7 +1569,9 @@ async def hunt_recorded_run(
     # hunt covered nothing.
     grid_blind = False
     try:
-        async for ev in run_hunt(ctx, objective=objective, prior=prior, earlier=earlier):
+        async for ev in run_hunt(
+            ctx, objective=objective, prior=prior, earlier=earlier, campaign_scope=scope
+        ):
             if ev.kind == "done" and ev.payload.get("degraded"):
                 grid_blind = True
             await recorder.record(ev.kind, ev.sequence, ev.payload)

@@ -10,7 +10,7 @@ packages — so the agent never has to import the HTTP layer to write an ack.
 from __future__ import annotations
 
 import inspect
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 from soc_ai.audit.logger import AuditWriteError
 from soc_ai.config import Settings
@@ -21,8 +21,26 @@ from soc_ai.tools._registry import get_tool
 if TYPE_CHECKING:
     from soc_ai.audit.logger import AuditLogger
 
-# The only tools that may ever be executed via a direct analyst action.
+# The tools a report may recommend, and the only names the execute route takes
+# from a recommended action.
 WRITE_TOOLS = frozenset({"ack_alert", "escalate_to_case", "add_case_comment"})
+
+# The write the execute route makes for a promoted hunt finding: a case built
+# from the stored finding (soc_ai.tools.escalate_to_case.open_finding_case).
+# Deliberately NOT in WRITE_TOOLS. That set is what a recommended action may
+# name, and every argument of this tool is a write target (the alerts to
+# attach) that must come from the stored finding. A report or a chat proposal
+# that names this tool is refused as "not a write" before any argument is read.
+FINDING_CASE_TOOL: Final = "open_finding_case"
+
+# The write of "Open one case" on a campaign: one case built from the stored
+# campaign (soc_ai.tools.escalate_to_case.open_campaign_case). Not in
+# WRITE_TOOLS for the same reason as FINDING_CASE_TOOL: the alerts it attaches
+# are a write target that must come from the store.
+CAMPAIGN_CASE_TOOL: Final = "open_campaign_case"
+
+# Everything execute_write_tool will run.
+_EXECUTABLE_TOOLS = WRITE_TOOLS | {FINDING_CASE_TOOL, CAMPAIGN_CASE_TOOL}
 
 
 async def execute_write_tool(
@@ -40,7 +58,8 @@ async def execute_write_tool(
     Filters ``tool_args`` to the tool's real signature (models invent extra
     kwargs), injects ``auth``/``settings`` when declared, and returns
     ``(result, error)`` — ``error`` is a string on a tool failure, never a raise.
-    Refuses anything outside :data:`WRITE_TOOLS`.
+    Refuses anything outside :data:`WRITE_TOOLS`, :data:`FINDING_CASE_TOOL`
+    and :data:`CAMPAIGN_CASE_TOOL`.
 
     Audit/fail-closed: when ``audit`` is provided, a *mutating* audit record is
     written BEFORE the SO call (the intent), so under ``audit_fail_closed`` a
@@ -48,7 +67,7 @@ async def execute_write_tool(
     without an audit record. The audit failure surfaces as the ``error`` string
     (the SO write is not attempted). A second audit record captures the result.
     """
-    if tool_name not in WRITE_TOOLS:
+    if tool_name not in _EXECUTABLE_TOOLS:
         return None, f"not an executable write tool: {tool_name!r}"
 
     # The approver/executor identity resolved by the endpoint (identify_caller):
@@ -121,4 +140,4 @@ async def execute_write_tool(
     return result, None
 
 
-__all__ = ["WRITE_TOOLS", "execute_write_tool"]
+__all__ = ["CAMPAIGN_CASE_TOOL", "FINDING_CASE_TOOL", "WRITE_TOOLS", "execute_write_tool"]

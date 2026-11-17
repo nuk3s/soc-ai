@@ -14,6 +14,12 @@
 // `line-clamp-*` class, or a `textOverflow: 'ellipsis'` style, cuts the text
 // at the box edge and draws "…" there. A class string with one of them fails
 // the test the same way.
+//
+// A box with a height cap in em and a hidden overflow cuts a text at a line
+// edge and draws nothing there, so the reader does not see the cut. The
+// Alerts reason ended mid-sentence that way on production (2026-11-13). One
+// class string that holds both a `max-h-[<n>em]` and a hidden overflow fails
+// the test too.
 import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 
@@ -28,6 +34,11 @@ const SOURCES = import.meta.glob<string>(
 const OWNED_ELSEWHERE: Record<string, number> = {
   // The graph components. Their SVG labels cut at a character count, and the
   // chart title clamps at two lines.
+  //
+  // The runbook list shows the first three lines of a runbook body. The body
+  // runs to pages, the tooltip holds the whole body and the row opens the
+  // runbook. The owner kept this preview in the ellipsis ban (2026-10-07).
+  './screens/Runbooks.tsx': 1,
 };
 
 const BANNED = /…|\.\.\./;
@@ -35,6 +46,10 @@ const BANNED = /…|\.\.\./;
 const CUT_CLASS =
   /(^|\s)(?:[a-z0-9-]+:)*(truncate|text-ellipsis|overflow-ellipsis|line-clamp-\d+)(?=\s|$)/;
 const CUT_STYLE = /^ellipsis$/;
+/** A height cap in em and a hidden overflow: a clip with no mark. */
+const CLIP_HEIGHT = /(^|\s)(?:[a-z0-9-]+:)*max-h-\[[0-9.]+em\](?=\s|$)/;
+const CLIP_OVERFLOW = /(^|\s)(?:[a-z0-9-]+:)*overflow-(?:y-)?(?:hidden|clip)(?=\s|$)/;
+const clips = (text: string) => CLIP_HEIGHT.test(text) && CLIP_OVERFLOW.test(text);
 
 /** The text of each string, template part and JSX text in `source` that holds
  *  an ellipsis or a class that draws one, with its line number. */
@@ -44,6 +59,18 @@ export function ellipsisLiterals(fileName: string, source: string): string[] {
   const out: string[] = [];
   const visit = (node: ts.Node) => {
     let text: string | null = null;
+    // A clip: one class string with a height cap in em and a hidden
+    // overflow. A template reads as one string: its parts joined.
+    let whole: string | null = null;
+    if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
+      whole = node.text;
+    } else if (ts.isTemplateExpression(node)) {
+      whole = [node.head.text, ...node.templateSpans.map((s) => s.literal.text)].join(' ');
+    }
+    if (whole !== null && clips(whole)) {
+      const line = file.getLineAndCharacterOfPosition(node.getStart(file)).line + 1;
+      out.push(`${fileName}:${line}: clip: ${whole.trim().slice(0, 120)}`);
+    }
     if (
       ts.isStringLiteral(node) ||
       ts.isNoSubstitutionTemplateLiteral(node) ||
@@ -103,6 +130,17 @@ describe('the ellipsis ban', () => {
     expect(ellipsisLiterals('probe.tsx', src)).toHaveLength(11);
   });
 
+  it('catches a class string that clips a text at a height in em', () => {
+    const src = [
+      'const a = <div className="min-w-0 max-h-[2.9em] overflow-hidden break-words">x</div>;',
+      "const b = `name${wide ? '' : ' max-h-[2.8em] overflow-hidden'}`;",
+      'const c = `mt-0.5 max-h-[1.45em] ${tone} overflow-hidden`;',
+      "const d = 'sm:max-h-[3em] overflow-y-hidden';",
+      "const e = 'max-h-[4.2em] overflow-clip';",
+    ].join('\n');
+    expect(ellipsisLiterals('probe.tsx', src)).toHaveLength(5);
+  });
+
   it('passes a comment, a spread and a regular expression', () => {
     const src = [
       '// Loading… is a comment.',
@@ -112,6 +150,12 @@ describe('the ellipsis ban', () => {
       'const i = <div {...props}>{/* Reading… */}Ready</div>;',
       "const n = 'The grid truncated the list.';",
       'const o = <span className="break-words whitespace-normal">x</span>;',
+      // A height cap alone, a hidden overflow alone, and a cap in px or rem
+      // on a scroll box are no clip of a text.
+      'const p = <div className="max-h-[2.8em] break-words">x</div>;',
+      'const q = <div className="overflow-hidden rounded-card">x</div>;',
+      'const r = <div className="max-h-[420px] overflow-hidden">x</div>;',
+      'const t = <div className="max-h-[2.8em] overflow-y-auto">x</div>;',
     ].join('\n');
     expect(ellipsisLiterals('probe.tsx', src)).toEqual([]);
   });

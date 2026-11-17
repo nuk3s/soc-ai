@@ -136,7 +136,7 @@ describe('the selection on the leads list', () => {
     byTab({ needs_decision: [lead()], closed: [lead({ status: 'dismissed', dismissed_reason: 'lab_host' })] });
     mount();
     fireEvent.click(await screen.findByRole('checkbox', { name: 'Select lead 1' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Closed' }));
+    fireEvent.click(screen.getByRole('button', { name: /^Closed/ }));
     await screen.findByRole('checkbox', { name: 'Select lead 2' });
     expect(screen.queryByTestId('leads-bulk-bar')).toBeNull();
   });
@@ -153,12 +153,12 @@ describe('the selection on the leads list', () => {
     expect(within(bar()).getByRole('button', { name: 'Hunt (1)' })).toBeTruthy();
     expect(within(bar()).queryByRole('button', { name: /^Reopen/ })).toBeNull();
 
-    fireEvent.click(screen.getByRole('button', { name: 'Closed' }));
+    fireEvent.click(screen.getByRole('button', { name: /^Closed/ }));
     fireEvent.click(await screen.findByRole('checkbox', { name: 'Select lead 2' }));
     expect(within(bar()).getByRole('button', { name: 'Reopen (1)' })).toBeTruthy();
     expect(within(bar()).queryByRole('button', { name: /^Dismiss/ })).toBeNull();
 
-    fireEvent.click(screen.getByRole('button', { name: 'In progress' }));
+    fireEvent.click(screen.getByRole('button', { name: /^In progress/ }));
     fireEvent.click(await screen.findByRole('checkbox', { name: 'Select lead 3' }));
     expect(bar().textContent).toContain('A lead under a running hunt takes no bulk decision.');
   });

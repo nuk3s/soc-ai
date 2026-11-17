@@ -442,12 +442,18 @@ def test_get_detection_tuning_returns_nominations_and_overrides(client: TestClie
             "already_muted": False,
         }
     ]
-    with patch("soc_ai.webui.detection_tuning.nominate", AsyncMock(return_value=noms)):
+    with patch(
+        "soc_ai.webui.detection_tuning.nominate_page",
+        AsyncMock(return_value=dt.NominationPage(noms, 0)),
+    ):
         resp = client.get("/api/v1/detection-tuning")
     assert resp.status_code == 200
     body = resp.json()
     assert body["nominations"][0]["rule_name"] == "ET NOISE"
     assert body["nominations"][0]["recommendation"] == "mute"
+    # The window and its alert total ride along, so the panel can state the
+    # share of the window that the mute suggestions produce.
+    assert (body["window"], body["alert_total"]) == ("7d", 0)
     assert body["overrides"] == []
 
 
@@ -491,7 +497,10 @@ def test_detection_tuning_summary_counts_actionable_mutes(client: TestClient) ->
             "already_muted": False,
         },
     ]
-    with patch("soc_ai.webui.detection_tuning.nominate", AsyncMock(return_value=noms)):
+    with patch(
+        "soc_ai.webui.detection_tuning.nominate_page",
+        AsyncMock(return_value=dt.NominationPage(noms, 0)),
+    ):
         resp = client.get("/api/v1/detection-tuning/summary")
     assert resp.status_code == 200
     # Three nominated rules, one of them a pending mute (D10). The window of
@@ -526,7 +535,7 @@ def test_summary_answers_a_down_grid_with_503_not_an_unhandled_500(client: TestC
     from elastic_transport import ConnectionError as EsConnectionError
 
     with patch(
-        "soc_ai.webui.detection_tuning.nominate",
+        "soc_ai.webui.detection_tuning.nominate_page",
         AsyncMock(side_effect=EsConnectionError("grid down")),
     ):
         resp = client.get("/api/v1/detection-tuning/summary")
@@ -541,7 +550,7 @@ def test_summary_maps_an_es_client_error_to_400(client: TestClient) -> None:
 
     meta = ApiResponseMeta(400, "HTTP/1.1", HttpHeaders(), 0.0, None)
     with patch(
-        "soc_ai.webui.detection_tuning.nominate",
+        "soc_ai.webui.detection_tuning.nominate_page",
         AsyncMock(side_effect=BadRequestError("bad", meta=meta, body={})),
     ):
         resp = client.get("/api/v1/detection-tuning/summary")
@@ -563,7 +572,10 @@ def test_post_override_then_remove_roundtrip(client: TestClient) -> None:
     override_id = created["id"]
 
     # It now shows up in the overrides list.
-    with patch("soc_ai.webui.detection_tuning.nominate", AsyncMock(return_value=[])):
+    with patch(
+        "soc_ai.webui.detection_tuning.nominate_page",
+        AsyncMock(return_value=dt.NominationPage([], 0)),
+    ):
         listing = client.get("/api/v1/detection-tuning").json()
     assert [o["rule_name"] for o in listing["overrides"]] == ["ET NOISE"]
 
@@ -615,3 +627,18 @@ def test_muted_rule_excluded_from_alerts_feed(client: TestClient) -> None:
     by_name = {g["name"]: g for g in with_muted}
     assert by_name["ET NOISE"]["muted"] is True
     assert by_name["ET REAL"]["muted"] is False
+
+
+async def test_nominate_page_counts_every_alert_event_of_the_window(
+    settings_kratos: Settings,
+) -> None:
+    """The tuning panel states "25 rules produce N% of the alert events". The
+    total counts every event the feed matched in the window, a nominated rule
+    or not."""
+    engine, maker = await _db(settings_kratos)
+    fetch = AsyncMock(return_value=GroupPage([], 17062))
+    state = SimpleNamespace(settings=settings_kratos, elastic=AsyncMock(), db_sessionmaker=maker)
+    with patch("soc_ai.webui.detection_tuning.aq.fetch_groups", fetch):
+        page = await dt.nominate_page(state)
+    assert (page.nominations, page.alert_total, page.window) == ([], 17062, "7d")
+    await engine.dispose()

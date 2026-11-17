@@ -191,8 +191,10 @@ async def test_query_zeek_default_log_types(settings_kratos: Settings) -> None:
 
     body = fake_es.search.call_args.kwargs["body"]
     terms_clause = next(c for c in body["query"]["bool"]["must"] if "terms" in c)
-    expected_datasets = [f"zeek.{t}" for t in DEFAULT_LOG_TYPES]
-    assert terms_clause["terms"]["event.dataset"] == expected_datasets
+    asked = terms_clause["terms"]["event.dataset"]
+    assert {f"zeek.{t}" for t in DEFAULT_LOG_TYPES} <= set(asked)
+    # Security Onion 3.x names the file log zeek.file. The pivot asks for both names.
+    assert set(asked) - {f"zeek.{t}" for t in DEFAULT_LOG_TYPES} == {"zeek.file"}
 
 
 @pytest.mark.asyncio

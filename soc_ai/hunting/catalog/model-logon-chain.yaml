@@ -5,7 +5,7 @@ description: >
   two records in order: a session that lands on host B, and minutes later an
   attempt from B to a host C that B never reached before.
 
-  This detector learns the edge set of the estate from accepted sessions
+  This detector learns the edge set of the network from accepted sessions
   over 30 days: Windows logons of type 3 and 10 with a source address, and
   sshd Accepted lines. A hit needs a session on B and, within 15 minutes, the
   first attempt from B to a third host C that is not in the learned edge set

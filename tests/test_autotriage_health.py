@@ -310,6 +310,7 @@ def test_the_status_fields_name_the_pause_and_the_alarm() -> None:
         "paused_until": None,
         "pause_ends": None,
         "failed_in_a_row": 0,
+        "gateway_paused": False,
         "alarm_error": None,
         "alarm_failures": 0,
     }
@@ -491,3 +492,202 @@ def test_the_2026_10_28_replay_lets_one_alert_recover() -> None:
     assert verdict is not None
     assert len(failed_at) == 3
     assert verdict - failed_at[2] <= timedelta(hours=6, minutes=5)
+
+
+# ---------------------------------------------------------------------------
+# The gateway pause (B5, 2026-11-13)
+# ---------------------------------------------------------------------------
+#
+# From 2026-11-01 to 2026-11-12 the gateway could not reach the model engine in
+# eight windows. 62 runs failed, each in 5 to 12 seconds, and the sweep started
+# the next alert at once. The pause of five failures in a row opened six times,
+# after it burned five alerts each time. 33 alerts kept an error and no verdict.
+
+GATEWAY_500 = (
+    "status_code: 500, model_name: analyst, body: {'message': 'litellm.InternalServerError: "
+    "Hosted_vllmException - Cannot connect to host 10.0.0.9:8888', 'type': None}"
+)
+GATEWAY_502 = "status_code: 502, model_name: analyst, body: Bad Gateway"
+LOOP = ("investigation_loop", "ModelHTTPError")
+
+
+@pytest.mark.parametrize(
+    ("error_type", "message"),
+    [
+        ("ModelHTTPError", GATEWAY_500),
+        ("ModelHTTPError", GATEWAY_502),
+        ("ModelHTTPError", "status_code: 503, model_name: analyst, body: no healthy deployment"),
+        ("ModelAPIError", "Connection error."),
+        ("APIConnectionError", "Connection error."),
+        ("ConnectError", "All connection attempts failed"),
+    ],
+)
+def test_a_gateway_connection_error_is_recognized(error_type: str, message: str) -> None:
+    assert ah.is_gateway_connection_error(error_type, message)
+
+
+@pytest.mark.parametrize(
+    ("error_type", "message"),
+    [
+        # The 2026-10-27 failure: the gateway answered, and refused the schema.
+        ("ModelHTTPError", "status_code: 400, model_name: analyst, body: schema refused"),
+        ("ModelHTTPError", "status_code: 500, model_name: analyst, body: internal error"),
+        ("ModelHTTPError", "status_code: 429, model_name: analyst, body: rate limit"),
+        ("UnexpectedModelBehavior", "Model token limit (32000) exceeded before any response"),
+        ("ModelAPIError", "Request timed out."),
+        ("TimeoutError", ""),
+        ("CancelledError", ""),
+        ("RuntimeError", "Cannot connect to host"),
+    ],
+)
+def test_another_failure_is_not_a_gateway_connection_error(error_type: str, message: str) -> None:
+    """Negative controls: an answer of the gateway, a timeout and a fault of
+    the worker keep the rule of five failures in a row."""
+    assert not ah.is_gateway_connection_error(error_type, message)
+
+
+def test_two_gateway_connection_errors_in_sequence_pause_the_sweep() -> None:
+    health = ah.TriageHealth()
+    t0 = datetime.now(UTC) - timedelta(minutes=30)
+    health.record_failure("a0", *LOOP, message=GATEWAY_500, at=t0)
+    assert not health.gateway_paused
+    assert not health.blocks_sweep(at=t0)
+    health.record_failure("a1", *LOOP, message=GATEWAY_500, at=t0 + timedelta(seconds=8))
+    assert health.gateway_paused
+    assert health.blocks_sweep(at=t0 + timedelta(seconds=9))
+    # The pause has no end time. Only a test of the gateway that passes ends it.
+    assert health.blocks_sweep(at=t0 + timedelta(days=2))
+    assert health.paused_until is None
+
+
+def test_another_failure_between_two_gateway_errors_opens_no_pause() -> None:
+    """Negative control: the two errors must be in sequence."""
+    health = ah.TriageHealth()
+    t0 = datetime.now(UTC) - timedelta(minutes=30)
+    health.record_failure("a0", *LOOP, message=GATEWAY_500, at=t0)
+    health.record_failure("a1", "synth_first_round1", "UnexpectedModelBehavior", at=t0)
+    health.record_failure("a2", *LOOP, message=GATEWAY_500, at=t0)
+    assert not health.gateway_paused
+
+
+def test_a_verdict_between_two_gateway_errors_opens_no_pause() -> None:
+    health = ah.TriageHealth()
+    t0 = datetime.now(UTC) - timedelta(minutes=30)
+    health.record_failure("a0", *LOOP, message=GATEWAY_502, at=t0)
+    health.record_verdict("ok", at=t0)
+    health.record_failure("a1", *LOOP, message=GATEWAY_502, at=t0)
+    assert not health.gateway_paused
+
+
+def test_two_failures_of_another_class_do_not_open_the_gateway_pause() -> None:
+    """Negative control: the rule of five failures in a row did not change."""
+    health = ah.TriageHealth()
+    t0 = datetime.now(UTC) - timedelta(minutes=30)
+    for i in range(4):
+        health.record_failure(f"a{i}", *SYNTH, message="status_code: 400, body: refused", at=t0)
+    assert not health.gateway_paused
+    assert not health.blocks_sweep(at=t0)
+    assert health.record_failure("a4", *SYNTH, message="status_code: 400", at=t0)[1] is True
+    assert health.is_paused(at=t0)
+
+
+def test_a_recovery_closes_the_pause_and_gives_the_failed_alerts_their_runs_back() -> None:
+    health = ah.TriageHealth()
+    t0 = datetime.now(UTC) - timedelta(minutes=30)
+    health.record_failure("a0", *LOOP, message=GATEWAY_500, at=t0)
+    health.record_failure("a1", *LOOP, message=GATEWAY_500, at=t0)
+    health.record_failure("other", *SYNTH, message="status_code: 400", at=t0)
+    t1 = t0 + timedelta(minutes=10)
+    healed = health.record_gateway_recovered(["stored-alert"], at=t1)
+    assert not health.gateway_paused
+    assert not health.blocks_sweep(at=t1)
+    # The alerts that failed on the gateway run again at once: the two that
+    # this process saw, and the one that the store named.
+    assert sorted(healed) == ["a0", "a1", "stored-alert"]
+    assert health.heal_since("a0") == t1
+    assert health.heal_since("a1") == t1
+    assert health.heal_since("stored-alert") == t1
+    # Negative control: an alert that failed with another error keeps its wait.
+    assert health.heal_since("other") is None
+    # The next gateway error starts a new count.
+    health.record_failure("a2", *LOOP, message=GATEWAY_500, at=t1)
+    assert not health.gateway_paused
+
+
+def test_the_bell_and_the_status_name_the_gateway_pause() -> None:
+    health = ah.TriageHealth()
+    t0 = datetime.now(UTC) - timedelta(minutes=30)
+    health.record_failure("a0", *LOOP, message=GATEWAY_500, at=t0)
+    health.record_failure("a1", *LOOP, message=GATEWAY_500, at=t0)
+    row = health.bell_row(at=t0 + timedelta(minutes=1))
+    assert row is not None
+    assert row[1] == (
+        "Continuous Auto-Investigate is paused. The model gateway failed 2 runs in a row "
+        "with a connection error. The last error is ModelHTTPError in investigation_loop. "
+        "soc-ai tests the gateway before each scheduled run. A test that passes ends the pause."
+    )
+    fields = health.status_fields(at=t0 + timedelta(minutes=1))
+    assert fields["gateway_paused"] is True
+    assert fields["failed_in_a_row"] == 2
+    assert fields["alarm_error"] == "ModelHTTPError in investigation_loop"
+    health.record_gateway_recovered([], at=t0 + timedelta(minutes=5))
+    assert health.bell_row(at=t0 + timedelta(minutes=6)) is None
+    assert health.status_fields(at=t0 + timedelta(minutes=6))["gateway_paused"] is False
+
+
+def test_the_gateway_pause_text_reads_in_ste() -> None:
+    text = ah.gateway_pause_text(2, "ModelHTTPError in investigation_loop")
+    assert "—" not in text and "–" not in text and "(" not in text
+    for sentence in text.split(". "):
+        assert len(sentence.split()) <= 25, sentence
+
+
+def test_a_verdict_from_any_run_closes_the_gateway_pause() -> None:
+    """Review defect 5. A press reached a verdict while the gateway pause was
+    open, so the gateway answers. The pause stayed open, the sweep stayed
+    blocked, and the bell read "failed 0 runs in a row"."""
+    health = ah.TriageHealth()
+    t0 = datetime.now(UTC) - timedelta(minutes=30)
+    health.record_failure("a1", *LOOP, message=GATEWAY_502, at=t0)
+    health.record_failure("a2", *LOOP, message=GATEWAY_502, at=t0)
+    assert health.gateway_paused
+    t1 = t0 + timedelta(minutes=3)
+    health.record_verdict("a3", at=t1)
+    assert not health.gateway_paused
+    assert not health.blocks_sweep(at=t1)
+    assert health.bell_row(at=t1) is None
+    assert health.status_fields(at=t1)["gateway_paused"] is False
+    # The alerts that failed on the gateway have their runs back.
+    assert health.heal_since("a1") == t1
+    assert health.heal_since("a2") == t1
+
+
+def test_the_bell_keeps_the_count_of_the_gateway_errors() -> None:
+    """The bell text must match the real state. Another failure during the
+    pause set the count of the text to zero."""
+    health = ah.TriageHealth()
+    t0 = datetime.now(UTC) - timedelta(minutes=30)
+    health.record_failure("a1", *LOOP, message=GATEWAY_502, at=t0)
+    health.record_failure("a2", *LOOP, message=GATEWAY_502, at=t0)
+    health.record_failure("a3", "worker", "RuntimeError", message="another fault", at=t0)
+    assert health.gateway_paused
+    row = health.bell_row(at=t0 + timedelta(minutes=1))
+    assert row is not None
+    assert "failed 2 runs in a row with a connection error" in row[1]
+    assert health.status_fields(at=t0 + timedelta(minutes=1))["failed_in_a_row"] == 2
+    # A third gateway error during the pause counts.
+    health.record_failure("a4", *LOOP, message=GATEWAY_502, at=t0)
+    row = health.bell_row(at=t0 + timedelta(minutes=1))
+    assert row is not None
+    assert "failed 3 runs in a row with a connection error" in row[1]
+
+
+def test_a_failure_does_not_close_the_gateway_pause() -> None:
+    """Negative control: only a verdict or a gateway test that passes closes it."""
+    health = ah.TriageHealth()
+    t0 = datetime.now(UTC) - timedelta(minutes=30)
+    health.record_failure("a1", *LOOP, message=GATEWAY_502, at=t0)
+    health.record_failure("a2", *LOOP, message=GATEWAY_502, at=t0)
+    health.record_failure("a3", *SYNTH, message="status_code: 400, body: refused", at=t0)
+    assert health.gateway_paused
+    assert health.blocks_sweep(at=t0 + timedelta(days=1))

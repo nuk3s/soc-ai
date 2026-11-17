@@ -324,7 +324,8 @@ async def test_query_events_oql_caps_size_at_max_results(
         max_results=25,
     )
 
-    body = fake_es.search.call_args.kwargs["body"]
+    # The first search is the query. A zero-hit query is followed by one field check.
+    body = fake_es.search.call_args_list[0].kwargs["body"]
     assert body["size"] == 25
 
 

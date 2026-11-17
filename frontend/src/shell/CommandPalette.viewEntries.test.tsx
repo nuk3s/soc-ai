@@ -16,6 +16,7 @@ vi.mock('react-router-dom', async (importOriginal) => {
 });
 
 vi.mock('../lib/api', () => ({
+  getAbout: vi.fn(() => Promise.resolve({ version: '1.6.0' })),
   getAlerts: vi.fn(() => Promise.resolve({ groups: [], truncated: false, other_docs: 0 })),
   getInvestigations: vi.fn(() => Promise.resolve([])),
   getConfig: vi.fn(() => Promise.resolve({ groups: [], tokens: [], users: [], dangerHost: '' })),

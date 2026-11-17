@@ -142,6 +142,12 @@ class AlertContext(BaseModel):
     # the host history gate reads it. The budget trim returns JSON and does not
     # rebuild the model, so the object the gates receive keeps the field.
     subject_focus_document_ids: list[str] = Field(default_factory=list, exclude=True)
+    # The hosts that the promoted finding names. Empty on every alert run and
+    # on a lead promotion, and out of every dump like the list above. The host
+    # history gate reads it when the finding cites no document that the grid
+    # holds. The anchor is then a record of another finding, so the hosts of
+    # the anchor do not stand for the finding.
+    subject_focus_hosts: list[str] = Field(default_factory=list, exclude=True)
     pivot_summary: dict[str, int] = Field(default_factory=dict)
     # Histogram of rule_name → count of alerts that fired on this IP recently
     # (wide ±host_risk_window_hours window). DATA ONLY, not a verdict — each

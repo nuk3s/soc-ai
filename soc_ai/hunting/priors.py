@@ -905,7 +905,7 @@ def evaluate_prior(  # noqa: PLR0912, PLR0915 - one function reads as one proced
     )
     if suppressed:
         note += (
-            f" {plural(suppressed, 'new member')} common across the estate formed no observation."
+            f" {plural(suppressed, 'new member')} common across the network formed no observation."
         )
     if role_traits:
         note += (

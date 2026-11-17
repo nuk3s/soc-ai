@@ -1475,7 +1475,7 @@ async def run_prior_sweep(  # noqa: PLR0912, PLR0915 - one function reads as one
             notes.append(refreshed)
     except Exception as exc:
         await db.rollback()
-        notes.append(f"estate prevalence could not be read, novelty runs without it: {exc}")
+        notes.append(f"network prevalence could not be read, novelty runs without it: {exc}")
     # The windows an investigation confirmed. Unread, the baseline learns
     # from the attack, and the sweep says so.
     try:

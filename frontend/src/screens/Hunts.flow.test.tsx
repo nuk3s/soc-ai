@@ -9,6 +9,7 @@ import { fireEvent, render, screen, waitFor, within } from '@testing-library/rea
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { describe, expect, it, vi } from 'vitest';
 import { DemoProvider } from '../lib/demo';
+import { DEFINE_CAMPAIGN, DEFINE_NEEDS_YOU } from '../lib/tooltips';
 
 vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
@@ -66,6 +67,10 @@ describe('How this flows', () => {
   it('opens the chart from the address', async () => {
     renderHunts('/hunts?flow=1');
     expect(await screen.findByTestId('hunting-flow-chart')).toBeTruthy();
+    // The chart ends in the campaign and Needs you, and the lines under it say so.
+    const lines = screen.getByTestId('flow-definitions');
+    expect(lines.textContent).toContain(DEFINE_CAMPAIGN);
+    expect(lines.textContent).toContain(DEFINE_NEEDS_YOU);
   });
 
   it('keeps the drawer shut on the plain address', async () => {

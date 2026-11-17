@@ -12,6 +12,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from soc_ai.api.webui._campaign_link import CampaignLinkOut
 from soc_ai.api.webui._event_timeline import EventTimelineOut
 from soc_ai.config import Settings
 from soc_ai.event_time import WAVE_GAP_SECONDS, as_utc, gap_words
@@ -35,6 +36,8 @@ _TL_GROUP = {
     "tool_call": "Tool calls",
     "tool_result": "Tool calls",
     "model_response": "Tool calls",
+    # A model call that ran again with low reasoning sits beside the responses.
+    "token_limit_retry": "Tool calls",
     "decision_template_match": "Decision",
     "template_ceiling": "Decision",
     "triage_report": "Decision",
@@ -101,6 +104,7 @@ _TL_GROUP = {
     "malware_rule_name_ungrounded_downgrade": "Validators",
     "decisive_value_support_cap": "Validators",
     "unsupported_decisive_value_downgrade": "Validators",
+    "impact_evidence_downgrade": "Validators",
     "recommended_actions_blocked": "Validators",
     "egress_blocked": "Validators",
 }
@@ -253,12 +257,47 @@ def _peer_sub(enr: dict[str, Any]) -> str | None:
     return None
 
 
+def _reputation_unchecked(entry: dict[str, Any]) -> bool:
+    """True when a stored enrichment AFFIRMS that its miss is not evidence.
+
+    Two stored shapes. A current record holds ``reputation_status``, and
+    ``not_checked`` is the affirmation. An older record holds
+    ``blocklist_checked``, and an explicit ``False`` is the affirmation. A
+    record with neither field makes no claim, so it renders as it always did.
+    """
+    status = entry.get("reputation_status")
+    if status is not None:
+        # An internal address is not a gap in the feeds: the row reads
+        # "internal address", as it did.
+        return bool(
+            status == "not_checked" and entry.get("not_checked_reason") != "internal_address"
+        )
+    return entry.get("blocklist_checked") is False
+
+
+def _unchecked_label(entry: dict[str, Any]) -> str:
+    """The timeline words for a miss that is not evidence.
+
+    A current record can hold a loaded feed that is not a malware feed, so "no
+    blocklist loaded" is true only for the older shape and for a record that
+    checked no feed.
+    """
+    reason = entry.get("not_checked_reason")
+    if reason == "stale_feed":
+        return "reputation not checked. The feed file is stale"
+    if reason == "lookup_failed":
+        return "reputation not checked. The lookup failed"
+    if entry.get("feeds_checked"):
+        return "reputation not checked. No malware feed is loaded"
+    return "no blocklist loaded. soc-ai checked nothing"
+
+
 def _blocklist_unchecked(enrichments: Any) -> bool:
     """True when an enrichment AFFIRMS that no blocklist feed answered it.
 
-    Tri-state on purpose: ``None`` is a record written before the field existed
-    and makes no claim, so it renders as it always did. Only an explicit
-    ``False`` turns a quiet "nothing flagged" into "nothing was checked".
+    Tri-state on purpose: a record written before the field existed makes no
+    claim, so it renders as it always did. Only an explicit statement turns a
+    quiet "nothing flagged" into "nothing was checked".
 
     Shape-tolerant, like everything else reading a stored payload here: a
     partial enrichment can leave a list or a string where the map belongs, and
@@ -266,9 +305,7 @@ def _blocklist_unchecked(enrichments: Any) -> bool:
     """
     if not isinstance(enrichments, dict):
         return False
-    return any(
-        isinstance(e, dict) and e.get("blocklist_checked") is False for e in enrichments.values()
-    )
+    return any(isinstance(e, dict) and _reputation_unchecked(e) for e in enrichments.values())
 
 
 def _flag_sources(enr: dict[str, Any]) -> list[str]:
@@ -524,8 +561,8 @@ def _tool_outcome(result: Any) -> str:
         # not excuse it: the curated internal-seed feed is the one that names
         # known-bad internal hosts.
         where = "internal address" if result.get("internal") else ""
-        if result.get("blocklist_checked") is False:
-            unloaded = "no blocklist loaded. soc-ai checked nothing"
+        if _reputation_unchecked(result):
+            unloaded = _unchecked_label(result)
             return f"{where}, {unloaded}" if where else unloaded
         return where or "no blocklist/MISP match"
     # ES query / zeek result
@@ -849,9 +886,9 @@ def _verdict_words(verdict: Any) -> str:
 # Why the investigation loop ran, as a sentence (R2 STE 5). The codes come from
 # the orchestrator's loop_reason and soc_ai.agent.budget.ClassPlan.reason.
 _LOOP_REASONS = {
-    "deep_rerun": "An analyst asked for a deep run.",
-    "analyst_run": "An analyst asked for this run.",
-    "hunt_subject": "The run investigates a hunt.",
+    "deep_rerun": "An analyst asked for a deep investigation.",
+    "analyst_run": "An analyst asked for this investigation.",
+    "hunt_subject": "The investigation examines a hunt.",
     "fast_triage_disabled": "Fast triage is off. Every alert gets the full investigation.",
     "session_true_positive_stands": "A true positive stands on the same network session.",
     "round1_cannot_settle": "The first pass cannot settle this alert.",
@@ -896,12 +933,14 @@ def _percent(ratio: Any) -> str:
 _AUTO_ACK_SKIP_REASON = {
     "high_stakes": "high stakes",
     "below_threshold": "confidence below the threshold",
-    "no_investigation": "the run retrieved nothing",
+    "no_investigation": "the investigation retrieved nothing",
     "uncited": "no citation resolves",
     "promoted_finding": "a promoted finding has no alert",
     "oracle_dissent": "the Oracle disagreed without evidence",
     "analyst_verdict": "an analyst set a different verdict",
     "analyst_verdict_unknown": "soc-ai could not read the analyst verdict",
+    "earlier_true_positive": "an earlier investigation gave a true positive",
+    "earlier_runs_unread": "soc-ai could not read the earlier investigations",
 }
 
 
@@ -940,6 +979,20 @@ def _downgrade_detail(p: dict[str, Any]) -> str | None:
     summary = p.get("original_summary")
     if isinstance(summary, str) and summary.strip():
         lines.append(f"The summary before the change: {summary.strip()}")
+    return "\n".join(lines)
+
+
+def _impact_detail(p: dict[str, Any]) -> str:
+    """The impact guard, in words (H2). The verdict does not change."""
+    before, after = p.get("original_impact"), p.get("settled_impact")
+    lines = [
+        f"soc-ai changed the impact from {before} to {after}. The verdict does not change."
+        if isinstance(before, str) and isinstance(after, str)
+        else "soc-ai changed the impact. The verdict does not change."
+    ]
+    reason = p.get("reason")
+    if isinstance(reason, str) and reason.strip():
+        lines.append(f"Reason: {reason.strip()}")
     return "\n".join(lines)
 
 
@@ -1101,6 +1154,8 @@ def _special_step(kind: str, p: dict[str, Any]) -> tuple[str, str] | None:
         return timeline_labels.title_for(kind, p), _auto_ack_detail(p)
     if kind.endswith("_downgrade") and (down := _downgrade_detail(p)) is not None:
         return timeline_labels.title_for(kind, p), down
+    if kind == "impact_evidence_downgrade":
+        return timeline_labels.title_for(kind, p), _impact_detail(p)
     if kind == "auto_ack_skipped":
         reason = _auto_ack_skip_reason(p)
         return (
@@ -1157,7 +1212,7 @@ def _detail_for(kind: str, p: dict[str, Any] | None, result: Any = None) -> str:
             conf = p.get("confidence")
             at = f" at {conf:.2f}" if isinstance(conf, int | float) else ""
             return (
-                f"The run matched the {_template_label(p.get('template_id'))} pattern. "
+                f"The investigation matched the {_template_label(p.get('template_id'))} pattern. "
                 f"The pattern gives {_verdict_words(p.get('verdict'))}{at}. "
                 f"{_template_rationale(p.get('template_id'), p.get('rationale'))}"
             ).strip()
@@ -1225,12 +1280,15 @@ def _detail_for(kind: str, p: dict[str, Any] | None, result: Any = None) -> str:
             if isinstance(minutes, int) and minutes > 0
             else ""
         )
-        return f"An earlier run on another alert of this network session reached {chips}{window}."
+        return (
+            "An earlier investigation on another alert of this network session "
+            f"reached {chips}{window}."
+        )
     if kind == "analyst_verdict":
         who = p.get("analyst") or "An analyst"
         return (
             f"{who} set the verdict of this alert to {_verdict_words(p.get('verdict'))} "
-            f"on investigation {p.get('id')}. The run read this verdict as context."
+            f"on investigation {p.get('id')}. The investigation read this verdict as context."
         )
     if kind == "session_verdict_conflict":
         return (
@@ -1297,6 +1355,14 @@ class RecommendedActionOut(BaseModel):
     # the pending-action list, the needs-you count and the execute route read.
     # Dismiss stays on. None when the console may execute the action.
     blockedReason: str | None = None
+    # A note on an action that stays executable and waits on no one
+    # (:func:`soc_ai.api.webui.action_rules.action_note`). ``noteCode`` is
+    # ``campaign`` for a run that a campaign holds: ``note`` reads "Part of
+    # the campaign <title>. Decide on the campaign." and ``noteHref`` opens
+    # the campaign. All three are None on every other action.
+    noteCode: str | None = None
+    note: str | None = None
+    noteHref: str | None = None
 
 
 # A verdict code as the words of a sentence: "set the verdict to false positive".
@@ -1340,8 +1406,8 @@ def analyst_verdict_block(
     head = f"{who} set the verdict of this alert to {_verdict_name(analyst_verdict)}."
     if analyst_verdict != run_verdict:
         return (
-            f"{head} This run reached {_verdict_name(run_verdict)}. "
-            "Override the verdict of this run to act."
+            f"{head} This investigation reached {_verdict_name(run_verdict)}. "
+            "Override the verdict of this investigation to act."
         )
     if tag == "ack" and analyst_verdict != "false_positive":
         return f"{head} soc-ai does not acknowledge an alert with that verdict."
@@ -1383,6 +1449,11 @@ class WaitingActionOut(BaseModel):
     rationale: str = ""
     executable: bool = True
     reason: str | None = None
+    # The escalate of a finding only: an earlier press recorded no result and
+    # the finding is on no case. The scope route answers ``retry`` for the same
+    # record. The row then offers no Escalate and links to the investigation,
+    # whose card offers "Try again".
+    retry: bool = False
 
 
 class TimelineStepOut(BaseModel):
@@ -1391,6 +1462,9 @@ class TimelineStepOut(BaseModel):
     title: str
     time: str = ""
     detail: str = ""
+    # The tool of a tool call step, such as ``t_prevalence``. The page scrolls
+    # a tool citation of the report to this step (K1). None on other steps.
+    tool: str | None = None
 
 
 # Assistant-message ``meta["kind"]`` values that render as a CARD with a control
@@ -1415,11 +1489,144 @@ class ChatMessageOut(BaseModel):
     proposal: dict[str, Any] | None = None
 
 
+class VerdictChangeOut(BaseModel):
+    """The verdict change of a gate, for the one labeled line on the report."""
+
+    gate: str
+    fromVerdict: str
+    toVerdict: str
+    # The reason, in one or two sentences. The page prints it after the label.
+    reason: str = ""
+    # The evidence the gate looked for and did not find. Open questions lists it.
+    missing: list[str] = []
+    # Each step that changed the verdict, in pipeline order: the vote and the
+    # gates. ``fromVerdict`` above is the verdict of the model.
+    steps: list[dict[str, str]] = []
+
+
+class ImpactChangeOut(BaseModel):
+    """The change of the impact guard, for one labeled line on the report (H2).
+
+    The verdict stays a true positive. The model said ``succeeded``, the
+    report cites no fetched record with content of the event, and the impact
+    reads ``attempted``.
+    """
+
+    gate: str
+    fromImpact: str
+    toImpact: str
+    # The reason, in one sentence. The page prints it after the label.
+    reason: str = ""
+    # The evidence the guard looked for and did not find.
+    missing: list[str] = []
+
+
+def _impact_change_out(report: dict[str, Any], verdict: str | None) -> ImpactChangeOut | None:
+    """The stored impact change of a run, or None.
+
+    None when an analyst verdict or a pipeline error replaced the verdict of
+    the run, and when the row is no true positive now.
+    """
+    change = report.get("impact_change")
+    if not isinstance(change, dict) or report.get("resolution") or verdict != "true_positive":
+        return None
+    before, after = change.get("from_impact"), change.get("to_impact")
+    if not (isinstance(before, str) and isinstance(after, str)) or after != report.get("impact"):
+        return None
+    return ImpactChangeOut(
+        gate=str(change.get("gate") or ""),
+        fromImpact=before,
+        toImpact=after,
+        reason=scrub_secrets(str(change.get("reason") or "")),
+        missing=[scrub_secrets(str(m)) for m in (change.get("missing") or []) if str(m).strip()],
+    )
+
+
+def _verdict_change_out(report: dict[str, Any], events: list[Any]) -> VerdictChangeOut | None:
+    change = _verdict_change_of(report, events)
+    if change is None:
+        return None
+    return VerdictChangeOut(
+        gate=str(change.get("gate") or ""),
+        fromVerdict=str(change.get("from_verdict") or ""),
+        toVerdict=str(change.get("to_verdict") or ""),
+        reason=scrub_secrets(str(change.get("reason") or "")),
+        missing=[scrub_secrets(str(m)) for m in (change.get("missing") or []) if str(m).strip()],
+        steps=[
+            {
+                "gate": str(step.get("gate") or ""),
+                "fromVerdict": str(step.get("from_verdict") or ""),
+                "toVerdict": str(step.get("to_verdict") or ""),
+            }
+            for step in (change.get("steps") or [])
+            if isinstance(step, dict)
+        ],
+    )
+
+
+def _served_model_of(
+    report: dict[str, Any], events: list[Any]
+) -> tuple[str | None, str | None, bool]:
+    """(served model groups, asked models, fallback mark) of one run.
+
+    The report carries the record since B4 (``served_model``). An older run
+    has none, so the record is built from the ``served_backend`` of its
+    ``usage`` events, by the same rule: only the gateway says what a fallback
+    is (:func:`soc_ai.agent._gateway_retry.call_was_fallback`). Each name list
+    is None when the run recorded none, and the page then prints "not
+    recorded".
+    """
+    from soc_ai.agent.orchestrator import served_model_record  # noqa: PLC0415 - heavy package
+
+    record = report.get("served_model")
+    # A record with no asked models has the shape of a rule that compared the
+    # model group with ``analyst_model``. It is read from the events again.
+    if not (isinstance(record, dict) and isinstance(record.get("requested_models"), list)):
+        record = served_model_record(
+            [(e.payload or {}).get("served_backend") for e in events if e.kind == "usage"]
+        )
+    if not isinstance(record, dict):
+        return None, None, False
+
+    def _names(key: str) -> str | None:
+        values = record.get(key)
+        names = [str(v) for v in values if str(v).strip()] if isinstance(values, list) else []
+        return ", ".join(names) or None
+
+    return _names("model_groups"), _names("requested_models"), bool(record.get("fallback"))
+
+
+def _low_reasoning_of(report: dict[str, Any], events: list[Any]) -> bool:
+    """True when a model call of the run ran again with low reasoning (B6).
+
+    A call that hits the output token limit before a response runs one more
+    time with low reasoning effort. The report carries the mark, and a stored
+    run with no key has the ``token_limit_retry`` event.
+    """
+    if report.get("low_reasoning_retry"):
+        return True
+    return any(e.kind == "token_limit_retry" for e in events)
+
+
 class InvMetaOut(BaseModel):
     model: str
+    # A model call of the run hit the output token limit and ran again with
+    # low reasoning (B6). The page marks the model line.
+    lowReasoning: bool = False
+    # The gateway model groups that served the run, and the models that its
+    # calls asked for (B4). Each is None when the run recorded none.
+    # ``servedFallback`` marks a run that the gateway served from a fallback
+    # route: its fallback count is above zero, or a model group is not the
+    # model that the call asked for.
+    servedModel: str | None = None
+    requestedModel: str | None = None
+    servedFallback: bool = False
     oracle: str | None = None
     ranBy: str
     ranAt: str
+    # The time of the event that the run judges (migration 0072), ISO UTC.
+    # The page states it before ``ranAt``, the time of the investigation.
+    eventAt: str = ""
     toolCalls: int
     pivots: int
 
@@ -1438,6 +1645,10 @@ class OracleOut(BaseModel):
     # The Oracle answered another class with no evidence that resolves. Its
     # answer is an opinion on the run; the local verdict stands.
     withheld: bool = False
+    # Why the Oracle gave no verdict, as one sentence, when the run recorded
+    # a failed or a skipped call. None when the Oracle answered, and when the
+    # run recorded no reason (K3).
+    noAnswer: str | None = None
 
 
 class FallbackOut(BaseModel):
@@ -1483,12 +1694,26 @@ class CitationOut(BaseModel):
     ``tool`` (a tool the run called) or ``unknown``. ``target`` is the id, path
     or tool name. ``resolved`` is the validator's answer, None when the run
     recorded no validation.
+
+    A ``path`` citation carries the value the field holds in the context the
+    run stored, in ``value``, and the grid document that holds the field, in
+    ``documentId``. The page opens that document at the field (K1). Both are
+    None when the stored context has no such field. ``documentId`` is None
+    for a field of a profile or of the host coverage: no grid document holds
+    it.
+
+    ``value`` holds at most :data:`CITED_VALUE_MAX` characters. A cited
+    payload can be large. ``valueTruncated`` is True when the server cut
+    the value.
     """
 
     text: str
     kind: str
     target: str | None = None
     resolved: bool | None = None
+    documentId: str | None = None
+    value: str | None = None
+    valueTruncated: bool = False
 
 
 class FailureOut(BaseModel):
@@ -1501,7 +1726,14 @@ class FailureOut(BaseModel):
     cause: str
     hint: str | None = None
     permanent: bool = False
+    # The class of the cause, for the plain sentence the page leads with
+    # (K2): ``gateway``, ``token_limit``, ``time_limit``, ``grid`` or
+    # ``other``. A permanent cause is ``other``: the page states it apart.
+    kind: str = "other"
 
+
+# The most characters of a cited value that the detail sends.
+CITED_VALUE_MAX = 2000
 
 # Markers the pipeline writes into `citations` that name no document.
 _NON_DOCUMENT_CITATIONS = frozenset({"synth_first_failure"})
@@ -1530,6 +1762,11 @@ def _citations_out(report: dict[str, Any], events: list[Any]) -> list[CitationOu
             for item in per
             if isinstance(item, dict) and item.get("citation")
         }
+    context: dict[str, Any] = {}
+    for e in events:
+        if e.kind in ("enriched_alert_context", "alert_context") and isinstance(e.payload, dict):
+            context = e.payload
+            break
     raw = report.get("citations")
     out: list[CitationOut] = []
     seen: set[str] = set()
@@ -1544,8 +1781,125 @@ def _citations_out(report: dict[str, Any], events: list[Any]) -> list[CitationOu
             # A ULID names an investigation or a hunt, never a grid document.
             # The page would open the document dialog on it and read a 404.
             kind = "run"
-        out.append(CitationOut(text=c, kind=kind, target=target, resolved=resolved_by_text.get(c)))
+        document_id, value = (
+            _cited_field(context, target) if kind == "path" and target else (None, None)
+        )
+        # The value is scrubbed before the cut, so the cut never splits a
+        # secret that the scrub would have caught whole.
+        truncated = value is not None and len(value) > CITED_VALUE_MAX
+        if truncated and value is not None:
+            value = value[:CITED_VALUE_MAX]
+        out.append(
+            CitationOut(
+                text=c,
+                kind=kind,
+                target=target,
+                resolved=resolved_by_text.get(c),
+                documentId=document_id,
+                value=value,
+                valueTruncated=truncated,
+            )
+        )
     return out
+
+
+# The lists of grid documents in a stored alert context. A path into one of
+# them names a document by its index: ``community_id_events.0.zeek_http_status``.
+_CONTEXT_DOCUMENT_LISTS = frozenset(
+    {
+        "community_id_events",
+        "host_events",
+        "user_events",
+        "process_events",
+        "file_events",
+        "subject_documents",
+    }
+)
+
+
+def _cited_field(context: Mapping[str, Any], path: str) -> tuple[str | None, str | None]:
+    """(document id, value) of a cited field path, from the stored context.
+
+    The value comes from the walk the citation validator uses
+    (:func:`soc_ai.agent.evidence.context_path_value`), so the page shows the
+    value that the validator resolved. ``alert.<field>`` names the alert
+    document. ``<list>.<n>.<field>`` names the n-th document of a pivot list.
+    Any other root, a profile or the host coverage, has a value and no
+    document. A path the context does not hold returns (None, None). The
+    value is scrubbed: a payload can quote a credential.
+    """
+    from soc_ai.agent.evidence import context_path_value  # noqa: PLC0415
+
+    if not context:
+        return None, None
+    found = context_path_value(context, path)
+    if found is None:
+        return None, None
+    if isinstance(found, dict | list):
+        text = json.dumps(found, separators=(",", ":"), sort_keys=True, default=str)
+    elif isinstance(found, bool):
+        text = "true" if found else "false"
+    else:
+        text = str(found)
+    parts = path.split(".")
+    holder: Any = None
+    if parts[0] == "alert":
+        holder = context.get("alert")
+    elif parts[0] in _CONTEXT_DOCUMENT_LISTS and len(parts) > 1 and parts[1].isdigit():
+        docs = context.get(parts[0])
+        index = int(parts[1])
+        if isinstance(docs, list) and index < len(docs):
+            holder = docs[index]
+    doc_id = holder.get("id") if isinstance(holder, dict) else None
+    return (
+        doc_id if isinstance(doc_id, str) and doc_id.strip() else None,
+        scrub_secrets(text),
+    )
+
+
+def _run_text(report: dict[str, Any], inv: Investigation) -> tuple[str, str, str | None]:
+    """(summary, headline, model text) of a run, as the page shows them.
+
+    One reader for every stored shape (:func:`soc_ai.agent.gates.run_text`).
+    The headline never contradicts the final verdict: a run whose claim a
+    gate refuted leads with the reason of the gate, and the text of the model
+    comes back as the third value, for the label "The model wrote". A row of
+    an older release is repaired where its stored data allows.
+    """
+    from soc_ai.agent.gates import run_text  # noqa: PLC0415 - heavy package
+
+    text = run_text(report, rationale=inv.rationale, summary=inv.summary)
+    return text.summary, text.headline, text.model_text
+
+
+def _verdict_change_of(report: dict[str, Any], events: list[Any]) -> dict[str, Any] | None:
+    """The verdict change that a gate made on this run, or None.
+
+    The report carries it in ``verdict_change`` (B2, 2026-11-13). A run that an
+    older release stored has no such key, so the record is built from its gate
+    events with the same builder. That fallback holds only while the verdict
+    of the gate still stands: an Oracle verdict on the row replaced it. An
+    analyst verdict and a pipeline error replace the verdict on any row.
+    """
+    from soc_ai.agent.gates import (  # noqa: PLC0415 - the agent package is heavy
+        VERDICT_CHANGE_GATES,
+        verdict_change_from_audit,
+    )
+
+    if report.get("resolution"):
+        # An analyst verdict or a pipeline error replaced the verdict.
+        return None
+    stored = report.get("verdict_change")
+    if isinstance(stored, dict) and stored.get("to_verdict"):
+        return stored
+    if report.get("local_verdict"):
+        return None
+    kinds = {key for key, _field in VERDICT_CHANGE_GATES}
+    audit = {e.kind: (e.payload or {}) for e in events if e.kind in kinds}
+    change = verdict_change_from_audit(audit)
+    if change is None or change.get("to_verdict") != report.get("verdict"):
+        return None
+    return change
 
 
 def _open_questions_out(report: dict[str, Any], events: list[Any]) -> list[str]:
@@ -1556,6 +1910,10 @@ def _open_questions_out(report: dict[str, Any], events: list[Any]) -> list[str]:
     ``investigation_transcript`` event. The detail read the report alone, so
     every needs_more_info run on prod showed no open questions (P2). An older
     report that carries the key still wins.
+
+    The evidence that a gate found missing comes first (B2). The card showed
+    one bullet for a lowered verdict, the sentence that states the change, and
+    it asked no question.
     """
 
     def _clean(raw: Any) -> list[str]:
@@ -1563,15 +1921,21 @@ def _open_questions_out(report: dict[str, Any], events: list[Any]) -> list[str]:
             return []
         return [str(q).strip() for q in raw if isinstance(q, str) and q.strip()]
 
+    change = _verdict_change_of(report, events)
+    missing = _clean((change or {}).get("missing"))
+
+    def _with_missing(questions: list[str]) -> list[str]:
+        return missing + [q for q in questions if q not in missing]
+
     from_report = _clean(report.get("open_questions"))
     if from_report:
-        return from_report
+        return _with_missing(from_report)
     for e in reversed(events):
         if e.kind == "investigation_transcript":
             found = _clean((e.payload or {}).get("open_questions"))
             if found:
-                return found
-    return []
+                return _with_missing(found)
+    return missing
 
 
 # An error type or message that no re-run can change: the alert itself is gone.
@@ -1584,11 +1948,11 @@ _PERMANENT_ERROR_PREFIXES = ("alert not found", "hunt not found")
 # 2026-10-06). The stored rows keep their text, and the page reads this.
 _FAILURE_HINTS: dict[str, str] = {
     "run_cancelled": (
-        "This run stopped before a verdict. A sweep time limit, a restart or a closed "
-        "connection stops a run. Re-run it to get a verdict."
+        "This investigation stopped before a verdict. A sweep time limit, a restart or a "
+        "closed connection stops an investigation. Re-run it to get a verdict."
     ),
     "whole_run_backstop": (
-        "This run hit its time limit before a verdict. A slow model backend is the usual "
+        "This investigation hit its time limit before a verdict. A slow model backend is the usual "
         "cause. The operator can check the model gateway."
     ),
 }
@@ -1626,8 +1990,33 @@ def _failure_out(status: str | None, events: list[Any]) -> FailureOut | None:
             cause=_compact(message),
             hint=hint if isinstance(hint, str) and hint.strip() else None,
             permanent=permanent,
+            kind="other" if permanent else _failure_kind(p, err_type, message),
         )
     return None
+
+
+def _failure_kind(payload: Mapping[str, Any], err_type: str, message: str) -> str:
+    """The class of a recorded run error, for the plain sentence of the page.
+
+    The classes of the nightly snapshot (:func:`soc_ai.eval.quality.classify_run_error`)
+    plus ``grid``. The phase decides the grid: the prefetch reads only the
+    grid, and its hint names the grid. The time limit of the whole run is
+    its own phase.
+    """
+    from soc_ai.agent.orchestrator import (  # noqa: PLC0415 - the agent package is heavy
+        _GRID_SLOW_HINT,
+        _GRID_UNREACHABLE_HINT,
+        _PHASE_DEPENDENCY,
+    )
+    from soc_ai.eval.quality import classify_run_error  # noqa: PLC0415
+
+    phase = str(payload.get("phase") or "")
+    if phase == "whole_run_backstop":
+        return "time_limit"
+    hint = str(payload.get("hint") or "").strip()
+    if _PHASE_DEPENDENCY.get(phase) == "grid" or hint in (_GRID_UNREACHABLE_HINT, _GRID_SLOW_HINT):
+        return "grid"
+    return classify_run_error(err_type or None, message)
 
 
 class SupersededRunOut(BaseModel):
@@ -1652,6 +2041,21 @@ class StandingAnalystVerdictOut(BaseModel):
     via: str
     # ISO UTC time of the resolution, when it was stored.
     at: str | None = None
+
+
+class AuthorizationRefOut(BaseModel):
+    """The authorized activity a run matched, as a list row and the run page read it.
+
+    ``state`` is ``active``, ``expired`` or ``revoked``. An expired
+    authorization keeps the marks of its runs. After a revoke the run gets
+    normal handling again, and the page says so. ``expiresAt`` is ISO UTC.
+    """
+
+    id: int
+    label: str
+    state: str
+    expiresAt: str
+    by: str
 
 
 class EntityRefOut(BaseModel):
@@ -1723,6 +2127,32 @@ class InvestigationOut(BaseModel):
     failure: FailureOut | None = None
     resolution: dict[str, Any] | None = None
     validatorNote: str | None = None
+    # The text of the model, when a gate refuted its claim. The headline and
+    # the summary are then the reason of the gate, and the page prints this
+    # text under the label "The model wrote". None on every other run.
+    modelText: str | None = None
+    # The verdict change of a gate (B2): the gate, the verdict before and
+    # after, the reason as one line and the missing evidence. None when no
+    # gate changed the verdict. Built by `_verdict_change_out`.
+    verdictChange: VerdictChangeOut | None = None
+    # H2. What the hostile action of a true positive did: ``succeeded``,
+    # ``attempted``, ``unknown`` or ``none``. Null for every other verdict, and
+    # for a true positive that an older release stored.
+    impact: str | None = None
+    # The change of the impact guard: the model said ``succeeded`` and the
+    # report cites no record that shows the effect. None on every other run.
+    impactChange: ImpactChangeOut | None = None
+    # The first line of the run, built by the server: the verdict, the impact
+    # of a true positive, and the source and the target with the name and the
+    # role that the Hosts data holds. A row of an older release gets the line
+    # at read time, and its impact reads "not stated". None for a run with no
+    # verdict and for a pipeline error.
+    firstLine: str | None = None
+    # H3. The reasoning of the Oracle, when the Oracle wrote the report of
+    # the run and its answer held a summary for the analyst. The summary is
+    # then that text alone. None on a local report, and on a run of an older
+    # release, whose summary still holds the reasoning.
+    oracleReasoning: str | None = None
     # Pipeline-failure fallback provenance (E1.2). Present ONLY when the run's
     # report is a synth-failure fallback (`is_pipeline_fallback`) — the drawer
     # then renders "this run failed before reaching a verdict: <hint>" + a Re-run
@@ -1792,6 +2222,11 @@ class InvestigationOut(BaseModel):
     # offers no settled bar and no escalate from the chat on such a run
     # (V3-N2). None when the run has an alert to act on.
     writeBlockedReason: str | None = None
+    # "finding" or "lead" when a promotion landed this run, else None: the
+    # answer of :func:`soc_ai.api.webui.action_rules.promoted_kind`, the one
+    # the action rule reads. The console read ``kind`` on its own and could
+    # disagree with the server about what a finding run is.
+    promotedKind: str | None = None
     # The Security Onion cases the alert of this run is on, read when an
     # escalate of the run waits: the escalation ledger first, then the case
     # links of the grid. The escalate card names and links each case, like
@@ -1827,6 +2262,22 @@ class InvestigationOut(BaseModel):
     # stored documents. None while the run runs, and when fewer than two
     # documents have a stored time.
     eventTimeline: EventTimelineOut | None = None
+    # The authorized activity this run matched (soc_ai.store.authorized_activity).
+    # ``authorizationId`` is the stored link, and it stays after a revoke.
+    # ``authorization`` holds the label, the state and the expiry. Null on a
+    # run that matched none.
+    authorizationId: int | None = None
+    authorization: AuthorizationRefOut | None = None
+    # The one line of a run that is outside an authorized scope. It names the
+    # part that failed. Null when no scope has anything to say, and null after
+    # a revoke of the authorization the line names.
+    outsideAuthorizedScope: str | None = None
+    # The active campaign that this investigation is a member of, or null.
+    campaign: CampaignLinkOut | None = None
+    # The one line of a clear from Needs you (`soc-ai needs-you clear`):
+    # "Cleared from Needs you on {date} by {user}: {reason}." Null when no
+    # clear stands. The verdict stays the verdict of the run.
+    needsYouCleared: str | None = None
 
 
 def _host_contexts(profiles: Any) -> list[dict[str, Any]]:
@@ -2012,6 +2463,16 @@ def _ack_pending_note(events: list[Any]) -> str | None:
                 "soc-ai could not read the analyst verdict of this alert. "
                 "A person must acknowledge it."
             )
+        elif p.get("reason") == "earlier_true_positive":
+            ack_pending_note = (
+                "An earlier investigation of this alert gave a true positive. "
+                "soc-ai does not acknowledge it without you."
+            )
+        elif p.get("reason") == "earlier_runs_unread":
+            ack_pending_note = (
+                "soc-ai could not read the earlier investigations of this alert. "
+                "A person must acknowledge it."
+            )
         elif p.get("reason") == "below_threshold":
             conf, thr = p.get("confidence"), p.get("threshold")
             if isinstance(conf, int | float) and isinstance(thr, int | float):
@@ -2021,7 +2482,7 @@ def _ack_pending_note(events: list[Any]) -> str | None:
                 )
         elif p.get("reason") == "no_investigation":
             ack_pending_note = (
-                "Auto-ack is on. This run reached its verdict and retrieved "
+                "Auto-ack is on. This investigation reached its verdict and retrieved "
                 "nothing. A person must acknowledge it."
             )
         elif p.get("reason") == "oracle_dissent":
@@ -2036,7 +2497,7 @@ def _ack_pending_note(events: list[Any]) -> str | None:
             # count telling them which one it was.
             ack_pending_note = (
                 "Auto-ack is on. The report cites no evidence that resolves to "
-                "anything this run retrieved. A person must acknowledge it."
+                "anything this investigation retrieved. A person must acknowledge it."
             )
         break
     return ack_pending_note
@@ -2044,7 +2505,24 @@ def _ack_pending_note(events: list[Any]) -> str | None:
 
 # The note on every recommended action of a backtest replay. The console
 # renders an action that carries a note as closed, with no Execute button.
-REPLAY_ACTION_NOTE = "Not executable. This run is a backtest replay."
+REPLAY_ACTION_NOTE = "Not executable. This investigation is a backtest replay."
+
+
+# A comment needs the case of the run. The escalate of the run is recorded as
+# done, and the record names no case: the alert was already on a case that
+# soc-ai could not name. The comment then has no target and no way to get one,
+# so it reads as closed with this reason. It said "Escalate the alert first"
+# beside an escalate that was done (review 2026-11-13, lane D, defect 8).
+COMMENT_CASE_UNKNOWN = (
+    "The alert is already on a Security Onion case, and soc-ai does not know the "
+    "case. Add the comment in Security Onion."
+)
+
+
+def _escalate_done_with_no_case(executed: dict[str, dict[str, Any]]) -> bool:
+    """Whether an escalate of the run is done and no receipt names its case."""
+    escalates = [p for p in executed.values() if p.get("tool_name") == "escalate_to_case"]
+    return bool(escalates) and not any(p.get("case_id") for p in escalates)
 
 
 # Why an ack the record calls done is offered again: the grid answered and
@@ -2142,6 +2620,7 @@ def _build_actions(
     auto_acked = any(e.kind == "auto_ack" and (e.payload or {}).get("success") for e in events)
     executed = _executed_actions(events)
     dismissed = _dismissals(events)
+    case_unknown = _escalate_done_with_no_case(executed)
 
     ack_pending_note = _ack_pending_note(events)
 
@@ -2197,6 +2676,9 @@ def _build_actions(
             by, at = "auto-ack", ran_at
         elif applied:
             note = _ack_note(tn)
+        elif tn == "add_case_comment" and case_unknown:
+            # Closed with the reason, and no write button.
+            applied, note = True, COMMENT_CASE_UNKNOWN
         pending_note = ack_pending_note if tn == "ack_alert" and not applied else None
         if tn == "ack_alert" and applied and alert_unacked:
             # The record says done and the grid says not done. The card follows
@@ -2309,11 +2791,14 @@ def _build_oracle(events: list[Any]) -> OracleOut | None:
     """
     esc_payload: dict[str, Any] | None = None
     adj_payload: dict[str, Any] | None = None
+    no_answer: str | None = None
     for e in events:
         if e.kind == "oracle_escalation":
             esc_payload = e.payload or {}
         elif e.kind == "oracle_adjudication":
             adj_payload = e.payload or {}
+        elif e.kind in ("oracle_adjudication_failed", "oracle_skipped"):
+            no_answer = _oracle_no_answer(e.kind, e.payload or {})
     if esc_payload is None and adj_payload is None:
         return None
 
@@ -2340,7 +2825,23 @@ def _build_oracle(events: list[Any]) -> OracleOut | None:
         redactionNote=redaction_note,
         changed=changed,
         withheld=withheld,
+        noAnswer=None if oracle_verdict else no_answer,
     )
+
+
+def _oracle_no_answer(kind: str, payload: dict[str, Any]) -> str:
+    """Why the Oracle gave no verdict, as one sentence for the run page.
+
+    The phrases are the ones the timeline step uses
+    (:data:`soc_ai.webui.timeline_labels._ORACLE_FAILURE_PHRASE`), so the
+    Oracle card and the step say the same thing.
+    """
+    if kind == "oracle_skipped":
+        return "Oracle calls are paused."
+    phrase = timeline_labels._ORACLE_FAILURE_PHRASE.get(str(payload.get("error_class") or ""))
+    if phrase is None:
+        return "The Oracle call failed."
+    return f"{phrase[0].upper()}{phrase[1:]}."
 
 
 def _build_timeline(events: list[Any]) -> tuple[list[TimelineStepOut], int, int, bool]:
@@ -2410,8 +2911,15 @@ def _build_timeline(events: list[Any]) -> tuple[list[TimelineStepOut], int, int,
             detail = _detail_for(e.kind, p)
         if e.kind == "targeted_dispatch":
             last_dispatch = len(timeline)
+        step_tool = (
+            str(p.get("tool_name") or "") or None
+            if e.kind in ("tool_call", "targeted_dispatch")
+            else None
+        )
         timeline.append(
-            TimelineStepOut(id=f"e{e.sequence}", group=group, title=title, detail=detail)
+            TimelineStepOut(
+                id=f"e{e.sequence}", group=group, title=title, detail=detail, tool=step_tool
+            )
         )
     # One count from one source: the rows the "Tool calls" section shows. A
     # separate tally drifted from the section (2 against 3 rows on prod, P10).

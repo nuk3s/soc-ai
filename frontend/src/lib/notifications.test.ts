@@ -101,7 +101,7 @@ describe('notificationKind', () => {
 
   it('lists every kind the derivation can return', () => {
     const kinds = NOTIFICATION_KINDS.map((k) => k.id);
-    expect(kinds).toEqual(['system', 'host', 'investigation', 'hunting']);
+    expect(kinds).toEqual(['system', 'host', 'campaign', 'investigation', 'hunting']);
   });
 
   // A failed triage sat on the System chip while the Investigations chip held
@@ -123,7 +123,7 @@ describe('describeNotifications', () => {
   it('names only the row types present, with a count each', () => {
     expect(
       describeNotifications([{ id: 'lead:1' }, { id: 'inv-done:a' }, { id: 'inv-done:b' }], false),
-    ).toBe('3 notifications: 1 lead and 2 completed investigations. Finished runs cover the last 24 h.');
+    ).toBe('3 notifications: 1 lead and 2 completed investigations. Finished investigations and hunts cover the last 24 h.');
   });
 
   // The header said "the 10 newest" over a list the API cut at 12 rows, and
@@ -136,7 +136,7 @@ describe('describeNotifications', () => {
       ...Array.from({ length: 10 }, (_, i) => ({ id: `inv-done:${i}` })),
     ];
     expect(describeNotifications(rows, true)).toBe(
-      '12 notifications loaded: 2 running investigations and 10 completed investigations. More notifications exist. Select Show more to load them. Finished runs cover the last 24 h.',
+      '12 notifications loaded: 2 running investigations and 10 completed investigations. More notifications exist. Select Show more to load them. Finished investigations and hunts cover the last 24 h.',
     );
   });
 
@@ -187,7 +187,7 @@ describe('the hunt rows of the bell', () => {
   it('names a folded sweep and a running hunt in the header', () => {
     expect(
       describeNotifications([{ id: 'hunt-sweep:could_not_run:01A' }, { id: 'hunt:01B' }], false),
-    ).toBe('2 notifications: 1 catalog sweep and 1 running hunt. Finished runs cover the last 24 h.');
+    ).toBe('2 notifications: 1 catalog sweep and 1 running hunt. Finished investigations and hunts cover the last 24 h.');
     // A running hunt alone has no window.
     expect(describeNotifications([{ id: 'hunt:01B' }], false)).toBe('1 notification: 1 running hunt.');
   });

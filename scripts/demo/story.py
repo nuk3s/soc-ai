@@ -103,7 +103,7 @@ MACHINES: tuple[Machine, ...] = (
         "Windows Server 2022",
         "domain_controller",
         role_evidence=(
-            "responds on tcp/88, tcp/389, tcp/445 and udp/53 to every workstation of the estate"
+            "responds on tcp/88, tcp/389, tcp/445 and udp/53 to every internal workstation"
         ),
         declared={"role": "domain_controller", "criticality": "critical"},
         mac=0x10,
@@ -124,7 +124,7 @@ MACHINES: tuple[Machine, ...] = (
         "windows",
         "Windows Server 2022",
         "domain_controller",
-        role_evidence="responds on tcp/88, tcp/389 and udp/53. The second resolver of the estate",
+        role_evidence="responds on tcp/88, tcp/389 and udp/53. The second resolver of the network",
         mac=0x11,
         services=(("udp", 53, 30_114), ("tcp", 88, 9_402), ("tcp", 389, 4_877)),
         events_per_day=31_000,
@@ -209,7 +209,7 @@ MACHINES: tuple[Machine, ...] = (
         "linux",
         "Rocky Linux 9",
         "server",
-        role_evidence="opens connections to every address of the estate on many ports",
+        role_evidence="opens connections to every internal address on many ports",
         declared={"role": "security_appliance"},
         mac=0x40,
         services=(("tcp", 8834, 140),),

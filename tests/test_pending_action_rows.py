@@ -151,6 +151,7 @@ def test_a_pending_row_carries_its_waiting_action(client: TestClient) -> None:  
             "rationale": "The beacon matches a known C2 address.",
             "executable": True,
             "reason": None,
+            "retry": False,
         }
     ]
 
@@ -305,8 +306,9 @@ def test_the_execute_route_writes_for_a_standing_run(client: TestClient) -> None
 
 
 _DISPUTED = (
-    "ana set the verdict of this alert to false positive. This run reached true positive. "
-    "Override the verdict of this run to act."
+    "ana set the verdict of this alert to false positive. "
+    "This investigation reached true positive. "
+    "Override the verdict of this investigation to act."
 )
 _NO_ACK = (
     "ana set the verdict of this alert to true positive. soc-ai does not acknowledge an "

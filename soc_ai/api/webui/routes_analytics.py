@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, cast
 
@@ -33,7 +34,13 @@ from soc_ai.api.webui._shared import (
 from soc_ai.api.webui.kind_labels import kind_label
 from soc_ai.config import Settings
 from soc_ai.hunting.catalog_tiers import Catalog, effective_catalog
-from soc_ai.hunting.leads import decays_from, no_lead_reasons
+from soc_ai.hunting.leads import (
+    HitMachine,
+    decays_from,
+    machines_of,
+    no_lead_reasons,
+    read_hit,
+)
 from soc_ai.hunting.ledger import HIT_SOURCES, Ledger, analytic_ledger
 from soc_ai.hunting.spec import CATALOG_DIR, PRIOR_SWEEP_EVALUATORS, HuntSpec
 from soc_ai.hunting.weight import live_weight
@@ -271,6 +278,11 @@ class ShadowHitOut(BaseModel):
     lead_id: int | None
     first_seen_at: str | None = None
     occurrences: int = 1
+    # The machine the entity belongs to: the key the Hosts page uses, and the
+    # name it shows. Null for an entity on no machine record. A hit is one
+    # analytic and one value on one machine, and the row is one address.
+    machine_key: str | None = None
+    machine_name: str | None = None
 
 
 class ShadowHitsOut(BaseModel):
@@ -340,6 +352,12 @@ class AnalyticHitOut(BaseModel):
     # hold lasts. A hit recorded live stays under Live and counts toward a
     # lead, and the card says why its analytic now reads shadow (R3-D11).
     analytic_held_by_system: str | None = None
+    # The machine the entity belongs to: the key the Hosts page uses, and the
+    # name it shows. Null for an entity on no machine record. The read mark
+    # of a shadow hit is keyed on the machine: the same analytic and the same
+    # value on another address of the machine is a repeat of the same hit.
+    machine_key: str | None = None
+    machine_name: str | None = None
 
 
 class AnalyticHitCountsOut(BaseModel):
@@ -355,9 +373,58 @@ class AnalyticHitCountsOut(BaseModel):
     shadow: int = 0
 
 
+class AnalyticHitWindowOut(BaseModel):
+    """The two parts of the hit list, each with its own window.
+
+    The list holds the hits of the last ``days`` days, and every unread shadow
+    hit at any age. The block labelled the sum "last 7 days", and on production
+    39 of 249 hits were from those days (review 2026-11-12, F3). A count obeys
+    the window on its label, or it states its own window. So the two parts are
+    counted apart:
+
+    - ``in_window``: hits that an analytic saw in the last ``days`` days, live
+      and shadow, read and unread.
+    - ``older_unread``: unread shadow hits that no analytic saw in those days.
+
+    Their sum is ``counts.all``. Neither follows the filter or the page.
+    """
+
+    days: int = 7
+    in_window: int = 0
+    older_unread: int = 0
+
+
+class AnalyticHitGroupOut(BaseModel):
+    """The hits of one analytic under the filter, counted over the whole list.
+
+    On production 233 unread hits came from 3 analytics, and each card
+    repeated the two decisions on its analytic (review 2026-11-12, F2). The
+    block now renders one header for each analytic from this row: the count,
+    the machines, and the decisions once.
+
+    ``machines`` counts the machines that the host hits name. Two addresses of
+    one machine are one machine. An address that no machine holds counts as
+    one. ``accounts`` counts the user accounts that the hits name.
+    """
+
+    analytic_id: str
+    analytic_title: str
+    # The status of the analytic now, by the rule of :func:`_hit_row`.
+    analytic_status: str
+    tier: str
+    analytic_exists: bool = True
+    hits: int = 0
+    unread: int = 0
+    machines: int = 0
+    accounts: int = 0
+    newest_at: str | None = None
+
+
 class AnalyticHitsOut(BaseModel):
     hits: list[AnalyticHitOut]
     counts: AnalyticHitCountsOut
+    window: AnalyticHitWindowOut = AnalyticHitWindowOut()
+    groups: list[AnalyticHitGroupOut] = []
 
 
 def _iso(value: Any) -> str | None:
@@ -995,11 +1062,15 @@ async def list_shadow_hits(request: Request, limit: int = 50) -> ShadowHitsOut:
         # and the sidebar all render this number, and a count of the first 50
         # rows says "3 shadow hits need your read" on a night that has 60.
         unread = await _count_hits(db, *unread_shadow_hits_where(cat))
+        machines = await machines_of(db, [r.entity_key for r in rows if r.entity_kind == "host"])
     hits: list[ShadowHitOut] = []
     for observation in rows:
         receipts = _receipts_of(observation)
         state, missing = _hit_state(observation, receipts)
         spec = cat.listed.get(observation.spec_id)
+        machine = (
+            machines.get(observation.entity_key) if observation.entity_kind == "host" else None
+        )
         hits.append(
             ShadowHitOut(
                 id=observation.id,
@@ -1016,6 +1087,8 @@ async def list_shadow_hits(request: Request, limit: int = 50) -> ShadowHitsOut:
                 receipts=receipts,
                 read=observation.read_at is not None,
                 lead_id=observation.lead_id,
+                machine_key=machine.key if machine else None,
+                machine_name=machine.name if machine else None,
             )
         )
     return ShadowHitsOut(hits=hits, unread=unread)
@@ -1034,8 +1107,8 @@ async def mark_shadow_hit_read(request: Request, obs_id: int) -> dict[str, bool]
                 "The shadow band on the Hunts page lists every shadow hit.",
             )
         if row.read_at is None:
-            row.read_at = datetime.now(UTC).replace(tzinfo=None)
-            await db.commit()
+            # The same hit on the other addresses of the machine is read too.
+            await read_hit(db, row, at=datetime.now(UTC).replace(tzinfo=None))
     return {"ok": True}
 
 
@@ -1077,6 +1150,66 @@ def _read_all_mark(raw: str) -> datetime:
     return mark
 
 
+async def _mark_shadow_hits_read(
+    request: Request,
+    *,
+    before: str,
+    expected: int | None,
+    analytic_id: str | None = None,
+) -> ShadowHitsReadAllOut:
+    """Mark unread shadow hits born up to ``before`` as read, in one write.
+
+    With ``analytic_id`` the write takes the hits of that analytic only. The
+    rows are the ones :func:`unread_shadow_hits_where` names, the rows the
+    needs-you count holds, so a hit of a retired analytic is not touched.
+
+    The read is committed first. The audit record follows, and a failed audit
+    write does not undo the read, the rule the dossier writes follow.
+    """
+    mark = _read_all_mark(before)
+    now = datetime.now(UTC).replace(tzinfo=None)
+    scope: tuple[Any, ...] = ()
+    if analytic_id is not None:
+        scope = (EntityObservation.spec_id == analytic_id,)
+    async with request.app.state.db_sessionmaker() as db:
+        cat = await effective_catalog(db)
+        result = await db.execute(
+            update(EntityObservation)
+            .where(*unread_shadow_hits_where(cat), *scope, EntityObservation.born_at <= mark)
+            .values(read_at=now)
+            .execution_options(synchronize_session=False)
+        )
+        # cast: AsyncSession.execute is typed Result, but an UPDATE returns a
+        # CursorResult, whose rowcount is the number of rows changed.
+        read = int(cast("CursorResult[Any]", result).rowcount or 0)
+        if expected is not None and read > expected:
+            # More hits than the confirm step named. The write and the check
+            # are one transaction, so the rollback leaves every hit unread.
+            await db.rollback()
+            raise api_error(
+                409,
+                "shadow_hits_changed",
+                f"{read - expected} new shadow hits arrived after the count. "
+                "Open the list again and confirm the new count.",
+            )
+        await db.commit()
+    payload: dict[str, Any] = {"read": read, "before": mark.replace(tzinfo=UTC).isoformat()}
+    if analytic_id is not None:
+        payload["analytic_id"] = analytic_id
+    try:
+        audit = getattr(request.app.state, "audit", None)
+        if audit is not None:
+            await audit.log_kind(
+                _READ_ALL_SESSION,
+                "shadow_hits_read",
+                payload,
+                user=await identify_caller(request),
+            )
+    except Exception:
+        _LOGGER.warning("shadow-hit bulk read audit write failed (continuing)", exc_info=True)
+    return ShadowHitsReadAllOut(read=read)
+
+
 @router.post("/hunts/shadow-hits/read-all", response_model=ShadowHitsReadAllOut)
 async def mark_all_shadow_hits_read(
     request: Request, body: ShadowHitsReadAllIn
@@ -1085,49 +1218,38 @@ async def mark_all_shadow_hits_read(
 
     "Dismiss all" in the bell sends the moment it loaded the count. A hit born
     after that moment was not in the count the analyst saw, so it stays
-    unread. The rows are the ones :func:`unread_shadow_hits_where` names, the
-    rows the needs-you count holds, so a hit of a retired analytic is not
-    touched.
-
-    The read is committed first. The audit record follows, and a failed audit
-    write does not undo the read, the rule the dossier writes follow.
+    unread.
     """
-    mark = _read_all_mark(body.before)
-    now = datetime.now(UTC).replace(tzinfo=None)
-    async with request.app.state.db_sessionmaker() as db:
-        cat = await effective_catalog(db)
-        result = await db.execute(
-            update(EntityObservation)
-            .where(*unread_shadow_hits_where(cat), EntityObservation.born_at <= mark)
-            .values(read_at=now)
-            .execution_options(synchronize_session=False)
+    return await _mark_shadow_hits_read(request, before=body.before, expected=body.expected)
+
+
+class ShadowHitsReadAnalyticIn(ShadowHitsReadAllIn):
+    # The analytic whose unread hits the press reads.
+    analytic_id: str
+
+
+@router.post("/hunts/shadow-hits/read-analytic", response_model=ShadowHitsReadAllOut)
+async def mark_analytic_shadow_hits_read(
+    request: Request, body: ShadowHitsReadAnalyticIn
+) -> ShadowHitsReadAllOut:
+    """Mark the unread shadow hits of one analytic as read, in one write.
+
+    The header of an analytic on the Hunts page offers "Mark N read". The
+    page held 233 unread hits of 3 analytics, and each hit took one press
+    (review 2026-11-12, F2). ``before`` is the moment the page loaded the
+    count and ``expected`` is the N on the button, by the rule of
+    :func:`mark_all_shadow_hits_read`. The analytic keeps its status.
+    """
+    analytic_id = body.analytic_id.strip()
+    if not analytic_id:
+        raise api_error(
+            422,
+            "analytic_required",
+            "Name the analytic in 'analytic_id'. GET /hunts/hits lists the id of each group.",
         )
-        # cast: AsyncSession.execute is typed Result, but an UPDATE returns a
-        # CursorResult, whose rowcount is the number of rows changed.
-        read = int(cast("CursorResult[Any]", result).rowcount or 0)
-        if body.expected is not None and read > body.expected:
-            # More hits than the confirm step named. The write and the check
-            # are one transaction, so the rollback leaves every hit unread.
-            await db.rollback()
-            raise api_error(
-                409,
-                "shadow_hits_changed",
-                f"{read - body.expected} new shadow hits arrived after the count. "
-                "Open the list again and confirm the new count.",
-            )
-        await db.commit()
-    try:
-        audit = getattr(request.app.state, "audit", None)
-        if audit is not None:
-            await audit.log_kind(
-                _READ_ALL_SESSION,
-                "shadow_hits_read",
-                {"read": read, "before": mark.replace(tzinfo=UTC).isoformat()},
-                user=await identify_caller(request),
-            )
-    except Exception:
-        _LOGGER.warning("shadow-hit read-all audit write failed (continuing)", exc_info=True)
-    return ShadowHitsReadAllOut(read=read)
+    return await _mark_shadow_hits_read(
+        request, before=body.before, expected=body.expected, analytic_id=analytic_id
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1205,6 +1327,7 @@ def _hit_row(
     lead_status: str | None,
     no_lead_reason: str | None = None,
     held_by_system: str | None = None,
+    machine: HitMachine | None = None,
 ) -> AnalyticHitOut:
     """One hit as the card renders it."""
     receipts = _receipts_of(observation)
@@ -1252,6 +1375,8 @@ def _hit_row(
         dismissed_at=_iso(observation.dismissed_at),
         dismissed_note=observation.dismissed_note,
         analytic_held_by_system=held_by_system if now_status == "shadow" else None,
+        machine_key=machine.key if machine else None,
+        machine_name=machine.name if machine else None,
     )
 
 
@@ -1277,6 +1402,11 @@ async def list_analytic_hits(
 
     ``counts`` is read over the whole window, not over the returned page. The
     chips would otherwise report the page as the night.
+
+    ``window`` states the two parts of ``counts.all`` apart: the hits of the
+    last ``days`` days, and the older unread shadow hits. The label of the
+    block prints both, because one number under "last 7 days" held hits that
+    were weeks old.
     """
     from soc_ai.store.models import Lead  # noqa: PLC0415 - lazy, as the leads routes do
 
@@ -1349,6 +1479,21 @@ async def list_analytic_hits(
             ),
         )
         counts.all = counts.live + counts.shadow
+        # The two parts of that total, each under its own window. ``born_at``
+        # is the newest sighting, so a hit first seen a month back and seen
+        # again this week is in the window.
+        a_hit = (
+            EntityObservation.source.in_(_HIT_SOURCES),
+            or_(and_(*is_live), and_(*is_shadow)),
+        )
+        window = AnalyticHitWindowOut(
+            days=days,
+            in_window=await _count_hits(db, *a_hit, EntityObservation.born_at >= since),
+            older_unread=await _count_hits(
+                db, *a_hit, unread_shadow, EntityObservation.born_at < since
+            ),
+        )
+        groups = await _hit_groups(db, cat, (*in_window, *where), unread_shadow)
         lead_ids = {int(r.lead_id) for r in rows if r.lead_id}
         lead_status: dict[int, str] = {}
         if lead_ids:
@@ -1369,6 +1514,8 @@ async def list_analytic_hits(
                 if r.lead_id is None and r.dismissed_at is None
             ],
         )
+        # One read for the page: the machine of each host a hit is on.
+        machines = await machines_of(db, [r.entity_key for r in rows if r.entity_kind == "host"])
     return AnalyticHitsOut(
         hits=[
             _hit_row(
@@ -1377,10 +1524,13 @@ async def list_analytic_hits(
                 lead_status.get(int(r.lead_id or 0)),
                 reasons.get((r.entity_kind, r.entity_key)),
                 holds[r.spec_id].why if r.spec_id in holds else None,
+                machines.get(r.entity_key) if r.entity_kind == "host" else None,
             )
             for r in rows
         ],
         counts=counts,
+        window=window,
+        groups=groups,
     )
 
 
@@ -1388,15 +1538,154 @@ async def _count_hits(db: AsyncSession, *where: Any) -> int:
     return int((await db.scalar(select(func.count(EntityObservation.id)).where(*where))) or 0)
 
 
+async def _hit_groups(
+    db: AsyncSession, cat: Catalog, where: tuple[Any, ...], unread_shadow: Any
+) -> list[AnalyticHitGroupOut]:
+    """One group for each analytic that holds a hit under ``where``.
+
+    Counted over the whole list and not over the page, by the rule of the
+    chip counts. The groups that hold an unread hit come first, because
+    Needs-you counts those hits. Then the newest sighting first.
+    """
+    from soc_ai.store.models import HostDossier  # noqa: PLC0415 - lazy, as the leads routes do
+
+    rows = (
+        await db.execute(
+            select(
+                EntityObservation.spec_id,
+                EntityObservation.entity_kind,
+                EntityObservation.entity_key,
+                func.count(EntityObservation.id),
+                func.sum(case((unread_shadow, 1), else_=0)),
+                func.max(EntityObservation.born_at),
+                func.max(case((EntityObservation.shadow.is_(True), 1), else_=0)),
+            )
+            .where(*where)
+            .group_by(
+                EntityObservation.spec_id,
+                EntityObservation.entity_kind,
+                EntityObservation.entity_key,
+            )
+        )
+    ).all()
+    if not rows:
+        return []
+    # The machine behind each host key, one read for the list. Two addresses
+    # of one machine are one machine. A key that no machine holds is its own.
+    host_keys = sorted({str(key) for _spec, kind, key, *_rest in rows if kind != "user"})
+    machine_of: dict[str, int] = {}
+    for start in range(0, len(host_keys), 500):
+        chunk = host_keys[start : start + 500]
+        found = await db.execute(
+            select(HostDossier.host_key, HostDossier.machine_id).where(
+                HostDossier.host_key.in_(chunk), HostDossier.machine_id.is_not(None)
+            )
+        )
+        machine_of.update({str(key): int(machine_id) for key, machine_id in found.all()})
+
+    hits: dict[str, int] = {}
+    unread: dict[str, int] = {}
+    newest: dict[str, datetime] = {}
+    shadow_flag: dict[str, bool] = {}
+    machines: dict[str, set[str]] = {}
+    accounts: dict[str, set[str]] = {}
+    for spec_id, kind, key, n, n_unread, born, any_shadow in rows:
+        spec = str(spec_id)
+        hits[spec] = hits.get(spec, 0) + int(n or 0)
+        unread[spec] = unread.get(spec, 0) + int(n_unread or 0)
+        if born is not None and (spec not in newest or born > newest[spec]):
+            newest[spec] = born
+        shadow_flag[spec] = shadow_flag.get(spec, False) or bool(any_shadow)
+        if kind == "user":
+            accounts.setdefault(spec, set()).add(str(key))
+        else:
+            machine = machine_of.get(str(key))
+            machines.setdefault(spec, set()).add(
+                f"m:{machine}" if machine is not None else str(key)
+            )
+
+    out: list[AnalyticHitGroupOut] = []
+    for spec, hit_count in hits.items():
+        listed = cat.listed.get(spec)
+        tier, status = cat.status_of(spec)
+        # The catalog answers for an analytic it knows. For one it lost, the
+        # flag on the rows is the only answer left (the rule of _hit_row).
+        now_status = status if spec in cat.tiers else ("shadow" if shadow_flag[spec] else "live")
+        out.append(
+            AnalyticHitGroupOut(
+                analytic_id=spec,
+                analytic_title=listed.title if listed else spec,
+                analytic_status=now_status,
+                tier=tier,
+                analytic_exists=listed is not None,
+                hits=hit_count,
+                unread=unread[spec],
+                machines=len(machines.get(spec, ())),
+                accounts=len(accounts.get(spec, ())),
+                newest_at=_iso(newest.get(spec)),
+            )
+        )
+    out.sort(key=lambda g: g.analytic_id)
+    out.sort(key=lambda g: g.newest_at or "", reverse=True)
+    out.sort(key=lambda g: g.unread == 0)
+    return out
+
+
+# The parts of the needs-you count that wait on a decision of the analyst. An
+# unread shadow hit is a review item: one press of Dismiss all reads every hit,
+# so a count that one press clears is no decision. "Needs you 280" held 233
+# unread hits in red, and the 47 decisions sat inside a number six times their
+# size (production review 2026-11-12, ui-core 4).
+#
+# Each part counts one decision once. ``investigations_waiting`` counts each
+# investigation that waits once: a waiting action or a verdict that needs more
+# info. ``needs_more_info`` and ``pending_actions`` are its detail and no part:
+# ``pending_actions`` counts actions, so an investigation with two waiting
+# actions counted twice, and the top bar stated a number that the Needs you
+# page did not list (integration of the campaign decisions, 2026-11-14).
+DECISION_PARTS: tuple[str, ...] = (
+    # The active campaigns with no decision. The analyst decides once on a
+    # campaign, and its investigations count in no other part.
+    "campaigns",
+    "investigations_waiting",
+    "leads_needing_decision",
+    "untriaged_groups",
+)
+REVIEW_PART = "unread_shadow_hits"
+
+
+def split_needs_you(parts: Mapping[str, int | None]) -> tuple[int, int | None]:
+    """(decisions, review) of the needs-you parts: the one rule of the split.
+
+    ``decisions`` is the sum of the decision parts that were read, a floor when
+    a part is None. ``review`` is the unread shadow hits, None when they were
+    not read. ``GET /needs-you`` and ``GET /hunts/needs-you`` both call this,
+    so the Dashboard tile, the bell, the sidebar and the Hunts strip state one
+    split. ``GET /needs-you/items`` lists one item for each unit of
+    ``decisions``, and its ``total`` is the same sum.
+    """
+    decisions = sum(parts.get(key) or 0 for key in DECISION_PARTS)
+    return decisions, parts.get(REVIEW_PART)
+
+
 class NeedsYouOut(BaseModel):
     """What waits on the analyst right now.
 
     The sidebar badge on Hunts and the Needs-you strip both read this. Two
     things wait: a shadow hit nobody has read, and a lead nobody has decided.
+    The lead is a decision. The hit is review work, and ``review`` counts it
+    apart (:func:`split_needs_you`). ``total`` is the sum of the two, kept for
+    an older console.
     """
 
     unread_shadow_hits: int = 0
     leads_needing_decision: int = 0
+    # The leads that wait on a decision. The badge and the strip state this
+    # number in the accent color.
+    decisions: int = 0
+    # The unread shadow hits, in a neutral color beside the decisions.
+    review: int = 0
+    # Deprecated: decisions plus review. An older console reads it.
     total: int = 0
     # The live "A lead starts its own hunt" setting. The leads block reads it
     # here, because the config route is for admins and the block must say
@@ -1434,9 +1723,14 @@ async def needs_you(request: Request) -> NeedsYouOut:
             )
             or 0
         )
+    decisions, _review = split_needs_you(
+        {"leads_needing_decision": leads, "unread_shadow_hits": unread}
+    )
     return NeedsYouOut(
         unread_shadow_hits=unread,
         leads_needing_decision=leads,
+        decisions=decisions,
+        review=unread,
         total=unread + leads,
         lead_auto_hunt=auto_hunt,
     )

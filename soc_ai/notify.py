@@ -38,6 +38,7 @@ import httpx
 
 from soc_ai.demo.guard import assert_egress_allowed
 from soc_ai.hunting.outcome import FindingVerdicts, outcome_label
+from soc_ai.store.authorized_activity import authorization_id_of
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -337,13 +338,20 @@ def event_for_investigation(
 
     Returns None (no notification) unless the verdict is ``true_positive`` AND the
     confidence is at/above ``notify_tp_confidence_threshold`` AND ``notify_on_tp``
-    is on. Pure + side-effect-free — the caller decides whether to fire. The body
+    is on. A run inside an authorized scope returns None too: the report
+    carries the mark (``report["authorized_activity"]``), and such a run raises
+    no notification of its own.
+    Pure + side-effect-free — the caller decides whether to fire. The body
     carries the verdict/confidence + a short summary; the permalink is
     ``/app/investigation/<id>``.
     """
     if not bool(getattr(settings, "notify_on_tp", False)):
         return None
     if str(report.get("verdict") or "") != "true_positive":
+        return None
+    if authorization_id_of(report) is not None:
+        # The run is inside an authorized scope. It raises no notification of
+        # its own. The card of the authorization counts it.
         return None
     try:
         confidence = float(report.get("confidence") or 0.0)
@@ -379,7 +387,7 @@ def event_for_hunt(
     ``verdicts`` is the summary of the investigations of the hunt's subject
     findings. When one of them reached a verdict, the verdicts decide: the
     notice fires on a true positive only, and its title states the count
-    ("Hunt finished: 2 of 3 findings are threats").
+    ("Hunt finished: 2 confirmed · 1 not judged · of 3 threat findings").
     """
     if not bool(getattr(settings, "notify_on_hunt_threat", False)):
         return None
@@ -400,10 +408,12 @@ def event_for_hunt(
     threats = [
         f for f in findings if isinstance(f, dict) and str(f.get("category") or "") == "threat"
     ]
-    if not threats:
+    # A threat finding that a campaign holds restates activity that the
+    # campaign already raised. It wakes no one.
+    n = len(threats) - (verdicts.held if verdicts is not None else 0)
+    if n <= 0:
         return None
     lead = str(threats[0].get("title") or "").strip()
-    n = len(threats)
     body = f"{n} threat finding{'s' if n != 1 else ''}. {lead}".strip()
     return NotifyEvent(
         kind="hunt_threat",

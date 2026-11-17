@@ -10,7 +10,7 @@
 // "0 machines" is a claim about the network that is false exactly when the
 // endpoint is down.
 
-import { AlertTriangle, RadioTower, Scale, Server, Sparkles, WifiOff } from 'lucide-react';
+import { RadioTower, RefreshCw, Scale, Server, Sparkles, WifiOff } from 'lucide-react';
 import type { ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import { cn } from '../lib/cn';
@@ -273,11 +273,18 @@ export function attentionList(summary: MachineSummary): AttentionPart[] {
   return out;
 }
 
-/** "37 need attention: 34 out of date, 3 failed to build". */
+/** The name of the tile. The parts are housekeeping of the host records:
+ *  the review of 2026-11-12 found "NEEDS ATTENTION 1,258" in red over 780
+ *  out of date, 2 failed builds and 476 never built. The tile is neutral and
+ *  says what it counts. */
+export const REBUILD_LABEL = 'Host records to rebuild';
+
+/** "37 host records to rebuild: 34 out of date, 3 failed to build". */
 export function attentionSentence(summary: MachineSummary): string {
-  if (summary.needs_attention === 0) return 'No machine needs attention.';
+  if (summary.needs_attention === 0) return 'No host record needs a rebuild.';
   const parts = attentionList(summary).map((p) => p.text);
-  const head = `${summary.needs_attention.toLocaleString()} need attention`;
+  const n = summary.needs_attention;
+  const head = `${n.toLocaleString()} host ${n === 1 ? 'record' : 'records'} to rebuild`;
   return parts.length ? `${head}: ${parts.join(', ')}` : head;
 }
 
@@ -378,7 +385,7 @@ export function HostsSummary({
         <div data-testid="card-attention" className="rounded-panel">
           <Kpi
             testId="sum-attention"
-            label="Needs attention"
+            label={REBUILD_LABEL}
             value={
               summary == null ? (
                 UNKNOWN
@@ -414,20 +421,15 @@ export function HostsSummary({
                 ))
               )
             }
-            icon={<AlertTriangle size={16} />}
-            tone={
-              summary == null
-                ? UNKNOWN_TONE
-                : summary.never_built > 0
-                  ? 'text-danger'
-                  : summary.needs_attention > 0
-                    ? 'text-warn'
-                    : 'text-mono-green'
-            }
+            icon={<RefreshCw size={16} />}
+            // Neutral at every count: a host record to rebuild is
+            // housekeeping of the sweep. Red marks a confirmed threat or a
+            // failed write only.
+            tone={summary == null ? UNKNOWN_TONE : 'text-text-2'}
             title={
               summary == null
-                ? 'Machines the sweep cannot build, or builds from old evidence.'
-                : `${attentionSentence(summary)}. Each number lists its machines.`
+                ? 'Host records the sweep cannot build, or builds from old evidence.'
+                : `${attentionSentence(summary)}. Each number lists its machines. The sweep rebuilds the records on its schedule.`
             }
           />
         </div>

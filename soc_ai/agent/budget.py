@@ -27,8 +27,9 @@ did, so a label never claims a loop that did not run.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
-from typing import Final, Literal
+from typing import Any, Final, Literal
 
 RunClass = Literal["cheap", "standard", "deep", "rule_prior"]
 RequestedClass = Literal["standard", "deep"]
@@ -112,6 +113,217 @@ def ran_class(plan: ClassPlan, *, ran_loop: bool) -> RunClass:
     if plan.run_class == CHEAP and not ran_loop:
         return CHEAP
     return STANDARD
+
+
+# ── The report a run hands the analyst ──────────────────────────────────────
+#
+# A cheap run is one synthesis request, so the round-1 report IS the report.
+# Production, 2026-10-31 to 2026-11-13 (review 2026-11-13, triage finding 8):
+# 24 of 29 cheap runs wrote to the prompt, not to the analyst. A summary began
+# "Keep the candidate verdict. I refine confidence from 0.85 to 0.80." The row
+# headline read "The verdict is decisive and the payload plus clean conn
+# provide positive evidence." Seven runs offered a comment on a case that did
+# not exist, and none offered Acknowledge.
+#
+# The prompt carries the contract now (soc_ai.agent.prompts, the round-1
+# rubric). A prompt is a request, so the cheap class also settles the report
+# in code. The verdict, the confidence and the citations stay the model's.
+
+# A sentence the round-1 model writes to the prompt. Only the exact forms: a
+# whole sentence, in the first person or in the imperative the model copies
+# from the prompt, that states that it keeps, refines or adjusts the candidate
+# verdict or the confidence, and states nothing else. "Keep the candidate
+# verdict." and "I refine confidence from 0.85 to 0.80." are the two
+# production forms.
+#
+# The first version matched a phrase anywhere in a sentence, and it deleted
+# evidence: "The ICE agent kept the candidate from 10.20.30.20 and sent STUN
+# binding requests to 142.250.82.127:19302." went whole (review of the lane).
+# A sentence with a reason after it ("I keep the candidate because ...") is no
+# exact form and stays. A missed echo costs one odd sentence. A wrong strip
+# costs the analyst the evidence.
+_PROMPT_TALK = re.compile(
+    r"(?:I\s+)?(?:keep|refine|adjust)\s+the\s+candidate(?:\s+verdict)?"
+    r"(?:\s+of\s+`?(?:false[_ ]positive|true[_ ]positive|needs[_ ]more[_ ]info)`?)?"
+    r"|(?:I\s+)?(?:keep|refine|adjust|raise|lower|reduce|set|increase|decrease)\s+"
+    r"(?:the\s+|my\s+)?confidence"
+    r"(?:\s+(?:from\s+[01](?:\.\d+)?\s+)?to\s+[01](?:\.\d+)?)?",
+    re.IGNORECASE,
+)
+
+# What marks a sentence as evidence, whatever else it says: a digit that is no
+# confidence value (an address, a port, a count), or a dotted name (a dataset,
+# a record name, a domain). Such a sentence is never stripped.
+_CONFIDENCE_VALUE = re.compile(r"(?<![\w.])[01](?:\.\d+)?(?![\w.]*\w)")
+_EVIDENCE_TOKEN = re.compile(r"\d|\w\.\w")
+
+# The end of the first sentence: a full stop, a question mark or an
+# exclamation mark before whitespace. A decimal point has a digit after it.
+_FIRST_SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
+
+
+def _is_prompt_talk(sentence: str) -> bool:
+    """Whether ``sentence`` is an exact form of prompt talk and holds no evidence."""
+    text = sentence.strip().rstrip(".!").strip()
+    if _EVIDENCE_TOKEN.search(_CONFIDENCE_VALUE.sub("", text)):
+        return False
+    return _PROMPT_TALK.fullmatch(text) is not None
+
+
+def _without_prompt_talk(text: str) -> tuple[str, int]:
+    """``text`` without the sentences that answer the prompt, and the count removed.
+
+    The text comes back empty when every sentence was prompt talk. The caller
+    decides what stands in its place.
+    """
+    from soc_ai.agent.narrative_grounding import (  # noqa: PLC0415 - lazy
+        _split_sentences,
+        strip_sentences,
+    )
+
+    removed = sum(1 for sentence in _split_sentences(text) if _is_prompt_talk(sentence))
+    if not removed:
+        return text, 0
+    return strip_sentences(text, _is_prompt_talk), removed
+
+
+def _first_sentence(text: str) -> str:
+    return _FIRST_SENTENCE_END.split(text.strip(), maxsplit=1)[0].strip()
+
+
+# The reason of an Acknowledge that the cheap class adds when the summary has
+# no sentence to lend it.
+_ACK_REASON = "The verdict is false positive. Acknowledge the alert."
+
+
+def settle_report_actions(
+    report: Any,  # TriageReport
+    *,
+    alert_id: str,
+    run_class: str,
+) -> tuple[Any, dict[str, Any] | None]:
+    """The report as the analyst gets it, and what changed, or None.
+
+    Every class: a case comment that can have no case goes
+    (:func:`soc_ai.triage_models.drop_case_comments_without_a_case`). The
+    execute route refuses it, so the card would never run.
+
+    The cheap class only, because its report is one round-1 synthesis:
+
+    * The summary and each action reason lose the sentences that answer the
+      prompt (:data:`_PROMPT_TALK`). A summary that was nothing else is kept
+      as written: an empty summary reads as a failed run. A reason that was
+      nothing else takes the first sentence of the summary, which is the
+      headline the row falls back to when a report has no action.
+    * A false positive offers Acknowledge. The model's own ``ack_alert`` is
+      kept. With none, one is added for the alert of the run, after any action
+      the model did write, so the model's first reason stays the headline.
+
+    The acknowledge is an offer on a card. It writes nothing: the analyst
+    executes it, or the auto-acknowledge decides on its own gates, which read
+    the verdict and never this list. The verdict, the confidence and the
+    citations are not touched. An unchanged report comes back as the same
+    object, so a caller's identity checks hold.
+    """
+    from soc_ai.triage_models import (  # noqa: PLC0415 - lazy
+        RecommendedAction,
+        drop_case_comments_without_a_case,
+    )
+
+    actions, dropped = drop_case_comments_without_a_case(list(report.recommended_actions))
+    summary = report.summary or ""
+    removed = 0
+    ack_added = False
+    if run_class == CHEAP:
+        stripped, cut = _without_prompt_talk(summary)
+        if stripped.strip():
+            summary, removed = stripped, cut
+        first = _first_sentence(summary)
+        headline = "" if _is_prompt_talk(first) else first
+        for i, action in enumerate(actions):
+            reason, cut = _without_prompt_talk(action.rationale or "")
+            if not cut:
+                continue
+            reason = reason.strip() or headline
+            if reason:
+                removed += cut
+                actions[i] = action.model_copy(update={"rationale": reason})
+        if report.verdict == "false_positive" and not any(
+            a.tool_name == "ack_alert" for a in actions
+        ):
+            actions.append(
+                RecommendedAction(
+                    tool_name="ack_alert",
+                    tool_args={"alert_id": alert_id},
+                    rationale=headline or _ACK_REASON,
+                )
+            )
+            ack_added = True
+    if not (dropped or removed or ack_added):
+        return report, None
+    settled = report.model_copy(update={"summary": summary, "recommended_actions": actions})
+    return settled, {
+        "dropped_case_comments": dropped,
+        "prompt_talk_removed": removed,
+        "ack_added": ack_added,
+    }
+
+
+# The reason and the case text of the Escalate that an Oracle true positive
+# gets when its summary has no sentence to lend.
+_ESCALATE_REASON = "The verdict is true positive. Open a case for this alert."
+_ESCALATE_TITLE = "soc-ai investigation"
+
+
+def oracle_true_positive_action(
+    report: Any,  # TriageReport
+    *,
+    alert_id: str,
+    rule_name: str | None,
+) -> tuple[Any, bool]:
+    """An Oracle true positive with the action a local true positive gets (H3).
+
+    A local true positive recommends one ``escalate_to_case``: the prompt asks
+    the model for it, with the alert id, a title and a description. The Oracle
+    answers with a verdict and text, and it writes no action. Its report keeps
+    the actions of the local report only when both agree on the verdict, so 5
+    Oracle true positives on production offered nothing to act on (review
+    2026-11-13, triage finding 7).
+
+    The action is built from the run, the way the analyst override builds it
+    (``routes_actions._override_actions``): the title is the rule name, the
+    description is the summary, and the reason is the first sentence of the
+    summary, which is then the row headline. An escalate that the report
+    already holds stays, and no second one is added. Every other verdict
+    comes back as the same object.
+
+    The action is an offer on a card. It writes nothing: the analyst executes
+    it, and the execute route binds the case to this run.
+    """
+    from soc_ai.tools.escalate_to_case import (  # noqa: PLC0415 - lazy
+        fit_case_description,
+        fit_case_title,
+    )
+    from soc_ai.triage_models import RecommendedAction  # noqa: PLC0415 - lazy
+
+    if report.verdict != "true_positive":
+        return report, False
+    actions = list(report.recommended_actions)
+    if any(a.tool_name == "escalate_to_case" for a in actions):
+        return report, False
+    summary = (report.summary or "").strip()
+    actions.append(
+        RecommendedAction(
+            tool_name="escalate_to_case",
+            tool_args={
+                "alert_id": alert_id,
+                "case_title": fit_case_title((rule_name or "").strip() or _ESCALATE_TITLE),
+                "case_description": fit_case_description(summary or _ESCALATE_REASON),
+            },
+            rationale=_first_sentence(summary) or _ESCALATE_REASON,
+        )
+    )
+    return report.model_copy(update={"recommended_actions": actions}), True
 
 
 # ── Planes: what the alert is made of ───────────────────────────────────────
@@ -371,5 +583,6 @@ __all__ = [
     "alert_planes",
     "plan_run_class",
     "ran_class",
+    "settle_report_actions",
     "standard_visible_tools",
 ]

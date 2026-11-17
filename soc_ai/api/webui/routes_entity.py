@@ -613,11 +613,46 @@ class EntitySearchOut(BaseModel):
     hits: list[EntitySearchHitOut]
 
 
-def _hunt_detail(hunt: Hunt) -> str:
+def _hunt_detail(hunt: Hunt, outcome_words: str | None = None) -> str:
+    """The second line of a hunt hit: its id and its outcome.
+
+    The outcome is the label of the hunt list ("3 confirmed · 1 not judged ·
+    of 4 threat findings"). Without one the line names the run status.
+    """
+    if outcome_words:
+        return f"Hunt {hunt.id} · {outcome_words}"
     status = {"complete": "finished", "running": "running", "error": "failed"}.get(
         hunt.status, hunt.status
     )
     return f"Hunt {hunt.id} · {status}"
+
+
+def _hunt_outcome_words(hunt: Hunt, verdicts: Any) -> str | None:
+    """The outcome label of one hunt, the words of the hunt list, or None."""
+    from soc_ai.api.webui import routes_hunts  # noqa: PLC0415 - cycle
+    from soc_ai.hunting import outcome as hunt_outcome  # noqa: PLC0415 - lazy
+
+    try:
+        _threats, outcome, _headline = routes_hunts._outcome_of(hunt, verdicts)
+        words = hunt_outcome.outcome_label(outcome, routes_hunts._phase_counts(hunt, verdicts))
+    except Exception:  # a malformed stored report costs the words, not the hit
+        _LOGGER.warning("palette: the outcome of hunt %s did not read", hunt.id, exc_info=True)
+        return None
+    return words or None
+
+
+def _hunt_label(hunt: Hunt) -> str:
+    """The first line of a hunt hit: the plain title of the hunt list.
+
+    The palette printed the whole objective. A lead hunt's objective is a
+    13-line prompt for the model, and one result filled the panel (review
+    2026-11-12). The title is one line: "Lead 49 hunt: 10.20.30.5", or the
+    first line of an analyst's objective.
+    """
+    from soc_ai.api.webui.routes_hunts import objective_headline  # noqa: PLC0415 - cycle
+
+    title = " ".join(objective_headline(hunt.objective or "").split())
+    return title or hunt.id
 
 
 @router.get("/search/entities", response_model=EntitySearchOut)
@@ -751,8 +786,9 @@ async def search_entities(
             )
             shown += 1
 
-        # Hunts: the id, whole or in part, or the objective.
-        for hunt in (
+        # Hunts: the id, whole or in part, or the objective. The hit shows the
+        # title and the outcome, never the prompt.
+        found = (
             await db.scalars(
                 select(Hunt)
                 .where(
@@ -765,14 +801,15 @@ async def search_entities(
                 .order_by(Hunt.created_at.desc())
                 .limit(_SEARCH_CAP)
             )
-        ).all():
-            objective = " ".join((hunt.objective or "").split())
+        ).all()
+        verdicts = await hunt_svc.finding_verdicts(db, [h.id for h in found])
+        for hunt in found:
             hits.append(
                 EntitySearchHitOut(
                     type="hunt",
                     value=hunt.id,
-                    label=objective or hunt.id,
-                    detail=_hunt_detail(hunt),
+                    label=_hunt_label(hunt),
+                    detail=_hunt_detail(hunt, _hunt_outcome_words(hunt, verdicts.get(hunt.id))),
                     href=f"/hunts/{quote(hunt.id, safe='')}",
                 )
             )

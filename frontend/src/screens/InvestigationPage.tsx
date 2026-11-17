@@ -3,6 +3,7 @@ import { useRef, useState } from 'react';
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { deleteInvestigation, getInvestigation, isNotFound } from '../lib/api';
 import { useAsync } from '../lib/useAsync';
+import { InvestigationCampaignStrip } from '../components/campaign/InvestigationCampaignStrip';
 import { ErrorState, LoadingState, NotFoundState, StaleNotice, notFoundTitle } from '../components/States';
 import { useOptionalShell } from '../shell/ShellContext';
 import { Investigation } from './Investigation';
@@ -169,6 +170,10 @@ export function InvestigationPage() {
       {delErr && (
         <div className="mx-auto mb-3 max-w-workstation text-[12px] text-danger">{delErr}</div>
       )}
+      {/* The campaign leads the page: the campaign is the unit of work, and
+          this investigation is one part of it (owner, 2026-11-14). */}
+      <InvestigationCampaignStrip campaign={inv?.campaign} className="mx-auto mb-3 max-w-workstation" />
+
 
       {/* Only on the first load — never on a poll refresh (it would remount the
           page subtree, causing the flicker + scanline reset). */}

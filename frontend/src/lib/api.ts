@@ -53,6 +53,7 @@ import type {
   InvestigationList,
   InvestigationRow,
   MachineDetail,
+  MachineLastEvents,
   MachineList,
   MachineResolve,
   MachineSortKey,
@@ -73,6 +74,7 @@ import type {
   StartBacktestOpts,
   TriageState,
   UpdateCheckResult,
+  Verdict,
   Workspace,
 } from './types';
 
@@ -464,6 +466,848 @@ export function getAlertsEmptyReason(query: AlertQuery = {}): Promise<AlertsEmpt
   return request<AlertsEmptyReason>('/alerts/empty-reason' + (qs ? `?${qs}` : ''));
 }
 
+// ── Confirmed threats ───────────────────────────────────────────────────────
+//
+// The true positives of a window, merged by affected host, worst first. The
+// Dashboard, the Hunt Console and the host page read this one route, so the
+// three surfaces and the True positives tile state one count.
+
+/** The host a group of true positives targets. */
+export interface ThreatTarget {
+  address: string;
+  name: string | null;
+  role: string | null;
+  machineKey: string | null;
+}
+
+/** What the evidence says the attack did on the target. */
+export type ThreatImpact = 'succeeded' | 'attempted' | 'unknown' | 'none';
+
+/**
+ * The direction of a group. `inbound`: the sources connect to the target.
+ * `outbound`: the target, an internal host, connects to the sources.
+ */
+export type ThreatDirection = 'inbound' | 'outbound';
+
+/** One affected host and its true positive runs in the window. */
+export interface ThreatRow {
+  /** The affected host: the destination of an inbound run, the source of an outbound run. */
+  target: ThreatTarget;
+  direction: ThreatDirection;
+  headline: string;
+  impact: ThreatImpact;
+  runs: number;
+  alertRuns: number;
+  findingRuns: number;
+  sources: { address: string; name: string | null }[];
+  sourcesMore: number;
+  rules: string[];
+  rulesMore: number;
+  firstSeen: string;
+  lastSeen: string;
+  waitingActions: number;
+  newestInvestigationId: string;
+  investigationsHref: string;
+  /** The runs of the row that an authorization holds. Absent on an older server. */
+  authorizedRuns?: number;
+  /** The authorizations of those runs, the most runs first, at most three. */
+  authorizations?: ThreatRowAuthorization[];
+}
+
+/** One authorization that marks runs of a threat row. */
+export interface ThreatRowAuthorization {
+  id: number;
+  label: string;
+  state: string;
+  expiresAt: string;
+  runs: number;
+  runsHref: string;
+}
+
+/** A group whose every run is inside one authorized activity record. */
+export interface AuthorizedThreatGroup {
+  authorization: { id: number; label: string; state: string; expiresAt: string };
+  target: ThreatTarget;
+  direction: ThreatDirection;
+  runs: number;
+  lastSeen: string;
+  runsHref: string;
+}
+
+/** One campaign of the confirmed threats: a row of `GET /campaigns` and three
+ *  counts over the true positive investigations of the campaign in the window
+ *  of the request. */
+export interface ThreatCampaign extends CampaignRow {
+  investigations: number;
+  /** Those with an action that waits and no authorization mark that holds. */
+  waiting: number;
+  /** Those with an authorization mark that holds. */
+  authorized: number;
+}
+
+export interface ThreatList {
+  window: { since: string; until: string };
+  /** The active campaigns with a true positive investigation in the window,
+   *  worst stage first, then newest last event. With `host`, only the
+   *  campaigns where that machine is a party. Absent on an older server. */
+  campaigns?: ThreatCampaign[];
+  /** Ordered worst first by the server. With `campaigns`, only the
+   *  investigations that are in no campaign. */
+  rows: ThreatRow[];
+  authorized: AuthorizedThreatGroup[];
+  /** The count the True positives tile states: every true positive of the
+   *  window, the investigations of the campaigns included. */
+  total: number;
+}
+
+export interface ThreatQuery {
+  since: string;
+  /** A preset window closes at now. */
+  until?: string;
+  /** One host: a machine key or an address. */
+  host?: string;
+}
+
+/** The confirmed threats of one window, or of one host in that window. */
+export function getThreats(q: ThreatQuery): Promise<ThreatList> {
+  const qs = new URLSearchParams({ since: q.since, until: q.until ?? new Date().toISOString() });
+  if (q.host?.trim()) qs.set('host', q.host.trim());
+  return request<ThreatList>(`/threats?${qs}`);
+}
+
+// ── Campaigns ───────────────────────────────────────────────────────────────
+//
+// A campaign joins the true positive runs of one attack: the actors, the
+// targets, the stages and the member runs. The engine builds it from the
+// stored runs. Both routes are read-only. lib/campaignWords.ts holds the
+// words for each stored value.
+//
+// The console counts the EVENTS of the grid: `events`, `edge.alerts`,
+// `row.alerts`. The analyst reads alerts and findings, never runs. A server of
+// an earlier release sends none of these fields, so each one is optional here
+// and the page draws without it.
+
+/** The status the API states. The store holds `active`; the API splits it
+ *  into `open` and `ended` by the newest member event. */
+export type CampaignStatus = 'open' | 'ended' | 'withdrawn' | 'merged';
+export type CampaignStage = 'reconnaissance' | 'attempt' | 'access' | 'action' | 'movement';
+export type CampaignLink =
+  | 'seed'
+  | 'session'
+  | 'actor'
+  | 'artifact'
+  | 'documents'
+  | 'target_source'
+  | 'named_pair'
+  | 'included';
+export type CampaignRole = 'actor' | 'target';
+export type CampaignDirection = 'forward' | 'reverse' | 'beyond';
+/** How soc-ai knows the machine behind an address. */
+export type CampaignJoin = 'agent' | 'dhcp' | 'network';
+/** The detection tier that saw a stage first. */
+export type CampaignTier = 'alert' | 'analytic' | 'scheduled_hunt' | 'lead_hunt' | 'hunt';
+export type CampaignMemberKind = 'alert' | 'finding' | 'lead';
+
+/** One machine in a short list: a row of the list, a wave, a session. */
+export interface CampaignPartyBrief {
+  machineKey: string;
+  name: string | null;
+  address: string | null;
+}
+
+/** One row of `GET /campaigns`. */
+export interface CampaignRow {
+  id: number;
+  title: string;
+  status: CampaignStatus;
+  stage: CampaignStage | null;
+  actors: CampaignPartyBrief[];
+  /** At most three. `targetsMore` counts the rest. */
+  targets: CampaignPartyBrief[];
+  targetsMore: number;
+  firstEvent: string;
+  lastEvent: string;
+  /** The count of member runs. */
+  members: number;
+  /** The alert events of the stored events of the campaign. Null when the
+   *  campaign holds no stored events. An earlier server sends none. */
+  alerts?: number | null;
+  /** The decision on the campaign, or null when it waits on one. An earlier
+   *  server sends none. */
+  decision?: CampaignDecisionType | null;
+  /** Since when the campaign waits on a decision: its first event, or the
+   *  time it opened again. Null when it holds a decision. */
+  waitsSince?: string | null;
+  /** The authorization on the campaign, or null. An earlier server sends none. */
+  authorization?: Pick<CampaignAuthorizationRecord, 'expiresAt' | 'state'> | null;
+  /** The true positive investigations beyond the authorization. An earlier server sends none. */
+  beyond?: number;
+}
+
+/** The decisions of a campaign. Part A of phase 2 writes only `closed`. */
+export type CampaignDecisionType = 'closed' | 'authorized' | 'case';
+
+/** Why the analyst closed a campaign. */
+export type CampaignCloseReason = 'handled_outside' | 'accepted_risk' | 'test_over';
+
+/** The decision on a campaign, on `GET /campaigns/{id}`. */
+export interface CampaignDecision {
+  type: CampaignDecisionType;
+  /** The reason of a close. */
+  reason?: CampaignCloseReason | null;
+  note?: string | null;
+  /** The analyst who decided. */
+  by?: string | null;
+  at: string;
+}
+
+export type CampaignChangeType =
+  | 'formed'
+  | 'stage'
+  | 'party'
+  | 'decided'
+  | 'reopened'
+  | 'acknowledged'
+  | 'beyond'
+  | 'excluded'
+  | 'included'
+  | 'case_intent'
+  | 'case'
+  | 'case_failed'
+  | 'case_comment';
+
+/** The state of the Security Onion case of a campaign. `open`: Security
+ *  Onion holds the case. `pending`: soc-ai asked for the case and could not
+ *  read the answer, so the request stays open until "Try again". `failed`:
+ *  Security Onion refused the case, and the campaign holds no decision. */
+export type CampaignCaseState = 'open' | 'pending' | 'failed';
+
+/** The one Security Onion case of a campaign, on `GET /campaigns/{id}`. A
+ *  pending or a failed case can hold no id and no address. */
+export interface CampaignCase {
+  id?: string | null;
+  /** The page of the case in the Security Onion console. */
+  url?: string | null;
+  openedAt?: string | null;
+  /** The analyst who opened the case. */
+  by?: string | null;
+  /** The alerts that soc-ai attached to the case. */
+  alerts?: number | null;
+  /** The comments that soc-ai added to the case after a change. */
+  comments?: number | null;
+  state: CampaignCaseState;
+  /** Why Security Onion refused the case. */
+  failure?: string | null;
+}
+
+/** `GET /campaigns/{id}/case-scope`: what one case of the campaign holds,
+ *  read before the press. `alerts` is null when the grid read fails, never 0.
+ *  `existing` is the case that the campaign holds already: a press then opens
+ *  no second case. */
+export interface CampaignCaseScope {
+  title: string;
+  alerts: number | null;
+  /** True when the alerts reached the cap of the server. */
+  capped: boolean;
+  /** The alerts that the case skips: acknowledged, on a case, and the
+   *  records that are no Security Onion alert. */
+  skipped: { acknowledged: number; escalated: number; noAlert: number };
+  existing: { id: string; url?: string | null } | null;
+}
+
+/** Why a campaign opened again: a later event, a higher stage, a machine
+ *  that the close did not cover, an analyst, or the revoke of the
+ *  authorization. */
+export type CampaignReopenCause = 'activity' | 'stage' | 'party' | 'analyst' | 'revoked';
+
+/** Why an investigation is outside the authorization of its campaign. `source`:
+ *  its source is not a listed machine. `target`: its target is not a listed
+ *  machine. `expired`: its event is after the expiry. `machine`: an address
+ *  now resolves to another machine. */
+export type CampaignBeyondWhy = 'source' | 'target' | 'expired' | 'machine';
+
+export type CampaignAuthorizationState = 'active' | 'expired' | 'revoked';
+
+/** The authorization on a campaign: the listed machines, the period and the
+ *  counts of the true positive investigations inside and outside. */
+export interface CampaignAuthorizationRecord {
+  id: number;
+  label: string;
+  note?: string | null;
+  /** The admin who recorded it. */
+  by?: string | null;
+  at: string;
+  /** The first event of the campaign. */
+  startsAt: string;
+  expiresAt: string;
+  state: CampaignAuthorizationState;
+  /** The listed machines. */
+  machineKeys: string[];
+  inside: number;
+  outside: number;
+}
+
+/** One investigation of an authorized campaign that is outside the
+ *  authorization. It keeps normal handling. */
+export interface CampaignBeyondRun {
+  runId: string;
+  label: string;
+  eventAt: string | null;
+  sourceKey: string | null;
+  targetKey: string | null;
+  why: CampaignBeyondWhy;
+}
+
+/** One investigation that an analyst excluded from the campaign. */
+export interface CampaignExcludedRun {
+  runId: string;
+  label: string;
+  by: string | null;
+  at: string;
+  reason: string;
+}
+
+/** One lead on `GET /campaigns/{id}`. `related` false: a lead of the
+ *  campaign, whose every observation is an alert of an investigation that the
+ *  campaign holds. `related` true: a lead on a machine of the campaign with
+ *  an observation in its period that the campaign does not hold. It keeps
+ *  normal handling. */
+export interface CampaignLead {
+  id: number;
+  title: string;
+  /** The stored status of the lead: open, hunting, dismissed, promoted. */
+  state: string;
+  /** True when a hunt of its own ran on the lead. */
+  hunted: boolean;
+  related: boolean;
+}
+
+/** One hunt of a campaign on `GET /campaigns/{id}`, newest first, at most 20. */
+export interface CampaignHunt {
+  id: string;
+  /** The class that started the hunt: campaign, lead, schedule, analyst or catalog. */
+  starter: string;
+  status: string;
+  startedAt: string | null;
+  findings: number;
+  threatFindings: number;
+}
+
+/** The most hunts that `GET /campaigns/{id}` lists. */
+export const CAMPAIGN_HUNTS_CAP = 20;
+
+/** One machine of the draft of an authorization. `listed` is the default of
+ *  its check box. */
+export interface CampaignAuthorizeParty {
+  machineKey: string;
+  role: CampaignRole;
+  name: string | null;
+  address: string | null;
+  listed: boolean;
+}
+
+/** `GET /campaigns/{id}/authorize-draft`: the defaults of the dialog and the
+ *  counts of the scope with every machine listed. `earlier` is a stored
+ *  authorization with a rule list that covers investigations of the campaign. */
+export interface CampaignAuthorizeDraft {
+  label: string;
+  expiresAt: string;
+  maxExpiresAt: string;
+  startsAt: string;
+  parties: CampaignAuthorizeParty[];
+  /** The true positive investigations that the scope covers. */
+  inside: number;
+  /** The true positive investigations that the scope does not cover. */
+  outside: number;
+  /** The investigations inside with an action that waits today. */
+  waiting: number;
+  earlier: { id: number; label: string; covers: number; of: number } | null;
+}
+
+/** The detail of one change. Each type fills its own fields. */
+export interface CampaignChangeDetail {
+  /** `stage`: the stage before and after. */
+  from?: CampaignStage | null;
+  to?: CampaignStage | null;
+  /** `party`: the names of the new machines. */
+  names?: string[];
+  /** `decided`: the decision, its reason and the analyst. */
+  decision?: CampaignDecisionType;
+  /** `decided`: the reason of a close. `case_failed`: why Security Onion
+   *  refused the case, in words. */
+  reason?: CampaignCloseReason | (string & {}) | null;
+  /** `decided` and `reopened` by an analyst. `case`: the analyst who opened it. */
+  by?: string | null;
+  /** `case` and `case_comment`: the id of the case in Security Onion. */
+  caseId?: string | null;
+  /** `case_comment`: the change the comment is for, a higher stage or a new machine. */
+  for?: 'stage' | 'party';
+  /** `decided`: true when the close asked soc-ai to acknowledge the alerts. */
+  acknowledge?: boolean;
+  /** `reopened`: why. */
+  cause?: CampaignReopenCause;
+  /** `acknowledged`: the alerts that soc-ai acknowledged, and the ones it
+   *  could not. `case`: the alerts that soc-ai attached to the case. */
+  alerts?: number;
+  failed?: number;
+  /** `beyond`, `excluded` and `included`: the investigation. */
+  runId?: string;
+  /** `beyond`: why the investigation is outside the authorization. */
+  why?: CampaignBeyondWhy;
+}
+
+/** One change of a campaign. */
+export interface CampaignChange {
+  id: number;
+  type: CampaignChangeType;
+  at: string;
+  detail: CampaignChangeDetail;
+}
+
+/** `GET /campaigns/{id}/close-scope`: the alert events that a close would
+ *  acknowledge. `alerts` is null when the grid did not answer. */
+export interface CampaignCloseScope {
+  alerts: number | null;
+  rules: number | null;
+  /** True when the count reached the cap of the server. */
+  capped: boolean;
+}
+
+/** The campaign of one investigation: on a row of `GET /investigations`, on
+ *  the investigation payload, on an alert group and on the investigation of a
+ *  hunt finding. The field is `campaign`, null when the investigation is in no
+ *  campaign. A server of an earlier release sends no field, so each holder
+ *  types it optional. The contract names it `CampaignLink`; that name holds
+ *  the link type of a campaign investigation above. */
+export interface InvestigationCampaign {
+  id: number;
+  title: string;
+  /** `open` or `ended`. */
+  status: CampaignStatus;
+  /** The stage that the campaign reached. */
+  stage: CampaignStage | null;
+  /** True when the investigation is on a session of the campaign and its
+   *  verdict is no true positive: a verdict that differs. */
+  differs: boolean;
+  /** The decision on the campaign, or null when it waits on one. An earlier
+   *  server sends none. */
+  decision?: CampaignDecisionType | null;
+  /** Since when the campaign waits on a decision. Null when it holds one. */
+  waitsSince?: string | null;
+}
+
+/** The part a machine plays in a campaign. */
+export type HostCampaignRole = 'actor' | 'target' | 'both';
+
+/** One campaign of a machine, on the host page. Newest last event first. */
+export interface HostCampaign extends InvestigationCampaign {
+  role: HostCampaignRole;
+  firstEvent: string;
+  lastEvent: string;
+  /** The alert events of the campaign, as in a list row. Null when the
+   *  campaign holds no stored events. */
+  alerts?: number | null;
+}
+
+export interface CampaignList {
+  /** The active campaigns, newest last event first. */
+  rows: CampaignRow[];
+  total: number;
+  /** True when the rebuild failed and the rows are the rows of the last build. */
+  stale: boolean;
+}
+
+/** An authorization that member runs of the campaign match. */
+export interface CampaignAuthorization {
+  id: number;
+  label: string;
+  /** `active`, `expired` or `revoked`. */
+  state: string;
+  expiresAt: string | null;
+  memberRuns: number;
+}
+
+/** One stage of the ladder. */
+export interface CampaignLadderStep {
+  stage: CampaignStage;
+  reached: boolean;
+  firstAt: string | null;
+  members: number;
+  proofRunId: string | null;
+  proofDocumentId: string | null;
+  /** What happened, in one sentence. An earlier server sends none. */
+  headline?: string | null;
+  /** The record that proves the stage. An earlier server sends none. */
+  evidence?: CampaignStageEvidence | null;
+}
+
+/** The record of the grid that proves a stage. */
+export interface CampaignStageEvidence {
+  documentId: string;
+  label: string;
+  at: string | null;
+}
+
+export interface CampaignParty {
+  machineKey: string;
+  name: string | null;
+  role: CampaignRole;
+  addresses: string[];
+  join: CampaignJoin | null;
+  hasAgent: boolean;
+  firstEvent: string | null;
+  lastEvent: string | null;
+  memberRuns: number;
+  /** A target that only `beyond` members name. */
+  beyond: boolean;
+}
+
+export interface CampaignWave {
+  n: number;
+  start: string;
+  end: string;
+  /** The count of member runs in the wave. */
+  events: number;
+}
+
+export interface CampaignActorWaves {
+  actor: CampaignPartyBrief;
+  waves: CampaignWave[];
+}
+
+/** The evidence of the link that made the run a member. */
+export interface CampaignEvidence {
+  memberRunId: string | null;
+  machineKey: string | null;
+  machineName: string | null;
+  artifact: string | null;
+  communityId: string | null;
+  documentIds: string[];
+}
+
+export interface CampaignMember {
+  runId: string;
+  kind: CampaignMemberKind;
+  label: string;
+  verdict: Verdict;
+  impact: ThreatImpact | null;
+  stage: CampaignStage | null;
+  link: CampaignLink;
+  evidence: CampaignEvidence;
+  direction: CampaignDirection;
+  eventAt: string | null;
+  finishedAt: string | null;
+  tier: CampaignTier;
+  sourceAddress: string | null;
+  targetAddress: string | null;
+  /** The machine key of each end, or null for an end that is no machine. */
+  sourceKey: string | null;
+  targetKey: string | null;
+  /** A run on a member session with a verdict other than true positive. */
+  verdictDiffers: boolean;
+  huntId: string | null;
+  /** True when the authorization of the campaign covers the investigation.
+   *  An earlier server sends none. */
+  authorized?: boolean;
+  /** True when an analyst included the investigation. An earlier server sends none. */
+  included?: boolean;
+}
+
+/** One arrow of the attack graph: the true positive runs from one machine to
+ *  another. `stage` is the highest stage that a run of the arrow proves.
+ *  `beyond` marks an arrow from a target that an attack worked on.
+ *  `fromDocuments` marks an arrow that no run has as its two ends: an alert
+ *  document of a finding shows it. */
+export interface CampaignEdge {
+  source: string;
+  target: string;
+  runs: number;
+  stage: CampaignStage | null;
+  firstAt: string;
+  lastAt: string;
+  beyond: boolean;
+  fromDocuments: boolean;
+  /** The alert events of the confirmed rules between the two machines:
+   *  `events.pairs[].alerts` of the same pair. Null when no pair holds them.
+   *  An earlier server sends none. */
+  alerts?: number | null;
+}
+
+export interface CampaignRelatedRun {
+  runId: string;
+  label: string;
+  finishedAt: string | null;
+  sourceAddress: string | null;
+  targetAddress: string | null;
+}
+
+export interface CampaignRelatedSession {
+  source: CampaignPartyBrief;
+  target: CampaignPartyBrief;
+  port: number | null;
+  dataset: string;
+  documents: number;
+  firstAt: string;
+  lastAt: string;
+  documentIds: string[];
+}
+
+export interface CampaignNamedHost {
+  value: string;
+  documents: number;
+  documentIds: string[];
+}
+
+/** Candidates the engine does not include. */
+export interface CampaignRelated {
+  needsMoreInfo: CampaignRelatedRun[];
+  sessions: CampaignRelatedSession[];
+  named: CampaignNamedHost[];
+  falsePositiveFromTargets: number;
+}
+
+/** The tier that saw one stage first, and the time to its verdict. */
+export interface CampaignDetection {
+  stage: CampaignStage;
+  tier: CampaignTier;
+  runId: string;
+  eventAt: string | null;
+  verdictAt: string | null;
+  seconds: number | null;
+}
+
+/** Where the events of a campaign come from. `grid`: soc-ai read them from
+ *  the grid. `stored`: the grid read failed or never ran, and the events are
+ *  the events that the investigations hold. `none`: no events. */
+export type CampaignEventsSource = 'grid' | 'stored' | 'none';
+
+/** The verdict of a rule between two machines. A confirmed rule is a
+ *  `true_positive`. Any other rule takes the verdict of the standing
+ *  investigations with that rule name between the two machines. */
+export type CampaignRuleVerdict = 'true_positive' | 'false_positive' | 'needs_more_info' | 'not_judged';
+
+/** The alert events of one rule between two machines. */
+export interface CampaignRuleEvents {
+  name: string;
+  alerts: number;
+  firstAt: string;
+  lastAt: string;
+  verdict: CampaignRuleVerdict;
+}
+
+/** The grid records of one dataset between two machines. */
+export interface CampaignDatasetRecords {
+  name: string;
+  records: number;
+}
+
+/** The events between two machines of the campaign. */
+export interface CampaignPairEvents {
+  source: string;
+  target: string;
+  /** The alert events of the confirmed rules between the two machines. */
+  alerts: number;
+  /** The alert events of every other rule between them. */
+  otherAlerts: number;
+  /** Every grid record between the two machines. Null unless the source is `grid`. */
+  records: number | null;
+  firstAt: string | null;
+  lastAt: string | null;
+  rules: CampaignRuleEvents[];
+  /** Empty unless the source is `grid`. */
+  datasets: CampaignDatasetRecords[];
+}
+
+/** The alert events of one machine in one bucket of time. */
+export interface CampaignTimelineBucket {
+  at: string;
+  alerts: number;
+}
+
+export interface CampaignTimelineLane {
+  machineKey: string;
+  buckets: CampaignTimelineBucket[];
+}
+
+/** The events of a campaign. The timeline holds the confirmed rules only. */
+export interface CampaignEvents {
+  source: CampaignEventsSource;
+  /** When soc-ai read the grid. */
+  readAt: string | null;
+  /** The alert events of the confirmed rules, all pairs. */
+  alerts: number;
+  /** The distinct confirmed rules. */
+  rules: number;
+  /** The true positive finding investigations of the campaign. */
+  findings: number;
+  /** Every grid record between the pairs. Null unless the source is `grid`. */
+  records: number | null;
+  pairs: CampaignPairEvents[];
+  timeline: { bucketSeconds: number; lanes: CampaignTimelineLane[] };
+}
+
+/** `GET /campaigns/{id}`. A merged or a withdrawn campaign has empty lists. */
+export interface CampaignDetail {
+  graph: { edges: CampaignEdge[] };
+  id: number;
+  title: string;
+  status: CampaignStatus;
+  mergedInto: number | null;
+  earlierCampaign: { id: number; title: string } | null;
+  bottomLine: string;
+  stage: CampaignStage | null;
+  firstEvent: string;
+  lastEvent: string;
+  builtAt: string;
+  stale: boolean;
+  authorizations: CampaignAuthorization[];
+  ladder: CampaignLadderStep[];
+  parties: CampaignParty[];
+  waves: CampaignActorWaves[];
+  members: CampaignMember[];
+  related: CampaignRelated;
+  detection: CampaignDetection[];
+  /** The events of the grid between the machines. An earlier server sends none. */
+  events?: CampaignEvents;
+  /** The decision on the campaign, or null when it waits on one. An earlier
+   *  server sends none, and the page then shows no decision bar. */
+  decision?: CampaignDecision | null;
+  /** Since when the campaign waits on a decision. Null when it holds one. */
+  waitsSince?: string | null;
+  /** The changes of the campaign, newest first, at most 50. */
+  changes?: CampaignChange[];
+  /** The authorization on the campaign, or null. An earlier server sends none. */
+  authorization?: CampaignAuthorizationRecord | null;
+  /** The true positive investigations outside the authorization. */
+  beyond?: CampaignBeyondRun[];
+  /** The investigations that an analyst excluded from the campaign. */
+  excluded?: CampaignExcludedRun[];
+  /** The leads of the campaign and the related leads. An earlier server sends none. */
+  leads?: CampaignLead[];
+  /** The hunts of the campaign, newest first. An earlier server sends none. */
+  hunts?: CampaignHunt[];
+  /** The Security Onion case of the campaign, or null. An earlier server
+   *  sends none, and the page then offers no case. */
+  case?: CampaignCase | null;
+}
+
+/** The active campaigns. */
+export function getCampaigns(): Promise<CampaignList> {
+  return request<CampaignList>('/campaigns');
+}
+
+/** One campaign. An unknown id answers 404 with `campaign_not_found`. */
+export function getCampaign(id: number): Promise<CampaignDetail> {
+  return request<CampaignDetail>(`/campaigns/${id}`);
+}
+
+/** The alert events that a close of the campaign would acknowledge. */
+export function getCampaignCloseScope(id: number): Promise<CampaignCloseScope> {
+  return request<CampaignCloseScope>(`/campaigns/${id}/close-scope`);
+}
+
+/** Close a campaign with a reason. The answer is the campaign after the
+ *  close. With `acknowledge`, the server acknowledges the alerts of the
+ *  scope after it answers. */
+export function closeCampaign(
+  id: number,
+  body: { reason: CampaignCloseReason; note: string; acknowledge: boolean },
+): Promise<CampaignDetail> {
+  return post<CampaignDetail>(`/campaigns/${id}/close`, body).then((answer) => {
+    // A close takes the campaign out of the needs-you count.
+    emitNeedsYouChanged();
+    return answer;
+  });
+}
+
+/** Acknowledge the alerts of a closed campaign that are still open. The
+ *  answer is the campaign after the write, with one `acknowledged` change. */
+export function acknowledgeCampaign(id: number): Promise<CampaignDetail> {
+  return post<CampaignDetail>(`/campaigns/${id}/acknowledge`, {});
+}
+
+/** Clear the decision on a campaign. It then waits on a decision again. */
+export function reopenCampaign(id: number, body: { note: string }): Promise<CampaignDetail> {
+  return post<CampaignDetail>(`/campaigns/${id}/reopen`, body).then((answer) => {
+    emitNeedsYouChanged();
+    return answer;
+  });
+}
+
+/** The defaults and the counts of the dialog "Record authorized activity". Admin only. */
+export function getCampaignAuthorizeDraft(id: number): Promise<CampaignAuthorizeDraft> {
+  return request<CampaignAuthorizeDraft>(`/campaigns/${id}/authorize-draft`);
+}
+
+/** Record an authorization on a campaign. Admin only. The answer is the
+ *  campaign after the write. */
+export function authorizeCampaign(
+  id: number,
+  body: { label: string; note: string; expiresAt: string; machineKeys: string[] },
+): Promise<CampaignDetail> {
+  return post<CampaignDetail>(`/campaigns/${id}/authorize`, body).then((answer) => {
+    emitNeedsYouChanged();
+    return answer;
+  });
+}
+
+/** What one case of the campaign holds, read before the press. */
+export function getCampaignCaseScope(id: number): Promise<CampaignCaseScope> {
+  return request<CampaignCaseScope>(`/campaigns/${id}/case-scope`);
+}
+
+/** Open the one Security Onion case of a campaign. The answer is the
+ *  campaign after the write. A campaign that holds a case already gets no
+ *  second one. */
+export function openCampaignCase(id: number, body: { note: string }): Promise<CampaignDetail> {
+  return post<CampaignDetail>(`/campaigns/${id}/case`, body).then((answer) => {
+    // A case takes the campaign out of the needs-you count.
+    emitNeedsYouChanged();
+    return answer;
+  });
+}
+
+/** Clear the open request for a case whose answer soc-ai could not read.
+ *  The server writes an audit record. */
+export function retryCampaignCase(id: number): Promise<CampaignDetail> {
+  return post<CampaignDetail>(`/campaigns/${id}/case/retry`, {}).then((answer) => {
+    emitNeedsYouChanged();
+    return answer;
+  });
+}
+
+/** Revoke the authorization of a campaign with a reason. */
+export function revokeCampaignAuthorization(id: number, body: { reason: string }): Promise<CampaignDetail> {
+  return post<CampaignDetail>(`/campaigns/${id}/revoke-authorization`, body).then((answer) => {
+    emitNeedsYouChanged();
+    return answer;
+  });
+}
+
+/** Take one investigation out of the campaign with a reason. */
+export function excludeFromCampaign(id: number, body: { runId: string; reason: string }): Promise<CampaignDetail> {
+  return post<CampaignDetail>(`/campaigns/${id}/exclude`, body).then((answer) => {
+    emitNeedsYouChanged();
+    return answer;
+  });
+}
+
+/** Join one investigation of "Related, not proven" to the campaign with a reason. */
+export function includeInCampaign(id: number, body: { runId: string; reason: string }): Promise<CampaignDetail> {
+  return post<CampaignDetail>(`/campaigns/${id}/include`, body).then((answer) => {
+    emitNeedsYouChanged();
+    return answer;
+  });
+}
+
+/** Undo the exclude or the include of one investigation. */
+export function undoCampaignOverride(id: number, runId: string): Promise<CampaignDetail> {
+  return post<CampaignDetail>(`/campaigns/${id}/overrides/${encodeURIComponent(runId)}/undo`, {}).then((answer) => {
+    emitNeedsYouChanged();
+    return answer;
+  });
+}
+
 /**
  * The recorded grid gaps that overlap the page window, oldest first. A gap is
  * a time when soc-ai could not read the grid, or when the documents stopped
@@ -559,6 +1403,18 @@ export interface InvestigationListQuery {
   /** One machine: the runs that name any of its addresses or names. Any
    *  key of the machine works. */
   entity?: string;
+  /** Only the runs that matched one authorized activity, by its id. The card
+   *  of the authorization links here. */
+  authorization?: number;
+  /** Only the runs that wait on the analyst: a verdict that needs more info,
+   *  or a recommended action that waits. The Investigations badge counts
+   *  these runs with the same query (GET /needs-you, investigations_waiting). */
+  needsYou?: boolean;
+  /** The time that `since`/`until` bound and the order reads. The server
+   *  default is the time of the event. 'investigated' reads the time when
+   *  soc-ai started the investigation: the pipeline errors are a list of
+   *  what soc-ai did. */
+  clock?: 'event' | 'investigated';
   limit?: number;
   offset?: number;
 }
@@ -575,6 +1431,9 @@ export function listInvestigations(q: InvestigationListQuery = {}): Promise<Inve
   if (q.includeBacktest) p.set('include_backtest', 'true');
   if (q.pendingAction) p.set('pending_action', 'true');
   if (q.entity?.trim()) p.set('entity', q.entity.trim());
+  if (q.authorization != null) p.set('authorization', String(q.authorization));
+  if (q.needsYou) p.set('needs_you', 'true');
+  if (q.clock === 'investigated') p.set('clock', 'investigated');
   if (q.limit != null) p.set('limit', String(q.limit));
   if (q.offset != null) p.set('offset', String(q.offset));
   const qs = p.toString();
@@ -630,7 +1489,9 @@ export interface HuntsQuery {
   until?: string; // ISO datetime — inclusive upper bound on created_at
   /** Sent only when set. The Hunts screen filters kind client-side over the
    *  fetched page today; this is the seam for the server to take it over. */
-  kind?: HuntKind;
+  /** `campaign` names the hunts that soc-ai started on a change of a
+   *  campaign. It is a starter: the stored kind of such a hunt can differ. */
+  kind?: HuntKind | 'campaign';
 }
 
 export function getHunts(query: HuntsQuery = {}): Promise<HuntRow[]> {
@@ -1142,6 +2003,34 @@ export interface QualityPoint {
   app_version?: string | null;
   code_commit?: string | null;
   analyst_model?: string | null;
+  /** The detail of the point (migration 0066). OPTIONAL: an older server
+   *  omits them, and a row from before that revision reads as an absence.
+   *  The planted true positives of the batch: `caught`, `missed` or
+   *  `not_measured`, with the cause of a plant that was not measured. */
+  synth?: QualitySynth[];
+  synth_note?: string | null;
+  /** Runs that completed and whose grade request failed, and their causes. */
+  n_not_graded?: number | null;
+  not_graded_kinds?: Record<string, number>;
+  /** One sentence when the grader lost grades. It opens with "Agreement is
+   *  not measured." when no run was graded. */
+  not_measured?: string | null;
+  /** Verdict agreement on the real alerts: the runs where the model and the
+   *  Oracle each stated a verdict, and how many of those agree. */
+  verdict_agree?: number | null;
+  verdict_compared?: number | null;
+  /** `n_error` by cause, and the runs that never ended. */
+  error_classes?: Record<string, number>;
+  n_unfinished?: number | null;
+}
+
+/** What became of one planted true positive. */
+export interface QualitySynth {
+  scenario_id: string;
+  outcome: 'caught' | 'missed' | 'not_measured' | string;
+  verdict?: string | null;
+  confidence?: number | null;
+  cause?: string | null;
 }
 
 /** When the trend last moved, and what the last attempt did. A nightly that
@@ -1226,6 +2115,13 @@ export interface DetectionNomination {
   prior_suspended?: boolean;
   /** Why the prior held back on the newest alert it did not cover. */
   prior_last_reason?: string | null;
+  /** The covered alerts and the disagreements split by safeguard 1: two
+   *  internal addresses, or a known external address. Absent from an older
+   *  backend. */
+  prior_covered_internal?: number;
+  prior_covered_known_external?: number;
+  prior_disagreements_internal?: number;
+  prior_disagreements_known_external?: number;
 }
 
 /** An active operator override (a soft, reversible mute). */
@@ -1242,6 +2138,10 @@ export interface DetectionOverride {
 export interface DetectionTuning {
   nominations: DetectionNomination[];
   overrides: DetectionOverride[];
+  /** The window of the alert volume, and every alert event of the feed in
+   *  it. Absent from an older server, and null when the grid gave no total. */
+  window?: string;
+  alert_total?: number | null;
 }
 
 /** Nominated noisy rules + the active soft-mute overrides. */
@@ -2039,6 +2939,147 @@ export function resolveInvestigation(invId: string, messageId: number, token: st
   );
 }
 
+// ---------------------------------------------------------------------------
+// Authorized activity: the analyst records that some activity is authorized.
+// A run inside the scope keeps its verdict and requests no case.
+// ---------------------------------------------------------------------------
+
+/** One address of a scope, with the machine that held it at the decision.
+ *  `identity` is `agent` when the agent of the machine reports the address,
+ *  and `address` for a target that no agent reports. */
+export interface AuthorizedMachine {
+  address: string;
+  name: string | null;
+  machine_key: string | null;
+  identity: 'agent' | 'address' | string;
+}
+
+/** One source address the dialog may offer. `runs` counts its true positive
+ *  runs on the target in the last 30 days. */
+export interface AuthorizedDraftSource extends AuthorizedMachine {
+  runs: number;
+  of_this_run: boolean;
+}
+
+/** One rule name the dialog may offer, with its run count on the pair. */
+export interface AuthorizedDraftRule {
+  name: string;
+  runs: number;
+  of_this_run: boolean;
+}
+
+/** What one true positive run allows as authorized activity. `allowed` false
+ *  carries the reason, and every other field is then empty. */
+export interface AuthorizedDraft {
+  investigation_id: string;
+  allowed: boolean;
+  reason: string | null;
+  hint: string | null;
+  rule_class: string | null;
+  target: AuthorizedMachine | null;
+  /** False when no agent reports the target address. The record then
+   *  follows the address. */
+  target_has_agent: boolean;
+  sources: AuthorizedDraftSource[];
+  /** The source addresses the draft left out, each with the reason. */
+  excluded_sources: { address: string; reason: string; hint: string }[];
+  /** The rule names a scope may list. A match needs the exact name. */
+  rules: AuthorizedDraftRule[];
+  /** The earlier runs the scope matches. The run of the dialog is not counted. */
+  earlier_runs: number;
+  /** Why the run of the dialog stays outside the chosen scope, or null. */
+  this_run_outside: string | null;
+  earlier_days_max: number;
+  default_days: number;
+  max_days: number;
+  expiry_choices: number[];
+  max_sources: number;
+  max_rules: number;
+}
+
+/** One authorized activity record, as its card shows it. Times are ISO UTC. */
+export interface AuthorizedActivity {
+  id: number;
+  label: string;
+  note: string | null;
+  state: 'active' | 'expired' | 'revoked';
+  sources: AuthorizedMachine[];
+  target: AuthorizedMachine;
+  /** The exact rule names of the scope. No other rule matches. */
+  rule_names: string[];
+  rule_class: string;
+  starts_at: string;
+  expires_at: string;
+  created_at: string;
+  created_by: string;
+  revoked_at: string | null;
+  revoked_by: string | null;
+  revoke_reason: string | null;
+  source_investigation_id: string | null;
+  runs_since_decision: number;
+  earlier_runs: number;
+  runs_total: number;
+  last_match_at: string | null;
+  runs_href: string;
+  /** Set on the answer of a revoke: the runs that went back to normal handling. */
+  runs_returned?: number | null;
+}
+
+export interface AuthorizedActivityList {
+  rows: AuthorizedActivity[];
+  active: number;
+}
+
+/** The authorized activity records: the active ones, then the ones that ended
+ *  in the last 7 days. */
+export function getAuthorizedActivity(ended = true): Promise<AuthorizedActivityList> {
+  return request<AuthorizedActivityList>(`/authorized-activity${ended ? '' : '?ended=false'}`);
+}
+
+/** What the run allows, and the count of earlier runs for a choice of rules
+ *  and sources. */
+export function getAuthorizedDraft(
+  invId: string,
+  q: { rules?: string[]; sources?: string[] } = {},
+): Promise<AuthorizedDraft> {
+  const p = new URLSearchParams();
+  for (const rule of q.rules ?? []) p.append('rule', rule);
+  for (const source of q.sources ?? []) p.append('source', source);
+  const qs = p.toString();
+  return request<AuthorizedDraft>(
+    `/investigations/${encodeURIComponent(invId)}/authorized-activity/draft${qs ? `?${qs}` : ''}`,
+  );
+}
+
+export interface AuthorizedActivityInput {
+  investigation_id: string;
+  label: string;
+  note?: string | null;
+  sources: string[];
+  rule_names: string[];
+  expires_in_days: number;
+  apply_to_earlier: boolean;
+}
+
+/** Record the activity of one true positive run as authorized. Admin only. */
+export function createAuthorizedActivity(body: AuthorizedActivityInput): Promise<AuthorizedActivity> {
+  return post<AuthorizedActivity>('/authorized-activity', body).then((answer) => {
+    // The run of the record requests no case now, so the count moves.
+    emitNeedsYouChanged();
+    return answer;
+  });
+}
+
+/** Revoke one record. Its runs get normal handling again. */
+export function revokeAuthorizedActivity(id: number, reason: string): Promise<AuthorizedActivity> {
+  return post<AuthorizedActivity>(`/authorized-activity/${id}/revoke`, { reason }).then(
+    (answer) => {
+      emitNeedsYouChanged();
+      return answer;
+    },
+  );
+}
+
 /** Manually override a completed investigation's verdict. */
 export function overrideVerdict(
   invId: string,
@@ -2078,10 +3119,12 @@ export function executeAction(
   invId: string,
   index: number,
   scope?: 'group' | 'alert',
+  /** "Try again" on the case of a finding whose earlier press has no result. */
+  retry = false,
 ): Promise<ExecuteActionResult> {
   return post<ExecuteActionResult>(
     `/investigations/${encodeURIComponent(invId)}/actions/${index}/execute`,
-    scope ? { scope } : undefined,
+    scope || retry ? { ...(scope ? { scope } : {}), ...(retry ? { retry: true } : {}) } : undefined,
     SO_WRITE_OPTS,
   ).then((answer) => {
     // An executed action leaves the pending-action part of the needs-you count.
@@ -2093,8 +3136,10 @@ export function executeAction(
 /** What one recommended action will write, stated before the analyst confirms. */
 export interface ActionScope {
   tool: string;
-  /** 'group' for a rule-wide ack, 'alert' for this alert, 'case' for a comment. */
-  scope: 'group' | 'alert' | 'case';
+  /** 'group' for a rule-wide ack, 'alert' for this alert, 'finding' for the
+   *  case of a promoted finding, 'case' for a comment. For 'finding', `count`
+   *  is the alerts the case attaches and `held` is the cited alerts it skips. */
+  scope: 'group' | 'alert' | 'finding' | 'case';
   count: number | null;
   hosts: number | null;
   held: number;
@@ -2105,6 +3150,11 @@ export interface ActionScope {
   cases?: CaseLink[];
   /** False when the grid did not confirm the case list. */
   casesComplete?: boolean;
+  /** The case of a finding only: an earlier press recorded no result, and a
+   *  press opens no case. The card offers "Try again" behind a confirm that
+   *  reads `retrySentence`. */
+  retry?: boolean;
+  retrySentence?: string | null;
 }
 
 export function getActionScope(invId: string, index: number): Promise<ActionScope> {
@@ -3007,10 +4057,35 @@ export function getMachineSummary(activity?: 'active' | 'all'): Promise<MachineS
   return request<MachineSummary>('/hosts/summary' + (activity ? `?activity=${activity}` : ''));
 }
 
+/** The newest grid event of each address, in one request for a page of the
+ *  Hosts list. The server answers 503 when the grid is down. */
+export function getHostLastEvents(ips: string[]): Promise<MachineLastEvents> {
+  const p = new URLSearchParams();
+  for (const ip of ips) p.append('ip', ip);
+  return request<MachineLastEvents>(`/hosts/last-events?${p.toString()}`);
+}
+
 /** An address, a name, a MAC or an agent id to its machine key. A value that
  *  names no machine is a 404 (`no_host`). */
 export function resolveMachine(value: string): Promise<MachineResolve> {
   return request<MachineResolve>(`/hosts/resolve?value=${encodeURIComponent(value)}`);
+}
+
+/** The name and the role of the machine that holds one address. `roleGuess`
+ *  marks a role the resolver withheld as a guess. */
+export interface HostName {
+  key: string;
+  name: string | null;
+  role: string | null;
+  roleGuess: boolean;
+}
+
+/** The name and the role of each address, in one read for a list page. An
+ *  address that no machine with a name or a role holds is absent. */
+export function getHostNames(ips: string[]): Promise<{ hosts: Record<string, HostName> }> {
+  const p = new URLSearchParams();
+  for (const ip of ips) p.append('ip', ip);
+  return request<{ hosts: Record<string, HostName> }>(`/hosts/names?${p.toString()}`);
 }
 
 /** One machine: every address, the containers and the primary dossier. */
@@ -3257,12 +4332,31 @@ export interface Lead {
   /** The outcome code of the attached hunt: threats, clean, gap or failed.
    *  `hunt_outcome_label` is the words for it. */
   hunt_outcome?: string | null;
+  /** What the attached hunt said: the first sentence of its narrative. Empty
+   *  for a hunt that did not finish. Absent on an older server. */
+  hunt_answer?: string;
+  /** What the attached hunt could not check, one sentence for each visibility
+   *  gap. Absent on an older server. */
+  hunt_not_checked?: string[];
+  /** Why the finished hunt did not settle the lead: the code the settle rule
+   *  recorded, and the sentence to print. Null when no hold is in force.
+   *  Absent on an older server. */
+  hold_reason?: string | null;
+  hold_sentence?: string | null;
+  /** A closed lead only. How many observations joined the lead after the
+   *  close, and when the newest did. Absent on an older server. */
+  repeats_after_close?: number;
+  last_repeat_at?: string | null;
   /** True when the lead formed from backtest replays only. A replay is a
    *  measurement on an alert an analyst already closed, not live evidence. */
   formed_from_backtest?: boolean;
   /** True when soc-ai closed the lead because every finding of its hunt has a
    *  verdict. Absent from an older server. */
   closed_by_hunt_verdicts?: boolean;
+  /** The campaign of a lead whose every observation is an alert of an
+   *  investigation that the campaign holds. The analyst decides on the
+   *  campaign. Null for any other lead. Absent on an older server. */
+  campaign?: InvestigationCampaign | null;
 }
 
 /** One hunt on a lead, with its answer. The page labelled a hunt by its id
@@ -3400,12 +4494,16 @@ export interface LeadPromotedFinding {
  *  The spine adds two words that name what the analyst must do rather than
  *  what the record holds. `needs_decision` is a lead with no hunt, or a lead
  *  whose hunt has finished. `in_progress` is a lead whose hunt still runs.
- *  `open_or_hunting` is the open work: the host page counts these. */
+ *  `open_or_hunting` is the open work: the host page counts these.
+ *
+ *  `fleet_condition` is a stored status: one departure on more hosts than the
+ *  span cap. It has its own tab, because it waits on no decision. */
 export type LeadStatusFilter =
   | 'open'
   | 'hunting'
   | 'dismissed'
   | 'promoted'
+  | 'fleet_condition'
   | 'closed'
   | 'new'
   | 'all'
@@ -3439,6 +4537,9 @@ export interface LeadCount {
   status: string;
   entity: string | null;
   total: number;
+  /** The open and hunting leads among them that an active campaign holds.
+   *  Such a lead waits on its campaign. An older server sends none. */
+  in_campaign?: number;
 }
 
 /** The true total for a filter of GET /leads. The list stops at its row
@@ -3862,9 +4963,43 @@ export interface AnalyticHitsCounts {
   shadow: number;
 }
 
+/** The two parts of the hit list, each with its own window. `in_window` is
+ *  the hits an analytic saw in the last `days` days. `older_unread` is the
+ *  unread shadow hits that no analytic saw in those days: the list holds an
+ *  unread shadow hit at any age. Their sum is `counts.all`. */
+export interface AnalyticHitsWindow {
+  days: number;
+  in_window: number;
+  older_unread: number;
+}
+
+/** The hits of one analytic under the filter, counted over the whole list
+ *  and not over the page. The block renders one header for each analytic from
+ *  this row. `machines` counts the machines the host hits name: two addresses
+ *  of one machine are one machine. `accounts` counts the user accounts. */
+export interface AnalyticHitGroup {
+  analytic_id: string;
+  analytic_title: string;
+  /** The status of the analytic now. */
+  analytic_status: string;
+  tier: string;
+  analytic_exists: boolean;
+  hits: number;
+  unread: number;
+  machines: number;
+  accounts: number;
+  newest_at: string | null;
+}
+
 export interface AnalyticHits {
   hits: AnalyticHit[];
   counts: AnalyticHitsCounts;
+  /** Absent from an older server. The label then states both windows in
+   *  words over the one total. */
+  window?: AnalyticHitsWindow;
+  /** One group for each analytic, the groups with unread hits first. Absent
+   *  from an older server. The block then counts the hits it has read. */
+  groups?: AnalyticHitGroup[];
 }
 
 /** The four words the hit filter chips read. */
@@ -3874,6 +5009,13 @@ export type AnalyticHitFilter = 'all' | 'unread' | 'live' | 'shadow';
 export interface NeedsYou {
   unread_shadow_hits: number;
   leads_needing_decision: number;
+  /** The leads that wait on a decision: the count the strip and the badge
+   *  state. Absent on an older server. */
+  decisions?: number;
+  /** The unread shadow hits: review work, shown apart in a neutral color.
+   *  Absent on an older server. */
+  review?: number;
+  /** Deprecated: decisions plus review. */
   total: number;
   /** The live "A lead starts its own hunt" setting. Absent on an older server. */
   lead_auto_hunt?: boolean;
@@ -4085,6 +5227,21 @@ export interface NeedsYouCount {
   untriaged_groups: number | null;
   needs_more_info: number | null;
   pending_actions: number | null;
+  /** The active campaigns with no decision. Absent on an older server. */
+  campaigns?: number | null;
+  /** The parts that wait on a decision, summed by the server: campaigns,
+   *  investigations that wait, leads and alert groups, each decision once.
+   *  The count every surface states, and the `total` of the Needs you page.
+   *  Absent on an older server. */
+  decisions?: number;
+  /** The unread shadow hits: review work, shown apart in a neutral color.
+   *  Null when the server could not read them. Absent on an older server. */
+  review?: number | null;
+  /** The runs of the Needs you view of the Investigations list, in
+   *  `verdict_window`. The Investigations badge states it. Null when the
+   *  server could not count them. Absent on an older server. */
+  investigations_waiting?: number | null;
+  /** Deprecated: decisions plus review. An older console reads it. */
   total: number;
   unknown: string[];
   /** The window of the alert part, in range words ("7d"). */
@@ -4098,6 +5255,39 @@ export interface NeedsYouCount {
 /** The needs-you count: every part and the total. */
 export function getNeedsYouCount(): Promise<NeedsYouCount> {
   return request<NeedsYouCount>('/needs-you');
+}
+
+/** The type of one item of the Needs you list. `alerts` is one item for
+ *  every alert group with no verdict. */
+export type NeedsYouItemType = 'campaign' | 'investigation' | 'lead' | 'alerts';
+
+/** One item of the Needs you list: what waits, why, since when and where
+ *  the analyst decides it. */
+export interface NeedsYouItem {
+  type: NeedsYouItemType;
+  id: string;
+  title: string;
+  /** Why it waits, in one sentence. */
+  detail: string;
+  since: string | null;
+  href: string;
+  /** The stage of a campaign. Null for the other types. */
+  stage?: CampaignStage | null;
+}
+
+/** `GET /needs-you/items`: oldest first, at most 200. `total` is the count
+ *  that the top bar states: `decisions` of `GET /needs-you`, with each alert
+ *  group counted. */
+export interface NeedsYouItems {
+  items: NeedsYouItem[];
+  total: number;
+  /** Each type that the server could not read. `total` is then a floor.
+   *  Absent on an older server. */
+  unknown?: NeedsYouItemType[];
+}
+
+export function getNeedsYouItems(): Promise<NeedsYouItems> {
+  return request<NeedsYouItems>('/needs-you/items');
 }
 
 /** Mark one shadow hit read. Opening its receipts is what reads it. */
@@ -4117,6 +5307,26 @@ export function markShadowHitRead(id: number): Promise<{ ok: boolean }> {
 export function markAllShadowHitsRead(before: string, expected?: number): Promise<{ read: number }> {
   const body = expected === undefined ? { before } : { before, expected };
   return post<{ read: number }>('/hunts/shadow-hits/read-all', body).then((answer) => {
+    publishShadowHitsChanged();
+    emitNeedsYouChanged();
+    return answer;
+  });
+}
+
+/** Mark the unread shadow hits of one analytic read, in one write. `before`
+ *  is the moment the block loaded its counts, and `expected` is the count on
+ *  the button. The server marks nothing and answers 409 `shadow_hits_changed`
+ *  when it would mark more. The analytic keeps its status. */
+export function markAnalyticShadowHitsRead(
+  analyticId: string,
+  before: string,
+  expected?: number,
+): Promise<{ read: number }> {
+  const body =
+    expected === undefined
+      ? { analytic_id: analyticId, before }
+      : { analytic_id: analyticId, before, expected };
+  return post<{ read: number }>('/hunts/shadow-hits/read-analytic', body).then((answer) => {
     publishShadowHitsChanged();
     emitNeedsYouChanged();
     return answer;

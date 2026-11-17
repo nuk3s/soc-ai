@@ -185,8 +185,8 @@ describe('a queued hunt on the lead page', () => {
     vi.mocked(getNeedsYou).mockResolvedValue({ ...NEEDS_YOU, lead_auto_hunt: true });
     vi.mocked(getLead).mockResolvedValue({ ...LEAD, hunt_queued: true } as never);
     mount();
-    // The why line is always on screen. The weights sit behind Scoring.
-    await screen.findByTestId('lead-why');
+    // The state line is always on screen. The weights sit behind Scoring.
+    await screen.findByTestId('lead-state-sentence');
     expect(screen.queryByTestId('lead-left-to-you')).toBeNull();
   });
 });
@@ -200,17 +200,17 @@ describe('the lead page offers one verb', () => {
     mount();
     const hunt = await screen.findByRole('button', { name: 'Hunt this lead' });
     expect(hunt.getAttribute('title')).toBe(ACTION_HUNT);
-    expect(screen.getByTestId('lead-actions-line').textContent).toBe(
+    expect(screen.getByTestId('lead-action-effect-hunt').textContent).toBe(
       'Hunt this lead. soc-ai investigates each threat finding of the hunt and shows the verdicts.',
     );
-    expect(LEAD_ACTIONS_LINE).toBe(screen.getByTestId('lead-actions-line').textContent);
+    expect(LEAD_ACTIONS_LINE).toBe(screen.getByTestId('lead-action-effect-hunt').textContent);
   });
 
   it('offers no investigation of its own, before or after the hunt', async () => {
     for (const lead of [LEAD, { ...LEAD, hunt_queued: true }, HUNTED]) {
       vi.mocked(getLead).mockResolvedValue(lead as never);
       const { unmount } = mount();
-      await screen.findByTestId('lead-why');
+      await screen.findByTestId('lead-state-sentence');
       expect(screen.queryByRole('button', { name: /Open an investigation|Promote/ })).toBeNull();
       unmount();
     }
@@ -227,7 +227,7 @@ describe('the lead page offers one verb', () => {
     } as never);
     mount();
     await screen.findByRole('button', { name: LEAD_ACTION.reopen });
-    expect(screen.queryByTestId('lead-actions-line')).toBeNull();
+    expect(screen.queryByTestId('lead-action-effect-hunt')).toBeNull();
   });
 
   // The re-read behind an act is a second request, and it can fail on its
@@ -417,8 +417,8 @@ describe('related leads', () => {
   // answer nobody made.
   it('shows no panel at all when the API sends none', async () => {
     mount();
-    // The why line is always on screen. The weights sit behind Scoring.
-    await screen.findByTestId('lead-why');
+    // The state line is always on screen. The weights sit behind Scoring.
+    await screen.findByTestId('lead-state-sentence');
     expect(screen.queryByTestId('lead-related')).toBeNull();
   });
 });

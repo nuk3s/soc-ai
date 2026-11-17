@@ -62,7 +62,7 @@ from pydantic_ai.usage import RequestUsage, RunUsage, UsageLimits
 
 from soc_ai import metrics
 from soc_ai.agent import budget, context_budget
-from soc_ai.agent._gateway_retry import capture_backend_attribution
+from soc_ai.agent._gateway_retry import call_was_fallback, capture_backend_attribution
 from soc_ai.agent._partial_replay import (
     repair_dangling_tool_calls,
     replay_reasoning_context,
@@ -107,6 +107,8 @@ from soc_ai.agent.gates import (  # noqa: F401
     _FUZZY_TOKEN_RE,
     _GROUNDED_EVIDENCE_TOKENS,
     _PIVOT_ATTRS,
+    IMPACT_GATE,
+    VOTE_STEP,
     _apply_targeted_downgrades,
     _citation_confidence_cap,
     _downgrade_unevidenced_verdict,
@@ -118,17 +120,25 @@ from soc_ai.agent.gates import (  # noqa: F401
     _pivot_evidence_tokens,
     _refuse_benign_verdict_without_baseline,
     _resolve_citations,
+    _settle_impact,
     _synth_first_post_validate,
     _validate_citations,
     _verdict_cites_decisive_pivot_value,
     _verdict_grounded_in_pivot,
     enforce_session_verdict_consistency,
+    impact_change_from_audit,
+    oracle_view,
+    report_text,
+    verdict_change_from_audit,
 )
 from soc_ai.agent.loop_result import SINGLE, SWARM_STRATEGIES, LoopResult, strategy_of
 from soc_ai.agent.models import (
+    LOW_REASONING_EFFORT,
     build_investigator_model,
     build_model,
     build_synthesizer_model,
+    is_token_limit_before_response,
+    low_reasoning_settings,
 )
 from soc_ai.agent.narrative_grounding import coverage_subject, ground_host_coverage_claims
 from soc_ai.agent.prompts import (
@@ -180,10 +190,11 @@ from soc_ai.oracle import client as _oracle_client
 from soc_ai.oracle.identifiers import EffectiveIdentifiers, effective_internal_identifiers
 from soc_ai.so_client.inventory import inventory_prompt_block
 from soc_ai.so_client.models import SoAlert
+from soc_ai.store import first_line as first_line_svc
 from soc_ai.tools.enrichment import build_local_enrichment_context
 from soc_ai.tools.get_alert_context import ENDPOINT_COVERAGE_GAP_KEY
 from soc_ai.tools.write_exec import execute_write_tool
-from soc_ai.triage_models import is_pipeline_fallback
+from soc_ai.triage_models import is_pipeline_fallback, settled_impact, settled_stage
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -873,6 +884,95 @@ def _run_usage(run_result: Any) -> RunUsage | None:
     return u if isinstance(u, RunUsage) else None
 
 
+def _token_limit_retry_payload(phase: str, exc: BaseException) -> dict[str, Any]:
+    """The ``token_limit_retry`` event: one model call ran again with low reasoning."""
+    return {
+        "phase": phase,
+        "reasoning_effort": LOW_REASONING_EFFORT,
+        "message": str(exc),
+    }
+
+
+async def _run_with_token_limit_retry(
+    agent: Any,
+    prompt: Any,
+    *,
+    turn_timeout_s: float,
+    phase: str,
+    retried: list[dict[str, Any]],
+    **run_kwargs: Any,
+) -> Any:
+    """Run one synthesis call, and once more with low reasoning after a token-limit stop.
+
+    A reasoning model can spend its whole response budget on reasoning. The
+    response then ends with no output, and pydantic-ai raises the token-limit
+    error (:func:`soc_ai.agent.models.is_token_limit_before_response`). The
+    same call with low reasoning effort keeps budget for the report. One retry
+    only: a second stop propagates to the caller, which lands the fallback as
+    before. Each attempt has its own turn timeout. ``retried`` receives one
+    payload when the retry ran, and the caller emits it as an event.
+    """
+    try:
+        async with asyncio.timeout(turn_timeout_s):
+            return await agent.run(prompt, **run_kwargs)
+    except Exception as exc:
+        if not is_token_limit_before_response(exc):
+            raise
+        retried.append(_token_limit_retry_payload(phase, exc))
+        _LOGGER.warning(
+            "%s: the model hit its output token limit before a response. "
+            "The call runs one more time with low reasoning.",
+            phase,
+        )
+    async with asyncio.timeout(turn_timeout_s):
+        return await agent.run(prompt, model_settings=low_reasoning_settings(), **run_kwargs)
+
+
+def _resumed_loop_kwargs(
+    history: list[Any], usage_limits: Any, stopped_usage: RunUsage | None
+) -> dict[str, Any]:
+    """The arguments of the loop that resumes after a token-limit stop.
+
+    The history before the stopped turn, low reasoning for each later turn,
+    and the counters of the stopped attempt. With the counters the request
+    limit and the tool-call limit of the loop hold for the whole run. They
+    started again from zero.
+    """
+    kwargs: dict[str, Any] = {
+        "message_history": history,
+        "usage_limits": usage_limits,
+        "model_settings": low_reasoning_settings(),
+    }
+    if stopped_usage is not None:
+        kwargs["usage"] = stopped_usage
+    return kwargs
+
+
+def _with_stopped_fallback(attr: dict[str, Any], stopped: dict[str, Any]) -> dict[str, Any]:
+    """The attribution of a resumed loop, with the fallback mark of the stopped attempt.
+
+    The resumed loop has a new attribution sink, so a fallback call of the
+    stopped attempt would leave no mark on the run.
+    """
+    if not call_was_fallback(stopped):
+        return attr
+    group = stopped.get("fallback_model_group") or stopped.get("model_group")
+    return {**attr, "fallback": True, **({"fallback_model_group": group} if group else {})}
+
+
+def _resume_history(gathered: list[Any]) -> list[Any]:
+    """The loop history to resume from after a token-limit stop.
+
+    The stopped turn left a response with no output at the end of the history.
+    The history up to the last request is intact: pydantic-ai continues from a
+    history that ends with a request.
+    """
+    history = list(gathered)
+    while history and type(history[-1]).__name__ != "ModelRequest":
+        history.pop()
+    return history
+
+
 # The note a verdict carries when the loop stopped at its budget and the
 # partial synthesis wrote it from the evidence gathered before the cutoff.
 _BUDGET_CUT_NOTE = (
@@ -1012,6 +1112,30 @@ def _is_high_stakes_alert(alert: SoAlert) -> bool:
     a honeypot interaction and an unattended acknowledgement — and an
     acknowledged honeypot hit is a silenced intrusion, since a decoy has no
     benign population to be a false positive from.
+
+    The severity arm has one exception, and it is the only arm that has one.
+    Security Onion does not judge a Suricata alert: its ``common.nids`` ingest
+    pipeline maps the Suricata priority of the rule onto ``event.severity`` (1
+    becomes 3, high), and a rule takes its priority from its classification. So
+    every rule filed under a priority 1 classification reads as high, whatever
+    the rule matches, and "Potential Corporate Privacy Violation" is priority 1
+    in Suricata's own classification.config. Production, 2026-10-31 to
+    2026-11-13: 274 confident false positives waited for a manual acknowledge
+    as high-stakes, and 131 of them were one rule, "ET USER_AGENTS Steam HTTP
+    Client User-Agent", which Security Onion scored high and whose author
+    declared ``signature_severity`` Informational. Such an alert leaves the
+    hold, and only on positive knowledge (:func:`_high_severity_is_explained`).
+
+    The exception is deliberately narrow. It is read last, so it cannot lower
+    an alert that any other arm holds: an exploit or malware classification, a
+    malware token and a decoy all return before it. It stops at high: that
+    pipeline writes 3 at most, so a critical severity came from another
+    producer (a Sigma level, Elastic Defend's 99) and still holds the alert.
+    And absence is never a reason. The first version asked only "is the
+    signature Informational", so an alert whose classification could not be
+    read at all (the message JSON did not parse, a local classtype, a document
+    that is not Suricata) left the hold on the strength of the arms above
+    having nothing to read. Each of those is held again.
     """
     from soc_ai.agent.decision_templates import (  # noqa: PLC0415 — circular
         _ATTACK_CLASSTYPES,
@@ -1035,9 +1159,51 @@ def _is_high_stakes_alert(alert: SoAlert) -> bool:
     if _alert_signals_decoy(alert):
         return True
     sev_label = (alert.severity_label or "").strip().lower()
-    if sev_label in ("critical", "high"):
+    sev_score = alert.severity_score
+    if sev_label == "critical" or (sev_score is not None and sev_score > 3):
         return True
-    return alert.severity_score is not None and alert.severity_score >= 3
+    if sev_label == "high" or sev_score == 3:
+        return not _high_severity_is_explained(alert)
+    return False
+
+
+# The classifications whose own priority is 1 in Suricata's classification.config
+# and that the routing table (soc_ai.agent.classifier) calls informational.
+# Security Onion scores every rule of these two as high, whatever it matches.
+# Every other priority 1 classification is an attack or a compromise, and an
+# earlier arm holds it. A classification outside this set that reads as high
+# got there another way (the rule sets its own ``priority:1``, or the
+# classification is local), and nothing here knows why.
+_HIGH_BY_CLASSIFICATION_ALONE: frozenset[str] = frozenset(
+    {"policy-violation", "inappropriate-content"}
+)
+
+
+def _high_severity_is_explained(alert: SoAlert) -> bool:
+    """Whether a high severity is KNOWN to be the classification priority of an
+    informational rule, and nothing else.
+
+    True only when every one of these was read off the alert:
+
+    * It is a Suricata alert. The ``common.nids`` mapping is Suricata's, and
+      another producer's high means what that producer says it means.
+    * Its classification was read, and it is one whose own priority is 1 and
+      whose class is informational (:data:`_HIGH_BY_CLASSIFICATION_ALONE`).
+      That is what makes the high severity an artefact of the classification.
+      No classification, a local one, an unrouted one, or a milder one raised
+      by an explicit priority all fail here.
+    * The rule author declared the signature Informational, and declared
+      nothing more severe beside it (the model keeps the most severe value).
+
+    Anything this cannot read leaves the alert held.
+    """
+    module = (alert.event_module or "").strip().lower()
+    dataset = (alert.event_dataset or "").strip().lower().split(".", 1)[0]
+    if {module, dataset} - {"", "suricata"} or "suricata" not in (module, dataset):
+        return False
+    if normalize_classtype(alert.classtype) not in _HIGH_BY_CLASSIFICATION_ALONE:
+        return False
+    return alert.rule_metadata is not None and alert.rule_metadata.is_informational
 
 
 async def _standing_analyst_verdict(ctx: InvestigationContext, es_id: str) -> tuple[Any, bool]:
@@ -1103,6 +1269,60 @@ async def _analyst_verdict_holds_ack(
     return held
 
 
+async def _earlier_true_positive_holds_ack(
+    report: TriageReport,
+    es_id: str,
+    *,
+    ctx: InvestigationContext,
+    emit_ev: Any,
+) -> StepEvent | None:
+    """The ``auto_ack_skipped`` event when an earlier run of the alert leaned
+    true positive.
+
+    Production, 2026-11-13: an earlier run of the alert reached true positive
+    and an evidence gate lowered it to needs more info. Hours later a new run
+    reached false positive at 0.82 and the ack was written with no person. A
+    verdict that flipped between runs is a question for the analyst, whatever
+    the new run says. The ack waits, and the Acknowledge action stays on the
+    run for the analyst to press.
+
+    FAILS CLOSED. A store that does not answer is not permission to write.
+    No store on the context (CLI, eval, a direct caller) has no earlier run
+    to read.
+    """
+    maker = ctx.db_sessionmaker
+    if maker is None or not es_id:
+        return None
+    from soc_ai.store.investigations import earlier_true_positive_runs  # noqa: PLC0415
+
+    found: dict[str, str] | None
+    try:
+        async with maker() as db:
+            found = await earlier_true_positive_runs(db, [es_id])
+    except Exception as exc:
+        _LOGGER.warning("earlier-run lookup failed for alert %s: %s", es_id, exc)
+        found = None
+    if found is not None and es_id not in found:
+        return None
+    payload: dict[str, Any] = {
+        "es_id": es_id,
+        "reason": "earlier_true_positive" if found is not None else "earlier_runs_unread",
+        "confidence": report.confidence,
+        "threshold": ctx.settings.auto_ack_fp_threshold,
+    }
+    if found is not None:
+        payload["earlier_investigation_id"] = found[es_id]
+    _LOGGER.info(
+        "auto-ack suppressed for alert %s: %s",
+        es_id,
+        f"earlier run {found[es_id]} leaned true positive"
+        if found is not None
+        else "earlier runs unread",
+    )
+    held: StepEvent = emit_ev("auto_ack_skipped", payload)
+    return held
+
+
 async def maybe_auto_ack_fp(
     report: TriageReport,
     es_id: str,
@@ -1130,6 +1350,8 @@ async def maybe_auto_ack_fp(
     - the alert is NOT high-stakes (see :func:`_is_high_stakes_alert`)
     - no analyst verdict other than false positive stands on the alert, on
       this run or on any earlier run of it (see :func:`_analyst_verdict_holds_ack`)
+    - no earlier run of the alert leaned true positive
+      (see :func:`_earlier_true_positive_holds_ack`)
 
     ``citation_coverage`` is the resolved share of the report's citations, as
     :func:`soc_ai.agent.gates._resolve_citations` measured them, or ``None``
@@ -1184,7 +1406,8 @@ async def maybe_auto_ack_fp(
     when the write was attempted; an ``auto_ack_skipped`` StepEvent (with
     ``reason`` = ``analyst_verdict`` | ``analyst_verdict_unknown`` |
     ``below_threshold`` | ``no_investigation`` | ``uncited`` |
-    ``high_stakes`` | ``oracle_dissent``)
+    ``high_stakes`` | ``oracle_dissent`` | ``earlier_true_positive`` |
+    ``earlier_runs_unread``)
     when auto-ack was armed for this FP but a guard held it back — recorded so
     the drawer can explain why the pending ack needs a human; or ``None`` when
     auto-ack simply doesn't apply (disabled, or a non-FP verdict).
@@ -1299,6 +1522,9 @@ async def maybe_auto_ack_fp(
             },
         )
         return high_stakes_ev
+    earlier_ev = await _earlier_true_positive_holds_ack(report, es_id, ctx=ctx, emit_ev=emit_ev)
+    if earlier_ev is not None:
+        return earlier_ev
 
     _LOGGER.info(
         "auto-acking FP alert %s (confidence=%.2f >= threshold=%.2f)",
@@ -2014,6 +2240,133 @@ def classic_oracle_escalation_reason(
     return None
 
 
+# ----- The served model of a run (B4, 2026-11-13) -----
+#
+# soc-ai asks the gateway for one model in each call. The gateway can serve the
+# call from another model group: a fallback route. Production got two wrong
+# true positives from the route ``qwen3.6-35b-temp-fallback`` on 2026-11-03.
+# Each ``usage`` event named that route in ``served_backend``, and nothing read
+# it: the run carried no mark, and no rule sent it to the Oracle.
+#
+# Only the gateway says what a fallback is (:func:`call_was_fallback`): its
+# fallback count, or a model group that is not the model that the call asked
+# for. ``analyst_model`` is no test: production runs two configured names on
+# one backend.
+ORACLE_REASON_FALLBACK_ROUTE = "fallback_route"
+
+
+def _by_use(counts: dict[str, int]) -> list[str]:
+    """The names of a tally, the most used first."""
+    return sorted(counts, key=lambda name: (-counts[name], name))
+
+
+def served_model_record(calls: Sequence[Any]) -> dict[str, Any] | None:
+    """What served one run: the model groups, the asked models and the mark.
+
+    ``calls`` holds the ``served_backend`` of each ``usage`` event of the run,
+    one for each model phase that wrote toward the verdict. ``fallback`` is
+    True when the gateway served any of them from a fallback route. None when
+    no call carries an attribution, so an unknown is never a mark.
+    """
+    groups: dict[str, int] = {}
+    asked: dict[str, int] = {}
+    fallback_groups: list[str] = []
+    fallback = False
+    known = False
+    for call in calls:
+        if not isinstance(call, dict) or not call:
+            continue
+        known = True
+        group, requested = call.get("model_group"), call.get("requested_model")
+        if isinstance(group, str) and group:
+            groups[group] = groups.get(group, 0) + 1
+        if isinstance(requested, str) and requested:
+            asked[requested] = asked.get(requested, 0) + 1
+        if call_was_fallback(call):
+            fallback = True
+            via = call.get("fallback_model_group")
+            if isinstance(via, str) and via and via not in fallback_groups:
+                fallback_groups.append(via)
+    if not known:
+        return None
+    served = _by_use(groups)
+    return {
+        "model_groups": served + [g for g in fallback_groups if g not in served],
+        "requested_models": _by_use(asked),
+        "fallback": fallback,
+    }
+
+
+def fallback_route_reason(
+    report: TriageReport,
+    served: dict[str, Any] | None,
+    settings: Settings,
+    *,
+    earlier_verdicts: Sequence[str],
+    run_class: str = budget.STANDARD,
+) -> str | None:
+    """Why a verdict from a fallback route goes to the Oracle, or None.
+
+    A weaker model on a fallback route gets a second opinion in two cases:
+
+    - the verdict is a true positive;
+    - the verdict changes an earlier verdict of the same alert.
+      ``earlier_verdicts`` holds the newest earlier verdict of the alert and
+      the verdicts of the same network session.
+
+    The limits of every Oracle rule hold: the Oracle is on, the run class can
+    reach the Oracle, and the report is no pipeline error. A run on the
+    configured model, or a run with no attribution, gets None.
+    """
+    if not settings.oracle_enabled or run_class not in budget.ORACLE_CLASSES:
+        return None
+    if not served or not served.get("fallback"):
+        return None
+    if is_pipeline_fallback({"resolution": report.resolution}):
+        return None
+    if report.verdict == "true_positive":
+        return ORACLE_REASON_FALLBACK_ROUTE
+    if any(v and v != report.verdict for v in earlier_verdicts):
+        return ORACLE_REASON_FALLBACK_ROUTE
+    return None
+
+
+async def _earlier_alert_verdict(ctx: InvestigationContext, alert_id: str) -> str | None:
+    """The newest real verdict of an earlier run of this alert, or None.
+
+    This run is still ``running``, and the lookup reads complete runs only, so
+    it cannot match itself. A pipeline error is no verdict. Fail-soft: no
+    store, or a store error, gives None.
+    """
+    if ctx.db_sessionmaker is None:
+        return None
+    from sqlalchemy import select  # noqa: PLC0415 - the store is optional here
+
+    from soc_ai.store.models import Investigation  # noqa: PLC0415
+
+    try:
+        async with ctx.db_sessionmaker() as db:
+            rows = (
+                await db.execute(
+                    select(Investigation.verdict, Investigation.is_fallback)
+                    .where(
+                        Investigation.alert_es_id == alert_id,
+                        Investigation.status == "complete",
+                        Investigation.verdict.is_not(None),
+                    )
+                    .order_by(Investigation.created_at.desc())
+                    .limit(5)
+                )
+            ).all()
+    except Exception as e:
+        _LOGGER.warning("earlier verdict lookup failed (the fallback rule reads none): %s", e)
+        return None
+    for verdict, is_fallback in rows:
+        if not is_fallback and isinstance(verdict, str) and verdict:
+            return verdict
+    return None
+
+
 @dataclasses.dataclass(frozen=True)
 class OracleRuleDecision:
     """What the Oracle rule mode decided for one local verdict.
@@ -2169,6 +2522,58 @@ async def _resolve_oracle_identifiers(
     if effective is None:
         return None
     return effective.suffixes, effective.hosts
+
+
+async def _first_line_fields(
+    ctx: InvestigationContext,
+    report: TriageReport,
+    impact: str | None,
+    enriched: Any,
+    subject: HuntSubject | None,
+) -> dict[str, Any]:
+    """The first line, the ends and the event time of the report that stands (H2).
+
+    The server builds the line, never the model: the verdict, the impact and
+    the two hosts as the Hosts data names them
+    (:mod:`soc_ai.store.first_line`). A finding run takes its direction from
+    the promoted finding, because its anchor document can be the response of
+    the victim. With no store on the context, each end prints as its address.
+    A pipeline error gets none of the three: its report states a failure, and
+    it names no host. Never raises: the line must not cost a verdict.
+    """
+    if isinstance(report.resolution, dict):
+        return {}
+    try:
+        alert = getattr(enriched, "alert", None)
+        src = getattr(alert, "source_ip", None)
+        dst = getattr(alert, "destination_ip", None)
+        finding = subject.promoted_finding if subject is not None else None
+        if finding is not None:
+            source, target = first_line_svc.finding_ends(src, dst, finding.hosts)
+        else:
+            source, target = first_line_svc.alert_ends(src, dst, getattr(alert, "host_name", None))
+        out: dict[str, Any] = {}
+        if source or target:
+            out[first_line_svc.ENDS_KEY] = {"source": source, "target": target}
+        at = getattr(alert, "timestamp", None)
+        if isinstance(at, datetime):
+            out[first_line_svc.EVENT_TIME_KEY] = (
+                at if at.tzinfo is not None else at.replace(tzinfo=UTC)
+            ).isoformat()
+        labels: dict[str, first_line_svc.HostLabel] = {}
+        maker = ctx.db_sessionmaker
+        if maker is not None and (source or target):
+            async with maker() as db:
+                labels = await first_line_svc.labels_for_settings(
+                    db, [source, target], ctx.settings
+                )
+        line = first_line_svc.build(report.verdict, impact, source, target, labels)
+        if line:
+            out[first_line_svc.FIRST_LINE_KEY] = line
+        return out
+    except Exception:
+        _LOGGER.warning("first line: not built for this run", exc_info=True)
+        return {}
 
 
 def _ground_host_claims(report: TriageReport, enriched: Any) -> tuple[TriageReport, int]:
@@ -2686,7 +3091,23 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             kind=kind, session_id=session_id, sequence=sequence_counter[0], payload=payload
         )
 
+    # B4. The gateway attribution of each model phase of this run: the
+    # served_backend of its usage event. Every event passes _audit, so the
+    # loop, the synthesis calls and the swarm all land here.
+    run_served: list[dict[str, Any]] = []
+    # B6. The phases of this run whose model call ran again with low
+    # reasoning. The report carries them, so the page can mark the run.
+    low_reasoning_phases: list[str] = []
+
     async def _audit(ev: StepEvent) -> None:
+        if ev.kind == "usage":
+            backend = ev.payload.get("served_backend")
+            if isinstance(backend, dict) and backend:
+                run_served.append(backend)
+        elif ev.kind == "token_limit_retry":
+            phase = str(ev.payload.get("phase") or "")
+            if phase and phase not in low_reasoning_phases:
+                low_reasoning_phases.append(phase)
         # Audit must never crash the in-flight investigation. The audit logger
         # already swallows ES errors, but a Pydantic ValidationError on
         # AuditKind would propagate before the ES call - catch it here too.
@@ -2768,6 +3189,19 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         err_ev = _ev("error", _error_payload(exc, phase=phase, round_num=0))
         await _audit(err_ev)
         yield err_ev
+
+    async def _emit_token_limit_retries(
+        retried: list[dict[str, Any]],
+    ) -> AsyncGenerator[StepEvent, None]:
+        """Stream each token-limit retry of one model call, and empty the list.
+
+        The event states that the call hit the output token limit and ran one
+        more time with low reasoning. Drive it like ``_emit_egress_blocked``.
+        """
+        while retried:
+            retry_ev = _ev("token_limit_retry", retried.pop(0))
+            await _audit(retry_ev)
+            yield retry_ev
 
     # D2. `alert_id` is the anchor document, which a hunt-subject run needs for
     # its time windows. `subject` says what the run is about, so a reader of
@@ -2883,6 +3317,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         # Change A. The documents that the promoted finding cites. Only the
         # host history gate reads them, and the field stays out of every dump.
         enriched.subject_focus_document_ids = subject.promoted_document_ids()
+        enriched.subject_focus_hosts = subject.promoted_hosts()
         subject_block = subject.render_block()
     enriched_payload = enriched.model_dump(mode="json")
     if subject is not None:
@@ -3341,6 +3776,8 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         # recorded just "Exceeded maximum output retries (3)" with hint=null).
         r1_captured: list[Any] = []
         r1_attr: dict[str, Any] = {}
+        # B6. A token-limit stop runs the call one more time with low reasoning.
+        r1_token_retries: list[dict[str, Any]] = []
         try:
             # Fail-closed residue sweep on the FINAL composed outbound message
             # (after every sanitize_text above): if fail-closed is on and an
@@ -3351,8 +3788,13 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 capture_run_messages() as r1_captured,
                 capture_backend_attribution() as r1_attr,
             ):
-                async with asyncio.timeout(ctx.settings.investigation_turn_timeout_s):
-                    synth_result_round1 = await synth_agent.run(user_msg_round1)
+                synth_result_round1 = await _run_with_token_limit_retry(
+                    synth_agent,
+                    user_msg_round1,
+                    turn_timeout_s=ctx.settings.investigation_turn_timeout_s,
+                    phase="synth_first_round1",
+                    retried=r1_token_retries,
+                )
         except EgressResidueError as e:
             # Blocked egress: the model was NOT called. Audit the block (count
             # only) + emit the paired error event, then land the SAME honest
@@ -3367,6 +3809,8 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             # fall through with a fallback NMI TriageReport so the row in
             # index.jsonl is structured (not verdict=None). The post-validators
             # + triage_report emission below run uniformly on the fallback.
+            async for ev in _emit_token_limit_retries(r1_token_retries):
+                yield ev
             r1_causes = _retry_causes_from_messages(r1_captured)
             r1_served = _served_backend(r1_attr)
             err_ev = _ev(
@@ -3386,6 +3830,8 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             )
             await metrics.get_metrics().record_event("fallback_verdict", {})
         else:
+            async for ev in _emit_token_limit_retries(r1_token_retries):
+                yield ev
             triage_round1 = _strip_model_resolution(synth_result_round1.output)
             if guard is not None:
                 # Restore real identifiers AT THE ASSIGNMENT SOURCE (not at a
@@ -3815,121 +4261,185 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             # later turn raised.
             loop_attr: dict[str, Any] = {}
             inv_result: Any = None
-            try:
-                # Fail-closed residue sweep on the FINAL composed investigator prompt
-                # BEFORE the loop's first model call — if an internal identifier
-                # survived, this raises so the payload never reaches the model.
-                guarded_msg = _guard_egress(guard, inv_user_msg, ctx.settings)
-                if loop.emits_report:
-                    # W3: the loop writes the report, so the vote re-runs the
-                    # loop itself, tools and all. Set before the run, so a run
-                    # cut short at its budget can still vote.
-                    loop.rerun = (investigator, guarded_msg, loop_usage_limits)
-                # Stream the run NODE-BY-NODE via agent.iter() so each tool_call /
-                # tool_result / model_response lands in the timeline THE MOMENT it
-                # happens (the recorder persists every event immediately, FLUSH_EVERY=1)
-                # instead of replaying the whole investigation in one burst at the end.
-                # CallToolsNode carries the model's response (text + tool requests);
-                # the following ModelRequestNode carries that step's tool results.
-                node_msg: Any = None
-                with capture_backend_attribution() as loop_attr:
-                    async with investigator.iter(
-                        guarded_msg, usage_limits=loop_usage_limits
-                    ) as inv_run:
-                        # Advance NODE-BY-NODE with a PER-TURN wall-clock timeout on each
-                        # iterator step (the model-run await that produces the next node),
-                        # NOT one timeout spanning the whole multi-turn loop. Event
-                        # projection + yielding stays outside the timeout so streaming is
-                        # unchanged. A per-turn TimeoutError propagates to the same
-                        # except-handlers below (error event + honest stop) as any other
-                        # investigator failure.
-                        node_iter = inv_run.__aiter__()
-                        while True:
-                            async with asyncio.timeout(ctx.settings.investigation_turn_timeout_s):
-                                try:
-                                    node = await node_iter.__anext__()
-                                except StopAsyncIteration:
-                                    break
-                            # CallToolsNode carries the model's response (text + tool
-                            # requests); the following ModelRequestNode carries that
-                            # step's tool results. Detect by attribute so the message is
-                            # projected the moment its node arrives.
-                            node_msg = getattr(node, "model_response", None)
-                            if node_msg is None:
-                                node_msg = getattr(node, "request", None)
-                            if node_msg is not None:
-                                loop.gathered.append(node_msg)
-                                async for ev in _walk_message(
-                                    node_msg, _ev, phase="investigation_loop", round_num=1
+            inv_run: Any = None
+            # B6. Set when a turn hit the output token limit before a response:
+            # the loop then resumes one time from this history with low
+            # reasoning. None on the first attempt.
+            resume_from: list[Any] | None = None
+            # The counters and the gateway attribution of the stopped attempt.
+            # The counters go into the resumed loop, so its request limit and
+            # its tool-call limit hold for the whole run.
+            stopped_usage: RunUsage | None = None
+            stopped_attr: dict[str, Any] = {}
+            guarded_msg: Any = None
+            while True:
+                try:
+                    # Fail-closed residue sweep on the FINAL composed investigator prompt
+                    # BEFORE the loop's first model call — if an internal identifier
+                    # survived, this raises so the payload never reaches the model.
+                    if resume_from is None:
+                        guarded_msg = _guard_egress(guard, inv_user_msg, ctx.settings)
+                        if loop.emits_report:
+                            # W3: the loop writes the report, so the vote re-runs the
+                            # loop itself, tools and all. Set before the run, so a run
+                            # cut short at its budget can still vote.
+                            loop.rerun = (investigator, guarded_msg, loop_usage_limits)
+                    # Stream the run NODE-BY-NODE via agent.iter() so each tool_call /
+                    # tool_result / model_response lands in the timeline THE MOMENT it
+                    # happens (the recorder persists every event immediately, FLUSH_EVERY=1)
+                    # instead of replaying the whole investigation in one burst at the end.
+                    # CallToolsNode carries the model's response (text + tool requests);
+                    # the following ModelRequestNode carries that step's tool results.
+                    node_msg: Any = None
+                    # The resumed run takes its next request from the history,
+                    # so it gets no new prompt. The first attempt keeps the
+                    # exact call it made before B6.
+                    iter_run = (
+                        investigator.iter(guarded_msg, usage_limits=loop_usage_limits)
+                        if resume_from is None
+                        else investigator.iter(
+                            None,
+                            **_resumed_loop_kwargs(resume_from, loop_usage_limits, stopped_usage),
+                        )
+                    )
+                    # The resumed run yields the last request of the history
+                    # again. That request streamed on the first attempt.
+                    skip_request = resume_from is not None
+                    with capture_backend_attribution() as loop_attr:
+                        async with iter_run as inv_run:
+                            # Advance NODE-BY-NODE with a PER-TURN wall-clock timeout on each
+                            # iterator step (the model-run await that produces the next node),
+                            # NOT one timeout spanning the whole multi-turn loop. Event
+                            # projection + yielding stays outside the timeout so streaming is
+                            # unchanged. A per-turn TimeoutError propagates to the same
+                            # except-handlers below (error event + honest stop) as any other
+                            # investigator failure.
+                            node_iter = inv_run.__aiter__()
+                            while True:
+                                async with asyncio.timeout(
+                                    ctx.settings.investigation_turn_timeout_s
                                 ):
-                                    # The loop converses in label space; restore real
-                                    # values in the streamed timeline events (tool
-                                    # calls/results, reasoning traces) — they are
-                                    # local storage/display, never egress.
-                                    out_ev = (
-                                        ev
-                                        if guard is None
-                                        else ev.model_copy(
-                                            update={"payload": guard.desanitize_obj(ev.payload)}
+                                    try:
+                                        node = await node_iter.__anext__()
+                                    except StopAsyncIteration:
+                                        break
+                                # CallToolsNode carries the model's response (text + tool
+                                # requests); the following ModelRequestNode carries that
+                                # step's tool results. Detect by attribute so the message is
+                                # projected the moment its node arrives.
+                                node_msg = getattr(node, "model_response", None)
+                                if node_msg is None:
+                                    node_msg = getattr(node, "request", None)
+                                    if node_msg is not None and skip_request:
+                                        skip_request = False
+                                        continue
+                                if node_msg is not None:
+                                    loop.gathered.append(node_msg)
+                                    async for ev in _walk_message(
+                                        node_msg, _ev, phase="investigation_loop", round_num=1
+                                    ):
+                                        # The loop converses in label space; restore real
+                                        # values in the streamed timeline events (tool
+                                        # calls/results, reasoning traces) — they are
+                                        # local storage/display, never egress.
+                                        out_ev = (
+                                            ev
+                                            if guard is None
+                                            else ev.model_copy(
+                                                update={"payload": guard.desanitize_obj(ev.payload)}
+                                            )
                                         )
-                                    )
-                                    await _audit(out_ev)
-                                    yield out_ev
-                inv_result = inv_run.result
-            except asyncio.CancelledError:
-                raise  # cooperative cancel — propagate, never swallow
-            except EgressResidueError as e:
-                # Fail-closed block on the investigator prompt — the model was NEVER
-                # called. Audit the block (count only) + emit the paired error event,
-                # then route the convergence below to the HONEST pipeline-fallback.
-                async for ev in _emit_egress_blocked("investigation_loop", e):
-                    yield ev
-                loop.egress_blocked = e
-                return
-            except UsageLimitExceeded as e:
-                # Budget exhaustion is an EXPECTED outcome of a thorough investigation,
-                # NOT an infrastructure failure. The tool calls + model responses
-                # already streamed live above, so don't discard them with status=error
-                # and no verdict: land the round-1 verdict via the same fallback used
-                # when the loop-synth crashes. (This is the "conclude gracefully at the
-                # budget boundary" behaviour, vs. the old "error out" one.)
-                _LOGGER.warning("investigation loop hit budget limit: %s", e)
-                err_ev = _ev(
-                    "error", _error_payload(e, phase="investigation_loop_budget", round_num=1)
-                )
-                await _audit(err_ev)
-                yield err_ev
-                loop.budget_exc = e
-                return
-            except TimeoutError as e:
-                # A per-turn wall-clock timeout (investigation_turn_timeout_s) fired
-                # while advancing the investigator on a slow stack. The evidence
-                # gathered before the hung turn already streamed live, so conclude
-                # GRACEFULLY with the round-1 verdict via the same budget-boundary
-                # fallback as UsageLimitExceeded — do NOT discard the run with
-                # status=error. (Mirrors the hunt runner's timeout→partial-report
-                # behaviour; a slow stack is the expected trigger, not an infra fault.)
-                _LOGGER.warning("investigation loop turn timed out: %s", e)
-                err_ev = _ev(
-                    "error", _error_payload(e, phase="investigation_loop_timeout", round_num=1)
-                )
-                await _audit(err_ev)
-                yield err_ev
-                loop.budget_exc = e
-                return
-            except BaseException as e:
-                # The investigator could not gather evidence — most often a transient
-                # LLM-gateway connection drop (the openai client has already retried
-                # litellm_max_retries times). Do NOT fabricate a needs_more_info
-                # verdict from an empty transcript: that reads as if the agent
-                # investigated and was unsure. Surface an honest error and stop — the
-                # recorder marks the run 'error' (retryable), not a fake verdict.
-                _LOGGER.exception("investigation loop investigator run failed")
-                err_ev = _ev("error", _error_payload(e, phase="investigation_loop", round_num=1))
-                await _audit(err_ev)
-                yield err_ev
-                loop.stopped = True
-                return
+                                        await _audit(out_ev)
+                                        yield out_ev
+                    inv_result = inv_run.result
+                    break
+                except asyncio.CancelledError:
+                    raise  # cooperative cancel — propagate, never swallow
+                except EgressResidueError as e:
+                    # Fail-closed block on the investigator prompt — the model was NEVER
+                    # called. Audit the block (count only) + emit the paired error event,
+                    # then route the convergence below to the HONEST pipeline-fallback.
+                    async for ev in _emit_egress_blocked("investigation_loop", e):
+                        yield ev
+                    loop.egress_blocked = e
+                    return
+                except UsageLimitExceeded as e:
+                    # Budget exhaustion is an EXPECTED outcome of a thorough investigation,
+                    # NOT an infrastructure failure. The tool calls + model responses
+                    # already streamed live above, so don't discard them with status=error
+                    # and no verdict: land the round-1 verdict via the same fallback used
+                    # when the loop-synth crashes. (This is the "conclude gracefully at the
+                    # budget boundary" behaviour, vs. the old "error out" one.)
+                    _LOGGER.warning("investigation loop hit budget limit: %s", e)
+                    err_ev = _ev(
+                        "error", _error_payload(e, phase="investigation_loop_budget", round_num=1)
+                    )
+                    await _audit(err_ev)
+                    yield err_ev
+                    loop.budget_exc = e
+                    return
+                except TimeoutError as e:
+                    # A per-turn wall-clock timeout (investigation_turn_timeout_s) fired
+                    # while advancing the investigator on a slow stack. The evidence
+                    # gathered before the hung turn already streamed live, so conclude
+                    # GRACEFULLY with the round-1 verdict via the same budget-boundary
+                    # fallback as UsageLimitExceeded — do NOT discard the run with
+                    # status=error. (Mirrors the hunt runner's timeout→partial-report
+                    # behaviour; a slow stack is the expected trigger, not an infra fault.)
+                    _LOGGER.warning("investigation loop turn timed out: %s", e)
+                    err_ev = _ev(
+                        "error", _error_payload(e, phase="investigation_loop_timeout", round_num=1)
+                    )
+                    await _audit(err_ev)
+                    yield err_ev
+                    loop.budget_exc = e
+                    return
+                except BaseException as e:
+                    # The investigator could not gather evidence — most often a transient
+                    # LLM-gateway connection drop (the openai client has already retried
+                    # litellm_max_retries times). Do NOT fabricate a needs_more_info
+                    # verdict from an empty transcript: that reads as if the agent
+                    # investigated and was unsure. Surface an honest error and stop — the
+                    # recorder marks the run 'error' (retryable), not a fake verdict.
+                    #
+                    # B6. One class runs again: a turn that hit the output token
+                    # limit before a response. The loop resumes one time from
+                    # the history before that turn, with low reasoning. The
+                    # tool results that streamed stay, and no tool runs twice.
+                    history = (
+                        _resume_history(loop.gathered)
+                        if resume_from is None and is_token_limit_before_response(e)
+                        else []
+                    )
+                    if history:
+                        retry_ev = _ev(
+                            "token_limit_retry",
+                            _token_limit_retry_payload("investigation_loop", e),
+                        )
+                        await _audit(retry_ev)
+                        yield retry_ev
+                        # The counters of the stopped attempt carry over into
+                        # the resumed loop, so the limits of the loop do not
+                        # start again from zero. The usage of the resumed loop
+                        # then holds them, and the stopped attempt writes no
+                        # usage event of its own.
+                        stopped_usage = _run_usage(inv_run)
+                        stopped_attr = dict(loop_attr)
+                        _LOGGER.warning(
+                            "investigation loop: the model hit its output token limit "
+                            "before a response. The loop resumes one time with low reasoning."
+                        )
+                        loop.gathered[:] = history
+                        resume_from = history
+                        continue
+                    _LOGGER.exception("investigation loop investigator run failed")
+                    err_ev = _ev(
+                        "error", _error_payload(e, phase="investigation_loop", round_num=1)
+                    )
+                    await _audit(err_ev)
+                    yield err_ev
+                    loop.stopped = True
+                    return
 
             if inv_result is None:
                 # No End node and no exception: the convergence below lands the
@@ -3937,7 +4447,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 return
             loop.output = inv_result.output
             loop.messages = inv_result.all_messages()
-            loop.served_backend = _served_backend(loop_attr)
+            loop.served_backend = _served_backend(_with_stopped_fallback(loop_attr, stopped_attr))
             loop.usage = _run_usage(inv_result)
             if loop.emits_report:
                 loop.report_path = "investigator"
@@ -4147,6 +4657,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             # live only in the run's RetryPromptParts.
             ls_captured: list[Any] = []
             ls_attr: dict[str, Any] = {}
+            ls_token_retries: list[dict[str, Any]] = []
             try:
                 # Fail-closed residue sweep on the FINAL composed loop-synth
                 # message before the model call — raises BEFORE egress on residue.
@@ -4155,11 +4666,14 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                     capture_run_messages() as ls_captured,
                     capture_backend_attribution() as ls_attr,
                 ):
-                    async with asyncio.timeout(ctx.settings.investigation_turn_timeout_s):
-                        loop_synth_result = await loop_synth.run(
-                            loop_synth_msg,
-                            usage_limits=loop_usage_limits,
-                        )
+                    loop_synth_result = await _run_with_token_limit_retry(
+                        loop_synth,
+                        loop_synth_msg,
+                        turn_timeout_s=ctx.settings.investigation_turn_timeout_s,
+                        phase="investigation_loop_synth",
+                        retried=ls_token_retries,
+                        usage_limits=loop_usage_limits,
+                    )
             except asyncio.CancelledError:
                 raise  # cooperative cancel — propagate, never swallow
             except EgressResidueError as e:
@@ -4178,6 +4692,8 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 # Catch it, record the error, and DON'T discard the evidence: a
                 # settled round-1 verdict stands, and with none the gathered
                 # history is replayed (same rule as the budget cut).
+                async for ev in _emit_token_limit_retries(ls_token_retries):
+                    yield ev
                 ls_causes = _retry_causes_from_messages(ls_captured)
                 ls_served = _served_backend(ls_attr)
                 err_ev = _ev(
@@ -4203,6 +4719,8 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 ):
                     yield ev
             else:
+                async for ev in _emit_token_limit_retries(ls_token_retries):
+                    yield ev
                 report_path = "synth_round2"
                 triage_final = _strip_model_resolution(loop_synth_result.output)
                 if guard is not None:
@@ -4322,6 +4840,7 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 user_msg_round2 = guard.sanitize_text(user_msg_round2)
             r2_captured: list[Any] = []
             r2_attr: dict[str, Any] = {}
+            r2_token_retries: list[dict[str, Any]] = []
             try:
                 # Fail-closed residue sweep on the FINAL composed round-2 message
                 # before the model call — raises BEFORE egress on residue.
@@ -4330,8 +4849,13 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                     capture_run_messages() as r2_captured,
                     capture_backend_attribution() as r2_attr,
                 ):
-                    async with asyncio.timeout(ctx.settings.investigation_turn_timeout_s):
-                        synth_result_round2 = await synth_agent.run(user_msg_round2)
+                    synth_result_round2 = await _run_with_token_limit_retry(
+                        synth_agent,
+                        user_msg_round2,
+                        turn_timeout_s=ctx.settings.investigation_turn_timeout_s,
+                        phase="synth_first_round2",
+                        retried=r2_token_retries,
+                    )
             except asyncio.CancelledError:
                 raise  # cooperative cancel — propagate, never swallow
             except EgressResidueError as e:
@@ -4352,6 +4876,8 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 # per-attempt schema-validation causes off the captured run so a
                 # round-2 retry-exhaustion isn't the hint=null blind spot the
                 # retry_causes feature closed for round-1/loop-synth.
+                async for ev in _emit_token_limit_retries(r2_token_retries):
+                    yield ev
                 r2_causes = _retry_causes_from_messages(r2_captured)
                 r2_served = _served_backend(r2_attr)
                 err_ev = _ev(
@@ -4374,6 +4900,8 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 phase_d_synth_ok = False
                 break
             else:
+                async for ev in _emit_token_limit_retries(r2_token_retries):
+                    yield ev
                 phase_d_synth_ok = True
                 triage_final = _strip_model_resolution(synth_result_round2.output)
                 if guard is not None:
@@ -4428,6 +4956,9 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
     # three runs at 8 tool calls each, and a vote that dropped every run cut
     # at the budget collapsed it into single runs.
     vote_samples = int(getattr(ctx.settings, "verdict_consistency_samples", 1) or 1)
+    # B2. The step of a vote that changes the verdict, for the verdict change
+    # record. Empty when no vote ran or the vote kept the verdict.
+    vote_change_audit: dict[str, Any] = {}
     if vote_samples > 1 and final_synth_rerun is not None:
         sample_agent, sample_msg, sample_limits = final_synth_rerun
         sample_reports: list[TriageReport] = [triage_final]
@@ -4550,6 +5081,16 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 representative = max(sample_reports, key=lambda r: r.confidence)
             else:
                 representative = next(r for r in sample_reports if r.verdict == voted_verdict)
+            # B2. A vote that changes the verdict of the first report is a
+            # step of the verdict change record, as a gate is.
+            if voted_verdict != triage_final.verdict:
+                vote_change_audit = {
+                    VOTE_STEP: {
+                        "original_verdict": triage_final.verdict,
+                        "voted_verdict": voted_verdict,
+                        "tally": vote_tally,
+                    }
+                }
             triage_final = representative.model_copy(
                 update={
                     "verdict": voted_verdict,
@@ -4708,6 +5249,13 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         await _audit(ev)
         yield ev
 
+    # H2. The impact guard changed `succeeded` to `attempted`: the report
+    # cites no fetched record with content of the event.
+    if IMPACT_GATE in validation_audit:
+        ev = _ev(IMPACT_GATE, validation_audit[IMPACT_GATE])
+        await _audit(ev)
+        yield ev
+
     # ----- Host coverage grounding -----
     # A sentence that says a host has no host telemetry is false while the
     # prefetch read any plane for that host. Production stored twelve of them
@@ -4726,9 +5274,25 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
     # The local verdict is preserved in the audit via `local_verdict` in the
     # oracle_escalation event so evaluators can compare both.
     local_triage_final = triage_final  # snapshot before any Oracle override
+    # B2. The verdict change that the gates above made, as one record. The
+    # summary keeps the text of the model, so the record is how the report,
+    # the page and the Oracle learn of the change.
+    # ``change_audit`` holds each step that changed the verdict that stands:
+    # the vote, then the gates. A later step is added to it, so the record
+    # keeps the verdict of the model as its origin.
+    change_audit: dict[str, Any] = {**vote_change_audit, **validation_audit}
+    verdict_change = verdict_change_from_audit(change_audit)
+    # H2. The impact change of the guard, as one record, like the verdict
+    # change above. An Oracle report replaces it with its own.
+    impact_change = impact_change_from_audit(validation_audit)
     # True when the Oracle answered with a different class and no evidence: its
     # answer is an opinion on the run, and the auto-acknowledge never fires.
     oracle_opinion_withheld = False
+    # H3. The reasoning of the Oracle, when its answer holds an analyst
+    # summary. The report stores it in its own field, apart from the summary.
+    oracle_reasoning: str | None = None
+    # True from the moment the report of the run is the report of the Oracle.
+    oracle_wrote_report = False
     # The class that ran. A cheap run never reaches the Oracle.
     final_run_class = budget.ran_class(class_plan, ran_loop=ran_investigation_loop)
     # The Oracle rule mode decides (classic, shadow or uncertainty). The reason
@@ -4743,6 +5307,23 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         run_class=final_run_class,
     )
     escalation_reason = rule_decision.reason
+    # B4. What served this run. A true positive from a fallback route, or a
+    # verdict from one that changes an earlier verdict of the same alert, goes
+    # to the Oracle when no other rule sent it.
+    served_model = served_model_record(run_served)
+    if escalation_reason is None and served_model is not None and served_model["fallback"]:
+        earlier_verdicts = [str(d.get("verdict") or "") for d in session_digests]
+        if subject is None:
+            earlier_alert = await _earlier_alert_verdict(ctx, alert_id)
+            if earlier_alert:
+                earlier_verdicts.append(earlier_alert)
+        escalation_reason = fallback_route_reason(
+            triage_final,
+            served_model,
+            ctx.settings,
+            earlier_verdicts=earlier_verdicts,
+            run_class=final_run_class,
+        )
     if rule_decision.mode == "shadow" and (
         rule_decision.classic_reason is not None or rule_decision.uncertainty_reason is not None
     ):
@@ -4844,7 +5425,9 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         oracle_result = await _oracle_client.adjudicate(
             ctx,
             enriched=enriched,
-            local_report=triage_final,
+            # The copy for the Oracle opens its summary with the verdict
+            # change of a gate (B2). The stored report keeps the model text.
+            local_report=oracle_view(triage_final, verdict_change),
             transcript_text=transcript_text,
             loop_messages=loop_messages,
             evidence_bullets=loop_evidence_bullets,
@@ -4909,6 +5492,18 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             oracle_report = _refuse_benign_verdict_without_baseline(
                 oracle_report, enriched, oracle_audit
             )
+            # H2. The impact guard, Oracle path parity. An Oracle `succeeded`
+            # needs a cited record with content of the event, like a local
+            # one. The records are the ones this run fetched. The citations
+            # are the ones of the report plus the ones the Oracle named.
+            oracle_report = _settle_impact(
+                oracle_report,
+                enriched,
+                oracle_audit,
+                messages=targeted_messages,
+                tool_results=targeted_results_all,
+                extra_citations=oracle_result.oracle_citations,
+            )
             # The host history gate (_downgrade_ungrounded_host_anchored_tp)
             # does not run on the Oracle report. Owner rule of 2026-10-30: the
             # gate must not override an Oracle true positive. On 2026-10-29 the
@@ -4918,14 +5513,17 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
             # (the override gate above and oracle/client.py). That rule accepts
             # any prefetched pivot id, so on an alert run the removal is a
             # policy choice and not a proof. When the local gate fired,
-            # local_summary opens with _HOST_ANCHORED_TP_LEAD, so the Oracle
-            # reads the change. The ICMP (Fix M2) and no-baseline guards stay.
+            # local_summary opens with _HOST_ANCHORED_TP_LEAD (oracle_view), so
+            # the Oracle reads the change. The ICMP (Fix M2) and no-baseline
+            # guards stay.
+            answer_reasoning = oracle_result.oracle_reasoning
             if guard is not None:
                 # The Oracle desanitizes its OWN labels (its independent
                 # pipeline/mapping), but the loop-transcript text it was shown
                 # can carry THIS guard's labels — if it echoed any (e.g.
                 # HOST_01 quoted from loop evidence), restore them too.
                 oracle_report = _desanitize_report(oracle_report, guard)
+                answer_reasoning = str(guard.desanitize_obj(answer_reasoning))
 
             adj_ev = _ev(
                 "oracle_adjudication",
@@ -4991,10 +5589,31 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
                 # applied at the _verdict_to_report seam); do NOT relabel it as an
                 # Oracle override.
                 triage_final = local_triage_final
+            elif oracle_result.analyst_summary:
+                # H3. The answer holds a text for the analyst. It is the
+                # summary of the run as the Oracle wrote it, with no mark and
+                # no reasoning in it. The reasoning has its own field, and the
+                # page shows the Oracle on its own card.
+                triage_final = oracle_report.model_copy()
+                oracle_reasoning = answer_reasoning.strip() or None
             else:
-                # Mark the Oracle report so UI/audit shows it was adjudicated.
+                # An answer of the earlier prompt has no analyst summary. The
+                # run keeps the text of the earlier release: the mark, the
+                # summary and the reasoning in one field.
                 adjudicated_summary = f"[Oracle adjudicated] {oracle_report.summary}"
                 triage_final = oracle_report.model_copy(update={"summary": adjudicated_summary})
+            if triage_final is not local_triage_final:
+                oracle_wrote_report = True
+                # The verdict is the verdict of the Oracle now. The change of a
+                # local gate no longer describes it. A guard that changed the
+                # Oracle report does (B2).
+                change_audit = dict(oracle_audit)
+                verdict_change = verdict_change_from_audit(change_audit)
+                impact_change = impact_change_from_audit(oracle_audit)
+                if impact_change is not None:
+                    impact_ev = _ev(IMPACT_GATE, {**oracle_audit[IMPACT_GATE], "report": "oracle"})
+                    await _audit(impact_ev)
+                    yield impact_ev
                 # The Oracle's own loop is retrieval too, and the verdict below
                 # is now the Oracle's. A single-shot adjudication reports 0 and
                 # adds nothing.
@@ -5065,6 +5684,51 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         session_gate_ev = _ev("session_verdict_conflict", session_gate_audit)
         await _audit(session_gate_ev)
         yield session_gate_ev
+        # The same-session gate has the last word. Its step joins the steps
+        # before it, so the record keeps the verdict of the model as its
+        # origin: a true positive that the ICMP gate set to a false positive
+        # and this gate then held read "from a false positive" (B2).
+        change_audit = {**change_audit, "session_verdict_conflict": session_gate_audit}
+        verdict_change = verdict_change_from_audit(change_audit)
+
+    # ----- The actions and the text the analyst gets -----
+    # After the last word on the verdict, so the acknowledge of a cheap false
+    # positive is offered on the verdict that stands. Every path loses a case
+    # comment that can have no case; the cheap path also loses its prompt talk
+    # (soc_ai.agent.budget.settle_report_actions).
+    if oracle_wrote_report:
+        # H3. An Oracle true positive gets the action a local true positive
+        # gets. The Oracle writes a verdict and text, and no action.
+        promoted = subject.promoted_finding if subject is not None else None
+        triage_final, escalate_added = budget.oracle_true_positive_action(
+            triage_final,
+            alert_id=alert_id,
+            rule_name=(promoted.title if promoted is not None else None)
+            or getattr(enriched.alert, "rule_name", None),
+        )
+        if escalate_added:
+            _LOGGER.info("oracle true positive for alert %s: escalate action added", alert_id)
+    settled_final, settle_audit = budget.settle_report_actions(
+        triage_final, alert_id=alert_id, run_class=final_run_class
+    )
+    if settle_audit is not None:
+        # The checks below ask "did the Oracle write this report" by identity.
+        # A settled local report is still the local report.
+        if triage_final is local_triage_final:
+            local_triage_final = settled_final
+        triage_final = settled_final
+        _LOGGER.info("report settled for alert %s: %s", alert_id, settle_audit)
+        if settle_audit["dropped_case_comments"]:
+            actions_ev = _ev(
+                "recommended_actions_blocked",
+                {
+                    "blocked_count": settle_audit["dropped_case_comments"],
+                    "reason": "no_case_for_comment",
+                    "tools": ["add_case_comment"],
+                },
+            )
+            await _audit(actions_ev)
+            yield actions_ev
 
     # ----- Final triage emit -----
     # W3 A/B provenance on the report itself, so a stored run answers "which
@@ -5078,18 +5742,76 @@ async def _run_synth_first_pipeline(  # noqa: PLR0912, PLR0915 - multi-phase pip
         triage_final = triage_final.model_copy(
             update={"resolution": {**triage_final.resolution, "report_path": report_path}}
         )
+    # H2. The impact of the verdict that stands, and the first line. The
+    # impact is one of the four values for a true positive and None for every
+    # other verdict, whatever a later step did to the verdict.
+    final_impact = settled_impact(triage_final.verdict, triage_final.impact)
+    if impact_change is not None and impact_change.get("to_impact") != final_impact:
+        impact_change = None
+    first_line_fields = await _first_line_fields(ctx, triage_final, final_impact, enriched, subject)
+    # The stage of a finding run, for the stage ladder of a campaign. The
+    # stage is the claim of the local report: the Oracle states none, so its
+    # report keeps the local claim. The impact that stands decides if a stage
+    # above attempt stands.
+    final_stage = settled_stage(
+        triage_final.verdict,
+        triage_final.stage or local_triage_final.stage,
+        final_impact,
+        finding=subject is not None and subject.promoted_finding is not None,
+    )
     triage_ev = _ev(
         "triage_report",
         {
             "verdict": triage_final.verdict,
             "confidence": triage_final.confidence,
-            "summary": triage_final.summary,
+            # H2. Null for every verdict that is no true positive.
+            "impact": final_impact,
+            # The change of the impact guard, in its own field: the gate, the
+            # impact before and after, the reason and the missing evidence
+            # (gates.impact_change_from_audit). Key ABSENT when the guard
+            # changed nothing.
+            **({"impact_change": impact_change} if impact_change else {}),
+            # The stage of a finding run. Key ABSENT on every other run and on
+            # a finding run that states none.
+            **({"stage": final_stage} if final_stage else {}),
+            # The first line, the two ends and the event time. Each key is
+            # ABSENT when the run has no value for it.
+            **first_line_fields,
+            # H3. The reasoning of the Oracle, apart from the summary. Key
+            # ABSENT on a local report and on an Oracle answer with no
+            # analyst summary.
+            **(
+                {"oracle_reasoning": oracle_reasoning}
+                if oracle_reasoning and oracle_wrote_report
+                else {}
+            ),
+            # The summary, and ``model_summary`` when a gate refuted the claim
+            # of the model: the stored summary then leads with the reason of
+            # the gate, so no list shows a headline that contradicts the
+            # verdict (gates.report_text).
+            **report_text(triage_final.summary, verdict_change),
             "citations": triage_final.citations,
             "recommended_actions": [
                 a.model_dump(mode="json") for a in triage_final.recommended_actions
             ],
             "field_reconciliation": triage_final.field_reconciliation,
             "validator_note": triage_final.validator_note,
+            # B2. The verdict change of a gate, in its own field: the gate, the
+            # verdict before and after, the reason and the missing evidence
+            # (gates.verdict_change_from_audit). Key ABSENT when no gate
+            # changed the verdict, so every other report keeps its shape.
+            **({"verdict_change": verdict_change} if verdict_change else {}),
+            # B4. What served this run: the gateway model groups, the models
+            # that its calls asked for and the fallback mark
+            # (served_model_record). Key ABSENT when no call has an attribution.
+            **({"served_model": served_model} if served_model else {}),
+            # B6. The phases whose model call hit the output token limit and
+            # ran again with low reasoning. Key ABSENT on every other run.
+            **(
+                {"low_reasoning_retry": {"phases": list(low_reasoning_phases)}}
+                if low_reasoning_phases
+                else {}
+            ),
             # Pipeline-fallback provenance marker (E1.2). Present ONLY on the
             # synth-failure path (`_synth_failure_fallback_report`) — a real
             # verdict leaves it None and it's dropped below. The persisted report
@@ -5180,8 +5902,10 @@ __all__ = [
     "build_synthesizer",
     "build_synthesizer_model",
     "classic_oracle_escalation_reason",
+    "fallback_route_reason",
     "investigate",
     "maybe_auto_ack_fp",
     "oracle_escalation_reason",
     "oracle_rule_decision",
+    "served_model_record",
 ]

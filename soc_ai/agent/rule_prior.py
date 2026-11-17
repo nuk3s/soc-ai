@@ -12,7 +12,17 @@ rule gets the noise as cover. So it holds only when all six safeguards of
 decision 2 hold (docs/dev/specs/2026-10-04-four-tier-detection-methodology.md,
 "Rule prior safeguards"):
 
-1. Both endpoints sit inside the estate. An external endpoint always runs.
+1. Both addresses are internal, or the external address is known. With one
+   internal and one external address, the external address is known when two
+   or more model-backed false positives of the rule in the last 7 days had the
+   same internal address and an external address that matches: the same
+   address, the same IPv4 /24 or IPv6 /64 network, or the same name of the
+   external end when both alerts carry one. A name counts only when the
+   external address is the destination of both flows, because a TLS server
+   name, an HTTP host and a DNS query name the destination. Such a cover
+   records the reason ``covered_known_external``, and a held one
+   ``external_endpoint_new``. Two external addresses always get the model
+   (``external_endpoint``).
 2. At least ``rule_prior_min_runs`` (five or more) model-backed false
    positives of the rule in the last 7 days, every model-backed verdict in
    that window a false positive, and one of them in the last 24 hours. The
@@ -28,6 +38,12 @@ decision 2 hold (docs/dev/specs/2026-10-04-four-tier-detection-methodology.md,
    still gets a real run. A real run that disagrees with the prior suspends it
    for the rule until an analyst clears it on the Detection tuning panel.
 
+One more hold sits beside the six: an alert with an address of a party of an
+open campaign always gets the model (``campaign_machine``). The alert can be
+the next stage of the campaign. A campaign that an analyst closed holds no
+machine. The read takes the stored campaign rows and
+never rebuilds a campaign.
+
 ``rule_prior_mode`` decides what a covered alert gets. ``shadow`` (the
 default) runs the model as before and records the decision beside the real
 verdict. ``live`` records the prior's verdict and skips the model, except for
@@ -36,7 +52,8 @@ alert is checked, and a disagreement suspends the rule the same way a sampled
 one does in live mode.
 
 Fail closed: a store error, a nomination the grid could not answer, an
-unknown severity or a missing endpoint means the prior does not apply.
+unknown severity, a missing or unreadable address or an unreadable name means
+the prior does not apply.
 """
 
 from __future__ import annotations
@@ -63,8 +80,21 @@ MODE_OFF = "off"
 MODE_SHADOW = "shadow"
 MODE_LIVE = "live"
 
-COVERED = "covered"
+COVERED = store.COVERED
+CAMPAIGN_MACHINE = "campaign_machine"
+COVERED_KNOWN_EXTERNAL = store.COVERED_KNOWN_EXTERNAL
+EXTERNAL_ENDPOINT = "external_endpoint"
+EXTERNAL_ENDPOINT_NEW = "external_endpoint_new"
 WOULD_VERDICT = "false_positive"
+
+# Safeguard 1: the model-backed false positives on the same internal address
+# that make an external address known, and the network of a match.
+KNOWN_EXTERNAL_RUNS = 2
+_V4_PREFIX = 24
+_V6_PREFIX = 64
+# How many candidate runs the name match reads. More candidates give no
+# match, so the cap can only hold an alert back.
+_NAME_CANDIDATES_MAX = 200
 
 # Severity labels the alert feed carries. Anything else is unknown.
 _KNOWN_SEVERITIES = frozenset({"critical", "high", "medium", "low"})
@@ -80,6 +110,9 @@ class PriorTarget:
     dst_ip: str
     severity: str = ""
     host_name: str = ""
+    # The names of the external end that the alert document carries: the TLS
+    # server name, the HTTP host, the DNS query. Empty when it carries none.
+    external_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -111,6 +144,76 @@ def _inside(value: str, cidrs: Sequence[Any]) -> bool:
         except TypeError:
             continue
     return False
+
+
+_Address = ipaddress.IPv4Address | ipaddress.IPv6Address
+
+
+@dataclass(frozen=True)
+class _Ends:
+    """The two addresses of a flow with one internal and one external end."""
+
+    internal: _Address
+    external: _Address
+    # The external address is the destination of the flow.
+    outbound: bool
+
+
+def _address(value: str | None) -> _Address | None:
+    try:
+        return ipaddress.ip_address((value or "").strip())
+    except ValueError:
+        return None
+
+
+def _ends(src: str | None, dst: str | None, cidrs: Sequence[Any]) -> _Ends | None:
+    """The ends of a flow with exactly one internal address, else None."""
+    src_addr, dst_addr = _address(src), _address(dst)
+    if src_addr is None or dst_addr is None:
+        return None
+    src_in, dst_in = _inside(str(src_addr), cidrs), _inside(str(dst_addr), cidrs)
+    if src_in and not dst_in:
+        return _Ends(internal=src_addr, external=dst_addr, outbound=True)
+    if dst_in and not src_in:
+        return _Ends(internal=dst_addr, external=src_addr, outbound=False)
+    return None
+
+
+def _same_network(left: _Address, right: _Address) -> bool:
+    if left.version != right.version:
+        return False
+    prefix = _V4_PREFIX if left.version == 4 else _V6_PREFIX
+    return right in ipaddress.ip_network(f"{left}/{prefix}", strict=False)
+
+
+async def _known_external(
+    db: AsyncSession, target: PriorTarget, ends: _Ends, runs: Sequence[Any], cidrs: Sequence[Any]
+) -> list[Any]:
+    """The false positives of the window that make the external address known.
+
+    Newest first. A run counts when its internal address is the internal
+    address of the alert and its external address matches: the same address,
+    the same network, or a shared name of the external end.
+    """
+    names = frozenset(
+        n for n in (store.normalize_name(v) for v in target.external_names) if n is not None
+    )
+    matched: set[str] = set()
+    by_name: list[str] = []
+    for run in runs:
+        if run.verdict != WOULD_VERDICT:
+            continue
+        run_ends = _ends(run.src_ip, run.dest_ip, cidrs)
+        if run_ends is None or run_ends.internal != ends.internal:
+            continue
+        if run_ends.external == ends.external or _same_network(run_ends.external, ends.external):
+            matched.add(run.id)
+        elif names and ends.outbound and run_ends.outbound:
+            by_name.append(run.id)
+    if len(matched) < KNOWN_EXTERNAL_RUNS and by_name:
+        stored = await store.stored_external_names(db, by_name[:_NAME_CANDIDATES_MAX])
+        matched.update(run_id for run_id, held in stored.items() if names & held)
+    return [run for run in runs if run.id in matched]
 
 
 def mode_of(settings: Any) -> str:
@@ -165,11 +268,16 @@ def precheck(target: PriorTarget, cidrs: Sequence[Any]) -> PriorDecision | None:
         return _hold("critical_severity")
     if severity not in _KNOWN_SEVERITIES:
         return _hold("severity_unknown")
-    # Safeguard 1: both endpoints inside the estate.
+    # Safeguard 1: both addresses internal, or one external address that the
+    # store must show as known (``_evaluate``). Two external addresses, or an
+    # address that does not parse, always get the model.
     if not target.src_ip or not target.dst_ip:
         return _hold("no_flow_endpoints")
-    if not (_inside(target.src_ip, cidrs) and _inside(target.dst_ip, cidrs)):
-        return _hold("external_endpoint")
+    src_in, dst_in = _inside(target.src_ip, cidrs), _inside(target.dst_ip, cidrs)
+    if src_in and dst_in:
+        return None
+    if _ends(target.src_ip, target.dst_ip, cidrs) is None:
+        return _hold(EXTERNAL_ENDPOINT)
     return None
 
 
@@ -186,6 +294,10 @@ async def _evaluate(
     held = precheck(target, cidrs)
     if held is not None:
         return held
+    # A machine of an open campaign always gets the model: the alert can be
+    # the next stage of the campaign.
+    if await store.in_open_campaign(db, (target.src_ip, target.dst_ip), now=now):
+        return _hold(CAMPAIGN_MACHINE)
     # Safeguard 4: the detection tuning panel nominates the rule.
     if nominated is None:
         return _hold("nomination_unavailable")
@@ -209,6 +321,15 @@ async def _evaluate(
     newest = runs[0]
     if newest.created_at < now - timedelta(hours=LAPSE_HOURS):
         return _hold("lapsed", runs_in_window=len(runs))
+    # Safeguard 1: an external address must be known for this rule on this
+    # internal machine. The source is then the newest run that knows it.
+    source, reason = newest, COVERED
+    ends = _ends(target.src_ip, target.dst_ip, cidrs)
+    if ends is not None:
+        known = await _known_external(db, target, ends, runs, cidrs)
+        if len(known) < KNOWN_EXTERNAL_RUNS:
+            return _hold(EXTERNAL_ENDPOINT_NEW, runs_in_window=len(runs))
+        source, reason = known[0], COVERED_KNOWN_EXTERNAL
     # Safeguard 3: the prior yields to tier 2 and tier 3.
     if await store.hosts_have_tier2_signal(
         db,
@@ -220,20 +341,23 @@ async def _evaluate(
     rate = float(getattr(settings, "rule_prior_sample_rate", 0.02) or 0.0)
     return PriorDecision(
         applies=True,
-        reason=COVERED,
+        reason=reason,
         sampled=rng.random() < rate,
-        source_id=newest.id,
+        source_id=source.id,
         would_verdict=WOULD_VERDICT,
-        would_confidence=newest.confidence,
+        would_confidence=source.confidence,
         runs_in_window=len(runs),
     )
 
 
 _PRIOR_NOTE = (
-    "The rule prior covered this alert. No model ran on it. The verdict, the "
+    "The rule prior covered this alert. The model did not read it. The verdict, the "
     "rationale and the citations come from investigation {source} of the same rule. "
-    "{runs} model runs of the rule ended false positive in the last {days} days. "
-    "Re-run the investigation to have the model read this alert."
+    "{runs} investigations of the rule by the model ended false positive in the last "
+    "{days} days.{external} Re-run the investigation to have the model read this alert."
+)
+_PRIOR_NOTE_EXTERNAL = (
+    " Two or more of them had the same internal address and a matching external address."
 )
 
 
@@ -261,7 +385,12 @@ async def record_prior_run(
     if source is None:
         return None
     source_report = source.report if isinstance(source.report, dict) else {}
-    note = _PRIOR_NOTE.format(source=source.id, runs=decision.runs_in_window, days=WINDOW_DAYS)
+    note = _PRIOR_NOTE.format(
+        source=source.id,
+        runs=decision.runs_in_window,
+        days=WINDOW_DAYS,
+        external=_PRIOR_NOTE_EXTERNAL if decision.reason == COVERED_KNOWN_EXTERNAL else "",
+    )
     source_summary = str(source_report.get("summary") or source.summary or "")
     report: dict[str, Any] = {
         "verdict": source.verdict,
@@ -272,7 +401,7 @@ async def record_prior_run(
         # actions name the source run's alert.
         "recommended_actions": [],
         "run_class": store.RULE_PRIOR_CLASS,
-        "run_class_reason": COVERED,
+        "run_class_reason": decision.reason,
         "rule_prior": {
             "source_investigation_id": source.id,
             "runs_in_window": decision.runs_in_window,
@@ -319,8 +448,13 @@ async def record_prior_run(
 
 
 __all__ = [
+    "CAMPAIGN_MACHINE",
     "COVERED",
+    "COVERED_KNOWN_EXTERNAL",
+    "EXTERNAL_ENDPOINT",
+    "EXTERNAL_ENDPOINT_NEW",
     "FRESH_OBSERVATION_HOURS",
+    "KNOWN_EXTERNAL_RUNS",
     "LAPSE_HOURS",
     "MODE_LIVE",
     "MODE_OFF",

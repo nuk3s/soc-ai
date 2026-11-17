@@ -77,11 +77,17 @@ beforeEach(() => {
 });
 
 describe('RunClassChip', () => {
-  it.each(['cheap', 'standard', 'deep', 'rule_prior'])('names the %s class with its tooltip', (cls) => {
+  // K3: standard is the default depth and shows no chip.
+  it.each(['cheap', 'deep', 'rule_prior'])('names the %s class with its tooltip', (cls) => {
     render(<RunClassChip runClass={cls} />);
     const chip = screen.getByTestId('run-class-chip');
     expect(chip).toHaveTextContent(CHIP_RUN_CLASS[cls].label);
     expect(chip).toHaveAttribute('title', CHIP_RUN_CLASS[cls].title);
+  });
+
+  it('renders nothing for the default class, standard', () => {
+    const { container } = render(<RunClassChip runClass="standard" />);
+    expect(container).toBeEmptyDOMElement();
   });
 
   it('renders nothing for a run with no recorded class', () => {
@@ -136,7 +142,7 @@ describe('Investigations list: run class chip', () => {
   it('shows the depth chip only where a depth is recorded or pending', async () => {
     vi.mocked(listInvestigations).mockResolvedValue(
       invList([
-        invRow({ id: 'A', alertId: 'ev-a', runClass: 'standard' }),
+        invRow({ id: 'A', alertId: 'ev-a', runClass: 'deep' }),
         invRow({ id: 'B', alertId: 'ev-b', runClass: null }),
         invRow({ id: 'C', alertId: 'ev-c', runClass: null, status: 'running', verdict: 'untriaged' }),
       ]),
@@ -146,7 +152,7 @@ describe('Investigations list: run class chip', () => {
         <Investigations />
       </MemoryRouter>,
     );
-    expect(await screen.findByTestId('run-class-A')).toHaveTextContent('Depth: standard');
+    expect(await screen.findByTestId('run-class-A')).toHaveTextContent('Depth: deep');
     expect(screen.queryByTestId('run-class-B')).toBeNull();
     expect(screen.getByTestId('run-class-C')).toHaveTextContent('Depth: pending');
   });

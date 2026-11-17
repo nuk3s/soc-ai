@@ -6,12 +6,14 @@
 //
 // Every number in the tile now names the unit and the window it answers for.
 //
-// Dogfood 2026-10-06 (S6): the tile read "0 of 2 detection groups" for 7 days
-// while the Investigations list said 15 true positives for the same 7 days.
-// The tile now reads the list's own count, from the list's own query.
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+// Review 2026-11-12 (ui-core 3): the tile said 3 and the outcomes card said 0
+// for one window, and no element named the hosts. The tile now states the
+// total of the Confirmed threats panel, from the same answer, and the panel
+// is the first block of the page.
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { describe, expect, it, vi } from 'vitest';
+import type { ThreatList } from '../lib/api';
 import type { AlertGroup, InvestigationList, InvestigationRow, Verdict } from '../lib/types';
 
 const group = (id: string, verdict: Verdict): AlertGroup => ({
@@ -36,6 +38,7 @@ const GROUPS: [string, Verdict][] = [
 ];
 
 const listInvestigations = vi.hoisted(() => vi.fn());
+const getThreats = vi.hoisted(() => vi.fn());
 
 const empty = (): InvestigationList => ({
   rows: [] as InvestigationRow[],
@@ -54,6 +57,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
   getDossierConflicts: vi.fn().mockResolvedValue({ pending: 0, rows: [] }),
   getQualityEvalStatus: vi.fn().mockResolvedValue({ running: false }),
   listInvestigations,
+  getThreats,
   getAutoTriageStatus: vi.fn().mockResolvedValue({ active: false, hunted: 0, total: 0 }),
   getDataSources: vi.fn().mockResolvedValue({ sources: [] }),
   getQualityTrend: vi.fn().mockResolvedValue({ points: [] }),
@@ -83,19 +87,51 @@ const fallback = (id: string): InvestigationRow => ({
   fallback: true,
 });
 
-/** The list query of the tile: a window and one row, no verdict filter. */
-const isTileQuery = (q: { verdict?: string[]; limit?: number; since?: string } = {}) =>
-  !q.verdict?.length && q.limit === 1 && !!q.since;
+const threatsOf = (total: number): ThreatList => ({
+  window: { since: new Date(Date.now() - 86_400_000).toISOString(), until: new Date().toISOString() },
+  rows: [
+    {
+      target: { address: '10.20.30.5', name: 'mainsrv', role: 'web server', machineKey: 'agent:m1' },
+      direction: 'inbound',
+      headline: 'An exploit chain ran against the web server.',
+      impact: 'succeeded',
+      runs: total - 2,
+      alertRuns: total - 2,
+      findingRuns: 0,
+      sources: [{ address: '10.40.50.7', name: null }],
+      sourcesMore: 0,
+      rules: [],
+      rulesMore: 0,
+      firstSeen: new Date(Date.now() - 3_600_000).toISOString(),
+      lastSeen: new Date(Date.now() - 600_000).toISOString(),
+      waitingActions: 0,
+      newestInvestigationId: 'inv-1',
+      investigationsHref: '/investigations?entity=agent%3Am1',
+    },
+  ],
+  authorized: [
+    {
+      authorization: { id: 3, label: 'Red team test', state: 'active', expiresAt: new Date(Date.now() + 86_400_000).toISOString() },
+      target: { address: '10.20.30.20', name: 'lab01', role: null, machineKey: 'agent:lab' },
+      direction: 'inbound',
+      runs: 2,
+      lastSeen: new Date(Date.now() - 600_000).toISOString(),
+      runsHref: '/investigations?authorization=3&range=all',
+    },
+  ],
+  total,
+});
 
 const mount = async (pipelineErrors: InvestigationRow[] = []) => {
   vi.mocked(getAlerts).mockResolvedValue(queueOf(GROUPS.map(([id, v]) => group(id, v))));
-  listInvestigations.mockImplementation(async (q: { verdict?: string[]; limit?: number; since?: string } = {}) =>
+  // NEGATIVE CONTROL source: the Investigations list states 99 true
+  // positives. The tile must not read it.
+  listInvestigations.mockImplementation(async (q: { verdict?: string[] } = {}) =>
     q.verdict?.length
       ? { ...empty(), rows: pipelineErrors, total: pipelineErrors.length }
-      : isTileQuery(q)
-        ? { ...empty(), total: 37, truePositives: 15 }
-        : empty(),
+      : { ...empty(), total: 120, truePositives: 99 },
   );
+  getThreats.mockReset().mockResolvedValue(threatsOf(15));
   render(
     <MemoryRouter>
       <Dashboard />
@@ -109,20 +145,34 @@ const tpTile = async () =>
   (await screen.findByText('True positives · 24h')).closest('.rounded-panel')!;
 
 describe('Dashboard true-positives tile — every number answers one question', () => {
-  it('reads the count of the Investigations list query, over the window', async () => {
+  it('states the total of the Confirmed threats answer, over the window', async () => {
     await mount();
     const tile = await tpTile();
-    // 15 true positives among 37 investigations: the list's own header count.
-    await waitFor(() => expect(tile.textContent).toContain('15'));
-    expect(tile.textContent).toContain('of 37 investigations');
-    const query = listInvestigations.mock.calls.map((c) => c[0]).find(isTileQuery);
-    expect(query).toBeTruthy();
-    // The 24h window, as the list computes it.
-    const since = Date.parse(query.since);
+    await waitFor(() => expect(screen.getByTestId('tp-total').textContent).toBe('15'));
+    // The panel states the same number from the same answer.
+    expect(screen.getByTestId('confirmed-threats-total').textContent).toBe('15 true positives');
+    // Two hosts: one threat row and one authorized group.
+    expect(within(tile as HTMLElement).getByTestId('tp-hosts').textContent).toBe('on 2 hosts in this window');
+    // One read serves the tile and the panel.
+    expect(getThreats).toHaveBeenCalledTimes(1);
+    // The 24h window.
+    const since = Date.parse(getThreats.mock.calls[0][0].since);
     expect(Math.abs(Date.now() - since - 24 * 3_600_000)).toBeLessThan(60_000);
+    // NEGATIVE CONTROL: the count of the Investigations list does not reach the tile.
+    expect(tile.textContent).not.toContain('99');
   });
 
-  it('links to the list it counts, with the window and the verdict filter', async () => {
+  it('puts the Confirmed threats panel above the tiles', async () => {
+    await mount();
+    const tile = await tpTile();
+    const panel = screen.getByTestId('confirmed-threats');
+    expect(panel.compareDocumentPosition(tile) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // A fixed block: it is not a cell of the panel grid, so no saved layout moves it.
+    expect(panel.closest('.dash-cell')).toBeNull();
+    expect(await screen.findAllByTestId('threat-row')).toHaveLength(1);
+  });
+
+  it('links to the true positives list, with the window and the verdict filter', async () => {
     await mount();
     const tile = await tpTile();
     await waitFor(() => expect(tile.textContent).toContain('Open them'));
@@ -135,22 +185,35 @@ describe('Dashboard true-positives tile — every number answers one question', 
     await tpTile();
     fireEvent.click(screen.getByText('7d'));
     expect(await screen.findByText('True positives · 7d')).toBeTruthy();
+    expect(await screen.findByText('Confirmed threats · last 7 days')).toBeTruthy();
     await waitFor(() => {
-      const sinces = listInvestigations.mock.calls
-        .map((c) => c[0])
-        .filter(isTileQuery)
-        .map((q) => Date.now() - Date.parse(q.since));
+      const sinces = getThreats.mock.calls.map((c) => Date.now() - Date.parse(c[0].since));
       expect(sinces.some((ms) => Math.abs(ms - 7 * 86_400_000) < 60_000)).toBe(true);
     });
   });
 
-  // NEGATIVE CONTROL. The alert groups in the window no longer decide the
-  // tile. The outcomes chart still counts them, on its own unit.
+  // NEGATIVE CONTROL. The alert groups in the window do not decide the tile.
+  // The outcomes chart still counts them, and states that unit.
   it('does not count alert groups', async () => {
     await mount();
     const tile = await tpTile();
-    await waitFor(() => expect(tile.textContent).toContain('15'));
+    await waitFor(() => expect(screen.getByTestId('tp-total').textContent).toBe('15'));
     expect(tile.textContent).not.toContain('detection groups');
+    expect(screen.getByTestId('outcomes-clock').textContent).toBe(
+      'The chart counts the alert groups with an alert in this window.',
+    );
+  });
+
+  it('states a failed read as unknown in the tile and in the panel', async () => {
+    await mount();
+    getThreats.mockReset().mockRejectedValue(new Error('503'));
+    fireEvent.click(screen.getByText('7d'));
+    await screen.findByTestId('confirmed-threats-error');
+    const tile = (await screen.findByText('True positives · 7d')).closest('.rounded-panel')!;
+    expect(within(tile as HTMLElement).getByTestId('tp-total').textContent).toBe('?');
+    expect(tile.textContent).toContain('Could not read the confirmed threats.');
+    // NEGATIVE CONTROL: a failure is not a zero and not the empty line.
+    expect(screen.queryByTestId('confirmed-threats-empty')).toBeNull();
   });
 
   it('labels the pipeline-error clause with its OWN window and unit', async () => {
@@ -159,7 +222,7 @@ describe('Dashboard true-positives tile — every number answers one question', 
     // It counts investigation runs over thirty days, which is neither the unit
     // nor the window in the tile's heading, so it says so. The clause waits for
     // its own read.
-    await waitFor(() => expect(tile.textContent).toMatch(/runs, last 30 days/i));
+    await waitFor(() => expect(tile.textContent).toMatch(/investigations, last 30 days/i));
     expect(await screen.findByRole('button', { name: '2 pipeline errors' })).toBeTruthy();
   });
 

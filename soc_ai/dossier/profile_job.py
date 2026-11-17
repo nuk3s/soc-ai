@@ -1107,7 +1107,9 @@ async def _build(  # noqa: PLR0915 - one procedure, read top to bottom
             "The build did not read outside the census for them."
         )
     for name in sorted(shared.unscoped):
-        build.notes.append(f"entity profiles: the build read {name} estate-wide, in one search.")
+        build.notes.append(
+            f"entity profiles: the build read {name} on all machines, in one search."
+        )
     build.written = outcome.written
     build.single = len(shared.single)
     build.batched = max(0, plan.to_build - build.single)
@@ -1122,7 +1124,7 @@ async def _build(  # noqa: PLR0915 - one procedure, read top to bottom
                 build.errors.append(f"entity profiles: expiry failed: {exc}")
             stage.detail = f"{build.expired} rows"
     if build.written or build.expired:
-        with clock.stage("estate") as stage:
+        with clock.stage("prevalence") as stage:
             stage.detail = await _refresh_estate(sessionmaker, build)
     summary = _summary(build)
     build.notes.append(summary)
@@ -1144,7 +1146,7 @@ async def _refresh_estate(sessionmaker: Any, build: ProfileBuild) -> str:
             done = await refresh_estate(db)
     except Exception as exc:
         build.notes.append(
-            f"estate prevalence: the refresh after the build failed: {exc}. "
+            f"network prevalence: the refresh after the build failed: {exc}. "
             "The next prior sweep refreshes it."
         )
         return "failed"

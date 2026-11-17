@@ -10,12 +10,15 @@ patch ``soc_ai.agent.orchestrator.build_*_model``) keep working unchanged.
 
 from __future__ import annotations
 
+from typing import Literal
+
 import httpx
 from openai import AsyncOpenAI
 from pydantic_ai.models import Model
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.profiles.openai import OpenAIModelProfile
 from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic_ai.settings import ModelSettings
 
 from soc_ai.agent._gateway_retry import RetryingAsyncTransport
 from soc_ai.config import Settings
@@ -159,6 +162,37 @@ def build_synthesizer_model(settings: Settings, *, temperature: float | None = N
     )
 
 
+# The reasoning effort of the one retry after a token-limit stop. The OpenAI
+# chat API names it ``reasoning_effort``, and the gateway passes it to the
+# engine.
+LOW_REASONING_EFFORT: Literal["low"] = "low"
+
+
+def is_token_limit_before_response(exc: BaseException) -> bool:
+    """True when the model spent its whole response budget and wrote no output.
+
+    pydantic-ai raises ``UnexpectedModelBehavior`` with "Model token limit
+    (32000) exceeded before any response was generated" when a response ends
+    with finish reason ``length`` and holds no part, or thinking parts only.
+    Production recorded 12 such runs from 2026-11-04 to 2026-11-12, all on
+    binary-payload rules, and each one lost 2 to 9 minutes of model time.
+    """
+    msg = str(exc).lower()
+    return "token limit" in msg and "before any response" in msg
+
+
+def low_reasoning_settings() -> ModelSettings:
+    """The run-level model settings of the retry after a token-limit stop.
+
+    The retry asks for low reasoning effort, so the model keeps a part of its
+    response budget for the output. pydantic-ai merges these settings over the
+    settings of the model, so the token cap and the temperature stay.
+    """
+    from pydantic_ai.models.openai import OpenAIChatModelSettings  # noqa: PLC0415
+
+    return OpenAIChatModelSettings(openai_reasoning_effort=LOW_REASONING_EFFORT)
+
+
 # Backwards-compat shim — older callers passed a single `agent` with the
 # heavy model doing both jobs. Internally we now split. The `build_model`
 # alias keeps the import path stable for any in-tree callers; new code
@@ -169,7 +203,10 @@ def build_model(settings: Settings) -> Model:  # pragma: no cover - thin alias
 
 
 __all__ = [
+    "LOW_REASONING_EFFORT",
     "build_investigator_model",
     "build_model",
     "build_synthesizer_model",
+    "is_token_limit_before_response",
+    "low_reasoning_settings",
 ]

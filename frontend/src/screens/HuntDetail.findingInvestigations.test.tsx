@@ -7,6 +7,8 @@ import { render, screen, within } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AboutInfo, HuntDetailData, HuntFinding } from '../lib/types';
+import { forbiddenWords } from '../test/analystWords';
+import { LINK, LINK_DIFFERS } from '../test/campaign';
 
 vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
@@ -278,5 +280,45 @@ describe('the finding investigation words', () => {
     expect(findingsProgressLine({ findingsInvestigated: 0, findingsTotal: 1 })).toBe(
       'Investigating 0 of 1 finding',
     );
+  });
+});
+
+// The campaign is the unit of work (owner, 2026-11-14). A finding card names
+// the campaign of its investigation and links to it.
+describe('HuntDetail findings, part of a campaign', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getAbout).mockResolvedValue(about);
+  });
+
+  it('puts the campaign chip on the line of a finding whose investigation is in a campaign', async () => {
+    const inCampaign = finding(1, {
+      ...confirmed,
+      investigation: { ...confirmed.investigation!, campaign: LINK },
+    });
+    vi.mocked(getHunt).mockResolvedValue(hunt({ findings: [inCampaign, cleared] }));
+    mount();
+    await screen.findAllByText(inCampaign.title);
+    const line = within(card(inCampaign.title)).getByTestId('finding-investigation');
+    const chip = within(line).getByTestId('finding-campaign');
+    expect(chip).toHaveAttribute('href', '/campaigns/7');
+    expect(chip).toHaveAccessibleName(/^Campaign: actor-a against web-1\. Stage reached: Action on the target/);
+    // The chip leads the line.
+    expect(line.firstElementChild).toBe(chip);
+    expect(forbiddenWords(line)).toEqual([]);
+    // NEGATIVE CONTROL. A finding whose investigation is in no campaign has no chip.
+    expect(within(card(cleared.title)).queryByTestId('finding-campaign')).toBeNull();
+  });
+
+  it('states that the verdict of a finding differs from its campaign', async () => {
+    const differs = finding(2, {
+      ...cleared,
+      investigation: { ...cleared.investigation!, campaign: LINK_DIFFERS },
+    });
+    vi.mocked(getHunt).mockResolvedValue(hunt({ findings: [differs] }));
+    mount();
+    await screen.findAllByText(differs.title);
+    const chip = within(card(differs.title)).getByTestId('finding-campaign');
+    expect(chip.getAttribute('title')).toContain('Same session as this campaign. The verdict differs.');
   });
 });

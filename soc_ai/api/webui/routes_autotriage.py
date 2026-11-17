@@ -50,7 +50,8 @@ class AutoTriageStatusOut(BaseModel):
     # analyst's grid read as a handful per sweep.
     inherited_acked_total: int = 0
     # Why inherited acks were held back this run (reason code -> count):
-    # ``no_investigation`` | ``high_stakes``.
+    # ``no_investigation`` | ``high_stakes`` | ``analyst_verdict`` |
+    # ``earlier_true_positive`` | ``earlier_runs_unread``.
     inherited_refused: dict[str, int] = {}
     # Per-reason breakdown of ``skipped`` (reason code -> count); sums to skipped.
     # ``retry_wait`` and ``retry_limit`` count the failed alerts that wait
@@ -74,6 +75,10 @@ class AutoTriageStatusOut(BaseModel):
     pause_ends: str | None = None
     # Failed runs in a row while paused, else 0.
     failed_in_a_row: int = 0
+    # The gateway pause: two gateway connection errors in sequence stopped the
+    # scheduled runs. It has no end time, so ``paused_until`` stays None. A
+    # gateway test that passes ends it.
+    gateway_paused: bool = False
     # The error of the newest open alarm, or the last error while paused:
     # "ModelHTTPError in synth_first_round1". None when all is well.
     alarm_error: str | None = None

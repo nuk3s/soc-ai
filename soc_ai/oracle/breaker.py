@@ -10,8 +10,8 @@ The breaker opens on either of two signals:
 
 - a quota answer (:data:`soc_ai.oracle.failures.QUOTA`): HTTP 429, or a usage,
   rate or weekly limit in the gateway message. It stays open until the reset
-  time that the message or the ``Retry-After`` header names, or for
-  :data:`BACKOFF` when neither names one;
+  time that the message, the ``retry_after`` field of its JSON body or the
+  ``Retry-After`` header names, or for :data:`BACKOFF` when none names one;
 - :data:`OPEN_AFTER_5XX` server errors in a row from the route, with no answer
   between them. It stays open for :data:`BACKOFF`.
 
@@ -26,6 +26,7 @@ facts from the stored events (:func:`soc_ai.store.oracle_ledger.latest_route_out
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -41,6 +42,12 @@ MIN_PAUSE = timedelta(minutes=1)
 MAX_PAUSE = timedelta(days=8)
 """A named reset beyond this is not believed: a weekly limit resets within 7
 days. The pause is cut to this length."""
+
+RETRY_AFTER_MAX = timedelta(days=7)
+"""A safety bound on the wait that a ``retry_after`` value names. A provider
+can send any number, and a time stamp in milliseconds read as seconds is
+57,000 years. No value pauses the route for more than 7 days: a weekly limit
+resets within that time."""
 
 OPEN_AFTER_5XX = 3
 """Server errors in a row, with no answer between them, that open the breaker."""
@@ -112,6 +119,17 @@ _TIME_RE = re.compile(
 _RELATIVE_RE = re.compile(
     r"(?:try again|retry|resets?)\s+(?:in|after)\s+(?P<n>\d+(?:\.\d+)?)\s*"
     r"(?P<unit>seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)\b",
+    re.IGNORECASE,
+)
+
+
+# "retry_after":36085, the JSON field of a provider error body. The message
+# can hold the body as a JSON string, so its quotes can carry backslashes.
+# Production got this field on each quota answer of 2026-11-01 and 2026-11-08,
+# with 36,085 s and 86,400 s, and no sentence named the wait. The breaker read
+# no reset time and paused one hour. The key must be the whole key.
+_JSON_RETRY_AFTER_RE = re.compile(
+    r"""(?<![A-Za-z0-9_])retry_after\\*["']?\s*[:=]\s*\\*["']?(?P<v>[^"'\\,}\s]+)""",
     re.IGNORECASE,
 )
 
@@ -192,29 +210,63 @@ def _from_relative(m: re.Match[str], now: datetime) -> datetime:
     return now + timedelta(seconds=n)
 
 
+def _from_retry_after_field(m: re.Match[str], now: datetime) -> datetime | None:
+    """The time that one ``retry_after`` value names, or None.
+
+    The value is a number of seconds, as a number or as a numeric string, or
+    an ISO time stamp. The wait is cut to :data:`RETRY_AFTER_MAX`. A value
+    that is neither, or that is zero, negative or not finite, names nothing.
+    """
+    raw = m.group("v").strip()
+    latest = now + RETRY_AFTER_MAX
+    try:
+        seconds: float | None = float(raw)
+    except ValueError:
+        seconds = None
+    if seconds is not None:
+        if not math.isfinite(seconds) or seconds <= 0:
+            return None
+        return now + timedelta(seconds=min(seconds, RETRY_AFTER_MAX.total_seconds()))
+    try:
+        when = datetime.fromisoformat(raw.replace("Z", "+00:00").replace("z", "+00:00"))
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return min(when, latest)
+
+
 def parse_reset_time(text: str, now: datetime | None = None) -> datetime | None:
     """The reset time a gateway message names, in UTC, or None.
 
     Reads a month and day with a clock time, an ISO time stamp, a clock time
-    alone, or a relative "in N minutes", in that order. A time zone other than
-    UTC must be an IANA name. A time that is already past, or a name that does
-    not resolve, returns None, and the caller backs off for :data:`BACKOFF`.
+    alone, a relative "in N minutes", or the ``retry_after`` field of a JSON
+    error body in seconds, in that order. A time zone other than UTC must be
+    an IANA name. A time that is already past, or a name that does not
+    resolve, returns None, and the caller backs off for :data:`BACKOFF`.
     """
     if not text:
         return None
     now = now or _now()
     found: datetime | None = None
-    if m := _DATE_TIME_RE.search(text):
-        found = _from_date_time(m, now)
-    elif m := _ISO_RE.search(text):
-        found = _from_iso(m)
-    elif m := _TIME_RE.search(text):
-        found = _from_time(m, now)
-    elif m := _RELATIVE_RE.search(text):
-        found = _from_relative(m, now)
-    if found is None:
+    # Never raises. The caller runs inside the failure handler of the Oracle
+    # client, and an error here ended the run and left the route open.
+    try:
+        if m := _DATE_TIME_RE.search(text):
+            found = _from_date_time(m, now)
+        elif m := _ISO_RE.search(text):
+            found = _from_iso(m)
+        elif m := _TIME_RE.search(text):
+            found = _from_time(m, now)
+        elif m := _RELATIVE_RE.search(text):
+            found = _from_relative(m, now)
+        elif m := _JSON_RETRY_AFTER_RE.search(text):
+            found = _from_retry_after_field(m, now)
+        if found is None:
+            return None
+        found = found.astimezone(UTC)
+    except (OverflowError, ValueError, ArithmeticError):
         return None
-    found = found.astimezone(UTC)
     return found if found > now else None
 
 
@@ -225,7 +277,10 @@ def parse_retry_after(value: str | None, now: datetime | None = None) -> datetim
     now = now or _now()
     value = value.strip()
     if value.isdigit():
-        return now + timedelta(seconds=int(value))
+        # Cut to the safety bound before the sum, so a huge number cannot
+        # pass the range of a time delta.
+        seconds = min(int(value), int(RETRY_AFTER_MAX.total_seconds()))
+        return now + timedelta(seconds=seconds)
     try:
         when = parsedate_to_datetime(value)
     except (TypeError, ValueError, IndexError):
@@ -348,6 +403,7 @@ __all__ = [
     "OPEN_AFTER_5XX",
     "PAUSE_5XX",
     "PAUSE_QUOTA",
+    "RETRY_AFTER_MAX",
     "OracleRouteBreaker",
     "RouteState",
     "iso",

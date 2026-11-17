@@ -245,10 +245,10 @@ describe('LeadsStrip shadow semantics', () => {
 // Hunting sounded like the same act. The tabs now name what the analyst must
 // do, and the block opens on the one that waits.
 describe('LeadsStrip tabs', () => {
-  it('names the four tabs and opens on Needs decision', async () => {
+  it('names the five tabs and opens on Needs decision', async () => {
     mount();
     await screen.findByTestId('lead-7');
-    for (const label of ['Needs decision', 'In progress', 'Closed', 'All']) {
+    for (const label of ['Needs decision', 'In progress', 'Closed', 'Fleet condition', 'All']) {
       expect(screen.getByRole('button', { name: label })).toBeTruthy();
     }
     expect(
@@ -278,7 +278,8 @@ describe('LeadsStrip tabs', () => {
         'In progress: a hunt is running. ' +
         'Closed: an analyst dismissed the lead or opened an investigation on it. soc-ai also closes ' +
         'a lead when its hunt finds no threat, or when every threat finding of the hunt that names an ' +
-        'entity has a verdict.',
+        'entity has a verdict. ' +
+        'Fleet condition: one departure is on more than 8 hosts at one time. It waits on no decision.',
     );
   });
 
@@ -816,7 +817,7 @@ describe('a lead soc-ai closed on the verdicts of its hunt', () => {
     hunt_id: 'H-5',
     hunt_status: 'complete',
     hunt_outcome: 'threats',
-    hunt_outcome_label: '2 of 5 findings are threats',
+    hunt_outcome_label: '2 confirmed · 0 not judged · of 2 threat findings',
     investigation_id: 'INV-1',
     closed_by_hunt_verdicts: true,
   } as Lead;
@@ -825,7 +826,7 @@ describe('a lead soc-ai closed on the verdicts of its hunt', () => {
     vi.mocked(getLeads).mockResolvedValue([closed]);
     mount();
     const pill = await screen.findByTestId('lead-status');
-    expect(pill.textContent).toBe('Closed. 2 of 5 findings are threats.');
+    expect(pill.textContent).toBe('Closed. 2 confirmed · 0 not judged · of 2 threat findings.');
     expect(pill.getAttribute('title')).toBe(PILL_CLOSED_ON_VERDICTS);
     expect(screen.getByText('closed by soc-ai')).toBeTruthy();
   });

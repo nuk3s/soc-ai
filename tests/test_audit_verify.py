@@ -1160,22 +1160,52 @@ async def test_verify_streams_one_page_at_a_time(monkeypatch: pytest.MonkeyPatch
     index holds 35 records and a page is 10, so the scan takes four pages. At
     every page the checker receives, the served records still alive must fit
     in one page. The old fetch-everything walk held all 35 at once.
+
+    Each worker thread here keeps its finished work item until the NEXT page
+    is counted. A thread-pool work item holds its arguments until its worker
+    loops back for the next job, and on a loaded parallel run that loop-back
+    can come after the event loop has fetched the next page: the old
+    ``to_thread(checker.feed_page, page)`` then held two pages ("held 20
+    records at once", once in 8 runs under ``-n 4``). The lag pins that worst
+    schedule on every run, so the bound holds by design, not by luck.
     """
+    import concurrent.futures.thread as cf_thread
+    import threading
+
     from soc_ai.audit import chain as chain_mod
 
     page = 10
     fake = _TrackingES(_build_chain(35))
     elastic = _elastic_with([], fake=fake)
     held: list[int] = []
+    counted = threading.Condition()
+    done = False
     real_feed = chain_mod.EpochStreamChecker.feed_page
+    real_run = cf_thread._WorkItem.run
 
     def _spy(self: Any, records: list[dict[str, Any]]) -> None:
         gc.collect()
-        held.append(len(fake.live))
+        with counted:
+            held.append(len(fake.live))
+            counted.notify_all()
         real_feed(self, records)
 
+    def _lagging_run(item: Any) -> None:
+        real_run(item)
+        # The future is resolved and the event loop moves on; this worker
+        # still holds ``item`` until the next page is counted.
+        with counted:
+            seen = len(held)
+            counted.wait_for(lambda: done or len(held) > seen, timeout=5.0)
+
     monkeypatch.setattr(chain_mod.EpochStreamChecker, "feed_page", _spy)
-    result = await verify_audit_chain(elastic, "soc-ai-audit", page_size=page, max_records=None)
+    monkeypatch.setattr(cf_thread._WorkItem, "run", _lagging_run)
+    try:
+        result = await verify_audit_chain(elastic, "soc-ai-audit", page_size=page, max_records=None)
+    finally:
+        with counted:
+            done = True
+            counted.notify_all()
 
     assert result.ok is True
     assert result.records_verified == 35
@@ -1221,7 +1251,7 @@ async def test_verify_runs_its_hash_work_off_the_event_loop(
     await other
 
     assert result.ok is True
-    assert "feed_page" in calls
+    assert "_feed_boxed_page" in calls
     assert progressed >= 3, f"a concurrent task advanced {progressed} times during the verify"
 
 

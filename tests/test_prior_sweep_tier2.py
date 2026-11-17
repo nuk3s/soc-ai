@@ -249,7 +249,7 @@ async def test_a_port_most_of_the_estate_holds_forms_no_observation(
     (result,) = [r for r in sweep.results if r.entity_key == newcomer]
     assert result.coverage == "measured"
     assert result.suppressed == 1
-    assert "1 new member common across the estate formed no observation." in result.note
+    assert "1 new member common across the network formed no observation." in result.note
     assert await _rows(maker) == []
     await engine.dispose()
 

@@ -2,6 +2,7 @@ import { Activity, ArrowUpRight, Crosshair, Database, Gauge, Ghost, Inbox, Rotat
 import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { PipelineErrorChip, StatusTag, VerdictPill } from '../components/Badges';
+import { ConfirmedThreats, threatsFor, useThreats } from '../components/ConfirmedThreats';
 import { DashboardGrid, LAYOUT_HELP_ID, LayoutControls } from '../components/DashboardGrid';
 import { FlowBadge } from '../components/FlowBadge';
 import { GridGapStrip } from '../components/GridGapStrip';
@@ -19,6 +20,7 @@ import {
   type DataSource,
   type Health,
   type HealthComponent,
+  type NeedsYouCount,
   getAbout,
   getAlerts,
   getAutoTriageStatus,
@@ -42,7 +44,7 @@ import { PIPELINE_ERRORS_URL, livePipelineErrors } from '../lib/investigationFil
 import { statusDetail, statusMeta } from '../lib/labels';
 import { formatSkipReasons } from '../lib/skipReasons';
 import { COUNTING } from '../lib/text';
-import { absoluteTime, agoWords, rangeToSinceUntil, windowFromSearch, windowParams } from '../lib/timeRange';
+import { absoluteTime, agoWords, rangeToSinceUntil, utcWindow, windowFromSearch, windowParams } from '../lib/timeRange';
 import { VERDICT } from '../lib/tokens';
 import {
   COUNT_AGE,
@@ -67,7 +69,19 @@ import type {
 import { useAsync } from '../lib/useAsync';
 import type { PanelId } from '../lib/dashboardLayout';
 import { useDashboardLayout } from '../lib/useDashboardLayout';
-import { type NeedsYouState, needsYouLinks, useNeedsYouCount } from '../lib/needsYou';
+import {
+  ANY_AGE,
+  type NeedsYouState,
+  type PartKey,
+  decisionCount,
+  decisionFloor,
+  NEEDS_YOU_PAGE,
+  needsYouLines,
+  needsYouLinks,
+  needsYouReviewLine,
+  scopeOfWindow,
+  useNeedsYouCount,
+} from '../lib/needsYou';
 import { WIDE_QUERY, useMediaQuery } from '../lib/useMediaQuery';
 
 // Status presentation mirrors the Investigations screen so a verdict reads the
@@ -308,32 +322,39 @@ function windowWords(range: string): string {
   return `${n} ${unit}${n === 1 ? '' : 's'}`;
 }
 
-interface NeedsYouLine {
-  key: string;
-  count: number | null;
-  one: string;
-  many: string;
-  /** What to say when the server could not read the part. */
-  unknown: string;
-  to: string;
-  /** The scope of the count, in visible words: "all open", "last 7 days". */
-  scope: string;
-}
-
 /** "7d" as "last 7 days": the scope words of a part that has a window. */
 function lastWords(range: string): string {
   return `last ${windowWords(range)}`;
 }
 
+/** The test id of each line of the tile. The ids are older than the lines
+ *  the tile shares with the bell, and the browser checks read them. */
+const TILE_LINE_ID: Partial<Record<PartKey, string>> = {
+  campaigns: 'campaigns',
+  investigations_waiting: 'investigations',
+  leads_needing_decision: 'leads',
+  untriaged_groups: 'alerts',
+};
+
 /**
  * The scope of the whole count, for the tile with no line to carry it. The
- * total mixes four scopes, so "Nothing needs you" must say over what.
+ * total mixes the scopes of its parts, so "Nothing needs you" must say over
+ * what.
  */
-function needsYouScopeSentence(alertWindow: string, verdictWindow: string): string {
-  return (
-    'The count covers all open leads, all unread shadow hits, alert groups of the ' +
-    `${lastWords(alertWindow)}, and verdicts and actions of the ${lastWords(verdictWindow)}.`
-  );
+function needsYouScopeSentence(data: NeedsYouCount): string {
+  // The defaults of needsYouLinks: an older server sends no window.
+  const verdicts = scopeOfWindow(data.verdict_window ?? '30d');
+  const alerts = scopeOfWindow(data.alert_window ?? '7d');
+  const campaigns = data.campaigns !== undefined;
+  const parts: string[] = [];
+  if (verdicts === ANY_AGE) {
+    parts.push(campaigns ? `campaigns and investigations ${ANY_AGE}` : `investigations ${ANY_AGE}`);
+  } else {
+    if (campaigns) parts.push(`campaigns ${ANY_AGE}`);
+    parts.push(`investigations of the ${verdicts}`);
+  }
+  parts.push('all open leads', `alert groups of the ${alerts}`);
+  return `The count covers ${parts.slice(0, -1).join(', ')}, and ${parts[parts.length - 1]}.`;
 }
 
 /**
@@ -355,76 +376,50 @@ function needsYouScopeSentence(alertWindow: string, verdictWindow: string): stri
  */
 function NeedsYouTile({ state, incomplete = false }: { state: NeedsYouState; incomplete?: boolean }) {
   const { data, failed } = state;
-  const links = needsYouLinks(data);
-  const floor = (data?.unknown.length ?? 0) > 0;
-  const value = data ? `${data.total.toLocaleString()}${floor ? '+' : ''}` : failed ? '?' : COUNTING;
-  const lines: NeedsYouLine[] = data
-    ? [
-        {
-          key: 'leads',
-          count: data.leads_needing_decision,
-          one: 'lead waits on a decision',
-          many: 'leads wait on a decision',
-          unknown: 'Could not count the leads.',
-          to: links.leads,
-          scope: 'all open',
-        },
-        {
-          key: 'hits',
-          count: data.unread_shadow_hits,
-          one: 'shadow hit is unread',
-          many: 'shadow hits are unread',
-          unknown: 'Could not count the shadow hits.',
-          to: links.shadowHits,
-          scope: 'all unread',
-        },
-        {
-          key: 'alerts',
-          count: data.untriaged_groups,
-          one: 'alert group has no verdict',
-          many: 'alert groups have no verdict',
-          unknown: 'Could not count the alert groups. The grid did not answer.',
-          to: links.untriaged,
-          scope: lastWords(data.alert_window),
-        },
-        {
-          key: 'nmi',
-          count: data.needs_more_info,
-          one: 'verdict needs more info',
-          many: 'verdicts need more info',
-          unknown: 'Could not count the verdicts that need more info.',
-          to: links.needsMoreInfo,
-          scope: lastWords(data.verdict_window),
-        },
-        {
-          key: 'actions',
-          count: data.pending_actions,
-          one: 'recommended action waits for you',
-          many: 'recommended actions wait for you',
-          unknown: 'Could not count the recommended actions.',
-          to: links.pendingActions,
-          scope: lastWords(data.verdict_window),
-        },
-      ].filter((line) => line.count === null || line.count > 0)
-    : [];
-  const color = !data ? '#8b949e' : data.total > 0 || floor ? '#f5a623' : '#3fb950';
+  // The tile counts decisions. The unread shadow hits are review work: one
+  // press of Dismiss all reads every hit, and 233 of them held a red "280"
+  // (production review 2026-11-12, ui-core 4). They have their own neutral
+  // line under the decisions, with their own link.
+  const decisions = data ? decisionCount(data) : 0;
+  const floor = data ? decisionFloor(data) : false;
+  const review = needsYouReviewLine(data);
+  const value = data ? `${decisions.toLocaleString()}${floor ? '+' : ''}` : failed ? '?' : COUNTING;
+  // The lines of the bell: campaigns, investigations, leads and alert groups.
+  // They add up to the number above them. The tile kept its own copy of the
+  // lines, and the copy could drift from the bell.
+  const lines = needsYouLines(data);
+  const color = !data ? '#8b949e' : decisions > 0 || floor ? '#f5a623' : '#3fb950';
   return (
     <div data-testid="kpi-needs-you">
       <Panel className="px-4 py-3.5">
-        <div className="flex items-start justify-between">
-          <div className="text-[10.5px] font-semibold uppercase tracking-[.06em] text-faint">Needs you</div>
-          <span className="flex" style={{ color }}>
-            <Inbox size={16} />
+        {/* The flow sentence is the tooltip of the label, and the link to
+            the chart sits in the header. The sentence filled four lines at
+            the foot of the tile, and the three tiles beside it stretched to
+            its height (polish review 2026-11-13). */}
+        <div data-testid="needs-you-flow" className="flex items-start justify-between gap-2">
+          <div
+            title={OVERVIEW_FLOW}
+            className="text-[10.5px] font-semibold uppercase tracking-[.06em] text-faint"
+          >
+            Needs you
+          </div>
+          <span className="flex items-center gap-2">
+            <FlowLink className="text-[11px]" />
+            <span className="flex" style={{ color }}>
+              <Inbox size={16} />
+            </span>
           </span>
         </div>
-        <div
-          data-testid="needs-you-total"
-          className="mt-2 text-[27px] font-semibold leading-none tabular-nums"
-          style={{ color }}
-          title={COUNT_NEEDS_YOU}
-        >
-          {value}
-        </div>
+        {/* The total opens the Needs you page: one list of every decision. */}
+        <Link to={NEEDS_YOU_PAGE} className="mt-2 inline-block hover:underline" style={{ color }}>
+          <span
+            data-testid="needs-you-total"
+            className="block text-[27px] font-semibold leading-none tabular-nums"
+            title={COUNT_NEEDS_YOU}
+          >
+            {value}
+          </span>
+        </Link>
         {/* The total mixes the scopes of the lines, so it says so in words.
             The tooltip alone left "15" reading as a count of the page window. */}
         {/* A line with no count states no scope. When no line holds a
@@ -432,8 +427,8 @@ function NeedsYouTile({ state, incomplete = false }: { state: NeedsYouState; inc
         {data && lines.length > 0 && (
           <div data-testid="needs-you-total-scope" className="mt-1 text-[11px] leading-[1.4] text-faint">
             {lines.some((line) => line.count !== null)
-              ? 'The sum of the lines below. Each line states its scope.'
-              : needsYouScopeSentence(data.alert_window, data.verdict_window)}
+              ? 'The sum of the decision lines below. Each line states its scope.'
+              : needsYouScopeSentence(data)}
           </div>
         )}
         <div className="mt-1.5 text-[11.5px] leading-[1.5] text-dim">
@@ -443,36 +438,55 @@ function NeedsYouTile({ state, incomplete = false }: { state: NeedsYouState; inc
             <>
               Nothing needs you.
               <div data-testid="needs-you-total-scope" className="mt-1 text-[11px] leading-[1.4] text-faint">
-                {needsYouScopeSentence(data.alert_window, data.verdict_window)}
+                {needsYouScopeSentence(data)}
               </div>
             </>
           ) : (
             <ul className="flex flex-col gap-0.5">
               {lines.map((line) => (
-                <li key={line.key} data-testid={`needs-you-line-${line.key}`}>
+                <li key={line.key} data-testid={`needs-you-line-${TILE_LINE_ID[line.key] ?? line.key}`}>
                   {line.count === null ? (
                     <span className="text-faint">{line.unknown}</span>
                   ) : (
                     <Link to={line.to} className="text-accent hover:underline">
-                      {line.count.toLocaleString()} {line.count === 1 ? line.one : line.many}
-                      {line.key === 'alerts' && data.alert_floor ? ' or more' : ''}
+                      {line.text}
                     </Link>
                   )}
-                  {line.count !== null && <span className="text-faint"> · {line.scope}</span>}
+                  {/* The scope never breaks inside: "at any" over "age" read as two
+                      scopes in the narrow tile. */}
+                  {line.count !== null && (
+                    <span className="text-faint">
+                      {' '}
+                      <span data-testid="scope-of-line" className="whitespace-nowrap">
+                        · {line.scope}
+                      </span>
+                    </span>
+                  )}
                 </li>
               ))}
             </ul>
           )}
+          {/* The review count, apart from the decisions and in a neutral
+              color. It is not in the number above. */}
+          {review && (
+            <div data-testid="needs-you-line-hits" className="mt-1.5 border-t border-border-faint pt-1.5">
+              {review.count === null ? (
+                <span className="text-faint">{review.unknown}</span>
+              ) : (
+                <>
+                  <Link to={review.to} className="text-text-2 hover:underline">
+                    {review.text}
+                  </Link>
+                  <span className="text-faint">
+                    {' '}
+                    <span className="whitespace-nowrap">· {review.scope}</span>
+                  </span>
+                </>
+              )}
+            </div>
+          )}
         </div>
         {incomplete && <IncompleteMark />}
-        {/* The flow in one sentence, under the count the analyst works from.
-            The link opens the chart on the Hunts page. */}
-        <div
-          data-testid="needs-you-flow"
-          className="mt-2.5 border-t border-border-faint pt-2 text-[11.5px] leading-[1.5] text-dim"
-        >
-          {OVERVIEW_FLOW} <FlowLink />
-        </div>
       </Panel>
     </div>
   );
@@ -503,7 +517,9 @@ function VerdictBreakdown({
           ) : null,
         )}
       </div>
-      <div className="mt-3.5 grid grid-cols-2 gap-2 sm:grid-cols-4">
+      {/* As many columns as hold a whole tile. Four fixed columns put the
+          count of "Needs more info" over the next tile at 1100 px. */}
+      <div className="mt-3.5 grid grid-cols-[repeat(auto-fill,minmax(176px,1fr))] gap-2">
         {VERDICT_ORDER.map((v) => (
           <button
             key={v}
@@ -534,11 +550,11 @@ function VerdictBreakdown({
       {inherited > 0 && (
         <div
           data-testid="outcome-inherited"
-          title="These groups have no investigation run in this window. Each one counts under the verdict of its newest earlier run."
+          title="These groups have no investigation in this window. Each one counts under the verdict of its newest earlier investigation."
           className="mt-2.5 text-[11.5px] leading-[1.4] text-dim"
         >
           {inherited.toLocaleString()} of {total.toLocaleString()} {total === 1 ? 'group' : 'groups'}: verdict inherited
-          from a run before this window.
+          from an investigation before this window.
         </div>
       )}
     </div>
@@ -1100,23 +1116,35 @@ export function Dashboard() {
     total: number;
     partial: boolean;
   }> => {
+    // The time of the investigation: a pipeline error is a fact about what
+    // soc-ai did, and the list reads the time of the event by default.
     const pipeErr = await listInvestigations({
       verdict: ['pipeline_error'],
       errorState: 'live',
+      clock: 'investigated',
       ...rangeToSinceUntil('30d'),
       limit: 500,
     });
     return { rows: pipeErr.rows, total: pipeErr.total, partial: pipeErr.partial === true };
   };
   const pipeErr = useAsync(fetchPipelineErrors, [], { refetchInterval: 300_000 });
-  // The true-positive count: the Investigations list query over this window,
-  // one row, for its server-side count. The list applies its own defaults on
-  // the server, so the tile and the list count the same runs.
-  const tpRead = useAsync(
-    () => listInvestigations({ ...rangeToSinceUntil(range, custom), limit: 1 }),
-    [range, custom?.from, custom?.to],
-    { refetchInterval: 30_000 },
-  );
+  // The confirmed threats of this window. The panel and the True positives
+  // tile read this one answer, so they state one count. The tile read the
+  // Investigations list and the outcomes card counted alert groups, and the
+  // review of 2026-11-12 found "3" beside "0" for one window (ui-core 3).
+  // The key tags each answer with its window.
+  const threatsKey = ['dashboard', range, custom?.from ?? '', custom?.to ?? ''].join('|');
+  const threats = useThreats(threatsKey, () => rangeToSinceUntil(range, custom), 30_000);
+  const threatList = threatsFor(threats, threatsKey);
+  const threatsWindow = (() => {
+    if (range !== 'custom' || !custom) return lastWords(range);
+    const w = rangeToSinceUntil(range, custom);
+    return `window ${utcWindow(w.since, w.until ?? new Date().toISOString())}`;
+  })();
+  // The hosts the count lands on: one per target, threats and authorized.
+  const threatHosts = threatList
+    ? new Set([...threatList.rows, ...threatList.authorized].map((g) => g.target.machineKey ?? g.target.address)).size
+    : 0;
   const triageActiveRef = useRef(false);
   const triageTick = useRef(0);
   const triage = useAsync(getAutoTriageStatus, [], {
@@ -1313,7 +1341,8 @@ export function Dashboard() {
     () =>
       [...recentRows]
         .filter((r) => r.status !== 'cancelled' && r.status !== 'interrupted')
-        .sort((a, b) => (b.ts ?? '').localeCompare(a.ts ?? ''))
+        // The newest event first, as on the Investigations list.
+        .sort((a, b) => (b.eventAt || b.ts || '').localeCompare(a.eventAt || a.ts || ''))
         .slice(0, 7),
     [recentRows],
   );
@@ -1366,7 +1395,8 @@ export function Dashboard() {
   // they carry no mark.
   const esDegraded = down.some((d) => d.key === 'es');
   const i = (n: number): string => (invs.data ? n.toLocaleString() : invs.error ? '—' : COUNTING);
-  const tpCount = (n: number): string => (tpRead.data ? n.toLocaleString() : tpRead.error ? '?' : COUNTING);
+  const tpCount = (): string =>
+    threatList ? threatList.total.toLocaleString() : threats.error && !threats.loading ? '?' : COUNTING;
   // Is this KPI row still showing counts from a grid that has since gone dark?
   // A failed BACKGROUND poll keeps the last-good data on screen and never sets
   // `error` — deliberate, so a blip doesn't blank a working console — which
@@ -1486,6 +1516,12 @@ export function Dashboard() {
       )}
       <GridGapStrip range={range} custom={custom} className="mb-3" />
 
+      {/* The first panel answers the question the analyst opens the console
+          for: is anything bad happening, on which host, how bad, and what
+          waits. It sits outside the panel grid: a fixed first block, not a
+          tile that a saved layout can move down the page. */}
+      <ConfirmedThreats read={threats} readKey={threatsKey} windowLabel={threatsWindow} className="mb-4" />
+
       {/* The counts below are the last ones the grid answered, and both ways of
           losing the next read leave them frozen with nothing on the screen
           dating them: a poll loop that has stopped landing, and a refresh the
@@ -1547,31 +1583,31 @@ export function Dashboard() {
             said the two were counting different things (dogfood 2026-09-07, D4).
             Now the group figures name their unit and their denominator, and the
             run figure carries its own window and unit on its own line. */}
-        {/* One count of true positives, from the query the Investigations
-            list runs. The tile counted alert groups still in the window and
-            read 0 while the list said 15 for the same 7 days (dogfood
-            2026-10-06, S6). It now reads the list's own count, through the
-            same route and its defaults, and links to that list. */}
+        {/* One count of true positives: the total of the Confirmed threats
+            panel above, from the same answer. The tile read the
+            Investigations list, and the outcomes card counted alert groups,
+            and one window read 3 and 0 (review 2026-11-12, ui-core 3). */}
         <StatCard
           key="kpi-true-positives"
           label={`True positives · ${range}`}
-          value={tpCount(tpRead.data?.truePositives ?? 0)}
+          value={<span data-testid="tp-total">{tpCount()}</span>}
           sub={
             <>
               <div>
-                {tpRead.data ? (
+                {threatList ? (
                   <>
-                    of {tpRead.data.total.toLocaleString()} investigation
-                    {tpRead.data.total === 1 ? '' : 's'}{' '}
-                    <span data-testid="tp-clock">started in this window</span> ·{' '}
+                    <span data-testid="tp-hosts">
+                      on {threatHosts === 1 ? '1 host' : `${threatHosts.toLocaleString()} hosts`} in this window
+                    </span>{' '}
+                    ·{' '}
                     <Link to={truePositiveDestination(range, custom)} className="text-accent hover:underline">
                       Open them
                     </Link>
                   </>
-                ) : tpRead.error ? (
-                  'Could not count the investigations.'
+                ) : threats.error && !threats.loading ? (
+                  'Could not read the confirmed threats.'
                 ) : (
-                  <LoadingInline>Counting the investigations</LoadingInline>
+                  <LoadingInline>Reading the confirmed threats</LoadingInline>
                 )}
               </div>
               {pipelineErrors > 0 && (
@@ -1580,8 +1616,8 @@ export function Dashboard() {
                     onClick={() => navigate(PIPELINE_ERRORS_URL)}
                     title={
                       pipelineErrorsTruncated
-                        ? `At least ${pipelineErrors.toLocaleString()} runs need a retry. Open the list for the full set.`
-                        : 'The Investigations list holds these runs. Open a run to see the error and dismiss it.'
+                        ? `At least ${pipelineErrors.toLocaleString()} investigations need a retry. Open the list for the full set.`
+                        : 'The Investigations list holds these investigations. Open one to see the error and dismiss it.'
                     }
                     className="cursor-pointer underline decoration-[rgba(252,165,165,.45)] underline-offset-2 hover:decoration-[#fca5a5]"
                     style={{ color: '#fca5a5' }}
@@ -1590,12 +1626,12 @@ export function Dashboard() {
                     {pipelineErrorsTruncated ? '+' : ''} pipeline error
                     {pipelineErrors === 1 && !pipelineErrorsTruncated ? '' : 's'}
                   </button>
-                  <span className="text-faint"> · runs, last 30 days</span>
+                  <span className="text-faint"> · investigations, last 30 days</span>
                 </div>
               )}
             </>
           }
-          color={(tpRead.data?.truePositives ?? 0) > 0 ? '#f04438' : '#8b949e'}
+          color={(threatList?.total ?? 0) > 0 ? '#f04438' : '#8b949e'}
           icon={<ShieldCheck size={16} />}
           title={COUNT_TRUE_POSITIVES}
           // The count reads the store. A grid outage does not change it, so
@@ -1665,12 +1701,11 @@ export function Dashboard() {
               title="Investigation outcomes"
               right={<span className="text-[11.5px] text-faint">{a(m.groups)} detection {m.groups === 1 ? 'group' : 'groups'}</span>}
             />
-            {/* The panel and the True positives tile count by two clocks. The
-                panel did not say which, and the two read different numbers
-                for one window (R1-D9). */}
+            {/* The chart counts alert groups. The True positives tile and the
+                Confirmed threats panel count true positive runs, so the
+                chart states its unit (R1-D9, review 2026-11-12 ui-core 3). */}
             <div data-testid="outcomes-clock" className="px-[15px] pt-2.5 text-[11.5px] leading-[1.45] text-faint">
-              The chart counts the alert groups with an alert in this window. The True positives
-              tile counts the investigations that started in this window.
+              The chart counts the alert groups with an alert in this window.
             </div>
             {(alerts.loading && !alerts.data) || switchingWindow ? (
               <LoadingState label={switchingWindow ? `Loading the ${rangeLabel} window` : undefined} />
@@ -1791,7 +1826,7 @@ export function Dashboard() {
                         className="hidden w-[64px] flex-none text-right font-mono text-[10.5px] text-faint 2xl:block"
                         title={COUNT_AGE}
                       >
-                        {r.when}
+                        {r.eventWhen || r.when}
                       </span>
                       {/* The tags, in the one order of every list. The
                           synthetic mark keeps a planted attack from reading

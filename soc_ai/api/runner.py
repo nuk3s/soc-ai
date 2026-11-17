@@ -19,6 +19,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
+from soc_ai.agent import authorized_activity
 from soc_ai.agent.context import HuntSubject
 from soc_ai.agent.orchestrator import (
     InvestigationContext,
@@ -125,6 +126,14 @@ async def recorded_run(
     # Highest sequence seen, so a terminal error event appends after the run's
     # own events instead of colliding with sequence 0 in the timeline.
     last_seq = 0
+    marker = authorized_activity.RunMarker(
+        state,
+        started_by=started_by,
+        kind=kind,
+        synthetic=is_synth_eval,
+        subject=subject,
+        investigation_id=inv_id,
+    )
 
     async def _record_terminal_error(payload: dict[str, Any]) -> None:
         """Persist a terminal-failure event so the row is never silently 'error'.
@@ -151,7 +160,10 @@ async def recorded_run(
         async with asyncio.timeout(run_timeout):
             async for ev in event_stream:
                 last_seq = max(last_seq, ev.sequence)
-                await recorder.record(ev.kind, ev.sequence, ev.payload)
+                # The authorized activity decision. It reads the finished
+                # report, after the last gate, and adds one key to a copy.
+                payload = await marker.see(ev.kind, ev.session_id, ev.payload)
+                await recorder.record(ev.kind, ev.sequence, payload)
                 # Frame contract (kind, {session_id, sequence, payload}) is
                 # mirrored by soc_ai/demo/replay.py — change both together
                 # (pinned by tests/test_demo_mode.py's frame-contract test).
@@ -160,7 +172,7 @@ async def recorded_run(
                     {
                         "session_id": ev.session_id,
                         "sequence": ev.sequence,
-                        "payload": ev.payload,
+                        "payload": payload,
                     },
                 )
         await recorder.finish("complete")

@@ -6,6 +6,7 @@ import asyncio
 import logging
 import re
 from collections import Counter
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta, tzinfo
 from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -17,6 +18,7 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy import func, select
 
 from soc_ai.api.deps import get_elastic, get_settings_dep
+from soc_ai.api.webui._campaign_link import CampaignLinkOut, link_for
 from soc_ai.api.webui._errors import api_error, oql_refusal
 from soc_ai.api.webui._shared import (
     _ago,
@@ -27,11 +29,13 @@ from soc_ai.api.webui._shared import (
     _verdict,
     router,
 )
+from soc_ai.campaigns import service as campaign_svc
 from soc_ai.config import DEFAULT_ALERT_LABELS, DEFAULT_ALERTS_QUERY, Settings
 from soc_ai.errors import OqlValidationError
 from soc_ai.so_client.elastic import ElasticClient, GridPartialResultsError
 from soc_ai.so_client.fields import detection_kind
 from soc_ai.store import assignments as assign_svc
+from soc_ai.store import authorized_activity as authorized_svc
 from soc_ai.store import detection_overrides as override_svc
 from soc_ai.store import escalations as esc_svc
 from soc_ai.store import grid_gaps as gaps_svc
@@ -406,6 +410,21 @@ class AlertGroupOut(BaseModel):
     # reads the ids of the newest escalated alerts only, and an alert can be
     # on a case nobody can name. False means the list is partial.
     casesComplete: bool = False
+    # The recommended actions that wait for a person on the true positive
+    # runs of the group: its runs in the page window and the run behind its
+    # standing verdict. The rule is the needs-you rule
+    # (:func:`routes_meta.pending_actions_by_run`). The "Needs decision" view
+    # held one needs-more-info group and left out nine true positives with a
+    # waiting Escalate (prod review 2026-11-12, ui-core 8).
+    waitingActions: int = 0
+    # The headline of the run behind the standing verdict (``invId``) and of
+    # the run behind the window verdict (``windowInvId``). The row states it
+    # as its reason line. None when the group has no such run.
+    headline: str | None = None
+    windowHeadline: str | None = None
+    # The active campaign of the run behind the standing verdict (``invId``),
+    # or null.
+    campaign: CampaignLinkOut | None = None
 
 
 # The siblings one row lists. The count names the rest.
@@ -553,9 +572,10 @@ def _mix_window(
 ) -> tuple[datetime, datetime | None]:
     """The page window for the verdict mix, as naive UTC times.
 
-    Runs made inside the page window decide the verdict of a group (owner
-    rule, 2026-10-14). A custom window gives both bounds. The bounds alone
-    make the window custom, the same as for the grid query: the console sent
+    Runs inside the page window decide the verdict of a group (owner rule,
+    2026-10-14). A run is inside it when its event is (owner, 2026-11-15).
+    A custom window gives both bounds. The bounds alone make the window
+    custom, the same as for the grid query: the console sent
     them without ``range=custom``, and the mix read the default 24 hours. A
     preset window starts its span before now and has no upper bound, because
     no run is newer than now.
@@ -573,17 +593,20 @@ async def _verdict_mix(
 ) -> tuple[dict[str, dict[str, int]], dict[str, Investigation]]:
     """Per rule: the verdict counts over its alerts, and the worst run.
 
-    Only runs made in ``[since, until]`` count. One alert counts once, with
-    the verdict of its newest complete run in that window. A pipeline
+    Only runs whose event is in ``[since, until]`` count. One alert counts
+    once, with the verdict of its newest complete run. A pipeline
     fallback and a hunt-subject run decide nothing about an alert, so they
     are left out, as the verdict filter of the list leaves them out. A
     backtest replay is a measurement, and the standing verdict skips it too.
     """
     if not rule_names:
         return {}, {}
-    bounds = [Investigation.created_at >= since]
+    # The time of the event (migration 0072): the runs of the alerts of the
+    # window. A Re-run of today on an alert of 3 days ago is no verdict of
+    # the last 24 hours. The newest run of an alert still decides.
+    bounds = [Investigation.event_at >= since]
     if until is not None:
-        bounds.append(Investigation.created_at <= until)
+        bounds.append(Investigation.event_at <= until)
     ranked = (
         select(
             Investigation.id.label("id"),
@@ -656,6 +679,102 @@ def _worse_than(
     if _VERDICT_RANK.get(worst, 0) <= _VERDICT_RANK.get(standing, 0):
         return None, None, None
     return worst, worst_run.confidence, worst_run.id
+
+
+async def _waiting_by_rule(
+    db: Any,
+    state: Any,
+    standing: dict[str, Investigation],
+    since: datetime,
+    until: datetime | None,
+) -> dict[str, int]:
+    """Per rule: the recommended actions that wait for a person.
+
+    The runs are the true positive runs of the page window, the runs the
+    needs-you count reads (:func:`routes_meta.pending_action_runs`), and the
+    run behind the standing verdict of each rule when it is a true positive.
+    A false positive recommends an acknowledgement, and the needs-you rule
+    leaves that housekeeping out, so a false positive group counts nothing.
+    """
+    from soc_ai.api.webui.routes_meta import (  # noqa: PLC0415 - cycle
+        pending_action_runs,
+        pending_actions_by_run,
+    )
+
+    in_window = await pending_action_runs(db, since=since, until=until, state=state)
+    rule_of: dict[str, str] = {}
+    if in_window:
+        rule_of = {
+            run_id: rule
+            for run_id, rule in (
+                await db.execute(
+                    select(Investigation.id, Investigation.rule_name).where(
+                        Investigation.id.in_(list(in_window))
+                    )
+                )
+            ).all()
+            if rule
+        }
+    counts: dict[str, int] = {}
+    for run_id, count in in_window.items():
+        rule = rule_of.get(run_id)
+        if rule:
+            counts[rule] = counts.get(rule, 0) + count
+    # The standing run of a rule can carry another rule name: a lead promotion
+    # of its alert. It counts for the group that shows it too.
+    for rule, inv in standing.items():
+        if inv.id in in_window and rule_of.get(inv.id) != rule:
+            counts[rule] = counts.get(rule, 0) + in_window[inv.id]
+    # A standing run inside the window was read above.
+    older = [
+        inv
+        for inv in standing.values()
+        if _outside(getattr(inv, "created_at", None), since, until)
+        and getattr(inv, "verdict", None) == "true_positive"
+        and _recommends(getattr(inv, "report", None))
+        and not is_pipeline_fallback(getattr(inv, "report", None))
+        and not inv_svc.is_backtest(inv)
+    ]
+    if older:
+        by_run = await pending_actions_by_run(db, older, state=state)
+        for rule, inv in standing.items():
+            if by_run.get(inv.id):
+                counts[rule] = counts.get(rule, 0) + by_run[inv.id]
+    return counts
+
+
+def _recommends(report: Any) -> bool:
+    """True when a stored report recommends an action."""
+    return isinstance(report, dict) and bool(report.get("recommended_actions"))
+
+
+def _outside(created: datetime | None, since: datetime, until: datetime | None) -> bool:
+    """True when a run time falls outside ``[since, until]``."""
+    if created is None:
+        return False
+    return created < since or (until is not None and created > until)
+
+
+def _headline(
+    inv: Investigation | None, marks: Mapping[int, authorized_svc.Mark] | None = None
+) -> str | None:
+    """The headline of a run, as its page shows it, or None.
+
+    A run whose authorization holds drops each sentence that denies an
+    authorization, as its page does (:func:`authorized_svc.run_text_for_mark`).
+    """
+    if inv is None:
+        return None
+    from soc_ai.agent.gates import run_text  # noqa: PLC0415 - heavy package
+    from soc_ai.secret_scrub import scrub_secrets  # noqa: PLC0415 - lazy
+
+    text = run_text(
+        getattr(inv, "report", None),
+        rationale=getattr(inv, "rationale", None),
+        summary=getattr(inv, "summary", None),
+    ).headline
+    mark = (marks or {}).get(getattr(inv, "authorization_id", None) or 0)
+    return scrub_secrets(authorized_svc.run_text_for_mark(text, mark)).strip() or None
 
 
 async def _standing_verdicts(db: Any, rule_names: list[str]) -> dict[str, Investigation]:
@@ -924,6 +1043,7 @@ async def list_alerts(  # noqa: PLR0915 - one linear join of the grid rows and t
     worst_runs: dict[str, Investigation] = {}
     assignments: dict[str, dict[str, str]] = {}
     verdicts: dict[str, Investigation] = {}
+    marks: dict[int, authorized_svc.Mark] = {}
     # Newest run of ANY status per rule — drives the "Triaging…" flag AND the E2.1
     # failed-retry note. Already fetched below; hoisted here so the render loop can
     # read it without a re-fetch (no N+1).
@@ -931,6 +1051,8 @@ async def list_alerts(  # noqa: PLR0915 - one linear join of the grid rows and t
     running_rules: set[str] = set()
     muted_rules: set[str] = set()
     analyst_by_alert: dict[str, inv_svc.AnalystVerdict] = {}
+    waiting_by_rule: dict[str, int] = {}
+    campaigns: dict[str, campaign_svc.CampaignLink] = {}
     if groups:
         page_names = [g.rule_name for g in groups]
         rule_names = page_names + sorted(sibling_names - set(page_names))
@@ -942,8 +1064,18 @@ async def list_alerts(  # noqa: PLR0915 - one linear join of the grid rows and t
             latest_any = await inv_svc.latest_for_rules(db, rule_names)
             assignments = await assign_svc.assignments_for_rules(db, rule_names)
             muted_rules = await override_svc.muted_rule_names(db)
-            mix, worst_runs = await _verdict_mix(
-                db, rule_names, *_mix_window(range_, from_, to, settings.so_timezone)
+            mix_since, mix_until = _mix_window(range_, from_, to, settings.so_timezone)
+            mix, worst_runs = await _verdict_mix(db, rule_names, mix_since, mix_until)
+            waiting_by_rule = await _waiting_by_rule(
+                db, request.app.state, verdicts, mix_since, mix_until
+            )
+            campaigns = await campaign_svc.links_of(db, [inv.id for inv in verdicts.values()])
+            marks = await authorized_svc.marks_for(
+                db,
+                [
+                    getattr(run, "authorization_id", None)
+                    for run in [*verdicts.values(), *worst_runs.values()]
+                ],
             )
         # The id of the in-flight run per rule, so a "Triaging…" row links straight
         # to its live investigation (a running row has no completed verdict, so its
@@ -1058,6 +1190,10 @@ async def list_alerts(  # noqa: PLR0915 - one linear join of the grid rows and t
                 siblingsPartial=siblings_partial,
                 cases=case_links.get(g.rule_name, ([], False))[0],
                 casesComplete=case_links.get(g.rule_name, ([], False))[1],
+                waitingActions=waiting_by_rule.get(g.rule_name, 0),
+                headline=_headline(_inv, marks),
+                windowHeadline=_headline(window_run, marks),
+                campaign=link_for(campaigns, inv_id),
             )
         )
     return AlertQueueOut(groups=out, truncated=page.truncated, other_docs=page.other_docs)

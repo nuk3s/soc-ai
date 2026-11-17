@@ -16,9 +16,10 @@ primary path, so the ``AsyncOpenAI`` client is built with ``max_retries=0``.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any
@@ -77,8 +78,57 @@ def capture_backend_attribution() -> Iterator[dict[str, Any]]:
         _ATTRIBUTION.reset(token)
 
 
-def _record_attribution(response: httpx.Response) -> None:
+def _positive_count(value: Any) -> bool:
+    """True when a header count is above zero. The gateway sends it as a string."""
+    try:
+        return float(str(value).strip()) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def call_was_fallback(call: Any) -> bool:
+    """True when the gateway served one call from a fallback route.
+
+    ``call`` is the attribution of one call or one phase, the ``served_backend``
+    of a ``usage`` event. Only the word of the gateway counts:
+
+    - its fallback count is above zero (``attempted_fallbacks``), or
+    - the model group that served the call is not the model that the call
+      asked for (``requested_model``), or
+    - an earlier call under the same sink was a fallback (``fallback``).
+
+    The configured ``analyst_model`` is no test. Production runs two
+    configured names on one backend, and a rule on ``analyst_model`` marked
+    each call that asked for the second name. A call with no asked model and
+    no fallback count proves nothing, so it is no fallback.
+    """
+    if not isinstance(call, Mapping):
+        return False
+    if call.get("fallback") is True or _positive_count(call.get("attempted_fallbacks")):
+        return True
+    group, asked = call.get("model_group"), call.get("requested_model")
+    return bool(group and asked and str(group) != str(asked))
+
+
+def _requested_model(request: httpx.Request | None) -> str | None:
+    """The model name in the JSON body of one gateway request, or None."""
+    if request is None:
+        return None
+    try:
+        body = json.loads(request.content)
+    except Exception:
+        return None
+    model = body.get("model") if isinstance(body, dict) else None
+    return model if isinstance(model, str) and model else None
+
+
+def _record_attribution(response: httpx.Response, request: httpx.Request | None = None) -> None:
     """Stash the gateway's backend headers into the active sink (no-op if none).
+
+    ``request`` adds the model that this call asked for (``requested_model``).
+    One sink holds the calls of one phase, and each call writes over the
+    headers of the call before it. So a fallback call also sets ``fallback``
+    and ``fallback_model_group``, and those two stay for the whole block.
 
     Fail-soft on purpose: attribution is diagnostics, and must never be able to
     break a model call that otherwise succeeded.
@@ -87,10 +137,19 @@ def _record_attribution(response: httpx.Response) -> None:
         sink = _ATTRIBUTION.get()
         if sink is None:
             return
+        call: dict[str, Any] = {}
         for header, key in _ATTRIBUTION_HEADERS.items():
             value = response.headers.get(header)
             if value:
-                sink[key] = value
+                call[key] = value
+        requested = _requested_model(request)
+        if requested:
+            call["requested_model"] = requested
+        sink.update(call)
+        if call_was_fallback(call):
+            sink["fallback"] = True
+            if call.get("model_group"):
+                sink["fallback_model_group"] = call["model_group"]
     except Exception:  # pragma: no cover - diagnostics must never raise
         _LOGGER.debug("failed to record gateway attribution", exc_info=True)
 
@@ -161,7 +220,7 @@ class RetryingAsyncTransport(httpx.AsyncBaseTransport):
                 # Record on EVERY response, including the ones we go on to retry:
                 # if the final attempt raises a transport error, the last headers
                 # we saw are still the best attribution available.
-                _record_attribution(response)
+                _record_attribution(response, request)
                 if response.status_code not in _RETRYABLE_STATUS or attempt >= self._max_retries:
                     return response
                 # Must release the connection before retrying the request.

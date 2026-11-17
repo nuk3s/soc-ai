@@ -601,7 +601,11 @@ class Settings(BaseSettings):
     sequentially — 200 is roughly 3.5 minutes of wall clock. Overflow is not
     dropped: rows are selected staleness-first (`last_built_at ASC NULLS FIRST`)
     from a durable column, not walked with a cursor, so the hosts skipped this
-    sweep are exactly the ones at the front of the queue on the next."""
+    sweep are exactly the ones at the front of the queue on the next.
+
+    The active hosts go first: a host with an alert or an investigation in the
+    last 7 days, a host with an agent, and a host that originated an event in
+    the last 7 days. The other hosts keep one build in ten."""
 
     dossier_max_hosts: int = 5000
     """Cap on stored dossier rows. A scanned /16 puts 65k source IPs through the
@@ -826,12 +830,18 @@ class Settings(BaseSettings):
     """The rule prior rung of the tier 1 ladder (soc_ai.agent.rule_prior).
 
     The rule prior covers a scheduled alert with the verdict of its rule's
-    latest model-backed run when every safeguard holds: both endpoints inside
-    the estate, at least ``rule_prior_min_runs`` model-backed false positives
-    of the rule in the last 7 days and one in the last 24 hours, no open lead
-    and no fresh observation on either host, not critical, a rule the
-    detection tuning panel nominates, and no analyst override in the rule's
-    history. It never acknowledges in Security Onion.
+    latest model-backed run when every safeguard holds. Both addresses are
+    internal, or the one external address is known. Two or more model-backed
+    false positives of the rule in the last 7 days must have the same internal
+    address. Their external address must match the external address of the
+    alert. A match is the same address, the same IPv4 /24 or IPv6 /64
+    network, or the same name of the external end. The rule has at least
+    ``rule_prior_min_runs`` model-backed false positives in the last 7 days
+    and one in the last 24 hours. Neither host carries an open lead or a
+    fresh observation. No address belongs to a machine of an open campaign.
+    The alert is not critical. The detection tuning panel nominates the
+    rule, and no analyst override is in the rule's history. It never
+    acknowledges in Security Onion.
 
     ``off`` evaluates nothing. ``shadow`` (the default) runs the model as
     before and records what the prior would have decided beside the real
@@ -1921,8 +1931,9 @@ class Settings(BaseSettings):
     to accept that (mirroring ``auto_triage_schedule_enabled``'s default-off
     posture). Even then both paths are gated by the confidence threshold AND
     the high-stakes guard (``_is_high_stakes_alert`` — a critical/high-severity
-    or malware/exploit-class alert is never auto-acked, whatever the verdict),
-    and every unattended write is audited.
+    or malware/exploit-class alert is never auto-acked, whatever the verdict;
+    the one exception is a high-severity alert whose rule declares
+    ``signature_severity`` Informational), and every unattended write is audited.
 
     The direct path additionally requires that the investigation RETRIEVED
     something: a successful tool call, a Phase-D targeted dispatch, or a tool
@@ -1935,7 +1946,8 @@ class Settings(BaseSettings):
     row does not record whether the original run retrieved anything.
 
     Note the severity interaction: the high-stakes guard never auto-acks a
-    critical/high-severity (or malware/exploit-class) alert, while
+    critical/high-severity (or malware/exploit-class) alert, a high-severity
+    alert of an Informational rule excepted, while
     ``auto_triage_min_severity`` defaults to "high". If you want auto-ack to
     actually clear a backlog, lower the auto-triage floor to "medium"/"low" so
     the sweep investigates the low-severity FPs auto-ack is allowed to write.
@@ -2012,6 +2024,25 @@ class Settings(BaseSettings):
     CLI clamps the effective value to [1, 10] (the config console enforces
     the same bounds), so a stray env value can't turn the nightly into an
     hour-long batch."""
+
+    quality_nightly_synth_n: int = 1
+    """How many synthetic true positives each nightly batch plants beside its
+    real alerts. 1 by default: a real alert carries no ground truth, and on a
+    quiet grid every alert is benign, so a batch with no known positive cannot
+    show whether a real intrusion would be caught. Until 2026-11-13 the nightly
+    planted none and production measured no recall across 113 batches.
+
+    The scenario comes from the easy tier of the catalogue and changes each
+    day. A plant the run does not call a positive raises the quality alarm and
+    the alarm names the scenario. The planted run is scored against its own
+    ground truth and is never sent to the Oracle.
+
+    0 turns the feature off. The run WRITES to the grid when this is above 0:
+    it plants the scenario documents under ``logs-synth-*`` and removes them
+    when the batch ends, so the Security Onion account needs write access to
+    that pattern. A refused write costs the night its known positive and
+    nothing else, and the snapshot states the cause. Bounded [0, 3] in the
+    config console; the nightly clamps the same way."""
 
     quality_alarm_drop: float = 0.15
     """Absolute agreement-rate drop (0-1) below the trailing 7-point same-mode

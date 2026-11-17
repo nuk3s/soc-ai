@@ -171,6 +171,8 @@ describe('a failed run (RL11, RD13, D1)', () => {
       verdict: 'untriaged',
       failure: { cause: 'alert not found: ev-1', permanent: true },
     });
+    // K2: the raw error is behind the toggle.
+    fireEvent.click(screen.getByRole('button', { name: 'Show the technical detail' }));
     expect(screen.getByTestId('failure-cause')).toHaveTextContent('alert not found: ev-1');
     expect(container.textContent).not.toContain('may have stalled');
     expect(container.textContent).not.toContain('Re-run it to try again');
@@ -190,8 +192,8 @@ describe('a failed run (RL11, RD13, D1)', () => {
 
   it('links the later run that replaced this one', () => {
     const { container } = mount({ status: 'error', verdict: 'untriaged', supersededBy: 'INV-LATER' });
-    expect(screen.getByTestId('superseded-by')).toHaveTextContent('A later run replaced this one.');
-    expect(screen.getByRole('link', { name: 'Open the later run' })).toHaveAttribute(
+    expect(screen.getByTestId('superseded-by')).toHaveTextContent('A later investigation replaced this one.');
+    expect(screen.getByRole('link', { name: 'Open the later investigation' })).toHaveAttribute(
       'href',
       '/investigation/INV-LATER',
     );

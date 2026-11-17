@@ -79,12 +79,31 @@ soc-ai accepts ECS-style dotted field names. The common namespaces are:
 - **Host**: `host.name`, `host.ip`
 - **Identity**: `user.name`
 - **Process**: `process.entity_id`, `process.name`, `process.command_line`
-- **File**: `file.name`, `file.hash.sha256`, `file.hash.md5`
-- **Zeek logs**: `zeek.conn.*`, `zeek.dns.query`, `zeek.http.uri`, `zeek.ssl.server_name`, `zeek.files.*`
-- **Suricata**: `suricata.eve.alert.*`
+- **File**: `file.name`, `file.mime_type`, `hash.md5`, `hash.sha1`, `hash.sha256`, `process.hash.sha256`
+- **Zeek conn**: `connection.state`, `connection.history`, `connection.local.originator`, `connection.local.responder`, `event.duration`, `client.bytes`, `server.bytes`, `network.protocol`
+- **Zeek dns**: `dns.query.name`, `dns.query.type_name`, `dns.response.code_name`, `dns.resolved_ip`
+- **Zeek http**: `http.method`, `http.virtual_host`, `http.uri`, `http.status_code`, `http.useragent`
+- **Zeek ssl**: `ssl.server_name`, `ssl.version`, `ssl.established`, `hash.ja3`, `hash.ja3s`
+- **Zeek ssh**: `ssh.authentication.success`, `ssh.authentication.attempts`, `ssh.client`, `ssh.server`, `ssh.direction`
+- **Zeek kerberos**: `kerberos.request_type`, `kerberos.ticket.cipher`, `kerberos.service`, `kerberos.client`, `kerberos.success`
+- **Zeek smb and dce_rpc**: `smb.path`, `smb.share_type`, `dce_rpc.endpoint`, `dce_rpc.operation`
+- **Alerts**: `tags:alert` selects the Suricata and Sigma alerts. `event.kind:alert` selects the endpoint alerts.
 
 If you name a field outside the whitelist, the validator rejects the query. The error
 names the bad field. Try a more conventional name from the list above before you guess.
+
+### Zeek field names
+
+The grid holds the fields of a Zeek log under the names in the list above. The grid does
+not hold them under `zeek.<log>.<field>`. `zeek.ssh.auth_success` and `zeek.dns.query`
+are older names, and a current grid holds no value under them.
+
+- A Zeek record holds no `host.name`. Select a host on a Zeek record with `source.ip`
+  or `destination.ip`.
+- A Zeek conn record holds no `network.direction`. An outbound connection has
+  `connection.local.originator:true` and `connection.local.responder:false`.
+- If the list above does not name the field you need, call `t_describe_dataset` for the
+  dataset. Use the field names that it returns.
 
 <!-- triage-examples:start -->
 ## Worked examples
@@ -123,34 +142,39 @@ source.ip:203.0.113.50 OR destination.ip:203.0.113.50
 ### 4. Top-10 destination IPs that triggered any alert
 
 ```oql
-event.kind:alert | groupby destination.ip | sortby count desc | head 10
+tags:alert | groupby destination.ip | sortby count desc | head 10
 ```
 
 ### 5. Suspicious outbound traffic on non-standard ports
 
 ```oql
-network.direction:outbound AND NOT destination.port:[80 TO 443]
+event.dataset:zeek.conn AND connection.local.originator:true AND connection.local.responder:false AND NOT destination.port:[80 TO 443]
 | sortby @timestamp desc
 | head 50
 ```
 
 ### 6. Failed DNS lookups for a host
 
+A Zeek record holds no `host.name`. Select the host by its address:
+
 ```oql
-host.name:workstation-01 AND event.module:zeek AND zeek.dns.rcode_name:NXDOMAIN
+event.dataset:zeek.dns AND source.ip:192.0.2.41 AND dns.response.code_name:NXDOMAIN
 | sortby @timestamp desc
 ```
 
 ### 7. Count of alerts grouped by severity in the last day
 
 ```oql
-event.kind:alert | groupby event.severity_label | sortby count desc
+tags:alert | groupby event.severity_label | sortby count desc
 ```
 
 ### 8. Find every event with a specific file hash
 
+A Zeek or Strelka file record holds the hash in `hash.md5`, `hash.sha1` or
+`hash.sha256`. An endpoint process event holds it in `process.hash.sha256`.
+
 ```oql
-file.hash.sha256:deadbeefcafe0000000000000000000000000000000000000000000000000000
+hash.sha256:deadbeefcafe0000000000000000000000000000000000000000000000000000 OR process.hash.sha256:deadbeefcafe0000000000000000000000000000000000000000000000000000
 ```
 
 ### 9. Multi-host beacon pattern
@@ -158,8 +182,8 @@ file.hash.sha256:deadbeefcafe000000000000000000000000000000000000000000000000000
 This query returns the top destinations that many hosts contact.
 
 ```oql
-event.module:zeek AND zeek.conn.duration:[60 TO *]
-| groupby destination.ip, host.name
+event.dataset:zeek.conn AND event.duration:[60 TO *]
+| groupby destination.ip, source.ip
 | sortby count desc
 | head 20
 ```
@@ -169,7 +193,7 @@ event.module:zeek AND zeek.conn.duration:[60 TO *]
 This query returns the count only. It returns no documents.
 
 ```oql
-event.kind:alert | count
+tags:alert | count
 ```
 
 <!-- triage-examples:end -->
@@ -185,15 +209,18 @@ finding.
 These are TGS requests with RC4. The attacker harvests tickets under a weak cipher.
 
 ```oql
-event.dataset:zeek.kerberos AND zeek.kerberos.request_type:TGS AND zeek.kerberos.cipher:RC4-HMAC
+event.dataset:zeek.kerberos AND kerberos.request_type:TGS AND kerberos.ticket.cipher:rc4-hmac
 ```
 
 ### 12. PsExec service creation
 
-This is classic remote-execution lateral movement.
+This is classic remote-execution lateral movement. PsExec writes the service binary
+`PSEXESVC.exe` to the `ADMIN$` share. Call `t_describe_dataset` for `zeek.smb_files`.
+Its answer names the field that holds the file name. Filter that field with
+`PSEXESVC*`. The share connections are in `zeek.smb_mapping`:
 
 ```oql
-event.dataset:zeek.smb_files AND zeek.smb_files.name:PSEXESVC*
+event.dataset:zeek.smb_mapping AND smb.share_type:DISK | groupby smb.path
 ```
 
 ### 13. Successful SSH logins
@@ -201,7 +228,7 @@ event.dataset:zeek.smb_files AND zeek.smb_files.name:PSEXESVC*
 These logins completed.
 
 ```oql
-event.dataset:zeek.ssh AND zeek.ssh.auth_success:true
+event.dataset:zeek.ssh AND ssh.authentication.success:true
 ```
 
 ### 14. RITA-style behavioral rollups
@@ -221,7 +248,7 @@ Find the SET of internal hosts that contacted it. The fan-out itself is a findin
 indicator below is the TEST-NET address `203.0.113.7`:
 
 ```oql
-destination.ip:203.0.113.7 | groupby host.name | sortby count desc
+destination.ip:203.0.113.7 | groupby source.ip | sortby count desc
 ```
 
 ### 16. Which datasets one host ships
@@ -242,6 +269,23 @@ Use the address when you do not know the name:
 ```oql
 host.ip:192.0.2.41 | groupby event.dataset
 ```
+
+## Zero-hit results
+
+A query that filters on a field returns zero for one of two causes. No document has the
+value, or no document holds the field. Only the first cause is evidence of absence.
+
+After each zero-hit query, soc-ai counts the documents that hold each field you named. It
+counts in the same dataset and the same window. A `groupby` that returns no bucket gets
+the same check.
+
+- **The result holds a `field_note`.** No document in that dataset and window holds a
+  field that you named. **That zero is not evidence of absence.** Do not write "none
+  found" or "no successful login" from it. Call `t_describe_dataset` for the dataset.
+  Read the real field name. Run the query again.
+- **The result holds no `field_note`.** Documents hold every field that you named. The
+  zero then means that no document has that value in that window.
+- `t_field_values` reports the same check in its `note` field.
 
 ## Common pitfalls (avoid these)
 

@@ -1,8 +1,9 @@
-import { AtSign, Bell, BookOpen, ChevronsLeft, Crosshair, Globe, History, Info, Keyboard, LayoutDashboard, Search, Server, Settings, SlidersHorizontal, Triangle, User, Wrench, Zap } from 'lucide-react';
+import { AtSign, Bell, BookOpen, ChevronsLeft, Crosshair, Globe, History, Info, Keyboard, LayoutDashboard, Network, Search, Server, Settings, SlidersHorizontal, Triangle, User, Wrench, Zap } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { getAlerts, getConfig, getHealth, getInvestigations, listMachines, searchEntityIndex, signOut } from '../lib/api';
+import { getAbout, getAlerts, getConfig, getHealth, getInvestigations, listMachines, searchEntityIndex, signOut } from '../lib/api';
+import { releaseNotesUrl } from '../lib/docsSite';
 import { buildConfigLayout, keyToSectionId } from '../lib/configLayout';
 import type { ConfigParent } from '../lib/configLayout';
 import { machineHref } from '../lib/hostsList';
@@ -167,6 +168,9 @@ export function CommandPalette() {
   // with no word on the window, the severities or the model cost (dogfood
   // 2026-10-19, R1-D14).
   const [bulk, setBulk] = useState<BulkCheck | null>(null);
+  // The running version, for the Release notes entry. Read once per mount.
+  const [version, setVersion] = useState<string | null>(null);
+  const versionRequested = useRef(false);
   const confirmRef = useRef<HTMLButtonElement>(null);
   const cancelRef = useRef<HTMLButtonElement>(null);
 
@@ -184,6 +188,8 @@ export function CommandPalette() {
       { group: 'Go to', label: 'Hosts', icon: <Server size={15} />, run: go('/hosts') },
       { group: 'Go to', label: 'Notifications', icon: <Bell size={15} />, run: go('/notifications') },
       { group: 'Go to', label: 'Hunts', icon: <Crosshair size={15} />, run: go('/hunts') },
+      // The campaign pages have no side item. The palette is a way in.
+      { group: 'Go to', label: 'Campaigns', icon: <Network size={15} />, run: go('/campaigns') },
       // Operator group, sidebar order: the hub first, then its three items.
       { group: 'Go to', label: 'Status', icon: <Wrench size={15} />, run: go('/operate') },
       { group: 'Go to', label: 'Runbooks', icon: <BookOpen size={15} />, run: go('/runbooks') },
@@ -217,6 +223,17 @@ export function CommandPalette() {
         },
       },
       {
+        group: 'Help',
+        label: 'Release notes',
+        icon: <BookOpen size={15} />,
+        run: () => {
+          closePalette();
+          // The notes of the running version. With no version read yet,
+          // the changelog.
+          window.open(releaseNotesUrl(version), '_blank', 'noopener');
+        },
+      },
+      {
         group: 'Action',
         label: (collapsed ? 'Expand' : 'Collapse') + ' sidebar',
         icon: <ChevronsLeft size={15} />,
@@ -245,7 +262,7 @@ export function CommandPalette() {
           ] satisfies Command[])),
     ];
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [collapsed, navigate, closePalette, toggleNav, signedOut, openShortcuts]);
+  }, [collapsed, navigate, closePalette, toggleNav, signedOut, openShortcuts, version]);
 
   // Entity corpus for the search half of "Search or jump to": fetched once per
   // palette open (fail-soft — a fetch error just means command-only results).
@@ -363,7 +380,13 @@ export function CommandPalette() {
         else navigate(h.to);
       },
     }));
-    return [...base, ...hostCmds, ...indexCmds, ...entities, ...settings];
+    // L4: investigations and hosts rank before hunts. A hunt hit was first,
+    // and its label was a 13-line prompt (review 2026-11-12).
+    const investigations = entities.filter((c) => c.group === 'Investigations');
+    const alerts = entities.filter((c) => c.group !== 'Investigations');
+    const hunts = indexCmds.filter((c) => c.group === 'Hunts');
+    const others = indexCmds.filter((c) => c.group !== 'Hunts');
+    return [...base, ...hostCmds, ...investigations, ...others, ...alerts, ...hunts, ...settings];
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [q, commands, hostResult, indexResult, invs, groups, layout]);
 
@@ -376,6 +399,12 @@ export function CommandPalette() {
     setBulk(null);
     getInvestigations().then(setInvs).catch(() => {});
     getAlerts({ range: '7d' }).then((q) => setGroups(q.groups)).catch(() => {});
+    if (!versionRequested.current) {
+      versionRequested.current = true;
+      getAbout()
+        .then((a) => setVersion(a.version || null))
+        .catch(() => {});
+    }
     if (!configRequested.current) {
       configRequested.current = true;
       getConfig()

@@ -370,6 +370,64 @@ def _conn_query(ip: str, window: str) -> dict[str, Any]:
     }
 
 
+async def fetch_newest_events(
+    elastic: ElasticClient, settings: Settings, ips: list[str], *, window: str = "24h"
+) -> dict[str, str]:
+    """The newest connection record of each address, in ONE search.
+
+    The Hosts list reads this for its Last seen column. The stored last seen is
+    the newest event the last sweep saw, so every row read the age of the
+    sweep (review 2026-11-12). The host page reads the newest record of the
+    same datasets (:func:`fetch_host_activity`), so the list and the page agree.
+    An address with no record in ``window`` is absent from the answer.
+    """
+    wanted = list(dict.fromkeys(ip for ip in ips if ip))
+    if not wanted:
+        return {}
+    since = TIME_RANGES[_supported(window)]
+    query = {
+        "bool": {
+            "filter": [
+                {
+                    "bool": {
+                        "should": [
+                            {"terms": {"event.dataset": list(CONN_DATASETS)}},
+                            {"terms": {"data_stream.dataset": list(CONN_DATASETS)}},
+                        ],
+                        "minimum_should_match": 1,
+                    }
+                },
+                {"range": {"@timestamp": {"gte": since}}},
+                {
+                    "bool": {
+                        "should": [
+                            {"terms": {"source.ip": wanted}},
+                            {"terms": {"destination.ip": wanted}},
+                        ],
+                        "minimum_should_match": 1,
+                    }
+                },
+            ],
+            "must_not": [{"exists": {"field": "synth.scenario_id"}}],
+        }
+    }
+    aggs = {
+        "by_ip": {
+            "filters": {"filters": {ip: _either_endpoint(ip) for ip in wanted}},
+            "aggs": {"newest": {"max": {"field": "@timestamp"}}},
+        }
+    }
+    result = await elastic.search(settings.events_index_pattern, query, size=0, aggs=aggs)
+    buckets = ((result.aggregations or {}).get("by_ip") or {}).get("buckets") or {}
+    out: dict[str, str] = {}
+    if isinstance(buckets, dict):
+        for ip, bucket in buckets.items():
+            stamp = _fold_newest(bucket if isinstance(bucket, dict) else {})
+            if stamp:
+                out[str(ip)] = stamp
+    return out
+
+
 def _peer_aggs(peer_field: str) -> dict[str, Any]:
     return {
         "peers": {

@@ -1,5 +1,6 @@
 import { AlertTriangle, Check, Loader2, X } from 'lucide-react';
 import { useEffect, useId, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
 import {
   dismissAction,
   executeAction,
@@ -42,7 +43,16 @@ import { isBacktestReplay } from './BacktestReplayChip';
 // ---------------------------------------------------------------------------
 
 /** The note on a replay row. The words of the server and the action card. */
-export const REPLAY_ACTION_NOTE = 'Not executable. This run is a backtest replay.';
+export const REPLAY_ACTION_NOTE = 'Not executable. This investigation is a backtest replay.';
+
+/** The row of a finding escalate whose earlier press recorded no result. The
+ *  card of the investigation states the full sentence and offers "Try again"
+ *  behind a confirm. A press on the row only returned the blocked sentence. */
+export const BLOCKED_CASE_ROW =
+  'The case request did not finish. Open the investigation to try again.';
+
+/** The link of a blocked row. */
+export const BLOCKED_CASE_LINK = 'Open the investigation';
 
 /** "The alert of ET X" / "Security Onion case 42" / "The finding X": what
  *  the action acts on. The row called a finding or a lead "The alert of ..."
@@ -74,7 +84,14 @@ export function actionConfirmText(
   scopeState: 'idle' | 'loading' | 'error',
 ): string {
   const name = a.target || rule;
-  if (a.type === 'escalate') return `Open a Security Onion case for the alert of ${name}.`;
+  if (a.type === 'escalate') {
+    // A promoted finding has no alert. Its case comes from the finding, and
+    // the server states the alerts that the case attaches.
+    if (a.targetType !== 'finding') return `Open a Security Onion case for the alert of ${name}.`;
+    return scope?.scope === 'finding'
+      ? scope.sentence
+      : `Open a Security Onion case for the finding ${name}.`;
+  }
   if (a.type === 'comment') {
     return a.target
       ? `Add a comment to Security Onion case ${a.target}.`
@@ -161,7 +178,10 @@ function WaitingActionLine({
   // replay and refuses each write, the dismissal too. The client keeps the
   // rule, so an older server or a stale flag cannot offer the button.
   const replay = isBacktestReplay(row.ranBy);
-  const canExecute = a.executable && !replay;
+  // A finding escalate that waits on "Try again" offers no write on the row.
+  // The card of the investigation holds the retry and its confirm.
+  const blockedCase = a.type === 'escalate' && a.retry === true && !replay;
+  const canExecute = a.executable && !replay && !blockedCase;
   const reason = replay ? REPLAY_ACTION_NOTE : a.executable ? null : a.reason;
   // The word of the action card names the write. "Execute" named nothing.
   const verb = ACTION_VERB[a.type] ?? a.label;
@@ -320,19 +340,30 @@ function WaitingActionLine({
                 {busy === 'executing' ? 'Writing to Security Onion' : 'Storing the dismissal'}
               </span>
             )}
-            <button
-              ref={executeRef}
-              type="button"
-              aria-describedby={targetId}
-              aria-expanded={confirm === 'write'}
-              disabled={busy !== null || !canExecute}
-              title={reason ?? undefined}
-              onClick={() => (confirm === 'write' ? close() : open('write', executeRef.current))}
-              className={`${btn} border-success-btn-border bg-success-btn text-[#eafff2] hover:bg-[#22824c] disabled:hover:bg-success-btn`}
-            >
-              <Check size={13} />
-              {verb}
-            </button>
+            {blockedCase ? (
+              <Link
+                to={`/investigation/${encodeURIComponent(row.id)}`}
+                aria-describedby={targetId}
+                data-testid="waiting-action-open-investigation"
+                className={`${btn} border-border-strong bg-surface-3 text-accent hover:text-text`}
+              >
+                {BLOCKED_CASE_LINK}
+              </Link>
+            ) : (
+              <button
+                ref={executeRef}
+                type="button"
+                aria-describedby={targetId}
+                aria-expanded={confirm === 'write'}
+                disabled={busy !== null || !canExecute}
+                title={reason ?? undefined}
+                onClick={() => (confirm === 'write' ? close() : open('write', executeRef.current))}
+                className={`${btn} border-success-btn-border bg-success-btn text-[#eafff2] hover:bg-[#22824c] disabled:hover:bg-success-btn`}
+              >
+                <Check size={13} />
+                {verb}
+              </button>
+            )}
             <button
               ref={dismissRef}
               type="button"
@@ -349,7 +380,12 @@ function WaitingActionLine({
         )}
       </div>
       {a.rationale && <div className="text-[12px] leading-[1.5] text-dim">{a.rationale}</div>}
-      {reason && (
+      {blockedCase && (
+        <div data-testid="waiting-action-blocked" className="text-[12px] leading-[1.5] text-warn">
+          {BLOCKED_CASE_ROW}
+        </div>
+      )}
+      {reason && !blockedCase && (
         <div data-testid="waiting-action-reason" className="text-[12px] leading-[1.5] text-faint">
           {reason}
         </div>

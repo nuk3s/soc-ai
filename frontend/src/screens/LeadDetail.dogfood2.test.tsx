@@ -128,7 +128,7 @@ describe('C8: the reasons sit in plain view', () => {
   it('states what a hunt does under the actions, and what "left to you" means', async () => {
     vi.mocked(getLead).mockResolvedValue(NEW as never);
     mount();
-    expect((await screen.findByTestId('lead-actions-line')).textContent).toBe(
+    expect((await screen.findByTestId('lead-action-effect-hunt')).textContent).toBe(
       'Hunt this lead. soc-ai investigates each threat finding of the hunt and shows the verdicts.',
     );
     expect(screen.getByTestId('lead-left-to-you-reason').textContent).toMatch(
@@ -136,12 +136,15 @@ describe('C8: the reasons sit in plain view', () => {
     );
   });
 
-  // Negative control: the hunted lead states the verb too, and offers no
-  // control the line does not name.
-  it('states the verb on a hunted lead, with no investigation control', async () => {
+  // Negative control: a hunted lead states the buttons it offers. It offers
+  // no "Hunt this lead", so it prints no line for one (review 2026-11-12, F5),
+  // and it offers no investigation control.
+  it('states the buttons of a hunted lead, with no investigation control', async () => {
     mount();
     await screen.findByTestId('lead-status');
-    expect(screen.getByTestId('lead-actions-line')).toBeTruthy();
+    expect(screen.getByTestId('lead-action-effect-readHunt')).toBeTruthy();
+    expect(screen.getByTestId('lead-action-effect-huntAgain')).toBeTruthy();
+    expect(screen.queryByTestId('lead-action-effect-hunt')).toBeNull();
     expect(screen.queryByRole('button', { name: /Open an investigation|Promote/ })).toBeNull();
   });
 
@@ -289,15 +292,16 @@ describe('C2: the header says why this is a lead', () => {
   it('states the observations by type, the entity and the span', async () => {
     vi.mocked(getLead).mockResolvedValue(LEAD7 as never);
     mount();
-    expect((await screen.findByTestId('lead-why')).textContent).toBe(
-      'Why this is a lead: 2 rate spikes and 2 off-hours sightings on one host in 18 days.',
+    // The first sentence of the state line. It names the host.
+    expect((await screen.findByTestId('lead-state-sentence')).textContent).toMatch(
+      /^soc-ai saw 2 rate spikes and 2 off-hours sightings on 10\.99\.0\.40 in 18 days\. /,
     );
   });
 
   it('keeps the weights behind the Scoring toggle', async () => {
     vi.mocked(getLead).mockResolvedValue(LEAD7 as never);
     mount();
-    await screen.findByTestId('lead-why');
+    await screen.findByTestId('lead-state-sentence');
     // Negative control: no weight is on screen before the toggle.
     expect(screen.queryByTestId('lead-meta')).toBeNull();
     expect(screen.queryByText(/weight now/)).toBeNull();

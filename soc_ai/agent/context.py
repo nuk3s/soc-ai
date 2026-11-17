@@ -276,6 +276,14 @@ class HuntSubject(BaseModel):
     # later hunt that finds the same subject reuses this run. None for a lead
     # promotion, which promotes no one finding.
     subject_fingerprint: str | None = None
+    # When the hunt started and ended (naive UTC, as the hunt row stores them),
+    # and whether it is a synthetic-evaluation hunt. The anchor rule reads the
+    # grid inside the window of the hunt for a finding that cites no document
+    # of its own (soc_ai.webui.finding_promotion). None on a subject built by
+    # hand, and that rule then reads no grid.
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    is_synth_eval: bool = False
 
     @property
     def promoted_finding(self) -> SubjectFinding | None:
@@ -298,6 +306,13 @@ class HuntSubject(BaseModel):
             return []
         wanted = set(finding.citations)
         return [d.id for d in self.documents if d.id in wanted]
+
+    def promoted_hosts(self) -> list[str]:
+        """The hosts that the promoted finding names. Empty for a lead promotion."""
+        finding = self.promoted_finding
+        if finding is None:
+            return []
+        return [h for h in finding.hosts if isinstance(h, str) and h.strip()]
 
     def claim(self) -> dict[str, Any] | None:
         """The claim of the promoted finding for the Oracle case, or None.
@@ -677,4 +692,7 @@ async def build_hunt_subject(
         ],
         documents=documents,
         documents_omitted=omitted,
+        started_at=hunt.created_at,
+        finished_at=hunt.finished_at,
+        is_synth_eval=bool(hunt.is_synth_eval),
     )

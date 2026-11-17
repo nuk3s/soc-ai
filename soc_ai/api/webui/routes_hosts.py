@@ -17,6 +17,7 @@ dossiers. A declaration the operator makes between two sweeps shows at once.
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import re
 from dataclasses import dataclass, field
@@ -24,15 +25,20 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 from urllib.parse import quote
 
-from fastapi import Depends, Query, Request
+from elastic_transport import TransportError
+from elasticsearch import ApiError
+from fastapi import Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from soc_ai.api.deps import get_settings_dep
+from soc_ai.api.deps import get_elastic, get_settings_dep
+from soc_ai.api.webui._campaign_link import HostCampaignOut, host_campaign_out
 from soc_ai.api.webui._errors import api_error
 from soc_ai.api.webui._shared import _iso_utc, router
+from soc_ai.api.webui.routes_alerts import _es_api_error_http, _grid_unavailable
 from soc_ai.api.webui.routes_dossier import DossierOut, _current_dossier, last_finished_sweep
+from soc_ai.campaigns import service as campaign_svc
 from soc_ai.config import Settings
 from soc_ai.dossier.infer import ROLE_VOCABULARY
 from soc_ai.dossier.resolve import (
@@ -40,10 +46,12 @@ from soc_ai.dossier.resolve import (
     DEFAULT_STALENESS_HOURS,
     resolve_field,
 )
+from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.store import host_dossier as dossier_store
 from soc_ai.store import host_machines
 from soc_ai.store.host_machines import address_sort_key, normalize_mac, short_name
 from soc_ai.store.models import HostDossier, HostDossierField, HostMachine
+from soc_ai.webui import host_activity as activity_query
 
 # "New" means first seen inside this window.
 _NEW_DAYS = 7
@@ -53,7 +61,21 @@ _MAX_LIMIT = 500
 # Addresses a list row carries. The machine page lists all of them.
 _ROW_ADDRESSES = 5
 
-_SORTS: tuple[str, ...] = ("name", "address", "role", "agent", "events", "first_seen", "last_seen")
+_SORTS: tuple[str, ...] = (
+    "name",
+    "address",
+    "role",
+    "agent",
+    "events",
+    "first_seen",
+    "last_seen",
+    "findings",
+)
+# The window of the confirmed threat count in the Findings column. The column
+# header states it.
+_FINDINGS_DAYS = 7
+# Addresses one GET /hosts/last-events call reads. Four pages of 50 rows.
+_LAST_EVENTS_MAX = 200
 _DIRS: tuple[str, ...] = ("asc", "desc")
 # The direction a column sorts in when the request names none: text and
 # addresses A to Z, counts and times largest and newest first.
@@ -65,6 +87,7 @@ _DEFAULT_DIR: dict[str, str] = {
     "events": "desc",
     "first_seen": "desc",
     "last_seen": "desc",
+    "findings": "desc",
 }
 _ROLE_BUCKETS: tuple[str, ...] = ("unknown", "low_confidence", "stale")
 # A role filter on a guess the resolver withheld: ``guess:<slug>`` lists the
@@ -125,6 +148,27 @@ class MachineFlagsOut(BaseModel):
     rebound: bool = False
 
 
+class MachineFindingsOut(BaseModel):
+    """The findings on one machine, for the Findings column of the list."""
+
+    # Real runs that reached the verdict true positive in the last ``days``
+    # days and name an address or the name of the machine. A run that a newer
+    # run of the same alert replaced does not count.
+    confirmed: int = 0
+    # Leads that are open or hunting and name the machine, at any age.
+    open_leads: int = 0
+    days: int = _FINDINGS_DAYS
+
+
+class MachineLastEventsOut(BaseModel):
+    """The newest grid event of each address, read live in one search."""
+
+    # Address to the time of its newest connection record, ISO UTC. An
+    # address with no record in the window is absent.
+    events: dict[str, str] = Field(default_factory=dict)
+    window: str = "24h"
+
+
 class MachineRowOut(BaseModel):
     """One machine in the Hosts list."""
 
@@ -143,6 +187,10 @@ class MachineRowOut(BaseModel):
     first_seen: str | None = None
     last_seen: str | None = None
     flags: MachineFlagsOut = Field(default_factory=MachineFlagsOut)
+    # The security column of the list (review 2026-11-12): the true positive
+    # verdicts on the machine in the last 7 days, and the open leads that name
+    # it. Two store reads for the whole list, no request per row.
+    findings: MachineFindingsOut = Field(default_factory=MachineFindingsOut)
     # The error the last sweep stored on the primary address, when the build
     # failed. The list states it as a sentence on a machine with no clean build.
     build_error: str | None = None
@@ -195,6 +243,23 @@ class MachineResolveOut(BaseModel):
     matched: _AsMatched
 
 
+class HostNameOut(BaseModel):
+    """The name and the role of the machine that holds one address."""
+
+    key: str
+    name: str | None = None
+    # The role slug. A role the resolver withheld as a guess carries
+    # ``roleGuess`` True, and the console marks it as a guess.
+    role: str | None = None
+    roleGuess: bool = False
+
+
+class HostNamesOut(BaseModel):
+    """Each asked address that a machine with a name or a role holds."""
+
+    hosts: dict[str, HostNameOut] = Field(default_factory=dict)
+
+
 class MachineAddressOut(BaseModel):
     ip: str
     kind: str
@@ -219,6 +284,9 @@ class MachineDetailOut(MachineRowOut):
     macs: list[str] = Field(default_factory=list)
     merged_from: list[str] = Field(default_factory=list)
     dossier: DossierOut | None = None
+    # The active campaigns where this machine is a party, newest last event
+    # first. Empty when the machine is in no campaign.
+    campaigns: list[HostCampaignOut] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +325,8 @@ class _View:
     rebound: bool
     build_error: str | None = None
     search_rank: int | None = field(default=None)
+    confirmed: int = 0
+    open_leads: int = 0
 
     @property
     def primary_ip(self) -> str:
@@ -364,10 +434,20 @@ def _names(
     return names[0][0], names[0][1], names
 
 
-async def _estate(db: AsyncSession, knobs: _Knobs) -> list[_View]:
-    """Every live machine, read with its addresses and the live dossier facts."""
-    machines = (await db.scalars(select(HostMachine).where(HostMachine.address_count > 0))).all()
-    hosts = (await db.scalars(select(HostDossier).where(HostDossier.machine_id.is_not(None)))).all()
+async def _estate(db: AsyncSession, knobs: _Knobs, only: set[int] | None = None) -> list[_View]:
+    """Every live machine, read with its addresses and the live dossier facts.
+
+    ``only`` limits the read to those machine ids.
+    """
+    machine_where: list[Any] = [HostMachine.address_count > 0]
+    host_where: list[Any] = [HostDossier.machine_id.is_not(None)]
+    if only is not None:
+        if not only:
+            return []
+        machine_where.append(HostMachine.id.in_(only))
+        host_where.append(HostDossier.machine_id.in_(only))
+    machines = (await db.scalars(select(HostMachine).where(*machine_where))).all()
+    hosts = (await db.scalars(select(HostDossier).where(*host_where))).all()
     by_machine: dict[int, list[HostDossier]] = {}
     for host in hosts:
         by_machine.setdefault(int(host.machine_id or 0), []).append(host)
@@ -497,6 +577,91 @@ def _as_address(host: HostDossier) -> _Address:
         first_seen=host.first_seen,
         last_seen=host.last_seen,
     )
+
+
+def _machine_index(views: list[_View]) -> tuple[dict[str, _View], dict[str, _View]]:
+    """Each address and each unique name of the estate, to its machine."""
+    by_ip: dict[str, _View] = {}
+    by_name: dict[str, _View] = {}
+    shared: set[str] = set()
+    for view in views:
+        for address in view.members:
+            by_ip[address.ip] = view
+        for value, _source in view.names:
+            folded = value.casefold()
+            if folded in by_name and by_name[folded] is not view:
+                shared.add(folded)
+            by_name[folded] = view
+    for folded in shared:
+        by_name.pop(folded, None)
+    return by_ip, by_name
+
+
+async def _attach_findings(db: AsyncSession, views: list[_View], now: datetime) -> None:
+    """Count the confirmed threats and the open leads of every machine.
+
+    Two reads for the whole estate: the true positive runs of the window, and
+    the open leads. Each is mapped to a machine by address, or by a name that
+    one machine holds. A run counts once per machine even when both ends of
+    the flow are its addresses.
+    """
+    from soc_ai.store import investigations as inv_svc  # noqa: PLC0415 - lazy
+    from soc_ai.store.models import Investigation, Lead  # noqa: PLC0415 - lazy
+
+    by_ip, by_name = _machine_index(views)
+    if not by_ip:
+        return
+    since = _naive(now) - timedelta(days=_FINDINGS_DAYS)
+    runs = (
+        await db.execute(
+            select(
+                Investigation.id,
+                Investigation.src_ip,
+                Investigation.dest_ip,
+                Investigation.host_name,
+            ).where(
+                Investigation.status == "complete",
+                Investigation.verdict == "true_positive",
+                Investigation.is_fallback.is_not(True),
+                Investigation.is_synth_eval.is_(False),
+                # The time of the event (migration 0072): a verdict of today
+                # on an event of 10 days ago is no finding of the 7 days.
+                Investigation.event_at >= since,
+                inv_svc.not_backtest(),
+                ~inv_svc.superseded_sql(),
+            )
+        )
+    ).all()
+    confirmed: dict[int, set[str]] = {}
+    for run_id, src, dst, host_name in runs:
+        # Keyed by identity: a view is a mutable dataclass, so it has no hash.
+        hit = {id(by_ip[ip]) for ip in (src, dst) if ip and ip in by_ip}
+        if host_name and host_name.casefold() in by_name:
+            hit.add(id(by_name[host_name.casefold()]))
+        for key in hit:
+            confirmed.setdefault(key, set()).add(str(run_id))
+    leads = (
+        await db.execute(
+            select(Lead.id, Lead.entities_json).where(Lead.status.in_(("open", "hunting")))
+        )
+    ).all()
+    open_leads: dict[int, set[int]] = {}
+    for lead_id, entities in leads:
+        for entry in entities or []:
+            if isinstance(entry, list | tuple) and len(entry) >= 2:
+                kind, value = str(entry[0] or ""), str(entry[1] or "")
+            elif isinstance(entry, dict):
+                kind, value = str(entry.get("kind") or ""), str(entry.get("key") or "")
+            else:
+                continue
+            view = by_ip.get(value)
+            if view is None and kind == "host":
+                view = by_name.get(value.casefold())
+            if view is not None:
+                open_leads.setdefault(id(view), set()).add(int(lead_id))
+    for view in views:
+        view.confirmed = len(confirmed.get(id(view), ()))
+        view.open_leads = len(open_leads.get(id(view), ()))
 
 
 # ---------------------------------------------------------------------------
@@ -663,6 +828,8 @@ def _sort_value(view: _View, sort: str) -> Any:
         return view.events
     if sort == "first_seen":
         return view.first_seen
+    if sort == "findings":
+        return (view.confirmed, view.open_leads)
     return view.last_seen
 
 
@@ -748,6 +915,7 @@ def _row_out(view: _View) -> MachineRowOut:
             rebound=view.rebound,
         ),
         build_error=view.build_error if view.broken else None,
+        findings=MachineFindingsOut(confirmed=view.confirmed, open_leads=view.open_leads),
     )
 
 
@@ -798,6 +966,7 @@ async def list_machines(
     knobs = _knobs(settings)
     async with request.app.state.db_sessionmaker() as db:
         views = await _estate(db, knobs)
+        await _attach_findings(db, views, knobs.now)
     filters.role = _check_role(role, views)
     kept: list[_View] = []
     for view in views:
@@ -885,6 +1054,44 @@ async def machine_summary(
     )
 
 
+@router.get("/hosts/last-events", response_model=MachineLastEventsOut)
+async def machine_last_events(
+    ip: list[str] = Query(default_factory=list),
+    settings: Settings = Depends(get_settings_dep),
+    elastic: ElasticClient = Depends(get_elastic),
+) -> MachineLastEventsOut:
+    """The newest grid event of each address, for the Last seen column.
+
+    One search for a page of the list, never one per row. The list itself
+    reads the store and keeps working while the grid is down. This route
+    answers 503 then, and the column keeps the time the last sweep saw.
+    """
+    wanted: list[str] = []
+    for value in ip:
+        text = value.strip()
+        try:
+            ipaddress.ip_address(text)
+        except ValueError:
+            raise api_error(
+                422, "invalid_ip", f"The value '{text[:64]}' is not an IP address."
+            ) from None
+        wanted.append(text)
+    if len(wanted) > _LAST_EVENTS_MAX:
+        raise api_error(
+            422,
+            "too_many_addresses",
+            f"Send at most {_LAST_EVENTS_MAX} addresses in one request.",
+        )
+    try:
+        async with asyncio.timeout(settings.webui_grid_timeout_s):
+            events = await activity_query.fetch_newest_events(elastic, settings, wanted)
+    except (TimeoutError, TransportError) as exc:
+        raise HTTPException(status_code=503, detail=_grid_unavailable(exc)) from exc
+    except ApiError as exc:
+        raise _es_api_error_http(exc) from exc
+    return MachineLastEventsOut(events=events, window="24h")
+
+
 _NO_HOST_HINT = "No machine holds this value. Run a sweep, or search the Hosts list."
 
 
@@ -911,6 +1118,70 @@ async def resolve_machine(
     return MachineResolveOut(key=held.key, primary_ip=held.primary_ip, matched=matched)
 
 
+# Addresses one names read takes. A list page shows at most a few hundred.
+_NAMES_MAX = 200
+
+
+@router.get("/hosts/names", response_model=HostNamesOut)
+async def host_names(
+    request: Request,
+    ip: list[str] = Query(default_factory=list),
+    settings: Settings = Depends(get_settings_dep),
+) -> HostNamesOut:
+    """The machine name and role of each address, in one read for a list page.
+
+    The Alerts and Investigations lists showed "10.x.x.x → 10.y.y.y" while the
+    Hosts list knew the name and the role of both ends (prod review
+    2026-11-12, ui-core 9). The name and the role are the ones the Hosts list
+    shows. A container address and an address no machine holds are left out.
+    A machine with no name and no role is left out, so the console prints the
+    address alone. More than ``_NAMES_MAX`` addresses is a 422.
+    """
+    wanted = {value.strip() for value in ip if value and value.strip()}
+    if len(wanted) > _NAMES_MAX:
+        raise api_error(
+            422, "too_many_addresses", f"Send at most {_NAMES_MAX} addresses in one read."
+        )
+    if not wanted:
+        return HostNamesOut()
+    knobs = _knobs(settings)
+    async with request.app.state.db_sessionmaker() as db:
+        machine_ids = {
+            int(machine_id)
+            for machine_id in (
+                await db.scalars(
+                    select(HostDossier.machine_id).where(
+                        HostDossier.ip.in_(wanted),
+                        HostDossier.machine_id.is_not(None),
+                        or_(
+                            HostDossier.address_kind.is_(None),
+                            HostDossier.address_kind != "container",
+                        ),
+                    )
+                )
+            ).all()
+            if machine_id is not None
+        }
+        views = await _estate(db, knobs, only=machine_ids)
+    out: dict[str, HostNameOut] = {}
+    for view in views:
+        role = view.role
+        firm = role.state in ("declared", "inferred") and bool(role.value)
+        slug = role.value if firm else role.guess
+        if view.name is None and not slug:
+            continue
+        entry = HostNameOut(
+            key=view.row.machine_key,
+            name=view.name,
+            role=slug or None,
+            roleGuess=bool(slug) and not firm,
+        )
+        for member in view.members:
+            if member.ip in wanted:
+                out[member.ip] = entry
+    return HostNamesOut(hosts=out)
+
+
 @router.get("/hosts/{key}", response_model=MachineDetailOut)
 async def get_machine(
     request: Request, key: str, settings: Settings = Depends(get_settings_dep)
@@ -919,6 +1190,7 @@ async def get_machine(
 
     ``dossier`` is the per-address dossier of the primary address. A key that an
     earlier sweep merged into this machine answers with this machine.
+    ``campaigns`` holds the active campaigns where the machine is a party.
     """
     knobs = _knobs(settings)
     async with request.app.state.db_sessionmaker() as db:
@@ -928,6 +1200,10 @@ async def get_machine(
         view = next((v for v in views if key in (v.row.merged_from_json or [])), None)
     if view is None:
         raise api_error(404, "no_host", _NO_HOST_HINT)
+    async with request.app.state.db_sessionmaker() as db:
+        campaigns = await campaign_svc.campaigns_of_machine(
+            db, [view.row.machine_key, *(str(k) for k in view.row.merged_from_json or [])]
+        )
     base = _row_out(view).model_dump(exclude={"addresses"})
     primary = view.primary_ip
     dossier = await _current_dossier(request, primary, settings) if primary else None
@@ -953,6 +1229,7 @@ async def get_machine(
         macs=[m for m in (normalize_mac(str(m)) for m in view.row.macs_json or []) if m],
         merged_from=[str(k) for k in view.row.merged_from_json or []],
         dossier=dossier,
+        campaigns=[host_campaign_out(c) for c in campaigns],
     )
 
 

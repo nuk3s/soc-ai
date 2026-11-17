@@ -1,128 +1,178 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="876" viewBox="0 0 1600 876" font-family="Inter, system-ui, -apple-system, Segoe UI, sans-serif">
-<defs><marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#58a6ff"/></marker><marker id="arrow-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#d29922"/></marker><marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3fb950"/></marker><marker id="arrow-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#a371f7"/></marker></defs>
-<rect width="1600" height="876" fill="#0d1117"/>
-<text x="32" y="40" font-size="22" font-weight="700" fill="#e6edf3">How this flows: from an alert or a sweep to an action in Security Onion</text>
-<text x="32" y="62" font-size="13" fill="#8b949e">Two inputs enter on the left. Each box states what the thing is. Blue: the sweep path. Purple: the alert path and the investigation. Amber: what waits on you. Green: a loop back to observations.</text>
-<text x="32" y="96" font-size="11" font-weight="700" fill="#58a6ff" letter-spacing="1">THE SWEEP PATH · EVERY HOUR</text>
-<rect x="32" y="104" width="236" height="216" rx="10" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
-<text x="48" y="132" font-size="18" font-weight="700" fill="#e6edf3">Analytic</text>
-<text x="252" y="131" font-size="11" font-weight="700" fill="#58a6ff" text-anchor="end" letter-spacing="1">RUNS</text>
-<text x="48" y="154" font-size="13" font-weight="600" fill="#e6edf3">One written detection.</text>
-<text x="48" y="176" font-size="12.5" fill="#e6edf3">The sweep runs it every hour.</text>
-<text x="48" y="193" font-size="12.5" fill="#e6edf3">live: its hits can form a lead.</text>
-<text x="48" y="210" font-size="12.5" fill="#e6edf3">shadow: you read its hits.</text>
-<text x="48" y="227" font-size="12.5" fill="#8b949e">draft → shadow → live → retired</text>
-<text x="48" y="244" font-size="12.5" fill="#e6edf3">You tune it: approve, reject</text>
-<text x="48" y="261" font-size="12.5" fill="#e6edf3">or draft.</text>
-<text x="48" y="294" font-size="12.5" fill="#8b949e">Screen: Hunts › Analytics.</text>
-<rect x="324" y="104" width="236" height="216" rx="10" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
-<text x="340" y="132" font-size="18" font-weight="700" fill="#e6edf3">Hit</text>
-<text x="544" y="131" font-size="11" font-weight="700" fill="#58a6ff" text-anchor="end" letter-spacing="1">FOUND</text>
-<text x="340" y="154" font-size="13" font-weight="600" fill="#e6edf3">One match of one analytic</text>
-<text x="340" y="171" font-size="13" font-weight="600" fill="#e6edf3">on one entity.</text>
-<text x="340" y="193" font-size="12.5" fill="#8b949e">An observation with documents</text>
-<text x="340" y="210" font-size="12.5" fill="#8b949e">behind it.</text>
-<text x="340" y="227" font-size="12.5" fill="#e6edf3">A live hit adds weight to a</text>
-<text x="340" y="244" font-size="12.5" fill="#e6edf3">lead. A shadow hit waits for</text>
-<text x="340" y="261" font-size="12.5" fill="#e6edf3">you to read it.</text>
-<text x="340" y="294" font-size="12.5" fill="#8b949e">Screen: Hunts › Analytic hits.</text>
-<rect x="616" y="104" width="236" height="216" rx="10" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
-<text x="632" y="132" font-size="18" font-weight="700" fill="#e6edf3">Lead</text>
-<text x="836" y="131" font-size="11" font-weight="700" fill="#58a6ff" text-anchor="end" letter-spacing="1">HUNT IT</text>
-<text x="632" y="154" font-size="13" font-weight="600" fill="#e6edf3">Observations on one entity</text>
-<text x="632" y="171" font-size="13" font-weight="600" fill="#e6edf3">that are worth one decision.</text>
-<text x="632" y="193" font-size="12.5" fill="#e6edf3">A new lead starts its own hunt.</text>
-<text x="632" y="210" font-size="12.5" fill="#e6edf3">Or press Hunt this lead.</text>
-<text x="632" y="227" font-size="12.5" fill="#e6edf3">Dismiss a lead that is noise.</text>
-<text x="632" y="244" font-size="12.5" fill="#8b949e">Related leads share an analytic,</text>
-<text x="632" y="261" font-size="12.5" fill="#8b949e">an address or a technique.</text>
-<text x="632" y="294" font-size="12.5" fill="#8b949e">Screen: Hunts › Leads.</text>
-<rect x="956" y="104" width="236" height="216" rx="10" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
-<text x="972" y="132" font-size="18" font-weight="700" fill="#e6edf3">Hunt</text>
-<text x="1176" y="131" font-size="11" font-weight="700" fill="#58a6ff" text-anchor="end" letter-spacing="1">LEARN</text>
-<text x="972" y="154" font-size="13" font-weight="600" fill="#e6edf3">One run against</text>
-<text x="972" y="171" font-size="13" font-weight="600" fill="#e6edf3">one objective.</text>
-<text x="972" y="193" font-size="12.5" fill="#e6edf3">The model or a catalog query</text>
-<text x="972" y="210" font-size="12.5" fill="#e6edf3">runs it. It returns findings.</text>
-<text x="972" y="227" font-size="12.5" fill="#e6edf3">soc-ai investigates each</text>
-<text x="972" y="244" font-size="12.5" fill="#e6edf3">threat finding at the end.</text>
-<text x="972" y="261" font-size="12.5" fill="#e6edf3">It takes no action itself.</text>
-<text x="972" y="278" font-size="12.5" fill="#8b949e">A threat finding with none</text>
-<text x="972" y="295" font-size="12.5" fill="#8b949e">offers Open an investigation.</text>
-<rect x="1332" y="104" width="236" height="432" rx="10" fill="#161b22" stroke="#a371f7" stroke-width="1.5"/>
-<text x="1348" y="132" font-size="18" font-weight="700" fill="#e6edf3">Investigation</text>
-<text x="1552" y="131" font-size="11" font-weight="700" fill="#a371f7" text-anchor="end" letter-spacing="1">DECIDE</text>
-<text x="1348" y="154" font-size="13" font-weight="600" fill="#e6edf3">One agent run that ends</text>
-<text x="1348" y="171" font-size="13" font-weight="600" fill="#e6edf3">in a verdict.</text>
-<text x="1348" y="193" font-size="12.5" fill="#e6edf3">Its subject is one alert, or</text>
-<text x="1348" y="210" font-size="12.5" fill="#e6edf3">a hunt and its findings.</text>
-<text x="1348" y="227" font-size="12.5" fill="#e6edf3">It recommends actions and</text>
-<text x="1348" y="244" font-size="12.5" fill="#e6edf3">writes an audit record.</text>
-<text x="1348" y="266" font-size="12.5" fill="#8b949e">true positive, false positive</text>
-<text x="1348" y="283" font-size="12.5" fill="#8b949e">or needs more info, with a</text>
-<text x="1348" y="300" font-size="12.5" fill="#8b949e">confidence.</text>
-<text x="1348" y="322" font-size="12.5" fill="#8b949e">Triage is the run. The</text>
-<text x="1348" y="339" font-size="12.5" fill="#8b949e">investigation is its record.</text>
-<text x="1348" y="400" font-size="12.5" fill="#e6edf3">Each threat finding of a hunt</text>
-<text x="1348" y="417" font-size="12.5" fill="#e6edf3">gets an investigation. Two</text>
-<text x="1348" y="434" font-size="12.5" fill="#e6edf3">findings can share one.</text>
-<text x="1348" y="451" font-size="12.5" fill="#e6edf3">An alert gets one when</text>
-<text x="1348" y="468" font-size="12.5" fill="#e6edf3">soc-ai triages it.</text>
-<text x="1348" y="510" font-size="12.5" fill="#8b949e">Screen: Investigations.</text>
-<path d="M 268,204 L 324,204" fill="none" stroke="#58a6ff" stroke-width="2" marker-end="url(#arrow-blue)"/>
-<text x="296" y="196" font-size="12" fill="#58a6ff" text-anchor="middle">finds</text>
-<path d="M 560,204 L 616,204" fill="none" stroke="#58a6ff" stroke-width="2" marker-end="url(#arrow-blue)"/>
-<text x="588" y="196" font-size="12" fill="#58a6ff" text-anchor="middle">forms</text>
-<path d="M 852,204 L 956,204" fill="none" stroke="#58a6ff" stroke-width="2" marker-end="url(#arrow-blue)"/>
-<text x="904" y="196" font-size="12" fill="#58a6ff" text-anchor="middle">Hunt this lead</text>
-<text x="904" y="222" font-size="11" fill="#58a6ff" text-anchor="middle">or auto-hunt</text>
-<path d="M 1192,204 L 1332,204" fill="none" stroke="#58a6ff" stroke-width="2" marker-end="url(#arrow-blue)"/>
-<text x="1262" y="196" font-size="12" fill="#58a6ff" text-anchor="middle">investigates</text>
-<text x="1262" y="222" font-size="12" fill="#58a6ff" text-anchor="middle">each threat finding</text>
-<path d="M 1074,320 L 1074,336 L 442,336 L 442,320" fill="none" stroke="#3fb950" stroke-width="2" marker-end="url(#arrow-green)"/>
-<text x="758" y="350" font-size="12" fill="#3fb950" text-anchor="middle">a threat finding writes an observation</text>
-<path d="M 1332,364 L 400,364 L 400,320" fill="none" stroke="#3fb950" stroke-width="2" marker-end="url(#arrow-green)"/>
-<text x="1060" y="378" font-size="12" fill="#3fb950" text-anchor="middle">a verdict writes an observation</text>
-<text x="32" y="388" font-size="11" font-weight="700" fill="#a371f7" letter-spacing="1">THE ALERT PATH · EVERY ALERT</text>
-<rect x="32" y="396" width="236" height="140" rx="10" fill="#161b22" stroke="#a371f7" stroke-width="1.5"/>
-<text x="48" y="424" font-size="18" font-weight="700" fill="#e6edf3">Alert</text>
-<text x="252" y="423" font-size="11" font-weight="700" fill="#a371f7" text-anchor="end" letter-spacing="1">INPUT</text>
-<text x="48" y="446" font-size="13" font-weight="600" fill="#e6edf3">A detection the grid raised.</text>
-<text x="48" y="463" font-size="12.5" fill="#8b949e">Suricata · Sigma · notice.</text>
-<text x="48" y="480" font-size="12.5" fill="#e6edf3">Auto-Investigate triages it,</text>
-<text x="48" y="497" font-size="12.5" fill="#e6edf3">or you press Investigate.</text>
-<text x="48" y="520" font-size="12.5" fill="#8b949e">Screen: Alerts.</text>
-<path d="M 268,466 L 1332,466" fill="none" stroke="#a371f7" stroke-width="2" marker-end="url(#arrow-purple)"/>
-<text x="800" y="456" font-size="12" fill="#a371f7" text-anchor="middle">soc-ai triages the alert</text>
-<path d="M 1450,536 L 1450,576" fill="none" stroke="#a371f7" stroke-width="2" marker-end="url(#arrow-purple)"/>
-<text x="1462" y="561" font-size="12" fill="#a371f7">ends in</text>
-<rect x="1332" y="576" width="236" height="100" rx="10" fill="#161b22" stroke="#a371f7" stroke-width="1.5"/>
-<text x="1348" y="604" font-size="18" font-weight="700" fill="#e6edf3">Verdict</text>
-<text x="1348" y="626" font-size="12.5" fill="#e6edf3">The answer of an investigation.</text>
-<text x="1348" y="643" font-size="12.5" fill="#e6edf3">Agree, or override it.</text>
-<text x="1348" y="660" font-size="12.5" fill="#8b949e">Request more info on a gap.</text>
-<path d="M 1450,676 L 1450,716" fill="none" stroke="#a371f7" stroke-width="2" marker-end="url(#arrow-purple)"/>
-<text x="1462" y="701" font-size="12" fill="#a371f7">you act</text>
-<rect x="1332" y="716" width="236" height="130" rx="10" fill="#161b22" stroke="#a371f7" stroke-width="1.5"/>
-<text x="1348" y="743" font-size="15" font-weight="700" fill="#e6edf3">Action in Security Onion</text>
-<text x="1348" y="765" font-size="12.5" fill="#e6edf3">Acknowledge, escalate to a</text>
-<text x="1348" y="782" font-size="12.5" fill="#e6edf3">case, or add a comment.</text>
-<text x="1348" y="804" font-size="12.5" fill="#8b949e">soc-ai writes it to Security</text>
-<text x="1348" y="821" font-size="12.5" fill="#8b949e">Onion and keeps a receipt.</text>
-<rect x="32" y="576" width="868" height="140" rx="10" fill="#161b22" stroke="#d29922" stroke-width="1.5"/>
-<text x="48" y="604" font-size="15" font-weight="700" fill="#d29922">Needs you: the one queue</text>
-<text x="48" y="628" font-size="12.5" fill="#e6edf3">Leads that wait on a decision, unread shadow hits, alert groups with no verdict,</text>
-<text x="48" y="646" font-size="12.5" fill="#e6edf3">verdicts that need more info, and recommended actions that wait for you.</text>
-<text x="48" y="664" font-size="12.5" fill="#e6edf3">You decide on one object: agree, override, acknowledge, escalate, dismiss, or open an investigation.</text>
-<text x="48" y="688" font-size="12.5" fill="#8b949e">The sidebar badge, the bell and the Dashboard tile show the same count.</text>
-<path d="M 900,612 L 1332,612" fill="none" stroke="#d29922" stroke-width="2" marker-end="url(#arrow-amber)"/>
-<text x="1116" y="604" font-size="12" fill="#d29922" text-anchor="middle">agree or override the verdict</text>
-<path d="M 900,662 L 1300,662 L 1300,781 L 1332,781" fill="none" stroke="#d29922" stroke-width="2" marker-end="url(#arrow-amber)"/>
-<text x="1100" y="654" font-size="12" fill="#d29922" text-anchor="middle">acknowledge or escalate</text>
-<rect x="32" y="732" width="868" height="114" rx="10" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
-<text x="48" y="760" font-size="15" font-weight="700" fill="#e6edf3">Two verbs</text>
-<text x="48" y="784" font-size="12.5" fill="#e6edf3">Hunt this lead: learn what is here. The hunt returns findings. soc-ai investigates each threat finding.</text>
-<text x="48" y="802" font-size="12.5" fill="#e6edf3">Open an investigation: decide and act. It is the manual control on a finding with no investigation.</text>
-<text x="48" y="820" font-size="12.5" fill="#8b949e">An investigation ends in a verdict, recommended actions and an audit record.</text>
-<text x="48" y="838" font-size="12.5" fill="#8b949e">soc-ai investigates each threat finding when the hunt ends.</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1074" viewBox="0 0 1600 1074" font-family="Inter, system-ui, -apple-system, Segoe UI, sans-serif">
+<defs><marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#58a6ff"/></marker><marker id="arrow-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#a371f7"/></marker><marker id="arrow-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#d29922"/></marker><marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3fb950"/></marker><marker id="arrow-orange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#ed9235"/></marker></defs>
+<rect width="1600" height="1074" fill="#0d1117"/>
+<text x="32" y="40" font-size="22" font-weight="700" fill="#e6edf3">How this flows: from the grid to your decision</text>
+<path d="M 32,62 L 48,62" stroke="#58a6ff" stroke-width="3"/>
+<text x="54" y="66" font-size="13" fill="#8b949e">Blue: the sweep path.</text>
+<path d="M 236,62 L 252,62" stroke="#a371f7" stroke-width="3"/>
+<text x="258" y="66" font-size="13" fill="#8b949e">Purple: the alert path and the investigation.</text>
+<rect x="596" y="56" width="16" height="12" rx="3" fill="#2a2119" stroke="#ed9235" stroke-width="2"/>
+<text x="618" y="66" font-size="13" fill="#8b949e">Orange: the campaign.</text>
+<path d="M 806,62 L 822,62" stroke="#d29922" stroke-width="3"/>
+<text x="828" y="66" font-size="13" fill="#8b949e">Amber: what waits on you.</text>
+<path d="M 1044,62 L 1060,62" stroke="#3fb950" stroke-width="3"/>
+<text x="1066" y="66" font-size="13" fill="#8b949e">Green: a loop back to the observations.</text>
+<path d="M 40,124 L 54,124" stroke="#58a6ff" stroke-width="3"/>
+<text x="60" y="128" font-size="11" font-weight="700" fill="#8b949e" letter-spacing="1">THE SWEEP PATH · EVERY HOUR</text>
+<rect x="40" y="136" width="272" height="216" rx="10" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+<text x="56" y="164" font-size="18" font-weight="700" fill="#e6edf3">Analytic</text>
+<text x="296" y="163" font-size="11" font-weight="700" fill="#8b949e" text-anchor="end" letter-spacing="1">DETECTS</text>
+<text x="56" y="186" font-size="13" font-weight="600" fill="#e6edf3">One written detection.</text>
+<text x="56" y="208" font-size="12.5" fill="#e6edf3">The sweep reads the grid with it</text>
+<text x="56" y="225" font-size="12.5" fill="#e6edf3">every hour.</text>
+<text x="56" y="247" font-size="12.5" fill="#e6edf3">live: its hits can form a lead.</text>
+<text x="56" y="264" font-size="12.5" fill="#e6edf3">shadow: you review its hits.</text>
+<text x="56" y="336" font-size="12.5" fill="#8b949e">Screen: Hunts › Analytics.</text>
+<rect x="392" y="136" width="272" height="216" rx="10" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+<text x="408" y="164" font-size="18" font-weight="700" fill="#e6edf3">Hit</text>
+<text x="648" y="163" font-size="11" font-weight="700" fill="#8b949e" text-anchor="end" letter-spacing="1">FOUND</text>
+<text x="408" y="186" font-size="13" font-weight="600" fill="#e6edf3">One match of one analytic</text>
+<text x="408" y="203" font-size="13" font-weight="600" fill="#e6edf3">on one entity.</text>
+<text x="408" y="225" font-size="12.5" fill="#e6edf3">An observation with the records</text>
+<text x="408" y="242" font-size="12.5" fill="#e6edf3">behind it.</text>
+<text x="408" y="264" font-size="12.5" fill="#e6edf3">A live hit adds weight to a lead.</text>
+<text x="408" y="336" font-size="12.5" fill="#8b949e">Screen: Hunts › Analytic hits.</text>
+<rect x="744" y="136" width="272" height="216" rx="10" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+<text x="760" y="164" font-size="18" font-weight="700" fill="#e6edf3">Lead</text>
+<text x="1000" y="163" font-size="11" font-weight="700" fill="#8b949e" text-anchor="end" letter-spacing="1">QUESTION</text>
+<text x="760" y="186" font-size="13" font-weight="600" fill="#e6edf3">Observations on one entity</text>
+<text x="760" y="203" font-size="13" font-weight="600" fill="#e6edf3">that are worth one look.</text>
+<text x="760" y="225" font-size="12.5" fill="#e6edf3">soc-ai hunts each new lead.</text>
+<text x="760" y="242" font-size="12.5" fill="#e6edf3">A clean hunt closes it.</text>
+<text x="760" y="259" font-size="12.5" fill="#e6edf3">A verdict on each threat closes it.</text>
+<text x="760" y="276" font-size="12.5" fill="#e6edf3">A lead of a campaign waits on</text>
+<text x="760" y="293" font-size="12.5" fill="#e6edf3">the campaign.</text>
+<text x="760" y="310" font-size="12.5" fill="#e6edf3">Any other lead waits on you.</text>
+<text x="760" y="336" font-size="12.5" fill="#8b949e">Screen: Hunts › Leads.</text>
+<rect x="1136" y="136" width="272" height="216" rx="10" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+<text x="1152" y="164" font-size="18" font-weight="700" fill="#e6edf3">Hunt</text>
+<text x="1392" y="163" font-size="11" font-weight="700" fill="#8b949e" text-anchor="end" letter-spacing="1">SEARCH</text>
+<text x="1152" y="186" font-size="13" font-weight="600" fill="#e6edf3">One search of the grid</text>
+<text x="1152" y="203" font-size="13" font-weight="600" fill="#e6edf3">for one objective.</text>
+<text x="1152" y="225" font-size="12.5" fill="#e6edf3">A lead, a campaign, a schedule</text>
+<text x="1152" y="242" font-size="12.5" fill="#e6edf3">or you start it.</text>
+<text x="1152" y="264" font-size="12.5" fill="#e6edf3">It reads the open campaigns.</text>
+<text x="1152" y="281" font-size="12.5" fill="#e6edf3">It returns findings.</text>
+<text x="1152" y="298" font-size="12.5" fill="#e6edf3">It takes no action.</text>
+<text x="1152" y="336" font-size="12.5" fill="#8b949e">Screen: Hunts.</text>
+<path d="M 312,236 L 392,236" fill="none" stroke="#58a6ff" stroke-width="2" stroke-linejoin="round" marker-end="url(#arrow-blue)"/>
+<text x="352" y="226" font-size="12" fill="#adbac7" text-anchor="middle">finds</text>
+<path d="M 664,236 L 744,236" fill="none" stroke="#58a6ff" stroke-width="2" stroke-linejoin="round" marker-end="url(#arrow-blue)"/>
+<text x="704" y="226" font-size="12" fill="#adbac7" text-anchor="middle">forms</text>
+<path d="M 1016,236 L 1136,236" fill="none" stroke="#58a6ff" stroke-width="2" stroke-linejoin="round" marker-end="url(#arrow-blue)"/>
+<text x="1076" y="226" font-size="12" fill="#adbac7" text-anchor="middle">soc-ai hunts it</text>
+<path d="M 40,480 L 54,480" stroke="#a371f7" stroke-width="3"/>
+<text x="60" y="484" font-size="11" font-weight="700" fill="#8b949e" letter-spacing="1">THE ALERT PATH · EVERY ALERT</text>
+<rect x="40" y="492" width="236" height="220" rx="10" fill="#161b22" stroke="#a371f7" stroke-width="1.5"/>
+<text x="56" y="520" font-size="18" font-weight="700" fill="#e6edf3">Alert</text>
+<text x="260" y="519" font-size="11" font-weight="700" fill="#8b949e" text-anchor="end" letter-spacing="1">INPUT</text>
+<text x="56" y="542" font-size="13" font-weight="600" fill="#e6edf3">A detection the grid raised.</text>
+<text x="56" y="564" font-size="12.5" fill="#8b949e">Suricata · Sigma · notice.</text>
+<text x="56" y="586" font-size="12.5" fill="#e6edf3">One investigation serves the</text>
+<text x="56" y="603" font-size="12.5" fill="#e6edf3">alerts of one rule between</text>
+<text x="56" y="620" font-size="12.5" fill="#e6edf3">two addresses.</text>
+<text x="56" y="642" font-size="12.5" fill="#e6edf3">The other alerts take its</text>
+<text x="56" y="659" font-size="12.5" fill="#e6edf3">verdict for 7 days.</text>
+<text x="56" y="696" font-size="12.5" fill="#8b949e">Screen: Alerts.</text>
+<rect x="406" y="492" width="250" height="220" rx="10" fill="#161b22" stroke="#a371f7" stroke-width="1.5"/>
+<text x="422" y="520" font-size="18" font-weight="700" fill="#e6edf3">Investigation</text>
+<text x="640" y="519" font-size="11" font-weight="700" fill="#8b949e" text-anchor="end" letter-spacing="1">JUDGE</text>
+<text x="422" y="542" font-size="13" font-weight="600" fill="#e6edf3">soc-ai reads one alert or one</text>
+<text x="422" y="559" font-size="13" font-weight="600" fill="#e6edf3">hunt finding and ends in</text>
+<text x="422" y="576" font-size="13" font-weight="600" fill="#e6edf3">a verdict.</text>
+<text x="422" y="598" font-size="12.5" fill="#e6edf3">It cites its evidence and writes</text>
+<text x="422" y="615" font-size="12.5" fill="#e6edf3">an audit record.</text>
+<text x="422" y="637" font-size="12.5" fill="#e6edf3">Dated by the time of its event.</text>
+<text x="422" y="696" font-size="12.5" fill="#8b949e">Screen: Investigations.</text>
+<rect x="720" y="492" width="230" height="220" rx="10" fill="#161b22" stroke="#a371f7" stroke-width="1.5"/>
+<text x="736" y="520" font-size="18" font-weight="700" fill="#e6edf3">Verdict</text>
+<text x="736" y="542" font-size="13" font-weight="600" fill="#e6edf3">True positive, false positive</text>
+<text x="736" y="559" font-size="13" font-weight="600" fill="#e6edf3">or needs more info.</text>
+<text x="736" y="581" font-size="12.5" fill="#e6edf3">soc-ai can acknowledge</text>
+<text x="736" y="598" font-size="12.5" fill="#e6edf3">a confident false positive.</text>
+<text x="736" y="620" font-size="12.5" fill="#e6edf3">You can override a verdict.</text>
+<rect x="1070" y="492" width="280" height="220" rx="10" fill="#2a2119" stroke="#ed9235" stroke-width="2.5"/>
+<text x="1086" y="520" font-size="18" font-weight="700" fill="#e6edf3">Campaign</text>
+<text x="1334" y="519" font-size="11" font-weight="700" fill="#8b949e" text-anchor="end" letter-spacing="1">ONE ACTIVITY</text>
+<text x="1086" y="542" font-size="13" font-weight="600" fill="#e6edf3">The investigations that proven</text>
+<text x="1086" y="559" font-size="13" font-weight="600" fill="#e6edf3">links join to one confirmed</text>
+<text x="1086" y="576" font-size="13" font-weight="600" fill="#e6edf3">attack.</text>
+<text x="1086" y="598" font-size="12.5" fill="#e6edf3">Machines, stages and a timeline</text>
+<text x="1086" y="615" font-size="12.5" fill="#e6edf3">in one picture.</text>
+<text x="1086" y="637" font-size="12.5" fill="#e6edf3">soc-ai builds it after each verdict.</text>
+<text x="1086" y="654" font-size="12.5" fill="#e6edf3">An alert or a hunt finding can</text>
+<text x="1086" y="671" font-size="12.5" fill="#e6edf3">start it.</text>
+<text x="1086" y="696" font-size="12.5" fill="#8b949e">Screen: Campaigns.</text>
+<path d="M 276,602 L 406,602" fill="none" stroke="#a371f7" stroke-width="2" stroke-linejoin="round" marker-end="url(#arrow-purple)"/>
+<text x="341" y="558" font-size="12" fill="#adbac7" text-anchor="middle">soc-ai investigates</text>
+<text x="341" y="574" font-size="12" fill="#adbac7" text-anchor="middle">one alert of</text>
+<text x="341" y="590" font-size="12" fill="#adbac7" text-anchor="middle">each group</text>
+<path d="M 656,602 L 720,602" fill="none" stroke="#a371f7" stroke-width="2" stroke-linejoin="round" marker-end="url(#arrow-purple)"/>
+<text x="688" y="592" font-size="12" fill="#adbac7" text-anchor="middle">ends in</text>
+<path d="M 950,602 L 1070,602" fill="none" stroke="#ed9235" stroke-width="2" stroke-linejoin="round" marker-end="url(#arrow-orange)"/>
+<text x="1010" y="574" font-size="12" fill="#adbac7" text-anchor="middle">a confirmed attack</text>
+<text x="1010" y="590" font-size="12" fill="#adbac7" text-anchor="middle">starts or joins</text>
+<path d="M 1160,352 L 1160,428 L 626,428 L 626,492" fill="none" stroke="#58a6ff" stroke-width="2" stroke-linejoin="round" marker-end="url(#arrow-blue)"/>
+<text x="903" y="402" font-size="12" fill="#adbac7" text-anchor="middle">soc-ai investigates each threat finding that names an entity,</text>
+<text x="903" y="418" font-size="12" fill="#adbac7" text-anchor="middle">unless a campaign holds it</text>
+<path d="M 770,352 L 770,372 L 18,372 L 18,922 L 40,922" fill="none" stroke="#d29922" stroke-width="2" stroke-linejoin="round" marker-end="url(#arrow-amber)"/>
+<text x="60" y="392" font-size="12" fill="#adbac7" text-anchor="start">a lead that needs a decision</text>
+<path d="M 890,492 L 890,450 L 1452,450 L 1452,100 L 880,100 L 880,136" fill="none" stroke="#3fb950" stroke-width="2" stroke-linejoin="round" marker-end="url(#arrow-green)"/>
+<text x="1166" y="118" font-size="12" fill="#adbac7" text-anchor="middle">a true positive or needs more info verdict of an alert writes an observation</text>
+<path d="M 920,492 L 920,470 L 1418,470 L 1418,812" fill="none" stroke="#a371f7" stroke-width="2" stroke-linejoin="round" marker-end="url(#arrow-purple)"/>
+<text x="1430" y="572" font-size="12" fill="#adbac7" text-anchor="start">soc-ai acknowledges a</text>
+<text x="1430" y="588" font-size="12" fill="#adbac7" text-anchor="start">confident false positive</text>
+<text x="1430" y="610" font-size="12" fill="#adbac7" text-anchor="start">if the operator turns on</text>
+<text x="1430" y="626" font-size="12" fill="#adbac7" text-anchor="start">auto-acknowledge</text>
+<path d="M 1320,492 L 1320,360" fill="none" stroke="#0d1117" stroke-width="8"/>
+<path d="M 1320,492 L 1320,352" fill="none" stroke="#ed9235" stroke-width="2" stroke-linejoin="round" marker-end="url(#arrow-orange)"/>
+<text x="1330" y="374" font-size="12" fill="#adbac7" text-anchor="start">a change starts</text>
+<text x="1330" y="390" font-size="12" fill="#adbac7" text-anchor="start">one hunt, at most</text>
+<text x="1330" y="406" font-size="12" fill="#adbac7" text-anchor="start">one in 24 hours</text>
+<rect x="40" y="812" width="750" height="200" rx="10" fill="#161b22" stroke="#d29922" stroke-width="1.5"/>
+<text x="56" y="840" font-size="16" font-weight="700" fill="#e6edf3">Needs you: one number, one list</text>
+<text x="56" y="996" font-size="12.5" fill="#8b949e">Screen: Needs you.</text>
+<circle cx="62" cy="865.5" r="4" fill="#d29922"/>
+<text x="74" y="870" font-size="13.5" font-weight="600" fill="#e6edf3">Campaigns with no decision</text>
+<circle cx="362" cy="865.5" r="4" fill="#d29922"/>
+<text x="374" y="870" font-size="13.5" font-weight="600" fill="#e6edf3">Investigations that wait</text>
+<circle cx="62" cy="889.5" r="4" fill="#d29922"/>
+<text x="74" y="894" font-size="13.5" font-weight="600" fill="#e6edf3">Leads that need a decision</text>
+<circle cx="362" cy="889.5" r="4" fill="#d29922"/>
+<text x="374" y="894" font-size="13.5" font-weight="600" fill="#e6edf3">Alert groups with no verdict</text>
+<text x="56" y="936" font-size="12.5" fill="#e6edf3">The oldest first. An item stays until it has a decision.</text>
+<text x="56" y="958" font-size="12.5" fill="#e6edf3">The top bar, the Dashboard and the Needs you page state the same number.</text>
+<rect x="890" y="812" width="300" height="200" rx="10" fill="#161b22" stroke="#d29922" stroke-width="1.5"/>
+<text x="906" y="840" font-size="16" font-weight="700" fill="#e6edf3">Your decision on a campaign</text>
+<text x="906" y="862" font-size="13" font-weight="600" fill="#e6edf3">One decision for the whole activity.</text>
+<text x="906" y="884" font-size="12.5" fill="#e6edf3">Open one case: one Security Onion</text>
+<text x="906" y="901" font-size="12.5" fill="#e6edf3">case for the whole activity.</text>
+<text x="906" y="923" font-size="12.5" fill="#e6edf3">Authorize: activity between the</text>
+<text x="906" y="940" font-size="12.5" fill="#e6edf3">listed machines raises no</text>
+<text x="906" y="957" font-size="12.5" fill="#e6edf3">notification until the expiry.</text>
+<text x="906" y="979" font-size="12.5" fill="#e6edf3">Close with a reason: new activity</text>
+<text x="906" y="996" font-size="12.5" fill="#e6edf3">opens the campaign again.</text>
+<rect x="1280" y="812" width="300" height="200" rx="10" fill="#161b22" stroke="#a371f7" stroke-width="1.5"/>
+<text x="1296" y="840" font-size="16" font-weight="700" fill="#e6edf3">Action in Security Onion</text>
+<text x="1296" y="862" font-size="13" font-weight="600" fill="#e6edf3">Acknowledge, escalate to a case,</text>
+<text x="1296" y="879" font-size="13" font-weight="600" fill="#e6edf3">or add a comment.</text>
+<text x="1296" y="901" font-size="12.5" fill="#e6edf3">A case of a campaign holds at most</text>
+<text x="1296" y="918" font-size="12.5" fill="#e6edf3">25 alerts. A higher stage or a new</text>
+<text x="1296" y="935" font-size="12.5" fill="#e6edf3">machine adds one comment.</text>
+<text x="1296" y="957" font-size="12.5" fill="#e6edf3">A close can acknowledge the alerts</text>
+<text x="1296" y="974" font-size="12.5" fill="#e6edf3">of the campaign. soc-ai keeps</text>
+<text x="1296" y="991" font-size="12.5" fill="#e6edf3">a receipt.</text>
+<path d="M 740,712 L 740,812" fill="none" stroke="#d29922" stroke-width="2" stroke-linejoin="round" marker-end="url(#arrow-amber)"/>
+<text x="730" y="748" font-size="12" fill="#adbac7" text-anchor="end">a verdict outside a campaign</text>
+<text x="730" y="764" font-size="12" fill="#adbac7" text-anchor="end">that waits</text>
+<path d="M 1100,712 L 1100,764 L 770,764 L 770,812" fill="none" stroke="#d29922" stroke-width="2" stroke-linejoin="round" marker-end="url(#arrow-amber)"/>
+<text x="945" y="754" font-size="12" fill="#adbac7" text-anchor="middle">one item for each campaign with no decision</text>
+<path d="M 790,896 L 890,896" fill="none" stroke="#d29922" stroke-width="2" stroke-linejoin="round" marker-end="url(#arrow-amber)"/>
+<text x="840" y="868" font-size="12" fill="#adbac7" text-anchor="middle">you decide</text>
+<text x="840" y="884" font-size="12" fill="#adbac7" text-anchor="middle">once</text>
+<path d="M 1190,896 L 1280,896" fill="none" stroke="#d29922" stroke-width="2" stroke-linejoin="round" marker-end="url(#arrow-amber)"/>
+<text x="1235" y="868" font-size="12" fill="#adbac7" text-anchor="middle">soc-ai</text>
+<text x="1235" y="884" font-size="12" fill="#adbac7" text-anchor="middle">writes</text>
+<path d="M 690,1012 L 690,1038 L 1360,1038 L 1360,1012" fill="none" stroke="#d29922" stroke-width="2" stroke-linejoin="round" marker-end="url(#arrow-amber)"/>
+<text x="1025" y="1058" font-size="12" fill="#adbac7" text-anchor="middle">you approve an action that an investigation in no campaign recommends</text>
 </svg>

@@ -40,6 +40,58 @@ This job never fetches 2 configured sources over the network:
 - `spamhaus_drop` in `spamhaus_drop.txt`. It is license-gated and OFF by default.
   Acknowledge the Spamhaus terms first, then fetch it out of band.
 
+## Reputation result
+
+Each lookup of an address, a domain or a file hash returns seven reputation fields. The
+model, the timeline and the evidence lines read the same fields.
+
+| Field | Content |
+|---|---|
+| `reputation_status` | `listed`, `not_listed` or `not_checked`. |
+| `not_checked_reason` | `no_feed`, `stale_feed`, `lookup_failed` or `internal_address`. |
+| `feeds_matched` | The feeds that list the indicator. |
+| `feeds_checked` | The loaded, fresh feeds that index this indicator type. Each one was checked. |
+| `feeds_stale` | The loaded feeds of this type whose file is older than `blocklist_stale_threshold_days`. |
+| `feeds_not_loaded` | The configured feeds that are not loaded. |
+| `reputation_note` | One plain statement of what the result supports. |
+
+The status follows three rules:
+
+- `listed`: a feed lists the indicator. `blocklist_hits` holds the entries.
+- `not_listed`: a fresh malware feed that indexes this indicator type is loaded, and no
+  checked feed lists the indicator. The miss is evidence for the feeds in `feeds_checked`
+  only.
+- `not_checked`: the miss is not evidence. The model must not call the indicator clean.
+  Four causes give this status. No fresh malware feed that indexes this indicator type is
+  loaded. The file of the feed is stale. The address is internal, and the feeds list
+  public infrastructure. The lookup failed.
+
+A feed is checked only for an indicator type that its loader indexes. Each hash
+algorithm is one type.
+
+| Source | Addresses | Domains | MD5 | SHA-1 | SHA-256 | Malware feed |
+|---|---|---|---|---|---|---|
+| `urlhaus` | yes | yes | no | no | no | yes |
+| `threatfox` | yes | yes | yes | yes | yes | yes |
+| `feodo` | yes | no | no | no | no | yes |
+| `spamhaus_drop` | yes | no | no | no | no | yes |
+| `tor` | yes | no | no | no | no | no |
+| `internal_seed` | yes | yes | no | no | yes | no |
+
+A Zeek file record holds an MD5 and a SHA-1. ThreatFox is the one feed that can answer
+for them.
+
+The Tor exit list is an anonymity list. A miss on it says only that the address is not
+a Tor exit. The operator seed list holds only the entries that the operator wrote. A
+host that loads only these two feeds returns `not_checked` for each miss.
+
+To get `not_listed` for a miss, load a malware feed. Set `ABUSE_CH_AUTH_KEY` and run the
+refresh command.
+
+An older stored record holds `blocklist_sources` and `blocklist_checked`. The console
+still renders such a record. `blocklist_sources` named the loaded feeds. It never
+named a match.
+
 ## abuse.ch Auth-Key
 
 URLhaus, ThreatFox and Feodo need this key.

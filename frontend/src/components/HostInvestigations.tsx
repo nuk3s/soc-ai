@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import { listInvestigations } from '../lib/api';
 import { plural } from '../lib/plural';
 import { absTime } from '../lib/timeRange';
+import type { InvestigationRow } from '../lib/types';
 import { useAsync } from '../lib/useAsync';
 import { VerdictPill } from './Badges';
 import { Panel, PanelHeader } from './Panel';
@@ -19,8 +20,39 @@ import { LoadingState } from './States';
 // count here and the filtered list agree.
 // ---------------------------------------------------------------------------
 
-/** The newest runs the block lists. The list link holds the rest. */
+/** The runs the block lists. The list link holds the rest. */
 export const HOST_INVESTIGATIONS_SHOWN = 3;
+
+// The worst verdict first. The page of an attacked host with 42 true
+// positives listed its three newest runs, three false positives (review
+// 2026-11-12, ui-hunt 7).
+const VERDICT_RANK: Record<string, number> = {
+  true_positive: 0,
+  needs_more_info: 1,
+  inconclusive: 2,
+  untriaged: 3,
+  false_positive: 4,
+};
+const rankOf = (v: string): number => VERDICT_RANK[v] ?? 5;
+
+/** The rows to show: the newest true positives first when the newest runs
+ *  hold fewer of them than the block can show, then the newest of the rest,
+ *  worst verdict first. The sort is stable, so newer runs stay above older
+ *  ones of the same verdict. */
+export function worstFirst(newest: InvestigationRow[], truePositives: InvestigationRow[] = []): InvestigationRow[] {
+  const seen = new Set<string>();
+  const merged: InvestigationRow[] = [];
+  for (const r of [...truePositives.filter((r) => r.verdict === 'true_positive'), ...newest]) {
+    if (seen.has(r.id)) continue;
+    seen.add(r.id);
+    merged.push(r);
+  }
+  return merged
+    .map((r, i) => ({ r, i }))
+    .sort((a, b) => rankOf(a.r.verdict) - rankOf(b.r.verdict) || a.i - b.i)
+    .map(({ r }) => r)
+    .slice(0, HOST_INVESTIGATIONS_SHOWN);
+}
 
 /** The Investigations list, filtered on the machine, over all time. */
 export function investigationsHref(entityKey: string, label?: string | null): string {
@@ -44,13 +76,25 @@ export function investigationsCountLine(total: number, truePositives: number): s
  *  next one loads. */
 export function useHostInvestigations(entityKey: string) {
   return useAsync(
-    () =>
-      entityKey
-        ? listInvestigations({ entity: entityKey, limit: HOST_INVESTIGATIONS_SHOWN }).then((list) => ({
-            key: entityKey,
-            list,
-          }))
-        : Promise.resolve(null),
+    async () => {
+      if (!entityKey) return null;
+      const list = await listInvestigations({ entity: entityKey, limit: HOST_INVESTIGATIONS_SHOWN });
+      // A second read only when true positives exist that the newest runs
+      // do not show. The count and the total stay those of the first read.
+      const shownTp = list.rows.filter((r) => r.verdict === 'true_positive').length;
+      const wantTp = Math.min(list.truePositives, HOST_INVESTIGATIONS_SHOWN);
+      const tps =
+        shownTp < wantTp
+          ? (
+              await listInvestigations({
+                entity: entityKey,
+                verdict: ['true_positive'],
+                limit: HOST_INVESTIGATIONS_SHOWN,
+              }).catch(() => null)
+            )?.rows ?? []
+          : [];
+      return { key: entityKey, list: { ...list, rows: worstFirst(list.rows, tps) } };
+    },
     [entityKey],
     { refetchInterval: 300_000 },
   );

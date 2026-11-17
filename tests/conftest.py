@@ -151,9 +151,11 @@ def _clear_process_caches() -> None:
     """
     from soc_ai import notify
     from soc_ai.agent import context_budget
+    from soc_ai.campaigns import service as campaign_service
     from soc_ai.so_client import fields, inventory
     from soc_ai.store import host_dossier
 
+    campaign_service.reset_fresh_cache()
     inventory._clear_cache()
     fields._clear_agg_field_cache()
     context_budget._window_cache.clear()
@@ -191,6 +193,19 @@ def migrated_store_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 @pytest.fixture(autouse=True)
+def roomy_data_volume(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The doctor reads a data volume with free space, whatever this host has.
+
+    The disk row of the doctor warns below 15% free or 2 G free. A test that
+    expects an all-green doctor must not fail on a full development host or a
+    full CI runner. tests/test_doctor_disk.py sets its own numbers.
+    """
+    from soc_ai import doctor
+
+    monkeypatch.setattr(doctor, "_disk_usage", lambda _path: (100 * 1024**3, 60 * 1024**3))
+
+
+@pytest.fixture(autouse=True)
 def reset_oracle_breaker() -> Iterator[None]:
     """Each test starts with every Oracle route closed.
 
@@ -203,6 +218,29 @@ def reset_oracle_breaker() -> Iterator[None]:
     BREAKER.reset()
     yield
     BREAKER.reset()
+
+
+@pytest.fixture(autouse=True)
+def no_campaign_refresh_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An app boot starts no campaign refresh loop.
+
+    The loop rebuilds the campaigns two seconds after a verdict. In a test
+    that boots the app for another reason, that rebuild would write to the
+    store of the test in the background. tests/test_campaign_refresh.py turns
+    the loop on where it tests it.
+    """
+    monkeypatch.setattr(soc_ai_main, "CAMPAIGN_REFRESH_LOOP", False)
+
+
+@pytest.fixture(autouse=True)
+def no_campaign_hunt_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An app boot starts no campaign hunt loop.
+
+    The loop starts hunts on the changes of the campaigns. A test that boots
+    the app for another reason must not start one in the background.
+    tests/test_campaign_hunt_loop.py calls the loop where it tests it.
+    """
+    monkeypatch.setattr(soc_ai_main, "CAMPAIGN_HUNT_LOOP", False)
 
 
 @pytest.fixture(autouse=True)

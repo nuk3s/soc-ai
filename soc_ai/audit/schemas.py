@@ -120,6 +120,15 @@ AuditKind = Literal[
     # (the recurring trap documented on the downgrade kinds above).
     "decisive_value_support_cap",
     "unsupported_decisive_value_downgrade",
+    # H2 impact guard (gates._settle_impact): a true positive said `succeeded`
+    # and cited no fetched record with content of the event, so the impact
+    # reads `attempted`. The verdict does not change. Must be a valid audit
+    # kind or _audit drops it (the trap documented on the downgrade kinds).
+    "impact_evidence_downgrade",
+    # One model call hit its output token limit before a response and ran one
+    # more time with low reasoning (soc_ai.agent.models). Payload carries the
+    # phase and the error text. Must be a valid audit kind or _audit drops it.
+    "token_limit_retry",
     # retask
     "usage",
     "retask",
@@ -291,6 +300,63 @@ AuditKind = Literal[
     # holds its own row, and this record holds the press: who, which leads,
     # and what each lead got. Must be a valid audit kind or _audit drops it.
     "leads_bulk_decision",
+    # Authorized activity (soc_ai/store/authorized_activity.py). An analyst
+    # records that some activity is authorized, and a run inside that scope
+    # then requests no case. The record hides work from the queue, so each
+    # step is on the trail: who created it and with which scope, each run
+    # that matched it, each run that came close and was outside it, its
+    # expiry and its revoke. Each must be a valid audit kind or _audit drops
+    # it, the trap the downgrade kinds above document.
+    "authorized_activity_created",
+    "authorized_activity_matched",
+    "authorized_activity_outside",
+    "authorized_activity_expired",
+    "authorized_activity_revoked",
+    # A decision on a campaign (soc_ai/api/webui/routes_campaigns.py). A close
+    # takes the campaign out of Needs you, so its record is written before the
+    # commit and fails closed. An analyst who opens the campaign again gets a
+    # record too. Each must be a valid audit kind or _audit drops it.
+    "campaign_closed",
+    "campaign_reopened",
+    # An analyst took an investigation out of a campaign, joined one to it, or
+    # undid either (soc_ai/api/webui/routes_campaigns.py). The campaign record
+    # of authorized activity reuses the authorized_activity kinds above.
+    "campaign_excluded",
+    "campaign_included",
+    "campaign_override_undone",
+    # The one Security Onion case of a campaign
+    # (soc_ai/api/webui/routes_campaign_case.py). The decision ``case`` takes
+    # the campaign out of Needs you, so ``campaign_case_opened`` comes before
+    # the commit and fails closed. ``campaign_case_failed`` states a press that
+    # opened no case, or a decision that the store did not save.
+    # ``campaign_case_retry`` comes before an analyst clears an intent with no
+    # result, and fails closed. ``campaign_case_commented`` follows each
+    # comment of the step after a rebuild. Each must be a valid audit kind or
+    # _audit drops it.
+    "campaign_case_opened",
+    "campaign_case_failed",
+    "campaign_case_retry",
+    "campaign_case_commented",
+    # A campaign decision whose record above came first and whose store write
+    # then failed (soc_ai/api/webui/_decision_commit.py). The trail must state
+    # that the change did not happen. Each must be a valid audit kind or _audit
+    # drops it.
+    "campaign_close_failed",
+    "campaign_exclude_failed",
+    "campaign_include_failed",
+    "campaign_override_undo_failed",
+    "authorized_activity_create_failed",
+    "authorized_activity_revoke_failed",
+    # A clear of an old item of Needs you, and its undo
+    # (soc_ai/webui/needs_you_clear.py, `soc-ai needs-you`). A clear hides
+    # work from the analyst, so its record comes before the store write and
+    # fails closed. Each must be a valid audit kind or _audit drops it.
+    "needs_you_cleared",
+    "needs_you_restored",
+    # A clear or a restore whose record above came first and whose store
+    # write then failed. The trail must state that the change did not happen.
+    "needs_you_clear_failed",
+    "needs_you_restore_failed",
     "done",
     "error",
 ]

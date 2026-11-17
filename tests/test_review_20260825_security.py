@@ -183,9 +183,11 @@ def test_hunt_earlier_block_residue_is_dropped_and_the_hunt_still_runs(
     settings_kratos.analyst_redaction_fail_closed = True
     block = EarlierConclusions(text=f'It wrote: "{_RESIDUE_ONLY}"', refs={})
 
+    # The second value names the parts that were dropped. A block with one
+    # part reads "block".
     assert asyncio.run(hunt_runner._vetted_earlier(_hunt_ctx(settings_kratos), block)) == (
         None,
-        True,
+        ["block"],
     )
 
     captured: list[dict[str, Any]] = []

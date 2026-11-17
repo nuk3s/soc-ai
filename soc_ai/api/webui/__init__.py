@@ -385,6 +385,39 @@ from soc_ai.api.webui.routes_lead_bulk import (
 )
 
 # isort: split
+# The authorized activity routes. They read the investigations store only.
+from soc_ai.api.webui.routes_authorized_activity import (
+    AuthorizedActivityOut,
+    authorized_activity_draft,
+    create_authorized_activity,
+    list_authorized_activity,
+    revoke_authorized_activity,
+)
+
+# isort: split
+# The confirmed threats route. After routes_meta: it reads the needs-you rule.
+from soc_ai.api.webui.routes_threats import (  # noqa: F401 - registers the /threats route
+    ThreatsOut,
+    list_threats,
+)
+
+# isort: split
+# The campaign routes. They read the campaign tables and the investigations store.
+from soc_ai.api.webui.routes_campaigns import (  # noqa: F401 - registers the /campaigns routes
+    CampaignOut,
+    CampaignsOut,
+    get_campaign,
+    list_campaigns,
+)
+
+# isort: split
+# The case of a campaign. After routes_campaigns: it reads the campaign payload.
+from soc_ai.api.webui.routes_campaign_case import (  # noqa: F401 - registers the case routes
+    CaseScopeOut,
+    campaign_case_scope,
+)
+
+# isort: split
 from soc_ai.api.webui.routes_quality import (
     QualityEvalStatusOut,
     QualityPointOut,
@@ -466,6 +499,7 @@ __all__ = [
     "AssignIn",
     "AssignOut",
     "AuditVerifyScheduleOut",
+    "AuthorizedActivityOut",
     "AutoTriageIn",
     "AutoTriageStatusOut",
     "BacktestIn",
@@ -652,6 +686,7 @@ __all__ = [
     "approve_runbook",
     "assign_alert",
     "audit_verify_schedule",
+    "authorized_activity_draft",
     "auto_triage_status",
     "backtest_by_id",
     "backtest_status",
@@ -666,6 +701,7 @@ __all__ = [
     "clear_general_chat",
     "client_ip",
     "create_analytic",
+    "create_authorized_activity",
     "create_detection_override",
     "create_hunt_schedule",
     "create_runbook",
@@ -708,6 +744,7 @@ __all__ = [
     "lead_bulk_hunt_plan",
     "list_alerts",
     "list_analytics",
+    "list_authorized_activity",
     "list_dossier_conflicts",
     "list_dossiers",
     "list_group_events",
@@ -738,6 +775,7 @@ __all__ = [
     "resolve_alert_for_hunt",
     "resolve_investigation",
     "review_grid_gap_hits",
+    "revoke_authorized_activity",
     "revoke_token",
     "router",
     "set_analytic_status",

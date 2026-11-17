@@ -291,9 +291,11 @@ def test_one_sweep_of_catalog_runs_folds_into_one_line(client: TestClient) -> No
     assert [n["title"] for n in folded] == ["3 catalog hunts finished: no threat found"]
     assert folded[0]["id"] == f"hunt-sweep:no_threat:{sweep[-1]}"
     assert not any(f"hunt-done:{hunt_id}" in ids for hunt_id in sweep)
-    # The threat keeps its line, between the fold and the earlier sweep.
-    assert ids.index(folded[0]["id"]) < ids.index(f"hunt-done:{threat}")
-    assert ids.index(f"hunt-done:{threat}") < ids.index(f"hunt-done:{earlier}")
+    # The threat keeps its line and leads the bell: a threat outranks the
+    # newer clean runs (production review 2026-11-12, ui-core 5). The fold
+    # sits before the earlier sweep, newest first.
+    assert ids.index(f"hunt-done:{threat}") < ids.index(folded[0]["id"])
+    assert ids.index(folded[0]["id"]) < ids.index(f"hunt-done:{earlier}")
     assert not any("[catalog]" in n["title"] for n in notices)
 
 

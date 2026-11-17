@@ -146,6 +146,34 @@ def _ev(source: dict[str, Any], env: Mapping[str, Any], path: str) -> Any:
     return _first(unwrapped(source, env, path))
 
 
+_FLAG_TRUE: frozenset[str] = frozenset({"true", "t", "1"})
+_FLAG_FALSE: frozenset[str] = frozenset({"false", "f", "0"})
+
+
+def _stored_flag(value: Any) -> bool | None:
+    """A stored yes or no, read strictly. ``None`` when the value says neither.
+
+    A grid stores a flag as a JSON boolean, and an older pipeline stores it as
+    text: ``"true"``, ``"T"``, ``"1"`` and ``"false"``, ``"F"``, ``"0"``. A
+    list gives its first element. ``bool(value)`` is true for each non-empty
+    text, so a stored ``"false"`` read as true: a failed SSH login became the
+    evidence line "completed SSH login". Every other value is unknown.
+    """
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return {1: True, 0: False}.get(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in _FLAG_TRUE:
+            return True
+        if text in _FLAG_FALSE:
+            return False
+    return None
+
+
 def _extract_zeek_typed(
     source: dict[str, Any], env: Mapping[str, Any], parse_errors: list[str]
 ) -> dict[str, Any]:
@@ -203,8 +231,7 @@ def _extract_zeek_typed(
     out["zeek_dns_query"] = _one(source, env, fields.DNS_QUERY)
     out["zeek_dns_rcode_name"] = _one(source, env, fields.DNS_RCODE)
     # rejected has no ECS equivalent — read the zeek.* field directly.
-    rejected = _ev(source, env, "zeek.dns.rejected")
-    out["zeek_dns_rejected"] = bool(rejected) if rejected is not None else None
+    out["zeek_dns_rejected"] = _stored_flag(_ev(source, env, "zeek.dns.rejected"))
     # ssl/tls.* — ECS ssl.server_name / hash.ja3 / hash.ja3s first. Keep the
     # legacy zeek.ssl.*_hash fallback (not in the candidate tables) so older
     # ingest layouts that wrote *_hash still resolve.
@@ -239,8 +266,7 @@ def _extract_zeek_typed(
     # were never surfaced. qtype (e.g. TXT-heavy) is the DNS-tunnel corroborator;
     # ssl established distinguishes a completed TLS session from a scan.
     out["zeek_dns_qtype"] = _one(source, env, fields.DNS_QTYPE)
-    established = _one(source, env, fields.SSL_ESTABLISHED)
-    out["zeek_ssl_established"] = bool(established) if established is not None else None
+    out["zeek_ssl_established"] = _stored_flag(_one(source, env, fields.SSL_ESTABLISHED))
     out["zeek_conn_service"] = _one(source, env, fields.CONN_SERVICE)
     # kerberos (Kerberoasting): cipher carries the ticket encryption — RC4-HMAC is
     # the decisive roast signature; service is the requested SPN.
@@ -256,8 +282,9 @@ def _extract_zeek_typed(
     out["zeek_dce_rpc_operation"] = _one(source, env, fields.DCE_RPC_OPERATION)
     # ssh — a COMPLETED authentication (auth_success) is the decisive lateral /
     # intrusion signal; combined with a bad-reputation source it's a confirmed login.
-    ssh_auth = _one(source, env, fields.SSH_AUTH_SUCCESS)
-    out["zeek_ssh_auth_success"] = bool(ssh_auth) if ssh_auth is not None else None
+    # Parsed strictly. Truthiness read a stored "false" as a completed login,
+    # and a document with no result as a failed one.
+    out["zeek_ssh_auth_success"] = _stored_flag(_one(source, env, fields.SSH_AUTH_SUCCESS))
     out["zeek_ssh_auth_attempts"] = _coerce(
         "ssh.auth_attempts", _one(source, env, fields.SSH_AUTH_ATTEMPTS), int
     )
@@ -288,6 +315,27 @@ def _parse_message_json(message: str | None) -> dict[str, Any]:
     except (json.JSONDecodeError, TypeError, ValueError):
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+# The signature severities of the ET ruleset, lowest first. A value outside
+# the list ranks above all of them: an unknown word is never read as mild.
+_SIGNATURE_SEVERITY_RANK = {"informational": 0, "minor": 1, "major": 2, "critical": 3}
+
+
+def _most_severe_signature_severity(value: Any) -> str | None:
+    """The one signature severity of a rule: the most severe value it carries.
+
+    ``rule.metadata.signature_severity`` is a list, and a rule can carry two
+    values. The first value used to stand for the rule, so
+    ``["Informational", "Major"]`` read as Informational and the reverse
+    order read as Major. Every reader of the field asks "how severe did the
+    author call this", and the answer to that is the highest value.
+    """
+    values = value if isinstance(value, list) else [value]
+    words = [str(v).strip() for v in values if v is not None and str(v).strip()]
+    if not words:
+        return None
+    return max(words, key=lambda w: _SIGNATURE_SEVERITY_RANK.get(w.lower(), len(words) + 4))
 
 
 class RuleMetadata(BaseModel):
@@ -327,7 +375,7 @@ class RuleMetadata(BaseModel):
         """
         if not isinstance(metadata, dict):
             return None
-        sig_sev = _first(metadata.get("signature_severity"))
+        sig_sev = _most_severe_signature_severity(metadata.get("signature_severity"))
         attack_target = _first(metadata.get("attack_target"))
         confidence = _first(metadata.get("confidence"))
         deployment = _first(metadata.get("deployment"))

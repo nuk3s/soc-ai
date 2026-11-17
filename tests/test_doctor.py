@@ -1092,6 +1092,20 @@ def test_backup_row_warns_when_no_archive_is_present(tmp_path: Path) -> None:
     assert "docs/DOCKER.md" in row.hint
 
 
+def test_backup_row_names_a_command_that_writes_where_it_reads(tmp_path: Path) -> None:
+    """The review of 2026-11-12: the warning named no command on any page. The
+    hint carries one in backticks, and the Diagnostics pane offers it to copy.
+    The archive lands in the directory this check reads, with the name it globs."""
+    import re
+
+    settings = _settings(tmp_path)
+    [row] = doctor.check_backups(settings)
+    commands = re.findall(r"`([^`]+)`", row.hint)
+    backups = str(settings.soc_ai_data_dir / "backups")
+    assert commands[0] == f"mkdir -p {backups} && cd {backups} && soc-ai backup"
+    assert any(c.startswith("docker compose exec -T soc-ai") for c in commands)
+
+
 def test_backup_row_warns_on_an_old_archive_and_passes_a_fresh_one(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     _touch_backup(settings, age_h=80)

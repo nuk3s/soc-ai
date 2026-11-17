@@ -70,7 +70,7 @@ def test_another_loop_reason_ignores_a_trigger() -> None:
     """NEGATIVE CONTROL. Only definitely_investigate reads the trigger."""
     payload = {"reason": "deep_rerun", "trigger": "malware_rule", "round1_verdict": None}
     assert _step(_loop(payload), 1).detail == (
-        "An analyst asked for a deep run. soc-ai skipped the first pass."
+        "An analyst asked for a deep investigation. soc-ai skipped the first pass."
     )
 
 
@@ -334,7 +334,7 @@ def test_the_internal_traffic_rationale_drops_east_west(stored: str, expected: s
         1,
     ).detail
     assert detail == (
-        "The run matched the internal traffic pattern. The pattern gives a false "
+        "The investigation matched the internal traffic pattern. The pattern gives a false "
         f"positive at 0.85. {expected}"
     )
     assert "east-west" not in detail

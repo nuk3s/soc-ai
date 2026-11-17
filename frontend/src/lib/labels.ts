@@ -183,7 +183,7 @@ export const OUTCOME_LABELS: Record<HuntOutcomeKey, LabelMeta> = {
   running: meta('Running', 'info'),
   // A hunt investigates its subject findings as part of the hunt. These three
   // come from that phase. `outcomeLabel` writes the counts when it has them:
-  // "Investigating 2 of 3 findings", "2 of 3 findings are threats".
+  // "Investigating 2 of 3 findings", "3 confirmed · 1 not judged · of 4 threat findings".
   investigating: meta('Investigating findings', 'info'),
   threats_confirmed: meta('Threats confirmed', 'danger'),
   no_threat_confirmed: meta('No threat confirmed', 'ok'),
@@ -195,6 +195,40 @@ export interface OutcomeCounts {
   investigated?: number | null;
   total?: number | null;
   threats?: number | null;
+  /** The false positive verdicts among the threat findings. */
+  falsePositives?: number | null;
+  /** The threat findings of the report, a subject or not. */
+  threatFindings?: number | null;
+}
+
+/** The counts of the one threat count sentence. */
+export interface ThreatCounts {
+  /** Threat findings whose verdict is true positive. */
+  confirmed: number;
+  /** Threat findings whose verdict is false positive. */
+  falsePositives?: number;
+  /** Every threat finding of the hunt. */
+  threatFindings: number;
+}
+
+/** The threat findings with no true positive and no false positive verdict:
+ *  a failed run, a needs more info verdict, a finding with no run. */
+export function notJudgedCount(c: ThreatCounts): number {
+  return Math.max(0, c.threatFindings - c.confirmed - (c.falsePositives ?? 0));
+}
+
+/** The one threat count format of the console (soc_ai/hunting/outcome.py
+ *  threat_count_sentence): "3 confirmed · 1 not judged · of 4 threat
+ *  findings". A false positive count joins when there is one, so the parts add
+ *  up. A hunt row read "7 · 4 threat" beside "3 of 7 findings are threats"
+ *  before this (review 2026-11-12). */
+export function threatCountSentence(c: ThreatCounts): string {
+  const fp = c.falsePositives ?? 0;
+  const parts = [`${c.confirmed} confirmed`];
+  if (fp > 0) parts.push(`${fp} false positive${fp === 1 ? '' : 's'}`);
+  parts.push(`${notJudgedCount(c)} not judged`);
+  parts.push(`of ${c.threatFindings} threat finding${c.threatFindings === 1 ? '' : 's'}`);
+  return parts.join(' · ');
 }
 
 function findingsWord(n: number): string {
@@ -239,15 +273,22 @@ export function outcomeMeta(outcome: string | null | undefined): LabelMeta {
 
 /** "could_not_run" and the API's "failed" both read "Could not run".
  *  With the phase counts, `investigating` reads "Investigating 2 of 3
- *  findings" and `threats_confirmed` reads "2 of 3 findings are threats". */
+ *  findings" and `threats_confirmed` reads the count sentence of threatCountSentence. */
 export function outcomeLabel(outcome: string | null | undefined, counts?: OutcomeCounts): string {
   const total = counts?.total ?? 0;
   if (total > 0 && outcome === 'investigating') {
     return `Investigating ${counts?.investigated ?? 0} of ${findingsWord(total)}`;
   }
-  if (total > 0 && outcome === 'threats_confirmed' && counts?.threats != null) {
-    const verb = counts.threats === 1 ? 'is a threat' : 'are threats';
-    return `${counts.threats} of ${findingsWord(total)} ${verb}`;
+  if (total > 0 && counts?.threats != null) {
+    const sentence = {
+      confirmed: counts.threats,
+      falsePositives: counts.falsePositives ?? 0,
+      threatFindings: Math.max(counts.threatFindings ?? 0, total),
+    };
+    if (outcome === 'threats_confirmed') return threatCountSentence(sentence);
+    if (outcome === 'no_threat_confirmed' && notJudgedCount(sentence) > 0) {
+      return threatCountSentence(sentence);
+    }
   }
   return outcomeMeta(outcome).label;
 }
@@ -261,11 +302,20 @@ export function huntOutcomeText(row: {
   outcome_label?: string | null;
   findingsInvestigated?: number | null;
   findingsTotal?: number | null;
+  findingsConfirmed?: number | null;
+  findingsFalsePositive?: number | null;
+  threatFindingCount?: number | null;
 }): string | null {
   const key = huntOutcome(row);
   if (!key) return null;
   if (row.outcome_label && (key === row.outcome || key === 'investigating')) return row.outcome_label;
-  return outcomeLabel(key, { investigated: row.findingsInvestigated, total: row.findingsTotal });
+  return outcomeLabel(key, {
+    investigated: row.findingsInvestigated,
+    total: row.findingsTotal,
+    threats: row.findingsConfirmed,
+    falsePositives: row.findingsFalsePositive,
+    threatFindings: row.threatFindingCount,
+  });
 }
 
 // ---- Run statuses ------------------------------------------------------------
@@ -285,12 +335,12 @@ export const STATUS_LABELS: Record<RunStatusKey, LabelMeta> = {
 };
 
 const STATUS_DETAIL: Record<string, string> = {
-  complete: 'The run finished.',
-  running: 'The run is in progress.',
-  queued: 'The run waits for a free worker.',
-  error: 'An error stopped the run before it finished.',
-  cancelled: 'A cancel request stopped the run before it finished.',
-  interrupted: 'A service restart stopped the run before it finished.',
+  complete: 'The {subject} finished.',
+  running: 'The {subject} is in progress.',
+  queued: 'The {subject} waits for a free worker.',
+  error: 'An error stopped the {subject} before it finished.',
+  cancelled: 'A cancel request stopped the {subject} before it finished.',
+  interrupted: 'A service restart stopped the {subject} before it finished.',
 };
 
 export function statusMeta(status: string | null | undefined): LabelMeta {
@@ -303,10 +353,15 @@ export function statusLabel(status: string | null | undefined): string {
   return statusMeta(status).label;
 }
 
-/** One sentence on why a run is in its status. Use it as the tooltip of a
- *  "Failed" chip, because the chip no longer names the cause. */
-export function statusDetail(status: string | null | undefined): string {
-  return (status && STATUS_DETAIL[status]) || 'soc-ai recorded no status for this run.';
+/** One sentence on why an investigation or a hunt is in its status. Use it
+ *  as the tooltip of a "Failed" chip, because the chip no longer names the
+ *  cause. The sentence names the subject: never "run" (owner 2026-11-14). */
+export function statusDetail(
+  status: string | null | undefined,
+  subject: 'investigation' | 'hunt' = 'investigation',
+): string {
+  const text = (status && STATUS_DETAIL[status]) || 'soc-ai recorded no status for this {subject}.';
+  return text.replace('{subject}', subject);
 }
 
 /** True for a status that stopped the run before it finished. */

@@ -110,9 +110,16 @@ async def test_the_domain_lookup_carries_it_too(settings_kratos: Settings) -> No
 async def test_the_hash_lookup_carries_it_too(settings_kratos: Settings) -> None:
     digest = "a" * 64
     unchecked = await enrich_hash(digest, "sha256", settings=settings_kratos, blocklist=_empty_db())
-    checked = await enrich_hash(digest, "sha256", settings=settings_kratos, blocklist=_loaded_db())
+    # ThreatFox is the feed that holds file hashes. URLhaus and the Tor exit
+    # list hold none, so a hash "checked" against them was never checked.
+    hash_db = BlocklistDB(loaded_sources=["threatfox"])
+    checked = await enrich_hash(digest, "sha256", settings=settings_kratos, blocklist=hash_db)
+    no_hash_feed = await enrich_hash(
+        digest, "sha256", settings=settings_kratos, blocklist=_loaded_db()
+    )
     assert unchecked.blocklist_checked is False
     assert checked.blocklist_checked is True
+    assert no_hash_feed.blocklist_checked is False
 
 
 def test_a_context_nobody_recorded_says_nothing_either_way() -> None:
@@ -130,8 +137,12 @@ async def test_the_marker_survives_the_dump_the_model_reads(settings_kratos: Set
     """The model sees the tool result as JSON, so the distinction has to serialise."""
     e = await enrich_ip(EXTERNAL, settings=settings_kratos, blocklist=_empty_db())
     dumped = e.model_dump(mode="json")
-    assert dumped["blocklist_checked"] is False
-    assert dumped["blocklist_sources"] == []
+    assert dumped["reputation_status"] == "not_checked"
+    assert dumped["feeds_checked"] == []
+    # The older names are not in the dump: a hunt read `blocklist_sources`
+    # as a list of matches (tests/test_reputation_feeds.py).
+    assert "blocklist_checked" not in dumped
+    assert "blocklist_sources" not in dumped
 
 
 # ---------------------------------------------------------------------------
@@ -392,7 +403,7 @@ def test_the_coverage_gap_is_a_citable_bullet() -> None:
     gap = [b for b in bullets if "blocklist" in b]
     assert len(gap) == 1
     assert "not exoneration" in gap[0]
-    assert "blocklist_sources" in gap[0]
+    assert "reputation_status" in gap[0]
 
 
 def test_no_coverage_bullet_when_the_feeds_answered() -> None:

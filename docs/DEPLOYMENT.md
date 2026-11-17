@@ -428,7 +428,8 @@ ssh soc-ai@<vm-host> '
 soc-ai authenticates to ES directly with the analyst basic-auth credentials. It
 needs no separate ES service account.
 
-The write tools are `ack_alert`, `escalate_to_case` and `add_case_comment`. They
+The write tools are `ack_alert`, `escalate_to_case`, `add_case_comment`,
+`open_finding_case` and `open_campaign_case`. They
 go through the Security Onion web API with the analyst's Kratos session
 cookie. They use the same always-available routes that the SO web UI itself
 uses:

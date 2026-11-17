@@ -21,7 +21,8 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Literal
+from collections.abc import Sequence
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -31,6 +32,26 @@ WriteToolName = Literal["ack_alert", "escalate_to_case", "add_case_comment"]
 # The model must never emit it directly (the field description says so); it is
 # in the Literal so voted reports validate/persist/read back like any verdict.
 Verdict = Literal["true_positive", "false_positive", "needs_more_info", "inconclusive"]
+
+# H2 (2026-11-13). What the hostile action of a true positive did. A true
+# positive says that the detection is correct, and three identical unanswered
+# SYN probes on production got TP 0.65, TP 0.75 and FP 0.72: the verdict had
+# no place for "the rule is right and nothing happened". The impact is that
+# place. It is set for a true positive and it is None for every other verdict.
+Impact = Literal["none", "attempted", "succeeded", "unknown"]
+# The four values, worst first. A list that orders by impact and the merged
+# threat rows read this order.
+IMPACT_ORDER: tuple[str, ...] = ("succeeded", "attempted", "unknown", "none")
+TRUE_POSITIVE = "true_positive"
+
+# How far the activity of a hunt finding went (campaign design, 2026-11-13).
+# A campaign reads it for its stage ladder. Only a run that judges a finding
+# states it. A stage above ``attempt`` is a claim that a record shows the
+# effect, so it stands only with the impact ``succeeded``: the impact guard
+# already checked the cited record (gates._settle_impact).
+Stage = Literal["reconnaissance", "attempt", "access", "action", "movement"]
+# The five values, lowest first.
+STAGE_ORDER: tuple[str, ...] = ("reconnaissance", "attempt", "access", "action", "movement")
 
 
 # Null sentinels a serving model writes into an Optional container field instead
@@ -58,6 +79,89 @@ def _normalize_verdict(v: Any) -> Any:
         if folded in ("true_positive", "false_positive", "needs_more_info", "inconclusive"):
             return folded
     return v
+
+
+def _normalize_impact(v: Any) -> Any:
+    """Fold a model-written impact to one of the four values, else to None.
+
+    The string ``"none"`` is the impact ``none`` here, so the null-sentinel
+    rescue of the other optional fields must not run on this field. Case,
+    whitespace and a trailing full stop fold. Any other text becomes None:
+    the report then reads ``unknown`` for a true positive, and a word the
+    schema does not know never burns a schema retry.
+    """
+    if v is None:
+        return None
+    if isinstance(v, str):
+        folded = v.strip().strip(".").strip().lower()
+        return folded if folded in IMPACT_ORDER else None
+    return None
+
+
+def _normalize_stage(v: Any) -> Any:
+    """Fold a model-written stage to one of the five values, else to None.
+
+    Case, whitespace and a trailing full stop fold. Any other text becomes
+    None, so a word the schema does not know never burns a schema retry.
+    """
+    if isinstance(v, str):
+        folded = v.strip().strip(".").strip().lower()
+        return folded if folded in STAGE_ORDER else None
+    return None
+
+
+def settled_stage(verdict: Any, stage: Any, impact: Any, *, finding: bool) -> Stage | None:
+    """The stage that a report states: one of the five, or None.
+
+    None when the verdict is no true positive, when the run judges no
+    finding, and when the model stated no stage. A stage above ``attempt``
+    stands only with the impact ``succeeded``. Without it the stage reads
+    ``attempt``. ``impact`` is the impact after its guard.
+    """
+    if verdict != TRUE_POSITIVE or not finding:
+        return None
+    if not isinstance(stage, str) or stage not in STAGE_ORDER:
+        return None
+    if STAGE_ORDER.index(stage) > STAGE_ORDER.index("attempt") and impact != "succeeded":
+        return "attempt"
+    return cast("Stage", stage)
+
+
+def stored_stage(report: Any, verdict: Any) -> Stage | None:
+    """The stage a stored report holds for a row with this verdict, or None."""
+    if verdict != TRUE_POSITIVE or not isinstance(report, dict):
+        return None
+    value = report.get("stage")
+    if isinstance(value, str) and value in STAGE_ORDER:
+        return cast("Stage", value)
+    return None
+
+
+def settled_impact(verdict: Any, impact: Any) -> Impact | None:
+    """The impact a report with this verdict states: one of the four, or None.
+
+    A true positive always states an impact, and ``unknown`` stands for one
+    that the model did not state. Every other verdict states none.
+    """
+    if verdict != TRUE_POSITIVE:
+        return None
+    if isinstance(impact, str) and impact in IMPACT_ORDER:
+        return cast("Impact", impact)
+    return "unknown"
+
+
+def stored_impact(report: Any, verdict: Any) -> Impact | None:
+    """The impact a stored report holds for a row with this verdict, or None.
+
+    None for a row that is no true positive, and for a true positive that an
+    older release stored: such a row states no impact.
+    """
+    if verdict != TRUE_POSITIVE or not isinstance(report, dict):
+        return None
+    value = report.get("impact")
+    if isinstance(value, str) and value in IMPACT_ORDER:
+        return cast("Impact", value)
+    return None
 
 
 def _decode_string_list(v: Any) -> Any:
@@ -164,6 +268,41 @@ class RecommendedAction(BaseModel):
     rationale: str = Field(description="One-line justification visible to the analyst.")
 
     _decode_tool_args = field_validator("tool_args", mode="before")(_decode_stringified_json)
+
+
+def _action_tool(action: Any) -> str:
+    """The tool of one recommended action: a model object or a stored dict."""
+    if isinstance(action, dict):
+        return str(action.get("tool_name") or "")
+    return str(getattr(action, "tool_name", "") or "")
+
+
+def drop_case_comments_without_a_case[ActionT](
+    actions: Sequence[ActionT], *, case_open: bool = False
+) -> tuple[list[ActionT], int]:
+    """``actions`` without each case comment that can have no case, and the count dropped.
+
+    The execute route binds ``add_case_comment`` to a case that THIS
+    investigation opened, and refuses it when there is none (F07: the case id
+    in ``tool_args`` is model-authored and never a write target). A run that
+    has just finished opened no case, so a comment in its report is a card the
+    analyst can never run. Seven cheap-path runs on production offered one,
+    each on a case id the model made up from an alert id (review 2026-11-13).
+
+    The one way a new report can come to have a case is its own escalate, so
+    a comment beside an ``escalate_to_case`` stays: the card keeps it off
+    until the analyst runs the escalate, and says so. ``case_open`` is for a
+    caller that writes actions onto a run that already opened a case (a chat
+    proposal applied after an escalate).
+
+    Works on model objects and on stored dicts, and leaves anything that is
+    neither alone: a stored list is not schema-checked.
+    """
+    kept = list(actions)
+    if case_open or any(_action_tool(a) == "escalate_to_case" for a in kept):
+        return kept, 0
+    kept = [a for a in kept if _action_tool(a) != "add_case_comment"]
+    return kept, len(actions) - len(kept)
 
 
 class InvestigationTranscript(BaseModel):
@@ -281,6 +420,33 @@ class TriageReport(BaseModel):
             "Written for the on-call analyst."
         )
     )
+    impact: Impact | None = Field(
+        default=None,
+        description=(
+            "What the hostile action did. Set it only for a true_positive. "
+            "none: the rule fired on real activity that had no hostile effect, "
+            "for example a probe that got no answer. "
+            "attempted: a hostile action was sent, and no evidence shows that it worked. "
+            "succeeded: a record shows that it worked, for example response content "
+            "or a later stage. Cite that record by its id. "
+            "unknown: the evidence does not show the effect. "
+            "Leave it null for every other verdict."
+        ),
+    )
+    stage: Stage | None = Field(
+        default=None,
+        description=(
+            "How far the activity of a hunt finding went. Set it only when the run "
+            "judges a hunt finding and the verdict is true_positive. "
+            "reconnaissance: scans and probes. "
+            "attempt: a hostile action was sent, and no record shows that it worked. "
+            "access: a record shows that the action worked. "
+            "action: a record shows a command, a file read or a file write on the target. "
+            "movement: a record shows that the target acted against a third host. "
+            "A stage above attempt needs the impact succeeded. "
+            "Leave it null for every other run and every other verdict."
+        ),
+    )
     citations: list[str] = Field(
         default_factory=list,
         description=(
@@ -355,6 +521,10 @@ class TriageReport(BaseModel):
     _decode_actions = field_validator("recommended_actions", mode="before")(_decode_object_list)
     # Formatting-only fold of the canonical verdicts (never synonym mapping).
     _normalize_verdict_fmt = field_validator("verdict", mode="before")(_normalize_verdict)
+    # Formatting-only fold of the four impact values. An unknown word is None.
+    _normalize_impact_fmt = field_validator("impact", mode="before")(_normalize_impact)
+    # Formatting-only fold of the five stage values. An unknown word is None.
+    _normalize_stage_fmt = field_validator("stage", mode="before")(_normalize_stage)
 
     # ``resolution`` gets the null-sentinel rescue ONLY — deliberately NOT the
     # full stringified-JSON decode the fields above receive.
@@ -407,12 +577,21 @@ def is_pipeline_fallback(report: dict[str, Any] | None) -> bool:
 
 
 __all__ = [
+    "IMPACT_ORDER",
     "PIPELINE_FALLBACK_PROVENANCE",
+    "STAGE_ORDER",
+    "TRUE_POSITIVE",
+    "Impact",
     "InvestigationTranscript",
     "RecommendedAction",
     "TargetedGap",
     "TriageReport",
     "Verdict",
     "WriteToolName",
+    "drop_case_comments_without_a_case",
     "is_pipeline_fallback",
+    "settled_impact",
+    "settled_stage",
+    "stored_impact",
+    "stored_stage",
 ]

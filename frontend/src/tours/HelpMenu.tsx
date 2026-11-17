@@ -1,6 +1,8 @@
 import { ExternalLink, HelpCircle } from 'lucide-react';
 import { useEffect, useId, useRef, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react';
+import { getAbout } from '../lib/api';
+import { releaseNotesUrl } from '../lib/docsSite';
 import { GUIDE_URL } from '../shell/pages';
 import { useShell } from '../shell/ShellContext';
 import { useTours } from './TourProvider';
@@ -11,7 +13,8 @@ import { useTours } from './TourProvider';
  * - Tour this page: the tour of the current page. Off on a page with no tour.
  * - Tour soc-ai from the start: the welcome tour again. Page tours keep their state.
  * - Keyboard shortcuts: the shortcut sheet.
- * - Open the guide: the guide in a new tab.
+ * - Open the guide: the console guide on the docs site, in a new tab.
+ * - Release notes: the notes of the running version, in a new tab.
  * - Turn on tours: shown while the operator has turned the tours off.
  *
  * The menu works in an automated browser too, so a check can open a tour on
@@ -43,6 +46,18 @@ export function HelpMenu() {
   useEffect(() => {
     if (open) ensureLoaded?.();
   }, [open, ensureLoaded]);
+
+  // The running version names its release notes. Read once, when the menu
+  // first opens. With no answer the entry opens the changelog.
+  const [version, setVersion] = useState<string | null>(null);
+  const askedVersion = useRef(false);
+  useEffect(() => {
+    if (!open || askedVersion.current) return;
+    askedVersion.current = true;
+    getAbout()
+      .then((a) => setVersion(a.version || null))
+      .catch(() => setVersion(null));
+  }, [open]);
 
   useEffect(() => {
     if (!open) return;
@@ -161,6 +176,21 @@ export function HelpMenu() {
             className="flex w-full items-center gap-2 rounded-control px-2.5 py-2 text-left text-[12.5px] text-text-2 outline-none hover:bg-[#141b25] focus:bg-[#141b25]"
           >
             <span className="flex-1">Open the guide</span>
+            <span className="flex text-faint" aria-hidden="true">
+              <ExternalLink size={12} />
+            </span>
+          </a>
+          <a
+            role="menuitem"
+            tabIndex={-1}
+            href={releaseNotesUrl(version)}
+            target="_blank"
+            rel="noopener noreferrer"
+            data-testid="help-release-notes"
+            onClick={() => setOpen(false)}
+            className="flex w-full items-center gap-2 rounded-control px-2.5 py-2 text-left text-[12.5px] text-text-2 outline-none hover:bg-[#141b25] focus:bg-[#141b25]"
+          >
+            <span className="flex-1">Release notes</span>
             <span className="flex text-faint" aria-hidden="true">
               <ExternalLink size={12} />
             </span>

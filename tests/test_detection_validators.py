@@ -152,14 +152,16 @@ def test_validate_sigma_yaml_non_whitelisted_field_sets_schema_ok_false() -> Non
             "  category: dce_rpc\n"
             "detection:\n"
             "  selection:\n"
-            "    dce_rpc.operation: NetrServerAuthenticate3\n"
+            "    rpc_call.operation: NetrServerAuthenticate3\n"
             "  condition: selection\n"
         )
     )
     validated = validate_sigma_yaml(draft)
     assert validated.schema_ok is False
     assert validated.validator_note is not None
-    assert "dce_rpc.operation" in validated.validator_note
+    # dce_rpc.operation was the example here until the whitelist gained the
+    # dce_rpc fields: a Security Onion 3.x grid stores that name.
+    assert "rpc_call.operation" in validated.validator_note
     assert "not searchable" in validated.validator_note
 
 

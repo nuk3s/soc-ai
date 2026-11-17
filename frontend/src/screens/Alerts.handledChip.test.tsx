@@ -14,6 +14,8 @@ import { MemoryRouter } from 'react-router-dom';
 import { ToastProvider } from '../lib/toast';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AlertGroup } from '../lib/types';
+import { forbiddenWords } from '../test/analystWords';
+import { LINK } from '../test/campaign';
 
 vi.mock('../lib/api', async (importOriginal) => {
   const orig = await importOriginal<typeof import('../lib/api')>();
@@ -133,5 +135,22 @@ describe('the handled-count chips', () => {
   it('control: a counted row has no "uncounted" chip', async () => {
     await showGroup({ ...GROUP, ackedCount: 3, escalatedCount: 0 });
     expect(screen.queryByTestId('counts-unknown')).toBeNull();
+  });
+});
+
+// The campaign is the unit of work (owner, 2026-11-14). A group whose verdict
+// investigation is in a campaign carries the campaign chip in its tags.
+describe('the campaign chip of a group', () => {
+  it('links the group to the campaign of its verdict investigation', async () => {
+    await showGroup({ ...GROUP, verdict: 'true_positive', campaign: LINK });
+    const chip = screen.getByTestId('alert-campaign-es-1');
+    expect(chip).toHaveAttribute('href', '/campaigns/7');
+    expect(chip).toHaveAccessibleName(/^Campaign: actor-a against web-1\./);
+    expect(forbiddenWords(screen.getByTestId('alert-tags-es-1'))).toEqual([]);
+  });
+
+  it('control: a group in no campaign has no chip', async () => {
+    await showGroup({ ...GROUP, campaign: null });
+    expect(screen.queryByTestId('alert-campaign-es-1')).toBeNull();
   });
 });

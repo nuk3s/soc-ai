@@ -369,6 +369,20 @@ _CATALOG: tuple[_ToolDef, ...] = (
         "Add a comment to a Security Onion case. The analyst runs this action.",
         (_SO,),
     ),
+    _ToolDef(
+        "open_finding_case",
+        "Action",
+        False,
+        "Open a Security Onion case from a hunt finding. The analyst runs this action.",
+        (_SO,),
+    ),
+    _ToolDef(
+        "open_campaign_case",
+        "Action",
+        False,
+        "Open one Security Onion case for a campaign. The analyst runs this action.",
+        (_SO,),
+    ),
 )
 
 # Category display order.

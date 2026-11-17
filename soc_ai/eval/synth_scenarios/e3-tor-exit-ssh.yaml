@@ -14,6 +14,12 @@ attack:
   - T1078   # Valid Accounts (likely follow-on)
 sigma_refs: []
 
+# What the deployment must have loaded. The nightly plants this scenario only
+# when the Tor exit list is loaded and lists the source.
+requires:
+  - blocklist: tor
+    ip: "185.220.101.182"
+
 ground_truth:
   verdict: true_positive
   confidence_min: 0.70

@@ -145,7 +145,7 @@ export function PipelineErrorChip({ hint, large }: { hint?: string | null; large
         (large ? 'px-3 py-[5px] text-[12.5px] uppercase tracking-[.01em]' : 'px-[9px] py-[2.5px] text-[11.5px]')
       }
       style={{ color: '#fca5a5', background: 'rgba(240,68,56,.09)', borderColor: 'rgba(240,68,56,.35)' }}
-      title={hint ?? 'This run failed before it reached a verdict. Run it again.'}
+      title={hint ?? 'This investigation failed before it reached a verdict. Run it again.'}
     >
       <Wrench size={large ? 12 : 10} strokeWidth={2.5} />
       Pipeline error
@@ -166,7 +166,7 @@ export function SyntheticEvalBadge() {
     <span
       className="inline-flex flex-none items-center gap-1 whitespace-nowrap rounded-chip border px-1.5 py-px text-[9.5px] font-semibold tracking-[.02em]"
       style={{ color: '#f5a623', borderColor: 'rgba(245,166,35,.4)', background: 'rgba(245,166,35,.09)' }}
-      title="This run used planted synthetic attack scenarios that measure verdict quality. Nothing in it describes real activity on your network."
+      title="This investigation used planted synthetic attack scenarios that measure verdict quality. Nothing in it describes real activity on your network."
     >
       <FlaskConical size={9} strokeWidth={2.5} />
       Synthetic evaluation data
@@ -196,6 +196,10 @@ export function RunClassChip({
   placeholder?: boolean;
   running?: boolean;
 }) {
+  // Standard is the depth of almost every run. Its chip on every row and on
+  // every page said nothing (review 2026-11-12, console finding 15), so a
+  // chip marks a depth that is not the default.
+  if (runClass === 'standard') return null;
   const known = runClass ? CHIP_RUN_CLASS[runClass] : undefined;
   if (!known) {
     if (!placeholder) return null;
@@ -266,7 +270,7 @@ export function RecordedRunChip() {
       title="soc-ai ran this investigation earlier and recorded it. You are replaying the recording."
     >
       <Disc size={10} strokeWidth={2.5} />
-      recorded run
+      recorded investigation
     </span>
   );
 }

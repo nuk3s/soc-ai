@@ -68,10 +68,12 @@ value at import time would make that claim false.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import ipaddress
 import logging
 import re
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
@@ -108,12 +110,13 @@ from soc_ai.dossier.types import (
 )
 from soc_ai.enrichment.discovery import SELF_REPORTED_SIGNALS, _is_internal_ip, _junk_host_reason
 from soc_ai.oracle.identifiers import effective_internal_identifiers
+from soc_ai.so_client import fields
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.store import host_dossier as dossier_store
 from soc_ai.store import host_machines
 from soc_ai.store.auth import utcnow
 from soc_ai.store.internal_identifiers import upsert_detected
-from soc_ai.store.models import DossierRun, HostDossier, HostDossierField
+from soc_ai.store.models import DossierRun, HostDossier, HostDossierField, Investigation
 from soc_ai.tools._synth_scope import synth_scope_must_not
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -206,6 +209,9 @@ class DossierSummary:
     partial_reason: str | None = None
     # Machines the sweep wrote at its end. 0 when it kept the previous ones.
     machines: int = 0
+    # The source side of the census did not fit, so "this address sent no
+    # document" is not proved by the census alone.
+    src_truncated: bool = False
     # Wall time and searches per stage, in run order. The log carries the same
     # numbers, one line per stage. The run row has no column for them.
     stages: list[dict[str, Any]] = field(default_factory=list)
@@ -225,6 +231,57 @@ class _Candidate:
     shippers: set[str] = field(default_factory=set)
     # The shipper sub-agg fell short: another agent may see the address too.
     partial_shippers: bool = False
+    # Documents that name the address as the ORIGINATOR, and the last of them.
+    originated: int = 0
+    last_originated: datetime | None = None
+    # TCP flow records that name it as the RESPONDER and carry a responder
+    # counter, and the documents among all that name it where a counter shows a
+    # packet or a byte from it.
+    judged: int = 0
+    answered: int = 0
+    # Documents that name it as the responder and are not TCP: UDP, ICMP, and a
+    # document with no transport field.
+    non_tcp: int = 0
+    # The sensors that wrote the judged records, and whether the list is whole.
+    sensors: set[str] = field(default_factory=set)
+    partial_sensors: bool = False
+    # Each of those sensors shows responder traffic for a host in the window.
+    sensor_answers: bool = False
+    # An agent reports the address.
+    agent: bool = False
+    # A name source names the address: a DNS answer or a DHCP lease.
+    named: bool = False
+
+    @property
+    def probe_only(self) -> bool:
+        """True when the grid holds only TCP probes that other hosts sent TO the address.
+
+        Each test must hold.
+
+        * No document names the address as the originator.
+        * At least one TCP flow record that names it as the responder carries a
+          responder counter, and no document shows a packet or a byte from it.
+        * It received no record of a different transport. A UDP receiver such
+          as a syslog collector answers nothing and is a real host, so one UDP
+          or ICMP record keeps the record.
+        * Each sensor that wrote those TCP records shows responder traffic for
+          a host in the window. A sensor that captures one direction writes
+          zero for each real server, so its zero proves nothing.
+        * No agent reports it. No DNS answer and no DHCP lease names it.
+
+        A grid whose flow records carry no responder counter gives
+        ``judged == 0``, and the address then keeps its record: an address that
+        cannot be measured is not called silent.
+        """
+        return (
+            self.originated == 0
+            and self.judged > 0
+            and self.answered == 0
+            and self.non_tcp == 0
+            and self.sensor_answers
+            and not self.agent
+            and not self.named
+        )
 
 
 # Sub-agg caps on each census address bucket. Small on purpose: the container
@@ -284,7 +341,52 @@ def _census_agg_size(settings: Settings) -> int:
     return max(_MIN_CENSUS_AGG_SIZE, min(int(settings.dossier_max_hosts), _MAX_CENSUS_AGG_SIZE))
 
 
-def _endpoint_agg(field_name: str, size: int) -> dict[str, Any]:
+def _responder_aggs() -> dict[str, Any]:
+    """Three counts for each responder address.
+
+    ``judged`` counts the TCP records that carry a responder counter, and it
+    names the sensors that wrote them. ``answered`` counts the documents where
+    a counter is above zero: the address sent a packet. A SYN that a closed
+    port refused counts, because the RST is a packet. ``non_tcp`` counts the
+    documents of a different transport. A probe to an address with no machine
+    gives judged records, no answered document and no document of a different
+    transport.
+
+    The two clauses are the ones the served-port reads use
+    (:mod:`soc_ai.so_client.fields`, "Responder evidence"), so the host rule
+    and the port rule agree on what a responder packet is.
+    """
+    return {
+        "judged": {
+            "filter": fields.judged_record_clause(),
+            "aggs": {"sensors": {"terms": {"field": _SENSOR_FIELD, "size": _SENSOR_AGG_SIZE}}},
+        },
+        "answered": {"filter": fields.responder_answered_clause()},
+        "non_tcp": {"filter": {"bool": {"must_not": [fields.tcp_record_clause()]}}},
+    }
+
+
+# The field that names the sensor of a flow record, and how many sensors one
+# address or one grid can name in the census.
+_SENSOR_FIELD = "observer.name"
+_SENSOR_AGG_SIZE = 5
+_GRID_SENSOR_AGG_SIZE = 200
+
+
+def _answering_agg() -> dict[str, Any]:
+    """The sensors that show a responder packet for a host in the window."""
+    return {
+        "filter": fields.responder_answered_clause(),
+        "aggs": {"sensors": {"terms": {"field": _SENSOR_FIELD, "size": _GRID_SENSOR_AGG_SIZE}}},
+    }
+
+
+def _sensor_names(agg: dict[str, Any] | None) -> set[str]:
+    buckets = ((agg or {}).get("sensors") or {}).get("buckets") or ()
+    return {str(b.get("key")) for b in buckets if isinstance(b, dict) and b.get("key")}
+
+
+def _endpoint_agg(field_name: str, size: int, *, responder: bool = False) -> dict[str, Any]:
     """Terms agg over an IP field, carrying each address's lifetime.
 
     The min/max sub-aggs are why the census needs no documents: a host's first
@@ -298,27 +400,36 @@ def _endpoint_agg(field_name: str, size: int) -> dict[str, Any]:
     :func:`_note_truncation` makes the ceiling something an operator can see
     rather than something the dossier hides.
     """
-    return {
-        "terms": {"field": field_name, "size": size},
-        "aggs": {
-            "first_seen": {"min": {"field": "@timestamp"}},
-            "last_seen": {"max": {"field": "@timestamp"}},
-            # Who reports the address: the container rule needs an address an
-            # agent's endpoint sensor sees.
-            "datasets": {"terms": {"field": "event.dataset", "size": _SOURCE_DATASET_AGG_SIZE}},
-            "shippers": {"terms": {"field": "host.name", "size": _SOURCE_SHIPPER_AGG_SIZE}},
-        },
+    sub_aggs: dict[str, Any] = {
+        "first_seen": {"min": {"field": "@timestamp"}},
+        "last_seen": {"max": {"field": "@timestamp"}},
+        # Who reports the address: the container rule needs an address an
+        # agent's endpoint sensor sees.
+        "datasets": {"terms": {"field": "event.dataset", "size": _SOURCE_DATASET_AGG_SIZE}},
+        "shippers": {"terms": {"field": "host.name", "size": _SOURCE_SHIPPER_AGG_SIZE}},
     }
+    if responder:
+        # Only the responder side asks: did the address answer at all.
+        sub_aggs.update(_responder_aggs())
+    return {"terms": {"field": field_name, "size": size}, "aggs": sub_aggs}
 
 
 def _ingest_buckets(
-    buckets: list[dict[str, Any]], cidrs: list[Any], out: dict[str, _Candidate]
+    buckets: list[dict[str, Any]],
+    cidrs: list[Any],
+    out: dict[str, _Candidate],
+    *,
+    originator: bool = False,
 ) -> None:
     """Fold one endpoint's buckets into the candidate map, internal addresses only.
 
     A bucket key that is not an address (a mapping artefact) is skipped rather
     than raised on: the census is the one place that sees whatever the grid
     happens to hold.
+
+    ``originator`` says which side the buckets are. The originator side counts
+    the documents that the address sent. The responder side reads the two
+    counts of :func:`_responder_aggs`.
     """
     for bucket in buckets:
         raw = str(bucket.get("key") or "")
@@ -329,12 +440,24 @@ def _ingest_buckets(
         except ValueError:  # pragma: no cover - _is_internal_ip already parsed it
             continue
         candidate = out.setdefault(ip, _Candidate(ip=ip))
-        candidate.events += int(bucket.get("doc_count") or 0)
-        _widen_lifetime(
-            candidate,
-            _agg_datetime(bucket.get("first_seen")),
-            _agg_datetime(bucket.get("last_seen")),
-        )
+        docs = int(bucket.get("doc_count") or 0)
+        candidate.events += docs
+        last = _agg_datetime(bucket.get("last_seen"))
+        _widen_lifetime(candidate, _agg_datetime(bucket.get("first_seen")), last)
+        if originator:
+            candidate.originated += docs
+            if last is not None and (
+                candidate.last_originated is None or last > candidate.last_originated
+            ):
+                candidate.last_originated = last
+        else:
+            judged = bucket.get("judged") or {}
+            candidate.judged += int(judged.get("doc_count") or 0)
+            candidate.sensors |= _sensor_names(judged)
+            if int((judged.get("sensors") or {}).get("sum_other_doc_count") or 0) > 0:
+                candidate.partial_sensors = True
+            candidate.answered += int((bucket.get("answered") or {}).get("doc_count") or 0)
+            candidate.non_tcp += int((bucket.get("non_tcp") or {}).get("doc_count") or 0)
         for name, held in (("datasets", candidate.datasets), ("shippers", candidate.shippers)):
             agg = bucket.get(name) or {}
             if name == "shippers" and int(agg.get("sum_other_doc_count") or 0) > 0:
@@ -395,7 +518,8 @@ async def _census(
             size=0,
             aggs={
                 "src": _endpoint_agg("source.ip", agg_size),
-                "dst": _endpoint_agg("destination.ip", agg_size),
+                "dst": _endpoint_agg("destination.ip", agg_size, responder=True),
+                "answering": _answering_agg(),
             },
             track_total_hits=True,
         )
@@ -420,8 +544,18 @@ async def _census(
                         f"census stopped at {page_cap} addresses on {field_name}. "
                         "Raise dossier_max_hosts or narrow internal_cidrs.",
                     )
-        _ingest_buckets(list(agg.get("buckets") or []), cidrs, candidates)
+        _ingest_buckets(list(agg.get("buckets") or []), cidrs, candidates, originator=key == "src")
     _note_truncation(aggs, summary, agg_size=agg_size)
+    # A source list that did not fit cannot prove that an address sent nothing.
+    src = aggs.get("src") or {}
+    summary.src_truncated = int(src.get("sum_other_doc_count") or 0) > 0 or bool(src.get("capped"))
+    answering = _sensor_names(aggs.get("answering"))
+    for candidate in candidates.values():
+        candidate.sensor_answers = (
+            bool(candidate.sensors)
+            and not candidate.partial_sensors
+            and candidate.sensors <= answering
+        )
     return candidates
 
 
@@ -456,7 +590,9 @@ async def _census_pages(
             "filter": [base, {"terms": {field_name: [str(net) for net in cidrs]}}],
         }
     }
-    sub_aggs = _endpoint_agg(field_name, _CENSUS_PAGE)["aggs"]
+    sub_aggs = _endpoint_agg(field_name, _CENSUS_PAGE, responder=field_name == "destination.ip")[
+        "aggs"
+    ]
     buckets: list[dict[str, Any]] = []
     after: dict[str, Any] | None = None
     capped = False
@@ -551,6 +687,7 @@ def _ingest_agent_claims(
         if not _is_internal_ip(ip, cidrs):
             continue
         candidate = out.setdefault(ip, _Candidate(ip=ip))
+        candidate.agent = True
         held = report.addresses.get(ip)
         if candidate.events == 0 and held is not None:
             candidate.events = held.docs
@@ -592,6 +729,7 @@ def _ingest_dns_names(
         if not _is_internal_ip(ip, cidrs):
             continue
         candidate = out.setdefault(ip, _Candidate(ip=ip))
+        candidate.named = True
         _widen_lifetime(candidate, claim.first_answer, claim.last_answer)
 
 
@@ -619,6 +757,131 @@ def _drop_broadcast(candidates: dict[str, _Candidate], cidrs: list[Any]) -> list
     for ip in doomed:
         del candidates[ip]
     return doomed
+
+
+def _mark_leases(leases: DhcpLeaseInventory, candidates: dict[str, _Candidate]) -> None:
+    """A DHCP lease names its address: a machine asked for it."""
+    for lease in leases.leases:
+        candidate = candidates.get(lease.ip)
+        if candidate is not None:
+            candidate.named = True
+
+
+async def _originators(
+    es_client: Any,
+    index: str,
+    lookback_days: int,
+    addresses: list[str],
+    summary: DossierSummary,
+) -> dict[str, int] | None:
+    """The documents that each of ``addresses`` sent, in one search.
+
+    The census reads the source side with a terms aggregation, and a large
+    network does not fit in it. An address that the aggregation left out reads
+    as "sent nothing". This search asks for the candidates by address, so its
+    answer does not depend on what fit. Returns ``None`` when the search cannot
+    run or fails: the caller then keeps each record.
+    """
+    if len(addresses) > _MAX_CENSUS_AGG_SIZE:
+        _record_note(
+            summary,
+            f"the probe-only check has {len(addresses)} candidate addresses, more than one "
+            "search can read. The sweep kept each record.",
+        )
+        return None
+    query = {
+        "bool": {
+            "filter": [
+                {"range": {"@timestamp": {"gte": f"now-{lookback_days}d"}}},
+                {"terms": {"source.ip": addresses}},
+            ],
+            "must_not": list(synth_scope_must_not(False)),
+        }
+    }
+    try:
+        result = await es_client.search(
+            index,
+            query,
+            size=0,
+            aggs={"originators": {"terms": {"field": "source.ip", "size": len(addresses)}}},
+        )
+    except Exception as exc:
+        _record_error(summary, f"probe-only originator read: {type(exc).__name__}: {exc}")
+        _LOGGER.warning("dossier: probe-only originator read failed: %s", exc)
+        return None
+    buckets = ((result.aggregations or {}).get("originators") or {}).get("buckets") or ()
+    return {
+        str(bucket.get("key")): int(bucket.get("doc_count") or 0)
+        for bucket in buckets
+        if isinstance(bucket, dict) and int(bucket.get("doc_count") or 0) > 0
+    }
+
+
+async def _drop_probe_only(
+    db_sessionmaker: async_sessionmaker[AsyncSession],
+    candidates: dict[str, _Candidate],
+    summary: DossierSummary,
+    *,
+    es_client: Any,
+    index: str,
+    lookback_days: int,
+) -> list[str]:
+    """Remove the addresses that only received probes. Returns the addresses removed.
+
+    One Nmap sweep of seven /24 networks put 1,672 addresses into the census as
+    responders. Each one became a host row and a machine record. No machine was
+    at those addresses: no document showed a packet from them. The nightly
+    sweep then spent six nights of host builds on them, and the real hosts read
+    as stale.
+
+    The rule is :attr:`_Candidate.probe_only`. It cannot remove a host that the
+    grid has evidence of, because each kind of evidence fails one of its tests:
+    a packet from the host, a record of a transport that needs no answer, an
+    agent on the host, or a name for the host. A machine that sends nothing,
+    answers nothing, runs no agent and has no name gets its record on the first
+    sweep after one of those appears.
+
+    "Sent nothing" comes from the source side of the census. When that side
+    was truncated, one targeted search reads the candidates as originators
+    before the decision. If that search cannot run, no address is removed.
+
+    An address that already has a row keeps it. This function creates nothing
+    and deletes nothing. If the store cannot be read, no address is removed.
+    """
+    suspects = sorted(ip for ip, candidate in candidates.items() if candidate.probe_only)
+    if not suspects:
+        return []
+    if summary.src_truncated:
+        sent = await _originators(es_client, index, lookback_days, suspects, summary)
+        if sent is None:
+            return []
+        for ip, docs in sent.items():
+            if ip in candidates:
+                candidates[ip].originated += docs
+        suspects = [ip for ip in suspects if ip not in sent]
+        if not suspects:
+            return []
+    known: set[str] = set()
+    try:
+        async with db_sessionmaker() as db:
+            for start in range(0, len(suspects), _CENSUS_COMMIT_CHUNK):
+                chunk = suspects[start : start + _CENSUS_COMMIT_CHUNK]
+                rows = await db.scalars(select(HostDossier.ip).where(HostDossier.ip.in_(chunk)))
+                known.update(str(ip) for ip in rows.all())
+    except Exception as exc:
+        _record_error(summary, f"probe-only check: {type(exc).__name__}: {exc}")
+        return []
+    dropped = [ip for ip in suspects if ip not in known]
+    for ip in dropped:
+        del candidates[ip]
+    if dropped:
+        _record_note(
+            summary,
+            f"{len(dropped)} address(es) only received probes and got no host record. "
+            "No document shows a packet from them. No agent reports them and no name "
+            "source names them.",
+        )
+    return dropped
 
 
 async def _record_census(
@@ -668,24 +931,130 @@ async def _record_census(
 # ---------------------------------------------------------------------------
 
 
-async def _due_hosts(db_sessionmaker: async_sessionmaker[AsyncSession], limit: int) -> list[str]:
-    """The *limit* stalest hosts, never-built first.
+# How far back an alert, an investigation or an originated event makes a host
+# active.
+_ACTIVITY_WINDOW_DAYS = 7
+# One host build in this many goes to the hosts with no recent activity. A row
+# that no sweep has built still gets its turn when the active hosts fill a
+# sweep.
+_QUIET_SHARE = 10
+
+
+def _naive_utc(value: datetime) -> datetime:
+    """The store's clock form: UTC with no zone."""
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(UTC).replace(tzinfo=None)
+
+
+async def _active_addresses(
+    db_sessionmaker: async_sessionmaker[AsyncSession],
+    candidates: dict[str, _Candidate],
+    summary: DossierSummary,
+) -> set[str]:
+    """The addresses that the model is most likely to ask about next.
+
+    Three signals, and one is enough:
+
+    * an alert or an investigation named the address in the last
+      :data:`_ACTIVITY_WINDOW_DAYS` days,
+    * an agent reports the address,
+    * the address originated an event in the same window.
+
+    The first signal reads the store and the other two read this sweep's
+    census. When the census failed, the agent addresses come from the rows that
+    the last machine build marked. A failed store read costs the first signal
+    only, and the sweep says so.
+    """
+    cutoff = utcnow() - timedelta(days=_ACTIVITY_WINDOW_DAYS)
+    active: set[str] = set()
+    for ip, candidate in candidates.items():
+        recent = candidate.last_originated is not None and (
+            _naive_utc(candidate.last_originated) >= cutoff
+        )
+        if candidate.agent or recent:
+            active.add(ip)
+    try:
+        async with db_sessionmaker() as db:
+            rows = await db.execute(
+                select(Investigation.src_ip, Investigation.dest_ip).where(
+                    Investigation.created_at >= cutoff,
+                    Investigation.is_synth_eval.is_(False),
+                )
+            )
+            for src_ip, dest_ip in rows.all():
+                active.update(str(ip) for ip in (src_ip, dest_ip) if ip)
+            agents = await db.scalars(
+                select(HostDossier.ip).where(HostDossier.address_kind == "agent")
+            )
+            active.update(str(ip) for ip in agents.all())
+    except Exception as exc:
+        _record_error(summary, f"active hosts: {type(exc).__name__}: {exc}")
+        _LOGGER.warning("dossier: active-host read failed: %s", exc)
+    return active
+
+
+async def _due_hosts(
+    db_sessionmaker: async_sessionmaker[AsyncSession],
+    limit: int,
+    active: Collection[str] = (),
+    evidenced: Collection[str] = (),
+) -> list[str]:
+    """The *limit* hosts to build: the active hosts first, then the stalest.
 
     Staleness is an ORDER BY, not a filter: a small network should be rebuilt on
     every sweep, and a large one drains oldest-first across sweeps. Priority is
     recomputed from the durable ``last_built_at`` each time, so a restart resumes
     where the last sweep stopped instead of starting the network over.
 
+    Staleness alone was the order until one Nmap sweep added 1,672 rows that no
+    sweep had built. Those rows sorted first, and at 200 builds a sweep they
+    held the queue for six nights. The hosts with alerts were not rebuilt in
+    that time, and the model read ``role: unknown [stale]`` for them. So the
+    hosts in ``active`` go first, stalest first among them. The other hosts
+    follow. They always keep one build in :data:`_QUIET_SHARE`, and at least
+    one build, and that share goes to the stalest of them. So each row builds
+    within a bounded number of sweeps: the count of the other hosts divided by
+    the share. The builds that the active hosts leave go to the addresses in
+    ``evidenced`` first: the census of this sweep holds evidence of a machine
+    there. The rows that are left are the rows of addresses that only received
+    probes and the rows that this census did not see.
+
     Read as plain strings in one short session: holding an ORM identity map open
     across a multi-minute sweep is how a background job pins a pool connection.
     """
+    limit = max(1, limit)
     async with db_sessionmaker() as db:
         rows = await db.scalars(
-            select(HostDossier.ip)
-            .order_by(nulls_first(HostDossier.last_built_at.asc()), HostDossier.id.asc())
-            .limit(max(1, limit))
+            select(HostDossier.ip).order_by(
+                nulls_first(HostDossier.last_built_at.asc()), HostDossier.id.asc()
+            )
         )
-        return [str(ip) for ip in rows.all()]
+        ordered = [str(ip) for ip in rows.all()]
+    if (not active and not evidenced) or limit == 1:
+        # One build cannot serve two shares. Staleness alone gives each row a
+        # turn.
+        return ordered[:limit]
+    wanted, known = set(active), set(evidenced)
+    hot = [ip for ip in ordered if ip in wanted]
+    others = [ip for ip in ordered if ip not in wanted]
+    # The reserved share rotates by staleness over every other row, with or
+    # without evidence. A row waits at most len(others) / reserved sweeps. The
+    # share went to the rows with evidence first, and 20 of them refilled it on
+    # each sweep: a row outside the evidence never built.
+    reserved = min(len(others), max(1, limit // _QUIET_SHARE))
+    chosen = set(others[:reserved])
+    first = hot[: limit - reserved]
+    spare = limit - len(first) - len(chosen)
+    for ip in (*(ip for ip in others if ip in known), *(ip for ip in others if ip not in known)):
+        if spare <= 0:
+            break
+        if ip not in chosen:
+            chosen.add(ip)
+            spare -= 1
+    quiet = [ip for ip in others if ip in chosen and ip in known]
+    quiet += [ip for ip in others if ip in chosen and ip not in known]
+    return first + quiet
 
 
 def _component_digest(value: str | None) -> str:
@@ -866,6 +1235,32 @@ def _port_count(value_json: Any) -> int | None:
     return None
 
 
+def _port_numbers(value_json: Any) -> set[int]:
+    """The port numbers of a services payload. Empty for another shape."""
+    entries = value_json.get("ports") if isinstance(value_json, dict) else value_json
+    out: set[int] = set()
+    for entry in entries if isinstance(entries, list) else ():
+        port = entry.get("port") if isinstance(entry, dict) else entry
+        if isinstance(port, int) and not isinstance(port, bool):
+            out.add(port)
+    return out
+
+
+def _probed_ports(observations: HostObservations) -> set[int]:
+    """The responder ports that this read returned as probed.
+
+    The collector marks such a port with ``answered: 0``: it has flow records,
+    and none shows an answer.
+    """
+    out: set[int] = set()
+    for bucket in observations.resp_ports or ():
+        answered = bucket.get("answered")
+        if isinstance(answered, int) and not isinstance(answered, bool) and answered == 0:
+            with contextlib.suppress(TypeError, ValueError):
+                out.add(int(bucket.get("value")))  # type: ignore[arg-type]
+    return out
+
+
 def _partial_port_read(
     observations: HostObservations,
     facts: dict[str, Fact],
@@ -878,6 +1273,12 @@ def _partial_port_read(
     ports the previous build held for this host. The second catches a grid
     that answers partial results with no error, which is what a deployment
     with ``es_fail_on_partial_results`` off receives.
+
+    A previous port that this read returned as PROBED was returned. The read
+    saw its records, and they show no answer. Without that count, the build
+    after a port scan would keep each false port for ever: the port set of a
+    scanned address drops from seven to none, and the second test would call
+    the correction a short read.
     """
     for error in observations.errors:
         if error.startswith(_MAIN_PASS_PREFIXES) and _DEGRADED_RE.search(error):
@@ -886,7 +1287,11 @@ def _partial_port_read(
     before = _port_count(held.inferred_value_json) if held is not None else None
     fact = facts.get("services_offered")
     now = _port_count(fact.value_json) if fact is not None else None
-    if before is not None and before >= _PORT_DROP_MIN_PRIOR and (now or 0) * 2 < before:
+    explained = 0
+    if held is not None:
+        explained = len(_port_numbers(held.inferred_value_json) & _probed_ports(observations))
+    returned = (now or 0) + explained
+    if before is not None and before >= _PORT_DROP_MIN_PRIOR and returned * 2 < before:
         return f"the read returned {now or 0} served ports where the previous build had {before}"
     return None
 
@@ -1659,7 +2064,17 @@ async def _sweep_stages(  # noqa: PLR0915 - one procedure, read top to bottom
         )
         _ingest_agent_claims(agent_inventory, cidrs, candidates)
         _ingest_dns_names(dns_names, cidrs, candidates)
+        _mark_leases(leases, candidates)
         _drop_broadcast(candidates, cidrs)
+        # After every pass that can prove a machine is at an address.
+        await _drop_probe_only(
+            db_sessionmaker,
+            candidates,
+            summary,
+            es_client=es_client,
+            index=index,
+            lookback_days=lookback_days,
+        )
         stage.detail = f"{len(candidates)} addresses"
     with clock.stage("census record"):
         # A row an older census wrote for a broadcast address goes too.
@@ -1678,7 +2093,12 @@ async def _sweep_stages(  # noqa: PLR0915 - one procedure, read top to bottom
             await _prune_stale(db_sessionmaker, settings, set(candidates), summary)
 
     with clock.stage("host builds") as stage:
-        due = await _due_hosts(db_sessionmaker, int(settings.dossier_max_hosts_per_run))
+        active = await _active_addresses(db_sessionmaker, candidates, summary)
+        # A probe-only address is still a candidate when it already has a row.
+        evidenced = {ip for ip, candidate in candidates.items() if not candidate.probe_only}
+        due = await _due_hosts(
+            db_sessionmaker, int(settings.dossier_max_hosts_per_run), active, evidenced
+        )
         for ip in due:
             try:
                 await _build_host(

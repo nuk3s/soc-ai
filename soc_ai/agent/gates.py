@@ -8,6 +8,7 @@ import json
 import logging
 import re
 from collections.abc import Sequence
+from dataclasses import dataclass
 from ipaddress import ip_address
 from typing import Any, Literal
 
@@ -858,7 +859,13 @@ def _synth_first_post_validate(
     # host_alert_profile lists malware/C2 rules (which may themselves be FPs)
     # and the external IP has no reputation — with zero per-alert evidence.
     # On a hunt finding it also reads the documents the promoted finding cites.
-    report = _downgrade_ungrounded_host_anchored_tp(report, enriched_ctx, audit)
+    report = _downgrade_ungrounded_host_anchored_tp(
+        report,
+        enriched_ctx,
+        audit,
+        messages=targeted_messages,
+        tool_results=targeted_tool_results,
+    )
 
     # ----- Decisive-value support gate (H1's deferred half) -----
     # The gates above check evidence was GATHERED; this one checks the gathered
@@ -890,6 +897,17 @@ def _synth_first_post_validate(
         targeted_messages=targeted_messages,
         targeted_tool_called=targeted_tool_called,
         resolved_citations=int(citation_validation["counts"]["valid"]),
+    )
+
+    # ----- The impact of a true positive (H2) -----
+    # After the last gate that can change the verdict: the impact belongs to
+    # the verdict that stands. A verdict that a gate lowered states no impact.
+    report = _settle_impact(
+        report,
+        enriched_ctx,
+        audit,
+        messages=targeted_messages,
+        tool_results=targeted_tool_results,
     )
 
     return report, audit
@@ -957,17 +975,28 @@ _WEB_ATTACK_EVIDENCE_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     )
 )
 
-# The text of the host history gate. The lead opens the summary when the gate
-# fires: its first sentence becomes the row headline and the session-prior
-# digest (recorder._first_rationale), and the Oracle reads it in local_summary.
+# The text of the host history gate. Until B2 (2026-11-13) a lead opened the
+# summary when the gate fired, so its first sentence became the row headline:
+# "soc-ai changed the verdict from a true positive to needs more info". The
+# analyst read how soc-ai handled the verdict and did not read what the host
+# did. The summary now keeps the text of the model, and the change travels in
+# its own field (:func:`verdict_change_from_audit`). The lead stays here for
+# two readers: the Oracle case (:func:`oracle_view`) and the rows that an
+# older release stored (:func:`strip_stored_gate_lead`).
 _HOST_ANCHORED_TP_LEAD = (
     "soc-ai changed the verdict from a true positive to needs more info. "
     "soc-ai found no direct evidence for the true positive. "
     "The rest of this summary is the text that the model wrote."
 )
 _HOST_ANCHORED_TP_IOC = "No blocklist or MISP entry matches an indicator."
-_HOST_ANCHORED_TP_ALERT = "The alert is not a malware or attack detection."
-_HOST_ANCHORED_TP_FINDING = "No document that this finding cites is a malware or attack detection."
+_HOST_ANCHORED_TP_ALERT = (
+    "The alert is not a malware or attack detection. "
+    "The report cites no record of the host that holds content of the event."
+)
+_HOST_ANCHORED_TP_FINDING = (
+    "No document that this finding cites is a malware or attack detection. "
+    "The report cites no record of the host that holds content of the event."
+)
 _HOST_ANCHORED_TP_WORDS = (
     "The summary and the citations name no attack evidence beyond the alert history "
     "of the host. Examples of attack evidence are a beacon, a payload, a web shell "
@@ -1132,6 +1161,7 @@ def _refuse_benign_verdict_without_baseline(
         "spec_id": spec.id,
         "spec_title": spec.title,
         "spec_level": spec.level,
+        "exceptions": [" ".join(fp.split()) for fp in spec.false_positives],
         "original_verdict": report.verdict,
         "capped_verdict": "needs_more_info",
         "original_confidence": report.confidence,
@@ -1150,10 +1180,442 @@ def _refuse_benign_verdict_without_baseline(
     )
 
 
+def _is_telemetry_record(doc: Any) -> bool:
+    """True when *doc* is a record of an event, and no detector raised it.
+
+    A Zeek or endpoint record states what happened. An alert states what a
+    rule claims. The document must name a dataset, name no detector
+    (:func:`soc_ai.so_client.fields.detection_kind`) and carry no rule name.
+    """
+    from soc_ai.so_client.fields import detection_kind  # noqa: PLC0415
+
+    dataset = str(getattr(doc, "event_dataset", None) or "").strip()
+    if not dataset or getattr(doc, "rule_name", None):
+        return False
+    return detection_kind(dataset, getattr(doc, "event_module", None)) == "alert"
+
+
+# ----- Per-event evidence of the host history gate (B1, 2026-11-13) -----
+#
+# The gate keeps a true positive when the report cites, by id, one resolved
+# record that meets all three conditions:
+#   (a) a tool of this run fetched it, or it is a stored document of the
+#       promoted finding;
+#   (b) it involves a host of the focus document;
+#   (c) it holds content of the event.
+# A bare flow record, an alert history, a host profile and a rule label hold
+# no content of the event. The first version of this fix kept a true positive
+# for an attack alert on the same flow and for the anchor id alone. A review
+# proved both wrong: the first is the BPFDoor case that the gate exists for,
+# and each hunt run gets the anchor id as its alert id.
+
+# The typed fields of a grid document that hold content of an event. The
+# zeek_conn_* fields are absent on purpose: they describe a flow.
+_RECORD_CONTENT_ATTRS: tuple[str, ...] = (
+    "payload_printable",
+    "dns_query",
+    "zeek_dns_query",
+    "zeek_ssl_server_name",
+    "zeek_ssl_ja3",
+    "zeek_ssl_ja3s",
+    "zeek_files_mime_type",
+    "zeek_files_md5",
+    "zeek_files_sha256",
+    "zeek_http_method",
+    "zeek_http_host",
+    "zeek_http_uri",
+    "zeek_http_user_agent",
+    "zeek_kerberos_cipher",
+    "zeek_kerberos_service",
+    "zeek_kerberos_request_type",
+    "zeek_smb_action",
+    "zeek_smb_name",
+    "zeek_dce_rpc_endpoint",
+    "zeek_dce_rpc_operation",
+    "zeek_ssh_client",
+    "zeek_ssh_server",
+    "process_entity_id",
+    "file_hash_sha256",
+)
+# The keys of a raw document that hold a payload. A payload is content of the
+# event in any dataset, also in an alert document.
+_PAYLOAD_KEYS = frozenset(
+    {"payload", "payload_printable", "payload_decoded", "payload_hex", "packet", "printable"}
+)
+# The keys of a raw document that hold content of an HTTP, DNS, TLS, SSH,
+# Kerberos, SMB, file or process event. Matched on the last part of the key.
+_EVENT_CONTENT_KEYS = frozenset(
+    {
+        "uri",
+        "url",
+        "method",
+        "user_agent",
+        "request_body",
+        "response_body",
+        "query",
+        "answers",
+        "rcode_name",
+        "server_name",
+        "ja3",
+        "ja3s",
+        "ja4",
+        "hassh",
+        "sha256",
+        "sha1",
+        "md5",
+        "mime_type",
+        "filename",
+        "command_line",
+        "executable",
+        "cipher",
+        "request_type",
+        "auth_success",
+        "endpoint",
+        "operation",
+    }
+)
+_RECORD_WALK_DEPTH = 6
+
+
+def _is_flow_dataset(dataset: str) -> bool:
+    """True for a dataset of bare flow records: zeek.conn and its equivalents."""
+    name = dataset.strip().lower()
+    return name.endswith((".conn", ".flow", ".flows", ".netflow")) or name in {"conn", "flow"}
+
+
+def _focus_hosts(alert: Any) -> frozenset[str]:
+    """The hosts of the focus document: its two addresses and its host name."""
+    values = [
+        getattr(alert, "source_ip", None),
+        getattr(alert, "destination_ip", None),
+        getattr(alert, "host_name", None),
+        *(getattr(alert, "host_ip", None) or []),
+    ]
+    return frozenset(str(v).lower() for v in values if isinstance(v, str) and v.strip())
+
+
+def _document_holds_event_content(doc: Any, hosts: frozenset[str]) -> bool:
+    """Conditions (b) and (c) for a stored grid document.
+
+    The document involves a focus host, and it is a record with content of
+    the event. A payload counts in any dataset. Else the document must be a
+    telemetry record, no flow record, with one content field.
+    """
+    involved = {
+        str(v).lower()
+        for v in (
+            getattr(doc, "source_ip", None),
+            getattr(doc, "destination_ip", None),
+            getattr(doc, "host_name", None),
+        )
+        if isinstance(v, str) and v
+    }
+    if not involved & hosts:
+        return False
+    if getattr(doc, "payload_printable", None):
+        return True
+    if not _is_telemetry_record(doc):
+        return False
+    if _is_flow_dataset(str(getattr(doc, "event_dataset", "") or "")):
+        return False
+    return any(getattr(doc, attr, None) not in (None, "", [], {}) for attr in _RECORD_CONTENT_ATTRS)
+
+
+def _leaves(
+    value: Any, path: tuple[str, ...] = (), depth: int = 0
+) -> list[tuple[tuple[str, ...], Any]]:
+    """Each (key path, scalar value) of a raw document, to a bounded depth.
+
+    A dotted key counts as its parts, so ``{"event.dataset": x}`` and
+    ``{"event": {"dataset": x}}`` give the same path.
+    """
+    if depth > _RECORD_WALK_DEPTH:
+        return []
+    out: list[tuple[tuple[str, ...], Any]] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            parts = tuple(p for p in str(key).lower().split(".") if p)
+            out.extend(_leaves(item, path + parts, depth + 1))
+    elif isinstance(value, list):
+        for item in value:
+            out.extend(_leaves(item, path, depth + 1))
+    else:
+        out.append((path, value))
+    return out
+
+
+def _raw_record_holds_event_content(record: dict[str, Any], hosts: frozenset[str]) -> bool:
+    """Conditions (b) and (c) for a raw document inside a tool result."""
+    from soc_ai.so_client.fields import detection_kind  # noqa: PLC0415
+
+    leaves = [(path, v) for path, v in _leaves(record) if path and v not in (None, "", [], {})]
+    if not any(isinstance(v, str) and v.lower() in hosts for _path, v in leaves):
+        return False
+    last = {path[-1] for path, _v in leaves}
+    if last & _PAYLOAD_KEYS:
+        return True
+    datasets = [str(v) for path, v in leaves if path[-1] in ("dataset", "event_dataset")]
+    if any(_is_flow_dataset(d) or detection_kind(d) != "alert" for d in datasets):
+        return False
+    # A document with a rule name is the claim of a detector. A document with
+    # a connection state is a flow record.
+    for path, _v in leaves:
+        if path[-1] in ("rule_name", "signature", "conn_state"):
+            return False
+        if path[-2:] in (("rule", "name"), ("connection", "state"), ("conn", "state")):
+            return False
+    return bool(last & _EVENT_CONTENT_KEYS)
+
+
+def _fetched_records(
+    messages: Sequence[Any] | None, tool_results: Sequence[Any] | None
+) -> dict[str, list[dict[str, Any]]]:
+    """The raw documents that the tools of this run fetched, by lower-case id.
+
+    Reads the tool returns of the message history and the results of the
+    targeted dispatch. A failed call gives nothing (:func:`_evidence_payload`).
+    A document is a dict with an ``_id`` or ``id`` key. A tool that returns
+    one document with no id inside is keyed on the id argument of its call.
+    """
+    found: dict[str, list[dict[str, Any]]] = {}
+
+    def _add(doc_id: Any, record: Any) -> None:
+        if isinstance(doc_id, str) and doc_id.strip() and isinstance(record, dict):
+            found.setdefault(doc_id.strip().lower(), []).append(record)
+
+    def _walk(value: Any, depth: int = 0) -> None:
+        if depth > _RECORD_WALK_DEPTH:
+            return
+        if isinstance(value, dict):
+            _add(value.get("_id") or value.get("id"), value)
+            for item in value.values():
+                if isinstance(item, dict | list):
+                    _walk(item, depth + 1)
+        elif isinstance(value, list):
+            for item in value:
+                _walk(item, depth + 1)
+
+    call_ids: dict[str, list[str]] = {}
+    returns: list[tuple[Any, Any]] = []
+    for msg in messages or []:
+        for part in getattr(msg, "parts", None) or []:
+            kind = getattr(part, "part_kind", None)
+            if kind == "tool-call":
+                args = getattr(part, "args", None)
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except ValueError:
+                        args = None
+                if isinstance(args, dict):
+                    call_ids[str(getattr(part, "tool_call_id", ""))] = [
+                        str(v) for k, v in args.items() if k in ("event_id", "alert_id", "id") and v
+                    ]
+            elif kind in ("tool-return", "builtin-tool-return"):
+                returns.append(
+                    (getattr(part, "tool_call_id", None), getattr(part, "content", None))
+                )
+    for call_id, content in returns:
+        payload = _evidence_payload(content)
+        if payload is None:
+            continue
+        _walk(payload)
+        for doc_id in call_ids.get(str(call_id), []):
+            _add(doc_id, payload)
+    for content in tool_results or []:
+        payload = _evidence_payload(content)
+        if payload is not None:
+            _walk(payload)
+    return found
+
+
+def _report_cites_event_record(
+    report: Any,
+    enriched_ctx: Any,
+    *,
+    messages: Sequence[Any] | None,
+    tool_results: Sequence[Any] | None,
+) -> bool:
+    """True when the report cites, by id, a record with content of the event.
+
+    The one rule for an alert run and a finding run. See the block comment
+    above for the three conditions. A citation in prose does not count: the
+    citation classifier reads an id only from an id citation. A lead run and a
+    finding with no resolved document get no exemption: the anchor of such a
+    run is a record of the lead or of another finding.
+    """
+    cited = {
+        target.lower()
+        for kind, target in (_classify_citation(str(c)) for c in (report.citations or []))
+        if kind == "id" and target
+    }
+    if not cited:
+        return False
+    subject_docs = list(getattr(enriched_ctx, "subject_documents", None) or [])
+    focus_ids = set(getattr(enriched_ctx, "subject_focus_document_ids", None) or [])
+    if subject_docs and not focus_ids:
+        # A lead run, or a finding that cites no document that the grid holds.
+        # The anchor is then a record of the lead or of another finding. The
+        # anchor, its hosts and the documents of the subject prove nothing
+        # about this claim. A record that a tool of THIS run fetched still
+        # can: run 01M7BHDHYD20B45HJQ2QVZ507F fetched three Zeek HTTP records
+        # of a file read, cited each by id, and read "attempted" (production,
+        # 2026-11-13). The record must involve a host that the promoted
+        # finding names. A lead run names none and gets no exemption.
+        hosts = frozenset(
+            h.strip().lower()
+            for h in (getattr(enriched_ctx, "subject_focus_hosts", None) or [])
+            if isinstance(h, str) and h.strip()
+        )
+        subject_docs = []
+    else:
+        hosts = _focus_hosts(getattr(enriched_ctx, "alert", None))
+    if not hosts:
+        return False
+    for doc in subject_docs:
+        doc_id = getattr(doc, "id", None)
+        if (
+            isinstance(doc_id, str)
+            and doc_id in focus_ids
+            and doc_id.lower() in cited
+            and _document_holds_event_content(doc, hosts)
+        ):
+            return True  # a stored document of the promoted finding
+    fetched = _fetched_records(messages, tool_results)
+    return any(
+        _raw_record_holds_event_content(record, hosts)
+        for doc_id in cited
+        for record in fetched.get(doc_id, [])
+    )
+
+
+# ----- The impact of a true positive (H2, 2026-11-13) -----
+#
+# A true positive says that the detection is correct. The impact says what the
+# hostile action did: none, attempted, succeeded or unknown. Three identical
+# unanswered SYN probes on production got TP 0.65, TP 0.75 and FP 0.72,
+# because the verdict had no place for "the rule is right and nothing
+# happened".
+#
+# The model states the impact. One value is a claim that the gates can check:
+# ``succeeded`` says that a record shows the effect. It stands only when the
+# report cites such a record by id, by the rule of the host history gate
+# (:func:`_report_cites_event_record`): a tool of this run fetched the record,
+# or the promoted finding stores it, it involves a focus host, and it holds
+# content of the event. Without one the impact reads ``attempted``. The
+# verdict, the confidence and the text of the model are not touched.
+
+IMPACT_GATE = "impact_evidence_downgrade"
+"""The audit key and the event kind of the impact guard."""
+
+_IMPACT_REASON = (
+    "The report cites no fetched record with content of the event for a host of the alert."
+)
+_IMPACT_MISSING = (
+    "A record of the host with content of the event that the report cites by its id. "
+    "Examples are a response body, a payload and a record of a later stage."
+)
+
+
+def _settle_impact(
+    report: Any,  # TriageReport
+    enriched_ctx: Any,  # EnrichedAlertContext | AlertContext
+    audit: dict[str, Any],
+    *,
+    messages: Sequence[Any] | None = None,
+    tool_results: Sequence[Any] | None = None,
+    extra_citations: Sequence[str] | None = None,
+) -> Any:
+    """The report with the impact that its verdict and its evidence allow.
+
+    - A verdict that is no true positive states no impact.
+    - A true positive with no impact from the model reads ``unknown``.
+    - ``succeeded`` needs a cited record with content of the event. Without
+      one it becomes ``attempted``, and the change is written to ``audit``
+      under :data:`IMPACT_GATE`.
+
+    ``extra_citations`` are evidence ids that belong to the report and that
+    its citation list does not hold: the resolved citations of the Oracle.
+    An unchanged report comes back as the same object.
+    """
+    from soc_ai.triage_models import settled_impact  # noqa: PLC0415 - light import
+
+    stated = getattr(report, "impact", None)
+    impact = settled_impact(report.verdict, stated)
+    if impact == "succeeded":
+        checked = report
+        if extra_citations:
+            checked = report.model_copy(
+                update={"citations": [*(report.citations or []), *extra_citations]}
+            )
+        try:
+            backed = _report_cites_event_record(
+                checked, enriched_ctx, messages=messages, tool_results=tool_results
+            )
+        except Exception:
+            # A context that the rule cannot read proves no record.
+            backed = False
+        if not backed:
+            impact = "attempted"
+            audit[IMPACT_GATE] = {
+                "original_impact": "succeeded",
+                "settled_impact": "attempted",
+                "reason": _IMPACT_REASON,
+            }
+    if impact == stated:
+        return report
+    return report.model_copy(update={"impact": impact})
+
+
+def impact_change_from_audit(audit: Any) -> dict[str, Any] | None:
+    """The impact change that the guard of one run made, or None.
+
+    The twin of :func:`verdict_change_from_audit` for the impact. ``audit``
+    maps a step key to its audit entry. The record names the gate, the impact
+    of the model, the impact that stands, the reason as one line, the missing
+    evidence and the step. Fails closed to None on an entry that names no
+    impact pair.
+    """
+    if not isinstance(audit, dict):
+        return None
+    entry = audit.get(IMPACT_GATE)
+    if not isinstance(entry, dict):
+        return None
+    before, after = entry.get("original_impact"), entry.get("settled_impact")
+    if not (isinstance(before, str) and isinstance(after, str)) or before == after:
+        return None
+    return {
+        "gate": IMPACT_GATE,
+        "from_impact": before,
+        "to_impact": after,
+        "reason": _IMPACT_REASON,
+        "missing": [_IMPACT_MISSING],
+        "steps": [
+            {
+                "gate": IMPACT_GATE,
+                "from_impact": before,
+                "to_impact": after,
+                "reason": _IMPACT_REASON,
+            }
+        ],
+    }
+
+
+def impact_change_line(change: dict[str, Any]) -> str:
+    """The one labeled line of an impact change, as a reader sees it."""
+    return (
+        f"soc-ai changed the impact from {change.get('from_impact')} "
+        f"to {change.get('to_impact')}. {change.get('reason') or ''}"
+    ).strip()
+
+
 def _downgrade_ungrounded_host_anchored_tp(
     report: Any,  # TriageReport
     enriched_ctx: Any,  # EnrichedAlertContext | AlertContext
     audit: dict[str, Any],
+    *,
+    messages: Sequence[Any] | None = None,
+    tool_results: Sequence[Any] | None = None,
 ) -> Any:
     """Downgrade a TP that rests solely on host_alert_profile + absence of reputation.
 
@@ -1171,7 +1633,12 @@ def _downgrade_ungrounded_host_anchored_tp(
          b. The focus alert, and on a hunt finding every document that the
             promoted finding cites, is not a malware/exploit/attack class
             (checked via _alert_signals_malware + _ATTACK_CLASSTYPES). If one
-            of them is a confirmed-malware-class signature we leave the TP
+            of them is a confirmed-malware-class signature we leave the TP.
+            A record with content of the event that the report cites by its
+            id also leaves the TP: a tool of this run fetched the record, or
+            the promoted finding stores it, and it involves a focus host
+            (B1, 2026-11-13). A flow record, a host profile and the label
+            of a sibling alert do not count
          c. No concrete beacon/payload/lateral evidence cited in summary or
             citations, and no web attack evidence of a type that no
             host_alert_profile rule name names (conservative keyword scan;
@@ -1179,12 +1646,13 @@ def _downgrade_ungrounded_host_anchored_tp(
 
     When all conditions hold, the verdict goes to needs_more_info at confidence
     <= 0.5 and recommended_actions is cleared. The summary keeps the text of the
-    model behind _HOST_ANCHORED_TP_LEAD, and the reason is appended to
-    validator_note.
+    model unchanged, and the reason is appended to validator_note.
 
     Owner fix of 2026-10-30: the gate replaced the summary with a fixed text
     and wiped the stories of four hunt-finding investigations on prod. The gate
-    now only adds ways to keep a true positive, and it keeps the story.
+    now only adds ways to keep a true positive, and it keeps the story. Since
+    B2 (2026-11-13) it adds no lead to the summary: the change is its own
+    field on the report (:func:`verdict_change_from_audit`).
     """
     if report.verdict != "true_positive":
         return report
@@ -1251,6 +1719,18 @@ def _downgrade_ungrounded_host_anchored_tp(
             # positives were downgraded to needs-more-info.
             if normalize_classtype(getattr(doc, "classtype", None)) in _ATTACK_CLASSTYPES:
                 return report  # attack-class classtype — leave the TP
+
+        # Gate 3b, per-event evidence (B1, 2026-11-13). The gate fired 9 times
+        # on prod from 2026-10-31 to 2026-11-12. Five fires were finding runs
+        # of one exploit activity: each finding cited Zeek HTTP records of the
+        # requests, each report cited them by id, and no listed word was in
+        # the plain story. The check reads the structure of the evidence, and
+        # the word list below did not grow. ``messages`` and ``tool_results``
+        # are the tool results of this run.
+        if _report_cites_event_record(
+            report, enriched_ctx, messages=messages, tool_results=tool_results
+        ):
+            return report  # a cited record with content of the event
     except Exception:
         return report  # import or attribute failure → conservatively leave TP
 
@@ -1278,20 +1758,20 @@ def _downgrade_ungrounded_host_anchored_tp(
         "original_verdict": "true_positive",
         "downgraded_verdict": "needs_more_info",
         "reason": _host_anchored_tp_reason(on_finding),
+        "on_finding": on_finding,
     }
-    # The summary still leads with the correct conclusion: its first sentence
-    # becomes the row headline and the session-prior digest
-    # (recorder._first_rationale). The summary keeps the story of the model
-    # after the lead (owner fix, 2026-10-30). The lead travels in
-    # local_summary, so the Oracle, the session prior and the chat seed read
-    # the change without reading validator_note. The note is appended, so the
-    # note of an earlier gate stays.
+    # The summary keeps the text of the model, whole and first (B2,
+    # 2026-11-13): its first sentence is the row headline and the digest of
+    # the session prior (recorder._first_rationale), and it states what the
+    # host did. The change travels in the audit entry above, which
+    # verdict_change_from_audit reads for the report, and the Oracle reads it
+    # through oracle_view. The note is appended, so the note of an earlier
+    # gate stays.
     return report.model_copy(
         update={
             "verdict": "needs_more_info",
             "confidence": min(report.confidence, 0.5),
             "recommended_actions": [],
-            "summary": f"{_HOST_ANCHORED_TP_LEAD} {report.summary or ''}".strip(),
             "validator_note": f"{report.validator_note}\n{note}" if report.validator_note else note,
         }
     )
@@ -1340,56 +1820,49 @@ def _apply_targeted_downgrades(
         else None
     )
     if ioc_verification is not None:
-        if ioc_verification == "explicit_blocklist_lookup":
+        explicit = ioc_verification == "explicit_blocklist_lookup"
+        if explicit:
             # Legacy/no-enrichment path: state ONLY what ran — an explicit
             # blocklist probe on both endpoints. No MISP/enrichment check
             # happened here, so the reason must not claim one.
             reason = (
-                "solicited internal ICMP echo reply (ping response: Zeek "
-                "type-8 request → type-0 reply, both internal; explicit "
-                "blocklist lookup clean on both endpoints — no enrichment "
-                "context on this path, MISP not consulted) — not a covert "
-                "beacon; the malware rule label is an uncorroborated "
-                "content match"
+                "The traffic is a solicited ping between two internal hosts: an echo "
+                "request and its reply. An explicit blocklist lookup is clean on both "
+                "endpoints. This path has no enrichment context, and MISP was not read. "
+                "The traffic is not a covert beacon. The malware rule matched packet "
+                "content only."
             )
         else:
             reason = (
-                "solicited internal ICMP echo reply (ping response: Zeek "
-                "type-8 request → type-0 reply, both internal, no blocklist/"
-                "MISP hit) — not a covert beacon; the malware rule label is "
-                "an uncorroborated content match"
+                "The traffic is a solicited ping between two internal hosts: an echo "
+                "request and its reply. The enrichments show no blocklist/MISP hit. "
+                "The traffic is not a covert beacon. The malware rule matched packet "
+                "content only."
             )
-        original_summary = report.summary or ""
+        # No original_summary in the event: the summary keeps the text of the
+        # model, and the timeline (_timeline._downgrade_detail) would print it
+        # twice.
         audit["icmp_solicited_downgrade"] = {
             "original_verdict": "true_positive",
             "downgraded_verdict": "false_positive",
             "reason": reason,
-            "original_summary": original_summary,
+            "ioc_verification": ioc_verification,
         }
-        # Lead the summary with the correct conclusion; move the override
-        # explanation and the agent's original text to validator_note so
-        # nothing is lost, just relocated. This avoids the confusing pattern
-        # of a "[Auto-corrected…]" bracket followed by the agent's wrong
-        # narrative still narrating C2 under an FP verdict.
-        corrected_summary = (
-            "Solicited internal ICMP echo request/reply between two internal "
-            "hosts — a benign ping exchange. The ET MALWARE signature matched "
-            "on packet content only; there are no corroborating C2 indicators "
-            "(no beacon cadence, blocklist/MISP hit, or payload evidence)."
-        )
+        # B2 (2026-11-13): this gate does not write to the summary. Until then
+        # it replaced the summary with a fixed text and moved the text of the
+        # model into validator_note. The change is its own field on the report
+        # (verdict_change_from_audit). This gate refutes the claim of the
+        # model, so the stored report leads with the reason and keeps the
+        # text of the model under its own key (report_text): the headline of
+        # a false positive row must not read as C2.
         validator_note = (
-            "Verdict auto-corrected true_positive→false_positive by the "
-            "solicited-ICMP-echo validator. "
-            + reason
-            + " Original agent summary: "
-            + original_summary
+            "soc-ai changed the verdict from a true positive to a false positive. " + reason
         )
         report = report.model_copy(
             update={
                 "verdict": "false_positive",
                 "recommended_actions": [],
                 "confidence": min(report.confidence, 0.8),
-                "summary": corrected_summary,
                 "validator_note": validator_note,
             }
         )
@@ -2076,17 +2549,20 @@ def _enforce_decisive_value_support(
                 "coerced to needs_more_info for a real investigation"
             ),
         }
+        # B2 (2026-11-13): the note is no longer appended to the summary. The
+        # change is its own field on the report (verdict_change_from_audit).
         note = (
-            " (Downgraded to needs_more_info by the decisive-value support "
-            "gate: the verdict asserts " + ", ".join(unsupported) + " — which "
-            "appears in no document this run retrieved.)"
+            "soc-ai changed the verdict from a true positive to needs more info. "
+            "The verdict names " + ", ".join(unsupported) + ". No document that this "
+            "run read holds it."
         )
+        prior_note = getattr(report, "validator_note", None)
         return report.model_copy(
             update={
                 "verdict": "needs_more_info",
                 "confidence": capped_conf,
                 "recommended_actions": [],
-                "summary": (getattr(report, "summary", "") or "") + note,
+                "validator_note": f"{prior_note}\n{note}" if prior_note else note,
             }
         )
 
@@ -2209,17 +2685,20 @@ def _downgrade_unevidenced_verdict(
             "prefetch-only rationalization, coerced to needs_more_info"
         ),
     }
+    # B2 (2026-11-13): the note is no longer appended to the summary. The
+    # change is its own field on the report (verdict_change_from_audit).
     note = (
-        " (Downgraded to needs_more_info by the evidence gate: this verdict rested "
-        "on prefetched alert fields with no investigation — no tool was run to "
-        "confirm it. Re-run to investigate.)"
+        f"soc-ai changed the verdict from {_verdict_phrase(report.verdict)} to needs more "
+        "info. The verdict rested on the alert fields only, and no tool call returned "
+        "evidence. Run the investigation again."
     )
+    prior_note = getattr(report, "validator_note", None)
     return report.model_copy(
         update={
             "verdict": "needs_more_info",
             "confidence": capped_conf,
             "recommended_actions": [],
-            "summary": (getattr(report, "summary", "") or "") + note,
+            "validator_note": f"{prior_note}\n{note}" if prior_note else note,
         }
     )
 
@@ -2386,10 +2865,9 @@ def enforce_session_verdict_consistency(
     note = (
         "Verdict held at needs_more_info by the same-session gate. This alert was "
         f"settled false positive, but investigation {prior_id} already reached true "
-        "positive on the SAME network session (matching community id). One session "
-        "cannot be both, so the false positive does not stand and the alert is not "
-        "recommended for acknowledgement. Read both before deciding. Original "
-        f"summary: {getattr(report, 'summary', '')}"
+        "positive on the same network session, with the same community id. One "
+        "session cannot be both, so the false positive does not stand and the alert "
+        "is not recommended for acknowledgement. Read both before deciding."
     )
     audit = {
         "original_verdict": "false_positive",
@@ -2415,3 +2893,399 @@ def enforce_session_verdict_consistency(
         ),
         audit,
     )
+
+
+# ---------------------------------------------------------------------------
+# The verdict change of a gate, as its own field on the report (B2)
+# ---------------------------------------------------------------------------
+#
+# Review 2026-11-12, console finding 1. The largest text on the report page of
+# run 01M6WEC0CG156GP1YX38YEAKV5 was "soc-ai changed the verdict from a true
+# positive to needs more info", and the Open questions card repeated it. The
+# facts sat in the body. The rule since then: a gate that changes a verdict
+# keeps the text of the model, and the change is one labeled line. The gates
+# above write their reason into ``audit``. This section turns the audit of one
+# run into one record, ``verdict_change``, that the report carries:
+#
+#     {"gate": <audit key>, "from_verdict": ..., "to_verdict": ...,
+#      "reason": <the labeled line>, "missing": [<evidence that is missing>]}
+#
+# ``reason`` and ``missing`` are built from the structure of the audit entry,
+# never copied from its text, so a stored event of an older release gives the
+# same words.
+
+_VERDICT_PHRASES = {
+    "true_positive": "a true positive",
+    "false_positive": "a false positive",
+    "needs_more_info": "needs more info",
+    "inconclusive": "inconclusive",
+}
+
+
+def _verdict_phrase(verdict: Any) -> str:
+    """A verdict code in the words of a sentence: "a true positive"."""
+    return _VERDICT_PHRASES.get(str(verdict), str(verdict).replace("_", " "))
+
+
+# The gates that change a verdict, in the order the pipeline runs them, with
+# the key of the audit entry that holds the verdict after the change.
+VOTE_STEP = "self_consistency_vote"
+"""The step of the self-consistency vote. It runs before the gates, and it is
+no gate: the report after a vote is a sample that reached the voted verdict."""
+
+VERDICT_CHANGE_GATES: tuple[tuple[str, str], ...] = (
+    (VOTE_STEP, "voted_verdict"),
+    ("verdict_floor_rewrite", "capped_verdict"),
+    ("icmp_solicited_downgrade", "downgraded_verdict"),
+    ("malware_rule_name_ungrounded_downgrade", "capped_verdict"),
+    ("decoy_benign_verdict_refused", "capped_verdict"),
+    ("no_baseline_verdict_refused", "capped_verdict"),
+    ("ungrounded_host_anchored_tp_downgrade", "downgraded_verdict"),
+    ("unsupported_decisive_value_downgrade", "capped_verdict"),
+    ("evidence_gate_downgrade", "capped_verdict"),
+    ("session_verdict_conflict", "held_verdict"),
+)
+
+_MISSING_IOC = "A blocklist or MISP entry that matches an indicator."
+_MISSING_ATTACK_WORDS = (
+    "Attack evidence in the report beyond the alert history of the host. "
+    "Examples are a beacon, a payload, a web shell and a path traversal."
+)
+
+
+def _change_floor(p: dict[str, Any]) -> tuple[str, list[str]]:
+    conf, floor = p.get("confidence"), p.get("floor")
+    numbers = (
+        f"The confidence {float(conf):.2f} is below the floor {float(floor):.2f}. "
+        if isinstance(conf, int | float) and isinstance(floor, int | float)
+        else "The confidence is below the floor. "
+    )
+    if not p.get("n_citations"):
+        return (
+            numbers + "The report cites no evidence.",
+            ["Evidence for the verdict. The report cites no document, field or tool result."],
+        )
+    return (
+        numbers + "Fewer than one in four citations of the report resolve.",
+        ["A citation that resolves to a document, a field or a tool result of this run."],
+    )
+
+
+def _change_icmp(p: dict[str, Any]) -> tuple[str, list[str]]:
+    explicit = p.get("ioc_verification") == "explicit_blocklist_lookup" or (
+        "ioc_verification" not in p and "explicit blocklist lookup" in str(p.get("reason") or "")
+    )
+    checked = (
+        "No blocklist entry matches an endpoint, and MISP was not read."
+        if explicit
+        else "No blocklist or MISP entry matches an endpoint."
+    )
+    return (
+        "The traffic is an echo request and its reply between two internal hosts. "
+        f"{checked} The rule matched packet content only.",
+        [],
+    )
+
+
+def _change_malware_name(_p: dict[str, Any]) -> tuple[str, list[str]]:
+    return (
+        "The rule name signals malware, and the run has no evidence beyond the rule name.",
+        [
+            _MISSING_IOC,
+            "A decisive value from a related record that the report cites. Examples are "
+            "a JA3 hash, a file hash and a Kerberos service name.",
+            "A tool result that confirms the malware claim. This run made no successful tool call.",
+        ],
+    )
+
+
+def _change_decoy(_p: dict[str, Any]) -> tuple[str, list[str]]:
+    return (
+        "The alert comes from a decoy. A decoy has no benign population, so no "
+        "baseline or volume argument can clear it.",
+        [
+            "What the log of the decoy recorded for this source.",
+            "Whether the source was authorised to reach the decoy.",
+            "What drove the source at that moment.",
+        ],
+    )
+
+
+def _change_no_baseline(p: dict[str, Any]) -> tuple[str, list[str]]:
+    spec = str(p.get("spec_id") or "of this detection")
+    exceptions = [str(e) for e in (p.get("exceptions") or []) if str(e).strip()][:3]
+    missing = [f"Whether the principal is this exception of the spec: {e}" for e in exceptions]
+    if not missing:
+        missing = ["Whether the principal is an exception that the spec lists."]
+    missing.append("What drove the principal at that moment.")
+    return (
+        f"The catalog spec {spec} states that this detection has no benign population. "
+        "No baseline, threshold or volume argument can clear it.",
+        missing,
+    )
+
+
+def _change_host_history(p: dict[str, Any]) -> tuple[str, list[str]]:
+    on_finding = bool(p.get("on_finding")) or (
+        "on_finding" not in p and "this finding cites" in str(p.get("reason") or "")
+    )
+    reason = "The run found no direct evidence of an attack beyond the alert history of the host."
+    record = (
+        "A record of the host with content of the event that the report cites by its id. "
+        "Examples are a payload, an HTTP record and a DNS record."
+    )
+    if on_finding:
+        return reason, [
+            _MISSING_IOC,
+            "A malware or attack alert among the documents that the finding cites.",
+            record,
+            _MISSING_ATTACK_WORDS,
+        ]
+    return reason, [_MISSING_IOC, record, _MISSING_ATTACK_WORDS]
+
+
+def _change_decisive_value(p: dict[str, Any]) -> tuple[str, list[str]]:
+    values = [str(v) for v in (p.get("unsupported_values") or []) if str(v).strip()][:5]
+    if not values:
+        return (
+            "The verdict names an indicator value. No document that this run read holds it.",
+            ["A document that holds the indicator value of the verdict."],
+        )
+    return (
+        f"The verdict names {', '.join(values)}. No document that this run read holds "
+        f"{'it' if len(values) == 1 else 'them'}.",
+        [f"A document that holds {v}." for v in values],
+    )
+
+
+def _change_evidence_gate(_p: dict[str, Any]) -> tuple[str, list[str]]:
+    return (
+        "The verdict rests on the alert fields only. No tool call of this run returned evidence.",
+        [
+            "A tool result that confirms or refutes the verdict. This run made no "
+            "successful tool call."
+        ],
+    )
+
+
+def _change_session(p: dict[str, Any]) -> tuple[str, list[str]]:
+    prior = str(p.get("prior_investigation_id") or "unknown")
+    return (
+        f"Investigation {prior} reached a true positive on the same network session. "
+        "One session cannot hold both verdicts.",
+        [
+            f"Which verdict on this session is correct. Read investigation {prior} and "
+            "this investigation."
+        ],
+    )
+
+
+def _change_vote(p: dict[str, Any]) -> tuple[str, list[str]]:
+    if str(p.get("voted_verdict")) in _UNSETTLED_VERDICTS:
+        return (
+            "The samples of the model did not agree on one verdict.",
+            ["A verdict that the samples of the model agree on. Run the investigation again."],
+        )
+    return ("Most samples of the model reached this verdict.", [])
+
+
+_VERDICT_CHANGE_TEXT = {
+    VOTE_STEP: _change_vote,
+    "verdict_floor_rewrite": _change_floor,
+    "icmp_solicited_downgrade": _change_icmp,
+    "malware_rule_name_ungrounded_downgrade": _change_malware_name,
+    "decoy_benign_verdict_refused": _change_decoy,
+    "no_baseline_verdict_refused": _change_no_baseline,
+    "ungrounded_host_anchored_tp_downgrade": _change_host_history,
+    "unsupported_decisive_value_downgrade": _change_decisive_value,
+    "evidence_gate_downgrade": _change_evidence_gate,
+    "session_verdict_conflict": _change_session,
+}
+
+
+def verdict_change_from_audit(audit: Any) -> dict[str, Any] | None:
+    """The verdict change that the vote and the gates of one run made, or None.
+
+    ``audit`` maps a step key to its audit entry: the dict that
+    :func:`_synth_first_post_validate` returns, or the stored events of a run
+    keyed by their kind. Several steps can change the verdict in sequence.
+    The record keeps the verdict of the model as its origin, lists each step
+    in pipeline order under ``steps``, and takes the gate, the reason and the
+    missing evidence from the last step, because the last step set the
+    verdict that stands.
+
+    Fails closed to None on an entry that names no verdict pair, so a
+    malformed stored event never puts a false line on the page.
+    """
+    if not isinstance(audit, dict):
+        return None
+    steps: list[dict[str, Any]] = []
+    missing: list[str] = []
+    for key, to_field in VERDICT_CHANGE_GATES:
+        entry = audit.get(key)
+        if not isinstance(entry, dict):
+            continue
+        before, after = entry.get("original_verdict"), entry.get(to_field)
+        if not (isinstance(before, str) and isinstance(after, str)) or before == after:
+            continue
+        reason, missing = _VERDICT_CHANGE_TEXT[key](entry)
+        steps.append({"gate": key, "from_verdict": before, "to_verdict": after, "reason": reason})
+    if not steps:
+        return None
+    return {
+        "gate": steps[-1]["gate"],
+        "from_verdict": steps[0]["from_verdict"],
+        "to_verdict": steps[-1]["to_verdict"],
+        "reason": steps[-1]["reason"],
+        "missing": missing,
+        "steps": steps,
+    }
+
+
+def verdict_change_line(change: dict[str, Any]) -> str:
+    """The one labeled line of a verdict change, as a reader sees it."""
+    return (
+        f"soc-ai changed the verdict from {_verdict_phrase(change.get('from_verdict'))} "
+        f"to {_verdict_phrase(change.get('to_verdict'))}. {change.get('reason') or ''}"
+    ).strip()
+
+
+def oracle_view(report: Any, change: dict[str, Any] | None) -> Any:
+    """The local report as the Oracle reads it.
+
+    The Oracle case carries ``local_summary`` and no gate field. So the copy
+    for the Oracle opens its summary with the verdict change, as the summary
+    of the host history gate did before B2. The stored report is not touched.
+    The lead of the host history gate keeps its wording of 2026-10-30.
+    """
+    if not change:
+        return report
+    if change.get("gate") == "ungrounded_host_anchored_tp_downgrade":
+        lead = _HOST_ANCHORED_TP_LEAD
+    else:
+        lead = (
+            f"{verdict_change_line(change)} "
+            "The rest of this summary is the text that the model wrote."
+        )
+    return report.model_copy(update={"summary": f"{lead} {report.summary or ''}".strip()})
+
+
+# ----- The headline never contradicts the final verdict -----
+#
+# Two cases, by what the gate did to the claim of the model.
+#
+# A gate LOWERS the claim to needs more info. The claim stands, unproven. The
+# sentence of the model stays the headline, and the Verdict change line
+# follows it.
+#
+# A gate REFUTES the claim: it sets a settled verdict that the sentence of the
+# model contradicts. Today that is the solicited ICMP gate, a true positive to
+# a false positive. A false positive row with the headline "BPFDoor heartbeat
+# confirms a C2 tunnel" tells the analyst two things. So the reason of the
+# gate is the summary of a refuted report, and the text of the model moves to
+# its own key, ``model_summary``. The stored summary and the stored headline
+# are what every list, every digest and the page read, so no reader needs the
+# rule. :func:`report_text` writes that shape, and :func:`run_text` reads
+# every stored shape, the rows of older releases too.
+
+_UNSETTLED_VERDICTS = frozenset({"needs_more_info", "inconclusive"})
+# The end of the validator note that the solicited ICMP gate wrote before B2.
+_LEGACY_MODEL_TEXT_MARK = "Original agent summary:"
+
+
+def is_refutation(change: Any) -> bool:
+    """True when a gate set a settled verdict in place of the verdict of the model.
+
+    A change to needs more info or to inconclusive lowers the claim and is no
+    refutation. A record with no change is none. The vote is none either: the
+    report after a vote is a sample that reached the voted verdict, so its
+    text agrees with that verdict.
+    """
+    if not isinstance(change, dict):
+        return False
+    if change.get("gate") == VOTE_STEP:
+        return False
+    before, after = change.get("from_verdict"), change.get("to_verdict")
+    return bool(after) and after != before and after not in _UNSETTLED_VERDICTS
+
+
+def report_text(summary: str | None, change: dict[str, Any] | None) -> dict[str, str]:
+    """The text keys of the stored report: ``summary``, and ``model_summary``.
+
+    A report whose claim a gate refuted leads with the reason of the gate, and
+    keeps the text of the model under ``model_summary``. Every other report
+    keeps the text of the model as its summary and has no second key.
+    """
+    text = summary or ""
+    if not is_refutation(change):
+        return {"summary": text}
+    reason = str((change or {}).get("reason") or "").strip()
+    if not reason:
+        return {"summary": text}
+    return {"summary": reason, "model_summary": text}
+
+
+def _headline_sentence(text: str) -> str:
+    """The first sentence of a summary, by the rule of the recorder."""
+    return text.split(". ", maxsplit=1)[0] if text else ""
+
+
+@dataclass(frozen=True)
+class RunText:
+    """The text of one stored run, as a reader shows it."""
+
+    # The row headline. It never contradicts the final verdict.
+    headline: str
+    # The body under the headline.
+    summary: str
+    # The text of the model when a gate refuted its claim, else None. The page
+    # prints it under the label "The model wrote".
+    model_text: str | None
+
+
+def run_text(report: Any, *, rationale: str | None, summary: str | None) -> RunText:
+    """The headline, the summary and the model text of one stored run.
+
+    The one reader of the text of a run. ``report`` is the stored report,
+    and ``rationale`` and ``summary`` are the columns of the row. It reads
+    three stored shapes:
+
+    - a refuted report of this release: the summary is the reason of the
+      gate, and ``model_summary`` holds the text of the model;
+    - a report that the solicited ICMP gate wrote before B2: the summary is
+      the text of the gate, and the validator note ends with the text of the
+      model;
+    - a report with the lead of the host history gate in its summary
+      (2026-10-30 to B2): the lead is removed, so the sentence of the model
+      is the headline of that needs more info run.
+    """
+    stored = report if isinstance(report, dict) else {}
+    text = str(stored.get("summary") or summary or "").strip()
+    model_text = stored.get("model_summary")
+    if isinstance(model_text, str) and model_text.strip():
+        # The headline comes from the summary. A stored headline can be the
+        # rationale of an action that the model wrote.
+        return RunText(_headline_sentence(text), text, model_text.strip())
+    text = strip_stored_gate_lead(text)
+    headline = strip_stored_gate_lead(rationale) or text
+    note = str(stored.get("validator_note") or "")
+    _before, mark, legacy = note.partition(_LEGACY_MODEL_TEXT_MARK)
+    return RunText(headline, text, legacy.strip() or None if mark else None)
+
+
+def strip_stored_gate_lead(text: str | None) -> str:
+    """A stored summary without the lead of the host history gate.
+
+    From 2026-10-30 to B2 the gate stored its lead at the start of the
+    summary, and the first sentence of the lead became the row headline. A
+    reader of such a row gets the text of the model. A text that is the lead
+    alone, the stored headline, becomes empty, so the caller falls back to
+    the summary.
+    """
+    value = (text or "").strip()
+    first = _HOST_ANCHORED_TP_LEAD.split(". ", maxsplit=1)[0]
+    if value in (first, f"{first}."):
+        return ""
+    if value.startswith(_HOST_ANCHORED_TP_LEAD):
+        return value[len(_HOST_ANCHORED_TP_LEAD) :].strip()
+    return value

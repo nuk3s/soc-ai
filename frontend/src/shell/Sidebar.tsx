@@ -8,16 +8,24 @@ import {
   History,
   Info,
   LayoutDashboard,
+  Network,
   Search,
   Server,
   Settings,
   Triangle,
   Wrench,
 } from 'lucide-react';
-import { NavLink, useLocation } from 'react-router-dom';
+import { Link, NavLink, useLocation } from 'react-router-dom';
 import { type ReactNode, useEffect, useState } from 'react';
 import { getAbout, getMe } from '../lib/api';
-import { needsYouPart, useNeedsYouCount } from '../lib/needsYou';
+import {
+  campaignsWaiting,
+  investigationsWaiting,
+  needsYouLinks,
+  needsYouPart,
+  reviewCount,
+  useNeedsYouCount,
+} from '../lib/needsYou';
 import type { AboutInfo, Me } from '../lib/types';
 import { ScopeMark, Wordmark } from '../components/Logo';
 import { AccountMenu } from './AccountMenu';
@@ -50,12 +58,17 @@ const NAV_GROUPS: NavGroup[] = [
     label: 'Analyst',
     items: [
       { to: '/dashboard', label: 'Dashboard', icon: <LayoutDashboard size={16} /> },
+      // The campaign is the unit of work of the analyst (owner, 2026-11-14),
+      // so Campaigns sits directly after Dashboard. Its item lights on the
+      // list and on each campaign page.
+      { to: '/campaigns', label: 'Campaigns', icon: <Network size={16} />, match: ['/campaigns'] },
       { to: '/alerts', label: 'Alerts', icon: <Triangle size={16} /> },
       { to: '/investigations', label: 'Investigations', icon: <Search size={16} />, match: ['/investigations', '/investigation'] },
       // Sits beside Investigations rather than under Config: the dossier is a
       // network view an analyst pivots INTO from an alert, not a settings panel.
       { to: '/hosts', label: 'Hosts', icon: <Server size={16} />, match: ['/hosts'] },
-      // A lead lives on the Hunts page, so a lead page keeps Hunts lit.
+      // A lead lives on the Hunts page, so a lead page keeps Hunts lit. The
+      // campaign pages light their own item above.
       // Notifications left the sidebar: the bell opens the same list, and
       // its "View all notifications" link opens the page.
       { to: '/hunts', label: 'Hunts', icon: <Crosshair size={16} />, match: ['/hunts', '/leads'] },
@@ -108,7 +121,17 @@ interface NavBadge {
   /** The count, or null when the server could not read it. */
   value: number | null;
   title: string;
+  /** The list the badge counts. The badge is a link to it, so the number on
+   *  the badge is the list it opens. */
+  to: string;
+  /** A decision badge is amber. A review badge is grey: the unread shadow
+   *  hits are review work, and only a decision takes the color. */
+  tone: 'decision' | 'review';
+  /** The words after the count in the accessible name: "need you". */
+  noun: (n: number) => string;
 }
+
+const needYou = (n: number) => `need${n === 1 ? 's' : ''} you`;
 
 /** "7d" as "7 days", "24h" as "24 hours", for a badge tooltip. */
 function windowWords(range: string): string {
@@ -129,23 +152,36 @@ function badgeState(badge: NavBadge, failed: boolean, loaded: boolean): 'none' |
   return badge.value ? 'count' : 'none';
 }
 
-/** The name of a nav link on the collapsed rail, where the label is not on
- *  screen. It carries the badge in words. */
-function railLinkName(label: string, badge: NavBadge | undefined, failed: boolean, loaded: boolean): string {
-  if (!badge) return label;
+/** One badge in words: "2 need you", "236 shadow hits to review". */
+function badgeWords(badge: NavBadge, failed: boolean, loaded: boolean): string | null {
   const st = badgeState(badge, failed, loaded);
-  if (st === 'unknown') return `${label}, could not count what needs you`;
-  if (st === 'count') return `${label}, ${badge.value} need${badge.value === 1 ? 's' : ''} you`;
-  return label;
+  if (st === 'unknown') return badge.tone === 'review' ? null : 'could not count what needs you';
+  if (st === 'count') return `${badge.value} ${badge.noun(badge.value ?? 0)}`;
+  return null;
 }
+
+/** The name of a nav link on the collapsed rail, where the label is not on
+ *  screen. It carries the badges in words. */
+function railLinkName(label: string, badges: NavBadge[] | undefined, failed: boolean, loaded: boolean): string {
+  const words = (badges ?? []).map((b) => badgeWords(b, failed, loaded)).filter((w): w is string => !!w);
+  return [label, ...words].join(', ');
+}
+
+const BADGE_STYLE = {
+  decision: { color: '#d29922', borderColor: 'rgba(210,153,34,.45)', background: 'rgba(210,153,34,.1)' },
+  neutral: { color: '#8b949e', borderColor: 'rgba(139,148,158,.45)', background: 'rgba(139,148,158,.1)' },
+};
 
 function NeedsYouBadge({
   badge,
+  label,
   failed,
   loaded,
   compact = false,
 }: {
   badge: NavBadge;
+  /** The label of the nav entry, for the accessible name of the badge. */
+  label: string;
   failed: boolean;
   loaded: boolean;
   /** The collapsed rail: a small count on the corner of the icon. The rail
@@ -156,22 +192,56 @@ function NeedsYouBadge({
   if (st === 'none') return null;
   const unknown = st === 'unknown';
   const value = badge.value ?? 0;
+  // The badge is a link of its own, beside the nav link. The badge on
+  // Investigations said 39 and the entry opened 64 other rows (production
+  // review 2026-11-12, ui-core 7). Each badge opens the list it counts.
   return (
-    <span
+    <Link
+      to={badge.to}
       data-testid={badge.testId}
+      aria-label={`${badgeWords(badge, failed, loaded) ?? 'could not count what needs you'} in ${label}`}
       className={
         compact
-          ? 'absolute right-0.5 top-0 rounded-chip border px-1 text-[9px] font-semibold leading-[14px] tabular-nums'
-          : 'rounded-chip border px-1.5 py-px text-[10px] font-semibold tabular-nums'
+          ? 'rounded-chip border px-1 text-[9px] font-semibold leading-[14px] tabular-nums hover:brightness-125'
+          : 'rounded-chip border px-1.5 py-px text-[10px] font-semibold tabular-nums hover:brightness-125'
       }
-      style={
-        unknown
-          ? { color: '#8b949e', borderColor: 'rgba(139,148,158,.45)', background: 'rgba(139,148,158,.1)' }
-          : { color: '#d29922', borderColor: 'rgba(210,153,34,.45)', background: 'rgba(210,153,34,.1)' }
-      }
+      style={unknown || badge.tone === 'review' ? BADGE_STYLE.neutral : BADGE_STYLE.decision}
       title={unknown ? 'Could not read what needs you. Open the page to try again.' : badge.title}
     >
-      {unknown ? '?' : compact && value > 99 ? '99+' : badge.value}
+      {unknown ? '?' : compact && value > 99 ? '99+' : value}
+    </Link>
+  );
+}
+
+/** The badges of one nav entry, beside its link. The rail shows the first
+ *  badge that has something to say. */
+function NavBadges({
+  badges,
+  label,
+  failed,
+  loaded,
+  compact,
+}: {
+  badges: NavBadge[];
+  label: string;
+  failed: boolean;
+  loaded: boolean;
+  compact: boolean;
+}) {
+  const shown = badges.filter((b) => badgeState(b, failed, loaded) !== 'none');
+  if (shown.length === 0) return null;
+  const list = compact ? shown.slice(0, 1) : shown;
+  return (
+    <span
+      className={
+        compact
+          ? 'absolute right-0.5 top-0 flex'
+          : 'absolute right-[9px] top-1/2 flex -translate-y-1/2 items-center gap-1'
+      }
+    >
+      {list.map((b) => (
+        <NeedsYouBadge key={b.testId} badge={b} label={label} failed={failed} loaded={loaded} compact={compact} />
+      ))}
     </span>
   );
 }
@@ -190,28 +260,67 @@ export function Sidebar() {
   // since there's no SSR concern for this value).
   const [operateStoredCollapsed, setOperateStoredCollapsed] = useState<boolean>(readStoredOperateCollapsed);
 
-  // What waits on the analyst, as badges on the three entries that hold it.
+  // What waits on the analyst, as badges on the four entries that hold it.
   // Every badge is a part of the one needs-you count, which the Dashboard tile
-  // and the bell read from the same provider, so the badges add up to the
-  // number those two surfaces state. A failed read is not a zero. The badge
-  // went away on a 503, and the nav then read exactly like a quiet day.
+  // and the bell read from the same provider. A failed read is not a zero. The
+  // badge went away on a 503, and the nav then read exactly like a quiet day.
+  //
+  // The amber badges count decisions. The unread shadow hits are review work,
+  // and their badge on Hunts is grey (production review 2026-11-12, ui-core
+  // 4). The Investigations badge counts the runs of the list's Needs you view,
+  // with the same query, so the badge and the view state one number (ui-core 7).
   const needsYou = useNeedsYouCount();
-  const badges: Record<string, NavBadge> = {
-    '/alerts': {
-      testId: 'sidebar-needs-you-alerts',
-      value: needsYouPart(needsYou.data, 'untriaged_groups'),
-      title: `Alert groups with no verdict in the last ${windowWords(needsYou.data?.alert_window ?? '7d')}. The count hides acknowledged groups.`,
-    },
-    '/investigations': {
-      testId: 'sidebar-needs-you-investigations',
-      value: needsYouPart(needsYou.data, 'needs_more_info', 'pending_actions'),
-      title: `Verdicts that need more info, plus recommended actions that wait for you, in the last ${windowWords(needsYou.data?.verdict_window ?? '30d')}.`,
-    },
-    '/hunts': {
-      testId: 'sidebar-needs-you',
-      value: needsYouPart(needsYou.data, 'unread_shadow_hits', 'leads_needing_decision'),
-      title: 'Unread shadow hits, plus leads that wait on a decision. Open Hunts to read them.',
-    },
+  const links = needsYouLinks(needsYou.data);
+  const verdictWindow = windowWords(needsYou.data?.verdict_window ?? '30d');
+  const badges: Record<string, NavBadge[]> = {
+    '/campaigns': [
+      {
+        testId: 'sidebar-needs-you-campaigns',
+        value: campaignsWaiting(needsYou.data),
+        title: 'Campaigns that wait on your decision, at any age. Select the badge to open them.',
+        to: links.campaigns,
+        tone: 'decision',
+        noun: needYou,
+      },
+    ],
+    '/alerts': [
+      {
+        testId: 'sidebar-needs-you-alerts',
+        value: needsYouPart(needsYou.data, 'untriaged_groups'),
+        title: `Alert groups with no verdict in the last ${windowWords(needsYou.data?.alert_window ?? '7d')}. The count hides acknowledged groups.`,
+        to: links.untriaged,
+        tone: 'decision',
+        noun: needYou,
+      },
+    ],
+    '/investigations': [
+      {
+        testId: 'sidebar-needs-you-investigations',
+        value: investigationsWaiting(needsYou.data),
+        title: `Investigations that need more info or have a recommended action that waits for you, in the last ${verdictWindow}. An investigation of a campaign waits on the campaign. Select the badge to open the Needs you view.`,
+        to: links.investigations,
+        tone: 'decision',
+        noun: needYou,
+      },
+    ],
+    '/hunts': [
+      {
+        testId: 'sidebar-needs-you',
+        value: needsYouPart(needsYou.data, 'leads_needing_decision'),
+        title: 'Leads that wait on a decision. Select the badge to open them.',
+        to: links.leads,
+        tone: 'decision',
+        noun: needYou,
+      },
+      {
+        testId: 'sidebar-review-hits',
+        value: needsYou.data ? reviewCount(needsYou.data) : null,
+        title: 'Unread shadow hits to review. A shadow hit is not a decision. Select the badge to open the hits.',
+        to: links.shadowHits,
+        tone: 'review',
+        noun: (n) => `shadow ${n === 1 ? 'hit' : 'hits'} to review`,
+      },
+    ],
   };
 
   useEffect(() => {
@@ -296,42 +405,44 @@ export function Sidebar() {
                     ? railLinkName(n.label, badges[n.to], badgeFailed, badgeLoaded)
                     : undefined;
                   return (
-                    <NavLink
-                      key={n.to}
-                      to={n.to}
-                      title={railName ?? n.label}
-                      aria-label={railName}
-                      className="relative mb-0.5 flex items-center gap-2.5 rounded-control px-[9px] py-2 text-[13.5px] font-medium hover:bg-surface-3"
-                      style={{
-                        justifyContent: collapsed ? 'center' : 'flex-start',
-                        background: active ? '#11161e' : 'transparent',
-                      }}
-                    >
-                      <span className="flex w-[17px] flex-none" style={{ color: active ? '#4b8bf5' : '#7d8896' }}>
-                        {n.icon}
-                      </span>
-                      {!collapsed && (
-                        <span className="flex-1 whitespace-nowrap" style={{ color: active ? '#e6e9ef' : '#8b94a3' }}>
-                          {n.label}
+                    <div key={n.to} className="relative">
+                      <NavLink
+                        to={n.to}
+                        title={railName ?? n.label}
+                        aria-label={railName}
+                        className="relative mb-0.5 flex items-center gap-2.5 rounded-control px-[9px] py-2 text-[13.5px] font-medium hover:bg-surface-3"
+                        style={{
+                          justifyContent: collapsed ? 'center' : 'flex-start',
+                          background: active ? '#11161e' : 'transparent',
+                        }}
+                      >
+                        <span className="flex w-[17px] flex-none" style={{ color: active ? '#4b8bf5' : '#7d8896' }}>
+                          {n.icon}
                         </span>
-                      )}
+                        {!collapsed && (
+                          <span className="flex-1 whitespace-nowrap" style={{ color: active ? '#e6e9ef' : '#8b94a3' }}>
+                            {n.label}
+                          </span>
+                        )}
+                        {!collapsed && n.dev && (
+                          <span
+                            className="rounded-chip border px-1.5 py-px text-[9.5px] font-semibold uppercase tracking-[.04em]"
+                            style={{ color: '#f5a623', borderColor: 'rgba(245,166,35,.35)', background: 'rgba(245,166,35,.08)' }}
+                          >
+                            dev
+                          </span>
+                        )}
+                      </NavLink>
                       {badges[n.to] && (
-                        <NeedsYouBadge
-                          badge={badges[n.to]}
+                        <NavBadges
+                          badges={badges[n.to]}
+                          label={n.label}
                           failed={badgeFailed}
                           loaded={badgeLoaded}
                           compact={collapsed}
                         />
                       )}
-                      {!collapsed && n.dev && (
-                        <span
-                          className="rounded-chip border px-1.5 py-px text-[9.5px] font-semibold uppercase tracking-[.04em]"
-                          style={{ color: '#f5a623', borderColor: 'rgba(245,166,35,.35)', background: 'rgba(245,166,35,.08)' }}
-                        >
-                          dev
-                        </span>
-                      )}
-                    </NavLink>
+                    </div>
                   );
                 })}
             </div>

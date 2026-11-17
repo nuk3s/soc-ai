@@ -70,7 +70,7 @@ async def estate_model_wake(app: Any, *, now: datetime | None = None) -> Any:
         return None
     status = _get_dossier_status(app.state)
     if status.running:
-        _LOGGER.info("estate model: a dossier sweep holds the slot. The fit waits.")
+        _LOGGER.info("network model: a dossier sweep holds the slot. The fit waits.")
         return None
     status.running = True
     try:
@@ -97,4 +97,4 @@ async def estate_model_loop(app: Any) -> None:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            _LOGGER.warning("estate model loop: %s: %s", type(exc).__name__, exc)
+            _LOGGER.warning("network model loop: %s: %s", type(exc).__name__, exc)

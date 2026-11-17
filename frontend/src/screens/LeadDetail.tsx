@@ -1,22 +1,26 @@
+import { TrendingDown } from 'lucide-react';
 import { useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import {
   LEAD_ACTION as ACTIONS,
+  LEAD_FORMS_AT,
   FormedFromBacktestChip,
   INVESTIGATION_GONE_LABEL,
   LEFT_TO_YOU_LABEL,
   LeadStatePill,
+  dismissReasonLabel,
+  heldByCampaign,
   huntQueued,
   leadState,
   leftToYou,
 } from '../components/LeadsStrip';
+import { CampaignChip } from '../components/campaign/CampaignChip';
 import { Definition } from '../components/Definition';
 import { FlowStrip } from '../components/FlowStrip';
 import { LeadTimeline } from '../components/LeadTimeline';
 import {
   DismissLeadForm,
   HUNT_CLOSED_ACTOR,
-  REASON_LABEL,
   closedByHunt,
   closedOnVerdicts,
   dismissEffect,
@@ -50,7 +54,8 @@ import {
   entityCountWords,
   huntRecordSentence,
   leadHuntLabel,
-  leadWhySentence,
+  leadStateSentence,
+  repeatsAfterCloseLine,
   staleHuntSentence,
   verdictToDecide,
   verdictWords,
@@ -72,12 +77,15 @@ import {
   CHIP_SHADOW_LEAD,
   CHIP_TYPE,
   INVESTIGATION_GONE,
-  LEAD_ACTIONS_LINE,
+  LEAD_ACTION_EFFECT,
   LEAD_LEGEND,
+  LEAD_VERDICT_EFFECT,
   LEGEND_AUTO_HUNT,
   RELATED_REASON,
+  REPEATS_AFTER_CLOSE,
   WEIGHT_AT_FORMATION,
   WEIGHT_BY_TYPE,
+  WEIGHT_DECAYED,
   WEIGHT_NOW,
   huntStatusTitle,
 } from '../lib/tooltips';
@@ -140,7 +148,7 @@ function rowOutcome(h: LeadHuntRow, lead: LeadDetailT): string | null {
 }
 
 /** The outcome words of one hunt row. The server's label carries the counts
- *  of a hunt that investigated its findings, "2 of 2 findings are threats".
+ *  of a hunt that investigated its findings, "2 confirmed · 0 not judged · of 2 threat findings".
  *  The client word stands in for an older server. */
 function rowOutcomeLabel(h: LeadHuntRow, lead: LeadDetailT): string {
   const outcome = rowOutcome(h, lead);
@@ -265,6 +273,9 @@ export function LeadDetail() {
   // The loop owns this lead's next move. The page reads the strip's words for
   // it: the same pill, the same secondary Hunt, the same legend sentence.
   const queued = huntQueued(d);
+  // A campaign holds the lead: the analyst decides on the campaign, so the
+  // page asks for no decision on the lead and no act is the primary one.
+  const held = heldByCampaign(d);
   // A server that sends no setting leaves the page with this lead's own
   // queued hunt, which proves the loop runs and never disproves it.
   const autoHunt =
@@ -295,6 +306,28 @@ export function LeadDetail() {
   // The hunt the actions point at. A link goes to the hunt page, so the
   // address is written once.
   const huntHref = attached ? `/hunts/${attached.id}` : d.hunt_id ? `/hunts/${d.hunt_id}` : null;
+  // F5: the buttons the header shows for this state, in the order it shows
+  // them. The page prints one effect line for each, so no line names a button
+  // the lead does not offer.
+  const viewsInvestigation =
+    state === 'promoted' && Boolean(d.investigation_id) && d.investigation_exists !== false;
+  const shownActions: (keyof typeof LEAD_ACTION_EFFECT)[] =
+    state === 'new'
+      ? queued
+        ? ['dismiss', 'huntNow']
+        : ['hunt', 'dismiss']
+      : state === 'fleet_condition'
+        ? ['hunt', 'dismiss']
+        : state === 'in_progress'
+          ? huntHref
+            ? ['viewHunt']
+            : []
+          : state === 'hunted'
+            ? [...(huntHref ? (['readHunt'] as const) : []), 'dismiss', 'huntAgain']
+            : ['reopen', ...(viewsInvestigation ? (['viewInvestigation'] as const) : [])];
+  // F5: the live weight fell under the weight a lead forms at. A closed lead
+  // states no live weight, so it carries no mark.
+  const weightDecayed = liveWeight && d.weight_now < LEAD_FORMS_AT;
   const linkClass = 'text-[12px] font-semibold text-accent hover:underline';
   const buttonClass =
     'rounded-control border border-border-strong px-3 py-1.5 text-[12px] font-semibold disabled:opacity-50';
@@ -366,6 +399,8 @@ export function LeadDetail() {
         {/* The pill the strip wears. The page and the strip read one word for
             one state, and the outcome of a finished hunt rides in the pill. */}
         <LeadStatePill lead={d} />
+        {/* The campaign that holds the lead. The analyst decides on it. */}
+        <CampaignChip campaign={d.campaign} testId="lead-campaign-chip" />
         {formedFromBacktest(d) && <FormedFromBacktestChip />}
         {/* The loop starts a hunt on every new lead but three: a shadow lead,
             a reopened lead and a lead with no documents. This is one of the
@@ -400,7 +435,7 @@ export function LeadDetail() {
               className="text-[11.5px] text-dim"
               title={CHIP_DISMISS_REASON}
             >
-              reason: {REASON_LABEL[d.dismissed_reason] ?? d.dismissed_reason}
+              reason: {dismissReasonLabel(d.dismissed_reason)}
             </span>
           )
         )}
@@ -430,20 +465,38 @@ export function LeadDetail() {
             shadow
           </span>
         )}
+        {/* F5: "weight now 0.32" sat behind Scoring, and a lead forms at 0.85.
+            The mark is in plain view. Neutral: a decayed weight is a fact
+            about age, and it is no alarm. */}
+        {weightDecayed && (
+          <span
+            data-testid="lead-weight-decayed"
+            title={WEIGHT_DECAYED}
+            className="inline-flex flex-none items-center gap-1 whitespace-nowrap rounded-chip border border-border-strong bg-surface-2 px-1.5 py-px font-mono text-[10.5px] text-text-2"
+          >
+            <TrendingDown size={11} strokeWidth={2.5} aria-hidden="true" />
+            {`weight decayed to ${d.weight_now.toFixed(2)} · a lead forms at ${LEAD_FORMS_AT.toFixed(2)}`}
+          </span>
+        )}
         {/* One set of actions per state, in the words of the strip. A closed
             lead offers one act: every other act answers 409 from the server. A
             lead under a running hunt offers one act: follow the hunt. */}
         <span className="ml-auto flex flex-wrap items-center gap-2.5" data-tour="lead-actions">
-          {state === 'new' && (
+          {(state === 'new' || state === 'fleet_condition') && (
             <>
               {/* A queued lead already has a hunt coming, so the word on the
-                  button is the word for jumping the queue. */}
+                  button is the word for jumping the queue. A fleet condition
+                  waits on no decision, so its Hunt is no primary act. */}
               {!queued && (
                 <button
                   type="button"
                   disabled={busy}
                   title={ACTION_HUNT}
-                  className="rounded-control bg-accent px-3 py-1.5 text-[12px] font-semibold text-white disabled:opacity-50"
+                  className={
+                    state === 'fleet_condition' || held
+                      ? buttonClass
+                      : 'rounded-control bg-accent px-3 py-1.5 text-[12px] font-semibold text-white disabled:opacity-50'
+                  }
                   onClick={() => run(startHunt)}
                 >
                   {ACTIONS.hunt}
@@ -536,12 +589,36 @@ export function LeadDetail() {
             ))}
         </span>
       </div>
-      {/* C8: what the hunt does, and the meaning of "left to you", in plain
-          view. Both lived in a hover title alone. The owner asked what a hunt
-          is for (2026-10-07), so an open lead states it under its actions. */}
-      {(!closed || leftToYou(d, autoHunt)) && (
+      {/* F5: the state of the lead in one line, first under the header: what
+          soc-ai saw and on which host, what the hunt concluded, and what the
+          lead waits on. The analyst read a pill, a helper line, two banners
+          and a weight behind a toggle to learn the same. */}
+      <div data-testid="lead-state-sentence" className="mt-2 text-[13px] text-text">
+        {leadStateSentence(d, {
+          state,
+          queued,
+          verdictToDecide: Boolean(ask),
+          closedBySocAi: closedByHunt(d) || closedOnVerdicts(d),
+          campaignTitle: held ? d.campaign?.title : null,
+          dismissedReason: d.dismissed_reason,
+          machineName,
+        })}
+      </div>
+      {/* C8 and F5: what each button does, in plain view, and the meaning of
+          "left to you". The page printed the hunt line over every open lead,
+          so a hunted lead read "Hunt this lead." and offered no such button.
+          Each line here belongs to a button the header shows. */}
+      {(shownActions.length > 0 || leftToYou(d, autoHunt)) && (
         <div data-testid="lead-action-notes" className="mt-1.5 text-[12px] text-dim">
-          {!closed && <div data-testid="lead-actions-line">{LEAD_ACTIONS_LINE}</div>}
+          {shownActions.length > 0 && (
+            <div data-testid="lead-action-effects">
+              {shownActions.map((key) => (
+                <div key={key} data-testid={`lead-action-effect-${key}`}>
+                  {LEAD_ACTION_EFFECT[key]}
+                </div>
+              ))}
+            </div>
+          )}
           {leftToYou(d, autoHunt) && (
             <div data-testid="lead-left-to-you-reason">{CHIP_LEFT_TO_YOU}</div>
           )}
@@ -600,6 +677,9 @@ export function LeadDetail() {
           >
             Keep open
           </button>
+          <span data-testid="lead-verdict-effects" className="basis-full text-[12px] text-dim">
+            {`${LEAD_VERDICT_EFFECT.close} ${LEAD_VERDICT_EFFECT.keep}`}
+          </span>
         </div>
       )}
       {/* What a lead is, under the title. An analyst who lands here from a link
@@ -610,13 +690,11 @@ export function LeadDetail() {
       <div data-testid="lead-legend" className="mt-1 text-[11px] text-faint">
         {autoHunt ? `${LEAD_LEGEND} ${LEGEND_AUTO_HUNT}` : LEAD_LEGEND}
       </div>
-      {/* C2: why this is a lead, in one sentence. The header read the
-          numbers of the scoring, and the analyst asked what happened. */}
-      <div data-testid="lead-why" className="mt-1.5 text-[13px] text-text-2">
-        {leadWhySentence(d)}
-      </div>
+      {/* C2: why this is a lead is the first sentence of the state line at
+          the top. The header read the numbers of the scoring, and the analyst
+          asked what happened. */}
       <div
-        className="mt-0.5 flex flex-wrap items-center gap-2 text-[12px] text-dim"
+        className="mt-1.5 flex flex-wrap items-center gap-2 text-[12px] text-dim"
         data-tour="lead-weight"
       >
         <span title={absTime(d.formed_at)}>formed {ago(d.formed_at)}</span>
@@ -671,6 +749,17 @@ export function LeadDetail() {
       {state === 'dismissed' && !closedByHunt(d) && (
         <div data-testid="lead-dismiss-effect" className="mt-2 text-[12.5px] text-text-2">
           {`Dismissed. ${dismissEffect(d.entities[0]?.[1] ?? null)}`}
+        </div>
+      )}
+      {/* A true-positive alert of a rule this lead held joins the closed lead
+          and starts no hunt. The page did not state the repeats. */}
+      {repeatsAfterCloseLine(d) && (
+        <div
+          data-testid="lead-repeats-after-close"
+          className="mt-2 text-[12.5px] text-text-2"
+          title={REPEATS_AFTER_CLOSE}
+        >
+          {repeatsAfterCloseLine(d)}
         </div>
       )}
       {/* S3: the record of every hunt, beside the newest answer. The pill read

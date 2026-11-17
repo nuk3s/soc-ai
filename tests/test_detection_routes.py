@@ -389,9 +389,10 @@ def test_hunt_finding_route_citation_fetch_bounded_and_list_elided(
     ):
         resp = flagged_client.post(f"/api/v1/hunts/{hunt_id}/findings/0/draft-detection")
     assert resp.status_code == 200
-    assert search.await_args is not None
-    fetched_ids = search.await_args.args[1]["ids"]["values"]
-    assert fetched_ids == citations[:5]
+    # The citation fetch is the one search with an ids query. The dry run adds
+    # its exists probes for the field names of the draft after it.
+    fetches = [c.args[1]["ids"]["values"] for c in search.await_args_list if "ids" in c.args[1]]
+    assert fetches == [citations[:5]]
     assert mock_draft.await_args is not None
     evidence = mock_draft.await_args.kwargs["evidence"]
     assert ", and 5 more" in evidence

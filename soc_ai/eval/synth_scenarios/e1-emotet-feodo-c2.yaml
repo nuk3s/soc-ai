@@ -21,6 +21,12 @@ attack:
 sigma_refs:
   - 9b15893a-d5f4-4e94-b08b-e58dabec3501  # Emotet C2 traffic (sigmahq)
 
+# What the deployment must have loaded. The nightly plants this scenario only
+# when the Feodo feed is loaded and lists the destination.
+requires:
+  - blocklist: feodo
+    ip: "162.243.103.246"
+
 ground_truth:
   verdict: true_positive
   confidence_min: 0.75

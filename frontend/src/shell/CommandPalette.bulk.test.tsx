@@ -17,6 +17,7 @@ vi.mock('react-router-dom', async (importOriginal) => {
 });
 
 vi.mock('../lib/api', () => ({
+  getAbout: vi.fn(() => Promise.resolve({ version: '1.6.0' })),
   getAlerts: vi.fn(),
   getHealth: vi.fn(),
   getInvestigations: vi.fn(() => Promise.resolve([])),

@@ -174,6 +174,114 @@ def test_the_reset_forms(text: str, expected: datetime | None) -> None:
     assert parse_reset_time(text, T0) == expected
 
 
+# The quota answer of 2026-11-01 and 2026-11-08, as the gateway message holds
+# it (review 2026-11-12, ops finding 7). The provider names the wait in a JSON
+# field and in no sentence. The breaker read no reset time and paused one hour.
+def _quota_message(seconds: int) -> str:
+    body = (
+        '{"type":"error","error":{"type":"rate_limit_error","message":"Claude Max rate '
+        'limit reached. Wait a moment and try again.","retry_after":SECONDS}}'
+    ).replace("SECONDS", str(seconds))
+    return (
+        f"litellm.RateLimitError: AnthropicException - {body}. Received Model "
+        "Group=claude-opus-5 Available Model Group Fallbacks=None"
+    )
+
+
+@pytest.mark.parametrize("seconds", [36085, 36676, 86400])
+def test_the_production_quota_body_names_its_retry_time(seconds: int) -> None:
+    assert parse_reset_time(_quota_message(seconds), T0) == T0 + timedelta(seconds=seconds)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # The same field inside a JSON string that is escaped one more time.
+        ('{\\"type\\":\\"error\\",\\"retry_after\\":36676}', T0 + timedelta(seconds=36676)),
+        ('{"error": {"retry_after": "120"}}', T0 + timedelta(seconds=120)),
+        ('{"retry_after": 12.5}', T0 + timedelta(seconds=12.5)),
+        # A sentence with a time wins over the field.
+        (
+            'usage limit, resets at 2026-09-14T05:00:00Z {"retry_after": 60}',
+            RESET,
+        ),
+        # An ISO time in the field is a time, and never its first digits as
+        # seconds (review defect 7).
+        ('{"retry_after":"2026-09-14T05:00:00Z"}', RESET),
+        ('{"retry_after": "2026-09-14T05:00:00+00:00"}', RESET),
+        # The safety bound: no value pauses the route for more than 7 days.
+        ('{"retry_after":1794268800000}', T0 + timedelta(days=7)),
+        ('{"retry_after":"' + "9" * 20 + '"}', T0 + timedelta(days=7)),
+        ('{"retry_after":"2031-01-01T00:00:00Z"}', T0 + timedelta(days=7)),
+        # Negative controls: zero names no wait, and another key is not the field.
+        ('{"retry_after": "soon"}', None),
+        ('{"retry_after": "nan"}', None),
+        ('{"retry_after": "inf"}', None),
+        ('{"retry_after": -5}', None),
+        ('{"retry_after": 0}', None),
+        ('{"retry_after_ms_hint": "soon", "retries": 3}', None),
+        ('{"no_retry_after_field": true}', None),
+    ],
+)
+def test_the_retry_after_field_forms(text: str, expected: datetime | None) -> None:
+    assert parse_reset_time(text, T0) == expected
+
+
+def test_a_quota_answer_pauses_for_the_time_the_body_names(clock: _Clock) -> None:
+    """The breaker paused one hour while the provider named 10 hours. Each
+    hour one more escalation went to a route that could not answer."""
+    route = "http://gateway.example.test:4000|claude-opus-5"
+    BREAKER.reset()
+    opened = BREAKER.record_failure(
+        route, error_class="quota", message="scrubbed", reset_text=_quota_message(36085)
+    )
+    assert opened is True
+    state = BREAKER.state(route)
+    assert state.open_until == T0 + timedelta(seconds=36085)
+    assert state.reset_named is True
+    # One hour later the route is still paused.
+    clock.now = T0 + timedelta(hours=1, minutes=1)
+    assert BREAKER.open_until(route) == T0 + timedelta(seconds=36085)
+    BREAKER.reset()
+
+
+@pytest.mark.parametrize(
+    "value", ["1794268800000", "9" * 20, '"soon"', '"2026-13-45T99:00:00Z"', "1e400", "-1"]
+)
+def test_no_retry_after_value_raises_or_leaves_the_route_open(clock: _Clock, value: str) -> None:
+    """Review defect 7. A huge value raised OverflowError inside the failure
+    handler of the client, so the run ended in error and the route stayed
+    open. Every value now pauses the route: for the time that it names, cut
+    to 7 days, or for one hour when it names none."""
+    route = "http://gateway.example.test:4000|claude-opus-5"
+    BREAKER.reset()
+    opened = BREAKER.record_failure(
+        route, error_class="quota", message=f'{{"error":{{"retry_after":{value}}}}}'
+    )
+    assert opened is True
+    until = BREAKER.state(route).open_until
+    assert until is not None
+    assert T0 + breaker.MIN_PAUSE <= until <= T0 + breaker.RETRY_AFTER_MAX
+    if not BREAKER.state(route).reset_named:
+        assert until == T0 + breaker.BACKOFF
+    BREAKER.reset()
+
+
+def test_a_huge_retry_after_header_is_cut_to_the_safety_bound() -> None:
+    assert parse_retry_after("1794268800000", T0) == T0 + breaker.RETRY_AFTER_MAX
+    assert parse_retry_after("9" * 400, T0) == T0 + breaker.RETRY_AFTER_MAX
+
+
+def test_a_quota_answer_with_no_time_still_pauses_one_hour(clock: _Clock) -> None:
+    """Negative control: the fallback pause did not change."""
+    route = "http://gateway.example.test:4000|claude-opus-5"
+    BREAKER.reset()
+    BREAKER.record_failure(route, error_class="quota", message="rate limit exceeded")
+    assert BREAKER.state(route).open_until == T0 + breaker.BACKOFF
+    assert BREAKER.state(route).reset_named is False
+    BREAKER.reset()
+
+
 def test_the_retry_after_header() -> None:
     assert parse_retry_after("120", T0) == T0 + timedelta(seconds=120)
     assert parse_retry_after("Mon, 14 Sep 2026 05:00:00 GMT", T0) == RESET

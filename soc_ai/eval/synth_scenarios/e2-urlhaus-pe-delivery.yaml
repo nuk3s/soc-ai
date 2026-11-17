@@ -12,6 +12,12 @@ attack:
   - T1071.001  # Application Layer Protocol: Web Protocols
 sigma_refs: []
 
+# What the deployment must have loaded. The nightly plants this scenario only
+# when the URLhaus feed is loaded and lists the destination.
+requires:
+  - blocklist: urlhaus
+    ip: "193.42.39.117"
+
 ground_truth:
   verdict: true_positive
   confidence_min: 0.75

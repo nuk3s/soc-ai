@@ -37,7 +37,7 @@ export function OracleShadowTally() {
         >
           <div>Rule</div>
           <div>Reason</div>
-          <div>Runs</div>
+          <div>Investigations</div>
           <div>Other rule too</div>
         </div>
         {loading && !data && (
@@ -51,7 +51,7 @@ export function OracleShadowTally() {
         {data && rows.length === 0 && (
           <div className="px-3.5 py-3 text-[12.5px] text-faint">
             {data.mode === 'shadow'
-              ? `No run in the last ${data.days} days reached either Oracle rule.`
+              ? `No investigation in the last ${data.days} days reached either Oracle rule.`
               : `The Oracle rule mode is ${data.mode}. No shadow row is recorded in this mode.`}
           </div>
         )}

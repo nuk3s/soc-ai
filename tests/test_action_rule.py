@@ -34,7 +34,7 @@ from soc_ai.api.webui.action_rules import ActionFacts, action_block, block_reaso
 
 from tests.anchor_grid import install
 from tests.test_needs_you_count import client  # noqa: F401 - the shared fixture
-from tests.test_pending_action_rows import _ESCALATE, _pending_rows, _seed, _waiting
+from tests.test_pending_action_rows import _ACK, _ESCALATE, _pending_rows, _seed, _waiting
 
 # The anchor is not a Security Onion alert, so the sentence names a document.
 _ANCHORED_BY_LEAD = (
@@ -152,9 +152,15 @@ def test_an_alert_a_promoted_finding_anchors_names_the_finding(client: TestClien
 
 
 def test_a_promoted_finding_keeps_its_own_sentence(client: TestClient) -> None:  # noqa: F811
-    _seed(client, "INV-HUNT", alert_id="es-telemetry", actions=[_ESCALATE], kind="hunt")
+    """The acknowledge of a finding has no alert to reach. The escalate opens
+    a case from the finding, so it is on (tests/test_finding_case.py)."""
+    _seed(client, "INV-HUNT", alert_id="es-telemetry", actions=[_ACK, _ESCALATE], kind="hunt")
     detail = _detail(client, "INV-HUNT")
-    assert [a["blockedReason"] for a in detail["actions"]] == [action_rules.PROMOTED_FINDING]
+    assert [a["blockedReason"] for a in detail["actions"]] == [
+        action_rules.PROMOTED_FINDING,
+        None,
+    ]
+    assert detail["writeBlockedReason"] == action_rules.PROMOTED_FINDING
 
 
 def test_a_standing_alert_run_offers_its_write_on_the_card(client: TestClient) -> None:  # noqa: F811
@@ -196,12 +202,16 @@ def test_the_execute_route_refuses_a_write_against_the_analyst(client: TestClien
 def test_an_action_no_one_can_execute_does_not_count(client: TestClient) -> None:  # noqa: F811
     """8 of 9 counted actions were on promoted findings. None of them waits.
 
+    The escalate of a finding opens a case from the finding since the review
+    of 2026-11-13, so it counts (tests/test_finding_case.py). The finding of
+    this test carries an acknowledge, which no one can execute on a finding.
+
     NEGATIVE CONTROL: the executable escalate on a standing alert run still
     counts, and its run stays on the pending list. The test fails if the
     count drops every action.
     """
     install(client, telemetry={"es-l1"})
-    _seed(client, "INV-FINDING", alert_id="es-f1", actions=[_ESCALATE], kind="hunt")
+    _seed(client, "INV-FINDING", alert_id="es-f1", actions=[_ACK], kind="hunt")
     _seed(client, "INV-LEAD", alert_id="es-l1", actions=[_ESCALATE], kind="lead")
     _hunt_subject(client, "INV-LEAD")
     _seed(client, "INV-ANCHORED", alert_id="es-l1", actions=[_ESCALATE], hours_ago=3)

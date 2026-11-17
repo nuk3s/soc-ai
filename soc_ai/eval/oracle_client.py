@@ -56,7 +56,16 @@ class OracleError(RuntimeError):
 
     The harness translates this into a clean CLI exit code; the bundle's
     ``meta.json`` records the failure for debugging.
+
+    ``status_code`` is the gateway's HTTP status when there was one, and None
+    on a transport error. The nightly reads it to tell a used-up quota (429)
+    from a gateway fault: both lose the grade, and only one of them is fixed by
+    waiting.
     """
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 def call_oracle(
@@ -131,7 +140,10 @@ def call_oracle(
             data = r.json()
     except httpx.HTTPStatusError as e:
         body = e.response.text[:500] if e.response is not None else ""
-        raise OracleError(f"LiteLLM returned {e.response.status_code}: {body}") from e
+        raise OracleError(
+            f"LiteLLM returned {e.response.status_code}: {body}",
+            status_code=e.response.status_code,
+        ) from e
     except httpx.HTTPError as e:
         raise OracleError(f"transport error talking to LiteLLM: {e}") from e
     except ValueError as e:

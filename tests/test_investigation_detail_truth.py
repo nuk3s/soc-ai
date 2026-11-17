@@ -316,6 +316,8 @@ def test_detail_serves_open_questions_citations_and_failure(client: TestClient) 
         "cause": "alert not found: ev-truth",
         "hint": None,
         "permanent": True,
+        # K2: the class of the cause. A permanent cause is "other".
+        "kind": "other",
     }
 
 

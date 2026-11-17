@@ -148,7 +148,7 @@ describe('Re-run on a finding run', () => {
     expect(promoteFinding).not.toHaveBeenCalled();
     expect(dialog.textContent).toContain('alice set the verdict of this finding to false positive.');
     expect(dialog.textContent).toContain(
-      'The verdict of the new run then replaces the analyst verdict on the hunt page.',
+      'The verdict of the new investigation then replaces the analyst verdict on the hunt page.',
     );
     // The body and the buttons say one thing: the hunt page loses the
     // analyst verdict, and this run keeps it as a record.
@@ -190,7 +190,7 @@ describe('Re-run on a finding run', () => {
     fireEvent.click(toolbarReRun());
     const strip = await screen.findByRole('alert');
     expect(strip.textContent).toContain('The API gave no answer to Re-run investigation.');
-    expect(strip.textContent).toContain('a newer run of this finding');
+    expect(strip.textContent).toContain('a newer investigation of this finding');
   });
 
   it('says Re-run in the open-questions block of a finding run', () => {
@@ -244,8 +244,8 @@ describe('newRunConfirmText for a finding', () => {
     );
     expect(lines).toEqual([
       'alice set the verdict of this finding to true positive.',
-      'A re-run starts a new run of the finding. The verdict of the new run then replaces the analyst verdict on the hunt page.',
-      'The run with the analyst verdict stays as a record.',
+      'Re-run investigation starts a new investigation of the finding. The verdict of the new investigation then replaces the analyst verdict on the hunt page.',
+      'The investigation with the analyst verdict stays as a record.',
     ]);
   });
 
@@ -270,7 +270,7 @@ describe('an older run of a finding', () => {
   it('locks Re-run and Override, and names the newer run of the finding', () => {
     mount(findingRun(replaced));
     expect(screen.getByTestId('superseded-banner').textContent).toContain(
-      'A newer run on this finding reached true positive (0.90).',
+      'A newer investigation on this finding reached true positive (0.90).',
     );
     const reRun = toolbarReRun();
     expect(reRun).toBeDisabled();
@@ -286,10 +286,10 @@ describe('an older run of a finding', () => {
 
   it('NEGATIVE CONTROL: the sentence of an alert run keeps the alert words', () => {
     expect(supersededSentence({ id: 'x', status: 'running' })).toBe(
-      'A newer run on this alert is in progress.',
+      'A newer investigation on this alert is in progress.',
     );
     expect(supersededSentence({ id: 'x', status: 'running' }, 'finding')).toBe(
-      'A newer run on this finding is in progress.',
+      'A newer investigation on this finding is in progress.',
     );
   });
 });

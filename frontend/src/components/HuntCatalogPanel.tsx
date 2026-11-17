@@ -652,7 +652,10 @@ function SpecRow({
       ) : (
         <>
           <span className="flex-none font-mono text-[11.5px] text-dim" title={COUNTS_TITLE}>
-            fired {spec.fired_24h} · fresh {spec.fresh_24h} · handled {spec.already_handled_24h}
+            {/* L5: the count states its window at the count. The Analytics
+                tab counts 7 days, and the two read as one number (review
+                2026-11-12). */}
+            fired {spec.fired_24h} · fresh {spec.fresh_24h} · handled {spec.already_handled_24h} in 24 h
             {failedRuns(spec)}
           </span>
           {/* The age, not a boolean: "last fired never" on a critical spec

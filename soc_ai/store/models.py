@@ -21,8 +21,10 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    event,
     false,
     func,
+    inspect,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -30,6 +32,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 # timezone is stored as naive UTC, which asyncpg requires and SQLite needs for a
 # correct wall clock. Importing it under the SQLAlchemy name keeps each column
 # declaration as it was, and a new column gets the contract without a choice.
+from soc_ai.store import event_at as event_at_rule
 from soc_ai.store.dialect import UtcDateTime as DateTime
 
 
@@ -123,6 +126,11 @@ class Investigation(Base):
         # finished_at, the clock it renders; (status, created_at) served the
         # equality and then sorted every completed row on each poll.
         Index("ix_investigations_status_finished", "status", "finished_at"),
+        # Migration 0066. The card of an authorization counts and lists its runs.
+        Index("ix_investigations_authorization", "authorization_id"),
+        # Migration 0072. The list, the confirmed threats and their windows
+        # bound and order on the time of the event.
+        Index("ix_investigations_event_at", "event_at"),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)  # ULID
@@ -201,6 +209,69 @@ class Investigation(Base):
     tool_calls: Mapped[int | None] = mapped_column(Integer, default=None)
     es_searches: Mapped[int | None] = mapped_column(Integer, default=None)
     wall_ms: Mapped[int | None] = mapped_column(Integer, default=None)
+    # The authorized activity this run matched (migration 0066), stamped at
+    # finalize from ``report["authorized_activity"]``. NULL on every other
+    # run. A column, because the bell and the lists read scalar columns only.
+    # No foreign key, like ``hunt_id``. A revoke keeps the value: the readers
+    # ask :mod:`soc_ai.store.authorized_activity` whether the mark still holds.
+    authorization_id: Mapped[int | None] = mapped_column(Integer, default=None)
+    # The time of the event that the run judges (migration 0072), naive UTC.
+    # The analyst reads the time of an investigation as the time of its
+    # event, so every list, window, count and sort of the analyst reads this
+    # column, and ``created_at`` stays the time when soc-ai investigated.
+    # :func:`soc_ai.store.event_at.decide` is the one rule. The insert hook
+    # below fills it, and ``finalize`` settles it with the time of the alert.
+    event_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+
+
+@event.listens_for(Investigation, "before_insert")
+def _stamp_event_at(_mapper: Any, _connection: Any, target: Investigation) -> None:
+    """Give every new row an event time, by the one rule, with no alert time.
+
+    A row born with no ``created_at`` gets the server time when it is
+    written. Its event time is the same moment, read here from the clock.
+    """
+    if target.event_at is not None:
+        return
+    created = target.created_at or datetime.now(UTC).replace(tzinfo=None)
+    target.event_at = event_at_rule.decide(report=target.report, alert_at=None, created_at=created)
+
+
+@event.listens_for(Investigation, "before_update")
+def _follow_created_at(_mapper: Any, _connection: Any, target: Investigation) -> None:
+    """Keep the event time inside the rule when a writer moves ``created_at``.
+
+    The store never moves it. A seed script and a test do, to date a row in
+    the past. An event time that came from ``created_at`` moves with it. An
+    earlier event time, from the report or the alert, stays, and the clamp of
+    the rule still holds. A writer that clears ``event_at`` gets the value of
+    the rule back, so no ORM write stores a null.
+    """
+    state = inspect(target)
+    history = state.attrs.created_at.history
+    if not history.has_changes():
+        # A row read with some columns only, for example under raiseload,
+        # keeps the columns that it did not read.
+        if {"event_at", "created_at"} & state.unloaded:
+            return
+        if target.event_at is None:
+            # A writer cleared the value. The rule gives it back.
+            report = None if "report" in state.unloaded else target.report
+            target.event_at = event_at_rule.decide(
+                report=report, alert_at=None, created_at=target.created_at
+            )
+        return
+    if "event_at" in state.unloaded:
+        return
+    new = event_at_rule.parse_time(target.created_at)
+    old = event_at_rule.parse_time(history.deleted[0]) if history.deleted else None
+    current = event_at_rule.parse_time(target.event_at)
+    if new is None:
+        return
+    if current is None or old is None or current >= old:
+        target.event_at = event_at_rule.decide(report=target.report, alert_at=None, created_at=new)
+    else:
+        target.event_at = min(current, new)
 
 
 class InvestigationEvent(Base):
@@ -244,7 +315,8 @@ class Hunt(Base):
     # write in ``soc_ai.store.hunts.create``; NULL on legacy rows (they just
     # won't diff). Indexed — ``previous_completed_run`` filters on it.
     objective_hash: Mapped[str | None] = mapped_column(String(64), default=None, index=True)
-    kind: Mapped[str] = mapped_column(String(16), default="chat")  # chat | scheduled | triggered
+    # chat | scheduled | triggered | lead | campaign
+    kind: Mapped[str] = mapped_column(String(16), default="chat")
     status: Mapped[str] = mapped_column(String(16), default="running")
     narrative: Mapped[str | None] = mapped_column(Text, default=None)
     report: Mapped[dict[str, Any] | None] = mapped_column(NULLABLE_JSON, default=None)  # HuntReport
@@ -266,10 +338,16 @@ class Hunt(Base):
     # recorded from an explicit eval context; unreachable from a request body.
     is_synth_eval: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     started_by: Mapped[str] = mapped_column(String(64), default="anonymous")
-    # The class that started the hunt: analyst, schedule, lead, or catalog
-    # (rows the sweep wrote before merge 1). started_by keeps the actor name.
+    # The class that started the hunt: analyst, schedule, lead, campaign, or
+    # catalog (rows the sweep wrote before merge 1). started_by keeps the
+    # actor name.
     starter: Mapped[str] = mapped_column(String(16), default="analyst", server_default="analyst")
     lead_id: Mapped[int | None] = mapped_column(Integer, default=None, index=True)
+    # The campaign that the hunt is for (migration 0073): a hunt that the
+    # campaign started, a lead hunt of a lead of the campaign, or a hunt whose
+    # finding investigations one campaign holds. No foreign key, like
+    # ``lead_id``. The limit of one campaign hunt in 24 hours reads it.
+    campaign_id: Mapped[int | None] = mapped_column(Integer, default=None, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
     # What the run cost (migration 0058). Same columns and same meaning as on
@@ -879,6 +957,20 @@ class QualitySnapshot(Base):
     app_version: Mapped[str | None] = mapped_column(String(64), default=None)
     code_commit: Mapped[str | None] = mapped_column(String(64), default=None)
     analyst_model: Mapped[str | None] = mapped_column(String(256), default=None)
+    # What the numbers above cannot hold (migration 0066). One JSON object,
+    # built by :func:`soc_ai.eval.quality.snapshot_detail`:
+    #
+    # - ``served`` and ``served_recorded``: which model SERVED the runs.
+    #   ``analyst_model`` is the configured route and stays that. The gateway
+    #   moved one route to another engine and a fallback route served runs, and
+    #   every snapshot of those days carried the one configured name.
+    # - ``synth`` and ``synth_note``: what became of each planted true positive.
+    # - ``not_graded`` and ``not_measured``: the runs whose grade request
+    #   failed, by cause. Those runs are not errors and are not in ``n_error``.
+    #
+    # NULL on every row written before 0066: that row recorded none of this,
+    # which is a different fact from a row that measured it and found nothing.
+    detail: Mapped[dict[str, Any] | None] = mapped_column(NULLABLE_JSON, default=None)
 
 
 class QualityEvalAttempt(Base):
@@ -1630,6 +1722,10 @@ class Lead(Base):
     # When an analyst last reopened the lead. The loop and the settle rule
     # leave a reopened lead to the analyst who reopened it.
     reopened_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+    # The campaign that holds every live observation of the lead (migration
+    # 0073). The step after a rebuild sets it and removes it
+    # (soc_ai.campaigns.lead_tags). Such a lead waits on the campaign.
+    campaign_id: Mapped[int | None] = mapped_column(Integer, default=None, index=True)
 
 
 class PriorSpecRun(Base):
@@ -1784,3 +1880,224 @@ class GridGap(Base):
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
     detail: Mapped[str | None] = mapped_column(Text, default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
+
+
+class AuthorizedActivity(Base):
+    """One decision of an analyst: this activity is authorized (migration 0066).
+
+    The scope has three parts, and a run must match all three: ``sources``, a
+    list of ``{"address", "machine_key", "name"}``; one target in
+    ``target_address`` and ``target_machine_key``; and the exact rule names in
+    ``rule_names`` with their alert class in ``rule_class``. ``starts_at`` and ``expires_at`` bound
+    the alert time. A row is never deleted. A revoke stamps ``revoked_at``,
+    and the row then matches nothing. The store module is
+    :mod:`soc_ai.store.authorized_activity`.
+
+    A record with a ``campaign_id`` covers one campaign (migration 0071). It
+    lists machines in ``parties``, ``[{"machine_key", "role", "name",
+    "addresses"}]``, and no rules: ``rule_names`` is ``[]`` and
+    ``target_address`` and ``rule_class`` are empty text. ``starts_at`` is the
+    first event of the campaign.
+    """
+
+    __tablename__ = "authorized_activity"
+    __table_args__ = (
+        Index("ix_authorized_activity_expires", "expires_at"),
+        Index("ix_authorized_activity_campaign", "campaign_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    label: Mapped[str] = mapped_column(String(120))
+    note: Mapped[str | None] = mapped_column(Text, default=None)
+    sources: Mapped[list[dict[str, Any]]] = mapped_column(JSON)
+    target_address: Mapped[str] = mapped_column(String(64))
+    target_machine_key: Mapped[str | None] = mapped_column(String(128), default=None)
+    target_name: Mapped[str | None] = mapped_column(String(255), default=None)
+    rule_names: Mapped[list[str]] = mapped_column(JSON)
+    rule_class: Mapped[str] = mapped_column(String(32))
+    source_investigation_id: Mapped[str | None] = mapped_column(String(32), default=None)
+    starts_at: Mapped[datetime] = mapped_column(DateTime())
+    expires_at: Mapped[datetime] = mapped_column(DateTime())
+    created_by: Mapped[str] = mapped_column(String(128), default="anonymous")
+    created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+    revoked_by: Mapped[str | None] = mapped_column(String(128), default=None)
+    revoke_reason: Mapped[str | None] = mapped_column(String(512), default=None)
+    # When the expiry got its audit record. NULL means not written yet.
+    expiry_recorded_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+    # The campaign of a campaign record, and its listed machines (migration 0071).
+    campaign_id: Mapped[int | None] = mapped_column(Integer, default=None)
+    parties: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, default=None)
+
+
+class Campaign(Base):
+    """One campaign: one story of an attack, built from the stored runs (migration 0068).
+
+    ``status`` is ``active``, ``withdrawn`` or ``merged``. A rebuild keeps the
+    id stable. ``merged_into_id`` names the campaign that took the members of
+    a merged campaign. ``earlier_campaign_id`` is an older campaign on the same
+    actor and target pair. ``detail`` holds the ladder, the waves, the
+    sessions, the named hosts, the detection record and the pairs. The
+    campaign engine in :mod:`soc_ai.campaigns` writes the row.
+
+    ``events``, ``events_at`` and ``events_basis`` hold the events of the
+    last grid read, its time and the hash of what it covered (migration 0069).
+    The detail route writes them. A rebuild leaves them as they are.
+
+    The decision of the analyst lives on this row (migration 0070), because a
+    rebuild deletes and writes the member and party rows again. ``decision``
+    is null, ``closed``, ``authorized`` or ``case``. ``decision_basis`` holds
+    what the decision covered: ``{"last_event", "stage", "parties"}``. A
+    rebuild that goes past it clears the decision. ``authorization_id`` and
+    ``case_id`` are for later decisions.
+    """
+
+    __tablename__ = "campaigns"
+    __table_args__ = (Index("ix_campaigns_last_event", "last_event"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    status: Mapped[str] = mapped_column(String(16), default="active", server_default="active")
+    merged_into_id: Mapped[int | None] = mapped_column(Integer, default=None)
+    earlier_campaign_id: Mapped[int | None] = mapped_column(Integer, default=None)
+    seed_run_id: Mapped[str] = mapped_column(String(32))
+    title: Mapped[str] = mapped_column(String(255))
+    bottom_line: Mapped[str] = mapped_column(Text)
+    stage: Mapped[str | None] = mapped_column(String(16), default=None)
+    first_event: Mapped[datetime] = mapped_column(DateTime())
+    last_event: Mapped[datetime] = mapped_column(DateTime())
+    member_count: Mapped[int] = mapped_column(Integer)
+    detail: Mapped[dict[str, Any]] = mapped_column(JSON)
+    built_at: Mapped[datetime] = mapped_column(DateTime())
+    created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
+    events: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=None)
+    events_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+    events_basis: Mapped[str | None] = mapped_column(String(64), default=None)
+    decision: Mapped[str | None] = mapped_column(String(16), default=None)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+    decided_by: Mapped[str | None] = mapped_column(String(128), default=None)
+    decision_note: Mapped[str | None] = mapped_column(Text, default=None)
+    close_reason: Mapped[str | None] = mapped_column(String(32), default=None)
+    decision_basis: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=None)
+    authorization_id: Mapped[int | None] = mapped_column(Integer, default=None)
+    case_id: Mapped[str | None] = mapped_column(String(64), default=None)
+
+
+class CampaignChange(Base):
+    """One change of one campaign (migration 0070).
+
+    ``type`` is ``formed``, ``stage``, ``party``, ``decided``, ``reopened``
+    or ``acknowledged``. ``detail`` holds the facts of the change. A rebuild
+    writes the first three and ``reopened``. The decision routes write the
+    rest. ``campaign_id`` has no foreign key, like ``run_id``.
+    """
+
+    __tablename__ = "campaign_changes"
+    __table_args__ = (
+        Index("ix_campaign_changes_campaign", "campaign_id"),
+        Index("ix_campaign_changes_created", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    campaign_id: Mapped[int] = mapped_column(Integer)
+    type: Mapped[str] = mapped_column(String(24))
+    detail: Mapped[dict[str, Any]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime())
+
+
+class CampaignRunOverride(Base):
+    """One investigation that an analyst excluded from a campaign or included in one (0071).
+
+    ``type`` is ``excluded`` or ``included``. ``campaign_id`` is the campaign
+    at the time of the override. ``anchor_run_id`` is the seed of that
+    campaign for an inclusion. One override for each investigation: the
+    unique index on ``run_id`` holds this rule. An undo deletes the row. A
+    rebuild reads the rows and gives them to the engine.
+    """
+
+    __tablename__ = "campaign_run_overrides"
+    __table_args__ = (
+        Index("ux_campaign_run_overrides_run", "run_id", unique=True),
+        Index("ix_campaign_run_overrides_campaign", "campaign_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(32))
+    type: Mapped[str] = mapped_column(String(16))
+    campaign_id: Mapped[int] = mapped_column(Integer)
+    anchor_run_id: Mapped[str | None] = mapped_column(String(32), default=None)
+    by: Mapped[str] = mapped_column(String(128))
+    reason: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime())
+
+
+class CampaignMember(Base):
+    """One run in one campaign (migration 0068).
+
+    A run is a member of one campaign at most, and the unique index on
+    ``run_id`` holds this rule. ``run_id`` has no foreign key, like
+    ``hunt_id``. ``link`` is the link type that joins the run, and
+    ``evidence`` is the proof of that link. ``direction`` is ``forward``,
+    ``reverse`` or ``beyond``.
+    """
+
+    __tablename__ = "campaign_members"
+    __table_args__ = (
+        Index("ux_campaign_members_run", "run_id", unique=True),
+        Index("ix_campaign_members_campaign", "campaign_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    campaign_id: Mapped[int] = mapped_column(ForeignKey("campaigns.id"))
+    run_id: Mapped[str] = mapped_column(String(32))
+    link: Mapped[str] = mapped_column(String(16))
+    evidence: Mapped[dict[str, Any]] = mapped_column(JSON)
+    direction: Mapped[str] = mapped_column(String(8))
+    stage: Mapped[str | None] = mapped_column(String(16), default=None)
+    # True when the verdict of the run is not a true positive.
+    verdict_differs: Mapped[bool] = mapped_column(Boolean)
+    event_time: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+    actor_key: Mapped[str | None] = mapped_column(String(128), default=None)
+    target_key: Mapped[str | None] = mapped_column(String(128), default=None)
+
+
+class CampaignParty(Base):
+    """One machine in one campaign, an actor or a target (migration 0068).
+
+    A machine is a party of a campaign once, and the unique index holds this
+    rule. ``join_kind`` is ``agent``, ``dhcp`` or ``network``. ``beyond`` is
+    true for a target that only ``beyond`` members name.
+    """
+
+    __tablename__ = "campaign_parties"
+    __table_args__ = (
+        Index("ux_campaign_parties_machine", "campaign_id", "machine_key", unique=True),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    campaign_id: Mapped[int] = mapped_column(ForeignKey("campaigns.id"))
+    machine_key: Mapped[str] = mapped_column(String(128))
+    role: Mapped[str] = mapped_column(String(8))
+    name: Mapped[str | None] = mapped_column(String(255), default=None)
+    addresses: Mapped[list[str]] = mapped_column(JSON)
+    join_kind: Mapped[str | None] = mapped_column(String(16), default=None)
+    first_event: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+    last_event: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+    member_runs: Mapped[int] = mapped_column(Integer)
+    beyond: Mapped[bool] = mapped_column(Boolean)
+
+
+class CampaignRunFacts(Base):
+    """What the campaign engine reads of one run (migration 0068).
+
+    A rebuild reads this row and does not query the grid. ``basis`` holds the
+    verdict, the times of the run and the version of the facts. When the
+    basis changes, the engine reads the facts again. ``run_id`` has no
+    foreign key, like ``hunt_id``.
+    """
+
+    __tablename__ = "campaign_run_facts"
+
+    run_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    basis: Mapped[str] = mapped_column(String(160))
+    facts: Mapped[dict[str, Any]] = mapped_column(JSON)
+    built_at: Mapped[datetime] = mapped_column(DateTime())

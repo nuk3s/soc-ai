@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -261,19 +262,46 @@ async def test_a_schema_read_still_reaches_an_import_only_plane() -> None:
     assert out["sampled"] == 1
 
 
+class _ScopeES:
+    """A grid with an empty value list, and a dataset count under test control."""
+
+    def __init__(self, scope_docs: int) -> None:
+        self.scope_docs = scope_docs
+        self.calls: list[dict[str, Any]] = []
+
+    async def search(self, index: str, query: dict[str, Any], **kwargs: Any) -> EsSearchResult:
+        self.calls.append({"index": index, "query": query, **kwargs})
+        named = (kwargs.get("aggs") or {}).get("field_check")
+        if named is None:
+            return EsSearchResult(total=0, took_ms=1, aggregations={"vals": {"buckets": []}})
+        buckets = {key: {"doc_count": 0} for key in named["filters"]["filters"]}
+        buckets["scope"] = {"doc_count": self.scope_docs}
+        return EsSearchResult(
+            total=0, took_ms=1, aggregations={"field_check": {"buckets": buckets}}
+        )
+
+
 @pytest.mark.asyncio
-async def test_the_marker_guard_answers_in_the_same_shape_as_a_real_empty() -> None:
-    """The refusal must not become a tell by having fewer keys than an answer.
+@pytest.mark.parametrize("scope_docs", [0, 900])
+async def test_the_marker_guard_answers_as_a_field_that_no_document_holds(scope_docs: int) -> None:
+    """The refusal must not become a tell by differing from a real answer.
 
-    `field_values("synth.scenario_id")` returns an empty list without querying,
-    so that probing for the eval marker looks exactly like probing for a field
-    that does not exist. Every key the answered path gained has to appear on
-    the refusal too, or the shapes diverge and the difference is the disclosure.
+    `field_values("synth.scenario_id")` answers as a field that no document
+    holds answers. Each key and each value is the same, the note included, for
+    both causes of an empty list: the dataset has no document, and the dataset
+    has documents that do not hold the field. Only the name of the field
+    differs. The guard runs no search.
     """
-    es = _FakeES(aggs={"vals": {"buckets": []}})
-    answered = await field_values("host.name", elastic=es, settings=_settings())
-    refused = await field_values("synth.scenario_id", elastic=es, settings=_settings())
+    es = _ScopeES(scope_docs)
+    real = await field_values("zeek.nope", elastic=es, settings=_settings(), dataset="zeek.quiet")
+    seen = len(es.calls)
+    refused = await field_values(
+        "synth.scenario_id", elastic=es, settings=_settings(), dataset="zeek.quiet"
+    )
 
-    assert refused.keys() == answered.keys()
-    assert refused["values"] == answered["values"] == []
-    assert len(es.calls) == 1, "the guard must not issue a query"
+    expected = json.loads(json.dumps(real).replace("zeek.nope", "synth.scenario_id"))
+    assert refused == expected
+    assert refused["values"] == []
+    assert "not evidence of absence" in refused["note"]
+    assert seen == 2, "the real empty answer is the values search and one field check"
+    assert len(es.calls) == seen, "the guard must not issue a query"

@@ -73,7 +73,7 @@ export function DemoBanner() {
       className="flex items-center justify-center border-b px-4 text-center text-[12.5px] font-medium text-text-2"
       style={{ height: DEMO_BANNER_H, borderColor: 'rgba(75,139,245,.4)', background: '#0e1117' }}
     >
-      Demo. Some runs are recordings from a test grid. A script generated the rest. Nothing
+      Demo. Some investigations are recordings from a test grid. A script generated the rest. Nothing
       here is live.
     </div>
   );

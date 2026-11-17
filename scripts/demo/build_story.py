@@ -587,7 +587,7 @@ def authored_investigations(recorded: dict[str, dict[str, Any]]) -> list[dict[st
             f"bkp01 ({bkp}) uploaded 4.2 GB to {st.R2_STORAGE} over 9 hours. The backup job "
             "of bkp01 writes to a different provider on a nightly schedule, and this upload "
             f"ran outside it. {st.ADMIN_ACCOUNT} logged on to bkp01 over SSH 20 minutes before the "
-            "upload, and that account runs no backup job. Data left the estate. Treat it as "
+            "upload, and that account runs no backup job. Data left the network. Treat it as "
             "exfiltration."
         ),
         opening="The first run left two questions open. I read the backup job and the logons.",
@@ -632,7 +632,7 @@ def authored_investigations(recorded: dict[str, dict[str, Any]]) -> list[dict[st
                         f"{st.ADMIN_ACCOUNT}. Join this case to the PsExec case."
                     ),
                 },
-                "rationale": "Data left the estate through an account the attacker holds.",
+                "rationale": "Data left the network through an account the attacker holds.",
             },
             {
                 "tool_name": "add_case_comment",
@@ -2493,7 +2493,7 @@ def hunt_rows(
             ],
             report=_report(
                 f"ws-sales-04 beacons to {st.EMOTET_C2} every 300 seconds and sends Emotet "
-                "check-ins to the same address. No other host of the estate talks to it.",
+                "check-ins to the same address. No other internal host talks to it.",
                 [
                     _finding(
                         "Beacon to the Emotet server every 300 s",
@@ -2517,7 +2517,7 @@ def hunt_rows(
                     ),
                     _finding(
                         "No other host talks to the address",
-                        f"No other host of the estate opened a connection to {st.EMOTET_C2} "
+                        f"No other internal host opened a connection to {st.EMOTET_C2} "
                         "in the last 7 days.",
                         category="observation",
                         severity="info",
@@ -2657,7 +2657,7 @@ def hunt_rows(
             ],
             report=_report(
                 "No internal host beacons to a rare external address in the last 24 hours. "
-                "Two update services poll at a fixed cadence, and both are on the estate "
+                "Two update services poll at a fixed cadence, and both are on the network "
                 "baseline.",
                 [
                     _finding(
@@ -3264,6 +3264,26 @@ def _analyst_note(inv: dict[str, Any]) -> None:
     )
 
 
+# What the hostile action of each true positive of the story did. The
+# Confirmed threats panel orders its rows by this impact, so the demo shows a
+# row for a threat that worked and a row for one that was only sent. A true
+# positive with no entry states no impact, like a run of an older release.
+_IMPACTS = {
+    EMOTET_INV: "succeeded",
+    BZAR_INV: "succeeded",
+    URLHAUS_INV: "attempted",
+}
+
+
+def _state_impacts(by_id: dict[str, dict[str, Any]]) -> None:
+    """Put the impact on the report of each true positive that has one."""
+    for inv_id, impact in _IMPACTS.items():
+        inv = by_id[inv_id]
+        if inv.get("verdict") != "true_positive":
+            sys.exit(f"{inv_id}: an impact needs a true positive verdict")
+        inv["report"] = {**inv["report"], "impact": impact}
+
+
 def build(recorded_path: Path = RECORDED) -> dict[str, Any]:
     raw = json.loads(recorded_path.read_text())
     if raw.get("version") != 1:
@@ -3283,6 +3303,7 @@ def build(recorded_path: Path = RECORDED) -> dict[str, Any]:
     }
     _executed_escalate(by_id[BZAR_INV])
     _analyst_note(by_id[BONJOUR_INV])
+    _state_impacts(by_id)
     replays = [place_replay(r) for r in rec["replays"]]
     all_runs = investigations + authored
     alert_ids = {inv["id"]: str(inv["alert_es_id"]) for inv in all_runs if inv.get("alert_es_id")}

@@ -6,8 +6,11 @@
 // page the docs called "Settings", and "Operate" named a group and a page.
 // ---------------------------------------------------------------------------
 
-/** The guide, served beside the console under the same base path. */
-export const GUIDE_URL = `${import.meta.env.BASE_URL}guide/`;
+/** The console guide: docs/WEBUI_GUIDE.md on the docs site. The link opened
+ *  /app/guide/, a copy the build takes from a folder outside the repository,
+ *  and on 2026-11-12 that copy was the 1.5.0 release note under a 1.6.0
+ *  console. The release notes have their own entry (lib/docsSite.ts). */
+export { CONSOLE_GUIDE_URL as GUIDE_URL } from '../lib/docsSite';
 
 /** The breadcrumb of a path: the page, and the record on it when there is one. */
 export interface Crumb {
@@ -49,6 +52,9 @@ export function crumbFor(pathname: string, search = ''): Crumb {
     // A lead lives on the Hunts page, so its breadcrumb starts there.
     case 'leads':
       return record ? { crumb: 'Hunts', crumb2: `Lead ${record}` } : { crumb: 'Hunts' };
+    // The campaign page names its title with `setCrumbName`.
+    case 'campaigns':
+      return record ? { crumb: 'Campaigns', crumb2: record } : { crumb: 'Campaigns' };
     case 'hosts':
       return record ? { crumb: 'Hosts', crumb2: record } : { crumb: 'Hosts' };
     // The entity page shows an address the host list does not hold, a user
@@ -61,6 +67,8 @@ export function crumbFor(pathname: string, search = ''): Crumb {
     }
     case 'notifications':
       return { crumb: 'Notifications' };
+    case 'needs-you':
+      return { crumb: 'Needs you' };
     case 'operate':
       return { crumb: 'Status' };
     case 'backtest':
@@ -81,6 +89,7 @@ export function pageLabel(path: string): string {
   const { crumb, crumb2 } = crumbFor(pathname, search);
   if (pathname.startsWith('/leads/') && crumb2) return crumb2;
   if (pathname.startsWith('/hunts/')) return 'Hunt';
+  if (pathname.startsWith('/campaigns/')) return 'Campaign';
   if (pathname.startsWith('/entity/') && entityHint(search)) return crumb;
   if (pathname.startsWith('/hosts/') || pathname.startsWith('/entity/')) return 'Host';
   return crumb;

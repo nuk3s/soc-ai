@@ -458,7 +458,7 @@ describe('Investigations retry tucking', () => {
     expect(screen.getAllByText('GPL ICMP Large ICMP Packet')).toHaveLength(1);
     const reveal = screen.getByRole('button', { name: /1 earlier/ });
     fireEvent.click(reveal);
-    expect(screen.getByText('superseded run')).toBeTruthy();
+    expect(screen.getByText('superseded investigation')).toBeTruthy();
   });
 });
 
@@ -549,7 +549,7 @@ describe('Investigations rows open without a mouse', () => {
     mount('/investigations');
     await screen.findAllByText('GPL ICMP Large ICMP Packet');
     fireEvent.click(screen.getByRole('button', { name: /1 earlier/ }));
-    const link = screen.getByRole('link', { name: /superseded run/ });
+    const link = screen.getByRole('link', { name: /superseded investigation/ });
     expect(link.getAttribute('href')).toBe('/investigation/INV-RETRY');
   });
 

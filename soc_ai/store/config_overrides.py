@@ -528,11 +528,15 @@ WHITELIST: tuple[SettingSpec, ...] = (
             "Auto-Investigate run also acknowledges an alert that inherits such a "
             "verdict inside the inherit window. The alert must share the rule, the "
             "source and the destination. The default is on, and soc-ai audits every "
-            "unattended acknowledgement. soc-ai never acknowledges a high or "
-            "critical severity alert, and never a malware or exploit alert. To "
-            "clear a standing false-positive backlog, run Auto-Investigate over "
-            "those alerts and lower the severity floor to medium or low. Turn this "
-            "setting off to require a click for every acknowledgement."
+            "unattended acknowledgement. soc-ai never acknowledges a critical "
+            "severity alert, and never a malware or exploit alert. soc-ai "
+            "acknowledges an alert with the severity high only if each of these "
+            "conditions is true. The alert is a Suricata alert. The classification "
+            "is policy violation or inappropriate content. Each signature severity "
+            "of the rule is Informational. To clear a standing false-positive backlog, "
+            "run Auto-Investigate over those alerts and lower the severity floor "
+            "to medium or low. Turn this setting off to require a click for every "
+            "acknowledgement."
         ),
     ),
     SettingSpec(
@@ -1342,6 +1346,24 @@ WHITELIST: tuple[SettingSpec, ...] = (
         max_value=10,
     ),
     SettingSpec(
+        key="quality_nightly_synth_n",
+        attr="quality_nightly_synth_n",
+        type="int",
+        label="Nightly eval synthetic true positives (per run)",
+        section="Quality",
+        hot=True,
+        help=(
+            "This setting is how many synthetic true positives each nightly run "
+            "plants beside its real alerts. A real alert has no known answer. A "
+            "synthetic true positive has one, so a miss raises the quality alarm "
+            "and the alarm names the scenario. The run writes the synthetic "
+            "documents to `logs-synth-*` on the grid and removes them when the "
+            "batch ends. Set 0 to plant nothing."
+        ),
+        min_value=0,
+        max_value=3,
+    ),
+    SettingSpec(
         key="quality_alarm_drop",
         attr="quality_alarm_drop",
         type="float",
@@ -1352,7 +1374,9 @@ WHITELIST: tuple[SettingSpec, ...] = (
             "A nightly run compares its agreement rate with the median of the last 7 "
             "runs. A drop larger than this value raises a quality alarm. This rule "
             "applies when the Oracle grades the run. Without the Oracle, soc-ai "
-            "alarms on errors and fallbacks."
+            "alarms on errors and fallbacks. A second rule has no setting: low "
+            "verdict agreement across the last 7 runs raises the alarm at any value "
+            "here."
         ),
         min_value=0.05,
         max_value=0.5,
@@ -1564,13 +1588,13 @@ WHITELIST: tuple[SettingSpec, ...] = (
         key="profile_estate_rare_hosts",
         attr="profile_estate_rare_hosts",
         type="int",
-        label="Estate-rare below this many hosts",
+        label="Rare on the network below this many hosts",
         section="Behavioural profiles",
         hot=True,
         help=(
-            "A new member that fewer hosts hold is estate-rare. Its observation has a "
+            "A new member that fewer hosts hold is rare on the network. Its observation has a "
             "higher weight. The default is 3 hosts. A member must also reach this "
-            "number of hosts to be estate-common."
+            "number of hosts to be common on the network."
         ),
         min_value=1,
         max_value=100,
@@ -1579,12 +1603,12 @@ WHITELIST: tuple[SettingSpec, ...] = (
         key="profile_estate_common_share",
         attr="profile_estate_common_share",
         type="float",
-        label="Estate-common above this share of hosts",
+        label="Common on the network above this share of hosts",
         section="Behavioural profiles",
         hot=True,
         help=(
             "A new member that more than this share of the profiled hosts hold is "
-            "a trait of the estate. It forms no observation. The default is 0.2, "
+            "a trait of the network. It forms no observation. The default is 0.2, "
             "which is 20 % of the profiled hosts."
         ),
         min_value=0.0,
@@ -1594,12 +1618,12 @@ WHITELIST: tuple[SettingSpec, ...] = (
         key="estate_model_enabled",
         attr="estate_model_enabled",
         type="bool",
-        label="Fit the estate model",
+        label="Fit the network model",
         section="Behavioural profiles",
         hot=True,
         help=(
             "soc-ai groups the hosts that act alike once a day. It scores each host "
-            "against the estate. Its observations stay in shadow. A host with no "
+            "against the network. Its observations stay in shadow. A host with no "
             "confident role uses its learned group as its peer group. This feature "
             "needs an extra package that your deployment may not have. Settings > "
             "Diagnostics shows whether it is present. The container image includes "

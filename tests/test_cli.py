@@ -1480,9 +1480,8 @@ def test_audit_verify_cli_streams_a_large_index_in_bounded_memory(
     assert rc == 0
     assert "45 records verified" in _strip_ansi(capsys.readouterr().out)
     assert len(held) >= 5
-    # The bound is a page, with one page of slack: under a parallel test run
-    # the collector can lag one feed behind. The whole index would be 45.
-    assert max(held) <= 20, f"held {max(held)} records at once; a page is 10"
+    # The bound is one page. The whole index would be 45.
+    assert max(held) <= 10, f"held {max(held)} records at once; a page is 10"
 
 
 def test_audit_verify_duplicates_only_exits_3_and_says_no_record_was_altered(
@@ -1643,7 +1642,7 @@ def test_estate_model_show_with_no_fit(
     monkeypatch.setattr(cli, "get_settings", lambda: settings)
     assert cli._estate_model_show(_estate_args("show")) == 0
     out = capsys.readouterr().out
-    assert out == ("The setting estate_model_enabled is off.\nNo estate model fit is on record.\n")
+    assert out == ("The setting estate_model_enabled is off.\nNo network model fit is on record.\n")
 
 
 def test_estate_model_show_prints_every_field_of_the_newest_fit(
@@ -1733,7 +1732,7 @@ def test_estate_model_run_with_the_setting_off_fits_once_and_says_so(
         "The setting estate_model_enabled is off. This one fit runs because you asked for "
         "it. The daily loop stays off.\n"
     )
-    assert "estate model: learning. 0 hosts." in out
+    assert "network model: learning. 0 hosts." in out
     assert "The store recorded fit 1." in out
     assert settings.estate_model_enabled is False  # the one-shot run changed no setting
 

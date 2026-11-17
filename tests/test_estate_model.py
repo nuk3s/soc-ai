@@ -478,7 +478,7 @@ async def test_the_two_learning_cases_record_what_the_states_table_says(
         groups = (await db.execute(select(EstatePeerGroup))).scalars().all()
     await engine.dispose()
     assert run.state == store.STATE_LEARNING
-    assert run.reason == "The estate holds 12 hosts with a profile. The model needs 20."
+    assert run.reason == "The network holds 12 hosts with a profile. The model needs 20."
     assert fit is not None and fit.state == store.STATE_LEARNING and fit.hosts == 12
     assert fit.groups == 0 and fit.model_file is None and fit.model_sha256 is None
     assert list(groups) == []

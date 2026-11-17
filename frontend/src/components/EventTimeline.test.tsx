@@ -103,6 +103,12 @@ describe('EventTimelinePanel', () => {
     expect(within(waves[0]).getByText('Wave 1')).toBeTruthy();
     expect(within(waves[1]).getByText('Wave 2')).toBeTruthy();
     expect(screen.getByText('This wave starts 22h 27m after wave 1 ends.')).toBeTruthy();
+    // The gap line sits in the wave it opens, under its header. It read as
+    // the last line of wave 1 (review 2026-11-12).
+    const gap = within(waves[1]).getByTestId('event-wave-gap');
+    expect(within(waves[0]).queryByTestId('event-wave-gap')).toBeNull();
+    const header = within(waves[1]).getByText('Wave 2');
+    expect(header.compareDocumentPosition(gap) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(screen.getByText(/A new wave starts after a gap of more than 30 minutes/)).toBeTruthy();
     expect(screen.getByText(/the alert and the documents that the verdict cites/)).toBeTruthy();
   });

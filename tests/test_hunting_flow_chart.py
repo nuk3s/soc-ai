@@ -9,6 +9,7 @@ keep the two copies identical and keep the chart on the words of the controls.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -24,9 +25,11 @@ def test_the_two_copies_are_identical() -> None:
     assert CONSOLE_COPY.read_bytes() == DOCS_COPY.read_bytes()
 
 
-def test_the_chart_uses_the_words_of_the_controls() -> None:
+def test_the_chart_uses_the_words_of_the_console() -> None:
+    # The two verbs ("Hunt this lead", "Open an investigation") left the chart
+    # on 2026-11-16. The definition lines under the chart carry them.
     chart = _chart()
-    for word in ("Hunt this lead", "Open an investigation", "Hit", "Needs you"):
+    for word in ("Hit", "Needs you", "Campaign", "Your decision on a campaign"):
         assert word in chart, word
 
 
@@ -34,7 +37,7 @@ def test_the_chart_draws_the_alert_path_beside_the_sweep_path() -> None:
     chart = _chart()
     assert "THE SWEEP PATH" in chart
     assert "THE ALERT PATH" in chart
-    for box in ("Alert", "Investigation", "Verdict", "Action in Security Onion"):
+    for box in ("Alert", "Investigation", "Verdict", "Campaign", "Action in Security Onion"):
         assert f">{box}<" in chart, box
 
 
@@ -59,9 +62,29 @@ def test_the_chart_uses_the_console_definitions() -> None:
     for words in (
         "One written detection.",
         "One match of one analytic",
-        "One run against",
-        "the Dashboard tile",
-        "threat finding when the hunt ends.",
+        "One search of the grid",
+        "the Dashboard",
+        "each threat finding that names an entity",
+    ):
+        assert words in chart, words
+
+
+def test_the_chart_states_the_leads_and_hunts_of_a_campaign() -> None:
+    # Leads and hunts of a campaign (2026-11-16): a lead of a campaign waits on
+    # it, a change of a campaign starts at most one hunt in 24 hours, a hunt
+    # reads the open campaigns, and a finding that a campaign holds gets no
+    # investigation of its own.
+    chart = _chart()
+    for words in (
+        "A lead of a campaign waits on",
+        "a change starts",
+        "one in 24 hours",
+        "It reads the open campaigns.",
+        "unless a campaign holds it",
+        # One Security Onion case for a campaign (part C).
+        "Open one case: one Security Onion",
+        "holds at most",
+        "an investigation in no campaign recommends",
     ):
         assert words in chart, words
 
@@ -77,5 +100,21 @@ def test_the_chart_states_no_retired_claim() -> None:
         "its own investigation",
         "investigates each one",
         ">each finding<",
+        # Review of 2026-11-14: the console has no Agree control, only a press
+        # on a finding writes an observation, and a hunt finding can start a
+        # campaign.
+        "Agree",
+        "agree",
+        "a threat finding writes an observation",
+        "starts none",
+        ">Two verbs<",
     ):
         assert words not in chart, words
+
+
+def test_the_chart_uses_no_retired_word() -> None:
+    # An investigation is no "run" and no "member", the network is no
+    # "estate", and the user-facing word is "type".
+    words = " ".join(re.findall(r"<text[^>]*>([^<]*)</text>", _chart()))
+    for word in ("run", "runs", "member", "members", "estate", "kind"):
+        assert not re.search(rf"\b{word}\b", words, re.IGNORECASE), word

@@ -5,9 +5,9 @@ import { DocumentChip } from './DocumentDrawer';
 import {
   HUNT_CLOSED_ACTOR,
   HUNT_CLOSED_OUTCOME,
-  REASON_LABEL,
   benignLine,
   closedByHunt,
+  dismissReasonLabel,
 } from './LeadsStrip';
 import { Panel, PanelHeader } from './Panel';
 import type { LeadDetail, LeadObservationDetail, LeadPromotedFinding } from '../lib/api';
@@ -123,7 +123,7 @@ export function decisionSentence(d: LeadDecision): string {
   const by = actorOf(d.by, HUNT_CLOSED_ACTOR);
   switch (d.action) {
     case 'dismissed': {
-      const reason = REASON_LABEL[d.reason ?? ''] ?? d.reason ?? 'Other';
+      const reason = d.reason ? dismissReasonLabel(d.reason) : 'Other';
       // One stop at the end. A note that ends in a stop read "shipping..".
       return withStop(`Dismissed${by ? ` by ${by}` : ''}: ${reason}${d.note ? `. ${d.note}` : ''}`);
     }
@@ -232,7 +232,7 @@ function LegacyDismissalRow({ lead }: { lead: LeadDetail }) {
           ? `Closed ${ago(at)} by ${HUNT_CLOSED_ACTOR}. ${HUNT_CLOSED_OUTCOME}`
           : withStop(
               `Dismissed ${ago(at)} by ${lead.dismissed_by}: ${
-                REASON_LABEL[lead.dismissed_reason ?? ''] ?? lead.dismissed_reason
+                (lead.dismissed_reason ? dismissReasonLabel(lead.dismissed_reason) : lead.dismissed_reason)
               }${lead.dismissed_note ? `. ${lead.dismissed_note}` : ''}`,
             )}
         {leadReopened(lead) ? ` ${REOPEN_UNKNOWN}` : ''}

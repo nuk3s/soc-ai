@@ -135,7 +135,7 @@ def read_verified(data_dir: Path | str, name: str, recorded: Mapping[str, str]) 
     except ValueError as exc:
         raise ModelRefused(f"The file {name} is not JSON.") from exc
     if not isinstance(payload, dict) or payload.get("format") != FORMAT:
-        raise ModelRefused(f"The file {name} is not an estate model of format {FORMAT}.")
+        raise ModelRefused(f"The file {name} is not a network model of format {FORMAT}.")
     return payload
 
 

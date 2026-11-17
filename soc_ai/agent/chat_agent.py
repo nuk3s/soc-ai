@@ -124,7 +124,7 @@ a gap in that plane only. Write "this host ships no process events". Do not writ
 **Get the hostname.** `host.name` names the host on the documents its own agent \
 ships. Run `host.ip:<IP> | groupby host.name` to read it. On a network sensor \
 document, `host.name` names the sensor. A DNS answer or a DHCP lease also names the \
-host. For example: `event.dataset:zeek.dhcp AND (source.ip:<IP> OR destination.ip:<IP>)`.
+host. For example: `event.dataset:zeek.dhcp AND (client.address:<IP> OR dhcp.assigned_ip:<IP>)`.
 
 **Infer a host role from DNS.** Query \
 `event.dataset:zeek.dns AND (source.ip:<IP> OR destination.ip:<IP>)` to see which \

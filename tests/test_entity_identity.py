@@ -269,6 +269,36 @@ def test_the_palette_finds_a_user_a_domain_and_a_hunt(
     assert hunt_hits[0]["href"] == f"/hunts/{ids['hunt_id']}"
 
 
+def test_a_hunt_hit_shows_a_one_line_title_and_its_outcome_never_the_prompt(
+    seeded: tuple[TestClient, dict[str, Any]],
+) -> None:
+    """The review of 2026-11-12: Ctrl K "php2shell" returned as its first result
+    a 13-line lead hunt prompt with tool names. A hunt hit shows the title of
+    the hunt list and its outcome."""
+    client, _ = seeded
+    prompt = (
+        "[lead 49] Investigate 10.20.30.5. The lead formed from a triaged alert.\n"
+        "Observations:\n- php2shell upload to 10.20.30.5 (alert)\n"
+        "Read each document id with get_event_raw before you run any query.\n"
+        "Judge the observations from these documents first. Then widen the search."
+    )
+
+    async def _seed() -> str:
+        async with client.app.state.db_sessionmaker() as db:  # type: ignore[attr-defined]
+            hunt = await hunt_svc.create(db, objective=prompt, started_by="auto-hunt")
+            await hunt_svc.finalize(db, hunt.id, status="complete", report={"findings": []})
+            await db.commit()
+            return str(hunt.id)
+
+    hunt_id = asyncio.run(_seed())
+    [hit] = [h for h in _hits(client, "php2shell") if h["type"] == "hunt"]
+    assert hit["value"] == hunt_id
+    assert hit["label"] == "Lead 49 hunt: 10.20.30.5"
+    assert "\n" not in hit["label"] and "get_event_raw" not in hit["label"]
+    assert hit["detail"] == f"Hunt {hunt_id} · No threat found"
+    assert "get_event_raw" not in hit["detail"]
+
+
 def test_the_palette_offers_an_address_no_machine_holds(
     seeded: tuple[TestClient, dict[str, Any]],
 ) -> None:

@@ -246,5 +246,14 @@ answer.
 
 The FIRST line of your verdict section must be exactly:
 AGREEMENT: <yes|no|partial>
+The SECOND line of your verdict section must be exactly:
+ORACLE_VERDICT: <true_positive|false_positive|needs_more_info>
 followed by your reasoning.
+
+ORACLE_VERDICT is the verdict that YOU reach from the evidence in the run
+trail. It is separate from AGREEMENT. Do not lower it because the confidence
+is too high, the reasoning is thin, or a recommended action is wrong: those
+belong in AGREEMENT and in your reasoning. Give needs_more_info only when
+the evidence in the trail does not settle the alert. Give ORACLE_VERDICT
+even when the run produced no report.
 """

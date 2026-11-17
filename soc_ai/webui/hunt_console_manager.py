@@ -82,6 +82,7 @@ class HuntConsoleManager:
         starter: str = "analyst",
         lead_id: int | None = None,
         earlier: EarlierConclusions | None = None,
+        campaign_id: int | None = None,
     ) -> str | None:
         """Create the hunt row and spawn a background drainer task.
 
@@ -101,6 +102,12 @@ class HuntConsoleManager:
         ``earlier`` is the earlier-conclusions block (:mod:`soc_ai.hunting.earlier`)
         that a lead hunt and a scheduled hunt read. :meth:`start_streaming`
         passes none, so an analyst's chat hunt reads none.
+
+        ``campaign_id`` names the campaign that the hunt is for: a campaign
+        hunt, and a lead hunt of a lead of a campaign. The row holds it from
+        its first commit (:func:`soc_ai.store.hunts.campaign_of_start`). Such
+        a hunt reads the block of that campaign only
+        (:func:`soc_ai.hunting.campaign_block.scope_of`).
         """
         return await self._launch(
             state,
@@ -112,6 +119,7 @@ class HuntConsoleManager:
             lead_id=lead_id,
             sink=None,
             earlier=earlier,
+            campaign_id=campaign_id,
         )
 
     async def start_streaming(
@@ -152,6 +160,7 @@ class HuntConsoleManager:
         lead_id: int | None = None,
         sink: HuntEventQueue | None,
         earlier: EarlierConclusions | None = None,
+        campaign_id: int | None = None,
     ) -> str | None:
         # Concurrency guard: this manager is fire-and-forget (one unbounded
         # background asyncio.Task per call), so without a cap a scripted/rapid-fire
@@ -181,14 +190,19 @@ class HuntConsoleManager:
                 lead_id=lead_id,
                 cancel_token=token,
                 earlier=earlier,
+                campaign_id=campaign_id,
             )
 
             hunt_id: str | None = None
             try:
-                async for name, data in gen:
-                    if name == "hunt_created":
-                        hunt_id = data.get("hunt_id")
-                        break
+                # The row takes the campaign id as it is created. The block
+                # ends before the drainer task exists, so the task that runs
+                # the hunt does not carry the value.
+                with hunt_svc.campaign_of_start(campaign_id):
+                    async for name, data in gen:
+                        if name == "hunt_created":
+                            hunt_id = data.get("hunt_id")
+                            break
             except Exception:
                 _LOGGER.exception("hunt_console_manager: failed to start hunt")
                 return None

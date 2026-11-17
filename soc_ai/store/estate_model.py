@@ -173,7 +173,7 @@ async def record_fit(
 ) -> int:
     """Write one fit as a challenger. Returns its id."""
     if state not in STATES:
-        raise ValueError(f"unknown estate model state: {state}")
+        raise ValueError(f"unknown network model state: {state}")
     at = _naive(fitted_at)
     row = EstateModelFit(
         fitted_at=at,
@@ -219,7 +219,7 @@ async def update_fit(db: AsyncSession, fit_id: int, **values: Any) -> None:
     if unknown:
         raise ValueError(f"not an updatable fit column: {sorted(unknown)}")
     if "state" in values and values["state"] not in STATES:
-        raise ValueError(f"unknown estate model state: {values['state']}")
+        raise ValueError(f"unknown network model state: {values['state']}")
     await db.execute(update(EstateModelFit).where(EstateModelFit.id == fit_id).values(**values))
     await db.commit()
 

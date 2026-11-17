@@ -68,7 +68,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
   getPreflightDetail: vi.fn().mockResolvedValue({
     checked_at: new Date().toISOString(),
     rows: [
-      { name: 'estate model', status: 'INFO', detail: 'off. The extra package that the estate model needs is installed.', hint: '' },
+      { name: 'network model', status: 'INFO', detail: 'off. The extra package that the network model needs is installed.', hint: '' },
       { name: 'prompt assets', status: 'PASS', detail: '2 assets are present', hint: '' },
       { name: 'blocklists', status: 'WARN', detail: 'no feed is loaded', hint: '' },
       { name: 'auth', status: 'WARN', detail: 'sign-in is off', hint: '' },
@@ -508,7 +508,7 @@ describe('Diagnostics — Verify audit chain', () => {
 describe('Diagnostics, the doctor list', () => {
   it('shows the INFO and PASS rows when the pane opens', async () => {
     renderDiagnostics();
-    expect(await screen.findByTestId('doctor-row-estate model')).toBeTruthy();
+    expect(await screen.findByTestId('doctor-row-network model')).toBeTruthy();
     expect(screen.getByTestId('doctor-row-prompt assets')).toBeTruthy();
   });
 });
@@ -541,9 +541,9 @@ describe('Diagnostics, the grade chips', () => {
     expect(chip).toHaveAttribute('aria-pressed', 'true');
     expect(screen.getByTestId('doctor-row-blocklists')).toBeTruthy();
     expect(screen.getByTestId('doctor-row-auth')).toBeTruthy();
-    expect(screen.queryByTestId('doctor-row-estate model')).toBeNull();
+    expect(screen.queryByTestId('doctor-row-network model')).toBeNull();
     // A second press shows every row again.
     fireEvent.click(chip);
-    expect(screen.getByTestId('doctor-row-estate model')).toBeTruthy();
+    expect(screen.getByTestId('doctor-row-network model')).toBeTruthy();
   });
 });

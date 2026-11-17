@@ -970,7 +970,7 @@ def test_clean_hostname_rejects_machine_guid_mdns_names() -> None:
     # Bare GUID (no suffix) — some stacks answer without .local:
     assert _clean_hostname("3a7471a9-8964-4f54-8aab-23af820978fb") is None
     # Real names keep working:
-    assert _clean_hostname("bazzite") == "bazzite"
+    assert _clean_hostname("fileserver") == "fileserver"
     assert _clean_hostname("nano-pve.example.com") == "nano-pve.example.com"
 
 

@@ -36,10 +36,14 @@ const PROD: NeedsYouCount = {
   untriaged_groups: 0,
   needs_more_info: 2,
   pending_actions: 0,
+  // The two investigations behind the verdicts that need more info.
+  investigations_waiting: 2,
+  decisions: 9,
+  review: 300,
   total: 309,
   unknown: [],
   alert_window: '7d',
-  verdict_window: '30d',
+  verdict_window: 'all',
   alert_floor: false,
 };
 
@@ -97,23 +101,28 @@ afterEach(() => {
 });
 
 describe('the bell panel accounts for every unit of the badge', () => {
-  it('lists each part of the count with its scope, and the parts add up to the badge', async () => {
+  it('lists each decision part with its scope, and the parts add up to the badge', async () => {
     vi.mocked(getNotifications).mockResolvedValue([
       event('inv-done:A', 'Verdict false_positive: ET A', minutesAgo(5)),
       event('hunt-done:B', 'Hunt finished: no threat found. Sweep', minutesAgo(6)),
     ]);
     await mount();
-    expect(badge()).toBe('309');
+    // The badge counts decisions. 300 unread hits are review work
+    // (production review 2026-11-12, ui-core 4).
+    expect(badge()).toBe('9');
     const block = within(panel()).getByTestId('needs-you-block');
     const parts = within(block).getAllByTestId(/^needs-you-part-/).map((p) => p.textContent);
     expect(parts).toEqual([
+      '2 investigations wait on your decision, at any age',
       '7 leads wait on a decision, all open',
-      '300 shadow hits are unread, all unread',
-      '2 verdicts need more info, last 30 days',
     ]);
     const sum = parts.reduce((s, p) => s + Number(p!.split(' ')[0]), 0);
     expect(String(sum)).toBe(badge());
-    expect(screen.getByTestId('notif-summary').textContent).toBe('309 need you · 2 notifications');
+    expect(within(block).getByTestId('needs-you-review').textContent).toBe(
+      '300 shadow hits to review, all unread',
+    );
+    expect(screen.getByTestId('notif-summary').textContent).toBe('9 need you · 2 notifications');
+    expect(bell().getAttribute('aria-label')).toBe('Notifications, 9 need you. 300 shadow hits to review');
   });
 
   it('asks the server for the events only, and leaves the hit and lead rows to the block', async () => {
@@ -136,7 +145,7 @@ describe('the bell panel accounts for every unit of the badge', () => {
     });
     vi.mocked(getNotifications).mockResolvedValue([]);
     await mount();
-    expect(badge()).toBe('309+');
+    expect(badge()).toBe('9+');
     expect(within(panel()).getByTestId('needs-you-part-untriaged_groups').textContent).toBe(
       'Could not count the alert groups. The grid did not answer.',
     );
@@ -214,7 +223,7 @@ describe('Dismiss all in the bell panel', () => {
     expect(getNeedsYouCount).toHaveBeenCalledTimes(2);
     expect(badge()).toBe('9');
     const parts = within(panel()).getAllByTestId(/^needs-you-part-/).map((p) => p.textContent);
-    expect(parts).toEqual(['7 leads wait on a decision, all open', '2 verdicts need more info, last 30 days']);
+    expect(parts).toEqual(['2 investigations wait on your decision, at any age', '7 leads wait on a decision, all open']);
     // The next read sends the moment, so hidden rows take no place in the limit.
     expect(getNotifications).toHaveBeenLastCalledWith({ limit: 12, eventsOnly: true, after: NOW.toISOString() });
   });

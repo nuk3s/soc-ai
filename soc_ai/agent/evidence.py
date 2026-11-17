@@ -338,6 +338,18 @@ def _path_exists_in_alert(alert_ctx: Any, dotted: str) -> bool:
         dump = alert_ctx.model_dump(mode="json")
     except Exception:
         return False
+    return context_path_value(dump, dotted) is not None
+
+
+def context_path_value(dump: Any, dotted: str) -> Any:
+    """The value at a dotted path in a stored alert-context dump, or None.
+
+    The one walk of :func:`_path_exists_in_alert`: longest dot-joined key
+    prefix at each dict level, a list index for a list, and an embedded JSON
+    object string parsed once. The investigation page reads the value of a
+    cited field with it, so the page and the validator agree on what a path
+    names.
+    """
     parts = dotted.split(".")
     cur: Any = dump
     i = 0
@@ -347,9 +359,9 @@ def _path_exists_in_alert(alert_ctx: Any, dotted: str) -> bool:
             try:
                 parsed = json.loads(cur)
             except (ValueError, TypeError):
-                return False
+                return None
             if not isinstance(parsed, dict | list):
-                return False
+                return None
             cur = parsed
         if isinstance(cur, dict):
             for j in range(len(parts), i, -1):
@@ -359,16 +371,16 @@ def _path_exists_in_alert(alert_ctx: Any, dotted: str) -> bool:
                     i = j
                     break
             else:
-                return False
+                return None
         elif isinstance(cur, list):
             try:
                 cur = cur[int(parts[i])]
             except (ValueError, IndexError):
-                return False
+                return None
             i += 1
         else:
-            return False
-    return cur is not None
+            return None
+    return cur
 
 
 def _tool_was_invoked(
@@ -903,22 +915,25 @@ def _materialize_prefetch_evidence(alert_ctx: Any) -> list[str]:
             )
 
     # Blocklist coverage. Same shape and the same reasoning as the endpoint
-    # coverage gap below: when the feeds loaded nothing, every lookup missed and
-    # the miss says nothing. Handed over as a citable fact so the synthesizer
-    # can name it, instead of a silence it reads as a clean reputation check.
-    # ONE bullet for the run, not one per indicator, and only on an explicit
-    # False — an unrecorded enrichment makes no claim. Constant wording apart
-    # from the citation path.
+    # coverage gap below: when no malware feed answered a lookup, the miss says
+    # nothing. Handed over as a citable fact so the synthesizer can name it,
+    # instead of a silence it reads as a clean reputation check. ONE bullet for
+    # the run, not one per indicator, and only on an explicit False — an
+    # unrecorded enrichment makes no claim. Constant wording apart from the
+    # citation path. The path is the status: a production host loaded the Tor
+    # exit list alone, and the older bullet stayed quiet because one feed had
+    # loaded.
     unchecked = next(
         (i for i, e in enrichments.items() if getattr(e, "blocklist_checked", None) is False),
         None,
     )
     if unchecked is not None:
         evidence.append(
-            "blocklist coverage gap: no local threat-intel feed was loaded, so no indicator "
-            "was checked against one — every empty blocklist_hits in this bundle is an "
-            "absence of data, not a clean reputation result; not exoneration and not guilt "
-            f"(path enrichments.{unchecked}.blocklist_sources)"
+            "blocklist coverage gap: no malware feed answered for at least one indicator, "
+            "so its reputation is not checked — an empty blocklist_hits with "
+            "reputation_status not_checked is an absence of data, not a clean reputation "
+            "result; not exoneration and not guilt "
+            f"(path enrichments.{unchecked}.reputation_status)"
         )
 
     # Endpoint coverage. When the prefetch established that the alert's hosts

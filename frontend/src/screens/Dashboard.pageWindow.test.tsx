@@ -10,7 +10,7 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { InvestigationListQuery } from '../lib/api';
+import type { InvestigationListQuery, NeedsYouCount } from '../lib/api';
 
 const ROW = vi.hoisted(() => ({
   id: 'INV-OLD',
@@ -65,7 +65,27 @@ import {
 } from '../lib/api';
 import { Dashboard } from './Dashboard';
 
-const NEEDS = {
+// The server of the campaign decisions: the investigations that wait count
+// once each, at any age. One verdict needs more info and 5 actions wait on
+// the 3 investigations.
+const NEEDS: NeedsYouCount = {
+  leads_needing_decision: 2,
+  unread_shadow_hits: 3,
+  untriaged_groups: 4,
+  needs_more_info: 1,
+  pending_actions: 5,
+  investigations_waiting: 3,
+  decisions: 2 + 4 + 3,
+  review: 3,
+  total: 12,
+  unknown: [],
+  alert_window: '7d',
+  verdict_window: 'all',
+  alert_floor: false,
+};
+
+// An older server: no campaigns, no decisions, no investigations_waiting.
+const OLDER: NeedsYouCount = {
   leads_needing_decision: 2,
   unread_shadow_hits: 3,
   untriaged_groups: 4,
@@ -106,42 +126,101 @@ describe('Needs-you tile scope words', () => {
     expect((await screen.findByTestId('needs-you-line-leads')).textContent).toBe(
       '2 leads wait on a decision · all open',
     );
+    // The hits are review work, on their own line apart from the decisions
+    // (production review 2026-11-12, ui-core 4).
     expect(screen.getByTestId('needs-you-line-hits').textContent).toBe(
-      '3 shadow hits are unread · all unread',
+      '3 shadow hits to review · all unread',
     );
     expect(screen.getByTestId('needs-you-line-alerts').textContent).toBe(
       '4 alert groups have no verdict · last 7 days',
     );
-    expect(screen.getByTestId('needs-you-line-nmi').textContent).toBe(
-      '1 verdict needs more info · last 30 days',
+    // One line for the investigations that wait, each investigation once.
+    // The window "all" reads "at any age", never "last all".
+    expect(screen.getByTestId('needs-you-line-investigations').textContent).toBe(
+      '3 investigations wait on your decision · at any age',
     );
-    expect(screen.getByTestId('needs-you-line-actions').textContent).toBe(
-      '5 recommended actions wait for you · last 30 days',
-    );
+    expect(screen.queryByTestId('needs-you-line-nmi')).toBeNull();
+    expect(screen.queryByTestId('needs-you-line-actions')).toBeNull();
+    expect(screen.getByTestId('kpi-needs-you').textContent).not.toContain('last all');
+    // A scope never breaks inside: "at any" over "age" read as two scopes.
+    const scope = within(screen.getByTestId('needs-you-line-investigations')).getByTestId('scope-of-line');
+    expect(scope.textContent).toBe('· at any age');
+    expect(scope.className).toContain('whitespace-nowrap');
   });
 
-  it('opens the runs with a pending action from the actions line (R1-I1)', async () => {
-    // The line opened every true positive of 30 days, a list that did not
-    // match its number.
+  it('states the campaigns first, at any age, and opens the campaigns that wait', async () => {
+    vi.mocked(getNeedsYouCount).mockResolvedValue({ ...NEEDS, campaigns: 2, decisions: 11 });
     mount();
-    const line = await screen.findByTestId('needs-you-line-actions');
-    expect(within(line).getByRole('link').getAttribute('href')).toBe(
-      '/investigations?range=30d&actions=pending',
+    const line = await screen.findByTestId('needs-you-line-campaigns');
+    expect(line.textContent).toBe('2 campaigns wait on your decision · at any age');
+    expect(within(line).getByRole('link').getAttribute('href')).toBe('/campaigns?decision=waits');
+    const items = within(screen.getByTestId('kpi-needs-you')).getAllByRole('listitem');
+    // The order of the lines: campaigns, investigations, leads, alert groups.
+    expect(items.map((item) => item.getAttribute('data-testid'))).toEqual([
+      'needs-you-line-campaigns',
+      'needs-you-line-investigations',
+      'needs-you-line-leads',
+      'needs-you-line-alerts',
+    ]);
+  });
+
+  it('states no campaign line for an older server', async () => {
+    vi.mocked(getNeedsYouCount).mockResolvedValue(OLDER);
+    mount();
+    await screen.findByTestId('needs-you-line-leads');
+    expect(screen.queryByTestId('needs-you-line-campaigns')).toBeNull();
+    // The two parts that server summed are the one line of the investigations.
+    expect(screen.getByTestId('needs-you-line-investigations').textContent).toBe(
+      '6 investigations wait on your decision · last 30 days',
     );
+    await waitFor(() => expect(screen.getByTestId('needs-you-total').textContent).toBe('12'));
+  });
+
+  it('opens the Needs you view of Investigations from the investigations line', async () => {
+    mount();
+    const line = await screen.findByTestId('needs-you-line-investigations');
+    expect(within(line).getByRole('link').getAttribute('href')).toBe('/investigations?view=needs_you&range=all');
   });
 
   it('labels the total as the sum of the lines, each with its own scope', async () => {
     mount();
     const total = await screen.findByTestId('needs-you-total');
-    await waitFor(() => expect(total.textContent).toBe('15'));
+    // 3 investigations, 2 leads and 4 alert groups. The 3 hits are not in
+    // the number, and the 5 actions count in their 3 investigations.
+    await waitFor(() => expect(total.textContent).toBe('9'));
+    const lines = within(screen.getByTestId('kpi-needs-you'))
+      .getAllByRole('listitem')
+      .map((item) => Number(item.textContent!.split(' ')[0]));
+    expect(lines.reduce((sum, n) => sum + n, 0)).toBe(9);
     expect(screen.getByTestId('needs-you-total-scope').textContent).toBe(
-      'The sum of the lines below. Each line states its scope.',
+      'The sum of the decision lines below. Each line states its scope.',
     );
   });
 
   it('names every scope when nothing needs the analyst', async () => {
     vi.mocked(getNeedsYouCount).mockResolvedValue({
       ...NEEDS,
+      campaigns: 0,
+      leads_needing_decision: 0,
+      unread_shadow_hits: 0,
+      untriaged_groups: 0,
+      needs_more_info: 0,
+      pending_actions: 0,
+      investigations_waiting: 0,
+      decisions: 0,
+      review: 0,
+      total: 0,
+    });
+    mount();
+    await screen.findByText('Nothing needs you.');
+    expect(screen.getByTestId('needs-you-total-scope').textContent).toBe(
+      'The count covers campaigns and investigations at any age, all open leads, and alert groups of the last 7 days.',
+    );
+  });
+
+  it('names the scopes of an older server when nothing needs the analyst', async () => {
+    vi.mocked(getNeedsYouCount).mockResolvedValue({
+      ...OLDER,
       leads_needing_decision: 0,
       unread_shadow_hits: 0,
       untriaged_groups: 0,
@@ -152,7 +231,7 @@ describe('Needs-you tile scope words', () => {
     mount();
     await screen.findByText('Nothing needs you.');
     expect(screen.getByTestId('needs-you-total-scope').textContent).toBe(
-      'The count covers all open leads, all unread shadow hits, alert groups of the last 7 days, and verdicts and actions of the last 30 days.',
+      'The count covers investigations of the last 30 days, all open leads, and alert groups of the last 7 days.',
     );
   });
 });
@@ -169,13 +248,16 @@ describe('Needs-you tile with no counted line', () => {
       untriaged_groups: null,
       needs_more_info: 0,
       pending_actions: 0,
+      investigations_waiting: 0,
+      decisions: 0,
+      review: 0,
       total: 0,
       unknown: ['untriaged_groups'],
     });
     mount();
     await screen.findByText('Could not count the alert groups. The grid did not answer.');
     expect(screen.getByTestId('needs-you-total-scope').textContent).toBe(
-      'The count covers all open leads, all unread shadow hits, alert groups of the last 7 days, and verdicts and actions of the last 30 days.',
+      'The count covers investigations at any age, all open leads, and alert groups of the last 7 days.',
     );
   });
 });

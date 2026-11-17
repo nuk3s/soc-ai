@@ -136,7 +136,7 @@ async def test_a_fresh_store_has_the_column_with_an_empty_default(
             lambda sc: {c["name"]: c for c in inspect(sc).get_columns("users")}
         )
         head = await conn.execute(text("SELECT version_num FROM alembic_version"))
-        assert head.scalar_one() == "0065"
+        assert head.scalar_one() == "0073"
     assert "tours_state" in cols
     assert cols["tours_state"]["nullable"] is False
     maker = make_sessionmaker(engine)

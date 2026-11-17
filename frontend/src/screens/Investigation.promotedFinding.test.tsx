@@ -87,8 +87,9 @@ const judged = (): Inv => inv({ subject: { ...inv().subject!, judges: 'finding' 
 describe('an investigation that judges one finding', () => {
   it('names the finding as the subject when the run judges it', () => {
     mount(judged());
+    // K3: the finding by its number and title, with no code label.
     expect(screen.getByTestId('promoted-finding').textContent).toContain(
-      'Subject: F2, HTTP service executes id command as root',
+      'Finding 2: HTTP service executes id command as root',
     );
     expect(screen.getByText('Context: hunt').getAttribute('title')).toBe(SUBJECT_HUNT_CONTEXT);
     expect(screen.queryByText('Subject: hunt')).toBeNull();
@@ -118,10 +119,10 @@ describe('an investigation that judges one finding', () => {
       }),
     );
     expect(screen.getByTestId('promoted-finding').textContent).toBe(
-      'Subject: F2, HTTP service executes id command as root',
+      'Finding 2: HTTP service executes id command as root',
     );
     expect(screen.getByTestId('verdict-subject').textContent).toBe(
-      'F2, HTTP service executes id command as root',
+      'Finding 2: HTTP service executes id command as root',
     );
     expect(screen.getByTestId('verdict-subject').getAttribute('title')).toBe(SUBJECT_FINDING);
     expect(screen.getByTestId('subject-promoted').textContent).toBe('subject');
@@ -136,7 +137,7 @@ describe('a promoted investigation', () => {
     // A legacy row: no `judges` key. The run judged the whole hunt.
     mount(inv());
     const panel = screen.getByTestId('promoted-finding');
-    expect(panel.textContent).toContain('Promoted finding: F2, HTTP service executes id command as root');
+    expect(panel.textContent).toContain('Promoted finding 2: HTTP service executes id command as root');
     expect(screen.getByText('Subject: hunt').getAttribute('title')).toBe(CHIP_SUBJECT_HUNT);
     expect(screen.getByTestId('subject-promoted').textContent).toBe('promoted');
     expect(screen.getByTestId('verdict-subject').getAttribute('title')).toBe(SUBJECT_OBJECTIVE);
@@ -146,7 +147,7 @@ describe('a promoted investigation', () => {
     ]);
     expect(within(screen.getByTestId('promoted-evidence')).getAllByRole('button').length).toBe(2);
     expect(screen.getByTestId('verdict-subject').textContent).toBe(
-      'F2, HTTP service executes id command as root',
+      'Promoted finding 2: HTTP service executes id command as root',
     );
     expect(screen.getByTestId('subject-promoted')).toBeTruthy();
   });

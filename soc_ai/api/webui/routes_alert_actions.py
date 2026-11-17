@@ -27,6 +27,7 @@ from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.store import assignments as assign_svc
 from soc_ai.store import escalations as esc_svc
 from soc_ai.store import investigations as inv_svc
+from soc_ai.tools.escalate_to_case import fit_case_title
 from soc_ai.tools.write_exec import execute_write_tool
 from soc_ai.webui import alerts_query as aq
 from soc_ai.webui import anchor_check
@@ -448,7 +449,7 @@ async def _escalate_many(
                 "escalate_to_case",
                 {
                     "alert_id": ev.es_id,
-                    "case_title": f"{rule_name}"[:120] or "Escalated alert",
+                    "case_title": fit_case_title(f"{rule_name}") or "Escalated alert",
                     "case_description": (
                         f"Escalated from soc-ai: {rule_name}"
                         + (f" ({endpoints})" if endpoints else "")

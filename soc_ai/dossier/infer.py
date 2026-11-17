@@ -466,10 +466,15 @@ class _PortObservation:
     ``peers``, ``hours``) so the classifier improves the moment the collector
     can supply them: an ``answered`` filter sub-agg on ``fields.CONN_STATE`` (or
     ``resp_bytes > 0``), a ``source.ip`` cardinality, and an hourly
-    date_histogram, all nested under the responder ``ports`` terms agg. Until
-    then the host-wide fallbacks below are what stands between a port scan and a
-    role, and they are coarse: they can only see whether the host answered
-    ANYTHING, not what it answered on.
+    date_histogram, all nested under the responder ``ports`` terms agg.
+
+    The collector supplies ``answered`` for a PROBED port, as 0: each flow
+    record to the port is a TCP record that shows no answer or a refusal
+    (``soc_ai.dossier.observe._port_pairs``). For every other port the key is
+    absent, and the host-wide fallbacks below still decide. They are coarse:
+    they can only see whether the host answered ANYTHING, not what it answered
+    on. One Nmap sweep passed them, because its records held no responder byte
+    field and the byte percentile was not measured.
     """
 
     port: int

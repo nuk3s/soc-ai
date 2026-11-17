@@ -9,7 +9,10 @@ import {
   moreEntityWords,
   kindCount,
   leadHuntLabel,
-  leadWhySentence,
+  leadHuntSentence,
+  leadSeenSentence,
+  leadStateSentence,
+  leadWaitSentence,
   runTime,
   staleHuntSentence,
 } from './leadWords';
@@ -30,12 +33,12 @@ describe('entityCountWords (K6)', () => {
   });
 });
 
-describe('leadWhySentence', () => {
+describe('leadSeenSentence', () => {
   const obs = (kind: string, at: string) => ({ kind, born_at: at, observed_at: at, evidence: null });
 
-  it('counts by type in the order the types appear', () => {
+  it('counts by type in the order the types appear, and names the account', () => {
     expect(
-      leadWhySentence({
+      leadSeenSentence({
         entities: [['user', 'domainadmin']],
         kinds: ['catalog_match'],
         observations: [
@@ -44,13 +47,28 @@ describe('leadWhySentence', () => {
           obs('catalog_match', '2026-10-06T00:30:00Z'),
         ],
       }),
-    ).toBe('Why this is a lead: 2 analytic matches and 1 triaged alert on one account in 3 hours.');
+    ).toBe('soc-ai saw 2 analytic matches and 1 triaged alert on the account domainadmin in 3 hours.');
+  });
+
+  it('names the machine and its address, and counts the other entities', () => {
+    const lead = {
+      entities: [['host', '192.0.2.33']],
+      kinds: ['above_baseline'],
+      observations: [obs('above_baseline', '2026-10-06T03:00:00Z')],
+    };
+    expect(leadSeenSentence(lead, 'adguard2')).toBe(
+      'soc-ai saw 1 rate spike on adguard2 at 192.0.2.33 in 1 hour.',
+    );
+    expect(leadSeenSentence(lead)).toBe('soc-ai saw 1 rate spike on 192.0.2.33 in 1 hour.');
+    expect(
+      leadSeenSentence({ ...lead, entities: [['host', '192.0.2.33'], ['host', 'b'], ['user', 'u']] }),
+    ).toBe('soc-ai saw 1 rate spike on 192.0.2.33 in 1 hour. The lead also names 1 host and 1 account.');
   });
 
   it('says what formed a lead whose observations are gone', () => {
     expect(
-      leadWhySentence({ entities: [['host', '192.0.2.1']], kinds: ['alert'], observations: [] }),
-    ).toBe('Why this is a lead: it formed from triaged alerts on one host.');
+      leadSeenSentence({ entities: [['host', '192.0.2.1']], kinds: ['alert'], observations: [] }),
+    ).toBe('This lead formed from triaged alerts on 192.0.2.1.');
   });
 
   // Negative control: a type the table does not name still counts.
@@ -239,6 +257,128 @@ describe('moreEntityWords (R3 STE 7)', () => {
     expect(moreEntityWords([['user', 'u']])).toBe('1 more account');
     expect(moreEntityWords([['host', 'a'], ['host', 'b'], ['user', 'u']])).toBe(
       '3 more: 2 hosts and 1 account',
+    );
+  });
+});
+
+// F5 (production review 2026-11-12). The lead page gave the decision in
+// pieces: a pill, a helper line about a hunt that had already run, two
+// banners and a weight behind a toggle. One line now states what the hunt
+// concluded and what the lead waits on.
+describe('leadHuntSentence', () => {
+  const NOW = Date.parse('2026-11-12T12:00:00Z');
+  const hunt = (over: Record<string, unknown>) => ({
+    status: 'complete',
+    outcome: 'clean',
+    started_at: '2026-10-04T12:00:00Z',
+    ...over,
+  });
+
+  it('states when the newest hunt ran and what it found', () => {
+    expect(leadHuntSentence({ hunts: [hunt({})] }, NOW)).toBe(
+      'The newest hunt ran 39 days ago and found no threat.',
+    );
+    expect(leadHuntSentence({ hunts: [hunt({ outcome: 'threats' })] }, NOW)).toBe(
+      'The newest hunt ran 39 days ago and found a threat.',
+    );
+    expect(leadHuntSentence({ hunts: [hunt({ outcome: 'threats_confirmed' })] }, NOW)).toBe(
+      'The newest hunt ran 39 days ago and confirmed a threat.',
+    );
+    expect(leadHuntSentence({ hunts: [hunt({ outcome: 'gap' })] }, NOW)).toBe(
+      'The newest hunt ran 39 days ago. It found no threat and reported a visibility gap.',
+    );
+  });
+
+  it('states that no hunt ran', () => {
+    expect(leadHuntSentence({ hunts: [] }, NOW)).toBe('No hunt ran on this lead.');
+  });
+
+  it('keeps an earlier threat beside a newer clean hunt', () => {
+    expect(leadHuntSentence({ hunts: [hunt({})], hunt_threat_count: 1 }, NOW)).toBe(
+      'The newest hunt ran 39 days ago and found no threat. An earlier hunt found a threat.',
+    );
+  });
+
+  // Negative controls: a hunt with no result claims none.
+  it('claims no result for a hunt that runs or that could not run', () => {
+    expect(leadHuntSentence({ hunts: [hunt({ status: 'running', outcome: '' })] }, NOW)).toBe(
+      'A hunt runs on this lead now.',
+    );
+    expect(leadHuntSentence({ hunts: [hunt({ status: 'investigating', outcome: 'threats' })] }, NOW)).toBe(
+      'The newest hunt investigates its findings now.',
+    );
+    expect(leadHuntSentence({ hunts: [hunt({ status: 'error', outcome: 'failed' })] }, NOW)).toBe(
+      'The newest hunt could not run.',
+    );
+    expect(leadHuntSentence({ hunts: [hunt({ outcome: 'no_answer' })] }, NOW)).toBe(
+      'The newest hunt ran 39 days ago and gave no answer.',
+    );
+  });
+
+  it('reads the lead record when the server names no hunt list', () => {
+    expect(
+      leadHuntSentence({ hunt_id: 'H', hunt_status: 'complete', hunt_outcome: 'clean' }, NOW),
+    ).toBe('The newest hunt found no threat.');
+    expect(leadHuntSentence({ hunt_id: null }, NOW)).toBe('No hunt ran on this lead.');
+  });
+});
+
+describe('leadWaitSentence', () => {
+  it('names who holds the next move in each state', () => {
+    expect(leadWaitSentence({ state: 'new' })).toBe(
+      'The lead waits on your decision: hunt it or dismiss it.',
+    );
+    expect(leadWaitSentence({ state: 'new', queued: true })).toBe(
+      'The lead waits on auto-hunt. Its hunt starts within a minute.',
+    );
+    expect(leadWaitSentence({ state: 'in_progress' })).toBe('The lead waits on the hunt.');
+    expect(leadWaitSentence({ state: 'hunted' })).toBe(
+      'The lead waits on your decision: dismiss it or hunt again.',
+    );
+    expect(leadWaitSentence({ state: 'hunted', verdictToDecide: true })).toBe(
+      'The lead waits on your decision: close it on the investigation or keep it open.',
+    );
+    expect(leadWaitSentence({ state: 'fleet_condition' })).toBe(
+      'The lead is a fleet condition. It waits on no decision.',
+    );
+  });
+
+  it('says a closed lead waits on nothing, and who closed it', () => {
+    expect(leadWaitSentence({ state: 'dismissed' })).toBe(
+      'An analyst dismissed the lead. It waits on nothing.',
+    );
+    expect(leadWaitSentence({ state: 'dismissed', closedBySocAi: true })).toBe(
+      'soc-ai closed the lead. It waits on nothing.',
+    );
+    expect(leadWaitSentence({ state: 'promoted' })).toBe(
+      'An investigation closed the lead. It waits on nothing.',
+    );
+    expect(leadWaitSentence({ state: 'promoted', closedBySocAi: true })).toBe(
+      'soc-ai closed the lead. It waits on nothing.',
+    );
+  });
+});
+
+describe('leadStateSentence', () => {
+  it('is the three sentences in order: seen, hunt, wait', () => {
+    const NOW = Date.parse('2026-11-12T12:00:00Z');
+    expect(
+      leadStateSentence(
+        {
+          entities: [['host', '192.0.2.33']],
+          kinds: ['above_baseline'],
+          observations: [
+            { kind: 'above_baseline', born_at: '2026-10-06T03:00:00Z', observed_at: '2026-10-06T03:00:00Z', evidence: null },
+          ],
+          hunts: [{ status: 'complete', outcome: 'clean', started_at: '2026-10-04T12:00:00Z' }],
+        },
+        { state: 'hunted', machineName: 'adguard2' },
+        NOW,
+      ),
+    ).toBe(
+      'soc-ai saw 1 rate spike on adguard2 at 192.0.2.33 in 1 hour. ' +
+        'The newest hunt ran 39 days ago and found no threat. ' +
+        'The lead waits on your decision: dismiss it or hunt again.',
     );
   });
 });

@@ -55,7 +55,19 @@ class DetectionNominationOut(BaseModel):
     prior_unchecked: int = 0
     prior_suspended: bool = False
     # Why the prior held back on the newest alert of the rule it did not cover.
+    # The console states each reason in words (frontend/src/lib/tooltips.ts,
+    # RULE_PRIOR_REASON). ``external_endpoint_new``: the external address is
+    # new for the rule on the internal machine. ``campaign_machine``: an
+    # address belongs to a machine of an open campaign.
     prior_last_reason: str | None = None
+    # The covered alerts and the disagreements split by safeguard 1: both
+    # addresses internal (``covered``), or one external address that two or
+    # more false positives of the rule on the same internal machine already
+    # had (``covered_known_external``).
+    prior_covered_internal: int = 0
+    prior_covered_known_external: int = 0
+    prior_disagreements_internal: int = 0
+    prior_disagreements_known_external: int = 0
 
 
 class DetectionOverrideOut(BaseModel):
@@ -73,6 +85,11 @@ class DetectionOverrideOut(BaseModel):
 class DetectionTuningOut(BaseModel):
     nominations: list[DetectionNominationOut]
     overrides: list[DetectionOverrideOut]
+    # The window of the alert volume, and every alert event of the feed in it.
+    # The panel states the share of the window that the mute suggestions
+    # produce. Null when the grid answered no total.
+    window: str = "7d"
+    alert_total: int | None = None
 
 
 class DetectionOverrideIn(BaseModel):
@@ -95,7 +112,7 @@ def _override_out(row: Any) -> DetectionOverrideOut:
     )
 
 
-async def _nominate(request: Request, settings: Settings) -> list[dict[str, Any]]:
+async def _nominate(request: Request, settings: Settings) -> Any:
     """Nominate noisy rules, answering a degraded grid instead of crashing on it.
 
     Nominating reads the grid, so it carries the alert routes' failure modes and
@@ -128,7 +145,7 @@ async def _nominate(request: Request, settings: Settings) -> list[dict[str, Any]
 
     try:
         async with asyncio.timeout(settings.webui_grid_timeout_s):
-            return await dt.nominate(request.app.state)
+            return await dt.nominate_page(request.app.state)
     except (TimeoutError, TransportError) as exc:
         raise HTTPException(status_code=503, detail=_grid_unavailable(exc)) from exc
     except ApiError as exc:
@@ -151,7 +168,8 @@ async def get_detection_tuning(
     operator's active soft mutes. A mute hides a rule from the default alerts feed
     — it never touches Security Onion.
     """
-    nominations = await _nominate(request, settings)
+    page = await _nominate(request, settings)
+    nominations = page.nominations
     async with request.app.state.db_sessionmaker() as db:
         overrides = await override_svc.list_active(db)
         prior = await rule_prior_store.stats_by_rule(db, [n["rule_name"] for n in nominations])
@@ -161,6 +179,8 @@ async def get_detection_tuning(
             for n in nominations
         ],
         overrides=[_override_out(o) for o in overrides],
+        window=page.window,
+        alert_total=page.alert_total,
     )
 
 
@@ -174,6 +194,10 @@ def _prior_fields(stats: rule_prior_store.RulePriorStats | None) -> dict[str, An
         "prior_unchecked": stats.unchecked,
         "prior_suspended": stats.suspended,
         "prior_last_reason": stats.last_reason,
+        "prior_covered_internal": stats.covered_internal,
+        "prior_covered_known_external": stats.covered_known_external,
+        "prior_disagreements_internal": stats.disagreements_internal,
+        "prior_disagreements_known_external": stats.disagreements_known_external,
     }
 
 
@@ -288,7 +312,7 @@ async def get_detection_tuning_summary(
 
     Degraded-grid behaviour lives in :func:`_nominate`, shared with the list route.
     """
-    nominations = await _nominate(request, settings)
+    nominations = (await _nominate(request, settings)).nominations
     pending = sum(
         1 for n in nominations if n.get("recommendation") == "mute" and not n.get("already_muted")
     )

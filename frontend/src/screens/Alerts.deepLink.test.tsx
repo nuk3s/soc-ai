@@ -73,7 +73,9 @@ describe('Alerts deep-link seeding', () => {
 
   it('leaves the Verdict filter open when the param is absent', async () => {
     mount('/alerts');
-    expect(await screen.findByText('Verdict')).toBeTruthy();
+    // The filter trigger, and no count beside its label. The sort menu also
+    // holds the word "Verdict", as an option.
+    expect(await screen.findByRole('button', { name: 'Verdict' })).toBeTruthy();
   });
 
   it('seeds the time range from ?range= so the Dashboard window survives', async () => {

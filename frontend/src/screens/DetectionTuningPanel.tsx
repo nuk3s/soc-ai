@@ -12,6 +12,8 @@ import { OracleShadowTally } from './OracleShadowTally';
 import { ErrorState, LoadingState } from '../components/States';
 import {
   RULE_PRIOR_COLUMN,
+  RULE_PRIOR_INTERNAL,
+  RULE_PRIOR_KNOWN_EXTERNAL,
   RULE_PRIOR_REASON,
   RULE_PRIOR_SUSPENDED,
   RULE_PRIOR_UNCHECKED,
@@ -22,10 +24,33 @@ import { useAsync } from '../lib/useAsync';
 // columns cannot drift apart.
 const NOMINATION_COLS = 'grid-cols-[1fr_80px_150px_170px_110px_90px]';
 
+/** One line of the split of the covered alerts: the covers and the disagreements. */
+function PriorSplitLine({
+  label,
+  covered,
+  disagree,
+  tip,
+  testId,
+}: {
+  label: string;
+  covered: number;
+  disagree: number;
+  tip: string;
+  testId: string;
+}) {
+  return (
+    <div data-testid={testId} title={tip} className="font-mono text-faint">
+      {label}: covered {covered} · disagree{' '}
+      <span className={disagree > 0 ? 'text-danger' : undefined}>{disagree}</span>
+    </div>
+  );
+}
+
 /**
  * The Rule prior cell: what the rule prior did on this rule. Covered alerts
- * and the real verdicts beside them; a suspension with its Clear button; or,
- * when it covered nothing, why it held back on the newest alert.
+ * and the real verdicts beside them, split into two internal addresses and a
+ * known external address; a suspension with its Clear button; or, when it
+ * covered nothing, why it held back on the newest alert.
  */
 function RulePriorCell({
   n,
@@ -41,19 +66,42 @@ function RulePriorCell({
   const disagree = n.prior_disagreements ?? 0;
   const unchecked = n.prior_unchecked ?? 0;
   const reason = n.prior_last_reason ? RULE_PRIOR_REASON[n.prior_last_reason] : undefined;
+  // An older backend sends no split. The cell then shows the totals only.
+  const split =
+    n.prior_covered_internal !== undefined || n.prior_covered_known_external !== undefined;
   return (
     <div data-testid={`rule-prior-${n.rule_name}`} className="min-w-0 text-[11px] leading-[1.45]">
       {covered > 0 ? (
-        <div className="font-mono text-dim">
-          covered {covered} · agree {agree} · disagree{' '}
-          <span className={disagree > 0 ? 'text-danger' : undefined}>{disagree}</span>
-          {unchecked > 0 && (
-            <span title={RULE_PRIOR_UNCHECKED} className="text-faint">
-              {' '}
-              · {unchecked} unchecked
-            </span>
+        <>
+          <div className="font-mono text-dim">
+            covered {covered} · agree {agree} · disagree{' '}
+            <span className={disagree > 0 ? 'text-danger' : undefined}>{disagree}</span>
+            {unchecked > 0 && (
+              <span title={RULE_PRIOR_UNCHECKED} className="text-faint">
+                {' '}
+                · {unchecked} unchecked
+              </span>
+            )}
+          </div>
+          {split && (
+            <>
+              <PriorSplitLine
+                label="internal"
+                covered={n.prior_covered_internal ?? 0}
+                disagree={n.prior_disagreements_internal ?? 0}
+                tip={RULE_PRIOR_INTERNAL}
+                testId={`rule-prior-internal-${n.rule_name}`}
+              />
+              <PriorSplitLine
+                label="known external"
+                covered={n.prior_covered_known_external ?? 0}
+                disagree={n.prior_disagreements_known_external ?? 0}
+                tip={RULE_PRIOR_KNOWN_EXTERNAL}
+                testId={`rule-prior-external-${n.rule_name}`}
+              />
+            </>
           )}
-        </div>
+        </>
       ) : (
         <div className="text-faint" title={reason}>
           {reason ? `not covered: ${reason}` : 'not covered'}
@@ -81,11 +129,47 @@ function RulePriorCell({
   );
 }
 
-/** Color + label for a tuning recommendation. */
+/** Color + label for a tuning recommendation. A mute suggestion is routine
+ *  housekeeping: red marks a confirmed threat or a failed write only (review
+ *  2026-11-12), so the suggestion wears the accent. */
 function recBadge(rec: DetectionNomination['recommendation']): { color: string; label: string } {
-  if (rec === 'mute') return { color: '#f04438', label: 'Mute' };
+  if (rec === 'mute') return { color: '#4b8bf5', label: 'Mute' };
   if (rec === 'monitor') return { color: '#f5a623', label: 'Monitor' };
   return { color: '#8b949e', label: 'None' };
+}
+
+/** The rules the next step mutes: a mute suggestion, not muted yet, and no
+ *  true positive. */
+export function muteCandidates(nominations: DetectionNomination[]): DetectionNomination[] {
+  return nominations.filter((n) => n.recommendation === 'mute' && !n.already_muted && n.tp === 0);
+}
+
+/** The window words: "7d" reads "the last 7 days". */
+function windowWords(window: string | undefined): string {
+  const m = (window ?? '7d').match(/^(\d+)([dh])$/);
+  if (!m) return 'this window';
+  const n = Number(m[1]);
+  const unit = m[2] === 'd' ? 'day' : 'hour';
+  return n === 1 ? `the last ${unit}` : `the last ${n} ${unit}s`;
+}
+
+/** The one next step of the panel: "25 rules produce 62% of the alert events
+ *  of the last 7 days and no true positive." Null when no rule waits. */
+export function nextStepSentence(
+  nominations: DetectionNomination[],
+  alertTotal: number | null | undefined,
+  window: string | undefined,
+): string | null {
+  const rules = muteCandidates(nominations);
+  if (rules.length === 0) return null;
+  const events = rules.reduce((sum, n) => sum + n.alert_count, 0);
+  const who = rules.length === 1 ? '1 rule produces' : `${rules.length} rules produce`;
+  const when = windowWords(window);
+  if (alertTotal && alertTotal > 0) {
+    const share = Math.min(100, Math.round((events / alertTotal) * 100));
+    return `${who} ${share}% of the alert events of ${when} and no true positive.`;
+  }
+  return `${who} ${events.toLocaleString()} alert events of ${when} and no true positive.`;
 }
 
 /**
@@ -126,6 +210,7 @@ export function DetectionTuningPanel({
   const { data, loading, error } = useAsync(getDetectionTuning, [nonce]);
   const [actionError, setActionError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [confirmAll, setConfirmAll] = useState(false);
 
   const nominations = data?.nominations ?? [];
   const overrides = data?.overrides ?? [];
@@ -174,6 +259,64 @@ export function DetectionTuningPanel({
         <div className="mb-2 text-[12px] text-danger">{actionError}</div>
       )}
 
+      {/* L3: one next step above the table. The panel showed "37 · 25 MUTE
+          SUGGESTIONS" and one Mute for each row, and no line said what the
+          25 cost or how to act on them (review 2026-11-12). */}
+      {overridesKnown && nextStepSentence(nominations, data?.alert_total, data?.window) && (
+        <div
+          data-testid="tuning-next-step"
+          className="mb-3 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-card border border-border bg-surface-1 px-3.5 py-2.5 text-[12.5px] text-text-2"
+        >
+          <span className="min-w-0 flex-1">
+            {nextStepSentence(nominations, data?.alert_total, data?.window)}
+          </span>
+          {confirmAll ? (
+            <span className="flex flex-wrap items-center gap-2" data-testid="tuning-mute-confirm">
+              <span className="text-dim">
+                {`Mute ${muteCandidates(nominations).length} rules? A mute hides their alerts from the default feed. It never changes Security Onion.`}
+              </span>
+              <button
+                type="button"
+                data-testid="tuning-mute-all-confirm"
+                disabled={busy}
+                onClick={() => {
+                  const rules = muteCandidates(nominations);
+                  setConfirmAll(false);
+                  // One request for each rule, in order. A failed request
+                  // stops the run and names itself.
+                  mutate(
+                    rules.reduce<Promise<unknown>>(
+                      (chain, n) => chain.then(() => muteRule(n.rule_name, n.reason)),
+                      Promise.resolve(),
+                    ),
+                  );
+                }}
+                className="flex-none rounded-[7px] border border-accent bg-[rgba(75,139,245,.14)] px-[11px] py-[5px] text-[11.5px] font-semibold text-text hover:bg-[rgba(75,139,245,.22)] disabled:opacity-40"
+              >
+                {`Mute ${muteCandidates(nominations).length} rules`}
+              </button>
+              <button
+                type="button"
+                onClick={() => setConfirmAll(false)}
+                className="flex-none rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-[5px] text-[11.5px] font-semibold text-text-2 hover:text-text"
+              >
+                Cancel
+              </button>
+            </span>
+          ) : (
+            <button
+              type="button"
+              data-testid="tuning-mute-all"
+              disabled={busy}
+              onClick={() => setConfirmAll(true)}
+              className="flex-none rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-[5px] text-[11.5px] font-semibold text-text hover:border-accent disabled:opacity-40"
+            >
+              {muteCandidates(nominations).length === 1 ? 'Mute this rule' : `Mute these ${muteCandidates(nominations).length} rules`}
+            </button>
+          )}
+        </div>
+      )}
+
       {/* ── Nominations ──────────────────────────────────────────────────── */}
       {/* The count matches the Dashboard nudge, which names both numbers
           (D10). Unknown until a load lands, for the reason given above. */}
@@ -186,7 +329,7 @@ export function DetectionTuningPanel({
       <div className="mb-4 overflow-hidden rounded-card border border-border bg-surface-1">
         <div className={`grid ${NOMINATION_COLS} gap-2 border-b border-border bg-surface-2 px-3.5 py-2 text-[10.5px] font-semibold uppercase tracking-[.06em] text-faint`}>
           <div>Rule</div>
-          <div>Alerts</div>
+          <div title="The alert events of the rule in the window of the panel.">{`Alerts · ${data?.window ?? '7d'}`}</div>
           <div title="False positive, true positive and needs more info verdicts on the rule.">
             FP / TP / Needs more info
           </div>
@@ -228,7 +371,7 @@ export function DetectionTuningPanel({
                     </div>
                   )}
                 </div>
-                <div className="font-mono text-[12px] text-dim">{n.alert_count}</div>
+                <div className="font-mono text-[12px] text-dim">{n.alert_count.toLocaleString()}</div>
                 <div className="font-mono text-[11.5px] text-dim">
                   {n.fp} / {n.tp} / {n.nmi}
                 </div>
@@ -305,8 +448,7 @@ export function DetectionTuningPanel({
               <button
                 onClick={() => mutate(unmuteRule(o.id))}
                 disabled={busy}
-                className="flex-none rounded-[7px] border px-[11px] py-[5px] text-[11.5px] font-semibold text-danger hover:bg-[rgba(240,68,56,.12)] disabled:cursor-not-allowed disabled:opacity-40"
-                style={{ borderColor: 'rgba(240,68,56,.3)' }}
+                className="flex-none rounded-[7px] border border-border-strong bg-surface-3 px-[11px] py-[5px] text-[11.5px] font-semibold text-text hover:border-accent disabled:cursor-not-allowed disabled:opacity-40"
               >
                 Un-mute
               </button>

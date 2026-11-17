@@ -34,6 +34,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
   clearHostChat: vi.fn(),
   getObservations: vi.fn(),
   getLeads: vi.fn(),
+  getThreats: vi.fn(),
 }));
 
 import {
@@ -46,11 +47,13 @@ import {
   getMachine,
   getMe,
   getObservations,
+  getThreats,
   resolveMachine,
 } from '../lib/api';
 import { rememberListUrl } from '../lib/hostsList';
 import { ShellProvider, useShell } from '../shell/ShellContext';
 import { HostDetail } from './HostDetail';
+import { HOST_CAMPAIGNS, THREAT_CAMPAIGN } from '../test/campaign';
 import { WithChat } from '../test/chatHarness';
 
 const PRIMARY = '192.0.2.10';
@@ -190,6 +193,9 @@ beforeEach(() => {
   vi.mocked(getHostChat).mockReset().mockResolvedValue({ messages: [], pending: false });
   vi.mocked(getObservations).mockReset().mockResolvedValue({ entity: PRIMARY, days: 7, observations: [] });
   vi.mocked(getLeads).mockReset().mockResolvedValue([]);
+  vi.mocked(getThreats)
+    .mockReset()
+    .mockResolvedValue({ window: { since: '', until: '' }, rows: [], authorized: [], total: 0 });
 });
 
 function Probe() {
@@ -528,5 +534,98 @@ describe('HostDetail: the top bar name', () => {
     await waitFor(() =>
       expect(screen.getByTestId('crumb-name').textContent).toBe(`agent:ea2d=${PRIMARY}`),
     );
+  });
+});
+
+// Review 2026-11-12 (ui-hunt 7): the page of an attacked host answered "what
+// is it" and "what is covered", and not "what do I do".
+describe('HostDetail: the confirmed threats strip', () => {
+  const threatRow = {
+    target: { address: PRIMARY, name: 'files01', role: 'server', machineKey: 'agent:ea2d' },
+    direction: 'inbound' as const,
+    headline: 'An exploit chain ran against the file server and opened a shell.',
+    impact: 'succeeded' as const,
+    runs: 42,
+    alertRuns: 37,
+    findingRuns: 5,
+    sources: [{ address: '203.0.113.7', name: null }],
+    sourcesMore: 2,
+    rules: ['ET EXPLOIT Example RCE'],
+    rulesMore: 0,
+    firstSeen: new Date(Date.now() - 5 * 86_400_000).toISOString(),
+    lastSeen: new Date(Date.now() - 3_600_000).toISOString(),
+    waitingActions: 3,
+    newestInvestigationId: 'inv-42',
+    investigationsHref: '/investigations?entity=agent%3Aea2d&verdict=true_positive',
+  };
+
+  it('states the threat of the host under the header, with its waiting action', async () => {
+    vi.mocked(getThreats).mockResolvedValue({ window: { since: '', until: '' }, rows: [threatRow], authorized: [], total: 42 });
+    mount(['/hosts/agent%3Aea2d']);
+    const strip = await screen.findByTestId('host-threats');
+    expect(within(strip).getByTestId('host-threats-count').textContent).toBe(
+      'This host has 42 true positive investigations in the last 30 days.',
+    );
+    expect(within(strip).getByTestId('impact-chip').textContent).toBe('Succeeded');
+    expect(strip.textContent).toContain(threatRow.headline);
+    expect(within(strip).getByTestId('host-threats-primary').textContent).toBe('3 actions wait');
+    // The read names the machine key and 30 days.
+    const q = vi.mocked(getThreats).mock.calls[0][0];
+    expect(q.host).toBe('agent:ea2d');
+    expect(Math.abs(Date.now() - Date.parse(q.since) - 30 * 86_400_000)).toBeLessThan(60_000);
+    // The strip sits under the header and above the investigations.
+    const hero = screen.getByTestId('hero-name');
+    expect(hero.compareDocumentPosition(strip) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    const invs = await screen.findByTestId('host-investigations-title');
+    expect(strip.compareDocumentPosition(invs) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it('shows no strip when the host has no row', async () => {
+    mount(['/hosts/agent%3Aea2d']);
+    await screen.findByTestId('host-addresses');
+    await waitFor(() => expect(getThreats).toHaveBeenCalled());
+    expect(screen.queryByTestId('host-threats')).toBeNull();
+    expect(screen.queryByTestId('confirmed-threats-error')).toBeNull();
+  });
+});
+
+// The campaign is the unit of work (owner, 2026-11-14). The host page names
+// the campaigns of the machine directly under the header.
+describe('HostDetail: the campaigns of the machine', () => {
+  it('lists the campaigns under the header, with the state of each decision', async () => {
+    vi.mocked(getMachine).mockResolvedValue({
+      ...MACHINE,
+      campaigns: [{ ...HOST_CAMPAIGNS[0], decision: null, waitsSince: '2026-10-24T00:40:00Z' }, HOST_CAMPAIGNS[1]],
+    });
+    vi.mocked(getThreats).mockResolvedValue({
+      window: { since: '', until: '' },
+      campaigns: [THREAT_CAMPAIGN],
+      rows: [],
+      authorized: [],
+      total: 25,
+    });
+    mount(['/hosts/agent%3Aea2d']);
+    const strip = await screen.findByTestId('host-campaigns');
+    const lines = within(strip).getAllByTestId('host-campaign');
+    expect(lines).toHaveLength(2);
+    expect(within(lines[0]).getByRole('link', { name: 'actor-a against web-1' })).toHaveAttribute('href', '/campaigns/7');
+    expect(within(lines[0]).getByTestId('host-campaign-role').textContent).toBe('Target');
+    // The campaign waits on the analyst: the chip states it. The authorized
+    // investigations come from the confirmed threats of the host.
+    expect(within(lines[0]).getByTestId('campaign-decision-chip')).toHaveTextContent('Waits on you');
+    expect(await within(lines[0]).findByTestId('host-campaign-authorized')).toHaveTextContent('4 authorized');
+    expect(within(lines[0]).queryByTestId('host-campaign-waiting')).toBeNull();
+    const hero = screen.getByTestId('hero-name');
+    expect(hero.compareDocumentPosition(strip) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // Every true positive of the host is in a campaign: no host threat strip.
+    expect(screen.queryByTestId('host-threats')).toBeNull();
+  });
+
+  // NEGATIVE CONTROL. A machine in no campaign, and a server of an earlier
+  // release, show no campaign strip.
+  it('shows no campaign strip for a machine in no campaign', async () => {
+    mount(['/hosts/agent%3Aea2d']);
+    await screen.findByTestId('host-addresses');
+    expect(screen.queryByTestId('host-campaigns')).toBeNull();
   });
 });

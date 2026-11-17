@@ -19,6 +19,7 @@ import { Checkbox } from '../components/Controls';
 import { Definition } from '../components/Definition';
 import { GridGapStrip } from '../components/GridGapStrip';
 import { FLOW_PARAM, FlowLink, HowThisFlowsDrawer } from '../components/HowThisFlows';
+import { HuntDegradedChip } from '../components/HuntDegradedChip';
 import { ListToolbar } from '../components/ListToolbar';
 import { scrollIntoViewSettled } from '../lib/scrollSettled';
 import { useTabTitle } from '../lib/useTabTitle';
@@ -46,7 +47,7 @@ import {
   updateHuntSchedule,
 } from '../lib/api';
 import type { HuntKindTotals, HuntSchedule, HuntScheduleList, Lead } from '../lib/api';
-import { huntOutcome, outcomeLabel, outcomeMeta, statusDetail, statusMeta } from '../lib/labels';
+import { huntOutcome, huntOutcomeText, outcomeLabel, outcomeMeta, statusDetail, statusMeta } from '../lib/labels';
 import { HUNT_KIND } from '../lib/tokens';
 import {
   STATUS_COMPLETE,
@@ -54,6 +55,7 @@ import {
   STATUS_RUNNING,
   TYPE_ALL,
   TYPE_CATALOG,
+  TYPE_CAMPAIGN,
   TYPE_LEAD,
   TYPE_MANUAL,
   TYPE_SCHEDULE,
@@ -64,9 +66,12 @@ import type { HuntKind, HuntRehuntResult, HuntRow, HuntStatus, SavedViewQuery } 
 import { LeadsStrip } from '../components/LeadsStrip';
 import { ANALYTIC_FILTER_PARAMS, AnalyticsPanel } from '../components/AnalyticsPanel';
 import { AnalyticHits } from '../components/AnalyticHits';
+import { AuthorizedActivityCards } from '../components/AuthorizedActivityCards';
 import { NeedsYouStrip } from '../components/NeedsYouStrip';
+import { RecentConfirmedThreats } from '../components/ConfirmedThreats';
 import { NewHuntDrawer } from '../components/NewHuntDrawer';
-import { getAnalytics, type AnalyticsList } from '../lib/api';
+import { getAnalytics, getHuntCatalog, type AnalyticsList, type HuntCatalog } from '../lib/api';
+import { liveCoverage, liveCoverageWords } from '../lib/analyticRuns';
 
 // The two tabs of this screen. Hunts is what an analyst started. Analytics is
 // the detection logic those hunts and the sweeps run.
@@ -85,10 +90,17 @@ function tabClass(active: boolean): string {
 // for. A status with no analytics is left out: a standing zero says nothing.
 const ANALYTIC_STATUS_WORDS = ['live', 'shadow', 'candidate', 'retired'] as const;
 
-function analyticsCountLine(list: AnalyticsList | null): string | null {
+export function analyticsCountLine(
+  list: AnalyticsList | null,
+  catalog?: HuntCatalog | null,
+): string | null {
   if (!list) return null;
-  const parts = ANALYTIC_STATUS_WORDS.filter((w) => (list.counts[w] ?? 0) > 0).map(
-    (w) => `${list.counts[w]} ${w}`,
+  // L5: the live count states how the live analytics ran, from the run state
+  // each row shows: "15 live (4 measuring, 11 blind)".
+  const parts = ANALYTIC_STATUS_WORDS.filter((w) => (list.counts[w] ?? 0) > 0).map((w) =>
+    w === 'live'
+      ? liveCoverageWords(liveCoverage(list.analytics, catalog), !!catalog)
+      : `${list.counts[w]} ${w}`,
   );
   return [String(list.analytics.length), ...parts].join(' · ');
 }
@@ -164,7 +176,10 @@ function windowWords(range: string): string {
 // Catalog lists the runs the analytic sweep recorded. The list with no type
 // holds them too, and the bell links a folded sweep line to this chip. The
 // storage kind of a catalog run is `triggered`.
-type HuntKindFilter = HuntKind | 'all';
+// Campaign lists the hunts that soc-ai started on a change of a campaign. It
+// is a starter and no stored kind, so the screen also keeps only the rows with
+// that starter: a server that does not know the type sends every hunt.
+type HuntKindFilter = HuntKind | 'all' | 'campaign';
 const DEFAULT_KIND: HuntKindFilter = 'all';
 type KindChip = { id: HuntKindFilter; label: string; empty: string; title: string };
 /** The runs the analytic sweep recorded. */
@@ -179,6 +194,7 @@ const KIND_CHIPS: KindChip[] = [
   { id: 'chat', label: 'Manual', empty: 'manual hunts', title: TYPE_MANUAL },
   { id: 'scheduled', label: 'Schedule', empty: 'scheduled runs', title: TYPE_SCHEDULE },
   { id: 'lead', label: 'Lead', empty: 'lead hunts', title: TYPE_LEAD },
+  { id: 'campaign', label: 'Campaign', empty: 'campaign hunts', title: TYPE_CAMPAIGN },
   CATALOG_KIND,
 ];
 const isKindFilter = (v: unknown): v is HuntKindFilter => KIND_CHIPS.some((c) => c.id === v);
@@ -200,6 +216,8 @@ const starterText = (h: HuntRow): ReactNode => {
       return 'schedule';
     case 'catalog':
       return 'catalog run';
+    case 'campaign':
+      return 'campaign';
     default:
       return h.startedBy || 'analyst';
   }
@@ -240,7 +258,10 @@ const NO_COUNT_OUTCOMES = new Set(['could_not_run', 'no_answer', 'no_threat_gap'
 
 /** F4: the cell and the header counted threat findings under the word
  *  Findings, so a hunt with one finding read 0 and one with six read 1. The
- *  cell states both counts. The outcome comes from lib/labels.ts. */
+ *  cell states every finding. The threat count has one format, and the status
+ *  cell states it: "3 confirmed · 1 not judged · of 4 threat findings". The
+ *  cell read "7 · 4 threat" beside "3 of 7 findings are threats" before
+ *  (review 2026-11-12). The outcome comes from lib/labels.ts. */
 /** Whether the findings cell of a row states a count. The header counts the
  *  findings of these rows only, so the two agree. */
 function findingsCellCounts(h: HuntRow): boolean {
@@ -250,10 +271,7 @@ function findingsCellCounts(h: HuntRow): boolean {
 
 function findingsCellText(h: HuntRow): string {
   if (!findingsCellCounts(h)) return '—';
-  const total = h.findingCount ?? 0;
-  // A row recorded before the threat count existed states the total only.
-  const threats = h.threatFindingCount;
-  return threats != null && threats > 0 ? `${total} · ${threats} threat` : String(total);
+  return String(h.findingCount ?? 0);
 }
 
 /** The hunt a schedule last started. The server sends it beside the schedule
@@ -281,10 +299,14 @@ function StatusDot({
   status,
   outcome,
   outcomeLabel: serverLabel,
+  row,
 }: {
   status: HuntStatus;
   outcome?: HuntRow['outcome'];
   outcomeLabel?: string;
+  /** The counts of the row. An older server sends no label, and the row
+   *  writes the count sentence from them. */
+  row?: HuntRow;
 }) {
   // One outcome per hunt, in the words and the colour of lib/labels.ts. A hunt
   // that could not run is grey and a hunt that found a threat is red. The list
@@ -301,7 +323,7 @@ function StatusDot({
       : key === 'could_not_run'
         ? status === 'complete'
           ? STATUS_COULD_NOT_RUN
-          : statusDetail(status)
+          : statusDetail(status, 'hunt')
         : status === 'complete'
           ? STATUS_COMPLETE
           : undefined;
@@ -310,7 +332,9 @@ function StatusDot({
   // An investigating hunt also carries its count, "Investigating 2 of 3
   // findings", which the client word cannot state.
   const label =
-    (status === 'complete' || status === 'investigating') && serverLabel ? serverLabel : m.label;
+    status === 'complete' || status === 'investigating'
+      ? serverLabel || (row ? huntOutcomeText({ ...row, outcome_label: null }) : null) || m.label
+      : m.label;
   return (
     <span
       className="flex items-start gap-1.5 text-[12px] leading-[1.35]"
@@ -778,8 +802,11 @@ export function Hunts() {
   // the catalog moves when an analyst changes a status.
   const [analyticsReload, setAnalyticsReload] = useState(0);
   const analytics = useAsync(getAnalytics, [analyticsReload], { refetchInterval: 300_000 });
+  // The run state of each analytic, for the live coverage of the tab label.
+  // The panel reads the same catalog, so the label and the rows agree.
+  const huntCatalog = useAsync(getHuntCatalog, [analyticsReload], { refetchInterval: 300_000 });
   const analyticsChanged = () => setAnalyticsReload((n) => n + 1);
-  const analyticsCount = analyticsCountLine(analytics.data);
+  const analyticsCount = analyticsCountLine(analytics.data, huntCatalog.data);
 
   // The fold of each section of this tab. The page holds the three folds that
   // a link can jump to, so a Needs-you link opens the block before it scrolls
@@ -878,7 +905,10 @@ export function Hunts() {
   // `visible` is the server's answer to the window AND the kind chip together;
   // the header, the selection, the active chip's count and the table all read
   // it, so none of them can disagree.
-  const visible = useMemo(() => data ?? [], [data]);
+  const visible = useMemo(
+    () => (kind === 'campaign' ? (data ?? []).filter((h) => h.starter === 'campaign') : (data ?? [])),
+    [data, kind],
+  );
 
   // The header describes the window and the kind chip, as the server
   // answered them. The unwindowed `stats` poll stays: `huntsExist` needs "any
@@ -900,10 +930,16 @@ export function Hunts() {
   const windowTotals = totalsRead.data?.key === huntWindowKey ? totalsRead.data.totals : null;
   // The totals of the type on screen. A type with no hunt in the window is
   // absent from `by_kind`, and it counts zero.
+  // A campaign hunt is counted under its stored kind, so the Campaign type
+  // has a total only when the server keys one by that name. With none, the
+  // counts are of the rows on screen.
+  const byKind = windowTotals?.by_kind as Partial<Record<string, HuntKindTotals>> | undefined;
   const scopedTotals: HuntKindTotals | null = windowTotals
     ? kind === 'all'
       ? windowTotals
-      : (windowTotals.by_kind[kind] ?? { hunts: 0, findings: 0, threat_findings: 0, running: 0 })
+      : kind === 'campaign'
+        ? (byKind?.campaign ?? null)
+        : (windowTotals.by_kind[kind] ?? { hunts: 0, findings: 0, threat_findings: 0, running: 0 })
     : null;
   // With no totals, a full page means the counts are a floor.
   const pageFloor = !scopedTotals && visible.length >= HUNTS_PAGE_CAP;
@@ -913,12 +949,17 @@ export function Hunts() {
   const windowStats = useMemo(() => {
     const rows = visible;
     const mark = (n: number): string => `${n}${pageFloor ? '+' : ''}`;
-    const kindCount = (k: HuntKind): number =>
-      windowTotals ? (windowTotals.by_kind[k]?.hunts ?? 0) : rows.filter((h) => h.kind === k).length;
-    const byKind =
+    const kindCount = (k: string): number =>
+      byKind ? (byKind[k]?.hunts ?? 0) : rows.filter((h) => h.kind === k).length;
+    // Each stored kind once. A campaign hunt counts under its stored kind, and
+    // under "campaign" only when the server stores that kind.
+    const kinds =
       kind === 'all' && (windowTotals ? windowTotals.hunts > 0 : rows.length > 0)
         ? KIND_CHIPS.filter((c) => c.id !== 'all')
-            .map((c) => ({ n: kindCount(c.id as HuntKind), label: HUNT_KIND[c.id as HuntKind].label }))
+            .map((c) => ({
+              n: kindCount(c.id),
+              label: HUNT_KIND[c.id as HuntKind]?.label ?? c.label.toLowerCase(),
+            }))
             .filter((c) => c.n > 0)
             .map((c) => `${mark(c.n)} ${c.label}`)
             .join(', ')
@@ -940,12 +981,12 @@ export function Hunts() {
         label: 'Hunts',
         value: scopedTotals ? String(scopedTotals.hunts) : mark(rows.length),
         sub: 'in window',
-        detail: byKind ? `(${byKind})` : '',
+        detail: kinds ? `(${kinds})` : '',
       },
       { label: 'Findings', value: mark(findings), sub: `${mark(threats)} threat`, detail: '' },
       { label: 'In progress', value: mark(running), sub: 'running or investigating', detail: '' },
     ];
-  }, [visible, kind, windowTotals, scopedTotals, pageFloor]);
+  }, [visible, kind, windowTotals, byKind, scopedTotals, pageFloor]);
 
   // A hunt started elsewhere won't appear while this list is idle — force one
   // refetch when the tab regains focus.
@@ -1124,14 +1165,21 @@ export function Hunts() {
       {tab === 'analytics' ? (
         // The panel owns `?open=` and mounts the drawer itself, so one
         // parameter opens one drawer whichever surface asked for it.
-        <AnalyticsPanel shared={analytics} onChanged={analyticsChanged} />
+        <AnalyticsPanel shared={analytics} sharedCatalog={huntCatalog} onChanged={analyticsChanged} />
       ) : (
         <>
       {/* The page reads by the work, top to bottom: what needs the analyst,
           the leads that wait on a decision, what the analytics found, what
           was pursued. Each item appears once. W1: the leads started 1,977 px
           down a 900 px screen, under 12 hits that waited on nobody. */}
+      {/* The confirmed threats come first. The review of 2026-11-12 found
+          the one result that needed a response 10,900 px down this page
+          (ui-hunt 1). The block states its own window. */}
+      <RecentConfirmedThreats days={7} className="mb-4" />
       <NeedsYouStrip />
+      {/* One card for each authorized activity record. A hunt reads the same
+          records as context, and it reports activity outside them. */}
+      <AuthorizedActivityCards className="mb-4" />
       {/* The two tour anchors wrap shared blocks. A plain block with no
           border or padding lets the bottom margin of the block pass through,
           so the page lays out the same. */}
@@ -1455,8 +1503,14 @@ export function Hunts() {
                 {findingsCellText(h)}
               </div>
               <div className="text-[13px] tabular-nums text-text-2">{h.affectedHosts}</div>
-              <div>
-                <StatusDot status={h.status} outcome={h.outcome} outcomeLabel={h.outcome_label} />
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                <StatusDot status={h.status} outcome={h.outcome} outcomeLabel={h.outcome_label} row={h} />
+                {/* A hunt that completed in a degraded state: its model
+                    returned no reasoning trace. The row read "Complete" and
+                    nothing more (prod, 2026-11-03). */}
+                {h.degraded && (
+                  <HuntDegradedChip note={h.degradedNote} testId={`hunt-degraded-${h.id}`} />
+                )}
               </div>
               <div className="text-[12px] text-dim" title={h.ts}>{h.when}</div>
               {/* The tags, in the one order of every list. Scheduled and
@@ -1465,6 +1519,8 @@ export function Hunts() {
                   planted attack from reading as real activity. */}
               <RowTags
                 testId={`hunt-tags-${h.id}`}
+                campaign={h.campaign}
+                campaignTestId={`hunt-campaign-${h.id}`}
                 huntKind={h.kind}
                 synthetic={h.isSynthEval}
                 chatCount={h.chatCount}

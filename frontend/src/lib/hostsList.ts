@@ -24,6 +24,7 @@ export const MACHINE_SORT_KEYS: readonly MachineSortKey[] = [
   'events',
   'first_seen',
   'last_seen',
+  'findings',
 ];
 
 export const DEFAULT_MACHINE_SORT: MachineSortKey = 'last_seen';
@@ -38,6 +39,7 @@ export const FIRST_DIR: Record<MachineSortKey, SortDir> = {
   events: 'desc',
   first_seen: 'desc',
   last_seen: 'desc',
+  findings: 'desc',
 };
 
 export interface HostsListState {

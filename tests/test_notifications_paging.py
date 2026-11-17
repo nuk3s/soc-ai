@@ -63,12 +63,14 @@ def _prefix(row: dict[str, Any]) -> str:
 
 
 def _seed_completed_runs(client: TestClient, n: int) -> None:
+    # Inconclusive verdicts: false positive closures fold into one row
+    # (tests/test_bell_urgency.py), and these tests count rows.
     for i in range(n):
         _seed_run(
             client,
             f"INV-DONE-{i:03d}",
             alert_id=f"es-done-{i}",
-            verdict="false_positive",
+            verdict="inconclusive",
             hours_ago=1 + i / 100,
         )
 
@@ -159,8 +161,11 @@ def test_events_only_leaves_out_the_rows_the_needs_you_count_holds(client: TestC
 
     everything = {_prefix(r) for r in _notifications(client, limit=200)}
     assert {"shadow-hit", "lead", "inv-done"} <= everything
-    # The defect: at the default limit the hits fill the list.
-    assert {_prefix(r) for r in _notifications(client)} == {"shadow-hit"}
+    # Without events_only the hits take rows of the default list. The urgency
+    # order puts the leads and the verdicts first (tests/test_bell_urgency.py).
+    plain = [_prefix(r) for r in _notifications(client)]
+    assert "shadow-hit" in plain
+    assert plain.index("lead") < plain.index("shadow-hit")
 
     events = _notifications(client, events_only=True)
     assert [_prefix(r) for r in events] == ["inv-done", "inv-done"]
@@ -394,7 +399,7 @@ def test_after_drops_the_dismissible_rows_up_to_the_mark(client: TestClient) -> 
             client,
             f"INV-OLD-{i:02d}",
             alert_id=f"es-old-{i}",
-            verdict="false_positive",
+            verdict="inconclusive",
             hours_ago=3 + i / 10,
         )
     for i in range(3):
@@ -402,7 +407,7 @@ def test_after_drops_the_dismissible_rows_up_to_the_mark(client: TestClient) -> 
             client,
             f"INV-NEW-{i}",
             alert_id=f"es-new-{i}",
-            verdict="false_positive",
+            verdict="inconclusive",
             hours_ago=0.5 + i / 10,
         )
     for i in range(6):

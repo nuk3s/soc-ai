@@ -204,11 +204,18 @@ EXPOSE 8443
 # says so too, so it reads correctly in `docker inspect`'s health log.
 #
 # /healthz answers over HTTPS on the direct path and over HTTP on the proxy
-# path. The check tries HTTPS first, with -k to skip verify, then HTTP.
+# path. SOC_AI_TLS_CERT is set on the direct path and blank on the proxy path,
+# so the check asks in the scheme of the server first. -k skips verify. An
+# HTTPS-first check on the proxy path made the server log "Invalid HTTP request
+# received" each 30 s. The other scheme stays as the second try.
 # Interval is generous (30s) so a slow cold-start (DB migration + bootstrap)
 # doesn't flip the container unhealthy before the server is ready.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -fsk https://127.0.0.1:8443/healthz || curl -fs http://127.0.0.1:8443/healthz || exit 1
+    CMD if [ -n "${SOC_AI_TLS_CERT}" ]; then \
+          curl -fsk https://127.0.0.1:8443/healthz || curl -fs http://127.0.0.1:8443/healthz || exit 1; \
+        else \
+          curl -fs http://127.0.0.1:8443/healthz || curl -fsk https://127.0.0.1:8443/healthz || exit 1; \
+        fi
 
 # ── Default command ───────────────────────────────────────────────────────────
 # Invoked as `python -m uvicorn`, NOT the `uvicorn` console script: the venv is

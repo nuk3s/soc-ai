@@ -23,6 +23,7 @@ A *mute* is a soft, soc-ai-side suppression (see
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 from soc_ai.store import detection_overrides as override_svc
@@ -48,8 +49,10 @@ __all__ = [
     "MUTE_MIN_ALERTS",
     "OVERRIDE_FP_SIGNAL",
     "VOLUME_RANGE",
+    "NominationPage",
     "assess",
     "nominate",
+    "nominate_page",
 ]
 
 # The window of the alert volume, in the range words of the alerts feed. The
@@ -58,7 +61,27 @@ __all__ = [
 VOLUME_RANGE = "7d"
 
 
+@dataclass(frozen=True)
+class NominationPage:
+    """The nominated rules, and the alert events of the window they come from.
+
+    ``alert_total`` counts every alert event the feed matched in
+    :data:`VOLUME_RANGE`, a nominated rule or not. The tuning panel states the
+    share of the window that the mute suggestions produce (review 2026-11-12).
+    """
+
+    nominations: list[dict[str, Any]]
+    alert_total: int
+    window: str = VOLUME_RANGE
+
+
 async def nominate(state: Any) -> list[dict[str, Any]]:
+    """The nominated rules of :func:`nominate_page`, for a caller that needs
+    no volume total."""
+    return (await nominate_page(state)).nominations
+
+
+async def nominate_page(state: Any) -> NominationPage:
     """Nominate noisy, FP-leaning rules from the live feed for tuning.
 
     Pulls the grouped-by-rule alert volume from the alerts feed, joins each rule's
@@ -79,16 +102,15 @@ async def nominate(state: Any) -> list[dict[str, Any]]:
     settings = state.settings
     elastic = state.elastic
 
-    groups = (
-        await aq.fetch_groups(
-            elastic,
-            settings,
-            time_range=VOLUME_RANGE,
-            sort="count",
-        )
-    ).groups
+    page = await aq.fetch_groups(
+        elastic,
+        settings,
+        time_range=VOLUME_RANGE,
+        sort="count",
+    )
+    groups = page.groups
     if not groups:
-        return []
+        return NominationPage(nominations=[], alert_total=int(page.total or 0))
 
     rule_names = [g.rule_name for g in groups if g.rule_name]
     async with state.db_sessionmaker() as db:
@@ -141,4 +163,4 @@ async def nominate(state: Any) -> list[dict[str, Any]]:
         )
 
     nominations.sort(key=lambda n: n["alert_count"], reverse=True)
-    return nominations
+    return NominationPage(nominations=nominations, alert_total=int(page.total or 0))

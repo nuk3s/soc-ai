@@ -814,7 +814,10 @@ async def test_a_read_that_fails_starts_the_hunt_without_conclusions(
         assert await earlier.earlier_for_objective(maker, _OBJECTIVE) is None
 
     warnings = [r for r in caplog.records if r.name == "soc_ai.hunting.earlier"]
-    assert len(warnings) == 2
+    # One line for the lead. Two for the objective: its earlier runs and the
+    # confirmed activity of its window are read apart, so one failed read does
+    # not drop the other block.
+    assert len(warnings) == 3
     assert all(r.levelno == logging.WARNING for r in warnings)
 
 

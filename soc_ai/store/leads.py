@@ -19,17 +19,29 @@ from typing import Any
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from soc_ai.store.models import EntityObservation, Hunt, HuntEvent, Lead
+from soc_ai.store.models import (
+    Campaign,
+    CampaignMember,
+    EntityObservation,
+    Hunt,
+    HuntEvent,
+    Investigation,
+    Lead,
+)
 
 __all__ = [
     "AUTO_HUNT_ACTOR",
     "AUTO_HUNT_RETRY_LIMIT",
     "BACKTEST_DECISION",
     "BACKTEST_DECISION_NOTE",
+    "CAMPAIGN_ACTOR",
+    "CAMPAIGN_AUTHORIZED_REASON",
+    "CAMPAIGN_CLOSED_REASON",
     "CLOSED_STATUSES",
     "DISMISS_REASONS",
     "GRID_GAP_REASON",
     "HOLD_EARLIER_THREAT",
+    "HOLD_LATER_FINDING",
     "HOLD_LEAD_LINK",
     "HOLD_NO_VERDICT",
     "HOLD_PARTIAL_READ",
@@ -41,9 +53,14 @@ __all__ = [
     "OBSERVATION_DISMISS_REASONS",
     "PROMOTED_FINDING_REASON",
     "RELATED_WINDOW_DAYS",
+    "SYSTEM_DISMISS_REASONS",
     "RelatedLead",
+    "alert_rule_of",
     "analyst_dismissed",
+    "campaign_lead_clause",
+    "campaign_leads",
     "cites_documents",
+    "closed_at_of",
     "decisions_of",
     "derived_hold_reason",
     "dismiss",
@@ -52,6 +69,7 @@ __all__ = [
     "formed_from_backtest",
     "get",
     "hold_reason_of",
+    "hold_sentence_of",
     "hunt_did_not_run",
     "hunt_is_queued",
     "hunt_outcome_of",
@@ -66,9 +84,11 @@ __all__ = [
     "related_counts",
     "related_leads",
     "reopen",
+    "repeats_after_close",
     "settle_after_hunt",
     "settle_finished_hunts",
     "timeline",
+    "waits_on_campaign_clause",
 ]
 
 _LOGGER = logging.getLogger(__name__)
@@ -87,6 +107,17 @@ DISMISS_REASONS: tuple[str, ...] = (
     "lab_host",
     "other",
 )
+
+# The reasons soc-ai writes when a campaign closes its leads (D6): the
+# analyst closed the campaign, or authorized its activity. They are not in
+# DISMISS_REASONS: the form offers the analyst's list, and no analyst closes a
+# lead with the reason of a campaign. :func:`dismiss` takes them with
+# ``system=True`` only. The column holds 32 characters.
+CAMPAIGN_CLOSED_REASON = "campaign_closed"
+CAMPAIGN_AUTHORIZED_REASON = "campaign_authorized"
+SYSTEM_DISMISS_REASONS: tuple[str, ...] = (CAMPAIGN_CLOSED_REASON, CAMPAIGN_AUTHORIZED_REASON)
+# The hand of such a close.
+CAMPAIGN_ACTOR = "system:campaign"
 
 # A closed lead does not absorb new observations. A new lead can form on the
 # same entity from observations recorded after the close.
@@ -130,12 +161,46 @@ HOLD_LEAD_LINK = "lead_link"
 # cancelled or never started. The documented rule leaves the lead to the
 # analyst. Prod lead 47 (2026-10-24) waited with no reason on its page.
 HOLD_NO_VERDICT = "no_verdict"
+# A live finding joined the lead after its hunt started, so the hunt did not
+# read it: the evidence block of a hunt is written at its start. A second
+# true-positive alert joins the open lead of its host and starts no second
+# hunt (soc_ai.hunting.leads.form_leads). The lead then must not close as
+# clean on a hunt that did not read the alert. Production lead 3 took three
+# true-positive alerts four weeks after its hunt.
+HOLD_LATER_FINDING = "later_finding"
+# The sentence for a hold that names no cause of its own. A hold that knows
+# its cause records it as the note of the ``held`` decision, and the console
+# prints that note (:func:`hold_sentence_of`).
 HOLD_SENTENCES: dict[str, str] = {
     HOLD_PARTIAL_READ: "The hunt could not read all evidence.",
     HOLD_EARLIER_THREAT: "An earlier hunt found a threat.",
     HOLD_LEAD_LINK: "The hunt linked this lead to other leads.",
     HOLD_NO_VERDICT: "A threat finding of the hunt has no verdict.",
+    HOLD_LATER_FINDING: (
+        "A new observation joined this lead after the hunt started. The hunt did not read it."
+    ),
 }
+
+# The cause of a partial read, in one sentence each. Only a grid failure, a
+# cut-short run and a run error hold a lead. A corrected query error and a
+# standing visibility gap do not (:func:`_clean_close_blocker`).
+_NOTE_RUN_ERROR = "The hunt recorded an error before it finished."
+_NOTE_BUDGET = "The hunt reached its budget before it read all evidence."
+_NOTE_GRID_UNANSWERED = (
+    "The grid did not answer a query of the hunt. The hunt did not get that answer later."
+)
+_NOTE_GRID_AND_GAP = "The grid did not answer a query, and the hunt reports a visibility gap."
+_NOTE_DEGRADED = "The hunt ran degraded. It did not read the grid."
+_DEGRADED_NOTES: dict[str, str] = {
+    "grid_unavailable": "Every grid query of the hunt failed.",
+    "grid_queries_rejected": "The grid rejected every query of the hunt.",
+    "no_grid_reads": "The hunt ran no grid query.",
+}
+
+# The reason the tool boundary stamps on a result when the grid did not
+# answer (soc_ai.agent.toolset.GRID_UNAVAILABLE_REASON). The store does not
+# import the agent, and tests/test_lead_truth.py pins the two as equal.
+_GRID_UNAVAILABLE = "grid_unavailable"
 
 # The decision an analyst records when an investigation of one of the lead's
 # hunt findings reached a verdict and the lead stays open all the same. The
@@ -221,6 +286,90 @@ def _has_a_hunt() -> Any:
     )
 
 
+# The spec id of an alert observation (soc_ai.hunting.sources.ALERT_SPEC_ID).
+# The store does not import the hunting package at module level, and
+# tests/test_campaign_lead_tags.py pins the two as equal.
+_ALERT_SPEC_ID = "alert"
+# The status of an active campaign (soc_ai.campaigns.service.STATUS_ACTIVE).
+_CAMPAIGN_ACTIVE = "active"
+# The kinds of a promoted run (soc_ai.store.investigations.PROMOTED_KINDS).
+# Such a run writes no alert observation.
+_PROMOTED_KINDS: tuple[str, ...] = ("hunt", "lead")
+
+
+def campaign_lead_clause() -> Any:
+    """The SQL for a lead of a campaign: the lead waits on its campaign (D4).
+
+    The step after a rebuild sets ``leads.campaign_id``
+    (:mod:`soc_ai.campaigns.lead_tags`). The clause holds while three facts
+    hold: the lead names a campaign, the campaign is active, and every
+    observation on the lead that counts is the alert observation of a true
+    positive member of that campaign. A dismissed observation counts toward
+    no lead, so it does not count here either.
+
+    The third fact is read again here, on each read. A sweep in another
+    process can attach a statistics observation to the lead, and no rebuild
+    follows such a write. The lead then has normal handling at once: the
+    clause only ever gives a lead back to the analyst. It never takes one.
+
+    Every reader of a lead of a campaign reads this clause: the Needs you
+    count and list, the Needs decision tab, the bell, the row twin
+    :func:`campaign_leads` and the lead loop. The count and the list then
+    agree. The caller selects from ``leads``.
+    """
+    held_alerts = (
+        select(Investigation.alert_es_id)
+        .join(CampaignMember, CampaignMember.run_id == Investigation.id)
+        .where(
+            CampaignMember.campaign_id == Lead.campaign_id,
+            CampaignMember.verdict_differs.is_(False),
+            # NOT IN over a set that holds a null is never true. The filter
+            # keeps a stray observation visible as stray.
+            Investigation.alert_es_id.is_not(None),
+            func.coalesce(Investigation.kind, "").not_in(_PROMOTED_KINDS),
+        )
+        .correlate(Lead)
+    )
+    stray = (
+        select(EntityObservation.id)
+        .where(
+            EntityObservation.lead_id == Lead.id,
+            EntityObservation.dismissed_at.is_(None),
+            or_(
+                EntityObservation.spec_id != _ALERT_SPEC_ID,
+                EntityObservation.fingerprint.not_in(held_alerts),
+            ),
+        )
+        .correlate(Lead)
+        .exists()
+    )
+    active = (
+        select(Campaign.id)
+        .where(Campaign.id == Lead.campaign_id, Campaign.status == _CAMPAIGN_ACTIVE)
+        .correlate(Lead)
+        .exists()
+    )
+    return and_(Lead.campaign_id.is_not(None), active, ~stray)
+
+
+async def campaign_leads(db: AsyncSession, lead_ids: Sequence[int]) -> dict[int, int]:
+    """The campaign of each lead among ``lead_ids`` that is a lead of a campaign.
+
+    The row twin of :func:`campaign_lead_clause`, for a reader that holds
+    lead rows: the lead list, the lead page and :func:`hunt_is_queued`.
+    """
+    ids = sorted({int(i) for i in lead_ids})
+    out: dict[int, int] = {}
+    for start in range(0, len(ids), 500):
+        rows = await db.execute(
+            select(Lead.id, Lead.campaign_id).where(
+                Lead.id.in_(ids[start : start + 500]), campaign_lead_clause()
+            )
+        )
+        out.update({int(lid): int(cid) for lid, cid in rows.all() if cid is not None})
+    return out
+
+
 def needs_decision_clause(*, auto_hunt: bool) -> Any:
     """The SQL for a lead that waits on a decision.
 
@@ -243,7 +392,18 @@ def needs_decision_clause(*, auto_hunt: bool) -> Any:
 
     The caller LEFT JOINs the hunt. A lead with a hunt id and no hunt row
     reads as waiting, which is right: nothing is running on it.
+
+    A lead of a campaign (:func:`campaign_lead_clause`) waits on its campaign,
+    not on its own decision. The analyst decides on the campaign, and the
+    campaign is one item of Needs you. The clause leaves such a lead out, so
+    the count, the list and the tab leave it out by one rule.
     """
+    waits = _waits_on_a_decision(auto_hunt=auto_hunt)
+    return and_(~campaign_lead_clause(), waits)
+
+
+def _waits_on_a_decision(*, auto_hunt: bool) -> Any:
+    """:func:`needs_decision_clause` before the leads of a campaign leave it."""
     hunt_finished = and_(
         _has_a_hunt(),
         or_(Hunt.id.is_(None), Hunt.status.not_in(HUNT_RUNNING_STATUSES)),
@@ -262,7 +422,7 @@ def needs_decision_clause(*, auto_hunt: bool) -> Any:
     return or_(no_hunt_yet, hunt_finished)
 
 
-def hunt_is_queued(lead: Lead, *, auto_hunt: bool) -> bool:
+def hunt_is_queued(lead: Lead, *, auto_hunt: bool, of_campaign: bool = False) -> bool:
     """Whether the loop will start this lead's hunt.
 
     The row-level twin of the clause above, and the field the New pill reads
@@ -272,9 +432,14 @@ def hunt_is_queued(lead: Lead, *, auto_hunt: bool) -> bool:
     A lead that names a hunt is never queued, whatever its status. The loop
     starts a hunt on a lead that has none, and a reopened lead keeps the hunt
     it had.
+
+    A lead of a campaign is never queued either. ``of_campaign`` is the
+    answer of :func:`campaign_leads` for the row. Its hunt follows the
+    campaign: at most one hunt for one campaign in 24 hours.
     """
     return bool(
         auto_hunt
+        and not of_campaign
         and lead.status == "open"
         and not lead.hunt_id
         and lead.dismissed_at is None
@@ -289,8 +454,23 @@ def in_progress_clause() -> Any:
     The twin of :func:`needs_decision_clause`: the same set of leads that
     carry a hunt, split by the hunt's status. A reopened lead the analyst hunt
     again reads In progress while that hunt runs, and waits when it lands.
+
+    A lead of a campaign is not in progress: it waits on its campaign, and
+    :func:`waits_on_campaign_clause` counts it.
     """
-    return and_(_has_a_hunt(), Hunt.status.in_(HUNT_RUNNING_STATUSES))
+    return and_(~campaign_lead_clause(), _has_a_hunt(), Hunt.status.in_(HUNT_RUNNING_STATUSES))
+
+
+def waits_on_campaign_clause() -> Any:
+    """The SQL for an open or hunting lead of a campaign: it waits on the campaign.
+
+    The lead tabs count it apart (``in_campaign`` of ``GET /leads/count``).
+    The Needs decision tab and the In progress tab leave it out, so the
+    counts of the tabs and this count sum to the leads of the All tab, less
+    the new leads that wait on auto-hunt. A dismissed or promoted lead of a
+    campaign stays in the Closed tab.
+    """
+    return and_(Lead.status.in_(("open", "hunting")), campaign_lead_clause())
 
 
 async def get(db: AsyncSession, lead_id: int) -> Lead | None:
@@ -394,6 +574,61 @@ def closed_on_verdicts(lead: Lead) -> bool:
     return False
 
 
+def closed_at_of(lead: Lead) -> datetime | None:
+    """When the lead closed, or None for a lead that is not closed.
+
+    A dismissal states its time in its own column. A promotion clears those
+    columns, so its time is the newest ``promoted`` entry of the history. A
+    row with no such entry falls back to the last write.
+    """
+    if lead.status == "dismissed":
+        return _naive_utc(lead.dismissed_at or lead.updated_at)
+    if lead.status != "promoted":
+        return None
+    for decision in reversed(decisions_of(lead)):
+        if decision.get("action") == "promoted":
+            try:
+                # The history states its time with an offset. The columns are
+                # naive UTC, and every caller compares the two.
+                return _naive_utc(datetime.fromisoformat(str(decision.get("at"))))
+            except ValueError:
+                break
+    return _naive_utc(lead.updated_at)
+
+
+def _naive_utc(value: datetime | None) -> datetime | None:
+    """A time as naive UTC, the form of the stored columns.
+
+    The list of leads answered 500 when a promoted lead was on it: the close
+    time came from the history with an offset, and an observation time has
+    none (browser smoke, 2026-11-13).
+    """
+    if value is None or value.tzinfo is None:
+        return value
+    return value.astimezone(UTC).replace(tzinfo=None)
+
+
+def repeats_after_close(
+    lead: Lead, observations: Sequence[EntityObservation]
+) -> tuple[int, datetime | None]:
+    """How many observations joined the lead after it closed, and when the newest did.
+
+    A true-positive alert whose rule the closed lead held joins that lead for
+    the decay horizon and starts no hunt (``soc_ai.hunting.leads``). The row
+    of the closed lead states the count and the time, so the repeats are not
+    out of sight. A lead that is not closed has none.
+    """
+    closed_at = closed_at_of(lead)
+    if closed_at is None:
+        return 0, None
+    later = [
+        born
+        for o in observations
+        if o.lead_id == lead.id and (born := _naive_utc(o.born_at)) is not None and born > closed_at
+    ]
+    return len(later), (max(later) if later else None)
+
+
 def hold_reason_of(lead: Lead) -> str | None:
     """Why the settle rule left the lead's current hunt to the analyst, or None.
 
@@ -411,6 +646,52 @@ def hold_reason_of(lead: Lead) -> str | None:
         return None
     reason = last.get("reason")
     return str(reason) if reason else None
+
+
+def hold_sentence_of(lead: Lead, reason: str | None) -> str | None:
+    """The sentence the console prints for a hold, or None for no hold.
+
+    The page printed one fixed sentence for seven production leads: "The hunt
+    could not read all evidence." It did not say what the hunt could not
+    read. A hold that knows its cause records it as the note of the ``held``
+    decision, and that note is the sentence. A hold with no note, or one read
+    on read for a row settled before the rule, takes the fixed sentence.
+    """
+    if not reason:
+        return None
+    if hold_reason_of(lead) == reason:
+        for decision in reversed(decisions_of(lead)):
+            if decision.get("action") == "held":
+                note = decision.get("note")
+                if isinstance(note, str) and note.strip():
+                    return note.strip()
+                break
+    return HOLD_SENTENCES.get(reason)
+
+
+def _record_hold(lead: Lead, at: datetime, *, by: str, hold: _Hold, hunt_id: str) -> bool:
+    """Record why the lead waits, once per hunt and cause. True when the history changed.
+
+    The reconciliation pass calls the settle rule on every wake. A second
+    entry for the same hold says nothing new, so the entry is written once.
+    When the same hold now knows a cause that its entry does not state, the
+    note of that entry is written again in place.
+    """
+    if hold_reason_of(lead) != hold.reason:
+        record_decision(
+            lead, "held", at, by=by, reason=hold.reason, hunt_id=hunt_id, note=hold.note
+        )
+        lead.updated_at = at
+        return True
+    history = decisions_of(lead)
+    for entry in reversed(history):
+        if entry.get("action") == "held":
+            if entry.get("note") == hold.note:
+                return False
+            entry["note"] = hold.note
+            lead.decisions_json = history
+            return True
+    return False
 
 
 async def mark_hunting(db: AsyncSession, lead_id: int, *, hunt_id: str) -> Lead:
@@ -434,8 +715,16 @@ async def dismiss(
     note: str | None,
     by: str,
     now: datetime | None = None,
+    system: bool = False,
 ) -> Lead:
-    if reason not in DISMISS_REASONS:
+    """Close the lead as dismissed, with a reason and one decision record.
+
+    ``reason`` comes from :data:`DISMISS_REASONS`. With ``system``, soc-ai
+    closes the lead with its campaign and the reason comes from
+    :data:`SYSTEM_DISMISS_REASONS`. A route never passes ``system``.
+    """
+    allowed = (*DISMISS_REASONS, *SYSTEM_DISMISS_REASONS) if system else DISMISS_REASONS
+    if reason not in allowed:
         raise ValueError(f"unknown dismissal reason: {reason}")
     lead = await db.get(Lead, int(lead_id))
     if lead is None:
@@ -645,11 +934,121 @@ def analyst_dismissed(lead: Lead) -> bool:
     return lead.dismissed_at is not None and lead.dismissed_by != AUTO_HUNT_ACTOR
 
 
-def _tool_failed(result: Any) -> bool:
-    return isinstance(result, dict) and bool(result.get("error"))
+@dataclass(frozen=True)
+class _Hold:
+    """Why a finished hunt does not settle its lead: the reason code and the cause."""
+
+    reason: str
+    note: str | None = None
 
 
-async def _clean_close_blocker(db: AsyncSession, hunt: Hunt) -> str | None:
+@lru_cache(maxsize=1)
+def _grid_error_types() -> frozenset[str]:
+    """The exception names that mean the grid did not answer.
+
+    Some tools catch their own exception and return its class name in
+    ``type``, with no ``reason``. A transport error there is the same grid
+    failure the tool boundary stamps, so the settle rule reads both. An
+    ``ApiError`` with no subclass is a status the client does not map: a 5xx,
+    a 408 or a 429. The 4xx subclasses are query errors and are not listed.
+    """
+    from elastic_transport import TransportError  # noqa: PLC0415 - lazy, the store reads no grid
+
+    from soc_ai.so_client import elastic  # noqa: F401, PLC0415 - defines GridPartialResultsError
+
+    names = {"ApiError", "TimeoutError"}
+    pending: list[type] = [TransportError]
+    while pending:
+        cls = pending.pop()
+        names.add(cls.__name__)
+        pending.extend(cls.__subclasses__())
+    return frozenset(names)
+
+
+def _grid_failed(result: Any) -> bool:
+    """Whether a tool result says the grid did not answer, or a dataset was out of reach.
+
+    A query the model wrote wrong is not one. 23 of 32 failed tool results in
+    the production review window were query errors that the model corrected
+    on its next call, and each one held a lead.
+    """
+    if not isinstance(result, dict) or not result.get("error"):
+        return False
+    if _GRID_UNAVAILABLE in (result.get("reason"), result.get("error")):
+        return True
+    return str(result.get("type") or "") in _grid_error_types()
+
+
+def _tool_answered(result: Any) -> bool:
+    """Whether a tool result is an answer from the grid: no error and no short-circuit."""
+    if not isinstance(result, dict):
+        return result is not None
+    if result.get("error"):
+        return False
+    return not (result.get("duplicate_call") or result.get("prefetch_already_has_this"))
+
+
+def _unrecovered_grid_failures(results: Sequence[tuple[str, Any]]) -> tuple[int, int]:
+    """(grid failures, grid failures with no later answer), over the tool results in order.
+
+    A failure is recovered when a later call of the same tool got an answer.
+    The model is told to vary the query once after a grid failure, so the
+    recovery is a later call and never the same one.
+    """
+    failures = unrecovered = 0
+    for index, (tool, result) in enumerate(results):
+        if not _grid_failed(result):
+            continue
+        failures += 1
+        if not any(
+            later_tool == tool and _tool_answered(later)
+            for later_tool, later in results[index + 1 :]
+        ):
+            unrecovered += 1
+    return failures, unrecovered
+
+
+async def _later_finding(db: AsyncSession, hunt: Hunt) -> _Hold | None:
+    """The hold for a live finding that joined the lead after the hunt started, or None.
+
+    The bound is the start of the hunt. Its objective and its evidence block
+    name the observations the lead held then. A finding that joined while the
+    hunt ran is in neither, so a clean answer says nothing about it.
+    """
+    if hunt.lead_id is None:
+        return None
+    from soc_ai.hunting.weight import Kind, is_finding_grade  # noqa: PLC0415 - avoids a cycle
+
+    # The store stamps the start of a hunt to the second, and an observation
+    # to the microsecond. An alert recorded in the second of the start would
+    # read as later than a start it came before, so that second counts as read.
+    started = hunt.created_at.replace(microsecond=0) + timedelta(seconds=1)
+    rows = await db.execute(
+        select(EntityObservation.kind, EntityObservation.birth_weight).where(
+            EntityObservation.lead_id == int(hunt.lead_id),
+            EntityObservation.shadow.is_(False),
+            EntityObservation.dismissed_at.is_(None),
+            EntityObservation.born_at >= started,
+            EntityObservation.kind.in_((Kind.ALERT.value, Kind.PRIOR_NO_BASELINE.value)),
+        )
+    )
+    kinds = {
+        str(kind) for kind, birth in rows if is_finding_grade(Kind(str(kind)), float(birth or 0.0))
+    }
+    if not kinds:
+        return None
+    what = (
+        "A true-positive alert"
+        if Kind.ALERT.value in kinds
+        else "A hit of an analytic with no benign baseline"
+    )
+    return _Hold(
+        HOLD_LATER_FINDING,
+        f"{what} joined this lead after the hunt started. The hunt did not read it.",
+    )
+
+
+async def _clean_close_blocker(db: AsyncSession, hunt: Hunt) -> _Hold | None:
     """Why a hunt that answered clean may not close its lead, or None.
 
     A hunt closes a lead as clean only when it read its evidence. The range
@@ -660,20 +1059,30 @@ async def _clean_close_blocker(db: AsyncSession, hunt: Hunt) -> str | None:
 
     - ``earlier_threat``: an earlier complete hunt on the same lead found a
       threat. A later clean answer does not undo it. The analyst decides.
-    - ``partial_read``: the report holds a visibility gap, a tool call failed
-      in the trace, the run was degraded, or the report came from the
-      budget synthesizer.
+    - ``later_finding``: a live finding joined the lead after the hunt started.
+    - ``partial_read``: the grid did not answer a call and the hunt did not
+      get that answer, the run was degraded, the run recorded an error, or
+      the report came from the budget synthesizer.
     - ``lead_link``: the citation gate lowered a threat finding that linked
       this lead to other leads (``lead_links`` on the ``citation_validation``
       event). A partial read wins over it, so the reason does not depend on
       the order of the events.
 
-    Every test reads a structured signal: the finding category, the tool
-    result's error, the ``error`` event, the ``degraded`` and ``partial``
-    flags on the ``done`` event, and the ``lead_links`` count. A console
-    string decides nothing, because a wording edit in the runner then made a
-    partial hunt close its lead as clean. The one exception is a row recorded
-    before the ``partial`` flag existed (see :data:`_LEGACY_PARTIAL_TEXT`).
+    **Only a grid failure holds a lead for a failed tool call.** Any failed
+    tool result and any visibility gap finding held one before. Seven of
+    eight production leads waited on a hunt that found no threat: on a query
+    error that the model corrected on its next call, or on a standing fact
+    such as "no agent on the host". Neither says that the hunt missed its
+    evidence. A grid failure does, when no later call of the same tool got an
+    answer. A visibility gap beside a grid failure also holds: the gap can be
+    the read that the grid lost.
+
+    Every test reads a structured signal: the finding category, the reason
+    and the type of a tool result, the ``error`` event, the ``degraded`` and
+    ``partial`` flags on the ``done`` event, and the ``lead_links`` count. A
+    console string decides nothing, because a wording edit in the runner then
+    made a partial hunt close its lead as clean. The one exception is a row
+    recorded before the ``partial`` flag existed (see :data:`_LEGACY_PARTIAL_TEXT`).
     """
     if hunt.lead_id is not None:
         earlier = await db.scalars(
@@ -684,45 +1093,58 @@ async def _clean_close_blocker(db: AsyncSession, hunt: Hunt) -> str | None:
             )
         )
         if any(hunt_outcome_of(h) == "threats" for h in earlier.all()):
-            return HOLD_EARLIER_THREAT
+            return _Hold(HOLD_EARLIER_THREAT)
+    later = await _later_finding(db, hunt)
+    if later is not None:
+        return later
 
     from soc_ai.hunting.findings import finding_category  # noqa: PLC0415 - avoids a cycle
 
     report = hunt.report if isinstance(hunt.report, dict) else {}
     findings = [f for f in (report.get("findings") or []) if isinstance(f, dict)]
-    if any(finding_category(f) == "visibility_gap" for f in findings):
-        return HOLD_PARTIAL_READ
+    a_gap = any(finding_category(f) == "visibility_gap" for f in findings)
 
     events = await db.scalars(
-        select(HuntEvent).where(
+        select(HuntEvent)
+        .where(
             HuntEvent.hunt_id == hunt.id,
             HuntEvent.kind.in_(
                 ("tool_result", "done", "model_response", "error", "citation_validation")
             ),
         )
+        .order_by(HuntEvent.sequence, HuntEvent.id)
     )
     rows = [(e.kind, e.payload if isinstance(e.payload, dict) else {}) for e in events.all()]
     # A ``done`` event that carries the partial key states the fact. Only a row
     # recorded before the key existed falls back to its frozen stored text.
     flagged = any(kind == "done" and _DONE_PARTIAL_KEY in payload for kind, payload in rows)
     linked = False
+    results: list[tuple[str, Any]] = []
     for kind, payload in rows:
         if kind == "citation_validation":
             linked = linked or _int_count(payload.get("lead_links")) > 0
             continue
         if kind == "error":
-            return HOLD_PARTIAL_READ
-        if kind == "tool_result" and _tool_failed(payload.get("result")):
-            return HOLD_PARTIAL_READ
-        if kind == "done" and (payload.get("degraded") or payload.get(_DONE_PARTIAL_KEY)):
-            return HOLD_PARTIAL_READ
+            return _Hold(HOLD_PARTIAL_READ, _NOTE_RUN_ERROR)
+        if kind == "tool_result":
+            results.append((str(payload.get("tool_name") or ""), payload.get("result")))
+        if kind == "done" and payload.get("degraded"):
+            cause = _DEGRADED_NOTES.get(str(payload.get("degraded_reason") or ""), _NOTE_DEGRADED)
+            return _Hold(HOLD_PARTIAL_READ, cause)
+        if kind == "done" and payload.get(_DONE_PARTIAL_KEY):
+            return _Hold(HOLD_PARTIAL_READ, _NOTE_BUDGET)
         if (
             not flagged
             and kind == "model_response"
             and str(payload.get("text") or "").startswith(_LEGACY_PARTIAL_TEXT)
         ):
-            return HOLD_PARTIAL_READ
-    return HOLD_LEAD_LINK if linked else None
+            return _Hold(HOLD_PARTIAL_READ, _NOTE_BUDGET)
+    failures, unrecovered = _unrecovered_grid_failures(results)
+    if unrecovered:
+        return _Hold(HOLD_PARTIAL_READ, _NOTE_GRID_UNANSWERED)
+    if failures and a_gap:
+        return _Hold(HOLD_PARTIAL_READ, _NOTE_GRID_AND_GAP)
+    return _Hold(HOLD_LEAD_LINK) if linked else None
 
 
 def _int_count(value: Any) -> int:
@@ -762,7 +1184,8 @@ async def derived_hold_reason(db: AsyncSession, lead: Lead) -> str | None:
         return None
     if hunt_outcome_of(hunt) != "clean":
         return None
-    return await _clean_close_blocker(db, hunt)
+    blocker = await _clean_close_blocker(db, hunt)
+    return blocker.reason if blocker is not None else None
 
 
 def _verdicts_decide(hunt: Hunt) -> bool:
@@ -784,50 +1207,81 @@ def _subject_links(hunt: Hunt) -> dict[int, Any]:
     return subject_links(finding_links(hunt), report.get("findings"))
 
 
-async def _subject_verdicts(
+async def _subject_runs(
     db: AsyncSession, hunt: Hunt, links: dict[int, Any]
-) -> list[dict[str, Any]] | None:
-    """The verdict of every subject finding of the hunt, or None when one has none.
+) -> list[dict[str, Any]]:
+    """One entry for each subject finding of the hunt, in ordinal order.
 
     ``links`` holds the entries of the subject findings (:func:`_subject_links`).
-    One entry per subject finding, in ordinal order: the ordinal, the
-    investigation, its verdict and its confidence. Only a complete run that is
-    not a pipeline fallback carries a verdict.
+    An entry states the ordinal, the investigation, its verdict and its
+    confidence. ``verdict`` is None for a finding with no verdict: only a
+    complete run that is not a pipeline fallback carries one.
     """
     from soc_ai.store.models import Investigation  # noqa: PLC0415 - local, like the hunt reads
 
-    if not links:
-        return None
     ids = [link.investigation_id for link in links.values() if link.investigation_id]
-    if len(ids) < len(links):
-        return None
-    rows = await db.execute(
-        select(
-            Investigation.id,
-            Investigation.status,
-            Investigation.verdict,
-            Investigation.confidence,
-            Investigation.is_fallback,
-        ).where(Investigation.id.in_(ids))
-    )
-    runs = {str(r[0]): r for r in rows.all()}
+    runs: dict[str, Any] = {}
+    if ids:
+        rows = await db.execute(
+            select(
+                Investigation.id,
+                Investigation.status,
+                Investigation.verdict,
+                Investigation.confidence,
+                Investigation.is_fallback,
+            ).where(Investigation.id.in_(ids))
+        )
+        runs = {str(r[0]): r for r in rows.all()}
     out: list[dict[str, Any]] = []
     for ordinal in sorted(links):
-        run = runs.get(links[ordinal].investigation_id or "")
-        if run is None:
-            return None
-        _id, status, verdict, confidence, fallback = run
-        if status != "complete" or fallback is True or not verdict:
-            return None
+        run_id = links[ordinal].investigation_id
+        run = runs.get(run_id or "")
+        verdict: str | None = None
+        confidence: Any = None
+        if run is not None:
+            _id, status, stored, confidence, fallback = run
+            if status == "complete" and fallback is not True and stored:
+                verdict = str(stored)
         out.append(
             {
                 "ordinal": ordinal,
-                "investigation_id": str(_id),
-                "verdict": str(verdict),
-                "confidence": confidence,
+                "investigation_id": str(run_id) if run is not None else None,
+                "verdict": verdict,
+                "confidence": confidence if verdict is not None else None,
             }
         )
     return out
+
+
+async def _subject_verdicts(
+    db: AsyncSession, hunt: Hunt, links: dict[int, Any]
+) -> list[dict[str, Any]] | None:
+    """The verdict of every subject finding of the hunt, or None when one has none."""
+    runs = await _subject_runs(db, hunt, links)
+    if not runs or any(run["verdict"] is None for run in runs):
+        return None
+    return runs
+
+
+def _no_verdict_note(runs: Sequence[dict[str, Any]]) -> str | None:
+    """What a lead held on a missing verdict states: the count, and a confirmed threat.
+
+    Production lead 66 held a true positive that the Oracle confirmed, and it
+    waited on one failed run. Its page read the same as the leads of seven
+    hunts that found no threat.
+    """
+    if not runs:
+        return None
+    missing = sum(1 for run in runs if run["verdict"] is None)
+    threats = sum(1 for run in runs if run["verdict"] == "true_positive")
+    note = (
+        f"{missing} of {len(runs)} threat findings {'has' if missing == 1 else 'have'} no verdict."
+    )
+    if threats == 1:
+        note += " 1 finding is a true positive."
+    elif threats:
+        note += f" {threats} findings are true positives."
+    return note
 
 
 async def settle_after_hunt(db: AsyncSession, hunt: Hunt, *, now: datetime | None = None) -> str:
@@ -840,6 +1294,7 @@ async def settle_after_hunt(db: AsyncSession, hunt: Hunt, *, now: datetime | Non
       reopened is theirs to decide; it waits instead. A hunt that did not
       read all its evidence, or a lead an earlier hunt found a threat on,
       waits too, and the history records why (:func:`_clean_close_blocker`).
+      A failed tool call holds the lead only when the grid did not answer.
     - ``threats`` or ``gap``: the lead waits on the analyst. A threat is a
       decision, and a gap cannot be hunted away.
     - anything else (a query raised, or the hunt ended in error, cancelled
@@ -869,24 +1324,30 @@ async def settle_after_hunt(db: AsyncSession, hunt: Hunt, *, now: datetime | Non
     if links:
         if analyst_dismissed(lead):
             return "waits"
-        decided = await _subject_verdicts(db, hunt, links)
-        if decided is None:
+        decided = await _subject_runs(db, hunt, links)
+        if any(run["verdict"] is None for run in decided):
             # Recorded once per hunt, like the hold of a clean hunt. Prod lead
             # 47 (2026-10-24) waited on one failed run with no reason on its
-            # page, while its sibling lead with every verdict closed.
-            if hold_reason_of(lead) != HOLD_NO_VERDICT:
-                record_decision(
-                    lead,
-                    "held",
-                    at,
-                    by=SYSTEM_HUNT_ACTOR,
-                    reason=HOLD_NO_VERDICT,
-                    hunt_id=hunt.id,
-                )
-                lead.updated_at = at
+            # page, while its sibling lead with every verdict closed. A
+            # missing verdict is no grid failure, and it still holds: the
+            # finding that nobody judged can be the threat.
+            hold = _Hold(HOLD_NO_VERDICT, _no_verdict_note(decided))
+            if _record_hold(lead, at, by=SYSTEM_HUNT_ACTOR, hold=hold, hunt_id=hunt.id):
                 await db.commit()
                 _LOGGER.info(
                     "lead %s waits: a subject finding of hunt %s has no verdict", lead.id, hunt.id
+                )
+            return "waits"
+        # Verdicts with no true positive read as "no threat confirmed". That
+        # is no answer for a finding the hunt did not read. A true positive
+        # among them confirms a threat, and the lead closes on it.
+        confirmed = any(run["verdict"] == "true_positive" for run in decided)
+        later = None if confirmed else await _later_finding(db, hunt)
+        if later is not None:
+            if _record_hold(lead, at, by=SYSTEM_HUNT_ACTOR, hold=later, hunt_id=hunt.id):
+                await db.commit()
+                _LOGGER.info(
+                    "lead %s waits: a finding joined it after hunt %s started", lead.id, hunt.id
                 )
             return "waits"
         first = next((v for v in decided if v["verdict"] == "true_positive"), decided[0])
@@ -916,13 +1377,11 @@ async def settle_after_hunt(db: AsyncSession, hunt: Hunt, *, now: datetime | Non
         if blocker is not None:
             # Recorded once per hunt. The reconciliation pass calls this on
             # every wake, and a second entry would say nothing new.
-            if hold_reason_of(lead) != blocker:
-                record_decision(
-                    lead, "held", at, by=AUTO_HUNT_ACTOR, reason=blocker, hunt_id=hunt.id
-                )
-                lead.updated_at = at
+            if _record_hold(lead, at, by=AUTO_HUNT_ACTOR, hold=blocker, hunt_id=hunt.id):
                 await db.commit()
-                _LOGGER.info("lead %s waits: hunt %s answered clean, %s", lead.id, hunt.id, blocker)
+                _LOGGER.info(
+                    "lead %s waits: hunt %s answered clean, %s", lead.id, hunt.id, blocker.reason
+                )
             return "waits"
         record_decision(
             lead,
@@ -1369,6 +1828,11 @@ def _lead_facts(lead: Lead, observations: Sequence[EntityObservation]) -> _LeadF
     )
 
 
+def alert_rule_of(observation: EntityObservation) -> str | None:
+    """The rule that raised an alert observation, for a reader outside this module."""
+    return _alert_rule_of(observation)
+
+
 def _alert_rule_of(o: EntityObservation) -> str | None:
     """The rule that raised an alert observation.
 
@@ -1425,17 +1889,33 @@ def _reason(mine: _LeadFacts, theirs: _LeadFacts) -> str | None:
     return None
 
 
+# The statuses a related lead can hold. A dismissed or promoted lead is an
+# answer. A fleet condition is one condition on many hosts, which is a rollout
+# far more often than an attacker, so it is no campaign question either.
+_RELATABLE_STATUSES: tuple[str, ...] = ("open", "hunting")
+
+
 async def _open_leads_since(db: AsyncSession, *, days: int, now: datetime | None) -> list[Lead]:
     """The open leads formed inside the window, newest first.
 
     Open means an analyst has not answered it. A dismissed or promoted lead is
     an answer, and naming it beside a new lead sends the analyst back over
     ground somebody has already covered.
+
+    A fleet condition lead and a shadow lead are left out. Production lead
+    hunt 01M6M7PY21P60193JHXRZYNPBF named 8 related leads, each a shadow fleet
+    lead from a rate analytic, and wrote that they share one incident. It read
+    none of those hosts. A shadow analytic records and never acts, so its lead
+    must not put a campaign question into a hunt.
     """
     cutoff = (_naive(now) or datetime.now(UTC).replace(tzinfo=None)) - timedelta(days=days)
     rows = await db.scalars(
         select(Lead)
-        .where(Lead.status.not_in(tuple(CLOSED_STATUSES)), Lead.formed_at >= cutoff)
+        .where(
+            Lead.status.in_(_RELATABLE_STATUSES),
+            Lead.shadow.is_(False),
+            Lead.formed_at >= cutoff,
+        )
         .order_by(Lead.formed_at.desc(), Lead.id.desc())
         .limit(200)
     )
@@ -1466,7 +1946,8 @@ async def related_leads(
     Three shares say that two leads may be one story: the same analytic inside
     a working day, the same external network, the same ATT&CK technique. A
     lead that names one of this lead's own entities is left out, because that
-    is one entity's story and not a move across two.
+    is one entity's story and not a move across two. A fleet condition lead
+    and a shadow lead are left out too (:func:`_open_leads_since`).
 
     Nothing is stored. The open leads are few, and a stored relation would go
     stale as soon as an analyst dismissed either lead.

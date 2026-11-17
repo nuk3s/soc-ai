@@ -1,10 +1,13 @@
 import type { ReactNode } from 'react';
 import { MessageSquare } from 'lucide-react';
 
-import { CHIP_SUBJECT_HUNT } from '../lib/tooltips';
-import type { DetectionKind, HuntKind } from '../lib/types';
+import { AUTHORIZED_MARK, markHolds } from '../lib/authorizedActivity';
+import { CHIP_AUTHORIZED_ACTIVITY, CHIP_SUBJECT_HUNT } from '../lib/tooltips';
+import type { InvestigationCampaign } from '../lib/api';
+import type { AuthorizationRef, DetectionKind, HuntKind } from '../lib/types';
 import { HuntKindBadge, KindBadge, RunClassChip, SyntheticEvalBadge } from './Badges';
 import { BacktestReplayChip } from './BacktestReplayChip';
+import { CampaignChip } from './campaign/CampaignChip';
 
 // ---------------------------------------------------------------------------
 // The tags column.
@@ -26,7 +29,7 @@ export const TAGS_COLUMN = '160px';
 
 /** The tooltip on the column header. */
 export const TAGS_HEADER_TITLE =
-  'The tags of the row. A tag states the type, the depth of the run or a mark on the row. ' +
+  'The tags of the row. A tag states the type, the campaign, the depth of the investigation or a mark on the row. ' +
   'The order is the same on every list.';
 
 /** The header of the tags column. */
@@ -46,6 +49,9 @@ export interface RowTagsProps {
   testId?: string;
   /** The detection type. */
   kind?: DetectionKind;
+  /** The campaign of the investigation of the row. The chip links to it. */
+  campaign?: InvestigationCampaign | null;
+  campaignTestId?: string;
   /** The run read a hunt. */
   subjectHunt?: boolean;
   subjectTestId?: string;
@@ -58,6 +64,8 @@ export interface RowTagsProps {
   /** The run is a backtest replay. */
   replay?: boolean;
   replayTestId?: string;
+  /** The authorized activity the run matched. A revoked one shows no chip. */
+  authorized?: AuthorizationRef | null;
   /** The handled counts of an alert group. */
   counts?: ReactNode;
   /** An operator dismissed the failure. */
@@ -71,14 +79,16 @@ export interface RowTagsProps {
 }
 
 /**
- * The tags of one row, in the one order: type, hunt subject, hunt kind,
- * depth, synthetic mark, replay mark, handled counts, dismissed, superseded,
- * related runs, chat count. The cell renders on a row with no tag too, so
+ * The tags of one row, in the one order: type, campaign, hunt subject, hunt kind,
+ * depth, synthetic mark, replay mark, authorized activity, handled counts,
+ * dismissed, superseded, related runs, chat count. The cell renders on a row with no tag too, so
  * the column holds its width on every row.
  */
 export function RowTags({
   testId = 'row-tags',
   kind,
+  campaign,
+  campaignTestId,
   subjectHunt,
   subjectTestId,
   huntKind,
@@ -86,6 +96,7 @@ export function RowTags({
   synthetic,
   replay,
   replayTestId,
+  authorized,
   counts,
   dismissed,
   superseded,
@@ -95,6 +106,7 @@ export function RowTags({
   return (
     <div data-testid={testId} className="flex min-w-0 flex-wrap items-center gap-1">
       {kind && <KindBadge kind={kind} />}
+      <CampaignChip campaign={campaign} testId={campaignTestId} />
       {subjectHunt && (
         <span data-testid={subjectTestId} title={CHIP_SUBJECT_HUNT} className={`${CHIP} text-dim`}>
           hunt
@@ -111,6 +123,15 @@ export function RowTags({
       )}
       {synthetic && <SyntheticEvalBadge />}
       {replay && <BacktestReplayChip testId={replayTestId} />}
+      {markHolds(authorized) && (
+        <span
+          data-testid="authorized-chip"
+          title={`${CHIP_AUTHORIZED_ACTIVITY} The label is "${authorized.label}".`}
+          className={`${CHIP} border-accent text-accent`}
+        >
+          {AUTHORIZED_MARK}
+        </span>
+      )}
       {counts}
       {dismissed && (
         <span

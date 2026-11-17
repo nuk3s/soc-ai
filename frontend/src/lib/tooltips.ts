@@ -25,24 +25,71 @@
 import { CLOSE_RULE_CLAUSE } from './leadDecisions';
 
 export const DEFINE_HIT =
-  'A hit is one match of one analytic on one entity. A live hit adds weight to a lead. A ' +
-  'shadow hit adds no weight. It waits for you to read it and to approve or reject the ' +
-  'analytic that wrote it.';
+  'A hit is one match of one analytic on one entity: an observation with the records behind ' +
+  'it. A live hit adds weight to a lead. A shadow hit adds no weight, and you review it to ' +
+  'approve or reject the analytic that wrote it.';
 
 export const DEFINE_LEAD =
-  'A lead is a set of observations on one entity that are worth one decision: hunt it or ' +
-  'dismiss it.';
+  'A lead is a set of observations on one entity that are worth one look. soc-ai hunts each ' +
+  'new lead that is not a shadow lead. A clean hunt or a verdict on each threat it found ' +
+  'closes the lead. A lead of a campaign holds only alerts of the investigations of one ' +
+  'campaign. It waits on that campaign, and a close or an authorization of the campaign ' +
+  'dismisses it. Any other lead waits on you.';
 
 export const DEFINE_HUNT =
-  'A hunt is one run against one objective. The model or a catalog query runs it. soc-ai ' +
-  'investigates each threat finding when the hunt ends. You, a schedule or a lead can start one.';
+  'A hunt is one search of the grid for one objective, and a lead, a campaign, a schedule or ' +
+  'you start it. It reads the open campaigns and reports only new activity on their machines. ' +
+  'It returns findings and takes no action. When the hunt ends, soc-ai investigates each ' +
+  'threat finding that names an entity, up to 20 for each hunt, unless a campaign holds the ' +
+  'finding.';
 
 export const DEFINE_SCHEDULE =
   'A schedule starts a hunt on an interval and writes a hunt row on every run.';
 
 export const DEFINE_ANALYTIC =
-  'An analytic is one written detection. The sweep runs each analytic. A live analytic ' +
-  'records hits that can form a lead. A shadow analytic records hits for you to read.';
+  'An analytic is one written detection. The sweep reads the grid with each live and shadow ' +
+  'analytic every hour, when the operator turns it on. A live analytic records hits that can ' +
+  'form a lead, and a shadow analytic records hits for you to review.';
+
+// The rest of the flow: the alert path, the investigation and the campaign.
+// The "How this flows" drawer prints these lines under the chart, in the order
+// the chart reads. The chart of 2026-10-07 left out the campaign, and a review
+// of 2026-11-14 found nine places where it differed from the code.
+
+export const DEFINE_ALERT =
+  'An alert is a detection that the grid raised. One investigation serves the alerts of one ' +
+  'rule between two addresses, and the other alerts take its verdict for 7 days.';
+
+export const DEFINE_INVESTIGATION =
+  'An investigation is the work of soc-ai on one alert or one hunt finding, dated by the time ' +
+  'of its event. It cites its evidence, ends in a verdict and writes an audit record.';
+
+export const DEFINE_VERDICT =
+  'A verdict is true positive, false positive or needs more info, and you can override it. ' +
+  'When the operator turns on auto-acknowledge, soc-ai acknowledges a confident false ' +
+  'positive, except on a critical, high, exploit or malware alert.';
+
+export const DEFINE_CAMPAIGN =
+  'A campaign is one activity: a confirmed attack from one machine on another, and the ' +
+  'investigations that proven links join to it. soc-ai builds the campaigns again after each ' +
+  'verdict. soc-ai starts at most one hunt for a campaign in 24 hours. A higher stage, a new ' +
+  'machine, new activity after a close or activity beyond an authorization starts one.';
+
+export const DEFINE_CAMPAIGN_DECISION =
+  'You open one Security Onion case for the whole campaign, close the campaign with a reason, ' +
+  'or record its activity as authorized until an expiry. An administrator records the ' +
+  'authorization. New activity opens a closed campaign again, and activity outside the ' +
+  'authorization gets normal handling.';
+
+export const DEFINE_NEEDS_YOU =
+  'Needs you lists the work that waits on you, the oldest first. The work is the campaigns ' +
+  'with no decision, the investigations that wait, the leads that need a decision and the ' +
+  'alert groups with no verdict. The top bar, the Dashboard and the Needs you page state the ' +
+  'same number.';
+
+export const DEFINE_TWO_VERBS =
+  '"Hunt this lead" starts the hunt of a lead now. "Open an investigation" is the control on ' +
+  'a finding with no investigation, and the press also writes an observation.';
 
 // ── The fold of a section ───────────────────────────────────────────────────
 //
@@ -84,6 +131,29 @@ export const PILL_CLOSED_ON_VERDICTS = `Closed: soc-ai closed this lead. ${CLOSE
 export const PILL_PROMOTED =
   'Promoted: an analyst opened an investigation from this lead. The lead is closed.';
 
+/** The line of a closed lead that observations joined after the close. The
+ *  horizon is the decay horizon of soc_ai.hunting.leads. */
+export const REPEATS_AFTER_CLOSE =
+  'A true positive alert of a rule this lead held joins the closed lead for 207 hours. ' +
+  'It starts no hunt.';
+
+/** What a fleet condition is, in one line. The Fleet condition tab prints it,
+ *  and the pill and the legend read the same words. The span cap is
+ *  DEFAULT_SPAN_CAP in soc_ai/hunting/leads.py. Only a profile departure
+ *  counts toward it. */
+export const FLEET_CONDITION_LINE =
+  'A fleet condition is one departure that more than 8 hosts hold at one time. A change to ' +
+  'the network causes it more often than an attack does. A fleet condition lead waits on no ' +
+  'decision, and soc-ai starts no hunt on it.';
+
+/** The pill of a lead in the stored status `fleet_condition`. The pill read
+ *  "New", and 47 of 70 leads on production then read as work nobody had
+ *  started (review 2026-11-12, F1). */
+export const PILL_FLEET_CONDITION =
+  'Fleet condition: more than 8 hosts hold one departure of this lead at one time. A change ' +
+  'to the network causes that more often than an attack does. The lead waits on no decision, ' +
+  'and soc-ai starts no hunt on it. You can hunt it or dismiss it.';
+
 /** The one sentence on the Reopen button. The strip said "back in the queue"
  *  and the lead page said "back in the new list", which is two names for one
  *  place. The pill sentence above names the queue, so the queue it is. */
@@ -111,9 +181,40 @@ export const TAB_CLOSED =
   'Leads an analyst dismissed or opened an investigation on, and leads a hunt closed when it found no threat. ' +
   `soc-ai also closes a lead when ${CLOSE_RULE_CLAUSE}. Reopen puts one back.`;
 
+export const TAB_FLEET_CONDITION =
+  'Leads that are a fleet condition. Nothing waits on you here. ' + FLEET_CONDITION_LINE;
+
 export const TAB_ALL = 'Every lead, in every state.';
 
+/** The line beside the tab counts while auto-hunt holds new leads. Such a
+ *  lead is in no tab but All, so the four tab counts and this count sum to
+ *  the All count. */
+export function leadsQueuedNote(n: number): string {
+  return n === 1
+    ? '1 new lead waits on auto-hunt. The All tab lists it.'
+    : `${n.toLocaleString()} new leads wait on auto-hunt. The All tab lists them.`;
+}
+
+/** The leads that an active campaign holds. They wait on no hunt and on no
+ *  decision of their own: the analyst decides on the campaign. */
+export function leadsOfCampaignNote(n: number): string {
+  return n === 1
+    ? '1 lead waits on its campaign. The All tab lists it.'
+    : `${n.toLocaleString()} leads wait on their campaign. The All tab lists them.`;
+}
+
 // ── The analytic chips ──────────────────────────────────────────────────────
+
+// ── Authorized activity ─────────────────────────────────────────────────────
+
+export const DEFINE_AUTHORIZED_ACTIVITY =
+  'Authorized activity is activity that an analyst recorded as authorized: a label, a scope ' +
+  'and an expiry. An investigation inside the scope keeps its true positive verdict. It requests ' +
+  'no case and raises no notification of its own. An investigation outside the scope gets normal handling.';
+
+export const CHIP_AUTHORIZED_ACTIVITY =
+  'Authorized activity: this investigation is inside a scope that an analyst recorded as authorized. ' +
+  'It keeps its verdict and requests no case.';
 
 export const CHIP_LIVE = 'Live: the analytic runs on every sweep. Its hits count and can form leads.';
 
@@ -194,6 +295,29 @@ export const HIT_FILTERS =
   'Hit filters. Unread: shadow hits nobody has opened or acted on. ' +
   'Live: hits from live analytics. Shadow: hits from analytics in shadow.';
 
+// ── The header of one analytic in the hits block ────────────────────────────
+//
+// 233 unread hits came from 3 analytics, and each card repeated the two
+// decisions on its analytic (review 2026-11-12, F2). The decisions sit once on
+// the header of the analytic, and each button states its effect: one line in
+// plain view, and the same sentence on the hover. Each line starts with the
+// name of its button, as the lines on the lead page do.
+
+export const HIT_GROUP_APPROVE =
+  'Approve analytic. The analytic goes live, and its hits then count toward a lead.';
+
+export const HIT_GROUP_REJECT =
+  'Reject analytic. The analytic is retired and stops. Its hits leave this list.';
+
+/** The effect of "Mark N read". `n` is the number on the button. */
+export function hitGroupMarkRead(n: number): string {
+  const hits = n === 1 ? 'The 1 unread hit of this analytic is' : `The ${n.toLocaleString()} unread hits of this analytic are`;
+  return `Mark ${n.toLocaleString()} read. ${hits} marked read. The analytic keeps its status.`;
+}
+
+export const HIT_GROUP_FOLD =
+  'The header counts every hit of the analytic. The rows under it are the hits the list has read.';
+
 // ── The hunt type chips ─────────────────────────────────────────────────────
 
 export const TYPE_ALL = 'Every hunt in the window. The catalog runs are included.';
@@ -203,6 +327,7 @@ export const TYPE_MANUAL = 'Hunts an analyst started from an objective.';
 export const TYPE_SCHEDULE = 'Hunts a schedule started.';
 
 export const TYPE_LEAD = 'Hunts started from a lead.';
+export const TYPE_CAMPAIGN = 'Hunts that soc-ai started on a change of a campaign.';
 
 export const TYPE_CATALOG =
   'Runs the analytic sweep recorded. The sweep records a run when an analytic cannot read its data.';
@@ -236,7 +361,8 @@ export const LEAD_LEGEND =
   'Needs decision: the lead is New or Hunted, and it waits on you. ' +
   'In progress: a hunt is running. ' +
   'Closed: an analyst dismissed the lead or opened an investigation on it. soc-ai also closes ' +
-  `a lead when its hunt finds no threat, or when ${CLOSE_RULE_CLAUSE}.`;
+  `a lead when its hunt finds no threat, or when ${CLOSE_RULE_CLAUSE}. ` +
+  'Fleet condition: one departure is on more than 8 hosts at one time. It waits on no decision.';
 
 /** The chip on an analytic in the stored status `candidate`. The screen word
  *  is "draft": the analytic is written and has never run. */
@@ -332,7 +458,7 @@ export const FILTER_ALL = TYPE_ALL;
 export const FILTER_CATALOG = TYPE_CATALOG;
 
 export const STATUS_INVESTIGATION =
-  'Where the investigation is. A run that is still going has no verdict yet.';
+  'Where the investigation is. An investigation that is still going has no verdict yet.';
 
 /** One sentence per hunt status. A hunt that was cancelled, interrupted or
  *  errored did not run to the end, and the row names the reason.
@@ -364,7 +490,7 @@ export const COUNT_AFFECTED_HOSTS = 'The hosts the findings of this hunt name.';
 
 export const COUNT_MITRE = 'The MITRE ATT&CK techniques the findings of this hunt name.';
 
-export const COUNT_AGE = 'When the run started.';
+export const COUNT_AGE = 'The time of the event that the investigation judges.';
 
 export const CHIP_INTERVAL = 'The interval a schedule runs at.';
 
@@ -403,7 +529,8 @@ export const DIFF_NEW = 'Findings this run reported and the last run did not.';
 
 export const DIFF_PERSISTING = 'Findings both runs reported.';
 
-export const DIFF_RESOLVED = 'Findings the last run reported and this run did not.';
+export const DIFF_NOT_REPORTED =
+  'Findings the last run reported and this run did not. The activity can still run.';
 
 export const STEP_DETAIL = 'Open the step to read what the agent did.';
 
@@ -477,14 +604,64 @@ export const COUNT_ALERT_EVENTS =
  *  2026-10-07: "What is the user flow?"). The "How this flows" link follows
  *  it. */
 export const OVERVIEW_FLOW =
-  'soc-ai investigates alerts and runs hunts. You make each decision in Needs you. ' +
-  'soc-ai sends your actions to Security Onion.';
+  'soc-ai investigates alerts, hunts leads and joins confirmed attacks into campaigns. You ' +
+  'decide in Needs you, and soc-ai writes your actions to Security Onion.';
 
 export const COUNT_NEEDS_YOU =
-  'The work that waits on you: leads to decide, unread shadow hits, alert groups with no verdict, verdicts that need more info and recommended actions. The sidebar badges and the bell state the same count.';
+  'The decisions that wait on you: campaigns with no decision, leads to decide, alert groups with no verdict, verdicts that need more info and recommended actions. The bell states the same count. Unread shadow hits are review work, and the tile states them on their own line.';
 
 export const COUNT_TRUE_POSITIVES =
-  'Investigations in this window with a true positive verdict. The Investigations list counts the same runs with the same query.';
+  'True positives in this window. The Confirmed threats panel states the same count and lists each target host.';
+
+// ── Confirmed threats ───────────────────────────────────────────────────────
+//
+// The first panel of the Dashboard and of the Hunt Console, and the strip on
+// a host page. The review of 2026-11-12 found the one result that needed a
+// response 10,900 px down the Hunt Console, and a Dashboard with two true
+// positive counts and no host name.
+
+/** The line under the panel title. */
+export const DEFINE_CONFIRMED_THREATS =
+  'A confirmed threat is a true positive verdict. The panel lists the campaigns first, the worst ' +
+  'stage first. It merges the other investigations by target host and lists the worst host first.';
+
+/** The word and the sentence of each impact chip. Only Succeeded and
+ *  Attempted wear a color. */
+export const CHIP_IMPACT: Record<'succeeded' | 'attempted' | 'unknown' | 'none', { label: string; title: string }> = {
+  succeeded: {
+    label: 'Succeeded',
+    title: 'Succeeded: the evidence shows that the attack worked on the target.',
+  },
+  attempted: {
+    label: 'Attempted',
+    title: 'Attempted: the evidence shows an attack on the target. It shows no success.',
+  },
+  unknown: {
+    label: 'Impact unknown',
+    title: 'Impact unknown: the evidence does not show if the attack worked.',
+  },
+  none: {
+    label: 'No impact',
+    title: 'No impact: the evidence shows no effect on the target.',
+  },
+};
+
+/** The primary link of a row with recommended actions that wait. */
+export const THREAT_ACTIONS_WAIT =
+  'Recommended actions wait for your decision. The link opens the newest investigation of this host.';
+
+/** The primary link of a row with no action that waits. */
+export const THREAT_OPEN =
+  'The link opens the true positive investigations of this host in this window.';
+
+/** The quiet line of a group inside an authorized activity record. */
+export const THREAT_AUTHORIZED =
+  'Each investigation of this group is inside an authorized activity record. The investigations ' +
+  'keep the true positive verdict. The link opens the investigations.';
+
+/** The count of the investigations of a campaign inside an authorized activity record. */
+export const THREAT_CAMPAIGN_AUTHORIZED =
+  'True positive investigations of this campaign inside an authorized activity record. They request no case.';
 
 export const COUNT_RUNNING = 'Investigations soc-ai is working now.';
 
@@ -553,12 +730,89 @@ export const ACTION_HUNT =
 export const LEAD_ACTIONS_LINE =
   'Hunt this lead. soc-ai investigates each threat finding of the hunt and shows the verdicts.';
 
+// ── The lead page: one effect line for each button ──────────────────────────
+//
+// The lead page printed the hunt line above over every open lead. A lead with
+// the pill "Hunted · No threat found" then read "Hunt this lead. ..." and
+// offered no such button. The other buttons stated no effect (review
+// 2026-11-12, F5). Each button the page shows now has one line, and the page
+// prints the lines of the buttons it shows. Each line starts with the name of
+// its button. The keys are the keys of LEAD_ACTION in LeadsStrip.tsx.
+
+export const LEAD_ACTION_EFFECT = {
+  hunt: LEAD_ACTIONS_LINE,
+  huntNow: 'Hunt now. The hunt starts now. The lead does not wait for auto-hunt.',
+  dismiss:
+    'Dismiss. The lead closes with the reason that you choose. The observations on the lead ' +
+    'and their repeats then form no new lead.',
+  viewHunt: 'View hunt. The page of the hunt opens. The hunt still runs.',
+  readHunt:
+    'Read hunt. The page of the hunt opens with the findings, the narrative and the verdicts.',
+  huntAgain:
+    'Hunt again. One more hunt starts after a confirm. The lead then points at the new hunt.',
+  reopen:
+    'Reopen. The lead goes back in the queue and waits on you. Auto-hunt starts no hunt on a ' +
+    'reopened lead.',
+  viewInvestigation: 'View investigation. The page of the investigation on this lead opens.',
+} as const;
+
+/** The two buttons of the verdict strip on the lead page. */
+export const LEAD_VERDICT_EFFECT = {
+  close: 'Close the lead. The lead closes and names this investigation.',
+  keep: 'Keep open. The lead stays open. The page does not ask again about this investigation.',
+} as const;
+
+// ── The dismissal reasons ───────────────────────────────────────────────────
+//
+// The form listed nine reasons and stated the effect of none. The store keeps
+// the reason on the lead and in its history (soc_ai/store/leads.py, dismiss).
+// The lead quality report and the ledger of each analytic count it
+// (routes_hunts.py lead_quality, soc_ai/hunting/ledger.py). No code reads a
+// reason to change a baseline, an analytic, a role or a host. So every effect
+// line says what the reason records and what it leaves as it is.
+
+export const DISMISS_REASON_COMMON =
+  'Each reason closes the lead in the same way. The history of the lead keeps the reason, and ' +
+  'the lead quality report counts it. No reason changes a baseline, an analytic or a host.';
+
+export const DISMISS_REASON_EFFECT: Record<string, string> = {
+  expected_for_role:
+    'Records that the role of the host explains the observations. The role of the host does not change.',
+  known_change:
+    'Records that a known change caused the observations. soc-ai stores no exception for the change.',
+  benign_repeat:
+    'Records that the observations repeat a benign pattern. soc-ai stores no rule for the pattern.',
+  bad_baseline: 'Records that the baseline is wrong. The baseline does not change.',
+  authorized_test:
+    'Records that an authorized test or scan caused the observations. The reason authorizes no later activity.',
+  duplicate:
+    'Records that another lead or investigation holds this work. soc-ai links no other record to this lead.',
+  bad_analytic_logic:
+    'Records that the analytic logic is wrong. The analytic keeps its status and still runs. Its ledger counts this dismissal.',
+  lab_host:
+    'Records that the host is a lab host or a test host. The host gets no mark, and a new observation on it can form a new lead.',
+  other: 'Records no specific cause. State the cause in the note.',
+};
+
+/** The line under the reason select: the effect of the chosen reason, then
+ *  what every reason does. With no reason chosen it is the common line. */
+export function dismissReasonEffect(reason: string): string {
+  const own = DISMISS_REASON_EFFECT[reason];
+  return own ? `${own} ${DISMISS_REASON_COMMON}` : DISMISS_REASON_COMMON;
+}
+
+/** The mark on a lead whose live weight is under the weight a lead forms at.
+ *  "weight now 0.32" sat behind the Scoring toggle, and a lead forms at 0.85. */
+export const WEIGHT_DECAYED =
+  'The live weight of this lead is under the weight at which a lead forms. ' +
+  `${SIGHTING_HALF_WEIGHT} A sweep that sees it again adds weight.`;
+
 /** The hover of "Open an investigation" on a finding that has no
  *  investigation. The hunt investigates its findings, and this is the manual
  *  control for a finding it left. */
 export const ACTION_OPEN_INVESTIGATION =
-  'Open an investigation on this finding. The control starts one run of the model on the ' +
-  'evidence that the finding cites. The run ends in a verdict and recommended actions.';
+  'Open an investigation on this finding. The control starts the model on the evidence ' +
+  'that the finding cites. The investigation ends in a verdict and recommended actions.';
 
 /** The depth chip on an investigation: how far the run was allowed to go.
  *
@@ -582,7 +836,7 @@ export const CHIP_RUN_CLASS: Record<string, { label: string; title: string }> = 
   deep: {
     label: 'Depth: deep',
     title:
-      'Deep. An analyst asked for a deep re-run. The model investigated with every read tool ' +
+      'Deep. An analyst asked for a deep investigation. The model investigated with every read tool ' +
       'at the full budget. The Oracle reviews an uncertain verdict.',
   },
   rule_prior: {
@@ -596,13 +850,13 @@ export const CHIP_RUN_CLASS: Record<string, { label: string; title: string }> = 
  *  rows only read as a property the other rows lack. */
 export const CHIP_RUN_CLASS_NONE = {
   label: 'Depth: not recorded',
-  title: 'soc-ai recorded no depth for this run. A run from before depths existed has none.',
+  title: 'soc-ai recorded no depth for this investigation. An investigation from before depths existed has none.',
 };
 
 /** The same chip on a run still in progress. The depth is written when it ends. */
 export const CHIP_RUN_CLASS_PENDING = {
   label: 'Depth: pending',
-  title: 'The run is in progress. soc-ai records its depth when it ends.',
+  title: 'The investigation is in progress. soc-ai records its depth when it ends.',
 };
 
 /** Why a verdict went to the Oracle. The codes the uncertainty rule and the
@@ -611,10 +865,11 @@ export const CHIP_RUN_CLASS_PENDING = {
 export const ORACLE_REASON: Record<string, string> = {
   confidence_in_band: 'The confidence is in the gate band, from 0.4 to below 0.7.',
   template_split: 'The decision template and the model disagree on the verdict.',
-  deep_needs_more_info: 'A deep re-run ended with the verdict Needs more info.',
+  deep_needs_more_info: 'A deep investigation ended with the verdict Needs more info.',
   needs_more_info: 'The local verdict is Needs more info.',
   malware_non_tp: 'A malware or attack rule has a local verdict other than True positive.',
   below_confidence: 'The local confidence is below 0.6.',
+  fallback_route: 'A fallback model route served this investigation.',
 };
 
 /** The Oracle rule shadow tally in the Detection tuning panel. */
@@ -624,15 +879,26 @@ export const ORACLE_SHADOW_CAPTION =
 
 /** The Rule prior column of the Detection tuning panel. */
 export const RULE_PRIOR_COLUMN =
-  'The rule prior gives a scheduled alert the verdict of its rule\'s latest model run. ' +
-  'The column counts the alerts it covered in the last 30 days. It counts how many real verdicts agreed.';
+  'The rule prior gives a scheduled alert the verdict of the latest investigation of its rule by the model. ' +
+  'The column counts the alerts it covered in the last 30 days. ' +
+  'It counts the real verdicts that agreed and disagreed.';
 
 export const RULE_PRIOR_SUSPENDED =
-  'A real run disagreed with the rule prior on this rule. The prior stays off for the rule. ' +
-  'Read the disagreeing run. Then clear the suspension.';
+  'The model disagreed with the rule prior on an alert of this rule. The prior stays off for the rule. ' +
+  'Read the investigation that disagreed. Then clear the suspension.';
 
 export const RULE_PRIOR_UNCHECKED =
-  'Covered alerts that got no real run. Live mode skips the model on a covered alert unless the sample picks it.';
+  'Covered alerts that the model did not read. Live mode skips the model on a covered alert unless the sample picks it.';
+
+/** The covered alerts with two internal addresses, and their disagreements. */
+export const RULE_PRIOR_INTERNAL =
+  'Covered alerts with two internal addresses. The second count is the real verdicts that disagreed.';
+
+/** The covered alerts with a known external address, and their disagreements. */
+export const RULE_PRIOR_KNOWN_EXTERNAL =
+  'Covered alerts with one external address that the rule knows on the same internal machine. ' +
+  'Two or more false positives of the rule in the last 7 days had a matching external address. ' +
+  'The second count is the real verdicts that disagreed.';
 
 /** Why the rule prior held back on the newest alert of a rule it did not cover. */
 export const RULE_PRIOR_REASON: Record<string, string> = {
@@ -640,14 +906,16 @@ export const RULE_PRIOR_REASON: Record<string, string> = {
   critical_severity: 'The alert is critical.',
   severity_unknown: 'The alert carries no severity label.',
   no_flow_endpoints: 'The alert has no source or no destination address.',
-  external_endpoint: 'An endpoint is outside the estate.',
+  external_endpoint: 'Both addresses are external, or an address is unreadable.',
+  external_endpoint_new: 'The external address is new for this rule on this internal machine.',
+  campaign_machine: 'An address belongs to a machine of an open campaign that is not closed.',
   nomination_unavailable: 'The grid could not list the nominated rules.',
   not_nominated: 'Detection tuning did not nominate the rule.',
   analyst_override: 'An analyst overrode a verdict of this rule.',
-  suspended: 'A real run disagreed with the prior.',
-  non_false_positive_in_window: 'A model run of the rule this week was not a false positive.',
+  suspended: 'The model disagreed with the prior on an earlier alert.',
+  non_false_positive_in_window: 'An investigation of the rule by the model this week was not a false positive.',
   too_few_runs: 'The rule has too few model false positives this week.',
-  lapsed: 'No model ran on the rule in the last 24 hours.',
+  lapsed: 'The model read no alert of the rule in the last 24 hours.',
   open_lead_or_fresh_observation: 'A host carries an open lead or a fresh observation.',
   evaluation_failed: 'The prior could not read its inputs.',
 };

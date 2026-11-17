@@ -317,7 +317,7 @@ describe('a failed re-run under a stale verdict (D8)', () => {
     await screen.findAllByText('ET MALWARE Win32/Emotet CnC Activity (POST)');
 
     // The row an analyst reads at a glance carries the outcome, collapsed.
-    expect(screen.getByText('newest run failed')).toBeTruthy();
+    expect(screen.getByText('newest investigation failed')).toBeTruthy();
     // And the verdict it is still showing is genuinely the older one — this is a
     // disclosure on the primary row, not a demotion of it.
     expect(container.textContent).toContain('True positive');
@@ -329,7 +329,7 @@ describe('a failed re-run under a stale verdict (D8)', () => {
     );
     mountList();
     await screen.findAllByText('ET MALWARE Win32/Emotet CnC Activity (POST)');
-    expect(screen.getByText('newest run failed').closest('button')).toBeTruthy();
+    expect(screen.getByText('newest investigation failed').closest('button')).toBeTruthy();
   });
 
   it('leaves an ordinary row alone when its newest run is itself (control)', async () => {
@@ -353,7 +353,7 @@ describe('a failed re-run under a stale verdict (D8)', () => {
     );
     mountList();
     await screen.findByText('ET SCAN Nmap Scripting Engine');
-    expect(screen.queryByText(/newest run/)).toBeNull();
+    expect(screen.queryByText(/newest investigation/)).toBeNull();
   });
 
   it('claims nothing on a payload that predates the fields (control)', async () => {
@@ -366,6 +366,6 @@ describe('a failed re-run under a stale verdict (D8)', () => {
     listInvestigations.mockResolvedValue(listOf([legacy]));
     mountList();
     await screen.findByText('ET MALWARE Win32/Emotet CnC Activity (POST)');
-    expect(screen.queryByText(/newest run/)).toBeNull();
+    expect(screen.queryByText(/newest investigation/)).toBeNull();
   });
 });

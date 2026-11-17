@@ -55,7 +55,11 @@ function StepBody({ step }: { step: FlowStep }) {
     <>
       {step.state === 'done' && <Check size={11} aria-hidden className="flex-none text-success" />}
       {label}
-      {step.note && <span className="font-normal text-dim">{step.note}</span>}
+      {step.note && (
+        <span className={cn('font-normal', step.tone === 'warn' ? 'text-warn' : 'text-dim')}>
+          {step.note}
+        </span>
+      )}
       {step.state === 'next' && step.control && (
         <span data-testid={`flow-control-${step.key}`} className="font-semibold text-accent">
           {`· ${step.control}`}
@@ -85,12 +89,13 @@ export function FlowStrip({ steps, label = 'The flow', className }: FlowStripPro
             key={step.key}
             data-testid={`flow-step-${step.key}`}
             data-state={step.state}
+            data-tone={step.tone}
             aria-current={step.state === 'current' ? 'step' : undefined}
             title={stepTitle(step)}
             className="inline-flex items-center gap-x-1"
           >
             {i > 0 && <ChevronRight size={12} aria-hidden className="flex-none text-ghost" />}
-            <span className={cn(BASE, STATE_CLASS[step.state])}>
+            <span className={cn(BASE, STATE_CLASS[step.state], step.tone === 'warn' && 'border-warn/60')}>
               <StepBody step={step} />
             </span>
           </li>

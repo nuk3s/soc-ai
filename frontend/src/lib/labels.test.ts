@@ -99,12 +99,24 @@ describe('hunt outcomes', () => {
       'Investigating 2 of 3 findings',
     );
     expect(outcomeLabel('threats_confirmed', { threats: 2, total: 3 })).toBe(
-      '2 of 3 findings are threats',
+      '2 confirmed · 1 not judged · of 3 threat findings',
     );
     expect(outcomeLabel('threats_confirmed', { threats: 1, total: 1 })).toBe(
-      '1 of 1 finding is a threat',
+      '1 confirmed · 0 not judged · of 1 threat finding',
     );
+    // A false positive joins the sentence, so the parts add up.
+    expect(
+      outcomeLabel('threats_confirmed', { threats: 2, falsePositives: 1, total: 3, threatFindings: 4 }),
+    ).toBe('2 confirmed · 1 false positive · 1 not judged · of 4 threat findings');
     expect(outcomeLabel('no_threat_confirmed')).toBe('No threat confirmed');
+    // A failed run under "No threat confirmed" states the count sentence.
+    expect(outcomeLabel('no_threat_confirmed', { threats: 0, falsePositives: 1, total: 2 })).toBe(
+      '0 confirmed · 1 false positive · 1 not judged · of 2 threat findings',
+    );
+    // Control: every threat finding judged reads the plain label.
+    expect(outcomeLabel('no_threat_confirmed', { threats: 0, falsePositives: 2, total: 2 })).toBe(
+      'No threat confirmed',
+    );
     // Without counts each reads its plain label.
     expect(outcomeLabel('investigating')).toBe('Investigating findings');
     expect(outcomeLabel('threats_confirmed')).toBe('Threats confirmed');
@@ -128,9 +140,9 @@ describe('hunt outcomes', () => {
       huntOutcomeText({
         status: 'complete',
         outcome: 'threats_confirmed',
-        outcome_label: '2 of 3 findings are threats',
+        outcome_label: '2 confirmed · 1 not judged · of 3 threat findings',
       }),
-    ).toBe('2 of 3 findings are threats');
+    ).toBe('2 confirmed · 1 not judged · of 3 threat findings');
     // An older server sends no label. The row's counts write the progress.
     expect(
       huntOutcomeText({ status: 'investigating', findingsInvestigated: 1, findingsTotal: 4 }),

@@ -2,14 +2,17 @@ import { useEffect, useState, type ReactNode } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 
 import {
+  ApiError,
   getAnalyticHits,
   getHuntCatalog,
+  markAnalyticShadowHitsRead,
   markObservationBenign,
   markShadowHitRead,
   setAnalyticStatus,
   startHuntConsole,
   type AnalyticHit,
   type AnalyticHitFilter,
+  type AnalyticHitGroup,
   type AnalyticHits as AnalyticHitsPage,
   type HuntCatalog,
 } from '../lib/api';
@@ -30,8 +33,12 @@ import {
   HIT_FILTER_LIVE,
   HIT_FILTER_SHADOW,
   HIT_FILTER_UNREAD,
+  HIT_GROUP_APPROVE,
+  HIT_GROUP_FOLD,
+  HIT_GROUP_REJECT,
   UNREAD_DOT,
   chipRead,
+  hitGroupMarkRead,
 } from '../lib/tooltips';
 import { useAsync } from '../lib/useAsync';
 import { AnalyticDrawer } from './AnalyticDrawer';
@@ -55,11 +62,16 @@ import { LoadingInline, StaleNotice } from './States';
 // The list reads 50 hits a page. The line under it states how many of the
 // window's hits it holds, and "Show more" reads the next page.
 //
-// A card names two things. The analytic is the logic. The hit is the instance
-// the analytic wrote. The owner's rule: the real hit is never lighter than the
-// provisional one. A live hit carries a solid accent border and a bold title. A
-// shadow hit carries a dashed amber border and a normal title. A read shadow
-// hit is dimmer still.
+// The hits are grouped by analytic (review 2026-11-12, F2). The header of a
+// group is the analytic: the logic, its status, its counts over the whole
+// list, and the decisions on it, once. A card under the header is the hit:
+// the instance the analytic wrote. 233 unread hits of 3 analytics repeated
+// the two decisions on 233 cards, and the pile took 233 presses to read.
+//
+// The owner's rule: the real hit is never lighter than the provisional one. A
+// live hit carries a solid accent border, and the title of a live analytic is
+// bold. A shadow hit carries a dashed amber border. A read shadow hit is
+// dimmer still.
 //
 // A hit whose receipts are incomplete reads "could not run" and names the
 // missing part. It is never shown as a hit and it is never hidden.
@@ -77,6 +89,24 @@ const SECTION_NOTE =
 /** The hits one request reads. "Show more" reads one more page of this size. */
 export const HITS_PAGE = 50;
 
+/** The days the block covers. The request and the label read this one number. */
+export const HITS_WINDOW_DAYS = 7;
+
+/** The label beside the heading: the two parts of the list, each with its
+ *  own window.
+ *
+ *  The label read "last 7 days · 249" over 39 hits from those days and 210
+ *  older unread shadow hits (review 2026-11-12, F3). A count obeys the window
+ *  on its label, or it states its own window. A server that sends one total
+ *  gets both windows in words. */
+export function hitsWindowLabel(
+  all: number,
+  window: { days: number; in_window: number; older_unread: number } | null | undefined,
+): string {
+  if (!window) return `last ${HITS_WINDOW_DAYS} days and older unread · ${all}`;
+  return `${window.in_window} in the last ${window.days} days · ${window.older_unread} older unread`;
+}
+
 const SHOW_MORE_TOOLTIP = `Read the next ${HITS_PAGE} hits of this list.`;
 
 /** Read the first `pages` pages of one filter as one list.
@@ -91,7 +121,7 @@ async function readHitPages(
 ): Promise<AnalyticHitsPage> {
   const answers = await Promise.all(
     Array.from({ length: pages }, (_, n) =>
-      getAnalyticHits({ days: 7, filter, limit: HITS_PAGE, offset: n * HITS_PAGE }),
+      getAnalyticHits({ days: HITS_WINDOW_DAYS, filter, limit: HITS_PAGE, offset: n * HITS_PAGE }),
     ),
   );
   const seen = new Set<number>();
@@ -102,7 +132,12 @@ async function readHitPages(
       seen.add(h.id);
       return true;
     });
-  return { hits, counts: answers[0].counts };
+  return {
+    hits,
+    counts: answers[0].counts,
+    window: answers[0].window,
+    groups: answers[0].groups,
+  };
 }
 
 const TITLE_TOOLTIP = 'Open the analytic: its definition, its ledger and its versions.';
@@ -453,7 +488,6 @@ function HitCard({
   read,
   onRead,
   onChange,
-  onOpenAnalytic,
 }: {
   hit: AnalyticHit;
   /** True once the analyst has read it, from the server or from this session.
@@ -462,14 +496,10 @@ function HitCard({
   read: boolean;
   onRead: (id: number) => void;
   onChange: () => void;
-  onOpenAnalytic: (id: string) => void;
 }) {
   const navigate = useNavigate();
   const [open, setOpen] = useState(false);
-  const [approving, setApproving] = useState(false);
-  const [rejecting, setRejecting] = useState(false);
   const [markingBenign, setMarkingBenign] = useState(false);
-  const [why, setWhy] = useState('');
   const [busy, setBusy] = useState(false);
   const [failed, setFailed] = useState<string | null>(null);
 
@@ -530,27 +560,6 @@ function HitCard({
     }
   };
 
-  // The decision is what reads the hit. The server names the statuses one
-  // status can move to, and that sentence is the answer to a refusal.
-  const decide = async (to: 'live' | 'retired') => {
-    setBusy(true);
-    setFailed(null);
-    try {
-      await setAnalyticStatus(hit.analytic_id, to, why);
-      setApproving(false);
-      setRejecting(false);
-      setWhy('');
-      await markRead();
-      onChange();
-    } catch (e) {
-      setFailed(
-        e instanceof Error && e.message ? e.message : 'The status did not change. Try again.',
-      );
-    } finally {
-      setBusy(false);
-    }
-  };
-
   // The stored summary first: the analytic wrote it about this instance. When
   // it repeats the two lines above it, the dry run is the fact that does not.
   const summary = summaryBody(hit) ?? dryRunLine(hit);
@@ -573,9 +582,12 @@ function HitCard({
       }
     >
       <div className="min-w-0">
+        {/* The header of the group names the analytic, its status and its
+            tier once. The card states the hit, and the chips that are about
+            this hit alone. */}
         <div className="flex flex-wrap items-center gap-2">
           <span className="text-[10.5px] font-semibold uppercase tracking-[.06em] text-faint">
-            Analytic:
+            Hit:
           </span>
           {unread && (
             <span
@@ -584,72 +596,6 @@ function HitCard({
               title={UNREAD_DOT}
             />
           )}
-          {removed ? (
-            // No drawer can open an analytic the catalog does not list, so
-            // the id is text and not a control.
-            <span
-              data-testid="analytic-hit-title"
-              className="text-[13px] text-dim"
-              title={`Analytic ${hit.analytic_id}`}
-            >
-              {removedAnalyticTitle(hit)}
-            </span>
-          ) : (
-            <button
-              type="button"
-              data-testid="analytic-hit-title"
-              className={`text-left text-[13px] hover:underline ${
-                recordedLive ? 'font-bold' : 'font-medium'
-              }`}
-              title={TITLE_TOOLTIP}
-              onClick={() => onOpenAnalytic(hit.analytic_id)}
-            >
-              {hit.analytic_title}
-            </button>
-          )}
-          {removed ? (
-            <Chip label="analytic removed" title={CHIP_ANALYTIC_REMOVED} tone="faint" />
-          ) : (
-            <Chip
-              label={hit.analytic_status}
-              title={liveAnalytic ? CHIP_LIVE : CHIP_SHADOW}
-              tone={liveAnalytic ? 'live' : 'shadow'}
-            />
-          )}
-          {/* The hit lists under Shadow and its analytic reads live. The chip
-              states why, so the two words do not read as a contradiction. */}
-          {!recordedLive && liveAnalytic && (
-            <Chip label="recorded in shadow" title={CHIP_RECORDED_IN_SHADOW} tone="faint" />
-          )}
-          {/* The other way round: the hit lists under Live and its analytic
-              reads shadow, because soc-ai or an analyst moved it after the hit
-              (R3-D11). */}
-          {recordedLive && shadowAnalytic && (
-            <Chip label="recorded live" title={CHIP_RECORDED_LIVE} tone="faint" />
-          )}
-          <Chip
-            label={hit.tier === 'shipped' ? 'shipped' : 'local'}
-            title={hit.tier === 'shipped' ? CHIP_SHIPPED : CHIP_LOCAL}
-          />
-          {!recordedLive && read && (
-            <Chip
-              label={hit.read_at ? `read ${ago(hit.read_at)}` : 'read'}
-              title={chipRead(hit.read_at ? ago(hit.read_at) : null)}
-              tone="faint"
-            />
-          )}
-          {!provable && (
-            <Chip
-              label="could not run"
-              title="The evidence of this hit is incomplete. Read the missing part below."
-            />
-          )}
-        </div>
-
-        <div className="mt-1.5 flex flex-wrap items-center gap-2">
-          <span className="text-[10.5px] font-semibold uppercase tracking-[.06em] text-faint">
-            Hit:
-          </span>
           <Link
             to={keyPath(hit.entity_kind, hit.entity_key)}
             className="font-mono text-[12.5px] font-semibold text-accent hover:underline"
@@ -681,6 +627,30 @@ function HitCard({
             </>
           ) : (
             <Chip label="no lead" title={hit.no_lead_reason ?? CHIP_NO_LEAD} tone="faint" />
+          )}
+          {/* The hit lists under Shadow and its analytic reads live. The chip
+              states why, so the two words do not read as a contradiction. */}
+          {!recordedLive && liveAnalytic && (
+            <Chip label="recorded in shadow" title={CHIP_RECORDED_IN_SHADOW} tone="faint" />
+          )}
+          {/* The other way round: the hit lists under Live and its analytic
+              reads shadow, because soc-ai or an analyst moved it after the hit
+              (R3-D11). */}
+          {recordedLive && shadowAnalytic && (
+            <Chip label="recorded live" title={CHIP_RECORDED_LIVE} tone="faint" />
+          )}
+          {!recordedLive && read && (
+            <Chip
+              label={hit.read_at ? `read ${ago(hit.read_at)}` : 'read'}
+              title={chipRead(hit.read_at ? ago(hit.read_at) : null)}
+              tone="faint"
+            />
+          )}
+          {!provable && (
+            <Chip
+              label="could not run"
+              title="The evidence of this hit is incomplete. Read the missing part below."
+            />
           )}
         </div>
 
@@ -773,36 +743,6 @@ function HitCard({
             )}
           </>
         )}
-        {/* The decisions are about the analytic, so they follow its status.
-            The card offered the approval on an analytic an analyst had approved
-            already, because it read the flag on the row as the status. */}
-        {shadowAnalytic && provable && (
-          <button
-            type="button"
-            disabled={busy}
-            onClick={() => {
-              setApproving(true);
-              setRejecting(false);
-            }}
-            className="rounded-control border px-3 py-1 text-[11.5px] font-semibold disabled:opacity-50"
-            style={{ color: AMBER, borderColor: 'rgba(210,153,34,.5)' }}
-          >
-            Approve analytic
-          </button>
-        )}
-        {shadowAnalytic && (
-          <button
-            type="button"
-            disabled={busy}
-            onClick={() => {
-              setRejecting(true);
-              setApproving(false);
-            }}
-            className="rounded-control px-3 py-1 text-[11.5px] text-dim disabled:opacity-50"
-          >
-            Reject analytic
-          </button>
-        )}
         {/* The read action an analyst can take without a decision. A hit that
             is understood from the summary alone had no way off the unread count
             except an action the analyst did not want to take. */}
@@ -828,42 +768,395 @@ function HitCard({
           }}
         />
       )}
-      {(approving || rejecting) && (
-        <div className="col-span-2 flex flex-wrap items-center gap-2 text-[12px]">
-          {/* "Reject" named no outcome. The analytic is retired, it stops
-              running, and the reason is stored on the transition. */}
-          <span data-testid="analytic-decision-note" className="basis-full text-[11.5px] text-dim">
-            {approving
-              ? 'The analytic goes live with this reason. It raises what it finds.'
-              : 'The analytic is retired with this reason. It stops running.'}
-          </span>
-          <input
-            value={why}
-            onChange={(e) => setWhy(e.target.value)}
-            placeholder={approving ? 'Why it goes live' : 'Why it is rejected'}
-            className="min-w-[260px] flex-1 rounded-control border border-border bg-surface-2 px-2 py-1"
-          />
-          <button
-            type="button"
-            disabled={!why || busy}
-            onClick={() => decide(approving ? 'live' : 'retired')}
-            className="rounded-control bg-accent px-3 py-1 font-semibold text-white disabled:opacity-50"
+    </li>
+  );
+}
+
+/** The hits of a group the block shows before the analyst unfolds it. */
+export const GROUP_PREVIEW = 3;
+
+/** One analytic of the block: its counts, and the hits of it the list has read. */
+export interface HitGroup {
+  id: string;
+  title: string;
+  status: string;
+  tier: string;
+  exists: boolean;
+  hits: number;
+  unread: number;
+  machines: number;
+  accounts: number;
+  /** True when the server counted the group over the whole list. False when
+   *  the block counted the hits it has read, for a server that sends no group. */
+  counted: boolean;
+  rows: AnalyticHit[];
+}
+
+/** An analytic id in words, for a group whose analytic the catalog lost and
+ *  whose hits the list has not read. */
+function idInWords(id: string): string {
+  const words = id.replace(/[-_]+/g, ' ').trim();
+  return words ? words.charAt(0).toUpperCase() + words.slice(1) : id;
+}
+
+/** The hits of the list, grouped by analytic, in the order of the server.
+ *
+ *  The server counts each group over the whole list. A hit that this session
+ *  read comes off the unread count of its group, by the rule of the unread
+ *  chip. A hit whose analytic the server named no group for gets a group that
+ *  counts the hits the list has read. */
+export function groupHits(
+  rows: readonly AnalyticHit[],
+  served: readonly AnalyticHitGroup[] | undefined,
+  readIds: ReadonlySet<number>,
+): HitGroup[] {
+  const byAnalytic = new Map<string, AnalyticHit[]>();
+  for (const row of rows) {
+    const mine = byAnalytic.get(row.analytic_id);
+    if (mine) mine.push(row);
+    else byAnalytic.set(row.analytic_id, [row]);
+  }
+  const out: HitGroup[] = [];
+  const seen = new Set<string>();
+  for (const g of served ?? []) {
+    seen.add(g.analytic_id);
+    const mine = byAnalytic.get(g.analytic_id) ?? [];
+    const readHere = mine.filter(
+      (h) => h.recorded_in_shadow && h.read === false && readIds.has(h.id),
+    ).length;
+    out.push({
+      id: g.analytic_id,
+      title: g.analytic_exists
+        ? g.analytic_title
+        : mine[0]
+          ? removedAnalyticTitle(mine[0])
+          : idInWords(g.analytic_id),
+      status: g.analytic_status,
+      tier: g.tier,
+      exists: g.analytic_exists,
+      hits: Math.max(g.hits, mine.length),
+      unread: Math.max(0, g.unread - readHere),
+      machines: g.machines,
+      accounts: g.accounts,
+      counted: true,
+      rows: mine,
+    });
+  }
+  for (const [id, mine] of byAnalytic) {
+    if (seen.has(id)) continue;
+    const first = mine[0];
+    const exists = first.analytic_exists !== false;
+    const keys = (user: boolean) =>
+      new Set(mine.filter((h) => (h.entity_kind === 'user') === user).map((h) => h.entity_key)).size;
+    out.push({
+      id,
+      title: exists ? first.analytic_title : removedAnalyticTitle(first),
+      status: first.analytic_status,
+      tier: first.tier,
+      exists,
+      hits: mine.length,
+      unread: mine.filter((h) => h.recorded_in_shadow && h.read !== true && !readIds.has(h.id))
+        .length,
+      machines: keys(false),
+      accounts: keys(true),
+      counted: false,
+      rows: mine,
+    });
+  }
+  return out;
+}
+
+/** "116 hits · 116 unread · 44 machines". The unread part is for an analytic
+ *  in shadow, and for any analytic that still holds an unread hit. */
+function groupCountsText(group: HitGroup): string {
+  const parts = [plural(group.hits, 'hit')];
+  if (group.status === 'shadow' || group.unread > 0) parts.push(`${group.unread} unread`);
+  if (group.machines > 0 || group.accounts === 0) parts.push(plural(group.machines, 'machine'));
+  if (group.accounts > 0) parts.push(plural(group.accounts, 'account'));
+  return parts.join(' · ');
+}
+
+/**
+ * One analytic and its hits.
+ *
+ * The header carries the decisions on the analytic once: Approve, Reject and
+ * "Mark N read". Each button states its effect in one line under the counts
+ * and on its hover. The rows fold under the header: three hits are in view,
+ * and the rest of the hits the list has read open on request.
+ */
+function HitGroupBlock({
+  group,
+  loadedAt,
+  wasRead,
+  onRead,
+  onChange,
+  onOpenAnalytic,
+}: {
+  group: HitGroup;
+  /** When the block loaded its counts. A bulk read takes the hits up to it. */
+  loadedAt: number | null;
+  wasRead: (hit: AnalyticHit) => boolean;
+  onRead: (id: number) => void;
+  onChange: () => void;
+  onOpenAnalytic: (id: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [approving, setApproving] = useState(false);
+  const [rejecting, setRejecting] = useState(false);
+  const [why, setWhy] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [failed, setFailed] = useState<string | null>(null);
+
+  const liveAnalytic = group.exists && group.status === 'live';
+  const shadowAnalytic = group.exists && group.status === 'shadow';
+  // A shadow hit must prove itself before the analytic can go live on it. The
+  // header offers the approval when a hit the list has read proves itself.
+  const provable = group.rows.some(
+    (h) => h.state === 'hit' && (!h.recorded_in_shadow || (h.receipts?.complete ?? false)),
+  );
+  const canApprove = shadowAnalytic && provable;
+  const canReject = shadowAnalytic;
+  const canMarkRead = group.unread > 0;
+  const effects = [
+    canApprove ? HIT_GROUP_APPROVE : null,
+    canReject ? HIT_GROUP_REJECT : null,
+    canMarkRead ? hitGroupMarkRead(group.unread) : null,
+  ].filter((line): line is string => line !== null);
+
+  const refusal = (e: unknown, fallback: string) =>
+    e instanceof ApiError && e.reason ? e.message : e instanceof Error && e.message ? e.message : fallback;
+
+  // One write for the unread hits of this analytic. The count on the button
+  // goes with it, so the server marks nothing when more hits arrived.
+  const markAllRead = async () => {
+    setBusy(true);
+    setFailed(null);
+    try {
+      await markAnalyticShadowHitsRead(
+        group.id,
+        new Date(loadedAt ?? Date.now()).toISOString(),
+        group.counted ? group.unread : undefined,
+      );
+      onChange();
+    } catch (e) {
+      setFailed(refusal(e, 'The hits were not marked read. Try again.'));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // The decision is what reads the hits. The server names the statuses one
+  // status can move to, and that sentence is the answer to a refusal.
+  const decide = async (to: 'live' | 'retired') => {
+    setBusy(true);
+    setFailed(null);
+    try {
+      await setAnalyticStatus(group.id, to, why);
+      setApproving(false);
+      setRejecting(false);
+      setWhy('');
+      // A retirement takes the hits off the list. An approval leaves them on
+      // the shadow half, so the decision reads them.
+      if (to === 'live' && group.unread > 0) {
+        try {
+          await markAnalyticShadowHitsRead(group.id, new Date().toISOString());
+        } catch {
+          setFailed('The analytic is live. Its hits were not marked read. Try Mark read again.');
+        }
+      }
+      onChange();
+    } catch (e) {
+      setFailed(refusal(e, 'The status did not change. Try again.'));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const shown = open ? group.rows : group.rows.slice(0, GROUP_PREVIEW);
+  const folded = group.rows.length - GROUP_PREVIEW;
+  const decisionClass =
+    'rounded-control border px-3 py-1 text-[11.5px] font-semibold disabled:opacity-50';
+
+  return (
+    <section
+      data-testid={`analytic-group-${group.id}`}
+      aria-label={`Analytic: ${group.title}`}
+      className="border-t border-border"
+    >
+      <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2 bg-surface-2/40 px-[15px] py-2.5">
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-[10.5px] font-semibold uppercase tracking-[.06em] text-faint">
+              Analytic:
+            </span>
+            {group.exists ? (
+              <button
+                type="button"
+                data-testid="analytic-group-title"
+                className={`text-left text-[13px] hover:underline ${
+                  liveAnalytic ? 'font-bold' : 'font-medium'
+                }`}
+                title={TITLE_TOOLTIP}
+                onClick={() => onOpenAnalytic(group.id)}
+              >
+                {group.title}
+              </button>
+            ) : (
+              // No drawer can open an analytic the catalog does not list, so
+              // the id is text and not a control.
+              <span
+                data-testid="analytic-group-title"
+                className="text-[13px] text-dim"
+                title={`Analytic ${group.id}`}
+              >
+                {group.title}
+              </span>
+            )}
+            {group.exists ? (
+              <Chip
+                label={group.status}
+                title={liveAnalytic ? CHIP_LIVE : CHIP_SHADOW}
+                tone={liveAnalytic ? 'live' : 'shadow'}
+              />
+            ) : (
+              <Chip label="analytic removed" title={CHIP_ANALYTIC_REMOVED} tone="faint" />
+            )}
+            <Chip
+              label={group.tier === 'shipped' ? 'shipped' : 'local'}
+              title={group.tier === 'shipped' ? CHIP_SHIPPED : CHIP_LOCAL}
+            />
+          </div>
+          <div
+            data-testid="analytic-group-counts"
+            className="mt-1 font-mono text-[11.5px] tabular-nums text-dim"
+            title={HIT_GROUP_FOLD}
           >
-            Confirm
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              setApproving(false);
-              setRejecting(false);
-            }}
-            className="text-dim"
-          >
-            Cancel
-          </button>
+            {groupCountsText(group)}
+          </div>
+          {effects.length > 0 && (
+            <div data-testid="analytic-group-effects" className="mt-1 text-[11.5px] leading-[1.5] text-faint">
+              {effects.join(' ')}
+            </div>
+          )}
+        </div>
+        <div className="flex flex-wrap items-center gap-1.5">
+          {canApprove && (
+            <button
+              type="button"
+              disabled={busy}
+              title={HIT_GROUP_APPROVE}
+              onClick={() => {
+                setApproving(true);
+                setRejecting(false);
+              }}
+              className={decisionClass}
+              style={{ color: AMBER, borderColor: 'rgba(210,153,34,.5)' }}
+            >
+              Approve analytic
+            </button>
+          )}
+          {canReject && (
+            <button
+              type="button"
+              disabled={busy}
+              title={HIT_GROUP_REJECT}
+              onClick={() => {
+                setRejecting(true);
+                setApproving(false);
+              }}
+              className={`${decisionClass} border-border-strong text-dim`}
+            >
+              Reject analytic
+            </button>
+          )}
+          {canMarkRead && (
+            <button
+              type="button"
+              disabled={busy}
+              title={hitGroupMarkRead(group.unread)}
+              onClick={() => void markAllRead()}
+              className={`${decisionClass} border-border-strong`}
+            >
+              {`Mark ${group.unread.toLocaleString()} read`}
+            </button>
+          )}
+        </div>
+        {(approving || rejecting) && (
+          <div className="flex basis-full flex-wrap items-center gap-2 text-[12px]">
+            {/* "Reject" named no outcome. The analytic is retired, it stops
+                running, and the reason is stored on the transition. */}
+            <span data-testid="analytic-decision-note" className="basis-full text-[11.5px] text-dim">
+              {approving
+                ? `The analytic goes live with this reason. It raises what it finds.${
+                    group.unread > 0
+                      ? ` Its ${plural(group.unread, 'unread hit')} ${
+                          group.unread === 1 ? 'is' : 'are'
+                        } marked read.`
+                      : ''
+                  }`
+                : 'The analytic is retired with this reason. It stops running. Its hits leave this list.'}
+            </span>
+            <input
+              value={why}
+              onChange={(e) => setWhy(e.target.value)}
+              placeholder={approving ? 'Why it goes live' : 'Why it is rejected'}
+              className="min-w-[260px] flex-1 rounded-control border border-border bg-surface-2 px-2 py-1"
+            />
+            <button
+              type="button"
+              disabled={!why || busy}
+              onClick={() => void decide(approving ? 'live' : 'retired')}
+              className="rounded-control bg-accent px-3 py-1 font-semibold text-white disabled:opacity-50"
+            >
+              Confirm
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setApproving(false);
+                setRejecting(false);
+              }}
+              className="text-dim"
+            >
+              Cancel
+            </button>
+          </div>
+        )}
+        {failed && (
+          <div data-testid="analytic-group-failed" className="basis-full text-[11.5px] text-warn">
+            {failed}
+          </div>
+        )}
+      </div>
+      {shown.length > 0 && (
+        <ul>
+          {shown.map((hit) => (
+            <HitCard key={hit.id} hit={hit} read={wasRead(hit)} onRead={onRead} onChange={onChange} />
+          ))}
+        </ul>
+      )}
+      {(folded > 0 || (group.counted && group.rows.length < group.hits)) && (
+        <div className="flex flex-wrap items-center gap-3 border-t border-border-faint px-[15px] py-2 text-[11.5px] text-dim">
+          {folded > 0 && (
+            <button
+              type="button"
+              data-testid="analytic-group-toggle"
+              aria-expanded={open}
+              onClick={() => setOpen((v) => !v)}
+              className="font-semibold text-accent hover:underline"
+            >
+              {open ? 'Show fewer hits' : `Show ${plural(folded, 'more hit')}`}
+            </button>
+          )}
+          {group.counted && group.rows.length < group.hits && (
+            <span data-testid="analytic-group-share">
+              {`The list holds ${group.rows.length} of the ${plural(group.hits, 'hit')} of this analytic. ` +
+                'Show more reads the next hits of the list.'}
+            </span>
+          )}
         </div>
       )}
-    </li>
+    </section>
   );
 }
 
@@ -924,6 +1217,22 @@ export function AnalyticHits({
   const counts = served
     ? { ...served, unread: Math.max(0, served.unread - readHere) }
     : undefined;
+  // The two windows of the label. A hit this session read comes off the older
+  // unread count when its newest sighting is older than the window, by the
+  // rule the unread chip follows.
+  const servedWindow = hits.data?.window;
+  const windowStart = Date.now() - (servedWindow?.days ?? HITS_WINDOW_DAYS) * 86_400_000;
+  const readHereOlder = rows.filter(
+    (h) =>
+      h.recorded_in_shadow &&
+      h.read === false &&
+      readIds.has(h.id) &&
+      h.born_at !== null &&
+      Date.parse(h.born_at) < windowStart,
+  ).length;
+  const hitsWindow = servedWindow
+    ? { ...servedWindow, older_unread: Math.max(0, servedWindow.older_unread - readHereOlder) }
+    : undefined;
   // W1: with no unread hit the block folds to one line. The analyst opens
   // the hits on request. A filter in the address is a request already, and a
   // list with no hit keeps its empty-state sentence.
@@ -970,11 +1279,20 @@ export function AnalyticHits({
           )}
           <span>
             Analytic hits{' '}
-            <span className="font-mono text-[11.5px] font-normal text-faint">
-              last 7 days · {counts ? counts.all : '—'}
+            <span
+              data-testid="analytic-hits-window"
+              className="font-mono text-[11.5px] font-normal text-faint"
+              title={
+                'The hits that an analytic saw in the last 7 days, and the unread shadow hits ' +
+                'that are older. The list holds an unread shadow hit at any age.'
+              }
+            >
+              {counts ? hitsWindowLabel(counts.all, hitsWindow) : `last ${HITS_WINDOW_DAYS} days · —`}
               {/* Folded, the Unread chip is out of sight, and the unread count
                   is the one number that says whether this block holds work. */}
-              {collapsed && counts ? ` · ${counts.unread} unread` : ''}
+              {collapsed && counts
+                ? ` · ${counts.unread} ${hitsWindow ? 'unread in all' : 'unread'}`
+                : ''}
             </span>
           </span>
         </span>
@@ -995,7 +1313,7 @@ export function AnalyticHits({
           data-testid="analytic-hits-quiet"
           className="flex flex-wrap items-center gap-2 px-[15px] py-2.5 text-[12.5px] text-dim"
         >
-          <span>{`${plural(counts?.all ?? 0, 'hit')} in 7 days. None waits on you.`}</span>
+          <span>{`${plural(hitsWindow?.in_window ?? counts?.all ?? 0, 'hit')} in 7 days. None waits on you.`}</span>
           <button
             type="button"
             onClick={() => setShowQuiet(true)}
@@ -1056,18 +1374,18 @@ export function AnalyticHits({
         </div>
       ) : (
         <>
-          <ul>
-            {rows.map((hit) => (
-              <HitCard
-                key={hit.id}
-                hit={hit}
-                read={wasRead(hit)}
-                onRead={markedRead}
-                onChange={changed}
-                onOpenAnalytic={setOpenAnalytic}
-              />
-            ))}
-          </ul>
+          {/* One header for each analytic, and its hits under it. */}
+          {groupHits(rows, hits.data.groups, readIds).map((group) => (
+            <HitGroupBlock
+              key={group.id}
+              group={group}
+              loadedAt={hits.lastUpdated}
+              wasRead={wasRead}
+              onRead={markedRead}
+              onChange={changed}
+              onOpenAnalytic={setOpenAnalytic}
+            />
+          ))}
           {/* The list held 50 of 148 hits and ended with no word about the
               rest. The line states the share, and the control reads more. */}
           <div className="flex flex-wrap items-center gap-3 border-t border-border-faint px-[15px] py-2.5">

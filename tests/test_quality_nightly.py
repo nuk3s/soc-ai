@@ -253,9 +253,11 @@ def test_metrics_fallback_and_error_rates() -> None:
         _row("d", error="boom"),
     ]
     m = compute_snapshot_metrics(rows, aggregate(rows), mode="local")
-    assert m.n_ok == 2 and m.n_error == 2
-    assert m.fallback_rate == pytest.approx(0.5)  # 1 of 2 OK rows
-    assert m.error_rate == pytest.approx(0.5)  # 2 of 4 attempted
+    # A fallback is a failed run that carries a placeholder verdict, so it is
+    # an error like the two runs that raised (production review 2026-11-13).
+    assert m.n_ok == 1 and m.n_error == 3
+    assert m.fallback_rate == pytest.approx(0.5)  # 1 of the 2 runs with a report
+    assert m.error_rate == pytest.approx(0.75)  # 3 of 4 runs that ended
 
 
 def test_metrics_no_ok_rows_yields_null_fallback() -> None:
@@ -868,7 +870,8 @@ def test_cli_local_run_writes_snapshot_and_suggests_cron(
     s = snaps[0]
     assert s.mode == "local"
     assert s.agreement_rate is None  # local mode never fakes agreement
-    assert s.n_ok == 3 and s.n_error == 0
+    # The fallback run is an error and not a completed run.
+    assert s.n_ok == 2 and s.n_error == 1
     assert s.fallback_rate == pytest.approx(1 / 3)
     assert s.alarmed is False
     assert s.batch_dir and s.batch_dir.endswith("batch-test")
@@ -926,7 +929,11 @@ def test_cli_alarm_fires_with_enough_history(
     assert len(snaps) == 4
     latest = snaps[0]
     assert latest.alarmed is True
-    assert latest.alarm_reasons and "fallback_rate" in latest.alarm_reasons[0]
+    # Three fallbacks are three failed runs: the error ceiling fires beside the
+    # jump rule, and each states its own number.
+    assert latest.alarm_key == "error_ceiling+fallback_jump"
+    assert any("fallback_rate" in reason for reason in latest.alarm_reasons)
+    assert any("error_rate 1.00" in reason for reason in latest.alarm_reasons)
     assert captured["alarm"] is not None
     assert captured["alarm"]["mode"] == "local"
     assert captured["alarm"]["reasons"] == latest.alarm_reasons
@@ -1251,7 +1258,7 @@ def test_other_mode_history_cannot_suppress_an_alarm(
 
     newest = _read_snapshots(settings)[0]
     assert newest.mode == "local"
-    assert newest.alarm_key == "fallback_jump"
+    assert newest.alarm_key == "error_ceiling+fallback_jump"
     assert newest.alarm_since == datetime(2026, 8, 6, 2, 17)
     assert len(handoffs) == 1
 

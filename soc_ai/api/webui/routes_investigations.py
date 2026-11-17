@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
@@ -24,6 +24,7 @@ from soc_ai.api.webui import (
     routes_entity,
     routes_hunts,
 )
+from soc_ai.api.webui._campaign_link import CampaignLinkOut, link_for
 from soc_ai.api.webui._errors import api_error
 from soc_ai.api.webui._shared import (
     _ago,
@@ -51,21 +52,25 @@ from soc_ai.api.webui._timeline import (
     action_tool_names,
 )
 from soc_ai.api.webui.routes_alerts import _es_api_error_http, _grid_unavailable
+from soc_ai.campaigns import service as campaign_svc
 from soc_ai.config import Settings
 from soc_ai.demo.guard import is_demo
 from soc_ai.hunting.step_words import current_activity
 from soc_ai.secret_scrub import scrub_secrets, scrub_value
 from soc_ai.so_client.elastic import ElasticClient
+from soc_ai.store import authorized_activity as authorized_svc
 from soc_ai.store import chat as chat_svc
+from soc_ai.store import first_line as first_line_svc
 from soc_ai.store import host_machines
 from soc_ai.store import investigations as inv_svc
 from soc_ai.store.models import Hunt, Investigation
-from soc_ai.triage_models import is_pipeline_fallback
+from soc_ai.triage_models import IMPACT_ORDER, is_pipeline_fallback, stored_impact
 from soc_ai.webui import (
     anchor_check,
     case_links,
     finding_promotion,
     hunt_manager,
+    needs_you_clear,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -201,8 +206,15 @@ class InvestigationRowOut(BaseModel):
     # of an address and a dash. None on a legacy row.
     hostName: str | None = None
     status: str
+    # The time when soc-ai started this run: the relative words and the ISO
+    # time. Support for the analyst. The list states the event time first.
     when: str
     ts: str = ""
+    # The time of the event that this run judges (migration 0072), ISO UTC,
+    # and the relative words that ``when`` uses. The window, the order and
+    # the When column of the list read it (owner, 2026-11-15).
+    eventAt: str = ""
+    eventWhen: str = ""
     chatCount: int = 0
     # The alert this run investigated — lets the UI cluster retries of the SAME
     # alert so errored/cancelled re-runs nest under the one that produced a verdict.
@@ -258,6 +270,42 @@ class InvestigationRowOut(BaseModel):
     # offers Execute and Dismiss on the row (dogfood 2026-10-19, R1-I1). None
     # means the list did not read them.
     waitingActions: list[_timeline.WaitingActionOut] | None = None
+    # The authorized activity the run matched. ``authorizationId`` is the
+    # stored link. ``authorization`` holds the label, the state and the
+    # expiry. Both are null on a run that matched none. A panel that folds
+    # the authorized runs into one row reads the two fields. A revoked
+    # authorization has the state ``revoked``, and its runs get normal handling.
+    authorizationId: int | None = None
+    authorization: _timeline.AuthorizationRefOut | None = None
+    # H2. What the hostile action of a true positive did: ``succeeded``,
+    # ``attempted``, ``unknown`` or ``none``. Null for every other verdict, and
+    # for a true positive that an older release stored.
+    impact: str | None = None
+    # The first line of the run, built by the server: the verdict, the impact
+    # of a true positive, and the source and the target as "name (role)
+    # address" where the Hosts data has a name or a role. A row of an older
+    # release gets the line at read time, and its impact reads "not stated".
+    # Null for a run with no verdict and for a pipeline error.
+    firstLine: str | None = None
+    # The headline of the run: the sentence the Alerts row and the
+    # investigation page state, scrubbed. The list prints it under the name.
+    # Null for a run with no verdict and for a pipeline error.
+    headline: str | None = None
+    # The active campaign that this run is a member of, or null.
+    campaign: CampaignLinkOut | None = None
+
+
+def authorization_ref(mark: authorized_svc.Mark | None) -> _timeline.AuthorizationRefOut | None:
+    """The mark of a run as the API states it, or None."""
+    if mark is None:
+        return None
+    return _timeline.AuthorizationRefOut(
+        id=mark.id,
+        label=mark.label,
+        state=mark.state,
+        expiresAt=_iso_utc(mark.expires_at),
+        by=mark.by,
+    )
 
 
 def _elapsed_sec(inv: Investigation) -> int:
@@ -281,6 +329,7 @@ def _row(
     *,
     is_primary: bool = True,
     latest_run: inv_svc.RunRef | None = None,
+    labels: dict[str, first_line_svc.HostLabel] | None = None,
 ) -> InvestigationRowOut:
     """Map one persisted run to its list row.
 
@@ -324,6 +373,8 @@ def _row(
         when=_ago(_iso_utc(inv.created_at)),
         # tz-AWARE ISO so the browser localizes correctly (naive → parsed as local).
         ts=_iso_utc(inv.created_at),
+        eventAt=_iso_utc(inv.event_at or inv.created_at),
+        eventWhen=_ago(_iso_utc(inv.event_at or inv.created_at)),
         chatCount=chat_count,
         # The group the row belongs to. A hunt-subject run groups under
         # itself: the document it anchors on is a time anchor, not its subject.
@@ -340,7 +391,59 @@ def _row(
         isSynthEval=bool(inv.is_synth_eval),
         runClass=_run_class_of(inv),
         ranBy=inv.started_by or "",
+        authorizationId=inv.authorization_id,
+        impact=None if is_pipeline_fallback(inv.report) else stored_impact(inv.report, inv.verdict),
+        firstLine=_first_line(inv, labels),
+        headline=_row_headline(inv),
     )
+
+
+def _row_headline(inv: Investigation) -> str | None:
+    """The headline of a run for its list row, or None.
+
+    The same sentence the Alerts row and the investigation page state. The
+    first line repeated the verdict chip and the Source to Dest cells of the
+    row (polish review 2026-11-13).
+    """
+    if _verdict(inv.verdict) == "untriaged" or is_pipeline_fallback(inv.report):
+        return None
+    report = inv.report if isinstance(inv.report, dict) else {}
+    _summary, headline, _model = _timeline._run_text(report, inv)
+    return scrub_secrets(headline).strip() or None
+
+
+def _first_line(
+    inv: Investigation, labels: dict[str, first_line_svc.HostLabel] | None
+) -> str | None:
+    """The first line of a run for the API, with any credential scrubbed."""
+    line = first_line_svc.of_run(inv, labels)
+    return scrub_secrets(line) if line else None
+
+
+async def _detail_first_line(request: Request, settings: Any, inv: Investigation) -> str | None:
+    """The first line of one run for its page, with the Hosts data read when needed."""
+    async with request.app.state.db_sessionmaker() as db:
+        return _first_line(inv, await _host_labels(db, settings, [inv]))
+
+
+async def _host_labels(
+    db: Any, settings: Any, runs: Sequence[Investigation]
+) -> dict[str, first_line_svc.HostLabel]:
+    """The Hosts data labels for the runs that store no first line.
+
+    One read for a page. A run that stores its line needs none: the line
+    holds the names as they stood when the run ended.
+    """
+    values = [
+        value
+        for inv in runs
+        if not (isinstance(inv.report, dict) and inv.report.get(first_line_svc.FIRST_LINE_KEY))
+        or (isinstance(inv.report, dict) and inv.report.get("resolution"))
+        for value in first_line_svc.run_values(inv)
+    ]
+    if not values:
+        return {}
+    return await first_line_svc.labels_for_settings(db, values, settings)
 
 
 class _RunLike(Protocol):
@@ -362,6 +465,33 @@ class _RunLike(Protocol):
 
     @property
     def status(self) -> str: ...
+
+
+def _group_key(inv: Any) -> str | None:
+    """The key of the group a run belongs to: its alert, or its hunt finding.
+
+    None for a run that stands alone. The primacy rule reads one group per key.
+    """
+    alert = inv_svc.alert_group_id(inv)
+    if alert is not None:
+        return alert
+    finding = inv_svc.finding_group_id(inv)
+    return inv_svc.finding_group_key(finding) if finding is not None else None
+
+
+async def _page_group_runs(db: Any, rows: Sequence[Any]) -> list[inv_svc.RunRef]:
+    """Every run of each group that a page row names: the primacy input.
+
+    The runs of one alert form a group, and the runs of one hunt finding form
+    a group too. A retry or a Re-run of a finding left its older run on the
+    list as the current answer (production, 2026-11-13).
+    """
+    alert_ids = sorted({g for inv in rows if (g := inv_svc.alert_group_id(inv))})
+    out = list(await inv_svc.runs_for_alerts(db, alert_ids))
+    finding_groups = sorted({f for inv in rows if (f := inv_svc.finding_group_id(inv))})
+    for runs in (await inv_svc.runs_for_findings(db, finding_groups)).values():
+        out.extend(runs)
+    return out
 
 
 def _primary_run_ids(rows: Sequence[_RunLike]) -> set[str]:
@@ -444,6 +574,26 @@ def _csv_filter(name: str, raw: str | None, allowed: tuple[str, ...]) -> list[st
     return members
 
 
+def _impact_sort_and_clock(
+    impact: str | None, sort: str | None, clock: str | None
+) -> tuple[list[str], str, str]:
+    """The impact filter, the order and the clock of the list, each refused when unknown."""
+    impacts = _csv_filter("impact", impact, IMPACT_ORDER)
+    if sort and sort not in inv_svc.PAGE_SORTS:
+        raise api_error(
+            422,
+            "bad_filter",
+            f"sort accepts one of these values: {', '.join(inv_svc.PAGE_SORTS)}.",
+        )
+    if clock and clock not in inv_svc.PAGE_CLOCKS:
+        raise api_error(
+            422,
+            "bad_filter",
+            f"clock accepts one of these values: {', '.join(inv_svc.PAGE_CLOCKS)}.",
+        )
+    return impacts, sort or inv_svc.SORT_NEWEST, clock or inv_svc.CLOCK_EVENT
+
+
 # The two halves of a pipeline-error set. A run "needs a retry" when it produced
 # nothing usable AND nobody has dealt with it: not dismissed by an operator, and
 # not superseded by a later run of the same alert that did land a verdict.
@@ -520,12 +670,21 @@ async def list_investigations(
     include_backtest: bool = False,
     pending_action: bool = False,
     entity: str | None = None,
+    authorization: int | None = None,
+    needs_you: bool = False,
+    impact: str | None = None,
+    sort: str | None = None,
+    primary_only: bool = False,
+    clock: str | None = None,
 ) -> InvestigationListOut:
     """Investigation rows, newest first — filtered, counted and paged in SQL.
 
     ``status`` / ``verdict`` are comma-separated multi-selects (single values —
-    the old contract — parse identically). ``since``/``until`` bound
-    ``created_at`` inclusively, like ``GET /hunts``. ``q`` is free text matched
+    the old contract — parse identically). ``since``/``until`` bound the time
+    of the event that a run judges (``eventAt``) inclusively, and the rows
+    come newest event first. ``clock=investigated`` bounds and orders on the
+    time when soc-ai started the run (``ts``) instead: the pipeline errors
+    of 30 days are a list of what soc-ai did. ``q`` is free text matched
     against the rule name, source and destination — the columns the table shows.
     Filtering in SQL is the point: the old newest-100 page made every older
     errored run unreachable under ANY filter once one outcome saturated the
@@ -568,9 +727,37 @@ async def list_investigations(
     every run to find the actions (dogfood 2026-10-19, R1-I1). A replay never
     has a pending action, so the filter leaves replays out even with
     ``include_backtest``.
+
+    ``authorization`` keeps only the runs that matched one authorized
+    activity, by its id. The card of the authorization links here with its
+    count. Each row carries ``authorizationId`` and ``authorization`` whatever
+    the filter: a run inside an authorized scope stays in every list.
+
+    ``needs_you`` keeps the runs that wait on the analyst: a verdict that
+    needs more info, or a recommended action that waits for a person, inside
+    ``since``/``until``. The rows carry ``pendingActions`` and
+    ``waitingActions`` as under ``pending_action``. ``GET /needs-you`` counts
+    ``investigations_waiting`` with this query, so the Investigations badge and
+    the Needs you view state one number. The badge said 39 (9 runs plus 30
+    actions) over a list of 64 other rows (production review 2026-11-12,
+    ui-core 7). The other filters narrow the set.
+
+    ``impact`` keeps the true positives whose impact is one of the values:
+    ``succeeded``, ``attempted``, ``unknown``, ``none``. It is a
+    comma-separated multi-select. ``unknown`` also matches a true positive
+    that states no impact, which is every true positive of an older release.
+
+    ``sort`` is ``newest`` (the default) or ``verdict``. ``verdict`` puts the
+    worst verdict first: true positive, needs more info, inconclusive, false
+    positive. Inside the true positives the impact is the first key, in the
+    order above. The newest run is first inside each group. An unknown value
+    is refused with 422.
+
+    Each row carries ``impact`` and ``firstLine``.
     """
     statuses = _csv_filter("status", status, inv_svc.DISPLAY_STATUSES)
     verdicts = _csv_filter("verdict", verdict, _VERDICT_FILTERS)
+    impacts, order, window_clock = _impact_sort_and_clock(impact, sort, clock)
     if error_state and error_state not in _ERROR_STATES:
         raise api_error(
             422,
@@ -602,20 +789,27 @@ async def list_investigations(
         )
     async with request.app.state.db_sessionmaker() as db:
         pending: dict[str, int] | None = None
-        if pending_action:
+        if pending_action or needs_you:
             from soc_ai.api.webui.routes_meta import (  # noqa: PLC0415 - cycle
-                pending_action_runs,
+                request_pending_action_runs,
             )
 
-            pending = await pending_action_runs(
+            # Once per request: GET /needs-you reads the same scan for its
+            # pending_actions part.
+            pending = await request_pending_action_runs(
+                request,
                 db,
                 since=routes_hunts._naive_utc(since),
                 until=routes_hunts._naive_utc(until),
-                state=request.app.state,
+                clock=window_clock,
             )
         entity_keys = (
             await host_machines.entity_expansion(db, wanted_entity) if wanted_entity else None
         )
+        only_ids = set(pending) if pending is not None and pending_action else None
+        if authorization is not None:
+            matched = set(await authorized_svc.run_ids(db, authorization))
+            only_ids = matched if only_ids is None else only_ids & matched
         page = await inv_svc.query_page(
             db,
             since=routes_hunts._naive_utc(since),
@@ -626,15 +820,22 @@ async def list_investigations(
             limit=read_limit,
             offset=read_offset,
             include_backtest=include_backtest,
-            ids=None if pending is None else sorted(pending),
+            ids=None if only_ids is None else sorted(only_ids),
             entity_keys=entity_keys,
+            needs_you_ids=sorted(pending) if needs_you and pending is not None else None,
+            impacts=impacts or None,
+            sort=order,
+            primary_only=primary_only,
+            clock=window_clock,
         )
+        marks = await authorized_svc.marks_for(db, [inv.authorization_id for inv in page.rows])
+        labels = await _host_labels(db, request.app.state.settings, page.rows)
         # A row stored with the old "suricata" default shows the type its alert
         # document names (RL5). Corrected once, in place.
         await inv_svc.heal_detection_kinds(db, page.rows)
         chat_counts = await chat_svc.counts_for(db, [inv.id for inv in page.rows])
-        alert_ids = sorted({g for inv in page.rows if (g := inv_svc.alert_group_id(inv))})
-        group_rows = await inv_svc.runs_for_alerts(db, alert_ids)
+        campaigns = await campaign_svc.links_of(db, [inv.id for inv in page.rows])
+        group_rows = await _page_group_runs(db, page.rows)
         waiting: dict[str, list[_timeline.WaitingActionOut]] | None = None
         if pending is not None:
             from soc_ai.api.webui.routes_meta import (  # noqa: PLC0415 - cycle
@@ -655,7 +856,7 @@ async def list_investigations(
     # about it. Newest-first order is what _primary_run_ids assumes.
     seen = {r.id for r in group_rows}
     combined = group_rows + [
-        inv_svc.RunRef(inv.id, inv_svc.alert_group_id(inv), inv.status, inv.created_at)
+        inv_svc.RunRef(inv.id, _group_key(inv), inv.status, inv.created_at)
         for inv in page.rows
         if inv.id not in seen
     ]
@@ -668,10 +869,12 @@ async def list_investigations(
             inv,
             chat_counts.get(inv.id, 0),
             is_primary=inv.id in primary,
-            latest_run=latest.get(inv_svc.alert_group_id(inv) or inv.id),
+            latest_run=latest.get(_group_key(inv) or inv.id),
+            labels=labels,
         )
         for inv in page.rows
     ]
+    _apply_marks(rows, marks, campaigns)
     if pending is not None:
         for row in rows:
             row.pendingActions = pending.get(row.id, 0)
@@ -713,7 +916,7 @@ async def list_investigations(
 
 
 @router.get("/investigations/{inv_id}", response_model=InvestigationOut)
-async def get_investigation(
+async def get_investigation(  # noqa: PLR0915 - one linear read of the run and its context
     request: Request,
     inv_id: str,
     settings: Settings = Depends(get_settings_dep),
@@ -760,6 +963,10 @@ async def get_investigation(
         # promotion is kind 'lead' and its subject is still a hunt.
         wants_hunt = inv.kind == "hunt" or _subject_type(inv) == "hunt"
         hunt = await db.get(Hunt, inv.hunt_id) if wants_hunt and inv.hunt_id else None
+        # The authorized activity the run matched, and the line of a run
+        # that is outside one.
+        mark, outside_line = await _authorization_of(db, inv)
+        campaign = link_for(await campaign_svc.links_of(db, [inv.id]), inv.id)
 
     # A row stored before the store-side scrub existed can still hold a
     # credential the model quoted. Scrub the model-written text on read too.
@@ -798,6 +1005,8 @@ async def get_investigation(
         analyst=standing_analyst,
         anchor=anchor,
         anchor_status=anchor_status,
+        authorized=mark.label if mark is not None and mark.holds else None,
+        campaign=campaign,
     )
 
     # The enriched-alert-context event carries the alert, the host's alert
@@ -822,7 +1031,13 @@ async def get_investigation(
         step.title = scrub_secrets(step.title)
         step.detail = scrub_secrets(step.detail)
     nodes, edges, graph_note = _entity_graph(alert_obj, enrichments, inv)
-    summary_text = report.get("summary") or inv.summary or ""
+    # The text of the run. The headline never contradicts the final verdict,
+    # and a row of an older release is repaired (B2).
+    # A run inside a scope whose authorization holds: each sentence that
+    # denies an authorization goes. The model never reads an authorization,
+    # so such a sentence is ungrounded. The store keeps the report, so a
+    # revoke returns the text (polish review 2026-11-13).
+    summary_text, headline_text, model_text = _text_under_mark(report, inv, actions, mark)
     # The endpoints chip reads the alert's own fields. A host-reported alert
     # names a source address and a host, and no destination: the host is where
     # the alert came from, and it is never one end of the flow.
@@ -840,13 +1055,21 @@ async def get_investigation(
             reporter=reporter or _str_or_none(inv.host_name),
             subject=_subject_out(inv, hunt),
         )
+    # What served the run (B4). The model line names the model that the run
+    # asked for, when the run recorded it.
+    served_model, requested_model, served_fallback = _timeline._served_model_of(report, events)
     meta = InvMetaOut(
-        model=settings.analyst_model,
+        model=requested_model or settings.analyst_model,
+        lowReasoning=_timeline._low_reasoning_of(report, events),
+        servedModel=served_model,
+        requestedModel=requested_model,
+        servedFallback=served_fallback,
         oracle=_oracle_line(settings, inv, has_oracle),
         ranBy=inv.started_by or "—",
         # tz-AWARE ISO (with +00:00) so the value is unambiguous UTC — the raw
         # naive string had no offset, so it couldn't be localized/interpreted.
         ranAt=_iso_utc(inv.created_at),
+        eventAt=_iso_utc(inv.event_at or inv.created_at),
         toolCalls=tool_calls,
         pivots=pivots,
     )
@@ -865,7 +1088,7 @@ async def get_investigation(
         reportedBy=reporter,
         verdict=_verdict(inv.verdict),
         conf=inv.confidence if inv.confidence is not None else 0.0,
-        rationale=scrub_secrets(inv.rationale or summary_text),
+        rationale=scrub_secrets(headline_text),
         summary=[{"t": "text", "v": scrub_secrets(summary_text)}],
         status=(
             "investigating"
@@ -905,6 +1128,12 @@ async def get_investigation(
         failure=_timeline._failure_out(inv.status, events),
         resolution=report.get("resolution") or None,
         validatorNote=_note_or_none(report.get("validator_note")),
+        modelText=scrub_secrets(model_text) if model_text else None,
+        verdictChange=_timeline._verdict_change_out(report, events),
+        impact=None if is_pipeline_fallback(report) else stored_impact(report, inv.verdict),
+        impactChange=_timeline._impact_change_out(report, inv.verdict),
+        firstLine=await _detail_first_line(request, settings, inv),
+        oracleReasoning=_note_or_none(report.get("oracle_reasoning")),
         # Pipeline-failure provenance (E1.2) — non-None ONLY for a synth-failure
         # fallback run; drives the drawer's "failed before reaching a verdict"
         # panel instead of the amber Needs-info block.
@@ -920,6 +1149,7 @@ async def get_investigation(
         supersededRun=_superseded_run_out(newer),
         standingAnalystVerdict=standing_analyst,
         writeBlockedReason=write_blocked,
+        promotedKind=action_rules.promoted_kind(inv),
         alertCases=alert_cases,
         alertCasesComplete=cases_complete,
         alertLiveRun=_superseded_run_out(live_run),
@@ -931,7 +1161,77 @@ async def get_investigation(
         eventTimeline=_event_timeline.investigation_event_timeline(
             events, citations, inv.status, focus_ids=_finding_focus_ids(inv, hunt)
         ),
+        authorizationId=inv.authorization_id,
+        authorization=authorization_ref(mark),
+        outsideAuthorizedScope=outside_line,
+        campaign=campaign,
+        needsYouCleared=needs_you_clear.cleared_sentence(inv.report),
     )
+
+
+def _apply_marks(
+    rows: list[InvestigationRowOut],
+    marks: dict[int, authorized_svc.Mark],
+    campaigns: Mapping[str, campaign_svc.CampaignLink] | None = None,
+) -> None:
+    """Give each row its mark, the headline that its mark allows, and its campaign.
+
+    A run whose authorization holds drops each sentence that denies an
+    authorization (:func:`authorized_svc.run_text_for_mark`).
+    """
+    for row in rows:
+        row.campaign = link_for(campaigns or {}, row.id)
+        mark = marks.get(row.authorizationId or 0)
+        row.authorization = authorization_ref(mark)
+        if row.headline:
+            row.headline = authorized_svc.run_text_for_mark(row.headline, mark)
+
+
+def _text_under_mark(
+    report: dict[str, Any],
+    inv: Investigation,
+    actions: Sequence[_timeline.RecommendedActionOut],
+    mark: authorized_svc.Mark | None,
+) -> tuple[str, str, str | None]:
+    """(summary, headline, model text) of a run under its mark.
+
+    The summary, the headline and the rationale of each action drop each
+    sentence that denies an authorization when the mark holds. The rationale
+    of each action changes in place. The model text is the quote under "The
+    model wrote" and stays as the model wrote it.
+    """
+    summary, headline, model_text = _timeline._run_text(report, inv)
+    for action in actions:
+        action.rationale = authorized_svc.run_text_for_mark(action.rationale, mark)
+    return (
+        authorized_svc.run_text_for_mark(summary, mark),
+        authorized_svc.run_text_for_mark(headline, mark),
+        model_text,
+    )
+
+
+async def _authorization_of(
+    db: Any, inv: Investigation
+) -> tuple[authorized_svc.Mark | None, str | None]:
+    """The mark of the authorization a run matched, and its outside line.
+
+    The line is ``report["authorized_activity"]["line"]`` of a run that is
+    outside a scope. It names an authorization. After a revoke that
+    authorization covers nothing, so the line would point at a scope that is
+    gone, and the page then shows none.
+    """
+    raw = inv.report.get(authorized_svc.REPORT_KEY) if isinstance(inv.report, dict) else None
+    outside = (
+        raw if isinstance(raw, dict) and raw.get("state") == authorized_svc.RUN_OUTSIDE else None
+    )
+    named = outside.get("id") if outside is not None else None
+    marks = await authorized_svc.marks_for(
+        db, [inv.authorization_id, named if isinstance(named, int) else None]
+    )
+    line = outside.get("line") if outside is not None else None
+    scope = marks.get(named) if isinstance(named, int) else None
+    shown = line if isinstance(line, str) and scope is not None and scope.holds else None
+    return marks.get(inv.authorization_id or 0), shown
 
 
 async def _apply_action_rule(
@@ -947,6 +1247,8 @@ async def _apply_action_rule(
     analyst: StandingAnalystVerdictOut | None,
     anchor: str | None,
     anchor_status: str = anchor_check.NOT_ALERT,
+    authorized: str | None = None,
+    campaign: CampaignLinkOut | None = None,
 ) -> tuple[str | None, list[CaseRefOut], bool]:
     """Set the ``blockedReason`` of each action card, under the one action rule.
 
@@ -963,6 +1265,11 @@ async def _apply_action_rule(
 
     The cases are read only when an escalate waits. The card names each case:
     the execute route opens no second case.
+
+    A run that a campaign holds keeps its actions executable, except its
+    Escalate: the campaign opens the one case. Each card then carries the
+    note ``campaign`` and the link of the campaign: the analyst decides on
+    the campaign (:func:`action_rules.action_note`).
     """
     from soc_ai.api.webui.routes_actions import _observed_case_id  # noqa: PLC0415 - cycle
 
@@ -977,10 +1284,17 @@ async def _apply_action_rule(
         analyst_verdict=analyst.verdict if analyst is not None else None,
         analyst_by=analyst.by if analyst is not None else None,
         case_id=_observed_case_id(list(events)),
+        authorized=authorized,
         demo=is_demo(settings),
     )
+    facts = action_rules.with_campaign(facts, campaign)
+    note = action_rules.action_note(facts)
     for action, tool_name in zip(actions, action_tool_names(events, report), strict=False):
         action.blockedReason = action_rules.block_reason(facts, tool_name)
+        if note is not None and not action.applied and not action.dismissed:
+            action.noteCode = note.code
+            action.note = note.reason
+            action.noteHref = f"/campaigns/{facts.campaign_id}"
     write_blocked = action_rules.block_reason(
         dataclasses.replace(facts, replay=False, superseded_by=None, demo=False), None
     )
@@ -1075,7 +1389,7 @@ def _oracle_line(settings: Settings, inv: Investigation, has_oracle: bool) -> st
     conf = inv.confidence
     band = settings.oracle_escalate_below_confidence
     if inv.status != "complete" or conf is None:
-        return "Oracle review: none. The run has no verdict to review."
+        return "Oracle review: none. The investigation has no verdict to review."
     if conf >= band:
         return f"Oracle review: not needed. Confidence {conf:.2f} is above the review band."
     return f"Oracle review: not run. Confidence {conf:.2f} is under {band:.2f}."
@@ -1268,7 +1582,8 @@ async def dismiss_pipeline_error(inv_id: str, request: Request) -> dict[str, boo
                 detail={
                     "reason": "not_pipeline_error",
                     "hint": (
-                        "This run reached a verdict and did not fail. There is nothing to dismiss."
+                        "This investigation reached a verdict and did not fail. "
+                        "There is nothing to dismiss."
                     ),
                 },
             )
@@ -1655,7 +1970,7 @@ async def request_more_info(
             detail={
                 "reason": "already_answered",
                 "invId": answered,
-                "hint": f"Investigation {answered} answers this run. Open it.",
+                "hint": f"Investigation {answered} answers this investigation. Open it.",
             },
         )
 
@@ -1686,7 +2001,7 @@ async def request_more_info(
         raise api_error(
             503,
             "could_not_start",
-            "The console did not start the run. Check the model gateway in Settings.",
+            "The console did not start the investigation. Check the model gateway in Settings.",
         )
     async with request.app.state.db_sessionmaker() as db:
         await inv_svc.record_follow_up(db, inv_id, follow_up_id=new_inv_id, requested_by=started_by)

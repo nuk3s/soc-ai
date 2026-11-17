@@ -13,6 +13,8 @@ import { fireEvent, render, screen, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { InvestigationList, InvestigationRow } from '../lib/types';
+import { forbiddenWords } from '../test/analystWords';
+import { LINK, LINK_DIFFERS } from '../test/campaign';
 
 const row = (over: Partial<InvestigationRow>): InvestigationRow => ({
   id: 'INV-X',
@@ -70,12 +72,14 @@ describe('the depth tag', () => {
   it('shows no tag on a row with no recorded depth', async () => {
     listInvestigations.mockResolvedValue(
       list([
-        row({ id: 'A', alertId: 'ev-a', runClass: 'standard' }),
+        row({ id: 'A', alertId: 'ev-a', runClass: 'deep' }),
         row({ id: 'B', alertId: 'ev-b', runClass: null }),
       ]),
     );
     mount();
-    expect(await screen.findByTestId('run-class-A')).toHaveTextContent('Depth: standard');
+    // K3: standard is the default depth and shows no tag, so the row with a
+    // tag holds another depth.
+    expect(await screen.findByTestId('run-class-A')).toHaveTextContent('Depth: deep');
     expect(screen.queryByTestId('run-class-B')).toBeNull();
     expect(screen.getByTestId('inv-tags-B').textContent).not.toContain('not recorded');
   });
@@ -143,7 +147,7 @@ describe('the group header count', () => {
     const header = await screen.findByTestId('group-count-ET INFO NTLMv1 Session Setup Response');
     expect(header.textContent).toBe('3 investigations');
     expect(header.getAttribute('title')).toBe(
-      'This detection has 3 investigations in the list. The count includes the earlier runs under each row.',
+      'This detection has 3 investigations in the list. The count includes the earlier investigations under each row.',
     );
     expect(screen.getByTestId('group-count-ET SCAN Potential SSH Scan').textContent).toBe(
       '1 investigation',
@@ -164,7 +168,35 @@ describe('the group header count', () => {
     const header = await screen.findByTestId('group-count-ET INFO NTLMv1 Session Setup Response');
     expect(header.textContent).toBe('2 investigations on this page');
     expect(header.getAttribute('title')).toBe(
-      'This detection has 2 investigations on this page. The count includes the earlier runs under each row.',
+      'This detection has 2 investigations on this page. The count includes the earlier investigations under each row.',
     );
+  });
+});
+
+// The campaign is the unit of work (owner, 2026-11-14). A row whose
+// investigation is in a campaign carries the campaign chip in its tags.
+describe('the campaign tag', () => {
+  it('links a row to its campaign, and a row in no campaign carries no chip', async () => {
+    listInvestigations.mockResolvedValue(
+      list([
+        row({ id: 'A', alertId: 'ev-a', verdict: 'true_positive', campaign: LINK }),
+        row({ id: 'B', alertId: 'ev-b', campaign: LINK_DIFFERS }),
+        row({ id: 'C', alertId: 'ev-c', campaign: null }),
+        // A server of an earlier release sends no field.
+        row({ id: 'D', alertId: 'ev-d' }),
+      ]),
+    );
+    mount();
+    const chip = await screen.findByTestId('inv-campaign-A');
+    expect(chip).toHaveAttribute('href', '/campaigns/7');
+    expect(within(screen.getByTestId('inv-tags-A')).getByRole('link')).toBe(chip);
+    expect(chip).toHaveAccessibleName('Campaign: actor-a against web-1. Stage reached: Action on the target, 4 of 5.');
+    expect(screen.getByTestId('inv-campaign-B').getAttribute('title')).toContain(
+      'Same session as this campaign. The verdict differs.',
+    );
+    expect(forbiddenWords(screen.getByTestId('inv-tags-A'))).toEqual([]);
+    // NEGATIVE CONTROL.
+    expect(screen.queryByTestId('inv-campaign-C')).toBeNull();
+    expect(screen.queryByTestId('inv-campaign-D')).toBeNull();
   });
 });

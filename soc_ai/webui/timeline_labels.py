@@ -97,6 +97,7 @@ _ICON: dict[str, str] = {
     "malware_rule_name_ungrounded_downgrade": "📉",
     "decisive_value_support_cap": "📉",
     "unsupported_decisive_value_downgrade": "📉",
+    "impact_evidence_downgrade": "📉",
     "icmp_solicited_downgrade": "📉",
     "fast_path_escalation": "⚡",
     "fast_path_evidence_guard": "⚡",
@@ -105,10 +106,12 @@ _ICON: dict[str, str] = {
     "recommended_actions_blocked": "🚫",
     "retask": "🎯",
     "retask_skipped_no_closeable_gap": "·",
+    "token_limit_retry": "↻",
     "oracle_escalation": "🔮",
     "oracle_adjudication": "🔮",
     "oracle_adjudication_failed": "🔮",
     "oracle_skipped": "🔮",
+    "oracle_retry_dropped": "🔮",
     "investigation_transcript": "📝",
     "auto_ack": "☑",
     "inherited_ack": "☑",
@@ -553,6 +556,12 @@ def _t_vote(p: dict[str, Any]) -> str:
 
 def _t_actions_blocked(p: dict[str, Any]) -> str:
     n = p.get("blocked_count")
+    if p.get("reason") == "no_case_for_comment":
+        # A new run opened no case, and the execute route refuses a comment
+        # with no case (soc_ai.triage_models.drop_case_comments_without_a_case).
+        count = n if isinstance(n, int) else 1
+        noun = "action" if count == 1 else "actions"
+        return f"Removed {count} case comment {noun}. This investigation opened no case"
     if isinstance(n, int):
         return f"Withheld {n} recommended action(s): confidence below floor"
     return "Recommended actions withheld: confidence below floor"
@@ -597,6 +606,22 @@ def _t_oracle_skipped(p: dict[str, Any]) -> str:
     until = p.get("paused_until")
     when = f" until {str(until).replace('T', ' ').replace('Z', '')} UTC" if until else ""
     return f"Oracle call skipped: Oracle calls are paused{when}. The local verdict stands"
+
+
+# Why a run left the Oracle retry queue (soc_ai.oracle.retry), in words.
+_RETRY_DROP_REASON: dict[str, str] = {
+    "hunt_not_found": "the hunt of the finding is gone",
+    "finding_not_found": "the finding is not in the report of its hunt",
+    "no_promotable_evidence": "no cited document of the finding is in the grid",
+    "alert_not_found": "the grid no longer holds the alert",
+    "alert_closed": "the alert is acknowledged or escalated",
+}
+
+
+def _t_oracle_retry_dropped(p: dict[str, Any]) -> str:
+    reason = str(p.get("reason") or "")
+    words = _RETRY_DROP_REASON.get(reason, reason.replace("_", " ") or "no reason recorded")
+    return f"No new run for the Oracle: {words}. The local verdict stands"
 
 
 def _t_auto_ack(p: dict[str, Any]) -> str:
@@ -690,6 +715,10 @@ _STATIC_TITLES: dict[str, str] = {
     "synth_round1_skipped": "Skipped the first-pass synthesis: the investigation ran first",
     "context_trimmed": "Trimmed oldest related events to fit the model's context window",
     "retask_skipped_no_closeable_gap": "No re-task: no closeable evidence gap",
+    "token_limit_retry": (
+        "The model hit its output token limit before a response. "
+        "The call ran one more time with low reasoning"
+    ),
     "rubric_derivation": "Derived the evidence checklist for this alert type",
     "evidence_gate_downgrade": "Confidence lowered: verdict not evidence-backed",
     "ungrounded_host_anchored_tp_downgrade": (
@@ -705,6 +734,9 @@ _STATIC_TITLES: dict[str, str] = {
         "Verdict downgraded: the decisive indicator appears in no retrieved document"
     ),
     "icmp_solicited_downgrade": "Verdict downgraded: the ICMP replies answered a normal ping",
+    "impact_evidence_downgrade": (
+        "Impact changed to attempted: the report cites no record that shows the effect"
+    ),
     "evidence_gate_pivot_exemption": (
         "Evidence gate passed: verdict grounded in cited pivot evidence"
     ),
@@ -747,6 +779,7 @@ _DYNAMIC_TITLES: dict[str, Callable[[dict[str, Any]], str]] = {
     "oracle_adjudication": _t_oracle_adjudication,
     "oracle_adjudication_failed": _t_oracle_failed,
     "oracle_skipped": _t_oracle_skipped,
+    "oracle_retry_dropped": _t_oracle_retry_dropped,
     "auto_ack": _t_auto_ack,
     "inherited_ack": _t_inherited_ack,
     "triage_report": _t_triage_report,

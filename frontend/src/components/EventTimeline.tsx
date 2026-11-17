@@ -115,16 +115,19 @@ export function EventTimelinePanel({ timeline }: { timeline: EventTimeline }) {
         const previous = i > 0 ? timeline.waves[i - 1] : null;
         const gap = previous ? seconds(previous.end, wave.start) : null;
         return (
-          <section key={wave.n} data-testid="event-wave" className="pt-2.5">
-            {previous && gap != null && (
-              <p className="px-[15px] pb-1.5 text-[12px] italic text-faint">
-                {`This wave starts ${formatDuration(gap)} after wave ${previous.n} ends.`}
-              </p>
-            )}
-            <div className="flex flex-wrap items-baseline gap-x-2 border-t border-border px-[15px] pt-2">
+          // The gap line belongs to the wave it opens. It sat above the rule
+          // of the wave header, so it read as the last line of the wave
+          // before (review 2026-11-12). It now sits under the header.
+          <section key={wave.n} data-testid="event-wave" className="mt-2.5 border-t border-border">
+            <div className="flex flex-wrap items-baseline gap-x-2 px-[15px] pt-2">
               <span className="text-[12.5px] font-semibold text-text">{`Wave ${wave.n}`}</span>
               <span className="font-mono text-[11.5px] text-dim">{waveLine(wave)}</span>
             </div>
+            {previous && gap != null && (
+              <p data-testid="event-wave-gap" className="px-[15px] pt-0.5 text-[12px] italic text-faint">
+                {`This wave starts ${formatDuration(gap)} after wave ${previous.n} ends.`}
+              </p>
+            )}
             <ul>
               {(byWave.get(wave.n) ?? []).map((e) => (
                 <EntryRow key={e.id} entry={e} markCited={markCited} />

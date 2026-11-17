@@ -1556,12 +1556,19 @@ async def test_synth_first_downgrades_solicited_icmp_echo_tp(
     assert report_ev.payload["verdict"] == "false_positive"
     assert report_ev.payload["recommended_actions"] == []
     assert report_ev.payload["confidence"] == pytest.approx(0.8)
-    # Summary must lead with the correct conclusion — no confusing inline bracket.
+    # B2 (2026-11-13): the gate refutes the claim of the model, so the stored
+    # summary leads with the reason of the gate. The headline of a false
+    # positive row never reads as C2. The text of the model has its own key.
     assert not report_ev.payload["summary"].lower().startswith("[auto-corrected")
-    assert "solicited" in report_ev.payload["summary"].lower()
-    # Original synth narrative preserved in validator_note, not in summary.
+    assert "echo request" in report_ev.payload["summary"]
     assert "symmetric byte counts" not in report_ev.payload["summary"]
-    assert "symmetric byte counts" in (report_ev.payload.get("validator_note") or "")
+    assert "symmetric byte counts" in report_ev.payload["model_summary"]
+    assert "solicited" in (report_ev.payload.get("validator_note") or "").lower()
+    change = report_ev.payload["verdict_change"]
+    assert change["gate"] == "icmp_solicited_downgrade"
+    assert (change["from_verdict"], change["to_verdict"]) == ("true_positive", "false_positive")
+    assert "echo request" in change["reason"]
+    assert change["missing"] == []
 
 
 @pytest.mark.asyncio
@@ -6010,10 +6017,9 @@ def test_downgrade_ungrounded_host_anchored_tp_fires_on_no_evidence() -> None:
     (separate unconfirmed alert), enrichments have no blocklist/MISP hits, focus
     alert is misc-activity (not malware class), no beacon/payload tokens in summary.
     Expected: verdict=needs_more_info, recommended_actions=[], audit entry written.
-    The text of the model stays behind a lead that states the change (change A,
-    2026-10-30).
+    The summary keeps the text of the model, with no lead (B2, 2026-11-13).
     """
-    from soc_ai.agent.gates import _HOST_ANCHORED_TP_LEAD, _host_anchored_tp_note
+    from soc_ai.agent.gates import _host_anchored_tp_note
     from soc_ai.agent.orchestrator import _downgrade_ungrounded_host_anchored_tp
 
     report = TriageReport(
@@ -6042,10 +6048,8 @@ def test_downgrade_ungrounded_host_anchored_tp_fires_on_no_evidence() -> None:
     assert "ungrounded_host_anchored_tp_downgrade" in audit, "audit entry must be written"
     assert audit["ungrounded_host_anchored_tp_downgrade"]["original_verdict"] == "true_positive"
     assert audit["ungrounded_host_anchored_tp_downgrade"]["downgraded_verdict"] == "needs_more_info"
-    # The summary leads with the change, then keeps the text of the model.
-    assert result.summary == (
-        f"{_HOST_ANCHORED_TP_LEAD} BPFDoor C2 confirmed by host profile and absence of reputation."
-    )
+    # The summary keeps the text of the model, whole and first.
+    assert result.summary == "BPFDoor C2 confirmed by host profile and absence of reputation."
     assert result.validator_note == _host_anchored_tp_note(False)
 
 

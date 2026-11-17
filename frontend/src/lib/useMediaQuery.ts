@@ -21,3 +21,8 @@ export function useMediaQuery(query: string): boolean {
   }, [query]);
   return on;
 }
+
+/** The width where the Alerts and Investigations rows show every column. Under
+ *  it a row folds its low-value columns into the name cell, so the row and its
+ *  actions fit the card (prod review 2026-11-12, ui-core 12). */
+export const WIDE_TABLE_QUERY = '(min-width: 1280px)';

@@ -74,6 +74,6 @@ describe('Dashboard recent investigations status words', () => {
       expect((await rowOf(status)).textContent ?? '').not.toMatch(/Investigating|\bError\b|Interrupted/);
     }
     // The title names the cause, because "Failed" no longer does.
-    expect((await rowOf('error')).querySelector('[title*="An error stopped the run"]')).toBeTruthy();
+    expect((await rowOf('error')).querySelector('[title*="An error stopped the investigation"]')).toBeTruthy();
   });
 });

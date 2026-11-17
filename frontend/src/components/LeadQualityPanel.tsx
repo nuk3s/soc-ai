@@ -18,7 +18,7 @@ import {
 } from '../lib/tooltips';
 import { kindLabel } from '../lib/kinds';
 import { useAsync } from '../lib/useAsync';
-import { REASON_LABEL } from './LeadsStrip';
+import { dismissReasonLabel } from './LeadsStrip';
 
 /** The types that formed a lead, in the analyst's words. The API joins the
  *  stored names with a plus sign. */
@@ -138,7 +138,7 @@ export function LeadQualityPanel() {
                           dismiss form offered. */}
                       {reasons.map((r) => (
                         <th key={r} className={HEAD_CLASS} title={QUALITY_DISMISSED}>
-                          {REASON_LABEL[r] ?? r}
+                          {dismissReasonLabel(r)}
                         </th>
                       ))}
                     </tr>

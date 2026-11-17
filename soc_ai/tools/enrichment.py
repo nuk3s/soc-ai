@@ -26,20 +26,34 @@ import ipaddress as _ipaddress
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
+from datetime import UTC, datetime, timedelta
+from typing import Any, Literal
 
 import httpx
-from pydantic import BaseModel, Field, computed_field
+from pydantic import BaseModel, Field
 
 from soc_ai.config import Settings
 from soc_ai.demo.guard import assert_egress_allowed
-from soc_ai.enrichment.blocklists import BlocklistDB, BlocklistHit
+from soc_ai.enrichment.blocklists import (
+    FEED_PROFILES,
+    BlocklistDB,
+    BlocklistHit,
+    IndicatorKind,
+    feed_of_hit,
+)
 from soc_ai.enrichment.cloud_tags import CloudPrefixDB
 from soc_ai.enrichment.maxmind import AsnInfo, GeoIpInfo, MaxmindReader
 from soc_ai.enrichment.refresh import cloud_prefix_staleness_days
 from soc_ai.tools._registry import tool
 
 _LOGGER = logging.getLogger(__name__)
+
+
+ReputationStatus = Literal["listed", "not_listed", "not_checked"]
+LISTED: ReputationStatus = "listed"
+NOT_LISTED: ReputationStatus = "not_listed"
+NOT_CHECKED: ReputationStatus = "not_checked"
+NotCheckedReason = Literal["no_feed", "stale_feed", "lookup_failed", "internal_address"]
 
 
 class Finding(BaseModel):
@@ -76,23 +90,58 @@ class IndicatorEnrichment(BaseModel):
     indicator_type: str  # "ip" | "domain" | "sha256"
     internal: bool = False
     blocklist_hits: list[BlocklistHit] = Field(default_factory=list)
-    blocklist_sources: list[str] | None = None
-    """The blocklist feeds that actually answered this lookup.
+    reputation_status: ReputationStatus | None = None
+    """What the feeds support about this indicator.
 
-    An empty ``blocklist_hits`` says nothing on its own. The feeds have never
-    been refreshed on either deployment and the data directory does not exist,
-    so ``BlocklistDB`` loads nothing and every lookup misses; the only signal
-    was a warning in the process log, and the timeline rendered the miss as
-    "no blocklist/MISP match". Three triages leaned on that phrasing.
+    - ``listed``: a feed lists the indicator. ``feeds_matched`` names it.
+    - ``not_listed``: a malware feed that holds this indicator type is loaded,
+      and no checked feed lists the indicator. The miss is evidence for the
+      feeds in ``feeds_checked`` and for no other feed.
+    - ``not_checked``: no malware feed that holds this indicator type is
+      loaded. The empty ``blocklist_hits`` is an absence of data.
+    - ``None``: the record does not say. It predates this field.
 
-    Three states, because there are three:
+    The older shape named the loaded feeds in ``blocklist_sources`` and set
+    ``blocklist_checked: true`` when one feed loaded. A production host loaded
+    the Tor exit list alone. Each lookup then read ``blocklist_checked: true``,
+    the prompt counted the miss as positive evidence, and two hunts read
+    ``blocklist_sources: ["tor"]`` with no hit as a Tor hit.
+    """
+    feeds_matched: list[str] = Field(default_factory=list)
+    """The feeds that list the indicator. Empty on a miss."""
+    feeds_checked: list[str] = Field(default_factory=list)
+    """The loaded feeds that hold this indicator type. Each one was checked.
 
-    - ``None`` — the result does not say. Records written before this field
-      existed, and hand-built contexts. Nothing may be concluded either way.
-    - ``[]`` — a lookup ran against a database with nothing loaded. An empty
-      hit list here is an absence of data.
-    - non-empty — these feeds answered. An empty hit list is a clean result,
-      as far as they reach.
+    A feed in this list did not match unless ``feeds_matched`` also names it.
+    """
+    not_checked_reason: NotCheckedReason | None = None
+    """Why the status is ``not_checked``. ``None`` for each other status.
+
+    - ``no_feed``: no fresh malware feed that indexes this indicator type is
+      loaded.
+    - ``stale_feed``: the malware feeds of this type are loaded and stale.
+    - ``lookup_failed``: the lookup raised an error.
+    - ``internal_address``: the address is internal. The feeds list public
+      infrastructure, so a miss says nothing. This reason is not a gap in the
+      feeds: the gates and the timeline do not treat it as one.
+    """
+    feeds_stale: list[str] = Field(default_factory=list)
+    """The loaded feeds of this indicator type whose file is too old.
+
+    A match on a stale feed is still a match. A miss on a stale feed is not
+    evidence, so a stale feed is not in ``feeds_checked``.
+    """
+    feeds_not_loaded: list[str] = Field(default_factory=list)
+    """The configured feeds that are not loaded. They answered nothing."""
+    reputation_note: str | None = None
+    """One plain statement of what the result supports."""
+    blocklist_sources: list[str] | None = Field(default=None, exclude=True)
+    """The loaded feeds, in the older shape. Not in the dump.
+
+    Kept as an input so that a record stored before ``reputation_status``
+    still reads: ``None`` says nothing, ``[]`` says that no feed was loaded,
+    and a list says that those feeds were loaded. A reader of the dump could
+    take the name for a list of matches, so the dump no longer holds it.
     """
     asn: AsnInfo | None = None
     geoip: GeoIpInfo | None = None
@@ -102,14 +151,22 @@ class IndicatorEnrichment(BaseModel):
 
     model_config = {"arbitrary_types_allowed": True}
 
-    @computed_field  # type: ignore[prop-decorator]
     @property
     def blocklist_checked(self) -> bool | None:
-        """Whether a reputation lookup actually ran, or ``None`` if unrecorded.
+        """Whether a miss here is evidence, or ``None`` if the record does not say.
 
-        Computed so it lands in ``model_dump`` and reaches the model and every
-        renderer without each of them re-deriving it from a list length.
+        ``False`` for ``not_checked`` with a gap in the feeds: no feed, a stale
+        feed or a failed lookup. ``None`` for ``not_checked`` on an internal
+        address, which says nothing about the feeds. A record of the older
+        shape reads as it did: ``False`` when no feed was loaded. The value is
+        not in the dump: ``reputation_status`` carries it there.
         """
+        if self.reputation_status is not None:
+            if self.reputation_status != NOT_CHECKED:
+                return True
+            # An internal address is not a gap in the feeds. The record makes
+            # no claim about them.
+            return None if self.not_checked_reason == "internal_address" else False
         if self.blocklist_sources is None:
             return None
         return bool(self.blocklist_sources)
@@ -231,17 +288,182 @@ _NO_FEEDS_LOADED = (
     "feeds with `soc-ai blocklists refresh`."
 )
 
+_KIND_WORD: dict[IndicatorKind, str] = {
+    "ip": "addresses",
+    "domain": "domains",
+    "md5": "MD5 hashes",
+    "sha1": "SHA-1 hashes",
+    "sha256": "SHA-256 hashes",
+}
 
-def _record_blocklist_scope(enrichment: IndicatorEnrichment, blocklist: BlocklistDB | None) -> None:
-    """Record which feeds answered, and say so in ``errors`` when none did.
 
-    Same reasoning as the cloud-tag IPv6 note above: silence is not a negative
-    signal, and the only way the model learns the difference is if the result
-    says it. The list is the structured form every renderer reads; the errors
-    line is the one the model reads in prose.
+def _names(feeds: Sequence[str]) -> str:
+    quoted = [f"`{feed}`" for feed in feeds]
+    if len(quoted) <= 1:
+        return "".join(quoted)
+    return ", ".join(quoted[:-1]) + " and " + quoted[-1]
+
+
+def _feed_word(feeds: Sequence[str]) -> str:
+    return "feed" if len(feeds) == 1 else "feeds"
+
+
+def _reputation_note(
+    status: ReputationStatus,
+    kind: IndicatorKind,
+    matched: Sequence[str],
+    checked: Sequence[str],
+    not_loaded: Sequence[str],
+    *,
+    stale: Sequence[str] = (),
+    internal: bool = False,
+    failed: bool = False,
+) -> str:
+    """The plain statement of what the reputation result supports."""
+    sentences: list[str] = []
+    if status == LISTED:
+        verb = "lists" if len(matched) == 1 else "list"
+        sentences.append(f"The {_feed_word(matched)} {_names(matched)} {verb} this indicator.")
+    elif status == NOT_LISTED:
+        verb = "does" if len(checked) == 1 else "do"
+        sentences.append(
+            f"The {_feed_word(checked)} {_names(checked)} {verb} not list this indicator. "
+            "The miss is evidence for the checked feeds only."
+        )
+    elif failed:
+        sentences.append(
+            "The lookup failed, so no feed was checked. "
+            "The reputation of this indicator is not checked. "
+            "The empty blocklist_hits is not a clean result."
+        )
+    elif internal:
+        sentences.append(
+            "This is an internal address. The feeds list public infrastructure, so a miss "
+            "says nothing about it. The reputation of this indicator is not checked."
+        )
+    else:
+        sentences.append(
+            f"No {'fresh ' if stale else ''}malware feed that holds "
+            f"{_KIND_WORD.get(kind, 'this indicator type')} is loaded. "
+            "The reputation of this indicator is not checked. "
+            "The empty blocklist_hits is not a clean result."
+        )
+        if checked:
+            verb = "does" if len(checked) == 1 else "do"
+            sentences.append(
+                f"The {_feed_word(checked)} {_names(checked)} {verb} not list it. "
+                "That miss does not clear the indicator."
+            )
+    if stale and status != LISTED:
+        verb = "is" if len(stale) == 1 else "are"
+        sentences.append(
+            f"The {_feed_word(stale)} {_names(stale)} {verb} stale. "
+            "A miss on a stale feed is not evidence."
+        )
+    if not_loaded:
+        verb = "is" if len(not_loaded) == 1 else "are"
+        sentences.append(
+            f"The {_feed_word(not_loaded)} {_names(not_loaded)} {verb} configured and not loaded."
+        )
+    return " ".join(sentences)
+
+
+def _stale_feeds(
+    blocklist: BlocklistDB, feeds: Sequence[str], settings: Settings | None
+) -> list[str]:
+    """The feeds whose file is older than ``blocklist_stale_threshold_days``.
+
+    A feed with no recorded file time is not called stale: a database that a
+    test or a caller built in memory has no file.
     """
-    enrichment.blocklist_sources = list(blocklist.loaded_sources) if blocklist else []
-    if not enrichment.blocklist_sources:
+    if settings is None:
+        return []
+    limit = timedelta(days=max(1, int(settings.blocklist_stale_threshold_days)))
+    now = datetime.now(UTC)
+    out: list[str] = []
+    for feed in feeds:
+        stamp = blocklist.file_mtimes.get(feed)
+        if stamp is None:
+            continue
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=UTC)
+        if now - stamp > limit:
+            out.append(feed)
+    return out
+
+
+def _record_blocklist_scope(
+    enrichment: IndicatorEnrichment,
+    blocklist: BlocklistDB | None,
+    kind: IndicatorKind,
+    *,
+    settings: Settings | None = None,
+    failed: bool = False,
+) -> None:
+    """Record what the feeds support about the indicator.
+
+    Four lists and one status. ``feeds_matched`` names the feeds of the hits.
+    ``feeds_checked`` names the loaded, fresh feeds whose loader indexes this
+    indicator type: the Tor exit list holds addresses, so it is not checked for
+    a domain, and URLhaus indexes no hash, so it is not checked for an MD5.
+    ``feeds_stale`` names the feeds of that type whose file is too old.
+    ``feeds_not_loaded`` names the configured feeds that did not load.
+
+    A miss is ``not_listed`` only when a fresh malware feed was checked. Each
+    other miss is ``not_checked``: a miss on the Tor exit list says only that
+    the address is not a Tor exit, a miss on a stale file says what the feed
+    held weeks ago, a miss for an internal address says nothing because the
+    feeds list public infrastructure, and a lookup that failed checked nothing.
+
+    Silence is not a negative signal, and the only way the model learns the
+    difference is if the result says it.
+    """
+    loaded = list(blocklist.loaded_sources) if blocklist else []
+    holding = blocklist.feeds_for(kind) if blocklist and not failed else []
+    stale = _stale_feeds(blocklist, holding, settings) if blocklist else []
+    checked = [feed for feed in holding if feed not in stale]
+    matched: dict[str, None] = {}
+    for hit in enrichment.blocklist_hits:
+        matched.setdefault(feed_of_hit(hit), None)
+    not_loaded = list(dict.fromkeys(blocklist.missing_sources)) if blocklist else []
+    if matched:
+        status = LISTED
+    elif (
+        not failed
+        and not enrichment.internal
+        and any(FEED_PROFILES[feed].malware for feed in checked)
+    ):
+        status = NOT_LISTED
+    else:
+        status = NOT_CHECKED
+    reason: NotCheckedReason | None = None
+    if status == NOT_CHECKED:
+        if failed:
+            reason = "lookup_failed"
+        elif enrichment.internal and any(FEED_PROFILES[feed].malware for feed in checked):
+            reason = "internal_address"
+        elif any(FEED_PROFILES[feed].malware for feed in stale):
+            reason = "stale_feed"
+        else:
+            reason = "no_feed"
+    enrichment.reputation_status = status
+    enrichment.not_checked_reason = reason
+    enrichment.feeds_matched = list(matched)
+    enrichment.feeds_checked = checked
+    enrichment.feeds_stale = stale
+    enrichment.feeds_not_loaded = not_loaded
+    enrichment.reputation_note = _reputation_note(
+        status,
+        kind,
+        list(matched),
+        checked,
+        not_loaded,
+        stale=stale,
+        internal=reason == "internal_address",
+        failed=failed,
+    )
+    enrichment.blocklist_sources = loaded
+    if not loaded:
         enrichment.errors.append(_NO_FEEDS_LOADED)
 
 
@@ -303,12 +525,14 @@ async def enrich_ip(
             enrichment.internal = True
             break
 
+    failed = False
     if blocklist is not None:
         try:
             enrichment.blocklist_hits = blocklist.lookup_ip(ip)
         except Exception as e:  # fail-open
+            failed = True
             enrichment.errors.append(f"blocklist lookup failed: {e}")
-    _record_blocklist_scope(enrichment, blocklist)
+    _record_blocklist_scope(enrichment, blocklist, "ip", settings=settings, failed=failed)
 
     if maxmind is not None and not enrichment.internal:
         try:
@@ -369,12 +593,14 @@ async def enrich_domain(
 ) -> IndicatorEnrichment:
     """Local-only domain enrichment (BlocklistDB + optional MISP)."""
     enrichment = IndicatorEnrichment(indicator=domain, indicator_type="domain")
+    failed = False
     if blocklist is not None:
         try:
             enrichment.blocklist_hits = blocklist.lookup_domain(domain)
         except Exception as e:  # fail-open
+            failed = True
             enrichment.errors.append(f"blocklist lookup failed: {e}")
-    _record_blocklist_scope(enrichment, blocklist)
+    _record_blocklist_scope(enrichment, blocklist, "domain", settings=settings, failed=failed)
     if misp is not None:
         try:
             misp_results = await misp.search_ioc(domain, ioc_type=["domain", "hostname"])
@@ -408,12 +634,15 @@ async def enrich_hash(
     """
     indicator_type = _HASH_TYPES.get(algo.lower(), algo.lower())
     enrichment = IndicatorEnrichment(indicator=hash_value, indicator_type=indicator_type)
+    failed = False
     if blocklist is not None:
         try:
             enrichment.blocklist_hits = blocklist.lookup_hash(hash_value)
         except Exception as e:  # fail-open
+            failed = True
             enrichment.errors.append(f"blocklist lookup failed: {e}")
-    _record_blocklist_scope(enrichment, blocklist)
+    # One type for each algorithm: a feed that indexes no MD5 cannot clear one.
+    _record_blocklist_scope(enrichment, blocklist, indicator_type, settings=settings, failed=failed)
     misp_type = _HASH_TYPES.get(algo.lower())
     if misp is not None and misp_type is not None:
         try:

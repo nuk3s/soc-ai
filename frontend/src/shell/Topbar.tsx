@@ -1,4 +1,5 @@
 import { Bell, Check, ChevronDown, Network, Search, Settings, X } from 'lucide-react';
+import { CampaignNoticeMark } from '../components/campaign/shared';
 import { type RefObject, useEffect, useRef, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { AskSocAiButton } from '../components/AskPanel';
@@ -23,12 +24,21 @@ import {
   formatNotificationWhen,
   getClearedAt,
   hasMoreNotifications,
+  isCampaignRow,
   isNeedsYouRow,
   nextNotificationLimit,
   visibleNotifications,
 } from '../lib/notifications';
 import type { Notification, Workspace } from '../lib/types';
-import { needsYouLines, useNeedsYouCount } from '../lib/needsYou';
+import {
+  decisionCount,
+  decisionFloor,
+  needsYouLines,
+  needsYouReviewLine,
+  reviewCount,
+  reviewText,
+  useNeedsYouCount,
+} from '../lib/needsYou';
 import { type Crumb, crumbFor } from './pages';
 import { PALETTE_TRIGGER_ATTR, paletteKeyLabel } from './platform';
 import { UPSTREAM_COLOR, type UpstreamState, upstreamState } from './upstream';
@@ -320,11 +330,17 @@ export function Topbar() {
   // the danger and warn rows, the old rule. With nothing needing the analyst
   // and a danger row on the list, such as a dependency down or a failed
   // triage, the badge shows "!" so a fault still lights the bell.
+  //
+  // The badge counts decisions only. An unread shadow hit is review work: one
+  // press of Dismiss all reads every hit, and 233 of them held a red "280"
+  // (production review 2026-11-12, ui-core 4). The panel states the hits on
+  // their own neutral line, and the name of the bell says them.
   const needsYou = useNeedsYouCount();
   const events = notifs.filter((n) => !isNeedsYouRow(n));
   const faults = events.filter((n) => n.tone === 'danger').length;
-  const need = needsYou.data ? needsYou.data.total : null;
-  const floor = (needsYou.data?.unknown.length ?? 0) > 0;
+  const need = needsYou.data ? decisionCount(needsYou.data) : null;
+  const floor = needsYou.data ? decisionFloor(needsYou.data) : false;
+  const review = needsYou.data ? reviewCount(needsYou.data) : null;
   const fallback = notifs.filter((n) => n.tone !== 'accent').length;
   const badge: string | null =
     need === null
@@ -338,7 +354,7 @@ export function Topbar() {
           : null;
   // The name states the floor the badge marks with "+". It read "34 need you"
   // under a badge of "34+" (dogfood 2026-10-19, R1-D18).
-  const bellName =
+  const bellHead =
     need !== null && need > 0
       ? floor
         ? `Notifications, ${need} or more need you`
@@ -350,9 +366,12 @@ export function Topbar() {
         : need === null && fallback > 0
           ? `Notifications, ${fallback} need${fallback === 1 ? 's' : ''} attention`
           : 'Notifications';
-  const showSummary = notifs.length > 0 || (need ?? 0) > 0 || needsYou.failed;
-  // The parts of the badge, shown above the events. They add up to the badge.
+  const bellName = review !== null && review > 0 ? `${bellHead}. ${reviewText(review)}` : bellHead;
+  const showSummary = notifs.length > 0 || (need ?? 0) > 0 || (review ?? 0) > 0 || needsYou.failed;
+  // The decision parts of the badge, shown above the events. They add up to
+  // the badge. The review line follows them.
   const needsYouParts = needsYouLines(needsYou.data);
+  const showNeedsYouBlock = needsYouParts.length > 0 || needsYouReviewLine(needsYou.data) !== null;
   const more = hasMoreNotifications(received, limit);
 
   return (
@@ -597,7 +616,7 @@ export function Topbar() {
           {/* Every unit of the badge, part by part, with its scope. The panel
               listed 12 shadow hits under a badge of 309 (production
               2026-10-14). */}
-          {needsYouParts.length > 0 && (
+          {showNeedsYouBlock && (
             <NeedsYouBlock
               state={needsYou}
               onFollow={() => setNotifOpen(false)}
@@ -609,7 +628,7 @@ export function Topbar() {
           <div className="max-h-[min(60vh,560px)] overflow-y-auto">
           {events.length === 0 && (
             <div className="px-3.5 py-6 text-center text-[12px] text-faint">
-              {needsYouParts.length > 0 ? 'No other notifications.' : NO_NOTIFICATIONS}
+              {showNeedsYouBlock ? 'No other notifications.' : NO_NOTIFICATIONS}
             </div>
           )}
           {events.map((nt) => {
@@ -620,6 +639,12 @@ export function Topbar() {
                       dropdown is narrow, so the browser clamps the title to
                       three lines and the hover holds the whole text. The
                       server cut the objective at 80 characters, mid-word. */}
+                  {/* A change of a campaign wears the campaign mark. */}
+                  {isCampaignRow(nt) && (
+                    <>
+                      <CampaignNoticeMark stage={nt.stage} />{' '}
+                    </>
+                  )}
                   <span
                     data-testid="bell-title"
                     className="break-words"

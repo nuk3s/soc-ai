@@ -210,6 +210,8 @@ def hunt_entry(hunt: Hunt) -> str:
     """The entry point that started this hunt."""
     if hunt.starter == "lead":
         return "Lead hunt, auto" if hunt.started_by == _AUTO_HUNT_ACTOR else "Lead hunt, analyst"
+    if hunt.starter == "campaign" or hunt.kind == "campaign":
+        return "Campaign hunt"
     if hunt.starter == "schedule" or hunt.kind == "scheduled":
         return "Hunt, schedule"
     if hunt.starter == "catalog" or hunt.kind == "triggered":

@@ -6,6 +6,448 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Words
+
+- **The network.** The console, the Config help, the doctor, the command line, the logs, the demo
+  and the docs say "the network" for all machines. A machine or an address is internal or external.
+  The tier 3 model is the network model.
+- **Investigation.** The console, the bell and the action hints say "investigation" where they
+  said "run". `soc-ai campaigns rebuild` counts campaigns and investigations.
+- **The gates.** `tests/test_prose_style.py` and `frontend/src/retiredWords.test.ts` hold both rules.
+
+### How this flows
+
+- **Leads, hunts and the case on the chart.** The chart states that a lead of a campaign waits on
+  the campaign, that a change of a campaign starts at most one hunt in 24 hours, that a hunt reads
+  the open campaigns, and that a campaign has three decisions: a case, an authorization or a close.
+- **The chart.** The chart "How this flows" draws the system as it is: the sweep path and the alert
+  path end in an investigation and a verdict, a confirmed attack starts or joins a campaign, and the
+  analyst decides in Needs you. It draws the campaign, the decision on a campaign and the one Needs
+  you number. Each box states what the code does. The control "Agree" is gone: it did not exist.
+- **The definitions.** The lines under the chart define each box, from the analytic to Needs you.
+  The Hunts page and the guides use the same definitions.
+
+### The time of an investigation
+
+- **The event time.** The Investigations list dates each investigation by the time of its event. A
+  second line states the time of the investigation when it is more than one hour later. The window
+  and the order of the list read the time of the event.
+- **Counts of a window.** The True positives tile and the Confirmed threats panel count the events
+  of the window. A verdict of today on an old event is no threat of the last 24 hours.
+- **A new verdict on an old event.** Needs you and the campaign changes have no window, so the
+  verdict still reaches the analyst. A bell row for a verdict on an event older than 24 hours states
+  the date of the event.
+- **The work of soc-ai.** The Failed view and the pipeline error tile read the time of the
+  investigation.
+- **Migration 0072.** `investigations.event_at` holds the event time, with an index. The migration
+  fills it for every stored investigation.
+
+### Campaigns
+
+- **The campaign.** A campaign is one activity: a set of investigations that proven links join. An
+  engine builds the campaigns from the stored investigations. Code decides which investigations
+  belong, and the model reads no campaign.
+- **The links.** An investigation joins by one of five links: Session, Actor, Artifact, Documents
+  and Target as source. Each investigation of a campaign stores its link and the evidence. An
+  investigation that links to two campaigns merges them, and the older campaign keeps its id.
+- **The stage of a finding.** An investigation that judges a hunt finding can state the report
+  field `stage`: `reconnaissance`, `attempt`, `access`, `action` or `movement`. A stage above
+  `attempt` stands only with the impact `succeeded`. An alert investigation stores no stage.
+- **The routes.** `GET /api/v1/campaigns` lists the active campaigns. `GET /api/v1/campaigns/{id}`
+  gives one campaign.
+- **The page.** The console has a Campaigns list and one page for each campaign. The page opens
+  with three graphics: the stage ladder, the attack graph of the machines and the timeline of the
+  alerts of each actor. A click on a graphic shows its investigations in the Members table. Five
+  closed folds under the graphics hold the investigations, the parties, the related investigations
+  and documents, the verdicts that differ and the detection record. The page offers no decision in
+  this release.
+- **The events.** The campaign page counts events of the grid, because one investigation can stand
+  for many alerts. The detail route reads the alert events between each pair of machines, by rule.
+  Each arrow of the attack graph states its alert count. Each reached stage states what happened
+  and the record that proves it. When the grid read fails, the page counts the alerts that the
+  investigations hold.
+- **The commands.** `soc-ai campaigns rebuild` builds the campaigns from the stored investigations,
+  and `--dry-run` writes nothing. `soc-ai campaigns list` prints them.
+- **Migration 0068.** Four new tables hold the campaigns, their investigations, their parties and
+  the facts of each investigation. No existing value changes.
+- **Migration 0069.** Three nullable columns of `campaigns` hold the events of the last grid read,
+  the time of the read and the basis of the read. No existing value changes.
+- **The campaign on each page.** soc-ai builds the campaigns in the background after a verdict, an
+  override, a chat verdict or a dismissed action, and it checks the store every 5 minutes. A row of
+  Investigations, a group of Alerts and a hunt finding link to their campaign. The page of an
+  investigation in a campaign starts with its campaign. The host page lists the campaigns of the
+  machine and the role of the machine. The sidebar has a Campaigns item after Dashboard.
+- **The stage meter.** Each campaign shows a meter of five segments. The meter shows the stage that
+  the campaign reached.
+- **Confirmed threats.** The panel lists the campaigns of its window first. Each campaign states
+  its alerts, the investigations that wait on a decision and the investigations that an
+  authorization holds. A true positive in no campaign stays a row under "Not in a campaign". The
+  panel and the authorization cards say "investigation".
+- **A Re-run.** An investigation stays in its campaign while its Re-run is in progress.
+- **The decision on a campaign.** The campaign is the unit of work of the analyst. The campaign
+  page states its decision under the title. An analyst closes a campaign with one of three reasons:
+  "Handled outside soc-ai", "Accepted risk" or "Test that is over". A note is optional. A close
+  writes its audit record first. When soc-ai cannot write the record, the close changes nothing.
+- **What a close covers.** A close covers what has happened. A later event, a higher stage or a new
+  machine opens the campaign again and adds one row to the bell. A close changes no verdict. An
+  analyst can open a closed campaign again.
+- **The alerts of a closed campaign.** The close dialog states how many alerts of the campaign it
+  acknowledges in Security Onion. A failed acknowledgement does not open the campaign again.
+- **The changes of a campaign.** The timeline marks each decision and each reopen. A fold lists
+  each change: the campaign formed, reached a higher stage, gained a machine, got a decision or
+  opened again.
+- **The bell.** The bell shows one row for each new campaign, higher stage, new machine and reopen,
+  in the color of the stage. A true positive in a campaign raises no row of its own.
+- **Migration 0070.** Eight nullable columns of `campaigns` hold the decision, and the new table
+  `campaign_changes` holds the changes. No existing value changes.
+- **The authorization on a campaign.** An admin records authorized activity on a campaign. The
+  record lists the machines of the campaign with their role, a label and an expiry of at most 30
+  days. It holds no rule list. The dialog shows the machines and the counts before the press.
+- **Inside the authorization.** An investigation of an alert or of a hunt finding is inside when
+  its source is a listed actor, its target is a listed target and its event is in the period. The
+  answer of a listed target to a listed actor is inside too. An inside investigation requests no
+  case, raises no bell row and no webhook, and forms no lead. Its verdict stays.
+- **Beyond the authorization.** Each other investigation on a listed machine stays loud: an
+  unlisted source, a listed target that acts against any other machine, an unlisted target, an event after the
+  expiry, an address that moved to another machine, and a report that names a third machine. The
+  campaign page states "Activity beyond the authorization" in the danger tone and lists each
+  investigation with its reason. The attack graph marks each listed machine with a shield.
+- **Revoke and expiry.** A revoke needs a reason. It ends each mark and returns the campaign to
+  Needs you as one item. After the expiry the decision covers the past, and a later event is loud.
+- **Exclude and Include.** An analyst can exclude an investigation from a campaign, include one
+  that the page lists under "Related, not proven", and undo either. Each needs a reason.
+- **An earlier authorization.** An authorization with a rule list works as before. No migration
+  changes it.
+- **Migration 0071.** `authorized_activity` gains the campaign and its listed machines, and the new
+  table `campaign_run_overrides` holds each exclusion and inclusion. No existing value changes.
+- **Stage words.** The bell, Needs you and the bottom line name each stage in the same words:
+  Reconnaissance, Attempt, Access, Action on the target, Movement beyond the target.
+- **Link labels.** The Investigations fold of a campaign names each link in analyst words, for
+  example "Same attacking machine" and "The target then acted". The guide maps each label to its
+  engine name.
+- **A decision that the store does not save.** When the store fails after the audit record of a
+  close, an authorization, a revoke, an exclusion or an inclusion, soc-ai writes a second audit
+  record for the failure and answers 503.
+- **The remaining alerts.** A closed campaign offers "Acknowledge the remaining alerts" when its
+  acknowledgement did not finish. `POST /api/v1/campaigns/{id}/acknowledge` does it.
+- **Sigma alerts.** A campaign counts the Sigma alerts between its machines. Security Onion nests
+  the addresses of a Sigma alert under `event_data`.
+- **The audit verifier.** `soc-ai audit verify` holds one page of records at a time. Before, a
+  worker could hold a second page for a moment.
+- **One case for a campaign.** "Open one case" opens one Security Onion case for the campaign: the
+  bottom line, the stages, the machines and a link to the campaign page, with at most 25 alerts of
+  the campaign. The dialog shows the case before the press. soc-ai records the intent before the
+  first call. A press with no readable answer waits on "Try again", and a refusal states its reason.
+  A second press opens no second case.
+- **The alert read of a case.** The read of the alerts for a case names the period of their events,
+  so the grid opens the indices of those days only. A read with no period passed the grid timeout
+  on a first call after a quiet hour.
+- **Comments on the case.** A higher stage and a new machine of a campaign with a case each add one
+  comment to the case. A new investigation adds none.
+- **The Escalate of one investigation.** The Escalate of an investigation that a campaign holds is
+  blocked. The card reads "Open the case on the campaign." and links to the campaign.
+- **The leads of a campaign.** A lead whose observations are all alerts of one campaign waits on
+  that campaign. It is no Needs you item and no bell row, and it never reads "hunt queued". A lead
+  with any other observation keeps normal handling, and the campaign page lists it under "Related,
+  not proven". A close or an authorization of a campaign dismisses the leads of the campaign.
+- **One hunt for one campaign in 24 hours.** The first hunt of a campaign is the hunt of its first
+  lead. After that, a higher stage, a new machine, a reopen by new activity or activity beyond an
+  authorization starts one campaign hunt. The limit holds after a restart. The objective of a
+  campaign hunt holds stored facts only.
+- **A hunt reads the campaigns.** A hunt reads one block for each open campaign: the machines, the
+  stages, the period and the decision of the analyst. It reports a finding on those machines only
+  for a later stage, a new machine or a later event. A hunt finding states its stage. An evaluation
+  hunt reads no block.
+- **A finding that a campaign holds.** A finding that restates a campaign gets no investigation of
+  its own. Every machine that it names is in the campaign, it cites records, no record is later
+  than the last event, and its stage is not above the reached stage. The hunt page links the
+  campaign. Such a finding is in no threat count and sends no notice.
+- **The fold "Leads and hunts".** The campaign page shows each hunt of the campaign on the time
+  axis beside the changes that can start a hunt, then its leads and its hunts. The Hunts list has
+  the type "Campaign".
+- **Migration 0073.** `leads.campaign_id` and `hunts.campaign_id`, nullable with an index. No
+  existing value changes.
+- **The anchor of a finding.** An investigation of a hunt finding that cites no document anchors
+  on a record between the hosts that the finding names. A record of a dataset that the finding
+  cites wins. Before, the anchor was the first record of the hunt, also when another finding cited it.
+- **The Named machines link.** A finding can cite summary queries and no single record. Its
+  investigation then states the target and no source. Such an investigation joins a campaign when
+  its finding names one other machine and the campaign holds an attack of that machine on that
+  target. It starts no campaign and adds no machine.
+- **The limit.** A true positive with an external source forms no campaign. The grid read covers
+  the 20 pairs of machines with the most investigations.
+
+### Rule prior
+
+- **A known external address.** The rule prior covers an alert with one internal and one external
+  address when two or more false positives of the rule on the same internal machine had a matching
+  external address: the same address, the same /24 or /64 network, or the same name. An alert with
+  a new external address, or with two external addresses, gets the model. The mode stays `shadow`.
+- **A machine of an open campaign.** The rule prior does not cover an alert on a machine of an open
+  campaign. A campaign that an analyst closed holds no machine.
+- **The record.** The Detection tuning panel splits the record of the rule prior into alerts with
+  two internal addresses and alerts with a known external address.
+
+### Confirmed threats
+
+- **A headline about the claim.** A finding run that opens with "The claim is correct" states
+  nothing that happened. The row then states the finding title. The prompt of a finding run asks
+  for a first sentence that states what happened on the hosts.
+- **The headline of a row.** The field `headline` states what happened in the sentence of the
+  newest run. The row states the hosts and the impact in their own fields. The headline drops the
+  tag "[Oracle adjudicated]" of an older Oracle run. A sentence that names a raw verdict key or the
+  local verdict gives way to the rule name of the run, or the finding title of a finding run.
+- **The route.** `GET /api/v1/threats` lists the true positive verdicts that stand in a window: the
+  latest run of each alert and of each hunt finding. A replaced run, a backtest replay, a
+  synthetic run and a pipeline error do not count. The route takes `since`, `until` and `host`.
+  The default window is the last 24 hours.
+- **The affected host.** The route merges the runs by the affected machine. The destination is the
+  affected machine when it is internal. The source is the affected machine when the destination is
+  external and the source is internal. The setting `internal_cidrs` decides what is internal. Two
+  addresses and a host name of one machine are one machine, by the Hosts data.
+- **The row.** Each row gives `target`, `direction`, `headline`, `impact`, `runs`, `alertRuns`,
+  `findingRuns`, `sources`, `sourcesMore`, `rules`, `rulesMore`, `firstSeen`, `lastSeen`,
+  `waitingActions`, `newestInvestigationId` and `investigationsHref`. `direction` is `inbound` or
+  `outbound`. The inbound runs and the outbound runs of one machine are two rows. The rows are in
+  the order of impact, then waiting actions, then time. The response holds at most 50 rows.
+- **Authorized activity.** A group whose every run matched an authorization that holds is in
+  `authorized`. The list has one entry for each authorization, machine and direction. Each entry
+  gives `direction`. A group with one unmarked run stays a row, and only its unmarked runs count
+  as waiting. `total` counts every true positive run of the window.
+- **The panel.** The Dashboard and the Hunt Console open with a Confirmed threats panel. Each row
+  states the host with its name and role, an impact chip, the headline, the other ends, the run
+  count, the newest event and one link. An inbound row states "From" its sources. An outbound row
+  states "To" its external addresses. The link opens the waiting actions or the investigations. A
+  group inside authorized activity gets one quiet line under the rows. A failed read states that
+  it is not an all-clear. The empty line states the window.
+- **One count.** The True positives tile reads the `total` of the panel. The outcomes card states
+  that it counts alert groups.
+- **Authorized runs in a row.** A row that holds runs inside an authorization states it in one
+  quiet line under the row, for example "9 of 22 runs are authorized activity: php2shell testing."
+  The label links to the runs. Each row gives `authorizedRuns` and `authorizations`, at most 3.
+  Each authorization gives `id`, `label`, `state`, `expiresAt`, `runs` and `runsHref`.
+- **The host page.** The host page shows the threats of its host in a strip under the header. The
+  strip counts runs: "This host has 46 true positive runs in the last 30 days." The list of
+  investigations on the host shows the worst verdict first.
+
+### Impact and the first line
+
+- **Impact.** A report has the field `impact`: `none`, `attempted`, `succeeded` or `unknown`. Only
+  a true positive states an impact.
+- **The impact guard.** The impact stays `succeeded` only when the report cites, by id, a fetched
+  record with content of the event for a host of the alert. With no such record the impact reads
+  `attempted`. The verdict and the text of the model do not change. The guard also runs on an
+  Oracle report. The investigation detail gives `impactChange` with `gate`, `fromImpact`,
+  `toImpact`, `reason` and `missing`.
+- **The first line.** The server builds the first line of each run: the verdict, the impact and
+  the two hosts. Each end reads "name (role) address" when the Hosts data has a name or a role, and
+  the address alone when it has neither. The model never writes the line. A run of an older
+  release gets its line at read time, and its impact reads "not stated".
+- **API.** `GET /api/v1/investigations` gives `impact` and `firstLine` on each row. The detail
+  gives them too. The list takes the filter `impact`, a comma-separated list. `sort=verdict` puts
+  the worst verdict first, and the worst impact first inside the true positives.
+- **The list.** An Investigations row prints the headline of the run as one quiet line under the
+  name: the sentence of the Alerts row and of the investigation page. The whole sentence shows and
+  wraps. A row with no headline prints no line. A row that states the impact `succeeded`,
+  `attempted` or `none` shows the impact chip beside the verdict chip. An unknown impact shows no
+  chip. `GET /api/v1/investigations` gives `headline` on each row, scrubbed.
+
+### Investigation page
+
+- **The headline.** The headline is one sentence: the stored headline when it is one sentence,
+  else the first sentence of the summary. The body is the summary without a leading copy of the
+  headline. The first line shows as one quiet line above the headline when the run states the
+  impact `succeeded`, `attempted` or `none`. The verdict chip and the flow badge state the rest
+  of the line, so the page hides it otherwise. A sentence does not end at
+  e.g., i.e., vs., etc., cf. or approx. A sentence does not end at "No." before a number.
+- **Cited fields.** A cited field chip names the field in words with a short value. The chip opens
+  the Document drawer at the field. The drawer shows the cited value first and marks the field
+  row. A tool citation scrolls to its step in the timeline. A citation that does not resolve stays
+  a plain chip, and its tooltip states why. The detail gives `citations[].documentId` and
+  `citations[].value`. A tool call step gives `tool`.
+- **The value cap.** `citations[].value` holds at most 2,000 characters. `citations[].valueTruncated`
+  is true when the server cut the value. The drawer then states "The value is cut at 2,000
+  characters." The server scrubs the value before the cut.
+- **A failed run.** The failed-run card leads with one sentence for the class of the cause and the
+  step the analyst can take. The raw error and the hint are behind "Show the technical detail".
+  The detail gives `failure.kind`: `gateway`, `token_limit`, `time_limit`, `grid` or `other`. A
+  permanent cause still advises no re-run.
+- **Words.** A finding reads "Finding 1" with its title. Tool ids and verdict keys read in words in
+  the headline, the body, the finding detail and the note. The note label is "Verdict check". The
+  depth chip shows only a depth that is not standard, on the page and on every list.
+- **The Oracle card.** The card names the verdict of soc-ai and of the Oracle in words. When the
+  Oracle gave no answer, the chip and the card state it. The detail gives the reason in
+  `oracle.noAnswer`.
+- **Red.** Red marks a true positive verdict and a failed write only. The failed-run card and the
+  pipeline error panel are grey with an amber icon. Their Re-run button uses the accent color.
+  Every Host context bar has one neutral color. The finding card and the hunt strip of a false
+  positive run are neutral.
+
+### The Oracle
+
+- **The analyst summary.** The Oracle answers with an analyst summary and its reasoning. The
+  summary of the run is the analyst summary. The detail gives the reasoning in `oracleReasoning`.
+  The two fields replace the old summary field in the prompt, so the request does not grow. An
+  answer with no analyst summary keeps the text of the earlier release. A stored run keeps its
+  text.
+- **Escalate.** An Oracle true positive offers one Escalate to case. The title is the rule name.
+  The reason is the first sentence of the analyst summary.
+
+### Auto-acknowledge
+
+- **Earlier true positive.** Auto-acknowledge does not acknowledge an alert when an earlier run of
+  the alert gave a true positive. The model verdict, the Oracle answer and the final verdict of the
+  earlier run each count. An alert that inherits a false positive obeys the same rule. The
+  Acknowledge action waits for the analyst. A store that does not answer holds the acknowledge.
+
+### Needs you
+
+- **One number.** Needs you counts each decision once: the campaigns with no decision, the
+  investigations that wait, the leads and the alert groups with no verdict. The top bar, the
+  Dashboard tile, the bell and the Needs you page state the same number.
+- **One list.** The new Needs you page lists every decision that waits, the campaigns first, each
+  with its age. `GET /api/v1/needs-you/items` gives the list.
+- **A campaign is one item.** An investigation that a campaign holds is no item of its own. Its
+  action card names the campaign. The action stays usable.
+- **No time limit.** A verdict that needs more info and a waiting action stay in Needs you until a
+  person decides. Before, they left the count after 30 days.
+- **A clear of old items.** `soc-ai needs-you list` prints each investigation that waits.
+  `soc-ai needs-you clear --before DATE --reason TEXT` clears the investigations with an event
+  before the date, after a dry run and a typed confirmation. The verdict does not change, and each
+  clear writes an audit record. `soc-ai needs-you restore ID` puts one back. The investigation page
+  states who cleared it, when and why.
+- **A replaced verdict.** A needs more info verdict that a later run of the same alert or of the
+  same hunt finding replaced waits on nobody. The count `needs_more_info`, the count
+  `investigations_waiting` and the Needs you view leave it out. `GET /api/v1/investigations` takes
+  `primary_only=true`, which leaves out each replaced run. The list marks the older run of a hunt
+  finding as an earlier run.
+- **Decisions and review.** `GET /api/v1/needs-you` and `GET /api/v1/hunts/needs-you` give
+  `decisions` and `review`. `review` counts the unread shadow hits. One server function splits the
+  parts.
+- **The deprecated total.** The field `total` of `GET /api/v1/needs-you` keeps its old meaning, the
+  sum of every part, and is deprecated. Read `decisions` and `review`.
+- **The console.** The Dashboard tile, the bell badge, the Hunts badge and the Hunts strip state the
+  decision count. The unread shadow hits show beside it as "N shadow hits to review" in a neutral
+  color, with their own link. Each sidebar badge is a link to the list that it counts.
+- **The Needs you view.** `GET /api/v1/investigations` takes `needs_you=true`: the runs that need
+  more info or hold a waiting action in the window. `GET /api/v1/needs-you` gives
+  `investigations_waiting`, the total of that query over the verdict window. The Investigations
+  badge states that number and opens the Needs you view.
+- **One scan.** `GET /api/v1/needs-you` runs the pending-action scan once for each request. The
+  part `pending_actions` and the Needs you query read the same result.
+- **A shorter tile.** The flow sentence under the Needs you tile is now the tooltip of its label,
+  and the "How this flows" link sits in the tile header. The three count tiles beside it take the
+  height of the tallest tile, so the row of four tiles is lower. On the demo data it drops from
+  300 px to 212 px. A tile that an operator resized taller than its content keeps that height.
+
+### Investigations list
+
+- **Preset views.** The list has four preset chips: Needs you, True positives, Failed and All. The
+  address names the active view with `?view=`. The True positives view puts the worst impact first.
+- **The row fits 1100 px.** Under 1280 px a row folds its Tags into the name cell. The whole name
+  shows and wraps. The row actions stay in the last column.
+- **The wide row.** From 1280 px the detection column takes the free width. The flow sits under the
+  name, and the Source → Dest sort sits beside the Detection sort. The other columns fit their
+  content. At a 1440 px window the detection column is 520 px wide, so a rule name of 60
+  characters and a flow each fit on one line.
+
+### Alerts
+
+- **Verdict order.** The Alerts list orders by verdict first: true positive, needs more info,
+  untriaged, inconclusive, false positive. Inside one verdict the most severe group comes first,
+  then the newest.
+- **The sort menu.** The sort control is a menu with Verdict, Severity, Last seen, Count,
+  Confidence and Detection, and a direction button.
+- **Waiting actions.** Each alert group gives `waitingActions`: the actions that wait for a person
+  on its true positive runs, under the needs-you rule. A group with one is in Needs decision.
+- **The reason line.** Each alert group gives `headline` and `windowHeadline`. The row states the
+  headline of the run behind its verdict as a second line. The whole headline shows and wraps. A
+  true positive row has a shield mark, a bold name and a bar at the left edge.
+- **The row fits 1100 px.** Under 1280 px a row folds the Owner and the Tags columns into the
+  detection cell. The whole rule name shows and wraps. The row actions stay in the last column.
+  The text "inherited" stacks under the verdict chip. The verdict counts of a group break between
+  words only.
+- **The wide row.** From 1280 px the detection column takes the free width. The Severity, Last
+  seen, Tags and action columns fit their content. At a 1440 px window the detection column is
+  452 px wide, so a rule name of 60 characters fits on one line.
+
+### Host names in the lists
+
+- **Name and role.** An address prints as "ws-01 (workstation) 10.20.30.5" when the Hosts data has
+  a name or a role for it. An address with neither prints alone. A role that the resolver withheld
+  reads "guess". The Alerts rows, the Investigations list, the Dashboard and the verdict card read
+  it.
+- **API.** `GET /api/v1/hosts/names` answers the name and the role of up to 200 addresses in one
+  read. It takes `ip` once for each address. Each entry gives `key`, `name`, `role` and
+  `roleGuess`. The console sends one read for each render and keeps the answers for five minutes.
+- **Flow colors.** The Alerts event rows use the flow component of the group row. The source is
+  amber and the destination is green on both rows.
+
+### Hosts list
+
+- **The Findings column.** The column counts the true positive verdicts on the machine in the last
+  7 days and the open leads that name it. Each row gives `findings` with `confirmed`, `open_leads`
+  and `days`. `GET /api/v1/hosts` takes `sort=findings`.
+- **Last seen.** `GET /api/v1/hosts/last-events` reads the newest grid event of each address of
+  the page in one search. It gives `events` and `window`. When the grid does not answer, the cell
+  keeps the newest event that the last sweep saw.
+- **The rebuild tile.** The tile "Host records to rebuild" is neutral and states the same three
+  parts.
+
+### Hunts and analytics
+
+- **One count sentence.** The hunt list, the hunt page, the lead pages and the bell state one
+  sentence, for example "3 confirmed · 1 not judged · of 4 threat findings". A false positive
+  count joins the sentence when there is one. A restated finding counts the verdict that answers
+  for it. The findings cell states every finding.
+- **API.** The hunt routes give `findingsConfirmed` and `findingsFalsePositive` on the row and on
+  the page. The page also gives `threatFindingCount`.
+- **The flow strip.** The strip marks Investigations done only when each investigation ended with a
+  verdict. Otherwise the step is amber.
+- **The hunt page.** The page opens with the count sentence and the first sentence of the
+  narrative. The findings come before the charts, the diff and the timelines. The wave gap line
+  sits under the header of the wave that it opens.
+- **The Analytics label.** The tab label and the panel count line state "15 live (4 measuring,
+  11 blind)". The measuring and the blind counts are parts of the live count, so they sit in the
+  brackets. The counts come from the run state of each row. A failed run and a loop that does not
+  run add their own counts in the brackets, so the parts add up to the live count. Until the catalog
+  is read, the label states the live count alone.
+- **Hit windows.** The Last 7 days column states the unread shadow hits as "unread at any age". The
+  Status page states "fired, fresh and handled in 24 h" at the count.
+
+### Bell
+
+- **The order of urgency.** `GET /api/v1/notifications` orders the rows: a dependency that is down,
+  confirmed threats, decisions that wait, failures and the other standing conditions, notices,
+  runs in flight, closures, then the notices older than 24 hours. A dependency is the grid, the
+  model gateway or the Security Onion API. The newest row of each tier comes first.
+- **Folds.** Two or more false positive closures fold into one row with a count and a link to the
+  list. The same failure on the same subject folds into one row with a count. A fold counts only
+  the rows after the Dismiss all mark.
+- **The Notifications page.** The page puts the group of the most urgent row first.
+
+### Configuration
+
+- **Diagnostics.** The FAIL rows come first, then the WARN rows, then the other rows. Each FAIL and
+  WARN row has a control for its fix: the password dialog, the setting that the hint names, the
+  command of the hint with a Copy button, or the doc section on the docs site. The backups hint
+  names a command that writes a dated archive into the directory that the check reads.
+- **Quality.** The section opens with the last evaluation: the time of the run, the runs that
+  completed, the verdict agreement as "N of M", the synthetic true positive, and "not measured"
+  with its cause.
+- **Detection tuning.** The page states the mute suggestions with no true positive and their share
+  of the alert events of the window. One control asks for a confirmation and then mutes those
+  rules. A mute suggestion and Un-mute are not red. `GET /api/v1/detection-tuning` gives `window`
+  and `alert_total`.
+
+### Palette and guide
+
+- **Hunt results.** A hunt result of the palette shows the title of the hunt on one line and its
+  outcome on the second line. It never shows the prompt of the hunt. The palette lists the hosts
+  and the investigations before the hunts.
+- **The guide.** The Help menu and the palette open the console guide on the docs site. The release
+  notes of the running version are a separate entry.
+
 ### Tutorial mode
 
 - **Tours.** The console has a welcome tour and one tour for each page. The welcome tour
@@ -33,7 +475,7 @@ All notable changes to this project are documented here. The format is based on
 ### Demo
 
 - **Every page shows content.** The hosted demo and `docker-compose.demo.yml` hold one story on
-  an estate of 24 machines. An attack chain runs from a downloaded executable to lateral
+  a network of 24 machines. An attack chain runs from a downloaded executable to lateral
   movement and an upload to cloud storage, with benign noise around it. The Hosts page, the
   host and entity pages, leads in every state, the analytic hits, a held analytic, a closed grid
   gap with its review hits, the Status panels, the runbooks and a cancelled backtest now show
@@ -48,6 +490,8 @@ All notable changes to this project are documented here. The format is based on
   citation drawer and the alert pass. A time range now limits the alerts it lists.
 - **The banner** reads "Demo. Some runs are recordings from a test grid. A script generated the
   rest. Nothing here is live."
+- **Impact in the demo.** The demo story and the demo seed give each true positive an impact. The
+  Confirmed threats panel has a row with "succeeded" and a row with "attempted".
 - **No background work on the demo.** The demo runs no lead hunt and no reaper loop. The seed
   runs after the startup reaper, so the hunt in progress stays in progress.
 
@@ -164,6 +608,13 @@ All notable changes to this project are documented here. The format is based on
   the local verdict must still cite evidence beyond the alert. The Oracle reads the change of the
   gate at the start of the local summary. On 2026-10-29 the gate changed two Oracle true positives
   on hunt findings back to needs more info.
+- **Per-event evidence.** The gate also keeps a true positive when the report cites, by id, a record
+  with content of the event. The content is a payload, or an HTTP, DNS, SSH, file or process record.
+  A tool of the run fetched the record, or the promoted finding stores it. The record involves a
+  focus host. A flow record, a host profile and the label of a sibling alert do not count. One rule
+  serves an alert run and a finding run. A lead run and a finding with no resolved document get no
+  exemption. On production the gate lowered 9 true positives from 2026-10-31 to 2026-11-12. Five of
+  them were finding runs of one exploit activity.
 
 ### Host names
 
@@ -232,6 +683,19 @@ All notable changes to this project are documented here. The format is based on
   subject can answer for a finding. The hunt page now names that investigation on the finding, and
   the lead settles on its verdict. Before this fix, the finding kept its failed run, so the lead
   stayed held on each re-run.
+- **Only a grid failure holds a lead.** A failed tool call holds a lead only when the grid did not
+  answer and no later call of that tool got an answer. A grid failure beside a visibility gap also
+  holds. A degraded run, a run error, a budget report, an earlier threat and a lead link hold as
+  before. Before this fix, any failed tool call and any visibility gap held a lead. On production,
+  seven of eight leads waited after a hunt that found no threat.
+- **A true positive that joined during the hunt.** A true positive alert that joined the lead after
+  the start of its hunt holds the lead. The hunt wrote its objective and its evidence block at its
+  start, so it did not read that alert. A hunt with a confirmed true positive closes its lead as
+  before.
+- **The hold sentence on the row.** A hold records its cause. The lead row prints the sentence under
+  the hunt result, and the lead page prints it too. A hold on a finding with no verdict states the
+  count and each confirmed threat. `GET /api/v1/hunts/leads` gives `hold_reason` and `hold_sentence`
+  for each row.
 
 ### Auto-Investigate retries
 
@@ -258,10 +722,373 @@ All notable changes to this project are documented here. The format is based on
 - **The reason.** On 2026-10-27 the model gateway refused the triage schema for 11 hours. The
   scheduler ran two alerts 109 times each. The bell showed each failed run as a needs_more_info
   verdict, and no alarm named the fault.
+- **Gateway pause.** Two gateway connection errors in sequence pause the scheduled runs. The pause
+  has no end time. Before each scheduled run, the scheduler tests the gateway with one small
+  completion. A verdict from any run ends the pause. A test answer that is not a connection failure
+  also ends it. A 502, a 503, a 500 that names a failed connection and no answer keep the pause. The
+  alerts that failed on the gateway then run again at once. The bell states the count of the gateway
+  errors of the open pause. `GET /api/v1/auto-triage` gives `gateway_paused`.
+- **One batch at a time.** The gateway test takes up to 30 seconds. After the test, the scheduler
+  reads the slot again and plans nothing when a batch is active.
+- **One log line for each alert group.** The sweep logs a refused acknowledgement one time for each
+  alert group. Production wrote 74,560 of these lines for 1,238 alerts in 13 days.
+
+### Authorized activity
+
+- **The record.** An admin records authorized activity from a true positive alert run. The record
+  holds a label, the exact source addresses, the target address, the exact rule names and an expiry.
+  The store keeps the machine key of each address. The store refuses a record with no expiry, an
+  expiry more than 30 days away, no source or more than 8 sources. A record is never deleted.
+  Migration 0067 adds the table `authorized_activity` and the column
+  `investigations.authorization_id`.
+- **The sources.** A source must be an address that the agent of its machine reports. A container
+  address, a bridge address and an address that joined its machine by a DNS name or a lease cannot
+  be in a scope. The draft states why it left an address out.
+- **Inside a scope.** A run is inside a scope when its source, its target, its rule name and its
+  alert time match the record. The rule name must be on the list. No prefix matches. The match also
+  needs the stored address and the same mapping in the Hosts data of today. The triage model never
+  reads an authorization.
+- **The report must stay inside.** A matched run stays inside only when its report cites and names
+  only the machines of the scope. A citation of a field of the focus alert or of an event on its
+  session is inside. A tool call, a host alert profile and an investigation id do not decide. Each
+  other citation must resolve to a document between a source and the target. Each address and each
+  known machine name in the summary, the rationale and each action rationale must be a source or the
+  target. A failed read of the names puts the run outside.
+- **Hunt findings.** A hunt finding run never matches a scope. Its run keeps its case request, its
+  notification and its lead. One line on the run names the record.
+- **A run inside a scope.** The run requests no case: Escalate to case and the case comment are
+  closed. The needs-you count and the waiting list leave the run out. The bell and the webhook raise
+  nothing for it. The lead path writes no observation for it. The verdict, the confidence and every
+  sentence of the model stay. The run stays in every list and in the count of true positives. A
+  backtest replay, a synthetic run and a verdict other than true positive get no answer. A failed
+  store read gives no mark, so the run gets normal handling.
+- **A run outside a scope.** A run that shares a machine with a scope and fails one part is outside.
+  One line on the run names the part, for example the first address or host beyond the scope. The
+  run gets normal handling.
+- **Expiry and revoke.** An expired record keeps the marks of its runs. The expiry raises one bell
+  row with the label and the run count. The bell counts the expired records past its three rows.
+  Revoke needs a reason. A revoke returns every marked run to normal handling. It sends the runs to
+  the lead path in batches and states the count.
+- **The console.** A true positive alert run offers "Record authorized activity". The dialog lists
+  the source addresses and the rule names as checkboxes. The source and the rule of the run are
+  always selected. The dialog states that a target with no agent follows its address until the
+  expiry. It states before the save when the run itself stays outside the record. It counts the
+  earlier runs that the scope matches. The earlier runs get the mark only when the analyst selects
+  them, 30 days back at most.
+- **The mark and the card.** A run inside a scope shows the mark, the label, the analyst and the
+  expiry. Each list row of an authorized run carries a chip. The Investigations page and the Hunt
+  Console show one card for each record, full width. The card is one row: the label, the state, the
+  sources by name to the target, the expiry, the run count with its link, and Revoke. The rule
+  names, the note and who recorded the record sit behind the toggle "Show the N rules", closed by
+  default.
+- **The text of an authorized run.** The triage model never reads an authorization, so a run
+  inside a scope can state "No record of authorized testing covers this traffic." For a run whose
+  authorization holds, the console drops each sentence of the summary, the headline and the
+  action reasons that holds a negation and an authorization term. The investigation page, the
+  Investigations rows, the Alerts reason line and the Confirmed threats headline read the run
+  this way. A sentence with no such term stays. When every sentence would go, the text stays
+  whole. The store keeps the report, so a revoke returns the text.
+- **Hunt context.** A hunt reads a block of authorized activity after its objective. The block lists
+  at most 5 records that are active or that expired in the last 7 days. It never lists a revoked
+  record. It states that activity inside a scope is known and that activity outside every scope is a
+  finding. The label and the names are inside the untrusted text fence. The Objective step shows the
+  block. An evaluation hunt reads no block. When the redaction cannot clean the block, soc-ai drops
+  it, and the hunt reports the activity as a threat.
+- **Audit.** Each create, revoke and expiry writes an audit record. The create writes its record
+  before the commit, and a failed write saves no record. Each scope answer on a run writes an audit
+  record on the trail of the run.
+- **API.** New routes: `GET /api/v1/investigations/{id}/authorized-activity/draft`, `POST
+  /api/v1/authorized-activity`, `POST /api/v1/authorized-activity/{id}/revoke` and `GET
+  /api/v1/authorized-activity`. Only an admin creates a record. `GET /api/v1/investigations` takes
+  the filter `authorization`. Each row gives `authorizationId` and `authorization`. The
+  investigation detail gives `outsideAuthorizedScope`.
+
+### Leads
+
+- **Fleet condition.** A lead with the status `fleet_condition` reads "Fleet condition" on its pill,
+  and a fifth tab lists these leads. The tab states what a fleet condition is and that it waits on
+  no decision. Each tab states its count. The four state tabs sum to the All tab. `GET
+  /api/v1/hunts/leads` and `GET /api/v1/hunts/leads/count` take the status `fleet_condition`. Before
+  this fix, 47 of 70 production leads read "New" and were on no tab.
+- **Related leads.** The related list and the related count hold live leads that are open or under a
+  hunt. A fleet condition lead and a shadow lead are not related.
+- **The hunt result on the row.** Every lead row prints "Hunt result:" and one of "found a threat",
+  "found no threat", "hunt failed" or "not hunted". A finished hunt adds its answer and what it
+  could not check. A hunt that still runs claims no result. `GET /api/v1/hunts/leads` gives
+  `hunt_answer` and `hunt_not_checked`.
+- **The lead page.** The page opens with one state line. The line states what soc-ai saw and on
+  which host, what the newest hunt concluded and what the lead waits on. One line states the effect
+  of each button that the page shows. The dismissal form states what the chosen reason records. A
+  lead whose live weight is under the forming weight carries a mark.
+- **The bulk bar.** The bar states the reason for each lead that an action skips, for example "6
+  shadow leads take no bulk action." When the actions skip different leads, each action states its
+  own skips.
+- **A true positive forms a live lead.** A true positive alert joins a lead on its entity that is
+  open or under a hunt and is not shadow. With no such lead, it forms one. That lead is never shadow
+  and never a fleet condition. A second true positive joins the live lead and starts no second hunt.
+  On production, 13 of 17 true positives started no hunt.
+- **A true positive in the wrong lead.** A true positive in a fleet condition, in a shadow lead or
+  in a closed lead as history moves to a live lead at the next sweep. A lead that holds a live
+  finding with weight is never marked shadow. A shadow hit does not reopen the closed lead of a true
+  positive.
+- **Repeats after a close.** A true positive alert joins a closed lead on its host when the lead
+  held the same alert rule at its close. The close must be less than 207 hours old. The alert forms
+  no lead and starts no hunt. Another rule, another host or the same rule after 207 hours forms a
+  live lead that the loop hunts.
+- **Other sightings after a close.** A sighting with a new document more than 207 hours after the
+  close leaves the closed lead and starts a new count. A dismissal by an analyst keeps its scope
+  until Reopen, with no time limit. On production, 32 observations fired again after their lead
+  closed and formed nothing.
+- **The repeats line.** A closed lead with repeats states the count and the time of the newest
+  repeat on its row and on the lead page. The tooltip states the 207 hour rule. `GET
+  /api/v1/hunts/leads` and the lead detail give `repeats_after_close` and `last_repeat_at`.
+
+### Analytic hits
+
+- **Two counts.** The label of the Analytic hits block states two counts, for example "39 in the
+  last 7 days · 210 older unread". Each count states its own window. `GET /api/v1/hunts/hits` gives
+  the object `window` with `days`, `in_window` and `older_unread`.
+- **One header for each analytic.** The block groups the hits by analytic. The header states the hit
+  count, the unread count and the machines. It carries one Approve, one Reject and one "Mark N
+  read". Three hits are in view, and the other hits open on request. `GET /api/v1/hunts/hits` gives
+  `groups`. Each group gives `analytic_id`, `analytic_title`, `analytic_status`, `tier`,
+  `analytic_exists`, `hits`, `unread`, `machines`, `accounts` and `newest_at`.
+- **Mark the hits of one analytic read.** New route: `POST /api/v1/hunts/shadow-hits/read-analytic`.
+  It marks the unread hits of one analytic read in one write and writes one audit record. An
+  approval reads the unread hits of its analytic through the same route.
+- **The read mark.** The read mark is keyed on the machine. A repeat keeps its read mark unless its
+  weight is higher than the weight the analyst read. A score further from the baseline than the
+  largest score the analyst read also clears the mark. A read covers the same hit on each address of
+  the machine. The hit rows of `GET /api/v1/hunts/hits` and `GET /api/v1/hunts/shadow-hits` give
+  `machine_key` and `machine_name`. On production, 123 of 233 unread hits were hits that the owner
+  had read.
+
+### Hunts
+
+- **"vs last run".** A finding matches a finding of the last run when the two name one machine and
+  share a rule, a technique or a stored document. The match is many to many. A finding that cites
+  nothing keeps the match on the title and the host set. The third list reads "not reported this
+  run" in gray. The `diff` object of a hunt gives `notReported`. `resolved` stays for one release as
+  a deprecated copy of `notReported`.
+- **Budget hunts.** A hunt that reached its budget keeps its report. The report writer runs once
+  more on a text copy of the evidence.
+- **Degraded hunts.** A hunt whose model returns no reasoning trace gets the mark "Degraded" when
+  one of the last 10 agent hunts carried a trace. The Hunts list, the hunt page and each finding
+  show the mark. The hunt API gives `degraded` and `degradedNote`. A later scheduled hunt does not
+  read a marked run as an earlier conclusion.
+- **Lost hunts.** A lost hunt states a plain cause. Each way to lose a report has its own sentence.
+  The hunt API gives the raw error in `errorDetail`, and the hunt page shows it behind a toggle.
+  Each failed report attempt writes a usage event.
+- **The window block.** A scheduled hunt reads the confirmed activity of its window. The block lists
+  the true positive alert verdicts by target host and rule, with the count that the Oracle
+  confirmed. It lists the hunt findings whose latest run is a true positive. It lists the open leads
+  under a label that states that a lead is not confirmed activity. Every value is quoted inside the
+  untrusted text fence. The whole block is at most 6,000 characters.
+- **The window.** The window comes from the objective, for example "72h", "7d" or "seven days". With
+  no window in the objective, the hunt reads the interval of its schedule. An alert counts by its
+  event time.
+- **A true positive that the report omits.** A true positive of the block is accounted for when the
+  report holds a threat finding on its target. A narrative that names its host or its rule also
+  accounts for it. Otherwise the report gets one labeled line before the narrative. The line names
+  each such true positive. The text of the model stays whole.
+- **Restated findings.** A finding that restates an investigated finding of another hunt from the
+  last 7 days starts no run. The run of the earlier finding answers for it. Only a finished true
+  positive answers. Each document that the new finding cites must be a stored document of the
+  earlier finding. The two findings name the same machines, and the new finding names no new
+  technique.
+- **The restates link.** The link is read live. When the earlier run stops being a true positive,
+  the finding shows no verdict, and "Open an investigation" starts a run. A lead hunt does not use
+  the rule. The finding gives `restates` with `huntId`, `ordinal`, `title`, `verdict` and `answers`.
+  The finding card reads "Restates" with the earlier finding and its verdict.
+
+### Finding cases
+
+- **Escalate on a hunt finding.** Escalate on a true positive run of a hunt finding opens a Security
+  Onion case from the finding. The title is the title of the stored finding. The description holds
+  the headline of the run, the hosts and the documents that the finding cites. The card, the pending
+  row, the needs-you count and the execute route agree. The acknowledge of a finding and each write
+  of a promoted lead stay off.
+- **The alerts on the case.** The case attaches at most 25 cited alerts. It skips an alert with a
+  decision in Security Onion, an alert that is already on a case and an alert that is not on a host
+  of the finding. The scope sentence and the button state the count before the press. The result
+  states the attached count and the skipped count. A grid that does not answer opens no case.
+- **The audited write.** The write runs through the audited path as the tool `open_finding_case`. No
+  report can name that tool. No argument of the model reaches the write. The investigation detail
+  gives `promotedKind`.
+- **One case for each finding.** The runs of one finding share one case. The guard keys on the hunt
+  and the finding. A press records an intent before the call to Security Onion and a result after. A
+  press that cannot record its intent sends no request. A press that finds an intent with no result
+  opens no case. It states that a case can exist and names the Cases page and the title.
+- **Try again.** A finding whose create failed with a server or a transport error offers one control
+  on its card, Try again. The confirm tells the analyst to look at the Cases page of Security Onion
+  first. The press writes an audit record, clears the open intent and opens the case once more. A
+  retry that soc-ai cannot audit opens no case. The scope answer gives `retry` and `retrySentence`.
+  The execute request takes `retry`.
+- **The pending row of a blocked finding.** The row states "The case request did not finish. Open
+  the investigation to try again." It links to the investigation and offers no Escalate button. Each
+  waiting action of `GET /api/v1/investigations` gives `retry`.
+- **Escalate arguments.** The execute route binds the title and the description of an Escalate
+  action when the field is empty or is not text. The title is the rule name. The description is the
+  headline of the run, or the reason of the action. The override path binds the same fields. On
+  production, five Escalate actions failed on empty arguments.
+- **Case limits.** Each path that opens a case cuts the title to 100 bytes and the description to
+  1,000,000 bytes, on a character boundary. Security Onion refuses a longer value.
+
+### Triage
+
+- **Severity high of an Informational rule.** A high severity alert leaves the high-stakes hold when
+  soc-ai can read that the rule is Informational. The alert must be a Suricata alert. Its
+  classification must have priority 1, and the routing table must call it informational. Each
+  signature severity value must be Informational. An alert that fails one condition stays high
+  stakes. On production, 274 confident false positives waited for a manual acknowledge in two weeks.
+- **The other arms.** An exploit or a malware classification, a malware token and a deception sensor
+  still hold the alert. When a rule carries two signature severity values, the most severe value
+  stands. The inherited acknowledge reads the same rule. The help of the auto-acknowledge setting,
+  the Config note and the product page state each condition.
+- **The cheap path.** The cheap path writes its summary for the analyst. soc-ai removes a whole
+  first person sentence that keeps or refines the candidate verdict or the confidence and states
+  nothing else. A sentence with an address, a port, a count, a dataset or a record name stays.
+  soc-ai adds an Acknowledge action to a false positive that has none. The verdict, the confidence
+  and the citations stay.
+- **Case comments.** Every path drops a case comment when the run can have no case. A comment beside
+  an Escalate action stays. When the escalate finds the alert already on a case, it stores that
+  case, and the comment binds to it. When no source names the case, the comment reads as closed with
+  a plain reason. The timeline records each removed comment. The loop prompt names the argument
+  `comment` of the tool.
+
+### Gates and verdict text
+
+- **The text of the model.** A gate that lowers a claim to needs more info keeps the text of the
+  model as the summary and the headline. A gate that refutes a claim sets a settled verdict. The
+  stored summary and headline then lead with the reason of the gate. The text of the model moves to
+  the report field `model_summary`. The report page prints it under the label "The model wrote". The
+  headline of a run never contradicts its final verdict.
+- **The verdict change record.** The report carries `verdict_change`. The record keeps the verdict
+  of the model as its origin and lists each step in order, with the reason and the missing evidence.
+  The report page prints the reason as one labeled line under the headline. Open questions lists the
+  missing evidence. The investigation detail gives `verdictChange` and `modelText`. The copy of the
+  report that the Oracle reads still opens with the change.
+
+### Grid fields and the query tool
+
+- **Field names.** The field tables, the Zeek pivot, the primer and the hunt examples use the names
+  that the grid stores. The SSH login result is `ssh.authentication.success`. The tables for the
+  User-Agent, the file hash, the file size, the Kerberos cipher, the software banner, the software
+  type, the DHCP domain and the SMB share type gain their grid names. Ten of twelve scheduled hunts
+  filtered on a dead SSH name.
+- **One filter for every name.** A filter on one name of a field matches every name of that field. A
+  name is added only when its type accepts the value. A filter on one alert label matches both alert
+  labels. A filter that names two names of one thing stays as written. The filter bar of the console
+  widens a name in the same way. A dataset filter reads `event.dataset` and `data_stream.dataset`.
+- **Flags.** The SSH login result, the TLS established flag and the DNS rejected flag parse
+  strictly. A stored "false" is a failure.
+- **The Sigma dry run.** The dry run runs the rule as written. When the grid stores the value under
+  a different name, the draft fails its check, and the note gives the grid name. A configured alert
+  source runs as the operator wrote it.
+- **Zero-hit results.** After a zero-hit query on a named field, `t_query_events_oql` counts the
+  documents that hold the field. When no document holds it, the result gives `field_note`. The note
+  states that the zero is not evidence of absence. `t_field_values` reports the same check in
+  `note`. A zero on a field that documents hold gets no note. The primer states the rule in the
+  section Zero-hit results.
+
+### Reputation
+
+- **Reputation status.** An enrichment result gives `reputation_status`: `listed`, `not_listed` or
+  `not_checked`. It also gives `feeds_matched`, `feeds_checked`, `feeds_not_loaded`, `feeds_stale`,
+  `not_checked_reason` and `reputation_note`. The prompt counts only `not_listed` as evidence.
+- **When a miss is evidence.** A miss is `not_listed` only when a malware feed that indexes the type
+  of the indicator was checked. A miss with the Tor exit list or the operator seed list as the only
+  feed is `not_checked`. A miss for an internal address, a failed lookup and a miss on a stale feed
+  are `not_checked`. A match on a stale feed is still a match.
+- **Removed fields.** The result no longer holds `blocklist_sources` or `blocklist_checked`. A
+  record in the older shape still validates and renders.
+- **ThreatFox.** The ThreatFox loader indexes MD5, SHA-1 and SHA-256. Each hash algorithm is one
+  indicator type.
+- **Doctor.** The doctor warns when no fresh malware feed is on disk. `docs/BLOCKLISTS.md` describes
+  the result.
+
+### Model runs
+
+- **Output token limit.** A run that hits the output token limit runs once more with low reasoning
+  effort. The investigation loop resumes from the history before the stopped turn, so no tool runs
+  twice. The counters of the stopped attempt carry over. The run records a `token_limit_retry`
+  event. The report names the phases that ran again. The investigation detail gives `lowReasoning`.
+- **Served model.** Each report records `served_model`: the configured model, the gateway model
+  groups and a fallback mark. A call is a fallback when the gateway fallback count is above zero. A
+  call that a model group other than the asked model served is also a fallback. A run with no record
+  reads "not recorded".
+- **The served model on the page.** The investigation detail gives `servedModel`, `requestedModel`
+  and `servedFallback`. The report page shows one line with the mark. A true positive from a
+  fallback route goes to the Oracle. A fallback verdict that changes an earlier verdict of the same
+  alert or session also goes to the Oracle.
+
+### Oracle retries
+
+- **Retry after a failed Oracle call.** A run whose Oracle call failed waits in a queue in the
+  store. When the route pause ends, the auto-triage sweep starts a new run of the same alert or
+  finding. The cap reads every stored run of the subject: two new runs after a quota or a transport
+  failure, one after a refusal.
+- **The queue.** A subject that cannot run leaves the queue, and the run records the reason. The
+  queue skips a subject that the analyst closed. A new run of a finding updates the link on the hunt
+  row.
+- **The wait.** The breaker reads `retry_after` from the JSON error body as seconds or as an ISO
+  time. It cuts the wait to 7 days.
+
+### Nightly evaluation
+
+- **Synthetic true positives.** Each nightly batch plants synthetic true positives beside the real
+  alerts. The new setting `quality_nightly_synth_n` sets the count. The default is 1. A synthetic
+  run that does not return a true positive raises the quality alarm. A synthetic run that fails is
+  not measured.
+- **Eligible scenarios.** The nightly plants only a scenario whose inputs the deployment has loaded.
+  The snapshot names each scenario that is not eligible and its missing input.
+- **Cleanup.** The nightly deletes each synthetic document by its id and its index. A run that stops
+  before the end leaves a record, and the next run deletes those documents. A delete that fails is
+  reported.
+- **Low agreement alarm.** The alarm reads verdict agreement on real alerts over the last 7 runs,
+  with a floor of 0.50. The grader prompt asks for the line `ORACLE_VERDICT`. The alarm text lists
+  each pair of verdicts that disagree.
+- **Errors.** A run with no report, a run with no verdict and a fallback run count as errors. Each
+  error gets a class: `gateway`, `token_limit`, `time_limit` or `other`. A run that the Oracle does
+  not grade is a completed run that is not measured. The error rate alarm names the quota of the
+  Oracle route when the quota is the cause.
+- **Notifications.** A notification starts when a condition starts. A cancelled run records its own
+  outcome.
+- **The snapshot.** Migration 0066 adds `quality_snapshots.detail`. Each point of `GET
+  /api/v1/quality/trend` gives `served_models`, `served_model_recorded`, `synth`, `synth_note`,
+  `synth_ineligible`, `synth_ineligible_note`, `synth_cleanup_error`, `n_not_graded`,
+  `not_graded_kinds`, `not_measured`, `verdict_agree`, `verdict_compared`, `verdict_disagreements`,
+  `n_no_oracle_verdict`, `error_classes` and `n_unfinished`.
+
+### Host sweep
+
+- **Probed addresses.** The census makes no host row for an address that a TCP scan probed and that
+  shows no other sign of a machine. Such an address originated no document and sent no responder
+  packet or byte. No agent, DNS answer or lease names it. The rule applies only when each sensor of
+  the TCP records shows responder traffic in the window. An address that has a row keeps it. On
+  production, one Nmap sweep made 1,672 rows.
+- **Build order.** The host sweep builds active hosts first. An active host has an alert or an
+  investigation in the last 7 days, an agent, or an originated event in the last 7 days. The other
+  hosts keep a reserved share of the builds, and each row builds within a bound.
+- **A probed port is not a served port.** A TCP flow record is a probe when it carries a responder
+  counter and no counter is above zero. A refused connection is also a probe. A port where each
+  record is a probe reads "answered: 0". It gets no service, no role and no place on the management
+  plane. A rebuild corrects a stored false port.
+
+### Operations
+
+- **Disk space.** The doctor has a "disk space" row for the volume of the data directory. The row
+  warns below 15% free or below 2 G free.
+- **Health check.** The container health check asks in the scheme of the server first. It reads
+  `SOC_AI_TLS_CERT`. The Dockerfile check follows the same rule. Before this fix, the check made the
+  server log 37,402 warning lines in 13 days.
+- **Memory.** The container memory limit in `docker-compose.yml` is 3G. The limit was 1G, and a
+  production container reached it 6,631 times in nine days.
+
 ### Dependencies
 
-- `opentelemetry-api` 1.45.1. pip-audit found CVE-2026-114603 in 1.39.1. The lock drops
-  `importlib-metadata` and `zipp`, which the new version no longer needs.
+- `opentelemetry-api` 1.45.2. pip-audit found CVE-2026-114603 in 1.39.1 and CVE-2026-126360 in
+  1.45.1. The lock drops `importlib-metadata` and `zipp`, which the new version no longer needs.
 
 ## [1.6.0] - 2026-10-21
 

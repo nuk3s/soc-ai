@@ -9,7 +9,7 @@
 // happy-dom has no layout engine, so "the same x" is the same grid column.
 import { render, screen, within } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
@@ -110,7 +110,11 @@ function chipTexts(cell: HTMLElement): string[] {
 }
 
 function expectNoChip(cell: HTMLElement, name: string) {
-  expect(cell.textContent?.trim()).toBe(name);
+  // A wide Investigations row holds the flow under the name, as the Alerts
+  // row does. The flow is a line of addresses, not a chip.
+  const text = cell.cloneNode(true) as HTMLElement;
+  text.querySelectorAll('[data-testid^="inv-flow-"]').forEach((n) => n.remove());
+  expect(text.textContent?.trim()).toBe(name);
   for (const text of CHIP_TEXT) expect(cell.textContent).not.toContain(text);
   expect(cell.querySelector('[data-testid^="run-class"]')).toBeNull();
   expect(cell.querySelector('[data-testid^="backtest-replay"]')).toBeNull();
@@ -118,8 +122,29 @@ function expectNoChip(cell: HTMLElement, name: string) {
   expect(cell.querySelector('[data-testid="counts-unknown"]')).toBeNull();
 }
 
+// The tags column is the layout of a wide window. Under 1280 px the Alerts
+// and Investigations rows fold their tags into the detection cell (M1,
+// ui-core 12), and happy-dom opens a 1024 px window.
+let wideWindow: { mockRestore: () => void } | null = null;
 beforeEach(() => {
   vi.clearAllMocks();
+  wideWindow = vi.spyOn(window, 'matchMedia').mockImplementation(
+    (query: string) =>
+      ({
+        matches: query.includes('min-width'),
+        media: query,
+        onchange: null,
+        addEventListener: () => undefined,
+        removeEventListener: () => undefined,
+        addListener: () => undefined,
+        removeListener: () => undefined,
+        dispatchEvent: () => false,
+      }) as MediaQueryList,
+  );
+});
+afterEach(() => {
+  wideWindow?.mockRestore();
+  wideWindow = null;
 });
 
 describe('the tags cell', () => {
@@ -135,7 +160,7 @@ describe('the tags cell', () => {
           replay
           counts={<span>3 acknowledged</span>}
           dismissed
-          superseded="A newer run replaced this run."
+          superseded="A newer investigation replaced this one."
           links={<button type="button">2 earlier</button>}
           chatCount={4}
         />
@@ -231,7 +256,8 @@ describe('the Investigations list', () => {
     expectNoChip(full, FULL_NAME);
     expectNoChip(bare, BARE_NAME);
     // The header over the name column is Detection.
-    const header = screen.getByRole('button', { name: 'Sort by Detection' }).parentElement!;
+    const header = screen.getByRole('button', { name: 'Sort by Detection' }).closest('[role="columnheader"]')!
+      .parentElement!;
     expect(columnOf(header)).toBe(columnOf(full));
   });
 

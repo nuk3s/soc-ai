@@ -88,7 +88,9 @@ def _ctx(settings: Settings, maker: Any) -> InvestigationContext:
     )
 
 
-async def _rerun(settings: Settings, maker: Any) -> tuple[list[Any], AsyncMock, Any, Any]:
+async def _rerun(
+    settings: Settings, maker: Any, actions: list[Any] | None = None
+) -> tuple[list[Any], AsyncMock, Any, Any]:
     """A run that investigates, settles false positive at 0.9 and would auto-ack.
 
     The same shape as ``test_auto_ack_still_fires_when_the_run_did_investigate``
@@ -104,6 +106,7 @@ async def _rerun(settings: Settings, maker: Any) -> tuple[list[Any], AsyncMock, 
         confidence=0.9,
         summary="Zeek shows the SNI belongs to the vendor's update service.",
         citations=["(tool t_query_zeek_logs)"],
+        recommended_actions=actions or [],
     )
     loop_synth_result = MagicMock()
     loop_synth_result.output = settled

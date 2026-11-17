@@ -3,10 +3,12 @@
 // hunt (Investigate button, HuntDetail.tsx) also sends the hunt path in the
 // router state, and that state outlives a reload. With neither, the link goes
 // to the list of investigations.
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Investigation as Inv, InvestigationSubject } from '../lib/types';
+import { forbiddenWords } from '../test/analystWords';
+import { LINK, LINK_DIFFERS } from '../test/campaign';
 
 vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
@@ -163,5 +165,56 @@ describe('InvestigationPage title and Delete', () => {
     fireEvent.click(screen.getByTestId('investigation-more'));
     fireEvent.click(screen.getByRole('menuitem', { name: /Delete investigation/ }));
     expect(screen.getByRole('button', { name: /Confirm delete/ })).toBeTruthy();
+  });
+});
+
+// The campaign is the unit of work (owner, 2026-11-14). The page of one
+// investigation is support for its campaign, so the campaign strip leads it.
+describe('InvestigationPage campaign strip', () => {
+  it('leads the page with the stage meter, the sentence, the stage and the link', async () => {
+    vi.mocked(getInvestigation).mockResolvedValue({ ...baseInv, campaign: LINK });
+    at('/investigation/INV-1');
+    const strip = await screen.findByTestId('investigation-campaign');
+    expect(within(strip).getByRole('img')).toHaveAccessibleName('Stage reached: Action on the target, 4 of 5');
+    expect(within(strip).getByTestId('investigation-campaign-sentence')).toHaveTextContent(
+      'Part of the campaign actor-a against web-1.',
+    );
+    expect(within(strip).getByTestId('investigation-campaign-stage')).toHaveTextContent(
+      'Stage reached: Action on the target',
+    );
+    expect(within(strip).getByRole('link', { name: 'Open the campaign' })).toHaveAttribute('href', '/campaigns/7');
+    // The strip comes before the report.
+    const report = screen.getByTestId('investigation-report');
+    expect(strip.compareDocumentPosition(report) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // The title wraps. It is never cut.
+    expect(within(strip).getByTestId('investigation-campaign-sentence').className).toContain('break-words');
+    expect(forbiddenWords(strip)).toEqual([]);
+  });
+
+  it('states that the verdict differs on a session of the campaign', async () => {
+    vi.mocked(getInvestigation).mockResolvedValue({
+      ...baseInv,
+      verdict: 'false_positive',
+      campaign: { ...LINK_DIFFERS, stage: null },
+    });
+    at('/investigation/INV-1');
+    const strip = await screen.findByTestId('investigation-campaign');
+    expect(within(strip).getByTestId('investigation-campaign-sentence')).toHaveTextContent(
+      'Same session as the campaign actor-a against web-1. The verdict differs.',
+    );
+    expect(within(strip).getByTestId('investigation-campaign-stage')).toHaveTextContent('No proven stage');
+    expect(strip).toHaveAttribute('data-differs', 'true');
+  });
+
+  // NEGATIVE CONTROL. An investigation in no campaign, and a server of an
+  // earlier release, show no strip.
+  it('shows no strip with no campaign', async () => {
+    for (const campaign of [null, undefined]) {
+      vi.mocked(getInvestigation).mockResolvedValue({ ...baseInv, campaign });
+      const { unmount } = at('/investigation/INV-1');
+      await screen.findByTestId('investigation-report');
+      expect(screen.queryByTestId('investigation-campaign')).toBeNull();
+      unmount();
+    }
   });
 });

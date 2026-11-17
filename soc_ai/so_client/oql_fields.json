@@ -86,8 +86,12 @@
     "wireguard",
     "osquery",
     "osquery_meta",
-    "action_data"
+    "action_data",
+    "kerberos",
+    "smb",
+    "dce_rpc"
   ],
+  "_comment_protocol_families": "kerberos, smb and dce_rpc: a Security Onion 3.x grid writes the Zeek kerberos, smb_mapping and dce_rpc logs under these roots (kerberos.request_type, kerberos.ticket.cipher, smb.path, smb.share_type, dce_rpc.endpoint, dce_rpc.operation; census of stored documents, 2026-11-13). The validator refused all of them while it accepted the zeek.kerberos.* names that the grid does not hold.",
   "_comment_ecs_zeek": "Modern SO / Elastic-Agent 9.x populates ECS field names for Zeek data (dns.query.name, client.bytes, hash.ja3s, http.virtual_host, ...) while the zeek.* fields are mapped-but-empty. These ECS names are already covered by the prefixes above (dns/client/server/network/connection/hash/ssl/http/user_agent/file) and so already pass is_allowed(); they are listed explicitly here too as the documented, intended OQL surface for the agent so the field-resolution layer in so_client/fields.py and the OQL allowlist agree on the same canonical names. The zeek.* prefix stays valid for older SO and synth fixtures.",
   "exact_fields": [
     "_id",

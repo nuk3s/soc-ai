@@ -26,6 +26,7 @@ from soc_ai.agent import rule_prior
 from soc_ai.api.deps import ctx_from_state
 from soc_ai.api.runner import run_recorded
 from soc_ai.errors import OqlValidationError
+from soc_ai.oracle import retry as oracle_retry
 from soc_ai.so_client.fields import get_dotted
 from soc_ai.store import investigations as inv_svc
 from soc_ai.store import rule_prior as rule_prior_store
@@ -58,6 +59,14 @@ class Target:
     # selection): the prior then holds, because it cannot rule out critical.
     severity: str = ""
     host_name: str = ""
+    # The names of the external end that the alert document carries (TLS
+    # server name, HTTP host, DNS query), for safeguard 1 of the rule prior.
+    external_names: tuple[str, ...] = ()
+    # The run whose Oracle escalation failed, when the Oracle retry queue
+    # planned this target (soc_ai.oracle.retry). The new run exists to reach
+    # the Oracle, so the rule prior does not cover it, and its actor names
+    # the queue. Empty on every other target.
+    oracle_retry_of: str = ""
 
 
 @dataclass
@@ -100,7 +109,9 @@ class AutoTriageStatus:
     inherited_acked_total: int = 0
     # Why inherited acks were held back this run (reason code -> count):
     # ``no_investigation`` (the source verdict retrieved nothing),
-    # ``high_stakes``. Reset per run alongside ``inherited_acked``.
+    # ``high_stakes``, ``analyst_verdict``, ``earlier_true_positive`` (an
+    # earlier run of the alert leaned true positive), ``earlier_runs_unread``.
+    # Reset per run alongside ``inherited_acked``.
     inherited_refused: dict[str, int] = field(default_factory=dict)
     # per-reason breakdown of ``skipped`` for this run (reason code -> count).
     # Written by the planner (plan_targets / plan_targets_for_ids) so the polling
@@ -507,6 +518,7 @@ async def plan_targets(
             dst_ip=dst_ip,
             severity=ev.severity or "",
             host_name=ev.subject_host or "",
+            external_names=ev.external_names,
         )
         # The retry budget comes after the coverage checks, so a sibling's
         # verdict still covers a failed alert and queues its acks.
@@ -826,6 +838,68 @@ async def _analyst_held_alerts(state: Any, alert_ids: list[str]) -> set[str] | N
     return {aid for aid, v in found.items() if v.verdict != "false_positive"}
 
 
+async def _earlier_true_positive_alerts(
+    state: Any, alert_ids: list[str], exclude_ids: list[str]
+) -> dict[str, str] | None:
+    """Which of *alert_ids* have an earlier run that leaned true positive.
+
+    The same rule as the direct auto-ack (production, 2026-11-13): an alert
+    that an earlier run called a true positive is never acknowledged with no
+    person, and a sibling's inherited false positive does not change that.
+    One store read covers the batch.
+
+    FAILS CLOSED. None means the store did not answer, and the caller refuses
+    every candidate.
+    """
+    if not alert_ids:
+        return {}
+    try:
+        async with state.db_sessionmaker() as db:
+            return await inv_svc.earlier_true_positive_runs(db, alert_ids, exclude_ids=exclude_ids)
+    except Exception:
+        _LOGGER.exception(
+            "auto-triage: could not read the earlier runs. Refusing %d inherited acks",
+            len(alert_ids),
+        )
+        return None
+
+
+def _earlier_runs_refusal(earlier_tp: dict[str, str] | None, alert_id: str) -> str | None:
+    """The refusal reason from the earlier runs of *alert_id*, or None."""
+    if earlier_tp is None:
+        return "earlier_runs_unread"
+    return "earlier_true_positive" if alert_id in earlier_tp else None
+
+
+# The alert groups whose refused acknowledgement this process logged. An alert
+# group is one rule and the investigation its alerts inherit from: the refusal
+# reads the source verdict only, so it is one decision for the whole group.
+# Prod logged the same decision on every sweep: 74,560 lines for 1,238 alerts
+# in 13 days, up to 474 for one alert (review 2026-11-12). The counter
+# ``inherited_refused`` still counts each refused alert on each sweep.
+_NOT_ACKED_LOGGED: set[tuple[str, str]] = set()
+_NOT_ACKED_LOGGED_MAX = 20_000
+
+
+def _log_not_acked_once(cand: InheritedAck) -> None:
+    """Log a refused inherited acknowledgement one time for each alert group."""
+    key = (cand.rule_name, cand.inherited_from)
+    if key in _NOT_ACKED_LOGGED:
+        return
+    if len(_NOT_ACKED_LOGGED) >= _NOT_ACKED_LOGGED_MAX:
+        # A bound on the memory of a long process run. A group can log again.
+        _NOT_ACKED_LOGGED.clear()
+    _NOT_ACKED_LOGGED.add(key)
+    _LOGGER.info(
+        "auto-triage: not acking the alerts of rule %s, first alert %s. The verdict "
+        "that they inherit from %s had no successful tool call, targeted dispatch or "
+        "Oracle retrieval. This line prints one time for this alert group.",
+        cand.rule_name or "unknown",
+        cand.alert_es_id,
+        cand.inherited_from,
+    )
+
+
 async def _ack_inherited_fps(
     state: Any,
     ctx: Any,
@@ -869,6 +943,11 @@ async def _ack_inherited_fps(
         state, list(dict.fromkeys(a.inherited_from for a in acks))
     )
     analyst_held = await _analyst_held_alerts(state, [a.alert_es_id for a in acks])
+    earlier_tp = await _earlier_true_positive_alerts(
+        state,
+        list(dict.fromkeys(a.alert_es_id for a in acks)),
+        list(dict.fromkeys(a.inherited_from for a in acks)),
+    )
     try:
         lookup = await state.elastic.search(
             state.settings.events_index_pattern,
@@ -899,12 +978,7 @@ async def _ack_inherited_fps(
             # confident false positive on the console. It just stops
             # authorizing writes to Security Onion that nobody looked at.
             _bump(status.inherited_refused, "no_investigation")
-            _LOGGER.info(
-                "auto-triage: not acking %s — the inherited verdict (from %s) had no "
-                "successful tool call, targeted dispatch or Oracle retrieval behind it",
-                cand.alert_es_id,
-                cand.inherited_from,
-            )
+            _log_not_acked_once(cand)
             continue
         try:
             alert = SoAlert.from_es_hit(hit)
@@ -913,6 +987,12 @@ async def _ack_inherited_fps(
             continue
         if _is_high_stakes_alert(alert):
             _bump(status.inherited_refused, "high_stakes")
+            continue
+        if (refused := _earlier_runs_refusal(earlier_tp, cand.alert_es_id)) is not None:
+            # An earlier run of this alert leaned true positive, or the store
+            # did not answer. A sibling's false positive does not close it
+            # with no person.
+            _bump(status.inherited_refused, refused)
             continue
         _result, error = await execute_write_tool(
             "ack_alert",
@@ -1008,13 +1088,14 @@ def _prior_target(target: Target) -> rule_prior.PriorTarget:
         dst_ip=target.dst_ip,
         severity=target.severity,
         host_name=target.host_name,
+        external_names=target.external_names,
     )
 
 
 class _RulePriorSweep:
     """The rule prior's inputs for one scheduled sweep, read once.
 
-    The mode, the estate's address space and the detection tuning
+    The mode, the internal address space and the detection tuning
     nominations are read at the first target and held for the sweep, so a
     sweep of 25 targets asks the grid for the nominations once. A failure to
     read either one fails closed: the prior then holds for every target.
@@ -1039,7 +1120,7 @@ class _RulePriorSweep:
                 async with self._state.db_sessionmaker() as db:
                     self._cidrs = list((await effective_internal_identifiers(db, settings)).cidrs)
             except Exception:
-                _LOGGER.warning("rule prior: estate CIDRs unreadable; using settings")
+                _LOGGER.warning("rule prior: the internal CIDRs are unreadable; using settings")
                 self._cidrs = list(getattr(settings, "internal_cidrs", []) or [])
         return self._cidrs
 
@@ -1161,6 +1242,9 @@ class _TargetRun:
     # The phase and the type of the FIRST error event, for the retry alarm.
     error_phase: str | None = None
     error_type: str | None = None
+    # Its text, for the gateway pause: the text tells a gateway connection
+    # error from another failure of the same type.
+    error_message: str = ""
 
     def observe(self, name: str, data: Any, status: AutoTriageStatus) -> None:
         if name == "error":
@@ -1171,6 +1255,7 @@ class _TargetRun:
                 body = payload if isinstance(payload, dict) else data
                 self.error_phase = str(body.get("phase") or "") or None
                 self.error_type = str(body.get("type") or "") or None
+                self.error_message = str(body.get("message") or "")
             self.errored = True
         elif name == "tool_call":
             status.tool_calls += 1
@@ -1280,8 +1365,11 @@ async def run_auto_triage(  # noqa: PLR0915 - one linear per-target flow, guards
             status.current = label
             # ----- The rule prior rung (stage 1, soc_ai.agent.rule_prior) -----
             decision_id: int | None = None
-            if prior is not None:
-                covered, decision_id = await prior.gate(target, started_by, status)
+            # A target of the Oracle retry queue runs the model: the rule
+            # prior would cover it with no model call and no escalation.
+            target_prior = None if target.oracle_retry_of else prior
+            if target_prior is not None:
+                covered, decision_id = await target_prior.gate(target, started_by, status)
                 if covered:
                     status.current = None
                     continue
@@ -1305,7 +1393,7 @@ async def run_auto_triage(  # noqa: PLR0915 - one linear per-target flow, guards
                     state,
                     ctx=ctx,
                     alert_id=target.alert_es_id,
-                    started_by=started_by,
+                    started_by=(oracle_retry.STARTED_BY if target.oracle_retry_of else started_by),
                     # Group sweeps know the rule name up front; selected-id runs
                     # carry "" and fall back to stream-extraction.
                     rule_name=target.rule_name or None,
@@ -1360,18 +1448,25 @@ async def run_auto_triage(  # noqa: PLR0915 - one linear per-target flow, guards
                 failure = ("worker", type(exc).__name__)
             finally:
                 status.current = None
-            if prior is not None:
+            if target_prior is not None:
                 # The real verdict beside the decision. A disagreement on a
                 # covered alert suspends the prior for its rule.
-                await prior.settle(
+                await target_prior.settle(
                     decision_id, investigation_id=run.run_id, real_verdict=_real_verdict(run.report)
                 )
             # The retry alarm and the pause read every model run, a press too.
             if _real_verdict(run.report):
                 status.health.record_verdict(target.alert_es_id)
             else:
-                status.health.record_failure(target.alert_es_id, *(failure or ("run", "NoVerdict")))
-            if stop_on_pause and status.health.is_paused():
+                status.health.record_failure(
+                    target.alert_es_id,
+                    *(failure or ("run", "NoVerdict")),
+                    message=run.error_message,
+                )
+            # Either pause stops the scheduled run: five failed runs in a row,
+            # or two gateway connection errors in sequence. The second one
+            # keeps an outage from one failed run for each alert of the sweep.
+            if stop_on_pause and status.health.blocks_sweep():
                 _LOGGER.warning(
                     "auto-triage: the pause is open. The run stops after %d of %d targets.",
                     i + 1,
@@ -1381,6 +1476,351 @@ async def run_auto_triage(  # noqa: PLR0915 - one linear per-target flow, guards
     finally:
         status.active = False
         status.finished_at = datetime.now(UTC).isoformat()
+
+
+GATEWAY_PROBE_TIMEOUT_S = 30.0
+"""The time limit of one gateway test."""
+
+
+@dataclass(frozen=True)
+class GatewayProbe:
+    """What one gateway test gave.
+
+    ``reachable`` is False for a connection failure only: no answer at all, or
+    an answer that says that the gateway cannot reach the model engine.
+    ``status`` is the HTTP status of the answer, None with no answer.
+    """
+
+    reachable: bool
+    status: int | None
+
+
+async def probe_gateway(settings: Any) -> GatewayProbe:
+    """Test the model gateway with one small completion. Never raises.
+
+    The gateway pause opens when the gateway cannot reach the model engine.
+    A list of models does not test that path, so the test is one completion
+    of the analyst model with a limit of one token.
+
+    The test answers one question: is the gateway reachable. HTTP 200 says
+    yes. So does every other answer that is no connection failure, for
+    example 401 for a changed key or 404 for a renamed model: the alarm and
+    the pause of five failed runs handle such an error. An answer of 502 or
+    503, an answer of 500 that names a connection that did not open, and no
+    answer at all say no
+    (:func:`soc_ai.webui.autotriage_health.is_gateway_connection_error`).
+    """
+    import httpx  # noqa: PLC0415 - one call site
+
+    from soc_ai.demo.guard import assert_egress_allowed  # noqa: PLC0415
+
+    try:
+        assert_egress_allowed(settings, "llm gateway")
+        key = settings.litellm_api_key.get_secret_value() if settings.litellm_api_key else "dummy"
+        async with httpx.AsyncClient(
+            verify=settings.litellm_verify_ssl, timeout=GATEWAY_PROBE_TIMEOUT_S
+        ) as client:
+            response = await client.post(
+                str(settings.litellm_base_url).rstrip("/") + "/v1/chat/completions",
+                headers={"Authorization": f"Bearer {key}"},
+                json={
+                    "model": settings.analyst_model,
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "max_tokens": 1,
+                },
+            )
+    except Exception as exc:
+        _LOGGER.debug("auto-triage: the gateway test got no answer: %r", exc)
+        return GatewayProbe(False, None)
+    status = int(response.status_code)
+    if status == 200:
+        return GatewayProbe(True, status)
+    # The text of a model error with this status, as a run records it.
+    as_run_error = f"status_code: {status}, body: {response.text[:2000]}"
+    down = autotriage_health.is_gateway_connection_error("ModelHTTPError", as_run_error)
+    return GatewayProbe(not down, status)
+
+
+async def _gateway_failed_alerts(state: Any) -> list[str]:
+    """The alerts of the sweep window whose run failed on the gateway. Never raises.
+
+    Reads the error runs of the last day and the text of their error events.
+    The health state of the process knows the failures that it saw. The store
+    also knows the failures of an earlier process, before a restart.
+    """
+    from sqlalchemy import select  # noqa: PLC0415
+
+    from soc_ai.store.models import Investigation, InvestigationEvent  # noqa: PLC0415
+
+    maker = getattr(state, "db_sessionmaker", None)
+    if maker is None:
+        return []
+    cutoff = datetime.now(UTC).replace(tzinfo=None) - autotriage_health.MEMORY
+    try:
+        async with maker() as db:
+            rows = (
+                await db.execute(
+                    select(Investigation.alert_es_id, InvestigationEvent.payload)
+                    .join(
+                        InvestigationEvent,
+                        InvestigationEvent.investigation_id == Investigation.id,
+                    )
+                    .where(
+                        Investigation.status == "error",
+                        Investigation.created_at >= cutoff,
+                        InvestigationEvent.kind == "error",
+                    )
+                )
+            ).all()
+    except Exception:
+        _LOGGER.exception("auto-triage: the failed runs of the gateway outage could not be read")
+        return []
+    alerts: list[str] = []
+    for alert_id, payload in rows:
+        body = payload if isinstance(payload, dict) else {}
+        if alert_id and autotriage_health.is_gateway_connection_error(
+            str(body.get("type") or ""), str(body.get("message") or "")
+        ):
+            alerts.append(str(alert_id))
+    return list(dict.fromkeys(alerts))
+
+
+async def _gateway_recovered(state: Any) -> bool:
+    """Test the gateway while the gateway pause is open. True when the pause closed.
+
+    An answer that is no connection failure closes the pause: the gateway is
+    reachable. The alerts that failed on the gateway get their runs back, so
+    the sweep that starts now runs them again. An answer other than 200 is
+    logged one time, here, because the pause is then closed.
+    """
+    probe = await probe_gateway(state.settings)
+    if not probe.reachable:
+        _LOGGER.debug("auto-triage: the model gateway does not answer. The pause holds.")
+        return False
+    healed = get_status(state).health.record_gateway_recovered(await _gateway_failed_alerts(state))
+    if probe.status != 200:
+        _LOGGER.warning(
+            "auto-triage: the gateway test got HTTP %s. The gateway answers, so the "
+            "gateway pause is closed. The failure rules of the runs handle this error.",
+            probe.status,
+        )
+    _LOGGER.info(
+        "auto-triage: the model gateway answers again. The gateway pause is closed. "
+        "%d alerts that failed on the gateway run again.",
+        len(healed),
+    )
+    return True
+
+
+# What one try to start a run of the Oracle retry queue gave. Any other value
+# is the reason why the subject leaves the queue.
+_RETRY_STARTED = "started"
+_RETRY_LATER = "later"
+
+
+async def _start_finding_retry(state: Any, pending: oracle_retry.PendingEscalation) -> str:
+    """Start a new run of a finding whose Oracle escalation failed. Never raises.
+
+    The same steps as the Re-run of the investigation page: read the finding
+    from the report of its hunt, build the hunt subject, pick the anchor,
+    start the run through the investigation manager and point the hunt row at
+    the new run. Returns ``started``, ``later`` for a fault that can pass (a
+    hunt that still runs, a grid that does not answer, a manager that is
+    full), or the reason why the finding can never run.
+    """
+    from soc_ai.agent.context import build_hunt_subject  # noqa: PLC0415 - heavy package
+    from soc_ai.hunting.findings import (  # noqa: PLC0415
+        finding_document_ids,
+        subject_fingerprint,
+    )
+    from soc_ai.store import hunts as hunt_svc  # noqa: PLC0415
+    from soc_ai.store.models import Hunt  # noqa: PLC0415
+    from soc_ai.webui import finding_promotion, hunt_findings  # noqa: PLC0415 - import cycle
+
+    settings = state.settings
+    hunt_id, ordinal = pending.hunt_id, pending.finding_ordinal
+    if hunt_id is None or ordinal is None:
+        return "finding_not_found"
+    try:
+        async with state.db_sessionmaker() as db:
+            hunt = await db.get(Hunt, hunt_id)
+            if hunt is None:
+                return "hunt_not_found"
+            if hunt.status == "running":
+                return _RETRY_LATER
+            report = hunt.report if isinstance(hunt.report, dict) else {}
+            findings = report.get("findings") or []
+            if not (0 <= ordinal < len(findings)) or not isinstance(findings[ordinal], dict):
+                return "finding_not_found"
+            finding = findings[ordinal]
+            is_synth_eval = bool(hunt.is_synth_eval)
+            has_plan = ordinal in hunt_svc.finding_links(hunt)
+        async with asyncio.timeout(settings.webui_grid_timeout_s):
+            async with state.db_sessionmaker() as db:
+                subject = await build_hunt_subject(
+                    db,
+                    elastic=state.elastic,
+                    settings=settings,
+                    hunt_id=hunt_id,
+                    finding_ordinal=ordinal,
+                    lead_id=pending.lead_id,
+                )
+            subject = subject.model_copy(
+                update={"subject_fingerprint": subject_fingerprint(finding)}
+            )
+            anchor_id = await finding_promotion.promotion_anchor(
+                settings=settings,
+                elastic=state.elastic,
+                citations=finding_document_ids(finding),
+                subject=subject,
+            )
+        async with hunt_findings.start_lock(state):
+            inv_id = await finding_promotion.start_promotion(
+                state,
+                anchor_id=anchor_id,
+                started_by=oracle_retry.STARTED_BY,
+                title=str(finding.get("title") or "Hunt finding"),
+                detail=str(finding.get("detail") or ""),
+                hosts=[str(h) for h in (finding.get("hosts") or [])],
+                kind="hunt",
+                hunt_id=hunt_id,
+                finding_ordinal=ordinal,
+                focus_origin="hunt_finding",
+                is_synth_eval=is_synth_eval,
+                subject=subject,
+            )
+    except finding_promotion.PromotionRefused as exc:
+        # No cited document resolves on the grid: the finding can never run.
+        # A manager that did not start the run can start it on a later sweep.
+        return _RETRY_LATER if exc.status == 503 else exc.reason
+    except LookupError:
+        return "hunt_not_found"
+    except Exception as exc:
+        _LOGGER.warning(
+            "auto-triage: the new run of finding %s of hunt %s did not start: %r. "
+            "The Oracle retry queue tries again on the next sweep.",
+            ordinal,
+            hunt_id,
+            exc,
+        )
+        return _RETRY_LATER
+    if has_plan:
+        # The hunt row points at the new run. It kept the link to the run
+        # that this one replaces.
+        await hunt_findings.record_link(
+            state,
+            hunt_id,
+            ordinal,
+            hunt_svc.LINK_INVESTIGATING,
+            investigation_id=inv_id,
+            origin=hunt_svc.ORIGIN_OPENED,
+        )
+    return _RETRY_STARTED
+
+
+async def _alert_states(state: Any, alert_ids: list[str]) -> dict[str, str] | None:
+    """What the grid says of each alert: ``open``, ``closed`` or ``missing``.
+
+    An alert is closed when the grid shows it as acknowledged or escalated:
+    the analyst worked it, in the console or in Security Onion. None when the
+    grid does not answer, so an unknown state is never a reason to drop.
+    """
+    if not alert_ids:
+        return {}
+    try:
+        lookup = await state.elastic.search(
+            state.settings.events_index_pattern,
+            {"ids": {"values": alert_ids}},
+            size=len(alert_ids),
+        )
+    except Exception:
+        _LOGGER.exception("auto-triage: the alert state of the Oracle retry queue was not read")
+        return None
+    states = dict.fromkeys(alert_ids, "missing")
+    for hit in lookup.hits:
+        source = hit.get("_source", {})
+        closed = get_dotted(source, "event.acknowledged") or get_dotted(source, "event.escalated")
+        states[str(hit.get("_id"))] = "closed" if closed else "open"
+    return states
+
+
+async def plan_oracle_retries(state: Any, *, planned: set[str]) -> list[Target]:
+    """The targets of the Oracle retry queue for this sweep. Never raises.
+
+    Reads the runs whose Oracle escalation failed and whose route pause is
+    over (:mod:`soc_ai.oracle.retry`). An alert becomes a target of the sweep,
+    unless the sweep planned that alert already. A finding starts its own run
+    through the investigation manager, because the sweep worker runs alerts.
+
+    One sweep starts :data:`soc_ai.oracle.retry.RETRY_PER_SWEEP` runs. The
+    count is of runs that start, so a subject that cannot start holds back no
+    other one. A subject that can never run leaves the queue with the reason:
+    the hunt of a finding is gone, the grid no longer holds the alert, or the
+    grid shows the alert as acknowledged or escalated.
+    """
+    maker = getattr(state, "db_sessionmaker", None)
+    if maker is None:
+        return []  # no store, so no queue
+    try:
+        pending = await oracle_retry.pending_escalations(maker, state.settings)
+    except Exception:
+        _LOGGER.exception("auto-triage: the Oracle retry queue could not be read")
+        return []
+    if not pending:
+        return []
+    alert_states = await _alert_states(state, [p.alert_es_id for p in pending if not p.is_finding])
+    targets: list[Target] = []
+    started = 0
+    for item in pending:
+        if started >= oracle_retry.RETRY_PER_SWEEP:
+            break
+        if item.is_finding:
+            what = f"finding {item.finding_ordinal} of hunt {item.hunt_id}"
+            outcome = await _start_finding_retry(state, item)
+        else:
+            what = f"alert {item.alert_es_id}"
+            alert_state = None if alert_states is None else alert_states.get(item.alert_es_id)
+            if alert_state is None or item.alert_es_id in planned:
+                outcome = _RETRY_LATER  # the grid did not answer, or the sweep runs it
+            elif alert_state == "closed":
+                outcome = "alert_closed"
+            elif alert_state == "missing":
+                outcome = "alert_not_found"
+            else:
+                outcome = _RETRY_STARTED
+                targets.append(
+                    Target(
+                        alert_es_id=item.alert_es_id,
+                        rule_name=item.rule_name,
+                        src_ip="",
+                        dst_ip="",
+                        oracle_retry_of=item.investigation_id,
+                    )
+                )
+        if outcome == _RETRY_LATER:
+            continue
+        if outcome != _RETRY_STARTED:
+            await oracle_retry.drop_from_queue(maker, item.investigation_id, outcome)
+            _LOGGER.info(
+                "auto-triage: run %s leaves the Oracle retry queue. The %s cannot run "
+                "again, reason %s.",
+                item.investigation_id,
+                what,
+                outcome,
+            )
+            continue
+        started += 1
+        _LOGGER.info(
+            "auto-triage: the Oracle did not answer run %s, error class %s. The pause "
+            "is over, so %s runs again. This subject has %d failed Oracle calls, and "
+            "the queue stops after %d.",
+            item.investigation_id,
+            item.error_class,
+            what,
+            item.failed_runs,
+            oracle_retry.retry_limit(item.error_class) + 1,
+        )
+    return targets
 
 
 def config_severity_band(settings: Any) -> tuple[str, ...]:
@@ -1415,13 +1855,25 @@ async def start_config_sweep(state: Any, *, started_by: str) -> int:
     launches a background :func:`run_auto_triage`. Returns the number of targets
     launched, or 0 if a sweep is already running / there is nothing to triage.
     While the pause of :mod:`soc_ai.webui.autotriage_health` is open it plans
-    nothing and returns 0.
+    nothing and returns 0. While the gateway pause is open it first tests the
+    gateway: a test that fails returns 0, and a test that passes closes the
+    pause. The targets of the Oracle retry queue join the planned targets
+    (:func:`plan_oracle_retries`).
     Used by the continuous scheduler loop; mirrors the ⚡ endpoint's config-band
     path.
     """
     status = get_status(state)
     if status.active:
         return 0
+    if status.health.gateway_paused:
+        # The gateway pause holds until a test of the gateway passes. The last
+        # real batch stands on the status, so nothing here resets it.
+        if not await _gateway_recovered(state):
+            return 0
+        # Read the slot again: a press can take it while the gateway test
+        # runs. A fresh read, because the type checker holds the first one.
+        if get_status(state).active:
+            return 0
     if status.health.is_paused():
         # The pause stops the scheduled runs only. The last real batch stands
         # on the status, so nothing here resets it.
@@ -1459,6 +1911,12 @@ async def start_config_sweep(state: Any, *, started_by: str) -> int:
         else:
             status.active = False
         return 0
+    # The Oracle retry queue: runs whose escalation the Oracle did not answer,
+    # now that the route pause is over. An alert joins the targets of this
+    # sweep. A finding starts its own run.
+    targets = targets + await plan_oracle_retries(
+        state, planned={str(getattr(t, "alert_es_id", "")) for t in targets}
+    )
     if not targets and not inherited_acks:
         status.reset(active=False, total=0, skipped=skipped, severities=band)
         status.finished_at = datetime.now(UTC).isoformat()

@@ -345,17 +345,18 @@ describe('the "?" menu', () => {
       'Tour soc-ai from the start',
       'Keyboard shortcuts',
       'Open the guide',
+      'Release notes',
     ]);
     await waitFor(() => expect(items[0]).toHaveFocus());
     fireEvent.keyDown(menu, { key: 'ArrowDown' });
     expect(items[1]).toHaveFocus();
     fireEvent.keyDown(menu, { key: 'ArrowUp' });
     fireEvent.keyDown(menu, { key: 'ArrowUp' });
-    expect(items[3]).toHaveFocus();
+    expect(items[4]).toHaveFocus();
     fireEvent.keyDown(menu, { key: 'Home' });
     expect(items[0]).toHaveFocus();
     fireEvent.keyDown(menu, { key: 'End' });
-    expect(items[3]).toHaveFocus();
+    expect(items[4]).toHaveFocus();
     fireEvent.keyDown(menu, { key: 'Escape' });
     expect(screen.queryByRole('menu')).toBeNull();
     expect(button).toHaveFocus();
@@ -368,8 +369,13 @@ describe('the "?" menu', () => {
     mount('/alerts');
     fireEvent.click(screen.getByRole('button', { name: 'Help' }));
     const guide = screen.getByRole('menuitem', { name: 'Open the guide' });
-    expect(guide.getAttribute('href')).toBe('/app/guide/');
+    expect(guide.getAttribute('href')).toBe('https://nuk3s.github.io/soc-ai/WEBUI_GUIDE/');
     expect(guide.getAttribute('target')).toBe('_blank');
+    // L4: the release notes are their own entry. The guide link opened the
+    // 1.5.0 release note on a 1.6.0 console (review 2026-11-12).
+    const notes = screen.getByRole('menuitem', { name: 'Release notes' });
+    expect(notes.getAttribute('target')).toBe('_blank');
+    expect(notes.getAttribute('href')).toMatch(/^https:\/\/nuk3s\.github\.io\/soc-ai\/(releases\/\d+\.\d+\.\d+\/|project\/changelog\/)$/);
     fireEvent.click(screen.getByRole('menuitem', { name: 'Keyboard shortcuts' }));
     expect(screen.getByTestId('shortcuts-open')).toBeInTheDocument();
     expect(screen.queryByRole('menu')).toBeNull();

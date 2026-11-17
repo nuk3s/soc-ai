@@ -86,7 +86,7 @@ describe('HostsSummary: Needs attention lists what it counts', () => {
     const card = screen.getByTestId('sum-attention');
     expect(card.textContent).toMatch(/34 out of date, 3 failed to build/);
     expect(card.getAttribute('title')).toBe(
-      '37 need attention: 34 out of date, 3 failed to build. Each number lists its machines.',
+      '37 host records to rebuild: 34 out of date, 3 failed to build. Each number lists its machines. The sweep rebuilds the records on its schedule.',
     );
     expect(screen.getByTestId('attention-all').textContent).toBe('37');
     expect(screen.getByTestId('attention-stale').getAttribute('href')).toBe('/hosts?health=stale&activity=all');
@@ -111,8 +111,19 @@ describe('HostsSummary: Needs attention lists what it counts', () => {
       '/hosts?health=broken&activity=all',
     );
     expect(screen.getByTestId('sum-attention').getAttribute('title')).toBe(
-      '9 need attention: 4 out of date, 2 failed to build, 3 never built. Each number lists its machines.',
+      '9 host records to rebuild: 4 out of date, 2 failed to build, 3 never built. Each number lists its machines. The sweep rebuilds the records on its schedule.',
     );
+  });
+
+  // L2: "NEEDS ATTENTION 1,258" in red was housekeeping. The tile is
+  // neutral at every count and names what it counts.
+  it('names the tile for the host records to rebuild, in a neutral tone', () => {
+    mount({ ...SUMMARY, needs_attention: 1258, out_of_date: 780, never_built: 478, build_failed: 2 });
+    const card = screen.getByTestId('sum-attention');
+    expect(card.textContent).toMatch(/Host records to rebuild/);
+    expect(card.textContent).not.toMatch(/Needs attention/i);
+    expect(card.textContent).toMatch(/780 out of date, 2 failed to build, 476 never built/);
+    expect(card.innerHTML).not.toMatch(/text-danger|text-warn/);
   });
 
   it('shows a part only when it counts a machine', () => {

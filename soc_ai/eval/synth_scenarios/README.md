@@ -60,6 +60,26 @@ provide that signal.
   actually computes (cv 1.89 vs 0.030), not on address class. A benign twin
   the instrument skips proves nothing about the instrument.
 
+## Nightly use
+
+`soc-ai eval-nightly` plants scenarios from this catalogue beside its real
+alerts. The setting `quality_nightly_synth_n` gives the count. The default is 1.
+
+- The pool is the easy tier with `ground_truth.verdict: true_positive` and a
+  triage target. A miss in this tier means the pipeline is broken, so a miss
+  raises the quality alarm.
+- A scenario is eligible only when the deployment has each input in its
+  `requires` list. The nightly does not plant a scenario that is not eligible,
+  and the snapshot states the reason. Declare `requires` for each input that
+  the scenario cannot plant: a reputation feed is a file on the soc-ai host.
+- The pick moves one place each day through the eligible scenarios. Each of
+  them runs one time before a scenario runs again.
+- The score is the verdict only. `confidence_min` does not apply. The confidence
+  of one run varies by more than the distance to that floor.
+- A new easy true positive joins the pool with no code change. Check that the
+  model returns a true positive for it on each of several runs before you add
+  it. A scenario that fails by chance raises a false alarm.
+
 ## File naming
 
 `{tier-letter}{number}-{shortname}.yaml`, e.g. `e1-emotet-feodo-c2.yaml`.
@@ -79,6 +99,10 @@ attack:                         # list[str]: MITRE ATT&CK technique IDs
   - T1573
 
 sigma_refs: []                  # list[str]: optional Sigma rule IDs
+
+requires:                       # list[dict]: optional. Inputs the deployment
+  - blocklist: feodo            #   must have loaded. A feed id, and the
+    ip: "162.243.103.246"       #   address that the feed must list.
 
 ground_truth:
   verdict: true_positive        # enum: true_positive | false_positive | needs_more_info

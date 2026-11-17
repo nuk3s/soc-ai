@@ -377,6 +377,15 @@ async def _edge_seq(elastic: ElasticClient, index: str, query: dict[str, Any], o
     return src.get("seq") if isinstance(src, dict) else None
 
 
+def _feed_boxed_page(checker: EpochStreamChecker, box: list[list[dict[str, Any]]]) -> None:
+    """Feed the one page in *box* to *checker*, and empty *box* first.
+
+    Runs in a worker thread. The work item that carries this call outlives the
+    call, so it must hold an empty box, never a page.
+    """
+    checker.feed_page(box.pop())
+
+
 async def _stream_epoch(
     elastic: ElasticClient,
     index: str,
@@ -419,11 +428,17 @@ async def _stream_epoch(
                 seqs += 1
                 lo_seq = seq if lo_seq is None else min(lo_seq, seq)
                 hi_seq = seq if hi_seq is None else max(hi_seq, seq)
-        await asyncio.to_thread(checker.feed_page, page)
+        # Hand the page over in a box the worker empties. A thread-pool work
+        # item keeps its arguments alive until its worker thread loops back for
+        # the next job, which can come after this loop has fetched the next
+        # page; a page passed as an argument was then held twice for a moment.
+        box = [page]
+        del page
+        await asyncio.to_thread(_feed_boxed_page, checker, box)
         n_hits = len(hits)
         cursor = hits[-1].get("sort") if hits else None
         # Drop the page before the next round trip: one page in memory, never two.
-        del page, hits
+        del hits
         if n_hits < size:
             break
         if not isinstance(cursor, list) or not cursor:

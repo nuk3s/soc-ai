@@ -6476,7 +6476,8 @@
     ],
     "field_reconciliation": "alert.event_action=allowed but verdict is true_positive — the firewall permitted the traffic, which is why escalation is needed (the host is actively connected to C2 infrastructure and was not blocked). The SNI 'cdn-fronted-host.example.com' uses the reserved 'example.com' suffix (RFC 2606), strongly suggesting the data was sanitized/anonymized at the sensor; the real SNI is not available for reputation lookup.",
     "validator_note": null,
-    "local_verdict": null
+    "local_verdict": null,
+    "impact": "succeeded"
    },
    "src_ip": "10.20.10.24",
    "dest_ip": "162.243.103.246",
@@ -8684,7 +8685,8 @@
     ],
     "field_reconciliation": null,
     "validator_note": null,
-    "local_verdict": null
+    "local_verdict": null,
+    "impact": "attempted"
    },
    "src_ip": "10.20.10.26",
    "dest_ip": "193.42.39.117",
@@ -10830,7 +10832,8 @@
     ],
     "field_reconciliation": null,
     "validator_note": null,
-    "local_verdict": null
+    "local_verdict": null,
+    "impact": "succeeded"
    },
    "src_ip": "10.20.0.50",
    "dest_ip": "10.20.0.20",
@@ -15410,11 +15413,11 @@
    "verdict": "true_positive",
    "confidence": 0.81,
    "rationale": null,
-   "summary": "bkp01 (10.20.0.25) uploaded 4.2 GB to 162.159.140.42 over 9 hours. The backup job of bkp01 writes to a different provider on a nightly schedule, and this upload ran outside it. it-admin-07 logged on to bkp01 over SSH 20 minutes before the upload, and that account runs no backup job. Data left the estate. Treat it as exfiltration.",
+   "summary": "bkp01 (10.20.0.25) uploaded 4.2 GB to 162.159.140.42 over 9 hours. The backup job of bkp01 writes to a different provider on a nightly schedule, and this upload ran outside it. it-admin-07 logged on to bkp01 over SSH 20 minutes before the upload, and that account runs no backup job. Data left the network. Treat it as exfiltration.",
    "report": {
     "verdict": "true_positive",
     "confidence": 0.81,
-    "summary": "bkp01 (10.20.0.25) uploaded 4.2 GB to 162.159.140.42 over 9 hours. The backup job of bkp01 writes to a different provider on a nightly schedule, and this upload ran outside it. it-admin-07 logged on to bkp01 over SSH 20 minutes before the upload, and that account runs no backup job. Data left the estate. Treat it as exfiltration.",
+    "summary": "bkp01 (10.20.0.25) uploaded 4.2 GB to 162.159.140.42 over 9 hours. The backup job of bkp01 writes to a different provider on a nightly schedule, and this upload ran outside it. it-admin-07 logged on to bkp01 over SSH 20 minutes before the upload, and that account runs no backup job. Data left the network. Treat it as exfiltration.",
     "citations": [
      "tool t_query_events_oql returned 1 hits",
      "tool t_query_events_oql returned 3 hits"
@@ -15427,7 +15430,7 @@
        "case_title": "Upload of 4.2 GB from bkp01 to unknown cloud storage",
        "case_description": "bkp01 uploaded 4.2 GB to a bucket nobody owns, after a logon by it-admin-07. Join this case to the PsExec case."
       },
-      "rationale": "Data left the estate through an account the attacker holds."
+      "rationale": "Data left the network through an account the attacker holds."
      },
      {
       "tool_name": "add_case_comment",
@@ -15636,7 +15639,7 @@
        "it-admin-07 logged on to bkp01 before the upload (tool t_query_events_oql)"
       ],
       "tentative_verdict": "true_positive",
-      "tentative_summary": "bkp01 (10.20.0.25) uploaded 4.2 GB to 162.159.140.42 over 9 hours. The backup job of bkp01 writes to a different provider on a nightly schedule, and this upload ran outside it. it-admin-07 logged on to bkp01 over SSH 20 minutes before the upload, and that account runs no backup job. Data left the estate. Treat it as exfiltration."
+      "tentative_summary": "bkp01 (10.20.0.25) uploaded 4.2 GB to 162.159.140.42 over 9 hours. The backup job of bkp01 writes to a different provider on a nightly schedule, and this upload ran outside it. it-admin-07 logged on to bkp01 over SSH 20 minutes before the upload, and that account runs no backup job. Data left the network. Treat it as exfiltration."
      }
     },
     {
@@ -15679,7 +15682,7 @@
      "payload": {
       "verdict": "true_positive",
       "confidence": 0.81,
-      "summary": "bkp01 (10.20.0.25) uploaded 4.2 GB to 162.159.140.42 over 9 hours. The backup job of bkp01 writes to a different provider on a nightly schedule, and this upload ran outside it. it-admin-07 logged on to bkp01 over SSH 20 minutes before the upload, and that account runs no backup job. Data left the estate. Treat it as exfiltration.",
+      "summary": "bkp01 (10.20.0.25) uploaded 4.2 GB to 162.159.140.42 over 9 hours. The backup job of bkp01 writes to a different provider on a nightly schedule, and this upload ran outside it. it-admin-07 logged on to bkp01 over SSH 20 minutes before the upload, and that account runs no backup job. Data left the network. Treat it as exfiltration.",
       "citations": [
        "tool t_query_events_oql returned 1 hits",
        "tool t_query_events_oql returned 3 hits"
@@ -15692,7 +15695,7 @@
          "case_title": "Upload of 4.2 GB from bkp01 to unknown cloud storage",
          "case_description": "bkp01 uploaded 4.2 GB to a bucket nobody owns, after a logon by it-admin-07. Join this case to the PsExec case."
         },
-        "rationale": "Data left the estate through an account the attacker holds."
+        "rationale": "Data left the network through an account the attacker holds."
        },
        {
         "tool_name": "add_case_comment",
@@ -18415,7 +18418,7 @@
    "objective_hash": "6fa89fc2b7eac29a143c74d1308faaac",
    "kind": "lead",
    "status": "complete",
-   "narrative": "ws-sales-04 beacons to 162.243.103.246 every 300 seconds and sends Emotet check-ins to the same address. No other host of the estate talks to it.",
+   "narrative": "ws-sales-04 beacons to 162.243.103.246 every 300 seconds and sends Emotet check-ins to the same address. No other internal host talks to it.",
    "report": {
     "findings": [
      {
@@ -18451,7 +18454,7 @@
      },
      {
       "title": "No other host talks to the address",
-      "detail": "No other host of the estate opened a connection to 162.243.103.246 in the last 7 days.",
+      "detail": "No other internal host opened a connection to 162.243.103.246 in the last 7 days.",
       "severity": "info",
       "category": "observation",
       "hosts": [],
@@ -18461,7 +18464,7 @@
       "mitre_techniques": []
      }
     ],
-    "narrative": "ws-sales-04 beacons to 162.243.103.246 every 300 seconds and sends Emotet check-ins to the same address. No other host of the estate talks to it.",
+    "narrative": "ws-sales-04 beacons to 162.243.103.246 every 300 seconds and sends Emotet check-ins to the same address. No other internal host talks to it.",
     "affected_hosts": [
      "ws-sales-04"
     ],
@@ -18571,7 +18574,7 @@
        },
        {
         "title": "No other host talks to the address",
-        "detail": "No other host of the estate opened a connection to 162.243.103.246 in the last 7 days.",
+        "detail": "No other internal host opened a connection to 162.243.103.246 in the last 7 days.",
         "severity": "info",
         "category": "observation",
         "hosts": [],
@@ -18581,7 +18584,7 @@
         "mitre_techniques": []
        }
       ],
-      "narrative": "ws-sales-04 beacons to 162.243.103.246 every 300 seconds and sends Emotet check-ins to the same address. No other host of the estate talks to it.",
+      "narrative": "ws-sales-04 beacons to 162.243.103.246 every 300 seconds and sends Emotet check-ins to the same address. No other internal host talks to it.",
       "affected_hosts": [
        "ws-sales-04"
       ],
@@ -18900,7 +18903,7 @@
    "objective_hash": "474e1e2dc8cf680d98ac2d1619d09991",
    "kind": "scheduled",
    "status": "complete",
-   "narrative": "No internal host beacons to a rare external address in the last 24 hours. Two update services poll at a fixed cadence, and both are on the estate baseline.",
+   "narrative": "No internal host beacons to a rare external address in the last 24 hours. Two update services poll at a fixed cadence, and both are on the network baseline.",
    "report": {
     "findings": [
      {
@@ -18917,7 +18920,7 @@
       "mitre_techniques": []
      }
     ],
-    "narrative": "No internal host beacons to a rare external address in the last 24 hours. Two update services poll at a fixed cadence, and both are on the estate baseline.",
+    "narrative": "No internal host beacons to a rare external address in the last 24 hours. Two update services poll at a fixed cadence, and both are on the network baseline.",
     "affected_hosts": [
      "prn-02"
     ],
@@ -18982,7 +18985,7 @@
         "mitre_techniques": []
        }
       ],
-      "narrative": "No internal host beacons to a rare external address in the last 24 hours. Two update services poll at a fixed cadence, and both are on the estate baseline.",
+      "narrative": "No internal host beacons to a rare external address in the last 24 hours. Two update services poll at a fixed cadence, and both are on the network baseline.",
       "affected_hosts": [
        "prn-02"
       ],
@@ -21104,7 +21107,7 @@
     "inferred_evidence": {
      "behaviour": {
       "strings": [
-       "responds on tcp/88, tcp/389, tcp/445 and udp/53 to every workstation of the estate"
+       "responds on tcp/88, tcp/389, tcp/445 and udp/53 to every internal workstation"
       ],
       "value": "domain_controller",
       "strength": "strong",
@@ -21199,7 +21202,7 @@
     "inferred_evidence": {
      "behaviour": {
       "strings": [
-       "responds on tcp/88, tcp/389, tcp/445 and udp/53 to every workstation of the estate"
+       "responds on tcp/88, tcp/389, tcp/445 and udp/53 to every internal workstation"
       ],
       "value": "udp/53, tcp/88, tcp/389, tcp/445",
       "strength": "strong",
@@ -21374,7 +21377,7 @@
     "inferred_evidence": {
      "behaviour": {
       "strings": [
-       "responds on tcp/88, tcp/389 and udp/53. The second resolver of the estate"
+       "responds on tcp/88, tcp/389 and udp/53. The second resolver of the network"
       ],
       "value": "domain_controller",
       "strength": "strong",
@@ -21463,7 +21466,7 @@
     "inferred_evidence": {
      "behaviour": {
       "strings": [
-       "responds on tcp/88, tcp/389 and udp/53. The second resolver of the estate"
+       "responds on tcp/88, tcp/389 and udp/53. The second resolver of the network"
       ],
       "value": "udp/53, tcp/88, tcp/389",
       "strength": "strong",
@@ -22823,7 +22826,7 @@
     "inferred_evidence": {
      "behaviour": {
       "strings": [
-       "opens connections to every address of the estate on many ports"
+       "opens connections to every internal address on many ports"
       ],
       "value": "server",
       "strength": "strong",
@@ -22900,7 +22903,7 @@
     "inferred_evidence": {
      "behaviour": {
       "strings": [
-       "opens connections to every address of the estate on many ports"
+       "opens connections to every internal address on many ports"
       ],
       "value": "tcp/8834",
       "strength": "strong",

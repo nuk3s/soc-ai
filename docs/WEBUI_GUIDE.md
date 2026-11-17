@@ -18,28 +18,34 @@ operator screens.
 
 ## The flow
 
-![How this flows: the alert path and the sweep path](img/hunting-flow.svg)
+![How this flows: from the grid to your decision](img/hunting-flow.svg)
 
-Work comes in on two paths. Each path ends in a verdict and an action in Security Onion.
+Work comes in on two paths. Both paths end in an investigation and a verdict. A confirmed attack
+starts or joins a campaign, and you decide once on the campaign in Needs you.
 
-- **The alert path:** Security Onion raises an alert. soc-ai triages the alert to a verdict.
-  Auto-Investigate starts the triage, or you press **Investigate** on the Alerts screen. The chain
-  is Alert, Investigation, Verdict, Action in Security Onion.
-- **The sweep path:** a sweep runs every hour. An analytic hit writes an observation. Observations
-  on one entity form a lead. A new lead starts its own hunt. The hunt investigates what it finds
-  and brings back the verdicts. The chain is Hit, Lead, Hunt, Investigations, Verdicts, Actions.
+- **The alert path:** Security Onion raises an alert. soc-ai investigates one alert of each group,
+  and a group is one rule between two addresses. The other alerts of the group take its verdict
+  for 7 days. Auto-Investigate starts the investigation, or you press **Investigate** on the
+  Alerts screen. The chain is Alert, Investigation, Verdict, Campaign.
+- **The sweep path:** when the operator turns the sweep on, it reads the grid every hour. An
+  analytic hit writes an observation. Observations on one entity form a lead. soc-ai hunts each
+  new lead and investigates each threat finding that names an entity, unless a campaign holds
+  the finding. A lead of a campaign waits on the campaign, and a change of the campaign starts
+  at most one hunt in 24 hours. The chain is Hit, Lead, Hunt, Investigation, Verdict, Campaign.
 
-Needs you is the single queue for your decisions. It holds the leads that wait on a decision, the unread shadow hits,
-the alert groups with no verdict, the verdicts that need more info and the recommended actions
-that wait for you. You decide on one object at a time: agree, override, acknowledge, escalate,
-dismiss or open an investigation. Your actions go to Security Onion. You tune an analytic with
-approve, reject and draft.
+Needs you is the single queue for your decisions. It holds the campaigns that wait on your
+decision, the investigations that wait on your decision, the leads that wait on a decision and the
+alert groups with no verdict. An investigation waits when its verdict needs more info or when a
+recommended action waits for you. An unread shadow hit is review work. The console counts the unread shadow hits
+apart, in a neutral color. You decide once on a campaign: open one Security Onion case for the whole
+activity, close it with a reason, or record its activity as authorized. On an investigation you override the verdict or approve a recommended
+action. Your actions go to Security Onion. You tune an analytic with approve, reject and draft.
 
 Two controls start the next step:
 
-- **Hunt this lead:** a hunt is one run against one objective. It returns findings and a
+- **Hunt this lead:** a hunt is one search of the grid for one objective. It returns findings and a
   narrative. The hunt itself writes no verdict and takes no action. soc-ai investigates each
-  finding and brings back the verdicts. A hunt is complete only after soc-ai
+  threat finding that names an entity and brings back the verdicts. A hunt is complete only after soc-ai
   investigates its findings.
 - **Open an investigation:** an investigation ends in a verdict, recommended actions and an audit
   record. Its actions go to Security Onion. The hunt page offers this control on a finding with no
@@ -136,23 +142,42 @@ The bell in the top bar holds the notifications. Its "View all notifications"
 link opens the Notifications page at `/app/notifications`. The sidebar has no
 entry for that page.
 
-The bell badge states the Needs-you count. The "Needs you" block lists each part of
+The bell badge states the Needs-you count: the decisions that wait on you. The
+badge is red only when a decision waits. The "Needs you" block lists each part of
 that count, with its scope and a link to its list. The block is at the top of
-the bell panel and of the Notifications page. The parts add up to the badge. The
+the bell panel and of the Notifications page. The parts add up to the badge. A
+neutral line under the parts states the unread shadow hits, for example "236
+shadow hits to review", with its own link. The badge does not count them. The
 events follow the block. "Show more" loads 20 more events.
+
+The events are in the order of urgency: a dependency that is down, confirmed
+threats, decisions that wait, failures, notices, runs in progress and closures.
+A dependency is the grid, the model gateway or the Security Onion API. When one
+is down, the other events are not reliable. A notice older than 24 hours
+goes to the end. Inside each group the newest event comes first. Two or more
+false positive closures show as one row, for example "58 false positives closed
+in the last 24 hours". That row opens the list of those runs. The same failure
+on the same subject shows as one row with a count. On the Notifications page,
+the group of the most urgent event comes first.
 
 "Dismiss all" hides every event up to the moment the list loaded. It also
 marks every unread shadow hit up to that moment as read, and the audit trail
 records it. Leads, alert groups with no verdict, verdicts that need more info and
 recommended actions are decisions. Dismiss all does not touch them.
 
-The Alerts, Investigations and Hunts entries carry a badge for the work that
-waits on you there. The badges are parts of the Needs-you count. The
-Needs-you tile on the Dashboard and the bell state the same total.
+The Alerts, Investigations and Hunts entries carry a badge for the decisions that
+wait on you there. Each badge is a link to the list it counts. The Investigations
+badge counts investigations, and it opens the Needs you view of the list. The
+line of the investigations on the tile and in the bell states the same count.
+The Hunts entry also carries a grey badge for the
+unread shadow hits. The Needs-you tile on the Dashboard and the bell state the
+same decision count.
 
 The help button "?" in the top bar opens the help menu. The menu starts a tour,
 opens the keyboard shortcuts and opens this guide in a new tab. See [Tours](#tours).
 The command palette also holds the keyboard shortcuts. Press ⌘K and type "shortcuts".
+The palette lists hosts and investigations before hunts. A hunt result shows the
+title of the hunt and its outcome on one line each.
 
 The Ask soc-ai button at the right end of the top bar opens the chat. See
 [Ask soc-ai](#ask-soc-ai).
@@ -197,7 +222,8 @@ The "?" button in the top bar opens the help menu:
 | Tour this page | Starts the tour of the current page. |
 | Tour soc-ai from the start | Starts the welcome tour again. The page tours keep their state. Use Tour this page for the tour of a page. |
 | Keyboard shortcuts | Opens the keyboard shortcut sheet. |
-| Open the guide | Opens this guide in a new tab. |
+| Open the guide | Opens this guide on the docs site in a new tab. |
+| Release notes | Opens the release notes of the running version on the docs site in a new tab. |
 | Turn on tours | Shows when the tours are off. It turns them on again. |
 
 ### Turn off tours
@@ -331,24 +357,30 @@ chat on either one.
 
 ### Needs you
 
-The first tile states the work that waits on you. It has one line for each
+The first tile states the decisions that wait on you. It has one line for each
 part, and each line opens the list that holds that work:
 
+- the campaigns that wait on your decision, at any age,
+- the investigations that wait on your decision, at any age: a verdict that
+  needs more info or a recommended action that waits for you,
 - the leads that wait on a decision,
-- the unread shadow hits,
-- the alert groups with no verdict in the last 7 days,
-- the verdicts that need more info in the last 30 days,
-- the recommended actions that wait for you on the true positives of the
-  last 30 days.
+- the alert groups with no verdict in the last 7 days.
 
-The sidebar badges and the bell state the same total. A part that soc-ai cannot
-read shows its own line with the reason, and the total then reads "11+". The
-tile says "Nothing needs you" only when it read every part and each part is
+Each decision counts once. An investigation with two recommended actions is one
+decision. The lines add up to the number of the tile. The bell, the top bar and
+the heading of the Needs you page state the same count. A part that soc-ai
+cannot read shows its own line with the reason, and the total then reads "11+".
+The tile says "Nothing needs you" only when it read every part and each part is
 zero.
 
-The recommended actions line opens the Investigations list with the filter
-**Action waits for you**. Each row shows its waiting actions: the alert or the
-case, and the reason of the model. Each action has two buttons on the row. The
+A neutral line under the parts states the unread shadow hits: "236 shadow hits
+to review". The line opens the unread hits on the Hunts page. The tile number
+does not count them. A shadow hit is review work, and Dismiss all reads every
+hit in one press.
+
+The investigations line opens the Investigations list in the view **Needs you**.
+A row with a recommended action that waits shows its waiting actions: the alert
+or the case, and the reason of the model. Each action has two buttons on the row. The
 first button names the write, as on the action card: **Escalate to case**,
 **Acknowledge** or **Add comment**. The second button is **Dismiss**. You do not
 need to open the investigation. The write button asks first and states what
@@ -360,12 +392,27 @@ Then press **Dismiss actions** in the selection bar. One confirm covers the
 press. The result line names each row and offers **Undo** for the whole press.
 A row that failed stays selected.
 
+**The clear of old items.** Needs you has no time limit, so an investigation
+stays until a person decides. The operator can clear the old investigations
+from the command line. Use `soc-ai needs-you list` to see each investigation
+that waits, with its event date. Then use `soc-ai needs-you clear --before
+2026-10-01 --reason "Old work"`. The command takes each listed investigation
+with an event before the date. `--only true_positive` or `--only
+needs_more_info` takes one verdict. `--dry-run` prints the investigations and
+writes nothing. Without `--yes`, the command asks for a typed "yes". Each clear
+writes the audit record `needs_you_cleared` first, and a failed record stops
+the clear. A clear dismisses the waiting actions of a true positive. A clear
+changes no verdict, and it is no override. The page of the investigation states
+"Cleared from Needs you on {date} by {user}: {reason}." Use `soc-ai needs-you
+restore <id>` to undo the clear of one investigation.
+
 An action counts only when soc-ai can execute it. One rule decides for the
 action card, the list row, the count and the write to Security Onion. The
 count, the badges, the bell and the list leave out an action in these cases:
 
 - The run is a backtest replay, or a newer run replaced it.
-- The run is a promoted finding or a promoted lead.
+- The run is a promoted lead.
+- The run is a promoted finding, and the action is an acknowledge or a comment.
 - A promoted finding or lead uses the document of the run as its anchor, and the
   document is not a Security Onion alert.
 - A promoted finding or lead uses the document of the run as its anchor, and the
@@ -386,16 +433,27 @@ Onion alert that a promotion uses as its anchor keeps its actions. For a
 document outside the feed, the card reads "A promoted lead uses this document
 as its anchor. The document is not a Security Onion alert." When the grid does
 not answer, the card reads "soc-ai could not read the anchor document. Try
-again when the grid answers." The run of a promoted finding or lead writes
-nothing to Security Onion in every case.
+again when the grid answers." The run of a promoted lead writes nothing to
+Security Onion in every case.
+
+The run of a promoted finding has one write. **Escalate to case** opens one
+Security Onion case from the finding. The title of the case is the title of
+the finding. The description holds the headline of the run, the hosts and the
+documents that the finding cites. soc-ai attaches at most 25 cited alerts, and
+Security Onion marks each attached alert escalated and acknowledged. soc-ai
+skips a cited alert in these cases: the alert has a decision in Security
+Onion, the alert is already on a case, or the alert is not on a host of the
+finding. The card states the two counts before the press. A finding that
+cites no alert gets a case with no alert. One finding gets one case. A press
+on another action or on a later run of the finding opens no second case.
 
 An escalate card names each Security Onion case that the alert is already on,
 with a link to the case. A press then opens no second case. soc-ai records the
 action as done.
 
-Under the tile one sentence states the flow: "soc-ai investigates alerts and runs hunts. You
-make each decision in Needs you. soc-ai sends your actions to Security Onion." The **How this
-flows** link after it opens the chart on the Hunts page.
+Under the tile one sentence states the flow: "soc-ai investigates alerts, hunts leads and joins
+confirmed attacks into campaigns. You decide in Needs you, and soc-ai writes your actions to
+Security Onion." The **How this flows** link after it opens the chart on the Hunts page.
 
 The true positives tile counts the investigations with a true positive verdict
 in the Dashboard window. The Investigations list counts the same runs with the
@@ -465,6 +523,17 @@ If a point raises an alarm, the card prints the path to the eval bundle of that 
 directory holds the oracle critiques. The critiques are the only evidence for or
 against the alarm. The card prints a file path on the soc-ai host. Read the
 file with `docker exec soc-ai cat <path>/report.md`.
+
+Each run also plants one synthetic true positive. The line with the last attempt
+states the result: the model caught it, the model missed it, or the run did not
+measure it. A miss raises the alarm and the alarm names the scenario. The alarm
+also starts when the Oracle and the model state the same verdict for too few
+alerts across the last 7 runs. The agreement rate on this card does not start
+that alarm. See [DOCKER.md](DOCKER.md#alarm-rules) for each rule.
+
+soc-ai does not count a run with no grade as an error. If the Oracle grades no
+run of a batch, the line with the last attempt states "Agreement is not measured"
+and gives the cause. The usual cause is a used Oracle quota.
 
 ### Dashboard layout
 
@@ -542,7 +611,11 @@ by rule and shows the newest first.
   fallback. `auto_triage_retry_limit` sets the number of short retries. Five failed runs with the same
   error in two hours open an alarm in the bell. Each hour, one failed alert runs again as a
   test. A verdict on one of the failed alerts closes the alarm. Five failed runs in a row with
-  no verdict pause continuous Auto-Investigate for 15 to 60 minutes. Bulk Investigate runs
+  no verdict pause continuous Auto-Investigate for 15 to 60 minutes. Two gateway connection
+  errors in sequence also pause it. That pause has no end time. soc-ai tests the model gateway
+  before each scheduled run. The pause ends when the gateway is reachable: a test gets an
+  answer that is no connection failure, or a run reaches a verdict. The alerts that failed on
+  the gateway then run again at once. Bulk Investigate runs
   during a pause. Bulk Investigate of selected alerts and Re-run ignore the retry limit.
 
 ## Investigations
@@ -552,6 +625,34 @@ by rule and shows the newest first.
 The Investigations screen is at `/app/investigations`. It lists every past investigation and every running one, with a
 permalink on each. A row carries the verdict, the rule, the time and the person
 who started it. Use the list to review history and to find an earlier verdict.
+
+**Event time:** the time of an investigation is the time of the event that it
+judges. The When column states the time of the event. A second line reads
+"investigated 2h ago" when soc-ai investigated the event more than one hour
+later. The hover text states both times in UTC. The window and the order of the
+list read the time of the event. The Dashboard tile **True positives** and the
+**Confirmed threats** panel read it too. Thus an investigation of today on an
+event of 10 days ago is not in the last 24 hours. Needs you has no window, so it
+still lists that investigation. The bell states a change of the campaign that
+holds it. A
+bell row for a verdict on an event older than 24 hours states the date of the
+event. The **Failed** view reads the time when soc-ai started the investigation,
+because a pipeline error is a fact about soc-ai.
+
+**Preset views:** the chips at the top of the list open a view in one press. The
+address names the active view, for example `?view=needs_you`, so a link opens it.
+
+- **Needs you:** the investigations that need more info or have a recommended
+  action that waits for you, at any age. The chip and the badge on the
+  Investigations entry state the same number. The badge opens this view.
+- **True positives:** the true positives in the window on screen. A row that
+  states an impact comes first, and the worst impact leads.
+- **Failed:** the runs with no usable verdict that need a retry, started in the
+  last 30 days. The pipeline error tile on the Dashboard counts the same runs.
+- **All:** every investigation in the window on screen.
+
+A view sets the filters it owns and clears the other filters. A filter change
+after the press narrows the view.
 
 **Stale-run reaping:** soc-ai cleans up an investigation that a crash, a restart
 or a network drop left in `running`. At startup it marks every orphaned `running`
@@ -606,10 +707,10 @@ The Hunts screen is at `/app/hunts`. It holds the hunting pipeline in order, top
 strip, Analytic hits, Leads, Hunts and the New hunt drawer. A second tab,
 Analytics, holds the analytic catalog and the Lead quality block.
 
-The Needs-you strip counts the two things that wait on you: the unread shadow
-hits, and the leads that need a decision. Each link jumps to the block that holds
-them, with the filter set. The sidebar badge on the Hunts item shows the same
-count.
+The Needs-you strip counts the leads that need a decision. A neutral line beside
+the count states the unread shadow hits to review. Each link jumps to the block
+that holds them, with the filter set. The sidebar badges on the Hunts item show
+the same two numbers.
 
 A lead settles when its hunt finishes. A hunt that found no threat closes the
 lead. The lead then shows under Closed as "Closed. The hunt found no threat." with
@@ -648,8 +749,14 @@ and a reload keep them. Click a row to open the machine.
 
 Six cards for the whole network are above the table, with a role bar under them.
 Each card is a link to the list filter it counts: Machines, With an agent,
-Without an agent, New in 7 days, Needs attention and Conflicts. The filters never
-change the cards.
+Without an agent, New in 7 days, Host records to rebuild and Conflicts. The filters
+never change the cards. Host records to rebuild counts the records that are out of
+date, failed to build or were never built. The sweep rebuilds them on its schedule.
+
+The Findings column gives two counts for each machine. "Confirmed" counts the true
+positive verdicts on the machine in the last 7 days. "Open leads" counts the leads
+that name the machine and are open or hunting now. Sort on the column to put the
+machines with confirmed threats first.
 
 Under the cards, a line gives the age of the numbers, for example "Last swept 4h ago". A
 note appears while automatic sweeps are off. It gives the time of the state that the
@@ -785,7 +892,7 @@ a stronger rule placed.
 | Primary address | The agent address with the most events, else the newest lease, else the only address. |
 | Name | A declaration, else the agent `host.name`, else the newest lease hostname, else the strong DNS name of the primary address. The machine keeps every name with its source. |
 | Events | The sum over the addresses of the machine. An address that only its agent reports counts the agent's own documents for that address. |
-| Last seen | The newest event on any address of the machine. |
+| Last seen | The newest event on any address of the machine. The list reads the grid once for the page. When the grid does not answer, the cell gives the newest event that the last sweep saw. |
 
 An agent's own name and a DHCP lease hostname are the names that the machine gives
 itself. The sweep keeps them when they are a public top-level domain, such as "nexus".
@@ -1167,6 +1274,27 @@ Diagnostics lists every doctor row. The header has one chip per grade with rows:
 FAIL, WARN and INFO, in that order. A chip shows the rows of its grade only. Press
 it again to show every row. **Verify audit chain** reads the audit records of the
 last 7 days, and the result line names that window.
+
+The FAIL rows come first, then the WARN rows, then the other rows in the doctor
+order. Each FAIL and WARN row has a control for its fix. **Change password** opens
+the password dialog. **Open the setting** opens the setting that the hint names.
+**Copy the command** copies the command of the hint. **Read** opens the doc
+section on the docs site.
+
+### Quality
+
+The Quality section opens with the result of the last evaluation. It states when
+the evaluation ran and how many runs completed. It states verdict agreement as
+"N of M" alerts, and whether the model found the synthetic true positive. When
+the Oracle graded no run, it states "Agreement is not measured" and the cause.
+
+### Detection tuning
+
+One line above the nominated rules states the next step. It counts the mute
+suggestions with no true positive and their share of the alert events of the
+window. **Mute these rules** asks for a confirmation. It then mutes each rule. A
+mute hides the alerts of a rule from the default feed. It never changes Security
+Onion.
 
 ### Settings search
 

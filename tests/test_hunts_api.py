@@ -2528,12 +2528,12 @@ def test_previous_completed_run_none_when_first_run(
     assert asyncio.run(_go()) is None
 
 
-def test_get_hunt_diff_new_persisting_resolved(
+def test_get_hunt_diff_new_persisting_not_reported(
     client: TestClient, settings_kratos: Settings
 ) -> None:
     """End-to-end via GET /hunts/{id}: seed a prior complete hunt (findings A,B,C)
     + a later complete hunt same objective (findings A,B,D) → diff = 1 new (D) ·
-    2 persisting (A,B) · 1 resolved (C)."""
+    2 persisting (A,B) · 1 not reported this run (C)."""
     from datetime import timedelta
 
     t0 = datetime(2026, 7, 7, 12, 0, 0)
@@ -2565,7 +2565,7 @@ def test_get_hunt_diff_new_persisting_resolved(
     assert diff is not None
     assert sorted(e["title"] for e in diff["new"]) == ["Finding D"]
     assert sorted(e["title"] for e in diff["persisting"]) == ["Finding A", "Finding B"]
-    assert sorted(e["title"] for e in diff["resolved"]) == ["Finding C"]
+    assert sorted(e["title"] for e in diff["notReported"]) == ["Finding C"]
     # the baseline run is referenced (for the "vs run from {ago}" label)
     assert diff["previousHuntId"]
     assert diff["previousTs"]
@@ -2668,7 +2668,7 @@ def test_get_hunt_diff_fuzzy_title_and_hosts_identity(
     diff = client.get(f"/api/v1/hunts/{current}").json()["diff"]
     assert len(diff["persisting"]) == 1
     assert diff["new"] == []
-    assert diff["resolved"] == []
+    assert diff["notReported"] == []
 
 
 def test_hunt_recorded_run_leads_with_hunt_created(settings_kratos: Settings) -> None:
@@ -2796,10 +2796,13 @@ def test_an_errored_hunt_stores_why_it_failed(settings_kratos: Settings) -> None
 
     _hunt_id, status, narrative = asyncio.run(_go())
     assert status == "error"
-    # A known shape reads as the plain sentence. This one is not known, so it
-    # names the exception and keeps the message.
-    assert narrative.startswith("The hunt failed: RuntimeError.")
-    assert "refused the connection" in narrative
+    # A known shape reads as the plain sentence. This one is not known, so the
+    # narrative says so in plain words. The raw error stays in the error event
+    # of the hunt (tests/test_hunt_degraded_run.py), behind a toggle on the page.
+    assert narrative == (
+        "The hunt stopped on an error. The technical detail holds the text of the error."
+    )
+    assert "RuntimeError" not in narrative
     asyncio.run(engine.dispose())  # type: ignore[union-attr]
 
 

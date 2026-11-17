@@ -22,13 +22,14 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from soc_ai.config import Settings
 from soc_ai.eval.harness import EvalResult
 from soc_ai.eval.harness import run as harness_run
+from soc_ai.eval.quality import NOT_RUN_ERROR
 from soc_ai.eval.sampler import DEFAULT_DIVERSITY_KEYS, sample_diverse_alerts
-from soc_ai.eval.synth_ingest import IngestResult, ingest_scenarios
+from soc_ai.eval.synth_ingest import IngestResult, ingest_scenarios, write_ledger
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.triage_models import is_pipeline_fallback
 
@@ -59,6 +60,14 @@ class IndexRow:
     verdict: str | None = None
     confidence: float | None = None
     agreement: str | None = None  # "yes" | "no" | "partial" | "unknown"
+    # The verdict the ORACLE reaches for the alert, from the ORACLE_VERDICT
+    # line of its critique. None when the critique states none, which includes
+    # every critique written before the line was asked for. ``agreement`` above
+    # is a different thing: it grades the verdict, the confidence and the
+    # reasoning together, so a correct verdict with a loose report is
+    # ``partial``. Whether the two verdicts are the same class is what this
+    # field makes answerable.
+    oracle_verdict: str | None = None
     retask_count: int | None = None
     investigation_ms: int | None = None
     claude_ms: int | None = None
@@ -92,6 +101,31 @@ class IndexRow:
     synth_scenario_id: str | None = None
     synth_plant_id: str | None = None
     synth_repeat: int = 0
+    # The planted ground truth of a synthetic row, None for a real alert. The
+    # nightly reads it to decide whether a row could have been MISSED: only a
+    # planted true positive can, and a benign twin that closes benign is the
+    # correct answer. The synth-stratum scorer joins on the catalogue and does
+    # not need it, so a row from before this field scores exactly as it did.
+    synth_expected_verdict: str | None = None
+    # The grade request failed and the caller chose to keep the investigation
+    # (``harness.run(tolerate_grader_failure=True)``, which only the nightly
+    # passes). ``error`` stays None on such a row: the triage completed, the
+    # verdict above is real, and counting it as an errored run is how three
+    # nights lost to the Oracle quota came to be recorded as triage failures.
+    # ``grader_error_kind`` is one of the harness GRADER_* constants.
+    grader_error: str | None = None
+    grader_error_kind: str | None = None
+    # Which model served the run: ``{"model": ...}`` entries with a ``backend``
+    # key when the gateway named the engine. Empty when the run recorded
+    # nothing. See :func:`soc_ai.eval.harness.served_models_from_events`.
+    served: list[dict[str, str]] = field(default_factory=list)
+    # Why the RUN failed, as the run recorded it: the exception class and its
+    # text. Set from the report of a pipeline fallback, or from the last
+    # ``error`` event of a run that left no report. ``error`` above is a
+    # different thing: it is set when the harness itself raised or timed out.
+    # The nightly reads these two to name the class of a run with no result.
+    run_error_type: str | None = None
+    run_error: str | None = None
 
 
 @dataclass
@@ -128,6 +162,21 @@ class BatchConfig:
     # infra wobble lands on one repeat of each scenario instead of every
     # repeat of one. Real-alert sampling (``n``) is unaffected.
     synth_repeats: int = 1
+    # True when the scenarios ride along with a batch of real alerts and the
+    # real alerts are the point (the nightly). Two things change. A plant that
+    # fails does not fail the batch: the real alerts still run and the summary
+    # carries the cause in ``synth_error``. And nothing is planted when the
+    # sampler found no real alert, so a quiet grid keeps its "no eligible
+    # alerts" outcome and its grid stays untouched. False (the default) keeps
+    # the hard failure: ``validate-batch --synth-set`` asked for the scenarios,
+    # and a benchmark that ran without them would report a recall over nothing.
+    synth_optional: bool = False
+    # A suffix for every plant key of this batch (see
+    # ``synth_ingest.plant_id_for``). The nightly passes one per run, so a
+    # plant left on the grid by an earlier night, or by a manual
+    # ``validate-batch``, can never be read as evidence by tonight's run.
+    # None keeps the bare scenario id, the historical key.
+    synth_plant_tag: str | None = None
 
 
 @dataclass
@@ -141,6 +190,14 @@ class BatchSummary:
     n_error: int
     aborted_reason: str | None
     elapsed_s: int
+    # Only under ``BatchConfig.synth_optional``: why the plant failed, or None.
+    synth_error: str | None = None
+    # Only under ``BatchConfig.synth_optional``: the ``(index, id)`` of every
+    # document the plant wrote, including the ones a failed plant wrote before
+    # it failed. The caller removes exactly these, by id. The same list is in
+    # the batch directory (``synth_ingest.LEDGER_NAME``) from the moment the
+    # plant ends, so a batch that is killed leaves it behind.
+    synth_documents: tuple[tuple[str, str], ...] = ()
 
 
 # Type alias so tests can substitute stubs without monkey-patching.
@@ -221,6 +278,29 @@ def extract_agreement(response_md: str) -> str:
     ):
         return "yes"
     return "unknown"
+
+
+_ORACLE_VERDICT_RE = re.compile(
+    r"^[\s>*_`]*oracle_verdict[\s*_`]*:[\s*_`]*"
+    r"(true_positive|false_positive|needs_more_info|inconclusive)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def extract_oracle_verdict(response_md: str) -> str | None:
+    """The verdict the oracle states for the alert, or None when it states none.
+
+    Reads the machine-readable ``ORACLE_VERDICT:`` line the prompt asks for,
+    inside the ``## 1. Verdict`` section when there is one. Markdown emphasis
+    around the label or the value is tolerated. Nothing is inferred from prose:
+    a critique that names no verdict on that line gives None, and the caller
+    counts the run as not compared. A guess here would feed an alarm.
+    """
+    if not response_md:
+        return None
+    section = _VERDICT_SECTION_RE.search(response_md)
+    found = _ORACLE_VERDICT_RE.search(section.group(1) if section else response_md)
+    return found.group(1).lower() if found else None
 
 
 def read_retask_count(bundle_dir: Path) -> int:
@@ -360,6 +440,7 @@ async def _run_one(
             synth_scenario_id=synth_scenario_id,
             synth_plant_id=synth_plant_id,
             synth_repeat=synth_repeat,
+            synth_expected_verdict=expected_verdict,
         )
     except Exception as e:
         return IndexRow(
@@ -369,6 +450,7 @@ async def _run_one(
             synth_scenario_id=synth_scenario_id,
             synth_plant_id=synth_plant_id,
             synth_repeat=synth_repeat,
+            synth_expected_verdict=expected_verdict,
         )
 
     bundle_dir = result.bundle_dir
@@ -377,6 +459,15 @@ async def _run_one(
     retask_count = read_retask_count(bundle_dir)
     report = result.sanitized_report or {}
     usage = result.oracle_response.usage
+    # What the run recorded about its own failure. A fallback report names the
+    # exception that produced it; a run with no report has its last error event.
+    run_error_type = getattr(result, "run_error_type", None)
+    run_error = getattr(result, "run_error", None)
+    if is_pipeline_fallback(report):
+        resolution = report.get("resolution")
+        if isinstance(resolution, dict) and isinstance(resolution.get("error_type"), str):
+            run_error_type = resolution["error_type"]
+        run_error = run_error or (str(report.get("summary") or "")[:300] or None)
 
     return IndexRow(
         alert_id=alert_id,
@@ -384,6 +475,7 @@ async def _run_one(
         verdict=report.get("verdict"),
         confidence=report.get("confidence"),
         agreement=agreement,
+        oracle_verdict=extract_oracle_verdict(response_md),
         retask_count=retask_count,
         investigation_ms=result.investigation_elapsed_ms,
         claude_ms=result.oracle_response.elapsed_ms,
@@ -405,6 +497,14 @@ async def _run_one(
         synth_scenario_id=synth_scenario_id,
         synth_plant_id=synth_plant_id,
         synth_repeat=synth_repeat,
+        synth_expected_verdict=expected_verdict,
+        # getattr: a runner double may return a result built before these
+        # fields existed, and an absent field means "nothing to report".
+        grader_error=(str(getattr(result, "grader_error", None) or "")[:500] or None),
+        grader_error_kind=getattr(result, "grader_error_kind", None),
+        served=[dict(entry) for entry in (getattr(result, "served", None) or [])],
+        run_error_type=run_error_type,
+        run_error=run_error,
     )
 
 
@@ -481,15 +581,50 @@ async def run_batch(  # noqa: PLR0912, PLR0915 - one place that wires the whole 
     # tagging + per-run synth visibility.
     synth_id_to_plant: dict[str, str] = {}
     synth_id_to_repeat: dict[str, int] = {}
-    if cfg.synth_scenarios:
+    synth_error: str | None = None
+    synth_documents: tuple[tuple[str, str], ...] = ()
+    # An optional plant rides along with real alerts. With none of those there
+    # is no batch to ride along with, so nothing is written to the grid.
+    plant = bool(cfg.synth_scenarios) and (bool(target_ids) or not cfg.synth_optional)
+    if cfg.synth_scenarios and plant:
         scenario_by_id = {s.id: s for s in cfg.synth_scenarios}
         run_time = cfg.synth_run_time or datetime.now(UTC)
-        ingest_results = await synth_ingester(
-            list(cfg.synth_scenarios),
-            elastic=elastic,
-            run_time=run_time,
-            repeats=cfg.synth_repeats,
-        )
+        # The tag is passed only when one is set, so an ingester double that
+        # predates it keeps its signature.
+        ingest_kwargs: dict[str, Any] = {
+            "elastic": elastic,
+            "run_time": run_time,
+            "repeats": cfg.synth_repeats,
+        }
+        if cfg.synth_plant_tag:
+            ingest_kwargs["plant_tag"] = cfg.synth_plant_tag
+        # A ride-along plant is the caller's to take back, so the ingester
+        # reports each document as it lands. The list survives a plant that
+        # fails part way, which a return value does not.
+        written: list[tuple[str, str]] = []
+        if cfg.synth_optional:
+            ingest_kwargs["written"] = written
+        try:
+            ingest_results = await synth_ingester(list(cfg.synth_scenarios), **ingest_kwargs)
+        except Exception as e:
+            if not cfg.synth_optional:
+                raise
+            # The real alerts are the point of this batch. A grid that refuses
+            # the write, or a containment check that refuses the plant, costs
+            # the batch its known positive and nothing else. The caller reports
+            # the cause; it is not swallowed.
+            synth_error = f"{type(e).__name__}: {e}"[:300]
+            _LOGGER.warning("optional synth plant failed; running real alerts only: %s", e)
+            ingest_results = []
+        if cfg.synth_optional:
+            # An ingester double may fill only the results.
+            synth_documents = tuple(written) or tuple(
+                document
+                for res in ingest_results
+                for document in (getattr(res, "documents", None) or ())
+            )
+            if synth_documents:
+                write_ledger(batch_dir, synth_documents, planted_at=run_time)
         # Round-robin over the catalogue: repeat 0 of every scenario, then
         # repeat 1, ... so a transient infra wobble degrades one repeat of
         # each scenario instead of wiping out one scenario's whole sample.
@@ -516,6 +651,8 @@ async def run_batch(  # noqa: PLR0912, PLR0915 - one place that wires the whole 
             n_error=0,
             aborted_reason="sampler returned no eligible alerts",
             elapsed_s=int(time.monotonic() - started),
+            synth_error=synth_error,
+            synth_documents=synth_documents,
         )
 
     sem = asyncio.Semaphore(cfg.concurrency)
@@ -532,11 +669,12 @@ async def run_batch(  # noqa: PLR0912, PLR0915 - one place that wires the whole 
             if cancelled:
                 return IndexRow(
                     alert_id=alert_id,
-                    error="aborted by failure budget",
+                    error=NOT_RUN_ERROR,
                     is_synth=scenario_id is not None,
                     synth_scenario_id=scenario_id,
                     synth_plant_id=synth_id_to_plant.get(alert_id),
                     synth_repeat=synth_id_to_repeat.get(alert_id, 0),
+                    synth_expected_verdict=synth_id_to_expected_verdict.get(alert_id),
                 )
             return await _run_one(
                 alert_id,
@@ -631,4 +769,6 @@ async def run_batch(  # noqa: PLR0912, PLR0915 - one place that wires the whole 
         n_error=n_err,
         aborted_reason=aborted_reason,
         elapsed_s=int(time.monotonic() - started),
+        synth_error=synth_error,
+        synth_documents=synth_documents,
     )

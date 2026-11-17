@@ -23,7 +23,7 @@ KIND_LABEL: dict[str, str] = {
     "below_baseline": "rate collapsed",
     "above_baseline": "rate spiked",
     "scope_count": "across many hosts",
-    "estate_outlier": "estate outlier",
+    "estate_outlier": "unusual across all hosts",
     "alert": "alert",
     "prior_no_baseline": "no benign baseline",
     "catalog_match": "analytic match",

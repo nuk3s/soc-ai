@@ -248,7 +248,9 @@ curl -k https://localhost:8443/healthz
 ```
 
 This check probes nothing. It passes when the grid is unreachable, the model gateway
-is down and no analyst model is set. The container healthcheck polls it. A
+is down and no analyst model is set. The container healthcheck polls it. The
+healthcheck asks in HTTPS when `SOC_AI_TLS_CERT` is set. It asks in plain HTTP when
+`SOC_AI_TLS_CERT` is blank, which is the proxy path. A
 `healthy` state in `docker ps` means only that the process is up. It does not check
 the install. For that, run the doctor:
 
@@ -782,7 +784,8 @@ available for a run by hand.
 
 ### Nightly quality micro-eval schedule
 
-`soc-ai eval-nightly` investigates a handful of real alerts. It writes one row to
+`soc-ai eval-nightly` investigates a handful of real alerts and one synthetic
+true positive. It writes one row to
 the local quality trend, on the dashboard's Verdict quality card. It alarms
 through the notification webhook if the new point regresses against its own
 history. The verdicts then get a measurement every night. A drop in quality after
@@ -810,6 +813,119 @@ Force either mode with `--graded` or `--local`. Tune the sample size
 `quality_nightly_n` and the alarm threshold `quality_alarm_drop` live, in the
 Quality section of the Settings page.
 
+#### Synthetic true positive
+
+A real alert has no known answer. On a quiet grid each alert is benign, so a
+batch of real alerts alone cannot show that soc-ai finds an intrusion. Each run
+therefore plants one synthetic true positive beside the real alerts. The
+setting is `quality_nightly_synth_n`. The default is 1 and the maximum is 3.
+Set 0 to plant nothing.
+
+- The scenario comes from the easy tier of the catalogue in
+  `soc_ai/eval/synth_scenarios/`. The scenario changes each day.
+- A scenario can need an input that the deployment loads, for example a
+  reputation feed. The scenario file lists each input under `requires`. Before
+  each run soc-ai compares the list with the feeds that are loaded. soc-ai does
+  not plant a scenario with a missing input, so that scenario cannot raise the
+  alarm. The snapshot names each such scenario and the missing input.
+- If no scenario is eligible, the run plants nothing. The snapshot states the
+  cause and the run raises no alarm for a miss.
+- soc-ai compares the verdict of the synthetic run with the known answer. The
+  synthetic run does not go to the Oracle and uses no Oracle quota.
+- A synthetic run that does not return a true positive raises the quality alarm.
+  The alarm text names the scenario and the verdict of the run.
+- A synthetic run that fails is not a miss. The snapshot records it as not
+  measured and states the cause.
+- The numbers of the real alerts do not include the synthetic run.
+
+The run writes to the grid. It writes the synthetic documents to `logs-synth-*`
+and removes them when the batch ends. The Security Onion account of soc-ai needs
+write access to that pattern. If the grid refuses the write, the real alerts
+still run and the snapshot states the cause. soc-ai never reads a synthetic
+document outside this run. Security Onion shows the synthetic alert until the
+run removes it. Each synthetic document carries the field `synth.scenario_id`.
+
+soc-ai records the address of each synthetic document that it writes. The
+record is the file `synth_documents.json` in the batch directory. soc-ai deletes
+each document by that address. The run sends no delete by query, so it cannot
+delete a document that it did not write.
+
+If a delete fails, the run reports it. The report is on the line with the last
+attempt and in the snapshot. The record keeps the documents that are left, and
+the next run tries again. A run that stops before the end cannot remove its
+synthetic documents. The next run removes them from the record of that run. To
+remove them by hand, run `soc-ai synth-clean`.
+
+#### Alarm rules
+
+The run raises the quality alarm for five conditions:
+
+| Condition | Rule |
+|---|---|
+| Synthetic miss | A synthetic run does not return a true positive. This rule needs no history. |
+| Agreement drop | The agreement rate of one run is below the pooled rate of the last 30 runs by more than `quality_alarm_drop`. Chance does not explain the difference. |
+| Low verdict agreement | The verdict agreement of the last 7 runs is below the floor of 0.50. |
+| Error rate | More than 30% of the runs end with no result. |
+| Fallback rate | The fallback rate is more than 0.30 above the median of the last 7 runs. |
+
+Verdict agreement is a different number from the agreement rate. The agreement
+rate grades the verdict, the confidence and the reasoning together. A correct
+verdict with a weak report lowers it. Verdict agreement counts one thing: the
+Oracle and the model state the same verdict for a real alert.
+
+- A true positive agrees with a true positive. A false positive agrees with a
+  false positive.
+- `needs_more_info` and `inconclusive` are one class. Each agrees with the
+  other. Each disagrees with a true positive and with a false positive.
+- A run with no verdict does not count. A run for which the Oracle states no
+  verdict does not count.
+- A synthetic run does not count.
+
+The low verdict agreement rule needs 3 graded runs. It counts the verdicts of
+the last 7 runs together. It raises the alarm only when a true rate of 0.50
+gives a count that low in 2% of cases or fewer. At 35 verdicts that is 10
+agreements or fewer. One bad run cannot raise it. A long period of low verdict
+agreement cannot stop it, because the floor does not move. The alarm text lists
+each pair of verdicts that disagree, with its count.
+
+The Oracle states its verdict on the line `ORACLE_VERDICT` of each critique. A
+critique from before this line has no verdict, so the rule starts with the runs
+after the upgrade.
+
+soc-ai sends one notification when a condition starts. A condition that
+continues sends no second notification. A condition that ends while a different
+condition continues also sends none.
+
+#### Runs with no result
+
+A completed run has a report and a verdict. Each verdict counts, also
+`needs_more_info`. Each other run that ends is an error:
+
+- a run that fails or reaches its time limit
+- a run that ends with no report or with no verdict
+- a fallback run. The model call failed and soc-ai wrote a placeholder verdict.
+
+Each error counts in the error rate and in the error rate rule. The snapshot
+gives each error a class from the record of the run: `gateway`, `token_limit`,
+`time_limit` or `other`. The alarm text states the classes. The agreement
+numbers and the verdict counts use the completed runs only. A run that did not
+end before the batch stopped is not completed and is not an error.
+
+#### Runs with no grade
+
+The Oracle can fail to grade a run. The usual cause is a used quota. The
+investigation of such a run is complete and its verdict counts. soc-ai does not
+count the run as an error. The snapshot records the number of runs with no grade
+and the cause. When the Oracle grades no run of the batch, the run reports
+"Agreement is not measured" and raises no alarm for it.
+
+#### Served model
+
+The snapshot records the configured model in `analyst_model`. It also records
+the model that served each run, with the address of the engine when the gateway
+reports it. If a run records no served model, the snapshot lists the configured
+model for that run and marks it as not recorded.
+
 Each run also writes a `batch-<timestamp>/` bundle to `/var/lib/soc-ai/evals`, on
 the `soc_ai_evals` volume. The bundle holds the per-alert artifacts, the Oracle
 critiques and a `report.md`. Read one if a point alarms. The critiques say *why*
@@ -824,14 +940,23 @@ docker exec soc-ai cat /var/lib/soc-ai/evals/batch-<timestamp>/report.md
 `--out-dir` overrides the location. Without it, the bundles go under the data directory.
 That location keeps them on a volume and out of the container filesystem.
 
-### Memory cap of 1 GB
+### Memory limit of 3 GB
 
-`docker-compose.yml` sets a `1G` memory limit. Under cgroup v2 that limit is a
+`docker-compose.yml` sets a `3G` memory limit. Under cgroup v2 that limit is a
 hard cap. A hunt that accumulates a large tool output can
 reach the cap, and the kernel then OOM-kills the container. The container
 restarts through `restart: unless-stopped`. If the container restarts in the
 middle of a hunt, raise `deploy.resources.limits.memory` in
 `docker-compose.yml`.
+
+### Free space on the data volume
+
+A full volume stops every write to the store. Triage and hunts then stop. The doctor
+row `disk space` reads the volume that holds the data directory. The row is WARN when
+less than 15% is free or less than 2 G is free. To clear the warning, make the volume
+larger or remove files from it. Old backup archives, unused container images and the
+Docker build cache use the most space. `docker image prune` and `docker builder prune`
+remove the last two.
 
 ---
 

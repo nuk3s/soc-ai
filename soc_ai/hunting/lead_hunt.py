@@ -21,17 +21,19 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 from weakref import WeakValueDictionary
 
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from soc_ai.hunting import campaign_hunt
 from soc_ai.store.leads import (
     AUTO_HUNT_ACTOR,
     AUTO_HUNT_RETRY_LIMIT,
     HUNT_RUNNING_STATUSES,
+    campaign_leads,
     hunt_did_not_run,
 )
 from soc_ai.store.models import Hunt, Lead
@@ -54,6 +56,10 @@ __all__ = [
 # A WeakValueDictionary drops a lead's lock once no start holds it, so the map
 # does not keep an entry for every lead ever hunted.
 _STARTS: WeakValueDictionary[int, asyncio.Lock] = WeakValueDictionary()
+
+
+def _naive_now() -> datetime:
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 def _start_lock(lead_id: int) -> asyncio.Lock:
@@ -88,8 +94,11 @@ class LeadHuntRefused(Exception):
 
     ``reason`` is one of ``lead_not_found``, ``lead_is_closed`` or
     ``could_not_start``. The route turns it into a 404, a 409 or a 503. The
-    loop logs it and takes the next lead. ``lead`` carries the row when there
-    is one, because the 409 names the dismissal that closed it.
+    loop logs it and takes the next lead. A start by the loop on a lead of a
+    campaign can also read a reason of
+    :func:`soc_ai.hunting.campaign_hunt.refusal`. No route start reads one.
+    ``lead`` carries the row when there is one, because the 409 names the
+    dismissal that closed it.
     """
 
     def __init__(self, reason: str, lead_id: int, *, lead: Lead | None = None) -> None:
@@ -140,6 +149,8 @@ async def _start_lead_hunt(state: Any, *, lead_id: int, started_by: str) -> Lead
         lead = await leads_store.get(db, lead_id)
         if lead is None:
             raise LeadHuntRefused("lead_not_found", lead_id)
+        # A lead of a campaign: its hunt is a hunt for the campaign (D1, D4).
+        campaign_id = (await leads_store.campaign_leads(db, [lead_id])).get(lead_id)
         # A hunt that runs is the hunt. A hunt that finished is history, and
         # Hunt again starts the next one. A lead that names a hunt row the
         # store no longer holds reads as waiting, so it takes a new hunt too.
@@ -160,15 +171,39 @@ async def _start_lead_hunt(state: Any, *, lead_id: int, started_by: str) -> Lead
     # Read on its own session, and never raises: a failed read starts the hunt
     # without the block.
     earlier = await earlier_mod.earlier_for_lead(state.db_sessionmaker, lead_id)
-    hunt_id = await hcm.get_manager(state).start(
-        state,
-        objective=objective,
-        started_by=started_by,
-        kind="lead",
-        starter="lead",
-        lead_id=lead_id,
-        earlier=earlier,
-    )
+    manager = hcm.get_manager(state)
+    if campaign_id is None:
+        hunt_id = await manager.start(
+            state,
+            objective=objective,
+            started_by=started_by,
+            kind="lead",
+            starter="lead",
+            lead_id=lead_id,
+            earlier=earlier,
+        )
+    else:
+        # The check and the hunt row run under the lock of the campaign, so
+        # the campaign hunt loop cannot start a hunt for it in between. The
+        # loop of this module asks the limit again here: a hunt for the
+        # campaign can start between its selection and this start. An
+        # analyst's Hunt is the analyst's call, and it counts for the limit.
+        async with campaign_hunt.campaign_lock(campaign_id):
+            if started_by == AUTO_HUNT_ACTOR:
+                async with state.db_sessionmaker() as db:
+                    why = await campaign_hunt.refusal(db, campaign_id, now=_naive_now())
+                if why is not None:
+                    raise LeadHuntRefused(why, lead_id)
+            hunt_id = await manager.start(
+                state,
+                objective=objective,
+                started_by=started_by,
+                kind="lead",
+                starter="lead",
+                lead_id=lead_id,
+                earlier=earlier,
+                campaign_id=campaign_id,
+            )
     if hunt_id is None:
         raise LeadHuntRefused("could_not_start", lead_id)
 
@@ -184,7 +219,11 @@ async def _start_lead_hunt(state: Any, *, lead_id: int, started_by: str) -> Lead
 
 
 async def leads_awaiting_a_hunt(
-    db: AsyncSession, *, limit: int = 50, after: tuple[datetime, int] | None = None
+    db: AsyncSession,
+    *,
+    limit: int = 50,
+    after: tuple[datetime, int] | None = None,
+    now: datetime | None = None,
 ) -> list[Lead]:
     """The open leads the loop may hunt, oldest first.
 
@@ -203,6 +242,14 @@ async def leads_awaiting_a_hunt(
       lead did not run. A gateway that dropped one hunt gets one more try.
       After that the lead waits on the analyst, open and visible, rather than
       burning a hunt every wake.
+
+    A lead of a campaign (:func:`soc_ai.store.leads.campaign_lead_clause`)
+    follows its campaign. The loop skips it when the campaign had a hunt in
+    the last 24 hours, and when the campaign holds the decision ``closed`` or
+    ``authorized`` (:func:`soc_ai.hunting.campaign_hunt.refusal`). Otherwise
+    the lead hunt runs and is the hunt of the campaign. A lead with one
+    observation of another type is no lead of a campaign, so it keeps this
+    rule as it was.
 
     Oldest first, because the oldest lead has waited longest.
 
@@ -227,6 +274,9 @@ async def leads_awaiting_a_hunt(
     )
     kept: list[Lead] = []
     cursor = after
+    at = now or _naive_now()
+    # The answer of the limit for each campaign that this call read.
+    refused: dict[int, str | None] = {}
     while len(kept) < limit:
         query = select(Lead).where(
             Lead.status == "open",
@@ -265,7 +315,15 @@ async def leads_awaiting_a_hunt(
             if hunt.lead_id is None or not hunt_did_not_run(hunt):
                 continue
             failed[int(hunt.lead_id)] = failed.get(int(hunt.lead_id), 0) + 1
-        kept.extend(lead for lead in rows if failed.get(int(lead.id), 0) < AUTO_HUNT_RETRY_LIMIT)
+        campaigns = await campaign_leads(db, [int(lead.id) for lead in rows])
+        for campaign_id in sorted(set(campaigns.values()) - set(refused)):
+            refused[campaign_id] = await campaign_hunt.refusal(db, campaign_id, now=at)
+        kept.extend(
+            lead
+            for lead in rows
+            if failed.get(int(lead.id), 0) < AUTO_HUNT_RETRY_LIMIT
+            and (int(lead.id) not in campaigns or refused[campaigns[int(lead.id)]] is None)
+        )
         if len(rows) < limit:
             break
         cursor = (rows[-1].formed_at, int(rows[-1].id))

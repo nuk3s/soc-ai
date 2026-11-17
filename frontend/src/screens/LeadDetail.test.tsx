@@ -824,7 +824,7 @@ describe('LeadDetail decisions', () => {
       status: 'hunting',
       hunt_id: 'H-3',
       hunt_status: 'complete',
-      hunt_outcome_label: '2 of 3 findings are threats',
+      hunt_outcome_label: '2 confirmed · 1 not judged · of 3 threat findings',
       hold_reason: 'no_verdict',
       hold_sentence: null,
       decisions: [

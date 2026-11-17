@@ -13,7 +13,7 @@ from typing import Annotated, Any, Literal
 
 from fastapi import Depends, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, model_serializer
-from sqlalchemy import func, not_, select
+from sqlalchemy import and_, func, not_, select
 
 from soc_ai import __commit__, __version__
 from soc_ai.api.data_sources import DataSourceOut, collect_data_sources
@@ -30,12 +30,14 @@ from soc_ai.api.webui._shared import (
 )
 from soc_ai.api.webui.kind_labels import kind_label
 from soc_ai.bootstrap_credential import clear_bootstrap_credential, uses_generated_password
+from soc_ai.campaigns import service as campaign_svc
 from soc_ai.config import Settings
 from soc_ai.demo.guard import is_demo
 from soc_ai.doctor import CheckResult, run_doctor
 from soc_ai.hunting.outcome import FindingVerdicts
 from soc_ai.notify import hunt_outcome_tone
 from soc_ai.store import auth as auth_svc
+from soc_ai.store import authorized_activity as authorized_svc
 from soc_ai.store import dashboard_layout as layout_svc
 from soc_ai.store import grid_gaps as gaps_svc
 from soc_ai.store import host_dossier as dossier_svc
@@ -151,6 +153,10 @@ class NotificationOut(BaseModel):
     # moment and hides every dismissible row up to it, the rows it never
     # loaded included.
     at: str | None = None
+    # The stage of the campaign on a campaign row (``campaign:<change id>``),
+    # so the console paints the row in the color of the stage. None on every
+    # other row.
+    stage: str | None = None
 
 
 @router.get("/workspaces", response_model=list[WorkspaceOut])
@@ -731,6 +737,9 @@ async def _lead_notifications(
 ) -> list[NotificationOut]:
     """One bell entry per open or hunting lead, whenever it formed.
 
+    A lead of a campaign (:func:`soc_ai.store.leads.campaign_lead_clause`)
+    raises no row and is not in the count: the campaign is the item.
+
     The id carries the lead id, so a client-side dismissal holds for that lead
     and the bell announces one lead once. Every such lead reads warn, because a
     lead waits on the analyst until somebody decides it. The feed used to read
@@ -742,11 +751,15 @@ async def _lead_notifications(
     investigation off the bell. That row has no dismiss control: its number is
     live, and the Hunts page is where the leads are decided.
     """
+    from soc_ai.store import leads as leads_store  # noqa: PLC0415 - lazy
     from soc_ai.store.models import Lead  # noqa: PLC0415 - lazy
 
     try:
         async with request.app.state.db_sessionmaker() as db:
-            open_leads = Lead.status.in_(("open", "hunting"))
+            # A lead of a campaign raises no row: the campaign has its own.
+            open_leads = and_(
+                Lead.status.in_(("open", "hunting")), ~leads_store.campaign_lead_clause()
+            )
             rows = (
                 await db.scalars(
                     select(Lead)
@@ -796,6 +809,186 @@ async def _lead_notifications(
     return out
 
 
+# Campaign change rows shown at once. A busy rebuild can form several
+# campaigns, and the default list holds 12 rows.
+_CAMPAIGN_NOTIF_CAP = 5
+
+
+def campaign_change_title(type_: str, title: str, detail: dict[str, Any]) -> str:
+    """The bell row of one change of a campaign."""
+    from soc_ai.campaigns.words import stage_words  # noqa: PLC0415 - lazy
+
+    if type_ == "stage":
+        words = stage_words(str(detail.get("to") or ""))
+        if words is None:
+            return f"The campaign {title} reached a higher stage."
+        return f"The campaign {title} reached the stage {words}."
+    if type_ == "party":
+        names = [str(n) for n in detail.get("names") or [] if n]
+        if len(names) == 1:
+            return f"A new machine joined the campaign {title}: {names[0]}."
+        return f"New machines joined the campaign {title}: {', '.join(names)}."
+    if type_ == "reopened":
+        cause = detail.get("cause")
+        if cause == "stage":
+            return f"A higher stage opened the campaign {title} again."
+        if cause == "party":
+            return f"A new machine opened the campaign {title} again."
+        return f"New activity opened the campaign {title} again."
+    if type_ == "beyond":
+        return f"Activity beyond the authorization of the campaign {title}."
+    return f"A new campaign formed: {title}."
+
+
+async def _campaign_change_notifications(
+    request: Request, *, since: datetime, limit: int = NOTIF_DEFAULT_LIMIT
+) -> list[NotificationOut]:
+    """One row for each change of an active campaign in the bell window.
+
+    The changes ``formed``, ``stage``, ``party``, ``reopened`` and ``beyond``.
+    Each is a danger row, one for each investigation beyond an authorization
+    too. A ``stage`` change of a campaign with an authorization in force is a
+    neutral row: the higher stage is between the listed machines. A
+    decision, an acknowledgement, an open again by an analyst, a revoke, an
+    exclusion and an inclusion raise no row: a person made them. The id
+    carries the change id, so a dismissal holds for that change. The true
+    positive rows of the investigations that a campaign holds are not sent,
+    so the campaign row speaks for them.
+    """
+    from soc_ai.store.models import (  # noqa: PLC0415 - lazy
+        AuthorizedActivity,
+        Campaign,
+        CampaignChange,
+    )
+
+    try:
+        async with request.app.state.db_sessionmaker() as db:
+            rows = (
+                await db.execute(
+                    select(
+                        CampaignChange,
+                        Campaign.title,
+                        Campaign.stage,
+                        Campaign.decision,
+                        AuthorizedActivity.expires_at,
+                        AuthorizedActivity.revoked_at,
+                    )
+                    .join(Campaign, Campaign.id == CampaignChange.campaign_id)
+                    .outerjoin(
+                        AuthorizedActivity, AuthorizedActivity.id == Campaign.authorization_id
+                    )
+                    .where(
+                        CampaignChange.created_at >= since.replace(tzinfo=None),
+                        CampaignChange.type.in_(("formed", "stage", "party", "reopened", "beyond")),
+                        Campaign.status == campaign_svc.STATUS_ACTIVE,
+                    )
+                    .order_by(CampaignChange.created_at.desc(), CampaignChange.id.desc())
+                    .limit(4 * _notif_cap(_CAMPAIGN_NOTIF_CAP, limit))
+                )
+            ).all()
+    except Exception:
+        _LOGGER.warning("notifications: the campaign changes could not be read", exc_info=True)
+        return []
+    out: list[NotificationOut] = []
+    now = datetime.now(UTC).replace(tzinfo=None)
+    for change, title, stage, decision, expires_at, revoked_at in rows:
+        detail = change.detail if isinstance(change.detail, dict) else {}
+        if change.type == "reopened" and detail.get("cause") in ("analyst", "revoked"):
+            continue
+        in_force = (
+            decision == "authorized"
+            and expires_at is not None
+            and revoked_at is None
+            and expires_at > now
+        )
+        out.append(
+            NotificationOut(
+                id=f"campaign:{change.id}",
+                tone="accent" if change.type == "stage" and in_force else "danger",
+                title=campaign_change_title(change.type, str(title), detail),
+                when=_ago(change.created_at.replace(tzinfo=UTC).isoformat()),
+                href=f"/campaigns/{change.campaign_id}",
+                at=_at(change.created_at),
+                stage=stage,
+            )
+        )
+    return out[: _notif_cap(_CAMPAIGN_NOTIF_CAP, limit)]
+
+
+# A verdict row about an event older than this states the date of the event.
+_OLD_EVENT = timedelta(hours=24)
+
+
+def _event_note(event_at: datetime | None, now: datetime | None = None) -> str:
+    """The sentence that dates an old event on a verdict row, or empty.
+
+    The bell lists verdicts by the time of the verdict. A hunt and a Re-run
+    judge events of days ago, and such a row read as news of today (owner,
+    2026-11-15). The date is UTC, the clock of the store.
+    """
+    if event_at is None:
+        return ""
+    at = event_at.astimezone(UTC).replace(tzinfo=None) if event_at.tzinfo else event_at
+    if (now or auth_svc.utcnow()) - at <= _OLD_EVENT:
+        return ""
+    return f". The event is from {at:%Y-%m-%d}."
+
+
+def _verdict_rows(
+    completed: Sequence[Any], *, cutoff: datetime, held: dict[str, Any]
+) -> list[NotificationOut]:
+    """One row for each run that ended with a verdict in the bell window.
+
+    A true positive that a campaign holds raises no row of its own
+    (:func:`soc_ai.campaigns.service.held`): the row of the campaign change
+    speaks for it. ``held`` maps a run id to its campaign link.
+    """
+    done: list[NotificationOut] = []
+    for inv in completed:
+        fin = inv.finished_at
+        if fin is None or fin < cutoff:
+            continue
+        if inv.is_fallback:
+            # A pipeline fallback is a failed triage with a placeholder
+            # verdict. It read as "Verdict needs_more_info" for each of the
+            # 226 failed runs of 2026-10-27. The query above already left out
+            # the dismissed ones.
+            done.append(
+                NotificationOut(
+                    id=f"inv-failed:{inv.id}",
+                    tone="danger",
+                    title=f"Triage failed, pipeline error: {inv.rule_name or inv.id}",
+                    when=_ago(fin.isoformat()),
+                    href=f"/investigation/{inv.id}",
+                    isSynthEval=bool(inv.is_synth_eval),
+                    at=_at(fin),
+                )
+            )
+            continue
+        verdict = inv.verdict or "untriaged"
+        if verdict == "true_positive" and campaign_svc.held(held.get(inv.id)):
+            continue
+        tone = (
+            "danger"
+            if verdict == "true_positive"
+            else "warn"
+            if verdict in ("needs_more_info", "inconclusive")
+            else "accent"
+        )
+        done.append(
+            NotificationOut(
+                id=f"inv-done:{inv.id}",
+                tone=tone,
+                title=f"Verdict {verdict}: {inv.rule_name or inv.id}{_event_note(inv.event_at)}",
+                when=_ago(fin.isoformat()),
+                href=f"/investigation/{inv.id}",
+                isSynthEval=bool(inv.is_synth_eval),
+                at=_at(fin),
+            )
+        )
+    return done
+
+
 @router.get("/notifications", response_model=list[NotificationOut])
 async def list_notifications(
     request: Request,
@@ -824,12 +1017,15 @@ async def list_notifications(
 ) -> list[NotificationOut]:
     """The standing conditions, the runs in flight and the runs of the last 24 h.
 
-    The standing conditions come first: a dependency that is down, a grid
-    gap that closed in the last 24 h, a broken audit chain, an expiring
+    The sources are the standing conditions (a dependency that is down, a
+    grid gap that closed in the last 24 h, a broken audit chain, an expiring
     certificate, a paused Oracle, a failing or paused Auto-Investigate, a
-    quality alarm, a dossier conflict, the
-    unread shadow hits, the analytics soc-ai held, the open leads and the
-    failed triages. The runs follow, newest first.
+    quality alarm, a dossier conflict, the unread shadow hits, the analytics
+    soc-ai held, the open leads and the failed triages) and the runs.
+    :func:`by_urgency` orders them: confirmed threats, decisions that wait,
+    failures, notices, runs in flight, closures, then old notices. Two or more
+    false positive closures fold into one row with a count and a link, and the
+    same failure on the same subject folds into one row with a count.
 
     The bell badge does not count this list. It states the needs-you count
     (``GET /needs-you``), and the bell panel shows each part of that count
@@ -872,6 +1068,8 @@ async def list_notifications(
             )
         )
     out.extend(await _grid_gap_notifications(request, since=cutoff))
+    out.extend(await _authorized_expiry_notifications(request, since=cutoff))
+    out.extend(await _campaign_change_notifications(request, since=cutoff, limit=limit))
     out.extend(_audit_chain_notifications(request))
     out.extend(_tls_notifications(request))
     out.extend(_oracle_pause_notifications(request))
@@ -901,7 +1099,14 @@ async def list_notifications(
             # A dismissed fallback leaves the bell. The filter is in SQL, so
             # the dismissed rows cannot fill the cap ahead of real verdicts.
             exclude_dismissed_fallbacks=True,
+            # A run inside an authorized scope raises no row of its own.
+            exclude_authorized=True,
+            # The false positive closures fold into one row below. Left in,
+            # 20 of them filled this cap ahead of a true positive.
+            false_positives=False,
         )
+        # The false positive closures fold into one row (ui-core 5).
+        fp_out = await _false_positive_rows(db, cutoff=cutoff, hide_upto=hide_upto)
         failed = await inv_svc.list_recent_notifications(
             db,
             status="error",
@@ -932,6 +1137,11 @@ async def list_notifications(
         # What the investigations of the hunts' findings decided. A verdict
         # outranks the hunt's own claim on the bell, as on the hunt list.
         hunt_verdicts = await hunts_svc.finding_verdicts(db, [h.id for h in hunts_done])
+        # A true positive that a campaign holds raises no row of its own: the
+        # row of the campaign change speaks for it.
+        held_links = await campaign_svc.links_of(
+            db, [inv.id for inv in completed if inv.verdict == "true_positive"]
+        )
     # A triage that died goes with the standing entries, not the completions:
     # it is the same class of fact as a dependency being down, and putting it
     # behind a busy hour's verdicts is how it stays unseen. Ten weeks of these
@@ -961,54 +1171,246 @@ async def list_notifications(
                 at=_at(inv.created_at),
             )
         )
-    done: list[NotificationOut] = []
-    for inv in completed:
-        fin = inv.finished_at
-        if fin is None or fin < cutoff:
-            continue
-        if inv.is_fallback:
-            # A pipeline fallback is a failed triage with a placeholder
-            # verdict. It read as "Verdict needs_more_info" for each of the
-            # 226 failed runs of 2026-10-27. The query above already left out
-            # the dismissed ones.
-            done.append(
-                NotificationOut(
-                    id=f"inv-failed:{inv.id}",
-                    tone="danger",
-                    title=f"Triage failed, pipeline error: {inv.rule_name or inv.id}",
-                    when=_ago(fin.isoformat()),
-                    href=f"/investigation/{inv.id}",
-                    isSynthEval=bool(inv.is_synth_eval),
-                    at=_at(fin),
-                )
-            )
-            continue
-        verdict = inv.verdict or "untriaged"
-        tone = (
-            "danger"
-            if verdict == "true_positive"
-            else "warn"
-            if verdict in ("needs_more_info", "inconclusive")
-            else "accent"
-        )
-        done.append(
-            NotificationOut(
-                id=f"inv-done:{inv.id}",
-                tone=tone,
-                title=f"Verdict {verdict}: {inv.rule_name or inv.id}",
-                when=_ago(fin.isoformat()),
-                href=f"/investigation/{inv.id}",
-                isSynthEval=bool(inv.is_synth_eval),
-                at=_at(fin),
-            )
-        )
+    done = _verdict_rows(completed, cutoff=cutoff, held=held_links)
+    done.extend(fp_out)
     for h in hunts_running:
         done.append(_hunt_in_flight(h))
     done.extend(_hunt_notifications(hunts_done, hunt_inputs, hunt_verdicts))
     rows = out + done
     if hide_upto is not None:
         rows = [row for row in rows if not _cleared(row, hide_upto)]
-    return rows[:limit]
+    # The fold and the order come after the Dismiss all mark, so a folded row
+    # counts only the rows the analyst has not dismissed.
+    return by_urgency(_fold_same_failures(rows))[:limit]
+
+
+async def _false_positive_rows(
+    db: Any, *, cutoff: datetime, hide_upto: datetime | None
+) -> list[NotificationOut]:
+    """The bell rows of the false positive closures in the window.
+
+    The closures the analyst has not dismissed: the newest two rows and the
+    count, with the terms of the completed half (production review
+    2026-11-12, ui-core 5). One closure keeps its own row, because a fold of
+    one says less than the row. Two or more fold into one row with a count.
+    """
+    hide_naive = hide_upto.astimezone(UTC).replace(tzinfo=None) if hide_upto else None
+    terms: dict[str, Any] = {
+        "status": "complete",
+        "finished_since": cutoff,
+        "exclude_dismissed_fallbacks": True,
+        "exclude_authorized": True,
+        "false_positives": True,
+        "finished_after": hide_naive,
+    }
+    rows = await inv_svc.list_recent_notifications(db, limit=2, **terms)
+    if not rows:
+        return []
+    if len(rows) == 1:
+        inv = rows[0]
+        fin = inv.finished_at or inv.created_at
+        return [
+            NotificationOut(
+                id=f"inv-done:{inv.id}",
+                tone="accent",
+                title=(
+                    f"Verdict false_positive: {inv.rule_name or inv.id}{_event_note(inv.event_at)}"
+                ),
+                when=_ago(fin.isoformat()),
+                href=f"/investigation/{inv.id}",
+                isSynthEval=bool(inv.is_synth_eval),
+                at=_at(fin),
+            )
+        ]
+    count = await inv_svc.count_recent_notifications(db, **terms)
+    after_mark = hide_naive is not None and hide_naive > cutoff
+    return [_false_positive_fold(rows[0], count, after_mark=after_mark)]
+
+
+# The false positive closures fold into one row. The link opens them on the
+# Investigations list, over the window of the bell. The bell counts what
+# soc-ai closed, so the list reads the time of the investigation.
+_FP_FOLD_HREF = "/investigations?range=24h&verdict=false_positive&clock=investigated"
+
+
+def _false_positive_fold(
+    newest: inv_svc.NotifRow, count: int, *, after_mark: bool
+) -> NotificationOut:
+    """One row for the false positive closures of the bell window.
+
+    The id carries the newest run, so a dismissal holds until a new closure
+    arrives. ``at`` is the newest closure, so a Dismiss all hides the row
+    exactly when it covers every closure the row counts. After a Dismiss all
+    the row counts the closures since that moment, and it says so.
+    """
+    fin = newest.finished_at or newest.created_at
+    since = "after the last Dismiss all" if after_mark else "in the last 24 hours"
+    return NotificationOut(
+        id=f"inv-fp:{newest.id}",
+        tone="accent",
+        title=f"{count} false positives closed {since}",
+        when=_ago(fin.isoformat()),
+        href=_FP_FOLD_HREF,
+        at=_at(fin),
+    )
+
+
+# The rows of one failure that can repeat on one subject.
+_FOLDABLE_FAILURES = ("inv-failed", "hunt-done")
+
+
+def _fold_noun(key: tuple[str, str] | None) -> str:
+    """The analyst word for the rows a fold counts. Never "runs" (owner 2026-11-14)."""
+    return "hunts" if key is not None and key[0] == "hunt-done" else "investigations"
+
+
+def _fold_same_failures(rows: list[NotificationOut]) -> list[NotificationOut]:
+    """Fold the same failure on the same subject into one row with a count.
+
+    Two rows are the same failure when they have the same source and the same
+    title: "Triage failed, no verdict: <rule>" twice. The newest row stays, at
+    its place, and names the count. A hunt row folds only when it could not
+    run. The bell listed two identical failed triages as two of its 12 rows
+    (production review 2026-11-12, ui-core 5).
+    """
+
+    def key(row: NotificationOut) -> tuple[str, str] | None:
+        prefix = row.id.split(":", 1)[0]
+        if prefix not in _FOLDABLE_FAILURES:
+            return None
+        if prefix == "hunt-done" and row.outcome != "could_not_run":
+            return None
+        return prefix, row.title
+
+    groups: dict[tuple[str, str], list[NotificationOut]] = {}
+    for row in rows:
+        k = key(row)
+        if k is not None:
+            groups.setdefault(k, []).append(row)
+    out: list[NotificationOut] = []
+    for row in rows:
+        k = key(row)
+        members = groups.get(k) if k is not None else None
+        if not members or len(members) == 1:
+            out.append(row)
+            continue
+        newest = max(members, key=lambda r: _moment(r) or datetime.min.replace(tzinfo=UTC))
+        if row is not newest:
+            continue
+        out.append(
+            newest.model_copy(
+                update={
+                    "title": f"{newest.title.rstrip('.')}. {len(members)} {_fold_noun(k)} failed "
+                    "the same way."
+                }
+            )
+        )
+    return out
+
+
+# The urgency tiers of the bell, first to last.
+_TIER_DEPENDENCY_DOWN = 0
+_TIER_THREAT = 1
+_TIER_DECISION = 2
+_TIER_FAILURE = 3
+_TIER_NOTICE = 4
+_TIER_RUNNING = 5
+_TIER_CLOSURE = 6
+_TIER_OLD_NOTICE = 7
+
+_THREAT_OUTCOMES = frozenset({"threat_found", "threats_confirmed"})
+# The notices that describe a past moment. Past the bell window they sink
+# below the closures: three analytic notices of 25 to 38 days led the bell.
+_AGING_NOTICES = frozenset(
+    {
+        "analytic-held",
+        "dossier-conflict",
+        "grid-gap",
+        "authorized-expired",
+        "authorized-expired-more",
+    }
+)
+
+
+def _moment(row: NotificationOut) -> datetime | None:
+    if not row.at:
+        return None
+    try:
+        moment = datetime.fromisoformat(row.at)
+    except ValueError:
+        return None
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+
+
+def _urgency_tier(row: NotificationOut, *, stale_before: datetime) -> int:
+    """The tier of one bell row. See :func:`by_urgency`."""
+    parts = row.id.split(":", 2)
+    prefix = parts[0]
+    if prefix == "dep-down" and len(parts) > 1 and parts[1] in _DEP_LABEL:
+        # The grid, the model gateway or the Security Onion API is down.
+        # Every other row of the bell reads through it.
+        return _TIER_DEPENDENCY_DOWN
+    if prefix == "inv-done":
+        # The tone of a verdict row: danger is a true positive, warn a
+        # verdict that waits on more info, accent a closure.
+        if row.tone == "danger":
+            return _TIER_THREAT
+        return _TIER_DECISION if row.tone == "warn" else _TIER_CLOSURE
+    if prefix in ("hunt-done", "hunt-sweep"):
+        if row.outcome in _THREAT_OUTCOMES:
+            return _TIER_THREAT
+        return _TIER_FAILURE if row.outcome == "could_not_run" else _TIER_CLOSURE
+    if prefix == "campaign":
+        # A campaign formed, reached a higher stage, gained a machine, opened
+        # again or holds activity beyond its authorization: a confirmed
+        # threat, beside the true positive rows. A higher stage between the
+        # listed machines of an authorization in force is a neutral row.
+        return _TIER_CLOSURE if row.tone == "accent" else _TIER_THREAT
+    if prefix == "inv-fp":
+        return _TIER_CLOSURE
+    if prefix in ("lead", "lead-more"):
+        return _TIER_DECISION
+    if prefix in ("inv", "hunt"):
+        return _TIER_RUNNING
+    if prefix in _AGING_NOTICES:
+        moment = _moment(row)
+        return _TIER_OLD_NOTICE if moment is not None and moment < stale_before else _TIER_NOTICE
+    if prefix == "shadow-hit":
+        return _TIER_NOTICE
+    # A failed triage, and every other standing condition: a broken audit
+    # chain, a paused Oracle, a failing Auto-Investigate, a quality alarm, a
+    # certificate that expires.
+    return _TIER_FAILURE
+
+
+def by_urgency(
+    rows: Sequence[NotificationOut], *, now: datetime | None = None
+) -> list[NotificationOut]:
+    """The bell rows in the order of urgency.
+
+    A dependency that is down first: the grid, the model gateway or the
+    Security Onion API. With it down, no other row is reliable. Then the
+    confirmed threats, the decisions that wait (a lead, a verdict
+    that needs more info), the failures and the standing conditions, then
+    the notices, the runs in flight and the closures. A notice that describes
+    a moment older than the bell window sinks below the closures. Inside a
+    tier the newest row comes first, and a row with no moment ends its tier.
+
+    The bell listed 3 old analytic notices, 3 failed triages and 6 false
+    positives as its first 12 rows, and the true positives were rows 35 to 37
+    (production review 2026-11-12, ui-core 5).
+    """
+    stale_before = (now or datetime.now(UTC)) - _NOTIF_WINDOW
+
+    def order(row: NotificationOut) -> tuple[int, bool, float]:
+        moment = _moment(row)
+        return (
+            _urgency_tier(row, stale_before=stale_before),
+            moment is None,
+            -moment.timestamp() if moment is not None else 0.0,
+        )
+
+    return sorted(rows, key=order)
 
 
 async def _grid_gap_notifications(request: Request, *, since: datetime) -> list[NotificationOut]:
@@ -1046,6 +1448,76 @@ async def _grid_gap_notifications(request: Request, *, since: datetime) -> list[
 # Closed grid gaps shown at once. A flapping grid can close many short gaps in
 # a day, and the default list holds 12 rows.
 _GRID_GAP_NOTIF_CAP = 3
+# Expired authorizations shown at once.
+_AUTHORIZED_EXPIRY_NOTIF_CAP = 3
+
+
+def authorized_expiry_title(label: str, runs: int) -> str:
+    """The one bell row of an expired authorization."""
+    matched = "1 investigation matched it" if runs == 1 else f"{runs} investigations matched it"
+    return (
+        f'The authorized activity "{label}" expired. {matched}. '
+        "New investigations get normal handling."
+    )
+
+
+async def _authorized_expiry_notifications(
+    request: Request, *, since: datetime
+) -> list[NotificationOut]:
+    """One row for each authorization that expired in the bell window.
+
+    A run inside an authorized scope raises no row, so the expiry is the one
+    moment the bell speaks about the authorization. The row states the total
+    count of the runs that matched, and it is the prompt to record the
+    activity again or to let it end. The first rows name one record each. One
+    more row counts the rest, so no expiry is left out. A revoked
+    authorization raises no row: the analyst ended it.
+    """
+    try:
+        async with request.app.state.db_sessionmaker() as db:
+            rows = await authorized_svc.recently_expired(db, since=since)
+            counts = await authorized_svc.run_counts(db, [int(r.id) for r in rows])
+    except Exception:
+        _LOGGER.warning("notifications: the authorized activity could not be read", exc_info=True)
+        return []
+
+    def runs_of(row: Any) -> int:
+        return counts.get(int(row.id), authorized_svc.RunCount()).total
+
+    shown = rows[:_AUTHORIZED_EXPIRY_NOTIF_CAP]
+    rest = rows[_AUTHORIZED_EXPIRY_NOTIF_CAP:]
+    out = [
+        NotificationOut(
+            id=f"authorized-expired:{row.id}",
+            tone="warn",
+            title=authorized_expiry_title(row.label, runs_of(row)),
+            when=_ago(row.expires_at.isoformat()),
+            href=f"/investigations?authorization={row.id}&range=all",
+            at=_at(row.expires_at),
+        )
+        for row in shown
+    ]
+    if rest:
+        total = sum(runs_of(row) for row in rest)
+        matched = (
+            "1 investigation matched them" if total == 1 else f"{total} investigations matched them"
+        )
+        records = (
+            "1 more authorized activity record"
+            if len(rest) == 1
+            else (f"{len(rest)} more authorized activity records")
+        )
+        out.append(
+            NotificationOut(
+                id=f"authorized-expired-more:{rest[0].id}:{len(rest)}",
+                tone="warn",
+                title=f"{records} expired. {matched}. New investigations get normal handling.",
+                when=_ago(rest[0].expires_at.isoformat()),
+                href=None,
+                at=_at(rest[0].expires_at),
+            )
+        )
+    return out
 
 
 def _after_mark(raw: str | None) -> datetime | None:
@@ -1140,10 +1612,11 @@ def _hunt_outcome_of(
 
     if verdicts is not None and verdicts.decided and h.status == "complete":
         return hunt_outcome.public_outcome(h.status, [], None, verdicts), ""
-    if h.threat_findings_count:
+    # A threat finding that a campaign holds is no new threat of the hunt.
+    if int(h.threat_findings_count or 0) - (verdicts.held if verdicts is not None else 0) > 0:
         return "threat_found", ""
     findings, narrative = inputs.get(h.id, ([], ""))
-    outcome = hunt_outcome.public_outcome(h.status, findings, narrative)
+    outcome = hunt_outcome.public_outcome(h.status, findings, narrative, verdicts)
     headline = hunt_outcome.outcome_headline(outcome, h.status, findings, narrative) or ""
     return outcome, headline
 
@@ -1160,7 +1633,7 @@ def _hunt_line(
     :func:`routes_hunts.objective_headline`. The tone comes from
     :data:`soc_ai.notify.HUNT_OUTCOME_TONE`, so the bell and the webhook agree.
     A hunt whose findings an investigation confirmed reads "Hunt finished: 2
-    of 3 findings are threats".
+    confirmed · 1 not judged · of 3 threat findings".
     """
     title = routes_hunts.objective_headline(h.objective)
     if outcome == "threats_confirmed":
@@ -1283,10 +1756,11 @@ def _folded_notice(group: list[tuple[hunts_svc.HuntNotifRow, str, str]]) -> Noti
 
 # ── The needs-you count ────────────────────────────────────────────────────
 
-# The window of the two investigation parts. The console links the
-# needs-more-info part to the Investigations list with a verdict filter, and
-# that list opens on 30 days when a link names a verdict.
-_NEEDS_YOU_VERDICT_DAYS = 30
+# The window of the two investigation parts, in the console's range words. An
+# item stays until a person decides, so the parts read every age. The window
+# was 30 days, and a verdict that needed more info left Needs you on day 31
+# with no decision made.
+_NEEDS_YOU_VERDICT_WINDOW = "all"
 # How long one grid read of the alert part serves every caller. The read is an
 # aggregation, and every open tab polls this count from three surfaces.
 _NEEDS_YOU_ALERT_TTL_S = 30.0
@@ -1316,18 +1790,45 @@ class NeedsYouCountOut(BaseModel):
     A part is ``None`` when the server could not read it. ``unknown`` names
     those parts, and ``total`` is then the sum of the parts it could read, a
     floor. A failed read is never a zero.
+
+    ``decisions`` and ``review`` split the count by one rule
+    (:func:`routes_analytics.split_needs_you`). ``decisions`` is
+    ``campaigns`` + ``investigations_waiting`` + ``leads_needing_decision`` +
+    ``untriaged_groups``: each decision once. An unread shadow hit is review
+    work. The console states the decisions as the count, and the hits beside
+    it in a neutral color. ``total`` is the sum of the two, kept for an older
+    console. ``GET /needs-you/items`` lists the same decisions, and its
+    ``total`` is ``decisions`` when every part was read.
+
+    ``investigations_waiting`` counts the runs behind the two investigation
+    details: the runs that need more info and the runs with a waiting action.
+    It is the total of ``GET /investigations?needs_you=true`` over
+    ``verdict_window``, the same query, so the Investigations badge and the
+    Needs you view state one number. ``needs_more_info`` and
+    ``pending_actions`` stay as detail and are no part of ``decisions``:
+    ``pending_actions`` counts actions, and a run can hold two.
+
+    ``campaigns`` counts the active campaigns with no decision, at any age.
+    An investigation that a campaign holds is no item of its own: the analyst
+    decides on the campaign (:func:`soc_ai.campaigns.service.held`). It
+    counts in no other part.
     """
 
     leads_needing_decision: int | None = 0
+    campaigns: int | None = 0
     unread_shadow_hits: int | None = 0
     untriaged_groups: int | None = 0
     needs_more_info: int | None = 0
     pending_actions: int | None = 0
+    decisions: int = 0
+    review: int | None = 0
+    investigations_waiting: int | None = 0
+    # Deprecated: decisions plus review. An older console reads it.
     total: int = 0
     unknown: list[str] = Field(default_factory=list)
     # The windows of the parts that have one, in the console's range words.
     alert_window: str = "7d"
-    verdict_window: str = f"{_NEEDS_YOU_VERDICT_DAYS}d"
+    verdict_window: str = _NEEDS_YOU_VERDICT_WINDOW
     # True when the alert part is a floor: the grid capped the group list.
     alert_floor: bool = False
 
@@ -1346,14 +1847,44 @@ async def _cached_untriaged_groups(request: Request) -> tuple[int, bool]:
     return count, floor
 
 
-async def _pending_action_count(request: Request, *, since: datetime) -> int:
+async def _pending_action_count(request: Request, *, since: datetime | None) -> int:
     """Recommended actions that wait for a person, on the standing true positives.
 
     The rule is :func:`pending_action_runs`. This sums its counts.
     """
     async with request.app.state.db_sessionmaker() as db:
-        by_run = await pending_action_runs(db, since=since, state=request.app.state)
+        by_run = await request_pending_action_runs(request, db, since=since)
     return sum(by_run.values())
+
+
+async def request_pending_action_runs(
+    request: Request,
+    db: Any,
+    *,
+    since: datetime | None,
+    until: datetime | None = None,
+    clock: str = inv_svc.CLOCK_EVENT,
+) -> dict[str, int]:
+    """:func:`pending_action_runs`, read once per request for one window.
+
+    ``GET /needs-you`` reads the scan for ``pending_actions`` and again
+    through the Needs you query of the Investigations list. The scan reads
+    every true positive run of the window and its events, so the second
+    read doubled the cost of a route that each tab polls. The result stays
+    on the request, keyed by the window. A failed scan stores nothing.
+    """
+    memo: dict[tuple[datetime | None, datetime | None, str], dict[str, int]] | None = getattr(
+        request.state, "pending_action_runs", None
+    )
+    if memo is None:
+        memo = {}
+        request.state.pending_action_runs = memo
+    key = (since, until, clock)
+    if key not in memo:
+        memo[key] = await pending_action_runs(
+            db, since=since, until=until, state=request.app.state, clock=clock
+        )
+    return memo[key]
 
 
 async def pending_action_runs(
@@ -1362,6 +1893,7 @@ async def pending_action_runs(
     since: datetime | None,
     until: datetime | None = None,
     state: Any = None,
+    clock: str = inv_svc.CLOCK_EVENT,
 ) -> dict[str, int]:
     """The runs with a pending recommended action, and the count of each one.
 
@@ -1383,9 +1915,12 @@ async def pending_action_runs(
     (dogfood 2026-10-20). A blocked action stays on the run page, with its
     reason and its next step.
 
-    ``since`` and ``until`` bound ``created_at`` (naive UTC, inclusive). The
-    needs-you count and the Investigations list filter both read this, so the
-    list holds the runs the count counts.
+    ``since`` and ``until`` bound the time of ``clock`` (naive UTC,
+    inclusive), the window of the Investigations list: ``event_at`` by
+    default, ``created_at`` for ``investigated``. The needs-you count passes
+    no window: an action waits until a person decides, whatever the age of
+    its event. The scan takes the newest investigations first, so a new
+    verdict on an old event is never the one that the cap leaves out.
 
     The card also reads the live acknowledged flag of the alert from the grid.
     This rule does not, because one grid read per run is too much for a poll.
@@ -1396,6 +1931,10 @@ async def pending_action_runs(
     search for every anchor of the scan, and the answers stay in a cache
     (:mod:`soc_ai.webui.anchor_check`). Without ``state`` an anchored alert
     counts nothing.
+
+    A run that a campaign holds counts nothing: the campaign is the item
+    (:func:`soc_ai.campaigns.service.held`). The action rule says the same
+    (:func:`action_rules.action_waits`), so the card and the count agree.
     """
     from soc_ai.store.models import Investigation  # noqa: PLC0415 - lazy
 
@@ -1405,11 +1944,17 @@ async def pending_action_runs(
         Investigation.is_fallback.isnot(True),
         inv_svc.not_backtest(),
         not_(inv_svc.superseded_sql()),
+        # A run that a campaign holds waits on the campaign. Left out before
+        # the scan cap, so the held runs cannot fill the cap.
+        not_(campaign_svc.held_sql()),
     ]
+    window = (
+        Investigation.created_at if clock == inv_svc.CLOCK_INVESTIGATED else Investigation.event_at
+    )
     if since is not None:
-        conds.append(Investigation.created_at >= since)
+        conds.append(window >= since)
     if until is not None:
-        conds.append(Investigation.created_at <= until)
+        conds.append(window <= until)
     runs = (
         await db.scalars(
             select(Investigation)
@@ -1423,16 +1968,18 @@ async def pending_action_runs(
 
 
 async def pending_actions_by_run(
-    db: Any, runs: Sequence[Any], *, state: Any = None
+    db: Any, runs: Sequence[Any], *, state: Any = None, held: bool = True
 ) -> dict[str, int]:
     """The pending recommended actions of each run, keyed by run id.
 
     The caller picks the runs. This applies the rest of the needs-you rule
     (:func:`pending_action_runs`) through :func:`waiting_actions_by_run`, so
     the count and the list rows cannot disagree. The hunt page reads it for
-    the investigation of each finding.
+    the investigation of each finding. ``held`` False reads the runs as if
+    no campaign held them: the draft of a campaign authorization counts the
+    actions that wait on the campaign.
     """
-    by_run = await _waiting_actions(db, runs, demo=False, state=state)
+    by_run = await _waiting_actions(db, runs, demo=False, state=state, held=held)
     return {run_id: len(actions) for run_id, actions in by_run.items()}
 
 
@@ -1469,7 +2016,7 @@ def _target_type(run: Any, tool_name: str) -> str:
 
 
 async def _waiting_actions(
-    db: Any, runs: Sequence[Any], *, demo: bool, state: Any = None
+    db: Any, runs: Sequence[Any], *, demo: bool, state: Any = None, held: bool = True
 ) -> dict[str, list[Any]]:
     """The waiting actions of each run, under the one action rule.
 
@@ -1485,7 +2032,10 @@ async def _waiting_actions(
         WaitingActionOut,
         _build_actions,
     )
-    from soc_ai.api.webui.routes_actions import _observed_case_id  # noqa: PLC0415 - cycle
+    from soc_ai.api.webui.routes_actions import (  # noqa: PLC0415 - cycle
+        _observed_case_id,
+        finding_case_blocked,
+    )
     from soc_ai.api.webui.routes_investigations import (  # noqa: PLC0415 - cycle
         superseding_run_ids,
     )
@@ -1545,32 +2095,53 @@ async def _waiting_actions(
     anchor_states = (
         await anchor_check.alert_status(state, list(anchors)) if anchors and state else {}
     )
+    # A run inside an authorized scope requests nothing. A revoke ends that.
+    marks = await authorized_svc.marks_for(
+        db, [getattr(r, "authorization_id", None) for r in candidates]
+    )
+    # A run that a campaign holds waits on the campaign.
+    campaigns = await campaign_svc.links_of(db, [r.id for r in candidates]) if held else {}
     out: dict[str, list[Any]] = {}
     for run in candidates:
         run_events = by_run.get(run.id, [])
         standing = None if inv_svc.is_hunt_subject(run) else analyst.get(run.alert_es_id)
         case_id = _observed_case_id(run_events)
         promoted = action_rules.promoted_kind(run)
-        facts = action_rules.ActionFacts(
-            replay=inv_svc.is_backtest(run),
-            promoted=promoted,
-            anchor=None if promoted else anchors.get(run.alert_es_id or ""),
-            anchor_status=anchor_states.get(run.alert_es_id or "", anchor_check.UNKNOWN),
-            alert_id=run.alert_es_id,
-            run_verdict=run.verdict,
-            analyst_verdict=standing.verdict if standing is not None else None,
-            analyst_by=standing.resolved_by if standing is not None else None,
-            case_id=case_id,
+        mark = marks.get(getattr(run, "authorization_id", None) or 0)
+        facts = action_rules.with_campaign(
+            action_rules.ActionFacts(
+                replay=inv_svc.is_backtest(run),
+                promoted=promoted,
+                anchor=None if promoted else anchors.get(run.alert_es_id or ""),
+                anchor_status=anchor_states.get(run.alert_es_id or "", anchor_check.UNKNOWN),
+                alert_id=run.alert_es_id,
+                run_verdict=run.verdict,
+                analyst_verdict=standing.verdict if standing is not None else None,
+                analyst_by=standing.resolved_by if standing is not None else None,
+                case_id=case_id,
+                authorized=mark.label if mark is not None and mark.holds else None,
+            ),
+            campaigns.get(run.id),
         )
         waiting: list[Any] = []
         for index, action, rec in open_actions[run.id]:
             tool_name = str(rec.get("tool_name") or "")
-            # An action the console cannot execute does not wait for anyone.
-            if action_rules.action_block(facts, tool_name) is not None:
+            # An action the console cannot execute does not wait for anyone,
+            # and no action of an authorized run or of a run that a campaign
+            # holds does.
+            if not action_rules.action_waits(facts, tool_name):
                 continue
             reason = action_rules.block_reason(dataclasses.replace(facts, demo=demo), tool_name)
             tag = _ACTION_TAG.get(tool_name, "comment")
             on_case = tool_name == "add_case_comment"
+            target_type = _target_type(run, tool_name)
+            # A finding escalate that waits on "Try again" offers no Escalate
+            # on the row. One record read, for that action type only.
+            retry = (
+                tag == "escalate"
+                and target_type == "finding"
+                and await finding_case_blocked(db, run)
+            )
             waiting.append(
                 WaitingActionOut(
                     id=action.id,
@@ -1582,10 +2153,11 @@ async def _waiting_actions(
                         if on_case
                         else run.rule_name or f"Alert {run.alert_es_id or run.id}"
                     ),
-                    targetType=_target_type(run, tool_name),
+                    targetType=target_type,
                     rationale=scrub_secrets(action.rationale or ""),
                     executable=reason is None,
                     reason=reason,
+                    retry=retry,
                 )
             )
         if waiting:
@@ -1601,13 +2173,23 @@ async def needs_you_count(request: Request) -> NeedsYouCountOut:
       count (``GET /hunts/needs-you``), read through its own route.
     * ``untriaged_groups``: alert groups with no verdict in ``alert_window``,
       acknowledged groups hidden, read through the Alerts list.
-    * ``needs_more_info``: runs with that verdict in ``verdict_window``, the
-      count the Investigations list shows for that filter.
+    * ``needs_more_info``: runs with that verdict in ``verdict_window`` that
+      still wait. A run that a later run replaced, and a run that
+      ``soc-ai needs-you clear`` took out, wait no more.
     * ``pending_actions``: recommended actions that wait on the standing true
       positives in ``verdict_window``.
+    * ``decisions`` and ``review``: the split of the parts
+      (:func:`routes_analytics.split_needs_you`). ``decisions`` sums
+      ``campaigns``, ``investigations_waiting``, ``leads_needing_decision``
+      and ``untriaged_groups``. ``needs_more_info`` and ``pending_actions``
+      are detail of ``investigations_waiting``.
+    * ``investigations_waiting``: the runs of the Needs you view of the
+      Investigations list in ``verdict_window``.
+    * ``campaigns``: the active campaigns with no decision, at any age.
 
-    Each part fails alone. A grid outage takes the alert part and leaves the
-    four database parts standing.
+    The investigation parts read every age: an item stays until a person
+    decides. The scan caps stay. Each part fails alone. A grid outage takes
+    the alert part and leaves the database parts standing.
     """
     from soc_ai.api.webui import (  # noqa: PLC0415 - lazy
         routes_alerts,
@@ -1631,40 +2213,284 @@ async def needs_you_count(request: Request) -> NeedsYouCountOut:
         _LOGGER.warning("needs-you: the alert part failed (continuing)", exc_info=True)
         out.untriaged_groups = None
         out.unknown.append("untriaged_groups")
-    since = datetime.now(UTC) - timedelta(days=_NEEDS_YOU_VERDICT_DAYS)
     try:
-        page = await routes_investigations.list_investigations(
-            request,
-            status=None,
-            verdict="needs_more_info",
-            q=None,
-            since=since,
-            until=None,
-            error_state=None,
-            limit=1,
-            offset=0,
-        )
+        async with request.app.state.db_sessionmaker() as db:
+            out.campaigns = await campaign_svc.waiting_count(db)
+    except Exception:
+        _LOGGER.warning("needs-you: the campaign part failed (continuing)", exc_info=True)
+        out.campaigns = None
+        out.unknown.append("campaigns")
+    try:
+        # The Needs you rule with no action set: the verdicts that need more
+        # info and still wait. A verdict that a later run replaced, and a
+        # verdict that a clear took out of Needs you, wait on nobody.
+        async with request.app.state.db_sessionmaker() as db:
+            page = await inv_svc.query_page(db, limit=1, needs_you_ids=[])
         out.needs_more_info = page.total
     except Exception:
         _LOGGER.warning("needs-you: the needs-more-info part failed (continuing)", exc_info=True)
         out.needs_more_info = None
         out.unknown.append("needs_more_info")
     try:
-        out.pending_actions = await _pending_action_count(request, since=since.replace(tzinfo=None))
+        out.pending_actions = await _pending_action_count(request, since=None)
     except Exception:
         _LOGGER.warning("needs-you: the pending-action part failed (continuing)", exc_info=True)
         out.pending_actions = None
         out.unknown.append("pending_actions")
-    out.total = sum(
-        part or 0
-        for part in (
-            out.leads_needing_decision,
-            out.unread_shadow_hits,
-            out.untriaged_groups,
-            out.needs_more_info,
-            out.pending_actions,
+    try:
+        # The list query of the Needs you view, one row, for its total.
+        waiting = await routes_investigations.list_investigations(
+            request,
+            status=None,
+            verdict=None,
+            q=None,
+            since=None,
+            until=None,
+            error_state=None,
+            limit=1,
+            offset=0,
+            needs_you=True,
         )
+        out.investigations_waiting = waiting.total
+    except Exception:
+        _LOGGER.warning("needs-you: the investigation run count failed (continuing)", exc_info=True)
+        out.investigations_waiting = None
+        # A part of the decisions: the count is a floor, and the console says so.
+        out.unknown.append("investigations_waiting")
+    out.decisions, out.review = routes_analytics.split_needs_you(
+        {
+            "campaigns": out.campaigns,
+            "investigations_waiting": out.investigations_waiting,
+            "leads_needing_decision": out.leads_needing_decision,
+            "untriaged_groups": out.untriaged_groups,
+            "unread_shadow_hits": out.unread_shadow_hits,
+        }
     )
+    out.total = out.decisions + (out.review or 0)
+    return out
+
+
+# The most items GET /needs-you/items lists, the oldest first.
+NEEDS_YOU_ITEMS_MAX = 200
+
+
+class NeedsYouItemOut(BaseModel):
+    """One decision that waits on the analyst.
+
+    ``type`` is ``campaign``, ``investigation``, ``lead`` or ``alerts``.
+    ``since`` is when the item started to wait, as ISO-8601 UTC: the wait of
+    a campaign, the finish of an investigation, the formation of a lead. It
+    is null for the one item of the alert groups. ``stage`` is the stage of a
+    campaign, else null.
+    """
+
+    type: str
+    id: str
+    title: str
+    detail: str
+    since: str | None = None
+    href: str
+    stage: str | None = None
+
+
+class NeedsYouItemsOut(BaseModel):
+    """The decisions that wait, in one list, the oldest first, at most 200.
+
+    ``total`` counts every item, the items past the cap included, and the one
+    item of the alert groups counts its groups: the number of the top bar,
+    ``decisions`` of ``GET /needs-you``. ``unknown`` names each type that
+    soc-ai could not read. Its items are missing, and ``total`` is then a
+    floor.
+    """
+
+    items: list[NeedsYouItemOut] = Field(default_factory=list)
+    total: int = 0
+    unknown: list[str] = Field(default_factory=list)
+
+
+def _plural_words(n: int, one: str, many: str) -> str:
+    return f"{n:,} {one if n == 1 else many}"
+
+
+def _campaign_items(rows: Sequence[Any]) -> list[NeedsYouItemOut]:
+    from soc_ai.campaigns.words import stage_sentence  # noqa: PLC0415 - lazy
+
+    out: list[NeedsYouItemOut] = []
+    for row in rows:
+        parts = [stage_sentence(row.stage)]
+        if row.alerts is not None:
+            parts.append(f"{_plural_words(row.alerts, 'alert event', 'alert events')}.")
+        out.append(
+            NeedsYouItemOut(
+                type="campaign",
+                id=str(row.id),
+                title=row.title,
+                detail=" ".join(parts),
+                since=_at(row.waits_since or row.first_event),
+                href=f"/campaigns/{row.id}",
+                stage=row.stage,
+            )
+        )
+    return out
+
+
+async def _investigation_items(request: Request, db: Any) -> tuple[list[NeedsYouItemOut], int]:
+    """The investigations that wait, by the rule of ``investigations_waiting``.
+
+    The query of ``GET /investigations?needs_you=true`` at every age. The page
+    holds the newest first, so the oldest are the last rows.
+    """
+    pending = await request_pending_action_runs(request, db, since=None)
+    wanted = sorted(pending)
+    head = await inv_svc.query_page(db, limit=1, needs_you_ids=wanted)
+    total = head.total
+    page = await inv_svc.query_page(
+        db,
+        limit=NEEDS_YOU_ITEMS_MAX,
+        offset=max(0, total - NEEDS_YOU_ITEMS_MAX),
+        needs_you_ids=wanted,
+    )
+    # An investigation beyond the authorization of its campaign says so first.
+    links = await campaign_svc.links_of(db, [inv.id for inv in page.rows])
+    out: list[NeedsYouItemOut] = []
+    for inv in page.rows:
+        actions = pending.get(inv.id, 0)
+        detail = (
+            f"{_plural_words(actions, 'recommended action waits', 'recommended actions wait')}."
+            if actions
+            else "The verdict needs more info."
+        )
+        link = links.get(inv.id)
+        if link is not None and link.beyond:
+            detail = f"Beyond the authorization of the campaign {link.title}. {detail}"
+        out.append(
+            NeedsYouItemOut(
+                type="investigation",
+                id=str(inv.id),
+                title=inv.rule_name or f"Investigation {inv.id}",
+                detail=detail,
+                since=_at(inv.finished_at or inv.created_at),
+                href=f"/investigation/{inv.id}",
+            )
+        )
+    return out, total
+
+
+async def _lead_items(request: Request, db: Any) -> tuple[list[NeedsYouItemOut], int]:
+    """The leads that wait on a decision, by the rule of ``leads_needing_decision``."""
+    from soc_ai.store import leads as leads_store  # noqa: PLC0415 - lazy
+    from soc_ai.store.models import Hunt, Lead  # noqa: PLC0415 - lazy
+
+    auto_hunt = bool(getattr(request.app.state.settings, "lead_auto_hunt", False))
+    waits = leads_store.needs_decision_clause(auto_hunt=auto_hunt)
+    total = int(
+        await db.scalar(
+            select(func.count(Lead.id)).outerjoin(Hunt, Hunt.id == Lead.hunt_id).where(waits)
+        )
+        or 0
+    )
+    rows = (
+        await db.scalars(
+            select(Lead)
+            .outerjoin(Hunt, Hunt.id == Lead.hunt_id)
+            .where(waits)
+            .order_by(Lead.formed_at, Lead.id)
+            .limit(NEEDS_YOU_ITEMS_MAX)
+        )
+    ).all()
+    out: list[NeedsYouItemOut] = []
+    for lead in rows:
+        entities = [
+            str(entity[1])
+            for entity in (lead.entities_json or [])
+            if isinstance(entity, list | tuple) and len(entity) == 2
+        ]
+        kinds = ", ".join(kind_label(kind) for kind in (lead.kinds_json or []))
+        out.append(
+            NeedsYouItemOut(
+                type="lead",
+                id=str(lead.id),
+                title=f"Lead {lead.id} on {', '.join(entities) or 'an entity'}",
+                detail=f"Observations: {kinds}." if kinds else "The lead waits on a decision.",
+                since=_at(lead.formed_at),
+                href=f"/leads/{lead.id}",
+            )
+        )
+    return out, total
+
+
+def _window_words(window: str) -> str:
+    """A range word as words: "7d" is "7 days"."""
+    units = {"m": ("minute", "minutes"), "h": ("hour", "hours"), "d": ("day", "days")}
+    number, unit = window[:-1], window[-1:]
+    if not number.isdigit() or unit not in units:
+        return window
+    return _plural_words(int(number), *units[unit])
+
+
+def _alert_item(count: int, floor: bool, window: str) -> NeedsYouItemOut:
+    groups = _plural_words(count, "alert group has", "alert groups have")
+    lead = "At least " if floor else ""
+    return NeedsYouItemOut(
+        type="alerts",
+        id="alerts",
+        title="Alert groups with no verdict",
+        detail=f"{lead}{groups} no verdict in the last {_window_words(window)}.",
+        href=f"/alerts?range={window}&verdict=untriaged",
+    )
+
+
+@router.get("/needs-you/items", response_model=NeedsYouItemsOut)
+async def needs_you_items(request: Request) -> NeedsYouItemsOut:
+    """The decisions that wait on the analyst, in one list, the oldest first.
+
+    One item for each active campaign with no decision, each investigation
+    that waits, and each lead that needs a decision. One more item states
+    the alert groups with no verdict, with the count in ``detail``. The rules
+    are the rules of ``GET /needs-you``: an investigation that a campaign
+    holds is no item of its own, and the investigations and the leads count
+    at every age. ``total`` is the number of the top bar: ``decisions`` of
+    ``GET /needs-you``, with the alert groups counted one by one.
+
+    Each type fails alone, and ``unknown`` names it.
+    """
+    from soc_ai.api.webui import routes_alerts  # noqa: PLC0415 - lazy
+
+    out = NeedsYouItemsOut()
+    items: list[NeedsYouItemOut] = []
+    try:
+        async with request.app.state.db_sessionmaker() as db:
+            rows = await campaign_svc.waiting_campaigns(db)
+        items += _campaign_items(rows)
+        out.total += len(rows)
+    except Exception:
+        _LOGGER.warning("needs-you items: the campaigns failed (continuing)", exc_info=True)
+        out.unknown.append("campaign")
+    for name, read in (("investigation", _investigation_items), ("lead", _lead_items)):
+        try:
+            async with request.app.state.db_sessionmaker() as db:
+                found, total = await read(request, db)
+            items += found
+            out.total += total
+        except Exception:
+            _LOGGER.warning(
+                "needs-you items: the %s items failed (continuing)", name, exc_info=True
+            )
+            out.unknown.append(name)
+    try:
+        count, floor = await _cached_untriaged_groups(request)
+        if count:
+            items.append(_alert_item(count, floor, routes_alerts.NEEDS_YOU_ALERT_RANGE))
+            # One item for every group, and each group is one decision: the
+            # total counts the groups, so it is the number of GET /needs-you.
+            out.total += count
+    except Exception:
+        _LOGGER.warning("needs-you items: the alert groups failed (continuing)", exc_info=True)
+        out.unknown.append("alerts")
+    # The oldest first. The item of the alert groups has no moment, so it ends
+    # the list.
+    items.sort(key=lambda item: (item.since is None, item.since or "", item.type, item.id))
+    out.items = items[:NEEDS_YOU_ITEMS_MAX]
     return out
 
 

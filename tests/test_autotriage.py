@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
 from typing import Any
@@ -815,6 +816,37 @@ class TestInheritedAckEvidenceBar:
         )
         write, _status = self._run(at_settings, source)
         write.assert_not_awaited()
+
+    def test_the_refusal_logs_one_time_for_each_alert_group(
+        self, at_settings: Settings, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Prod wrote 74,560 "not acking" lines for 1,238 alerts in 13 days,
+        up to 474 for one alert: each sweep logged the same decision again
+        (review 2026-11-12, ops finding 9). The line prints one time for each
+        alert group in one process run. An alert group is one rule and the
+        investigation its alerts inherit from."""
+        from soc_ai.webui import autotriage as at
+
+        at._NOT_ACKED_LOGGED.clear()
+        source = _seed_investigation(at_settings, rule_name="ET SCAN thing", alert_es_id="src-ev")
+        other = _seed_investigation(at_settings, rule_name="ET SCAN thing", alert_es_id="src-ev2")
+        with caplog.at_level(logging.INFO, logger="soc_ai.webui.autotriage"):
+            for _sweep in range(3):
+                write, status = self._run(at_settings, source)
+                # Negative control: the log is quiet, the decision is not. Each
+                # sweep still refuses the acknowledgement and still counts it.
+                write.assert_not_awaited()
+                assert status.inherited_refused == {"no_investigation": 1}
+            lines = [r.getMessage() for r in caplog.records if "not acking" in r.getMessage()]
+            assert len(lines) == 1, lines
+            assert source in lines[0]
+            assert "ET SCAN thing" in lines[0]
+            # A second group, the same rule from another investigation, gets
+            # its own line.
+            self._run(at_settings, other)
+            lines = [r.getMessage() for r in caplog.records if "not acking" in r.getMessage()]
+            assert len(lines) == 2, lines
+            assert other in lines[1]
 
     def test_an_investigated_source_still_acks(self, at_settings: Settings) -> None:
         """The control that matters: an acknowledgement that genuinely should

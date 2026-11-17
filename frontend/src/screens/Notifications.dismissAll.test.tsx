@@ -26,10 +26,14 @@ const PROD: NeedsYouCount = {
   untriaged_groups: 0,
   needs_more_info: 2,
   pending_actions: 0,
+  // The two investigations behind the verdicts that need more info.
+  investigations_waiting: 2,
+  decisions: 9,
+  review: 300,
   total: 309,
   unknown: [],
   alert_window: '7d',
-  verdict_window: '30d',
+  verdict_window: 'all',
   alert_floor: false,
 };
 
@@ -81,10 +85,14 @@ describe('Notifications: the Needs-you block', () => {
     const block = await screen.findByTestId('needs-you-block');
     await waitFor(() =>
       expect(within(block).getAllByTestId(/^needs-you-part-/).map((p) => p.textContent)).toEqual([
+        '2 investigations wait on your decision, at any age',
         '7 leads wait on a decision, all open',
-        '300 shadow hits are unread, all unread',
-        '2 verdicts need more info, last 30 days',
       ]),
+    );
+    // The hits are review work, on their own line (production review
+    // 2026-11-12, ui-core 4).
+    expect(within(block).getByTestId('needs-you-review').textContent).toBe(
+      '300 shadow hits to review, all unread',
     );
     expect(getNotifications).toHaveBeenCalledWith({ limit: 12, eventsOnly: true, after: null });
   });
@@ -111,7 +119,7 @@ describe('Notifications: Dismiss all', () => {
     vi.mocked(getNotifications).mockResolvedValue([...runs(2), tamper]);
     renderScreen();
     await screen.findByText(/ET RUN 0$/);
-    await screen.findByTestId('needs-you-part-unread_shadow_hits');
+    await screen.findByTestId('needs-you-review');
     expect(screen.queryByRole('button', { name: /clear all/i })).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: 'Dismiss all' }));
     expect(screen.getByRole('group', { name: 'Confirm dismiss all' }).textContent).toContain(
@@ -123,7 +131,7 @@ describe('Notifications: Dismiss all', () => {
     vi.mocked(getNotifications).mockResolvedValue([...runs(2), tamper]);
     renderScreen();
     await screen.findByText(/ET RUN 0$/);
-    await screen.findByTestId('needs-you-part-unread_shadow_hits');
+    await screen.findByTestId('needs-you-review');
     const before = Date.now();
     fireEvent.click(screen.getByRole('button', { name: 'Dismiss all' }));
     fireEvent.click(screen.getByRole('button', { name: 'Dismiss all' }));
@@ -140,7 +148,7 @@ describe('Notifications: Dismiss all', () => {
     vi.mocked(getNotifications).mockResolvedValue(runs(2));
     renderScreen();
     await screen.findByText(/ET RUN 0$/);
-    await screen.findByTestId('needs-you-part-unread_shadow_hits');
+    await screen.findByTestId('needs-you-review');
     fireEvent.click(screen.getByRole('button', { name: 'Dismiss all' }));
     // The read after the Dismiss all: a row older than the mark that the
     // screen never loaded, and a newer one. An older server ignores `after`.
@@ -174,7 +182,7 @@ describe('Notifications: Dismiss all undo', () => {
       </MemoryRouter>,
     );
     await screen.findByText(/ET RUN 0$/);
-    await screen.findByTestId('needs-you-part-unread_shadow_hits');
+    await screen.findByTestId('needs-you-review');
     fireEvent.click(screen.getByRole('button', { name: 'Dismiss all' }));
     expect(screen.getByRole('group', { name: 'Confirm dismiss all' }).textContent).toContain(
       'Undo shows the notifications again. The shadow hits stay read.',

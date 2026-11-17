@@ -113,17 +113,38 @@ PORT_TRANSPORTS: tuple[str, ...] = ("tcp", "udp")
 _TRANSPORT_AGG_SIZE = 4
 
 
+def _probed(bucket: dict[str, Any]) -> bool:
+    """True when each record to the port is a probe.
+
+    The port has no record with served evidence, and no record that the rule
+    cannot judge. A bucket with no evidence counts is a grid or a reader from
+    before the counts, and the port keeps the behavior it had.
+    """
+    served, unjudged = bucket.get("served"), bucket.get("unjudged")
+    if not isinstance(served, dict) or not isinstance(unjudged, dict):
+        return False
+    return int(served.get("doc_count") or 0) == 0 and int(unjudged.get("doc_count") or 0) == 0
+
+
 def _port_pairs(agg: dict[str, Any] | None) -> list[dict[str, Any]]:
-    """The responder port terms as ``[{value, count, transport?}]``.
+    """The responder port terms as ``[{value, count, transport?, answered?}]``.
 
     ``transport`` is the busiest of tcp and udp under the port. It is absent
     when the grid carries no transport field, and the renderer then keeps its
     old assumption. Port 0 is not a port and is dropped.
+
+    ``answered`` is present only on a probed port, and it is 0: the port has
+    flow records and none shows an answer. The inference reads it and gives
+    the port no service, no role and no place on the management plane. One
+    record with a responder packet is enough to leave the key off, and the
+    port then counts as it did before. One Nmap sweep made 594 of 600 sampled
+    addresses a "management-plane responder on tcp/22".
     """
     out: list[dict[str, Any]] = []
     for pair, bucket in zip(_bucket_pairs(agg), _raw_buckets(agg), strict=False):
         if str(pair.get("value")) == "0":
             continue
+        entry = {**pair, "answered": 0} if _probed(bucket) else pair
         transports = ((bucket.get("transport") or {}).get("buckets")) or []
         best = next(
             (
@@ -133,7 +154,7 @@ def _port_pairs(agg: dict[str, Any] | None) -> list[dict[str, Any]]:
             ),
             None,
         )
-        out.append({**pair, "transport": best} if best is not None else pair)
+        out.append({**entry, "transport": best} if best is not None else entry)
     return out
 
 
@@ -1146,7 +1167,17 @@ def _build_aggs(ip: str, f: _AggFields, *, optional: bool = True) -> dict[str, A
     and is what every role rule reads, so it must survive the retry.
     """
     responder_aggs: dict[str, Any] = {
-        "ports": {"terms": {"field": "destination.port", "size": _PORT_AGG_SIZE}},
+        "ports": {
+            "terms": {"field": "destination.port", "size": _PORT_AGG_SIZE},
+            # A flow record is written for a connection ATTEMPT, so a port scan
+            # gave a host responder ports that it never answered on. These two
+            # counts tell a served port from a probed port (see _port_pairs).
+            # They are in the mandatory half: every role rule reads the ports.
+            "aggs": {
+                "served": {"filter": fields.served_evidence_clause()},
+                "unjudged": {"filter": {"bool": {"must_not": [fields.judged_record_clause()]}}},
+            },
+        },
         "peers": {"cardinality": {"field": "source.ip"}},
         "hours": {
             "date_histogram": {
@@ -1163,8 +1194,8 @@ def _build_aggs(ip: str, f: _AggFields, *, optional: bool = True) -> dict[str, A
     if optional:
         # Which transport each answered port ran over. A UDP-only service on
         # 53 rendered as tcp/53 because the port terms carried no transport.
-        responder_aggs["ports"]["aggs"] = {
-            "transport": {"terms": {"field": f.transport, "size": _TRANSPORT_AGG_SIZE}}
+        responder_aggs["ports"]["aggs"]["transport"] = {
+            "terms": {"field": f.transport, "size": _TRANSPORT_AGG_SIZE}
         }
         responder_aggs["services"] = {"terms": {"field": f.service, "size": _SERVICE_AGG_SIZE}}
         responder_aggs["bytes"] = {"percentiles": {"field": f.resp_bytes, "percents": [50, 95]}}

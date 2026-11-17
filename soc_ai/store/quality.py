@@ -53,6 +53,7 @@ async def insert_snapshot(
     n_no: int | None = None,
     n_classified: int | None = None,
     analyst_model: str | None = None,
+    detail: dict[str, Any] | None = None,
     keep_last: int = KEEP_LAST,
 ) -> QualitySnapshot:
     """Insert one nightly snapshot and prune history in the SAME transaction.
@@ -85,6 +86,11 @@ async def insert_snapshot(
     is how ``analyst_model`` differs. That one names a route out of the
     install's configuration, which this module has no business reading, so it
     is passed in and is NULL when a caller had nothing to say.
+
+    ``detail`` (0066) is the same kind of argument: the served model of the
+    runs, the planted true positives and the lost grades, as one JSON object.
+    None leaves SQL NULL, which a reader takes as "this row recorded none of
+    it" and never as "it measured them and found nothing".
     """
     from soc_ai import __commit__, __version__  # noqa: PLC0415 - lazy: avoid a cycle
 
@@ -109,6 +115,7 @@ async def insert_snapshot(
         app_version=__version__,
         code_commit=__commit__,
         analyst_model=analyst_model,
+        detail=detail,
     )
     db.add(row)
     # Flush so the new row has its id and is visible to the prune subquery —

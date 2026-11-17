@@ -641,6 +641,443 @@ def test_the_focus_of_a_finding_run_asks_for_the_claim() -> None:
     assert "Answer the hunt's objective." in promotion_focus(**kwargs, finding_subject=False)
 
 
+# ── A finding with no document of its own anchors on the hosts it names ─────
+#
+# Prod 2026-11-14, hunt 01M7DNRCRYV7CSHM5PX6K6GC12: finding 0 named the web
+# server and one client and cited two summary queries. Its investigation
+# anchored on a zeek.ssh record between two other machines, which another
+# finding cited. The row held the ends and the time of that record.
+
+_WEB = "192.0.2.164"
+_CLIENT = "198.51.100.226"
+_ACTOR = "198.51.100.58"
+_PEER = "198.51.100.8"
+_CI = "192.0.2.172"
+_OWN_QUERY = "t_query_events_oql zeek.http destination.ip:192.0.2.164 groupby http.uri 2026-11-14"
+
+
+def _doc(
+    doc_id: str,
+    dataset: str,
+    src: str | None = None,
+    dst: str | None = None,
+    *,
+    host_name: str | None = None,
+    host_ip: list[str] | None = None,
+) -> Any:
+    from soc_ai.so_client.models import SoAlert
+
+    return SoAlert(
+        id=doc_id,
+        event_dataset=dataset,
+        source_ip=src,
+        destination_ip=dst,
+        host_name=host_name,
+        host_ip=host_ip or [],
+    )
+
+
+def _hit(doc_id: str, dataset: str, src: str | None = None, dst: str | None = None) -> Any:
+    source: dict[str, Any] = {"event": {"dataset": dataset}}
+    if src:
+        source["source"] = {"ip": src}
+    if dst:
+        source["destination"] = {"ip": dst}
+    return {"_id": doc_id, "_source": source}
+
+
+def _host_subject(
+    hosts: list[str],
+    documents: list[Any],
+    *,
+    own: list[str] | None = None,
+    promoted: bool = True,
+    started_at: Any = None,
+    finished_at: Any = None,
+    objective: str = "Hunt for malicious activity over the past 72 hours.",
+) -> Any:
+    """F0 names ``hosts`` and cites ``own``. F1 cites every document of the subject."""
+    from soc_ai.agent.context import HuntSubject, SubjectFinding
+
+    return HuntSubject(
+        hunt_id="01HUNT0000000000000000000",
+        objective=objective,
+        findings=[
+            SubjectFinding(
+                ordinal=0,
+                title="Successful LFI read-back on the web server",
+                hosts=hosts,
+                citations=own if own is not None else [_OWN_QUERY],
+                promoted=promoted,
+            ),
+            SubjectFinding(
+                ordinal=1,
+                title="SSH fan-out is established behavior",
+                hosts=[_ACTOR],
+                citations=[d.id for d in documents],
+            ),
+        ],
+        documents=documents,
+        started_at=started_at,
+        finished_at=finished_at,
+    )
+
+
+class _HostGrid:
+    """A grid double for the host read. It answers every search with ``hits``.
+
+    The double does not apply the query, so a hit on other machines also comes
+    back. The anchor rule must test the ends of each hit itself.
+    """
+
+    def __init__(self, hits: list[Any] | None = None, *, error: BaseException | None = None):
+        self.hits = list(hits or [])
+        self.error = error
+        self.calls: list[dict[str, Any]] = []
+
+    async def search(self, index: str, query: dict[str, Any], **kwargs: Any) -> EsSearchResult:
+        self.calls.append({"index": index, "query": query, **kwargs})
+        if self.error is not None:
+            raise self.error
+        return EsSearchResult(total=len(self.hits), took_ms=1, hits=self.hits)
+
+
+def _anchor(subject: Any, grid: _HostGrid, citations: list[str] | None = None) -> str:
+    from soc_ai.webui.finding_promotion import promotion_anchor
+
+    settings = SimpleNamespace(webui_grid_timeout_s=5.0, events_index_pattern="logs-*")
+    return asyncio.run(
+        promotion_anchor(
+            settings=settings,  # type: ignore[arg-type]
+            elastic=grid,  # type: ignore[arg-type]
+            citations=citations if citations is not None else [_OWN_QUERY],
+            subject=subject,
+        )
+    )
+
+
+# The five documents of the prod hunt: four sigma alerts on a CI machine and
+# one zeek.ssh record between two other machines.
+_PROD_DOCUMENTS = [
+    *(_doc(f"sigma-ci-0000{i}", "sigma.alert", _CI, None) for i in range(4)),
+    _doc("zeek-ssh-other-01", "zeek.ssh", _ACTOR, _PEER),
+]
+
+
+def test_the_reproduction_anchors_on_a_record_between_the_two_named_hosts() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    started = datetime.now(UTC).replace(tzinfo=None) - timedelta(minutes=13)
+    subject = _host_subject([_WEB, _CLIENT], list(_PROD_DOCUMENTS), started_at=started)
+    grid = _HostGrid(
+        [
+            # Newest first. The double ignores the query, so the newest hit is
+            # a record of other machines. The rule must not take it.
+            _hit("zeek-ssh-other-02", "zeek.ssh", _ACTOR, _PEER),
+            # A newer SSH session between the same two hosts. The finding
+            # cites zeek.http queries, and its time is not the time of the
+            # HTTP requests (the read on the real grid, 2026-11-14).
+            _hit("zeek-ssh-pair-001", "zeek.ssh", _CLIENT, _WEB),
+            _hit("suricata-lfi-0001", "suricata.alert", _CLIENT, _WEB),
+            _hit("zeek-http-lfi-001", "zeek.http", _CLIENT, _WEB),
+        ]
+    )
+    assert _anchor(subject, grid) == "zeek-http-lfi-001"
+    # One bounded read inside the window of the hunt, for the cited dataset.
+    assert len(grid.calls) == 1
+    call = grid.calls[0]
+    assert call["size"] <= 50
+    assert call["sort"][0]["@timestamp"]["order"] == "desc"
+    assert {"terms": {"event.dataset": ["zeek.http"]}} in call["query"]["bool"]["filter"]
+    text = repr(call["query"])
+    assert _WEB in text and _CLIENT in text
+    assert _ACTOR not in text
+    window = call["query"]["bool"]["filter"][0]["range"]["@timestamp"]
+    # The objective states 72 hours, so the window starts 72 hours before the hunt.
+    assert window["gte"] == (started - timedelta(hours=72)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # A production hunt never reads a synthetic document.
+    assert "synth" in repr(call["query"]["bool"]["must_not"])
+
+
+def test_the_reproduction_through_the_promote_route(kind_client: TestClient) -> None:
+    """The route builds the subject from the stored hunt, so the window and the
+    hosts come from the hunt row and its report."""
+    hunt_id = _seed_hunt(
+        kind_client,
+        findings=[
+            {
+                "title": "Successful LFI read-back on the web server",
+                "detail": "The client read back a file through the web server.",
+                "hosts": [_WEB, _CLIENT],
+                "citations": [_OWN_QUERY],
+            },
+            {
+                "title": "SSH fan-out is established behavior",
+                "detail": "actor-a reaches its peers over SSH.",
+                "hosts": [_ACTOR],
+                "citations": ["zeek-ssh-other-01"],
+            },
+        ],
+    )
+    stored = {"zeek-ssh-other-01": _hit("zeek-ssh-other-01", "zeek.ssh", _ACTOR, _PEER)}
+
+    async def search(index: str, query: dict[str, Any], **kwargs: Any) -> EsSearchResult:
+        ids = (query.get("ids") or {}).get("values")
+        if ids is not None:
+            hits = [stored[i] for i in ids if i in stored]
+        else:
+            hits = [_hit("zeek-http-lfi-001", "zeek.http", _CLIENT, _WEB)]
+        return EsSearchResult(total=len(hits), took_ms=1, hits=hits)
+
+    fake_mgr = AsyncMock()
+    fake_mgr.start = _fake_start_creates_row
+    with (
+        patch(_MGR_TARGET, return_value=fake_mgr),
+        patch.object(ElasticClient, "search", AsyncMock(side_effect=search)),
+    ):
+        resp = kind_client.post(f"/api/v1/hunts/{hunt_id}/findings/0/investigate")
+    assert resp.status_code == 200
+    inv = _fetch_inv(kind_client, resp.json()["investigation_id"])
+    assert inv is not None
+    assert inv.alert_es_id == "zeek-http-lfi-001"
+
+
+def test_a_subject_document_between_the_named_hosts_wins_with_no_grid_read() -> None:
+    documents = [
+        _doc("zeek-ssh-other-01", "zeek.ssh", _ACTOR, _PEER),
+        _doc("zeek-conn-oneend-1", "zeek.conn", _CLIENT, "203.0.113.9"),
+        _doc("suricata-both-001", "suricata.alert", _CLIENT, _WEB),
+        _doc("zeek-http-both-01", "zeek.http", _CLIENT, _WEB),
+    ]
+    grid = _HostGrid()
+    # Both ends on named hosts beats one end, and telemetry beats a detector.
+    assert _anchor(_host_subject([_WEB, _CLIENT], documents), grid) == "zeek-http-both-01"
+    assert grid.calls == []
+    # With no telemetry between them, the detector document between them wins.
+    assert _anchor(_host_subject([_WEB, _CLIENT], documents[:3]), grid) == "suricata-both-001"
+
+
+def test_a_subject_document_with_one_end_on_a_named_host_beats_other_machines() -> None:
+    documents = [
+        _doc("zeek-ssh-other-01", "zeek.ssh", _ACTOR, _PEER),
+        _doc("zeek-conn-oneend-1", "zeek.conn", _CLIENT, "203.0.113.9"),
+    ]
+    grid = _HostGrid()
+    assert _anchor(_host_subject([_WEB, _CLIENT], documents), grid) == "zeek-conn-oneend-1"
+    assert grid.calls == []
+
+
+def test_a_named_host_matches_the_host_name_of_a_subject_document() -> None:
+    """``web-1`` is a name. A subject document ties it to its address, and a
+    record of that address is a record of web-1."""
+    documents = [
+        _doc("zeek-ssh-other-01", "zeek.ssh", _ACTOR, _PEER),
+        _doc("winlog-web1-0001", "windows.security", host_name="WEB-1", host_ip=["192.0.2.10"]),
+        _doc("zeek-conn-both-01", "zeek.conn", _CLIENT, "192.0.2.10"),
+    ]
+    grid = _HostGrid()
+    assert _anchor(_host_subject(["web-1", _CLIENT], documents), grid) == "zeek-conn-both-01"
+    # One named host: the record logged on web-1 has web-1 as an end.
+    assert _anchor(_host_subject(["web-1"], documents[:2]), grid) == "winlog-web1-0001"
+    assert grid.calls == []
+
+
+def test_one_named_host_reads_the_newest_record_with_that_host_as_an_end() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    started = datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=1)
+    subject = _host_subject(
+        [_WEB], list(_PROD_DOCUMENTS), started_at=started, objective="Hunt for exploits."
+    )
+    grid = _HostGrid([_hit("zeek-http-web-001", "zeek.http", "203.0.113.9", _WEB)])
+    assert _anchor(subject, grid) == "zeek-http-web-001"
+    window = grid.calls[0]["query"]["bool"]["filter"][0]["range"]["@timestamp"]
+    # No stated window: the default window of a hunt query, 24 hours.
+    assert window["gte"] == (started - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+_NO_DATASET = "t_host_summary 192.0.2.164 2026-11-14T18:45:35Z"
+
+
+def test_a_cited_dataset_wins_inside_steps_one_and_two() -> None:
+    both = [
+        _doc("zeek-ssh-pair-001", "zeek.ssh", _CLIENT, _WEB),
+        _doc("zeek-http-both-01", "zeek.http", _CLIENT, _WEB),
+    ]
+    one = [
+        _doc("zeek-ssh-oneend-1", "zeek.ssh", _CLIENT, "203.0.113.9"),
+        _doc("zeek-http-oneend1", "zeek.http", "203.0.113.9", _WEB),
+    ]
+    grid = _HostGrid()
+    assert _anchor(_host_subject([_WEB, _CLIENT], both), grid) == "zeek-http-both-01"
+    assert _anchor(_host_subject([_WEB, _CLIENT], one), grid) == "zeek-http-oneend1"
+    # Control: with no dataset cited, the first telemetry document wins.
+    assert _anchor(_host_subject([_WEB, _CLIENT], both, own=[_NO_DATASET]), grid) == (
+        "zeek-ssh-pair-001"
+    )
+    assert grid.calls == []
+
+
+def test_a_finding_with_no_dataset_cited_keeps_the_newest_record_rule() -> None:
+    from datetime import UTC, datetime
+
+    subject = _host_subject(
+        [_WEB, _CLIENT], list(_PROD_DOCUMENTS), own=[_NO_DATASET], started_at=datetime.now(UTC)
+    )
+    grid = _HostGrid(
+        [
+            _hit("zeek-ssh-pair-001", "zeek.ssh", _CLIENT, _WEB),
+            _hit("zeek-http-lfi-001", "zeek.http", _CLIENT, _WEB),
+        ]
+    )
+    assert _anchor(subject, grid, citations=[_NO_DATASET]) == "zeek-ssh-pair-001"
+    assert len(grid.calls) == 1
+    assert "event.dataset" not in repr(grid.calls[0]["query"])
+
+
+def test_a_cited_dataset_with_no_record_falls_back_to_the_read_of_before() -> None:
+    from datetime import UTC, datetime
+
+    subject = _host_subject([_WEB, _CLIENT], list(_PROD_DOCUMENTS), started_at=datetime.now(UTC))
+    grid = _HostGrid([_hit("zeek-ssh-pair-001", "zeek.ssh", _CLIENT, _WEB)])
+    assert _anchor(subject, grid) == "zeek-ssh-pair-001"
+    # Two reads at most: the cited dataset first, then any dataset.
+    assert len(grid.calls) == 2
+    assert "event.dataset" in repr(grid.calls[0]["query"])
+    assert "event.dataset" not in repr(grid.calls[1]["query"])
+
+
+def test_the_datasets_that_a_citation_names() -> None:
+    from soc_ai.webui.finding_promotion import cited_datasets
+
+    assert cited_datasets(
+        [
+            _OWN_QUERY,
+            "t_query_events_oql suricata.alert destination.ip:192.0.2.164 groupby rule.name",
+            't_query_events_oql:event.dataset:"zeek.dns" AND source.ip:198.51.100.226',
+            "t_query_events_oql source.ip:192.0.2.164 AND event.dataset:zeek.conn | count",
+        ]
+    ) == frozenset({"zeek.http", "suricata.alert", "zeek.dns", "zeek.conn"})
+
+
+@pytest.mark.parametrize(
+    "citation",
+    [
+        # The first word has the shape of a dataset but names a field.
+        "t_query_events_oql source.ip:192.0.2.164 groupby destination.ip",
+        "t_query_events_oql http.uri groupby source.ip",
+        # A dataset with no query tool, and a tool that takes no dataset.
+        "zeek.http",
+        "t_query_zeek_logs zeek.http 1:abcdefghijklmnopqrstuvwxyz0=",
+        "t_rule_prevalence ET EXPLOIT zeek.http probe",
+        # A broken query.
+        "t_query_events_oql",
+        "t_query_events_oql zeek..http",
+        "t_query_events_oql event.dataset: AND source.ip:192.0.2.164",
+        "t_query_events_oqlzeek.http",
+        "the hunt read zeek.http records",
+        "0n0D26EBLWkWRQIw3NP-",
+    ],
+)
+def test_a_malformed_citation_names_no_dataset(citation: str) -> None:
+    from soc_ai.webui.finding_promotion import cited_datasets
+
+    assert cited_datasets([citation]) == frozenset()
+    assert cited_datasets([42, None, citation]) == frozenset()
+
+
+# Negative controls: the paths that keep the rule of before.
+
+
+def test_a_finding_with_its_own_documents_anchors_on_them() -> None:
+    documents = [
+        _doc("suricata-own-0001", "suricata.alert", "203.0.113.9", _ACTOR),
+        _doc("zeek-http-both-01", "zeek.http", _CLIENT, _WEB),
+    ]
+    grid = _HostGrid([_hit("zeek-http-lfi-001", "zeek.http", _CLIENT, _WEB)])
+    subject = _host_subject([_WEB, _CLIENT], documents, own=["suricata-own-0001"])
+    assert _anchor(subject, grid) == "suricata-own-0001"
+    assert grid.calls == []
+
+
+def test_a_lead_subject_anchors_as_before() -> None:
+    documents = [
+        _doc("sigma-ci-00000", "sigma.alert", _CI, None),
+        _doc("zeek-ssh-other-01", "zeek.ssh", _ACTOR, _PEER),
+        _doc("zeek-http-both-01", "zeek.http", _CLIENT, _WEB),
+    ]
+    grid = _HostGrid()
+    subject = _host_subject([_WEB, _CLIENT], documents, promoted=False)
+    assert _anchor(subject, grid) == "zeek-ssh-other-01"
+    assert grid.calls == []
+
+
+def test_a_finding_with_no_document_and_no_host_keeps_the_rule_of_before() -> None:
+    from datetime import UTC, datetime
+
+    grid = _HostGrid([_hit("zeek-http-lfi-001", "zeek.http", _CLIENT, _WEB)])
+    subject = _host_subject([], list(_PROD_DOCUMENTS), started_at=datetime.now(UTC))
+    assert _anchor(subject, grid) == "zeek-ssh-other-01"
+    assert grid.calls == []
+
+
+@pytest.mark.parametrize(
+    "error",
+    [TimeoutError(), ConnectionError("the grid is down"), RuntimeError("refused query")],
+)
+def test_a_grid_failure_of_the_host_read_falls_to_the_rule_of_before(error: Exception) -> None:
+    from datetime import UTC, datetime
+
+    subject = _host_subject([_WEB, _CLIENT], list(_PROD_DOCUMENTS), started_at=datetime.now(UTC))
+    grid = _HostGrid(error=error)
+    assert _anchor(subject, grid) == "zeek-ssh-other-01"
+    assert len(grid.calls) == 1
+
+
+def test_a_host_read_with_no_record_on_the_named_hosts_falls_to_the_rule_of_before() -> None:
+    from datetime import UTC, datetime
+
+    subject = _host_subject([_WEB, _CLIENT], list(_PROD_DOCUMENTS), started_at=datetime.now(UTC))
+    # The double returns a record of other machines and a record with one end
+    # only. Neither is between the two named hosts.
+    grid = _HostGrid(
+        [
+            _hit("zeek-ssh-other-02", "zeek.ssh", _ACTOR, _PEER),
+            _hit("zeek-conn-oneend-1", "zeek.conn", _CLIENT, "203.0.113.9"),
+        ]
+    )
+    assert _anchor(subject, grid) == "zeek-ssh-other-01"
+
+
+async def test_the_subject_carries_the_window_of_the_hunt(settings_kratos: Settings) -> None:
+    from soc_ai.agent.context import build_hunt_subject
+    from soc_ai.store.models import Hunt
+
+    engine, maker = await _db(settings_kratos)
+    try:
+        async with maker() as db:
+            hunt = await hunt_svc.create(
+                db, objective=_LONG_OBJECTIVE, started_by="admin", is_synth_eval=True
+            )
+            hunt_id = hunt.id
+            await hunt_svc.finalize(db, hunt_id, status="complete", report={"findings": []})
+        async with maker() as db:
+            row = await db.get(Hunt, hunt_id)
+            assert row is not None
+            subject = await build_hunt_subject(
+                db,
+                elastic=_HostGrid(),  # type: ignore[arg-type]
+                settings=settings_kratos,
+                hunt_id=hunt_id,
+            )
+            assert subject.started_at == row.created_at
+            assert subject.finished_at == row.finished_at
+            assert subject.finished_at is not None
+            assert subject.is_synth_eval is True
+    finally:
+        await engine.dispose()
+
+
 def test_promote_finding_detector_only_still_promotable(kind_client: TestClient) -> None:
     """No cited telemetry doc — only a detector's own alert. Still resolves an
     anchor (the detector doc itself), not a 422: the promoted investigation
@@ -1537,6 +1974,8 @@ def test_get_hunt_detail_reports_promotion_state_per_finding(kind_client: TestCl
         "status": "complete",
         "verdict": "false_positive",
         "conf": 0.72,
+        # The investigation is in no campaign.
+        "campaign": None,
     }
 
 
@@ -1572,6 +2011,7 @@ def test_get_hunt_detail_errored_promotion_reports_error_status_honestly(
         "status": "error",
         "verdict": None,
         "conf": None,
+        "campaign": None,
     }
 
 

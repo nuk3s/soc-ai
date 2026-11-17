@@ -2,11 +2,11 @@ id: prior-server-internet-nonweb-novel-port
 title: A server connects to the internet on a port it has never used
 description: >
   Servers are the most predictable machines on a network. A server answers
-  requests and fetches updates. It does little else. An outbound connection to a
-  destination outside the estate, on a port this server has never used, matches
+  requests and fetches updates. It does little else. An outbound connection to an
+  external destination, on a port this server has never used, matches
   command-and-control, exfiltration and a second-stage download.
 
-  The dimension counts flows to destinations outside the estate only. A server
+  The dimension counts flows to external destinations only. A server
   talking to its own domain controller is not a server reaching the internet.
 
   The dimension also drops the dynamic port range. A port assigned per

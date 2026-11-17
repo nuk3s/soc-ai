@@ -14,6 +14,9 @@ import type { HuntRow, HuntStat } from '../lib/types';
 const getHuntsMock = vi.hoisted(() => vi.fn());
 const getHuntStatsMock = vi.hoisted(() => vi.fn());
 const getHuntTemplatesMock = vi.hoisted(() => vi.fn());
+const getThreatsMock = vi.hoisted(() =>
+  vi.fn().mockResolvedValue({ window: { since: '', until: '' }, rows: [], authorized: [], total: 0 }),
+);
 
 vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
@@ -34,6 +37,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
     .fn()
     .mockResolvedValue({ unread_shadow_hits: 0, leads_needing_decision: 0, total: 0 }),
   getLeads: vi.fn().mockResolvedValue([]),
+  getThreats: getThreatsMock,
 }));
 
 import { ShellProvider } from '../shell/ShellContext';
@@ -89,6 +93,9 @@ describe('Hunts page anatomy', () => {
     await screen.findByText(ROW.objective);
 
     const stats = screen.getByTestId('hunt-stats-line');
+    // The confirmed threats come first, above Needs you, with their own
+    // window (review 2026-11-12, ui-hunt 1).
+    const threats = screen.getByTestId('confirmed-threats');
     const needsYou = screen.getByTestId('needs-you');
     const hits = document.getElementById('analytic-hits')!;
     const leads = screen.getByTestId('leads-strip');
@@ -97,7 +104,11 @@ describe('Hunts page anatomy', () => {
     const section = screen.getByTestId('define-hunt');
     const objectiveHeader = screen.getByText('Objective');
 
-    expect(follows(stats, needsYou)).toBe(true);
+    expect(follows(stats, threats)).toBe(true);
+    expect(follows(threats, needsYou)).toBe(true);
+    expect(screen.getByTestId('confirmed-threats-title').textContent).toBe('Confirmed threats · last 7 days');
+    const since = Date.parse(getThreatsMock.mock.calls[0][0].since);
+    expect(Math.abs(Date.now() - since - 7 * 86_400_000)).toBeLessThan(60_000);
     expect(follows(needsYou, leads)).toBe(true);
     expect(follows(leads, hits)).toBe(true);
     expect(follows(hits, section)).toBe(true);

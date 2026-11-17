@@ -36,8 +36,8 @@ GENERAL: Final = "general"
 # soc_ai.agent.budget states for each plane.
 PLANE_FOCUS: dict[str, str] = {
     budget.PLANE_NETWORK: "the flow of the alert: its session, its Zeek records and its peers",
-    budget.PLANE_EXTERNAL: "the endpoints and the indicators outside the estate",
-    budget.PLANE_EAST_WEST: "the traffic between two hosts inside the estate",
+    budget.PLANE_EXTERNAL: "the external endpoints and the external indicators",
+    budget.PLANE_EAST_WEST: "the traffic between two internal hosts",
     budget.PLANE_WINDOWS: "the host logs, the Active Directory protocols and the attack rule",
     budget.PLANE_HOSTILE: "the malware or attack claim of the rule and what confirms it",
     budget.PLANE_PAYLOAD: "the bytes the rule matched",

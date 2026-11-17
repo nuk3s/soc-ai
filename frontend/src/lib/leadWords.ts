@@ -6,9 +6,10 @@
 // thing in one way.
 // ---------------------------------------------------------------------------
 
+import { ACTION_CAMPAIGN_NOTE } from './campaignWords';
 import { huntOutcome } from './labels';
 import { CLOSE_RULE_CLAUSE, isSystemActor } from './leadDecisions';
-import { utcStamp, utcWindow } from './timeRange';
+import { ago, utcStamp, utcWindow } from './timeRange';
 import { VERDICT } from './tokens';
 import type { Verdict } from './types';
 
@@ -252,23 +253,160 @@ function spanWords(observations: readonly DatedObservation[]): string {
   return ` in ${days} ${days === 1 ? 'day' : 'days'}`;
 }
 
-/** Why this is a lead, in one sentence. Example: "Why this is a lead: 2 rate
- *  spikes and 2 off-hours sightings on one host in 18 days." The counts are
- *  observations, by type, in the order the types first appear. */
-export function leadWhySentence(lead: {
-  entities: readonly (readonly string[])[];
-  kinds: readonly string[];
-  observations: readonly (DatedObservation & { kind: string })[];
-}): string {
+/** What soc-ai saw, and on which entity, in one sentence. Example: "soc-ai
+ *  saw 2 rate spikes and 2 off-hours sightings on adguard2 at 192.0.2.33 in 18
+ *  days." The counts are observations, by type, in the order the types first
+ *  appear. `machineName` is the name of the machine behind the first entity,
+ *  when the Hosts list holds one. A lead that names more entities states them
+ *  in a second sentence. */
+export function leadSeenSentence(
+  lead: {
+    entities: readonly (readonly string[])[];
+    kinds: readonly string[];
+    observations: readonly (DatedObservation & { kind: string })[];
+  },
+  machineName?: string | null,
+): string {
+  const [kind, key] = lead.entities[0] ?? [];
+  const subject = !key
+    ? entityNoun(kind, 1)
+    : kind === 'user'
+      ? `the account ${key}`
+      : machineName && machineName !== key
+        ? `${machineName} at ${key}`
+        : key;
+  const others = lead.entities.slice(1);
+  const also = others.length > 0 ? ` The lead also names ${entityCountWords(others)}.` : '';
   const counts = new Map<string, number>();
   for (const o of lead.observations) counts.set(o.kind, (counts.get(o.kind) ?? 0) + 1);
-  const on = entityNoun(lead.entities[0]?.[0], Math.max(1, lead.entities.length));
   if (counts.size === 0) {
     const kinds = lead.kinds.map((k) => (KIND_NOUN[k] ? KIND_NOUN[k][1] : k.replace(/_/g, ' ')));
-    return `Why this is a lead: it formed from ${andList(kinds) || 'observations that are gone'} on ${on}.`;
+    return `This lead formed from ${andList(kinds) || 'observations that are gone'} on ${subject}.${also}`;
   }
-  const parts = Array.from(counts, ([kind, n]) => kindCount(kind, n));
-  return `Why this is a lead: ${andList(parts)} on ${on}${spanWords(lead.observations)}.`;
+  const parts = Array.from(counts, ([k, n]) => kindCount(k, n));
+  return `soc-ai saw ${andList(parts)} on ${subject}${spanWords(lead.observations)}.${also}`;
+}
+
+/** What the newest hunt on a lead concluded, in one sentence. A hunt that
+ *  runs, and a hunt that could not run, claim no result. `hunts` is newest
+ *  first. A server that sends no list leaves the hunt the lead record names. */
+export function leadHuntSentence(
+  lead: {
+    hunts?: readonly { status: string; outcome: string; started_at: string | null }[];
+    hunt_id?: string | null;
+    hunt_status?: string | null;
+    hunt_outcome?: string | null;
+    hunt_threat_count?: number;
+  },
+  now = Date.now(),
+): string {
+  const listed = lead.hunts?.[0];
+  const newest = listed
+    ? listed
+    : lead.hunt_id || lead.hunt_status
+      ? { status: lead.hunt_status ?? '', outcome: lead.hunt_outcome ?? '', started_at: null }
+      : null;
+  if (!newest) return 'No hunt ran on this lead.';
+  const key = huntOutcome(newest);
+  if (key === 'running') return 'A hunt runs on this lead now.';
+  if (key === 'investigating') return 'The newest hunt investigates its findings now.';
+  const threat = key === 'threat_found' || key === 'threats_confirmed';
+  const earlier = !threat && (lead.hunt_threat_count ?? 0) > 0 ? ' An earlier hunt found a threat.' : '';
+  if (key === 'could_not_run') return `The newest hunt could not run.${earlier}`;
+  const ran = newest.started_at ? `The newest hunt ran ${agoWords(newest.started_at, now)}` : null;
+  if (key === 'no_threat_gap') {
+    return ran
+      ? `${ran}. It found no threat and reported a visibility gap.${earlier}`
+      : `The newest hunt found no threat and reported a visibility gap.${earlier}`;
+  }
+  if (key === null) {
+    return ran
+      ? `${ran}. Its result is not on record.${earlier}`
+      : `The result of the newest hunt is not on record.${earlier}`;
+  }
+  const found: Record<string, string> = {
+    threat_found: 'found a threat',
+    threats_confirmed: 'confirmed a threat',
+    no_threat: 'found no threat',
+    no_threat_confirmed: 'confirmed no threat',
+    no_answer: 'gave no answer',
+  };
+  return `${ran ? `${ran} and` : 'The newest hunt'} ${found[key]}.${earlier}`;
+}
+
+/** The line of a lead that a campaign holds: "Part of the campaign {title}.
+ *  Decide on the campaign." The action card of an investigation of the
+ *  campaign states the same sentence. */
+export function campaignLeadSentence(title: string): string {
+  return `${ACTION_CAMPAIGN_NOTE.before}${title.trim()}${ACTION_CAMPAIGN_NOTE.after}`;
+}
+
+/** The close of a lead by its campaign, after "soc-ai closed the lead: ". */
+const CAMPAIGN_CLOSE_WORDS: Record<string, string> = {
+  campaign_closed: 'an analyst closed the campaign',
+  campaign_authorized: 'an admin authorized the campaign',
+};
+
+/** What a lead waits on, from its state. `state` is the state the pill wears
+ *  (components/LeadsStrip.tsx, leadState). */
+export function leadWaitSentence(facts: {
+  state: string;
+  /** The title of the campaign that holds an open lead. The lead then waits
+   *  on the decision on the campaign. */
+  campaignTitle?: string | null;
+  /** The reason a closed lead holds. A campaign writes its own reasons. */
+  dismissedReason?: string | null;
+  /** Auto-hunt holds the next move of a new lead. */
+  queued?: boolean;
+  /** An investigation of a hunt finding has a verdict the analyst must answer. */
+  verdictToDecide?: boolean;
+  /** soc-ai closed the lead: after a clean hunt, or on the verdicts of a hunt. */
+  closedBySocAi?: boolean;
+}): string {
+  const open = facts.state === 'new' || facts.state === 'in_progress' || facts.state === 'hunted';
+  if (open && facts.campaignTitle) return campaignLeadSentence(facts.campaignTitle);
+  const byCampaign = CAMPAIGN_CLOSE_WORDS[facts.dismissedReason ?? ''];
+  if (facts.state === 'dismissed' && byCampaign) return `soc-ai closed the lead: ${byCampaign}. It waits on nothing.`;
+  switch (facts.state) {
+    case 'new':
+      return facts.queued
+        ? 'The lead waits on auto-hunt. Its hunt starts within a minute.'
+        : 'The lead waits on your decision: hunt it or dismiss it.';
+    case 'in_progress':
+      return 'The lead waits on the hunt.';
+    case 'hunted':
+      return facts.verdictToDecide
+        ? 'The lead waits on your decision: close it on the investigation or keep it open.'
+        : 'The lead waits on your decision: dismiss it or hunt again.';
+    case 'fleet_condition':
+      return 'The lead is a fleet condition. It waits on no decision.';
+    case 'dismissed':
+      return facts.closedBySocAi
+        ? 'soc-ai closed the lead. It waits on nothing.'
+        : 'An analyst dismissed the lead. It waits on nothing.';
+    case 'promoted':
+      return facts.closedBySocAi
+        ? 'soc-ai closed the lead. It waits on nothing.'
+        : 'An investigation closed the lead. It waits on nothing.';
+    default:
+      return 'The lead waits on your decision.';
+  }
+}
+
+/** The state of a lead in one line, for the top of the lead page: what
+ *  soc-ai saw and on which entity, what the hunt concluded, and what the lead
+ *  waits on. The page gave these in a pill, a helper line, two banners and a
+ *  weight behind a toggle (review 2026-11-12, F5). */
+export function leadStateSentence(
+  lead: Parameters<typeof leadSeenSentence>[0] & Parameters<typeof leadHuntSentence>[0],
+  facts: Parameters<typeof leadWaitSentence>[0] & { machineName?: string | null },
+  now = Date.now(),
+): string {
+  return [
+    leadSeenSentence(lead, facts.machineName),
+    leadHuntSentence(lead, now),
+    leadWaitSentence(facts),
+  ].join(' ');
 }
 
 /** A run time as an analyst reads it: "under 1 min", "6 min", "1 h 5 min". */
@@ -376,6 +514,85 @@ export function huntRecordSentence(
     tail = 'The newest hunt found none.';
   }
   return `${head} ${tail}`;
+}
+
+// ---------------------------------------------------------------------------
+// The hunt result on a lead row.
+//
+// The pill of a hunted lead states the outcome. A new lead, a closed lead and
+// a fleet condition lead stated nothing about a hunt, and no row stated what
+// the hunt said. Seven of eight open leads on production waited after a clean
+// hunt and read the same as the one real item (review 2026-11-12, hunts F6).
+// ---------------------------------------------------------------------------
+
+/** The result of the hunts on one lead. `threat` also covers a newer hunt
+ *  with no threat over an earlier hunt that found one. */
+export type LeadHuntResultKey =
+  | 'not_hunted'
+  | 'running'
+  | 'threat'
+  | 'no_threat'
+  | 'no_threat_gap'
+  | 'no_answer'
+  | 'failed'
+  | 'unknown';
+
+/** The words an earlier threat adds to a result that is not a threat. */
+const EARLIER_THREAT_WORDS = 'An earlier hunt found a threat';
+
+/** The hunt result of one lead, in the words the row prints after "Hunt
+ *  result:". The four results are "found a threat", "found no threat", "hunt
+ *  failed" and "not hunted". A hunt that still runs has no result, and a
+ *  visibility gap is no clean answer, so each has its own words. */
+export function leadHuntResult(lead: {
+  hunt_id?: string | null;
+  hunt_status?: string | null;
+  hunt_outcome?: string | null;
+  hunt_threat_count?: number;
+}): { key: LeadHuntResultKey; words: string } {
+  const earlier = (lead.hunt_threat_count ?? 0) > 0;
+  // An earlier threat stays on the record under any newer result.
+  const worst = (key: LeadHuntResultKey, words: string) =>
+    earlier
+      ? { key: 'threat' as const, words: `${words}. ${EARLIER_THREAT_WORDS}` }
+      : { key, words };
+  if (!lead.hunt_id && !lead.hunt_status) return worst('not_hunted', 'not hunted');
+  const outcome = huntOutcome({ status: lead.hunt_status, outcome: lead.hunt_outcome });
+  switch (outcome) {
+    case 'running':
+      return { key: 'running', words: 'the hunt runs now' };
+    case 'investigating':
+      return { key: 'running', words: 'the hunt investigates its findings' };
+    case 'threat_found':
+    case 'threats_confirmed':
+      return { key: 'threat', words: 'found a threat' };
+    case 'could_not_run':
+      return worst('failed', 'hunt failed');
+    case 'no_threat':
+    case 'no_threat_confirmed':
+      return worst('no_threat', 'found no threat');
+    case 'no_threat_gap':
+      return worst('no_threat_gap', 'found no threat, with a visibility gap');
+    case 'no_answer':
+      return worst('no_answer', 'the hunt gave no answer');
+    default:
+      return worst('unknown', 'hunted, with no result on record');
+  }
+}
+
+/** The line of a closed lead that observations joined after the close: "4
+ *  repeats after the close. Newest: 2h ago." Null for an open lead and for a
+ *  closed lead with no repeat. A true-positive alert of a rule the lead held
+ *  joins the closed lead and starts no hunt, so without the line the repeats
+ *  were out of sight (soc_ai.store.leads.repeats_after_close). */
+export function repeatsAfterCloseLine(
+  lead: { status: string; repeats_after_close?: number; last_repeat_at?: string | null },
+  now = Date.now(),
+): string | null {
+  const n = lead.repeats_after_close ?? 0;
+  if (n <= 0 || (lead.status !== 'dismissed' && lead.status !== 'promoted')) return null;
+  const count = `${n.toLocaleString()} ${n === 1 ? 'repeat' : 'repeats'} after the close.`;
+  return lead.last_repeat_at ? `${count} Newest: ${ago(lead.last_repeat_at, now)}.` : count;
 }
 
 /** The facts of one hunt on a lead that its label states. */

@@ -15,18 +15,27 @@ import {
   getNeedsYou,
   huntLead,
   reopenLead,
+  type InvestigationCampaign,
   type Lead,
   type LeadBulkHuntPlan,
   type LeadBulkPress,
   type LeadBulkResult,
   type LeadStatusFilter,
 } from '../lib/api';
+import { LEAD_OF_CAMPAIGN_TITLE } from '../lib/campaignWords';
 import { demoBlocked, useDemo } from '../lib/demo';
 import { entityPath } from '../lib/entityPath';
 import { kindLabel, sourceLabel, sourceTitle } from '../lib/kinds';
 import { huntOutcome, outcomeLabel, outcomeMeta } from '../lib/labels';
-import { formedFromBacktest } from '../lib/leadDecisions';
-import { HUNT_AGAIN_CLOSE, moreEntityWords } from '../lib/leadWords';
+import { formedFromBacktest, holdSentence } from '../lib/leadDecisions';
+import {
+  HUNT_AGAIN_CLOSE,
+  campaignLeadSentence,
+  leadHuntResult,
+  moreEntityWords,
+  repeatsAfterCloseLine,
+  withStop,
+} from '../lib/leadWords';
 import { plural } from '../lib/plural';
 import { absTime, ago } from '../lib/timeRange';
 import {
@@ -43,6 +52,7 @@ import {
   CHIP_RELATED,
   CHIP_SWEEPS,
   CLOSE_RULE,
+  FLEET_CONDITION_LINE,
   INVESTIGATION_GONE,
   LEADS_NOTE_AUTO_HUNT,
   LEGEND_AUTO_HUNT,
@@ -50,19 +60,27 @@ import {
   PILL_CLOSED_ON_VERDICTS,
   LEAD_LEGEND,
   PILL_DISMISSED,
+  PILL_FLEET_CONDITION,
   PILL_HUNTED,
   PILL_HUNT_QUEUED,
   PILL_IN_PROGRESS,
   PILL_NEW,
   PILL_PROMOTED,
+  REPEATS_AFTER_CLOSE,
   TAB_ALL,
   TAB_CLOSED,
+  TAB_FLEET_CONDITION,
   TAB_IN_PROGRESS,
   TAB_NEEDS_DECISION,
   WEIGHT_AT_FORMATION,
+  DISMISS_REASON_EFFECT,
+  dismissReasonEffect,
+  leadsOfCampaignNote,
+  leadsQueuedNote,
 } from '../lib/tooltips';
 import { useAsync } from '../lib/useAsync';
 import { useListSelection } from '../lib/useListSelection';
+import { CampaignChip } from './campaign/CampaignChip';
 import { Checkbox } from './Controls';
 import { Definition } from './Definition';
 import { SelectionStrip } from './ListToolbar';
@@ -91,6 +109,13 @@ const LEADS_BODY_ID = 'leads-body';
  *  DEFAULT_LEAD_THRESHOLD). The card states it beside the weight at formation,
  *  so the number has a scale (dogfood 2026-10-06). */
 export const LEAD_FORMS_AT = 0.85;
+
+/** The hosts one departure may be on before its lead is a fleet condition
+ *  (soc_ai/hunting/leads.py, DEFAULT_SPAN_CAP). */
+export const LEAD_SPAN_CAP = 8;
+
+/** The stored status of a fleet condition lead. */
+export const FLEET_CONDITION_STATUS = 'fleet_condition';
 
 /** One label per dismissal reason. The lead page reads the same map, so one
  *  reason reads the same word wherever an analyst meets it. */
@@ -123,6 +148,24 @@ export function dismissEffect(entity: string | null): string {
 /** The reasons the server accepts. The strip has no lead detail to read them
  *  from, so it carries the list the route validates against. */
 export const DISMISS_REASONS = Object.keys(REASON_LABEL);
+
+/** The reasons soc-ai writes when a campaign closes its leads. No form offers
+ *  them: the analyst closes the campaign, and its leads close with it. */
+export const CAMPAIGN_REASON_LABEL: Record<string, string> = {
+  campaign_closed: 'An analyst closed the campaign',
+  campaign_authorized: 'An admin authorized the campaign',
+};
+
+/** The words of one dismissal reason. An unknown reason reads as itself. */
+export function dismissReasonLabel(reason: string): string {
+  return REASON_LABEL[reason] ?? CAMPAIGN_REASON_LABEL[reason] ?? reason;
+}
+
+/** True when a campaign holds the lead and the lead is open. The analyst
+ *  decides on the campaign, so the lead asks for no decision of its own. */
+export function heldByCampaign(lead: { status: string; campaign?: InvestigationCampaign | null }): boolean {
+  return Boolean(lead.campaign) && lead.status !== 'dismissed' && lead.status !== 'promoted';
+}
 
 /** The reason the grid-gap review writes on each hit it marks benign. No form
  *  offers it, and no lead takes it. The note names the gap and its hours. */
@@ -190,6 +233,7 @@ export const LEAD_STATUS_LABEL: Record<string, string> = {
   hunting: 'Hunting',
   dismissed: 'Closed',
   promoted: 'Closed',
+  fleet_condition: 'Fleet condition',
 };
 
 /** The screen word for one lead status. An unknown status reads as itself. */
@@ -204,9 +248,15 @@ export function leadStatusLabel(status: string): string {
  *  Needs decision tab while the pill read "In progress" and hid every act. */
 const HUNT_RUNNING = new Set(['running', 'queued']);
 
-/** The five states of a lead. The state is what the pill says and what the
+/** The six states of a lead. The state is what the pill says and what the
  *  actions follow. */
-export type LeadState = 'new' | 'in_progress' | 'hunted' | 'dismissed' | 'promoted';
+export type LeadState =
+  | 'new'
+  | 'in_progress'
+  | 'hunted'
+  | 'dismissed'
+  | 'promoted'
+  | 'fleet_condition';
 
 /** The state of one lead, from the record. A finished hunt reads Hunted:
  *  "Hunting" said the hunt was still running, so a lead that had already been
@@ -218,6 +268,11 @@ export function leadState(lead: {
 }): LeadState {
   if (lead.status === 'dismissed') return 'dismissed';
   if (lead.status === 'promoted') return 'promoted';
+  // A fleet condition is a status of its own. Every status this function did
+  // not name fell to "new", so 47 of 70 leads on production read "New" and
+  // sat in no tab (review 2026-11-12, F1). A hunt or a dismissal moves the
+  // lead to another stored status, so this state holds no hunt.
+  if (lead.status === FLEET_CONDITION_STATUS) return 'fleet_condition';
   if (lead.hunt_status && !HUNT_RUNNING.has(lead.hunt_status)) return 'hunted';
   if (lead.status === 'hunting' || lead.hunt_status) return 'in_progress';
   return 'new';
@@ -232,6 +287,7 @@ export const LEAD_STATE_LABEL: Record<LeadState, string> = {
   hunted: 'Hunted',
   dismissed: 'Dismissed',
   promoted: 'Promoted',
+  fleet_condition: 'Fleet condition',
 };
 
 const LEAD_STATE_TITLE: Record<LeadState, string> = {
@@ -240,6 +296,7 @@ const LEAD_STATE_TITLE: Record<LeadState, string> = {
   hunted: PILL_HUNTED,
   dismissed: PILL_DISMISSED,
   promoted: PILL_PROMOTED,
+  fleet_condition: PILL_FLEET_CONDITION,
 };
 
 const LEAD_STATE_STYLE: Record<LeadState, { color: string; border: string; background: string }> = {
@@ -254,13 +311,27 @@ const LEAD_STATE_STYLE: Record<LeadState, { color: string; border: string; backg
   hunted: { color: '#3fb950', border: 'rgba(63,185,80,.45)', background: 'rgba(63,185,80,.10)' },
   dismissed: { color: '#8b949e', border: 'rgba(139,148,158,.45)', background: 'rgba(139,148,158,.10)' },
   promoted: { color: '#a371f7', border: 'rgba(163,113,247,.45)', background: 'rgba(163,113,247,.10)' },
+  // Neutral. A fleet condition waits on no decision, so it wears no colour of
+  // work: the blue of New said somebody must start it.
+  fleet_condition: {
+    color: '#9aa4b2',
+    border: 'rgba(154,164,178,.45)',
+    background: 'rgba(154,164,178,.08)',
+  },
 };
 
 /** True when the loop owns this lead's next move. Auto-hunt is on, the lead
  *  has never been hunted, and the hunt starts within a minute. Nothing waits
  *  on the analyst, and a bare New pill said the opposite. */
-export function huntQueued(lead: { status: string; hunt_queued?: boolean; hunt_status?: string | null; hunt_id?: string | null }): boolean {
-  return lead.hunt_queued === true && leadState(lead) === 'new';
+export function huntQueued(lead: {
+  status: string;
+  hunt_queued?: boolean;
+  hunt_status?: string | null;
+  hunt_id?: string | null;
+  campaign?: InvestigationCampaign | null;
+}): boolean {
+  // A lead of a campaign waits on no hunt: the hunts of the campaign cover it.
+  return lead.hunt_queued === true && leadState(lead) === 'new' && !heldByCampaign(lead);
 }
 
 /** The word beside the pill on a lead the loop leaves to the analyst. */
@@ -276,10 +347,11 @@ export const LEFT_TO_YOU_LABEL = 'left to you';
  *  With the setting off the loop leaves every lead, and a chip on all of them
  *  says nothing about any one of them. */
 export function leftToYou(
-  lead: { status: string; hunt_queued?: boolean; hunt_id?: string | null },
+  lead: { status: string; hunt_queued?: boolean; hunt_id?: string | null; campaign?: InvestigationCampaign | null },
   autoHunt: boolean,
 ): boolean {
-  return autoHunt && lead.hunt_queued === false && lead.status === 'open' && !lead.hunt_id;
+  // The loop leaves a lead of a campaign to the campaign, not to the analyst.
+  return autoHunt && lead.hunt_queued === false && lead.status === 'open' && !lead.hunt_id && !heldByCampaign(lead);
 }
 
 /** The words the pill states for a lead whose newest hunt found no threat
@@ -315,9 +387,13 @@ export function LeadStatePill({
     dismissed_reason?: string | null;
     closed_by_hunt_verdicts?: boolean;
     decisions?: { action: string; by?: string | null; reason?: string | null }[];
+    campaign?: InvestigationCampaign | null;
   };
 }) {
   const state = leadState(lead);
+  // A lead of a campaign waits on the campaign. Its pill wears the neutral
+  // tone: the blue of New and In progress says that the lead needs somebody.
+  const held = heldByCampaign(lead);
   const queued = huntQueued(lead);
   const byHunt = closedByHunt(lead);
   const onVerdicts = closedOnVerdicts(lead);
@@ -331,7 +407,9 @@ export function LeadStatePill({
       : null;
   const style = toned
     ? { color: toned.color, border: toned.border, background: toned.bg }
-    : LEAD_STATE_STYLE[state];
+    : held
+      ? LEAD_STATE_STYLE.fleet_condition
+      : LEAD_STATE_STYLE[state];
   // The tail of the pill names who holds the lead next. A finished hunt names
   // the worst outcome on record. A queued hunt names the loop. A closure by
   // the rule is one sentence, with no tail. An older server sends the label
@@ -349,11 +427,14 @@ export function LeadStatePill({
       ? PILL_CLOSED_ON_VERDICTS
       : queued
         ? PILL_HUNT_QUEUED
-        : LEAD_STATE_TITLE[state];
+        : held
+          ? LEAD_OF_CAMPAIGN_TITLE
+          : LEAD_STATE_TITLE[state];
   return (
     <span
       data-testid="lead-status"
       data-lead-state={state}
+      data-campaign={held || undefined}
       title={title}
       className="inline-flex flex-none items-center gap-1.5 rounded-chip border px-1.5 py-px text-[10.5px] font-medium"
       style={{ color: style.color, borderColor: style.border, background: style.background }}
@@ -429,18 +510,46 @@ export const LEAD_STATE_ACTIONS: Record<LeadState, string[]> = {
   hunted: [LEAD_ACTION.readHunt, LEAD_ACTION.dismiss, LEAD_ACTION.huntAgain],
   dismissed: [LEAD_ACTION.reopen],
   promoted: [LEAD_ACTION.reopen, LEAD_ACTION.viewInvestigation],
+  fleet_condition: [LEAD_ACTION.hunt, LEAD_ACTION.dismiss],
 };
 
-/** The four tabs, in the order an analyst reads them: what waits on a
- *  decision, what is being worked, what is finished, everything. */
-export type LeadTab = 'needs_decision' | 'in_progress' | 'closed' | 'all';
+/** The five tabs, in the order an analyst reads them: what waits on a
+ *  decision, what is being worked, what is finished, what waits on no
+ *  decision, everything. */
+export type LeadTab = 'needs_decision' | 'in_progress' | 'closed' | 'fleet_condition' | 'all';
 
 export const LEAD_TABS: { id: LeadTab; label: string; title: string }[] = [
   { id: 'needs_decision', label: 'Needs decision', title: TAB_NEEDS_DECISION },
   { id: 'in_progress', label: 'In progress', title: TAB_IN_PROGRESS },
   { id: 'closed', label: 'Closed', title: TAB_CLOSED },
+  { id: 'fleet_condition', label: 'Fleet condition', title: TAB_FLEET_CONDITION },
   { id: 'all', label: 'All', title: TAB_ALL },
 ];
+
+/** The tabs that hold one state each. With the All tab they are every tab.
+ *  Their counts sum to the All count, less the leads that wait on auto-hunt. */
+export const LEAD_STATE_TABS: LeadTab[] = ['needs_decision', 'in_progress', 'closed', 'fleet_condition'];
+
+/** The count on each tab, or null for a count the server did not answer. */
+export type LeadTabCounts = Record<LeadTab, number | null>;
+
+/** The leads the All tab holds and no other tab holds: new leads that wait
+ *  on auto-hunt. Null while a count is missing. Never under 0: the five
+ *  counts are five reads, and a lead can move between two of them. */
+export function leadsOutsideTabs(
+  counts: LeadTabCounts | null | undefined,
+  inCampaign = 0,
+): number | null {
+  if (!counts || counts.all === null) return null;
+  let inTabs = 0;
+  for (const tab of LEAD_STATE_TABS) {
+    const n = counts[tab];
+    if (n === null) return null;
+    inTabs += n;
+  }
+  // A lead of a campaign is in no state tab, and it waits on no hunt.
+  return Math.max(0, counts.all - inTabs - inCampaign);
+}
 
 const isLeadTab = (v: unknown): v is LeadTab => LEAD_TABS.some((t) => t.id === v);
 
@@ -484,17 +593,19 @@ const EMPTY_STATE: Record<LeadTab, string> = {
     'No lead waits on a decision. Every lead is under a hunt, or closed, or none has formed.',
   in_progress: 'No hunt is running on a lead.',
   closed: 'No closed leads. No analyst closed a lead, and soc-ai closed none.',
+  fleet_condition: `No fleet condition. No departure is on more than ${LEAD_SPAN_CAP} hosts at one time.`,
   all: 'No leads. No entity has observations of two types, a finding, or a repeated single type.',
 };
 
 /** The scope of each tab, in visible words. The Hunts page and the host page
  *  both have a time filter, and the leads follow neither: a backlog keeps its
- *  full scope. The two tabs of open work say "all open". The two tabs that
- *  hold closed leads say "all time". */
+ *  full scope. The two tabs of open work say "all open". The tabs that hold
+ *  closed leads or fleet conditions say "all time". */
 export const TAB_SCOPE: Record<LeadTab, string> = {
   needs_decision: 'all open',
   in_progress: 'all open',
   closed: 'all time',
+  fleet_condition: 'all time',
   all: 'all time',
 };
 
@@ -503,6 +614,7 @@ function countText(tab: LeadTab, n: number): string {
   if (tab === 'needs_decision') return `${n} ${n === 1 ? 'needs' : 'need'} a decision`;
   if (tab === 'in_progress') return `${n} in progress`;
   if (tab === 'closed') return plural(n, 'closed lead');
+  if (tab === 'fleet_condition') return plural(n, 'fleet condition');
   return plural(n, 'lead');
 }
 
@@ -569,6 +681,16 @@ export function leadFoundThreat(lead: {
   if ((lead.hunt_threat_count ?? 0) > 0) return true;
   const key = huntOutcome({ outcome: lead.hunt_outcome });
   return key === 'threat_found' || key === 'threats_confirmed';
+}
+
+/** The effect of a dismissal reason, under the reason select. The single
+ *  form and the bulk confirm render this one line. */
+export function DismissReasonEffect({ reason }: { reason: string }) {
+  return (
+    <div data-testid="dismiss-reason-effect" className="basis-full text-[11.5px] leading-[1.5] text-dim">
+      {dismissReasonEffect(reason)}
+    </div>
+  );
 }
 
 export function DismissLeadForm({
@@ -640,11 +762,14 @@ export function DismissLeadForm({
         className="rounded-control border border-border bg-surface-2 px-2 py-1"
       >
         <option value="">Choose a reason</option>
-        {reasons.map((r) => (
-          <option key={r} value={r}>
-            {REASON_LABEL[r] ?? r}
-          </option>
-        ))}
+        {/* A campaign writes its own reasons. No analyst picks one. */}
+        {reasons
+          .filter((r) => !(r in CAMPAIGN_REASON_LABEL))
+          .map((r) => (
+            <option key={r} value={r} title={DISMISS_REASON_EFFECT[r]}>
+              {REASON_LABEL[r] ?? r}
+            </option>
+          ))}
       </select>
       <input
         value={note}
@@ -665,6 +790,9 @@ export function DismissLeadForm({
           Cancel
         </button>
       )}
+      {/* What the chosen reason records, and what every reason does. The
+          form listed nine reasons and stated the effect of none. */}
+      <DismissReasonEffect reason={reason} />
       {failed && <span className="text-[11.5px] text-danger">{failed}</span>}
     </div>
   );
@@ -709,6 +837,7 @@ function LeadRow({
   const [failed, setFailed] = useState<string | null>(null);
   const state = leadState(lead);
   const queued = huntQueued(lead);
+  const held = heldByCampaign(lead);
   const huntPath = lead.hunt_id ? `/hunts/${lead.hunt_id}` : `/leads/${lead.id}`;
 
   const run = async (work: () => Promise<void>, message: string) => {
@@ -742,6 +871,14 @@ function LeadRow({
 
   // The words the type chips on this card already say.
   const typeChipWords = new Set(lead.kinds.map((k, i) => kindLabel(k, lead.kind_labels?.[i])));
+  // The hunt result, on every row. The pill states the outcome of a hunted
+  // lead only, and no row stated what the hunt said.
+  const huntResult = leadHuntResult(lead);
+  const notChecked = lead.hunt_not_checked ?? [];
+  // Why the finished hunt did not settle the lead, and the repeats a closed
+  // lead took after the close. The API sent both and the row printed neither.
+  const hold = holdSentence(lead);
+  const repeats = repeatsAfterCloseLine(lead);
 
   return (
     <li
@@ -771,6 +908,8 @@ function LeadRow({
       </Link>
       {/* The pill is the state. The tab is a filter. */}
       <LeadStatePill lead={lead} />
+      {/* The campaign that holds the lead. The analyst decides on it. */}
+      <CampaignChip campaign={lead.campaign} testId={`lead-campaign-chip-${lead.id}`} />
       {/* A replay is a measurement on an alert an analyst already closed. A
           lead it formed reads as live work without the mark. */}
       {formedFromBacktest(lead) && <FormedFromBacktestChip testId={`lead-backtest-chip-${lead.id}`} />}
@@ -800,7 +939,7 @@ function LeadRow({
             className="rounded-chip border border-border-faint px-1.5 py-px text-[10.5px] text-faint"
             title={CHIP_DISMISS_REASON}
           >
-            reason: {REASON_LABEL[lead.dismissed_reason] ?? lead.dismissed_reason}
+            reason: {dismissReasonLabel(lead.dismissed_reason)}
           </span>
         )
       )}
@@ -865,6 +1004,17 @@ function LeadRow({
           shadow
         </span>
       )}
+      {/* The number that made the lead a fleet condition: the hosts that held
+          the departure when the lead formed. */}
+      {state === 'fleet_condition' && lead.scope_count > LEAD_SPAN_CAP && (
+        <span
+          data-testid={`lead-fleet-span-${lead.id}`}
+          className="text-[11.5px] text-dim"
+          title={PILL_FLEET_CONDITION}
+        >
+          one departure on {plural(lead.scope_count, 'host')}
+        </span>
+      )}
 
       {/* The actions follow the state. A lead already under a hunt offered
           "Hunt this lead", which starts a second one. A closed lead offered
@@ -896,12 +1046,37 @@ function LeadRow({
         )}
         {state === 'new' && !queued && (
           <>
+            {/* A lead of a campaign asks for no act: the analyst decides on
+                the campaign. The hunt stays on offer as a secondary act. */}
             <button
               type="button"
               disabled={busy}
               onClick={hunt}
               title={ACTION_HUNT}
-              className={PRIMARY_CLASS}
+              className={held ? ACTION_CLASS : PRIMARY_CLASS}
+            >
+              {LEAD_ACTION.hunt}
+            </button>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => setDismissing((v) => !v)}
+              className={ACTION_CLASS}
+            >
+              {LEAD_ACTION.dismiss}
+            </button>
+          </>
+        )}
+        {/* A fleet condition waits on no decision, so neither act is the
+            primary one. Both stay: the server takes a hunt and a dismissal. */}
+        {state === 'fleet_condition' && (
+          <>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={hunt}
+              title={ACTION_HUNT}
+              className={ACTION_CLASS}
             >
               {LEAD_ACTION.hunt}
             </button>
@@ -973,6 +1148,42 @@ function LeadRow({
             </Link>
           ))}
       </span>
+      {/* A lead of a campaign states the campaign that decides it. */}
+      {held && lead.campaign && (
+        <div data-testid={`lead-campaign-${lead.id}`} className="basis-full break-words text-[11.5px] text-text-2">
+          {campaignLeadSentence(lead.campaign.title)}
+        </div>
+      )}
+      {/* The result, then what the hunt said, then what it could not check.
+          The lead page states the same two sentences for each hunt. */}
+      <div
+        data-testid={`lead-hunt-result-${lead.id}`}
+        data-hunt-result={huntResult.key}
+        className="basis-full break-words text-[11.5px] text-dim"
+      >
+        {'Hunt result: '}
+        <span className="font-semibold text-text-2">{huntResult.words}</span>
+        {'.'}
+        {lead.hunt_answer ? ` Answer: ${withStop(lead.hunt_answer)}` : ''}
+        {notChecked.length > 0 ? ` Not checked: ${notChecked.map(withStop).join(' ')}` : ''}
+      </div>
+      {hold && (
+        <div
+          data-testid={`lead-hold-${lead.id}`}
+          className="basis-full break-words text-[11.5px] text-warn"
+        >
+          {withStop(hold)}
+        </div>
+      )}
+      {repeats && (
+        <div
+          data-testid={`lead-repeats-${lead.id}`}
+          className="basis-full text-[11.5px] text-dim"
+          title={REPEATS_AFTER_CLOSE}
+        >
+          {repeats}
+        </div>
+      )}
       {failed && <span className="basis-full text-[11.5px] text-danger">{failed}</span>}
       {/* A second hunt on one lead is a real thing to want and a common
           mis-click. The confirm names the hunt that already exists. */}
@@ -1104,11 +1315,14 @@ export const LEAD_BULK_LABEL: Record<LeadBulkAction, string> = {
 };
 
 /** The bulk acts each tab offers. A lead under a running hunt takes no
- *  decision, so In progress offers none. */
+ *  decision, so In progress offers none. The Fleet condition tab offers no
+ *  bulk hunt: one departure on many hosts is one question, and a hunt for
+ *  each host asks it many times. */
 export const LEAD_BULK_ACTIONS: Record<LeadTab, LeadBulkAction[]> = {
   needs_decision: ['dismiss', 'hunt'],
   in_progress: [],
   closed: ['reopen'],
+  fleet_condition: ['dismiss'],
   all: ['dismiss', 'hunt', 'reopen'],
 };
 
@@ -1217,6 +1431,52 @@ function skipSentence(plan: LeadBulkPlan): string | null {
   const groups = countCodes(plan.skip.map((s) => s.code));
   const why = groups.map(([code]) => SKIP_WHY[code]).filter(Boolean);
   return [`The press skips ${joinWords(groups.map(([code, n]) => skipWords(code, n)))}.`, ...why].join(' ');
+}
+
+/**
+ * Which selected leads the bulk actions of a tab skip, and why, for the bar.
+ *
+ * The bar read "8 leads selected · Dismiss (2) · Hunt (2)" and gave no reason
+ * for the other six: the reason showed only on a button whose count was 0
+ * (review 2026-11-12, F4). The sentence comes from the plan the buttons count
+ * from, so the two cannot disagree.
+ *
+ * When every action skips the same leads, one sentence names them. When the
+ * actions differ, each action states its own skips. Null when no action
+ * skips a lead.
+ */
+export function bulkExcludedText(
+  actions: readonly LeadBulkAction[],
+  leads: readonly Lead[],
+): string | null {
+  const plans = actions.map((action) => {
+    const groups = countCodes(leadBulkPlan(action, leads).skip.map((s) => s.code));
+    return { action, groups, key: groups.map(([code, n]) => `${code}:${n}`).join(',') };
+  });
+  const skipping = plans.filter((p) => p.groups.length > 0);
+  if (skipping.length === 0) return null;
+  const words = (groups: [string, number][]) =>
+    joinWords(groups.map(([code, n]) => skipWords(code, n)));
+  const sentences: string[] = [];
+  if (skipping.length === plans.length && plans.every((p) => p.key === plans[0].key)) {
+    const total = plans[0].groups.reduce((sum, [, n]) => sum + n, 0);
+    sentences.push(`${words(plans[0].groups)} ${total === 1 ? 'takes' : 'take'} no bulk action.`);
+  } else {
+    // The actions that skip the same leads share one sentence.
+    const byKey = new Map<string, { labels: string[]; groups: [string, number][] }>();
+    for (const p of skipping) {
+      const entry = byKey.get(p.key) ?? { labels: [], groups: p.groups };
+      entry.labels.push(LEAD_BULK_LABEL[p.action]);
+      byKey.set(p.key, entry);
+    }
+    for (const { labels, groups } of byKey.values()) {
+      sentences.push(
+        `${joinWords(labels)} ${labels.length === 1 ? 'skips' : 'skip'} ${words(groups)}.`,
+      );
+    }
+  }
+  const codes = [...new Set(skipping.flatMap((p) => p.groups.map(([code]) => code)))];
+  return [...sentences, ...codes.map((code) => SKIP_WHY[code]).filter(Boolean)].join(' ');
 }
 
 function offListSentence(offList: number): string | null {
@@ -1510,7 +1770,7 @@ function LeadBulkConfirm({
             >
               <option value="">Choose a reason</option>
               {DISMISS_REASONS.map((r) => (
-                <option key={r} value={r}>
+                <option key={r} value={r} title={DISMISS_REASON_EFFECT[r]}>
                   {REASON_LABEL[r] ?? r}
                 </option>
               ))}
@@ -1522,6 +1782,7 @@ function LeadBulkConfirm({
               aria-label="Note, optional"
               className="min-w-[200px] flex-1 rounded-control border border-border bg-surface-2 px-2 py-1"
             />
+            <DismissReasonEffect reason={reason} />
           </div>
         )}
         <div className="flex justify-end gap-2.5">
@@ -1746,15 +2007,32 @@ export function LeadsStrip({
     [tab, reload, entityKey],
     { refetchInterval: 60_000 },
   );
-  // The true total of the tab. The rows stop at the server's limit, and the
-  // heading counted the rows, so it never said more than 50. A failed count
-  // leaves the heading on the rows. `async` turns a throw into a rejection.
-  const total = useAsync(
-    async () =>
-      entityKey
-        ? getLeadCount(tab as LeadStatusFilter, { entity: entityKey })
-        : getLeadCount(tab as LeadStatusFilter),
-    [tab, reload, entityKey],
+  // The true total of every tab. The rows stop at the server's limit, and the
+  // heading counted the rows, so it never said more than 50. Each tab states
+  // its count, so an analyst sees where every lead is without a click on each
+  // tab: the tabs summed to 23 of 70 leads on production, and nothing said so
+  // (review 2026-11-12, F1). A failed count is null, and its tab then states
+  // no number. `async` turns a throw into a rejection.
+  // The leads of the All tab that an active campaign holds, from the same read.
+  const inCampaignRef = useRef(0);
+  const tabCounts = useAsync(
+    async (): Promise<LeadTabCounts> => {
+      const totals = await Promise.all(
+        LEAD_TABS.map(async (t) => {
+          try {
+            const answer = entityKey
+              ? await getLeadCount(t.id as LeadStatusFilter, { entity: entityKey })
+              : await getLeadCount(t.id as LeadStatusFilter);
+            if (t.id === 'all') inCampaignRef.current = answer.in_campaign ?? 0;
+            return answer.total;
+          } catch {
+            return null;
+          }
+        }),
+      );
+      return Object.fromEntries(LEAD_TABS.map((t, i) => [t.id, totals[i]])) as LeadTabCounts;
+    },
+    [reload, entityKey],
     { refetchInterval: 60_000 },
   );
   // The caller's callback, held in a ref so an inline arrow function in the
@@ -1762,8 +2040,11 @@ export function LeadsStrip({
   const onRowsRef = useRef(onRows);
   onRowsRef.current = onRows;
   const rows = leads.data ?? [];
-  const totalCount =
-    total.data && total.data.status === tab ? Math.max(total.data.total, rows.length) : rows.length;
+  const tabCount = tabCounts.data?.[tab] ?? null;
+  const totalCount = tabCount !== null ? Math.max(tabCount, rows.length) : rows.length;
+  // The leads no tab but All holds. They wait on auto-hunt.
+  const inCampaign = tabCounts.data ? inCampaignRef.current : 0;
+  const outsideTabs = leadsOutsideTabs(tabCounts.data, inCampaign);
   // The rows, to the block that asked for them. The effect keys on the loaded
   // list, so a render the poll did not change does not re-announce it.
   const loaded = leads.data;
@@ -1906,6 +2187,8 @@ export function LeadsStrip({
 
   const selecting = selectable && sel.count > 0;
   const bulkActions = LEAD_BULK_ACTIONS[tab];
+  // The selected leads a press skips, with the reason, in the bar.
+  const bulkExcluded = selecting ? bulkExcludedText(bulkActions, selectedLeads) : null;
 
   if (onHost && leads.data && rows.length === 0) return null;
   return (
@@ -1962,9 +2245,34 @@ export function LeadsStrip({
                   }`}
                 >
                   {t.label}
+                  {typeof tabCounts.data?.[t.id] === 'number' && (
+                    <span
+                      data-testid={`leads-tab-count-${t.id}`}
+                      className="ml-1 font-mono tabular-nums text-faint"
+                    >
+                      {tabCounts.data[t.id]}
+                    </span>
+                  )}
                 </button>
               ))}
             </span>
+            {/* The four state tabs and this count sum to the All count. */}
+            {outsideTabs !== null && outsideTabs > 0 && (
+              <span
+                data-testid="leads-queued-note"
+                className="text-[10.5px] font-normal normal-case tracking-normal text-dim"
+              >
+                {leadsQueuedNote(outsideTabs)}
+              </span>
+            )}
+            {inCampaign > 0 && (
+              <span
+                data-testid="leads-campaign-note"
+                className="text-[10.5px] font-normal normal-case tracking-normal text-dim"
+              >
+                {leadsOfCampaignNote(inCampaign)}
+              </span>
+            )}
             {/* The four words are a taxonomy. A taxonomy nobody can read is a
                 filter an analyst guesses at. */}
             <span
@@ -2028,6 +2336,16 @@ export function LeadsStrip({
         <div id={LEADS_BODY_ID} className="pb-2" />
       ) : (
         <div id={LEADS_BODY_ID}>
+          {/* What a fleet condition is, on the tab that lists them. The line
+              stays over an empty list. */}
+          {tab === 'fleet_condition' && (
+            <div
+              data-testid="leads-fleet-line"
+              className="border-b border-border-faint px-[15px] py-2 text-[12px] text-text-2"
+            >
+              {FLEET_CONDITION_LINE}
+            </div>
+          )}
           {/* The selection strip and the result line of the last press, held
               at the top of the strip while the analyst scrolls the list. The
               strip is the one the other lists render. */}
@@ -2072,6 +2390,11 @@ export function LeadsStrip({
                       ),
                   }}
                 />
+              )}
+              {bulkExcluded && (
+                <div data-testid="leads-bulk-excluded" className="mb-2 text-[12px] text-dim">
+                  {bulkExcluded}
+                </div>
               )}
               {bulk && (
                 <LeadBulkResultLine

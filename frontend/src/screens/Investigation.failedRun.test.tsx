@@ -60,12 +60,12 @@ describe('a run that died without a verdict', () => {
     mount();
     fireEvent.click(screen.getByRole('button', { name: /^Dismiss/ }));
     await waitFor(() => expect(dismissInvestigationError).toHaveBeenCalledWith('INV-DEAD'));
-    expect(await screen.findByText(/The Dashboard does not count this run/i)).toBeTruthy();
+    expect(await screen.findByText(/The Dashboard does not count this investigation/i)).toBeTruthy();
   });
 
   it('reports an already-dismissed run as done, with no button to press again', () => {
     mount({ errorDismissed: true });
-    expect(screen.getByText(/The Dashboard does not count this run/i)).toBeTruthy();
+    expect(screen.getByText(/The Dashboard does not count this investigation/i)).toBeTruthy();
     expect(screen.queryByRole('button', { name: /^Dismiss/ })).toBeNull();
   });
 

@@ -3,6 +3,10 @@
 // link sets the filter of the block below, and a failed read reads as a
 // failure. A strip that answers "nothing needs you" while the server is down
 // is the false all-clear this page exists to prevent.
+//
+// Production review 2026-11-12 (ui-hunt 1, ui-core 4): the strip read "NEEDS
+// YOU 241" for 233 unread hits and 8 leads. The count chip now holds the
+// decisions. The hits are a neutral review count with their own link.
 import { act, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -25,7 +29,7 @@ const mount = (path = '/hunts') =>
 beforeEach(() => {
   vi.mocked(getNeedsYou)
     .mockReset()
-    .mockResolvedValue({ unread_shadow_hits: 2, leads_needing_decision: 2, total: 4 });
+    .mockResolvedValue({ unread_shadow_hits: 2, leads_needing_decision: 2, decisions: 2, review: 2, total: 4 });
 });
 
 describe('NeedsYouStrip', () => {
@@ -33,9 +37,29 @@ describe('NeedsYouStrip', () => {
     mount();
     const strip = await screen.findByTestId('needs-you');
     expect(strip.textContent).toContain('Needs you');
-    expect(await screen.findByTestId('needs-you-count')).toHaveProperty('textContent', '4');
-    expect(screen.getByText('2 shadow hits are unread')).toBeTruthy();
+    expect(await screen.findByTestId('needs-you-count')).toHaveProperty('textContent', '2');
+    expect(screen.getByText('2 shadow hits to review')).toBeTruthy();
     expect(screen.getByText('2 leads wait on a decision')).toBeTruthy();
+  });
+
+  // NEGATIVE CONTROL. 233 unread hits and no lead: no decision count, and the
+  // hits still show with their link.
+  it('gives the hits no decision count', async () => {
+    vi.mocked(getNeedsYou).mockResolvedValue({
+      unread_shadow_hits: 233,
+      leads_needing_decision: 0,
+      decisions: 0,
+      review: 233,
+      total: 233,
+    });
+    mount();
+    expect(await screen.findByText('Nothing needs you.')).toBeTruthy();
+    expect(screen.queryByTestId('needs-you-count')).toBeNull();
+    expect(screen.getByTestId('needs-you-hits').textContent).toBe(
+      '233 shadow hits to review · all unread · Show the unread hits',
+    );
+    const link = screen.getByRole('link', { name: 'Show the unread hits' });
+    expect(link.className).not.toContain('text-accent');
   });
 
   it('sets the hit filter and the lead tab from the links', async () => {
@@ -59,7 +83,7 @@ describe('NeedsYouStrip', () => {
   it('states the scope of each line, and the window the hit link opens', async () => {
     mount();
     expect((await screen.findByTestId('needs-you-hits')).textContent).toBe(
-      '2 shadow hits are unread · all unread · Show the unread hits',
+      '2 shadow hits to review · all unread · Show the unread hits',
     );
     expect(screen.getByTestId('needs-you-leads').textContent).toBe(
       '2 leads wait on a decision · all open',
@@ -74,7 +98,7 @@ describe('NeedsYouStrip', () => {
     });
     mount();
     expect((await screen.findByTestId('needs-you-scope')).textContent).toBe(
-      'The count covers all unread shadow hits and all open leads.',
+      'The count covers all open leads and all unread shadow hits.',
     );
   });
 
@@ -85,7 +109,7 @@ describe('NeedsYouStrip', () => {
       total: 2,
     });
     mount();
-    expect(await screen.findByText('1 shadow hit is unread')).toBeTruthy();
+    expect(await screen.findByText('1 shadow hit to review')).toBeTruthy();
     expect(screen.getByText('1 lead waits on a decision')).toBeTruthy();
   });
 
@@ -97,7 +121,7 @@ describe('NeedsYouStrip', () => {
     });
     mount();
     expect(await screen.findByText('3 leads wait on a decision')).toBeTruthy();
-    expect(screen.queryByText(/unread/)).toBeNull();
+    expect(screen.queryByText(/to review/)).toBeNull();
   });
 
   it('takes one line when nothing waits', async () => {
@@ -108,7 +132,7 @@ describe('NeedsYouStrip', () => {
     });
     mount();
     expect(await screen.findByText('Nothing needs you.')).toBeTruthy();
-    expect(screen.getByText('No unread shadow hit. No lead waits on a decision.')).toBeTruthy();
+    expect(screen.getByText('No lead waits on a decision.')).toBeTruthy();
     expect(screen.queryByTestId('needs-you-count')).toBeNull();
   });
 
@@ -146,13 +170,13 @@ describe('NeedsYouStrip on a failing poll', () => {
       .mockRejectedValue(new ApiError('down', 503));
     mount();
     await settle();
-    expect(screen.getByTestId('needs-you-count').textContent).toBe('4');
+    expect(screen.getByTestId('needs-you-count').textContent).toBe('2');
     expect(screen.queryByText(/This data is from/)).toBeNull();
 
     await poll(130_000);
     expect(screen.getByText(/This data is from/)).toBeTruthy();
     // The number stays: last-known beats a blank, as long as it is dated.
-    expect(screen.getByTestId('needs-you-count').textContent).toBe('4');
+    expect(screen.getByTestId('needs-you-count').textContent).toBe('2');
   });
 
   it('rides out one missed poll without a marker', async () => {

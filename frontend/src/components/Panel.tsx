@@ -15,6 +15,8 @@ export function CollapseChevron({
   label,
   section,
   controls,
+  children,
+  className,
 }: {
   collapsed: boolean;
   onToggle: () => void;
@@ -25,6 +27,10 @@ export function CollapseChevron({
   section?: string;
   /** The id of the block this chevron folds. */
   controls?: string;
+  /** What the button holds after the chevron. A fold header passes its title
+   *  and its count, so the whole header row is the one button. */
+  children?: ReactNode;
+  className?: string;
 }) {
   const act = collapsed ? 'Expand' : 'Collapse';
   return (
@@ -35,13 +41,14 @@ export function CollapseChevron({
       aria-controls={controls}
       aria-label={label ?? (section ? `${act} ${section}` : `${act} section`)}
       title={section ? (collapsed ? EXPAND_SECTION : COLLAPSE_SECTION) : undefined}
-      className="group flex-none text-faint hover:text-text-2"
+      className={cn('group flex-none text-faint hover:text-text-2', className)}
     >
       <ChevronRight
         size={15}
-        className="transition-transform"
+        className="flex-none transition-transform"
         style={{ transform: collapsed ? 'none' : 'rotate(90deg)' }}
       />
+      {children}
     </button>
   );
 }

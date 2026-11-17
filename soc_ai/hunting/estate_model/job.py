@@ -101,7 +101,7 @@ STATUS_FAILED = "failed"
 
 # The one line the run logs when the setting is on and the extra is absent.
 UNAVAILABLE_LINE = (
-    "estate model: unavailable. The ml extra is not installed. soc-ai fits no estate model."
+    "network model: unavailable. The ml extra is not installed. soc-ai fits no network model."
 )
 
 # Below this many hosts with a profile the model does not fit.
@@ -163,7 +163,7 @@ class EstateRun:
         """The one log line of a run that fitted."""
         psi = "none" if self.psi is None else f"{self.psi:.2f}"
         return (
-            f"estate model: {self.state}. {self.hosts} hosts in {self.groups} groups. "
+            f"network model: {self.state}. {self.hosts} hosts in {self.groups} groups. "
             f"{self.outliers} above the threshold, {self.unexplained} with no stated reason, "
             f"{self.shared} shared with a subgroup, {self.no_documents} with no document, "
             f"{self.observations} observations. "
@@ -187,7 +187,7 @@ def decide_state(
     if hosts < MIN_HOSTS:
         return (
             store.STATE_LEARNING,
-            f"The estate holds {hosts} hosts with a profile. The model needs {MIN_HOSTS}.",
+            f"The network holds {hosts} hosts with a profile. The model needs {MIN_HOSTS}.",
         )
     if support_days < MIN_SUPPORT_DAYS:
         return (
@@ -306,7 +306,7 @@ def _reasons(
     median = group.score_median if group is not None else 0.0
     sentences = [
         f"{host.entity_key} departs from learned group {host.group_id} of {size} hosts.",
-        f"Its estate outlier score is {host.score:.2f}. The group median is {median:.2f}.",
+        f"Its network outlier score is {host.score:.2f}. The group median is {median:.2f}.",
     ]
     block: dict[str, dict[str, Any]] = {}
     for item in host.top:
@@ -414,7 +414,7 @@ async def run_estate_model(  # noqa: PLR0915 - one procedure, read top to bottom
         except ModelRefused as exc:
             run.refused.append(str(exc))
     for line in run.refused:
-        _LOGGER.warning("estate model: %s", line)
+        _LOGGER.warning("network model: %s", line)
 
     support = int(statistics.median([v.support_days for v in read.vectors])) if read.vectors else 0
     if run.hosts < MIN_HOSTS:
@@ -430,7 +430,7 @@ async def run_estate_model(  # noqa: PLR0915 - one procedure, read top to bottom
                 hosts=run.hosts,
                 support_days=support,
             )
-        _LOGGER.info("estate model: %s %s", run.state, run.reason)
+        _LOGGER.info("network model: %s %s", run.state, run.reason)
         return run
 
     features = feature_list(read.vectors)
@@ -443,7 +443,7 @@ async def run_estate_model(  # noqa: PLR0915 - one procedure, read top to bottom
     except Exception as exc:
         run.status = STATUS_FAILED
         run.errors.append(f"the fit failed: {type(exc).__name__}: {exc}")
-        _LOGGER.warning("estate model: the fit failed. %s: %s", type(exc).__name__, exc)
+        _LOGGER.warning("network model: the fit failed. %s: %s", type(exc).__name__, exc)
         return run
     run.seconds = fitted.seconds
     run.groups = len(fitted.groups)
@@ -559,7 +559,7 @@ async def _append_audit(audit: Any | None, run: EstateRun) -> bool:
         )
     except Exception as exc:
         run.errors.append(f"the audit append failed: {type(exc).__name__}: {exc}")
-        _LOGGER.warning("estate model: the audit append failed. %s", exc)
+        _LOGGER.warning("network model: the audit append failed. %s", exc)
         return False
     return True
 

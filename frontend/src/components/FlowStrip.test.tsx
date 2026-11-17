@@ -234,10 +234,96 @@ describe('leadFlow', () => {
       'actions:next',
     ]);
     expect(step(steps, 'investigations').note).toBe('2 of 2 findings');
-    expect(step(steps, 'verdicts').note).toBe('1 of 2 threats');
+    expect(step(steps, 'verdicts').note).toBe(
+      '1 confirmed · 1 false positive · 0 not judged · of 2 threat findings',
+    );
     expect(step(steps, 'actions')).toMatchObject({
       note: '1 wait for you',
       control: 'Acknowledge or Escalate to case',
+    });
+  });
+
+  // L1: the strip read "Investigations 4 of 4" with a check and "Verdicts 3
+  // of 4 threats" beside a card that read "Investigation failed, re-run."
+  it('a failed investigation leaves the Investigations step amber and not done', () => {
+    const steps = leadFlow(
+      HUNTED_LEAD,
+      hunt({
+        findingsInvestigated: 4,
+        findingsTotal: 4,
+        findingsConfirmed: 3,
+        findingsFalsePositive: 0,
+        threatFindingCount: 4,
+        findings: [
+          threat({ investigationId: 'I-1', investigationStatus: 'complete', verdict: 'true_positive' }),
+          threat({ investigationId: 'I-2', investigationStatus: 'complete', verdict: 'true_positive' }),
+          threat({ investigationId: 'I-3', investigationStatus: 'complete', verdict: 'true_positive' }),
+          threat({ investigationId: 'I-4', investigationStatus: 'failed' }),
+        ],
+      }),
+    );
+    expect(step(steps, 'investigations')).toMatchObject({
+      state: 'next',
+      tone: 'warn',
+      note: '3 of 4 findings with a verdict',
+      control: 'Open an investigation',
+    });
+    expect(step(steps, 'verdicts')).toMatchObject({
+      state: 'not_yet',
+      tone: 'warn',
+      note: '3 confirmed · 1 not judged · of 4 threat findings',
+    });
+    expect(steps.filter((s) => s.state === 'done').map((s) => s.key)).not.toContain('investigations');
+  });
+
+  it('a restated finding counts the verdict that answers for it', () => {
+    // F2 restates an earlier finding. It has no run of its own, and the
+    // earlier true positive answers for it. The parts still add up.
+    const steps = leadFlow(
+      HUNTED_LEAD,
+      hunt({
+        findingsInvestigated: 2,
+        findingsTotal: 2,
+        findingsConfirmed: 2,
+        threatFindingCount: 2,
+        findings: [
+          threat({ investigationId: 'I-1', investigationStatus: 'complete', verdict: 'true_positive' }),
+          threat({
+            investigationId: 'I-OLD',
+            investigationStatus: 'complete',
+            verdict: 'true_positive',
+            restates: { huntId: 'H-0', ordinal: 0, title: 'earlier', verdict: 'true_positive', answers: true },
+          }),
+        ],
+      }),
+    );
+    expect(step(steps, 'investigations').state).toBe('done');
+    expect(step(steps, 'verdicts')).toMatchObject({
+      state: 'done',
+      note: '2 confirmed · 0 not judged · of 2 threat findings',
+    });
+    expect(step(steps, 'verdicts').tone).toBeUndefined();
+  });
+
+  it('a needs more info verdict leaves the Verdicts step open', () => {
+    const steps = leadFlow(
+      HUNTED_LEAD,
+      hunt({
+        findingsInvestigated: 2,
+        findingsTotal: 2,
+        findings: [
+          threat({ investigationId: 'I-1', investigationStatus: 'complete', verdict: 'true_positive', pendingActions: 0 }),
+          threat({ investigationId: 'I-2', investigationStatus: 'complete', verdict: 'needs_more_info', pendingActions: 0 }),
+        ],
+      }),
+    );
+    // Control: each investigation ended with a verdict, so the step is done.
+    expect(step(steps, 'investigations').state).toBe('done');
+    expect(step(steps, 'verdicts')).toMatchObject({
+      state: 'next',
+      tone: 'warn',
+      note: '1 confirmed · 1 not judged · of 2 threat findings',
+      control: 'View investigation',
     });
   });
 
@@ -257,7 +343,9 @@ describe('leadFlow', () => {
       note: '1 of 1 finding',
       to: '/investigation/I-9',
     });
-    expect(step(steps, 'verdicts').note).toBe('no threat confirmed');
+    expect(step(steps, 'verdicts').note).toBe(
+      '0 confirmed · 1 false positive · 0 not judged · of 1 threat finding',
+    );
     // The older server does not count the actions that wait.
     expect(step(steps, 'actions')).toMatchObject({ state: 'next', control: 'View investigation' });
   });
@@ -492,7 +580,7 @@ describe('investigationFlow', () => {
       }),
     );
     expect(step(steps, 'verdict').control).toBeUndefined();
-    expect(step(steps, 'verdict').title).toBe('A re-run cannot change the recorded cause.');
+    expect(step(steps, 'verdict').title).toBe('A new investigation cannot change the recorded cause.');
   });
 
   // R2-D22: after an override to true positive the strip read the old
@@ -545,7 +633,7 @@ describe('investigationFlow', () => {
     const verdict = step(steps, 'verdict');
     expect(verdict.control).toBeUndefined();
     expect(verdict.note).toBe('needs more info');
-    expect(verdict.title).toBe('A newer run replaced this one. Its actions are off.');
+    expect(verdict.title).toBe('A newer investigation replaced this one. Its actions are off.');
     mount(steps);
     expect(screen.queryByTestId('flow-control-verdict')).toBeNull();
   });

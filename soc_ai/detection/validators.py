@@ -35,6 +35,7 @@ import yaml
 
 from soc_ai.config import Settings
 from soc_ai.detection.models import DryRunResult, SigmaDraft
+from soc_ai.so_client import fields as grid_fields
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.so_client.oql import (
     And,
@@ -506,21 +507,59 @@ async def dry_run_detection(
             settings=settings,
             time_range_minutes=window_days * 1440,
             time_anchor=time_anchor,
+            # The rule as written. Security Onion matches the field name that
+            # the rule holds, so the dry run must not read the other names of
+            # the field: it would report hits for a rule that never fires.
+            widen_names=False,
         )
     except Exception as e:
         return _not_run(str(e))
 
     sample_ids = [str(hit["_id"]) for hit in res.hits[:5] if isinstance(hit, dict) and "_id" in hit]
-    return draft.model_copy(
-        update={
-            "dry_run": DryRunResult(
-                ran=True,
-                hit_count=res.total,
-                total_is_lower_bound=res.total_is_lower_bound,
-                sample_ids=sample_ids,
-                window_days=window_days,
+    update: dict[str, Any] = {
+        "dry_run": DryRunResult(
+            ran=True,
+            hit_count=res.total,
+            total_is_lower_bound=res.total_is_lower_bound,
+            sample_ids=sample_ids,
+            window_days=window_days,
+        )
+    }
+    dead = await _dead_field_note(ast.filter_, elastic=elastic, settings=settings)
+    if dead is not None:
+        # The structure check passed on a name that the whitelist accepts. The
+        # grid holds the value under a different name, so the rule cannot fire.
+        update.update({"schema_ok": False, "validator_note": dead})
+    return draft.model_copy(update=update)
+
+
+async def _dead_field_note(
+    filter_: FilterNode, *, elastic: ElasticClient, settings: Settings
+) -> str | None:
+    """Name each field of the draft that this grid stores under a different name.
+
+    One exists probe for each name of the field, cached, in the order: the
+    name of the draft, then the other names. The probe never raises. When the
+    name of the draft holds data, or no name holds data, the draft is not
+    judged.
+    """
+    sentences: list[str] = []
+    for name in sorted(collect_filter_fields(filter_)):
+        others = [other for other in grid_fields.same_value_names(name) if other != name]
+        if not others:
+            continue
+        live = await grid_fields.resolve_agg_field(
+            elastic, settings.events_index_pattern, (name, *others)
+        )
+        if live != name:
+            sentences.append(
+                f"The rule names the field `{name}`. This grid stores the value in `{live}`."
             )
-        }
+    if not sentences:
+        return None
+    return (
+        " ".join(sentences) + " Security Onion matches the name that the rule holds. "
+        "Write the grid name in the rule and in the query."
     )
 
 

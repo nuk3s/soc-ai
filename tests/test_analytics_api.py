@@ -1281,6 +1281,8 @@ def test_needs_you_counts_unread_shadow_hits(client: TestClient) -> None:
     assert body == {
         "unread_shadow_hits": 1,
         "leads_needing_decision": 0,
+        "decisions": 0,
+        "review": 1,
         "total": 1,
         "lead_auto_hunt": True,
     }
@@ -1298,6 +1300,8 @@ def test_needs_you_leaves_out_a_new_lead_whose_hunt_is_queued(client: TestClient
     assert body == {
         "unread_shadow_hits": 0,
         "leads_needing_decision": 0,
+        "decisions": 0,
+        "review": 0,
         "total": 0,
         "lead_auto_hunt": True,
     }
@@ -1313,6 +1317,8 @@ def test_needs_you_counts_a_new_lead_when_the_loop_is_off(client: TestClient) ->
     assert body == {
         "unread_shadow_hits": 0,
         "leads_needing_decision": 1,
+        "decisions": 1,
+        "review": 0,
         "total": 1,
         "lead_auto_hunt": False,
     }
@@ -1369,6 +1375,8 @@ def test_the_needs_you_total_is_the_sum_of_the_two_counts(client: TestClient) ->
     assert body == {
         "unread_shadow_hits": 1,
         "leads_needing_decision": 2,
+        "decisions": 2,
+        "review": 1,
         "total": 3,
         "lead_auto_hunt": True,
     }

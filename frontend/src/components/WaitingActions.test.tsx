@@ -9,6 +9,7 @@
 // says it may, and a failed write keeps the row.
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { DemoProvider } from '../lib/demo';
 import { ToastProvider } from '../lib/toast';
@@ -27,7 +28,12 @@ vi.mock('../lib/api', async (importOriginal) => ({
 }));
 
 import { ACTION_VERB } from './ActionCard';
-import { WaitingActions, actionConfirmText, actionTargetText } from './WaitingActions';
+import {
+  BLOCKED_CASE_ROW,
+  WaitingActions,
+  actionConfirmText,
+  actionTargetText,
+} from './WaitingActions';
 
 const RULE = 'ET MALWARE Known C2 Beacon';
 
@@ -83,11 +89,13 @@ function mount(r: InvestigationRow, opts: { demo?: boolean } = {}) {
   const onDone = vi.fn();
   const onRestored = vi.fn();
   render(
-    <DemoProvider demo={opts.demo ?? false}>
-      <ToastProvider>
-        <WaitingActions row={r} onDone={onDone} onRestored={onRestored} />
-      </ToastProvider>
-    </DemoProvider>,
+    <MemoryRouter>
+      <DemoProvider demo={opts.demo ?? false}>
+        <ToastProvider>
+          <WaitingActions row={r} onDone={onDone} onRestored={onRestored} />
+        </ToastProvider>
+      </DemoProvider>
+    </MemoryRouter>,
   );
   return { onDone, onRestored };
 }
@@ -134,7 +142,7 @@ describe('the row controls', () => {
 
   it('turns the write off and states the reason when the server says so', () => {
     const reason =
-      'ana set the verdict of this alert to false positive. This run reached true positive. Override the verdict of this run to act.';
+      'ana set the verdict of this alert to false positive. This investigation reached true positive. Override the verdict of this investigation to act.';
     mount(row({ waitingActions: [{ ...escalate, executable: false, reason }] }));
     const write = screen.getByRole('button', { name: 'Escalate to case' });
     expect(write).toBeDisabled();
@@ -151,7 +159,7 @@ describe('the row controls', () => {
     // With no button, the line names the type itself.
     expect(screen.getByTestId('waiting-action-INV-1-0').textContent).toContain('Escalate to case');
     expect(screen.getByTestId('waiting-action-reason').textContent).toBe(
-      'Not executable. This run is a backtest replay.',
+      'Not executable. This investigation is a backtest replay.',
     );
     expect(executeAction).not.toHaveBeenCalled();
   });
@@ -403,6 +411,23 @@ describe('actionConfirmText', () => {
     expect(actionConfirmText(escalate, RULE, null, 'idle')).toBe(
       `Open a Security Onion case for the alert of ${RULE}.`,
     );
+    // Review 2026-11-13, D2: the escalate of a finding opens a case for the
+    // finding. A finding has no alert.
+    const finding = { ...escalate, targetType: 'finding' as const, target: 'LFI on 10.20.30.164' };
+    expect(actionConfirmText(finding, RULE, null, 'idle')).toBe(
+      'Open a Security Onion case for the finding LFI on 10.20.30.164.',
+    );
+    // The server states the alerts that the case attaches. The row says the same.
+    const scope = {
+      tool: 'escalate_to_case',
+      scope: 'finding' as const,
+      count: 3,
+      hosts: null,
+      held: 2,
+      rangeLabel: '',
+      sentence: 'Open one Security Onion case for this finding. soc-ai attaches 3 alerts that the finding cites.',
+    };
+    expect(actionConfirmText(finding, RULE, scope, 'idle')).toBe(scope.sentence);
     const group = {
       tool: 'ack_alert',
       scope: 'group' as const,
@@ -429,5 +454,34 @@ describe('actionConfirmText', () => {
         'idle',
       ),
     ).toBe('Add a comment to Security Onion case case-7.');
+  });
+});
+
+describe('the escalate of a blocked finding case', () => {
+  const finding: WaitingAction = {
+    ...escalate,
+    target: 'Exploit chain on a web host',
+    targetType: 'finding',
+  };
+
+  it('states the blocked sentence, links the investigation and offers no Escalate', () => {
+    mount(row({ id: 'INV-F', waitingActions: [{ ...finding, retry: true }] }));
+    const line = screen.getByTestId('waiting-action-INV-F-0');
+    expect(screen.getByTestId('waiting-action-blocked').textContent).toBe(BLOCKED_CASE_ROW);
+    const link = screen.getByTestId('waiting-action-open-investigation');
+    expect(link.getAttribute('href')).toBe('/investigation/INV-F');
+    expect(screen.queryByRole('button', { name: ACTION_VERB.escalate })).toBeNull();
+    // Dismiss stays: it writes nothing to Security Onion.
+    expect(screen.getByRole('button', { name: 'Dismiss' })).toBeTruthy();
+    expect(line.textContent).not.toContain('Escalate to case');
+    expect(getActionScope).not.toHaveBeenCalled();
+    expect(executeAction).not.toHaveBeenCalled();
+  });
+
+  it('NEGATIVE CONTROL: a finding escalate with no retry keeps Escalate and no link', () => {
+    mount(row({ id: 'INV-F', waitingActions: [{ ...finding, retry: false }] }));
+    expect(screen.getByRole('button', { name: ACTION_VERB.escalate })).toBeTruthy();
+    expect(screen.queryByTestId('waiting-action-blocked')).toBeNull();
+    expect(screen.queryByTestId('waiting-action-open-investigation')).toBeNull();
   });
 });

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 import { ApiError, getEvent, type EventDocument } from '../lib/api';
 import { useAsync } from '../lib/useAsync';
@@ -85,8 +85,71 @@ function CopyJson({ source }: { source: Record<string, unknown> }) {
   );
 }
 
-function Body({ doc }: { doc: EventDocument }) {
+/** A field that a report cites, for the drawer to show first. `label` is
+ *  the field in words, `path` the raw path the model wrote, and `value` the
+ *  value the run read. `valueTruncated` is true when the server cut the
+ *  value at 2,000 characters. */
+export interface CitedField {
+  label: string;
+  path: string;
+  value: string | null;
+  valueTruncated?: boolean;
+}
+
+/** The line under a cited value that the server cut. */
+export const CITED_VALUE_CUT = 'The value is cut at 2,000 characters.';
+
+/** The rows of the document that hold the cited field: a key with the same
+ *  leaf, or the same value. The run stores a field under its own name, and
+ *  the grid can name it another way (`zeek_http_status`, `http.status_code`). */
+export function citedRows(rows: Array<[string, string]>, cited: CitedField): Set<string> {
+  const leaf = cited.path.split('.').filter((p) => !/^\d+$/.test(p)).pop() ?? '';
+  const value = (cited.value ?? '').trim();
+  const out = new Set<string>();
+  for (const [key, v] of rows) {
+    const keyLeaf = key.split('.').pop() ?? '';
+    if ((leaf && keyLeaf === leaf) || (value !== '' && v.trim() === value)) out.add(key);
+  }
+  return out;
+}
+
+function CitedBlock({ cited }: { cited: CitedField }) {
+  return (
+    <div
+      data-testid="document-cited"
+      className="mt-3 rounded-card border border-accent/40 bg-accent/[.06] px-3 py-2"
+    >
+      <div className="text-[11px] text-faint">
+        The report cites this field: <span className="font-semibold text-text-2">{cited.label}</span>
+      </div>
+      <div className="mt-0.5 break-all font-mono text-[11px] text-faint">{cited.path}</div>
+      {cited.value != null && cited.value !== '' ? (
+        <div
+          data-testid="document-cited-value"
+          className="mt-1.5 max-h-[240px] overflow-auto whitespace-pre-wrap break-all font-mono text-[11.5px] text-text-2"
+        >
+          {cited.value}
+        </div>
+      ) : (
+        <div className="mt-1.5 text-[11.5px] text-dim">soc-ai stored no value for this field.</div>
+      )}
+      {cited.value != null && cited.value !== '' && cited.valueTruncated && (
+        <div data-testid="document-cited-cut" className="mt-1 text-[11px] text-dim">
+          {CITED_VALUE_CUT}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Body({ doc, cited }: { doc: EventDocument; cited?: CitedField }) {
   const rows = flattenSource(doc.source);
+  const marked = cited ? citedRows(rows, cited) : new Set<string>();
+  const firstMarked = useRef<HTMLLIElement | null>(null);
+  useEffect(() => {
+    firstMarked.current?.scrollIntoView?.({ block: 'center' });
+  }, [doc]);
+  const firstKey = rows.find(([key]) => marked.has(key))?.[0];
   return (
     <div className="p-4 text-[12.5px]">
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5">
@@ -106,8 +169,15 @@ function Body({ doc }: { doc: EventDocument }) {
         <div className="mt-3 text-dim">This document has no fields.</div>
       ) : (
         <ul data-testid="document-source" className="mt-3 divide-y divide-border-faint">
-          {rows.map(([key, value]) => (
-            <li key={key} className="grid grid-cols-[minmax(0,34%)_minmax(0,1fr)] gap-3 py-1.5">
+          {rows.map(([key, value]) => {
+            const hit = marked.has(key);
+            return (
+            <li
+              key={key}
+              ref={key === firstKey ? firstMarked : undefined}
+              data-cited={hit ? 'true' : undefined}
+              className={`grid grid-cols-[minmax(0,34%)_minmax(0,1fr)] gap-3 py-1.5 ${hit ? 'bg-accent/[.08]' : ''}`}
+            >
               <span
                 data-testid="document-key"
                 className="break-all font-mono text-[11.5px] text-faint"
@@ -118,7 +188,8 @@ function Body({ doc }: { doc: EventDocument }) {
                 {value}
               </span>
             </li>
-          ))}
+            );
+          })}
         </ul>
       )}
     </div>
@@ -151,9 +222,12 @@ function SlowRead() {
 export function DocumentDrawer({
   documentId,
   onClose,
+  cited,
 }: {
   documentId: string | null;
   onClose: () => void;
+  /** The field a report cites. The drawer shows it first and marks its row. */
+  cited?: CitedField;
 }) {
   // An empty id reads nothing. GET /events/ is a route that answers 404 for a
   // reason that has nothing to do with this document.
@@ -181,12 +255,19 @@ export function DocumentDrawer({
         </span>
       }
     >
+      {/* The cited field shows while the document loads, and when the grid
+          no longer holds the document: the value is what the run read. */}
+      {cited && (
+        <div className="px-4 pt-1 text-[12.5px]">
+          <CitedBlock cited={cited} />
+        </div>
+      )}
       {!data ? (
         <div className="p-4 text-[12.5px] text-dim">
           {blank ? NO_ID : doc.error ? (gone ? NOT_FOUND : READ_FAILED) : <SlowRead key={documentId} />}
         </div>
       ) : (
-        <Body doc={data} />
+        <Body doc={data} cited={cited} />
       )}
     </Drawer>
   );

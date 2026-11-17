@@ -100,7 +100,7 @@ describe('the window', () => {
     expect(await screen.findByText(/1 investigation in total/)).toBeTruthy();
     expect(lastQuery().since).toBeUndefined();
     expect(screen.getByTestId('window-widened').textContent).toMatch(
-      /No run started in the last 24 hours\. The newest run started 45d ago, so the list shows all time\./,
+      /No investigation is of an event in the last 24 hours\. The newest event was 45d ago, so the list shows all time\./,
     );
     expect(container.textContent).not.toContain('in the last 30 days');
   });
@@ -170,7 +170,7 @@ describe('a row with no verdict', () => {
       noVerdictText(
         row({ id: 'OLD', verdict: 'untriaged', status: 'error', isPrimary: false, latestRunId: 'NEW' }),
       ),
-    ).toBe('Failed. A later run replaced it.');
+    ).toBe('Failed. A later investigation replaced it.');
   });
 
   it('says an earlier run holds the verdict when the failed run is the newest', () => {
@@ -178,9 +178,9 @@ describe('a row with no verdict', () => {
       noVerdictText(
         row({ id: 'NEW', verdict: 'untriaged', status: 'error', isPrimary: false, latestRunId: 'NEW' }),
       ),
-    ).toBe('Failed. An earlier run holds the verdict.');
+    ).toBe('Failed. An earlier investigation holds the verdict.');
     expect(noVerdictText(row({ verdict: 'untriaged', status: 'interrupted' }))).toBe(
-      'Failed. No run reached a verdict.',
+      'Failed. No investigation reached a verdict.',
     );
   });
 
@@ -194,7 +194,7 @@ describe('a row with no verdict', () => {
     );
     mount();
     expect((await screen.findByTestId('no-verdict-RUN')).textContent).toBe('Running');
-    expect(screen.getByTestId('no-verdict-CUT').textContent).toBe('Failed. No run reached a verdict.');
+    expect(screen.getByTestId('no-verdict-CUT').textContent).toBe('Failed. No investigation reached a verdict.');
     const statuses = screen.getAllByTestId('status-cell');
     const failed = statuses.find((s) => s.textContent === 'Failed')!;
     expect(failed.getAttribute('title')).toMatch(/service restart/);
@@ -211,7 +211,10 @@ describe('the When and confidence cells', () => {
     mount('/investigations?range=7d');
     const when = await screen.findByTestId('when-A');
     expect(when.textContent).toBe('4d ago');
-    expect(when.getAttribute('title')).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2} \S+$/);
+    // A row with no event time: the time of the investigation stands in, in UTC.
+    expect(when.getAttribute('title')).toMatch(
+      /^Event \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\. Investigated \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\.$/,
+    );
     expect(screen.getByText('0.70')).toBeTruthy();
   });
 });

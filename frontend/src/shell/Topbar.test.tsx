@@ -519,7 +519,7 @@ describe('Topbar help', () => {
     await flush();
     act(() => screen.getByRole('button', { name: 'Help' }).click());
     const help = screen.getByRole('menuitem', { name: 'Open the guide' });
-    expect(help.getAttribute('href')).toBe('/app/guide/');
+    expect(help.getAttribute('href')).toBe('https://nuk3s.github.io/soc-ai/WEBUI_GUIDE/');
     expect(help.getAttribute('target')).toBe('_blank');
   });
 

@@ -571,7 +571,7 @@ describe('the row names an analyst verdict a newer run hides (V1-A3)', () => {
     const chip = await screen.findByTestId('analyst-verdict-es-1');
     expect(chip.textContent).toBe('· analyst: true positive');
     expect(chip.getAttribute('title')).toBe(
-      'alice set the verdict of this alert to true positive on another run. Open that run.',
+      'alice set the verdict of this alert to true positive on another investigation. Open that investigation.',
     );
   });
 

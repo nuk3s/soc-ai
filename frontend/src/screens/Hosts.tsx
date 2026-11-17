@@ -33,6 +33,7 @@ import {
   getDossierConflicts,
   getDossierRefreshStatus,
   getDossierSummary,
+  getHostLastEvents,
   getMachineSummary,
   getMe,
   listMachines,
@@ -388,17 +389,71 @@ interface Column {
   label: string;
   right?: boolean;
   width: string;
+  /** The hover of the header: what the column counts and its window. */
+  title?: string;
 }
 
+/** The hover of the Findings header: what each count counts, and its window. */
+export const FINDINGS_HEADER_TITLE =
+  'Confirmed: the true positive verdicts on this machine in the last 7 days. Open leads: the leads that name this machine and are open or hunting now.';
+
 const COLUMNS: Column[] = [
-  { key: 'name', label: 'Host', width: 'w-[22%]' },
-  { key: 'address', label: 'Address', width: 'w-[15%]' },
-  { key: 'agent', label: 'Agent', width: 'w-[15%]' },
-  { key: 'role', label: 'Role', width: 'w-[17%]' },
-  { key: 'events', label: 'Events', right: true, width: 'w-[9%]' },
+  { key: 'name', label: 'Host', width: 'w-[19%]' },
+  { key: 'address', label: 'Address', width: 'w-[14%]' },
+  { key: 'agent', label: 'Agent', width: 'w-[13%]' },
+  { key: 'role', label: 'Role', width: 'w-[15%]' },
+  // L2: the security column. The list had none, and a machine with 27 true
+  // positive investigations read like every other row (review 2026-11-12).
+  { key: 'findings', label: 'Findings', width: 'w-[11%]', title: FINDINGS_HEADER_TITLE },
+  { key: 'events', label: 'Events', right: true, width: 'w-[8%]' },
   { key: 'first_seen', label: 'First seen', right: true, width: 'w-[10%]' },
   { key: 'last_seen', label: 'Last seen', right: true, width: 'w-[10%]' },
 ];
+
+/** The Findings cell: confirmed threats first, then the open leads. Red marks
+ *  a confirmed threat only. */
+function FindingsCell({ row }: { row: MachineRow }) {
+  const f = row.findings;
+  if (!f) {
+    return (
+      <span className="text-[12px] text-faint" title="This server sends no findings count.">
+        not counted
+      </span>
+    );
+  }
+  if (f.confirmed === 0 && f.open_leads === 0) {
+    return (
+      <span className="text-[12px] text-faint" title={FINDINGS_HEADER_TITLE}>
+        none
+      </span>
+    );
+  }
+  return (
+    <div data-testid={`machine-findings-${row.key}`} className="text-[12px] leading-[1.4]" title={FINDINGS_HEADER_TITLE}>
+      {f.confirmed > 0 && (
+        <div className="font-semibold text-danger">{`${f.confirmed} confirmed in ${f.days} days`}</div>
+      )}
+      {f.open_leads > 0 && (
+        <div className="text-text-2">{plural(f.open_leads, 'open lead')}</div>
+      )}
+    </div>
+  );
+}
+
+/** The newest of two ISO times, or the one that is set. */
+function newestOf(a: string | null | undefined, b: string | null | undefined): string | null {
+  if (!a) return b ?? null;
+  if (!b) return a;
+  return new Date(a).getTime() >= new Date(b).getTime() ? a : b;
+}
+
+/** The newest live grid event of a row, over its addresses, or null. */
+export function liveLastEvent(row: Pick<MachineRow, 'addresses' | 'primary_ip'>, events: Record<string, string> | null | undefined): string | null {
+  if (!events) return null;
+  let best: string | null = null;
+  for (const ip of new Set([row.primary_ip, ...row.addresses])) best = newestOf(best, events[ip]);
+  return best;
+}
 
 /** A column header that sorts on click, toggles the direction and shows it. */
 function SortHeader({
@@ -419,6 +474,7 @@ function SortHeader({
     <th
       scope="col"
       aria-sort={ariaSort}
+      title={col.title}
       className={cn('px-2.5 py-[9px] font-semibold', col.width, col.right ? 'text-right' : 'text-left')}
     >
       <span className={cn('inline-flex items-center gap-1', col.right && 'justify-end')}>
@@ -583,8 +639,12 @@ function MachineTableRow({
   linkState,
   sweep,
   tourAnchor,
+  lastEvent,
 }: {
   row: MachineRow;
+  /** The newest grid event of the row, read live for the page. Null when
+   *  the read failed or found none in its window. */
+  lastEvent?: string | null;
   selectable: boolean;
   selected: boolean;
   onToggle: () => void;
@@ -711,6 +771,11 @@ function MachineTableRow({
           <RoleCell row={row} />
         </span>
       </td>
+      <td className="min-w-0 px-2.5 py-[9px] align-middle">
+        <span className="relative z-[1]">
+          <FindingsCell row={row} />
+        </span>
+      </td>
       <td className="px-2.5 py-[9px] text-right align-middle font-mono text-[12px] text-dim">
         {row.events.toLocaleString()}
       </td>
@@ -720,8 +785,20 @@ function MachineTableRow({
         </span>
       </td>
       <td className="px-2.5 py-[9px] text-right align-middle font-mono text-[11.5px] text-faint">
-        <span className="relative z-[1]" title={absolute(row.last_seen)}>
-          {ago(row.last_seen)}
+        {/* L2: the time of the last grid event. The stored last seen is the
+            newest event the last sweep saw, so every row read the age of the
+            sweep while the host page read "last grid event now" (review
+            2026-11-12). The page reads the grid once for its rows. */}
+        <span
+          className="relative z-[1]"
+          data-testid={`machine-last-seen-${row.key}`}
+          title={
+            lastEvent && newestOf(lastEvent, row.last_seen) === lastEvent
+              ? `The newest grid event of this machine, ${absolute(lastEvent)}. The console read it from the grid with the page.`
+              : `The newest grid event that the last sweep saw, ${absolute(row.last_seen)}.`
+          }
+        >
+          {ago(newestOf(lastEvent, row.last_seen))}
         </span>
       </td>
     </tr>
@@ -770,11 +847,11 @@ function Pager({
 
 // ---- filter vocabulary ------------------------------------------------------
 
-/** The chip of each health filter. Each one is a part of Needs attention.
+/** The chip of each health filter. Each one is a part of the host records to rebuild.
  *  `broken` lists a failed build and a machine never built, so its chip
  *  names both (dogfood 2026-10-19, R4-D16). */
 const HEALTH_CHIPS: Record<'attention' | 'stale' | 'broken', string> = {
-  attention: 'Needs attention',
+  attention: 'Host records to rebuild',
   stale: 'Out of date',
   broken: 'No clean build',
 };
@@ -950,6 +1027,17 @@ export function Hosts() {
 
   const queryKey = JSON.stringify(machineQuery(state));
   const list = useAsync(() => listMachines(machineQuery(state)), [queryKey]);
+  // The newest grid event of each row, in one read for the page. The list
+  // reads the store and keeps working with the grid down. A failed read
+  // leaves the time the last sweep saw.
+  const pageIps = Array.from(
+    new Set((list.data?.rows ?? []).flatMap((r) => [r.primary_ip, ...r.addresses]).filter(Boolean)),
+  ).slice(0, 200);
+  const pageIpsKey = pageIps.join(',');
+  const lastEvents = useAsync(
+    () => (pageIps.length > 0 ? getHostLastEvents(pageIps) : Promise.resolve(null)),
+    [pageIpsKey],
+  );
 
   // The cards: counts over the whole census, never the page.
   const kpis = useAsync(() => getMachineSummary(), []);
@@ -1909,6 +1997,7 @@ export function Hosts() {
                       onOpen={saveScroll}
                       linkState={linkState}
                       sweep={listSweep}
+                      lastEvent={liveLastEvent(row, lastEvents.data?.events)}
                     />
                   ))
                 )}

@@ -63,6 +63,7 @@ const CONFIG_FIXTURE: Config = {
 const getConfigMock = vi.fn();
 
 vi.mock('../lib/api', () => ({
+  getAbout: vi.fn(() => Promise.resolve({ version: '1.6.0' })),
   getAlerts: vi.fn(() => Promise.resolve({ groups: [], truncated: false, other_docs: 0 })),
   getInvestigations: vi.fn(() => Promise.resolve([])),
   getConfig: () => getConfigMock(),
@@ -99,12 +100,23 @@ describe('CommandPalette', () => {
 
   it('offers Go-to entries for every primary route, incl. Dashboard/Notifications/Backtest/Status', async () => {
     await openPalette();
-    for (const label of ['Dashboard', 'Notifications', 'Backtest', 'Alerts', 'Investigations', 'Hunts', 'Status', 'Runbooks', 'Settings']) {
+    for (const label of ['Dashboard', 'Notifications', 'Backtest', 'Alerts', 'Investigations', 'Hunts', 'Campaigns', 'Status', 'Runbooks', 'Settings']) {
       expect(screen.getByRole('option', { name: new RegExp(`${label}\\s+Go to`) })).toBeInTheDocument();
     }
     // The old names are gone: one page, one name (dogfood 2026-10-06).
     expect(screen.queryByRole('option', { name: /^Config\s+Go to/ })).toBeNull();
     expect(screen.queryByRole('option', { name: /^Operate\s+Go to/ })).toBeNull();
+  });
+
+  // The campaign pages have no side item. The palette lists them after Hunts.
+  it('offers Campaigns after Hunts and opens the list', async () => {
+    await openPalette();
+    const names = screen.getAllByRole('option').map((o) => o.textContent ?? '');
+    const hunts = names.findIndex((n) => /^Hunts\s*Go to/.test(n));
+    expect(hunts).toBeGreaterThanOrEqual(0);
+    expect(names[hunts + 1]).toMatch(/^Campaigns\s*Go to/);
+    fireEvent.click(screen.getByRole('option', { name: /^Campaigns\s+Go to/ }));
+    expect(navigateMock).toHaveBeenCalledWith('/campaigns');
   });
 
   // The help button opened the palette and the palette held no help. The

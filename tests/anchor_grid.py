@@ -53,12 +53,16 @@ class AnchorGrid:
         alerts: set[str] | None = None,
         telemetry: set[str] | None = None,
         down: bool = False,
+        sources: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         from soc_ai.webui.alerts_query import _oql_filter_dsl
 
         self.alerts = set(alerts or ())
         self.telemetry = set(telemetry or ())
         self.down = down
+        # The stored fields of a document, by id. A document with no entry
+        # answers with an empty source.
+        self.sources = dict(sources or {})
         self.feed_reads = 0
         self._feed = json.dumps(_oql_filter_dsl(settings.webui_alerts_query), sort_keys=True)
 
@@ -73,7 +77,11 @@ class AnchorGrid:
         if ids is None:
             return {"hits": {"total": {"value": 0, "relation": "eq"}, "hits": []}}
         held = self.alerts if feed else self.alerts | self.telemetry
-        hits = [{"_id": i, "_index": "logs-test", "_source": {}} for i in ids if i in held]
+        hits = [
+            {"_id": i, "_index": "logs-test", "_source": self.sources.get(i, {})}
+            for i in ids
+            if i in held
+        ]
         return {"hits": {"total": {"value": len(hits), "relation": "eq"}, "hits": hits}}
 
 

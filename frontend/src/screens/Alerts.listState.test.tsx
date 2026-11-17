@@ -128,7 +128,8 @@ describe('the filters live in the URL (P8, RL15)', () => {
     await waitFor(() => expect(location).toContain('range=7d'));
     fireEvent.click(screen.getByRole('button', { name: /Hide acknowledged/ }));
     await waitFor(() => expect(location).toContain('hide_acked=false'));
-    fireEvent.click(screen.getByText(/^Last seen/));
+    // The column header. The sort menu holds the same words as an option.
+    fireEvent.click(screen.getAllByText(/^Last seen/).find((el) => el.tagName !== 'OPTION')!);
     await waitFor(() => expect(location).toContain('sort=latest%3Adesc'));
     // Other parameters stay.
     expect(location).toContain('view=all');
@@ -137,7 +138,8 @@ describe('the filters live in the URL (P8, RL15)', () => {
   it('seeds the sort from the URL', async () => {
     mount('/alerts?sort=count:asc');
     await screen.findByText('ET SCAN Test Detection');
-    expect(screen.getByText(/^Sort/).textContent).toContain('count ↑');
+    expect((screen.getByLabelText('Sort') as HTMLSelectElement).value).toBe('count');
+    expect(screen.getByTestId('alerts-sort-dir').textContent).toBe('↑');
   });
 
   it('NEGATIVE CONTROL: default values leave the URL clean', async () => {

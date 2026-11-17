@@ -44,6 +44,7 @@ from sqlalchemy import DateTime, Table, insert, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.types import TypeDecorator
 
+from soc_ai.store import investigations as inv_svc
 from soc_ai.store.models import (
     Backtest,
     Base,
@@ -283,12 +284,16 @@ async def seed_fixtures(
             events = inv.pop("events", [])
             if await db.get(Investigation, inv["id"]) is not None:
                 continue
-            db.add(Investigation(**_store_row(_table("investigations"), inv)))
+            row = Investigation(**_store_row(_table("investigations"), inv))
+            db.add(row)
             # Parent before children: no ORM relationships are declared, so
             # flush the parent row before its FK event rows.
             await db.flush()
             for ev in events:
                 db.add(InvestigationEvent(investigation_id=inv["id"], **ev))
+            # The event time by the rule of the store: the report, else the
+            # stored alert, else the time of the investigation.
+            await inv_svc.settle_event_at(db, [row])
             added += 1
         for raw in doc.get("hunts", []):
             hunt = copy.deepcopy(raw)

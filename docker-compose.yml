@@ -108,15 +108,27 @@ services:
       - soc_ai_evals:/var/lib/soc-ai/evals
 
     # ── Liveness check ───────────────────────────────────────────────────────
-    # Mirrors the HEALTHCHECK in the Dockerfile. It tries HTTPS, then HTTP, so
-    # it passes on the direct path and behind the caddy service.
+    # Mirrors the HEALTHCHECK in the Dockerfile. The server speaks HTTPS when
+    # SOC_AI_TLS_CERT is set, and plain HTTP when it is blank, which is the
+    # proxy path behind the caddy service. The check asks in the scheme of the
+    # server first. An HTTPS-first check on the proxy path made the server log
+    # "Invalid HTTP request received" each 30 s: 37,402 lines in 13 days, 98%
+    # of all warnings. The other scheme stays as the second try, so a server
+    # that an override started in the other scheme still reads as live.
     #
     # LIVENESS, not health: a green container here means this process answered,
     # nothing more. It probes no dependency and must not, or an outage upstream
     # would become a restart loop down here. For the verdict, run
     # `docker compose exec soc-ai python -m soc_ai doctor`.
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsk https://127.0.0.1:8443/healthz || curl -fs http://127.0.0.1:8443/healthz"]
+      test:
+        - CMD-SHELL
+        - >-
+          if [ -n "$${SOC_AI_TLS_CERT}" ]; then
+          curl -fsk https://127.0.0.1:8443/healthz || curl -fs http://127.0.0.1:8443/healthz;
+          else
+          curl -fs http://127.0.0.1:8443/healthz || curl -fsk https://127.0.0.1:8443/healthz;
+          fi
       interval: 30s
       timeout: 10s
       start_period: 60s
@@ -145,10 +157,13 @@ services:
     # ── Resource hints (adjust to your hardware) ──────────────────────────────
     # The app is primarily I/O-bound (ES queries + LLM calls); these are soft
     # limits that prevent a runaway investigation loop from starving the host.
+    # The limit was 1G. A production container reached it 6,631 times in nine
+    # days and kept 341 MB of the process in swap. 3G holds the process with
+    # the store, a hunt and the nightly sweep in memory.
     deploy:
       resources:
         limits:
-          memory: 1G
+          memory: 3G
         reservations:
           memory: 256M
 

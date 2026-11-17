@@ -17,6 +17,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
   getAnalyticHits: vi.fn(),
   getEvent: vi.fn(),
   getHuntCatalog: vi.fn(),
+  markAnalyticShadowHitsRead: vi.fn(),
   markShadowHitRead: vi.fn(),
   setAnalyticStatus: vi.fn(),
   startHuntConsole: vi.fn(),
@@ -26,6 +27,7 @@ import {
   ApiError,
   getAnalyticHits,
   getHuntCatalog,
+  markAnalyticShadowHitsRead,
   markShadowHitRead,
   setAnalyticStatus,
   startHuntConsole,
@@ -102,6 +104,8 @@ const SHADOW: AnalyticHit = {
 };
 
 const COUNTS = { all: 2, unread: 1, live: 1, shadow: 1 };
+/** Both hits are from the window, so no older unread hit is in the list. */
+const WINDOW = { days: 7, in_window: 2, older_unread: 0 };
 
 function LocationProbe() {
   const l = useLocation();
@@ -122,11 +126,21 @@ const mount = (path = '/hunts') =>
 
 const card = async (id: number) => await screen.findByTestId(`analytic-hit-${id}`);
 
+/** The group that holds one hit: the header of its analytic, and its cards.
+ *  The header names the analytic, its status and its tier, and it carries the
+ *  decisions on the analytic (review 2026-11-12, F2). */
+const groupOf = async (id: number) => {
+  const el = (await card(id)).closest('[data-testid^="analytic-group-"]');
+  if (!(el instanceof HTMLElement)) throw new Error(`hit ${id} is in no group`);
+  return el;
+};
+
 beforeEach(() => {
   vi.mocked(getAnalyticHits)
     .mockReset()
-    .mockResolvedValue({ hits: [LIVE, SHADOW], counts: COUNTS });
+    .mockResolvedValue({ hits: [LIVE, SHADOW], counts: COUNTS, window: WINDOW });
   vi.mocked(markShadowHitRead).mockReset().mockResolvedValue({ ok: true });
+  vi.mocked(markAnalyticShadowHitsRead).mockReset().mockResolvedValue({ read: 1 });
   vi.mocked(setAnalyticStatus).mockReset().mockResolvedValue({} as never);
   vi.mocked(startHuntConsole).mockReset().mockResolvedValue({ hunt_id: 'H9' });
   vi.mocked(getHuntCatalog).mockReset().mockResolvedValue(CATALOG_RAN);
@@ -146,7 +160,9 @@ describe('the block', () => {
   it('names the window, counts the hits and states the order', async () => {
     mount();
     await card(41);
-    expect(screen.getByText(/last 7 days · 2/)).toBeTruthy();
+    expect(screen.getByTestId('analytic-hits-window').textContent).toBe(
+      '2 in the last 7 days · 0 older unread',
+    );
     expect(
       screen.getByText(
         'What the analytics found. ' +
@@ -304,6 +320,9 @@ describe('paging', () => {
   const liveHit = (n: number): AnalyticHit => ({
     ...LIVE,
     id: 1000 + n,
+    // One analytic for each hit. A group shows three hits and folds the
+    // rest, and these tests count the hits the pages read.
+    analytic_id: `identity-dcsync-${n}`,
     entity_key: `host-${n}`,
     lead_id: null,
     lead_status: null,
@@ -416,11 +435,14 @@ describe('paging', () => {
 });
 
 describe('the card', () => {
-  it('names the analytic and the hit on two labelled lines', async () => {
+  it('names the analytic on the header and the hit on the card', async () => {
     mount();
     const live = await card(41);
-    expect(within(live).getByText('Analytic:')).toBeTruthy();
-    expect(within(live).getByRole('button', { name: LIVE.analytic_title })).toBeTruthy();
+    const header = await groupOf(41);
+    expect(within(header).getByText('Analytic:')).toBeTruthy();
+    expect(within(header).getByRole('button', { name: LIVE.analytic_title })).toBeTruthy();
+    // The card does not repeat the analytic.
+    expect(within(live).queryByText('Analytic:')).toBeNull();
     expect(within(live).getByText('Hit:')).toBeTruthy();
     const entity = within(live).getByText('domainadmin');
     // The user carries its type, so a machine of the same name never opens.
@@ -432,11 +454,11 @@ describe('the card', () => {
 
   it('carries the status chips and the tier chips with their sentences', async () => {
     mount();
-    const live = await card(41);
+    const live = await groupOf(41);
     expect(within(live).getByText('live').getAttribute('title')).toBe(CHIP_LIVE);
     expect(within(live).getByText('shipped').getAttribute('title')).toBe(CHIP_SHIPPED);
 
-    const shadow = await card(42);
+    const shadow = await groupOf(42);
     expect(within(shadow).getByText('shadow').getAttribute('title')).toBe(CHIP_SHADOW);
     expect(within(shadow).getByText('local').getAttribute('title')).toBe(CHIP_LOCAL);
   });
@@ -445,12 +467,15 @@ describe('the card', () => {
     mount();
     const live = await card(41);
     const shadow = await card(42);
-    expect(within(live).getByRole('button', { name: LIVE.analytic_title }).className).toContain(
-      'font-bold',
-    );
-    expect(within(shadow).getByRole('button', { name: SHADOW.analytic_title }).className).not.toContain(
-      'font-bold',
-    );
+    expect(
+      within(await groupOf(41)).getByRole('button', { name: LIVE.analytic_title }).className,
+    ).toContain('font-bold');
+    expect(
+      within(await groupOf(42)).getByRole('button', { name: SHADOW.analytic_title }).className,
+    ).not.toContain('font-bold');
+    // The border is the weight of the hit: solid for live, dashed for shadow.
+    expect(live.style.borderLeft).toContain('solid');
+    expect(shadow.style.borderLeft).toContain('dashed');
     expect(live.getAttribute('data-hit-status')).toBe('live');
     expect(shadow.getAttribute('data-hit-status')).toBe('shadow');
   });
@@ -580,7 +605,11 @@ describe('the card', () => {
     const shadow = await card(42);
     expect(within(shadow).getByText('could not run')).toBeTruthy();
     expect(within(shadow).getByText(/This is not an all-clear/)).toBeTruthy();
-    expect(within(shadow).queryByRole('button', { name: 'Approve analytic' })).toBeNull();
+    // No hit of the analytic proves itself, so the header offers no approval.
+    expect(
+      within(await groupOf(42)).queryByRole('button', { name: 'Approve analytic' }),
+    ).toBeNull();
+    expect(within(await groupOf(42)).getByRole('button', { name: 'Reject analytic' })).toBeTruthy();
   });
 });
 
@@ -651,9 +680,9 @@ describe('reading a shadow hit', () => {
 });
 
 describe('deciding on a shadow analytic', () => {
-  it('asks for the reason and posts the approval, and reads the hit', async () => {
+  it('asks for the reason and posts the approval, and reads the hits of the analytic', async () => {
     mount();
-    const shadow = await card(42);
+    const shadow = await groupOf(42);
     fireEvent.click(within(shadow).getByRole('button', { name: 'Approve analytic' }));
     fireEvent.change(within(shadow).getByPlaceholderText('Why it goes live'), {
       target: { value: 'it proved itself' },
@@ -666,12 +695,15 @@ describe('deciding on a shadow analytic', () => {
         'it proved itself',
       ),
     );
-    await waitFor(() => expect(markShadowHitRead).toHaveBeenCalledWith(42));
+    // The decision reads the unread hits of the analytic, in one write.
+    await waitFor(() => expect(markAnalyticShadowHitsRead).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(markAnalyticShadowHitsRead).mock.calls[0][0]).toBe('local-ntlm-failures');
+    expect(markShadowHitRead).not.toHaveBeenCalled();
   });
 
   it('retires the analytic with a reason when it is rejected', async () => {
     mount();
-    const shadow = await card(42);
+    const shadow = await groupOf(42);
     fireEvent.click(within(shadow).getByRole('button', { name: 'Reject analytic' }));
     fireEvent.change(within(shadow).getByPlaceholderText('Why it is rejected'), {
       target: { value: 'it fires on backups' },
@@ -688,10 +720,11 @@ describe('deciding on a shadow analytic', () => {
 
   it('offers no analytic decision on a live hit', async () => {
     mount();
-    const live = await card(41);
+    const live = await groupOf(41);
     expect(within(live).queryByRole('button', { name: 'Approve analytic' })).toBeNull();
     expect(within(live).queryByRole('button', { name: 'Reject analytic' })).toBeNull();
     expect(within(live).queryByRole('button', { name: 'Mark read' })).toBeNull();
+    expect(within(live).queryByRole('button', { name: /^Mark \d+ read$/ })).toBeNull();
   });
 });
 
@@ -721,7 +754,7 @@ describe('a hit whose analytic the catalog no longer lists', () => {
   it('states the removal in place of the status chip', async () => {
     vi.mocked(getAnalyticHits).mockResolvedValue({ hits: [GONE_LIVE], counts: COUNTS });
     mount();
-    const hit = await card(51);
+    const hit = await groupOf(51);
     expect(within(hit).getByText('analytic removed').getAttribute('title')).toBe(
       CHIP_ANALYTIC_REMOVED,
     );
@@ -734,8 +767,8 @@ describe('a hit whose analytic the catalog no longer lists', () => {
   it('names the analytic in words, as text that opens nothing', async () => {
     vi.mocked(getAnalyticHits).mockResolvedValue({ hits: [GONE_LIVE], counts: COUNTS });
     mount();
-    const hit = await card(51);
-    const title = within(hit).getByTestId('analytic-hit-title');
+    const hit = await groupOf(51);
+    const title = within(hit).getByTestId('analytic-group-title');
     expect(title.tagName).toBe('SPAN');
     expect(title.textContent).toBe('Prior retired from the catalog');
     expect(title.getAttribute('title')).toBe('Analytic prior-retired-from-the-catalog');
@@ -748,8 +781,8 @@ describe('a hit whose analytic the catalog no longer lists', () => {
       counts: COUNTS,
     });
     mount();
-    const hit = await card(51);
-    expect(within(hit).getByTestId('analytic-hit-title').textContent).toBe(
+    const hit = await groupOf(51);
+    expect(within(hit).getByTestId('analytic-group-title').textContent).toBe(
       'Defender adjudicates a threat on a server',
     );
     expect(within(hit).getByText('analytic removed')).toBeTruthy();
@@ -759,10 +792,13 @@ describe('a hit whose analytic the catalog no longer lists', () => {
     vi.mocked(getAnalyticHits).mockResolvedValue({ hits: [GONE_SHADOW], counts: COUNTS });
     mount();
     const hit = await card(52);
-    expect(within(hit).queryByRole('button', { name: 'Approve analytic' })).toBeNull();
-    expect(within(hit).queryByRole('button', { name: 'Reject analytic' })).toBeNull();
-    // The read state is a fact about the hit, so the hit can still be read.
+    const header = await groupOf(52);
+    expect(within(header).queryByRole('button', { name: 'Approve analytic' })).toBeNull();
+    expect(within(header).queryByRole('button', { name: 'Reject analytic' })).toBeNull();
+    // The read state is a fact about the hit, so the hit can still be read,
+    // and the header still reads the hits of the analytic in one press.
     expect(within(hit).getByRole('button', { name: 'Mark read' })).toBeTruthy();
+    expect(within(header).getByRole('button', { name: 'Mark 1 read' })).toBeTruthy();
   });
 
   it('keeps the status chip and the drawer on an analytic that exists', async () => {
@@ -772,11 +808,11 @@ describe('a hit whose analytic the catalog no longer lists', () => {
       counts: COUNTS,
     });
     mount();
-    const live = await card(41);
+    const live = await groupOf(41);
     expect(within(live).getByText('live').getAttribute('title')).toBe(CHIP_LIVE);
     expect(within(live).getByRole('button', { name: LIVE.analytic_title })).toBeTruthy();
     expect(within(live).queryByText('analytic removed')).toBeNull();
-    const shadow = await card(42);
+    const shadow = await groupOf(42);
     expect(within(shadow).getByText('shadow')).toBeTruthy();
     expect(within(shadow).queryByText('analytic removed')).toBeNull();
   });
@@ -793,25 +829,26 @@ describe('a hit recorded in shadow whose analytic is live now', () => {
 
   it('wears the live chip and states where it was recorded', async () => {
     const hit = await mountApproved();
-    expect(within(hit).getByText('live').getAttribute('title')).toBe(CHIP_LIVE);
-    expect(within(hit).queryByText('shadow')).toBeNull();
+    const header = await groupOf(42);
+    expect(within(header).getByText('live').getAttribute('title')).toBe(CHIP_LIVE);
+    expect(within(header).queryByText('shadow')).toBeNull();
     expect(within(hit).getByText('recorded in shadow').getAttribute('title')).toBe(
       CHIP_RECORDED_IN_SHADOW,
     );
   });
 
   it('offers neither decision on an analytic that is already live', async () => {
-    const hit = await mountApproved();
-    expect(within(hit).queryByRole('button', { name: 'Approve analytic' })).toBeNull();
-    expect(within(hit).queryByRole('button', { name: 'Reject analytic' })).toBeNull();
+    await mountApproved();
+    const header = await groupOf(42);
+    expect(within(header).queryByRole('button', { name: 'Approve analytic' })).toBeNull();
+    expect(within(header).queryByRole('button', { name: 'Reject analytic' })).toBeNull();
   });
 
   it('stays on the shadow half it lists under, and stays readable', async () => {
     const hit = await mountApproved();
     expect(hit.getAttribute('data-hit-status')).toBe('shadow');
-    expect(within(hit).getByRole('button', { name: SHADOW.analytic_title }).className).not.toContain(
-      'font-bold',
-    );
+    // The hit keeps the dashed border of the half it was recorded in.
+    expect(hit.style.borderLeft).toContain('dashed');
     expect(within(hit).getByTitle(UNREAD_DOT)).toBeTruthy();
     fireEvent.click(within(hit).getByRole('button', { name: 'Mark read' }));
     await waitFor(() => expect(markShadowHitRead).toHaveBeenCalledWith(42));
@@ -830,7 +867,7 @@ describe('a hit recorded in shadow whose analytic is live now', () => {
 
   it('leaves the chip off a hit of an analytic that is still in shadow', async () => {
     mount();
-    const shadow = await card(42);
+    const shadow = await groupOf(42);
     expect(within(shadow).getByText('shadow').getAttribute('title')).toBe(CHIP_SHADOW);
     expect(within(shadow).queryByText('recorded in shadow')).toBeNull();
     expect(within(shadow).getByRole('button', { name: 'Approve analytic' })).toBeTruthy();
@@ -840,7 +877,7 @@ describe('a hit recorded in shadow whose analytic is live now', () => {
   it('leaves the chip off a hit that was born live', async () => {
     mount();
     const live = await card(41);
-    expect(within(live).getByText('live').getAttribute('title')).toBe(CHIP_LIVE);
+    expect(within(await groupOf(41)).getByText('live').getAttribute('title')).toBe(CHIP_LIVE);
     expect(within(live).queryByText('recorded in shadow')).toBeNull();
     expect(live.getAttribute('data-hit-status')).toBe('live');
   });
@@ -860,7 +897,9 @@ describe('the fold', () => {
 
   it('keeps the title, the count and the unread figure while it is folded', async () => {
     mountFolded(true);
-    expect(await screen.findByText(/last 7 days · 2 · 1 unread/)).toBeTruthy();
+    expect(
+      await screen.findByText('2 in the last 7 days · 0 older unread · 1 unread in all'),
+    ).toBeTruthy();
     expect(screen.getByTestId('define-hit')).toBeTruthy();
     expect(screen.queryByTestId('analytic-hit-41')).toBeNull();
     expect(screen.queryByRole('button', { name: /^Unread/ })).toBeNull();

@@ -149,7 +149,7 @@ describe('R2-D4: a record keeps its buttons off, with the reason', () => {
     const buttons = screen.getAllByRole('button', { name: 'Re-run investigation' });
     for (const b of buttons) {
       expect(b).toBeDisabled();
-      expect(b.getAttribute('title')).toBe('A re-run cannot change the recorded cause.');
+      expect(b.getAttribute('title')).toBe('A new investigation cannot change the recorded cause.');
     }
   });
 
@@ -171,10 +171,12 @@ describe('R2-D5: cited evidence says what resolved', () => {
         ],
       }),
     );
-    const unresolved = screen.getByText('community_id_events.2.payload_printable');
+    // K1: a chip names the field in words. The raw path is in the tooltip.
+    const unresolved = screen.getByText('Payload');
     expect(unresolved.getAttribute('data-resolved')).toBe('false');
     expect(unresolved.getAttribute('title')).toContain('did not resolve');
-    const resolved = screen.getByText('alert.rule_name');
+    expect(unresolved.getAttribute('title')).toContain('community_id_events.2.payload_printable');
+    const resolved = screen.getByText('Rule name');
     expect(resolved.getAttribute('data-resolved')).toBe('true');
     expect(screen.getByTestId('cited-tool').textContent).toContain('Zeek logs');
     expect(screen.getByTestId('cited-evidence').textContent).toContain('1 citation did not resolve.');
@@ -281,9 +283,9 @@ describe('V1-A3: the analyst verdict on an earlier run stands and is named', () 
     mount(inv(onEarlierRun()));
     const note = screen.getByTestId('standing-analyst-verdict');
     expect(note.textContent).toContain(
-      'alice set the verdict of this alert to true positive on another run. That verdict stands.',
+      'alice set the verdict of this alert to true positive on another investigation. That verdict stands.',
     );
-    expect(within(note).getByRole('link', { name: 'Open that run.' }).getAttribute('href')).toBe(
+    expect(within(note).getByRole('link', { name: 'Open that investigation.' }).getAttribute('href')).toBe(
       '/investigation/INV-0',
     );
     // This run's own verdict is the model's.
@@ -295,7 +297,7 @@ describe('V1-A3: the analyst verdict on an earlier run stands and is named', () 
     fireEvent.click(rerunButton());
     const dialog = screen.getByRole('dialog', { name: 'Re-run investigation' });
     expect(dialog.textContent).toContain('alice set the verdict of this alert to true positive.');
-    expect(dialog.textContent).toContain('That verdict is on another run of the alert.');
+    expect(dialog.textContent).toContain('That verdict is on another investigation of the alert.');
     fireEvent.click(screen.getByRole('button', { name: 'Keep the analyst verdict' }));
     expect(startHunt).not.toHaveBeenCalled();
   });
@@ -307,7 +309,7 @@ describe('V1-A3: the analyst verdict on an earlier run stands and is named', () 
     expect(requestMoreInfo).not.toHaveBeenCalled();
     const dialog = screen.getByRole('dialog', { name: 'Request more info' });
     expect(dialog.textContent).toContain(
-      'Request more info starts a new run. The new run can reach another verdict, and the alert then shows that verdict.',
+      'Request more info starts a new investigation. The new investigation can reach another verdict, and the alert then shows that verdict.',
     );
     fireEvent.click(within(dialog).getByRole('button', { name: 'Replace the analyst verdict' }));
     await waitFor(() => expect(onReHunt).toHaveBeenCalledWith('INV-ANSWER'));
@@ -363,16 +365,16 @@ describe('V1-A2: a new run from a replay names the live verdict it replaces', ()
     fireEvent.click(requestInfoButton());
     const dialog = screen.getByRole('dialog', { name: 'Request more info' });
     const text = dialog.textContent ?? '';
-    expect(text).toContain('This run is a backtest replay.');
+    expect(text).toContain('This investigation is a backtest replay.');
     expect(text).toContain('The live verdict of the alert is true positive at 0.65.');
     expect(text).toContain(
-      'Request more info starts a live run. The verdict of the new run becomes the live verdict of the alert.',
+      'Request more info starts a live investigation. The verdict of the new investigation becomes the live verdict of the alert.',
     );
     fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
     expect(requestMoreInfo).not.toHaveBeenCalled();
 
     fireEvent.click(requestInfoButton());
-    fireEvent.click(screen.getByRole('button', { name: 'Start a live run' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Start a live investigation' }));
     await waitFor(() => expect(onReHunt).toHaveBeenCalledWith('INV-ANSWER'));
   });
 
@@ -381,7 +383,7 @@ describe('V1-A2: a new run from a replay names the live verdict it replaces', ()
     fireEvent.click(rerunButton());
     const dialog = screen.getByRole('dialog', { name: 'Re-run investigation' });
     expect(dialog.textContent).toContain(
-      'A re-run starts a live run. The verdict of the new run becomes the live verdict of the alert.',
+      'Re-run investigation starts a live investigation. The verdict of the new investigation becomes the live verdict of the alert.',
     );
     expect(startHunt).not.toHaveBeenCalled();
   });
@@ -397,7 +399,7 @@ describe('V1-A2: a new run from a replay names the live verdict it replaces', ()
     fireEvent.click(requestInfoButton());
     const dialog = screen.getByRole('dialog', { name: 'Request more info' });
     expect(dialog.textContent).toContain('alice set the verdict of this alert to true positive.');
-    expect(dialog.textContent).toContain('This run is a backtest replay.');
+    expect(dialog.textContent).toContain('This investigation is a backtest replay.');
     expect(within(dialog).getByRole('button', { name: 'Replace the analyst verdict' })).toBeTruthy();
   });
 });

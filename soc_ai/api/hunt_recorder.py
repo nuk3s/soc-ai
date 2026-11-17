@@ -13,7 +13,7 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from soc_ai.hunting.findings import plain_error
+from soc_ai.hunting.outcome import failure_cause
 from soc_ai.run_meter import RunMeter, SearchMeter
 from soc_ai.store import hunts as hunt_svc
 from soc_ai.store import leads as leads_store
@@ -23,24 +23,19 @@ _LOGGER = logging.getLogger(__name__)
 
 
 def error_narrative(message: str | None, exc_type: str | None) -> str:
-    """One sentence that says why a hunt failed.
+    """The plain cause of a failed hunt, for the hunt row.
 
     A hunt that ended 'error' with an empty narrative was the second dogfood's
     most repeated complaint. The page said the hunt failed and no surface said
     what failed, so every one of them cost a server-log read.
 
-    A known exception shape gets the plain sentence
-    :func:`soc_ai.hunting.findings.plain_error` writes for the catalog path.
-    Anything else names the exception and keeps its whole message.
+    The narrative then named the exception and kept its whole message, and
+    the page of a lost hunt read "UsageLimitExceeded ... tool_calls_limit of
+    0" (prod, 2026-10-31). The narrative is now the plain cause
+    (:func:`soc_ai.hunting.outcome.failure_cause`). The raw error stays in the
+    ``error`` event of the hunt, and the page shows it behind a toggle.
     """
-    raw = (message or "").strip()
-    plain = plain_error(raw)
-    if plain and plain != raw:
-        return plain
-    name = (exc_type or "").strip() or "Error"
-    if not raw:
-        return f"The hunt failed: {name}."
-    return f"The hunt failed: {name}. {raw}"
+    return failure_cause(message, exc_type)
 
 
 # Flush after every event so the running hunt's activity timeline populates LIVE
@@ -84,6 +79,9 @@ class HuntRecorder:
         # that finalizes 'error' with no report.
         self._error: dict[str, Any] | None = None
         self._finished = False
+        # The highest event sequence recorded, so an event that the recorder
+        # writes itself (:meth:`note_failure`) follows the stream in order.
+        self._last_sequence = 0
         self.hunt_id: str | None = None
         # The status finish() landed, or None before it ran.
         self.final_status: str | None = None
@@ -125,6 +123,7 @@ class HuntRecorder:
         # empty time. A copy, so the report the row lands is the agent's own.
         stamped = {**payload, "_at": datetime.now(UTC).isoformat()}
         self._buffer.append({"kind": kind, "sequence": sequence, "payload": stamped})
+        self._last_sequence = max(self._last_sequence, int(sequence))
         if kind == "hunt_report":
             self._report = payload
         if kind == "error":
@@ -138,8 +137,22 @@ class HuntRecorder:
         The stream raises before it can emit an ``error`` event when the
         failure is in the runner rather than in the agent. The caller's except
         block calls this so the narrative still says what happened.
+
+        The failure is buffered as an ``error`` event too, and the finalize
+        flushes it. The narrative holds the plain cause only, so the event is
+        the one record of the raw error.
         """
         self._error = {"message": str(exc), "type": type(exc).__name__}
+        if self.hunt_id is None or self._finished:
+            return
+        self._last_sequence += 1
+        self._buffer.append(
+            {
+                "kind": "error",
+                "sequence": self._last_sequence,
+                "payload": {**self._error, "_at": datetime.now(UTC).isoformat()},
+            }
+        )
 
     async def _flush(self) -> None:
         if not self._buffer or self.hunt_id is None:

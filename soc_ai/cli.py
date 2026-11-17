@@ -808,8 +808,12 @@ def _eval_nightly(args: argparse.Namespace) -> int:
     Default mode follows the install's posture: ``oracle_enabled`` is the
     operator's standing declaration that cloud-oracle egress is acceptable,
     so it gates the nightly grader too; ``--graded`` / ``--local`` override.
-    NO synth scenarios and NO meta-analysis — the nightly is a cheap smoke-
-    trend over real traffic, not a benchmark.
+    NO meta-analysis — the nightly is a cheap smoke-trend over real traffic,
+    not a benchmark. It does plant ``quality_nightly_synth_n`` synthetic true
+    positives (1 by default) beside the real alerts, because real traffic
+    carries no ground truth and a batch with no known positive measures no
+    recall. A planted run is scored against its own ground truth and is never
+    sent to the oracle.
 
     Scheduling: either the in-app scheduler (Config → Quality →
     ``eval_nightly_enabled``, runs daily at ``eval_nightly_hour_utc``) or
@@ -879,6 +883,11 @@ def _eval_nightly(args: argparse.Namespace) -> int:
             print(f"{_C['bold']}{_C['red']}QUALITY REGRESSION{_C['reset']}", file=sys.stderr)
             for r in result.alarm_reasons:
                 print(f"  {_C['yellow']}- {r}{_C['reset']}", file=sys.stderr)
+        if result.detail:
+            # What the run has to say beyond its numbers: what became of the
+            # planted true positive, and any grade the grader did not give. A
+            # lost grade is stated here and is never an alarm above.
+            print(f"{_C['dim']}{result.detail}{_C['reset']}", file=sys.stderr)
     if rc == 0:
         # The nightly only trends if something schedules it — hand the operator
         # the exact host-cron line (docs/DOCKER.md carries the same one).
@@ -1939,7 +1948,7 @@ def format_estate_fit(fit: Any, *, enabled: bool) -> str:
     setting = "on" if enabled else "off"
     head = f"The setting estate_model_enabled is {setting}."
     if fit is None:
-        return f"{head}\nNo estate model fit is on record."
+        return f"{head}\nNo network model fit is on record."
     psi = "none" if fit.psi is None else f"{fit.psi:.2f}"
     drifted = ", ".join(f"{d.get('feature')} {d.get('psi')}" for d in fit.drifted or [])
     reason = f" {fit.reason}" if fit.reason else ""
@@ -2052,7 +2061,7 @@ def _estate_model_run(args: argparse.Namespace) -> int:
         await apply_persisted_overrides(settings)
         if bool(getattr(settings, "soc_ai_demo", False)):
             print(
-                f"{_C['red']}estate-model run refused{_C['reset']}: this is a demo "
+                f"{_C['red']}network model fit refused{_C['reset']}: this is a demo "
                 "deployment. The daily loop fits nothing in a demo.",
                 file=sys.stderr,
             )
@@ -2082,12 +2091,12 @@ def _estate_model_run(args: argparse.Namespace) -> int:
             return 3
         if run.status == STATUS_FAILED:
             for line in run.errors:
-                print(f"{_C['red']}estate model{_C['reset']}: {line}", file=sys.stderr)
+                print(f"{_C['red']}network model{_C['reset']}: {line}", file=sys.stderr)
             return 5
         if run.groups or run.model_file:
             print(run.line())
         else:
-            print(f"estate model: {run.state}. {run.hosts} hosts.")
+            print(f"network model: {run.state}. {run.hosts} hosts.")
         if run.reason:
             print(run.reason)
         if run.model_file:
@@ -2095,7 +2104,7 @@ def _estate_model_run(args: argparse.Namespace) -> int:
         for line in [*run.refused, *run.notes]:
             print(line)
         for line in run.errors:
-            print(f"{_C['yellow']}estate model{_C['reset']}: {line}", file=sys.stderr)
+            print(f"{_C['yellow']}network model{_C['reset']}: {line}", file=sys.stderr)
         print(f"The store recorded fit {run.fit_id}. `soc-ai estate-model show` prints it.")
         return 0
 
@@ -2106,7 +2115,7 @@ def _register_estate_model(sub: Any) -> None:
     """Register ``estate-model show`` and ``estate-model run``."""
     p_em = sub.add_parser(
         "estate-model",
-        help="Show the newest estate model fit, or fit the estate model once now",
+        help="Show the newest network model fit, or fit the network model once now",
     )
     em_sub = p_em.add_subparsers(dest="estate_model_cmd")
     p_show = em_sub.add_parser(
@@ -2119,7 +2128,7 @@ def _register_estate_model(sub: Any) -> None:
     p_show.set_defaults(func=_estate_model_show)
     p_run = em_sub.add_parser(
         "run",
-        help="Fit the estate model once, now. It runs with estate_model_enabled off "
+        help="Fit the network model once, now. It runs with estate_model_enabled off "
         "and says so. It refuses in a demo. The daily loop takes the dossier slot "
         "in the server process. This command cannot take that slot, so run it "
         "when no dossier sweep runs",
@@ -2927,8 +2936,10 @@ def _register_eval_nightly(sub: Any) -> None:
     """Register the ``eval-nightly`` subparser (split out of :func:`main` for size)."""
     p_en = sub.add_parser(
         "eval-nightly",
-        help="Nightly quality micro-eval. It investigates a few real alerts, lands "
-        "one row in the local quality trend, and alarms on a regression. Schedule "
+        help="Nightly quality micro-eval. It investigates a few real alerts and one "
+        "synthetic true positive, lands one row in the local quality trend, and "
+        "alarms on a regression. It writes the synthetic documents to logs-synth-* "
+        "on the grid and removes them when the batch ends. Schedule "
         "it from host cron. See docs/DOCKER.md. The mode defaults to oracle-graded "
         "if oracle_enabled is on. Otherwise the mode is zero-egress local",
     )
@@ -2942,7 +2953,7 @@ def _register_eval_nightly(sub: Any) -> None:
     nightly_mode.add_argument(
         "--graded",
         action="store_true",
-        help="Force the Oracle grading. It makes one cloud call per alert, and "
+        help="Force the Oracle grading. It makes one cloud call per real alert, and "
         "agreement_rate joins the trend",
     )
     nightly_mode.add_argument(
@@ -3260,6 +3271,20 @@ def main() -> None:  # noqa: PLR0915 - linear subparser registration, one statem
     )
 
     _register_grid_gaps(sub)
+
+    # `soc-ai campaigns rebuild|list`: build the campaigns from the stored runs.
+    from soc_ai.cli_campaigns import (  # noqa: PLC0415
+        register_subparser as _register_campaigns,
+    )
+
+    _register_campaigns(sub)
+
+    # `soc-ai needs-you list|clear|restore`: the investigations of Needs you.
+    from soc_ai.cli_needs_you import (  # noqa: PLC0415
+        register_subparser as _register_needs_you,
+    )
+
+    _register_needs_you(sub)
 
     p_er = sub.add_parser(
         "eval-report",

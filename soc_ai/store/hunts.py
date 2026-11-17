@@ -8,9 +8,11 @@ narrative across hosts/time) but the lifecycle + tee/finalize shape is the same.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import re
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextvars import ContextVar
 from datetime import datetime, timedelta
 from typing import Any, NamedTuple
 
@@ -25,7 +27,7 @@ from soc_ai.hunting.findings import (
     is_run_failure_finding,
     threat_finding_count,
 )
-from soc_ai.hunting.outcome import FindingVerdicts, public_outcome
+from soc_ai.hunting.outcome import FindingVerdicts, degraded_reason, public_outcome
 from soc_ai.run_meter import RunCounters, apply_counters
 from soc_ai.secret_scrub import (
     MODEL_TEXT_EVENT_KINDS,
@@ -34,6 +36,7 @@ from soc_ai.secret_scrub import (
     scrub_value,
 )
 from soc_ai.store import chat_memory
+from soc_ai.store import investigations as inv_svc
 from soc_ai.store.auth import utcnow
 from soc_ai.store.models import Hunt, HuntEvent, HuntSpecState, Investigation, Lead
 
@@ -52,8 +55,14 @@ LINK_ENDED = "ended"
 LINK_OVER_CAP = "over_cap"
 LINK_FAILED = "failed"
 LINK_CANCELLED = "cancelled"
+# The finding restates a campaign that the hunt read, and it has no
+# investigation of its own (soc_ai.hunting.campaign_hold). The entry names the
+# campaign. It is settled: no investigation is due.
+LINK_CAMPAIGN = "campaign"
 # The states that count as an ended investigation. A failed one ended too.
-LINK_ENDED_STATES: frozenset[str] = frozenset({LINK_ENDED, LINK_FAILED, LINK_CANCELLED})
+LINK_ENDED_STATES: frozenset[str] = frozenset(
+    {LINK_ENDED, LINK_FAILED, LINK_CANCELLED, LINK_CAMPAIGN}
+)
 # Who put the investigation on the finding: the hunt opened it, the hunt
 # reused an investigation of the same subject, or an analyst opened it.
 ORIGIN_OPENED = "opened"
@@ -99,6 +108,25 @@ def _objective_hash(objective: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:32]
 
 
+# The campaign of the hunt that the caller starts. The console manager sets
+# it around the start of one hunt (soc_ai.webui.hunt_console_manager), and
+# :func:`create` writes it on the row. The hunt row names its campaign from
+# its first commit, so the limit of one campaign hunt in 24 hours reads it at
+# once. The value lives for the start only: the task that runs the hunt does
+# not see it.
+_START_CAMPAIGN: ContextVar[int | None] = ContextVar("hunt_start_campaign", default=None)
+
+
+@contextlib.contextmanager
+def campaign_of_start(campaign_id: int | None) -> Iterator[None]:
+    """The campaign that :func:`create` writes on the hunt that starts in this block."""
+    token = _START_CAMPAIGN.set(campaign_id)
+    try:
+        yield
+    finally:
+        _START_CAMPAIGN.reset(token)
+
+
 async def create(
     db: AsyncSession,
     *,
@@ -108,15 +136,22 @@ async def create(
     is_synth_eval: bool = False,
     starter: str = "analyst",
     lead_id: int | None = None,
+    campaign_id: int | None = None,
 ) -> Hunt:
     """Create the hunt row.
 
-    ``starter`` names the class that started it: analyst, schedule or lead.
-    ``lead_id`` links a lead-started hunt to its lead.
+    ``starter`` names the class that started it: analyst, schedule, lead or
+    campaign. ``lead_id`` links a lead-started hunt to its lead.
+    ``campaign_id`` names the campaign that the hunt is for.
 
     ``is_synth_eval`` marks a synthetic-evaluation run (the hunt could see
     planted synth scenarios) — set only from an explicit eval context by the
-    hunt recorder, never from a request body."""
+    hunt recorder, never from a request body. Such a hunt never takes a
+    campaign id: it describes nothing real."""
+    if campaign_id is None:
+        campaign_id = _START_CAMPAIGN.get()
+    if is_synth_eval:
+        campaign_id = None
     hunt = Hunt(
         id=str(ULID()),
         objective=objective,
@@ -126,6 +161,7 @@ async def create(
         is_synth_eval=is_synth_eval,
         starter=starter[:16],
         lead_id=lead_id,
+        campaign_id=campaign_id,
     )
     db.add(hunt)
     await db.commit()
@@ -189,7 +225,9 @@ async def earlier_runs(
       describes nothing real.
     - A partial or degraded run, by the ``partial`` and ``degraded`` keys of
       its ``done`` event. The owner's re-hunt rule says a partial run poisons
-      a later run (``routes_hunts``, the re-hunt route).
+      a later run (``routes_hunts``, the re-hunt route). A run whose report
+      carries the degraded mark is held back for the same reason: its model
+      returned no reasoning trace (:func:`soc_ai.hunting.outcome.degraded_reason`).
     - A run whose findings are all failed queries. It read nothing, so it
       concluded nothing (the rule of ``routes_hunts._did_not_run``).
     - An error, cancelled or interrupted run, by the status.
@@ -230,6 +268,8 @@ async def earlier_runs(
         if hunt.id in held_back:
             continue
         report = hunt.report if isinstance(hunt.report, dict) else {}
+        if degraded_reason(report) is not None:
+            continue
         raw = report.get("findings")
         findings = [f for f in raw if isinstance(f, dict)] if isinstance(raw, list) else []
         if findings and all(is_run_failure_finding(f) for f in findings):
@@ -240,6 +280,82 @@ async def earlier_runs(
     floor = before - timedelta(days=window_days)
     older = [h for h in eligible[1:] if h.created_at is not None and h.created_at >= floor]
     return [eligible[0], *older[: limit - 1]]
+
+
+async def other_hunts_in_window(
+    db: AsyncSession,
+    *,
+    objective: str,
+    since: datetime,
+    before: datetime,
+    limit: int = 20,
+) -> list[Hunt]:
+    """The agent hunts of a window that are not runs of ``objective``, newest first.
+
+    A scheduled hunt reads what the other hunts of its window found
+    (:mod:`soc_ai.hunting.earlier`): the lead hunts, the campaign hunts and
+    the analyst hunts. The runs of its own objective reach it through
+    :func:`earlier_runs`. A hunt
+    counts when it started in the window and it holds a report: ``complete``
+    or ``investigating``. A catalog run and a run of the synthetic evaluation
+    do not count. The first is one query with no model, and its matches reach
+    the hunt as observations and leads. The second describes nothing real.
+    """
+    rows = await db.scalars(
+        select(Hunt)
+        .where(
+            Hunt.created_at >= since,
+            Hunt.created_at < before,
+            Hunt.status.in_((STATUS_COMPLETE, STATUS_INVESTIGATING)),
+            Hunt.is_synth_eval.is_(False),
+            Hunt.kind != "triggered",
+            func.coalesce(Hunt.objective_hash, "") != _objective_hash(objective),
+        )
+        .order_by(Hunt.created_at.desc(), Hunt.id.desc())
+        .limit(max(1, limit))
+    )
+    return list(rows.all())
+
+
+# How many of the newest agent hunts the reasoning check reads.
+REASONING_LOOKBACK_HUNTS = 10
+
+
+async def recent_reasoning_seen(db: AsyncSession, *, limit: int = REASONING_LOOKBACK_HUNTS) -> bool:
+    """Whether one of the newest ``limit`` agent hunts carried a reasoning trace.
+
+    The runner asks before it marks a hunt with no reasoning trace as
+    degraded (:func:`soc_ai.api.hunt_runner._reasoning_expected`). A
+    deployment on a model that does not reason holds no trace on any hunt, so
+    the answer is no and no hunt takes the mark. A catalog run and a run of
+    the synthetic evaluation are not read: the first calls no model, and the
+    second is no record of this deployment's hunts.
+
+    The hunt that asks is among the newest hunts. It holds no trace, so it
+    cannot answer for itself.
+    """
+    recent = list(
+        (
+            await db.scalars(
+                select(Hunt.id)
+                .where(Hunt.kind != "triggered", Hunt.is_synth_eval.is_(False))
+                .order_by(Hunt.created_at.desc(), Hunt.id.desc())
+                .limit(max(1, limit))
+            )
+        ).all()
+    )
+    if not recent:
+        return False
+    found = await db.scalar(
+        select(HuntEvent.id)
+        .where(
+            HuntEvent.hunt_id.in_(recent),
+            HuntEvent.kind == "model_response",
+            func.coalesce(HuntEvent.payload["reasoning_trace"].as_string(), "") != "",
+        )
+        .limit(1)
+    )
+    return found is not None
 
 
 async def append_events(db: AsyncSession, hunt_id: str, events: list[dict[str, Any]]) -> None:
@@ -305,13 +421,29 @@ async def finalize(
 
 
 class FindingLink(NamedTuple):
-    """One subject finding's entry on the hunt row."""
+    """One subject finding's entry on the hunt row.
+
+    ``restates`` names the earlier finding this one repeats, when the hunt
+    linked it to that finding's investigation and started no new one:
+    ``{"hunt_id", "ordinal", "title"}``
+    (:func:`soc_ai.hunting.finding_match.restates`).
+
+    ``campaign_id`` names the campaign that holds the finding, with the state
+    :data:`LINK_CAMPAIGN`.
+    """
 
     ordinal: int
     state: str
     investigation_id: str | None = None
     origin: str | None = None
     reason: str | None = None
+    restates: dict[str, Any] | None = None
+    campaign_id: int | None = None
+
+    @property
+    def held(self) -> bool:
+        """A campaign holds the finding, and no investigation of its own replaced the entry."""
+        return self.state == LINK_CAMPAIGN and self.campaign_id is not None
 
 
 def _ended_count(plan: dict[str, Any]) -> int:
@@ -364,8 +496,37 @@ def finding_links_from(raw: Any) -> dict[int, FindingLink]:
             investigation_id=str(inv_id) if inv_id else None,
             origin=str(entry["origin"]) if entry.get("origin") else None,
             reason=str(entry["reason"]) if entry.get("reason") else None,
+            restates=_restates_of(entry.get("restates")),
+            campaign_id=_campaign_of(entry.get("campaign_id")),
         )
     return out
+
+
+def _campaign_of(raw: Any) -> int | None:
+    """The stored campaign id of one entry, or None for any other shape."""
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+        return None
+    return raw
+
+
+def restated_group(link: FindingLink) -> tuple[str, int]:
+    """The earlier finding a restating link names, as ``(hunt id, ordinal)``."""
+    restates = link.restates or {}
+    return str(restates.get("hunt_id") or ""), int(restates.get("ordinal") or 0)
+
+
+def _restates_of(raw: Any) -> dict[str, Any] | None:
+    """The stored ``restates`` value of one entry, or None for any other shape."""
+    if not isinstance(raw, dict) or not raw.get("hunt_id"):
+        return None
+    ordinal = raw.get("ordinal")
+    if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 0:
+        return None
+    return {
+        "hunt_id": str(raw["hunt_id"]),
+        "ordinal": ordinal,
+        "title": str(raw.get("title") or ""),
+    }
 
 
 def plan_entry(
@@ -374,6 +535,8 @@ def plan_entry(
     investigation_id: str | None = None,
     origin: str | None = None,
     reason: str | None = None,
+    restates: dict[str, Any] | None = None,
+    campaign_id: int | None = None,
 ) -> dict[str, Any]:
     """One entry of ``finding_investigations``, as the column stores it."""
     entry: dict[str, Any] = {"state": state}
@@ -383,6 +546,10 @@ def plan_entry(
         entry["origin"] = origin
     if reason:
         entry["reason"] = reason
+    if restates:
+        entry["restates"] = restates
+    if campaign_id is not None:
+        entry["campaign_id"] = int(campaign_id)
     return entry
 
 
@@ -395,6 +562,8 @@ async def set_finding_link(
     investigation_id: str | None = None,
     origin: str | None = None,
     reason: str | None = None,
+    restates: dict[str, Any] | None = None,
+    campaign_id: int | None = None,
 ) -> Hunt | None:
     """Write one finding's entry and recount the ended investigations.
 
@@ -406,7 +575,12 @@ async def set_finding_link(
         return None
     plan = dict(hunt.finding_investigations or {})
     plan[str(ordinal)] = plan_entry(
-        state, investigation_id=investigation_id, origin=origin, reason=reason
+        state,
+        investigation_id=investigation_id,
+        origin=origin,
+        reason=reason,
+        restates=restates,
+        campaign_id=campaign_id,
     )
     hunt.finding_investigations = plan
     hunt.findings_investigated = _ended_count(plan)
@@ -519,8 +693,10 @@ async def finding_verdicts(db: AsyncSession, hunt_ids: Sequence[str]) -> dict[st
         )
     ).all()
     links_by_hunt: dict[str, tuple[int, dict[int, FindingLink], int]] = {}
+    threat_counts: dict[str, int] = {}
     for hunt_id, stored_total, raw, report in rows:
         findings = report.get("findings") if isinstance(report, dict) else None
+        threat_counts[str(hunt_id)] = threat_finding_count(findings)
         links = finding_links_from(raw)
         kept = subject_links(links, findings)
         total = int(stored_total or 0)
@@ -548,13 +724,39 @@ async def finding_verdicts(db: AsyncSession, hunt_ids: Sequence[str]) -> dict[st
         )
         for inv_id, status, verdict, fallback in found.all():
             runs[str(inv_id)] = (str(status or ""), verdict, bool(fallback))
+    # A finding that restates an earlier finding reads the latest run of that
+    # finding, live. Only a true positive answers for it. Any other state
+    # leaves the finding with no verdict, so it counts in no outcome.
+    live = await inv_svc.latest_finding_runs(
+        db,
+        [
+            restated_group(link)
+            for _total, links, _every in links_by_hunt.values()
+            for link in links.values()
+            if link.restates
+        ],
+    )
     out: dict[str, FindingVerdicts] = {}
-    for hunt_id, (total, links, every) in links_by_hunt.items():
-        if total <= 0:
+    for hunt_id, (stored, links, every) in links_by_hunt.items():
+        # A finding that a campaign holds is no new threat finding of the
+        # hunt: the campaign holds its activity, and no verdict is due. It
+        # counts apart, so it reads neither as investigated nor as not judged.
+        held = sum(1 for link in links.values() if link.held)
+        total = stored - held
+        if total <= 0 and not held:
             continue
-        decided = threats = done = 0
+        decided = threats = false_positives = done = 0
         for link in links.values():
+            if link.held:
+                continue
             run = runs.get(link.investigation_id or "")
+            if link.restates:
+                latest = live.get(restated_group(link))
+                run = (
+                    (latest.status, latest.verdict, latest.is_fallback)
+                    if latest is not None and latest.answers
+                    else None
+                )
             done += _link_ended(link, run[0] if run is not None else None)
             if run is None:
                 continue
@@ -562,8 +764,16 @@ async def finding_verdicts(db: AsyncSession, hunt_ids: Sequence[str]) -> dict[st
             if status == "complete" and not fallback and verdict:
                 decided += 1
                 threats += verdict == "true_positive"
+                false_positives += verdict == "false_positive"
         out[hunt_id] = FindingVerdicts(
-            total=total, investigated=done, decided=decided, threats=threats, findings=every
+            total=max(0, total),
+            investigated=done,
+            decided=decided,
+            threats=threats,
+            findings=every,
+            false_positives=false_positives,
+            threat_findings=max(0, threat_counts.get(hunt_id, 0) - held),
+            held=held,
         )
     return out
 

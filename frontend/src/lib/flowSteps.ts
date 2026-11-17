@@ -16,9 +16,16 @@
 // Every rule reads stored fields. A step the data cannot prove is never done.
 // ---------------------------------------------------------------------------
 
+import { LEAD_COVERED } from './campaignWords';
 import { ACTION_VERB } from '../components/ActionCard';
 import type { LeadDetail } from './api';
-import { VERDICT_LABELS, type VerdictKey } from './labels';
+import {
+  VERDICT_LABELS,
+  notJudgedCount,
+  threatCountSentence,
+  type ThreatCounts,
+  type VerdictKey,
+} from './labels';
 import type { HuntDetailData, HuntFinding, Investigation } from './types';
 
 export type FlowStepState = 'done' | 'current' | 'next' | 'not_yet';
@@ -38,6 +45,9 @@ export interface FlowStep {
   note?: string;
   /** The hover sentence. */
   title?: string;
+  /** "warn" paints the step amber: an investigation of it ended with no
+   *  verdict, or a threat finding is not judged. */
+  tone?: 'warn';
 }
 
 // ── The fields of the hunt investigation phase ─────────────────────────────
@@ -52,6 +62,9 @@ export interface FlowStep {
 export interface HuntInvestigationFields {
   findingsInvestigated?: number | null;
   findingsTotal?: number | null;
+  findingsConfirmed?: number | null;
+  findingsFalsePositive?: number | null;
+  threatFindingCount?: number | null;
 }
 
 /** The fields the investigation phase adds to a finding. */
@@ -140,6 +153,8 @@ export interface InvestigationFlowOptions {
   actedHere?: boolean;
   /** The run writes nothing: a backtest replay. */
   noWrites?: boolean;
+  /** The run is inside an authorized activity scope. It requests no case. */
+  authorized?: boolean;
 }
 
 /** The flow of one investigation, for the alert drawer and the page. */
@@ -208,7 +223,7 @@ export function investigationFlow(
     verdict = { key: 'verdict', label: 'Verdict', state: 'next', title: 'soc-ai reaches the verdict.' };
   } else if (failed) {
     verdict = inv.supersededBy
-      ? { key: 'verdict', label: 'Verdict', state: 'next', title: 'A newer run replaced this one.' }
+      ? { key: 'verdict', label: 'Verdict', state: 'next', title: 'A newer investigation replaced this one.' }
       : inv.status === 'error' && inv.failure?.permanent
         ? // The failure panel says no re-run can help, so the strip names no
           // Re-run either (R2-D4).
@@ -216,7 +231,7 @@ export function investigationFlow(
             key: 'verdict',
             label: 'Verdict',
             state: 'next',
-            title: 'A re-run cannot change the recorded cause.',
+            title: 'A new investigation cannot change the recorded cause.',
           }
         : { key: 'verdict', label: 'Verdict', state: 'next', control: again };
   } else if (!SETTLED.has(inv.verdict)) {
@@ -229,7 +244,7 @@ export function investigationFlow(
           label: 'Verdict',
           state: 'next',
           note: verdictNote(inv.verdict),
-          title: 'A newer run replaced this one. Its actions are off.',
+          title: 'A newer investigation replaced this one. Its actions are off.',
         }
       : {
           key: 'verdict',
@@ -252,13 +267,19 @@ export function investigationFlow(
     // settle an escalate: after an override to true positive the strip read
     // the old auto-ack as the action (R2-D22).
     const waiting = pending.filter((a) => a.tag !== 'ack');
-    if (!opts.actedHere && !inv.supersededBy && waiting.length > 0) {
+    if (opts.authorized && !applied) {
+      // The run matches an authorized activity. No action waits, and the
+      // strip names no write as the next step.
+      action.state = 'done';
+      action.note = 'none requested';
+      action.title = 'This investigation matches an authorized activity. It requests no case.';
+    } else if (!opts.actedHere && !inv.supersededBy && waiting.length > 0) {
       action.state = 'next';
       action.control = controlWords(waiting.map((a) => a.tag));
     } else if (applied) {
       action.state = 'done';
     } else if (inv.supersededBy) {
-      action.title = 'A newer run replaced this one. Its actions are off.';
+      action.title = 'A newer investigation replaced this one. Its actions are off.';
     } else if (pending.length > 0) {
       action.state = 'next';
       action.control = controlWords(pending.map((a) => a.tag));
@@ -390,13 +411,55 @@ function huntTail(hunt: FlowHunt | null, retry: string): FlowStep[] {
     }
     return [investigations, verdicts, actions];
   }
+  // The one threat count sentence. The server counts the verdicts the
+  // outcome label reads. An older server sends no count, and the cards answer.
+  const sentence: ThreatCounts = {
+    confirmed: hunt.findingsConfirmed ?? done.filter((i) => i.verdict === 'true_positive').length,
+    falsePositives:
+      hunt.findingsFalsePositive ?? done.filter((i) => i.verdict === 'false_positive').length,
+    threatFindings: Math.max(hunt.threatFindingCount ?? subject.length, total),
+  };
+  verdicts.note = threatCountSentence(sentence);
+  // Every investigation ended, and the step is done only when each ended
+  // with a verdict. The strip read "Investigations 4 of 4" with a check
+  // beside a card that read "Investigation failed, re-run." (review
+  // 2026-11-12).
+  const withVerdict = Math.min(total, done.filter((i) => !!i.verdict).length);
+  if (withVerdict < total) {
+    const missing = total - withVerdict;
+    investigations.state = 'next';
+    investigations.tone = 'warn';
+    investigations.note = `${findingsNote(withVerdict, total)} with a verdict`;
+    const open = subject.filter((f) => {
+      const inv = findingInvestigation(f);
+      return !(inv?.status === 'complete' && inv.verdict);
+    });
+    if (open.some((f) => (f.citations ?? []).length > 0)) {
+      investigations.control = 'Open an investigation';
+      investigations.title =
+        missing === 1
+          ? '1 investigation ended with no verdict. Open an investigation on its finding.'
+          : `${missing} investigations ended with no verdict. Open an investigation on each finding.`;
+    } else {
+      investigations.title = NO_EVENT_TO_INVESTIGATE;
+    }
+    verdicts.tone = 'warn';
+    return [investigations, verdicts, actions];
+  }
   investigations.state = 'done';
   const runs = distinctRuns(done);
   investigations.title = sharedRunsTitle(done.length, runs.length);
   if (runs.length === 1) investigations.to = `/investigation/${encodeURIComponent(runs[0].id)}`;
+  if (notJudgedCount(sentence) > 0) {
+    // A run reached needs more info or inconclusive, or a threat finding has
+    // no run. The analyst judges it on its investigation page.
+    verdicts.state = 'next';
+    verdicts.tone = 'warn';
+    verdicts.control = 'View investigation';
+    verdicts.title = 'A threat finding is not judged. Open its investigation and set the verdict.';
+    return [investigations, verdicts, actions];
+  }
   verdicts.state = 'done';
-  const threats = done.filter((i) => i.verdict === 'true_positive').length;
-  verdicts.note = threats > 0 ? `${threats} of ${total} threats` : 'no threat confirmed';
   const known = runs.filter((i) => i.pendingActions !== null);
   const waiting = known.reduce((n, i) => n + (i.pendingActions ?? 0), 0);
   if (waiting > 0) {
@@ -421,7 +484,7 @@ function huntTail(hunt: FlowHunt | null, retry: string): FlowStep[] {
 export function leadFlow(
   lead: Pick<
     LeadDetail,
-    'status' | 'hunt_id' | 'hunt_status' | 'hunt_queued' | 'investigation_id' | 'dismissed_reason'
+    'status' | 'hunt_id' | 'hunt_status' | 'hunt_queued' | 'investigation_id' | 'dismissed_reason' | 'campaign'
   >,
   hunt: FlowHunt | null,
 ): FlowStep[] {
@@ -446,7 +509,12 @@ export function leadFlow(
   const huntStep: FlowStep = { key: 'hunt', label: 'Hunt', state: 'not_yet', to: huntTo };
   if (!lead.hunt_id) {
     huntStep.to = undefined;
-    if (lead.hunt_queued) {
+    if (lead.campaign && !dismissed && !closedByHunt && !promoted) {
+      // A lead of a campaign has no hunt of its own as its next step. The
+      // hunts of the campaign cover it, and the analyst decides on the campaign.
+      huntStep.note = 'by the campaign';
+      huntStep.title = LEAD_COVERED;
+    } else if (lead.hunt_queued) {
       huntStep.state = 'next';
       huntStep.note = 'queued';
       huntStep.title = "The lead's hunt starts within a minute.";
@@ -524,7 +592,20 @@ export function leadFlow(
 // ── The hunt ────────────────────────────────────────────────────────────────
 
 /** The first step of a hunt: what started it. */
-function huntOrigin(hunt: Pick<FlowHunt, 'kind' | 'starter'>, leadId: number | null): FlowStep[] {
+function huntOrigin(hunt: Pick<FlowHunt, 'kind' | 'starter' | 'campaign'>, leadId: number | null): FlowStep[] {
+  // A change of a campaign started the hunt. The starter names it, whatever
+  // kind the store gives the hunt.
+  if (hunt.starter === 'campaign') {
+    return [
+      {
+        key: 'campaign',
+        label: 'Campaign',
+        state: 'done',
+        to: hunt.campaign ? `/campaigns/${hunt.campaign.id}` : undefined,
+        title: 'A change of the campaign started this hunt.',
+      },
+    ];
+  }
   if (leadId != null || hunt.kind === 'lead' || hunt.starter === 'lead') {
     return [
       { key: 'hit', label: 'Hit', state: 'done', title: 'The hits and observations that formed the lead.' },

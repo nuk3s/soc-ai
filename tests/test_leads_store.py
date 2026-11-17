@@ -631,6 +631,45 @@ async def test_a_successor_lead_on_the_same_entity_is_not_related(
     assert counts == {mine.id: 1}
 
 
+async def test_a_fleet_condition_lead_and_a_shadow_lead_are_never_related(
+    settings_kratos: Settings,
+) -> None:
+    """C7. A lead hunt named 8 related leads, and all 8 were shadow fleet leads.
+
+    Prod hunt 01M6M7PY21P60193JHXRZYNPBF wrote "The related leads 54-62 on the
+    other addresses share this one infrastructure incident" and read none of
+    those hosts. A fleet condition is no intrusion, and a shadow lead comes
+    from an analytic nobody approved. Neither is a campaign question.
+    """
+    _engine, maker = await _db(settings_kratos)
+    async with maker() as db:
+        mine = await _seed_lead(db, host="10.1.1.5", spec_id=_FIRST_LOGON, born_at=_NOW)
+        fleet = await _seed_lead(
+            db, host="10.1.1.6", spec_id=_GROUP_CHANGED, born_at=_NOW, status="fleet_condition"
+        )
+        shadow = await _seed_lead(db, host="10.1.1.7", spec_id=_GROUP_CHANGED, born_at=_NOW)
+        shadow.shadow = True
+        await db.commit()
+        # NEGATIVE CONTROL. A live lead under a finished hunt shares the same
+        # technique, and it still relates. The filter reads the two marks. It
+        # does not drop the technique reason.
+        hunted = await _seed_lead(
+            db, host="10.1.1.8", spec_id=_GROUP_CHANGED, born_at=_NOW, status="hunting"
+        )
+        related = await leads_store.related_leads(db, mine, now=_NOW)
+        counts = await leads_store.related_counts(db, [mine, fleet, shadow], now=_NOW)
+        rows = await leads_store.timeline(db, mine.id)
+        objective = leads_store.objective_for(mine, rows, related)
+    assert [r.lead_id for r in related] == [hunted.id]
+    assert related[0].reason == "same technique T1078.002"
+    # The row count reads the same rule, so the chip and the page agree. A
+    # fleet condition lead and a shadow lead still count the live leads they
+    # share something with.
+    assert counts == {mine.id: 1, fleet.id: 2, shadow.id: 2}
+    assert f"lead {hunted.id} on 10.1.1.8" in objective
+    assert f"lead {fleet.id} " not in objective and f"lead {shadow.id} " not in objective
+
+
 async def test_related_counts_answers_the_whole_page_at_once(
     settings_kratos: Settings,
 ) -> None:
@@ -805,7 +844,15 @@ async def test_a_clean_hunt_with_a_visibility_gap_does_not_close_its_lead(
     An observation finding beside a gap reads "clean" on the Hunts page. The
     range re-hunt that closed a lead as hunt_clean had exactly this shape:
     "Alert documents unreadable due to grid timeout" beside two observations.
+
+    The hold reads the grid failure in the trace, not the gap finding alone
+    (review of 2026-11-12, C5). A later call of the same tool got an answer
+    here, and the lead still waits: the gap can be the read the grid lost.
+    A gap with no grid failure is a standing fact, and tests/test_lead_truth.py
+    pins that it holds nothing.
     """
+    from soc_ai.store import hunts as hunt_svc
+
     _engine, maker = await _db(settings_kratos)
     unread = {
         "title": "Alert documents unreadable due to grid timeout",
@@ -816,6 +863,25 @@ async def test_a_clean_hunt_with_a_visibility_gap_does_not_close_its_lead(
         lead = await _lead_row(db, hunt_id="01GAPCLEAN")
         hunt = await _hunt_row(
             db, hunt_id="01GAPCLEAN", lead_id=lead.id, findings=[_OBSERVATION, unread]
+        )
+        await hunt_svc.append_events(
+            db,
+            "01GAPCLEAN",
+            [
+                {
+                    "kind": "tool_result",
+                    "sequence": 3,
+                    "payload": {
+                        "tool_name": "t_get_event_raw",
+                        "result": {"error": True, "reason": "grid_unavailable"},
+                    },
+                },
+                {
+                    "kind": "tool_result",
+                    "sequence": 5,
+                    "payload": {"tool_name": "t_get_event_raw", "result": {"_id": "d2"}},
+                },
+            ],
         )
         assert leads_store.hunt_outcome_of(hunt) == "clean"
         assert await leads_store.settle_after_hunt(db, hunt) == "waits"

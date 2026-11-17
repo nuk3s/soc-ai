@@ -46,7 +46,12 @@ from soc_ai.dossier.profile_math import (
 )
 from soc_ai.enrichment.discovery import _is_internal_ip, _is_ip_literal
 from soc_ai.so_client.elastic import DEFAULT_MAX_BUCKETS, ElasticClient
-from soc_ai.so_client.fields import DATASET_NAME_FIELDS, EPHEMERAL_PORT_FLOOR, is_peer_address
+from soc_ai.so_client.fields import (
+    DATASET_NAME_FIELDS,
+    EPHEMERAL_PORT_FLOOR,
+    is_peer_address,
+    probe_record_clause,
+)
 from soc_ai.tools._provenance import LIVE, provenance_must_not
 from soc_ai.tools._synth_scope import synth_scope_must_not
 
@@ -639,10 +644,23 @@ def served_direction_clauses(planes: Sequence[str]) -> dict[str, list[dict[str, 
 
 
 def _direction_for(dimension: str, *, planes: Sequence[str]) -> dict[str, list[dict[str, Any]]]:
-    """The direction clauses for this dimension. Empty for every dimension but a guarded one."""
+    """The served-port clauses for this dimension. Empty for every dimension but a guarded one.
+
+    The direction clauses, and after them the probe exclusion. A flow record is
+    written for a connection attempt, so a port scan put ports into the
+    baseline of each scanned host and into the recent read. A SYN that nothing
+    answered and a SYN that a closed port refused are left out
+    (:func:`soc_ai.so_client.fields.probe_record_clause`). The baseline builder
+    and the prior sweep both call this function, so the two sides still agree
+    on what a served port is.
+    """
     if dimension not in GUARDED_PORT_DIMENSIONS:
         return {"filter": [], "must_not": []}
-    return served_direction_clauses(planes)
+    direction = served_direction_clauses(planes)
+    return {
+        "filter": direction["filter"],
+        "must_not": [*direction["must_not"], probe_record_clause()],
+    }
 
 
 def _entity_support_days(bucket: dict[str, Any], *, window_days: int) -> int:

@@ -15,6 +15,8 @@ import {
   type RunState,
   appliesWord,
   failureLine,
+  liveCoverage,
+  liveCoverageWords,
   intervalWords,
   loopResultLine,
   methodWord,
@@ -454,7 +456,9 @@ function Row({
         {analytic.dismissed_7d} dismissed
         {analytic.status === 'shadow' && (
           <div>
-            {plural(analytic.shadow_hits_7d, 'shadow hit')} · {analytic.unread_shadow_hits} unread
+            {/* L5: the unread count reads every age. It sat under "Last 7
+                days" with no window of its own (review 2026-11-12). */}
+            {plural(analytic.shadow_hits_7d, 'shadow hit')} · {analytic.unread_shadow_hits} unread at any age
           </div>
         )}
       </td>
@@ -495,9 +499,13 @@ function Row({
  */
 export function AnalyticsPanel({
   shared,
+  sharedCatalog,
   onChanged,
 }: {
   shared?: UseAsyncResult<AnalyticsList>;
+  /** The catalog the screen read for its tab label. The rows and the label
+   *  then read one answer. */
+  sharedCatalog?: UseAsyncResult<HuntCatalog>;
   onChanged?: () => void;
 } = {}) {
   const [reload, setReload] = useState(0);
@@ -533,7 +541,12 @@ export function AnalyticsPanel({
     { refetchInterval: shared ? 0 : 300_000 },
   );
   const list: UseAsyncResult<AnalyticsList | null> = shared ?? own;
-  const catalog = useAsync(getHuntCatalog, [reload], { refetchInterval: 300_000 });
+  const ownCatalog = useAsync(
+    () => (sharedCatalog ? Promise.resolve(null) : getHuntCatalog()),
+    [reload],
+    { refetchInterval: sharedCatalog ? 0 : 300_000 },
+  );
+  const catalog: UseAsyncResult<HuntCatalog | null> = sharedCatalog ?? ownCatalog;
   const data = list.data;
   const coverageOf = new Map(
     (catalog.data?.specs ?? []).map((s) => [s.id, s.coverage] as const),
@@ -593,8 +606,8 @@ export function AnalyticsPanel({
                 ? `${rows.length} of ${all.length} analytics match`
                 : `${all.length} analytics`}
               {' · '}
-              {counts.live ?? 0} live · {counts.shadow ?? 0} shadow · {counts.candidate ?? 0}{' '}
-              draft · {counts.retired ?? 0} retired
+              {liveCoverageWords(liveCoverage(all, catalog.data), !!catalog.data)} ·{' '}
+              {counts.shadow ?? 0} shadow · {counts.candidate ?? 0} draft · {counts.retired ?? 0} retired
             </div>
             <div className="border-b border-border-faint px-[15px] py-2">
               <ListToolbar

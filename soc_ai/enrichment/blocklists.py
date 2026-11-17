@@ -41,6 +41,52 @@ class BlocklistHit:
     raw_url: str | None = None  # for URLhaus, the original full URL
 
 
+# The three indicator types a lookup can ask about.
+IndicatorKind = str  # "ip" | "domain" | "md5" | "sha1" | "sha256"
+
+
+@dataclass(frozen=True)
+class FeedProfile:
+    """What one feed can answer.
+
+    ``kinds`` holds the indicator types that the LOADER of the feed indexes. The
+    Tor exit list holds addresses only, so it cannot answer for a domain or a
+    file hash. A hash is one type for each algorithm: URLhaus indexes no hash,
+    the seed list indexes its hashes as SHA-256, and ThreatFox indexes MD5,
+    SHA-1 and SHA-256. A feed that indexes no MD5 cannot clear an MD5.
+
+    ``malware`` is true for a feed of malware infrastructure. A miss on such a
+    feed is the only miss that supports "not known malware infrastructure".
+    The Tor exit list is an anonymity list: a miss says "not a Tor exit" and
+    nothing more. The operator seed list holds only what the operator wrote.
+    """
+
+    label: str
+    kinds: frozenset[IndicatorKind]
+    malware: bool
+
+
+FEED_PROFILES: dict[str, FeedProfile] = {
+    "urlhaus": FeedProfile("abuse.ch URLhaus", frozenset({"ip", "domain"}), malware=True),
+    "threatfox": FeedProfile(
+        "abuse.ch ThreatFox", frozenset({"ip", "domain", "md5", "sha1", "sha256"}), malware=True
+    ),
+    "feodo": FeedProfile("abuse.ch Feodo Tracker", frozenset({"ip"}), malware=True),
+    "tor": FeedProfile("Tor Project exit list", frozenset({"ip"}), malware=False),
+    "internal_seed": FeedProfile(
+        "internal_seed", frozenset({"ip", "domain", "sha256"}), malware=False
+    ),
+    "spamhaus_drop": FeedProfile("Spamhaus DROP", frozenset({"ip"}), malware=True),
+}
+
+_FEED_OF_LABEL: dict[str, str] = {profile.label: feed for feed, profile in FEED_PROFILES.items()}
+
+
+def feed_of_hit(hit: BlocklistHit) -> str:
+    """The feed key of a hit: ``urlhaus`` for a hit that reads "abuse.ch URLhaus"."""
+    return _FEED_OF_LABEL.get(hit.source, hit.source)
+
+
 @dataclass
 class BlocklistDB:
     """In-memory IOC reputation lookup, populated from on-disk files at start.
@@ -130,6 +176,14 @@ class BlocklistDB:
             + sum(len(hits) for hits in self.hashes.values())
             + len(self.spamhaus_networks)
         )
+
+    def feeds_for(self, kind: IndicatorKind) -> list[str]:
+        """The loaded feeds that list indicators of ``kind``, in load order."""
+        return [
+            feed
+            for feed in self.loaded_sources
+            if (profile := FEED_PROFILES.get(feed)) is not None and kind in profile.kinds
+        ]
 
     def lookup_ip(self, ip: str) -> list[BlocklistHit]:
         key = _norm_ip(ip) or ip
@@ -254,6 +308,14 @@ def _strip_port(ioc_value: str) -> str:
     return raw if _is_ip_literal(raw) else ""
 
 
+# The hash rows of a ThreatFox export, by ioc_type.
+_THREATFOX_HASH_KINDS: dict[str, str] = {
+    "md5_hash": "md5",
+    "sha1_hash": "sha1",
+    "sha256_hash": "sha256",
+}
+
+
 def _load_threatfox(db: BlocklistDB, data_dir: Path) -> None:
     """Parse abuse.ch ThreatFox JSON; populate db.ips/domains/hashes."""
     path = data_dir / "threatfox.json"
@@ -304,11 +366,14 @@ def _load_threatfox(db: BlocklistDB, data_dir: Path) -> None:
                     first_seen=first_seen,
                 )
                 db.domains.setdefault(ioc_value.lower(), []).append(hit)
-            elif ioc_type.endswith("sha256_hash"):
+            elif (hash_kind := _THREATFOX_HASH_KINDS.get(ioc_type)) is not None:
+                # The grid stores MD5 and SHA-1 for a Zeek file and no SHA-256,
+                # so a loader that kept SHA-256 rows only could not answer for
+                # a hash that the grid holds.
                 h = ioc_value.lower()
                 hit = BlocklistHit(
                     indicator=h,
-                    indicator_type="sha256",
+                    indicator_type=hash_kind,
                     source="abuse.ch ThreatFox",
                     tags=tags,
                     first_seen=first_seen,

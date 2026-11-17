@@ -135,6 +135,16 @@ class EsSearchResult(BaseModel):
     the caller did not ask for it.
     """
 
+    field_note: str | None = None
+    """Why a zero-hit result is not evidence of absence, or ``None``.
+
+    Set when the query filters or groups on a field that no document in the
+    same dataset and window holds. Ten scheduled hunts filtered on a field
+    name that the grid does not store, and six reports stated the zero as "no
+    successful SSH login". ``None`` on a result with hits, and on a zero-hit
+    result whose fields are all present: that zero is a zero on the value.
+    """
+
     @computed_field  # type: ignore[prop-decorator]
     @property
     def total_display(self) -> str:

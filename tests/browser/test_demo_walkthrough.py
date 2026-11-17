@@ -36,7 +36,7 @@ _WAIT_MS = 15000
 # substring of the current sentence, so the test proves the real banner rendered
 # without pinning its punctuation. Keep it in step with the copy: this assertion
 # runs only in the browser-smoke CI job, not in the local pytest gate.
-_BANNER = "Some runs are recordings from a test grid"
+_BANNER = "Some investigations are recordings from a test grid"
 
 # A recorded replay alert (committed fixtures.json). Its recorded verdict is read
 # from the fixture rather than hardcoded, so a data refresh can't silently pass.
@@ -225,7 +225,9 @@ def test_investigation_detail_verdict_and_recorded_chip(page: Page, demo_mode_st
         timeout=_WAIT_MS
     )
     # Demo-only chip: this is a replayed recording, labelled as such.
-    expect(page.get_by_text("recorded run", exact=False).first).to_be_visible(timeout=_WAIT_MS)
+    expect(page.get_by_text("recorded investigation", exact=False).first).to_be_visible(
+        timeout=_WAIT_MS
+    )
     # Timeline of the recorded run renders.
     expect(page.get_by_text("Investigation timeline", exact=False).first).to_be_visible(
         timeout=_WAIT_MS

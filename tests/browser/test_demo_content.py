@@ -71,12 +71,27 @@ def test_dashboard_tiles_and_panels_hold_data(page: Page, demo_mode_stack: dict)
         "needs_more_info",
         "pending_actions",
     )
-    assert all(needs[p] > 0 for p in parts), needs
-    assert needs["total"] == sum(needs[p] for p in parts)
+    # The one needs-more-info run of the demo has a later run with a verdict,
+    # so it waits on nobody and the count is 0. Every other part holds data.
+    assert all(needs[p] > 0 for p in parts if p != "needs_more_info"), needs
+    assert needs["needs_more_info"] == 0, needs
+    # The tile counts each decision once: a campaign, an investigation that
+    # waits, a lead and an alert group. The waiting actions are detail: one
+    # investigation can hold two. The unread shadow hits are a review count.
+    decisions = (
+        "campaigns",
+        "investigations_waiting",
+        "leads_needing_decision",
+        "untriaged_groups",
+    )
+    assert all(needs[p] > 0 for p in decisions), needs
+    assert needs["decisions"] == sum(needs[p] for p in decisions)
+    assert needs["review"] == needs["unread_shadow_hits"]
+    assert needs["total"] == needs["decisions"] + needs["review"]
     _open(page, base, "/dashboard")
     _see(page, "Needs you")
     _see(page, f"{needs['leads_needing_decision']} leads wait on a decision")
-    _see(page, f"{needs['unread_shadow_hits']} shadow hits are unread")
+    _see(page, f"{needs['unread_shadow_hits']} shadow hits to review")
     _see(page, re.compile(r"Review \d+ hits in this gap"))
     _in_dom(page, "Investigation outcomes")
     _in_dom(page, re.compile(r"Last batch at .* investigated"))
@@ -142,7 +157,7 @@ def test_investigation_page_shows_citations_follow_up_note_and_blocked_action(
         i for i in runs.values() if (i.get("report") or {}).get("follow_up") and i["verdict"]
     )
     _open(page, base, f"/investigation/{nmi['id']}")
-    _see(page, re.compile(r"A newer run on this alert reached true positive"))
+    _see(page, re.compile(r"A newer investigation on this alert reached true positive"))
     # The analyst's verdict note.
     noted = next(
         i for i in runs.values() if (i.get("rationale") or "").startswith("Verdict set by")
@@ -152,7 +167,7 @@ def test_investigation_page_shows_citations_follow_up_note_and_blocked_action(
     # A backtest replay: its action is blocked, and the page says why.
     replay = next(i for i in runs.values() if i.get("started_by") == "backtest")
     _open(page, base, f"/investigation/{replay['id']}")
-    _in_dom(page, "Not executable. This run is a backtest replay.")
+    _in_dom(page, "Not executable. This investigation is a backtest replay.")
 
 
 def test_investigation_page_shows_the_same_flow_block(page: Page, demo_mode_stack: dict) -> None:
@@ -186,7 +201,13 @@ def test_hunts_page_holds_leads_hits_hunts_and_schedules(page: Page, demo_mode_s
     assert len(_get(base, "/api/v1/hunt-schedules")) >= 2
     _open(page, base, "/hunts")
     _see(page, "Hunted · Threat found")
-    _in_dom(page, re.compile(r"Analytic hits last 7 days · [1-9]"))
+    # The label states the two windows apart. Their sum is the hits on the list.
+    window = hits["window"]
+    assert window["in_window"] + window["older_unread"] == hits["counts"]["all"] > 0
+    _in_dom(
+        page,
+        f"{window['in_window']} in the last 7 days · {window['older_unread']} older unread",
+    )
     _in_dom(page, "Scheduled hunts")
 
 

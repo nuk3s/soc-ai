@@ -11,6 +11,8 @@ import {
   type DeclarationChange,
 } from '../components/DeclarationUndo';
 import { HostFacts, HostUnknowns } from '../components/HostFacts';
+import { HostThreatStrip, threatsFor, useThreats } from '../components/ConfirmedThreats';
+import { HostCampaigns } from '../components/campaign/HostCampaigns';
 import { HostHero } from '../components/HostHero';
 import {
   HostInvestigations,
@@ -488,6 +490,18 @@ export function HostDetail() {
   // reads every address and name. An address page reads its address.
   const investigationKey = machine ? machine.key : situationKey;
   const investigations = useHostInvestigations(investigationKey);
+  // The confirmed threats of this host over 30 days: the same route and the
+  // same row the Dashboard panel lists for it. The strip under the header
+  // shows nothing when the host has no row.
+  const threatsKey = `host|${investigationKey}`;
+  const hostThreats = useThreats(
+    threatsKey,
+    () =>
+      investigationKey
+        ? { since: new Date(Date.now() - 30 * 86_400_000).toISOString(), host: investigationKey }
+        : null,
+    300_000,
+  );
   const investigationList =
     investigations.data && investigations.data.key === investigationKey ? investigations.data.list : null;
   const situation = [
@@ -1127,6 +1141,16 @@ export function HostDetail() {
               lastActivity={lastSeenOf(shown)}
               situation={situation}
             />
+            {/* The campaigns of the machine lead: the campaign is the unit
+                of work (owner, 2026-11-14). The threats of the host add the
+                decisions that wait to each campaign. */}
+            <HostCampaigns
+              campaigns={machine?.campaigns}
+              threats={threatsFor(hostThreats, threatsKey)?.campaigns}
+            />
+            {/* The threat on this host and its one next step, directly under
+                the header (review 2026-11-12, ui-hunt 7). */}
+            <HostThreatStrip read={hostThreats} readKey={threatsKey} />
             <GridGapStrip range={shownRange} className="mb-3" />
 
             {undo && (

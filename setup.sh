@@ -506,7 +506,7 @@ if [[ $RECFG == y ]]; then
     info "  The store is in PostgreSQL (SOC_AI_DATABASE_URL). It stays there."
     [[ $PG_URL == *@postgres:5432/* ]] && PG_COMPOSE=y
   else
-    yesno STORE_POSTGRES "  Keep the store in PostgreSQL? Yes suits a large estate, no keeps SQLite" "${STORE_POSTGRES:-n}"
+    yesno STORE_POSTGRES "  Keep the store in PostgreSQL? Yes suits a large network, no keeps SQLite" "${STORE_POSTGRES:-n}"
     if [[ $STORE_POSTGRES == y && $FRESH_ENV -eq 0 ]]; then
       warn "This host already has a .env, so its SQLite store can hold data. The store stays in SQLite."
       warn "  To move it, follow docs/DOCKER.md, PostgreSQL: soc-ai store migrate copies every table."

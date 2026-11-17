@@ -387,6 +387,78 @@ describe('hunt-kind recommended actions', () => {
     expect(approve).not.toBeDisabled();
   });
 
+  // Review 2026-11-13, D2. A true positive finding had one action, and it was
+  // off. The escalate of a finding opens a case from the finding, so the
+  // server sends no reason and the card offers the write for the finding.
+  it('offers the escalate of a finding, and names the finding', () => {
+    const escalate: RecommendedAction = {
+      id: 'act-2',
+      title: 'Escalate to case',
+      tag: 'escalate',
+      rationale: 'The confirmed responses show a working exploit chain.',
+    };
+    render(
+      <MemoryRouter>
+        <Investigation
+          inv={baseInv({
+            kind: 'hunt',
+            promotedKind: 'finding',
+            huntId: '01HUNT0000000000000000000000',
+            actions: [escalate, promotedAck],
+            writeBlockedReason: 'A promoted finding has no Security Onion alert to act on.',
+          })}
+          layout="page"
+        />
+      </MemoryRouter>,
+    );
+    const open = screen.getByRole('button', { name: /^Escalate to case$/i });
+    expect(open).not.toBeDisabled();
+    expect(screen.getByTestId('action-card-0').textContent).toContain(
+      'Open one Security Onion case for this finding.',
+    );
+    // Negative control: the acknowledge beside it stays off.
+    expect(screen.getByRole('button', { name: /^Acknowledge$/i })).toBeDisabled();
+  });
+
+  // The server says what a finding run is (promotedKind). The console read
+  // the kind of the run on its own, and the two could disagree.
+  it('obeys the server field, and not the kind of the run', () => {
+    const escalate: RecommendedAction = {
+      id: 'act-2',
+      title: 'Escalate to case',
+      tag: 'escalate',
+      rationale: 'The beacon matches a known C2 address.',
+    };
+    render(
+      <MemoryRouter>
+        <Investigation
+          inv={baseInv({ kind: 'hunt', promotedKind: null, actions: [escalate] })}
+          layout="page"
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByTestId('action-card-0').textContent).toContain(
+      'Open one Security Onion case for this alert.',
+    );
+  });
+
+  it('names the alert on the escalate of an alert run', () => {
+    const escalate: RecommendedAction = {
+      id: 'act-2',
+      title: 'Escalate to case',
+      tag: 'escalate',
+      rationale: 'The beacon matches a known C2 address.',
+    };
+    render(
+      <MemoryRouter>
+        <Investigation inv={baseInv({ kind: 'suricata', actions: [escalate] })} layout="page" />
+      </MemoryRouter>,
+    );
+    expect(screen.getByTestId('action-card-0').textContent).toContain(
+      'Open one Security Onion case for this alert.',
+    );
+  });
+
   it('does not fire onApprove when clicking a disabled action button', () => {
     render(
       <MemoryRouter>

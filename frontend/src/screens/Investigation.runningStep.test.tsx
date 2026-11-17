@@ -54,14 +54,14 @@ describe('a running run', () => {
     );
     expect(screen.getByTestId('running-now').textContent).toContain('Now the agent searches the events.');
     expect(screen.getByTestId('running-estimate').textContent).toContain(
-      'A run on this grid takes 2 to 5 minutes. The median of the last 20 runs is 3 minutes.',
+      'An investigation on this grid takes 2 to 5 minutes. The median of the last 20 investigations is 3 minutes.',
     );
   });
 
   it('control: with no store estimate it gives the plain range', () => {
-    expect(runEstimate(null)).toBe('A run takes 1 to 5 minutes.');
+    expect(runEstimate(null)).toBe('An investigation takes 1 to 5 minutes.');
     expect(runEstimate({ lowMin: 3, highMin: 3, medianMin: 3, samples: 4 })).toBe(
-      'A run on this grid takes about 3 minutes. The median of the last 4 runs is 3 minutes.',
+      'An investigation on this grid takes about 3 minutes. The median of the last 4 investigations is 3 minutes.',
     );
   });
 });

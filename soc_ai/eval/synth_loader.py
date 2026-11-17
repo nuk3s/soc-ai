@@ -160,6 +160,27 @@ class SpecJourney(BaseModel):
         return v
 
 
+class Requirement(BaseModel):
+    """One input a scenario needs from the DEPLOYMENT before it can be detected.
+
+    A scenario plants its own events. It cannot plant what the deployment
+    loads from outside the grid: a reputation feed is a file on the soc-ai host.
+    ``e1`` is an easy true positive because its destination is on the Feodo
+    list, and on a deployment that never loaded that list the same alert is a
+    signature and a fingerprint. A miss there says nothing about the model.
+
+    ``blocklist`` is a feed id as ``blocklist_sources`` names it (``feodo``,
+    ``urlhaus``, ``tor``). ``ip`` is the address the scenario relies on. A feed
+    that is loaded and no longer lists the address meets the first condition
+    and not the second, and it is the second the detection needs.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    blocklist: str = Field(min_length=1)
+    ip: str | None = None
+
+
 class Scenario(BaseModel):
     """A complete synthetic-TP scenario.
 
@@ -176,6 +197,13 @@ class Scenario(BaseModel):
     story: str
     attack: list[str]
     sigma_refs: list[str] = Field(default_factory=list)
+    requires: list[Requirement] = Field(default_factory=list)
+    """What the deployment must have loaded for this scenario to be detectable.
+
+    Empty for a scenario whose whole evidence is in its own events. The nightly
+    plants a scenario only when every entry is met at run time. The benchmark
+    (``validate-batch``) does not read this: it runs the scenarios it is given.
+    """
     ground_truth: GroundTruth
     events: list[EventTemplate]
     rubric_notes: str = ""

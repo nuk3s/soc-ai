@@ -39,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import ipaddress
+import shutil
 import socket
 import ssl
 import struct
@@ -59,6 +60,7 @@ from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from soc_ai.config import DEFAULT_ALERTS_QUERY, Settings
+from soc_ai.enrichment.blocklists import FEED_PROFILES
 from soc_ai.errors import OqlValidationError, SoAuthError
 from soc_ai.so_client.auth import make_auth
 from soc_ai.so_client.elastic import ElasticClient, GridPartialResultsError
@@ -1766,10 +1768,15 @@ def check_backups(settings: Settings, *, now: datetime | None = None) -> list[Ch
             )
         ]
     backups_dir = Path(settings.soc_ai_data_dir) / "backups"
+    # The command writes a dated archive into the directory this check reads.
+    # The Diagnostics pane offers it with a Copy button: the review of
+    # 2026-11-12 found the warning with no command on any page.
+    command = f"mkdir -p {backups_dir} && cd {backups_dir} && soc-ai backup"
     hint = (
-        "Schedule a nightly soc-ai backup. See docs/DOCKER.md, Backup schedule and "
-        "retention. soc-ai reads this directory only. A job that writes to another "
-        "directory does not show here."
+        f"Run `{command}` from a nightly host cron job. In Docker, run "
+        f"`docker compose exec -T soc-ai sh -c '{command}'`. See docs/DOCKER.md, "
+        "Backup schedule and retention. soc-ai reads this directory only. A job that "
+        "writes to another directory does not show here."
     )
     try:
         archives = [p for p in backups_dir.glob("soc-ai-backup-*.tar.gz") if p.is_file()]
@@ -1798,6 +1805,81 @@ def check_backups(settings: Settings, *, now: datetime | None = None) -> list[Ch
             f"the newest backup archive in {backups_dir} is {hours} h old.",
         )
     ]
+
+
+# ── Check: free space on the data volume (WARN) ──────────────────────────────
+
+# The two limits of the row. Either one is enough for a WARN.
+_DISK_MIN_FREE_FRACTION = 0.15
+_DISK_MIN_FREE_BYTES = 2 * 1024**3
+_GIB = 1024**3
+
+
+def _disk_usage(path: Path) -> tuple[int, int]:
+    """Total and free bytes of the volume that holds ``path``."""
+    usage = shutil.disk_usage(path)
+    return int(usage.total), int(usage.free)
+
+
+def _existing_dir(path: Path) -> Path:
+    """``path``, or its nearest parent that exists.
+
+    A data directory that no start has made yet is on the volume of its
+    parent, and the row still has a volume to measure.
+    """
+    current = path.resolve()
+    while not current.exists() and current != current.parent:
+        current = current.parent
+    return current
+
+
+def check_disk(settings: Settings) -> list[CheckResult]:
+    """Free space on the volume that holds the data directory.
+
+    A full volume stops every write to the store, and triage and hunts stop
+    with it. A production host ran with 1.9 G free on a volume where one
+    backup needs 770 MB and one deploy needs up to 1.4 G, and no doctor row
+    said so. WARN below 15% free or below 2 G free. The hint names the fix.
+    """
+    name = "disk space"
+    data_dir = Path(settings.soc_ai_data_dir)
+    hint = (
+        "Make the volume larger, or remove files from it. Old backup archives, unused "
+        "container images and the Docker build cache use the most space. "
+        "`docker image prune` and `docker builder prune` remove the last two. "
+        "A full volume stops every write to the store, and triage and hunts stop."
+    )
+    try:
+        total, free = _disk_usage(_existing_dir(data_dir))
+    except OSError as exc:
+        return [
+            CheckResult(
+                name,
+                "WARN",
+                f"soc-ai cannot read the free space of the volume of {data_dir}: "
+                f"{_safe_reason(exc)}.",
+                hint="Check that the data directory exists and that soc-ai can read it.",
+            )
+        ]
+    if total <= 0:
+        return [
+            CheckResult(name, "INFO", f"the volume of {data_dir} reports no size. No check ran.")
+        ]
+    percent = 100.0 * free / total
+    detail = (
+        f"{free / _GIB:.1f} G of {total / _GIB:.1f} G is free on the volume of "
+        f"{data_dir}. That is {percent:.0f}%."
+    )
+    if free < _DISK_MIN_FREE_BYTES or free / total < _DISK_MIN_FREE_FRACTION:
+        return [
+            CheckResult(
+                name,
+                "WARN",
+                f"{detail} The limits are 2 G and {_DISK_MIN_FREE_FRACTION * 100:.0f}%.",
+                hint=hint,
+            )
+        ]
+    return [CheckResult(name, "PASS", detail)]
 
 
 # ── Check 6: egress posture (INFO only) ──────────────────────────────────────
@@ -2186,7 +2268,14 @@ def check_blocklists(settings: Settings) -> list[CheckResult]:
     name = "blocklists"
     configured = [s for s in settings.blocklist_sources if s in _BLOCKLIST_FEED_FILES]
     if not configured:
-        return [CheckResult(name, "INFO", "no refreshable blocklist feed is configured.")]
+        return [
+            CheckResult(
+                name,
+                "INFO",
+                "no refreshable blocklist feed is configured. No malware feed is on disk, "
+                "so each reputation result reads not_checked.",
+            )
+        ]
     threshold_days = settings.blocklist_stale_threshold_days
     now = datetime.now(UTC)
     missing: list[str] = []
@@ -2204,7 +2293,15 @@ def check_blocklists(settings: Settings) -> list[CheckResult]:
             stale.append(f"{source} at {age_days:.0f} days old")
         else:
             fresh += 1
-    if not missing and not stale:
+    # A miss is evidence only for a fresh malware feed. A host with the Tor
+    # exit list alone has none, and each reputation result then reads
+    # not_checked (production review 2026-11-12). The row says so for each
+    # way to get there: a feed that is missing, a feed that is stale, and a
+    # store whose configured feeds are all fresh and hold no malware feed.
+    stale_names = {entry.split(" ", 1)[0] for entry in stale}
+    usable = [s for s in configured if s not in missing and s not in stale_names]
+    no_malware_feed = not any(FEED_PROFILES[s].malware for s in usable if s in FEED_PROFILES)
+    if not missing and not stale and not no_malware_feed:
         return [
             CheckResult(
                 name,
@@ -2218,14 +2315,25 @@ def check_blocklists(settings: Settings) -> list[CheckResult]:
         parts.append("never refreshed: " + ", ".join(missing))
     if stale:
         parts.append(f"stale after {threshold_days} days: " + ", ".join(stale))
-    return [
-        CheckResult(
-            name,
-            "WARN",
-            ". ".join(parts),
-            hint=_blocklist_hint(settings, missing, stale),
-        )
-    ]
+    hint = _blocklist_hint(settings, missing, stale) if missing or stale else ""
+    if no_malware_feed:
+        on_disk = [s for s in configured if s not in missing]
+        if any(FEED_PROFILES[s].malware for s in on_disk if s in FEED_PROFILES):
+            # The malware feeds are on disk, and each one is stale.
+            parts.append(
+                "no fresh malware feed is on disk, so each reputation result reads not_checked"
+            )
+        else:
+            parts.append("no malware feed is on disk, so each reputation result reads not_checked")
+        if not any(FEED_PROFILES[s].malware for s in configured if s in FEED_PROFILES):
+            # No malware feed is configured, so a refresh cannot bring one.
+            hint = (
+                "Add a malware feed. Put `urlhaus`, `threatfox` or `feodo` in "
+                "`blocklist_sources`, set ABUSE_CH_AUTH_KEY and run `soc-ai blocklists "
+                "refresh`. The key is free at https://auth.abuse.ch/. "
+                + (hint or "See docs/BLOCKLISTS.md.")
+            ).strip()
+    return [CheckResult(name, "WARN", ". ".join(parts), hint=hint)]
 
 
 # ── Check 8: prompt assets (FAIL: absence is invisible in the output) ────────
@@ -2334,7 +2442,7 @@ async def _last_fit_when_off(settings: Settings) -> Any:
 
 # The doctor row named "the ml extra", a packaging word no operator reads. The
 # row names the fact: an extra package, and whether this deployment has it.
-_ESTATE_EXTRA_PRESENT = "The extra package that the estate model needs is installed."
+_ESTATE_EXTRA_PRESENT = "The extra package that the network model needs is installed."
 
 
 async def check_estate_model(
@@ -2349,7 +2457,7 @@ async def check_estate_model(
     from soc_ai.hunting.estate_model import ml_installed  # noqa: PLC0415 - lazy, no numpy
     from soc_ai.store import estate_model as estate_store  # noqa: PLC0415
 
-    name = "estate model"
+    name = "network model"
     enabled = bool(getattr(settings, "estate_model_enabled", False))
     if not ml_installed():
         if not enabled:
@@ -2357,16 +2465,16 @@ async def check_estate_model(
                 CheckResult(
                     name,
                     "INFO",
-                    "unavailable. The estate model needs an extra package, and this "
-                    "deployment has not installed it. The estate model is off.",
+                    "unavailable. The network model needs an extra package, and this "
+                    "deployment has not installed it. The network model is off.",
                 )
             ]
         return [
             CheckResult(
                 name,
                 "WARN",
-                "unavailable. The estate model is on. It needs an extra package, and "
-                "this deployment has not installed it. soc-ai fits no estate model.",
+                "unavailable. The network model is on. It needs an extra package, and "
+                "this deployment has not installed it. soc-ai fits no network model.",
                 hint="Install the extra with `uv sync --extra ml`, or run the container "
                 "image. The image includes it.",
             )
@@ -2390,8 +2498,8 @@ async def check_estate_model(
             CheckResult(
                 name,
                 "WARN",
-                f"soc-ai cannot read the estate model record in the store. {_safe_reason(exc)}",
-                hint="Run the store check above. The estate model state is unknown.",
+                f"soc-ai cannot read the network model record in the store. {_safe_reason(exc)}",
+                hint="Run the store check above. The network model state is unknown.",
             )
         ]
     if fit is None:
@@ -2408,7 +2516,7 @@ async def check_estate_model(
                 name,
                 "WARN",
                 f"stale. The last fit ran on {day}, in state {fit.state}.",
-                hint="Read the app log for lines that start with `estate model:`.",
+                hint="Read the app log for lines that start with `network model:`.",
             )
         ]
     if fit.state == estate_store.STATE_MEASURED:
@@ -2570,7 +2678,7 @@ async def run_doctor(
         _isolated("audit chain", _solo(check_audit_chain(settings)), _AUDIT_CHAIN_WRAP_S),
         _isolated("gateway", check_gateway(settings), _GATEWAY_TIMEOUT_S),
         _isolated("oracle route", check_oracle_route(settings), _ORACLE_ROUTE_TIMEOUT_S),
-        _isolated("estate model", check_estate_model(settings), _STORE_TIMEOUT_S),
+        _isolated("network model", check_estate_model(settings), _STORE_TIMEOUT_S),
         _isolated("admin password", check_admin_password(settings), _STORE_TIMEOUT_S),
     ]
     if include_fitness:
@@ -2584,5 +2692,6 @@ async def run_doctor(
     results.extend(check_tls(settings))
     results.extend(check_blocklists(settings))
     results.extend(check_backups(settings))
+    results.extend(check_disk(settings))
     results.extend(check_prompt_assets())
     return results

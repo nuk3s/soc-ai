@@ -1,7 +1,7 @@
 // The host page of a domain controller with 7 investigations, 6 of them true
 // positives, showed no investigation count, list or link. A search for the
 // host name found 1 of the 7 (dogfood 2026-10-19, R4-D3 and R4-I1).
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -87,6 +87,49 @@ describe('HostInvestigations', () => {
       'No investigation names this host.',
     );
     expect(screen.queryByTestId('host-investigations-all')).toBeNull();
+  });
+
+  // Review 2026-11-12 (ui-hunt 7): an attacked host with 42 true positives
+  // listed its three newest runs, three false positives.
+  it('lists the true positives first when the newest runs are false positives', async () => {
+    const fps = [
+      row('F1', 'false_positive', 'ET INFO ZIP file download'),
+      row('F2', 'false_positive', 'ET INFO APT User-Agent'),
+      row('F3', 'needs_more_info', 'ET INFO APT User-Agent'),
+    ];
+    const tps = [row('T1', 'true_positive', 'ET EXPLOIT Example RCE'), row('T2', 'true_positive', 'ET EXPLOIT Example RCE')];
+    vi.mocked(listInvestigations).mockImplementation(async (q = {}) =>
+      q.verdict?.length
+        ? { ...LIST, rows: tps, total: 42 }
+        : { ...LIST, rows: fps, total: 115, truePositives: 42 },
+    );
+    mount();
+    await waitFor(() =>
+      expect(screen.getAllByTestId('host-investigation-row').map((r) => r.getAttribute('href'))).toEqual([
+        '/investigation/T1',
+        '/investigation/T2',
+        '/investigation/F3',
+      ]),
+    );
+    expect(listInvestigations).toHaveBeenCalledWith({ entity: 'agent:ea2d', verdict: ['true_positive'], limit: 3 });
+    // The count line keeps the counts of the whole host.
+    expect(screen.getByTestId('host-investigations-count').textContent).toBe(
+      '115 investigations name this host. 42 reached a true-positive verdict.',
+    );
+  });
+
+  it('keeps the newest order and makes no second read when the host has no true positive', async () => {
+    // NEGATIVE CONTROL: no true positive, so nothing moves and nothing more is read.
+    const rows = [row('A', 'false_positive', 'one'), row('B', 'inconclusive', 'two'), row('C', 'false_positive', 'three')];
+    vi.mocked(listInvestigations).mockResolvedValue({ ...LIST, rows, total: 3, truePositives: 0 });
+    mount();
+    await waitFor(() => expect(screen.getAllByTestId('host-investigation-row')).toHaveLength(3));
+    expect(screen.getAllByTestId('host-investigation-row').map((r) => r.getAttribute('href'))).toEqual([
+      '/investigation/B',
+      '/investigation/A',
+      '/investigation/C',
+    ]);
+    expect(listInvestigations).toHaveBeenCalledTimes(1);
   });
 
   it('says that the read failed', async () => {

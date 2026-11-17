@@ -49,6 +49,17 @@ _COALESCE_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("zeek.files.md5", fields.FILE_MD5),
     ("zeek.files.sha256", fields.FILE_SHA256),
     ("zeek.files.total_bytes", fields.FILE_SIZE),
+    ("zeek.files.filename", fields.FILE_NAME),
+    # SSH, the lateral-movement workhorse. These six were on the projection
+    # under their zeek.* names only. Security Onion 3.x writes none of those
+    # names, so an ssh hit came back with no login result: the stored documents
+    # hold ssh.authentication.success.
+    ("zeek.ssh.auth_success", fields.SSH_AUTH_SUCCESS),
+    ("zeek.ssh.auth_attempts", fields.SSH_AUTH_ATTEMPTS),
+    ("zeek.ssh.client", fields.SSH_CLIENT),
+    ("zeek.ssh.server", fields.SSH_SERVER),
+    ("zeek.ssh.version", fields.SSH_VERSION),
+    ("zeek.ssh.direction", fields.SSH_DIRECTION),
 )
 
 # The full _source projection: the stable 5-tuple/identity fields plus EVERY
@@ -67,15 +78,6 @@ _STABLE_SOURCE_FIELDS: tuple[str, ...] = (
     # Zeek-only fields with no ECS coalesce target but still useful to the agent.
     "zeek.ssl.subject",
     "zeek.ssl.issuer",
-    "zeek.files.filename",
-    # SSH — the lateral-movement workhorse. Without these on the projection an
-    # ssh hit came back field-stripped, reinforcing a false "no SSH" conclusion.
-    "zeek.ssh.auth_success",
-    "zeek.ssh.auth_attempts",
-    "zeek.ssh.client",
-    "zeek.ssh.server",
-    "zeek.ssh.version",
-    "zeek.ssh.direction",
 )
 
 
@@ -92,6 +94,20 @@ def _build_source_projection() -> list[str]:
     for _key, candidates in _COALESCE_FIELDS:
         for c in candidates:
             seen.setdefault(c, None)
+    return list(seen)
+
+
+def _datasets_for(log_types: tuple[str, ...]) -> list[str]:
+    """The ``event.dataset`` values of the log types, under every name of each.
+
+    Security Onion 3.x names the file log ``zeek.file``. Older grids and the
+    synth fixtures name it ``zeek.files``. A pivot that asked for one name got
+    no file record from a grid that uses the other name.
+    """
+    seen: dict[str, None] = {}
+    for log_type in log_types:
+        for name in fields.same_dataset_names(f"zeek.{log_type}"):
+            seen.setdefault(name, None)
     return list(seen)
 
 
@@ -131,7 +147,7 @@ async def query_zeek_logs(
         elastic: client for the SO ES cluster.
         settings: app settings (uses ``events_index_pattern``).
         log_types: Zeek dataset suffixes to include (e.g. ``["conn", "dns"]``).
-            Defaults to ``conn``, ``dns``, ``http``, ``ssl``, ``files``.
+            Defaults to ``conn``, ``dns``, ``http``, ``ssl``, ``files``, ``ssh``.
         time_range_minutes: window size in minutes. Default 60, capped at
             ``_MAX_TIME_RANGE_MINUTES`` (43_200 = 30 days).
         max_results: hard cap on returned records.
@@ -158,7 +174,7 @@ async def query_zeek_logs(
         )
 
     types = tuple(log_types) if log_types else DEFAULT_LOG_TYPES
-    datasets = [f"zeek.{t}" for t in types]
+    datasets = _datasets_for(types)
 
     query: dict[str, Any] = {
         "bool": {
