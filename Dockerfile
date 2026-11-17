@@ -66,7 +66,7 @@ RUN npm run build
 
 
 # ── Stage 3: runtime ─────────────────────────────────────────────────────────
-FROM python:3.12-slim@sha256:a0f57064cbdcd6285fa45f51237ab0b35ea8ebaed06a1f5973e89e19dfb86704 AS runtime
+FROM python:3.15-slim@sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928 AS runtime
 # ^ digest-pinned (see the builder stage's FROM comment above); tag: 3.12-slim.
 
 # ── OS-level deps ─────────────────────────────────────────────────────────────
