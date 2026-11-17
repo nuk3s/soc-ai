@@ -247,3 +247,21 @@ def test_every_workflow_job_sets_a_timeout() -> None:
     assert not missing, (
         "workflow job(s) without timeout-minutes (GitHub's default is 360): " + ", ".join(missing)
     )
+
+
+def test_every_workflow_job_pins_its_runner_image() -> None:
+    """``ubuntu-latest`` is a floating label. On 2026-11-17 it moved to Ubuntu
+    26.04, and the locked Playwright had no Chromium build for that image, so
+    the browser smoke failed on a tree that passed every local gate. A job
+    names a dated runner image, so a new image arrives with a reviewed
+    change."""
+    floating = []
+    for path in sorted((REPO_ROOT / ".github" / "workflows").glob("*.yml")):
+        workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
+        for name, job in workflow["jobs"].items():
+            if "uses" in job:
+                continue
+            runner = str(job.get("runs-on", ""))
+            if not re.fullmatch(r"ubuntu-\d\d\.\d\d", runner):
+                floating.append(f"{path.name}:{name} runs on {runner!r}")
+    assert not floating, "workflow job(s) on a floating runner image: " + "; ".join(floating)

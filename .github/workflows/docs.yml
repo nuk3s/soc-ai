@@ -27,7 +27,7 @@ concurrency:
 jobs:
   build:
     name: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # A stalled install would otherwise hold the `pages` concurrency group for
     # GitHub's 360-minute default and queue every later docs deploy behind it.
     timeout-minutes: 10
@@ -62,7 +62,7 @@ jobs:
   deploy:
     name: deploy
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # deploy-pages can sit in the Pages queue for a few minutes; 10 leaves room
     # for that without letting a stuck deploy block the next one for hours.
     timeout-minutes: 10

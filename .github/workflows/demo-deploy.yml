@@ -39,7 +39,7 @@ concurrency:
 jobs:
   leak-gate:
     name: demo fixture leak gate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -62,7 +62,7 @@ jobs:
 
   deploy:
     name: deploy to Render
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     needs: leak-gate
     steps:

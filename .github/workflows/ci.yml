@@ -17,7 +17,7 @@ permissions:
 jobs:
   ci:
     name: lint + typecheck + test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Raised 10 -> 30 (2026-08-16): the backend suite crossed the old cap as it
     # grew past ~4300 tests — the degraded-grid publish was killed at exactly
     # 10m0s with everything passing, the same failure shape the internal CI
@@ -73,7 +73,7 @@ jobs:
   # throwaway service that lives for this job only.
   store-postgres:
     name: store tests on PostgreSQL
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     services:
       postgres:
@@ -117,7 +117,7 @@ jobs:
   # (no dependency, no config, no `lint` script); tsc is the only static gate.
   frontend:
     name: frontend typecheck + test + build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     defaults:
       run:
@@ -157,7 +157,7 @@ jobs:
   # here on its own, with no coverage gate. `-s` prints the stage table.
   scale:
     name: scale harness (2,000 hosts)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
 
     steps:
@@ -185,7 +185,7 @@ jobs:
   # `--ignore=tests/browser`); runs here in isolation under `-m browser`.
   browser-smoke:
     name: browser smoke (E2E)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     needs: [ci, frontend]
 
@@ -233,7 +233,7 @@ jobs:
   # Never add -q: quiet mode exits 0 on a strict abort.
   docs:
     name: docs strict build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
 
     steps:
@@ -264,7 +264,7 @@ jobs:
   # (.github/dependabot.yml) opens the bump that clears it.
   audit:
     name: dependency audit
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
 
     steps:
